@@ -25,6 +25,7 @@ from __future__ import annotations
 import math
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -75,6 +76,8 @@ def _stub_model(audio_tower: MuseSparkAudioTower | None):
     model._loaded_audio = set()
     model.model = torch.nn.Module()
     model.model.layers = []
+    # Loading asks the backbone's config whether it packs decode monokernels.
+    model.model.config = SimpleNamespace(decode_monokernel=False)
     model.is_multimodal_active = audio_tower is not None
     return model
 

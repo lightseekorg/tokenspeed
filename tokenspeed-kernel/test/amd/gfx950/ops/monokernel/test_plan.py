@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -148,3 +149,91 @@ def test_placement_must_name_the_module_stages_in_order():
         placement({"b3": 30, "b1": 28}, ("b1", "b3"))
     with pytest.raises(ValueError, match="must place"):
         placement({"b1": 28}, ("b1", "b3"))
+
+
+def _peer_plan(world, peers):
+    return Plan(
+        grid=4,
+        stages=(
+            Stage("push", 2, 0, writes=("part",)),
+            Stage("sum", 2, 2, reads=("part",)),
+        ),
+        regions=(("part", 40), ("local", 8)),
+        rows=1,
+        chain=1,
+        world=world,
+        peers=peers,
+    )
+
+
+def test_plan_peer_regions_hold_two_aligned_copies():
+    plan = _peer_plan(8, ("part",))
+    # 40 pairs round up to 64 per copy; the local region follows both copies.
+    assert plan.peer_copy("part") == 64
+    assert plan.offset("local") == 128
+    assert plan.is_peer("part") and not plan.is_peer("local")
+    assert json.loads(plan.key)["peers"] == ["part"]
+    assert plan.only(("sum",)).peers == ("part",)
+
+
+def test_plan_rejects_peer_regions_on_one_rank_or_unknown_names():
+    with pytest.raises(ValueError, match="more than one rank"):
+        _peer_plan(1, ("part",))
+    with pytest.raises(ValueError, match="unknown peer regions"):
+        _peer_plan(8, ("nope",))
+
+
+def test_plan_flags_are_peer_regions_and_part_of_the_key():
+    """Flag regions (Plan.flags) are peer regions a host stands in for with
+    raised flags; they tell plans apart."""
+    plain = _peer_plan(8, ("part",))
+    flagged = replace(plain, flags=("part",))
+    assert flagged.is_flag("part") and not plain.is_flag("part")
+    assert json.loads(flagged.key)["flags"] == ["part"]
+    assert flagged.key != plain.key
+    assert flagged.only(("sum",)).flags == ("part",)
+    with pytest.raises(ValueError, match="not peer regions"):
+        replace(plain, flags=("local",))
+
+
+@pytest.mark.parametrize(
+    "poll_check,poll_timeout_shift", [(64, 29), (4096, 10), (64, 10)]
+)
+def test_poll_bound_changes_the_key_without_changing_layout(
+    poll_check, poll_timeout_shift
+):
+    production = Plan(
+        grid=2,
+        stages=(Stage("s", 1, 0, writes=("a",)),),
+        regions=(("a", 33),),
+        rows=2,
+        chain=1,
+    )
+    explicit = replace(production, poll_check=4096, poll_timeout_shift=29)
+    short = replace(
+        production, poll_check=poll_check, poll_timeout_shift=poll_timeout_shift
+    )
+    assert production == explicit
+    assert production.key == explicit.key
+    assert short.key != production.key
+    assert short.offset("a") == production.offset("a")
+    assert short.row_pairs == production.row_pairs
+    assert short.scratch_pairs == production.scratch_pairs
+    sliced = short.only(("s",))
+    assert sliced.poll_check == poll_check
+    assert sliced.poll_timeout_shift == poll_timeout_shift
+    assert sliced.key == short.key
+
+
+@pytest.mark.parametrize(
+    "bounds",
+    [
+        dict(poll_check=0),
+        dict(poll_check=2**32),
+        dict(poll_timeout_shift=-1),
+        dict(poll_timeout_shift=57),
+    ],
+)
+def test_plan_rejects_poll_bounds_that_do_not_fit(bounds):
+    with pytest.raises(ValueError, match="poll_"):
+        Plan(grid=1, stages=(), regions=(), rows=1, chain=1, **bounds)

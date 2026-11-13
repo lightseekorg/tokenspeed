@@ -503,6 +503,9 @@ impl Frontend for EngineTransport {
         if let ControlOutput::GetAdmission(snapshot) = &mut output {
             snapshot.dp_rank = i64::from(self.engine_index);
         }
+        if let ControlOutput::GetSharedPrefixPublication(publication) = &mut output {
+            publication.dp_rank = i64::from(self.engine_index);
+        }
         let asker = self
             .askers
             .get_mut(output.tag())

@@ -28,6 +28,17 @@ forwards, launches and regular forwards follow each other freely through the
 shared caches (next rule). Each model's kernel README gives its boundary
 tensors.
 
+A model's boundary layers may keep the regular code in every forward, when
+their hand-over to the embedding or the LM head differs from the other
+layers'. The model's kernel README names them and why.
+Every other layer launches or none does, as above. The first launch after a
+boundary layer takes that layer's complete output, and the last launch before
+one returns the regular layer's boundary, so no pending state crosses
+between a launch and a regular layer. A draft model that takes the switch
+(see **One switch** below) is a backbone of its own and follows the same
+rule as the target: its layers, and its other launches (a context write, a
+draft head), are all packed at startup or startup fails.
+
 **Same caches, same layouts.** A monokernel reads and writes the KV cache,
 the recurrent state pages, and the other per-request caches exactly as the
 regular decode path does. Prefill, the regular decode path, and the monokernel
@@ -51,9 +62,14 @@ planning do not change. A monokernel layer runs a decode step that its plans
 serve as one launch, and every other forward (prefill, larger steps) with the
 regular layer's code. Startup fails when the checkpoint's architecture has
 no monokernel (`DECODE_MONOKERNEL_ARCHITECTURES` in `server_args.py`), or
-when a layer cannot be packed after loading. The switch never serves a layer
-without its kernel. The model's layer loop is the same with and without the
-switch.
+when a layer other than a boundary layer cannot be packed after loading. The
+switch never serves such a layer without its kernel. A draft model with
+monokernels of its own takes the switch too when its target is one they serve
+(`DRAFT_MONOKERNEL_TARGETS` in `server_args.py`: the DFlash2 draft of a Muse
+Spark target, the MTP draft of a Qwen3.8 target) and follows the same rule:
+when a piece of it cannot be packed, startup fails and names each piece and
+why. Every other draft keeps the regular path. The model's layer loop is the
+same with and without the switch.
 
 **Deadlock freedom comes from the plan.** Each stage reads only regions that
 an earlier stage writes, and the plan checks this when it is constructed.
@@ -69,6 +85,28 @@ step counter is a device tensor that changes once per forward, inside the
 CUDA graph, after the forward's last fused layer. So no write from an earlier
 layer or step can satisfy a poll. All layers share the scratch buffer, and
 nothing clears it.
+
+**A tensor-parallel group runs one plan.** In a plan of several ranks, every
+rank runs the same stages, and a stage can put into another rank's copy of a
+peer region. The deadlock rule then holds across ranks: the earliest
+unfinished stage on any rank reads only regions that earlier stages on every
+rank wrote, and all CTAs of all ranks are resident. The scratch lives on a
+symmetric heap, so a region has the same offset on every rank. Each state
+sizes its heap buffers and reserves them before the heap exists; the heap is
+created once, with the reservations on top of its communication buffers and
+headroom. A rank can start its next launch while another still reads this one,
+but not two launches ahead, because finishing the next launch needs every
+rank's part of it. So a peer region holds two copies, which the launches pick
+by a parity that alternates on every rank. Puts and polls of a peer region use
+system scope: another GPU's store does not update the local caches.
+
+**Bulk values go as plain words and one flag.** A tagged pair carries 32 bits
+of payload in 64. A producer of many values per task may instead store them
+as plain words past the caches, wait until its stores land, and then put one
+tagged flag. The consumer polls the flag and then loads the words past the
+caches. The tag still guards reuse: a word is read only after this launch's
+flag. The choice is a stage's: plain words halve the bytes a consumer
+reads, and the producer waits for its stores to land before the flag.
 
 **A step starts and ends in the model.** One step is one forward. The model
 calls `start_step()` on its monokernel state before its layers and
@@ -86,10 +124,30 @@ the producers' stores. A poll issues all its loads, waits once, and retries
 after a short sleep. A retry loads only the pairs whose tag differs, so a wide
 poll sees its last pairs one round trip after they land.
 
+Flag polls wait in one atomic poll instruction, with the same time bound and
+fail-stop. They wait for the whole pair, `(tag << 32) | 1`, not the tag alone,
+so the plan names its peer flag regions, and a host that stands in for absent
+ranks (in a single-GPU bench) writes those pairs as raised flags. A stage that
+waits for a flag together with data pairs keeps one tagged poll for both: two
+polls in a row cost a round trip on its critical path.
+
 **A stuck poll stops the process.** A poll stops the kernel with an error
-after a bounded number of retries, which take far longer than a launch. A
-deadlock or a missing producer then gives a GPU error and the process stops,
-instead of a hang.
+after a bounded wait, which is far longer than a launch. A deadlock or a
+missing producer then gives a GPU error and the process stops, instead of a
+hang. The bound is time, not a retry count: in a tensor-parallel group, a rank
+whose host submits a launch seconds late must only stall its peers. Given a
+stuck-poll record buffer, a poll that gives up first writes what it waited for
+(the tag, the pair, what it saw, the clocks) where the host can read it after
+the process stops. A stall leaves records on every CTA downstream of it; the
+decoder groups them by wait and prints the earliest stage in plan order first,
+which by the deadlock rule is the one whose producer is missing.
+
+**A launch first reads its own code.** A layer kernel's code can be larger
+than the instruction cache, and the weights that stream through the caches
+evict it during a launch. Each stage would then wait on its instructions
+from memory, one stage after another on the critical path. So a launch's
+first tasks may read its own code into the caches as data, and stages that
+run once a launch keep compute-light loops rolled, not unrolled.
 
 **Compile-time plans are canonical text.** A plan is a compile-time argument
 of the kernel, and Triton's compile hooks serialize every compile-time

@@ -23,6 +23,8 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <unordered_map>
+#include <unordered_set>
 #include <variant>
 #include <vector>
 
@@ -40,6 +42,28 @@ struct KvBlockRemovedEvent {
 };
 
 using KvCacheEvent = std::variant<KvBlockStoredEvent, KvBlockRemovedEvent>;
+
+// Projects per-boundary Device residency onto a prefix-closed routing view.
+// This owns only event metadata, never cache blocks or eviction decisions.
+class KvEventPrefixView {
+public:
+    // Scheduler Stored events each describe one boundary, including short tails.
+    // Return net visibility changes: removals leaf-first, stores parent-first.
+    std::vector<KvCacheEvent> Apply(std::vector<KvCacheEvent> events);
+
+private:
+    struct Node {
+        std::optional<KvBlockStoredEvent> resident;
+        std::optional<std::uint64_t> parent;
+        std::unordered_set<std::uint64_t> children;
+        std::int32_t depth{0};
+        bool registered{false};
+        bool visible{false};
+    };
+    void Reconcile(std::uint64_t hash, std::unordered_map<std::uint64_t, bool>& before);
+    void Prune(std::uint64_t hash);
+    std::unordered_map<std::uint64_t, Node> nodes_;
+};
 
 std::uint64_t HashKvBlock(std::span<const std::int32_t> token_ids, std::optional<std::uint64_t> parent_hash);
 

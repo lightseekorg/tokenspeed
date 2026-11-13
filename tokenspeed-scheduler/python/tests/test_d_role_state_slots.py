@@ -25,7 +25,9 @@ the peer's prompt-end state lands in slot 1 and nothing is read from slot 0
 (the D runs no prefill). The first decode keeps the pair and reads slot 1,
 later decodes write it in place, so a request never needs a state block after
 its admission and a pool filled by remote admissions before any KV lands
-still drains.
+still drains. The peer fills the landed blocks whole, so the plan zeroes
+neither them nor the state's slot 1: only the History block holding an
+unaligned prompt end and the reserve pages beyond it.
 
 Shape: K3-shaped 4-group config (1 History + 3 State groups, P = 2 tokens per
 block, 32 usable pages), one-block prompts with max_new_tokens = 4.
@@ -34,7 +36,7 @@ block, 32 usable pages), one-block prompts with max_new_tokens = 4.
 from __future__ import annotations
 
 import pytest
-from conftest import K3_STATE_GROUPS, _make_k3_config
+from conftest import K3_HISTORY_GROUP, K3_STATE_GROUPS, PAGE, _make_k3_config
 
 ts = pytest.importorskip("tokenspeed_scheduler")
 
@@ -203,7 +205,8 @@ class TestDRoleStateSlots:
 
     def test_remote_admission_lands_the_state_in_slot_one(self):
         """The landing row is [0, slot1]: no checkpoint to read, a fresh block
-        for the peer's prompt-end state, and no state transfer skipped."""
+        for the peer's prompt-end state, and no state transfer skipped. The
+        transfer fills slot 1 whole, so the plan does not zero it."""
         scheduler = ts.Scheduler(_d_role_config(decode_input_tokens=1))
         _submit_and_bootstrap(scheduler, ["r0"])
         plan = scheduler.next_execution_plan()
@@ -214,7 +217,37 @@ class TestDRoleStateSlots:
         zeroed = dict(plan.pages_to_zero)
         for group, (slot0, slot1) in _state_rows(plan.remote_prefill, "r0").items():
             assert slot0 == 0, group
-            assert slot1 > 0 and slot1 in zeroed[group], group
+            assert slot1 > 0 and slot1 not in zeroed[group], group
+
+    @pytest.mark.parametrize("prompt_tokens", [2 * PAGE, 2 * PAGE + 1])
+    def test_remote_landing_zeroes_only_the_pages_the_peer_does_not_fill(
+        self, prompt_tokens
+    ):
+        """Every History block that ends at or below the prompt end lands whole
+        from the peer and is not zeroed; the block holding an unaligned prompt
+        end and the reserve pages beyond it are."""
+        scheduler = ts.Scheduler(_d_role_config(decode_input_tokens=1))
+        scheduler.submit_requests(
+            [_spec("r0", list(range(1, prompt_tokens + 1)), MAX_NEW_TOKENS)]
+        )
+        scheduler.advance(ts.ExecutionEvent().add_event(ts.PD.BootstrappedEvent("r0")))
+        plan = scheduler.next_execution_plan()
+        assert plan.remote_prefill is not None and list(
+            plan.remote_prefill.request_ids
+        ) == ["r0"]
+        row = list(plan.remote_prefill.request_ids).index("r0")
+        blocks = [
+            block
+            for block in dict(plan.remote_prefill.block_tables)[K3_HISTORY_GROUP][row]
+            if block > 0
+        ]
+        landed = prompt_tokens // PAGE
+        assert len(blocks) > landed, "the admission reserves pages past the prompt"
+        zeroed = set(dict(plan.pages_to_zero)[K3_HISTORY_GROUP])
+        assert zeroed.isdisjoint(blocks[:landed]), "landed blocks are filled whole"
+        assert zeroed == set(
+            blocks[landed:]
+        ), "the partial and reserve pages are zeroed"
 
     def test_landed_request_decodes_in_place_with_an_exhausted_pool(self):
         """With the pool otherwise exhausted, every freshly landed prompt takes

@@ -4,12 +4,30 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: Build and test wheels, or also publish them to PyPI
+        description: Build and test wheels, or also publish them
         required: true
         type: choice
         options:
           - dry-run
           - publish
+      release_type:
+        description: Stable release, post-release, or release candidate
+        required: true
+        type: choice
+        default: post
+        options:
+          - post
+          - rc
+          - release
+      version_date:
+        description: "post/rc: YYYYMMDD (empty = UTC today); post advances past occupied dates"
+        required: false
+        type: string
+      publish_post_to_pypi:
+        description: "Also upload a post release to PyPI (post only)"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -19,8 +37,64 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
+  metadata:
     if: inputs.mode == 'dry-run' || (inputs.mode == 'publish' && github.repository == 'lightseekorg/tokenspeed' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      date: ${{ steps.version.outputs.date }}
+      tag_name: ${{ steps.version.outputs.tag_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Resolve release version
+        id: version
+        env:
+          RELEASE_TYPE: ${{ inputs.release_type }}
+          VERSION_DATE: ${{ inputs.version_date }}
+          PUBLISH_POST_TO_PYPI: ${{ inputs.publish_post_to_pypi }}
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          if [ "$PUBLISH_POST_TO_PYPI" = true ] && [ "$RELEASE_TYPE" != post ]; then
+            echo "publish_post_to_pypi is only valid for post releases." >&2
+            exit 1
+          fi
+          if [ "$RELEASE_TYPE" != release ]; then
+            VERSION_DATE=${VERSION_DATE:-$(date -u +%Y%m%d)}
+          fi
+          version_args=()
+          if [ "$RELEASE_TYPE" = post ]; then
+            gh api --paginate 'repos/lightseekorg/whl/releases?per_page=100' \
+              --jq '.[].tag_name' > release-tags.txt
+            version_args+=(--release-tags release-tags.txt)
+          fi
+          version=$(python .github/scripts/prepare-engine-release.py . \
+            --target version --kind "$RELEASE_TYPE" --date "$VERSION_DATE" "${version_args[@]}")
+          if [ "$RELEASE_TYPE" = post ]; then
+            VERSION_DATE=${version##*.post}
+          fi
+          {
+            echo "version=$version"
+            echo "date=$VERSION_DATE"
+            echo "tag_name=tokenspeed-engine-v$version"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "Version: $version"
+            echo "Source: $SOURCE_SHA"
+            echo "Wheel destination: lightseekorg/whl"
+            if [ "$RELEASE_TYPE" = release ] || [ "$PUBLISH_POST_TO_PYPI" = true ]; then
+              echo "Also publish to PyPI in publish mode."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    needs: metadata
     name: Wheel (${{ matrix.arch }}, Python ${{ matrix.python }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
@@ -41,6 +115,20 @@ jobs:
           ref: ${{ github.sha }}
           persist-credentials: false
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Apply wheel version to the build checkout
+        env:
+          RELEASE_TYPE: ${{ inputs.release_type }}
+          VERSION_DATE: ${{ needs.metadata.outputs.date }}
+          EXPECTED_VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          version=$(python .github/scripts/prepare-engine-release.py . \
+            --target engine --kind "$RELEASE_TYPE" --date "$VERSION_DATE")
+          test "$version" = "$EXPECTED_VERSION"
+
       - name: Build and repair wheel
         env:
           ARCH: ${{ matrix.arch }}
@@ -56,12 +144,14 @@ jobs:
       - name: Test installed wheel outside the build environment
         env:
           PYTHON_VERSION: ${{ matrix.python }}
+          EXPECTED_VERSION: ${{ needs.metadata.outputs.version }}
         run: |
           docker run --rm \
             -v "$PWD/dist:/wheels:ro" \
             -v "$PWD/test/ci_system/check_engine_wheel.py:/check_engine_wheel.py:ro" \
+            -e EXPECTED_VERSION \
             "python:${PYTHON_VERSION}-slim" \
-            sh -ec 'python -m venv /tmp/runtime; /tmp/runtime/bin/pip install --no-index /wheels/*.whl; /tmp/runtime/bin/python /check_engine_wheel.py'
+            sh -ec 'python -m venv /tmp/runtime; /tmp/runtime/bin/pip install --no-index /wheels/*.whl; /tmp/runtime/bin/python /check_engine_wheel.py "$EXPECTED_VERSION"'
 
       - name: Upload tested wheel
         uses: actions/upload-artifact@v4
@@ -70,9 +160,129 @@ jobs:
           path: dist/*.whl
           if-no-files-found: error
 
-  publish:
-    needs: build
+  publish-whl:
+    needs: [metadata, build]
     if: inputs.mode == 'publish' && github.repository == 'lightseekorg/tokenspeed' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout release scripts
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download tested wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: tokenspeed-engine-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish to the wheel repository
+        env:
+          GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+          RELEASE_TYPE: ${{ inputs.release_type }}
+          VERSION: ${{ needs.metadata.outputs.version }}
+          TAG_NAME: ${{ needs.metadata.outputs.tag_name }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          gh auth status
+          test "$(gh api user --jq .login)" = lightseek-bot
+          for repo in lightseekorg/tokenspeed lightseekorg/whl; do
+            test "$(gh repo view "$repo" --json visibility --jq .visibility)" = PUBLIC
+          done
+          title="tokenspeed-engine $VERSION"
+          notes="$title built from lightseekorg/tokenspeed@$SOURCE_SHA"
+          printf '%s\n' "$notes" > release-notes.txt
+          cat release-notes.txt
+          if gh release view "$TAG_NAME" --repo lightseekorg/whl >/dev/null 2>&1; then
+            existing_notes=$(gh release view "$TAG_NAME" --repo lightseekorg/whl --json body --jq .body)
+            if [ "$existing_notes" != "$notes" ]; then
+              echo "This version belongs to a different source commit; start a new post run or choose a new version." >&2
+              exit 1
+            fi
+            existing_assets=$(gh release view "$TAG_NAME" --repo lightseekorg/whl --json assets --jq '.assets[].name')
+            for asset in dist/*.whl; do
+              if ! grep -Fxq "$(basename "$asset")" <<< "$existing_assets"; then
+                gh release upload "$TAG_NAME" "$asset" --repo lightseekorg/whl
+              fi
+            done
+          else
+            flags=()
+            if [ "$RELEASE_TYPE" = rc ]; then
+              flags+=(--prerelease --latest=false)
+            fi
+            gh release create "$TAG_NAME" dist/*.whl --repo lightseekorg/whl \
+              --title "$title" --notes-file release-notes.txt "${flags[@]}"
+          fi
+          gh release view "$TAG_NAME" --repo lightseekorg/whl --json url,body,assets
+          gh api "repos/lightseekorg/whl/releases/tags/$TAG_NAME" > engine-release.json
+
+      - name: Checkout wheel index
+        uses: actions/checkout@v4
+        with:
+          repository: lightseekorg/whl
+          ref: gh-pages
+          path: wheelhouse
+          token: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+
+      - name: Publish pip indexes
+        env:
+          GH_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+          RELEASE_TYPE: ${{ inputs.release_type }}
+          VERSION: ${{ needs.metadata.outputs.version }}
+        run: |
+          variant=engine-nightly
+          if [ "$RELEASE_TYPE" = release ]; then
+            variant=engine-release
+          fi
+          python .github/scripts/update-nightly-index.py \
+            --package tokenspeed-engine --variant "$variant" \
+            wheelhouse engine-release.json dist > engine-index-paths.txt
+          mapfile -t index_paths < engine-index-paths.txt
+          cd wheelhouse
+          gh auth status
+          test "$(gh api user --jq .login)" = lightseek-bot
+          case "$(git remote get-url --push origin)" in
+            https://github.com/lightseekorg/whl|https://github.com/lightseekorg/whl.git) ;;
+            *) echo "Unexpected wheel index push destination." >&2; exit 1 ;;
+          esac
+          for repo in lightseekorg/tokenspeed lightseekorg/whl; do
+            test "$(gh repo view "$repo" --json visibility --jq .visibility)" = PUBLIC
+          done
+          git config user.name lightseek-bot
+          git config user.email 243258330+lightseek-bot@users.noreply.github.com
+          git add -- "${index_paths[@]}"
+          git diff --cached --check
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git diff --cached
+          if [ -f .pre-commit-config.yaml ]; then
+            pre-commit run --all-files
+          fi
+          git commit -s -m "Publish tokenspeed-engine $VERSION wheel indexes"
+          for attempt in 1 2 3; do
+            if git push origin HEAD:gh-pages; then
+              for path in "${index_paths[@]}"; do
+                gh api "repos/lightseekorg/whl/contents/$path?ref=gh-pages" --jq .content | base64 --decode
+              done
+              exit 0
+            fi
+            git fetch origin gh-pages:refs/remotes/origin/gh-pages
+            git rebase origin/gh-pages
+          done
+          echo "Could not publish the engine pip indexes after three attempts." >&2
+          exit 1
+
+  publish:
+    needs: publish-whl
+    if: inputs.mode == 'publish' && (inputs.release_type == 'release' || (inputs.release_type == 'post' && inputs.publish_post_to_pypi)) && github.repository == 'lightseekorg/tokenspeed' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: pypi
