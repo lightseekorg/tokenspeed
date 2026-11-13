@@ -732,7 +732,7 @@ Notes:
 - The NVIDIA command below captures each prefill bucket for 1 and for up to
   64 requests (`--prefill-graph-capture-batch-sizes 1 64`), so a prefill of
   several requests also runs its KDA layers inside the graph instead of at
-  eager breaks. On 2 GB300 nodes this cut the time to first token of 2 to 64
+  eager breaks. On 2 GB300 nodes, this cut the time-to-first-token of 2 to 64
   concurrent short prompts by 40% to 55%, for about 0.7 GB less KV cache per
   GPU and 2 to 3 more minutes of startup.
 - The Kimi-K3.1 DSpark draft (`Inferact/Kimi-K3.1-Pro-DSpark-preview`)
