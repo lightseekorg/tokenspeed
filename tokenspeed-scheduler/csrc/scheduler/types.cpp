@@ -273,7 +273,8 @@ void SchedulerConfig::ValidateCapacityInputs() const {
         // A prefix hit re-feeds up to one replay window and must still carry
         // the prompt's final window whole, or at least a prefix page of new
         // tokens when the window is smaller than a page.
-        if (max_scheduled_tokens < replay_window_tokens + std::max(replay_window_tokens, prefix_granularity)) {
+        if (max_scheduled_tokens <
+            std::int64_t{replay_window_tokens} + std::max(replay_window_tokens, prefix_granularity)) {
             throw std::invalid_argument(
                 "Scheduler: max_scheduled_tokens must cover the replayable groups' largest sliding_window_tokens "
                 "plus max(that window, prefix_granularity)");

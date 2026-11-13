@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -661,6 +662,33 @@ TEST(SchedulerConfigValidateTest, ReplayableRequiresASlidingWindowGroup) {
     group.sliding_window_tokens.reset();
     group.block_granularity = 0;
     ExpectRejectedNamingGroup(config, "swa");
+}
+
+TEST(SchedulerConfigValidateTest, RejectsASlidingWindowThatABlockTakesPastInt32) {
+    SchedulerConfig config = MakeValidConfig();
+    CacheGroupConfig& group = config.cache_groups[0];
+    group.group_id = "long_window";
+    group.attn_kind = AttnKind::kSlidingWindow;
+    group.sliding_window_tokens = std::numeric_limits<std::int32_t>::max() - group.block_granularity;
+    EXPECT_NO_THROW(WithHostPackingFromDevice(config).Validate());
+    group.sliding_window_tokens = std::numeric_limits<std::int32_t>::max() - group.block_granularity + 1;
+    ExpectRejectedNamingGroup(config, "long_window");
+}
+
+TEST(SchedulerConfigValidateTest, ReplayBudgetPastInt32IsRejected) {
+    // A replayable window of 1.5 * 2^30 tokens: a hit chunk needs replay plus
+    // a window, 3 * 2^30 tokens, which no int32 budget holds.
+    SchedulerConfig config = MakeValidConfig();
+    CacheGroupConfig swa;
+    swa.group_id = "swa";
+    swa.block_granularity = 64;
+    swa.total_pages = config.device_allocator.total_pages;
+    swa.attn_kind = AttnKind::kSlidingWindow;
+    swa.sliding_window_tokens = 3 << 29;
+    swa.replayable = true;
+    config.cache_groups.push_back(swa);
+    config.max_scheduled_tokens = std::numeric_limits<std::int32_t>::max();
+    EXPECT_THROW(WithHostPackingFromDevice(config).Validate(), std::invalid_argument);
 }
 
 TEST(SchedulerConfigValidateTest, ReplayNeedsBudgetForAWindowOnEveryRole) {
