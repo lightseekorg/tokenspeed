@@ -108,6 +108,9 @@ def _expand_via_stacks(backend, pool, logical_rows, device="cuda"):
                 block_granularity=pool.arena.prefix_granularity,
                 kernel_page_size=backend.kernel_page_size,
                 max_num_pages=backend.max_num_pages,
+                atom_pages_per_block=(
+                    pool.arena.prefix_granularity // backend.kernel_page_size
+                ),
             )
         ],
         max_bs=max(bs, 4),

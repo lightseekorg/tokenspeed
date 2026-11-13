@@ -609,6 +609,8 @@ class ServerArgs:
     # Opt-in: large QSA prefill calls over an FP8 KV cache attend a BF16 copy
     # of their pages, reserved from the KV cache budget; see the flag's help.
     enable_qsa_prefill_bf16_scratch: bool = False
+    # Experimental: pack Qwen4-Exp full-attention K/V into one FlatKV plane.
+    qwen4_exp_flat_kv: bool = False
     sampling_backend: str | None = None
     # Random stream of the non-greedy rows of the FlashInfer sampling backends:
     # "batch" keys flashinfer's Philox stream by the batch row, so a request's
@@ -3862,6 +3864,16 @@ class ServerArgs:
             "dtype (mxfp8 included), chunked prefill below 2048 tokens or "
             "disabled, or a GPU without the CuTe QSA kernel. The decode role, "
             "which runs no prefill, reserves no scratch.",
+        )
+        parser.add_argument(
+            "--qwen4-exp-flat-kv",
+            action="store_true",
+            dest="qwen4_exp_flat_kv",
+            default=ServerArgs.qwen4_exp_flat_kv,
+            help="Experimental Qwen4-Exp FlatKV layout: pack full-attention K/V "
+            "fields into one plane and translate scheduler block IDs to "
+            "contiguous atom-page IDs before attention. Requires PP=1; "
+            "recurrent, PLE and QSA side caches keep their existing groups.",
         )
         parser.add_argument(
             "--sampling-backend",

@@ -97,6 +97,9 @@ def _kv_producer_options(args: ServerArgs, *, draft_dtype: str) -> dict[str, Any
             if args.enable_qsa_prefill_bf16_scratch
             else {}
         ),
+        # FlatKV changes physical field strides and atom-page addressing; peers
+        # must use the same layout even though their logical blocks are unchanged.
+        **({"qwen4_exp_flat_kv": True} if args.qwen4_exp_flat_kv else {}),
     }
 
 

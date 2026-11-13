@@ -330,6 +330,23 @@ class CacheArena:
             token_rows = spec.rows_per_page
         if spec.attn_kind == "state" or field.shape[0] != token_rows:
             return pages
+        if field.page_stride_bytes != field.payload_bytes:
+            # A padded history field cannot fold pages with view(). Expose
+            # contiguous atom rows from its block-0 base instead; the router
+            # folds the original page stride into the atom-page IDs it emits.
+            row_bytes = field.payload_bytes // field.shape[0]
+            span_bytes = (
+                group.page_count - 1
+            ) * field.page_stride_bytes + field.payload_bytes
+            if span_bytes % row_bytes:
+                raise ValueError(
+                    f"cache field {field.field_id!r} stride does not cover "
+                    "a whole number of atom rows"
+                )
+            return pages.as_strided(
+                (span_bytes // row_bytes, *field.shape[1:]),
+                (row_bytes // field.element_size, *reversed(element_strides)),
+            )
         return pages.view(-1, *field.shape[1:])
 
     def field(self, field_id: str) -> torch.Tensor:

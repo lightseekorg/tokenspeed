@@ -112,6 +112,31 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
         """Allow side groups that do not fill every shared plane."""
         return float("inf")
 
+    @cached_property
+    def _flat_kv(self) -> bool:
+        """Whether full-attention K/V uses the experimental single plane."""
+        enabled = bool(self.server_args.qwen4_exp_flat_kv)
+        if enabled and self.server_args.mapping.pp_size != 1:
+            raise NotImplementedError(
+                "Qwen4-Exp FlatKV currently requires PP=1; PP-local repacking "
+                "has not been implemented"
+            )
+        return enabled
+
+    @override
+    def fields_for_layer(
+        self, layer_id: int, group_id: str, occurrence: int
+    ) -> tuple[CacheFieldSpec, ...]:
+        fields = super().fields_for_layer(layer_id, group_id, occurrence)
+        if not self._flat_kv or self.layer_types[layer_id] != FULL_ATTENTION:
+            return fields
+        # The pool exposes each field through a contiguous atom-row view. The
+        # router folds this plane's larger page stride into its atom-page IDs.
+        return tuple(
+            replace(field, plane_id="flatkv", exact_page_stride=False)
+            for field in fields
+        )
+
     def _ple_fields(self) -> tuple[CacheFieldSpec, ...]:
         if not getattr(self._text_config, "ple_layer_ids", None):
             return ()

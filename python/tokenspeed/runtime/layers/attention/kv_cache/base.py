@@ -263,6 +263,22 @@ class CachePool(ABC):
             num_layers=self.layer_num,
         )
 
+    def atom_pages_per_block(self, group_id: str, kernel_page_size: int) -> int:
+        """Return atom pages per scheduler block for a kernel page table.
+
+        Ordinary fields are tightly packed, so atom pages are just the kernel
+        subpages of one scheduler block. MHA-shaped pools override this when a
+        shared plane inserts other fields between consecutive field pages.
+        """
+        specs = {spec.group_id: spec for spec in self.arena.cache_group_specs}
+        granularity = specs[group_id].block_granularity
+        if kernel_page_size <= 0 or granularity % kernel_page_size:
+            raise ValueError(
+                f"cache group {group_id!r}: block_granularity {granularity} "
+                f"is not divisible by kernel page size {kernel_page_size}"
+            )
+        return granularity // kernel_page_size
+
     def history_group_by_layer(self) -> dict[int, str]:
         """View-local layer id -> the history group its KV planes
         ride; what ``bind_cache_groups`` stamps onto the model's

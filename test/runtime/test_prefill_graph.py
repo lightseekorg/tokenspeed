@@ -636,6 +636,7 @@ class TestDummyGroupTablesTest:
                     block_granularity=128,
                     kernel_page_size=64,
                     max_num_pages=max_num_pages,
+                    atom_pages_per_block=2,
                 )
             ],
             max_bs=1,
@@ -663,6 +664,7 @@ class TestDummyGroupTablesTest:
                     block_granularity=128,
                     kernel_page_size=64,
                     max_num_pages=130,
+                    atom_pages_per_block=2,
                 )
             ],
             max_bs=1,

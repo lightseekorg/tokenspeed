@@ -27,10 +27,18 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tokenspeed.runtime.layers.attention.backends.paged.group_tables import (
+    GroupTableSpec,
+    GroupTableStacks,
+)
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
 from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
+from tokenspeed.runtime.layers.attention.kv_cache.factory import (
+    create_cache_arena,
+    create_cache_pool,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
     QWEN4_EXP_PLE_CACHE_GROUP,
     QWEN4_EXP_QSA_CACHE_GROUP,
@@ -120,6 +128,7 @@ def _recipe(
             enable_replay_ssm=True,
             mamba_ssm_dtype="float32",
             enable_qsa_prefill_bf16_scratch=False,
+            qwen4_exp_flat_kv=False,
         ),
         model_config=model_config,
         attn_config=config,
@@ -383,3 +392,133 @@ def test_qwen4_zero_index_width_keeps_geometry_validation() -> None:
     recipe.model_config.hf_text_config.indexer_head_dim = 0
     with pytest.raises(ValueError, match="invalid geometry"):
         recipe.setup()
+
+
+def _flat_kv_recipe() -> Qwen4ExpRecipe:
+    recipe = _recipe(
+        layer_types=(FULL_ATTENTION, FULL_ATTENTION), speculative=False, width=1
+    )
+    recipe.server_args.qwen4_exp_flat_kv = True
+    recipe.server_args.mapping = SimpleNamespace(pp_size=1)
+    recipe.cache_budget_bytes = 16 << 20
+    return recipe
+
+
+def _flat_kv_pool(recipe):
+    setup = recipe.setup()
+    config = replace(recipe.attn_config, device="cpu")
+    arena = create_cache_arena(setup.spec, device="cpu", enable_memory_saver=False)
+    pool = create_cache_pool(
+        setup.spec,
+        config,
+        arena,
+        num_layers=setup.num_target_layers,
+        rank=0,
+    )
+    return arena, pool
+
+
+@pytest.mark.parametrize("kernel_page_size", [64, 256])
+def test_flat_kv_atom_pages_resolve_to_the_original_field_bytes(
+    kernel_page_size: int,
+) -> None:
+    recipe = _flat_kv_recipe()
+    arena, pool = _flat_kv_pool(recipe)
+    plan = arena.plan
+    kv_ids = {f"layer.{layer}.{name}" for layer in range(2) for name in ("k", "v")}
+    assert {field.plane_id for field in plan.fields if field.field_id in kv_ids} == {
+        "flatkv"
+    }
+
+    granularity = plan.prefix_granularity
+    ratio = granularity // kernel_page_size
+    atom_pages = pool.atom_pages_per_block(FULL_ATTENTION, kernel_page_size)
+    group = plan.group(FULL_ATTENTION)
+    last_block = group.page_count - 1
+    raw = torch.tensor([[0, 1, last_block]], dtype=torch.int32)
+    stacks = GroupTableStacks(
+        [
+            GroupTableSpec(
+                FULL_ATTENTION,
+                granularity,
+                kernel_page_size,
+                3 * ratio,
+                atom_pages,
+            )
+        ],
+        max_bs=1,
+        max_tokens_per_req=1,
+        max_extend_tokens=0,
+        device="cpu",
+    )
+    stacks.fill(1, 1, {FULL_ATTENTION: raw})
+    table = stacks.table(FULL_ATTENTION, 1)
+    expected = [0] * ratio + [
+        block * atom_pages + subpage
+        for block in (1, last_block)
+        for subpage in range(ratio)
+    ]
+    assert table.tolist() == [expected]
+    assert stacks.host_table(FULL_ATTENTION, raw, 1).tolist() == [expected]
+
+    # The two-layer layout is [k0, v0, k1, v1] in every scheduler block.
+    # At Q=G, logic block 1 therefore maps to atom page 4 for every field.
+    if kernel_page_size == granularity:
+        assert atom_pages == 4
+        assert table[0, ratio].item() == 4
+
+    for layer in range(2):
+        for name in ("k", "v"):
+            field_id = f"layer.{layer}.{name}"
+            field = plan.field(field_id)
+            row_bytes = field.payload_bytes // granularity
+            cache = (
+                pool.get_key_buffer(layer)
+                if name == "k"
+                else pool.get_value_buffer(layer)
+            )
+            for block in (1, last_block):
+                for subpage in range(ratio):
+                    column = block * ratio + subpage
+                    atom_page = table[0, column].item()
+                    row = atom_page * kernel_page_size + 3
+                    value = 10 + layer * 20 + (name == "v") * 40 + subpage
+                    cache[row].fill_(value)
+                    expected_offset = (
+                        plan.field_page_byte_offset(field_id, block)
+                        + (subpage * kernel_page_size + 3) * row_bytes
+                    )
+                    actual = arena.buffer.view(torch.bfloat16)[
+                        expected_offset // 2 : expected_offset // 2 + cache.shape[-1]
+                    ]
+                    assert torch.all(actual == value), (
+                        field_id,
+                        block,
+                        subpage,
+                        expected_offset,
+                    )
+
+
+def test_flat_kv_rejects_a_stride_that_is_not_whole_atom_pages() -> None:
+    arena, pool = _flat_kv_pool(_flat_kv_recipe())
+    field_id = "layer.0.k"
+    arena.plan = replace(
+        arena.plan,
+        fields=tuple(
+            (
+                replace(field, page_stride_bytes=field.page_stride_bytes + 1)
+                if field.field_id == field_id
+                else field
+            )
+            for field in arena.plan.fields
+        ),
+    )
+    with pytest.raises(ValueError, match="is not divisible by atom-page payload"):
+        pool.atom_pages_per_block(FULL_ATTENTION, 64)
+
+
+def test_flat_kv_rejects_pipeline_parallelism() -> None:
+    recipe = _flat_kv_recipe()
+    recipe.server_args.mapping.pp_size = 2
+    with pytest.raises(NotImplementedError, match="PP=1"):
+        recipe.fields_for_layer(0, FULL_ATTENTION, 0)

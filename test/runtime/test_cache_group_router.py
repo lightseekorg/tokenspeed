@@ -164,7 +164,11 @@ class TestPersistentExtendSpanTest:
     def _stacks(self, capacity):
         specs = [
             GroupTableSpec(
-                FULL, block_granularity=4, kernel_page_size=4, max_num_pages=3
+                FULL,
+                block_granularity=4,
+                kernel_page_size=4,
+                max_num_pages=3,
+                atom_pages_per_block=1,
             )
         ]
         stacks = GroupTableStacks(
@@ -284,10 +288,18 @@ class TestGroupTableStacksTest:
     def _stacks(self, device="cpu", max_bs=4):
         specs = [
             GroupTableSpec(
-                FULL, block_granularity=4, kernel_page_size=4, max_num_pages=3
+                FULL,
+                block_granularity=4,
+                kernel_page_size=4,
+                max_num_pages=3,
+                atom_pages_per_block=1,
             ),
             GroupTableSpec(
-                SWA, block_granularity=4, kernel_page_size=2, max_num_pages=6
+                SWA,
+                block_granularity=4,
+                kernel_page_size=2,
+                max_num_pages=6,
+                atom_pages_per_block=2,
             ),
         ]
         return GroupTableStacks(
@@ -489,13 +501,25 @@ class TestGroupTableStacksTest:
         # A geometry no other test builds, so only the construction compiles it.
         specs = [
             GroupTableSpec(
-                "a", block_granularity=8, kernel_page_size=8, max_num_pages=5
+                "a",
+                block_granularity=8,
+                kernel_page_size=8,
+                max_num_pages=5,
+                atom_pages_per_block=1,
             ),
             GroupTableSpec(
-                "b", block_granularity=8, kernel_page_size=2, max_num_pages=9
+                "b",
+                block_granularity=8,
+                kernel_page_size=2,
+                max_num_pages=9,
+                atom_pages_per_block=4,
             ),
             GroupTableSpec(
-                "c", block_granularity=8, kernel_page_size=4, max_num_pages=7
+                "c",
+                block_granularity=8,
+                kernel_page_size=4,
+                max_num_pages=7,
+                atom_pages_per_block=2,
             ),
         ]
         stacks = GroupTableStacks(

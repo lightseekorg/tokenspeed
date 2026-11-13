@@ -1187,6 +1187,17 @@ object:
   MTP steps. Checkpoints that already set
   `text_config.index_share_for_mtp_iteration=true` do not need this flag.
 
+### Experimental FlatKV cache
+
+`--qwen4-exp-flat-kv` packs all full-attention K/V fields into one `flatkv`
+plane. The runtime translates scheduler block IDs to contiguous atom-page IDs
+before attention, so the existing kernels need no padded-stride support and no
+KV gather is introduced. The field page stride must be a whole number of
+kernel-page payloads. This draft currently requires PP=1 and uniform K/V head
+geometry; GDN, PLE and QSA side caches keep their existing groups and plane
+policy. The flag is off by default and is part of the L3 storage identity when
+enabled.
+
 ## GPT-OSS 20B / 120B
 
 Small GPT-OSS launches can start simple. Large GPT-OSS launches usually tune

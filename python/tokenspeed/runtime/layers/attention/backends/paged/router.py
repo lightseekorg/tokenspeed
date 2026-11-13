@@ -381,6 +381,9 @@ class CacheGroupRouter(AttentionBackend):
                 block_granularity=self.geometry.granularity_of(gid),
                 kernel_page_size=leaf.kernel_page_size,
                 max_num_pages=leaf.max_num_pages,
+                atom_pages_per_block=self.cache_pool.atom_pages_per_block(
+                    gid, leaf.kernel_page_size
+                ),
             )
             for gid, leaf in self.leaves.items()
         ]
