@@ -118,7 +118,7 @@ def make_config(
     storage_config: StorageConfig | None,
     host_write_policy: str,
     prefill_decode_interval: int,
-    prefill_decode_min_interval: int = 0,
+    prefill_decode_min_interval: int,
     debug_force_retraction_interval: int = 0,
     enable_kv_cache_events: bool = False,
     decode_input_tokens: int = 1,
