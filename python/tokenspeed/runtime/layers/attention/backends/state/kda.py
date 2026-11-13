@@ -137,6 +137,15 @@ def _slice_kda_prefill_inputs(
     )
 
 
+def _pack_token_spans(
+    tensor: torch.Tensor, spans: Sequence[tuple[int, int]]
+) -> torch.Tensor:
+    """Pack each ``[start, end)`` span of a packed input's token axis in order."""
+    if len(spans) == 1:
+        return tensor[:, spans[0][0] : spans[0][1]]
+    return torch.cat([tensor[:, start:end] for start, end in spans], dim=1)
+
+
 class KdaAttnBackend(CapacityPrefillBackend):
     """Attention backend for KDA linear attention layers (Kimi-K3).
 
@@ -153,6 +162,8 @@ class KdaAttnBackend(CapacityPrefillBackend):
 
     _verify_reads_committed_recurrent_state = True
     _verify_packed_qkv_views = True
+    # A second scan over each checkpointed row's prefix stores the checkpoint.
+    _stores_in_forward_state_checkpoints = True
     # Eager forwards keep the same metadata contract as replay.
     _capacity_layout_when_uncaptured = True
 
@@ -1161,17 +1172,20 @@ class KdaAttnBackend(CapacityPrefillBackend):
         metadata retains the physical packed extent; GPU boundaries determine
         live work, so that extent is not a live-token count. The adapter clears
         inputs before full-tile loads; inline output padding is cleared by the
-        in-graph scrub. Only an ordinary break uses the handoff copy.
+        in-graph scrub. Only an ordinary break uses the handoff copy. A
+        prefill graph runs a checkpointing forward on ordinary metadata at its
+        eager breaks, so the output is zero-padded to ``seq_len`` rows there.
 
         ``cu_seqlens_cpu`` is the required metadata-built int64 mirror of
         ``query_start_loc``. It supplies exact-length host planning and
         capacity admission without a per-layer synchronizing D2H. The prepared
         capacity path builds its chunk plan on device instead of on the host.
+
+        ``state_checkpoints`` is the forward's checkpoint plan. The KDA scan
+        kernels store no interior state, so ``_checkpoint_prefix_states``
+        computes the plan rows the forward publishes; its other rows stay
+        unwritten.
         """
-        if state_checkpoints is not None:
-            raise NotImplementedError(
-                f"{type(self).__name__} stores no in-forward State checkpoints"
-            )
         _reject_skip_term(D)
         head_k_dim = query.shape[3]
         num_value_heads = value.shape[2]
@@ -1195,6 +1209,19 @@ class KdaAttnBackend(CapacityPrefillBackend):
 
         if query_start_loc.dtype != torch.int64:
             raise RuntimeError("KDA prefill requires metadata-built int64 boundaries")
+        if state_checkpoints is not None:
+            state_checkpoints.states.index_copy_(
+                0,
+                self.forward_metadata.scan_checkpoint_rows,
+                self._checkpoint_prefix_states(
+                    (query, key, value, g_kda, beta_kda),
+                    recurrent_state,
+                    cu_seqlens_cpu,
+                    A_log=A_log,
+                    dt_bias=dt_bias,
+                    lower_bound=lower_bound,
+                ),
+            )
         kda_result = kda_paged_prefill(
             query,
             key,
@@ -1216,7 +1243,58 @@ class KdaAttnBackend(CapacityPrefillBackend):
             recurrent_layout=self.kda_recurrent_layout,
         )
 
-        return kda_result.out.squeeze(0), kda_result.final_state
+        out = kda_result.out.squeeze(0)
+        if out.shape[0] < seq_len:
+            # A live scan at a padded graph bucket's eager break; zero the rest.
+            out = torch.nn.functional.pad(out, (0, 0, 0, 0, 0, seq_len - out.shape[0]))
+        return out, kda_result.final_state
+
+    def _checkpoint_prefix_states(
+        self,
+        inputs: tuple[torch.Tensor, ...],
+        recurrent_state: torch.Tensor,
+        cu_seqlens_cpu: torch.Tensor,
+        *,
+        A_log: torch.Tensor,
+        dt_bias: torch.Tensor,
+        lower_bound: float | None,
+    ) -> torch.Tensor:
+        """Return the FP32 state at each of this forward's in-forward checkpoints.
+
+        Each is the final state of an exact-length scan over its row's tokens
+        before the checkpoint, from the row's input state: what a forward
+        ending at the checkpoint would leave in the live slot.
+
+        Args:
+            inputs: Packed ``(query, key, value, gate, beta)`` of the forward.
+            recurrent_state: The forward's per-row input states.
+            cu_seqlens_cpu: Host int64 boundaries of the forward's rows.
+            A_log: FP32 gate parameter.
+            dt_bias: FP32 gate bias.
+            lower_bound: KDA decay clamp.
+
+        Returns:
+            One state per checkpoint, in checkpoint order.
+        """
+        checkpoints = self.forward_metadata.state_checkpoints
+        starts = cu_seqlens_cpu[checkpoints.rows]
+        spans = list(zip(starts.tolist(), (starts + checkpoints.offsets).tolist()))
+        prefix_cu_seqlens_cpu = torch.cat(
+            (torch.zeros(1, dtype=torch.int64), checkpoints.offsets.cumsum(0))
+        )
+        result = kda_paged_prefill(
+            *(_pack_token_spans(tensor, spans) for tensor in inputs),
+            A_log,
+            dt_bias,
+            initial_state=recurrent_state[checkpoints.rows],
+            cu_seqlens=prefix_cu_seqlens_cpu.to(recurrent_state.device),
+            cu_seqlens_cpu=prefix_cu_seqlens_cpu,
+            capacity=None,
+            lower_bound=lower_bound,
+            solution=None if self.kda_backend == "auto" else self.kda_backend,
+            recurrent_layout=self.kda_recurrent_layout,
+        )
+        return result.final_state
 
     @override
     def _prepare_prefill_scan_query_start_loc(
