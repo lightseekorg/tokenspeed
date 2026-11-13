@@ -1924,8 +1924,9 @@ class ServerArgs:
             )
 
         # Block verification, and synthetic rejection over sampled drafts, run
-        # the sampled-chain verify on the flashinfer backend; greedy and sonic
-        # force the synthetic length over their own verify.
+        # the sampled-chain verify on the flashinfer backend (block also on
+        # triton); greedy and sonic force the synthetic length over their own
+        # verify.
         sampled_chain_verify = self.speculative_rejection_sample_method == "block" or (
             self.speculative_rejection_sample_method == "synthetic"
             and self.sampling_backend not in ("greedy", "sonic")
@@ -1935,7 +1936,10 @@ class ServerArgs:
                 not self.enable_speculative_sampling
                 or self.speculative_algorithm not in BLOCK_REJECTION_ALGORITHMS
                 or self.speculative_eagle_topk != 1
-                or self.sampling_backend != "flashinfer"
+                or not (
+                    self.sampling_backend == "flashinfer"
+                    or self._block_verifies_on_triton
+                )
                 or self.dp_sampling
                 or self.mapping.has_attn_dp
                 or self.pipeline_parallel_size != 1
@@ -1946,8 +1950,9 @@ class ServerArgs:
                     f"{self.speculative_rejection_sample_method} with sampled drafts "
                     "requires a DSPARK or EAGLE3 chain "
                     "(--speculative-eagle-topk 1), --enable-speculative-sampling, "
-                    "the flashinfer sampling backend, and aggregate TP without attention DP, "
-                    "DP sampling, pipeline parallelism, or PD disaggregation"
+                    "the flashinfer sampling backend (or triton for block), and "
+                    "aggregate TP without attention DP, DP sampling, pipeline "
+                    "parallelism, or PD disaggregation"
                 )
             if self.speculative_rejection_sample_method == "synthetic":
                 # vLLM's draft_sample_method=probabilistic with
@@ -1961,6 +1966,14 @@ class ServerArgs:
                 )
         if self.enable_speculative_sampling:
             self._validate_speculative_sampling()
+
+    @property
+    def _block_verifies_on_triton(self) -> bool:
+        """Block verification on the triton backend, which reads the dense q."""
+        return (
+            self.speculative_rejection_sample_method == "block"
+            and self.sampling_backend == "triton"
+        )
 
     @property
     def eagle_harness(self) -> bool:
@@ -2029,7 +2042,8 @@ class ServerArgs:
         its own logits (the Eagle family and the multi-depth MTP drafter) and
         the verifier must be a backend that runs the draft-prob chain kernel:
         ``greedy`` verifies by exact match and ``triton`` by a target-sampled
-        exact match, so a dense q never enters either. The one block drafter
+        exact match, so a dense q never enters either, except that ``triton``
+        runs block verification over the dense q. The one block drafter
         served is DFLASH with the DFlash2 candidate selector: its walk samples
         each step from the selector's q over its top-K candidates, which only
         the ``triton`` backend verifies (sparse q); base DFLASH without the
@@ -2092,14 +2106,18 @@ class ServerArgs:
                     "the DFlash2 selector's sparse draft distribution; got "
                     f"--sampling-backend {self.sampling_backend}"
                 )
-        elif self.sampling_backend not in SPECULATIVE_SAMPLING_BACKENDS:
+        elif (
+            self.sampling_backend not in SPECULATIVE_SAMPLING_BACKENDS
+            and not self._block_verifies_on_triton
+        ):
             if self.sampling_backend == "greedy":
                 why = "verifies by exact match, so the draft distribution never enters"
             elif self.sampling_backend in ("triton", "triton_full"):
                 why = (
                     "verifies by target-sampled exact match and has no dense "
                     "draft-prob rejection kernel (triton reads only the DFlash2 "
-                    "selector's sparse q, under DFLASH)"
+                    "selector's sparse q, under DFLASH, and the dense q under "
+                    "--speculative-rejection-sample-method block)"
                 )
             else:
                 why = "has no draft-prob rejection kernel"
