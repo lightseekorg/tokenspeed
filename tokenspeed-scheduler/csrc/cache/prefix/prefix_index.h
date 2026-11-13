@@ -986,7 +986,7 @@ private:
         // into stable list nodes. available_order keeps eviction candidates
         // sorted by age; common_order keeps shared keys in source age order.
         // AdmissionPlanner owns the policy that ranks one access epoch.
-        FixedSlotResource entry_memory{256};
+        FixedSlotResource entry_memory{SlotShape::ListNodeOf<CacheEntry>(), 256, std::pmr::new_delete_resource()};
         // Registration destructors erase their nodes, so maps outlive entries.
         OrderIndex available_order;
         OrderIndex common_order;

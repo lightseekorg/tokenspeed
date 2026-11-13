@@ -26,6 +26,7 @@
 #include <deque>
 #include <limits>
 #include <memory>
+#include <memory_resource>
 #include <new>
 #include <optional>
 #include <set>
@@ -642,7 +643,8 @@ private:
     // Stable slots allocated on demand, independent of physical page IDs.
     // Last-owner release recycles the control only after cancelling observers
     // and releasing its CacheBlock; no stale observer survives slot reuse.
-    mutable FixedSlotResource control_memory_{256};
+    mutable FixedSlotResource control_memory_{SlotShape::Of<internal_cache_block_ref::CacheBlockControl>(), 256,
+                                              std::pmr::new_delete_resource()};
     std::vector<LcmBlock> lcm_blocks_;
     // Free parents are interchangeable: release appends and allocation consumes
     // the front. Bound parents have per-group, per-bucket availability indices.

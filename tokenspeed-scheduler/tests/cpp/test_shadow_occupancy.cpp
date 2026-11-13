@@ -300,11 +300,86 @@ TEST(CacheEvictionCandidates, SortReachesTheKeyOrderFromAnyInput) {
     }
 }
 
+// Forwards to the new/delete resource and records what was asked of it.
+class RecordingResource final : public std::pmr::memory_resource {
+public:
+    std::vector<SlotShape> allocations;
+    std::size_t live{0};
+
+private:
+    void* do_allocate(std::size_t bytes, std::size_t alignment) override {
+        void* memory = std::pmr::new_delete_resource()->allocate(bytes, alignment);
+        allocations.push_back(SlotShape{bytes, alignment});
+        ++live;
+        return memory;
+    }
+    void do_deallocate(void* pointer, std::size_t bytes, std::size_t alignment) noexcept override {
+        std::pmr::new_delete_resource()->deallocate(pointer, bytes, alignment);
+        --live;
+    }
+    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override { return this == &other; }
+};
+
+// The shape a real list asks for when it adds an element.
+template <typename T>
+SlotShape AllocatedListNode() {
+    RecordingResource recorder;
+    std::pmr::list<T> values{&recorder};
+    values.emplace_back();
+    return recorder.allocations.back();
+}
+
+TEST(SlotShape, ListNodeOfIsTheShapeAListAllocatesPerElement) {
+    struct Odd {
+        char bytes[3];
+    };
+    struct alignas(64) Wide {
+        char bytes[100];
+    };
+    struct alignas(256) Aligned {
+        int value;
+    };
+    EXPECT_EQ(SlotShape::ListNodeOf<char>(), AllocatedListNode<char>());
+    EXPECT_EQ(SlotShape::ListNodeOf<Odd>(), AllocatedListNode<Odd>());
+    EXPECT_EQ(SlotShape::ListNodeOf<std::int64_t>(), AllocatedListNode<std::int64_t>());
+    EXPECT_EQ(SlotShape::ListNodeOf<std::string>(), AllocatedListNode<std::string>());
+    EXPECT_EQ(SlotShape::ListNodeOf<Wide>(), AllocatedListNode<Wide>());
+    EXPECT_EQ(SlotShape::ListNodeOf<Aligned>(), AllocatedListNode<Aligned>());
+}
+
+// The owner names the pooled shape, so a request of another shape made
+// first, here a vector's buffer, neither takes a slot nor keeps the nodes
+// from being pooled: four nodes take one chunk of four slots.
+TEST(FixedSlotResource, PoolsTheShapeItWasGivenWhateverIsAskedFirst) {
+    RecordingResource upstream;
+    const SlotShape node = SlotShape::ListNodeOf<std::int64_t>();
+    const SlotShape buffer{5 * sizeof(std::int64_t), alignof(std::int64_t)};
+    ASSERT_NE(buffer, node);
+    const SlotShape chunk{4 * node.bytes, node.alignment};
+    {
+        FixedSlotResource storage{node, 4, &upstream};
+        {
+            std::pmr::vector<std::int64_t> values{&storage};
+            values.reserve(5);
+            std::pmr::list<std::int64_t> nodes{&storage};
+            for (std::int64_t i = 0; i < 4; ++i) nodes.push_back(i);
+            EXPECT_EQ(upstream.allocations, (std::vector<SlotShape>{buffer, chunk}));
+            nodes.push_back(4);
+            EXPECT_EQ(upstream.allocations, (std::vector<SlotShape>{buffer, chunk, chunk}))
+                << "a fifth node takes a second chunk";
+            std::int64_t expected = 0;
+            for (const std::int64_t value : nodes) EXPECT_EQ(value, expected++);
+        }
+        EXPECT_EQ(upstream.live, 2u) << "the chunks stay until the resource goes";
+    }
+    EXPECT_EQ(upstream.live, 0u);
+}
+
 TEST(FixedSlotResource, AlignedNodesKeepTheirAddressAcrossGrowthAndReuse) {
     struct alignas(256) Value {
         int value;
     };
-    FixedSlotResource storage{16};
+    FixedSlotResource storage{SlotShape::ListNodeOf<Value>(), 16, std::pmr::new_delete_resource()};
     std::pmr::list<Value> values{&storage};
     values.push_back(Value{73});
     const auto* anchor = &values.front();
@@ -322,9 +397,9 @@ TEST(FixedSlotResource, AlignedNodesKeepTheirAddressAcrossGrowthAndReuse) {
 }
 
 TEST(FixedSlotResource, RequestsOfAnotherShapeUseTheUpstreamResource) {
-    FixedSlotResource storage{4};
-    // The list's first node fixes the slot shape; the vector's growing
-    // buffers never match it.
+    FixedSlotResource storage{SlotShape::ListNodeOf<std::int64_t>(), 4, std::pmr::new_delete_resource()};
+    // The slots take the list's nodes; the vector's growing buffers never
+    // match them.
     std::pmr::list<std::int64_t> nodes{&storage};
     std::pmr::vector<std::int64_t> values{&storage};
     for (std::int64_t i = 0; i < 64; ++i) {
@@ -352,7 +427,7 @@ TEST(FixedSlotResource, FreeSlotsArePoisonedUntilHandedOut) {
 #if !defined(TOKENSPEED_SCHEDULER_ADDRESS_SANITIZER)
     GTEST_SKIP() << "needs AddressSanitizer";
 #else
-    FixedSlotResource storage{4};
+    FixedSlotResource storage{SlotShape::ListNodeOf<std::int64_t>(), 4, std::pmr::new_delete_resource()};
     std::pmr::list<std::int64_t> nodes{&storage};
     nodes.push_back(1);
     nodes.push_back(2);

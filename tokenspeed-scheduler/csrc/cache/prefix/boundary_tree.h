@@ -679,7 +679,7 @@ private:
     // Each node and its key live in stable pooled list storage. Index rehash and
     // backward-shift erase move handles only; Holds and traversal links stay
     // valid until their own node's ordinary last-holder removal.
-    FixedSlotResource node_memory_{256};
+    FixedSlotResource node_memory_{SlotShape::ListNodeOf<Node>(), 256, std::pmr::new_delete_resource()};
     NodeList node_storage_{&node_memory_};
     // Answers node_storage_.end() for an absent hash.
     FlatPointerIndex<NodeIterator, ContentHash, NodeKey, std::hash<ContentHash>> nodes_{node_storage_.end()};
