@@ -28,6 +28,12 @@ has a single Triton kernel, so they call it directly instead of selecting a
 registered kernel. The SwiGLU takes a half of at most 16,384 columns and
 raises `ValueError` above that.
 
+On NVIDIA SM10x, BF16 token-group-128 quantization writes canonical FP32
+scales directly in the quantization kernel, without a subsequent transpose
+copy. It retains reciprocal scaling and clamps each group's maximum magnitude
+to the existing BF16-rounded `1e-10` epsilon. Explicit backend overrides,
+other input dtypes and other scale encodings retain their existing routes.
+
 `granularity="block"` accepts positive two-dimensional block sizes and
 BF16, FP16, or FP32 inputs. The quantizer masks partial edge blocks, and the
 returned FP32 scale shape is `[ceil(M / block_m), ceil(K / block_k)]`. GEMM
@@ -82,3 +88,50 @@ from ranked selection. Explicit `override` selects the native entry; its
 implementation validates the supported quantization parameters. Callers
 opting in must support the returned strides. This entry does not change
 model projections or GEMM dispatch.
+
+## DeepGEMM packed UE8M0
+
+On SM100/SM103, `quantize_fp8(..., granularity="token_group", group_size=128,
+scale_encoding="packed_ue8m0")` produces E4M3 codes and int32 scales with
+shape `[M, ceil(K/512)]` and strides `[1, round_up(M,4)]`. Four exponent
+bytes share each word. Quantization uses bit-level upward rounding of the
+FP32 scale exponent, matching vLLM, and initializes all row/K padding in
+the same launch. There is no separate transpose, pack or memset kernel.
+PDL and CUDA Graph replay use the same implementation.
+
+### CuTe DSL implementation
+
+The BF16/group128/packed-UE8M0 path selects CuTe DSL by default on
+SM100/SM103. Ordinary FP32-scale quantization uses the existing registered
+quantizers.
+Eight lanes quantize each group of 128, using packed BF16 arithmetic and
+FP8x2 conversion. The scale recipe floors absmax at FP32 `1e-10`, multiplies
+by FP32 `1/448`, and rounds the exponent upward, matching SGLang's BF16
+UE8M0 path. FP8 values and packed scales, including padding, are written in
+one launch. This path does not support FP16 or ordinary FP32 scales.
+
+The launcher uses 32 threads for a single row, 128 threads for 2–512 rows,
+and 256 threads above that. Positive FP32 scale bits are rounded upward by
+adding the mantissa mask before extracting the exponent. Saturating FP8x2
+conversion supplies the output clamp and retains NaNs, avoiding a separate
+BF16 clamp for each pair. Group absmax and the scale recipe are unchanged.
+M and scale stride are runtime values; only K, thread count, PDL setting and
+device identify a compiled executor. Warm each required executor before
+CUDA Graph capture. PDL waits for the producer and signals after output
+stores. The low-level `launch` accepts preallocated outputs for benchmarks
+or graph owners; the registry wrapper allocates outputs like the existing
+quantizers and copies unaligned inputs when needed.
+
+## Output gate and packed UE8M0
+
+The CuTe DSL `output_fp8_quant_pack` implementation fuses a BF16 sigmoid gate or per-head RMSNorm with a
+SiLU/sigmoid gate into group128 quantization on SM100/SM103. The
+kernel rounds the gated result to BF16 before quantizing and writes packed
+UE8M0 scales with zero padding. Each warp owns one head-row and uses a
+hardware warp-max reduction for group absmax; inverse scales are built from
+exponent bits. Static norm weights load before the PDL wait, while activation
+and gate loads follow it. Rows and tensor strides remain runtime arguments.
+
+`try_output_fp8_quant_pack` checks the input requirements and launches the
+fusion when they hold. It returns `None` when callers need to run the separate
+gate or norm and quantization operations.

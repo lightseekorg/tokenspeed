@@ -57,10 +57,10 @@ class DSAResources:
     release: Callable
 
 
-def prepare_dsa_resources(*, group, rank):
+def prepare_dsa_resources(*, group, rank, heads):
     """Select and allocate DSA communication resources outside graph capture."""
     return select_kernel("attention", "dsa_prepare_resources", format_signature())(
-        group=group, rank=rank
+        group=group, rank=rank, heads=heads
     )
 
 

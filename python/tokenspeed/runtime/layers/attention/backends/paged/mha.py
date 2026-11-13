@@ -135,12 +135,19 @@ class MHAAttnBackend(PagedAttentionBackend):
 
     # Every kernel call site forwards layer.sliding_window_size.
     supports_layer_sliding_window: bool = True
+    # Set from the resolved kernel solution in __init__: a token sink reaches
+    # only the Triton decode leaf, so a backend pinned to another solution
+    # cannot serve one and says so before a layer declares a sink.
+    supports_layer_window_sink: bool = False
 
     def __init__(self, config: AttnConfig, spec: MHAConfig, *, kernel_page_size: int):
         super().__init__(config, spec, kernel_page_size=kernel_page_size)
         # Map the selected backend to the corresponding kernel solution string.
         backend_name = spec.backend_name or "mha"
         self.kernel_solution = _KERNEL_SOLUTION_BY_BACKEND[backend_name]
+        # ``None`` leaves selection free, so the sink-capable leaf is reachable;
+        # a pinned solution must be the one that declares the trait.
+        self.supports_layer_window_sink = self.kernel_solution in (None, "triton")
 
         self.skip_softmax_threshold = spec.skip_softmax_threshold
 
@@ -521,6 +528,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             page_table=metadata.page_table,
             cache_seqlens=metadata.seq_lens,
             window_left=layer.sliding_window_size,
+            window_sink=layer.sliding_window_sink,
             logit_cap=layer.logit_cap,
             sinks=sinks,
             max_seqlen_k=self.max_context_len,
@@ -779,13 +787,19 @@ class MHAAttnBackend(PagedAttentionBackend):
     def _get_kv_cache(self, layer: PagedAttention, token_to_kv_pool):
         # Page ids are in this leaf's kernel-page units (the router expanded
         # them), so view the cache at that size.
-        k_cache = token_to_kv_pool.get_key_buffer(layer.layer_id).view(
+        k_raw = token_to_kv_pool.get_key_buffer(layer.layer_id)
+        v_raw = token_to_kv_pool.get_value_buffer(layer.layer_id)
+        if k_raw.ndim == 4:
+            if k_raw.shape[1] != self.kernel_page_size:
+                raise ValueError("strided MHA pages must match the kernel page size")
+            return k_raw, v_raw
+        k_cache = k_raw.view(
             -1,
             self.kernel_page_size,
             layer.tp_k_head_num,
             layer.qk_head_dim,
         )
-        v_cache = token_to_kv_pool.get_value_buffer(layer.layer_id).view(
+        v_cache = v_raw.view(
             -1,
             self.kernel_page_size,
             layer.tp_v_head_num,

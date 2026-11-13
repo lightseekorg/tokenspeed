@@ -247,6 +247,23 @@ restart at every physical page, including page sizes 8 and 16 where one scale
 covers the whole page. Paged MXFP8 Q/K and packed-Q plus paged-KV remain
 unsupported; paged K therefore stays BF16/FP16 even when V uses FP8 storage.
 
+### Paged MXFP8 K/V cache
+
+`kv_mxfp8=True` reads the serving MXFP8 cache (FP8 E4M3 K and V, one UE8M0
+scale per token, KV head and 32 head_dim elements, in the layout
+`quantize_store_kv_mxfp8` writes) with a BF16 query. It requires 128-token
+pages, 128-token sequence tiles and `head_dim == 128`. The KV TMA warp loads
+each page's FP8 tile (128 B swizzled rows) and its 512 scale bytes into a raw
+stage, in the BF16 path's K/V order. A fifth, free-running warpgroup
+dequantizes each tile (one fused `cvt.rn.scaled::n2::ue8m0.bf16x2.e4m3x2` per
+pair): K into tensor memory, where GEMM1 reads its A operand, and V into the
+BF16 V stages in shared memory; separate K and V pipelines feed the two MMA
+warps. GEMM1, GEMM2, softmax and the reductions compute exactly what they do
+with a BF16 cache, so the result equals the BF16 kernel's on the dequantized
+cache bit for bit. Rows past a request's length are dequantized as zero: pool
+bytes there may be stale NaNs. The CTA's 64K registers are re-split across the
+five warpgroups (`kv_mxfp8_regs`).
+
 The local paged correctness harness follows the CUTLASS paged Decode example:
 it creates canonical dense K/V for the unchanged reference and scatters pages
 through a deterministic non-identity permutation. Dense V uses an

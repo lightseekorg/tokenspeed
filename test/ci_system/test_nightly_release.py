@@ -151,3 +151,55 @@ def test_tokenspeed_index_preserves_kernel_and_history(tmp_path, variant):
     assert kernel.read_text() == "existing kernel links\n"
     UPDATE(wheelhouse, release, dist.parent, "tokenspeed", variant, replace=True)
     assert index.read_text() == updated
+
+
+@pytest.mark.parametrize(
+    "variant,version,roots",
+    [
+        ("engine-release", "0.1.0", [""]),
+        ("engine-nightly", "0.1.0rc20261112", ["nightly", "nightly/rocm7.2"]),
+    ],
+)
+def test_engine_indexes_preserve_history_and_reject_replacement(
+    tmp_path, variant, version, roots
+):
+    wheelhouse = tmp_path / "wheelhouse"
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    name = f"tokenspeed_engine-{version}-cp312-cp312-manylinux_2_28_x86_64.whl"
+    (dist / name).write_bytes(b"wheel")
+    url = f"https://github.com/lightseekorg/whl/releases/download/tokenspeed-engine-v{version}/{name}"
+    release = {
+        "assets": [
+            {"name": name, "browser_download_url": url, "digest": f"sha256:{'a' * 64}"}
+        ]
+    }
+    for directory in roots:
+        root = wheelhouse / directory
+        (root / "tokenspeed-engine").mkdir(parents=True)
+        (root / "tokenspeed-engine/index.html").write_text("older engine links\n")
+        (root / "index.html").write_text('<a href="existing/">existing</a><br>\n')
+
+    paths = UPDATE(wheelhouse, release, dist, "tokenspeed-engine", variant)
+    snapshot = {path: (wheelhouse / path).read_text() for path in paths}
+    for directory in roots:
+        root = wheelhouse / directory
+        contents = (root / "tokenspeed-engine/index.html").read_text()
+        assert contents.startswith("older engine links\n")
+        assert f'{url}#sha256={"a" * 64}' in contents
+        assert 'href="tokenspeed-engine/"' in (root / "index.html").read_text()
+        assert 'href="existing/"' in (root / "index.html").read_text()
+    if variant == "engine-nightly":
+        assert 'href="rocm7.2/"' in (wheelhouse / "nightly/index.html").read_text()
+        assert not (wheelhouse / "tokenspeed-engine").exists()
+    else:
+        assert not (wheelhouse / "nightly").exists()
+
+    UPDATE(wheelhouse, release, dist, "tokenspeed-engine", variant)
+    assert snapshot == {path: (wheelhouse / path).read_text() for path in paths}
+    release["assets"][0]["digest"] = f"sha256:{'b' * 64}"
+    with pytest.raises(ValueError, match="digest changed"):
+        UPDATE(wheelhouse, release, dist, "tokenspeed-engine", variant)
+    with pytest.raises(ValueError, match="must not be replaced"):
+        UPDATE(wheelhouse, release, dist, "tokenspeed-engine", variant, replace=True)
+    assert snapshot == {path: (wheelhouse / path).read_text() for path in paths}

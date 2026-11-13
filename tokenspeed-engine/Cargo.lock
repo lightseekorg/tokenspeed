@@ -1418,6 +1418,7 @@ dependencies = [
  "crc32fast",
  "mimalloc",
  "pyo3",
+ "rustix",
  "serde_json",
  "thiserror 2.0.21",
  "tokenspeed-client",
@@ -1430,6 +1431,7 @@ dependencies = [
  "tokenspeed-wire",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "ureq",
  "zeromq",
 ]
@@ -1448,8 +1450,10 @@ name = "tokenspeed-host"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "libc",
  "mimalloc",
  "pyo3",
+ "rustix",
  "serde_json",
  "thiserror 2.0.21",
  "tokenspeed-collective",
@@ -1511,6 +1515,7 @@ dependencies = [
  "tokenspeed-mooncake",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "ureq",
  "zeromq",
 ]

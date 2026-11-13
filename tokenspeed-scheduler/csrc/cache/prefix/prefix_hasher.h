@@ -28,6 +28,7 @@
 
 #include <openssl/sha.h>
 
+#include "core/profile_span.h"
 #include "utils.h"
 
 namespace tokenspeed {
@@ -120,6 +121,7 @@ inline std::string HashPrefixPage(std::span<const std::int32_t> tokens, const st
 inline std::vector<std::string> ComputePrefixHashes(
     std::span<const std::span<const std::int32_t>> prefix_pages, const std::string& prior,
     std::span<const std::span<const std::string>> extra_keys_per_page = {}) {
+    ProfileSpan profile_span{"ComputePrefixHashes"};
     std::vector<std::string> hashes;
     hashes.reserve(prefix_pages.size());
     std::string current_prior = prior;
