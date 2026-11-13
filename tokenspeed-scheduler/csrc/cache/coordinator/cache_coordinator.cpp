@@ -1485,7 +1485,9 @@ CacheCoordinator::AcquiredPrefix CacheCoordinator::acquirePrefix(PrefixProbe&& p
 // capacity questions from the pool's own counters.
 std::int32_t CacheCoordinator::NumAvailableLcmBlocks() const {
     std::int32_t available = 0;
-    for (std::int32_t parent_id = 1; parent_id <= pool_.NumLcmBlocks(); ++parent_id) {
+    // Ids 1..NumLcmBlocks, counted so that INT32_MAX ends the loop.
+    for (std::int32_t i = 0; i < pool_.NumLcmBlocks(); ++i) {
+        const std::int32_t parent_id = i + 1;
         const std::optional<std::uint32_t> group_id = pool_.BoundGroup(parent_id);
         if (!group_id || groups_[*group_id].Index().ParentIsFullyEvictable(
                              pool_, parent_id, groups_[*group_id].Allocator().CacheBlocksPerLcmBlock())) {

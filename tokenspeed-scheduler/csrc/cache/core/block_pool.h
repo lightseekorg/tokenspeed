@@ -150,8 +150,9 @@ public:
                 wide_occupancy_words_ = std::max(wide_occupancy_words_, static_cast<std::size_t>(words));
             }
         }
-        for (std::int32_t id = 1; id <= num_lcm_blocks; ++id) {
-            free_parent_ids_.push_back(id);
+        // Ids 1..num_lcm_blocks, counted so that INT32_MAX ends the loop.
+        for (std::int32_t i = 0; i < num_lcm_blocks; ++i) {
+            free_parent_ids_.push_back(i + 1);
         }
     }
 
