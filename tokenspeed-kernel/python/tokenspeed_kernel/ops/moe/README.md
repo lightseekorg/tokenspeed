@@ -81,6 +81,11 @@ cross-vendor bitwise GEMM equivalence. Different FP32 reduction
 associations remain observable near cancellation and must be checked against
 native operator and model references before qualification.
 
+On Ascend, the public module remains importable so model discovery can run,
+but GPU block-scaled implementations are not imported. Planning block-scaled
+MoE routes on NPU raises `NotImplementedError`, including for an explicit
+`torch` solution; the CPU oracle is not an NPU fallback.
+
 Expert selection scores `sigmoid(logit) + bias` with `torch.sigmoid`'s
 `expf` and correctly rounded divide, so near-tied experts rank as in the
 reference. The router projection keeps the FP32 accumulator: `skinny_mm` for
