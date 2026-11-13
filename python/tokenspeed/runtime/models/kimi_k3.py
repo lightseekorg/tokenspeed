@@ -5515,6 +5515,14 @@ class KimiK3ForConditionalGeneration(nn.Module):
             )
         self.language_model.set_dflash_layers_to_capture(layer_ids)
 
+    def stores_capture_taps(self, ctx: ForwardContext) -> bool:
+        """Whether the language model's forward stores the draft's taps itself."""
+        if self.language_model is None:
+            raise AttributeError(
+                "Kimi-K3 encoder-only mode cannot capture target hidden states."
+            )
+        return self.language_model.stores_capture_taps(ctx)
+
     def set_target_context_capture(
         self, layer_ids: list[int], stream: str, hidden_size: int
     ) -> None:

@@ -260,9 +260,13 @@ def _sink_drafter(model, device, max_bs: int, spec_num_tokens: int):
         positions_buf=torch.arange(max_bs * spec_num_tokens, device=device),
     )
     drafter.attn_backend = SimpleNamespace(
-        decode_window_locations=lambda: (
-            torch.arange(max_bs * spec_num_tokens, device=device) + 100
+        draft_write_locations_uniform=lambda out, starts, width: out.copy_(
+            torch.arange(out.numel(), device=device) + 100
         )
+    )
+    drafter.context_starts_buf = torch.zeros(max_bs, dtype=torch.int64, device=device)
+    drafter.context_locs_buf = torch.zeros(
+        max_bs * spec_num_tokens, dtype=torch.int32, device=device
     )
     drafter._fused_kv_enabled = True
     drafter._init_context_taps()
