@@ -288,7 +288,7 @@ still runs last: `carryWholePrompts` then moves its row behind the carried
 prompts', so the completing prefills form a prefix of the batch. The fill
 takes none of the chunk's tokens, but what it admits keeps its pages until
 its transfer is acknowledged, like any completed prompt: in a tight pool the
-chunk's next admission may wait for those acknowledgements, which need
+chunk's next admission may wait for those acknowledgments, which need
 nothing from it (the decode node allocated their destinations before they
 were bootstrapped).
 
@@ -318,7 +318,7 @@ next oldest gets its own allowance. Priority is reevaluated after each
 admission, including within one batch. Failed admissions and resident chunks
 do not count. When chunk yielding is also enabled, carried first admissions,
 those filling the budget a chunk leaves included, count toward the same
-allowance. The fill follows the ranking, and so honours the protected
+allowance. The fill follows the ranking, and so honors the protected
 prompt: a chunk that keeps the head of line fills the budget it leaves from
 the new prompts the ranking still holds (for a resident's chunk, ranked
 after its admission, which publishes what its last chunk completed), in
