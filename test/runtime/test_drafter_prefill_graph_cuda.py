@@ -40,6 +40,7 @@ example::
 
 from __future__ import annotations
 
+import gc
 import os
 import random
 import re
@@ -322,18 +323,29 @@ def test_a_replay_waits_for_a_host_load_into_the_draft_cache() -> None:
 
     def round_after_a_slow_load(tracker):
         drafter.token_to_kv_pool.layerwise_load_tracker = tracker
+        # Earlier tests' graphs are freed here, not mid-round: on ROCm a freed graph can synchronize the device and order the replay after the load.
+        gc.collect()
         torch.cuda.synchronize()
-        # The load: long-running, then it writes the round's pages and
-        # records its last layer's completion.
-        with torch.cuda.stream(load_stream):
-            torch.cuda._sleep(1_000_000_000)
-            backend.cache[pages].fill_(sentinel)
-            if tracker is not None:
-                tracker.event_sets[0].last_layer_done_event.record(load_stream)
-        with torch.inference_mode():
-            _, forwards = _round(
-                drafter, backend, lengths, prefixes, True, _inputs(lengths, generator)
-            )
+        gc.disable()
+        try:
+            # The load: long-running, then it writes the round's pages and
+            # records its last layer's completion.
+            with torch.cuda.stream(load_stream):
+                torch.cuda._sleep(1_000_000_000)
+                backend.cache[pages].fill_(sentinel)
+                if tracker is not None:
+                    tracker.event_sets[0].last_layer_done_event.record(load_stream)
+            with torch.inference_mode():
+                _, forwards = _round(
+                    drafter,
+                    backend,
+                    lengths,
+                    prefixes,
+                    True,
+                    _inputs(lengths, generator),
+                )
+        finally:
+            gc.enable()
         torch.cuda.synchronize()
         assert forwards == 0
         return (backend.cache[pages] == sentinel).all(dim=1)
