@@ -58,10 +58,7 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
-from tokenspeed.runtime.layers.attention.dcp.placement import (
-    resolve_cache_slots,
-    resolve_write_slots,
-)
+from tokenspeed.runtime.layers.attention.dcp.placement import resolve_write_slots
 from tokenspeed.runtime.model_loader.weight_utils import (
     K_CACHE_SCALE_SUFFIXES,
     V_CACHE_SCALE_SUFFIXES,
@@ -416,11 +413,9 @@ class PagedAttention(nn.Module):
     ) -> HeadKVCache | LatentKVCache:
         """The pool's target for ``slots``, local to this rank's shard under KVP."""
         placement = ctx.attn_backend.cache_placement(self)
-        share = getattr(ctx.attn_backend, "sparse_topk", None)
-        if share is None:
-            slots, owned = resolve_cache_slots(slots, placement)
-        else:
-            slots, owned = resolve_write_slots(slots, placement, share)
+        slots, owned = resolve_write_slots(
+            slots, placement, ctx.attn_backend.sparse_topk
+        )
         target = ctx.token_to_kv_pool.kv_write_target(self.layer_id, slots, owned)
         if (
             self.fp8_kv_scales is not None

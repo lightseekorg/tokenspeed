@@ -33,6 +33,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from tokenspeed_kernel.platform import current_platform
 
+from tokenspeed.runtime.layers.attention.backends.base import SparseTopKShare
 from tokenspeed.runtime.layers.linear import ColumnParallelLinear, RowParallelLinear
 
 sys.path.insert(
@@ -1214,6 +1215,7 @@ def test_owned_attention_stores_prepared_rows_once(
         attn_backend=SimpleNamespace(
             padded_write_locations=lambda *args: positions,
             cache_placement=lambda layer: None,
+            sparse_topk=SparseTopKShare(),
             query_dtype=lambda layer, mode, activation: activation,
             forward=attend,
         ),
