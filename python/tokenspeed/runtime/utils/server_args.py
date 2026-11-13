@@ -2041,9 +2041,9 @@ class ServerArgs:
         distribution q, so the drafter must propose one token per step from
         its own logits (the Eagle family and the multi-depth MTP drafter) and
         the verifier must be a backend that runs the draft-prob chain kernel:
-        ``greedy`` verifies by exact match and ``triton`` by a target-sampled
-        exact match, so a dense q never enters either, except that ``triton``
-        runs block verification over the dense q. The one block drafter
+        ``greedy`` verifies by exact match, so a dense q never enters it, and
+        ``triton`` by a target-sampled exact match unless it runs block
+        verification, which reads the dense q. The one block drafter
         served is DFLASH with the DFlash2 candidate selector: its walk samples
         each step from the selector's q over its top-K candidates, which only
         the ``triton`` backend verifies (sparse q); base DFLASH without the

@@ -133,9 +133,10 @@ def block_target_probs(
     ``>= top_p`` and renormalized: FlashInfer's ``top_k_renorm_prob`` then
     ``top_p_renorm_prob``. Greedy rows (``top_k == 1``) are one-hot at the
     lowest-index argmax, the token whose one-hot q a greedy draft records,
-    so their verify stays exactly greedy. The top-k routes hold every finite
-    top_k within ``top_k_pad`` and rank only that many candidates; the other
-    filtering routes sort whole rows. Tensor-only, so it captures in a graph.
+    so their verify stays exactly greedy. On the top-k routes every row's
+    top_k is finite and at most ``top_k_pad``, so only that many candidates are
+    ranked; the other filtering routes sort whole rows. Tensor-only, so it
+    captures in a graph.
 
     Args:
         logits: ``[rows, V]`` target logits, vocabulary mask applied.

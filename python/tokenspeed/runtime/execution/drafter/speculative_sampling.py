@@ -75,7 +75,7 @@ if current_platform().is_nvidia:
 else:
 
     def softmax(logits: torch.Tensor, temperature: torch.Tensor) -> torch.Tensor:
-        """``softmax(logits / temperature)`` in fp32, where FlashInfer is absent."""
+        """``softmax(logits / temperature)`` in fp32, off NVIDIA (no FlashInfer)."""
         return torch.softmax(torch.div(logits.float(), temperature), dim=-1)
 
 
