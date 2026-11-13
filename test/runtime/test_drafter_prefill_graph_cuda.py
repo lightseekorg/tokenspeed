@@ -40,7 +40,6 @@ example::
 
 from __future__ import annotations
 
-import gc
 import os
 import random
 import re
@@ -323,11 +322,14 @@ def test_a_replay_waits_for_a_host_load_into_the_draft_cache() -> None:
 
     def round_after_a_slow_load(tracker):
         drafter.token_to_kv_pool.layerwise_load_tracker = tracker
-        # Earlier tests' graphs are freed here, not mid-round: on ROCm a freed graph can synchronize the device and order the replay after the load.
-        gc.collect()
-        torch.cuda.synchronize()
-        gc.disable()
-        try:
+        ids, sampled, hidden = _inputs(lengths, generator)
+        runner = drafter.draft_model_runner
+        with torch.inference_mode():
+            # The round is staged before the load starts, so only the draft races it: staging's blocking copies can wait for the whole device (seen on MI355).
+            prepare_extend(drafter, backend, lengths, prefixes, final=True, ids=ids)
+            draft_input = extend_input(drafter, lengths, sampled=sampled, hidden=hidden)
+            torch.cuda.synchronize()
+            before = runner.forward_calls
             # The load: long-running, then it writes the round's pages and
             # records its last layer's completion.
             with torch.cuda.stream(load_stream):
@@ -335,19 +337,9 @@ def test_a_replay_waits_for_a_host_load_into_the_draft_cache() -> None:
                 backend.cache[pages].fill_(sentinel)
                 if tracker is not None:
                     tracker.event_sets[0].last_layer_done_event.record(load_stream)
-            with torch.inference_mode():
-                _, forwards = _round(
-                    drafter,
-                    backend,
-                    lengths,
-                    prefixes,
-                    True,
-                    _inputs(lengths, generator),
-                )
-        finally:
-            gc.enable()
+            drafter.draft(draft_input)
         torch.cuda.synchronize()
-        assert forwards == 0
+        assert runner.forward_calls == before
         return (backend.cache[pages] == sentinel).all(dim=1)
 
     tracker = LayerwiseLoadTracker(1)
