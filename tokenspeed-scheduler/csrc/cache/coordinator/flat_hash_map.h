@@ -67,7 +67,14 @@ class FlatHashMap {
     using Traits = FlatHashKey<Key>;
 
 public:
+    // The slot count a table starts with.
+    static constexpr std::size_t kMinimumCapacity = 16;
+
     explicit FlatHashMap(std::pmr::memory_resource* resource) : slots_{resource} {}
+
+    // The slot where the probe for `key` starts in a table of `capacity`
+    // slots, a power of two. Tests use it to pick colliding keys.
+    static std::size_t HomeSlot(const Key& key, std::size_t capacity) noexcept { return hash(key) & (capacity - 1); }
 
     // Makes room for `count` keys without growing.
     void reserve(std::size_t count) {
@@ -129,7 +136,7 @@ public:
         }
         const std::size_t mask = slots_.size() - 1;
         for (std::size_t next = (hole + 1) & mask; !Traits::IsEmpty(slots_[next].key); next = (next + 1) & mask) {
-            const std::size_t home = hash(slots_[next].key) & mask;
+            const std::size_t home = HomeSlot(slots_[next].key, slots_.size());
             // Move an entry only when the hole is on its probe path, also
             // across the end of the table.
             if (((next - home) & mask) >= ((next - hole) & mask)) {
@@ -152,8 +159,6 @@ public:
     bool empty() const noexcept { return size_ == 0; }
 
 private:
-    static constexpr std::size_t kMinimumCapacity = 16;
-
     struct Slot {
         Key key{};
         [[no_unique_address]] Mapped mapped{};
@@ -173,7 +178,7 @@ private:
     // The slot holding `key`, else the empty slot that ends its probe.
     std::size_t position(const Key& key) const {
         const std::size_t mask = slots_.size() - 1;
-        std::size_t at = hash(key) & mask;
+        std::size_t at = HomeSlot(key, slots_.size());
         while (!Traits::IsEmpty(slots_[at].key) && !(slots_[at].key == key)) {
             at = (at + 1) & mask;
         }
@@ -187,7 +192,7 @@ private:
             if (Traits::IsEmpty(slot.key)) {
                 continue;
             }
-            std::size_t at = hash(slot.key) & mask;
+            std::size_t at = HomeSlot(slot.key, capacity);
             while (!Traits::IsEmpty(next[at].key)) {
                 at = (at + 1) & mask;
             }

@@ -179,31 +179,24 @@ TEST(FlatHashSet, TablesGrowingInTurnInOneArenaKeepTheirOwnKeys) {
 }
 
 // Backward-shift erase on a cluster that wraps past the end of the table.
-// The keys are picked by the table's mix (the splitmix64 finalizer) so their
-// homes are the last two slots of a fresh 16-slot table; what is checked holds
-// for any hash.
+// The keys are picked by the table's own home slots, so that they start
+// their probes in the last two slots of a fresh table, whatever the hash;
+// what is checked holds for any placement.
 TEST(FlatHashMap, EraseInTheLastSlotShiftsAClusterWrappedToTheFront) {
-    const auto home = [](CacheBlockLocation location) {
-        std::uint64_t bits = static_cast<std::uint32_t>(location.lcm_block_id) |
-                             static_cast<std::uint64_t>(static_cast<std::uint32_t>(location.slot_index)) << 32U;
-        bits ^= bits >> 30U;
-        bits *= 0xbf58476d1ce4e5b9ULL;
-        bits ^= bits >> 27U;
-        bits *= 0x94d049bb133111ebULL;
-        bits ^= bits >> 31U;
-        return bits & 15U;
-    };
-    std::vector<CacheBlockLocation> home_14;
-    std::vector<CacheBlockLocation> home_15;
-    for (std::int32_t id = 1; home_14.size() < 2 || home_15.size() < 2; ++id) {
+    using Map = FlatHashMap<CacheBlockLocation, std::int32_t>;
+    constexpr std::size_t kSlots = Map::kMinimumCapacity;
+    std::vector<CacheBlockLocation> home_second_last;
+    std::vector<CacheBlockLocation> home_last;
+    for (std::int32_t id = 1; home_second_last.size() < 2 || home_last.size() < 2; ++id) {
         const CacheBlockLocation location{.lcm_block_id = id, .slot_index = 0};
-        if (home(location) == 14 && home_14.size() < 2) home_14.push_back(location);
-        if (home(location) == 15 && home_15.size() < 2) home_15.push_back(location);
+        const std::size_t home = Map::HomeSlot(location, kSlots);
+        if (home == kSlots - 2 && home_second_last.size() < 2) home_second_last.push_back(location);
+        if (home == kSlots - 1 && home_last.size() < 2) home_last.push_back(location);
     }
     std::pmr::monotonic_buffer_resource arena;
-    FlatHashMap<CacheBlockLocation, std::int32_t> values{&arena};
-    // Slots 14 and 15, then 0 and 1 past the end of the table.
-    const std::array<CacheBlockLocation, 4> keys{home_14[0], home_15[0], home_14[1], home_15[1]};
+    Map values{&arena};
+    // The last two slots, then the first two past the end of the table.
+    const std::array<CacheBlockLocation, 4> keys{home_second_last[0], home_last[0], home_second_last[1], home_last[1]};
     for (std::int32_t i = 0; i < 4; ++i) {
         EXPECT_TRUE(values.TryEmplace(keys[i], i).second);
     }
