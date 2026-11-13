@@ -2,6 +2,95 @@
 
 Per-op notes for `ops/moe/`.
 
+## Original block-scaled expert rows
+
+`block_scaled_moe_routes` consumes original NVFP4 or MXFP8 weights and returns
+BF16 `[tokens, top_k, hidden]` rows, gamma already applied inside each expert.
+`block_scaled_moe_routes_plan` fixes the implementation for a layer's formats
+and widths, and loaders pass every expert weight and scale tensor they load
+through `block_scaled_moe_routes_process_tensor`, which rewrites it in place
+into the layout that implementation reads (a no-op for the Triton solutions).
+With `zero_remote_routes`, remote expert rows contain zero; without it they are
+left unwritten. With `fold_slots` the op returns BF16 `[tokens, 1, hidden]`
+instead: each token's local route rows summed in FP32 slot order from +0.0 and
+rounded once, remote routes adding nothing. Inkling2 folds this way and the EP
+all-reduce then adds the ranks' BF16 sums, an all-reduce of `[tokens, hidden]`
+rather than of every route row.
+
+NVFP4 quantizes each input row with outer denominator 1536. Each 16-value
+group chooses between FP8 E4M3 scales targeting E2M1 maxima of six and four,
+using a fixed FP32 pairwise MAE sum; ties retain six. FP4 ties round to even.
+Decoded BF16 tiles make NVFP4 products exact; they accumulate in FP32, then
+`(input_amax * weight_amax) * reciprocal_rn(1536 * stored_denominator)`
+applies before the BF16 output store. The loader owns the stored denominator;
+it is not an activation calibration scale or a hardcoded kernel constant. On
+Blackwell (`triton_scaled_dot_block_scaled_moe_routes`, SM100–SM103)
+`tl.dot_scaled` consumes the payloads and scales directly, so only the
+accumulation order inside a tile differs. Every tile shape sums an element's
+K blocks alike, so a token's rows do not depend on the batch.
+
+`flashinfer_trtllm_block_scaled_moe_routes` (SM103, widths in whole
+256-column K tiles) runs both projections on TRT-LLM-gen batched GEMMs, the
+MMA kind and K order of the scaled dot, and matches its rows bit for bit. The
+routing quantizer's rows are laid out per expert in GEMM token tiles
+(`_tile_routes`, which also writes the GEMM's dynamic-batch metadata and each
+row's FP32 output scale), the SwiGLU quantizer reads and writes those rows
+through a route-to-row map, and `_gather_route_rows` restores route rows, or
+with `fold_slots` the fold reads the tiled rows through the same map. The
+token tile is the mean routes per expert rounded up to a power of two, so the
+global expert count is an argument; configs that split K are never chosen.
+Tile and scale layout are runtime kernel arguments: a new batch size compiles
+nothing. The TRT-LLM-gen GEMMs read their tile metadata and stream their
+weights before their PDL wait; they wait before reading the activation rows.
+So under PDL the decode-sized routing quantizer quantizes its token's chunk
+before it waits, stores the tile metadata first and then releases the first
+GEMM, which streams weights while the rows are stored; the SwiGLU quantizer
+releases the second GEMM right after its wait, the metadata being older. The
+early quantization reads `x` before the top-k finishes, which holds for the
+router's input: the router waits before it releases its successors.
+
+MXFP8 quantizes input groups of 32 with UE8M0 ceiling scales. Code zero means
+`2^-127`, and 255 denotes NaN. Checkpoint scales are already rowwise and must
+not be expanded again from a conceptual block descriptor. Normal-range
+FP8 times power-of-two values decode exactly into BF16 tiles; extreme
+subnormal/overflow cases require separate native scaled-dot validation.
+
+The first projection stores interleaved BF16 gate/up rows. Capped SwiGLU
+loads them in FP32, computes sigmoid on the original gate, applies separate
+tanh caps, multiplies gamma last and rounds to BF16. On NVIDIA the sigmoid
+and tanh are the checkpoint reference kernels' PTX approximations,
+`rcp.approx.ftz(1 + ex2.approx.ftz(-log2(e) * gate))` and `tanh.approx.f32`;
+the torch oracle evaluates them exactly. The second projection's
+quantizer reads that BF16 value, for local routes only. Neither
+dropping these BF16 roundings nor moving gamma to the epilogue preserves this
+contract. Prefill- and decode-sized launches split this quantizer differently;
+NVFP4 row maxima do not depend on grouping, so both give the same bits.
+
+Under PDL, `block_scaled_topk` and the routing quantizer trigger their
+dependents before their own wait: their successors read only constant
+operands before waiting. The second expert projection maps its routes and
+prefetches its weight rows before its wait, and the SwiGLU quantizer before
+it loads its routes' expert ids before its own; both are older than the
+first expert projection, which waits first. The one-launch quantizer waits
+first too; the two launches of the decode-sized NVFP4 quantizer trigger
+first, so the second projection prefetches across both.
+
+The explicit `torch` solution supplies a CPU numerical oracle. The portable
+`triton` solution reuses the common route grouping; it does not assert
+cross-vendor bitwise GEMM equivalence. Different FP32 reduction
+associations remain observable near cancellation and must be checked against
+native operator and model references before qualification.
+
+On Ascend, the public module remains importable so model discovery can run,
+but GPU block-scaled implementations are not imported. Planning block-scaled
+MoE routes on NPU raises `NotImplementedError`, including for an explicit
+`torch` solution; the CPU oracle is not an NPU fallback.
+
+Expert selection scores `sigmoid(logit) + bias` with `torch.sigmoid`'s
+`expf` and correctly rounded divide, so near-tied experts rank as in the
+reference. The router projection keeps the FP32 accumulator: `skinny_mm` for
+decode-size rows on NVIDIA, the GEMM facade's FP32 output otherwise.
+
 ## Deferred route outputs
 
 `bf16_moe_routes` returns individual, unweighted expert outputs. Deferred MXFP4
@@ -38,8 +127,14 @@ tensor ops, graph-capturable. Every id must be a real expert in
 `[0, num_logical)`; the runtime masks zero experts and padded slots around
 the call and counts the mapped ids into its load counters afterwards.
 
-Follow-up: a fused Triton kernel for the same contract (one launch instead of
-four tensor ops per MoE layer per forward). Its arguments must follow the
+`block_scaled_topk` takes the layer's `ExpertDispatch` and makes the same
+choice inside its own launch: the tables are constant within a forward, so it
+reads each expert's first replica and replica count before its PDL wait and
+loads only a later replica after selection. The table width stays a runtime
+argument.
+
+Follow-up: the same fusion for the other routers (one launch instead of four
+tensor ops per MoE layer per forward). Their arguments must follow the
 compile-time parameter rule: token count, top-k, and table width are runtime
 arguments or bucketed, never `constexpr`.
 
@@ -252,6 +347,24 @@ GEMMs. On the measured BS1 MTP3 graph, FlashInfer 0.7's isolated-kernel tuner
 selected tile 8, leaving an idle interval before routing. This policy keeps
 tile 32 available for that shape while retaining upstream routing and GEMM
 implementations.
+
+### Kimi-K3 decode tactic
+
+The MXFP4 precomputed top-k path launches through the same private entry
+point, so its tuning gets the private runner's policies. For Kimi-K3's TP8
+experts (896 experts of 3,584 hidden and 384 intermediate, top-k 16), the
+runner restricts the 256- and 512-token buckets (129 to 512 decode rows) to
+tile 32. FlashInfer tunes on balanced routes, about 9 tokens per expert at
+512 rows, where tiles 8 and 16 win. In decode a few experts take 40% to 50% of
+the rows, and tiles of 8 or 16 tokens re-read their weights for every tile. Over
+16 serving routings per size on GB300, tile 32 takes 171.5 us at 256 rows
+(tile 8: 218.5 us) and 222.9 us at 512 rows (tile 16: 249.8 us); outputs are
+bitwise identical across tiles. Prefill chunks in these buckets see the same
+skew: rows drawn independently from serving routings put up to 120 of 256 rows
+on a single expert, and tile 32 takes 157.4 us at 256 rows (tile 16: 164.7 us, tile
+8: 205.0 us) and 209.0 us at 512 rows (tile 16: 235.9 us). The 128-token bucket
+measured no faster with tile 32 in serving, and tile 64 leads from 768 rows, so
+other buckets keep the full tuner.
 
 ### NVFP4 squared ReLU
 
@@ -468,6 +581,34 @@ normalized FP32 weights (scale 1) and INT32 IDs into caller-owned buffers.
 The routing-only kernel has no expert-plan workspace or 8,192-token limit.
 Other contracts retain their existing routers.
 
+## Kimi-K3 front projections
+
+`try_latent_moe_input_projections` runs a registered fused implementation or
+returns `None` before any projection. This lets the runtime retain the
+separate projections and their stream scheduling for unsupported inputs.
+`latent_moe_input_projections` keeps its portable composition when no fused
+implementation is available. The generic packed Triton kernel
+(`triton_latent_input_packed`) is registered on AMD only: on NVIDIA the
+separate vendor GEMM projections are faster, so below the fused front's row
+bound no fused kernel matches and the runtime keeps the separate path.
+
+`cuda_latent_input` is the vendored FlashInfer/Cake fused front
+(`thirdparty/cuda/kimi3_latent_front.py` and `csrc/kimi3_latent_front/`): one
+persistent launch produces the FP32 router logits, the BF16 latent input and
+the BF16 SiTU-activated shared-expert input. It is registered on SM100 and
+SM103 parts with 148 or 152 SMs (the counts the plan rules are validated for)
+for 2048 BF16 rows or more (no upper bound: the plan scales with the row
+count), Kimi-K3's replicated router/latent weights, full shared-expert weights,
+and SiTU clamps 4 and 25. Attention-DP uses it only
+without shared-expert TP; EP routing/quantization and the shared down projection
+keep their existing owners. Smaller shapes and shared-expert TP retain their
+existing paths.
+
+The programs are JIT-built through FlashInfer's toolchain like the Kimi-K3
+router and do not depend on the FlashInfer package shipping its experimental
+kernel sources (release wheels omit them). Prepare/warm up before graph capture;
+no persistent activation tensors are cached per layer by this adapter.
+
 ## NVFP4 MegaMoE for Qwen3.5
 
 The `mega_moe` NVFP4 adapter supports gated SiLU (`silu(gate) * up`) and
@@ -574,7 +715,9 @@ symmetric memory instead of NCCL collectives:
 1. One GEMM computes this rank's 112 router logits and 448 latent-down rows
    and multicasts both to every rank.
 2. One kernel takes the top-16 experts (sigmoid plus correction bias,
-   renormalized, scaled) and gathers the full latent row.
+   renormalized, scaled) and gathers the full latent row. It reads the logits
+   from their mailbox as they land, without waiting for the GEMM to complete,
+   and every thread of a row's CTA ranks the candidates, at every row count.
 3. Persistent MXFP4 experts compute this rank's intermediate slice of the
    chosen experts and combine them into a weighted latent partial.
 4. One tail kernel all-reduces the partials, applies the latent RMSNorm, runs

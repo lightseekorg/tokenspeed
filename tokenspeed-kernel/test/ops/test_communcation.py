@@ -34,9 +34,11 @@ from tokenspeed_kernel.ops.communication.iris import (
     iris_lamport_residual_rmsnorm_supported,
 )
 from tokenspeed_kernel.ops.communication.triton import (
+    MulticastRows,
     all_gather,
     create_state,
     reduce_scatter,
+    row_reduce_scatter,
 )
 from tokenspeed_kernel.platform import current_platform
 
@@ -127,6 +129,9 @@ def worker_main(rank: int, world_size: int, port: int, hidden_size: int) -> None
         if current_platform().is_amd:
             check_all_reduce(rank, world_size, device)
             check_allreduce_residual_rmsnorm(rank, world_size, device)
+        else:
+            check_row_reduce_scatter(rank, world_size, device)
+            check_multicast_rows(rank, world_size, device)
     finally:
         dist.destroy_process_group()
 
@@ -154,6 +159,72 @@ def check_all_gather(
 
     assert result.shape == expected.shape
     torch.testing.assert_close(result, expected, atol=0, rtol=0)
+
+
+def check_row_reduce_scatter(rank: int, world_size: int, device) -> None:
+    # A state of its own: the op's barrier uses channel 0 of the buffer's signal pad.
+    tokens, hidden = 37, 4608
+    state = create_state(
+        group=dist.group.WORLD,
+        rank_in_group=rank,
+        max_tokens=64,
+        hidden_size=hidden,
+        device=None,
+    )
+    generator = torch.Generator(device=device).manual_seed(rank)
+    for _ in range(2):
+        partial = (
+            torch.randn((tokens, hidden), generator=generator, device=device) * 3
+        ).bfloat16()
+        # -0.0 partials sum to +0.0 from the +0.0 start.
+        partial[5] = -0.0
+        state.comm_buff[:tokens].copy_(partial)
+        partials = [torch.empty_like(partial) for _ in range(world_size)]
+        dist.all_gather(partials, partial)
+        expected = torch.zeros((tokens, hidden), device=device)
+        for peer in partials:
+            expected += peer.float()
+        rows = torch.tensor([30, 0, 5, 7, 36, 12, 13], device=device).int()
+        out = torch.full(
+            (tokens, hidden), float("nan"), device=device, dtype=torch.bfloat16
+        )
+        row_reduce_scatter(state, rows, out)
+        torch.cuda.synchronize()
+        # Every rank has read the buffers before any rank rewrites its own.
+        dist.barrier()
+        listed = rows.long()
+        assert torch.equal(out[listed], expected.bfloat16()[listed])
+        assert not torch.signbit(out[5]).any()
+        others = torch.ones(tokens, dtype=torch.bool, device=device)
+        others[listed] = False
+        assert out[others].isnan().all()
+    # Ranks with no rows still join the barrier.
+    rows = torch.tensor([3], device=device).int()[: rank % 2]
+    out = torch.full(
+        (tokens, hidden), float("nan"), device=device, dtype=torch.bfloat16
+    )
+    row_reduce_scatter(state, rows, out)
+    torch.cuda.synchronize()
+    assert out[3].isnan().all() == (rank % 2 == 0)
+
+
+def check_multicast_rows(rank: int, world_size: int, device) -> None:
+    rows = MulticastRows(dist.group.WORLD, 3 * 40 * 64, device)
+    for queries, tokens in ((3, 40), (1, 13)):
+        shape = (queries, tokens, 64)
+        share = -(-tokens // world_size)
+        first = min(rank * share, tokens)
+        mine = torch.full(
+            (queries, min(share, tokens - first), 64), rank + 1.0, device=device
+        )
+        rows.multicast(shape)[:, first : first + mine.shape[1]] = mine.bfloat16()
+        rows.barrier()
+        expected = torch.empty(shape, device=device)
+        for peer in range(world_size):
+            expected[:, peer * share : (peer + 1) * share] = peer + 1
+        assert torch.equal(rows.local(shape), expected.bfloat16())
+        # Every rank has read its copy before any rank stores the next rows.
+        rows.barrier()
 
 
 def check_all_reduce(rank: int, world_size: int, device) -> None:

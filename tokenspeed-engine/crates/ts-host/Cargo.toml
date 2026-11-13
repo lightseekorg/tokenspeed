@@ -14,6 +14,7 @@ path = "src/main.rs"
 
 [dependencies]
 bytes.workspace = true
+libc = "0.2"
 mimalloc = { version = "0.1", default-features = false }
 pyo3 = "0.30"
 serde_json = "1"
@@ -32,6 +33,9 @@ ts-pd = { package = "tokenspeed-pd", version = "0.1.0", path = "../ts-pd" }
 ts-scheduler = { package = "tokenspeed-scheduler", version = "0.1.0", path = "../ts-scheduler" }
 ts-wire = { package = "tokenspeed-wire", version = "0.1.0", path = "../ts-wire" }
 zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "tcp-transport"] }
+
+[dev-dependencies]
+rustix = { version = "1", features = ["time"] }
 
 [lints]
 workspace = true

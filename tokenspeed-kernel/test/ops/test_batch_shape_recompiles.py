@@ -936,6 +936,10 @@ def test_rel_mha_decode_table_width_and_split_count():
                 max_seqlen_q=1,
                 softmax_scale=1.0 / HEAD_DIM,
                 solution="triton",
+                output_dtype=None,
+                return_lse=False,
+                gate=None,
+                sink=None,
             )
             for heads in (NUM_Q_HEADS, NUM_KV_HEADS)
         ]
@@ -982,6 +986,7 @@ def test_rel_mha_extend_table_width():
             rel_logits=rel_logits,
             softmax_scale=1.0 / HEAD_DIM,
             solution="triton",
+            output_dtype=None,
         )
 
     expected = run(table.shape[1])

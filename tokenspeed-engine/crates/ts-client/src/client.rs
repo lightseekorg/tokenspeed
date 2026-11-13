@@ -89,6 +89,72 @@ pub struct OutputChunk {
     pub output_top_logprobs: Option<TopLogprobs>,
 }
 
+impl OutputChunk {
+    /// Consume a wire batch into `(request_id, chunk)` rows, after validating
+    /// its columns. Each yielded chunk takes its request's buffers without
+    /// copying them; dropping the iterator releases all unconsumed rows.
+    pub fn from_batch(
+        mut batch: BatchTokenIDOutSlim,
+    ) -> std::result::Result<impl Iterator<Item = (String, Self)>, ts_wire::Error> {
+        // Keep the borrowed view's validation and compatibility rules as
+        // the single definition of a well-formed output batch.
+        drop(batch.requests()?);
+        // New columns must also update From<&RequestOutput> and extend
+        // consuming_output_rows_preserves_columns_and_transfers_prompt_buffers.
+        let rids = batch.rids.take().expect("validated request ids");
+        fn take<T: Default>(column: &mut [T], i: usize) -> T {
+            column.get_mut(i).map(std::mem::take).unwrap_or_default()
+        }
+        fn pair<A, B>(
+            values: &mut [Vec<A>],
+            ids: &mut [Vec<B>],
+            i: usize,
+        ) -> Option<(Vec<A>, Vec<B>)> {
+            let (values, ids) = (values.get_mut(i)?, ids.get_mut(i)?);
+            if values.is_empty() {
+                None
+            } else {
+                Some((std::mem::take(values), std::mem::take(ids)))
+            }
+        }
+        Ok(rids.into_iter().enumerate().map(move |(i, rid)| {
+            let reason = take(&mut batch.finished_reasons, i);
+            let chunk = Self {
+                output_ids: take(&mut batch.output_ids, i),
+                finish_reason: (!reason.is_empty()).then_some(reason),
+                prompt_tokens: batch.prompt_tokens[i],
+                completion_tokens: batch.completion_tokens[i],
+                cached_tokens: batch.cached_tokens[i],
+                reasoning_tokens: batch.reasoning_tokens.get(i).copied().unwrap_or(0),
+                output_token_logprobs: take(&mut batch.output_token_logprobs_val, i),
+                output_token_cumulative_probs: take(
+                    &mut batch.output_token_cumulative_probs_val,
+                    i,
+                ),
+                finish_details: take(&mut batch.finish_reason_details, i),
+                spec_verify_ct: batch.spec_verify_ct.get(i).copied(),
+                accept_draft_tokens: batch.accept_draft_tokens.get(i).copied().flatten(),
+                input_token_logprobs: pair(
+                    &mut batch.input_token_logprobs_val,
+                    &mut batch.input_token_logprobs_idx,
+                    i,
+                ),
+                input_top_logprobs: pair(
+                    &mut batch.input_top_logprobs_val,
+                    &mut batch.input_top_logprobs_idx,
+                    i,
+                ),
+                output_top_logprobs: pair(
+                    &mut batch.output_top_logprobs_val,
+                    &mut batch.output_top_logprobs_idx,
+                    i,
+                ),
+            };
+            (rid, chunk)
+        }))
+    }
+}
+
 impl From<&RequestOutput<'_>> for OutputChunk {
     fn from(row: &RequestOutput<'_>) -> Self {
         fn owned<A: Clone, B: Clone>(pair: Option<(&[A], &[B])>) -> Option<(Vec<A>, Vec<B>)> {
@@ -272,7 +338,7 @@ impl Shared {
         Some(pending.engine)
     }
 
-    fn dispatch(&self, batch: &BatchTokenIDOutSlim) {
+    fn dispatch(&self, batch: BatchTokenIDOutSlim) {
         let slot = batch
             .engine_index
             .checked_sub(i64::from(self.first_engine_index))
@@ -295,30 +361,38 @@ impl Shared {
             ),
         }
 
-        let rows = match batch.requests() {
+        let mut rows = match OutputChunk::from_batch(batch) {
             Ok(rows) => rows,
             Err(error) => {
                 warn!(%error, "dropping a malformed output batch");
                 return;
             }
         };
+        // Keep discarded and unconsumed rows outside the map guard's
+        // lifetime, including on unwind. Cancelled rows can own large arrays.
+        let mut discarded = Vec::new();
         let mut requests = lock(&self.requests);
-        for row in rows {
-            let Some(pending) = requests.get(row.rid) else {
+        for (rid, chunk) in rows.by_ref() {
+            let Some(pending) = requests.get(&rid) else {
                 // Cancelled while its output was in flight.
-                debug!(rid = row.rid, "output for a request that is not in flight");
+                debug!(rid, "output for a request that is not in flight");
+                discarded.push(Ok(chunk));
                 continue;
             };
             // A closed receiver means the stream is being dropped; its drop
             // forgets the request.
-            let _ = pending.tx.send(Ok(OutputChunk::from(&row)));
-            if row.finish_reason.is_some() {
-                let pending = requests.remove(row.rid).expect("present above");
+            let finished = chunk.finish_reason.is_some();
+            if let Err(error) = pending.tx.send(Ok(chunk)) {
+                discarded.push(error.0);
+            }
+            if finished {
+                let pending = requests.remove(&rid).expect("present above");
                 self.engines[pending.engine]
                     .in_flight
                     .fetch_sub(1, Ordering::Relaxed);
             }
         }
+        drop(requests);
     }
 
     fn dispatch_control(&self, output: ControlOutput) {
@@ -482,6 +556,7 @@ impl EngineClient {
         }
         self.shared.require(REQUEST_ADD)?;
         let engine = self.shared.route(&request)?;
+        debug!(rid, engine, routing = ?self.shared.routing, bootstrap_room = request.bootstrap_room, "generate request routed");
         let (tx, rx) = mpsc::unbounded_channel();
         {
             // Register before sending: outputs can arrive before `send`
@@ -642,7 +717,7 @@ async fn receive_outputs(shared: Arc<Shared>, mut output: PullSocket) {
             }
         };
         match EngineOutput::from_frames(&message.into_vec()) {
-            Ok(EngineOutput::Batch(batch)) => shared.dispatch(&batch),
+            Ok(EngineOutput::Batch(batch)) => shared.dispatch(*batch),
             Ok(EngineOutput::Control(output)) => shared.dispatch_control(*output),
             // This client sends no control calls.
             Ok(EngineOutput::ControlReply(reply)) => {

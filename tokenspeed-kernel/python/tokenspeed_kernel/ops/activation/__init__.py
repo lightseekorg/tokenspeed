@@ -43,7 +43,18 @@ def silu_and_mul(
     Positive ``limit`` values use the portable Triton implementation because
     the CUDA implementation does not expose the checkpoint's clamp semantics.
 
+    An empty ``x`` returns an empty output without reaching a leaf: SwiGLU is
+    elementwise, but a zero-row launch is a zero grid dimension, which CUDA
+    rejects ("invalid configuration argument"). Rows legitimately reach zero on
+    an idle attention-DP rank or a block drafter's idle forward, which still
+    runs its layers so its collectives stay aligned with its peers.
     """
+    if x.numel() == 0:
+        if out is not None:
+            return out
+        return torch.empty(
+            (*x.shape[:-1], x.shape[-1] // 2), dtype=x.dtype, device=x.device
+        )
     if current_platform().is_npu and limit is None:
         from tokenspeed_kernel.ops.activation.ascend import silu_and_mul as npu_swiglu
 

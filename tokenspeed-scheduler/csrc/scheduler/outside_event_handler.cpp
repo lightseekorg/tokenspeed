@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <array>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -30,6 +31,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include "core/profile_span.h"
 #include "fsm/forward_events.h"
 #include "fsm/forward_states.h"
 #include "fsm/pd_events.h"
@@ -126,6 +128,7 @@ void Scheduler::handleEvent(const forward::Finish& event) {
 }
 
 void Scheduler::settleFinishedRequests() {
+    ProfileSpan profile_span{"Scheduler::settleFinishedRequests"};
     for (const std::unique_ptr<Request>& request : requests_) {
         const auto* transferring = request->GetIf<fsm::PdTransferring>();
         if (transferring != nullptr && transferring->transfer_stopped && request->ResultsInFlight() == 0) {
@@ -143,6 +146,7 @@ void Scheduler::settleFinishedRequests() {
 }
 
 std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& request) {
+    ProfileSpan profile_span{"Scheduler::publishCompletedPages"};
     fsm::CacheProgress progress = request.CacheProgress();
     // The frontier is final: every forward has landed, so the State slot the
     // last kept token's forward wrote holds the state after it (slot 1, or
@@ -155,7 +159,7 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
         finishCheckpointIsDead(request, progress) ? PublicationPoint::kChunk : PublicationPoint::kFinal,
         /*allow_state_checkpoint=*/coordinator_.CheckpointGranularity() == 1 ||
             (config_.role != Role::kD && num_computed_tokens <= request.PrefillSize()),
-        /*preserve_source_blocks=*/false);
+        /*preserve_source_blocks=*/false, /*publish_to_cache=*/config_.PublishesCompletedPages());
     std::vector<std::string> store_hashes = progress.prefix_hashes;
     if (completed.completed_pages) {
         registerKvEventPublication(request, progress.prefix_hashes, *completed.completed_pages);
@@ -384,6 +388,12 @@ void Scheduler::handleEvent(const forward::UpdateReserveNumTokens& event) {
 
 void Scheduler::handleEvent(const forward::ExtendResult& event) {
     if (Request* request = findRequest(event.request_id)) {
+        // Only a prefill chunk's result is a span: a decode batch would add
+        // one per row.
+        std::optional<ProfileSpan> profile_span;
+        if (!request->Is<fsm::Decoding>()) {
+            profile_span.emplace("Scheduler::handlePrefillResult");
+        }
         request->NoteResultLanded();
         request->Apply(fsm::ExtendResultEvent{event.tokens});
         if (!event.spec_candidate_ids.empty()) {

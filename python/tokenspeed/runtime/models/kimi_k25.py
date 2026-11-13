@@ -33,6 +33,7 @@ import torch
 
 from tokenspeed.runtime.configs.kimi_k25_config import KimiK25Config
 from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.deepseek_v3 import DeepseekV3ForCausalLM
@@ -265,6 +266,14 @@ class KimiK25ForConditionalGeneration(torch.nn.Module):
             )
 
         self.language_model.set_dflash_layers_to_capture(layer_ids)
+
+    def stores_capture_taps(self, ctx: ForwardContext) -> bool:
+        """Whether the language model's forward stores the draft's taps itself."""
+        if self.language_model is None:
+            raise AttributeError(
+                "Kimi-K2.5 encoder-only mode cannot capture target hidden states."
+            )
+        return self.language_model.stores_capture_taps(ctx)
 
     def get_input_embeddings(self):
         if hasattr(self.language_model, "get_input_embeddings"):

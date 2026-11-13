@@ -40,6 +40,8 @@ from tokenspeed.runtime.execution.slot_state import (
 )
 
 if TYPE_CHECKING:
+    from transformers import PretrainedConfig
+
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
     from tokenspeed.runtime.layers.sampled_vocab_shard import SampledVocabShard
     from tokenspeed.runtime.sampling.dp_sampling_config import DpSamplingRuntimeConfig
@@ -87,6 +89,9 @@ class SamplingBackendConfig:
     # ServerArgs.logprob_order). Behaviour-selecting, so no default either.
     logprob_order: str
 
+    # Only ascend_full applies the optional top-p candidate truncation.
+    npu_sampling_top_p_top_k_cap: bool = False
+
     enable_nan_detection: bool = False
 
     # Optional logprob features — OFF by default. These are checked at server
@@ -106,6 +111,8 @@ class SamplingBackendConfig:
     # rejection sampling). Required to keep RNG out of the CUDA graph.
     max_bs: int = 1
     max_draft_tokens_per_req: int = 1
+    # Sizing like max_bs: with draft trees (``ServerArgs.speculative_draft_tree``) a backend allocates and warms its tree verify; the ``tree`` argument of ``verify`` picks the rule.
+    draft_tree: bool = False
 
     # Sizing for backend-owned per-request state (e.g. token-count buffers
     # for penalties in FlashInferFullSamplingBackend). Indexed by req_pool_idx, not
@@ -125,6 +132,7 @@ class SamplingBackendConfig:
         cls,
         server_args: ServerArgs,
         *,
+        hf_config: PretrainedConfig,
         max_bs: int,
         max_draft_tokens_per_req: int,
         device: str,
@@ -133,11 +141,17 @@ class SamplingBackendConfig:
         vocab_size: int = 0,
         tp_group: tuple[int, ...] | None = None,
     ) -> SamplingBackendConfig:
+        npu_sampling_top_p_top_k_cap = getattr(
+            hf_config, "npu_sampling_top_p_top_k_cap", False
+        )
+        if not isinstance(npu_sampling_top_p_top_k_cap, bool):
+            raise ValueError("HF config npu_sampling_top_p_top_k_cap must be a boolean")
 
         return cls(
             synthetic_acceptance_length=server_args.synthetic_acceptance_length,
             sampling_stream=server_args.sampling_stream,
             logprob_order=server_args.logprob_order,
+            npu_sampling_top_p_top_k_cap=npu_sampling_top_p_top_k_cap,
             enable_nan_detection=server_args.enable_nan_detection,
             enable_output_logprobs=server_args.enable_output_logprobs,
             enable_output_cumulative_probs=server_args.enable_output_cumulative_probs,
@@ -151,6 +165,7 @@ class SamplingBackendConfig:
             ),
             max_bs=max_bs,
             max_draft_tokens_per_req=max(max_draft_tokens_per_req, 1),
+            draft_tree=server_args.speculative_draft_tree,
             max_req_pool_size=max_req_pool_size,
             vocab_size=vocab_size,
             device=device,
@@ -775,10 +790,29 @@ class SamplingBackend(ABC):
         output_tokens: torch.Tensor,
         output_lengths: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """If the backend wrote both outputs into a single contiguous GPU
-        buffer, return CPU views obtained from one D2H copy. Otherwise
-        return None and let the caller fall back to two separate D2Hs."""
-        return None
+        """One D2H of the packed predict+accept_length region.
+
+        Applies when both outputs alias into ``_output_pack_buf``, where
+        ``verify()`` lands them (and a backend's ``sample()`` may). Otherwise
+        returns None and the caller falls back to two D2Hs.
+        """
+        if (
+            output_tokens.data_ptr() != self._output_pack_buf.data_ptr()
+            or output_lengths.data_ptr() != self._accept_length_buf.data_ptr()
+        ):
+            return None
+        n_t = output_tokens.numel()
+        n_l = output_lengths.numel()
+        # Copy the whole [0, predict_max + n_l). The gap [n_t, predict_max)
+        # is stale padding (max_bs * max_n  vs.  bs * n) — small enough that
+        # the saved launch beats the wasted bandwidth.
+        size = self._predict_max + n_l
+        cpu_pack = torch.empty(size, dtype=torch.int32, pin_memory=True)
+        cpu_pack.copy_(self._output_pack_buf[:size], non_blocking=True)
+        return (
+            cpu_pack[:n_t].view(output_tokens.shape),
+            cpu_pack[self._predict_max : self._predict_max + n_l],
+        )
 
     # Backends whose verify() takes draft trees (tree=TreeVerifyBatch).
     supports_tree_verify: bool = False

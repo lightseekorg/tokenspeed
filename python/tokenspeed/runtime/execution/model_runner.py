@@ -459,6 +459,11 @@ class ModelRunner:
         """Receive trainer-broadcast weights over the NCCL group and load them."""
         import torch.distributed as dist
 
+        if self.mapping.moe_weight_sharing_size is not None:
+            return (
+                False,
+                "Peer expert weights are immutable; restart to change the checkpoint",
+            )
         pg = self._weight_update_pg
         if pg is None:
             return False, "weight update group not initialized"
@@ -512,10 +517,9 @@ class ModelRunner:
         """Read one committed weight-store version into ``models`` in place.
 
         Runs on the forward thread. The SDK streams partial ``load_weights``
-        calls, so the models are bracketed in a weight-update session; the
-        SDK's device staging buffers are released afterwards -- also when the
-        read failed partway -- because PyTorch would otherwise keep the blocks
-        cached against the KV arena.
+        calls, so the models are bracketed in a weight-update session. Wait for
+        the runner's accelerator to complete the update before acknowledging it
+        and clear its allocator cache on both success and failure.
 
         Args:
             version: The committed version to load.
@@ -528,11 +532,17 @@ class ModelRunner:
         Returns:
             ``(ok, message)`` for the control plane.
         """
+        if self.mapping.moe_weight_sharing_size is not None:
+            return (
+                False,
+                "Peer expert weights are immutable; restart to change the checkpoint",
+            )
         if self.model_update is None:
             return False, (
                 "update_weights_from_mooncake requires the server to start with "
                 "--model-update-config (target runner only)"
             )
+        device_module = torch.get_device_module(self.device)
         try:
             with weight_update_session(
                 models,
@@ -542,13 +552,13 @@ class ModelRunner:
                 ),
             ):
                 result = self.model_update.update(models, version, snapshot=snapshot)
-            torch.cuda.synchronize(torch.device(f"cuda:{self.gpu_id}"))
+            device_module.synchronize(self.gpu_id)
             return True, f"applied model version {version}: {result}"
         except Exception as e:  # noqa: BLE001 - surface to the control plane
             logger.exception("update_weights_from_mooncake failed")
             return False, str(e)
         finally:
-            torch.cuda.empty_cache()
+            device_module.empty_cache()
 
     def update_weights_from_disk(self, obj) -> tuple[bool, str]:
         """Reload this worker's parameters in place from a checkpoint directory.
@@ -575,6 +585,11 @@ class ModelRunner:
             post_load_transformed_modules,
         )
 
+        if self.mapping.moe_weight_sharing_size is not None:
+            return (
+                False,
+                "Peer expert weights are immutable; restart to change the checkpoint",
+            )
         model_path = str(obj.model_path)
         transformed = post_load_transformed_modules(self.model)
         if transformed:
@@ -684,13 +699,19 @@ class ModelRunner:
             ``(shapes, problem)``: the checkpoint's tensor shapes (None when
             it is not safetensors) and why it must be refused (None if not).
         """
+        from tokenspeed.runtime.model_loader.loader import CheckpointFileSelection
         from tokenspeed.runtime.model_loader.weight_utils import (
             safetensors_tensor_shapes,
         )
 
         fall_back_to_pt = getattr(self.model, "fall_back_to_pt_during_load", False)
+        weight_files = (
+            self.model.checkpoint_weight_files
+            if isinstance(self.model, CheckpointFileSelection)
+            else None
+        )
         _, files, use_safetensors = loader._prepare_weights(
-            model_path, None, fall_back_to_pt
+            model_path, None, fall_back_to_pt, weight_files
         )
         if not use_safetensors:
             return None, None
@@ -706,6 +727,7 @@ class ModelRunner:
                     self.model_config.model_path,
                     getattr(self.model_config, "revision", None),
                     fall_back_to_pt,
+                    weight_files,
                 )
                 held = safetensors_tensor_shapes(held_files) if held_safetensors else {}
             except Exception as e:  # noqa: BLE001 - only the shape check is lost

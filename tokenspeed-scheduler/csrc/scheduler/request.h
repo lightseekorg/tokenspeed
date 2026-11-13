@@ -48,7 +48,9 @@ public:
 
     const std::string& Id() const { return id_; }
     const std::string& SessionId() const { return session_id_; }
-    // The registration of SessionId() under the request's access epoch that
+    const std::string& CacheGroupId() const { return cache_group_id_; }
+    std::span<const std::int32_t> SharedPrefixTokens() const { return shared_prefix_tokens_; }
+    // The registration of its group/session owner under the access epoch that
     // its first admission returned: held for the request's whole life, which
     // every later admission, publication and restore under that epoch lies in.
     void HoldSessionAccess(CacheCoordinator::SessionAccess session_access) {
@@ -343,11 +345,14 @@ public:
     }
 
 private:
+    friend struct SchedulerTestAccess;
     fsm::ForwardResources& forwardResources(const char* operation);
     const fsm::ForwardResources& forwardResources(const char* operation) const;
 
     std::string id_;
     std::string session_id_;
+    std::string cache_group_id_;
+    std::vector<std::int32_t> shared_prefix_tokens_;
     CacheCoordinator::SessionAccess session_access_;
     TokenContainer token_container_;
     std::int32_t submitted_prompt_size_{0};

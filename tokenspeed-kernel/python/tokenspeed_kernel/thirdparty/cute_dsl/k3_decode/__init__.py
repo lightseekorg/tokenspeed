@@ -15,5 +15,7 @@
 # cluster split-K) and its per-row-count dispatch (gemm/decode.py) without the cuBLAS
 # engine: the cluster split-K stays prepared at every row count, for the rows above
 # 16 and the operands the warp split-K cannot take.
+# The o-projection producers take their output rows (``n``, K3's 7168 by default)
+# rather than a fixed 112-CTA grid.
 
 """CuTe DSL decode kernels for Kimi-K3: MoE front, experts and tail."""

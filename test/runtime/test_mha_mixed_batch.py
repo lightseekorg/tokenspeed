@@ -27,6 +27,7 @@ Registered kernel numerics and graph execution require separate GPU tests.
 
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -388,6 +389,8 @@ def _block_runtime():
     drafter.input_buffers = InputBuffers(4, 64, 16, device="cpu")
     drafter.runtime_states = RuntimeStates(16, 32, 32, 16, device="cpu")
     drafter.draft_seq_lens_buf = torch.zeros(4, dtype=torch.int32)
+    drafter.context_starts_buf = torch.zeros(4, dtype=torch.int64)
+    drafter.context_locs_buf = torch.zeros(4 * 16, dtype=torch.int32)
     drafter.block_ids_buf = torch.ones((4, 16), dtype=torch.int32)
     drafter.block_positions_buf = torch.zeros((4, 16), dtype=torch.int64)
     drafter.block_offsets = torch.arange(16, dtype=torch.int64).unsqueeze(0)
@@ -396,6 +399,8 @@ def _block_runtime():
     drafter.token_to_kv_pool = None  # No model/cache-storage operation is reached.
     drafter.round_block_tables = None
     drafter.embed_tokens = _stop_before_weights
+    # wire_target's choice for a one-rank layout: the lookup is the input.
+    drafter._first_layer_input = "full"
     runner = ForwardStepRunner.__new__(ForwardStepRunner)
     runner.attn_backend, runner.draft_attn_backend = routers
     runner.drafter = drafter
@@ -875,6 +880,118 @@ def test_block_decode_after_mixed_excludes_poison_beyond_accepted_history_and_bl
     torch.testing.assert_close(
         output, expected[:, None, None, None].expand_as(output), rtol=0, atol=0
     )
+
+
+@pytest.mark.parametrize("for_graph_replay", [False, True])
+def test_a_block_drafter_writes_context_before_publishing_its_block(
+    monkeypatch, for_graph_replay
+):
+    """Context KV uses the draft's pages before its proposal window is published."""
+    runner, drafter, leaves, layers = _block_runtime()
+    buffers = drafter.input_buffers
+    slots = torch.tensor([7, 2, 9], dtype=torch.int64)
+    buffers.req_pool_indices_buf[:3].copy_(slots)
+    written = {}
+
+    def capture(self, hidden, positions, cache_locs, decode_only=False):
+        written["locs"] = cache_locs.tolist()
+
+    monkeypatch.setattr(DFlash2, "_write_native_cache", capture)
+    ctx = ForwardContext(
+        attn_backend=runner.attn_backend,
+        token_to_kv_pool=None,
+        bs=3,
+        num_extends=0,
+        input_num_tokens=3 * 16,
+        forward_mode=ForwardMode.DECODE,
+        output_layout=ForwardOutputLayout(0, 0, 3, 16),
+    )
+    # Only the ROW count is checked on this path; the width is free.
+    hidden = torch.zeros(3 * 16, 8)
+    for generation in (1, 2):
+        lengths = torch.tensor([19, 48, 80], dtype=torch.int32) + 16 * (generation - 1)
+        starts = (lengths - 16).tolist()
+        tables = _round_tables(leaves, slots.tolist(), generation)
+        buffers.positions_buf[: 3 * 16].copy_(
+            torch.cat([torch.arange(start, start + 16) for start in starts])
+        )
+        # Each target round restores context locations after the prior draft
+        # published its proposal window, including when replaying a graph.
+        runner._prepare_decode_metadata(
+            3,
+            3,
+            slots,
+            lengths,
+            forward_mode=ForwardMode.DECODE,
+            use_graph=for_graph_replay,
+            settle=lambda: None,
+            block_tables=tables,
+        )
+        drafter._update_native_cache_from_target(
+            ctx,
+            SimpleNamespace(hidden_states=hidden),
+            torch.ones(3, dtype=torch.int32),
+        )
+        assert written["locs"] == _expected_locations(
+            tables["draft_attention"], starts, 16
+        )
+
+        # Only after writing context does the draft switch to proposal rows.
+        runner.draft_attn_backend.publish_draft_step_locations(
+            cache_start=lengths.to(torch.int64), num_tokens=16
+        )
+        assert runner.draft_attn_backend.decode_window_locations().tolist() == (
+            _expected_locations(tables["draft_attention"], lengths.tolist(), 16)
+        )
+
+
+def test_an_unsharded_draft_is_not_handed_the_targets_query_shard(monkeypatch):
+    """A target may compute a query-context shard while its draft does not.
+
+    A draft that plans its own attention family is configured unsharded
+    (``model_wide_kwargs``'s draft_unsharded) because it is handed the rows
+    the target computed and runs its forward over them whole. Passing the
+    target's plan on would claim a sharding the draft never sees, and an MHA
+    leaf refuses one outright (``reject_query_shard``).
+    """
+    runner, drafter, leaves, layers = _block_runtime()
+    assert not runner.draft_attn_backend.query_sharded
+
+    # Record the plan each side's extend init received; the decode refresh
+    # that follows on the draft side takes no plan at all.
+    seen = []
+
+    def record(self, *args, **kwargs):
+        seen.append(kwargs.get("query_shard", "absent"))
+
+    monkeypatch.setattr(CacheGroupRouter, "init_forward_metadata", record)
+    monkeypatch.setattr(
+        CacheGroupRouter, "refresh_decode_metadata", lambda *a, **k: None
+    )
+
+    slots = torch.tensor([7, 2, 9], dtype=torch.int64)
+    lengths = torch.tensor([19, 48, 80], dtype=torch.int32)
+    query, prefix = torch.tensor([3]), torch.tensor([16])
+    runner._init_forward_metadata(
+        3,
+        1,
+        slots,
+        lengths,
+        ForwardMode.MIXED,
+        block_tables=_round_tables(leaves, slots.tolist(), 1),
+        extend_seq_lens=query,
+        extend_seq_lens_cpu=query,
+        extend_prefix_lens=prefix,
+        extend_prefix_lens_cpu=prefix,
+        extend_replay_lens_cpu=torch.zeros_like(prefix),
+        extend_prompt_lens_cpu=query + prefix,
+        extend_with_prefix=True,
+        query_shard="target-plan",
+        block_tables_cpu={},
+    )
+
+    # Two extend inits: the target's with the plan, the draft's without.
+    assert seen == ["target-plan", None]
 
 
 if __name__ == "__main__":
