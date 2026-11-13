@@ -211,7 +211,7 @@ def _fwd_kernel_stage1(
             )
     elif DIRECT_OUTPUT:
         offs_out = cur_q * stride_mid_ob + cur_head * stride_mid_oh + offs_dv
-        tl.store(Att_Out + offs_out, float("nan"), mask=mask_dv)
+        tl.store(Att_Out + offs_out, 0.0, mask=mask_dv)
 
 
 def _decode_att_m_fwd(
@@ -494,7 +494,7 @@ def _fwd_grouped_kernel_stage1(
             cur_q * stride_mid_ob + cur_head[:, None] * stride_mid_oh + offs_dv[None, :]
         )
         tl.store(
-            Att_Out + offs_out, float("nan"), mask=mask_h[:, None] & mask_dv[None, :]
+            Att_Out + offs_out, 0.0, mask=mask_h[:, None] & mask_dv[None, :]
         )
 
 
@@ -1398,7 +1398,9 @@ def _triton_mha_decode_with_kvcache_impl(
             lse_out=lse,
         )
         return (out, lse) if return_lse else out
-    if sinks is None and window_sink == 0:
+    max_kv_splits = 4
+    splits = _num_kv_splits(q, k_cache.shape[2], max_kv_splits)
+    if splits == 1 and sinks is None and window_sink == 0:
         # With one KV split and no sink, stage 2 only casts and stores the result.
         launch = (
             _decode_att_m_fwd
@@ -1407,8 +1409,8 @@ def _triton_mha_decode_with_kvcache_impl(
         )
         launch(
             q,
-            k_cache.view(-1, k_cache.shape[2], k_cache.shape[3]),
-            v_cache.view(-1, v_cache.shape[2], v_cache.shape[3]),
+            k_cache,
+            v_cache,
             out,
             None,
             page_table,
@@ -1425,7 +1427,6 @@ def _triton_mha_decode_with_kvcache_impl(
             direct_output=True,
         )
         return out
-    max_kv_splits = 4
     attn_logits = torch.empty(
         q.shape[0],
         q.shape[1],
@@ -1443,7 +1444,7 @@ def _triton_mha_decode_with_kvcache_impl(
     )
     num_kv_splits = torch.full(
         (cache_seqlens.shape[0],),
-        _num_kv_splits(q, k_cache.shape[2], max_kv_splits),
+        splits,
         dtype=torch.int32,
         device=q.device,
     )
