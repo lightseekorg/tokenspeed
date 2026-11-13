@@ -57,6 +57,7 @@ from test.runtime.test_kimi_k3_kda import (  # noqa: E402
     _StubContractPool,
 )
 
+import tokenspeed.runtime.layers.attention.backends.state.kda as kda_backend  # noqa: E402
 from tokenspeed.runtime.engine.scheduler_utils import pool_to_cache_groups  # noqa: E402
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode  # noqa: E402
 from tokenspeed.runtime.layers.attention.backends.state.kda import (  # noqa: E402
@@ -426,6 +427,38 @@ def test_a_graph_bucket_pads_the_spanning_forward():
         expected = exact.states(unpadded[3], slot)
         for key, state in padded.states(spanning[3], slot).items():
             assert torch.equal(state, expected[key]), (slot, key)
+
+
+@requires_cuda
+def test_the_spanning_forward_keeps_the_host_ahead(monkeypatch):
+    # Around its scans the spanning forward stages its checkpoint inputs
+    # without a host sync: one per layer would stall the forward thread.
+    scan = kda_backend.kda_paged_prefill
+
+    def unchecked_scan(*args, **kwargs):
+        mode = torch.cuda.get_sync_debug_mode()
+        torch.cuda.set_sync_debug_mode(0)
+        try:
+            return scan(*args, **kwargs)
+        finally:
+            torch.cuda.set_sync_debug_mode(mode)
+
+    monkeypatch.setattr(kda_backend, "kda_paged_prefill", unchecked_scan)
+    server = _Server(_layer_params(51), in_forward=True)
+    streams = _token_streams(52, PROMPT)
+    server.submit("x", list(range(PROMPT)))
+    server.prefill(streams)
+    forward = server.forward
+
+    def checked_forward(*args, **kwargs):
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            return forward(*args, **kwargs)
+        finally:
+            torch.cuda.set_sync_debug_mode(0)
+
+    monkeypatch.setattr(server, "forward", checked_forward)
+    assert server.prefill(streams)[2] == [BOUNDARY - BUDGET]
 
 
 @requires_cuda

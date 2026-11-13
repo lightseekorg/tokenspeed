@@ -1282,12 +1282,17 @@ class KdaAttnBackend(CapacityPrefillBackend):
         prefix_cu_seqlens_cpu = torch.cat(
             (torch.zeros(1, dtype=torch.int64), checkpoints.offsets.cumsum(0))
         )
+        # Keep the forward thread ahead of the GPU: pageable copies would sync.
+        rows, prefix_cu_seqlens = (
+            tensor.pin_memory().to(recurrent_state.device, non_blocking=True)
+            for tensor in (checkpoints.rows, prefix_cu_seqlens_cpu)
+        )
         result = kda_paged_prefill(
             *(_pack_token_spans(tensor, spans) for tensor in inputs),
             A_log,
             dt_bias,
-            initial_state=recurrent_state[checkpoints.rows],
-            cu_seqlens=prefix_cu_seqlens_cpu.to(recurrent_state.device),
+            initial_state=recurrent_state[rows],
+            cu_seqlens=prefix_cu_seqlens,
             cu_seqlens_cpu=prefix_cu_seqlens_cpu,
             capacity=None,
             lower_bound=lower_bound,
