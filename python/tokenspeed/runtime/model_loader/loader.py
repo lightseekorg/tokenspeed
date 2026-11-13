@@ -411,6 +411,7 @@ class DefaultModelLoader(BaseModelLoader):
         weight_name_filter: Callable[[str], bool] | None,
         checkpoint_load_group: tuple[int, ...] | None,
         mapping: Mapping,
+        shared_weight_name_filter: Callable[[str], bool] | None,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Get an iterator for the model weights based on the load format.
 
@@ -420,6 +421,8 @@ class DefaultModelLoader(BaseModelLoader):
         consumer, i.e. with ``source.prefix`` applied. Distributed loaders
         only synchronize ranks in ``checkpoint_load_group`` when one is
         declared: pipeline stages can consume different checkpoint subsets.
+        ``shared_weight_name_filter`` selects immutable host weights that need
+        a shared writable file mapping for GPU registration/writeback.
         """
         hf_folder, hf_weights_files, use_safetensors = self._prepare_weights(
             source.model_or_path,
@@ -428,6 +431,11 @@ class DefaultModelLoader(BaseModelLoader):
             source.weight_files,
         )
         hf_weights_files.sort()
+        shared_filter = (
+            (lambda name: shared_weight_name_filter(source.prefix + name))
+            if shared_weight_name_filter is not None
+            else None
+        )
         # Filtered models can consume different shard lists on different ranks.
         # Keep their independent prefetch rather than assign reads to absent peers.
         local_rank, local_world_size = 0, 1
@@ -488,6 +496,7 @@ class DefaultModelLoader(BaseModelLoader):
                 prefetch_num_threads=self.load_config.weight_loader_prefetch_num_threads,
                 local_rank=local_rank,
                 local_world_size=local_world_size,
+                shared_weight_name_filter=shared_filter,
             )
         elif use_safetensors:
             weights_iterator = safetensors_weights_iterator(
@@ -496,6 +505,7 @@ class DefaultModelLoader(BaseModelLoader):
                 prefetch_num_threads=self.load_config.weight_loader_prefetch_num_threads,
                 local_rank=local_rank,
                 local_world_size=local_world_size,
+                shared_weight_name_filter=shared_filter,
             )
         else:
             weights_iterator = pt_weights_iterator(hf_weights_files)
@@ -523,6 +533,10 @@ class DefaultModelLoader(BaseModelLoader):
         The in-place reload (``ModelRunner.update_weights_from_disk``) reads
         through here too, so a reloaded model binds the new checkpoint
         directory and picks its load group exactly as at startup.
+
+        A model's ``checkpoint_shared_weight_name_filter`` selects immutable
+        safetensors weights that need shared writable mmap storage for host
+        registration. The predicate sees the same prefixed names as the model.
         """
         # Draft (NextN/MTP) models embedded in the target checkpoint expose
         # ``checkpoint_weight_name_filter`` so only the shards holding their
@@ -532,6 +546,9 @@ class DefaultModelLoader(BaseModelLoader):
             model.checkpoint_weight_files
             if isinstance(model, CheckpointFileSelection)
             else None
+        )
+        shared_weight_name_filter = getattr(
+            model, "checkpoint_shared_weight_name_filter", None
         )
         bind_checkpoint_dir = getattr(model, "bind_checkpoint_dir", None)
         if callable(bind_checkpoint_dir):
@@ -560,6 +577,7 @@ class DefaultModelLoader(BaseModelLoader):
             weight_name_filter,
             checkpoint_load_group,
             mapping,
+            shared_weight_name_filter,
         )
 
         secondary_weights = cast(
@@ -567,7 +585,11 @@ class DefaultModelLoader(BaseModelLoader):
         )
         for source in secondary_weights:
             yield from self._get_weights_iterator(
-                source, weight_name_filter, checkpoint_load_group, mapping
+                source,
+                weight_name_filter,
+                checkpoint_load_group,
+                mapping,
+                shared_weight_name_filter,
             )
 
     def download_model(self, model_config: ModelConfig) -> None:
