@@ -553,7 +553,7 @@ TEST(KvCacheEventStatusTest, HistoryCountsMatchPerKeyResidencyAcrossTiersAndShar
                            .cache_blocks_per_lcm_block = 1,
                            .block_granularity = 8}};
         auto coordinator = MakeCoordinator(specs, 8, device, false, &host, nullptr, false, false, 0);
-        const CacheKey boundary{.content_hash = "prefix"};
+        const CacheKey boundary{.content_hash = ContentHash{"prefix"}};
         std::vector<CacheKey> history;
         for (std::uint32_t group = 0; group < 2; ++group) {
             const auto granularity = specs[group].block_granularity;

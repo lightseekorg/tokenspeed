@@ -55,9 +55,10 @@ bool ReqPoolIndex::valid() const {
 }
 
 ReqPoolAllocator::ReqPoolAllocator(std::int32_t size) : size_(size) {
-    // Slot 0 is conventionally reserved (matches Python which starts from index 1).
-    for (std::int32_t i = 1; i < size + 1; ++i) {
-        free_slots_.push_back(i);
+    // Slot 0 is conventionally reserved (matches Python which starts from
+    // index 1): slots 1..size, counted so that INT32_MAX ends the loop.
+    for (std::int32_t i = 0; i < size; ++i) {
+        free_slots_.push_back(i + 1);
     }
 }
 

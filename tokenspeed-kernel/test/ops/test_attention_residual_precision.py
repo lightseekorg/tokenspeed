@@ -584,8 +584,10 @@ def test_one_pass_mix_matches_the_split_equations(
         if dtype == torch.float32:
             torch.testing.assert_close(actual, expected, rtol=2e-5, atol=3e-6)
         else:
+            # The FP32 mix's own error, then one BF16 rounding: a mix that
+            # cancels to near zero has no relative bound.
             torch.testing.assert_close(
-                actual.float(), expected.float(), rtol=8e-3, atol=0
+                actual.float(), expected.float(), rtol=8e-3, atol=3e-6
             )
 
 
