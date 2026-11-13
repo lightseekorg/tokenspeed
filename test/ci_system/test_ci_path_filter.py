@@ -161,11 +161,15 @@ def test_unclassified_amd_paths_keep_both_full_suites(path):
         "run_mi450_rocjitsu.sh",
         "run_mi450_rocjitsu_parallel.sh",
         "mi450_sim_report_digest.py",
-        "test_mi450_sim_report_digest.py",
     ],
 )
 def test_simulator_scripts_select_only_mi450(name):
     assert required_groups(f"test/ci_system/{name}") == {"amd-mi450"}
+
+
+def test_the_digest_test_needs_no_runner_group():
+    # The lint workflow runs it on every pull request.
+    assert required_groups("test/ci_system/test_mi450_sim_report_digest.py") == set()
 
 
 @pytest.mark.parametrize(

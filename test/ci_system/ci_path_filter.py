@@ -97,13 +97,15 @@ RUNNER_GROUP_PATHS = {
         for name in (
             "mi450_sim_env.sh",
             "mi450_sim_report_digest.py",
-            "test_mi450_sim_report_digest.py",
             "run_mi450_rocjitsu.sh",
             "run_mi450_rocjitsu_parallel.sh",
             "setup_mi450_sim.sh",
         )
     },
     "test/ci/deepswe": frozenset(),
+    # The lint workflow runs this test on every pull request; no runner group
+    # needs to.
+    "test/ci_system/test_mi450_sim_report_digest.py": frozenset(),
     "test/ci/run_slurm.sh": frozenset({"nvidia-gb200-slurm", "nvidia-gb300-slurm"}),
     "test/ci_system/slurm_submit.py": frozenset(
         {"nvidia-gb200-slurm", "nvidia-gb300-slurm"}
