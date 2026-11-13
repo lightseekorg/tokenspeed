@@ -499,11 +499,12 @@ The Hopper implementation accepts BF16 inputs with a positive width divisible
 by 128, a contiguous local interval with 1–1024 experts, and model-static top-k
 values from 1 to 32.
 Negative and nonlocal IDs have inverse row -1 and produce no packed row.
-Every integer N from 1 through 256 is supported, subject to
+Every integer N from 1 through 4096 is supported, subject to
 `tokens * topk * hidden <= 2**31 - 1`; the model geometry bounds above still
 apply. An empty MoE input returns an empty output before invoking the producer.
-For N > 256 the registered MoE path retains native preprocessing.
-The compilation buckets are 1, 8, 16, 32, 64, 128, and 256. Select the smallest
+For N > 4096 the registered MoE path retains native preprocessing.
+The compilation buckets are 1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048,
+and 4096. Select the smallest
 bucket at least as large as N: for example, 3 and 7 share bucket 8, while
 129, 192, and 255 share bucket 256. Buckets select code, not accepted input
 sizes: inputs and route maps use actual N, without padding to a bucket.
@@ -529,7 +530,7 @@ input objects and existing output storage after earlier readers retire.
 
 Model dimensions and token buckets select compiled variants. Actual N is an
 explicit runtime scalar. Each non-decode bucket has a full-bucket and a
-partial-bucket specialization of the same algorithm (13 variants at most per
+partial-bucket specialization of the same algorithm (21 variants at most per
 model geometry/device). The former retains constant N-dependent strides;
 the latter accepts every smaller N in the bucket. Warming a bucket compiles
 both variants so later capture requires no new compilation. The input and packed-row strides remain fixed by
@@ -541,19 +542,20 @@ buffers, and launch geometry. Replay refreshes metadata from the live input
 tensors; it does not change N or run the Python dispatcher.
 
 N=1 keeps the decode kernel. For 2 <= N <= 128, each CTA owns one token;
-for 129 <= N <= 256, each CTA owns up to two consecutive tokens. The grid
+for larger N, each CTA owns up to bucket/128 consecutive tokens (at most 32). The grid
 covers actual N, and the last CTA masks an absent token. Each CTA scans the
 bucket-sized route interval, masking entries outside actual N, to derive the
 prior count for each expert. Its reserved output rows cannot overlap another
 CTA's rows. Source IDs remain `slot*N + token`; packed rows and scale padding
 are sized from actual N. Runtime-scaled address products use int64.
 
-CPU tests cover every accepted N, rejection above 256, indexing bounds, and
-native map layouts. Hopper producer tests cover every N from 1 through 256,
-bytewise FP8/scale agreement, invalid routes, graph replay and capture at a new
-N after bucket warmup. Native integration tests cover the 512x1024 native FC1/SwiGLU/FP8 epilogue
-and require finite, byte-identical expert outputs. They also cover larger N through
-the fallback. Performance comparisons must use warmed kernels at the original
+CPU tests cover every accepted N, rejection above 4096, indexing bounds, and
+native map layouts. Hopper producer tests cover every N from 1 through 256
+and larger bucket boundaries and CTA tails through 4096. They check bytewise
+FP8/scale agreement, invalid routes, graph replay and capture at a new N
+after bucket warmup. Native integration tests cover the 512x1024 native FC1/SwiGLU/FP8 epilogue
+and require finite, byte-identical expert outputs. They also cover registered input fusion through N=4096 and native
+preprocessing beyond that bound. Performance comparisons must use warmed kernels at the original
 sizes and retain both positive and negative results.
 
 ### Prepared input consumption

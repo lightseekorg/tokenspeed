@@ -814,3 +814,49 @@ def test_native_schedule_repeated_transitions():
     ):
         actual = state.native_for_tokens(tokens)(left, right)
         assert actual.item() == expected
+
+
+@pytest.mark.parametrize(
+    "tokens", (257, 511, 512, 513, 1023, 1024, 1025, 2047, 2048, 2049, 4095, 4096)
+)
+def test_extended_token_range_and_cta_tails(tokens):
+    exercise_route_graph(tokens, 65, 5, 256)
+
+
+@pytest.mark.parametrize(
+    "warm_tokens,reuse_tokens",
+    (
+        (512, (257, 385, 511)),
+        (257, (512, 385, 511)),
+        (1024, (513, 769, 1023)),
+        (513, (1024, 769, 1023)),
+        (2048, (1025, 1537, 2047)),
+        (1025, (2048, 1537, 2047)),
+        (4096, (2049, 3073, 4095)),
+        (2049, (4096, 3073, 4095)),
+    ),
+)
+def test_extended_bucket_warmup_during_capture(warm_tokens, reuse_tokens):
+    test_bucket_warmup_covers_new_shapes_during_capture(warm_tokens, reuse_tokens, 3)
+
+
+@pytest.mark.parametrize("tokens", (257, 512, 513, 1024, 1025, 2048, 2049, 4096, 4097))
+@pytest.mark.parametrize("ep_size,ep_rank", ((1, 0), (3, 2)))
+@pytest.mark.parametrize("use_fused_finalize", (False, True))
+def test_extended_registered_moe_input_path(
+    native_input_consumer,
+    native_input_weights,
+    tokens,
+    ep_size,
+    ep_rank,
+    use_fused_finalize,
+):
+    exercise_planned_moe(
+        native_input_consumer,
+        native_input_weights,
+        tokens,
+        5,
+        ep_size,
+        ep_rank,
+        use_fused_finalize=use_fused_finalize,
+    )

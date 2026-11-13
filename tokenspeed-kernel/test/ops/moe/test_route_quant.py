@@ -62,6 +62,18 @@ def test_dimensions_reach_device_validation(tokens, experts, topk, hidden):
         (129, 256),
         (192, 256),
         (256, 256),
+        (257, 512),
+        (511, 512),
+        (512, 512),
+        (513, 1024),
+        (1023, 1024),
+        (1024, 1024),
+        (1025, 2048),
+        (2047, 2048),
+        (2048, 2048),
+        (2049, 4096),
+        (4095, 4096),
+        (4096, 4096),
     ),
 )
 def test_runtime_token_count_and_compilation_bucket(tokens, bucket):
@@ -83,11 +95,11 @@ def test_compilation_bucket_rejects_nonpositive_tokens(tokens):
         _route_token_bucket(tokens)
 
 
-@pytest.mark.parametrize("tokens", (257, 512, 1024, 4096, 8193))
-def test_fused_producer_rejects_tokens_above_256(tokens):
-    with pytest.raises(ValueError, match="must not exceed 256"):
+@pytest.mark.parametrize("tokens", (4097, 8192, 8193, 2**31))
+def test_fused_producer_rejects_tokens_above_4096(tokens):
+    with pytest.raises(ValueError, match="must not exceed 4096"):
         _route_token_bucket(tokens)
-    with pytest.raises(ValueError, match="must not exceed 256"):
+    with pytest.raises(ValueError, match="must not exceed 4096"):
         route_quant_fp8(
             torch.empty((tokens, 128), dtype=torch.bfloat16, device="meta"),
             torch.empty((tokens, 3), dtype=torch.int32, device="meta"),
@@ -97,7 +109,7 @@ def test_fused_producer_rejects_tokens_above_256(tokens):
         )
 
 
-@pytest.mark.parametrize("tokens", range(1, 257))
+@pytest.mark.parametrize("tokens", range(1, 4097))
 def test_all_token_counts_reach_device_validation(tokens):
     with pytest.raises(ValueError, match="one CUDA device"):
         route_quant_fp8(
@@ -249,7 +261,9 @@ def test_native_consumer_accepts_padded_capacity(small_storage):
     )
 
 
-@pytest.mark.parametrize("tokens", (2, 7, 9, 129, 192, 255, 256))
+@pytest.mark.parametrize(
+    "tokens", (2, 7, 9, 129, 192, 255, 256, 257, 513, 1025, 2049, 4095, 4096)
+)
 def test_native_consumer_uses_actual_token_layout(tokens):
     storage = make_storage(tokens=tokens, topk=5, experts=33, hidden=256)
     validate_storage(storage)

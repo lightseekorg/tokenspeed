@@ -24,15 +24,15 @@ from dataclasses import dataclass
 
 import torch
 
-TOKEN_BUCKETS = (1, 8, 16, 32, 64, 128, 256)
+TOKEN_BUCKETS = (1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096)
 
 
 def _route_token_bucket(tokens: int) -> int:
-    """Select a compilation bound for any token count in 1..256."""
+    """Select a compilation bound for any token count in 1..4096."""
     if tokens <= 0:
         raise ValueError("Route token count must be positive")
     if tokens > TOKEN_BUCKETS[-1]:
-        raise ValueError("Fused route token count must not exceed 256")
+        raise ValueError("Fused route token count must not exceed 4096")
     return next(bound for bound in TOKEN_BUCKETS if tokens <= bound)
 
 
@@ -86,12 +86,12 @@ def route_quant_fp8(
 
     Returns:
         Owned FP8 rows, padded FP32 scales, offsets and inverse/source maps.
-        Any integer token count in 1..256 is accepted, subject to
+        Any integer token count in 1..4096 is accepted, subject to
         tokens * topk * hidden <= 2**31 - 1. Top-k is model-static in 1..32.
         Compilation rounds up to one of the finite TOKEN_BUCKETS. Actual N
         remains a runtime value; inputs are not padded to a bucket. Warm each
         used bucket before CUDA graph capture. The registered MoE path uses
-        native preprocessing for N > 256.
+        native preprocessing for N > 4096.
     """
     if input.ndim != 2 or input.shape[1] <= 0 or input.shape[1] % 128:
         raise ValueError("Route input width must be a positive multiple of 128")
