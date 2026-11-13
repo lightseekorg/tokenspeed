@@ -413,8 +413,7 @@ class MuseSparkMonokernelState(MonokernelState):
         context, iris_group = iris_symmetric_heap(group, rank, device)
         # The scratch is on the Iris heap. Nothing clears it: the tags make old
         # pairs stale.
-        scratch_shape, taps_shape = self.heap_shapes(fused, taps)
-        super().__init__(context.zeros(scratch_shape, dtype=torch.int64))
+        super().__init__(context.zeros(self.scratch_shape(fused), dtype=torch.int64))
         self.fused = fused
         self.cpu_group = cpu_group
         # The layers whose entering residual a draft reads.
@@ -436,11 +435,14 @@ class MuseSparkMonokernelState(MonokernelState):
         )
         # A draft's taps: the residual entering each captured layer, BF16, in
         # the layout of the concatenated captures (row, tap, column). The
-        # launch before a captured layer stores it on every rank.
+        # launch before a captured layer stores the whole rows on every rank,
+        # each rank into its own buffer, so it is plain device memory: no
+        # peer writes or reads it.
+        taps_shape = self.taps_shape(fused, taps)
         self.taps: torch.Tensor | None = (
             None
             if taps_shape is None
-            else context.zeros(taps_shape, dtype=torch.bfloat16)
+            else torch.zeros(taps_shape, dtype=torch.bfloat16, device=device)
         )
         self.bases = iris_group.bases.to(device)
         # The q | k | v projection a launch hands to the next one (past one
@@ -486,28 +488,29 @@ class MuseSparkMonokernelState(MonokernelState):
         return {}
 
     @staticmethod
-    def heap_shapes(
-        fused: dict[int, FusedDecodeLayer], taps: list[int]
-    ) -> tuple[tuple[int], tuple[int, int, int] | None]:
-        """The shapes the state allocates on the Iris heap: the int64 mailbox
-        scratch, and the BF16 draft taps (None when the launches store none).
+    def scratch_shape(fused: dict[int, FusedDecodeLayer]) -> tuple[int]:
+        """The int64 mailbox scratch, the state's only Iris heap allocation.
         Every layer's plan lays the regions out alike (``layer.layer_plan``),
         so the largest plan's scratch serves both kinds of layer."""
-        scratch = (max(f.scratch_pairs for f in fused.values()),)
-        slots = MuseSparkMonokernelState.store_tap_slots(fused, taps)
-        return scratch, (MAX_ROWS, len(slots), HIDDEN) if slots else None
+        return (max(f.scratch_pairs for f in fused.values()),)
 
     @staticmethod
-    def heap_bytes(fused: dict[int, FusedDecodeLayer], taps: list[int]) -> int:
-        """The Iris heap bytes the state allocates (:meth:`heap_shapes`), at
+    def taps_shape(
+        fused: dict[int, FusedDecodeLayer], taps: list[int]
+    ) -> tuple[int, int, int] | None:
+        """The BF16 draft taps' shape, or None when the launches store none."""
+        slots = MuseSparkMonokernelState.store_tap_slots(fused, taps)
+        return (MAX_ROWS, len(slots), HIDDEN) if slots else None
+
+    @staticmethod
+    def heap_bytes(fused: dict[int, FusedDecodeLayer]) -> int:
+        """The Iris heap bytes the state allocates (:meth:`scratch_shape`), at
         the heap allocator's alignment."""
         from tokenspeed_kernel.ops.communication.iris import iris_heap_bytes
 
-        scratch, taps_shape = MuseSparkMonokernelState.heap_shapes(fused, taps)
-        total = iris_heap_bytes(scratch, torch.int64)
-        if taps_shape is not None:
-            total += iris_heap_bytes(taps_shape, torch.bfloat16)
-        return total
+        return iris_heap_bytes(
+            MuseSparkMonokernelState.scratch_shape(fused), torch.int64
+        )
 
     def start_step(self) -> None:
         super().start_step()
@@ -750,8 +753,7 @@ def enable_decode_monokernels(model: torch.nn.Module) -> None:
 def reserve_monokernel_heap(model: torch.nn.Module) -> None:
     """Reserve what :class:`MuseSparkMonokernelState` allocates on the Iris
     heap, before the heap exists (:meth:`MuseSparkMonokernelState.heap_bytes`).
-    :func:`enable_decode_monokernels` calls it after packing, and the model
-    again when its captured layers change."""
+    :func:`enable_decode_monokernels` calls it after packing."""
     fused = {i: layer.fused for i, layer in enumerate(model.layers) if layer.fused}
     if not fused:
         return
@@ -759,7 +761,7 @@ def reserve_monokernel_heap(model: torch.nn.Module) -> None:
 
     reserve_iris_heap(
         "muse_spark_monokernel",
-        MuseSparkMonokernelState.heap_bytes(fused, list(model.layers_to_capture)),
+        MuseSparkMonokernelState.heap_bytes(fused),
     )
 
 

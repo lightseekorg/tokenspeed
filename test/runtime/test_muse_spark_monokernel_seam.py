@@ -47,6 +47,7 @@ from tokenspeed.runtime.execution.output_layout import (  # noqa: E402
 )
 from tokenspeed.runtime.layers.paged_attention import PagedAttention  # noqa: E402
 from tokenspeed.runtime.models.muse_spark_monokernel import (  # noqa: E402
+    HIDDEN,
     MAX_ROWS,
     NOT_TP8,
     OTHER_CONSTANTS,
@@ -328,7 +329,9 @@ def test_the_state_allocates_what_it_reserved_on_the_iris_heap(
     """The model reserves its state's Iris heap buffers before the heap
     exists, and the heap is created with only those bytes on top of the
     communication buffers: what the state allocates once it exists is
-    exactly what was reserved, with and without the draft's taps."""
+    exactly what was reserved, with and without the draft's taps. The taps
+    are each rank's own (no peer writes or reads them), so they stay off the
+    heap."""
     from tokenspeed_kernel.ops.communication import _iris
     from tokenspeed_kernel.ops.model.muse_spark.monokernel import FusedDecodeLayer
 
@@ -367,6 +370,12 @@ def test_the_state_allocates_what_it_reserved_on_the_iris_heap(
     assert state.scratch.numel() == 4096 + 60
     assert len(state.tap_slots) == stored
     assert sum(allocated) == reserved
+    assert allocated == [_iris.allocation_bytes((4096 + 60,), torch.int64)]
+    if stored:
+        assert state.taps.shape == (MAX_ROWS, stored, HIDDEN)
+        assert state.taps.device.type == "cuda"
+    else:
+        assert state.taps is None
 
 
 def test_an_fp8_kv_cache_takes_the_kernels(monkeypatch) -> None:
