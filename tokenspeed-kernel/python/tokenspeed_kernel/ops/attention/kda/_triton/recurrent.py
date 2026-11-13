@@ -1378,7 +1378,8 @@ def fused_recurrent_kda_megafuse(
     return out
 
 
-@triton.jit
+# The batch count stays unspecialized, so every batch size shares one binary.
+@triton.jit(do_not_specialize=["B"])
 def batched_kda_commit_conv_window_kernel(
     addresses,
     qkv_ref,
