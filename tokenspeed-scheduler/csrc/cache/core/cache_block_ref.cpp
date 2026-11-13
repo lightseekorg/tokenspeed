@@ -48,7 +48,7 @@ void CacheBlockControl::release() noexcept {
         while (unique_observers_ != nullptr) {
             unique_observers_->Reset();
         }
-        delete this;
+        object_.OwnerPool().destroyBlockControl(this);
         return;
     }
     if (strong_count_ == 1 && unique_observers_ != nullptr) {
@@ -101,18 +101,6 @@ CacheBlockRef::~CacheBlockRef() noexcept {
     reset();
 }
 
-const CacheBlock* CacheBlockRef::operator->() const noexcept {
-    return control_ == nullptr ? nullptr : &control_->object();
-}
-
-const CacheBlock& CacheBlockRef::operator*() const noexcept {
-    return control_->object();
-}
-
-std::uint32_t CacheBlockRef::use_count() const noexcept {
-    return control_ == nullptr ? 0 : control_->useCount();
-}
-
 bool CacheBlockRef::IsOwnedBy(const BlockPool& pool) const noexcept {
     return control_ != nullptr && control_->isOwnedBy(pool);
 }
@@ -148,16 +136,14 @@ void CacheBlockUniqueObserver::Observe(const CacheBlockRef& block, Callback call
     context_ = context;
 }
 
-void CacheBlockUniqueObserver::Reset() noexcept {
-    if (head_ != nullptr) {
-        if (previous_ != nullptr) {
-            previous_->next_ = next_;
-        } else {
-            *head_ = next_;
-        }
-        if (next_ != nullptr) {
-            next_->previous_ = previous_;
-        }
+void CacheBlockUniqueObserver::unlink() noexcept {
+    if (previous_ != nullptr) {
+        previous_->next_ = next_;
+    } else {
+        *head_ = next_;
+    }
+    if (next_ != nullptr) {
+        next_->previous_ = previous_;
     }
     head_ = nullptr;
     previous_ = nullptr;

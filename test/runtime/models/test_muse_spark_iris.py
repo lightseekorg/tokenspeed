@@ -660,10 +660,10 @@ def _muse_tp_owned_forward_worker(
                     torch.cat(shards, dim=-1), scale=scale, expert=None
                 )
             moe.down_columns.process_weights_after_loading(moe.down_columns)
-        moe.experts.process_weights_after_loading(moe.experts)
     else:
         moe.experts.w13_weight.normal_(0, 0.02)
         moe.experts.w2_weight.normal_(0, 0.02)
+    moe.experts.process_weights_after_loading(moe.experts)
     moe.gate.process_weights_after_loading(moe.gate)
     _, state = _prepare_muse_backend(world_size, None, moe, expert_tp_size=world_size)
     for rows in (192, 193, 1029):

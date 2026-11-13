@@ -51,8 +51,6 @@ from tokenspeed_kernel.ops.layernorm import (
 from tokenspeed_kernel.ops.moe import (
     FUSED_ROUTING_MAX_TOKENS,
     PreparedNvfp4Routing,
-    bf16_moe_routes,
-    bf16_moe_routes_warmup,
     gather_moe_routes,
     moe_sigmoid_bias_topk_routing,
     moe_sorted_gate_up,
@@ -1184,11 +1182,10 @@ class MuseSparkRouter(PreparedFP32RouterGEMV):
 class MuseSparkMoE(nn.Module):
     """Sharded SwiGLU experts with per-route post normalization.
 
-    The experts run as raw BF16 weights through the portable Triton route
-    kernel, or as FP4 weights through ``MoELayer``'s planned kernel when the
-    checkpoint quantizes this layer. Both arms finish with the same post-expert
-    norm and weighted reduction: the BF16 arm over a materialized per-route
-    tensor, the quantized one straight through the planned kernel's permute map.
+    The experts, BF16 or FP4 as the checkpoint stores this layer, run through
+    ``MoELayer``'s planned kernel with the finalize deferred. The post-expert
+    norm and weighted reduction then read its routes in token order, or
+    through the kernel's permute map when it returns one.
     """
 
     def __init__(
@@ -1228,7 +1225,6 @@ class MuseSparkMoE(nn.Module):
         self.tp_size = mapping.moe.tp_size
         self.tp_group = mapping.moe.tp_group
         compressed_size = config.moe_hidden_size
-        intermediate_size = config.moe_intermediate_size // self.tp_size
 
         self.gate = MuseSparkRouter(
             hidden_size=config.hidden_size,
@@ -1262,49 +1258,29 @@ class MuseSparkMoE(nn.Module):
                 quant_config.exclude_modules,
             )
         )
-        if self.quantized_experts:
-            self.experts = MoELayer(
-                top_k=self.topk,
-                num_experts=self.num_experts,
-                hidden_size=compressed_size,
-                intermediate_size=config.moe_intermediate_size,
-                quant_config=quant_config,
-                layer_index=layer_id,
-                prefix=experts_prefix,
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
-                ep_rank=self.ep_rank,
-                ep_size=self.ep_size,
-                # "swiglu" would force one shared gate/up scale; this model is plain silu(gate) * up.
-                activation="silu",
-                routing_mode="precomputed_topk",
-            )
-            self.expert_quant_kind = self.experts._quant_kind
-            if self.expert_quant_kind not in {"mxfp4", "nvfp4"}:
-                raise ValueError(
-                    "Muse Spark quantized experts require NVFP4 or MXFP4 weights"
-                )
-            if not self.experts.supports_deferred_finalize:
-                raise ValueError(
-                    "Muse Spark normalizes each expert route before the "
-                    "top-k reduction, so its MoE kernel must defer the finalize"
-                )
-        else:
-            self.expert_quant_kind = "unquant"
-            self.experts = nn.Module()
-            self.experts.w13_weight = nn.Parameter(
-                torch.empty(
-                    self.experts_per_rank,
-                    2 * intermediate_size,
-                    compressed_size,
-                )
-            )
-            self.experts.w2_weight = nn.Parameter(
-                torch.empty(
-                    self.experts_per_rank,
-                    compressed_size,
-                    intermediate_size,
-                )
+        self.experts = MoELayer(
+            top_k=self.topk,
+            num_experts=self.num_experts,
+            hidden_size=compressed_size,
+            intermediate_size=config.moe_intermediate_size,
+            # The exclusions above leave some expert layers in BF16.
+            quant_config=quant_config if self.quantized_experts else None,
+            layer_index=layer_id,
+            prefix=experts_prefix,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+            ep_rank=self.ep_rank,
+            ep_size=self.ep_size,
+            # "swiglu" would force one shared gate/up scale; this model is plain silu(gate) * up.
+            activation="silu",
+            routing_mode="precomputed_topk",
+            # Each route is normalized before the top-k reduction.
+            requires_deferred_finalize=True,
+        )
+        self.expert_quant_kind = self.experts._quant_kind
+        if self.quantized_experts and self.expert_quant_kind not in {"mxfp4", "nvfp4"}:
+            raise ValueError(
+                "Muse Spark quantized experts require NVFP4 or MXFP4 weights"
             )
         self.post_expert_norm = MuseSparkRMSNorm(
             hidden_size=compressed_size,
@@ -1565,7 +1541,7 @@ class MuseSparkMoE(nn.Module):
             return iris.reduce_scatter_owned_rows(combined)
         return _muse_all_reduce(self.iris_state, (combined,), self.ep_group)[0]
 
-    def _quantized_combined(
+    def _experts_combined(
         self,
         compressed: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         compressed_quantized: tuple[torch.Tensor, torch.Tensor] | None,
@@ -1577,7 +1553,7 @@ class MuseSparkMoE(nn.Module):
         prepared: PreparedNvfp4Routing | None,
         owned_rows: bool,
     ) -> torch.Tensor:
-        """Run FP4 experts and complete sharded routes before normalization."""
+        """Run the experts and complete sharded routes before normalization."""
         norm_weight = self.post_expert_norm.weight
         iris = self.iris_state
         if (
@@ -1614,7 +1590,10 @@ class MuseSparkMoE(nn.Module):
             assert gemm2_out.data_ptr() == deferred_out.data_ptr()
         if prepared is None:
             self._prepare_routing(compressed_quantized, topk_ids, topk_weights)
-        if (
+        # Map-less routes are in token order with every row defined.
+        if expanded_idx is None:
+            gemm2_out = gemm2_out.view(*topk_ids.shape, norm_weight.shape[0])
+        elif (
             self.tp_size > 1
             and self.ep_size == 1
             and self.experts.deferred_output_is_token_order
@@ -1941,46 +1920,21 @@ class MuseSparkMoE(nn.Module):
             )
             compressed_quantized = None
             router_logits = None
-        if self.quantized_experts:
-            combined = self._quantized_combined(
-                (
-                    compressed.contiguous()
-                    if isinstance(compressed, torch.Tensor)
-                    else compressed
-                ),
-                compressed_quantized,
-                topk_weights,
-                topk_ids,
-                router_logits,
-                num_global_tokens,
-                max_num_tokens_per_gpu,
-                prepared,
-                owned_global_rows is not None,
-            )
-        else:
-            routes = bf16_moe_routes(
-                compressed.contiguous(),
-                self.experts.w13_weight,
-                self.experts.w2_weight,
-                topk_ids.contiguous(),
-                self.expert_start,
-                output=(
-                    self._acquire_route_destination(
-                        compressed.shape[0], owned_global_rows is not None
-                    )
-                    if self.tp_size > 1 and self.iris_state is not None
-                    else None
-                ),
-                batch_invariant=global_server_args_dict["numerics"]
-                in BITWISE_ENVELOPES,
-            )
-            combined = self._reduce_expert_routes(
-                routes=routes,
-                route_map=None,
-                num_tokens=compressed.shape[0],
-                route_weights=topk_weights,
-                owned_rows=owned_global_rows is not None,
-            )
+        combined = self._experts_combined(
+            (
+                compressed.contiguous()
+                if isinstance(compressed, torch.Tensor)
+                else compressed
+            ),
+            compressed_quantized,
+            topk_weights,
+            topk_ids,
+            router_logits,
+            num_global_tokens,
+            max_num_tokens_per_gpu,
+            prepared,
+            owned_global_rows is not None,
+        )
         if not project:
             assert owned_global_rows is None
             return combined, None, None
@@ -3321,20 +3275,17 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
                 raise ValueError(f"checkpoint is missing audio tensors: {missing[:5]}")
         if self.model.config.decode_monokernel:
             enable_decode_monokernels(self.model)
-        bf16_mlps = [
-            layer.mlp for layer in self.model.layers if not layer.mlp.quantized_experts
+        # The BF16 route kernels' warmup only compiles, so disable_autotune keeps it.
+        experts_to_warm = [
+            layer.mlp.experts
+            for layer in self.model.layers
+            if layer.mlp.experts.plan.get("warmup") is not None
+            and not (
+                global_server_args_dict["disable_autotune"]
+                and layer.mlp.quantized_experts
+            )
         ]
-        experts_to_warm = (
-            []
-            if global_server_args_dict["disable_autotune"]
-            else [
-                layer.mlp.experts
-                for layer in self.model.layers
-                if layer.mlp.quantized_experts
-                and layer.mlp.experts.plan.get("warmup") is not None
-            ]
-        )
-        if not bf16_mlps and not experts_to_warm:
+        if not experts_to_warm:
             return
         # Match the global routing span reserved by execution/device.py.
         chunk = int(global_server_args_dict["chunked_prefill_size"])
@@ -3351,18 +3302,6 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
         if global_server_args_dict["speculative_algorithm"]:
             decode_rows *= int(global_server_args_dict["speculative_num_draft_tokens"])
         max_tokens = max(max_tokens, decode_rows)
-        # BF16 expert layers compile their route kernels before graph capture.
-        # This is JIT warmup, not tuning, so disable_autotune does not skip it.
-        for mlp in bf16_mlps:
-            bf16_moe_routes_warmup(
-                mlp.experts.w13_weight,
-                mlp.experts.w2_weight,
-                mlp.topk,
-                mlp.expert_start,
-                max_num_tokens=max_tokens,
-                batch_invariant=global_server_args_dict["numerics"]
-                in BITWISE_ENVELOPES,
-            )
         for experts in experts_to_warm:
             if not experts._weights_processed:
                 raise RuntimeError("MoE weights must be processed before warmup")
