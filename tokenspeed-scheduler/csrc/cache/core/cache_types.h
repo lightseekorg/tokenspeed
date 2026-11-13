@@ -33,6 +33,7 @@
 
 #include "cache/core/block_table.h"
 #include "cache/core/cache_config.h"
+#include "cache/core/content_hash.h"
 #include "utils.h"
 
 namespace tokenspeed {
@@ -54,7 +55,6 @@ inline constexpr std::int64_t kMaxCheckpointRetentionRequests{std::int64_t{1} <<
 inline constexpr std::int32_t kMaxCheckpointDistance{5};
 
 using CacheNamespaceId = std::uint32_t;
-using ContentHash = std::string;
 
 inline constexpr CacheNamespaceId kDefaultCacheNamespaceId = 0;
 
@@ -309,6 +309,14 @@ struct PrefixMatch {
 // converges every group to the final common boundary.
 struct GroupPrefixProbe {
     std::vector<std::uint8_t> hits{};
+    // Optional physical lookup hints: where the probe found each hit. Hints
+    // only, owning no block or entry pointer: nothing keeps them in step with
+    // hits once the coordinator rewrites hits, and consumers recheck the pool
+    // and complete key against the live location index, falling back to key
+    // lookup on a mismatch (after relocation, slot reuse or such a rewrite).
+    // Tail/State/L3-only shapes may have no location hints.
+    const BlockPool* location_pool{nullptr};
+    std::vector<CacheBlockLocation> locations{};
 };
 
 // Pinned source/destination blocks for one asynchronous cache transfer. A

@@ -21,6 +21,8 @@
 #include <gtest/gtest.h>
 #include <spdlog/sinks/stdout_sinks.h>
 
+#include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -54,6 +56,28 @@ TEST(ChecksDeathTest, AFailedFatalCheckAbortsWithTheCallersLocation) {
             FatalCheck(false, "the pool is corrupt");
         },
         "Fatal check failed: the pool is corrupt at .*test_utils\\.cpp:[0-9]+ in .*TestBody");
+}
+
+TEST(CeilDivTest, StaysExactUpToInt32Max) {
+    constexpr std::int32_t kInt32Max = std::numeric_limits<std::int32_t>::max();
+    EXPECT_EQ(CeilDiv(0, 64), 0);
+    EXPECT_EQ(CeilDiv(1, 64), 1);
+    EXPECT_EQ(CeilDiv(64, 64), 1);
+    EXPECT_EQ(CeilDiv(65, 64), 2);
+    EXPECT_EQ(CeilDiv(kInt32Max, 1024), 2097152);
+    EXPECT_EQ(CeilDiv(kInt32Max - 1022, 1024), 2097152);
+    EXPECT_EQ(CeilDiv(kInt32Max - 1023, 1024), 2097151);
+    EXPECT_EQ(CeilDiv(kInt32Max, kInt32Max), 1);
+    EXPECT_EQ(CeilDiv(kInt32Max, 1), kInt32Max);
+}
+
+TEST(CheckedInt32Test, NarrowsInRangeAndThrowsPastIt) {
+    EXPECT_EQ(CheckedInt32(std::int64_t{std::numeric_limits<std::int32_t>::max()}),
+              std::numeric_limits<std::int32_t>::max());
+    EXPECT_EQ(CheckedInt32(std::int64_t{std::numeric_limits<std::int32_t>::min()}),
+              std::numeric_limits<std::int32_t>::min());
+    EXPECT_THROW((void)CheckedInt32(std::int64_t{1} << 31), std::runtime_error);
+    EXPECT_THROW((void)CheckedInt32(-(std::int64_t{1} << 31) - 1), std::runtime_error);
 }
 
 }  // namespace

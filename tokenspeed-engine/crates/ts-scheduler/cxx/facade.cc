@@ -530,7 +530,7 @@ rust::Vec<StorageOpView> plan_storage_ops(const tokenspeed::ExecutionPlan& plan)
         views.reserve(cache_keys.size());
         for (const tokenspeed::CacheKey& key : cache_keys) {
             views.push_back(StorageKeyView{.group_id = key.group_id,
-                                           .content_hash = rust::String(key.content_hash),
+                                           .content_hash = rust::String(key.content_hash.ToString()),
                                            .page_offset = key.page_offset});
         }
         return views;
