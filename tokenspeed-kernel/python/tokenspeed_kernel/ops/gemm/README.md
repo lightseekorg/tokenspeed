@@ -84,6 +84,13 @@ through the `("gemm", "mv_weightless_rmsnorm_gated_sigmoid")` operation. A
 registered kernel serves it only where the separate gated norm and `mv` select
 the kernels it reproduces bit for bit; otherwise callers keep the two calls.
 
+`mv_rmsnorm_gated_sigmoid` is its multi-row decode form, through the
+`("gemm", "mv_rmsnorm_gated_sigmoid")` operation: the GEMV's prologue runs the
+per-head `rmsnorm_gated_sigmoid` on 2 to 8 rows, each wave's K step one whole
+head. It stands in only where `mm` selects the GEMV it reproduces bit for bit
+on the normed rows; `mv_rmsnorm_gated_sigmoid_supported` tells callers when to
+keep the gated norm and `mm` as two calls.
+
 On SM107, BF16 output projections whose weight shape is in the measured
 `_SM107_BF16_GEMM_SHAPES` set (the TP4 per-rank projections plus the TP1
 `[2560, 6144]` o_proj) run FlashInfer's CuTe DSL low-latency GEMM at M <= 4,
