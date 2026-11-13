@@ -59,6 +59,9 @@ handshake socket. An EPD encode node's ranks run the host's encode mode instead
 event loop. Their first rank dials the frontend the same way and takes
 encode requests.
 
+The launcher snapshots each rank's environment inside its start context so
+allocator preload hooks reach the child along with the native logging defaults.
+
 What an engine registers with tells its frontend what it serves: the
 request types it takes (an encode server takes encode requests only), the
 field order of the positional structs on its wire, its role and, for a
@@ -732,7 +735,11 @@ final result on all forward threads before replying. Under the discard
 policy, local loading success is pending: only the successful replica-wide
 commit marks parameters usable. A failed load invalidates every rank,
 including ranks that loaded locally; KV wake and forwarding remain blocked
-until deployment restart. The same gate carries the online expert
+until deployment restart. Discard requires both the model and its resolved
+quantization configuration to opt in; quantized post-load derivation must
+rebuild codes and scales in place from the complete new checkpoint, never
+reuse discarded values or mark remapped storage usable on its own.
+The same gate carries the online expert
 rebalance's *internal* steps (snapshot, commit, chunk apply) from a second
 queue with its own columns: frontend operations arrive on different DP
 engines in different rounds while the controller queues internal steps at
