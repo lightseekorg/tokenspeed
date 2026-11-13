@@ -24,6 +24,8 @@
 #include <cstdint>
 #include <functional>
 
+#include "cache/core/prefetch.h"
+
 namespace tokenspeed {
 
 class BlockPool;
@@ -65,7 +67,7 @@ private:
 
 namespace internal_cache_block_ref {
 
-// Dynamically allocated shared-ownership control. The embedded CacheBlock is
+// Pool-owned, stable shared-ownership control. The embedded CacheBlock is
 // destroyed together with the control when the last CacheBlockRef releases it.
 class CacheBlockControl {
 public:
@@ -112,6 +114,11 @@ public:
 
     std::uint32_t use_count() const noexcept;
     bool unique() const noexcept { return use_count() == 1; }
+    // A hint for reading or releasing the block: prefetches its shared
+    // control (owner count, location, pool) without reading it.
+    void Prefetch() const noexcept {
+        if (control_ != nullptr) PrefetchObject(*control_);
+    }
     bool IsOwnedBy(const BlockPool& pool) const noexcept;
     void reset() noexcept;
     void swap(CacheBlockRef& other) noexcept;
@@ -126,6 +133,19 @@ private:
 
     internal_cache_block_ref::CacheBlockControl* control_{nullptr};
 };
+
+// Inline: index scans and evictions read these once per cache entry.
+inline const CacheBlock* CacheBlockRef::operator->() const noexcept {
+    return control_ == nullptr ? nullptr : &control_->object();
+}
+
+inline const CacheBlock& CacheBlockRef::operator*() const noexcept {
+    return control_->object();
+}
+
+inline std::uint32_t CacheBlockRef::use_count() const noexcept {
+    return control_ == nullptr ? 0 : control_->useCount();
+}
 
 inline void swap(CacheBlockRef& lhs, CacheBlockRef& rhs) noexcept {
     lhs.swap(rhs);
@@ -145,10 +165,17 @@ public:
     // A unique block invokes callback immediately; an empty reference cancels
     // any previous observation. The observer does not keep the block alive.
     void Observe(const CacheBlockRef& block, Callback callback, void* context) noexcept;
-    void Reset() noexcept;
+    void Reset() noexcept {
+        // An observer Observe has not linked has every field null already.
+        if (head_ != nullptr) {
+            unlink();
+        }
+    }
 
 private:
     friend class internal_cache_block_ref::CacheBlockControl;
+
+    void unlink() noexcept;
 
     CacheBlockUniqueObserver** head_{nullptr};
     CacheBlockUniqueObserver* previous_{nullptr};

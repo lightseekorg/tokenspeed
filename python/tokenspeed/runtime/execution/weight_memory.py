@@ -34,10 +34,13 @@ from typing import Protocol, runtime_checkable
 import torch
 from torch import nn
 
+from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+
 
 @runtime_checkable
 class DiscardableModel(Protocol):
     supports_weight_discard: bool
+    quant_config: QuantizationConfig | None
 
     def required_weight_update_names(self) -> set[str]: ...
 
@@ -121,6 +124,15 @@ class WeightMemoryState:
             ):
                 raise ValueError(
                     f"{type(model).__name__} does not support weight discard"
+                )
+            # Inspect the resolved model config, including quantization detected
+            # from a checkpoint or translated by a model/plugin at construction.
+            if (
+                model.quant_config is not None
+                and not model.quant_config.supports_weight_discard
+            ):
+                raise ValueError(
+                    f"{type(model.quant_config).__name__} does not support weight discard"
                 )
             # Fail at startup if the model cannot describe a complete replacement.
             if not isinstance(model.required_weight_update_names(), set):

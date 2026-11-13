@@ -88,7 +88,10 @@ class TestInstantTensorWeights:
 
             reference_tensors = dict(
                 safetensors_weights_iterator(
-                    safetensors_files, local_rank=0, local_world_size=1
+                    safetensors_files,
+                    local_rank=0,
+                    local_world_size=1,
+                    shared_weight_name_filter=None,
                 )
             )
 

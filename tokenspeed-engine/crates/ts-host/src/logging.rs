@@ -24,7 +24,52 @@ use std::io::Write;
 
 use pyo3::{prelude::*, types::PyDict};
 use tracing_appender::non_blocking::{NonBlockingBuilder, WorkerGuard};
+use tracing_subscriber::fmt::time::FormatTime;
 use tracing_subscriber::{fmt::writer::BoxMakeWriter, EnvFilter};
+
+/// Environment variable switching log timestamps to local time. Truthy
+/// values match dynamo's `DYN_LOG_USE_LOCAL_TZ`: `1`, `true`, `on`, `yes`
+/// (case-insensitive). Unset or any other value keeps UTC, the default.
+const ENV_LOG_USE_LOCAL_TZ: &str = "TS_HOST_LOG_USE_LOCAL_TZ";
+
+/// Timestamp rendering for the rank's own logs. Local time keeps one wall
+/// clock across the merged stderr: the C++ scheduler's spdlog and the
+/// embedded Python logging stack already log local time. The numeric UTC
+/// offset stays in the line so a timestamp is still unambiguous.
+enum LogTimer {
+    Local,
+    Utc,
+}
+
+impl LogTimer {
+    fn from_env() -> Self {
+        Self::from_value(std::env::var(ENV_LOG_USE_LOCAL_TZ).ok().as_deref())
+    }
+
+    /// Pure so the truthy table is testable without mutating the process
+    /// environment, which races `getenv` in concurrently running tests.
+    fn from_value(value: Option<&str>) -> Self {
+        match value {
+            Some(value) if matches!(value.to_lowercase().as_str(), "1" | "true" | "on" | "yes") => {
+                LogTimer::Local
+            }
+            _ => LogTimer::Utc,
+        }
+    }
+}
+
+impl FormatTime for LogTimer {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
+        match self {
+            LogTimer::Local => write!(
+                w,
+                "{}",
+                chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.6f%:z")
+            ),
+            LogTimer::Utc => write!(w, "{}", chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.6fZ")),
+        }
+    }
+}
 
 const QUEUE_CAPACITY: usize = 8192;
 
@@ -46,6 +91,7 @@ fn writer<W: Write + Send + 'static>(
 pub fn init(enable_async_logging: bool) -> Option<WorkerGuard> {
     let (writer, guard) = writer(std::io::stderr, enable_async_logging);
     tracing_subscriber::fmt()
+        .with_timer(LogTimer::from_env())
         .with_env_filter(
             EnvFilter::try_from_env("TS_HOST_LOG").unwrap_or_else(|_| EnvFilter::new("info")),
         )
@@ -88,6 +134,94 @@ mod tests {
     };
 
     use super::*;
+
+    #[derive(Clone)]
+    struct CaptureWriter {
+        output: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.output.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn format_one_line(timer: LogTimer) -> String {
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let stream = CaptureWriter {
+            output: output.clone(),
+        };
+        let (writer, guard) = writer(move || stream.clone(), false);
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_timer(timer)
+            .with_writer(writer)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("time check");
+        });
+        drop(guard);
+        let line = String::from_utf8_lossy(&output.lock().unwrap())
+            .trim()
+            .to_string();
+        line
+    }
+
+    #[test]
+    fn local_timer_logs_local_wall_clock_with_explicit_offset() {
+        let line = format_one_line(LogTimer::Local);
+        // "2026-11-13T17:12:41.763889+08:00  INFO time check: time check"
+        let (stamp, rest) = line
+            .split_once(' ')
+            .expect("event line starts with a timestamp field");
+        assert!(rest.contains("INFO"), "{line}");
+        assert!(!stamp.ends_with('Z'), "{line}");
+        let logged = chrono::DateTime::parse_from_rfc3339(stamp)
+            .unwrap_or_else(|error| panic!("{stamp}: {error}"));
+        let now = chrono::Local::now();
+        let drift = (logged.with_timezone(&chrono::Local) - now)
+            .num_seconds()
+            .abs();
+        assert!(drift < 60, "logged {logged} vs local now {now}");
+    }
+
+    #[test]
+    fn utc_timer_logs_utc_wall_clock() {
+        let line = format_one_line(LogTimer::Utc);
+        let (stamp, rest) = line
+            .split_once(' ')
+            .expect("event line starts with a timestamp field");
+        assert!(rest.contains("INFO"), "{line}");
+        let logged = chrono::DateTime::parse_from_rfc3339(stamp)
+            .unwrap_or_else(|error| panic!("{stamp}: {error}"));
+        assert!(stamp.ends_with('Z'), "{line}");
+        let drift = (logged.with_timezone(&chrono::Utc) - chrono::Utc::now())
+            .num_seconds()
+            .abs();
+        assert!(drift < 60, "logged {logged} vs utc now");
+    }
+
+    #[test]
+    fn use_local_tz_switch_follows_the_environment_variable() {
+        for (value, expect_local) in [
+            (Some("1"), true),
+            (Some("TRUE"), true),
+            (Some("yes"), true),
+            (Some("on"), true),
+            (Some("0"), false),
+            (Some(""), false),
+            (Some("no"), false),
+            (None, false),
+        ] {
+            let local = matches!(LogTimer::from_value(value), LogTimer::Local);
+            assert_eq!(local, expect_local, "TS_HOST_LOG_USE_LOCAL_TZ={value:?}");
+        }
+    }
 
     #[derive(Clone)]
     struct BlockingWriter {
