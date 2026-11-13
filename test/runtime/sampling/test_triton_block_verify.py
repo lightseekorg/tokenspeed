@@ -142,10 +142,12 @@ def _config(device: str) -> SamplingBackendConfig:
     )
 
 
-def _backend(monkeypatch, device: str = "cpu") -> tb.TritonSamplingBackend:
+def _backend(
+    monkeypatch, device: str = "cpu", method: str = "block"
+) -> tb.TritonSamplingBackend:
     # The rejection method is read from the server args, like ``numerics``.
     monkeypatch.setitem(
-        global_server_args_dict, "speculative_rejection_sample_method", "block"
+        global_server_args_dict, "speculative_rejection_sample_method", method
     )
     if device != "cpu":
         return tb.TritonSamplingBackend(_config(device))
@@ -317,15 +319,7 @@ def test_without_recorded_q_the_target_only_rule_runs(monkeypatch):
 
 
 def test_standard_rejection_allocates_no_block_buffers(monkeypatch):
-    monkeypatch.setitem(
-        global_server_args_dict, "speculative_rejection_sample_method", "standard"
-    )
-    with patch.object(
-        torch.cuda,
-        "get_device_properties",
-        return_value=SimpleNamespace(multi_processor_count=4),
-    ):
-        backend = tb.TritonSamplingBackend(_config("cpu"))
+    backend = _backend(monkeypatch, method="standard")
     assert not backend._block_verify
     assert backend._draft_probs_gather_buf is None and backend._block_coins is None
 
