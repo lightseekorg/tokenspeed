@@ -353,7 +353,13 @@ fn a_recording_sees_the_schedulers_phases_inside_its_calls() {
     };
     let submit = named("Scheduler::submit_requests");
     assert_eq!(submit.category, profile::HOST);
-    for phase in ["copyRequestSpecs", "Scheduler::SubmitRequests"] {
+    // With prefix caching on, a request's prompt page hashes are computed in
+    // the round it arrives, so ComputePrefixHashes runs under submit.
+    for phase in [
+        "copyRequestSpecs",
+        "Scheduler::SubmitRequests",
+        "ComputePrefixHashes",
+    ] {
         let phase = named(phase);
         assert_eq!(phase.category, profile::SCHEDULER, "{phase:?}");
         assert!(within(phase, submit), "{phase:?} outside {submit:?}");
@@ -371,7 +377,6 @@ fn a_recording_sees_the_schedulers_phases_inside_its_calls() {
         "Scheduler::scheduleLocalPrefillWork",
         "Scheduler::schedulePrefillFirstChunk",
         "Scheduler::matchPrefixAtAdmission",
-        "ComputePrefixHashes",
         "CacheCoordinator::ProbePromptPrefix",
         "CacheCoordinator::Admit",
         "planAdmission",
