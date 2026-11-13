@@ -26,6 +26,7 @@ and the pool writes keys in the plane's own dtype without converting.
 
 from __future__ import annotations
 
+import json
 from test.ci_system.ci_register import register_cuda_ci
 from test.runtime.dsa_index_k_test_utils import index_k_pool
 
@@ -152,28 +153,46 @@ def test_the_configure_attention_hook_names_the_plane():
         _dsa_spec(None)
 
 
-@pytest.mark.parametrize(
-    "architecture",
-    ["GlmMoeDsaForCausalLM", "DeepseekV41ForCausalLM", "LlamaForCausalLM"],
-)
-def test_only_kimi_k31_takes_an_index_k_format(architecture):
-    from types import SimpleNamespace
+_LLAMA_CONFIG = {
+    "model_type": "llama",
+    "architectures": ["LlamaForCausalLM"],
+    "dtype": "bfloat16",
+    "vocab_size": 32000,
+    "hidden_size": 64,
+    "intermediate_size": 128,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 16,
+    "max_position_embeddings": 512,
+}
 
-    from tokenspeed.runtime.configs.model_config import (
-        _resolve_attention_family,
-        refuse_untaken_index_k_format,
+
+def _model_config(path, config: dict, *, is_draft_worker=False, **flags):
+    from tokenspeed.runtime.configs.model_config import ModelConfig
+
+    (path / "config.json").write_text(json.dumps(config))
+    return ModelConfig(
+        str(path),
+        trust_remote_code=False,
+        model_override_args="{}",
+        dtype="bfloat16",
+        is_draft_worker=is_draft_worker,
+        server_args=ServerArgs(model=str(path), **flags),
     )
 
-    def check(arch, server_args):
-        config = SimpleNamespace(architectures=[arch])
-        family = _resolve_attention_family(config, config)
-        refuse_untaken_index_k_format(family, arch, server_args)
 
-    explicit = ServerArgs(model="x", dsa_index_k_format="fp8_scaled")
-    check("KimiK31ForConditionalGeneration", explicit)
-    check(architecture, ServerArgs(model="x"))
-    with pytest.raises(ValueError, match=f"only to Kimi-K3.1, not {architecture}"):
-        check(architecture, explicit)
+def test_only_kimi_k31_takes_an_index_k_format(tmp_path):
+    from test.runtime.test_kimi_k31 import _K31_CONFIG_JSON
+
+    _model_config(tmp_path, _K31_CONFIG_JSON, dsa_index_k_format="mxfp4")
+    _model_config(tmp_path, _LLAMA_CONFIG)
+    with pytest.raises(ValueError, match="only to Kimi-K3.1, not LlamaForCausalLM"):
+        _model_config(tmp_path, _LLAMA_CONFIG, dsa_index_k_format="fp8_scaled")
+    # A draft shares its target's launch flags.
+    _model_config(
+        tmp_path, _LLAMA_CONFIG, is_draft_worker=True, dsa_index_k_format="mxfp4"
+    )
 
 
 def test_bf16_plane_costs_its_own_rows():
