@@ -556,7 +556,7 @@ class ForwardStepRunner:
         # The tables name no arena; only the graphs and their pool go.
         global_graph_memory_pool = None
 
-    def _cuda_graph_capture_variants(self, bs: int = 1) -> tuple[str, ...]:
+    def _cuda_graph_capture_variants(self, bs: int) -> tuple[str, ...]:
         variants = (CUDA_GRAPH_VARIANT_DEFAULT,)
         if self.sampling_backend is not None:
             variants = tuple(
@@ -569,7 +569,7 @@ class ForwardStepRunner:
                     )
                 )
             )
-        drafter = getattr(self, "drafter", None)
+        drafter = self.drafter
         capacities = (
             (bs * self.max_tokens_per_req,)
             if drafter is None
@@ -609,7 +609,7 @@ class ForwardStepRunner:
     def _cuda_graph_key(self, bs: int) -> tuple[str, int]:
         variant = self._query_variant(
             self._cuda_graph_replay_variant(),
-            getattr(self, "_decode_query_tokens", None) or bs * self.max_tokens_per_req,
+            self._decode_query_tokens or bs * self.max_tokens_per_req,
             bs,
         )
         key = (variant, bs)

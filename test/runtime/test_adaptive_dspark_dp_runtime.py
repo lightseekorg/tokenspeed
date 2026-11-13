@@ -76,6 +76,21 @@ def _make_drafter(mapping):
     return drafter
 
 
+def _serving_budget(drafter, world):
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=4,
+        num_extends=0,
+        input_num_tokens=24,
+        forward_mode=ForwardMode.DECODE,
+        output_layout=ForwardOutputLayout(0, 0, 4, 6),
+        global_bs=[4] * world,
+        global_num_decodes=[4] * world,
+    )
+    return drafter.prepare_decode_graph_token_layout(ctx, actual_bs=4, padded_bs=4)
+
+
 @pytest.mark.skipif(
     int(os.environ.get("WORLD_SIZE", "1")) < 2,
     reason="requires torchrun with multiple GPUs",
@@ -125,7 +140,7 @@ def test_dp_budget_agreement_and_native_fallback():
         )
     for _ in range(2):
         drafter.verify_feedback.prepare(ids, slots, num_extends=0)
-    assert drafter._prepare_calibrated_budget(actual_bs=4, padded_bs=4) == 24
+    assert _serving_budget(drafter, world) == 24
     drafter.verify_feedback.publish(
         drafter.verify_feedback.snapshot(),
         local_scores,
@@ -133,7 +148,7 @@ def test_dp_budget_agreement_and_native_fallback():
     )
     for _ in range(2):
         drafter.verify_feedback.prepare(ids, slots, num_extends=0)
-    assert drafter._prepare_calibrated_budget(actual_bs=4, padded_bs=4) == 12
+    assert _serving_budget(drafter, world) == 12
     assert drafter._verify_indptr[-1].item() == 12
     assert drafter._verify_budget_buffers[4].valid.item()
     # Repeated allocations must retain fresh per-rank scores and layouts.
@@ -149,7 +164,7 @@ def test_dp_budget_agreement_and_native_fallback():
         )
         for _ in range(2):
             drafter.verify_feedback.prepare(ids, slots, num_extends=0)
-        assert drafter._prepare_calibrated_budget(actual_bs=4, padded_bs=4) == 12
+        assert _serving_budget(drafter, world) == 12
         pending_layouts.append(
             (
                 favored,
@@ -168,7 +183,7 @@ def test_dp_budget_agreement_and_native_fallback():
         favored = (rank + offset) % 4
         drafter.confidence_scores.fill_(-20)
         drafter.confidence_scores[favored].fill_(20)
-        assert drafter._prepare_calibrated_budget(actual_bs=4, padded_bs=4) == 12
+        assert _serving_budget(drafter, world) == 12
         counts = drafter._verify_indptr.diff().tolist()
         assert counts[favored] == 6 and sum(counts) == 12
     drafter.confidence_scores.fill_(float("inf"))
@@ -190,16 +205,14 @@ def test_dp_budget_agreement_and_native_fallback():
             drafter.prepare_decode_graph_token_layout(ctx, actual_bs=4, padded_bs=4)
             == 24
         )
-    # Exercise each peer with its actual local admission size, including idle.
+    # Idle peers need no feedback. A shortened active batch still has stale
+    # four-request feedback here and must fall back.
     for peer_bs in (0, 3):
         ctx.global_bs[-1] = ctx.global_num_decodes[-1] = peer_bs
         actual_bs = peer_bs if rank == world - 1 else 4
-        assert (
-            drafter.prepare_decode_graph_token_layout(
-                ctx, actual_bs=actual_bs, padded_bs=4
-            )
-            == 24
-        )
+        assert drafter.prepare_decode_graph_token_layout(
+            ctx, actual_bs=actual_bs, padded_bs=4
+        ) == (12 if peer_bs == 0 else 24)
     # Equal graph padding and batches below the local threshold stay native.
     for actual_bs, padded_bs in ((3, 4), (2, 2)):
         ctx.global_bs = [actual_bs] * world
@@ -296,7 +309,7 @@ def test_budget_without_forward_thread_sync(topology):
     for _ in range(2):
         drafter.verify_feedback.prepare(ids, slots, num_extends=0)
     with _strict_serving_sync():
-        selected = drafter._prepare_calibrated_budget(actual_bs=4, padded_bs=4)
+        selected = _serving_budget(drafter, world)
     assert selected == (12 if topology == "tp" else 24)
 
     drafter.verify_feedback.publish(
@@ -305,10 +318,20 @@ def test_budget_without_forward_thread_sync(topology):
     for _ in range(2):
         drafter.verify_feedback.prepare(ids, slots, num_extends=0)
     with _strict_serving_sync():
-        selected = drafter._prepare_calibrated_budget(actual_bs=4, padded_bs=4)
+        selected = _serving_budget(drafter, world)
     assert selected == 12
     counts = drafter._verify_indptr.diff().cpu().tolist()
     assert counts[favored] == 6 and sum(counts) == 12
+    torch.testing.assert_close(
+        drafter._verify_budget_buffers[4].scores.cpu(),
+        torch.tensor(scores),
+        rtol=0,
+        atol=0,
+    )
+    # Startup preparation broadcasts only inside each TP group.
+    with _strict_serving_sync():
+        selected = drafter._prepare_calibrated_budget(actual_bs=4, padded_bs=4)
+    assert selected == 12
     torch.testing.assert_close(
         drafter._verify_budget_buffers[4].scores.cpu(),
         torch.tensor(scores),

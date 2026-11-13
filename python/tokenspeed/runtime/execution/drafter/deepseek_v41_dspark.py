@@ -609,7 +609,11 @@ class DeepseekV41DSpark(BaseDrafter):
             packet[3:].copy_(torch.tensor(scores, dtype=torch.float32).flatten())
         if tp > 1:
             torch.distributed.broadcast(
-                packet, src=self.tp_group[0], group=self._verification_host_group
+                packet,
+                src=self.tp_group[0],
+                group=pg_manager.get_process_group(
+                    "gloo", self.tp_group, name="dsv41_verify_tp_metadata"
+                ),
             )
             selected = int(packet[0].item())
         if selected != full:
@@ -632,6 +636,10 @@ class DeepseekV41DSpark(BaseDrafter):
                 self._verification_group,
                 backend="gloo",
                 name="dsv41_verify_metadata",
+            )
+        if len(self.tp_group) > 1:
+            pg_manager.init_process_group(
+                self.tp_group, backend="gloo", name="dsv41_verify_tp_metadata"
             )
         buffers = _VerifyBudgetBuffers(
             scores=torch.zeros(
