@@ -45,6 +45,13 @@ from tokenspeed.runtime.execution.model_executor import (  # noqa: E402
     drafter_accept_lengths,
 )
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+from tokenspeed.runtime.models.kimi_k3 import (  # noqa: E402
+    KimiK3ForConditionalGeneration,
+)
+from tokenspeed.runtime.models.kimi_k25 import (  # noqa: E402
+    KimiK25ForConditionalGeneration,
+)
+from tokenspeed.runtime.models.registry import ModelRegistry  # noqa: E402
 from tokenspeed.runtime.models.target_capture import (  # noqa: E402
     TargetCaptureConfigurator,
 )
@@ -985,6 +992,35 @@ def test_dflash_leaves_the_taps_to_a_target_that_stores_them():
 
     assert ctx.target_capture_sink is None
     assert drafter._context_written is False
+
+
+def test_every_dflash_target_answers_whether_it_stores_the_taps():
+    # A block drafter asks each round, so a target it can attach to must answer.
+    missing = sorted(
+        name
+        for name, cls in ModelRegistry.models.items()
+        if hasattr(cls, "set_dflash_layers_to_capture")
+        and not hasattr(cls, "stores_capture_taps")
+    )
+    assert missing == []
+
+
+@pytest.mark.parametrize(
+    "wrapper", [KimiK3ForConditionalGeneration, KimiK25ForConditionalGeneration]
+)
+@pytest.mark.parametrize("stores_taps", [False, True])
+def test_a_multimodal_wrapper_answers_for_its_language_model(wrapper, stores_taps):
+    target = wrapper.__new__(wrapper)
+    torch.nn.Module.__init__(target)
+    target.language_model = _TapTarget(stores_taps)
+    drafter = _sink_dflash(enabled=True)
+    drafter.target_model = target
+    ctx = _target_ctx(num_extends=0, num_tokens=4)
+
+    drafter.prepare_target_forward(ctx)
+
+    assert target.stores_capture_taps(ctx) is stores_taps
+    assert (ctx.target_capture_sink is None) is stores_taps
 
 
 @pytest.mark.parametrize(
