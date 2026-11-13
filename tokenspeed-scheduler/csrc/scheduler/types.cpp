@@ -66,6 +66,10 @@ void SchedulerConfig::Validate() const {
     if (device_allocator.total_pages <= 1) {
         throw std::invalid_argument("Scheduler: device cache must contain a null page and usable capacity");
     }
+    // 0 or 1 is no Host pool; a negative count is no pool size at all.
+    if (host_allocator.total_pages < 0) {
+        throw std::invalid_argument("Scheduler: host_allocator.total_pages (num_host_pages) must be >= 0");
+    }
     for (const CacheGroupConfig& group : cache_groups) {
         group.Validate();
         // A grain only shapes where the checkpoint lands; the capability to write it stays a hard requirement, so
@@ -180,6 +184,12 @@ void SchedulerConfig::Validate() const {
     }
     // The knob retracts through the same path capacity pressure uses, and
     // that path needs somewhere to put the image.
+    // Its magnitude is the period; INT32_MIN has none in int32.
+    if (debug_force_retraction_interval == std::numeric_limits<std::int32_t>::min()) {
+        throw std::invalid_argument(
+            "Scheduler: debug_force_retraction_interval (--debug-force-retraction-interval) must be in "
+            "[-INT32_MAX, INT32_MAX]");
+    }
     if (debug_force_retraction_interval != 0 && !HasSnapshotPool()) {
         throw std::invalid_argument(
             "Scheduler: debug_force_retraction_interval (--debug-force-retraction-interval) requires a snapshot "

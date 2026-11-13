@@ -843,6 +843,31 @@ TEST(SchedulerConfigValidateTest, ForcedRetractionRequiresASnapshotPool) {
     EXPECT_NO_THROW(WithHostPackingFromDevice(config).Validate());
 }
 
+TEST(SchedulerConfigValidateTest, ForcedRetractionIntervalHasAnInt32Magnitude) {
+    // Its magnitude is the period in plans; INT32_MIN has none in int32.
+    SchedulerConfig config = MakeValidConfig();
+    for (const std::int32_t interval :
+         {std::numeric_limits<std::int32_t>::max(), -std::numeric_limits<std::int32_t>::max()}) {
+        config.debug_force_retraction_interval = interval;
+        EXPECT_NO_THROW(WithHostPackingFromDevice(config).Validate()) << interval;
+    }
+    config.debug_force_retraction_interval = std::numeric_limits<std::int32_t>::min();
+    EXPECT_THROW(WithHostPackingFromDevice(config).Validate(), std::invalid_argument);
+}
+
+TEST(SchedulerConfigValidateTest, RejectsANegativeHostPageCount) {
+    // 0 and the null page alone both mean no Host pool.
+    SchedulerConfig config = MakeValidConfig();
+    for (const std::int32_t pages : {0, 1}) {
+        config.host_allocator.total_pages = pages;
+        EXPECT_NO_THROW(WithHostPackingFromDevice(config).Validate()) << pages;
+    }
+    for (const std::int32_t pages : {-1, std::numeric_limits<std::int32_t>::min()}) {
+        config.host_allocator.total_pages = pages;
+        EXPECT_THROW(WithHostPackingFromDevice(config).Validate(), std::invalid_argument) << pages;
+    }
+}
+
 TEST(SchedulerConfigValidateTest, RetractionDiagnosticsNameTheServerArgs) {
     // The runtime surfaces these messages verbatim at startup, so each one
     // names the server arg the operator has to change.

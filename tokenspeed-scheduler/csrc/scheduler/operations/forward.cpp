@@ -1733,7 +1733,7 @@ void Scheduler::maybeForceRetraction(PlanBuild& build, std::span<Request* const>
     }
     if (armed == nullptr) {
         forced_victim_id_.clear();
-        if (plan_calls_ % std::abs(interval) != 0) {
+        if (plan_calls_ % std::abs(std::int64_t{interval}) != 0) {
             return;
         }
         const auto candidate = std::ranges::find_if(candidates, [&](Request* request) {
