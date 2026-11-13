@@ -114,6 +114,8 @@ class Inkling2ModelConfig(InklingModelConfig):
             "num_nextn_predict_layers": 0,
             "tie_word_embeddings": False,
             "hidden_act": "silu",
+            "pre_norm_pre_affine": False,
+            "final_norm_pre_affine": False,
         }
         for name, value in fixed.items():
             if name in kwargs and kwargs[name] != value:

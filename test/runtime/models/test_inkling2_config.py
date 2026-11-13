@@ -278,6 +278,8 @@ def test_draft_loading_rejects_old_nextn_path(
         ({"qk_l2_clip_threshold": float("nan")}, "finite and positive"),
         ({"gate_activation": "softmax"}, "requires gate_activation"),
         ({"num_nextn_predict_layers": 5}, "requires num_nextn_predict_layers"),
+        ({"pre_norm_pre_affine": True}, "requires pre_norm_pre_affine"),
+        ({"final_norm_pre_affine": True}, "requires final_norm_pre_affine"),
         ({"max_position_embeddings": 4096}, "must match model_max_length"),
         ({"v_head_dim": 64}, "v_head_dim must match head_dim"),
         ({"swa_v_head_dim": 64}, "swa_v_head_dim must match swa_head_dim"),
