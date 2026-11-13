@@ -310,6 +310,10 @@ _A8W4_STAGE1_DEDUP_MAX_M = 16
 _A8W4_SORTED_MIN_CONCURRENCY = 2
 _A8W4_SORTED_MIN_DRAFT_TOKENS = 4
 _A8W4_SORTED_STAGE1_MIN_M = _A8W4_SORTED_MIN_CONCURRENCY * _A8W4_SORTED_MIN_DRAFT_TOKENS
+# The decode rows that sort their routes by expert, padding each expert to a
+# multiple of this block; a sort made upstream in that layout replaces their own.
+A8W4_SORTED_DECODE_ROWS = range(_A8W4_SORTED_STAGE1_MIN_M, _SITU_WARP_DECODE_MAX_M + 1)
+A8W4_SORT_BLOCK_SIZE = 16
 _A8W4_SORTED_XCD_SWIZZLE = 1
 _A8W4_SORTED_STAGE2_N_TILES = 4
 
@@ -630,11 +634,13 @@ def gluon_mxfp4_fp8_precomputed_situ(
         )
 
         sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids = sorted_routes
-        capacity = _max_padded_route_capacity(M * TOPK, num_local_experts, 16)
+        capacity = _max_padded_route_capacity(
+            M * TOPK, num_local_experts, A8W4_SORT_BLOCK_SIZE
+        )
         if (
             sorted_ids.shape != (capacity,)
             or sorted_weights.shape != (capacity,)
-            or sorted_expert_ids.shape != (triton.cdiv(capacity, 16),)
+            or sorted_expert_ids.shape != (triton.cdiv(capacity, A8W4_SORT_BLOCK_SIZE),)
             or num_valid_ids.shape != (2,)
             or sorted_ids.dtype != torch.int32
             or sorted_weights.dtype != torch.float32
@@ -659,7 +665,7 @@ def gluon_mxfp4_fp8_precomputed_situ(
             num_local_experts,
             N,
             out_dtype,
-            16,
+            A8W4_SORT_BLOCK_SIZE,
             use_minimum_route_chunks=True,
             expert_start=expert_start,
             out=out,

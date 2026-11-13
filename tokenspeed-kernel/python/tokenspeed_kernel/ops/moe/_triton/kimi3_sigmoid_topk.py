@@ -527,6 +527,24 @@ def _kimi3_sigmoid_bias_topk_sorted_kernel(
                 )
 
 
+def kimi3_sorted_routing_supported(num_experts: int, top_k: int) -> bool:
+    """Whether ``kimi3_sigmoid_bias_topk_sorted`` routes this layer here."""
+    return num_experts == 896 and top_k == 16 and current_platform().is_cdna4
+
+
+def kimi3_sorted_routing_accepts(router_logits: torch.Tensor) -> bool:
+    """Whether ``kimi3_sigmoid_bias_topk_sorted`` takes these logits: contiguous
+    GPU FP32 ``[rows, 896]`` with ``1 <= rows <= 256``."""
+    return (
+        router_logits.dim() == 2
+        and router_logits.shape[1] == 896
+        and 0 < router_logits.shape[0] <= _SORTED_MAX_ROWS
+        and router_logits.dtype == torch.float32
+        and router_logits.is_cuda
+        and router_logits.is_contiguous()
+    )
+
+
 def kimi3_sorted_routing_scratch(device: torch.device) -> torch.Tensor:
     """Allocate the zeroed scratch ``kimi3_sigmoid_bias_topk_sorted`` reuses.
 
@@ -622,14 +640,7 @@ def kimi3_sigmoid_bias_topk_sorted(
         padded routes (and their blocks) are unwritten. Given
         ``shared_down``, its output follows as a seventh tensor.
     """
-    if (
-        router_logits.dim() != 2
-        or router_logits.shape[1] != 896
-        or not 0 < router_logits.shape[0] <= _SORTED_MAX_ROWS
-        or router_logits.dtype != torch.float32
-        or not router_logits.is_cuda
-        or not router_logits.is_contiguous()
-    ):
+    if not kimi3_sorted_routing_accepts(router_logits):
         raise ValueError(
             f"sorted Kimi K3 top-k requires contiguous GPU FP32 logits "
             f"[rows <= {_SORTED_MAX_ROWS}, 896]"
@@ -741,6 +752,8 @@ def kimi3_sigmoid_bias_topk_sorted(
 __all__ = [
     "kimi3_sigmoid_bias_topk",
     "kimi3_sigmoid_bias_topk_sorted",
+    "kimi3_sorted_routing_accepts",
     "kimi3_sorted_routing_fuses_shared_down",
     "kimi3_sorted_routing_scratch",
+    "kimi3_sorted_routing_supported",
 ]
