@@ -704,8 +704,7 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
                 } else if (group.attn_kind == AttnKind::kSlidingWindow) {
                     const std::int32_t block_granularity =
                         coordinator_.GroupBlockGranularity(static_cast<std::int32_t>(i));
-                    const std::int32_t hit_blocks =
-                        group.replayable ? 0 : (hit_tokens + block_granularity - 1) / block_granularity;
+                    const std::int32_t hit_blocks = group.replayable ? 0 : CeilDiv(hit_tokens, block_granularity);
                     const std::int32_t retained_begin =
                         std::max(0, request->PrefillSize() - *group.sliding_window_tokens + 1);
                     demands[i].extent = SparseSuffix{
@@ -990,21 +989,24 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
         // Every token-spanned group covers the same logical extent. Reuse
         // reserved speculative slots after a prefill interrupts decode instead
         // of charging another verify span on every restart.
-        const std::int32_t verify_end = num_computed_tokens + pending_decode_tokens + decode_width;
+        const std::int64_t verify_end = std::int64_t{num_computed_tokens} + pending_decode_tokens + decode_width;
         // Draft writes land in the next verify window up to the token limit; admission covers none without a budget.
         const std::int64_t draft_end =
             request->HasDeclaredBudget()
-                ? std::min({std::int64_t{verify_end} + CapacityModel::DraftWindowTokens(config_), request->TokenLimit(),
+                ? std::min({verify_end + CapacityModel::DraftWindowTokens(config_), request->TokenLimit(),
                             std::int64_t{std::numeric_limits<std::int32_t>::max()}})
                 : verify_end;
-        const auto decode_end = static_cast<std::int32_t>(std::max<std::int64_t>(verify_end, draft_end));
+        const std::int32_t decode_end =
+            CheckedInt32(std::max(verify_end, draft_end), "a decode window exceeds int32 token positions");
         std::int32_t reserved_end = decode_end;
         for (std::int32_t i = 0; i < coordinator_.NumGroups(); ++i) {
             if (coordinator_.GroupIsState(static_cast<std::size_t>(i))) {
                 continue;
             }
+            // The table's capacity, blocks * granularity, can pass INT32_MAX.
             const BlockTable& table = tables[static_cast<std::size_t>(i)];
-            reserved_end = table.NumBlocks() * coordinator_.GroupBlockGranularity(i) - table.AvailableTokens();
+            reserved_end = CheckedInt32(std::int64_t{table.NumBlocks()} * coordinator_.GroupBlockGranularity(i) -
+                                        table.AvailableTokens());
             break;
         }
         reserve_tokens = std::max(decode_end - reserved_end, 0);
@@ -1968,7 +1970,7 @@ std::vector<Scheduler::WholePrompt> Scheduler::wholePromptsAfter(std::span<Reque
                 .request = request,
                 .tokens = *tokens,
                 // What pushOperation charges a chunk ending at the prompt end.
-                .pages = (request->PrefillSize() + config_.prefix_granularity - 1) / config_.prefix_granularity,
+                .pages = CeilDiv(request->PrefillSize(), config_.prefix_granularity),
             });
         }
     }
