@@ -63,6 +63,12 @@ def make_fixture(output: Path):
         norm_topk_prob=True,
     )
     config.save_pretrained(output)
+    # Transformers 5 serializes num_experts as num_local_experts, while
+    # TokenSpeed's checkpoint config consumes the canonical num_experts key.
+    config_path = output / "config.json"
+    checkpoint_config = json.loads(config_path.read_text())
+    checkpoint_config["num_experts"] = experts
+    config_path.write_text(json.dumps(checkpoint_config, indent=2) + "\n")
     (output / "generation_config.json").write_text(
         json.dumps({"bos_token_id": 1, "eos_token_id": 2, "pad_token_id": 0}) + "\n"
     )
