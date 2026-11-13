@@ -48,7 +48,7 @@ from tokenspeed_kernel.ops.ple.triton import (
     _ple_page_gather_pair_kernel,
     _ple_page_scatter_kernel,
 )
-from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.platform import ArchVersion, current_platform, pdl_enabled
 from tokenspeed_kernel.warmup import kernel_launcher
 
 __all__ = [
@@ -465,13 +465,25 @@ def ple_conv_sequences(
         ):
             raise ValueError("windows is smaller than the requested block layout")
         write_windows = True
-    block_c = 256
+    platform = current_platform()
+    tiled = (
+        total_tokens >= 1024
+        and channels >= 1024
+        and not write_windows
+        and values.dtype == torch.bfloat16
+        and platform.is_nvidia
+        and platform.arch_version == ArchVersion(10, 3)
+    )
+    block_t, block_c = (8, 128) if tiled else (1, 256)
     use_pdl = pdl_enabled()
     pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
     final_conv = values.new_empty(
         (batch_size if write_final else 0, channels, state_len)
     )
-    work_items = max(total_tokens, batch_size if write_final or scatter_windows else 0)
+    work_items = max(
+        _triton.cdiv(total_tokens, block_t),
+        batch_size if write_final or scatter_windows else 0,
+    )
     if work_items:
         grid = (work_items, _triton.cdiv(channels, block_c))
         kernel_launcher(_ple_conv_state_kernel, grid)(
@@ -504,6 +516,7 @@ def ple_conv_sequences(
             ADD_RESIDUAL=len(addends) > 1,
             ENABLE_PDL=use_pdl,
             BLOCK_C=block_c,
+            BLOCK_T=block_t,
             **pdl_kwargs,
         )
     return conv_output, final_conv, windows

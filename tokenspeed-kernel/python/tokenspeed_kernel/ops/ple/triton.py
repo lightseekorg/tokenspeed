@@ -597,6 +597,75 @@ def _ple_conv_final_kernel(
 
 
 @triton.jit
+def _ple_conv_token_tile(
+    values_ptr,
+    initial_ptr,
+    weights,
+    req_ptr,
+    col_ptr,
+    starts_ptr,
+    out_ptr,
+    gated_ptr,
+    residual_ptr,
+    gated_row_stride,
+    residual_row_stride,
+    C,
+    TOTAL,
+    D: tl.constexpr,
+    K: tl.constexpr,
+    STATE: tl.constexpr,
+    ADD_GATED: tl.constexpr,
+    ADD_RESIDUAL: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+):
+    token = tl.program_id(0).to(tl.int64) * BLOCK_T + tl.arange(0, BLOCK_T)
+    ch = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
+    live = token < TOTAL
+    valid = live[:, None] & (ch[None, :] < C)
+    req = tl.load(req_ptr + token, live, other=0).to(tl.int64)
+    col = tl.load(col_ptr + token, live, other=0).to(tl.int64)
+    start = tl.load(starts_ptr + req, live, other=0).to(tl.int64)
+    initial_base = (req[:, None] * C + ch[None, :]) * STATE
+    out_dtype = out_ptr.dtype.element_ty
+
+    acc = tl.zeros((BLOCK_T, BLOCK_C), dtype=tl.float32)
+    for k in tl.static_range(K):
+        v = col + k * D
+        from_state = v < STATE
+        tok_idx = tl.maximum(start + v - STATE, 0)
+        x_state = tl.load(
+            initial_ptr + initial_base + v[:, None],
+            mask=valid & from_state[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        x_tok = tl.load(
+            values_ptr + tok_idx[:, None] * C + ch[None, :],
+            mask=valid & ~from_state[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        x = tl.where(from_state[:, None], x_state, x_tok)
+        acc += weights[k][None, :] * x
+    silu = acc * (1.0 / (1.0 + tl.exp(-acc)))
+    result = silu.to(out_dtype)
+    if ADD_GATED:
+        gated = tl.load(
+            gated_ptr + token[:, None] * gated_row_stride + ch[None, :],
+            mask=valid,
+            other=0.0,
+        )
+        result = (result.to(tl.float32) + gated.to(tl.float32)).to(out_dtype)
+    if ADD_RESIDUAL:
+        residual = tl.load(
+            residual_ptr + token[:, None] * residual_row_stride + ch[None, :],
+            mask=valid,
+            other=0.0,
+        )
+        result = (result.to(tl.float32) + residual.to(tl.float32)).to(out_dtype)
+    tl.store(out_ptr + token[:, None] * C + ch[None, :], result, mask=valid)
+
+
+@triton.jit
 def _ple_conv_state_kernel(
     values_ptr,
     initial_ptr,
@@ -627,11 +696,12 @@ def _ple_conv_state_kernel(
     WEIGHTS_INDEPENDENT: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
     BLOCK_C: tl.constexpr,
+    BLOCK_T: tl.constexpr,
 ):
     """One launch for token outputs and request states, including empty requests.
 
-    Program i owns token i and request i independently. Neither state writer
-    consumes conv outputs: both read the same immutable normalized input.
+    Program i owns a tile of tokens and request i independently. State writes
+    read the same immutable normalized input as convolution.
     """
     ch = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
     if ENABLE_PDL and not WEIGHTS_INDEPENDENT:
@@ -644,31 +714,58 @@ def _ple_conv_state_kernel(
             tl.extra.cuda.gdc_wait()
         # Successors may set up, but must wait before reading any output.
         tl.extra.cuda.gdc_launch_dependents()
-    if tl.program_id(0) < TOTAL:
-        _ple_dilated_conv_kernel(
-            values_ptr,
-            initial_ptr,
-            weights,
-            req_ptr,
-            col_ptr,
-            starts_ptr,
-            out_ptr,
-            windows_ptr,
-            gated_ptr,
-            residual_ptr,
-            windows_block_rows,
-            gated_row_stride,
-            residual_row_stride,
-            C,
-            D,
-            K,
-            STATE,
-            WRITE_WINDOWS,
-            SCATTER_WINDOWS,
-            ADD_GATED,
-            ADD_RESIDUAL,
-            BLOCK_C,
-        )
+    token_base = tl.program_id(0)
+    if BLOCK_T > 1:
+        token_base = token_base.to(tl.int64) * BLOCK_T
+    if token_base < TOTAL:
+        if BLOCK_T > 1:
+            _ple_conv_token_tile(
+                values_ptr,
+                initial_ptr,
+                weights,
+                req_ptr,
+                col_ptr,
+                starts_ptr,
+                out_ptr,
+                gated_ptr,
+                residual_ptr,
+                gated_row_stride,
+                residual_row_stride,
+                C,
+                TOTAL,
+                D,
+                K,
+                STATE,
+                ADD_GATED,
+                ADD_RESIDUAL,
+                BLOCK_C,
+                BLOCK_T,
+            )
+        else:
+            _ple_dilated_conv_kernel(
+                values_ptr,
+                initial_ptr,
+                weights,
+                req_ptr,
+                col_ptr,
+                starts_ptr,
+                out_ptr,
+                windows_ptr,
+                gated_ptr,
+                residual_ptr,
+                windows_block_rows,
+                gated_row_stride,
+                residual_row_stride,
+                C,
+                D,
+                K,
+                STATE,
+                WRITE_WINDOWS,
+                SCATTER_WINDOWS,
+                ADD_GATED,
+                ADD_RESIDUAL,
+                BLOCK_C,
+            )
     if WRITE_FINAL or SCATTER_WINDOWS:
         if tl.program_id(0) < BATCH:
             _ple_conv_final_kernel(
@@ -781,7 +878,17 @@ register_triton_warmup(
         for block in (32, 64, 128, 256)
     ),
 )
+
+
+def _conv_state_warmup_variants(bound):
+    bounds = {"TOTAL": (1, 16, 17), "BATCH": (1, 16, 17)}
+    if bound["BLOCK_T"] > 1:
+        # Long-prefill warmup also covers the same call with a short tail.
+        return (bounds, bounds | {"BLOCK_T": (1,), "BLOCK_C": (256,)})
+    return (bounds,)
+
+
 register_triton_warmup(
     _ple_conv_state_kernel,
-    variants=({"TOTAL": (1, 16, 17), "BATCH": (1, 16, 17)},),
+    variants=_conv_state_warmup_variants,
 )

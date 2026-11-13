@@ -53,7 +53,7 @@ from tokenspeed_kernel.ops.ple import (
     prepare_ngram_reciprocals,
 )
 from tokenspeed_kernel.ops.ple.triton import _exact_remainder
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import ArchVersion, current_platform
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="PLE kernel tests require a GPU"
@@ -312,6 +312,70 @@ def test_conv_runtime_bounds(lengths, write_final, windows, pdl):
             assert final.shape[0] == 0
         if windows:
             torch.testing.assert_close(scratch, expected_windows, rtol=0, atol=0)
+
+
+def test_conv_token_tiles_across_request_boundaries(pdl):
+    platform = current_platform()
+    if not platform.is_nvidia or platform.arch_version != ArchVersion(10, 3):
+        pytest.skip("token-tiled convolution uses NVIDIA SM103")
+
+    lengths = (521, 0, 510)
+    total, channels, state = sum(lengths), 1027, 9
+    opts = {"device": "cuda", "dtype": torch.bfloat16}
+    values = torch.randn(total + 9, channels, **opts)
+    gated, residual = [
+        torch.randn(total + 9, channels + 16, **opts)[:, :channels] for _ in range(2)
+    ]
+    weight = torch.randn(channels, 4, **opts)
+    initial = torch.randn(len(lengths), channels, state, **opts)
+
+    def prepare(lengths, values, initial, gated, residual):
+        lens = torch.tensor(lengths, device="cuda", dtype=torch.int64)
+        starts = lens.cumsum(0) - lens
+        req = torch.repeat_interleave(torch.arange(len(lengths), device="cuda"), lens)
+        col = torch.arange(sum(lengths), device="cuda") - starts[req]
+        args = (values, initial, weight, req, col, lens, starts)
+        kwargs = dict(
+            total_tokens=sum(lengths),
+            batch_size=len(lengths),
+            dilation=3,
+            kernel_size=4,
+            state_len=state,
+            write_final=True,
+            weights_independent=True,
+            add_terms=(gated, residual),
+        )
+        return args, kwargs
+
+    outputs, states = [], []
+    offset = 0
+    for request, length in enumerate(lengths):
+        rows = slice(offset, offset + length)
+        args, kwargs = prepare(
+            (length,),
+            values[rows],
+            initial[request : request + 1],
+            gated[rows],
+            residual[rows],
+        )
+        output, final, _ = ple_conv_sequences(*args, **kwargs)
+        outputs.append(output)
+        states.append(final)
+        offset += length
+    expected = torch.cat(outputs)
+    expected_final = torch.cat(states)
+
+    def check(output, final):
+        assert torch.equal(output[:total].view(torch.int16), expected.view(torch.int16))
+        assert torch.equal(final.view(torch.int16), expected_final.view(torch.int16))
+
+    args, kwargs = prepare(lengths, values, initial, gated, residual)
+    check(*ple_conv_sequences(*args, **kwargs)[:2])
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = ple_conv_sequences(*args, **kwargs)
+    graph.replay()
+    check(*captured[:2])
 
 
 def test_conv_state_large_request_offset(pdl):
