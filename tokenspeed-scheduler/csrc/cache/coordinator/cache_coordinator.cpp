@@ -45,8 +45,8 @@
 
 namespace tokenspeed {
 
-SessionCacheOwner CacheCoordinator::sessionTag(const std::string& id) {
-    auto& weak = session_tags_[id];
+SessionCacheOwner CacheCoordinator::cacheOwnerTag(const std::string& id, CacheOwnerTags& registry) {
+    auto& weak = registry[id];
     if (auto tag = weak.lock(); tag && !tag->ended) {
         tag->demoted = false;
         return tag;
@@ -57,6 +57,7 @@ SessionCacheOwner CacheCoordinator::sessionTag(const std::string& id) {
     if (++session_tags_since_sweep_ >= 4096) {
         session_tags_since_sweep_ = 0;
         std::erase_if(session_tags_, [](const auto& entry) { return entry.second.expired(); });
+        std::erase_if(cache_group_tags_, [](const auto& entry) { return entry.second.expired(); });
     }
     return tag;
 }
@@ -95,14 +96,23 @@ std::size_t CacheCoordinator::DemoteSession(const std::string& session_id, bool 
 }
 
 std::size_t CacheCoordinator::DemoteSessions(const std::vector<std::string>& ids, bool ended) {
+    return demoteCacheOwners(ids, ended, session_tags_);
+}
+
+std::size_t CacheCoordinator::DemoteCacheGroups(const std::vector<std::string>& ids, bool ended) {
+    return demoteCacheOwners(ids, ended, cache_group_tags_);
+}
+
+std::size_t CacheCoordinator::demoteCacheOwners(const std::vector<std::string>& ids, bool ended,
+                                                CacheOwnerTags& registry) {
     std::vector<SessionCacheOwner> owners;
     std::unordered_set<const SessionCacheTag*> tags;
     for (const auto& id : ids) {
-        auto it = session_tags_.find(id);
-        if (it == session_tags_.end()) continue;
+        auto it = registry.find(id);
+        if (it == registry.end()) continue;
         auto tag = it->second.lock();
         if (!tag) {
-            session_tags_.erase(it);
+            registry.erase(it);
             continue;
         }
         tag->demoted = true;
@@ -857,6 +867,18 @@ void CacheCoordinator::forEachCandidateBoundary(const PromptPrefix& prompt, std:
                     candidates.push_back({.tail_tokens = tail.tail_tokens, .hash = tail.hash});
                 }
             }
+            for (const auto boundary : prompt.shared_prefix_tokens) {
+                const auto count = boundary - page_tokens;
+                if (count <= 0 || count >= prefix_granularity_ || boundary > from_tokens ||
+                    boundary > prompt.max_tokens || boundary <= floor_tokens ||
+                    static_cast<std::size_t>(boundary) > prompt.tokens.size())
+                    continue;
+                const auto hash = HashPrefixPage(prompt.tokens.subspan(page_tokens, count), prior);
+                if (std::ranges::none_of(candidates, [&](const auto& candidate) {
+                        return candidate.tail_tokens == count && candidate.hash == hash;
+                    }))
+                    candidates.push_back({.tail_tokens = count, .hash = hash});
+            }
             std::ranges::stable_sort(candidates, std::greater<>{}, &TailTable::Tail::tail_tokens);
             // The prompt's own hash at a tail length, reused while the
             // candidates (sorted by length) keep that length.
@@ -864,8 +886,8 @@ void CacheCoordinator::forEachCandidateBoundary(const PromptPrefix& prompt, std:
             std::int32_t hashed_tail_tokens = 0;
             for (const TailTable::Tail& tail : candidates) {
                 const std::int32_t boundary = page_tokens + tail.tail_tokens;
-                if (boundary > from_tokens || boundary > prompt.max_tokens || boundary <= floor_tokens ||
-                    static_cast<std::size_t>(boundary) > prompt.tokens.size()) {
+                if (boundary % checkpoint_granularity_ != 0 || boundary > from_tokens || boundary > prompt.max_tokens ||
+                    boundary <= floor_tokens || static_cast<std::size_t>(boundary) > prompt.tokens.size()) {
                     continue;
                 }
                 if (tail.tail_tokens != hashed_tail_tokens) {
@@ -882,7 +904,7 @@ void CacheCoordinator::forEachCandidateBoundary(const PromptPrefix& prompt, std:
                 }
             }
         }
-        if (page_tokens > floor_tokens && page_tokens <= from_tokens) {
+        if (page_tokens > floor_tokens && page_tokens <= from_tokens && page_tokens % checkpoint_granularity_ == 0) {
             if (!visit(page_tokens, 0, ContentHash{})) {
                 return;
             }
@@ -3270,6 +3292,61 @@ void CacheCoordinator::forEachStorageDependency(const PrefixProbe::Tier& probe,
             }
         }
     }
+}
+
+CacheCoordinator::StorageQuery CacheCoordinator::SharedPrefixKeys(const PromptPrefix& prompt,
+                                                                  std::size_t max_keys) const {
+    StorageQuery result;
+    if (prompt.max_tokens <= 0) return result;
+    const auto full_tokens = prompt.max_tokens / prefix_granularity_ * prefix_granularity_;
+    const auto tail_tokens = prompt.max_tokens - full_tokens;
+    if (static_cast<std::size_t>(full_tokens / prefix_granularity_) > prompt.prefix_hashes.size() ||
+        (tail_tokens && (!prompt.tail || prompt.tail->tail_tokens != tail_tokens)))
+        return result;
+    const auto add = [&](CacheKey key) {
+        if (result.keys.size() == max_keys) return false;
+        result.keys.push_back(std::move(key));
+        return true;
+    };
+    for (const auto i : match_order_) {
+        const auto& group = groups_[i];
+        if (GroupIsState(i)) {
+            if (prompt.max_tokens % group.Spec().checkpoint_granularity != 0) return {};
+            const auto& hash =
+                tail_tokens ? prompt.tail->hash : prompt.prefix_hashes[full_tokens / prefix_granularity_ - 1];
+            if (!add(CacheKey{.group_id = group.Id(), .content_hash = hash, .page_offset = 0})) {
+                result.max_tokens = -1;
+                return result;
+            }
+            continue;
+        }
+        const auto grain = geometry_[i].BlockGranularity();
+        const auto per_prefix = prefix_granularity_ / grain;
+        const auto full_blocks = full_tokens / grain;
+        const auto first = group.Matcher().IsPrefixClosed()
+                               ? 0
+                               : SlidingWindowBlocks(static_cast<std::int32_t>(i), prompt.max_tokens).first;
+        for (auto block = first; block < full_blocks; ++block) {
+            if (!add(CacheKey{.group_id = group.Id(),
+                              .content_hash = prompt.prefix_hashes[block / per_prefix],
+                              .page_offset = block % per_prefix})) {
+                result.max_tokens = -1;
+                return result;
+            }
+        }
+        if (tail_tokens) {
+            const auto keys = tailKeysForGroup(i, prompt.tail->hash, tail_tokens);
+            for (std::size_t j = 0; j < keys.size(); ++j) {
+                if (full_blocks + static_cast<std::int32_t>(j) < first) continue;
+                if (!add(keys[j])) {
+                    result.max_tokens = -1;
+                    return result;
+                }
+            }
+        }
+    }
+    result.max_tokens = prompt.max_tokens;
+    return result;
 }
 
 CacheCoordinator::StorageQuery CacheCoordinator::MissingStorageKeys(const PromptPrefix& prompt,

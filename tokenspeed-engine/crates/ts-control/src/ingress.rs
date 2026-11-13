@@ -266,6 +266,22 @@ pub fn admit(mut request: TokenizedGenerateReqInput, limits: &IngressLimits) -> 
                 })
         })
         .or_else(|| {
+            request
+                .cache_group_id
+                .as_ref()
+                .filter(|id| id.len() > MAX_CACHE_SESSION_ID_BYTES)
+                .map(|_| {
+                    format!(
+                        "cache_group_id exceeds the limit of {MAX_CACHE_SESSION_ID_BYTES} UTF-8 bytes"
+                    )
+                })
+        })
+        .or_else(|| {
+            (request.shared_prefix_tokens.len() > 64 || request.shared_prefix_tokens.iter().any(|&boundary|
+                boundary <= 0 || boundary as usize >= request.input_ids.as_ref().map_or(0, Vec::len)))
+                .then(|| "shared_prefix_tokens requires at most 64 positive boundaries shorter than the input".to_owned())
+        })
+        .or_else(|| {
             refusal(
                 &view,
                 request.input_ids.as_deref().unwrap_or_default(),
@@ -353,6 +369,8 @@ pub fn admit(mut request: TokenizedGenerateReqInput, limits: &IngressLimits) -> 
     let spec = RequestSpec {
         request_id: rid.clone(),
         session_id: request.cache_session_id.unwrap_or_default(),
+        cache_group_id: request.cache_group_id.unwrap_or_default(),
+        shared_prefix_tokens: request.shared_prefix_tokens,
         tokens: request.input_ids.unwrap_or_default(),
         max_new_tokens: max_new_tokens.clamp(0, i64::from(i32::MAX)) as i32,
         // Prompt logprobs need logits from their start on, so the admission
@@ -726,6 +744,49 @@ mod tests {
             let message = refused_message(admit(request, &limits()).unwrap());
             assert!(message.contains("cache_session_id"), "{message}");
             assert!(message.contains("4096 UTF-8 bytes"), "{message}");
+        }
+    }
+
+    #[test]
+    fn shared_prefix_hints_are_bounded_and_preserve_normal_admission() {
+        let mut valid = request("r1", vec![1, 2, 3, 4], SamplingParams::default());
+        valid.shared_prefix_tokens = vec![1, 3];
+        let Some(Admitted::Run(admission)) = admit(valid, &limits()) else {
+            panic!("expected valid hints")
+        };
+        assert_eq!(admission.spec.shared_prefix_tokens, [1, 3]);
+        assert_eq!(admission.spec.max_cached_prefix_tokens, i32::MAX);
+        for hints in [vec![0], vec![-1], vec![4], vec![1; 65]] {
+            let mut invalid = request("r1", vec![1, 2, 3, 4], SamplingParams::default());
+            invalid.shared_prefix_tokens = hints;
+            assert!(refused_message(admit(invalid, &limits()).unwrap())
+                .contains("shared_prefix_tokens"));
+        }
+    }
+
+    #[test]
+    fn cache_groups_do_not_replace_sessions_or_change_tokens() {
+        for group_id in [
+            None,
+            Some(String::new()),
+            Some("g".repeat(4096)),
+            Some("🦀".repeat(1024)),
+        ] {
+            let mut request = request("r1", vec![1, 2, 3], SamplingParams::default());
+            request.cache_session_id = Some("independent-session".to_owned());
+            request.cache_group_id = group_id.clone();
+            let Some(Admitted::Run(admission)) = admit(request, &limits()) else {
+                panic!("expected admission for a bounded cache group");
+            };
+            assert_eq!(admission.spec.session_id, "independent-session");
+            assert_eq!(admission.spec.cache_group_id, group_id.unwrap_or_default());
+            assert_eq!(admission.spec.tokens, [1, 2, 3]);
+        }
+        for group_id in ["g".repeat(4097), format!("{}g", "🦀".repeat(1024))] {
+            let mut request = request("r1", vec![1, 2, 3], SamplingParams::default());
+            request.cache_group_id = Some(group_id);
+            let message = refused_message(admit(request, &limits()).unwrap());
+            assert!(message.contains("cache_group_id"), "{message}");
         }
     }
 

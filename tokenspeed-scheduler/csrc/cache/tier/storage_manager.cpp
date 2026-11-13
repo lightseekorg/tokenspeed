@@ -191,6 +191,15 @@ void StorageTransferManager::rememberNegative(const CacheKey& key) {
     }
 }
 
+void StorageTransferManager::rememberPublished(const CacheKey& key) {
+    if (!published_.insert(key).second) return;
+    published_order_.push_back(key);
+    while (published_order_.size() > static_cast<std::size_t>(config_.metadata_entries)) {
+        published_.erase(published_order_.front());
+        published_order_.pop_front();
+    }
+}
+
 void StorageTransferManager::Complete(const cache::StorageDone& event) {
     const auto it = operations_.find(event.op_id);
     if (it == operations_.end() || it->second.completed) return;
@@ -212,9 +221,14 @@ void StorageTransferManager::Complete(const cache::StorageDone& event) {
         for (std::size_t i = 0; i < ticket.success.size(); ++i) {
             if (!ticket.detached && event.object_failures[i]) {
                 rememberNegative(ticket.keys[i]);
+                published_.erase(ticket.keys[i]);
+                std::erase(published_order_, ticket.keys[i]);
             }
             if (event.retired && !ticket.detached && ticket.success[i]) {
                 coordinator_.CacheHostBlock(ticket.blocks[i], ticket.keys[i], /*inherited_metadata=*/std::nullopt);
+                // A successful accepted GET proves the immutable object also
+                // existed remotely. A later producer need not PUT it again.
+                rememberPublished(ticket.keys[i]);
             }
         }
         if (event.retired && !ticket.detached && ticket.tail) {
@@ -222,6 +236,11 @@ void StorageTransferManager::Complete(const cache::StorageDone& event) {
         }
     }
     if (!event.retired) return;  // Quarantine is charged until a process/transport teardown proves safety.
+    if (kind == StorageKind::kPut) {
+        for (std::size_t i = 0; i < ticket.keys.size(); ++i) {
+            if (ticket.success[i]) rememberPublished(ticket.keys[i]);
+        }
+    }
     if (ticket.detached || kind == StorageKind::kPut) operations_.erase(it);
 }
 
@@ -322,6 +341,9 @@ void StorageTransferManager::ClearMetadata() {
     DropBackups();
     negative_.clear();
     negative_order_.clear();
+    published_.clear();
+    published_order_.clear();
+    ++publication_epoch_;
 }
 
 std::vector<StorageOperation> StorageTransferManager::TakeCommands() {

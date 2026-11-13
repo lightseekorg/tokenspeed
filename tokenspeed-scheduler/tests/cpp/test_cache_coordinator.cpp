@@ -77,7 +77,7 @@ TEST(CacheCoordinatorAdmissionBuckets, HostHitDestinationsPreserveSourceOwnershi
         const std::array demands{GroupDemand{.table = &tables[0], .extent = DenseGrowth{4}}};
         auto admitted = coordinator.Admit(coordinator.ProbePrefix(hashes), demands, RequestProgress{},
                                           /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt, false,
-                                          /*session_id=*/{});
+                                          /*session_id=*/{}, /*cache_group_id=*/{});
         ASSERT_TRUE(admitted);
         EXPECT_EQ(admitted->host_prefix_tokens, 16);
         ASSERT_EQ(admitted->load_pairs.size(), hashes.size());
@@ -166,7 +166,8 @@ TEST(CacheCoordinatorPreparedKeysTest, ProbeOwnsKeysAfterRequestIsReleased) {
     std::vector<BlockTable> tables(1);
     const std::array demands{GroupDemand{.table = &tables[0], .extent = DenseGrowth{1}}};
     const auto admitted = coordinator.Admit(std::move(probe), demands, RequestProgress{}, /*copy_in_blocks=*/{},
-                                            /*copy_in_point=*/std::nullopt, std::nullopt, false, /*session_id=*/{});
+                                            /*copy_in_point=*/std::nullopt, std::nullopt, false, /*session_id=*/{},
+                                            /*cache_group_id=*/{});
     ASSERT_TRUE(admitted);
     EXPECT_EQ(admitted->device_prefix_tokens, 6);
     EXPECT_EQ(tables[0].NumBlocks(), 4);
@@ -778,7 +779,7 @@ TEST(CacheCoordinatorAdmissionTest, ReportsOnlyFreshlyAllocatedKernelPageIds) {
     const std::optional<CacheCoordinator::AdmissionResult> first =
         coordinator.Admit(coordinator.ProbePrefix({}), first_demands, RequestProgress{},
                           /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt,
-                          /*evict_blocks_past_segments=*/false, /*session_id=*/{});
+                          /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{});
 
     ASSERT_TRUE(first);
     ASSERT_EQ(first->new_page_ids.size(), 2u);
@@ -796,7 +797,7 @@ TEST(CacheCoordinatorAdmissionTest, ReportsOnlyFreshlyAllocatedKernelPageIds) {
     const std::optional<CacheCoordinator::AdmissionResult> tail =
         coordinator.Admit(coordinator.ProbePrefix({}), tail_demands, RequestProgress{},
                           /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, first->access_epoch,
-                          /*evict_blocks_past_segments=*/false, /*session_id=*/{});
+                          /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{});
 
     ASSERT_TRUE(tail);
     ASSERT_EQ(tail->new_page_ids.size(), 2u);
@@ -829,7 +830,7 @@ TEST(CacheCoordinatorAdmissionTest, AcquireMatchedFullPrefixUsesOneAccessEpoch) 
     std::vector<GroupDemand> hit_demands = FreshDemands(hit_tables, no_new_tokens);
     ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix(hashes), hit_demands, RequestProgress{},
                                   /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt,
-                                  /*evict_blocks_past_segments=*/false, /*session_id=*/{}));
+                                  /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{}));
 
     std::vector<std::uint64_t> access_epochs;
     for (CacheBlockLocation location : locations) {
@@ -871,7 +872,7 @@ TEST(CacheCoordinatorAdmissionTest, LaterChunksReuseRequestAccessEpoch) {
     const std::optional<CacheCoordinator::AdmissionResult> second =
         coordinator.Admit(coordinator.ProbePrefix({}), second_demands, second_progress,
                           /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, first->access_epoch,
-                          /*evict_blocks_past_segments=*/false, /*session_id=*/{});
+                          /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{});
     ASSERT_TRUE(second);
     EXPECT_EQ(second->access_epoch, first->access_epoch);
 
@@ -888,7 +889,7 @@ TEST(CacheCoordinatorAdmissionTest, LaterChunksReuseRequestAccessEpoch) {
     const std::optional<CacheCoordinator::AdmissionResult> final =
         coordinator.Admit(coordinator.ProbePrefix({}), final_publication, final_progress,
                           /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, first->access_epoch,
-                          /*evict_blocks_past_segments=*/false, /*session_id=*/{});
+                          /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{});
     ASSERT_TRUE(final);
 
     for (const CacheBlockRef& block_ref : tables[0].Blocks()) {
@@ -929,7 +930,7 @@ TEST(CacheCoordinatorAdmissionTest, ProbeAndRejectedAdmissionDoNotAdvanceAccessE
     };
     EXPECT_FALSE(coordinator.Admit(std::move(probe), rejected_demands, RequestProgress{},
                                    /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt,
-                                   /*evict_blocks_past_segments=*/false, /*session_id=*/{}));
+                                   /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{}));
     metadata = coordinator.GroupPrefixIndex(0).MetadataFor(pool, location);
     ASSERT_TRUE(metadata);
     EXPECT_EQ(metadata->last_access_epoch, owner->access_epoch);
@@ -942,7 +943,7 @@ TEST(CacheCoordinatorAdmissionTest, ProbeAndRejectedAdmissionDoNotAdvanceAccessE
     const std::optional<CacheCoordinator::AdmissionResult> hit =
         coordinator.Admit(coordinator.ProbePrefix(hashes), hit_demands, RequestProgress{},
                           /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt,
-                          /*evict_blocks_past_segments=*/false, /*session_id=*/{});
+                          /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{});
     ASSERT_TRUE(hit);
     EXPECT_EQ(hit->access_epoch, owner->access_epoch + 1);
 }
@@ -1035,7 +1036,7 @@ TEST(CacheCoordinatorAdmissionTest, RejectedCachedHitDoesNotRefreshAccessEpoch) 
         CacheCoordinator::PrefixProbe prefix = coordinator.ProbePrefix(std::span<const std::string>{hashes}.first(1));
         EXPECT_FALSE(coordinator.Admit(std::move(prefix), demands, RequestProgress{},
                                        /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt,
-                                       /*evict_blocks_past_segments=*/false, /*session_id=*/{}));
+                                       /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{}));
         EXPECT_TRUE(tables[0].Blocks().empty());
         EXPECT_TRUE(coordinator.GroupPrefixIndex(0).Contains(pool, cached_location));
         const std::optional<PrefixCacheIndex::CachedBlockMetadata> metadata =
@@ -1111,7 +1112,7 @@ TEST(CacheCoordinatorAdmissionTest, FreeCachedHitCostsNoAdditionalPlacement) {
     std::vector<GroupDemand> demands = FreshDemands(tables, tokens);
     ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix(hashes), demands, RequestProgress{},
                                   /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt,
-                                  /*evict_blocks_past_segments=*/false, /*session_id=*/{}));
+                                  /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{}));
 
     ASSERT_EQ(tables[0].NumBlocks(), 2);
     EXPECT_EQ(tables[0].Blocks()[0]->Location().lcm_block_id, hit_parent);
@@ -1135,7 +1136,7 @@ TEST(CacheCoordinatorAdmissionTest, ReservedCapacityLivesInBlockTableUntilConsum
     const std::optional<CacheCoordinator::AdmissionResult> result =
         coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, /*copy_in_blocks=*/{},
                           /*copy_in_point=*/std::nullopt, std::nullopt,
-                          /*evict_blocks_past_segments=*/false, /*session_id=*/{});
+                          /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{});
     ASSERT_TRUE(result);
 
     EXPECT_TRUE(result->load_pairs.empty());
@@ -1166,7 +1167,7 @@ TEST(CacheCoordinatorAdmissionTest, HeterogeneousGroupsSharePartialAndEmptyParen
     std::vector<GroupDemand> demands = FreshDemands(tables, tokens);
     ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix(hashes), demands, RequestProgress{},
                                   /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt,
-                                  /*evict_blocks_past_segments=*/false, /*session_id=*/{}));
+                                  /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{}));
 
     ASSERT_EQ(tables[0].NumBlocks(), 1);
     EXPECT_EQ(tables[0].Blocks()[0]->Location(), (CacheBlockLocation{.lcm_block_id = hit_parent, .slot_index = 1}));
@@ -1192,7 +1193,7 @@ TEST(CacheCoordinatorAdmissionTest, PacksDemandBeforeConsumingAnotherGroupsOnlyP
     std::vector<GroupDemand> demands = FreshDemands(tables, tokens);
     ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{},
                                   /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt,
-                                  /*evict_blocks_past_segments=*/false, /*session_id=*/{}));
+                                  /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{}));
 
     ASSERT_EQ(tables[0].NumBlocks(), 2);
     const std::int32_t packed_parent = tables[0].Blocks()[0]->Location().lcm_block_id;
@@ -1224,7 +1225,7 @@ TEST(CacheCoordinatorAdmissionTest, RetriesWithCompactPackingWhenGreedyFreeSlots
     std::vector<GroupDemand> demands = FreshDemands(tables, tokens);
     ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{},
                                   /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt,
-                                  /*evict_blocks_past_segments=*/false, /*session_id=*/{}));
+                                  /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{}));
 
     ASSERT_EQ(tables[0].NumBlocks(), 2);
     EXPECT_EQ(tables[0].Blocks()[0]->Location().lcm_block_id, tables[0].Blocks()[1]->Location().lcm_block_id);
@@ -1253,7 +1254,7 @@ TEST(CacheCoordinatorAdmissionTest, KeepsCachedChildrenWhenUnpackedPlacementFits
     std::vector<GroupDemand> demands = FreshDemands(tables, tokens);
     ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{},
                                   /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt,
-                                  /*evict_blocks_past_segments=*/false, /*session_id=*/{}));
+                                  /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{}));
 
     EXPECT_EQ(coordinator.GroupPrefixIndex(0).NumEntries(pool), 2);
 }
@@ -1296,7 +1297,7 @@ TEST(CacheCoordinatorAdmissionTest, DoesNotShareFreeSlotsFromBoundForeignParent)
     std::vector<GroupDemand> demands = FreshDemands(tables, tokens);
     EXPECT_FALSE(coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{},
                                    /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt,
-                                   /*evict_blocks_past_segments=*/false, /*session_id=*/{}));
+                                   /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{}));
 
     EXPECT_EQ(pool.BoundGroup(1), std::optional<std::uint32_t>{0});
     EXPECT_TRUE(tables[0].Blocks().empty());
@@ -1350,14 +1351,14 @@ TEST(CacheCoordinatorAdmissionTest, ScatteredAvailableSlotsWaitForAWholeParentTo
     for (int attempt = 0; attempt < 2; ++attempt) {
         EXPECT_FALSE(coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{},
                                        /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt, false,
-                                       /*session_id=*/{}));
+                                       /*session_id=*/{}, /*cache_group_id=*/{}));
         EXPECT_EQ(coordinator.GroupPrefixIndex(0).NumEntries(pool), 8);
         EXPECT_TRUE(tables[1].Blocks().empty());
     }
     first.reset();
     ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{},
                                   /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt, false,
-                                  /*session_id=*/{}));
+                                  /*session_id=*/{}, /*cache_group_id=*/{}));
     EXPECT_EQ(coordinator.GroupPrefixIndex(0).NumEntries(pool), 4);
     EXPECT_EQ(tables[1].NumBlocks(), 1);
     EXPECT_TRUE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(hashes[4], 0)));
@@ -1387,7 +1388,7 @@ TEST(CacheCoordinatorAdmissionTest, FullEvictionUsesAccessEpochInsteadOfPermanen
     std::vector<GroupDemand> hit_demands = FreshDemands(hit_tables, no_new_tokens);
     ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix(std::span{hashes}.first(1)), hit_demands, RequestProgress{},
                                   /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt,
-                                  /*evict_blocks_past_segments=*/false, /*session_id=*/{}));
+                                  /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{}));
     coordinator.Free(hit_tables);
 
     std::vector<BlockTable> second_tables(coordinator.NumGroups());
@@ -1463,7 +1464,7 @@ TEST(CacheCoordinatorAdmissionTest, MixedGroupTieEvictsNonClosedBeforeFullHistor
     };
     ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{},
                                   /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt,
-                                  /*evict_blocks_past_segments=*/false, /*session_id=*/{}));
+                                  /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{}));
 
     EXPECT_TRUE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(hashes[0], 0)));
     EXPECT_FALSE(coordinator.GroupPrefixIndex(1).Contains(pool, Key(hashes[1], 1)));
@@ -1493,7 +1494,7 @@ TEST(CacheCoordinatorAdmissionTest, MergesGroupEpochsWithPinnedEntriesInEitherGr
         demands[full_group] = GroupDemand{.table = &tables[full_group], .extent = DenseGrowth{4}};
         ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{},
                                       /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt, false,
-                                      /*session_id=*/{}));
+                                      /*session_id=*/{}, /*cache_group_id=*/{}));
         EXPECT_TRUE(coordinator.GroupPrefixIndex(full_group).Contains(pool, Key(hashes[0], full_group)));
         EXPECT_FALSE(coordinator.GroupPrefixIndex(state_group).Contains(pool, Key(hashes[1], state_group)));
         EXPECT_TRUE(coordinator.GroupPrefixIndex(full_group).Contains(pool, Key(hashes[2], full_group)));
@@ -1535,7 +1536,7 @@ TEST(CacheCoordinatorAdmissionTest, RetriesWithFreshCursorsAfterPinnedAdmissionF
     for (int attempt = 0; attempt < 3; ++attempt) {
         EXPECT_FALSE(coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{},
                                        /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt,
-                                       /*evict_blocks_past_segments=*/false, /*session_id=*/{}));
+                                       /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{}));
         for (const BlockTable& table : tables) {
             EXPECT_EQ(table.NumBlocks(), 0);
         }
@@ -1546,7 +1547,7 @@ TEST(CacheCoordinatorAdmissionTest, RetriesWithFreshCursorsAfterPinnedAdmissionF
     pins[1].reset();
     ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{},
                                   /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt,
-                                  /*evict_blocks_past_segments=*/false, /*session_id=*/{}));
+                                  /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{}));
 
     EXPECT_TRUE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(hashes[0], 0, 0)));
     EXPECT_FALSE(coordinator.GroupPrefixIndex(1).Contains(pool, Key(hashes[1], 1, 0)));
@@ -1577,7 +1578,7 @@ TEST(CacheCoordinatorAdmissionTest, AReleasedCheckpointCanLeaveWithItsCanonicalP
         const auto admit = [&](std::vector<GroupDemand>& demands, const RequestProgress& progress) {
             return coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, /*copy_in_blocks=*/{},
                                      /*copy_in_point=*/std::nullopt, std::nullopt, allow_block_eviction,
-                                     /*session_id=*/{});
+                                     /*session_id=*/{}, /*cache_group_id=*/{});
         };
 
         // A live older request can publish its KV under its admission epoch
@@ -1701,7 +1702,7 @@ TEST(CacheCoordinatorAdmissionTest, LiveHistoryCannotFundRotationButAReleasedInp
         };
         ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{},
                                       /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt, false,
-                                      /*session_id=*/{}));
+                                      /*session_id=*/{}, /*cache_group_id=*/{}));
         ASSERT_EQ(pool.NumEmptyLcmBlocks(), capacity - 18);
         const auto history = BlockTableLcmBlockIds(tables[0]);
         CacheBlockRef retained_input = tables[1].Blocks()[0];
@@ -1713,7 +1714,7 @@ TEST(CacheCoordinatorAdmissionTest, LiveHistoryCannotFundRotationButAReleasedInp
             // retains the input. The live history is never released.
             ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, progress,
                                           /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt, false,
-                                          /*session_id=*/{}));
+                                          /*session_id=*/{}, /*cache_group_id=*/{}));
             EXPECT_EQ(BlockTableLcmBlockIds(tables[0]), history);
             EXPECT_EQ(pool.NumEmptyLcmBlocks(), 0);
             continue;
@@ -1722,7 +1723,7 @@ TEST(CacheCoordinatorAdmissionTest, LiveHistoryCannotFundRotationButAReleasedInp
         for (int attempt = 0; attempt < 2; ++attempt) {
             EXPECT_FALSE(coordinator.Admit(coordinator.ProbePrefix({}), demands, progress,
                                            /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt, false,
-                                           /*session_id=*/{}));
+                                           /*session_id=*/{}, /*cache_group_id=*/{}));
             EXPECT_EQ(BlockTableLcmBlockIds(tables[0]), history);
             EXPECT_EQ(tables[1].Blocks()[0], retained_input);
             EXPECT_EQ(tables[1].Blocks()[1]->Location(), output);
@@ -1730,7 +1731,7 @@ TEST(CacheCoordinatorAdmissionTest, LiveHistoryCannotFundRotationButAReleasedInp
         retained_input.reset();
         ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, progress,
                                       /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt, false,
-                                      /*session_id=*/{}));
+                                      /*session_id=*/{}, /*cache_group_id=*/{}));
         EXPECT_EQ(BlockTableLcmBlockIds(tables[0]), history);
         EXPECT_EQ(tables[1].NumBlocks(), 2);
         EXPECT_TRUE(tables[1].Blocks()[0]);
@@ -1753,7 +1754,7 @@ TEST(CacheCoordinatorAdmissionTest, OnlyNewlyExpiredWindowSlotsCanFundGrowth) {
     const auto advance = [&](std::int32_t computed) {
         return coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{.num_computed_tokens = computed},
                                  /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt, false,
-                                 /*session_id=*/{});
+                                 /*session_id=*/{}, /*cache_group_id=*/{});
     };
     EXPECT_FALSE(advance(7));
     EXPECT_EQ(BlockTableLcmBlockIds(tables[0]), original);
@@ -1792,7 +1793,8 @@ TEST(CacheCoordinatorAdmissionTest, ExpiredWindowPinsAndHolesDoNotFundGrowthUnti
     const std::vector<GroupDemand> demands = {{.table = &tables[0], .extent = DenseGrowth{8}}};
     const RequestProgress progress{.num_computed_tokens = 16};
     EXPECT_FALSE(coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, /*copy_in_blocks=*/{},
-                                   /*copy_in_point=*/std::nullopt, std::nullopt, false, /*session_id=*/{}));
+                                   /*copy_in_point=*/std::nullopt, std::nullopt, false, /*session_id=*/{},
+                                   /*cache_group_id=*/{}));
     EXPECT_EQ(BlockTableLcmBlockIds(tables[0]), before);
     EXPECT_EQ(tables[0].ReclaimedPrefixBlocks(), 0);
 
@@ -1800,7 +1802,8 @@ TEST(CacheCoordinatorAdmissionTest, ExpiredWindowPinsAndHolesDoNotFundGrowthUnti
     // slots. Neither the hole nor the still-live window supplies capacity.
     retained.reset();
     ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, /*copy_in_blocks=*/{},
-                                  /*copy_in_point=*/std::nullopt, std::nullopt, false, /*session_id=*/{}));
+                                  /*copy_in_point=*/std::nullopt, std::nullopt, false, /*session_id=*/{},
+                                  /*cache_group_id=*/{}));
     EXPECT_EQ(tables[0].ReclaimedPrefixBlocks(), 3);
     ASSERT_EQ(tables[0].NumBlocks(), 6);
     for (std::int32_t slot = 0; slot < 6; ++slot) {
@@ -1837,7 +1840,7 @@ TEST(CacheCoordinatorAdmissionTest, SkipsProtectedOldestEpochAndEvictsLaterEpoch
     };
     ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix(std::span{hashes}.first(1)), demands, RequestProgress{},
                                   /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt,
-                                  /*evict_blocks_past_segments=*/false, /*session_id=*/{}));
+                                  /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{}));
 
     EXPECT_TRUE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(hashes[0], /*group_id=*/0, /*page_offset=*/0)));
     EXPECT_FALSE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(hashes[1], /*group_id=*/0, /*page_offset=*/0)));
@@ -1866,14 +1869,14 @@ TEST(CacheCoordinatorAdmissionTest, ProspectiveUncachedReclaimDoesNotEvictCached
     const RequestProgress progress{.num_computed_tokens = 4};
     ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, /*copy_in_blocks=*/{},
                                   /*copy_in_point=*/std::nullopt, std::nullopt,
-                                  /*evict_blocks_past_segments=*/false, /*session_id=*/{}));
+                                  /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{}));
     ASSERT_EQ(pool.NumEmptyLcmBlocks(), 0);
 
     // The third step's rotation releases the request's own unpublished input
     // block, which funds its fresh live slot: the cached checkpoint stays.
     ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{.num_computed_tokens = 8},
                                   /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt,
-                                  /*evict_blocks_past_segments=*/false, /*session_id=*/{}));
+                                  /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{}));
     EXPECT_TRUE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(cached_hash, 0)));
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), 0);
 }
@@ -1898,7 +1901,7 @@ TEST(CacheCoordinatorAdmissionTest, RebindsOnlyAfterEvictingWholeForeignParent) 
     std::vector<GroupDemand> demands = FreshDemands(tables, tokens);
     ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{},
                                   /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt,
-                                  /*evict_blocks_past_segments=*/false, /*session_id=*/{}));
+                                  /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{}));
 
     EXPECT_EQ(pool.BoundGroup(1), std::optional<std::uint32_t>{1});
     EXPECT_EQ(tables[1].NumBlocks(), 1);
@@ -1966,7 +1969,7 @@ TEST(CacheCoordinatorAdmissionTest, RestoresOlderSiblingWhenMiddleCandidateFrees
     std::vector<GroupDemand> demands = FreshDemands(tables, tokens);
     ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{},
                                   /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt,
-                                  /*evict_blocks_past_segments=*/false, /*session_id=*/{}));
+                                  /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{}));
 
     EXPECT_TRUE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(hashes[0], 0)));
     EXPECT_TRUE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(hashes[1], 0)));
@@ -1997,7 +2000,7 @@ TEST(CacheCoordinatorAdmissionTest, ProspectiveHitParentCannotBecomeVictim) {
 
     EXPECT_FALSE(coordinator.Admit(std::move(prefix), demands, RequestProgress{}, /*copy_in_blocks=*/{},
                                    /*copy_in_point=*/std::nullopt, std::nullopt,
-                                   /*evict_blocks_past_segments=*/false, /*session_id=*/{}));
+                                   /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{}));
     EXPECT_EQ(pool.BoundGroup(protected_parent), std::optional<std::uint32_t>{0});
     EXPECT_EQ(coordinator.GroupPrefixIndex(0).NumEntries(pool), 2);
     EXPECT_TRUE(tables[0].Blocks().empty());
@@ -2025,7 +2028,7 @@ TEST(CacheCoordinatorAdmissionTest, ReclaimsTableOwnerBeforeEvictingProspectiveV
     const RequestProgress progress{.num_computed_tokens = 8};
     ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, /*copy_in_blocks=*/{},
                                   /*copy_in_point=*/std::nullopt, std::nullopt,
-                                  /*evict_blocks_past_segments=*/false, /*session_id=*/{}));
+                                  /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{}));
 
     ASSERT_EQ(tables[0].NumBlocks(), 3);
     EXPECT_FALSE(tables[0].Blocks()[0]);
@@ -2061,7 +2064,7 @@ TEST(CacheCoordinatorAdmissionTest, EvictsProspectiveVictimCachedDuringCommit) {
     };
     ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, /*copy_in_blocks=*/{},
                                   /*copy_in_point=*/std::nullopt, std::nullopt,
-                                  /*evict_blocks_past_segments=*/false, /*session_id=*/{}));
+                                  /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{}));
 
     EXPECT_FALSE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(hashes[0], 0)));
     EXPECT_TRUE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(hashes[1], 0)));
@@ -2098,7 +2101,7 @@ TEST(CacheCoordinatorAdmissionTest, RejectsProspectiveVictimWithAnExtraOwner) {
     const RequestProgress progress{.num_computed_tokens = 8};
     EXPECT_FALSE(coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, /*copy_in_blocks=*/{},
                                    /*copy_in_point=*/std::nullopt, std::nullopt,
-                                   /*evict_blocks_past_segments=*/false, /*session_id=*/{}));
+                                   /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{}));
     EXPECT_EQ(tables[0].NumBlocks(), 2);
     EXPECT_TRUE(tables[0].Blocks()[0]);
 }
@@ -3290,7 +3293,7 @@ TEST(CacheCoordinatorHostReplacement, DeviceUseMergesSessionOwnershipOfExistingH
                     .extent = state ? GroupExtent{StateStep{StateStep::Kind::kRotate}} : GroupExtent{DenseGrowth{4}}}};
                 auto first = coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{},
                                                /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt,
-                                               false, "first");
+                                               false, "first", /*cache_group_id=*/{});
                 ASSERT_TRUE(first);
                 coordinator.CacheCompletedBlocks(tables, completed, first->access_epoch);
                 const auto published = coordinator.GroupPrefixIndex(0).Inspect(device, key);
@@ -3317,7 +3320,7 @@ TEST(CacheCoordinatorHostReplacement, DeviceUseMergesSessionOwnershipOfExistingH
                 }
                 auto reused = coordinator.Admit(std::move(probe), demands, RequestProgress{},
                                                 /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt,
-                                                false, visitor);
+                                                false, visitor, /*cache_group_id=*/{});
                 ASSERT_TRUE(reused);
                 if (use == Use::kPublication) {
                     coordinator.CacheCompletedBlocks(tables, completed, reused->access_epoch);
@@ -4483,7 +4486,7 @@ TEST(CacheCoordinatorHostExtension, PreservesAllNullWindowExtensionSlots) {
     const std::optional<CacheCoordinator::AdmissionResult> result =
         coordinator.Admit(coordinator.ProbePrefix(hashes), demands, RequestProgress{}, /*copy_in_blocks=*/{},
                           /*copy_in_point=*/std::nullopt, std::nullopt,
-                          /*evict_blocks_past_segments=*/false, /*session_id=*/{});
+                          /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{});
 
     ASSERT_TRUE(result);
     EXPECT_EQ(result->host_prefix_tokens, 6);
@@ -5694,7 +5697,7 @@ TEST(CompletedBoundaryTest, HistoricalHashesWithoutBoundaryAreNotPublished) {
     // however many pages the table has filled.
     ASSERT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{.num_computed_tokens = 4},
                                   /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt,
-                                  /*evict_blocks_past_segments=*/false, /*session_id=*/{}));
+                                  /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{}));
     EXPECT_EQ(coordinator.GroupPrefixIndex(0).NumEntries(pool), 0);
     coordinator.Free(tables);
 }
@@ -5723,7 +5726,7 @@ TEST(CompletedBoundaryTest, RejectsEmptyCompletedPageRange) {
 
     EXPECT_THROW(coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, /*copy_in_blocks=*/{},
                                    /*copy_in_point=*/std::nullopt, std::nullopt,
-                                   /*evict_blocks_past_segments=*/false, /*session_id=*/{}),
+                                   /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{}),
                  std::runtime_error);
     EXPECT_THROW(coordinator.CacheCompletedBlocks(tables, progress, /*access_epoch=*/1), std::runtime_error);
     coordinator.Free(tables);
@@ -5752,7 +5755,7 @@ TEST(CompletedBoundaryTest, RejectsCompletedPagesWithoutComputedProgress) {
 
     EXPECT_THROW(coordinator.Admit(coordinator.ProbePrefix({}), demands, progress, /*copy_in_blocks=*/{},
                                    /*copy_in_point=*/std::nullopt, std::nullopt,
-                                   /*evict_blocks_past_segments=*/false, /*session_id=*/{}),
+                                   /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{}),
                  std::runtime_error);
     EXPECT_THROW(coordinator.CacheCompletedBlocks(tables, progress, /*access_epoch=*/1), std::runtime_error);
     coordinator.Free(tables);
@@ -5801,7 +5804,7 @@ TEST(SwaRegistrationTest, SwaBoundaryRequiresTrailingWindow) {
     };
     ASSERT_TRUE(coord.Admit(coord.ProbePrefix({}), demands, progress, /*copy_in_blocks=*/{},
                             /*copy_in_point=*/std::nullopt, std::nullopt,
-                            /*evict_blocks_past_segments=*/false, /*session_id=*/{}));
+                            /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{}));
     EXPECT_FALSE(coord.GroupPrefixIndex(0).Contains(pool, Key(ch[0], 0)));
     EXPECT_FALSE(coord.GroupPrefixIndex(0).Contains(pool, Key(ch[1], 0)));
     EXPECT_TRUE(coord.GroupPrefixIndex(0).Contains(pool, Key(ch[2], 0)));
@@ -5835,7 +5838,7 @@ TEST(SwaRegistrationTest, UnalignedEndpointPublishesTrailingFullPages) {
 
     ASSERT_TRUE(coord.Admit(coord.ProbePrefix({}), demands, progress, /*copy_in_blocks=*/{},
                             /*copy_in_point=*/std::nullopt, std::nullopt,
-                            /*evict_blocks_past_segments=*/false, /*session_id=*/{}));
+                            /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{}));
     EXPECT_FALSE(coord.GroupPrefixIndex(0).Contains(pool, Key(hashes[0], 0)));
     EXPECT_TRUE(coord.GroupPrefixIndex(0).Contains(pool, Key(hashes[1], 0)));
     EXPECT_TRUE(coord.GroupPrefixIndex(0).Contains(pool, Key(hashes[2], 0)));
@@ -5871,7 +5874,7 @@ TEST(SwaRegistrationTest, TheWindowBehindAnInForwardStateCheckpointIsPublishedAs
         std::optional<CacheCoordinator::AdmissionResult> admission =
             coord.Admit(coord.ProbePrefix({}), demands, RequestProgress{}, /*copy_in_blocks=*/{},
                         /*copy_in_point=*/std::nullopt, std::nullopt,
-                        /*evict_blocks_past_segments=*/false, /*session_id=*/{});
+                        /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{});
         ASSERT_TRUE(admission);
         const RequestProgress chunk_end{
             .completed_pages =
@@ -6038,7 +6041,7 @@ TEST(BoundedReplayCoordinator, AdmitMaterializesReplayableSuffixFromWindowBegin)
     const std::optional<CacheCoordinator::AdmissionResult> admitted =
         coord.Admit(coord.ProbePrefix(hashes), demands, RequestProgress{}, /*copy_in_blocks=*/{},
                     /*copy_in_point=*/std::nullopt, std::nullopt,
-                    /*evict_blocks_past_segments=*/false, /*session_id=*/{});
+                    /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{});
     ASSERT_TRUE(admitted.has_value());
     EXPECT_EQ(admitted->device_prefix_tokens, 16);
     EXPECT_EQ(admitted->junction_tokens, 0);
@@ -6168,7 +6171,7 @@ std::optional<CacheCoordinator::AdmissionResult> AdmitDemands(CacheCoordinator& 
     }
     return coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{},
                              /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt,
-                             /*evict_blocks_past_segments=*/false, /*session_id=*/{});
+                             /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{});
 }
 
 std::optional<CacheCoordinator::AdmissionResult> RestoreDemands(CacheCoordinator& coordinator,
@@ -16820,9 +16823,9 @@ TEST(CacheCoordinatorStoreCandidates, EndedSessionSuppressesQueuedStoresWithoutF
                                            /*checkpoint_retention_requests=*/0);
         std::vector<BlockTable> tables(1);
         const std::vector<GroupDemand> demands{{.table = &tables[0], .extent = DenseGrowth{4}}};
-        auto admitted =
-            coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{},
-                              /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt, false, "session");
+        auto admitted = coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{},
+                                          /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt, false,
+                                          "session", /*cache_group_id=*/{});
         ASSERT_TRUE(admitted);
         const auto hashes = ContentHashes({{1, 2}, {3, 4}});
         coordinator.CacheFullBlocks(tables, hashes, admitted->access_epoch, 0, CacheBoundaryKind::kChunk);
@@ -16848,16 +16851,17 @@ TEST(CacheCoordinatorSessionAccess, TheRegistrationLivesAsLongAsItsHandle) {
                                        /*checkpoint_retention_requests=*/0);
     std::vector<BlockTable> tables(1);
     const std::array demands{GroupDemand{.table = &tables[0], .extent = DenseGrowth{2}}};
-    auto first =
-        coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{},
-                          /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt, false, "session");
+    auto first = coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{},
+                                   /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt, false,
+                                   "session", /*cache_group_id=*/{});
     ASSERT_TRUE(first);
     const std::uint64_t epoch = first->access_epoch;
     ASSERT_NE(coordinator.SessionForAccess(epoch), nullptr);
     EXPECT_EQ(coordinator.SessionForAccess(epoch)->id, "session");
 
     auto continued = coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{},
-                                       /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, epoch, false, "session");
+                                       /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, epoch, false, "session",
+                                       /*cache_group_id=*/{});
     ASSERT_TRUE(continued);
     continued.reset();
     EXPECT_NE(coordinator.SessionForAccess(epoch), nullptr) << "only the first admission's handle registers";
@@ -16870,13 +16874,95 @@ TEST(CacheCoordinatorSessionAccess, TheRegistrationLivesAsLongAsItsHandle) {
 
     std::vector<BlockTable> untagged_tables(1);
     const std::array untagged_demands{GroupDemand{.table = &untagged_tables[0], .extent = DenseGrowth{2}}};
-    const auto untagged =
-        coordinator.Admit(coordinator.ProbePrefix({}), untagged_demands, RequestProgress{},
-                          /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt, false, {});
+    const auto untagged = coordinator.Admit(coordinator.ProbePrefix({}), untagged_demands, RequestProgress{},
+                                            /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt, false,
+                                            {}, /*cache_group_id=*/{});
     ASSERT_TRUE(untagged);
     EXPECT_EQ(coordinator.SessionForAccess(untagged->access_epoch), nullptr);
     coordinator.Free(tables);
     coordinator.Free(untagged_tables);
+}
+
+TEST(CacheCoordinatorCacheGroups, EndingACutPreservesItsGroupCacheAndStores) {
+    BlockPool pool(8, {1});
+    BlockPool host_pool(4, {1});
+    const std::array specs{CacheGroupSpec{.attn_kind = AttnKind::kSlidingWindow,
+                                          .sliding_window = 4,
+                                          .cache_blocks_per_lcm_block = 1,
+                                          .block_granularity = 2}};
+    auto coordinator = MakeCoordinator(specs, 2, pool, false, &host_pool, nullptr, true, false,
+                                       /*checkpoint_retention_requests=*/0);
+    std::vector<BlockTable> tables(1);
+    const std::array demands{GroupDemand{.table = &tables[0], .extent = DenseGrowth{4}}};
+    auto admitted = coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, {}, std::nullopt,
+                                      std::nullopt, false, "cut", "teacher-group");
+    ASSERT_TRUE(admitted);
+    const auto owner = coordinator.SessionForAccess(admitted->access_epoch);
+    ASSERT_NE(owner, nullptr);
+    EXPECT_EQ(owner->id, "teacher-group");
+    const auto hashes = ContentHashes({{1, 2}, {3, 4}});
+    coordinator.CacheFullBlocks(tables, hashes, admitted->access_epoch, 0, CacheBoundaryKind::kChunk);
+    EXPECT_EQ(coordinator.DemoteSessions({"cut", "teacher-group"}, true), 0u);
+    EXPECT_FALSE(owner->ended) << "session and group identifiers have separate namespaces";
+    EXPECT_FALSE(owner->demoted);
+    EXPECT_EQ(coordinator.TakePendingStores().size(), 2u);
+    // A group hint cannot free blocks that its active cut still owns.
+    EXPECT_EQ(coordinator.DemoteCacheGroups({"teacher-group"}, false), 0u);
+    EXPECT_EQ(tables[0].NumBlocks(), 2);
+    coordinator.Free(tables);
+    admitted.reset();
+    EXPECT_EQ(coordinator.DemoteCacheGroups({"teacher-group"}, true), 2u);
+    EXPECT_TRUE(owner->ended);
+    EXPECT_EQ(coordinator.ProbePrefix(hashes).device.num_common_tokens, 4);
+}
+
+TEST(CacheCoordinatorCacheGroups, SharedPrefixesStayMatchableAcrossGroupsAndIndividualSessions) {
+    BlockPool pool(8, {1});
+    const std::array specs{
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2}};
+    auto coordinator = MakeCoordinator(specs, 2, pool, false, nullptr, nullptr, false, false,
+                                       /*checkpoint_retention_requests=*/0);
+    const auto hashes = ContentHashes({{1, 2}});
+    for (const std::string group : {"one", "two", ""}) {
+        std::vector<BlockTable> tables(1);
+        const std::array demands{GroupDemand{.table = &tables[0], .extent = DenseGrowth{2}}};
+        auto admitted = coordinator.Admit(coordinator.ProbePrefix(hashes), demands, RequestProgress{}, {}, std::nullopt,
+                                          std::nullopt, false, "cut-" + group, group);
+        ASSERT_TRUE(admitted);
+        EXPECT_EQ(admitted->device_prefix_tokens, group == "one" ? 0 : 2);
+        coordinator.CacheFullBlocks(tables, hashes, admitted->access_epoch, 0, CacheBoundaryKind::kChunk);
+        coordinator.Free(tables);
+    }
+    EXPECT_EQ(coordinator.DemoteCacheGroups({"one", "two"}, true), 0u);
+    EXPECT_EQ(coordinator.ProbePrefix(hashes).device.num_common_tokens, 2);
+}
+
+TEST(CacheCoordinatorCacheGroups, OrdinaryEvictionReclaimsGroupsAndTheirOwnerMetadata) {
+    BlockPool pool(1, {1});
+    const std::array specs{
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2}};
+    auto coordinator = MakeCoordinator(specs, 2, pool, false, nullptr, nullptr, false, false,
+                                       /*checkpoint_retention_requests=*/0);
+    std::weak_ptr<SessionCacheTag> previous;
+    std::vector<std::string> previous_hashes;
+    for (int i = 0; i < 10000; ++i) {
+        std::vector<BlockTable> tables(1);
+        const std::array demands{GroupDemand{.table = &tables[0], .extent = DenseGrowth{2}}};
+        auto admitted = coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, {}, std::nullopt,
+                                          std::nullopt, false, "cut", "group-" + std::to_string(i));
+        ASSERT_TRUE(admitted) << "a group owner must not pin cached blocks";
+        if (i > 0) {
+            EXPECT_TRUE(previous.expired()) << "eviction must release the old group's last strong owner";
+            EXPECT_EQ(coordinator.ProbePrefix(previous_hashes).device.num_common_tokens, 0);
+        }
+        previous = coordinator.SessionForAccess(admitted->access_epoch);
+        previous_hashes = ContentHashes({{i, i + 1}});
+        coordinator.CacheFullBlocks(tables, previous_hashes, admitted->access_epoch, 0, CacheBoundaryKind::kChunk);
+        coordinator.Free(tables);
+    }
+    EXPECT_LT(CacheCoordinatorTestAccess::CacheGroupRegistrySize(coordinator), 4096u)
+        << "stale weak owners must be swept instead of growing for every completed group";
+    EXPECT_FALSE(previous.expired()) << "the surviving cache entry still owns its group";
 }
 
 }  // namespace tokenspeed::test
