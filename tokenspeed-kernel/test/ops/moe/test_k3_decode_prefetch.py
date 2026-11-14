@@ -112,3 +112,17 @@ def test_attention_prefetches_keep_the_served_row_counts_they_turn_on(monkeypatc
     assert prefetch.oproj_down_batches(served) == (3, 5, 8)
     assert prefetch.attention_moe_batches(False, served) == (5, 6, 8)
     assert prefetch.attention_moe_batches(True, served) == (8,)
+
+
+def test_the_front_weight_is_prefetched_once_per_served_row_count():
+    """The exit skips the front weight that both attention kinds already fetched.
+
+    ``ATTENTION_MOE`` prefetches the MoE front's packed weight with the
+    o-projection while the attention core runs; a second prefetch of it after
+    the o-projection exit only adds traffic beside the front GEMM.
+    """
+    served = k3_decode_support.BATCHES
+    kda = set(prefetch.attention_moe_batches(False, served))
+    mla = set(prefetch.attention_moe_batches(True, served))
+    assert kda & mla
+    assert not kda & mla & set(prefetch.oproj_down_batches(served))

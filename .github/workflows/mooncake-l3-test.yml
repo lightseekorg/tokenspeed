@@ -21,6 +21,8 @@ on:
       - "test/test_host_cache_storage.py"
       - "test/test_l3_tail_roundtrip.py"
       - "test/test_l3_kvstore.py"
+      - "test/ci_system/l3_native_release_validation.py"
+      - "test/ci_system/test_l3_native_release_validation.py"
       - ".github/workflows/mooncake-l3-test.yml"
   pull_request:
     branches: [main]
@@ -42,17 +44,37 @@ on:
       - "test/test_host_cache_storage.py"
       - "test/test_l3_tail_roundtrip.py"
       - "test/test_l3_kvstore.py"
+      - "test/ci_system/l3_native_release_validation.py"
+      - "test/ci_system/test_l3_native_release_validation.py"
       - ".github/workflows/mooncake-l3-test.yml"
   workflow_dispatch:
+    inputs:
+      iterations:
+        description: >-
+          Native master suite repetitions (1-20). Repeated protocol
+          validation, not a long-duration serving soak.
+        required: true
+        default: "3"
+      iteration-timeout-seconds:
+        description: >-
+          Per-iteration timeout in seconds (10-3600). iterations x timeout
+          plus cleanup and the setup margin must fit this job's 180-minute dispatch
+          budget.
+        required: true
+        default: "900"
 
+# Dispatched repetition runs get their own group: a push or pull request
+# must never cancel an in-flight dispatch (and lose its evidence).
 concurrency:
-  group: mooncake-l3-test-${{ github.ref }}
+  group: mooncake-l3-test-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   test:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # Pull requests validate one iteration inside 30 minutes; dispatched
+    # repetition runs get a bounded 180-minute budget.
+    timeout-minutes: ${{ github.event_name == 'workflow_dispatch' && 180 || 30 }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -94,11 +116,43 @@ jobs:
 
       # The executor against a live master: round trips, objects outliving
       # their writer, KVP owner relocation, tenant isolation, master restart.
+      # The release validation runner repeats that suite in isolated,
+      # timed-out subprocesses with MOONCAKE_REQUIRE_MASTER=1 strictly set,
+      # keeps raw output plus per-iteration receipts, and fails closed on
+      # zero-test, skipped, misscoped or incomplete runs. Pull requests run
+      # one iteration; workflow_dispatch takes bounded repetition. Repetition
+      # is repeated protocol validation, not a long-duration serving soak.
+      # exec puts the runner in the step's shell PID so job cancellation and
+      # timeout signals reach it and it can still write its report; the
+      # wall-clock budget rejects repetitions that cannot fit the job's
+      # timeout including cleanup and the runner's setup margin.
       - name: Run the L3 executor's live master tests
-        working-directory: tokenspeed-engine
         env:
-          MOONCAKE_REQUIRE_MASTER: "1"
-        run: cargo test --locked -p tokenspeed-l3 --test mooncake -- --test-threads=1
+          VALIDATION_ITERATIONS: ${{ inputs.iterations || '1' }}
+          VALIDATION_ITERATION_TIMEOUT: ${{ inputs['iteration-timeout-seconds'] || '900' }}
+          # Seconds matching this job's timeout-minutes (180 dispatch / 30).
+          VALIDATION_WALL_CLOCK_BUDGET: ${{ github.event_name == 'workflow_dispatch' && '10800' || '1800' }}
+          # A cross-check label only; the tested commit (the merge commit on
+          # pull requests) is recorded from the checkout itself.
+          VALIDATION_SOURCE_LABEL: ${{ github.event_name == 'pull_request' && format('pull_request-{0}-head-{1}', github.event.pull_request.number, github.event.pull_request.head.sha) || format('{0}-{1}', github.event_name, github.sha) }}
+        run: |
+          exec python test/ci_system/l3_native_release_validation.py \
+            --iterations "$VALIDATION_ITERATIONS" \
+            --iteration-timeout "$VALIDATION_ITERATION_TIMEOUT" \
+            --terminate-timeout 20 \
+            --wall-clock-budget "$VALIDATION_WALL_CLOCK_BUDGET" \
+            --engine-dir tokenspeed-engine \
+            --output-dir "$RUNNER_TEMP/l3-native-validation" \
+            --source-revision "$VALIDATION_SOURCE_LABEL"
+
+      - name: Upload native validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: l3-native-validation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/l3-native-validation
+          if-no-files-found: warn
+          retention-days: 30
 
       # tokenspeed_engine.L3Executor without ts-host, which needs no C++
       # scheduler build.
@@ -147,6 +201,13 @@ jobs:
             cargo build --release --locked -p tokenspeed-py
           cp target/release/lib_native.so \
             "python/tokenspeed_engine/_native$(python -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')"
+
+      # The release validation runner's own tests are CPU-only: real small
+      # subprocesses and temporary files, no Mooncake master or GPU.
+      - name: Run release validation runner tests
+        run: |
+          python -m pytest -q \
+            test/ci_system/test_l3_native_release_validation.py
 
       # The executor's own tests, the replica agreement and the L3 metrics
       # run in the engine's Rust tests (tokenspeed-engine-test.yml); without

@@ -258,6 +258,7 @@ class TestWeightLoaderPrefetch:
                             None,
                             (4, 5),
                             Mapping(rank=rank, world_size=8, nprocs_per_node=4),
+                            shared_weight_name_filter=None,
                         )
                     )
                 assert Counter(call.args[0] for call in read.call_args_list) == Counter(
@@ -290,6 +291,7 @@ class TestWeightLoaderPrefetch:
                             lambda name, selected=path: name == selected,
                             None,
                             Mapping(rank=rank, world_size=2),
+                            shared_weight_name_filter=None,
                         )
                     )
                 assert Counter(call.args[0] for call in read.call_args_list) == Counter(
@@ -324,11 +326,16 @@ class TestWeightLoaderPrefetch:
                                     prefetch=True,
                                     local_rank=0,
                                     local_world_size=1,
+                                    shared_weight_name_filter=None,
                                 )
                             )
                         else:
                             iterator = weight_utils.safetensors_weights_iterator(
-                                files, prefetch=True, local_rank=0, local_world_size=1
+                                files,
+                                prefetch=True,
+                                local_rank=0,
+                                local_world_size=1,
+                                shared_weight_name_filter=None,
                             )
                         try:
                             next(iterator)

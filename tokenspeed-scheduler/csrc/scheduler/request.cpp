@@ -20,6 +20,8 @@
 
 #include "scheduler/request.h"
 
+#include <algorithm>
+#include <cstddef>
 #include <stdexcept>
 
 #include "cache/prefix/prefix_hasher.h"
@@ -42,12 +44,46 @@ Request::Request(const RequestSpec& spec, std::int32_t prefix_granularity, Role 
                                   : fsm::State{fsm::Bootstrapping{&token_container_, prefix_granularity}}} {}
 
 std::span<const std::string> Request::PromptPrefixHashes() {
-    if (!prompt_prefix_hashes_) {
-        auto pages = FullPrefixPages(false);
-        pages.resize(static_cast<std::size_t>(submitted_prompt_size_ / prefix_granularity_));
-        prompt_prefix_hashes_ = ComputePrefixHashes(pages, "");
+    return PromptPrefixHashes(submitted_prompt_size_ / prefix_granularity_);
+}
+
+std::span<const std::string> Request::PromptPrefixHashes(std::int32_t num_pages) {
+    const std::int32_t prompt_pages = submitted_prompt_size_ / prefix_granularity_;
+    _assert(num_pages >= 0 && num_pages <= prompt_pages, "prompt hashes stay within complete submitted pages");
+    const bool first_lookup = !prompt_prefix_hashes_;
+    if (first_lookup) {
+        // Room for every complete prompt page up front: the chain never grows
+        // past that, so it never reallocates and earlier spans stay valid.
+        prompt_prefix_hashes_.emplace().reserve(static_cast<std::size_t>(prompt_pages));
     }
-    return *prompt_prefix_hashes_;
+    auto& hashes = *prompt_prefix_hashes_;
+    const auto first = static_cast<std::int32_t>(hashes.size());
+    // The first lookup is a hashing pass even with no complete page, so a
+    // profile shows every admitted prompt's hashing phase.
+    if (first_lookup || num_pages > first) {
+        ExtendPrefixHashes(hashes, PrefixPages(first, num_pages));
+    }
+    return std::span<const std::string>(hashes).first(num_pages);
+}
+
+void Request::AppendPrefixHashes(std::vector<std::string>& hashes, std::int32_t num_pages) const {
+    _assert(num_pages >= static_cast<std::int32_t>(hashes.size()) && num_pages <= TokenSize() / prefix_granularity_,
+            "completed hashes append only full token pages");
+    // Grow geometrically: decode appends one completed page at a time.
+    if (static_cast<std::size_t>(num_pages) > hashes.capacity()) {
+        hashes.reserve(std::max<std::size_t>(num_pages, 2 * hashes.size()));
+    }
+    if (prompt_prefix_hashes_) {
+        const auto& cached = *prompt_prefix_hashes_;
+        const auto end = std::min<std::size_t>(num_pages, cached.size());
+        if (hashes.size() < end) {
+            hashes.insert(hashes.end(), cached.begin() + hashes.size(), cached.begin() + end);
+        }
+    }
+    const auto first = static_cast<std::int32_t>(hashes.size());
+    if (first < num_pages) {
+        ExtendPrefixHashes(hashes, PrefixPages(first, num_pages));
+    }
 }
 
 std::span<const std::uint64_t> Request::KvEventBlockHashes(std::size_t num_pages) {
@@ -89,7 +125,7 @@ std::optional<TailPublication> Request::TailPublicationAt(std::int32_t num_compu
     }
     return TailPublication{
         .tail_tokens = tail_tokens,
-        .hash = HashPrefixPage(TokenSlice(num_computed_tokens - tail_tokens, tail_tokens), prior),
+        .hash = HashPrefixPage(TokenSlice(num_computed_tokens - tail_tokens, tail_tokens), ContentHash{prior}),
     };
 }
 

@@ -145,6 +145,7 @@ pub fn gate_code(op: &ControlRequest) -> Option<i64> {
         ControlRequest::RebalanceExperts(_) => 5,
         ControlRequest::UpdateWeightFromDisk(_) => 6,
         ControlRequest::ReloadForward(_) => 7,
+        ControlRequest::ResumeMemoryOccupation(_) => 8,
         _ => return None,
     })
 }
@@ -655,8 +656,27 @@ impl Controls {
             ControlRequest::ReleaseMemoryOccupation(release) => {
                 self.release(release.tags.as_deref(), release_refusal);
             }
-            ControlRequest::ResumeMemoryOccupation(resume) => {
-                return self.resume_memory(resume.tags.as_deref());
+            ControlRequest::ResumeMemoryOccupation(mut resume) => {
+                if self
+                    .weight_ops
+                    .iter()
+                    .any(|op| matches!(op, ControlRequest::ResumeMemoryOccupation(_)))
+                {
+                    self.reply(resume_memory_reply(
+                        false,
+                        "a collective memory resume is pending",
+                    ));
+                    return Effect::None;
+                }
+                return match self.resume_memory(resume.tags.as_deref()) {
+                    Effect::ResumeMemory(tags) if tags.iter().any(|tag| tag == "nccl") => {
+                        resume.tags = Some(tags);
+                        self.weight_ops
+                            .push_back(ControlRequest::ResumeMemoryOccupation(resume));
+                        Effect::None
+                    }
+                    effect => effect,
+                };
             }
             ControlRequest::IsSleeping(_) => {
                 let is_sleeping = !self.released.is_empty();

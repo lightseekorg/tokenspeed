@@ -81,8 +81,8 @@ def _get_reducer_d_tiles(
 
 
 def _get_reducer_max_splits(split_kv: int) -> int:
-    """Smallest power of two (at least 4) covering the split count."""
-    return max(4, 1 << (split_kv - 1).bit_length())
+    """Covering power of two, floored at 8 so 2 to 8 splits share one binary."""
+    return max(8, 1 << (split_kv - 1).bit_length())
 
 
 @functools.cache

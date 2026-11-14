@@ -257,6 +257,7 @@ def _install_profile_cache_key(tuner_type: type, runner_type: type) -> None:
         "input_shapes",
         "tuning_config",
         "extras",
+        "nearest_profile",
     ):
         raise RuntimeError(
             "Unsupported FlashInfer cache-key builder; review the profile adapter."
@@ -264,9 +265,23 @@ def _install_profile_cache_key(tuner_type: type, runner_type: type) -> None:
 
     @functools.wraps(original)
     def profile_cache_key(
-        cls, custom_op, runner, input_shapes, tuning_config, extras=()
+        cls,
+        custom_op,
+        runner,
+        input_shapes,
+        tuning_config,
+        extras=(),
+        nearest_profile=None,
     ):
-        key = original(cls, custom_op, runner, input_shapes, tuning_config, extras)
+        key = original(
+            cls,
+            custom_op,
+            runner,
+            input_shapes,
+            tuning_config,
+            extras,
+            nearest_profile=nearest_profile,
+        )
         if isinstance(runner, runner_type):
             return runner.cache_key_for_profile(key)
         return key

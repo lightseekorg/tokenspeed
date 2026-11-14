@@ -241,6 +241,39 @@ def test_spawned_host_inherits_engine_log_level(
         proc.join(timeout=10)
 
 
+def test_spawned_host_inherits_start_context_environment(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+
+    key = "TS_TEST_LAUNCH_CONTEXT"
+    monkeypatch.delenv(key, raising=False)
+
+    @contextmanager
+    def configure_child():
+        with monkeypatch.context() as scoped:
+            scoped.setenv(key, "configured")
+            yield
+
+    binary = _fake_host(
+        tmp_path,
+        """
+        import os
+        connection.recv()
+        connection.send({"status": "ready", "context": os.environ.get("TS_TEST_LAUNCH_CONTEXT")})
+        time.sleep(600)
+        """,
+    )
+    proc, reader = start_rust_host(
+        binary, *_rank_args(0), configure_child(), None, False
+    )
+    try:
+        (ready,) = receive_ready_messages([reader], [proc])
+        assert ready["context"] == "configured"
+        assert key not in os.environ
+    finally:
+        proc.terminate()
+        proc.join(timeout=10)
+
+
 def test_a_host_that_dies_before_ready_fails_the_launch(tmp_path):
     binary = _fake_host(tmp_path, "connection.recv()\nsys.exit(3)\n")
     proc, reader = start_rust_host(binary, *_rank_args(0), nullcontext(), None, False)

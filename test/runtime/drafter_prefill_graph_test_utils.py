@@ -307,12 +307,20 @@ class ToyRunner:
     forwards it runs (a replayed step runs none)."""
 
     def __init__(
-        self, model, device: str, *, dp_size: int = 1, world_size: int = 1
+        self,
+        model,
+        device: str,
+        *,
+        dp_size: int = 1,
+        world_size: int = 1,
+        pp_size: int = 1,
     ) -> None:
         self.model = model
         self.device = device
         self.mapping = SimpleNamespace(
-            attn=SimpleNamespace(dp_size=dp_size), world_size=world_size
+            attn=SimpleNamespace(dp_size=dp_size),
+            world_size=world_size,
+            pp_size=pp_size,
         )
         self.model_config = SimpleNamespace(requires_request_token_history=False)
         self.forward_calls = 0
@@ -348,6 +356,8 @@ def make_eagle(
     spec_num_steps: int = STEPS,
     dp_size: int = 1,
     world_size: int = 1,
+    pp_size: int = 1,
+    max_bs: int = MAX_BS,
     model: nn.Module | None = None,
 ) -> tuple[Eagle, ToyBackend]:
     """A real Eagle drafter over the toy draft model and backend."""
@@ -357,6 +367,7 @@ def make_eagle(
         device,
         dp_size=dp_size,
         world_size=world_size,
+        pp_size=pp_size,
     )
     drafter = Eagle(
         spec_num_tokens=spec_num_steps + 1,
@@ -365,16 +376,16 @@ def make_eagle(
         attn_backend=backend,
         token_to_kv_pool=ToyPool(),
         runtime_states=RuntimeStates(
-            req_pool_size=MAX_BS + 1,
+            req_pool_size=max_bs + 1,
             input_vocab_size=VOCAB,
             vocab_size=VOCAB,
             device=device,
             output_length=spec_num_steps + 1,
         ),
         input_buffers=InputBuffers(
-            max_bs=MAX_BS,
+            max_bs=max_bs,
             max_num_tokens=MAX_TOKENS,
-            state_write_padding_pool_index=MAX_BS,
+            state_write_padding_pool_index=max_bs,
             device=device,
         ),
         vocab_size=VOCAB,

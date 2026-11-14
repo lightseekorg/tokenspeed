@@ -136,8 +136,10 @@ void Run(int batch_size, int released_prefix_slots, int repeats) {
         const bool prefill = i % 8 == 0;
         if (prefill) {
             PrefillOperation extend;
-            extend.input_ids = {1, 2, 3, 4};
-            extend.shifted_input_ids = {2, 3, 4, 5};
+            static constexpr std::int32_t kInput[] = {1, 2, 3, 4};
+            static constexpr std::int32_t kShifted[] = {2, 3, 4, 5};
+            extend.input_ids = kInput;
+            extend.shifted_input_ids = kShifted;
             extend.extend_state_checkpoint_len = 2;
             ops.emplace_back(std::move(extend));
         } else {

@@ -23,10 +23,21 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel._triton import libdevice, tl, triton
 from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
+
+_IS_HIP = tl.constexpr(torch.version.hip is not None)
+
+
+@triton.jit
+def _torch_rsqrt(x):
+    """FP32 ``x`` rounded as ``torch.rsqrt`` rounds it: the approximate
+    instruction on CUDA, but correctly rounded on ROCm."""
+    if _IS_HIP:
+        return libdevice.rsqrt(x.to(tl.float64)).to(tl.float32)
+    return tl.rsqrt(x)
 
 
 @triton.jit
@@ -39,7 +50,7 @@ def _rms_normalized(value, WIDTH: tl.constexpr, EPS, MEAN_BY_RECIPROCAL: tl.cons
         mean = total * (1.0 / WIDTH)
     else:
         mean = tl.div_rn(total, WIDTH)
-    return value * tl.rsqrt(mean + EPS)
+    return value * _torch_rsqrt(mean + EPS)
 
 
 @triton.jit
@@ -48,7 +59,7 @@ def _l2_clipped(value, threshold, eps):
     norm is ``s * rsqrt(s)`` of the sum of squares ``s``, as the reference
     computes it."""
     sum_sq = tl.sum(value * value, 0)
-    norm = tl.where(sum_sq > 0, sum_sq * tl.rsqrt(sum_sq), 0.0)
+    norm = tl.where(sum_sq > 0, sum_sq * _torch_rsqrt(sum_sq), 0.0)
     multiplier = tl.minimum(1.0, tl.div_rn(threshold, norm + eps))
     return value * multiplier
 
@@ -57,14 +68,12 @@ def _l2_clipped(value, threshold, eps):
 def _rmsnorm_precision_kernel(
     X,
     Weight,
-    PreWeight,
     Out,
     group,
     group_stride,
     WIDTH: tl.constexpr,
     EPS: tl.constexpr,
     HAS_WEIGHT: tl.constexpr,
-    HAS_PRE_WEIGHT: tl.constexpr,
     MEAN_BY_RECIPROCAL: tl.constexpr,
     BLOCK: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
@@ -78,8 +87,6 @@ def _rmsnorm_precision_kernel(
     # Input rows come in groups of `group` adjacent rows, group_stride apart.
     source = (row // group) * group_stride + (row % group) * WIDTH
     value = tl.load(X + source + cols, cols < WIDTH, 0).to(tl.float32)
-    if HAS_PRE_WEIGHT:
-        value = value * tl.load(PreWeight + cols, cols < WIDTH, 0).to(tl.float32)
     value = _rms_normalized(value, WIDTH, EPS, MEAN_BY_RECIPROCAL)
     if HAS_WEIGHT:
         value = value * tl.load(Weight + cols, cols < WIDTH, 0).to(tl.float32)
@@ -100,7 +107,6 @@ def triton_rmsnorm_precision(
     x: torch.Tensor,
     weight: torch.Tensor | None,
     eps: float,
-    pre_weight: torch.Tensor | None,
     output_dtype: torch.dtype,
     *,
     mean_by_reciprocal: bool,
@@ -126,14 +132,12 @@ def triton_rmsnorm_precision(
         _rmsnorm_precision_kernel[(rows,)](
             x,
             weight,
-            pre_weight,
             output,
             group,
             group_stride,
             width,
             eps,
             weight is not None,
-            pre_weight is not None,
             mean_by_reciprocal,
             triton.next_power_of_2(width),
             pdl_enabled(),
@@ -149,13 +153,11 @@ def _add_rmsnorm_precision_kernel(
     X,
     Residual,
     Weight,
-    PreWeight,
     Out,
     SumOut,
     WIDTH: tl.constexpr,
     EPS: tl.constexpr,
     HAS_WEIGHT: tl.constexpr,
-    HAS_PRE_WEIGHT: tl.constexpr,
     MEAN_BY_RECIPROCAL: tl.constexpr,
     BLOCK: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
@@ -172,8 +174,6 @@ def _add_rmsnorm_precision_kernel(
         Residual + row * WIDTH + cols, mask, 0
     ).to(tl.float32)
     tl.store(SumOut + row * WIDTH + cols, value, mask)
-    if HAS_PRE_WEIGHT:
-        value = value * tl.load(PreWeight + cols, mask, 0).to(tl.float32)
     value = _rms_normalized(value, WIDTH, EPS, MEAN_BY_RECIPROCAL)
     if HAS_WEIGHT:
         value = value * tl.load(Weight + cols, mask, 0).to(tl.float32)
@@ -185,7 +185,6 @@ def triton_add_rmsnorm_precision(
     residual: torch.Tensor,
     weight: torch.Tensor | None,
     eps: float,
-    pre_weight: torch.Tensor | None,
     output_dtype: torch.dtype,
     sum_dtype: torch.dtype,
     *,
@@ -205,13 +204,11 @@ def triton_add_rmsnorm_precision(
             x,
             residual,
             weight,
-            pre_weight,
             output,
             summed,
             width,
             eps,
             weight is not None,
-            pre_weight is not None,
             mean_by_reciprocal,
             triton.next_power_of_2(width),
             pdl_enabled(),

@@ -80,12 +80,12 @@ Scheduler::SharedPrefixPublication Scheduler::GetSharedPrefixPublication(std::sp
     for (std::int32_t i = 0; i + grain <= max_prefix_tokens; i += grain) pages.push_back(input.subspan(i, grain));
     const auto hashes = ComputePrefixHashes(pages, "");
     const auto tail_tokens = max_prefix_tokens % grain;
-    const auto tail =
-        tail_tokens
-            ? std::optional{TailPublication{
-                  .tail_tokens = tail_tokens,
-                  .hash = HashPrefixPage(input.last(tail_tokens), hashes.empty() ? ContentHash{} : hashes.back())}}
-            : std::nullopt;
+    const auto tail = tail_tokens
+                          ? std::optional{TailPublication{
+                                .tail_tokens = tail_tokens,
+                                .hash = HashPrefixPage(input.last(tail_tokens),
+                                                       hashes.empty() ? ContentHash{} : ContentHash{hashes.back()})}}
+                          : std::nullopt;
     const auto dependencies = coordinator_.SharedPrefixKeys(
         {.prefix_hashes = hashes, .tokens = input, .max_tokens = max_prefix_tokens, .tail = tail},
         static_cast<std::size_t>(storage_transfers_->Config().metadata_entries));
@@ -228,9 +228,8 @@ void Scheduler::prepareStorage(Request& request) {
     }
     const auto grain = config_.prefix_granularity;
     const auto max_tokens = cacheablePrefixTokens(request);
-    auto pages = request.FullPrefixPages(false);
-    pages.resize(std::min(pages.size(), static_cast<std::size_t>(max_tokens / grain)));
-    auto hashes = ComputePrefixHashes(pages, "");
+    const auto cached_hashes = request.PromptPrefixHashes(max_tokens / grain);
+    std::vector<std::string> hashes(cached_hashes.begin(), cached_hashes.end());
     std::int32_t bound = max_tokens;
     std::optional<TailPublication> tail;
     const auto setBound = [&request, &hashes, &bound, &tail, grain](std::int32_t value) {
@@ -238,7 +237,7 @@ void Scheduler::prepareStorage(Request& request) {
         hashes.resize(static_cast<std::size_t>(bound / grain));
         tail.reset();
         if (const auto tail_tokens = bound % grain; tail_tokens > 0) {
-            const ContentHash prior = hashes.empty() ? ContentHash{} : hashes.back();
+            const ContentHash prior = hashes.empty() ? ContentHash{} : ContentHash{hashes.back()};
             tail = TailPublication{.tail_tokens = tail_tokens,
                                    .hash = HashPrefixPage(request.TokenSlice(bound - tail_tokens, tail_tokens), prior)};
         }

@@ -59,6 +59,9 @@ handshake socket. An EPD encode node's ranks run the host's encode mode instead
 event loop. Their first rank dials the frontend the same way and takes
 encode requests.
 
+The launcher snapshots each rank's environment inside its start context so
+allocator preload hooks reach the child along with the native logging defaults.
+
 What an engine registers with tells its frontend what it serves: the
 request types it takes (an encode server takes encode requests only), the
 field order of the positional structs on its wire, its role and, for a
@@ -700,8 +703,16 @@ idle forwards while a peer drains. An idle but unpaused peer prevents release:
 it could admit a request in the next round. Release intent rides the head
 gate, so every rank joins the tail's readiness agreement when any release is
 pending, including ranks without a release of their own. Ordinary rounds add
-no collective. Readiness is MIN-reduced over the replica and then attention DP
+no collective. An NCCL release also requires a pending NCCL release on every
+rank: a previously completed KV release does not authorize that collective.
+Other memory regions retain their local release semantics. Readiness is
+MIN-reduced over the replica and then attention DP
 before any release runs on the forward thread.
+
+A resume containing NCCL uses the same-round operation gate: it waits until
+every attention-DP engine holds its resume before entering device collectives.
+Other regions still resume locally. A pending collective resume refuses a
+second memory resume until it finishes.
 
 The head gate also agrees whether any DP rank still has released regions.
 Until all regions are restored on every rank, it withholds forward permission
@@ -732,7 +743,11 @@ final result on all forward threads before replying. Under the discard
 policy, local loading success is pending: only the successful replica-wide
 commit marks parameters usable. A failed load invalidates every rank,
 including ranks that loaded locally; KV wake and forwarding remain blocked
-until deployment restart. The same gate carries the online expert
+until deployment restart. Discard requires both the model and its resolved
+quantization configuration to opt in; quantized post-load derivation must
+rebuild codes and scales in place from the complete new checkpoint, never
+reuse discarded values or mark remapped storage usable on its own.
+The same gate carries the online expert
 rebalance's *internal* steps (snapshot, commit, chunk apply) from a second
 queue with its own columns: frontend operations arrive on different DP
 engines in different rounds while the controller queues internal steps at

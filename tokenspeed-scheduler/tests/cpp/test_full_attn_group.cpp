@@ -39,7 +39,7 @@ using token_span = std::span<const std::int32_t>;
 CacheKey RealKey(const std::vector<std::int32_t>& tokens, std::uint32_t group_id) {
     std::vector<token_span> pages = {token_span(tokens.data(), tokens.size())};
     std::vector<std::string> hashes = ComputePrefixHashes(pages, "");
-    return CacheKey{.group_id = group_id, .content_hash = std::move(hashes.front())};
+    return CacheKey{.group_id = group_id, .content_hash = ContentHash{std::move(hashes.front())}};
 }
 
 TEST(FullAttnManagerTest, ConstructsWithBlockGranularity) {
@@ -73,7 +73,7 @@ TEST(FullAttnManagerTest, ProbeAcceptsTypedCacheKeys) {
     BlockPool pool(8, {1});
     FullAttnManager mgr(4);
     const std::vector<CacheKey> keys{
-        CacheKey{.group_id = 0, .content_hash = "hash"},
+        CacheKey{.group_id = 0, .content_hash = ContentHash{"hash"}},
     };
 
     const GroupPrefixProbe probe = mgr.Probe(pool, keys, /*begin_blocks=*/0, /*max_blocks=*/1);
@@ -472,11 +472,11 @@ TEST(FullAttnManagerTest, ChainedPriorPreventsSecondPageCollision) {
     std::vector<token_span> pages_b = {token_span(p_b.data(), p_b.size()), token_span(q.data(), q.size())};
     std::vector<CacheKey> keys_a;
     for (std::string& hash : ComputePrefixHashes(pages_a, "")) {
-        keys_a.push_back(CacheKey{.group_id = 0, .content_hash = std::move(hash)});
+        keys_a.push_back(CacheKey{.group_id = 0, .content_hash = ContentHash{std::move(hash)}});
     }
     std::vector<CacheKey> keys_b;
     for (std::string& hash : ComputePrefixHashes(pages_b, "")) {
-        keys_b.push_back(CacheKey{.group_id = 0, .content_hash = std::move(hash)});
+        keys_b.push_back(CacheKey{.group_id = 0, .content_hash = ContentHash{std::move(hash)}});
     }
     ASSERT_EQ(keys_a.size(), 2u);
     ASSERT_EQ(keys_b.size(), 2u);
@@ -600,7 +600,7 @@ TEST(FullAttnManagerLcmTest, DuplicateRegistrationUpdatesEpochWithoutReorderingE
     const std::optional<PrefixCacheIndex::CachedBlockMetadata> metadata =
         mgr.CachedBlockMetadataFor(pool, first_location);
     ASSERT_TRUE(metadata);
-    EXPECT_EQ(metadata->last_access_epoch, next_access_epoch);
+    EXPECT_EQ(metadata->eviction.last_access_epoch, next_access_epoch);
     EXPECT_EQ(pool.NumOccupiedSlots(), 2);
 }
 
@@ -628,8 +628,8 @@ TEST(FullAttnManagerLcmTest, NamespaceIsPartOfPrefixIndex) {
     FullAttnManager mgr(4, 1, 0);
     BlockTable table;
     ASSERT_TRUE(mgr.Acquire(pool, table, 8));
-    const CacheKey first{.namespace_id = 1, .group_id = 0, .content_hash = "shared-content"};
-    const CacheKey second{.namespace_id = 2, .group_id = 0, .content_hash = "shared-content"};
+    const CacheKey first{.namespace_id = 1, .group_id = 0, .content_hash = ContentHash{"shared-content"}};
+    const CacheKey second{.namespace_id = 2, .group_id = 0, .content_hash = ContentHash{"shared-content"}};
     const std::uint64_t access_epoch = 1;
 
     mgr.RegisterFullBlocks(pool, table, std::vector<CacheKey>{first, second}, access_epoch);

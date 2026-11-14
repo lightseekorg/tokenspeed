@@ -4029,6 +4029,57 @@ def test_legacy_gluon_plans_keep_existing_implementation(
     assert plan["apply_kernel_name"] == expected
 
 
+def _deferred_bf16_plan(platform: PlatformInfo, **overrides) -> dict:
+    """Muse's BF16 expert plan: precomputed routes, caller-normalized."""
+    return _moe_fp8_channel_plan(
+        platform,
+        **{
+            "weight_dtype": "unquant",
+            "requires_deferred_finalize": True,
+            "ep_size": 4,
+            "ispp": 4096,
+            "hidden": 4096,
+            "swiglu_form": None,
+            "num_experts": 256,
+            "top_k": 8,
+            **overrides,
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "platform_fixture,expected",
+    [
+        ("h100_platform", "triton_bf16_routes_moe_apply"),
+        ("b200_platform", "flashinfer_trtllm_unquant_routed_moe_apply"),
+        ("b300_platform", "flashinfer_trtllm_unquant_routed_moe_apply"),
+        ("mi350_platform", "gluon_bf16_routes_moe_apply"),
+    ],
+)
+def test_deferred_bf16_plans_select_a_route_kernel(
+    platform_fixture: str, expected: str, request: pytest.FixtureRequest
+) -> None:
+    if KernelRegistry.get().get_by_name(expected) is None:
+        pytest.skip(f"{expected!r} is not registered on this host")
+    plan = _deferred_bf16_plan(request.getfixturevalue(platform_fixture))
+    assert plan["apply_kernel_name"] == expected
+    assert plan["supports_deferred_finalize"] is True
+
+
+def test_finalizing_bf16_plans_skip_the_route_kernels(
+    h100_platform: PlatformInfo,
+) -> None:
+    plan = _deferred_bf16_plan(
+        h100_platform, requires_deferred_finalize=False, ep_size=1, solution="triton"
+    )
+    assert plan["apply_kernel_name"] == "triton_bf16_precomputed_moe_apply"
+    # The only Triton kernel taking EP BF16 experts cannot finalize.
+    with pytest.raises(kernel_NoKernelFoundError):
+        _deferred_bf16_plan(
+            h100_platform, requires_deferred_finalize=False, solution="triton"
+        )
+
+
 def _select_on(platform: PlatformInfo, *args, **kwargs) -> str:
     registry = KernelRegistry.get()
     real_platform = Platform.get()

@@ -729,6 +729,12 @@ Notes:
   aggregated role the default bucket ladder takes about 7.5 GB more per GPU,
   out of the KV cache, and adds about 7 minutes to startup;
   `--prefill-graph-capture-token-sizes` captures fewer buckets for less.
+- The NVIDIA command below captures each prefill bucket for 1 and for up to
+  64 requests (`--prefill-graph-capture-batch-sizes 1 64`), so a prefill of
+  several requests also runs its KDA layers inside the graph instead of at
+  eager breaks. On 2 GB300 nodes, this cut the time-to-first-token of 2 to 64
+  concurrent short prompts by 40% to 55%, for about 0.7 GB less KV cache per
+  GPU and 2 to 3 more minutes of startup.
 - The Kimi-K3.1 DSpark draft (`Inferact/Kimi-K3.1-Pro-DSpark-preview`)
   proposes 7 tokens per step, so it takes
   `--speculative-num-draft-tokens 8`. Unlike Kimi-K3's draft, it attends
@@ -760,6 +766,7 @@ tokenspeed serve moonshotai/Kimi-K3.1-Pro \
   --mm-encoder-tp-mode data \
   --moe-backend flashinfer_trtllm \
   --max-num-seqs 64 \
+  --prefill-graph-capture-batch-sizes 1 64 \
   --speculative-algorithm DSPARK \
   --speculative-draft-model-path Inferact/Kimi-K3.1-Pro-DSpark-preview \
   --speculative-num-draft-tokens 8 \

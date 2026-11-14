@@ -75,7 +75,8 @@ timing claim is made for the fused kernel in this record.
 `precision.rmsnorm_precision` normalizes in FP32 and stores an explicit output
 dtype, such as BF16 from FP32 depth mixtures or weightless per-head value norms.
 CUDA inputs select its registered Triton implementation; other devices run the
-Torch equation.
+Torch equation. The Triton kernels round `rsqrt` as `torch.rsqrt` does on the
+same GPU: the approximate instruction on CUDA, correctly rounded on ROCm.
 
 `precision.l2_clip` keeps vectors below the threshold and rounds the clipped
 result to the input dtype before the optional FP32 token multiplier, which

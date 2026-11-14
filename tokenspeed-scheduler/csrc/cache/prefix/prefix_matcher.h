@@ -72,11 +72,15 @@ public:
         const std::int32_t end_blocks =
             static_cast<std::int32_t>(std::min(keys.size(), static_cast<std::size_t>(std::max(max_blocks, 0))));
         GroupPrefixProbe probe;
+        probe.location_pool = &pool;
         for (std::int32_t j = begin_blocks; j < end_blocks; ++j) {
-            if (!PrefixKeyIsHit(index, pool, keys[static_cast<std::size_t>(j)], extra_hits)) {
+            const CacheKey& key = keys[static_cast<std::size_t>(j)];
+            const auto location = index.LocationOf(pool, key);
+            if (!location && (extra_hits == nullptr || !extra_hits->contains(key))) {
                 break;
             }
             probe.hits.push_back(1);
+            probe.locations.push_back(location.value_or(CacheBlockLocation{}));
         }
         return probe;
     }
@@ -161,9 +165,7 @@ public:
 
 private:
     // Cached pages a boundary needs behind it: they cover the window's last (window - 1) tokens.
-    std::int32_t pagesNeededToResume() const {
-        return (sliding_window_ - 1 + block_granularity_ - 1) / block_granularity_;
-    }
+    std::int32_t pagesNeededToResume() const { return CeilDiv(sliding_window_ - 1, block_granularity_); }
 
     struct ResumableBoundary {
         std::int32_t boundary;    // == begin_blocks when no boundary qualifies

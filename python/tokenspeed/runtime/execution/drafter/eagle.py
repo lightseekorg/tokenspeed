@@ -38,6 +38,9 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
 )
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.drafter.base import (
+    EXTEND_DECODE_MAX_REQUESTS,
+    EXTEND_DECODE_SERIES,
+    EXTEND_STEP0_SERIES,
     DsaTopKState,
     HiddenDraftInput,
     HiddenStateDrafter,
@@ -67,10 +70,6 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 
 logger = get_colorful_logger(__name__)
-
-# CUDA-graph memory projection series of the extend-round graphs.
-_FIRST_STEP_SERIES = "prefill:drafter-step0"
-_DECODE_STEPS_SERIES = "prefill:drafter-decode"
 
 
 def _advance_draft_forward_metadata_if_supported(attn_backend, seq_lens) -> None:
@@ -860,21 +859,42 @@ class Eagle(HiddenStateDrafter):
         return self._draft_window(bs, next_tokens)
 
     # ------------------------------------------------------------------
-    # Extend-round CUDA graphs (--enable-drafter-prefill-graph)
+    # Extend-round CUDA graphs
     # ------------------------------------------------------------------
     #
     # An extend round runs step 0 over the forward's rows -- token-shaped up
     # to the narrowing, one row per request after it -- then the decode steps
-    # over one row per request. Both are recorded as breakable graphs on the
-    # target prefill graph's token buckets: the QSA indexer and attention
-    # cores stay at their eager breaks (they read the live metadata), and so
-    # do the steps that publish backend state (``run_eager``). Step 0's graph
-    # pads the rows to a token bucket and bakes its request count (the rows
-    # after the narrowing); the decode steps' graph bakes the request count
-    # alone. A round replays the graphs that fit it and runs the rest eager.
+    # over one row per request. Both are recorded as breakable graphs: the QSA
+    # indexer and attention cores stay at their eager breaks (they read the
+    # live metadata), and so do the steps that publish backend state
+    # (``run_eager``). Step 0's graph (--enable-drafter-prefill-graph) pads
+    # the rows to a target prefill token bucket and bakes its request count
+    # (the rows after the narrowing); the decode steps' graph bakes the
+    # request count alone and follows step 0 eager or replayed. A round
+    # replays the graphs that fit it and runs the rest eager.
+
+    def _decode_steps_graphs_supported(self) -> bool:
+        """Whether this configuration's extend-round decode steps can be recorded.
+
+        The graphs bake a chain's one row per request, the argmax proposal (no
+        draft sampler), no draft token history and no top-k carried across
+        steps, and one replay decision shared by every rank that runs the
+        round's collectives: attention DP decides per rank, and the pipeline's
+        chunk rounds are not validated. Tensor- and expert-parallel ranks all
+        run the same round.
+        """
+        return (
+            self.spec_num_steps > 1
+            and self.tree_spec is None
+            and self.draft_sampler is None
+            and not self.draft_reads_token_history
+            and not self._model_shares_mtp_topk()
+            and self.dp_size == 1
+            and self.draft_model_runner.mapping.pp_size == 1
+        )
 
     def _extend_graphs_supported(self) -> bool:
-        """Whether this configuration's extend rounds can be recorded at all.
+        """Whether this configuration's extend-round step 0 can be recorded.
 
         Only over a draft model that declares ``supports_breakable_draft_extend``:
         its narrowed step keeps the sequence mixers at break points (an MLA
@@ -882,11 +902,9 @@ class Eagle(HiddenStateDrafter):
         break), and its draft attention backend honours the context a break
         passes it (the narrowed rows attend in DECODE mode under step 0's
         EXTEND context; a backend that substitutes the ambient context's mode
-        would not). The graphs bake a chain's one row per request, the argmax
-        proposal (no draft sampler), no draft token history and no top-k
-        carried across steps, and one rank's own replay decision: attention DP
-        decides per rank, and tensor-, expert- and pipeline-parallel
-        collectives are not validated.
+        would not). It bakes what the decode steps bake, at any step count,
+        and runs on one rank: the tensor- and expert-parallel collectives of
+        the narrowed step are not validated.
         """
         return (
             bool(
@@ -910,17 +928,17 @@ class Eagle(HiddenStateDrafter):
         token_buckets: Sequence[int],
         request_counts: Callable[[int], Sequence[int]],
     ) -> dict[str, list[tuple[int, int]]]:
-        if not self._extend_graphs_supported():
-            return {}
-        first_step = [
-            (bucket, bs)
-            for bucket in sorted(token_buckets, reverse=True)
-            for bs in request_counts(bucket)
-        ]
-        plan = {_FIRST_STEP_SERIES: first_step}
-        if self.spec_num_steps > 1:
-            counts = sorted({bs for _, bs in first_step}, reverse=True)
-            plan[_DECODE_STEPS_SERIES] = [(bs, bs) for bs in counts]
+        plan = {}
+        if self._extend_graphs_supported():
+            plan[EXTEND_STEP0_SERIES] = [
+                (bucket, bs)
+                for bucket in sorted(token_buckets, reverse=True)
+                for bs in request_counts(bucket)
+            ]
+        if self._decode_steps_graphs_supported():
+            # The steps bake their request count exactly.
+            most = min(self.input_buffers.max_bs, EXTEND_DECODE_MAX_REQUESTS)
+            plan[EXTEND_DECODE_SERIES] = [(bs, bs) for bs in range(most, 0, -1)]
         return plan
 
     @override
@@ -949,34 +967,44 @@ class Eagle(HiddenStateDrafter):
         """
         if capture.num_warmup < 1:
             raise ValueError("the drafter prefill graphs need at least one warmup")
-        first_plan = capture.plan[_FIRST_STEP_SERIES]
-        first_step = [
-            first_plan[i] for i in capture.ladders[_FIRST_STEP_SERIES].sampled
-        ]
-        decode_plan = capture.plan.get(_DECODE_STEPS_SERIES, ())
+        first_plan = capture.plan.get(EXTEND_STEP0_SERIES, ())
+        first_step = (
+            [first_plan[i] for i in capture.ladders[EXTEND_STEP0_SERIES].sampled]
+            if first_plan
+            else []
+        )
+        decode_plan = capture.plan.get(EXTEND_DECODE_SERIES, ())
         decode_counts = (
-            [decode_plan[i][1] for i in capture.ladders[_DECODE_STEPS_SERIES].sampled]
+            [decode_plan[i][1] for i in capture.ladders[EXTEND_DECODE_SERIES].sampled]
             if decode_plan
             else []
         )
+        # Decode-steps dummy: the count's step-0 bucket, else one token per request.
+        dummy = {bs: bs for _, bs in decode_plan}
+        for bucket, bs in sorted(first_plan, reverse=True):
+            if bs in dummy:
+                dummy[bs] = bucket
         self.release_extend_graphs()
-        self._allocate_extend_buffers(capture, first_plan)
+        # Sized for the whole plan: a full capture reuses what a probe allocated.
+        self._allocate_extend_buffers(
+            capture,
+            tokens=max([bucket for bucket, _ in first_plan] + list(dummy.values())),
+            requests=max([bs for _, bs in first_plan] + list(dummy)),
+        )
         with maybe_inference_mode():
             for bucket, bs in first_step:
                 capture.prepare_batch(bucket, bs)
                 self._stage_capture_inputs(bucket, bs)
                 self._first_step_graphs[bucket, bs] = self._capture_first_step(
-                    bucket, bs, capture, observer.measure(_FIRST_STEP_SERIES)
+                    bucket, bs, capture, observer.measure(EXTEND_STEP0_SERIES)
                 )
             for bs in decode_counts:
-                # The decode steps follow a step 0 over a dummy extend of this
-                # request count, as in a live round.
-                bucket = min(b for b, count in first_plan if count == bs)
+                bucket = dummy[bs]
                 capture.prepare_batch(bucket, bs)
                 self._stage_capture_inputs(bucket, bs)
                 self._run_first_step_eager(bucket, bs, capture.stream)
                 self._decode_steps_graphs[bs] = self._capture_decode_steps(
-                    bs, capture, observer.measure(_DECODE_STEPS_SERIES)
+                    bs, capture, observer.measure(EXTEND_DECODE_SERIES)
                 )
         self._first_step_buckets = {}
         for bucket, bs in sorted(self._first_step_graphs):
@@ -1003,17 +1031,15 @@ class Eagle(HiddenStateDrafter):
         )
 
     def _allocate_extend_buffers(
-        self, capture: DrafterExtendCapture, first_plan: Sequence[tuple[int, int]]
+        self, capture: DrafterExtendCapture, *, tokens: int, requests: int
     ) -> None:
-        """The static buffers for the plan's largest bucket and request count.
+        """The static buffers for the plan's largest token count and request count.
 
         Allocated once, outside every measured capture window: like the target
         prefill graph's static outputs, they come out of the utilization
         headroom, not the CUDA-graph reserve. A later capture (after a cache
         rebind) reuses them.
         """
-        tokens = max(bucket for bucket, _ in first_plan)
-        requests = max(bs for _, bs in first_plan)
         width = capture.target_hidden_width
         buffers = self._extend_buffers
         if (
@@ -1217,8 +1243,8 @@ class Eagle(HiddenStateDrafter):
         """The captured graphs this round replays, or None to run it eager.
 
         Replays only what every graph baked holds: a pure extend (MIXED
-        rounds stay eager), no attention-DP sizing, no query shard, the
-        target's hidden rows for every input row; step 0 needs a captured
+        rounds stay eager), no attention-DP sizing, no query shard; step 0
+        needs the target's hidden rows for every input row and a captured
         bucket at least the round's tokens at exactly its request count, the
         decode steps their request count.
         """
@@ -1232,11 +1258,11 @@ class Eagle(HiddenStateDrafter):
         if shard is not None and shard.size > 1:
             return None
         num_tokens = draft_input.input_num_tokens
-        if draft_input.base_out_hidden_states.shape[0] != num_tokens:
-            return None
-        buckets = self._first_step_buckets.get(bs, [])
-        index = bisect.bisect_left(buckets, num_tokens)
-        first_step = (buckets[index], bs) if index < len(buckets) else None
+        first_step = None
+        if draft_input.base_out_hidden_states.shape[0] == num_tokens:
+            buckets = self._first_step_buckets.get(bs, [])
+            index = bisect.bisect_left(buckets, num_tokens)
+            first_step = (buckets[index], bs) if index < len(buckets) else None
         decode_steps = bs in self._decode_steps_graphs
         if first_step is None and not decode_steps:
             return None

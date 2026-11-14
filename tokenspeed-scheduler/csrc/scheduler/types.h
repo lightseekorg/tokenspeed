@@ -35,7 +35,8 @@ namespace tokenspeed {
 struct SchedulerConfig {
     std::int32_t prefix_granularity{};
     struct AllocatorConfig {
-        // Page 0 is the null placeholder, so usable = total - 1.
+        // Page 0 is the null placeholder, so usable = total - 1. Validate
+        // rejects a negative total_pages, which could wrap this.
         std::int32_t total_pages{};
         std::int32_t NumUsableBlocks() const { return total_pages - 1; }
     };
@@ -54,7 +55,8 @@ struct SchedulerConfig {
     // Test knob: every |N| plans the fused/D grammar retracts the oldest
     // quiescent Decoding request (N > 0) or the one Prefilling request
     // between its chunks (N < 0), bypassing ReserveCoversGeneration but not
-    // the image-fit refusal. 0 is off; non-zero requires a snapshot pool.
+    // the image-fit refusal. 0 is off; non-zero requires a snapshot pool;
+    // INT32_MIN, with no magnitude in int32, is rejected.
     // Lives here so every mirrored rank decides identically.
     std::int32_t debug_force_retraction_interval{0};
 

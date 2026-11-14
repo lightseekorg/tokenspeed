@@ -50,6 +50,7 @@ from test.runtime.drafter_prefill_graph_test_utils import (
     VOCAB,
     WIDTH,
     ToyBackend,
+    ToyDraftModel,
     capture_input,
     extend_input,
     make_eagle,
@@ -146,10 +147,10 @@ def _inputs(lengths, generator):
 def test_replays_match_the_eager_round() -> None:
     """Exact and padded buckets, one to three requests, cached prefixes,
     final chunks (the sampled token patched into the last row) and mid chunks
-    (step 0 alone, its cache writes kept), the decode steps replaying behind
-    an eager step 0 past the largest bucket, and the eager fallback at an
-    uncaptured request count: the replayed round leaves the same verify
-    window and draft cache as the eager one, the dummy slot aside. The toy's
+    (step 0 alone, its cache writes kept), and the decode steps replaying
+    behind an eager step 0 past the largest bucket and at a request count no
+    step-0 graph takes: the replayed round leaves the same verify window and
+    draft cache as the eager one, the dummy slot aside. The toy's
     token-shaped part is row-wise, so padded buckets match exactly too."""
     generator = torch.Generator().manual_seed(0)
     graphed, graphed_backend = make_eagle(device="cuda")
@@ -173,8 +174,8 @@ def test_replays_match_the_eager_round() -> None:
         ([33, 31], [0, 0], True, route((64, 2), True)),
         ([70], [0], True, route(None, True)),
         ([3], [0], True, route((16, 1), True)),
-        # Four requests: no graph at this request count.
-        ([3, 3, 3, 3], [0, 0, 0, 0], True, None),
+        # Four requests: no step-0 graph at this request count.
+        ([3, 3, 3, 3], [0, 0, 0, 0], True, route(None, True)),
     ]
     with torch.inference_mode():
         for lengths, prefixes, final, expected in cases:
@@ -205,6 +206,78 @@ def test_replays_match_the_eager_round() -> None:
             if not final:
                 # A mid chunk drafts step 0 only; the rest repeat column 0.
                 assert torch.equal(window[:, 2], window[:, 0])
+
+
+def test_the_decode_steps_replay_without_a_step_0_graph() -> None:
+    """A draft model whose narrowed step 0 has no breaks (the configuration
+    every tensor-parallel launch takes too) records the decode steps alone:
+    every round runs step 0 eager and replays the decode steps at its request
+    count, and leaves the verify window and draft cache the eager round does."""
+    generator = torch.Generator().manual_seed(2)
+    model = ToyDraftModel("cuda")
+    model.supports_breakable_draft_extend = False
+    graphed, graphed_backend = make_eagle(device="cuda", model=model)
+    eager, eager_backend = make_eagle(device="cuda")
+    _capture(graphed, graphed_backend, [16, 32], lambda _bucket: [1])
+    assert not graphed._first_step_graphs
+    cases = [
+        ([16], [0], True),
+        ([9, 7], [0, 100], True),
+        ([20, 3, 1], [7, 0, 300], True),
+        ([3, 3, 3, 3], [0, 0, 0, 0], True),
+        ([70], [0], True),
+        ([12, 12], [64, 0], False),
+    ]
+    with torch.inference_mode():
+        for lengths, prefixes, final in cases:
+            inputs = _inputs(lengths, generator)
+            prepare_extend(
+                graphed, graphed_backend, lengths, prefixes, final=final, ids=inputs[0]
+            )
+            route = graphed._extend_graph_route(
+                len(lengths), extend_input(graphed, lengths, hidden=inputs[2])
+            )
+            assert route == eagle_module._ExtendRoute(None, True), lengths
+            window, forwards = _round(
+                graphed, graphed_backend, lengths, prefixes, final, inputs
+            )
+            want, _ = _round(eager, eager_backend, lengths, prefixes, final, inputs)
+            # Step 0 alone runs eager.
+            assert forwards == 1
+            assert torch.equal(window, want), lengths
+            assert torch.equal(graphed_backend.cache[1:], eager_backend.cache[1:])
+
+
+def test_a_replayed_step_0_feeds_eager_decode_steps_past_their_ladder(
+    monkeypatch,
+) -> None:
+    """A step-0 graph at a request count past the decode steps' ladder hands
+    its proposals and hidden rows to eager decode steps through the static
+    buffers, and the round leaves the verify window and draft cache the eager
+    round does."""
+    monkeypatch.setattr(eagle_module, "EXTEND_DECODE_MAX_REQUESTS", 2)
+    generator = torch.Generator().manual_seed(3)
+    graphed, graphed_backend = make_eagle(device="cuda")
+    eager, eager_backend = make_eagle(device="cuda")
+    _capture(graphed, graphed_backend, [16], lambda _bucket: [1, 2, 3])
+    lengths, prefixes = [5, 2, 6], [0, 40, 9]
+    inputs = _inputs(lengths, generator)
+    with torch.inference_mode():
+        prepare_extend(
+            graphed, graphed_backend, lengths, prefixes, final=True, ids=inputs[0]
+        )
+        route = graphed._extend_graph_route(
+            len(lengths), extend_input(graphed, lengths, hidden=inputs[2])
+        )
+        assert route == eagle_module._ExtendRoute((16, 3), False)
+        window, forwards = _round(
+            graphed, graphed_backend, lengths, prefixes, True, inputs
+        )
+        want, _ = _round(eager, eager_backend, lengths, prefixes, True, inputs)
+    # The decode steps alone run eager.
+    assert forwards == STEPS - 1
+    assert torch.equal(window, want)
+    assert torch.equal(graphed_backend.cache[1:], eager_backend.cache[1:])
 
 
 def test_a_publication_recorded_into_the_graph_diverges_from_eager(
@@ -268,6 +341,9 @@ def test_a_replay_waits_for_a_host_load_into_the_draft_cache() -> None:
     tracker = LayerwiseLoadTracker(1)
     tracker.set_consumers(0)
     assert not round_after_a_slow_load(tracker).any()
+    # ROCm streams can share a hardware queue, which orders the replay after the load.
+    if torch.version.hip is not None:
+        return
     # Without a tracker nothing orders the replay after the load, which then
     # lands over the replay's writes: the case the wait exists for.
     assert round_after_a_slow_load(None).all()

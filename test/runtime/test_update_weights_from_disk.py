@@ -652,10 +652,22 @@ class TestReloadMatchesStartupLoad:
         real = loader_module.DefaultModelLoader._get_weights_iterator
         groups = []
 
-        def spy(loader, source, weight_name_filter, checkpoint_load_group, mapping):
+        def spy(
+            loader,
+            source,
+            weight_name_filter,
+            checkpoint_load_group,
+            mapping,
+            shared_weight_name_filter,
+        ):
             groups.append(checkpoint_load_group)
             return real(
-                loader, source, weight_name_filter, checkpoint_load_group, mapping
+                loader,
+                source,
+                weight_name_filter,
+                checkpoint_load_group,
+                mapping,
+                shared_weight_name_filter,
             )
 
         with mock.patch.object(

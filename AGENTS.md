@@ -165,6 +165,23 @@ Inside the root `tokenspeed-scheduler/` directory:
   request itself. Avoid paired acquire/release calls, hand-kept counters and
   erase-on-teardown code spread across call sites. `CacheBlockRef`,
   `ReqPoolIndex` and `StorageLease` are the models to follow.
+* Check integer overflow in the C++ scheduler. Token counts and positions,
+  page, block and slot indices and LCM block ids are 32-bit, and they grow
+  with request length and pool size (a million-token request, a Host pool of
+  10^8 pages). Widen a factor to `std::int64_t` before multiplying, e.g.
+  pages times page size, parents times packing, tokens times bytes per
+  token, or requests times blocks per request; casting the product is too
+  late. Write rounded-up divisions and bound checks so they cannot overflow
+  themselves (`n / d + (n % d != 0)` rather than `(n + d - 1) / d` near the
+  limit). Check the range before narrowing a `std::size_t` or `std::int64_t`
+  to `std::int32_t`, including values handed to Python or the Rust engine.
+  Validate integer config fields and request limits against ranges that
+  leave room for the rounding and offsets applied later (a token limit just
+  under `INT32_MAX` overflows once rounded up to a block). Watch unsigned
+  subtraction, mixed signed/unsigned comparisons, and `std::abs` or negation
+  of a value that can be `INT32_MIN`. Reviews should check every new or
+  changed computation on such counts; when a value can reach 2^31 in a
+  supported configuration, add a test at that bound.
 
 ## tokenspeed-scheduler releases
 

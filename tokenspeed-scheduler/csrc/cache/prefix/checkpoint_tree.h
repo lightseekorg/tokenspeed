@@ -80,7 +80,7 @@ public:
         _assert(
             !tokens.empty() && tokens.size() == full_tokens + static_cast<std::size_t>(tail ? tail->tail_tokens : 0),
             "checkpoint tokens cover exactly its full pages and tail");
-        const ContentHash& hash = tail ? tail->hash : prefix_hashes.back();
+        const ContentHash& hash = tail ? tail->hash : ContentHash{prefix_hashes.back()};
         if (nodes_.contains(hash)) {
             return false;
         }
@@ -403,7 +403,7 @@ private:
         std::size_t first = prefix_hashes.size();
         PrefixSegment* parent = nullptr;
         while (first > 0) {
-            if (const auto it = prefixes_.find(prefix_hashes[first - 1]); it != prefixes_.end()) {
+            if (const auto it = prefixes_.find(ContentHash{prefix_hashes[first - 1]}); it != prefixes_.end()) {
                 parent = it->second.get();
                 break;
             }
@@ -414,7 +414,7 @@ private:
         for (std::size_t i = first; i < prefix_hashes.size(); ++i) {
             const auto page_tokens = tokens.subspan(i * page, page);
             auto segment = std::make_unique<PrefixSegment>(PrefixSegment{
-                .hash = prefix_hashes[i],
+                .hash = ContentHash{prefix_hashes[i]},
                 .tokens = {page_tokens.begin(), page_tokens.end()},
                 .parent = parent,
                 .depth = static_cast<std::int32_t>(i + 1),
@@ -473,7 +473,8 @@ private:
                      std::size_t existing_pages) {
         const auto length = static_cast<std::int32_t>(tokens.size());
         for (auto full = static_cast<std::int32_t>(existing_pages); full >= 0; --full) {
-            const ContentHash prior = full == 0 ? ContentHash{} : prefix_hashes[static_cast<std::size_t>(full - 1)];
+            const ContentHash prior =
+                full == 0 ? ContentHash{} : ContentHash{prefix_hashes[static_cast<std::size_t>(full - 1)]};
             const std::int32_t page_start = full * prefix_granularity_;
             Node* best = nullptr;
             if (const auto it = tails_by_prior_.find(prior); it != tails_by_prior_.end()) {

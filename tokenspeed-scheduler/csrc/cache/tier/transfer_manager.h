@@ -302,6 +302,8 @@ private:
         DecodeSlotIndex decode_slot;
         std::uint64_t access_epoch{0};
     };
+    // Wraps by design: an id only tells in-flight ops apart, and none stays in
+    // flight across 2^32 later ops. The width is the wire format's.
     std::uint32_t nextOpId() { return next_op_id_++; }
     LoadBackOperation startLoadBack(std::vector<BlockTransfer> block_transfers);
     std::vector<CacheTransfer> resolveTransfers(std::span<const BlockTransfer> block_transfers) const;

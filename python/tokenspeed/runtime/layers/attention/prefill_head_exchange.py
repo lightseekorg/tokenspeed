@@ -26,6 +26,7 @@ from tokenspeed_kernel.ops.attention import dsv41
 from tokenspeed.runtime.distributed.comm_ops import (
     all_gather,
     all_to_all_head_scatter,
+    all_to_all_single,
     all_to_all_transpose,
 )
 from tokenspeed.runtime.execution.query_shard import scatter_count
@@ -95,3 +96,87 @@ def selected_prefill_with_head_exchange(
         lse=None,
     )
     return all_to_all_head_scatter(output, group, counts, backend=None)
+
+
+def exchange_query_rows_padded(
+    q: torch.Tensor,
+    group: tuple[int, ...],
+    rank: int,
+    counts: list[int],
+    padded_heads: int,
+) -> torch.Tensor:
+    """Give each rank its own rows with every rank's heads, zero-padded.
+
+    Pure data movement: the query's bytes cross the group whatever its dtype,
+    and the received head blocks land in the padded query with one copy.
+
+    Args:
+        q: This rank's ``[tokens, heads, dim]`` head block of every row, the
+            rows rank-major (``counts[i]`` rows belong to the ``i``-th rank).
+        group: The ranks sharing the rows, every one holding the same rows.
+        rank: This rank's index in ``group``.
+        counts: Rows per rank, in group order; every rank holds the same.
+        padded_heads: The core's head count, at least the group's heads.
+
+    Returns:
+        ``[counts[rank], padded_heads, dim]``: rank ``i``'s heads at
+        ``i * heads`` onward, zeros after the group's heads.
+    """
+    tokens, heads, dim = q.shape
+    world = len(group)
+    if padded_heads < world * heads:
+        raise ValueError("padded query heads must hold every rank's heads")
+    rows = counts[rank]
+    width = heads * dim * q.element_size()
+    received = torch.empty((world * rows, width), dtype=torch.uint8, device=q.device)
+    all_to_all_single(
+        received,
+        q.contiguous().view(torch.uint8).view(tokens, width),
+        group,
+        output_split_sizes=[rows] * world,
+        input_split_sizes=counts,
+    )
+    padded = q.new_empty((rows, padded_heads, dim))
+    target = padded.view(torch.uint8).view(rows, -1)
+    source = received.view(world, rows, width)
+    if width % 8 == 0:
+        # Copy whole 8-byte words: a strided byte copy of an FP8 query is far slower.
+        target, source, width = (
+            target.view(torch.int64),
+            source.view(torch.int64),
+            width // 8,
+        )
+    target[:, world * width :].zero_()
+    target[:, : world * width].view(rows, world, width).copy_(source.transpose(0, 1))
+    return padded
+
+
+def return_head_rows(
+    out: torch.Tensor, heads: int, group: tuple[int, ...], counts: list[int]
+) -> torch.Tensor:
+    """Hand each rank its head block of every row back: the inverse exchange.
+
+    Args:
+        out: This rank's ``[counts[rank], padded_heads, dim]`` core output,
+            rank ``i``'s heads at ``i * heads`` onward and padding after.
+        heads: Heads per rank.
+        group: The ranks sharing the rows.
+        counts: Rows per rank, in group order.
+
+    Returns:
+        ``[sum(counts), heads, dim]``: this rank's heads of every row, the
+        rows rank-major.
+    """
+    rows, _, dim = out.shape
+    world = len(group)
+    sent = out.new_empty((world, rows, heads, dim))
+    sent.copy_(out[:, : world * heads].unflatten(1, (world, heads)).transpose(0, 1))
+    received = out.new_empty((sum(counts), heads * dim))
+    all_to_all_single(
+        received,
+        sent.view(world * rows, heads * dim),
+        group,
+        output_split_sizes=counts,
+        input_split_sizes=[rows] * world,
+    )
+    return received.view(-1, heads, dim)

@@ -42,7 +42,7 @@ std::vector<std::int32_t> BlockIds(const std::vector<CacheBlockRef>& refs) {
 }
 
 CacheKey Key(std::string content_hash) {
-    return CacheKey{.content_hash = std::move(content_hash)};
+    return CacheKey{.content_hash = ContentHash{std::move(content_hash)}};
 }
 
 // The unified Match with a raised floor (begin_blocks > 0 over a non-device pool) is the

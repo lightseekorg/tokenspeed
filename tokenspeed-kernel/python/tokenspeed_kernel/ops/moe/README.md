@@ -98,6 +98,14 @@ execution also returns a map from each original route to its output row, with
 `-1` for remote experts. Consumers normalize each route before weighting and
 summation. Combining routes before normalization changes the operation.
 
+`triton_bf16_routes_moe_apply` and `gluon_bf16_routes_moe_apply` serve
+`bf16_moe_routes` as `moe.apply` kernels to layers that always finalize the
+routes themselves (`moe_plan(requires_deferred_finalize=True)`). They return the
+routes in token order without a map; rows of other ranks' experts are zero.
+They cannot finalize and declare `supports_finalize={False}`; every plan that
+does not require a deferred finalize asks for `supports_finalize`, so finalizing
+layers never select them.
+
 `gather_moe_routes` restores token/route order from a deferred output map and
 zeros absent routes. A kernel declaring `deferred_output_is_token_order` writes
 each route it owns to row `token * topk + slot`; with EP > 1 the other rows are
@@ -167,7 +175,7 @@ expert_apply = prepare_sm90_fp8_moe(
 ```
 
 Private modes apply `sm90_moe.patch` to a cached source copy of FlashInfer
-0.7.3 and compile isolated modules, operators, and tuning caches. They require
+0.7.4 and compile isolated modules, operators, and tuning caches. They require
 matching upstream sources, JIT enabled, and both CUDA toolkit and runtime
 12.8 or newer. Initialization reports unsupported sources or build settings.
 Private cold JIT compilations bind their include path to that versioned source
@@ -242,7 +250,7 @@ replay. Performance depends on routing; benchmark the intended workload.
 
 ### NVFP4 routing-map padding
 
-The pinned FlashInfer version (0.7.3) initializes unused rows inside active
+The pinned FlashInfer version (0.7.4) initializes unused rows inside active
 expert tiles of `permuted_idx_to_token_idx` to `-1` in its routing producers.
 This prevents unnecessary activation loads in the first GEMM without a separate
 fill-kernel launch. Routing refreshes live mappings and tile padding on every
@@ -718,6 +726,8 @@ symmetric memory instead of NCCL collectives:
    renormalized, scaled) and gathers the full latent row. It reads the logits
    from their mailbox as they land, without waiting for the GEMM to complete,
    and every thread of a row's CTA ranks the candidates, at every row count.
+   A NaN logit (a padded graph row's) counts as a zero sigmoid, so the row
+   ranks by bias instead of tying all 896 experts.
 3. Persistent MXFP4 experts compute this rank's intermediate slice of the
    chosen experts and combine them into a weighted latent partial.
 4. One tail kernel all-reduces the partials, applies the latent RMSNorm, runs
@@ -746,7 +756,7 @@ and the all-reduces leave idle, so the chain prefetches weights into L2
 (`_cute_dsl/k3_decode_prefetch.py` has the row counts and caps). A side stream
 prefetches the MoE front's packed weight after the o-projection exit; the
 o-projection shard and the MoE layer's front, shared-expert and up-projection
-weights after the KDA input projection or the MLA core; and, once the routed
+weights after the attention input projection; and, once the routed
 experts launch, the next layer's attention weights up to a cap. At 4-7 rows the
 routed experts instead prefetch the up-projection shard and the next attention's
 weights themselves, once their last weight load is issued. The forward rejoins
