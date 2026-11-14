@@ -161,7 +161,8 @@ def test_row_exchange_pads_every_rank_heads_and_hands_them_back(
     # exchange lands rank i's heads of my rows at heads 3i.., zeros after; the
     # inverse hands each rank its heads of every row back, bit for bit.
     world, heads, padded = 4, 3, 16
-    group = tuple(range(world))
+    # Global ranks other than the group indices: the exchange takes the index.
+    group = tuple(range(4, 4 + world))
     counts = scatter_count(tokens, world)
     starts = [sum(counts[:rank]) for rank in range(world)]
     full = torch.randn(tokens, world * heads, dim).to(dtype)
@@ -175,7 +176,6 @@ def test_row_exchange_pads_every_rank_heads_and_hands_them_back(
         return tensor.contiguous().view(torch.uint8)
 
     for rank in range(world):
-        monkeypatch.setattr(torch.distributed, "get_rank", lambda rank=rank: rank)
 
         def query_exchange(output, value, actual_group, **splits):
             assert actual_group == group
@@ -189,7 +189,9 @@ def test_row_exchange_pads_every_rank_heads_and_hands_them_back(
             )
 
         monkeypatch.setattr(exchange, "all_to_all_single", query_exchange)
-        query = exchange.exchange_query_rows_padded(blocks[rank], group, counts, padded)
+        query = exchange.exchange_query_rows_padded(
+            blocks[rank], group, rank, counts, padded
+        )
         assert query.shape == (counts[rank], padded, dim) and query.dtype == dtype
         assert torch.equal(bits(query[:, : world * heads]), bits(own(full, rank)))
         assert not bits(query[:, world * heads :]).any()

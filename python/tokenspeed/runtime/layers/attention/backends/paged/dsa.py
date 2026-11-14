@@ -1797,15 +1797,21 @@ class DSABackend(PagedAttentionBackend):
         rows = slice(start, start + counts[self.attn_tp_rank])
         core_heads = trtllm_sparse_mla_query_heads(self.num_attention_heads)
         out = dsa_prefill(
-            q=exchange_query_rows_padded(q_view, group, counts, core_heads),
+            q=exchange_query_rows_padded(
+                q_view, group, self.attn_tp_rank, counts, core_heads
+            ),
             kv_cache=token_to_kv_pool.get_key_buffer(layer.layer_id),
             sparse_kv_cache=None,
             topk_slots=topk_slots[rows],
-            topk_lens=topk_lens[rows].to(dtype=torch.int32).contiguous(),
+            topk_lens=topk_lens[rows]
+            .to(device=q_view.device, dtype=torch.int32)
+            .contiguous(),
             kv_seq_lens=(
                 None
                 if kv_seq_lens is None
-                else kv_seq_lens[rows].to(dtype=torch.int32).contiguous()
+                else kv_seq_lens[rows]
+                .to(device=q_view.device, dtype=torch.int32)
+                .contiguous()
             ),
             max_seqlen_k=max_seq_len,
             qk_nope_head_dim=self.qk_nope_head_dim,

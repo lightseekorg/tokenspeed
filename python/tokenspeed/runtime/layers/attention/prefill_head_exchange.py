@@ -99,7 +99,11 @@ def selected_prefill_with_head_exchange(
 
 
 def exchange_query_rows_padded(
-    q: torch.Tensor, group: tuple[int, ...], counts: list[int], padded_heads: int
+    q: torch.Tensor,
+    group: tuple[int, ...],
+    rank: int,
+    counts: list[int],
+    padded_heads: int,
 ) -> torch.Tensor:
     """Give each rank its own rows with every rank's heads, zero-padded.
 
@@ -110,6 +114,7 @@ def exchange_query_rows_padded(
         q: This rank's ``[tokens, heads, dim]`` head block of every row, the
             rows rank-major (``counts[i]`` rows belong to the ``i``-th rank).
         group: The ranks sharing the rows, every one holding the same rows.
+        rank: This rank's index in ``group``.
         counts: Rows per rank, in group order; every rank holds the same.
         padded_heads: The core's head count, at least the group's heads.
 
@@ -121,7 +126,7 @@ def exchange_query_rows_padded(
     world = len(group)
     if padded_heads < world * heads:
         raise ValueError("padded query heads must hold every rank's heads")
-    rows = counts[group.index(torch.distributed.get_rank())]
+    rows = counts[rank]
     width = heads * dim * q.element_size()
     received = torch.empty((world * rows, width), dtype=torch.uint8, device=q.device)
     all_to_all_single(
