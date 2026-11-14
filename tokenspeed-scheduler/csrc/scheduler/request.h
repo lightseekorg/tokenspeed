@@ -295,6 +295,8 @@ public:
 
     std::int32_t RequestPoolIndex() const { return forwardResources("RequestPoolIndex").RequestPoolIndex(); }
 
+    bool HasDecodeSlot() const { return forwardResources("HasDecodeSlot").decode_slot.valid(); }
+
     const std::vector<BlockTable>& BlockTablesRef() const { return forwardResources("BlockTablesRef").block_tables; }
 
     std::vector<BlockTable>& BlockTablesRef() { return forwardResources("BlockTablesRef").block_tables; }

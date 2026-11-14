@@ -255,6 +255,7 @@ def scheduler_config_from_args(
     storage_config: StorageConfig | None,
     max_scheduled_tokens: int,
     max_batch_size: int,
+    max_resident_requests: int,
     decode_input_tokens: int,
     overlap_schedule_depth: int,
     enable_kv_cache_events: bool,
@@ -270,6 +271,7 @@ def scheduler_config_from_args(
             when no storage backend is configured.
         max_scheduled_tokens: Per-step prefill token budget.
         max_batch_size: Rank-local batch slots.
+        max_resident_requests: Rank-local resident request slots.
         decode_input_tokens: Verify width per decode step.
         overlap_schedule_depth: Dispatched-but-uncommitted plans allowed.
         enable_kv_cache_events: Whether KV cache events are published.
@@ -287,6 +289,7 @@ def scheduler_config_from_args(
             // geometry.prefix_granularity
         ),
         max_batch_size=max_batch_size,
+        max_resident_requests=max_resident_requests,
         prefix_granularity=geometry.prefix_granularity,
         num_host_pages=specs.num_host_pages,
         disable_l2_cache=not server_args.enable_kvstore,

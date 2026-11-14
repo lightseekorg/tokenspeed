@@ -57,6 +57,7 @@ def make_leaf(monkeypatch):
             kv_cache_quant_method="",
             context_len=context,
             max_bs=8,
+            max_resident_requests=8,
             speculative_num_draft_tokens=queries,
             is_draft=draft,
             draft_block_decode=block,

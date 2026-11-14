@@ -545,6 +545,7 @@ def _prefill_cache_and_backend(monkeypatch, *, options):
         kv_cache_quant_method="none",
         context_len=512,
         max_bs=4,
+        max_resident_requests=4,
         components=(spec,),
     )
     return pool, AscendMLABackend(config, spec, kernel_page_size=128)

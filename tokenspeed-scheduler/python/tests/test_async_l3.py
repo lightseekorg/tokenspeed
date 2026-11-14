@@ -35,6 +35,7 @@ def scheduler(*, role, groups=1, host=32, timeout=100):
     cfg.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteThrough
     cfg.max_scheduled_tokens = 64
     cfg.max_batch_size = 8
+    cfg.max_resident_requests = cfg.max_batch_size
     cfg.enable_l3_storage = True
     cfg.storage_config = ts.StorageConfig(
         8,
@@ -436,6 +437,7 @@ def mixed_replay_scheduler():
     cfg.num_snapshot_pages = 1
     cfg.max_scheduled_tokens = 4
     cfg.max_batch_size = 8
+    cfg.max_resident_requests = cfg.max_batch_size
     cfg.enable_mixed_prefill_decode = True
     cfg.enable_l3_storage = True
     cfg.storage_config = ts.StorageConfig(

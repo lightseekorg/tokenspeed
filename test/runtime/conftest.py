@@ -109,6 +109,7 @@ def kimi_recipe(
         kv_cache_dtype=kv_cache_dtype,
         kv_cache_quant_method=None,
         max_bs=max_bs,
+        max_resident_requests=max_bs,
         # K3's per-group demand reads the scheduler's concurrency through
         # CacheRecipe.scheduler_limits, context length included.
         context_len=context_len,

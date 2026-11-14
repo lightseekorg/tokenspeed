@@ -128,6 +128,7 @@ def _backend():
         kv_cache_quant_method="none",
         context_len=128,
         max_bs=2,
+        max_resident_requests=2,
         components=(spec,),
         speculative_num_draft_tokens=2,
     )

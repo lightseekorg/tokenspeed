@@ -170,6 +170,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("enable_short_prefill_first", &tokenspeed::SchedulerConfig::enable_short_prefill_first)
         .def_rw("max_kv_page_num", &tokenspeed::SchedulerConfig::max_kv_page_num)
         .def_rw("max_batch_size", &tokenspeed::SchedulerConfig::max_batch_size)
+        .def_rw("max_resident_requests", &tokenspeed::SchedulerConfig::max_resident_requests)
         .def_rw("decode_input_tokens", &tokenspeed::SchedulerConfig::decode_input_tokens)
         .def_rw("overlap_schedule_depth", &tokenspeed::SchedulerConfig::overlap_schedule_depth)
         .def_rw("role", &tokenspeed::SchedulerConfig::role)
@@ -727,6 +728,12 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
              "Count requests suspended with an image (Retracted or Restoring); a weight update must not flush "
              "while this is non-zero.")
         .def("decoding_size", &tokenspeed::Scheduler::DecodingSize, "Count requests in the Decoding FSM state.")
+        .def("allocated_request_slots", &tokenspeed::Scheduler::AllocatedRequestSlots,
+             "Count physical request rows, including unfinished restore or cancellation operations.")
+        .def("active_decode_slots", &tokenspeed::Scheduler::ActiveDecodeSlots,
+             "Count execution permits, including restore reservations and finishing forwards.")
+        .def("ready_waiting_size", &tokenspeed::Scheduler::ReadyWaitingSize,
+             "Count completed prefills waiting for their first local decode permit.")
         .def("prefilling_size", &tokenspeed::Scheduler::PrefillSize,
              "Count local/remote prefills, PrefillAwaitingResult, and PrefillDone requests.")
         .def("remote_prefilling_size", &tokenspeed::Scheduler::RemotePrefillSize,

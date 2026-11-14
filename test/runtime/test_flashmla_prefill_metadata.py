@@ -76,6 +76,7 @@ def test_flashmla_prefill_plans_without_device_downloads(
         kernel_page_size=64,
         context_len=512,
         max_bs=4,
+        max_resident_requests=4,
         kv_cache_quant_method="",
         components=(spec,),
     )

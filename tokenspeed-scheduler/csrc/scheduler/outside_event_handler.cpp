@@ -138,8 +138,10 @@ void Scheduler::settleFinishedRequests() {
         if (!request->Is<fsm::Finishing>() || request->ResultsInFlight() > 0) {
             continue;
         }
-        if (auto store = publishCompletedPages(*request)) {
-            pending_write_back_operations_.push_back(std::move(*store));
+        if (request->GetIf<fsm::Finishing>()->publish_completed_pages) {
+            if (auto store = publishCompletedPages(*request)) {
+                pending_write_back_operations_.push_back(std::move(*store));
+            }
         }
         request->Apply(fsm::ReleaseEvent{&coordinator_});
     }
@@ -412,6 +414,8 @@ void Scheduler::abortRequest(Request& request) {
     if (pdTransferInFlight(request)) {
         // The transport stops the transfer; the pages wait for it.
         request.Apply(fsm::StopPdTransferEvent{});
+    } else if (request.ResultsInFlight() > 0) {
+        request.Apply(fsm::AbortInFlightEvent{});
     } else {
         request.Apply(fsm::AbortEvent{&coordinator_});
     }
@@ -467,9 +471,10 @@ void Scheduler::handleEvent(const cache::RestoreDone& event) {
         // issues.
         registerKvEventRestore(*request, restoring->resources.cache_progress.prefix_hashes, restoring->kv_event_tails);
     }
-    ReqPoolIndex request_pool_index = tier_transfers_.CompleteSnapshotRestore(event.op_id, /*publish=*/resumes);
+    TierTransferManager::RestoredSlots slots =
+        tier_transfers_.CompleteSnapshotRestore(event.op_id, /*publish=*/resumes);
     if (resumes) {
-        request->Apply(fsm::RestoreDoneEvent{std::move(request_pool_index)});
+        request->Apply(fsm::RestoreDoneEvent{std::move(slots.request_pool_index), std::move(slots.decode_slot)});
     }
     // Otherwise the row and the blob slot return with the ticket: the request
     // that would have used them is gone.

@@ -992,6 +992,37 @@ gets a new identity even if its transport IP and port are reused. The sender
 refreshes cached remote memory keys on address reuse without changing the
 public address used by EPD.
 
+### Decode receive capacity
+
+On a decode node, --disaggregation-decode-extra-slots adds shared resident
+request slots per attention DP rank. It defaults to zero. A positive value
+is rejected on prefill, fused and encode nodes.
+
+If the rank-local execution limit is B = max-num-seqs / attention DP size
+and the extra count is E, the resident pool has C = B + E real request rows.
+For example, max-num-seqs=48 and E=16 with two attention DP ranks gives
+B=24 and C=40 on each rank. TP replicas use the same rank-local limits.
+
+The extra rows allow KV reception and ready requests to overlap a full
+decode batch. They do not enlarge the execution batch, CUDA graph ladder,
+or single-forward scratch. Request-indexed persistent state grows with C,
+and every admitted request still consumes the ordinary LCM KV capacity.
+Receiving all configured requests at their maximum context length is not
+guaranteed. More rows can reduce the remaining KV budget.
+
+Use an explicit extra count when measuring the feature. Restart with zero
+to restore the original capacity; shrinking a live request pool is not
+supported. A request keeps its original slot when reception completes and
+waits for an execution permit before its first decode.
+
+This change requires matching TokenSpeed runtime and native components, even
+when E=0. Do not mix runtime or scheduler builds from before this API change
+with builds that include it. For source deployments, rebuild and install
+tokenspeed-engine and any standalone tokenspeed-scheduler from the same
+revision as the Python runtime. The serving host uses the scheduler embedded
+in tokenspeed-engine; upgrading the standalone scheduler wheel alone does
+not update that embedded copy.
+
 ## Observability
 
 | Parameter | Purpose |
@@ -1110,16 +1141,47 @@ metrics on its `--prometheus-port`.
 `tokenspeed:num_requests_running` counts the rank's running batch: local
 prefill forwards, prompts whose prefill is done (about to decode on a fused
 rank, or awaiting the PD transfer on a prefill rank), and decode rows. On a
-decode rank that is the decode batch, bounded by the rank's
-`max_num_seqs / attention-DP size`; it excludes `RemotePrefilling` requests
-waiting for the prefill peer's KV.
+decode rank it includes requests whose KV has landed but that are waiting
+for an execution permit; it excludes `RemotePrefilling` requests waiting
+for the prefill peer's KV. With extra resident slots, this gauge can exceed
+the execution batch limit. The decode batch line's #running-req remains
+the actual number of rows dispatched.
 `tokenspeed:num_requests_inflight` counts every request the rank admitted and
 has not finished, including the scheduler's waiting and retracted requests and
 the PD states the batch excludes — a decode rank's `RemotePrefilling` and
 `PdTransferring` requests wait for the prefill node's KV and take no batch row.
 On a PD decode rank the inflight gauge therefore exceeds the running gauge while
-prompts wait for transfer; use `num_requests_running` for batch saturation and
-`num_requests_inflight` for how much work the rank holds.
+prompts wait for transfer. The inflight gauge also includes unadmitted work,
+so it does not measure request-slot occupancy.
+
+Three additional rank-local gauges expose the decode capacity split:
+
+| Metric | Meaning |
+| --- | --- |
+| tokenspeed:num_requests_resident | Requests holding a request-pool slot, bounded by B + E. Includes slots still held while a finished request's work drains. |
+| tokenspeed:num_active_decode_slots | Execution permits held by requests or their in-flight work, bounded by B. Includes permits reserved for restore and permits awaiting the final forward result. |
+| tokenspeed:num_decode_ready_waiting_reqs | Resident requests whose KV is ready but that have no execution permit. |
+
+The decode line reports these as #slots(resident/active-decode/ready-waiting).
+For B=36 and E=128, sustained resident=164 proves the resident pool is full;
+active-decode=36 proves the execution permits are occupied. Use the actual
+batch row count and throughput alongside these counters: draining or
+restoring work can hold a permit without dispatching a row that round.
+
+Ready-waiting counts only resident PrefillDone requests waiting for their
+first decode. It excludes Retracted requests whose snapshots are on Host,
+as well as Restoring and Finishing requests. On PD nodes,
+tokenspeed:num_retracted_queue_reqs tracks Retracted and Restoring requests
+separately.
+
+The rank-local histogram tokenspeed:decode_ready_wait_seconds measures E-queue
+wait from the decode host observing complete prefill KV arrival to the first
+decode forward dispatch. It records once per request, including requests that
+dispatch immediately, and excludes requests cancelled or finished before decode.
+It excludes prefill computation and KV transfer; dispatch is the host boundary,
+not a GPU kernel start timestamp. The 0.1-second bucket measures how many observed
+waits meet a 100 ms target. Requests still waiting have no histogram observation
+yet; read it alongside tokenspeed:num_decode_ready_waiting_reqs.
 
 The decode role splits that PD wait into its own gauges.
 `tokenspeed:num_decode_kv_wait_reqs` counts `RemotePrefilling` requests: the

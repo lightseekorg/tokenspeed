@@ -1222,6 +1222,9 @@ class HostBootstrap:
             )
             # The scheduler's request slots are per attention-DP rank.
             max_batch_size = server_args.max_num_seqs // max(mapping.attn.dp_size, 1)
+            max_resident_requests = (
+                max_batch_size + server_args.disaggregation_decode_extra_slots
+            )
             device = build_device_side(
                 server_args=server_args,
                 model_config=model_config,
@@ -1233,6 +1236,7 @@ class HostBootstrap:
                 overlap_schedule_depth=overlap_schedule_depth,
                 decode_input_tokens=decode_input_tokens,
                 max_batch_size=max_batch_size,
+                max_resident_requests=max_resident_requests,
                 kv_transfer_builder=functools.partial(
                     build_host_peer, outbox=pd_outbox
                 ),
@@ -1263,6 +1267,7 @@ class HostBootstrap:
                 storage_config=storage_config,
                 max_scheduled_tokens=server_args.chunked_prefill_size,
                 max_batch_size=max_batch_size,
+                max_resident_requests=max_resident_requests,
                 decode_input_tokens=decode_input_tokens,
                 overlap_schedule_depth=overlap_schedule_depth,
                 enable_kv_cache_events=kv_events,

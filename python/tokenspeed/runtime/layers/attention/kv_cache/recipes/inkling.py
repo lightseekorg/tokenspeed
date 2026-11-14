@@ -403,7 +403,7 @@ def inkling_kv_dequant_scratch_shape(
 def _conv_ring_bytes(*, text_config, attn_config, num_layers: int, spec_tokens: int):
     from tokenspeed.runtime.configs.inkling_config import inkling_conv_total_dim
 
-    rows = int(attn_config.max_bs) + 2
+    rows = int(attn_config.max_resident_requests) + 2
     # Match InklingAttnBackend.from_config: (W-1) taps + K chunk rows.
     spec_tokens = max(1, int(spec_tokens))
     ring_rows = int(text_config.sconv_kernel_size) - 1 + spec_tokens

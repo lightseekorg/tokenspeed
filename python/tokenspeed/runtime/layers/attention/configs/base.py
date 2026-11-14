@@ -204,6 +204,8 @@ class AttnConfig:
     # against this; user-facing limits stay on the logical context_len.
     context_len: int
     max_bs: int
+    # Real resident requests. Null row 0 and graph padding are additional rows.
+    max_resident_requests: int
     # True iff server_args.disaggregation_mode != "null"; cache recipes use
     # it to stamp transfer policies onto the cache group specs.
     pd_disaggregation_enabled: bool = False
@@ -231,6 +233,13 @@ class AttnConfig:
     components: tuple[AttnComponentSpec, ...]
 
     def __post_init__(self):
+        from tokenspeed.runtime.execution.request_slots import RequestSlotLayout
+
+        if type(self.max_bs) is not int or self.max_bs <= 0:
+            raise ValueError("max_bs must be a positive integer")
+        RequestSlotLayout(self.max_resident_requests)
+        if self.max_resident_requests < self.max_bs:
+            raise ValueError("max_resident_requests must be at least max_bs")
         softmax_components = [
             c for c in self.components if isinstance(c, SoftmaxAttnConfig)
         ]
@@ -353,6 +362,9 @@ def model_wide_kwargs(
     context parallel shard (GPU DSA through the MLA config, and V4.1). It only
     affects a draft config; ``__post_init__`` refuses a target that cannot shard.
     """
+    max_bs = server_args.max_num_seqs // (
+        server_args.data_parallel_size or server_args.mapping.attn.dp_size
+    )
     kwargs = dict(
         device=server_args.device,
         dtype=model_config.dtype,
@@ -360,8 +372,8 @@ def model_wide_kwargs(
         kv_cache_mxfp8=kv_cache_mxfp8,
         kv_cache_quant_method=server_args.kv_cache_quant_method,
         context_len=model_config.context_len + server_args.spec_context_pad,
-        max_bs=server_args.max_num_seqs
-        // (server_args.data_parallel_size or server_args.mapping.attn.dp_size),
+        max_bs=max_bs,
+        max_resident_requests=max_bs + server_args.disaggregation_decode_extra_slots,
         pd_disaggregation_enabled=server_args.disaggregation_mode != "null",
         is_draft=is_draft,
         draft_block_decode=draft_block_decode,

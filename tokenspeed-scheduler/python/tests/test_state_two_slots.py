@@ -51,6 +51,7 @@ def _fused_config(decode_input_tokens: int) -> "ts.SchedulerConfig":
     cfg = _make_k3_config()
     cfg.decode_input_tokens = decode_input_tokens
     cfg.max_batch_size = 8
+    cfg.max_resident_requests = cfg.max_batch_size
     return cfg
 
 

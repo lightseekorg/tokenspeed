@@ -762,6 +762,7 @@ protected:
         }
         cfg.max_scheduled_tokens = 8;
         cfg.max_batch_size = 2;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.decode_input_tokens = 1;
         cfg.state_checkpoint_in_forward = in_forward_;
         cfg.demote_superseded_state_checkpoints = demote_;

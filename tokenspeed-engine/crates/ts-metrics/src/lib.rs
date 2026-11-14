@@ -396,6 +396,9 @@ pub struct EngineMetrics {
     num_requests_running: Metric,
     num_requests_inflight: Metric,
     num_requests_waiting: Metric,
+    num_requests_resident: Metric,
+    num_active_decode_slots: Metric,
+    num_decode_ready_waiting_reqs: Metric,
     kv_cache_usage: Metric,
     iteration_tokens: Metric,
     spec_decode_num_accepted_tokens: Metric,
@@ -407,6 +410,7 @@ pub struct EngineMetrics {
     num_capacity_aborted_requests: Metric,
     num_preemptions: Metric,
     request_queue_time: Metric,
+    decode_ready_wait: Metric,
     /// Resident KV occupancy: pages in use (active plus reclaimable prefix
     /// entries) over the usable pages, and the same in tokens.
     kv_token_usage: Metric,
@@ -468,6 +472,24 @@ impl EngineMetrics {
                 exporter,
                 "tokenspeed:num_requests_waiting",
                 "Requests waiting in the C++ scheduler queue.",
+                names,
+            ),
+            num_requests_resident: Metric::gauge(
+                exporter,
+                "tokenspeed:num_requests_resident",
+                "Requests holding a request-pool slot, including requests whose in-flight work is draining.",
+                names,
+            ),
+            num_active_decode_slots: Metric::gauge(
+                exporter,
+                "tokenspeed:num_active_decode_slots",
+                "Decode permits held by requests or their in-flight operations, including restore reservations.",
+                names,
+            ),
+            num_decode_ready_waiting_reqs: Metric::gauge(
+                exporter,
+                "tokenspeed:num_decode_ready_waiting_reqs",
+                "Resident requests whose KV is ready but that have no execution permit.",
                 names,
             ),
             kv_cache_usage: Metric::gauge(
@@ -556,6 +578,18 @@ impl EngineMetrics {
                 &[
                     0.3, 0.5, 0.8, 1.0, 1.5, 2.0, 2.5, 5.0, 10.0, 15.0, 20.0, 30.0, 40.0, 50.0,
                     60.0, 120.0, 240.0, 480.0, 960.0, 1920.0, 7680.0,
+                ],
+            ),
+            decode_ready_wait: Metric::histogram(
+                exporter,
+                "tokenspeed:decode_ready_wait_seconds",
+                "Wall time on the decode role from observing complete prefill KV arrival \
+                 to first decode forward dispatch, observed once per request. Requests \
+                 cancelled or finished before decode dispatch are excluded.",
+                names,
+                &[
+                    0.001, 0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.5, 1.0,
+                    2.0, 5.0, 10.0, 30.0, 60.0, 120.0,
                 ],
             ),
             kv_token_usage: Metric::gauge(
@@ -745,6 +779,16 @@ impl EngineMetrics {
         }
     }
 
+    /// Request-slot occupancy, separate from the frontend's load counters.
+    pub fn record_decode_slot_usage(&self, resident: i64, active_decode: i64, ready_waiting: i64) {
+        let labels = self.labels();
+        self.num_requests_resident.set(&labels, resident as f64);
+        self.num_active_decode_slots
+            .set(&labels, active_decode as f64);
+        self.num_decode_ready_waiting_reqs
+            .set(&labels, ready_waiting as f64);
+    }
+
     /// A verify step's speculation counts over its decode slots.
     pub fn record_spec_decode_step(
         &self,
@@ -801,6 +845,11 @@ impl EngineMetrics {
     /// A request's wait from submission to its first forward.
     pub fn observe_request_queue_time(&self, seconds: f64) {
         self.request_queue_time.observe(&self.labels(), seconds);
+    }
+
+    /// The decode role's KV-ready wait before its first decode dispatch.
+    pub fn observe_decode_ready_wait(&self, seconds: f64) {
+        self.decode_ready_wait.observe(&self.labels(), seconds);
     }
 
     /// Resident KV occupancy. `used_pages` counts active and reclaimable

@@ -142,6 +142,7 @@ class TestAttentionBackendChoices:
             is_draft=False,
             speculative_num_draft_tokens=1,
             max_bs=4,
+            max_resident_requests=4,
             component=components.get,
         )
         model_config = SimpleNamespace(
@@ -257,6 +258,7 @@ class TestAttentionBackendChoices:
             context_len=65536,
             kernel_page_size=64,
             max_bs=8,
+            max_resident_requests=8,
             components=(spec,),
         )
 
@@ -355,6 +357,7 @@ class TestAttentionBackendChoices:
             kernel_page_size=kernel_page_size,
             context_len=256,
             max_bs=2,
+            max_resident_requests=2,
             kv_cache_quant_method="none",
             components=(spec,),
         )
@@ -778,6 +781,7 @@ class TestPagedRouterNameResolution:
             kernel_page_size=64,
             context_len=256,
             max_bs=2,
+            max_resident_requests=2,
             kv_cache_quant_method="none",
             components=(spec,),
         )

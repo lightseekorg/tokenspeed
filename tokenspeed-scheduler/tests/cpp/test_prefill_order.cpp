@@ -36,6 +36,7 @@ protected:
         config.prefix_granularity = 4;
         config.max_scheduled_tokens = 64;
         config.max_batch_size = 32;
+        config.max_resident_requests = config.max_batch_size;
         config.device_allocator.total_pages = 2049;
         config.host_allocator.total_pages = 4097;
         config.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteBack;
@@ -290,6 +291,7 @@ TEST_P(ShortPrefillOrderTest, EachOldestPromptGetsItsOwnBypassAllowance) {
 TEST_P(ShortPrefillOrderTest, ContinuousShortArrivalsAdvanceEveryEarlierLongPrompt) {
     auto config = MakeConfig();
     config.max_batch_size = 2;
+    config.max_resident_requests = config.max_batch_size;
     config_ = WithHostPackingFromDevice(config);
     scheduler_ = std::make_unique<Scheduler>(config_);
     for (int i = 0; i < 3; ++i) {

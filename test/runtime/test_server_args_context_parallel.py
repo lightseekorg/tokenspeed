@@ -384,6 +384,7 @@ def _dsa_attn_config(**overrides):
         kernel_page_size=64,
         context_len=4096,
         max_bs=4,
+        max_resident_requests=4,
         kvp_size=2,
         kvp_rank=0,
         kvp_group=(0, 1),

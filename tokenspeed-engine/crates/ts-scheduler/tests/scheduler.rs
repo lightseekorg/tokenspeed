@@ -74,6 +74,7 @@ cfg = ts.SchedulerConfig()
 cfg.prefix_granularity = 16
 cfg.max_scheduled_tokens = 512
 cfg.max_batch_size = 8
+cfg.max_resident_requests = 8
 cfg.num_device_pages = 64
 cfg.num_snapshot_pages = 1
 cfg.cache_groups = [
@@ -514,6 +515,7 @@ cfg.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteThrough
 cfg.num_snapshot_pages = 1
 cfg.max_scheduled_tokens = 8
 cfg.max_batch_size = 4
+cfg.max_resident_requests = 4
 cfg.disable_l2_cache = False
 cfg.enable_l3_storage = True
 cfg.storage_config = ts.StorageConfig(
@@ -746,6 +748,105 @@ fn a_remote_prefill_carries_what_the_data_plane_reads() {
         (1, 1, 0)
     );
     assert_eq!(python_transfer_view(plan, "remote_prefill"), rows);
+}
+
+#[test]
+fn decode_slot_counts_distinguish_resident_ready_and_draining_work() {
+    interpreter();
+    let code = pd_scheduler("D")
+        .replace("max_batch_size = 8", "max_batch_size = 2")
+        .replace("max_resident_requests = 8", "max_resident_requests = 4");
+    let mut scheduler = Python::attach(|py| Scheduler::from_python(&run(py, &code)).unwrap());
+    scheduler
+        .submit_requests(&[
+            spec("a", vec![1, 2]),
+            spec("b", vec![3, 4]),
+            spec("c", vec![5, 6]),
+            spec("d", vec![7, 8]),
+            spec("queued", vec![9, 10]),
+        ])
+        .unwrap();
+    for rid in ["a", "b", "c", "d", "queued"] {
+        scheduler
+            .advance(&[event(ForwardEventKind::PdBootstrapped, rid, vec![])])
+            .unwrap();
+    }
+    for rid in ["a", "b", "c", "d"] {
+        let transfer = scheduler
+            .next_execution_plan(true, false)
+            .remote_prefill_transfer()
+            .unwrap();
+        assert_eq!(transfer.request_ids, [rid]);
+    }
+    let sizes = scheduler.sizes();
+    assert_eq!(
+        (
+            sizes.allocated_request_slots,
+            sizes.active_decode_slots,
+            sizes.ready_waiting
+        ),
+        (4, 0, 0)
+    );
+    // The old load counters keep their existing meanings: unadmitted work
+    // waits, and remote prefills do not count as a running decode batch.
+    assert_eq!(
+        (sizes.running, sizes.waiting, sizes.remote_prefilling),
+        (0, 1, 4)
+    );
+    assert!(scheduler
+        .next_execution_plan(true, false)
+        .remote_prefill_transfer()
+        .is_none());
+    for rid in ["a", "b", "c", "d"] {
+        scheduler
+            .advance(&[ForwardEvent {
+                bootstrap_token: 42,
+                ..event(ForwardEventKind::PdRemotePrefillDone, rid, vec![])
+            }])
+            .unwrap();
+    }
+    assert_eq!(scheduler.sizes().ready_waiting, 4);
+    let plan = scheduler.next_execution_plan(true, false);
+    assert_eq!(plan.forward_batches()[0].request_ids, ["a", "b"]);
+    let sizes = scheduler.sizes();
+    assert_eq!(
+        (
+            sizes.allocated_request_slots,
+            sizes.active_decode_slots,
+            sizes.ready_waiting
+        ),
+        (4, 2, 2)
+    );
+    assert_eq!(
+        (sizes.running, sizes.waiting, sizes.remote_prefilling),
+        (4, 1, 0),
+        "ready requests retain their existing contribution to the load report"
+    );
+    scheduler
+        .advance(&[event(ForwardEventKind::Abort, "a", vec![])])
+        .unwrap();
+    let sizes = scheduler.sizes();
+    assert_eq!(
+        (
+            sizes.allocated_request_slots,
+            sizes.active_decode_slots,
+            sizes.ready_waiting
+        ),
+        (4, 2, 2),
+        "an aborted in-flight forward still owns its request slot and decode permit"
+    );
+    scheduler
+        .advance(&[event(ForwardEventKind::ExtendResult, "a", vec![43])])
+        .unwrap();
+    let sizes = scheduler.sizes();
+    assert_eq!(
+        (
+            sizes.allocated_request_slots,
+            sizes.active_decode_slots,
+            sizes.ready_waiting
+        ),
+        (3, 1, 2)
+    );
 }
 
 #[test]

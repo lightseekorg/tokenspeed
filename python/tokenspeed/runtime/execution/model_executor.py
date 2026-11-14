@@ -393,7 +393,7 @@ class ModelExecutorConfig:
     """
 
     # Rank-local graph-padding req-pool index. The C++ scheduler owns real rows
-    # 1..max_batch_size and row 0 is reserved, so this must sit after the
+    # 1..max_resident_requests and row 0 is reserved, so this must sit after the
     # scheduler-owned range.
     max_req_pool_size: int
     output_length: int
@@ -921,6 +921,7 @@ class ModelExecutor:
         )
         if self.draft_attn_backend is not None:
             self.draft_attn_backend.configure_runtime(
+                request_slot_capacity=self.config.max_req_pool_size + 1,
                 cache_group_specs=tuple(
                     _cache_arena_attr(
                         self.draft_token_to_kv_pool, "cache_group_specs", ()

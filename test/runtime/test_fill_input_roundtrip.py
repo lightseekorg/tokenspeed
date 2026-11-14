@@ -112,6 +112,7 @@ def buffers(request, monkeypatch):
 def _scheduler(*, token_budget: int, mixed: bool) -> Scheduler:
     config = SchedulerConfig()
     config.max_batch_size = PAD_POOL - 1
+    config.max_resident_requests = PAD_POOL - 1
     config.max_scheduled_tokens = token_budget
     config.prefix_granularity = 4
     config.num_device_pages = 128

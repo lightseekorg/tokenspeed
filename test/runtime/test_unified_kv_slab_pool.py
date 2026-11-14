@@ -468,7 +468,8 @@ class TestStateCacheGroupPageCountTest:
             virtual_packing={spec.group_id: 1 for spec in specs},
             limits=SchedulerLimits(
                 role=SchedulerConfig.Role.Fused,
-                max_live_requests=2,
+                max_batch_size=2,
+                max_resident_requests=2,
                 max_scheduled_tokens=max_scheduled_tokens,
                 max_context_len=4096,
                 decode_input_tokens=decode_input_tokens,

@@ -93,6 +93,7 @@ def _recipe(
         kernel_page_size=64,
         context_len=1024,
         max_bs=2,
+        max_resident_requests=2,
         pd_disaggregation_enabled=False,
         speculative_num_steps=2 if speculative else 0,
         speculative_num_draft_tokens=width,

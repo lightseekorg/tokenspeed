@@ -143,6 +143,7 @@ def test_a_target_verify_without_gated_deltanet_keeps_the_regular_path() -> None
         kernel_page_size=64,
         context_len=1024,
         max_bs=2,
+        max_resident_requests=2,
         pd_disaggregation_enabled=False,
         speculative_num_steps=3,
         speculative_num_draft_tokens=4,

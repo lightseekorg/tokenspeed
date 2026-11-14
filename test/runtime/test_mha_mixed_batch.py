@@ -72,6 +72,7 @@ def _backend(
         kv_cache_quant_method="none",
         context_len=1024,
         max_bs=16,
+        max_resident_requests=16,
         speculative_num_draft_tokens=width,
         is_draft=is_draft,
         draft_block_decode=block_decode,

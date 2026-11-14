@@ -54,20 +54,17 @@ class StateCheckpointSuite : public SchedulerTestSuite {
 protected:
     static constexpr std::int32_t kP = 4;
 
-    // These cache probes cancel to reclaim capacity. On P, the abort command
-    // alone cannot release pages: model the peer's retirement ACK and the
-    // outstanding forward result before probing the next request.
+    // These cache probes cancel to reclaim capacity. Retire the queued
+    // forwards and, on P, the transfer before probing the next request.
     void AbortAndRetire(const std::string& id) {
         SendAbortEvent(id);
         if (config_.role == Role::kP) {
             ExecutionEvent event;
             event.With(pd::TransferStoppedEvent{id});
             scheduler_->Advance(std::move(event));
-            if (scheduler_->PdTransferPinned(id)) {
-                SendForwardDone(id);
-            }
-            EXPECT_FALSE(scheduler_->PdTransferPinned(id));
         }
+        DrainForwardResults(id);
+        EXPECT_FALSE(scheduler_->PdTransferPinned(id));
     }
 
     SchedulerConfig MakeConfig() override {
@@ -78,6 +75,7 @@ protected:
         cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 8;
         cfg.max_batch_size = 2;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.disable_l2_cache = true;
         for (const std::string& id : {"full", "state0", "state1", "state2"}) {
             const bool is_state = id != "full";
@@ -2043,6 +2041,7 @@ protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = StateCheckpointInForwardPrefillRoleSuite::MakeConfig();
         cfg.max_batch_size = 4;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.prefill_chunk_yield_tokens = 4;
         return cfg;
     }
@@ -2138,6 +2137,7 @@ protected:
         cfg.prefix_granularity = 256;
         cfg.max_scheduled_tokens = 16384;
         cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.prefill_chunk_yield_tokens = 4096;
         cfg.device_allocator.total_pages = 1025;
         for (CacheGroupConfig& group : cfg.cache_groups) {
@@ -2483,6 +2483,7 @@ protected:
         }
         cfg.max_scheduled_tokens = 48;
         cfg.max_batch_size = 4;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.overlap_schedule_depth = 1;
         cfg.enable_mixed_prefill_decode = true;
         return cfg;
@@ -2749,6 +2750,7 @@ protected:
             group.total_pages = cfg.device_allocator.total_pages;
         }
         cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.decode_input_tokens = 1;
         return cfg;
     }
@@ -4472,6 +4474,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, AnOlderPublicationLeavesALaterHitte
         const bool write_back = policy == SchedulerConfig::HostWritePolicy::kWriteBack;
         Reset(host_cache, /*decode_width=*/1);
         config_.max_batch_size = 3;  // x, h and g in flight together
+        config_.max_resident_requests = config_.max_batch_size;
         scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
         std::vector<std::int32_t> o = MakeTokens(22, 3000);
         CompleteSession("o", o);

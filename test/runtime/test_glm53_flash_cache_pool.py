@@ -92,6 +92,7 @@ def test_glm53_flash_pool_binds_paged_cache_and_request_local_tail() -> None:
         kv_cache_quant_method="none",
         context_len=4096,
         max_bs=8,
+        max_resident_requests=8,
         components=(dsa, linear),
     )
     draft_attn_config = replace(

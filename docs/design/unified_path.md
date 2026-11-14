@@ -94,6 +94,13 @@ ranks; callers need not establish an inference context.
 
 ### Buffer sizing: the ladder is a performance subset, never a capacity limit
 
+Request slot capacity is independent of forward batch capacity. PD decode
+extra slots increase the real request range to 1..C, keep null row 0, and
+place padding at C+1. Persistent state indexed by request slot covers C+2
+rows. A batch of at most B requests can contain a slot index greater than B;
+batch-indexed inputs, metadata, graph buckets and scratch remain bounded by
+B. Passing a larger resident pool must not enlarge the execution ladder.
+
 `ForwardStepRunner` distinguishes `max_capture_bs` (top of the capture ladder,
 bounded by `max_cudagraph_capture_size`) from `max_decode_bs`
 (`max_num_seqs // dp_size`, floored at `max_capture_bs`). Persistent decode

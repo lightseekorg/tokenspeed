@@ -180,6 +180,7 @@ cfg = ts.SchedulerConfig()
 cfg.prefix_granularity = {page}
 cfg.max_scheduled_tokens = {tokens}
 cfg.max_batch_size = {rows}
+cfg.max_resident_requests = {rows}
 cfg.num_device_pages = {pages} + 1
 cfg.num_snapshot_pages = 1
 cfg.cache_groups = [ts.CacheGroupConfig(group_id="full_attention", block_granularity={page},

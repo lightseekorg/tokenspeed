@@ -257,6 +257,7 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
             overlap_schedule_depth=0,
             decode_input_tokens=16,
             max_batch_size=16,
+            max_resident_requests=16,
             kv_transfer_builder=functools.partial(build_host_peer, outbox=None),
         )
     # Once, before tuning and capture, only where the checkpoint declares the contract.
@@ -437,6 +438,7 @@ def _profile_batch(mode):
     config.prefix_granularity = 16
     config.max_scheduled_tokens = 8
     config.max_batch_size = 4
+    config.max_resident_requests = 4
     config.num_device_pages = 64
     config.num_snapshot_pages = 1
     config.enable_mixed_prefill_decode = True

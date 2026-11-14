@@ -1422,6 +1422,7 @@ def _retraction_pool_request(
     *,
     host_group_packing,
     max_batch_size: int,
+    max_resident_requests: int,
     max_context_len: int,
     decode_input_tokens: int,
     overlap_schedule_depth: int,
@@ -1452,7 +1453,8 @@ def _retraction_pool_request(
             virtual_packing=host_group_packing,
             limits=SchedulerLimits(
                 role=scheduler_role(server_args.disaggregation_mode),
-                max_live_requests=max_batch_size,
+                max_batch_size=max_batch_size,
+                max_resident_requests=max_resident_requests,
                 max_scheduled_tokens=int(server_args.chunked_prefill_size),
                 max_context_len=max_context_len,
                 decode_input_tokens=decode_input_tokens,
@@ -1483,6 +1485,7 @@ def build_device_side(
     overlap_schedule_depth: int,
     decode_input_tokens: int,
     max_batch_size: int,
+    max_resident_requests: int,
     kv_transfer_builder,
 ) -> DeviceBuild:
     """Construct the whole device side and return the three views of it.
@@ -1511,9 +1514,9 @@ def build_device_side(
             size the KV budget.
         overlap_schedule_depth: Decode KV reservation depth.
         decode_input_tokens: Tokens each decode step feeds per request.
-        max_batch_size: Rank-local scheduler batch bound; the executor
-            sizes its request pool one row past it for the graph-padding
-            sink row.
+        max_batch_size: Rank-local scheduler execution bound.
+        max_resident_requests: Rank-local request-pool bound. Null row 0 and
+            the graph-padding row sit outside the live range.
         kv_transfer_builder: Builds the PD transfer peer from the finished
             attention build, or returns None outside disaggregation: the
             host's ``build_host_peer`` (``pd/host_peer.py``), bound to the
@@ -1663,7 +1666,7 @@ def build_device_side(
                 server_args=server_args,
                 model_config=model_config,
                 model=target.model,
-                max_req_pool_size=RequestSlotLayout(max_batch_size).padding,
+                max_req_pool_size=RequestSlotLayout(max_resident_requests).padding,
                 gpu_id=gpu_id,
                 global_rank=global_rank,
                 prefix_granularity=views.cache_geometry.prefix_granularity,
@@ -1750,6 +1753,7 @@ def build_device_side(
         views.token_to_kv_pool.arena.runtime_contract,
         host_group_packing=host_tail_packing,
         max_batch_size=max_batch_size,
+        max_resident_requests=max_resident_requests,
         max_context_len=model_config.context_len + server_args.spec_context_pad,
         decode_input_tokens=decode_input_tokens,
         overlap_schedule_depth=overlap_schedule_depth,

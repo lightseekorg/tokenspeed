@@ -932,6 +932,11 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 self.config.kv_total_pages,
                 iteration_tokens,
             );
+            metrics.record_decode_slot_usage(
+                sizes.allocated_request_slots as i64,
+                sizes.active_decode_slots as i64,
+                sizes.ready_waiting as i64,
+            );
             let total_pages = self.config.kv_total_pages;
             metrics.record_cache_occupancy(
                 total_pages - i64::from(sizes.empty_lcm_blocks),
@@ -1032,6 +1037,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             for rid in &batch.request_ids {
                 if let Some(at) = self.outputs.take_submitted_at(rid) {
                     metrics.observe_request_queue_time(at.elapsed().as_secs_f64());
+                }
+                if let Some(at) = self.outputs.take_decode_ready_at(rid) {
+                    metrics.observe_decode_ready_wait(at.elapsed().as_secs_f64());
                 }
             }
         }
@@ -2565,6 +2573,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 let resident = kv_total_pages - i64::from(sizes.empty_lcm_blocks);
                 RoundStats {
                     queued: sizes.waiting,
+                    allocated_request_slots: sizes.allocated_request_slots,
+                    active_decode_slots: sizes.active_decode_slots,
+                    ready_waiting: sizes.ready_waiting,
                     active_pages: active,
                     cached_pages: (resident - active).max(0),
                     pd: [

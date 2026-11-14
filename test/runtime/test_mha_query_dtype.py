@@ -57,6 +57,7 @@ def _backend(kv_cache_dtype: torch.dtype) -> MHAAttnBackend:
         kv_cache_quant_method="none",
         context_len=256,
         max_bs=4,
+        max_resident_requests=4,
         speculative_num_draft_tokens=1,
         is_draft=False,
         draft_block_decode=False,

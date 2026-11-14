@@ -453,6 +453,9 @@ class ServerArgs:
     # Memory and scheduling
     gpu_memory_utilization: float | None = None
     max_num_seqs: int | None = None
+    # Additional resident requests per attention-DP rank; forwards still use
+    # max_num_seqs. Zero leaves the request pool at its execution capacity.
+    disaggregation_decode_extra_slots: int = 0
     max_total_tokens: int | None = None
     chunked_prefill_size: int | None = None
     max_prefill_tokens: int = 8192
@@ -906,6 +909,7 @@ class ServerArgs:
         return _SPEC_OVERSHOOT_SPANS * int(self.speculative_num_draft_tokens)
 
     def __post_init__(self):
+        self.validate_decode_extra_slots()
         self.validate_weight_memory_policy()
         self.validate_forward_reload()
         self.resolve_basic_defaults()
@@ -2822,6 +2826,7 @@ class ServerArgs:
             )
 
     def validate(self):
+        self.validate_decode_extra_slots()
         if (
             type(self.ttft_trace_sampling_percentage) is not int
             or not 0 <= self.ttft_trace_sampling_percentage <= 100
@@ -2926,6 +2931,17 @@ class ServerArgs:
             # Enable PDL for fused attention kernels.
             os.environ.setdefault("TRTLLM_ENABLE_PDL", "1")
         os.environ.setdefault("TLLM_LOG_LEVEL", "INFO")
+
+    def validate_decode_extra_slots(self) -> None:
+        extra = self.disaggregation_decode_extra_slots
+        if type(extra) is not int or extra < 0:
+            raise ValueError(
+                "--disaggregation-decode-extra-slots must be a non-negative integer"
+            )
+        if extra and self.disaggregation_mode != "decode":
+            raise ValueError(
+                "--disaggregation-decode-extra-slots requires --disaggregation-mode decode"
+            )
 
     def validate_prefill_delay(self) -> None:
         intervals = self.prefill_delay
@@ -3174,6 +3190,14 @@ class ServerArgs:
             type=int,
             default=ServerArgs.max_num_seqs,
             help="Maximum number of sequences to process concurrently.",
+        )
+        parser.add_argument(
+            "--disaggregation-decode-extra-slots",
+            type=int,
+            default=ServerArgs.disaggregation_decode_extra_slots,
+            help="Additional resident request slots per attention-DP rank on a "
+            "decode server. These receive KV without increasing the execution "
+            "concurrency set by --max-num-seqs. Defaults to zero.",
         )
         parser.add_argument(
             "--max-total-tokens",
