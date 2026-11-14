@@ -471,7 +471,7 @@ its DSpark drafter's block rows, where a row mask would need one per row
 count. The share is right only when each rank's MegaMoE input is its
 attention-DP group's whole padded batch: request-major, the same number of
 rows per request, the filler requests last. Attention TP 1 and rows
-replicated over attention TP (attention TP == MoE TPxEP) give that; they are
+replicated over attention TP (attention TP == MoE TP×EP) give that; they are
 the only layouts DeepSeek V4.1 admits with MegaMoE. Any other attention TP,
 such as Qwen3.5's DP4/TP2/EP8, reduce-scatters each group's rows into shards
 (`moe_input_row_segments`) that hold its live rows unevenly. The runner
