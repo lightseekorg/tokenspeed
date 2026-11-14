@@ -1238,6 +1238,9 @@ import tokenspeed_kernel.ops.attention.gdn.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.gdn.triton  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.gdn.cute_dsl  # noqa: E402,F401
 
+if current_platform().is_nvidia:
+    import tokenspeed_kernel.ops.attention.gdn.gluon_nvidia  # noqa: E402,F401
+
 # isort: on
 
 __all__ = [
