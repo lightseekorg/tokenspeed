@@ -299,7 +299,10 @@ class DeepseekV41Recipe(CacheRecipe):
         BF16 KV rows for an entire prefill at once. Candidate/top-k ids still
         live for every scheduled query across Reindex/Reuse layers.
         """
-        from tokenspeed_kernel.ops.attention.dsv41 import index_logit_rows
+        from tokenspeed_kernel.ops.attention.dsv41 import (
+            index_logit_rows,
+            prefill_indexer_batching_supported,
+        )
 
         max_bs = self.attn_config.max_bs
         horizon = (1 + self.overlap_schedule_depth) * self.decode_input_tokens
@@ -310,6 +313,7 @@ class DeepseekV41Recipe(CacheRecipe):
         )
         spec = self.attn_config.component(DeepseekV41Config)
         rows = spec.row_layout()
+        batched_indexer = prefill_indexer_batching_supported(rows.index_row_bytes)
         queries = spec.max_query_tokens
         # Tables/lengths stay request-shaped; positions, request maps, write
         # locations and compact SWA slots/lengths cover every verify query.
@@ -364,7 +368,7 @@ class DeepseekV41Recipe(CacheRecipe):
         # place, so one BF16 matrix peaks.
         dense_scores = (
             min(queries, index_logit_rows(score_columns)) * score_columns * 2
-            if prefills
+            if prefills and batched_indexer
             else 0
         )
         # Reindex layers (index source != KV owner) score every row of a prefill
@@ -400,7 +404,9 @@ class DeepseekV41Recipe(CacheRecipe):
         # One scorer runs at a time, so its peak bounds the scratch. Dense
         # prefill also packs one gathered history per request in the call.
         packed_histories = (
-            min(max_bs, queries) * score_columns * rows.index_row_bytes
+            (min(max_bs, queries) if batched_indexer else 1)
+            * score_columns
+            * rows.index_row_bytes
             if prefills
             else 0
         )

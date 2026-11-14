@@ -2946,6 +2946,13 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         """Merge request windows, splitting a request whose own Q×K exceeds one call."""
         from tokenspeed_kernel.ops.attention import dsv41
 
+        # Hopper and portable scorers tile each request internally; merging
+        # histories would turn their broadcast dense tables into paged tables.
+        if not dsv41.prefill_indexer_batching_supported(
+            self.spec.row_layout().index_row_bytes
+        ):
+            return windows
+
         active = [
             (start, stop, span)
             for start, stop, span in windows
