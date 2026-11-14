@@ -1997,6 +1997,17 @@ make one of the engine's pipeline stages hold more bytes: a stage allocates
 every plane its layers' fields touch, so a field on a plane that no other layer
 of its stage uses costs that stage the whole plane.
 
+With `--qwen4-exp-flat-kv`, the full-attention K/V fields instead share one
+`flatkv` plane (PP=1 only; GDN, PLE and QSA side groups keep their existing
+layout policy). Their compute views stay contiguous without changing the
+attention kernels. For a field page stride `S`, kernel page payload `B`, and
+scheduler block `b` containing kernel subpage `j`, the router emits atom page
+`b * (S / B) + j`, while each field's view starts at its block-0 address. The
+address is therefore `base + b * S + j * B`, exactly the original strided
+address. `S` must be divisible by `B`; tightly packed fields reduce to the
+ordinary `b * r + j` mapping. The same atom table drives `out_cache_loc`, so
+reads and writes share the mapping.
+
 Inkling's ShortConv checkpoints share the attention planes the same way: a
 kvconv group and one hiddenconv group per attention group put each layer's
 rows on that layer's K and V planes, so a parent is exactly its KV pages. A

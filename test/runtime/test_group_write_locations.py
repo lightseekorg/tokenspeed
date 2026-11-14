@@ -244,7 +244,7 @@ if __name__ == "__main__":
 class TestInt32WriteSlots:
     def test_stacked_slots_refresh_and_pad_without_replacing_decode_storage(self):
         stacks = GroupTableStacks(
-            [GroupTableSpec("history", 128, 128, 2)],
+            [GroupTableSpec("history", 128, 128, 2, 1)],
             max_bs=1,
             max_tokens_per_req=4,
             max_extend_tokens=4,
@@ -298,7 +298,7 @@ class TestHostPageSizeMirror:
                     raise AssertionError("device page-size scalar read")
                 return func(*args, **(kwargs or {}))
 
-        specs = [GroupTableSpec("a", 2, 2, 3), GroupTableSpec("b", 4, 4, 3)]
+        specs = [GroupTableSpec("a", 2, 2, 3, 1), GroupTableSpec("b", 4, 4, 3, 1)]
         stacks = GroupTableStacks(
             specs, max_bs=3, max_tokens_per_req=4, max_extend_tokens=8, device=device
         )

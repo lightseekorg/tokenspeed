@@ -115,6 +115,7 @@ def _group_table(backend, raw_rows, bs: int, actual_bs: int) -> torch.Tensor:
                 block_granularity=_LOGICAL_P,
                 kernel_page_size=backend.kernel_page_size,
                 max_num_pages=backend.max_num_pages,
+                atom_pages_per_block=(_LOGICAL_P // backend.kernel_page_size),
             )
         ],
         max_bs=max(bs, 4),

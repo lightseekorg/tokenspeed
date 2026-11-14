@@ -37,9 +37,27 @@ def _odd_specs():
     ratio 1 (exact width), ratio 2 (width overshoots the raw span -> zero
     tail), ratio 4 (width undershoots -> truncation)."""
     return [
-        GroupTableSpec(G0, block_granularity=4, kernel_page_size=4, max_num_pages=7),
-        GroupTableSpec(G1, block_granularity=4, kernel_page_size=2, max_num_pages=13),
-        GroupTableSpec(G2, block_granularity=4, kernel_page_size=1, max_num_pages=5),
+        GroupTableSpec(
+            G0,
+            block_granularity=4,
+            kernel_page_size=4,
+            max_num_pages=7,
+            atom_pages_per_block=1,
+        ),
+        GroupTableSpec(
+            G1,
+            block_granularity=4,
+            kernel_page_size=2,
+            max_num_pages=13,
+            atom_pages_per_block=2,
+        ),
+        GroupTableSpec(
+            G2,
+            block_granularity=4,
+            kernel_page_size=1,
+            max_num_pages=5,
+            atom_pages_per_block=4,
+        ),
     ]
 
 

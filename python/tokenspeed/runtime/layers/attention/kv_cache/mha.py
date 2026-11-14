@@ -32,6 +32,7 @@ from tokenspeed_kernel.ops.kvcache.triton import (
     quantize_store_kv_mxfp8,
     store_kv_cache,
 )
+from typing_extensions import override
 
 from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
 from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
@@ -106,14 +107,58 @@ class MHATokenToKVPool(CachePool):
         "v": "v_buffer",
     }
 
+    @override
+    def atom_pages_per_block(self, group_id: str, kernel_page_size: int) -> int:
+        ordinary = super().atom_pages_per_block(group_id, kernel_page_size)
+        multipliers = set()
+        for (_, plane), field_id in self.layer_fields.items():
+            if plane not in ("k", "v"):
+                continue
+            field = self.arena.plan.field(field_id)
+            if field.group_id != group_id:
+                continue
+            if field.page_stride_bytes == field.payload_bytes:
+                multipliers.add(ordinary)
+                continue
+            if self._layer_kv_head_counts is not None:
+                raise NotImplementedError(
+                    "FlatKV atom pages currently require uniform K/V head geometry"
+                )
+            row_bytes = field.payload_bytes // field.shape[0]
+            atom_bytes = kernel_page_size * row_bytes
+            if field.page_stride_bytes % atom_bytes:
+                raise ValueError(
+                    f"cache field {field_id!r}: page stride "
+                    f"{field.page_stride_bytes} is not divisible by atom-page "
+                    f"payload {atom_bytes}"
+                )
+            multipliers.add(field.page_stride_bytes // atom_bytes)
+        if not multipliers:
+            return ordinary
+        if len(multipliers) != 1:
+            raise ValueError(
+                f"cache group {group_id!r} needs one atom-page multiplier for "
+                f"every layer sharing its page table, got {sorted(multipliers)}"
+            )
+        return multipliers.pop()
+
     def get_kv_size_bytes(self):
-        # Different layer views may share an address through the memory plan.
-        # Count each physical region once, independent of Python identity.
-        k_caches = {t.data_ptr(): t for t in self.k_buffer if t is not None}
-        v_caches = {t.data_ptr(): t for t in self.v_buffer if t is not None}
-        k_size_bytes = sum(t.nbytes for t in k_caches.values())
-        v_size_bytes = sum(t.nbytes for t in v_caches.values())
-        return k_size_bytes, v_size_bytes
+        # Count planned payload, not the atom view's span across neighboring
+        # fields. Aliased layer views still count once by their base address.
+        def planned_size(buffers, plane):
+            sizes = {}
+            for layer, buf in enumerate(buffers):
+                if buf is None:
+                    continue
+                field = self.arena.plan.field(self.layer_fields[(layer, plane)])
+                group = self.arena.plan.group(field.group_id)
+                sizes[buf.data_ptr()] = group.page_count * field.payload_bytes
+            return sum(sizes.values())
+
+        return (
+            planned_size(self.k_buffer, "k"),
+            planned_size(self.v_buffer, "v"),
+        )
 
     def _layer_row_view(self, buf: torch.Tensor, layer_id: int) -> torch.Tensor:
         """Per-layer token-row view over one byte-uniform cache field.
