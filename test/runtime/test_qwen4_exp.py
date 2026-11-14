@@ -373,6 +373,18 @@ def test_qwen4_exp_ple_offload_default(
     assert not Qwen4ExpTextConfig(ple_offload_embedding=False).ple_offload_embedding
 
 
+@pytest.mark.parametrize("placement", ["auto", "shm", "cuda_vmm"])
+def test_qwen4_exp_shared_ple_placement_roundtrip(placement: str) -> None:
+    config = Qwen4ExpTextConfig(ple_offload_embedding=placement)
+    restored = Qwen4ExpTextConfig.from_dict(config.to_dict())
+    assert restored.ple_offload_embedding == placement
+
+
+def test_qwen4_exp_rejects_unknown_shared_ple_placement() -> None:
+    with pytest.raises(ValueError, match="auto, shm, or cuda_vmm"):
+        Qwen4ExpTextConfig(ple_offload_embedding="nvme")
+
+
 def test_qwen4_exp_flat_config_preserves_text_rope_parameters() -> None:
     config = Qwen4ExpConfig(
         hidden_size=16,
@@ -3547,6 +3559,8 @@ def _ple_checkpoint_loader_stub(
     )
     ple.lookup._checkpoint_weight_scale = 1.0
     ple.lookup.offload_embedding = offload
+    ple.lookup._shared_table = None
+    ple.lookup._shared_loaded = False
     ple.lookup._compute_device = torch.device("cuda" if offload else "cpu")
 
     embedding = torch.nn.Module()
