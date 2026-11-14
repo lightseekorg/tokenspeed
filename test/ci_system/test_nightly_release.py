@@ -42,15 +42,17 @@ def project(tmp_path):
     return tmp_path
 
 
-def test_nightly_versions_and_kernel_dependency_share_date(project):
+def test_nightly_pins_kernel_date_and_actual_engine_version(project):
     base_version = tomllib.loads((project / "python/pyproject.toml").read_text())[
         "project"
     ]["version"]
-    version = PREPARE(project, "20260930", "0.1.3.post20260930")
+    version = PREPARE(project, "20260930", "0.1.3.post20260930", "0.1.0.post20261001")
     metadata = tomllib.loads((project / "python/pyproject.toml").read_text())["project"]
     assert metadata["version"] == version == f"{base_version}.post20260930"
     kernel = [d for d in metadata["dependencies"] if d.startswith("tokenspeed-kernel")]
     assert kernel == ["tokenspeed-kernel==0.1.3.post20260930"]
+    engine = [d for d in metadata["dependencies"] if d.startswith("tokenspeed-engine")]
+    assert engine == ["tokenspeed-engine==0.1.0.post20261001"]
     assert (
         runpy.run_path(str(project / "python/tokenspeed/version.py"))["__version__"]
         == version
@@ -63,7 +65,9 @@ def test_release_candidate_kernel_nightly_makes_a_tokenspeed_release_candidate(
     base_version = tomllib.loads((project / "python/pyproject.toml").read_text())[
         "project"
     ]["version"]
-    version = PREPARE(project, "20261108", "0.1.4rc1.post20261108")
+    version = PREPARE(
+        project, "20261108", "0.1.4rc1.post20261108", "0.1.0.post20261108"
+    )
     metadata = tomllib.loads((project / "python/pyproject.toml").read_text())["project"]
     assert metadata["version"] == version == f"{base_version}rc1.post20261108"
     pins = [d for d in metadata["dependencies"] if d.startswith("tokenspeed-kernel")]
@@ -82,7 +86,7 @@ def test_invalid_or_mismatched_date_does_not_change_metadata(project, date, kern
     path = project / "python/pyproject.toml"
     original = path.read_bytes()
     with pytest.raises(ValueError):
-        PREPARE(project, date, kernel)
+        PREPARE(project, date, kernel, "0.1.0.post20260930")
     assert path.read_bytes() == original
 
 
@@ -99,7 +103,7 @@ def test_kernel_with_anything_but_a_release_candidate_is_refused(project, kernel
     path = project / "python/pyproject.toml"
     original = path.read_bytes()
     with pytest.raises(ValueError):
-        PREPARE(project, "20261108", kernel)
+        PREPARE(project, "20261108", kernel, "0.1.0.post20261108")
     assert path.read_bytes() == original
 
 
