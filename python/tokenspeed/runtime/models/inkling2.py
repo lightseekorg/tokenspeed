@@ -166,12 +166,7 @@ class Inkling2DecoderLayer(nn.Module):
 
         def norm() -> PrecisionRMSNorm:
             return PrecisionRMSNorm(
-                config.hidden_size,
-                config.rms_norm_eps,
-                config.pre_norm_pre_affine,
-                torch.bfloat16,
-                True,
-                False,
+                config.hidden_size, config.rms_norm_eps, torch.bfloat16, True, False
             )
 
         self.attn_norm = norm() if self.is_local else None
@@ -203,7 +198,7 @@ class Inkling2DecoderLayer(nn.Module):
             "input_norm_gains",
             (
                 None
-                if self.is_local or config.pre_norm_pre_affine
+                if self.is_local
                 else torch.zeros((3, config.hidden_size), dtype=torch.bfloat16)
             ),
             persistent=False,
@@ -388,7 +383,7 @@ class Inkling2TextModel(nn.Module):
             tp_group=mapping.attn.tp_group,
         )
         self.embed_norm = PrecisionRMSNorm(
-            config.hidden_size, config.rms_norm_eps, False, torch.bfloat16, True, False
+            config.hidden_size, config.rms_norm_eps, torch.bfloat16, True, False
         )
         self.layers = nn.ModuleList(
             [
@@ -409,12 +404,7 @@ class Inkling2TextModel(nn.Module):
             config.attn_res_normalize_values,
         )
         self.norm = PrecisionRMSNorm(
-            config.hidden_size,
-            config.rms_norm_eps,
-            config.final_norm_pre_affine,
-            torch.bfloat16,
-            True,
-            False,
+            config.hidden_size, config.rms_norm_eps, torch.bfloat16, True, False
         )
 
     def forward(
