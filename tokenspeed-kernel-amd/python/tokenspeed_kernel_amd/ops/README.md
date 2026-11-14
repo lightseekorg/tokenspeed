@@ -985,6 +985,9 @@ slower, and rows of at most `topk` candidates take ~4.2 us instead of ~2.4 us.
   workgroups and rows 9-32 4096-column ones, each one compiled variant.
 - A per-stream workspace holds each row's histogram and counters and is back
   to zero after every call, so graph replays reuse it.
+- With simulation enabled, rows with at most top-k visible entries return
+  every visible slot once and pad the rest with -1. Only longer rows reach
+  stratified sampling, so all top-k strata are nonempty in every implementation.
 
 #### Algorithm
 
@@ -1022,6 +1025,14 @@ scoring, `gluon_dsv41_index_topk_gfx1250` for candidate rows, then
 uses the portable Triton radix select (`tokenspeed_kernel`
 `index_block_select`). Both scorers take queries packed as MXFP4 values with
 one E8M0 scale per 32 values; the adapter packs a call's queries once.
+
+The gfx950 selector's explicit `simulation` input replaces final selected IDs
+with stratified samples while retaining scoring, tie handling and selection.
+Simulation requires fully allocated, finite visible histories; sorted candidate
+blocks form a valid prefix and include the newest block. Row output stays
+sorted, unique and causal; block output retains the newest visible block.
+Original selected IDs enter the sampling hash so their computation stays live.
+The seed is a runtime scalar and adds no JIT specialization.
 
 #### Contract
 

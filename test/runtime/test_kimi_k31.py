@@ -1394,6 +1394,7 @@ def test_configured_index_k_quantization_and_topk(tmp_path, phase) -> None:
             block_table=_kernel_page_table(block_ids, "cuda"),
             seq_lens_2d=seq_lens_2d,
             plan=dsa_plan(seq_lens_2d=seq_lens_2d, page_size=pool.index_k_page_size),
+            simulation_seed=None,
         )
     good = torch.ones(seq_len, device="cuda", dtype=torch.bool)
     good[bad] = False

@@ -363,6 +363,21 @@ class CacheArena:
         except KeyError:
             raise ValueError(f"cache field {field_id!r} is not planned") from None
 
+    def field_pages(self, field_id: str) -> torch.Tensor:
+        """Return the same field bytes with an explicit physical page axis.
+
+        Compute-facing fields may flatten pages into token rows. Cache setup
+        and fixed-state snapshots operate on physical pages instead; unflatten
+        that axis using the plan without copying the cache or inventing strides.
+        """
+        field = self.plan.field(field_id)
+        view = self.field(field_id)
+        if view.ndim == len(field.shape) + 1:
+            return view
+        return view.unflatten(
+            0, (self.plan.group(field.group_id).page_count, field.shape[0])
+        )
+
     def field_address(self, field_id: str) -> int:
         """Address of physical block zero, including host placement."""
         return self._fields[field_id].data_ptr()
@@ -634,7 +649,7 @@ class CacheArena:
 
     @torch.no_grad()
     def clear(self) -> None:
-        """Zero the arena after sleep/wake remaps its storage.
+        """Zero all owned payloads after remapping or for an exclusive synthetic fixture.
 
         Exactly one owner, so callers may fan this out over every compute
         view without double-clearing or needing a "views skip" rule. The

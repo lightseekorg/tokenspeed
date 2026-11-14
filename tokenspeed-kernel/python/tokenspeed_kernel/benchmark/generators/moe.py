@@ -233,6 +233,7 @@ def _routing_tensors(
         routed_scaling_factor=routed_scaling_factor,
         correction_bias=_correction_bias(experts, device=router_logits.device),
         topk_weights_dtype=weights_dtype,
+        simulation_seed=None,
     )
     if expert_start:
         topk_ids = topk_ids + expert_start
@@ -782,6 +783,7 @@ def prepare_sigmoid_bias_topk(
             routed_scaling_factor=routed_scaling_factor,
             correction_bias=correction_bias,
             topk_weights_dtype=weights_dtype,
+            simulation_seed=None,
         )
 
     return PreparedBenchmark(
@@ -851,6 +853,7 @@ def prepare_softmax_topk(
             "topk",
             normalize_topk_weights,
             1.0,
+            simulation_seed=None,
         )
 
     return PreparedBenchmark(
@@ -933,6 +936,7 @@ def prepare_topk(
             normalize_topk_weights,
             routed_scaling_factor,
             correction_bias=correction_bias,
+            simulation_seed=None,
         )
 
     return PreparedBenchmark(

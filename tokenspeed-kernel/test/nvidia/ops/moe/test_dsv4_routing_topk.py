@@ -64,7 +64,11 @@ def test_weight_dtype_scales_in_fp32_before_store(
         solution=None,
     )
     unscaled, ids = moe_topk(
-        logits, routed_scaling_factor=1.0, topk_weights_dtype=torch.float32, **args
+        logits,
+        routed_scaling_factor=1.0,
+        topk_weights_dtype=torch.float32,
+        **args,
+        simulation_seed=None,
     )
 
     def run():
@@ -73,6 +77,7 @@ def test_weight_dtype_scales_in_fp32_before_store(
             routed_scaling_factor=scaling_factor,
             topk_weights_dtype=torch.bfloat16,
             **args,
+            simulation_seed=None,
         )
 
     actual, ids_bf16 = run()
@@ -89,7 +94,11 @@ def test_weight_dtype_scales_in_fp32_before_store(
         logits.normal_()
         graph.replay()
         unscaled, ids = moe_topk(
-            logits, routed_scaling_factor=1.0, topk_weights_dtype=torch.float32, **args
+            logits,
+            routed_scaling_factor=1.0,
+            topk_weights_dtype=torch.float32,
+            **args,
+            simulation_seed=None,
         )
         torch.testing.assert_close(
             captured, (unscaled * scaling_factor).bfloat16(), atol=0, rtol=0

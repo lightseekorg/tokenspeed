@@ -1115,6 +1115,7 @@ def test_softmax_topk_generator_selection_matches_operation_api(
             "topk",
             True,
             1.0,
+            simulation_seed=None,
         )
     request = _qwen38_request(
         "softmax_topk",

@@ -51,6 +51,7 @@ def _sigmoid_topk(
         correction_bias=correction_bias,
         logical_to_physical_map=logical_to_physical_map,
         solution=solution,
+        simulation_seed=None,
     )
 
 
@@ -304,6 +305,7 @@ def test_kimi_topk_prefill_matches_reference(tokens: int) -> None:
         16,
         routed_scaling_factor=1.0,
         normalize_topk_weights=True,
+        simulation_seed=None,
     )
     torch.testing.assert_close(actual_ids, expected_ids.to(torch.int32), rtol=0, atol=0)
     torch.testing.assert_close(actual_weights, expected_weights, rtol=2e-6, atol=2e-7)
@@ -328,6 +330,7 @@ def test_kimi_topk_prefill_scales_beyond_8k(dtype: torch.dtype) -> None:
         16,
         routed_scaling_factor=1.0,
         normalize_topk_weights=True,
+        simulation_seed=None,
     )
 
     torch.testing.assert_close(actual_ids, expected_ids.to(torch.int32), rtol=0, atol=0)
@@ -361,6 +364,7 @@ def test_kimi_topk_prefill_selects_evenly_strided_winners(
         16,
         routed_scaling_factor=1.0,
         normalize_topk_weights=True,
+        simulation_seed=None,
     )
     torch.testing.assert_close(actual_ids, expected_ids.to(torch.int32), rtol=0, atol=0)
     torch.testing.assert_close(actual_weights, expected_weights, rtol=2e-6, atol=2e-7)
@@ -393,6 +397,7 @@ def test_sigmoid_topk_prefill_exhausts_a_lane_of_few_experts(
         8,
         routed_scaling_factor=1.0,
         normalize_topk_weights=True,
+        simulation_seed=None,
     )
     torch.testing.assert_close(actual_ids, expected_ids.to(torch.int32), rtol=0, atol=0)
     torch.testing.assert_close(
@@ -407,7 +412,86 @@ def test_sigmoid_topk_prefill_exhausts_a_lane_of_few_experts(
 def test_kimi_topk_prefill_ties_choose_smaller_expert_id() -> None:
     logits = torch.zeros(3, 896, device="cuda")
     bias = torch.zeros(896, device="cuda")
-    weights, ids = moe_sigmoid_bias_topk(logits, bias, 16)
+    weights, ids = moe_sigmoid_bias_topk(logits, bias, 16, simulation_seed=None)
     expected_ids = torch.arange(16, device="cuda", dtype=torch.int32).expand(3, -1)
     assert torch.equal(ids, expected_ids)
     torch.testing.assert_close(weights, torch.full_like(weights, 1 / 16))
+
+
+@pytest.mark.skipif(not is_cdna4(), reason="Final-store simulation targets gfx950")
+@pytest.mark.parametrize("rows", [1, 2, 4, 8, 16, 32, 256, 1024])
+@pytest.mark.parametrize(
+    "experts,topk,score",
+    [(896, 16, "sigmoid"), (384, 6, "sqrt_softplus"), (256, 8, "sigmoid")],
+)
+def test_simulated_routing_preserves_scores_and_unique_experts(
+    rows, experts, topk, score
+):
+    # Equal synthetic token rows would collapse onto the same experts without
+    # simulation. Each output row must remain a permutation of real decisions.
+    logits = torch.linspace(-1, 1, experts, device="cuda").expand(rows, -1).contiguous()
+    bias = torch.zeros(experts, device="cuda")
+
+    def route(seed):
+        return kernel_moe_topk(
+            logits,
+            topk,
+            score,
+            "topk",
+            True,
+            1.0,
+            correction_bias=bias,
+            simulation_seed=seed,
+        )
+
+    original_weights, original_ids = route(None)
+    weights, ids = route(73)
+    torch.testing.assert_close(weights, original_weights, atol=0, rtol=0)
+    ordered = ids.sort(dim=1).values
+    assert ((ids >= 0) & (ids < experts)).all()
+    assert (ordered[:, 1:] != ordered[:, :-1]).all()
+    assert not torch.equal(ids, original_ids)
+    if rows >= 32:
+        assert ids.unique().numel() > experts // 3
+    # A new runtime seed does not change specialization; graph replay performs
+    # the same final-store permutation without adding a separate launch.
+    from utils import assert_no_triton_compile
+
+    route(74)
+    from tokenspeed_kernel.ops.moe._triton.decode_sigmoid_topk import (
+        _decode_sigmoid_bias_topk_kernel,
+    )
+    from tokenspeed_kernel.ops.moe._triton.kimi3_sigmoid_topk import (
+        _kimi3_sigmoid_bias_topk_kernel,
+    )
+    from tokenspeed_kernel.ops.moe._triton.sqrt_softplus_topk import (
+        _sqrt_softplus_topk_kernel,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.routing import (
+        _sigmoid_bias_topk_route_gluon_kernel,
+        gluon_sigmoid_bias_topk_gfx950,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.sqrt_softplus_topk import (
+        gluon_sqrt_softplus_topk_gfx950,
+    )
+
+    with assert_no_triton_compile(
+        gluon_sigmoid_bias_topk_gfx950,
+        _sigmoid_bias_topk_route_gluon_kernel,
+        _kimi3_sigmoid_bias_topk_kernel,
+        _decode_sigmoid_bias_topk_kernel,
+        _sqrt_softplus_topk_kernel,
+        gluon_sqrt_softplus_topk_gfx950,
+    ):
+        for seed in (1, 16, 0, 75):
+            other_weights, other_ids = route(seed)
+            torch.testing.assert_close(other_weights, weights, atol=0, rtol=0)
+    assert not torch.equal(ids, other_ids)
+    torch.testing.assert_close(other_weights, weights, atol=0, rtol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_weights, graph_ids = route(73)
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(graph_weights, weights, atol=0, rtol=0)
+    torch.testing.assert_close(graph_ids, ids, atol=0, rtol=0)

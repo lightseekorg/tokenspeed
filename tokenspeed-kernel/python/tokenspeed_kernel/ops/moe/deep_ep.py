@@ -1002,8 +1002,7 @@ if platform.is_nvidia and has_optional_package("deep_ep"):
             capacity = plan.get("deepep_low_latency_max_num_tokens_per_gpu")
             if not capacity:
                 raise ValueError(
-                    "DeepEP plan is missing "
-                    "deepep_low_latency_max_num_tokens_per_gpu"
+                    "DeepEP plan is missing deepep_low_latency_max_num_tokens_per_gpu"
                 )
             config = SimpleNamespace(
                 top_k=getattr(w, "top_k"),

@@ -29,7 +29,7 @@ def test_sigmoid_bias_topk_torch_is_byte_exact() -> None:
     expected_weights = expected_weights / expected_weights.sum(dim=-1, keepdim=True)
 
     actual_weights, actual_ids = moe_sigmoid_bias_topk(
-        logits, bias, 8, solution="torch"
+        logits, bias, 8, solution="torch", simulation_seed=None
     )
     assert torch.equal(actual_ids, expected_ids.to(torch.int32))
     assert torch.equal(actual_weights, expected_weights)

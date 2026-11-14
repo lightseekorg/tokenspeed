@@ -1701,7 +1701,9 @@ def _muse_lamport_gather_mxfp4_worker(rank, world_size, device):
     assert bool((region == -(2**31)).all())
 
 
-def _muse_lamport_gather_mxfp4_topk_worker(rank, world_size, device):
+def _muse_lamport_gather_mxfp4_topk_worker(
+    rank, world_size, device, *, simulation_seed
+):
     from tokenspeed_kernel.ops.communication._iris.muse_spark.all_gather import (
         iris_fused_lamport_allgather_rmsnorm_mxfp4_topk,
     )
@@ -1731,14 +1733,30 @@ def _muse_lamport_gather_mxfp4_topk_worker(rank, world_size, device):
 
         update(0)
         state.all_gather_rmsnorm_mxfp4_quant_topk(
-            local, weight, 1e-6, 1.0, logits, bias, topk, scale
+            local,
+            weight,
+            1e-6,
+            1.0,
+            logits,
+            bias,
+            topk,
+            scale,
+            simulation_seed=simulation_seed,
         )
         torch.cuda.synchronize()
         dist.barrier()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             (packed, scales), weights, ids = state.all_gather_rmsnorm_mxfp4_quant_topk(
-                local, weight, 1e-6, 1.0, logits, bias, topk, scale
+                local,
+                weight,
+                1e-6,
+                1.0,
+                logits,
+                bias,
+                topk,
+                scale,
+                simulation_seed=simulation_seed,
             )
         for phase in range(3):
             expected = update(phase)
@@ -1768,19 +1786,33 @@ def _muse_lamport_gather_mxfp4_topk_worker(rank, world_size, device):
                 topk_weights_dtype=torch.float32,
                 override=None,
                 solution=None,
+                simulation_seed=simulation_seed,
             )
             assert torch.equal(ids, reference_ids)
             assert torch.equal(weights, reference_weights)
+            if simulation_seed is not None:
+                assert bool(((ids >= 0) & (ids < experts)).all())
+                ordered = ids.sort(dim=-1).values
+                assert bool((ordered[:, 1:] != ordered[:, :-1]).all())
     # The row count is a runtime argument: rows of an already compiled
     # specialization class reuse its binary.
     with assert_no_triton_compile(iris_fused_lamport_allgather_rmsnorm_mxfp4_topk):
-        for rows in (3, 5, 12):
+        # Include the equal-to-one and divisible-by-16 scalar classes.
+        for rows, seed in ((3, 1), (5, 16), (12, 0)):
             local = torch.zeros(
                 (rows, local_width), dtype=torch.bfloat16, device=device
             )
             logits = torch.zeros((rows, experts), dtype=torch.float32, device=device)
             state.all_gather_rmsnorm_mxfp4_quant_topk(
-                local, weight, 1e-6, 1.0, logits, bias, topk, scale
+                local,
+                weight,
+                1e-6,
+                1.0,
+                logits,
+                bias,
+                topk,
+                scale,
+                simulation_seed=(None if simulation_seed is None else seed),
             )
     torch.cuda.synchronize()
     dist.barrier()
@@ -3359,9 +3391,14 @@ def _muse_owned_stream_tap_worker(rank, world_size, device):
             _muse_lamport_gather_mxfp4_worker, "nccl", id="lamport_gather_mxfp4"
         ),
         pytest.param(
-            _muse_lamport_gather_mxfp4_topk_worker,
+            partial(_muse_lamport_gather_mxfp4_topk_worker, simulation_seed=None),
             "nccl",
             id="lamport_gather_mxfp4_topk",
+        ),
+        pytest.param(
+            partial(_muse_lamport_gather_mxfp4_topk_worker, simulation_seed=17),
+            "nccl",
+            id="lamport_gather_mxfp4_topk_simulated",
         ),
         pytest.param(
             _muse_decode_step_lamport_worker, "nccl", id="decode_step_lamport"

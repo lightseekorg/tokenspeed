@@ -342,6 +342,7 @@ class TestDeepseekV4Config:
                 routed_scaling_factor=2.0,
                 hash_routing=False,
                 weights_dtype=torch.bfloat16,
+                layer_id=0,
             )(hidden_states, router_logits)
 
         assert (output.topk_weights) is (topk_weights)
@@ -370,6 +371,7 @@ class TestDeepseekV4Config:
                 routed_scaling_factor=1.0,
                 hash_routing=False,
                 weights_dtype=torch.float32,
+                layer_id=0,
             )(torch.ones((2, 3)), router_logits)
             expected = topk_module.simulated_router_logits(router_logits)
 
@@ -1528,6 +1530,7 @@ class TestDeepseekV4Config:
             routed_scaling_factor=1.0,
             correction_bias=bias,
             solution="torch",
+            simulation_seed=None,
         )
 
         expected_scores = F.softplus(logits).sqrt()
@@ -1567,6 +1570,7 @@ class TestDeepseekV4Config:
             hash_indices_table=table,
             input_ids=input_ids,
             solution="torch",
+            simulation_seed=None,
         )
 
         expected_ids = torch.tensor([[3, 1], [2, 3]], dtype=torch.int32)
@@ -1687,6 +1691,7 @@ class TestDeepseekV4Config:
             renormalize=True,
             routed_scaling_factor=1.0,
             correction_bias=bias,
+            simulation_seed=None,
         )
 
         expected_scores = F.softplus(logits).sqrt()

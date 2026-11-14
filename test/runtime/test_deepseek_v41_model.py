@@ -3953,6 +3953,7 @@ def test_routing_matches_reference_bias_and_normalization(topk, vision, with_ima
         routed_scaling_factor=1.0,
         correction_bias=actual_bias,
         solution="torch",
+        simulation_seed=None,
     )
     expected_scores = F.softplus(logits).sqrt()
     expected_bias = torch.stack([bias, bias_vl]) if with_images else bias

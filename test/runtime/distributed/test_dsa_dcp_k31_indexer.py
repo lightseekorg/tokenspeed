@@ -317,6 +317,7 @@ def _assert_matches_native(selected, lens, q, weights, plane, table, seq_lens):
         plan=dsa_plan(page_size=_PAGE, seq_lens_2d=seq_lens_2d, solution="deep_gemm"),
         solution="deep_gemm",
         slot_order="selection",
+        simulation_seed=None,
     )
     offsets = selected[rows]
     requests = rows // _Q_LEN

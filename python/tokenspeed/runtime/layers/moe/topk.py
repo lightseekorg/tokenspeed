@@ -454,7 +454,6 @@ def simulated_router_logits(router_logits: torch.Tensor) -> torch.Tensor:
 
 
 class TopK(torch.nn.Module):
-
     def __init__(
         self,
         top_k: int,
@@ -525,6 +524,13 @@ class TopK(torch.nn.Module):
                 f"got {routing_simulation!r}"
             )
         self.simulate_routing = routing_simulation == "uniform"
+        if global_server_args_dict["simulate"]:
+            if self.simulate_routing:
+                raise ValueError(
+                    "--simulate-tokens cannot be combined with input-logit routing simulation"
+                )
+            if layer_id is None:
+                raise ValueError("Simulated routing requires a layer_id")
 
     def forward(
         self,
@@ -543,6 +549,10 @@ class TopK(torch.nn.Module):
             router_logits = simulated_router_logits(router_logits)
 
         if output_format == TopKOutputFormat.BYPASSED:
+            if global_server_args_dict["simulate"]:
+                raise NotImplementedError(
+                    "In-kernel routing does not implement final-writeback simulation"
+                )
             if out is not None:
                 raise ValueError("Bypassed routing does not accept output buffers")
             return BypassedTopKOutput(
@@ -572,6 +582,10 @@ class TopK(torch.nn.Module):
     ) -> TopKOutput:
         output_format = self.topk_config.output_format or TopKOutputFormat.STANDARD
         if output_format.is_bypassed():
+            if global_server_args_dict["simulate"]:
+                raise NotImplementedError(
+                    "In-kernel routing does not implement final-writeback simulation"
+                )
             if hidden_states is None:
                 hidden_states = torch.empty((0, 0), dtype=torch.float32, device=device)
             if router_logits is None:
@@ -624,6 +638,17 @@ def select_experts(
     out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> StandardTopKOutput:
 
+    simulate = global_server_args_dict["simulate"]
+    if simulate and topk_config.layer_id is None:
+        raise ValueError("Simulated routing requires a layer_id")
+    if (
+        simulate
+        and expert_location_dispatch_info is not None
+        and expert_location_dispatch_info.ep_dispatch_algorithm == "fake"
+    ):
+        raise NotImplementedError(
+            "Simulation preserves scoring; fake-logit dispatch is unsupported"
+        )
     top_k = topk_config.top_k
     use_grouped_topk = topk_config.use_grouped_topk
     topk_group = topk_config.topk_group
@@ -662,6 +687,10 @@ def select_experts(
     if topk_config.num_sink_experts > 0:
         assert num_token_non_padded is None
         assert expert_location_dispatch_info is None
+        if simulate:
+            raise NotImplementedError(
+                "Selected routing path does not implement final-writeback simulation"
+            )
         topk_weights, topk_ids = inkling_topk(
             router_logits,
             correction_bias,
@@ -675,6 +704,10 @@ def select_experts(
         assert topk_group is not None
         assert num_expert_group is not None
         if correction_bias is None:
+            if simulate:
+                raise NotImplementedError(
+                    "Selected routing path does not implement final-writeback simulation"
+                )
             topk_weights, topk_ids = grouped_topk_gpu(
                 hidden_states,
                 router_logits,
@@ -725,11 +758,20 @@ def select_experts(
                     topk_weights_dtype=topk_config.topk_weights_dtype,
                     topk_indices_dtype=out[1].dtype if out is not None else torch.int32,
                     out=out,
+                    simulation_seed=(
+                        topk_config.layer_id
+                        if global_server_args_dict["simulate"]
+                        else None
+                    ),
                 )
             else:
                 if out is not None:
                     raise ValueError(
                         "Selected routing configuration cannot write output buffers"
+                    )
+                if simulate:
+                    raise NotImplementedError(
+                        "Selected routing path does not implement final-writeback simulation"
                     )
                 topk_weights, topk_ids = minimax_biased_grouped_topk(
                     hidden_states,
@@ -758,6 +800,10 @@ def select_experts(
             num_token_non_padded is None
         ), "num_token_non_padded is not yet supported in fused_topk_native"
         assert expert_location_dispatch_info is None
+        if simulate:
+            raise NotImplementedError(
+                "Selected routing path does not implement final-writeback simulation"
+            )
         topk_weights, topk_ids = torch_native_fused_topk(
             hidden_states,
             router_logits,
@@ -771,6 +817,10 @@ def select_experts(
         num_real_experts = router_logits.shape[1] - topk_config.zero_expert_num
         if topk_config.router_topk == "torch":
             # The trainer's order; TopK.__init__ refused renormalize with it.
+            if simulate:
+                raise NotImplementedError(
+                    "Selected routing path does not implement final-writeback simulation"
+                )
             topk_weights, topk_ids = torch_router_topk(
                 router_logits,
                 correction_bias,
@@ -791,6 +841,10 @@ def select_experts(
             topk_weights = torch.empty(
                 num_tokens, top_k, device=router_logits.device, dtype=torch.float32
             )
+            if simulate:
+                raise NotImplementedError(
+                    "Selected routing path does not implement final-writeback simulation"
+                )
             cuda_routing_flash(
                 router_logits,
                 correction_bias,
@@ -819,6 +873,9 @@ def select_experts(
                 1.0 if routed_scaling_factor is None else routed_scaling_factor
             ),
             topk_indices_dtype=topk_config.topk_indices_dtype,
+            simulation_seed=(
+                topk_config.layer_id if global_server_args_dict["simulate"] else None
+            ),
         )
         topk_ids = topk_ids_logical_to_physical(
             topk_ids,
@@ -832,6 +889,10 @@ def select_experts(
             num_token_non_padded is None
         ), "num_token_non_padded is not yet supported in custom_routing_function"
         assert expert_location_dispatch_info is None
+        if simulate:
+            raise NotImplementedError(
+                "Selected routing path does not implement final-writeback simulation"
+            )
         topk_weights, topk_ids = custom_routing_function(
             hidden_states=hidden_states,
             gating_output=router_logits,

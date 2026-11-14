@@ -89,6 +89,7 @@ def test_public_sigmoid_bias_topk_dispatch_uses_gluon_kernel(
         8,
         routed_scaling_factor=2.827,
         normalize_topk_weights=True,
+        simulation_seed=None,
     )
 
     assert actual_weights is sentinel_weights
@@ -121,6 +122,7 @@ def test_public_sigmoid_bias_topk_uses_per_token_float32_route(
         16,
         routed_scaling_factor=2.827,
         normalize_topk_weights=True,
+        simulation_seed=None,
     )
 
     assert actual_weights is sentinel_weights
@@ -158,6 +160,7 @@ def test_public_sigmoid_bias_topk_retains_decode_route_above_prefill_topk(
         routed_scaling_factor=2.827,
         normalize_topk_weights=True,
         solution="gluon",
+        simulation_seed=None,
     )
 
     assert actual_weights is sentinel_weights
@@ -180,6 +183,7 @@ def test_sigmoid_bias_topk_route_gluon_matches_supported_dtype_reference(
         8,
         routed_scaling_factor=2.0,
         normalize_topk_weights=True,
+        simulation_seed=None,
     )
     torch.cuda.synchronize()
 
@@ -213,6 +217,7 @@ def test_sigmoid_bias_topk_route_gluon_matches_nan_and_neg_inf_reference(
         8,
         routed_scaling_factor=2.0,
         normalize_topk_weights=normalize_topk_weights,
+        simulation_seed=None,
     )
     torch.cuda.synchronize()
 
@@ -252,6 +257,7 @@ def test_sigmoid_bias_topk_route_gluon_matches_bf16_e384(
         8,
         routed_scaling_factor=2.827,
         normalize_topk_weights=True,
+        simulation_seed=None,
     )
     torch.cuda.synchronize()
 
@@ -286,6 +292,7 @@ def test_sigmoid_bias_topk_route_gluon_matches_v9_shapes(
         8,
         routed_scaling_factor=2.827,
         normalize_topk_weights=True,
+        simulation_seed=None,
     )
     torch.cuda.synchronize()
 
@@ -316,6 +323,7 @@ def test_sigmoid_bias_topk_route_gluon_handles_strided_inputs(
         8,
         routed_scaling_factor=2.827,
         normalize_topk_weights=True,
+        simulation_seed=None,
     )
 
     actual_ids, actual_weights = invoke_sigmoid_bias_topk_route_gluon(
@@ -324,6 +332,7 @@ def test_sigmoid_bias_topk_route_gluon_handles_strided_inputs(
         8,
         routed_scaling_factor=2.827,
         normalize_topk_weights=True,
+        simulation_seed=None,
     )
     torch.cuda.synchronize()
 
@@ -351,6 +360,7 @@ def test_prefill_sigmoid_bias_topk_route_gluon_handles_strided_inputs() -> None:
         8,
         routed_scaling_factor=2.827,
         normalize_topk_weights=True,
+        simulation_seed=None,
     )
 
     actual_ids, actual_weights = invoke_sigmoid_bias_topk_route_prefill_gluon(
@@ -359,6 +369,7 @@ def test_prefill_sigmoid_bias_topk_route_gluon_handles_strided_inputs() -> None:
         8,
         routed_scaling_factor=2.827,
         normalize_topk_weights=True,
+        simulation_seed=None,
     )
     torch.cuda.synchronize()
 
@@ -376,7 +387,7 @@ def test_sigmoid_bias_topk_route_gluon_matches_bf16_extremes() -> None:
     expected_weights = logits.sigmoid().float()
 
     actual_ids, actual_weights = invoke_sigmoid_bias_topk_route_gluon(
-        logits, correction_bias, 8, normalize_topk_weights=False
+        logits, correction_bias, 8, normalize_topk_weights=False, simulation_seed=None
     )
     torch.cuda.synchronize()
     actual_weights_by_id = torch.empty_like(actual_weights).scatter(
@@ -437,6 +448,7 @@ def test_sigmoid_bias_topk_route_gluon_matches_bf16_rounding_boundaries() -> Non
         8,
         routed_scaling_factor=2.827,
         normalize_topk_weights=True,
+        simulation_seed=None,
     )
     torch.cuda.synchronize()
 
@@ -451,10 +463,7 @@ def test_sigmoid_bias_topk_route_gluon_graph_replay_uses_updated_inputs(
     logits = torch.zeros((16, 16), device="cuda", dtype=dtype)
     correction_bias = torch.arange(16, device="cuda", dtype=torch.float32)
     invoke_sigmoid_bias_topk_route_gluon(
-        logits,
-        correction_bias,
-        8,
-        routed_scaling_factor=2.0,
+        logits, correction_bias, 8, routed_scaling_factor=2.0, simulation_seed=None
     )
     torch.cuda.synchronize()
 
@@ -466,6 +475,7 @@ def test_sigmoid_bias_topk_route_gluon_graph_replay_uses_updated_inputs(
             8,
             routed_scaling_factor=2.0,
             normalize_topk_weights=True,
+            simulation_seed=None,
         )
 
     correction_bias.copy_(torch.arange(15, -1, -1, device="cuda", dtype=torch.float32))
@@ -501,6 +511,7 @@ def test_sigmoid_bias_topk_route_gluon_v9_graph_replay_uses_updated_inputs(
         8,
         routed_scaling_factor=2.827,
         normalize_topk_weights=True,
+        simulation_seed=None,
     )
     torch.cuda.synchronize()
 
@@ -512,6 +523,7 @@ def test_sigmoid_bias_topk_route_gluon_v9_graph_replay_uses_updated_inputs(
             8,
             routed_scaling_factor=2.827,
             normalize_topk_weights=True,
+            simulation_seed=None,
         )
 
     replacement_logits = torch.randn(

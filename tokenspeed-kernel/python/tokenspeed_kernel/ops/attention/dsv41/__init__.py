@@ -657,6 +657,8 @@ def index_topk(
     out: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None,
     solution: str | None,
     index_metadata: object | None = None,
+    *,
+    simulation_seed: int | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Bounded Full/Reindex scoring, Top-K rows, and optional source candidates.
 
@@ -687,6 +689,10 @@ def index_topk(
             [T, candidate_topk], [T]), or None to allocate them.
         solution: Optional registered implementation restriction. Pass None for
             automatic kernel selection.
+        simulation_seed: None for ordinary selection; otherwise seed final-store
+            distributed sampling on supported backends. Simulation requires a
+            fully allocated, finite visible prefix and sorted, prefix-packed
+            candidate blocks including the newest visible block.
         index_metadata: Object from new_index_metadata for these exact table,
             length and optional request-ID tensors, shared only within one
             invocation, or None (default). Native
@@ -804,6 +810,13 @@ def index_topk(
         solution=solution,
         override=None,
     )
+    simulation_kwargs = {}
+    if kernel.name == "gluon_dsv41_index_topk_gfx950":
+        simulation_kwargs["simulation_seed"] = simulation_seed
+    elif simulation_seed is not None:
+        raise NotImplementedError(
+            f"CSA2 selection simulation is unsupported by {kernel.name}"
+        )
     spec = KernelRegistry.get().get_by_name(kernel.name)
     if isinstance(index_q, IndexQueryInput) and (
         spec is None or True not in spec.traits.get("supports_index_query_input", ())
@@ -833,6 +846,7 @@ def index_topk(
         process_group,
         out,
         index_metadata,
+        **simulation_kwargs,
     )
 
 

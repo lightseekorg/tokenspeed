@@ -188,8 +188,9 @@ def run_dsv41_csa2_index_topk(
 
     ``launch_logits`` scores a tile of packed queries into FP32 logits and
     writes every column the selections read (-inf where nothing is scored);
-    ``select_rows`` has the ``select_rows_torch`` contract and
-    ``select_blocks`` the ``index_block_select`` contract.
+    ``select_rows`` extends the ``select_rows_torch`` contract with visible
+    sequence lengths for simulation; ``select_blocks`` follows the
+    ``index_block_select`` contract.
     """
     del index_metadata
     out = _index_topk_outputs(
@@ -291,6 +292,7 @@ def run_dsv41_csa2_index_topk(
                 int(topk),
                 row_out[output_begin:output_end],
                 row_lens[output_begin:output_end],
+                visible_lens=tile_visible,
             )
             if make_blocks:
                 select_blocks(
@@ -344,29 +346,74 @@ def launch_gfx1250_logits(
     )
 
 
-def select_rows_gfx950(logits, candidates, live_widths, topk, row_out, row_lens):
+def select_rows_gfx950(
+    logits,
+    candidates,
+    live_widths,
+    topk,
+    row_out,
+    row_lens,
+    *,
+    visible_lens,
+    simulation_seed,
+):
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41 import (
         launch_gluon_dsv41_index_topk_select_gfx950,
     )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41.simulation import (
+        IndexSelectionSimulation,
+    )
 
     launch_gluon_dsv41_index_topk_select_gfx950(
-        logits, candidates, live_widths, topk, row_out, row_lens
+        logits,
+        candidates,
+        live_widths,
+        topk,
+        row_out,
+        row_lens,
+        simulation=(
+            None
+            if simulation_seed is None
+            else IndexSelectionSimulation(
+                seed=simulation_seed,
+                visible_lens=visible_lens,
+                force_latest=False,
+            )
+        ),
     )
 
 
 def select_blocks_gfx950(
-    logits, visible, candidate_topk, block_out, block_lens, *, visible_capacity
+    logits,
+    visible,
+    candidate_topk,
+    block_out,
+    block_lens,
+    *,
+    visible_capacity,
+    simulation_seed,
 ):
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41 import (
         launch_gluon_dsv41_index_block_select_gfx950,
     )
 
     launch_gluon_dsv41_index_block_select_gfx950(
-        logits, visible, candidate_topk, block_out, block_lens, visible_capacity
+        logits,
+        visible,
+        candidate_topk,
+        block_out,
+        block_lens,
+        visible_capacity,
+        simulation_seed=simulation_seed,
     )
 
 
-def select_rows_gfx1250(logits, candidates, live_widths, topk, row_out, row_lens):
+def select_rows_gfx1250(
+    logits, candidates, live_widths, topk, row_out, row_lens, *, visible_lens
+):
+    # Causal rows are already masked by the scorer; only simulation needs the
+    # logical history length in addition to the compact candidates' scan width.
+    del visible_lens
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv41 import (
         launch_gluon_dsv41_index_topk_select_gfx1250,
     )

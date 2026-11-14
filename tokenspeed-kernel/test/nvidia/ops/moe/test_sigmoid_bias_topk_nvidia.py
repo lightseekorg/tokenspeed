@@ -53,6 +53,7 @@ def _sigmoid_topk(
         correction_bias=correction_bias,
         logical_to_physical_map=logical_to_physical_map,
         topk_weights_dtype=weights_dtype,
+        simulation_seed=None,
     )
 
 

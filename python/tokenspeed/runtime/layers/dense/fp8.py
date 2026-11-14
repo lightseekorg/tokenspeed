@@ -37,7 +37,11 @@ from tokenspeed.runtime.layers.parameter import (
 )
 from tokenspeed.runtime.layers.quantization.base_config import LinearMethodBase
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
-from tokenspeed.runtime.layers.quantization.utils import convert_to_channelwise
+from tokenspeed.runtime.layers.quantization.utils import (
+    convert_to_channelwise,
+    dummy_unit_scales,
+)
+from tokenspeed.runtime.utils import set_weight_attrs
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
@@ -157,6 +161,7 @@ class Fp8LinearMethod(LinearMethodBase):
                     scale.zero_()
                 else:
                     scale[:] = torch.finfo(torch.float32).min
+                set_weight_attrs(scale, {"dummy_initializer": dummy_unit_scales})
                 layer.register_parameter("weight_scale_inv", scale)
             else:
                 scale = PerTensorScaleParameter(
@@ -164,6 +169,7 @@ class Fp8LinearMethod(LinearMethodBase):
                     weight_loader=weight_loader,
                 )
                 scale[:] = torch.finfo(torch.float32).min
+                set_weight_attrs(scale, {"dummy_initializer": dummy_unit_scales})
                 layer.register_parameter("weight_scale", scale)
 
             # INPUT ACTIVATION SCALE
@@ -180,6 +186,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 )
 
                 scale[:] = torch.finfo(torch.float32).min
+                set_weight_attrs(scale, {"dummy_initializer": dummy_unit_scales})
                 layer.register_parameter("input_scale", scale)
             else:
                 layer.register_parameter("input_scale", None)

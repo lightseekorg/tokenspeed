@@ -445,6 +445,7 @@ def test_dsv41_index_topk_table_width():
             None,
             None,
             solution="triton",
+            simulation_seed=None,
         )
 
     # The table row stride is twice the width, so both keep one divisibility

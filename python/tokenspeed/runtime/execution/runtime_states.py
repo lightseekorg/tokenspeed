@@ -478,6 +478,95 @@ class RuntimeStates:
             self.ngram_accepted_tokens.index_fill_(0, extend_request_pool_indices, -1)
             self.ngram_needs_seed.index_fill_(0, extend_request_pool_indices, True)
 
+    def seed_simulated_decode(
+        self,
+        seeds: RequestHistorySeeds,
+        candidate_token_ids: tuple[tuple[int, ...], ...],
+        *,
+        request_ids: tuple[str, ...],
+    ) -> None:
+        """Initialize a private benchmark's request rows without a prefill.
+
+        Cache allocation and payload initialization belong to the device owner.
+        This method only seeds normal runtime state on the caller's stream.
+        Candidates include the next target input in column zero and one token
+        for every speculative column, so the first forward uses its full width.
+        Tokens are synthetic but valid; no claim about speculative acceptance is
+        made. A benchmark restores state outside its timed forward interval.
+        """
+        count = len(seeds.slots)
+        width = self.future_input_map.shape[1]
+        if len(candidate_token_ids) != count or len(request_ids) != count:
+            raise ValueError("Simulation needs one candidate row and ID per request")
+        if len(set(seeds.slots)) != count or len(set(request_ids)) != count:
+            raise ValueError("Simulated request slots and IDs must be unique")
+        if any(
+            not 0 < slot < self.future_input_map.shape[0] - 1 for slot in seeds.slots
+        ):
+            raise ValueError(
+                "Simulated slots must exclude the null and graph-padding rows"
+            )
+        if any(len(row) != width for row in candidate_token_ids):
+            raise ValueError(
+                "Simulated candidates must cover the configured decode width"
+            )
+        if any(
+            len(tokens) != length
+            for tokens, length in zip(seeds.tokens, seeds.prefix_lengths, strict=True)
+        ):
+            raise ValueError("Simulated state needs each complete synthetic prompt")
+        if any(length < 1 or length >= 2**31 for length in seeds.prefix_lengths):
+            raise ValueError("Simulated prefix lengths must be positive int32 values")
+        for tokens in (*seeds.tokens, *candidate_token_ids):
+            if any(token < 0 or token >= self.input_vocab_size for token in tokens):
+                raise ValueError("Simulated token ID is outside the input vocabulary")
+        history = self.request_token_history_ids
+        if history is not None and any(
+            n > history.shape[1] for n in seeds.prefix_lengths
+        ):
+            raise ValueError("Simulated prefix exceeds request token history capacity")
+
+        pin = torch.device(self.device).type != "cpu"
+        slots = torch.tensor(seeds.slots, dtype=torch.int64, pin_memory=pin).to(
+            self.device, non_blocking=True
+        )
+        lengths = torch.tensor(
+            seeds.prefix_lengths, dtype=torch.int32, pin_memory=pin
+        ).to(self.device, non_blocking=True)
+        candidates = torch.tensor(
+            candidate_token_ids, dtype=torch.int32, pin_memory=pin
+        ).to(self.device, non_blocking=True)
+        self.reset_states(slots, lengths)
+        # A new benchmark case may reuse the same request IDs at another
+        # context length; force ordinary stop binding to refresh its limit.
+        self.stop_token_ids.index_fill_(0, slots, -1)
+        self.token_limits.index_fill_(0, slots, torch.iinfo(torch.int32).max)
+        for slot in seeds.slots:
+            self._stop_criteria_bindings[slot] = None
+        self.future_input_map.index_copy_(0, slots, candidates)
+        self.spec_candidates_ready.index_fill_(0, slots, width > 1)
+        if self.future_parent_map is not None:
+            assert self.chain_parents is not None
+            self.future_parent_map.index_copy_(
+                0, slots, self.chain_parents.expand(count, -1)
+            )
+        if history is not None:
+            self.seed_request_token_history(seeds)
+        if self.ngram_accepted_tokens is not None:
+            context = self.ngram_accepted_tokens.shape[1]
+            tails = []
+            for tokens in seeds.tokens:
+                tail = list(reversed(tokens[-context:]))
+                tails.append(tail + [-1] * (context - len(tail)))
+            values = torch.tensor(tails, dtype=torch.int64, pin_memory=pin).to(
+                self.device, non_blocking=True
+            )
+            self.ngram_accepted_tokens.index_copy_(0, slots, values)
+            assert self.ngram_needs_seed is not None
+            self.ngram_needs_seed.index_fill_(0, slots, False)
+            for slot, request_id in zip(seeds.slots, request_ids, strict=True):
+                self.ngram_request_ids[slot] = request_id
+
     def bind_stop_criteria(
         self,
         request_ids: Sequence[str],

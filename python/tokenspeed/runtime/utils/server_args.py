@@ -858,6 +858,7 @@ class ServerArgs:
     moe_weight_sharing_size: int | None = None
     mapping: Mapping | None = None
     emulate_rank_zero: bool = False
+    simulate: bool = False
 
     mla_chunk_multiplier: int = 4
     mm_attention_backend: str | None = None
@@ -906,6 +907,7 @@ class ServerArgs:
         return _SPEC_OVERSHOOT_SPANS * int(self.speculative_num_draft_tokens)
 
     def __post_init__(self):
+        self.resolve_simulation()
         self.validate_weight_memory_policy()
         self.validate_forward_reload()
         self.resolve_basic_defaults()
@@ -921,6 +923,29 @@ class ServerArgs:
         self.resolve_disaggregation()
         self.validate_output_cumulative_probs()
         self.validate()
+
+    def resolve_simulation(self) -> None:
+        if not self.simulate:
+            return
+        if self.load_format not in ("auto", "dummy"):
+            raise ValueError("--simulate-tokens requires --load-format auto or dummy")
+        architectures = _checkpoint_architectures(self.model, self.revision, True)
+        supported = {
+            "KimiK31ForConditionalGeneration",
+            "DeepseekV41ForCausalLM",
+            "MuseSparkForConditionalGeneration",
+        }
+        if architectures is None:
+            raise ValueError(
+                "--simulate-tokens could not read model architectures from config.json"
+            )
+        if not architectures or not supported.intersection(architectures):
+            raise ValueError(f"--simulate-tokens does not support {architectures!r}")
+        if self.emulate_rank_zero:
+            raise ValueError(
+                "--simulate-tokens preserves real collectives; do not combine with --emulate-rank-zero"
+            )
+        self.load_format = "dummy"
 
     def validate_output_cumulative_probs(self):
         from tokenspeed.runtime.utils.env import envs
@@ -3070,6 +3095,12 @@ class ServerArgs:
             '"npcache" will load the weights in pytorch format and store '
             "a numpy cache to speed up the loading. "
             '"dummy" will initialize the weights with random values.',
+        )
+        parser.add_argument(
+            "--simulate-tokens",
+            dest="simulate",
+            action="store_true",
+            help="Benchmark with synthetic weights and routing/selection decisions, retaining real collectives; generated text is not meaningful.",
         )
         parser.add_argument(
             "--trust-remote-code",

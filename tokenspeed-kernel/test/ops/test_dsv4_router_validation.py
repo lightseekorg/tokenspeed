@@ -43,6 +43,7 @@ def test_default_hash_router_rejects_invalid_table_values(invalid: int) -> None:
             routed_scaling_factor=1.0,
             hash_indices_table=table,
             input_ids=input_ids,
+            simulation_seed=None,
         )
 
 
@@ -58,6 +59,7 @@ def test_non_hash_router_rejects_input_ids() -> None:
             renormalize=True,
             routed_scaling_factor=1.0,
             input_ids=torch.zeros((1,), dtype=torch.int64),
+            simulation_seed=None,
         )
 
 
@@ -77,6 +79,7 @@ def test_hash_router_rejects_correction_bias() -> None:
             correction_bias=torch.zeros(4),
             hash_indices_table=table,
             input_ids=input_ids,
+            simulation_seed=None,
         )
 
 
@@ -120,6 +123,7 @@ def test_sqrt_softplus_router_preserves_output_dtypes(
         topk_weights_dtype=weights_dtype,
         override=override,
         solution="torch",
+        simulation_seed=None,
     )
 
     scores = torch.nn.functional.softplus(logits).sqrt()
@@ -162,6 +166,7 @@ def test_unified_router_preserves_override_and_output_dtypes(
         topk_indices_dtype=torch.int64,
         topk_weights_dtype=torch.float64,
         override=override,
+        simulation_seed=None,
     )
 
     scores = logits.sigmoid() if score_function == "sigmoid" else logits.softmax(-1)

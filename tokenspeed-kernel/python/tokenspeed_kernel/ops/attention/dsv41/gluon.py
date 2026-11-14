@@ -22,6 +22,8 @@
 
 from __future__ import annotations
 
+from functools import partial
+
 import torch
 from tokenspeed_kernel.ops.attention.dsv41._gluon.indexer import (
     launch_gfx950_logits,
@@ -132,13 +134,15 @@ if current_platform().is_amd:
         traits=_INDEX_TRAITS,
         priority=Priority.SPECIALIZED,
     )
-    def gluon_dsv41_index_topk_gfx950(*args, **kwargs):
+    def gluon_dsv41_index_topk_gfx950(*args, simulation_seed, **kwargs):
         return run_dsv41_csa2_index_topk(
             *args,
             **kwargs,
             launch_logits=launch_gfx950_logits,
-            select_rows=select_rows_gfx950,
-            select_blocks=select_blocks_gfx950,
+            select_rows=partial(select_rows_gfx950, simulation_seed=simulation_seed),
+            select_blocks=partial(
+                select_blocks_gfx950, simulation_seed=simulation_seed
+            ),
         )
 
     @register_kernel(

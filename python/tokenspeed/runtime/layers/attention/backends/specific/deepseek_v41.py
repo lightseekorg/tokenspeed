@@ -93,6 +93,7 @@ from tokenspeed.runtime.layers.attention.prefill_head_exchange import (
 from tokenspeed.runtime.layers.attention.query_partition import InterleavedQueryPlan
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.layers.paged_attention import QueryShardGather
+from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.host_sync import allow_host_sync
 
 # Initial long-prefill thresholds; tune with query count and visible history.
@@ -338,6 +339,11 @@ class DeepseekV41AttentionBackend(AttentionBackend):
     def __init__(self, config: AttnConfig, spec: DeepseekV41Config) -> None:
         super().__init__(config, spec)
         self._attention_exchange_layers: set[int] = set()
+        self.simulate = global_server_args_dict["simulate"]
+        if self.simulate and config.kvp_size > 1:
+            raise NotImplementedError(
+                "V4.1 sparse simulation requires replicated index history"
+            )
         self.kvp_size = config.kvp_size
         self.kvp_rank = config.kvp_rank
         self.kvp_group = config.kvp_group
@@ -1858,6 +1864,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 outputs,
                 None,
                 geometry.kernel_metadata,
+                simulation_seed=layer_id if self.simulate else None,
             )
             del scoring_cache
         if partition is not None:

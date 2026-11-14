@@ -1215,6 +1215,9 @@ class MuseSparkMoE(nn.Module):
         if config.moe_intermediate_size % mapping.moe.tp_size:
             raise ValueError("the expert intermediate size must divide across TP ranks")
         self.num_experts = config.num_local_experts
+        self.simulation_seed: int | None = (
+            layer_id if global_server_args_dict["simulate"] else None
+        )
         self.topk = config.num_experts_per_tok
         self.route_scale = config.routed_scaling_factor
         self.ep_rank = mapping.moe.ep_rank
@@ -1279,6 +1282,10 @@ class MuseSparkMoE(nn.Module):
             requires_deferred_finalize=True,
         )
         self.expert_quant_kind = self.experts._quant_kind
+        if self.simulation_seed is not None and self.expert_quant_kind == "nvfp4":
+            raise NotImplementedError(
+                "Prepared NVFP4 routing does not implement final-writeback simulation"
+            )
         if self.quantized_experts and self.expert_quant_kind not in {"mxfp4", "nvfp4"}:
             raise ValueError(
                 "Muse Spark quantized experts require NVFP4 or MXFP4 weights"
@@ -1712,6 +1719,7 @@ class MuseSparkMoE(nn.Module):
             bias,
             self.topk,
             self.route_scale,
+            simulation_seed=self.simulation_seed,
         )
         return (
             projection.workspace[: hidden_states.shape[0]],
@@ -1771,6 +1779,10 @@ class MuseSparkMoE(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Top-k route weights and ids; with prepared GEMMs the same launch fills their routing."""
         if prepared is not None:
+            if self.simulation_seed is not None:
+                raise NotImplementedError(
+                    "Prepared NVFP4 routing does not implement final-writeback simulation"
+                )
             return moe_sigmoid_bias_topk_routing(
                 router_logits,
                 self.gate.e_score_correction_bias,
@@ -1797,6 +1809,7 @@ class MuseSparkMoE(nn.Module):
             topk_weights_dtype=torch.float32,
             override=None,
             solution=None,
+            simulation_seed=self.simulation_seed,
         )
 
     def forward(
@@ -2351,6 +2364,10 @@ class MuseSparkModel(BaseTransformerModel):
         quant_config: QuantizationConfig | None,
         prefix: str,
     ) -> None:
+        if config.decode_monokernel and global_server_args_dict["simulate"]:
+            raise NotImplementedError(
+                "Muse Spark decode monokernels do not implement final-writeback simulation"
+            )
         _widen_modelopt_exclusions(quant_config)
         exclude_fully_excluded_fused_modules(
             quant_config,
@@ -3276,10 +3293,22 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
         for layer in self.model.layers:
             layer.refresh_residual_gates()
 
+    def post_load_weights(self) -> None:
+        """Derive auxiliary column shards before quantized layout conversion."""
+        super().post_load_weights()
+        if global_server_args_dict["simulate"]:
+            for layer in self.model.layers:
+                moe = layer.mlp
+                if moe.down_columns is not None:
+                    moe.down_columns.initialize_replicated_dummy(
+                        moe.experts.w2_weight, moe.experts.w2_weight_scale
+                    )
+
     def post_quant_warmup(self) -> None:
         """Validate loaded audio weights and warm bounded expert kernel families."""
-        # A missing or partial tower would encode audio with random weights.
-        if self.audio_tower is not None:
+        # Real checkpoints must contain the complete tower. Simulation already
+        # initialized every parameter through the dummy loader, with no reads.
+        if self.audio_tower is not None and not global_server_args_dict["simulate"]:
             audio_parameters = {
                 name
                 for name, _ in self.named_parameters()

@@ -21,6 +21,7 @@
 """Raw indexer visibility is bounded by consumers before int32 conversion."""
 
 from contextlib import ExitStack
+from functools import partial
 
 import pytest
 import torch
@@ -83,6 +84,7 @@ def _run(fixture, visible, reindex, make_blocks):
         None,
         None,
         "gluon",
+        simulation_seed=None,
     )
 
 
@@ -193,6 +195,8 @@ def test_row_selector_live_width_strides_match_dense_without_recompile(rows, dty
         from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41.indexer import (
             launch_gluon_dsv41_index_topk_select_gfx950 as launch,
         )
+
+        launch = partial(launch, simulation=None)
     elif current_platform().is_cdna5:
         from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv41.topk import (
             gluon_dsv41_index_topk_select_gfx1250 as kernel,

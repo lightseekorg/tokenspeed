@@ -134,6 +134,7 @@ def _decode(seq_lens: list[int]) -> list[set[int]]:
         initial_tokens=_INITIAL,
         local_tokens=_LOCAL,
         slot_order="selection",
+        simulation_seed=None,
     )
     slots, counts = slots.cpu(), counts.cpu()
     base = [r * max_pages * _PAGE for r in range(reqs)]

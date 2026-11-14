@@ -1715,6 +1715,7 @@ def _maybe_route_owned_mxfp4_mfma_decode(
             top_k,
             routed_scaling_factor=routed_scaling_factor,
             normalize_topk_weights=normalize_topk_weights,
+            simulation_seed=None,
         )
     elif method == 0:
         # Global softmax, optionally with a choice bias. Grouped softmax only
@@ -2041,6 +2042,7 @@ def _maybe_gluon_package_mxfp4_prefill(
                         top_k,
                         routed_scaling_factor=routed_scaling_factor,
                         normalize_topk_weights=normalize_topk_weights,
+                        simulation_seed=None,
                     )
                 else:
                     topk_weights, topk_ids = _biased_grouped_topk_reference(

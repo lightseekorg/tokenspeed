@@ -24,9 +24,10 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
+from tokenspeed_kernel.ops.moe._triton.simulation import permute_experts
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["simulation_seed"])
 def _sqrt_softplus_topk_kernel(
     logits_ptr,
     bias_ptr,
@@ -41,6 +42,7 @@ def _sqrt_softplus_topk_kernel(
     hash_stride_m,
     hash_stride_k,
     scale,
+    simulation_seed,
     EXPERTS: tl.constexpr,
     TOPK: tl.constexpr,
     BLOCK_E: tl.constexpr,
@@ -49,6 +51,7 @@ def _sqrt_softplus_topk_kernel(
     BIAS: tl.constexpr,
     RENORMALIZE: tl.constexpr,
     NEED_SCORES: tl.constexpr,
+    SIMULATE: tl.constexpr,
 ):
     """Write expert ids and sqrt-softplus weights using top-k or hash routing."""
     token = tl.program_id(0)
@@ -100,6 +103,10 @@ def _sqrt_softplus_topk_kernel(
     if RENORMALIZE:
         chosen_weights /= tl.maximum(tl.sum(chosen_weights, 0), 1.1754943508222875e-38)
     chosen_weights *= scale
+    if SIMULATE:
+        # Keep the original selected ids and their score gathers live; only
+        # the expert destinations change at the final store.
+        chosen_ids = permute_experts(chosen_ids, token, simulation_seed, EXPERTS)
     tl.store(weights_ptr + token * TOPK + lanes, chosen_weights, mask=lanes < TOPK)
     tl.store(experts_ptr + token * TOPK + lanes, chosen_ids, mask=lanes < TOPK)
 
@@ -114,6 +121,8 @@ def triton_sqrt_softplus_topk(
     need_scores: bool,
     routed_scaling_factor: float,
     weights_dtype: torch.dtype,
+    *,
+    simulation_seed: int | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Select experts using the sqrt-softplus routing contract.
 
@@ -127,6 +136,8 @@ def triton_sqrt_softplus_topk(
         need_scores: Materialize all sqrt-softplus scores when true.
         routed_scaling_factor: FP32 multiplier applied after normalization.
         weights_dtype: FP32 or BF16 storage, converted only after scaling.
+        simulation_seed: Final expert-ID permutation seed, or None for normal
+            routing. Score computation and hash-table reads remain unchanged.
 
     Returns:
         Route weights in weights_dtype, INT32 expert ids, and FP32 scores (or the unused
@@ -166,6 +177,7 @@ def triton_sqrt_softplus_topk(
             hash_indices_table.stride(0) if hash_indices_table is not None else 0,
             hash_indices_table.stride(1) if hash_indices_table is not None else 0,
             float(routed_scaling_factor),
+            simulation_seed=0 if simulation_seed is None else simulation_seed,
             EXPERTS=experts,
             TOPK=top_k,
             BLOCK_E=triton.next_power_of_2(experts),
@@ -174,6 +186,7 @@ def triton_sqrt_softplus_topk(
             BIAS=bias_routing,
             RENORMALIZE=renormalize,
             NEED_SCORES=need_scores,
+            SIMULATE=simulation_seed is not None,
             num_warps=4,
         )
     return weights, ids, scores

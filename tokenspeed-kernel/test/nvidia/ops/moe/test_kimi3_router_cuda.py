@@ -76,14 +76,25 @@ def test_router_output_buffers_and_graph(rows, pattern):
             weights_dtype=torch.bfloat16,
             solution="cuda",
             out=out,
+            simulation_seed=None,
         )
 
     actual = run()
     assert actual[0] is out[0] and actual[1] is out[1]
-    check_routes(actual, _moe_sigmoid_bias_topk(logits, bias, 16, solution="triton"))
+    check_routes(
+        actual,
+        _moe_sigmoid_bias_topk(
+            logits, bias, 16, solution="triton", simulation_seed=None
+        ),
+    )
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = run()
     logits.normal_()
     graph.replay()
-    check_routes(captured, _moe_sigmoid_bias_topk(logits, bias, 16, solution="triton"))
+    check_routes(
+        captured,
+        _moe_sigmoid_bias_topk(
+            logits, bias, 16, solution="triton", simulation_seed=None
+        ),
+    )

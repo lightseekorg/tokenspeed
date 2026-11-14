@@ -2903,7 +2903,10 @@ def test_prefill_selection_skips_only_redundant_work(length):
         out,
         solution,
         index_metadata,
+        *,
+        simulation_seed,
     ):
+        assert simulation_seed is None
         for ids, counts, stride in ((out[0], out[1], 1), (out[2], out[3], 8)):
             values = torch.arange(ids.shape[1]).expand_as(ids)
             ids.copy_(values.masked_fill(values * stride >= visible[:, None], -1))
@@ -2970,7 +2973,10 @@ def test_canonical_prefill_batches_full_requests_into_one_index_topk():
         out,
         solution,
         index_metadata,
+        *,
+        simulation_seed,
     ):
+        assert simulation_seed is None
         for ids, counts, stride in ((out[0], out[1], 1), (out[2], out[3], 8)):
             values = torch.arange(ids.shape[1]).expand_as(ids)
             ids.copy_(values.masked_fill(values * stride >= visible[:, None], -1))
@@ -3444,7 +3450,8 @@ def test_projected_indexer_queries_are_not_sliced_twice(projected, deferred):
             q, meta.positions, torch.zeros(25, 64), weight_scale=0.25
         )
 
-    def score(*args):
+    def score(*args, simulation_seed):
+        assert simulation_seed is None
         query = args[0]
         values = query.values if deferred else query
         seen.extend(values[:, 0, 0].tolist())

@@ -28,34 +28,31 @@ def test_topk_call_can_override_configured_output_format() -> None:
     assert output.router_logits is router_logits
 
 
+@pytest.mark.parametrize("simulate", [False, True])
+@pytest.mark.parametrize("biased", [False, True])
 def test_plain_route_uses_kernel_package_topk(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, simulate: bool, biased: bool
 ) -> None:
-    calls: list[tuple[int, torch.dtype, bool, float, str | None]] = []
+    calls = []
+    bias = torch.zeros(8) if biased else None
 
-    def fake_topk(
-        router_logits: torch.Tensor,
-        top_k: int,
-        score_function: str,
-        selection_method: str,
-        renormalize: bool,
-        routed_scaling_factor: float,
-        topk_indices_dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        assert score_function == "softmax"
-        assert selection_method == "topk"
+    def fake_topk(router_logits, top_k, *, simulation_seed, **kwargs):
+        assert simulation_seed == (3 if simulate else None)
+        assert kwargs["score_function"] == ("sigmoid" if biased else "softmax")
+        assert kwargs["selection_method"] == "topk"
+        assert kwargs.get("correction_bias") is bias
         calls.append(
             (
                 top_k,
-                topk_indices_dtype,
-                renormalize,
-                routed_scaling_factor,
-                None,
+                kwargs["topk_indices_dtype"],
+                kwargs["renormalize"],
+                kwargs["routed_scaling_factor"],
             )
         )
         shape = (router_logits.shape[0], top_k)
-        return torch.ones(shape), torch.zeros(shape, dtype=topk_indices_dtype)
+        return torch.ones(shape), torch.zeros(shape, dtype=kwargs["topk_indices_dtype"])
 
+    monkeypatch.setitem(topk_module.global_server_args_dict, "simulate", simulate)
     monkeypatch.setattr(topk_module, "moe_topk", fake_topk)
     output = select_experts(
         hidden_states=torch.empty((2, 4), dtype=torch.float32),
@@ -66,10 +63,14 @@ def test_plain_route_uses_kernel_package_topk(
             renormalize=True,
             routed_scaling_factor=2.5,
             topk_indices_dtype=torch.int32,
+            layer_id=3,
+            use_grouped_topk=biased,
+            correction_bias=bias,
+            num_expert_group=1,
+            topk_group=1,
         ),
     )
-
-    assert calls == [(2, torch.int32, True, 2.5, None)]
+    assert calls == [(2, torch.int32, True, 2.5)]
     assert output.topk_weights.shape == output.topk_ids.shape == (2, 2)
     assert output.topk_ids.dtype == torch.int32
 
@@ -238,3 +239,43 @@ def test_simulated_routing_spreads_tokens_over_fixed_experts(
 
     again = topk(hidden_states[:4], router_logits[:4]).router_logits
     assert torch.equal(again, logits[:4])
+
+
+@pytest.mark.parametrize(
+    "case", ["sink", "grouped", "grouped_bias", "native", "torch", "cuda", "custom"]
+)
+def test_simulation_rejects_unseeded_routing_paths(monkeypatch, case):
+    monkeypatch.setitem(topk_module.global_server_args_dict, "simulate", True)
+    settings = {"top_k": 2, "layer_id": 3, "router_topk": "fused"}
+    if case == "sink":
+        settings["num_sink_experts"] = 1
+    elif case in ("grouped", "grouped_bias"):
+        settings.update(use_grouped_topk=True, topk_group=1, num_expert_group=2)
+        if case == "grouped_bias":
+            settings["correction_bias"] = torch.zeros(8)
+    elif case == "native":
+        settings["torch_native"] = True
+    elif case in ("torch", "cuda"):
+        settings.update(
+            correction_bias=torch.zeros(8),
+            router_topk="torch" if case == "torch" else "fused",
+        )
+    else:
+
+        def custom(**kwargs):
+            raise AssertionError("Unseeded router must not execute")
+
+        settings["custom_routing_function"] = custom
+    with pytest.raises(NotImplementedError, match="final-writeback simulation"):
+        select_experts(torch.empty(2, 4), torch.empty(2, 8), TopKConfig(**settings))
+
+
+def test_simulation_rejects_bypassed_routing_override(monkeypatch):
+    monkeypatch.setitem(topk_module.global_server_args_dict, "simulate", True)
+    topk = TopK(top_k=2, layer_id=3, output_format=TopKOutputFormat.STANDARD)
+    with pytest.raises(NotImplementedError, match="In-kernel routing"):
+        topk(
+            torch.empty(2, 4),
+            torch.empty(2, 8),
+            output_format=TopKOutputFormat.BYPASSED,
+        )

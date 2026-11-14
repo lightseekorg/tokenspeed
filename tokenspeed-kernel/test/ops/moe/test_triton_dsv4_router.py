@@ -63,6 +63,7 @@ def test_router_reuses_compilation_across_token_counts(
             routed_scaling_factor=2.5,
             topk_weights_dtype=weights_dtype,
             override="triton_sqrt_softplus_topk",
+            simulation_seed=None,
         )
         scores = F.softplus(logits).sqrt()
         expected_weights, expected_ids = scores.topk(6, dim=-1)
@@ -81,6 +82,67 @@ def test_router_reuses_compilation_across_token_counts(
     with assert_no_triton_compile(sqrt_softplus_topk._sqrt_softplus_topk_kernel):
         for tokens in (2, 17, 32, 65):
             run(tokens)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+@pytest.mark.parametrize("kind", ["plain", "bias", "hash"])
+def test_simulated_router_keeps_weights_and_reuses_compilation(kind):
+    from tokenspeed_kernel.ops.moe._triton.sqrt_softplus_topk import (
+        _sqrt_softplus_topk_kernel,
+    )
+    from utils import assert_no_triton_compile
+
+    generator = torch.Generator(device="cuda").manual_seed(47)
+    logits = torch.randn(65, 384, device="cuda", generator=generator)
+    bias = (
+        torch.randn(384, device="cuda", generator=generator) if kind == "bias" else None
+    )
+    table = (
+        torch.stack(
+            [
+                torch.randperm(384, device="cuda", generator=generator)[:6]
+                for _ in range(65)
+            ]
+        ).to(torch.int32)
+        if kind == "hash"
+        else None
+    )
+    input_ids = torch.arange(65, device="cuda") if table is not None else None
+
+    def route(rows, seed):
+        return moe_topk(
+            logits[:rows],
+            top_k=6,
+            score_function="sqrt_softplus",
+            selection_method="hash" if kind == "hash" else "topk",
+            renormalize=True,
+            routed_scaling_factor=2.5,
+            correction_bias=bias,
+            hash_indices_table=table,
+            input_ids=None if input_ids is None else input_ids[:rows],
+            override="triton_sqrt_softplus_topk",
+            simulation_seed=seed,
+        )
+
+    route(1, None)
+    route(1, 73)
+    with assert_no_triton_compile(_sqrt_softplus_topk_kernel):
+        for rows in (2, 8, 17, 65):
+            real_weights, real_ids = route(rows, None)
+            weights, ids = route(rows, 75)
+            torch.testing.assert_close(weights, real_weights, atol=0, rtol=0)
+            assert ((ids >= 0) & (ids < 384)).all()
+            ordered = ids.sort(dim=1).values
+            assert (ordered[:, 1:] != ordered[:, :-1]).all()
+            assert not torch.equal(ids, real_ids)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = route(65, 75)
+    logits.neg_()
+    graph.replay()
+    expected = route(65, 75)
+    for actual, reference in zip(captured, expected, strict=True):
+        torch.testing.assert_close(actual, reference, atol=0, rtol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
@@ -136,6 +198,7 @@ def test_router_matches_reference(
         hash_indices_table=table,
         input_ids=input_ids,
         override=kernel,
+        simulation_seed=None,
     )
     expected_scores = F.softplus(logits.float()).sqrt()
     expected_ids = (
@@ -177,11 +240,16 @@ def test_fused_router_matches_logits_path(experts: int, tokens: int) -> None:
         correction_bias=bias,
     )
     try:
-        weights, ids = moe_topk(None, hidden_states=x, gate_weight=gate, **args)
+        weights, ids = moe_topk(
+            None, hidden_states=x, gate_weight=gate, **args, simulation_seed=None
+        )
     except NoKernelFoundError:
         pytest.skip("no fused router kernel on this platform")
     expected_weights, expected_ids = moe_topk(
-        x.float() @ gate.float().T, override="triton_sqrt_softplus_topk", **args
+        x.float() @ gate.float().T,
+        override="triton_sqrt_softplus_topk",
+        **args,
+        simulation_seed=None,
     )
     torch.testing.assert_close(ids, expected_ids, atol=0, rtol=0)
     torch.testing.assert_close(weights, expected_weights, atol=1e-5, rtol=1e-5)
@@ -211,6 +279,7 @@ def test_gfx1250_fused_router_reuses_compilation_across_token_counts() -> None:
             routed_scaling_factor=1.5,
             correction_bias=bias,
             override="gluon_router_sqrt_softplus_topk_gfx1250",
+            simulation_seed=None,
         )
 
     run(1)
@@ -237,6 +306,7 @@ def test_router_ties_and_graph_replay(weights_dtype: torch.dtype) -> None:
             routed_scaling_factor=1.0,
             topk_weights_dtype=weights_dtype,
             override="triton_sqrt_softplus_topk",
+            simulation_seed=None,
         )
 
     weights, ids = run()
@@ -283,6 +353,7 @@ def test_router_nan_logits_keep_expert_ids_in_range(
             routed_scaling_factor=1.0,
             correction_bias=bias,
             override=kernel,
+            simulation_seed=None,
         )
         return ids
 
@@ -383,6 +454,7 @@ def test_router_to_mxfp4_experts(tokens: int) -> None:
             renormalize=True,
             routed_scaling_factor=1.0,
             correction_bias=bias,
+            simulation_seed=None,
         )
         return moe_apply(
             plan,

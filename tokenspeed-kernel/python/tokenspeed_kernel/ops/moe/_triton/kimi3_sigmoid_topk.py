@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.moe._triton.simulation import permute_experts
 from tokenspeed_kernel.platform import Platform, current_platform
 
 
@@ -35,7 +36,7 @@ def _float32_to_ordered_key(value):
     return bits ^ tl.where((bits & sign) != 0, full, sign)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["simulation_seed"])
 def _kimi3_sigmoid_bias_topk_kernel(
     logits,
     correction_bias,
@@ -46,12 +47,14 @@ def _kimi3_sigmoid_bias_topk_kernel(
     NORMALIZE_TOPK_WEIGHTS: tl.constexpr,
     HAS_DISPATCH_MAP: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
+    simulation_seed,
+    SIMULATE: tl.constexpr,
 ):
     num_experts: tl.constexpr = 896
     padded_experts: tl.constexpr = 1024
     topk: tl.constexpr = 16
     # One program per row; every reduction below is row-local.
-    row = tl.program_id(0)
+    row = tl.program_id(0).to(tl.int64)
     logits += row * num_experts
     topk_ids += row * topk
     topk_weights += row * topk
@@ -97,6 +100,9 @@ def _kimi3_sigmoid_bias_topk_kernel(
         selected_weights /= denominator
     selected_weights *= ROUTED_SCALING_FACTOR
 
+    if SIMULATE:
+        selected_ids = permute_experts(selected_ids, row, simulation_seed, num_experts)
+
     if HAS_DISPATCH_MAP:
         # Static expert-location dispatch: route each selected logical expert
         # to this rank's physical replica inside the same launch.
@@ -119,6 +125,7 @@ def kimi3_sigmoid_bias_topk(
     weights_dtype: torch.dtype = torch.float32,
     enable_pdl: bool = False,
     out: tuple[torch.Tensor, torch.Tensor] | None = None,
+    simulation_seed: int | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Route Kimi K3 tokens to their top 16 of 896 experts, one row per CTA.
 
@@ -198,6 +205,8 @@ def kimi3_sigmoid_bias_topk(
         ROUTED_SCALING_FACTOR=float(routed_scaling_factor),
         NORMALIZE_TOPK_WEIGHTS=normalize_topk_weights,
         HAS_DISPATCH_MAP=logical_to_physical_map is not None,
+        simulation_seed=0 if simulation_seed is None else simulation_seed,
+        SIMULATE=simulation_seed is not None,
         ENABLE_PDL=enable_pdl,
         num_warps=8,
         num_stages=1,

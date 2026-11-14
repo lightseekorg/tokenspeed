@@ -20,6 +20,8 @@
 
 """GFX950/GFX1250 CSA2 row selection matches the torch top-k selection."""
 
+from functools import partial
+
 import pytest
 import torch
 from utils import assert_no_triton_compile, is_cdna4, is_cdna5
@@ -38,6 +40,8 @@ if is_cdna4():
     from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41.indexer import (
         launch_gluon_dsv41_index_topk_select_gfx950 as launch_select,
     )
+
+    launch_select = partial(launch_select, simulation=None)
 else:
     from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv41.topk import (
         gluon_dsv41_index_topk_select_gfx1250 as select_kernel,
@@ -209,3 +213,162 @@ def test_select_rejects_layouts_the_kernel_would_misaddress():
         args.update(bad)
         with pytest.raises(ValueError):
             launch(**args)
+
+
+@pytest.mark.skipif(not is_cdna4(), reason="Simulation currently targets gfx950")
+@pytest.mark.parametrize("tied", [False, True])
+def test_simulated_full_and_reindex_preserve_selection_geometry(tied):
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41.indexer import (
+        launch_gluon_dsv41_index_block_select_gfx950,
+        launch_gluon_dsv41_index_topk_select_gfx950,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41.simulation import (
+        IndexSelectionSimulation,
+    )
+
+    visible = torch.tensor(
+        [0, 7, 127, 513, 4097, 75003], device=DEVICE, dtype=torch.int32
+    )
+    width, topk, block_topk = 75008, 512, 2048
+    generator = torch.Generator(device=DEVICE).manual_seed(81)
+    logits = torch.randn(len(visible), width, device=DEVICE, generator=generator)
+    if tied:
+        logits.zero_()
+    logits.masked_fill_(
+        torch.arange(width, device=DEVICE)[None] >= visible[:, None], -torch.inf
+    )
+    rows = torch.empty(len(visible), topk, dtype=torch.int32, device=DEVICE)
+    lengths = torch.empty_like(visible)
+    blocks = torch.empty(len(visible), block_topk, dtype=torch.int32, device=DEVICE)
+    block_lengths = torch.empty_like(visible)
+    simulation = IndexSelectionSimulation(
+        seed=17, visible_lens=visible, force_latest=False
+    )
+
+    def full():
+        launch_gluon_dsv41_index_topk_select_gfx950(
+            logits,
+            None,
+            visible,
+            topk,
+            rows,
+            lengths,
+            simulation=simulation,
+        )
+        launch_gluon_dsv41_index_block_select_gfx950(
+            logits,
+            visible,
+            block_topk,
+            blocks,
+            block_lengths,
+            width,
+            simulation_seed=17,
+        )
+
+    full()
+    original_rows, original_lengths = _select(
+        launch_select, logits, None, topk, visible
+    )
+    assert torch.equal(lengths, original_lengths)
+    assert not torch.equal(rows[-1], original_rows[-1])
+    for q, n in enumerate(visible.tolist()):
+        count = min(n, topk)
+        selected = rows[q, :count].long()
+        rank = torch.arange(count, device=DEVICE)
+        assert torch.all(selected >= rank * n // max(count, 1))
+        assert torch.all(selected < (rank + 1) * n // max(count, 1))
+        assert torch.all(rows[q, count:] == -1)
+        block_count = min((n + 7) // 8, block_topk)
+        assert int(block_lengths[q]) == block_count
+        chosen_blocks = blocks[q, :block_count]
+        assert torch.all(chosen_blocks[1:] > chosen_blocks[:-1])
+        assert torch.all(blocks[q, block_count:] == -1)
+        if n:
+            assert int(chosen_blocks[-1]) == (n - 1) // 8
+
+    expected_rows, expected_blocks = rows.clone(), blocks.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        full()
+    rows.fill_(-99)
+    blocks.fill_(-99)
+    graph.replay()
+    assert torch.equal(rows, expected_rows)
+    assert torch.equal(blocks, expected_blocks)
+
+    # Reindex uses only Full's selected blocks, including a partial newest block.
+    columns = torch.arange(block_topk * 8, device=DEVICE)
+    logical = blocks[:, columns // 8].long() * 8 + columns % 8
+    valid = (blocks[:, columns // 8] >= 0) & (logical < visible[:, None])
+    reindex_logits = torch.randn(logical.shape, device=DEVICE, generator=generator)
+    if tied:
+        reindex_logits.zero_()
+    reindex_logits.masked_fill_(~valid, -torch.inf)
+
+    def reindex(seed):
+        launch_gluon_dsv41_index_topk_select_gfx950(
+            reindex_logits,
+            blocks,
+            None,
+            topk,
+            rows,
+            lengths,
+            simulation=IndexSelectionSimulation(
+                seed=seed, visible_lens=visible, force_latest=False
+            ),
+        )
+
+    reindex(17)
+    first = rows.clone()
+    for q, n in enumerate(visible.tolist()):
+        count = int(lengths[q])
+        picked = rows[q, :count]
+        assert torch.all(picked[1:] > picked[:-1])
+        assert torch.all((picked >= 0) & (picked < n))
+        assert torch.isin(picked.long(), logical[q, valid[q]]).all()
+        assert count == min(int(valid[q].sum()), topk)
+        assert torch.all(rows[q, count:] == -1)
+    with assert_no_triton_compile(select_kernel):
+        reindex(19)
+    assert not torch.equal(rows[-1], first[-1])
+    reindex(17)
+    assert torch.equal(rows, first)
+    reindex_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(reindex_graph):
+        reindex(17)
+    rows.fill_(-99)
+    reindex_graph.replay()
+    assert torch.equal(rows, first)
+
+
+@pytest.mark.skipif(not is_cdna4(), reason="Simulation currently targets gfx950")
+def test_simulated_selection_widens_long_context_stratum_products():
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41.indexer import (
+        launch_gluon_dsv41_index_topk_select_gfx950,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41.simulation import (
+        IndexSelectionSimulation,
+    )
+
+    extent, count = 1200000, 2048
+    logits = torch.randn(1, extent, device=DEVICE)
+    visible = torch.tensor([extent], device=DEVICE, dtype=torch.int32)
+    rows = torch.empty(1, count, device=DEVICE, dtype=torch.int32)
+    lengths = torch.empty_like(visible)
+    launch_gluon_dsv41_index_topk_select_gfx950(
+        logits,
+        None,
+        visible,
+        count,
+        rows,
+        lengths,
+        simulation=IndexSelectionSimulation(
+            seed=17, visible_lens=visible, force_latest=False
+        ),
+    )
+    ranks = torch.arange(count, device=DEVICE, dtype=torch.int64)
+    assert count * extent > 2**31
+    assert lengths.item() == count
+    assert bool((rows[0].long() >= ranks * extent // count).all())
+    assert bool((rows[0].long() < (ranks + 1) * extent // count).all())
+    assert bool((rows[0, 1:] > rows[0, :-1]).all())

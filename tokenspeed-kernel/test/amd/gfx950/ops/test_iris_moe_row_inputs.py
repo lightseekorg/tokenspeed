@@ -99,7 +99,12 @@ def _check_row_inputs(rank: int, device: torch.device, group, state) -> None:
     def route(rows, logits):
         calls.append(rows.shape[0])
         ids, weights = invoke_sigmoid_bias_topk_route_prefill_gluon(
-            logits, bias, 16, routed_scaling_factor=2.5, normalize_topk_weights=True
+            logits,
+            bias,
+            16,
+            routed_scaling_factor=2.5,
+            normalize_topk_weights=True,
+            simulation_seed=None,
         )
         return weights, ids
 
@@ -121,7 +126,12 @@ def _check_row_inputs(rank: int, device: torch.device, group, state) -> None:
                 linear_beta=25.0,
             )
             ids, weights = invoke_sigmoid_bias_topk_route_prefill_gluon(
-                router, bias, 16, routed_scaling_factor=2.5, normalize_topk_weights=True
+                router,
+                bias,
+                16,
+                routed_scaling_factor=2.5,
+                normalize_topk_weights=True,
+                simulation_seed=None,
             )
             packed, scales = _quantize_mxfp4_activation(latent)
             if rank == (rows // 256 + layer) % 8:
