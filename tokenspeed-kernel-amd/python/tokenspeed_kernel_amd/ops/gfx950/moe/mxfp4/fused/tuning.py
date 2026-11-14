@@ -73,8 +73,9 @@ _GROUPED_MOE_CONFIGS = {
 # SiTU package prefill, same key and entries; rows outside every range keep the
 # density-based fallback.
 _GROUPED_SITU_MOE_CONFIGS = {
-    # Kimi K3.1 at TP8. Four stage-1 warps beat one at 32-row tiles, and
-    # 64-row tiles beat 128-row tiles while their padding is the larger cost.
+    # Kimi K3.1 at TP8. Four stage-1 warps beat fewer at 32- and 64-row
+    # tiles, and 64-row tiles beat 128-row tiles while their padding is the
+    # larger cost.
     (3584, 384, 512, 896, 896, 16): (
         (
             449,
@@ -82,9 +83,9 @@ _GROUPED_SITU_MOE_CONFIGS = {
             _GroupedMoEConfig(32, 4, use_minimum_route_chunks=False, runtime_rows=False),
         ),
         (
-            3585,
-            7168,
-            _GroupedMoEConfig(64, 2, use_minimum_route_chunks=False, runtime_rows=False),
+            1793,
+            16384,
+            _GroupedMoEConfig(64, 4, use_minimum_route_chunks=False, runtime_rows=False),
         ),
     ),
 }
