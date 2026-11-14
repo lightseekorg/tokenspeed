@@ -28,6 +28,7 @@ from tokenspeed_kernel.ops.moe.gluon import (
     _DSV4_PROFILE,
     _GPT_OSS_120B_PROFILE,
     _KIMI_K3_PROFILE,
+    _MUSE_SPARK_PROFILE,
     _GluonPetitState,
     _Profile,
     _validate_layer,
@@ -38,7 +39,8 @@ from tokenspeed_kernel.selection import NoKernelFoundError
 
 
 @pytest.mark.parametrize(
-    "profile", [_GPT_OSS_120B_PROFILE, _DSV4_PROFILE, _KIMI_K3_PROFILE]
+    "profile",
+    [_GPT_OSS_120B_PROFILE, _DSV4_PROFILE, _KIMI_K3_PROFILE, _MUSE_SPARK_PROFILE],
 )
 def test_petit_plan_selects_gluon_registration(profile, mi350_platform) -> None:
     with mock.patch(
@@ -48,6 +50,7 @@ def test_petit_plan_selects_gluon_registration(profile, mi350_platform) -> None:
             "mxfp4",
             input_dtype=torch.bfloat16,
             activation=profile.activation,
+            requires_deferred_finalize=True,
             routing_mode="precomputed_topk",
             a2a_backend="gluon_petit",
             ep_size=8,
@@ -68,6 +71,8 @@ def test_petit_plan_selects_gluon_registration(profile, mi350_platform) -> None:
     assert plan["apply_kernel_name"] == "gluon_petit_mxfp4_megamoe_apply"
     assert plan["weight_preprocessor"] is gluon_petit_mxfp4_megamoe_weights
     assert plan["a2a_backend"] == "gluon_petit"
+    # Per-route consumers take the unsummed routes.
+    assert plan["supports_deferred_finalize"]
 
 
 def test_petit_cannot_replace_explicit_deepep(mi350_platform) -> None:
@@ -129,6 +134,28 @@ def _dsv4_layer(limit: float | None) -> SimpleNamespace:
         w13_weight_bias=None,
         w2_weight_bias=None,
     )
+
+
+def _muse_spark_layer() -> SimpleNamespace:
+    return SimpleNamespace(
+        num_experts=256,
+        top_k=8,
+        hidden_size=4096,
+        intermediate_size=4096,
+        ep_size=8,
+        tp_size=1,
+        num_local_experts=32,
+        activation="silu",
+        swiglu_beta=None,
+        swiglu_arg=None,
+        w13_input_layout="concatenated",
+        w13_weight_bias=None,
+        w2_weight_bias=None,
+    )
+
+
+def test_validate_layer_selects_muse_spark_profile() -> None:
+    assert _validate_layer(_muse_spark_layer()) == _MUSE_SPARK_PROFILE
 
 
 def test_validate_layer_selects_gpt_oss_120b_profile() -> None:

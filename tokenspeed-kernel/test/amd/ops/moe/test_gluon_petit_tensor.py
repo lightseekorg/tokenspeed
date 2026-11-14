@@ -252,7 +252,7 @@ def test_partial_scale_load_preserves_lds(num_tokens):
     mega = importlib.import_module("lib.moe.rocm.mega_moe")
     stage1, _, _ = mega._MegaMoESolutions()[
         config._solution_id_for_tokens(num_tokens)
-    ].Kernels(True, num_tokens >= 256, num_tokens >= 1024)
+    ].Kernels(True, num_tokens >= 256, num_tokens >= 1024, True)
     policy = stage1.Input
     source = torch.arange(
         policy.kGroupM * policy.kRowStride // 4, dtype=torch.int32, device="cuda"
@@ -321,7 +321,9 @@ def test_tensor_quantization_padding_and_zero_groups(groups):
     torch.testing.assert_close(out, expected, atol=0, rtol=0)
 
 
-def test_token_counts_do_not_recompile() -> None:
+# The route-copy combine body must keep num_tokens a runtime argument too.
+@pytest.mark.parametrize("reduce_routes", (True, False))
+def test_token_counts_do_not_recompile(reduce_routes: bool) -> None:
     # New token counts must not trigger JIT compilation during serving.
     # num_tokens is a runtime argument of the MegaMoE kernels, so whether it
     # recompiles depends only on their signatures, not on the Kernel config.
@@ -341,7 +343,7 @@ def test_token_counts_do_not_recompile() -> None:
         has_bias=True,
     )
     adapter = mega_moe._MegaMoESolutions()[config._solution_id_for_tokens(1)]
-    stage1, _, combine = adapter.Kernels(True, False, False)
+    stage1, _, combine = adapter.Kernels(True, False, False, reduce_routes)
     device = torch.device("cuda", 0)
     uint8 = torch.empty(1, dtype=torch.uint8, device=device)
     int32 = torch.empty(1, dtype=torch.int32, device=device)
@@ -368,7 +370,8 @@ def test_token_counts_do_not_recompile() -> None:
         mega_moe.MegaMoECombine.warmup(
             bfloat16,
             rows,
-            config.compute_model_dim,
+            # Route copies keep model_dim rows per route; sums can be wider.
+            config.compute_model_dim if reduce_routes else config.model_dim,
             uint8,
             0,
             combine,
