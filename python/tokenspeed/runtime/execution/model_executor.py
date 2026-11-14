@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import gc
 import time
 from collections.abc import Mapping, Sequence
@@ -1215,7 +1216,7 @@ class ModelExecutor:
         )
 
     def autotune(self, *, keep_loaded_tactics: bool) -> None:
-        """Warm kernels on the serving stream and optionally tune missing tactics.
+        """Warm kernels and optionally tune missing tactics.
 
         A forward reload keeps the tactics already loaded by this process.
         """
@@ -1279,16 +1280,25 @@ class ModelExecutor:
         )
 
         tic = time.time()
-        # Prefill can bind workspace state on first use. Prepare and run the
-        # dummy batch on the serving stream after the caller's device writes.
-        self.execution_stream.wait_stream(
-            self.device_module.current_stream(self.device)
-        )
+        # Ascend prefill binds workspace state to the stream of its first use,
+        # so there the dummy batch runs on the serving stream after the
+        # caller's device writes. Elsewhere it stays on the current stream:
+        # warming on the serving stream made Kimi-K3.1's 8K prefill chunks
+        # about 30% slower on MI350.
+        warm_on_serving_stream = current_platform().is_npu
+        if warm_on_serving_stream:
+            self.execution_stream.wait_stream(
+                self.device_module.current_stream(self.device)
+            )
         set_autotune_process_group(cpu_group)
         try:
             # Capture later refreshes the metadata created here in place.
             with (
-                self.device_module.stream(self.execution_stream),
+                (
+                    self.device_module.stream(self.execution_stream)
+                    if warm_on_serving_stream
+                    else contextlib.nullcontext()
+                ),
                 torch.no_grad(),
                 kernel_warmup(enabled=True),
                 autotune(tune_mode=tune_mode, tuning_buckets=None, round_up=None),
