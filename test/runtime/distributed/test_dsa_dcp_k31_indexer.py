@@ -968,6 +968,7 @@ class _IndexKPool:
     def __init__(self, plane: torch.Tensor):
         self.plane = plane
         self.index_k_page_size = _PAGE
+        self.index_k_format = "fp8_scaled"
 
     def get_index_k_buffer(self, layer_id: int) -> torch.Tensor:
         return self.plane
