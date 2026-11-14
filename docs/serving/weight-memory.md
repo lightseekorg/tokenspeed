@@ -46,6 +46,47 @@ Expert placement state (load counters and, for all-to-all EP under a static
 dispatch algorithm, the per-rank dispatch map) is allocated with the placement
 before the model is built, so it also stays resident across discard.
 
+## Persistent attention and runtime buffers
+
+With memory saving enabled, attention-backend initialization, fixed workspaces,
+runtime inputs and history, and prefill/decode graph metadata use a separate
+CPU-backed allocation pool. Shared workspace growth uses the same pool.
+Allocation sites use `named_region(name)` to describe their owner:
+
+| Region name | Allocations | Underlying pool |
+| --- | --- | --- |
+| `executor_inputs` | executor inputs and ngram input buffers | `persistent_buffers` |
+| `runtime_states` | request history and runtime state | `persistent_buffers` |
+| `attention_state` | attention backend and graph metadata | `persistent_buffers` |
+| `workspace` | shared scratch allocations, including growth | `persistent_buffers` |
+
+The adapter resolves these aliases centrally. The executor owns its adapter
+and passes it to the prefill graph; their buffers do not depend on the KV
+arena's adapter.
+These allocations share the `weights` tag, so they are restored before a weight
+update even while KV remains released. They retain their contents and virtual
+addresses under either weight policy; discarding parameters must not discard
+constant tables, pointer tables or kernel semaphores. Existing Tensor views and
+captured graphs remain bound to the same addresses.
+
+The persistent-buffer pool is separate from the parameter and KV pools because
+their backup policies differ. Nested aliases reuse the active underlying pool,
+including when different adapter instances enter them. Region names do not add
+sleep/wake tags or change the KV discard policy.
+Communication storage initialized outside managed weight allocations
+keeps its existing lifetime.
+
+When the `nccl` tag is released, the forward thread drains device work,
+suspends existing communicators and clears allocator caches. On NVIDIA CUDA,
+it also lowers the current context's thread-stack limit and restores the limit
+before NCCL resumes; ROCm skips this NVIDIA driver operation. A release or
+resume containing NCCL waits for the corresponding request on every
+attention-DP engine before entering device collectives. Explicit
+`NCCL_CUMEM_ENABLE` and `CUDA_MODULE_LOADING` settings are
+preserved by the launcher. This does not destroy workers, contexts or process
+groups. CUDA eager execution also clears PyTorch's cuBLAS workspaces; graph
+execution retains those workspaces because captured kernels may refer to them.
+
 ## Allocator runtime requirements
 
 The allocator must recognize managed pointers when they are freed outside their
