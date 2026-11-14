@@ -390,8 +390,9 @@ class EngramHostAlloc:
         keeps mmap without asking. ``sharded`` tables always use anonymous
         memory.
     numa: cumem placement: ``interleave`` alternates 2 GiB chunks over the
-        host NUMA nodes of the host's GPUs; ``writer`` keeps them on the node
-        of the writer rank's GPU.
+        host NUMA nodes of the GPUs the job's ranks use on that host;
+        ``writer`` keeps them on the node of the writer rank's GPU. A single
+        rank's table stays on its own GPU's node either way.
     """
 
     mode: str
