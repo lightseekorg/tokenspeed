@@ -4111,9 +4111,10 @@ class ServerArgs:
             default=ServerArgs.engram_host_table_numa,
             help=(
                 "Placement of cumem Engram tables. interleave: alternate 2 GiB "
-                "chunks over the host NUMA nodes of the host's GPUs. writer: "
-                "keep them on the NUMA node of the GPU of the rank that loads "
-                "them."
+                "chunks over the host NUMA nodes of the GPUs the job's ranks "
+                "use on that host. writer: keep them on the NUMA node of the "
+                "GPU of the rank that loads them. A single rank's table stays "
+                "on its own GPU's node either way."
             ),
         )
         parser.add_argument(
