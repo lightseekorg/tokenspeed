@@ -2018,3 +2018,82 @@ def test_dense_mm_override_precedes_decode_shortcut(monkeypatch, kind, numerics)
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+class _StreamDouble:
+    """A stream that records the streams it is ordered after."""
+
+    def __init__(self, name, log):
+        self.name = name
+        self._log = log
+
+    def wait_stream(self, other):
+        self._log.append(("wait", self.name, other.name))
+
+
+class _DeviceModuleDouble:
+    """Tracks the current stream through ``stream()`` like torch.cuda does."""
+
+    def __init__(self, log):
+        self._log = log
+        self.current = _StreamDouble("current", log)
+
+    def current_stream(self, device=None):
+        return self.current
+
+    def stream(self, stream):
+        module = self
+
+        class _Use:
+            def __enter__(self):
+                self.previous = module.current
+                module.current = stream
+
+            def __exit__(self, *exc):
+                module.current = self.previous
+
+        return _Use()
+
+
+@pytest.mark.parametrize("is_npu", [False, True])
+def test_startup_warmup_runs_on_the_serving_stream_only_on_npu(monkeypatch, is_npu):
+    """Ascend warms on the serving stream after the caller's writes; other
+    platforms keep the dummy forward on the caller's current stream."""
+    log = []
+    device_module = _DeviceModuleDouble(log)
+
+    def forward(**kwargs):
+        log.append(("forward", device_module.current.name))
+
+    executor = _AutotuneExecutor(
+        config=_AutotuneConfig(chunked_prefill_size=16, prefill_only=True),
+        forward=forward,
+        input_buffers=_InputBuffersDouble(
+            input_ids_buf=torch.arange(32),
+            positions_buf=torch.arange(32),
+            max_bs=8,
+            max_num_tokens=32,
+            on_fill_dummy=lambda **kwargs: None,
+        ),
+        prefill_graph=_PrefillGraphDouble(
+            make_dummy_batch=lambda n, bs: _DummyBatch(bs=bs, query_shard=None)
+        ),
+        forward_step=_ForwardStepDouble(),
+        drafter=None,
+        model_input_kwargs=lambda n, bs, rows: {},
+        events=[],
+    )
+    executor.device_module = device_module
+    executor.execution_stream = _StreamDouble("serving", log)
+    platform = type("_Platform", (), {"is_npu": is_npu})()
+    monkeypatch.setattr(executor_module, "current_platform", lambda: platform)
+    for name in ("load_autotune_cache", "save_autotune_cache"):
+        monkeypatch.setattr(executor_module, name, lambda *args: None)
+    monkeypatch.setattr(executor_module, "set_autotune_process_group", lambda g: None)
+    _tap(monkeypatch, executor_module, "autotune", lambda *args, **kwargs: None)
+    ModelExecutor.autotune(executor, keep_loaded_tactics=False)
+    if is_npu:
+        assert log == [("wait", "serving", "current"), ("forward", "serving")]
+    else:
+        assert log == [("forward", "current")]
+    assert device_module.current.name == "current"
