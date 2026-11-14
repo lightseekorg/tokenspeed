@@ -23,6 +23,7 @@ serving reads (load_cost_data)."""
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import sys
@@ -233,9 +234,13 @@ def test_attention_samples_cover_the_context_grid(attention_backend) -> None:
         attention_samples,
     )
 
-    for sliding_window in (0, 256):
+    kv_dtypes = [torch.bfloat16]
+    if attention_backend == "mha":
+        # The mha cascade also times a unit-scale FP8 cache.
+        kv_dtypes.append(torch.float8_e4m3fn)
+    for kv_cache_dtype, sliding_window in itertools.product(kv_dtypes, (0, 256)):
         records = attention_samples(
-            attention_backend=attention_backend, batch_size=2, rows=4, window=16, num_q_heads=8, num_kv_heads=2,
+            attention_backend=attention_backend, kv_cache_dtype=kv_cache_dtype, batch_size=2, rows=4, window=16, num_q_heads=8, num_kv_heads=2,
             head_dim=128, sliding_window=sliding_window, context_step=64,
             context_stop=1024, fast=True, repeat=2, widths=[1, 4],
             category="cache_llm",

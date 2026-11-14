@@ -321,8 +321,11 @@ cache differ: the backend's `query_dtype` names it per layer and forward
 mode, and the prologue returns the query in it (the Triton solution rounds
 once from fp32, the composite converts its result), so no separate cast runs
 before attention. The MHA backend asks for unscaled FP8 in decode over an FP8
-cache; a fresh prefill attends the activation-dtype key and value rows the
-prologue returns, so extend keeps the activation dtype.
+cache when a decode kernel reads FP8 queries for the layer's traits, and the
+activation dtype otherwise: the portable Triton kernels widen FP8 K/V tiles
+under a 16-bit query (`mha_fp8_kvcache_query_dtype`); so does a bound draft
+tree's cascade. A fresh prefill attends the activation-dtype key and value rows
+the prologue returns, so extend keeps the activation dtype.
 
 MXFP8 is a GQA format for 128-wide key and value heads. FP8 per-token-head is
 an MLA format.

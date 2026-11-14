@@ -24,7 +24,7 @@
         --model <target> --draft-model <EAGLE-4 draft> --run-dir <dir> \\
         --tp-size 4 --compute-intensity chain_intensity --topk 1 \\
         --num-steps 15 --num-draft-tokens 16 --max-bs 8 --mamba-ssm-dtype float32 \\
-        --attention-backend trtllm
+        --kv-cache-dtype auto --attention-backend trtllm
 
 For each sampled batch size the driver writes ``config/measure_config.json``,
 serves that many identical greedy requests on an exec-mode-2 engine (whose
@@ -36,7 +36,7 @@ lanes over the context range with the kernels serving runs
 converge is measured again (three retries).
 
 Serving reads the run directory as its ``--speculative-data-path``, with the
-same draft shape, TP size, attention backends and state dtype.
+same draft shape, TP size, attention backends, state dtype and KV cache dtype.
 """
 
 from __future__ import annotations
@@ -76,6 +76,9 @@ from tokenspeed.runtime.layers.attention.kernel_page_sizes import TRTLLM_MHA_PAG
 # Tokens a measured request may emit; the engine ends the batch with an EOS well before.
 _MAX_NEW_TOKENS = 1024
 _WORKSPACE_BYTES = 256 << 20
+# --kv-cache-dtype choices: the cache the attention timing reads (the engine
+# serves with --dtype bfloat16).
+_KV_CACHE_DTYPES = {"auto": torch.bfloat16, "fp8_e4m3": torch.float8_e4m3fn}
 # The fixed prompt every measured request starts from.
 _PROMPT = (
     "Please write a detailed, step-by-step explanation of how a modern operating "
@@ -88,6 +91,7 @@ _PROMPT = (
 def attention_samples(
     *,
     attention_backend: str,
+    kv_cache_dtype: torch.dtype,
     batch_size: int,
     rows: int,
     window: int,
@@ -108,7 +112,9 @@ def attention_samples(
     its ``window``-key tree window. The prefix half is the one
     ``attention_backend`` serves with: ``trtllm`` the trtllm-gen decode,
     ``mha`` the Triton decode, with the sliding-window lanes folded into it as
-    query heads (``MHAAttnBackend._tree_cascade``).
+    query heads (``MHAAttnBackend._tree_cascade``). The cache holds
+    ``kv_cache_dtype`` (the model dtype or unit-scale FP8 E4M3, which both
+    halves widen to the bf16 query).
 
     Serving forwards all ``rows`` whatever the round's width, so one timing
     per context stands for every swept width.
@@ -126,14 +132,17 @@ def attention_samples(
     ]  # fmt: skip
     pages_per_req = math.ceil((context_stop + window) / page)
     num_pages = batch_size * pages_per_req
-    k_rows = torch.randn(
-        (num_pages * page, num_kv_heads, head_dim), device=device, dtype=dtype
-    )
-    v_rows = torch.randn_like(k_rows)
-
     if attention_backend not in ("trtllm", "mha"):
         raise ValueError(f"no tree cascade timing for {attention_backend!r}")
+    if kv_cache_dtype not in (dtype, torch.float8_e4m3fn):
+        raise ValueError(f"no tree cascade timing over a {kv_cache_dtype} cache")
     trtllm = attention_backend == "trtllm"
+    if trtllm and kv_cache_dtype != dtype:
+        raise ValueError("the trtllm cascade timing reads a model-dtype cache only")
+    k_rows = torch.randn(
+        (num_pages * page, num_kv_heads, head_dim), device=device, dtype=dtype
+    ).to(kv_cache_dtype)
+    v_rows = torch.randn(k_rows.shape, device=device, dtype=dtype).to(kv_cache_dtype)
 
     def paged(rows_: torch.Tensor) -> torch.Tensor:
         cache = rows_.view(-1, page, num_kv_heads, head_dim)
@@ -329,7 +338,9 @@ def measure_batch(args, engine, input_ids, batch_size, target_cfg, draft_cfg) ->
          (d_heads, d_kv_heads, d_head_dim), d_window),
     ):  # fmt: skip
         records = attention_samples(
-            attention_backend=args.attention_backend, batch_size=batch_size, rows=rows, window=window,
+            attention_backend=args.attention_backend,
+            kv_cache_dtype=_KV_CACHE_DTYPES[args.kv_cache_dtype],
+            batch_size=batch_size, rows=rows, window=window,
             num_q_heads=shape[0] // tp, num_kv_heads=max(1, shape[1] // tp),
             head_dim=shape[2], sliding_window=sliding, context_step=args.context_step,
             context_stop=args.context_stop, fast=args.fast, repeat=repeat,
@@ -400,6 +411,12 @@ def main(argv: list[str] | None = None) -> None:
         "state's verify kernels)",
     )
     parser.add_argument(
+        "--kv-cache-dtype",
+        required=True,
+        choices=sorted(_KV_CACHE_DTYPES),
+        help="KV cache dtype, as serving runs it (auto: the model dtype)",
+    )
+    parser.add_argument(
         "--gpu-memory-utilization",
         type=float,
         default=0.85,
@@ -448,6 +465,7 @@ def main(argv: list[str] | None = None) -> None:
             "--speculative-exec-mode", "2", "--speculative-data-path", args.run_dir,
             "--speculative-compute-intensity", args.compute_intensity,
             "--log-level", "warning", "--mamba-ssm-dtype", args.mamba_ssm_dtype,
+            "--kv-cache-dtype", args.kv_cache_dtype,
             "--gpu-memory-utilization", str(args.gpu_memory_utilization),
         ],
         num_engines=1,

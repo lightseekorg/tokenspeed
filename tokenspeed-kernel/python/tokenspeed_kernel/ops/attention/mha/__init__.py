@@ -185,6 +185,74 @@ def mha_plan(
     return {"extend_mode": extend_mode}
 
 
+_KVCACHE_READS = ("mha_decode_with_kvcache", "mha_extend_with_kvcache")
+
+
+def mha_fp8_kvcache_query_dtype(
+    mode: str,
+    kv_cache_dtype: torch.dtype,
+    activation_dtype: torch.dtype,
+    head_dim: int,
+    page_size: int,
+    window_left: int,
+    logit_cap: float,
+    sinks: bool | None,
+    solution: str | None,
+) -> torch.dtype:
+    """The query dtype a paged read of a unit-scale FP8 KV cache takes.
+
+    Queries are cast to the cache dtype when a kernel of ``mode`` reads FP8
+    queries under these traits. Otherwise they stay in the activation dtype
+    when a kernel takes a 16-bit query and widens the FP8 K/V in registers
+    (the portable Triton kernels). With neither, the cache dtype is returned,
+    so kernel selection reports the missing kernel as before.
+
+    Args:
+        mode: ``"mha_decode_with_kvcache"`` or ``"mha_extend_with_kvcache"``.
+        kv_cache_dtype: FP8 storage dtype of the K/V cache.
+        activation_dtype: Dtype of the projected queries.
+        head_dim: Attention head dimension.
+        page_size: KV cache page size the kernel reads.
+        window_left: Exclusive left sliding-window size, or -1.
+        logit_cap: Logit soft-cap value, or 0.0 when disabled.
+        sinks: Whether attention sinks are used; ``None`` when the caller
+            does not know yet (any kernel matches on this trait).
+        solution: Optional kernel solution to restrict selection.
+
+    Returns:
+        ``kv_cache_dtype`` or ``activation_dtype``.
+    """
+    if mode not in _KVCACHE_READS:
+        raise ValueError(f"mode must be one of {_KVCACHE_READS}, got {mode!r}")
+    traits = {
+        "head_dim": head_dim,
+        "page_size": page_size,
+        "logit_cap": logit_cap != 0.0,
+        "return_lse": False,
+        "sliding_window": window_left >= 0,
+    }
+    if sinks is not None:
+        traits["sinks"] = sinks
+    if mode == "mha_extend_with_kvcache":
+        traits["is_causal"] = True
+    for q_dtype in (kv_cache_dtype, activation_dtype):
+        signature = format_signature(
+            q=dense_tensor_format(q_dtype),
+            k_cache=dense_tensor_format(kv_cache_dtype),
+            v_cache=dense_tensor_format(kv_cache_dtype),
+        )
+        candidates = KernelRegistry.get().get_for_operator(
+            "attention",
+            mode,
+            platform=current_platform(),
+            format_signature=signature,
+            solution=solution,
+        )
+        if any(spec_matches_traits(spec, traits) for spec in candidates):
+            return q_dtype
+    return kv_cache_dtype
+
+
 def mha_prefill(
     # attention inputs
     q: torch.Tensor,
@@ -920,6 +988,7 @@ import tokenspeed_kernel.ops.attention.mha.gluon  # noqa: E402,F401
 
 __all__ = [
     "mha_plan",
+    "mha_fp8_kvcache_query_dtype",
     "mha_prefill",
     "mha_extend_with_kvcache",
     "mha_decode_with_kvcache",
