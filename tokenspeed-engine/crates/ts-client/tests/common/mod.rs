@@ -24,7 +24,8 @@
 //! * a request with `max_new_tokens = n` gets `n` one-token outputs, the
 //!   last finished with `"length"`;
 //! * a request without `max_new_tokens` gets one token and then runs until
-//!   it is aborted, which finishes it with `"abort"`.
+//!   it is aborted. Like `ts-control`, a client's abort finishes it without
+//!   output; `ts-client` ends the stream with `"abort"` itself.
 //!
 //! Generated token `k` of a request is `1000 * engine_index + k`, so tests
 //! can tell which engine served a request.
@@ -229,12 +230,11 @@ async fn run(
                     output.send(single(batch)).await.unwrap();
                 }
             }
+            // Like ts-control, a client's abort finishes the request
+            // without output.
             EngineRequest::Abort(rids) => {
                 for rid in rids {
-                    if running.remove(&rid) {
-                        let batch = step(index, &rid, 2, Some("abort"), 0, &running, false);
-                        output.send(single(batch)).await.unwrap();
-                    }
+                    running.remove(&rid);
                 }
             }
             // A flush succeeds on engine 0 only; nothing else is paused.

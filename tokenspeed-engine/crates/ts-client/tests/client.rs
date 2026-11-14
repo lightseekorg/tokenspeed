@@ -268,10 +268,29 @@ async fn a_pinned_decode_request_goes_to_its_rank_not_the_rooms() {
 async fn abort_finishes_the_stream() {
     let (client, _engines) = connect(1, Routing::Aggregated(LoadBalance::RoundRobin)).await;
     let mut stream = client.generate(request("r1", None)).await.unwrap();
-    assert_eq!(next(&mut stream).await.unwrap().unwrap().output_ids, [1]);
+    let first = next(&mut stream).await.unwrap().unwrap();
+    assert_eq!(first.output_ids, [1]);
+    assert_eq!(
+        (
+            first.prompt_tokens,
+            first.completion_tokens,
+            first.reasoning_tokens
+        ),
+        (3, 1, 10)
+    );
     assert!(client.abort("r1").await.unwrap());
     let last = next(&mut stream).await.unwrap().unwrap();
     assert_eq!(last.finish_reason.as_deref(), Some("abort"));
+    assert!(last.output_ids.is_empty());
+    // The counts are cumulative: the abort keeps the latest output's.
+    assert_eq!(
+        (
+            last.prompt_tokens,
+            last.completion_tokens,
+            last.reasoning_tokens
+        ),
+        (3, 1, 10)
+    );
     assert!(next(&mut stream).await.is_none());
     assert!(!client.abort("r1").await.unwrap());
     assert_eq!(client.in_flight(), [0]);
