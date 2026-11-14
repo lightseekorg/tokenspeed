@@ -1519,6 +1519,9 @@ def test_weight_update_is_refused_before_writing_with_a_column_split_down_copy(
     # The tiny config is too small to build the copy; attach one.
     layer.mlp.down_columns = MoEDownColumns(4, 128, 64, tp_rank=0, tp_size=8)
     norm = layer.input_layernorm.weight
+    # The parameters are allocated uninitialized and may hold NaN, which
+    # never compares equal; give the norm finite values.
+    norm.data.fill_(1.0)
     before = norm.clone()
 
     with pytest.raises(RuntimeError, match="column-split copy"):

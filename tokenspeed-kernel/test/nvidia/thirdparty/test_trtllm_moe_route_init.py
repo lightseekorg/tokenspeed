@@ -333,6 +333,18 @@ def test_serving_lookup_uses_mapped_profile_for_policy_tag():
     )
     assert key.nearest_profile[hidden_index][0] == 32
     assert key.extras[-1] == "tokenspeed-qwen38-tile32-v1"
+    profile_shapes = list(key.nearest_profile)
+    profile_shapes[hidden_index] = (64, 2560)
+    explicit = core.AutoTuner._get_cache_key(
+        "test_moe",
+        runner,
+        _input_shapes(inputs),
+        config,
+        runner.get_cache_key_extras(inputs),
+        nearest_profile=tuple(profile_shapes),
+    )
+    assert explicit.nearest_profile[hidden_index][0] == 64
+    assert "tokenspeed-qwen38-tile32-v1" not in explicit.extras
 
 
 def test_cache_key_hook_preserves_stock_runner_keys():

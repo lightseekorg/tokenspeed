@@ -411,6 +411,7 @@ def test_input_allocation_covers_decode(
     config = SimpleNamespace(
         device="cpu",
         max_num_seqs=160,
+        enable_memory_saver=False,
         data_parallel_size=dp_size,
         chunked_prefill_size=prefill_tokens,
         output_length=width,

@@ -454,7 +454,12 @@ def test_prims_qsa_new_batch_plans_reuse_cluster_occupancy(device):
         # Each intermediate route count builds a new eager plan while the
         # native attention kernels are already warmed for this geometry.
         for routes in range(2, 8):
-            actual = forward(routes)
+            previous_sync_debug = torch.cuda.get_sync_debug_mode()
+            try:
+                torch.cuda.set_sync_debug_mode("error")
+                actual = forward(routes)
+            finally:
+                torch.cuda.set_sync_debug_mode(previous_sync_debug)
             expected = _reference(q[:routes], k, v, slots[:routes], 1 / 16)
             torch.testing.assert_close(actual, expected, atol=4e-3, rtol=1e-2)
         assert monitor.stats().serving_compiles == 0

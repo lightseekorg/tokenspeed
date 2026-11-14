@@ -1302,6 +1302,8 @@ struct Pd {
 /// What an engine runs with beyond its layout, depth and cache tiers.
 #[derive(Default, Clone)]
 struct Setup {
+    /// The fake device exposes the collective NCCL sleep region.
+    nccl_suspendable: bool,
     /// Override the ingress context limit to exercise native capacity errors.
     context_limit: Option<i64>,
     /// Override the Device pool size for capacity-pressure scenarios.
@@ -1372,7 +1374,7 @@ fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopCon
     let pd = setup.pd.as_ref();
     let kv_total_pages = setup.device_pages.map_or(512, |pages| pages as i64 - 1);
     let mut memory_regions = vec!["kv_cache".to_owned(), "weights".to_owned()];
-    if setup.legacy_nccl {
+    if setup.legacy_nccl || setup.nccl_suspendable {
         memory_regions.push("nccl".to_owned());
     }
     LoopConfig {
@@ -4502,6 +4504,109 @@ fn a_reload_runs_once_every_dp_engine_holds_the_same_one() {
             ("ReloadForwardReqOutput", true)
         ]
     );
+}
+
+#[test]
+fn a_further_nccl_release_waits_for_every_already_sleeping_dp_engine() {
+    let release = |tags: &[&str]| {
+        EngineRequest::Control(Box::new(ControlRequest::ReleaseMemoryOccupation(
+            ReleaseMemoryOccupationReqInput {
+                rid: None,
+                http_worker_ipc: None,
+                tags: Some(tags.iter().map(|tag| (*tag).to_owned()).collect()),
+            },
+        )))
+    };
+    let wake = || {
+        EngineRequest::Control(Box::new(ControlRequest::ResumeMemoryOccupation(
+            ResumeMemoryOccupationReqInput {
+                rid: None,
+                http_worker_ipc: None,
+                tags: None,
+            },
+        )))
+    };
+    let mut first: Script = vec![Vec::new(); 14];
+    let mut second: Script = vec![Vec::new(); 14];
+    first[0].push(release(&["kv_cache"]));
+    second[0].push(release(&["kv_cache"]));
+    // The next release has reached only one engine. A previously completed
+    // KV release on the peer does not consent to this new device operation.
+    first[3].push(release(&["weights", "nccl"]));
+    first[7].push(wake());
+    second[7].push(wake());
+    first[8].push(EngineRequest::Control(Box::new(resume())));
+    second[8].push(EngineRequest::Control(Box::new(resume())));
+    let ranks = run_scripted(
+        Layout::Dp(2),
+        1,
+        Tiers::DeviceOnly,
+        Setup {
+            nccl_suspendable: true,
+            ..Setup::default()
+        },
+        vec![first, second],
+        no_reaction,
+    );
+    for rank in ranks {
+        assert_eq!(rank.outcome, Ok(()));
+        assert_eq!(rank.device_ops, ["release kv_cache", "resume kv_cache"]);
+    }
+}
+
+#[test]
+fn nccl_resume_waits_for_every_dp_engine() {
+    for send_peer in [false, true] {
+        let release = || {
+            EngineRequest::Control(Box::new(ControlRequest::ReleaseMemoryOccupation(
+                ReleaseMemoryOccupationReqInput {
+                    rid: None,
+                    http_worker_ipc: None,
+                    tags: None,
+                },
+            )))
+        };
+        let wake = || {
+            EngineRequest::Control(Box::new(ControlRequest::ResumeMemoryOccupation(
+                ResumeMemoryOccupationReqInput {
+                    rid: None,
+                    http_worker_ipc: None,
+                    tags: None,
+                },
+            )))
+        };
+        let mut first: Script = vec![Vec::new(); 9];
+        let mut second: Script = vec![Vec::new(); 9];
+        first[0].push(release());
+        second[0].push(release());
+        first[3].push(wake());
+        if send_peer {
+            second[5].push(wake());
+        }
+        let ranks = run_scripted(
+            Layout::Dp(2),
+            1,
+            Tiers::DeviceOnly,
+            Setup {
+                nccl_suspendable: true,
+                ..Setup::default()
+            },
+            vec![first, second],
+            no_reaction,
+        );
+        for rank in ranks {
+            assert_eq!(rank.outcome, Ok(()));
+            let expected = if send_peer {
+                vec![
+                    "release kv_cache,weights,nccl",
+                    "resume nccl,weights,kv_cache",
+                ]
+            } else {
+                vec!["release kv_cache,weights,nccl"]
+            };
+            assert_eq!(rank.device_ops, expected);
+        }
+    }
 }
 
 /// A JSON schema the toy vocabulary takes most of a second to compile.

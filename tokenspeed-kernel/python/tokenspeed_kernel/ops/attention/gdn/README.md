@@ -134,7 +134,7 @@ for decode, MTP, BF16 state, and prefill.
 
 ## Rubin FlashInfer
 
-The audited FlashInfer Python/cubin release for these adapters is `0.7.3`.
+The audited FlashInfer Python/cubin release for these adapters is `0.7.4`.
 Registrations live in `flashinfer.py`; the explicit `flashinfer_rubin` decode
 solution requires the audited release.
 
