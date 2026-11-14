@@ -784,7 +784,7 @@ step than the EAGLE3 draft. The index-K planes make a K3.1 cache block about
 of 50K input and 500 output tokens run at once.
 
 ```bash
-tokenspeed serve moonshotai/Kimi-K3.1-Pro \
+GPU_MAX_HW_QUEUES=2 tokenspeed serve moonshotai/Kimi-K3.1-Pro \
   --served-model-name kimi-k3.1 \
   --trust-remote-code \
   --max-model-len 65536 \
@@ -796,6 +796,7 @@ tokenspeed serve moonshotai/Kimi-K3.1-Pro \
   --drafter-attention-backend gluon \
   --max-num-seqs 64 \
   --disable-kvstore \
+  --enable-startup-requests \
   --host 0.0.0.0 \
   --port 8000
 ```
@@ -810,6 +811,18 @@ tokenspeed serve moonshotai/Kimi-K3.1-Pro \
   `mla` backend select the kernels.
 - Prefill runs eager on gfx950: the DSA backend replays prefill CUDA graphs on
   NVIDIA only.
+- `GPU_MAX_HW_QUEUES=2` gives each stream priority one hardware queue per
+  compute pipe. With ROCm's default of 4, two queues share a pipe, so
+  prefill's high-priority side kernels can wait behind the forward's GEMMs.
+- `--enable-startup-requests` has the engine serve a few requests of its own
+  before it reports ready, so eager prefill and the request bookkeeping are
+  compiled before the first client request instead of during it.
+- Optionally, add `--kv-parallel-size 8 --decode-context-parallel-size 8` for
+  long contexts or many concurrent requests. Each GPU then stores one eighth of
+  every request's full-attention pages, so about 55 requests of 50K input and
+  500 output tokens run at once, and decode attends each GPU's share of the
+  selected keys. See
+  [KV parallelism](../serving/parallelism.md#kv-parallelism).
 - The Kimi-K3 AMD note on greedy sampling applies.
 
 ## GLM5 / GLM5.2

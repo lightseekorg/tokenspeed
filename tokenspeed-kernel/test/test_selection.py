@@ -53,6 +53,7 @@ from tokenspeed_kernel.selection import (
     set_selection_policy,
     spec_matches_shape_traits,
     spec_matches_traits,
+    traits_problem_filter,
     warmup_selection,
 )
 from tokenspeed_kernel.signature import (
@@ -493,6 +494,28 @@ class TestSpecMatchesShapeTraits:
         assert spec_matches_shape_traits(spec, {"m": 256, "n": 4096, "k": 1280})
         assert not spec_matches_shape_traits(spec, {"m": 256, "n": 4096})
         assert not spec_matches_shape_traits(spec, {})
+
+    def test_problem_filter_checks_the_named_traits(self):
+        def fits(*, rows: int, heads: int) -> bool:
+            return rows * heads * 4 < 2**31
+
+        spec = KernelSpec(
+            name="k",
+            family="f",
+            mode="m",
+            traits={
+                "head_dim": frozenset({128}),
+                "problem_filter": frozenset(
+                    {traits_problem_filter(fits, "rows", "heads")}
+                ),
+            },
+        )
+
+        accepted = {"rows": 2**20, "heads": 96, "head_dim": 128}
+        assert _filter_by_traits([spec], accepted) == [spec]
+        assert not _filter_by_traits([spec], {**accepted, "rows": 2**23})
+        # A request missing a size the filter reads is refused.
+        assert not _filter_by_traits([spec], {"rows": 1, "head_dim": 128})
 
     def test_filter_by_traits_applies_shape_and_value_traits(self):
         spec = KernelSpec(

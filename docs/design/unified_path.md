@@ -924,6 +924,22 @@ draft backend also attends in the mode a break passes it). `ServerArgs`
 refuses the switch for the launches its arguments rule out, and
 `ModelExecutor` for a boot whose plan has no step-0 series.
 
+A one-layer draft whose rows meet only at attention (Qwen3.5's MTP head, a
+`SplitExtendDraft`) splits its extend rounds instead and records
+no step-0 graph. A row's draft K/V reads only that row's inputs (its shifted
+token, the target's hidden row, its position), so `write_draft_kv` runs the
+layer up to its attention prologue over every row, and step 0 then runs from
+each request's last row as one more decode step, one below the frontier: it
+rewrites that row's K/V and attends over the prefix. The K/V writer replays
+one graph over a fixed tile of rows (`EXTEND_KV_TILE_ROWS`, at most the
+largest bucket; `prefill:drafter-kv`), staging the round tile after tile with
+the padded rows written to the dummy slot, and waits for the draft pool's
+Host load first as a step-0 replay does. The steps replay the decode-steps
+graph of the round's request count. No graph bakes a token bucket and a
+request count together, so a round of up to 16 requests replays at any token
+count. A mid chunk writes its K/V and drafts nothing, as no verify follows
+it. A round under attention DP or a query shard keeps step 0 whole, eagerly.
+
 A replay is not bit-identical to a serving-time eager round in general. The
 graphs keep the kernels startup dispatch chose for them, as the decode graphs
 do: small-M BF16 GEMMs route to FlashInfer only before serving
@@ -2469,6 +2485,20 @@ dense / MoE groups that are neither 1 nor the attention TP width in
 `validate_qcp`; the shard width (`N == attn.tp_size`) in `Mapping`; and the
 attention family (GPU DSA), device, and KV cache (bf16: the gathered write is
 `latent_store`, native rows only) in `AttnConfig`, which sees them resolved.
+
+## Runtime sizes reuse binaries
+
+Runtime payload counts and page-table widths do not select new binaries.
+The small Iris all-reduce keeps fixed mailbox geometry, validates complete
+tiles on the host and uses a uniform tile predicate so runtime payload
+bounds retain coherent 16-byte peer transactions. Paged history-table row
+offsets are computed in 64 bits before multiplying by the runtime stride.
+Scalar prefix-length reads share one binary across slice alignments.
+
+`test_batch_shape_recompiles_gfx950.py` checks binary reuse across runtime sizes;
+`test_mla_prefix_chunks.py` exercises a table offset beyond 2**31.
+Full serving validation must additionally show no compilation after
+readiness with the compilation monitor enabled.
 
 ## Non-goals
 

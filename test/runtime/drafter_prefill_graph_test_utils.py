@@ -79,6 +79,7 @@ MAX_LEN = 512
 STEPS = 3
 FIRST_STEP_SERIES = "prefill:drafter-step0"
 DECODE_STEPS_SERIES = "prefill:drafter-decode"
+KV_WRITER_SERIES = "prefill:drafter-kv"
 
 
 class _ToyLayout(NamedTuple):
@@ -172,6 +173,14 @@ class ToyBackend:
             self.extend_lengths if forward_mode.is_extend() else self.seq_lens
         )
         return self.selected
+
+    def padded_write_locations(
+        self, layer, forward_mode: ForwardMode, rows: int
+    ) -> torch.Tensor:
+        """The extend's persistent write slots, the dummy slot past the live rows."""
+        del layer
+        assert forward_mode.is_extend()
+        return self.extend_locs[:rows]
 
     def advance_draft_forward_metadata(self, seq_lens: torch.Tensor) -> None:
         bs = seq_lens.shape[0]
@@ -300,6 +309,18 @@ class ToyDraftModel(nn.Module):
         mask = torch.arange(MAX_LEN, device=x.device) < lengths[:, None]
         summed = (per_request * mask[..., None]).sum(1)
         return x + summed / lengths[:, None].clamp_min(1)
+
+
+class ToySplitDraftModel(ToyDraftModel):
+    """The toy as a split draft: each row's K/V is what the index break gives it."""
+
+    # The toy backend serves one write layout, whichever attention asks.
+    draft_kv_attention = None
+
+    def write_draft_kv(self, ctx, input_ids, positions, captured_hidden_states, slots):
+        x = self.embed(input_ids) + captured_hidden_states[:, :HIDDEN] * self.fold
+        kv = x * 2 + positions.to(x.dtype)[:, None] * 0.01
+        ctx.attn_backend.cache.index_copy_(0, slots, kv)
 
 
 class ToyRunner:

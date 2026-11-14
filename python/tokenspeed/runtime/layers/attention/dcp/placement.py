@@ -28,6 +28,7 @@ from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
     compact_owned_slots,
     virtual_slots_to_local,
 )
+from tokenspeed_kernel.platform import current_platform
 
 
 @dataclass(frozen=True)
@@ -64,6 +65,41 @@ def resolve_cache_slots(
         degree=len(placement.group),
         rank=placement.rank,
     )
+
+
+def resolve_write_slots(
+    loc: torch.Tensor, placement: CachePlacement | None, share
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """``resolve_cache_slots`` once per forward for every layer's writes.
+
+    Every layer of a forward writes its cache rows at the same virtual
+    slots, so the resolved slots are kept on ``share`` (the forward's
+    ``SparseTopKShare``, cleared when the next forward's metadata is built)
+    and reused while ``loc`` is the same, unmodified tensor. The entry holds
+    ``loc``, so its storage cannot be reused for other slots meanwhile. A
+    graph capture reuses only what it resolved itself: one resolved eagerly
+    is not recomputed when the graph replays. A caller that forks streams
+    resolves before the fork, on the stream every branch is ordered after.
+    Only AMD keeps them; elsewhere every layer resolves its own.
+    """
+    if placement is None:
+        return loc, None
+    if not current_platform().is_amd:
+        return resolve_cache_slots(loc, placement)
+    capturing = torch.cuda.is_current_stream_capturing()
+    for cached_loc, version, cached_placement, captured, resolved in share.write_slots:
+        if (
+            cached_placement == placement
+            and captured == capturing
+            and cached_loc.data_ptr() == loc.data_ptr()
+            and cached_loc.shape == loc.shape
+            and cached_loc.stride() == loc.stride()
+            and version == loc._version
+        ):
+            return resolved
+    resolved = resolve_cache_slots(loc, placement)
+    share.write_slots.append((loc, loc._version, placement, capturing, resolved))
+    return resolved
 
 
 def compact_owned_cache_slots(
