@@ -338,7 +338,7 @@ restores whatever is released:
 | Tag | Memory | On resume |
 | --- | --- | --- |
 | `kv_cache` | the cache arena's device regions | zeroed; a PD engine registers it with the transfer engine again |
-| `weights` | model and draft parameters | CPU backup, or remapped and invalid until a complete update; frozen draft allocations retain CPU backup |
+| `weights` | model and draft parameters, persistent attention/runtime buffers and shared workspaces | parameters use CPU backup or remain invalid until a complete update; frozen drafts and attention/runtime buffers retain CPU backup |
 | `cuda_graph` | the decode CUDA graphs' memory pool | discarded; replays rewrite it |
 | `nccl` | NCCL communicator buffers (`ProcessGroupNCCL.suspend`); requires a PyTorch build with suspend support and NCCL 2.29.7 or later | resumed in place |
 
@@ -357,8 +357,10 @@ load that fails after it started requires a restart; an update that any rank
 refuses before loading runs on no rank and can be retried. A bare resume of all
 tags immediately after discard is therefore invalid. Sparse KV
 offload keeps its pinned Host history mapped across a release and zeroes it on
-resume. Other device memory (input buffers, communication workspaces such as
-symmetric memory or DeepEP buffers, the prefill CUDA graphs) stays resident.
+resume. Persistent attention/runtime buffers and shared workspaces are backed
+up with the `weights` tag, retaining their addresses and contents. Other device
+memory, including communication workspaces such as symmetric memory or DeepEP
+buffers and prefill CUDA graph capture pools, stays resident.
 
 With attention DP, every rank must stop admissions and drain before any rank
 releases memory. Send the release to every DP engine concurrently; a release

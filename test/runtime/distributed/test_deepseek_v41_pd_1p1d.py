@@ -11,6 +11,7 @@ Usage:
 """
 
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -164,7 +165,6 @@ def pd_server():
 def test_quality(pd_server):
     assert pd_server.poll() is None, "PD server exited unexpectedly"
     failures = []
-    accepted = 0
     for i, check in enumerate(QUALITY_CHECKS):
         data = _chat(LB_PORT, check["messages"], max_tokens=check["max_tokens"])
         content = data["choices"][0]["message"]["content"]
@@ -176,8 +176,18 @@ def test_quality(pd_server):
             failures.append(
                 f"  check[{i}]: expected {check['expected']!r} in {content!r}"
             )
-        details = (data.get("usage") or {}).get("completion_tokens_details") or {}
-        accepted += int(details.get("accepted_prediction_tokens") or 0)
     assert not failures, "Quality check failures:\n" + "\n".join(failures)
     if ENABLE_DSPARK:
-        assert accepted > 0, "DSpark accepted no draft tokens on the decode node"
+        # The direct gateway lane does not expose speculative counts in usage.
+        # The decode engine logs accepted tokens per verify, including the bonus
+        # token: a value above one proves that it accepted a draft token.
+        with open(os.path.join(LOG_DIR, "decode.log")) as log:
+            accepted_lengths = [
+                float(value)
+                for value in re.findall(
+                    r"Req: \S+ Finish! Accept_num_tokens_avg: ([0-9.]+)", log.read()
+                )
+            ]
+        assert (
+            max(accepted_lengths, default=0) > 1
+        ), f"DSpark accepted no draft tokens on the decode node: {accepted_lengths}"

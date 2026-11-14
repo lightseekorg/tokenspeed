@@ -1389,7 +1389,7 @@ class _FiGemmDouble:
         self.dispatches = []
         self._dispatch = dispatch
 
-    def _get_cache_buf(self, name, size, device):
+    def _get_stream_cache_buf(self, name, size, device):
         self.cache_buf_requests.append((name, size, device))
         return self.workspace
 

@@ -86,6 +86,7 @@ from tokenspeed.runtime.layers.logits_processor import (  # noqa: E402
     LogitsProcessor,
 )
 from tokenspeed.runtime.utils.server_args import ServerArgs  # noqa: E402
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
@@ -352,6 +353,7 @@ def _target_prefill_graph() -> prefill_graph_module.PrefillGraph:
         token_to_kv_pool=None,
         input_buffers=None,
         config=config,
+        memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False),
     )
 
 
