@@ -877,7 +877,7 @@ drafter declares what it records (`BaseDrafter.extend_graph_plan`), and the
 capture and the CUDA-graph memory projection read that one plan: Eagle's
 decode steps at each request count from 1 to `EXTEND_DECODE_MAX_REQUESTS` (16,
 at most `max_num_seqs`; `prefill:drafter-decode`), and unless
-`--no-enable-drafter-prefill-graph` its step 0 per target token bucket at each
+`--disable-drafter-prefill-graph` its step 0 per target token bucket at each
 exact request count of `--prefill-graph-capture-batch-sizes`
 (`prefill:drafter-step0`). An extend round admits a few requests (under a
 steady streaming load, one or two in nearly every round), so a larger one
@@ -922,11 +922,8 @@ run the same round, so they replay alike. Step 0 shares that decision and
 additionally needs a draft model that declares
 `supports_breakable_draft_extend` (Qwen4-Exp's and Qwen3.5's MTP heads; its
 draft backend also attends in the mode a break passes it) and no query shard
-or sharded KV. Elsewhere step 0 runs eagerly; an explicit
-`--enable-drafter-prefill-graph` requires it instead: `ServerArgs` refuses the
-launches its arguments rule out (pipeline, attention DP and context
-parallelism among them), and `ModelExecutor` a boot whose plan has no step-0
-series.
+or sharded KV. Elsewhere step 0 runs eagerly, as it does everywhere under
+`--disable-drafter-prefill-graph`.
 
 A replay is not bit-identical to a serving-time eager round in general. The
 graphs keep the kernels startup dispatch chose for them, as the decode graphs

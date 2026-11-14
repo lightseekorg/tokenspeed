@@ -507,8 +507,8 @@ def test_the_drafters_own_pool_is_declared_captured_and_labelled() -> None:
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.device = "cuda"
     executor.drafter = drafter
-    # Its own prefill graph does not wait for --enable-drafter-prefill-graph.
-    executor.config = SimpleNamespace(enable_drafter_prefill_graph=False)
+    # Its own prefill graph does not wait for the step-0 graphs.
+    executor.config = SimpleNamespace(disable_drafter_prefill_graph=True)
     executor.forward_step = SimpleNamespace(
         disable=True, capture_ladders=lambda entries: {}, stream="stream"
     )
@@ -566,7 +566,7 @@ def test_the_drafter_extend_graphs_are_declared_captured_and_labelled() -> None:
     executor.drafter = Drafter()
     executor.draft_attn_backend = "draft backend"
     executor.config = SimpleNamespace(
-        enable_drafter_prefill_graph=True,
+        disable_drafter_prefill_graph=False,
         prefill_graph_capture_batch_sizes=[1, 2],
         context_len=4096,
         max_num_seqs=8,
@@ -628,13 +628,9 @@ def test_the_drafter_extend_graphs_are_declared_captured_and_labelled() -> None:
     capture.prepare_batch(48, 2)
     assert dummies == [(48, 2, "draft backend")]
 
-    # By default step 0 is declared wherever the drafter supports it.
-    executor.config.enable_drafter_prefill_graph = None
-    assert set(_ladders(executor, 5)) == set(ladders)
-
     # Switched off only the decode steps are declared and captured.
     seen.clear()
-    executor.config.enable_drafter_prefill_graph = False
+    executor.config.disable_drafter_prefill_graph = True
     assert set(_ladders(executor, 5)) == {"prefill", "prefill:drafter-decode"}
     with mock.patch.object(model_executor, "workspace_pool", lambda _d: mock.Mock()):
         ModelExecutor.capture_graphs(executor, entries=None, observer=observer)

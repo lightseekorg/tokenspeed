@@ -867,7 +867,7 @@ class Eagle(HiddenStateDrafter):
     # over one row per request. Both are recorded as breakable graphs: the QSA
     # indexer and attention cores stay at their eager breaks (they read the
     # live metadata), and so do the steps that publish backend state
-    # (``run_eager``). Step 0's graph (--enable-drafter-prefill-graph) pads
+    # (``run_eager``). Step 0's graph (unless --disable-drafter-prefill-graph) pads
     # the rows to a target prefill token bucket and bakes its request count
     # (the rows after the narrowing); the decode steps' graph bakes the
     # request count alone and follows step 0 eager or replayed. A round

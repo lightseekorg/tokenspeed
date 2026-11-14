@@ -209,8 +209,7 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
     # break points (the QSA indexer, ``PagedAttention.attend``) and publishes
     # the accepted prefix through the narrowing handle, and its draft backend
     # (the cache-group router, no state groups) attends in the mode it is
-    # passed, so the drafter may record its extend round as breakable graphs
-    # (--enable-drafter-prefill-graph).
+    # passed, so the drafter may record its extend round as breakable graphs.
     supports_breakable_draft_extend = True
 
     def __init__(

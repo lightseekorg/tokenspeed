@@ -19,7 +19,7 @@
 # SOFTWARE.
 
 """A real ``Eagle`` drafter over a toy draft model and draft backend, for the
-drafter prefill graph tests (``--enable-drafter-prefill-graph``).
+drafter prefill graph tests.
 
 The toy stands in for what a test host lacks (weights, a real draft backend)
 and keeps the state a real draft backend keeps, read the way a real draft step

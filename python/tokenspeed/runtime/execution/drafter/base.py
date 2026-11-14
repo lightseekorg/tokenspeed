@@ -58,7 +58,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 
-# Extend-round graph series: step 0 (--enable-drafter-prefill-graph), decode steps.
+# Extend-round graph series: step 0, decode steps.
 EXTEND_STEP0_SERIES = "prefill:drafter-step0"
 EXTEND_DECODE_SERIES = "prefill:drafter-decode"
 # Rounds admit a few requests each; one with more runs its decode steps eager.
@@ -375,7 +375,7 @@ class BaseDrafter:
     ) -> dict[str, list[tuple[int, int]]]:
         """Every entry ``capture_extend_graphs`` can measure, per memory-projection
         series (the executor drops ``EXTEND_STEP0_SERIES`` under
-        ``--no-enable-drafter-prefill-graph``).
+        ``--disable-drafter-prefill-graph``).
 
         The one channel between that capture and the CUDA-graph memory
         projection, which prices exactly these entries: a series lists its

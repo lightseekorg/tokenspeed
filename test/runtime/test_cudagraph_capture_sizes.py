@@ -78,7 +78,7 @@ def _config(
         query_shard_rank=0,
         prefill_graph_max_tokens=256,
         enable_memory_saver=False,
-        enable_drafter_prefill_graph=False,
+        disable_drafter_prefill_graph=True,
     )
 
 

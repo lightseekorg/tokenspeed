@@ -206,7 +206,7 @@ def _config():
         prefill_only=False,
         decode_only_attention=False,
         prefill_graph_capture_batch_sizes=[1],
-        enable_drafter_prefill_graph=False,
+        disable_drafter_prefill_graph=True,
         input_logprob_chunk_tokens=32,
         enable_speculative_sampling=False,
         query_shard_size=1,
