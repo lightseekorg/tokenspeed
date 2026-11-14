@@ -1707,6 +1707,15 @@ or two-key-tile schedules with TDM query loads and fused K/V transfers. Short
 eight-wave tiles preserve wave ownership through the output store. Long
 sequences overlap K/V transfers with QK, softmax, and PV through a double
 buffer; selected layouts defer probability reductions to reduce loop work.
+Underfilled D128 MHA grids with maximum sequence lengths of 1024–8192 can use
+32-row/two-wave or 64-row/four-wave tiles, selected from the live query
+workgroup count. Larger grids retain wider tiles to reuse K/V loads.
+The two-wave tile requires equal sequence lengths and complete 32-row query
+tiles; the small-grid policy retains four waves for ragged or partial tiles.
+Long D128 BF16/FP16 MHA with at least 32 heads visits query tiles of one head
+first to improve K/V reuse when a single request has at least 256 query tiles.
+This ordering uses runtime grid dimensions and applies to 256-row tiles without
+windows, sinks, or LSE output.
 
 Strongly imbalanced ragged batches compact live query tiles onto the grid.
 Partial query tiles remain masked and can use smaller matrices while reusing
@@ -1728,7 +1737,7 @@ The normalization modes have these prerequisites and numerical bounds:
 | --- | --- | --- |
 | Online softmax | General path, including FP8 and windows | Keep the maximum in unscaled score units; update it and rescale FP32 state for each key tile. |
 | Single-tile normalization | Short BF16/FP16, D128, 256 query rows, 128 keys, eight waves, no sinks/LSE | Subtract the tile maximum, accumulate the FP32 denominator, then round probabilities for PV. A finite maximum seed gives masked rows zero probability. |
-| Fixed first-tile shift | BF16/FP16, four waves, D64/D128, 64/128-key tiles, no window, at least three key tiles | Keep the first tile's shift. Require an absolute base-2 shift at most 64, denominator in `(0, 1e30)`, and finite normalized output within the output dtype's range. |
+| Fixed first-tile shift | BF16/FP16, two or four waves, D64/D128, 64/128-key tiles, no window, at least three key tiles | Keep the first tile's shift. Require an absolute base-2 shift at most 64, denominator in `(0, 1e30)`, and finite normalized output within the output dtype's range. |
 | Online retry | Any valid row fails a fixed-shift guard | Recompute the workgroup with subtract-before-scale online softmax in the same launch and buffers, overwriting provisional output and LSE. |
 
 The shift bound limits cancellation; NaN-propagating reductions detect invalid
