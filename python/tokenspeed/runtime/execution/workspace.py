@@ -59,7 +59,8 @@ import os
 import torch
 
 from tokenspeed.runtime.utils import get_colorful_logger
-from tokenspeed.runtime.utils.env import envs
+from tokenspeed.runtime.utils.env import envs, global_server_args_dict
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = get_colorful_logger(__name__)
 
@@ -92,8 +93,18 @@ class WorkspacePool:
         if initial_nbytes is None:
             initial_nbytes = envs.TOKENSPEED_WORKSPACE_INITIAL_MB.get() * (1 << 20)
         self.device = torch.device(device)
-        self._block = torch.empty(initial_nbytes, dtype=torch.uint8, device=self.device)
+        self._memory_saver = TorchMemorySaverAdapter.create(
+            enable=self.device.type in ("cuda", "npu")
+            and global_server_args_dict["enable_memory_saver"],
+            device=self.device.type,
+        )
+        self._block = self._new_block(initial_nbytes)
         self._frozen = False
+
+    def _new_block(self, nbytes: int) -> torch.Tensor:
+        """Tag the initial or grown scratch allocation without changing existing views."""
+        with self._memory_saver.named_region("workspace"):
+            return torch.empty(nbytes, dtype=torch.uint8, device=self.device)
 
     def allocate(
         self, *specs: tuple[tuple[int, ...], torch.dtype]
@@ -129,7 +140,7 @@ class WorkspacePool:
             # request from those bytes.
             self._block = torch.empty(0, dtype=torch.uint8, device=self.device)
             del block
-            self._block = torch.empty(total, dtype=torch.uint8, device=self.device)
+            self._block = self._new_block(total)
             block = self._block
 
         views = []

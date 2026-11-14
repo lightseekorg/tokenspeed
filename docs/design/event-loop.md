@@ -744,14 +744,23 @@ it could admit a request in the next round. Release intent rides the head
 gate, so every rank joins the tail's readiness agreement when any release is
 pending, including ranks without a release of their own. Ordinary rounds add
 no collective. Protocol 3 reduces readiness directly over its memory domain.
-Protocol 2 reduces over the replica and then attention DP. Release runs on
-the forward thread after the applicable readiness checks pass.
+Protocol 2 reduces over the replica and then attention DP. Under protocol 2,
+an NCCL release also requires a pending NCCL release on every rank: a
+previously completed KV release does not authorize that collective. Other
+regions retain their local release semantics. Release runs on the forward
+thread after the applicable readiness checks pass. Protocol 3 leaves NCCL
+resident and refuses its release tag.
 
 Protocol 3 cancellation uses that same head gate. A continue on any ingress
 refuses the whole observed memory-call batch throughout the domain; local
 before/after-continue cutoffs cannot agree across independent ingress queues.
 Replies are emitted after the gate. Collect the continue and outstanding memory
 replies before issuing a new memory call. Protocol 2 keeps its existing path.
+
+A protocol-2 resume containing NCCL uses the same-round operation gate: it
+waits until every attention-DP engine holds its resume before entering device
+collectives. Other regions still resume locally. A pending collective resume
+refuses a second memory resume until it finishes.
 
 The head gate also agrees whether any DP rank still has released regions.
 Until all regions are restored on every rank, it withholds forward permission

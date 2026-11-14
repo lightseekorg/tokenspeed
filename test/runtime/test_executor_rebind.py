@@ -37,6 +37,9 @@ register_cuda_ci(est_time=5, suite="runtime-1gpu")
 from tokenspeed.runtime.execution import model_executor as module  # noqa: E402
 from tokenspeed.runtime.execution.drafter.base import BaseDrafter  # noqa: E402
 from tokenspeed.runtime.execution.model_executor import ModelExecutor  # noqa: E402
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import (  # noqa: E402
+    TorchMemorySaverAdapter,
+)
 
 
 def _pool(tag, *, attn_kind="full_history"):
@@ -75,6 +78,9 @@ class _Holder:
 def _executor(monkeypatch, log, *, with_draft: bool):
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.device = "cuda"
+    executor.memory_saver_adapter = TorchMemorySaverAdapter.create(
+        enable=False, device="cpu"
+    )
     executor.config = SimpleNamespace(
         spec_algo=None,
         enforce_eager=False,

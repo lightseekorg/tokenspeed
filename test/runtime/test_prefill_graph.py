@@ -25,6 +25,7 @@ from ci_system.ci_register import register_cuda_ci
 
 from tokenspeed.runtime.execution.memory_delta import NULL_MEMORY_DELTA_OBSERVER
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
@@ -1035,6 +1036,9 @@ class TestDummyGroupTablesTest:
                 token_to_kv_pool=pool,
                 input_buffers=object(),
                 config=config,
+                memory_saver_adapter=TorchMemorySaverAdapter.create(
+                    enable=False, device="cpu"
+                ),
             )
 
         assert not (graph.disable)
@@ -1054,6 +1058,9 @@ class TestDummyGroupTablesTest:
                 token_to_kv_pool=pool,
                 input_buffers=object(),
                 config=config,
+                memory_saver_adapter=TorchMemorySaverAdapter.create(
+                    enable=False, device="cpu"
+                ),
             )
         assert graph.disable
 
@@ -1079,6 +1086,9 @@ class TestCaptureFailureIsLoudTest:
     def _bare(self, raises=None):
         pg = self.PrefillGraph.__new__(self.PrefillGraph)
         pg.disable = False
+        pg.memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=False, device="cpu"
+        )
         pg.capture_buckets = [4]
         pg._captures = {}
         pg._encoders = {}
@@ -1223,6 +1233,9 @@ class TestNarrowingPrefillGraphTest:
                     token_to_kv_pool=_fake_pool(runtime_contract=object()),
                     input_buffers=object(),
                     config=config,
+                    memory_saver_adapter=TorchMemorySaverAdapter.create(
+                        enable=False, device="cpu"
+                    ),
                 )
             assert not (graph.disable)
             assert (graph._narrowing) is (inner if expected_buckets else None)
@@ -1266,6 +1279,9 @@ class TestNarrowingPrefillGraphTest:
                     token_to_kv_pool=_fake_pool(runtime_contract=object()),
                     input_buffers=object(),
                     config=config,
+                    memory_saver_adapter=TorchMemorySaverAdapter.create(
+                        enable=False, device="cpu"
+                    ),
                 )
             assert (graph.disable) == (expected_disable)
             assert (graph.decoder_buckets) == ([])
@@ -1481,6 +1497,9 @@ class TestPrefillRoleGraphsTest:
                 token_to_kv_pool=_fake_pool(runtime_contract=object()),
                 input_buffers=object(),
                 config=config,
+                memory_saver_adapter=TorchMemorySaverAdapter.create(
+                    enable=False, device="cpu"
+                ),
             )
 
     def test_placeholder_tables_give_a_state_group_its_two_slots(self):
@@ -1554,6 +1573,9 @@ class TestPrefillRoleGraphsTest:
                 token_to_kv_pool=_fake_pool(runtime_contract=object()),
                 input_buffers=object(),
                 config=self._config(prefill_only=True, enforce_eager=enforce_eager),
+                memory_saver_adapter=TorchMemorySaverAdapter.create(
+                    enable=False, device="cpu"
+                ),
             )
 
     def _check_plan(

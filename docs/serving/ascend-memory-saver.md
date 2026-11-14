@@ -48,7 +48,7 @@ that wheel with CANN `9.2.0`. It has not been rerun for the current integration.
 
 The NPU feature depends on the common memory-protocol changes in
 [PR #3397](https://github.com/lightseekorg/tokenspeed/pull/3397), pinned here
-at `2e0975c31d88661b2fe110e0fac860594ed62479`. It is open and Ready for
+at `97400c6eb136254021a2b1880a3e35104e4e9e5a`. It is open and Ready for
 Review, not merged. This dependency is separate from the Ascend allocator and model support.
 
 Build the TokenSpeed Python runtime, kernel packages, native saver library,
@@ -132,13 +132,19 @@ when weights are ready. This pairing also applies to graph-pool CPU backup.
 | Tag | Released memory | How it becomes ready |
 | --- | --- | --- |
 | `kv_cache` | Device KV cache arena | TokenSpeed maps and clears the arena on wake. |
-| `weights` | Model weight regions | CPU backup restores the old bytes. Discard requires a complete weight update after remapping. |
+| `weights` | Model parameters and persistent runtime buffers | Persistent buffers always restore their CPU backup. Parameters restore their backup or require a complete weight update after discard. |
 | `acl_graph` | ACL decode graph private pool | The original graph replays with restored or freshly written temporary bytes. |
 
 The ACL Graph executable stays resident; the saver releases its managed
-private allocation pages. HCCL groups and their workspaces stay resident.
-Device memory available to training also depends on persistent graph inputs
-and other runtime allocations.
+private allocation pages. Persistent executor inputs, runtime state, attention
+metadata and shared workspaces use a separate CPU-backed pool under `weights`.
+Releasing that tag frees their physical pages; waking it restores their values
+and original addresses. This also applies with `--weight-memory-policy discard`:
+the flag controls model parameters, while persistent buffers retain their backup.
+No additional flag or release tag is needed. HCCL groups and their workspaces
+stay resident. Other allocations outside managed regions also remain resident.
+Backing up these buffers consumes pinned host memory and adds data transfer
+to pause and resume, including when model parameters use `discard`.
 
 Measure reclaimed device memory with driver free-memory readings. Allocator
 reservation counters can still include the virtual ranges kept for replay.

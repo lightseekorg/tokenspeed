@@ -21,9 +21,13 @@
 """CPU regression tests for the downloadable serving evidence checker."""
 
 import json
+from test.ci_system.ci_register import register_cuda_ci
 
 import pytest
 from test_summarize_cuda_two_node_serving import summarize
+
+# CPU regressions use the runtime job's complete dependency environment.
+register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 
 def write_case(tmp_path, layout, *, mixed=False, protocol=3, nccl=False):

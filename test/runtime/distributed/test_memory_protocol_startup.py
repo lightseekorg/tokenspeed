@@ -21,6 +21,7 @@
 """Exercise the memory protocol handshake with real multi-process Gloo."""
 
 from datetime import timedelta
+from test.ci_system.ci_register import register_cuda_ci
 
 import pytest
 import torch.distributed as dist
@@ -30,6 +31,9 @@ from tokenspeed.runtime.engine.memory_protocol import (
     gather_collective_addresses,
     supports_replica_memory_transitions,
 )
+
+# CPU regressions use the runtime job's complete dependency environment.
+register_cuda_ci(est_time=60, suite="runtime-1gpu")
 
 
 @pytest.mark.parametrize(

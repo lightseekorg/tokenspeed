@@ -81,7 +81,7 @@ class PoolState:
         self.pools: dict[PoolKey, OwnedPool] = {}
         self.paused: set[str] = set()
         self.failed: set[str] = set()
-        self.region_active = False
+        self.active_key: PoolKey | None = None
         self.lock = RLock()
 
     def _pool(self, key: PoolKey) -> OwnedPool | None:
@@ -99,14 +99,14 @@ class PoolState:
     def region(self, key: PoolKey) -> Iterator[OwnedPool | None]:
         # Hold the gate for the entire capture/allocation scope.
         with self.lock:
-            if self.region_active:
+            if self.active_key is not None:
                 raise RuntimeError("Cannot nest Ascend memory allocation scopes")
             owned = self._pool(key)
-            self.region_active = True
+            self.active_key = key
             try:
                 yield owned
             finally:
-                self.region_active = False
+                self.active_key = None
 
     def graph_pool(
         self, *, owned: OwnedPool | None, requested
@@ -139,7 +139,7 @@ class PoolState:
 
     def pause(self, tag: str | None) -> None:
         with self.lock:
-            if self.region_active:
+            if self.active_key is not None:
                 raise RuntimeError("Cannot pause an active allocation/capture scope")
             targets = self._targets(tag)
             self.failed.update(targets)
@@ -151,7 +151,7 @@ class PoolState:
 
     def resume(self, tag: str | None) -> None:
         with self.lock:
-            if self.region_active:
+            if self.active_key is not None:
                 raise RuntimeError("Cannot resume an active allocation/capture scope")
             targets = self._targets(tag)
             self.failed.update(targets)

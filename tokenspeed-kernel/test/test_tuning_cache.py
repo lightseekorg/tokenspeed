@@ -269,6 +269,46 @@ def test_reuse_cache_preserves_explicit_profiling_policy(
     assert fi.AutoTuner.search_cache is original_search
 
 
+def test_reuse_cache_validates_the_profile_shape(monkeypatch):
+    fi = pytest.importorskip("flashinfer.autotuner.autotuner")
+    monkeypatch.setattr(tuning, "_autotuner", fi)
+    monkeypatch.delenv("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE", raising=False)
+
+    class Runner(fi.TunableRunner):
+        def get_valid_tactics(self, inputs, profile):
+            return [7]
+
+        def validate_tactic(self, inputs, tactic):
+            return tactic == 7 and inputs[0].shape[0] == 32
+
+        def validate_tactic_for_profile(self, inputs, tactic, profile):
+            return tactic == 7 and profile.get_opt_shapes()[0][0] == 32
+
+        def forward(self, inputs, tactic=-1, **kwargs):
+            raise AssertionError("Cache lookup must not launch a kernel")
+
+    tuner = fi.AutoTuner()
+    runner = Runner()
+    config = fi.TuningConfig()
+    inputs = [torch.empty(1, 128)]
+    profile = fi.OptimizationProfile([[fi.StaticDim(32), fi.StaticDim(128)]], [None])
+    shapes = profile.get_opt_shapes()
+    key = tuner._get_cache_key("probe", runner, shapes, config, ())
+    tuner.profiling_cache[key] = (7, profile)
+    tuner.is_tuning_mode = True
+    with tuning._reuse_autotune_cache():
+        hit, _, tactic, _ = tuner.search_cache(
+            "probe",
+            [runner],
+            shapes,
+            config,
+            inputs=inputs,
+            validation_profile=profile,
+        )
+        assert hit and tactic == 7
+        assert tuner.is_tuning_mode
+
+
 @pytest.mark.parametrize(
     "tokens,local,queries",
     [(512, 112, [512, 64]), (513, 112, [513, 65]), (512, 896, [512])],

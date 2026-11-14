@@ -37,6 +37,7 @@ from tokenspeed.runtime.utils.ascend_memory_saver_state import (
     PoolState,
 )
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import (
+    _NAMED_REGION_POOLS,
     TorchMemorySaverAdapter,
     _defer_communication_initializers,
 )
@@ -197,6 +198,20 @@ class AscendMemorySaverAdapter(TorchMemorySaverAdapter):
             else AllocationPolicy.DISCARD
         )
         return self.allocation_region(PoolKey(tag, policy, tag))
+
+    @contextmanager
+    def named_region(self, name: str):
+        """Back up persistent owners while reusing their active allocator scope."""
+        key = PoolKey("weights", AllocationPolicy.CPU_BACKUP, _NAMED_REGION_POOLS[name])
+        state = self._state()
+        # Aliases share one live PTA scope across all adapters in this worker.
+        # Keep the gate held so another thread cannot borrow its allocator route.
+        with state.state.lock:
+            if state.state.active_key == key:
+                yield
+                return
+        with self.allocation_region(key):
+            yield
 
     @contextmanager
     def allocation_region(self, key: PoolKey):

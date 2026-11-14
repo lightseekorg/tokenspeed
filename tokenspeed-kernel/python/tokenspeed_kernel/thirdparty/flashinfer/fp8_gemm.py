@@ -105,9 +105,8 @@ def cublas_fp8_gemm(
         out: ``[batch, M, N]`` dense BF16 or FP16 output.
     """
     # Streams can overlap (a forked shared expert), so each keeps its own scratch.
-    stream = torch.cuda.current_stream(a.device).stream_id
-    workspace = gemm_base._get_cache_buf(
-        f"bmm_fp8_workspace_{stream}", gemm_base.DEFAULT_WORKSPACE_SIZE, a.device
+    workspace = gemm_base._get_stream_cache_buf(
+        "bmm_fp8_workspace", gemm_base.DEFAULT_WORKSPACE_SIZE, a.device
     )
     _private_fp8_gemm_sm100(a.device.index)(
         a, b, a_scale, b_scale, out, workspace, ["cublas"]

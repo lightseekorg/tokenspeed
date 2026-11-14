@@ -94,6 +94,15 @@ to share a pool must match the registered scope and policy. The graph handle
 does not by itself define which storage is shared. Input buffers and graph
 metadata allocated outside capture follow their own allocation scopes.
 
+The runtime's `executor_inputs`, `runtime_states`, `attention_state`, and
+`workspace` named regions share a separate `weights` pool with CPU backup.
+Its scope is `persistent_buffers`; parameter-discard pools remain distinct.
+Release and resume of `weights` include both policies. Persistent values and
+addresses are restored before a weight update or graph replay can use them.
+Nested aliases reuse the live pool; communication initialization is deferred
+until the outer allocation scope exits. This uses the existing ABI 2 backend
+and does not require another PTA patch.
+
 The decode graph private pool uses discard for audited BF16 MHA model and
 drafter combinations with the greedy sampler. The target and any draft
 model must declare that persistent state lives outside capture. The serving

@@ -34,7 +34,7 @@ use std::{
         Arc, Mutex, Once, PoisonError,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use pyo3::{prelude::*, types::PyDict};
@@ -1316,6 +1316,8 @@ struct Pd {
 /// What an engine runs with beyond its layout, depth and cache tiers.
 #[derive(Default, Clone)]
 struct Setup {
+    /// The fake device exposes the collective NCCL sleep region.
+    nccl_suspendable: bool,
     /// Override the ingress context limit to exercise native capacity errors.
     context_limit: Option<i64>,
     /// Override the Device pool size for capacity-pressure scenarios.
@@ -1390,7 +1392,7 @@ fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopCon
     let pd = setup.pd.as_ref();
     let kv_total_pages = setup.device_pages.map_or(512, |pages| pages as i64 - 1);
     let mut memory_regions = vec!["kv_cache".to_owned(), "weights".to_owned()];
-    if setup.legacy_nccl {
+    if setup.legacy_nccl || setup.nccl_suspendable {
         memory_regions.push("nccl".to_owned());
     }
     if setup.ascend_graph {
@@ -4529,6 +4531,109 @@ fn a_reload_runs_once_every_dp_engine_holds_the_same_one() {
     );
 }
 
+#[test]
+fn a_further_nccl_release_waits_for_every_already_sleeping_dp_engine() {
+    let release = |tags: &[&str]| {
+        EngineRequest::Control(Box::new(ControlRequest::ReleaseMemoryOccupation(
+            ReleaseMemoryOccupationReqInput {
+                rid: None,
+                http_worker_ipc: None,
+                tags: Some(tags.iter().map(|tag| (*tag).to_owned()).collect()),
+            },
+        )))
+    };
+    let wake = || {
+        EngineRequest::Control(Box::new(ControlRequest::ResumeMemoryOccupation(
+            ResumeMemoryOccupationReqInput {
+                rid: None,
+                http_worker_ipc: None,
+                tags: None,
+            },
+        )))
+    };
+    let mut first: Script = vec![Vec::new(); 14];
+    let mut second: Script = vec![Vec::new(); 14];
+    first[0].push(release(&["kv_cache"]));
+    second[0].push(release(&["kv_cache"]));
+    // The next release has reached only one engine. A previously completed
+    // KV release on the peer does not consent to this new device operation.
+    first[3].push(release(&["weights", "nccl"]));
+    first[7].push(wake());
+    second[7].push(wake());
+    first[8].push(EngineRequest::Control(Box::new(resume())));
+    second[8].push(EngineRequest::Control(Box::new(resume())));
+    let ranks = run_scripted(
+        Layout::Dp(2),
+        1,
+        Tiers::DeviceOnly,
+        Setup {
+            nccl_suspendable: true,
+            ..Setup::default()
+        },
+        vec![first, second],
+        no_reaction,
+    );
+    for rank in ranks {
+        assert_eq!(rank.outcome, Ok(()));
+        assert_eq!(rank.device_ops, ["release kv_cache", "resume kv_cache"]);
+    }
+}
+
+#[test]
+fn nccl_resume_waits_for_every_dp_engine() {
+    for send_peer in [false, true] {
+        let release = || {
+            EngineRequest::Control(Box::new(ControlRequest::ReleaseMemoryOccupation(
+                ReleaseMemoryOccupationReqInput {
+                    rid: None,
+                    http_worker_ipc: None,
+                    tags: None,
+                },
+            )))
+        };
+        let wake = || {
+            EngineRequest::Control(Box::new(ControlRequest::ResumeMemoryOccupation(
+                ResumeMemoryOccupationReqInput {
+                    rid: None,
+                    http_worker_ipc: None,
+                    tags: None,
+                },
+            )))
+        };
+        let mut first: Script = vec![Vec::new(); 9];
+        let mut second: Script = vec![Vec::new(); 9];
+        first[0].push(release());
+        second[0].push(release());
+        first[3].push(wake());
+        if send_peer {
+            second[5].push(wake());
+        }
+        let ranks = run_scripted(
+            Layout::Dp(2),
+            1,
+            Tiers::DeviceOnly,
+            Setup {
+                nccl_suspendable: true,
+                ..Setup::default()
+            },
+            vec![first, second],
+            no_reaction,
+        );
+        for rank in ranks {
+            assert_eq!(rank.outcome, Ok(()));
+            let expected = if send_peer {
+                vec![
+                    "release kv_cache,weights,nccl",
+                    "resume nccl,weights,kv_cache",
+                ]
+            } else {
+                vec!["release kv_cache,weights,nccl"]
+            };
+            assert_eq!(rank.device_ops, expected);
+        }
+    }
+}
+
 /// A JSON schema the toy vocabulary takes most of a second to compile.
 fn slow_schema() -> String {
     let names: Vec<String> = (0..3000).map(|i| format!("p{i}")).collect();
@@ -5932,6 +6037,231 @@ fn dp_memory_missing_release_participant_can_cancel_without_sleeping() {
         [("ResumeSchedulerReqOutput", true)]
     );
     assert!(ranks.iter().all(|rank| rank.device_ops.is_empty()));
+}
+
+#[test]
+fn dp_memory_timeout_refuses_the_observed_batch_and_a_late_peer_can_retry() {
+    use std::sync::mpsc;
+
+    // Keep the real 30-second production deadline. A channel stands in only
+    // for frontend delivery, so this exercises two expiry gates, the real
+    // schedulers and TP/DP mesh without adding a production clock override.
+    struct LiveFrontend {
+        inner: ScriptedFrontend,
+        input: mpsc::Receiver<Vec<EngineRequest>>,
+        delivered: mpsc::Sender<Instant>,
+    }
+    impl Frontend for LiveFrontend {
+        fn receive(&mut self, wait: Option<Duration>) -> Vec<EngineRequest> {
+            match self.input.recv_timeout(wait.unwrap_or(Duration::ZERO)) {
+                Ok(messages) => {
+                    self.delivered.send(Instant::now()).unwrap();
+                    messages
+                }
+                Err(_) => Vec::new(),
+            }
+        }
+        fn closed(&self) -> bool {
+            false
+        }
+        fn send(&mut self, outputs: Vec<StreamedOutput>, load: Load) {
+            self.inner.send(outputs, load);
+        }
+        fn reply(&mut self, reply: ControlOutput) {
+            self.inner.reply(reply);
+        }
+    }
+    struct StopOnDrop(Arc<AtomicBool>);
+    impl Drop for StopOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+    fn wait_for(deadline: Instant, mut ready: impl FnMut() -> bool) {
+        while !ready() {
+            assert!(
+                Instant::now() < deadline,
+                "memory timeout test did not finish"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    let layout = Layout::TpDp { tp: 2, dp: 2 };
+    let setup = Setup {
+        replica_memory_transitions: true,
+        ..Setup::default()
+    };
+    let config = loop_config(0, false, &setup);
+    let stop = Arc::new(AtomicBool::new(false));
+    let _stop_on_drop = StopOnDrop(stop.clone());
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let (listeners, addresses) = mesh_listeners(4);
+    let (done, outcomes) = mpsc::channel();
+    let mut inputs = Vec::new();
+    let mut deliveries = Vec::new();
+    let mut replies = Vec::new();
+    let mut outputs = Vec::new();
+    let mut device_ops = Vec::new();
+    let mut threads = Vec::new();
+    for (rank, mesh_listener) in listeners.into_iter().enumerate() {
+        let device = fake_device(layout, rank, &setup);
+        device_ops.push(device.device_ops.clone());
+        let frontend = if rank % 2 == 0 {
+            let (input, receiver) = mpsc::channel();
+            let (delivered, delivery) = mpsc::channel();
+            let observed_replies = Arc::new(Mutex::new(Vec::new()));
+            let observed_outputs = Arc::new(Mutex::new(Vec::new()));
+            inputs.push(input);
+            deliveries.push(delivery);
+            replies.push(observed_replies.clone());
+            outputs.push(observed_outputs.clone());
+            Some(LiveFrontend {
+                inner: ScriptedFrontend {
+                    script: VecDeque::new(),
+                    react: no_reaction,
+                    reacted: Vec::new(),
+                    replies: observed_replies,
+                    finished: Arc::new(Mutex::new(Vec::new())),
+                    outputs: observed_outputs,
+                },
+                input: receiver,
+                delivered,
+            })
+        } else {
+            None
+        };
+        let spec = RankSpec {
+            rank,
+            layout,
+            tiers: Tiers::DeviceOnly,
+            config: config.clone(),
+            setup: setup.clone(),
+            mesh_listener,
+            addresses: addresses.clone(),
+        };
+        let (stop, done) = (stop.clone(), done.clone());
+        threads.push(thread::spawn(move || {
+            let result = run_rank(spec, device, None, || frontend, &stop);
+            done.send(result.map_err(|error| error.to_string()))
+                .unwrap();
+        }));
+    }
+    let calls = |ids: &[&str]| {
+        ids.iter()
+            .map(|id| EngineRequest::Control(Box::new(memory_request(true, None, Some(id)))))
+            .collect()
+    };
+    inputs[0].send(calls(&["old-head"])).unwrap();
+    let old_delivered = deliveries[0]
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .unwrap();
+    // The followers have not reached their own deadline when the old head
+    // expires. Rejecting only that head would leave their replies pending.
+    thread::sleep(Duration::from_secs(15));
+    inputs[0].send(calls(&["young-1", "young-2"])).unwrap();
+    let young_delivered = deliveries[0]
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .unwrap();
+    wait_for(deadline, || replies[0].lock().unwrap().len() == 3);
+    assert!(old_delivered.elapsed() >= Duration::from_secs(29));
+    assert!(young_delivered.elapsed() < Duration::from_secs(25));
+    assert_eq!(
+        outcome(replies[0].lock().unwrap().clone()),
+        [("ReleaseMemoryOccupationReqOutput", false); 3]
+    );
+    assert!(replies[1].lock().unwrap().is_empty());
+
+    // These are the same fanout's delayed deliveries, not retries. This peer
+    // missed the expiry gate and answers only after its own head expires.
+    inputs[1]
+        .send(calls(&["old-head", "young-1", "young-2"]))
+        .unwrap();
+    let late_delivered = deliveries[1]
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .unwrap();
+    wait_for(deadline, || replies[1].lock().unwrap().len() == 3);
+    assert!(late_delivered.elapsed() >= Duration::from_secs(29));
+    assert_eq!(
+        outcome(replies[1].lock().unwrap().clone()),
+        [("ReleaseMemoryOccupationReqOutput", false); 3]
+    );
+    assert!(device_ops.iter().all(|ops| ops.lock().unwrap().is_empty()));
+
+    // All six old replies have now been collected. A fresh matching ID must
+    // release and resume normally, with no stale call consuming either reply.
+    for (release, id, count) in [(true, "fresh-release", 4), (false, "fresh-resume", 5)] {
+        for input in &inputs {
+            input
+                .send(vec![EngineRequest::Control(Box::new(memory_request(
+                    release,
+                    None,
+                    Some(id),
+                )))])
+                .unwrap();
+        }
+        wait_for(deadline, || {
+            replies
+                .iter()
+                .all(|rows| rows.lock().unwrap().len() == count)
+        });
+    }
+    for rows in &replies {
+        assert_eq!(
+            outcome(rows.lock().unwrap().clone()),
+            [
+                ("ReleaseMemoryOccupationReqOutput", false),
+                ("ReleaseMemoryOccupationReqOutput", false),
+                ("ReleaseMemoryOccupationReqOutput", false),
+                ("ReleaseMemoryOccupationReqOutput", true),
+                ("ResumeMemoryOccupationReqOutput", true),
+            ]
+        );
+    }
+    for input in &inputs {
+        input
+            .send(vec![EngineRequest::Add(Box::new(request(
+                "awake",
+                4,
+                budget(2),
+            )))])
+            .unwrap();
+    }
+    wait_for(deadline, || {
+        outputs.iter().all(|rows| {
+            rows.lock()
+                .unwrap()
+                .iter()
+                .any(|row| row.finish_reason.is_some())
+        })
+    });
+    for rows in &outputs {
+        let tokens: Vec<_> = rows
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|row| row.output_ids.iter().copied())
+            .collect();
+        assert_eq!(tokens, [1000, 1001]);
+    }
+    for ops in device_ops {
+        assert_eq!(
+            *ops.lock().unwrap(),
+            ["release kv_cache,weights", "resume weights,kv_cache"]
+        );
+    }
+    stop.store(true, Ordering::Relaxed);
+    for _ in 0..4 {
+        assert_eq!(
+            outcomes
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap(),
+            Ok(())
+        );
+    }
+    for thread in threads {
+        thread.join().unwrap();
+    }
 }
 
 #[test]

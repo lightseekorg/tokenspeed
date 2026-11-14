@@ -50,8 +50,8 @@ jobs:
       matrix: ${{ fromJson(inputs.matrix) }}
     name: ${{ matrix.name }} (${{ matrix.runner }})
     runs-on: ${{ matrix.runner }}
-    # The AMD kernel suite needs more than an hour with a cold Triton cache.
-    timeout-minutes: ${{ matrix.runner == 'amd-mi45x-cpu-test' && 30 || (matrix.name == 'ut-tokenspeed-kernel' && inputs.timeout_minutes < 90 && 90 || inputs.timeout_minutes) }}
+    # The kernel suites need more than an hour with a cold Triton cache.
+    timeout-minutes: ${{ matrix.runner == 'amd-mi45x-cpu-test' && 30 || ((matrix.name == 'ut-tokenspeed-kernel' || startsWith(matrix.name, 'ut-tokenspeed-kernel-part-')) && inputs.timeout_minutes < 90 && 90 || inputs.timeout_minutes) }}
     continue-on-error: ${{ matrix.optional }}
     env:
       INSTALL_TOKENSPEED_MLA_FROM_SOURCE: ${{ inputs.install_tokenspeed_mla_from_source }}

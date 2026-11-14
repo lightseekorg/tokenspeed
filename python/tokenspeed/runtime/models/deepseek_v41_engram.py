@@ -737,11 +737,12 @@ class RowShardedEngramEmbedding(nn.Module):
             local = (indices >= self.row_start) & (indices < self.row_end)
             local_ids = (indices - self.row_start).masked_fill(~local, 0)
             if self.host_table:
-                codes = host_gather.uint8_row_gather(
-                    self.weight.view(torch.uint8), local_ids, None
+                # Gather whole packed rows and split them: a gather per column
+                # view would pay each random row's host page translation twice.
+                rows = host_gather.uint8_row_gather(self.packed, local_ids, None)
+                values = _dequant_fp8_e8m0(
+                    rows[..., : self.embedding_dim], rows[..., self.embedding_dim :]
                 )
-                scales = host_gather.uint8_row_gather(self.scale, local_ids, None)
-                values = _dequant_fp8_e8m0(codes, scales)
             else:
                 local_ids = local_ids.long()
                 # Byte gathers work on CPU and CUDA, including dtypes without index kernels.

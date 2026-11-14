@@ -28,12 +28,63 @@ import argparse
 import ast
 import functools
 import os
+import re
 import subprocess
 import sys
 import tempfile
 from contextlib import contextmanager
 from multiprocessing import Pipe
 from pathlib import Path
+
+
+def preload_cases(*, prepend_hook: bool):
+    hook = "/test/torch_memory_saver_hook_mode_preload.so"
+    explicit = "/custom/torch_memory_saver_hook_mode_preload_cu12.abi3.so"
+    extra, other = "/test/context_only.so", "/test/other_hook.so"
+    cases = [
+        ("no_override", None, None),
+        ("ordinary_preload", [other], None),
+        (
+            "explicit_hook",
+            [other, explicit, "/test/last.so"],
+            [other, explicit, "/test/last.so", extra],
+        ),
+        (
+            "legacy_cpp_hook",
+            [other, "/custom/torch_memory_saver_cpp.some-postfix.so"],
+            [other, "/custom/torch_memory_saver_cpp.some-postfix.so", extra],
+        ),
+        ("directory_name", ["/test/torch_memory_saver/libhelper.so"], None),
+        ("other_library", ["/test/torch_memory_saver_helper.so"], None),
+        ("cpp_helper", ["/test/torch_memory_saver_cpp_helper.so"], None),
+        ("similar_name", ["/test/not_torch_memory_saver_hook_mode_preload.so"], None),
+        (
+            "repeated_explicit_hook",
+            [explicit, other, explicit],
+            [explicit, other, extra],
+        ),
+        ("repeated_context_hook", None, None),
+    ]
+    for name, inherited, override in cases:
+        configured = [hook, extra, *(inherited if prepend_hook and inherited else [])]
+        expected = override if override is not None else configured.copy()
+        if name == "repeated_context_hook":
+            configured.append(hook)
+        for separator in (":", " \t"):
+            yield (
+                f"{name}-{'prepend' if prepend_hook else 'overwrite'}-{separator!r}",
+                separator.join(inherited) if inherited is not None else None,
+                separator.join(configured),
+                ":".join(expected),
+            )
+
+
+def conflicting_preload_cases():
+    first = "/one/torch_memory_saver_hook_mode_preload.so"
+    second = "/two/torch_memory_saver_hook_mode_preload_cu12.abi3.so"
+    for separator in (":", " \t"):
+        yield f"parent-{separator!r}", separator.join([first, second]), first
+        yield f"context-{separator!r}", None, separator.join([first, second])
 
 
 def run(source: Path, *, prepend_hook: bool):
@@ -46,7 +97,8 @@ def run(source: Path, *, prepend_hook: bool):
                 node
                 for node in ast.parse(source.read_text()).body
                 if isinstance(node, (ast.ClassDef, ast.FunctionDef))
-                and node.name in {"HostProcess", "start_rust_host"}
+                and node.name
+                in {"HostProcess", "_merge_memory_saver_preload", "start_rust_host"}
             ],
         ],
         type_ignores=[],
@@ -55,6 +107,7 @@ def run(source: Path, *, prepend_hook: bool):
         "Pipe": Pipe,
         "functools": functools,
         "os": os,
+        "re": re,
         "rank_process_title": lambda _mapping: "tokenspeed::tp0",
         "subprocess": subprocess,
         "sys": sys,
@@ -74,9 +127,6 @@ def run(source: Path, *, prepend_hook: bool):
                 else:
                     os.environ[key] = value
 
-    hook = "/test/torch_memory_saver_hook_mode_preload.so"
-    other = "/test/other_hook.so"
-    override = f"/test/torch_memory_saver_custom.so:{other}"
     # The full ServerArgs imports the GPU stack. This fixture supplies only
     # the launch arguments; it does not replace any process-spawn behavior.
     server_args = argparse.Namespace(
@@ -97,12 +147,13 @@ def run(source: Path, *, prepend_hook: bool):
                 "connection.send((os.environ.get('LD_PRELOAD'), os.environ.get('LD_LIBRARY_PATH')))\n"
             )
             binary.chmod(0o700)
-            for inherited in (None, other, override):
+            for name, inherited, prepared, expected in preload_cases(
+                prepend_hook=prepend_hook
+            ):
                 if inherited is None:
                     os.environ.pop("LD_PRELOAD", None)
                 else:
                     os.environ["LD_PRELOAD"] = inherited
-                prepared = f"{hook}:{inherited}" if prepend_hook and inherited else hook
                 parent_library_path = os.environ.get("LD_LIBRARY_PATH")
                 process, reader = launcher["start_rust_host"](
                     str(binary),
@@ -119,16 +170,40 @@ def run(source: Path, *, prepend_hook: bool):
                     observed = reader.recv()
                     assert os.environ.get("LD_PRELOAD") == inherited
                     assert os.environ.get("LD_LIBRARY_PATH") == parent_library_path
-                    expected = override if inherited == override else prepared
-                    assert observed == (expected, "/test/runtime"), observed
+                    assert re.split(r"[:\s]+", observed[0]) == expected.split(
+                        ":"
+                    ), observed
+                    assert observed[1] == "/test/runtime", observed
                     process.join(timeout=5)
                     assert process.exitcode == 0
-                    print(f"passed: inherited={inherited!r}, prepend={prepend_hook}")
+                    print(f"passed: {name}")
                 finally:
                     reader.close()
                     if process.is_alive():
                         process.terminate()
                     process.join(timeout=5)
+            for name, inherited, prepared in conflicting_preload_cases():
+                if inherited is None:
+                    os.environ.pop("LD_PRELOAD", None)
+                else:
+                    os.environ["LD_PRELOAD"] = inherited
+                before = len(list(Path("/dev/fd").iterdir()))
+                try:
+                    launcher["start_rust_host"](
+                        str(binary),
+                        server_args,
+                        None,
+                        environment({"LD_PRELOAD": prepared}),
+                        None,
+                        False,
+                    )
+                except ValueError as error:
+                    assert "multiple memory-saver preload hooks" in str(error)
+                else:
+                    raise AssertionError("conflicting hooks were accepted")
+                assert os.environ.get("LD_PRELOAD") == inherited
+                assert len(list(Path("/dev/fd").iterdir())) == before
+                print(f"passed: conflicting-{name}")
 
 
 if __name__ == "__main__":

@@ -1494,12 +1494,16 @@ class _SleepDeviceModule:
     def synchronize(self) -> None:
         self._trace.append("device.synchronize")
 
+    def empty_cache(self) -> None:
+        self._trace.append("device.empty_cache")
+
 
 class _SleepExecutor:
     """Only what the release/wake operations read off the executor."""
 
     def __init__(self, trace) -> None:
         self.device = "cpu"
+        self.config = SimpleNamespace(enforce_eager=False)
         self.device_module = _SleepDeviceModule(trace)
         self.token_to_kv_pool = _SleepPool(trace)
 
@@ -1604,7 +1608,19 @@ def test_ascend_saver_refuses_to_launch_with_unavailable_pools(operation):
             handle.run_idle_forward(None)
 
 
-def test_nccl_suspend_and_resume_reach_the_communicators(monkeypatch):
+@pytest.mark.parametrize(
+    "device_type,enforce_eager,hip",
+    [
+        ("cpu", False, None),
+        ("cuda", False, None),
+        ("cuda", True, None),
+        ("cuda", False, "6.4"),
+        ("cuda", True, "6.4"),
+    ],
+)
+def test_nccl_suspend_and_resume_reach_the_communicators(
+    monkeypatch, device_type, enforce_eager, hip
+):
     from tokenspeed.runtime.execution import device as device_module
 
     trace = []
@@ -1615,8 +1631,31 @@ def test_nccl_suspend_and_resume_reach_the_communicators(monkeypatch):
         device_module, "resume_nccl_communicators", lambda: trace.append("resume")
     )
     handle = DeviceHandle(_SleepExecutor(trace))
+    handle._forward_device = torch.device(device_type)
+    handle._executor.config.enforce_eager = enforce_eager
+    monkeypatch.setattr(torch.version, "hip", hip)
+    monkeypatch.setattr(
+        torch._C,
+        "_cuda_clearCublasWorkspaces",
+        lambda: trace.append("cuBLAS.clear"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        device_module, "trim_cuda_stack", lambda: trace.append("stack.trim") or 2048
+    )
+    monkeypatch.setattr(
+        device_module,
+        "restore_cuda_stack",
+        lambda limit: trace.append(("stack.restore", limit)),
+    )
 
     handle.suspend_nccl()
     handle.resume_nccl()
 
-    assert trace == ["suspend", "resume"]
+    expected = ["device.synchronize", "suspend"]
+    if device_type == "cuda" and enforce_eager:
+        expected += ["device.synchronize", "cuBLAS.clear"]
+    expected.append("device.empty_cache")
+    if device_type == "cuda" and hip is None:
+        expected += ["stack.trim", ("stack.restore", 2048)]
+    assert trace == [*expected, "resume"]

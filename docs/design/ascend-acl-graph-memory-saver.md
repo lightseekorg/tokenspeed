@@ -32,7 +32,7 @@ Ascend allocator only for NPU workers that enable the saver.
 
 The shared protocol dependency is
 [PR #3397](https://github.com/lightseekorg/tokenspeed/pull/3397), pinned at
-`2e0975c31d88661b2fe110e0fac860594ed62479` for this integration. The PR is
+`97400c6eb136254021a2b1880a3e35104e4e9e5a` for this integration. The PR is
 open and Ready for Review, not merged. Its request matching, cache publication, and weight commit contracts remain
 shared. Checked Ascend Saver serving selects protocol 3 and rejects an
 older local host; CUDA and ROCm retain the protocol 2 default.
@@ -45,6 +45,9 @@ Decode graph capture goes through `torch_memory_saver.cuda_graph` so the
 private pool receives the `cuda_graph` tag with discard semantics.
 The allocator selects pools by tag and backup policy. It also recognizes
 managed pointers freed outside the original allocation region.
+Persistent executor inputs, runtime state, attention metadata and shared
+workspaces use a separate CPU-backed pool under the `weights` lifecycle.
+Their contents survive even when model parameters use `discard`.
 [TokenSpeed allocator adapter](../../python/tokenspeed/runtime/utils/torch_memory_saver_adapter.py)
 · [Reference allocator implementation](https://github.com/fzyzcjy/torch_memory_saver/tree/7078bc36ebc926ced1cd6d314b869c0a0d3d1f18)
 
@@ -80,13 +83,22 @@ allocations use PTA's default allocator. The Ascend path uses the native
 | Independent draft weights | `retain` preserves them through CPU backup. `refresh` puts them in the same update version as the target. The target owns shared parameters, such as tied embeddings or output weights. |
 | KV arena | Discard physical pages. Clear resumed KV and synchronize the zeroing before admission reopens. Release clears scheduler-side device cache references after all ranks agree they are ready. |
 | Decode graph private pool | Discard for audited BF16 MHA paths with greedy sampling and explicit model and draft capability. Other supported capture paths back up the pool to host memory. A shared pool has one compatible retention policy. |
-| Persistent graph inputs, metadata, and communication workspaces | Keep their owning allocations resident, or restore them through their own explicit memory region. Captured HCCL operations continue to use the live communicator and remapped addresses. |
+| Persistent executor inputs, runtime state, attention metadata and shared workspaces | Share a distinct CPU-backed pool under `weights`. Preserve contents and virtual addresses even when model parameters use `discard`. |
+| Communication workspaces | Stay resident. Captured HCCL operations continue to use the live communicator and remapped addresses. |
 
 A managed pool is identified by its release tag, retention policy, and
 allocation scope. Several pools can share a tag. Joint capture uses one pool.
 Separate graphs can share a compatible pool or use independent scopes. Pool
 identity and allocator ownership remain valid even when capture ends and frees
 occur outside the original allocation scope.
+
+The named owners `executor_inputs`, `runtime_states`, `attention_state`, and
+`workspace` all select `PoolKey("weights", CPU_BACKUP, "persistent_buffers")`.
+This keeps persistent bytes separate from parameter-discard and graph pools
+without adding a public release tag. Nested aliases across adapter instances
+reuse the active allocator scope under the shared worker lock. Other nested
+allocation scopes remain invalid. Deferred communication initialization runs
+after the outer allocator scope exits, so its storage stays resident.
 
 The native backend reserves an address range with `aclrtReserveMemAddress`,
 obtains physical pages with `aclrtMallocPhysical`, and maps them with

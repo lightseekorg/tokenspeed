@@ -57,11 +57,54 @@ Expert placement state (load counters and, for all-to-all EP under a static
 dispatch algorithm, the per-rank dispatch map) is allocated with the placement
 before the model is built, so it also stays resident across discard.
 
+## Persistent attention and runtime buffers
+
+With memory saving enabled, attention-backend initialization, fixed workspaces,
+runtime inputs and history, and prefill/decode graph metadata use a separate
+CPU-backed allocation pool. Shared workspace growth uses the same pool.
+Allocation sites use `named_region(name)` to describe their owner:
+
+| Region name | Allocations | Underlying pool |
+| --- | --- | --- |
+| `executor_inputs` | executor inputs and ngram input buffers | `persistent_buffers` |
+| `runtime_states` | request history and runtime state | `persistent_buffers` |
+| `attention_state` | attention backend and graph metadata | `persistent_buffers` |
+| `workspace` | shared scratch allocations, including growth | `persistent_buffers` |
+
+The adapter resolves these aliases centrally. The executor owns its adapter
+and passes it to the prefill graph; their buffers do not depend on the KV
+arena's adapter.
+These allocations share the `weights` tag, so they are restored before a weight
+update even while KV remains released. They retain their contents and virtual
+addresses under either weight policy; discarding parameters must not discard
+constant tables, pointer tables or kernel semaphores. Existing Tensor views and
+captured graphs remain bound to the same addresses.
+
+The persistent-buffer pool is separate from the parameter and KV pools because
+their backup policies differ. Nested aliases reuse the active underlying pool,
+including when different adapter instances enter them. Region names do not add
+sleep/wake tags or change the KV discard policy.
+Communication storage initialized outside managed weight allocations
+keeps its existing lifetime.
+
+When the `nccl` tag is released, the forward thread drains device work,
+suspends existing communicators and clears allocator caches. On NVIDIA CUDA,
+it also lowers the current context's thread-stack limit and restores the limit
+before NCCL resumes; ROCm skips this NVIDIA driver operation. A release or
+resume containing NCCL waits for the corresponding request on every
+attention-DP engine before entering device collectives. Explicit
+`NCCL_CUMEM_ENABLE` and `CUDA_MODULE_LOADING` settings are
+preserved by the launcher. This does not destroy workers, contexts or process
+groups. CUDA eager execution also clears PyTorch's cuBLAS workspaces; graph
+execution retains those workspaces because captured kernels may refer to them.
+
 ## Allocator runtime requirements
 
 The launcher captures its child environment inside the allocator's launch
-context. An explicitly supplied memory-saver preload keeps its path and order;
-otherwise the context selects the hook and library paths for the child.
+context. An explicitly supplied memory-saver preload is reused once. Parent
+preload libraries keep their relative order, and additional non-saver libraries
+from the launch context are retained. Without an explicit saver preload, the
+context selects the hook and library paths for the child.
 
 The allocator must recognize managed pointers when they are freed outside their
 allocation region, and must separate pools by both tag and CPU-backup policy.
@@ -114,8 +157,13 @@ coordinated domain. A release or resume succeeds only after all of those
 engines finish. The domain is the attention-TP/PP replica for independent
 engines and the existing coordinated attention-DP group for engines that
 share a forward, including EP across replicas. Calls may reach engines in
-different rounds. A head call with missing participants waits up to 30
-seconds while no earlier release is draining. `continue_generation` cancels
+different rounds. The 30-second wait is a queue-head threshold while participants
+are missing and no earlier release is draining, not a separate minimum wait for
+every queued call. When any head expires, the gate refuses the entire batch
+already observed in each rank's local queue. A newer queued call can therefore
+be refused before its own 30 seconds have elapsed. A peer's delivery that arrives
+after that gate is outside the refused batch and may answer later.
+`continue_generation` cancels
 pending memory operations before device work starts, including calls observed
 in the same gate after continue arrived locally. This domain-wide cancellation
 avoids different queue cutoffs at independent ingresses. An engine whose memory
@@ -126,9 +174,13 @@ explicit matching, send the same optional `transition_id` string with each
 engine's named control call. Direct wire callers use the request's `rid`
 field. Use a fresh ID for each operation. Existing ordered fanout can omit
 the ID. A late request from an earlier attempt can cause a mismatch and a
-refusal, so collect outstanding replies before retrying. A reported device
-failure after execution begins requires recovery of the affected engines
-before training or serving continues.
+refusal, so collect every outstanding memory reply before retrying, including
+late replies from a timed-out batch. A continue reply alone does not fence that
+fanout. Refusals before device work can be retried after collecting those
+replies. A device-apply failure, or an L1 clear failure after the domain agreed
+it was ready, is fatal to the coordinated domain, including otherwise healthy
+ranks. Recover the whole domain before training or serving continues;
+cross-host process supervision remains the deployment's responsibility.
 
 CUDA uses protocol 2, with its existing graph memory and NCCL behavior.
 Protocol 3 leaves NCCL buffers resident and refuses an explicit `nccl` tag

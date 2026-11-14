@@ -278,7 +278,7 @@ def validate_state_checkpoint_in_forward(
             f"{type(attn_backend).__name__} cannot store in-forward State "
             "checkpoints for every State group (supported: GDN with a "
             "checkpointing prefill kernel and a prefix granularity it divides, "
-            "Qwen4-Exp PLE)"
+            "KDA, Qwen4-Exp PLE)"
         )
 
 

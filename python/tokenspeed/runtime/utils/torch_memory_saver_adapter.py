@@ -18,6 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+"""Map runtime allocation owners to shared pools and memory-saver lifecycle tags."""
+
 from abc import ABC
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -26,12 +28,32 @@ from functools import cache
 
 import torch
 
+_NAMED_REGION_POOLS = {
+    "executor_inputs": "persistent_buffers",
+    "runtime_states": "persistent_buffers",
+    "attention_state": "persistent_buffers",
+    "workspace": "persistent_buffers",
+}
+
 
 @cache
 def _gpu_memory_saver():
     from torch_memory_saver import TorchMemorySaver
 
     return TorchMemorySaver()
+
+
+@cache
+def _gpu_buffer_memory_savers():
+    from torch_memory_saver import TorchMemorySaver
+
+    # Separate pools retain persistent values when parameters use discard.
+    return {"persistent_buffers": TorchMemorySaver()}
+
+
+_active_buffer_pool: ContextVar[object | None] = ContextVar(
+    "tokenspeed_active_buffer_pool", default=None
+)
 
 
 _communication_initializers: ContextVar[list[Callable[[], None]] | None] = ContextVar(
@@ -85,6 +107,20 @@ class TorchMemorySaverAdapter(ABC):
     def region(self, tag: str | None = None, enable_cpu_backup: bool = False):
         raise NotImplementedError
 
+    def named_region(self, name: str):
+        """Allocate an owner's persistent buffers in its named region.
+
+        Logical names may alias the same CPU-backed pool. These buffers keep
+        their addresses and contents across the existing ``weights`` lifecycle.
+
+        Args:
+            name: The allocation owner's registered region name.
+
+        Raises:
+            KeyError: The region name is not registered.
+        """
+        raise NotImplementedError
+
     def cuda_graph(self, graph, *, pool, stream, tag: str):
         """Capture context for ``graph``: ``torch.cuda.graph`` whose private
         memory pool, when the saver is enabled, lands in the pausable region
@@ -100,6 +136,25 @@ class TorchMemorySaverAdapter(ABC):
 
 
 class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
+    @contextmanager
+    def named_region(self, name: str):
+        """Resolve the owner's pool and reuse it across nested allocation scopes."""
+        pool = _gpu_buffer_memory_savers()[_NAMED_REGION_POOLS[name]]
+        # The native pause/resume API operates on process-wide tags. Restore
+        # before weight updates, even when KV is still paused. Back up values:
+        # some buffers contain constant tables, pointers and kernel semaphores.
+        # A backend can construct or grow the shared WorkspacePool. TMS disallows
+        # nested regions; allocations in this case already have the right owner.
+        if _active_buffer_pool.get() is pool:
+            yield
+            return
+        token = _active_buffer_pool.set(pool)
+        try:
+            with pool.region(tag="weights", enable_cpu_backup=True):
+                yield
+        finally:
+            _active_buffer_pool.reset(token)
+
     def configure_subprocess(self):
         from torch_memory_saver import configure_subprocess
 
@@ -135,6 +190,13 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
 
 
 class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
+    @contextmanager
+    def named_region(self, name: str):
+        """Validate the owner name while leaving its allocations unmanaged."""
+        if name not in _NAMED_REGION_POOLS:
+            raise KeyError(name)
+        yield
+
     @contextmanager
     def configure_subprocess(self):
         yield

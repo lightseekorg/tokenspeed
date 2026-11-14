@@ -392,25 +392,30 @@ class ForwardStepRunner:
         )
         # Backends alias their cache_seqlens buffer. Draft backend aliases
         # the drafter-owned draft_seq_lens to keep InputBuffers read-only.
-        attn_backend.init_cuda_graph_state(
-            self.max_decode_bs,
-            cache_group_specs=tuple(token_to_kv_pool.arena.cache_group_specs),
-            cache_group_page_counts=(token_to_kv_pool.arena.cache_group_page_counts),
-            max_tokens_per_req=self.max_tokens_per_req,
-            overlap_schedule_depth=self.overlap_schedule_depth,
-            max_extend_tokens=config.prefill_graph_max_tokens,
-        )
-        if draft_attn_backend is not None:
-            draft_attn_backend.init_cuda_graph_state(
+        with self.memory_saver_adapter.named_region("attention_state"):
+            attn_backend.init_cuda_graph_state(
                 self.max_decode_bs,
-                cache_group_specs=tuple(draft_token_to_kv_pool.arena.cache_group_specs),
+                cache_group_specs=tuple(token_to_kv_pool.arena.cache_group_specs),
                 cache_group_page_counts=(
-                    draft_token_to_kv_pool.arena.cache_group_page_counts
+                    token_to_kv_pool.arena.cache_group_page_counts
                 ),
                 max_tokens_per_req=self.max_tokens_per_req,
                 overlap_schedule_depth=self.overlap_schedule_depth,
                 max_extend_tokens=config.prefill_graph_max_tokens,
             )
+            if draft_attn_backend is not None:
+                draft_attn_backend.init_cuda_graph_state(
+                    self.max_decode_bs,
+                    cache_group_specs=tuple(
+                        draft_token_to_kv_pool.arena.cache_group_specs
+                    ),
+                    cache_group_page_counts=(
+                        draft_token_to_kv_pool.arena.cache_group_page_counts
+                    ),
+                    max_tokens_per_req=self.max_tokens_per_req,
+                    overlap_schedule_depth=self.overlap_schedule_depth,
+                    max_extend_tokens=config.prefill_graph_max_tokens,
+                )
 
         # One placeholder table set serves capture, the idle replay and any
         # pre-contract warmup: per published group, a zero (null-page) table
