@@ -812,6 +812,7 @@ def test_executor_input_capacity_covers_decode_capture(
         device="cpu",
         max_num_seqs=4,
         data_parallel_size=1,
+        enable_memory_saver=False,
         spec_algo="DSPARK" if width > 1 else None,
         spec_num_tokens=width,
         chunked_prefill_size=chunk_size,

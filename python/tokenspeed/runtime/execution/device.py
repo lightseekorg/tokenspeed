@@ -861,7 +861,7 @@ class DeviceHandle:
         self.synchronize()
         suspend_nccl_communicators()
         self.empty_cache()
-        if self._forward_device.type == "cuda":
+        if self._forward_device.type == "cuda" and torch.version.hip is None:
             self._awake_cuda_stack_limit = trim_cuda_stack()
 
     def resume_nccl(self) -> None:

@@ -60,8 +60,9 @@ Allocation sites use `named_region(name)` to describe their owner:
 | `attention_state` | attention backend and graph metadata | `persistent_buffers` |
 | `workspace` | shared scratch allocations, including growth | `persistent_buffers` |
 
-The adapter resolves these aliases centrally. The executor owns its adapter;
-its inputs and runtime states do not depend on the KV arena's adapter.
+The adapter resolves these aliases centrally. The executor owns its adapter
+and passes it to the prefill graph; their buffers do not depend on the KV
+arena's adapter.
 These allocations share the `weights` tag, so they are restored before a weight
 update even while KV remains released. They retain their contents and virtual
 addresses under either weight policy; discarding parameters must not discard
@@ -76,9 +77,12 @@ Communication storage initialized outside managed weight allocations
 keeps its existing lifetime.
 
 When the `nccl` tag is released, the forward thread drains device work,
-suspends existing communicators, clears allocator caches and lowers the current
-CUDA context's thread-stack limit. The original limit is restored before NCCL
-resumes. Explicit `NCCL_CUMEM_ENABLE` and `CUDA_MODULE_LOADING` settings are
+suspends existing communicators and clears allocator caches. On NVIDIA CUDA,
+it also lowers the current context's thread-stack limit and restores the limit
+before NCCL resumes; ROCm skips this NVIDIA driver operation. A release or
+resume containing NCCL waits for the corresponding request on every
+attention-DP engine before entering device collectives. Explicit
+`NCCL_CUMEM_ENABLE` and `CUDA_MODULE_LOADING` settings are
 preserved by the launcher. This does not destroy workers, contexts or process
 groups. CUDA eager execution also clears PyTorch's cuBLAS workspaces; graph
 execution retains those workspaces because captured kernels may refer to them.

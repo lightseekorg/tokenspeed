@@ -1071,6 +1071,7 @@ class ModelExecutor:
             token_to_kv_pool=self.token_to_kv_pool,
             input_buffers=self.input_buffers,
             config=self.config,
+            memory_saver_adapter=self.memory_saver_adapter,
             drafter=self.drafter,
             graph_supported=self._graph_support.prefill_graph,
         )

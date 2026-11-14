@@ -1554,10 +1554,17 @@ def test_kv_release_without_a_peer_only_quiesces_and_repairs():
 
 
 @pytest.mark.parametrize(
-    "device_type,enforce_eager", [("cpu", False), ("cuda", False), ("cuda", True)]
+    "device_type,enforce_eager,hip",
+    [
+        ("cpu", False, None),
+        ("cuda", False, None),
+        ("cuda", True, None),
+        ("cuda", False, "6.4"),
+        ("cuda", True, "6.4"),
+    ],
 )
 def test_nccl_suspend_and_resume_reach_the_communicators(
-    monkeypatch, device_type, enforce_eager
+    monkeypatch, device_type, enforce_eager, hip
 ):
     from tokenspeed.runtime.execution import device as device_module
 
@@ -1571,6 +1578,7 @@ def test_nccl_suspend_and_resume_reach_the_communicators(
     handle = DeviceHandle(_SleepExecutor(trace))
     handle._forward_device = torch.device(device_type)
     handle._executor.config.enforce_eager = enforce_eager
+    monkeypatch.setattr(torch.version, "hip", hip)
     monkeypatch.setattr(
         torch._C,
         "_cuda_clearCublasWorkspaces",
@@ -1593,6 +1601,6 @@ def test_nccl_suspend_and_resume_reach_the_communicators(
     if device_type == "cuda" and enforce_eager:
         expected += ["device.synchronize", "cuBLAS.clear"]
     expected.append("device.empty_cache")
-    if device_type == "cuda":
+    if device_type == "cuda" and hip is None:
         expected += ["stack.trim", ("stack.restore", 2048)]
     assert trace == [*expected, "resume"]
