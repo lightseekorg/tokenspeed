@@ -693,6 +693,13 @@ def _test_all_gather(rank, world_size, device, group, ref_group):
         result = all_gather(inp, group, dim=-1)
         torch.testing.assert_close(result, expected)
 
+    # middle dim
+    inp = torch.randint(1, 16, (2, 3, 8), dtype=torch.bfloat16, device=device)
+    output_list = [torch.empty_like(inp) for _ in range(world_size)]
+    dist.all_gather(output_list, inp, group=ref_group)
+    result = all_gather(inp, group, dim=1)
+    torch.testing.assert_close(result, torch.cat(output_list, dim=1))
+
 
 def _test_all_gather_single(rank, world_size, device, group, ref_group):
     from tokenspeed.runtime.distributed.comm_ops import all_gather_single
