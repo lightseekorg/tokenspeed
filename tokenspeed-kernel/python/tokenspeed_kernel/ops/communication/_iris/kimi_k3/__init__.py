@@ -95,6 +95,20 @@ def _k3_two_shot_heap_bytes(producer_direct_max_numel: int) -> int:
     return allocation_bytes((3, 2, 8, numel // 8), torch.bfloat16) if numel else 0
 
 
+def _k3_attnres_lamport_rows(world_size: int, enable_lamport: bool) -> int:
+    """Rows the fused AttnRes Lamport two-shot serves for this group."""
+    from tokenspeed_kernel.ops.communication._iris.kimi_k3.attnres import (
+        ATTNRES_LAMPORT_MAX_ROWS,
+        ATTNRES_WORLD_SIZE,
+    )
+
+    return (
+        ATTNRES_LAMPORT_MAX_ROWS
+        if enable_lamport and world_size == ATTNRES_WORLD_SIZE
+        else 0
+    )
+
+
 def allreduce_residual_attnres_max_tokens(world_size: int) -> int:
     """Return K3's measured fused AttnRes window for this group size."""
     return 16 if current_platform().is_cdna4 and world_size == 8 else 0
@@ -139,7 +153,13 @@ class K3IrisState:
         self.enable_lamport = enable_lamport
         self.attnres = (
             IrisAttnResState(
-                all_reduce.peers, attnres_max_numel, attnres_max_rows, all_reduce.dtype
+                all_reduce.peers,
+                attnres_max_numel,
+                attnres_max_rows,
+                all_reduce.dtype,
+                lamport_max_rows=_k3_attnres_lamport_rows(
+                    all_reduce.world_size, enable_lamport
+                ),
             )
             if attnres_max_numel
             else None
@@ -927,6 +947,7 @@ class K3IrisState:
         if self.attnres is None or partial.ndim != 2:
             return False
         rows = partial.shape[0]
+        lamported = rows <= self.attnres.lamport_max_rows
         # Rows past the push one-shot's inbox reduce through the two-shot.
         pushed = (
             partial.numel() <= self.attnres.max_numel and rows <= self.attnres.max_rows
@@ -937,7 +958,7 @@ class K3IrisState:
             and partial.numel() <= self.two_shot_max_numel
             and partial.is_contiguous()
         )
-        return (pushed or reduced) and attnres_supported(
+        return (lamported or pushed or reduced) and attnres_supported(
             partial,
             residual,
             score_weight,
@@ -960,11 +981,17 @@ class K3IrisState:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return normalized AttnRes output and the accumulated residual.
 
-        The partial reduces through the Lamport one-shot (below 8 rows) or
-        two-shot mailboxes, in the fused kernel's ascending rank order, and
-        a row epilogue finishes it; the fused push one-shot serves the rest.
+        Within the state's Lamport window one fused Lamport two-shot reduces
+        and finishes the partial. Otherwise it reduces through the Lamport
+        one-shot (below 8 rows) or two-shot mailboxes, in the fused kernel's
+        ascending rank order, and a row epilogue finishes it; the fused push
+        one-shot serves the rest.
         """
         assert self.attnres is not None
+        if partial.shape[0] <= self.attnres.lamport_max_rows:
+            return self.attnres.lamport(
+                partial, residual, score_weight, output_weight, scratch, eps
+            )
         reduced = (
             self._reduce_attention_lamport(partial) if partial.is_contiguous() else None
         )
@@ -1100,7 +1127,11 @@ def prepare_k3_communication(
     )
     if attnres_max_numel:
         total_bytes += IrisAttnResState.heap_bytes(
-            attnres_max_numel, attnres_max_rows, world_size, dtype
+            attnres_max_numel,
+            attnres_max_rows,
+            world_size,
+            dtype,
+            lamport_max_rows=_k3_attnres_lamport_rows(world_size, enable_lamport),
         )
     if enable_lamport and ProducerLamport.supported(world_size, dtype):
         lamport_numel = _k3_lamport_numel(producer_direct_max_numel)
