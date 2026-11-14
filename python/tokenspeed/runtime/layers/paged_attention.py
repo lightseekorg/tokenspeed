@@ -333,6 +333,30 @@ class PagedAttention(nn.Module):
             override=None,
         )
 
+    def write_kv_at(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        positions: torch.Tensor,
+        slots: torch.Tensor,
+        ctx: ForwardContext,
+    ) -> None:
+        """The prologue's head steps, writing K/V to ``slots`` (0 for a padded row)."""
+        norm, rotary = self._steps(positions)
+        gqa_prologue(
+            q,
+            k,
+            v,
+            norm=norm,
+            rotary=rotary,
+            cache=self._local_target(slots, ctx),
+            query_dtype=ctx.attn_backend.query_dtype(self, ctx.forward_mode, q.dtype),
+            return_kv=False,
+            solution=None,
+            override=None,
+        )
+
     def relative_prologue(
         self,
         q: torch.Tensor,

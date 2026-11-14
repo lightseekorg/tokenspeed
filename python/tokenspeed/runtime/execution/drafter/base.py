@@ -61,6 +61,9 @@ if TYPE_CHECKING:
 # Extend-round graph series: step 0 (--enable-drafter-prefill-graph), decode steps.
 EXTEND_STEP0_SERIES = "prefill:drafter-step0"
 EXTEND_DECODE_SERIES = "prefill:drafter-decode"
+# A split extend round's draft K/V writer, one graph over a fixed tile of rows.
+EXTEND_KV_SERIES = "prefill:drafter-kv"
+EXTEND_KV_TILE_ROWS = 2048
 # Rounds admit a few requests each; one with more runs its decode steps eager.
 EXTEND_DECODE_MAX_REQUESTS = 16
 
