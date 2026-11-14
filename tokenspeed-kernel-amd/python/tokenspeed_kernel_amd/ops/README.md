@@ -2517,6 +2517,41 @@ weights, and divide out that factor at normalization. The projected-value API
 applies the existing value projection to the latent output. Graph replay reads
 updated page tables and lengths in place.
 
+### gfx950 MLA query-row decode
+
+`gluon_mla_decode_query_rows_gfx950` decodes up to 16 query rows per request
+whose visible lengths need not follow a causal offset, such as a KVP rank's
+local lengths for a draft block. The MLA DCP decode takes it for the drafter
+under KVP through `mla_decode_query_rows`.
+
+#### Contract
+
+- Queries are BF16 or FP8 E4M3 `(requests, queries, heads, 576)` with 1 to 16
+  queries and a contiguous last dimension. The cache is a contiguous FP8
+  `(pages, 64, 1, 576)`; FP8 queries require an E4M3 cache.
+- The page table is Int32 `(requests, pages)` with a unit inner stride, one
+  row per request. Row lengths are a contiguous Int32 `(requests, queries)`:
+  query `j` of request `i` sees the first `row_lengths[i, j]` tokens.
+- The output is BF16 `(requests, queries, heads, 512)`, with an optional FP32
+  log-sum-exp `(requests, queries, heads)` in natural-log units. A row with
+  no visible token has zero output and a negative-infinity log-sum-exp.
+
+#### Algorithm
+
+A program holds 64 (query, head) rows of one request and loads each 64-token
+KV tile once for all of them; each row masks the tile by its own length. FP8
+queries keep the FP8 MFMA and the scaled FP8 probabilities of the folded
+FP8 decode. BF16 queries widen the FP8 tile to BF16 in registers, as the
+folded BF16 decode does. Only the reduction order differs from the folded
+kernels.
+
+Each program needs one CU, so the split count is the one of at most 32, at
+most about three waves of 256 workgroups and at least four KV tiles per split,
+whose grid fills its last wave best. Splits store BF16 partials in a
+power-of-two bucket, and a second kernel merges them by log-sum-exp. The split
+count and page-table stride are runtime arguments, so batch sizes and table
+widths that keep the split count reuse one binary.
+
 ### gfx1250 general biased-sigmoid top-k
 
 `gluon_sigmoid_bias_topk_route_gfx1250` selects experts for shapes outside

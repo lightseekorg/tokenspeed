@@ -1442,6 +1442,140 @@ def mla_decode_with_kvcache(
         return kernel(**kernel_kwargs)
 
 
+def _mla_decode_query_rows_traits(
+    *,
+    q_len: int,
+    page_size: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    return_lse: bool,
+) -> dict:
+    return {
+        "q_len": q_len,
+        "page_size": page_size,
+        "kv_lora_rank": kv_lora_rank,
+        "qk_rope_head_dim": qk_rope_head_dim,
+        "return_lse": return_lse,
+    }
+
+
+def supports_mla_decode_query_rows(
+    *,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    page_size: int,
+    q_len: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    return_lse: bool,
+    solution: str | None = None,
+) -> bool:
+    """Whether a kernel runs :func:`mla_decode_query_rows` for this shape."""
+    try:
+        select_kernel(
+            "attention",
+            "mla_decode_query_rows",
+            format_signature(
+                q=dense_tensor_format(q_dtype),
+                kv_cache=dense_tensor_format(kv_dtype),
+            ),
+            traits=_mla_decode_query_rows_traits(
+                q_len=q_len,
+                page_size=page_size,
+                kv_lora_rank=kv_lora_rank,
+                qk_rope_head_dim=qk_rope_head_dim,
+                return_lse=return_lse,
+            ),
+            solution=solution,
+        )
+    except NoKernelFoundError:
+        return False
+    return True
+
+
+def mla_decode_query_rows(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    row_lengths: torch.Tensor,
+    max_seqlen_k: int,
+    softmax_scale: float,
+    *,
+    kv_lora_rank: int,
+    return_lse: bool = False,
+    solution: str | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """MLA decode of every query row of a request against its one page-table row.
+
+    Unlike :func:`mla_decode_with_kvcache` on the query axis, the visible
+    length is given per query row rather than derived from a causal offset,
+    so rows whose lengths follow no fixed pattern (a KVP rank's local causal
+    lengths) still share the request's KV reads.
+
+    Args:
+        q: Queries ``[requests, queries, heads, kv_lora_rank + rope_dim]``.
+        kv_cache: Paged latent cache ``[pages, page_size, 1, head_dim]``.
+        page_table: Int32 ``[requests, pages]``.
+        row_lengths: Int32 ``[requests, queries]``: query ``j`` of request
+            ``i`` attends the first ``row_lengths[i, j]`` tokens.
+        max_seqlen_k: Host-side upper bound on ``row_lengths``.
+        softmax_scale: Scale applied to QK logits.
+        kv_lora_rank: MLA latent width; the rest of the query is RoPE.
+        return_lse: Also return the natural-log LSE ``[requests, queries, heads]``.
+        solution: Optional solution to pin.
+        out: Optional output ``[requests, queries, heads, kv_lora_rank]``.
+
+    Returns:
+        The latent output, or ``(output, lse)`` when ``return_lse``. Rows with
+        no visible tokens have zero output and negative-infinity LSE.
+    """
+    traits = _mla_decode_query_rows_traits(
+        q_len=q.shape[1],
+        page_size=kv_cache.shape[1],
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=q.shape[-1] - kv_lora_rank,
+        return_lse=return_lse,
+    )
+    signature = _attention_format_signature(q=q, kv_cache=kv_cache)
+    kernel = select_kernel(
+        "attention",
+        "mla_decode_query_rows",
+        signature,
+        traits=traits,
+        solution=solution,
+    )
+    shape_params = {
+        "batch_size": q.shape[0],
+        "q_len": q.shape[1],
+        "num_q_heads": q.shape[2],
+        "num_pages": kv_cache.shape[0],
+        "page_size": kv_cache.shape[1],
+        "max_pages_per_seq": page_table.shape[1],
+        "max_seqlen_k": max_seqlen_k,
+    }
+    ShapeCapture.get().record(
+        "attention", "mla_decode_query_rows", kernel.name, q.dtype, shape_params
+    )
+    with kernel_scope(
+        "attention",
+        "mla_decode_query_rows",
+        q.dtype,
+        kernel_name=kernel.name,
+        **shape_params,
+    ):
+        return kernel(
+            q,
+            kv_cache,
+            page_table,
+            row_lengths,
+            max_seqlen_k,
+            softmax_scale,
+            return_lse=return_lse,
+            out=out,
+        )
+
+
 # Backend registration (side-effect imports)
 # isort: off
 import tokenspeed_kernel.ops.attention.mla.cuda  # noqa: E402,F401
@@ -1468,5 +1602,7 @@ __all__ = [
     "mla_use_absorbed_extend",
     "mla_extend_with_kvcache",
     "supports_mla_decode_query_blocks",
+    "supports_mla_decode_query_rows",
     "mla_decode_with_kvcache",
+    "mla_decode_query_rows",
 ]
