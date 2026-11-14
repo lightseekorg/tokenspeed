@@ -35,7 +35,7 @@ mkdir -p "logs/$label"
 out="$root/logs/$label"
 
 if [[ ${TS_TEST_LOGICAL_NS:-0} != 1 ]]; then
-    exec 9>/var/tmp/tokenspeed-nccl-validation-h200-5-6-7.lock
+    exec 9>"${TS_TEST_LOCK_FILE:-/var/tmp/tokenspeed-logical-two-node-validation.lock}"
     flock -n 9
     nvidia-smi --query-gpu=index,memory.used,utilization.gpu \
         --format=csv,noheader,nounits > "$out/devices-before.csv"
@@ -75,15 +75,13 @@ nsenter -t "$peer" -n ip link set tsnet up
 } > "$out/network.log"
 
 export CUDA_DEVICE_ORDER=PCI_BUS_ID OMP_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1
-export LD_LIBRARY_PATH=/opt/nccl-mt/lib:${LD_LIBRARY_PATH:-}
 export NCCL_P2P_DISABLE=1 NCCL_SHM_DISABLE=1 NCCL_IB_DISABLE=1 NCCL_NET=Socket
 export NCCL_CUMEM_HOST_ENABLE=0
 export NCCL_SOCKET_IFNAME='=tsnet' GLOO_SOCKET_IFNAME=tsnet
 export NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NET,GRAPH,P2P NCCL_GRAPH_REGISTER=0
 export NCCL_DEBUG_FILE="$out/nccl.%p.log"
-export LD_LIBRARY_PATH=/usr/local/conda/lib/python3.11/site-packages/nvidia/cuda_runtime/lib:$LD_LIBRARY_PATH
 rc=0
-timeout -s TERM -k 20 285 python3 "$harness/test_cuda_two_node.py" \
+timeout -s TERM -k 20 285 "${TS_TEST_PYTHON:-python3}" "$harness/test_cuda_two_node.py" \
     --netns-1 "/proc/$peer/ns/net" --output "$out/serving" "$@" || rc=$?
 printf '%s\n' "$rc" > "$out/serving.exit"
 exit "$rc"

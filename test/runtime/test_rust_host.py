@@ -28,6 +28,7 @@ and scheduler, with a CPU stand-in for the model executor.
 from __future__ import annotations
 
 import os
+import re
 import signal
 import stat
 import sys
@@ -46,6 +47,10 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 register_cuda_ci(est_time=60, suite="runtime-1gpu")
 
 from test.l3_test_utils import storage_scheduler  # noqa: E402
+from test.runtime.distributed.cuda_memory_protocol.test_launcher_context_cpu import (  # noqa: E402
+    conflicting_preload_cases,
+    preload_cases,
+)
 
 from tokenspeed_scheduler import (  # noqa: E402
     AttnKind,
@@ -275,28 +280,21 @@ def test_spawned_host_inherits_start_context_environment(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "inherited_preload, keep_inherited",
+    "inherited_preload, configured_preload, expected_preload",
     [
-        (None, False),
-        ("/test/another-hook.so", False),
-        ("/test/torch_memory_saver_custom.so:/test/another-hook.so", True),
+        pytest.param(*case[1:], id=case[0])
+        for prepend in (False, True)
+        for case in preload_cases(prepend_hook=prepend)
     ],
 )
-@pytest.mark.parametrize("prepend_hook", [False, True])
 def test_spawned_host_inherits_environment_from_start_context(
-    tmp_path, monkeypatch, inherited_preload, keep_inherited, prepend_hook
+    tmp_path, monkeypatch, inherited_preload, configured_preload, expected_preload
 ):
     if inherited_preload is None:
         monkeypatch.delenv("LD_PRELOAD", raising=False)
     else:
         monkeypatch.setenv("LD_PRELOAD", inherited_preload)
     monkeypatch.setenv("LD_LIBRARY_PATH", "/original")
-    hook = "/test/torch_memory_saver_hook_mode_preload.so"
-    configured_preload = (
-        f"{hook}:{inherited_preload}"
-        if prepend_hook and inherited_preload is not None
-        else hook
-    )
 
     @contextmanager
     def start_context():
@@ -321,8 +319,7 @@ def test_spawned_host_inherits_environment_from_start_context(
     proc, reader = start_rust_host(binary, *_rank_args(0), start_context(), None, False)
     try:
         (ready,) = receive_ready_messages([reader], [proc])
-        expected = inherited_preload if keep_inherited else configured_preload
-        assert ready["preload"] == expected
+        assert re.split(r"[:\s]+", ready["preload"]) == expected_preload.split(":")
         assert ready["library_path"] == "/test/runtime:/original"
         assert os.environ.get("LD_PRELOAD") == inherited_preload
         assert os.environ["LD_LIBRARY_PATH"] == "/original"
@@ -330,6 +327,31 @@ def test_spawned_host_inherits_environment_from_start_context(
         reader.close()
         proc.terminate()
         proc.join(timeout=10)
+
+
+@pytest.mark.parametrize(
+    "inherited_preload, configured_preload",
+    [pytest.param(*case[1:], id=case[0]) for case in conflicting_preload_cases()],
+)
+def test_conflicting_memory_saver_hooks_are_refused_before_spawn(
+    monkeypatch, inherited_preload, configured_preload
+):
+    if inherited_preload is None:
+        monkeypatch.delenv("LD_PRELOAD", raising=False)
+    else:
+        monkeypatch.setenv("LD_PRELOAD", inherited_preload)
+
+    @contextmanager
+    def start_context():
+        with monkeypatch.context() as launch_env:
+            launch_env.setenv("LD_PRELOAD", configured_preload)
+            yield
+
+    with pytest.raises(ValueError, match="multiple memory-saver preload hooks"):
+        start_rust_host(
+            "unused-test-host", *_rank_args(0), start_context(), None, False
+        )
+    assert os.environ.get("LD_PRELOAD") == inherited_preload
 
 
 def test_a_host_that_dies_before_ready_fails_the_launch(tmp_path):

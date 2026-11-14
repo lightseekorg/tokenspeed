@@ -19,6 +19,7 @@
 # SOFTWARE.
 
 from contextlib import nullcontext
+from test.ci_system.ci_register import register_cuda_ci
 from types import SimpleNamespace
 
 import pytest
@@ -30,6 +31,9 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.model_executor import ModelExecutor
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.logits_processor_output import LogitsProcessorOutput
+
+# CPU regressions use the runtime job's complete dependency environment.
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 
 class _RuntimeStates:
