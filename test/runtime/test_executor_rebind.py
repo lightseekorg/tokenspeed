@@ -208,7 +208,7 @@ def test_capture_hands_both_owners_the_entries_and_the_drafter_its_window(
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.device = "cuda"
     # A drafter's own prefill graph does not wait for the extend-graph switch.
-    executor.config = SimpleNamespace(enable_drafter_prefill_graph=False)
+    executor.config = SimpleNamespace(disable_drafter_prefill_graph=True)
     executor.forward_step = SimpleNamespace(
         disable=False,
         stream="stream",

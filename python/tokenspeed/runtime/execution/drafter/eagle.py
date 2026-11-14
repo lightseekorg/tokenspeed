@@ -867,7 +867,7 @@ class Eagle(HiddenStateDrafter):
     # over one row per request. Both are recorded as breakable graphs: the QSA
     # indexer and attention cores stay at their eager breaks (they read the
     # live metadata), and so do the steps that publish backend state
-    # (``run_eager``). Step 0's graph (--enable-drafter-prefill-graph) pads
+    # (``run_eager``). Step 0's graph (unless --disable-drafter-prefill-graph) pads
     # the rows to a target prefill token bucket and bakes its request count
     # (the rows after the narrowing); the decode steps' graph bakes the
     # request count alone and follows step 0 eager or replayed. A round
@@ -903,8 +903,8 @@ class Eagle(HiddenStateDrafter):
         passes it (the narrowed rows attend in DECODE mode under step 0's
         EXTEND context; a backend that substitutes the ambient context's mode
         would not). It bakes what the decode steps bake, at any step count,
-        and runs on one rank: the tensor- and expert-parallel collectives of
-        the narrowed step are not validated.
+        and shares their one replay decision across the ranks that run the
+        round's collectives; a query shard or sharded KV never replays it.
         """
         return (
             bool(
@@ -919,7 +919,9 @@ class Eagle(HiddenStateDrafter):
             and not self.draft_reads_token_history
             and not self._model_shares_mtp_topk()
             and self.dp_size == 1
-            and self.world_size == 1
+            and self.draft_model_runner.mapping.pp_size == 1
+            and not self.draft_model_runner.mapping.attn.has_qcp
+            and not self.draft_model_runner.mapping.attn.has_kvp
         )
 
     @override

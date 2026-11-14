@@ -246,8 +246,7 @@ def _ladders(executor: ModelExecutor, entries: int) -> dict[str, CapturedLadder]
             if executor.captures_drafter_prefill_graph
             else {}
         ),
-        # The drafter's extend graphs (--enable-drafter-prefill-graph): their
-        # own private pool too, and their plan's series.
+        # The drafter's extend graphs: their own private pool and plan series.
         **executor.drafter_extend_ladders(entries),
     }
 

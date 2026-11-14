@@ -61,8 +61,8 @@ def test_draft_prefill_capture_uses_the_resolved_prefill_gate(
     # A real instance, so the gate resolves the production property.
     executor = model_executor.ModelExecutor.__new__(model_executor.ModelExecutor)
     executor.device = "cuda"
-    # Without --enable-drafter-prefill-graph: the declaration alone decides.
-    executor.config = Mock(enable_drafter_prefill_graph=False)
+    # With the step-0 graphs off the declaration alone decides.
+    executor.config = Mock(disable_drafter_prefill_graph=True)
     executor.forward_step = Mock(disable=decode_disabled)
     executor.prefill_graph = Mock(disable=prefill_disabled)
     # Explicit: a bare Mock answers truthily, so the gate below would hold anyway.

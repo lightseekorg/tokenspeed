@@ -774,7 +774,7 @@ class _ObserverDouble:
 class _CaptureConfig:
     """The ModelExecutorConfig fields capture_graphs() reads."""
 
-    enable_drafter_prefill_graph: bool = True
+    disable_drafter_prefill_graph: bool = False
     prefill_graph_capture_batch_sizes: list[int] | None = None
     context_len: int = 4096
     max_num_seqs: int = 4

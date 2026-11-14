@@ -21,12 +21,12 @@
 """The drafter's extend-round graphs without a GPU.
 
 Eagle records its extend round as breakable graphs: the decode steps per
-request count up to 16, and with ``--enable-drafter-prefill-graph`` step 0
+request count up to 16, and (unless ``--disable-drafter-prefill-graph``) step 0
 per (prefill token bucket, request count). These tests pin
 the plan the CUDA-graph memory projection prices, the capture order the probe
 pairs its readings with, the static buffers' sizing (and the target's hidden-row
 width and dtype it takes from the prefill graph), which graphs a round replays
-(and when it runs eager), and the launches the switch refuses. The
+(and when it runs eager), and what the switch turns off. The
 GPU-only steps of a capture (warmup forwards, stream capture) are replaced by
 recorders; ``test_drafter_prefill_graph_cuda.py`` replays real graphs.
 """
@@ -114,7 +114,7 @@ def test_the_plan_takes_the_target_buckets_at_their_request_counts() -> None:
         FIRST_STEP_SERIES: [(16, 1)]
     }
     # Its own prefill-graph hook stays undeclared: the extend graphs are a
-    # separate plan, captured only behind --enable-drafter-prefill-graph.
+    # separate plan.
     assert not drafter.captures_prefill_graph
 
 
@@ -126,7 +126,7 @@ def test_the_decode_steps_stop_at_sixteen_requests() -> None:
     assert plan[DECODE_STEPS_SERIES] == [(bs, bs) for bs in range(16, 0, -1)]
 
 
-@pytest.mark.parametrize("setup", ["tensor_parallel", "undeclared_draft"])
+@pytest.mark.parametrize("setup", ["undeclared_draft", "query_shard", "sharded_kv"])
 def test_the_decode_steps_record_without_step_0(setup) -> None:
     model = ToyDraftModel("cpu")
     if setup == "undeclared_draft":
@@ -134,11 +134,22 @@ def test_the_decode_steps_record_without_step_0(setup) -> None:
         # draft attends inside one unbroken call).
         model.supports_breakable_draft_extend = False
     drafter, _ = make_eagle(
-        model=model, world_size=2 if setup == "tensor_parallel" else 1
+        model=model,
+        qcp_size=2 if setup == "query_shard" else 1,
+        kvp_size=2 if setup == "sharded_kv" else 1,
     )
 
     assert drafter.extend_graph_plan([16, 32], lambda _bucket: [1]) == {
         DECODE_STEPS_SERIES: [(4, 4), (3, 3), (2, 2), (1, 1)]
+    }
+
+
+def test_tensor_parallel_ranks_record_step_0_and_the_decode_steps() -> None:
+    drafter, _ = make_eagle(world_size=2)
+
+    assert drafter.extend_graph_plan([16, 32], lambda _bucket: [1]) == {
+        FIRST_STEP_SERIES: [(32, 1), (16, 1)],
+        DECODE_STEPS_SERIES: [(4, 4), (3, 3), (2, 2), (1, 1)],
     }
 
 
@@ -331,7 +342,7 @@ def _target_prefill_graph() -> prefill_graph_module.PrefillGraph:
         prefill_only=False,
         decode_only_attention=False,
         prefill_graph_capture_batch_sizes=None,
-        enable_drafter_prefill_graph=True,
+        disable_drafter_prefill_graph=False,
         input_logprob_chunk_tokens=1024,
         enable_speculative_sampling=False,
         query_shard_size=1,
@@ -506,71 +517,25 @@ def test_run_eager_is_a_direct_call_outside_a_capture() -> None:
 
 
 # ----------------------------------------------------------------------
-# The launches the switch refuses.
+# The switch.
 # ----------------------------------------------------------------------
 
 
-def _args(**overrides) -> ServerArgs:
-    kwargs = dict(
-        model="x",
-        speculative_algorithm="MTP",
-        enable_drafter_prefill_graph=True,
-    )
-    kwargs.update(overrides)
-    return ServerArgs(**kwargs)
-
-
 def test_the_switch_is_off_by_default_and_parses() -> None:
-    assert ServerArgs(model="x").enable_drafter_prefill_graph is False
+    assert ServerArgs(model="x").disable_drafter_prefill_graph is False
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
-    assert parser.parse_args(["--model", "x"]).enable_drafter_prefill_graph is False
+    assert parser.parse_args(["--model", "x"]).disable_drafter_prefill_graph is False
     assert parser.parse_args(
-        ["--model", "x", "--enable-drafter-prefill-graph"]
-    ).enable_drafter_prefill_graph
+        ["--model", "x", "--disable-drafter-prefill-graph"]
+    ).disable_drafter_prefill_graph
 
 
-@pytest.mark.parametrize("algorithm", ["MTP", "EAGLE3"])
-def test_a_single_rank_chain_drafter_resolves(algorithm) -> None:
-    extra = {} if algorithm == "MTP" else {"speculative_draft_model_path": "draft"}
-    assert _args(speculative_algorithm=algorithm, **extra).enable_drafter_prefill_graph
-
-
-@pytest.mark.parametrize(
-    "overrides, message",
-    [
-        ({"speculative_algorithm": None}, "needs a chain drafter"),
-        (
-            {"speculative_algorithm": "DFLASH", "speculative_draft_model_path": "d"},
-            "needs a chain drafter",
-        ),
-        (
-            {
-                "speculative_eagle_topk": 2,
-                "speculative_num_steps": 3,
-                "speculative_num_draft_tokens": 6,
-            },
-            "draft trees",
-        ),
-        (
-            {"enable_speculative_sampling": True, "sampling_backend": "flashinfer"},
-            "speculative-sampling",
-        ),
-        ({"attn_tp_size": 2}, "runs on one rank"),
-        ({"disable_prefill_graph": True}, "prefill CUDA graphs"),
-        ({"enforce_eager": True}, "prefill CUDA graphs"),
-    ],
-)
-def test_launches_the_graphs_cannot_serve_are_refused(overrides, message) -> None:
-    with pytest.raises(ValueError, match=message):
-        _args(**overrides)
-
-
-def _executor(*, enabled, prefill_graph_disabled, drafter):
-    """The executor state the boot-time verdict reads, without the GPU boot."""
+def _executor(*, disabled, prefill_graph_disabled, drafter):
+    """The executor state the boot-time plan reads, without the GPU boot."""
     executor = model_executor.ModelExecutor.__new__(model_executor.ModelExecutor)
     executor.config = SimpleNamespace(
-        enable_drafter_prefill_graph=enabled,
+        disable_drafter_prefill_graph=disabled,
         prefill_graph_capture_batch_sizes=None,
         context_len=4096,
         max_num_seqs=MAX_BS,
@@ -583,31 +548,25 @@ def _executor(*, enabled, prefill_graph_disabled, drafter):
     return executor
 
 
-def test_the_executor_refuses_a_boot_that_would_record_no_drafter_graph() -> None:
-    supported, _ = make_eagle()
-    model = ToyDraftModel("cpu")
-    model.supports_breakable_draft_extend = False
-    undeclared, _ = make_eagle(model=model)
+@pytest.mark.parametrize("disabled", [False, True])
+def test_the_executor_records_step_0_unless_switched_off(disabled) -> None:
+    drafter, _ = make_eagle()
+    executor = _executor(
+        disabled=disabled, prefill_graph_disabled=False, drafter=drafter
+    )
 
-    _executor(
-        enabled=True, prefill_graph_disabled=False, drafter=supported
-    )._validate_drafter_extend_graphs()
-    with pytest.raises(ValueError, match="prefill CUDA graph is off"):
-        _executor(
-            enabled=True, prefill_graph_disabled=True, drafter=supported
-        )._validate_drafter_extend_graphs()
-    with pytest.raises(ValueError, match="Eagle drafter records none"):
-        _executor(
-            enabled=True, prefill_graph_disabled=False, drafter=undeclared
-        )._validate_drafter_extend_graphs()
-    with pytest.raises(ValueError, match="no drafter"):
-        _executor(
-            enabled=True, prefill_graph_disabled=False, drafter=None
-        )._validate_drafter_extend_graphs()
-    # Without the switch nothing is required.
-    for drafter in (supported, undeclared, None):
+    plan = executor._drafter_extend_plan()
+
+    assert (FIRST_STEP_SERIES in plan) is not disabled
+    assert plan[DECODE_STEPS_SERIES] == [(4, 4), (3, 3), (2, 2), (1, 1)]
+
+
+def test_a_boot_without_the_prefill_graph_or_a_drafter_records_none() -> None:
+    drafter, _ = make_eagle()
+    for prefill_graph_disabled, engine_drafter in ((True, drafter), (False, None)):
         executor = _executor(
-            enabled=False, prefill_graph_disabled=True, drafter=drafter
+            disabled=False,
+            prefill_graph_disabled=prefill_graph_disabled,
+            drafter=engine_drafter,
         )
-        executor._validate_drafter_extend_graphs()
         assert not executor.captures_drafter_extend_graphs

@@ -287,12 +287,12 @@ inside these and pass through, and remain for callers that reach a backend
 directly. Prefill graphs capture the target model and replay a round with
 draft narrowing eagerly, so draft layers need no break. A narrowed draft
 step writes every row itself and skips the pre-break prologue. The drafter
-prefill graph (`--enable-drafter-prefill-graph`, see
+prefill graph (on unless `--disable-drafter-prefill-graph`, see
 [unified_path.md](unified_path.md#drafter-prefill-graphs)) records a draft's
 extend step only when the draft model declares
-`supports_breakable_draft_extend`: Qwen4-Exp's MTP head runs the GQA prologue
-in the captured segment and attends at `PagedAttention.attend`, like the
-target.
+`supports_breakable_draft_extend`: Qwen4-Exp's and Qwen3.5's MTP heads run the
+GQA prologue in the captured segment and attend at `PagedAttention.attend`,
+like the target.
 
 ## Formats and scales
 

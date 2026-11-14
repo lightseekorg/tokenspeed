@@ -824,8 +824,8 @@ class ServerArgs:
     prefill_graph_capture_sizes: list[int] | None = None
     # Request capacities for inline attention; unset keeps the minimum per bucket.
     prefill_graph_capture_batch_sizes: list[int] | None = None
-    # Replay the speculative drafter's extend-round work from CUDA graphs too.
-    enable_drafter_prefill_graph: bool = False
+    # Keep the drafter's step 0 eager in prefill rounds (graphed wherever supported).
+    disable_drafter_prefill_graph: bool = False
     cudagraph_capture_sizes: list[int] | None = None
     enable_nan_detection: bool = False
     enable_nvtx: bool = False
@@ -2123,47 +2123,6 @@ class ServerArgs:
                 f"that the fp32 sentinel threshold + 1.0 stays above it; got {threshold}"
             )
 
-    def validate_drafter_prefill_graph(self) -> None:
-        """Refuse ``--enable-drafter-prefill-graph`` launches it cannot serve.
-
-        The drafter's graphs record an Eagle chain's extend round beside the
-        target's prefill CUDA graphs, with the argmax proposal, on one rank
-        (attention DP decides replays per rank; the tensor-, expert- and
-        pipeline-parallel collectives inside the round are not validated).
-        Whether the loaded draft model supports it is known only at executor
-        build, which refuses it there.
-        """
-        if not self.enable_drafter_prefill_graph:
-            return
-        if self.speculative_algorithm not in STEP_SPEC_ALGORITHMS:
-            raise ValueError(
-                "--enable-drafter-prefill-graph needs a chain drafter "
-                f"(--speculative-algorithm {', '.join(STEP_SPEC_ALGORITHMS)}); "
-                f"got {self.speculative_algorithm}"
-            )
-        if self.speculative_draft_tree:
-            raise ValueError(
-                "--enable-drafter-prefill-graph records a draft chain; draft trees "
-                "(--speculative-eagle-topk > 1 or EAGLE-Harness) are not supported"
-            )
-        if self.enable_speculative_sampling:
-            raise ValueError(
-                "--enable-drafter-prefill-graph records the argmax proposal and "
-                "does not support --enable-speculative-sampling"
-            )
-        if self.mapping.world_size != 1:
-            raise ValueError(
-                "--enable-drafter-prefill-graph runs on one rank (no tensor, "
-                "expert, pipeline, attention-data or context parallelism); got "
-                f"{self.mapping.world_size} ranks"
-            )
-        if self.disable_prefill_graph or self.enforce_eager:
-            raise ValueError(
-                "--enable-drafter-prefill-graph records the drafter beside the "
-                "target's prefill CUDA graphs, which --disable-prefill-graph and "
-                "--enforce-eager turn off"
-            )
-
     def resolve_communication(self):
         # Auto-enable allreduce fusion on supported single-node TP configurations,
         # and for Beam on Hopper or newer at any node count: across nodes Beam's
@@ -2919,7 +2878,6 @@ class ServerArgs:
                 )
 
         self.validate_expert_placement_options()
-        self.validate_drafter_prefill_graph()
 
         if not self.disable_pdl:
             os.environ.setdefault("TORCHINDUCTOR_ENABLE_PDL", "1")
@@ -4507,29 +4465,29 @@ class ServerArgs:
             "Adding request counts increases capture time and memory. "
             "This does not replace the scheduler's --max-num-seqs limit. "
             "Batches without a fitting capacity retain the ordinary attention breaks. "
-            "With --enable-drafter-prefill-graph these request counts also select "
-            "the drafter's step-0 and decode-step graphs, which replay only at the "
-            "exact count (unset: one request per bucket, or the fewest that fit a "
-            "bucket longer than the context length).",
+            "Unless --disable-drafter-prefill-graph, these request counts also "
+            "select the drafter's step-0 graphs, which replay only at the exact "
+            "count (unset: one request per bucket, or the fewest that fit a bucket "
+            "longer than the context length).",
         )
         parser.add_argument(
-            "--enable-drafter-prefill-graph",
+            "--disable-drafter-prefill-graph",
             action="store_true",
-            default=ServerArgs.enable_drafter_prefill_graph,
-            help="Also replay the speculative drafter's extend step inside a "
-            "prefill forward from CUDA graphs, per prefill token bucket at each "
-            "exact request count of --prefill-graph-capture-batch-sizes (unset: "
-            "the fewest requests the bucket fits in the context length), with "
-            "attention at eager breaks; the draft's decode steps that follow the "
-            "extend step replay from graphs even without this switch. Only "
-            "pure-extend forwards at a captured request count replay; the others "
-            "run the step eagerly. The switch needs the prefill graph on one rank "
-            "(no TP, EP, PP or attention DP) and a chain "
-            "EAGLE-style drafter (no --speculative-eagle-topk > 1, no "
+            help="Run the speculative drafter's extend step (step 0) inside a "
+            "prefill forward eagerly. By default it replays from CUDA graphs per "
+            "prefill token bucket at each exact request count of "
+            "--prefill-graph-capture-batch-sizes (unset: the fewest requests the "
+            "bucket fits in the context length), with attention at eager breaks, "
+            "wherever supported: under tensor and expert parallelism (no PP, "
+            "attention DP or context parallelism), with a chain EAGLE-style "
+            "drafter (no --speculative-eagle-topk > 1, no "
             "--enable-speculative-sampling) whose draft model declares support "
-            "(Qwen4-Exp MTP without index_share_for_mtp_iteration); other launches "
-            "are refused. Its static buffers (the target's hidden rows at the "
-            "largest bucket) come out of the --gpu-memory-utilization headroom.",
+            "(Qwen4-Exp MTP without index_share_for_mtp_iteration, or Qwen3.5 "
+            "MTP); elsewhere step 0 runs eagerly. Only pure-extend forwards at a "
+            "captured request count replay. The draft's decode steps that follow "
+            "step 0 replay from graphs regardless of this switch. The graphs' "
+            "static buffers (the target's hidden rows at the largest bucket) come "
+            "out of the --gpu-memory-utilization headroom.",
         )
         parser.add_argument(
             "--enable-nan-detection",

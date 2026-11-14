@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Drafter prefill graph replays on a GPU (``--enable-drafter-prefill-graph``).
+"""Drafter prefill graph replays on a GPU.
 
 A real Eagle drafter over the toy draft model and backend
 (``drafter_prefill_graph_test_utils``) captures its extend-round graphs; each
@@ -391,7 +391,7 @@ def _engine(*, drafter_graph: bool):
         "--gpu-memory-utilization",
         "0.8",
         "--disable-kvstore",
-        *(["--enable-drafter-prefill-graph"] if drafter_graph else []),
+        *([] if drafter_graph else ["--disable-drafter-prefill-graph"]),
         *_EXTRA_ARGS,
     ]
     return WireDriver(
