@@ -350,6 +350,18 @@ def _run_cutedsl_decode(
         if split_kvs is not None
         else None
     )
+    backend._decode_split_tasks_buf = (
+        torch.tensor(
+            [
+                (request << 32) | split
+                for request, count in enumerate(split_kvs.tolist())
+                for split in range(count)
+            ],
+            dtype=torch.int64,
+        )
+        if split_kvs is not None
+        else None
+    )
 
     layer = SimpleNamespace(
         tp_q_head_num=1,
