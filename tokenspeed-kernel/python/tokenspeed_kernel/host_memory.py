@@ -109,6 +109,13 @@ def node_memory(numa_node: int) -> NodeMemory:
     MemFree alone undercounts: creating pinned memory reclaims clean page cache
     (such as checkpoint files just read), so free memory sits near the
     watermark while much more is available.
+
+    Args:
+        numa_node: Host NUMA node whose sysfs meminfo is read.
+
+    Returns:
+        The node's memory in bytes. Its ``available`` counts clean page cache
+        and reclaimable kernel memory as well as free memory.
     """
     fields = {}
     meminfo = _NODE_ROOT / f"node{numa_node}" / "meminfo"
@@ -324,6 +331,9 @@ def _round_up(value: int, multiple: int) -> int:
 
 def host_numa_node(device_index: int) -> int | None:
     """The host NUMA node of a GPU (``CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID``).
+
+    Args:
+        device_index: CUDA device whose host NUMA node is queried.
 
     Returns:
         The node id, or None off NVIDIA or when the GPU reports none.
