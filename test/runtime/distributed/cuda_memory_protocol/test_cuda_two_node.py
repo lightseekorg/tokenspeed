@@ -169,23 +169,49 @@ def node_env(args, node, devices):
 
 
 def stop_processes(processes):
-    for process in processes:
-        if process.poll() is None:
-            process.terminate()
-    deadline = time.monotonic() + 40
-    for process in processes:
+    signals = (signal.SIGALRM, signal.SIGTERM)
+    handlers = {signum: signal.getsignal(signum) for signum in signals}
+    pending = []
+
+    def defer(signum, frame):
+        if handlers[signum] != signal.SIG_IGN and not pending:
+            pending.append((signum, frame))
+
+    # A deadline must still fail the test, but only after our launchers are
+    # reaped. A main-thread signal mask alone cannot protect against signals
+    # delivered through the controller's background threads.
+    try:
+        for signum in signals:
+            signal.signal(signum, defer)
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+        deadline = time.monotonic() + 40
+        for process in processes:
+            try:
+                process.wait(timeout=max(0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                pass
+        # Reap the exact process group started for this launcher.
+        for process in processes:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=5)
+        return [process.returncode for process in processes]
+    finally:
         try:
-            process.wait(timeout=max(0, deadline - time.monotonic()))
-        except subprocess.TimeoutExpired:
-            pass
-    # Reap the exact process group started for this launcher.
-    for process in processes:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        process.wait(timeout=5)
-    return [process.returncode for process in processes]
+            signal.signal(signal.SIGALRM, handlers[signal.SIGALRM])
+        finally:
+            signal.signal(signal.SIGTERM, handlers[signal.SIGTERM])
+        if pending:
+            signum, frame = pending[0]
+            handler = handlers[signum]
+            if callable(handler):
+                handler(signum, frame)
+            else:
+                signal.raise_signal(signum)
 
 
 def observe_mixed(wire, processes, timeout):

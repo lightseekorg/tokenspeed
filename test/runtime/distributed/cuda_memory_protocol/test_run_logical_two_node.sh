@@ -81,7 +81,9 @@ export NCCL_SOCKET_IFNAME='=tsnet' GLOO_SOCKET_IFNAME=tsnet
 export NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=INIT,NET,GRAPH,P2P NCCL_GRAPH_REGISTER=0
 export NCCL_DEBUG_FILE="$out/nccl.%p.log"
 rc=0
-timeout -s TERM -k 20 285 "${TS_TEST_PYTHON:-python3}" "$harness/test_cuda_two_node.py" \
+# Allow a 250s case, 40s shared shutdown grace, two 5s reaps, and startup margin.
+# The final kill must also leave enough time to finish bounded cleanup on TERM.
+timeout -s TERM -k 60 330 "${TS_TEST_PYTHON:-python3}" "$harness/test_cuda_two_node.py" \
     --netns-1 "/proc/$peer/ns/net" --output "$out/serving" "$@" || rc=$?
 printf '%s\n' "$rc" > "$out/serving.exit"
 exit "$rc"
