@@ -30,8 +30,14 @@ import torch.distributed as dist
 
 
 class ExecutionStream:
+    def __init__(self):
+        self.synchronized = False
+
+    def wait_stream(self, stream):
+        raise AssertionError("Prefill must not insert cross-stream waits")
+
     def synchronize(self):
-        pass
+        self.synchronized = True
 
 
 class NpuDevice:
@@ -41,6 +47,9 @@ class NpuDevice:
     def current_stream(self, device):
         return self.stream
 
+    def is_available(self):
+        return False
+
 
 @pytest.fixture
 def transport_class(monkeypatch):
@@ -49,8 +58,7 @@ def transport_class(monkeypatch):
     monkeypatch.setitem(sys.modules, "torch_npu", npu)
     monkeypatch.setitem(sys.modules, "flash_ops", ModuleType("flash_ops"))
     monkeypatch.setattr(torch, "npu", NpuDevice(), raising=False)
-    # CPU lacks stream-aware storage. All byte copies still execute for real.
-    monkeypatch.setattr(torch.Tensor, "record_stream", lambda self, stream: None)
+
     monkeypatch.setattr(
         torch.ops.custom, "dsa_cp_patch", lambda *args, **kw: args[3], raising=False
     )
@@ -247,9 +255,7 @@ def test_patch_copies_router_slots_into_owned_native_buffer(
     runtime.close()
 
 
-def test_history_ensure_rejects_stale_batch_and_different_stream(
-    transport_class, monkeypatch
-):
+def test_history_ensure_rejects_stale_batch(transport_class, monkeypatch):
     cls, _ = transport_class
     monkeypatch.setattr(dist, "get_rank", lambda: 0)
     monkeypatch.setattr(dist, "get_process_group_ranks", lambda group: [0])
@@ -275,6 +281,93 @@ def test_history_ensure_rejects_stale_batch_and_different_stream(
         runtime.prefetch(2, cache, None, **options)
     with pytest.raises(RuntimeError, match="different batch/layer"):
         runtime.prefetch(1, cache, None, **(options | {"batch_key": object()}))
-    torch.npu.stream = ExecutionStream()
-    with pytest.raises(RuntimeError, match="original execution stream"):
-        runtime.gather_current(1, cache[:1], width=576, total_rows=1)
+    runtime.finish(1)
+    runtime.close()
+
+
+@pytest.mark.parametrize("has_index", [False, True])
+@pytest.mark.parametrize("same_stream", [False, True])
+def test_ordered_stream_handoffs_keep_exact_bytes(
+    transport_class, monkeypatch, has_index, same_stream
+):
+    cls, _ = transport_class
+    monkeypatch.setattr(dist, "get_rank", lambda: 0)
+    cache = payload(256, 576, 9)
+    index = payload(256, 128, 19) if has_index else None
+    runtime = cls(
+        cache,
+        index,
+        ranks=(0,),
+        history_group=None,
+        max_current_rows=2,
+        history_null_rows=128,
+    )
+    warmup_stream = ExecutionStream()
+    serving_stream = warmup_stream if same_stream else ExecutionStream()
+    next_stream = serving_stream if same_stream else ExecutionStream()
+    key = object()
+    options = dict(
+        batch_key=key,
+        total_rows=2,
+        has_history=True,
+        history_slots=torch.tensor([128, 129]),
+        history_counts=(2,),
+    )
+    previous = None
+    for step, stream in enumerate(
+        (warmup_stream, warmup_stream, serving_stream, serving_stream, next_stream)
+    ):
+        if previous is not None and stream is not previous:
+            # Startup completes warmup; other callers must also order a handoff.
+            previous.synchronize()
+        torch.npu.stream = stream
+        runtime.prefetch(3, cache, index, **options)
+        exact(runtime.kv[128:130], cache[128:130])
+        if has_index:
+            exact(runtime.index[128:130], index[128:130])
+            current_index = payload(2, 128, 20 + step)
+            runtime.gather_current(3, current_index, width=128, total_rows=2)
+        current = payload(2, 576, 10 + step)
+        runtime.gather_current(3, current, width=576, total_rows=2)
+        exact(runtime.kv[130:132], current)
+        if has_index:
+            exact(runtime.index[130:132], current_index)
+        runtime.finish(3)
+        assert runtime.workspace_bytes == 0
+        previous = stream
+    assert not next_stream.synchronized
+    runtime.close()
+    assert not next_stream.synchronized
+
+
+@pytest.mark.parametrize("has_index", [False, True])
+def test_close_releases_active_prefill(transport_class, monkeypatch, has_index):
+    cls, _ = transport_class
+    monkeypatch.setattr(dist, "get_rank", lambda: 0)
+    cache = payload(256, 576, 7)
+    index = payload(256, 128, 17) if has_index else None
+    runtime = cls(
+        cache,
+        index,
+        ranks=(0,),
+        history_group=None,
+        max_current_rows=1,
+        history_null_rows=128,
+    )
+    stream = torch.npu.stream
+    options = dict(
+        batch_key=object(),
+        total_rows=1,
+        has_history=False,
+        history_slots=torch.empty(0, dtype=torch.int64),
+        history_counts=(0,),
+    )
+    runtime.prefetch(1, cache, index, **options)
+    assert runtime.workspace_bytes > 0
+    assert not stream.synchronized
+    runtime.close()
+    assert not stream.synchronized
+    assert runtime.workspace_bytes == 0
+    runtime.close()
+    with pytest.raises(RuntimeError, match="transport is closed"):
+        runtime.prefetch(1, cache, index, **options)

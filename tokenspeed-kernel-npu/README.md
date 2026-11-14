@@ -154,7 +154,7 @@ PYTHONPATH="${PWD}/python:${PWD}/tokenspeed-kernel/python:${PWD}/tokenspeed-kern
 ### DSA/MLA Prefill transport
 
 Prefill uses official HCCL collectives and the `flash_ops`
-`custom::dsa_cp_patch` ACLNN adapter. The transport owns an isolated HCCL group
+`custom::dsa_cp_patch` ACLNN adapter. The transport uses an isolated HCCL group
 for cache owners, with no additional user-managed communication stream.
 Synchronous submissions order HCCL's internal stream before subsequent work
 on the fixed execution stream; they need no application-owned Work handles.
@@ -170,13 +170,12 @@ Cache inputs accept contiguous `[rows,width]` and `[rows,1,width]`.
 
 Receive planes, packets, and commit slots are temporary. Prefetch may be called
 at KDA; the attention entry ensures it was submitted once for the same batch
-and layer. Concurrent consumption by another batch/layer is rejected. Tensor
-references and `record_stream` preserve storage through HCCL, unpacking,
-patching and attention. `finish` releases references after the final queued
-consumer. Shutdown drains execution before releasing the group. The transport
-records its peak owned buffer bytes; serving acceptance also measures device
-allocation/reservation peaks. `chunk_prefill_kv_size` only controls scheduler
-admission and never enables transport or fixes its buffer size.
+and layer. Concurrent consumption by another batch/layer is rejected. `finish`
+and `close` release temporary references without synchronizing; the runtime
+manager owns the collective group. The transport records its peak owned buffer
+bytes; serving acceptance also measures device allocation/reservation peaks.
+`chunk_prefill_kv_size` only controls scheduler admission and never enables
+transport or fixes its buffer size.
 
 Run `test/test_mla_cp_transport.py` with `torchrun` and an explicit `TEST_OUTPUT`
 directory. It covers compact shared history pages, empty/uneven owners, both
