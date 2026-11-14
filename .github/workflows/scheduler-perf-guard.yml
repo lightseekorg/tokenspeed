@@ -117,8 +117,12 @@ jobs:
               -DTOKENSPEED_SCHEDULER_BUILD_TESTS=ON \
               -DTOKENSPEED_SCHEDULER_BUILD_PYTHON=OFF
             for target in tokenspeed_scheduler_full_cache_benchmark tokenspeed_scheduler_decode_rounds_benchmark; do
-              # A base that predates a benchmark has no such target.
-              if cmake --build tokenspeed-scheduler/build --target "$target"; then
+              # A base that predates a benchmark has no such target. Remove
+              # the other revision's binary first: some Ninja versions report
+              # an unknown target whose file exists as up to date.
+              rm -f "tokenspeed-scheduler/build/$target"
+              if cmake --build tokenspeed-scheduler/build --target "$target" \
+                && [ -x "tokenspeed-scheduler/build/$target" ]; then
                 cp "tokenspeed-scheduler/build/$target" "bench/$side/"
               elif [ "$side" = candidate ]; then
                 exit 1
