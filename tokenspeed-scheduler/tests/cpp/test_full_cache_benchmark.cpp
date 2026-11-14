@@ -18,6 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+#include "decode_round_benchmark.h"
 #include "full_cache_benchmark.h"
 
 namespace tokenspeed::benchmark {
@@ -127,6 +128,34 @@ TEST(FullCacheBenchmark, AlignsFractionalHitRatesToFullPages) {
     EXPECT_EQ(config.EvictedPages(), 22960);
     EXPECT_NO_THROW(config.Validate());
     EXPECT_THROW((FullCacheConfig{100, 64, 131072, 16, 30}.Validate()), std::runtime_error);
+}
+
+TEST(DecodeRoundBenchmark, MeasuresRoundsWhoseTablesGrow) {
+    // Two tokens per round: every request crosses a page every other round.
+    const DecodeRoundConfig config{
+        .page_size = 4, .context_tokens = 32, .num_requests = 3, .decode_tokens = 2, .num_rounds = 10};
+    DecodeRoundWorkload workload(config);
+    const std::int32_t blocks_before = workload.ActiveLcmBlocks();
+    const std::int32_t tokens_before = workload.RequestTokens(0);
+    for (std::int32_t round = 0; round < config.num_rounds; ++round) {
+        SCOPED_TRACE(round);
+        const DecodeRoundSample sample = workload.RunRound();
+        ExpectMeasured(sample.plan, 1, "plan");
+        ExpectMeasured(sample.advance, 1, "advance");
+    }
+    EXPECT_EQ(workload.RequestTokens(0), tokens_before + config.num_rounds * config.decode_tokens);
+    // 20 more tokens per request: five pages each.
+    EXPECT_EQ(workload.ActiveLcmBlocks(), blocks_before + config.num_requests * 5);
+    EXPECT_THROW(workload.RunRound(), std::runtime_error);
+}
+
+TEST(DecodeRoundBenchmark, StaggersPageCrossingsAcrossRequests) {
+    const DecodeRoundConfig config{
+        .page_size = 16, .context_tokens = 64, .num_requests = 20, .decode_tokens = 1, .num_rounds = 1};
+    EXPECT_EQ(config.PromptTokens(0), 64);
+    EXPECT_EQ(config.PromptTokens(5), 69);
+    EXPECT_EQ(config.PromptTokens(16), 64);
+    EXPECT_THROW((DecodeRoundConfig{16, 60, 1, 1, 1}.Validate()), std::runtime_error);
 }
 
 }  // namespace

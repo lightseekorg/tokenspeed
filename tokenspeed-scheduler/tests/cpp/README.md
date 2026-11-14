@@ -128,6 +128,64 @@ each revision with its matching headers/core, run the driver with `--module-dir`
 and `--output`, and compare the parsed JSON. This complements the C++ and
 Python behavioral suites; it does not expose or depend on hash-slot order.
 
+## Decode rounds with long contexts
+
+`tokenspeed_scheduler_decode_rounds_benchmark` measures the steady state of a
+decode server: a batch of long-context requests that all decode in every
+round, each accepting `DECODE_TOKENS` tokens per round (the verify width) so
+that the block tables keep growing. Build it like the full-cache benchmark
+(target `tokenspeed_scheduler_decode_rounds_benchmark`); its arguments are
+
+```text
+PAGE_SIZE CONTEXT_TOKENS REQUESTS DECODE_TOKENS WARMUP_ROUNDS ROUNDS
+```
+
+Request `i`'s prompt is `CONTEXT_TOKENS + i % PAGE_SIZE` tokens, so requests
+cross page boundaries in different rounds. Admission reserves part of each
+request's generation budget up front, and a table grows only once decode has
+used that reserve: setup prefills every prompt in one plan and decodes,
+unmeasured, until the tables start to grow. The output reports thread-CPU and
+wall time of each round's `NextExecutionPlan` (`plan`) and of applying its
+results (`advance`). The cost of a round's admission should not depend on the
+context length; building the forward batch copies every request's page table
+and does.
+
+## CI performance guard
+
+`.github/workflows/scheduler-perf-guard.yml` runs on every change to the
+scheduler. It builds the base revision and the candidate in the same source
+directory and compares them with `test/ci_system/scheduler_perf_guard.py`:
+
+- `instructions` counts, under Callgrind, the instructions executed inside the
+  scheduler's API calls (`SubmitRequests`, `NextExecutionPlan`, `Advance`) and
+  inside `CacheCoordinator::Admit`, per sample, on reduced full-cache and decode
+  workloads. Each case runs twice with different sample counts and takes the
+  difference, which cancels setup. The counts are exact, so a change of more
+  than 2% fails the job. Two scaling checks also fail it when the candidate
+  breaks them and the base did not: a full-cache admission must not cost more
+  in a 4x larger cache, and a decode round's admission must not cost more with
+  8x longer contexts.
+- `timing` runs the full-size workloads (full cache with and without KV events,
+  256 x 128K-token decode) in alternating base and candidate processes and
+  reports thread-CPU medians. It sees memory effects that instruction counts
+  miss, such as cache misses and prefetching, but CI machines are shared and
+  noisy, so it only reports; confirm a reported regression locally.
+
+Every pull request starts the workflow; one that changes no scheduler path
+skips its jobs, which then pass, so `Instruction counts` can be a required
+check. A change that is meant to cost more (new work for a feature) shows up
+as an instruction regression: explain it in the pull request. To run the guard
+locally, build both revisions' benchmarks and pass their directories:
+
+```bash
+python3 test/ci_system/scheduler_perf_guard.py instructions \
+  --base BASE_BIN_DIR --candidate CANDIDATE_BIN_DIR --output perf-guard \
+  --valgrind valgrind --callgrind-annotate callgrind_annotate
+python3 test/ci_system/scheduler_perf_guard.py timing \
+  --base BASE_BIN_DIR --candidate CANDIDATE_BIN_DIR --output perf-guard \
+  --rounds 3 --cpu 2
+```
+
 # Sanitizer builds
 
 `TOKENSPEED_SCHEDULER_SANITIZE` lists sanitizers to build the core library
