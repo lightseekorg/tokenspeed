@@ -88,7 +88,8 @@ struct CacheKeyHash {
 // Immutable keys expanded for one prompt and one coordinator's group geometry.
 // These carry no residency or ownership information; every retry still probes
 // the current cache indexes. Sharing keeps a pending probe valid when its
-// request drops the prepared keys after successful admission.
+// request drops the prepared keys after successful admission. A replayable
+// group, which is never matched, has none.
 using PreparedPrefixKeys = std::shared_ptr<const std::vector<std::vector<CacheKey>>>;
 
 struct CacheGroupSpec {

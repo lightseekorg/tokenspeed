@@ -581,6 +581,13 @@ std::int32_t SweepThenConverge(std::span<const std::size_t> order, const std::ve
 std::vector<std::vector<CacheKey>> CacheCoordinator::buildGroupKeys(std::span<const std::string> content_hashes) const {
     std::vector<std::vector<CacheKey>> group_keys(groups_.size());
     for (std::size_t i = 0; i < groups_.size(); ++i) {
+        // A replayable group is never matched (match_order_ leaves it out)
+        // and holds no hit on either tier, so no probe reads its keys. They
+        // would be most of the keys: a 2-token window group expands every
+        // prefix page into prefix_granularity / 2 of them.
+        if (GroupIsReplayable(static_cast<std::int32_t>(i))) {
+            continue;
+        }
         group_keys[i] = keysForGroup(content_hashes, groups_[i].Id());
     }
     return group_keys;
@@ -669,6 +676,13 @@ CoordinatorMatch CacheCoordinator::acquireTierWithKeys(std::span<const std::vect
     out.per_group.resize(groups_.size());
     bool seen_state_group = false;
     for (std::size_t i = 0; i < groups_.size(); ++i) {
+        if (GroupIsReplayable(static_cast<std::int32_t>(i))) {
+            // Never matched, so it has no keys (buildGroupKeys) and nothing
+            // to acquire: its match stays empty.
+            _assert(probe.per_group[i].hits.empty() && (!probe.tail || probe.tail->group_keys[i].empty()),
+                    "a replayable group holds no prefix hit");
+            continue;
+        }
         // A State group's hits count from page 0 (PrefixProbe::Tier).
         const std::int32_t floor_pages = GroupIsState(i) ? 0 : floor_tokens / geometry_[i].BlockGranularity();
         out.per_group[i] = groups_[i].Index().AcquireMatched(pool, group_keys[i], floor_pages, probe.per_group[i],
