@@ -41,6 +41,30 @@ from tokenspeed.runtime.execution.types import (
 from tokenspeed.runtime.sampling.tree_verify import DraftTreeQ
 
 
+def _fill_rows(tensor: torch.Tensor, rows: torch.Tensor, value) -> None:
+    """Set ``tensor[rows]`` to ``value`` in place, stream-ordered, no host sync.
+
+    ``index_fill_`` is the direct spelling, but Ascend's implementation
+    synchronizes the stream, which a decode graph cannot capture. ``scatter_``
+    writes the same rows without a host round trip and keeps ``index_fill_``'s
+    semantics for repeated indices (every listed row is written).
+
+    Args:
+        tensor: Destination, 1-D or a 2-D view whose rows ``rows`` selects.
+        rows: int64 row indices into ``tensor``'s first dimension.
+        value: Scalar to write.
+    """
+    assert rows.dtype == torch.int64, f"row indices must be int64, got {rows.dtype}"
+    source = torch.full(
+        (rows.numel(),) if tensor.dim() == 1 else (rows.numel(), tensor.shape[1]),
+        value,
+        dtype=tensor.dtype,
+        device=tensor.device,
+    )
+    index = rows if tensor.dim() == 1 else rows[:, None].expand_as(source)
+    tensor.scatter_(0, index, source)
+
+
 def _stacked_view(tables: Sequence[torch.Tensor]) -> torch.Tensor | None:
     """``tables`` as one ``[len(tables), rows, cols]`` view when they are
     equal-shape row-major tables laid end to end in one storage, else None."""
@@ -598,10 +622,10 @@ class RuntimeStates:
     def mark_spec_candidates_drafted(self, req_pool_indices: torch.Tensor) -> None:
         """The drafter wrote these slots' next-step rows: their candidates are real.
 
-        Tensor-only (``index_fill_``), so it records into a decode graph with
-        the row writes it follows.
+        Tensor-only (``scatter_`` via :func:`_fill_rows`), so it records into a
+        decode graph with the row writes it follows.
         """
-        self.spec_candidates_ready.index_fill_(0, req_pool_indices, True)
+        _fill_rows(self.spec_candidates_ready, req_pool_indices, True)
 
     def write_remote_spec_candidate_ids(
         self, req_pool_idx: int, candidate_ids: list[int]
