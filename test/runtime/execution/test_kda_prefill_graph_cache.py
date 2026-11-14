@@ -645,10 +645,11 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_plain_metadata_norms_only_the_scanned_rows():
+def test_plain_metadata_norms_the_zero_padded_bucket():
     """An ordinary capture's eager break gets the bucket's rows on the plain
-    metadata, which scans only the live ones; the output norm's gate spans the
-    bucket and must follow the scan."""
+    metadata, which scans only the live ones; the scan's output is zero-padded
+    to the bucket, so the output norm, whose gate spans the bucket, applies to
+    every row."""
     from tokenspeed_kernel.ops.attention.gdn.triton import (
         CAUSAL_CONV1D_BLOCK_M,
         build_causal_conv1d_prefill_metadata,
@@ -743,8 +744,10 @@ def test_plain_metadata_norms_only_the_scanned_rows():
         )
 
     core = forward(None).reshape(-1, channels)
-    assert core.shape[0] == live
-    expected = apply_kda_output_norm(core, norm.rows(0, live))
+    assert core.shape[0] == bucket
+    assert torch.count_nonzero(core[:live]) > 0
+    assert torch.count_nonzero(core[live:]) == 0
+    expected = apply_kda_output_norm(core, norm)
     assert torch.equal(forward(norm).reshape(-1, channels), expected)
 
 
