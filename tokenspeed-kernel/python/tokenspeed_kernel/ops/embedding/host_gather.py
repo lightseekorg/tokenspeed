@@ -20,10 +20,11 @@
 
 """Gather uint8 rows from a host-resident table onto the device.
 
-The table stays in pinned / cudaHostRegistered host memory. The kernel reads
-it through a device-visible pointer (UVA on NVIDIA, hipHostGetDevicePointer
-on AMD). Invalid indices write zeros. Callers own dequantization so FP8/E8M0
-rounding stays with the same torch casts as the GPU-resident path.
+The table stays in pinned, cudaHostRegistered or ``host_memory`` (host-NUMA
+cuMem) host memory. The kernel reads it through a device-visible pointer (UVA
+on NVIDIA, hipHostGetDevicePointer on AMD). Invalid indices write zeros.
+Callers own dequantization so FP8/E8M0 rounding stays with the same torch
+casts as the GPU-resident path.
 """
 
 from __future__ import annotations

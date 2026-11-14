@@ -691,6 +691,8 @@ class ServerArgs:
     engram_host_table: bool = False
     engram_host_table_dir: str | None = None
     engram_host_table_layout: str = "auto"
+    engram_host_table_alloc: str = "auto"
+    engram_host_table_numa: str = "interleave"
     # Run each decoder layer's small decode steps as one persistent
     # monokernel launch (DECODE_MONOKERNEL_ARCHITECTURES). Off by default.
     decode_monokernel: bool = False
@@ -4067,8 +4069,9 @@ class ServerArgs:
             help=(
                 "Directory for shared Engram mmap files. Default: /dev/shm "
                 "when it has enough free space, otherwise /scratch or /tmp. "
-                "Used only with --engram-host-table-layout shared. Docker often "
-                "caps /dev/shm at 32-64 GiB, too small for a full V4.1 table."
+                "Used only when several ranks share tables in mmap memory (see "
+                "--engram-host-table-alloc). Docker often caps /dev/shm at "
+                "32-64 GiB, too small for a full V4.1 table."
             ),
         )
         parser.add_argument(
@@ -4082,6 +4085,36 @@ class ServerArgs:
                 "attention-TP rank holds a host shard and keeps the all-reduce "
                 "(anonymous mapping, huge-page friendly). auto: sharded when "
                 "attention TP > 1, else shared."
+            ),
+        )
+        parser.add_argument(
+            "--engram-host-table-alloc",
+            type=str,
+            choices=["auto", "cumem", "mmap"],
+            default=ServerArgs.engram_host_table_alloc,
+            help=(
+                "Host memory of shared Engram tables. cumem: pinned host-NUMA "
+                "memory from CUDA virtual memory management, which GPUs map "
+                "with 2 MiB pages, so random-row lookups miss the GPU TLB far "
+                "less than with the 4-64 KiB base pages of a registered shared "
+                "file; the ranks of a host share one copy through FABRIC handles; "
+                "fails if unavailable. mmap: a registered shared file (see "
+                "--engram-host-table-dir), or registered anonymous memory for "
+                "a single rank. auto: cumem when every rank can use it, "
+                "otherwise mmap on every rank (with a warning on NVIDIA)."
+            ),
+        )
+        parser.add_argument(
+            "--engram-host-table-numa",
+            type=str,
+            choices=["interleave", "writer"],
+            default=ServerArgs.engram_host_table_numa,
+            help=(
+                "Placement of cumem Engram tables. interleave: alternate 2 GiB "
+                "chunks over the host NUMA nodes of the GPUs the job's ranks "
+                "use on that host. writer: keep them on the NUMA node of the "
+                "GPU of the rank that loads them. A single rank's table stays "
+                "on its own GPU's node either way."
             ),
         )
         parser.add_argument(

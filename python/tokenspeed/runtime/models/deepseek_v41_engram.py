@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: MIT AND Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 LightSeek Foundation
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
 # Copyright (c) 2026 LightSeek Foundation
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
@@ -33,10 +37,13 @@ Integration contract:
   are replicated within mapping.attn.tp_group; QCP lookup gathers hash IDs and
   reduce-scatters the table contributions back to local query rows.
   GPU-resident tables are row-sharded across attention TP and all-reduced.
-  Host tables stay in anonymous or shared host memory, one packed
-  [codes | scales] row per entry, and gather through UVA. Their GPU
-  registrations are released before their backing memory is freed. When a
-  rank holds every row it looks up, the gather emits wkv's MXFP8 input directly.
+  Host tables keep one packed [codes | scales] row per entry in host memory
+  and gather through UVA. ``shared`` tables live in host-NUMA cuMem memory,
+  which GPUs map with 2 MiB pages rather than a tmpfs file's 4-64 KiB base
+  pages, and the ranks of a host map one copy (EngramHostAlloc). Otherwise
+  they stay in a registered shared file or anonymous memory, whose GPU
+  registrations are released before the memory is freed. When a rank holds
+  every row it looks up, the gather emits wkv's MXFP8 input directly.
   ``shared`` keeps one full copy per node and skips the lookup all-reduce.
   ``sharded`` keeps a host shard per attention-TP rank and retains the all-reduce.
   ``auto`` selects sharded when attention TP > 1. Output matches the GPU path.
@@ -68,6 +75,8 @@ import numpy as np
 import torch
 from sympy import isprime
 from tokenizers import Regex, normalizers
+from tokenspeed_kernel import host_memory
+from tokenspeed_kernel.ops.communication.fabric import host_identity
 from tokenspeed_kernel.ops.embedding import host_gather
 from tokenspeed_kernel.ops.metadata.ngram import (
     NGramHashParams,
@@ -369,6 +378,48 @@ def resolve_engram_host_layout(host_table: bool, tp_size: int) -> str:
     )
 
 
+@dataclass(frozen=True)
+class EngramHostAlloc:
+    """Where a host Engram table's memory comes from.
+
+    mode: ``cumem`` puts ``shared`` tables in pinned host-NUMA memory from CUDA
+        virtual memory management, which GPUs map with 2 MiB pages, and fails
+        if that is unavailable; ``mmap`` keeps the registered shared file of
+        several ranks or a single rank's anonymous memory; ``auto`` uses cumem
+        when every rank can and mmap on every rank otherwise, and off NVIDIA
+        keeps mmap without asking. ``sharded`` tables always use anonymous
+        memory.
+    numa: cumem placement: ``interleave`` alternates 2 GiB chunks over the
+        host NUMA nodes of the GPUs the job's ranks use on that host;
+        ``writer`` keeps them on the node of the writer rank's GPU. A single
+        rank's table stays on its own GPU's node either way.
+    """
+
+    mode: str
+    numa: str
+
+    def __post_init__(self) -> None:
+        if self.mode not in ("auto", "cumem", "mmap"):
+            raise ValueError(
+                f"Engram host table alloc must be auto, cumem or mmap; got {self.mode!r}"
+            )
+        if self.numa not in ("interleave", "writer"):
+            raise ValueError(
+                "Engram host table NUMA placement must be interleave or writer; "
+                f"got {self.numa!r}"
+            )
+
+
+def resolve_engram_host_alloc(host_layout: str) -> EngramHostAlloc | None:
+    """Return the CLI's host-table allocation, or None for GPU tables."""
+    if host_layout == "gpu":
+        return None
+    return EngramHostAlloc(
+        global_server_args_dict["engram_host_table_alloc"],
+        global_server_args_dict["engram_host_table_numa"],
+    )
+
+
 def _cleanup_host_files() -> None:
     while _CREATED_HOST_FILES:
         path = _CREATED_HOST_FILES.pop()
@@ -456,6 +507,172 @@ def _allocate_host_bytes(
     return _tensor_from_host_bytes(buffer, shape, dtype), buffer
 
 
+# Shared cuMem tables are adapted from vLLM's Engram host tables
+# (vllm/models/deepseek_v41/nvidia/ops/engram_host_table.py, Apache-2.0): one
+# rank per host creates the memory, the others import it, and no rank uses it
+# unless every rank succeeds. Changed here: the world group decides together,
+# grouping ranks by host identity and requiring one writer per host, and a
+# single rank allocates without export.
+
+# cuMem tables are created in 2 GiB chunks, so the creator can stop before it
+# drains a NUMA node, and interleaved tables alternate nodes per chunk.
+_CUMEM_CHUNK_BYTES = 2 << 30
+# Fraction of each NUMA node left to other allocations.
+_CUMEM_NUMA_RESERVE = 0.05
+
+
+def _describe_error(exc: Exception) -> str:
+    return f"{type(exc).__name__}: {exc}"
+
+
+def _host_table_device_index(device: torch.device) -> int:
+    """The CUDA device whose kernels read a host table placed for ``device``."""
+    if device.type == "cuda" and device.index is not None:
+        return device.index
+    return torch.cuda.current_device() if torch.cuda.is_available() else 0
+
+
+def _cumem_fallback(
+    host_alloc: EngramHostAlloc, layer_id: int, reason: str
+) -> host_memory.HostMemory | None:
+    if host_alloc.mode == "cumem":
+        raise RuntimeError(
+            f"Engram layer {layer_id}: no host-NUMA cuMem table: {reason}"
+        )
+    # Ranks that share a table reach this verdict, and its reason, together,
+    # so world rank 0 warns for all of them.
+    first_rank = (
+        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+    )
+    log = logger.warning if first_rank else logger.info
+    log(
+        f"Engram layer {layer_id}: host table falls back from host-NUMA cuMem to "
+        "a registered mmap (--engram-host-table-alloc mmap selects it without "
+        f"this warning): {reason}"
+    )
+    return None
+
+
+def _log_cumem_table(
+    layer_id: int, memory: host_memory.HostMemory, origin: str, ranks: int
+) -> None:
+    logger.info(
+        f"Engram layer {layer_id}: host table in host-NUMA cuMem (2 MiB GPU "
+        f"pages), {memory.tensor.numel() / 2**30:.2f} GiB on NUMA nodes "
+        f"{list(memory.numa_nodes)!s}, {origin}, shared by {ranks} rank(s)"
+    )
+
+
+def _cumem_sharing_error(
+    ranks: list[tuple[int, bool, int | None, str | None]],
+) -> str | None:
+    """Why gathered (host, writer, NUMA node, probe error) ranks cannot share."""
+    errors = [f"rank {rank}: {info[3]}" for rank, info in enumerate(ranks) if info[3]]
+    writers: dict[int, int] = {}
+    for host, writer, _, _ in ranks:
+        writers[host] = writers.get(host, 0) + int(writer)
+    errors += [
+        f"a host has {count} writer ranks instead of one"
+        for count in writers.values()
+        if count != 1
+    ]
+    return "; ".join(errors) or None
+
+
+def _cumem_host_table(
+    nbytes: int,
+    host_alloc: EngramHostAlloc,
+    device: torch.device,
+    multi_rank: bool,
+    writer: bool,
+    layer_id: int,
+) -> host_memory.HostMemory | None:
+    """Back a shared table with host-NUMA cuMem memory, or return None for mmap.
+
+    A single rank allocates privately on its GPU's NUMA node. Ranks sharing
+    tables run three object all-gathers over the world group, in the same
+    order on every rank: (host, writer, NUMA node, probe error) of each rank,
+    each writer's exported memory, and each rank's failure. Each host's writer
+    creates the memory and the other ranks of that host import it. Unless
+    every rank succeeds, every rank closes what it mapped and falls back to
+    mmap together (``auto``) or raises (``cumem``). No collective runs in mmap
+    mode or, off NVIDIA, in auto mode: every rank of a job takes that branch.
+    """
+    if host_alloc.mode == "mmap":
+        return None
+    if host_alloc.mode == "auto" and not host_memory.platform_supported():
+        # No rank can have cuMem host memory here; nothing to probe or report.
+        return None
+    device_index = _host_table_device_index(device)
+    if not multi_rank:
+        error = host_memory.probe_host_memory(device_index, False)
+        if error is None:
+            try:
+                memory = host_memory.create_host_memory(
+                    nbytes,
+                    (host_memory.host_numa_node(device_index),),
+                    device_index,
+                    False,
+                    _CUMEM_CHUNK_BYTES,
+                    _CUMEM_NUMA_RESERVE,
+                )
+            except Exception as exc:
+                error = _describe_error(exc)
+            else:
+                _log_cumem_table(layer_id, memory, "private", 1)
+                return memory
+        return _cumem_fallback(host_alloc, layer_id, error)
+    world_size = torch.distributed.get_world_size()
+    rank = torch.distributed.get_rank()
+    probe = host_memory.probe_host_memory(device_index, True)
+    node = host_memory.host_numa_node(device_index) if probe is None else None
+    ranks = [None] * world_size
+    torch.distributed.all_gather_object(ranks, (host_identity(), writer, node, probe))
+    error = _cumem_sharing_error(ranks)
+    if error is not None:
+        return _cumem_fallback(host_alloc, layer_id, error)
+    peers = [peer for peer, info in enumerate(ranks) if info[0] == ranks[rank][0]]
+    creator = next(peer for peer in peers if ranks[peer][1])
+    memory = exported = failure = None
+    if writer:
+        nodes = (
+            (node,)
+            if host_alloc.numa == "writer"
+            else tuple(sorted({ranks[peer][2] for peer in peers}))
+        )
+        try:
+            memory = host_memory.create_host_memory(
+                nbytes,
+                nodes,
+                device_index,
+                True,
+                _CUMEM_CHUNK_BYTES,
+                _CUMEM_NUMA_RESERVE,
+            )
+            exported = memory.export()
+        except Exception as exc:
+            failure = _describe_error(exc)
+    shared = [None] * world_size
+    torch.distributed.all_gather_object(shared, exported)
+    if not writer and shared[creator] is not None:
+        try:
+            memory = host_memory.import_host_memory(shared[creator], device_index)
+        except Exception as exc:
+            failure = _describe_error(exc)
+    failures = [None] * world_size
+    torch.distributed.all_gather_object(failures, failure)
+    errors = "; ".join(
+        f"rank {peer}: {message}" for peer, message in enumerate(failures) if message
+    )
+    if errors:
+        if memory is not None:
+            memory.close()
+        return _cumem_fallback(host_alloc, layer_id, errors)
+    origin = "created" if writer else f"imported from rank {creator}"
+    _log_cumem_table(layer_id, memory, origin, len(peers))
+    return memory
+
+
 def _dequant_fp8_e8m0(codes: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
     values = codes.view(torch.uint8).view(torch.float8_e4m3fn).float()
     scale = scales.view(torch.uint8).view(torch.float8_e8m0fnu).float()
@@ -477,6 +694,7 @@ class RowShardedEngramEmbedding(nn.Module):
         device: torch.device | str,
         host_table: bool,
         host_layout: str,
+        host_alloc: EngramHostAlloc | None,
         layer_id: int,
     ):
         super().__init__()
@@ -493,8 +711,17 @@ class RowShardedEngramEmbedding(nn.Module):
                 raise ValueError(
                     "Host Engram tables require host_layout shared or sharded"
                 )
+            if not isinstance(host_alloc, EngramHostAlloc):
+                raise TypeError("Host Engram tables require an EngramHostAlloc")
+            if host_layout == "sharded" and host_alloc.mode == "cumem":
+                raise ValueError(
+                    "cuMem Engram host tables require the shared layout; sharded "
+                    "tables use anonymous memory"
+                )
         elif host_layout != "gpu":
             raise ValueError("GPU Engram tables require host_layout='gpu'")
+        elif host_alloc is not None:
+            raise ValueError("GPU Engram tables take no host allocation")
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
         self.tp_group = mapping.attn.tp_group
@@ -533,27 +760,31 @@ class RowShardedEngramEmbedding(nn.Module):
         # row, so a packed row costs one lookup instead of two. weight and
         # scale are column views of it.
         self.packed: torch.Tensor | None = None
+        # The host-NUMA cuMem memory of a shared table, if it got one. The
+        # packed rows' storage owns the mapping, so any view of them keeps it
+        # alive after this module is gone.
+        self.cumem: host_memory.HostMemory | None = None
         if host_table:
-            packed_path = ""
             packed_shape = (
                 self.part_num_embeddings,
                 embedding_dim + embedding_dim // 32,
             )
-            if shared_file:
-                packed_bytes = _host_table_nbytes(packed_shape, torch.uint8)
-                packed_path = _engram_host_table_path(layer_id, "packed", packed_bytes)
-                if self._shared_writer:
-                    _create_host_file(packed_path, packed_bytes)
-                torch.distributed.barrier()
-            self.packed, packed_mmap = _allocate_host_bytes(
-                packed_shape,
-                torch.uint8,
-                device,
-                shared_file,
-                packed_path,
-            )
-            if packed_mmap is not None:
-                self._mmap_keep.append(packed_mmap)
+            packed_bytes = _host_table_nbytes(packed_shape, torch.uint8)
+            if host_layout == "shared" and torch.device(device).type != "meta":
+                self.cumem = _cumem_host_table(
+                    packed_bytes,
+                    host_alloc,
+                    torch.device(device),
+                    shared_file,
+                    self._shared_writer,
+                    layer_id,
+                )
+            if self.cumem is not None:
+                self.packed = self.cumem.tensor.view(packed_shape)
+            else:
+                self.packed = self._allocate_mmap_rows(
+                    packed_shape, packed_bytes, device, shared_file, layer_id
+                )
             self.weight = nn.Parameter(
                 self.packed[:, :embedding_dim].view(torch.float8_e4m3fn),
                 requires_grad=False,
@@ -561,10 +792,6 @@ class RowShardedEngramEmbedding(nn.Module):
             self.scale = nn.Parameter(
                 self.packed[:, embedding_dim:], requires_grad=False
             )
-            if shared_file:
-                torch.distributed.barrier()
-                if self._shared_writer:
-                    _unlink_host_file(packed_path)
         else:
             self.weight = nn.Parameter(
                 torch.empty(
@@ -596,9 +823,47 @@ class RowShardedEngramEmbedding(nn.Module):
             self.scale.data[local_rows:].fill_(127)
             self._register_host_for_gpu()
 
+    def _allocate_mmap_rows(
+        self,
+        packed_shape: tuple[int, int],
+        packed_bytes: int,
+        device: torch.device | str,
+        shared_file: bool,
+        layer_id: int,
+    ) -> torch.Tensor:
+        """Map the packed rows from a shared job file, or an anonymous buffer.
+
+        Every rank sharing the table maps the writer's file before the writer
+        unlinks it; the mappings keep the memory.
+        """
+        packed_path = ""
+        if shared_file:
+            packed_path = _engram_host_table_path(layer_id, "packed", packed_bytes)
+            if self._shared_writer:
+                _create_host_file(packed_path, packed_bytes)
+            torch.distributed.barrier()
+        packed, packed_mmap = _allocate_host_bytes(
+            packed_shape,
+            torch.uint8,
+            device,
+            shared_file,
+            packed_path,
+        )
+        if packed_mmap is not None:
+            self._mmap_keep.append(packed_mmap)
+        if shared_file:
+            torch.distributed.barrier()
+            if self._shared_writer:
+                _unlink_host_file(packed_path)
+        return packed
+
     def _register_host_for_gpu(self) -> None:
         """cudaHostRegister once. Gather kernels must not register."""
         if self._host_gpu_registered or not self.host_table:
+            return
+        if self.cumem is not None:
+            # cuMem memory is mapped for the GPU when it is created.
+            self._host_gpu_registered = True
             return
         if (
             torch.device(self.weight.device).type != "cpu"
@@ -664,7 +929,7 @@ class RowShardedEngramEmbedding(nn.Module):
         """Copy table rows from a CPU safetensors get_slice() in bounded chunks.
 
         GPU and host-sharded tables copy only this rank's rows. Shared host
-        tables copy every row on the writer rank; followers map the file.
+        tables copy every row on the writer rank; followers map the same memory.
         Args: parameter_name is 'weight' or 'scale'; tensor_slice is the global
         checkpoint tensor's lazy CPU slice; chunk_rows bounds transient host
         storage. No full tensor, remote shard, or BF16 table is allocated.
@@ -796,6 +1061,7 @@ class DeepseekV41Engram(nn.Module):
         device: torch.device | str,
         host_table: bool,
         host_layout: str,
+        host_alloc: EngramHostAlloc | None,
     ):
         """Construct with the V4.1 runtime quant config selected by the caller.
 
@@ -855,6 +1121,7 @@ class DeepseekV41Engram(nn.Module):
             device,
             host_table,
             host_layout,
+            host_alloc,
             layer_id,
         )
         self.q_weight.weight_loader = default_weight_loader
