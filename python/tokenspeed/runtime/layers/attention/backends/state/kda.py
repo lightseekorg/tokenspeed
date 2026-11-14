@@ -316,8 +316,16 @@ class KdaAttnBackend(CapacityPrefillBackend):
             recurrent_layout=self.kda_recurrent_layout,
             **shape,
         )
+        first_layer = min(cache_pool.state_group_by_layer)
         self._batched_replay_kernel = (
-            resolve_kda_batched_replay_commit(self.dtype, **shape)
+            resolve_kda_batched_replay_commit(
+                self.dtype,
+                **shape,
+                spec_query_len=self.speculative_num_draft_tokens,
+                state_dtype=cache_pool.get_component(
+                    first_layer, "recurrent_state"
+                ).dtype,
+            )
             if self._replay_active
             else None
         )
