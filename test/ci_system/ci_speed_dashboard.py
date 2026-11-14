@@ -333,6 +333,12 @@ def read_jobs(cache: Path, run_id: int, attempt: int) -> list[dict] | None:
 
 
 def fetch_run_lists(gh: GitHub, cache: Path, now: dt.datetime, days: int) -> None:
+    """Refresh the cached run list of every tracked workflow and event, one file
+    per UTC day over the last ``days`` days.
+
+    Days older than MUTABLE_DAYS whose runs have all completed are frozen and
+    not refetched.
+    """
     start = (now - dt.timedelta(days=days)).date()
     for wf in WORKFLOWS:
         for ev, query in EVENTS:
@@ -354,6 +360,10 @@ def fetch_run_lists(gh: GitHub, cache: Path, now: dt.datetime, days: int) -> Non
 
 
 def load_runs(cache: Path, now: dt.datetime, days: int) -> list[dict]:
+    """Return the cached runs created in the last ``days`` days, one per run id,
+    each tagged with its workflow key (``wf``), event (``ev``: pr or main) and
+    ``run_attempt``.
+    """
     lo = now - dt.timedelta(days=days)
     runs: dict[int, dict] = {}
     for wf in WORKFLOWS:
@@ -533,6 +543,15 @@ def annotate_runs(
 
 
 def workflow_stats(runs: list[dict], now: dt.datetime, cut: dt.datetime) -> dict:
+    """Per-workflow wall-time summaries and run outcome counts.
+
+    Pull request runs split into the current period (created at or after
+    ``cut``) and the previous one; each period gets wall-time percentiles of
+    runs that ran tests, plus counts of scan-only (noop), cancelled, superseded
+    (cancelled with a newer run on the same branch), stuck (unfinished for over
+    STUCK_HOURS at ``now``) and action_required runs. ``main`` summarizes the
+    push runs on main over the whole window.
+    """
     by_branch = collections.defaultdict(list)
     for r in runs:
         if r["ev"] == "pr":
@@ -584,6 +603,10 @@ def workflow_stats(runs: list[dict], now: dt.datetime, cut: dt.datetime) -> dict
 
 
 def daily_series(runs: list[dict], days: list[dt.date]) -> dict:
+    """Per workflow and Pacific day: [median, p90, count] of pull request wall
+    times and [median, count] of main push wall times, or None for a day
+    without runs. Workflows with no data are left out.
+    """
     buckets = collections.defaultdict(list)
     for r in runs:
         if r["wall"] is not None and not r["noop"]:
@@ -745,6 +768,13 @@ def critical_path(
 
 
 def runner_labels(jobs1: dict[int, list]) -> list[dict]:
+    """Queue and run times per self-hosted runner label from first-attempt jobs.
+
+    Each row has queue percentiles (created to started), the median run time,
+    the peak number of overlapping jobs, and the jobs never picked up with how
+    long they waited. Key labels come first, with empty rows for key labels
+    that had no jobs.
+    """
     acc = collections.defaultdict(
         lambda: {"q": [], "run": [], "never": 0, "never_wait": [], "iv": []}
     )
@@ -833,6 +863,12 @@ def flakiness(
     top: int,
     min_runs: int,
 ) -> list[dict]:
+    """First-attempt pass/fail counts per job name on pull requests and main.
+
+    For a failed pull request job, ``rerun_pass``/``rerun_fail`` record how the
+    same job ended in the run's latest attempt. Returns the ``top`` jobs by
+    failures among those with a failure and at least ``min_runs`` runs.
+    """
     acc = collections.defaultdict(
         lambda: {
             "ok": 0,

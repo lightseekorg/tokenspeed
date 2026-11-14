@@ -143,6 +143,8 @@ table { width: 100%; border-collapse: collapse; font-size: .84rem; }
 th { text-align: left; font-weight: 600; font-size: .74rem; text-transform: uppercase; letter-spacing: .03em; color: var(--text-secondary); border-bottom: 1px solid var(--border-strong); padding: .45rem .55rem; white-space: nowrap; cursor: pointer; user-select: none; vertical-align: bottom; }
 table.static th { cursor: default; }
 th.asc::after { content: " ▲"; color: var(--accent); } th.desc::after { content: " ▼"; color: var(--accent); }
+th .sortbtn { all: inherit; display: inline; padding: 0; border: 0; background: none; cursor: pointer; }
+th .sortbtn:focus-visible, [data-tip]:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 td { padding: .42rem .55rem; border-bottom: 1px solid var(--border); font-variant-numeric: tabular-nums; vertical-align: top; }
 tbody tr:hover { background: var(--surface-hover); }
 table.compact td, table.compact th { padding: .3rem .45rem; font-size: .78rem; }
@@ -312,7 +314,11 @@ body.lang-bi .mix > span[lang="zh"]::before { content: ""; }
   function table(headers, rows, opts) {
     opts = opts || {};
     var h = '<div class="tbl-wrap"><table class="' + (opts.cls || "") + (opts.sortable === false ? " static" : "") + '"' + (opts.sortable === false ? "" : " data-sortable") + "><thead><tr>";
-    headers.forEach(function (x) { h += '<th data-sort="' + x[2] + '">' + bi(x[0], x[1]) + "</th>"; });
+    headers.forEach(function (x) {
+      var label = bi(x[0], x[1]);
+      if (opts.sortable !== false) label = '<button type="button" class="sortbtn">' + label + "</button>";
+      h += '<th scope="col" data-sort="' + x[2] + '">' + label + "</th>";
+    });
     h += "</tr></thead><tbody>";
     rows.forEach(function (r) {
       h += "<tr>" + r.map(function (c) { return '<td data-v="' + esc(c[1] == null ? -1 : c[1]) + '">' + c[0] + "</td>"; }).join("") + "</tr>";
@@ -580,9 +586,18 @@ body.lang-bi .mix > span[lang="zh"]::before { content: ""; }
     if (y + r.height > window.innerHeight - 8) y = ev.clientY - r.height - 14;
     tipEl.style.left = x + "px"; tipEl.style.top = y + "px";
   }
+  function tipText(d) {
+    return [pick(d.t[0], d.t[1])].concat(d.r.map(function (r) { return pick(r[0], r[1]) + ": " + r[2]; })).join("; ");
+  }
   function bindTips() {
     document.querySelectorAll("[data-tip]").forEach(function (el) {
-      el.addEventListener("pointerenter", function (ev) {
+      // Keyboard and screen-reader users reach the same data: every tooltip
+      // target is focusable, shows its tooltip on focus, and carries it as
+      // its accessible name.
+      el.setAttribute("tabindex", "0");
+      el.setAttribute("role", "img");
+      try { el.setAttribute("aria-label", tipText(JSON.parse(el.getAttribute("data-tip")))); } catch (e) {}
+      function show(ev) {
         var d; try { d = JSON.parse(el.getAttribute("data-tip")); } catch (e) { return; }
         tipEl.textContent = "";
         var t = document.createElement("div"); t.className = "tt"; t.textContent = pick(d.t[0], d.t[1]); tipEl.appendChild(t);
@@ -593,24 +608,39 @@ body.lang-bi .mix > span[lang="zh"]::before { content: ""; }
           var s = document.createElement("span"); s.textContent = pick(r[0], r[1]); row.appendChild(s);
           tipEl.appendChild(row);
         });
-        tipEl.style.opacity = 1; move(ev);
+        tipEl.style.opacity = 1;
+        if (ev.type === "focus") { var b = el.getBoundingClientRect(); move({clientX: b.right, clientY: b.top}); } else move(ev);
         var xh = el.ownerSVGElement && el.ownerSVGElement.querySelector(".xhair");
         if (xh && el.dataset.x) { xh.setAttribute("x1", el.dataset.x); xh.setAttribute("x2", el.dataset.x); xh.style.opacity = 1; }
-      });
-      el.addEventListener("pointermove", move);
-      el.addEventListener("pointerleave", function () {
+      }
+      function hide() {
         tipEl.style.opacity = 0;
         var xh = el.ownerSVGElement && el.ownerSVGElement.querySelector(".xhair"); if (xh) xh.style.opacity = 0;
-      });
+      }
+      el.addEventListener("pointerenter", show);
+      el.addEventListener("focus", show);
+      el.addEventListener("pointermove", move);
+      el.addEventListener("pointerleave", hide);
+      el.addEventListener("blur", hide);
+    });
+  }
+  // Each table is named after the card or section heading it sits under.
+  function nameTables() {
+    document.querySelectorAll("table").forEach(function (tbl) {
+      var scope = tbl.closest(".card") || tbl.closest("section"), hd = scope && scope.querySelector("h2, h3");
+      if (hd && !tbl.hasAttribute("aria-label")) tbl.setAttribute("aria-label", hd.textContent.trim());
     });
   }
   function bindSort() {
     document.querySelectorAll("table[data-sortable]").forEach(function (tbl) {
       tbl.querySelectorAll("th").forEach(function (th, idx) {
-        th.addEventListener("click", function () {
+        var btn = th.querySelector(".sortbtn");
+        if (!btn) return;
+        btn.addEventListener("click", function () {
           var num = th.dataset.sort === "number", asc = !th.classList.contains("asc");
-          tbl.querySelectorAll("th").forEach(function (x) { x.classList.remove("asc", "desc"); });
+          tbl.querySelectorAll("th").forEach(function (x) { x.classList.remove("asc", "desc"); x.removeAttribute("aria-sort"); });
           th.classList.add(asc ? "asc" : "desc");
+          th.setAttribute("aria-sort", asc ? "ascending" : "descending");
           var body = tbl.tBodies[0], rows = Array.prototype.slice.call(body.rows);
           rows.sort(function (a, b) {
             var x = a.cells[idx].dataset.v, y = b.cells[idx].dataset.v;
@@ -652,7 +682,7 @@ body.lang-bi .mix > span[lang="zh"]::before { content: ""; }
     renderHeader(); renderKpis(); renderWorkflowTable(); renderTrends(); renderCriticalPath();
     renderLabels(); renderSlow(); renderFlaky(); renderNotes();
     document.getElementById("main").hidden = false;
-    bindTips(); bindSort();
+    bindTips(); bindSort(); nameTables();
   }).catch(function (e) { console.warn("CI dashboard:", e); noData(); });
 })();
 </script>
