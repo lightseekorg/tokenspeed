@@ -178,24 +178,54 @@ def test_mha_decode_with_paged_cache() -> None:
     torch.testing.assert_close(output, expected, atol=2e-2, rtol=2e-2)
 
 
-def test_mha_decode_npugraph_updates_sequence_lengths() -> None:
-    page_size = 128
-    q = torch.randn(2, 4, 64, dtype=torch.bfloat16, device="npu")
-    k_cache = torch.randn(4, page_size, 2, 64, dtype=torch.bfloat16, device="npu")
+@pytest.mark.parametrize(
+    "q_length,page_size,head_dim",
+    [
+        (1, 128, 64),
+        (2, 128, 64),
+        (3, 128, 64),
+        (4, 128, 64),
+        (5, 128, 64),
+        (5, 64, 128),
+    ],
+)
+def test_mha_decode_npugraph_updates_sequence_lengths(
+    q_length: int, page_size: int, head_dim: int
+) -> None:
+    from tokenspeed_kernel.ops.attention.mha import (
+        mha_decode_with_kvcache as dispatch_decode,
+    )
+
+    q = torch.randn(2 * q_length, 4, head_dim, dtype=torch.bfloat16, device="npu")
+    k_cache = torch.randn(4, page_size, 2, head_dim, dtype=torch.bfloat16, device="npu")
     v_cache = torch.randn_like(k_cache)
     page_table = torch.tensor([[0, 0], [1, 2]], dtype=torch.int32, device="npu")
-    capture_lengths = torch.ones(2, dtype=torch.int32, device="npu")
+    capture_lengths = torch.full((2,), q_length, dtype=torch.int32, device="npu")
 
     for _ in range(3):
-        mha_decode_with_kvcache(
-            q, k_cache, v_cache, page_table, capture_lengths, max_seqlen_k=128
+        dispatch_decode(
+            q,
+            k_cache,
+            v_cache,
+            page_table,
+            capture_lengths,
+            max_seqlen_k=2 * page_size,
+            max_seqlen_q=q_length,
+            solution="torch_npu",
         )
     torch.npu.synchronize()
 
     graph = torch.npu.NPUGraph()
     with torch.npu.graph(graph, stream=torch.npu.Stream(), auto_dispatch_capture=True):
-        output = mha_decode_with_kvcache(
-            q, k_cache, v_cache, page_table, capture_lengths, max_seqlen_k=128
+        output = dispatch_decode(
+            q,
+            k_cache,
+            v_cache,
+            page_table,
+            capture_lengths,
+            max_seqlen_k=2 * page_size,
+            max_seqlen_q=q_length,
+            solution="torch_npu",
         )
     torch.npu.synchronize()
 
@@ -204,14 +234,66 @@ def test_mha_decode_npugraph_updates_sequence_lengths() -> None:
         graph.replay()
         torch.npu.synchronize()
 
-        expected = torch.stack(
+        expected = torch.cat(
             [
                 _attention(
-                    q[batch : batch + 1],
+                    q[batch * q_length : (batch + 1) * q_length],
                     _paged_rows(k_cache, page_table, batch, length),
                     _paged_rows(v_cache, page_table, batch, length),
-                    causal=False,
-                )[0]
+                    causal=q_length > 1,
+                )
+                for batch, length in enumerate(lengths)
+            ]
+        )
+        torch.testing.assert_close(output, expected, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("q_length,page_size", [(1, 128), (4, 64), (5, 64)])
+def test_mha_draft_decode_reads_device_lengths_in_npugraph(
+    q_length: int, page_size: int
+) -> None:
+    from tokenspeed_kernel.ops.attention.mha import (
+        mha_decode_with_kvcache as dispatch_decode,
+    )
+
+    q = torch.randn(2 * q_length, 8, 128, dtype=torch.bfloat16, device="npu")
+    k_cache = torch.randn(6, page_size, 4, 128, dtype=torch.bfloat16, device="npu")
+    v_cache = torch.randn_like(k_cache)
+    page_table = torch.tensor([[0, 1, 2], [3, 4, 5]], dtype=torch.int32, device="npu")
+    frontier = torch.tensor([4, 69], dtype=torch.int32, device="npu")
+
+    def run():
+        return dispatch_decode(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            page_table=page_table,
+            cache_seqlens=frontier + 1,
+            max_seqlen_k=3 * page_size,
+            max_seqlen_q=q_length,
+            solution="triton",
+        )
+
+    run()
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph, stream=torch.npu.Stream(), auto_dispatch_capture=True):
+        output = run()
+    torch.npu.synchronize()
+
+    for lengths in ([5, 70], [63, 129]):
+        frontier.copy_(torch.tensor(lengths, dtype=torch.int32) - 1)
+        graph.replay()
+        torch.npu.synchronize()
+
+        expected = torch.cat(
+            [
+                _attention(
+                    q[batch * q_length : (batch + 1) * q_length],
+                    _paged_rows(k_cache, page_table, batch, length),
+                    _paged_rows(v_cache, page_table, batch, length),
+                    causal=q_length > 1,
+                )
                 for batch, length in enumerate(lengths)
             ]
         )

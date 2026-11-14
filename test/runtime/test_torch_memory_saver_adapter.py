@@ -20,6 +20,7 @@
 
 """CPU checks for managed versus resident native allocation scopes."""
 
+import sys
 from contextlib import contextmanager
 
 import pytest
@@ -73,12 +74,12 @@ class CpuMemorySaver:
 @pytest.fixture
 def memory(monkeypatch):
     saver = CpuMemorySaver()
-    monkeypatch.setattr(adapter, "_primary_memory_saver", saver, raising=False)
+    monkeypatch.setattr(adapter, "_gpu_memory_saver", lambda: saver)
     return saver
 
 
 def test_native_storage_initializes_after_weight_region_and_survives_discard(memory):
-    saver = adapter.TorchMemorySaverAdapter.create(enable=True)
+    saver = adapter.TorchMemorySaverAdapter.create(enable=True, device="cuda")
     communication = []
     with saver.region(tag="weights", enable_cpu_backup=False):
         weight = memory.allocate(5)
@@ -93,7 +94,7 @@ def test_native_storage_initializes_after_weight_region_and_survives_discard(mem
 
 
 def test_multiple_preparations_finish_before_region_returns(memory):
-    saver = adapter.TorchMemorySaverAdapter.create(enable=True)
+    saver = adapter.TorchMemorySaverAdapter.create(enable=True, device="cuda")
     outputs = []
     with saver.region(tag="weights", enable_cpu_backup=False):
         for value in (3, 5, 7):
@@ -106,7 +107,7 @@ def test_multiple_preparations_finish_before_region_returns(memory):
 
 
 def test_failed_weight_load_does_not_initialize_communication(memory):
-    saver = adapter.TorchMemorySaverAdapter.create(enable=True)
+    saver = adapter.TorchMemorySaverAdapter.create(enable=True, device="cuda")
     outputs = []
     with pytest.raises(RuntimeError, match="load failed"):
         with saver.region(tag="weights", enable_cpu_backup=False):
@@ -120,7 +121,7 @@ def test_failed_weight_load_does_not_initialize_communication(memory):
 
 
 def test_preparation_failure_fails_loading_after_managed_scope_exits(memory):
-    saver = adapter.TorchMemorySaverAdapter.create(enable=True)
+    saver = adapter.TorchMemorySaverAdapter.create(enable=True, device="cuda")
 
     def fail():
         assert not memory.active
@@ -133,10 +134,17 @@ def test_preparation_failure_fails_loading_after_managed_scope_exits(memory):
 
 
 def test_disabled_adapter_initializes_communication_immediately(memory):
-    saver = adapter.TorchMemorySaverAdapter.create(enable=False)
+    saver = adapter.TorchMemorySaverAdapter.create(enable=False, device="cuda")
     outputs = []
     with saver.region(tag="weights", enable_cpu_backup=False):
         adapter.initialize_communication(lambda: outputs.append(memory.allocate(23)))
         assert outputs[0].item() == 23
     memory.pause(tag="weights")
     assert outputs[0].item() == 23
+
+
+def test_npu_and_disabled_gpu_can_construct_adapters_without_gpu_package(monkeypatch):
+    monkeypatch.setitem(sys.modules, "torch_memory_saver", None)
+    adapter.TorchMemorySaverAdapter.create(enable=True, device="npu")
+    with adapter.TorchMemorySaverAdapter.create(enable=False, device="cuda").region():
+        pass

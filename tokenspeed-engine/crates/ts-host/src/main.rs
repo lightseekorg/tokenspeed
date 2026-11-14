@@ -1052,5 +1052,9 @@ fn main() -> ExitCode {
 }
 
 #[cfg(test)]
+#[path = "../tests/support/restore_gil_for_exit.rs"]
+mod restore_gil_for_exit_tests;
+
+#[cfg(test)]
 #[path = "tests/main.rs"]
 mod tests;

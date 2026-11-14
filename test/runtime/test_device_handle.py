@@ -1142,15 +1142,29 @@ def test_the_forward_thread_takes_the_device_the_handle_was_built_on():
     assert seen == [0, 1]
 
 
-def test_the_guard_rejects_cuda_factories_before_they_run():
-    """Caught at dispatch, so this holds even on a CUDA-less machine."""
+# The ATen overload reaches the dispatch guard before CUDA initialization.
+# The public factory initializes CUDA before dispatch.
+@pytest.mark.parametrize(
+    "factory",
+    [
+        pytest.param(torch.ops.aten.empty.memory_format, id="aten"),
+        pytest.param(
+            torch.empty,
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="requires a CUDA device"
+            ),
+            id="torch-empty",
+        ),
+    ],
+)
+def test_the_guard_rejects_cuda_factories_before_they_run(factory):
     from tokenspeed.runtime.execution.device import _NoDeviceWork
 
     with _NoDeviceWork():
         cpu = torch.zeros(3)
         cpu += 1  # CPU work passes
         with pytest.raises(RuntimeError, match="Principle 1"):
-            torch.empty(2, device="cuda")
+            factory([2], device=torch.device("cuda"))
 
 
 def test_the_guard_scans_tensor_lists():
@@ -1564,6 +1578,30 @@ def test_replica_kv_resume_completes_clear_before_registration_and_reply():
         "peer.register",
         "device.synchronize",
     ]
+
+
+@pytest.mark.parametrize("operation", ["plan_without_forward", "idle_forward"])
+def test_ascend_saver_refuses_to_launch_with_unavailable_pools(operation):
+    from tokenspeed.runtime.execution.ascend_memory_saver_device import (
+        AscendMemorySaverDeviceHandle,
+    )
+    from tokenspeed.runtime.execution.weight_memory import WeightMemoryState
+
+    executor = _SleepExecutor([])
+    executor.model_runner = SimpleNamespace(
+        memory_saver_adapter=SimpleNamespace(
+            assert_active=mock.Mock(side_effect=RuntimeError("pool unavailable"))
+        )
+    )
+    handle = AscendMemorySaverDeviceHandle(
+        executor, weight_memory=WeightMemoryState(policy="cpu_backup", models=[])
+    )
+
+    with pytest.raises(RuntimeError, match="pool unavailable"):
+        if operation == "plan_without_forward":
+            handle.execute(None, None, cache_ops=())
+        else:
+            handle.run_idle_forward(None)
 
 
 def test_nccl_suspend_and_resume_reach_the_communicators(monkeypatch):

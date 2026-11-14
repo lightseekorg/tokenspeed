@@ -57,7 +57,7 @@ use ts_control::{
 };
 use ts_l3::{
     monotonic_clock, Executor, ExecutorConfig, GroupLayout, HostBuffer, HostLayout, IoResult,
-    Namespace, Range, Store, StoreError,
+    MemoryStore, Namespace, Range, Store, StoreError,
 };
 use ts_pd::{
     BootstrapInfo, EmbeddingItem, EmbeddingReceiver, LandedItem, LandedRequest, PdError, PdEvent,
@@ -69,8 +69,9 @@ use ts_scheduler::{
 use ts_wire::{
     codec::{Dict, StrOrList},
     control::{
-        FlushCacheReqInput, IsSchedulerPausedReqInput, IsSleepingReqInput, PauseSchedulerReqInput,
-        ProfileReq, ReleaseMemoryOccupationReqInput, ReloadForwardReqInput,
+        FlushCacheReqInput, GetSharedPrefixPublicationReqInput,
+        GetSharedPrefixPublicationReqOutput, IsSchedulerPausedReqInput, IsSleepingReqInput,
+        PauseSchedulerReqInput, ProfileReq, ReleaseMemoryOccupationReqInput, ReloadForwardReqInput,
         ResumeMemoryOccupationReqInput, ResumeSchedulerReqInput, UpdateWeightFromDiskReqInput,
         PROFILE_START,
     },
@@ -1040,6 +1041,8 @@ struct ScriptedStore {
     gate: Arc<Gate>,
     queries: Arc<Mutex<usize>>,
     gets: Arc<Mutex<usize>>,
+    /// Use the real in-memory store when a test needs publication and deletion.
+    memory: Option<Arc<MemoryStore>>,
 }
 
 impl Store for ScriptedStore {
@@ -1050,16 +1053,22 @@ impl Store for ScriptedStore {
     fn batch_exists(&self, keys: &[String]) -> Result<Vec<bool>, StoreError> {
         *self.queries.lock().unwrap() += 1;
         self.gate.pass();
+        if let Some(memory) = &self.memory {
+            return memory.batch_exists(keys);
+        }
         Ok(vec![true; keys.len()])
     }
 
     fn batch_get_into(
         &self,
         keys: &[String],
-        _: HostBuffer,
-        _: &[Range],
+        host: HostBuffer,
+        ranges: &[Range],
     ) -> Result<IoResult, StoreError> {
         *self.gets.lock().unwrap() += 1;
+        if let Some(memory) = &self.memory {
+            return memory.batch_get_into(keys, host, ranges);
+        }
         let landed = self.landed.unwrap_or(keys.len());
         Ok(IoResult {
             success: (0..keys.len()).map(|key| key < landed).collect(),
@@ -1071,9 +1080,12 @@ impl Store for ScriptedStore {
     fn batch_put_from(
         &self,
         keys: &[String],
-        _: HostBuffer,
-        _: &[Range],
+        host: HostBuffer,
+        ranges: &[Range],
     ) -> Result<IoResult, StoreError> {
+        if let Some(memory) = &self.memory {
+            return memory.batch_put_from(keys, host, ranges);
+        }
         Ok(IoResult {
             success: vec![true; keys.len()],
             retired: true,
@@ -1081,8 +1093,10 @@ impl Store for ScriptedStore {
         })
     }
 
-    fn remove_by_prefix(&self, _: &str) -> bool {
-        true
+    fn remove_by_prefix(&self, prefix: &str) -> bool {
+        self.memory
+            .as_ref()
+            .is_none_or(|memory| memory.remove_by_prefix(prefix))
     }
 
     fn close(&self) {}
@@ -1331,6 +1345,8 @@ struct Setup {
     l3_landed_keys: Option<fn(usize) -> usize>,
     /// L3: the stores' queries wait until the test opens their gates.
     l3_held_queries: bool,
+    /// Share a real store across the L3 executors instead of scripted hits.
+    l3_memory_store: Option<Arc<MemoryStore>>,
     /// The polls each rank's cache ops wait after the first before they are
     /// acknowledged; none when unset.
     cache_ack_polls: Option<fn(usize) -> usize>,
@@ -1349,6 +1365,8 @@ struct Setup {
     replica_memory_transitions: bool,
     /// Advertise the legacy NCCL region when the fixture models protocol 2.
     legacy_nccl: bool,
+    /// Advertise the Ascend graph region beside the shared KV arena.
+    ascend_graph: bool,
     /// A rank that fails after memory release begins.
     memory_release_failure_rank: Option<usize>,
     /// A rank that fails after memory resume begins.
@@ -1374,6 +1392,9 @@ fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopCon
     let mut memory_regions = vec!["kv_cache".to_owned(), "weights".to_owned()];
     if setup.legacy_nccl {
         memory_regions.push("nccl".to_owned());
+    }
+    if setup.ascend_graph {
+        memory_regions.push("acl_graph".to_owned());
     }
     LoopConfig {
         in_flight_depth,
@@ -1455,7 +1476,7 @@ fn run_rank<F: Frontend>(
         rank,
         layout,
         tiers,
-        config,
+        mut config,
         setup,
         mesh_listener,
         addresses,
@@ -1477,6 +1498,9 @@ fn run_rank<F: Frontend>(
         ..
     } = setup;
     let role = pd.as_ref().map_or(Role::Plain, |pd| pd.role);
+    if store.is_some() {
+        config.controls.l3_weight_version = Some("v1".to_owned());
+    }
     let outputs = OutputProcessor::new(
         None,
         1,
@@ -1638,6 +1662,7 @@ async fn start_ranks_with(
                 gate: storage_gate.clone(),
                 queries: Arc::new(Mutex::new(0)),
                 gets: Arc::new(Mutex::new(0)),
+                memory: setup.l3_memory_store.clone(),
             });
             let handle = Rank {
                 thread: None,
@@ -4842,6 +4867,145 @@ async fn a_load_refused_by_any_rank_runs_on_none_and_can_be_retried() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_refused_load_preserves_l3_publication_until_the_same_version_retry() {
+    async fn publication(engine: &Engine, query_id: &str) -> GetSharedPrefixPublicationReqOutput {
+        let request =
+            ControlRequest::GetSharedPrefixPublication(GetSharedPrefixPublicationReqInput {
+                rid: None,
+                http_worker_ipc: None,
+                query_id: query_id.to_owned(),
+                input_ids: (1..=65).collect(),
+                max_prefix_tokens: 64,
+            });
+        let mut replies =
+            tokio::time::timeout(Duration::from_secs(10), engine.client.control(request))
+                .await
+                .expect("no publication reply")
+                .unwrap();
+        assert_eq!(replies.len(), 1);
+        let ControlOutput::GetSharedPrefixPublication(reply) = replies.pop().unwrap() else {
+            panic!("unexpected publication reply");
+        };
+        assert!(reply.success, "{}", reply.message);
+        assert_eq!(reply.query_id, query_id);
+        assert_eq!(reply.dp_rank, 0);
+        reply
+    }
+
+    async fn published(engine: &Engine, query_id: &str) -> GetSharedPrefixPublicationReqOutput {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let reply = publication(engine, query_id).await;
+                if reply.status == "published" {
+                    assert_eq!(reply.confirmed_prefix_tokens, 64);
+                    return reply;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the warm prefix was not published")
+    }
+
+    let store = Arc::new(MemoryStore::new());
+    let engine = start_ranks_with(
+        Layout::Tp(2),
+        1,
+        Tiers::L3,
+        Setup {
+            l3_memory_store: Some(store.clone()),
+            weight_load_refused: Some(|rank| rank == 1),
+            ..Setup::default()
+        },
+    )
+    .await;
+    assert_eq!(
+        tokens(&run(&engine.client, request("warm", 65, budget(2))).await),
+        [1000, 1001]
+    );
+    let before = published(&engine, "before-refusal").await;
+    let old_namespace = ts_l3::keys::key_prefix("serving", "v1", "");
+    assert_eq!(before.storage_namespace, old_namespace);
+    assert!(before.cache_epoch > 0);
+    let old_keys = store.keys();
+    assert!(!old_keys.is_empty());
+    assert!(old_keys.iter().all(|key| key.starts_with(&old_namespace)));
+
+    let update = ControlRequest::UpdateWeightFromDisk(UpdateWeightFromDiskReqInput {
+        rid: None,
+        http_worker_ipc: None,
+        model_path: "/checkpoint".to_owned(),
+        load_format: None,
+        weight_version: Some("v2".to_owned()),
+        flush_cache: true,
+    });
+    assert_eq!(
+        control(&engine, update.clone()).await,
+        [("UpdateWeightFromDiskReqOutput", false)]
+    );
+    let refused = publication(&engine, "after-refusal").await;
+    assert_eq!(refused.status, "published");
+    assert_eq!(refused.confirmed_prefix_tokens, 64);
+    assert_eq!(refused.cache_epoch, before.cache_epoch);
+    assert_eq!(refused.storage_namespace, before.storage_namespace);
+    let refused_keys = store.keys();
+    assert!(old_keys.iter().all(|key| refused_keys.contains(key)));
+    for rank in &engine.ranks {
+        assert!(rank.device_ops.lock().unwrap().is_empty());
+        assert!(rank.weight_commits.lock().unwrap().is_empty());
+    }
+    let chunks = run(&engine.client, request("after-refusal", 65, budget(2))).await;
+    assert_eq!(tokens(&chunks), [1000, 1001]);
+    assert!(chunks.last().unwrap().cached_tokens > 0);
+
+    for rank in &engine.ranks {
+        rank.weight_load_refused.store(false, Ordering::SeqCst);
+    }
+    // A just-finished request can still refuse the flush. Retry the same
+    // checkpoint version; refused admission must not reserve that version.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while control(&engine, update.clone())
+            .await
+            .iter()
+            .any(|(_, success)| !success)
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the same-version retry never succeeded");
+    assert_weight_commits(&engine, &[true]).await;
+    for rank in &engine.ranks {
+        assert_eq!(
+            *rank.device_ops.lock().unwrap(),
+            ["UpdateWeightFromDiskReqInput"]
+        );
+    }
+    assert!(
+        store.keys().is_empty(),
+        "the old L3 namespace survived the flush"
+    );
+    let flushed = publication(&engine, "after-commit").await;
+    assert_eq!(flushed.status, "pending");
+    assert_eq!(flushed.confirmed_prefix_tokens, 0);
+    assert!(flushed.cache_epoch > before.cache_epoch);
+    let new_namespace = ts_l3::keys::key_prefix("serving", "v2", "");
+    assert_eq!(flushed.storage_namespace, new_namespace);
+
+    let chunks = run(&engine.client, request("after-retry", 65, budget(2))).await;
+    assert_eq!(tokens(&chunks), [1000, 1001]);
+    assert_eq!(chunks.last().unwrap().cached_tokens, 0);
+    let after = published(&engine, "new-publication").await;
+    assert_eq!(after.cache_epoch, flushed.cache_epoch);
+    assert_eq!(after.storage_namespace, new_namespace);
+    assert!(!store.keys().is_empty());
+    assert!(store
+        .keys()
+        .iter()
+        .all(|key| key.starts_with(&new_namespace)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_failed_weight_load_is_committed_as_invalid_on_every_rank() {
     for layout in [Layout::Dp(2), Layout::Tp(2), Layout::Pp(2)] {
         let engine = start_ranks_with(
@@ -5589,6 +5753,54 @@ fn memory_release_uses_supported_regions_for_each_protocol() {
                 "resume nccl,weights,kv_cache",
             ]
         };
+        for rank in ranks {
+            assert_eq!(rank.outcome, Ok(()));
+            assert_eq!(rank.device_ops, expected_ops);
+        }
+    }
+}
+
+#[test]
+fn dp_ascend_graph_release_matches_effective_tags_and_waits_for_kv_wake() {
+    for wake_kv in [false, true] {
+        let mut scripts = vec![vec![Vec::new(); 30]; 2];
+        scripts[0][0].push(memory_transition(true, Some(&["acl_graph"])));
+        scripts[1][2].push(memory_transition(true, Some(&["kv_cache", "acl_graph"])));
+        for script in &mut scripts {
+            script[6].push(memory_transition(false, Some(&["acl_graph"])));
+            if wake_kv {
+                script[18].push(memory_transition(false, Some(&["kv_cache"])));
+            }
+        }
+        scripts[0][10].push(EngineRequest::Add(Box::new(request("awake", 4, budget(2)))));
+        let ranks = run_scripted(
+            Layout::TpDp { tp: 2, dp: 2 },
+            0,
+            Tiers::DeviceOnly,
+            Setup {
+                replica_memory_transitions: true,
+                ascend_graph: true,
+                ..Setup::default()
+            },
+            scripts,
+            no_reaction,
+        );
+        let mut expected_ops = vec!["release kv_cache,acl_graph", "resume acl_graph"];
+        let mut expected_replies = vec![
+            ("ReleaseMemoryOccupationReqOutput", true),
+            ("ResumeMemoryOccupationReqOutput", true),
+        ];
+        if wake_kv {
+            expected_ops.push("resume kv_cache");
+            expected_replies.push(("ResumeMemoryOccupationReqOutput", true));
+            assert_scripted_tokens(&ranks[0], "awake", 2);
+        } else {
+            assert!(ranks[0].finished.is_empty());
+            assert_eq!(ranks[0].forwards, 0);
+        }
+        for leader in [&ranks[0], &ranks[2]] {
+            assert_eq!(outcome(leader.replies.clone()), expected_replies);
+        }
         for rank in ranks {
             assert_eq!(rank.outcome, Ok(()));
             assert_eq!(rank.device_ops, expected_ops);
@@ -6543,6 +6755,7 @@ fn a_profile_keeps_the_rounds_that_only_advance_storage() {
         gate: Gate::closed(),
         queries: Arc::new(Mutex::new(0)),
         gets: Arc::new(Mutex::new(0)),
+        memory: None,
     };
     let (queries, gets) = (store.queries.clone(), store.gets.clone());
     let notes = Arc::new(Mutex::new(RoundNotes::default()));
