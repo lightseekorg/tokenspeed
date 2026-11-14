@@ -12,6 +12,7 @@ runner:
 env:
   CI: "true"
   KIMI_K31_GATEWAY_TOKENIZER: /cache/huggingface/kimi-k3.1-gateway-tokenizer
+  GPU_MAX_HW_QUEUES: "2"
 install:
   - bash test/ci_system/install_deps_rocm.sh
 # --disable-prefill-graph: prefill graphs want 40 buckets on top of the decode
@@ -48,6 +49,7 @@ server:
     --trust-remote-code
     --sampling-backend greedy
     --disable-kvstore
+    --enable-startup-requests
     --kvstore-ratio 0.0
     --disable-prefix-caching
     --host 127.0.0.1
