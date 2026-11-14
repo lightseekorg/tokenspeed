@@ -1034,6 +1034,15 @@ every collective on NCCL (reductions on the fold). `AutoBackend.route` is
 the one place that decides. `docs/design/numerics.md` has the measured
 basis.
 
+Under plain attention TP with replicated MLA latent KV (no KVP, no query
+context parallelism), a GPU DSA sparse prefill of at least 4096 rows runs its
+core attention on a row shard instead of a head shard. An all-to-all hands
+each rank `1 / W` of the rows with every rank's heads (padded to the
+trtllm-gen core's head count), the core attends them, and a second all-to-all
+returns each rank's heads of every row. The core then reads each selected KV
+row once for all heads instead of once per rank. The bitwise numerics
+envelopes keep the head shard.
+
 On ARM systems, [NCCL 2.29.3](https://github.com/NVIDIA/nccl/releases/tag/v2.29.3-1)
 fixes a weak compare-and-swap failure that can hang NCCL when it was compiled
 with GCC older than 10. Affected NCCL builds older than 2.29.3 can exhaust proxy

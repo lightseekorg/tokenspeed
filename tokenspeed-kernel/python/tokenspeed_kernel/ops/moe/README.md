@@ -754,7 +754,7 @@ and the all-reduces leave idle, so the chain prefetches weights into L2
 (`_cute_dsl/k3_decode_prefetch.py` has the row counts and caps). A side stream
 prefetches the MoE front's packed weight after the o-projection exit; the
 o-projection shard and the MoE layer's front, shared-expert and up-projection
-weights after the KDA input projection or the MLA core; and, once the routed
+weights after the attention input projection; and, once the routed
 experts launch, the next layer's attention weights up to a cap. At 4-7 rows the
 routed experts instead prefetch the up-projection shard and the next attention's
 weights themselves, once their last weight load is issued. The forward rejoins
