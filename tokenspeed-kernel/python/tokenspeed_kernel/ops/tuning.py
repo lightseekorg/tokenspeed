@@ -163,6 +163,7 @@ def _reuse_autotune_cache():
         inputs=None,
         *,
         require_profiling_policy: bool = False,
+        validation_profile=None,
     ):
         with tuner._lock:
             # FI 0.7 skips persisted entries for cold-L2 tuning. Use serving
@@ -180,6 +181,7 @@ def _reuse_autotune_cache():
                     tuning_config,
                     inputs=inputs,
                     require_profiling_policy=require_profiling_policy,
+                    validation_profile=validation_profile,
                 )
             finally:
                 tuner.is_tuning_mode = was_tuning
