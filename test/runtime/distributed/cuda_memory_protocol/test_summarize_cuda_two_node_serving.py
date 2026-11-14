@@ -63,11 +63,24 @@ def nccl_counts(rank_rows, ranks):
                 and all(type(value) is int and value > 0 for value in ids)
             ), "Missing or invalid NCCL inventory"
             assert len(set(ids)) == len(ids), "Duplicate NCCL backend"
+            names = inventory.get("backend_group_names")
+            registered = inventory.get("registered_pg_names")
+            assert (
+                isinstance(names, list)
+                and names
+                and all(isinstance(name, str) and name for name in names)
+            ), "Missing or invalid NCCL group names"
+            assert len(set(names)) == len(names), "Duplicate NCCL group name"
+            assert isinstance(registered, list) and all(
+                isinstance(name, str) and name for name in registered
+            ), "Missing or invalid NCCL group registry"
+            assert set(names) <= set(registered), "Unregistered NCCL group name"
             assert type(count) is int and count > 0 and count == len(ids), (
                 "NCCL count differs from its production inventory",
                 rank,
                 release,
             )
+            assert count == len(names), "NCCL count differs from its group inventory"
             assert (
                 inventory["operation"] == completed["operation"]
             ), "Mismatched NCCL operation"
@@ -93,7 +106,9 @@ def nccl_counts(rank_rows, ranks):
             assert all(type(stamp) is int and stamp >= 0 for stamp in stamps) and all(
                 first < second for first, second in zip(stamps, stamps[1:])
             ), "NCCL evidence lies outside its apply phase"
-            phases[release] = (set(ids), inventory["operation"], stamps)
+            # Pybind can recreate or reuse Python backend wrappers between
+            # calls; the registered communicator names identify the pair.
+            phases[release] = (set(names), inventory["operation"], stamps)
         assert phases[True][0] == phases[False][0], "Unpaired NCCL backend inventory"
         assert phases[True][1] < phases[False][1], "Unpaired NCCL operation order"
         assert phases[True][2][-1] < phases[False][2][0], "Unpaired NCCL phase order"
