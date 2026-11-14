@@ -593,6 +593,100 @@ for larger batches. Row-derived reduction groups and token pairing belong
 only to the wider model. Other dimensions keep ordinary kernel selection;
 the fused work budget still bounds automatic selection.
 
+FP8 mixer weights use the same operator entry, with explicit
+`activation_quantization="none"` (W8A16) or `"fp8"` (W8A8), and FP32
+dequantization scales per output channel or per tensor. The validated FP8
+CuTe models are `(4, 2560, 320)` and `(4, 8192, 1024)` on Blackwell.
+Weights remain E4M3 in global memory. W8A16 converts only the resident weight
+tile to the activation dtype; W8A8 feeds native FP8 MMA. Split-K projection partials
+are reduced in rank order before scaling, inject stores and SiLU. SiLU
+rounds to the selected output dtype before Up; for 16-bit inputs this is
+the normalized-input dtype.
+
+With 16-bit normalized input, W8A8 applies the canonical per-token scale floor
+and independently rounded quantization multiplier to both normalized inputs
+and post-SiLU activations.
+The packed input quantizer retains 16-bit values in registers until
+the row maximum is available, then converts them with the same FP32 rounding.
+Up fuses weight/activation scaling, sigmoid gating and branch summation;
+it reads the original 16-bit normalized residual. This takes three compute
+launches for W8A16 and four for W8A8, including input quantization. The FP64
+reference includes these explicit quantization/rounding edges; quantization
+error against the unquantized model is a separate comparison. Weight-code
+and scale updates preserve their storage across graph replay, and share
+the existing PDL readiness contract. FP8 startup warms the finite token-tile
+buckets through the same execution helper.
+
+Prequantized W8A8 uses that same operator with E4M3 input codes, an explicit
+FP32 `normalized_scale` (one value or one per flattened token row), and an
+explicit BF16/FP16 `output_dtype`. The residual is input codes times their
+scale in FP32; it does not round through a separate 16-bit input. The
+predecessor owns input quantization. Mixer fusion preserves post-SiLU rounding
+to `output_dtype`, followed by canonical per-token FP8 quantization for Up.
+
+For the validated Blackwell model dimensions, Down, ordered split reduction,
+SiLU/FP8 quantization, Up and residual mixing execute in one cooperative
+kernel. Down and Up both use native FP8 MMA with FP32 accumulation. The
+resident grid is bounded by the compiled function's measured occupancy;
+device-scope arrival counters publish each phase and protect scratch reuse.
+The phases reuse one shared operand arena and TMEM allocation, with MMA
+completion and reader acknowledgements before reuse. Each execution stream
+owns persistent scratch and monotonic epochs initialized during warmup;
+graph replay needs no reset kernel. Startup warms finite token buckets
+16/32/64/128/256, with runtime row masks and additional rounds for larger
+batches. PDL waits precede producer-owned input, weight and scale reads.
+
+Prequantized Up reuses the BF16 token-major tile for the wide model and the
+largest narrow-model bucket: 128 tokens by four branches of contiguous hidden
+channels (64 per branch for the wide model, 32 for the narrow model). The
+256-token bucket retains two TMEM accumulators and shares each weight stage
+across their independent activation tiles. The last operand stages stay owned
+until both token parts finish; publishing the first accumulator before the
+second part's MMA tail lets its residual epilogue overlap that tail.
+
+The token-major reader owns a contiguous hidden vector within one token.
+Packed register loads prefetch the next branch's FP8 residual while the
+current branch consumes TMEM; the output is written directly in 16-byte
+vectors. Input, activation and weight scales are cached per tile. Small narrow
+buckets retain the hidden-major layout and shared residual/gate staging to
+avoid padding token MMA work. Both layouts use the same resident phases and
+producer/MMA stage pipeline. Another token round waits before scratch reuse;
+the final round publishes its arrivals without polling, with stream and PDL
+completion ordering protecting the next invocation.
+
+Under PDL, FP8 quantization can permit independent GEMM weight prefetch during
+its local math, after its upstream wait. GEMMs still wait before activation
+reads. Packed wide-input quantization uses a larger CTA under PDL to shorten
+the Down activation wait. Model width and PDL select its plan; row counts remain
+runtime arguments. Epilogue notification timing is a finite plan choice; nearly full
+legacy Up tiles retain late signaling because early launch increases latency.
+Wider token buckets can assign inject work to a separate warp while activation
+threads alone participate in quantization barriers. Startup warms these finite
+choices through the ordinary operator.
+
+The native FP8 Down projection pairs its initial weight and activation
+transfers when PDL is disabled. Full/empty barriers protect stage reuse;
+PDL retains its readiness dependency ordering.
+
+The wider model's larger W8A8 Up buckets reuse each resident FP8 weight tile
+across two independent 128-token MMA tiles. Separate activation tiles and
+TMEM accumulators retain each token's reduction; a shared operand stage is
+released after both MMAs finish.
+
+The FP8 plans choose resident operand tiles from model dimensions and finite
+row buckets. The wider model's W8 Down converts resident weight codes in
+registers directly into TMEM, with separate rings for compressed weights,
+decoded weights and original 16-bit activations. A raw slot stays owned until
+conversion and TMEM stores finish. The wider model's smallest W8 Up bucket
+expands a resident compressed shared tile in place. Its larger Up buckets use
+separate raw and decoded weight rings, allowing conversion to advance without
+overwriting MMA operands. Independent activation loading follows the same
+ownership rules. Up owns every HC branch of each output tile within one CTA,
+and can reuse decoded weights across two token tiles. Its larger token tiles
+cache output-channel scales in shared memory after the same readiness
+dependency, once per CTA across both token epilogues. Runtime row masks and
+startup bucket warming preserve the same graph replay contract.
+
 Startup uses the ordinary dummy model traversal with `kernel_warmup` to
 prepare CuTe QSA, streaming top-k and gated residual configurations. It follows
 normal dispatch overrides and scratch budgets, independently of optional

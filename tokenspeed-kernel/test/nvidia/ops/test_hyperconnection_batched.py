@@ -91,6 +91,7 @@ def mix(values, scale, independent):
         weights_independent=independent,
         override="cute_fused_hyperconnection_mix",
         solution=None,
+        activation_quantization="none"
     )
 
 
@@ -130,6 +131,7 @@ def test_batched_default_dispatch_respects_row_limit(
         weights_independent=True,
         override=None,
         solution=None,
+        activation_quantization="none"
     )
     assert capture._records[-1].kernel_name == expected_kernel
     check(result, reference(values, 0.25), dtype)
@@ -166,6 +168,7 @@ def test_default_dispatch_boundary_graph_replays(rows, expected_kernel, dtype):
             weights_independent=True,
             override=None,
             solution=None,
+            activation_quantization="none"
         )
 
     stream = torch.cuda.Stream()
@@ -705,6 +708,7 @@ def test_startup_warms_full_tail_tiles_and_rounds(monkeypatch):
             weights_independent=True,
             override=None,
             solution=None,
+            activation_quantization="none",
         )
 
     stream = torch.cuda.Stream()
@@ -769,6 +773,7 @@ def test_startup_warms_global_fused_override(
             weights_independent=True,
             override=override,
             solution=solution,
+            activation_quantization="none",
         )
 
     stream = torch.cuda.Stream()
@@ -826,6 +831,7 @@ def test_startup_skips_global_nonfused_override(monkeypatch, override_source):
             weights_independent=True,
             override="cute_fused_hyperconnection_mix",
             solution="cute_fused",
+            activation_quantization="none"
         )
     check(actual, reference(values, 0.25), torch.bfloat16)
     assert not cute_fused._PLANS
@@ -946,6 +952,7 @@ def test_prefill_up_mix_dynamic_graph(dtype, enable_pdl, has_inject):
             projection_scale=0.25,
             packed_up_weight=packed,
             override=override,
+            activation_quantization="none",
         )
 
     # Only warm the first large shape. Unseen tails must capture without JIT.
@@ -965,6 +972,7 @@ def test_prefill_up_mix_dynamic_graph(dtype, enable_pdl, has_inject):
             packed_up_weight=packed,
             override=None,
             solution=None,
+            activation_quantization="none",
         )
         expected_name = (
             "triton_hyperconnection_mix"
@@ -1018,6 +1026,7 @@ def test_prefill_up_mix_fallback_contract():
         projection_rows=324,
         weights_independent=True,
         override="triton_hyperconnection_mix",
+        activation_quantization="none",
     )
     for x, prepared, independent in (
         (value, None, True),
@@ -1036,6 +1045,7 @@ def test_prefill_up_mix_fallback_contract():
             packed_up_weight=prepared,
             override=None,
             solution=None,
+            activation_quantization="none",
         )
         assert kernel.name == "triton_hyperconnection_mix"
         actual = gated_residual_mix(
@@ -1048,5 +1058,6 @@ def test_prefill_up_mix_fallback_contract():
             projection_rows=324,
             weights_independent=independent,
             packed_up_weight=prepared,
+            activation_quantization="none",
         )
         torch.testing.assert_close(actual, expected, rtol=0.005, atol=0.002)

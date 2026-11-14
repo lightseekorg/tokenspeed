@@ -178,6 +178,7 @@ def test_hyperconnection_mix_generator_selection_matches_operation_api(
             lowrank,
             projection_rows=lowrank + (hc_count if inject else 0),
             weights_independent=True,
+            activation_quantization="none",
         )
     request = BenchmarkRequest(
         family="residual",

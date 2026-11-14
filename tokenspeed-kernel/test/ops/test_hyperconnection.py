@@ -185,6 +185,7 @@ def _mix(
         solution=None,
         projection_scale=projection_scale,
         weights_independent=weights_independent,
+        activation_quantization="none",
     )
 
 
@@ -314,6 +315,7 @@ def test_general_triton_mix_projection_storage(
         weights_independent=False,
         override="triton_hyperconnection_mix",
         solution=None,
+        activation_quantization="none",
     )
     assert projection_widths[0] == projection.shape[0]
     if prepared and dtype is not torch.float32:
