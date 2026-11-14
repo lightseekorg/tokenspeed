@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import math
 import os
 import signal
 import subprocess
@@ -123,6 +124,22 @@ class Completion:
         self.accept_draft_tokens = chunk["accept_draft_tokens"]
 
 
+@dataclasses.dataclass(frozen=True)
+class SchedulerLoadSample:
+    """One frontend-observed scheduler-load snapshot during ``generate``.
+
+    The four values in each ``engines`` row are ``num_running``,
+    ``num_waiting``, ``kv_active_pages`` and ``kv_total_pages``. ``in_flight``
+    is the frontend's current unfinished-request count for the same engine.
+    These are observations, not a trace: an empty sample sequence cannot prove
+    that requests were not batched.
+    """
+
+    elapsed_s: float
+    engines: tuple[tuple[int, int, int, int], ...]
+    in_flight: tuple[int, ...]
+
+
 class WireDriver:
     """A headless engine and the frontend connection to it.
 
@@ -146,7 +163,7 @@ class WireDriver:
                 the frontend address, which the driver adds.
             num_engines: The engine's attention-DP ranks.
             routing: How requests are placed on them: ``"round_robin"``,
-                ``"least_in_flight"`` or ``"minimum_cache_usage"``, or
+                ``"least_in_flight"`` or ``"minimum_cache_usage"`, or
                 ``"bootstrap_room"`` for a disaggregated role.
             startup_timeout_s: How long the engine may take to register.
             env: Variables to set for the engine's processes over this
@@ -230,23 +247,73 @@ class WireDriver:
         """
         return asyncio.run(self._generate(requests))
 
-    async def _generate(self, requests):
+    def generate_with_loads(
+        self,
+        requests: list[TokenizedGenerateReqInput],
+        *,
+        poll_interval_s: float,
+    ) -> tuple[list[Completion], list[SchedulerLoadSample]]:
+        """Run requests together and collect their output-coupled load snapshots.
+
+        This is deliberately an observation API rather than a scheduler trace:
+        the engine only publishes a load snapshot with an output, so a sample is
+        collected immediately after a current call's output arrives. In
+        particular, an empty or all-zero result must be reported as inconclusive,
+        not used to infer that the requests were not co-scheduled.
+
+        Args:
+            requests: Requests to submit before receiving any output.
+            poll_interval_s: Positive finite minimum interval between retained
+                load samples.
+        """
+        if not math.isfinite(poll_interval_s) or poll_interval_s <= 0:
+            raise ValueError("poll_interval_s must be a positive finite number")
+        return asyncio.run(self._generate_with_loads(requests, poll_interval_s))
+
+    async def _generate(self, requests, *, load_samples=None, poll_interval_s=None):
         completions = {request.rid: Completion() for request in requests}
         for request in requests:
             frames = [bytes(frame) for frame in self._encoder.encode(request)]
             await self.frontend.generate(frames)
+        started = time.monotonic()
+        last_sample_at = None
         unfinished = set(completions)
         while unfinished:
-            for rid, chunk in await self.frontend.next_outputs():
-                if rid not in completions:
-                    # A request of an earlier call that did not finish.
-                    continue
+            outputs = await self.frontend.next_outputs()
+            current_outputs = [
+                (rid, chunk) for rid, chunk in outputs if rid in completions
+            ]
+            if current_outputs and (
+                load_samples is not None
+                and (
+                    last_sample_at is None
+                    or time.monotonic() - last_sample_at >= poll_interval_s
+                )
+            ):
+                load_samples.append(
+                    SchedulerLoadSample(
+                        elapsed_s=time.monotonic() - started,
+                        engines=tuple(tuple(load) for load in self.frontend.loads()),
+                        in_flight=tuple(self.frontend.in_flight()),
+                    )
+                )
+                last_sample_at = time.monotonic()
+            for rid, chunk in current_outputs:
                 if isinstance(chunk, Exception):
                     raise chunk
                 completions[rid].add(chunk)
                 if chunk["finish_reason"] is not None:
                     unfinished.discard(rid)
         return [completions[request.rid] for request in requests]
+
+    async def _generate_with_loads(self, requests, poll_interval_s):
+        samples = []
+        completions = await self._generate(
+            requests,
+            load_samples=samples,
+            poll_interval_s=poll_interval_s,
+        )
+        return completions, samples
 
     def control(self, operation) -> list:
         """Run a control operation (``zmq_wire.CONTROL_REQUESTS``) on every

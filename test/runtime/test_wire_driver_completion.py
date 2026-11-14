@@ -30,7 +30,7 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
-from tokenspeed.runtime.entrypoints.wire_driver import Completion
+from tokenspeed.runtime.entrypoints.wire_driver import Completion, WireDriver
 
 
 def _chunk(ids, logprobs, cumulative_probs, reason, reasoning_tokens=0):
@@ -75,6 +75,13 @@ def test_completion_without_diagnostics_keeps_the_column_empty():
     completion = Completion()
     completion.add(_chunk([4], [-0.2], [], "length"))
     assert completion.output_token_cumulative_probs == []
+
+
+@pytest.mark.parametrize("interval", [0, -0.1, float("inf"), float("nan")])
+def test_generate_with_loads_requires_a_positive_finite_interval(interval):
+    driver = object.__new__(WireDriver)
+    with pytest.raises(ValueError, match="positive finite"):
+        driver.generate_with_loads([], poll_interval_s=interval)
 
 
 @pytest.mark.parametrize("logprobs,probs", [([-0.2], [0.8, 0.9]), ([], [0.8])])
