@@ -5,6 +5,8 @@ Enable memory saving with an explicit `--weight-memory-policy cpu_backup` or
 routes. Rebuild the Python runtime, native host and kernel package together;
 the memory-saving startup handshake rejects native hosts without the
 replica-wide update-commit protocol (version 2: load admission and commit).
+On Ascend, a matching host and runtime also coordinate release and resume
+(version 3).
 
 ## Policy and model contract
 
@@ -89,6 +91,12 @@ execution retains those workspaces because captured kernels may refer to them.
 
 ## Allocator runtime requirements
 
+The launcher captures its child environment inside the allocator's launch
+context. An explicitly supplied memory-saver preload is reused once. Parent
+preload libraries keep their relative order, and additional non-saver libraries
+from the launch context are retained. Without an explicit saver preload, the
+context selects the hook and library paths for the child.
+
 The allocator must recognize managed pointers when they are freed outside their
 allocation region, and must separate pools by both tag and CPU-backup policy.
 Some `0.0.9.post1` binaries lack the former fix. Validate clean process shutdown
@@ -131,6 +139,44 @@ A request to resume all regions immediately after discard fails: the new
 weights have not been committed yet. A weight update while KV is resident is
 also rejected under discard. Keep the orchestrator paused on any failed
 response, including a failure in a different serving replica.
+
+With protocol 3 on Ascend, send each memory operation to every engine in the
+coordinated domain. A release or resume succeeds only after all of those
+engines finish. The domain is the attention-TP/PP replica for independent
+engines and the existing coordinated attention-DP group for engines that
+share a forward, including EP across replicas. Calls may reach engines in
+different rounds. The 30-second wait is a queue-head threshold while participants
+are missing and no earlier release is draining, not a separate minimum wait for
+every queued call. When any head expires, the gate refuses the entire batch
+already observed in each rank's local queue. A newer queued call can therefore
+be refused before its own 30 seconds have elapsed. A peer's delivery that arrives
+after that gate is outside the refused batch and may answer later.
+`continue_generation` cancels
+pending memory operations before device work starts, including calls observed
+in the same gate after continue arrived locally. This domain-wide cancellation
+avoids different queue cutoffs at independent ingresses. An engine whose memory
+is already released remains asleep after cancellation.
+
+Issue memory operations in order and wait for the domain's replies. For
+explicit matching, send the same optional `transition_id` string with each
+engine's named control call. Direct wire callers use the request's `rid`
+field. Use a fresh ID for each operation. Existing ordered fanout can omit
+the ID. A late request from an earlier attempt can cause a mismatch and a
+refusal, so collect every outstanding memory reply before retrying, including
+late replies from a timed-out batch. A continue reply alone does not fence that
+fanout. Refusals before device work can be retried after collecting those
+replies. A device-apply failure, or an L1 clear failure after the domain agreed
+it was ready, is fatal to the coordinated domain, including otherwise healthy
+ranks. Recover the whole domain before training or serving continues;
+cross-host process supervision remains the deployment's responsibility.
+
+CUDA uses protocol 2, with its existing graph memory and NCCL behavior.
+Protocol 3 leaves NCCL buffers resident and refuses an explicit `nccl` tag
+before releasing any region. Under protocol 2, the optional `nccl` tag
+requires every participant of the underlying communicator. A world
+communicator can span otherwise independent DP engines. To manage those
+engines separately, send explicit tags that leave NCCL resident. An omitted
+tag list includes `nccl` when the runtime advertises it.
 
 ## Validation before enabling in a training job
 

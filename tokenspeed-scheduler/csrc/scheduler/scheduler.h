@@ -153,6 +153,8 @@ public:
     // Testing/control-plane operation. A successful return means the complete
     // Device L1 prefix cache was removed; Host L2 is never touched.
     bool ClearL1Cache();
+    // Same Device L1 readiness checks as ClearL1Cache, with no mutation.
+    bool CanClearL1Cache() const;
     // Public flush operation. A successful return means both Device L1 and
     // Host L2 prefix indexes were removed.
     bool ClearCache();

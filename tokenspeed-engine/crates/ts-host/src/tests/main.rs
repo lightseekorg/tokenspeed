@@ -474,3 +474,123 @@ fn logging_mode_is_explicit_and_validated() {
     assert!(parse_args(args("yes")).is_err());
     assert!(parse_args(args("true").take(4)).is_err());
 }
+
+#[test]
+fn bootstrap_selects_the_memory_protocol_for_the_rank() {
+    use pyo3::{
+        prelude::*,
+        types::{PyModule, PyString},
+    };
+
+    run_in_child(
+        "tests::bootstrap_selects_the_memory_protocol_for_the_rank",
+        || {
+            Python::initialize();
+            Python::attach(|py| {
+                let legacy = PyModule::from_code(
+                    py,
+                    c"def bootstrap(fd, outbox, protocol): return (fd, outbox, protocol)",
+                    c"legacy_bootstrap.py",
+                    c"legacy_bootstrap",
+                )
+                .unwrap();
+                let legacy_profiled = PyModule::from_code(
+                    py,
+                    c"def bootstrap(fd, outbox, protocol, host_spans=None): return (fd, outbox, protocol, host_spans)",
+                    c"legacy_profiled_bootstrap.py",
+                    c"legacy_profiled_bootstrap",
+                )
+                .unwrap();
+                let unchecked = PyModule::from_code(
+                    py,
+                    c"MEMORY_PROTOCOL_STARTUP = True\ndef prepare_bootstrap(fd, *, validate_memory_protocol=False):\n    return True, lambda outbox, protocol, host_spans: (fd, outbox, protocol, host_spans)",
+                    c"unchecked_bootstrap.py",
+                    c"unchecked_bootstrap",
+                )
+                .unwrap();
+                let prepared = PyModule::from_code(
+                    py,
+                    c"ASCEND_MEMORY_PROTOCOL_STARTUP = True\ndef prepare_bootstrap(fd, *, validate_memory_protocol):\n    return validate_memory_protocol and replica_memory_transitions, lambda outbox, protocol, host_spans: (fd, outbox, protocol, host_spans)",
+                    c"prepared_bootstrap.py",
+                    c"prepared_bootstrap",
+                )
+                .unwrap();
+                let outbox = PyString::new(py, "outbox");
+                let host_spans = PyString::new(py, "host spans");
+                let (worker, enabled) =
+                    super::bootstrap_worker(&legacy, 7, outbox.as_any(), host_spans.as_any())
+                        .unwrap();
+                assert!(!enabled);
+                assert_eq!(
+                    worker.extract::<(i32, String, u32)>().unwrap(),
+                    (7, "outbox".to_owned(), 2)
+                );
+                let (worker, enabled) = super::bootstrap_worker(
+                    &legacy_profiled,
+                    7,
+                    outbox.as_any(),
+                    host_spans.as_any(),
+                )
+                .unwrap();
+                assert!(!enabled);
+                assert_eq!(
+                    worker.extract::<(i32, String, u32, String)>().unwrap(),
+                    (7, "outbox".to_owned(), 2, "host spans".to_owned())
+                );
+                let (worker, enabled) =
+                    super::bootstrap_worker(&unchecked, 7, outbox.as_any(), host_spans.as_any())
+                        .unwrap();
+                assert!(!enabled);
+                assert_eq!(
+                    worker.extract::<(i32, String, u32, String)>().unwrap(),
+                    (7, "outbox".to_owned(), 2, "host spans".to_owned())
+                );
+                for (capability, protocol) in [(false, 2), (true, 3)] {
+                    prepared
+                        .setattr("replica_memory_transitions", capability)
+                        .unwrap();
+                    let (worker, enabled) =
+                        super::bootstrap_worker(&prepared, 7, outbox.as_any(), host_spans.as_any())
+                            .unwrap();
+                    assert_eq!(enabled, capability);
+                    assert_eq!(
+                        worker.extract::<(i32, String, u32, String)>().unwrap(),
+                        (7, "outbox".to_owned(), protocol, "host spans".to_owned())
+                    );
+                }
+            });
+        },
+    );
+}
+
+#[test]
+fn test_legacy_host_rejects_the_v3_mesh_address() {
+    use pyo3::{exceptions::PyTypeError, prelude::*};
+
+    run_in_child(
+        "tests::test_legacy_host_rejects_the_v3_mesh_address",
+        || {
+            Python::initialize();
+            Python::attach(|py| {
+                let globals = pyo3::types::PyDict::new(py);
+                py.run(
+                    c"v2 = ['192.0.2.1:7800', '192.0.2.2:7801']\nmixed = [v2[0], (3, v2[1])]",
+                    Some(&globals),
+                    None,
+                )
+                .unwrap();
+                let extract = |name| {
+                    globals
+                        .get_item(name)
+                        .unwrap()
+                        .unwrap()
+                        .extract::<Vec<String>>()
+                };
+                assert_eq!(extract("v2").unwrap(), ["192.0.2.1:7800", "192.0.2.2:7801"]);
+                assert!(extract("mixed")
+                    .unwrap_err()
+                    .is_instance_of::<PyTypeError>(py));
+            });
+        },
+    );
+}

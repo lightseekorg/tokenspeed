@@ -2170,7 +2170,9 @@ the group's rows. A rank's rows are ascending span rows but not one range:
 the model's rows are `input_ids_buf[plan.local_row_ids]`,
 `positions_buf[plan.local_row_ids]` and the same rows of every per-row
 input; per-request inputs keep the whole batch; a pipeline stage's boundary
-bundle carries shard rows. The collectives over the shard group concatenate
+bundle carries shard rows. After sending the boundary bundle, a non-final
+stage returns placeholder tokens and lengths and leaves all three probability
+outputs empty. The collectives over the shard group concatenate
 the ranks' rows rank by rank (*gather order*, `plan.span_to_gather_cpu`), with
 the per-rank counts `plan.row_counts` as the `CommManager` row tables: a leg
 that only moves or sums rows (the dense and MoE legs, the head exchanges,

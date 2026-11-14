@@ -36,7 +36,6 @@ import multiprocessing as mp
 import os
 import signal
 import sys
-import threading
 import time
 from collections.abc import Callable
 
@@ -278,6 +277,7 @@ def _supervise_schedulers(
     terminate_requested_at: list[float],
     *,
     exit_grace_s: float,
+    shutdown_requested: Callable[[], bool] | None = None,
 ) -> bool:
     """Wait until every scheduler exits; return whether any failed.
 
@@ -300,6 +300,12 @@ def _supervise_schedulers(
             )
             return True
         for proc in list(alive):
+            if (
+                not terminate_requested_at
+                and shutdown_requested is not None
+                and shutdown_requested()
+            ):
+                terminate()
             proc.join(timeout=1)
             if proc.exitcode is None:
                 continue
@@ -344,10 +350,12 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
     kv_bootstrap_server = None
     metrics_relay = None
 
-    # SIGUSR1 reports a child's internal failure (a rank's host sends it as
-    # it fails), so record the failure here: an exit status alone may not
-    # tell the supervisor.
-    child_failed = threading.Event()
+    # A failing rank's Rust host sends SIGUSR1. SIGQUIT retains the failure
+    # exit from register_child_failure_signals (including Ctrl-\);
+    # SIGTERM and SIGINT request a clean stop. Record failure here because
+    # a child's exit status alone may not tell the supervisor.
+    child_failed = False
+    shutdown_signal = None
     # When the first termination was requested; schedulers still running a
     # grace period later are killed with the rest of the tree.
     terminate_requested_at: list[float] = []
@@ -356,14 +364,28 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
     # is killed by this list at the end.
     scheduler_descendants: list[psutil.Process] = []
 
-    def _terminate_schedulers(signum=None, _frame=None):
-        """Forward a shutdown (or child-failure SIGUSR1) to every scheduler."""
-        if signum is not None:
-            logger.info(f"received signal {signum!s}; terminating scheduler(s)")
-        if signum == signal.SIGUSR1:
-            child_failed.set()
-        if not terminate_requested_at:
-            terminate_requested_at.append(time.monotonic())
+    def _request_shutdown(signum, _frame):
+        # A second rank can signal while Python is handling the first. Leave
+        # logging, locks and process inspection to the supervising loop.
+        nonlocal child_failed, shutdown_signal
+        if signum in (signal.SIGUSR1, signal.SIGQUIT):
+            child_failed = True
+        if shutdown_signal is None:
+            shutdown_signal = signum
+
+    def _check_startup_shutdown():
+        if shutdown_signal is not None:
+            sys.exit(int(child_failed))
+
+    def _terminate_schedulers():
+        """Forward the first shutdown request to every scheduler."""
+        if terminate_requested_at:
+            return
+        terminate_requested_at.append(time.monotonic())
+        if shutdown_signal is not None:
+            logger.info(
+                f"received signal {shutdown_signal!s}; terminating scheduler(s)"
+            )
         for proc in scheduler_procs:
             if proc.is_alive():
                 with contextlib.suppress(psutil.NoSuchProcess):
@@ -387,9 +409,10 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
 
         # Install before spawning so a signal in the launch window is not lost;
         # an unhandled SIGUSR1 would kill this supervisor without cleanup.
-        signal.signal(signal.SIGTERM, _terminate_schedulers)
-        signal.signal(signal.SIGINT, _terminate_schedulers)
-        signal.signal(signal.SIGUSR1, _terminate_schedulers)
+        signal.signal(signal.SIGTERM, _request_shutdown)
+        signal.signal(signal.SIGINT, _request_shutdown)
+        signal.signal(signal.SIGUSR1, _request_shutdown)
+        signal.signal(signal.SIGQUIT, _request_shutdown)
 
         metrics_service.start(server_args, port_args)
         kv_bootstrap_server = _start_kv_bootstrap_server(server_args)
@@ -417,7 +440,11 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
             )
         scheduler_procs.extend(procs)
         scheduler_pipe_readers.extend(readers)
-        for data in receive_ready_messages(scheduler_pipe_readers, scheduler_procs):
+        for data in receive_ready_messages(
+            scheduler_pipe_readers,
+            scheduler_procs,
+            check_cancelled=_check_startup_shutdown,
+        ):
             if data.get("status") != "ready":
                 raise RuntimeError(
                     "Scheduler initialization failed. See the error messages above."
@@ -432,8 +459,9 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
             _terminate_schedulers,
             terminate_requested_at,
             exit_grace_s=_SCHEDULER_EXIT_GRACE_S,
+            shutdown_requested=lambda: shutdown_signal is not None,
         )
-        if failed or child_failed.is_set():
+        if failed or child_failed:
             sys.exit(1)
     finally:
         # Backstop: never leak GPU-holding scheduler trees, whichever path

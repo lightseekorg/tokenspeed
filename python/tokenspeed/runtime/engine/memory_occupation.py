@@ -58,7 +58,7 @@ class MemoryRegion:
 
 
 def memory_regions(
-    device, adapter, *, nccl_suspendable: bool
+    device, adapter, *, nccl_suspendable: bool, replica_memory_transitions: bool
 ) -> dict[str, MemoryRegion]:
     """The releasable GPU-memory regions of an engine, keyed by tag.
 
@@ -67,6 +67,8 @@ def memory_regions(
     Which pools and peers that work touches is the handle's business; this
     side only says when. ``nccl_suspendable`` says whether the process's
     NCCL can suspend communicators; without it there is no ``nccl`` region.
+    With replica memory transitions, the KV clear completes before the
+    transfer engine registers the re-mapped arena.
     """
 
     def release_kv_cache() -> None:
@@ -80,7 +82,9 @@ def memory_regions(
         adapter.resume(tag="kv_cache")
         # Re-mapped memory holds garbage: zero it, then register it with
         # the PD transfer engine again.
-        device.finish_kv_resume()
+        device.finish_kv_resume(
+            synchronize_before_registration=replica_memory_transitions
+        )
 
     def allocator_region(tag: str) -> MemoryRegion:
         def release() -> None:

@@ -2005,7 +2005,7 @@ class ModelExecutor:
             self._pp_send_stage_state(logits_output)
             output_tokens = torch.zeros(bs, dtype=torch.int32, device=self.device)
             accept_lengths = torch.ones(bs, dtype=torch.int32, device=self.device)
-            return output_tokens, accept_lengths, None, None
+            return output_tokens, accept_lengths, None, None, None
 
         # Flag NaN per request and sanitize in place, before any sampling kernel.
         self.nan_guard.audit_logits(logits_output, ctx)
