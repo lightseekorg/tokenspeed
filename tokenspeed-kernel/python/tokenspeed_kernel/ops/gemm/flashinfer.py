@@ -934,7 +934,7 @@ def flashinfer_bf16_gemm(
         raise ValueError("Unsupported input to joint FlashInfer BF16 GEMM")
     if out is None:
         out = torch.empty((x.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device)
-    workspace = _fi_gemm._get_cache_buf(
+    workspace = _fi_gemm._get_stream_cache_buf(
         "mm_bf16_workspace", _fi_gemm.DEFAULT_WORKSPACE_SIZE, x.device
     )
     # WAR: the public auto heuristic excludes cute-dsl, and its SM100a check

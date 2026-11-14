@@ -703,8 +703,16 @@ idle forwards while a peer drains. An idle but unpaused peer prevents release:
 it could admit a request in the next round. Release intent rides the head
 gate, so every rank joins the tail's readiness agreement when any release is
 pending, including ranks without a release of their own. Ordinary rounds add
-no collective. Readiness is MIN-reduced over the replica and then attention DP
+no collective. An NCCL release also requires a pending NCCL release on every
+rank: a previously completed KV release does not authorize that collective.
+Other memory regions retain their local release semantics. Readiness is
+MIN-reduced over the replica and then attention DP
 before any release runs on the forward thread.
+
+A resume containing NCCL uses the same-round operation gate: it waits until
+every attention-DP engine holds its resume before entering device collectives.
+Other regions still resume locally. A pending collective resume refuses a
+second memory resume until it finishes.
 
 The head gate also agrees whether any DP rank still has released regions.
 Until all regions are restored on every rank, it withholds forward permission

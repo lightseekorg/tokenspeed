@@ -34,7 +34,7 @@ optional LSE is FP32 in natural-log units. Empty selections produce zero
 output and negative-infinite LSE. Negative slots inside a visible prefix are
 masked. Omitting lengths inspects the full selected-slot width.
 
-The pinned FlashInfer 0.7.3 provides the Prims-TS sparse MLA wrapper. Select
+The pinned FlashInfer 0.7.4 provides the Prims-TS sparse MLA wrapper. Select
 `solution="flashinfer_prims"` in the kernel API, or set
 `TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_DSA_PREFILL=flashinfer_prims_dsa_prefill`
 and `TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_DSA_DECODE=flashinfer_prims_dsa_decode`

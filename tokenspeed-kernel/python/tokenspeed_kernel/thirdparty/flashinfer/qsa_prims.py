@@ -219,7 +219,7 @@ class _PrimTSQSARunner:
             k_cache.shape[1],
             self._sm_count,
             head_dim=q.shape[2],
-            q_data_type=q.dtype,
+            q_dtype=q.dtype,
             split_kv=False,
             kv_block_size=metadata.block_size,
         )
@@ -276,7 +276,11 @@ class _PrimTSQSARunner:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("warm up the PrimTS QSA geometry before capture")
             offsets = _group_offsets(metadata.query_start_loc, group_size)
-            qo_indptr = torch.tensor(offsets, dtype=torch.int32, device=self._device)
+            # New packed geometries also occur during serving, which forbids
+            # synchronizing host-to-device copies.
+            qo_indptr = torch.tensor(
+                offsets, dtype=torch.int32, device="cpu", pin_memory=True
+            ).to(self._device, non_blocking=True)
             max_kv = metadata.block_table.shape[1] * page_size
             # Completed current blocks compete for top-k; only a partial tail is appended.
             size = get_q_token_kv_block_sparse_workspace_size(
@@ -285,7 +289,7 @@ class _PrimTSQSARunner:
                 metadata.block_table,
                 block_topk=topk,
                 max_seq_len_kv=max_kv,
-                o_data_type=q.dtype,
+                out_dtype=q.dtype,
                 qo_indptr=qo_indptr,
                 group_size=group_size,
                 kv_block_size=metadata.block_size,
@@ -317,14 +321,14 @@ class _PrimTSQSARunner:
                 device=self._device,
                 workspace_buffer=self._workspace,
                 group_size=group_size,
-                use_packed_q=True,
+                packed_query=True,
                 split_kv=False,
                 share_pattern_across_kv_heads=True,
                 count_current_block_in_topk=True,
                 mask_type="causal",
-                q_data_type=q.dtype,
-                kv_data_type=k.dtype,
-                o_data_type=q.dtype,
+                q_dtype=q.dtype,
+                kv_dtype=k.dtype,
+                out_dtype=q.dtype,
             )
             # Bound eager geometries per layer, not across every layer and
             # graph batch. Captures own their plans outside this LRU.

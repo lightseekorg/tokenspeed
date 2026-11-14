@@ -147,5 +147,77 @@ def test_swa_and_global_thresholds(tokens, minimum, swa_minimum, has_global, exp
     )
 
 
+@pytest.mark.parametrize("tokens", [8, 13, 1031])
+@pytest.mark.parametrize("dim", [64, 6])
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16])
+def test_row_exchange_pads_every_rank_heads_and_hands_them_back(
+    monkeypatch, tokens, dim, dtype
+):
+    # Four ranks with three heads each; the core pads to 16 heads. The query
+    # exchange lands rank i's heads of my rows at heads 3i.., zeros after; the
+    # inverse hands each rank its heads of every row back, bit for bit.
+    world, heads, padded = 4, 3, 16
+    # Global ranks other than the group indices: the exchange takes the index.
+    group = tuple(range(4, 4 + world))
+    counts = scatter_count(tokens, world)
+    starts = [sum(counts[:rank]) for rank in range(world)]
+    full = torch.randn(tokens, world * heads, dim).to(dtype)
+    blocks = [full[:, r * heads : (r + 1) * heads].contiguous() for r in range(world)]
+    out = torch.randn(tokens, world * heads, 5).to(torch.bfloat16)
+
+    def own(tensor, rank):
+        return tensor[starts[rank] : starts[rank] + counts[rank]]
+
+    def bits(tensor):
+        return tensor.contiguous().view(torch.uint8)
+
+    for rank in range(world):
+
+        def query_exchange(output, value, actual_group, **splits):
+            assert actual_group == group
+            assert splits == {
+                "output_split_sizes": [counts[rank]] * world,
+                "input_split_sizes": counts,
+            }
+            assert torch.equal(bits(value).flatten(), bits(blocks[rank]).flatten())
+            output.copy_(
+                torch.cat([bits(own(blocks[i], rank)).flatten(1) for i in range(world)])
+            )
+
+        monkeypatch.setattr(exchange, "all_to_all_single", query_exchange)
+        query = exchange.exchange_query_rows_padded(
+            blocks[rank], group, rank, counts, padded
+        )
+        assert query.shape == (counts[rank], padded, dim) and query.dtype == dtype
+        assert torch.equal(bits(query[:, : world * heads]), bits(own(full, rank)))
+        assert not bits(query[:, world * heads :]).any()
+
+        def head_return(output, value, actual_group, **splits):
+            assert actual_group == group
+            assert splits == {
+                "output_split_sizes": counts,
+                "input_split_sizes": [counts[rank]] * world,
+            }
+            sent = value.view(world, counts[rank], heads, 5)
+            for peer in range(world):
+                assert torch.equal(
+                    sent[peer], own(out, rank)[:, peer * heads : (peer + 1) * heads]
+                )
+            output.copy_(
+                torch.cat(
+                    [
+                        own(out, peer)[:, rank * heads : (rank + 1) * heads].flatten(1)
+                        for peer in range(world)
+                    ]
+                )
+            )
+
+        monkeypatch.setattr(exchange, "all_to_all_single", head_return)
+        core_out = torch.full((counts[rank], padded, 5), 7.0, dtype=torch.bfloat16)
+        core_out[:, : world * heads] = own(out, rank)
+        back = exchange.return_head_rows(core_out, heads, group, counts)
+        assert torch.equal(back, out[:, rank * heads : (rank + 1) * heads])
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))

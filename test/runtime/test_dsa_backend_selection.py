@@ -199,6 +199,7 @@ _K31_SPARSE_LEAF = dict(
     _dcp_records_core=False,
     _dcp_padded_query=False,
     _dcp_decode_records_core=False,
+    _row_shard_prefill=False,
 )
 
 
