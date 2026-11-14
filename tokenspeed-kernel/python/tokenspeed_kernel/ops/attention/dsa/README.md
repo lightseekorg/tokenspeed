@@ -277,6 +277,10 @@ must accept the keyword and support its omission. No in-tree production leaf
 currently declares this feature; it is an extension contract for registered
 providers, not a standalone scoring optimization.
 
+Both `plan_dsa_topk` and `select_dsa_prefill_topk_for_rows` require an explicit
+`row_starts_cpu` boolean: pass true when execution supplies the mirror so
+unsupported providers fail at initialization, and false otherwise.
+
 ## Slot order of the sparse cores
 
 `dsa_decode` and `dsa_prefill` take a required `slot_order` in

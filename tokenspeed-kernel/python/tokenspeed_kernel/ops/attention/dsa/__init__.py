@@ -339,6 +339,7 @@ def select_dsa_prefill_topk_for_rows(
     topk: int,
     page_size: int | None,
     batch_invariant: bool,
+    row_starts_cpu: bool,
     solution: str | None,
 ) -> str:
     """Select, without running it, the ``dsa_prefill_topk`` leaf for index keys
@@ -364,6 +365,7 @@ def select_dsa_prefill_topk_for_rows(
             to one is not selected without it), or ``None``.
         batch_invariant: Whether the ``batch_invariant`` feature is required
             too, as the forward will require it.
+        row_starts_cpu: Whether execution supplies the CPU row-start mirror.
         solution: Restrict selection to a registered solution, as the forward
             will.
 
@@ -382,6 +384,8 @@ def select_dsa_prefill_topk_for_rows(
         **_index_k_rows_traits(index_k_format),
     }
     required_features = {INDEX_K_WORKSPACE_ROWS_FEATURE}
+    if row_starts_cpu:
+        required_features.add(ROW_STARTS_CPU_FEATURE)
     if batch_invariant:
         required_features.add("batch_invariant")
     return select_kernel(
@@ -1205,10 +1209,12 @@ def plan_dsa_topk(
     forced_initial_local: bool,
     q_lens: frozenset[int],
     workspace_rows: bool,
+    row_starts_cpu: bool,
 ) -> KernelPlan:
     """Bind a batch-invariant indexer using static model/cache geometry.
 
     q_lens is the supported decode width domain; prefill uses an empty domain.
+    row_starts_cpu requires a leaf accepting the host mirror at execution.
     workspace_rows requires prefill support for gathered index keys in addition
     to a paged plane. Request counts and history lengths never choose a provider.
     """
@@ -1217,6 +1223,10 @@ def plan_dsa_topk(
     if (mode == "dsa_decode_topk") != bool(q_lens):
         raise ValueError("Only decode top-k requires a nonempty q_lens domain")
     features = {"batch_invariant"}
+    if row_starts_cpu:
+        if mode != "dsa_prefill_topk":
+            raise ValueError("CPU row starts are a prefill top-k input")
+        features.add(ROW_STARTS_CPU_FEATURE)
     if forced_initial_local:
         features.add("forced_initial_local")
     if workspace_rows:
