@@ -11,13 +11,11 @@ on:
       - "test/ci_system/scheduler_perf_guard.py"
       - "test/ci_system/test_scheduler_perf_guard.py"
       - ".github/workflows/scheduler-perf-guard.yml"
+  # Every pull request starts the workflow, so its "Instruction counts" check
+  # can be required: one that changes no scheduler path skips the jobs, and a
+  # skipped job passes.
   pull_request:
     branches: [main]
-    paths:
-      - "tokenspeed-scheduler/**"
-      - "test/ci_system/scheduler_perf_guard.py"
-      - "test/ci_system/test_scheduler_perf_guard.py"
-      - ".github/workflows/scheduler-perf-guard.yml"
   workflow_dispatch:
     inputs:
       base_ref:
@@ -30,8 +28,39 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  changes:
+    name: Detect scheduler changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      scheduler: ${{ steps.filter.outputs.scheduler }}
+    steps:
+      - name: Classify changed paths
+        id: filter
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          REPOSITORY: ${{ github.repository }}
+          PULL_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" != pull_request ]; then
+            # Pushes are filtered by `paths`; manual runs always compare.
+            echo "scheduler=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          files=$(gh api --paginate "/repos/$REPOSITORY/pulls/$PULL_NUMBER/files" --jq '.[].filename')
+          pattern='^(tokenspeed-scheduler/|test/ci_system/(test_)?scheduler_perf_guard\.py$|\.github/workflows/scheduler-perf-guard\.yml$)'
+          if grep -qE "$pattern" <<< "$files"; then
+            echo "scheduler=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "scheduler=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
     name: Build base and candidate
+    needs: changes
+    if: needs.changes.outputs.scheduler == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -111,10 +140,19 @@ jobs:
 
   instructions:
     name: Instruction counts
-    needs: build
+    needs: [changes, build]
+    # Runs unless the change provably touches no scheduler path, so a failed
+    # build fails this check instead of skipping it.
+    if: always() && needs.changes.outputs.scheduler != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
+      - name: Require the benchmarks
+        if: needs.build.result != 'success'
+        run: |
+          echo "::error::Building the benchmarks did not succeed (${{ needs.build.result }})."
+          exit 1
+
       - name: Checkout code
         uses: actions/checkout@v4
 
@@ -155,7 +193,8 @@ jobs:
 
   timing:
     name: CPU time (report only)
-    needs: build
+    needs: [changes, build]
+    if: needs.changes.outputs.scheduler == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:

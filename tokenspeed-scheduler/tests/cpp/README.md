@@ -171,8 +171,10 @@ directory and compares them with `test/ci_system/scheduler_perf_guard.py`:
   miss, such as cache misses and prefetching, but CI machines are shared and
   noisy, so it only reports; confirm a reported regression locally.
 
-A change that is meant to cost more (new work for a feature) shows up as an
-instruction regression: explain it in the pull request. To run the guard
+Every pull request starts the workflow; one that changes no scheduler path
+skips its jobs, which then pass, so `Instruction counts` can be a required
+check. A change that is meant to cost more (new work for a feature) shows up
+as an instruction regression: explain it in the pull request. To run the guard
 locally, build both revisions' benchmarks and pass their directories:
 
 ```bash
