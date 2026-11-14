@@ -147,10 +147,6 @@ def test_swa_and_global_thresholds(tokens, minimum, swa_minimum, has_global, exp
     )
 
 
-if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__]))
-
-
 @pytest.mark.parametrize("tokens", [8, 13, 1031])
 @pytest.mark.parametrize("dim", [64, 6])
 @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16])
@@ -221,3 +217,7 @@ def test_row_exchange_pads_every_rank_heads_and_hands_them_back(
         core_out[:, : world * heads] = own(out, rank)
         back = exchange.return_head_rows(core_out, heads, group, counts)
         assert torch.equal(back, out[:, rank * heads : (rank + 1) * heads])
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__]))
