@@ -133,6 +133,26 @@ class ChangeSelectionTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "identity changed"):
                     self.select_pr(pr_event(), api)
 
+    def test_rerun_skips_superseded_head_with_same_base(self):
+        api = GitHubFixture([])
+        api.before["head"]["sha"] = "4" * 40
+        self.assertIsNone(
+            changed_paths(REPOSITORY, "pull_request", pr_event(), api, run_attempt=2)
+        )
+        self.assertEqual(api.metadata_reads, 1)
+
+    def test_rerun_rejects_base_changes(self):
+        for head_changed in (False, True):
+            with self.subTest(head_changed=head_changed):
+                api = GitHubFixture([])
+                api.before["base"]["sha"] = "4" * 40
+                if head_changed:
+                    api.before["head"]["sha"] = "4" * 40
+                with self.assertRaisesRegex(ValueError, "identity changed"):
+                    changed_paths(
+                        REPOSITORY, "pull_request", pr_event(), api, run_attempt=2
+                    )
+
     def test_pr_rejects_changes_during_pagination(self):
         for ref in ("head", "base", "count"):
             with self.subTest(ref=ref):
