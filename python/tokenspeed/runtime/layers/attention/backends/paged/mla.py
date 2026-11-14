@@ -147,6 +147,8 @@ class MLAAttnBackend(PagedAttentionBackend):
     kvp_virtual_block_count: int | None = None
     dcp_metadata: CompactDCPMetadata | None = None
     _dcp_visible_lens_buf: torch.Tensor | None = None
+    draft_block_causal: bool = False
+    _dcp_causal_block: bool = False
     # Decode forwards layer.sliding_window_size as window_left.
     supports_layer_sliding_window: bool = True
 
@@ -164,18 +166,23 @@ class MLAAttnBackend(PagedAttentionBackend):
         self.num_local_heads = spec.num_attention_heads // spec.attn_tp_size
 
         # DFLASH/DSpark draft: the drafter proposes a whole block in one decode
-        # forward and needs the block to be non-causal. Rather than a mask, each
-        # request materializes one single-query decode metadata entry per
-        # block position (block_decode_expansion), all sharing the block-end
-        # seq_len, so every block query sees the whole block including its own
-        # future. Target verify and ordinary decode are untouched.
+        # forward. Rather than a mask, each request materializes one
+        # single-query decode metadata entry per block position
+        # (block_decode_expansion). A non-causal block (Kimi-K3 DSpark) gives
+        # every entry the block-end seq_len, so each query sees the whole block
+        # including its own future; a causal block (Kimi-K3.1 DSpark/DFlash2)
+        # backs entry j up to seq_len - (block - 1 - j), the verify layout.
+        # Under KVP a causal block keeps one block-end entry per request
+        # instead: the DCP decode derives every row's causal length at forward
+        # time, as for target verify. Target verify and ordinary decode are
+        # untouched.
         self.draft_block_decode = bool(config.draft_block_decode)
-        if config.draft_block_causal:
-            raise NotImplementedError(
-                f"{type(self).__name__} attends a draft block as a whole; a causal "
-                "block draft (Kimi-K3.1 DSpark) needs --drafter-attention-backend "
-                "tokenspeed_mla"
-            )
+        self.draft_block_causal = bool(config.draft_block_causal)
+        self._dcp_causal_block = (
+            self.draft_block_decode
+            and self.draft_block_causal
+            and len(tuple(config.kvp_group)) > 1
+        )
 
         backend_name = spec.backend_name or "mla"
         self.kernel_solution = {"mla": None, "gluon": "gluon"}[backend_name]
@@ -241,6 +248,7 @@ class MLAAttnBackend(PagedAttentionBackend):
         self._query_block_decode: dict[tuple[int, int, bool], bool] = {}
         self._block_page_table_buf: torch.Tensor | None = None
         self._block_seq_lens_buf: torch.Tensor | None = None
+        self._block_causal_backoff: torch.Tensor | None = None
 
         self.kvp_group = tuple(config.kvp_group)
         self.kvp_rank = config.kvp_rank
@@ -260,10 +268,12 @@ class MLAAttnBackend(PagedAttentionBackend):
             raise ValueError("MLA cache and KVP topology disagree")
         if block_granularity is None or block_granularity % self.kernel_page_size:
             raise ValueError("MLA ownership blocks must contain whole kernel pages")
-        if self.batch_invariant or self.draft_block_decode:
+        if self.batch_invariant or (
+            self.draft_block_decode and not self.draft_block_causal
+        ):
             raise ValueError(
                 "MLA DCP decode supports neither batch-invariant numerics nor "
-                "block drafts"
+                "non-causal block drafts"
             )
         if not self._dcp_decode_kernel_registered():
             raise ValueError(
@@ -315,6 +325,16 @@ class MLAAttnBackend(PagedAttentionBackend):
     @property
     def _dcp_active(self) -> bool:
         return self.kvp_block_granularity is not None
+
+    @property
+    def _expands_block(self) -> bool:
+        return self.block_decode_active and not self._dcp_causal_block
+
+    @property
+    def block_decode_expansion(self) -> int:
+        if self._dcp_causal_block:
+            return 1
+        return super().block_decode_expansion
 
     def init_cuda_graph_state(self, max_bs: int) -> None:
         super().init_cuda_graph_state(max_bs)
@@ -401,7 +421,11 @@ class MLAAttnBackend(PagedAttentionBackend):
                 kv_lora_rank=self.kv_lora_rank,
                 qk_rope_head_dim=self.qk_rope_head_dim,
                 sliding_window=sliding_window,
-                noncausal_block_size=q_len if self.block_decode_active else 1,
+                noncausal_block_size=(
+                    q_len
+                    if self.block_decode_active and not self.draft_block_causal
+                    else 1
+                ),
                 solution=self.kernel_solution,
             )
             self._query_block_decode[key] = answer
@@ -421,6 +445,7 @@ class MLAAttnBackend(PagedAttentionBackend):
         self.chunked_prefill_metadata = None
         self._block_page_table_buf = None
         self._block_seq_lens_buf = None
+        self._block_causal_backoff = None
         self.kvp_block_granularity = None
         self.kvp_virtual_block_count = None
         self.dcp_metadata = None
@@ -594,6 +619,14 @@ class MLAAttnBackend(PagedAttentionBackend):
         self._block_seq_lens_buf = torch.zeros(
             max_bs, dtype=self.seq_lens_buf.dtype, device=self.seq_lens_buf.device
         )
+        expansion = max(self.block_decode_expansion, 1)
+        self._block_causal_backoff = torch.arange(
+            expansion - 1,
+            -1,
+            -1,
+            dtype=self.seq_lens_buf.dtype,
+            device=self.seq_lens_buf.device,
+        )
 
     def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
         """Broadcast, keeping the per-request row the query-axis fold reads.
@@ -601,15 +634,26 @@ class MLAAttnBackend(PagedAttentionBackend):
         The drafter calls this inside the captured graph, so the row has to be
         written there too rather than derived from the expanded view per layer.
         """
+        if self._dcp_causal_block:
+            torch.clamp(
+                block_seq_lens[:bs],
+                self.spec_num_tokens,
+                self.max_context_len,
+                out=self.seq_lens_buf[:bs],
+            )
+            return
         self._ensure_block_row_buffers(bs)
         rows = self._block_seq_lens_buf[:bs]
         torch.clamp(
             block_seq_lens[:bs], self.spec_num_tokens, self.max_context_len, out=rows
         )
         expansion = self.block_decode_expansion
-        self.decode_seq_lens_buffer[: bs * expansion].view(bs, expansion).copy_(
-            rows.unsqueeze(1)
-        )
+        expanded = self.decode_seq_lens_buffer[: bs * expansion].view(bs, expansion)
+        if self.draft_block_causal:
+            # rows >= spec_num_tokens = expansion, so every entry keeps >= 1 token.
+            torch.sub(rows.unsqueeze(1), self._block_causal_backoff, out=expanded)
+        else:
+            expanded.copy_(rows.unsqueeze(1))
 
     def _decode_views(self, bs: int) -> MLADecodeMetadata:
         """Per-bs decode metadata views over the persistent buffers.
@@ -620,7 +664,7 @@ class MLAAttnBackend(PagedAttentionBackend):
         metadata = self._decode_views_by_bs.get(bs)
         if metadata is not None:
             return metadata
-        if self.block_decode_active:
+        if self._expands_block:
             expanded_bs = bs * self.block_decode_expansion
             self._ensure_block_row_buffers(bs)
             metadata = MLADecodeMetadata(
@@ -639,7 +683,13 @@ class MLAAttnBackend(PagedAttentionBackend):
                 num_extends=0,
                 page_table=self.page_table_buf[:bs],
                 seq_lens=self.seq_lens_buf[:bs],
-                q_len_per_req=self.verify_floor,
+                # A causal block's first row backs up spec_num_tokens - 1
+                # from the block end, like the first verify query.
+                q_len_per_req=(
+                    self.spec_num_tokens
+                    if self._dcp_causal_block
+                    else self.verify_floor
+                ),
             )
         self._decode_views_by_bs[bs] = metadata
         return metadata
@@ -658,7 +708,7 @@ class MLAAttnBackend(PagedAttentionBackend):
         # The cached view bakes num_extends=0; a mixed round's decode requests
         # start after the extend requests, so publish this round's split.
         metadata.num_extends = num_extends
-        if self.block_decode_active:
+        if self._expands_block:
             # Replicate each request's page table across its block positions.
             # Under replay the seq_lens are re-derived in-graph from the live
             # draft length; eager has no in-graph writer, and the capture
@@ -713,7 +763,11 @@ class MLAAttnBackend(PagedAttentionBackend):
         q_len_per_req = q.shape[0] // bs if bs > 0 else 1
 
         window_left = int(getattr(layer, "sliding_window_size", -1) or -1)
-        noncausal_block_size = self.spec_num_tokens if self.block_decode_active else 1
+        noncausal_block_size = (
+            self.spec_num_tokens
+            if self.block_decode_active and not self.draft_block_causal
+            else 1
+        )
 
         if self._dcp_active:
             if window_left >= 0 or layer.logit_cap != 0.0:
@@ -736,10 +790,11 @@ class MLAAttnBackend(PagedAttentionBackend):
                 page_table = metadata.block_page_table
                 cache_seqlens = metadata.block_seq_lens
             else:
-                # One metadata row per block position already, each at the
-                # block-end length, so the causal offsets below would re-impose
-                # the ordering the draft must not have. No extend offset
-                # either: refresh_decode_metadata expanded rows [0, bs), which
+                # One metadata row per block position already: each at the
+                # block-end length for a non-causal draft, or backed off to its
+                # own position for a causal one. Either way the ordering is
+                # baked in, so the causal offsets below would apply it twice.
+                # No extend offset either: refresh_decode_metadata expanded rows [0, bs), which
                 # is exactly what this query covers.
                 query = q.view(-1, layer.tp_q_head_num, layer.head_dim).unsqueeze(1)
                 page_table = metadata.page_table
@@ -862,8 +917,8 @@ class MLAAttnBackend(PagedAttentionBackend):
         groups = heads // kernel_heads
         # Every query row's local causal length, and its kernel length (at
         # least one) for each folded head group. Draft catch-up stores the
-        # first query's visible KV length; target verify stores the last
-        # one's and backs up.
+        # first query's visible KV length; target verify and a causal block
+        # draft store the last one's and back up.
         local_lengths = torch.empty(
             (bs * q_len_per_req,), device=q.device, dtype=torch.int32
         )
@@ -873,7 +928,11 @@ class MLAAttnBackend(PagedAttentionBackend):
         kvp_decode_visible_lengths(
             dcp.page_prefix,
             metadata.seq_lens[num_extends : num_extends + bs],
-            offset=0 if self.is_draft else 1 - q_len_per_req,
+            offset=(
+                0
+                if self.is_draft and not self.block_decode_active
+                else 1 - q_len_per_req
+            ),
             queries=q_len_per_req,
             groups=groups,
             page_size=self.kernel_page_size,
