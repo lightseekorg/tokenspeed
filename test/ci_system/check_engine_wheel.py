@@ -17,7 +17,7 @@ import json
 import os
 import sys
 
-def bootstrap(control_fd, outbox, protocol):
+def bootstrap(control_fd, outbox, protocol, host_spans=None):
     # Exercise native stdlib modules and a separately loaded extension.
     import _ctypes
     import _socket
