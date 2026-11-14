@@ -43,6 +43,7 @@ from tokenspeed_kernel.ops.communication.multimem import (
     multimem_all_reduce_staged,
     multimem_prealloc,
     multimem_stage,
+    multimem_view,
 )
 from tokenspeed_kernel.ops.gemm import mm
 from tokenspeed_kernel.ops.moe._cute_dsl.latent_tail import (
@@ -138,6 +139,9 @@ class K3AttnComm:
     attn_ar_fusion_ok: ClassVar[bool] = False
     dummy_norm: ClassVar[RMSNorm | None] = None
     cute_ar: ClassVar[Callable | None] = None
+    # The multimem staging group and row capacity of an o-projection past
+    # _MULTIMEM_AR_MIN_TOKENS rows (NVIDIA), or None.
+    staged_projection: ClassVar[tuple[str, int] | None] = None
     # Target and draft execute sequentially and share each group's fixed buffers.
     iris_states: ClassVar[dict[tuple[int, ...], K3IrisState]] = {}
 
@@ -197,6 +201,33 @@ class K3AttnComm:
         )
         logger.info(f"Kimi K3 attention reduce: {attention_reduce_backend}")
 
+    def prepare_staged_projection(self, max_num_tokens: int) -> bool:
+        """Reserve the multimem buffer a wide o-projection writes its partial into.
+
+        Collective: every rank calls it once, before KV sizing and graph
+        capture. The buffer is the MoE tail's when both use one group.
+        """
+        if (
+            not current_platform().is_nvidia
+            or self.mapping.attn.tp_size == 1
+            or max_num_tokens <= _MULTIMEM_AR_MIN_TOKENS
+            or global_server_args_dict.get("force_deterministic_rsag", False)
+            or global_server_args_dict.get("batch_invariant_collectives", False)
+        ):
+            return False
+        if self.staged_projection is not None:
+            if max_num_tokens > self.staged_projection[1]:
+                raise RuntimeError("Cannot grow a prepared K3 o-projection buffer")
+            return True
+        group = _get_process_group(self.mapping.attn.tp_group)
+        if not multimem_prealloc(max_num_tokens, (self.hidden_size,), group.group_name):
+            return False
+        K3AttnComm.staged_projection = (group.group_name, max_num_tokens)
+        logger.info(
+            f"K3 o-projection multimem staging prepared through M={max_num_tokens}"
+        )
+        return True
+
     def acquire_projection_output(
         self,
         like: torch.Tensor,
@@ -205,9 +236,25 @@ class K3AttnComm:
         """Return prepared storage for an eligible attention producer, or None."""
         from tokenspeed.runtime.layers.dense import UnquantizedLinearMethod
 
+        if not current_platform().is_cdna4:
+            # Prepared on NVIDIA only (prepare_staged_projection).
+            staged = self.staged_projection
+            if (
+                staged is None
+                or like.ndim != 2
+                or not _MULTIMEM_AR_MIN_TOKENS < like.shape[0] <= staged[1]
+                or like.dtype != torch.bfloat16
+                or type(projection.quant_method) is not UnquantizedLinearMethod
+                or projection.weight.dtype != torch.bfloat16
+                or projection.weight.shape[0] != self.hidden_size
+                or projection.bias is not None
+                or projection.reduce_results
+                or not projection.input_is_parallel
+            ):
+                return None
+            return multimem_view(like.shape[0], self.hidden_size, staged[0])
         if (
-            not current_platform().is_cdna4
-            or like.ndim != 2
+            like.ndim != 2
             or not _IRIS_ATTN_PRODUCER_DIRECT_MIN_TOKENS
             <= like.shape[0]
             <= _IRIS_MAX_TOKENS
@@ -265,6 +312,11 @@ class K3AttnComm:
             and not global_server_args_dict.get("batch_invariant_collectives", False)
             else None
         )
+        if reduced is None and producer_direct and self.staged_projection is not None:
+            # The MoE tail restages the buffer; AttnRes keeps the sum past it.
+            reduced = multimem_all_reduce_staged(
+                partial, self.staged_projection[0]
+            ).clone()
         if reduced is None:
             if producer_direct:
                 reduced = all_reduce((partial,), self.mapping.attn.tp_group)[0]

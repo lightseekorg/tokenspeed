@@ -101,7 +101,7 @@ wait across ranks inside the kernel (MegaMoE, fused DP projections, or DeepEP
 low-latency): each side can occupy what the other waits on. The runtime keeps
 the NCCL all-gather when one of them is configured.
 Cross-rank kernels whose CTAs pair up by index across ranks — NCCL, one-shot
-or two-shot multimem, and Lamport all-reduces, including PyTorch's multimem
+or two-shot multimem, and Lamport all-reduces, including the staged multimem
 all-reduce — run alongside: they rely on CTAs being dispatched by index, as
 NCCL's ring kernels already do, not on a CUDA guarantee.
 
@@ -149,3 +149,16 @@ same hand-offs for their buffers. Neither document says at which scope a
 task-boundary fence orders writes across domains: that link is not documented,
 and the evidence for it is empirical (byte-exact gathers over long runs with
 concurrent compute and collectives, on GB300).
+
+## Staged multimem all-reduce
+
+`multimem.py` keeps one symmetric BF16 buffer per row width and group.
+`multimem_stage` copies a tensor into it; a producer that can write in place
+(the Kimi-K3 o-projection GEMM) takes `multimem_view` instead and skips the
+copy. `multimem_all_reduce_staged` then sums the rows in one Triton kernel:
+each rank sums a contiguous share of the 16-byte vectors with
+`multimem.ld_reduce` and stores the sum to every copy with `multimem.st`,
+between two CTA barriers on the handle's signal pads. Up to 32 CTAs run it;
+on 8 GB300s over two nodes a [8192, 7168] sum takes 260 us there and 291 us at
+8 CTAs, where NCCL takes 364 us. The result lives in the buffer until the next
+stage or view of that width.

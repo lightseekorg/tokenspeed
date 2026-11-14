@@ -4862,10 +4862,13 @@ class KimiLinearForCausalLM(BaseCausalLM):
         attn_state = self.model.iris_states.get(self.mapping.attn.tp_group)
         moe_state = self.model.iris_states.get(self.mapping.moe.tp_ep_group)
         moe_comm: K3MoeTailComm | None = None
+        attn_comm: K3AttnComm | None = None
         for layer in self.model.layers:
             if not isinstance(layer, KimiLinearDecoderLayer):
                 continue
             layer.k3_comm.iris_state = attn_state
+            if attn_comm is None:
+                attn_comm = layer.k3_comm
             if not layer.is_moe_layer:
                 continue
             moe = layer.block_sparse_moe
@@ -4875,6 +4878,8 @@ class KimiLinearForCausalLM(BaseCausalLM):
                     moe_comm = moe.comm
         if moe_comm is not None:
             prepared = moe_comm.prepare(max_num_tokens) or prepared
+        if attn_comm is not None:
+            prepared = attn_comm.prepare_staged_projection(max_num_tokens) or prepared
         prepared = self._prepare_decode_chain() or prepared
         return bool(shared_mlps) or prepared
 

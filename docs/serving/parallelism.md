@@ -1024,6 +1024,14 @@ rounded once). The model builds the mailbox in `prepare_communication_runtime`;
 each layer uses both chains or neither, so the two uses alternate the
 mailbox's parities.
 
+Past 1024 rows, a Kimi-K3 attention layer's BF16 o-projection writes its
+partial straight into the multimem staging buffer of the MoE tail's
+up-projection (`K3AttnComm.prepare_staged_projection`). The sum then runs as
+the same in-switch all-reduce instead of NCCL. The reduced rows are copied
+out, because AttnRes keeps them after the MoE tail restages the buffer. Under
+`--batch-invariant-collectives` or `--force-deterministic-rsag` the attention
+keeps its ordinary all-reduce.
+
 Under `--numerics rl-bitwise` (`--batch-invariant-collectives`) every
 reduction takes NCCL data movement plus a rank-ordered fp32 fold, and the
 gathers stay on the multicast kernels; the in-switch reduction's order moves
