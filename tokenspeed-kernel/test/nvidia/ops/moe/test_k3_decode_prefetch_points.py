@@ -42,7 +42,9 @@ def _layer(forks):
     )
 
     layer = object.__new__(KimiK3DecodeAttentionLayer)
-    layer.projection = SimpleNamespace(run=lambda x, out: out)
+    layer.projection = SimpleNamespace(
+        run=lambda x, out: (forks.append(("projection",)), out)[1]
+    )
     layer.exit = SimpleNamespace(run=lambda *args: forks.append(("exit",)))
     layer.prefetch = SimpleNamespace(fork=lambda *args: forks.append(args))
     layer.layer_idx, layer.rows = 3, 16
@@ -54,7 +56,7 @@ def test_the_attention_prefetch_forks_after_the_input_projection():
     layer = _layer(forks)
     projected = layer.project(torch.zeros(8, 32))
     assert projected.shape == (8, 16)
-    assert forks == [("attention_moe", 3, 8)]
+    assert forks == [("projection",), ("attention_moe", 3, 8)]
     out = torch.zeros(8, 32)
     assert layer.leave(torch.zeros(8, 16), None, None, out) is out
-    assert forks[1:] == [("exit",), ("oproj_down", 3, 8)]
+    assert forks[2:] == [("exit",), ("oproj_down", 3, 8)]
