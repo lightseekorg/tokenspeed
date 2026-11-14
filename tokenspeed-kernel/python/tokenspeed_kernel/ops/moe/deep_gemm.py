@@ -290,7 +290,7 @@ def mega_moe_live_requests(device: torch.device | str) -> torch.Tensor:
     The ratio is right only when each rank's MegaMoE input is its
     attention-DP group's whole padded batch: request-major, with the same
     number of rows for every request and the filler requests last. Attention
-    TP 1 and rows replicated over attention TP (attention TP == MoE TPxEP)
+    TP 1 and rows replicated over attention TP (attention TP == MoE TP x EP)
     give that layout; they are the only layouts DeepSeek V4.1 admits with
     MegaMoE. A reduce-scatter shard of the batch does not: the live rows fall
     unevenly across the shards. Under such a layout (Qwen3.5's DP4/TP2/EP8)
