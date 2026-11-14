@@ -63,6 +63,15 @@ export default defineConfig({
           { text: "Disaggregated Serving", link: "/serving/disaggregation" },
           { text: "Weight Memory Policies", link: "/serving/weight-memory" }
         ]
+      },
+      {
+        text: "Operations",
+        items: [
+          {
+            text: "Native Mooncake L3 Validation",
+            link: "/operations/native-l3-validation"
+          }
+        ]
       }
     ],
     search: {

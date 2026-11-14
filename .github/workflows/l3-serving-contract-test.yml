@@ -1,0 +1,45 @@
+name: L3 Serving Gate Contracts
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "test/l3_serving_test_utils.py"
+      - "test/l3_test_utils.py"
+      - "test/test_l3_serving_gate.py"
+      - "test/runtime/test_l3_serving_e2e.py"
+      - "test/runtime/l3_serving_e2e_config.example.json"
+      - ".github/workflows/l3-serving-contract-test.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "test/l3_serving_test_utils.py"
+      - "test/l3_test_utils.py"
+      - "test/test_l3_serving_gate.py"
+      - "test/runtime/test_l3_serving_e2e.py"
+      - "test/runtime/l3_serving_e2e_config.example.json"
+      - ".github/workflows/l3-serving-contract-test.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: l3-serving-contract-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cpu-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
+      - name: Install test dependency
+        run: python -m pip install 'pytest>=9,<10'
+      - name: Test serving gate contracts without a model or native store
+        run: python -m pytest -q test/test_l3_serving_gate.py
