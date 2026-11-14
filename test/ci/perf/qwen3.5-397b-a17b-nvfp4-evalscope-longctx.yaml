@@ -20,7 +20,7 @@ server:
     --moe-tp-size 8
     --max-model-len 1048576
     --hf-overrides '{"max_position_embeddings": 1048576}'
-    --max-num-seqs 4
+    --max-num-seqs 8
     --gpu-memory-utilization 0.8
     --trust-remote-code
     --attention-backend trtllm

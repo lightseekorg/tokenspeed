@@ -66,6 +66,8 @@ void submit_requests(tokenspeed::Scheduler& scheduler, rust::Slice<const Request
             converted.push_back(tokenspeed::RequestSpec{
                 .request_id = std::string(spec.request_id),
                 .session_id = std::string(spec.session_id),
+                .cache_group_id = std::string(spec.cache_group_id),
+                .shared_prefix_tokens = to_std({spec.shared_prefix_tokens.data(), spec.shared_prefix_tokens.size()}),
                 .tokens = to_std({spec.tokens.data(), spec.tokens.size()}),
                 .max_new_tokens = spec.max_new_tokens,
                 .max_cached_prefix_tokens = spec.max_cached_prefix_tokens,
@@ -193,8 +195,25 @@ std::size_t demote_sessions(tokenspeed::Scheduler& scheduler, rust::Slice<const 
     return scheduler.DemoteSessions(session_ids, ended);
 }
 
+std::size_t demote_cache_groups(tokenspeed::Scheduler& scheduler, rust::Slice<const rust::String> ids, bool ended) {
+    std::vector<std::string> group_ids;
+    for (const auto& id : ids) group_ids.emplace_back(id);
+    return scheduler.DemoteCacheGroups(group_ids, ended);
+}
+
 std::size_t demote_session(tokenspeed::Scheduler& scheduler, rust::Str session_id, bool ended) {
     return scheduler.DemoteSession(std::string(session_id), ended);
+}
+
+bool shared_prefix_storage_enabled(const tokenspeed::Scheduler& scheduler) {
+    return scheduler.SharedPrefixStorageEnabled();
+}
+
+SharedPrefixPublication shared_prefix_publication(const tokenspeed::Scheduler& scheduler,
+                                                  rust::Slice<const std::int32_t> input_ids,
+                                                  std::int32_t max_prefix_tokens) {
+    const auto result = scheduler.GetSharedPrefixPublication({input_ids.data(), input_ids.size()}, max_prefix_tokens);
+    return SharedPrefixPublication{rust::String(result.status), result.confirmed_prefix_tokens, result.cache_epoch};
 }
 
 AdmissionSnapshot admission_snapshot(const tokenspeed::Scheduler& scheduler, std::int32_t token_step) {
@@ -511,7 +530,7 @@ rust::Vec<StorageOpView> plan_storage_ops(const tokenspeed::ExecutionPlan& plan)
         views.reserve(cache_keys.size());
         for (const tokenspeed::CacheKey& key : cache_keys) {
             views.push_back(StorageKeyView{.group_id = key.group_id,
-                                           .content_hash = rust::String(key.content_hash),
+                                           .content_hash = rust::String(key.content_hash.ToString()),
                                            .page_offset = key.page_offset});
         }
         return views;

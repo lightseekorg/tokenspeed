@@ -530,6 +530,12 @@ reaches back to the one that waited. The ops READMEs (`moe`,
 `attention/rmha`, `conv`, `residual`) name the kernels that trigger first
 and what each preloads before its wait.
 
+A captured kernel launches early only through a single programmatic
+dependency. A stream join adds the branch's last node to the next kernel's
+dependencies, and with two it waits for both to finish. `StreamFork` therefore
+waits once per branch: a join with no unjoined branch work, including a scope's
+closing join after an explicit one, adds nothing.
+
 `fused_gate_sigmoid_mul_add`, `sigmoid_mul`, `silu_and_mul`, `swiglu_oai`,
 `situ_and_mul`, `add3`, and split AttnRes launchers read `pdl_enabled()`
 themselves. They use that same value for `ENABLE_PDL` and `launch_pdl`; model
@@ -866,13 +872,17 @@ participate in expert-owned dispatch/combine, which never defers another reducti
 
 ### Drafter prefill graphs
 
-With `--enable-drafter-prefill-graph` the drafter's work inside an extend
-forward replays from graphs too. The drafter declares what it records
-(`BaseDrafter.extend_graph_plan`), and the capture and the CUDA-graph memory
-projection read that one plan: Eagle's step 0 per target token bucket at each
+The drafter's work inside an extend forward replays from graphs too. The
+drafter declares what it records (`BaseDrafter.extend_graph_plan`), and the
+capture and the CUDA-graph memory projection read that one plan: Eagle's
+decode steps at each request count from 1 to `EXTEND_DECODE_MAX_REQUESTS` (16,
+at most `max_num_seqs`; `prefill:drafter-decode`), and with
+`--enable-drafter-prefill-graph` its step 0 per target token bucket at each
 exact request count of `--prefill-graph-capture-batch-sizes`
-(`prefill:drafter-step0`), and its decode steps per request count
-(`prefill:drafter-decode`). They are breakable graphs in one private pool,
+(`prefill:drafter-step0`). An extend round admits a few requests (under a
+steady streaming load, one or two in nearly every round), so a larger one
+runs its decode steps eager; each captured count is a dummy extend of that
+many requests, which the probe arena's floor covers. They are breakable graphs in one private pool,
 apart from the target's prefill and decode pools. Their static buffers (the
 target's hidden rows at the largest bucket) are allocated outside the
 measured windows, like the target graph's static outputs, so the utilization
@@ -903,13 +913,16 @@ unwritten when the break runs.
 
 A round replays only what the graphs baked: a pure extend (MIXED rounds run
 eager), no attention DP or query shard, a fitting bucket at the exact request
-count (a round over the largest bucket still replays the decode steps). Only a
-chain drafter on one rank, without a draft sampler, token history or a top-k
-carried across steps, over a draft model that declares
-`supports_breakable_draft_extend` (its draft backend also attends in the mode
-a break passes it), captures at all. `ServerArgs` refuses the switch for the
-launches its arguments rule out, and `ModelExecutor` for a boot whose plan is
-empty.
+count for step 0 and the exact request count for the decode steps (which also
+follow an eager step 0). The decode steps need a chain drafter of more than
+one step without a draft sampler, token history or a top-k carried across
+steps, and one replay decision on every rank that runs the round's
+collectives: no attention DP, no pipeline. Tensor- and expert-parallel ranks
+run the same round, so they replay alike. Step 0 additionally runs on one
+rank, over a draft model that declares `supports_breakable_draft_extend` (its
+draft backend also attends in the mode a break passes it). `ServerArgs`
+refuses the switch for the launches its arguments rule out, and
+`ModelExecutor` for a boot whose plan has no step-0 series.
 
 A replay is not bit-identical to a serving-time eager round in general. The
 graphs keep the kernels startup dispatch chose for them, as the decode graphs
@@ -1707,9 +1720,13 @@ history destinations through `write_locations`.
   `extend_span_locations()` expose the writing router's history windows.
   DFLASH reads its own router before publishing a proposal window, so context
   KV follows the draft group's pages even when its retention differs from
-  the target's. The runner refreshes both routers before the target forward;
-  capture-tap writes and the fallback context write consume that same round's
-  draft locations.
+  the target's. Extend rows take the draft's extend span. Verify rows take
+  the target's verify width from each request's first verify position,
+  resolved through `draft_write_locations_uniform`: the draft's own decode
+  window has the draft's query width, which DSpark narrows by the anchor
+  row. The runner refreshes both routers before the target forward;
+  capture-tap writes and the fallback context write resolve over that same
+  round's draft table.
 * **Writes outside the backend** (the attention prologue) fetch their slots
   immediately before the write. An offloaded latent
   projection uses the compute slots returned by its sparse prepare. When a draft step-0
@@ -2009,7 +2026,9 @@ index and block `-1`, which the masked writers of the conv window and the
 recurrent state skip. The stored states are the scan's own, so the checkpoint
 blocks match eager bit for bit; the cost is the extra scratch writes and the
 shared scratch. A backend without the flag, and every other family, keeps such
-a forward on its live metadata at the eager break.
+a forward on its live metadata at the eager break. There KDA, whose scan
+kernels store no interior state, scans each checkpointed row's tokens before
+its checkpoint a second time and stores that scan's final state.
 
 Qwen4-Exp's composite passes these seams to its attention child, so its GDN
 layers run inline; PLE and the QSA indexer keep their breaks over their own

@@ -81,6 +81,11 @@ cross-vendor bitwise GEMM equivalence. Different FP32 reduction
 associations remain observable near cancellation and must be checked against
 native operator and model references before qualification.
 
+On Ascend, the public module remains importable so model discovery can run,
+but GPU block-scaled implementations are not imported. Planning block-scaled
+MoE routes on NPU raises `NotImplementedError`, including for an explicit
+`torch` solution; the CPU oracle is not an NPU fallback.
+
 Expert selection scores `sigmoid(logit) + bias` with `torch.sigmoid`'s
 `expf` and correctly rounded divide, so near-tied experts rank as in the
 reference. The router projection keeps the FP32 accumulator: `skinny_mm` for
@@ -92,6 +97,14 @@ decode-size rows on NVIDIA, the GEMM facade's FP32 output otherwise.
 execution also returns a map from each original route to its output row, with
 `-1` for remote experts. Consumers normalize each route before weighting and
 summation. Combining routes before normalization changes the operation.
+
+`triton_bf16_routes_moe_apply` and `gluon_bf16_routes_moe_apply` serve
+`bf16_moe_routes` as `moe.apply` kernels to layers that always finalize the
+routes themselves (`moe_plan(requires_deferred_finalize=True)`). They return the
+routes in token order without a map; rows of other ranks' experts are zero.
+They cannot finalize and declare `supports_finalize={False}`; every plan that
+does not require a deferred finalize asks for `supports_finalize`, so finalizing
+layers never select them.
 
 `gather_moe_routes` restores token/route order from a deferred output map and
 zeros absent routes. A kernel declaring `deferred_output_is_token_order` writes
@@ -162,7 +175,7 @@ expert_apply = prepare_sm90_fp8_moe(
 ```
 
 Private modes apply `sm90_moe.patch` to a cached source copy of FlashInfer
-0.7.3 and compile isolated modules, operators, and tuning caches. They require
+0.7.4 and compile isolated modules, operators, and tuning caches. They require
 matching upstream sources, JIT enabled, and both CUDA toolkit and runtime
 12.8 or newer. Initialization reports unsupported sources or build settings.
 Private cold JIT compilations bind their include path to that versioned source
@@ -237,7 +250,7 @@ replay. Performance depends on routing; benchmark the intended workload.
 
 ### NVFP4 routing-map padding
 
-The pinned FlashInfer version (0.7.3) initializes unused rows inside active
+The pinned FlashInfer version (0.7.4) initializes unused rows inside active
 expert tiles of `permuted_idx_to_token_idx` to `-1` in its routing producers.
 This prevents unnecessary activation loads in the first GEMM without a separate
 fill-kernel launch. Routing refreshes live mappings and tile padding on every
@@ -576,6 +589,34 @@ normalized FP32 weights (scale 1) and INT32 IDs into caller-owned buffers.
 The routing-only kernel has no expert-plan workspace or 8,192-token limit.
 Other contracts retain their existing routers.
 
+## Kimi-K3 front projections
+
+`try_latent_moe_input_projections` runs a registered fused implementation or
+returns `None` before any projection. This lets the runtime retain the
+separate projections and their stream scheduling for unsupported inputs.
+`latent_moe_input_projections` keeps its portable composition when no fused
+implementation is available. The generic packed Triton kernel
+(`triton_latent_input_packed`) is registered on AMD only: on NVIDIA the
+separate vendor GEMM projections are faster, so below the fused front's row
+bound no fused kernel matches and the runtime keeps the separate path.
+
+`cuda_latent_input` is the vendored FlashInfer/Cake fused front
+(`thirdparty/cuda/kimi3_latent_front.py` and `csrc/kimi3_latent_front/`): one
+persistent launch produces the FP32 router logits, the BF16 latent input and
+the BF16 SiTU-activated shared-expert input. It is registered on SM100 and
+SM103 parts with 148 or 152 SMs (the counts the plan rules are validated for)
+for 2048 BF16 rows or more (no upper bound: the plan scales with the row
+count), Kimi-K3's replicated router/latent weights, full shared-expert weights,
+and SiTU clamps 4 and 25. Attention-DP uses it only
+without shared-expert TP; EP routing/quantization and the shared down projection
+keep their existing owners. Smaller shapes and shared-expert TP retain their
+existing paths.
+
+The programs are JIT-built through FlashInfer's toolchain like the Kimi-K3
+router and do not depend on the FlashInfer package shipping its experimental
+kernel sources (release wheels omit them). Prepare/warm up before graph capture;
+no persistent activation tensors are cached per layer by this adapter.
+
 ## NVFP4 MegaMoE for Qwen3.5
 
 The `mega_moe` NVFP4 adapter supports gated SiLU (`silu(gate) * up`) and
@@ -682,7 +723,9 @@ symmetric memory instead of NCCL collectives:
 1. One GEMM computes this rank's 112 router logits and 448 latent-down rows
    and multicasts both to every rank.
 2. One kernel takes the top-16 experts (sigmoid plus correction bias,
-   renormalized, scaled) and gathers the full latent row.
+   renormalized, scaled) and gathers the full latent row. It reads the logits
+   from their mailbox as they land, without waiting for the GEMM to complete,
+   and every thread of a row's CTA ranks the candidates, at every row count.
 3. Persistent MXFP4 experts compute this rank's intermediate slice of the
    chosen experts and combine them into a weighted latent partial.
 4. One tail kernel all-reduces the partials, applies the latent RMSNorm, runs

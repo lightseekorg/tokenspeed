@@ -62,7 +62,10 @@ from tokenspeed.runtime.execution.cudagraph_memory import (
     ladder_from_plan,
 )
 from tokenspeed.runtime.execution.drafter import get_drafter_impl
-from tokenspeed.runtime.execution.drafter.base import DrafterExtendCapture
+from tokenspeed.runtime.execution.drafter.base import (
+    EXTEND_STEP0_SERIES,
+    DrafterExtendCapture,
+)
 from tokenspeed.runtime.execution.drafter.eagle_harness.config import (
     EagleHarnessConfig,
 )
@@ -146,6 +149,7 @@ from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.hf_transformers_utils import get_context_length
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.server_args import ServerArgs
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
@@ -618,6 +622,9 @@ class ModelExecutor:
     ):
         self.device = config.device
         self.config = config
+        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=config.enable_memory_saver
+        )
         self.model_runner = model_runner
         self.sampling_backend = sampling_backend
         self.attn_backend = attn_backend
@@ -647,41 +654,49 @@ class ModelExecutor:
         max_bs = config.max_num_seqs // max(config.data_parallel_size, 1)
 
         spec_num_tokens = config.spec_num_tokens if config.spec_algo is not None else 1
-        self.input_buffers = InputBuffers(
-            max_bs=max_bs,
-            max_num_tokens=max(
-                config.chunked_prefill_size, max_bs * config.output_length
-            ),
-            state_write_padding_pool_index=config.max_req_pool_size,
-            device=self.device,
-            reads_state_checkpoints=config.state_checkpoint_in_forward,
-        )
-        # Group-keyed zeroing requests carry scheduler (virtual) block IDs; this
-        # rank's position in the KVP group selects the pages it owns.
-        self._cache_kvp_rank = model_runner.mapping.attn.kvp_rank
-        ngram_context = engram_context_len(model_runner.model_config.hf_text_config)
-        if ngram_context and (config.pp_size != 1 or config.overlap_schedule_depth > 1):
-            raise NotImplementedError(
-                "Engram input history requires PP=1 and in-flight depth <= 1"
+        with self.memory_saver_adapter.named_region("executor_inputs"):
+            self.input_buffers = InputBuffers(
+                max_bs=max_bs,
+                max_num_tokens=max(
+                    config.chunked_prefill_size, max_bs * config.output_length
+                ),
+                state_write_padding_pool_index=config.max_req_pool_size,
+                device=self.device,
+                reads_state_checkpoints=config.state_checkpoint_in_forward,
             )
-        self.input_buffers.init_ngram_buffers(
-            ngram_context,
-            model_runner.model.get_ngram_hash_parameters() if ngram_context else None,
-            config.input_vocab_size,
-        )
-        self.runtime_states = RuntimeStates(
-            req_pool_size=config.max_req_pool_size,
-            input_vocab_size=config.input_vocab_size,
-            vocab_size=config.vocab_size,
-            device=self.device,
-            output_length=config.output_length,
-        )
-        self.runtime_states.init_ngram_state(ngram_context)
-        self.runtime_states.init_request_token_history(
-            config.physical_context_len
-            if model_runner.model_config.requires_request_token_history
-            else 0
-        )
+            # Group-keyed zeroing requests carry scheduler (virtual) block IDs; this
+            # rank's position in the KVP group selects the pages it owns.
+            self._cache_kvp_rank = model_runner.mapping.attn.kvp_rank
+            ngram_context = engram_context_len(model_runner.model_config.hf_text_config)
+            if ngram_context and (
+                config.pp_size != 1 or config.overlap_schedule_depth > 1
+            ):
+                raise NotImplementedError(
+                    "Engram input history requires PP=1 and in-flight depth <= 1"
+                )
+            self.input_buffers.init_ngram_buffers(
+                ngram_context,
+                (
+                    model_runner.model.get_ngram_hash_parameters()
+                    if ngram_context
+                    else None
+                ),
+                config.input_vocab_size,
+            )
+        with self.memory_saver_adapter.named_region("runtime_states"):
+            self.runtime_states = RuntimeStates(
+                req_pool_size=config.max_req_pool_size,
+                input_vocab_size=config.input_vocab_size,
+                vocab_size=config.vocab_size,
+                device=self.device,
+                output_length=config.output_length,
+            )
+            self.runtime_states.init_ngram_state(ngram_context)
+            self.runtime_states.init_request_token_history(
+                config.physical_context_len
+                if model_runner.model_config.requires_request_token_history
+                else 0
+            )
         # Sized like InputBuffers.max_bs so the padded graph-bucket bs fits.
         self.nan_guard = NanGuard.create(
             config.enable_nan_detection,
@@ -910,24 +925,25 @@ class ModelExecutor:
 
     def _configure_for_pools(self) -> None:
         """Publish the bound pools to the backends and the model's layers."""
-        self.attn_backend.configure_runtime(
-            request_slot_capacity=self.config.max_req_pool_size + 1,
-            cache_group_specs=tuple(self.token_to_kv_pool.arena.cache_group_specs),
-            cache_group_page_counts=_cache_arena_attr(
-                self.token_to_kv_pool, "cache_group_page_counts", None
-            ),
-        )
-        if self.draft_attn_backend is not None:
-            self.draft_attn_backend.configure_runtime(
-                cache_group_specs=tuple(
-                    _cache_arena_attr(
-                        self.draft_token_to_kv_pool, "cache_group_specs", ()
-                    )
-                ),
+        with self.memory_saver_adapter.named_region("attention_state"):
+            self.attn_backend.configure_runtime(
+                request_slot_capacity=self.config.max_req_pool_size + 1,
+                cache_group_specs=tuple(self.token_to_kv_pool.arena.cache_group_specs),
                 cache_group_page_counts=_cache_arena_attr(
-                    self.draft_token_to_kv_pool, "cache_group_page_counts", None
+                    self.token_to_kv_pool, "cache_group_page_counts", None
                 ),
             )
+            if self.draft_attn_backend is not None:
+                self.draft_attn_backend.configure_runtime(
+                    cache_group_specs=tuple(
+                        _cache_arena_attr(
+                            self.draft_token_to_kv_pool, "cache_group_specs", ()
+                        )
+                    ),
+                    cache_group_page_counts=_cache_arena_attr(
+                        self.draft_token_to_kv_pool, "cache_group_page_counts", None
+                    ),
+                )
 
         # Storage is the plan's decision: stamp each attention layer's cache
         # group from the pool and check the group retains what the layer's
@@ -1056,6 +1072,7 @@ class ModelExecutor:
             token_to_kv_pool=self.token_to_kv_pool,
             input_buffers=self.input_buffers,
             config=self.config,
+            memory_saver_adapter=self.memory_saver_adapter,
             drafter=self.drafter,
             graph_supported=self._graph_support.prefill_graph,
         )
@@ -1126,24 +1143,24 @@ class ModelExecutor:
     def _drafter_extend_plan(self) -> dict[str, list[tuple[int, int]]]:
         """The drafter's extend graphs this boot records, per series.
 
-        Only with ``--enable-drafter-prefill-graph``, the target's prefill
-        graph on, and a drafter that can capture them in this configuration;
-        they share the target's token buckets and capture each at the
-        bucket's exact request counts (``--prefill-graph-capture-batch-sizes``,
-        unset: the fewest requests that fit the bucket in the context length).
-        The capture and the projection read this one plan, so they reach the
-        same verdict.
+        Only with the target's prefill graph on and a drafter that can capture
+        them in this configuration. The decode steps' graphs are recorded at
+        each request count from 1 to ``EXTEND_DECODE_MAX_REQUESTS`` (at most
+        the batch); the step-0 graphs (``--enable-drafter-prefill-graph``)
+        share the target's token buckets and are captured at the bucket's
+        exact request counts
+        (``--prefill-graph-capture-batch-sizes``, unset: the fewest requests
+        that fit the bucket in the context length). The capture and the
+        projection read this one plan, so they reach the same verdict.
         """
-        if (
-            not self.config.enable_drafter_prefill_graph
-            or self.prefill_graph.disable
-            or self.drafter is None
-        ):
+        if self.prefill_graph.disable or self.drafter is None:
             return {}
         plan = self.drafter.extend_graph_plan(
             self.prefill_graph.capture_buckets,
             partial(resolve_prefill_capture_batch_sizes, self.config),
         )
+        if not self.config.enable_drafter_prefill_graph:
+            plan.pop(EXTEND_STEP0_SERIES, None)
         return {series: entries for series, entries in plan.items() if entries}
 
     @property
@@ -1153,18 +1170,18 @@ class ModelExecutor:
 
     def _validate_drafter_extend_graphs(self) -> None:
         """Refuse ``--enable-drafter-prefill-graph`` when this boot would
-        record no drafter graph.
+        record no step-0 graph.
 
         ``ServerArgs.validate_drafter_prefill_graph`` refuses the launches the
         arguments decide; whether the prefill graph is on and whether the
         drafter supports its loaded draft model are known only here.
 
         Raises:
-            ValueError: The switch is on and the plan is empty.
+            ValueError: The switch is on and the plan has no step-0 series.
         """
         if (
             not self.config.enable_drafter_prefill_graph
-            or self.captures_drafter_extend_graphs
+            or EXTEND_STEP0_SERIES in self._drafter_extend_plan()
         ):
             return
         if self.prefill_graph.disable:

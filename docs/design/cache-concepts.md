@@ -140,20 +140,38 @@ request fits, it does not enumerate eviction candidates. Under memory pressure,
 it enumerates candidates and keeps shadow occupancy only for the parents whose
 children it tentatively evicts. This makes the common zero-eviction path scale
 with cache groups and request demand rather than total cache capacity.
+A shadow's occupancy state grows only with the parents it touches
+(`ParentOccupancy`), never with pool capacity. A planner's lookup tables live
+for its plan alone, and no plan iterates them, so no decision depends on their
+slot or bucket order, whether a table is open-addressed (`FlatHashMap`) or
+node-based. Each shadow and each planner allocates its tables from a monotonic
+arena it owns (`std::pmr::monotonic_buffer_resource`): nothing is freed during
+the plan, everything returns when the planner dies, and nothing is kept between
+plans, so every plan starts with fresh tables and occupancy state. No array
+proportional to a sparse Host pool's theoretical slot count is initialized for
+planning.
 
 Replicated groups have one ownership bucket: every Host hit needs a Device
 destination in that bucket, without looking up or temporarily owning the Host
 block to count it. Sharded groups count destinations by their Host sources'
 ownership buckets.
 
-The prefix index remembers which entries an eviction traversal found pinned.
-Later admission attempts skip those entries until the last external block owner
-releases them. A one-shot ownership notification restores each entry to its
-original access epoch, including an epoch changed while it was pinned. This
-keeps the same LRU victim order without repeatedly scanning active requests'
-blocks. Admission cursors read this available-entry index directly, so a later
-plan also skips epochs whose entries are all known to be pinned. Temporary
-lookups do not update this secondary index. The notification
+The prefix index orders the entries eviction may take by access epoch, then
+location (the available-entry order). Each entry owns its registration there,
+and in the common order below, and removes it when destroyed; the orders
+outlive their registrations, and an entry cancels its ownership notification
+before its registrations or its block go. The index remembers which entries
+an eviction traversal found pinned, by whatever owner -- an admission's
+acquired hit, a `Find()` reference, a transfer: the traversal sets such an
+entry's order node aside, and later admission attempts skip it until the last
+external block owner releases it. Acquiring a hit does not itself set
+anything aside. A one-shot ownership notification then restores the same
+node, without allocating, under the entry's current access epoch and
+location, either of which may have changed while it was pinned. This keeps
+the same LRU victim order without repeatedly scanning active requests'
+blocks. Admission cursors read this available-entry index directly, so a
+later plan also skips epochs whose entries are all known to be pinned.
+Temporary lookups do not update this secondary index. The notification
 belongs to block-reference ownership; the pool still tracks placement alone.
 
 Host duplicate reclamation needs a complete Device prefix with no pending
@@ -184,12 +202,13 @@ it consumes those snapshots in the same order without traversing the index
 again. Both ownership classes are observed within the same unchanged plan.
 Admission and Host placement keep temporary lookup nodes in a memory
 resource scoped to the plan; Host placement also uses it for snapshots.
-The returned victim list owns its storage;
-no snapshot or allocator survives the call. Every later plan observes fresh
-ownership, access epochs, and tree links.
-The hash tables retain computed key hashes where the standard library supports
-it: walking a bucket or erasing an entry must not repeatedly hash its full
-content digest. Key equality and eviction order remain unchanged.
+The returned plan owns its victim list and the arena holding the victims'
+members until the admission commits; no snapshot, lookup table or planner
+arena survives the call. Every later plan observes fresh ownership, access
+epochs, and tree links.
+The lookup tables retain computed key hashes: walking a cluster or erasing an
+entry does not repeatedly hash its full content digest. Key equality and
+eviction order remain unchanged.
 
 The per-step page gauge composes two O(1) quantities the same way: empty
 parents come from the pool, active parents from the live requests' block
@@ -426,7 +445,8 @@ boundary or not. The one interior checkpoint is opt-in
 prompt's last page boundary before its replay tail also stores the state at
 that boundary into a third block of its rows (`STATE_CHECKPOINT_SLOT`,
 `InForwardStateCheckpoints`) -- the GDN scan emits it from inside the kernel,
-the conv and PLE windows are the inputs before it -- which is then published
+KDA scans the row's tokens before it a second time, the conv and PLE windows
+are the inputs before it -- which is then published
 like a natural checkpoint
 ([Scheduler §1.2](scheduler.md#12-state-groups-two-slots-natural-checkpoints)).
 Publication also registers every non-replayable sliding window at that
@@ -916,6 +936,51 @@ Perception rules per directory:
   mirrored ranks agree.
 * **`prefix_hasher.h`** — SHA-256 prefix-page hashing (moved from
   `scheduler/`).
+
+#### Prefix identities and index storage
+
+* **Hash bytes.** A page identity is SHA-256 over one self-delimiting byte
+  stream: the prior's bytes, the page's token IDs as little-endian 32-bit
+  values, then any extra keys. However hashing is implemented, it feeds
+  exactly that stream: cache identity, storage and KV-event formats never
+  depend on it. Each page chains the previous page's raw digest. A request
+  hashes its prompt pages once and keeps the chain
+  (`Request::PromptPrefixHashes`): admission retries reuse it, a bounded
+  storage query hashes no further than it asks, and publication hashes only
+  the pages the chain does not cover yet. A tail is hashed at the actual
+  publication frontier, under the chain hash of the page before it.
+* **Identity.** `ContentHash` holds a canonical lowercase SHA-256 identity as
+  its 32 bytes and any other key as its exact text, so an empty prior and a
+  zero digest stay distinct, as do uppercase and lowercase text. Equality
+  compares the complete identity, and a `CacheKey` every other field too; a
+  table may hash a digest prefix but never takes it for identity. Converting
+  between identity and text is always explicit, and external storage,
+  transfer and binding interfaces keep text.
+* **Ownership.** Each tier's entry list owns its entries, and the boundary
+  tree's node list owns its nodes and their keys, in stable pooled storage.
+  The key and location lookups are non-owning indices of handles into those
+  lists: rehashing or erasing moves handles, never entries; an entry or node
+  leaves its lookup, by identity, before it is destroyed; and no walk follows
+  slot order -- roots, children, siblings, Host leaves and eviction order come
+  from explicit links and ordered indices, so mirrored ranks agree. Pooled
+  storage and lookup tables keep their high-water capacity until their owner
+  is destroyed; the location index releases each segment once its last entry
+  leaves.
+  The retained-memory bounds are in the class comments (`FixedSlotResource`,
+  `FlatPointerIndex`, `SegmentedLocationIndex`). Block control objects live
+  in their `BlockPool`'s pooled storage: the last owner's release cancels
+  observers, frees the physical child exactly once, then recycles the control
+  slot, and a reused control address carries no ownership of its previous
+  block.
+* **Probe hints.** A probe may record where it found each hit, never an entry
+  pointer or a block owner. Acquisition and protection use such a location
+  only after checking its pool and the complete key at the live location, and
+  otherwise look the key up, so a probe pins nothing and a relocated or reused
+  location can never make it acquire another identity.
+* **Eviction prefetch.** Evicting a plan's victims may prefetch for the
+  victims a few places ahead through the live location index; it is only a
+  hint: it takes no ownership, keeps no entry between steps, and reads only
+  entries indexed at that moment and what they hold.
 
 ### `cache/allocator/` — where things live (token-free)
 
@@ -1608,8 +1673,17 @@ until the plan fits. Before inspecting segment trees, a second relaxed check
 releases the actual request-reclaimable slots and available cache entries into
 temporary occupancy, preserving parent and bucket placement while ignoring
 segment restrictions. It stops as soon as placement fits; when even all such
-releases fail, no victim order can make space. It uses the available-entry
-index, not the live cache, and never commits these tentative releases.
+releases fail, no victim order can make space. It reads the same ordered
+available-entry index as selection, not the live cache, and never commits
+these tentative releases. Selection may replay a bounded prefix of the epochs
+this pre-scan read instead of reading them again. A replayed epoch owns only
+the policy metadata selection ranks by, never blocks or session owners, dies
+with the planner, and is filtered, aged and sorted like an epoch read live.
+After a replay, selection resumes the index by key past the last replayed
+epoch. A demand short by n parents cannot fit before n more blocks leave, as
+one release closes at most one parent of the shortfall
+(`ShadowOccupancy::ParentShortfall`), so the pre-scan and selection ask the
+fit again only after that many releases.
 The bounds read current ownership on every attempt, so a
 released pin can fund the next retry. Request-reclaimable candidates are collected and sorted
 once; each cache group loads and sorts one epoch of eligible candidates at a
@@ -2385,6 +2459,8 @@ update these indices, including full-to-partial transitions and final-child
 release. Shared request/prefix references therefore keep both the parent
 binding and its index state alive until the last reference releases the block.
 These indices describe physical availability, not request-local owner loads.
+A parent's occupied-slot bits are clear whenever it is empty, so binding sets
+no initial state (`BlockPool::LcmBlock` says where they live).
 
 An exact acquire first checks `group holes + empty parents * group packing`.
 Capacity-first selection can consume all of these slots, so it then allocates
@@ -2889,6 +2965,43 @@ complete normally. Reusing an ended ID creates a new owner generation. The
 returned demotion count includes only blocks whose LRU epoch actually changed.
 Already-demoted blocks are not counted again unless later access promotes them.
 
+An independent set of requests may additionally carry `cache_group_id`. When
+nonempty, it owns the request's cached prefixes instead of `cache_session_id`;
+the session still identifies only its own request lifecycle. Cache group and
+session IDs are separate namespaces, so ending a cut or a session whose ID
+happens to equal the group ID cannot age that group's cache. Prefix matching
+continues to use token content and the normal model/cache namespace: the group
+ID never proves a hit, changes request tokens, or enables implicit appends.
+Every first-admission attempt, including the retry after lone-request
+compaction, carries the same session and group IDs so relocating hit blocks
+cannot change the cache owner selected by the request.
+
+`demote_cache_groups([{cache_group_ids, ended}])` applies the same bounded LRU
+hint to explicit group owners. Callers must not translate each member's
+completion into group completion. With no reliable group-end notification,
+omitting the hint is safe: group caches remain subject to ordinary eviction,
+without a group-wide pin or retention promise. Reuse across different groups
+or by an ungrouped request removes exclusive group ownership, as for sessions.
+The existing state-checkpoint and replay constraints are unchanged. Restricted
+State models still require the P/fused role's in-forward checkpoint flag and
+legal model-defined grain; the D role does not publish those checkpoints.
+A group tag does not synthesize missing intermediate states, pin every cut's
+prefix, or guarantee a hit. See `scheduler.md` for the input-checkpoint boundary
+and retention rules.
+
+Owner registries hold weak references. Request access handles and live cache
+entries own the tags; reclamation releases them. Periodic sweeping bounds
+expired registry keys, including workloads that create a new group per batch.
+Both group ingress and the group demotion API enforce the existing 4096-byte
+ID bound, and control batches contain at most 4096 nonempty IDs. Group identity
+must include the caller's model/weight epoch when IDs can repeat across weight
+updates; normal cache flushing and storage-version isolation still apply.
+
+`GetAdmission.cache_group_contract` advertises this ownership contract as `1`.
+The appended field defaults to `0` when an older native engine omits it; callers
+requiring group ownership must verify support on every participating rank before
+sending grouped requests. A newer wire crate alone does not prove engine support.
+
 `GetAdmission` reports live request slots, available/total physical LCM blocks,
 Host capacity, waiting/retracted counts, and a contract-versioned capacity curve.
 Contract version 1 rounds token lengths up to 1024-token buckets and uses the
@@ -2898,3 +3011,75 @@ must not derive physical demand by dividing token counts by a page size. Snapsho
 collection is an explicit control operation; the allocator scan is not added to
 each forward.
 The transport identifies each reply's DP rank, independent of reply arrival order.
+
+### Shared-store publication receipts
+
+`get_shared_prefix_publication` is a bounded, read-only control query. Its body
+contains a nonempty `query_id` (at most 256 UTF-8 bytes), actual `input_ids` (at
+most 1,048,576 i32 tokens), and an exact positive `max_prefix_tokens` no larger
+than that input. Each attention-DP reply echoes the nonce and identifies
+`dp_rank`; a router must select the DP that actually processed the producer and
+reject a late reply with a different nonce. Capability is advertised separately
+as `GetAdmissionReqOutput.shared_prefix_publication_contract == 1` and
+`shared_prefix_storage_enabled == true`; absent fields on an older engine mean
+unsupported, not successful publication.
+
+Contract version 1 requires exact prompt-end publication. With State groups,
+`--enable-state-checkpoint-in-forward` can omit the prompt-end checkpoint in
+favor of an earlier checkpoint (for example, 20 instead of 22 with a page of
+4 and a prefill budget of 8). This combination advertises
+`shared_prefix_storage_enabled == false` and publication queries return
+`unsupported` immediately, even for aligned boundaries or under pressure.
+Routers must reject grouped publication waiting during their capability check;
+turn the flag off to use this contract with unrestricted State groups. Ordinary
+local caching and shared-store QUERY/GET/PUT remain available. A future protocol
+that waits for an earlier checkpoint must report the actual published boundary
+and verify every State and KV dependency there; it cannot relabel that receipt
+as publication of the full prompt. Models without State groups are unaffected.
+
+A `published` result requires successful **retired PUT or accepted GET** receipts, agreed across
+the producer's cache-owning replica ranks, for every immutable object needed at
+that exact prefix: full KV history, each non-replayable window, and every State
+checkpoint. Device hits, Host hits, prefill completion, pending D2H and queued
+PUTs are not publication evidence. A GET counts only after replica agreement,
+native retirement, and acceptance into Host cache; detached or cancelled reads
+do not count. This lets a later producer reuse confirmed historical objects
+without writing them back merely to manufacture a receipt. The query uses the normal chained token
+hashes and checkpoint geometry; a group identifier cannot establish a hit.
+`confirmed_prefix_tokens` equals the requested boundary only for `published`,
+and is zero otherwise. A boundary that violates restricted State checkpoint
+geometry is `unsupported`, not `pending`: retrying cannot make it publishable.
+This query neither creates intermediate checkpoints nor changes model numerics.
+
+Receipts have the storage metadata budget, hold no block references, and are
+forgotten on all-tier cache flush, which increments `cache_epoch`. The reply
+also includes the executor's actual `storage_namespace`, including weight
+versions. Known object failures invalidate matching receipts. `pressure` reports
+blocked storage progress, `too_large` reports a complete dependency larger than
+the metadata budget, and `unsupported` reports a missing publication path or an
+unsupported checkpoint boundary. A router must not retry `unsupported` or
+`too_large`; it must bound its polling deadline for `pending` and fall back to
+ordinary execution on unavailable storage or cancellation. Queries keep no
+per-request wait state.
+
+A receipt proves past publication, not permanent residency: shared-store
+eviction can occur after the reply, and bounded receipt eviction can produce
+conservative misses. Consumers still perform the ordinary storage query/GET and
+validate complete dependencies before using any cache. This protocol requires
+a real shared KV Store with compatible key namespaces and cache layouts;
+Mooncake PD transport or weight transport alone is insufficient.
+
+Cross-instance discovery of a non-page-aligned checkpoint also needs its token
+boundary: an empty consumer cannot infer another instance's tail index from a
+content-addressed store. `shared_prefix_tokens` supplies at most 64 positive
+candidate boundaries shorter than this request. The native matcher hashes each
+candidate from this request's actual input and considers it only within the
+ordinary replay/logprob cacheable bound. Hints are request-local, do not insert
+global tail metadata, do not limit an existing longer local hit, and confer no
+ownership or residency. Candidate enumeration skips boundaries that violate
+any State group's checkpoint granularity, including hinted tails and page
+boundaries inside a restricted segment. A hint cannot make an otherwise
+unusable State checkpoint eligible for an optimistic storage query.
+Query/GET still requires all Full, State and window
+objects; diverging prompts therefore cannot reuse a checkpoint solely because
+they share a group or boundary length.

@@ -278,6 +278,8 @@ def test_context_write_uses_draft_router_before_proposal_publication():
                 runtime_states=States(torch.tensor([256], dtype=torch.int32)),
             )
             self.draft_seq_lens_buf = torch.zeros(1, dtype=torch.int32)
+            self.context_starts_buf = torch.zeros(1, dtype=torch.int64)
+            self.context_locs_buf = torch.zeros(4, dtype=torch.int32)
             self.cache = torch.zeros(2048, 4)
 
         def _write_native_cache(self, hidden, positions, locations, *, decode_only):

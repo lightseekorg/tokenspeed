@@ -22,6 +22,7 @@
 
 import os
 import sys
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -129,6 +130,7 @@ def test_prefill_context_write_does_not_require_decode_window():
         input_buffers=SimpleNamespace(positions_buf=positions),
         _write_native_cache=lambda h, p, loc, **kw: writes.append((h, p, loc, kw)),
     )
+    drafter._context_cache_locations = partial(DFlash._context_cache_locations, drafter)
     # No decode accessor: pure prefill must use the draft router's span.
     drafter.attn_backend = SimpleNamespace(
         group_ids=("draft_swa",),

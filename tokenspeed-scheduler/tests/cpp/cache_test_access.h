@@ -36,6 +36,10 @@
 namespace tokenspeed {
 
 struct CacheCoordinatorTestAccess {
+    static std::size_t CacheGroupRegistrySize(const CacheCoordinator& coordinator) {
+        return coordinator.cache_group_tags_.size();
+    }
+
     static auto MatchPrefix(CacheCoordinator& coordinator, std::span<const std::string> content_hashes) {
         return coordinator.acquirePrefix(coordinator.ProbePrefix(content_hashes), ++coordinator.next_access_epoch_);
     }
@@ -138,17 +142,17 @@ struct CacheCoordinatorTestAccess {
         for (const auto& [hash, counts] : expected) {
             const BoundaryTree::Node* node = tree.Find(hash);
             if (node == nullptr) {
-                mismatches.push_back("no node for the indexed hash " + hash);
+                mismatches.push_back("no node for the indexed hash " + hash.ToString());
                 continue;
             }
             for (const std::size_t tier : {BoundaryTree::kDevice, BoundaryTree::kHost}) {
                 if (node->Entries(tier) != counts.entries[tier] || node->StateEntries(tier) != counts.state[tier] ||
                     node->ClosedEntries(tier) != counts.closed[tier]) {
-                    mismatches.push_back("entry counts of " + hash + " on tier " + std::to_string(tier));
+                    mismatches.push_back("entry counts of " + hash.ToString() + " on tier " + std::to_string(tier));
                 }
             }
             if (node->ClosedPairs() != counts.pairs) {
-                mismatches.push_back("pair count of " + hash);
+                mismatches.push_back("pair count of " + hash.ToString());
             }
         }
         // Every node, by the tree's own links: one without entries hangs on
@@ -164,24 +168,24 @@ struct CacheCoordinatorTestAccess {
             const BoundaryTree::Node* node = pending.back();
             pending.pop_back();
             ++reached;
-            if (!expected.contains(*node->hash) && node->first_child == nullptr && node->PendingHostStores() == 0) {
-                mismatches.push_back("nothing holds the node " + *node->hash);
+            if (!expected.contains(node->hash) && node->first_child == nullptr && node->PendingHostStores() == 0) {
+                mismatches.push_back("nothing holds the node " + node->hash.ToString());
             }
-            if (checkpoints.Contains(*node->hash)) {
+            if (checkpoints.Contains(node->hash)) {
                 ++tracked_checkpoints;
                 const CheckpointTree::Residency residency = tree.CheckpointResidency(*node);
                 if (!residency.held) {
-                    mismatches.push_back("the checkpoint tree tracks the unheld checkpoint " + *node->hash);
+                    mismatches.push_back("the checkpoint tree tracks the unheld checkpoint " + node->hash.ToString());
                 }
                 // Distance is reported for a checkpoint present on either tier.
                 const bool present = residency.complete[0] || residency.complete[1] || residency.pending_host_store;
-                if (checkpoints.Distance(*node->hash).has_value() != present) {
-                    mismatches.push_back("checkpoint presence of " + *node->hash);
+                if (checkpoints.Distance(node->hash).has_value() != present) {
+                    mismatches.push_back("checkpoint presence of " + node->hash.ToString());
                 }
                 for (const CacheTier tier : {CacheTier::kDevice, CacheTier::kHost}) {
-                    if (checkpoints.AgedDistance(*node->hash, tier) != 0 &&
+                    if (checkpoints.AgedDistance(node->hash, tier) != 0 &&
                         !residency.complete[static_cast<std::size_t>(tier)]) {
-                        mismatches.push_back("aged checkpoint " + *node->hash + " incomplete on tier " +
+                        mismatches.push_back("aged checkpoint " + node->hash.ToString() + " incomplete on tier " +
                                              std::to_string(static_cast<int>(tier)));
                     }
                 }
@@ -259,7 +263,7 @@ inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(
     }
     return coordinator.Admit(std::move(prefix), demands, progress, copy_in_blocks, copy_in_point,
                              /*request_access_epoch=*/std::nullopt, /*evict_blocks_past_segments=*/false,
-                             /*session_id=*/{});
+                             /*session_id=*/{}, /*cache_group_id=*/{});
 }
 
 inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(

@@ -593,19 +593,20 @@ impl RequestState {
         if self.finished() {
             return !self.finished_output;
         }
-        let generated = self.output_ids.len() as i64;
         if self.stream {
-            // A zero interval would divide by zero; it means every token.
+            // An interval below one means every step.
             let interval = self
                 .stream_interval
                 .unwrap_or(default_stream_interval)
-                .max(1);
-            if interval > 1 {
-                generated % interval == 1
-            } else {
-                generated % interval == 0
-            }
+                .max(1) as usize;
+            // Send the first step's tokens at once, then whenever at least
+            // `interval` tokens are unsent. A speculative step appends several
+            // tokens, so the output length can step over any given value;
+            // counting unsent tokens doesn't depend on hitting an exact length.
+            let unsent = self.output_ids.len().saturating_sub(self.send_token_offset);
+            interval == 1 || (unsent > 0 && (self.send_token_offset == 0 || unsent >= interval))
         } else {
+            let generated = self.output_ids.len() as i64;
             generated == 1 || generated % FORCED_STREAM_INTERVAL == 0
         }
     }
@@ -701,27 +702,46 @@ mod tests {
         assert_eq!(request.finished_reason.unwrap().wire_type(), "abort");
     }
 
-    #[test]
-    fn stream_intervals_follow_the_python_schedule() {
-        let due = |stream: bool, interval: Option<i64>, generated: usize| {
-            let mut request = RequestState::new(
-                vec![1, 2, 3],
-                1000,
-                BTreeSet::new(),
-                stream,
-                interval,
-                false,
-            );
-            request.output_ids = vec![0; generated];
-            request.output_due(1)
-        };
-        assert!((1..5).all(|n| due(true, None, n)));
-        // An interval above one fires on its first token and every interval after.
-        assert_eq!(
-            (1..8).map(|n| due(true, Some(3), n)).collect::<Vec<_>>(),
-            [true, false, false, true, false, false, true]
+    /// Runs `steps` decode steps that each append `tokens_per_step` tokens and
+    /// returns the output lengths at which an output was sent. A send advances
+    /// `send_token_offset` as `OutputProcessor::stream_state` does.
+    fn sent_at(
+        stream: bool,
+        interval: Option<i64>,
+        tokens_per_step: usize,
+        steps: usize,
+    ) -> Vec<usize> {
+        let mut request = RequestState::new(
+            vec![1, 2, 3],
+            1000,
+            BTreeSet::new(),
+            stream,
+            interval,
+            false,
         );
+        let mut sent = Vec::new();
+        for _ in 0..steps {
+            request
+                .output_ids
+                .extend(std::iter::repeat_n(0, tokens_per_step));
+            if request.output_due(1) {
+                request.send_token_offset = request.output_ids.len();
+                sent.push(request.output_ids.len());
+            }
+        }
+        sent
+    }
+
+    #[test]
+    fn stream_intervals_send_once_enough_tokens_are_unsent() {
+        assert_eq!(sent_at(true, None, 1, 4), [1, 2, 3, 4]);
+        // An interval above one sends the first step's tokens, then every interval after.
+        assert_eq!(sent_at(true, Some(3), 1, 7), [1, 4, 7]);
+        // Speculative steps append several tokens, so the output length can
+        // step over any given value; an output still goes out once at least an
+        // interval's worth of tokens is unsent.
+        assert_eq!(sent_at(true, Some(40), 4, 30), [4, 44, 84]);
         // Non-streaming requests: the first token, then every 50.
-        assert!(due(false, None, 1) && !due(false, None, 2) && due(false, None, 50));
+        assert_eq!(sent_at(false, None, 1, 100), [1, 50, 100]);
     }
 }

@@ -110,17 +110,6 @@ void fillBlockTables(Operation& operation, Request& request, const CacheCoordina
     }
 }
 
-void appendCompletedPrefixHashes(std::vector<std::string>& prefix_hashes, const Request& request,
-                                 std::int32_t filled_prefix_pages) {
-    const std::int32_t first_new_prefix_page = static_cast<std::int32_t>(prefix_hashes.size());
-    _assert(filled_prefix_pages > first_new_prefix_page, "caller must pre-check page-hash progress");
-    const std::string previous_hash = prefix_hashes.empty() ? std::string{} : prefix_hashes.back();
-    std::vector<std::string> new_hashes =
-        ComputePrefixHashes(request.PrefixPages(first_new_prefix_page, filled_prefix_pages), previous_hash);
-    prefix_hashes.insert(prefix_hashes.end(), std::make_move_iterator(new_hashes.begin()),
-                         std::make_move_iterator(new_hashes.end()));
-}
-
 // The page boundary before a long prompt's replay tail where the forward that
 // spans it also writes the State checkpoint
 // (SchedulerConfig::state_checkpoint_in_forward); 0 means none. The D role
@@ -247,7 +236,7 @@ RequestProgress AdvanceRequestProgress(const Request& request, fsm::CacheProgres
     const std::int32_t first_new_prefix_page = static_cast<std::int32_t>(cache_progress.prefix_hashes.size());
     const std::int32_t filled_prefix_pages = num_computed_tokens / prefix_granularity;
     if (filled_prefix_pages > first_new_prefix_page) {
-        appendCompletedPrefixHashes(cache_progress.prefix_hashes, request, filled_prefix_pages);
+        request.AppendPrefixHashes(cache_progress.prefix_hashes, filled_prefix_pages);
     }
     RequestProgress progress{.num_computed_tokens = num_computed_tokens};
     std::optional<TailPublication> tail;
@@ -316,7 +305,7 @@ PrefillOperation applyPrefillEvent(Request& request, Event& event, const CacheCo
     operation.request_pool_index = request.RequestPoolIndex();
     operation.input_length = info.extend_len;
     operation.prefill_length = request.PrefillSize();
-    operation.input_ids.assign(info.input_ids.begin(), info.input_ids.end());
+    operation.input_ids = info.input_ids;
     operation.shifted_input_ids = info.shifted_input_ids;
     operation.extend_prefix_len = info.already_scheduled_len;
     operation.extend_replay_len = info.replay_len;
@@ -497,7 +486,7 @@ std::optional<CacheCoordinator::AdmissionResult> Scheduler::admit(
     std::optional<std::uint64_t> request_access_epoch, bool evict_blocks_past_segments) {
     std::optional<CacheCoordinator::AdmissionResult> result =
         coordinator_.Admit(std::move(prefix), demands, progress, copy_in_blocks, copy_in_point, request_access_epoch,
-                           evict_blocks_past_segments, /*session_id=*/{});
+                           evict_blocks_past_segments, /*session_id=*/{}, /*cache_group_id=*/{});
     if (!result) {
         feedback.admission_failed = true;
         return std::nullopt;
@@ -715,8 +704,7 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
                 } else if (group.attn_kind == AttnKind::kSlidingWindow) {
                     const std::int32_t block_granularity =
                         coordinator_.GroupBlockGranularity(static_cast<std::int32_t>(i));
-                    const std::int32_t hit_blocks =
-                        group.replayable ? 0 : (hit_tokens + block_granularity - 1) / block_granularity;
+                    const std::int32_t hit_blocks = group.replayable ? 0 : CeilDiv(hit_tokens, block_granularity);
                     const std::int32_t retained_begin =
                         std::max(0, request->PrefillSize() - *group.sliding_window_tokens + 1);
                     demands[i].extent = SparseSuffix{
@@ -761,10 +749,10 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
         source == fsm::PrefillSource::kLocal ? promptEndCopyInPoint(*request, hit_tokens) : std::nullopt;
     std::optional<CacheCoordinator::AdmissionResult> admission;
     if (writes_checkpoint) {
-        admission = coordinator_.Admit(CacheCoordinator::PrefixProbe{match.probe},
-                                       chunk_demands(tokens_this_round, true), RequestProgress{},
-                                       /*copy_in_blocks=*/{}, copy_in_point, /*request_access_epoch=*/std::nullopt,
-                                       /*evict_blocks_past_segments=*/false, request->SessionId());
+        admission = coordinator_.Admit(
+            CacheCoordinator::PrefixProbe{match.probe}, chunk_demands(tokens_this_round, true), RequestProgress{},
+            /*copy_in_blocks=*/{}, copy_in_point, /*request_access_epoch=*/std::nullopt,
+            /*evict_blocks_past_segments=*/false, request->SessionId(), request->CacheGroupId());
         if (!admission && must_complete) {
             // Ending at the checkpoint would leave a carried prompt
             // incomplete: it waits, as for any block that does not fit.
@@ -783,7 +771,8 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
             others_hold_pages ? std::move(match.probe) : CacheCoordinator::PrefixProbe{match.probe};
         admission = coordinator_.Admit(std::move(probe), chunk_demands(tokens_this_round, false), RequestProgress{},
                                        /*copy_in_blocks=*/{}, copy_in_point, /*request_access_epoch=*/std::nullopt,
-                                       /*evict_blocks_past_segments=*/!others_hold_pages, request->SessionId());
+                                       /*evict_blocks_past_segments=*/!others_hold_pages, request->SessionId(),
+                                       request->CacheGroupId());
     }
     // Lone-request compaction (docs/design/scheduler.md §1.4) at a first
     // admission: a Submitted request holds no pages, so nothing of its own is
@@ -797,7 +786,8 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
                 return coordinator_.Admit(std::move(match.probe), chunk_demands(tokens_this_round, false),
                                           RequestProgress{}, /*copy_in_blocks=*/{}, copy_in_point,
                                           /*request_access_epoch=*/std::nullopt,
-                                          /*evict_blocks_past_segments=*/true, request->SessionId());
+                                          /*evict_blocks_past_segments=*/true, request->SessionId(),
+                                          request->CacheGroupId());
             });
     }
     if (!admission) {
@@ -845,7 +835,9 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
         .prefix_hashes = std::vector<std::string>(match.prefix_hashes.begin(), match.prefix_hashes.end()),
         .access_epoch = admission->access_epoch,
         .junction_tokens = admission->junction_tokens,
-        .resumed_tail_hash = std::move(admission->resumed_tail_hash),
+        .resumed_tail_hash = admission->resumed_tail_hash
+                                 ? std::optional<std::string>{admission->resumed_tail_hash->ToString()}
+                                 : std::nullopt,
         .resume_tokens = hit_tokens,
     };
     // Checkpoint demotion counts the first admissions that resume at each
@@ -854,7 +846,8 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     const std::int32_t resumed_pages = cache_progress.resume_tokens / prefix_granularity;
     if (checkpoint_lineage_ && resumed_pages > 0 && cache_progress.resume_tokens % prefix_granularity == 0 &&
         resumed_pages <= static_cast<std::int32_t>(cache_progress.prefix_hashes.size())) {
-        checkpoint_lineage_->NoteResume(cache_progress.prefix_hashes[static_cast<std::size_t>(resumed_pages) - 1]);
+        checkpoint_lineage_->NoteResume(
+            ContentHash{cache_progress.prefix_hashes[static_cast<std::size_t>(resumed_pages) - 1]});
     }
     if (writes_checkpoint) {
         cache_progress.state_checkpoint_tokens = state_checkpoint;
@@ -996,21 +989,24 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
         // Every token-spanned group covers the same logical extent. Reuse
         // reserved speculative slots after a prefill interrupts decode instead
         // of charging another verify span on every restart.
-        const std::int32_t verify_end = num_computed_tokens + pending_decode_tokens + decode_width;
+        const std::int64_t verify_end = std::int64_t{num_computed_tokens} + pending_decode_tokens + decode_width;
         // Draft writes land in the next verify window up to the token limit; admission covers none without a budget.
         const std::int64_t draft_end =
             request->HasDeclaredBudget()
-                ? std::min({std::int64_t{verify_end} + CapacityModel::DraftWindowTokens(config_), request->TokenLimit(),
+                ? std::min({verify_end + CapacityModel::DraftWindowTokens(config_), request->TokenLimit(),
                             std::int64_t{std::numeric_limits<std::int32_t>::max()}})
                 : verify_end;
-        const auto decode_end = static_cast<std::int32_t>(std::max<std::int64_t>(verify_end, draft_end));
+        const std::int32_t decode_end =
+            CheckedInt32(std::max(verify_end, draft_end), "a decode window exceeds int32 token positions");
         std::int32_t reserved_end = decode_end;
         for (std::int32_t i = 0; i < coordinator_.NumGroups(); ++i) {
             if (coordinator_.GroupIsState(static_cast<std::size_t>(i))) {
                 continue;
             }
+            // The table's capacity, blocks * granularity, can pass INT32_MAX.
             const BlockTable& table = tables[static_cast<std::size_t>(i)];
-            reserved_end = table.NumBlocks() * coordinator_.GroupBlockGranularity(i) - table.AvailableTokens();
+            reserved_end = CheckedInt32(std::int64_t{table.NumBlocks()} * coordinator_.GroupBlockGranularity(i) -
+                                        table.AvailableTokens());
             break;
         }
         reserve_tokens = std::max(decode_end - reserved_end, 0);
@@ -1737,7 +1733,7 @@ void Scheduler::maybeForceRetraction(PlanBuild& build, std::span<Request* const>
     }
     if (armed == nullptr) {
         forced_victim_id_.clear();
-        if (plan_calls_ % std::abs(interval) != 0) {
+        if (plan_calls_ % std::abs(std::int64_t{interval}) != 0) {
             return;
         }
         const auto candidate = std::ranges::find_if(candidates, [&](Request* request) {
@@ -1974,7 +1970,7 @@ std::vector<Scheduler::WholePrompt> Scheduler::wholePromptsAfter(std::span<Reque
                 .request = request,
                 .tokens = *tokens,
                 // What pushOperation charges a chunk ending at the prompt end.
-                .pages = (request->PrefillSize() + config_.prefix_granularity - 1) / config_.prefix_granularity,
+                .pages = CeilDiv(request->PrefillSize(), config_.prefix_granularity),
             });
         }
     }

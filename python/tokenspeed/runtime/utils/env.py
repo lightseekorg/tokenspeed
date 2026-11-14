@@ -29,6 +29,7 @@ from tokenspeed.runtime.utils.server_args import ServerArgs
 
 global_server_args_dict: dict = {
     "model": None,
+    "enable_memory_saver": ServerArgs.enable_memory_saver,
     "revision": None,
     "disaggregation_mode": ServerArgs.disaggregation_mode,
     "attention_backend": ServerArgs.attention_backend,
@@ -100,10 +101,12 @@ global_server_args_dict: dict = {
 
 
 def global_server_args_dict_update(server_args: ServerArgs):
+    """Expose native server settings to process-local runtime consumers."""
     pdl_enabled(not server_args.disable_pdl)
     global_server_args_dict.update(
         {
             "model": server_args.model,
+            "enable_memory_saver": server_args.enable_memory_saver,
             "revision": server_args.revision,
             "disaggregation_mode": server_args.disaggregation_mode,
             "attention_backend": server_args.attention_backend,
