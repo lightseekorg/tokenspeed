@@ -4512,10 +4512,10 @@ class ServerArgs:
             "Adding request counts increases capture time and memory. "
             "This does not replace the scheduler's --max-num-seqs limit. "
             "Batches without a fitting capacity retain the ordinary attention breaks. "
-            "With --enable-drafter-prefill-graph these request counts also select "
-            "the drafter's step-0 and decode-step graphs, which replay only at the "
-            "exact count (unset: one request per bucket, or the fewest that fit a "
-            "bucket longer than the context length).",
+            "Unless --no-enable-drafter-prefill-graph, these request counts also "
+            "select the drafter's step-0 graphs, which replay only at the exact "
+            "count (unset: one request per bucket, or the fewest that fit a bucket "
+            "longer than the context length).",
         )
         parser.add_argument(
             "--enable-drafter-prefill-graph",

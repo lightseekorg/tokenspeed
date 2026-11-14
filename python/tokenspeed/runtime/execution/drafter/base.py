@@ -374,8 +374,8 @@ class BaseDrafter:
         request_counts: Callable[[int], Sequence[int]],
     ) -> dict[str, list[tuple[int, int]]]:
         """Every entry ``capture_extend_graphs`` can measure, per memory-projection
-        series (the executor keeps ``EXTEND_STEP0_SERIES`` only under
-        ``--enable-drafter-prefill-graph``).
+        series (the executor drops ``EXTEND_STEP0_SERIES`` under
+        ``--no-enable-drafter-prefill-graph``).
 
         The one channel between that capture and the CUDA-graph memory
         projection, which prices exactly these entries: a series lists its

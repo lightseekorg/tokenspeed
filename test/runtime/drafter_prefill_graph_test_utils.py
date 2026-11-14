@@ -315,11 +315,14 @@ class ToyRunner:
         world_size: int = 1,
         pp_size: int = 1,
         qcp_size: int = 1,
+        kvp_size: int = 1,
     ) -> None:
         self.model = model
         self.device = device
         self.mapping = SimpleNamespace(
-            attn=SimpleNamespace(dp_size=dp_size, has_qcp=qcp_size > 1, has_kvp=False),
+            attn=SimpleNamespace(
+                dp_size=dp_size, has_qcp=qcp_size > 1, has_kvp=kvp_size > 1
+            ),
             world_size=world_size,
             pp_size=pp_size,
         )
@@ -359,6 +362,7 @@ def make_eagle(
     world_size: int = 1,
     pp_size: int = 1,
     qcp_size: int = 1,
+    kvp_size: int = 1,
     max_bs: int = MAX_BS,
     model: nn.Module | None = None,
 ) -> tuple[Eagle, ToyBackend]:
@@ -371,6 +375,7 @@ def make_eagle(
         world_size=world_size,
         pp_size=pp_size,
         qcp_size=qcp_size,
+        kvp_size=kvp_size,
     )
     drafter = Eagle(
         spec_num_tokens=spec_num_steps + 1,

@@ -126,14 +126,18 @@ def test_the_decode_steps_stop_at_sixteen_requests() -> None:
     assert plan[DECODE_STEPS_SERIES] == [(bs, bs) for bs in range(16, 0, -1)]
 
 
-@pytest.mark.parametrize("setup", ["undeclared_draft", "query_shard"])
+@pytest.mark.parametrize("setup", ["undeclared_draft", "query_shard", "sharded_kv"])
 def test_the_decode_steps_record_without_step_0(setup) -> None:
     model = ToyDraftModel("cpu")
     if setup == "undeclared_draft":
         # A draft that does not declare its narrowed step breakable (an MLA
         # draft attends inside one unbroken call).
         model.supports_breakable_draft_extend = False
-    drafter, _ = make_eagle(model=model, qcp_size=2 if setup == "query_shard" else 1)
+    drafter, _ = make_eagle(
+        model=model,
+        qcp_size=2 if setup == "query_shard" else 1,
+        kvp_size=2 if setup == "sharded_kv" else 1,
+    )
 
     assert drafter.extend_graph_plan([16, 32], lambda _bucket: [1]) == {
         DECODE_STEPS_SERIES: [(4, 4), (3, 3), (2, 2), (1, 1)]
@@ -581,6 +585,14 @@ def test_a_chain_drafter_resolves_on_one_rank_or_under_tp(algorithm, ranks) -> N
             {
                 "attn_tp_size": 2,
                 "query_context_parallel_size": 2,
+                "disaggregation_mode": "prefill",
+            },
+            "tensor and expert",
+        ),
+        (
+            {
+                "attn_tp_size": 2,
+                "kv_parallel_size": 2,
                 "disaggregation_mode": "prefill",
             },
             "tensor and expert",
