@@ -41,6 +41,7 @@ from test.runtime.drafter_prefill_graph_test_utils import (
     DECODE_STEPS_SERIES,
     FIRST_STEP_SERIES,
     HIDDEN,
+    KV_WRITER_SERIES,
     MAX_BS,
     MAX_LEN,
     MAX_TOKENS,
@@ -49,9 +50,11 @@ from test.runtime.drafter_prefill_graph_test_utils import (
     WIDTH,
     RecordingObserver,
     ToyDraftModel,
+    ToySplitDraftModel,
     capture_input,
     extend_input,
     make_eagle,
+    prepare_extend,
 )
 from types import SimpleNamespace
 
@@ -292,6 +295,52 @@ def test_a_capture_without_warmup_is_refused() -> None:
 
     with pytest.raises(ValueError, match="at least one warmup"):
         drafter.capture_extend_graphs(capture, observer=RecordingObserver())
+
+
+def test_a_split_draft_plans_its_kv_writer_beside_the_decode_steps() -> None:
+    drafter, _ = make_eagle(model=ToySplitDraftModel("cpu"))
+
+    # One tile no wider than the largest bucket, and no step-0 graph.
+    assert drafter.extend_graph_plan([16, 32], lambda _bucket: [1, 2]) == {
+        KV_WRITER_SERIES: [(32, 1)],
+        DECODE_STEPS_SERIES: [(4, 4), (3, 3), (2, 2), (1, 1)],
+    }
+    wide = drafter.extend_graph_plan([16, 8192], lambda _bucket: [1])
+    assert wide[KV_WRITER_SERIES] == [(2048, 1)]
+    # Attention DP keeps step 0 whole: nothing is recorded.
+    dp, _ = make_eagle(model=ToySplitDraftModel("cpu"), dp_size=2, world_size=2)
+    assert dp.extend_graph_plan([16, 32], lambda _bucket: [1]) == {}
+
+
+@pytest.mark.parametrize("final", [True, False])
+def test_a_split_round_drafts_what_the_narrowed_round_drafts(final) -> None:
+    """A split round leaves the narrowed round's window and cache (a mid chunk none)."""
+    lengths, prefixes = [9, 4, 1], [0, 20, 5]
+    generator = torch.Generator().manual_seed(1)
+    num_tokens = sum(lengths)
+    ids = torch.randint(0, VOCAB, (num_tokens,), generator=generator)
+    sampled = torch.randint(0, VOCAB, (len(lengths),), generator=generator).int()
+    hidden = torch.randn(num_tokens, WIDTH, generator=generator)
+    rounds = []
+    for model in (ToyDraftModel("cpu"), ToySplitDraftModel("cpu")):
+        drafter, backend = make_eagle(model=model)
+        prepare_extend(drafter, backend, lengths, prefixes, final=final, ids=ids)
+        window = drafter.draft(
+            extend_input(drafter, lengths, sampled=sampled, hidden=hidden)
+        )
+        rounds.append((window, backend.cache, drafter.draft_model_runner.forward_calls))
+    (narrowed, narrowed_cache, narrowed_calls), (split, split_cache, split_calls) = (
+        rounds
+    )
+
+    assert torch.equal(split_cache[1:], narrowed_cache[1:])
+    if final:
+        assert torch.equal(split, narrowed)
+        assert (narrowed_calls, split_calls) == (STEPS, STEPS)
+    else:
+        assert torch.equal(split[:, 0], narrowed[:, 0])
+        assert torch.equal(split, split[:, :1].expand_as(split))
+        assert (narrowed_calls, split_calls) == (1, 0)
 
 
 # ----------------------------------------------------------------------
