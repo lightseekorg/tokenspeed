@@ -1212,7 +1212,7 @@ def nvidia_multimem_all_reduce_kernel(
 
 def nvidia_multimem_all_reduce(
     multicast_ptr: int,
-    signal_pad_ptrs_dev: int,
+    signal_pad_ptrs_dev: torch.Tensor,
     signal_pad_size: int,
     numel: int,
     rank: int,
