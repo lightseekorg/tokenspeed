@@ -22,14 +22,18 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import urllib.error
 from pathlib import Path
 
 import pytest
 from ci_speed_dashboard import (
+    GitHub,
     aggregate,
+    fetch_missing_jobs,
     flakiness,
     load_cached_jobs,
     load_runs,
+    prune_cache,
     write_json,
 )
 
@@ -227,3 +231,33 @@ def test_superseded_cancellation(cache: Path):
     write_json(path, {"runs": runs})
     stats = build(cache)["workflow_stats"]["MI350"]["cur"]
     assert stats["superseded"] == 1
+
+
+def test_prune_keeps_one_window_of_cache(cache: Path):
+    old = NOW.date() - dt.timedelta(days=20)
+    write_json(cache / "runs/nvidia-b200-tests.yml/pr" / f"{old}.json", {"runs": []})
+    write_json(cache / "jobs/999.json", [])
+    write_json(cache / "jobs_latest/999_a2.json", [])
+    runs = load_runs(cache, NOW, 14)
+    assert prune_cache(cache, runs, NOW, 14) == 3
+    assert not (cache / "runs/nvidia-b200-tests.yml/pr" / f"{old}.json").exists()
+    assert sorted(f.name for f in (cache / "jobs").iterdir()) == [
+        "1.json",
+        "10.json",
+        "2.json",
+        "20.json",
+    ]
+    assert [f.name for f in (cache / "jobs_latest").iterdir()] == ["10_a2.json"]
+
+
+def test_a_failing_job_fetch_still_lets_the_page_render(cache: Path, monkeypatch):
+    (cache / "jobs/20.json").unlink()
+    gh = GitHub("o/r", "token")
+
+    def fail(path):
+        raise urllib.error.HTTPError(path, 502, "bad gateway", None, None)
+
+    monkeypatch.setattr(gh, "get", fail)
+    runs = load_runs(cache, NOW, 14)
+    assert fetch_missing_jobs(gh, cache, runs, 10, 0) == 0
+    assert build(cache)["workflow_stats"]

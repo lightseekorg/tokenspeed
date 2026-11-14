@@ -242,7 +242,8 @@ class GitHub:
                     raise BudgetExhausted() from e
                 if attempt == 3 or e.code not in (403, 429, 500, 502, 503, 504):
                     raise
-            except urllib.error.URLError:
+            except (urllib.error.URLError, TimeoutError):
+                # Connection errors and read timeouts; HTTPError is handled above.
                 if attempt == 3:
                     raise
             time.sleep(5 * 2**attempt)
@@ -251,6 +252,11 @@ class GitHub:
 
 class BudgetExhausted(Exception):
     pass
+
+
+# Errors after which the run still renders from the cache. HTTPError is a
+# URLError, and a read timeout raises TimeoutError.
+FETCH_ERRORS = (BudgetExhausted, urllib.error.URLError, TimeoutError)
 
 
 def slim_run(run: dict) -> dict:
@@ -426,9 +432,33 @@ def fetch_missing_jobs(
     try:
         with concurrent.futures.ThreadPoolExecutor(4) as ex:
             done = sum(ex.map(work, todo))
-    except BudgetExhausted:
-        print("rate limit reached; rendering with the cached data", file=sys.stderr)
+    except FETCH_ERRORS as e:
+        print(
+            f"job fetch stopped ({e!r}); rendering with the cached data",
+            file=sys.stderr,
+        )
     return done
+
+
+def prune_cache(cache: Path, runs: list[dict], now: dt.datetime, days: int) -> int:
+    """Delete run lists older than the fetch window and job lists of runs that
+    left it, so each saved cache stays at about one window of data."""
+    oldest = (now - dt.timedelta(days=days + 1)).date().isoformat()
+    removed = 0
+    for f in (cache / "runs").glob("*/*/*.json"):
+        if f.stem < oldest:
+            f.unlink()
+            removed += 1
+    keep = {str(r["id"]) for r in runs}
+    for f in (cache / "jobs").glob("*.json"):
+        if f.stem not in keep:
+            f.unlink()
+            removed += 1
+    for f in (cache / "jobs_latest").glob("*.json"):
+        if f.stem.split("_a")[0] not in keep:
+            f.unlink()
+            removed += 1
+    return removed
 
 
 def fetch_markers(gh: GitHub, numbers: list[int]) -> list[dict]:
@@ -965,8 +995,8 @@ def main() -> None:
             fetch_run_lists(gh, args.cache, now, args.days + 1)
             numbers = [int(x) for x in args.marker_prs.split(",") if x.strip()]
             write_json(markers_path, fetch_markers(gh, numbers))
-        except BudgetExhausted:
-            print("rate limit reached while listing runs", file=sys.stderr)
+        except FETCH_ERRORS as e:
+            print(f"listing runs stopped ({e!r})", file=sys.stderr)
         runs = load_runs(args.cache, now, args.days)
         fetched_new = fetch_missing_jobs(
             gh, args.cache, runs, args.max_new_runs, args.reserve
@@ -978,6 +1008,9 @@ def main() -> None:
             file=sys.stderr,
         )
     runs = load_runs(args.cache, now, args.days)
+    if not args.offline:
+        removed = prune_cache(args.cache, runs, now, args.days)
+        print(f"pruned {removed} cache files outside the window", file=sys.stderr)
     jobs1, latest = load_cached_jobs(args.cache, runs)
     data = aggregate(runs, jobs1, latest, now, args.days)
     data["repo"] = args.repo
