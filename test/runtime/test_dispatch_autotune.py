@@ -202,6 +202,7 @@ def test_engine_role_selects_warmup_and_prefill_buckets(
         prefill_graph_max_tokens=prefill_graph_max_tokens,
     )
     assert config.attention_tp_size == attention_tp_size
+    assert config.moe_tp_ep_size == 16
     assert config.data_parallel_size == 16 // attention_tp_size
     assert config.decode_only_attention is (role == "decode")
     assert config.prefill_only is (role == "prefill")
