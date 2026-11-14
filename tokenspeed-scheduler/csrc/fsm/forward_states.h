@@ -99,6 +99,9 @@ struct AdmissionResources {
     // pages reach: past the hit, a junction the first chunk is cut at.
     bool pool_lookup_asked{false};
     std::int32_t pool_kv_tokens{0};
+    // The prompt tokens the Device or pool cache held at the lookup: what the
+    // load report subtracts from the prompt as work already done.
+    std::int32_t cached_prefix_estimate{0};
     std::optional<std::vector<std::string>> prefix_hashes;
 };
 

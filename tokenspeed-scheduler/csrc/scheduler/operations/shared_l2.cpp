@@ -44,7 +44,10 @@ std::vector<SharedL2Lookup> Scheduler::SharedL2Lookups() {
                      static_cast<std::size_t>(max_tokens / config_.prefix_granularity)));
         const CacheCoordinator::PromptPrefix prompt{
             .prefix_hashes = hashes, .tokens = request->TokenSlice(0, max_tokens), .max_tokens = max_tokens};
-        if (max_tokens == 0 || coordinator_.ProbePromptPrefix(prompt).device.num_common_tokens >= max_tokens) {
+        const std::int32_t device_hit =
+            max_tokens == 0 ? 0 : coordinator_.ProbePromptPrefix(prompt).device.num_common_tokens;
+        admission->cached_prefix_estimate = device_hit;
+        if (max_tokens == 0 || device_hit >= max_tokens) {
             // Nothing the pool could add.
             shared_l2_->ApplyLookup(SharedL2LookupResult{.request_id = request->Id()}, ContentHash{});
             continue;
@@ -66,6 +69,7 @@ std::vector<SharedL2ProxyPage> Scheduler::ApplySharedL2Lookups(const std::vector
         _assert(admission != nullptr && admission->pool_lookup_asked && !shared_l2_->LookedUp(result.request_id),
                 "a shared L2 lookup answers a waiting request that asked");
         admission->pool_kv_tokens = result.kv_tokens;
+        admission->cached_prefix_estimate = std::max(admission->cached_prefix_estimate, result.num_tokens);
         ContentHash prior;
         if (result.tail) {
             const auto full_pages = (result.num_tokens - result.tail->tail_tokens) / config_.prefix_granularity;

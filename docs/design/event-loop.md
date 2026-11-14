@@ -429,6 +429,11 @@ Parents do not measure a rank's attention work: hybrid packing and state
 reservations make their count drift from the tokens attended. The snapshot
 therefore also carries `num_resident_tokens`, the prompt plus committed
 output of every request the rank holds, read from the output processor.
+A request count does not measure prefill work either: one waiting prompt may
+need a few hundred new tokens, another a few hundred thousand. The snapshot
+carries `num_waiting_uncached_tokens`, the scheduler's
+`pending_prefill_tokens()`: each waiting prompt less what its cache lookup
+found, plus the unscheduled rest of prompts in prefill.
 `available_lcm_blocks()` scans the pool and prefix indexes for reclaimability
 and belongs in diagnostics and leak checks, never in the per-round sampler.
 

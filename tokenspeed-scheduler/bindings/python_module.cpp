@@ -677,6 +677,9 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
              "Count requests waiting for their PD bootstrap handshake.")
         .def("waiting_size", &tokenspeed::Scheduler::WaitingSize,
              "Count Submitted, Prefetching, Retracted and Restoring requests awaiting admission or their restore.")
+        .def("pending_prefill_tokens", &tokenspeed::Scheduler::PendingPrefillTokens,
+             "Prompt tokens still to compute: waiting prompts less what the caches held for them at their lookup, "
+             "plus the unscheduled rest of prompts in prefill.")
         .def("retracted_size", &tokenspeed::Scheduler::RetractedSize,
              "Count requests suspended with an image (Retracted or Restoring); a weight update must not flush "
              "while this is non-zero.")

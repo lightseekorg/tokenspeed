@@ -39,7 +39,7 @@ from tokenspeed.runtime.engine.io_struct import (
 
 logger = logging.getLogger(__name__)
 
-_LoadValues = tuple[int, int, int, int, int, int]
+_LoadValues = tuple[int, int, int, int, int, int, int]
 _SocketFactory = Callable[[str], tuple[object, object]]
 _SEND_RETRY_INTERVAL_S = 0.01
 _CLOSE_TIMEOUT_S = 1.0
@@ -92,7 +92,7 @@ class DirectLoadSnapshotSink:
         self._set_load_snapshot = set_load_snapshot
 
     def observe(self, values: _LoadValues) -> None:
-        num_running, num_waiting, num_active_pages, _, max_total_pages, _ = values
+        num_running, num_waiting, num_active_pages, _, max_total_pages, _, _ = values
         self._set_load_snapshot(
             num_running,
             num_waiting,
@@ -239,6 +239,7 @@ class LoadSnapshotPublisher:
             num_used_pages,
             max_total_pages,
             num_resident_tokens,
+            num_pending_prefill_tokens,
         ) = values
         return LoadSnapshot(
             self._epoch,
@@ -251,6 +252,7 @@ class LoadSnapshotPublisher:
             max_total_pages,
             self._valid_for_ms,
             num_resident_tokens,
+            num_pending_prefill_tokens,
         )
 
 
@@ -297,6 +299,7 @@ class LoadReporter:
                 stats["num_active_pages"] + stats["num_cached_pages"],
                 self._num_total_pages,
                 num_resident_tokens,
+                stats["num_pending_prefill_tokens"],
             )
         )
 
@@ -390,6 +393,7 @@ class LoadSnapshotStore:
             snapshot.max_total_pages,
             snapshot.valid_for_ms,
             snapshot.num_resident_tokens,
+            snapshot.num_waiting_uncached_tokens,
         )
         self._snapshots[rank] = _StoredSnapshot(copied, now)
         return True

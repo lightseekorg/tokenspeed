@@ -214,6 +214,28 @@ def test_a_rank_resumes_from_the_pool_where_another_rank_published():
     assert pool.stats()["pinned_blocks"] == 0
 
 
+def test_pending_prefill_tokens_count_each_prompt_less_its_cache_hit():
+    """The load report's queued work: a waiting prompt less what its lookup
+    found cached, and a prompt in prefill less what is already scheduled."""
+    pool = owner()
+    writer, reader = scheduler(), scheduler()
+    writer_rt, reader_rt = Runtime(pool, 1), Runtime(pool, 2)
+    prompt = list(range(9))
+    publish(writer, writer_rt, "a", prompt)
+
+    reader.submit_requests([_spec("b", prompt + [50, 51])])
+    assert reader.pending_prefill_tokens() == len(prompt) + 2
+    reader_rt.lookup(reader)
+    assert reader.pending_prefill_tokens() == 2
+    reader_rt.plan(reader, lookup=False)
+    assert reader.pending_prefill_tokens() == 0
+
+    cold, cold_rt = scheduler(), Runtime(pool, 3)
+    cold.submit_requests([_spec("c", list(range(200, 300)))])
+    cold_rt.plan(cold)
+    assert cold.pending_prefill_tokens() == 100 - 64
+
+
 def test_a_waiting_prompt_is_admitted_only_after_its_lookup():
     pool = owner()
     writer, reader = scheduler(), scheduler()

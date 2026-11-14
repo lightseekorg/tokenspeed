@@ -90,6 +90,9 @@ public:
     // Retracted (waiting to be restored) and Restoring (their copy back is in
     // flight) -- which hold no schedulable work until they resume.
     std::size_t WaitingSize() const;
+    // Prompt tokens still to compute: each waiting prompt less what the caches
+    // held for it at its lookup, plus the unscheduled rest of prompts in prefill.
+    std::int64_t PendingPrefillTokens() const;
     std::size_t DecodingSize() const;
     std::size_t PrefillSize() const;
     std::size_t AwaitingDestinationSize() const;

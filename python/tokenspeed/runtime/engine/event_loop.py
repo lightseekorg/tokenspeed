@@ -1151,6 +1151,7 @@ class EventLoop:
                 self._scheduler_cache_geometry.num_usable_pages - empty - active
             ),
             "num_queue_reqs": self.scheduler.waiting_size(),
+            "num_pending_prefill_tokens": self.scheduler.pending_prefill_tokens(),
         }
 
     def _record_scheduler_iteration_metrics(

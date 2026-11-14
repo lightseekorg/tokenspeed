@@ -143,12 +143,13 @@ def observed_values(**overrides) -> dict:
         num_used_pages=4,
         max_total_pages=10,
         num_resident_tokens=6,
+        num_waiting_uncached_tokens=7,
     )
     values.update(overrides)
     return values
 
 
-def observed_tuple(**overrides) -> tuple[int, int, int, int, int, int]:
+def observed_tuple(**overrides) -> tuple[int, int, int, int, int, int, int]:
     values = observed_values(**overrides)
     return (
         values["num_running_reqs"],
@@ -157,6 +158,7 @@ def observed_tuple(**overrides) -> tuple[int, int, int, int, int, int]:
         values["num_used_pages"],
         values["max_total_pages"],
         values["num_resident_tokens"],
+        values["num_waiting_uncached_tokens"],
     )
 
 
@@ -194,6 +196,7 @@ def make_snapshot(**overrides) -> LoadSnapshot:
         max_total_pages=10,
         valid_for_ms=int(VALID_FOR_SECONDS * 1_000),
         num_resident_tokens=6,
+        num_waiting_uncached_tokens=7,
     )
     fields.update(overrides)
     return LoadSnapshot(**fields)
@@ -241,6 +244,18 @@ def test_published_snapshot_carries_the_observed_resident_tokens():
         snapshot = socket.decoded_snapshots[0]
         assert (snapshot.dp_rank, snapshot.max_total_pages) == (2, 10)
         assert snapshot.num_resident_tokens == 123_456
+    finally:
+        publisher.close()
+
+
+def test_published_snapshot_carries_the_pending_prompt_work():
+    socket = RecordingSocket()
+    publisher, _ = start_publisher(socket)
+    try:
+        publisher.observe(observed_tuple(num_waiting_uncached_tokens=48_000))
+        wait_until(lambda: socket.decoded_snapshots)
+
+        assert socket.decoded_snapshots[0].num_waiting_uncached_tokens == 48_000
     finally:
         publisher.close()
 
@@ -394,6 +409,7 @@ def _reporter(trace, scheduler_state, *, enabled=True):
             "num_queue_reqs": scheduler_state["waiting"],
             "num_active_pages": scheduler_state["active"],
             "num_cached_pages": scheduler_state["cached"],
+            "num_pending_prefill_tokens": scheduler_state["pending"],
         }
 
     return load_snapshot_module.LoadReporter(
@@ -408,10 +424,17 @@ def _reporter(trace, scheduler_state, *, enabled=True):
 def test_running_round_publishes_the_sample_the_loop_already_took(active, cached):
     """The active path never samples again: the loop passes its own stats."""
     trace = []
-    reporter = _reporter(trace, {"waiting": 3, "active": active, "cached": cached})
+    reporter = _reporter(
+        trace, {"waiting": 3, "active": active, "cached": cached, "pending": 1_500}
+    )
 
     reporter.observe(
-        {"num_queue_reqs": 3, "num_active_pages": active, "num_cached_pages": cached},
+        {
+            "num_queue_reqs": 3,
+            "num_active_pages": active,
+            "num_cached_pages": cached,
+            "num_pending_prefill_tokens": 1_500,
+        },
         num_running=2,
         num_resident_tokens=9_000,
     )
@@ -426,6 +449,7 @@ def test_running_round_publishes_the_sample_the_loop_already_took(active, cached
                 num_used_pages=active + cached,
                 max_total_pages=20,
                 num_resident_tokens=9_000,
+                num_waiting_uncached_tokens=1_500,
             ),
         )
     ]
@@ -437,24 +461,26 @@ def test_frozen_rounds_sample_for_themselves():
     test_unchanged_values_only_emit_a_heartbeat), and the idle sleep bounds
     the rate to one sample per millisecond."""
     trace = []
-    scheduler_state = {"waiting": 0, "active": 0, "cached": 0}
+    scheduler_state = {"waiting": 0, "active": 0, "cached": 0, "pending": 0}
     reporter = _reporter(trace, scheduler_state)
 
     reporter.sample_and_observe(num_running=0, num_resident_tokens=0)
-    scheduler_state.update(waiting=1, active=2, cached=2)
+    scheduler_state.update(waiting=1, active=2, cached=2, pending=700)
     reporter.sample_and_observe(num_running=1, num_resident_tokens=300)
 
     assert trace == [
         "sample",
-        ("observe", (0, 0, 0, 0, 20, 0)),
+        ("observe", (0, 0, 0, 0, 20, 0, 0)),
         "sample",
-        ("observe", (1, 1, 2, 4, 20, 300)),
+        ("observe", (1, 1, 2, 4, 20, 300, 700)),
     ]
 
 
 def test_non_reporting_rank_never_samples_the_scheduler():
     trace = []
-    reporter = _reporter(trace, {"waiting": 0, "active": 0, "cached": 0}, enabled=False)
+    reporter = _reporter(
+        trace, {"waiting": 0, "active": 0, "cached": 0, "pending": 0}, enabled=False
+    )
 
     reporter.sample_and_observe(num_running=0, num_resident_tokens=0)
 
@@ -577,7 +603,7 @@ def test_event_loop_binds_the_output_setter_only_where_it_exists():
 
 def test_load_snapshot_is_immutable_and_positional():
     """Snapshots cannot be mutated after their wire values are assigned."""
-    snapshot = LoadSnapshot("boot-a", 1, 0, 2, 3, 4, 5, 10, 1_000, 6)
+    snapshot = LoadSnapshot("boot-a", 1, 0, 2, 3, 4, 5, 10, 1_000, 6, 7)
 
     with pytest.raises(AttributeError):
         snapshot.sequence = 2

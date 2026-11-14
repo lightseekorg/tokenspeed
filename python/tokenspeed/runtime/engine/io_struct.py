@@ -1193,6 +1193,9 @@ class LoadSnapshot(
     valid_for_ms: int
     # Prompt plus committed output tokens summed over the rank's requests.
     num_resident_tokens: int
+    # Prompt tokens still to compute: waiting prompts less their cache hit, plus
+    # the unscheduled rest of prompts in prefill (the gateway's queued work).
+    num_waiting_uncached_tokens: int
 
 
 class BlockReqType(Enum):

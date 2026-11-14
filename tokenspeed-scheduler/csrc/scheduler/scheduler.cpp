@@ -396,6 +396,18 @@ std::size_t Scheduler::WaitingSize() const {
     }));
 }
 
+std::int64_t Scheduler::PendingPrefillTokens() const {
+    std::int64_t tokens = 0;
+    for (const std::unique_ptr<Request>& request : requests_) {
+        if (const fsm::AdmissionResources* admission = request->AdmissionResourcesPtr()) {
+            tokens += std::max(0, request->PrefillSize() - admission->cached_prefix_estimate);
+        } else if (request->Is<fsm::Prefilling>()) {
+            tokens += std::max(0, request->PrefillSize() - request->NumComputedTokens());
+        }
+    }
+    return tokens;
+}
+
 std::size_t Scheduler::RetractedSize() const {
     return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const std::unique_ptr<Request>& request) {
         return request->IsAnyOf<fsm::Retracted, fsm::Restoring>();
