@@ -95,6 +95,9 @@ if platform.is_amd:
         supports_gluon_mm_bf16_fp32_gfx950 as _supports_mm_bf16_fp32,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
+        launch_gluon_gated_norm_gemv_a16w16_gfx950 as _gated_norm_gemv_a16w16_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
         launch_gluon_gemv_a16w8_gfx950 as _gemv_a16w8_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
@@ -102,6 +105,9 @@ if platform.is_amd:
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
         prefers_gluon_gemv_a16w16_gfx950 as _prefers_gemv_a16w16,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
+        supports_gluon_gated_norm_gemv_a16w16_gfx950 as _supports_gated_norm_gemv,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
         supports_gluon_gemv_a16w8_gfx950 as _supports_gemv_a16w8,
@@ -679,6 +685,42 @@ if platform.is_amd:
         if out is None:
             out = x.new_empty((x.shape[0], weight.shape[0]))
         return _gemv_a16w16_impl(x, weight, out)
+
+    def _gated_norm_gemv_a16w16_filter(m: int, n: int, k: int) -> bool:
+        # Heads are 128 wide, so K fixes the head count.
+        return _supports_gated_norm_gemv(m, n, k, k // 128, 128)
+
+    @register_kernel(
+        "gemm",
+        "mv_rmsnorm_gated_sigmoid",
+        name="gluon_gated_norm_gemv_a16w16_gfx950",
+        solution="gluon",
+        capability=_GFX950_CAPABILITY,
+        signatures=frozenset(
+            {
+                format_signature(
+                    x=dense_tensor_format(torch.bfloat16),
+                    gate=dense_tensor_format(torch.bfloat16),
+                    weight=dense_tensor_format(torch.bfloat16),
+                )
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "mnk_problem_filter": frozenset({_gated_norm_gemv_a16w16_filter}),
+            "head_dim": frozenset({128}),
+        },
+    )
+    def gluon_gated_norm_gemv_a16w16_gfx950(
+        x: torch.Tensor,
+        gate: torch.Tensor,
+        norm_weight: torch.Tensor,
+        weight: torch.Tensor,
+        out: torch.Tensor,
+        eps: float,
+    ) -> torch.Tensor:
+        """Dispatch gated decode rows to the gfx950 MFMA GEMV."""
+        return _gated_norm_gemv_a16w16_impl(x, gate, norm_weight, weight, out, eps)
 
     @register_kernel(
         "gemm",
@@ -1652,7 +1694,9 @@ if platform.is_amd:
     def gluon_linear_attnres_partials_gfx950(**kwargs):
         return _linear_attnres_partials_impl(**kwargs)
 
-    # 5-16 tokens reuse the decode GEMV tiles, matching the unfused path bit for bit.
+    # 5-16 tokens reuse the decode GEMV tiles, matching the GEMV and the
+    # standalone partials bit for bit. The MLA projection's unfused path runs
+    # hipBLASLt instead, which the fusion beats by dropping the partials launch.
     @register_kernel(
         "gemm",
         "linear_attnres_partials",
@@ -1675,7 +1719,7 @@ if platform.is_amd:
         traits={
             "tokens": frozenset(range(5, 17)),
             "input_size": frozenset({KIMI3_HIDDEN_SIZE}),
-            "output_size": frozenset({KIMI3_QKVFAB_SIZE}),
+            "output_size": frozenset({3648, KIMI3_QKVFAB_SIZE}),
             "num_blocks": frozenset(range(1, 12)),
             "inputs_contiguous": frozenset({True}),
         },

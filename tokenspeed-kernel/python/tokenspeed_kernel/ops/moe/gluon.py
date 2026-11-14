@@ -2113,7 +2113,7 @@ if platform.is_amd:
         x_quantized = getattr(w, "_situ_input_fp8", None)
         w._situ_input_fp8 = None
         rows = int(x[0].shape[0] if isinstance(x, tuple) else x.shape[0])
-        if situ_linear_beta is not None and is_warming_up() and rows > 64:
+        if situ_linear_beta is not None and is_warming_up():
             # Serving chunks pick tiles by row count, up to this warmup prefill's rows.
             warm_gluon_mxfp4_situ_prefill_rows(
                 w.w13_weight_triton_tensor,

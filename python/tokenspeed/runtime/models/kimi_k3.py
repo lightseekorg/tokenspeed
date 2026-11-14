@@ -88,6 +88,8 @@ from tokenspeed_kernel.ops.gemm import (
     kimi3_shared_situ_projection,
     linear_attnres_partials,
     linear_attnres_partials_available,
+    mv_rmsnorm_gated_sigmoid,
+    mv_rmsnorm_gated_sigmoid_supported,
 )
 from tokenspeed_kernel.ops.moe import (
     latent_moe_decode_pipeline_available,
@@ -122,6 +124,7 @@ from tokenspeed.runtime.execution.forward_step import (
 )
 from tokenspeed.runtime.layers.activation import SituAndMul
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
+from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.dense.w8a8_fp8 import w8a8_fp8_per_channel_mm
 from tokenspeed.runtime.layers.layernorm import (
     RMSNorm,
@@ -1842,6 +1845,22 @@ class KimiLinearKDA(nn.Module):
                 enable_pdl=pdl_enabled(),
             )
             return self.o_proj(values, scale=scales, ctx=ctx, out=projection_out)[0]
+        if self._o_proj_applies_output_norm(out_gate, projection_out):
+            # Decode rows: the o-projection GEMV applies the gated norm itself,
+            # bit for bit with the separate norm and mm.
+            core_out = self._recurrent_core(mixed_qkv, f_a_out, beta, ctx, None)
+            if projection_out is None:
+                projection_out = core_out.new_empty(
+                    (num_tokens, self.o_proj.weight.shape[0])
+                )
+            return mv_rmsnorm_gated_sigmoid(
+                core_out.contiguous(),
+                out_gate,
+                self.o_norm.weight,
+                self.o_proj.weight,
+                self.o_norm.variance_epsilon,
+                projection_out,
+            )
         core_out = self._recurrent_core(
             mixed_qkv, f_a_out, beta, ctx, self._output_norm(out_gate)
         )
@@ -1962,6 +1981,23 @@ class KimiLinearKDA(nn.Module):
         """The gated RMSNorm that makes the core output the BF16 o-projection input."""
         return KdaOutputNorm(out_gate, self.o_norm.weight, self.o_norm.variance_epsilon)
 
+    def _o_proj_applies_output_norm(
+        self, out_gate: torch.Tensor, projection_out: torch.Tensor | None
+    ) -> bool:
+        """Whether one o-projection GEMV launch can apply the gated norm too."""
+        if projection_out is None and (
+            self.output_parallel is not None
+            or type(self.o_proj.quant_method) is not UnquantizedLinearMethod
+            or self.o_proj.quant_method.batch_invariant
+            or self.o_proj.reduce_results
+        ):
+            # Without the producer-direct buffer, the o-projection's own matmul
+            # must be the GEMV that the fused kernel reproduces.
+            return False
+        return mv_rmsnorm_gated_sigmoid_supported(
+            out_gate, self.o_norm.weight, self.o_proj.weight
+        )
+
 
 class KimiLinearMoEGate(nn.Module):
     """Router for Kimi-K3 MoE: linear scorer + noaux_tc correction bias.
@@ -2040,8 +2076,9 @@ def _attnres_scratch(
 _IRIS_MAX_TOKENS = 8192
 _IRIS_BASELINE_PRODUCER_DIRECT_MAX_TOKENS = 48
 _IRIS_MOE_ROW_SHARD_MIN_TOKENS = 40
-# Through this many rows a replicated residual takes the Lamport reduce and gather tail.
-_IRIS_MOE_GATHER_TAIL_MAX_TOKENS = 64
+# Through this many rows a replicated residual takes the Lamport reduce and gather
+# tail; the Iris K3 fused decode row limit.
+_IRIS_MOE_GATHER_TAIL_MAX_TOKENS = 192
 # Below this, row-sharded router/latent projection idles CUs and loses (8x MI350X).
 _IRIS_MOE_ROW_INPUT_MIN_TOKENS = 4096
 
@@ -3005,12 +3042,18 @@ class KimiLinearMoE(nn.Module):
             # The optimized tail declined before consuming the producers.
             # Every ordinary projection epilogue requires a replicated prefix.
             prefix_sum = all_gather(prefix_sum, group, dim=0, backend=None)
+        # The gathered tail reads only this rank's column block of the shared rows.
+        shared_owned_columns = gather_tail
         reduced = None
         if slot_rows:
             # The MoE left its top-k slot rows (_situ_defer_topk_reduce).
             if shared_partial.data_ptr() != shared_out.data_ptr():
                 shared_out.copy_(shared_partial)
-            reduced = self.iris_state.reduce_moe(outputs, routed_partials=routed)
+            reduced = self.iris_state.reduce_moe(
+                outputs,
+                routed_partials=routed,
+                shared_owned_columns=shared_owned_columns,
+            )
         # A producer may return its own tensor instead of filling its destination.
         elif outputs is not None and all(
             partial.shape == output.shape and partial.data_ptr() == output.data_ptr()
@@ -3023,7 +3066,9 @@ class KimiLinearMoE(nn.Module):
             joined = torch.cat((routed, shared_partial), dim=-1)
         if reduced is None:
             reduced = (
-                self.iris_state.reduce_moe(joined)
+                self.iris_state.reduce_moe(
+                    joined, shared_owned_columns=shared_owned_columns
+                )
                 if isinstance(joined, tuple)
                 and self.iris_state is not None
                 and self.iris_state.all_reduce.owns_outputs(joined)
@@ -3038,12 +3083,16 @@ class KimiLinearMoE(nn.Module):
             self.iris_state is not None
             and not up_proj.narrowed
             and up_proj.solution == "auto"
-            and self.iris_state.can_moe_gather_tail(
-                routed,
-                shared,
-                prefix_sum,
-                up_proj.weight,
-                norm.weight if norm is not None else None,
+            and (
+                # Other shared columns may be undefined; the tail asserts support.
+                shared_owned_columns
+                or self.iris_state.can_moe_gather_tail(
+                    routed,
+                    shared,
+                    prefix_sum,
+                    up_proj.weight,
+                    norm.weight if norm is not None else None,
+                )
             )
         ):
             # Decode: each rank projects its weight column block, then gathers.

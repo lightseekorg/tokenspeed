@@ -429,7 +429,7 @@ def test_linear_attnres_partials_cpu_skips_device_kernel_selection(
     or "gfx950" not in getattr(torch.cuda.get_device_properties(0), "gcnArchName", ""),
     reason="gfx950 is required",
 )
-@pytest.mark.parametrize("tokens", [1, 2, 4])
+@pytest.mark.parametrize("tokens", [1, 2, 4, 8])
 @pytest.mark.parametrize("output_size", [3648, 6288])
 def test_linear_attnres_partials_gfx950_matches_composition(
     tokens: int, output_size: int
@@ -475,7 +475,11 @@ def test_linear_attnres_partials_gfx950_matches_composition(
         *scores,
         *scratch,
         eps=1e-6,
-        override="gluon_linear_attnres_partials_gfx950",
+        override=(
+            "gluon_linear_attnres_partials_gemv_gfx950"
+            if tokens > 4
+            else "gluon_linear_attnres_partials_gfx950"
+        ),
     )
 
     torch.testing.assert_close(
@@ -501,7 +505,10 @@ def test_linear_attnres_partials_gfx950_matches_composition(
             rtol=2e-4,
         )
 
-    with pytest.raises(ValueError, match="output size must be divisible by 16"):
+    with pytest.raises(
+        ValueError,
+        match="output size in" if tokens > 4 else "output size must be divisible by 16",
+    ):
         linear_attnres_partials(
             hidden,
             weight[:17],

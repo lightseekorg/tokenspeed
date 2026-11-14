@@ -351,7 +351,7 @@ def test_row_sharded_moe_tail_selection_and_fallback(
     moe.iris_state = SimpleNamespace(
         moe_tail=candidate,
         all_reduce=SimpleNamespace(owns_outputs=lambda tensors: producer_direct),
-        reduce_moe=lambda tensors: joined(tensors, group),
+        reduce_moe=lambda tensors, shared_owned_columns=False: joined(tensors, group),
         can_moe_gather_tail=lambda *args: False,
         can_reduce_moe_topk_partials=lambda shapes: False,
         can_latent_input_gather=lambda *args: False,
@@ -496,7 +496,7 @@ def test_sharded_attention_residual_is_gathered_before_moe_fallback(
     moe.iris_state = SimpleNamespace(
         moe_tail=candidate,
         all_reduce=SimpleNamespace(owns_outputs=lambda tensors: producer_direct),
-        reduce_moe=lambda tensors: joined(tensors, group),
+        reduce_moe=lambda tensors, shared_owned_columns=False: joined(tensors, group),
         can_moe_gather_tail=lambda *args: False,
         can_reduce_moe_topk_partials=lambda shapes: False,
         can_latent_input_gather=lambda *args: False,
@@ -619,7 +619,7 @@ def test_row_sharded_moe_inputs_feed_experts_and_tail(
 
     candidate = mock.Mock(side_effect=tail)
 
-    def reduce_moe(tensors):
+    def reduce_moe(tensors, shared_owned_columns=False):
         fork.events.append("reduce")
         return (routed, shared)
 
@@ -706,7 +706,7 @@ def test_row_sharded_moe_inputs_feed_experts_and_tail(
         assert result is expected
         joined.assert_not_called()
     else:
-        joined.assert_called_once_with((routed, shared))
+        joined.assert_called_once_with((routed, shared), shared_owned_columns=False)
         assert result._base is expected
 
 
@@ -773,7 +773,9 @@ def test_replicated_decode_rows_prefer_the_gather_tail(
     if gathered:
         assert output is gathered_out
         moe.iris_state.moe_tail.assert_not_called()
-        moe.iris_state.reduce_moe.assert_called_once_with((routed, shared))
+        moe.iris_state.reduce_moe.assert_called_once_with(
+            (routed, shared), shared_owned_columns=True
+        )
     else:
         assert output is row_sharded
         moe.iris_state.moe_tail.assert_called_once()
@@ -844,7 +846,7 @@ def test_decode_top_k_slot_rows_reduce_in_the_moe_all_reduce(
     assert moe.experts._situ_defer_topk_reduce is True
     assert all(call.args[0] is routed for call in can_gather.call_args_list)
     moe.iris_state.reduce_moe.assert_called_once_with(
-        (routed, shared), routed_partials=slots
+        (routed, shared), routed_partials=slots, shared_owned_columns=gathered
     )
     moe.iris_state.moe_tail.assert_not_called()
     if gathered:

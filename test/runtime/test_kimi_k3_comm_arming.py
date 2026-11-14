@@ -592,11 +592,10 @@ def test_attention_producer_window(monkeypatch, rows, eligible):
 @pytest.mark.parametrize(
     "rows,is_cdna4,eligible",
     [
-        (48, True, False),
-        (56, True, False),
         (64, True, False),
-        (72, True, True),
-        (73, True, False),
+        (192, True, False),
+        (200, True, True),
+        (201, True, False),
         (8192, True, True),
         (8200, True, False),
         (512, False, False),

@@ -43,6 +43,11 @@ the activation tile in registers); it measured faster than the 16-bit GEMVs
 at 8-32 rows on the draft's MLP and LM-head shapes, so selection takes it
 there only.
 
+``gluon_gated_norm_gemv_a16w16_gfx950`` runs the 16-bit MFMA tile on
+``rmsnorm_gated_sigmoid``'s output computed in its prologue: with heads as
+wide as the per-wave K step, each wave normalizes and gates its own head,
+which saves the separate norm launch ahead of a decode output projection.
+
 The summation order depends only on the constexprs, never on the row
 blocking, so any ``rows`` gives the same bits. Weights load with ``.cg``
 (``sc0 nt``: streamed, read once). The first K chunk of the weights is issued
@@ -61,11 +66,14 @@ cdna4 = gl.amd.cdna4
 
 __all__ = [
     "NUM_WARPS",
+    "gluon_gated_norm_gemv_a16w16_gfx950",
     "gluon_gemv_a16w16_gfx950",
     "gluon_gemv_a16w8_gfx950",
+    "launch_gluon_gated_norm_gemv_a16w16_gfx950",
     "launch_gluon_gemv_a16w16_gfx950",
     "launch_gluon_gemv_a16w8_gfx950",
     "prefers_gluon_gemv_a16w16_gfx950",
+    "supports_gluon_gated_norm_gemv_a16w16_gfx950",
     "supports_gluon_gemv_a16w16_gfx950",
     "supports_gluon_gemv_a16w8_gfx950",
 ]
@@ -97,6 +105,10 @@ _MFMA_LONG_K = 8192
 _MFMA_LONG_K_WARPS = 8
 # (N, K) -> largest M where two 16-row programs per CU beat one 28-row program.
 _HALF_TILE_MAX_M = {(7168, 768): 16, (7168, 1536): 4, (7168, 3584): 8}
+# Gated GEMV: every K iteration's weights are in registers at once, and past 8
+# rows the norm each program repeats outlasts the weight stream.
+_GATED_MAX_ITERS = 3
+_GATED_MAX_M = 8
 # FP8-weight tile: rows up to 128 in one MFMA tile (BLOCK_M 16 to 128), and
 # at most 32 output columns a program, so wide outputs (an LM head) launch
 # several programs a CU instead of one tile too large for its registers.
@@ -549,6 +561,133 @@ def gluon_gemv_a16w8_gfx950(
     )
 
 
+@gluon.constexpr_function
+def _gated_norm_layout(num_warps: int):
+    # [heads, rows, head_dim], one head a wave: along head_dim, the lanes and
+    # per-lane values of rmsnorm_gated_sigmoid's tile (8 values a lane, 16
+    # lanes a head), so every per-head sum runs in that kernel's order.
+    return gl.BlockedLayout([1, 1, 8], [1, 4, 16], [num_warps, 1, 1], [2, 1, 0])
+
+
+@gluon.constexpr_function
+def _gated_shared_layout(heads: int, rows: int, head_dim: int):
+    # Each K iteration's [head, row, head_dim] buffer. 16 bytes of padding per
+    # row put the MFMA operand reads of 16 rows at one K offset in distinct
+    # banks, and unlike a swizzle let the norm store a slice of the rows.
+    return gl.PaddedSharedLayout.with_identity_for(
+        [[head_dim, 8]], [heads, rows, head_dim], [2, 1, 0]
+    )
+
+
+@gluon.constexpr_function
+def _pow2_at_least(n: int) -> int:
+    return triton.next_power_of_2(n)
+
+
+@gluon.jit(launch_metadata=_gemv_launch_metadata, do_not_specialize=("M",))
+def gluon_gated_norm_gemv_a16w16_gfx950(
+    x_ptr,
+    gate_ptr,
+    norm_w_ptr,
+    w_ptr,
+    y_ptr,
+    M,
+    N,
+    rows,
+    stride_xm,
+    stride_gm,
+    stride_ym,
+    eps,
+    K: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    NORM_M: gl.constexpr,
+):
+    """The MFMA tile of ``gluon_gemv_a16w16_gfx950`` on the gated norm of ``x``.
+
+    The activations are ``rmsnorm_gated_sigmoid(x, gate, norm_w)`` with
+    ``BLOCK_K``-wide heads: wave ``s`` of every K iteration owns one head and
+    normalizes and gates its first ``NORM_M`` rows as that Triton kernel
+    rounds them into LDS, while every weight iteration is already in flight.
+    LDS rows from ``NORM_M`` on stay unwritten; they only feed output rows
+    that are never stored.
+    """
+    tile = gl.program_id(0)
+    KS: gl.constexpr = gl.num_warps()
+    KITER: gl.constexpr = KS * BLOCK_K
+    ITERS: gl.constexpr = K // KITER
+    mfma: gl.constexpr = _mfma_layout(KS)
+    a_l: gl.constexpr = gl.DotOperandLayout(operand_index=0, parent=mfma, k_width=8)
+    b_l: gl.constexpr = gl.DotOperandLayout(operand_index=1, parent=mfma, k_width=8)
+    h_l: gl.constexpr = _gated_norm_layout(KS)
+    h_s = gl.arange(0, KS, gl.SliceLayout(1, gl.SliceLayout(2, h_l)))
+    h_m = gl.arange(0, NORM_M, gl.SliceLayout(0, gl.SliceLayout(2, h_l)))
+    h_d = gl.arange(0, BLOCK_K, gl.SliceLayout(0, gl.SliceLayout(1, h_l)))
+    hk = h_s[:, None, None] * BLOCK_K + h_d[None, None, :]
+    # Rows past M repeat row M - 1 and weight rows past N repeat row N - 1
+    # (whole K iterations need no K mask): no load is masked, so no select
+    # consumes a weight load before the MFMA does. Those rows only reach
+    # outputs that are never stored.
+    h_row = gl.minimum(h_m, M - 1)
+    x_offs = h_row[None, :, None] * stride_xm + hk
+    gate_offs = h_row[None, :, None] * stride_gm + hk
+    # Buffer loads retire in order: the heads go out ahead of the weights so
+    # that the norm waits on them alone and runs under the weight stream.
+    xs = ()
+    gates = ()
+    for it in gl.static_range(ITERS):
+        xs += (cdna4.buffer_load(x_ptr, x_offs + it * KITER),)
+        gates += (cdna4.buffer_load(gate_ptr, gate_offs + it * KITER),)
+    norm_w = cdna4.buffer_load(norm_w_ptr, h_d).to(gl.float32)
+    w_offs, _, _ = _mfma_weight_offsets(tile, N, rows, K, BLOCK_N, BLOCK_K, 8)
+    # Scheduling barriers pin that issue order and keep the weight loads
+    # from sinking below the norm.
+    gl.amd.hint.sched_barrier()
+    ws = ()
+    for it in gl.static_range(ITERS):
+        ws += (cdna4.buffer_load(w_ptr, w_offs + it * KITER, cache=".cg"),)
+    gl.amd.hint.sched_barrier()
+    heads = gl.allocate_shared_memory(
+        x_ptr.dtype.element_ty,
+        [_pow2_at_least(ITERS), KS, BLOCK_M, BLOCK_K],
+        _gated_shared_layout(KS, BLOCK_M, BLOCK_K),
+    )
+    for it in gl.static_range(ITERS):
+        values = xs[it].to(gl.float32)
+        variance = gl.sum(values * values, axis=2) / BLOCK_K
+        gated = (
+            values
+            * gl.rsqrt(variance[:, :, None] + eps)
+            * norm_w[None, None, :]
+            * (1 / (1 + gl.exp(-gates[it].to(gl.float32))))
+        )
+        heads.index(it).slice(0, NORM_M, 1).store(gated.to(x_ptr.dtype.element_ty))
+    acc = gl.zeros((KS, BLOCK_M, BLOCK_N), gl.float32, mfma)
+    for it in gl.static_range(ITERS):
+        a = heads.index(it).load(a_l)
+        acc = cdna4.mfma(a, gl.convert_layout(ws[it], b_l), acc)
+    out = gl.sum(acc, axis=0)
+    out_l: gl.constexpr = gl.SliceLayout(0, mfma)
+    o_m = gl.arange(0, BLOCK_M, gl.SliceLayout(1, out_l))
+    o_n = gl.arange(0, BLOCK_N, gl.SliceLayout(0, out_l))
+    col = tile * rows + o_n
+    col_ok = (o_n < rows) & (col < N)
+    cdna4.buffer_store(
+        out.to(y_ptr.dtype.element_ty),
+        y_ptr,
+        o_m[:, None] * stride_ym + col[None, :],
+        mask=(o_m < M)[:, None] & col_ok[None, :],
+    )
+
+
+def _mfma_k_step(k: int) -> tuple[int, int]:
+    """``(BLOCK_K, num_warps)`` of the MFMA tile over a K-long row."""
+    # Long K splits over eight waves, doubling the weight bytes in flight per CU.
+    num_warps = _MFMA_LONG_K_WARPS if k >= _MFMA_LONG_K else NUM_WARPS
+    return (128 if k >= 128 * num_warps else 64), num_warps
+
+
 def _config(m: int, n: int, k: int, cus: int) -> tuple[int, int, int, int, int, int]:
     """``(rows, BLOCK_M, BLOCK_N, BLOCK_K, STAGES, num_warps)`` of a GEMV
     with ``n`` outputs on ``cus`` CUs."""
@@ -573,9 +712,7 @@ def _config(m: int, n: int, k: int, cus: int) -> tuple[int, int, int, int, int, 
             # also beats one register chunk that covers all of K.
             return rows, 1, block_n, _FMA_MIN_CHUNK, stages, NUM_WARPS
         return rows, 1, block_n, chunk, 0, NUM_WARPS
-    # Long K splits over eight waves, doubling the weight bytes in flight per CU.
-    num_warps = _MFMA_LONG_K_WARPS if k >= _MFMA_LONG_K else NUM_WARPS
-    block_k = 128 if k >= 128 * num_warps else 64
+    block_k, num_warps = _mfma_k_step(k)
     if rows > _MFMA_MIN_BLOCK_N and m <= _HALF_TILE_MAX_M.get((n, k), 0):
         rows = _MFMA_MIN_BLOCK_N
     block_n = max(triton.next_power_of_2(rows), _MFMA_MIN_BLOCK_N)
@@ -757,6 +894,117 @@ def launch_gluon_gemv_a16w8_gfx950(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_K=block_k,
+        num_warps=num_warps,
+    )
+    return out
+
+
+def supports_gluon_gated_norm_gemv_a16w16_gfx950(
+    m: int, n: int, k: int, num_heads: int, head_dim: int
+) -> bool:
+    """Whether the gated GEMV runs ``m`` rows of ``num_heads`` heads into ``n``.
+
+    It is the MFMA tile (2 to ``_GATED_MAX_M`` rows) whose per-wave K step is
+    one head, over at most ``_GATED_MAX_ITERS`` K iterations of whole heads.
+    """
+    if not (
+        2 <= m <= _GATED_MAX_M
+        and supports_gluon_gemv_a16w16_gfx950(m, n, k)
+        and num_heads * head_dim == k
+    ):
+        return False
+    block_k, num_warps = _mfma_k_step(k)
+    k_iter = num_warps * block_k
+    return (
+        num_warps == NUM_WARPS
+        and block_k == head_dim
+        and k % k_iter == 0
+        and k <= _GATED_MAX_ITERS * k_iter
+    )
+
+
+def launch_gluon_gated_norm_gemv_a16w16_gfx950(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    norm_weight: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor,
+    eps: float,
+) -> torch.Tensor:
+    """Run ``out = rmsnorm_gated_sigmoid(x, gate, norm_weight) @ weight.T``.
+
+    Every program recomputes all gated heads from ``x`` and ``gate``, keeping
+    both the Triton gated norm's rounding and the MFMA tile's K reduction, so
+    ``out`` is bitwise ``rmsnorm_gated_sigmoid`` followed by
+    ``launch_gluon_gemv_a16w16_gfx950``. Programs always take whole tiles:
+    each one repeats the norm, which outweighs what half tiles gain on small
+    ``M``.
+
+    Args:
+        x: Contiguous BF16 attention output ``[M, num_heads * head_dim]``.
+        gate: BF16 gate logits with ``x``'s shape and a unit inner stride.
+        norm_weight: ``[head_dim]`` weight of the per-head RMSNorm.
+        weight: Contiguous BF16 projection weight ``[N, K]``.
+        out: ``[M, N]`` BF16 destination with unit inner stride.
+        eps: Epsilon added to each per-head variance.
+
+    Returns:
+        ``out``.
+    """
+    if x.ndim != 2 or weight.ndim != 2 or out.ndim != 2 or norm_weight.ndim != 1:
+        raise ValueError("gated GEMV expects 2D x, weight and out and a 1D norm")
+    m, k = x.shape
+    n = weight.shape[0]
+    head_dim = norm_weight.numel()
+    if (
+        x.dtype != torch.bfloat16
+        or not x.is_cuda
+        or not x.is_contiguous()
+        or gate.shape != x.shape
+        or gate.dtype != x.dtype
+        or gate.stride(1) != 1
+        or weight.dtype != x.dtype
+        or not weight.is_contiguous()
+        or weight.shape[1] != k
+        or not norm_weight.is_contiguous()
+        or tuple(out.shape) != (m, n)
+        or out.dtype != x.dtype
+        or out.stride(1) != 1
+        or len({x.device, gate.device, norm_weight.device, weight.device, out.device})
+        != 1
+    ):
+        raise ValueError(
+            "expected contiguous BF16 rows, their gate, a [head_dim] norm, "
+            "[N, K] and a row-major [M, N]"
+        )
+    if head_dim == 0 or not supports_gluon_gated_norm_gemv_a16w16_gfx950(
+        m, n, k, k // head_dim, head_dim
+    ):
+        raise ValueError(
+            f"gated GEMV does not support M={m}, N={n}, K={k}, head_dim={head_dim}"
+        )
+    cus = torch.cuda.get_device_properties(x.device).multi_processor_count
+    rows = triton.cdiv(n, cus)
+    block_n = max(triton.next_power_of_2(rows), _MFMA_MIN_BLOCK_N)
+    block_k, num_warps = _mfma_k_step(k)
+    gluon_gated_norm_gemv_a16w16_gfx950[(triton.cdiv(n, rows),)](
+        x,
+        gate,
+        norm_weight,
+        weight,
+        out,
+        m,
+        n,
+        rows,
+        x.stride(0),
+        gate.stride(0),
+        out.stride(0),
+        eps,
+        K=k,
+        BLOCK_M=_MFMA_BLOCK_M,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        NORM_M=max(triton.next_power_of_2(m), 4),
         num_warps=num_warps,
     )
     return out
