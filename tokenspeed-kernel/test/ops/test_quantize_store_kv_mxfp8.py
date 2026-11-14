@@ -30,6 +30,11 @@ from tokenspeed_kernel.ops.kvcache.triton import (
     store_sf_interleaved,
 )
 from tokenspeed_kernel.ops.quantization import quantize_mxfp8
+from utils import (
+    assert_no_triton_compile,
+    int_specialization_class,
+    warm_specialization_classes,
+)
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires a CUDA GPU."
@@ -165,3 +170,147 @@ def test_rejects_value_rows_or_cache_unlike_the_keys(
         quantize_store_kv_mxfp8(
             k, v, k_cache, v_cache, scales, scales, torch.arange(4, device="cuda")
         )
+
+
+def _dequant_reference(x: torch.Tensor) -> torch.Tensor:
+    """BF16 value of each element after an MXFP8 round trip (flashinfer quantize)."""
+    rows = x.reshape(-1, 128)
+    data, sf = quantize_mxfp8(rows)
+    exp = sf.view(torch.uint8).reshape(-1, 4).to(torch.float32) - 127.0
+    scale = torch.exp2(exp).repeat_interleave(32, dim=1)
+    return (
+        (data.view(torch.float8_e4m3fn).float() * scale)
+        .to(torch.bfloat16)
+        .view(x.shape)
+    )
+
+
+@pytest.mark.parametrize(
+    "nheads,page_tokens,kernel_page", [(2, 128, 128), (4, 256, 128), (2, 128, 64)]
+)
+def test_dequant_gather_matches_round_trip(nheads, page_tokens, kernel_page):
+    from tokenspeed_kernel.ops.kvcache.triton import dequant_gather_kv_mxfp8
+
+    torch.manual_seed(2)
+    dev = "cuda"
+    num_pages = 64  # kernel pages in the cache
+    slots = num_pages * kernel_page
+    data_shape = (slots, nheads, 128)
+    sf_shape = (slots // page_tokens, nheads, page_tokens // 128, 32, 4, 4)
+    k_cache = torch.full(data_shape, float("nan"), device=dev).to(torch.float8_e4m3fn)
+    v_cache = torch.full(data_shape, float("nan"), device=dev).to(torch.float8_e4m3fn)
+    k_sf = torch.full(sf_shape, 255, device=dev, dtype=torch.uint8)
+    v_sf = torch.full(sf_shape, 255, device=dev, dtype=torch.uint8)
+
+    seq_lens = [1, 3 * kernel_page + 5, 7 * kernel_page]
+    width = 8
+    page_table = torch.zeros(len(seq_lens), width, dtype=torch.int32, device=dev)
+    perm = torch.randperm(num_pages, device=dev).to(torch.int32)
+    k_ref = torch.zeros(len(seq_lens), width * kernel_page, nheads, 128, device=dev)
+    v_ref = torch.zeros_like(k_ref)
+    used = 0
+    for b, n in enumerate(seq_lens):
+        pages = -(-n // kernel_page)
+        page_table[b, :pages] = perm[used : used + pages]
+        used += pages
+        k = torch.randn(n, nheads, 128, device=dev, dtype=torch.bfloat16) * 3
+        v = torch.randn(n, nheads, 128, device=dev, dtype=torch.bfloat16) * 3
+        k[0, 0, :32] = 0
+        tok = torch.arange(n, device=dev)
+        loc = page_table[b, tok // kernel_page].long() * kernel_page + tok % kernel_page
+        quantize_store_kv_mxfp8(
+            k, v, k_cache, v_cache, k_sf, v_sf, loc, page_tokens=page_tokens
+        )
+        k_ref[b, :n] = _dequant_reference(k).float()
+        v_ref[b, :n] = _dequant_reference(v).float()
+
+    # Request 1 reads only its last two pages (a sliding window); the others all.
+    first_page = torch.tensor([0, 2, 0], dtype=torch.int32, device=dev)
+    last_page = torch.tensor(
+        [-(-n // kernel_page) for n in seq_lens], dtype=torch.int32, device=dev
+    )
+    num = last_page - first_page
+    scratch = int(num.sum()) * kernel_page
+    k_out = torch.full((scratch, nheads, 128), 7.0, device=dev, dtype=torch.bfloat16)
+    v_out = torch.full_like(k_out, 7.0)
+    out_pt = torch.full_like(page_table, -1)
+    dequant_gather_kv_mxfp8(
+        k_cache,
+        v_cache,
+        k_sf,
+        v_sf,
+        page_table,
+        torch.tensor(seq_lens, dtype=torch.int32, device=dev),
+        first_page,
+        num,
+        k_out,
+        v_out,
+        out_pt,
+        kernel_page_size=kernel_page,
+        page_tokens=page_tokens,
+    )
+    base = 0
+    for b, n in enumerate(seq_lens):
+        f, l = int(first_page[b]), int(last_page[b])
+        expected = [base + i - f if f <= i < l else 0 for i in range(width)]
+        assert out_pt[b].tolist() == expected
+        base += l - f
+        for i in range(f, l):
+            got_k = k_out.view(-1, kernel_page, nheads, 128)[expected[i]]
+            got_v = v_out.view(-1, kernel_page, nheads, 128)[expected[i]]
+            rows = slice(i * kernel_page, (i + 1) * kernel_page)
+            assert torch.equal(got_k.float(), k_ref[b, rows])
+            assert torch.equal(got_v.float(), v_ref[b, rows])
+
+
+def test_dequant_gather_compiles_once_per_layout():
+    """Batch size, page-table width and scratch size are runtime arguments."""
+    from tokenspeed_kernel.ops.kvcache.triton import (
+        _dequant_gather_kv_mxfp8_kernel,
+        dequant_gather_kv_mxfp8,
+    )
+
+    dev, nheads, page = "cuda", 2, 128
+    slots = 64 * page
+    k_cache = torch.zeros(slots, nheads, 128, device=dev, dtype=torch.float8_e4m3fn)
+    v_cache = torch.zeros_like(k_cache)
+    sf_shape = (slots // page, nheads, 1, 32, 4, 4)
+    k_sf = torch.full(sf_shape, 127, device=dev, dtype=torch.uint8)
+    v_sf = torch.full_like(k_sf, 127)
+
+    def run(shape: tuple[int, int, int]) -> None:
+        bs, width, capacity = shape
+        page_table = torch.zeros(bs, width, dtype=torch.int32, device=dev)
+        k_out = torch.empty(
+            capacity * page, nheads, 128, device=dev, dtype=torch.bfloat16
+        )
+        dequant_gather_kv_mxfp8(
+            k_cache,
+            v_cache,
+            k_sf,
+            v_sf,
+            page_table,
+            torch.full((bs,), page, dtype=torch.int32, device=dev),
+            torch.zeros(bs, dtype=torch.int32, device=dev),
+            torch.ones(bs, dtype=torch.int32, device=dev),
+            k_out,
+            torch.empty_like(k_out),
+            torch.empty_like(page_table),
+            kernel_page_size=page,
+            page_tokens=page,
+        )
+
+    # The width also sets both page-table strides.
+    def key(shape):
+        return tuple(int_specialization_class(value) for value in shape[1:])
+
+    sweep = [
+        (bs, width, capacity)
+        for bs in (1, 3, 8)
+        for width in (1, 5, 16, 33, 48)
+        for capacity in (8, 16, 24, 32)
+    ]
+    warm_specialization_classes(run, key, sweep, pool=[])
+    with assert_no_triton_compile(_dequant_gather_kv_mxfp8_kernel):
+        for shape in sweep:
+            run(shape)

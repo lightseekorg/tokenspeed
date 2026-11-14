@@ -58,6 +58,13 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 
+# Extend-round graph series: step 0 (--enable-drafter-prefill-graph), decode steps.
+EXTEND_STEP0_SERIES = "prefill:drafter-step0"
+EXTEND_DECODE_SERIES = "prefill:drafter-decode"
+# Rounds admit a few requests each; one with more runs its decode steps eager.
+EXTEND_DECODE_MAX_REQUESTS = 16
+
+
 @dataclass(frozen=True)
 class DrafterExtendCapture:
     """What a drafter's extend-graph capture borrows from the executor."""
@@ -148,6 +155,14 @@ class BaseDrafter:
     def set_cache_pool(self, token_to_kv_pool: CachePool | None) -> None:
         """Take a replacement pool; a drafter that caches views rebuilds them."""
         self.token_to_kv_pool = token_to_kv_pool
+
+    def warmup_extend(self, num_tokens: int) -> None:
+        """Compile the draft's work for an extend of ``num_tokens`` tokens.
+
+        The startup's dummy extends drive the target model only, so a drafter
+        whose extend runs draft kernels runs them here, on every rank alike,
+        inside ``kernel_warmup``. The default has none.
+        """
 
     def bind_sampling_backend(self, sampling_backend: SamplingBackend) -> None:
         """Take the verifier's per-request sampling pools for sampled drafting.
@@ -358,8 +373,9 @@ class BaseDrafter:
         token_buckets: Sequence[int],
         request_counts: Callable[[int], Sequence[int]],
     ) -> dict[str, list[tuple[int, int]]]:
-        """Every entry ``capture_extend_graphs`` measures, per memory-projection
-        series (``--enable-drafter-prefill-graph``).
+        """Every entry ``capture_extend_graphs`` can measure, per memory-projection
+        series (the executor keeps ``EXTEND_STEP0_SERIES`` only under
+        ``--enable-drafter-prefill-graph``).
 
         The one channel between that capture and the CUDA-graph memory
         projection, which prices exactly these entries: a series lists its

@@ -241,6 +241,39 @@ def test_spawned_host_inherits_engine_log_level(
         proc.join(timeout=10)
 
 
+def test_spawned_host_inherits_start_context_environment(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+
+    key = "TS_TEST_LAUNCH_CONTEXT"
+    monkeypatch.delenv(key, raising=False)
+
+    @contextmanager
+    def configure_child():
+        with monkeypatch.context() as scoped:
+            scoped.setenv(key, "configured")
+            yield
+
+    binary = _fake_host(
+        tmp_path,
+        """
+        import os
+        connection.recv()
+        connection.send({"status": "ready", "context": os.environ.get("TS_TEST_LAUNCH_CONTEXT")})
+        time.sleep(600)
+        """,
+    )
+    proc, reader = start_rust_host(
+        binary, *_rank_args(0), configure_child(), None, False
+    )
+    try:
+        (ready,) = receive_ready_messages([reader], [proc])
+        assert ready["context"] == "configured"
+        assert key not in os.environ
+    finally:
+        proc.terminate()
+        proc.join(timeout=10)
+
+
 def test_a_host_that_dies_before_ready_fails_the_launch(tmp_path):
     binary = _fake_host(tmp_path, "connection.recv()\nsys.exit(3)\n")
     proc, reader = start_rust_host(binary, *_rank_args(0), nullcontext(), None, False)
@@ -490,6 +523,7 @@ def _data_plane(handle: DeviceHandle) -> HostDataPlane:
             attn_mapping=server_args.mapping.attn,
             sync_size=1,
             sync_group=None,
+            host_spans=None,
         ),
         {},
         report_compiles=False,
@@ -530,10 +564,11 @@ def test_the_data_plane_runs_a_plan_with_the_admitted_requests(
     )
 
     assert pending is not None
-    assert plane.complete(pending) == (
+    completed = plane.complete(pending)
+    assert completed[2].tolist() == [-0.5]
+    assert completed[:2] + completed[3:] == (
         [100],
         [1],
-        [-0.5],
         None,
         None,
         None,
@@ -572,16 +607,16 @@ def test_the_data_plane_hands_the_logprob_plan_to_the_forward(cumulative_probs):
     if cumulative_probs is None:
         assert returned_cumulative_probs is None
     else:
-        assert returned_cumulative_probs == pytest.approx(cumulative_probs)
+        assert returned_cumulative_probs.tolist() == pytest.approx(cumulative_probs)
     ((plan, sampled_top_k),) = executor.logprob_plans
     assert plan == InputLogprobPlan(
         row_starts=(0,), counts=(2,), position_starts=(0,), top_k=2
     )
     assert sampled_top_k == 1
     input_logprobs, input_top, output_top = logprobs
-    assert input_logprobs == pytest.approx([0.0, -0.1])
-    assert input_top[1] == [[0, 1], [1, 2]]
-    assert output_top == ([[-10.0]], [[100]])
+    assert input_logprobs.tolist() == pytest.approx([0.0, -0.1])
+    assert input_top[1].tolist() == [[0, 1], [1, 2]]
+    assert tuple(column.tolist() for column in output_top) == ([[-10.0]], [[100]])
 
 
 def _plan_with_one_request(rid: str):

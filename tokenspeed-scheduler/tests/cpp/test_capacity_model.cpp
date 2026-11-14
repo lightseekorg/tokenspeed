@@ -21,6 +21,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -100,6 +101,20 @@ SchedulerConfig SizedConfig(SchedulerConfig cfg, std::int32_t usable_lcm_blocks)
     return cfg;
 }
 
+TEST(CapacityModelSink, CountsTheRetainedHeadOncePerRequest) {
+    for (const auto role : {Role::kP, Role::kD, Role::kFused}) {
+        auto config = SizingConfig(role, 128, 4096, 8, 1, false, {Sliding("swa", 128, 1024, 24)});
+        config.max_batch_size = 8;
+        const auto without = CapacityModel(config);
+        config.cache_groups[0].sink_tokens = 16;
+        const auto with = CapacityModel(config);
+        EXPECT_EQ(with.SingleRequestGroupPages(524288)[0], without.SingleRequestGroupPages(524288)[0] + 1);
+        EXPECT_EQ(with.ConcurrentGroupPages(8LL * 524288, 524288)[0],
+                  without.ConcurrentGroupPages(8LL * 524288, 524288)[0] + 8);
+        EXPECT_EQ(with.SingleRequestGroupPages(0)[0], without.SingleRequestGroupPages(0)[0]);
+    }
+}
+
 std::vector<SchedulerConfig> Sweep() {
     std::vector<SchedulerConfig> configs;
     const std::vector<std::vector<CacheGroupConfig>> group_sets = {
@@ -151,6 +166,34 @@ TEST(CapacityModelTest, MatchesTheSchedulerStartupBound) {
                 << " groups=" << sizing.cache_groups.size() << " usable=" << usable_lcm_blocks;
         }
     }
+}
+
+TEST(CapacityModelTest, StopsTheTokenLimitShortOfInt32ByTheDecodeAndRoundingHeadroom) {
+    // 40000 pages of 65536 tokens would hold a request past INT32_MAX. On
+    // every role the bound stops short of it by the decode windows a step
+    // reserves past the limit, (overlap depth + 1) * decode width, and one
+    // prefix page.
+    constexpr std::int32_t kInt32Max = std::numeric_limits<std::int32_t>::max();
+    for (const Role role : {Role::kFused, Role::kP, Role::kD}) {
+        const CapacityModel eager{
+            SizingConfig(role, 65536, 65536, /*decode_width=*/1, /*overlap_depth=*/0, false, {Full("full", 65536, 1)})};
+        EXPECT_EQ(eager.MaxSingleRequestTokens(40000), kInt32Max - 1 - 65536);
+        const CapacityModel overlapped{
+            SizingConfig(role, 65536, 65536, /*decode_width=*/4, /*overlap_depth=*/1, false, {Full("full", 32768, 2)})};
+        EXPECT_EQ(overlapped.MaxSingleRequestTokens(40000), kInt32Max - 8 - 65536);
+    }
+}
+
+TEST(CapacityModelTest, SubmitRejectsATokenLimitPastTheInt32Headroom) {
+    constexpr std::int32_t kLimit = std::numeric_limits<std::int32_t>::max() - 1 - 65536;
+    Scheduler scheduler{WithHostPackingFromDevice(
+        SizedConfig(SizingConfig(Role::kFused, 65536, 65536, 1, 0, false, {Full("full", 65536, 1)}), 40000))};
+    EXPECT_EQ(scheduler.MaxSingleRequestTokens(), kLimit);
+    // One prompt token, and the rest of the limit as the generation budget.
+    EXPECT_NO_THROW(
+        scheduler.SubmitRequests({RequestSpec{.request_id = "at", .tokens = {1}, .max_new_tokens = kLimit - 1}}));
+    EXPECT_THROW(scheduler.SubmitRequests({RequestSpec{.request_id = "past", .tokens = {1}, .max_new_tokens = kLimit}}),
+                 std::invalid_argument);
 }
 
 TEST(CapacityModelTest, ConcurrentDemandCoversEveryAdmissibleSingleRequest) {

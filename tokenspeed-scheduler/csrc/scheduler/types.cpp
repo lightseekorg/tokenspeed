@@ -66,6 +66,10 @@ void SchedulerConfig::Validate() const {
     if (device_allocator.total_pages <= 1) {
         throw std::invalid_argument("Scheduler: device cache must contain a null page and usable capacity");
     }
+    // 0 or 1 is no Host pool; a negative count is no pool size at all.
+    if (host_allocator.total_pages < 0) {
+        throw std::invalid_argument("Scheduler: host_allocator.total_pages (num_host_pages) must be >= 0");
+    }
     for (const CacheGroupConfig& group : cache_groups) {
         group.Validate();
         // A grain only shapes where the checkpoint lands; the capability to write it stays a hard requirement, so
@@ -74,6 +78,13 @@ void SchedulerConfig::Validate() const {
             throw std::invalid_argument(
                 "Scheduler: a State group with checkpoint_granularity > 1 requires state_checkpoint_in_forward");
         }
+    }
+    if (enable_kv_cache_events && std::none_of(cache_groups.begin(), cache_groups.end(),
+                                               [](const auto& group) { return group.attn_kind == AttnKind::kFull; })) {
+        throw std::invalid_argument(
+            "Scheduler: KV cache events require a continuous Full/history cache group; "
+            "State-only, SWA-only, and State + SWA layouts are unsupported. "
+            "Disable enable_kv_cache_events to use these layouts without KV event routing.");
     }
     if (prefix_replay_tokens < 0) {
         throw std::invalid_argument("Scheduler: prefix_replay_tokens must be >= 0");
@@ -173,6 +184,12 @@ void SchedulerConfig::Validate() const {
     }
     // The knob retracts through the same path capacity pressure uses, and
     // that path needs somewhere to put the image.
+    // Its magnitude is the period; INT32_MIN has none in int32.
+    if (debug_force_retraction_interval == std::numeric_limits<std::int32_t>::min()) {
+        throw std::invalid_argument(
+            "Scheduler: debug_force_retraction_interval (--debug-force-retraction-interval) must be in "
+            "[-INT32_MAX, INT32_MAX]");
+    }
     if (debug_force_retraction_interval != 0 && !HasSnapshotPool()) {
         throw std::invalid_argument(
             "Scheduler: debug_force_retraction_interval (--debug-force-retraction-interval) requires a snapshot "
@@ -251,6 +268,13 @@ void SchedulerConfig::ValidateCapacityInputs() const {
         if (group.replayable) {
             replay_window_tokens = std::max(replay_window_tokens, *group.sliding_window_tokens);
         }
+        if (group.sink_tokens > 0 && *group.sliding_window_tokens < prefix_granularity) {
+            // The window then needs every block of a tail, so a tail in the
+            // sink's page holds the sink blocks too (CacheCoordinator).
+            throw std::invalid_argument("Cache group '" + group.group_id +
+                                        "': a group with sink_tokens needs sliding_window_tokens >= "
+                                        "prefix_granularity");
+        }
     }
     if (replay_window_tokens > 0 && checkpoint_granularity > 1) {
         throw std::invalid_argument("aligned State checkpoints do not support bounded replay groups");
@@ -259,7 +283,8 @@ void SchedulerConfig::ValidateCapacityInputs() const {
         // A prefix hit re-feeds up to one replay window and must still carry
         // the prompt's final window whole, or at least a prefix page of new
         // tokens when the window is smaller than a page.
-        if (max_scheduled_tokens < replay_window_tokens + std::max(replay_window_tokens, prefix_granularity)) {
+        if (max_scheduled_tokens <
+            std::int64_t{replay_window_tokens} + std::max(replay_window_tokens, prefix_granularity)) {
             throw std::invalid_argument(
                 "Scheduler: max_scheduled_tokens must cover the replayable groups' largest sliding_window_tokens "
                 "plus max(that window, prefix_granularity)");

@@ -26,12 +26,14 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
 #include <utility>
 #include <variant>
 #include <vector>
 
 #include "cache/allocator/group_allocator.h"
+#include "core/profile_span.h"
 
 namespace tokenspeed {
 
@@ -63,9 +65,14 @@ struct ForwardOperationBase {
     std::map<std::string, ForwardBlockTable> block_tables;
 };
 
+// Like block tables, token windows borrow their request only until this
+// Plan builds ForwardBatch. Advance cannot mutate tokens during that build.
+// The batch copies both windows into its own storage before returning.
 struct PrefillOperation : public ForwardOperationBase {
-    std::vector<std::int32_t> input_ids;
-    std::vector<std::int32_t> shifted_input_ids;
+    std::span<const std::int32_t> input_ids;
+    // The available shifted prompt window; the batch pads its missing suffix
+    // with -1 instead of reading generated tokens beyond PrefillSize().
+    std::span<const std::int32_t> shifted_input_ids;
     // The prompt positions already cached: the hit boundary, any token count.
     std::int32_t extend_prefix_len{0};
     // The D role's remote admission only: every State group's checkpoint at
@@ -185,8 +192,33 @@ struct ForwardBatch {
     // padding is -1. The owned transport windows omit the long zero prefixes.
     std::map<std::string, ForwardBlockTableRows> block_tables;
     explicit ForwardBatch(std::vector<ForwardOperation> ops) {
+        // Flattens every row's whole block table, which at long contexts
+        // costs a plan more than choosing its batch.
+        ProfileSpan profile_span{"ForwardBatch::ForwardBatch"};
         std::stable_partition(ops.begin(), ops.end(),
                               [](const ForwardOperation& a) { return std::holds_alternative<PrefillOperation>(a); });
+        std::size_t prefill_rows = 0;
+        std::size_t input_tokens = 0;
+        std::size_t shifted_tokens = 0;
+        for (const auto& op : ops) {
+            if (const auto* prefill = std::get_if<PrefillOperation>(&op)) {
+                ++prefill_rows;
+                input_tokens += prefill->input_ids.size();
+                shifted_tokens += prefill->input_ids.size();
+            }
+        }
+        request_ids.reserve(ops.size());
+        request_pool_indices.reserve(ops.size());
+        input_lengths.reserve(ops.size());
+        prefill_lengths.reserve(ops.size());
+        input_ids.reserve(input_tokens);
+        shifted_input_ids.reserve(shifted_tokens);
+        extend_prefix_lens.reserve(prefill_rows);
+        extend_replay_lens.reserve(prefill_rows);
+        state_prefix_cached.reserve(prefill_rows);
+        extend_state_checkpoint_lens.reserve(prefill_rows);
+        decode_input_ids.reserve(ops.size() - prefill_rows);
+        spec_candidate_ids.reserve(ops.size() - prefill_rows);
         for (auto& op : ops) {
             std::visit(
                 [this](auto& inner) {
@@ -200,6 +232,10 @@ struct ForwardBatch {
                 input_ids.insert(input_ids.end(), prefill->input_ids.begin(), prefill->input_ids.end());
                 shifted_input_ids.insert(shifted_input_ids.end(), prefill->shifted_input_ids.begin(),
                                          prefill->shifted_input_ids.end());
+                _assert(prefill->shifted_input_ids.size() <= prefill->input_ids.size(),
+                        "shifted prompt window exceeds its input window");
+                shifted_input_ids.insert(shifted_input_ids.end(),
+                                         prefill->input_ids.size() - prefill->shifted_input_ids.size(), -1);
                 extend_prefix_lens.push_back(prefill->extend_prefix_len);
                 extend_replay_lens.push_back(prefill->extend_replay_len);
                 state_prefix_cached.push_back(prefill->state_prefix_cached);
@@ -218,7 +254,8 @@ struct ForwardBatch {
                         const auto pages = source.NumPages();
                         columns = std::max(columns, pages);
                         window_columns = std::max(
-                            window_columns, pages - static_cast<std::size_t>(source.table.ReclaimedPrefixBlocks()));
+                            window_columns,
+                            pages - static_cast<std::size_t>(source.allocator.LeadingReleasedBlocks(source.table)));
                     }
                 },
                 op);
@@ -239,7 +276,7 @@ struct ForwardBatch {
                         std::size_t first = 0;
                         if (const auto it = inner.block_tables.find(gid); it != inner.block_tables.end()) {
                             const auto& source = it->second;
-                            released = source.table.ReclaimedPrefixBlocks();
+                            released = source.allocator.LeadingReleasedBlocks(source.table);
                             pages = source.NumPages();
                             first = pages > window_columns ? pages - window_columns : 0;
                             source.allocator.AppendBlockTablePageIds(source.table, windows, first);

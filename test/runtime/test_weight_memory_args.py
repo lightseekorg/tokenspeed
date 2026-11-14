@@ -78,7 +78,6 @@ def test_discard_uses_explicit_draft_update_semantics(draft_policy):
         ({"enable_memory_saver": False}, "requires memory saver"),
         ({"model_update_config": None}, "requires memory saver"),
         ({"model_update_draft_weights": None}, "explicit draft"),
-        ({"quantization": "fp8"}, "unquantized"),
         ({"enable_eplb": True}, "without EPLB"),
     ],
 )
@@ -87,3 +86,9 @@ def test_discard_rejects_unsupported_contracts_at_argument_resolution(
 ):
     with pytest.raises(ValueError, match=reason):
         ServerArgs(**discard_args(**overrides))
+
+
+def test_quantized_discard_defers_support_check_to_the_resolved_model():
+    args = ServerArgs(**discard_args(quantization="fp8"))
+    assert args.quantization == "fp8"
+    assert args.weight_memory_policy == "discard"

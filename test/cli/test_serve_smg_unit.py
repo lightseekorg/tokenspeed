@@ -42,6 +42,7 @@ sys.path.insert(0, os.path.join(REPO_ROOT, "python"))
 from tokenspeed.cli._argsplit import OrchestratorOpts, split_argv
 from tokenspeed.cli.serve_smg import (
     _DEFAULT_SMG_DISABLE_FLAGS,
+    INKLING2_REASONING_PARSER,
     INKLING_ATTENTION_BACKEND,
     INKLING_REASONING_PARSER,
     INKLING_TOOL_CALL_PARSER,
@@ -713,6 +714,90 @@ def test_local_inkling_config_is_detected(tmp_path):
     assert _is_inkling_model(_make_inkling_model_dir(tmp_path))
     assert not _is_inkling_model("moonshotai/Kimi-K3")
     assert not _is_inkling_model(None)
+
+
+@pytest.mark.parametrize("is_nvidia", [False, True])
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"model_type": "inkling2"},
+        {"architectures": ["Inkling2ForConditionalGeneration"]},
+    ],
+)
+def test_inkling2_alias_defaults_do_not_require_legacy_fa4(tmp_path, config, is_nvidia):
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    model = str(tmp_path)
+    with patch(
+        "tokenspeed.cli.serve_smg.current_platform",
+        return_value=SimpleNamespace(is_nvidia=is_nvidia),
+    ):
+        engine, gateway = _args_with_default_model_parsers(
+            ["--model", model], ["--model", model]
+        )
+        assert engine == [
+            "--model",
+            model,
+            "--reasoning-parser",
+            INKLING2_REASONING_PARSER,
+        ]
+        assert gateway == [
+            "--model",
+            model,
+            "--reasoning-parser",
+            INKLING_REASONING_PARSER,
+            "--tool-call-parser",
+            INKLING_TOOL_CALL_PARSER,
+        ]
+        explicit_engine = [
+            "--model",
+            model,
+            "--reasoning-parser",
+            "custom_reasoning",
+            "--attention-backend",
+            "triton",
+        ]
+        explicit_gateway = [
+            "--model",
+            model,
+            "--reasoning-parser",
+            "custom_reasoning",
+            "--tool-call-parser",
+            "custom_tools",
+        ]
+        assert _args_with_default_model_parsers(explicit_engine, explicit_gateway) == (
+            explicit_engine,
+            explicit_gateway,
+        )
+
+
+@pytest.mark.parametrize(
+    ("name", "config", "is_inkling2"),
+    [
+        ("org/Inkling2-Chat", None, True),
+        ("org/inkling-2-chat", None, True),
+        ("org/inkling-2025-10-01", None, False),
+        ("Inkling2-local", {"model_type": "inkling_mm_model"}, False),
+        ("inkling-2025-10-01", {"model_type": "inkling2"}, True),
+    ],
+)
+def test_inkling2_detection_reads_config_before_the_name(
+    tmp_path, name, config, is_inkling2
+):
+    model = name
+    if config is not None:
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "config.json").write_text(json.dumps(config))
+        model = str(tmp_path / name)
+    with patch(
+        "tokenspeed.cli.serve_smg.current_platform",
+        return_value=SimpleNamespace(is_nvidia=False),
+    ):
+        engine, _ = _args_with_default_model_parsers(
+            ["--model", model], ["--model", model]
+        )
+    assert _get_from_args(engine, "--reasoning-parser") == (
+        INKLING2_REASONING_PARSER if is_inkling2 else INKLING_REASONING_PARSER
+    )
 
 
 @patch(

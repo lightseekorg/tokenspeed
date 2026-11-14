@@ -34,7 +34,7 @@ optional LSE is FP32 in natural-log units. Empty selections produce zero
 output and negative-infinite LSE. Negative slots inside a visible prefix are
 masked. Omitting lengths inspects the full selected-slot width.
 
-The pinned FlashInfer 0.7.3 provides the Prims-TS sparse MLA wrapper. Select
+The pinned FlashInfer 0.7.4 provides the Prims-TS sparse MLA wrapper. Select
 `solution="flashinfer_prims"` in the kernel API, or set
 `TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_DSA_PREFILL=flashinfer_prims_dsa_prefill`
 and `TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_DSA_DECODE=flashinfer_prims_dsa_decode`
@@ -417,6 +417,12 @@ the end, a radix select over survivors plus candidates re-selects `k` pairs
 and raises the threshold. Per-pass histograms send non-matching keys to a
 sink slot so the passes stay branch-free; one warp locates the pivot bucket
 while the others wait, since the search is a latency chain.
+
+An initial window with fewer than `k` real entries keeps a negative-infinite
+threshold until reconstruction. Its local minimum is not a valid k-th value:
+lower scores from later segments may still be needed to fill the result.
+Regression tests also exercise a compact single-CTA geometry to cover this
+invariant when changing the tail and round sizes.
 
 The portable Triton attention implementations support `return_lse=True` for
 both dense and packed latent caches. They return `(output, lse)`, with FP32

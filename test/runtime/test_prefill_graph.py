@@ -25,6 +25,7 @@ from ci_system.ci_register import register_cuda_ci
 
 from tokenspeed.runtime.execution.memory_delta import NULL_MEMORY_DELTA_OBSERVER
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
@@ -863,8 +864,8 @@ class TestDummyGroupTablesTest:
         assert (unsharded["query_shard"]) is None
 
     def test_the_drafter_dummy_batch_prepares_the_draft_from_the_same_tables(self):
-        """The drafter's prefill-graph capture runs over a dummy extend whose
-        draft metadata comes from the same tables and lengths as the target's,
+        """The unsharded drafter's capture runs over a dummy extend whose draft
+        metadata comes from the same tables and lengths as the target's,
         through the live extend's two-step prep."""
         import torch
 
@@ -878,6 +879,7 @@ class TestDummyGroupTablesTest:
 
         calls = []
         draft_backend = _backend(
+            query_sharded=False,
             init_forward_metadata=lambda **kwargs: calls.append(("init", kwargs)),
             refresh_decode_metadata=lambda *args, **kwargs: calls.append(
                 ("refresh", args, kwargs)
@@ -1034,6 +1036,7 @@ class TestDummyGroupTablesTest:
                 token_to_kv_pool=pool,
                 input_buffers=object(),
                 config=config,
+                memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False),
             )
 
         assert not (graph.disable)
@@ -1053,6 +1056,7 @@ class TestDummyGroupTablesTest:
                 token_to_kv_pool=pool,
                 input_buffers=object(),
                 config=config,
+                memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False),
             )
         assert graph.disable
 
@@ -1078,6 +1082,7 @@ class TestCaptureFailureIsLoudTest:
     def _bare(self, raises=None):
         pg = self.PrefillGraph.__new__(self.PrefillGraph)
         pg.disable = False
+        pg.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
         pg.capture_buckets = [4]
         pg._captures = {}
         pg._encoders = {}
@@ -1095,8 +1100,10 @@ class TestCaptureFailureIsLoudTest:
             max_num_seqs=4,
             data_parallel_size=1,
         )
-        pg._embed_tokens = SimpleNamespace(
-            weight=self.torch.zeros(2, 8, dtype=self.torch.float32)
+        pg.inner_model = SimpleNamespace(
+            embed_tokens=SimpleNamespace(
+                weight=self.torch.zeros(2, 8, dtype=self.torch.float32)
+            )
         )
 
         def _capture_all_buckets(_decode_wrapper, _entries, _observer):
@@ -1220,6 +1227,7 @@ class TestNarrowingPrefillGraphTest:
                     token_to_kv_pool=_fake_pool(runtime_contract=object()),
                     input_buffers=object(),
                     config=config,
+                    memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False),
                 )
             assert not (graph.disable)
             assert (graph._narrowing) is (inner if expected_buckets else None)
@@ -1239,7 +1247,9 @@ class TestNarrowingPrefillGraphTest:
             inner.embed_tokens = object()
             model_runner = SimpleNamespace(
                 model=SimpleNamespace(model=inner),
-                model_config=SimpleNamespace(requires_request_token_history=False),
+                model_config=SimpleNamespace(
+                    requires_request_token_history=False, is_multimodal_active=False
+                ),
                 is_generation=True,
                 is_multimodal=False,
             )
@@ -1261,6 +1271,7 @@ class TestNarrowingPrefillGraphTest:
                     token_to_kv_pool=_fake_pool(runtime_contract=object()),
                     input_buffers=object(),
                     config=config,
+                    memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False),
                 )
             assert (graph.disable) == (expected_disable)
             assert (graph.decoder_buckets) == ([])
@@ -1476,6 +1487,7 @@ class TestPrefillRoleGraphsTest:
                 token_to_kv_pool=_fake_pool(runtime_contract=object()),
                 input_buffers=object(),
                 config=config,
+                memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False),
             )
 
     def test_placeholder_tables_give_a_state_group_its_two_slots(self):
@@ -1549,6 +1561,7 @@ class TestPrefillRoleGraphsTest:
                 token_to_kv_pool=_fake_pool(runtime_contract=object()),
                 input_buffers=object(),
                 config=self._config(prefill_only=True, enforce_eager=enforce_eager),
+                memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False),
             )
 
     def _check_plan(

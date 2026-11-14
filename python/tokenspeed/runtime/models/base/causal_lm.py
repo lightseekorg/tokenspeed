@@ -151,7 +151,9 @@ class BaseCausalLM(nn.Module):
     required source must arrive exactly once; the session validates all
     models before any post-load derivation. The model declares discard
     support separately and lists its non-checkpoint preserved tensors in
-    ``weight_discard_preserved_tensors``.
+    ``weight_discard_preserved_tensors``. A quantized model additionally needs
+    its resolved ``QuantizationConfig`` to opt in to discard: every complete
+    update must regenerate encoded weights and scales in their original storage.
 
     The session fields are class-level defaults so a subclass that builds
     itself without ``BaseCausalLM.__init__`` (the speculative drafts) still
@@ -330,6 +332,12 @@ class BaseCausalLM(nn.Module):
                 f"{type(self).__name__} does not return aux hidden states, so "
                 "EAGLE3 and DFLASH drafts cannot attach to it"
             )
+
+    def stores_capture_taps(self, ctx: ForwardContext) -> bool:
+        """Whether this forward stores the draft's taps itself (for example in
+        its decode monokernels), so that a draft's capture sink must not read
+        them as the forward produces them."""
+        return False
 
     def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None) -> None:
 

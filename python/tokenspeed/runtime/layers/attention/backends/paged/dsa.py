@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -294,6 +295,27 @@ class DSABackend(PagedAttentionBackend):
         self.batch_invariant: bool = (
             global_server_args_dict["numerics"] in BITWISE_ENVELOPES
         )
+        # Development switch: plan the decode core without the batch_invariant
+        # feature. No batch-invariant dsa_decode leaf covers a width-8 verify
+        # (aok stops at q_len 4), so a DFlash block_size 8 deployment under a
+        # bitwise envelope cannot otherwise start. Such a run does NOT meet the
+        # envelope: never record a baseline from it.
+        #
+        # Deliberately an environment variable, not a server_args flag: a CLI
+        # parameter would make this a supported feature, and it is a temporary
+        # bypass. Remove it once a batch-invariant dsa_decode leaf covers a
+        # width-8 verify.
+        self._non_bitwise_decode_escape: bool = (
+            self.batch_invariant
+            and os.environ.get("TS_DSA_ALLOW_NON_BITWISE_DECODE") == "1"
+        )
+        if self._non_bitwise_decode_escape:
+            logger.warning(
+                "TS_DSA_ALLOW_NON_BITWISE_DECODE=1: DSA decode planned without "
+                "batch invariance under --numerics %s; this run does not meet "
+                "the envelope.",
+                global_server_args_dict["numerics"],
+            )
         # --dsa-slot-order: how the cores reduce the selected slots
         # (docs/design/numerics.md, invariance.batch).
         self.slot_order: str = global_server_args_dict["dsa_slot_order"]
@@ -330,16 +352,36 @@ class DSABackend(PagedAttentionBackend):
                 ),
                 ignore_layout=False,
             )
+            decode_traits = {
+                **traits,
+                "q_len": frozenset(range(1, self.spec_num_tokens + 1)),
+            }
+            decode_variable = variable
+            if self._non_bitwise_decode_escape:
+                # Only aok declares slot_order, and it stops at width 4; a leaf
+                # that does not declare it serves "selection" implicitly, so
+                # "sorted" would still be refused.
+                if self.slot_order != "selection":
+                    raise ValueError(
+                        "TS_DSA_ALLOW_NON_BITWISE_DECODE needs "
+                        f"--dsa-slot-order selection; got {self.slot_order!r}"
+                    )
+                decode_traits.pop("slot_order", None)
+                # aok declares no `topk`, so the plan leaves it unrestricted,
+                # which the portable leaves' finite sets cannot match: pin it.
+                decode_variable = decode_variable - {"topk"}
+                decode_traits["topk"] = self.index_topk
             self.decode_kernel_plan = KernelPlan.select(
                 "attention",
                 "dsa_decode",
                 signature,
-                features=frozenset({"batch_invariant"}),
-                static_traits={
-                    **traits,
-                    "q_len": frozenset(range(1, self.spec_num_tokens + 1)),
-                },
-                variable_traits=variable,
+                features=(
+                    frozenset()
+                    if self._non_bitwise_decode_escape
+                    else frozenset({"batch_invariant"})
+                ),
+                static_traits=decode_traits,
+                variable_traits=decode_variable,
                 solution=None,
                 declared_traits=(
                     frozenset({"slot_order"})
@@ -347,6 +389,17 @@ class DSABackend(PagedAttentionBackend):
                     else frozenset()
                 ),
                 ignore_layout=False,
+            )
+            # Which leaf serves a verify width is otherwise only derivable by
+            # replaying the registry's trait matching by hand.
+            logger.info(
+                "DSA kernel plan: prefill=%s decode=%s (q_len<=%d, topk=%d, "
+                "batch_invariant=%s)",
+                self.prefill_kernel_plan.spec.name,
+                self.decode_kernel_plan.spec.name,
+                self.spec_num_tokens,
+                self.index_topk,
+                self.batch_invariant and not self._non_bitwise_decode_escape,
             )
         # Rank-major query gather with partials in the exchange layout; a pinned prefill plan keeps its own core.
         self.kvp_prefill_query_layout: bool = self.prefill_kernel_plan is None

@@ -12,6 +12,7 @@
 #include "cache/core/block_pool.h"
 #include "cache/core/cache_types.h"
 #include "cache/prefix/prefix_hasher.h"
+#include "prefix_hash_text.h"
 #include "cache/tier/transfer.h"
 #include "cache/tier/transfer_manager.h"
 #include "cache/tier/storage_manager.h"
@@ -162,9 +163,10 @@ TEST(CacheOperationTest, EveryTierTransferPairsBlocksOfEqualResidue) {
     std::vector<CacheBlockRef> same_bucket = host_pool.AcquireBlocksInBuckets(0, std::array<std::int32_t, 1>{0});
     std::vector<CacheBlockRef> other_bucket = host_pool.AcquireBlocksInBuckets(0, std::array<std::int32_t, 1>{1});
     ASSERT_EQ(device.size() + same_bucket.size() + other_bucket.size(), 3u);
-    const CacheKey key{.group_id = 0, .content_hash = "h0"};
+    const CacheKey key{.group_id = 0, .content_hash = ContentHash{"h0"}};
     coordinator.CacheHostBlock(same_bucket.front(), key, std::nullopt);
-    coordinator.CacheHostBlock(other_bucket.front(), CacheKey{.group_id = 0, .content_hash = "h1"}, std::nullopt);
+    coordinator.CacheHostBlock(other_bucket.front(), CacheKey{.group_id = 0, .content_hash = ContentHash{"h1"}},
+                               std::nullopt);
 
     std::vector<BlockTransfer> ok;
     ok.push_back(
@@ -175,7 +177,7 @@ TEST(CacheOperationTest, EveryTierTransferPairsBlocksOfEqualResidue) {
     crossed.push_back(BlockTransfer{.group_id = 0,
                                     .source = other_bucket.front(),
                                     .destination = device.front(),
-                                    .key = CacheKey{.group_id = 0, .content_hash = "h1"}});
+                                    .key = CacheKey{.group_id = 0, .content_hash = ContentHash{"h1"}}});
     EXPECT_THROW(transfers.StartPrefixLoad(std::move(crossed)), std::runtime_error);
 }
 
@@ -198,7 +200,7 @@ TEST(CacheOperationTest, ALoadExportsEachTiersBlockIdWithItsOwnPacking) {
     auto host = host_pool.AcquireBlocksInBuckets(0, buckets);
     ASSERT_EQ(device.size(), 6);
     ASSERT_EQ(host.size(), 8);
-    const CacheKey key{.group_id = 0, .content_hash = "compact-host"};
+    const CacheKey key{.group_id = 0, .content_hash = ContentHash{"compact-host"}};
     coordinator.CacheHostBlock(host.back(), key, std::nullopt);
     std::vector<BlockTransfer> rows;
     rows.push_back(BlockTransfer{.group_id = 0, .source = host.back(), .destination = device.back(), .key = key});
@@ -349,7 +351,7 @@ TEST(CacheOperationTest, StreamOrderedStorePinsNoDeviceSource) {
     std::vector<GroupDemand> demands{{.table = &tables[0], .extent = DenseGrowth{2}}};
     auto admission = coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{},
                                        /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt,
-                                       /*evict_blocks_past_segments=*/false, /*session_id=*/{});
+                                       /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{});
     ASSERT_TRUE(admission);
     const std::array<std::string, 1> hashes{"h0"};
     coordinator.CacheFullBlocks(tables, hashes, admission->access_epoch, /*first_slot=*/0, CacheBoundaryKind::kChunk);
@@ -366,7 +368,7 @@ TEST(CacheOperationTest, StreamOrderedStorePinsNoDeviceSource) {
     EXPECT_EQ(coordinator.StoreCandidatesDroppedByFlush(), 0u) << "the drain took the only candidate";
 
     transfers.CompleteWriteBack(write_back->op_id);
-    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(CacheKey{.group_id = 0, .content_hash = "h0"}));
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(CacheKey{.group_id = 0, .content_hash = ContentHash{"h0"}}));
     const TierTransferManager::WriteBackStats& publication_stores =
         transfers.WriteBackStatsFor(HostStoreCause::kPublication);
     EXPECT_EQ(publication_stores.ops, 1u);
@@ -391,7 +393,7 @@ TEST(CacheOperationTest, PinnedStoreHoldsDeviceSourceUntilAck) {
     std::vector<GroupDemand> demands{{.table = &tables[0], .extent = DenseGrowth{2}}};
     auto admission = coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{},
                                        /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt,
-                                       /*evict_blocks_past_segments=*/false, /*session_id=*/{});
+                                       /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{});
     ASSERT_TRUE(admission);
     const std::array<std::string, 1> hashes{"h0"};
     coordinator.CacheFullBlocks(tables, hashes, admission->access_epoch, /*first_slot=*/0, CacheBoundaryKind::kChunk);
@@ -411,15 +413,15 @@ TEST(CacheOperationTest, PinnedStoreHoldsDeviceSourceUntilAck) {
     std::vector<GroupDemand> newcomer_demands{{.table = &newcomer[0], .extent = DenseGrowth{2}}};
     EXPECT_FALSE(coordinator.Admit(coordinator.ProbePrefix({}), newcomer_demands, RequestProgress{},
                                    /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt,
-                                   /*evict_blocks_past_segments=*/false, /*session_id=*/{}))
+                                   /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{}))
         << "the only Device block is pinned by the in-flight store";
 
     transfers.CompleteWriteBack(write_back->op_id);
     EXPECT_FALSE(transfers.HasPinnedStoresInFlight());
-    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(CacheKey{.group_id = 0, .content_hash = "h0"}));
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(CacheKey{.group_id = 0, .content_hash = ContentHash{"h0"}}));
     EXPECT_TRUE(coordinator.Admit(coordinator.ProbePrefix({}), newcomer_demands, RequestProgress{},
                                   /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt,
-                                  /*evict_blocks_past_segments=*/false, /*session_id=*/{}))
+                                  /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{}))
         << "the ACK released the pin; the block is evictable again";
 }
 
@@ -445,18 +447,18 @@ TEST(CacheOperationTest, HostDestinationCannotBeReusedBeforeWriteBackAck) {
                       /*newly_cached=*/nullptr, /*session=*/nullptr);
     };
 
-    const CacheKey first_key{.group_id = 0, .content_hash = "first"};
+    const CacheKey first_key{.group_id = 0, .content_hash = ContentHash{"first"}};
     cache_device(first_key);
-    const std::array first_hashes{first_key.content_hash};
+    const std::array first_hashes{first_key.content_hash.ToString()};
     coordinator.QueueCachedBlocksForStore(first_hashes);
     auto first = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kPublication);
     ASSERT_TRUE(first);
     ASSERT_EQ(first->transfers.size(), 1u);
     const std::int32_t destination = first->transfers.front().destination_page;
 
-    const CacheKey second_key{.group_id = 0, .content_hash = "second"};
+    const CacheKey second_key{.group_id = 0, .content_hash = ContentHash{"second"}};
     cache_device(second_key);
-    const std::array second_hashes{second_key.content_hash};
+    const std::array second_hashes{second_key.content_hash.ToString()};
     coordinator.QueueCachedBlocksForStore(second_hashes);
     EXPECT_FALSE(transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kPublication));
     const TierTransferManager::WriteBackStats& publication_stores =
@@ -500,7 +502,7 @@ TEST(CacheOperationTest, RetractionStoreSkipsWhenHostHasNoPlacement) {
     std::vector<GroupDemand> demands{{.table = &tables[0], .extent = DenseGrowth{2}}};
     auto admission = coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{},
                                        /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt,
-                                       /*evict_blocks_past_segments=*/false, /*session_id=*/{});
+                                       /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{});
     ASSERT_TRUE(admission);
     const std::array<std::string, 1> hashes{"h0"};
     coordinator.CacheFullBlocks(tables, hashes, admission->access_epoch, /*first_slot=*/0, CacheBoundaryKind::kChunk);
@@ -549,19 +551,20 @@ TEST(CacheOperationTest, PendingStoresAllocateInCandidateOrderAcrossGroups) {
         return page;
     };
 
-    cache_block(host_pool, CacheKey{.group_id = 0, .content_hash = "old-0"});
-    cache_block(host_pool, CacheKey{.group_id = 0, .content_hash = "old-1"});
+    cache_block(host_pool, CacheKey{.group_id = 0, .content_hash = ContentHash{"old-0"}});
+    cache_block(host_pool, CacheKey{.group_id = 0, .content_hash = ContentHash{"old-1"}});
 
-    const CacheKey group_one{.group_id = 1, .content_hash = "new-1"};
+    const CacheKey group_one{.group_id = 1, .content_hash = ContentHash{"new-1"}};
     const std::int32_t group_one_source = cache_block(device_pool, group_one);
-    const std::array group_one_hashes{group_one.content_hash};
+    const std::array group_one_hashes{group_one.content_hash.ToString()};
     coordinator.QueueCachedBlocksForStore(group_one_hashes);
 
-    const CacheKey group_zero_first{.group_id = 0, .content_hash = "new-0"};
-    const CacheKey group_zero_second{.group_id = 0, .content_hash = "new-2"};
+    const CacheKey group_zero_first{.group_id = 0, .content_hash = ContentHash{"new-0"}};
+    const CacheKey group_zero_second{.group_id = 0, .content_hash = ContentHash{"new-2"}};
     cache_block(device_pool, group_zero_first);
     cache_block(device_pool, group_zero_second);
-    const std::array group_zero_hashes{group_zero_first.content_hash, group_zero_second.content_hash};
+    const std::array group_zero_hashes{group_zero_first.content_hash.ToString(),
+                                       group_zero_second.content_hash.ToString()};
     coordinator.QueueCachedBlocksForStore(group_zero_hashes);
 
     auto write_back = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kPublication);
@@ -602,10 +605,10 @@ TEST(CacheOperationTest, PendingStoreDrainCountsEachCandidateOnce) {
         /*snapshot_pool=*/nullptr,
         /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     TierTransferManager transfers{coordinator};
-    const CacheKey on_host{.group_id = 0, .content_hash = "on-host"};
-    const CacheKey stored{.group_id = 0, .content_hash = "stored"};
-    const CacheKey travelling{.group_id = 0, .content_hash = "travelling"};
-    const CacheKey evicted{.group_id = 0, .content_hash = "evicted"};
+    const CacheKey on_host{.group_id = 0, .content_hash = ContentHash{"on-host"}};
+    const CacheKey stored{.group_id = 0, .content_hash = ContentHash{"stored"}};
+    const CacheKey travelling{.group_id = 0, .content_hash = ContentHash{"travelling"}};
+    const CacheKey evicted{.group_id = 0, .content_hash = ContentHash{"evicted"}};
     for (const CacheKey& key : {on_host, stored, travelling, evicted}) {
         CacheBlockRef block = device_pool.AcquireBlock(0);
         ASSERT_TRUE(block);
@@ -617,18 +620,19 @@ TEST(CacheOperationTest, PendingStoreDrainCountsEachCandidateOnce) {
     coordinator.CacheHostBlock(host_copy, on_host, std::nullopt);
     host_copy.reset();
 
-    coordinator.QueueCachedBlocksForStore(std::array{travelling.content_hash});
+    coordinator.QueueCachedBlocksForStore(std::array{travelling.content_hash.ToString()});
     const auto earlier = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kFinish);
     ASSERT_TRUE(earlier);
 
-    coordinator.QueueCachedBlocksForStore(std::array{on_host.content_hash, stored.content_hash, stored.content_hash,
-                                                     travelling.content_hash, evicted.content_hash});
+    coordinator.QueueCachedBlocksForStore(std::array{on_host.content_hash.ToString(), stored.content_hash.ToString(),
+                                                     stored.content_hash.ToString(), travelling.content_hash.ToString(),
+                                                     evicted.content_hash.ToString()});
     const CacheBlockLocation evicted_location = coordinator.GroupPrefixIndex(0).Find(device_pool, evicted)->Location();
     ASSERT_TRUE(coordinator.GroupPrefixIndex(0).Evict(device_pool, evicted_location));
     const auto store = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kPublication);
     ASSERT_TRUE(store);
     ASSERT_EQ(store->transfers.size(), 1u);
-    EXPECT_EQ(store->transfers.front().content_hash, stored.content_hash);
+    EXPECT_EQ(store->transfers.front().content_hash, stored.content_hash.ToString());
 
     const TierTransferManager::WriteBackStats& publication_stores =
         transfers.WriteBackStatsFor(HostStoreCause::kPublication);
@@ -660,7 +664,7 @@ TEST(CacheOperationTest, RetractionReleaseEstimateExcludesBlocksOwnedByAnotherRe
     std::vector<GroupDemand> demands{{.table = &tables[0], .extent = DenseGrowth{4}}};
     auto admission = coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{},
                                        /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt, std::nullopt,
-                                       /*evict_blocks_past_segments=*/false, /*session_id=*/{});
+                                       /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{});
     ASSERT_TRUE(admission);
     const std::array<std::string, 2> hashes{"h0", "h1"};
     coordinator.CacheFullBlocks(tables, hashes, admission->access_epoch, /*first_slot=*/0, CacheBoundaryKind::kChunk);
@@ -743,7 +747,7 @@ TEST(CacheOperationTest, StateCheckpointStreamsOnlyWhenPublished) {
                                            /*checkpoint_retention_requests=*/0);
         TierTransferManager transfers(coordinator);
         const std::vector<std::string> hashes{"state2"};
-        const CacheKey key{.group_id = 0, .content_hash = hashes[0]};
+        const CacheKey key{.group_id = 0, .content_hash = ContentHash{hashes[0]}};
         std::vector<BlockTable> tables{
             BlockTable::FromBlocks(/*group_id=*/0, {pool.AcquireBlock(0), pool.AcquireBlock(0)}, 0)};
         CacheCompletedBlocksForTest(coordinator, tables, hashes, 1, 0, 2, CacheBoundaryKind::kChunk, true,
@@ -779,7 +783,7 @@ TEST(CacheOperationTest, HostRestoredStateCheckpointRemainsCachedAfterLoadAckAnd
                                        /*checkpoint_retention_requests=*/0);
     TierTransferManager transfers(coordinator);
     const std::vector<std::string> hashes{"restored-state"};
-    const CacheKey key{.group_id = 0, .content_hash = hashes[0]};
+    const CacheKey key{.group_id = 0, .content_hash = ContentHash{hashes[0]}};
     CacheBlockRef source = coordinator.AcquireHostBlock(0, /*bucket=*/0);
     ASSERT_TRUE(source);
     coordinator.CacheHostBlock(source, key, std::nullopt);
@@ -799,7 +803,7 @@ TEST(CacheOperationTest, HostRestoredStateCheckpointRemainsCachedAfterLoadAckAnd
     EXPECT_TRUE(coordinator.ContainsHostCachedBlock(key));
     const auto metadata = coordinator.GroupPrefixIndex(0).MetadataFor(pool, location);
     ASSERT_TRUE(metadata);
-    EXPECT_EQ(metadata->boundary_kind, CacheBoundaryKind::kEndpoint);
+    EXPECT_EQ(metadata->eviction.boundary_kind, CacheBoundaryKind::kEndpoint);
     EXPECT_EQ(coordinator.ProbePrefix(hashes).device.num_common_tokens, 2);
     EXPECT_TRUE(coordinator.ClearDeviceCache());
     EXPECT_EQ(pool.NumEmptyLcmBlocks(), 1);
@@ -861,7 +865,7 @@ TEST(CacheOperationTest, HostHitsLoadWithoutKeys) {
 
     CacheBlockRef host_block = host_pool.AcquireBlock(/*group_id=*/0);
     ASSERT_TRUE(host_block);
-    const CacheKey key{.group_id = 0, .content_hash = "h0"};
+    const CacheKey key{.group_id = 0, .content_hash = ContentHash{"h0"}};
     coordinator.CacheHostBlock(host_block, key, std::nullopt);
     host_block.reset();
 
@@ -873,7 +877,7 @@ TEST(CacheOperationTest, HostHitsLoadWithoutKeys) {
     auto admission = coordinator.Admit(std::move(probe), demands, RequestProgress{}, /*copy_in_blocks=*/{},
                                        /*copy_in_point=*/std::nullopt,
                                        /*request_access_epoch=*/std::nullopt, /*evict_blocks_past_segments=*/false,
-                                       /*session_id=*/{});
+                                       /*session_id=*/{}, /*cache_group_id=*/{});
     ASSERT_TRUE(admission);
     ASSERT_EQ(admission->load_pairs.size(), 1u);
     EXPECT_TRUE(admission->load_pairs[0].key.content_hash.empty());
@@ -899,7 +903,7 @@ TEST(CacheOperationTest, ExpandPrefixKeysCoversGroupsAndOffsets) {
         /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
     const std::vector<CacheKey> keys = coordinator.ExpandPrefixKeys(std::array<std::string, 1>{"h0"});
     ASSERT_EQ(keys.size(), 2u);
-    EXPECT_EQ(keys[0].content_hash, "h0");
+    EXPECT_EQ(keys[0].content_hash, ContentHash{"h0"});
     EXPECT_EQ(keys[0].page_offset, 0);
     EXPECT_EQ(keys[1].page_offset, 1);
 }
@@ -933,8 +937,8 @@ TEST(CacheOperationTest, AdmissionLoadPairsKeepHostPinnedAfterTableFree) {
         specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/true, &host_pool,
         /*snapshot_pool=*/nullptr,
         /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
-    const CacheKey key_h0{.group_id = 0, .content_hash = "h0"};
-    const CacheKey key_h1{.group_id = 0, .content_hash = "h1"};
+    const CacheKey key_h0{.group_id = 0, .content_hash = ContentHash{"h0"}};
+    const CacheKey key_h1{.group_id = 0, .content_hash = ContentHash{"h1"}};
     for (const CacheKey& key : {key_h0, key_h1}) {
         CacheBlockRef host_block = coordinator.AcquireHostBlock(/*group_id=*/0, /*bucket=*/0);
         ASSERT_TRUE(host_block);
@@ -948,7 +952,7 @@ TEST(CacheOperationTest, AdmissionLoadPairsKeepHostPinnedAfterTableFree) {
     auto admission = coordinator.Admit(std::move(probe), demands, RequestProgress{}, /*copy_in_blocks=*/{},
                                        /*copy_in_point=*/std::nullopt,
                                        /*request_access_epoch=*/std::nullopt, /*evict_blocks_past_segments=*/false,
-                                       /*session_id=*/{});
+                                       /*session_id=*/{}, /*cache_group_id=*/{});
     ASSERT_TRUE(admission);
     ASSERT_FALSE(admission->load_pairs.empty());
     EXPECT_EQ(coordinator.NumPinnedHostCachedBlocks(), 2);
@@ -971,7 +975,7 @@ protected:
     StorageTransferManager storage{coordinator,
                                    StorageConfig{4, 16, 4, 3, 32, 2, 100, 100, {8, 1048576, 1000}, {4, 524288, 500}}};
     std::vector<std::string> hashes{"h0", "h1", "h2"};
-    CacheKey key(const std::string& hash) { return CacheKey{.group_id = 0, .content_hash = hash}; }
+    CacheKey key(const std::string& hash) { return CacheKey{.group_id = 0, .content_hash = ContentHash{hash}}; }
 };
 
 class AsyncStorageTailTest : public ::testing::Test {
@@ -1000,7 +1004,8 @@ protected:
         CacheCoordinator::PromptPrefix result{
             .prefix_hashes = std::span{hashes}.first(bound / 4), .tokens = tokens, .max_tokens = bound};
         if (include_tail && bound % 4 != 0) {
-            const ContentHash prior = result.prefix_hashes.empty() ? ContentHash{} : result.prefix_hashes.back();
+            const ContentHash prior =
+                result.prefix_hashes.empty() ? ContentHash{} : ContentHash{result.prefix_hashes.back()};
             result.tail =
                 TailPublication{.tail_tokens = bound % 4,
                                 .hash = HashPrefixPage(std::span{tokens}.subspan(bound / 4 * 4, bound % 4), prior)};
@@ -1136,13 +1141,13 @@ TEST_F(AsyncStorageTailTest, KnownTailBelowTheRequestBoundCanBeRestored) {
     auto state = coordinator.AcquireHostBlock(2, 0);
     ASSERT_TRUE(state);
     coordinator.CacheHostBlock(state, {.group_id = 2, .content_hash = known.tail->hash}, std::nullopt);
-    coordinator.CacheHostTail(hashes[0], *known.tail);
+    coordinator.CacheHostTail(ContentHash{hashes[0]}, *known.tail);
     state.reset();
     const auto longer = prompt(11, true);
     const auto query = coordinator.MissingStorageKeys(longer, 64);
     std::vector<CacheKey> hits;
     for (const auto& key : query.keys) {
-        if ((key.group_id == 0 && key.content_hash == hashes[0]) || key.content_hash == known.tail->hash) {
+        if ((key.group_id == 0 && key.content_hash == ContentHash{hashes[0]}) || key.content_hash == known.tail->hash) {
             hits.push_back(key);
         }
     }
@@ -1160,7 +1165,7 @@ TEST_F(AsyncStorageTailTest, DifferentTokensUnderTheSamePriorDoNotQueryTheKnownT
     const auto known = prompt(7, true);
     auto state = coordinator.AcquireHostBlock(2, 0);
     coordinator.CacheHostBlock(state, {.group_id = 2, .content_hash = known.tail->hash}, std::nullopt);
-    coordinator.CacheHostTail(hashes[0], *known.tail);
+    coordinator.CacheHostTail(ContentHash{hashes[0]}, *known.tail);
     tokens[6] = 100;
     const auto query = coordinator.MissingStorageKeys(prompt(7, true), 64);
     EXPECT_TRUE(
@@ -1558,11 +1563,11 @@ TEST(CacheOperationTest, ShardedL3PartialReadUsesOrdinaryOwnerPreservingAdmissio
         std::vector<std::uint8_t> failures;
         for (std::size_t i = 0; i < get.keys.size(); ++i) {
             const auto& key = get.keys[i];
-            const auto page = std::find(hashes.begin(), hashes.end(), key.content_hash) - hashes.begin();
+            const auto page = std::find(hashes.begin(), hashes.end(), key.content_hash.ToString()) - hashes.begin();
             const auto bucket = key.group_id == 0 ? (page * 2 + key.page_offset) % shards : 0;
             EXPECT_EQ((get.host_blocks[i] - 1) % specs[key.group_id].shard_count, bucket);
-            successes.push_back(key.content_hash != "h2");
-            failures.push_back(key.content_hash == "h2");
+            successes.push_back(key.content_hash != ContentHash{"h2"});
+            failures.push_back(key.content_hash == ContentHash{"h2"});
         }
         storage.Complete(cache::StorageDone{read.OperationId(), successes, true, failures});
         EXPECT_EQ(coordinator.ProbePrefix(hashes).host.num_common_tokens, 8);
@@ -1575,7 +1580,7 @@ TEST(CacheOperationTest, ShardedL3PartialReadUsesOrdinaryOwnerPreservingAdmissio
         auto admission = coordinator.Admit(coordinator.ProbePrefix(hashes), demands, RequestProgress{},
                                            /*copy_in_blocks=*/{}, /*copy_in_point=*/std::nullopt,
                                            /*request_access_epoch=*/std::nullopt, /*evict_blocks_past_segments=*/false,
-                                           /*session_id=*/{});
+                                           /*session_id=*/{}, /*cache_group_id=*/{});
         ASSERT_TRUE(admission);
         EXPECT_EQ(admission->host_prefix_tokens, 8);
         ASSERT_EQ(admission->load_pairs.size(), 6u);
@@ -1602,7 +1607,7 @@ TEST(CacheOperationTest, ShardedL3ReservationRespectsBucketPressureAndExistingHo
     const std::array<std::string, 4> hashes{"h0", "h1", "h2", "h3"};
     auto pinned = host.AcquireBlocksInBuckets(0, std::array<std::int32_t, 1>{2});
     auto warm = host.AcquireBlocksInBuckets(0, std::array<std::int32_t, 1>{0});
-    coordinator.CacheHostBlock(warm.front(), CacheKey{.group_id = 0, .content_hash = "h0"}, std::nullopt);
+    coordinator.CacheHostBlock(warm.front(), CacheKey{.group_id = 0, .content_hash = ContentHash{"h0"}}, std::nullopt);
     warm.clear();
     const auto prompt = StoragePrompt(hashes, 2);
     const auto query = coordinator.MissingStorageKeys(prompt, 16);
@@ -1610,14 +1615,14 @@ TEST(CacheOperationTest, ShardedL3ReservationRespectsBucketPressureAndExistingHo
     // Bucket 2 cannot accept h2, so only the shorter complete prefix fits.
     auto short_read = coordinator.ReserveStoragePrefix(prompt, query.keys, 4);
     ASSERT_EQ(short_read.keys.size(), 1u);
-    EXPECT_EQ(short_read.keys[0].content_hash, "h1");
+    EXPECT_EQ(short_read.keys[0].content_hash, ContentHash{"h1"});
     EXPECT_EQ(coordinator.Allocator(0).BucketOf(short_read.blocks[0]->Location()), 1);
     short_read.blocks.clear();
     pinned.clear();
     const auto full_read = coordinator.ReserveStoragePrefix(prompt, query.keys, 4);
     ASSERT_EQ(full_read.keys.size(), 3u);
     for (std::size_t i = 0; i < full_read.keys.size(); ++i) {
-        EXPECT_EQ(full_read.keys[i].content_hash, hashes[i + 1]);
+        EXPECT_EQ(full_read.keys[i].content_hash, ContentHash{hashes[i + 1]});
         EXPECT_EQ(coordinator.Allocator(0).BucketOf(full_read.blocks[i]->Location()), static_cast<std::int32_t>(i + 1));
     }
     EXPECT_EQ(device.NumEmptyLcmBlocks(), 4);
@@ -1631,8 +1636,8 @@ TEST(CacheOperationTest, StorageReservationPinsAllWarmHitsBeforeEviction) {
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2}};
     auto coordinator = MakeCoordinator(specs, 2, device, true, &host, nullptr, true, /*write_back_evictions=*/false,
                                        /*checkpoint_retention_requests=*/0);
-    const CacheKey later{.group_id = 0, .content_hash = "h1"};
-    const CacheKey unrelated{.group_id = 0, .content_hash = "other"};
+    const CacheKey later{.group_id = 0, .content_hash = ContentHash{"h1"}};
+    const CacheKey unrelated{.group_id = 0, .content_hash = ContentHash{"other"}};
     auto first = host.AcquireBlock(0);
     auto second = host.AcquireBlock(0);
     coordinator.CacheHostBlock(first, later, std::nullopt);
@@ -1640,8 +1645,8 @@ TEST(CacheOperationTest, StorageReservationPinsAllWarmHitsBeforeEviction) {
     first.reset();
     second.reset();
     const std::array hashes{std::string{"h0"}, std::string{"h1"}};
-    auto reservation = coordinator.ReserveStoragePrefix(StoragePrompt(hashes, 2),
-                                                        std::array{CacheKey{.group_id = 0, .content_hash = "h0"}}, 2);
+    auto reservation = coordinator.ReserveStoragePrefix(
+        StoragePrompt(hashes, 2), std::array{CacheKey{.group_id = 0, .content_hash = ContentHash{"h0"}}}, 2);
     ASSERT_EQ(reservation.blocks.size(), 1u);
     EXPECT_EQ(coordinator.NumPinnedHostCachedBlocks(), 0);
     EXPECT_TRUE(coordinator.ContainsHostCachedBlock(later));

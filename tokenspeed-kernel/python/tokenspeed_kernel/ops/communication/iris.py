@@ -82,6 +82,45 @@ def discover_iris_world() -> bool:
     return discover_world()
 
 
+def reserve_iris_heap(owner: str, nbytes: int) -> None:
+    """Reserve ``nbytes`` of the shared Iris heap for ``owner``, replacing its
+    earlier reservation. The heap is created with every reservation on top of
+    the size its creator planned, so call this before the heap exists: a live
+    heap does not grow."""
+    from tokenspeed_kernel.ops.communication._iris import reserve_heap
+
+    reserve_heap(owner, nbytes)
+
+
+def iris_heap_bytes(shape: tuple[int, ...], dtype: torch.dtype) -> int:
+    """The heap bytes that an allocation of ``shape`` and ``dtype`` takes,
+    alignment included."""
+    from tokenspeed_kernel.ops.communication._iris import allocation_bytes
+
+    return allocation_bytes(shape, dtype)
+
+
+def iris_symmetric_heap(group: dist.ProcessGroup, rank: int, device: torch.device):
+    """The shared Iris context and the heap addresses of ``group``'s ranks
+    (``rank`` this process's rank in it), once the communication preparation
+    has created the heap. Buffers allocated from the context must have been
+    reserved (``reserve_iris_heap``) before the heap existed.
+
+    Returns:
+        ``(context, iris_group)``: ``context.zeros(shape, dtype=)`` allocates
+        at the same heap offset on every rank; ``iris_group.bases`` holds each
+        rank's heap base, and ``iris_group.finish_prepare()`` ends the group's
+        preparation.
+
+    Raises:
+        RuntimeError: The heap does not exist yet.
+    """
+    from tokenspeed_kernel.ops.communication._iris import IrisGroup, existing_context
+
+    context = existing_context()
+    return context, IrisGroup(context, group, rank, device)
+
+
 def iris_maps_world() -> bool | None:
     """``discover_iris_world``'s cached answer, or None before it ran."""
     from tokenspeed_kernel.ops.communication._iris import maps_world

@@ -1847,6 +1847,7 @@ def _attention_rel_prefill() -> object:
         cu_seqlens_cpu=[0, 4],
         max_seqlen=4,
         softmax_scale=1.0 / 64,
+        output_dtype=None,
     )
 
 
@@ -1871,6 +1872,7 @@ def _attention_rel_extend() -> object:
         max_seqlen_k=128,
         rel_logits=rel_logits,
         softmax_scale=1.0 / 64,
+        output_dtype=None,
     )
 
 
@@ -1896,6 +1898,7 @@ def _attention_rel_extend_page256_sliding() -> object:
         rel_logits=rel_logits,
         window_left=255,
         softmax_scale=1.0 / 128,
+        output_dtype=None,
     )
 
 
@@ -1918,6 +1921,10 @@ def _attention_rel_decode() -> object:
         cu_seqlens_q=cu_seqlens_q,
         max_seqlen_q=1,
         softmax_scale=1.0 / 64,
+        output_dtype=None,
+        return_lse=False,
+        gate=None,
+        sink=None,
     )
 
 
@@ -1941,6 +1948,10 @@ def _attention_rel_decode_page128_sliding() -> object:
         max_seqlen_q=1,
         window_left=127,
         softmax_scale=1.0 / 128,
+        output_dtype=None,
+        return_lse=False,
+        gate=None,
+        sink=None,
     )
 
 
@@ -1966,6 +1977,10 @@ def _attention_rel_decode_multiquery(window_left: int) -> object:
         max_seqlen_q=prediction,
         window_left=window_left,
         softmax_scale=1.0 / 128,
+        output_dtype=None,
+        return_lse=False,
+        gate=None,
+        sink=None,
     )
 
 
@@ -1997,6 +2012,10 @@ def _attention_rel_decode_page256_sliding() -> object:
         max_seqlen_q=1,
         window_left=255,
         softmax_scale=1.0 / 128,
+        output_dtype=None,
+        return_lse=False,
+        gate=None,
+        sink=None,
     )
 
 
@@ -4008,6 +4027,57 @@ def test_legacy_gluon_plans_keep_existing_implementation(
         mi350_platform, weight_dtype=dtype, ispp=width, solution="gluon"
     )
     assert plan["apply_kernel_name"] == expected
+
+
+def _deferred_bf16_plan(platform: PlatformInfo, **overrides) -> dict:
+    """Muse's BF16 expert plan: precomputed routes, caller-normalized."""
+    return _moe_fp8_channel_plan(
+        platform,
+        **{
+            "weight_dtype": "unquant",
+            "requires_deferred_finalize": True,
+            "ep_size": 4,
+            "ispp": 4096,
+            "hidden": 4096,
+            "swiglu_form": None,
+            "num_experts": 256,
+            "top_k": 8,
+            **overrides,
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "platform_fixture,expected",
+    [
+        ("h100_platform", "triton_bf16_routes_moe_apply"),
+        ("b200_platform", "flashinfer_trtllm_unquant_routed_moe_apply"),
+        ("b300_platform", "flashinfer_trtllm_unquant_routed_moe_apply"),
+        ("mi350_platform", "gluon_bf16_routes_moe_apply"),
+    ],
+)
+def test_deferred_bf16_plans_select_a_route_kernel(
+    platform_fixture: str, expected: str, request: pytest.FixtureRequest
+) -> None:
+    if KernelRegistry.get().get_by_name(expected) is None:
+        pytest.skip(f"{expected!r} is not registered on this host")
+    plan = _deferred_bf16_plan(request.getfixturevalue(platform_fixture))
+    assert plan["apply_kernel_name"] == expected
+    assert plan["supports_deferred_finalize"] is True
+
+
+def test_finalizing_bf16_plans_skip_the_route_kernels(
+    h100_platform: PlatformInfo,
+) -> None:
+    plan = _deferred_bf16_plan(
+        h100_platform, requires_deferred_finalize=False, ep_size=1, solution="triton"
+    )
+    assert plan["apply_kernel_name"] == "triton_bf16_precomputed_moe_apply"
+    # The only Triton kernel taking EP BF16 experts cannot finalize.
+    with pytest.raises(kernel_NoKernelFoundError):
+        _deferred_bf16_plan(
+            h100_platform, requires_deferred_finalize=False, solution="triton"
+        )
 
 
 def _select_on(platform: PlatformInfo, *args, **kwargs) -> str:
@@ -8101,3 +8171,83 @@ def test_kernel_api_selection(
         registry.clear_cache()
 
     assert calls == [case.expected]
+
+
+def test_fa3_declares_sinks_from_the_installed_signature(
+    h100_platform: PlatformInfo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An FA3 build without ``sinks`` must not advertise sink support.
+
+    Attention sinks reached FA3 after these entry points stabilized. When the
+    installed build takes no ``sinks`` argument, the kernels have to declare
+    ``sinks=False`` so selection skips them for a sink-bearing graph; declaring
+    True would hand the leaf a graph it cannot serve and fail on an unexpected
+    keyword inside ``flash_attn_with_kvcache``. Reaching the leaf anyway (a
+    caller bypassing selection) must raise rather than silently compute
+    sink-free attention.
+    """
+    if (
+        not Platform.get().is_nvidia
+        or importlib.util.find_spec("flash_attn_interface") is None
+    ):
+        pytest.skip("FA3 registration simulation requires NVIDIA FA3")
+
+    # The has_sinks=True half substitutes nothing: it reads the installed
+    # signature, so it only means anything on a build that takes `sinks`. On an
+    # older build both halves probe False and the assertion below reports the
+    # environment rather than the declaration under test.
+    import inspect as _fa3_inspect
+
+    import flash_attn_interface as _installed_fa3
+
+    if (
+        "sinks"
+        not in _fa3_inspect.signature(_installed_fa3.flash_attn_with_kvcache).parameters
+    ):
+        pytest.skip("the installed FA3 build takes no `sinks` argument")
+
+    real_platform = Platform.get()
+    real_registry = KernelRegistry.get()
+    import flash_attn_interface
+
+    sink_modes = ("fa3_mha_prefill", "fa3_mha_extend_with_kvcache")
+    decode = "fa3_mha_decode_with_kvcache"
+
+    def sinkless_with_kvcache(**kwargs):
+        # The older build's signature: no `sinks` parameter at all.
+        raise AssertionError("the sinkless probe must not be launched")
+
+    try:
+        Platform.override(h100_platform)
+        for has_sinks in (True, False):
+            KernelRegistry.reset()
+            with monkeypatch.context() as patch:
+                if not has_sinks:
+                    patch.setattr(
+                        flash_attn_interface,
+                        "flash_attn_with_kvcache",
+                        sinkless_with_kvcache,
+                    )
+                importlib.reload(_attention_flash_attn)
+                assert _attention_flash_attn._FA3_HAS_SINKS is has_sinks
+                registry = KernelRegistry.get()
+                for name in (*sink_modes, decode):
+                    spec = registry.get_by_name(name)
+                    assert spec is not None, name
+                    assert spec.traits["sinks"] == (
+                        frozenset({False, True}) if has_sinks else frozenset({False})
+                    ), name
+                # A sink that reaches the leaf anyway is named, not dropped.
+                kwargs = _attention_flash_attn._fa3_sink_kwargs
+                assert kwargs(None) == ({"sinks": None} if has_sinks else {})
+                if has_sinks:
+                    sinks = torch.empty((4,), dtype=torch.float32, device="meta")
+                    assert kwargs(sinks) == {"sinks": sinks}
+                else:
+                    with pytest.raises(ValueError, match="takes no attention sinks"):
+                        kwargs(torch.empty((4,), dtype=torch.float32, device="meta"))
+    finally:
+        Platform.override(real_platform)
+        KernelRegistry._instance = real_registry
+        importlib.reload(_attention_flash_attn)

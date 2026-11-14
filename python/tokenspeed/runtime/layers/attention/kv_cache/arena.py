@@ -328,7 +328,11 @@ class CacheArena:
             and field.field_id in self.offload_config.field_ids
         ):
             token_rows = spec.rows_per_page
-        if spec.attn_kind == "state" or field.shape[0] != token_rows:
+        if (
+            spec.attn_kind == "state"
+            or field.shape[0] != token_rows
+            or field.page_stride_bytes != field.payload_bytes
+        ):
             return pages
         return pages.view(-1, *field.shape[1:])
 
@@ -337,7 +341,8 @@ class CacheArena:
 
         The view is shaped the way the field is addressed. A history field whose
         planned shape leads with the prefix grain stores an entry per token,
-        so its page axis is folded away and consumers index entries directly.
+        so its page axis is folded away when pages are contiguous. Padded pages
+        retain the page axis and consumers honor its explicit stride.
         Offloaded fields use their group's physical row grain for this fold.
         Other fields (recurrent state, compressor state, block-scaled scale
         planes, V4's byte-shaped planes) retain page-indexed views.

@@ -24,8 +24,8 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes import plan
 
 # The one classification of a cache group -- the C++ scheduler's AttnKind.
 # ``full_history`` and ``sliding_window`` groups hold rows of token history
-# (the latter keeps only its trailing window resident); a ``state`` group holds
-# whole recurrent states and spans no tokens.
+# (the latter retains its trailing window and optional initial sink); a
+# ``state`` group holds whole recurrent states and spans no tokens.
 AttnKind = Literal["full_history", "sliding_window", "state"]
 ATTN_KINDS: frozenset[str] = frozenset(get_args(AttnKind))
 TransferPolicy = Literal["full_suffix", "latest_snapshot"]
@@ -57,7 +57,7 @@ class CacheGroupSpec:
       ``"full_history"`` and ``"sliding_window"`` kinds: paged KV-cache
       consumers whose CacheBlocks physically hold rows of entries (per-token
       KV, sliding windows, compressed entries). A sliding group keeps only its
-      trailing ``sliding_window_tokens`` resident.
+      trailing ``sliding_window_tokens`` and initial ``sink_tokens`` resident.
     * **No span** -- the ``"state"`` kind: snapshot-style groups
       (recurrent/conv state) whose CacheBlocks each hold one state. A state
       summarizes everything before it, so a block covers no token span and
@@ -91,8 +91,20 @@ class CacheGroupSpec:
     # None permits every natural checkpoint, including decode endpoints;
     # this is not row geometry.
     checkpoint_granularity: int | None = None
+    # Initial tokens retained alongside the trailing window. Zero adds no sink.
+    sink_tokens: int = 0
 
     def __post_init__(self) -> None:
+        if (
+            isinstance(self.sink_tokens, bool)
+            or not isinstance(self.sink_tokens, int)
+            or self.sink_tokens < 0
+        ):
+            raise ValueError("sink_tokens must be a nonnegative integer")
+        if self.sink_tokens and self.attn_kind != "sliding_window":
+            raise ValueError("sink_tokens requires a sliding-window group")
+        if self.sink_tokens and self.replayable:
+            raise ValueError("sink_tokens is not supported with bounded replay")
         if (
             isinstance(self.shard_count, bool)
             or not isinstance(self.shard_count, int)
@@ -266,7 +278,7 @@ def validate_state_checkpoint_in_forward(
             f"{type(attn_backend).__name__} cannot store in-forward State "
             "checkpoints for every State group (supported: GDN with a "
             "checkpointing prefill kernel and a prefix granularity it divides, "
-            "Qwen4-Exp PLE)"
+            "KDA, Qwen4-Exp PLE)"
         )
 
 
@@ -280,10 +292,12 @@ def compute_max_logical_pages_for_capture(
     """Return the decode CUDA Graph block-table width for one cache group.
 
     Decode only: a decode row describes live cache history, so a sliding group
-    is bounded by its window and a state group's row is its two slots
-    whatever the context. Prefill capture fabricates one extend across the
-    whole extent and derives a write column per position in it, so it sizes
-    its own tables -- see ``PrefillGraph._dummy_group_tables``.
+    without sinks is bounded by its window. Sink groups export absolute rows,
+    including holes between the sink and window, so need the full context
+    width. A state group's row is its two slots whatever the context.
+    Prefill capture fabricates one extend across the whole extent and derives
+    a write column per position in it, so it sizes its own tables -- see
+    ``PrefillGraph._dummy_group_tables``.
 
     Decode admission reserves the current verify span plus one span for each
     overlapped schedule.  Include that complete reservation horizon here: a
@@ -312,7 +326,7 @@ def compute_max_logical_pages_for_capture(
         return STATE_TABLE_SLOTS
     block_granularity = spec.block_granularity
     reservation_horizon = (overlap_schedule_depth + 1) * max_tokens_per_req
-    if spec.attn_kind == "sliding_window":
+    if spec.attn_kind == "sliding_window" and not spec.sink_tokens:
         # A window wider than the context retains the whole context; the extra
         # column is the block a window's first row lands in mid-block.
         retained = min(spec.sliding_window_tokens, max_context_len)

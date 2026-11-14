@@ -152,6 +152,10 @@ from tokenspeed.runtime.cache.l2.sizing import (
     RetractionPoolRequest,
     tail_lcm_blocks_per_request,
 )
+from tokenspeed.runtime.distributed.cuda_stack import (
+    restore_cuda_stack,
+    trim_cuda_stack,
+)
 from tokenspeed.runtime.distributed.nccl_suspend import (
     resume_nccl_communicators,
     suspend_nccl_communicators,
@@ -296,6 +300,7 @@ class DeviceSpecs:
     spec_num_tokens: int
     uses_eager_grammar: bool
     supports_disaggregation: bool
+    requires_forward_coordination: bool
     supports_pd_layerwise_finalization: bool
     supports_prompt_logprobs: bool
     cache_state_group_ids: tuple[str, ...]
@@ -404,6 +409,7 @@ class DeviceHandle:
         # Resolved here, on the building thread, whose current device the
         # distributed init set: torch starts every new thread on device 0.
         self._forward_device = _thread_device(executor.device)
+        self._awake_cuda_stack_limit: int | None = None
         # The compact Host cache -- the L2 prefix tier, the retraction
         # snapshot pool, or both -- or None with neither. Behind the handle
         # for the same reason the pools are: its submit path launches
@@ -468,9 +474,12 @@ class DeviceHandle:
         Device-bound copies (``LoadBackOp`` and ``RestoreOp``, ordered behind
         the zeroing and the forwards in flight, which may still write a
         block freed by an abort and granted here; both overwrite their
-        destinations whole), the transfer peer's remote streams, and
-        finally the ``ForwardBatch``. The loop hands the round over and does
-        not branch on it.
+        destinations whole), the transfer peer's remote streams (a
+        D-node remote prefill only prepares its slots here), the
+        ``ForwardBatch``, and last the D-node remote prefill's pull, whose
+        wait on the zeroing fence would otherwise hold the forward's launch
+        until the step in flight ends. The loop hands the round over and
+        does not branch on it.
 
         A store's ``request_pool_index`` names the victim's slot, which the
         scheduler frees in the same plan build: the slot's next owner first
@@ -588,23 +597,27 @@ class DeviceHandle:
             peer.execute(remote_decode)
         if remote_prefill is not None:
             # D role: the prompt prefills on the peer; pull its KV into the
-            # pages this plan admitted (and may be zeroing).
-            self._receive_remote_prefill(remote_prefill, zero_event)
+            # pages this plan admitted (and may be zeroing). The slots are
+            # prepared here; the pull follows the round's forward below.
+            self._prepare_remote_prefill_slots(remote_prefill)
 
         if planned is None:
-            return None
-
-        if self._role is DeviceRole.PD_PREFILL:
+            result = None
+        elif self._role is DeviceRole.PD_PREFILL:
             # A prefill chunk; the host armed its layerwise KV streaming, if
             # on, when it handed this plan over.
-            return self._launch_forward(planned, capture_next_input_ids=True)
+            result = self._launch_forward(planned, capture_next_input_ids=True)
+        else:
+            # Plain engine, or a D-role decode (the D role runs no local
+            # prefill: a retracted request resumes by restore, not by
+            # recompute). A constrained request's matcher was advanced past
+            # the prefill node's token when its RemotePrefillDoneEvent
+            # landed, so masking continues from the right state.
+            result = self._launch_forward(planned)
 
-        # Plain engine, or a D-role decode (the D role runs no local prefill:
-        # a retracted request resumes by restore, not by recompute). A
-        # constrained request's matcher was advanced past the prefill node's
-        # token when its RemotePrefillDoneEvent landed, so masking continues
-        # from the right state.
-        return self._launch_forward(planned)
+        if remote_prefill is not None:
+            self._pull_remote_prefill(remote_prefill, zero_event)
+        return result
 
     @property
     def role(self) -> DeviceRole:
@@ -691,6 +704,17 @@ class DeviceHandle:
             )
         return l2.poll_results()
 
+    def shutdown_model(self) -> None:
+        """Drain local readers, then release shared model weights
+        collectively. Called by the forward thread as its last task, after
+        the last forward's readers: the release joins the other weight
+        owners, who must all reach it."""
+        from tokenspeed.runtime.layers.moe.peer_weights import PeerWeightOwner
+
+        model = self._executor.model_runner.model
+        if isinstance(model, PeerWeightOwner):
+            model.close_peer_weights()
+
     def shutdown_cache(self) -> None:
         """Close the Host cache (the L2 tier and the snapshot pool), once the
         forward thread has stopped, having finished a drafter's pending
@@ -709,21 +733,42 @@ class DeviceHandle:
         self.settle()
         self._executor.execute_idle_forward(dp_metadata)
 
-    def _receive_remote_prefill(self, remote_prefill, zero_event) -> None:
-        """Pull a remote-prefill stream's rows' KV from the peer.
+    def _prepare_remote_prefill_slots(self, remote_prefill) -> None:
+        """Prepare a remote-prefill stream's slots, ahead of the round's
+        forward.
 
         Slot preparation and the cache-length reset touch the execution
         stream, each behind the default stream (the store fence: the slot
         may be a victim's this plan imaged, and its slot-state export reads
-        it on the write stream); the RDMA trigger is CPU-issued but writes
-        the same device pages, so it must follow them and the zeroing fence
+        it on the write stream). Stream-ordered, so it never blocks.
+
+        Args:
+            remote_prefill: The plan's remote-prefill stream; supplies the
+                admitted rows.
+        """
+        executor = self._executor
+        num_extends = remote_prefill.num_extends()
+        executor.prepare_remote_cache_slots(
+            list(remote_prefill.request_pool_indices[:num_extends])
+        )
+        executor.reset_remote_prefill_cache_lengths(remote_prefill)
+
+    def _pull_remote_prefill(self, remote_prefill, zero_event) -> None:
+        """Pull a remote-prefill stream's rows' KV from the peer, behind the
+        round's forward.
+
+        The RDMA trigger is CPU-issued but writes the device pages the slot
+        preparation touched, so it must follow them and the zeroing fence
         (Mooncake and GPUDirect writes are not ordered by the zeroing
         stream, so the destination pages must be published from sanitized
         memory). The same fence covers a retraction's stream-ordered
         write-back reading pages this admission was granted: the zero event
         is recorded on the forward thread's stream AFTER that stream waited
         on the write-back's completion, so waiting on it waits on the copy
-        too. Completion arrives through the transfer events.
+        too. The zeroing is ordered behind the step in flight, so this wait
+        holds the forward thread until that step ends; placed after the
+        round's forward is launched, it never delays that launch. Completion
+        arrives through the transfer events.
 
         Args:
             remote_prefill: The plan's remote-prefill stream; supplies the
@@ -732,12 +777,6 @@ class DeviceHandle:
                 plan zeroes nothing (an admission always zeroes its fresh
                 pages, so a granted request's receive never sees None).
         """
-        executor = self._executor
-        num_extends = remote_prefill.num_extends()
-        executor.prepare_remote_cache_slots(
-            list(remote_prefill.request_pool_indices[:num_extends])
-        )
-        executor.reset_remote_prefill_cache_lengths(remote_prefill)
         if zero_event is not None:
             zero_event.synchronize()
         self._kv_transfer.execute(remote_prefill)
@@ -750,6 +789,19 @@ class DeviceHandle:
         """Wait for all device work before a memory region is unmapped."""
         self.settle()
         self._executor.device_module.synchronize()
+
+    def empty_cache(self) -> None:
+        """Release eager cuBLAS workspaces and allocator blocks after GPU work drains."""
+        if self._forward_device.type == "cuda" and self._executor.config.enforce_eager:
+            # Graphs may retain these addresses; eager GEMMs acquire new workspaces lazily.
+            with allow_host_sync(
+                "release eager cuBLAS workspaces after device work drains"
+            ):
+                self.synchronize()
+                clear = getattr(torch._C, "_cuda_clearCublasWorkspaces", None)
+                if clear is not None:
+                    clear()
+        self._executor.device_module.empty_cache()
 
     def prepare_kv_release(self) -> None:
         """Quiesce everything that can touch the KV arena before it is unmapped.
@@ -805,13 +857,19 @@ class DeviceHandle:
             self._weight_memory.mark_kv_resumed()
 
     def suspend_nccl(self) -> None:
-        """Free the NCCL communicators' buffers; they stay usable after resume."""
-        self.settle()
+        """Drain GPU work and release NCCL buffers, allocator cache and the CUDA stack."""
+        self.synchronize()
         suspend_nccl_communicators()
+        self.empty_cache()
+        if self._forward_device.type == "cuda" and torch.version.hip is None:
+            self._awake_cuda_stack_limit = trim_cuda_stack()
 
     def resume_nccl(self) -> None:
         """Restore the NCCL communicators suspended by :meth:`suspend_nccl`."""
         self.settle()
+        if self._awake_cuda_stack_limit is not None:
+            restore_cuda_stack(self._awake_cuda_stack_limit)
+            self._awake_cuda_stack_limit = None
         resume_nccl_communicators()
 
     def run_remote_prefill_landing(
@@ -1353,12 +1411,16 @@ def probe_arena_floor(
     A narrowing model's decoder ladder (``decoder_rows_per_request`` is its
     ``max_decoder_rows_per_request``, None for other models) fabricates one
     request per that many rows of a bucket no wider than the token ladder's,
-    and never more than ``max_num_seqs``.
+    and never more than ``max_num_seqs``. A chain drafter records its extend
+    rounds' decode steps at every request count up to
+    ``EXTEND_DECODE_MAX_REQUESTS``, and never more than ``max_num_seqs``.
     """
     from tokenspeed.runtime.execution.cudagraph_memory import probe_arena_parent_blocks
+    from tokenspeed.runtime.execution.drafter.base import EXTEND_DECODE_MAX_REQUESTS
     from tokenspeed.runtime.execution.model_executor import (
         _resolve_prefill_graph_max_tokens,
     )
+    from tokenspeed.runtime.utils.server_args import STEP_SPEC_ALGORITHMS
 
     tokens = max(max_forward_tokens, _resolve_prefill_graph_max_tokens(server_args))
     return probe_arena_parent_blocks(
@@ -1369,6 +1431,11 @@ def probe_arena_floor(
             0
             if decoder_rows_per_request is None
             else min(-(-tokens // decoder_rows_per_request), server_args.max_num_seqs)
+        ),
+        drafter_requests=(
+            min(server_args.max_num_seqs, EXTEND_DECODE_MAX_REQUESTS)
+            if server_args.speculative_algorithm in STEP_SPEC_ALGORITHMS
+            else 0
         ),
     )
 
@@ -1803,6 +1870,7 @@ def build_device_side(
         spec_num_tokens=spec_num_tokens,
         uses_eager_grammar=executor.eager_grammar_buffers is not None,
         supports_disaggregation=views.token_to_kv_pool.arena.supports_disaggregation,
+        requires_forward_coordination=server_args.mapping.requires_forward_coordination,
         supports_pd_layerwise_finalization=_supports_pd_layerwise_finalization(
             executor, server_args.mapping
         ),

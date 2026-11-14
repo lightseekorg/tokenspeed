@@ -61,7 +61,10 @@ from tokenspeed.runtime.execution.cudagraph_memory import (
     ladder_from_plan,
 )
 from tokenspeed.runtime.execution.drafter import get_drafter_impl
-from tokenspeed.runtime.execution.drafter.base import DrafterExtendCapture
+from tokenspeed.runtime.execution.drafter.base import (
+    EXTEND_STEP0_SERIES,
+    DrafterExtendCapture,
+)
 from tokenspeed.runtime.execution.drafter.eagle_harness.config import (
     EagleHarnessConfig,
 )
@@ -145,6 +148,7 @@ from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.hf_transformers_utils import get_context_length
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.server_args import ServerArgs
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
@@ -617,6 +621,9 @@ class ModelExecutor:
     ):
         self.device = config.device
         self.config = config
+        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=config.enable_memory_saver
+        )
         self.model_runner = model_runner
         self.sampling_backend = sampling_backend
         self.attn_backend = attn_backend
@@ -646,41 +653,49 @@ class ModelExecutor:
         max_bs = config.max_num_seqs // max(config.data_parallel_size, 1)
 
         spec_num_tokens = config.spec_num_tokens if config.spec_algo is not None else 1
-        self.input_buffers = InputBuffers(
-            max_bs=max_bs,
-            max_num_tokens=max(
-                config.chunked_prefill_size, max_bs * config.output_length
-            ),
-            state_write_padding_pool_index=config.max_req_pool_size,
-            device=self.device,
-            reads_state_checkpoints=config.state_checkpoint_in_forward,
-        )
-        # Group-keyed zeroing requests carry scheduler (virtual) block IDs; this
-        # rank's position in the KVP group selects the pages it owns.
-        self._cache_kvp_rank = model_runner.mapping.attn.kvp_rank
-        ngram_context = engram_context_len(model_runner.model_config.hf_text_config)
-        if ngram_context and (config.pp_size != 1 or config.overlap_schedule_depth > 1):
-            raise NotImplementedError(
-                "Engram input history requires PP=1 and in-flight depth <= 1"
+        with self.memory_saver_adapter.named_region("executor_inputs"):
+            self.input_buffers = InputBuffers(
+                max_bs=max_bs,
+                max_num_tokens=max(
+                    config.chunked_prefill_size, max_bs * config.output_length
+                ),
+                state_write_padding_pool_index=config.max_req_pool_size,
+                device=self.device,
+                reads_state_checkpoints=config.state_checkpoint_in_forward,
             )
-        self.input_buffers.init_ngram_buffers(
-            ngram_context,
-            model_runner.model.get_ngram_hash_parameters() if ngram_context else None,
-            config.input_vocab_size,
-        )
-        self.runtime_states = RuntimeStates(
-            req_pool_size=config.max_req_pool_size,
-            input_vocab_size=config.input_vocab_size,
-            vocab_size=config.vocab_size,
-            device=self.device,
-            output_length=config.output_length,
-        )
-        self.runtime_states.init_ngram_state(ngram_context)
-        self.runtime_states.init_request_token_history(
-            config.physical_context_len
-            if model_runner.model_config.requires_request_token_history
-            else 0
-        )
+            # Group-keyed zeroing requests carry scheduler (virtual) block IDs; this
+            # rank's position in the KVP group selects the pages it owns.
+            self._cache_kvp_rank = model_runner.mapping.attn.kvp_rank
+            ngram_context = engram_context_len(model_runner.model_config.hf_text_config)
+            if ngram_context and (
+                config.pp_size != 1 or config.overlap_schedule_depth > 1
+            ):
+                raise NotImplementedError(
+                    "Engram input history requires PP=1 and in-flight depth <= 1"
+                )
+            self.input_buffers.init_ngram_buffers(
+                ngram_context,
+                (
+                    model_runner.model.get_ngram_hash_parameters()
+                    if ngram_context
+                    else None
+                ),
+                config.input_vocab_size,
+            )
+        with self.memory_saver_adapter.named_region("runtime_states"):
+            self.runtime_states = RuntimeStates(
+                req_pool_size=config.max_req_pool_size,
+                input_vocab_size=config.input_vocab_size,
+                vocab_size=config.vocab_size,
+                device=self.device,
+                output_length=config.output_length,
+            )
+            self.runtime_states.init_ngram_state(ngram_context)
+            self.runtime_states.init_request_token_history(
+                config.physical_context_len
+                if model_runner.model_config.requires_request_token_history
+                else 0
+            )
         # Sized like InputBuffers.max_bs so the padded graph-bucket bs fits.
         self.nan_guard = NanGuard.create(
             config.enable_nan_detection,
@@ -866,7 +881,7 @@ class ModelExecutor:
         if not self.sampling_backend.supports_tree_verify:
             raise NotImplementedError(
                 f"{type(self.sampling_backend).__name__} cannot verify draft trees; "
-                "use --sampling-backend greedy, triton or flashinfer"
+                "use --sampling-backend greedy, triton, flashinfer or sonic"
             )
         if self.draft_attn_backend is self.attn_backend:
             raise NotImplementedError(
@@ -909,24 +924,25 @@ class ModelExecutor:
 
     def _configure_for_pools(self) -> None:
         """Publish the bound pools to the backends and the model's layers."""
-        self.attn_backend.configure_runtime(
-            request_slot_capacity=self.config.max_req_pool_size + 1,
-            cache_group_specs=tuple(self.token_to_kv_pool.arena.cache_group_specs),
-            cache_group_page_counts=_cache_arena_attr(
-                self.token_to_kv_pool, "cache_group_page_counts", None
-            ),
-        )
-        if self.draft_attn_backend is not None:
-            self.draft_attn_backend.configure_runtime(
-                cache_group_specs=tuple(
-                    _cache_arena_attr(
-                        self.draft_token_to_kv_pool, "cache_group_specs", ()
-                    )
-                ),
+        with self.memory_saver_adapter.named_region("attention_state"):
+            self.attn_backend.configure_runtime(
+                request_slot_capacity=self.config.max_req_pool_size + 1,
+                cache_group_specs=tuple(self.token_to_kv_pool.arena.cache_group_specs),
                 cache_group_page_counts=_cache_arena_attr(
-                    self.draft_token_to_kv_pool, "cache_group_page_counts", None
+                    self.token_to_kv_pool, "cache_group_page_counts", None
                 ),
             )
+            if self.draft_attn_backend is not None:
+                self.draft_attn_backend.configure_runtime(
+                    cache_group_specs=tuple(
+                        _cache_arena_attr(
+                            self.draft_token_to_kv_pool, "cache_group_specs", ()
+                        )
+                    ),
+                    cache_group_page_counts=_cache_arena_attr(
+                        self.draft_token_to_kv_pool, "cache_group_page_counts", None
+                    ),
+                )
 
         # Storage is the plan's decision: stamp each attention layer's cache
         # group from the pool and check the group retains what the layer's
@@ -1055,6 +1071,7 @@ class ModelExecutor:
             token_to_kv_pool=self.token_to_kv_pool,
             input_buffers=self.input_buffers,
             config=self.config,
+            memory_saver_adapter=self.memory_saver_adapter,
             drafter=self.drafter,
             graph_supported=self._graph_support.prefill_graph,
         )
@@ -1125,24 +1142,24 @@ class ModelExecutor:
     def _drafter_extend_plan(self) -> dict[str, list[tuple[int, int]]]:
         """The drafter's extend graphs this boot records, per series.
 
-        Only with ``--enable-drafter-prefill-graph``, the target's prefill
-        graph on, and a drafter that can capture them in this configuration;
-        they share the target's token buckets and capture each at the
-        bucket's exact request counts (``--prefill-graph-capture-batch-sizes``,
-        unset: the fewest requests that fit the bucket in the context length).
-        The capture and the projection read this one plan, so they reach the
-        same verdict.
+        Only with the target's prefill graph on and a drafter that can capture
+        them in this configuration. The decode steps' graphs are recorded at
+        each request count from 1 to ``EXTEND_DECODE_MAX_REQUESTS`` (at most
+        the batch); the step-0 graphs (``--enable-drafter-prefill-graph``)
+        share the target's token buckets and are captured at the bucket's
+        exact request counts
+        (``--prefill-graph-capture-batch-sizes``, unset: the fewest requests
+        that fit the bucket in the context length). The capture and the
+        projection read this one plan, so they reach the same verdict.
         """
-        if (
-            not self.config.enable_drafter_prefill_graph
-            or self.prefill_graph.disable
-            or self.drafter is None
-        ):
+        if self.prefill_graph.disable or self.drafter is None:
             return {}
         plan = self.drafter.extend_graph_plan(
             self.prefill_graph.capture_buckets,
             partial(resolve_prefill_capture_batch_sizes, self.config),
         )
+        if not self.config.enable_drafter_prefill_graph:
+            plan.pop(EXTEND_STEP0_SERIES, None)
         return {series: entries for series, entries in plan.items() if entries}
 
     @property
@@ -1152,18 +1169,18 @@ class ModelExecutor:
 
     def _validate_drafter_extend_graphs(self) -> None:
         """Refuse ``--enable-drafter-prefill-graph`` when this boot would
-        record no drafter graph.
+        record no step-0 graph.
 
         ``ServerArgs.validate_drafter_prefill_graph`` refuses the launches the
         arguments decide; whether the prefill graph is on and whether the
         drafter supports its loaded draft model are known only here.
 
         Raises:
-            ValueError: The switch is on and the plan is empty.
+            ValueError: The switch is on and the plan has no step-0 series.
         """
         if (
             not self.config.enable_drafter_prefill_graph
-            or self.captures_drafter_extend_graphs
+            or EXTEND_STEP0_SERIES in self._drafter_extend_plan()
         ):
             return
         if self.prefill_graph.disable:
@@ -1198,7 +1215,10 @@ class ModelExecutor:
         )
 
     def autotune(self, *, keep_loaded_tactics: bool) -> None:
-        """Warm encountered kernels and optionally tune missing FlashInfer tactics; a reload keeps the tactics this process holds."""
+        """Warm kernels on the serving stream and optionally tune missing tactics.
+
+        A forward reload keeps the tactics already loaded by this process.
+        """
 
         per_rank_max_batch = max(
             1,
@@ -1259,10 +1279,16 @@ class ModelExecutor:
         )
 
         tic = time.time()
+        # Prefill can bind workspace state on first use. Prepare and run the
+        # dummy batch on the serving stream after the caller's device writes.
+        self.execution_stream.wait_stream(
+            self.device_module.current_stream(self.device)
+        )
         set_autotune_process_group(cpu_group)
         try:
             # Capture later refreshes the metadata created here in place.
             with (
+                self.device_module.stream(self.execution_stream),
                 torch.no_grad(),
                 kernel_warmup(enabled=True),
                 autotune(tune_mode=tune_mode, tuning_buckets=None, round_up=None),
@@ -1304,6 +1330,7 @@ class ModelExecutor:
                             **self._model_input_kwargs(num_tokens, ctx.bs, rows),
                         )
                     if self.drafter is not None:
+                        self.drafter.warmup_extend(num_tokens)
                         self._autotune_draft_experts(num_tokens)
                     if self.drafter is not None and not self.config.prefill_only:
                         # Prefill-only roles do not allocate decode/verify scratch.
@@ -1584,6 +1611,7 @@ class ModelExecutor:
                 ctx,
                 input_ids,
                 self._active_multimodal_context,
+                request_token_history=model_kwargs.get("request_token_history"),
             )
         if (
             mode is not None
@@ -2047,6 +2075,8 @@ class ModelExecutor:
                     )
             self._record_draft_final_cache_step(ctx.num_extends)
 
+        if self.capturable_grammar is not None:
+            self.capturable_grammar.join_post_sampler()
         return (
             output_tokens,
             accept_lengths,
@@ -2126,8 +2156,8 @@ class ModelExecutor:
         (RuntimeStates.future_draft_q, allocated by its bind_sampling_backend).
         The step drafters and DSpark sample from full-vocab logits and need
         the dense rows: whole-vocabulary rows, or this rank's columns when
-        the drafter samples from its own vocabulary shard
-        (``_draft_probs_columns``).
+        the verifier reads q per shard and the drafter can record them
+        (``_draft_probs_shard``).
         """
         if not config.enable_speculative_sampling or config.spec_draft_tree:
             return
@@ -2140,15 +2170,18 @@ class ModelExecutor:
             self.runtime_states.init_draft_probs(
                 spec_num_tokens=spec_num_tokens,
                 reject_threshold=config.spec_reject_draft_prob_threshold,
-                columns=self._draft_probs_columns(),
+                shard=self._draft_probs_shard(),
             )
 
-    def _draft_probs_columns(self) -> int | None:
-        """This rank's vocabulary columns when the drafter records q over its shard, else None for whole rows.
+    def _draft_probs_shard(self) -> tuple[int, int] | None:
+        """This rank's ``(first token, columns)`` when the drafter records q over its shard, else None for whole rows.
 
-        It does when the target's sampled rows stay vocab-sharded, the
-        verifier reads q per shard, and the drafter samples each step from a
-        head sharded alike; then no draft step gathers its logits.
+        It does when the target's sampled rows stay vocab-sharded and the
+        verifier reads q per shard. A drafter sampling each step from a head
+        sharded alike then never gathers its logits; a hot-token head
+        (Eagle3 ``d2t``), whose columns do not line up with the target's
+        shards, gathers them and records only the columns of its tokens that
+        fall in this rank's shard.
         """
         if (
             self.drafter is None
@@ -2157,16 +2190,22 @@ class ModelExecutor:
         ):
             return None
         shard = self.model_runner.model.lm_head.shard_indices
-        if not self.drafter.keep_draft_logits_vocab_sharded(
-            self.sampling_backend.supports_vocab_shard,
-            int(shard.org_vocab_start_index),
+        vocab_start = int(shard.org_vocab_start_index)
+        if self.drafter.keep_draft_logits_vocab_sharded(
+            self.sampling_backend.supports_vocab_shard, vocab_start
         ):
+            logger.info(
+                "Draft steps stay vocab-sharded: each rank samples its shard and "
+                "records q over its own columns"
+            )
+        elif self.drafter.draft_vocab_map() is not None:
+            logger.info(
+                "Draft steps gather the hot-token head's logits and each rank "
+                "records q over its own columns"
+            )
+        else:
             return None
-        logger.info(
-            "Draft steps stay vocab-sharded: each rank samples its shard and "
-            "records q over its own columns"
-        )
-        return int(shard.num_org_elements)
+        return vocab_start, int(shard.num_org_elements)
 
     def _build_sampling_info(self, bs: int, num_extends: int) -> SamplingBatchInfo:
         return SamplingBatchInfo(
@@ -2789,17 +2828,10 @@ class ModelExecutor:
                     output_layout=output_layout,
                     query_shard=query_shard,
                 )
-                if self.config.data_parallel_size > 1:
-                    if dp_metadata is None:
-                        raise RuntimeError(
-                            "DP forward metadata must be gathered on CPU by "
-                            "the event loop before model execution."
-                        )
-                    ctx.global_num_tokens = dp_metadata.global_num_tokens
-                    ctx.global_bs = dp_metadata.global_batch_size
-                    ctx.global_num_decodes = dp_metadata.global_num_decodes
-                    ctx.all_decode_or_idle = dp_metadata.all_decode_or_idle
-                    ctx.all_extend = dp_metadata.all_extend
+                ctx.apply_dp_metadata(
+                    dp_metadata,
+                    required=self.model_runner.mapping.requires_forward_coordination,
+                )
                 with nvtx_range("sampling_prep", color="yellow"):
                     sampling_start = time.perf_counter() if timing_enabled else 0.0
                     sampling_info = self._build_sampling_info(bs, num_extends)

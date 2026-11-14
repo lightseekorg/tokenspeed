@@ -305,6 +305,9 @@ class _AutotuneExecutor:
         self._model_input_kwargs_hook = model_input_kwargs
         self._events = events
         self.device = "cpu"
+        # autotune() runs its dummy forwards on the serving stream.
+        self.device_module = torch.get_device_module(self.device)
+        self.execution_stream = self.device_module.Stream()
         # The stub gathers whole sampled rows, so autotune() runs no
         # vocab-shard warmup.
         self._samples_from_vocab_shard = False
@@ -315,6 +318,18 @@ class _AutotuneExecutor:
     def _autotune_draft_experts(self, num_tokens):
         assert tuning_module.is_warming_up()
         self._events.append(("draft_experts", num_tokens))
+
+
+class _DrafterDouble:
+    """Records the startup's extend warmup (``BaseDrafter.warmup_extend``); a
+    real drafter needs a draft model and its runner."""
+
+    def __init__(self, events):
+        self._events = events
+
+    def warmup_extend(self, num_tokens):
+        assert tuning_module.is_warming_up()
+        self._events.append(("draft_extend", num_tokens))
 
 
 class _ProcessGroupManagerDouble:
@@ -410,7 +425,7 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
         forward_step=_ForwardStepDouble(
             warmup_decode_path=draft, max_decode_bs=max_decode_bs
         ),
-        drafter=object() if speculative else None,
+        drafter=_DrafterDouble(events) if speculative else None,
         model_input_kwargs=lambda n, bs, rows: {
             "engram_hash_ids": ngram_history[rows],
             "engram_token_mask": ngram_mask[rows],
@@ -458,7 +473,10 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
             "scrub",
             ("target", (32 if chunk_size < 0 else chunk_size)),
             *(
-                [("draft_experts", (32 if chunk_size < 0 else chunk_size))]
+                [
+                    ("draft_extend", (32 if chunk_size < 0 else chunk_size)),
+                    ("draft_experts", (32 if chunk_size < 0 else chunk_size)),
+                ]
                 if speculative
                 else []
             ),
@@ -607,7 +625,7 @@ def test_decode_only_attention_tunes_on_a_decode_step(
         forward_step=_ForwardStepDouble(
             warmup_decode_path=warmup, max_decode_bs=8, max_tokens_per_req=3
         ),
-        drafter=object() if speculative else None,
+        drafter=_DrafterDouble(events) if speculative else None,
         model_input_kwargs=no_extend_inputs,
         events=events,
     )
@@ -1286,7 +1304,9 @@ def test_situ_shared_launcher_preserves_ep_routing_and_return_contract(
     )
     fi = _FiMoeDouble(output if finalize else deferred)
     monkeypatch.setattr(mxfp4_module, "trtllm_fp4_block_scale_moe", fi)
-    monkeypatch.setattr(mxfp4_module, "trtllm_fp4_block_scale_routed_moe", fi)
+    monkeypatch.setattr(
+        mxfp4_module, "tokenspeed_trtllm_fp4_block_scale_routed_moe", fi
+    )
     monkeypatch.setattr(tuning_module, "_autotune_max_num_tokens", 9216)
     w = _RoutedWeightsDouble()
     logits = torch.randn(3, 8, dtype=torch.bfloat16)
@@ -1369,7 +1389,7 @@ class _FiGemmDouble:
         self.dispatches = []
         self._dispatch = dispatch
 
-    def _get_cache_buf(self, name, size, device):
+    def _get_stream_cache_buf(self, name, size, device):
         self.cache_buf_requests.append((name, size, device))
         return self.workspace
 

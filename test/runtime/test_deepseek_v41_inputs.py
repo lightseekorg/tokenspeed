@@ -812,6 +812,7 @@ def test_executor_input_capacity_covers_decode_capture(
         device="cpu",
         max_num_seqs=4,
         data_parallel_size=1,
+        enable_memory_saver=False,
         spec_algo="DSPARK" if width > 1 else None,
         spec_num_tokens=width,
         chunked_prefill_size=chunk_size,
@@ -965,6 +966,9 @@ def test_autotune_passes_engram_views_and_resets_dummy_inputs(
     runner.is_generation = True
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.device = ib.device
+    # autotune() runs its dummy forwards on the serving stream.
+    executor.device_module = torch.get_device_module(ib.device)
+    executor.execution_stream = executor.device_module.Stream()
     executor.config = SimpleNamespace(
         max_num_seqs=2,
         data_parallel_size=1,

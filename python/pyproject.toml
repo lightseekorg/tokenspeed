@@ -66,17 +66,13 @@ dependencies = [
     "tiktoken",
     "torch",
     "torchvision",
-    "tokenspeed-kernel>=0.1.4.dev0",
+    "tokenspeed-kernel>=0.1.5.dev0",
     "tokenspeed-mooncake>=0.3.13.post20261026",
     "tokenspeed-engine>=0.1.0",
     "tokenspeed-scheduler>=0.1.54",
-    "tokenspeed-smg==1.15.0.post20261110",
+    "tokenspeed-smg==1.16.0.post20261113",
     "tokenspeed-smg-grpc-proto==0.4.28.post20261109",
     "tokenspeed-smg-grpc-servicer==0.15.0.post20261110",
-    # Tag-capable sleep/wake allocator (region(tag, enable_cpu_backup)/pause/
-    # resume). Bundles cu12/cu13 binaries; import-guarded so it's a no-op unless
-    # --enable-memory-saver is set. See runtime/utils/torch_memory_saver_adapter.py.
-    "torch_memory_saver==0.0.9.post1",
     "tqdm",
     "transformers==5.12.0",
     "uv",

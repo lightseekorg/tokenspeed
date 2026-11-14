@@ -35,7 +35,8 @@ namespace tokenspeed {
 struct SchedulerConfig {
     std::int32_t prefix_granularity{};
     struct AllocatorConfig {
-        // Page 0 is the null placeholder, so usable = total - 1.
+        // Page 0 is the null placeholder, so usable = total - 1. Validate
+        // rejects a negative total_pages, which could wrap this.
         std::int32_t total_pages{};
         std::int32_t NumUsableBlocks() const { return total_pages - 1; }
     };
@@ -54,7 +55,8 @@ struct SchedulerConfig {
     // Test knob: every |N| plans the fused/D grammar retracts the oldest
     // quiescent Decoding request (N > 0) or the one Prefilling request
     // between its chunks (N < 0), bypassing ReserveCoversGeneration but not
-    // the image-fit refusal. 0 is off; non-zero requires a snapshot pool.
+    // the image-fit refusal. 0 is off; non-zero requires a snapshot pool;
+    // INT32_MIN, with no magnitude in int32, is rejected.
     // Lives here so every mirrored rank decides identically.
     std::int32_t debug_force_retraction_interval{0};
 
@@ -83,6 +85,15 @@ struct SchedulerConfig {
         return HasHostCache() && role != Role::kD && host_write_policy == HostWritePolicy::kWriteThrough;
     }
 
+    // Whether a request's completed pages are published into the Device index
+    // as it computes and when it finishes, for later admissions to match.
+    // Without prefix caching no admission matches either tier or prefetches
+    // from L3, so a published page would only hold its block until an
+    // allocation evicted it, and a Host copy of it would never be read. A
+    // retraction publishes its victim regardless; with a Host cache the
+    // image's L2 leg is built from that publication.
+    bool PublishesCompletedPages() const { return !disable_prefix_cache; }
+
     std::int32_t max_scheduled_tokens{};
     // Sum of ceil((cached prefix + this chunk) / prefix_granularity) across
     // all local prefill requests in one batch. Zero leaves this unbounded.
@@ -96,6 +107,7 @@ struct SchedulerConfig {
     bool disable_l2_cache{false};
     bool enable_l3_storage{false};
     std::optional<StorageConfig> storage_config;
+    // Device residency events require at least one continuous Full/history group.
     bool enable_kv_cache_events{false};
     bool enable_mixed_prefill_decode{false};
     // Fused role only: decode rounds owed after a local prefill round

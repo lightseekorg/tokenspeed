@@ -25,7 +25,7 @@
 Dummy batches balance tokens across the selected nonempty request count.
 The embedding lookup stays OUTSIDE
 the captured region: graphs start from a static input-embeds buffer, filled at
-replay by an eager ``embed_tokens`` gather (text) or by precomputed merged
+replay by the model's decoder-input lookup (text) or by precomputed merged
 embeddings (multimodal, via the model's ``multimodal_input_embeds`` seam).
 Capture borrows the decode
 :class:`~tokenspeed.runtime.execution.forward_step.ForwardStepRunner`'s
@@ -61,6 +61,7 @@ from __future__ import annotations
 import bisect
 import os
 import zlib
+from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, NamedTuple, Protocol, runtime_checkable
@@ -84,6 +85,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     ForwardMode,
 )
 from tokenspeed.runtime.execution.forward_step import prepare_draft_extend_metadata
+from tokenspeed.runtime.execution.history_embedding import HistoryEmbeddingModel
 from tokenspeed.runtime.execution.memory_delta import MemoryDeltaObserver
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
@@ -104,6 +106,7 @@ from tokenspeed.runtime.utils.common import (
     get_available_gpu_memory,
     maybe_inference_mode,
 )
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = get_colorful_logger(__name__)
 
@@ -112,6 +115,9 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.forward_step import ForwardStepRunner
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
     from tokenspeed.runtime.execution.model_executor import ModelExecutorConfig
+    from tokenspeed.runtime.execution.request_token_history import (
+        RequestTokenHistoryView,
+    )
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
@@ -302,6 +308,29 @@ def text_and_inner_model(
     return text_model, getattr(text_model, "model", None)
 
 
+def input_embedding(
+    model, *, requires_request_token_history: bool
+) -> Callable[..., torch.Tensor] | None:
+    """Resolve the inner model's eager embedding, or None when unsupported."""
+    text_model, inner = text_and_inner_model(model)
+    embed_tokens = getattr(inner, "embed_tokens", None)
+    if embed_tokens is None:
+        return None
+    if isinstance(inner, HistoryEmbeddingModel):
+        return inner.compute_input_embeddings
+    if requires_request_token_history:
+        return None
+    # A model whose decoder input transforms the lookup supplies its own.
+    get_input_embedding = getattr(text_model, "get_decoder_input_embedding", None)
+    if get_input_embedding is not None:
+        embed_tokens = get_input_embedding()
+
+    def compute_input_embeddings(input_ids, ctx, *, request_token_history):
+        return embed_tokens(input_ids)
+
+    return compute_input_embeddings
+
+
 def narrowing_prefill_model(model) -> NarrowingPrefillModel | None:
     """The narrowing model a prefill capture would drive, or ``None``.
 
@@ -408,6 +437,7 @@ class PrefillGraph:
         token_to_kv_pool: KV pool the dummy batch points at (reserved dummy slot).
         input_buffers: The shared static input buffers the graphs read from.
         config: Model-executor config (buckets, DP/world topology, device).
+        memory_saver_adapter: Executor-owned adapter for persistent graph metadata.
         drafter: If present, aux-hidden capture (EAGLE3/MTP) is baked into the
             captured graphs.
     """
@@ -419,23 +449,33 @@ class PrefillGraph:
         token_to_kv_pool,
         input_buffers: InputBuffers,
         config: ModelExecutorConfig,
+        memory_saver_adapter: TorchMemorySaverAdapter,
         drafter=None,
         num_warmup: int = 3,
         graph_supported: bool = True,
     ) -> None:
         model = model_runner.model if model_runner is not None else None
-        # Multimodal seam: models whose multimodal path is embeds-only expose
-        # multimodal_input_embeds; others (e.g. deepstack) replay text only.
-        self._multimodal_input_embeds = getattr(model, "multimodal_input_embeds", None)
+        requires_history = (
+            model_runner is not None
+            and model_runner.model_config.requires_request_token_history
+        )
+        # The multimodal seam does not consume or append token history.
+        self._multimodal_input_embeds = (
+            None
+            if requires_history
+            else getattr(model, "multimodal_input_embeds", None)
+        )
         self.text_model, self.inner_model = text_and_inner_model(model)
-        # Embedding runs eagerly OUTSIDE the graphs (see capture); the graphs
-        # read a static input-embeds buffer instead of gathering from input_ids.
-        self._embed_tokens = getattr(self.inner_model, "embed_tokens", None)
+        # Both embeddings run eagerly before graph padding, through one callable.
+        self._compute_input_embeddings = input_embedding(
+            model, requires_request_token_history=requires_history
+        )
         self._input_embeds_buf: torch.Tensor | None = None
         self.attn_backend = attn_backend
         self.token_to_kv_pool = token_to_kv_pool
         self.input_buffers = input_buffers
         self.config = config
+        self.memory_saver_adapter = memory_saver_adapter
         self.drafter = drafter
         self.num_warmup = num_warmup
         self.dp_size = config.data_parallel_size
@@ -461,18 +501,18 @@ class PrefillGraph:
             or not graph_supported
             or not self.capture_buckets
             or self.inner_model is None
-            or self._embed_tokens is None
+            or self._compute_input_embeddings is None
             or model_runner is None
             or not model_runner.is_generation
-            # The graph's embedding seam takes input_ids alone; an embedding
-            # that reads request-token history stays eager.
-            or model_runner.model_config.requires_request_token_history
             # DP replay decisions must come from replicated state, and a
             # forward's multimodal-ness is rank-local: one rank running its mm
             # prefill eager while text-only peers replay desyncs the EP
             # collectives. Until the DP metadata gather carries a multimodal
             # flag, keep the graph off for multimodal models under DP.
-            or (config.data_parallel_size > 1 and model_runner.is_multimodal)
+            or (
+                config.data_parallel_size > 1
+                and model_runner.model_config.is_multimodal_active
+            )
             # The narrowed row count is rank-local (which prompts complete on
             # this rank), so the decoder bucket -- and the collective shapes
             # its graph bakes -- would differ across ranks; the stages also
@@ -565,7 +605,7 @@ class PrefillGraph:
         """
         if self.disable:
             return
-        weight = self._embed_tokens.weight
+        weight = self.inner_model.embed_tokens.weight
         self._input_embeds_buf = torch.zeros(
             max(self.capture_buckets),
             weight.shape[1],
@@ -578,11 +618,12 @@ class PrefillGraph:
         self._encoders.clear()
         self._decoders.clear()
         self._captured_load_tracker = self.token_to_kv_pool.layerwise_load_tracker
-        self.attn_backend.init_prefill_graph_state(
-            max_num_tokens=max(self.capture_buckets),
-            max_bs=int(self.config.max_num_seqs)
-            // max(int(self.config.data_parallel_size), 1),
-        )
+        with self.memory_saver_adapter.named_region("attention_state"):
+            self.attn_backend.init_prefill_graph_state(
+                max_num_tokens=max(self.capture_buckets),
+                max_bs=int(self.config.max_num_seqs)
+                // max(int(self.config.data_parallel_size), 1),
+            )
         with maybe_inference_mode():
             self._capture_all_buckets(decode_wrapper, entries, observer)
             if self._narrowing is not None:
@@ -619,9 +660,7 @@ class PrefillGraph:
                 )
             minimum_bs = dummy_batch_size(bucket, self.config.context_len)
             self._ctx = self.make_dummy_batch(bucket, minimum_bs)
-            self._land_input_embeds(
-                self._embed_tokens(self.input_buffers.input_ids_buf[:bucket]), bucket
-            )
+            self._input_embeds_buf[:bucket].zero_()
             self._captured_hidden_mode = self._ctx.capture_hidden_mode
             # Breaks record the ambient dummy ctx; it is rebound live at replay.
             try:
@@ -734,9 +773,7 @@ class PrefillGraph:
                 )
             bs = -(-rows // per_request)
             self._ctx = self.make_dummy_batch(rows, bs)
-            self._land_input_embeds(
-                self._embed_tokens(self.input_buffers.input_ids_buf[:rows]), rows
-            )
+            self._input_embeds_buf[:rows].zero_()
             statics = self._narrowing.allocate_decoder_state(rows)
             try:
                 with active_forward(self._ctx):
@@ -1340,7 +1377,7 @@ class PrefillGraph:
 
         A forward carrying multimodal inputs replays only when the model
         exposes the embeds-only ``multimodal_input_embeds`` seam; models with
-        extra per-layer inputs (deepstack) run eager.
+        extra per-layer inputs (deepstack) or request-token history run eager.
         """
         if multimodal_context is not None and self._multimodal_input_embeds is None:
             return False
@@ -1351,14 +1388,18 @@ class PrefillGraph:
         ctx: ForwardContext,
         input_ids: torch.Tensor,
         multimodal_context=None,
+        *,
+        request_token_history: RequestTokenHistoryView | None,
     ):
         """Replay the captured graph for ``ctx`` (caller checked :meth:`can_run`).
 
         The embedding runs eagerly here, outside the graph: a plain text
-        prefill gathers ``embed_tokens(input_ids)`` into the static buffer; a
+        prefill calls the decoder-input lookup into the static buffer; a
         multimodal prefill builds the merged text+vision embeddings via the
         model's ``multimodal_input_embeds`` seam (vision encoder included)
-        instead -- both replay the same graphs. Then the inner stack replays
+        instead. An inner model with ``compute_input_embeddings`` computes its
+        embeddings from the live context and request-token history here too.
+        All three consume the same static buffer. Then the inner stack replays
         over the padded bucket and the model's eager logits tail finishes on
         the real-token rows.
         """
@@ -1371,10 +1412,11 @@ class PrefillGraph:
             input_embeds = self._multimodal_input_embeds(
                 input_ids, ctx, multimodal_context
             )
-        self._land_input_embeds(
-            input_embeds if input_embeds is not None else self._embed_tokens(input_ids),
-            bucket,
-        )
+        if input_embeds is None:
+            input_embeds = self._compute_input_embeddings(
+                input_ids, ctx, request_token_history=request_token_history
+            )
+        self._land_input_embeds(input_embeds, bucket)
         # Re-pad tail rows: they hold the previous forward's residue, which captured kernels consume.
         if num_tokens < bucket:
             ib = self.input_buffers

@@ -82,6 +82,7 @@ from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3Model,
 )
 from tokenspeed.runtime.utils import add_prefix, set_weight_attrs
+from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.device_stream import is_current_stream_capturing
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
@@ -339,7 +340,10 @@ class GlmDsaSparseAttentionMixin:
     ``weights_softmax_scale``), ``index_topk``, ``skip_indexer_topk``,
     ``is_nextn``, the decode top-k workspaces
     ``_decode_topk_indices_buffer`` / ``_decode_topk_lens_buffer`` /
-    ``_retired_decode_workspaces``, and ``prefill_topk_tp_split``.
+    ``_retired_decode_workspaces``, ``prefill_topk_tp_split``, and
+    ``decode_topk_fork``: a :class:`StreamFork` whose open scope runs a
+    decode round's top-k beside the query absorption (``StreamFork(None)``
+    keeps it on the main stream).
 
     ``prefill_topk_tp_split`` lets a host whose indexer is replicated on every
     attention-TP rank divide the prefill top-k rows among those ranks: each
@@ -1382,10 +1386,12 @@ class GlmDsaSparseAttentionMixin:
                     num_prefill_tokens,
                 )
             if ctx.num_extends < ctx.bs:
-                shared_topk.decode = self._compute_decode_topk_indices(
-                    indexer_output,
-                    ctx,
-                )
+                # After the index-K write; decode joins before attention reads it.
+                with self.decode_topk_fork.branch_after_main():
+                    shared_topk.decode = self._compute_decode_topk_indices(
+                        indexer_output,
+                        ctx,
+                    )
 
         q = self.q_b_proj(q_norm)[0] if projected_q is None else projected_q
         attn_output = torch.empty(
@@ -1428,17 +1434,22 @@ class GlmDsaSparseAttentionMixin:
                 raise RuntimeError(
                     "GLM DSA sparse decode requires computed top-k indices."
                 )
+            Q = self.forward_absorb_qkv_proj(
+                q[decode_start:decode_end],
+                latent_cache[decode_start:decode_end],
+                positions[decode_start:decode_end],
+                decode_ctx,
+                decode_locs,
+            )
+            self.decode_topk_fork.join()
             topk_indices, topk_lens = self._slice_decode_topk(
                 shared_topk.decode,
                 decode_start,
                 decode_end,
             )
-            self.forward_absorb(
-                positions[decode_start:decode_end],
-                q[decode_start:decode_end],
-                latent_cache[decode_start:decode_end],
+            self.forward_absorb_attn_v_proj(
+                Q,
                 decode_ctx,
-                decode_locs,
                 attn_output[decode_start:decode_end],
                 topk_indices=topk_indices,
                 topk_lens=topk_lens,
@@ -1637,6 +1648,7 @@ class GlmMoeDsaAttention(GlmDsaSparseAttentionMixin, DeepseekV3AttentionMLA):
         self._decode_topk_indices_buffer: torch.Tensor | None = None
         self._decode_topk_lens_buffer: torch.Tensor | None = None
         self._retired_decode_workspaces: list[torch.Tensor] = []
+        self.decode_topk_fork = StreamFork(None)
 
     @break_point
     def forward(

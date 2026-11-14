@@ -20,14 +20,17 @@
 
 #include "cache/coordinator/cache_coordinator.h"
 
+#include "core/profile_span.h"
 #include "cache/coordinator/eviction_plan.h"
 
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstddef>
 #include <functional>
 #include <limits>
 #include <memory>
+#include <memory_resource>
 #include <numeric>
 #include <optional>
 #include <tuple>
@@ -44,8 +47,8 @@
 
 namespace tokenspeed {
 
-SessionCacheOwner CacheCoordinator::sessionTag(const std::string& id) {
-    auto& weak = session_tags_[id];
+SessionCacheOwner CacheCoordinator::cacheOwnerTag(const std::string& id, CacheOwnerTags& registry) {
+    auto& weak = registry[id];
     if (auto tag = weak.lock(); tag && !tag->ended) {
         tag->demoted = false;
         return tag;
@@ -56,6 +59,7 @@ SessionCacheOwner CacheCoordinator::sessionTag(const std::string& id) {
     if (++session_tags_since_sweep_ >= 4096) {
         session_tags_since_sweep_ = 0;
         std::erase_if(session_tags_, [](const auto& entry) { return entry.second.expired(); });
+        std::erase_if(cache_group_tags_, [](const auto& entry) { return entry.second.expired(); });
     }
     return tag;
 }
@@ -94,14 +98,23 @@ std::size_t CacheCoordinator::DemoteSession(const std::string& session_id, bool 
 }
 
 std::size_t CacheCoordinator::DemoteSessions(const std::vector<std::string>& ids, bool ended) {
+    return demoteCacheOwners(ids, ended, session_tags_);
+}
+
+std::size_t CacheCoordinator::DemoteCacheGroups(const std::vector<std::string>& ids, bool ended) {
+    return demoteCacheOwners(ids, ended, cache_group_tags_);
+}
+
+std::size_t CacheCoordinator::demoteCacheOwners(const std::vector<std::string>& ids, bool ended,
+                                                CacheOwnerTags& registry) {
     std::vector<SessionCacheOwner> owners;
     std::unordered_set<const SessionCacheTag*> tags;
     for (const auto& id : ids) {
-        auto it = session_tags_.find(id);
-        if (it == session_tags_.end()) continue;
+        auto it = registry.find(id);
+        if (it == registry.end()) continue;
         auto tag = it->second.lock();
         if (!tag) {
-            session_tags_.erase(it);
+            registry.erase(it);
             continue;
         }
         tag->demoted = true;
@@ -162,6 +175,7 @@ CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t 
                                    std::int32_t checkpoint_retention_leaf_distance)
     : groups_{std::move(groups)},
       pool_{pool},
+      active_parents_{pool},
       host_pool_{host_pool},
       snapshot_pool_{snapshot_pool},
       stream_device_cache_to_host_{stream_device_cache_to_host && host_pool != nullptr},
@@ -201,6 +215,9 @@ CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t 
         _assert(groups_[i].Allocator().ShardCount() == groups_[i].Spec().shard_count,
                 "group allocator shard count must match its group spec");
         const auto& spec = groups_[i].Spec();
+        if (groups_[i].Matcher().IsPrefixClosed()) {
+            routing_history_groups_.push_back(i);
+        }
         _assert(spec.checkpoint_granularity >= 1, "checkpoint grain must be positive");
         if (spec.checkpoint_granularity > 1) {
             _assert(spec.attn_kind == AttnKind::kState, "only State groups constrain checkpoints");
@@ -290,7 +307,7 @@ bool CacheCoordinator::ClearDeviceCache() {
     // Every plan drains what its admissions and restores recorded; a clear
     // runs between plans and drops what it evicts.
     _assert(evicted_segments_.empty(), "a cache clear runs with no eviction left undrained");
-    std::vector<std::pair<std::uint32_t, CacheBlockLocation>> cached_locations;
+    VictimSet cached{std::pmr::get_default_resource()};
     for (const CacheGroup& group : groups_) {
         const PrefixCacheIndex& index = group.Index();
         const std::vector<PrefixCacheIndex::EvictionCandidate> group_entries = index.EvictableCandidates(pool_);
@@ -298,16 +315,22 @@ bool CacheCoordinator::ClearDeviceCache() {
             return false;
         }
         for (const PrefixCacheIndex::EvictionCandidate& entry : group_entries) {
-            cached_locations.emplace_back(group.Id(), entry.location);
+            cached.members.push_back(VictimSet::Member{.group_id = group.Id(),
+                                                       .location = entry.location,
+                                                       .in_stranded_suffix = false,
+                                                       .is_request_reclaim = false});
         }
     }
 
     store_candidates_dropped_by_flush_ += pending_stores_.size();
     pending_stores_.clear();
-    for (const auto& [group_id, location] : cached_locations) {
-        // The cascade of an earlier eviction may already have taken this one.
-        evictCachedBlock(group_id, location, &DeviceEvictionStats::flush, /*write_back_segment=*/nullptr);
-        FatalCheck(!pool_.IsOccupied(location), "clearable Device cache entry disappeared");
+    // The cascade of an earlier eviction may already have taken one.
+    for (const UnevictedVictim& victim :
+         evictPlannedVictims(std::span{&cached, 1}, /*write_back=*/false,
+                             VictimReasons{.victim = &DeviceEvictionStats::flush,
+                                           .stranded_suffix = &DeviceEvictionStats::flush,
+                                           .request_reclaim = &DeviceEvictionStats::flush})) {
+        FatalCheck(!pool_.IsOccupied(victim.location), "clearable Device cache entry disappeared");
     }
     // A Device-only clear leaves Host L2 untouched: the Host pages under a
     // Device prefix it emptied are not collected for it.
@@ -363,12 +386,17 @@ CacheCoordinator::BlockRange CacheCoordinator::SlidingWindowBlocks(std::int32_t 
     const CacheGroupSpec& spec = groups_[static_cast<std::size_t>(i)].Spec();
     _assert(spec.attn_kind == AttnKind::kSlidingWindow, "only a sliding group has a window behind a boundary");
     const std::int32_t block_granularity = geometry_[static_cast<std::size_t>(i)].BlockGranularity();
-    const std::int32_t past_end = (boundary_tokens + block_granularity - 1) / block_granularity;
+    const std::int32_t past_end = CeilDiv(boundary_tokens, block_granularity);
     const std::int32_t first_row = std::max(0, boundary_tokens - spec.sliding_window + 1);
     if (first_row >= boundary_tokens) {
         return BlockRange{.first = past_end, .past_end = past_end};  // W == 1: nothing behind the query
     }
     return BlockRange{.first = first_row / block_granularity, .past_end = past_end};
+}
+
+CacheCoordinator::BlockRange CacheCoordinator::SinkBlocksBelow(std::int32_t i, const BlockRange& window) const {
+    const std::int32_t sink_blocks = groups_[static_cast<std::size_t>(i)].Allocator().KeptHeadBlocks();
+    return BlockRange{.first = 0, .past_end = std::min(sink_blocks, window.first)};
 }
 
 CacheCoordinator::BlockRange CacheCoordinator::CopyInSlots(std::size_t i, std::int32_t tokens) const {
@@ -402,6 +430,32 @@ CacheCoordinator::BoundaryResidency CacheCoordinator::DeviceBoundaryResidency(co
     const std::int32_t total = numBoundaryKeys(tail_tokens);
     _assert(cached <= total, "a boundary's Device entries lie among its keys");
     return cached == total ? BoundaryResidency::kComplete : BoundaryResidency::kPartial;
+}
+
+CacheCoordinator::BoundaryEventStatus CacheCoordinator::GetBoundaryEventStatus(const CacheKey& boundary,
+                                                                               std::int32_t tail_tokens) const {
+    _assert(boundary.namespace_id == kDefaultCacheNamespaceId, "a tracked boundary lies in the default namespace");
+    _assert(tail_tokens >= 0 && tail_tokens < prefix_granularity_, "a tail lies strictly inside a prefix page");
+    const BoundaryTree::Node* node = boundary_tree_.Find(boundary.content_hash);
+    if (node == nullptr) return {.publishable = false, .has_device_entries = false};
+    const std::int32_t device_entries = node->Entries(BoundaryTree::kDevice);
+    // A continuous history group represents locality without requiring the
+    // auxiliary sliding windows or sparse checkpoints at every ancestor.
+    if (!routing_history_groups_.empty()) {
+        // The index already maintains one closed-entry hold per cached key.
+        // Count expected keys by group, not by probing every history block.
+        std::int32_t expected = 0;
+        for (const std::size_t group : routing_history_groups_) {
+            const auto i = static_cast<std::int32_t>(group);
+            expected += tail_tokens > 0 ? TailBlocksFor(i, tail_tokens) : BlocksPerBoundary(i);
+        }
+        const std::int32_t cached = node->ClosedEntries(BoundaryTree::kDevice);
+        _assert(cached <= expected, "a boundary's Device history entries lie among its keys");
+        return {.publishable = cached == expected, .has_device_entries = device_entries > 0};
+    }
+    // No continuous history means no ordinary prefix-residency events.
+    // Scheduler configuration rejects enabling this event stream in that case.
+    return {.publishable = false, .has_device_entries = device_entries > 0};
 }
 
 bool CacheCoordinator::HoldsStateCheckpoint(const ContentHash& content_hash) const {
@@ -442,7 +496,7 @@ std::vector<CacheCoordinator::NodeEntry> CacheCoordinator::NodeEntries(const Blo
                                                                        const BoundaryTree::Node& node) const {
     std::vector<NodeEntry> entries;
     entries.reserve(groups_.size());
-    CacheKey boundary{.content_hash = *node.hash};
+    CacheKey boundary{.content_hash = node.hash};
     const auto append = [&](std::size_t i, const CacheKey& key) {
         if (const auto entry = groups_[i].Index().Inspect(pool, key)) {
             entries.push_back(NodeEntry{
@@ -480,7 +534,7 @@ std::vector<CacheKey> CacheCoordinator::keysForGroup(std::span<const std::string
         for (std::int32_t offset = 0; offset < pages_per_prefix_hash; ++offset) {
             keys.push_back(CacheKey{
                 .group_id = group_id,
-                .content_hash = content_hash,
+                .content_hash = ContentHash{content_hash},
                 .page_offset = offset,
             });
         }
@@ -704,7 +758,7 @@ bool CacheCoordinator::groupAcceptsBoundary(std::size_t i, std::span<const std::
         // An aligned boundary is keyed by the chain hash of its last page.
         _assert(full_tokens > 0 && full_tokens % prefix_granularity_ == 0, "a page boundary past page 0");
         const auto page = static_cast<std::size_t>(full_tokens / prefix_granularity_) - 1;
-        const CacheKey key{.group_id = group.Id(), .content_hash = prefix_hashes[page], .page_offset = 0};
+        const CacheKey key{.group_id = group.Id(), .content_hash = ContentHash{prefix_hashes[page]}, .page_offset = 0};
         if (!contains(key)) {
             return false;
         }
@@ -724,7 +778,7 @@ bool CacheCoordinator::groupAcceptsBoundary(std::size_t i, std::span<const std::
         return true;
     }
     // A sliding window resumes at T when the blocks holding rows
-    // [T - W + 1, T) are cached.
+    // [T - W + 1, T) are cached, and with a sink the blocks holding it.
     const std::int32_t block_granularity = geometry_[i].BlockGranularity();
     const std::int32_t blocks_per_page = prefix_granularity_ / block_granularity;
     const std::int32_t floor_blocks = floor_tokens / block_granularity;
@@ -735,26 +789,35 @@ bool CacheCoordinator::groupAcceptsBoundary(std::size_t i, std::span<const std::
     if (page_hits != nullptr) {
         page_hits->hits.assign(static_cast<std::size_t>(std::max(full_blocks - floor_blocks, 0)), 0);
     }
-    for (std::int32_t block = window.first; block < window.past_end; ++block) {
+    const auto holds = [&](std::int32_t block) {
         if (block >= full_blocks) {
             const auto j = static_cast<std::size_t>(block - full_blocks);
             if (!contains(tail_keys[j])) {
                 return false;
             }
             tail_hits.hits[j] = 1;
-            continue;
+            return true;
         }
         if (block < floor_blocks) {
-            continue;
+            return true;
         }
-        const CacheKey page_key{.group_id = group.Id(),
-                                .content_hash = prefix_hashes[static_cast<std::size_t>(block / blocks_per_page)],
-                                .page_offset = block % blocks_per_page};
+        const CacheKey page_key{
+            .group_id = group.Id(),
+            .content_hash = ContentHash{prefix_hashes[static_cast<std::size_t>(block / blocks_per_page)]},
+            .page_offset = block % blocks_per_page};
         if (!contains(page_key)) {
             return false;
         }
         if (page_hits != nullptr) {
             page_hits->hits[static_cast<std::size_t>(block - floor_blocks)] = 1;
+        }
+        return true;
+    };
+    for (const BlockRange& needed : {SinkBlocksBelow(static_cast<std::int32_t>(i), window), window}) {
+        for (std::int32_t block = needed.first; block < needed.past_end; ++block) {
+            if (!holds(block)) {
+                return false;
+            }
         }
     }
     return true;
@@ -797,12 +860,13 @@ bool CacheCoordinator::stateGroupsAcceptBoundary(std::span<const std::size_t> ma
 template <typename Visit>
 void CacheCoordinator::forEachCandidateBoundary(const PromptPrefix& prompt, std::int32_t floor_tokens,
                                                 std::int32_t from_tokens, const Visit& visit) const {
-    for (std::int32_t page = from_tokens / prefix_granularity_; (page + 1) * prefix_granularity_ > floor_tokens;
-         --page) {
+    // The end of the page containing from_tokens can pass INT32_MAX.
+    for (std::int32_t page = from_tokens / prefix_granularity_;
+         (std::int64_t{page} + 1) * prefix_granularity_ > floor_tokens; --page) {
         const std::int32_t page_tokens = page * prefix_granularity_;
         if (static_cast<std::size_t>(page) <= prompt.prefix_hashes.size() && !prompt.tokens.empty()) {
             const ContentHash prior =
-                page == 0 ? ContentHash{} : prompt.prefix_hashes[static_cast<std::size_t>(page) - 1];
+                page == 0 ? ContentHash{} : ContentHash{prompt.prefix_hashes[static_cast<std::size_t>(page) - 1]};
             const std::span<const TailTable::Tail> published = boundary_tree_.Tails().Tails(prior);
             std::vector<TailTable::Tail> candidates(published.begin(), published.end());
             if (prompt.tail && page == prompt.max_tokens / prefix_granularity_) {
@@ -813,6 +877,18 @@ void CacheCoordinator::forEachCandidateBoundary(const PromptPrefix& prompt, std:
                     candidates.push_back({.tail_tokens = tail.tail_tokens, .hash = tail.hash});
                 }
             }
+            for (const auto boundary : prompt.shared_prefix_tokens) {
+                const auto count = boundary - page_tokens;
+                if (count <= 0 || count >= prefix_granularity_ || boundary > from_tokens ||
+                    boundary > prompt.max_tokens || boundary <= floor_tokens ||
+                    static_cast<std::size_t>(boundary) > prompt.tokens.size())
+                    continue;
+                const auto hash = HashPrefixPage(prompt.tokens.subspan(page_tokens, count), prior);
+                if (std::ranges::none_of(candidates, [&](const auto& candidate) {
+                        return candidate.tail_tokens == count && candidate.hash == hash;
+                    }))
+                    candidates.push_back({.tail_tokens = count, .hash = hash});
+            }
             std::ranges::stable_sort(candidates, std::greater<>{}, &TailTable::Tail::tail_tokens);
             // The prompt's own hash at a tail length, reused while the
             // candidates (sorted by length) keep that length.
@@ -820,8 +896,8 @@ void CacheCoordinator::forEachCandidateBoundary(const PromptPrefix& prompt, std:
             std::int32_t hashed_tail_tokens = 0;
             for (const TailTable::Tail& tail : candidates) {
                 const std::int32_t boundary = page_tokens + tail.tail_tokens;
-                if (boundary > from_tokens || boundary > prompt.max_tokens || boundary <= floor_tokens ||
-                    static_cast<std::size_t>(boundary) > prompt.tokens.size()) {
+                if (boundary % checkpoint_granularity_ != 0 || boundary > from_tokens || boundary > prompt.max_tokens ||
+                    boundary <= floor_tokens || static_cast<std::size_t>(boundary) > prompt.tokens.size()) {
                     continue;
                 }
                 if (tail.tail_tokens != hashed_tail_tokens) {
@@ -838,7 +914,7 @@ void CacheCoordinator::forEachCandidateBoundary(const PromptPrefix& prompt, std:
                 }
             }
         }
-        if (page_tokens > floor_tokens && page_tokens <= from_tokens) {
+        if (page_tokens > floor_tokens && page_tokens <= from_tokens && page_tokens % checkpoint_granularity_ == 0) {
             if (!visit(page_tokens, 0, ContentHash{})) {
                 return;
             }
@@ -953,8 +1029,10 @@ CacheCoordinator::PrefixProbe::Tier CacheCoordinator::probeTier(const PromptPref
     // tail there extends it) and descend from that coverage itself. With no
     // closed group every published boundary below the bound is a candidate.
     const std::int32_t from_tokens =
-        closed_order.empty() ? prompt.max_tokens
-                             : std::min(aligned.num_common_tokens + prefix_granularity_ - 1, prompt.max_tokens);
+        closed_order.empty()
+            ? prompt.max_tokens
+            : static_cast<std::int32_t>(std::min<std::int64_t>(
+                  std::int64_t{aligned.num_common_tokens} + prefix_granularity_ - 1, prompt.max_tokens));
     forEachCandidateBoundary(prompt, /*floor_tokens=*/0, from_tokens, visit);
     if (out.num_common_tokens == 0) {
         // No boundary matched: no group claims anything on the Device.
@@ -1017,11 +1095,14 @@ void CacheCoordinator::probeHostSuffix(const PromptPrefix& prompt, std::span<con
             }
             const std::int32_t block_granularity = geometry_[i].BlockGranularity();
             const BlockRange window = SlidingWindowBlocks(static_cast<std::int32_t>(i), boundary);
-            for (std::int32_t block = window.first; block < std::min(window.past_end, split_tokens / block_granularity);
-                 ++block) {
-                if (!groups_[i].Index().Contains(pool_, group_keys[i][static_cast<std::size_t>(block)])) {
-                    split_tokens = block * block_granularity - block * block_granularity % prefix_granularity_;
-                    break;
+            // Lowest first: a missing sink block lowers the split under the window.
+            for (const BlockRange& needed : {SinkBlocksBelow(static_cast<std::int32_t>(i), window), window}) {
+                for (std::int32_t block = needed.first;
+                     block < std::min(needed.past_end, split_tokens / block_granularity); ++block) {
+                    if (!groups_[i].Index().Contains(pool_, group_keys[i][static_cast<std::size_t>(block)])) {
+                        split_tokens = block * block_granularity - block * block_granularity % prefix_granularity_;
+                        break;
+                    }
                 }
             }
         }
@@ -1084,11 +1165,14 @@ void CacheCoordinator::probeHostSuffix(const PromptPrefix& prompt, std::span<con
                 host_hits[i].hits.assign(static_cast<std::size_t>((page_tokens - split_tokens) / block_granularity), 1);
                 continue;
             }
-            // The window blocks below the split, all on the Device by the split.
+            // The sink and window blocks below the split, all on the Device by the split.
             const BlockRange window = SlidingWindowBlocks(static_cast<std::int32_t>(i), boundary);
             device_hits[i].hits.assign(static_cast<std::size_t>(split_tokens / block_granularity), 0);
-            for (std::int32_t block = window.first; block < split_tokens / block_granularity; ++block) {
-                device_hits[i].hits[static_cast<std::size_t>(block)] = 1;
+            for (const BlockRange& needed : {SinkBlocksBelow(static_cast<std::int32_t>(i), window), window}) {
+                for (std::int32_t block = needed.first;
+                     block < std::min(needed.past_end, split_tokens / block_granularity); ++block) {
+                    device_hits[i].hits[static_cast<std::size_t>(block)] = 1;
+                }
             }
         }
         // The longest boundary whose KV the two tiers hold: the Host's KV
@@ -1134,9 +1218,10 @@ void CacheCoordinator::probeHostSuffix(const PromptPrefix& prompt, std::span<con
         host.tail = holds_tail(host_tail) ? std::optional{std::move(host_tail)} : std::nullopt;
         return false;
     };
-    const std::int32_t from_tokens = closed_order.empty()
-                                         ? prompt.max_tokens
-                                         : std::min(host_kv_end_tokens + prefix_granularity_ - 1, prompt.max_tokens);
+    const std::int32_t from_tokens =
+        closed_order.empty() ? prompt.max_tokens
+                             : static_cast<std::int32_t>(std::min<std::int64_t>(
+                                   std::int64_t{host_kv_end_tokens} + prefix_granularity_ - 1, prompt.max_tokens));
     forEachCandidateBoundary(prompt, above_tokens, from_tokens, visit);
 }
 
@@ -1175,10 +1260,12 @@ CacheCoordinator::PrefixProbe CacheCoordinator::probePrefixWithOrder(const Promp
 }
 
 PreparedPrefixKeys CacheCoordinator::PreparePrefixKeys(std::span<const std::string> content_hashes) const {
+    ProfileSpan profile_span{"CacheCoordinator::PreparePrefixKeys"};
     return std::make_shared<const std::vector<std::vector<CacheKey>>>(buildGroupKeys(content_hashes));
 }
 
 CacheCoordinator::PrefixProbe CacheCoordinator::ProbePromptPrefix(const PromptPrefix& prompt) const {
+    ProfileSpan profile_span{"CacheCoordinator::ProbePromptPrefix"};
     return probePrefixWithOrder(prompt, match_order_, /*claim_partial=*/true);
 }
 
@@ -1232,11 +1319,12 @@ std::vector<CacheCoordinator::PrefixBoundaryAvailability> CacheCoordinator::Insp
                     bool available = true;
                     if (GroupIsState(i)) {
                         const CacheKey key =
-                            tail_tokens > 0 ? tail_keys[0]
-                                            : CacheKey{.group_id = groups_[i].Id(),
-                                                       .content_hash = prompt.prefix_hashes[static_cast<std::size_t>(
-                                                           page_tokens / prefix_granularity_ - 1)],
-                                                       .page_offset = 0};
+                            tail_tokens > 0
+                                ? tail_keys[0]
+                                : CacheKey{.group_id = groups_[i].Id(),
+                                           .content_hash = ContentHash{prompt.prefix_hashes[static_cast<std::size_t>(
+                                               page_tokens / prefix_granularity_ - 1)]},
+                                           .page_offset = 0};
                         available = contains(i, key, tier);
                     } else {
                         const std::int32_t granularity = geometry_[i].BlockGranularity();
@@ -1248,11 +1336,14 @@ std::vector<CacheCoordinator::PrefixBoundaryAvailability> CacheCoordinator::Insp
                             }
                         } else {
                             const BlockRange window = SlidingWindowBlocks(static_cast<std::int32_t>(i), boundary);
-                            for (std::int32_t block = window.first; available && block < window.past_end; ++block) {
-                                const CacheKey& key = block < full_blocks
-                                                          ? keys[i][static_cast<std::size_t>(block)]
-                                                          : tail_keys[static_cast<std::size_t>(block - full_blocks)];
-                                available = contains(i, key, tier);
+                            for (const BlockRange& needed :
+                                 {SinkBlocksBelow(static_cast<std::int32_t>(i), window), window}) {
+                                for (std::int32_t block = needed.first; available && block < needed.past_end; ++block) {
+                                    const CacheKey& key =
+                                        block < full_blocks ? keys[i][static_cast<std::size_t>(block)]
+                                                            : tail_keys[static_cast<std::size_t>(block - full_blocks)];
+                                    available = contains(i, key, tier);
+                                }
                             }
                         }
                     }
@@ -1274,12 +1365,14 @@ CacheCoordinator::PrefixProbe CacheCoordinator::ProbePrefix(std::span<const std:
     return ProbePromptPrefix(PromptPrefix{
         .prefix_hashes = content_hashes,
         .tokens = {},
-        .max_tokens = static_cast<std::int32_t>(content_hashes.size()) * prefix_granularity_,
+        .max_tokens = CheckedInt32(static_cast<std::int64_t>(content_hashes.size()) * prefix_granularity_,
+                                   "a probed prefix exceeds int32 token positions"),
     });
 }
 
 CacheCoordinator::PrefixProbe CacheCoordinator::ProbeDecodeDevicePrefix(const PromptPrefix& prompt,
                                                                         std::int32_t prompt_end_tokens) const {
+    ProfileSpan profile_span{"CacheCoordinator::ProbeDecodeDevicePrefix"};
     _assert(prompt.tokens.empty() || prompt_end_tokens <= static_cast<std::int32_t>(prompt.tokens.size()),
             "the prompt end lies inside the supplied tokens");
     std::vector<std::size_t> history_match_order;
@@ -1306,7 +1399,7 @@ CacheCoordinator::PrefixProbe CacheCoordinator::ProbeDecodeDevicePrefix(const Pr
     if (prompt.tokens.empty() || pages > prompt.prefix_hashes.size()) {
         return probe;  // nothing to match: the prefix cache is off, or the last page is not hashed
     }
-    const ContentHash prior = pages == 0 ? ContentHash{} : prompt.prefix_hashes[pages - 1];
+    const ContentHash prior = pages == 0 ? ContentHash{} : ContentHash{prompt.prefix_hashes[pages - 1]};
     if (state_hit.tail_tokens > 0) {
         state_hit.hash = HashPrefixPage(prompt.tokens.subspan(static_cast<std::size_t>(page_tokens),
                                                               static_cast<std::size_t>(state_hit.tail_tokens)),
@@ -1336,6 +1429,7 @@ CacheCoordinator::PrefixProbe CacheCoordinator::ProbeDecodeDevicePrefix(const Pr
 }
 
 CacheCoordinator::AcquiredPrefix CacheCoordinator::acquirePrefix(PrefixProbe&& probe, std::uint64_t access_epoch) {
+    ProfileSpan profile_span{"CacheCoordinator::acquirePrefix"};
     AcquiredPrefix out;
     // The Host floor is the Device's full-page coverage: the Host's KV pages
     // start there (a Device KV tail means the Host holds none, only State
@@ -1391,7 +1485,9 @@ CacheCoordinator::AcquiredPrefix CacheCoordinator::acquirePrefix(PrefixProbe&& p
 // capacity questions from the pool's own counters.
 std::int32_t CacheCoordinator::NumAvailableLcmBlocks() const {
     std::int32_t available = 0;
-    for (std::int32_t parent_id = 1; parent_id <= pool_.NumLcmBlocks(); ++parent_id) {
+    // Ids 1..NumLcmBlocks, counted so that INT32_MAX ends the loop.
+    for (std::int32_t i = 0; i < pool_.NumLcmBlocks(); ++i) {
+        const std::int32_t parent_id = i + 1;
         const std::optional<std::uint32_t> group_id = pool_.BoundGroup(parent_id);
         if (!group_id || groups_[*group_id].Index().ParentIsFullyEvictable(
                              pool_, parent_id, groups_[*group_id].Allocator().CacheBlocksPerLcmBlock())) {
@@ -1401,14 +1497,17 @@ std::int32_t CacheCoordinator::NumAvailableLcmBlocks() const {
     return available;
 }
 
-std::int32_t CacheCoordinator::NumActiveLcmBlocks(std::span<const std::span<const BlockTable>> request_tables) const {
+std::int32_t CacheCoordinator::CountActiveLcmBlocks(std::span<const std::span<const BlockTable>> request_tables) const {
     // Parent ids are dense in [1, NumLcmBlocks], so byte flags dedupe shared
     // prefixes without hashing every block reference of every live request.
     std::vector<std::uint8_t> seen(static_cast<std::size_t>(pool_.NumLcmBlocks()) + 1, 0);
     std::int32_t active = 0;
     for (std::span<const BlockTable> tables : request_tables) {
-        for (const BlockTable& table : tables) {
-            for (const CacheBlockRef& block_ref : table.Blocks().subspan(table.ReclaimedPrefixBlocks())) {
+        _assert(tables.empty() || tables.size() == groups_.size(), "tables/groups size mismatch");
+        for (std::size_t i = 0; i < tables.size(); ++i) {
+            const BlockTable& table = tables[i];
+            const std::int32_t released = groups_[i].Allocator().LeadingReleasedBlocks(table);
+            for (const CacheBlockRef& block_ref : table.Blocks().subspan(static_cast<std::size_t>(released))) {
                 if (!block_ref) {
                     continue;
                 }
@@ -1728,7 +1827,13 @@ private:
     // Host rows land in their source's bucket: no dense blocks, no free-bucket pairs.
     std::vector<std::int64_t> no_dense_need_;
     std::vector<std::int64_t> no_pair_need_;
-    CacheEvictionCandidates::LocationSet taken_;
+    // Holds taken_'s slots until the planner dies, first in the planner's own
+    // raw buffer (left uninitialized: only the arena writes it), so a small
+    // placement calls no allocator for it.
+    static constexpr std::size_t kInlineScratchBytes = 4 * 1024;
+    alignas(std::max_align_t) std::array<std::byte, kInlineScratchBytes> scratch_buffer_;
+    std::pmr::monotonic_buffer_resource scratch_{scratch_buffer_.data(), scratch_buffer_.size()};
+    CacheEvictionCandidates::LocationSet taken_{&scratch_};
     std::vector<VictimSet> victims_;
 };
 
@@ -1878,36 +1983,37 @@ CacheBlockRef CacheCoordinator::FindHostCachedBlock(const CacheKey& key) const {
     return groups_[key.group_id].Index().Find(*host_pool_, key);
 }
 
-std::optional<CacheKey> CacheCoordinator::evictCachedBlockAlone(std::uint32_t group_id, CacheBlockLocation location,
-                                                                DeviceEvictionCounts DeviceEvictionStats::*reason,
-                                                                EvictedSegment* write_back_segment) {
+std::optional<CacheCoordinator::EvictedEntry> CacheCoordinator::evictCachedBlockAlone(
+    std::uint32_t group_id, CacheBlockLocation location, DeviceEvictionCounts DeviceEvictionStats::*reason,
+    EvictedSegment* write_back_segment) {
     PrefixCacheIndex& index = groups_[group_id].Index();
-    // Read while the entry is still there: the Host entry inherits it.
-    const std::optional<PrefixCacheIndex::CachedBlockMetadata> metadata = index.MetadataFor(pool_, location);
+    PrefixCacheIndex::EvictableEntry entry = index.FindEvictable(pool_, location);
+    if (!entry) {
+        return std::nullopt;
+    }
+    // The entry's own key and tree node: read them only before Evict below.
+    const CacheKey& key = entry.key();
+    BoundaryTree::Node* const node = entry.boundary_node();
+    _assert(node != nullptr, "an indexed entry has a tree node");
+    const PrefixCacheIndex::CachedBlockMetadata metadata = entry.metadata();
+    // The node still counts this entry among its Device entries.
+    const bool device_companions_left = node->Entries(BoundaryTree::kDevice) > 1;
     // A demoted entry never rides an eviction write-back, whatever evicts it
     // -- an admission's or a restore's victim, a request's own released slot
     // or a stranded suffix: it is dropped, counted under what evicted it. A
     // demoted session's entry or a superseded input shares its epoch without
     // being demoted: the rule below takes it.
-    const bool demoted = metadata && isDemotedEntry(*metadata);
-    const bool drops_demoted = demoted && write_back_segment != nullptr;
+    const bool demoted = isDemotedEntry(metadata);
     // A superseded input an admission, rotation or restore evicts leaves as the
     // reclaim of the request that superseded it, under either write policy,
     // and is never written back. It is never a stranded suffix: a tail at
     // epoch 0 is a candidate of its own before any page above it.
-    if (demoted) {
-        write_back_segment = nullptr;
-    } else if (metadata && metadata->last_access_epoch == kSupersededAccessEpoch &&
-               (reason == &DeviceEvictionStats::admission || reason == &DeviceEvictionStats::restore ||
-                reason == &DeviceEvictionStats::compaction || reason == &DeviceEvictionStats::request_reclaim)) {
-        reason = &DeviceEvictionStats::request_reclaim;
-        write_back_segment = nullptr;
-    }
-    const std::optional<CacheKey> key = index.UnpinnedKeyAt(pool_, location);
-    if (!key) {
-        return key;  // pinned or gone: nothing to record
-    }
-    if (drops_demoted) {
+    const bool superseded =
+        !demoted && metadata.eviction.last_access_epoch == kSupersededAccessEpoch &&
+        (reason == &DeviceEvictionStats::admission || reason == &DeviceEvictionStats::restore ||
+         reason == &DeviceEvictionStats::compaction || reason == &DeviceEvictionStats::request_reclaim);
+    DeviceEvictionCounts& evicted = device_evictions_.*(superseded ? &DeviceEvictionStats::request_reclaim : reason);
+    if (demoted && write_back_segment != nullptr) {
         ++demoted_entries_not_written_back_;
         // A request's own released slot the drain would have considered is
         // dropped like a dead one, and counted with them, so the drain's
@@ -1916,12 +2022,10 @@ std::optional<CacheKey> CacheCoordinator::evictCachedBlockAlone(std::uint32_t gr
             ++device_evictions_.request_reclaim_for_write_back;
         }
     }
-    if (write_back_segment != nullptr) {
+    if (write_back_segment != nullptr && !demoted && !superseded) {
         if (reason == &DeviceEvictionStats::request_reclaim) {
             ++device_evictions_.request_reclaim_for_write_back;
         }
-        BoundaryTree::Node* node = boundary_tree_.Find(key->content_hash);
-        _assert(node != nullptr, "an indexed entry has a tree node");
         // Judged and recorded while the entry still holds the node, so the
         // checkpoints of a checkpoint boundary are recorded and hold it on the
         // Host before the pages above it are judged: no probe could resume
@@ -1929,34 +2033,32 @@ std::optional<CacheKey> CacheCoordinator::evictCachedBlockAlone(std::uint32_t gr
         // a boundary with no checkpoint boundary at or under it on either tier
         // and none on its way there.
         const bool dead =
-            (node->tail_tokens > 0 && !boundary_tree_.Tails().Contains(key->content_hash)) ||
+            (node->tail_tokens > 0 && !boundary_tree_.Tails().Contains(key.content_hash)) ||
             (num_state_groups_ > 0 && !node->HasCheckpointBoundaryInSubtree() && node->PendingHostStores() == 0);
         if (dead) {
             ++dead_entries_not_written_back_;
         } else {
             write_back_segment->members.push_back(
-                EvictedBlock{.key = *key,
+                EvictedBlock{.key = key,
                              .device_location = location,
-                             .metadata = *metadata,
-                             .host_block = FindHostCachedBlock(*key),
-                             .written_back_before = (node->written_back_group_bits >> key->group_id & 1U) != 0,
-                             .pending = holdPendingStore(*node, *key, GroupIsState(group_id))});
+                             .metadata = metadata,
+                             .host_block = FindHostCachedBlock(key),
+                             .written_back_before = (node->written_back_group_bits >> key.group_id & 1U) != 0,
+                             .pending = holdPendingStore(*node, key, GroupIsState(group_id))});
             write_back_segment->newest_access_epoch =
-                std::max(write_back_segment->newest_access_epoch, metadata->last_access_epoch);
+                std::max(write_back_segment->newest_access_epoch, metadata.eviction.last_access_epoch);
         }
     }
-    // The entry's hold on its node goes with it.
-    FatalCheck(index.Evict(pool_, location).has_value(), "an unpinned cache entry stays evictable");
+    CacheKey removed = index.Evict(std::move(entry));
     if (cache_mutation_sink_) {
-        cache_mutation_sink_(*key, CacheMutation::kRemoved);
+        cache_mutation_sink_(removed, CacheMutation::kRemoved);
     }
-    DeviceEvictionCounts& evicted = device_evictions_.*reason;
     ++evicted.blocks;
     // Contains takes no reference, so it pins nothing on the Host tier.
-    if (host_pool_ != nullptr && index.Contains(*host_pool_, *key)) {
+    if (host_pool_ != nullptr && index.Contains(*host_pool_, removed)) {
         ++evicted.host_resident;
     }
-    return key;
+    return EvictedEntry{.key = std::move(removed), .device_companions_left = device_companions_left};
 }
 
 CacheCoordinator::PendingHostStore CacheCoordinator::holdPendingStore(BoundaryTree::Node& node, const CacheKey& key,
@@ -2006,20 +2108,25 @@ bool CacheCoordinator::evictCachedBlock(std::uint32_t group_id, CacheBlockLocati
                                         DeviceEvictionCounts DeviceEvictionStats::*reason,
                                         EvictedSegment* write_back_segment) {
     // Its own entry first: when that was the last holder of the hash's node,
-    // the node leaves with its tail hint, and the cascade finds nothing.
-    const std::optional<CacheKey> removed = evictCachedBlockAlone(group_id, location, reason, write_back_segment);
-    if (!removed) {
+    // the node leaves with its tail hint. Either cascade evicts only Device
+    // entries under the hash: with none left, it would find nothing.
+    const std::optional<EvictedEntry> evicted = evictCachedBlockAlone(group_id, location, reason, write_back_segment);
+    if (!evicted) {
         return false;
     }
-    if (const std::optional<std::int32_t> tail_tokens = boundary_tree_.Tails().TailTokensOf(removed->content_hash)) {
-        evictTailEntries(removed->content_hash, *tail_tokens, reason, write_back_segment);
+    if (!evicted->device_companions_left) {
+        return true;
+    }
+    const CacheKey& removed = evicted->key;
+    if (const std::optional<std::int32_t> tail_tokens = boundary_tree_.Tails().TailTokensOf(removed.content_hash)) {
+        evictTailEntries(removed.content_hash, *tail_tokens, reason, write_back_segment);
     } else {
         // A state checkpoint is matched only with the KV below it and with
         // the checkpoints every other State group holds at its hash: a KV
         // block of its page gone, or one of those checkpoints, it is dead
         // weight and leaves too. A checkpoint takes no KV along: the page
         // still serves the boundaries past it.
-        ForEachBoundaryKey(*removed, /*tail_tokens=*/0, [&](std::size_t i, const CacheKey& key) {
+        ForEachBoundaryKey(removed, /*tail_tokens=*/0, [&](std::size_t i, const CacheKey& key) {
             if (!GroupIsState(i)) {
                 return;
             }
@@ -2029,6 +2136,112 @@ bool CacheCoordinator::evictCachedBlock(std::uint32_t group_id, CacheBlockLocati
         });
     }
     return true;
+}
+
+namespace {
+
+// Software prefetch for evicting a plan's victims in plan order
+// (CacheCoordinator::evictPlannedVictims). Before each victim leaves,
+// Advance() issues each stage of PrefixCacheIndex::PrefetchEvictions for the
+// victim that many places ahead: the location index slot, with the LCM
+// parent record, 2 * kDistance ahead; the entry kDistance ahead; and what
+// removing the entry touches beyond it kDistance / 2 ahead, so each stage
+// finds the lines it reads already on their way. It keeps positions in the
+// plan, never an entry: a victim a cascade took first is skipped by the
+// index. A cascade's own victims are not prefetched.
+class VictimPrefetch {
+public:
+    VictimPrefetch(std::span<const VictimSet> victims, const std::vector<CacheGroup>& groups, const BlockPool& pool)
+        : groups_{groups},
+          pool_{pool},
+          slot_{victims, 2 * kDistance},
+          entry_{victims, kDistance},
+          removal_{victims, kDistance / 2} {}
+
+    // Once before each victim leaves, in plan order. The stages' victims of
+    // one group share one call, which finds the group's Device entries once.
+    void Advance() noexcept {
+        const VictimSet::Member* slot = slot_.Next();
+        const VictimSet::Member* entry = entry_.Next();
+        const VictimSet::Member* removal = removal_.Next();
+        if (slot != nullptr) pool_.PrefetchRelease(slot->location);
+        while (const VictimSet::Member* first = slot != nullptr ? slot : entry != nullptr ? entry : removal) {
+            const std::uint32_t group_id = first->group_id;
+            // A stage's victim when it is of this group, which then leaves the
+            // stage.
+            const auto take = [group_id](const VictimSet::Member*& member) -> const CacheBlockLocation* {
+                if (member == nullptr || member->group_id != group_id) return nullptr;
+                return &std::exchange(member, nullptr)->location;
+            };
+            groups_[group_id].Index().PrefetchEvictions(pool_, take(slot), take(entry), take(removal));
+        }
+    }
+
+private:
+    // In victims. A full-cache benchmark ran equally fast from 2 to 16: a
+    // victim or two ahead already covers a memory miss.
+    static constexpr std::size_t kDistance = 4;
+
+    // A position in the victims of all sets, in plan order.
+    class Cursor {
+    public:
+        Cursor(std::span<const VictimSet> victims, std::size_t ahead) : victims_{victims} {
+            settle();
+            for (std::size_t i = 0; i < ahead && set_ < victims_.size(); ++i) step();
+        }
+        // The victim here, then moves past it; null past the last.
+        const VictimSet::Member* Next() noexcept {
+            if (set_ >= victims_.size()) return nullptr;
+            const VictimSet::Member* member = &victims_[set_].members[member_];
+            step();
+            return member;
+        }
+
+    private:
+        void step() noexcept {
+            ++member_;
+            settle();
+        }
+        void settle() noexcept {
+            while (set_ < victims_.size() && member_ >= victims_[set_].members.size()) {
+                ++set_;
+                member_ = 0;
+            }
+        }
+
+        std::span<const VictimSet> victims_;
+        std::size_t set_{0};
+        std::size_t member_{0};
+    };
+
+    const std::vector<CacheGroup>& groups_;
+    const BlockPool& pool_;
+    Cursor slot_;
+    Cursor entry_;
+    Cursor removal_;
+};
+
+}  // namespace
+
+std::vector<CacheCoordinator::UnevictedVictim> CacheCoordinator::evictPlannedVictims(std::span<const VictimSet> victims,
+                                                                                     bool write_back,
+                                                                                     const VictimReasons& reasons) {
+    std::vector<UnevictedVictim> unevicted;
+    VictimPrefetch prefetch{victims, groups_, pool_};
+    for (const VictimSet& set : victims) {
+        EvictedSegment* segment = write_back ? &evicted_segments_.emplace_back() : nullptr;
+        for (const auto& [group_id, location, in_stranded_suffix, is_request_reclaim] : set.members) {
+            prefetch.Advance();
+            DeviceEvictionCounts DeviceEvictionStats::*reason = is_request_reclaim   ? reasons.request_reclaim
+                                                                : in_stranded_suffix ? reasons.stranded_suffix
+                                                                                     : reasons.victim;
+            if (!evictCachedBlock(group_id, location, reason, segment)) {
+                unevicted.push_back(UnevictedVictim{
+                    .group_id = group_id, .location = location, .reason = reason, .write_back_segment = segment});
+            }
+        }
+    }
+    return unevicted;
 }
 
 bool CacheCoordinator::evictHostCachedBlock(std::uint32_t group_id, CacheBlockLocation location,
@@ -2088,6 +2301,7 @@ void CacheCoordinator::evictTailEntries(const ContentHash& hash, std::int32_t ta
 }
 
 void CacheCoordinator::CollectDeadEntries() {
+    ProfileSpan profile_span{"CacheCoordinator::CollectDeadEntries"};
     // A node's entries, the Device's before the Host's.
     const auto entries_of = [&](const BoundaryTree::Node& node) {
         std::vector<NodeEntry> entries = NodeEntries(pool_, node);
@@ -2103,7 +2317,7 @@ void CacheCoordinator::CollectDeadEntries() {
     const auto dead = [&](const BoundaryTree::Node& node) {
         return node.PendingHostStores() == 0 &&
                ((num_state_groups_ > 0 && !node.HasCheckpointBoundaryInSubtree()) ||
-                (node.tail_tokens > 0 && !boundary_tree_.Tails().Contains(*node.hash)) ||
+                (node.tail_tokens > 0 && !boundary_tree_.Tails().Contains(node.hash)) ||
                 (has_prefix_closed_groups_ && std::ranges::none_of(entries_of(node), [&](const NodeEntry& entry) {
                      return groups_[entry.group_id].Matcher().IsPrefixClosed();
                  })));
@@ -2129,7 +2343,7 @@ void CacheCoordinator::CollectDeadEntries() {
             top = top->parent;
             climbed.emplace_back(top, std::move(parent_entries));
         }
-        if (waiting_roots.contains(*top->hash)) {
+        if (waiting_roots.contains(top->hash)) {
             continue;
         }
         // Post-order over the subtree, a node after the nodes under it, so
@@ -2167,7 +2381,7 @@ void CacheCoordinator::CollectDeadEntries() {
             stack.pop_back();
         }
         // The evictions below may take the node away.
-        ContentHash root = *top->hash;
+        ContentHash root = top->hash;
         for (const NodeEntry& entry : entries_to_evict) {
             if (entry.pool == &pool_) {
                 FatalCheck(
@@ -2357,7 +2571,8 @@ std::vector<CacheKey> CacheCoordinator::BoundaryCheckpointKeys(std::span<const s
                 const std::int32_t block = range.first_cache_block + static_cast<std::int32_t>(j);
                 const auto behind = [&](std::int32_t kept_tokens) {
                     const BlockRange window = SlidingWindowBlocks(static_cast<std::int32_t>(i), kept_tokens);
-                    return block >= window.first && block < window.past_end;
+                    return (block >= window.first && block < window.past_end) ||
+                           block < SinkBlocksBelow(static_cast<std::int32_t>(i), window).past_end;
                 };
                 if (sliding && std::ranges::any_of(kept_boundaries, behind)) {
                     continue;
@@ -2400,12 +2615,12 @@ void CacheCoordinator::recordCheckpoints(const CompletedPages& completed, std::u
         const auto pages = static_cast<std::size_t>(completed.state_checkpoint_pages);
         if (checkpoints_.Observe(completed.tokens.first(pages * static_cast<std::size_t>(prefix_granularity_)),
                                  completed.prefix_hashes.first(pages), std::nullopt, access_epoch)) {
-            syncCheckpoint(completed.prefix_hashes[pages - 1]);
+            syncCheckpoint(ContentHash{completed.prefix_hashes[pages - 1]});
         }
     }
     if (completed.publish_state &&
         checkpoints_.Observe(completed.tokens, completed.prefix_hashes, completed.tail, access_epoch)) {
-        syncCheckpoint(completed.tail ? completed.tail->hash : completed.prefix_hashes.back());
+        syncCheckpoint(completed.tail ? completed.tail->hash : ContentHash{completed.prefix_hashes.back()});
     }
 }
 
@@ -2460,7 +2675,8 @@ void CacheCoordinator::recordPublishedTail(const CompletedPages& completed) {
     if (!completed.tail) {
         return;
     }
-    const ContentHash prior = completed.prefix_hashes.empty() ? ContentHash{} : completed.prefix_hashes.back();
+    const ContentHash prior =
+        completed.prefix_hashes.empty() ? ContentHash{} : ContentHash{completed.prefix_hashes.back()};
     recordTail(prior, *completed.tail);
 }
 
@@ -2498,7 +2714,8 @@ CacheKey CacheCoordinator::historyBlockKey(std::size_t group_index, const Comple
     if (block < full_blocks) {
         return CacheKey{
             .group_id = groups_[group_index].Id(),
-            .content_hash = completed.prefix_hashes[static_cast<std::size_t>(block / pages_per_prefix_hash)],
+            .content_hash =
+                ContentHash{completed.prefix_hashes[static_cast<std::size_t>(block / pages_per_prefix_hash)]},
             .page_offset = block % pages_per_prefix_hash};
     }
     _assert(completed.tail.has_value() && block - full_blocks < TailBlocksFor(static_cast<std::int32_t>(group_index),
@@ -2551,7 +2768,7 @@ std::vector<CacheCoordinator::PublishedRange> CacheCoordinator::completedBlockRa
         if (boundary_tokens % groups_[group_index].Spec().checkpoint_granularity != 0) {
             return ranges;
         }
-        const ContentHash hash = completed.tail ? completed.tail->hash : completed.prefix_hashes.back();
+        const ContentHash hash = completed.tail ? completed.tail->hash : ContentHash{completed.prefix_hashes.back()};
         ranges.push_back(PublishedRange{
             .first_cache_block = completed.state_slot,
             .keys = {CacheKey{.group_id = groups_[group_index].Id(), .content_hash = hash, .page_offset = 0}},
@@ -2579,14 +2796,23 @@ std::vector<CacheCoordinator::PublishedRange> CacheCoordinator::completedBlockRa
     const std::int32_t state_checkpoint_tokens = completed.state_checkpoint_pages * prefix_granularity_;
     for (const std::int32_t boundary_tokens : boundaries) {
         const BlockRange window = SlidingWindowBlocks(static_cast<std::int32_t>(group_index), boundary_tokens);
-        if (window.first >= window.past_end) {
+        const BlockRange sink_blocks = SinkBlocksBelow(static_cast<std::int32_t>(group_index), window);
+        if (window.first >= window.past_end && sink_blocks.first >= sink_blocks.past_end) {
             continue;
         }
         PublishedRange range = history_range(window.first, window.past_end);
         if (state_checkpoint_tokens > 0 && boundary_tokens == state_checkpoint_tokens) {
             range.boundary_kind = CacheBoundaryKind::kEndpoint;
         }
-        ranges.push_back(std::move(range));
+        if (sink_blocks.first < sink_blocks.past_end) {
+            PublishedRange sink = history_range(sink_blocks.first, sink_blocks.past_end);
+            sink.boundary_kind = range.boundary_kind;
+            sink.sink = true;
+            ranges.push_back(std::move(sink));
+        }
+        if (!range.keys.empty()) {
+            ranges.push_back(std::move(range));
+        }
     }
     return ranges;
 }
@@ -2634,7 +2860,9 @@ void CacheCoordinator::cacheCompletedBlocksForGroup(std::size_t group_index, Blo
                     "an in-forward State checkpoint lies inside the hashed prefix");
             const CacheKey key{
                 .group_id = groups_[group_index].Id(),
-                .content_hash = completed.prefix_hashes[static_cast<std::size_t>(completed.state_checkpoint_pages - 1)],
+                .content_hash =
+                    ContentHash{
+                        completed.prefix_hashes[static_cast<std::size_t>(completed.state_checkpoint_pages - 1)]},
                 .page_offset = 0};
             cacheBlocksForGroup<Tier>(group_index, completed.state_checkpoint_blocks.subspan(group_index, 1),
                                       std::span<const CacheKey>(&key, 1), /*first_logical_block=*/1, access_epoch,
@@ -2664,6 +2892,9 @@ std::int32_t CacheCoordinator::FirstPublishedPage(const CompletedPages& complete
     std::int32_t first_page = completed.first_new_prefix_page;
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         for (const PublishedRange& range : completedBlockRanges(i, completed)) {
+            if (range.sink) {
+                continue;  // PublishedSinkPages names these pages
+            }
             // A State group's one key is the point itself: the deepest page
             // unless a tail is published. A history group's run starts at
             // slot first_cache_block.
@@ -2679,6 +2910,23 @@ std::int32_t CacheCoordinator::FirstPublishedPage(const CompletedPages& complete
     // below the first new one. A sliding window behind it is one of the
     // ranges read above.
     return first_page;
+}
+
+std::int32_t CacheCoordinator::PublishedSinkPages(const CompletedPages& completed) const {
+    std::int32_t pages = 0;
+    for (std::size_t i = 0; i < groups_.size(); ++i) {
+        if (groups_[i].Allocator().KeptHeadBlocks() == 0) {
+            continue;
+        }
+        const std::int32_t blocks_per_page = BlocksPerBoundary(static_cast<std::int32_t>(i));
+        for (const PublishedRange& range : completedBlockRanges(i, completed)) {
+            if (range.sink) {
+                const std::int32_t past_end = range.first_cache_block + static_cast<std::int32_t>(range.keys.size());
+                pages = std::max(pages, (past_end + blocks_per_page - 1) / blocks_per_page);
+            }
+        }
+    }
+    return pages;
 }
 
 void CacheCoordinator::ReclaimExpired(std::span<BlockTable> tables, std::int32_t num_computed_tokens) {
@@ -2714,19 +2962,24 @@ std::vector<CacheBlockRef> CacheCoordinator::RetainInputCheckpoint(std::span<con
             continue;
         }
         if (GroupIsState(i)) {
-            if (!retain(CacheKey{.group_id = groups_[i].Id(),
-                                 .content_hash = prefix_hashes[static_cast<std::size_t>(boundary_pages - 1)]})) {
+            if (!retain(CacheKey{
+                    .group_id = groups_[i].Id(),
+                    .content_hash = ContentHash{prefix_hashes[static_cast<std::size_t>(boundary_pages - 1)]}})) {
                 return {};
             }
             continue;
         }
         const BlockRange window = SlidingWindowBlocks(static_cast<std::int32_t>(i), boundary_tokens);
         const std::int32_t blocks_per_boundary = BlocksPerBoundary(static_cast<std::int32_t>(i));
-        for (std::int32_t slot = window.first; slot < window.past_end; ++slot) {
-            if (!retain(CacheKey{.group_id = groups_[i].Id(),
-                                 .content_hash = prefix_hashes[static_cast<std::size_t>(slot / blocks_per_boundary)],
+        for (const BlockRange& needed : {SinkBlocksBelow(static_cast<std::int32_t>(i), window), window}) {
+            for (std::int32_t slot = needed.first; slot < needed.past_end; ++slot) {
+                if (!retain(
+                        CacheKey{.group_id = groups_[i].Id(),
+                                 .content_hash =
+                                     ContentHash{prefix_hashes[static_cast<std::size_t>(slot / blocks_per_boundary)]},
                                  .page_offset = slot % blocks_per_boundary})) {
-                return {};
+                    return {};
+                }
             }
         }
     }
@@ -2752,7 +3005,8 @@ void CacheCoordinator::RefreshRetainedCheckpoint(std::span<CacheBlockRef> blocks
         }
         const auto metadata = index.MetadataFor(pool, block->Location());
         _assert(metadata.has_value(), "a cached block has eviction metadata");
-        index.Register(pool, block, *key, access_epoch, metadata->logical_block_index, metadata->boundary_kind,
+        index.Register(pool, block, *key, access_epoch, metadata->eviction.logical_block_index,
+                       metadata->eviction.boundary_kind,
                        /*newly_cached=*/nullptr, session);
         if (GroupIsState(key->group_id)) {
             BoundaryTree::Node* node = boundary_tree_.Find(key->content_hash);
@@ -2790,9 +3044,12 @@ CacheCoordinator::DataSpan dataSpan(const BlockTable& table, const GroupGeometry
         return CacheCoordinator::DataSpan{.blocks = table.NumBlocks(), .tail_tokens = 0};
     }
     const std::int32_t block_granularity = geometry.BlockGranularity();
-    const std::int32_t covering = (num_tokens + block_granularity - 1) / block_granularity;
+    const std::int32_t covering = CeilDiv(num_tokens, block_granularity);
     _assert(covering <= table.NumBlocks(), "snapshot token count exceeds the table's logical fill");
-    return CacheCoordinator::DataSpan{.blocks = covering, .tail_tokens = covering * block_granularity - num_tokens};
+    // Less than one block, though the covering blocks' capacity can pass INT32_MAX.
+    return CacheCoordinator::DataSpan{
+        .blocks = covering,
+        .tail_tokens = static_cast<std::int32_t>(std::int64_t{covering} * block_granularity - num_tokens)};
 }
 
 }  // namespace
@@ -2814,8 +3071,8 @@ std::vector<std::vector<ImageSlot>> CacheCoordinator::PublishedDataSlots(std::sp
                 published[i].push_back(ImageSlot{.slot_index = slot,
                                                  .block = block,
                                                  .key = std::move(*key),
-                                                 .logical_block_index = metadata->logical_block_index,
-                                                 .boundary_kind = metadata->boundary_kind});
+                                                 .logical_block_index = metadata->eviction.logical_block_index,
+                                                 .boundary_kind = metadata->eviction.boundary_kind});
             }
         }
     }
@@ -3005,27 +3262,28 @@ void CacheCoordinator::CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& 
     _assert(key.group_id < groups_.size(), "CacheHostBlock group id out of range");
     PrefixCacheIndex& index = groups_[key.group_id].Index();
     PrefixCacheIndex::CachedBlockMetadata metadata{
-        .logical_block_index = -1,
-        .boundary_kind = CacheBoundaryKind::kChunk,
+        .eviction = {.logical_block_index = -1, .boundary_kind = CacheBoundaryKind::kChunk},
     };
     if (inherited_metadata) {
         metadata = *inherited_metadata;
         // Registering touches an existing entry with the epoch given: never
         // age one a Host hit of this very build may just have touched.
         if (const std::optional<CacheBlockLocation> existing = locationOf(*host_pool_, key.group_id, key)) {
-            metadata.last_access_epoch =
-                std::max(metadata.last_access_epoch, index.MetadataFor(*host_pool_, *existing)->last_access_epoch);
+            metadata.eviction.last_access_epoch =
+                std::max(metadata.eviction.last_access_epoch,
+                         index.MetadataFor(*host_pool_, *existing)->eviction.last_access_epoch);
         }
     } else {
-        metadata.last_access_epoch = ++next_access_epoch_;
+        metadata.eviction.last_access_epoch = ++next_access_epoch_;
     }
     // The entry holds the node of its hash: a store's the node its Device
     // publication linked, while either tier holds the hash; an L3 GET's, or a
     // store's whose Device entry left before the ACK, one it starts without a
     // parent, until a publication through its hash gives it its boundary (and,
     // past page 0, links it).
-    index.Register(*host_pool_, block_ref, key, metadata.last_access_epoch, metadata.logical_block_index,
-                   metadata.boundary_kind, /*newly_cached=*/nullptr, metadata.session);
+    index.Register(*host_pool_, block_ref, key, metadata.eviction.last_access_epoch,
+                   metadata.eviction.logical_block_index, metadata.eviction.boundary_kind, /*newly_cached=*/nullptr,
+                   metadata.session);
     // A copy a demotion reached on its way (TierTransferManager::
     // DemoteInFlightEvictions) lands demoted, unless the entry is newer.
     if (metadata.demoted) {
@@ -3035,7 +3293,7 @@ void CacheCoordinator::CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& 
         BoundaryTree::Node* node = boundary_tree_.Find(key.content_hash);
         _assert(node != nullptr, "an indexed checkpoint has a tree node");
         node->latest_state_access_epoch =
-            std::max({node->latest_state_access_epoch, metadata.last_access_epoch, metadata.max_access_epoch});
+            std::max({node->latest_state_access_epoch, metadata.eviction.last_access_epoch, metadata.max_access_epoch});
     }
 }
 
@@ -3096,7 +3354,7 @@ std::unique_ptr<PrefixMatcher> MakePrefixMatcher(const CacheGroupSpec& spec) {
         case AttnKind::kSlidingWindow:
             _assert(spec.block_granularity > 0, "group block_granularity must be > 0");
             _assert(spec.sliding_window > 0, "sliding window group requires a positive window");
-            return std::make_unique<SwaMatcher>(spec.block_granularity, spec.sliding_window);
+            return std::make_unique<SwaMatcher>(spec.block_granularity, spec.sliding_window, spec.sink_tokens);
         default:
             FatalCheck(false, "unknown AttnKind in coordinator group spec");
             return nullptr;
@@ -3124,7 +3382,17 @@ CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int
             _assert(spec.block_granularity > 0 && prefix_granularity % spec.block_granularity == 0,
                     "group block_granularity must be a positive divisor of the prefix granularity");
         }
-        auto allocator = std::make_unique<GroupAllocator>(spec.cache_blocks_per_lcm_block, group_id, spec.shard_count);
+        std::int32_t sink_blocks = 0;
+        if (spec.sink_tokens > 0) {
+            _assert(spec.attn_kind == AttnKind::kSlidingWindow && !spec.replayable,
+                    "only a cached sliding-window group keeps a sink");
+            // A window of at least a prefix page needs every block of a tail,
+            // so a tail in the sink's page holds the sink blocks as well.
+            _assert(spec.sliding_window >= prefix_granularity, "a sink group's window must cover a prefix page");
+            sink_blocks = spec.sink_tokens / spec.block_granularity + (spec.sink_tokens % spec.block_granularity != 0);
+        }
+        auto allocator =
+            std::make_unique<GroupAllocator>(spec.cache_blocks_per_lcm_block, group_id, spec.shard_count, sink_blocks);
         groups.emplace_back(spec, std::move(allocator), MakePrefixMatcher(spec));
     }
     return CacheCoordinator{std::move(groups),
@@ -3166,6 +3434,62 @@ void CacheCoordinator::forEachStorageDependency(const PrefixProbe::Tier& probe,
             }
         }
     }
+}
+
+CacheCoordinator::StorageQuery CacheCoordinator::SharedPrefixKeys(const PromptPrefix& prompt,
+                                                                  std::size_t max_keys) const {
+    StorageQuery result;
+    if (prompt.max_tokens <= 0) return result;
+    const auto full_tokens = prompt.max_tokens / prefix_granularity_ * prefix_granularity_;
+    const auto tail_tokens = prompt.max_tokens - full_tokens;
+    if (static_cast<std::size_t>(full_tokens / prefix_granularity_) > prompt.prefix_hashes.size() ||
+        (tail_tokens && (!prompt.tail || prompt.tail->tail_tokens != tail_tokens)))
+        return result;
+    const auto add = [&](CacheKey key) {
+        if (result.keys.size() == max_keys) return false;
+        result.keys.push_back(std::move(key));
+        return true;
+    };
+    for (const auto i : match_order_) {
+        const auto& group = groups_[i];
+        if (GroupIsState(i)) {
+            if (prompt.max_tokens % group.Spec().checkpoint_granularity != 0) return {};
+            const ContentHash hash = tail_tokens
+                                         ? prompt.tail->hash
+                                         : ContentHash{prompt.prefix_hashes[full_tokens / prefix_granularity_ - 1]};
+            if (!add(CacheKey{.group_id = group.Id(), .content_hash = hash, .page_offset = 0})) {
+                result.max_tokens = -1;
+                return result;
+            }
+            continue;
+        }
+        const auto grain = geometry_[i].BlockGranularity();
+        const auto per_prefix = prefix_granularity_ / grain;
+        const auto full_blocks = full_tokens / grain;
+        const auto first = group.Matcher().IsPrefixClosed()
+                               ? 0
+                               : SlidingWindowBlocks(static_cast<std::int32_t>(i), prompt.max_tokens).first;
+        for (auto block = first; block < full_blocks; ++block) {
+            if (!add(CacheKey{.group_id = group.Id(),
+                              .content_hash = ContentHash{prompt.prefix_hashes[block / per_prefix]},
+                              .page_offset = block % per_prefix})) {
+                result.max_tokens = -1;
+                return result;
+            }
+        }
+        if (tail_tokens) {
+            const auto keys = tailKeysForGroup(i, prompt.tail->hash, tail_tokens);
+            for (std::size_t j = 0; j < keys.size(); ++j) {
+                if (full_blocks + static_cast<std::int32_t>(j) < first) continue;
+                if (!add(keys[j])) {
+                    result.max_tokens = -1;
+                    return result;
+                }
+            }
+        }
+    }
+    result.max_tokens = prompt.max_tokens;
+    return result;
 }
 
 CacheCoordinator::StorageQuery CacheCoordinator::MissingStorageKeys(const PromptPrefix& prompt,
@@ -3281,9 +3605,10 @@ CacheCoordinator::StorageReservation CacheCoordinator::ReserveStoragePrefix(cons
         // stay evictable during I/O; ordinary admission matches the cache again.
         forEachStorageDependency(probe, group_keys, device.full_page_tokens, pin);
         if (probe.tail) {
-            result.tail_prior = probe.full_page_tokens == 0
-                                    ? ContentHash{}
-                                    : prompt.prefix_hashes[probe.full_page_tokens / prefix_granularity_ - 1];
+            result.tail_prior =
+                probe.full_page_tokens == 0
+                    ? ContentHash{}
+                    : ContentHash{prompt.prefix_hashes[probe.full_page_tokens / prefix_granularity_ - 1]};
             result.tail = TailPublication{.tail_tokens = probe.tail->tail_tokens, .hash = probe.tail->hash};
         }
         if (result.keys.empty()) return {};

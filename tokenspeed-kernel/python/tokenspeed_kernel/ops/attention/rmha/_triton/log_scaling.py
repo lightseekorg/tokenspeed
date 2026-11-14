@@ -23,9 +23,25 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel._triton import libdevice, tl, triton
 
 __all__ = ["log_scaling_tau"]
+
+_IS_HIP = tl.constexpr(torch.version.hip is not None)
+
+
+@triton.jit
+def _torch_log(x):
+    """FP32 ``x >= 1`` rounded as ``torch.log`` rounds it. On ROCm that is
+    HIP's ``logf`` for normal inputs: log2, then a product with ln(2) carried
+    in two constants through FMAs."""
+    if _IS_HIP:
+        y = libdevice.log2(x)
+        ln2_hi = 0.6931471228599548  # 0x3f317217
+        low = tl.fma(y, ln2_hi, -(y * ln2_hi))
+        low = tl.fma(y, 5.769998878690785e-08, low)  # 0x3377d1cf
+        return tl.fma(y, ln2_hi, low)
+    return libdevice.log(x)
 
 
 @triton.jit
@@ -34,19 +50,26 @@ def _log_scaling_tau_kernel(
     out_ptr,
     n,
     n_floor,
+    inv_n_floor,
     alpha,
     BLOCK: tl.constexpr,
+    TORCH_ORDER: tl.constexpr,
 ):
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < n
     pos = tl.load(positions_ptr + offs, mask=mask, other=0)
-    effective_n = (pos + 1).to(tl.float32) / n_floor
-    tau = 1.0 + alpha * tl.log(tl.maximum(effective_n, 1.0))
+    if TORCH_ORDER:
+        # Torch's order: times the FP32 reciprocal, clamp, logf, multiply, then add.
+        effective_n = (pos + 1).to(tl.float32) * inv_n_floor
+        tau = _torch_log(tl.maximum(effective_n, 1.0)) * alpha + 1.0
+    else:
+        effective_n = (pos + 1).to(tl.float32) / n_floor
+        tau = 1.0 + alpha * tl.log(tl.maximum(effective_n, 1.0))
     tl.store(out_ptr + offs, tau, mask=mask)
 
 
 def log_scaling_tau(
-    positions: torch.Tensor, n_floor: int, alpha: float
+    positions: torch.Tensor, n_floor: int, alpha: float, *, torch_order: bool
 ) -> torch.Tensor:
     """Per-token attention-logit scale ``1 + alpha * log(max((pos+1)/n_floor, 1))``.
 
@@ -57,6 +80,9 @@ def log_scaling_tau(
         positions: ``[T]`` integer absolute positions (CUDA).
         n_floor: Context length below which tau is exactly 1.
         alpha: Log-scaling slope from the model config.
+        torch_order: Byte for byte the Torch statement
+            ``1.0 + alpha * ((positions + 1).float() / n_floor).clamp_min(1).log()``
+            instead of the fused division, fast log and contraction.
 
     Returns:
         ``[T]`` fp32 tau values.
@@ -66,12 +92,19 @@ def log_scaling_tau(
     if n == 0:
         return out
     BLOCK = 1024
+    inv_n_floor = 1.0
+    if torch_order:
+        floor32 = torch.tensor(float(n_floor), dtype=torch.float32)
+        inv_n_floor = (torch.ones((), dtype=torch.float32) / floor32).item()
     _log_scaling_tau_kernel[(triton.cdiv(n, BLOCK),)](
         positions,
         out,
         n,
         float(n_floor),
+        inv_n_floor,
         float(alpha),
         BLOCK=BLOCK,
+        TORCH_ORDER=torch_order,
+        **({"enable_fp_fusion": False} if torch_order else {}),
     )
     return out

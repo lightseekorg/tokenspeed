@@ -124,9 +124,9 @@ void Run(int batch_size, int released_prefix_slots, int repeats) {
     constexpr std::uint32_t kFull = 0, kWindow = 1, kState = 2;
     BlockPool pool(batch_size * (kFullColumns / kHistoryPacking + 8),
                    {kHistoryPacking, kHistoryPacking, kStatePacking});
-    GroupAllocator full(kHistoryPacking, kFull, 1);
-    GroupAllocator window(kHistoryPacking, kWindow, 1);
-    GroupAllocator state(kStatePacking, kState, 1);
+    GroupAllocator full(kHistoryPacking, kFull, 1, 0);
+    GroupAllocator window(kHistoryPacking, kWindow, 1, 0);
+    GroupAllocator state(kStatePacking, kState, 1, 0);
     std::vector<BlockTable> full_tables(batch_size), window_tables(batch_size), state_tables(batch_size);
     std::vector<CacheBlockRef> checkpoints(batch_size);
     std::vector<ForwardOperation> ops;
@@ -136,8 +136,10 @@ void Run(int batch_size, int released_prefix_slots, int repeats) {
         const bool prefill = i % 8 == 0;
         if (prefill) {
             PrefillOperation extend;
-            extend.input_ids = {1, 2, 3, 4};
-            extend.shifted_input_ids = {2, 3, 4, 5};
+            static constexpr std::int32_t kInput[] = {1, 2, 3, 4};
+            static constexpr std::int32_t kShifted[] = {2, 3, 4, 5};
+            extend.input_ids = kInput;
+            extend.shifted_input_ids = kShifted;
             extend.extend_state_checkpoint_len = 2;
             ops.emplace_back(std::move(extend));
         } else {

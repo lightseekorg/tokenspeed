@@ -14,8 +14,11 @@ from unittest.mock import Mock
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.sampling.cute_dsl import MarkovArgmaxWorkspace
 
+from tokenspeed.runtime.execution.drafter import dspark as dspark_module
 from tokenspeed.runtime.execution.drafter.dspark import DSpark
+from tokenspeed.runtime.execution.input_buffer import InputBuffers
 from tokenspeed.runtime.models.dspark import VanillaMarkov
 
 VOCAB = 32
@@ -28,6 +31,10 @@ def _drafter(spec_num_tokens: int = 8, vocab: int = VOCAB) -> DSpark:
     drafter = DSpark.__new__(DSpark)
     drafter.spec_num_tokens = spec_num_tokens
     drafter.lm_head = None
+    drafter.draft_sampler = None  # the greedy walk
+    # Resolved without the fused step: the default walk is the unfused one.
+    drafter._markov_argmax_resolved = True
+    drafter._markov_argmax_workspace = None
     torch.manual_seed(0)
     head = VanillaMarkov(vocab_size=vocab, markov_rank=RANK)
     drafter.markov_head = head
@@ -59,7 +66,10 @@ def test_draft_prefill_capture_uses_the_resolved_prefill_gate(
     executor.forward_step = Mock(disable=decode_disabled)
     executor.prefill_graph = Mock(disable=prefill_disabled)
     # Explicit: a bare Mock answers truthily, so the gate below would hold anyway.
-    executor.drafter = Mock(captures_prefill_graph=declares)
+    # DSpark records no extend-round graphs (the base drafter's empty plan).
+    executor.drafter = Mock(
+        captures_prefill_graph=declares, **{"extend_graph_plan.return_value": {}}
+    )
     model_executor.ModelExecutor.capture_graphs(
         executor, entries=None, observer=NULL_MEMORY_DELTA_OBSERVER
     )
@@ -262,16 +272,23 @@ def test_proposals_are_valid_token_ids() -> None:
 
 
 class _ShardIndices:
-    def __init__(self, num_org: int) -> None:
+    def __init__(self, num_org: int, start: int) -> None:
         self.num_org_elements = num_org
+        self.org_vocab_start_index = start
 
 
 class _ShardedHead:
-    """Enough of a vocab-parallel head for the block projection to run."""
+    """Enough of a vocab-parallel head for the block projection to run.
 
-    def __init__(self, weight: torch.Tensor) -> None:
+    The shard of an ``org_vocab_size``-token vocabulary starts at ``start``.
+    """
+
+    def __init__(
+        self, weight: torch.Tensor, start: int = 0, org_vocab_size: int = VOCAB
+    ) -> None:
         self.weight = weight
-        self.shard_indices = _ShardIndices(weight.shape[0])
+        self.shard_indices = _ShardIndices(weight.shape[0], start)
+        self.org_vocab_size = org_vocab_size
 
 
 def test_the_walk_feeds_each_round_its_own_positions_hoisted_slice() -> None:
@@ -336,3 +353,160 @@ def test_the_block_projection_stands_down_without_a_sharded_head() -> None:
 
     drafter.lm_head = _ShardedHead(torch.randn(0, HIDDEN))
     assert drafter._block_base_logits(torch.randn(2, 4, HIDDEN)) is None
+
+
+# --------------------------------------------------------------------------
+# The fused step
+# --------------------------------------------------------------------------
+
+
+def _eighths(*shape: int, seed: int) -> torch.Tensor:
+    """Draw BF16 values in {-1/8, 0, 1/8}.
+
+    Base logits and Markov biases are then small multiples of 1/64, exact in
+    BF16 in any accumulation order and of one magnitude, so both decide
+    proposals.
+    """
+    gen = torch.Generator().manual_seed(seed)
+    return (torch.randint(-1, 2, shape, generator=gen) / 8).to(torch.bfloat16)
+
+
+def _kernel_contract(workspace, base, prev, embedding, projection, start, out):
+    """markov_argmax_step on one rank, written in torch: the kernel needs a GPU.
+
+    Clamp the previous token, round the FP32 bias to the logits dtype, add in
+    that dtype and write the global id of the argmax.
+    """
+    assert workspace.vocab_per_rank == base.shape[-1] == projection.shape[0]
+    latent = embedding[prev.long().clamp(0, embedding.shape[0] - 1)]
+    bias = (latent.float() @ projection.float().T).to(base.dtype)
+    out.copy_(torch.argmax((base + bias).float(), dim=-1) + start)
+
+
+def _shard_walk(fused: bool, monkeypatch) -> torch.Tensor:
+    """Walk a rank whose head shard is tokens [8, 24) of the 32-token vocab."""
+    spec, rows, start, width = 6, 3, 8, 16
+    drafter = _drafter(spec_num_tokens=spec)
+    markov = drafter.markov_head.to(torch.bfloat16)
+    markov.markov_w1.weight.data = _eighths(VOCAB, RANK, seed=1)
+    markov.markov_w2.weight.data = _eighths(VOCAB, RANK, seed=2)
+    drafter.lm_head = _ShardedHead(_eighths(width, HIDDEN, seed=3), start=start)
+    hidden = _eighths(rows, spec, HIDDEN, seed=4)
+    block_ids = torch.tensor([[5], [31], [-3]], dtype=torch.int32).expand(
+        rows, spec - 1
+    )
+    next_tokens = torch.full((rows, spec), -1, dtype=torch.int32)
+
+    def unfused_argmax(hidden, out=None, bias_fn=None, base_logits=None):
+        assert not fused, "the fused walk must not run the unfused step"
+        assert hidden.shape[0] == base_logits.shape[0] == rows
+        bias = bias_fn(start, base_logits.shape[-1]).to(base_logits.dtype)
+        out.copy_(torch.argmax((base_logits + bias).float(), dim=-1) + start)
+        return out
+
+    drafter._greedy_argmax_vocab_parallel = unfused_argmax
+    if fused:
+        drafter._markov_argmax_workspace = MarkovArgmaxWorkspace(
+            state=None,
+            device=torch.device("cpu"),
+            max_rows=rows,
+            vocab_per_rank=width,
+            rank_dim=RANK,
+            dtype=torch.bfloat16,
+            keys=torch.empty(0, dtype=torch.int64),
+            ctas_done=torch.empty(0, dtype=torch.int32),
+            kernels={},
+        )
+        monkeypatch.setattr(dspark_module, "markov_argmax_step", _kernel_contract)
+    return drafter._sample_block(hidden, block_ids, next_tokens).clone()
+
+
+def test_the_fused_walk_proposes_what_the_unfused_walk_does(monkeypatch) -> None:
+    """The fused walk proposes exactly what the unfused walk does.
+
+    Each fused position must read its own base logits, the token just written
+    for the previous position (clamped), this rank's projection rows, and its
+    vocabulary offset.
+    """
+    unfused = _shard_walk(False, monkeypatch)
+    fused = _shard_walk(True, monkeypatch)
+    assert unfused[:, 0].tolist() == [5, 31, 0]
+    assert ((unfused[:, 1:] >= 8) & (unfused[:, 1:] < 24)).all()
+    assert torch.equal(fused, unfused)
+
+
+def _gate_drafter(markov_dtype, markov_vocab: int, state) -> DSpark:
+    drafter = _drafter()
+    drafter._markov_argmax_resolved = False
+    drafter.markov_head = VanillaMarkov(vocab_size=markov_vocab, markov_rank=128).to(
+        markov_dtype
+    )
+    drafter.lm_head = _ShardedHead(
+        torch.zeros(16, HIDDEN, dtype=torch.bfloat16), start=16, org_vocab_size=32
+    )
+    drafter._dist_argmax_state = state
+    drafter.input_buffers = InputBuffers(
+        max_bs=12, max_num_tokens=96, state_write_padding_pool_index=0, device="cpu"
+    )
+    return drafter
+
+
+@pytest.mark.parametrize(
+    "markov_dtype, markov_vocab, has_state, fused",
+    [
+        (torch.bfloat16, 32, True, True),
+        (torch.bfloat16, 32, False, False),  # no distributed-argmax slots
+        (torch.float32, 32, True, False),  # Markov head in another dtype
+        (torch.bfloat16, 24, True, False),  # a shard without Markov rows
+    ],
+)
+def test_the_fused_step_resolves_once_where_the_distributed_argmax_runs(
+    monkeypatch, markov_dtype, markov_vocab, has_state, fused
+) -> None:
+    created = []
+
+    def create(state, **kwargs):
+        created.append((state, kwargs))
+        return "workspace"
+
+    monkeypatch.setattr(dspark_module, "create_markov_argmax_workspace", create)
+    state = object() if has_state else None
+    drafter = _gate_drafter(markov_dtype, markov_vocab, state)
+    block_logits = torch.zeros(3, 16, dtype=torch.bfloat16)
+
+    for _ in range(2):
+        got = drafter._resolve_markov_argmax(block_logits)
+        assert got == ("workspace" if fused else None)
+    assert drafter._markov_argmax_resolved
+    if fused:
+        assert created == [
+            (
+                state,
+                dict(
+                    device=block_logits.device,
+                    max_rows=12,
+                    vocab_per_rank=16,
+                    rank_dim=128,
+                    dtype=torch.bfloat16,
+                ),
+            )
+        ]
+    else:
+        assert created == []
+
+
+def test_the_fused_step_is_never_resolved_inside_a_capture(monkeypatch) -> None:
+    """A first walk inside a capture keeps the unfused step for now.
+
+    Allocation and compilation belong to warmup, so the verdict waits for an
+    eager walk.
+    """
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setattr(
+        dspark_module,
+        "create_markov_argmax_workspace",
+        lambda *a, **k: pytest.fail("created inside a capture"),
+    )
+    drafter = _gate_drafter(torch.bfloat16, 32, object())
+    assert drafter._resolve_markov_argmax(torch.zeros(3, 16)) is None
+    assert not drafter._markov_argmax_resolved

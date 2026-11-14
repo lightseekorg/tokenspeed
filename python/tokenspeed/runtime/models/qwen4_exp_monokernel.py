@@ -112,7 +112,7 @@ class Qwen4ExpMonokernelState(MonokernelState):
     launches read and the draft's lengths of the current forward."""
 
     def __init__(self, device: torch.device, scratch_pairs: int) -> None:
-        super().__init__(device, scratch_pairs)
+        super().__init__(torch.zeros(scratch_pairs, dtype=torch.int64, device=device))
         # Constants the launches read, made here, outside any CUDA graph
         # capture: a capture records a kernel without running it, so a
         # constant made there holds garbage for every other graph. A launch

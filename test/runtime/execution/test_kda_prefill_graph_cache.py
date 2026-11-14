@@ -551,8 +551,7 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name):
     owner._handoff_storage, owner._outputs = {}, None
     owner._captures = {}
     owner.input_buffers = SimpleNamespace(input_ids_buf=torch.ones(bucket))
-    owner._embed_tokens = lambda ids: ids
-    owner._land_input_embeds = lambda *args: None
+    owner._input_embeds_buf = torch.empty(bucket, 1)
     owner.attn_backend = hybrid
     owner._run_inner = lambda bucket: (forward(compact=False), None)
 
@@ -703,7 +702,9 @@ def test_outer_owner_selects_matching_graph_and_refreshes_before_replay(
     owner._route_counts = {}
     owner._replay_bucket = lambda ctx: 8
     owner._log_engaged_once = lambda *args: None
-    owner._embed_tokens = lambda ids: torch.zeros(8, 4)
+    owner._compute_input_embeddings = (
+        lambda ids, ctx, *, request_token_history: torch.zeros(8, 4)
+    )
     owner._land_input_embeds = lambda *args: None
     owner._padded_to = lambda *args: nullcontext()
     owner.config = SimpleNamespace(model_is_mrope=False, world_size=1)
@@ -728,7 +729,12 @@ def test_outer_owner_selects_matching_graph_and_refreshes_before_replay(
         ),
         patch("tokenspeed.runtime.execution.prefill_graph.logger") as log,
     ):
-        result = owner.replay(ctx, torch.zeros(num_tokens, dtype=torch.int64), None)
+        result = owner.replay(
+            ctx,
+            torch.zeros(num_tokens, dtype=torch.int64),
+            None,
+            request_token_history=None,
+        )
     torch.testing.assert_close(result, torch.full((num_tokens, 4), float(expected)))
     assert ctx.bs == batch_size
     assert events == ([] if transfer else ["refresh"]) + [
@@ -791,7 +797,9 @@ def test_replay_waits_for_the_whole_host_load_before_the_first_segment(consumers
     owner._route_counts = {}
     owner._replay_bucket = lambda ctx: 8
     owner._log_engaged_once = lambda *args: None
-    owner._embed_tokens = lambda ids: torch.zeros(8, 4)
+    owner._compute_input_embeddings = (
+        lambda ids, ctx, *, request_token_history: torch.zeros(8, 4)
+    )
     owner._land_input_embeds = lambda *args: None
     owner._padded_to = lambda *args: nullcontext()
     owner.config = SimpleNamespace(model_is_mrope=False, world_size=1)
@@ -823,7 +831,9 @@ def test_replay_waits_for_the_whole_host_load_before_the_first_segment(consumers
             return_value=None,
         ),
     ):
-        owner.replay(ctx, torch.zeros(8, dtype=torch.int64), None)
+        owner.replay(
+            ctx, torch.zeros(8, dtype=torch.int64), None, request_token_history=None
+        )
     waits = [f"wait e{index}" for index in consumers or ()]
     assert events == waits + ["refresh", "inline"]
 
@@ -918,8 +928,7 @@ def test_outer_capture_records_one_variant_per_configured_request_count():
     owner.capture_buckets = [8]
     owner._captures = {}
     owner.input_buffers = SimpleNamespace(input_ids_buf=torch.ones(8))
-    owner._embed_tokens = lambda ids: ids
-    owner._land_input_embeds = lambda *args: None
+    owner._input_embeds_buf = torch.empty(8, 1)
     active_count = None
 
     def prepare(bucket, bs, mode, *, capture):
@@ -988,7 +997,7 @@ def test_executor_prepares_eager_prefill_metadata_before_any_layer(
     executor.attn_backend = SimpleNamespace(prepare_prefill_metadata=prepare)
     executor.prefill_graph = SimpleNamespace(
         can_run=lambda *_: use_graph,
-        replay=lambda *_: events.append("graph"),
+        replay=lambda *_, request_token_history: events.append("graph"),
     )
     executor.model_runner = SimpleNamespace(
         forward=lambda *_, **__: events.append("eager")
@@ -1007,7 +1016,8 @@ def kimi_host_cache():
     """A Kimi-K3 TP8 pool with a Host L2 tier, the device handle that runs a
     plan's cache ops on it, and a bare prefill graph owner over the pool, which
     captures a test's forward (its ``_run_inner``) in one bucket after the
-    Host cache executor exists, as a server does.
+    Host cache executor exists, as a server does. Memory saving is disabled
+    through the real adapter so capture still enters its named allocation scope.
 
     Page 1 of every cache group holds random bytes (finite floats in the first
     KDA layer's recurrent state) and is stored to Host page 1, which a test
@@ -1035,6 +1045,9 @@ def kimi_host_cache():
         HybridLinearAttnBackend,
     )
     from tokenspeed.runtime.layers.attention.backends.state.kda import KdaAttnBackend
+    from tokenspeed.runtime.utils.torch_memory_saver_adapter import (
+        TorchMemorySaverAdapter,
+    )
 
     class WriteBackOp:
         # A stream-ordered store of page ``src`` of each group to ``dst``.
@@ -1112,6 +1125,7 @@ def kimi_host_cache():
     owner = object.__new__(PrefillGraph)
     owner.disable = False
     owner.capture_buckets = [_BUCKET]
+    owner.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
     owner.num_warmup = 1
     owner._narrowing = None
     owner._expert_load_rows = None
@@ -1144,8 +1158,10 @@ def kimi_host_cache():
     )
     owner.make_dummy_batch = lambda num_tokens, bs: ctx
     owner._replay_bucket = lambda ctx: _BUCKET
-    owner._embed_tokens = torch.nn.Embedding(2, 4)
-    owner._land_input_embeds = lambda *args: None
+    owner.inner_model = SimpleNamespace(embed_tokens=torch.nn.Embedding(2, 4))
+    owner._compute_input_embeddings = (
+        lambda ids, ctx, *, request_token_history: owner.inner_model.embed_tokens(ids)
+    )
     owner.text_model = SimpleNamespace(
         lm_head=None, logits_processor=lambda ids, hidden, *args: hidden
     )
@@ -1283,7 +1299,9 @@ def test_a_replay_writes_a_loaded_tail_page_after_the_load(
         # Under inference mode, as the forward step replays.
         with maybe_inference_mode():
             result = owner.replay(
-                cache.ctx, torch.ones(_BUCKET, dtype=torch.int64), None
+                cache.ctx,
+                torch.ones(_BUCKET, dtype=torch.int64),
+                request_token_history=None,
             )
     finally:
         pool.__class__ = kimi_pool_class
@@ -1348,7 +1366,7 @@ def test_an_inline_kda_replay_reads_a_loaded_state_after_the_load(kimi_host_cach
     forward()
     torch.cuda.synchronize()
     inline = BreakableCapture()
-    with inline:
+    with maybe_inference_mode(), inline:
         inline_output = forward()
     assert inline.num_segments == 1
     owner._captures[_BUCKET, 1] = (inline, CapturedForward(inline_output, None))
@@ -1370,7 +1388,9 @@ def test_an_inline_kda_replay_reads_a_loaded_state_after_the_load(kimi_host_cach
         )
         with maybe_inference_mode():
             results[inline_kda] = owner.replay(
-                cache.ctx, torch.ones(_BUCKET, dtype=torch.int64), None
+                cache.ctx,
+                torch.ones(_BUCKET, dtype=torch.int64),
+                request_token_history=None,
             ).clone()
         assert not cache.executor.load_stream.query()
         torch.cuda.synchronize()
@@ -1465,7 +1485,11 @@ def test_a_replay_waits_before_each_segment_only_for_the_layers_it_touches(
             events.layer_done_events[layer].record()
     tracker.set_consumers(load)
     with maybe_inference_mode():
-        result = owner.replay(cache.ctx, torch.ones(_BUCKET, dtype=torch.int64), None)
+        result = owner.replay(
+            cache.ctx,
+            torch.ones(_BUCKET, dtype=torch.int64),
+            request_token_history=None,
+        )
     first_segment_done.synchronize()
     assert not load_stream.query()
     torch.cuda.synchronize()

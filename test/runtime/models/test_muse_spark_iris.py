@@ -152,7 +152,12 @@ def _prepare_muse_backend(world_size, projection, moe, *, expert_tp_size):
         config=SimpleNamespace(
             hidden_size=8192, moe_hidden_size=4096, num_experts_per_tok=8
         ),
-        model=SimpleNamespace(iris_state=None, layers=[layer]),
+        # The model's config says whether its monokernels share the heap.
+        model=SimpleNamespace(
+            iris_state=None,
+            layers=[layer],
+            config=SimpleNamespace(decode_monokernel=False),
+        ),
     )
     assert MuseSparkForConditionalGeneration.prepare_communication_runtime(owner, 8192)
     state = owner.model.iris_state
@@ -226,6 +231,7 @@ def _muse_owned_qkvg_worker(rank, world_size, device):
         torch.ones((64,), device=device, dtype=torch.float32),
         0.0,
         eps,
+        round_before_rope=False,
     )
 
     def make_inputs(rows):
@@ -654,10 +660,10 @@ def _muse_tp_owned_forward_worker(
                     torch.cat(shards, dim=-1), scale=scale, expert=None
                 )
             moe.down_columns.process_weights_after_loading(moe.down_columns)
-        moe.experts.process_weights_after_loading(moe.experts)
     else:
         moe.experts.w13_weight.normal_(0, 0.02)
         moe.experts.w2_weight.normal_(0, 0.02)
+    moe.experts.process_weights_after_loading(moe.experts)
     moe.gate.process_weights_after_loading(moe.gate)
     _, state = _prepare_muse_backend(world_size, None, moe, expert_tp_size=world_size)
     for rows in (192, 193, 1029):
@@ -786,6 +792,7 @@ def _muse_owned_routed_wt_worker(rank, world_size, device):
                 norm.weight_offset,
                 pdl_enabled(),
                 output,
+                None,
             )
         return state.reduce_scatter_owned_rows(output).clone()
 

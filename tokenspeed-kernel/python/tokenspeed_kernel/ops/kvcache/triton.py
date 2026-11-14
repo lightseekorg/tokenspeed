@@ -56,6 +56,7 @@ __all__ = [
     "compact_window_rows",
     "copy_page_fields",
     "copy_state_rows",
+    "dequant_gather_kv_mxfp8",
     "fused_fp8_set_kv_buffer",
     "get_mla_kv_buffer_triton",
     "index_k_block_split_scatter",
@@ -2075,6 +2076,9 @@ def _store_kv_cache_kernel(
     v_src_token_stride,
     k_dst_row_stride,
     v_dst_row_stride,
+    dst_page_size,
+    k_dst_page_stride,
+    v_dst_page_stride,
     n_kv_per_token: tl.constexpr,
     BLOCK: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
@@ -2101,12 +2105,26 @@ def _store_kv_cache_kernel(
         src = tl.load(
             v_src_ptr + row * v_src_token_stride + offsets, mask=mask, other=0
         )
-        tl.store(v_dst_ptr + dst_row * v_dst_row_stride + offsets, src, mask=mask)
+        tl.store(
+            v_dst_ptr
+            + (dst_row // dst_page_size) * v_dst_page_stride
+            + (dst_row % dst_page_size) * v_dst_row_stride
+            + offsets,
+            src,
+            mask=mask,
+        )
     else:
         src = tl.load(
             k_src_ptr + row * k_src_token_stride + offsets, mask=mask, other=0
         )
-        tl.store(k_dst_ptr + dst_row * k_dst_row_stride + offsets, src, mask=mask)
+        tl.store(
+            k_dst_ptr
+            + (dst_row // dst_page_size) * k_dst_page_stride
+            + (dst_row % dst_page_size) * k_dst_row_stride
+            + offsets,
+            src,
+            mask=mask,
+        )
 
 
 def store_kv_cache(
@@ -2123,7 +2141,8 @@ def store_kv_cache(
     launch handling both k and v rows. The last dim of all four tensors must
     be contiguous (stride == 1); the leading axis may have any stride — this
     lets src tensors come from a qkv-split view directly (no contiguous copy
-    required).
+    required). Destinations may also be ``[pages, rows, heads, dim]`` fields
+    with an explicit page stride; ``loc`` still indexes token slots.
 
     ``enable_pdl`` defaults to the platform policy; pass ``False`` to disable
     Programmatic Dependent Launch explicitly. When enabled, the kernel waits
@@ -2143,8 +2162,16 @@ def store_kv_cache(
 
     k_src_stride = k_src.stride(0) if k_src.dim() > 1 else k_src.shape[-1]
     v_src_stride = v_src.stride(0) if v_src.dim() > 1 else v_src.shape[-1]
-    k_dst_stride = k_dst.stride(0) if k_dst.dim() > 1 else k_dst.shape[-1]
-    v_dst_stride = v_dst.stride(0) if v_dst.dim() > 1 else v_dst.shape[-1]
+    k_dst_stride = (
+        k_dst.stride(-3)
+        if k_dst.dim() >= 3
+        else (k_dst.stride(0) if k_dst.dim() > 1 else k_dst.shape[-1])
+    )
+    v_dst_stride = (
+        v_dst.stride(-3)
+        if v_dst.dim() >= 3
+        else (v_dst.stride(0) if v_dst.dim() > 1 else v_dst.shape[-1])
+    )
 
     block = triton.next_power_of_2(n_kv_k)
     use_pdl = _use_pdl(enable_pdl)
@@ -2161,6 +2188,9 @@ def store_kv_cache(
         v_src_stride,
         k_dst_stride,
         v_dst_stride,
+        k_dst.shape[1] if k_dst.ndim == 4 else 1,
+        k_dst.stride(0) if k_dst.ndim == 4 else k_dst_stride,
+        v_dst.stride(0) if v_dst.ndim == 4 else v_dst_stride,
         n_kv_k,
         BLOCK=block,
         ENABLE_PDL=use_pdl,
@@ -3215,6 +3245,214 @@ def quantize_mxfp8_rows(
         **kwargs,
     )
     return data, sf
+
+
+# -----------------------------------------------------------------------------
+# MXFP8 KV dequantize + gather (a BF16 paged view of an MXFP8 cache)
+# -----------------------------------------------------------------------------
+
+
+@triton.jit
+def _dequant_mxfp8_tile(src_ptr, sf_ptr, slot, sf_word, valid, row_stride, head_off):
+    """Dequantize [ROWS, 128] fp8 rows of one head with their packed UE8M0 words.
+
+    Rows past the request's length read as zero: the pool bytes there may be
+    stale fp8 or scale NaNs that would poison P @ V.
+    """
+    d_off = tl.arange(0, 128)
+    q8 = tl.load(
+        src_ptr + slot[:, None] * row_stride + head_off + d_off[None, :],
+        mask=valid[:, None],
+        other=0,
+    )
+    x = q8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+    packed = tl.load(sf_ptr + sf_word, mask=valid, other=0).to(tl.uint32, bitcast=True)
+    exp = (packed[:, None] >> (8 * (d_off[None, :] // 32)).to(tl.uint32)) & 0xFF
+    y = x * tl.exp2(exp.to(tl.float32) - 127.0)
+    return tl.where(valid[:, None], y, 0.0).to(tl.bfloat16)
+
+
+@triton.jit
+def _dequant_gather_kv_mxfp8_kernel(
+    k_src_ptr,  # fp8 cache rows as u8, row = slot
+    v_src_ptr,
+    k_sf_ptr,  # SF slabs as u32 (4 packed e8m0), interleaved atom layout
+    v_sf_ptr,
+    page_table_ptr,  # [B, W] int32 source pages (kernel-page units)
+    seq_lens_ptr,  # [B] int32 tokens per request
+    first_page_ptr,  # [B] int32 first gathered logical page
+    num_pages_ptr,  # [B] int32 gathered pages
+    base_page_ptr,  # [B] int32 first scratch page of the request
+    k_dst_ptr,  # bf16 scratch rows, row = scratch slot
+    v_dst_ptr,
+    out_page_table_ptr,  # [B, W] int32
+    page_table_stride,
+    out_page_table_stride,
+    src_row_stride,
+    dst_row_stride,
+    sf_page_stride,  # nheads * chunks_per_page * 128 (u32 units)
+    page_tokens,  # tokens per page of the layer's group (SF layout unit)
+    width,
+    capacity_pages,
+    KERNEL_PAGE: tl.constexpr,
+    NHEADS: tl.constexpr,
+    PAGES_PER_PROG: tl.constexpr,
+    ROWS: tl.constexpr,
+):
+    b = tl.program_id(0).to(tl.int64)
+    chunk = tl.program_id(1)
+    seq_len = tl.load(seq_lens_ptr + b)
+    first = tl.load(first_page_ptr + b)
+    count = tl.load(num_pages_ptr + b)
+    base = tl.load(base_page_ptr + b)
+    rows = tl.arange(0, ROWS)
+    d_off = tl.arange(0, 128)
+    chunks_per_page = page_tokens // 128
+    for j in range(PAGES_PER_PROG):
+        i = chunk * PAGES_PER_PROG + j
+        if i < width:
+            dst_page = base + i - first
+            keep = (i >= first) & (i < first + count) & (dst_page < capacity_pages)
+            # Pages outside the gathered range point at scratch page 0: the
+            # kernels never read them (outside the window or past the length).
+            tl.store(
+                out_page_table_ptr + b * out_page_table_stride + i,
+                tl.where(keep, dst_page, 0),
+            )
+            if keep:
+                src_page = tl.load(page_table_ptr + b * page_table_stride + i).to(
+                    tl.int64
+                )
+                for r0 in range(0, KERNEL_PAGE, ROWS):
+                    valid = i * KERNEL_PAGE + r0 + rows < seq_len
+                    slot = src_page * KERNEL_PAGE + r0 + rows
+                    dst_slot = dst_page.to(tl.int64) * KERNEL_PAGE + r0 + rows
+                    page_off = slot % page_tokens
+                    row = page_off % 128
+                    sf_word = (
+                        (slot // page_tokens) * sf_page_stride
+                        + (page_off // 128) * 128
+                        + (row % 32) * 4
+                        + row // 32
+                    )
+                    for h in tl.static_range(NHEADS):
+                        word = sf_word + h * chunks_per_page * 128
+                        dst = (
+                            dst_slot[:, None] * dst_row_stride
+                            + h * 128
+                            + d_off[None, :]
+                        )
+                        k = _dequant_mxfp8_tile(
+                            k_src_ptr,
+                            k_sf_ptr,
+                            slot,
+                            word,
+                            valid,
+                            src_row_stride,
+                            h * 128,
+                        )
+                        tl.store(k_dst_ptr + dst, k)
+                        v = _dequant_mxfp8_tile(
+                            v_src_ptr,
+                            v_sf_ptr,
+                            slot,
+                            word,
+                            valid,
+                            src_row_stride,
+                            h * 128,
+                        )
+                        tl.store(v_dst_ptr + dst, v)
+
+
+def dequant_gather_kv_mxfp8(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k_sf: torch.Tensor,
+    v_sf: torch.Tensor,
+    page_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    first_page: torch.Tensor,
+    num_pages: torch.Tensor,
+    k_out: torch.Tensor,
+    v_out: torch.Tensor,
+    out_page_table: torch.Tensor,
+    *,
+    kernel_page_size: int,
+    page_tokens: int,
+) -> None:
+    """Dequantize the MXFP8 cache pages an attention call reads into BF16 pages.
+
+    Request ``b`` reads logical pages ``[first_page[b], first_page[b] +
+    num_pages[b])`` of its ``page_table`` row; they land on consecutive
+    scratch pages (requests in batch order) and ``out_page_table`` maps them,
+    so a BF16 paged-attention kernel run on ``(k_out, v_out, out_page_table)``
+    sees exactly the dequantized cache. Other ``out_page_table`` entries are 0.
+    Rows at or past ``seq_lens[b]`` are zero. Pages beyond the scratch
+    capacity are not gathered; callers size the scratch for the batch.
+
+    Args:
+        k_cache, v_cache: fp8-e4m3 row views ``[slots, H, 128]`` (the views
+            ``quantize_store_kv_mxfp8`` writes), slot = page * kernel_page_size + row.
+        k_sf, v_sf: e8m0 scale slabs in the interleaved layout of
+            ``quantize_store_kv_mxfp8`` for ``page_tokens``.
+        page_table: ``[B, W]`` int32 source pages in kernel-page units.
+        seq_lens: ``[B]`` int32 tokens per request.
+        first_page, num_pages: ``[B]`` int32 gathered page range per request.
+        k_out, v_out: BF16 scratch rows ``[scratch_slots, H, 128]``.
+        out_page_table: ``[B, W]`` int32 output page table.
+        kernel_page_size: Tokens per page-table entry.
+        page_tokens: Tokens per page of the layer's group (multiple of 128).
+    """
+    assert page_tokens % 128 == 0
+    if k_cache.dim() != 3 or k_cache.shape[-1] != 128 or v_cache.shape != k_cache.shape:
+        raise ValueError(
+            f"MXFP8 KV caches hold [slots, heads, 128] rows: "
+            f"{tuple(k_cache.shape)} / {tuple(v_cache.shape)}"
+        )
+    if k_out.dtype != torch.bfloat16 or k_out.shape[1:] != k_cache.shape[1:]:
+        raise ValueError(
+            f"scratch {tuple(k_out.shape)} {k_out.dtype} must be BF16 rows of "
+            f"the cache's {tuple(k_cache.shape[1:])} heads"
+        )
+    if v_out.shape != k_out.shape or v_out.dtype != k_out.dtype:
+        raise ValueError("the value scratch must match the key scratch")
+    if page_table.shape != out_page_table.shape:
+        raise ValueError("out_page_table must match page_table")
+    for t in (k_cache, v_cache, k_out, v_out):
+        assert t.stride(-1) == 1 and t.stride(-2) == 128
+    b, width = page_table.shape
+    if b == 0:
+        return
+    nheads = k_cache.shape[1]
+    base_page = torch.cumsum(num_pages, 0, dtype=torch.int32) - num_pages
+    pages_per_prog = 8
+    grid = (b, triton.cdiv(width, pages_per_prog))
+    _dequant_gather_kv_mxfp8_kernel[grid](
+        k_cache.view(torch.uint8),
+        v_cache.view(torch.uint8),
+        k_sf.view(torch.uint8).reshape(-1, 4).view(torch.int32).reshape(-1),
+        v_sf.view(torch.uint8).reshape(-1, 4).view(torch.int32).reshape(-1),
+        page_table,
+        seq_lens,
+        first_page,
+        num_pages,
+        base_page,
+        k_out,
+        v_out,
+        out_page_table,
+        page_table.stride(0),
+        out_page_table.stride(0),
+        k_cache.stride(0),
+        k_out.stride(0),
+        nheads * (page_tokens // 128) * 128,
+        page_tokens,
+        width,
+        k_out.shape[0] // kernel_page_size,
+        KERNEL_PAGE=kernel_page_size,
+        NHEADS=nheads,
+        PAGES_PER_PROG=pages_per_prog,
+        ROWS=32,
+    )
 
 
 # GLM-5 DSA block-split index-K scatter

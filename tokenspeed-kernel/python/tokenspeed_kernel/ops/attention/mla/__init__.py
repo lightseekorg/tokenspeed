@@ -1445,6 +1445,7 @@ def mla_decode_with_kvcache(
 # Backend registration (side-effect imports)
 # isort: off
 import tokenspeed_kernel.ops.attention.mla.cuda  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.mla.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.mla.tokenspeed_mla  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.mla.triton  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.mla.gluon  # noqa: E402,F401

@@ -219,6 +219,66 @@ ts serve \
     --speculative-num-draft-tokens 4
 ```
 
+## Inkling 2
+
+Inkling 2 serves the original Thinking Machines checkpoint,
+`thinkingmachines/Inkling-2-Small`, on both vendors: NVFP4 experts in layers
+0-39, MXFP8 experts in layers 40-47, everything else BF16. The DSpark draft
+(`mtp.safetensors`) ships in the same directory, so
+`--speculative-algorithm DSPARK` needs no draft path, and its widths (seven
+proposals per round) come from the checkpoint. `ts serve` selects the
+`inkling2` reasoning parser.
+
+The commands set only what Inkling 2 needs:
+
+- `--tp 4 --ep-size 4`: attention and dense layers 4-way tensor parallel,
+  experts 4-way expert parallel, the layout Inkling 2 is validated on.
+- `--mm-encoder-tp-mode data`: the vision encoder runs only at TP1; data mode
+  places a copy on every rank and spreads the images over them.
+- `--max-model-len 1048552`: the draft covers the checkpoint's 1,048,576
+  positions minus its 24-token speculative pad. Without the draft, drop this
+  flag and `--speculative-algorithm` to serve all 1,048,576 tokens.
+- `--sampling-backend triton`: on B300 it decodes about 3% faster than the
+  default sampler at nonzero temperature.
+- `--kv-cache-dtype mxfp8` (NVIDIA): the target's KV cache is stored as
+  MXFP8, FP8 E4M3 values with one power-of-two scale per 32; the DSpark
+  draft's stays BF16. A token takes 0.70 of its BF16 cache bytes, so four
+  B300 GPUs hold 15.8M tokens instead of 10.9M. With 64 concurrent agentic
+  sessions and `--kvstore-size 32`, that is 33% more throughput, as more
+  prefixes stay cached. From one to 32 sessions, per-user decode matches the
+  BF16 cache within about 2%, and the median first token comes 6-12 ms later.
+  Prefills over a cached prefix dequantize the pages they read into a BF16
+  scratch of `--max-model-len` tokens, 1 GiB per GPU. Accuracy matches the
+  BF16 cache in our evaluations.
+
+On NVIDIA, export `TRITON_USE_SLP_VECTORIZER=1`: with `tokenspeed-triton`
+post20261028, the default NVPTX vectorizer makes decode 3-4% slower. On AMD,
+the attention, draft attention, and vision backends stay on Triton.
+
+Add `--grammar-backend xgrammar` for JSON (`response_format`) requests.
+Requests without a schema decode as fast as without a grammar backend.
+
+The first start on a machine autotunes kernel tactics, which takes about 10
+minutes on four B300 GPUs. The results are saved under
+`~/.cache/tokenspeed/flashinfer-autotune`, so later starts with the same layout
+come up in about 80 seconds.
+
+```bash
+# nvidia (4x B300)
+TRITON_USE_SLP_VECTORIZER=1 ts serve thinkingmachines/Inkling-2-Small \
+    --tp 4 --ep-size 4 --mm-encoder-tp-mode data \
+    --max-model-len 1048552 --sampling-backend triton \
+    --kv-cache-dtype mxfp8 --speculative-algorithm DSPARK
+
+# amd (4x MI350X)
+ts serve thinkingmachines/Inkling-2-Small \
+    --tp 4 --ep-size 4 --mm-encoder-tp-mode data \
+    --max-model-len 1048552 --sampling-backend triton \
+    --attention-backend triton --drafter-attention-backend triton \
+    --mm-attention-backend triton_attn \
+    --speculative-algorithm DSPARK
+```
+
 ## MiniMax M3
 
 MiniMax M3 uses 128-token MSA blocks. TokenSpeed configures its dense and sparse
@@ -669,6 +729,12 @@ Notes:
   aggregated role the default bucket ladder takes about 7.5 GB more per GPU,
   out of the KV cache, and adds about 7 minutes to startup;
   `--prefill-graph-capture-token-sizes` captures fewer buckets for less.
+- The NVIDIA command below captures each prefill bucket for 1 and for up to
+  64 requests (`--prefill-graph-capture-batch-sizes 1 64`), so a prefill of
+  several requests also runs its KDA layers inside the graph instead of at
+  eager breaks. On 2 GB300 nodes, this cut the time-to-first-token of 2 to 64
+  concurrent short prompts by 40% to 55%, for about 0.7 GB less KV cache per
+  GPU and 2 to 3 more minutes of startup.
 - The Kimi-K3.1 DSpark draft (`Inferact/Kimi-K3.1-Pro-DSpark-preview`)
   proposes 7 tokens per step, so it takes
   `--speculative-num-draft-tokens 8`. Unlike Kimi-K3's draft, it attends
@@ -700,6 +766,7 @@ tokenspeed serve moonshotai/Kimi-K3.1-Pro \
   --mm-encoder-tp-mode data \
   --moe-backend flashinfer_trtllm \
   --max-num-seqs 64 \
+  --prefill-graph-capture-batch-sizes 1 64 \
   --speculative-algorithm DSPARK \
   --speculative-draft-model-path Inferact/Kimi-K3.1-Pro-DSpark-preview \
   --speculative-num-draft-tokens 8 \

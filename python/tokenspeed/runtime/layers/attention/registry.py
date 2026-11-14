@@ -163,6 +163,12 @@ def _resolve_heterogeneous_draft_family(
                 "Kimi-K3 unified cache currently requires an ordinary MLA draft view"
             )
         return draft_family
+    if target_family == "inkling":
+        if draft_family != "mha":
+            raise RuntimeError(
+                "Inkling unified cache requires an ordinary MHA draft view"
+            )
+        return draft_family
     if target_family not in _ORDINARY_CACHE_FAMILIES:
         if draft_family_declared:
             raise RuntimeError(
@@ -320,6 +326,7 @@ _HYBRID_DSA_KDA_ARCHITECTURES = {
 _INKLING_ARCHITECTURES = {
     "InklingForConditionalGeneration",
     "InklingForConditionalGenerationNextN",
+    "Inkling2ForConditionalGeneration",
 }
 
 _DSPARK_DRAFT_ARCHITECTURES = frozenset({"DeepseekV41ForCausalLMDSpark"})
@@ -543,7 +550,7 @@ def _resolve_cache_family(
     config: AttnConfig,
 ) -> CacheModelFamily:
     """The one dispatch from family facts (plus built config) to the recipe."""
-    if profile.model_profile is not None:
+    if profile.model_profile is not None and profile.model_profile.cache_family:
         return profile.model_profile.cache_family
     if config.component(Dots3NoteAttentionConfig) is not None:
         return "dots3_note"
@@ -655,6 +662,7 @@ def create_paged_router(
         spec_num_tokens=config.speculative_num_draft_tokens or 1,
         device=config.device,
         consumed_group_ids=(FULL_ATTENTION,) if name == "qsa" else None,
+        query_sharded=config.qcp_size > 1,
     )
 
 
@@ -1044,38 +1052,39 @@ def _create_target_components(
     )
     if backend is not None:
         return backend, pool
-    if linear_attention is not None:
-        backend = _create_hybrid_linear_attn_backend(
-            server_args,
-            model_config,
+    with arena.memory_saver_adapter.named_region("attention_state"):
+        if linear_attention is not None:
+            backend = _create_hybrid_linear_attn_backend(
+                server_args,
+                model_config,
+                config,
+                pool=pool,
+                full_attn_backend_name=full_attn_backend_name,
+                linear_attention=linear_attention,
+            )
+            return backend, pool
+
+        backend = _create_attn_backend(model_config.attention_arch, config)
+        if not is_inkling:
+            return backend, pool
+
+        from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
+            InklingAttnBackend,
+        )
+
+        text_config = model_config.hf_config.get_text_config()
+        backend = InklingAttnBackend.from_config(
+            backend,
+            text_config,
             config,
-            pool=pool,
-            full_attn_backend_name=full_attn_backend_name,
-            linear_attention=linear_attention,
+            num_layers=text_config.num_hidden_layers,
+            is_draft=False,
+            enable_layerwise_cache_ready=(
+                server_args.disaggregation_mode == "prefill"
+                and server_args.disaggregation_layerwise_interval > 0
+            ),
         )
         return backend, pool
-
-    backend = _create_attn_backend(model_config.attention_arch, config)
-    if not is_inkling:
-        return backend, pool
-
-    from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
-        InklingAttnBackend,
-    )
-
-    text_config = model_config.hf_config.get_text_config()
-    backend = InklingAttnBackend.from_config(
-        backend,
-        text_config,
-        config,
-        num_layers=text_config.num_hidden_layers,
-        is_draft=False,
-        enable_layerwise_cache_ready=(
-            server_args.disaggregation_mode == "prefill"
-            and server_args.disaggregation_layerwise_interval > 0
-        ),
-    )
-    return backend, pool
 
 
 def _create_draft_components(
@@ -1120,36 +1129,37 @@ def _create_draft_components(
     )
     if backend is not None:
         return backend, draft_pool
-    if linear_attention is not None:
-        backend = _create_hybrid_linear_attn_backend(
-            server_args,
-            model_config,
-            config,
-            pool=draft_pool,
-            full_attn_backend_name=full_attn_backend_name,
-            linear_attention=linear_attention,
-        )
+    with pool.arena.memory_saver_adapter.named_region("attention_state"):
+        if linear_attention is not None:
+            backend = _create_hybrid_linear_attn_backend(
+                server_args,
+                model_config,
+                config,
+                pool=draft_pool,
+                full_attn_backend_name=full_attn_backend_name,
+                linear_attention=linear_attention,
+            )
+            return backend, draft_pool
+
+        backend = _create_attn_backend(model_config.attention_arch, config)
+        if is_inkling:
+            from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
+                InklingAttnBackend,
+            )
+
+            # Depth layers carry conv checkpoint fields as continuation tenants
+            # of the target's kvconv/hiddenconv groups; the draft gets the same
+            # paged bridges (publish/restore) the target wrapper gets.
+            text_config = model_config.hf_config.get_text_config()
+            backend = InklingAttnBackend.from_config(
+                backend,
+                text_config,
+                config,
+                num_layers=num_layers,
+                is_draft=True,
+                enable_layerwise_cache_ready=False,
+            )
         return backend, draft_pool
-
-    backend = _create_attn_backend(model_config.attention_arch, config)
-    if is_inkling:
-        from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
-            InklingAttnBackend,
-        )
-
-        # Depth layers carry conv checkpoint fields as continuation tenants
-        # of the target's kvconv/hiddenconv groups; the draft gets the same
-        # paged bridges (publish/restore) the target wrapper gets.
-        text_config = model_config.hf_config.get_text_config()
-        backend = InklingAttnBackend.from_config(
-            backend,
-            text_config,
-            config,
-            num_layers=num_layers,
-            is_draft=True,
-            enable_layerwise_cache_ready=False,
-        )
-    return backend, draft_pool
 
 
 def _prepare_fixed_workspaces(
@@ -1363,19 +1373,27 @@ def create_attn_components(
         if draft_attn_config is not None
         else None
     )
-    # A draft model's own profile is authoritative for its cache layout;
-    # the attention-config class only approximates it for in-tree drafts.
+    # A draft model's own profile is authoritative for its cache layout. One that
+    # leaves cache_family None declares nothing: it binds like an undeclared
+    # draft, so the same draft serves an ordinary target (as an MHA view) and a
+    # custom family (through that family's own recipe).
     draft_profile = (
         draft_model_config.model_profile if draft_attn_config is not None else None
     )
-    if draft_profile is not None:
+    draft_family_declared = (
+        draft_profile is not None and draft_profile.cache_family is not None
+    )
+    if draft_family_declared:
         draft_cache_family = draft_profile.cache_family
+    elif draft_attn_config is not None and draft.is_inkling:
+        # The softmax config alone cannot tell a convolutional draft from MHA.
+        draft_cache_family = "inkling"
     else:
         draft_cache_family = _ordinary_cache_family(draft_attn_config)
     heterogeneous_draft_family = _resolve_heterogeneous_draft_family(
         cache_family,
         draft_cache_family,
-        draft_family_declared=draft_profile is not None,
+        draft_family_declared=draft_family_declared,
     )
     # One profile per boot, where a boot without a reserve takes it; a rebuild reuses it.
     if profiled_cache_bytes is None:
@@ -1551,21 +1569,25 @@ def create_attn_components(
     # their group geometry (and buffer sizing) from the pool's published
     # specs. Every LCM pool publishes a cache contract, so there is no
     # separate contract-marking step.
-    for side_backend, side_pool in ((backend, pool), (draft_attn_backend, draft_pool)):
-        if side_backend is None or side_pool is None:
-            continue
-        side_backend.set_cache_pool(side_pool)
+    with arena.memory_saver_adapter.named_region("attention_state"):
+        for side_backend, side_pool in (
+            (backend, pool),
+            (draft_attn_backend, draft_pool),
+        ):
+            if side_backend is None or side_pool is None:
+                continue
+            side_backend.set_cache_pool(side_pool)
 
-    _prepare_fixed_workspaces(
-        server_args=server_args,
-        config=config,
-        backend=backend,
-        draft_backend=draft_attn_backend,
-        uses_paged_state_verify=cache_setup.uses_paged_state_verify,
-        is_inkling=cache_family == "inkling",
-        qsa_bf16_scratch=qsa_bf16_scratch,
-        expected_bytes=fixed_workspace_bytes,
-    )
+        _prepare_fixed_workspaces(
+            server_args=server_args,
+            config=config,
+            backend=backend,
+            draft_backend=draft_attn_backend,
+            uses_paged_state_verify=cache_setup.uses_paged_state_verify,
+            is_inkling=cache_family == "inkling",
+            qsa_bf16_scratch=qsa_bf16_scratch,
+            expected_bytes=fixed_workspace_bytes,
+        )
 
     cache_storage = _cache_storage_report(
         configured_cache_bytes=cache_budget_bytes,

@@ -916,6 +916,81 @@ def test_the_remote_decode_keeps_the_forward_order():
     assert trace == ["forward", ("send", remote_decode)]
 
 
+def _decode_peer(trace):
+    """A D-role transfer peer the handle recognizes by type; records its
+    pulls."""
+
+    class _Peer:
+        mode = "decode"
+
+        def execute(self, op) -> None:
+            trace.append(("pull", op))
+
+    return _Peer()
+
+
+def _receiving_handle(trace, *, prepare=None):
+    handle = _handle(trace, kv_transfer=_decode_peer(trace))
+    executor = handle._executor
+    executor.prepare_remote_cache_slots = prepare or (
+        lambda slots: trace.append(("prepare", slots))
+    )
+    executor.reset_remote_prefill_cache_lengths = lambda op: trace.append("reset")
+    executor.zero_cache_pages = lambda pages: SimpleNamespace(
+        synchronize=lambda: trace.append("wait_zeroing")
+    )
+    return handle
+
+
+def _remote_prefill():
+    return SimpleNamespace(num_extends=lambda: 1, request_pool_indices=[3, 9])
+
+
+@pytest.mark.parametrize("forwards", [True, False])
+def test_a_remote_prefill_pulls_behind_the_rounds_forward(forwards):
+    """The zeroing fence the pull waits on is ordered behind the step in
+    flight; the round's forward is launched first so that wait never delays
+    its launch. A round without a batch still pulls."""
+    trace: list = []
+    handle = _receiving_handle(trace)
+    remote_prefill = _remote_prefill()
+
+    _execute(
+        handle,
+        _plan(pages_to_zero=[5], remote_prefill=remote_prefill),
+        _planned(num_extends=0) if forwards else None,
+    )
+
+    assert trace == [
+        ("prepare", [3]),
+        "reset",
+        *(["forward"] if forwards else []),
+        "wait_zeroing",
+        ("pull", remote_prefill),
+    ]
+
+
+def test_a_failed_slot_preparation_never_triggers_the_pull():
+    """Unprepared slots are never published: the failure surfaces from the
+    round itself, before the forward and the pull."""
+    trace: list = []
+
+    def prepare(slots):
+        raise RuntimeError("slot preparation failed")
+
+    handle = _receiving_handle(trace, prepare=prepare)
+
+    with pytest.raises(RuntimeError, match="slot preparation failed"):
+        _execute(
+            handle,
+            _plan(pages_to_zero=[5], remote_prefill=_remote_prefill()),
+            _planned(num_extends=0),
+        )
+
+    assert "forward" not in trace
+    assert not any(isinstance(entry, tuple) and entry[0] == "pull" for entry in trace)
+
+
 # ----------------------------------------------------------------------
 # EPD receive: the encoder facts a multimodal prefill node reads.
 # ----------------------------------------------------------------------
@@ -1405,12 +1480,16 @@ class _SleepDeviceModule:
     def synchronize(self) -> None:
         self._trace.append("device.synchronize")
 
+    def empty_cache(self) -> None:
+        self._trace.append("device.empty_cache")
+
 
 class _SleepExecutor:
     """Only what the release/wake operations read off the executor."""
 
     def __init__(self, trace) -> None:
         self.device = "cpu"
+        self.config = SimpleNamespace(enforce_eager=False)
         self.device_module = _SleepDeviceModule(trace)
         self.token_to_kv_pool = _SleepPool(trace)
 
@@ -1474,7 +1553,19 @@ def test_kv_release_without_a_peer_only_quiesces_and_repairs():
     ]
 
 
-def test_nccl_suspend_and_resume_reach_the_communicators(monkeypatch):
+@pytest.mark.parametrize(
+    "device_type,enforce_eager,hip",
+    [
+        ("cpu", False, None),
+        ("cuda", False, None),
+        ("cuda", True, None),
+        ("cuda", False, "6.4"),
+        ("cuda", True, "6.4"),
+    ],
+)
+def test_nccl_suspend_and_resume_reach_the_communicators(
+    monkeypatch, device_type, enforce_eager, hip
+):
     from tokenspeed.runtime.execution import device as device_module
 
     trace = []
@@ -1485,8 +1576,31 @@ def test_nccl_suspend_and_resume_reach_the_communicators(monkeypatch):
         device_module, "resume_nccl_communicators", lambda: trace.append("resume")
     )
     handle = DeviceHandle(_SleepExecutor(trace))
+    handle._forward_device = torch.device(device_type)
+    handle._executor.config.enforce_eager = enforce_eager
+    monkeypatch.setattr(torch.version, "hip", hip)
+    monkeypatch.setattr(
+        torch._C,
+        "_cuda_clearCublasWorkspaces",
+        lambda: trace.append("cuBLAS.clear"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        device_module, "trim_cuda_stack", lambda: trace.append("stack.trim") or 2048
+    )
+    monkeypatch.setattr(
+        device_module,
+        "restore_cuda_stack",
+        lambda limit: trace.append(("stack.restore", limit)),
+    )
 
     handle.suspend_nccl()
     handle.resume_nccl()
 
-    assert trace == ["suspend", "resume"]
+    expected = ["device.synchronize", "suspend"]
+    if device_type == "cuda" and enforce_eager:
+        expected += ["device.synchronize", "cuBLAS.clear"]
+    expected.append("device.empty_cache")
+    if device_type == "cuda" and hip is None:
+        expected += ["stack.trim", ("stack.restore", 2048)]
+    assert trace == [*expected, "resume"]

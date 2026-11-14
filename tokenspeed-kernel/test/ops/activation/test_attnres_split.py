@@ -133,7 +133,9 @@ def test_pair_tiles_match_row_kernels_bitwise(T, KB):
 
     got, ref = _scratch(T), _scratch(T)
     attnres_partial(blocks, wp_a, eps, got)
-    _attnres_partial_kernel[(T,)](blocks, wp_a, *ref, **args)
+    _attnres_partial_kernel[(T,)](
+        blocks, wp_a, *ref, n_tokens=T, NORMALIZE_VALUES=False, **args
+    )
     got_a, got_b, ref_a, ref_b = _scratch(T), _scratch(T), _scratch(T), _scratch(T)
     attnres_partial_dual(blocks, wp_a, wp_b, eps, got_a, got_b)
     _attnres_partial_dual_kernel[(T,)](blocks, wp_a, wp_b, *ref_a, *ref_b, **args)
