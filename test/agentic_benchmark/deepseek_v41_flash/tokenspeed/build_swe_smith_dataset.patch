@@ -1,0 +1,13 @@
+--- build_swe_smith_dataset.py
++++ build_swe_smith_dataset.py
+@@ -340,2 +340,3 @@
+-    from modelscope import AutoTokenizer
+-    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
++    from deepseek_v41_tokenizer import load_tokenizer
++
++    tokenizer = load_tokenizer(args.model_path)
+@@ -415 +416,3 @@
+-    with multiprocessing.Pool(num_workers) as pool:
++    # Use spawn context to avoid fork-based deadlocks on Linux.
++    mp_ctx = multiprocessing.get_context('spawn')
++    with mp_ctx.Pool(num_workers) as pool:
