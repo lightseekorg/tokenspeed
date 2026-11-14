@@ -48,6 +48,7 @@ from tokenspeed_kernel.ops.attention.kda import (  # noqa: E402
 from tokenspeed_kernel.ops.attention.kda._cute_dsl.commit_state import (  # noqa: E402
     MAX_WINDOW,
     commit_states,
+    commit_states_supported,
 )
 from tokenspeed_kernel.ops.attention.kda.vllm_recoverssm import (  # noqa: E402
     batched_recoverssm_commit,
@@ -258,6 +259,67 @@ def test_a_length_past_the_window_writes_nothing() -> None:
         assert torch.equal(got[target], original[target])
     assert any(not torch.equal(g, b) for g, b in zip(state, before))
     del keep
+
+
+def test_far_state_pages_commit_like_near_ones() -> None:
+    """State pages past 2**31 elements commit exactly like near pages.
+
+    The far pool holds the near pool's pages from a page offset past the bound,
+    and the round reads and writes the same pages shifted by that offset.
+    """
+    window, capacity, slots = 8, 8, 4
+    descriptors, state, _, keep = _pools(
+        1, 2, window=window, capacity=capacity, slots=slots, seed=21, extreme=False
+    )
+    round_args = _round(
+        1, 2, window=window, capacity=capacity, slots=slots, seed=22, rejects=False
+    )
+    near = state[0]
+    offset = 2**31 // (HEADS * DIM * DIM) + 1
+    assert offset * HEADS * DIM * DIM > 2**31
+    far = torch.empty(offset + near.shape[0], HEADS, DIM, DIM, device="cuda")
+    far[offset:] = near
+    far_descriptors = descriptors.clone()
+    far_descriptors.view(torch.int64)[0, 8] = far.data_ptr()
+    far_args = dict(
+        round_args,
+        read_indices=round_args["read_indices"] + offset,
+        write_indices=round_args["write_indices"] + offset,
+    )
+    before = near.clone()
+    commit_states(descriptors, **round_args, **_strides(window))
+    commit_states(far_descriptors, **far_args, **_strides(window))
+    torch.cuda.synchronize()
+    assert not torch.equal(near, before)
+    assert torch.equal(far[offset:].view(torch.int32), near.view(torch.int32))
+    del keep
+
+
+@pytest.mark.parametrize(
+    "state_stride, correction_stride, supported",
+    [
+        (HEADS * DIM * DIM, WIDTH + CORRECTION_ROW_PAD, True),
+        (HEADS * DIM * DIM + 2, WIDTH + CORRECTION_ROW_PAD, False),
+        (HEADS * DIM * DIM, WIDTH + CORRECTION_ROW_PAD + 1, False),
+    ],
+)
+def test_strides_off_16_bytes_keep_the_triton_commit(
+    state_stride, correction_stride, supported
+) -> None:
+    """The kernel moves state and corrections 16 bytes at a time."""
+    assert (
+        commit_states_supported(
+            activation_dtype=torch.bfloat16,
+            state_dtype=torch.float32,
+            draft_token_num=8,
+            head_dim=DIM,
+            lower_bound=-5.0,
+            record_metadata=torch.zeros(1, 3, dtype=torch.int64),
+            state_stride=state_stride,
+            correction_stride=correction_stride,
+        )
+        is supported
+    )
 
 
 def test_the_registered_commit_matches_the_triton_commit() -> None:

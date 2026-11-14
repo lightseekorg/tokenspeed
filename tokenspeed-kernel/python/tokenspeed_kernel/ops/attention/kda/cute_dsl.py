@@ -829,6 +829,8 @@ if current_platform().is_nvidia and has_optional_package("cutlass", "quack"):
             head_dim=head_dim,
             lower_bound=lower_bound,
             record_metadata=record_metadata,
+            state_stride=state_stride,
+            correction_stride=correction_stride,
         ):
             batched_recoverssm_commit(descriptors, **arguments)
             return

@@ -501,12 +501,15 @@ def commit_states_supported(
     head_dim: int,
     lower_bound: float | None,
     record_metadata: torch.Tensor | None,
+    state_stride: int,
+    correction_stride: int,
 ) -> bool:
     """Whether ``commit_states`` takes this batched commit.
 
     It takes BF16 records, FP32 state, 128-wide heads, a bounded gate, record
-    metadata, and windows of at most ``MAX_WINDOW`` tokens (the Triton
-    commit's CUDA-core path).
+    metadata, windows of at most ``MAX_WINDOW`` tokens (the Triton commit's
+    CUDA-core path), and state and correction strides that keep its 16-byte
+    loads and stores aligned.
     """
     return (
         activation_dtype == torch.bfloat16
@@ -515,6 +518,8 @@ def commit_states_supported(
         and lower_bound is not None
         and record_metadata is not None
         and 1 <= draft_token_num <= MAX_WINDOW
+        and state_stride % 4 == 0
+        and correction_stride % 4 == 0
     )
 
 
