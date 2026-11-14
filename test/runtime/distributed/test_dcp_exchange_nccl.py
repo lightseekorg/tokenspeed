@@ -567,6 +567,7 @@ def _records_leaf(dsa, group, rank, query_layout):
     leaf.kvp_block_granularity = _RECORDS_BLOCK
     leaf.kvp_virtual_block_count = _records_virtual_blocks(len(group))
     leaf.query_shard_metadata = None
+    leaf._row_shard_prefill = False
     leaf.step_counter = None
     leaf.num_attention_heads = _RECORDS_HEADS * len(group)
     leaf.num_local_heads = _RECORDS_HEADS

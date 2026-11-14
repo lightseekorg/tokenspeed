@@ -65,6 +65,7 @@ def test_dsa_sparse_prefill_publishes_one_cache_step_after_cache_use(
     backend.num_local_heads = 1
     backend.num_attention_heads = 1
     backend.query_shard_metadata = None
+    backend._row_shard_prefill = False
     backend.step_counter = SimpleNamespace(record_cache=lambda: events.append("ready"))
 
     def fake_dsa_prefill(**_kwargs):
