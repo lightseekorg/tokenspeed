@@ -2827,6 +2827,23 @@ class ServerArgs:
                 "a prefill engine runs no decodes and a decode engine no local "
                 "prefill rounds"
             )
+        if self.monokernel_stuck_record_dir is not None:
+            fs_type = _filesystem_type(self.monokernel_stuck_record_dir)
+            if fs_type != "tmpfs":
+                # The record file is mapped and registered as GPU-visible host
+                # memory. On a disk filesystem the kernel's periodic dirty-page
+                # writeback of those pages stalls decode for 1-2 s every few
+                # seconds; tmpfs pages are never written back.
+                raise ValueError(
+                    "--monokernel-stuck-record-dir must be on tmpfs (for "
+                    f"example /dev/shm); {self.monokernel_stuck_record_dir} is "
+                    f"on {fs_type}"
+                )
+        if self.monokernel_stuck_record_dir is not None and not self.decode_monokernel:
+            raise ValueError(
+                "--monokernel-stuck-record-dir needs --decode-monokernel: only "
+                "the monokernel launches write stuck-poll records"
+            )
         if self.device == "npu":
             if not self.disable_prefill_graph:
                 raise ValueError("NPU execution requires --disable-prefill-graph")
