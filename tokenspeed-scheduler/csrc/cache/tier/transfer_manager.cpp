@@ -47,6 +47,10 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores(StoreS
     ProfileSpan profile_span{"TierTransferManager::StartPendingStores"};
     _assert(cause == HostStoreCause::kPublication || cause == HostStoreCause::kFinish,
             "only publication and finish drain the pending-store queue");
+    auto candidates = coordinator_.TakePendingStores();
+    if (candidates.empty()) {
+        return std::nullopt;
+    }
     WriteBackStats& stats = write_back_stats_[static_cast<std::size_t>(cause)];
     std::vector<CacheKey> keys;
     std::vector<CacheBlockRef> device_block_refs;
@@ -67,7 +71,7 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores(StoreS
             storing_keys.insert(ticket.key);
         }
     }
-    for (auto& candidate : coordinator_.TakePendingStores()) {
+    for (auto& candidate : candidates) {
         if (coordinator_.ContainsHostCachedBlock(candidate.key)) {
             ++stats.host_cached;
             continue;
