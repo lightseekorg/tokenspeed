@@ -33,9 +33,12 @@ With `--enable-async-logging`, the Rust tracing writer and Python root logger
 also run off the serving threads. Each has a bounded, lossy queue: a slow
 output stream must not introduce I/O backpressure into a round. The host
 owns Python log cleanup explicitly after serving returns, including errors
-and encode ranks. Returning from Rust does not finalize Python, so an
+and encode ranks. A generation failure notifies the launcher before blocking
+cleanup or logging. Returning from Rust does not finalize Python, so an
 `atexit` hook alone cannot drain those records. Cleanup is bounded because
-an output stream can remain stalled.
+an output stream can remain stalled. For Ascend ranks, the launcher asks
+the host to restore the main thread's GIL after log cleanup so Triton-Ascend's
+native exit handlers can run.
 
 The ranks of a replica (an attention-TP group, across every pipeline stage)
 run the same scheduler. They talk over `ts-collective`'s TCP mesh, in fixed
@@ -68,7 +71,9 @@ members confirm device completion. A device failure during apply stops the
 engine through the existing host failure path. Cross-host supervision
 remains the deployment's responsibility. The host and runtime both opt in to
 the checked startup. CUDA and other devices use protocol 2 and its local
-memory-transition path, as do older host/runtime combinations. The existing
+memory-transition path, as do compatible older host/runtime combinations.
+Ascend Memory Saver serving requires protocol 3 and rejects an older host
+before building the device. The existing
 Gloo address rendezvous verifies that every rank in the serving world selected
 the same protocol before any rank starts the Rust mesh or reports ready.
 Protocol 2 still advertises a plain address. Protocol 3 tags its address

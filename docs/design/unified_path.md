@@ -92,6 +92,19 @@ NPU graph task updates and replay run in inference mode because they write the
 output tensors allocated during capture. This applies to active and idle DP
 ranks; callers need not establish an inference context.
 
+Ascend MHA target decode updates FIA's host sequence lengths before replay
+from the target's decode metadata. This applies the verify width floor to
+short live requests and padding rows alike. A speculative verify window uses
+causal attention aligned to the end of the cache. Automatic native MHA draft
+decode uses the Triton kernel in the decode graph and its warmup to read
+device sequence lengths, including the accepted frontier computed inside the
+same graph. Eager draft decode uses the normal kernel selection.
+For private pools using discard, the replay owns the writes to Q, workspace
+and outputs. Auto-dispatch updates the FIA task descriptors using live host
+lengths; the tasks consume device data in graph order. The shared causal
+mask is prepared before capture, alongside the resident input, sampler and
+attention metadata buffers.
+
 ### Buffer sizing: the ladder is a performance subset, never a capacity limit
 
 `ForwardStepRunner` distinguishes `max_capture_bs` (top of the capture ladder,
@@ -120,6 +133,9 @@ supported logits dtype up front, keyed by the head's
 the prepared state matching `logits.dtype`, with the portable packed-key
 all-reduce prepared as the fallback for any other dtype. They never construct,
 rendezvous or allocate communication state.
+
+Drafting capture checks use the logits tensor's accelerator. CPU execution has
+no capture state; allocation and compilation stay in warmup on each accelerator.
 
 ### Ascend context-parallel decode
 
@@ -1335,7 +1351,8 @@ round stream and launches its device-chained round behind it).
 
 Address-freezing bugs — a refresh that binds metadata views over storage the
 captured graph never recorded — are assertable: capture snapshots the tensor
-identities reachable from the decode-metadata slots (`graph_ptr_guard`), and
+identities reachable from the decode-metadata slots at ACL capture entry or
+after CUDA/ROCm capture (`graph_ptr_guard`), and
 `TOKENSPEED_GRAPH_DEBUG=1` re-verifies them before every replay (production
 replays pay one bool check). The snapshot has no exemption list: every
 tensor a slot reaches is an address the refresh must keep. Per-step-mutable

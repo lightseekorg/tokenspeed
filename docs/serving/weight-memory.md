@@ -6,16 +6,22 @@ routes. Rebuild the Python runtime, native host and kernel package together;
 the memory-saving startup handshake rejects native hosts without the
 replica-wide update-commit protocol (version 2: load admission and commit).
 On Ascend, a matching host and runtime also coordinate release and resume
-(version 3).
+(version 3). Ascend Memory Saver requires protocol 3. The
+[Ascend user guide](ascend-memory-saver.md) covers installation and a complete
+checkpoint update.
 
 ## Policy and model contract
 
 `cpu_backup` copies weight-region allocations to host memory and restores their
 contents on wake. `discard` releases target weight pages without copying old
 parameters to CPU. Remapping their original addresses does not make the model
-usable. A complete new version must arrive through the configured Model Updater
-SDK (`update_weights_from_mooncake`). Disk, tensor and distributed updates are
-not supported under discard.
+usable. A configured Model Updater SDK replaces the checkpoint through
+`update_weights_from_mooncake` on CUDA and Ascend. Ascend also accepts a
+complete disk checkpoint for the target through `update_weights_from_disk`.
+Use `load_format="auto"` for that path. The worker reads the current checkpoint
+files directly and validates full source shapes before taking rank-local slices.
+An invalid checkpoint detected after the update starts follows the same
+restart requirement as any other load failure.
 
 Discard requires an explicitly opted-in model that provides:
 
@@ -26,8 +32,9 @@ Discard requires an explicitly opted-in model that provides:
 Only immutable tensors, such as rotary caches, receive small CPU snapshots.
 The inventory cannot alias parameter storage. Parameter addresses, shapes,
 strides and dtypes must remain unchanged by the update. Models without this
-contract, quantized weights and online expert rebalancing are rejected. An
-opting-in model must also reject padded or transformed expert layouts unless
+contract, resolved quantization configs without their own discard opt-in, and
+online expert rebalancing are rejected. An opting-in model must also reject
+padded or transformed expert layouts unless
 it can reconstruct all padding and transformations after an update.
 
 `--model-update-draft-weights retain` preserves frozen draft allocations using
@@ -35,6 +42,8 @@ CPU backup. Target/draft shared embeddings or output weights keep the target's
 discard policy and receive the new target version. `refresh` instead requires
 complete target **and** draft streams before either model derives new state.
 A trainer that does not publish draft weights must use `retain`.
+An Ascend disk reload replaces the target only. With a discarded draft, use
+the SDK so both models can be loaded in one transaction.
 
 DeepEP and attention head-TP exchange allocations are deferred until the
 weight allocation region has exited. Head-TP peer address tables and Lamport
@@ -70,12 +79,15 @@ not suspend NCCL or release its communication buffers.
 ## One update cycle
 
 1. Stop admissions and drain running work on every serving replica.
-2. Release `kv_cache`, then `weights` and optionally `cuda_graph`. Keep NCCL
-   resident unless the deployment explicitly supports suspending it.
+2. Release `kv_cache`, then `weights` and optionally the decode graph pool
+   (`cuda_graph` on CUDA-compatible backends, `acl_graph` on Ascend). Keep HCCL
+   resident on Ascend. Release `nccl` only when the deployment supports
+   suspending it.
 3. Train and publish the next complete checkpoint version.
 4. Resume the weight and graph tags, leaving `kv_cache` released. This restores
    storage and immutable constants; target parameters remain invalid.
-5. Apply the complete SDK update to every prefill/decode engine. Each model
+5. Apply the complete SDK update on each engine, or load the complete disk
+   checkpoint on the Ascend worker. Each model
    checks for missing, duplicate, unexpected and unconsumed checkpoint inputs.
    All models validate coverage and all ranks agree on receiving success before
    any derived state is rebuilt. A stream or coverage failure aborts the session
@@ -86,7 +98,7 @@ not suspend NCCL or release its communication buffers.
    restart the deployment rather than attempting a partial wake. Before the
    update's cache flush and before any rank loads, all ranks agree that the
    update can start. If any rank refuses (weights still released, KV still
-   resident under discard, a non-SDK update under discard), no rank flushes or
+   resident under discard, or an unsupported update transport), no rank flushes or
    loads; if the flush is refused, no rank loads. Either way the weights stay
    untouched and the update may be retried.
 7. Resume `kv_cache`, then allow new rollouts. Remapped KV pages are cleared
