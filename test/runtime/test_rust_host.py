@@ -47,7 +47,7 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 register_cuda_ci(est_time=60, suite="runtime-1gpu")
 
 from test.l3_test_utils import storage_scheduler  # noqa: E402
-from test.runtime.distributed.cuda_memory_protocol.test_launcher_context_cpu import (  # noqa: E402
+from test.runtime.test_launcher_preload_cases import (  # noqa: E402
     conflicting_preload_cases,
     preload_cases,
 )
