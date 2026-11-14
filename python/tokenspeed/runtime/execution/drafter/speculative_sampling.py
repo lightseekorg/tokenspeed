@@ -70,6 +70,8 @@ from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.layers.sampled_vocab_shard import gather_topk_pairs
 
+# Bypasses the registry: tokenspeed-kernel has no family-level softmax op, and
+# the recorded q must be fp32 softmax(logits / T) on every platform.
 if current_platform().is_nvidia:
     from tokenspeed_kernel.ops.sampling.flashinfer import softmax
 else:

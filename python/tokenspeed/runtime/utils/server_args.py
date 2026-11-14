@@ -133,7 +133,7 @@ AUX_CAPTURE_SPEC_ALGORITHMS = ("EAGLE3", "EAGLE4")
 #: Drafters that propose one token per draft step (a chain of steps + 1 tokens, or a tree).
 STEP_SPEC_ALGORITHMS = ("EAGLE3", "EAGLE4", "MTP")
 # Drafters whose topk=1 chain can record sampled proposals for block
-# verification or synthetic rejection on the flashinfer backend.
+# verification (flashinfer or triton) or synthetic rejection (flashinfer).
 BLOCK_REJECTION_ALGORITHMS = ("DSPARK", "EAGLE3")
 # Verify rules, named as vLLM's rejection_sample_method.
 REJECTION_SAMPLE_METHODS = ("standard", "block", "synthetic")

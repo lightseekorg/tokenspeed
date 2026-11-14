@@ -36,12 +36,17 @@ Noise streams for a request with seed ``s`` and verify offset ``o``:
 * coin at row ``r``: ``rand(randint(s, COIN_OFFSET_SALT + o + r), 0)``;
 * draft step ``l``: ``rand(randint(s, DRAFT_SAMPLE_OFFSET_SALT + base + l),
   token_id)``;
-* block verification's residual / bonus coin:
-  ``rand(randint(s, BLOCK_RESIDUAL_COIN_OFFSET_SALT + o), 0)`` (its prefix
-  ``i`` reads the coin at row ``i``).
+* block verification's coins: ``rand(randint(s, BLOCK_COIN_OFFSET_SALT + o),
+  j)``, ``j = 0`` for the residual / bonus draw and ``j = 1 + i`` for prefix
+  ``i``.
 
 Plain offsets stay below ``2**40``, draft offsets below ``2**41`` and coin
 offsets below ``2**42``, so the four streams never share a draw.
+
+Block verification's accepted length depends on every prefix coin, so a coin
+past it is conditioned high. Its coins are therefore keyed by the step's first
+verify position alone: the next step starts at a later position and draws
+fresh coins, where row-keyed coins would re-read the conditioned ones.
 """
 
 from __future__ import annotations
@@ -51,7 +56,7 @@ from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.sampling.triton.common import check_draft_q_inputs
 
 __all__ = [
-    "BLOCK_RESIDUAL_COIN_OFFSET_SALT",
+    "BLOCK_COIN_OFFSET_SALT",
     "COIN_OFFSET_SALT",
     "DRAFT_SAMPLE_OFFSET_SALT",
     "block_verify_coins_from_pools",
@@ -62,7 +67,7 @@ __all__ = [
 # Philox offset salts of the draft and coin streams (see the module docstring).
 DRAFT_SAMPLE_OFFSET_SALT = 1 << 40
 COIN_OFFSET_SALT = 1 << 41
-BLOCK_RESIDUAL_COIN_OFFSET_SALT = 1 << 42
+BLOCK_COIN_OFFSET_SALT = 1 << 42
 # Top-p within this distance of 1 means no top-p cutoff.
 TOP_P_ONE_EPS = 1.0e-6
 
@@ -95,19 +100,19 @@ def _block_verify_coins_kernel(
     final_coins_ptr,
     coins_row_stride,
     NUM_TOKENS_PER_REQ: tl.constexpr,
-    COIN_SALT: tl.constexpr,
-    RESIDUAL_SALT: tl.constexpr,
+    BLOCK_SALT: tl.constexpr,
 ):
     req_row = tl.program_id(0)
     pool_idx = tl.load(req_pool_indices_ptr + req_row).to(tl.int64)
     seed = tl.load(seed_pool_ptr + pool_idx).to(tl.int64)
     offset = tl.load(offsets_pool_ptr + pool_idx).to(tl.int64)
+    step_seed = tl.randint(seed, BLOCK_SALT + offset)
     for spec_pos in tl.static_range(NUM_TOKENS_PER_REQ):
         tl.store(
             coins_ptr + req_row * coins_row_stride + spec_pos,
-            _coin(seed, offset + spec_pos, COIN_SALT),
+            tl.rand(step_seed, tl.full((), 1 + spec_pos, tl.int32)),
         )
-    tl.store(final_coins_ptr + req_row, _coin(seed, offset, RESIDUAL_SALT))
+    tl.store(final_coins_ptr + req_row, tl.rand(step_seed, tl.full((), 0, tl.int32)))
 
 
 @triton.jit
@@ -581,10 +586,10 @@ def block_verify_coins_from_pools(
 ) -> None:
     """Block verification's coins, keyed by each request's seed and position.
 
-    Prefix ``i`` of a request reads the coin token-wise rejection reads at
-    verify row ``i``, and the residual / bonus draw reads its own stream (see
-    the module docstring), so a request's coins are the same alone, in any
-    batch and after a retraction.
+    One draw keyed by the request's first verify position holds the residual /
+    bonus coin and then the prefix coins (see the module docstring), so a
+    request's coins are the same alone, in any batch and after a retraction,
+    and no two verify steps of a request share a coin.
 
     Args:
         req_pool_indices: ``[bs]`` int32/int64 pool slot of each request.
@@ -626,7 +631,6 @@ def block_verify_coins_from_pools(
         final_coins,
         coins.stride(0),
         NUM_TOKENS_PER_REQ=num_tokens_per_req,
-        COIN_SALT=COIN_OFFSET_SALT,
-        RESIDUAL_SALT=BLOCK_RESIDUAL_COIN_OFFSET_SALT,
+        BLOCK_SALT=BLOCK_COIN_OFFSET_SALT,
         num_warps=1,
     )

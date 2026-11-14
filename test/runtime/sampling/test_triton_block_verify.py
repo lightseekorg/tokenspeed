@@ -326,8 +326,10 @@ def test_standard_rejection_allocates_no_block_buffers(monkeypatch):
 
 @requires_gpu
 def test_coins_are_keyed_by_seed_and_position():
-    seed_pool = torch.tensor([0, 11, 22, 33], dtype=torch.int64, device="cuda")
-    offsets_pool = torch.tensor([0, 500, 600, 500], dtype=torch.int64, device="cuda")
+    seed_pool = torch.tensor([0, 11, 22, 33, 11], dtype=torch.int64, device="cuda")
+    offsets_pool = torch.tensor(
+        [0, 500, 600, 500, 501], dtype=torch.int64, device="cuda"
+    )
 
     def coins_of(slots):
         slots = torch.tensor(slots, dtype=torch.int32, device="cuda")
@@ -345,6 +347,13 @@ def test_coins_are_keyed_by_seed_and_position():
     assert not torch.equal(coins[0], coins[2])
     # The residual coin is its own stream, not prefix coin 0.
     assert not torch.equal(final, coins[:, 0])
+    # The next step of slot 1's request, one position on, re-verifies rows the
+    # step at 500 verified; the verdict at 500 conditioned those rows' coins,
+    # so the later step must not read any of them.
+    this_step, this_final = coins_of([1])
+    next_step, next_final = coins_of([4])
+    drawn = torch.cat([this_step[0], this_final])
+    assert not torch.isin(torch.cat([next_step[0], next_final]), drawn).any()
 
 
 @requires_gpu
