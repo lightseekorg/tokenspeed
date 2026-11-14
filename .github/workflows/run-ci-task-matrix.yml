@@ -107,7 +107,14 @@ jobs:
           echo "WORK_DIR=$work_dir" >> "$GITHUB_ENV"
           # Correctness jobs must be able to compile on full shared volumes.
           # Performance jobs retain their established warm kernel cache.
-          if [ "${{ matrix.type }}" = "ut" ] || [ "${{ matrix.type }}" = "eval" ]; then
+          # AMD unit tests keep the shared warm cache too to speed up CI.
+          use_job_triton_cache=false
+          case "${{ matrix.type }}:${{ matrix.runner }}" in
+            eval:*) use_job_triton_cache=true ;;
+            ut:amd-*) ;;
+            ut:*) use_job_triton_cache=true ;;
+          esac
+          if [ "$use_job_triton_cache" = true ]; then
             echo "TRITON_CACHE_DIR=$work_dir/.triton-cache" >> "$GITHUB_ENV"
           fi
           # Keep project dependencies job-local, but reuse EvalScope downloads
