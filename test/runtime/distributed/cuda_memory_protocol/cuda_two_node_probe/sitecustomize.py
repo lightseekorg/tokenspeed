@@ -128,13 +128,20 @@ if TRACE and HOST and Path("/proc/self/exe").resolve() == Path(HOST).resolve():
             backends = original_inventory(*args, **kwargs)
             if active_nccl is not None:
                 operation, release = active_nccl
-                # Observe exactly the production return value. Do not resolve
-                # communicators again or retain backend objects in the trace.
+                # Observe exactly the production return value. The read-only
+                # group names survive Python wrapper recreation and ID reuse.
+                # Do not resolve communicators again or retain backend objects.
                 record(
                     "nccl_inventory",
                     operation=operation,
                     release=release,
                     backend_ids=[id(backend) for backend in backends],
+                    backend_group_names=[
+                        backend.options.group_name for backend in backends
+                    ],
+                    registered_pg_names=list(
+                        nccl_suspend.distributed_c10d._world.pg_names.values()
+                    ),
                 )
             return backends
 

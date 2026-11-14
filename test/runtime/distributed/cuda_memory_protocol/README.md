@@ -68,7 +68,7 @@ needed by the environment:
 
 For example, an environment with a custom NCCL build can set
 `TS_TEST_NCCL_LIB_DIR=/absolute/path/to/nccl/lib`. The recorded H200 setup used
-PyTorch 2.9, FlashInfer 0.7.3, NVCC 12.8, and NCCL 2.30.7 with native
+PyTorch 2.9, FlashInfer 0.7.4, NVCC 12.8, and NCCL 2.30.7 with native
 suspend/resume support; these paths are not built into the runner.
 
 Warm the FlashInfer Hopper kernel in the same environment/cache used for
@@ -106,14 +106,17 @@ Missing, extra, empty, truncated, or non-integer ACK records are rejected.
 
 For each `nccl` case, the probe passively records the exact backend list
 returned by production `_nccl_backends` and the original suspend/resume
-return counts. It records only backend IDs, calls no additional communicator
-lookup, synchronization or collective, and returns the original objects and
-results unchanged. Each rank must have one positive count per direction,
-matching its unique inventory IDs within that apply phase; suspend and
-resume must cover the same backend ID set, with release before resume. Missing, duplicate, undercounted,
+return counts. It records only scalar metadata: backend IDs, read-only
+`backend.options.group_name` and the existing process-group registry names.
+It calls no additional communicator lookup, synchronization or collective,
+and returns the original objects and results unchanged. Each rank must have
+one positive count per direction, matching its unique backend IDs and unique
+registered group names within that apply phase. Python wrapper IDs can change
+or be reused between calls, so suspend/resume must cover the same group-name
+set, with release before resume. Missing, duplicate, undercounted,
 out-of-phase or unpaired records fail validation. Counts follow the actual
 inventory, including cached split communicators, rather than topology
-constants. Historical `nccl` logs without inventory records need a new run;
+constants. Historical `nccl` logs without this metadata need a new run;
 the checker does not waive this requirement. Non-`nccl` cases do not require
 inventory records.
 

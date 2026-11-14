@@ -89,7 +89,19 @@ def write_case(tmp_path, layout, *, mixed=False, protocol=3, nccl=False):
                                         "release": release,
                                         "operation": operation,
                                         "backend_ids": [
-                                            rank * 100 + i + 1 for i in range(count)
+                                            rank * 100
+                                            + i
+                                            + 1
+                                            + (0 if release else 10000)
+                                            for i in range(count)
+                                        ],
+                                        "backend_group_names": [
+                                            str(i) for i in range(count)
+                                        ],
+                                        # Registered CPU/unused groups need not
+                                        # appear in the actual NCCL inventory.
+                                        "registered_pg_names": [
+                                            str(i) for i in range(count + 2)
                                         ],
                                         "ns": stamp + 1,
                                     },
@@ -169,11 +181,28 @@ def test_nccl_inventory_can_vary_by_rank_without_topology_constants(tmp_path, pr
     for row in rows:
         if row["event"] == "nccl_inventory":
             ids = [row["rank"] * 100 + i + 1 for i in range(counts[str(row["rank"])])]
-            row["backend_ids"] = ids if row["release"] else ids[::-1]
+            names = [str(i) for i in range(len(ids))]
+            row["backend_ids"] = (
+                ids if row["release"] else [value + 10000 for value in ids[::-1]]
+            )
+            row["backend_group_names"] = names if row["release"] else names[::-1]
+            row["registered_pg_names"] = names + ["unused-group"]
         elif row["event"] == "nccl_complete":
             row["count"] = counts[str(row["rank"])]
     trace.write_text("".join(json.dumps(row) + "\n" for row in rows))
     assert summarize(directory)["nccl_backend_counts_per_rank"] == counts
+
+
+@pytest.mark.parametrize("protocol", [2, 3])
+def test_nccl_group_identity_allows_python_wrapper_id_reuse(tmp_path, protocol):
+    directory, _ = write_case(tmp_path, "ep4", protocol=protocol, nccl=True)
+    trace = directory / "serving/node-0.jsonl"
+    rows = [json.loads(line) for line in trace.read_text().splitlines()]
+    for row in rows:
+        if row["event"] == "nccl_inventory" and not row["release"]:
+            row["backend_ids"] = [value - 10000 for value in row["backend_ids"]]
+    trace.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    assert summarize(directory)["protocols"] == [protocol, protocol]
 
 
 @pytest.mark.parametrize("protocol", [2, 3])
@@ -193,7 +222,14 @@ def test_nccl_inventory_can_vary_by_rank_without_topology_constants(tmp_path, pr
         "non_integer_count",
         "wrong_operation",
         "unpaired_operation",
-        "unpaired_ids",
+        "unpaired_group_names",
+        "missing_group_names",
+        "missing_registry",
+        "empty_group_name",
+        "duplicate_group_name",
+        "unregistered_group_name",
+        "truncated_group_names",
+        "reused_ids_with_different_groups",
         "wrong_release",
         "wrong_rank",
         "out_of_phase",
@@ -252,8 +288,32 @@ def test_incomplete_or_unpaired_nccl_inventory_is_rejected(tmp_path, protocol, d
         for row in rows:
             if row["rank"] == 0 and row["event"] in {"nccl_inventory", "nccl_complete"}:
                 row["operation"] = 1
-    elif damage == "unpaired_ids":
-        inventory["backend_ids"][0] += 50
+    elif damage == "unpaired_group_names":
+        inventory["backend_group_names"][0] = "different-group"
+        inventory["registered_pg_names"].append("different-group")
+    elif damage == "missing_group_names":
+        del inventory["backend_group_names"]
+    elif damage == "missing_registry":
+        del inventory["registered_pg_names"]
+    elif damage == "empty_group_name":
+        inventory["backend_group_names"][0] = ""
+    elif damage == "duplicate_group_name":
+        inventory["backend_group_names"][-1] = inventory["backend_group_names"][0]
+    elif damage == "unregistered_group_name":
+        inventory["backend_group_names"][0] = "unregistered-group"
+    elif damage == "truncated_group_names":
+        inventory["backend_group_names"].pop()
+    elif damage == "reused_ids_with_different_groups":
+        resumed = next(
+            row
+            for row in rows
+            if row["event"] == "nccl_inventory"
+            and row["rank"] == 0
+            and not row["release"]
+        )
+        resumed["backend_ids"] = inventory["backend_ids"][:]
+        resumed["backend_group_names"][0] = "different-group"
+        resumed["registered_pg_names"].append("different-group")
     elif damage == "wrong_release":
         inventory["release"] = False
     elif damage == "wrong_rank":
