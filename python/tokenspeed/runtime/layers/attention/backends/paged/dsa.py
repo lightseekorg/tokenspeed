@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.ops.attention.dsa import (
+    MXFP4_INDEX_QUERY_FORMAT,
     dsa_decode,
     dsa_decode_dcp_records,
     dsa_decode_dcp_records_supported,
@@ -729,7 +730,8 @@ class DSABackend(PagedAttentionBackend):
         plus a KPool's ``pool_size - 1`` tail slots (GLM-5.3-Flash's 2051).
         Under DCP the indexer scores the model-dtype index query and head
         weights against packed index-K pages of this leaf's page size,
-        without a solution pin (``select_dsa_topk``).
+        without a solution pin (``select_dsa_topk``); an mxfp4 plane's
+        scorers take mxfp4 queries only.
         """
         use_dcp = len(self.kvp_group) > 1
         q_dtype = (
@@ -781,13 +783,18 @@ class DSABackend(PagedAttentionBackend):
                     "dsa_index_candidates",
                     "dsa_index_candidates",
                     format_signature(
-                        q=dense_tensor_format(self.q_data_type),
+                        q=(
+                            MXFP4_INDEX_QUERY_FORMAT
+                            if self.index_k_format == "mxfp4"
+                            else dense_tensor_format(self.q_data_type)
+                        ),
                         weights=dense_tensor_format(self.q_data_type),
                     ),
                     {
                         "index_heads": self.index_n_heads,
                         "head_dim": self.index_head_dim,
                         "page_size": self.kernel_page_size,
+                        "index_k_format": self.index_k_format,
                         "index_k_layout": "packed",
                     },
                     None,
@@ -811,11 +818,14 @@ class DSABackend(PagedAttentionBackend):
         if plan is not None:
             plan.validate("attention", mode, signature, traits, None, solution, None)
             return plan.kernel.name, True
-        if mode == "dsa_index_candidates" and self.index_k_format != "fp8_scaled":
+        if mode == "dsa_index_candidates" and self.index_k_format not in (
+            "fp8_scaled",
+            "mxfp4",
+        ):
             # The facade refuses any other plane before it selects.
             raise TypeError(
-                "DSA index candidates require packed FP8 Index-K storage, "
-                f"index_k_format is {self.index_k_format!r}"
+                "DSA index candidates require fp8_scaled or mxfp4 Index-K "
+                f"storage, index_k_format is {self.index_k_format!r}"
             )
         kernel = select_kernel(
             "attention", mode, signature, traits=traits, solution=solution

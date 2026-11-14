@@ -1208,7 +1208,16 @@ def test_select_dsa_topk_merges_every_tile_once(monkeypatch):
     plans, calls, gathers = [], [], []
 
     def plan(
-        q, weights, index_k_cache, local_table, requests, causal, *, page_size, columns
+        q,
+        weights,
+        index_k_cache,
+        local_table,
+        requests,
+        causal,
+        *,
+        page_size,
+        columns,
+        index_k_format,
     ):
         # Decode's metadata plans the table's width.
         assert columns is None

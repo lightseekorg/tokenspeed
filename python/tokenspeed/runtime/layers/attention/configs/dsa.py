@@ -45,9 +45,16 @@ _INDEX_K_SCALE_BYTES = torch._utils._element_size(torch.float32)
 # ``bf16`` keeps the keys as the indexer produced them, no scale plane. The
 # model config selects one (``index_k_format``); the pool writes exactly that
 # layout and the top-k facades read it off the plane's dtype, so a plane is
-# never converted on the way in or out.
-INDEX_K_FORMATS = ("fp8_scaled", "bf16")
-_INDEX_K_PLANE_DTYPES = {"fp8_scaled": torch.uint8, "bf16": torch.bfloat16}
+# never converted on the way in or out. ``mxfp4`` packs E2M1 keys with one
+# UE8M0 scale per 32 elements (DSV4.1's 68-byte index rows) into uint8 rows;
+# its dtype is fp8_scaled's, so every reader names it explicitly.
+INDEX_K_FORMATS = ("fp8_scaled", "bf16", "mxfp4")
+_INDEX_K_PLANE_DTYPES = {
+    "fp8_scaled": torch.uint8,
+    "bf16": torch.bfloat16,
+    "mxfp4": torch.uint8,
+}
+_INDEX_K_MXFP4_GROUP_SIZE = 32
 
 
 def index_k_plane_dtype(index_k_format: str) -> torch.dtype:
@@ -76,6 +83,13 @@ def index_k_row_bytes(index_head_dim: int, index_k_format: str) -> int:
     """Bytes of one index-K row in ``index_k_format``."""
     if index_k_format == "fp8_scaled":
         return dsa_index_k_row_bytes(index_head_dim)
+    if index_k_format == "mxfp4":
+        if index_head_dim <= 0 or index_head_dim % _INDEX_K_MXFP4_GROUP_SIZE:
+            raise ValueError(
+                f"mxfp4 index_head_dim must be a positive multiple of "
+                f"{_INDEX_K_MXFP4_GROUP_SIZE}, got {index_head_dim}"
+            )
+        return index_head_dim // 2 + index_head_dim // _INDEX_K_MXFP4_GROUP_SIZE
     return index_head_dim * torch._utils._element_size(
         index_k_plane_dtype(index_k_format)
     )

@@ -123,6 +123,7 @@ def _ctx(seq_lens, q_len, *, is_draft=False, placement=_PLACEMENT):
     pool = SimpleNamespace(
         get_index_k_buffer=lambda layer_id: torch.zeros(128, 132, dtype=torch.uint8),
         index_k_page_size=64,
+        index_k_format="fp8_scaled",
     )
     return SimpleNamespace(attn_backend=backend, token_to_kv_pool=pool, num_extends=0)
 
@@ -332,6 +333,7 @@ def _prefill_ctx(columns):
     pool = SimpleNamespace(
         get_index_k_buffer=lambda layer_id: torch.zeros(128, 132, dtype=torch.uint8),
         index_k_page_size=64,
+        index_k_format="fp8_scaled",
     )
     return SimpleNamespace(attn_backend=backend, token_to_kv_pool=pool, num_extends=1)
 
@@ -581,6 +583,7 @@ def test_a_history_prefill_selects_each_group_over_its_gathered_pages():
     pool = SimpleNamespace(
         get_index_k_buffer=lambda layer_id: torch.zeros(128, 132, dtype=torch.uint8),
         index_k_page_size=64,
+        index_k_format="fp8_scaled",
     )
     ctx = SimpleNamespace(attn_backend=backend, token_to_kv_pool=pool, num_extends=3)
     calls = []

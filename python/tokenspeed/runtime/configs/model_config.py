@@ -128,6 +128,8 @@ class _AttentionFamilySpec:
     configure: Callable[[object, ServerArgs], None]
     # A name, or a function of the launch returning one (None: no default).
     default_backend: str | Callable[[ServerArgs], str | None] | None = None
+    # ``configure`` reads ``--dsa-index-k-format``; other models refuse it.
+    takes_index_k_format: bool = False
 
 
 def override_model_config(model_config, ext_yaml):
@@ -177,9 +179,17 @@ def configure_kimi_k31_attention(model_config, server_args: ServerArgs) -> None:
     up to 45K tokens) score the same on both formats within run-to-run
     noise. The checkpoint's BF16 indexer weights (``KimiK3Config`` rejects
     ``indexer_use_fp8: true``) do not pin the serving format of the keys.
+    ``--dsa-index-k-format mxfp4`` stores 68-byte rows instead, refused under
+    bitwise numerics.
     """
-    configure_dsa_attention(model_config, server_args)
-    model_config.index_k_format = "fp8_scaled"
+    _configure_dsa_geometry(model_config)
+    index_k_format = server_args.dsa_index_k_format or "fp8_scaled"
+    if index_k_format == "mxfp4" and server_args.numerics in BITWISE_ENVELOPES:
+        raise ValueError(
+            "--dsa-index-k-format mxfp4 is not supported under --numerics "
+            f"{server_args.numerics}"
+        )
+    model_config.index_k_format = index_k_format
     # K3.1 keeps all DSA ops in one eager break narrowing padded replays to live rows.
     model_config.dsa_padded_prefill_replay = True
 
@@ -192,6 +202,11 @@ def configure_dsa_attention(model_config, server_args: ServerArgs) -> None:
     same geometry under every launch.
     """
     del server_args
+    _configure_dsa_geometry(model_config)
+
+
+def _configure_dsa_geometry(model_config) -> None:
+    """The MLA latent plus DSA indexer geometry, with ``fp8_scaled`` keys."""
     mla_config = (
         model_config.hf_text_config
         if hasattr(model_config.hf_text_config, "kv_lora_rank")
@@ -506,6 +521,7 @@ _ATTENTION_FAMILY_SPECS = (
         name="Kimi-K3.1",
         architectures=frozenset({"KimiK31ForConditionalGeneration"}),
         configure=configure_kimi_k31_attention,
+        takes_index_k_format=True,
     ),
     _AttentionFamilySpec(
         name="MLA",
@@ -546,6 +562,23 @@ def _resolve_attention_family(
         if any(arch in spec.architectures for arch in architectures):
             return spec
     return None
+
+
+def refuse_untaken_index_k_format(
+    family: _AttentionFamilySpec | None, architecture: str, server_args: ServerArgs
+) -> None:
+    """Refuse ``--dsa-index-k-format`` for a target whose attention family
+    does not read it, rather than serving the model's own format silently."""
+    if server_args.dsa_index_k_format is None or (
+        family is not None and family.takes_index_k_format
+    ):
+        return
+    takers = ", ".join(
+        s.name for s in _ATTENTION_FAMILY_SPECS if s.takes_index_k_format
+    )
+    raise ValueError(
+        f"--dsa-index-k-format applies only to {takers}, not {architecture}"
+    )
 
 
 def _is_dflash2_mla(
@@ -933,6 +966,16 @@ class ModelConfig:
             self.hf_config,
             self.hf_text_config,
         )
+        # A profile's own hook answers for the flags it reads, and the target
+        # answers for the launch its drafts share.
+        if (
+            server_args is not None
+            and self.model_profile is None
+            and not is_draft_worker
+        ):
+            refuse_untaken_index_k_format(
+                attention_family, resolve_architecture(self.hf_config), server_args
+            )
         if self.model_profile is not None:
             _apply_attention_defaults(
                 server_args,

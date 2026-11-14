@@ -33,6 +33,7 @@ from dataclasses import dataclass
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.attention.dsv41.triton import _mxfp4_index_rows, _ue8m0_word
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
 _PER_LAYER_GRID_CAP = int(os.environ.get("TOKENSPEED_KV_GRID_CAP", "64"))
@@ -3700,7 +3701,7 @@ def index_k_layernorm_scatter(
 @triton.jit
 def _index_k_layernorm_fp8_scatter_row(
     fp8_buf_ptr,  # uint8 flat view of the paged plane
-    scale_buf_ptr,  # float32 flat view of the same storage
+    scale_buf_ptr,  # float32 (int32 for MXFP4) flat view of the same storage
     x_ptr,  # [tokens, HD] pre-norm keys, unit inner stride
     weight_ptr,  # [HD] LayerNorm weight
     bias_ptr,  # [HD] LayerNorm bias
@@ -3709,7 +3710,7 @@ def _index_k_layernorm_fp8_scatter_row(
     t,  # int64 row
     x_row_stride,
     page_bytes,  # bytes per page (page stride)
-    scale_base_off,  # float32 offset of a page's scales ((ps*hd)//4)
+    scale_base_off,  # 4-byte offset of a page's scales (code bytes // 4)
     eps,
     HAS_WRITE_MASK: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
@@ -3718,7 +3719,9 @@ def _index_k_layernorm_fp8_scatter_row(
     NG: tl.constexpr,
     BLOCK_NG: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    MXFP4: tl.constexpr,
 ):
+    tl.static_assert(not MXFP4 or (HD == 128 and GROUP == 32))
     g = tl.arange(0, BLOCK_NG)[:, None]
     c = tl.arange(0, GROUP)[None, :]
     d = g * GROUP + c
@@ -3732,25 +3735,49 @@ def _index_k_layernorm_fp8_scatter_row(
     bias = tl.load(bias_ptr + d, mask=mask, other=0.0).to(tl.float32)
     # The keys are model-dtype rows before they are quantized.
     y = (centered * rstd * weight + bias).to(x_ptr.dtype.element_ty).to(tl.float32)
-    scale = tl.maximum(tl.max(tl.abs(y), axis=1), 1e-10) / FP8_MAX
-    codes = tl.clamp(y / scale[:, None], -FP8_MAX, FP8_MAX).to(tl.float8e4nv)
 
-    store_mask = mask
+    write = True
     if HAS_WRITE_MASK:
-        store_mask = store_mask & tl.load(write_mask_ptr + t).to(tl.int1)
+        write = tl.load(write_mask_ptr + t).to(tl.int1)
     loc = tl.load(loc_ptr + t).to(tl.int64)
     page = loc // PAGE_SIZE
     slot = loc % PAGE_SIZE
-    tl.store(
-        fp8_buf_ptr + page * page_bytes + slot * HD + d,
-        codes.to(tl.uint8, bitcast=True),
-        mask=store_mask,
-    )
-    tl.store(
-        scale_buf_ptr + page * (page_bytes // 4) + scale_base_off + slot * NG + g,
-        scale[:, None],
-        mask=store_mask,
-    )
+    if MXFP4:
+        # DSV4.1's index codec: UE8M0 2**ceil(log2(amax / 6)) per 32 elements.
+        grouped = tl.reshape(y, (1, NG, GROUP))
+        amax = tl.maximum(tl.max(tl.abs(grouped), 2), 6 * 2.0**-126)
+        packed, exponent = _mxfp4_index_rows(grouped, tl.div_rn(amax, 6.0), 1)
+        tl.store(
+            fp8_buf_ptr
+            + page * page_bytes
+            + slot * (HD // 2)
+            + tl.arange(0, HD // 2)[None, :],
+            packed,
+            mask=write,
+        )
+        tl.store(
+            scale_buf_ptr
+            + page * (page_bytes // 4)
+            + scale_base_off
+            + slot
+            + tl.arange(0, 1),
+            _ue8m0_word(exponent),
+            mask=write,
+        )
+    else:
+        scale = tl.maximum(tl.max(tl.abs(y), axis=1), 1e-10) / FP8_MAX
+        codes = tl.clamp(y / scale[:, None], -FP8_MAX, FP8_MAX).to(tl.float8e4nv)
+        store_mask = mask & write
+        tl.store(
+            fp8_buf_ptr + page * page_bytes + slot * HD + d,
+            codes.to(tl.uint8, bitcast=True),
+            mask=store_mask,
+        )
+        tl.store(
+            scale_buf_ptr + page * (page_bytes // 4) + scale_base_off + slot * NG + g,
+            scale[:, None],
+            mask=store_mask,
+        )
 
 
 @triton.jit
@@ -3773,6 +3800,7 @@ def _index_k_layernorm_fp8_scatter_kernel(
     NG: tl.constexpr,
     BLOCK_NG: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    MXFP4: tl.constexpr,
 ):
     _index_k_layernorm_fp8_scatter_row(
         fp8_buf_ptr,
@@ -3794,6 +3822,7 @@ def _index_k_layernorm_fp8_scatter_kernel(
         NG,
         BLOCK_NG,
         FP8_MAX,
+        MXFP4,
     )
 
 
@@ -3808,12 +3837,16 @@ def _index_k_layernorm_fp8_scatter_args(
     page_size: int,
     group_size: int,
     write_mask: torch.Tensor | None,
+    index_k_format: str = "fp8_scaled",
 ) -> tuple[tuple, dict[str, object]]:
     """Validate an :func:`index_k_layernorm_fp8_scatter` write (same arguments).
 
     Returns ``(args, constexprs)``: the runtime arguments and the constexprs
     ``_index_k_layernorm_fp8_scatter_kernel`` takes for it.
     """
+    if index_k_format not in ("fp8_scaled", "mxfp4"):
+        raise ValueError(f"unsupported index_k_format {index_k_format!r}")
+    mxfp4 = index_k_format == "mxfp4"
     tokens = index_k.shape[0]
     head_dim = index_k.shape[1] if index_k.ndim == 2 else -1
     if index_k.ndim != 2 or index_k.stride(-1) != 1:
@@ -3835,8 +3868,11 @@ def _index_k_layernorm_fp8_scatter_args(
         or write_mask.device != loc.device
     ):
         raise ValueError("Index-K write mask must be bool [tokens] on the slot device")
+    if mxfp4 and (head_dim != 128 or group_size != 32):
+        raise ValueError("mxfp4 index keys need head_dim 128 and group_size 32")
     ng = head_dim // group_size
-    row_bytes = head_dim + ng * 4
+    code_bytes = head_dim // 2 if mxfp4 else head_dim
+    row_bytes = code_bytes + (4 if mxfp4 else ng * 4)
     page_bytes = page_size * row_bytes
     if buf.ndim == 3:
         buf = buf.view(buf.shape[0], -1)
@@ -3853,7 +3889,7 @@ def _index_k_layernorm_fp8_scatter_args(
         raise ValueError("Index-K pages must be float32 aligned")
     args = (
         buf,
-        buf.view(torch.float32),
+        buf.view(torch.int32 if mxfp4 else torch.float32),
         index_k,
         weight.contiguous(),
         bias.contiguous(),
@@ -3861,7 +3897,7 @@ def _index_k_layernorm_fp8_scatter_args(
         write_mask,
         index_k.stride(0),
         page_bytes,
-        (page_size * head_dim) // 4,
+        (page_size * code_bytes) // 4,
         float(eps),
     )
     constexprs = {
@@ -3872,6 +3908,7 @@ def _index_k_layernorm_fp8_scatter_args(
         "NG": ng,
         "BLOCK_NG": _next_power_of_two(ng),
         "FP8_MAX": float(torch.finfo(torch.float8_e4m3fn).max),
+        "MXFP4": mxfp4,
     }
     return args, constexprs
 
@@ -3887,6 +3924,7 @@ def index_k_layernorm_fp8_scatter(
     page_size: int,
     group_size: int,
     write_mask: torch.Tensor | None,
+    index_k_format: str = "fp8_scaled",
 ) -> None:
     """LayerNorm pre-norm index keys and write them as fp8_scaled rows.
 
@@ -3909,6 +3947,11 @@ def index_k_layernorm_fp8_scatter(
         group_size: Elements per scale; divides ``head_dim``.
         write_mask: Optional bool ``[tokens]`` ownership mask; False rows are
             not written. None writes every row.
+        index_k_format: ``"fp8_scaled"``, or ``"mxfp4"`` for DSV4.1's index
+            codec: 64 nibble-packed E2M1 code bytes per row (even element in
+            the low nibble) and then each row's four UE8M0 exponents of
+            ``2**ceil(log2(max(amax, 6 * 2**-126) / 6))``. mxfp4 needs
+            ``head_dim`` 128 and ``group_size`` 32.
 
     Returns:
         None; ``buf`` is written in place.
@@ -3923,6 +3966,7 @@ def index_k_layernorm_fp8_scatter(
         page_size=page_size,
         group_size=group_size,
         write_mask=write_mask,
+        index_k_format=index_k_format,
     )
     if index_k.shape[0] == 0:
         return

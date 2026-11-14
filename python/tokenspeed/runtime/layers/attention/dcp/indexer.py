@@ -261,6 +261,9 @@ class DCPIndexMetadata:
     planned, are that wide, and otherwise every tile plans its own pages at
     it. ``None`` tiles by the table's width (decode's static width, or a leaf
     that compacts the whole table per call).
+
+    ``index_k_format`` names the plane's format for the candidate leaf where
+    its dtype does not (``"mxfp4"``); ``None`` reads it off the dtype.
     """
 
     page_table: torch.Tensor
@@ -270,6 +273,7 @@ class DCPIndexMetadata:
     pages: DSAIndexCandidatePages | None
     placement: CachePlacement
     columns: int | None = None
+    index_k_format: str | None = None
 
 
 # Above this, plan pages per tile: forward-wide pages stay live across MoE peaks.
@@ -291,6 +295,7 @@ def _owned_columns(
     index_k_cache: torch.Tensor,
     local_table: torch.Tensor,
     page_size: int,
+    index_k_format: str | None,
 ) -> int | None:
     """The owned width to tile by, or ``None`` for the table's width.
 
@@ -299,7 +304,7 @@ def _owned_columns(
     its logits by the whole table, so it keeps the table's width.
     """
     if columns is None or not dsa_index_candidates_accepts_pages(
-        q, weights, index_k_cache, page_size=page_size
+        q, weights, index_k_cache, page_size=page_size, index_k_format=index_k_format
     ):
         return None
     if columns <= 0:
@@ -318,6 +323,7 @@ def build_dcp_index_metadata(
     placement: CachePlacement,
     page_size: int,
     columns: int | None = None,
+    index_k_format: str | None = None,
 ) -> DCPIndexMetadata:
     """Resolve owned pages once for every indexer layer of a forward.
 
@@ -334,7 +340,9 @@ def build_dcp_index_metadata(
     local_table = _local_index_table(page_table, placement, page_size)
     query_requests = query_requests.contiguous()
     causal_lens = causal_lens.contiguous()
-    columns = _owned_columns(columns, q, weights, index_k_cache, local_table, page_size)
+    columns = _owned_columns(
+        columns, q, weights, index_k_cache, local_table, page_size, index_k_format
+    )
     pages = None
     if (
         columns is None
@@ -349,9 +357,17 @@ def build_dcp_index_metadata(
             causal_lens,
             page_size=page_size,
             columns=columns,
+            index_k_format=index_k_format,
         )
     return DCPIndexMetadata(
-        page_table, local_table, query_requests, causal_lens, pages, placement, columns
+        page_table,
+        local_table,
+        query_requests,
+        causal_lens,
+        pages,
+        placement,
+        columns,
+        index_k_format,
     )
 
 
@@ -375,6 +391,7 @@ def select_dsa_topk(
     columns: int | None = None,
     q_scales: torch.Tensor | None = None,
     query_group_size: int = 1,
+    index_k_format: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Return request-relative global Top-K from local Index-K pages.
 
@@ -402,11 +419,15 @@ def select_dsa_topk(
     not) fits, or the table-width tile where that is larger, so no exchange
     outgrows the table-width plan's.
     ``q_scales`` is the FP32 ``[rows, index_heads]`` scale of FP8 E4M3
-    queries, its rows aligned with ``q``'s and sliced to each tile like
-    them; None for BF16 queries. With ``q_scales``, ``query_group_size``
+    queries, or the int32 UE8M0 scale words of mxfp4 (uint8) ones, its rows
+    aligned with ``q``'s and sliced to each tile like them; None for BF16
+    queries. With ``q_scales``, ``query_group_size``
     consecutive rows are one request's verify window and share key tiles,
     each row keeping its own causal length. A tile whose first or end row is
     not a multiple of it scores its rows in groups of one.
+    ``index_k_format`` names the plane's format where its dtype does not
+    (``"mxfp4"``), as :class:`DCPIndexMetadata`'s does; ``metadata`` must
+    carry the same.
     """
     if q.shape[0] == 0:
         return (
@@ -422,7 +443,16 @@ def select_dsa_topk(
             causal_lens,
             None,
             placement,
-            _owned_columns(columns, q, weights, index_k_cache, local_table, page_size),
+            _owned_columns(
+                columns,
+                q,
+                weights,
+                index_k_cache,
+                local_table,
+                page_size,
+                index_k_format,
+            ),
+            index_k_format,
         )
     elif columns is not None:
         raise ValueError("DCP index metadata carries its own columns")
@@ -430,6 +460,7 @@ def select_dsa_topk(
         metadata.placement != placement
         or metadata.page_table.shape != page_table.shape
         or metadata.query_requests.shape != (q.shape[0],)
+        or metadata.index_k_format != index_k_format
     ):
         raise ValueError(
             "DCP index metadata was built for another placement, table or rows"
@@ -532,6 +563,7 @@ def _tile_pages(
         metadata.causal_lens[start:end],
         page_size=page_size,
         columns=metadata.columns,
+        index_k_format=metadata.index_k_format,
     )
     if pages is None:
         raise RuntimeError(
@@ -579,6 +611,7 @@ def _score_rows(
             if start % query_group_size == 0 and end % query_group_size == 0
             else 1
         ),
+        index_k_format=metadata.index_k_format,
     )
 
 
@@ -632,9 +665,11 @@ def select_owned_dsa_topk(
 
     Args:
         q: Index queries ``[rows, index_heads, head_dim]``, BF16, or FP8 E4M3
-            with ``q_scales``.
+            with ``q_scales``; or uint8 E2M1 codes ``[rows, index_heads,
+            head_dim / 2]`` with ``q_scales`` for an mxfp4 plane.
         weights: Per-head weights ``[rows, index_heads]``.
-        index_k_cache: This rank's packed FP8 Index-K pages (uint8).
+        index_k_cache: This rank's packed Index-K pages (uint8), in
+            ``metadata``'s ``index_k_format``.
         metadata: :func:`build_dcp_index_metadata` for these rows; its
             placement names the KVP group and this rank.
         page_size: Tokens per cache page.
@@ -645,7 +680,8 @@ def select_owned_dsa_topk(
         local_tokens: Trailing tokens of each row's window always selected.
         rider: Contiguous uint8 ``[rows, width]`` of this rank, ``width`` a
             multiple of 4, or None.
-        q_scales: FP32 ``[rows, index_heads]`` scales of FP8 queries, or None.
+        q_scales: FP32 ``[rows, index_heads]`` scales of FP8 queries, int32
+            UE8M0 scale words of mxfp4 ones, or None.
         query_group_size: Consecutive rows of one request's verify window,
             as in :func:`select_dsa_topk`.
         out: Preallocated int32 ``[rows, topk]`` local slots.
