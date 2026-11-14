@@ -714,6 +714,16 @@ class MoELayer(torch.nn.Module):
         return self.plan["supports_prequantized_input"]
 
     @property
+    def sorted_route_rows(self) -> frozenset[int]:
+        """Row counts at which the apply takes routes already sorted by expert."""
+        return self.plan["sorted_route_rows"]
+
+    @property
+    def sorted_route_block_size(self) -> int | None:
+        """Expert padding block of the sort those rows take."""
+        return self.plan["sorted_route_block_size"]
+
+    @property
     def supports_all_to_all_ep(self) -> bool:
         """Whether the kernel owns all-to-all dispatch, so each rank routes only
         its own tokens. Otherwise every rank routes every token and an expert

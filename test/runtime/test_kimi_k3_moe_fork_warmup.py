@@ -117,6 +117,7 @@ def _make_moe(fork: _SpyFork, *, num_tokens: int) -> SimpleNamespace:
         iris_state=None,
         stream_fork=fork,
         _topk_ready=None,
+        _fused_routing_scratch=None,
         routed_hidden=4,
         comm=comm,
         # Stand in for TopKOutputFormat so the fake does not have to track the
@@ -371,7 +372,12 @@ def test_row_sharded_moe_tail_selection_and_fallback(
         moe, prefix, prefix, rows, rows, prefix_is_sharded=False
     )
 
-    assert fork.calls == [{"enable": graph_phase, "overlap": capture_mode}]
+    assert fork.calls == [
+        {
+            "enable": graph_phase and mod.MOE_ROUTING_STREAM_FORK,
+            "overlap": capture_mode,
+        }
+    ]
     assert moe.experts._situ_output_buffer is (routed if producer_direct else None)
     moe.shared_experts.assert_called_once_with(
         prefix, down_out=shared if producer_direct else None
@@ -886,6 +892,163 @@ def test_non_iris_moe_tail_materializes_a_sharded_residual(monkeypatch, rows):
     gather.assert_called_once_with(shard, group, dim=0, backend=None)
     stage2 = moe.comm.up_proj_ag if rows <= 32 else moe.comm.up_proj_inject_ar
     assert stage2.call_count == 1 and stage2.call_args.args[2] is full
+
+
+# The decode rows at which the gfx950 A8W4 MoE takes an upstream sort.
+_SORTED_ROUTE_ROWS = frozenset(range(8, 193))
+
+
+class _Gate:
+    """The router gate: fixed FP32 logits and the selection bias."""
+
+    def __init__(self, logits: torch.Tensor, bias: torch.Tensor) -> None:
+        self.logits = logits
+        self.e_score_correction_bias = bias
+
+    def __call__(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.logits
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or "gfx950" not in torch.cuda.get_device_properties(0).gcnArchName,
+    reason="the fused K3 routing sorts for the gfx950 A8W4 MoE",
+)
+@pytest.mark.parametrize("rows", [4, 8, 192])
+def test_fused_routing_hands_its_sort_to_the_experts(rows):
+    from tokenspeed_kernel.ops.moe import kimi3_sorted_routing_scratch
+    from tokenspeed_kernel.ops.moe._triton.kimi3_sigmoid_topk import (
+        kimi3_sigmoid_bias_topk,
+    )
+
+    from tokenspeed.runtime.models import kimi_k3 as mod
+
+    generator = torch.Generator(device="cuda").manual_seed(rows)
+    logits = torch.randn((rows, 896), generator=generator, device="cuda")
+    bias = torch.randn((896,), generator=generator, device="cuda") * 0.01
+    fallback = (torch.zeros(rows, 16), torch.zeros(rows, 16))
+    moe = _make_moe(_SpyFork(), num_tokens=rows)
+    moe.gate = _Gate(logits, bias)
+    moe.topk = mock.Mock(
+        return_value=fallback,
+        simulate_routing=False,
+        topk_config=SimpleNamespace(
+            correction_bias=bias, routed_scaling_factor=2.827, renormalize=True
+        ),
+    )
+    moe.experts.sorted_route_rows = _SORTED_ROUTE_ROWS
+    moe.experts.sorted_route_block_size = 16
+    moe._fused_routing_scratch = kimi3_sorted_routing_scratch(torch.device("cuda"))
+    moe.experts._situ_sorted_routes = ("stale",)
+    handed = []
+
+    def routed_experts(routed_in, topk_output, *args, **kwargs):
+        handed.append((topk_output, moe.experts._situ_sorted_routes))
+        return routed_in
+
+    moe._routed_experts = routed_experts
+    with (
+        mock.patch.object(mod, "get_is_cuda_graph_phase", return_value=False),
+        mock.patch.object(mod, "get_is_capture_mode", return_value=False),
+    ):
+        KimiLinearMoE._replicated_moe_experts(
+            moe,
+            torch.zeros(rows, 4),
+            None,
+            mod.TopKOutputFormat.STANDARD,
+            rows,
+            rows,
+        )
+    ((topk_output, sorted_routes),) = handed
+    if rows < 8:
+        assert topk_output is fallback and sorted_routes is None
+        return
+    moe.topk.assert_not_called()
+    weights, ids = kimi3_sigmoid_bias_topk(
+        logits, bias, routed_scaling_factor=2.827, normalize_topk_weights=True
+    )
+    assert torch.equal(topk_output.topk_ids, ids)
+    assert torch.equal(
+        topk_output.topk_weights.view(torch.int32), weights.view(torch.int32)
+    )
+    sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids = sorted_routes
+    assert int(num_valid_ids[1]) == rows
+    real = sorted_ids[: int(num_valid_ids[0])]
+    assert int(((real >> 24) < 16).sum()) == rows * 16
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or "gfx950" not in torch.cuda.get_device_properties(0).gcnArchName,
+    reason="the fused K3 routing sorts for the gfx950 A8W4 MoE",
+)
+@pytest.mark.parametrize("rows", [4, 8, 128, 192])
+def test_fused_routing_carries_the_shared_down_projection(monkeypatch, rows):
+    from tokenspeed_kernel.ops.moe import kimi3_sorted_routing_scratch
+
+    from tokenspeed.runtime.models import kimi_k3 as mod
+
+    generator = torch.Generator(device="cuda").manual_seed(rows)
+    logits = torch.randn((rows, 896), generator=generator, device="cuda")
+    bias = torch.randn((896,), generator=generator, device="cuda") * 0.01
+    shared_input = torch.randn((rows, 768), generator=generator, device="cuda").to(
+        torch.bfloat16
+    )
+    down_weight = (
+        torch.randn((7168, 768), generator=generator, device="cuda") * 0.03
+    ).to(torch.bfloat16)
+    shared_out = torch.full((rows, 7168), -7.0, dtype=torch.bfloat16, device="cuda")
+    moe = _make_moe(_SpyFork(), num_tokens=rows)
+    moe.gate = _Gate(logits, bias)
+    moe.topk = mock.Mock(
+        return_value=(torch.zeros(rows, 16), torch.zeros(rows, 16)),
+        simulate_routing=False,
+        topk_config=SimpleNamespace(
+            correction_bias=bias, routed_scaling_factor=2.827, renormalize=True
+        ),
+    )
+    moe.experts.sorted_route_rows = _SORTED_ROUTE_ROWS
+    moe.experts.sorted_route_block_size = 16
+    moe._fused_routing_scratch = kimi3_sorted_routing_scratch(torch.device("cuda"))
+    moe.shared_experts = SimpleNamespace(down_proj=SimpleNamespace(weight=down_weight))
+    projections = mock.Mock(return_value=(logits, torch.zeros(rows, 4), shared_input))
+    moe._latent_input_projections = projections
+    order = []
+
+    def project_shared(hidden_states, weight, out=None):
+        assert hidden_states is shared_input and weight is down_weight
+        assert out is shared_out
+        order.append("shared_down")
+        return out.copy_(hidden_states.float() @ weight.float().T)
+
+    def routed_experts(routed_in, topk_output, *args, **kwargs):
+        order.append("experts")
+        return routed_in
+
+    monkeypatch.setattr(mod, "kimi3_shared_down_projection", project_shared)
+    moe._routed_experts = routed_experts
+    with (
+        mock.patch.object(mod, "get_is_cuda_graph_phase", return_value=False),
+        mock.patch.object(mod, "get_is_capture_mode", return_value=False),
+    ):
+        _, shared_partial = KimiLinearMoE._replicated_moe_experts(
+            moe,
+            torch.zeros(rows, 4),
+            shared_out,
+            mod.TopKOutputFormat.STANDARD,
+            rows,
+            rows,
+        )
+    # 8 through 128 rows ride the routing launch; the rest project first.
+    carried = 8 <= rows <= 128
+    assert order == (["experts"] if carried else ["shared_down", "experts"])
+    assert shared_partial is shared_out
+    torch.testing.assert_close(
+        shared_out.float(),
+        shared_input.float() @ down_weight.float().T,
+        rtol=2**-7,
+        atol=1e-4,
+    )
 
 
 if __name__ == "__main__":

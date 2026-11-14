@@ -589,6 +589,22 @@ normalized FP32 weights (scale 1) and INT32 IDs into caller-owned buffers.
 The routing-only kernel has no expert-plan workspace or 8,192-token limit.
 Other contracts retain their existing routers.
 
+On gfx950, `kimi3_sigmoid_bias_topk_sorted` (`_triton/kimi3_sigmoid_topk.py`)
+also sorts the routes by expert for the A8W4 SiTU decode, in one launch for
+up to 256 rows. Each row program routes one row with the packed top-k's own
+code, so ids and FP32 weights match `kimi3_sigmoid_bias_topk` bit for bit,
+writes them through to memory, sets its row's bit in each selected expert's
+arrival mask, and increments an arrival counter. One sorting program per 512
+routes follows the row programs in the grid (so every row program has
+dispatched before they wait) and polls the counter. Each sorting program
+derives the expert offsets from the masks and places its share of the routes
+at their expert's first slot plus the number of earlier rows in that expert's
+mask, in `gluon_moe_sorting`'s block-16 format. Routes within an expert
+therefore follow the flat top-k order, as `deterministic_order=True` does. The
+last sorting program leaves the caller-owned scratch zeroed, so sequential and
+graph-replayed launches can share it. The Kimi-K3 TP decode on gfx950 uses it,
+and the MoE then skips its own sort.
+
 ## Kimi-K3 front projections
 
 `try_latent_moe_input_projections` runs a registered fused implementation or

@@ -88,6 +88,7 @@ def test_attn_dp_replicates_dense_weights_and_selects_transport(
             self.supports_precomputed_topk = True
             self.topk_output_format = TopKOutputFormat.STANDARD
             self.plan = {"a2a_backend": expected_a2a}
+            self.sorted_route_rows = frozenset()
 
     monkeypatch.setattr(
         kimi_k3,

@@ -310,6 +310,10 @@ _A8W4_STAGE1_DEDUP_MAX_M = 16
 _A8W4_SORTED_MIN_CONCURRENCY = 2
 _A8W4_SORTED_MIN_DRAFT_TOKENS = 4
 _A8W4_SORTED_STAGE1_MIN_M = _A8W4_SORTED_MIN_CONCURRENCY * _A8W4_SORTED_MIN_DRAFT_TOKENS
+# The decode rows that sort their routes by expert, padding each expert to a
+# multiple of this block; a sort made upstream in that layout replaces their own.
+A8W4_SORTED_DECODE_ROWS = range(_A8W4_SORTED_STAGE1_MIN_M, _SITU_WARP_DECODE_MAX_M + 1)
+A8W4_SORT_BLOCK_SIZE = 16
 _A8W4_SORTED_XCD_SWIZZLE = 1
 _A8W4_SORTED_STAGE2_N_TILES = 4
 
@@ -410,6 +414,7 @@ def gluon_mxfp4_fp8_precomputed_situ(
     prefill_activation_format: str = "e2m1",
     defer_topk_reduce: bool = False,
     x_quantized: tuple[torch.Tensor, torch.Tensor] | None = None,
+    sorted_routes: tuple[torch.Tensor, ...] | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
     """Run SiTU decode (route-direct, combined top-k, or expert-sorted tiles)
     or block-ragged SiTU prefill.
@@ -428,6 +433,11 @@ def gluon_mxfp4_fp8_precomputed_situ(
     ``x_quantized`` is ``hidden_states``'s FP8 E4M3 copy and per-tensor scale
     as ``_dynamic_fp8_quantize`` returns them, produced upstream; decode then
     skips its own quantize.
+
+    ``sorted_routes`` is ``(sorted_ids, sorted_weights, sorted_expert_ids,
+    num_valid_ids)`` of these routes over the local experts in
+    ``gluon_moe_sorting``'s block-16 format, produced upstream; the
+    expert-sorted decode then skips its sort. Other paths ignore it.
     """
     if isinstance(hidden_states, tuple):
         rows = _mxfp4_input_metadata(hidden_states)[0]
@@ -618,7 +628,27 @@ def gluon_mxfp4_fp8_precomputed_situ(
     k_iters = (D + block_k - 1) // block_k
     even_k = D % block_k == 0
     num_buffers = min(_A8W4_STAGE1_NUM_BUFFERS, k_iters + (1 if even_k else 0))
-    if use_sorted_route_tiles:
+    if use_sorted_route_tiles and sorted_routes is not None:
+        from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.moe_sorting import (
+            _max_padded_route_capacity,
+        )
+
+        sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids = sorted_routes
+        capacity = _max_padded_route_capacity(
+            M * TOPK, num_local_experts, A8W4_SORT_BLOCK_SIZE
+        )
+        if (
+            sorted_ids.shape != (capacity,)
+            or sorted_weights.shape != (capacity,)
+            or sorted_expert_ids.shape != (triton.cdiv(capacity, A8W4_SORT_BLOCK_SIZE),)
+            or num_valid_ids.shape != (2,)
+            or sorted_ids.dtype != torch.int32
+            or sorted_weights.dtype != torch.float32
+            or sorted_expert_ids.dtype != torch.int32
+            or num_valid_ids.dtype != torch.int32
+        ):
+            raise ValueError("sorted routes must match gluon_moe_sorting's buffers")
+    elif use_sorted_route_tiles:
         from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.moe_sorting import (
             gluon_moe_sorting,
         )
@@ -635,13 +665,14 @@ def gluon_mxfp4_fp8_precomputed_situ(
             num_local_experts,
             N,
             out_dtype,
-            16,
+            A8W4_SORT_BLOCK_SIZE,
             use_minimum_route_chunks=True,
             expert_start=expert_start,
             out=out,
             runtime_rows=False,
             deterministic_order=False,
         )
+    if use_sorted_route_tiles:
         inter = torch.empty(
             (int(sorted_ids.shape[0]), i_dim),
             dtype=torch.float8_e4m3fn,

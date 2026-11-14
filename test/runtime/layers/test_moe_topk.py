@@ -115,6 +115,55 @@ def test_correction_bias_route_forwards_renormalize(
     assert calls == [renormalize]
 
 
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {},
+        {"num_expert_group": 2},
+        {"num_expert_group": 2, "topk_group": 2},
+        {"routed_scaling_factor": None},
+        {"num_fused_shared_experts": 1},
+    ],
+)
+def test_sigmoid_bias_topk_is_routed_exactly_where_the_config_names_it(
+    monkeypatch: pytest.MonkeyPatch, overrides: dict
+) -> None:
+    taken: list[str] = []
+
+    def fake(name):
+        def route(*args, topk=None, **kwargs):
+            taken.append(name)
+            rows, top_k = 3, 2 if topk is None else topk
+            return torch.ones((rows, top_k)), torch.zeros(
+                (rows, top_k), dtype=torch.int32
+            )
+
+        return route
+
+    monkeypatch.setattr(topk_module, "moe_topk", fake("sigmoid_bias"))
+    monkeypatch.setattr(topk_module, "minimax_biased_grouped_topk", fake("grouped"))
+    config = TopKConfig(
+        **{
+            "top_k": 2,
+            "router_topk": "fused",
+            "use_grouped_topk": True,
+            "num_expert_group": 1,
+            "topk_group": 1,
+            "correction_bias": torch.zeros((8,), dtype=torch.float32),
+            "routed_scaling_factor": 1.0,
+            **overrides,
+        }
+    )
+    select_experts(
+        hidden_states=torch.empty((3, 4), dtype=torch.float32),
+        router_logits=torch.empty((3, 8), dtype=torch.float32),
+        topk_config=config,
+    )
+
+    assert taken == ["sigmoid_bias" if config.uses_sigmoid_bias_topk else "grouped"]
+    assert config.uses_sigmoid_bias_topk is not bool(overrides)
+
+
 def _reference_torch_router_topk(
     logits: torch.Tensor,
     bias: torch.Tensor,
