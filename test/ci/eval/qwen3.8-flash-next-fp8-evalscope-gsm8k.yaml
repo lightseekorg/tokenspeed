@@ -30,6 +30,8 @@ server:
     --speculative-algorithm MTP
     --disable-replay-ssm
     --speculative-num-steps 3
+    --reasoning-parser qwen3
+    --tool-call-parser qwen_xml
     --max-model-len 8192
     --max-num-seqs 16
     --max-cudagraph-capture-size 16
