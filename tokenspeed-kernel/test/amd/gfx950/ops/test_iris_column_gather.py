@@ -50,6 +50,27 @@ def test_large_tp8_shards_take_two_subgroups_per_program():
     assert column_gather_num_warps(8192 * 896 * 2, 4) == 1
 
 
+@pytest.mark.parametrize("world_size", [4, 8])
+def test_warmup_prepares_every_subgroup_count_a_payload_picks(world_size):
+    from tokenspeed_kernel.ops.communication._iris.all_gather import (
+        _column_gather_variants,
+        column_gather_num_warps,
+    )
+
+    launched = {"BLOCK_WORDS": 256, "NUM_WARPS": 1, "WORDS_PER_LANE": 4}
+    sets = _column_gather_variants(launched | {"WORLD_SIZE": world_size})
+    warmed = {
+        (warps, block)
+        for choices in sets
+        for warps in choices["NUM_WARPS"]
+        for block in choices["BLOCK_WORDS"]
+    }
+    picked = {
+        column_gather_num_warps(rows * 896 * 2, world_size) for rows in (1, 848, 8192)
+    }
+    assert {(warps, 256 * warps) for warps in picked} <= warmed
+
+
 def _column_gather_worker(rank: int, port: int) -> None:
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)

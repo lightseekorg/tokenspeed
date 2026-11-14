@@ -973,6 +973,47 @@ def test_host_sharded_table_matches_gpu_and_allreduces(tmp_path, monkeypatch):
     )
 
 
+@pytest.mark.parametrize("layout, tp_size", [("sharded", 4), ("shared", 1)])
+def test_host_table_gathers_each_packed_row_once(monkeypatch, layout, tp_size):
+    """The BF16 host path makes one gather per forward over the packed table:
+    every host pass costs one random-row lookup per id, so gathering the codes
+    and scales views separately would fetch each row twice. On CPU the gather
+    is a torch index, so counting calls through the real gather is the only
+    way to observe a single pass. Each rank's partial is also checked bit for bit."""
+    rows, width = 19, 64
+    codes, scales = _weights(rows, width)
+    gather = engram.host_gather.uint8_row_gather
+    tables = []
+
+    def counting_gather(table, indices, out):
+        tables.append(table)
+        return gather(table, indices, out)
+
+    monkeypatch.setattr(engram.host_gather, "uint8_row_gather", counting_gather)
+    monkeypatch.setattr(engram, "all_reduce", lambda tensor, **kwargs: tensor)
+    # One layer's slice of [tokens, layers, columns] hashes: rows of every TP
+    # rank, and the invalid ids -1, 19 and 20.
+    ids = (torch.arange(60).reshape(5, 2, 6) * 7 % 22 - 1)[:, 0]
+    valid = (ids >= 0) & (ids < rows)
+    expected = _dequant(codes, scales)[ids.clamp(0, rows - 1)]
+    for rank in range(tp_size):
+        table = RowShardedEngramEmbedding(
+            rows, width, _mapping(rank, tp_size, 4), "cpu", True, layout, 1
+        )
+        table.weight_loader(table.weight, codes)
+        table.weight_loader(table.scale, scales)
+        tables.clear()
+        actual = table(ids, query_shard=None)
+        assert len(tables) == 1
+        assert tables[0].data_ptr() == table.packed.data_ptr()
+        assert tables[0].shape == (table.part_num_embeddings, width + width // 32)
+        assert tables[0].is_contiguous()
+        local = valid & (ids >= table.row_start) & (ids < table.row_end)
+        torch.testing.assert_close(
+            actual, expected.masked_fill(~local.unsqueeze(-1), 0), rtol=0, atol=0
+        )
+
+
 def test_host_sharded_meta_keeps_rank_rows():
     table = RowShardedEngramEmbedding(
         384016682, 256, _mapping(1, 4, 4), "meta", True, "sharded", 14
@@ -1089,6 +1130,39 @@ def test_cuda_host_table_gather_matches_device_shard():
     gc.collect()
     assert not weight.is_pinned()
     assert not scale.is_pinned()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cuda_host_sharded_table_matches_device_shard_and_graph_replay(
+    monkeypatch,
+):
+    """Each attention-TP rank's packed host shard (264-byte rows) gives its
+    device shard's partial bit for bit, eagerly and replayed in a graph."""
+    monkeypatch.setattr(engram, "all_reduce", lambda tensor, **kwargs: tensor)
+    rows, width = 75, 256
+    codes, scales = _weights(rows, width)
+    ids = torch.randint(-2, rows + 2, (9, 24), device="cuda:0")
+    for rank in range(4):
+        mapping = _mapping(rank, 4, 4)
+        device_embed = RowShardedEngramEmbedding(
+            rows, width, mapping, "cuda:0", False, "gpu", 1
+        )
+        host_embed = RowShardedEngramEmbedding(
+            rows, width, mapping, "cpu", True, "sharded", 1
+        )
+        for embed in (device_embed, host_embed):
+            embed.weight_loader(embed.weight, codes)
+            embed.weight_loader(embed.scale, scales)
+        expected = device_embed(ids, query_shard=None)
+        torch.testing.assert_close(
+            host_embed(ids, query_shard=None), expected, rtol=0, atol=0
+        )
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = host_embed(ids, query_shard=None)
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(captured, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("counts", [(2, 1, 1, 1), (1, 1, 0, 0)])

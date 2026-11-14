@@ -45,6 +45,7 @@ from tokenspeed_kernel.ops.attention.dsv4._triton.dcp import (
 )
 from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.selection import NoKernelFoundError
 
 torch.manual_seed(42)
 
@@ -679,6 +680,7 @@ def test_dsa_lse_partials_reconstruct_full_attention(packed, degree):
 
 @pytest.mark.parametrize("degree", [1, 2, 4, 8])
 def test_dsa_sharded_index_candidates_global_windows(device, degree):
+    from tokenspeed_kernel.ops.attention.dsa import dsa_index_candidates
     from tokenspeed_kernel.ops.attention.dsa.triton import triton_dsa_index_candidates
 
     torch.manual_seed(821)
@@ -712,25 +714,46 @@ def test_dsa_sharded_index_candidates_global_windows(device, degree):
         )
         owned = (table - 1) % degree == rank
         local_table = torch.where(owned, (table - 1) // degree + 1, -1)
-        offsets, scores = triton_dsa_index_candidates(
-            q,
-            weights,
-            local,
-            local_table,
-            query_requests,
-            causal_lens,
+        args = (q, weights, local, local_table, query_requests, causal_lens)
+        kwargs = dict(
             page_size=page_size,
             topk=topk,
             softmax_scale=0.1,
             initial_tokens=4,
             local_tokens=8,
         )
+        offsets, scores = triton_dsa_index_candidates(*args, **kwargs)
         valid = offsets >= 0
+        assert not valid.all()
         expected_scores = reference.gather(1, offsets.clamp_min(0).long())
         torch.testing.assert_close(
             scores[valid], expected_scores[valid], rtol=2e-4, atol=2e-4
         )
         assert torch.all(scores[~valid] == -float("inf"))
+
+        # The portable leaf does not declare INDEX_CANDIDATE_SCORES_OUT_FEATURE:
+        # the facade fills a send buffer's rows, wider than the scores.
+        leaf_offsets, leaf_scores = _by_offset(
+            dsa_index_candidates(*args, solution="triton", **kwargs)
+        )
+        buffer = torch.full((3, topk + 2), 11.0, device=device)
+        sent = dsa_index_candidates(
+            *args, solution="triton", scores_out=buffer[:, 1:-1], **kwargs
+        )
+        assert sent[1].data_ptr() == buffer[:, 1:-1].data_ptr()
+        sent_offsets, sent_scores = _by_offset(sent)
+        assert torch.equal(sent_offsets, leaf_offsets)
+        assert torch.equal(
+            sent_scores, torch.where(leaf_offsets >= 0, leaf_scores, -float("inf"))
+        )
+        assert (buffer[:, [0, -1]] == 11.0).all()
+        with pytest.raises(ValueError, match=r"FP32 \[rows, topk\] output"):
+            dsa_index_candidates(
+                *args,
+                solution="triton",
+                scores_out=torch.empty((3, topk - 1), device=device),
+                **kwargs,
+            )
         all_offsets.append(offsets)
         all_scores.append(scores)
     offsets, scores = torch.cat(all_offsets, 1), torch.cat(all_scores, 1)
@@ -1508,7 +1531,7 @@ def test_dsa_prefill_dcp_records_match_dispatch(tokens, degree, local_heads):
     )
     heads = degree * local_heads
     assert dsa_prefill_dcp_records_supported(
-        tokens=tokens, heads=heads, topk=_RECORDS_TOPK
+        tokens=tokens, heads=heads, topk=_RECORDS_TOPK, q_dtype=q.dtype
     )
     kwargs = _records_kwargs(cache, slots, lengths)
     # Reference: head-sharded prefill with LSE, repacked into the all-to-all records.
@@ -1536,16 +1559,20 @@ def test_dsa_prefill_dcp_records_match_dispatch(tokens, degree, local_heads):
 def test_dsa_prefill_dcp_records_refuse_split_launches():
     # Under one program per SM, dsa_prefill splits keys and the records would differ.
     sm_count = current_platform().sm_count
-    assert not dsa_prefill_dcp_records_supported(tokens=0, heads=16, topk=2048)
-    assert not dsa_prefill_dcp_records_supported(tokens=1, heads=16, topk=2048)
-    assert not dsa_prefill_dcp_records_supported(tokens=sm_count, heads=16, topk=2048)
-    assert dsa_prefill_dcp_records_supported(tokens=sm_count + 1, heads=16, topk=2048)
+
+    def supported(tokens, heads):
+        return dsa_prefill_dcp_records_supported(
+            tokens=tokens, heads=heads, topk=2048, q_dtype=torch.float8_e4m3fn
+        )
+
+    assert not supported(0, 16)
+    assert not supported(1, 16)
+    assert not supported(sm_count, 16)
+    assert supported(sm_count + 1, 16)
     # Heads past one 16-head block double the programs per token.
-    assert dsa_prefill_dcp_records_supported(
-        tokens=sm_count // 2 + 1, heads=17, topk=2048
-    )
+    assert supported(sm_count // 2 + 1, 17)
     q, cache, slots, lengths = _records_inputs(8, 2, 8, seed=5)
-    with pytest.raises(ValueError, match="runs one split"):
+    with pytest.raises(NoKernelFoundError, match="dsa_prefill_dcp_records"):
         dsa_prefill_dcp_records(q=q, **_records_kwargs(cache, slots, lengths))
 
 

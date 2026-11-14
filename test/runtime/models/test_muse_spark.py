@@ -33,6 +33,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from tokenspeed_kernel.platform import current_platform
 
+from tokenspeed.runtime.layers.attention.backends.base import SparseTopKShare
 from tokenspeed.runtime.layers.linear import ColumnParallelLinear, RowParallelLinear
 
 sys.path.insert(
@@ -1217,6 +1218,7 @@ def test_owned_attention_stores_prepared_rows_once(
         attn_backend=SimpleNamespace(
             padded_write_locations=lambda *args: positions,
             cache_placement=lambda layer: None,
+            sparse_topk=SparseTopKShare(),
             query_dtype=lambda layer, mode, activation: activation,
             forward=attend,
         ),
@@ -1519,6 +1521,9 @@ def test_weight_update_is_refused_before_writing_with_a_column_split_down_copy(
     # The tiny config is too small to build the copy; attach one.
     layer.mlp.down_columns = MoEDownColumns(4, 128, 64, tp_rank=0, tp_size=8)
     norm = layer.input_layernorm.weight
+    # The parameters are allocated uninitialized and may hold NaN, which
+    # never compares equal; give the norm finite values.
+    norm.data.fill_(1.0)
     before = norm.clone()
 
     with pytest.raises(RuntimeError, match="column-split copy"):

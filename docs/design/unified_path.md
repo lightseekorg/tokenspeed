@@ -2026,7 +2026,9 @@ index and block `-1`, which the masked writers of the conv window and the
 recurrent state skip. The stored states are the scan's own, so the checkpoint
 blocks match eager bit for bit; the cost is the extra scratch writes and the
 shared scratch. A backend without the flag, and every other family, keeps such
-a forward on its live metadata at the eager break.
+a forward on its live metadata at the eager break. There KDA, whose scan
+kernels store no interior state, scans each checkpointed row's tokens before
+its checkpoint a second time and stores that scan's final state.
 
 Qwen4-Exp's composite passes these seams to its attention child, so its GDN
 layers run inline; PLE and the QSA indexer keep their breaks over their own
@@ -2467,6 +2469,20 @@ dense / MoE groups that are neither 1 nor the attention TP width in
 `validate_qcp`; the shard width (`N == attn.tp_size`) in `Mapping`; and the
 attention family (GPU DSA), device, and KV cache (bf16: the gathered write is
 `latent_store`, native rows only) in `AttnConfig`, which sees them resolved.
+
+## Runtime sizes reuse binaries
+
+Runtime payload counts and page-table widths do not select new binaries.
+The small Iris all-reduce keeps fixed mailbox geometry, validates complete
+tiles on the host and uses a uniform tile predicate so runtime payload
+bounds retain coherent 16-byte peer transactions. Paged history-table row
+offsets are computed in 64 bits before multiplying by the runtime stride.
+Scalar prefix-length reads share one binary across slice alignments.
+
+`test_batch_shape_recompiles_gfx950.py` checks binary reuse across runtime sizes;
+`test_mla_prefix_chunks.py` exercises a table offset beyond 2**31.
+Full serving validation must additionally show no compilation after
+readiness with the compilation monitor enabled.
 
 ## Non-goals
 
