@@ -296,7 +296,7 @@ extend step only when the draft model declares
 `supports_breakable_draft_extend`: Qwen4-Exp's MTP head runs the GQA prologue
 in the captured segment and attends at `PagedAttention.attend`, like the
 target. Qwen3.5's MTP head splits the round instead
-(`supports_split_draft_extend`): its K/V writer stores every row through
+(a `SplitExtendDraft`): its K/V writer stores every row through
 `write_kv_at`, with no break, and step 0 runs from each request's last row as
 a decode step.
 

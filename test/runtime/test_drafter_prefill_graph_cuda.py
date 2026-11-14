@@ -231,6 +231,16 @@ def test_a_split_round_replays_what_the_narrowed_eager_round_drafts() -> None:
     with torch.inference_mode():
         for lengths, prefixes, final in cases:
             inputs = _inputs(lengths, generator)
+            prepare_extend(
+                split, split_backend, lengths, prefixes, final=final, ids=inputs[0]
+            )
+            # The decode-steps graphs open at step 0: no unsplit round takes them.
+            assert (
+                split._extend_graph_route(
+                    len(lengths), extend_input(split, lengths, hidden=inputs[2])
+                )
+                is None
+            ), lengths
             window, forwards = _round(
                 split, split_backend, lengths, prefixes, final, inputs
             )

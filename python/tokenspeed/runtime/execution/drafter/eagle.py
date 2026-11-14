@@ -572,7 +572,7 @@ class Eagle(HiddenStateDrafter):
         global_num_tokens: list[int] | None,
         global_bs: list[int] | None,
         all_decode_or_idle: bool,
-        first_input_ids: torch.Tensor | None = None,
+        first_input_ids: torch.Tensor | None,
     ) -> None:
         """Draft steps ``1 .. S - 1``: ``lanes`` rows per request (1 for a
         chain, K for a draft tree) forward from the accepted frontier.
@@ -904,6 +904,7 @@ class Eagle(HiddenStateDrafter):
                     global_num_tokens=draft_input.global_num_tokens,
                     global_bs=draft_input.global_bs,
                     all_decode_or_idle=draft_input.all_decode_or_idle,
+                    first_input_ids=None,
                 )
         return self._draft_window(bs, next_tokens)
 
@@ -1525,6 +1526,9 @@ class Eagle(HiddenStateDrafter):
         decode steps their request count.
         """
         if not (self._first_step_graphs or self._decode_steps_graphs):
+            return None
+        if self._split_extend_supported():
+            # Its decode-steps graphs open at step 0: only a split round replays them.
             return None
         if not draft_input.forward_mode.is_extend() or draft_input.num_extends != bs:
             return None

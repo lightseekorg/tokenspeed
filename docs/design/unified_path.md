@@ -924,8 +924,8 @@ draft backend also attends in the mode a break passes it). `ServerArgs`
 refuses the switch for the launches its arguments rule out, and
 `ModelExecutor` for a boot whose plan has no step-0 series.
 
-A one-layer draft whose rows meet only at attention (Qwen3.5's MTP head,
-`supports_split_draft_extend`) splits its extend rounds instead and records
+A one-layer draft whose rows meet only at attention (Qwen3.5's MTP head, a
+`SplitExtendDraft`) splits its extend rounds instead and records
 no step-0 graph. A row's draft K/V reads only that row's inputs (its shifted
 token, the target's hidden row, its position), so `write_draft_kv` runs the
 layer up to its attention prologue over every row, and step 0 then runs from
