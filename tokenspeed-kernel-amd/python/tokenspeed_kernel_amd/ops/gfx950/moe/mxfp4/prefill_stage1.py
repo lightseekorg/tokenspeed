@@ -39,7 +39,9 @@ Kernel shape:
   K-loop pipelining: 2-slot LDS ping-pong for A data, direct VGPR loads
   for A scales, and 2-slot VGPR ping-pong for B data and B scales;
   B[k+1] is issued at the top of tile k so its VMEM latency hides behind
-  tile k's MFMAs.
+  tile k's MFMAs. E2M1 tiles load scales a dword per lane: an A dword holds
+  both 16-row halves and both K halves of a lane's scale bytes, and a B
+  dword is shared by the two warps that own its 16-row halves.
 
 B-data is consumed in a (16, 16)-tile layout so each MFMA fetches its
 tile with a single 128-bit ``buffer_load``. The byte at logical
@@ -129,17 +131,32 @@ def _load_a_scale_vgpr(
     tile_k,
     group_stride,
     A_SCALE_K_STEP: gl.constexpr,
+    SCALE_LAYOUT: gl.constexpr,
+    DWORD: gl.constexpr,
 ):
     # Direct-to-VGPR A-scale load in the same CDNA4-swizzled scale contract
     # used by decode. ``a_scale_base_offsets`` is group-0, current pid_m,
     # [GROUP_MFMA_M, BLOCK_K_SCALE] in the native MFMA scale layout. Each
     # successive 32-row group advances the row block by stride_npad * 32.
-    return gl.amd.cdna4.buffer_load(
-        ptr=a_scales_ptr,
-        offsets=(
-            a_scale_base_offsets + GROUP_IDX * group_stride + tile_k * A_SCALE_K_STEP
-        ),
-    )
+    if DWORD:
+        # ``a_scale_base_offsets`` is [16, 4, 4] bytes instead: lane (r, kk)
+        # loads one dword holding rows r and r + 16 for K groups kk and kk + 4.
+        scale = gl.amd.cdna4.buffer_load(
+            ptr=a_scales_ptr + (GROUP_IDX * group_stride + tile_k * A_SCALE_K_STEP),
+            offsets=a_scale_base_offsets,
+        )
+        scale = gl.permute(gl.reshape(scale, [16, 4, 2, 2]), [3, 0, 2, 1])
+        scale = gl.convert_layout(gl.reshape(scale, [32, 8]), SCALE_LAYOUT)
+    else:
+        scale = gl.amd.cdna4.buffer_load(
+            ptr=a_scales_ptr,
+            offsets=(
+                a_scale_base_offsets
+                + GROUP_IDX * group_stride
+                + tile_k * A_SCALE_K_STEP
+            ),
+        )
+    return scale
 
 
 @gluon.jit
@@ -210,6 +227,29 @@ def _load_b_scale_vgpr(
 
 
 @gluon.jit
+def _load_b_scale_dword(
+    b_scales_dword_ptr,
+    b_scale_offs,
+    b_scale_shift,
+    k,
+    b_scale_k_step: gl.constexpr,
+    SCALE_LAYOUT: gl.constexpr,
+):
+    # ``b_scale_offs`` is [G, 2, 16, 4] dwords over 32-row group g, row half
+    # h, row r and K group kk. Dword (g, r, kk) holds rows r and r + 16 for K
+    # groups kk and kk + 4; both halves load it and keep their own bytes,
+    # which ``b_scale_shift`` (8 * h) moves to bits 0 and 16.
+    scale = gl.amd.cdna4.buffer_load(
+        ptr=b_scales_dword_ptr + k * (b_scale_k_step // 4), offsets=b_scale_offs
+    )
+    scale = scale.to(gl.uint32, bitcast=True) >> b_scale_shift
+    scale = gl.join(scale.to(gl.uint8), (scale >> 16).to(gl.uint8))
+    scale = gl.permute(scale, [0, 1, 2, 4, 3])
+    scale = gl.reshape(scale, [scale.shape[0] * 32, 8])
+    return gl.convert_layout(scale, SCALE_LAYOUT)
+
+
+@gluon.jit
 def _load_b_pair_vgpr(
     b_base_ptr,
     b_scales_ptr,
@@ -221,29 +261,44 @@ def _load_b_pair_vgpr(
     tile_k,
     b_scale_k_step: gl.constexpr,
     INTERLEAVED: gl.constexpr,
+    b_scale_shift,
+    SCALE_LAYOUT: gl.constexpr,
+    SCALE_DWORD: gl.constexpr,
 ):
     primary = _load_b_data_vgpr(b_base_ptr, offs_b_primary, b_data_k_off)
     if INTERLEAVED:
+        if SCALE_DWORD:
+            primary_scale = _load_b_scale_dword(
+                b_scales_ptr,
+                b_scale_offs_primary,
+                b_scale_shift,
+                tile_k,
+                b_scale_k_step,
+                SCALE_LAYOUT,
+            )
+        else:
+            primary_scale = _load_b_scale_vgpr(
+                b_scales_ptr,
+                b_scale_offs_primary,
+                tile_k,
+                b_scale_k_step,
+            )
+        secondary = primary
+        secondary_scale = primary_scale
+    else:
+        secondary = _load_b_data_vgpr(b_base_ptr, offs_b_secondary, b_data_k_off)
         primary_scale = _load_b_scale_vgpr(
             b_scales_ptr,
             b_scale_offs_primary,
             tile_k,
             b_scale_k_step,
         )
-        return primary, primary, primary_scale, primary_scale
-    secondary = _load_b_data_vgpr(b_base_ptr, offs_b_secondary, b_data_k_off)
-    primary_scale = _load_b_scale_vgpr(
-        b_scales_ptr,
-        b_scale_offs_primary,
-        tile_k,
-        b_scale_k_step,
-    )
-    secondary_scale = _load_b_scale_vgpr(
-        b_scales_ptr,
-        b_scale_offs_secondary,
-        tile_k,
-        b_scale_k_step,
-    )
+        secondary_scale = _load_b_scale_vgpr(
+            b_scales_ptr,
+            b_scale_offs_secondary,
+            tile_k,
+            b_scale_k_step,
+        )
     return primary, secondary, primary_scale, secondary_scale
 
 
@@ -944,8 +999,8 @@ def gluon_mxfp4_moe_stage1_kernel(
     gl.static_assert(
         NUM_WARPS == max(1, BLOCK_M // 32)
         or (A_FORMAT == "e4m3" and NUM_WARPS == 8)
-        or (A_FORMAT == "e2m1" and BLOCK_M == 32 and NUM_WARPS == 4),
-        "stage1 requires native E2M1 subgroups, four for BM32, or eight for E4M3",
+        or (A_FORMAT == "e2m1" and (BLOCK_M == 32 or BLOCK_M == 64) and NUM_WARPS == 4),
+        "stage1 requires native E2M1 subgroups, four for BM32/BM64, or eight for E4M3",
     )
     gl.static_assert(not OUTPUT_QUANTIZED or OUTPUT_SORTED)
 
@@ -1217,6 +1272,28 @@ def gluon_mxfp4_moe_stage1_kernel(
     a_k_lanes = gl.arange(0, BLOCK_K_SCALE, layout=k_scale_layout).to(gl.uint32)
     a_k_lane = ((a_k_lanes % 4) * 64 + ((a_k_lanes % 8) // 4) * 2)[None, :]
     a_scale_base_offsets = a_m_part + a_k_lane
+    # E2M1 tiles share A across warps, so a lane can load the dword holding
+    # both 16-row halves and both K-group halves of its scale bytes.
+    A_SCALE_DWORD: gl.constexpr = A_FORMAT == "e2m1" and GROUP_MFMA_M == 32
+    if A_SCALE_DWORD:
+        a_dword_layout: gl.constexpr = gl.BlockedLayout(
+            [1, 1, 4], [16, 4, 1], [1, 1, NUM_WARPS], [2, 0, 1]
+        )
+        a_dword_r = gl.arange(
+            0, 16, layout=gl.SliceLayout(1, gl.SliceLayout(2, a_dword_layout))
+        )
+        a_dword_k = gl.arange(
+            0, 4, layout=gl.SliceLayout(0, gl.SliceLayout(2, a_dword_layout))
+        )
+        a_dword_b = gl.arange(
+            0, 4, layout=gl.SliceLayout(0, gl.SliceLayout(1, a_dword_layout))
+        )
+        a_scale_base_offsets = (
+            ((pid_m * BLOCK_M) // 32) * (stride_se_n_pad * 32)
+            + a_dword_r[:, None, None] * 4
+            + a_dword_k[None, :, None] * 64
+            + a_dword_b[None, None, :]
+        )
     a_scale_group_stride = stride_se_n_pad * 32
 
     # ---- B data offsets (preshuffle-B closed form) --------------------
@@ -1333,6 +1410,52 @@ def gluon_mxfp4_moe_stage1_kernel(
         b_off_up = b_scale_static_offs_up
 
     b_scales_ptr_e = b_scales_ptr + off_experts.to(gl.int64) * stride_bse_e
+    # Each E2M1 warp owns one 16-row half of every 32-row B-scale group, so
+    # warp pairs load the same dword and each keeps its half.
+    B_SCALE_DWORD: gl.constexpr = (B_GDOT128 and A_FORMAT == "e2m1") and NUM_WARPS >= 2
+    b_scale_shift = 0
+    if B_SCALE_DWORD:
+        b_dword_layout: gl.constexpr = gl.BlockedLayout(
+            [1, 1, 1, 1], [1, 1, 16, 4], [NUM_WARPS // 2, 2, 1, 1], [2, 3, 1, 0]
+        )
+        b_dword_g = gl.arange(
+            0,
+            BLOCK_N // 32,
+            layout=gl.SliceLayout(
+                1, gl.SliceLayout(2, gl.SliceLayout(3, b_dword_layout))
+            ),
+        )
+        b_dword_h = gl.arange(
+            0,
+            2,
+            layout=gl.SliceLayout(
+                0, gl.SliceLayout(2, gl.SliceLayout(3, b_dword_layout))
+            ),
+        )
+        b_dword_r = gl.arange(
+            0,
+            16,
+            layout=gl.SliceLayout(
+                0, gl.SliceLayout(1, gl.SliceLayout(3, b_dword_layout))
+            ),
+        )
+        b_dword_k = gl.arange(
+            0,
+            4,
+            layout=gl.SliceLayout(
+                0, gl.SliceLayout(1, gl.SliceLayout(2, b_dword_layout))
+            ),
+        )
+        b_off_gate = (
+            ((pid_n * BLOCK_N) // 32 + b_dword_g)[:, None, None, None]
+            * (K_PACKED_TOTAL // 2)
+            + b_dword_h[None, :, None, None] * 0
+            + b_dword_r[None, None, :, None]
+            + b_dword_k[None, None, None, :] * 16
+        )
+        b_off_up = b_off_gate
+        b_scale_shift = (b_dword_h * 8).to(gl.uint32)[None, :, None, None]
+        b_scales_ptr_e = b_scales_ptr_e.to(gl.pointer_type(gl.int32))
 
     # ---- LDS allocation (2 A-data slots, ping-pong) --------------------
     # A fp4 data is still gathered through LDS. A scales use direct VGPR
@@ -1388,6 +1511,9 @@ def gluon_mxfp4_moe_stage1_kernel(
         0,
         B_SCALE_K_STEP,
         B_GDOT128,
+        b_scale_shift,
+        b_scale_layout,
+        B_SCALE_DWORD,
     )
 
     cdna4_async_copy.wait_group(0)
@@ -1404,6 +1530,8 @@ def gluon_mxfp4_moe_stage1_kernel(
         0,
         a_scale_group_stride,
         A_SCALE_K_STEP,
+        a_scale_group_layout,
+        A_SCALE_DWORD,
     )
     if BLOCK_M >= 64:
         cur_a_group1 = _read_a_lds_group(
@@ -1419,6 +1547,8 @@ def gluon_mxfp4_moe_stage1_kernel(
             0,
             a_scale_group_stride,
             A_SCALE_K_STEP,
+            a_scale_group_layout,
+            A_SCALE_DWORD,
         )
 
     # ---- Per-quarter accumulators (gate + up) -------------------------
@@ -1480,6 +1610,9 @@ def gluon_mxfp4_moe_stage1_kernel(
             nxt_b_scale_k,
             B_SCALE_K_STEP,
             B_GDOT128,
+            b_scale_shift,
+            b_scale_layout,
+            B_SCALE_DWORD,
         )
         if EARLY_A:
             _prefetch_a_data_lds(
@@ -1498,6 +1631,8 @@ def gluon_mxfp4_moe_stage1_kernel(
                 tile0_k + 1,
                 a_scale_group_stride,
                 A_SCALE_K_STEP,
+                a_scale_group_layout,
+                A_SCALE_DWORD,
             )
             if BLOCK_M >= 64:
                 nxt_a_scale_group1 = _load_a_scale_vgpr(
@@ -1507,6 +1642,8 @@ def gluon_mxfp4_moe_stage1_kernel(
                     tile0_k + 1,
                     a_scale_group_stride,
                     A_SCALE_K_STEP,
+                    a_scale_group_layout,
+                    A_SCALE_DWORD,
                 )
         # MFMA groups 0,1 with current A[k] + current B[k].
         gate_acc_group0, up_acc_group0 = _compute_gate_up_group(
@@ -1563,6 +1700,8 @@ def gluon_mxfp4_moe_stage1_kernel(
                 tile0_k,
                 a_scale_group_stride,
                 A_SCALE_K_STEP,
+                a_scale_group_layout,
+                A_SCALE_DWORD,
             )
             cur_a_group3 = _read_a_lds_group(
                 smem_a_slot0,
@@ -1577,6 +1716,8 @@ def gluon_mxfp4_moe_stage1_kernel(
                 tile0_k,
                 a_scale_group_stride,
                 A_SCALE_K_STEP,
+                a_scale_group_layout,
+                A_SCALE_DWORD,
             )
 
         if not EARLY_A:
@@ -1626,6 +1767,8 @@ def gluon_mxfp4_moe_stage1_kernel(
                 tile0_k + 1,
                 a_scale_group_stride,
                 A_SCALE_K_STEP,
+                a_scale_group_layout,
+                A_SCALE_DWORD,
             )
         if BLOCK_M >= 64:
             cur_a_group1 = _read_a_lds_group(
@@ -1644,6 +1787,8 @@ def gluon_mxfp4_moe_stage1_kernel(
                     tile0_k + 1,
                     a_scale_group_stride,
                     A_SCALE_K_STEP,
+                    a_scale_group_layout,
+                    A_SCALE_DWORD,
                 )
 
         # Swap B: next -> current.
@@ -1672,6 +1817,9 @@ def gluon_mxfp4_moe_stage1_kernel(
             nxt_b_scale_k,
             B_SCALE_K_STEP,
             B_GDOT128,
+            b_scale_shift,
+            b_scale_layout,
+            B_SCALE_DWORD,
         )
         if EARLY_A:
             _prefetch_a_data_lds(
@@ -1690,6 +1838,8 @@ def gluon_mxfp4_moe_stage1_kernel(
                 tile1_k + 1,
                 a_scale_group_stride,
                 A_SCALE_K_STEP,
+                a_scale_group_layout,
+                A_SCALE_DWORD,
             )
             if BLOCK_M >= 64:
                 nxt_a_scale_group1 = _load_a_scale_vgpr(
@@ -1699,6 +1849,8 @@ def gluon_mxfp4_moe_stage1_kernel(
                     tile1_k + 1,
                     a_scale_group_stride,
                     A_SCALE_K_STEP,
+                    a_scale_group_layout,
+                    A_SCALE_DWORD,
                 )
         gate_acc_group0, up_acc_group0 = _compute_gate_up_group(
             cur_a_group0,
@@ -1750,6 +1902,8 @@ def gluon_mxfp4_moe_stage1_kernel(
                 tile1_k,
                 a_scale_group_stride,
                 A_SCALE_K_STEP,
+                a_scale_group_layout,
+                A_SCALE_DWORD,
             )
             cur_a_group3 = _read_a_lds_group(
                 smem_a_slot0,
@@ -1764,6 +1918,8 @@ def gluon_mxfp4_moe_stage1_kernel(
                 tile1_k,
                 a_scale_group_stride,
                 A_SCALE_K_STEP,
+                a_scale_group_layout,
+                A_SCALE_DWORD,
             )
 
         if not EARLY_A:
@@ -1812,6 +1968,8 @@ def gluon_mxfp4_moe_stage1_kernel(
                 tile1_k + 1,
                 a_scale_group_stride,
                 A_SCALE_K_STEP,
+                a_scale_group_layout,
+                A_SCALE_DWORD,
             )
         if BLOCK_M >= 64:
             cur_a_group1 = _read_a_lds_group(
@@ -1830,6 +1988,8 @@ def gluon_mxfp4_moe_stage1_kernel(
                     tile1_k + 1,
                     a_scale_group_stride,
                     A_SCALE_K_STEP,
+                    a_scale_group_layout,
+                    A_SCALE_DWORD,
                 )
 
         cur_b_gate = next_b_gate
@@ -1857,6 +2017,9 @@ def gluon_mxfp4_moe_stage1_kernel(
             nxt_b_scale_k,
             B_SCALE_K_STEP,
             B_GDOT128,
+            b_scale_shift,
+            b_scale_layout,
+            B_SCALE_DWORD,
         )
         if EARLY_A:
             _prefetch_a_data_lds(
@@ -1875,6 +2038,8 @@ def gluon_mxfp4_moe_stage1_kernel(
                 pk + 1,
                 a_scale_group_stride,
                 A_SCALE_K_STEP,
+                a_scale_group_layout,
+                A_SCALE_DWORD,
             )
             if BLOCK_M >= 64:
                 nxt_a_scale_group1 = _load_a_scale_vgpr(
@@ -1884,6 +2049,8 @@ def gluon_mxfp4_moe_stage1_kernel(
                     pk + 1,
                     a_scale_group_stride,
                     A_SCALE_K_STEP,
+                    a_scale_group_layout,
+                    A_SCALE_DWORD,
                 )
         gate_acc_group0, up_acc_group0 = _compute_gate_up_group(
             cur_a_group0,
@@ -1935,6 +2102,8 @@ def gluon_mxfp4_moe_stage1_kernel(
                 pk,
                 a_scale_group_stride,
                 A_SCALE_K_STEP,
+                a_scale_group_layout,
+                A_SCALE_DWORD,
             )
             cur_a_group3 = _read_a_lds_group(
                 smem_a_slot0,
@@ -1949,6 +2118,8 @@ def gluon_mxfp4_moe_stage1_kernel(
                 pk,
                 a_scale_group_stride,
                 A_SCALE_K_STEP,
+                a_scale_group_layout,
+                A_SCALE_DWORD,
             )
 
         if not EARLY_A:
@@ -1997,6 +2168,8 @@ def gluon_mxfp4_moe_stage1_kernel(
                 pk + 1,
                 a_scale_group_stride,
                 A_SCALE_K_STEP,
+                a_scale_group_layout,
+                A_SCALE_DWORD,
             )
         if BLOCK_M >= 64:
             cur_a_group1 = _read_a_lds_group(
@@ -2015,6 +2188,8 @@ def gluon_mxfp4_moe_stage1_kernel(
                     pk + 1,
                     a_scale_group_stride,
                     A_SCALE_K_STEP,
+                    a_scale_group_layout,
+                    A_SCALE_DWORD,
                 )
 
         cur_b_gate = next_b_gate
@@ -2040,6 +2215,8 @@ def gluon_mxfp4_moe_stage1_kernel(
             num_k_iter - 1,
             a_scale_group_stride,
             A_SCALE_K_STEP,
+            a_scale_group_layout,
+            A_SCALE_DWORD,
         )
         cur_a_group3 = _read_a_lds_group(
             smem_a_slot0,
@@ -2054,6 +2231,8 @@ def gluon_mxfp4_moe_stage1_kernel(
             num_k_iter - 1,
             a_scale_group_stride,
             A_SCALE_K_STEP,
+            a_scale_group_layout,
+            A_SCALE_DWORD,
         )
 
     gate_acc_group0, up_acc_group0 = _compute_gate_up_group(
