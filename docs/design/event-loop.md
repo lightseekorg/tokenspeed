@@ -675,7 +675,14 @@ the pause), as a pause is under a release. A drain (`abort`, `wait`, a
 release) cancels the admitted requests the scheduler does not hold yet, which
 end toward their clients: those compiling their grammars, and those waiting
 for their images' embeddings, which end once their receives settle — the
-drain waits for those.
+drain waits for those. On a prefill engine under `independent` decode
+allocation (`scheduler.md` §3.1) the scheduler holds a request the transfer
+peer admitted before its decode destination is allocated, so a `wait` drain
+also waits for those destinations: a computed prompt is still prefilling
+until its transfer starts. A request the peer has not admitted is
+bootstrapping, as under `early`, which a `wait` drain does not wait for.
+The bootstrap timeout bounds the wait, from the moment the prompt held its
+pages.
 A disaggregated engine refuses new requests while a release is draining or
 memory is released: their transfer registration would name memory the
 release unmaps. On release the prefill peer deregisters its cache regions
@@ -938,7 +945,74 @@ obtain the normal retirement acknowledgments.
 **PD** (`pd`, `ts-pd`). Requests register with the transfer peer when submitted
 to the scheduler, before cache admission. Every round the replica agrees on
 which transfers changed state; their scheduler events join the round's tail feedback, and a failed
-transfer aborts its request on every rank together. A peer keeps state only
+transfer aborts its request on every rank together. A prompt whose logits
+held a NaN is aborted as its forward commits, which cancels its transfer, and
+its client gets the `NumericalError` abort once that transfer failed.
+Under `independent` decode allocation (`scheduler.md` §3.1) the peers keep
+the order "prefill pages first": the prefill node states the policy in its
+route, and a decode rank that reads it sends `["Announce", room, cache]` to
+the room's prefill ranks once connected, again with every heartbeat until
+each answered (at most 256 per endpoint and beat; a beat resumes in room
+order at the first room the previous one left out, whichever endpoint's).
+The prefill peer admits a registered request (`Bootstrapped`)
+when its decode ranks announced it and its destination's window has room: an
+equal share of the cache pool among the destinations that had a request
+tracked on this rank within the last bootstrap timeout, at least one, where
+each attention-DP rank of a decode node is its own destination (every
+attention-TP rank of the node announced the room), counted in the
+pool's blocks by the scheduler's capacity curve (`TransferPeer::occupy`),
+less the admitted requests of that destination whose manifests have not
+arrived. A destination with none outstanding always gets one in, whatever
+its size, and a request held back holds back the later ones of its
+destination. The window bounds what a destination holds; it is not hard
+isolation: a prompt larger than the share is admitted when its destination
+has nothing outstanding, and a destination not seen for a bootstrap timeout
+has no share reserved, so in both cases a decode node that is slow to
+allocate can delay other destinations for up to one timeout. A destination
+one of whose sessions is no longer registered loses its share at once: a
+retired cache does not come back. The shares, the charges and the clocks
+below are local to a rank and time-based; the members of a replica would
+have to agree on them, and `independent` requires single-member replicas.
+When the plan
+carrying a request's last chunk goes to the device
+(`ExecutionPlan::completed_prompts`, the scheduler's
+`ForwardBatch::CompletesPrompt`) the host marks it
+(`PrefillOutbox::mark_pages_held`) and the announcing ranks get the room's
+`Bootstrapped` status, as every later announcement does; a room that failed
+answers `Failed`. Only then does the decode peer report `Bootstrapped` to
+its scheduler: until every expected prefill rank's notice arrived the room
+is reported connecting, and the notice is kept beside the room's state, not
+in it. The manifests then reach the prefill peer, which reports
+`DestinationReady`; a manifest for a room that was not announced, or whose
+request does not hold its pages yet, fails the room, so a decode rank that
+does not follow the order fails at once. The decode scheduler may allocate
+noticed requests out of order; the decode peer bounds it: a noticed request
+is passed by later ones at most 8 times before no new one is shown, and at
+most 8 are shown unallocated; rooms of an `early` route are not counted.
+Timeouts: on the prefill side the bootstrap timeout bounds what a request
+waits for from its decode node. Not announced, it runs from registration.
+Admitted, it runs from the pages-held mark to the manifests, with none while
+the prompt computes. Held back by its destination's window, it runs from the
+later of two moments: the earliest pages-held mark among that destination's
+admitted requests whose manifests have not arrived, and the destination's
+last completed allocation (a room's manifests complete); with none while
+there is no such mark. So a request behind prompts this rank still computes
+waits without a prefill-side clock (the stall log reports it, at info
+level), a destination that allocates its other requests fails only the
+request it owes, and the requests behind one a decode node that allocates
+nothing never allocates fail in the poll that fails it, uncomputed. A decode
+node that stops after an allocation is in between: until one timeout after
+that allocation each request it owes fails alone and a held-back request is
+admitted in its place and computed, at most one window of prompts in all;
+after it the requests still held back fail with the next one it owes. A
+poll that fails a room admits nothing in its place: the
+window pass runs before the timeout pass and a timed-out room returns its
+charge when it is aborted after both; a request registered later is admitted
+when the window has room. On the decode side the waiting timeout runs from
+registration to the notice, restarted at the notice. A request that fails on
+the prefill side tells its announcing ranks
+as well as those that pre-allocated.
+A peer keeps state only
 for the rooms of requests the loop tracks (a sleep waits for those alone),
 with one exception on the prefill side: a room the decode node pre-allocated
 for before its request registered here, or one this rank failed first (an

@@ -64,6 +64,21 @@ const SOCKET_POLL: Duration = Duration::from_millis(100);
 /// How long a bootstrap-server lookup may take.
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// A Prefill node that allocates independently: the scheduler here may
+/// allocate requests in another order than the node's notices arrived. A
+/// noticed request is passed by later ones at most this many times before
+/// no newly noticed request is shown to the scheduler until it is allocated.
+const BYPASS_LIMIT: u32 = 8;
+
+/// See [`BYPASS_LIMIT`]: the most noticed, not yet allocated requests the
+/// scheduler sees at once.
+const VISIBLE_LIMIT: usize = 8;
+
+/// The most announcements a heartbeat repeats to one Prefill endpoint: a
+/// beat must not fill the endpoint's queue, which registrations and
+/// manifests share.
+const ANNOUNCE_BURST: usize = 256;
+
 /// A Decode rank's settings.
 #[derive(Debug, Clone)]
 pub struct DecodeConfig {
@@ -140,6 +155,12 @@ struct State {
     /// Bootstrap address -> its route; the addresses the heartbeat watches.
     routes: HashMap<String, (Option<String>, Arc<PrefillRoute>)>,
     connections: HashMap<ConnectionKey, Arc<Vec<Target>>>,
+    /// The connected rooms whose Prefill node allocates independently: the
+    /// node was told of each, and its notice admits the room here.
+    announced: HashSet<u64>,
+    /// The Prefill ranks whose notice arrived: the room's request holds
+    /// every page of its prompt there.
+    notices: HashMap<u64, BTreeSet<i64>>,
 }
 
 impl State {
@@ -156,6 +177,16 @@ impl State {
         self.tracked.contains(&room)
             && self.rooms.get(room) == Some(TransferPoll::Bootstrapping)
             && !self.cancellations.contains_key(&room)
+    }
+
+    /// An announced room whose Prefill ranks have not all sent their notice.
+    fn awaiting_notice(&self, room: u64) -> bool {
+        self.announced.contains(&room)
+            && !self.expected.get(&room).is_some_and(|expected| {
+                self.notices
+                    .get(&room)
+                    .is_some_and(|notices| expected.is_subset(notices))
+            })
     }
 
     /// Apply one Prefill rank's report.
@@ -243,6 +274,14 @@ impl State {
                     "Failed to get kvcache from prefill instance, it might be dead",
                 );
             }
+            // A Prefill rank's notice. It is not a state of this room: the
+            // room is bootstrapped once this rank connected it.
+            TransferPoll::Bootstrapped => {
+                self.notices
+                    .entry(room)
+                    .or_default()
+                    .insert(message.prefill_rank);
+            }
             status => self.rooms.update(room, status),
         }
     }
@@ -267,6 +306,9 @@ impl State {
             .entry(addr.to_owned())
             .or_default()
             .insert(room);
+        if route.independent {
+            self.announced.insert(room);
+        }
         self.rooms.update(room, TransferPoll::Bootstrapped);
         true
     }
@@ -337,6 +379,8 @@ impl State {
         self.admissions.remove(&room);
         self.waiting_since.remove(&room);
         self.cancellations.remove(&room);
+        self.announced.remove(&room);
+        self.notices.remove(&room);
         if let Some(rooms) = self.addr_rooms.get_mut(addr) {
             rooms.remove(&room);
         }
@@ -532,8 +576,18 @@ impl Shared {
             }
             state.connections.insert(key, targets.clone());
         }
-        if state.attach(room, addr, &route, targets) {
+        if state.attach(room, addr, &route, targets.clone()) {
             tracing::debug!(room, "connected");
+            if route.independent {
+                // The heartbeat repeats it until every rank answered.
+                for target in targets.iter() {
+                    let _ = self.transport.sockets.send_coalesced(
+                        &target.host,
+                        target.port,
+                        wire::announce_frames(room, &state.cache_id),
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -553,8 +607,56 @@ impl Shared {
         );
     }
 
+    /// An announcement or its answer may be lost: repeat the announcements
+    /// of the rooms still waiting for a notice, in room order from `resume`,
+    /// at most [`ANNOUNCE_BURST`] per endpoint and none to an endpoint whose
+    /// queue is full. Returns the first room left out, where the next beat
+    /// starts, or 0 when every room was covered.
+    fn announce_waiting(&self, resume: u64) -> u64 {
+        let state = self.state();
+        let mut waiting: Vec<u64> = state
+            .announced
+            .iter()
+            .copied()
+            .filter(|&room| state.awaiting_notice(room) && !state.cancellations.contains_key(&room))
+            .collect();
+        waiting.sort_unstable();
+        let start = waiting.partition_point(|&room| room < resume);
+        waiting.rotate_left(start);
+        let mut sent: HashMap<(&str, u16), usize> = HashMap::new();
+        let mut left_out = None;
+        for &room in &waiting {
+            let Some(targets) = state.targets.get(&room) else {
+                continue;
+            };
+            if targets.iter().any(|target| {
+                sent.get(&(target.host.as_str(), target.port))
+                    .is_some_and(|&count| count >= ANNOUNCE_BURST)
+            }) {
+                left_out.get_or_insert(room);
+                continue;
+            }
+            for target in targets.iter() {
+                let count = sent.entry((target.host.as_str(), target.port)).or_default();
+                match self.transport.sockets.send_coalesced(
+                    &target.host,
+                    target.port,
+                    wire::announce_frames(room, &state.cache_id),
+                ) {
+                    Ok(()) => *count += 1,
+                    Err(_) => {
+                        *count = ANNOUNCE_BURST;
+                        left_out.get_or_insert(room);
+                    }
+                }
+            }
+        }
+        left_out.unwrap_or(0)
+    }
+
     fn watch(&self, interval: Duration, max_failures: u32, stop: &mpsc::Receiver<()>) {
         let mut failures: HashMap<String, u32> = HashMap::new();
+        let mut resume = 0;
         while !sleep_or_stop(stop, interval) {
             let addrs: Vec<String> = {
                 let state = self.state();
@@ -585,6 +687,7 @@ impl Shared {
                     self.lose_node(&addr);
                 }
             }
+            resume = self.announce_waiting(resume);
         }
     }
 }
@@ -741,6 +844,11 @@ struct Receiver {
     room: u64,
     addr: String,
     started: Instant,
+    /// When every Prefill rank's notice had arrived for an announced room:
+    /// the admission timeout restarts there.
+    noticed: Option<Instant>,
+    /// The scheduler allocated the request's destination.
+    allocated: bool,
     local: TransferPoll,
     concluded: Option<TransferPoll>,
     draining: Option<Draining>,
@@ -757,6 +865,10 @@ pub struct DecodePeer {
     /// registers the same requests in the same order).
     order: Vec<String>,
     receivers: HashMap<String, Receiver>,
+    /// The announced requests whose notices arrived and whose destination
+    /// is not allocated yet, in notice order, each with how many later ones
+    /// were allocated before it ([`BYPASS_LIMIT`]).
+    noticed: Vec<(String, u32)>,
     timeout_logged: bool,
     drain_logged_at: Option<Instant>,
 }
@@ -838,6 +950,7 @@ impl DecodePeer {
                 waiting_timeout: config.waiting_timeout,
                 order: Vec::new(),
                 receivers: HashMap::new(),
+                noticed: Vec::new(),
                 timeout_logged: false,
                 drain_logged_at: None,
             },
@@ -882,6 +995,7 @@ impl DecodePeer {
             return;
         };
         self.order.retain(|tracked| tracked != rid);
+        self.noticed.retain(|(noticed, _)| noticed != rid);
         let mut state = self.shared.state();
         state.clear(receiver.room, &receiver.addr);
         state.rooms_by_rid.remove(rid);
@@ -922,6 +1036,8 @@ impl TransferPeer for DecodePeer {
                     room,
                     addr: addr.clone(),
                     started: Instant::now(),
+                    noticed: None,
+                    allocated: false,
                     local: TransferPoll::Bootstrapping,
                     concluded: None,
                     draining: None,
@@ -963,6 +1079,12 @@ impl TransferPeer for DecodePeer {
             let mut state = self.shared.state();
             for rid in &self.order {
                 let receiver = self.receivers.get_mut(rid).expect("tracked");
+                // An announced room is reported connecting until its
+                // Prefill ranks' notices arrived; they restart its wait.
+                let awaiting_notice = state.awaiting_notice(receiver.room);
+                if !awaiting_notice && state.announced.contains(&receiver.room) {
+                    receiver.noticed.get_or_insert(now);
+                }
                 let poll = match receiver.concluded {
                     Some(poll) => poll,
                     None => match state
@@ -975,7 +1097,8 @@ impl TransferPeer for DecodePeer {
                             status
                         }
                         TransferPoll::Bootstrapping | TransferPoll::Bootstrapped
-                            if now - receiver.started >= self.waiting_timeout =>
+                            if now - receiver.noticed.unwrap_or(receiver.started)
+                                >= self.waiting_timeout =>
                         {
                             state.rooms.record_failure(
                                 receiver.room,
@@ -1021,6 +1144,9 @@ impl TransferPeer for DecodePeer {
                                 _ => TransferPoll::WaitingForInput,
                             }
                         }
+                        TransferPoll::Bootstrapped if awaiting_notice => {
+                            TransferPoll::Bootstrapping
+                        }
                         status => status,
                     },
                 };
@@ -1056,12 +1182,68 @@ impl TransferPeer for DecodePeer {
             retired
         };
 
+        // The announced requests, in the order the replica agreed their
+        // notices arrived. One the scheduler allocated passed every earlier
+        // one still waiting.
+        {
+            let state = self.shared.state();
+            for (rid, &poll) in self.order.iter().zip(&agreed) {
+                let receiver = self.receivers.get_mut(rid).expect("tracked");
+                if !state.announced.contains(&receiver.room) || receiver.allocated {
+                    continue;
+                }
+                let position = self.noticed.iter().position(|(noticed, _)| noticed == rid);
+                if poll == TransferPoll::Failed as i64 {
+                    if let Some(position) = position {
+                        self.noticed.remove(position);
+                    }
+                } else if poll >= TransferPoll::WaitingForInput as i64 {
+                    receiver.allocated = true;
+                    if let Some(position) = position {
+                        self.noticed.remove(position);
+                        for (_, passed) in &mut self.noticed[..position] {
+                            *passed += 1;
+                        }
+                    }
+                } else if poll == TransferPoll::Bootstrapped as i64 && position.is_none() {
+                    self.noticed.push((rid.clone(), 0));
+                }
+            }
+        }
+        // Which of them the scheduler may see: in notice order, at most
+        // VISIBLE_LIMIT at once, and no new one while the oldest was passed
+        // BYPASS_LIMIT times.
+        let mut visible = self
+            .noticed
+            .iter()
+            .filter(|(rid, _)| self.receivers[rid].local == TransferPoll::Bootstrapped)
+            .count();
+        let closed = self
+            .noticed
+            .first()
+            .is_some_and(|(_, passed)| *passed >= BYPASS_LIMIT);
+        let mut shown: HashSet<&str> = HashSet::new();
+        for (rid, _) in &self.noticed {
+            if self.receivers[rid].local == TransferPoll::Bootstrapping
+                && (!closed || visible == 0)
+                && visible < VISIBLE_LIMIT
+            {
+                shown.insert(rid);
+                visible += 1;
+            }
+        }
+        let shown: HashSet<String> = shown.into_iter().map(str::to_owned).collect();
+
         let mut events = Vec::new();
         let mut ended = Vec::new();
         for ((rid, &poll), &retired) in self.order.iter().zip(&agreed).zip(&retired) {
             let receiver = self.receivers.get_mut(rid).expect("tracked");
             let poll = TransferPoll::from_wire(poll).unwrap_or(TransferPoll::Failed);
-            if receiver.local == TransferPoll::Bootstrapping && poll == TransferPoll::Bootstrapped {
+            let announced = self.noticed.iter().any(|(noticed, _)| noticed == rid);
+            if receiver.local == TransferPoll::Bootstrapping
+                && poll == TransferPoll::Bootstrapped
+                && (!announced || shown.contains(rid))
+            {
                 receiver.local = TransferPoll::Bootstrapped;
                 events.push(PdEvent::Bootstrapped(rid.clone()));
             } else if poll == TransferPoll::Failed {
@@ -1146,6 +1328,13 @@ impl TransferPeer for DecodePeer {
         Ok(events)
     }
 
+    fn allocates_independently(&self) -> bool {
+        false
+    }
+
+    /// The window is the prefill node's.
+    fn occupy(&mut self, _: &str, _: i64, _: i64) {}
+
     fn record_usage(&mut self, _rid: &str, _cached_tokens: i64, _bootstrap_logprob: Option<f64>) {}
 
     fn has_in_flight(&self) -> bool {
@@ -1185,6 +1374,7 @@ mod tests {
             dummy_tp_ranks: Vec::new(),
             expected_prefill_ranks: vec![0, 1],
             prefill_dp_size: 1,
+            independent: false,
         }
     }
 
@@ -1193,6 +1383,37 @@ mod tests {
         state.tracked.insert(room);
         state.rooms.update(room, TransferPoll::Bootstrapping);
         assert!(state.attach(room, addr, &route(), Arc::new(Vec::new())));
+    }
+
+    #[test]
+    fn a_notice_is_kept_before_the_connection_and_needs_every_expected_rank() {
+        let mut state = State::default();
+        let independent = PrefillRoute {
+            independent: true,
+            ..route()
+        };
+        // Both ranks' notices arrive while the room still connects: they do
+        // not connect it, and it needs none once connected.
+        state.tracked.insert(1);
+        state.rooms.update(1, TransferPoll::Bootstrapping);
+        for rank in [0, 1] {
+            state.apply(StatusMessage::bare(1, TransferPoll::Bootstrapped, rank));
+        }
+        assert_eq!(state.rooms.get(1), Some(TransferPoll::Bootstrapping));
+        assert!(state.attach(1, "p:1", &independent, Arc::new(Vec::new())));
+        assert_eq!(state.rooms.get(1), Some(TransferPoll::Bootstrapped));
+        assert!(!state.awaiting_notice(1));
+        // One rank's notice is not enough.
+        state.tracked.insert(2);
+        state.rooms.update(2, TransferPoll::Bootstrapping);
+        assert!(state.attach(2, "p:1", &independent, Arc::new(Vec::new())));
+        state.apply(StatusMessage::bare(2, TransferPoll::Bootstrapped, 0));
+        assert!(state.awaiting_notice(2));
+        state.apply(StatusMessage::bare(2, TransferPoll::Bootstrapped, 1));
+        assert!(!state.awaiting_notice(2));
+        // A room of a node that allocates early waits for none.
+        connected(&mut state, 3, "p:1");
+        assert!(!state.awaiting_notice(3));
     }
 
     #[test]

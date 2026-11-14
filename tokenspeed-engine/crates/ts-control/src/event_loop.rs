@@ -142,6 +142,10 @@ fn decode_rows(bytes: &[u8]) -> Option<Vec<Vec<i32>>> {
 /// How long an idle loop waits for a request before checking `stop` again.
 const IDLE_WAIT: Duration = Duration::from_millis(10);
 
+/// The token bucket of the scheduler's capacity curve
+/// (`Scheduler::admission_snapshot`).
+const ADMISSION_TOKEN_STEP: i32 = 1024;
+
 /// How long the scheduler's active page count is reused before it is taken
 /// again.
 const ACTIVE_PAGES_REFRESH: Duration = Duration::from_millis(100);
@@ -153,7 +157,10 @@ const ACTIVE_PAGES_REFRESH: Duration = Duration::from_millis(100);
 /// for seconds -- and whenever the loop runs no request, so an engine that
 /// went idle reports none active at once. A count taken while idle is not kept:
 /// the first round after requests arrive takes a new one, so an engine that
-/// just took a burst does not report none active for the next 100 ms.
+/// just took a burst does not report none active for the next 100 ms. The
+/// prefill role's gauge of the pages its computed prompts hold while they
+/// wait for their decode destination walks those prompts' block tables, so
+/// it is throttled the same way, idle while no prompt waits.
 #[derive(Debug, Default)]
 struct ActivePages {
     /// The last count taken while requests ran, and when.
@@ -578,6 +585,13 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     /// prefill work to schedule, and whether it would decode this round.
     dp_wants_prefill: Vec<bool>,
     dp_has_decode_work: Vec<bool>,
+    /// P role: the pages of the computed prompts waiting for their decode
+    /// destination, reused across rounds as `active_pages` is.
+    awaiting_destination_pages: ActivePages,
+    /// PD: the cache pool's blocks and the blocks a fresh request of each
+    /// token bucket takes, by the scheduler's capacity model; taken once,
+    /// when the first transfer registers.
+    pool_curve: Option<(i64, Vec<i64>)>,
 }
 
 /// What a round starts from, the same on every replica member.
@@ -642,6 +656,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             rounds_since_prefill: 0,
             dp_wants_prefill: Vec::new(),
             dp_has_decode_work: Vec::new(),
+            awaiting_destination_pages: ActivePages::default(),
+            pool_curve: None,
         }
     }
 
@@ -940,11 +956,27 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 self.config.kv_token_capacity,
             );
             match self.outputs.role() {
-                crate::output::Role::Prefill => metrics.record_prefill_queues(
-                    sizes.bootstrapping as i64,
-                    sizes.pd_transfer as i64,
-                    sizes.retracted as i64,
-                ),
+                crate::output::Role::Prefill => {
+                    // A walk of the waiting prompts' block tables, throttled
+                    // as the active count's is; none while no prompt waits.
+                    let none_waiting = sizes.awaiting_destination == 0;
+                    let awaiting_destination_pages =
+                        self.awaiting_destination_pages
+                            .read(Instant::now(), none_waiting, || {
+                                if none_waiting {
+                                    0
+                                } else {
+                                    scheduler.awaiting_destination_lcm_blocks()
+                                }
+                            });
+                    metrics.record_prefill_queues(
+                        sizes.bootstrapping as i64,
+                        sizes.pd_transfer as i64,
+                        sizes.retracted as i64,
+                        sizes.awaiting_destination as i64,
+                        i64::from(awaiting_destination_pages),
+                    );
+                }
                 crate::output::Role::Decode => metrics.record_decode_queues(
                     sizes.bootstrapping as i64,     // prealloc: waiting for the peer
                     sizes.remote_prefilling as i64, // kv_wait: waiting for its KV
@@ -1500,13 +1532,19 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         }
         let (specs, requests): (Vec<_>, Vec<_>) = submissions
             .into_iter()
-            .map(|submission| (submission.spec, (submission.rid, submission.bootstrap)))
+            .map(|submission| {
+                let prompt_tokens = submission.spec.tokens.len();
+                (
+                    submission.spec,
+                    (submission.rid, submission.bootstrap, prompt_tokens),
+                )
+            })
             .unzip();
         if let Err(error) = self.scheduler.submit_requests(&specs) {
             // SubmitRequests validates the whole batch before inserting it.
             // No transfer may start for requests the scheduler rejected.
             let reason = format!("Scheduler submission failed: {}", error.what());
-            for (rid, bootstrap) in requests {
+            for (rid, bootstrap, _) in requests {
                 if let (Some(transfer), Some(bootstrap)) = (self.transfer.as_mut(), bootstrap) {
                     transfer.abort_room(&rid, bootstrap.room);
                 }
@@ -1517,10 +1555,21 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             return Ok(());
         }
         let now = std::time::Instant::now();
-        for (rid, bootstrap) in requests {
+        for (rid, bootstrap, prompt_tokens) in requests {
             self.outputs.mark_submitted(&rid, now);
             if let (Some(transfer), Some(bootstrap)) = (self.transfer.as_mut(), &bootstrap) {
                 transfer.register(&rid, bootstrap)?;
+                if transfer.allocates_independently() {
+                    // What the prompt takes of the pool, for the window a P
+                    // peer keeps per destination.
+                    let (pool_blocks, curve) = self.pool_curve.get_or_insert_with(|| {
+                        let snapshot = self.scheduler.admission_snapshot(ADMISSION_TOKEN_STEP);
+                        (snapshot.total_blocks.into(), snapshot.capacity_blocks)
+                    });
+                    let bucket = prompt_tokens.saturating_sub(1) / ADMISSION_TOKEN_STEP as usize;
+                    let prompt_blocks = curve.get(bucket).or(curve.last()).copied().unwrap_or(0);
+                    transfer.occupy(&rid, prompt_blocks, *pool_blocks);
+                }
                 // An abort may precede this round's batched submission.
                 if self.outputs.state(&rid).is_some_and(|state| state.to_abort) {
                     transfer.cancel(&rid);
@@ -2151,7 +2200,6 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 // contract version if the curve's bucketing semantics change;
                 // see docs/design/cache-concepts.md.
                 const ADMISSION_CONTRACT_VERSION: i64 = 1;
-                const ADMISSION_TOKEN_STEP: i32 = 1024;
                 let snapshot = self.scheduler.admission_snapshot(ADMISSION_TOKEN_STEP);
                 self.controls.reply(ControlOutput::GetAdmission(
                     ts_wire::control::GetAdmissionReqOutput {
@@ -2443,6 +2491,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 PdEvent::Bootstrapped(rid) => {
                     self.outputs.bootstrapped(&rid);
                     events.push(pd_event(ForwardEventKind::PdBootstrapped, &rid, -1));
+                }
+                PdEvent::DestinationReady(rid) => {
+                    events.push(pd_event(ForwardEventKind::PdDestinationReady, &rid, -1));
                 }
                 PdEvent::Succeeded(rid) => {
                     events.push(pd_event(ForwardEventKind::PdSucceeded, &rid, -1));

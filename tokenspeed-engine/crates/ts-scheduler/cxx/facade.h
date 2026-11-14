@@ -69,6 +69,7 @@ SharedPrefixPublication shared_prefix_publication(const tokenspeed::Scheduler& s
 SchedulerSizes sizes(const tokenspeed::Scheduler& scheduler);
 std::int32_t active_lcm_blocks(const tokenspeed::Scheduler& scheduler);
 PrefillGateProbe probe_prefill_gate(const tokenspeed::Scheduler& scheduler);
+std::int32_t awaiting_destination_lcm_blocks(const tokenspeed::Scheduler& scheduler);
 CacheGroupPages cache_group_pages(const tokenspeed::Scheduler& scheduler, rust::Str group_id);
 rust::Vec<KvEventView> drain_kv_events(tokenspeed::Scheduler& scheduler);
 std::int32_t request_token_size(const tokenspeed::Scheduler& scheduler, rust::Str request_id);
@@ -82,6 +83,7 @@ bool can_clear_cache(const tokenspeed::Scheduler& scheduler);
 std::int32_t max_single_request_tokens(const tokenspeed::Scheduler& scheduler);
 
 rust::Vec<ForwardBatchView> plan_forward_batches(const tokenspeed::ExecutionPlan& plan);
+rust::Vec<rust::String> plan_completed_prompts(const tokenspeed::ExecutionPlan& plan);
 bool plan_needs_device(const tokenspeed::ExecutionPlan& plan);
 rust::Vec<ForwardBatchView> plan_remote_decode(const tokenspeed::ExecutionPlan& plan);
 rust::Vec<ForwardBatchView> plan_remote_prefill(const tokenspeed::ExecutionPlan& plan);

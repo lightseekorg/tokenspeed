@@ -43,6 +43,10 @@ Prefetching BootstrappedEvent::operator()(Prefetching&& state) {
     return std::move(state);
 }
 
+PrefillDone DestinationReadyEvent::operator()(PrefillAwaitingDestination&& state) {
+    return PrefillDone{std::move(state.resources), state.window, state.ReserveNumTokensInNextScheduleEvent()};
+}
+
 Finished SucceededEvent::operator()(Decoding&& /*state*/) {
     return Finished{};
 }

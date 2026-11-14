@@ -33,6 +33,9 @@ protected:
     SchedulerConfig MakeConfig() override {
         auto config = SchedulerTestSuite::MakeConfig();
         config.role = GetParam();
+        if (config.role == Role::kP) {
+            config.decode_allocation_policy = SchedulerConfig::DecodeAllocationPolicy::kEarly;
+        }
         config.prefix_granularity = 4;
         config.max_scheduled_tokens = 64;
         config.max_batch_size = 32;

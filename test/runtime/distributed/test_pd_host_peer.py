@@ -142,10 +142,12 @@ def _settings() -> PeerSettings:
 
 
 def _server_args(bootstrap_port: int) -> SimpleNamespace:
-    # ``_prefill_settings`` reads only where the bootstrap server listens.
+    # ``_prefill_settings`` reads only where the bootstrap server listens and
+    # the decode allocation policy the rank registers there.
     return SimpleNamespace(
         dist_init_addr="127.0.0.1:5000",
         disaggregation_bootstrap_port=bootstrap_port,
+        disaggregation_decode_allocation_policy="early",
     )
 
 
@@ -222,6 +224,7 @@ def test_prefill_settings_publish_the_logical_layout_and_keep_the_landing_one():
             )
             payload = json.loads(settings.bootstrap_payload)
             assert payload["cache_layout"] == settings.wire_layout.decode("ascii")
+            assert payload["decode_allocation_policy"] == "early"
             payloads.append(payload)
             assert settings.bootstrap_url == f"http://127.0.0.1:{server.port}/route"
             # The host's bootstrap server parses the contract and accepts the

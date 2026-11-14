@@ -112,6 +112,9 @@ void advance(tokenspeed::Scheduler& scheduler, rust::Slice<const ForwardEvent> e
             case ForwardEventKind::PdBootstrapped:
                 execution_event.With(tokenspeed::pd::BootstrappedEvent(std::move(request_id)));
                 break;
+            case ForwardEventKind::PdDestinationReady:
+                execution_event.With(tokenspeed::pd::DestinationReadyEvent(std::move(request_id)));
+                break;
             case ForwardEventKind::PdFailed:
                 execution_event.With(tokenspeed::pd::FailedEvent(std::move(request_id)));
                 break;
@@ -242,6 +245,7 @@ SchedulerSizes sizes(const tokenspeed::Scheduler& scheduler) {
         .bootstrapping = scheduler.BootstrappingSize(),
         .remote_prefilling = scheduler.RemotePrefillSize(),
         .pd_transfer = scheduler.PdTransferSize(),
+        .awaiting_destination = scheduler.AwaitingDestinationSize(),
         .empty_lcm_blocks = scheduler.EmptyLcmBlocks(),
     };
 }
@@ -254,6 +258,10 @@ PrefillGateProbe probe_prefill_gate(const tokenspeed::Scheduler& scheduler) {
         .wants_prefill = probe.wants_prefill,
         .has_decode_work = probe.has_decode_work,
     };
+}
+
+std::int32_t awaiting_destination_lcm_blocks(const tokenspeed::Scheduler& scheduler) {
+    return scheduler.AwaitingDestinationLcmBlocks();
 }
 
 CacheGroupPages cache_group_pages(const tokenspeed::Scheduler& scheduler, rust::Str group_id) {
@@ -413,6 +421,22 @@ rust::Vec<ForwardBatchView> plan_forward_batches(const tokenspeed::ExecutionPlan
         const auto* batch = std::get_if<tokenspeed::ForwardBatch>(&operation);
         if (batch != nullptr) {
             out.push_back(batch_view(*batch));
+        }
+    }
+    return out;
+}
+
+rust::Vec<rust::String> plan_completed_prompts(const tokenspeed::ExecutionPlan& plan) {
+    rust::Vec<rust::String> out;
+    for (const tokenspeed::Operation& operation : plan.Operations()) {
+        const auto* batch = std::get_if<tokenspeed::ForwardBatch>(&operation);
+        if (batch == nullptr) {
+            continue;
+        }
+        for (std::size_t row = 0; row < batch->NumExtends(); ++row) {
+            if (batch->CompletesPrompt(row)) {
+                out.push_back(rust::String(batch->request_ids[row]));
+            }
         }
     }
     return out;

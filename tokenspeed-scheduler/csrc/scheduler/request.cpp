@@ -106,6 +106,7 @@ PrefillInfo Request::CurrentPrefillInfo() const {
             [](const fsm::RemotePrefilling& state) { return state.CurrentPrefillInfo(); },
             [](const fsm::PrefillDone& state) { return state.CurrentPrefillInfo(); },
             [](const fsm::PrefillAwaitingResult& state) { return state.CurrentPrefillInfo(); },
+            [](const fsm::PrefillAwaitingDestination& state) { return state.CurrentPrefillInfo(); },
             [this](const auto&) -> PrefillInfo {
                 throw std::logic_error(
                     "Request::CurrentPrefillInfo: expected Prefilling, RemotePrefilling or PrefillDone; got " +
@@ -134,6 +135,7 @@ std::int32_t Request::NumComputedTokens() const {
         Overloaded{
             [](const fsm::Prefilling& state) { return state.window.begin + state.window.size; },
             [](const fsm::PrefillDone& state) { return state.window.begin + state.window.size; },
+            [](const fsm::PrefillAwaitingDestination& state) { return state.window.begin + state.window.size; },
             // Every token but the last is computed; the last is the sampled
             // token no landed forward consumed.
             [this](const fsm::Decoding&) { return TokenSize() - 1; },

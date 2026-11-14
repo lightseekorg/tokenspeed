@@ -77,6 +77,10 @@ mod ffi {
         UpdateReserveNumTokens,
         /// PD: the request's peers are connected (`pd::BootstrappedEvent`).
         PdBootstrapped,
+        /// PD, P role under independent decode allocation: every decode rank
+        /// allocated the request's destination
+        /// (`pd::DestinationReadyEvent`).
+        PdDestinationReady,
         /// PD: the request's transfer failed; it may still be stopping
         /// (`pd::FailedEvent`).
         PdFailed,
@@ -408,6 +412,10 @@ mod ffi {
         remote_prefilling: usize,
         /// PD: requests whose pages a transfer still pins.
         pd_transfer: usize,
+        /// PD, P role, independent admission: computed prompts waiting for
+        /// their decode destination; also counted in `running`, `prefilling`
+        /// and `pd_transfer`.
+        awaiting_destination: usize,
         /// Cache blocks holding nothing.
         empty_lcm_blocks: i32,
     }
@@ -481,6 +489,7 @@ mod ffi {
         fn sizes(scheduler: &Scheduler) -> SchedulerSizes;
         fn active_lcm_blocks(scheduler: &Scheduler) -> i32;
         fn probe_prefill_gate(scheduler: &Scheduler) -> PrefillGateProbe;
+        fn awaiting_destination_lcm_blocks(scheduler: &Scheduler) -> i32;
         fn cache_group_pages(scheduler: &Scheduler, group_id: &str) -> CacheGroupPages;
         fn drain_kv_events(scheduler: Pin<&mut Scheduler>) -> Vec<KvEventView>;
         fn request_token_size(scheduler: &Scheduler, request_id: &str) -> i32;
@@ -494,6 +503,7 @@ mod ffi {
         fn max_single_request_tokens(scheduler: &Scheduler) -> i32;
 
         fn plan_forward_batches(plan: &ExecutionPlan) -> Vec<ForwardBatchView>;
+        fn plan_completed_prompts(plan: &ExecutionPlan) -> Vec<String>;
         fn plan_needs_device(plan: &ExecutionPlan) -> bool;
         fn plan_remote_decode(plan: &ExecutionPlan) -> Vec<ForwardBatchView>;
         fn plan_remote_prefill(plan: &ExecutionPlan) -> Vec<ForwardBatchView>;
@@ -721,6 +731,15 @@ impl Scheduler {
         ffi::probe_prefill_gate(self.get())
     }
 
+    /// Cache blocks in the block tables of the prompts
+    /// `sizes().awaiting_destination` counts: what `active_lcm_blocks` reads
+    /// for every request, taken for these by walking their tables. Blocks
+    /// held outside the tables (e.g. a pending in-forward State checkpoint)
+    /// are not included.
+    pub fn awaiting_destination_lcm_blocks(&self) -> i32 {
+        ffi::awaiting_destination_lcm_blocks(self.get())
+    }
+
     /// One cache group's page counts.
     pub fn cache_group_pages(&self, group_id: &str) -> CacheGroupPages {
         ffi::cache_group_pages(self.get(), group_id)
@@ -794,6 +813,12 @@ impl ExecutionPlan {
     pub fn forward_batches(&self) -> Vec<ForwardBatchView> {
         let _span = profile::span("ExecutionPlan::forward_batches");
         ffi::plan_forward_batches(&self.0)
+    }
+
+    /// The requests whose prompt's last chunk the plan's batches carry
+    /// (`ForwardBatch::CompletesPrompt`).
+    pub fn completed_prompts(&self) -> Vec<String> {
+        ffi::plan_completed_prompts(&self.0)
     }
 
     /// Whether the data plane has anything to do for this plan: a batch,

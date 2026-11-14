@@ -626,6 +626,8 @@ fn pd_scheduler(role: &str) -> String {
         "result = ts.Scheduler(cfg)",
         &format!(
             "cfg.role = ts.SchedulerConfig.Role.{role}\n\
+             if cfg.role == ts.SchedulerConfig.Role.P:\n    \
+             cfg.decode_allocation_policy = ts.SchedulerConfig.DecodeAllocationPolicy.Early\n\
              cfg.cache_groups[0].transfer_policy = ts.CacheTransferPolicy.FullSuffix\n\
              result = ts.Scheduler(cfg)"
         ),
@@ -1020,7 +1022,7 @@ fn shared_prefix_publication_rejects_in_forward_state_before_waiting() {
             let code = STORAGE_SCHEDULER.replace(
                 "result = ts.Scheduler(cfg)",
                 &format!(
-                    "cfg.role = ts.SchedulerConfig.Role.{role}\ncfg.prefix_granularity = 4\ncfg.num_host_pages = 32\ncfg.storage_config = ts.StorageConfig(8, 64, 16, 64, 32, 1, 1000, 1000, ts.StoragePressure(8, 65536, 1000), ts.StoragePressure(4, 32768, 500))\ncfg.cache_groups = [ts.CacheGroupConfig('full', 2, 32, ts.AttnKind.Full, transfer_policy=ts.CacheTransferPolicy.FullSuffix)]\ncfg.state_checkpoint_in_forward = {enabled}\n{state}result = ts.Scheduler(cfg)"
+                    "cfg.role = ts.SchedulerConfig.Role.{role}\nif cfg.role == ts.SchedulerConfig.Role.P:\n    cfg.decode_allocation_policy = ts.SchedulerConfig.DecodeAllocationPolicy.Early\ncfg.prefix_granularity = 4\ncfg.num_host_pages = 32\ncfg.storage_config = ts.StorageConfig(8, 64, 16, 64, 32, 1, 1000, 1000, ts.StoragePressure(8, 65536, 1000), ts.StoragePressure(4, 32768, 500))\ncfg.cache_groups = [ts.CacheGroupConfig('full', 2, 32, ts.AttnKind.Full, transfer_policy=ts.CacheTransferPolicy.FullSuffix)]\ncfg.state_checkpoint_in_forward = {enabled}\n{state}result = ts.Scheduler(cfg)"
                 ),
             );
             let mut scheduler =
@@ -1068,7 +1070,7 @@ fn shared_prefix_publication_follows_real_prefill_host_copy_and_put() {
             ""
         };
         let code = STORAGE_SCHEDULER.replace("result = ts.Scheduler(cfg)", &format!(
-            "cfg.role = ts.SchedulerConfig.Role.P\ncfg.num_host_pages = 32\ncfg.cache_groups = [ts.CacheGroupConfig('full', 2, 32, ts.AttnKind.Full, transfer_policy=ts.CacheTransferPolicy.FullSuffix)]\ncfg.storage_config = ts.StorageConfig(8, 64, 16, 64, 32, 1, 1000, 1000, ts.StoragePressure(8, 65536, 1000), ts.StoragePressure(4, 32768, 500))\n{state}result = ts.Scheduler(cfg)"));
+            "cfg.role = ts.SchedulerConfig.Role.P\ncfg.decode_allocation_policy = ts.SchedulerConfig.DecodeAllocationPolicy.Early\ncfg.num_host_pages = 32\ncfg.cache_groups =[ts.CacheGroupConfig('full', 2, 32, ts.AttnKind.Full, transfer_policy=ts.CacheTransferPolicy.FullSuffix)]\ncfg.storage_config = ts.StorageConfig(8, 64, 16, 64, 32, 1, 1000, 1000, ts.StoragePressure(8, 65536, 1000), ts.StoragePressure(4, 32768, 500))\n{state}result = ts.Scheduler(cfg)"));
         let mut scheduler = Python::attach(|py| Scheduler::from_python(&run(py, &code)).unwrap());
         let tokens = vec![1, 2, 3, 4, 5]; // Includes a real partial-page prompt endpoint.
         scheduler.advance_head(&tick(1), &[]).unwrap();

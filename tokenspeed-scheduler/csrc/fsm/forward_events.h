@@ -172,6 +172,7 @@ struct AbortEvent : InvalidTransitionHandler<AbortEvent> {
     Finished operator()(RemotePrefilling&& state);
     Finished operator()(PrefillDone&& state);
     Finished operator()(PrefillAwaitingResult&& state);
+    Finished operator()(PrefillAwaitingDestination&& state);
     Finished operator()(Decoding&& state);
     Finished operator()(Retracted&& state);
     Finished operator()(Restoring&& state);
@@ -294,7 +295,11 @@ private:
 struct ExtendResultEvent : InvalidTransitionHandler<ExtendResultEvent> {
     using InvalidTransitionHandler<ExtendResultEvent>::operator();
 
-    explicit ExtendResultEvent(std::vector<std::int32_t> result_tokens) : result_tokens_{std::move(result_tokens)} {}
+    // `await_destination`: a P prompt whose Decode destination is not
+    // allocated yet parks in PrefillAwaitingDestination once its last token
+    // is real, instead of becoming PrefillDone.
+    ExtendResultEvent(std::vector<std::int32_t> result_tokens, bool await_destination)
+        : result_tokens_{std::move(result_tokens)}, await_destination_{await_destination} {}
 
     template <typename State>
         requires CanExtendTokenContainer<State>
@@ -311,11 +316,16 @@ struct ExtendResultEvent : InvalidTransitionHandler<ExtendResultEvent> {
     // waiting FOR: the prompt's last token is now real, so the request
     // becomes schedulable (P: its remote decode can carry the bootstrap
     // token).
-    std::variant<PrefillDone, PrefillAwaitingResult> operator()(PrefillAwaitingResult&& state) {
+    std::variant<PrefillDone, PrefillAwaitingResult, PrefillAwaitingDestination> operator()(
+        PrefillAwaitingResult&& state) {
         if (result_tokens_.empty()) {
             return std::move(state);
         }
         state.ExtendResultTokens(result_tokens_);
+        if (await_destination_) {
+            return PrefillAwaitingDestination{std::move(state.resources), state.window,
+                                              state.ReserveNumTokensInNextScheduleEvent()};
+        }
         // Older intermediate chunk results may still be landing on these
         // pages (see above): the bundle, in-flight count included, moves on.
         return PrefillDone{std::move(state.resources), state.window, state.ReserveNumTokensInNextScheduleEvent()};
@@ -337,6 +347,7 @@ struct ExtendResultEvent : InvalidTransitionHandler<ExtendResultEvent> {
 
 private:
     std::vector<std::int32_t> result_tokens_;
+    bool await_destination_;
 };
 
 }  // namespace tokenspeed::fsm

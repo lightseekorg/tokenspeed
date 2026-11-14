@@ -165,6 +165,10 @@ Finished AbortEvent::operator()(PrefillAwaitingResult&& state) {
     return abortForward(std::move(state));
 }
 
+Finished AbortEvent::operator()(PrefillAwaitingDestination&& state) {
+    return abortForward(std::move(state));
+}
+
 Finished AbortEvent::operator()(Decoding&& state) {
     return abortForward(std::move(state));
 }
