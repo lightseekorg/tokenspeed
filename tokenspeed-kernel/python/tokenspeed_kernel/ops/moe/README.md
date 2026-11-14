@@ -726,6 +726,8 @@ symmetric memory instead of NCCL collectives:
    renormalized, scaled) and gathers the full latent row. It reads the logits
    from their mailbox as they land, without waiting for the GEMM to complete,
    and every thread of a row's CTA ranks the candidates, at every row count.
+   A NaN logit (a padded graph row's) counts as a zero sigmoid, so the row
+   ranks by bias instead of tying all 896 experts.
 3. Persistent MXFP4 experts compute this rank's intermediate slice of the
    chosen experts and combine them into a weighted latent partial.
 4. One tail kernel all-reduces the partials, applies the latent RMSNorm, runs
