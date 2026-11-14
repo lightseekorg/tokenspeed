@@ -26,6 +26,14 @@ from __future__ import annotations
 
 import torch
 
+# Bypasses the registry: the fused step uses the CuTe DSL distributed-argmax slots.
+from tokenspeed_kernel.ops.sampling.cute_dsl import (
+    MarkovArgmaxWorkspace,
+    create_markov_argmax_workspace,
+    markov_argmax_step,
+    supports_markov_argmax_shape,
+)
+
 from tokenspeed.runtime.distributed.comm_ops import all_gather_single
 from tokenspeed.runtime.execution.drafter._dspark_walk import (
     dspark_walk_finish,
@@ -58,6 +66,9 @@ class DSpark(DFlash):
             )
         self._walk_words: torch.Tensor | None = None
         self._walk_gathered: torch.Tensor | None = None
+        # Resolved by the first greedy walk outside graph capture.
+        self._markov_argmax_resolved = False
+        self._markov_argmax_workspace: MarkovArgmaxWorkspace | None = None
 
     def require_full_draft_logits(self) -> None:
         """DSpark samples the target's shared head, not a draft-owned processor."""
@@ -81,6 +92,9 @@ class DSpark(DFlash):
         if block_logits is not None and self._fused_walk_fits(block_logits):
             self._fused_greedy_walk(block_logits, next_tokens)
             return next_tokens
+        workspace = (
+            None if block_logits is None else self._resolve_markov_argmax(block_logits)
+        )
         for k in range(1, self.spec_num_tokens):
             if workspace is not None:
                 # One launch: bias, add, and cross-rank argmax after token k - 1.
