@@ -131,6 +131,7 @@ import re
 import sys
 from pathlib import Path
 
+summaries = json.loads(Path("logs/cuda-v2-serving-summary.json").read_text())
 for name in sys.argv[1:]:
     directory = Path(name)
     result = json.loads((directory / "serving/result.json").read_text())
@@ -146,9 +147,14 @@ for name in sys.argv[1:]:
     if "nccl" in result["tags"]:
         text = "\n".join(log.read_text(errors="replace")
                          for log in sorted((directory / "serving").glob("node-*.log")))
-        groups = 2 if result["layout"] == "ep4" else 3
-        assert re.findall(r"Suspended (\d+) NCCL", text) == [str(groups)] * 4
-        assert re.findall(r"Resumed (\d+) NCCL", text) == [str(groups)] * 4
+        # Cached split communicators change inventory without changing topology.
+        # The checker paired each rank's actual return count with its inventory.
+        counts = sorted(
+            str(count)
+            for count in summaries[directory.name]["nccl_backend_counts_per_rank"].values()
+        )
+        assert sorted(re.findall(r"Suspended (\d+) NCCL", text)) == counts
+        assert sorted(re.findall(r"Resumed (\d+) NCCL", text)) == counts
         excerpts = [line for line in text.splitlines()
                     if "Suspended " in line or "Resumed " in line]
         clean = re.sub(r"\x1b\[[0-9;]*m", "", "\n".join(excerpts))

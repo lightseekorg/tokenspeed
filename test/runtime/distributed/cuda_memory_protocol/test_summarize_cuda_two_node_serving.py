@@ -25,6 +25,82 @@ import json
 from pathlib import Path
 
 
+def nccl_counts(rank_rows, ranks):
+    observations = [
+        row for row in rank_rows if row["event"] in {"nccl_inventory", "nccl_complete"}
+    ]
+    assert len(observations) == 4 * len(ranks), "Missing or duplicate NCCL evidence"
+    assert all(
+        {"rank", "release", "operation", "ns"} <= row.keys()
+        and type(row["release"]) is bool
+        and type(row["operation"]) is int
+        and row["operation"] > 0
+        for row in observations
+    ), "Invalid NCCL operation evidence"
+    assert {row["rank"] for row in observations} == ranks, "Missing NCCL rank"
+    counts = {}
+    for rank in ranks:
+        phases = {}
+        for release in (True, False):
+            rows = [
+                row
+                for row in observations
+                if row["rank"] == rank and row["release"] == release
+            ]
+            inventory = [row for row in rows if row["event"] == "nccl_inventory"]
+            completed = [row for row in rows if row["event"] == "nccl_complete"]
+            assert len(inventory) == len(completed) == 1, (
+                "Missing or duplicate NCCL phase",
+                rank,
+                release,
+            )
+            inventory, completed = inventory[0], completed[0]
+            ids = inventory.get("backend_ids")
+            count = completed.get("count")
+            assert (
+                isinstance(ids, list)
+                and ids
+                and all(type(value) is int and value > 0 for value in ids)
+            ), "Missing or invalid NCCL inventory"
+            assert len(set(ids)) == len(ids), "Duplicate NCCL backend"
+            assert type(count) is int and count > 0 and count == len(ids), (
+                "NCCL count differs from its production inventory",
+                rank,
+                release,
+            )
+            assert (
+                inventory["operation"] == completed["operation"]
+            ), "Mismatched NCCL operation"
+            apply = [
+                row
+                for row in rank_rows
+                if row["event"] in {"apply_begin", "apply_complete"}
+                and row["rank"] == rank
+                and row["release"] == release
+                and "nccl" in row["tags"]
+            ]
+            begins = [row for row in apply if row["event"] == "apply_begin"]
+            ends = [row for row in apply if row["event"] == "apply_complete"]
+            assert (
+                len(begins) == len(ends) == 1
+            ), "Missing or duplicate NCCL apply phase"
+            stamps = [
+                begins[0]["ns"],
+                inventory["ns"],
+                completed["ns"],
+                ends[0]["ns"],
+            ]
+            assert all(type(stamp) is int and stamp >= 0 for stamp in stamps) and all(
+                first < second for first, second in zip(stamps, stamps[1:])
+            ), "NCCL evidence lies outside its apply phase"
+            phases[release] = (set(ids), inventory["operation"], stamps)
+        assert phases[True][0] == phases[False][0], "Unpaired NCCL backend inventory"
+        assert phases[True][1] < phases[False][1], "Unpaired NCCL operation order"
+        assert phases[True][2][-1] < phases[False][2][0], "Unpaired NCCL phase order"
+        counts[str(rank)] = len(phases[True][0])
+    return counts
+
+
 def summarize(directory):
     serving = directory / "serving"
     result = json.loads((serving / "result.json").read_text())
@@ -147,6 +223,8 @@ def summarize(directory):
         )
         if result["protocols"] == [3, 3]:
             assert earliest_ack > max(row["ns"] for row in finished)
+    if "nccl" in tags:
+        summary["nccl_backend_counts_per_rank"] = nccl_counts(rank_rows, ranks)
     return summary | {
         "tags": tags,
         "tokens_per_ingress": result["tokens_per_ingress"],

@@ -104,6 +104,19 @@ ingresses or both DP2×TP2 ingresses, and exactly eight integer token IDs
 before release and after resume. Those token lists must match exactly.
 Missing, extra, empty, truncated, or non-integer ACK records are rejected.
 
+For each `nccl` case, the probe passively records the exact backend list
+returned by production `_nccl_backends` and the original suspend/resume
+return counts. It records only backend IDs, calls no additional communicator
+lookup, synchronization or collective, and returns the original objects and
+results unchanged. Each rank must have one positive count per direction,
+matching its unique inventory IDs within that apply phase; suspend and
+resume must cover the same backend ID set, with release before resume. Missing, duplicate, undercounted,
+out-of-phase or unpaired records fail validation. Counts follow the actual
+inventory, including cached split communicators, rather than topology
+constants. Historical `nccl` logs without inventory records need a new run;
+the checker does not waive this requirement. Non-`nccl` cases do not require
+inventory records.
+
 Protocol v2 retains its original one-apply-per-direction and local ACK
 semantics, including when `nccl` is requested. The checker must not impose
 v3's all-rank ACK barrier on v2. Its regression tests separately cover v3's
@@ -116,17 +129,18 @@ cd "$SOURCE"
 "$TS_TEST_PYTHON" -m pytest -q \
   test/runtime/distributed/test_memory_protocol_startup.py \
   "$HARNESS/test_cuda_two_node_evidence.py" \
+  "$HARNESS/test_cuda_two_node_cleanup.py" \
   test/runtime/test_model_executor_cache_state.py
 ```
 
 `network.log` and `socket-proof.log` preserve distinct network namespaces and
 NCCL `NET/Socket` data-channel evidence. The two `-nccl` cases also require
-four ranks' native suspend/resume messages: two NCCL groups per rank in EP4
-and three per rank in DP2×TP2+EP4. These appear in
-`nccl-suspend-resume.log`. Raw controller, launcher, rank, and NCCL logs stay
+four ranks' native suspend/resume message counts to match their validated
+inventory counts. These appear in `nccl-suspend-resume.log`; per-rank IDs
+and operation counts remain in the rank JSONL records. Raw controller, launcher, rank, and NCCL logs stay
 in each case directory so the summary can be independently checked.
 
-The three Python regression modules are registered in `runtime-1gpu` CI.
+The four Python regression modules are registered in `runtime-1gpu` CI.
 They are CPU behavioral tests using that job's complete runtime dependency
 environment. The startup tests exercise protocol-v2/v3 mismatch detection
 with real multiprocess Gloo, without enabling CUDA v3 serving.

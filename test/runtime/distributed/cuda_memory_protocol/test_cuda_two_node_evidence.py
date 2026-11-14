@@ -67,13 +67,49 @@ def write_case(tmp_path, layout, *, mixed=False, protocol=3, nccl=False):
                         [["kv_cache", "weights"], ["nccl"]] if release else [[], tags]
                     )
                 for index, phase in enumerate(phases):
+                    stamp = (100 if release else 200) + index * 4
+                    if nccl:
+                        rows.append(
+                            {
+                                "event": "apply_begin",
+                                "rank": rank,
+                                "release": release,
+                                "tags": phase,
+                                "ns": stamp,
+                            }
+                        )
+                        if "nccl" in phase:
+                            count = 3 if layout == "ep4" else 5
+                            operation = 1 if release else 2
+                            rows.extend(
+                                [
+                                    {
+                                        "event": "nccl_inventory",
+                                        "rank": rank,
+                                        "release": release,
+                                        "operation": operation,
+                                        "backend_ids": [
+                                            rank * 100 + i + 1 for i in range(count)
+                                        ],
+                                        "ns": stamp + 1,
+                                    },
+                                    {
+                                        "event": "nccl_complete",
+                                        "rank": rank,
+                                        "release": release,
+                                        "operation": operation,
+                                        "count": count,
+                                        "ns": stamp + 2,
+                                    },
+                                ]
+                            )
                     rows.append(
                         {
                             "event": "apply_complete",
                             "rank": rank,
                             "release": release,
                             "tags": phase,
-                            "ns": (100 if release else 200) + index,
+                            "ns": stamp + 3 if nccl else stamp,
                         }
                     )
     (serving / "node-0.jsonl").write_text(
@@ -117,7 +153,129 @@ def test_complete_before_after_token_evidence_passes(tmp_path, layout):
 @pytest.mark.parametrize("protocol", [2, 3])
 def test_nccl_apply_phases_match_protocol(tmp_path, layout, protocol):
     directory, _ = write_case(tmp_path, layout, protocol=protocol, nccl=True)
-    assert summarize(directory)["protocols"] == [protocol, protocol]
+    summary = summarize(directory)
+    assert summary["protocols"] == [protocol, protocol]
+    assert summary["nccl_backend_counts_per_rank"] == {
+        str(rank): 3 if layout == "ep4" else 5 for rank in range(4)
+    }
+
+
+@pytest.mark.parametrize("protocol", [2, 3])
+def test_nccl_inventory_can_vary_by_rank_without_topology_constants(tmp_path, protocol):
+    directory, _ = write_case(tmp_path, "ep4", protocol=protocol, nccl=True)
+    trace = directory / "serving/node-0.jsonl"
+    rows = [json.loads(line) for line in trace.read_text().splitlines()]
+    counts = {str(rank): rank + 2 for rank in range(4)}
+    for row in rows:
+        if row["event"] == "nccl_inventory":
+            ids = [row["rank"] * 100 + i + 1 for i in range(counts[str(row["rank"])])]
+            row["backend_ids"] = ids if row["release"] else ids[::-1]
+        elif row["event"] == "nccl_complete":
+            row["count"] = counts[str(row["rank"])]
+    trace.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    assert summarize(directory)["nccl_backend_counts_per_rank"] == counts
+
+
+@pytest.mark.parametrize("protocol", [2, 3])
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "missing_rank",
+        "legacy_without_inventory",
+        "missing_inventory",
+        "missing_complete",
+        "duplicate_inventory",
+        "duplicate_complete",
+        "empty_inventory",
+        "duplicate_backend",
+        "wrong_count",
+        "zero_count",
+        "non_integer_count",
+        "wrong_operation",
+        "unpaired_operation",
+        "unpaired_ids",
+        "wrong_release",
+        "wrong_rank",
+        "out_of_phase",
+        "complete_before_inventory",
+        "missing_apply_begin",
+    ],
+)
+def test_incomplete_or_unpaired_nccl_inventory_is_rejected(tmp_path, protocol, damage):
+    directory, _ = write_case(tmp_path, "ep4", protocol=protocol, nccl=True)
+    trace = directory / "serving/node-0.jsonl"
+    rows = [json.loads(line) for line in trace.read_text().splitlines()]
+    inventory = next(
+        row
+        for row in rows
+        if row["event"] == "nccl_inventory" and row["rank"] == 0 and row["release"]
+    )
+    complete = next(
+        row
+        for row in rows
+        if row["event"] == "nccl_complete" and row["rank"] == 0 and row["release"]
+    )
+    if damage == "missing_rank":
+        rows = [
+            row
+            for row in rows
+            if row["rank"] != 0
+            or row["event"] not in {"nccl_inventory", "nccl_complete"}
+        ]
+    elif damage == "legacy_without_inventory":
+        rows = [
+            row
+            for row in rows
+            if row["event"] not in {"nccl_inventory", "nccl_complete"}
+        ]
+    elif damage == "missing_inventory":
+        rows.remove(inventory)
+    elif damage == "missing_complete":
+        rows.remove(complete)
+    elif damage == "duplicate_inventory":
+        rows.append(inventory.copy())
+    elif damage == "duplicate_complete":
+        rows.append(complete.copy())
+    elif damage == "empty_inventory":
+        inventory["backend_ids"] = []
+    elif damage == "duplicate_backend":
+        inventory["backend_ids"][-1] = inventory["backend_ids"][0]
+    elif damage == "wrong_count":
+        complete["count"] -= 1
+    elif damage == "zero_count":
+        complete["count"] = 0
+    elif damage == "non_integer_count":
+        complete["count"] = True
+    elif damage == "wrong_operation":
+        complete["operation"] += 1
+    elif damage == "unpaired_operation":
+        for row in rows:
+            if row["rank"] == 0 and row["event"] in {"nccl_inventory", "nccl_complete"}:
+                row["operation"] = 1
+    elif damage == "unpaired_ids":
+        inventory["backend_ids"][0] += 50
+    elif damage == "wrong_release":
+        inventory["release"] = False
+    elif damage == "wrong_rank":
+        inventory["rank"] = 4
+    elif damage == "out_of_phase":
+        inventory["ns"] = 0
+    elif damage == "complete_before_inventory":
+        complete["ns"] = inventory["ns"] - 1
+    elif damage == "missing_apply_begin":
+        rows = [
+            row
+            for row in rows
+            if not (
+                row["event"] == "apply_begin"
+                and row["rank"] == 0
+                and row["release"]
+                and "nccl" in row["tags"]
+            )
+        ]
+    trace.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    with pytest.raises(AssertionError, match="NCCL"):
+        summarize(directory)
 
 
 @pytest.mark.parametrize("protocol", [2, 3])
@@ -139,6 +297,33 @@ def test_all_rank_ack_barrier_applies_only_to_v3(tmp_path, protocol, release):
     trace.write_text("".join(json.dumps(row) + "\n" for row in rows))
     if protocol == 2:
         assert summarize(directory)["protocols"] == [2, 2]
+    else:
+        with pytest.raises(AssertionError):
+            summarize(directory)
+
+
+@pytest.mark.parametrize("protocol", [2, 3])
+@pytest.mark.parametrize("release", [True, False])
+def test_nccl_inventory_does_not_add_a_v2_global_ack_barrier(
+    tmp_path, protocol, release
+):
+    directory, result = write_case(tmp_path, "ep4", protocol=protocol, nccl=True)
+    trace = directory / "serving/node-0.jsonl"
+    rows = [json.loads(line) for line in trace.read_text().splitlines()]
+    operation = "release" if release else "resume"
+    ack = min(result[f"{operation}_ack_ns"])
+    for row in rows:
+        if row["rank"] != 3 or row.get("release") != release:
+            continue
+        if row["event"] == "nccl_inventory":
+            row["ns"] = ack
+        elif row["event"] == "nccl_complete":
+            row["ns"] = ack + 1
+        elif row["event"] == "apply_complete" and "nccl" in row["tags"]:
+            row["ns"] = ack + 2
+    trace.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    if protocol == 2:
+        assert summarize(directory)["first_ack_after_last_rank_ms"][operation] <= 0
     else:
         with pytest.raises(AssertionError):
             summarize(directory)

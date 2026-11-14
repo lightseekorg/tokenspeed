@@ -116,6 +116,60 @@ if TRACE and HOST and Path("/proc/self/exe").resolve() == Path(HOST).resolve():
 
         bootstrap.report_ready = ready
 
+        from tokenspeed.runtime.distributed import nccl_suspend
+        from tokenspeed.runtime.execution import device
+
+        nccl_operation = 0
+        active_nccl = None
+        original_inventory = nccl_suspend._nccl_backends
+
+        @wraps(original_inventory)
+        def inventory(*args, **kwargs):
+            backends = original_inventory(*args, **kwargs)
+            if active_nccl is not None:
+                operation, release = active_nccl
+                # Observe exactly the production return value. Do not resolve
+                # communicators again or retain backend objects in the trace.
+                record(
+                    "nccl_inventory",
+                    operation=operation,
+                    release=release,
+                    backend_ids=[id(backend) for backend in backends],
+                )
+            return backends
+
+        nccl_suspend._nccl_backends = inventory
+
+        def trace_nccl(original, release):
+            @wraps(original)
+            def wrapped(*args, **kwargs):
+                nonlocal nccl_operation, active_nccl
+                nccl_operation += 1
+                operation = nccl_operation
+                previous = active_nccl
+                active_nccl = (operation, release)
+                try:
+                    count = original(*args, **kwargs)
+                    record(
+                        "nccl_complete",
+                        operation=operation,
+                        release=release,
+                        count=count,
+                    )
+                    return count
+                finally:
+                    active_nccl = previous
+
+            return wrapped
+
+        # DeviceHandle binds these helpers at import time. Wrap those exact
+        # aliases so their original calls, return values and failures survive.
+        for name, release in (
+            ("suspend_nccl_communicators", True),
+            ("resume_nccl_communicators", False),
+        ):
+            setattr(device, name, trace_nccl(getattr(device, name), release))
+
         def trace_apply(original, release):
             @wraps(original)
             def wrapped(self, tags):
