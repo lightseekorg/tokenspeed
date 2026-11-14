@@ -1852,6 +1852,64 @@ def test_gathered_mxfp4_preserves_rows_across_workspace_boundary(
     )
 
 
+def _nccl_owned_rows_worker(rank: int, port: int, world_size: int) -> None:
+    from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
+    from tokenspeed.runtime.distributed.process_group_manager import (
+        process_group_manager,
+    )
+
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        backend="nccl",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        group = tuple(range(world_size))
+        process_group_manager.init_process_group(group)
+        device = torch.device("cuda", rank)
+        backend = SimpleNamespace(nccl=NcclBackend())
+        owned = module._NcclOwnedRows(group)
+        width = 16 * world_size
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(module, "get_global_backend", lambda: backend)
+            for rows in (4 * world_size, 4 * world_size + 1, 4097):
+                local = owned.local_rows(rows)
+                first = rank * local
+                generator = torch.Generator().manual_seed(rows)
+                # Small integers sum exactly in BF16, so every rank order agrees.
+                partials = torch.randint(
+                    -8, 8, (world_size, rows, width), generator=generator
+                ).to(device=device, dtype=torch.bfloat16)
+                padding = (0, 0, 0, local * world_size - rows)
+                full = partials.sum(0)
+                expected = torch.nn.functional.pad(full, padding)[first : first + local]
+
+                reduced = owned.reduce_scatter_owned_rows(partials[rank])
+                torch.testing.assert_close(reduced, expected, atol=0, rtol=0)
+                gathered = owned.all_gather_owned_rows(reduced, rows)
+                torch.testing.assert_close(gathered, full, atol=0, rtol=0)
+                columns = full[:, rank * 16 : (rank + 1) * 16].contiguous()
+                transposed = owned.transpose_owned_columns(columns, rows)
+                torch.testing.assert_close(transposed, expected, atol=0, rtol=0)
+    finally:
+        dist.destroy_process_group()
+
+
+@requires_gpu
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_nccl_owned_rows_split_and_restore_padded_rows(world_size) -> None:
+    if torch.cuda.device_count() < world_size:
+        pytest.skip(f"requires {world_size} GPUs")
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    mp.spawn(
+        _nccl_owned_rows_worker, args=(port, world_size), nprocs=world_size, join=True
+    )
+
+
 @requires_gpu
 @pytest.mark.parametrize("world_size", [4, 8])
 def test_replicated_pool_preserves_column_projection_after_reload(
