@@ -309,3 +309,41 @@ def test_graph_replay_survives_buffer_growth():
     torch.cuda.synchronize()
     _assert_matches(captured, ref_small, "replay after growth")
     dist.barrier()
+
+
+@pytest.mark.parametrize("m,width", [(3, 8), (13, 24), (1025, HIDDEN)])
+def test_uneven_rank_shares_match_nccl(m, width):
+    """Uneven rank shares still sum every element once.
+
+    Vector counts that do not divide by the world leave the last ranks a
+    short or empty share.
+    """
+    rank, dev = _setup()
+    _require_multimem()
+    x = _inputs(rank, dev, m, width, seed=600 + m)
+    ref = _nccl_reference(x)
+    _assert_matches(_staged_reduce(x), ref, f"m={m} width={width}")
+
+
+@pytest.mark.parametrize("m", [1025, 4096, 8192])
+def test_view_written_in_place_matches_nccl(m):
+    """Rows written into ``multimem_view`` sum like NCCL.
+
+    A producer writes its rows in place and the staged all-reduce sums them; a
+    view past the capacity is refused.
+    """
+    from tokenspeed_kernel.ops.communication import multimem
+
+    rank, dev = _setup()
+    _require_multimem()
+    assert multimem.multimem_prealloc(8192, (HIDDEN,), _group_name())
+    x = _inputs(rank, dev, m, HIDDEN, seed=700 + m)
+    ref = _nccl_reference(x)
+    view = multimem.multimem_view(m, HIDDEN, _group_name())
+    assert view is not None and view.shape == (m, HIDDEN)
+    view.copy_(x)
+    out = multimem.multimem_all_reduce_staged(view, _group_name())
+    _assert_matches(out, ref, f"view m={m}")
+    capacity = multimem._BUFFERS[(dev.index, HIDDEN, _group_name())].shape[0]
+    assert multimem.multimem_view(capacity + 1, HIDDEN, _group_name()) is None
+    dist.barrier()

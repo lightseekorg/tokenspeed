@@ -23,14 +23,17 @@
 The in-switch ``ld_reduce`` collective takes about half NCCL's latency at
 latent-tail widths on GB200 and stays flat down to tens of tokens, where ring all-reduce
 pays its full latency floor. Tensors are staged through cached
-symmetric-memory buffers (one per width) so callers keep ordinary allocators.
+symmetric-memory buffers (one per width) so callers keep ordinary allocators;
+a producer that can write its output in place takes a view of the buffer.
 """
 
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.communication.triton import nvidia_multimem_all_reduce
 
 _BUFFERS: dict[tuple[int, int, str], torch.Tensor] = {}
+_HANDLES: dict[tuple[int, int, str], object] = {}
 # Replaced buffers stay referenced: in-flight kernels may still read them.
 _RETIRED: list[torch.Tensor] = []
 _SUPPORTED: bool | None = None
@@ -89,7 +92,7 @@ def _ensure_buffer(
         if buf is not None:
             _RETIRED.append(buf)
         buf = symm_mem.empty((cap, width), dtype=torch.bfloat16, device=device)
-        symm_mem.rendezvous(buf, group_name)
+        _HANDLES[key] = symm_mem.rendezvous(buf, group_name)
         _BUFFERS[key] = buf
     return buf
 
@@ -155,18 +158,48 @@ def multimem_stage(
     return view
 
 
+def multimem_view(rows: int, width: int, group_name: str) -> torch.Tensor | None:
+    """A ``[rows, width]`` view of a prepared staging buffer, for a producer to fill.
+
+    Args:
+        rows: Rows the producer writes.
+        width: Row width of a buffer ``multimem_prealloc`` prepared.
+        group_name: The group name it was prepared with.
+
+    Returns:
+        The view (valid until the next stage or view of the same width), or
+        None when no prepared buffer holds ``rows``. Never allocates, so it is
+        safe inside a forward and under capture.
+    """
+    if not multimem_available():
+        return None
+    buf = _BUFFERS.get((torch.cuda.current_device(), width, group_name))
+    if buf is None or buf.shape[0] < rows:
+        return None
+    return buf[:rows]
+
+
 def multimem_all_reduce_staged(view: torch.Tensor, group_name: str) -> torch.Tensor:
     """In-switch (ld_reduce) sum all-reduce of a staged view, in place.
 
     Args:
-        view: A view previously returned by ``multimem_stage``; every rank
-            must call with its own staged view of the same shape, in lockstep.
-        group_name: The same group name the view was staged with.
+        view: A view from ``multimem_stage`` or ``multimem_view``; every rank
+            must call with its own view of the same shape, in lockstep.
+        group_name: The same group name the view was taken with.
 
     Returns:
         The reduced view (same storage as the input).
     """
-    torch.ops.symm_mem.multimem_all_reduce_(view, "sum", group_name)
+    key = (view.device.index, view.shape[1], group_name)
+    buf, handle = _BUFFERS[key], _HANDLES[key]
+    nvidia_multimem_all_reduce(
+        handle.multicast_ptr + view.data_ptr() - buf.data_ptr(),
+        handle.signal_pad_ptrs_dev,
+        handle.signal_pad_size,
+        view.numel(),
+        handle.rank,
+        handle.world_size,
+    )
     return view
 
 
@@ -174,5 +207,6 @@ __all__ = [
     "multimem_available",
     "multimem_prealloc",
     "multimem_stage",
+    "multimem_view",
     "multimem_all_reduce_staged",
 ]

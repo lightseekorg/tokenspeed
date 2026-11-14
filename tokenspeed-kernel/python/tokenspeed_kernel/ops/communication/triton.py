@@ -1173,6 +1173,86 @@ def nvidia_rsag_multimem_all_gather(
     )
 
 
+# CTAs of the one-kernel multimem all-reduce. On 8 GB300s over two nodes a
+# [8192, 7168] BF16 sum took 291 us at 8 CTAs and 260 us at 16 to 32.
+_MULTIMEM_ALL_REDUCE_MAX_BLOCKS = 32
+
+
+@triton.jit
+def nvidia_multimem_all_reduce_kernel(
+    multicast_ptr,
+    signal_pad_ptr,
+    numel,
+    BLOCK_SIZE: tl.constexpr,
+    NUMEL_PER_THREAD: tl.constexpr,
+    RANK: tl.constexpr,
+    WORLD_SIZE: tl.constexpr,
+) -> None:
+    blockwise_barrier(signal_pad_ptr, None, RANK, WORLD_SIZE, sem="relaxed")
+    sync_threads()
+
+    # Each rank sums one contiguous share of the 16-byte vectors in the switch
+    # and stores the sum to every rank's copy.
+    vectors = numel // NUMEL_PER_THREAD
+    share = tl.cdiv(vectors, WORLD_SIZE)
+    end = tl.minimum((RANK + 1) * share, vectors)
+    tid = get_flat_tid()
+    block_start = RANK * share + tl.program_id(axis=0) * BLOCK_SIZE
+    while block_start < end:
+        vector = block_start + tid
+        mask = vector < end
+        ptr = multicast_ptr.to(tl.int64).to(tl.pointer_type(tl.uint64)) + vector * 2
+        x, y, z, w = multimem_ld_reduce_128(ptr, mask)
+        multimem_st_128(ptr, x, y, z, w, mask)
+        block_start += tl.num_programs(axis=0) * BLOCK_SIZE
+
+    sync_threads()
+    blockwise_barrier(signal_pad_ptr, None, RANK, WORLD_SIZE, sem="acq_rel")
+
+
+def nvidia_multimem_all_reduce(
+    multicast_ptr: int,
+    signal_pad_ptrs_dev: int,
+    signal_pad_size: int,
+    numel: int,
+    rank: int,
+    world_size: int,
+) -> None:
+    """Sum ``numel`` BF16 elements at ``multicast_ptr`` over every rank, in place.
+
+    Args:
+        multicast_ptr: Multicast address of the first element; 16-byte aligned.
+        signal_pad_ptrs_dev: The symmetric handle's device array of signal pads.
+        signal_pad_size: Bytes in each rank's signal pad.
+        numel: Elements to sum, a multiple of 8, the same on every rank.
+        rank: This rank in the symmetric handle's group.
+        world_size: Ranks in that group.
+    """
+    num_blocks, block_size, num_warps, numel_per_thread = nvidia_rsag_get_launch_config(
+        numel
+    )
+    share = triton.cdiv(numel // numel_per_thread, world_size)
+    num_blocks = max(
+        1, min(_MULTIMEM_ALL_REDUCE_MAX_BLOCKS, triton.cdiv(share, block_size))
+    )
+    # Each CTA's barrier takes one 32-bit slot per rank of every pad.
+    if num_blocks * world_size * 4 > signal_pad_size:
+        raise RuntimeError(
+            f"multimem all-reduce needs {num_blocks * world_size * 4} signal-pad "
+            f"bytes, but the handle has {signal_pad_size}"
+        )
+    nvidia_multimem_all_reduce_kernel[(num_blocks, 1, 1)](
+        multicast_ptr=multicast_ptr,
+        signal_pad_ptr=signal_pad_ptrs_dev,
+        numel=numel,
+        BLOCK_SIZE=block_size,
+        NUMEL_PER_THREAD=numel_per_thread,
+        RANK=rank,
+        WORLD_SIZE=world_size,
+        num_warps=num_warps,
+    )
+
+
 def nvidia_rsag_reduce_scatter(
     state: TritonRSAGState,
     hidden_states: torch.Tensor,
