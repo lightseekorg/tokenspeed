@@ -855,7 +855,7 @@ def combine_topk_weights(
     return out
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["block_table_stride", "logits_stride", "max_seq_len"])
 def _dsa_decode_logits_fp8_kernel(
     q,
     index_k_fp8,
