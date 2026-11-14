@@ -77,13 +77,40 @@ fn failed(error: ts_mooncake::Error) -> StoreError {
     StoreError(error.to_string())
 }
 
+/// An existence query's outcome: one flag, 0 or 1, per requested key. A
+/// response that answers a different number of keys is malformed: surplus
+/// results must never be truncated into apparent success, and a missing
+/// one leaves its key's state unknown.
+fn exists_outcome(results: Vec<i32>, keys: usize) -> Result<Vec<bool>, StoreError> {
+    if results.len() != keys {
+        return Err(StoreError(format!(
+            "Mooncake existence query returned {} results for {keys} keys",
+            results.len()
+        )));
+    }
+    if results.iter().any(|&flag| flag != 0 && flag != 1) {
+        return Err(StoreError(format!(
+            "Mooncake existence query failed: {results:?}"
+        )));
+    }
+    Ok(results.into_iter().map(|flag| flag == 1).collect())
+}
+
 /// A zero-copy GET's outcome from its per-key results: the bytes read or
 /// an error code. A miss precedes any transfer, so it retires as an object
 /// failure; a short read retires too, but the object is invalid. Another
-/// error may leave writes into the pool in flight.
-fn get_outcome(results: &[i64], sizes: &[usize]) -> IoResult {
+/// error may leave writes into the pool in flight. The response must
+/// answer every requested range exactly once, as in [`exists_outcome`].
+fn get_outcome(results: &[i64], sizes: &[usize]) -> Result<IoResult, StoreError> {
+    if results.len() != sizes.len() {
+        return Err(StoreError(format!(
+            "Mooncake get returned {} results for {} ranges",
+            results.len(),
+            sizes.len()
+        )));
+    }
     let full = |result: i64, size: usize| u64::try_from(result).is_ok_and(|n| n == size as u64);
-    IoResult {
+    Ok(IoResult {
         success: results
             .iter()
             .zip(sizes)
@@ -99,26 +126,43 @@ fn get_outcome(results: &[i64], sizes: &[usize]) -> IoResult {
                 result == OBJECT_NOT_FOUND || (result >= 0 && !full(result, size))
             })
             .collect(),
-    }
+    })
 }
 
 /// A PUT's outcome: the objects that already `exist` succeed without a
 /// write, and each `missing` key takes its write's result. An existing
 /// object (another writer's) is a success; an allocation rejection retires
 /// as a failure the scheduler offers again; other errors do not prove that
-/// the source bytes are no longer read.
-fn put_outcome(exists: Vec<bool>, missing: &[usize], results: &[i32]) -> IoResult {
+/// the source bytes are no longer read. The response must answer every
+/// missing key exactly once, as in [`exists_outcome`].
+fn put_outcome(
+    exists: Vec<bool>,
+    missing: &[usize],
+    results: &[i32],
+) -> Result<IoResult, StoreError> {
+    if results.len() != missing.len() {
+        return Err(StoreError(format!(
+            "Mooncake put returned {} results for {} writes",
+            results.len(),
+            missing.len()
+        )));
+    }
+    if missing.iter().any(|&index| index >= exists.len()) {
+        return Err(StoreError(
+            "Mooncake put answered a key outside its batch".to_owned(),
+        ));
+    }
     let mut success = exists;
     for (&index, &result) in missing.iter().zip(results) {
         success[index] = result == 0 || result == OBJECT_ALREADY_EXISTS;
     }
-    IoResult {
+    Ok(IoResult {
         object_failures: vec![false; success.len()],
         success,
         retired: results
             .iter()
             .all(|&result| [0, OBJECT_ALREADY_EXISTS, NO_AVAILABLE_HANDLE].contains(&result)),
-    }
+    })
 }
 
 /// The objects of the namespace `prefix`, as the store's regular expression.
@@ -138,12 +182,7 @@ impl Store for MooncakeStore {
             return Ok(Vec::new());
         }
         let results = self.client.batch_is_exist(keys).map_err(failed)?;
-        if results.iter().any(|&flag| flag != 0 && flag != 1) {
-            return Err(StoreError(format!(
-                "Mooncake existence query failed: {results:?}"
-            )));
-        }
-        Ok(results.into_iter().map(|flag| flag == 1).collect())
+        exists_outcome(results, keys.len())
     }
 
     fn batch_get_into(
@@ -167,7 +206,7 @@ impl Store for MooncakeStore {
             .client
             .batch_get_into(keys, &addrs, &sizes)
             .map_err(failed)?;
-        Ok(get_outcome(&results, &sizes))
+        get_outcome(&results, &sizes)
     }
 
     fn batch_put_from(
@@ -194,7 +233,7 @@ impl Store for MooncakeStore {
         };
         let missing: Vec<usize> = (0..keys.len()).filter(|&i| !exists[i]).collect();
         if missing.is_empty() {
-            return Ok(put_outcome(exists, &missing, &[]));
+            return put_outcome(exists, &missing, &[]);
         }
         let put_keys: Vec<String> = missing.iter().map(|&i| keys[i].clone()).collect();
         let put_ranges: Vec<Range> = missing.iter().map(|&i| ranges[i]).collect();
@@ -203,7 +242,7 @@ impl Store for MooncakeStore {
             .client
             .batch_put_from(&put_keys, &addrs, &sizes)
             .map_err(failed)?;
-        Ok(put_outcome(exists, &missing, &results))
+        put_outcome(exists, &missing, &results)
     }
 
     fn remove_by_prefix(&self, prefix: &str) -> bool {
@@ -241,12 +280,13 @@ mod tests {
     fn existing_objects_are_not_rewritten_and_rejections_retire() {
         // `existing` is stored; `saved` writes; `pressure` meets a full
         // store, a failure the scheduler offers again.
-        let outcome = put_outcome(vec![true, false, false], &[1, 2], &[0, NO_AVAILABLE_HANDLE]);
+        let outcome = put_outcome(vec![true, false, false], &[1, 2], &[0, NO_AVAILABLE_HANDLE])
+            .expect("a full response");
         assert_eq!(outcome.success, [true, true, false]);
         assert!(outcome.retired);
         assert_eq!(outcome.object_failures, [false, false, false]);
         // Another writer's concurrent create is a success.
-        let outcome = put_outcome(vec![false], &[0], &[OBJECT_ALREADY_EXISTS]);
+        let outcome = put_outcome(vec![false], &[0], &[OBJECT_ALREADY_EXISTS]).expect("full");
         assert_eq!(outcome.success, [true]);
         assert!(outcome.retired);
     }
@@ -254,7 +294,8 @@ mod tests {
     #[test]
     fn a_failed_put_does_not_retire() {
         for error in [-1, -800] {
-            let outcome = put_outcome(vec![true, false, false], &[1, 2], &[0, error]);
+            let outcome = put_outcome(vec![true, false, false], &[1, 2], &[0, error])
+                .expect("a full response");
             assert_eq!(outcome.success, [true, true, false]);
             assert!(!outcome.retired);
         }
@@ -263,26 +304,42 @@ mod tests {
     #[test]
     fn a_get_miss_retires_as_an_object_failure() {
         // The object was evicted after the existence query.
-        let outcome = get_outcome(&[OBJECT_NOT_FOUND, 8], &[8, 8]);
+        let outcome = get_outcome(&[OBJECT_NOT_FOUND, 8], &[8, 8]).expect("a full response");
         assert_eq!(outcome.success, [false, true]);
         assert!(outcome.retired);
         assert_eq!(outcome.object_failures, [true, false]);
         // An unknown error may still write into the pool.
-        let outcome = get_outcome(&[OBJECT_NOT_FOUND, -800], &[8, 8]);
+        let outcome = get_outcome(&[OBJECT_NOT_FOUND, -800], &[8, 8]).expect("a full response");
         assert!(!outcome.retired);
         assert_eq!(outcome.object_failures, [true, false]);
     }
 
     #[test]
     fn a_short_get_is_an_invalid_object() {
-        let outcome = get_outcome(&[4, 8], &[8, 8]);
+        let outcome = get_outcome(&[4, 8], &[8, 8]).expect("a full response");
         assert_eq!(outcome.success, [false, true]);
         assert!(outcome.retired);
         assert_eq!(outcome.object_failures, [true, false]);
-        let outcome = get_outcome(&[0, -1], &[8, 8]);
+        let outcome = get_outcome(&[0, -1], &[8, 8]).expect("a full response");
         assert_eq!(outcome.success, [false, false]);
         assert!(!outcome.retired);
         assert_eq!(outcome.object_failures, [true, false]);
+    }
+
+    #[test]
+    fn ragged_responses_are_errors_never_truncations() {
+        // A surplus result must not be truncated into apparent success,
+        // and a missing one leaves its key's state unknown.
+        assert!(get_outcome(&[8, 8, 8], &[8, 8]).is_err());
+        assert!(get_outcome(&[8], &[8, 8]).is_err());
+        assert!(put_outcome(vec![false, false], &[0, 1], &[0, 0, 0]).is_err());
+        assert!(put_outcome(vec![false, false], &[0, 1], &[0]).is_err());
+        // An answer for a key outside the batch cannot publish.
+        assert!(put_outcome(vec![false], &[1], &[0]).is_err());
+        assert!(exists_outcome(vec![0, 1, 0], 2).is_err());
+        assert!(exists_outcome(vec![1], 2).is_err());
+        assert!(exists_outcome(vec![-1, 1], 2).is_err());
+        assert_eq!(exists_outcome(vec![0, 1], 2).unwrap(), [false, true]);
     }
 
     #[test]
