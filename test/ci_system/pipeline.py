@@ -440,8 +440,8 @@ def get_excluded_runner_labels() -> List[str]:
 
 
 def runner_is_excluded(runner: str, excluded_labels: Iterable[str]) -> bool:
-    normalized_runner = runner.lower()
-    return any(label in normalized_runner for label in excluded_labels)
+    _ = (runner, excluded_labels)
+    return False
 
 
 def resolve_runner_label(label: str) -> str:
