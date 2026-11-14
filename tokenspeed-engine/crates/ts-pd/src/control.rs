@@ -22,6 +22,7 @@
 //! loop sees them: requests register at admission, and every round the
 //! replica agrees on which transfers changed state.
 
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use ts_collective::{Group, Mesh};
@@ -225,10 +226,83 @@ pub trait EmbeddingReceiver {
     fn awaiting_release(&self) -> bool;
 }
 
+/// EPD, an encode rank: its send ring's free slots. An item's rows wait in
+/// a slot from its forward until the transfer engine read them; the slot
+/// comes back when the [`SendSlot`] leasing it drops.
+#[derive(Debug, Clone)]
+pub struct SendRing {
+    free: Arc<Mutex<Vec<usize>>>,
+    slots: usize,
+}
+
+impl SendRing {
+    /// `slots` slots, all free.
+    pub fn new(slots: usize) -> Self {
+        Self {
+            // Popped from the back: the lowest slots go first.
+            free: Arc::new(Mutex::new((0..slots).rev().collect())),
+            slots,
+        }
+    }
+
+    /// The ring's slots.
+    pub fn slots(&self) -> usize {
+        self.slots
+    }
+
+    /// The slots free now. Others may come back at any time; only
+    /// [`SendRing::lease`] takes one.
+    pub fn free(&self) -> usize {
+        lock_free_slots(&self.free).len()
+    }
+
+    /// A free slot, `None` while every slot is leased.
+    pub fn lease(&self) -> Option<SendSlot> {
+        let slot = lock_free_slots(&self.free).pop()?;
+        Some(SendSlot {
+            free: Arc::clone(&self.free),
+            slot,
+        })
+    }
+}
+
+/// One leased send slot, back in its ring when this drops: whatever holds
+/// the rows -- the encode loop while the data plane fills them, then the
+/// chunk the sender writes, parks or drops -- returns the slot however that
+/// ends.
+#[derive(Debug)]
+pub struct SendSlot {
+    free: Arc<Mutex<Vec<usize>>>,
+    slot: usize,
+}
+
+impl SendSlot {
+    /// The slot's index in its ring.
+    pub fn index(&self) -> usize {
+        self.slot
+    }
+}
+
+impl Drop for SendSlot {
+    fn drop(&mut self) {
+        lock_free_slots(&self.free).push(self.slot);
+    }
+}
+
+/// A ring's free slots, even after a panic poisoned the lock: a panicking
+/// sender worker drops its chunk too, and returning the slot must not panic
+/// again.
+fn lock_free_slots(free: &Mutex<Vec<usize>>) -> MutexGuard<'_, Vec<usize>> {
+    free.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// EPD, an encode rank: one item's embedding in its send slot, as the
 /// transfer engine reads it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct EmbeddingChunk {
+    /// The send slot holding the rows, back in its ring once the chunk
+    /// drops: written, or its room failed.
+    pub slot: SendSlot,
     /// The room the prefill ranks receive it under.
     pub room: u64,
     /// The rows' address.
@@ -256,22 +330,50 @@ pub trait EmbeddingSender {
     fn begin(&mut self, room: u64) -> bool;
 
     /// Hand over a begun room's rows: they are written once every prefill
-    /// rank of the block asked, and must stay in place until the room
-    /// concludes.
+    /// rank of the block asked. The chunk keeps its slot until it drops,
+    /// once written or when the room failed.
     fn send(&mut self, chunk: EmbeddingChunk);
 
     /// Conclude a begun room failed before its rows were handed over,
     /// telling the prefill ranks that asked.
     fn fail(&mut self, room: u64, reason: &str);
-
-    /// The begun rooms that concluded since the last call, sent or failed:
-    /// their rows' slots take new rows.
-    fn concluded(&mut self) -> Vec<u64>;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_leased_slot_returns_when_its_lease_drops() {
+        let ring = SendRing::new(2);
+        let first = ring.lease().expect("a free slot");
+        let second = ring.lease().expect("a free slot");
+        // The lowest slots go first.
+        assert_eq!((first.index(), second.index()), (0, 1));
+        assert_eq!(ring.free(), 0);
+        assert!(ring.lease().is_none());
+        drop(second);
+        assert_eq!(ring.free(), 1);
+        assert_eq!(ring.lease().map(|slot| slot.index()), Some(1));
+        drop(first);
+        assert_eq!(ring.free(), ring.slots());
+    }
+
+    #[test]
+    fn a_slot_dropped_by_a_panicking_thread_still_returns() {
+        let ring = SendRing::new(1);
+        let slot = ring.lease().expect("a free slot");
+        let poisoner = ring.clone();
+        let worker = std::thread::spawn(move || {
+            let _slot = slot;
+            // Poison the ring's lock on the way out.
+            let _free = poisoner.free.lock().unwrap();
+            panic!("a transfer panicked");
+        });
+        assert!(worker.join().is_err());
+        assert!(ring.free.is_poisoned());
+        assert_eq!(ring.free(), 1);
+    }
 
     fn draining(rid: &str, age: Duration, now: Instant) -> Draining {
         Draining {

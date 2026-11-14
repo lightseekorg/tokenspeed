@@ -1439,6 +1439,24 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         let codes = self.replica_min(codes)?;
         if let Some(receiver) = self.embeddings.as_mut() {
             let landed = receiver.settle(&codes);
+            // The receiver keeps its own staged list, in step with this one
+            // by position: its landed requests must be ours with code 2.
+            let expected = self
+                .staged
+                .iter()
+                .zip(&codes)
+                .filter(|&(_, &code)| code == 2)
+                .map(|(submission, _)| submission.rid.as_str());
+            if !landed
+                .iter()
+                .map(|request| request.rid.as_str())
+                .eq(expected)
+            {
+                return Err(LoopError::DataPlane(DataPlaneError(
+                    "the EPD receiver landed requests other than the staged ones it agreed on"
+                        .to_owned(),
+                )));
+            }
             if !landed.is_empty() {
                 self.data_plane.epd_publish(&landed)?;
             }
