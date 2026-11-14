@@ -302,6 +302,213 @@ fn l3_snapshots_export_their_growth_once_and_keep_quarantine_visible() {
     std::fs::remove_dir_all(&directory).unwrap();
 }
 
+fn pairs(entries: &[(&str, f64)]) -> Vec<(String, f64)> {
+    entries
+        .iter()
+        .map(|&(name, value)| (name.to_owned(), value))
+        .collect()
+}
+
+fn l3_metrics(directory: &Path) -> L3Metrics {
+    let exporter = Exporter::new(&MetricsConfig {
+        prometheus_dir: Some(directory.to_owned()),
+        relay_endpoint: None,
+    })
+    .unwrap();
+    L3Metrics::new(
+        &exporter,
+        &L3Labels {
+            model_name: "m".to_owned(),
+            app_key: String::new(),
+            dp_rank: 0,
+            tp_rank: 1,
+            engine_role: "null".to_owned(),
+        },
+    )
+}
+
+/// An executor snapshot of three kinds, each with one rejected job, where
+/// `get`'s oldest ages are `get_ages` (queued, running, completed) and the
+/// other kinds hold no job.
+fn io_snapshot(get_ages: [f64; 3]) -> L3ExecutorSnapshot {
+    let states = ["queued", "running", "completed"];
+    let row = |kind: &str, ages: [f64; 3]| L3OperationSnapshot {
+        kind: kind.to_owned(),
+        events: pairs(&[("accepted", 4.0), ("rejected", 1.0)]),
+        operations: pairs(&states.map(|state| (state, 0.0))),
+        oldest_age_seconds: pairs(&[
+            (states[0], ages[0]),
+            (states[1], ages[1]),
+            (states[2], ages[2]),
+        ]),
+        ..L3OperationSnapshot::default()
+    };
+    L3ExecutorSnapshot {
+        operations: vec![
+            row("query", [0.0; 3]),
+            row("get", get_ages),
+            row("put", [0.0; 3]),
+        ],
+        health_state: "open".to_owned(),
+        health_epoch: 1.0,
+        unsafe_io: false,
+    }
+}
+
+/// `metric`'s rendered samples: their sorted labels and value.
+fn samples(rendered: &str, metric: &str) -> Vec<(Vec<(String, String)>, f64)> {
+    rendered
+        .lines()
+        .filter_map(|line| {
+            let (labels, value) = line
+                .strip_prefix(metric)?
+                .strip_prefix('{')?
+                .split_once("} ")?;
+            let labels = labels
+                .split(',')
+                .map(|pair| {
+                    let (name, value) = pair.split_once('=').unwrap();
+                    (name.to_owned(), value.trim_matches('"').to_owned())
+                })
+                .collect();
+            Some((labels, value.parse().unwrap()))
+        })
+        .collect()
+}
+
+fn label<'a>(labels: &'a [(String, String)], name: &str) -> &'a str {
+    &labels.iter().find(|(key, _)| key == name).unwrap().1
+}
+
+#[test]
+fn l3_operation_ages_export_per_kind_and_state_and_reset_once_drained() {
+    let directory = scratch_dir("l3-ages");
+    let mut metrics = l3_metrics(&directory);
+    let scheduler = L3SchedulerStats::default();
+    metrics.record(&io_snapshot([1.5, 3.0, 2.5]), &scheduler);
+    metrics.record(&io_snapshot([1.5, 3.0, 2.5]), &scheduler);
+    let Some(aged) = render(&directory) else {
+        return;
+    };
+    let age = "tokenspeed:l3_io_oldest_operation_age_seconds";
+    let series = samples(&aged, age);
+    assert_eq!(series.len(), 9, "{aged}");
+    for (labels, value) in &series {
+        let names: Vec<&str> = labels.iter().map(|(name, _)| name.as_str()).collect();
+        // Fixed, low-cardinality labels only.
+        assert_eq!(
+            names,
+            [
+                "app_key",
+                "dp_rank",
+                "engine_role",
+                "kind",
+                "model_name",
+                "state",
+                "tp_rank"
+            ]
+        );
+        let expected = match (label(labels, "kind"), label(labels, "state")) {
+            ("get", "queued") => 1.5,
+            ("get", "running") => 3.0,
+            ("get", "completed") => 2.5,
+            ("query" | "put", "queued" | "running" | "completed") => 0.0,
+            other => panic!("unexpected series {other:?}"),
+        };
+        assert_eq!(*value, expected, "{labels:?}");
+    }
+    let accepted = |rendered: &str| -> Vec<f64> {
+        samples(rendered, "tokenspeed:l3_io_events_total")
+            .into_iter()
+            .filter(|(labels, _)| label(labels, "event") == "accepted")
+            .map(|(_, value)| value)
+            .collect()
+    };
+    // The same cumulative snapshot, recorded twice, counts once.
+    assert_eq!(accepted(&aged), [4.0; 3]);
+
+    metrics.record(&io_snapshot([0.0; 3]), &scheduler);
+    let drained = render(&directory).unwrap();
+    let series = samples(&drained, age);
+    assert_eq!(series.len(), 9);
+    assert!(series.iter().all(|(_, value)| *value == 0.0), "{drained}");
+    assert_eq!(accepted(&drained), [4.0; 3]);
+    std::fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn the_l3_alert_rules_read_only_exported_series_and_labels() {
+    let directory = scratch_dir("l3-alerts");
+    let mut metrics = l3_metrics(&directory);
+    // Every counter a rule reads must have grown to exist.
+    metrics.record(
+        &io_snapshot([0.0, 31.0, 0.0]),
+        &L3SchedulerStats {
+            quarantined: 1.0,
+            pressure_gate_closed: true,
+            pressure_bypasses: 2.0,
+            ..L3SchedulerStats::default()
+        },
+    );
+    let Some(rendered) = render(&directory) else {
+        return;
+    };
+    let rules = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../examples/monitoring/tokenspeed-l3-alerts.yaml"),
+    )
+    .unwrap();
+    let mut selectors = 0;
+    for line in rules
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+    {
+        let mut rest = line;
+        while let Some(start) = rest.find("tokenspeed:") {
+            let tail = &rest[start..];
+            let end = tail
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
+                .unwrap_or(tail.len());
+            let name = &tail[..end];
+            let series = samples(&rendered, name);
+            assert!(!series.is_empty(), "the rules read {name}, never exported");
+            if let Some(matchers) = tail[end..].strip_prefix('{') {
+                let matchers = &matchers[..matchers.find('}').unwrap()];
+                for matcher in matchers.split(',') {
+                    let (key, values) = matcher
+                        .split_once("=~")
+                        .or_else(|| matcher.split_once('='))
+                        .unwrap();
+                    for value in values.trim_matches('"').split('|') {
+                        assert!(
+                            series.iter().any(|(labels, _)| labels
+                                .iter()
+                                .any(|(k, v)| k == key && v == value)),
+                            "no {name}{{{key}=\"{value}\"}} is exported"
+                        );
+                    }
+                }
+            }
+            selectors += 1;
+            rest = &tail[end..];
+        }
+        let mut rest = line;
+        while let Some(start) = rest.find("without (") {
+            let tail = &rest[start + "without (".len()..];
+            let end = tail.find(')').unwrap();
+            for key in tail[..end].split(',').map(str::trim) {
+                assert!(
+                    rendered.contains(&format!("{key}=\"")),
+                    "the rules aggregate away {key}, no exported label"
+                );
+            }
+            rest = &tail[end..];
+        }
+    }
+    assert!(selectors >= 5, "{selectors} selectors in the rules");
+    std::fs::remove_dir_all(&directory).unwrap();
+}
+
 #[test]
 fn a_relay_message_is_the_python_event_array() {
     let event = MetricEvent {

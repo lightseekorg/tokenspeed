@@ -1,0 +1,125 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+# Prometheus alerting rules for the Mooncake Store L3 cache tier. See
+# docs/operations/l3-observability.md for what each signal means and what to
+# do. They report a degraded cache tier, never serving readiness.
+#
+# Executor series (tokenspeed:l3_io_*, tokenspeed:l3_backend_*) are local to
+# one attention-TP rank and keep tp_rank. Scheduler series
+# (tokenspeed:l3_scheduler_resources, tokenspeed:l3_pressure_*) are mirrored
+# on every TP rank of a replica: they are reduced with max, never summed.
+# Thresholds assume the default async settings (wait_timeout_ms 2000,
+# operation_high_age_ms 500); scale them with yours.
+
+groups:
+  - name: tokenspeed-l3
+    rules:
+      - alert: TokenSpeedL3OperationStuck
+        expr: >-
+          tokenspeed:l3_io_oldest_operation_age_seconds{state=~"queued|running"}
+          > 30
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            L3 {{ $labels.kind }} jobs older than 30s are
+            {{ $labels.state }} on TP rank {{ $labels.tp_rank }}.
+          description: >-
+            Ages count from submission. A running job this old is native I/O
+            that has not returned; it keeps its Host references and operation
+            credit even after its request was cancelled. Check the store's
+            latency and transport; requests past wait_timeout_ms already
+            recompute.
+
+      - alert: TokenSpeedL3CompletionsUndelivered
+        expr: >-
+          tokenspeed:l3_io_oldest_operation_age_seconds{state="completed"}
+          > 30
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            Completed L3 {{ $labels.kind }} facts wait to be polled on TP
+            rank {{ $labels.tp_rank }}.
+          description: >-
+            Completed jobs stay charged until the engine's event loop polls
+            them. Age includes queue and backend time, so a newly completed
+            slow call is also old. Check completed-job counts and event-loop
+            progress before diagnosing a polling backlog.
+
+      - alert: TokenSpeedL3Quarantined
+        expr: >-
+          max without (tp_rank) (tokenspeed:l3_io_quarantined) == 1
+          or max without (tp_rank, resource)
+          (tokenspeed:l3_scheduler_resources{resource="quarantined"}) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: >-
+            L3 native I/O retirement is unproven on DP rank
+            {{ $labels.dp_rank }}; restart required.
+          description: >-
+            New L3 I/O stays disabled and the quarantined Host blocks stay
+            held until the process restarts. Serving continues on L1/L2 and
+            recomputation. Find the rank with tokenspeed:l3_io_quarantined,
+            then plan a restart.
+
+      - alert: TokenSpeedL3BackendUnavailable
+        expr: >-
+          tokenspeed:l3_backend_state > 0
+          and sum without (kind, event)
+          (rate(tokenspeed:l3_io_events_total{event="rejected"}[5m])) > 0
+          unless tokenspeed:l3_io_quarantined == 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            The L3 store has been refusing jobs on TP rank
+            {{ $labels.tp_rank }} for 10 minutes.
+          description: >-
+            The backend failed and its recovery probes keep failing; jobs are
+            rejected without a store call and requests recompute. This
+            recovers on its own once a probe succeeds. Check the store's
+            master and providers.
+
+      - alert: TokenSpeedL3PressureGateClosed
+        expr: >-
+          max without (tp_rank, resource)
+          (tokenspeed:l3_scheduler_resources{resource="pressure_gate_closed"})
+          == 1
+          and max without (tp_rank)
+          (rate(tokenspeed:l3_pressure_bypasses_total[5m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            L3 admission has been closed by queue pressure under traffic on
+            DP rank {{ $labels.dp_rank }}.
+          description: >-
+            New requests skip L3 preparation and backups are dropped. Compare
+            tokenspeed:l3_io_operations and
+            tokenspeed:l3_io_oldest_operation_age_seconds with the queue
+            watermarks.
