@@ -446,7 +446,14 @@ def test_kernel_ut_tasks_cover_every_test_once_per_runner():
     assert files
     tasks = [
         load_yaml(REPO_ROOT / f"test/ci/ut/ut-tokenspeed-kernel{suffix}.yaml")
-        for suffix in ("-part-i", "-part-ii", "-post-submit", "")
+        for suffix in (
+            "-part-i",
+            "-part-ii",
+            "-post-submit",
+            "",
+            "-part-amd-gfx950",
+            "-part-amd-ops",
+        )
     ]
     labels = {label for task in tasks for label in task["runner"]["labels"]}
     # Pin the runner set so dropping a runner from every task fails here.
