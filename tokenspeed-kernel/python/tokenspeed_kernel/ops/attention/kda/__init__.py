@@ -771,8 +771,8 @@ def resolve_kda_batched_replay_commit(
 
     NVIDIA records recovery accepts BF16 and FP16 activations, with history
     stored in the bound pool dtype. Other vendors use their registered dtypes.
-    Kernels bounded to a window or a state dtype need those stated to be
-    selected; the commit every caller can take remains otherwise.
+    Kernels bounded to a window or a state dtype are selected only when the
+    caller states them. Otherwise the commit every caller can take is selected.
 
     Args:
         dtype: Activation dtype used by the replay payload.
