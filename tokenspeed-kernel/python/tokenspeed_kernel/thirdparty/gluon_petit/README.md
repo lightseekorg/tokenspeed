@@ -27,10 +27,9 @@ when selecting a kernel plan.
 ## Runtime contract
 
 Select the backend with both `--moe-backend gluon_petit` and
-`--all2all-backend gluon_petit`. It requires one 8-GPU GFX950 node, EP8/TP1,
-BF16 model activations, serialized MXFP4 expert weights, trivial expert
-placement, and no more than 1024 tokens per rank. The registered profiles are
-GPT-OSS 120B and the DeepSeek V4 expert geometry with unclamped SiLU.
+`--all2all-backend gluon_petit`. It requires one GFX950 node, EP8/TP1 (or EP4
+for DeepSeek V4.1 Flash), BF16 model activations, serialized MXFP4 expert weights, trivial expert placement, and no more than 1024 tokens per rank. The registered
+profiles are GPT-OSS 120B and the DeepSeek V4 expert geometry with unclamped SiLU.
 Checkpoints declaring a SiLU activation clamp are rejected because this kernel
 cannot preserve that activation. Explicit FP8 activation requests are also
 rejected; this backend quantizes activations to MXFP4.

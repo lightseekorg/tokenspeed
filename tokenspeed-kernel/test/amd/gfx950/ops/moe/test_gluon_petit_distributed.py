@@ -18,10 +18,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Eight-rank numerical checks for the registered Petit
+"""Four- and eight-rank numerical checks for the registered Petit
 
-Run with torchrun --standalone --nproc_per_node=8 -m pytest --import-mode=importlib
-<path-to-this-file>. Optional PETIT_OUTPUT_DIR saves outputs for an exact
+Run with torchrun --standalone --nproc_per_node=<4 or 8> -m pytest
+--import-mode=importlib <path-to-this-file>. Optional PETIT_OUTPUT_DIR saves outputs for an exact
 before/after comparison. Local fixtures are independent of benchmark timing
 scope. Normal single-process pytest skips the GPU test.
 """
@@ -54,6 +54,8 @@ class _BenchmarkProfile:
     compute_intermediate: int
     activation: str
     has_bias: bool
+    clamp: float | None = None
+    world_sizes: tuple[int, ...] = (8,)
 
 
 _PROFILES = {
@@ -87,6 +89,24 @@ _PROFILES = {
         activation="situ",
         has_bias=False,
     ),
+    **{
+        name: _BenchmarkProfile(
+            name=name,
+            experts=experts,
+            top_k=top_k,
+            hidden=5120,
+            logical_intermediate=2304,
+            compute_intermediate=2560,
+            activation="swiglu",
+            has_bias=False,
+            clamp=10.0,
+            world_sizes=(4, 8),
+        )
+        for name, experts, top_k in (
+            ("dsv41_flash", 384, 6),
+            ("dsv41_flash_dspark", 128, 3),
+        )
+    },
 }
 
 
@@ -98,15 +118,17 @@ def _parameter(shape: tuple[int, ...], device: torch.device) -> torch.nn.Paramet
 
 
 class _TestMoeLayer(torch.nn.Module):
-    def __init__(self, profile: _BenchmarkProfile, device: torch.device) -> None:
+    def __init__(
+        self, profile: _BenchmarkProfile, ep_size: int, device: torch.device
+    ) -> None:
         super().__init__()
-        local_experts = profile.experts // 8
+        local_experts = profile.experts // ep_size
         self.num_experts = profile.experts
         self.top_k = profile.top_k
         self.hidden_size = profile.hidden
         self.intermediate_size = profile.logical_intermediate
         self.num_local_experts = local_experts
-        self.ep_size = 8
+        self.ep_size = ep_size
         self.tp_size = 1
         self.activation = profile.activation
         self.activation_situ_beta = 4.0 if profile.activation == "situ" else None
@@ -114,9 +136,12 @@ class _TestMoeLayer(torch.nn.Module):
             25.0 if profile.activation == "situ" else None
         )
         self.swiglu_beta = 1.0 if profile.has_bias else None
-        self.swiglu_arg = (
-            argparse.Namespace(alpha=1.702, limit=7.0) if profile.has_bias else None
-        )
+        if profile.has_bias:
+            self.swiglu_arg = argparse.Namespace(alpha=1.702, limit=7.0)
+        elif profile.clamp is not None:
+            self.swiglu_arg = argparse.Namespace(alpha=None, limit=profile.clamp)
+        else:
+            self.swiglu_arg = None
         self.w13_input_layout = "interleaved" if profile.has_bias else "concatenated"
         self.register_parameter(
             "w13_weight",
@@ -190,7 +215,7 @@ class _TestMoeLayer(torch.nn.Module):
             self.register_parameter("w2_weight_bias", None)
 
 
-def _make_plan(profile: _BenchmarkProfile) -> dict:
+def _make_plan(profile: _BenchmarkProfile, ep_size: int) -> dict:
     return kernel_moe_plan(
         "mxfp4",
         input_dtype=torch.bfloat16,
@@ -198,7 +223,7 @@ def _make_plan(profile: _BenchmarkProfile) -> dict:
         requires_deferred_finalize=False,
         routing_mode="precomputed_topk",
         a2a_backend="gluon_petit",
-        ep_size=8,
+        ep_size=ep_size,
         ispp=profile.logical_intermediate,
         fp8_scale_block_shape=None,
         internal_activation_dtype="mxfp4",
@@ -210,7 +235,7 @@ def _make_plan(profile: _BenchmarkProfile) -> dict:
             if profile.has_bias
             else "standard" if profile.activation == "swiglu" else None
         ),
-        activation_clamped=profile.has_bias,
+        activation_clamped=profile.has_bias or profile.clamp is not None,
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
@@ -225,12 +250,13 @@ def _routing(
     tokens: int,
     rank: int,
     profile: _BenchmarkProfile,
+    world_size: int,
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     token = torch.arange(tokens, dtype=torch.int32, device=device)[:, None]
     route = torch.arange(profile.top_k, dtype=torch.int32, device=device)[None, :]
-    local_experts = profile.experts // 8
-    destination = (rank + token + token // 16 + route) % 8
+    local_experts = profile.experts // world_size
+    destination = (rank + token + token // 16 + route) % world_size
     local = (token * profile.top_k + route) % local_experts
     ids = (destination * local_experts + local).to(torch.int32).contiguous()
     raw_weights = 1.0 + ((token + 2 * route) % 7).to(torch.float32)
@@ -261,7 +287,7 @@ def _quantized_reference(
     return (levels[closest] * blocks.sign() * scale).reshape(shape)
 
 
-def _weights(layer, profile, rank: int) -> None:
+def _weights(layer, profile, rank: int, world_size: int) -> None:
     """Sparse nonzero weights give an independent, inexpensive exact matmul oracle."""
     device = layer.w13_weight.device
     inter = profile.logical_intermediate
@@ -270,8 +296,8 @@ def _weights(layer, profile, rank: int) -> None:
     gate = rows % 2 == 0 if profile.has_bias else rows < inter
     channel = rows // 2 if profile.has_bias else rows % inter
     cols = (channel * 7 + torch.where(gate, 0, 3)) % hidden
-    for local in range(profile.experts // 8):
-        expert = rank * (profile.experts // 8) + local
+    for local in range(profile.experts // world_size):
+        expert = rank * (profile.experts // world_size) + local
         codes = torch.where(gate, 2 + expert % 3, 2 + (expert + 1) % 3).to(torch.uint8)
         layer.w13_weight[local, rows, cols // 2] = (codes << ((cols % 2) * 4)).to(
             torch.uint8
@@ -314,6 +340,10 @@ def _reference(x, ids, weights, profile):
             up -= 0.03125
             gate = gate.clamp(max=7)
             hidden = gate * torch.sigmoid(1.702 * gate) * (up.clamp(-7, 7) + 1)
+        elif profile.clamp is not None:
+            hidden = torch.nn.functional.silu(gate.clamp(max=profile.clamp)) * (
+                up.clamp(-profile.clamp, profile.clamp)
+            )
         elif profile.activation == "situ":
             hidden = (4.0 * torch.tanh(gate / 4.0) * torch.sigmoid(gate)) * (
                 25.0 * torch.tanh(up / 25.0)
@@ -332,12 +362,18 @@ def _reference(x, ids, weights, profile):
     return output.to(torch.bfloat16)
 
 
+_WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "1"))
+
+
 @pytest.mark.skipif(
-    int(os.environ.get("WORLD_SIZE", "1")) != 8 or not is_cdna4(),
-    reason="requires torchrun with eight gfx950 GPUs",
+    _WORLD_SIZE not in (4, 8) or not is_cdna4(),
+    reason="requires torchrun with four or eight gfx950 GPUs",
 )
-@pytest.mark.parametrize("profile_name", ("gpt_oss_120b", "dsv4", "kimi_k3"))
+@pytest.mark.parametrize("profile_name", tuple(_PROFILES))
 def test_distributed_petit_reference(profile_name):
+    profile = _PROFILES[profile_name]
+    if _WORLD_SIZE not in profile.world_sizes:
+        pytest.skip(f"{profile_name} is registered for EP{profile.world_sizes} only")
     expected_root = os.environ.get("PETIT_EXPECTED_RUNTIME_ROOT")
     if expected_root is not None:
         assert (
@@ -351,36 +387,41 @@ def test_distributed_petit_reference(profile_name):
         dist.init_process_group("nccl", timeout=timedelta(minutes=5))
     rank = dist.get_rank()
     device = torch.device("cuda", local_rank)
-    profile = _PROFILES[profile_name]
-    layer = _TestMoeLayer(profile, device)
-    _weights(layer, profile, rank)
-    plan = _make_plan(profile)
+    ws = _WORLD_SIZE
+    layer = _TestMoeLayer(profile, ws, device)
+    _weights(layer, profile, rank, ws)
+    plan = _make_plan(profile, ws)
     kernel_moe_process_weights(plan, layer)
     output_dir = os.environ.get("PETIT_OUTPUT_DIR")
     # Exercise empty source ranks, padding/tile boundaries and capacity, then
     # refresh both hidden states and destinations within the same captured graph.
     for case, counts in (
-        ("balanced", [16] * 8),
-        ("uneven", [0, 1, 15, 16, 31, 32, 63, 64]),
-        ("partial_scales", [256] * 8),
-        ("capacity", [1024] + [1] * 7),
+        ("balanced", [16] * ws),
+        ("uneven", [0, 1, 15, 16, 31, 32, 63, 64][:: 8 // ws]),
+        ("partial_scales", [256] * ws),
+        ("capacity", [1024] + [1] * (ws - 1)),
     ):
         count = counts[rank]
         x = torch.empty((count, profile.hidden), device=device, dtype=torch.bfloat16)
-        ids, weights = _routing(count, rank, profile, device)
+        ids, weights = _routing(count, rank, profile, ws, device)
 
         def refresh(step):
             values = torch.arange(x.numel(), device=device).reshape(x.shape)
-            input_scale = 4.0 if profile.activation == "situ" else 1.0 / 32
+            # Clamped profiles need inputs large enough to cross the clamp.
+            input_scale = (
+                4.0
+                if profile.activation == "situ" or profile.clamp is not None
+                else 1.0 / 32
+            )
             x.copy_(
                 (((values * 13 + rank * 7 + step * 17) % 127) - 63).float()
                 * input_scale
             )
-            new_ids, new_weights = _routing(count, rank + step, profile, device)
+            new_ids, new_weights = _routing(count, rank + step, profile, ws, device)
             if step:
                 # Concentrate routes on one destination without duplicate experts.
-                new_ids = (new_ids % (profile.experts // 8)) + (step % 8) * (
-                    profile.experts // 8
+                new_ids = (new_ids % (profile.experts // ws)) + (step % ws) * (
+                    profile.experts // ws
                 )
             ids.copy_(new_ids)
             weights.copy_(new_weights)

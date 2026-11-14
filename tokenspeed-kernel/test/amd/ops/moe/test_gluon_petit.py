@@ -26,8 +26,11 @@ import torch
 from tokenspeed_kernel.ops.moe import moe_plan
 from tokenspeed_kernel.ops.moe.gluon import (
     _DSV4_PROFILE,
+    _DSV41_FLASH_DSPARK_PROFILE,
+    _DSV41_FLASH_PROFILE,
     _GPT_OSS_120B_PROFILE,
     _KIMI_K3_PROFILE,
+    _get_workspace,
     _GluonPetitState,
     _Profile,
     _validate_layer,
@@ -95,6 +98,37 @@ def test_petit_cannot_replace_explicit_deepep(mi350_platform) -> None:
         )
 
 
+@pytest.mark.parametrize("ep_size,selected", [(4, True), (8, True), (2, False)])
+def test_petit_plan_ep_sizes(ep_size, selected, mi350_platform) -> None:
+    profile = _DSV41_FLASH_PROFILE
+    with mock.patch(
+        "tokenspeed_kernel.selection.current_platform", return_value=mi350_platform
+    ):
+        try:
+            plan = moe_plan(
+                "mxfp4",
+                input_dtype=torch.bfloat16,
+                activation="swiglu",
+                routing_mode="precomputed_topk",
+                a2a_backend="gluon_petit",
+                ep_size=ep_size,
+                ispp=profile.logical_intermediate,
+                hidden=profile.model_dim,
+                swiglu_form="standard",
+                activation_clamped=True,
+                expert_id_repeats=False,
+                internal_activation_dtype="mxfp4",
+                with_bias=False,
+                fast_math=True,
+                combine_order="rank",
+                features=frozenset(),
+                solution="gluon",
+            )
+        except NoKernelFoundError:
+            plan = None
+    assert (plan is not None) == selected
+
+
 def _gpt_oss_layer() -> SimpleNamespace:
     return SimpleNamespace(
         num_experts=128,
@@ -139,6 +173,50 @@ def test_validate_layer_preserves_dsv4_activation_contract() -> None:
     assert _validate_layer(_dsv4_layer(None)) == _DSV4_PROFILE
     with pytest.raises(ValueError, match="does not support an activation clamp"):
         _validate_layer(_dsv4_layer(10.0))
+
+
+@pytest.mark.parametrize(
+    "profile", [_DSV41_FLASH_PROFILE, _DSV41_FLASH_DSPARK_PROFILE], ids=lambda p: p.name
+)
+@pytest.mark.parametrize("ep_size", [4, 8])
+def test_validate_layer_accepts_dsv41_at_ep4_and_ep8(profile, ep_size) -> None:
+    layer = SimpleNamespace(
+        num_experts=profile.num_experts,
+        top_k=profile.top_k,
+        hidden_size=profile.model_dim,
+        intermediate_size=profile.logical_intermediate,
+        ep_size=ep_size,
+        tp_size=1,
+        num_local_experts=profile.num_experts // ep_size,
+        activation="swiglu",
+        swiglu_beta=None,
+        swiglu_arg=SimpleNamespace(alpha=None, limit=10.0),
+        w13_input_layout="concatenated",
+        w13_weight_bias=None,
+        w2_weight_bias=None,
+    )
+    assert _validate_layer(layer) == profile
+
+
+@pytest.mark.parametrize(
+    "profile",
+    [_GPT_OSS_120B_PROFILE, _DSV4_PROFILE, _KIMI_K3_PROFILE],
+    ids=lambda p: p.name,
+)
+def test_workspace_rejects_ep4_for_geometries_petit_registers_at_ep8_only(
+    profile,
+) -> None:
+    # Petit's own MegaMoeConfig decides; only the process group is faked.
+    with (
+        mock.patch(
+            "tokenspeed_kernel.ops.moe.gluon.dist.is_initialized", return_value=True
+        ),
+        mock.patch(
+            "tokenspeed_kernel.ops.moe.gluon.dist.get_world_size", return_value=4
+        ),
+        pytest.raises(ValueError, match="unsupported registered MegaMoE configuration"),
+    ):
+        _get_workspace(torch.device("cuda", 0), profile)
 
 
 @pytest.mark.parametrize(

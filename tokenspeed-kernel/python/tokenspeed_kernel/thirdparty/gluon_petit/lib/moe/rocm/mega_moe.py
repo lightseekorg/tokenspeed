@@ -118,16 +118,18 @@ def _MegaMoESolutions():
         3072,
         (P.kCta56, P.kCta192),
     )
-    for experts, topk in ((384, 6), (128, 3)):
-        register(
-            kMegaMoETwoStageMxFp4ClampedSiluSolutionId,
-            8,
-            experts,
-            topk,
-            5120,
-            2560,
-            (P.kCta56, P.kCta64, P.kCta128, P.kCta192),
-        )
+    # The config selector does not key tiles on rank count: EP4 reuses EP8 tiles.
+    for ranks in (4, 8):
+        for experts, topk in ((384, 6), (128, 3)):
+            register(
+                kMegaMoETwoStageMxFp4ClampedSiluSolutionId,
+                ranks,
+                experts,
+                topk,
+                5120,
+                2560,
+                (P.kCta56, P.kCta64, P.kCta128, P.kCta192),
+            )
     return dict(entries)
 
 

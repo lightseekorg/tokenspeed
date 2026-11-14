@@ -307,7 +307,7 @@ class MegaMoeConfig:
             and activation_function is MegaMoeActivationFunction.kimi_situ
         )
         deepseek_v41_config = (
-            self.world_size == 8
+            self.world_size in (4, 8)
             and (self.num_experts, self.topk) in ((384, 6), (128, 3))
             and self.model_dim == 5120
             and self.inter_dim == 2560
