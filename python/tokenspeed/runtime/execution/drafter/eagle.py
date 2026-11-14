@@ -903,8 +903,8 @@ class Eagle(HiddenStateDrafter):
         passes it (the narrowed rows attend in DECODE mode under step 0's
         EXTEND context; a backend that substitutes the ambient context's mode
         would not). It bakes what the decode steps bake, at any step count,
-        and runs on one rank: the tensor- and expert-parallel collectives of
-        the narrowed step are not validated.
+        and shares their one replay decision across the ranks that run the
+        round's collectives; a query shard or sharded KV never replays it.
         """
         return (
             bool(
@@ -919,7 +919,9 @@ class Eagle(HiddenStateDrafter):
             and not self.draft_reads_token_history
             and not self._model_shares_mtp_topk()
             and self.dp_size == 1
-            and self.world_size == 1
+            and self.draft_model_runner.mapping.pp_size == 1
+            and not self.draft_model_runner.mapping.attn.has_qcp
+            and not self.draft_model_runner.mapping.attn.has_kvp
         )
 
     @override

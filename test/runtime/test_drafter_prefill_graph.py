@@ -125,19 +125,26 @@ def test_the_decode_steps_stop_at_sixteen_requests() -> None:
     assert plan[DECODE_STEPS_SERIES] == [(bs, bs) for bs in range(16, 0, -1)]
 
 
-@pytest.mark.parametrize("setup", ["tensor_parallel", "undeclared_draft"])
+@pytest.mark.parametrize("setup", ["undeclared_draft", "query_shard"])
 def test_the_decode_steps_record_without_step_0(setup) -> None:
     model = ToyDraftModel("cpu")
     if setup == "undeclared_draft":
         # A draft that does not declare its narrowed step breakable (an MLA
         # draft attends inside one unbroken call).
         model.supports_breakable_draft_extend = False
-    drafter, _ = make_eagle(
-        model=model, world_size=2 if setup == "tensor_parallel" else 1
-    )
+    drafter, _ = make_eagle(model=model, qcp_size=2 if setup == "query_shard" else 1)
 
     assert drafter.extend_graph_plan([16, 32], lambda _bucket: [1]) == {
         DECODE_STEPS_SERIES: [(4, 4), (3, 3), (2, 2), (1, 1)]
+    }
+
+
+def test_tensor_parallel_ranks_record_step_0_and_the_decode_steps() -> None:
+    drafter, _ = make_eagle(world_size=2)
+
+    assert drafter.extend_graph_plan([16, 32], lambda _bucket: [1]) == {
+        FIRST_STEP_SERIES: [(32, 1), (16, 1)],
+        DECODE_STEPS_SERIES: [(4, 4), (3, 3), (2, 2), (1, 1)],
     }
 
 
@@ -518,20 +525,25 @@ def _args(**overrides) -> ServerArgs:
     return ServerArgs(**kwargs)
 
 
-def test_the_switch_is_off_by_default_and_parses() -> None:
-    assert ServerArgs(model="x").enable_drafter_prefill_graph is False
+def test_the_switch_defaults_to_wherever_supported_and_parses() -> None:
+    assert ServerArgs(model="x").enable_drafter_prefill_graph is None
     parser = argparse.ArgumentParser()
     ServerArgs.add_cli_args(parser)
-    assert parser.parse_args(["--model", "x"]).enable_drafter_prefill_graph is False
-    assert parser.parse_args(
-        ["--model", "x", "--enable-drafter-prefill-graph"]
-    ).enable_drafter_prefill_graph
+    for argv, value in (
+        ([], None),
+        (["--enable-drafter-prefill-graph"], True),
+        (["--no-enable-drafter-prefill-graph"], False),
+    ):
+        parsed = parser.parse_args(["--model", "x", *argv])
+        assert parsed.enable_drafter_prefill_graph is value
 
 
 @pytest.mark.parametrize("algorithm", ["MTP", "EAGLE3"])
-def test_a_single_rank_chain_drafter_resolves(algorithm) -> None:
+@pytest.mark.parametrize("ranks", [{}, {"attn_tp_size": 2}])
+def test_a_chain_drafter_resolves_on_one_rank_or_under_tp(algorithm, ranks) -> None:
     extra = {} if algorithm == "MTP" else {"speculative_draft_model_path": "draft"}
-    assert _args(speculative_algorithm=algorithm, **extra).enable_drafter_prefill_graph
+    args = _args(speculative_algorithm=algorithm, **ranks, **extra)
+    assert args.enable_drafter_prefill_graph
 
 
 @pytest.mark.parametrize(
@@ -554,7 +566,23 @@ def test_a_single_rank_chain_drafter_resolves(algorithm) -> None:
             {"enable_speculative_sampling": True, "sampling_backend": "flashinfer"},
             "speculative-sampling",
         ),
-        ({"attn_tp_size": 2}, "runs on one rank"),
+        ({"world_size": 2, "data_parallel_size": 2}, "tensor and expert"),
+        (
+            {
+                "world_size": 2,
+                "pipeline_parallel_size": 2,
+                "disaggregation_mode": "prefill",
+            },
+            "tensor and expert",
+        ),
+        (
+            {
+                "attn_tp_size": 2,
+                "query_context_parallel_size": 2,
+                "disaggregation_mode": "prefill",
+            },
+            "tensor and expert",
+        ),
         ({"disable_prefill_graph": True}, "prefill CUDA graphs"),
         ({"enforce_eager": True}, "prefill CUDA graphs"),
     ],
@@ -562,6 +590,25 @@ def test_a_single_rank_chain_drafter_resolves(algorithm) -> None:
 def test_launches_the_graphs_cannot_serve_are_refused(overrides, message) -> None:
     with pytest.raises(ValueError, match=message):
         _args(**overrides)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"world_size": 2, "data_parallel_size": 2},
+        {
+            "speculative_eagle_topk": 2,
+            "speculative_num_steps": 3,
+            "speculative_num_draft_tokens": 6,
+        },
+        {"enforce_eager": True},
+    ],
+)
+def test_the_default_leaves_step_0_eager_where_the_switch_would_refuse(
+    overrides,
+) -> None:
+    for value in (None, False):
+        _args(enable_drafter_prefill_graph=value, **overrides)
 
 
 def _executor(*, enabled, prefill_graph_disabled, drafter):
@@ -602,10 +649,24 @@ def test_the_executor_refuses_a_boot_that_would_record_no_drafter_graph() -> Non
         _executor(
             enabled=True, prefill_graph_disabled=False, drafter=None
         )._validate_drafter_extend_graphs()
-    # Without the switch nothing is required.
-    for drafter in (supported, undeclared, None):
-        executor = _executor(
-            enabled=False, prefill_graph_disabled=True, drafter=drafter
-        )
-        executor._validate_drafter_extend_graphs()
-        assert not executor.captures_drafter_extend_graphs
+    # By default or switched off nothing is required.
+    for enabled in (None, False):
+        for drafter in (supported, undeclared, None):
+            executor = _executor(
+                enabled=enabled, prefill_graph_disabled=True, drafter=drafter
+            )
+            executor._validate_drafter_extend_graphs()
+            assert not executor.captures_drafter_extend_graphs
+
+
+@pytest.mark.parametrize(
+    "enabled, step_0", [(None, True), (True, True), (False, False)]
+)
+def test_the_executor_records_step_0_unless_switched_off(enabled, step_0) -> None:
+    drafter, _ = make_eagle()
+    executor = _executor(enabled=enabled, prefill_graph_disabled=False, drafter=drafter)
+
+    plan = executor._drafter_extend_plan()
+
+    assert (FIRST_STEP_SERIES in plan) is step_0
+    assert plan[DECODE_STEPS_SERIES] == [(4, 4), (3, 3), (2, 2), (1, 1)]

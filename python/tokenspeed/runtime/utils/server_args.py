@@ -824,8 +824,8 @@ class ServerArgs:
     prefill_graph_capture_sizes: list[int] | None = None
     # Request capacities for inline attention; unset keeps the minimum per bucket.
     prefill_graph_capture_batch_sizes: list[int] | None = None
-    # Replay the speculative drafter's extend-round work from CUDA graphs too.
-    enable_drafter_prefill_graph: bool = False
+    # Drafter step-0 graphs in prefill rounds: None wherever supported, True required.
+    enable_drafter_prefill_graph: bool | None = None
     cudagraph_capture_sizes: list[int] | None = None
     enable_nan_detection: bool = False
     enable_nvtx: bool = False
@@ -2124,12 +2124,12 @@ class ServerArgs:
             )
 
     def validate_drafter_prefill_graph(self) -> None:
-        """Refuse ``--enable-drafter-prefill-graph`` launches it cannot serve.
+        """Refuse an explicit ``--enable-drafter-prefill-graph`` it cannot serve.
 
         The drafter's graphs record an Eagle chain's extend round beside the
-        target's prefill CUDA graphs, with the argmax proposal, on one rank
-        (attention DP decides replays per rank; the tensor-, expert- and
-        pipeline-parallel collectives inside the round are not validated).
+        target's prefill CUDA graphs, with the argmax proposal, under tensor
+        and expert parallelism (attention DP decides replays per rank; the
+        pipeline's and context parallelism's rounds are not validated).
         Whether the loaded draft model supports it is known only at executor
         build, which refuses it there.
         """
@@ -2151,11 +2151,16 @@ class ServerArgs:
                 "--enable-drafter-prefill-graph records the argmax proposal and "
                 "does not support --enable-speculative-sampling"
             )
-        if self.mapping.world_size != 1:
+        if (
+            self.mapping.has_attn_dp
+            or self.mapping.has_pp
+            or self.mapping.attn.has_qcp
+            or self.mapping.attn.has_kvp
+        ):
             raise ValueError(
-                "--enable-drafter-prefill-graph runs on one rank (no tensor, "
-                "expert, pipeline, attention-data or context parallelism); got "
-                f"{self.mapping.world_size} ranks"
+                "--enable-drafter-prefill-graph runs under tensor and expert "
+                "parallelism only (no pipeline, attention-data or context "
+                "parallelism)"
             )
         if self.disable_prefill_graph or self.enforce_eager:
             raise ValueError(
@@ -4514,7 +4519,7 @@ class ServerArgs:
         )
         parser.add_argument(
             "--enable-drafter-prefill-graph",
-            action="store_true",
+            action=argparse.BooleanOptionalAction,
             default=ServerArgs.enable_drafter_prefill_graph,
             help="Also replay the speculative drafter's extend step inside a "
             "prefill forward from CUDA graphs, per prefill token bucket at each "
@@ -4523,13 +4528,16 @@ class ServerArgs:
             "attention at eager breaks; the draft's decode steps that follow the "
             "extend step replay from graphs even without this switch. Only "
             "pure-extend forwards at a captured request count replay; the others "
-            "run the step eagerly. The switch needs the prefill graph on one rank "
-            "(no TP, EP, PP or attention DP) and a chain "
-            "EAGLE-style drafter (no --speculative-eagle-topk > 1, no "
-            "--enable-speculative-sampling) whose draft model declares support "
-            "(Qwen4-Exp MTP without index_share_for_mtp_iteration); other launches "
-            "are refused. Its static buffers (the target's hidden rows at the "
-            "largest bucket) come out of the --gpu-memory-utilization headroom.",
+            "run the step eagerly. On by default wherever supported: under "
+            "tensor and expert parallelism (no PP, attention DP or context "
+            "parallelism), with a chain EAGLE-style drafter (no "
+            "--speculative-eagle-topk > 1, no --enable-speculative-sampling) "
+            "whose draft model declares support (Qwen4-Exp MTP without "
+            "index_share_for_mtp_iteration, or Qwen3.5 MTP); elsewhere step 0 "
+            "runs eagerly. Passing the switch requires it and refuses other "
+            "launches; --no-enable-drafter-prefill-graph turns it off. Its static "
+            "buffers (the target's hidden rows at the largest bucket) come out of "
+            "the --gpu-memory-utilization headroom.",
         )
         parser.add_argument(
             "--enable-nan-detection",

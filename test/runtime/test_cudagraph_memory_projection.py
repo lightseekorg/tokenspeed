@@ -628,7 +628,11 @@ def test_the_drafter_extend_graphs_are_declared_captured_and_labelled() -> None:
     capture.prepare_batch(48, 2)
     assert dummies == [(48, 2, "draft backend")]
 
-    # Without the switch only the decode steps are declared and captured.
+    # By default step 0 is declared wherever the drafter supports it.
+    executor.config.enable_drafter_prefill_graph = None
+    assert set(_ladders(executor, 5)) == set(ladders)
+
+    # Switched off only the decode steps are declared and captured.
     seen.clear()
     executor.config.enable_drafter_prefill_graph = False
     assert set(_ladders(executor, 5)) == {"prefill", "prefill:drafter-decode"}

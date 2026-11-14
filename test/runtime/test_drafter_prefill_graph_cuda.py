@@ -391,7 +391,11 @@ def _engine(*, drafter_graph: bool):
         "--gpu-memory-utilization",
         "0.8",
         "--disable-kvstore",
-        *(["--enable-drafter-prefill-graph"] if drafter_graph else []),
+        (
+            "--enable-drafter-prefill-graph"
+            if drafter_graph
+            else "--no-enable-drafter-prefill-graph"
+        ),
         *_EXTRA_ARGS,
     ]
     return WireDriver(

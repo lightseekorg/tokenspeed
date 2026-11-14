@@ -136,6 +136,9 @@ class Qwen3_5DraftForCausalLM(Qwen3_5ForCausalLM):
 
 
 class Qwen3_5ForConditionalGenerationNextN(nn.Module):
+    # Its narrowed step attends at breaks through the router, which honours the mode.
+    supports_breakable_draft_extend = True
+
     def __init__(
         self,
         config: PretrainedConfig,

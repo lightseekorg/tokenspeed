@@ -430,10 +430,10 @@ class ModelExecutorConfig:
     decode_only_attention: bool
     # Explicit None selects the minimum request count for each token bucket.
     prefill_graph_capture_batch_sizes: list[int] | None
-    # The drafter's extend-round work replays from graphs beside the target's
-    # prefill graph (--enable-drafter-prefill-graph): it selects whether that
-    # work runs eager or from graphs, so it is explicit.
-    enable_drafter_prefill_graph: bool
+    # The drafter's step 0 replays from graphs beside the target's prefill graph
+    # (--enable-drafter-prefill-graph): None wherever the drafter supports it,
+    # True required, False eager.
+    enable_drafter_prefill_graph: bool | None
     # Prompt-logprob gather: how many prompt rows go through the LM head at
     # once (``--input-logprob-chunk-tokens``). Bounds the transient
     # ``[rows, vocab]`` logits; log-softmax is row-local so the value never
@@ -1131,7 +1131,7 @@ class ModelExecutor:
         Only with the target's prefill graph on and a drafter that can capture
         them in this configuration. The decode steps' graphs are recorded at
         each request count from 1 to ``EXTEND_DECODE_MAX_REQUESTS`` (at most
-        the batch); the step-0 graphs (``--enable-drafter-prefill-graph``)
+        the batch); the step-0 graphs (unless ``--no-enable-drafter-prefill-graph``)
         share the target's token buckets and are captured at the bucket's
         exact request counts
         (``--prefill-graph-capture-batch-sizes``, unset: the fewest requests
@@ -1144,7 +1144,7 @@ class ModelExecutor:
             self.prefill_graph.capture_buckets,
             partial(resolve_prefill_capture_batch_sizes, self.config),
         )
-        if not self.config.enable_drafter_prefill_graph:
+        if self.config.enable_drafter_prefill_graph is False:
             plan.pop(EXTEND_STEP0_SERIES, None)
         return {series: entries for series, entries in plan.items() if entries}
 
@@ -1154,8 +1154,8 @@ class ModelExecutor:
         return bool(self._drafter_extend_plan())
 
     def _validate_drafter_extend_graphs(self) -> None:
-        """Refuse ``--enable-drafter-prefill-graph`` when this boot would
-        record no step-0 graph.
+        """Refuse an explicit ``--enable-drafter-prefill-graph`` when this boot
+        would record no step-0 graph.
 
         ``ServerArgs.validate_drafter_prefill_graph`` refuses the launches the
         arguments decide; whether the prefill graph is on and whether the
@@ -1165,7 +1165,7 @@ class ModelExecutor:
             ValueError: The switch is on and the plan has no step-0 series.
         """
         if (
-            not self.config.enable_drafter_prefill_graph
+            self.config.enable_drafter_prefill_graph is not True
             or EXTEND_STEP0_SERIES in self._drafter_extend_plan()
         ):
             return
@@ -1178,7 +1178,7 @@ class ModelExecutor:
                 f"the {type(self.drafter).__name__} drafter records none for this "
                 "draft model; it needs a chain EAGLE-style drafter over a draft "
                 "model that declares supports_breakable_draft_extend (Qwen4-Exp "
-                "MTP), without draft token history or a shared MTP top-k "
+                "or Qwen3.5 MTP), without draft token history or a shared MTP top-k "
                 "(index_share_for_mtp_iteration)"
             )
         raise ValueError(
