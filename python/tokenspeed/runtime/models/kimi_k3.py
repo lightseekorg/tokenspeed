@@ -1005,6 +1005,19 @@ class _AttnResMixSpec:
     gather_next_projection: bool
 
 
+@dataclass
+class _AttentionPremix:
+    """A layer's fast-path AttnRes attention-input mix, ``attnres_combine``'s
+    operands, for the previous layer's MoE tail to apply as it gathers the
+    residual. ``out`` receives the mixed input if the tail did."""
+
+    weight: torch.Tensor
+    norm_weight: torch.Tensor
+    eps: float
+    scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    out: torch.Tensor | None = None
+
+
 # Below this, the replicated AttnRes mix costs too little to shard by rows.
 _K3_SHARDED_RESIDUAL_MIN_TOKENS = 1024
 
@@ -2895,6 +2908,7 @@ class KimiLinearMoE(nn.Module):
         prefix_is_sharded: bool,
         next_mix: _AttnResMixSpec | None,
         attention_gather,
+        attention_mix: _AttentionPremix | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Run native EP, or join TP partials before norm and replicated up-projection.
 
@@ -3122,14 +3136,33 @@ class KimiLinearMoE(nn.Module):
             )
         ):
             # Decode: each rank projects its weight column block, then gathers.
-            return self.iris_state.moe_gather_tail(
-                routed,
-                shared,
-                prefix_sum,
-                up_proj.weight,
-                norm_weight=norm.weight if norm is not None else None,
-                eps=norm.variance_epsilon if norm is not None else None,
+            tail_args = (routed, shared, prefix_sum, up_proj.weight)
+            norm_weight = norm.weight if norm is not None else None
+            eps = norm.variance_epsilon if norm is not None else None
+            mix = None
+            if attention_mix is not None:
+                from tokenspeed_kernel.ops.communication._iris.kimi_k3 import (
+                    K3AttentionMix,
+                )
+
+                mix = K3AttentionMix(
+                    attention_mix.weight,
+                    attention_mix.norm_weight,
+                    attention_mix.eps,
+                    *attention_mix.scratch,
+                )
+                if not self.iris_state.can_moe_gather_tail(
+                    *tail_args, norm_weight, mix
+                ):
+                    mix = None
+            if mix is None:
+                return self.iris_state.moe_gather_tail(
+                    *tail_args, norm_weight=norm_weight, eps=eps
+                )
+            output, attention_mix.out = self.iris_state.moe_gather_tail(
+                *tail_args, norm_weight=norm_weight, eps=eps, attention_mix=mix
             )
+            return output
         if self.routed_expert_norm is not None:
             routed = self.routed_expert_norm(routed)
         return self.routed_expert_up_proj.forward_add3(routed, prefix_sum, shared).view(
@@ -3515,6 +3548,7 @@ class KimiLinearMoE(nn.Module):
         prefix_is_sharded: bool,
         next_mix: _AttnResMixSpec | None = None,
         attention_gather=None,
+        attention_mix: _AttentionPremix | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Routed + shared experts, accumulated onto ``prefix_sum``.
 
@@ -3528,7 +3562,9 @@ class KimiLinearMoE(nn.Module):
         residual, the replicated ``next_mix`` output and its projection by
         ``next_mix.next_weight`` (None without one). ``attention_gather`` is
         the attention mix's pending gather of ``hidden_states`` (this rank's
-        rows are final), joined before any other rows are read.
+        rows are final), joined before any other rows are read. The AMD
+        gathered tail may also apply ``attention_mix`` to the returned
+        residual, setting its ``out``.
         """
         if prefix_is_sharded and (
             self.mapping.attn.dp_size > 1
@@ -3558,6 +3594,7 @@ class KimiLinearMoE(nn.Module):
                 prefix_is_sharded=prefix_is_sharded,
                 next_mix=next_mix,
                 attention_gather=attention_gather,
+                attention_mix=attention_mix,
             )
         if attention_gather is not None:
             self.iris_state.join_gather(attention_gather)
@@ -3821,6 +3858,9 @@ class KimiLinearDecoderLayer(nn.Module):
         # mix; set by the backbone after all layers exist. The partial launches
         # from this (MoE) layer's aux branch, hidden under the routed experts.
         self._next_attn_mix = None
+        # Our attention input, mixed by the previous layer's MoE tail; the
+        # next forward consumes it.
+        self._premixed_input = None
         # Whether the next layer's mlp-side partial rides our sweep too.
         self._hoist_next_mlp = False
         self._mlp_slot = _attnres_mlp_slot(layer_id)
@@ -3880,23 +3920,49 @@ class KimiLinearDecoderLayer(nn.Module):
         )
         return prefix_sum.clone() if mixed is prefix_sum else mixed
 
-    def _mix_into_attention(
+    def _fast_attention_mix(self, hidden_states: torch.Tensor) -> bool:
+        n_tok = hidden_states.shape[0]
+        return (
+            self._attn_split
+            and 0 < n_tok <= ATTNRES_FAST_PATH_MAX_TOKENS
+            and hidden_states.is_cuda
+            and self.prev_valid_blocks > 0
+        )
+
+    def _attention_premix(
         self, hidden_states: torch.Tensor, block_residual: torch.Tensor
+    ) -> _AttentionPremix | None:
+        """The fast-path mix of our input ``hidden_states`` for the previous
+        layer's MoE tail to apply, or None if we would not take that path."""
+        if not self._fast_attention_mix(
+            hidden_states
+        ) or self._fused_attnres_graph_available(hidden_states, block_residual):
+            return None
+        return _AttentionPremix(
+            self._attn_wp,
+            self.input_layernorm.weight,
+            self.self_attention_res_norm.variance_epsilon,
+            _sliced_scratch(hidden_states, 1, hidden_states.shape[0]),
+        )
+
+    def _mix_into_attention(
+        self,
+        hidden_states: torch.Tensor,
+        block_residual: torch.Tensor,
+        premixed: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """AttnRes entry: mix the residual candidates into the attention input.
 
         Returns ``(h, prefix_sum)`` -- with ``prefix_sum`` None at block-write
-        layers (the snapshot consumed it).
+        layers (the snapshot consumed it). ``premixed`` is the fast-path mix
+        the previous layer's MoE tail already applied.
         """
         prefix_sum = hidden_states
         n_tok = prefix_sum.shape[0]
-        fast_mix = (
-            self._attn_split
-            and 0 < n_tok <= ATTNRES_FAST_PATH_MAX_TOKENS
-            and prefix_sum.is_cuda
-            and self.prev_valid_blocks > 0
-        )
-        if fast_mix:
+        fast_mix = self._fast_attention_mix(prefix_sum)
+        if fast_mix and premixed is not None:
+            h = premixed
+        elif fast_mix:
             # The block partial was precomputed on the previous layer's aux
             # stream; only the prefix candidate is folded here.
             h = attnres_combine(
@@ -4189,6 +4255,7 @@ class KimiLinearDecoderLayer(nn.Module):
         block_residual: torch.Tensor,
         residual_stream: _ShardedResidualStream | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        premixed, self._premixed_input = self._premixed_input, None
         stream = residual_stream
         rows = stream.activation if stream is not None and stream.sharded else None
         if self._fused_attnres_graph_available(
@@ -4205,7 +4272,9 @@ class KimiLinearDecoderLayer(nn.Module):
             # This path mixes and returns every row.
             hidden_states = stream.unshard(hidden_states, block_residual)
 
-        h, prefix_sum = self._mix_into_attention(hidden_states, block_residual)
+        h, prefix_sum = self._mix_into_attention(
+            hidden_states, block_residual, premixed
+        )
         # The mlp-side mixing's block partial hides under attention on the aux
         # stream (blocks are final for this layer once the snapshot above ran);
         # the combine after the attention AR only touches the prefix candidate.
@@ -4355,6 +4424,11 @@ class KimiLinearDecoderLayer(nn.Module):
             num_global_tokens, max_num_tokens_per_gpu = (
                 self.comm_manager.get_num_tokens(ctx)
             )
+            premix = (
+                next_mix[0]._attention_premix(prefix_sum, block_residual)
+                if next_mix is not None and stream is None
+                else None
+            )
             prefix_sum = self.block_sparse_moe(
                 h,
                 prefix_sum,
@@ -4362,7 +4436,10 @@ class KimiLinearDecoderLayer(nn.Module):
                 max_num_tokens_per_gpu=max_num_tokens_per_gpu,
                 ctx=ctx,
                 prefix_is_sharded=False,
+                **({} if premix is None else {"attention_mix": premix}),
             )
+            if premix is not None:
+                next_mix[0]._premixed_input = premix.out
         else:
             prefix_sum = prefix_sum + self.mlp(h)
         return prefix_sum, block_residual
