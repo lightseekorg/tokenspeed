@@ -5,8 +5,6 @@ Enable memory saving with an explicit `--weight-memory-policy cpu_backup` or
 routes. Rebuild the Python runtime, native host and kernel package together;
 the memory-saving startup handshake rejects native hosts without the
 replica-wide update-commit protocol (version 2: load admission and commit).
-On Ascend, a matching host and runtime also coordinate release and resume
-(version 3).
 
 ## Policy and model contract
 
@@ -140,43 +138,44 @@ weights have not been committed yet. A weight update while KV is resident is
 also rejected under discard. Keep the orchestrator paused on any failed
 response, including a failure in a different serving replica.
 
-With protocol 3 on Ascend, send each memory operation to every engine in the
-coordinated domain. A release or resume succeeds only after all of those
-engines finish. The domain is the attention-TP/PP replica for independent
-engines and the existing coordinated attention-DP group for engines that
-share a forward, including EP across replicas. Calls may reach engines in
-different rounds. The 30-second wait is a queue-head threshold while participants
-are missing and no earlier release is draining, not a separate minimum wait for
-every queued call. When any head expires, the gate refuses the entire batch
-already observed in each rank's local queue. A newer queued call can therefore
-be refused before its own 30 seconds have elapsed. A peer's delivery that arrives
-after that gate is outside the refused batch and may answer later.
-`continue_generation` cancels
-pending memory operations before device work starts, including calls observed
-in the same gate after continue arrived locally. This domain-wide cancellation
-avoids different queue cutoffs at independent ingresses. An engine whose memory
-is already released remains asleep after cancellation.
+## Memory transition protocol
 
-Issue memory operations in order and wait for the domain's replies. For
-explicit matching, send the same optional `transition_id` string with each
-engine's named control call. Direct wire callers use the request's `rid`
-field. Use a fresh ID for each operation. Existing ordered fanout can omit
-the ID. A late request from an earlier attempt can cause a mismatch and a
-refusal, so collect every outstanding memory reply before retrying, including
-late replies from a timed-out batch. A continue reply alone does not fence that
-fanout. Refusals before device work can be retried after collecting those
-replies. A device-apply failure, or an L1 clear failure after the domain agreed
-it was ready, is fatal to the coordinated domain, including otherwise healthy
-ranks. Recover the whole domain before training or serving continues;
-cross-host process supervision remains the deployment's responsibility.
+The update-commit version 2 above is unchanged. Checked host/runtime pairs
+select release/resume protocol 3 for Ascend generation roles with
+`--enable-memory-saver`, excluding encode. CUDA, ROCm and other paths retain
+protocol 2 and its local ACK, graph and NCCL behavior. The existing Gloo address rendezvous rejects
+mixed protocols before the Rust mesh or READY: v2 keeps its plain address,
+and legacy v2 peers reject a tagged v3 address. Prefill and Decode worlds
+agree separately; earlier model/graph initialization flags must also agree.
 
-CUDA uses protocol 2, with its existing graph memory and NCCL behavior.
-Protocol 3 leaves NCCL buffers resident and refuses an explicit `nccl` tag
-before releasing any region. Under protocol 2, the optional `nccl` tag
-requires every participant of the underlying communicator. A world
-communicator can span otherwise independent DP engines. To manage those
-engines separately, send explicit tags that leave NCCL resident. An omitted
-tag list includes `nccl` when the runtime advertises it.
+For v3, fan out the same ordered operation to every participating ingress.
+The domain is the attention-TP/PP replica for independent engines, or the
+existing attention-DP group for shared forwards, including cross-replica EP.
+Direction and canonical tags must match. Send the same optional single-string
+`transition_id` to each engine (`rid` on the direct wire); use fresh IDs per
+operation. Ordered fanout may omit the ID. Success waits for every member's
+device completion; a pre-device refusal leaves mappings unchanged.
+
+`continue_generation` cancels the whole observed pending batch before device
+work, including calls observed in the same gate after continue arrived
+locally. Already released memory stays asleep. The 30-second queue-head
+threshold applies while participants are missing and no earlier release is
+draining: expiry refuses the whole observed batch, including younger calls
+that waited less than 30 seconds. A peer delivery after that gate can reply
+later. Before retrying, collect continue and every outstanding memory reply,
+including late timeout replies; continue success alone does not fence old
+fanout. Pre-device refusals are retryable after that collection. A device
+apply or post-readiness L1-clear failure is fatal to the whole domain,
+including healthy ranks: recover all members before training or serving;
+cross-host supervision remains the deployment's responsibility.
+
+Before a v2 NCCL release, identify every underlying communicator participant
+and fan out matching release/resume operations to all of them. A world
+communicator can span independent DP engines. Use explicit non-NCCL tags to
+manage those engines separately; omitted tags include `nccl` when advertised.
+V3 keeps NCCL resident and rejects explicit `nccl` before releasing any region.
+See the [event-loop invariants](../design/event-loop.md#subsystems-in-detail)
+for matching, drain and preflight ordering.
 
 ## Validation before enabling in a training job
 
