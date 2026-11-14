@@ -198,28 +198,19 @@ def test_clip_preserves_strides_and_materialization_before_token_scale(device_na
 
 
 @pytest.mark.parametrize("device_name", ["cpu", "cuda"])
-@pytest.mark.parametrize("pre_affine", [False, True])
-def test_rmsnorm_fp32_to_bf16_and_weightless_heads(device_name, pre_affine):
+def test_rmsnorm_fp32_to_bf16_and_weightless_heads(device_name):
     device = _device(device_name)
     x = torch.arange(1, 25, dtype=torch.float32, device=device).reshape(2, 3, 4) / 7
     weight = torch.tensor([0.5, 1.0, 1.5, 2.0], dtype=torch.bfloat16, device=device)
-    pre = (
-        torch.tensor([2.0, 0.5, 0.25, 1.0], dtype=torch.bfloat16, device=device)
-        if pre_affine
-        else None
-    )
-    value = x if pre is None else x * pre.float()
     expected = (
-        value
-        * torch.rsqrt(value.square().mean(dim=-1, keepdim=True) + 1e-6)
-        * weight.float()
+        x * torch.rsqrt(x.square().mean(dim=-1, keepdim=True) + 1e-6) * weight.float()
     )
     actual = rmsnorm_precision(
-        x, weight, 1e-6, pre, torch.bfloat16, mean_by_reciprocal=False
+        x, weight, 1e-6, torch.bfloat16, mean_by_reciprocal=False
     )
     torch.testing.assert_close(actual, expected.to(torch.bfloat16), rtol=0, atol=0)
     value_norm = rmsnorm_precision(
-        x, None, 1e-6, None, torch.bfloat16, mean_by_reciprocal=False
+        x, None, 1e-6, torch.bfloat16, mean_by_reciprocal=False
     )
     torch.testing.assert_close(
         value_norm,
@@ -246,7 +237,7 @@ def test_rmsnorm_mean_rounds_by_the_requested_rule():
     outputs = []
     for by_reciprocal, mean in ((False, divided), (True, multiplied)):
         actual = rmsnorm_precision(
-            x, None, 1e-6, None, torch.float32, mean_by_reciprocal=by_reciprocal
+            x, None, 1e-6, torch.float32, mean_by_reciprocal=by_reciprocal
         )
         expected = x * torch.rsqrt(mean[picked][:, None] + 1e-6)
         assert torch.equal(actual, expected)
@@ -270,13 +261,12 @@ def test_rmsnorm_reads_strided_head_rows_in_place():
         rows = torch.randn(tokens, 512, device="cuda").bfloat16()
         heads = rows[:, :256].unflatten(-1, (2, 128))
         actual = rmsnorm_precision(
-            heads, weight, 1e-6, None, torch.bfloat16, mean_by_reciprocal=False
+            heads, weight, 1e-6, torch.bfloat16, mean_by_reciprocal=False
         )
         expected = rmsnorm_precision(
             heads.contiguous(),
             weight,
             1e-6,
-            None,
             torch.bfloat16,
             mean_by_reciprocal=False,
         )
@@ -306,7 +296,7 @@ def test_empty_tokens(device_name):
     assert residual_sum((x, x)).shape == x.shape
     assert (
         rmsnorm_precision(
-            x.float(), None, 1e-6, None, torch.bfloat16, mean_by_reciprocal=False
+            x.float(), None, 1e-6, torch.bfloat16, mean_by_reciprocal=False
         ).shape
         == x.shape
     )
@@ -347,7 +337,7 @@ def test_invalid_contracts_fail_before_execution_cpu():
             **combine,
         )
     with pytest.raises(ValueError, match="epsilon"):
-        rmsnorm_precision(x, None, -1.0, None, torch.bfloat16, mean_by_reciprocal=False)
+        rmsnorm_precision(x, None, -1.0, torch.bfloat16, mean_by_reciprocal=False)
     with pytest.raises(ValueError, match="scale"):
         l2_clip(x.view(1, 1, 4), 1.0, 1e-6, None, torch.ones(2))
 
@@ -368,7 +358,7 @@ def test_changed_input_cuda_graph_replay():
             eps=1e-6,
         )[0]
         return rmsnorm_precision(
-            mixed, None, 1e-6, None, torch.bfloat16, mean_by_reciprocal=False
+            mixed, None, 1e-6, torch.bfloat16, mean_by_reciprocal=False
         )
 
     for _ in range(3):
@@ -395,7 +385,7 @@ def test_changed_input_cuda_graph_replay():
         eps=1e-6,
     )[0]
     expected = rmsnorm_precision(
-        expected_mixed, None, 1e-6, None, torch.bfloat16, mean_by_reciprocal=False
+        expected_mixed, None, 1e-6, torch.bfloat16, mean_by_reciprocal=False
     )
     assert not torch.equal(actual, before)
     torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
@@ -485,9 +475,7 @@ def test_split_mix_matches_the_equation_with_fused_norm(device_name, candidate):
     torch.testing.assert_close(mixed, expected, rtol=2e-5, atol=3e-6)
     expected_normed = torch.stack(
         [
-            rmsnorm_precision(
-                row, gain, 1e-6, None, torch.bfloat16, mean_by_reciprocal=False
-            )
+            rmsnorm_precision(row, gain, 1e-6, torch.bfloat16, mean_by_reciprocal=False)
             for row, gain in zip(mixed, gains)
         ]
     )
@@ -671,10 +659,9 @@ def test_one_pass_mix_token_source_and_query_counts_do_not_recompile():
 
 @pytest.mark.parametrize("device_name", ["cpu", "cuda"])
 @pytest.mark.parametrize("width", [2048, 4608])
-@pytest.mark.parametrize("pre", [False, True])
 @pytest.mark.parametrize("mean_by_reciprocal", [False, True])
 def test_add_rmsnorm_precision_is_the_sum_then_the_norm(
-    device_name, width, pre, mean_by_reciprocal
+    device_name, width, mean_by_reciprocal
 ):
     """One pass over the FP32 sum gives the separate statements' bits: the
     normalized rows and the sum stored once in BF16."""
@@ -685,18 +672,12 @@ def test_add_rmsnorm_precision_is_the_sum_then_the_norm(
         torch.randn((7, width), generator=generator, device=device) * 30
     ).bfloat16()
     weight = (torch.rand(width, generator=generator, device=device) + 0.5).bfloat16()
-    pre_weight = (
-        (torch.rand(width, generator=generator, device=device) + 0.5).bfloat16()
-        if pre
-        else None
-    )
     summed = x.float() + residual.float()
     normalized, stored = add_rmsnorm_precision(
         x,
         residual,
         weight,
         1e-6,
-        pre_weight,
         torch.bfloat16,
         torch.bfloat16,
         mean_by_reciprocal=mean_by_reciprocal,
@@ -705,7 +686,6 @@ def test_add_rmsnorm_precision_is_the_sum_then_the_norm(
         summed,
         weight,
         1e-6,
-        pre_weight,
         torch.bfloat16,
         mean_by_reciprocal=mean_by_reciprocal,
     )
