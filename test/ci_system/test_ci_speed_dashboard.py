@@ -250,14 +250,25 @@ def test_prune_keeps_one_window_of_cache(cache: Path):
     assert [f.name for f in (cache / "jobs_latest").iterdir()] == ["10_a2.json"]
 
 
-def test_a_failing_job_fetch_still_lets_the_page_render(cache: Path, monkeypatch):
-    (cache / "jobs/20.json").unlink()
+def test_a_failing_job_fetch_stops_the_rest_and_the_page_still_renders(
+    cache: Path, monkeypatch
+):
+    # Twenty runs without cached jobs, more than the four workers.
+    day_file = cache / "runs/nvidia-b200-tests.yml/pr" / f"{NOW.date()}.json"
+    listed = json.loads(day_file.read_text())
+    listed["runs"] += [run(100 + i, 200, 0, "success") for i in range(20)]
+    write_json(day_file, listed)
     gh = GitHub("o/r", "token")
+    calls = []
 
     def fail(path):
+        calls.append(path)
         raise urllib.error.HTTPError(path, 502, "bad gateway", None, None)
 
     monkeypatch.setattr(gh, "get", fail)
     runs = load_runs(cache, NOW, 14)
     assert fetch_missing_jobs(gh, cache, runs, 10, 0) == 0
+    # Queued fetches after the first failure are skipped (up to the 4 workers
+    # already running may each try once).
+    assert len(calls) <= 4
     assert build(cache)["workflow_stats"]

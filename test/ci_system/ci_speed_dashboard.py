@@ -40,6 +40,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -420,23 +421,33 @@ def fetch_missing_jobs(
     todo = todo[:max_new]
     done = 0
 
+    # The first failed fetch stops the rest, so an API outage does not retry
+    # every queued run before the page renders from the cache.
+    stop = threading.Event()
+
     def work(item):
         _, run_id, attempt = item
-        if gh.remaining is not None and gh.remaining < reserve:
+        if stop.is_set() or (gh.remaining is not None and gh.remaining < reserve):
             return False
-        jobs = fetch_jobs(gh, run_id, attempt)
+        try:
+            jobs = fetch_jobs(gh, run_id, attempt)
+        except FETCH_ERRORS:
+            stop.set()
+            raise
         if jobs and all(j["status"] == "completed" for j in jobs):
             write_json(job_path(cache, run_id, attempt), jobs)
         return True
 
+    ex = concurrent.futures.ThreadPoolExecutor(4)
     try:
-        with concurrent.futures.ThreadPoolExecutor(4) as ex:
-            done = sum(ex.map(work, todo))
+        done = sum(ex.map(work, todo))
     except FETCH_ERRORS as e:
         print(
             f"job fetch stopped ({e!r}); rendering with the cached data",
             file=sys.stderr,
         )
+    finally:
+        ex.shutdown(wait=True, cancel_futures=True)
     return done
 
 
