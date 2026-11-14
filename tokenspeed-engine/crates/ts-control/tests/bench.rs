@@ -278,6 +278,14 @@ impl DataPlane for InstantDevice {
         unreachable!("no control operation in the benchmark")
     }
 
+    fn check_memory_transition(
+        &mut self,
+        _: &[String],
+        _: bool,
+    ) -> Result<(bool, String), DataPlaneError> {
+        unreachable!("no control operation in the benchmark")
+    }
+
     fn release_memory(&mut self, _: &[String]) -> Result<(), DataPlaneError> {
         unreachable!("no control operation in the benchmark")
     }
@@ -431,6 +439,7 @@ fn bench_rounds(name: &str, shape: RoundShape) {
         request_token_history_lookback: None,
         controls: ControlConfig {
             memory_saver: false,
+            replica_memory_transitions: false,
             memory_regions: Vec::new(),
             l3_weight_version: None,
             allow_reload_forward: false,

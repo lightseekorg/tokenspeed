@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""GPU memory a sleeping engine releases (``release_memory_occupation``)
+"""Device memory a sleeping engine releases (``release_memory_occupation``)
 and restores on wake, one :class:`MemoryRegion` per tag.
 
 The Rust control plane drains the engine and orders the regions (the KV
@@ -30,8 +30,10 @@ cache:
 - ``weights``: model parameters (CPU backup, or discard until a complete
   replica-committed update; frozen draft allocations retain CPU backup);
 - ``kv_cache``: the cache arena (discarded; zeroed on resume);
-- ``cuda_graph``: the decode CUDA graph memory pool (discarded; every replay
-  rewrites it before reading);
+- ``cuda_graph``: the CUDA-compatible decode graph pool (discarded and
+  rewritten by replay);
+- ``acl_graph``: the Ascend decode graph pool (discarded or backed up to
+  host memory according to the backend policy);
 - ``nccl``: NCCL communicator buffers (suspended and resumed in place); only
   on an engine whose NCCL can suspend a communicator.
 """
@@ -40,11 +42,12 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Literal
 
 
 @dataclass(frozen=True)
 class MemoryRegion:
-    """How one releasable tag frees and restores its GPU memory.
+    """How one releasable tag frees and restores its device memory.
 
     Attributes:
         release: Frees the memory; runs once the scheduler has drained.
@@ -58,15 +61,23 @@ class MemoryRegion:
 
 
 def memory_regions(
-    device, adapter, *, nccl_suspendable: bool
+    device,
+    adapter,
+    *,
+    graph_tag: Literal["cuda_graph", "acl_graph"],
+    nccl_suspendable: bool,
+    replica_memory_transitions: bool,
 ) -> dict[str, MemoryRegion]:
-    """The releasable GPU-memory regions of an engine, keyed by tag.
+    """The releasable device-memory regions of an engine, keyed by tag.
 
     The memory-saver ``adapter`` unmaps and re-maps the allocator regions;
     the device handle does the data-plane work that must surround them.
     Which pools and peers that work touches is the handle's business; this
-    side only says when. ``nccl_suspendable`` says whether the process's
-    NCCL can suspend communicators; without it there is no ``nccl`` region.
+    side only says when. ``graph_tag`` selects the engine's graph pool.
+    ``nccl_suspendable`` says whether the process can suspend its NCCL
+    communicators; without it there is no ``nccl`` region.
+    With replica memory transitions, the KV clear completes before the
+    transfer engine registers the re-mapped arena.
     """
 
     def release_kv_cache() -> None:
@@ -80,7 +91,9 @@ def memory_regions(
         adapter.resume(tag="kv_cache")
         # Re-mapped memory holds garbage: zero it, then register it with
         # the PD transfer engine again.
-        device.finish_kv_resume()
+        device.finish_kv_resume(
+            synchronize_before_registration=replica_memory_transitions
+        )
 
     def allocator_region(tag: str) -> MemoryRegion:
         def release() -> None:
@@ -95,7 +108,7 @@ def memory_regions(
             release=lambda: device.release_weights(adapter),
             resume=lambda: device.resume_weights(adapter),
         ),
-        "cuda_graph": allocator_region("cuda_graph"),
+        graph_tag: allocator_region(graph_tag),
     }
     if nccl_suspendable:
         regions["nccl"] = MemoryRegion(

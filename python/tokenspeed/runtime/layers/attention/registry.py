@@ -589,6 +589,60 @@ def _get_default_backend_name(arch: AttentionArch) -> str:
         return "mha"
 
 
+def validate_npu_mtp_verify_width(
+    server_args: ServerArgs, model_config: ModelConfig
+) -> None:
+    """Reject an unsupported fixed Qwen3 MHA verify width before group creation.
+
+    Other model routes may interpret the draft-token budget differently.
+    """
+    width = server_args.speculative_num_draft_tokens
+    if (
+        server_args.device != "npu"
+        or server_args.disaggregation_mode != "null"
+        or server_args.speculative_algorithm != "MTP"
+        or server_args.speculative_draft_tree
+        or server_args.speculative_chain_width_table != "off"
+        or width is None
+        or server_args.attention_backend not in (None, "mha")
+        or model_config.attention_arch != AttentionArch.MHA
+        or model_config.model_profile is not None
+        or tuple(getattr(model_config.hf_config, "architectures", None) or ())
+        != ("Qwen3ForCausalLM",)
+    ):
+        return
+
+    from tokenspeed_kernel.registry import KernelRegistry
+    from tokenspeed_kernel.selection import resolve_kernel_override
+
+    mode = "mha_decode_with_kvcache"
+    if resolve_kernel_override("attention", mode, None):
+        return
+    platform = current_platform()
+    if not platform.is_npu:
+        return
+    # The MHA family import registers the same leaves that decode will query.
+    import tokenspeed_kernel.ops.attention.mha  # noqa: F401
+
+    candidates = KernelRegistry.get().get_for_operator(
+        "attention", mode, platform=platform
+    )
+    # Width alone can prove that no leaf can serve this route. Defer to normal
+    # dispatch if registration is incomplete or any leaf leaves width open.
+    if candidates and all(
+        "q_len" in spec.traits and width not in spec.traits["q_len"]
+        for spec in candidates
+    ):
+        supported = sorted(
+            {q_len for spec in candidates for q_len in spec.traits["q_len"]}
+        )
+        raise ValueError(
+            f"Unsupported NPU MHA verify width {width} "
+            f"(--speculative-num-draft-tokens) on {platform.device_name}. "
+            f"Registered widths: {supported}"
+        )
+
+
 def _get_backend_cls(name: str, arch: AttentionArch) -> type[AttentionBackend]:
     if name is None:
         entry = _BACKEND_REGISTRY.get(_get_default_backend_name(arch))

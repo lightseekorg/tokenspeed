@@ -27,7 +27,8 @@ views"). A refresh that reallocates a buffer — or binds a metadata view over
 fresh storage — silently feeds the replayed kernels stale data. Unit parity
 tests cannot see this class of bug, so this module makes it assertable:
 snapshot the tensor identities reachable from the graph-visible metadata
-slots right after capture, and re-verify them on every replay when
+slots at ACL capture entry or after CUDA/ROCm capture, and re-verify them
+before every replay when
 ``TOKENSPEED_GRAPH_DEBUG=1`` (production replays pay only a bool check).
 """
 

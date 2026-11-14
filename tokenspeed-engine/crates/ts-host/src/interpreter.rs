@@ -26,10 +26,24 @@
 use std::{
     ffi::{CStr, CString},
     mem::MaybeUninit,
-    ptr::addr_of_mut,
+    ptr::{addr_of_mut, NonNull},
 };
 
 use pyo3::ffi;
+
+/// The saved state of the thread that initialized Python. NonNull keeps it
+/// on that thread, and restoring it consumes the handle.
+pub struct MainThreadState(NonNull<ffi::PyThreadState>);
+
+impl MainThreadState {
+    /// Reattach after all host cleanup, while the main thread is detached.
+    /// Keep the interpreter and GIL available to native exit handlers.
+    pub fn restore_for_exit(self) {
+        // SAFETY: start captured this thread's state, and the interpreter
+        // remains initialized. main calls this after all scoped attachments.
+        unsafe { ffi::PyEval_RestoreThread(self.0.as_ptr()) };
+    }
+}
 
 /// Start the interpreter as the `executable` interpreter would start, with
 /// the scheduler's module built in, and release the GIL.
@@ -38,7 +52,7 @@ use pyo3::ffi;
 /// its prefix from it, so a virtual environment's site-packages and `.pth`
 /// files are the launcher's. Python installs no signal handlers; the host
 /// handles signals itself.
-pub fn start(executable: &str) -> Result<(), String> {
+pub fn start(executable: &str) -> Result<MainThreadState, String> {
     let executable =
         CString::new(executable).map_err(|_| "the Python executable path has a NUL".to_owned())?;
     ts_scheduler::register_builtin_module();
@@ -79,7 +93,8 @@ pub fn start(executable: &str) -> Result<(), String> {
         }
         // The thread that starts the interpreter holds the GIL; every thread,
         // this one included, attaches when it needs it.
-        ffi::PyEval_SaveThread();
+        let state = NonNull::new(ffi::PyEval_SaveThread())
+            .expect("the Python initialization thread has a thread state");
+        Ok(MainThreadState(state))
     }
-    Ok(())
 }

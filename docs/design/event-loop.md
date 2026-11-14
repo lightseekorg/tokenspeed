@@ -33,9 +33,12 @@ With `--enable-async-logging`, the Rust tracing writer and Python root logger
 also run off the serving threads. Each has a bounded, lossy queue: a slow
 output stream must not introduce I/O backpressure into a round. The host
 owns Python log cleanup explicitly after serving returns, including errors
-and encode ranks. Returning from Rust does not finalize Python, so an
+and encode ranks. A generation failure notifies the launcher before blocking
+cleanup or logging. Returning from Rust does not finalize Python, so an
 `atexit` hook alone cannot drain those records. Cleanup is bounded because
-an output stream can remain stalled.
+an output stream can remain stalled. For Ascend ranks, the launcher asks
+the host to restore the main thread's GIL after log cleanup so Triton-Ascend's
+native exit handlers can run.
 
 The ranks of a replica (an attention-TP group, across every pipeline stage)
 run the same scheduler. They talk over `ts-collective`'s TCP mesh, in fixed
@@ -49,6 +52,43 @@ idle forward when another has one. A stop request rides those collectives, so
 every rank stops after the same round; a frontend that is gone (its input
 socket closed, which does not reconnect) stops the engine the same way. One
 rank is the same path with groups of one.
+
+Memory saver protocol 3 queues release and resume at the common control
+gate on Ascend. The domain is the scheduler replica, or the existing
+attention-DP coordination group when one is present. That group covers the
+ranks that must forward together, including cross-replica MoE TP and EP. Ingress may
+receive an operation in different rounds on different replicas. The gate
+waits until every member has a call, then checks direction, canonical tags,
+and any shared transition ID before it starts the operation. Normal forwards
+and idle forwards can progress while an incomplete call waits to match.
+
+Release checks device prerequisites before and after the drain. For KV it
+checks that every member can clear its L1 index before clearing any index.
+Cancelling a pending call or drain leaves device mappings in place. Resume
+checks the local data plane before remapping, including weight validity for
+KV. The control plane publishes successful tags and replies only after all
+members confirm device completion. A device failure during apply stops the
+engine through the existing host failure path. Cross-host supervision
+remains the deployment's responsibility. The host and runtime both opt in to
+the checked startup. CUDA and other devices use protocol 2 and its local
+memory-transition path, as do compatible older host/runtime combinations.
+Ascend Memory Saver serving requires protocol 3 and rejects an older host
+before building the device. The existing
+Gloo address rendezvous verifies that every rank in the serving world selected
+the same protocol before any rank starts the Rust mesh or reports ready.
+Protocol 2 still advertises a plain address. Protocol 3 tags its address
+with its version, which a legacy host rejects during address decoding.
+Independent Prefill and Decode worlds agree separately.
+Deployments with an earlier, unchecked protocol-3 draft must upgrade it
+together. That draft advertised the same address as protocol 2.
+
+For a pipeline prefill engine, draining includes the KV transfers from
+every stage. The replica must retire those transfers before releasing the
+source KV. The decode engine has its own scheduler and can continue a
+request once its KV and first token have landed. The
+`pp_prefill_release_waits_for_the_remote_stage_kv_transfer` serving test
+holds one stage's transfer completion and checks that the replica keeps
+its KV until that stage retires.
 
 The launcher (`entrypoints/engine.py`) starts the ranks through
 `start_rust_host`, whatever the deployment: `ts serve` (SMG's gateway on its
@@ -703,16 +743,24 @@ idle forwards while a peer drains. An idle but unpaused peer prevents release:
 it could admit a request in the next round. Release intent rides the head
 gate, so every rank joins the tail's readiness agreement when any release is
 pending, including ranks without a release of their own. Ordinary rounds add
-no collective. An NCCL release also requires a pending NCCL release on every
-rank: a previously completed KV release does not authorize that collective.
-Other memory regions retain their local release semantics. Readiness is
-MIN-reduced over the replica and then attention DP
-before any release runs on the forward thread.
+no collective. Protocol 3 reduces readiness directly over its memory domain.
+Protocol 2 reduces over the replica and then attention DP. Under protocol 2,
+an NCCL release also requires a pending NCCL release on every rank: a
+previously completed KV release does not authorize that collective. Other
+regions retain their local release semantics. Release runs on the forward
+thread after the applicable readiness checks pass. Protocol 3 leaves NCCL
+resident and refuses its release tag.
 
-A resume containing NCCL uses the same-round operation gate: it waits until
-every attention-DP engine holds its resume before entering device collectives.
-Other regions still resume locally. A pending collective resume refuses a
-second memory resume until it finishes.
+Protocol 3 cancellation uses that same head gate. A continue on any ingress
+refuses the whole observed memory-call batch throughout the domain; local
+before/after-continue cutoffs cannot agree across independent ingress queues.
+Replies are emitted after the gate. Collect the continue and outstanding memory
+replies before issuing a new memory call. Protocol 2 keeps its existing path.
+
+A protocol-2 resume containing NCCL uses the same-round operation gate: it
+waits until every attention-DP engine holds its resume before entering device
+collectives. Other regions still resume locally. A pending collective resume
+refuses a second memory resume until it finishes.
 
 The head gate also agrees whether any DP rank still has released regions.
 Until all regions are restored on every rank, it withholds forward permission

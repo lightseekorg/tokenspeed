@@ -79,6 +79,20 @@ Start here:
 - [Compatible Parameters](https://lightseek.org/tokenspeed/configuration/compatible-parameters)
 - [Parallelism](https://lightseek.org/tokenspeed/serving/parallelism)
 
+## Ascend ACL Graph Memory Saver
+
+On Ascend, TokenSpeed can release memory between rollout windows and reuse the
+original decode graphs after wake. Dense BF16 Qwen3 workers can discard target
+weights and load a complete replacement checkpoint before generation resumes.
+The primary A2 stack uses PyTorch 2.9.0, PTA 2.9.0-730 with six required
+backports, and CANN 9.0.0. The guide separates this stack from the historical
+stock PTA 2.13.0 compatibility run. The validation report records accepted
+latest-source CPU and hardware results separately from earlier timing evidence.
+
+- [User guide](docs/serving/ascend-memory-saver.md)
+- [Design and CUDA comparison](docs/design/ascend-acl-graph-memory-saver.md)
+- [Hardware validation report](docs/serving/ascend-memory-saver-test-report.md)
+
 ## Citation
 
 ```bibtex

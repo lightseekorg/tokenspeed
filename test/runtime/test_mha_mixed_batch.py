@@ -56,10 +56,16 @@ register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 
 def _backend(
-    *, width=1, is_draft=False, block_decode=False, page_size=16, heads=(12, 2, 1)
+    *,
+    width=1,
+    is_draft=False,
+    block_decode=False,
+    page_size=16,
+    heads=(12, 2, 1),
+    backend_name="mha",
 ):
     spec = MHAConfig(
-        backend_name="mha",
+        backend_name=backend_name,
         num_attention_heads=heads[0],
         num_kv_heads=heads[1],
         head_dim=128,
@@ -78,6 +84,134 @@ def _backend(
         components=(spec,),
     )
     return mha.MHAAttnBackend(config, spec, kernel_page_size=page_size)
+
+
+def _full_history_router(leaf, *, is_draft=False):
+    router = CacheGroupRouter(
+        None,
+        is_draft=is_draft,
+        spec_num_tokens=leaf.spec_num_tokens,
+        device="cpu",
+        consumed_group_ids=None,
+    )
+    router.bind(
+        CacheGroupGeometry(
+            granularities={"full_attention": 16},
+            attn_kinds={"full_attention": "full_history"},
+            full_history_group_id="full_attention",
+            row_geometry={"full_attention": (16, 1)},
+            windows={"full_attention": None},
+        ),
+        {"full_attention": leaf},
+    )
+    return router
+
+
+@pytest.mark.parametrize("width", [4, 5])
+def test_ascend_fia_update_reads_target_verify_metadata_for_partial_batch(width):
+    leaf = _backend(width=width)
+    runner = ForwardStepRunner.__new__(ForwardStepRunner)
+    runner.attn_backend = _full_history_router(leaf)
+    runner.attn_backend.init_cuda_graph_state(4, max_extend_tokens=0)
+    runner.draft_attn_backend = None
+    runner.max_tokens_per_req = width
+    slot_ids = torch.tensor([2, 5, 7, 0], dtype=torch.int32)
+    block_tables = {
+        "full_attention": torch.arange(1, 13, dtype=torch.int32).reshape(3, 4)
+    }
+
+    class Graph:
+        def update(self, *, cpu_update_input):
+            assert torch.is_inference_mode_enabled()
+            self.lengths = cpu_update_input
+
+    graph = Graph()
+    for active_lengths in ([width - 1, 17, width], [32, width, width - 2]):
+        # Batch three replays the batch-four graph with the raw sentinel of 1.
+        raw = [*active_lengths, 1]
+        seq_lens = torch.tensor(raw, dtype=torch.int32)
+        runner._prepare_decode_metadata(
+            4,
+            3,
+            slot_ids,
+            seq_lens,
+            ForwardMode.DECODE,
+            use_graph=True,
+            settle=lambda: None,
+            block_tables=block_tables,
+        )
+        runner._update_npu_graph(graph, seq_lens)
+
+        expected = [max(length, width) for length in raw]
+        assert graph.lengths == [{"actual_seq_lengths_kv": expected}]
+        assert leaf.forward_decode_metadata.seq_lens.tolist() == expected
+        assert seq_lens.tolist() == raw
+
+
+@pytest.mark.parametrize("role", ["target", "draft"])
+@pytest.mark.parametrize("window", [-1, 0, 31])
+@pytest.mark.parametrize("backend_name", ["mha", "triton"])
+def test_ascend_mha_validates_the_layer_window_with_a_full_history_pool(
+    role, window, backend_name
+):
+    from tokenspeed.runtime.execution.model_executor import ModelExecutor
+
+    leaf = _backend(is_draft=role == "draft", backend_name=backend_name)
+    router = _full_history_router(leaf, is_draft=role == "draft")
+    layer = PagedAttention(
+        12,
+        128,
+        128**-0.5,
+        2,
+        7,
+        sliding_window_size=window,
+        rotary_emb=None,
+        qk_norm=None,
+    )
+    runner = SimpleNamespace(model=torch.nn.Sequential(layer))
+    executor = ModelExecutor.__new__(ModelExecutor)
+    executor.model_runner = runner if role == "target" else None
+    executor.attn_backend = router if role == "target" else None
+    executor._draft_model_runner = runner if role == "draft" else None
+    executor.draft_attn_backend = router if role == "draft" else None
+
+    if window < 0:
+        executor._validate_ascend_mha_attention()
+    else:
+        with pytest.raises(
+            ValueError,
+            match=rf"Ascend MHA requires full attention: {role} layer .*"
+            rf"layer_id=7.*window_left={window}",
+        ):
+            executor._validate_ascend_mha_attention()
+
+
+@pytest.mark.parametrize(
+    "device,is_draft,backend_name,eager_solution,graph_solution",
+    [
+        ("npu", True, "mha", None, "triton"),
+        ("npu", True, "triton", "triton", "triton"),
+        ("npu", True, "fa3", "fa3", "fa3"),
+        ("npu", False, "mha", None, None),
+        ("cuda", True, "mha", None, None),
+        ("cuda", True, "fa3", "fa3", "fa3"),
+    ],
+)
+def test_native_mha_draft_decode_selects_triton_only_for_automatic_acl_graphs(
+    monkeypatch, device, is_draft, backend_name, eager_solution, graph_solution
+):
+    from tokenspeed.runtime.execution import forward_step
+
+    leaf = _backend(is_draft=is_draft, backend_name=backend_name)
+    leaf.device = device
+    assert leaf._decode_kernel_solution() == eager_solution
+
+    # Enforced eager startup can enable this flag to warm up collectives.
+    monkeypatch.setattr(forward_step, "_is_cuda_graph_phase", True)
+    assert leaf._decode_kernel_solution() == eager_solution
+
+    monkeypatch.setattr(forward_step, "_is_acl_graph_forward", True)
+    assert leaf._decode_kernel_solution() == graph_solution
 
 
 def _init(backend, *, lengths, queries, prefixes, mode, tables=None):
@@ -573,8 +707,10 @@ def test_block_draft_mixed_to_decode_refreshes_all_owners_and_reordered_slots(
         if for_graph_replay:
             # Select the in-graph metadata branch without constructing a GPU
             # stream or graph. The outer CPU test runner denies initialization.
-            capture.setattr(torch.cuda, "is_available", lambda: True)
-            capture.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+            capture.setattr(
+                "tokenspeed.runtime.execution.drafter.dflash.is_current_stream_capturing",
+                lambda device: True,
+            )
         drafter._update_draft_prefix_lengths(decode_ctx, next_accepts)
         assert (
             drafter.draft_seq_lens_buf[:block_bs].tolist() == block_prefixes[:block_bs]
@@ -636,7 +772,7 @@ def _cached_attention_cpu(
     page_table,
     cache_seqlens,
     window_left,
-    **kwargs
+    **kwargs,
 ):
     """CPU stand-in for the unavailable GPU operation, using its public ABI.
 

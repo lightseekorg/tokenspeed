@@ -24,7 +24,7 @@
 //! half; `TOKENSPEED_HOST_BINARY` overrides the installed binary):
 //!
 //! ```text
-//! ts-host --python <executable> --control-fd <fd> --enable-async-logging <bool>
+//! ts-host --python <executable> --control-fd <fd> --enable-async-logging <bool> [--restore-gil-for-exit <bool>]
 //! ```
 //!
 //! The rank's arguments arrive on `--control-fd`, and readiness goes back
@@ -52,7 +52,10 @@ use std::{
     time::Duration,
 };
 
-use pyo3::{prelude::*, types::PyBytes};
+use pyo3::{
+    prelude::*,
+    types::{PyBytes, PyDict},
+};
 use ts_collective::{Group, Listener, Mesh};
 use ts_control::{
     batch_log::BatchLogConfig,
@@ -99,7 +102,7 @@ const EP_GROUP: u32 = 3;
 #[derive(Debug, thiserror::Error)]
 enum HostError {
     #[error(
-        "usage: ts-host --python <executable> --control-fd <fd> --enable-async-logging <bool>: {0}"
+        "usage: ts-host --python <executable> --control-fd <fd> --enable-async-logging <bool> [--restore-gil-for-exit <bool>]: {0}"
     )]
     Usage(String),
     #[error("{0}")]
@@ -138,6 +141,7 @@ struct Args {
     python: String,
     control_fd: i32,
     enable_async_logging: bool,
+    restore_gil_for_exit: bool,
 }
 
 /// The control and forward threads report to the same launcher.
@@ -210,6 +214,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, HostError>
     let mut python = None;
     let mut control_fd = None;
     let mut enable_async_logging = None;
+    let mut restore_gil_for_exit = false;
     while let Some(flag) = args.next() {
         let value = args
             .next()
@@ -230,6 +235,13 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, HostError>
                     ))
                 })?);
             }
+            "--restore-gil-for-exit" => {
+                restore_gil_for_exit = value.parse().map_err(|_| {
+                    HostError::Usage(format!(
+                        "bad --restore-gil-for-exit {value}: use true or false"
+                    ))
+                })?;
+            }
             _ => return Err(HostError::Usage(format!("unknown argument {flag}"))),
         }
     }
@@ -239,6 +251,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, HostError>
             .ok_or_else(|| HostError::Usage("--control-fd is required".to_owned()))?,
         enable_async_logging: enable_async_logging
             .ok_or_else(|| HostError::Usage("--enable-async-logging is required".to_owned()))?,
+        restore_gil_for_exit,
     })
 }
 
@@ -486,6 +499,7 @@ impl HostConfig {
         config: &Bound<'_, PyAny>,
         requires_bootstrap: bool,
         role: Role,
+        replica_memory_transitions: bool,
     ) -> PyResult<Self> {
         let l3 = {
             let l3 = config.getattr("l3")?;
@@ -557,6 +571,7 @@ impl HostConfig {
             collective_bind_host: config.getattr("collective_bind_host")?.extract()?,
             controls: ControlConfig {
                 memory_saver: config.getattr("memory_saver")?.extract()?,
+                replica_memory_transitions,
                 memory_regions: config.getattr("memory_regions")?.extract()?,
                 // With L3, the namespace's weight version.
                 l3_weight_version: l3.as_ref().map(|l3| l3.weight_version.clone()),
@@ -676,24 +691,78 @@ fn watch_signals(stop: Arc<AtomicBool>) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Select the rank's memory protocol before Python initializes the device.
+fn bootstrap_worker<'py>(
+    runtime: &Bound<'py, pyo3::types::PyModule>,
+    control_fd: i32,
+    outbox: &Bound<'py, PyAny>,
+    host_spans: &Bound<'py, PyAny>,
+) -> PyResult<(Bound<'py, PyAny>, bool)> {
+    let py = runtime.py();
+    let prepare = match runtime.getattr("prepare_bootstrap") {
+        Ok(prepare) => prepare,
+        // Old Python still owns the launch pipe and understands weight protocol 2.
+        Err(error) if error.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) => {
+            let bootstrap = runtime.getattr("bootstrap")?;
+            // Check the signature before the call consumes the launch pipe.
+            let parameters = py
+                .import("inspect")?
+                .call_method1("signature", (&bootstrap,))?
+                .getattr("parameters")?;
+            let worker = if parameters.contains("host_spans")? {
+                bootstrap.call1((control_fd, outbox, 2_u32, host_spans))?
+            } else {
+                bootstrap.call1((control_fd, outbox, 2_u32))?
+            };
+            return Ok((worker, false));
+        }
+        Err(error) => return Err(error),
+    };
+    // Earlier bootstraps can select v2. The previous draft used a different
+    // preflight ABI, so use v3 only when both halves support this startup.
+    let checked_startup = runtime.hasattr("ASCEND_MEMORY_PROTOCOL_STARTUP")?;
+    let prepared = if checked_startup {
+        let options = PyDict::new(py);
+        options.set_item("validate_memory_protocol", true)?;
+        prepare.call((control_fd,), Some(&options))?
+    } else {
+        prepare.call1((control_fd,))?
+    };
+    let (replica_memory_transitions, start): (bool, Py<PyAny>) = prepared.extract()?;
+    let replica_memory_transitions = checked_startup && replica_memory_transitions;
+    let protocol = if replica_memory_transitions {
+        3_u32
+    } else {
+        2_u32
+    };
+    let bootstrap = start.bind(py).call1((outbox, protocol, host_spans))?;
+    Ok((bootstrap, replica_memory_transitions))
+}
+
 fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
     let stop = Arc::new(AtomicBool::new(false));
     watch_signals(stop.clone())?;
 
-    let (bootstrap, outbox, mode) = Python::attach(|py| {
+    let (bootstrap, outbox, mode, replica_memory_transitions) = Python::attach(|py| {
         let built = (|| {
             // Before anything imports the scheduler package.
             ts_scheduler::alias_builtin_module(py)?;
             let outbox = Bound::new(py, pd::Outbox::new())?;
             let host_spans = Bound::new(py, host_spans::HostSpans)?;
-            let bootstrap = py
-                .import("tokenspeed.runtime.engine.rust_host")?
-                .call_method1(
-                    "bootstrap",
-                    (args.control_fd, outbox.clone(), 2_u32, host_spans),
-                )?;
+            let runtime = py.import("tokenspeed.runtime.engine.rust_host")?;
+            let (bootstrap, replica_memory_transitions) = bootstrap_worker(
+                &runtime,
+                args.control_fd,
+                outbox.as_any(),
+                host_spans.as_any(),
+            )?;
             let mode: String = bootstrap.getattr("mode")?.extract()?;
-            Ok((bootstrap.unbind(), outbox.unbind(), mode))
+            Ok((
+                bootstrap.unbind(),
+                outbox.unbind(),
+                mode,
+                replica_memory_transitions,
+            ))
         })();
         built.map_err(|error| python_error(py, error))
     })?;
@@ -729,7 +798,12 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
                 transfer_metrics,
             )?;
             let role = peers.role;
-            let config = HostConfig::from_python(&python_config, peers.transfer.is_some(), role)?;
+            let config = HostConfig::from_python(
+                &python_config,
+                peers.transfer.is_some(),
+                role,
+                replica_memory_transitions,
+            )?;
             let data_plane = bootstrap.getattr("data_plane")?.unbind();
             Ok((
                 bootstrap.unbind(),
@@ -945,16 +1019,22 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let _log_guard = logging::init(args.enable_async_logging);
+    let log_guard = logging::init(args.enable_async_logging);
     let launcher = LAUNCHER_FAILURE.get_or_init(LauncherFailure::for_parent);
-    let served = (|| {
-        interpreter::start(&args.python).map_err(HostError::Interpreter)?;
+    let main_thread = match interpreter::start(&args.python) {
+        Ok(state) => state,
+        Err(error) => {
+            launcher.report(HostError::Interpreter(error));
+            return ExitCode::FAILURE;
+        }
+    };
+    let served = {
         // The host does not finalize Python. Drain its logger on success,
         // error and unwind if the launcher has not stopped the rank.
         let _python_logs = logging::PythonLogGuard;
         serve(&args, launcher)
-    })();
-    match served {
+    };
+    let exit_code = match served {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             // Errors outside generation serving still arrive after cleanup,
@@ -962,8 +1042,18 @@ fn main() -> ExitCode {
             launcher.report(&error);
             ExitCode::FAILURE
         }
+    };
+    drop(log_guard);
+    if args.restore_gil_for_exit {
+        // Triton-Ascend's native exit handlers access Python on this thread.
+        main_thread.restore_for_exit();
     }
+    exit_code
 }
+
+#[cfg(test)]
+#[path = "../tests/support/restore_gil_for_exit.rs"]
+mod restore_gil_for_exit_tests;
 
 #[cfg(test)]
 #[path = "tests/main.rs"]

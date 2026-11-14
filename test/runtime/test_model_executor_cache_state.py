@@ -19,16 +19,21 @@
 # SOFTWARE.
 
 from contextlib import nullcontext
+from test.ci_system.ci_register import register_cuda_ci
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from tokenspeed.runtime.distributed.pp_stage import PPStageState
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.model_executor import ModelExecutor
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.logits_processor_output import LogitsProcessorOutput
+
+# CPU regressions use the runtime job's complete dependency environment.
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 
 class _RuntimeStates:
@@ -224,6 +229,44 @@ def test_draft_final_step_follows_the_complete_drafter_run():
         "candidates-real",
         "draft-final",
     ]
+
+
+def test_non_final_pipeline_stage_returns_empty_probability_outputs():
+    from tokenspeed.runtime.layers.attention.backends.base import CachePoolBinding
+
+    executor = ModelExecutor.__new__(ModelExecutor)
+    executor.attn_backend = CachePoolBinding()
+    executor.device = "cpu"
+    executor.device_module = torch.cpu
+    executor.input_buffers = SimpleNamespace(req_pool_indices_buf=torch.tensor([0]))
+    executor.grammar_runtime = None
+    executor.drafter = None
+    executor.dspark_context_producer = None
+    executor.config = SimpleNamespace(pp_size=2, pp_rank=0)
+    boundary = PPStageState(hidden_states=torch.ones((1, 4)))
+    executor._run_target_forward = lambda _ctx: boundary
+
+    # The downstream device rank is unavailable in this CPU test.
+    sent = []
+    executor._pp_send_stage_state = sent.append
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=1,
+        num_extends=1,
+        output_layout=ForwardOutputLayout(1, 1, 0, 1),
+        input_num_tokens=1,
+        forward_mode=ForwardMode.EXTEND,
+    )
+
+    tokens, lengths, logprobs, cumulative_probs, forward_logprobs = (
+        executor._forward_step(bs=1, ctx=ctx, sampling_info=object())
+    )
+
+    assert sent == [boundary]
+    assert tokens.tolist() == [0]
+    assert lengths.tolist() == [1]
+    assert (logprobs, cumulative_probs, forward_logprobs) == (None, None, None)
 
 
 def test_cudagraph_gc_flag_reaches_the_capture_context():

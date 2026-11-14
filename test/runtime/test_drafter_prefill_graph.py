@@ -346,7 +346,7 @@ def _target_prefill_graph() -> prefill_graph_module.PrefillGraph:
         token_to_kv_pool=None,
         input_buffers=None,
         config=config,
-        memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False),
+        memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False, device="cpu"),
     )
 
 

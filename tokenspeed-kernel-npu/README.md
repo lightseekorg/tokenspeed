@@ -18,6 +18,10 @@ Transformers 5.12.0, Triton 3.2.0, and Triton-Ascend 3.2.1. The setup script
 records every Python package mutation needed by this Ascend path, including the
 `apache-tvm-ffi==0.1.13` build dependency and editable install of this package.
 
+The Ascend Memory Saver uses a separate native allocator library. Its PTA
+options include the 2.9.0-730 backport and stock TorchNPU 2.13.0.
+[Memory Saver setup and dependencies](memory-saver/README.md)
+
 TokenSpeed applications should continue to import operators from
 `tokenspeed-kernel`; it owns registration and dispatch to this package.
 
@@ -104,6 +108,12 @@ CPU scheduler lengths are passed directly, without a device length readback.
 
 MLA decode partial packing reuses its compiled kernel across changing batch
 sizes and preserves empty-shard masks during Graph replay.
+
+Ascend paged MHA supports up to five query tokens per request for speculative
+verification. The fused attention and Triton decode registrations cover
+64- and 128-token pages.
+Qwen3 with fixed-width chain MTP and the default paged MHA route checks the
+registered verify widths before initializing the distributed process group.
 
 Run the operator correctness suite on a visible NPU with:
 

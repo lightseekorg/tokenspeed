@@ -127,6 +127,7 @@ from tokenspeed.runtime.layers.logits_processor import (
     prepare_logits_communication,
 )
 from tokenspeed.runtime.layers.paged_attention import (
+    PagedAttention,
     bind_cache_groups,
     check_block_drafter_storage,
 )
@@ -154,6 +155,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
+    from tokenspeed.runtime.utils.ascend_memory_saver_state import AllocationPolicy
 
 logger = get_colorful_logger(__name__)
 
@@ -622,7 +624,7 @@ class ModelExecutor:
         self.device = config.device
         self.config = config
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=config.enable_memory_saver
+            enable=config.enable_memory_saver, device=config.device
         )
         self.model_runner = model_runner
         self.sampling_backend = sampling_backend
@@ -647,6 +649,8 @@ class ModelExecutor:
         self.draft_attn_backend = draft_attn_backend
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self._draft_model_runner = draft_model_runner
+        if self.device == "npu":
+            self._validate_ascend_mha_attention()
         self._draft_final_step_counter = None
         self._pp_wire_logged = False
 
@@ -730,6 +734,25 @@ class ModelExecutor:
                 )
 
                 DrafterImpl = partial(EagleHarness, harness=config.eagle_harness)
+            if config.enable_memory_saver and self.device == "npu":
+                if (
+                    config.eagle_harness is not None
+                    or not DrafterImpl.supports_ascend_memory_saver
+                ):
+                    raise ValueError(
+                        f"{config.spec_algo} has no supported Ascend memory-saver "
+                        "drafter for this configuration"
+                    )
+                if is_block_drafter(config.spec_algo, is_draft=True) and (
+                    config.world_size != 1
+                    or not 2 <= config.spec_num_tokens <= 4
+                    or not self._supports_ascend_mha_graphs()
+                ):
+                    raise ValueError(
+                        f"Ascend memory saver with {config.spec_algo} requires "
+                        "single-rank BF16 MHA, the greedy sampler, a verified "
+                        "target and draft, and a verify width of 2 to 4"
+                    )
             self.drafter = DrafterImpl(
                 spec_num_tokens=config.spec_num_tokens,
                 spec_num_steps=config.spec_num_steps,
@@ -1022,6 +1045,84 @@ class ModelExecutor:
         self._configure_for_pools()
         self._build_graph_owners()
 
+    def _validate_ascend_mha_attention(self) -> None:
+        """Reject unsupported windows on native Ascend MHA target and draft layers.
+
+        Run once the cache routers have their leaves and before either eager
+        warmup or ACL capture, including when a solution is pinned. The built
+        layer's compute mask determines support. A draft can use a window
+        over a full-history pool. Raise ValueError with the offending layer
+        when its window is zero or positive.
+        """
+        from tokenspeed.runtime.layers.attention.backends.paged.mha import (
+            MHAAttnBackend,
+        )
+        from tokenspeed.runtime.layers.attention.backends.paged.router import (
+            CacheGroupRouter,
+        )
+
+        for role, runner, backend in (
+            ("target", self.model_runner, self.attn_backend),
+            ("draft", self._draft_model_runner, self.draft_attn_backend),
+        ):
+            if runner is None or type(backend) is not CacheGroupRouter:
+                continue
+            leaves = backend.child_backends()
+            if not leaves or any(type(leaf) is not MHAAttnBackend for leaf in leaves):
+                continue
+            for name, layer in runner.model.named_modules():
+                if isinstance(layer, PagedAttention) and layer.sliding_window_size >= 0:
+                    raise ValueError(
+                        "Ascend MHA requires full attention: "
+                        f"{role} layer {name!r} (layer_id={layer.layer_id}) uses "
+                        f"sliding-window attention (window_left={layer.sliding_window_size})."
+                    )
+
+    def _supports_ascend_mha_graphs(self) -> bool:
+        """The model, attention and sampler combination audited for discard."""
+        from tokenspeed.runtime.layers.attention.backends.paged.mha import (
+            MHAAttnBackend,
+        )
+        from tokenspeed.runtime.layers.attention.backends.paged.router import (
+            CacheGroupRouter,
+        )
+        from tokenspeed.runtime.sampling.backends.greedy import GreedySamplingBackend
+
+        def audited_mha(runner, backend):
+            # Model subclasses must declare their own contract because they
+            # can introduce persistent tensors of their own. The layer window
+            # check ran at startup, before either eager or graph warmup.
+            return (
+                vars(type(runner.model)).get("supports_acl_graph_discard", False)
+                and runner.model_config.dtype == torch.bfloat16
+                and runner.model_config.quantization is None
+                and type(backend) is CacheGroupRouter
+                and bool(backend.group_ids)
+                and all(
+                    type(leaf) is MHAAttnBackend
+                    and leaf.kv_cache_dtype == torch.bfloat16
+                    and leaf.kernel_solution is None
+                    for leaf in backend.child_backends()
+                )
+            )
+
+        draft = self._draft_model_runner
+        return (
+            audited_mha(self.model_runner, self.attn_backend)
+            and type(self.sampling_backend) is GreedySamplingBackend
+            and (draft is None or audited_mha(draft, self.draft_attn_backend))
+        )
+
+    def _acl_graph_policy(self) -> AllocationPolicy | None:
+        if self.device != "npu" or not self.config.enable_memory_saver:
+            return None
+        from tokenspeed.runtime.utils.ascend_memory_saver_state import AllocationPolicy
+
+        if self.capturable_grammar is None and self._supports_ascend_mha_graphs():
+            return AllocationPolicy.DISCARD
+        # Keep the backup policy for captures whose replay has not been audited.
+        return AllocationPolicy.CPU_BACKUP
+
     def _build_graph_owners(self) -> None:
         """Build the decode and prefill graph owners for the bound pools.
 
@@ -1042,6 +1143,7 @@ class ModelExecutor:
             sampling_backend=self.sampling_backend,
             runtime_states=self.runtime_states,
             decode_graph_supported=self._graph_support.decode_graph,
+            acl_graph_policy=self._acl_graph_policy(),
         )
         # Eager warmup can be DP-asymmetric; prewarm RSAG under uniform dummy inputs.
         # The prefill role never decodes: a DECODE-shaped dummy would need the
@@ -1123,6 +1225,16 @@ class ModelExecutor:
                     ),
                     observer=observer,
                 )
+
+        if self.device == "npu" and self.config.enable_memory_saver:
+            models = [("target", self.model_runner.model)]
+            if self._draft_model_runner is not None:
+                models.append(("draft", self._draft_model_runner.model))
+            self.model_runner.memory_saver_adapter.validate_startup(
+                models=models,
+                kv_regions=self.token_to_kv_pool.arena.regions,
+                graphs=self.forward_step.graphs.values(),
+            )
 
     @property
     def captures_drafter_prefill_graph(self) -> bool:
@@ -2005,7 +2117,7 @@ class ModelExecutor:
             self._pp_send_stage_state(logits_output)
             output_tokens = torch.zeros(bs, dtype=torch.int32, device=self.device)
             accept_lengths = torch.ones(bs, dtype=torch.int32, device=self.device)
-            return output_tokens, accept_lengths, None, None
+            return output_tokens, accept_lengths, None, None, None
 
         # Flag NaN per request and sanitize in place, before any sampling kernel.
         self.nan_guard.audit_logits(logits_output, ctx)

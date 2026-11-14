@@ -59,6 +59,7 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from tokenspeed.runtime.utils import get_colorful_logger
+from tokenspeed.runtime.utils.device_stream import is_current_stream_capturing
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.spec_block_geometry import (
     read_checkpoint_block_size,
@@ -138,6 +139,7 @@ class DFlash(BaseDrafter):
 
     supports_pd_layerwise_finalization = True
     uses_shared_context_projection = True
+    supports_ascend_memory_saver = True
     sample_from_anchor = False
     spec_algorithm = "DFLASH"
 
@@ -557,7 +559,7 @@ class DFlash(BaseDrafter):
     def _ensure_dist_argmax_state(self, dtype: torch.dtype, device: torch.device):
         """Probe once, before capture, and reuse the verdict for the process."""
         if self._dist_argmax_state is _UNSET:
-            if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            if is_current_stream_capturing(device):
                 return None  # rendezvous is collective; leave it to warmup
             self._dist_argmax_state = self._probe_dist_argmax_state(dtype, device)
         return self._dist_argmax_state
@@ -834,10 +836,8 @@ class DFlash(BaseDrafter):
         """Publish valid draft history independently of who produces cache bytes."""
         bs = base_ctx.bs
         req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
-        if (
-            base_ctx.num_extends == 0
-            and torch.cuda.is_available()
-            and torch.cuda.is_current_stream_capturing()
+        if base_ctx.num_extends == 0 and is_current_stream_capturing(
+            accept_lengths.device
         ):
             old_lens = self.runtime_states.valid_cache_lengths.index_select(
                 0, req_pool_indices
@@ -1429,9 +1429,7 @@ class DFlash(BaseDrafter):
                 out=block_positions,
             )
 
-        is_capturing = (
-            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
-        )
+        is_capturing = is_current_stream_capturing(current_tokens.device)
         # MLA block rows are all decode rows. Treating them as extends makes
         # MLA backends slice the entire block out of their decode metadata.
         metadata_num_extends = 0 if self.attention_kind == "kimi_mla" else bs

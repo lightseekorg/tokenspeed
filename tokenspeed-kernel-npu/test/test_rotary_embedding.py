@@ -57,21 +57,31 @@ def _reference(
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("positions_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("rotary_dim", [64, 128])
 @pytest.mark.parametrize("is_neox", [True, False])
 @pytest.mark.parametrize("use_output_buffers", [True, False])
+@pytest.mark.parametrize("key_only", [False, True])
 def test_apply_rope(
     dtype: torch.dtype,
+    positions_dtype: torch.dtype,
     rotary_dim: int,
     is_neox: bool,
     use_output_buffers: bool,
+    key_only: bool,
 ) -> None:
-    positions = torch.tensor([0, 7, 3, 15, 2, 9, 1], device="npu")
+    positions = torch.tensor(
+        [0, 7, 3, 15, 2, 9, 1], device="npu", dtype=positions_dtype
+    )
     frequencies = torch.randn(32, rotary_dim // 2, device="npu", dtype=dtype)
     cos_sin_cache = torch.cat((frequencies.cos(), frequencies.sin()), dim=-1)
     packed = torch.randn(7, (16 + 8) * 128, device="npu", dtype=dtype)
     q, k = packed.split((16 * 128, 8 * 128), dim=-1)
-    expected_q = _reference(q, cos_sin_cache, positions, rotary_dim, is_neox)
+    if key_only:
+        q = q[:, :0]
+    expected_q = (
+        q if key_only else _reference(q, cos_sin_cache, positions, rotary_dim, is_neox)
+    )
     expected_k = _reference(k, cos_sin_cache, positions, rotary_dim, is_neox)
     q_before, k_before = q.clone(), k.clone()
     q_out = torch.empty_like(q) if use_output_buffers else None

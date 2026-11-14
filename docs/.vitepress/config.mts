@@ -61,7 +61,8 @@ export default defineConfig({
         items: [
           { text: "Parallelism", link: "/serving/parallelism" },
           { text: "Disaggregated Serving", link: "/serving/disaggregation" },
-          { text: "Weight Memory Policies", link: "/serving/weight-memory" }
+          { text: "Weight Memory Policies", link: "/serving/weight-memory" },
+          { text: "Ascend Memory Saver", link: "/serving/ascend-memory-saver" }
         ]
       }
     ],

@@ -138,7 +138,7 @@ import contextlib
 import enum
 import json
 import os
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
@@ -790,6 +790,26 @@ class DeviceHandle:
         self.settle()
         self._executor.device_module.synchronize()
 
+    @contextlib.contextmanager
+    def complete_memory_transition(self) -> Iterator[None]:
+        """Wait for device work before reporting a successful transition."""
+        with allow_host_sync(
+            "memory transitions wait for the device before rank agreement"
+        ):
+            yield
+            self.synchronize()
+
+    def check_memory_transition(
+        self, tags: list[str], *, release: bool
+    ) -> tuple[bool, str]:
+        """Check the local weight and KV state without changing either."""
+        if self._weight_memory is not None:
+            try:
+                self._weight_memory.check_memory_transition(tags, release=release)
+            except RuntimeError as error:
+                return False, str(error)
+        return True, ""
+
     def empty_cache(self) -> None:
         """Release eager cuBLAS workspaces and allocator blocks after GPU work drains."""
         if self._forward_device.type == "cuda" and self._executor.config.enforce_eager:
@@ -840,7 +860,7 @@ class DeviceHandle:
         else:
             self._weight_memory.resume(operation)
 
-    def finish_kv_resume(self) -> None:
+    def finish_kv_resume(self, *, synchronize_before_registration: bool) -> None:
         """Repair the KV arena after a memory-saver wake re-maps its storage.
 
         Re-mapped memory holds garbage, so the arena is zeroed first. The
@@ -852,6 +872,9 @@ class DeviceHandle:
         self.settle()
         self._executor.token_to_kv_pool.clear_kv_buffers()
         if self._kv_transfer is not None:
+            if synchronize_before_registration:
+                # The transfer engine has no ordering with the clear's stream.
+                self._executor.device_module.synchronize()
             self._kv_transfer.restore_cache_registration()
         if self._weight_memory is not None:
             self._weight_memory.mark_kv_resumed()
@@ -1024,18 +1047,24 @@ class DeviceHandle:
         ):
             raise TypeError(f"unsupported weight-load request {type(req).__name__}")
         state = self._weight_memory
-        if state is None:
-            return True, "ready for weight update"
-        if (
-            state.policy == "discard"
-            and type(req) is not UpdateWeightsFromMooncakeReqInput
-        ):
-            return False, "Discard policy requires a complete Model Updater SDK update"
-        try:
-            state.check_update()
-        except RuntimeError as exc:
-            return False, str(exc)
+        if state is not None:
+            if state.policy == "discard" and not self._is_complete_weight_update(req):
+                return (
+                    False,
+                    "Discard policy requires a complete Model Updater SDK update",
+                )
+            try:
+                state.check_update()
+            except RuntimeError as exc:
+                return False, str(exc)
         return True, "ready for weight update"
+
+    def _is_complete_weight_update(self, req) -> bool:
+        from tokenspeed.runtime.engine.io_struct import (
+            UpdateWeightsFromMooncakeReqInput,
+        )
+
+        return type(req) is UpdateWeightsFromMooncakeReqInput
 
     def update_weights(self, req) -> tuple[bool, str]:
         """Apply one in-place RL weight-sync request, ordered against forwards.
@@ -1080,7 +1109,13 @@ class DeviceHandle:
                 )
             ),
             DestroyWeightsUpdateGroupReqInput: runner.destroy_weights_update_group,
-            UpdateWeightFromDiskReqInput: runner.update_weights_from_disk,
+            UpdateWeightFromDiskReqInput: (
+                lambda req: (
+                    runner.update_weights_from_disk(req, require_complete=True)
+                    if require_complete
+                    else runner.update_weights_from_disk(req)
+                )
+            ),
         }
         handler = handlers.get(type(req))
         if handler is None:
@@ -1923,12 +1958,19 @@ def build_device_side(
             policy=server_args.weight_memory_policy, models=update_models
         )
 
+    handle_type: type[DeviceHandle] = DeviceHandle
+    if server_args.enable_memory_saver and executor.device == "npu":
+        from tokenspeed.runtime.execution.ascend_memory_saver_device import (
+            AscendMemorySaverDeviceHandle,
+        )
+
+        handle_type = AscendMemorySaverDeviceHandle
     return DeviceBuild(
         host_cache=host_cache,
         specs=specs,
         transfer=kv_transfer,
         encoder_model_facts=encoder_model_facts,
-        handle=DeviceHandle(
+        handle=handle_type(
             executor,
             host_cache_executor=host_cache_executor,
             kv_transfer=kv_transfer,

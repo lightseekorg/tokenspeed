@@ -166,7 +166,7 @@ switch an envelope folds is also available individually under `auto`.
 | `--model-update-config` | JSON object handed to the Model Updater SDK for the Mooncake weight update. Requires the three flags below; see [Mooncake weight updates](#mooncake-weight-updates). |
 | `--model-update-sdk-module` | Import path of the Model Updater SDK module. Imported in the scheduler process on the first Mooncake update, not at startup. Required with `--model-update-config`. |
 | `--model-update-engine-type` | SDK `EngineType` member name for this engine, resolved as `EngineType[value.upper()]`. Required with `--model-update-config`. |
-| `--model-update-draft-weights` | `retain` or `refresh`: whether a Mooncake update also streams the speculative draft model's weights. Required with `--model-update-config`. |
+| `--model-update-draft-weights` | `retain` or `refresh` controls whether a Mooncake update streams draft weights. Required with `--model-update-config`. Ascend disk weight discard uses `retain` when a draft model is loaded. |
 
 ### Weight versions
 
@@ -324,13 +324,11 @@ Real rollout log probabilities require `--enable-output-logprobs`.
 #### Releasing GPU memory (`--enable-memory-saver`)
 
 Set `--weight-memory-policy cpu_backup|discard` explicitly whenever
-`--enable-memory-saver` is enabled. The host Python package, native host and
-kernel package must be built from matching sources; an older native host is
-rejected before device initialization. See [weight memory policies](../serving/weight-memory.md)
+`--enable-memory-saver` is enabled. See [weight memory policies](../serving/weight-memory.md)
 for the update contract and validation procedure.
 
-`ReleaseMemoryOccupationReqInput` frees GPU memory between rollouts so a
-trainer colocated on the same GPUs can use it;
+`ReleaseMemoryOccupationReqInput` frees device memory between rollouts so a
+trainer colocated on the same devices can use it;
 `ResumeMemoryOccupationReqInput` maps it back. Both take optional `tags`; a
 release without tags frees every region the engine has, a resume without tags
 restores whatever is released:
@@ -340,6 +338,7 @@ restores whatever is released:
 | `kv_cache` | the cache arena's device regions | zeroed; a PD engine registers it with the transfer engine again |
 | `weights` | model and draft parameters, persistent attention/runtime buffers and shared workspaces | parameters use CPU backup or remain invalid until a complete update; frozen drafts and attention/runtime buffers retain CPU backup |
 | `cuda_graph` | the decode CUDA graphs' memory pool | discarded; replays rewrite it |
+| `acl_graph` | the Ascend decode graphs' private memory pool | replays rewrite discarded contents on supported model and backend combinations; other combinations restore a Host backup |
 | `nccl` | NCCL communicator buffers (`ProcessGroupNCCL.suspend`); requires a PyTorch build with suspend support and NCCL 2.29.7 or later | resumed in place |
 
 A release waits until the scheduler is drained, and on a disaggregated
@@ -362,12 +361,62 @@ up with the `weights` tag, retaining their addresses and contents. Other device
 memory, including communication workspaces such as symmetric memory or DeepEP
 buffers and prefill CUDA graph capture pools, stays resident.
 
-With attention DP, every rank must stop admissions and drain before any rank
-releases memory. Send the release to every DP engine concurrently; a release
-itself stops admissions, so a separate pause is unnecessary. A peer explicitly
-paused with `wait` or `abort` may also satisfy the drain. An idle engine that
-has not paused prevents release. After a partial or staggered resume, no DP
-rank forwards until every region released on every rank has been restored.
+On Ascend, a matching native host and Python runtime use protocol 3 to
+coordinate release and resume across the ranks that forward together.
+CUDA and ROCm keep protocol 2 and their existing memory-transition behavior.
+[Weight memory policies](../serving/weight-memory.md#one-update-cycle) describes
+which engines need each call and how to match calls with a transition ID.
+
+Ascend Memory Saver requires protocol 3 and supports single-node TP1, TP2,
+TP4, and TP8 in aggregate serving with greedy chain speculation on eligible
+model/kernel combinations. Its common protocol dependency is the separate,
+open [PR #3397](https://github.com/lightseekorg/tokenspeed/pull/3397). The
+[Ascend Memory Saver user guide](../serving/ascend-memory-saver.md) shows the
+setup and control requests. The dense BF16 Qwen3 target supports
+`--weight-memory-policy discard` with a complete in-place disk or Mooncake SDK
+update. Use `--model-update-draft-weights retain` with disk discard when a
+draft is loaded. The SDK can also refresh eligible draft models in the same
+version. Shared target and draft parameters follow the target policy. On
+Ascend, combined target and draft refresh has been validated with a
+Qwen3-compatible synthetic MTP draft. Native Llama EAGLE3, DFlash and vanilla
+DSpark currently lack the complete in-place weight update contract. Their TP1
+Llama configurations can discard the decode graph pool while backing up
+weights. Graph-pool discard requires audited BF16 MHA paths and
+`--sampling-backend greedy`. DFlash and vanilla DSpark require full attention
+and a verify width from 2 to 4. Qwen3 with fixed-width chain MTP and the
+default paged MHA route checks the registered verify widths before process
+group initialization. DUMMY exercises target verification without draft weights.
+See the [Ascend backend requirements and pool policies](../../tokenspeed-kernel-npu/memory-saver/README.md)
+for the validated CANN and PTA builds and required allocator behavior. Run a
+`ts-host` built from the same TokenSpeed checkout as the Python launcher. Set
+`TOKENSPEED_NPU_MEMORY_SAVER_LIBRARY` to the absolute path of the built Ascend
+allocator library and set `PYTORCH_NPU_ALLOC_CONF=expandable_segments:False`
+before startup. Decode graphs and their virtual addresses stay live across
+release and resume. For a new checkpoint, resume `weights` and `acl_graph`,
+run the complete weight update, then resume `kv_cache` to clear it and resume
+admissions. Under discard, remapping weights leaves them invalid until the
+complete checkpoint is loaded, synchronized, and committed. The Ascend
+decode graph pool discards its contents for audited replay paths. Other paths
+use CPU backup. The HCCL process group and its
+communication buffers stay resident. Releasing `acl_graph` also discards
+the shared target/draft device KV arena, including when graph backing uses CPU
+backup. Graph-only wake leaves KV asleep. Changed-weight updates require
+`flush_cache=true` to clear L2/L3 before parameter writes. Draft overlap remains
+enabled. Ordinary captured HCCL operations use the
+preserved virtual addresses with the default `TORCH_HCCL_ZERO_COPY=0`.
+Explicitly registered communication windows have their own resident storage.
+The
+[Ascend acceptance tests](../../test/runtime/ascend_memory_saver/README.md)
+cover collective replay and per-rank memory accounting. If an Ascend allocator
+transition fails, the serving worker must restart.
+[Current and historical validation results](../serving/ascend-memory-saver-test-report.md)
+record accepted latest-source functional results separately from earlier
+timing components; CPU checks do not qualify physical GPU behavior.
+
+With coordinated attention DP, send each release or resume to every engine
+in the coordination group. Under protocol 3, matching release calls stop
+admissions and drain work before any rank releases memory. Forwarding resumes
+after every region released across the group has been restored.
 
 Queued weight operations finish before a release frees memory. If a PD engine
 is paused with buffered requests, release is refused: resume and drain those
@@ -454,6 +503,22 @@ module fails that update with a clear message rather than failing startup.
 `refresh` streams the target and the speculative draft model (every pipeline
 stage that holds draft weights). Both policies notify the drafter afterwards
 like the distributed update does.
+
+On Ascend, the SDK provider must stage CPU tensors or tensors on the local
+NPU. It must hand the loader ready tensors and keep their storage valid until
+the copies complete. Providers that allocate CUDA tensors or require CUDA at
+initialization need an Ascend-compatible implementation. Both target and any
+refreshed draft must opt in to the Ascend in-place contract. For `refresh`,
+publish both models under the same committed version. Route each chunk to
+its corresponding model in the SDK's target-first list, and send each
+model's independent checkpoint sources. Shared parameters have a single
+writer in the target. A drafter without a model needs only the target stream.
+
+For dense Qwen3 TP, send each rank full-shaped HF tensors for its required
+names. The serving loaders slice and fuse those tensors using the rank's
+layout, including GQA K/V replication and vocabulary padding. Each reader
+validates its own inventory and shapes before rank agreement and post-load
+hooks. See [Weight memory policies](../serving/weight-memory.md).
 
 `flush_cache` and `weight_version` follow the distributed update's rules
 with one default: a flushed Mooncake update publishes `weight_version =

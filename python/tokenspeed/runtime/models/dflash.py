@@ -55,6 +55,7 @@ from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.target_capture import TargetCaptureConfigurator
 from tokenspeed.runtime.models.utils import validate_attention_partition
 from tokenspeed.runtime.utils import add_prefix
+from tokenspeed.runtime.utils.device_stream import is_current_stream_capturing
 from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.spec_block_geometry import read_checkpoint_block_size
 
@@ -315,6 +316,7 @@ def _is_dflash_mla_config(hf_config) -> bool:
 
 class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
     decoder_layer_cls = DFlashDecoderLayer
+    supports_acl_graph_discard = True
 
     @classmethod
     def model_profile(cls, hf_config) -> ModelProfile:
@@ -534,7 +536,7 @@ class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
             or buffer.dtype != template.dtype
             or buffer.device != template.device
         ):
-            if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            if is_current_stream_capturing(template.device):
                 return torch.zeros_like(template)
             self._residual_buffer = torch.zeros_like(template)
             return self._residual_buffer

@@ -65,6 +65,13 @@ def _storage(tensor: torch.Tensor) -> tuple:
     return tensor.device, tensor.untyped_storage().data_ptr()
 
 
+def parameter_layout(model: nn.Module) -> dict[str, tuple]:
+    return {
+        name: _layout(value)
+        for name, value in model.named_parameters(remove_duplicate=False)
+    }
+
+
 @dataclass(frozen=True)
 class PreservedTensor:
     tensor: torch.Tensor
@@ -137,12 +144,7 @@ class WeightMemoryState:
             # Fail at startup if the model cannot describe a complete replacement.
             if not isinstance(model.required_weight_update_names(), set):
                 raise TypeError("Required checkpoint names must be a set")
-            self.parameter_layouts.append(
-                {
-                    name: _layout(value)
-                    for name, value in model.named_parameters(remove_duplicate=False)
-                }
-            )
+            self.parameter_layouts.append(parameter_layout(model))
             for tensor in model.weight_discard_preserved_tensors():
                 if not isinstance(tensor, torch.Tensor):
                     raise TypeError("Preserved model state must contain only tensors")
@@ -180,12 +182,33 @@ class WeightMemoryState:
     def mark_kv_resumed(self) -> None:
         self.kv_released = False
 
-    def release(self, operation: Callable[[], None]) -> None:
+    def check_memory_transition(self, tags: Sequence[str], *, release: bool) -> None:
+        """Check the ordered tags against local state without changing it."""
+        kv_released = self.kv_released
+        for tag in tags:
+            if tag == "kv_cache":
+                if release:
+                    self.require_healthy()
+                    kv_released = True
+                else:
+                    # Remapping discarded weights still requires a complete
+                    # update before KV can resume.
+                    self.before_kv_resume()
+            elif tag == "weights":
+                if release:
+                    self._check_release(kv_released=kv_released)
+                else:
+                    self._check_resume()
+
+    def _check_release(self, *, kv_released: bool) -> None:
         self.require_healthy()
         if not self.resident or self.updating:
             raise RuntimeError("Cannot release unavailable or updating weights")
-        if self.policy == "discard" and not self.kv_released:
+        if self.policy == "discard" and not kv_released:
             raise RuntimeError("Release KV before discarding weights")
+
+    def release(self, operation: Callable[[], None]) -> None:
+        self._check_release(kv_released=self.kv_released)
         self.resident = False
         if self.policy == "discard":
             self.valid = False
@@ -195,10 +218,13 @@ class WeightMemoryState:
             self.failed = True
             raise
 
-    def resume(self, operation: Callable[[], None]) -> None:
+    def _check_resume(self) -> None:
         self.require_healthy()
         if self.resident:
             raise RuntimeError("Weight storage is already resident")
+
+    def resume(self, operation: Callable[[], None]) -> None:
+        self._check_resume()
         try:
             operation()
             with torch.no_grad():
@@ -234,11 +260,7 @@ class WeightMemoryState:
             return
         try:
             for model, expected in zip(self.models, self.parameter_layouts):
-                actual = {
-                    name: _layout(value)
-                    for name, value in model.named_parameters(remove_duplicate=False)
-                }
-                if actual != expected:
+                if parameter_layout(model) != expected:
                     raise RuntimeError(
                         "Weight update changed captured parameter storage"
                     )

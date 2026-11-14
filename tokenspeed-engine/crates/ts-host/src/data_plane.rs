@@ -124,6 +124,12 @@ enum Op {
         payload: Bytes,
         reply: mpsc::SyncSender<Result<(bool, String), String>>,
     },
+    /// Read-only preflight for an ordered release or resume on this rank.
+    CheckMemoryTransition {
+        tags: Vec<String>,
+        release: bool,
+        reply: mpsc::SyncSender<Result<(bool, String), String>>,
+    },
     ReleaseMemory {
         tags: Vec<String>,
         reply: mpsc::SyncSender<Result<(), String>>,
@@ -162,6 +168,7 @@ impl Op {
             Op::CommitWeightUpdate { .. } => "Op::CommitWeightUpdate",
             Op::Profile { .. } => "Op::Profile",
             Op::ReloadForward { .. } => "Op::ReloadForward",
+            Op::CheckMemoryTransition { .. } => "Op::CheckMemoryTransition",
             Op::ReleaseMemory { .. } => "Op::ReleaseMemory",
             Op::ResumeMemory { .. } => "Op::ResumeMemory",
             Op::SnapshotExpertLoad { .. } => "Op::SnapshotExpertLoad",
@@ -535,6 +542,19 @@ impl DataPlane for PythonDataPlane {
         self.ask(|reply| Op::ReloadForward { payload, reply })
     }
 
+    fn check_memory_transition(
+        &mut self,
+        tags: &[String],
+        release: bool,
+    ) -> Result<(bool, String), DataPlaneError> {
+        let tags = tags.to_vec();
+        self.ask(|reply| Op::CheckMemoryTransition {
+            tags,
+            release,
+            reply,
+        })
+    }
+
     fn release_memory(&mut self, tags: &[String]) -> Result<(), DataPlaneError> {
         let tags = tags.to_vec();
         self.ask(|reply| Op::ReleaseMemory { tags, reply })
@@ -679,6 +699,7 @@ fn forward_loop(
                     let _ = reply.send(Err(failure));
                 }
                 Op::CheckWeightUpdate { reply, .. }
+                | Op::CheckMemoryTransition { reply, .. }
                 | Op::UpdateWeights { reply, .. }
                 | Op::Profile { reply, .. }
                 | Op::ReloadForward { reply, .. } => {
@@ -861,6 +882,17 @@ fn run(
         Op::ReloadForward { payload, reply } => {
             let done = plane
                 .call_method1("reload_forward", (PyBytes::new(py, &payload),))
+                .and_then(|result| result.extract())
+                .map_err(python);
+            answer(reply, done)?;
+        }
+        Op::CheckMemoryTransition {
+            tags,
+            release,
+            reply,
+        } => {
+            let done = plane
+                .call_method1("check_memory_transition", (tags, release))
                 .and_then(|result| result.extract())
                 .map_err(python);
             answer(reply, done)?;

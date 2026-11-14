@@ -916,6 +916,22 @@ class ServerArgs:
         self.resolve_kernel_backends()
         self.resolve_cache()
         self.resolve_speculative_decoding()
+        if self.enable_memory_saver and self.device == "npu":
+            from tokenspeed.runtime.utils.ascend_memory_saver_state import (
+                validate_memory_saver_scope,
+            )
+
+            validate_memory_saver_scope(
+                mapping=self.mapping,
+                emulate_rank_zero=self.emulate_rank_zero,
+                disaggregation_mode=self.disaggregation_mode,
+                has_draft_weights=self.speculative_draft_model_path is not None,
+                speculative_draft_tree=self.speculative_draft_tree,
+                speculative_topk=self.speculative_eagle_topk,
+                speculative_sampling=self.enable_speculative_sampling,
+                weight_policy=self.weight_memory_policy,
+                draft_policy=self.model_update_draft_weights,
+            )
         self.resolve_communication()
         self.resolve_numerics()
         self.resolve_disaggregation()
@@ -2561,14 +2577,18 @@ class ServerArgs:
         if self.enable_memory_saver and self.weight_memory_policy is None:
             raise ValueError("--enable-memory-saver requires --weight-memory-policy")
         if self.weight_memory_policy == "discard":
-            if not self.enable_memory_saver or self.model_update_config is None:
-                raise ValueError(
-                    "Weight discard requires memory saver and Model Updater configuration"
-                )
-            if self.model_update_draft_weights not in ("retain", "refresh"):
-                raise ValueError(
-                    "Weight discard requires an explicit draft update policy"
-                )
+            if self.device == "npu":
+                if not self.enable_memory_saver:
+                    raise ValueError("Weight discard requires memory saver")
+            else:
+                if not self.enable_memory_saver or self.model_update_config is None:
+                    raise ValueError(
+                        "Weight discard requires memory saver and Model Updater configuration"
+                    )
+                if self.model_update_draft_weights not in ("retain", "refresh"):
+                    raise ValueError(
+                        "Weight discard requires an explicit draft update policy"
+                    )
             # Quantization is checked against the resolved model config by
             # WeightMemoryState; CLI names alone cannot prove safe regeneration.
             if self.enable_eplb:
@@ -2589,6 +2609,13 @@ class ServerArgs:
             "--model-update-draft-weights": self.model_update_draft_weights,
         }
         if self.model_update_config is None:
+            if (
+                self.device == "npu"
+                and self.enable_memory_saver
+                and self.weight_memory_policy == "discard"
+                and self.model_update_draft_weights == "retain"
+            ):
+                companions.pop("--model-update-draft-weights")
             given = [flag for flag, value in companions.items() if value is not None]
             if given:
                 raise ValueError(f"{', '.join(given)} require --model-update-config")
@@ -4587,7 +4614,7 @@ class ServerArgs:
             default=None,
             help=(
                 "Required with memory saver: back up weights to CPU, or discard "
-                "them until a complete SDK update. Frozen draft weights retain CPU backup."
+                "them until a complete update. Frozen draft weights retain CPU backup."
             ),
         )
         parser.add_argument(
@@ -5084,7 +5111,8 @@ class ServerArgs:
             default=ServerArgs.model_update_draft_weights,
             help="Whether a Mooncake weight update also streams the "
             "speculative draft model's weights: 'retain' updates the target "
-            "only, 'refresh' updates target and draft.",
+            "only, 'refresh' updates target and draft. Ascend disk weight "
+            "discard uses 'retain' when a draft model is loaded.",
         )
 
     @classmethod

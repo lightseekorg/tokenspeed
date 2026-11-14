@@ -501,7 +501,9 @@ def test_the_fused_step_is_never_resolved_inside_a_capture(monkeypatch) -> None:
     Allocation and compilation belong to warmup, so the verdict waits for an
     eager walk.
     """
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setattr(
+        dspark_module, "is_current_stream_capturing", lambda device: True
+    )
     monkeypatch.setattr(
         dspark_module,
         "create_markov_argmax_workspace",
@@ -510,3 +512,15 @@ def test_the_fused_step_is_never_resolved_inside_a_capture(monkeypatch) -> None:
     drafter = _gate_drafter(torch.bfloat16, 32, object())
     assert drafter._resolve_markov_argmax(torch.zeros(3, 16)) is None
     assert not drafter._markov_argmax_resolved
+
+
+def test_cpu_markov_fallback_does_not_query_cuda_capture(monkeypatch) -> None:
+    """The non-CUDA fallback must work without CUDA runtime bindings."""
+
+    def unavailable_cuda():
+        pytest.fail("CPU Markov fallback queried the CUDA capture state")
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", unavailable_cuda)
+    drafter = _gate_drafter(torch.bfloat16, 32, None)
+    assert drafter._resolve_markov_argmax(torch.zeros(3, 16)) is None
+    assert drafter._markov_argmax_resolved

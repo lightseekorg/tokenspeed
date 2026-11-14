@@ -1125,7 +1125,9 @@ def kimi_host_cache():
     owner = object.__new__(PrefillGraph)
     owner.disable = False
     owner.capture_buckets = [_BUCKET]
-    owner.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
+    owner.memory_saver_adapter = TorchMemorySaverAdapter.create(
+        enable=False, device="cpu"
+    )
     owner.num_warmup = 1
     owner._narrowing = None
     owner._expert_load_rows = None
