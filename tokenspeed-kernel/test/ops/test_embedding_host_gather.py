@@ -126,3 +126,71 @@ def test_cuda_mxfp8_row_gather_does_not_recompile_per_batch():
                 table, ids[:tokens, 1], codes[:tokens], scales[:tokens]
             )
     torch.cuda.synchronize()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+def test_cuda_mxfp8_row_gather_sorted_path_matches_with_repeated_ids(index_dtype):
+    # Enough entries to take the sorted path; few table rows so most ids
+    # repeat and each run of equal ids is read once and copied to the rest.
+    generator = torch.Generator().manual_seed(3)
+    table = _mxfp8_table(97, 256, generator).pin_memory()
+    columns = 24
+    tokens = triton_host_gather._SORT_MIN_ROWS // columns + 3
+    ids = torch.randint(0, 97, (tokens, 2, columns), generator=generator)
+    ids[0, 1, 0], ids[5, 1, 7], ids[tokens - 1, 1, columns - 1] = -1, 97, -5
+    indices = ids.to(device="cuda:0", dtype=index_dtype)[:, 1]
+    assert indices.numel() >= triton_host_gather._SORT_MIN_ROWS
+    codes, scales = host_gather.mxfp8_row_gather(table, indices, None, None)
+    expected_codes, expected_scales = _quantized_rows(table, indices)
+    assert torch.equal(codes.view(torch.uint8).cpu(), expected_codes)
+    assert torch.equal(scales.cpu(), expected_scales)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cuda_mxfp8_row_gather_sorted_path_reads_rows_past_2gib():
+    # The sorted path widens its own id load, so it needs its own far-offset
+    # case: enough entries to take it, all on the last two rows of a 2.2 GB
+    # table, which puts the duplicate copies out there too. Only int32 ids
+    # exercise the widening; an int64 id tensor loads wide already. A guard
+    # region of the same size precedes the table, so an offset that wrapped
+    # reads its zeros inside the allocation instead of faulting.
+    rows = (1 << 31) // 264 + 2
+    pool = torch.zeros(2 * rows, 264, dtype=torch.uint8, device="cuda:0")
+    table = pool[rows:]
+    tail = _mxfp8_table(3, 256, torch.Generator().manual_seed(5))
+    table[-2:] = tail[1:].cuda()
+    columns = 2
+    tokens = triton_host_gather._SORT_MIN_ROWS // columns + 1
+    indices = torch.full(
+        (tokens, columns), rows - 1, dtype=torch.int32, device="cuda:0"
+    )
+    indices[::3, 0] = rows - 2
+    assert indices.numel() >= triton_host_gather._SORT_MIN_ROWS
+    codes, scales = host_gather.mxfp8_row_gather(table, indices, None, None)
+    # Table row rows - 1 holds tail row 2, and rows - 2 holds tail row 1.
+    expected_codes, expected_scales = _quantized_rows(tail, indices - (rows - 3))
+    assert torch.equal(codes.view(torch.uint8).cpu(), expected_codes)
+    assert torch.equal(scales.cpu(), expected_scales)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cuda_mxfp8_row_gather_sorted_path_does_not_recompile_per_batch():
+    table = _mxfp8_table(64, 256, torch.Generator().manual_seed(4)).pin_memory()
+    columns = 24
+    base = triton_host_gather._SORT_MIN_ROWS // columns + 1
+    ids = torch.randint(0, 64, (base + 64, 2, columns), device="cuda:0")
+    codes = torch.empty(
+        base + 64, columns * 256, dtype=torch.float8_e4m3fn, device="cuda:0"
+    )
+    scales = torch.empty(base + 64, columns * 8, dtype=torch.uint8, device="cuda:0")
+    host_gather.mxfp8_row_gather(table, ids[:base, 0], codes[:base], scales[:base])
+    with assert_no_triton_compile(
+        triton_host_gather._host_mxfp8_row_gather_kernel,
+        triton_host_gather._copy_duplicate_rows_kernel,
+    ):
+        for tokens in (base + 2, base + 17, base + 33, base + 64):
+            host_gather.mxfp8_row_gather(
+                table, ids[:tokens, 1], codes[:tokens], scales[:tokens]
+            )
+    torch.cuda.synchronize()
