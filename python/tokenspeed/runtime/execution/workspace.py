@@ -102,7 +102,7 @@ class WorkspacePool:
 
     def _new_block(self, nbytes: int) -> torch.Tensor:
         """Tag the initial or grown scratch allocation without changing existing views."""
-        with self._memory_saver.attention_region():
+        with self._memory_saver.named_region("workspace"):
             return torch.empty(nbytes, dtype=torch.uint8, device=self.device)
 
     def allocate(

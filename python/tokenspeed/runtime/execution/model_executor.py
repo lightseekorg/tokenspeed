@@ -148,6 +148,7 @@ from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.hf_transformers_utils import get_context_length
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.server_args import ServerArgs
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
@@ -620,6 +621,9 @@ class ModelExecutor:
     ):
         self.device = config.device
         self.config = config
+        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
+            enable=config.enable_memory_saver
+        )
         self.model_runner = model_runner
         self.sampling_backend = sampling_backend
         self.attn_backend = attn_backend
@@ -649,7 +653,7 @@ class ModelExecutor:
         max_bs = config.max_num_seqs // max(config.data_parallel_size, 1)
 
         spec_num_tokens = config.spec_num_tokens if config.spec_algo is not None else 1
-        with token_to_kv_pool.arena.memory_saver_adapter.attention_region():
+        with self.memory_saver_adapter.named_region("executor_inputs"):
             self.input_buffers = InputBuffers(
                 max_bs=max_bs,
                 max_num_tokens=max(
@@ -678,6 +682,7 @@ class ModelExecutor:
                 ),
                 config.input_vocab_size,
             )
+        with self.memory_saver_adapter.named_region("runtime_states"):
             self.runtime_states = RuntimeStates(
                 req_pool_size=config.max_req_pool_size,
                 input_vocab_size=config.input_vocab_size,
@@ -919,7 +924,7 @@ class ModelExecutor:
 
     def _configure_for_pools(self) -> None:
         """Publish the bound pools to the backends and the model's layers."""
-        with self.token_to_kv_pool.arena.memory_saver_adapter.attention_region():
+        with self.memory_saver_adapter.named_region("attention_state"):
             self.attn_backend.configure_runtime(
                 request_slot_capacity=self.config.max_req_pool_size + 1,
                 cache_group_specs=tuple(self.token_to_kv_pool.arena.cache_group_specs),

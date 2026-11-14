@@ -51,15 +51,28 @@ before the model is built, so it also stays resident across discard.
 With memory saving enabled, attention-backend initialization, fixed workspaces,
 runtime inputs and history, and prefill/decode graph metadata use a separate
 CPU-backed allocation pool. Shared workspace growth uses the same pool.
+Allocation sites use `named_region(name)` to describe their owner:
+
+| Region name | Allocations | Underlying pool |
+| --- | --- | --- |
+| `executor_inputs` | executor inputs and ngram input buffers | `persistent_buffers` |
+| `runtime_states` | request history and runtime state | `persistent_buffers` |
+| `attention_state` | attention backend and graph metadata | `persistent_buffers` |
+| `workspace` | shared scratch allocations, including growth | `persistent_buffers` |
+
+The adapter resolves these aliases centrally. The executor owns its adapter;
+its inputs and runtime states do not depend on the KV arena's adapter.
 These allocations share the `weights` tag, so they are restored before a weight
 update even while KV remains released. They retain their contents and virtual
 addresses under either weight policy; discarding parameters must not discard
 constant tables, pointer tables or kernel semaphores. Existing Tensor views and
 captured graphs remain bound to the same addresses.
 
-The attention pool is separate from the parameter and KV pools because their
-backup policies differ. Nested attention allocation scopes reuse the active
-scope. Communication storage initialized outside managed weight allocations
+The persistent-buffer pool is separate from the parameter and KV pools because
+their backup policies differ. Nested aliases reuse the active underlying pool,
+including when different adapter instances enter them. Region names do not add
+sleep/wake tags or change the KV discard policy.
+Communication storage initialized outside managed weight allocations
 keeps its existing lifetime.
 
 When the `nccl` tag is released, the forward thread drains device work,

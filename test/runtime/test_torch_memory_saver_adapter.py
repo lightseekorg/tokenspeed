@@ -90,9 +90,17 @@ def memory(monkeypatch):
     saver = CpuMemorySaver(allocations)
     monkeypatch.setattr(adapter, "_primary_memory_saver", saver, raising=False)
     monkeypatch.setattr(
-        adapter, "_attention_memory_saver", CpuMemorySaver(allocations), raising=False
+        adapter,
+        "_buffer_memory_savers",
+        {"persistent_buffers": CpuMemorySaver(allocations)},
+        raising=False,
     )
     return saver
+
+
+@pytest.fixture
+def buffers(memory):
+    return adapter._buffer_memory_savers["persistent_buffers"]
 
 
 def test_native_storage_initializes_after_weight_region_and_survives_discard(memory):
@@ -160,17 +168,28 @@ def test_disabled_adapter_initializes_communication_immediately(memory):
     assert outputs[0].item() == 23
 
 
-def test_attention_contents_and_addresses_survive_discarded_weights(memory):
+@pytest.mark.parametrize(
+    "name", ["executor_inputs", "runtime_states", "attention_state", "workspace"]
+)
+def test_named_buffers_preserve_contents_and_addresses_across_discard(
+    memory, buffers, name
+):
     saver = adapter.TorchMemorySaverAdapter.create(enable=True)
-    attention = adapter._attention_memory_saver
+    nested_saver = adapter.TorchMemorySaverAdapter.create(enable=True)
     with saver.region(tag="weights", enable_cpu_backup=False):
         weight = memory.allocate(5)
-    with saver.attention_region():
-        constant = attention.allocate(7)
-        with saver.attention_region():
-            index = attention.allocate(11)
+    with saver.region(tag="kv_cache", enable_cpu_backup=False):
+        kv = memory.allocate(19)
+    with saver.named_region(name):
+        constant = buffers.allocate(7)
+        nested_name = "workspace" if name != "workspace" else "attention_state"
+        with nested_saver.named_region(nested_name):
+            index = buffers.allocate(11)
     addresses = (constant.data_ptr(), index.data_ptr())
 
+    saver.pause(tag="kv_cache")
+    assert kv.item() == 0
+    assert (weight.item(), constant.item(), index.item()) == (5, 7, 11)
     for _ in range(2):
         saver.pause(tag="weights")
         assert weight.item() == constant.item() == index.item() == 0
@@ -180,22 +199,33 @@ def test_attention_contents_and_addresses_survive_discarded_weights(memory):
         assert (constant.data_ptr(), index.data_ptr()) == addresses
 
 
-def test_attention_scope_is_restored_after_failure(memory):
+def test_named_buffer_scope_is_restored_after_failure(memory, buffers):
     saver = adapter.TorchMemorySaverAdapter.create(enable=True)
-    attention = adapter._attention_memory_saver
     with pytest.raises(RuntimeError, match="allocation failed"):
-        with saver.attention_region():
-            raise RuntimeError("allocation failed")
-    with saver.attention_region():
-        constant = attention.allocate(13)
+        with saver.named_region("executor_inputs"):
+            with saver.named_region("workspace"):
+                raise RuntimeError("allocation failed")
+    with saver.named_region("runtime_states"):
+        constant = buffers.allocate(13)
     saver.pause(tag="weights")
     saver.resume(tag="weights")
     assert constant.item() == 13
 
 
-def test_disabled_attention_scope_leaves_allocations_resident(memory):
+@pytest.mark.parametrize(
+    "name", ["executor_inputs", "runtime_states", "attention_state", "workspace"]
+)
+def test_disabled_named_region_leaves_allocations_resident(memory, buffers, name):
     saver = adapter.TorchMemorySaverAdapter.create(enable=False)
-    with saver.attention_region():
-        constant = adapter._attention_memory_saver.allocate(17)
+    with saver.named_region(name):
+        constant = buffers.allocate(17)
     memory.pause(tag="weights")
     assert constant.item() == 17
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_unknown_named_region_is_rejected(memory, enabled):
+    saver = adapter.TorchMemorySaverAdapter.create(enable=enabled)
+    with pytest.raises(KeyError, match="unknown_owner"):
+        with saver.named_region("unknown_owner"):
+            pytest.fail("unknown region entered its allocation scope")

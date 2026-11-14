@@ -1052,7 +1052,7 @@ def _create_target_components(
     )
     if backend is not None:
         return backend, pool
-    with arena.memory_saver_adapter.attention_region():
+    with arena.memory_saver_adapter.named_region("attention_state"):
         if linear_attention is not None:
             backend = _create_hybrid_linear_attn_backend(
                 server_args,
@@ -1129,7 +1129,7 @@ def _create_draft_components(
     )
     if backend is not None:
         return backend, draft_pool
-    with pool.arena.memory_saver_adapter.attention_region():
+    with pool.arena.memory_saver_adapter.named_region("attention_state"):
         if linear_attention is not None:
             backend = _create_hybrid_linear_attn_backend(
                 server_args,
@@ -1569,7 +1569,7 @@ def create_attn_components(
     # their group geometry (and buffer sizing) from the pool's published
     # specs. Every LCM pool publishes a cache contract, so there is no
     # separate contract-marking step.
-    with arena.memory_saver_adapter.attention_region():
+    with arena.memory_saver_adapter.named_region("attention_state"):
         for side_backend, side_pool in (
             (backend, pool),
             (draft_attn_backend, draft_pool),

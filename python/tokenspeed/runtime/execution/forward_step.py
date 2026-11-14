@@ -384,7 +384,7 @@ class ForwardStepRunner:
         )
         # Backends alias their cache_seqlens buffer. Draft backend aliases
         # the drafter-owned draft_seq_lens to keep InputBuffers read-only.
-        with self.memory_saver_adapter.attention_region():
+        with self.memory_saver_adapter.named_region("attention_state"):
             attn_backend.init_cuda_graph_state(
                 self.max_decode_bs,
                 cache_group_specs=tuple(token_to_kv_pool.arena.cache_group_specs),

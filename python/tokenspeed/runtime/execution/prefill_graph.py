@@ -614,7 +614,9 @@ class PrefillGraph:
         self._encoders.clear()
         self._decoders.clear()
         self._captured_load_tracker = self.token_to_kv_pool.layerwise_load_tracker
-        with self.token_to_kv_pool.arena.memory_saver_adapter.attention_region():
+        with self.token_to_kv_pool.arena.memory_saver_adapter.named_region(
+            "attention_state"
+        ):
             self.attn_backend.init_prefill_graph_state(
                 max_num_tokens=max(self.capture_buckets),
                 max_bs=int(self.config.max_num_seqs)
