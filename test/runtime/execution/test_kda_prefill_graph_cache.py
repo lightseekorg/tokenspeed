@@ -1016,7 +1016,8 @@ def kimi_host_cache():
     """A Kimi-K3 TP8 pool with a Host L2 tier, the device handle that runs a
     plan's cache ops on it, and a bare prefill graph owner over the pool, which
     captures a test's forward (its ``_run_inner``) in one bucket after the
-    Host cache executor exists, as a server does.
+    Host cache executor exists, as a server does. Memory saving is disabled
+    through the real adapter so capture still enters its named allocation scope.
 
     Page 1 of every cache group holds random bytes (finite floats in the first
     KDA layer's recurrent state) and is stored to Host page 1, which a test
@@ -1044,6 +1045,9 @@ def kimi_host_cache():
         HybridLinearAttnBackend,
     )
     from tokenspeed.runtime.layers.attention.backends.state.kda import KdaAttnBackend
+    from tokenspeed.runtime.utils.torch_memory_saver_adapter import (
+        TorchMemorySaverAdapter,
+    )
 
     class WriteBackOp:
         # A stream-ordered store of page ``src`` of each group to ``dst``.
@@ -1121,6 +1125,7 @@ def kimi_host_cache():
     owner = object.__new__(PrefillGraph)
     owner.disable = False
     owner.capture_buckets = [_BUCKET]
+    owner.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
     owner.num_warmup = 1
     owner._narrowing = None
     owner._expert_load_rows = None

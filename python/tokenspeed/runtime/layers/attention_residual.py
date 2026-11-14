@@ -37,7 +37,7 @@ from torch import nn
 
 
 class PrecisionRMSNorm(nn.Module):
-    """Apply optional input scaling and learned RMSNorm with an explicit output dtype.
+    """Apply learned RMSNorm with an explicit output dtype.
 
     ``mean_by_reciprocal`` takes the mean square as a multiply by FP32
     ``1 / hidden_size`` instead of a correctly rounded divide, as the norm's
@@ -48,7 +48,6 @@ class PrecisionRMSNorm(nn.Module):
         self,
         hidden_size: int,
         eps: float,
-        pre_affine: bool,
         output_dtype: torch.dtype,
         elementwise_affine: bool,
         mean_by_reciprocal: bool,
@@ -64,18 +63,12 @@ class PrecisionRMSNorm(nn.Module):
             if elementwise_affine
             else None
         )
-        self.pre_weight = (
-            nn.Parameter(torch.ones(hidden_size, dtype=torch.bfloat16))
-            if pre_affine
-            else None
-        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return rmsnorm_precision(
             x,
             self.weight,
             self.eps,
-            self.pre_weight,
             self.output_dtype,
             mean_by_reciprocal=self.mean_by_reciprocal,
         )
@@ -201,8 +194,7 @@ class AttentionResidual(nn.Module):
 def norm_gains(norms: tuple[PrecisionRMSNorm, ...]) -> torch.Tensor | None:
     """The [norms, hidden] gains when the norms can run inside the mix kernel."""
     if any(
-        norm.pre_weight is not None
-        or norm.weight is None
+        norm.weight is None
         or norm.output_dtype != torch.bfloat16
         or norm.eps != norms[0].eps
         for norm in norms

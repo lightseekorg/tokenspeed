@@ -607,7 +607,7 @@ def test_head_norms_match_the_separate_clips_and_norm_bitwise(
         triton_l2_clip(q, 22.6, 1e-6, q_scale, tau),
         triton_l2_clip(k, 22.6, 1e-6, None, None),
         (
-            rmsnorm_precision(v, None, 1e-6, None, v.dtype, mean_by_reciprocal=False)
+            rmsnorm_precision(v, None, 1e-6, v.dtype, mean_by_reciprocal=False)
             if value_norm
             else v
         ),

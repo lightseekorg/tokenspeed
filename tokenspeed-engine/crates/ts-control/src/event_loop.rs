@@ -652,6 +652,51 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         Ok(())
     }
 
+    /// Serve `phases` of the engine's own requests before a frontend is
+    /// attached: each phase on its own, until every rank is idle, then the
+    /// prefix caches it filled are dropped. The requests take the serving
+    /// path -- admission, planning, the data plane and the commits -- so the
+    /// first requests a client sends find that path prepared. Every rank
+    /// calls this with the same phases; the replica's first member submits
+    /// them, as it does a frontend's requests. Their outputs go to the
+    /// frontend, which drops them while none is attached.
+    ///
+    /// Returns whether a stop was agreed meanwhile; the loop must not
+    /// [`Self::run`] then.
+    pub fn warm_up(
+        &mut self,
+        phases: Vec<Vec<EngineRequest>>,
+        stop: &AtomicBool,
+    ) -> Result<bool, LoopError> {
+        for requests in phases {
+            let mut submitted = if self.owns_frontend() {
+                requests
+            } else {
+                Vec::new()
+            };
+            loop {
+                let received = std::mem::take(&mut submitted);
+                if self.round_with(stop.load(Ordering::Relaxed), received)? {
+                    return Ok(true);
+                }
+                if self.converge(self.idle() && self.dp_idle)? {
+                    break;
+                }
+            }
+            while !self.clear_cache()? {
+                if self.round(stop.load(Ordering::Relaxed))? {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// The frontend, for attaching one after [`Self::warm_up`].
+    pub fn frontend_mut(&mut self) -> &mut F {
+        &mut self.frontend
+    }
+
     fn owns_frontend(&self) -> bool {
         self.ranks.replica.index() == 0
     }
@@ -684,6 +729,16 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     /// One round, with this rank's stop request. Returns whether the ranks
     /// agreed to stop after it.
     pub fn round(&mut self, stop_requested: bool) -> Result<bool, LoopError> {
+        self.round_with(stop_requested, Vec::new())
+    }
+
+    /// A round whose replica-first member also receives `submitted`, the
+    /// engine's own requests, ahead of the frontend's.
+    fn round_with(
+        &mut self,
+        stop_requested: bool,
+        submitted: Vec<EngineRequest>,
+    ) -> Result<bool, LoopError> {
         // A profile keeps the spans of a round that did something: a loop
         // waiting on a transfer spins through empty rounds.
         let held_spans = profile::hold();
@@ -692,9 +747,11 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         let mut released: Vec<String> = Vec::new();
 
         let received = if self.owns_frontend() {
-            let wait = (self.idle() && self.dp_idle).then_some(IDLE_WAIT);
+            let wait = (submitted.is_empty() && self.idle() && self.dp_idle).then_some(IDLE_WAIT);
             let _span = profile::span("Frontend::receive");
-            self.frontend.receive(wait)
+            let mut received = submitted;
+            received.extend(self.frontend.receive(wait));
+            received
         } else {
             Vec::new()
         };
@@ -721,7 +778,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         }
         // Every round on every rank, so the attention-DP ranks agree on the
         // flushes and weight operations they run together.
-        let (memory_resident, release_pending) = self.gate()?;
+        let (memory_resident, release_pending, nccl_release_pending) = self.gate()?;
         let forward_allowed = memory_resident && !self.controls.forward_blocked();
 
         // The storage tick and the cache-op acknowledgments advance at the
@@ -844,7 +901,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             }
         }
         // A deferred pause or release resolves once the scheduler drained.
-        self.finish_drain(release_pending)?;
+        self.finish_drain(release_pending, nccl_release_pending)?;
         let replies = self.controls.take_replies();
         busy |= !replies.is_empty();
         for reply in replies {
@@ -1594,8 +1651,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     /// flushes, and the weight operation at the queue's head once every
     /// attention-DP rank holds one of the same kind. One blocking weight
     /// operation per round. Returns whether every rank's memory is resident
-    /// and whether any rank has a pending memory release.
-    fn gate(&mut self) -> Result<(bool, bool), LoopError> {
+    /// and whether any rank has a pending memory release or NCCL release.
+    fn gate(&mut self) -> Result<(bool, bool, bool), LoopError> {
         let _span = profile::span("EventLoop::gate");
         let flushes = self.controls.take_flushes();
         let head = self.controls.weight_head().and_then(control::gate_code);
@@ -1611,6 +1668,10 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         let mut all_have_internal = internal.is_some();
         let mut memory_resident = !self.controls.memory_released();
         let mut release_pending = matches!(self.controls.drain(), Some(Drain::Release(_)));
+        let mut nccl_release_pending = matches!(
+            self.controls.drain(),
+            Some(Drain::Release(tags)) if tags.iter().any(|tag| tag == "nccl")
+        );
         if let Some(world) = &self.ranks.dp {
             let code = head.unwrap_or(0);
             let internal_code = internal.unwrap_or(0);
@@ -1624,7 +1685,12 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 internal_code,
                 -internal_code,
                 i64::from(!memory_resident),
-                i64::from(release_pending),
+                // MAX propagates NCCL intent even while a peer is already asleep.
+                if nccl_release_pending {
+                    2
+                } else {
+                    i64::from(release_pending)
+                },
                 key,
                 -key,
                 if reload_ready { -1 } else { 0 },
@@ -1634,6 +1700,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             // until every peer can join its device collectives again.
             memory_resident = reduced[7] == 0;
             release_pending = reduced[8] != 0;
+            nccl_release_pending = reduced[8] == 2;
             want_flush = reduced[0] > 0;
             all_have_head = reduced[1] == -1;
             let reload_heads = reduced[2] == RELOAD_GATE_CODE || -reduced[3] == RELOAD_GATE_CODE;
@@ -1707,7 +1774,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         } else if let Some(op) = ready_internal {
             self.complete_internal_op(op)?;
         }
-        Ok((memory_resident, release_pending))
+        Ok((memory_resident, release_pending, nccl_release_pending))
     }
 
     /// Whether any member of this rank's replica says yes.
@@ -1760,6 +1827,16 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     /// ranks before the reply. A weight load reaching here passed the
     /// all-rank admission in [`Self::gate`].
     fn complete_weight_op(&mut self, op: ControlRequest, flushed: bool) -> Result<(), LoopError> {
+        if let ControlRequest::ResumeMemoryOccupation(resume) = &op {
+            let tags = resume
+                .tags
+                .as_deref()
+                .expect("queued resume has normalized tags");
+            self.data_plane.resume_memory(tags)?;
+            tracing::info!(?tags, "memory resumed");
+            self.controls.finish_resume(tags);
+            return Ok(());
+        }
         let flush_refused = control::wants_flush(&op) && !flushed;
         let (success, message) = match &op {
             ControlRequest::RebalanceExperts(_) => {
@@ -2014,14 +2091,24 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     }
 
     /// Resolve a local pause once drained; release memory only once every
-    /// rank has stopped admissions and drained its work.
-    fn finish_drain(&mut self, release_pending: bool) -> Result<(), LoopError> {
+    /// rank has stopped admissions and drained its work; NCCL also needs intent.
+    fn finish_drain(
+        &mut self,
+        release_pending: bool,
+        nccl_release_pending: bool,
+    ) -> Result<(), LoopError> {
         let drained = self.controls.admit_blocked() && self.drained();
+        let nccl_ready = !nccl_release_pending
+            || matches!(
+                self.controls.drain(),
+                Some(Drain::Release(tags)) if tags.iter().any(|tag| tag == "nccl")
+            );
         // Every rank joins, even without a local drain. An idle but unpaused
         // peer may admit work next round and still needs our idle forwards.
         let all_paused = release_pending
             && self.converge(
-                drained
+                nccl_ready
+                    && drained
                     && !self.controls.weights_busy()
                     && self.transfers_idle()
                     && self.cache_ops.open() == 0,

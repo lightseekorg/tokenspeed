@@ -23,7 +23,7 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel_amd._triton import gl, gluon, tl
+from tokenspeed_kernel_amd._triton import compile_ahead, gl, gluon, tl
 
 cdna4 = gl.amd.cdna4
 _BLOCK_H = gl.constexpr(8192)
@@ -214,10 +214,15 @@ def attn_res_rmsnorm_gfx950(
     output_rms_weight: torch.Tensor,
     output_eps: float,
     num_valid_blocks: int,
+    warmup: bool,
     delta: torch.Tensor | None = None,
     block_write_idx: int = -1,
 ) -> torch.Tensor:
-    """Mix AttnRes candidates and apply the following RMSNorm in one launch."""
+    """Mix AttnRes candidates and apply the following RMSNorm in one launch.
+
+    ``warmup`` prepares both prefill and small-batch warp counts without
+    executing additional residual updates.
+    """
     tokens, hidden = layer_residual.shape
     if layer_residual.dtype != torch.bfloat16 or hidden not in {
         4096,
@@ -260,7 +265,7 @@ def attn_res_rmsnorm_gfx950(
     output = torch.empty_like(layer_residual)
     num_warps = 4 if tokens >= 256 or num_valid_blocks <= 1 else 8
     delta_tensor = layer_residual if delta is None else delta
-    gluon_attn_res_fwd_gfx950[(tokens,)](
+    launch_args = (
         layer_residual,
         delta_tensor,
         block_residual,
@@ -268,6 +273,8 @@ def attn_res_rmsnorm_gfx950(
         score_rms_weight,
         output_rms_weight,
         output,
+    )
+    launch_kwargs = dict(
         stride_layer_t=layer_residual.stride(0),
         stride_delta_t=delta_tensor.stride(0),
         stride_block_t=block_residual.stride(0),
@@ -283,6 +290,17 @@ def attn_res_rmsnorm_gfx950(
         NUM_WARPS=num_warps,
         num_warps=num_warps,
     )
+    if warmup:
+        # Graph capture can fuse this layer, so it need not visit the ordinary
+        # small-batch kernel that an eager serving tail reaches later.
+        warp_counts = (4,) if num_valid_blocks <= 1 else (4, 8)
+        for warps in warp_counts:
+            compile_ahead(
+                gluon_attn_res_fwd_gfx950,
+                *launch_args,
+                **(launch_kwargs | {"NUM_WARPS": warps, "num_warps": warps}),
+            )
+    gluon_attn_res_fwd_gfx950[(tokens,)](*launch_args, **launch_kwargs)
     return output
 
 

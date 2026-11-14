@@ -268,6 +268,7 @@ if [ -n "${FLASHINFER_PYTHON_SPEC}" ]; then
         0.7.2) FLASHINFER_CUBIN_SHA256="31704fa5b2562d459d34c67cee9e80e0abb96c82f89943d542276d5a92c88079" ;;
         0.7.2.post1) FLASHINFER_CUBIN_SHA256="1998c7006bcc06ee5dd3208a682af247382c6710d6b370a961381262c04c11f0" ;;
         0.7.3) FLASHINFER_CUBIN_SHA256="115b96065fa2dcc1674c74fcb0544ec2890a6fa4a8519b2251d1f6ab3d780093" ;;
+        0.7.4) FLASHINFER_CUBIN_SHA256="8af62986f52e8cd29d1eaef7ecc63c441c1c214bd33175019a8f548a128bc2e2" ;;
         *) echo "No SHA256 pinned for flashinfer-cubin ${FLASHINFER_VERSION}" >&2; exit 1 ;;
     esac
     # Nightlies version as X.Y.Z.devYYYYMMDD but tag as nightly-vX.Y.Z-YYYYMMDD,

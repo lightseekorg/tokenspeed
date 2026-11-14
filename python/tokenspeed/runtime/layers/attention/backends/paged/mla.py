@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
+from tokenspeed_kernel.ops.attention.dsv4._triton.dcp import normalize_dcp_partials
 from tokenspeed_kernel.ops.attention.mla import (
     mla_decode_with_kvcache,
     mla_extend_with_kvcache,
@@ -32,7 +33,10 @@ from tokenspeed_kernel.ops.attention.mla import (
     mla_use_absorbed_extend,
     supports_mla_decode_query_blocks,
 )
-from tokenspeed_kernel.selection import KernelPlan
+from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
+    kvp_decode_visible_lengths,
+)
+from tokenspeed_kernel.selection import KernelPlan, NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
@@ -49,6 +53,16 @@ from tokenspeed.runtime.layers.attention.chunk import (
 )
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+from tokenspeed.runtime.layers.attention.dcp.comm import (
+    combine_attention_partials,
+    gather_query_heads_lent,
+)
+from tokenspeed.runtime.layers.attention.dcp.metadata import (
+    CompactDCPLayout,
+    CompactDCPMetadata,
+    refresh_dcp_page_table_metadata,
+)
+from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     MLA_PAGE_SIZE,
 )
@@ -61,6 +75,15 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
 logger = get_colorful_logger(__name__)
+
+# The gfx950 FP8-cache decode kernels that return an LSE take at most 16 heads.
+_DCP_KERNEL_MAX_HEADS = 16
+
+
+def _dcp_kernel_heads(heads: int) -> int:
+    """The gathered heads one DCP decode launch row takes: the widest divisor
+    of ``heads`` the LSE-returning kernels run."""
+    return max(h for h in range(1, _DCP_KERNEL_MAX_HEADS + 1) if heads % h == 0)
 
 
 @dataclass(kw_only=True)
@@ -116,7 +139,14 @@ class MLAAttnBackend(PagedAttentionBackend):
     """Unified MLA leaf routed through tokenspeed_kernel MLA APIs."""
 
     supports_mla_projected_value_decode = True
+    supports_mla_dcp = True
     default_kernel_page_size = MLA_PAGE_SIZE
+    # A DSA wrapper's dense delegate shares the KVP config but is never handed
+    # cache geometry; only a configured leaf deals its pages over owners.
+    kvp_block_granularity: int | None = None
+    kvp_virtual_block_count: int | None = None
+    dcp_metadata: CompactDCPMetadata | None = None
+    _dcp_visible_lens_buf: torch.Tensor | None = None
     # Decode forwards layer.sliding_window_size as window_left.
     supports_layer_sliding_window: bool = True
 
@@ -212,6 +242,141 @@ class MLAAttnBackend(PagedAttentionBackend):
         self._block_page_table_buf: torch.Tensor | None = None
         self._block_seq_lens_buf: torch.Tensor | None = None
 
+        self.kvp_group = tuple(config.kvp_group)
+        self.kvp_rank = config.kvp_rank
+
+    def configure_runtime(
+        self,
+        *,
+        block_granularity: int,
+        virtual_block_count: int,
+        shard_count: int,
+        **kwargs,
+    ) -> None:
+        super().configure_runtime(**kwargs)
+        if shard_count == 1:
+            return
+        if shard_count != len(self.kvp_group):
+            raise ValueError("MLA cache and KVP topology disagree")
+        if block_granularity is None or block_granularity % self.kernel_page_size:
+            raise ValueError("MLA ownership blocks must contain whole kernel pages")
+        if self.batch_invariant or self.draft_block_decode:
+            raise ValueError(
+                "MLA DCP decode supports neither batch-invariant numerics nor "
+                "block drafts"
+            )
+        if not self._dcp_decode_kernel_registered():
+            raise ValueError(
+                "MLA DCP decode needs an mla_decode_with_kvcache kernel that "
+                f"returns the LSE for a {self.data_type} cache on this platform"
+            )
+        self.kvp_block_granularity = block_granularity
+        self.kvp_virtual_block_count = virtual_block_count
+        # Partials merge as latent rows, so the value projection follows the merge.
+        self.supports_mla_projected_value_decode = False
+
+    def _dcp_decode_kernel_registered(self) -> bool:
+        """Whether the registry holds a decode kernel returning the LSE the
+        partials merge needs, for the head groups ``_forward_dcp_decode``
+        launches and either query dtype that call may reach."""
+        heads = _dcp_kernel_heads(self.num_local_heads * len(self.kvp_group))
+        traits = {
+            "batch_size": 1,
+            "q_len": 1,
+            "num_q_heads": heads,
+            "qk_nope_head_dim": self.qk_nope_head_dim,
+            "kv_lora_rank": self.kv_lora_rank,
+            "qk_rope_head_dim": self.qk_rope_head_dim,
+            "page_size": self.kernel_page_size,
+            "noncausal_block_size": 1,
+            "block_on_query_axis": True,
+            "logit_cap": False,
+            "return_lse": True,
+            "sliding_window": False,
+        }
+        for q_dtype in dict.fromkeys((self.q_data_type, self.data_type)):
+            signature = format_signature(
+                q=dense_tensor_format(q_dtype),
+                kv_cache=dense_tensor_format(self.data_type),
+            )
+            try:
+                select_kernel(
+                    "attention",
+                    "mla_decode_with_kvcache",
+                    signature,
+                    traits=traits,
+                    solution=self.kernel_solution,
+                )
+            except NoKernelFoundError:
+                continue
+            return True
+        return False
+
+    @property
+    def _dcp_active(self) -> bool:
+        return self.kvp_block_granularity is not None
+
+    def init_cuda_graph_state(self, max_bs: int) -> None:
+        super().init_cuda_graph_state(max_bs)
+        if self._dcp_active:
+            self._init_dcp_state()
+
+    def _init_dcp_state(self) -> None:
+        """Allocate the compact owned-page table over the persistent decode
+        buffers; every refresh rewrites it in place for graph replay."""
+        self._dcp_visible_lens_buf = torch.zeros(
+            (self.page_table_buf.shape[0], 1),
+            dtype=torch.int32,
+            device=self.page_table_buf.device,
+        )
+        self.dcp_metadata = refresh_dcp_page_table_metadata(
+            page_table=self.page_table_buf,
+            virtual_block_count=self.kvp_virtual_block_count,
+            degree=len(self.kvp_group),
+            rank=self.kvp_rank,
+            layout=CompactDCPLayout(
+                seq_lens=self.seq_lens_buf,
+                page_size=self.kernel_page_size,
+                block_granularity=self.kvp_block_granularity,
+                visible_lens=self._dcp_visible_lens_buf,
+            ),
+            previous=None,
+        )
+
+    def _refresh_dcp_metadata(self, bs: int) -> None:
+        """Compact rows [0, bs) of this rank's owned pages.
+
+        Supplying query endpoints keeps every allocated page, so a draft step
+        that only advances seq_lens maps through the same owned-page prefix.
+        """
+        if self.dcp_metadata is None:
+            raise RuntimeError("MLA DCP metadata has not been initialized")
+        visible = self._dcp_visible_lens_buf[:bs]
+        visible.copy_(self.seq_lens_buf[:bs, None])
+        refresh_dcp_page_table_metadata(
+            page_table=self.page_table_buf[:bs],
+            virtual_block_count=self.kvp_virtual_block_count,
+            degree=len(self.kvp_group),
+            rank=self.kvp_rank,
+            layout=CompactDCPLayout(
+                seq_lens=self.seq_lens_buf[:bs],
+                page_size=self.kernel_page_size,
+                block_granularity=self.kvp_block_granularity,
+                visible_lens=visible,
+            ),
+            previous=self.dcp_metadata.slice_requests(0, bs),
+        )
+
+    def cache_placement(self, layer: PagedAttention) -> CachePlacement | None:
+        if not self._dcp_active:
+            return None
+        return CachePlacement(
+            block_granularity=self.kvp_block_granularity,
+            virtual_block_count=self.kvp_virtual_block_count,
+            group=self.kvp_group,
+            rank=self.kvp_rank,
+        )
+
     def _takes_query_blocks(
         self, num_q_heads: int, q_len: int, sliding_window: bool
     ) -> bool:
@@ -256,10 +421,18 @@ class MLAAttnBackend(PagedAttentionBackend):
         self.chunked_prefill_metadata = None
         self._block_page_table_buf = None
         self._block_seq_lens_buf = None
+        self.kvp_block_granularity = None
+        self.kvp_virtual_block_count = None
+        self.dcp_metadata = None
+        self._dcp_visible_lens_buf = None
 
     def _should_use_absorbed_cached_extend(
         self, *, max_extend_seq_len: int, max_extend_prefix_len: int
     ) -> bool:
+        if self._dcp_active:
+            # The paged extend kernel would read only this rank's pages; the
+            # chunked prefix replay gathers the history from its owners.
+            return False
         if self.batch_invariant:
             # Initial and cached prefill need the same query representation
             # as decode, independent of prefix length or batch geometry.
@@ -298,7 +471,6 @@ class MLAAttnBackend(PagedAttentionBackend):
         **kwargs,
     ) -> None:
         reject_query_shard(query_shard, "MLAAttnBackend")
-        del page_table_cpu
         if not (forward_mode.is_extend_or_mixed() or forward_mode.is_idle()):
             raise RuntimeError(
                 "MLA decode metadata goes through refresh_decode_metadata; "
@@ -312,6 +484,7 @@ class MLAAttnBackend(PagedAttentionBackend):
                 extend_seq_lens=extend_seq_lens[:num_extends],
                 extend_seq_lens_cpu=extend_seq_lens_cpu[:num_extends],
                 page_table=page_table[:num_extends],
+                page_table_cpu=page_table_cpu,
             )
 
         # Target mixed/idle batches carry decode requests whose metadata this
@@ -342,6 +515,7 @@ class MLAAttnBackend(PagedAttentionBackend):
         extend_seq_lens: torch.Tensor,
         extend_seq_lens_cpu: torch.Tensor,
         page_table: torch.Tensor,
+        page_table_cpu: torch.Tensor | None,
     ):
         extend_seq_lens_cpu_list = [int(x) for x in extend_seq_lens_cpu.tolist()]
         cum_extend_seq_lens = torch.zeros(
@@ -363,21 +537,23 @@ class MLAAttnBackend(PagedAttentionBackend):
             cum_seq_lens_kv = torch.zeros_like(cum_extend_seq_lens)
             torch.cumsum(seq_lens, dim=0, out=cum_seq_lens_kv[1:])
 
-        # The host chunk boundaries only feed the distributed prefix-history
-        # gather (KVP), which this backend does not support: it reads every
-        # history row from its own pool, so the boundaries are not needed here.
         (
             chunked_loop_num,
             chunk_kv_indices_list,
             chunked_seq_len,
             cu_chunked_seq_len,
             max_chunk_len_per_loop,
-            _chunk_bounds_cpu,
+            chunk_bounds_cpu,
         ) = build_chunked_prefill_metadata_arrays(
             extend_prefix_lens,
             extend_prefix_lens_cpu,
             page_table,
             self.kernel_page_size,
+        )
+        self._prepare_prefix_history(
+            chunk_kv_indices_list,
+            page_table_cpu=page_table_cpu,
+            chunk_bounds_cpu=chunk_bounds_cpu,
         )
 
         metadata = MLAPrefillMetadata(
@@ -501,7 +677,13 @@ class MLAAttnBackend(PagedAttentionBackend):
             return
         # clamp_min(1) is the identity, so the verify clamp is unconditional.
         self.seq_lens_buf[:bs].copy_(seq_lens[:bs].clamp_min(metadata.q_len_per_req))
-        self.page_table_buf[:bs].copy_(page_table[:bs])
+        num_pages = page_table.shape[1]
+        self.page_table_buf[:bs, :num_pages].copy_(page_table[:bs])
+        if self._dcp_active:
+            # The compact table keeps every allocated page, so a stale column
+            # of a wider earlier table must not survive as a reserve page.
+            self.page_table_buf[:bs, num_pages:].zero_()
+            self._refresh_dcp_metadata(bs)
         self.forward_decode_metadata = metadata
 
     # ------------------------------------------------------------------
@@ -532,6 +714,15 @@ class MLAAttnBackend(PagedAttentionBackend):
 
         window_left = int(getattr(layer, "sliding_window_size", -1) or -1)
         noncausal_block_size = self.spec_num_tokens if self.block_decode_active else 1
+
+        if self._dcp_active:
+            if window_left >= 0 or layer.logit_cap != 0.0:
+                raise NotImplementedError(
+                    "MLA DCP decode supports neither sliding windows nor logit caps"
+                )
+            return self._forward_dcp_decode(
+                q, layer, token_to_kv_pool, bs, q_len_per_req, num_extends
+            )
 
         if self.block_decode_active:
             if q_len_per_req == noncausal_block_size and self._takes_query_blocks(
@@ -644,6 +835,92 @@ class MLAAttnBackend(PagedAttentionBackend):
         output = self._unwrap_output(result)
         if value_weight is not None:
             return output.reshape(-1, value_weight.shape[0] * value_weight.shape[2])
+        return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+    def _forward_dcp_decode(
+        self,
+        q: torch.Tensor,
+        layer: PagedAttention,
+        token_to_kv_pool,
+        bs: int,
+        q_len_per_req: int,
+        num_extends: int,
+    ) -> torch.Tensor:
+        """Attend this rank's owned pages with every KVP rank's query heads,
+        then merge the partials back onto the TP-local heads.
+
+        Every query row runs as its own kernel row against its local causal
+        length: a multi-query causal mask would subtract the query's global
+        offset from a local length.
+        """
+        metadata = self.forward_decode_metadata
+        dcp = self.dcp_metadata.slice_requests(num_extends, num_extends + bs)
+        heads = layer.tp_q_head_num * len(self.kvp_group)
+        # Heads attend independently, so a wide gathered group folds onto the
+        # batch axis for the kernels that return an LSE.
+        kernel_heads = _dcp_kernel_heads(heads)
+        groups = heads // kernel_heads
+        # Every query row's local causal length, and its kernel length (at
+        # least one) for each folded head group. Draft catch-up stores the
+        # first query's visible KV length; target verify stores the last
+        # one's and backs up.
+        local_lengths = torch.empty(
+            (bs * q_len_per_req,), device=q.device, dtype=torch.int32
+        )
+        cache_seqlens = torch.empty(
+            (bs * q_len_per_req * groups,), device=q.device, dtype=torch.int32
+        )
+        kvp_decode_visible_lengths(
+            dcp.page_prefix,
+            metadata.seq_lens[num_extends : num_extends + bs],
+            offset=0 if self.is_draft else 1 - q_len_per_req,
+            queries=q_len_per_req,
+            groups=groups,
+            page_size=self.kernel_page_size,
+            local_lengths=local_lengths,
+            cache_lengths=cache_seqlens,
+        )
+
+        query = gather_query_heads_lent(
+            q.view(-1, layer.tp_q_head_num, layer.head_dim), self.kvp_group
+        )
+        rows = query.shape[0]
+        query = query.reshape(rows * groups, 1, kernel_heads, layer.head_dim)
+        page_table = dcp.local_page_table.repeat_interleave(
+            q_len_per_req * groups, dim=0
+        )
+        kv_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
+        if self.data_type != kv_cache.dtype:
+            kv_cache = kv_cache.to(self.data_type)
+        kv_cache = kv_cache.view(-1, self.kernel_page_size, 1, self.kv_cache_dim)
+        output, lse = mla_decode_with_kvcache(
+            q=query,
+            kv_cache=kv_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            max_seqlen_k=self.max_context_len,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            softmax_scale=layer.scaling,
+            return_lse=True,
+            solution=self.kernel_solution,
+        )
+        output, local_lse = normalize_dcp_partials(
+            output.reshape(rows, heads, self.kv_lora_rank),
+            lse.reshape(rows, heads),
+            local_lengths,
+            None,
+        )
+        output = combine_attention_partials(
+            output,
+            local_lse,
+            group=self.kvp_group,
+            rank=self.kvp_rank,
+            sink=None,
+            keep_all_heads=False,
+            lend_records=True,
+        )
         return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_extend(

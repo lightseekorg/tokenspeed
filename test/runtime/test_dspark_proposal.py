@@ -66,7 +66,10 @@ def test_draft_prefill_capture_uses_the_resolved_prefill_gate(
     executor.forward_step = Mock(disable=decode_disabled)
     executor.prefill_graph = Mock(disable=prefill_disabled)
     # Explicit: a bare Mock answers truthily, so the gate below would hold anyway.
-    executor.drafter = Mock(captures_prefill_graph=declares)
+    # DSpark records no extend-round graphs (the base drafter's empty plan).
+    executor.drafter = Mock(
+        captures_prefill_graph=declares, **{"extend_graph_plan.return_value": {}}
+    )
     model_executor.ModelExecutor.capture_graphs(
         executor, entries=None, observer=NULL_MEMORY_DELTA_OBSERVER
     )

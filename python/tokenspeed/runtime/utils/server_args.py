@@ -770,6 +770,7 @@ class ServerArgs:
     enforce_eager: bool = False
     disable_cuda_graph_padding: bool = False
     disable_autotune: bool = False
+    enable_startup_requests: bool = False
     enable_cudagraph_gc: bool = False
     disable_nccl_nvls: bool = False
     disable_symm_mem: bool = False
@@ -1578,6 +1579,7 @@ class ServerArgs:
         # Handle KVStore settings.
         self._handle_kvstore()
         self.validate_cache_options()
+        self.validate_startup_requests()
         self.resolve_retraction_snapshot_options()
 
     @property
@@ -2446,6 +2448,22 @@ class ServerArgs:
             raise ValueError(
                 "L3 storage (--kvstore-storage-backend) requires Host L2; "
                 "unset --disable-kvstore"
+            )
+
+    def validate_startup_requests(self):
+        if not self.enable_startup_requests:
+            return
+        # A disaggregated node's requests need a peer node, and dropping the
+        # startup prefixes would delete an L3 store's shared namespace.
+        if self.disaggregation_mode != "null":
+            raise ValueError(
+                "--enable-startup-requests is not supported with "
+                "--disaggregation-mode"
+            )
+        if self.kvstore_storage_backend is not None:
+            raise ValueError(
+                "--enable-startup-requests is not supported with "
+                "--kvstore-storage-backend"
             )
 
     def validate_cache_options(self):
@@ -4411,6 +4429,16 @@ class ServerArgs:
             "the library's heuristic fallback.",
         )
         parser.add_argument(
+            "--enable-startup-requests",
+            action="store_true",
+            default=ServerArgs.enable_startup_requests,
+            help="Before registering with the frontend, serve a few requests of "
+            "the engine's own (one short, one of a full prefill chunk, then a "
+            "full batch) through the ordinary serving path, so the first client "
+            "requests do not compile what that path reaches. Not supported with "
+            "--disaggregation-mode or --kvstore-storage-backend.",
+        )
+        parser.add_argument(
             "--enable-cudagraph-gc",
             action="store_true",
             help="Enable garbage collection during CUDA graph capture. If disabled (default), GC is frozen during capture to speed up the process.",
@@ -4516,14 +4544,15 @@ class ServerArgs:
             "--enable-drafter-prefill-graph",
             action="store_true",
             default=ServerArgs.enable_drafter_prefill_graph,
-            help="Also replay the speculative drafter's work inside a prefill "
-            "forward from CUDA graphs: the draft's extend step per prefill token "
-            "bucket at each exact request count of "
-            "--prefill-graph-capture-batch-sizes (unset: the fewest requests the "
-            "bucket fits in the context length), its decode steps per request "
-            "count, with attention at eager breaks. Only pure-extend forwards at a "
-            "captured request count replay; the others draft eagerly. Needs the "
-            "prefill graph on one rank (no TP, EP, PP or attention DP) and a chain "
+            help="Also replay the speculative drafter's extend step inside a "
+            "prefill forward from CUDA graphs, per prefill token bucket at each "
+            "exact request count of --prefill-graph-capture-batch-sizes (unset: "
+            "the fewest requests the bucket fits in the context length), with "
+            "attention at eager breaks; the draft's decode steps that follow the "
+            "extend step replay from graphs even without this switch. Only "
+            "pure-extend forwards at a captured request count replay; the others "
+            "run the step eagerly. The switch needs the prefill graph on one rank "
+            "(no TP, EP, PP or attention DP) and a chain "
             "EAGLE-style drafter (no --speculative-eagle-topk > 1, no "
             "--enable-speculative-sampling) whose draft model declares support "
             "(Qwen4-Exp MTP without index_share_for_mtp_iteration); other launches "

@@ -1094,7 +1094,7 @@ def rel_mha_head_norms(
                 v
                 if value_norm_eps is None
                 else rmsnorm_precision(
-                    v, None, value_norm_eps, None, v.dtype, mean_by_reciprocal=False
+                    v, None, value_norm_eps, v.dtype, mean_by_reciprocal=False
                 )
             ),
             l2_clip(rel, rel_threshold, clip_eps, rel_scale, output_scale),

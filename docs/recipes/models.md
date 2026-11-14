@@ -729,6 +729,12 @@ Notes:
   aggregated role the default bucket ladder takes about 7.5 GB more per GPU,
   out of the KV cache, and adds about 7 minutes to startup;
   `--prefill-graph-capture-token-sizes` captures fewer buckets for less.
+- The NVIDIA command below captures each prefill bucket for 1 and for up to
+  64 requests (`--prefill-graph-capture-batch-sizes 1 64`), so a prefill of
+  several requests also runs its KDA layers inside the graph instead of at
+  eager breaks. On 2 GB300 nodes, this cut the time-to-first-token of 2 to 64
+  concurrent short prompts by 40% to 55%, for about 0.7 GB less KV cache per
+  GPU and 2 to 3 more minutes of startup.
 - The Kimi-K3.1 DSpark draft (`Inferact/Kimi-K3.1-Pro-DSpark-preview`)
   proposes 7 tokens per step, so it takes
   `--speculative-num-draft-tokens 8`. Unlike Kimi-K3's draft, it attends
@@ -760,6 +766,7 @@ tokenspeed serve moonshotai/Kimi-K3.1-Pro \
   --mm-encoder-tp-mode data \
   --moe-backend flashinfer_trtllm \
   --max-num-seqs 64 \
+  --prefill-graph-capture-batch-sizes 1 64 \
   --speculative-algorithm DSPARK \
   --speculative-draft-model-path Inferact/Kimi-K3.1-Pro-DSpark-preview \
   --speculative-num-draft-tokens 8 \
@@ -777,7 +784,7 @@ step than the EAGLE3 draft. The index-K planes make a K3.1 cache block about
 of 50K input and 500 output tokens run at once.
 
 ```bash
-tokenspeed serve moonshotai/Kimi-K3.1-Pro \
+GPU_MAX_HW_QUEUES=2 tokenspeed serve moonshotai/Kimi-K3.1-Pro \
   --served-model-name kimi-k3.1 \
   --trust-remote-code \
   --max-model-len 65536 \
@@ -789,6 +796,7 @@ tokenspeed serve moonshotai/Kimi-K3.1-Pro \
   --drafter-attention-backend gluon \
   --max-num-seqs 64 \
   --disable-kvstore \
+  --enable-startup-requests \
   --host 0.0.0.0 \
   --port 8000
 ```
@@ -803,6 +811,18 @@ tokenspeed serve moonshotai/Kimi-K3.1-Pro \
   `mla` backend select the kernels.
 - Prefill runs eager on gfx950: the DSA backend replays prefill CUDA graphs on
   NVIDIA only.
+- `GPU_MAX_HW_QUEUES=2` gives each stream priority one hardware queue per
+  compute pipe. With ROCm's default of 4, two queues share a pipe, so
+  prefill's high-priority side kernels can wait behind the forward's GEMMs.
+- `--enable-startup-requests` has the engine serve a few requests of its own
+  before it reports ready, so eager prefill and the request bookkeeping are
+  compiled before the first client request instead of during it.
+- Optionally, add `--kv-parallel-size 8 --decode-context-parallel-size 8` for
+  long contexts or many concurrent requests. Each GPU then stores one eighth of
+  every request's full-attention pages, so about 55 requests of 50K input and
+  500 output tokens run at once, and decode attends each GPU's share of the
+  selected keys. See
+  [KV parallelism](../serving/parallelism.md#kv-parallelism).
 - The Kimi-K3 AMD note on greedy sampling applies.
 
 ## GLM5 / GLM5.2

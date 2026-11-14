@@ -36,13 +36,13 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
+  metadata:
     if: github.repository == 'lightseekorg/tokenspeed'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     outputs:
       nightly: ${{ steps.metadata.outputs.nightly }}
-      version: ${{ steps.metadata.outputs.version }}
+      version_date: ${{ steps.metadata.outputs.version_date }}
       kernel_version: ${{ steps.metadata.outputs.kernel_version }}
       source_sha: ${{ steps.metadata.outputs.source_sha }}
     steps:
@@ -137,12 +137,68 @@ jobs:
               fi
             fi
           fi
-          version=$(python .github/scripts/prepare-tokenspeed-nightly.py \
-            . "$version_date" "$kernel_version")
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "version_date=${version_date}" >> "$GITHUB_OUTPUT"
           echo "kernel_version=${kernel_version}" >> "$GITHUB_OUTPUT"
           echo "source_sha=${source_sha}" >> "$GITHUB_OUTPUT"
-          echo "TokenSpeed ${version} requires tokenspeed-kernel==${kernel_version}"
+
+  engine:
+    needs: metadata
+    uses: ./.github/workflows/release-tokenspeed-engine.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      mode: ${{ needs.metadata.outputs.nightly == 'true' && github.event_name != 'schedule' && !inputs.publish_github && 'dry-run' || 'publish' }}
+      release_type: post
+      version_date: ${{ needs.metadata.outputs.version_date }}
+      source_sha: ${{ needs.metadata.outputs.source_sha }}
+    secrets:
+      LIGHTSEEK_BOT_TOKEN: ${{ secrets.LIGHTSEEK_BOT_TOKEN }}
+
+  build:
+    needs: [metadata, engine]
+    runs-on: ubuntu-latest
+    outputs:
+      nightly: ${{ needs.metadata.outputs.nightly }}
+      version: ${{ steps.version.outputs.version }}
+      kernel_version: ${{ needs.metadata.outputs.kernel_version }}
+      source_sha: ${{ needs.metadata.outputs.source_sha }}
+    steps:
+      - name: Checkout release tooling
+        uses: actions/checkout@v4
+
+      - name: Verify engine version and checkout shared source
+        env:
+          SOURCE_SHA: ${{ needs.metadata.outputs.source_sha }}
+          ENGINE_VERSION: ${{ needs.engine.outputs.version }}
+        run: |
+          # A skipped reusable workflow must not allow runtime publication.
+          test -n "$ENGINE_VERSION"
+          # The kernel's commit can predate changes to the release tooling.
+          cp .github/scripts/prepare-tokenspeed-nightly.py "$RUNNER_TEMP/prepare-tokenspeed-nightly.py"
+          if [ "$SOURCE_SHA" != "$GITHUB_SHA" ]; then
+            git fetch --depth 1 origin "$SOURCE_SHA"
+            git checkout --detach "$SOURCE_SHA"
+          fi
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Pin nightly dependencies
+        if: needs.metadata.outputs.nightly == 'true'
+        id: version
+        env:
+          VERSION_DATE: ${{ needs.metadata.outputs.version_date }}
+          KERNEL_VERSION: ${{ needs.metadata.outputs.kernel_version }}
+          ENGINE_VERSION: ${{ needs.engine.outputs.version }}
+        run: |
+          python -m pip install packaging
+          version=$(python "$RUNNER_TEMP/prepare-tokenspeed-nightly.py" \
+            . "$VERSION_DATE" "$KERNEL_VERSION" "$ENGINE_VERSION")
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
 
       - name: Build distributions
         run: |

@@ -64,15 +64,17 @@ def probe_arena_parent_blocks(
     context_len: int,
     capture_batch_sizes: Sequence[int] | None,
     decoder_requests: int,
+    drafter_requests: int,
 ) -> int:
     """The parent-block floor a probe arena has to clear.
 
     Each fabricated extend row -- the autotune dummy prefill and every captured
-    prefill bucket, including configured capture batch sizes and the requests
+    prefill bucket, including configured capture batch sizes, the requests
     a narrowing model's decoder ladder fabricates (``decoder_requests``, 0 for
-    other models) -- takes a distinct page; decode capture uses only the null
-    page. A family whose verify scratch is the pool itself keeps the serving
-    concurrency instead (``verify_scratch_in_pool``).
+    other models) and the requests of a chain drafter's extend-round decode
+    steps (``drafter_requests``) -- takes a distinct page; decode capture uses
+    only the null page. A family whose verify scratch is the pool itself keeps
+    the serving concurrency instead (``verify_scratch_in_pool``).
     """
     from tokenspeed.runtime.execution.prefill_graph import dummy_batch_size
 
@@ -80,6 +82,7 @@ def probe_arena_parent_blocks(
         dummy_batch_size(max_forward_tokens, context_len),
         max(capture_batch_sizes or (0,)),
         decoder_requests,
+        drafter_requests,
     )
 
 

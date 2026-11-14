@@ -2053,8 +2053,12 @@ def prepare_k3_all_reduce_buffers(
     routed_hidden_size: int,
     max_num_tokens: int,
     states: dict[tuple[int, ...], "K3IrisState"],
+    pull_exchange_max_bytes: int = 0,
 ) -> bool:
-    """Prepare and retain each node-local group's Iris buffers before capture."""
+    """Prepare and retain each node-local group's Iris buffers before capture.
+
+    ``pull_exchange_max_bytes`` sizes the attention group's pull exchange for
+    the KVP decode's gathers and records exchange (zero omits it)."""
     if not current_platform().is_cdna4:
         return False
 
@@ -2084,6 +2088,7 @@ def prepare_k3_all_reduce_buffers(
         attnres_max_rows,
         enable_lamport,
         moe_tail_max_rows,
+        pull_exchange_max_bytes=0,
     ):
         if not backend.can_prepare_all_reduce_buffers(group, torch.bfloat16):
             return False
@@ -2097,6 +2102,13 @@ def prepare_k3_all_reduce_buffers(
                 or state.all_reduce.producer_direct_max_numel
                 < producer_direct_max_numel
                 or state.enable_lamport != enable_lamport
+                or (
+                    pull_exchange_max_bytes
+                    and (
+                        state.pull_exchange is None
+                        or state.pull_exchange.max_bytes < pull_exchange_max_bytes
+                    )
+                )
                 or (
                     attnres_max_rows
                     and (
@@ -2127,8 +2139,11 @@ def prepare_k3_all_reduce_buffers(
             dtype=torch.bfloat16,
             device=torch.device(f"cuda:{torch.cuda.current_device()}"),
             all_reduce=backend.iris.state(group, torch.bfloat16),
+            pull_exchange_max_bytes=pull_exchange_max_bytes,
         )
         backend.iris.install(group, state.all_reduce)
+        if state.pull_exchange is not None:
+            backend.iris.install_pull_exchange(group, state.pull_exchange)
         states[group] = state
         return True
 
@@ -2180,6 +2195,7 @@ def prepare_k3_all_reduce_buffers(
             attnres_max_rows=attnres_max_rows,
             enable_lamport=enable_lamport,
             moe_tail_max_rows=moe_tail_max_rows,
+            pull_exchange_max_bytes=pull_exchange_max_bytes,
         )
     if mapping.moe.tp_ep_size > 1 and not groups_are_equal:
         prepared = (
@@ -4858,6 +4874,7 @@ class KimiLinearForCausalLM(BaseCausalLM):
             routed_hidden_size=routed_hidden_size,
             max_num_tokens=max_num_tokens,
             states=self.model.iris_states,
+            pull_exchange_max_bytes=self._kvp_decode_exchange_bytes(),
         )
         attn_state = self.model.iris_states.get(self.mapping.attn.tp_group)
         moe_state = self.model.iris_states.get(self.mapping.moe.tp_ep_group)
@@ -4877,6 +4894,25 @@ class KimiLinearForCausalLM(BaseCausalLM):
             prepared = moe_comm.prepare(max_num_tokens) or prepared
         prepared = self._prepare_decode_chain() or prepared
         return bool(shared_mlps) or prepared
+
+    def _kvp_decode_exchange_bytes(self) -> int:
+        """The most bytes a rank sends in one KVP decode exchange of any
+        attention layer, where the KVP group is the attention TP group whose
+        K3 state holds the exchange."""
+        attn = self.mapping.attn
+        if attn.kvp_size == 1 or attn.kvp_group != attn.tp_group:
+            return 0
+        max_rows = max(_decode_graph_rows(), default=0)
+        return max(
+            (
+                layer.self_attn.kvp_decode_exchange_bytes(max_rows)
+                for layer in self.model.layers
+                if hasattr(
+                    getattr(layer, "self_attn", None), "kvp_decode_exchange_bytes"
+                )
+            ),
+            default=0,
+        )
 
     def _prepare_decode_chain(self) -> bool:
         """Bind the decode MoE chain where every MoE layer's execution plan allows it

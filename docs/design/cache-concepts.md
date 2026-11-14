@@ -445,7 +445,8 @@ boundary or not. The one interior checkpoint is opt-in
 prompt's last page boundary before its replay tail also stores the state at
 that boundary into a third block of its rows (`STATE_CHECKPOINT_SLOT`,
 `InForwardStateCheckpoints`) -- the GDN scan emits it from inside the kernel,
-the conv and PLE windows are the inputs before it -- which is then published
+KDA scans the row's tokens before it a second time, the conv and PLE windows
+are the inputs before it -- which is then published
 like a natural checkpoint
 ([Scheduler §1.2](scheduler.md#12-state-groups-two-slots-natural-checkpoints)).
 Publication also registers every non-replayable sliding window at that

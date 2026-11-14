@@ -112,7 +112,7 @@ def vocab_ids_to_padded_shards(
 
 def _norm(width: int, eps: float) -> PrecisionRMSNorm:
     # The draft's reference norms divide by a compile-time width: a reciprocal multiply.
-    return PrecisionRMSNorm(width, eps, False, torch.bfloat16, True, True)
+    return PrecisionRMSNorm(width, eps, torch.bfloat16, True, True)
 
 
 class Inkling2MTPAttention(nn.Module):
@@ -263,7 +263,6 @@ def _add_norm(
         residual,
         norm.weight,
         norm.eps,
-        norm.pre_weight,
         norm.output_dtype,
         torch.bfloat16,
         mean_by_reciprocal=norm.mean_by_reciprocal,

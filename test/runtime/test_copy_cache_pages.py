@@ -1067,6 +1067,7 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
                                 snapshot_slot=1,
                                 transfers=(CacheTransfer(0, 1, z, "", 0),),
                                 source_tier=(HostTier.L2,),
+                                admission_id=1,
                             )
                         ],
                     )

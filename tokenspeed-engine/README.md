@@ -110,6 +110,15 @@ and `yes`, case-insensitive, matching dynamo's `DYN_LOG_USE_LOCAL_TZ`.
 
 ## Releasing Python wheels
 
+**Build and Release TokenSpeed** first builds, tests and publishes an engine
+post release to the wheel repository, then builds and publishes TokenSpeed.
+Both use the same source commit; for a nightly this is the kernel nightly's
+commit. TokenSpeed nightlies pin the actual engine version returned by the
+release workflow, including any post-date advancement. Stable TokenSpeed
+releases retain their existing engine dependency range. These automatic
+engine releases do not upload to PyPI. A TokenSpeed nightly dry run also
+builds and tests the engine without publishing either package.
+
 Use **Release TokenSpeed Engine** in GitHub Actions. Select `dry-run` to
 build and test wheels, or `publish` on `main` to upload them. Choose a
 `release_type` (`post` by default):
