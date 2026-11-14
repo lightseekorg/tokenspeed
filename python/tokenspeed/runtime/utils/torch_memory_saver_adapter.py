@@ -29,8 +29,16 @@ try:
     import torch_memory_saver
 
     _primary_memory_saver = torch_memory_saver.TorchMemorySaver()
+    # A separate CUDA MemPool prevents allocator block reuse from mixing
+    # discardable weights/KV with attention metadata that must survive sleep.
+    _attention_memory_saver = torch_memory_saver.TorchMemorySaver()
 except ImportError:
     pass
+
+
+_inside_attention_region = ContextVar(
+    "tokenspeed_inside_attention_region", default=False
+)
 
 
 _communication_initializers: ContextVar[list[Callable[[], None]] | None] = ContextVar(
@@ -64,6 +72,10 @@ class TorchMemorySaverAdapter(ABC):
     def region(self, tag: str | None = None, enable_cpu_backup: bool = False):
         raise NotImplementedError
 
+    def attention_region(self):
+        """Allocate persistent attention buffers for address-preserving sleep/wake."""
+        raise NotImplementedError
+
     def cuda_graph(self, graph, *, pool, stream, tag: str):
         """Capture context for ``graph``: ``torch.cuda.graph`` whose private
         memory pool, when the saver is enabled, lands in the pausable region
@@ -79,6 +91,23 @@ class TorchMemorySaverAdapter(ABC):
 
 
 class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
+    @contextmanager
+    def attention_region(self):
+        # The native pause/resume API operates on process-wide tags. Restore
+        # before weight updates, even when KV is still paused. Back up values:
+        # some buffers contain constant tables, pointers and kernel semaphores.
+        # A backend can construct or grow the shared WorkspacePool. TMS disallows
+        # nested regions; allocations in this case already have the right owner.
+        if _inside_attention_region.get():
+            yield
+            return
+        token = _inside_attention_region.set(True)
+        try:
+            with _attention_memory_saver.region(tag="weights", enable_cpu_backup=True):
+                yield
+        finally:
+            _inside_attention_region.reset(token)
+
     def configure_subprocess(self):
         return torch_memory_saver.configure_subprocess()
 
@@ -124,6 +153,10 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
 
 
 class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):
+    @contextmanager
+    def attention_region(self):
+        yield
+
     @contextmanager
     def configure_subprocess(self):
         yield

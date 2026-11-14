@@ -152,6 +152,10 @@ from tokenspeed.runtime.cache.l2.sizing import (
     RetractionPoolRequest,
     tail_lcm_blocks_per_request,
 )
+from tokenspeed.runtime.distributed.cuda_stack import (
+    restore_cuda_stack,
+    trim_cuda_stack,
+)
 from tokenspeed.runtime.distributed.nccl_suspend import (
     resume_nccl_communicators,
     suspend_nccl_communicators,
@@ -405,6 +409,7 @@ class DeviceHandle:
         # Resolved here, on the building thread, whose current device the
         # distributed init set: torch starts every new thread on device 0.
         self._forward_device = _thread_device(executor.device)
+        self._awake_cuda_stack_limit: int | None = None
         # The compact Host cache -- the L2 prefix tier, the retraction
         # snapshot pool, or both -- or None with neither. Behind the handle
         # for the same reason the pools are: its submit path launches
@@ -785,6 +790,19 @@ class DeviceHandle:
         self.settle()
         self._executor.device_module.synchronize()
 
+    def empty_cache(self) -> None:
+        """Release eager cuBLAS workspaces and allocator blocks after GPU work drains."""
+        if self._forward_device.type == "cuda" and self._executor.config.enforce_eager:
+            # Graphs may retain these addresses; eager GEMMs acquire new workspaces lazily.
+            with allow_host_sync(
+                "release eager cuBLAS workspaces after device work drains"
+            ):
+                self.synchronize()
+                clear = getattr(torch._C, "_cuda_clearCublasWorkspaces", None)
+                if clear is not None:
+                    clear()
+        self._executor.device_module.empty_cache()
+
     def prepare_kv_release(self) -> None:
         """Quiesce everything that can touch the KV arena before it is unmapped.
 
@@ -839,13 +857,19 @@ class DeviceHandle:
             self._weight_memory.mark_kv_resumed()
 
     def suspend_nccl(self) -> None:
-        """Free the NCCL communicators' buffers; they stay usable after resume."""
-        self.settle()
+        """Drain GPU work and release NCCL buffers, allocator cache and the CUDA stack."""
+        self.synchronize()
         suspend_nccl_communicators()
+        self.empty_cache()
+        if self._forward_device.type == "cuda":
+            self._awake_cuda_stack_limit = trim_cuda_stack()
 
     def resume_nccl(self) -> None:
         """Restore the NCCL communicators suspended by :meth:`suspend_nccl`."""
         self.settle()
+        if self._awake_cuda_stack_limit is not None:
+            restore_cuda_stack(self._awake_cuda_stack_limit)
+            self._awake_cuda_stack_limit = None
         resume_nccl_communicators()
 
     def run_remote_prefill_landing(

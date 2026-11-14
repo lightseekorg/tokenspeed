@@ -58,7 +58,7 @@ def nccl_suspend_supported() -> bool:
 
 
 def _nccl_backends() -> list:
-    """The initialized NCCL backends of every process group, once each."""
+    """Existing NCCL backends, including cached split communicators, once each."""
     if not (
         dist.is_available()
         and dist.is_initialized()
@@ -77,7 +77,12 @@ def _nccl_backends() -> list:
             continue
         if not isinstance(backend, dist.ProcessGroupNCCL):
             continue
-        if not backend._is_initialized() or id(backend) in seen:
+        if id(backend) in seen:
+            continue
+        # A split communicator owns buffers before its first collective. _comm_ptr
+        # waits for that cached communicator and returns zero for an unused device.
+        cached_comm = getattr(backend, "_comm_ptr", None)
+        if not backend._is_initialized() and not (cached_comm and cached_comm()):
             continue
         seen.add(id(backend))
         backends.append(backend)
@@ -85,7 +90,7 @@ def _nccl_backends() -> list:
 
 
 def suspend_nccl_communicators() -> int:
-    """Suspend every initialized NCCL communicator; return how many."""
+    """Suspend every existing NCCL communicator; return how many."""
     backends = _nccl_backends()
     for backend in backends:
         backend.suspend()
@@ -94,7 +99,7 @@ def suspend_nccl_communicators() -> int:
 
 
 def resume_nccl_communicators() -> int:
-    """Resume every initialized NCCL communicator; return how many."""
+    """Resume every existing NCCL communicator; return how many."""
     backends = _nccl_backends()
     for backend in backends:
         backend.resume()

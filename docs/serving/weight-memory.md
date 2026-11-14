@@ -46,6 +46,30 @@ Expert placement state (load counters and, for all-to-all EP under a static
 dispatch algorithm, the per-rank dispatch map) is allocated with the placement
 before the model is built, so it also stays resident across discard.
 
+## Persistent attention and runtime buffers
+
+With memory saving enabled, attention-backend initialization, fixed workspaces,
+runtime inputs and history, and prefill/decode graph metadata use a separate
+CPU-backed allocation pool. Shared workspace growth uses the same pool.
+These allocations share the `weights` tag, so they are restored before a weight
+update even while KV remains released. They retain their contents and virtual
+addresses under either weight policy; discarding parameters must not discard
+constant tables, pointer tables or kernel semaphores. Existing Tensor views and
+captured graphs remain bound to the same addresses.
+
+The attention pool is separate from the parameter and KV pools because their
+backup policies differ. Nested attention allocation scopes reuse the active
+scope. Communication storage initialized outside managed weight allocations
+keeps its existing lifetime.
+
+When the `nccl` tag is released, the forward thread drains device work,
+suspends existing communicators, clears allocator caches and lowers the current
+CUDA context's thread-stack limit. The original limit is restored before NCCL
+resumes. Explicit `NCCL_CUMEM_ENABLE` and `CUDA_MODULE_LOADING` settings are
+preserved by the launcher. This does not destroy workers, contexts or process
+groups. CUDA eager execution also clears PyTorch's cuBLAS workspaces; graph
+execution retains those workspaces because captured kernels may refer to them.
+
 ## Allocator runtime requirements
 
 The allocator must recognize managed pointers when they are freed outside their

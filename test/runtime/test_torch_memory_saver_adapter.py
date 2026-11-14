@@ -21,27 +21,32 @@
 """CPU checks for managed versus resident native allocation scopes."""
 
 from contextlib import contextmanager
+from test.ci_system.ci_register import register_cuda_ci
 
 import pytest
 import torch
 
 from tokenspeed.runtime.utils import torch_memory_saver_adapter as adapter
 
+register_cuda_ci(est_time=5, suite="runtime-1gpu")
+
 
 class CpuMemorySaver:
     """Stand in for the unavailable CUDA allocator, retaining region semantics."""
 
-    def __init__(self):
+    def __init__(self, allocations):
         self.active = False
         self.tag = None
-        self.allocations = []
+        self.cpu_backup = False
+        self.allocations = allocations
+        self.snapshots = {}
 
     @contextmanager
     def region(self, *, tag, enable_cpu_backup):
-        del enable_cpu_backup
         assert not self.active
         self.active = True
         self.tag = tag
+        self.cpu_backup = enable_cpu_backup
         try:
             yield
         finally:
@@ -61,19 +66,32 @@ class CpuMemorySaver:
 
     def allocate(self, value):
         tensor = torch.tensor([value], dtype=torch.int32)
-        self.allocations.append((self.tag if self.active else None, tensor))
+        self.allocations.append(
+            (self.tag if self.active else None, tensor, self.active and self.cpu_backup)
+        )
         return tensor
 
     def pause(self, *, tag):
-        for allocation_tag, tensor in self.allocations:
+        for allocation_tag, tensor, cpu_backup in self.allocations:
             if allocation_tag == tag:
+                if cpu_backup:
+                    self.snapshots[tensor.data_ptr()] = tensor.clone()
                 tensor.zero_()
+
+    def resume(self, *, tag):
+        for allocation_tag, tensor, cpu_backup in self.allocations:
+            if allocation_tag == tag and cpu_backup:
+                tensor.copy_(self.snapshots.pop(tensor.data_ptr()))
 
 
 @pytest.fixture
 def memory(monkeypatch):
-    saver = CpuMemorySaver()
+    allocations = []
+    saver = CpuMemorySaver(allocations)
     monkeypatch.setattr(adapter, "_primary_memory_saver", saver, raising=False)
+    monkeypatch.setattr(
+        adapter, "_attention_memory_saver", CpuMemorySaver(allocations), raising=False
+    )
     return saver
 
 
@@ -140,3 +158,44 @@ def test_disabled_adapter_initializes_communication_immediately(memory):
         assert outputs[0].item() == 23
     memory.pause(tag="weights")
     assert outputs[0].item() == 23
+
+
+def test_attention_contents_and_addresses_survive_discarded_weights(memory):
+    saver = adapter.TorchMemorySaverAdapter.create(enable=True)
+    attention = adapter._attention_memory_saver
+    with saver.region(tag="weights", enable_cpu_backup=False):
+        weight = memory.allocate(5)
+    with saver.attention_region():
+        constant = attention.allocate(7)
+        with saver.attention_region():
+            index = attention.allocate(11)
+    addresses = (constant.data_ptr(), index.data_ptr())
+
+    for _ in range(2):
+        saver.pause(tag="weights")
+        assert weight.item() == constant.item() == index.item() == 0
+        saver.resume(tag="weights")
+        assert weight.item() == 0
+        assert (constant.item(), index.item()) == (7, 11)
+        assert (constant.data_ptr(), index.data_ptr()) == addresses
+
+
+def test_attention_scope_is_restored_after_failure(memory):
+    saver = adapter.TorchMemorySaverAdapter.create(enable=True)
+    attention = adapter._attention_memory_saver
+    with pytest.raises(RuntimeError, match="allocation failed"):
+        with saver.attention_region():
+            raise RuntimeError("allocation failed")
+    with saver.attention_region():
+        constant = attention.allocate(13)
+    saver.pause(tag="weights")
+    saver.resume(tag="weights")
+    assert constant.item() == 13
+
+
+def test_disabled_attention_scope_leaves_allocations_resident(memory):
+    saver = adapter.TorchMemorySaverAdapter.create(enable=False)
+    with saver.attention_region():
+        constant = adapter._attention_memory_saver.allocate(17)
+    memory.pause(tag="weights")
+    assert constant.item() == 17

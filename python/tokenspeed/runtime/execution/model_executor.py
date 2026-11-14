@@ -649,41 +649,48 @@ class ModelExecutor:
         max_bs = config.max_num_seqs // max(config.data_parallel_size, 1)
 
         spec_num_tokens = config.spec_num_tokens if config.spec_algo is not None else 1
-        self.input_buffers = InputBuffers(
-            max_bs=max_bs,
-            max_num_tokens=max(
-                config.chunked_prefill_size, max_bs * config.output_length
-            ),
-            state_write_padding_pool_index=config.max_req_pool_size,
-            device=self.device,
-            reads_state_checkpoints=config.state_checkpoint_in_forward,
-        )
-        # Group-keyed zeroing requests carry scheduler (virtual) block IDs; this
-        # rank's position in the KVP group selects the pages it owns.
-        self._cache_kvp_rank = model_runner.mapping.attn.kvp_rank
-        ngram_context = engram_context_len(model_runner.model_config.hf_text_config)
-        if ngram_context and (config.pp_size != 1 or config.overlap_schedule_depth > 1):
-            raise NotImplementedError(
-                "Engram input history requires PP=1 and in-flight depth <= 1"
+        with token_to_kv_pool.arena.memory_saver_adapter.attention_region():
+            self.input_buffers = InputBuffers(
+                max_bs=max_bs,
+                max_num_tokens=max(
+                    config.chunked_prefill_size, max_bs * config.output_length
+                ),
+                state_write_padding_pool_index=config.max_req_pool_size,
+                device=self.device,
+                reads_state_checkpoints=config.state_checkpoint_in_forward,
             )
-        self.input_buffers.init_ngram_buffers(
-            ngram_context,
-            model_runner.model.get_ngram_hash_parameters() if ngram_context else None,
-            config.input_vocab_size,
-        )
-        self.runtime_states = RuntimeStates(
-            req_pool_size=config.max_req_pool_size,
-            input_vocab_size=config.input_vocab_size,
-            vocab_size=config.vocab_size,
-            device=self.device,
-            output_length=config.output_length,
-        )
-        self.runtime_states.init_ngram_state(ngram_context)
-        self.runtime_states.init_request_token_history(
-            config.physical_context_len
-            if model_runner.model_config.requires_request_token_history
-            else 0
-        )
+            # Group-keyed zeroing requests carry scheduler (virtual) block IDs; this
+            # rank's position in the KVP group selects the pages it owns.
+            self._cache_kvp_rank = model_runner.mapping.attn.kvp_rank
+            ngram_context = engram_context_len(model_runner.model_config.hf_text_config)
+            if ngram_context and (
+                config.pp_size != 1 or config.overlap_schedule_depth > 1
+            ):
+                raise NotImplementedError(
+                    "Engram input history requires PP=1 and in-flight depth <= 1"
+                )
+            self.input_buffers.init_ngram_buffers(
+                ngram_context,
+                (
+                    model_runner.model.get_ngram_hash_parameters()
+                    if ngram_context
+                    else None
+                ),
+                config.input_vocab_size,
+            )
+            self.runtime_states = RuntimeStates(
+                req_pool_size=config.max_req_pool_size,
+                input_vocab_size=config.input_vocab_size,
+                vocab_size=config.vocab_size,
+                device=self.device,
+                output_length=config.output_length,
+            )
+            self.runtime_states.init_ngram_state(ngram_context)
+            self.runtime_states.init_request_token_history(
+                config.physical_context_len
+                if model_runner.model_config.requires_request_token_history
+                else 0
+            )
         # Sized like InputBuffers.max_bs so the padded graph-bucket bs fits.
         self.nan_guard = NanGuard.create(
             config.enable_nan_detection,
@@ -912,24 +919,25 @@ class ModelExecutor:
 
     def _configure_for_pools(self) -> None:
         """Publish the bound pools to the backends and the model's layers."""
-        self.attn_backend.configure_runtime(
-            request_slot_capacity=self.config.max_req_pool_size + 1,
-            cache_group_specs=tuple(self.token_to_kv_pool.arena.cache_group_specs),
-            cache_group_page_counts=_cache_arena_attr(
-                self.token_to_kv_pool, "cache_group_page_counts", None
-            ),
-        )
-        if self.draft_attn_backend is not None:
-            self.draft_attn_backend.configure_runtime(
-                cache_group_specs=tuple(
-                    _cache_arena_attr(
-                        self.draft_token_to_kv_pool, "cache_group_specs", ()
-                    )
-                ),
+        with self.token_to_kv_pool.arena.memory_saver_adapter.attention_region():
+            self.attn_backend.configure_runtime(
+                request_slot_capacity=self.config.max_req_pool_size + 1,
+                cache_group_specs=tuple(self.token_to_kv_pool.arena.cache_group_specs),
                 cache_group_page_counts=_cache_arena_attr(
-                    self.draft_token_to_kv_pool, "cache_group_page_counts", None
+                    self.token_to_kv_pool, "cache_group_page_counts", None
                 ),
             )
+            if self.draft_attn_backend is not None:
+                self.draft_attn_backend.configure_runtime(
+                    cache_group_specs=tuple(
+                        _cache_arena_attr(
+                            self.draft_token_to_kv_pool, "cache_group_specs", ()
+                        )
+                    ),
+                    cache_group_page_counts=_cache_arena_attr(
+                        self.draft_token_to_kv_pool, "cache_group_page_counts", None
+                    ),
+                )
 
         # Storage is the plan's decision: stamp each attention layer's cache
         # group from the pool and check the group retains what the layer's
