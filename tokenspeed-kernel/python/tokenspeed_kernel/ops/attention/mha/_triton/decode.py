@@ -1378,7 +1378,8 @@ def _triton_mha_decode_with_kvcache_impl(
             lse_out=lse,
         )
         return (out, lse) if return_lse else out
-    max_kv_splits = 4
+    # Low-batch RDNA4 decode fills its CUs with up to 16 KV splits.
+    max_kv_splits = 16 if current_platform().is_rdna4 else 4
     attn_logits = torch.empty(
         q.shape[0],
         q.shape[1],

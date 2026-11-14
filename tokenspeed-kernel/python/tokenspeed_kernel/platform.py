@@ -204,6 +204,10 @@ class PlatformInfo:
         return self.is_amd and self.arch_version == ArchVersion(12, 5)
 
     @property
+    def is_rdna4(self) -> bool:
+        return self.is_amd and self.arch_version == ArchVersion(12, 0)
+
+    @property
     def is_ampere_plus(self) -> bool:
         return self.is_nvidia and self.arch_version >= ArchVersion(8, 0)
 

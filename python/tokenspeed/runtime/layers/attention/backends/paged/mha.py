@@ -20,7 +20,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from typing import TYPE_CHECKING
 
@@ -112,6 +112,7 @@ class MHAExtendMetadata:
     # Mixed target queries are cache-backed even when the leading prefills
     # have no prefix; the fresh-prefill path must not discard decode history.
     is_mixed: bool
+    num_extends: int
     max_extend_prefix_len: int = 0
 
 
@@ -333,6 +334,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             max_extend_seq_len=max(query_lens_cpu),
             max_seqlen_k=max_seqlen_k,
             is_mixed=is_mixed,
+            num_extends=num_extends,
             # Only prefills have a host prefix mirror. Mixed batches always
             # use cached attention, without reading decode lengths back to CPU.
             max_extend_prefix_len=int(
@@ -687,6 +689,12 @@ class MHAAttnBackend(PagedAttentionBackend):
         )
         extend_mode = plan.get("extend_mode", "prewrite")
         if (
+            metadata.is_mixed
+            and plan.get("mixed_decode", False)
+            and self.spec_num_tokens == 1
+        ):
+            return self._forward_mixed(q, layer, token_to_kv_pool, metadata, sinks)
+        if (
             not metadata.is_mixed
             and metadata.max_extend_prefix_len == 0
             and extend_mode == "postwrite"
@@ -699,6 +707,54 @@ class MHAAttnBackend(PagedAttentionBackend):
                 self._forward_extend(q, layer, token_to_kv_pool, metadata, sinks)
             return self._forward_prefill(q, k, v, layer, metadata, sinks)
         return self._forward_extend(q, layer, token_to_kv_pool, metadata, sinks)
+
+    def _forward_mixed(
+        self,
+        q: torch.Tensor,
+        layer: PagedAttention,
+        token_to_kv_pool,
+        metadata: MHAExtendMetadata,
+        sinks: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Prefill attention for the leading extends, decode attention for the
+        trailing single-token rows."""
+        n = metadata.num_extends
+        (q,) = _slice_extend_inputs(metadata, q)
+        prefill_tokens = metadata.cu_extend_seq_lens_cpu[n]
+        prefill_metadata = replace(
+            metadata,
+            page_table=metadata.page_table[:n],
+            seq_lens=metadata.seq_lens[:n],
+            extend_seq_lens=metadata.extend_seq_lens[:n],
+            cu_extend_seq_lens=metadata.cu_extend_seq_lens[: n + 1],
+            cu_seqlens_kv=metadata.cu_seqlens_kv[: n + 1],
+            extend_prefix_lens=metadata.extend_prefix_lens[:n],
+            extend_seq_lens_cpu=metadata.extend_seq_lens_cpu[:n],
+            cu_extend_seq_lens_cpu=metadata.cu_extend_seq_lens_cpu[: n + 1],
+            max_extend_seq_len=max(metadata.extend_seq_lens_cpu[:n]),
+            is_mixed=False,
+        )
+        prefill_output = self._forward_extend(
+            q[:prefill_tokens], layer, token_to_kv_pool, prefill_metadata, sinks
+        )
+        k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
+        decode_output = mha_decode_with_kvcache(
+            q=q[prefill_tokens:],
+            k_cache=k_cache,
+            v_cache=v_cache,
+            page_table=metadata.page_table[n:],
+            cache_seqlens=metadata.seq_lens[n:],
+            window_left=layer.sliding_window_size,
+            logit_cap=layer.logit_cap,
+            sinks=sinks,
+            max_seqlen_k=self.max_context_len,
+            max_seqlen_q=1,
+            solution=self.kernel_solution,
+        )
+        decode_output = decode_output.reshape(
+            -1, layer.tp_q_head_num * layer.v_head_dim
+        )
+        return torch.cat((prefill_output, decode_output), dim=0)
 
     def _forward_prefill(
         self,
