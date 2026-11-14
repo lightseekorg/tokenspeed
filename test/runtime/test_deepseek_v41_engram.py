@@ -1193,6 +1193,62 @@ def test_cuda_host_table_gather_matches_device_shard():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cuda_shared_file_host_table_is_registered_and_gathers(tmp_path, monkeypatch):
+    """A shared table's registered-mmap fallback: the writer maps the job file
+    in the default host-table directory, registers it for the GPU and unlinks
+    it, and the GPU gathers from it like the device shard.
+
+    One process plays a host's writer: a one-rank group that reports two ranks.
+    mmap mode runs no collective that would notice, so this runs on one GPU.
+    """
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    monkeypatch.setitem(global_server_args_dict, "engram_host_table_dir", None)
+    monkeypatch.setattr(engram, "_HOST_TABLE_JOB_ID", None)
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    codes, scales = _weights(72, 32)
+    device_embed = RowShardedEngramEmbedding(
+        72, 32, _mapping(0, 1, 1), "cuda:0", False, "gpu", None, 1
+    )
+    device_embed.weight_loader(device_embed.weight, codes)
+    device_embed.weight_loader(device_embed.scale, scales)
+    dist.init_process_group(
+        "gloo",
+        init_method=(tmp_path / "rendezvous").as_uri(),
+        rank=0,
+        world_size=1,
+        timeout=timedelta(seconds=60),
+    )
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(dist, "get_world_size", lambda group=None: 2)
+            path = engram._engram_host_table_path(1, "packed", 72 * 33)
+            host_embed = RowShardedEngramEmbedding(
+                72, 32, _mapping(0, 1, 1), "cpu", True, "shared", _MMAP, 1
+            )
+    finally:
+        dist.destroy_process_group()
+    assert host_embed.cumem is None and host_embed._mmap_keep
+    assert host_embed._mmap_keep[0].filename == path
+    assert not os.path.exists(path)
+    assert host_embed.packed.is_pinned()
+    host_embed.weight_loader(host_embed.weight, codes)
+    host_embed.weight_loader(host_embed.scale, scales)
+    ids = torch.tensor([3, 4, 5, 0, 71], device="cuda:0")
+    torch.testing.assert_close(
+        host_embed(ids, query_shard=None),
+        device_embed(ids, query_shard=None),
+        rtol=0,
+        atol=0,
+    )
+    torch.cuda.synchronize()
+    packed = host_embed.packed
+    del host_embed
+    gc.collect()
+    assert not packed.is_pinned()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_cuda_host_sharded_table_matches_device_shard_and_graph_replay(
     monkeypatch,
 ):
@@ -1756,6 +1812,11 @@ def _cumem_rank(rank: int, directory: Path, scenario: str) -> None:
     """
     from tokenspeed.runtime.utils.env import global_server_args_dict
 
+    # These ranks stand in for GPU-less hosts: on a GPU runner the fallback
+    # scenarios would otherwise cudaHostRegister the shared file from four
+    # processes on one GPU. GPU registration of the shared file has its own
+    # test (test_cuda_shared_file_host_table_is_registered_and_gathers).
+    torch.cuda.is_available = lambda: False
     per_host = 2 if scenario == "two_hosts" else 4
     host = rank // per_host
     falls_back = scenario in ("import_fails", "probe_fails_two_writers")
