@@ -1070,9 +1070,10 @@ inline std::ostream& operator<<(std::ostream& out, const PrefillRow& row) {
 // first -- ends on the last page at least the tokens of the bootstrapped
 // prompts behind it that fit whole before its budget's end, and those prompts
 // complete in its forward, their rows ahead of its own: in every round the
-// completing prefills form a prefix of the batch. 4-token pages, a 32-token
-// budget, 16 tokens yielded at most, one full-attention group; with `hybrid_`
-// three State groups beside it.
+// completing prefills form a prefix of the batch. A chunk that keeps the head
+// of line for any reason fills the budget it still leaves with whole prompts
+// the same way. 4-token pages, a 32-token budget, 16 tokens yielded at most,
+// one full-attention group; with `hybrid_` three State groups beside it.
 class PrefillChunkYieldSuite : public SchedulerTestSuite {
 protected:
     static constexpr std::int32_t kPage = 4;
@@ -1082,10 +1083,11 @@ protected:
         SchedulerConfig cfg{};
         cfg.role = Role::kP;
         cfg.prefix_granularity = kPage;
-        cfg.device_allocator.total_pages = 257;
+        cfg.device_allocator.total_pages = pages_;
         cfg.disable_l2_cache = true;
         cfg.max_scheduled_tokens = kBudget;
         cfg.max_batch_size = batch_;
+        cfg.max_kv_page_num = kv_pages_;
         cfg.prefill_chunk_yield_tokens = yield_;
         cfg.cache_groups.push_back(CacheGroupConfig{
             .group_id = "full_attention",
@@ -1201,6 +1203,8 @@ protected:
     std::vector<std::string> handed_off_;
     std::int32_t yield_{16};
     std::int32_t batch_{8};
+    std::int32_t pages_{257};
+    std::int32_t kv_pages_{0};
     bool hybrid_{false};
 };
 
@@ -1316,8 +1320,8 @@ TEST_F(PrefillChunkYieldSuite, APromptSharingTheChunksPagesIsCarriedBesideStateG
     EXPECT_EQ(Round(), (PrefillRows{{"sharing", 0, 10, 10}, {"long", 32, 52, 100}}));
 }
 
-// With only prompts too long to carry waiting, the plans are those without
-// the knob.
+// With only prompts longer than the budget waiting, the plans are those
+// without the knob.
 TEST_F(PrefillChunkYieldSuite, WithOnlyLongPromptsWaitingThePlansAreThoseWithoutTheKnob) {
     const auto run = [this](std::int32_t yield, std::vector<PrefillRows>& rows) {
         Restart(yield);
@@ -1388,6 +1392,42 @@ TEST_F(PrefillChunkYieldSuite, TheCarriedPromptsTakeAtMostTheKnob) {
     EXPECT_EQ(Round(), (PrefillRows{{"long", 88, 120, 120}}));
 }
 
+// A prompt larger than the knob never changes what a chunk gives way to: a
+// 17-token one is passed over, not a stop, so the chunk still gives way to
+// the two 8-token prompts behind it. And with 12 tokens left after p0, the
+// 100-token prompt's first chunk still gives way to the 16-token prompt, not
+// to the 4-token one behind it: giving up 16 would leave the chunk less than
+// a page, so it takes all 12 and neither prompt runs.
+TEST_F(PrefillChunkYieldSuite, APromptLargerThanTheKnobLeavesWhatAChunkGivesWayTo) {
+    SubmitPrompt("long", MakeTokens(120, 1000));
+    EXPECT_EQ(Round(), (PrefillRows{{"long", 0, 32, 120}}));
+    SubmitPrompt("s17", MakeTokens(17, 2000));
+    SubmitPrompt("s8a", MakeTokens(8, 3000));
+    SubmitPrompt("s8b", MakeTokens(8, 4000));
+    EXPECT_EQ(Round(), (PrefillRows{{"s8a", 0, 8, 8}, {"s8b", 0, 8, 8}, {"long", 32, 48, 120}}));
+
+    Restart(16);
+    SubmitPrompt("p0", MakeTokens(20, 500));
+    SubmitPrompt("long", MakeTokens(100, 1000));
+    SubmitPrompt("s16", MakeTokens(16, 2000));
+    SubmitPrompt("s4", MakeTokens(4, 3000));
+    EXPECT_EQ(Round(), (PrefillRows{{"p0", 0, 20, 20}, {"long", 0, 12, 100}}));
+}
+
+// The chunk that gave way ends on a page, which may leave a few tokens past
+// what it gave way for: after p0's 5, the 100-token prompt gives way to s1
+// and s2's 16 tokens and ends at 8 (27 - 16 = 11, down to 8), and s3, which
+// would have passed the knob, fills the 3 tokens left.
+TEST_F(PrefillChunkYieldSuite, AChunkThatGaveWayFillsWhatItsPageEndLeaves) {
+    SubmitPrompt("p0", MakeTokens(5, 500));
+    SubmitPrompt("long", MakeTokens(100, 1000));
+    SubmitPrompt("s1", MakeTokens(8, 2000));
+    SubmitPrompt("s2", MakeTokens(8, 3000));
+    SubmitPrompt("s3", MakeTokens(3, 4000));
+    EXPECT_EQ(Round(),
+              (PrefillRows{{"p0", 0, 5, 5}, {"s1", 0, 8, 8}, {"s2", 0, 8, 8}, {"s3", 0, 3, 3}, {"long", 0, 8, 100}}));
+}
+
 // A prompt whose first chunk would end at a junction -- its KV is cached
 // past the last State checkpoint it can resume at -- cannot run whole, so it
 // is not carried, and alone it makes nothing give way.
@@ -1419,6 +1459,269 @@ TEST_F(PrefillChunkYieldSuite, AFirstChunkCutAtItsJunctionStillCarriesWholePromp
     EXPECT_EQ(Round(), (PrefillRows{{"holder", 8, 40, 100}}));
 }
 
+// A new prompt that fits the budget whole gives way to nothing, but cut at
+// its junction it keeps the head of line with 24 tokens left: the whole
+// prompts behind it fill them, their rows ahead of its own, and it finishes
+// next round. Off, it runs alone and they wait for that round.
+TEST_F(PrefillChunkYieldSuite, AFirstChunkCutAtItsJunctionFillsTheBudgetItLeaves) {
+    const auto run = [this](std::int32_t yield) {
+        hybrid_ = true;
+        Restart(yield);
+        const std::vector<std::int32_t> shared = MakeTokens(8, 5000);
+        Publish("earlier", Extending(shared, {5100, 5101, 5102}));
+        SubmitPrompt("holder", Extending(shared, MakeTokens(12, 8000)));
+        SubmitPrompt("s1", MakeTokens(6, 2000));
+        SubmitPrompt("s2", MakeTokens(6, 3000));
+        return std::vector<PrefillRows>{Round(), Round()};
+    };
+    EXPECT_EQ(run(16), (std::vector<PrefillRows>{{{"s1", 0, 6, 6}, {"s2", 0, 6, 6}, {"holder", 0, 8, 20}},
+                                                 {{"holder", 8, 20, 20}}}));
+    EXPECT_EQ(run(0), (std::vector<PrefillRows>{{{"holder", 0, 8, 20}},
+                                                {{"holder", 8, 20, 20}, {"s1", 0, 6, 6}, {"s2", 0, 6, 6}}}));
+}
+
+// The knob bounds what a chunk gives way to, not what fills the budget it
+// leaves: the 100-token prompt gives way to s1's 6 tokens, passing over s2's
+// 18, ends at its junction at 8, and s2 then fills the 18 tokens left.
+TEST_F(PrefillChunkYieldSuite, TheFillTakesMoreThanTheKnob) {
+    hybrid_ = true;
+    Restart(16);
+    const std::vector<std::int32_t> shared = MakeTokens(8, 5000);
+    Publish("earlier", Extending(shared, {5100, 5101, 5102}));
+    SubmitPrompt("holder", Extending(shared, MakeTokens(92, 8000)));
+    SubmitPrompt("s1", MakeTokens(6, 2000));
+    SubmitPrompt("s2", MakeTokens(18, 3000));
+    EXPECT_EQ(Round(), (PrefillRows{{"s1", 0, 6, 6}, {"s2", 0, 18, 18}, {"holder", 0, 8, 100}}));
+}
+
+// With enable_short_prefill_first the new prompts are ranked by the work left
+// past their hit, and the fill follows the ranking: the 16-token holder
+// resumes at the State one earlier prompt left at 8 and is cut at 12, where
+// another's KV ends, so it ranks first with 8 tokens left and keeps the head
+// of line with 28 of the budget's 32 left. The other prompts fill them least
+// work first, f2's 9 and then "ahead"'s 10, though ahead was submitted before
+// the holder, and complete ahead of its row; f1's 12 no longer fit the 9 left
+// and wait for the next round. A holder that gives way fills from what the
+// ranking still holds once those it carried are out: resuming at 24 with 12
+// tokens left, the 36-token holder gives way to g1's 13 behind it and is cut
+// at its junction at 28, and the 15 tokens left go to ahead's 14, not to g2's
+// 15 behind it.
+TEST_F(PrefillChunkYieldSuite, TheFillTakesTheLeastWorkFirstWhenShortPrefillsGoFirst) {
+    hybrid_ = true;
+    Restart(16);
+    config_.enable_short_prefill_first = true;
+    scheduler_ = std::make_unique<Scheduler>(config_);
+    const std::vector<std::int32_t> shared = Extending(MakeTokens(8, 5000), {5100, 5101, 5102, 5103});
+    Publish("checkpoint", MakeTokens(8, 5000));
+    Publish("earlier", Extending(shared, {5200, 5201, 5202}));
+    SubmitPrompt("ahead", MakeTokens(10, 4000));
+    SubmitPrompt("holder", Extending(shared, MakeTokens(4, 8000)));
+    SubmitPrompt("f1", MakeTokens(12, 2000));
+    SubmitPrompt("f2", MakeTokens(9, 3000));
+    EXPECT_EQ(Round(), (PrefillRows{{"f2", 0, 9, 9}, {"ahead", 0, 10, 10}, {"holder", 8, 12, 16}}));
+    EXPECT_EQ(Round(), (PrefillRows{{"holder", 12, 16, 16}, {"f1", 0, 12, 12}}));
+    EXPECT_EQ(handed_off_, (std::vector<std::string>{"ahead", "f2"}));
+
+    Restart(16);
+    config_.enable_short_prefill_first = true;
+    scheduler_ = std::make_unique<Scheduler>(config_);
+    const std::vector<std::int32_t> longer = Extending(MakeTokens(24, 5000), {5100, 5101, 5102, 5103});
+    Publish("checkpoint", MakeTokens(24, 5000));
+    Publish("earlier", Extending(longer, {5200, 5201, 5202}));
+    SubmitPrompt("ahead", MakeTokens(14, 4000));
+    SubmitPrompt("holder", Extending(longer, MakeTokens(8, 8000)));
+    SubmitPrompt("g1", MakeTokens(13, 2000));
+    SubmitPrompt("g2", MakeTokens(15, 3000));
+    EXPECT_EQ(Round(), (PrefillRows{{"g1", 0, 13, 13}, {"ahead", 0, 14, 14}, {"holder", 24, 28, 36}}));
+}
+
+// The fill takes a protected prompt first, protection reevaluated after each
+// admission: seven 4-token prompts filling a 7-row batch pass "ahead" over
+// seven times, and their transfers then hold the request slots for a round.
+// The holder ranks first as above, and its own admission is the eighth
+// bypass: protected, ahead fills 10 of the 28 tokens left before the three
+// 9-token prompts that rank ahead of it by work, two of which fill the rest.
+// After six passes in a 6-row batch, f1's admission is the eighth: ahead
+// follows it, then f2. A protected prompt the budget left cannot take is
+// passed over, not a stop: at 30 tokens, ahead leaves the 28 to the three
+// 9-token prompts and starts next round.
+TEST_F(PrefillChunkYieldSuite, TheFillTakesAProtectedPromptFirst) {
+    const auto run = [this](int passes, std::int32_t ahead_tokens) {
+        hybrid_ = true;
+        batch_ = passes;
+        Restart(16);
+        config_.enable_short_prefill_first = true;
+        scheduler_ = std::make_unique<Scheduler>(config_);
+        const std::vector<std::int32_t> shared = Extending(MakeTokens(8, 5000), {5100, 5101, 5102, 5103});
+        Publish("checkpoint", MakeTokens(8, 5000));
+        Publish("earlier", Extending(shared, {5200, 5201, 5202}));
+        SubmitPrompt("ahead", MakeTokens(ahead_tokens, 4000));
+        for (int i = 0; i < passes; ++i) {
+            SubmitPrompt("b" + std::to_string(i), MakeTokens(4, 6000 + 100 * i));
+        }
+        EXPECT_EQ(Round().size(), static_cast<std::size_t>(passes));
+        EXPECT_EQ(Round(), PrefillRows{});
+        SubmitPrompt("holder", Extending(shared, MakeTokens(4, 8000)));
+        for (int i = 1; i <= 3; ++i) {
+            SubmitPrompt("f" + std::to_string(i), MakeTokens(9, 2000 + 100 * i));
+        }
+        return std::vector<PrefillRows>{Round(), Round()};
+    };
+    EXPECT_EQ(run(7, 10),
+              (std::vector<PrefillRows>{{{"ahead", 0, 10, 10}, {"f1", 0, 9, 9}, {"f2", 0, 9, 9}, {"holder", 8, 12, 16}},
+                                        {{"holder", 12, 16, 16}, {"f3", 0, 9, 9}}}));
+    EXPECT_EQ(run(6, 10),
+              (std::vector<PrefillRows>{{{"f1", 0, 9, 9}, {"ahead", 0, 10, 10}, {"f2", 0, 9, 9}, {"holder", 8, 12, 16}},
+                                        {{"holder", 12, 16, 16}, {"f3", 0, 9, 9}}}));
+    EXPECT_EQ(run(7, 30),
+              (std::vector<PrefillRows>{{{"f1", 0, 9, 9}, {"f2", 0, 9, 9}, {"f3", 0, 9, 9}, {"holder", 8, 12, 16}},
+                                        {{"holder", 12, 16, 16}, {"ahead", 0, 28, 30}}}));
+}
+
+// A resident chunk's fill follows the ranking too, ranked after the chunk's
+// admission. Cut at its junction at 40, the 100-token prompt's second chunk
+// leaves 24 tokens and, with a 4-token knob, gives way to none of the prompts
+// waiting: d, c and b fill 19 of them, least work first, and a's 12 wait.
+// And a chunk's admission publishes the State its last chunk left at its
+// junction: ranked after it, a sibling sharing that State takes 2 tokens,
+// which fill the 2 a chunk at 8 leaves after giving way to f's 14.
+TEST_F(PrefillChunkYieldSuite, AResidentChunkFillsInRankOrderAfterItsAdmission) {
+    hybrid_ = true;
+    Restart(4);
+    config_.enable_short_prefill_first = true;
+    scheduler_ = std::make_unique<Scheduler>(config_);
+    const std::vector<std::int32_t> shared = MakeTokens(40, 5000);
+    Publish("earlier", Extending(shared, {5100, 5101, 5102}));
+    SubmitPrompt("holder", Extending(shared, MakeTokens(60, 8000)));
+    EXPECT_EQ(Round(), (PrefillRows{{"holder", 0, 32, 100}}));
+    SubmitPrompt("a", MakeTokens(12, 2000));
+    SubmitPrompt("b", MakeTokens(8, 3000));
+    SubmitPrompt("c", MakeTokens(6, 4000));
+    SubmitPrompt("d", MakeTokens(5, 6000));
+    EXPECT_EQ(Round(), (PrefillRows{{"d", 0, 5, 5}, {"c", 0, 6, 6}, {"b", 0, 8, 8}, {"holder", 32, 40, 100}}));
+
+    Restart(16);
+    config_.enable_short_prefill_first = true;
+    scheduler_ = std::make_unique<Scheduler>(config_);
+    const std::vector<std::int32_t> junction = MakeTokens(8, 5000);
+    Publish("earlier", Extending(junction, {5100, 5101, 5102}));
+    SubmitPrompt("holder", Extending(junction, MakeTokens(92, 8000)));
+    EXPECT_EQ(Round(), (PrefillRows{{"holder", 0, 8, 100}}));
+    SubmitPrompt("sibling", Extending(junction, {6100, 6101}));
+    SubmitPrompt("f", MakeTokens(14, 2000));
+    EXPECT_EQ(Round(), (PrefillRows{{"f", 0, 14, 14}, {"sibling", 8, 10, 10}, {"holder", 8, 24, 100}}));
+}
+
+// In rank order too, the fill ends at its first capacity failure. In a
+// 28-page pool no page is free once the 100-token prompt's second chunk and
+// s1 and s2, which it gives way to, hold theirs. "a" ranks first, 1 token
+// past the 40 "earlier" left cached, but its own hit keeps those pages from
+// being evicted for the page it needs, so the fill ends there: "b", which
+// could evict one, waits, though it fits the 2 tokens left and was submitted
+// before a. "x" fits neither the knob beside s1 and s2 nor what is left.
+TEST_F(PrefillChunkYieldSuite, TheRankedFillEndsAtItsFirstCapacityFailure) {
+    pages_ = 28;
+    Restart(16);
+    config_.enable_short_prefill_first = true;
+    scheduler_ = std::make_unique<Scheduler>(config_);
+    const std::vector<std::int32_t> earlier = MakeTokens(40, 5000);
+    Publish("earlier", earlier);
+    SubmitPrompt("holder", MakeTokens(100, 1000));
+    EXPECT_EQ(Round(), (PrefillRows{{"holder", 0, 32, 100}}));
+    SubmitPrompt("s1", MakeTokens(8, 2000));
+    SubmitPrompt("s2", MakeTokens(6, 3000));
+    SubmitPrompt("x", MakeTokens(3, 4000));
+    SubmitPrompt("b", MakeTokens(2, 6000));
+    SubmitPrompt("a", Extending(earlier, {7001}));
+    EXPECT_EQ(Round(), (PrefillRows{{"s1", 0, 8, 8}, {"s2", 0, 6, 6}, {"holder", 32, 48, 100}}));
+}
+
+// A resident chunk cut at its junction fills the budget it leaves too: the
+// 100-token prompt's KV is cached to 40 but no State checkpoint on its path,
+// so its second chunk gives way to s1 and s2 (s3 would pass the knob), still
+// ends at 40, and s3 fills 10 of the 12 tokens left. With nothing to give way
+// to, the same chunk leaves 24 tokens to a prompt larger than the knob.
+TEST_F(PrefillChunkYieldSuite, AResidentChunkCutAtItsJunctionFillsTheBudgetItLeaves) {
+    hybrid_ = true;
+    const std::vector<std::int32_t> shared = MakeTokens(40, 5000);
+    const auto start = [&] {
+        Restart(16);
+        Publish("earlier", Extending(shared, {5100, 5101, 5102}));
+        SubmitPrompt("holder", Extending(shared, MakeTokens(60, 8000)));
+        EXPECT_EQ(Round(), (PrefillRows{{"holder", 0, 32, 100}}));
+    };
+    start();
+    SubmitPrompt("s1", MakeTokens(6, 2000));
+    SubmitPrompt("s2", MakeTokens(6, 3000));
+    SubmitPrompt("s3", MakeTokens(10, 4000));
+    EXPECT_EQ(Round(), (PrefillRows{{"s1", 0, 6, 6}, {"s2", 0, 6, 6}, {"s3", 0, 10, 10}, {"holder", 32, 40, 100}}));
+    start();
+    SubmitPrompt("s4", MakeTokens(20, 6000));
+    EXPECT_EQ(Round(), (PrefillRows{{"s4", 0, 20, 20}, {"holder", 32, 40, 100}}));
+}
+
+// A resident chunk whose rest fits the budget gives way to nothing, so the
+// round's list is probed only after its admission: cut at its junction at 40,
+// the chunk leaves 24 tokens, which a 20-token prompt fills. Off, that prompt
+// waits for the chunk's last round.
+TEST_F(PrefillChunkYieldSuite, AResidentChunkWhoseRestFitsTheBudgetFillsAfterItsAdmission) {
+    const auto run = [this](std::int32_t yield) {
+        hybrid_ = true;
+        Restart(yield);
+        const std::vector<std::int32_t> shared = MakeTokens(40, 5000);
+        Publish("earlier", Extending(shared, {5100, 5101, 5102}));
+        SubmitPrompt("holder", Extending(shared, MakeTokens(20, 8000)));
+        std::vector<PrefillRows> rows{Round()};
+        SubmitPrompt("s1", MakeTokens(20, 2000));
+        rows.push_back(Round());
+        rows.push_back(Round());
+        return rows;
+    };
+    EXPECT_EQ(run(16),
+              (std::vector<PrefillRows>{
+                  {{"holder", 0, 32, 60}}, {{"s1", 0, 20, 20}, {"holder", 32, 40, 60}}, {{"holder", 40, 60, 60}}}));
+    EXPECT_EQ(run(0),
+              (std::vector<PrefillRows>{
+                  {{"holder", 0, 32, 60}}, {{"holder", 32, 40, 60}}, {{"holder", 40, 60, 60}, {"s1", 0, 12, 20}}}));
+}
+
+// What fills the budget holds its pages until its transfer is acknowledged,
+// like any completed prompt, so in a tight pool the chunk's next admission
+// may wait for that: in a 34-page pool the 24-token prompt filling what the
+// junction leaves keeps the chunk's third chunk out until its transfer is
+// acknowledged.
+TEST_F(PrefillChunkYieldSuite, AChunkWaitsForTheTransferOfWhatFilledItsBudgetInATightPool) {
+    hybrid_ = true;
+    pages_ = 34;
+    Restart(16);
+    const std::vector<std::int32_t> shared = MakeTokens(8, 5000);
+    Publish("earlier", Extending(shared, {5100, 5101, 5102}));
+    SubmitPrompt("holder", Extending(shared, MakeTokens(92, 8000)));
+    SubmitPrompt("big", MakeTokens(24, 2000));
+    EXPECT_EQ(Round(/*ack=*/false), (PrefillRows{{"big", 0, 24, 24}, {"holder", 0, 8, 100}}));
+    EXPECT_EQ(Round(/*ack=*/false), (PrefillRows{{"holder", 8, 40, 100}}));
+    EXPECT_EQ(handed_off_, std::vector<std::string>{"big"});
+    EXPECT_EQ(Round(/*ack=*/false), PrefillRows{});
+    SendPdSucceeded("big");
+    EXPECT_EQ(Round(), (PrefillRows{{"holder", 40, 72, 100}}));
+}
+
+// A prompt sharing the chunk's junction is not carried: the junction's State
+// is published only when the next chunk is admitted, so until then the
+// prompt's own first chunk would end there. It resumes there next round,
+// once the chunk's admission has published it.
+TEST_F(PrefillChunkYieldSuite, APromptSharingTheChunksJunctionResumesThereNextRound) {
+    hybrid_ = true;
+    Restart(16);
+    const std::vector<std::int32_t> shared = MakeTokens(8, 5000);
+    Publish("earlier", Extending(shared, {5100, 5101, 5102}));
+    SubmitPrompt("holder", Extending(shared, MakeTokens(12, 8000)));
+    SubmitPrompt("sibling", Extending(shared, {6100, 6101}));
+    SubmitPrompt("s1", MakeTokens(6, 2000));
+    EXPECT_EQ(Round(), (PrefillRows{{"s1", 0, 6, 6}, {"holder", 0, 8, 20}}));
+    EXPECT_EQ(Round(), (PrefillRows{{"holder", 8, 20, 20}, {"sibling", 8, 10, 10}}));
+}
+
 // Every carried prompt takes a batch row beside the long prompt's: with
 // three rows two are carried.
 TEST_F(PrefillChunkYieldSuite, TheBatchBoundsTheCarriedPrompts) {
@@ -1447,6 +1750,82 @@ TEST_F(PrefillChunkYieldSuite, TheFreeRequestSlotsBoundTheCarriedPrompts) {
     }
     EXPECT_EQ(Round(/*ack=*/false), (PrefillRows{{"s0", 0, 4, 4}, {"s1", 0, 4, 4}, {"long", 24, 48, 100}}));
     EXPECT_EQ(handed_off_, (std::vector<std::string>{"p0", "p1"}));
+}
+
+// The fill behind a chunk cut at its junction is bounded the same way, the
+// chunk counted once: with three batch rows two prompts fill its 24 tokens;
+// with two of five request slots pinned by unacknowledged transfers, two
+// more beside its own; with a 6-page KV budget, two 2-page prompts beside
+// its 2 pages.
+TEST_F(PrefillChunkYieldSuite, TheBatchSlotsAndKvPagesBoundTheFill) {
+    hybrid_ = true;
+    const std::vector<std::int32_t> shared = MakeTokens(8, 5000);
+    const auto submit = [&] {
+        SubmitPrompt("holder", Extending(shared, MakeTokens(12, 8000)));
+        for (int i = 0; i < 3; ++i) {
+            SubmitPrompt("s" + std::to_string(i), MakeTokens(6, 2000 + 100 * i));
+        }
+    };
+    const PrefillRows filled{{"s0", 0, 6, 6}, {"s1", 0, 6, 6}, {"holder", 0, 8, 20}};
+    batch_ = 3;
+    Restart(16);
+    Publish("earlier", Extending(shared, {5100, 5101, 5102}));
+    submit();
+    EXPECT_EQ(Round(), filled) << "three batch rows";
+
+    batch_ = 5;
+    Restart(16);
+    Publish("earlier", Extending(shared, {5100, 5101, 5102}));
+    SubmitPrompt("p0", MakeTokens(4, 500));
+    SubmitPrompt("p1", MakeTokens(4, 600));
+    EXPECT_EQ(Round(), (PrefillRows{{"p0", 0, 4, 4}, {"p1", 0, 4, 4}}));
+    submit();
+    EXPECT_EQ(Round(/*ack=*/false), filled) << "two free request slots";
+    EXPECT_EQ(handed_off_, (std::vector<std::string>{"p0", "p1"}));
+
+    batch_ = 8;
+    kv_pages_ = 6;
+    Restart(16);
+    Publish("earlier", Extending(shared, {5100, 5101, 5102}));
+    submit();
+    EXPECT_EQ(Round(), filled) << "a 6-page KV budget";
+}
+
+// The fill takes from the round's one list of whole prompts, so it probes at
+// most eight waiting prompts: behind seven too long to fill the 24 tokens the
+// junction leaves, the eighth fills 4 of them and the ninth, never probed,
+// waits.
+TEST_F(PrefillChunkYieldSuite, TheFillProbesAtMostEightPrompts) {
+    hybrid_ = true;
+    Restart(16);
+    const std::vector<std::int32_t> shared = MakeTokens(8, 5000);
+    Publish("earlier", Extending(shared, {5100, 5101, 5102}));
+    SubmitPrompt("holder", Extending(shared, MakeTokens(12, 8000)));
+    for (int i = 1; i <= 7; ++i) {
+        SubmitPrompt("long" + std::to_string(i), MakeTokens(40, 10000 + 100 * i));
+    }
+    SubmitPrompt("s8", MakeTokens(4, 2000));
+    SubmitPrompt("s9", MakeTokens(4, 3000));
+    EXPECT_EQ(Round(), (PrefillRows{{"s8", 0, 4, 4}, {"holder", 0, 8, 20}}));
+}
+
+// The round's list is probed before the long chunk's admission, which needs
+// three of the cached pages in an 18-page pool and evicts the oldest, the
+// 12 tokens follow_up resumes at: it is not carried after all, since its
+// whole prompt now takes 20 tokens, and s2, which the knob left out, takes
+// its place. Nothing fails.
+TEST_F(PrefillChunkYieldSuite, APromptWhosePrefixTheChunkEvictedIsNotCarried) {
+    pages_ = 19;
+    Restart(16);
+    const std::vector<std::int32_t> earlier = MakeTokens(12, 5000);
+    Publish("earlier", earlier);
+    Publish("padding", MakeTokens(24, 6000));
+    SubmitPrompt("long", MakeTokens(68, 1000));
+    EXPECT_EQ(Round(), (PrefillRows{{"long", 0, 32, 68}}));
+    SubmitPrompt("follow_up", Extending(earlier, MakeTokens(8, 7000)));
+    SubmitPrompt("s1", MakeTokens(8, 2000));
+    SubmitPrompt("s2", MakeTokens(8, 3000));
+    EXPECT_EQ(Round(), (PrefillRows{{"s1", 0, 8, 8}, {"s2", 0, 8, 8}, {"long", 32, 48, 68}}));
 }
 
 // Under a steady stream of short prompts the long prompt still advances by at

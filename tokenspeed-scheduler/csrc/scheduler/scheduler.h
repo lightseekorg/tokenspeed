@@ -589,30 +589,35 @@ private:
     std::optional<std::int32_t> wholePromptTokens(Request& request, Request* resident_holder, bool has_state_group);
     // The round's whole prompts, probed once: the Submitted candidates from
     // position `from` on that no phase scheduled yet and whose whole prompt
-    // takes at most prefill_chunk_yield_tokens, in candidate order, after at
-    // most kMaxYieldProbesPerRound probes; `resident_holder` is the resident
-    // chunk they are probed for, null for a new prompt's.
+    // takes at most prefill_chunk_yield_tokens or the budget left, whichever
+    // is more, in candidate order, after at most kMaxYieldProbesPerRound
+    // probes; `resident_holder` is the resident chunk they are probed for
+    // before its admission, null otherwise.
     std::vector<WholePrompt> wholePromptsAfter(std::span<Request* const> candidates, std::size_t from,
                                                const PlanBuild& build, Request* resident_holder);
-    // The whole prompts a holder carries: from the round's list, those from
-    // position `from` on still Submitted and unscheduled, in order, while
-    // their tokens fit prefill_chunk_yield_tokens and they and the holder fit
-    // the batch, the free request slots (one more for a new holder,
-    // `holder_is_new`) and, with max_kv_page_num, the KV page budget beside
-    // the holder's most pages (`holder_max_pages`).
+    // The whole prompts a holder gives way to: from the round's list, those
+    // from position `from` on still Submitted, unscheduled and taking at most
+    // prefill_chunk_yield_tokens, in order, while their tokens together fit
+    // it and they and the holder fit the batch, the free request slots (one
+    // more for a new holder, `holder_is_new`) and, with max_kv_page_num, the
+    // KV page budget beside the holder's most pages (`holder_max_pages`).
     std::vector<WholePrompt> carriedPrompts(std::span<const WholePrompt> whole_prompts, std::size_t from,
                                             const PlanBuild& build, bool holder_is_new,
                                             std::int32_t holder_max_pages) const;
-    // Admits the carried prompts behind a holder that kept the head of line
-    // (its operation the last pushed), each only if its first chunk completes
-    // it on the budget left; stops at the first capacity failure, and admits
-    // none once the plan is a lone-request compaction's (the holder's own;
-    // last_lone_compaction_plan_). Nothing it admits holds the head of line,
-    // and the holder's operation then moves behind theirs: the completing
-    // prefills run first, the incomplete one last. candidates supplies the
-    // round's FIFO order. With enable_short_prefill_first, a successful
-    // carried first admission that overtakes the oldest waiting prompt
-    // increments that prompt's bypass count.
+    // Admits the carried prompts beside a holder that kept the head of line
+    // (its operation the last pushed) -- those it gave way to, or those
+    // filling the budget it leaves (with enable_short_prefill_first one at a
+    // time, in rank order) -- each only if its first chunk completes it on
+    // the budget left, and skips one whose `tokens` exceed that budget; stops
+    // at the first capacity failure, and admits none once the plan is a
+    // lone-request compaction's (the holder's own; last_lone_compaction_plan_).
+    // Of each prompt it reads only `request` and `tokens`. Nothing it admits
+    // holds the head of line, and the holder's operation then moves behind
+    // theirs: the completing prefills run first, the incomplete one last.
+    // candidates supplies the round's FIFO order. With
+    // enable_short_prefill_first, a successful carried first admission that
+    // overtakes the oldest waiting prompt increments that prompt's bypass
+    // count.
     void carryWholePrompts(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                            std::span<const WholePrompt> carried, std::int32_t decode_reserve);
 
