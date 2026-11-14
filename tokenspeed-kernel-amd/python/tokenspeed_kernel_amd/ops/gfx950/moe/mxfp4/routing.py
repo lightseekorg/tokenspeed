@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
+from tokenspeed_kernel_amd.ops.gfx950.moe.simulation import permute_experts
 
 cdna4 = gl.amd.cdna4
 _ROUTE_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
@@ -233,7 +234,7 @@ def _route_u32_bits_to_f32(bits, element_ty: gl.constexpr):
 
 
 @gluon.jit(
-    do_not_specialize=("M",),
+    do_not_specialize=("M", "simulation_seed"),
 )
 def _sigmoid_bias_topk_route_gluon_kernel(
     logits_ptr,  # (M, E)
@@ -257,6 +258,8 @@ def _sigmoid_bias_topk_route_gluon_kernel(
     ROUTED_SCALING_FACTOR: gl.constexpr,
     X_DTYPE: gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    simulation_seed,
+    SIMULATE: gl.constexpr,
 ):
     NEG: gl.constexpr = float("-inf")
     lt: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [NUM_WARPS, 1], [1, 0])
@@ -315,6 +318,9 @@ def _sigmoid_bias_topk_route_gluon_kernel(
         )
         scale = gl.full([MP, TKP], ROUTED_SCALING_FACTOR, gl.float32, layout=lt)
         val_t = (normalized.to(gl.float32) * scale).to(X_DTYPE).to(gl.float32)
+
+    if SIMULATE:
+        idx_t = permute_experts(idx_t, row, simulation_seed, E)
 
     m = gl.arange(0, MP, layout=gl.SliceLayout(1, lt))
     zero_i = gl.zeros([MP, TKP], gl.int32, layout=lt)
@@ -417,6 +423,7 @@ def _launch_sigmoid_bias_topk_route_gluon(
     *,
     routed_scaling_factor: float = 1.0,
     normalize_topk_weights: bool = True,
+    simulation_seed: int | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     M, E = router_logits.shape
     topk_ids = torch.empty((M, topk), dtype=torch.int32, device=router_logits.device)
@@ -446,6 +453,8 @@ def _launch_sigmoid_bias_topk_route_gluon(
         ROUTED_SCALING_FACTOR=float(routed_scaling_factor),
         X_DTYPE=_ROUTE_GL_DTYPE[router_logits.dtype],
         NUM_WARPS=nw,
+        simulation_seed=0 if simulation_seed is None else simulation_seed,
+        SIMULATE=simulation_seed is not None,
         num_warps=nw,
     )
     return topk_ids, topk_weights
@@ -458,6 +467,7 @@ def invoke_sigmoid_bias_topk_route_gluon(
     *,
     routed_scaling_factor: float = 1.0,
     normalize_topk_weights: bool = True,
+    simulation_seed: int | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Route with DeepSeekV3/Kimi noaux_tc semantics for a single group.
 
@@ -481,6 +491,7 @@ def invoke_sigmoid_bias_topk_route_gluon(
         topk,
         routed_scaling_factor=routed_scaling_factor,
         normalize_topk_weights=normalize_topk_weights,
+        simulation_seed=simulation_seed,
     )
 
 
@@ -524,6 +535,8 @@ def sigmoid_bias_topk_row_gfx950(
     ROUTED_SCALING_FACTOR: gl.constexpr,
     X_DTYPE: gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    simulation_seed,
+    SIMULATE: gl.constexpr,
 ):
     """Select one token's experts as a tournament over per-lane candidates.
 
@@ -644,6 +657,9 @@ def sigmoid_bias_topk_row_gfx950(
     else:
         selected_weights *= ROUTED_SCALING_FACTOR
 
+    if SIMULATE:
+        selected_ids = permute_experts(selected_ids, token, simulation_seed, E)
+
     topk_mask = topk_lane < TOPK
     cdna4.buffer_store(
         selected_ids,
@@ -659,7 +675,7 @@ def sigmoid_bias_topk_row_gfx950(
     )
 
 
-@gluon.jit
+@gluon.jit(do_not_specialize=["simulation_seed"])
 def gluon_sigmoid_bias_topk_gfx950(
     logits_ptr,
     bias_ptr,
@@ -680,6 +696,8 @@ def gluon_sigmoid_bias_topk_gfx950(
     ROUTED_SCALING_FACTOR: gl.constexpr,
     X_DTYPE: gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    simulation_seed,
+    SIMULATE: gl.constexpr,
 ):
     sigmoid_bias_topk_row_gfx950(
         gl.program_id(0),
@@ -702,6 +720,8 @@ def gluon_sigmoid_bias_topk_gfx950(
         ROUTED_SCALING_FACTOR,
         X_DTYPE,
         NUM_WARPS,
+        simulation_seed,
+        SIMULATE,
     )
 
 
@@ -712,6 +732,7 @@ def invoke_sigmoid_bias_topk_route_prefill_gluon(
     *,
     routed_scaling_factor: float = 1.0,
     normalize_topk_weights: bool = True,
+    simulation_seed: int | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Large-M Kimi noaux_tc routing with one independent CTA per token."""
     if (
@@ -757,6 +778,8 @@ def invoke_sigmoid_bias_topk_route_prefill_gluon(
         ROUTED_SCALING_FACTOR=float(routed_scaling_factor),
         X_DTYPE=_ROUTE_GL_DTYPE[router_logits.dtype],
         NUM_WARPS=num_warps,
+        simulation_seed=0 if simulation_seed is None else simulation_seed,
+        SIMULATE=simulation_seed is not None,
         num_warps=num_warps,
     )
     return topk_ids, topk_weights

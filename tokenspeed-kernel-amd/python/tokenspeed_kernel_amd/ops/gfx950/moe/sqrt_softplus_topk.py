@@ -24,13 +24,14 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon
+from tokenspeed_kernel_amd.ops.gfx950.moe.simulation import permute_experts
 
 __all__ = ["launch_gluon_sqrt_softplus_topk_gfx950"]
 
 cdna4 = gl.amd.cdna4
 
 
-@gluon.jit
+@gluon.jit(do_not_specialize=["simulation_seed"])
 def gluon_sqrt_softplus_topk_gfx950(
     router_logits,
     correction_bias,
@@ -61,6 +62,8 @@ def gluon_sqrt_softplus_topk_gfx950(
     NEED_SCORES: gl.constexpr,
     SCALE: gl.constexpr,
     SPLIT: gl.constexpr,
+    simulation_seed,
+    SIMULATE: gl.constexpr,
 ):
     token = gl.program_id(0)
     expert_layout: gl.constexpr = gl.BlockedLayout([1], [64], [1], [0])
@@ -148,6 +151,9 @@ def gluon_sqrt_softplus_topk_gfx950(
     if SCALE != 1.0:
         selected_weights = selected_weights * SCALE
 
+    if SIMULATE:
+        selected_ids = permute_experts(selected_ids, token, simulation_seed, E)
+
     topk_mask = topk_lane < TOPK
     cdna4.buffer_store(
         selected_weights,
@@ -179,6 +185,8 @@ def launch_gluon_sqrt_softplus_topk_gfx950(
     input_ids: torch.Tensor | None = None,
     need_scores: bool = True,
     routed_scaling_factor: float = 1.0,
+    *,
+    simulation_seed: int | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Select DeepSeek V4 experts with one GFX950 Gluon kernel launch.
 
@@ -317,6 +325,8 @@ def launch_gluon_sqrt_softplus_topk_gfx950(
         NEED_SCORES=need_scores,
         SCALE=float(routed_scaling_factor),
         SPLIT=split,
+        simulation_seed=0 if simulation_seed is None else simulation_seed,
+        SIMULATE=simulation_seed is not None,
         num_warps=1,
     )
     return topk_weights, topk_ids, scores

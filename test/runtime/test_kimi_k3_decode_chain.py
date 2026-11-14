@@ -412,6 +412,16 @@ def test_layer_counts_whose_tail_parities_collide_are_not_bound(
     assert not _Owner.built
 
 
+def test_simulation_rejects_unseeded_decode_chain(monkeypatch):
+    layers = [_decoder(i, moe=True) for i in range(2)]
+    model = _bindable(monkeypatch, layers, simulate=True)
+    with pytest.raises(NotImplementedError, match="final-writeback simulation"):
+        KimiLinearForCausalLM._prepare_decode_chain(model)
+    assert not _Owner.built
+    assert model.model.decode_chain is None
+    assert all(layer.block_sparse_moe.decode_moe is None for layer in layers)
+
+
 def test_a_group_without_multicast_is_not_bound(monkeypatch):
     layers = [_decoder(i, moe=True) for i in range(2)]
     model = _bindable(monkeypatch, layers, multicast=False)

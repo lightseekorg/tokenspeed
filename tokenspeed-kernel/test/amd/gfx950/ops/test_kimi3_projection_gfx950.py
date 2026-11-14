@@ -297,6 +297,7 @@ def test_kimi3_router_projection_matches_torch_and_captures() -> None:
         16,
         routed_scaling_factor=1.0,
         normalize_topk_weights=True,
+        simulation_seed=None,
     )
     actual_weights, actual_ids = moe_sigmoid_bias_topk(
         output,
@@ -304,6 +305,7 @@ def test_kimi3_router_projection_matches_torch_and_captures() -> None:
         16,
         routed_scaling_factor=1.0,
         normalize_topk_weights=True,
+        simulation_seed=None,
     )
     assert torch.equal(actual_ids, expected_ids)
     torch.testing.assert_close(actual_weights, expected_weights, rtol=1e-6, atol=1e-7)

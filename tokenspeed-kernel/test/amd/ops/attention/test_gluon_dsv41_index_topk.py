@@ -150,6 +150,7 @@ def test_index_topk_gluon_full_above_32k(device, require, monkeypatch):
         None,
         None,
         solution="gluon",
+        simulation_seed=None,
     )
 
     torch.testing.assert_close(
@@ -464,7 +465,21 @@ def test_index_topk_missing_latest_page(device, require, solution, missing_page)
     )
     visible = torch.tensor([256, 256, 0], dtype=torch.int32, device=device)
     rows, row_lens, blocks, block_lens = dsv41.index_topk(
-        q, weights, cache, table, visible, None, 512, 32, 8, 2, 64, None, None, solution
+        q,
+        weights,
+        cache,
+        table,
+        visible,
+        None,
+        512,
+        32,
+        8,
+        2,
+        64,
+        None,
+        None,
+        solution,
+        simulation_seed=None,
     )
     expected_rows = torch.cat(
         [torch.arange(64, device=device), torch.arange(128, 192, device=device)]
@@ -498,7 +513,21 @@ def test_index_topk_latest_block_outside_table(
     table = torch.tensor([[0, 1, 2, 2]], dtype=torch.int32, device=device)
     visible = torch.tensor([length], dtype=torch.int32, device=device)
     output = dsv41.index_topk(
-        q, weights, cache, table, visible, None, 16, 1, 8, 1, 64, None, None, solution
+        q,
+        weights,
+        cache,
+        table,
+        visible,
+        None,
+        16,
+        1,
+        8,
+        1,
+        64,
+        None,
+        None,
+        solution,
+        simulation_seed=None,
     )
     assert output[2].item() == expected_block
     assert output[3].item() == 1
@@ -555,6 +584,7 @@ def test_index_topk_preserves_arena_page_stride(
             None,
             None,
             "gluon",
+            simulation_seed=None,
         )
 
     expected = run(cache.contiguous())

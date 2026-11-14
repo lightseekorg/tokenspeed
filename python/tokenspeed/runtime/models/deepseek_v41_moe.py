@@ -131,9 +131,11 @@ class DeepseekV4TopK(TopK):
         routed_scaling_factor: float,
         hash_routing: bool,
         weights_dtype: torch.dtype,
+        layer_id: int,
     ) -> None:
         super().__init__(
             top_k=top_k,
+            layer_id=layer_id,
             renormalize=renormalize,
             correction_bias=correction_bias,
             routed_scaling_factor=routed_scaling_factor,
@@ -167,6 +169,11 @@ class DeepseekV4TopK(TopK):
             hash_indices_table=hash_indices_table,
             input_ids=input_ids,
             topk_weights_dtype=self.weights_dtype,
+            simulation_seed=(
+                self.topk_config.layer_id
+                if global_server_args_dict["simulate"]
+                else None
+            ),
         )
         return StandardTopKOutput(topk_weights, topk_ids, router_logits)
 
@@ -334,6 +341,7 @@ class DeepseekV4MoE(nn.Module):
             ),
         )
         self.topk = DeepseekV4TopK(
+            layer_id=layer_index,
             top_k=config.num_experts_per_tok,
             renormalize=self._renormalize_routing_weights(),
             correction_bias=self.gate.e_score_correction_bias,
@@ -387,8 +395,7 @@ class DeepseekV4MoE(nn.Module):
                 f"{tuple(gate_up.weight.shape)} and {tuple(down.weight.shape)}"
             )
         logger.info(
-            f"Layer {self.layer_index} runs its shared expert outside MegaMoE: "
-            f"{reason}"
+            f"Layer {self.layer_index} runs its shared expert outside MegaMoE: {reason}"
         )
 
     def warmup(self) -> None:

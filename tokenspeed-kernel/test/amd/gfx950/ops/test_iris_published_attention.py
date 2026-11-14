@@ -403,7 +403,12 @@ def _deferred_gather_worker(rank: int, port: int) -> None:
 
     def route(rows, logits):
         ids, weights = invoke_sigmoid_bias_topk_route_prefill_gluon(
-            logits, bias, 16, routed_scaling_factor=2.5, normalize_topk_weights=True
+            logits,
+            bias,
+            16,
+            routed_scaling_factor=2.5,
+            normalize_topk_weights=True,
+            simulation_seed=None,
         )
         return weights, ids
 

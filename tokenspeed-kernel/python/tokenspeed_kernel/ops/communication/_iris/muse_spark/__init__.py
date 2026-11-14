@@ -2261,12 +2261,16 @@ class MuseIrisState:
         bias: torch.Tensor,
         topk: int,
         routed_scaling_factor: float,
+        *,
+        simulation_seed: int | None,
     ) -> tuple[tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor]:
         """Gather and quantize the expert inputs, and route the rows, in one launch.
 
         Returns the MXFP4 rows and scales of :meth:`all_gather_rmsnorm_mxfp4_quant`
         and the FP32 weights and int32 ids of the gfx950 biased-sigmoid top-k
         (normalized, then scaled by ``routed_scaling_factor``).
+        ``simulation_seed`` permutes only final expert IDs, or None preserves
+        selected IDs. Scoring, selection and the fused collective remain live.
         """
         if not self.can_all_gather_rmsnorm_mxfp4_quant_topk(
             local, weight, bias, topk
@@ -2314,6 +2318,7 @@ class MuseIrisState:
             topk_ids,
             topk_weights,
             rows,
+            0 if simulation_seed is None else simulation_seed,
             rank=self.all_reduce.rank_in_group,
             local_width=local_width,
             total_width=total_width,
@@ -2325,6 +2330,7 @@ class MuseIrisState:
             EXPERTS=logits.shape[1],
             TOPK=topk,
             ROUTED_SCALING_FACTOR=float(routed_scaling_factor),
+            SIMULATE=simulation_seed is not None,
             num_warps=1,
         )
         return (packed, scales), topk_weights, topk_ids

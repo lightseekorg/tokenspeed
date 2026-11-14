@@ -92,3 +92,30 @@ def test_request_time_stats_compatibility_flag():
     assert prepare_server_args(
         ["--model", "x", "--enable-request-time-stats-logging"]
     ).enable_log_request_stats
+
+
+@pytest.mark.parametrize(
+    "architecture",
+    [
+        "KimiK31ForConditionalGeneration",
+        "DeepseekV41ForCausalLM",
+        "MuseSparkForConditionalGeneration",
+    ],
+)
+def test_simulate_tokens_uses_dummy_weights_and_reaches_workers(tmp_path, architecture):
+    import json
+
+    (tmp_path / "config.json").write_text(json.dumps({"architectures": [architecture]}))
+    original = global_server_args_dict.copy()
+    try:
+        args = prepare_server_args(["--model", str(tmp_path), "--simulate-tokens"])
+        assert args.load_format == "dummy"
+        global_server_args_dict_update(args)
+        assert global_server_args_dict["simulate"] is True
+        args = prepare_server_args(["--model", str(tmp_path)])
+        global_server_args_dict_update(args)
+        assert global_server_args_dict["simulate"] is False
+        assert args.load_format == "auto"
+    finally:
+        global_server_args_dict.clear()
+        global_server_args_dict.update(original)

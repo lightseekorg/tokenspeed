@@ -46,6 +46,7 @@ def _softmax_topk(
         routed_scaling_factor=routed_scaling_factor,
         topk_indices_dtype=topk_indices_dtype,
         solution=solution,
+        simulation_seed=None,
     )
 
 

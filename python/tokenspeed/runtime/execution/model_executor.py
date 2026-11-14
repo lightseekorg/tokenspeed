@@ -2554,6 +2554,82 @@ class ModelExecutor:
                 rows, stream=self.execution_stream
             )
 
+    def prepare_simulated_decode(self, fixture, candidate_token_ids) -> None:
+        """Seed a private simulated benchmark on the normal execution stream.
+
+        Clears the shared target/draft arena, so this is only called between
+        benchmark cases, with no other live requests or in-flight forwards.
+        The CPU fixture retains the ordinary scheduler's page ownership.
+        """
+        if not self.model_runner.server_args.simulate:
+            raise RuntimeError("Synthetic cache preparation requires --simulate-tokens")
+        if self.config.overlap_schedule_depth != 0:
+            raise ValueError("Synthetic fixtures require serial direct forwards")
+        batch = fixture.decode_plan.forward[0]
+        if batch.num_extends() or any(
+            n != self.config.output_length for n in batch.input_lengths
+        ):
+            raise ValueError("Synthetic fixture must match the executor's decode width")
+        if len(candidate_token_ids) != len(fixture.next_token_ids) or any(
+            not row or row[0] != token
+            for row, token in zip(
+                candidate_token_ids, fixture.next_token_ids, strict=True
+            )
+        ):
+            raise ValueError(
+                "Candidate column zero must match the fixture's next token"
+            )
+        arena = self.token_to_kv_pool.arena
+        if (
+            self.draft_token_to_kv_pool is not None
+            and self.draft_token_to_kv_pool.arena is not arena
+        ):
+            raise RuntimeError("Target and draft must share the normal cache arena")
+        self.complete_pending_drafting()
+        self.execution_stream.wait_stream(self.default_stream)
+        with self.device_module.stream(self.execution_stream):
+            # Full-byte initialization includes KV, index keys, packed scales,
+            # compressor tails, convolution and recurrent state. Page-zeroing
+            # alone only covers fields marked for clearing on allocator reuse.
+            arena.clear()
+            from tokenspeed.runtime.execution.simulation import (
+                seed_simulated_index_history,
+            )
+            from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
+                DeepseekV41AttentionBackend,
+            )
+
+            index_format = (
+                self.attn_backend.index_format
+                if isinstance(self.attn_backend, DeepseekV41AttentionBackend)
+                else None
+            )
+            seed_simulated_index_history(
+                self.token_to_kv_pool,
+                fixture,
+                index_format=index_format,
+                seed=1234,
+                rows_per_chunk=8192,
+            )
+            seeds = RequestHistorySeeds(
+                slots=tuple(batch.request_pool_indices),
+                prefix_lengths=fixture.context_lengths,
+                tokens=fixture.prompt_tokens,
+            )
+            self.runtime_states.seed_simulated_decode(
+                seeds,
+                candidate_token_ids,
+                request_ids=tuple(batch.request_ids),
+            )
+            rows = torch.tensor(
+                batch.request_pool_indices, dtype=torch.int64, device=self.device
+            )
+            self.attn_backend.invalidate_cache_residency(
+                rows, stream=self.execution_stream
+            )
+        # This is case setup, not a timed forward or a serving-loop operation.
+        self.execution_stream.synchronize()
+
     def execute_forward_op(
         self,
         forward_op,

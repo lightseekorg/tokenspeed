@@ -25,6 +25,7 @@ from torch import nn
 
 from tokenspeed.runtime.layers.moe.types import MoELayerSpec
 from tokenspeed.runtime.layers.moe.weights.loaders import make_weight_loader, round_up
+from tokenspeed.runtime.layers.quantization.utils import dummy_unit_scales
 from tokenspeed.runtime.utils import set_weight_attrs
 
 
@@ -77,8 +78,11 @@ def create_fp8_block_scale_inverses(
                 )
 
     weight_loader = make_weight_loader(spec)
-    set_weight_attrs(w13_weight_scale, {"weight_loader": weight_loader})
-    set_weight_attrs(w2_weight_scale, {"weight_loader": weight_loader})
+    for scale in (w13_weight_scale, w2_weight_scale):
+        set_weight_attrs(
+            scale,
+            {"weight_loader": weight_loader, "dummy_initializer": dummy_unit_scales},
+        )
 
 
 __all__ = ["create_fp8_block_scale_inverses"]
