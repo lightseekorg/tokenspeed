@@ -27,6 +27,7 @@ from tokenspeed_kernel.ops.attention.dsa._triton.candidate_exchange import (
 )
 from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.selection import traits_problem_filter
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 # Selected-slot DSA attention in absorbed-MLA form: the values are the latent
@@ -981,6 +982,13 @@ def triton_dsa_prefill(
         "topk": frozenset({512, 1024, 2048, 2049, 2050, 2051}),
         "topk_layout": frozenset({"global_slots"}),
         "logit_cap": frozenset({False}),
+        "problem_filter": frozenset(
+            {
+                traits_problem_filter(
+                    triton_dsa_prefill_dcp_records_supported, "tokens", "heads", "topk"
+                )
+            }
+        ),
     },
     priority=Priority.PORTABLE,
 )
@@ -1259,7 +1267,13 @@ def triton_dsa_merge_candidates(
     "dsa_index_candidates",
     name="triton_dsa_sharded_index_candidates",
     solution="triton",
-    signatures=_TOPK_SIGNATURES,
+    signatures=frozenset(
+        format_signature(
+            q=dense_tensor_format(q_dtype), weights=dense_tensor_format(w_dtype)
+        )
+        for q_dtype in (torch.bfloat16, torch.float8_e4m3fn)
+        for w_dtype in (torch.bfloat16, torch.float32)
+    ),
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
     priority=Priority.PORTABLE,
 )
@@ -1276,8 +1290,16 @@ def triton_dsa_sharded_index_candidates(
     softmax_scale: float,
     initial_tokens: int,
     local_tokens: int,
+    q_scales: torch.Tensor | None = None,
+    query_group_size: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if current_platform().is_nvidia:
+    if q_scales is not None:
+        # Preserve the former model-side fallback's arithmetic exactly. The
+        # native leaf consumes the original FP8 values/scales directly.
+        weights = weights.float() * q_scales * float(softmax_scale)
+        q = q.to(torch.bfloat16)
+        softmax_scale = 1.0
+    elif current_platform().is_nvidia:
         quantized, weights = quantize_index_query_weights(q, weights, softmax_scale)
         q = quantized.to(torch.bfloat16)
         softmax_scale = 1.0
