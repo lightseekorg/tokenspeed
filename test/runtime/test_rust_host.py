@@ -51,6 +51,8 @@ from tokenspeed_scheduler import (  # noqa: E402
     AttnKind,
     Cache,
     CacheGroupConfig,
+    ExecutionEvent,
+    ForwardEvent,
     RequestSpec,
     Scheduler,
     SchedulerConfig,
@@ -70,6 +72,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (  # noqa: E402
 )
 from tokenspeed.runtime.execution.device import DeviceHandle  # noqa: E402
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode  # noqa: E402
+from tokenspeed.runtime.execution.runtime_states import RuntimeStates  # noqa: E402
 from tokenspeed.runtime.execution.types import (  # noqa: E402
     InputLogprobPlan,
     ModelExecutionResult,
@@ -412,6 +415,13 @@ class _CpuExecutor:
         self.output_token_cumulative_probs: torch.Tensor | None = (
             output_token_cumulative_probs
         )
+        self.runtime_states = RuntimeStates(
+            req_pool_size=4,
+            input_vocab_size=512,
+            vocab_size=512,
+            output_length=1,
+            device="cpu",
+        )
         self.forwards: list[tuple[list[str], list, tuple]] = []
         self.dp_metadata: list = []
         self.idle_forwards: list = []
@@ -420,6 +430,11 @@ class _CpuExecutor:
 
     def execute_forward_op(self, forward_op, sampling_params_list, **kwargs):
         rows = len(forward_op.request_ids)
+        self.runtime_states.bind_stop_criteria(
+            kwargs["admission_ids"],
+            forward_op.request_pool_indices,
+            kwargs["stop_criteria"],
+        )
         self.dp_metadata.append(kwargs["dp_metadata"])
         self.forwards.append(
             (
@@ -485,11 +500,11 @@ class _CpuExecutor:
         pass
 
 
-def _scheduler() -> Scheduler:
+def _scheduler(*, max_batch_size: int) -> Scheduler:
     config = SchedulerConfig()
     config.prefix_granularity = 16
     config.max_scheduled_tokens = 64
-    config.max_batch_size = 4
+    config.max_batch_size = max_batch_size
     config.num_device_pages = 64
     config.num_snapshot_pages = 1
     config.cache_groups = [
@@ -546,8 +561,8 @@ def test_the_data_plane_runs_a_plan_with_the_admitted_requests(
 ):
     plane = _data_plane(DeviceHandle(executor))
     params = _resolved("r1", temperature=0.0, max_new_tokens=8, stop_token_ids={9})
-    plane.admit([("r1", msgspec.msgpack.encode(params), [2, 9], 11, None)])
-    scheduler = _scheduler()
+    plane.admit([("r1", 1, msgspec.msgpack.encode(params), [2, 9], 11, None)])
+    scheduler = _scheduler(max_batch_size=4)
     spec = RequestSpec()
     spec.request_id = "r1"
     spec.tokens = [1, 2, 3]
@@ -597,7 +612,7 @@ def test_the_data_plane_hands_the_logprob_plan_to_the_forward(cumulative_probs):
         )
     )
     plane = _data_plane(DeviceHandle(executor))
-    plane.admit([("r1", msgspec.msgpack.encode(_resolved("r1")), [], 11, None)])
+    plane.admit([("r1", 1, msgspec.msgpack.encode(_resolved("r1")), [], 11, None)])
 
     pending = plane.execute(
         _plan_with_one_request("r1"), None, None, None, (([0], [2], [0], 2), 1), None
@@ -620,7 +635,7 @@ def test_the_data_plane_hands_the_logprob_plan_to_the_forward(cumulative_probs):
 
 
 def _plan_with_one_request(rid: str):
-    scheduler = _scheduler()
+    scheduler = _scheduler(max_batch_size=4)
     spec = RequestSpec()
     spec.request_id = rid
     spec.tokens = [1, 2, 3]
@@ -631,7 +646,7 @@ def _plan_with_one_request(rid: str):
 
 def test_a_data_parallel_forward_carries_every_ranks_batch(executor):
     plane = _data_plane(DeviceHandle(executor))
-    plane.admit([("r1", msgspec.msgpack.encode(_resolved("r1")), [], 11, None)])
+    plane.admit([("r1", 1, msgspec.msgpack.encode(_resolved("r1")), [], 11, None)])
 
     pending = plane.execute(
         _plan_with_one_request("r1"),
@@ -655,7 +670,7 @@ def test_a_data_parallel_forward_carries_every_ranks_batch(executor):
 
 def test_an_idle_data_parallel_rank_runs_an_idle_forward(executor):
     plane = _data_plane(DeviceHandle(executor))
-    plane.admit([("r1", msgspec.msgpack.encode(_resolved("r1")), [], 11, None)])
+    plane.admit([("r1", 1, msgspec.msgpack.encode(_resolved("r1")), [], 11, None)])
 
     # This rank's plan has a batch, but the control plane decided it idles.
     assert (
@@ -680,7 +695,14 @@ def test_an_idle_data_parallel_rank_runs_an_idle_forward(executor):
 def test_a_plan_without_a_batch_runs_no_forward(executor):
     plane = _data_plane(DeviceHandle(executor))
     assert (
-        plane.execute(_scheduler().next_execution_plan(), None, None, None, None, None)
+        plane.execute(
+            _scheduler(max_batch_size=4).next_execution_plan(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
         is None
     )
     assert executor.forwards == []
@@ -726,7 +748,7 @@ def test_the_data_plane_leaves_a_plans_storage_operations_to_the_host(executor):
 def test_a_released_request_is_forgotten(executor):
     plane = _data_plane(DeviceHandle(executor))
     params = _resolved("r1")
-    plane.admit([("r1", msgspec.msgpack.encode(params), [], 10, None)])
+    plane.admit([("r1", 1, msgspec.msgpack.encode(params), [], 10, None)])
     plane.release(["r1"])
     with pytest.raises(KeyError):
         plane.release(["r1"])
@@ -736,7 +758,7 @@ def test_a_forward_lands_once_and_counts_toward_a_profile_at_its_note(executor):
     """The commit waits on the copy event exactly once; the profiler counts
     the forward only when the forward thread runs its committed note."""
     profiled = _data_plane(DeviceHandle(executor))
-    profiled.admit([("r1", msgspec.msgpack.encode(_resolved("r1")), [], 11, None)])
+    profiled.admit([("r1", 1, msgspec.msgpack.encode(_resolved("r1")), [], 11, None)])
     launched = profiled.execute(
         _plan_with_one_request("r1"), None, None, None, (None, 0), None
     )
@@ -768,3 +790,49 @@ def test_the_forward_thread_is_named_for_its_role(executor):
     thread.start()
     thread.join()
     assert names == ["tokenspeed::forward"]
+
+
+def test_reused_external_id_binds_the_new_admissions_stops(executor):
+    plane = _data_plane(DeviceHandle(executor))
+    scheduler = _scheduler(max_batch_size=1)
+    for admission_id, prompt_length, limit, stops in [
+        (41, 4, 6, [7]),
+        (42, 10, 30, []),
+    ]:
+        params = _resolved("reused", max_new_tokens=limit - prompt_length)
+        plane.admit(
+            [
+                (
+                    "reused",
+                    admission_id,
+                    msgspec.msgpack.encode(params),
+                    stops,
+                    limit,
+                    None,
+                )
+            ]
+        )
+        spec = RequestSpec()
+        spec.request_id = "reused"
+        spec.tokens = list(range(prompt_length))
+        spec.max_new_tokens = limit - prompt_length
+        scheduler.submit_requests([spec])
+        plan = scheduler.next_execution_plan()
+        assert list(plan.forward[0].request_pool_indices) == [1]
+        pending = plane.execute(plan, None, None, None, (None, 0), None)
+        assert pending is not None
+        plane.complete(pending)
+        assert int(executor.runtime_states.token_limits[1]) == limit
+        assert executor.runtime_states.stop_token_ids[1, :1].tolist() == (stops or [-1])
+        result = ForwardEvent.ExtendResult()
+        result.request_id = "reused"
+        result.tokens = [100]
+        finish = ForwardEvent.Finish()
+        finish.request_id = "reused"
+        events = ExecutionEvent()
+        events.add_event(result)
+        events.add_event(finish)
+        scheduler.advance(events)
+        scheduler.next_execution_plan()
+        assert scheduler.request_token_size("reused") == -1
+        plane.release(["reused"])

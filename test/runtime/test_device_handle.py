@@ -83,7 +83,13 @@ register_cuda_ci(est_time=20, suite="runtime-2gpu")
 
 
 def _execute(handle, plan, planned):
-    return handle.execute(plan, planned, cache_ops=cache_ops_from_plan(plan).device)
+    return handle.execute(
+        plan,
+        planned,
+        cache_ops=cache_ops_from_plan(
+            plan, request_admission={f"r{i}": i for i in range(1, 10)}.__getitem__
+        ).device,
+    )
 
 
 @pytest.mark.parametrize(
@@ -428,6 +434,7 @@ def _planned(*, num_extends, label=None):
         input_logprob_plan=None,
         sampled_top_k=0,
         stop_criteria=(),
+        admission_ids=(1,),
     )
 
 
@@ -1419,7 +1426,7 @@ def test_device_consumes_the_explicit_snapshot_without_reading_plan_cache():
             return ()
 
     plan = Plan()
-    prepared = cache_ops_from_plan(plan)
+    prepared = cache_ops_from_plan(plan, request_admission={}.__getitem__)
     trace = []
     handle = _handle(trace)
     handle.execute(plan, None, cache_ops=prepared.device)

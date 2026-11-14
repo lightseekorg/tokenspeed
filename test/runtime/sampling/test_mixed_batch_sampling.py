@@ -123,7 +123,7 @@ def test_verify_reads_decode_rows_own_coins():
         p.verify(VOCAB)
 
     backend.prepare_step(
-        request_ids=rids,
+        admission_ids=list(range(1, len(rids) + 1)),
         request_pool_indices=pool,
         sampling_params_list=sp,
         num_tokens_per_req=n,
@@ -203,7 +203,7 @@ def test_mixed_round_preserves_prefill_outputs():
     for p in sp:
         p.verify(VOCAB)
     backend.prepare_step(
-        request_ids=rids,
+        admission_ids=list(range(1, len(rids) + 1)),
         request_pool_indices=pool,
         sampling_params_list=sp,
         num_tokens_per_req=n,
@@ -285,7 +285,7 @@ def test_mixed_round_preserves_prefill_logprobs():
     for p in sp:
         p.verify(VOCAB)
     backend.prepare_step(
-        request_ids=rids,
+        admission_ids=list(range(1, len(rids) + 1)),
         request_pool_indices=pool,
         sampling_params_list=sp,
         num_tokens_per_req=n,

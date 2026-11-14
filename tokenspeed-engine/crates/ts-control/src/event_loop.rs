@@ -2738,7 +2738,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     /// paused (registered, so an abort still reaches them).
     fn register(
         &mut self,
-        admissions: Vec<Admission>,
+        mut admissions: Vec<Admission>,
         outputs: &mut Vec<StreamedOutput>,
         released: &mut Vec<String>,
     ) -> Result<(), LoopError> {
@@ -2747,6 +2747,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         }
         let _span = profile::span("EventLoop::register");
         tracing::debug!(admitted = admissions.len(), "requests admitted");
+        for admission in &mut admissions {
+            self.outputs.assign_admission(&mut admission.state);
+        }
         // The data plane learns a request before the scheduler can plan it.
         self.data_plane.admit(&admissions)?;
         let mut submissions = Vec::with_capacity(admissions.len());

@@ -2582,6 +2582,7 @@ class ModelExecutor:
         input_logprob_plan: InputLogprobPlan | None,
         sampled_top_k: int,
         stop_criteria: Sequence[StopCriteria],
+        admission_ids: Sequence[int],
     ) -> ModelExecutionResult:
         self._reset_valid_cache_length(forward_op)
         self.log_step += 1
@@ -2610,7 +2611,7 @@ class ModelExecutor:
             # Outside the graph: in-graph sites only OR into the flag buffer.
             self.nan_guard.reset(bs)
             self.runtime_states.bind_stop_criteria(
-                forward_op.request_ids, forward_op.request_pool_indices, stop_criteria
+                admission_ids, forward_op.request_pool_indices, stop_criteria
             )
             cache_metadata = None
             block_tables = {}
@@ -2844,7 +2845,7 @@ class ModelExecutor:
                     # from sp.seed), so the event loop no longer threads them
                     # through.
                     self.sampling_backend.prepare_step(
-                        request_ids=forward_op.request_ids,
+                        admission_ids=admission_ids,
                         request_pool_indices=forward_op.request_pool_indices,
                         sampling_params_list=sampling_params_list,
                         num_tokens_per_req=self.config.output_length,

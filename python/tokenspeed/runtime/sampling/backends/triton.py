@@ -26,6 +26,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import torch
@@ -508,14 +509,14 @@ class TritonSamplingBackend(SamplingBackend):
 
     def prepare_step(
         self,
-        request_ids: list[str],
+        admission_ids: Sequence[int],
         request_pool_indices: list[int],
         sampling_params_list: list[SamplingParams],
         num_tokens_per_req: int = 1,
     ) -> None:
         SamplingBackend.prepare_step(
             self,
-            request_ids=request_ids,
+            admission_ids=admission_ids,
             request_pool_indices=request_pool_indices,
             sampling_params_list=sampling_params_list,
             num_tokens_per_req=num_tokens_per_req,

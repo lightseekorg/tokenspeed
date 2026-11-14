@@ -33,9 +33,9 @@ Token-derived rows are deliberately NOT part of the image: the request's
 committed-token history and the n-gram tail are reseeded from the control
 plane's token list on a slot change, exactly as a slot handoff is today.
 
-An owner that keys its slots by request -- the sampling backends' pools, the
-DSpark windows -- prepares a slot at the request's first forward and skips
-that reset while the slot's recorded request id matches. Such an owner images
+An owner that tracks slot admissions -- the sampling backends' pools --
+prepares a slot at the request's first forward and skips that reset while the
+slot's recorded admission identity matches. Such an owner images
 a **prepared marker** in front of its rows: a victim that never ran a forward
 on this engine (a PD decode role's request retracted between its landing and
 its first decode) still holds the slot's previous occupant's rows, so the
@@ -98,25 +98,24 @@ class SlotStateExporter(Protocol):
         """Bytes of one slot's image; fixed for the executor's lifetime."""
 
     def export_slot_state(
-        self, slot: int, out: torch.Tensor, stream, *, request_id: str
+        self, slot: int, out: torch.Tensor, stream, *, admission_id: int
     ) -> None:
         """Copy ``slot``'s state into ``out`` (uint8, ``slot_state_bytes()`` long).
 
         Enqueued on ``stream``; the caller orders that stream behind the
         stream the state was written on and records the completion event.
-        ``request_id`` is the victim the slot is imaged for: an owner that
-        keys its slots by request images whether the slot was prepared for
-        it (the module docstring).
+        ``admission_id`` identifies one admission in this engine lifetime,
+        independent of its reusable external request ID. An owner images
+        whether the slot was prepared for that admission (the module docstring).
         """
 
     def import_slot_state(
-        self, slot: int, src: torch.Tensor, stream, *, request_id: str
+        self, slot: int, src: torch.Tensor, stream, *, admission_id: int
     ) -> None:
-        """Copy an image back into ``slot`` for ``request_id``.
+        """Copy an image back into ``slot`` for ``admission_id``.
 
-        ``request_id`` lets an owner that keys its slots by request (DSpark's
-        windows) claim the slot, so its next prologue does not treat the
-        restored rows as a stale occupant's.
+        The admission identity stays unchanged across retraction. An owner
+        can claim the restored rows so its next preparation preserves them.
         """
 
 
@@ -244,19 +243,23 @@ class SlotStateLayout:
                 f"{image.numel()}"
             )
 
-    def export(self, slot: int, out: torch.Tensor, stream, *, request_id: str) -> None:
-        """Image ``slot``, ``request_id``'s, into ``out`` on ``stream``, one
+    def export(
+        self, slot: int, out: torch.Tensor, stream, *, admission_id: int
+    ) -> None:
+        """Image ``slot``, ``admission_id``'s, into ``out`` on ``stream``, one
         segment per exporter."""
         self._check(out)
         for exporter, begin, end in self.segments:
             exporter.export_slot_state(
-                slot, out[begin:end], stream, request_id=request_id
+                slot, out[begin:end], stream, admission_id=admission_id
             )
 
-    def import_(self, slot: int, src: torch.Tensor, stream, *, request_id: str) -> None:
-        """Restore ``src`` into ``slot``, now ``request_id``'s, on ``stream``."""
+    def import_(
+        self, slot: int, src: torch.Tensor, stream, *, admission_id: int
+    ) -> None:
+        """Restore ``src`` into ``slot``, now ``admission_id``'s, on ``stream``."""
         self._check(src)
         for exporter, begin, end in self.segments:
             exporter.import_slot_state(
-                slot, src[begin:end], stream, request_id=request_id
+                slot, src[begin:end], stream, admission_id=admission_id
             )

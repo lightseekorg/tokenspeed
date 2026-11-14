@@ -66,7 +66,7 @@ def test_finite_top_k_cap_and_disabled_survive_graph_replay(top_p, implicit_cap)
             SamplingParams(temperature=1, top_k=k, top_p=top_p, seed=73) for k in ks
         ]
         backend.prepare_step(
-            [f"top-k-{generation}-{row}" for row in range(rows)],
+            [generation * rows + row + 1 for row in range(rows)],
             list(range(1, rows + 1)),
             params,
             num_tokens_per_req=1,
@@ -139,7 +139,7 @@ def test_sampling_with_nan_detection_is_graph_safe(verify, implicit_cap, top_k):
         )
     )
     backend.prepare_step(
-        ["graph-safe"],
+        [23],
         [1],
         [SamplingParams(temperature=1, top_k=top_k, top_p=0.95, seed=73)],
         num_tokens_per_req=1,

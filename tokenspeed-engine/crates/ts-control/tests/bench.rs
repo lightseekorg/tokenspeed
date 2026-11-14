@@ -105,7 +105,8 @@ fn bench_commit_decode() {
     let mut rids: Vec<String> = Vec::with_capacity(bs);
     for i in 0..bs {
         let rid = format!("r{i}");
-        let state = RequestState::new(vec![0; 16], 1 << 30, BTreeSet::new(), true, None, false);
+        let mut state = RequestState::new(vec![0; 16], 1 << 30, BTreeSet::new(), true, None, false);
+        p.assign_admission(&mut state);
         p.register(rid.clone(), state);
         let _ = p
             .commit(

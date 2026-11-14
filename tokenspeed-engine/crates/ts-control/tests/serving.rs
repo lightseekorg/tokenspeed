@@ -280,6 +280,8 @@ type ExecutedPlan = (usize, Vec<String>, Vec<CacheOpView>);
 /// `ack_polls` polls later, and never while `ack_gate` is closed.
 #[derive(Default)]
 struct FakeDevice {
+    /// Every data-plane admission must already have a fresh identity.
+    last_admission: u64,
     /// This rank; PD names it as a sender of a request's KV.
     rank: usize,
     /// Tokens generated per request so far.
@@ -658,6 +660,8 @@ impl DataPlane for FakeDevice {
 
     fn admit(&mut self, requests: &[Admission]) -> Result<(), DataPlaneError> {
         for request in requests {
+            assert!(request.state.admission > self.last_admission);
+            self.last_admission = request.state.admission;
             self.generated.insert(request.rid.clone(), 0);
             if let Some(bootstrap) = &request.bootstrap {
                 self.rooms.insert(request.rid.clone(), bootstrap.room);
@@ -1492,6 +1496,7 @@ fn run_rank<F: Frontend>(
 fn fake_device(layout: Layout, rank: usize, setup: &Setup) -> FakeDevice {
     let (world, _, _) = layout.sizes();
     FakeDevice {
+        last_admission: 0,
         rank,
         ack_polls: setup.cache_ack_polls.map_or(0, |polls| polls(rank)),
         ack_gate: if setup.held_cache_acks {

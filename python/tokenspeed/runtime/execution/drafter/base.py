@@ -431,18 +431,16 @@ class BaseDrafter:
         return slot_state_image_bytes(self.slot_state_rows(0))
 
     def export_slot_state(
-        self, slot: int, out: torch.Tensor, stream, *, request_id: str
+        self, slot: int, out: torch.Tensor, stream, *, admission_id: int
     ) -> None:
-        # The default rows are rewritten by every forward of the slot, never
-        # keyed by request; a drafter that keys them (DSpark) overrides both
-        # copies to image the prepared marker (``slot_state.py``).
-        del request_id
+        # The default exporter copies slot rows without a prepared marker.
+        del admission_id
         pack_slot_rows(self.slot_state_rows(slot), out, stream)
 
     def import_slot_state(
-        self, slot: int, src: torch.Tensor, stream, *, request_id: str
+        self, slot: int, src: torch.Tensor, stream, *, admission_id: int
     ) -> None:
-        del request_id
+        del admission_id
         unpack_slot_rows(self.slot_state_rows(slot), src, stream)
 
     @abstractmethod

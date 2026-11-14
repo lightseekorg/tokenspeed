@@ -177,6 +177,7 @@ type ExpertLoad = (Vec<Vec<i64>>, Vec<Vec<i32>>);
 
 struct AdmitRow {
     rid: String,
+    admission_id: u64,
     sampling_params: Bytes,
     stop_token_ids: Vec<i32>,
     token_limit: i64,
@@ -415,6 +416,7 @@ impl DataPlane for PythonDataPlane {
             let stop = request.state.stop_criteria();
             rows.push(AdmitRow {
                 rid: request.rid.clone(),
+                admission_id: request.state.admission,
                 sampling_params,
                 stop_token_ids: stop.stop_token_ids,
                 token_limit: stop.token_limit,
@@ -722,6 +724,7 @@ fn run(
                         py,
                         [
                             row.rid.into_pyobject(py)?.into_any(),
+                            row.admission_id.into_pyobject(py)?.into_any(),
                             PyBytes::new(py, &row.sampling_params).into_any(),
                             PyList::new(py, row.stop_token_ids)?.into_any(),
                             row.token_limit.into_pyobject(py)?.into_any(),

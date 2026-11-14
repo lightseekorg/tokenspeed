@@ -614,6 +614,7 @@ _L3_HOST_POOLS: list = []
 class _AdmittedRequest:
     """A request as the data plane holds it from admission to release."""
 
+    admission_id: int
     sampling_params: SamplingParams
     stop_criteria: StopCriteria
     # Read by ``multimodal_context_for_forward``; None for a text request.
@@ -699,16 +700,23 @@ class HostDataPlane:
 
     def admit(
         self,
-        requests: list[tuple[str, bytes, list[int], int, list | None]],
+        requests: list[tuple[str, int, bytes, list[int], int, list | None]],
     ) -> None:
-        """Register requests: ``(rid, sampling params, stop token ids, token
+        """Register requests: ``(rid, admission id, sampling params, stop token ids, token
         limit, multimodal frames)`` each. The control plane already resolved
         the parameters (``is_normalized`` is set), so decoding them changes
         nothing. The multimodal frames are a generate request on the wire
         carrying only the request's multimodal inputs, whose features this
         side owns from here on."""
         carriers = []
-        for rid, encoded, stop_token_ids, token_limit, multimodal in requests:
+        for (
+            rid,
+            admission_id,
+            encoded,
+            stop_token_ids,
+            token_limit,
+            multimodal,
+        ) in requests:
             carrier = (
                 zmq_wire.decode_request_frames(multimodal)[0]
                 if multimodal is not None
@@ -717,6 +725,7 @@ class HostDataPlane:
             if carrier is not None:
                 carriers.append(carrier)
             self._requests[rid] = _AdmittedRequest(
+                admission_id=admission_id,
                 sampling_params=_SAMPLING_PARAMS.decode(encoded),
                 stop_criteria=StopCriteria(
                     stop_token_ids=tuple(stop_token_ids), token_limit=token_limit
@@ -729,6 +738,9 @@ class HostDataPlane:
             # Every attention-TP rank admits the same requests in the same
             # order, so the shared-memory reachability exchange pairs up.
             prepare_shm_features(carriers, self._attn_tp_cpu_group)
+
+    def _admission_id(self, rid: str) -> int:
+        return self._requests[rid].admission_id
 
     def execute(
         self,
@@ -782,6 +794,7 @@ class HostDataPlane:
             input_rows, sampled_top_k = logprobs
             planned = PlannedForward(
                 forward_op=forward_op,
+                admission_ids=tuple(request.admission_id for request in requests),
                 sampling_params_list=[request.sampling_params for request in requests],
                 dp_metadata=dp_metadata,
                 grammar_inputs=(
@@ -835,7 +848,7 @@ class HostDataPlane:
         # Each op once, validated before any owner runs one: the Host copies
         # go to the device; the host's L3 executor took the storage
         # operations.
-        cache_ops = cache_ops_from_plan(plan)
+        cache_ops = cache_ops_from_plan(plan, request_admission=self._admission_id)
         results = self._device.execute(plan, planned, cache_ops=cache_ops.device)
         if idle_forward:
             self._device.run_idle_forward(dp_metadata)

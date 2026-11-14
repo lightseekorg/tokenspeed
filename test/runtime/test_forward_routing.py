@@ -36,7 +36,11 @@ from tokenspeed.runtime.execution.types import PlannedForward
 
 
 def _execute(handle, plan, planned):
-    return handle.execute(plan, planned, cache_ops=cache_ops_from_plan(plan).device)
+    return handle.execute(
+        plan,
+        planned,
+        cache_ops=cache_ops_from_plan(plan, request_admission={}.__getitem__).device,
+    )
 
 
 class _PrefillPeer:
@@ -114,6 +118,7 @@ def _planned(*, num_extends=0):
         input_logprob_plan=None,
         sampled_top_k=0,
         stop_criteria=(),
+        admission_ids=(1,),
     )
 
 

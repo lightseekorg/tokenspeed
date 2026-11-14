@@ -106,6 +106,7 @@ class Guard:
 class Plane:
     def __init__(self):
         self.calls = []
+        self.admissions = []
         self.next_token = 100
         self.held = None
         self.unblock = threading.Event()
@@ -124,6 +125,9 @@ class Plane:
 
     def exit_forward_thread(self):
         self.note("exit_forward_thread")
+
+    def admit(self, rows):
+        self.admissions.extend(rows)
 
     def execute(self, plan, dp, ngram, grammar_advance, logprobs, history):
         self.note("execute")
@@ -226,6 +230,52 @@ fn this_thread() -> u64 {
             .extract()
             .unwrap()
     })
+}
+
+#[test]
+fn admission_identity_and_stop_criteria_reach_python_together() {
+    let (plane, _) = plane();
+    let mut data_plane = start(&plane);
+    let mut state = ts_control::request::RequestState::new(
+        vec![1, 2, 3],
+        8,
+        std::collections::BTreeSet::from([9]),
+        true,
+        None,
+        false,
+    );
+    state.admission = 42;
+    let request = Admission {
+        rid: "reused".to_owned(),
+        spec: ts_scheduler::RequestSpec {
+            request_id: "reused".to_owned(),
+            session_id: String::new(),
+            cache_group_id: String::new(),
+            shared_prefix_tokens: Vec::new(),
+            tokens: vec![1, 2, 3],
+            max_new_tokens: 8,
+            max_cached_prefix_tokens: i32::MAX,
+        },
+        state,
+        sampling_params: ts_wire::SamplingParams::default(),
+        bootstrap: None,
+        multimodal: None,
+        embeddings: Vec::new(),
+        grammar: None,
+    };
+    data_plane.admit(&[request]).unwrap();
+    data_plane.ask(|reply| Op::Barrier { reply }).unwrap();
+    Python::attach(|py| {
+        let rows = plane.bind(py).getattr("admissions").unwrap();
+        let row = rows.get_item(0).unwrap();
+        assert_eq!(
+            row.get_item(0).unwrap().extract::<String>().unwrap(),
+            "reused"
+        );
+        assert_eq!(row.get_item(1).unwrap().extract::<u64>().unwrap(), 42);
+        assert_eq!(row.get_item(3).unwrap().extract::<Vec<i32>>().unwrap(), [9]);
+        assert_eq!(row.get_item(4).unwrap().extract::<i64>().unwrap(), 11);
+    });
 }
 
 #[test]
