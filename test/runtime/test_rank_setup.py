@@ -702,18 +702,6 @@ def test_write_back_is_refused_without_its_prerequisites(flags, refused, monkeyp
         ),
         (
             [
-                "--attn-tp-size",
-                "8",
-                "--kv-parallel-size",
-                "8",
-                "--decode-context-parallel-size",
-                "8",
-                "--enable-mixed-batch",
-            ],
-            "Aggregated DCP does not support --enable-mixed-batch",
-        ),
-        (
-            [
                 "--disaggregation-mode",
                 "prefill",
                 "--attn-tp-size",
@@ -727,7 +715,7 @@ def test_write_back_is_refused_without_its_prerequisites(flags, refused, monkeyp
             "null or decode",
         ),
     ],
-    ids=["fused_kvp_without_dcp", "fused_dcp_mixed_batch", "prefill_dcp"],
+    ids=["fused_kvp_without_dcp", "prefill_dcp"],
 )
 def test_write_back_leaves_the_context_parallel_rules_as_they_are(flags, refused):
     # A fused engine writes back over sharded pages only as the DCP engine

@@ -537,3 +537,14 @@ def test_write_slots_are_reused_per_forward_and_slots(monkeypatch):
     capturing[0] = False
     after = placement_mod.resolve_write_slots(loc, placement, share)
     assert after[0] is eager[0]
+
+    # Slots made under inference mode carry no version, so they are not kept.
+    share.write_slots = []
+    with torch.inference_mode():
+        inference_loc = loc.clone()
+    for _ in range(2):
+        result = placement_mod.resolve_write_slots(inference_loc, placement, share)
+        expected = resolve_cache_slots(inference_loc, placement)
+        assert torch.equal(result[0], expected[0])
+        assert torch.equal(result[1], expected[1])
+    assert share.write_slots == []

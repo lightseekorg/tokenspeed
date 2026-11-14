@@ -2276,6 +2276,10 @@ class MambaAttnBackend(AttentionBackend):
                 self.forward_metadata.scrub_padding(
                     core_attn_out[0] if core_attn_out.ndim == 4 else core_attn_out
                 )
+            if output_norm is not None:
+                # The scan returns the retained rows only; a padded replay's
+                # eager break lands them in the bucket after this returns.
+                output_norm = output_norm.rows(0, num_real_tokens)
 
         return apply_kda_output_norm(core_attn_out, output_norm)
 

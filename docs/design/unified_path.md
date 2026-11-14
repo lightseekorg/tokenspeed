@@ -717,9 +717,9 @@ over the target and draft `child_backends()` trees once
 two graph subsystems (`ForwardStepRunner.disable`, `PrefillGraph.disable`).
 `DSABackend` disables the prefill graph (rationale on the class) unless its
 consumer narrows a padded replay to the live rows in an eager break: a KPool
-instance (GLM-5.3-Flash), and Kimi-K3.1 on the prefill role and, without
-`--enable-mixed-batch`, on the aggregated role
-(`DSAConfig.padded_prefill_replay`).
+instance (GLM-5.3-Flash), and Kimi-K3.1 on the prefill role and on the
+aggregated role, where a mixed round's decode rows ride in the narrowed break
+with the extend's (`DSAConfig.padded_prefill_replay`).
 That instance declaration follows launch arguments, so the prefill role and
 Kimi-K3.1's aggregated role check at boot that every rank plans the same
 prefill graphs (`check_rank_uniform_prefill_plan`; keyed on the role and
