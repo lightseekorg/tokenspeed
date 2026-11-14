@@ -13,9 +13,14 @@ on:
       - "docs/**"
       - "README.md"
       - ".github/workflows/docs.yml"
+      - "test/ci_system/ci_speed_dashboard.py"
+  schedule:
+    # Refresh the CI speed dashboard (docs/public/ci) with the latest runs.
+    - cron: "17 */6 * * *"
   workflow_dispatch:
 
 permissions:
+  actions: read
   contents: read
   pages: write
   id-token: write
@@ -35,6 +40,30 @@ jobs:
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: "1.3.0"
+
+      # Completed runs never change, so the dashboard keeps what it fetched
+      # and reads only new runs (the token allows ~1000 requests an hour).
+      - name: Restore CI speed cache
+        if: github.event_name != 'pull_request'
+        uses: actions/cache@v4
+        with:
+          path: .ci-speed-cache
+          key: ci-speed-${{ github.run_id }}
+          restore-keys: ci-speed-
+
+      # A failed refresh must not block the docs; the page then says the
+      # data was not generated.
+      - name: Build CI speed dashboard data
+        if: github.event_name != 'pull_request'
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python3 test/ci_system/ci_speed_dashboard.py
+          --repo "${{ github.repository }}"
+          --cache .ci-speed-cache
+          --out docs/public/ci/data.json
+          --max-new-runs 400
 
       - name: Install docs dependencies
         working-directory: docs

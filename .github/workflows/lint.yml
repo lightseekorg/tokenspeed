@@ -94,6 +94,9 @@ jobs:
       - name: Check CI path filter and MI450 report digest
         run: python -m pytest -q test/ci_system/test_ci_path_filter.py test/ci_system/test_mi450_sim_report_digest.py
 
+      - name: Check CI speed dashboard
+        run: python -m pytest -q test/ci_system/test_ci_speed_dashboard.py
+
       - name: Install scheduler C++ lint tools
         if: steps.scheduler_cpp_changes.outputs.changed == 'true'
         run: |

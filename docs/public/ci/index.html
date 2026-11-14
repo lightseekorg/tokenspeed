@@ -1,0 +1,660 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TokenSpeed CI speed</title>
+<meta name="description" content="Wall-clock, queue time and flakiness of TokenSpeed pull-request CI over the last 14 days.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Familjen+Grotesk:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f4f3ee; --bg-grid: rgba(30, 41, 74, .045);
+  --surface: #fcfcfb; --surface-hover: #f1f0ea; --surface-2: #eceae2;
+  --border: rgba(11, 11, 11, .10); --border-strong: rgba(11, 11, 11, .22);
+  --text-primary: #12172a; --text-secondary: #4f5160; --text-muted: #85848a;
+  --primary: #23356b; --primary-soft: #e3e7f3; --accent: #b86f00;
+  --good: #006300; --bad: #b42f2f; --grid: #e1e0d9; --axis: #c3c2b7;
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100;
+  --board: #18213d;
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --bg: #0e1016; --bg-grid: rgba(160, 175, 220, .04);
+    --surface: #171a22; --surface-hover: #1f232d; --surface-2: #20242f;
+    --border: rgba(255, 255, 255, .10); --border-strong: rgba(255, 255, 255, .22);
+    --text-primary: #eeede8; --text-secondary: #c3c2b7; --text-muted: #8c8b88;
+    --primary: #9db0ea; --primary-soft: #222b45; --accent: #f0b03c;
+    --good: #3fbf3f; --bad: #f07a7a; --grid: #2a2d34; --axis: #3a3d45;
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500;
+    --board: #0a0d17;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #0e1016; --bg-grid: rgba(160, 175, 220, .04);
+  --surface: #171a22; --surface-hover: #1f232d; --surface-2: #20242f;
+  --border: rgba(255, 255, 255, .10); --border-strong: rgba(255, 255, 255, .22);
+  --text-primary: #eeede8; --text-secondary: #c3c2b7; --text-muted: #8c8b88;
+  --primary: #9db0ea; --primary-soft: #222b45; --accent: #f0b03c;
+  --good: #3fbf3f; --bad: #f07a7a; --grid: #2a2d34; --axis: #3a3d45;
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500;
+  --board: #0a0d17;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; color: var(--text-primary); background-color: var(--bg);
+  background-image: linear-gradient(var(--bg-grid) 1px, transparent 1px), linear-gradient(90deg, var(--bg-grid) 1px, transparent 1px);
+  background-size: 28px 28px;
+  font-family: "IBM Plex Sans", "Noto Sans SC", system-ui, sans-serif; font-size: 15px; line-height: 1.5;
+}
+.container { max-width: 1320px; margin: 0 auto; padding: 1.4rem 1.6rem 3rem; }
+h1, h2, h3 { font-family: "Familjen Grotesk", "Noto Sans SC", sans-serif; letter-spacing: -.01em; margin: 0; }
+code, .mono { font-family: "IBM Plex Mono", monospace; font-size: .86em; }
+a { color: var(--primary); }
+
+/* language: elements come in lang="en" / lang="zh" pairs */
+body.lang-en [lang="zh"] { display: none !important; }
+body.lang-zh [lang="en"] { display: none !important; }
+body.lang-bi span[lang="zh"]::before { content: " · "; color: var(--text-muted); }
+body.lang-bi :is(h1, h2, .klab, th) > span[lang="zh"] { display: block; font-size: .78em; font-weight: 500; color: var(--text-secondary); text-transform: none; letter-spacing: 0; }
+body.lang-bi :is(p, li, .kfoot, .note) > span[lang="zh"] { display: block; margin-top: .15rem; color: var(--text-secondary); }
+body.lang-bi :is(h1, h2, .klab, th, p, li, .kfoot, .note) > span[lang="zh"]::before { content: ""; }
+body.lang-bi tspan[lang="zh"] { font-size: .92em; }
+body:not(.lang-bi) .bisep { display: none; }
+
+/* header */
+header.board { background: var(--board); color: #f6efe0; border-radius: 16px; padding: 1.4rem 1.6rem 1.2rem; position: relative; overflow: hidden; }
+header.board::after { content: ""; position: absolute; inset: 0; pointer-events: none; background: repeating-linear-gradient(0deg, rgba(255,255,255,.025) 0 1px, transparent 1px 4px); }
+.eyebrow { font-family: "IBM Plex Mono", monospace; font-size: .74rem; letter-spacing: .14em; text-transform: uppercase; color: #f0b03c; }
+header.board h1 { font-size: 2.1rem; margin: .3rem 0 .5rem; color: #fff; }
+header.board h1 span[lang="zh"] { color: #c9cde0 !important; }
+.boardrow { display: flex; flex-wrap: wrap; gap: .5rem 1.6rem; align-items: center; font-size: .86rem; color: #c9cde0; }
+.boardrow b { color: #fff; font-family: "IBM Plex Mono", monospace; font-weight: 500; }
+.lamp { display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: #f0b03c; box-shadow: 0 0 10px #f0b03c; margin-right: 6px; vertical-align: 1px; }
+.controls { position: absolute; top: 1.2rem; right: 1.4rem; display: flex; gap: .5rem; z-index: 2; }
+.seg { display: inline-flex; border: 1px solid rgba(255,255,255,.25); border-radius: 8px; overflow: hidden; }
+.seg button { font: inherit; font-size: .8rem; border: 0; background: transparent; color: #c9cde0; padding: 4px 11px; cursor: pointer; }
+.seg button.on { background: #f0b03c; color: #18213d; }
+.markers { margin: .9rem 0 0; padding: 0; list-style: none; font-size: .84rem; color: #c9cde0; }
+.markers a { color: #f6d58f; }
+@media (max-width: 760px) { .controls { position: static; margin-bottom: .8rem; } }
+
+/* sections */
+section { margin-top: 2.3rem; }
+.sechead { display: flex; align-items: baseline; gap: 1rem; margin-bottom: .9rem; border-bottom: 1px solid var(--border); padding-bottom: .5rem; }
+.sechead .num { font-family: "IBM Plex Mono", monospace; color: var(--accent); font-size: .85rem; }
+.sechead h2 { font-size: 1.35rem; }
+.sechead p { margin: 0 0 0 auto; color: var(--text-secondary); font-size: .84rem; max-width: 56ch; text-align: right; }
+.notice { background: var(--surface); border: 1px dashed var(--border-strong); border-radius: 14px; padding: 2rem; text-align: center; color: var(--text-secondary); margin-top: 2rem; }
+
+/* KPIs */
+.kpis { display: grid; grid-template-columns: 1.5fr repeat(4, 1fr); gap: 12px; }
+@media (max-width: 1100px) { .kpis { grid-template-columns: repeat(2, 1fr); } }
+.kpi, .card { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 1rem 1.1rem; min-width: 0; }
+.kpi.hero { border-top: 4px solid var(--accent); }
+.klab { font-size: .82rem; color: var(--text-secondary); font-weight: 500; min-height: 2.4em; }
+.kval { font-family: "Familjen Grotesk", sans-serif; font-size: 2.2rem; font-weight: 700; margin: .25rem 0 .1rem; letter-spacing: -.02em; }
+.kpi.hero .kval { font-size: 3.4rem; line-height: 1.05; }
+.ksub { font-size: .84rem; color: var(--text-secondary); }
+.kfoot { font-size: .74rem; color: var(--text-muted); margin-top: .5rem; line-height: 1.4; }
+.delta { display: inline-block; font-size: .78rem; margin-top: .45rem; padding: 2px 8px; border-radius: 20px; background: var(--surface-2); color: var(--text-secondary); }
+.delta.good { background: color-mix(in srgb, var(--good) 13%, transparent); color: var(--good); }
+.delta.bad { background: color-mix(in srgb, var(--bad) 13%, transparent); color: var(--bad); }
+.dl.good { color: var(--good); font-weight: 600; } .dl.bad { color: var(--bad); font-weight: 600; }
+.n { color: var(--text-muted); font-size: .8em; font-family: "IBM Plex Mono", monospace; }
+.smalln { color: var(--accent); font-size: .78em; font-weight: 600; }
+.tag { font-size: .66rem; padding: 1px 6px; border-radius: 10px; background: var(--primary-soft); color: var(--primary); vertical-align: 1px; }
+
+/* charts */
+.grid3 { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.grid1 { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; }
+.flakygrid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; }
+@media (max-width: 1100px) { .grid3, .flakygrid { grid-template-columns: minmax(0, 1fr); } }
+.card h3 { font-size: 1rem; margin-bottom: .3rem; }
+svg.chart { width: 100%; height: auto; display: block; overflow: visible; }
+svg .gridl { stroke: var(--grid); stroke-width: 1; }
+svg .axis { stroke: var(--axis); stroke-width: 1; }
+svg .tick { fill: var(--text-muted); font-size: 10px; font-family: "IBM Plex Mono", monospace; }
+svg .axt { fill: var(--text-secondary); font-size: 10.5px; }
+svg .ln { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+svg .dot { stroke: var(--surface); stroke-width: 2; }
+svg .faded { opacity: .45; }
+svg .hit { fill: transparent; cursor: crosshair; }
+svg .hit:hover { fill: color-mix(in srgb, var(--text-primary) 4%, transparent); }
+svg .xhair { stroke: var(--text-muted); stroke-width: 1; opacity: 0; pointer-events: none; }
+svg .marker { stroke: var(--accent); stroke-width: 1.5; }
+svg .mlab { fill: var(--accent); font-size: 10px; font-family: "IBM Plex Mono", monospace; }
+.legend { display: flex; flex-wrap: wrap; gap: .3rem 1rem; font-size: .78rem; color: var(--text-secondary); margin: .2rem 0 .3rem; }
+.lg { display: inline-flex; align-items: center; gap: 6px; }
+.lk-line { display: inline-block; width: 16px; height: 2px; border-radius: 2px; }
+.lk-rect { display: inline-block; width: 11px; height: 11px; border-radius: 3px; }
+.empty { padding: 2rem; text-align: center; color: var(--text-muted); font-size: .85rem; }
+.note { font-size: .8rem; color: var(--text-secondary); margin: .6rem 0 0; }
+details.card summary { cursor: pointer; font-weight: 600; font-size: .9rem; }
+details.card[open] summary { margin-bottom: .6rem; }
+
+/* tables */
+.tbl-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: .84rem; }
+th { text-align: left; font-weight: 600; font-size: .74rem; text-transform: uppercase; letter-spacing: .03em; color: var(--text-secondary); border-bottom: 1px solid var(--border-strong); padding: .45rem .55rem; white-space: nowrap; cursor: pointer; user-select: none; vertical-align: bottom; }
+table.static th { cursor: default; }
+th.asc::after { content: " ▲"; color: var(--accent); } th.desc::after { content: " ▼"; color: var(--accent); }
+td { padding: .42rem .55rem; border-bottom: 1px solid var(--border); font-variant-numeric: tabular-nums; vertical-align: top; }
+tbody tr:hover { background: var(--surface-hover); }
+table.compact td, table.compact th { padding: .3rem .45rem; font-size: .78rem; }
+td code { overflow-wrap: anywhere; }
+td:first-child { min-width: 240px; }
+.mix { display: block; min-width: 300px; font-size: .76rem; color: var(--text-secondary); }
+body.lang-bi .mix > span[lang="zh"] { display: block; }
+body.lang-bi .mix > span[lang="zh"]::before { content: ""; }
+
+/* failure bars */
+.fbar { display: grid; grid-template-columns: minmax(0, 1.4fr) 1fr 2.6rem; gap: .7rem; align-items: center; padding: .28rem 0; }
+.fname { font-size: .8rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ftrack { height: 10px; background: color-mix(in srgb, var(--s2) 14%, transparent); border-radius: 4px; }
+.ffill { height: 10px; background: var(--s2); border-radius: 0 4px 4px 0; }
+.fval { font-family: "IBM Plex Mono", monospace; font-size: .82rem; text-align: right; }
+
+.howto { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 12px; }
+@media (max-width: 1100px) { .howto { grid-template-columns: minmax(0, 1fr); } }
+.howto ol, .howto ul { margin: .3rem 0 0; padding-left: 1.2rem; font-size: .85rem; }
+.howto li { margin: .35rem 0; }
+.foot { font-size: .72rem; text-align: center; color: var(--text-muted); border-top: 1px solid var(--border); margin-top: 3rem; padding-top: 1rem; }
+
+#tip { position: fixed; z-index: 9999; pointer-events: none; background: var(--surface); color: var(--text-primary); border: 1px solid var(--border-strong); border-radius: 10px; padding: .55rem .7rem; font-size: .78rem; box-shadow: 0 8px 24px rgba(0,0,0,.18); opacity: 0; transition: opacity .12s; max-width: 360px; }
+#tip .tt { font-weight: 600; margin-bottom: .3rem; color: var(--text-secondary); }
+#tip .tr { display: flex; align-items: center; gap: .5rem; margin: .12rem 0; }
+#tip .tr i { width: 12px; height: 2px; border-radius: 2px; flex: none; }
+#tip .tr b { font-family: "IBM Plex Mono", monospace; font-weight: 600; }
+#tip .tr span { color: var(--text-secondary); }
+@keyframes rise { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: none; } }
+.rise { animation: rise .5s cubic-bezier(.22,1,.36,1) both; }
+@media (prefers-reduced-motion: reduce) { .rise { animation: none; } }
+</style>
+</head>
+<body class="lang-bi">
+<div class="container">
+
+<header class="board rise">
+  <div class="controls">
+    <div class="seg" role="group" aria-label="language">
+      <button data-lang="bi" class="on">双语</button><button data-lang="en">EN</button><button data-lang="zh">中文</button>
+    </div>
+    <div class="seg" role="group" aria-label="theme">
+      <button data-theme-btn="auto" class="on" title="follow system">◐</button><button data-theme-btn="light" title="light">☀</button><button data-theme-btn="dark" title="dark">☾</button>
+    </div>
+  </div>
+  <div class="eyebrow" id="repo">lightseekorg/tokenspeed · PR CI</div>
+  <h1><span lang="en">CI speed dashboard</span><span lang="zh">CI 速度看板</span></h1>
+  <div class="boardrow" id="boardrow"></div>
+  <ul class="markers" id="markers"></ul>
+</header>
+
+<div id="nodata" class="notice" hidden>
+  <p><span lang="en"><b>Data not generated yet.</b> This page reads <code>data.json</code>, which the docs workflow writes with <code>test/ci_system/ci_speed_dashboard.py</code>.</span><span lang="zh"><b>数据尚未生成。</b>本页读取 <code>data.json</code>，该文件由文档工作流通过 <code>test/ci_system/ci_speed_dashboard.py</code> 生成。</span></p>
+</div>
+
+<main id="main" hidden>
+<section>
+  <div class="sechead"><span class="num">01</span><h2><span lang="en">Headline</span><span lang="zh">核心指标</span></h2>
+    <p><span lang="en">Last 7 days vs the 7 days before. Lower is better everywhere.</span><span lang="zh">近 7 天对比前 7 天。所有指标越低越好。</span></p></div>
+  <div class="kpis" id="kpis"></div>
+</section>
+
+<section>
+  <div class="sechead"><span class="num">02</span><h2><span lang="en">Wall time per workflow</span><span lang="zh">各工作流墙钟时间</span></h2>
+    <p><span lang="en">Minutes from run created to its last job finished, attempt 1, substantive runs only.</span><span lang="zh">从运行创建到最后一个作业完成的分钟数，首次尝试，仅实质性运行。</span></p></div>
+  <div class="card" id="wftable"></div>
+</section>
+
+<section>
+  <div class="sechead"><span class="num">03</span><h2><span lang="en">Daily trend</span><span lang="zh">每日趋势</span></h2>
+    <p><span lang="en">Median and p90 wall time per Pacific-time day. Faded dots: fewer than 5 runs that day. Amber lines: when a marked PR merged.</span><span lang="zh">每个太平洋时间日的中位数与 p90。淡色点：当天少于 5 个运行。琥珀色竖线：标记的 PR 合并时间。</span></p></div>
+  <div class="grid3" id="trends"></div>
+</section>
+
+<section>
+  <div class="sechead"><span class="num">04</span><h2><span lang="en">Critical path: B200 and MI350</span><span lang="zh">关键路径：B200 与 MI350</span></h2>
+    <p><span lang="en">Successful runs that had both unit and model tests. Each column stacks the median of each segment, so a column is not exactly the median total.</span><span lang="zh">同时含单测与模型测试的成功运行。每列叠加各段的中位数，因此列高不严格等于总时长中位数。</span></p></div>
+  <div class="grid1" id="cp"></div>
+</section>
+
+<section>
+  <div class="sechead"><span class="num">05</span><h2><span lang="en">Runner labels</span><span lang="zh">Runner 标签</span></h2>
+    <p><span lang="en">Self-hosted jobs, attempt 1, PR and main. Queue = job created → a runner picked it up. Click a header to sort.</span><span lang="zh">自托管作业，首次尝试，含 PR 与 main。排队 = 作业创建 → 被 runner 领取。点击表头排序。</span></p></div>
+  <div class="card" id="labels"></div>
+</section>
+
+<section>
+  <div class="sechead"><span class="num">06</span><h2><span lang="en">Slowest jobs (top 15)</span><span lang="zh">最慢的作业（前 15）</span></h2>
+    <p><span lang="en">By median run time (runner start → end), PR runs, attempt 1, at least 3 runs.</span><span lang="zh">按运行时间中位数（runner 开始 → 结束），PR 运行，首次尝试，至少 3 次。</span></p></div>
+  <div class="card" id="slow"></div>
+</section>
+
+<section>
+  <div class="sechead"><span class="num">07</span><h2><span lang="en">Flakiness</span><span lang="zh">不稳定性</span></h2>
+    <p><span lang="en">A failure on attempt 1 can be a real bug in the PR. "Failed, then passed on rerun" (same commit) and failures on main are the flake signals.</span><span lang="zh">首次尝试失败可能是 PR 本身的问题。“失败后重跑通过”（同一提交）和 main 上的失败才是不稳定信号。</span></p></div>
+  <div class="flakygrid">
+    <div class="card"><h3><span lang="en">Top failing tasks (attempt-1 failures, PR)</span><span lang="zh">失败最多的任务（首次尝试失败，PR）</span></h3><div id="fbars"></div></div>
+    <div class="card"><div id="flaky"></div><p class="note" id="rerunnote"></p></div>
+  </div>
+</section>
+
+<section>
+  <div class="sechead"><span class="num">08</span><h2><span lang="en">How to read this</span><span lang="zh">如何阅读</span></h2></div>
+  <div class="howto">
+    <div class="card"><ol id="howto"></ol></div>
+    <div class="card"><h3><span lang="en">Caveats</span><span lang="zh">注意事项</span></h3><ul id="caveats"></ul></div>
+  </div>
+</section>
+</main>
+
+<div class="foot"><span lang="en">Source: GitHub Actions REST API, generated by</span><span lang="zh">数据来源：GitHub Actions REST API，生成脚本</span> <code>test/ci_system/ci_speed_dashboard.py</code> · <a href="https://github.com/lightseekorg/tokenspeed">lightseekorg/tokenspeed</a></div>
+</div>
+<div id="tip" role="tooltip"></div>
+
+<script>
+(function () {
+  "use strict";
+  var COLORS = ["var(--s1)", "var(--s2)", "var(--s3)", "var(--s4)"];
+  var SEGS = [["scan", "scan", "扫描（scan）"], ["barrier", "unit-test barrier", "单测屏障"],
+              ["mtq", "model-test queue", "模型测试排队"], ["mtx", "model-test execution", "模型测试执行"]];
+  var D = null, W = {};
+
+  // ---------- helpers
+  function esc(s) { return String(s).replace(/[&<>"']/g, function (c) { return {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]; }); }
+  function bi(en, zh) { return '<span lang="en">' + en + '</span><span lang="zh">' + zh + "</span>"; }
+  function tsp(en, zh) { return '<tspan lang="en">' + esc(en) + '</tspan><tspan class="bisep"> · </tspan><tspan lang="zh">' + esc(zh) + "</tspan>"; }
+  function fm(x) { return x == null ? "n/a" : (x >= 100 ? x.toFixed(0) : x.toFixed(1)); }
+  function fh(x) {
+    if (x == null) return "n/a";
+    if (x < 60) return (x >= 10 ? x.toFixed(0) : x.toFixed(1)) + "m";
+    var h = Math.floor(x / 60), m = Math.round(x % 60);
+    if (m === 60) { h += 1; m = 0; }
+    return h + "h" + (m < 10 ? "0" : "") + m + "m";
+  }
+  function pct(a, b) { return (a == null || !b) ? null : (a - b) / b * 100; }
+  function smallN(n, k) {
+    return n < k ? ' <span class="smalln">' + bi("n=" + n + ", small sample", "n=" + n + "，样本少") + "</span>"
+                 : ' <span class="n">n=' + n + "</span>";
+  }
+  function warnN(n) { return n + (n < 10 ? ' <span class="smalln">⚠</span>' : ""); }
+  function delta(cur, prev, points) {
+    if (cur == null || prev == null) return '<span class="delta">' + bi("no prior-week data", "无上周数据") + "</span>";
+    var d = points ? cur - prev : pct(cur, prev);
+    if (d == null) return '<span class="delta">—</span>';
+    var txt = points ? (d >= 0 ? "+" : "") + d.toFixed(1) + " pt" : (d >= 0 ? "+" : "") + d.toFixed(0) + "%";
+    var cls = Math.abs(d) < (points ? 1 : 3) ? "" : (d < 0 ? "good" : "bad");
+    var arrow = cls === "" ? "→" : (d < 0 ? "▼" : "▲");
+    var en = cls === "good" ? "better" : cls === "bad" ? "worse" : "flat";
+    var zh = cls === "good" ? "改善" : cls === "bad" ? "变差" : "持平";
+    return '<span class="delta ' + cls + '"><b>' + arrow + " " + txt + "</b> " + bi(en + " vs prev 7d", "较前 7 天" + zh) + "</span>";
+  }
+  function day(i) { var p = D.days[i].split("-"); return {m: +p[1], d: +p[2], iso: D.days[i]}; }
+  function niceStep(top) {
+    if (top <= 0) return 1;
+    var raw = top / 4, mag = Math.pow(10, Math.floor(Math.log10(raw)));
+    var ms = [1, 2, 2.5, 5, 10];
+    for (var i = 0; i < ms.length; i++) if (raw <= ms[i] * mag) return ms[i] * mag;
+    return 10 * mag;
+  }
+  function tip(title, rows) { return esc(JSON.stringify({t: title, r: rows})); }
+  function markerDays() {
+    return (D.markers || []).filter(function (m) { return m.merged_at; }).map(function (m) {
+      var iso = new Date(m.merged_at).toLocaleDateString("en-CA", {timeZone: "America/Los_Angeles"});
+      return {i: D.days.indexOf(iso), label: "#" + m.number};
+    }).filter(function (m) { return m.i >= 0; });
+  }
+  function table(headers, rows, opts) {
+    opts = opts || {};
+    var h = '<div class="tbl-wrap"><table class="' + (opts.cls || "") + (opts.sortable === false ? " static" : "") + '"' + (opts.sortable === false ? "" : " data-sortable") + "><thead><tr>";
+    headers.forEach(function (x) { h += '<th data-sort="' + x[2] + '">' + bi(x[0], x[1]) + "</th>"; });
+    h += "</tr></thead><tbody>";
+    rows.forEach(function (r) {
+      h += "<tr>" + r.map(function (c) { return '<td data-v="' + esc(c[1] == null ? -1 : c[1]) + '">' + c[0] + "</td>"; }).join("") + "</tr>";
+    });
+    return h + "</tbody></table></div>";
+  }
+  function legend(items, kind) {
+    return '<div class="legend">' + items.map(function (x) {
+      return '<span class="lg"><i class="lk-' + kind + '" style="background:' + x[2] + '"></i>' + bi(x[0], x[1]) + "</span>";
+    }).join("") + "</div>";
+  }
+
+  // ---------- charts
+  function lineChart(series) {
+    var w = 520, h = 210, pl = 44, pr = 12, pt = 14, pb = 40, pw = w - pl - pr, ph = h - pt - pb, n = D.days.length;
+    var vals = [];
+    series.forEach(function (s) { s.v.forEach(function (x) { if (x != null) vals.push(x); }); });
+    if (!vals.length) return '<div class="empty">' + bi("no data in window", "窗口内无数据") + "</div>";
+    var step = niceStep(Math.max.apply(null, vals)), top = Math.ceil(Math.max.apply(null, vals) / step) * step;
+    function X(i) { return pl + pw * i / Math.max(1, n - 1); }
+    function Y(v) { return pt + ph - ph * v / top; }
+    var o = ['<svg viewBox="0 0 ' + w + " " + h + '" class="chart" role="img">'];
+    for (var y = 0; y <= top + 1e-9; y += step)
+      o.push('<line class="gridl" x1="' + pl + '" x2="' + (w - pr) + '" y1="' + Y(y) + '" y2="' + Y(y) + '"/><text class="tick" x="' + (pl - 6) + '" y="' + (Y(y) + 3.5) + '" text-anchor="end">' + +y.toFixed(2) + "</text>");
+    o.push('<line class="axis" x1="' + pl + '" x2="' + (w - pr) + '" y1="' + Y(0) + '" y2="' + Y(0) + '"/>');
+    for (var i = 0; i < n; i += 2) o.push('<text class="tick" x="' + X(i) + '" y="' + (h - pb + 14) + '" text-anchor="middle">' + day(i).m + "/" + day(i).d + "</text>");
+    o.push('<text class="axt" x="' + (pl + pw / 2) + '" y="' + (h - 6) + '" text-anchor="middle">' + tsp("PR run created (PT day)", "PR 运行创建日（太平洋时间）") + "</text>");
+    o.push('<text class="axt" transform="translate(11,' + (pt + ph / 2) + ') rotate(-90)" text-anchor="middle">' + tsp("minutes", "分钟") + "</text>");
+    markerDays().forEach(function (m) { o.push('<line class="marker" x1="' + X(m.i) + '" x2="' + X(m.i) + '" y1="' + pt + '" y2="' + (pt + ph) + '"/><text class="mlab" x="' + (X(m.i) + 3) + '" y="' + (pt + 9) + '">' + esc(m.label) + "</text>"); });
+    series.forEach(function (s) {
+      var seg = [];
+      function flush() { if (seg.length > 1) o.push('<polyline class="ln" style="stroke:' + s.c + '" points="' + seg.join(" ") + '"/>'); seg = []; }
+      s.v.forEach(function (v, i) { if (v == null) flush(); else seg.push(X(i).toFixed(1) + "," + Y(v).toFixed(1)); });
+      flush();
+      s.v.forEach(function (v, i) { if (v != null) o.push('<circle class="dot' + (s.n[i] < 5 ? " faded" : "") + '" cx="' + X(i).toFixed(1) + '" cy="' + Y(v).toFixed(1) + '" r="4" style="fill:' + s.c + '"/>'); });
+    });
+    var bw = pw / Math.max(1, n - 1);
+    for (i = 0; i < n; i++) {
+      var rows = series.map(function (s) { return [s.en, s.zh, s.v[i] == null ? "n/a" : fm(s.v[i]) + " min (n=" + s.n[i] + ")", s.c]; });
+      o.push('<rect class="hit" x="' + Math.max(pl, X(i) - bw / 2) + '" y="' + pt + '" width="' + bw + '" height="' + ph + '" data-x="' + X(i) + '" data-tip="' + tip([day(i).iso, day(i).iso], rows) + '"/>');
+    }
+    o.push('<line class="xhair" x1="0" x2="0" y1="' + pt + '" y2="' + (pt + ph) + '"/></svg>');
+    return o.join("");
+  }
+
+  function stackedChart(daily) {
+    var w = 1180, h = 260, pl = 44, pr = 10, pt = 14, pb = 40, pw = w - pl - pr, ph = h - pt - pb, n = D.days.length;
+    var tops = daily.filter(Boolean).map(function (v) { return v[0] + v[1] + v[2] + v[3]; });
+    if (!tops.length) return '<div class="empty">' + bi("no job-level data yet", "暂无作业级数据") + "</div>";
+    var step = niceStep(Math.max.apply(null, tops)), top = Math.ceil(Math.max.apply(null, tops) / step) * step;
+    var band = pw / n, bw = Math.min(24, band * .62);
+    function Y(v) { return pt + ph - ph * v / top; }
+    var o = ['<svg viewBox="0 0 ' + w + " " + h + '" class="chart" role="img">'];
+    for (var y = 0; y <= top + 1e-9; y += step)
+      o.push('<line class="gridl" x1="' + pl + '" x2="' + (w - pr) + '" y1="' + Y(y) + '" y2="' + Y(y) + '"/><text class="tick" x="' + (pl - 6) + '" y="' + (Y(y) + 3.5) + '" text-anchor="end">' + +y.toFixed(2) + "</text>");
+    daily.forEach(function (v, i) {
+      var cx = pl + band * i + band / 2;
+      if (i % 2 === 0) o.push('<text class="tick" x="' + cx + '" y="' + (h - pb + 14) + '" text-anchor="middle">' + day(i).m + "/" + day(i).d + "</text>");
+      if (!v) return;
+      var yy = Y(0), faded = v[4] < 5 ? " faded" : "";
+      SEGS.forEach(function (s, si) {
+        var hh = ph * (v[si] || 0) / top;
+        if (hh <= .01) return;
+        o.push('<rect class="' + faded + '" x="' + (cx - bw / 2) + '" y="' + (yy - hh) + '" width="' + bw + '" height="' + Math.max(.5, hh - (si ? 2 : 0)) + '" rx="' + (si === 3 ? 3 : 0) + '" style="fill:' + COLORS[si] + '"/>');
+        yy -= hh;
+      });
+      var rows = SEGS.map(function (s, si) { return [s[1], s[2], fm(v[si]) + " min", COLORS[si]]; });
+      rows.push(["median total (to last model test)", "中位总时长（至最后模型测试）", fm(v[5]) + " min", null]);
+      rows.push(["runs", "运行数", String(v[4]), null]);
+      o.push('<rect class="hit" x="' + (cx - band / 2) + '" y="' + pt + '" width="' + band + '" height="' + ph + '" data-tip="' + tip([day(i).iso, day(i).iso], rows) + '"/>');
+    });
+    markerDays().forEach(function (m) { var x = pl + band * m.i; o.push('<line class="marker" x1="' + x + '" x2="' + x + '" y1="' + pt + '" y2="' + (pt + ph) + '"/><text class="mlab" x="' + (x + 3) + '" y="' + (pt + 9) + '">' + esc(m.label) + "</text>"); });
+    o.push('<line class="axis" x1="' + pl + '" x2="' + (w - pr) + '" y1="' + Y(0) + '" y2="' + Y(0) + '"/>');
+    o.push('<text class="axt" x="' + (pl + pw / 2) + '" y="' + (h - 6) + '" text-anchor="middle">' + tsp("PR run created (PT day)", "PR 运行创建日（太平洋时间）") + "</text>");
+    o.push('<text class="axt" transform="translate(11,' + (pt + ph / 2) + ') rotate(-90)" text-anchor="middle">' + tsp("minutes (median per segment)", "分钟（各段中位数）") + "</text></svg>");
+    return o.join("");
+  }
+
+  // ---------- sections
+  function renderHeader() {
+    var gen = new Date(D.generated_at), start = new Date(D.window.start);
+    var f = function (d) { return d.toLocaleString("sv-SE", {timeZone: "America/Los_Angeles", hour12: false}).slice(0, 16); };
+    document.getElementById("repo").textContent = D.repo + " · PR CI";
+    document.getElementById("boardrow").innerHTML =
+      "<span><span class=\"lamp\"></span>" + bi("Data as of", "数据截至") + " <b>" + f(gen) + " PT</b></span>" +
+      "<span>" + bi("Window", "时间窗") + " <b>" + f(start) + " → " + f(gen) + " PT</b></span>" +
+      "<span><b>" + D.counts.pr_runs + "</b> " + bi("pull_request runs", "个 pull_request 运行") + " + <b>" + D.counts.main_runs + "</b> " + bi("main push runs", "个 main 推送运行") + "</span>";
+    document.getElementById("markers").innerHTML = (D.markers || []).map(function (m) {
+      var st = m.merged_at ? bi("merged " + f(new Date(m.merged_at)) + " PT", "已合并 " + f(new Date(m.merged_at)) + " PT")
+                           : (m.draft ? bi("draft, not merged", "草稿，未合并") : bi(esc(m.state) + ", not merged", esc(m.state) + "，未合并"));
+      return '<li><a href="' + esc(m.url) + '">#' + m.number + "</a> " + esc(m.title) + " — <b>" + st + "</b></li>";
+    }).join("");
+  }
+
+  function renderKpis() {
+    var t = D.ttg, c = t.cur, p = t.prev, ws = D.workflow_stats;
+    // superseded heads (a newer push replaced the commit) are the normal flow, so they are left out
+    function ng(x) { var d = x.heads - x.never_green_superseded; return d > 0 ? (x.never_green - x.never_green_superseded) / d * 100 : null; }
+    var ngC = ng(c), ngP = ng(p);
+    function nf(per) {
+      var b = 0, can = 0, st = 0, sup = 0;
+      Object.keys(ws).forEach(function (k) { b += ws[k][per].base; can += ws[k][per].cancelled; st += ws[k][per].stuck; sup += ws[k][per].superseded; });
+      return {b: b, c: can, s: st, sup: sup, v: b ? (can + st) / b * 100 : null};
+    }
+    var nc = nf("cur"), np = nf("prev");
+    var h = [];
+    h.push('<div class="kpi hero rise"><div class="klab">' + bi("Time to all-required-green · median", "全部必需检查转绿耗时 · 中位数") + '</div><div class="kval">' + fh(c.med) +
+      '</div><div class="ksub">p90 <b>' + fh(c.p90) + "</b> ·" + smallN(c.n, 20) + "</div>" + delta(c.med, p.med) +
+      '<div class="kfoot">' + bi("PR head commits whose B200/MI350/MI450 runs did real work, newest run of each → last one green, reruns included. Prev 7d: median " + fh(p.med) + ", p90 " + fh(p.p90) + ", n=" + p.n + ". Green heads without job data yet are left out: " + c.unknown + " in the last 7 days, " + p.unknown + " in the 7 days before.",
+                                 "B200/MI350/MI450 运行做了实际测试的 PR head 提交，取各工作流最新运行 → 最后一个转绿，含重跑。前 7 天：中位 " + fh(p.med) + "，p90 " + fh(p.p90) + "，n=" + p.n + "。暂缺作业数据的已转绿 head 未计入：近 7 天 " + c.unknown + " 个，前 7 天 " + p.unknown + " 个。") + "</div></div>");
+    h.push('<div class="kpi rise"><div class="klab">' + bi("Heads that never went green", "从未转绿的 head") + '</div><div class="kval">' + (ngC == null ? "n/a" : ngC.toFixed(0) + "%") +
+      '</div><div class="ksub">' + (c.never_green - c.never_green_superseded) + " / " + (c.heads - c.never_green_superseded) + "</div>" + delta(ngC, ngP, true) +
+      '<div class="kfoot">' + bi("Heads whose required runs did real work and then failed or were cancelled. Left out: " + c.never_green_superseded + " heads replaced by a newer push before going green, and heads still running.",
+                                 "必需运行做了实际测试、随后失败或被取消的 head。不计入：" + c.never_green_superseded + " 个在转绿前被新推送取代的 head，以及仍在运行的 head。") + "</div></div>");
+    h.push('<div class="kpi rise"><div class="klab">' + bi("Runs that never finish", "未能完成的运行占比") + '</div><div class="kval">' + (nc.v == null ? "n/a" : nc.v.toFixed(0) + "%") +
+      '</div><div class="ksub">' + bi(nc.c + " cancelled (" + nc.sup + " superseded) + " + nc.s + " stuck >" + D.params.stuck_hours + "h, of " + nc.b, nc.c + " 个取消（" + nc.sup + " 个被取代）+ " + nc.s + " 个卡住 >" + D.params.stuck_hours + " 小时，共 " + nc.b) + "</div>" + delta(nc.v, np.v, true) +
+      '<div class="kfoot">' + bi("All listed workflows, PR runs, excluding action_required (fork PRs awaiting approval).", "所列全部工作流的 PR 运行，不含 action_required（待批准的 fork PR）。") + "</div></div>");
+    ["B200", "MI350"].forEach(function (k) {
+      var s = ws[k];
+      if (!s) return;
+      h.push('<div class="kpi rise"><div class="klab">' + bi(esc(W[k].name) + " wall · median", esc(W[k].name) + " 墙钟 · 中位数") + '</div><div class="kval">' + fh(s.cur.med) +
+        '</div><div class="ksub">p90 <b>' + fh(s.cur.p90) + "</b> ·" + smallN(s.cur.n, 20) + "</div>" + delta(s.cur.med, s.prev.med) +
+        '<div class="kfoot">' + bi("Substantive runs only; " + s.cur.noop + " scan-only runs left out.", "仅实质性运行；排除 " + s.cur.noop + " 个仅 scan 的运行。") + "</div></div>");
+    });
+    document.getElementById("kpis").innerHTML = h.join("");
+  }
+
+  function renderWorkflowTable() {
+    var rows = D.workflows.map(function (w) {
+      var s = D.workflow_stats[w.key], c = s.cur, p = s.prev, d = pct(c.med, p.med);
+      var nfc = c.base ? (c.cancelled + c.stuck) / c.base * 100 : null;
+      return [["<b>" + esc(w.name) + "</b>", w.name], [fm(c.med), c.med], [fm(c.p90), c.p90], [warnN(c.n), c.n],
+        [fm(p.med), p.med], [fm(p.p90), p.p90],
+        [d == null ? "n/a" : '<span class="dl ' + (d < -3 ? "good" : d > 3 ? "bad" : "") + '">' + (d >= 0 ? "+" : "") + d.toFixed(0) + "%</span>", d == null ? -999 : d],
+        [fm(s.main.med) + ' <span class="n">n=' + s.main.n + "</span>", s.main.med],
+        [nfc == null ? "n/a" : nfc.toFixed(0) + "%", nfc],
+        ['<span class="mix">' + bi(c.noop + " scan-only · " + c.cancelled + " cancelled (" + c.superseded + " superseded) · " + c.stuck + " stuck · " + c.action_required + " awaiting approval",
+            c.noop + " 仅 scan · " + c.cancelled + " 取消（" + c.superseded + " 被取代）· " + c.stuck + " 卡住 · " + c.action_required + " 待批准") + "</span>", c.runs]];
+    });
+    document.getElementById("wftable").innerHTML = table([["Workflow", "工作流", "string"], ["Median (7d)", "中位 (7天)", "number"], ["p90 (7d)", "p90 (7天)", "number"],
+      ["n (7d)", "样本 (7天)", "number"], ["Median (prev 7d)", "中位 (前7天)", "number"], ["p90 (prev 7d)", "p90 (前7天)", "number"], ["Δ median", "中位变化", "number"],
+      ["main push median", "main 推送中位", "number"], ["Never finish (7d)", "未完成 (7天)", "number"], ["Run mix (7d)", "运行构成 (7天)", "number"]], rows);
+  }
+
+  function renderTrends() {
+    var out = [];
+    D.workflows.forEach(function (w) {
+      var d = D.daily[w.key];
+      if (!d) return;
+      var nPr = d.pr.map(function (x) { return x ? x[2] : 0; });
+      var series = [{en: "PR median", zh: "PR 中位数", c: COLORS[0], v: d.pr.map(function (x) { return x ? x[0] : null; }), n: nPr},
+                    {en: "PR p90", zh: "PR p90", c: COLORS[1], v: d.pr.map(function (x) { return x ? x[1] : null; }), n: nPr}];
+      if (d.main.some(Boolean)) series.push({en: "main push median", zh: "main 推送中位数", c: COLORS[2], v: d.main.map(function (x) { return x ? x[0] : null; }), n: d.main.map(function (x) { return x ? x[1] : 0; })});
+      var tot = nPr.reduce(function (a, b) { return a + b; }, 0);
+      out.push('<div class="card"><h3>' + esc(w.name) + smallN(tot, 30) + "</h3>" + legend(series.map(function (s) { return [s.en, s.zh, s.c]; }), "line") + lineChart(series) + "</div>");
+    });
+    var keys = D.workflows.filter(function (w) { return D.daily[w.key]; }).map(function (w) { return w.key; });
+    var rows = D.days.map(function (iso, i) {
+      return [[iso, iso]].concat(keys.map(function (k) { var x = D.daily[k].pr[i]; return x ? [fm(x[0]) + " / " + fm(x[1]) + ' <span class="n">n=' + x[2] + "</span>", x[0]] : ["—", null]; }));
+    });
+    out.push('<details class="card" style="grid-column:1/-1"><summary>' + bi("Table view: daily PR median / p90 (minutes)", "表格视图：每日 PR 中位数 / p90（分钟）") + "</summary>" +
+      table([["PT day", "太平洋日", "string"]].concat(keys.map(function (k) { return [k + " med/p90", k + " 中位/p90", "number"]; })), rows, {cls: "compact"}) + "</details>");
+    document.getElementById("trends").innerHTML = out.join("");
+  }
+
+  function renderCriticalPath() {
+    var out = [];
+    Object.keys(D.critical_path).forEach(function (k) {
+      var cp = D.critical_path[k], n = cp.periods.cur.n + cp.periods.prev.n;
+      var rows = [["prev", "prev 7d", "前 7 天"], ["cur", "last 7d", "近 7 天"]].map(function (x) {
+        var p = cp.periods[x[0]];
+        return [[bi(x[1], x[2]), x[0]]].concat(SEGS.concat([["total"]]).map(function (s) { return [fm(p[s[0]].med) + " / " + fm(p[s[0]].p90), p[s[0]].med]; })).concat([[warnN(p.n), p.n]]);
+      });
+      var holders = cp.barrier_holders.map(function (h) { return "<code>" + esc(h[0]) + "</code> ×" + h[1]; }).join(", ") || "n/a";
+      out.push('<div class="card"><h3>' + esc(W[k].name) + " " + bi("critical path", "关键路径") + smallN(n, 20) + "</h3>" +
+        legend(SEGS.map(function (s, i) { return [s[1], s[2], COLORS[i]]; }), "rect") + stackedChart(cp.daily) +
+        table([["Window", "窗口", "string"]].concat(SEGS.map(function (s) { return [s[1] + " med/p90", s[2] + " 中位/p90", "number"]; }))
+          .concat([["Total med/p90", "合计 中位/p90", "number"], ["runs", "运行数", "number"]]), rows, {cls: "compact", sortable: false}) +
+        '<p class="note">' + bi("Last 7 days, the unit-test barrier was held by:", "近 7 天单测屏障的最后完成者：") + " " + holders + "</p></div>");
+    });
+    document.getElementById("cp").innerHTML = out.join("");
+  }
+
+  function renderLabels() {
+    var rows = D.labels.map(function (l) {
+      var never = l.never + (l.never ? ' <span class="n">(' + bi("waited med " + fm(l.never_wait_med) + " min", "等待中位 " + fm(l.never_wait_med) + " 分钟") + ")</span>" : "");
+      if (!l.jobs) return [["<code>" + esc(l.label) + '</code> <span class="tag">key</span>', l.label], ["0", 0], ["n/a", null], ["n/a", null], ["n/a", null], ["n/a", null], ["n/a", null], ["0", 0]];
+      return [["<code>" + esc(l.label) + "</code>" + (l.key ? ' <span class="tag">key</span>' : ""), l.label], [String(l.jobs), l.jobs],
+        [fm(l.q_med), l.q_med], [fm(l.q_p90), l.q_p90], [fm(l.q_max), l.q_max], [fm(l.run_med), l.run_med], ["≥" + l.conc, l.conc], [never, l.never]];
+    });
+    document.getElementById("labels").innerHTML = table([["Runner label", "Runner 标签", "string"], ["Jobs", "作业数", "number"], ["Queue med", "排队中位", "number"],
+      ["Queue p90", "排队 p90", "number"], ["Queue max", "排队最大", "number"], ["Run med", "运行中位", "number"], ["Max concurrency seen", "观测到的最大并发", "number"],
+      ["Never picked up", "从未被领取", "number"]], rows);
+  }
+
+  function renderSlow() {
+    var rows = D.slowest.map(function (s) {
+      return [["<code>" + esc(s.name) + "</code>", s.name], [esc(W[s.wf].name), s.wf], [fm(s.med), s.med], [fm(s.p90), s.p90], [fm(s.max), s.max], [warnN(s.n), s.n]];
+    });
+    document.getElementById("slow").innerHTML = rows.length ? table([["Job", "作业", "string"], ["Workflow", "工作流", "string"], ["Run med (min)", "运行中位（分钟）", "number"],
+      ["Run p90", "运行 p90", "number"], ["Max", "最大", "number"], ["n", "样本", "number"]], rows) : '<div class="empty">' + bi("no job-level data yet", "暂无作业级数据") + "</div>";
+  }
+
+  function renderFlaky() {
+    var rows = D.flaky.map(function (f) {
+      var tot = f.ok + f.fail, rr = f.rerun_pass + f.rerun_fail, mt = f.main_ok + f.main_fail;
+      return [["<code>" + esc(f.name) + "</code>", f.name], [esc(W[f.wf].name), f.wf], [(f.fail / tot * 100).toFixed(0) + "%", f.fail / tot], [f.fail + " / " + tot, f.fail],
+        [rr ? (f.rerun_pass / rr * 100).toFixed(0) + '% <span class="n">(' + f.rerun_pass + "/" + rr + ")</span>" : "n/a", rr ? f.rerun_pass / rr : null],
+        [mt ? (f.main_fail / mt * 100).toFixed(0) + '% <span class="n">(' + f.main_fail + "/" + mt + ")</span>" : "n/a", mt ? f.main_fail / mt : null]];
+    });
+    document.getElementById("flaky").innerHTML = rows.length ? table([["Job", "作业", "string"], ["Workflow", "工作流", "string"], ["Attempt-1 fail rate (PR)", "首次尝试失败率 (PR)", "number"],
+      ["Failures / runs", "失败 / 运行", "number"], ["Failed, then passed on rerun", "失败后重跑通过", "number"], ["Fail rate on main push", "main 推送失败率", "number"]], rows)
+      : '<div class="empty">' + bi("no failures in the job sample", "作业样本中无失败") + "</div>";
+    var top = D.flaky.slice(0, 10), mx = Math.max.apply(null, top.map(function (f) { return f.fail; }).concat([1]));
+    document.getElementById("fbars").innerHTML = top.map(function (f) {
+      var t = tip([f.name, f.name], [["attempt-1 failures (PR)", "首次尝试失败 (PR)", String(f.fail), "var(--s2)"], ["attempt-1 runs", "首次尝试运行数", String(f.ok + f.fail), null], ["workflow", "工作流", W[f.wf].name, null]]);
+      return '<div class="fbar" data-tip="' + t + '"><div class="fname"><code>' + esc(f.name) + '</code> <span class="n">' + esc(f.wf) + '</span></div><div class="ftrack"><div class="ffill" style="width:' + (f.fail / mx * 100).toFixed(1) + '%"></div></div><div class="fval">' + f.fail + "</div></div>";
+    }).join("") || '<div class="empty">—</div>';
+    var r = D.reruns;
+    document.getElementById("rerunnote").innerHTML = bi("Whole runs: " + r.n + " PR runs in the window were rerun at least once; the final attempt succeeded for " + r.final_success + (r.n ? " (" + (r.final_success / r.n * 100).toFixed(0) + "%)" : "") + ".",
+      "整体运行：窗口内 " + r.n + " 个 PR 运行至少重跑过一次，其中 " + r.final_success + (r.n ? "（" + (r.final_success / r.n * 100).toFixed(0) + "%）" : "") + " 个最终成功。");
+  }
+
+  function renderNotes() {
+    var P = D.params, nc = D.noop_check;
+    var cov = D.workflows.map(function (w) { var c = D.coverage[w.key]; return w.key + " " + c[0] + "/" + c[1]; }).join(" · ");
+    var howto = [
+      ["<b>Substantive run.</b> Most GPU workflows start with a <code>scan</code> job that picks the tests a PR needs. When it picks none, the run ends in under a minute. In those scan-gated workflows, a first attempt that ended within " + P.noop_minutes + " min, or whose jobs never used a self-hosted runner, counts as scan-only and is left out of wall-time stats; the count is under \"Run mix\". Checked against cached jobs: " + nc[0] + " of " + nc[1] + " runs disagree with the " + P.noop_minutes + "-minute rule.",
+       "<b>实质性运行。</b>大多数 GPU 工作流先由 <code>scan</code> 作业选出 PR 需要的测试；一个都不选时，运行不到一分钟就结束。在这些 scan 门控的工作流中，首次尝试在 " + P.noop_minutes + " 分钟内结束、或其作业从未使用自托管 runner 的运行视为仅 scan，不计入墙钟统计，数量列在“运行构成”中。用已缓存作业核对：" + nc[1] + " 个运行中有 " + nc[0] + " 个与 " + P.noop_minutes + " 分钟规则不符。"],
+      ["<b>Time to all-required-green.</b> The branch rule requires the check named <code>finish</code>; B200, MI350 and MI450 each end with a <code>finish</code> job. For each PR head commit we take the newest run of each of these workflows on that commit (labels, reopening and ready-for-review can start extra runs on the same commit). The clock runs from the earliest of those runs being created until the last one finishes green, reruns included. Heads where all of them were scan-only are left out; across all heads, " + D.ttg.all_heads_cur.n + " went green in the last 7 days, median " + fh(D.ttg.all_heads_cur.med) + ".",
+       "<b>全部必需检查转绿耗时。</b>分支规则要求名为 <code>finish</code> 的检查；B200、MI350、MI450 各以一个 <code>finish</code> 作业结束。对每个 PR head 提交，取这三个工作流在该提交上最新的一次运行（打标签、重新打开、转为 ready 都会在同一提交上触发额外运行）。计时从这些运行中最早的创建时间开始，到最后一个成功结束为止，含重跑。三者都仅 scan 的 head 不计入；若计入所有 head，近 7 天有 " + D.ttg.all_heads_cur.n + " 个转绿，中位 " + fh(D.ttg.all_heads_cur.med) + "。"],
+      ["<b>Never finish.</b> Cancelled runs plus runs still not completed " + P.stuck_hours + " h after creation. Most cancellations are \"superseded\": a newer push to the same PR branch started a newer run. That is expected, so it is shown separately.",
+       "<b>未完成。</b>被取消的运行加上创建 " + P.stuck_hours + " 小时后仍未完成的运行。大部分取消是“被取代”：同一 PR 分支的新推送触发了新运行。这在预期之内，因此单独列出。"],
+      ["<b>Critical path.</b> scan = run created → scan done. Unit-test barrier = scan done → last unit-test job done (model tests wait for all of them; on MI350 this includes <code>import-check</code>). Model-test queue = barrier → the last-finishing model test got a runner. Model-test execution = that job's run time.",
+       "<b>关键路径。</b>scan = 运行创建 → scan 完成。单测屏障 = scan 完成 → 最后一个单测作业完成（模型测试要等全部单测；MI350 上包含 <code>import-check</code>）。模型测试排队 = 屏障 → 最后完成的模型测试拿到 runner。模型测试执行 = 该作业的运行时间。"],
+      ["<b>Never picked up.</b> A job with no runner and no steps never ran. GitHub sets its started_at equal to created_at, so it counts as queued from creation until it was cancelled, not as running.",
+       "<b>从未被领取。</b>没有 runner 也没有步骤的作业从未运行。GitHub 会把它的 started_at 设为 created_at，因此这里把它记为从创建到被取消一直在排队，而不是在运行。"]
+    ];
+    var caveats = [
+      ["<b>Sample sizes.</b> ⚠ marks fewer than 10 samples (fewer than 20 on the headline cards). Treat those numbers as rough.",
+       "<b>样本量。</b>⚠ 表示少于 10 个样本（核心指标卡少于 20 个），这些数字仅供参考。"],
+      ["<b>Job-level coverage</b> (cached first-attempt job lists / runs that need one): " + cov + ". Each refresh fetches a capped number of job lists, GPU workflows first, so sections 04–07 and the wall times cover only cached runs; " + D.counts.wall_missing + " finished runs have no wall time yet.",
+       "<b>作业级覆盖率</b>（已缓存的首次尝试作业列表 / 需要的运行数）：" + cov + "。每次刷新只拉取有限数量的作业列表，GPU 工作流优先，因此第 04–07 节和墙钟时间只覆盖已缓存的运行；" + D.counts.wall_missing + " 个已完成运行暂无墙钟时间。"],
+      ["<b>Why job timestamps.</b> A run's <code>updated_at</code> can be bumped days after the run finished, so a run's end is its last job's <code>completed_at</code>.",
+       "<b>为什么用作业时间。</b>运行的 <code>updated_at</code> 可能在完成数天后被刷新，因此运行结束时间取最后一个作业的 <code>completed_at</code>。"],
+      ["<b>Max concurrency</b> is the most overlapping jobs seen in the cached jobs of the listed workflows. It is a lower bound (≥): other workflows and uncached runs use the same runners.",
+       "<b>最大并发</b>是所列工作流已缓存作业中同时运行的最多作业数，是下限（≥）：其他工作流和未缓存的运行也使用同一批 runner。"],
+      ["<b>n/a: jobs waiting right now.</b> Only completed runs are cached, so jobs queued at refresh time are not in \"never picked up\". Runs stuck longer than " + P.stuck_hours + " h appear under \"never finish\".",
+       "<b>n/a：当前仍在等待的作业。</b>只缓存已完成的运行，刷新时仍在排队的作业不计入“从未被领取”。卡住超过 " + P.stuck_hours + " 小时的运行计入“未完成”。"],
+      ["<b>Reruns.</b> " + D.reruns.n + " PR runs had more than one attempt; latest-attempt jobs are cached for " + D.reruns.latest_cached + ". Wall time always uses attempt 1, so reruns do not inflate it.",
+       "<b>重跑。</b>" + D.reruns.n + " 个 PR 运行有多次尝试；其中 " + D.reruns.latest_cached + " 个缓存了最新一次尝试的作业。墙钟时间始终用首次尝试，重跑不会拉高它。"],
+      ["<b>Excluded:</b> runs in <code>action_required</code> (fork PRs waiting for approval).", "<b>排除：</b><code>action_required</code> 状态的运行（等待批准的 fork PR）。"]
+    ];
+    document.getElementById("howto").innerHTML = howto.map(function (x) { return "<li>" + bi(x[0], x[1]) + "</li>"; }).join("");
+    document.getElementById("caveats").innerHTML = caveats.map(function (x) { return "<li>" + bi(x[0], x[1]) + "</li>"; }).join("");
+  }
+
+  // ---------- interaction
+  var tipEl = document.getElementById("tip");
+  function mode() { return document.body.classList.contains("lang-en") ? "en" : document.body.classList.contains("lang-zh") ? "zh" : "bi"; }
+  function pick(en, zh) { var m = mode(); return m === "en" ? en : m === "zh" ? zh : (en === zh ? en : en + " · " + zh); }
+  function move(ev) {
+    var x = ev.clientX + 14, y = ev.clientY + 14, r = tipEl.getBoundingClientRect();
+    if (x + r.width > window.innerWidth - 8) x = ev.clientX - r.width - 14;
+    if (y + r.height > window.innerHeight - 8) y = ev.clientY - r.height - 14;
+    tipEl.style.left = x + "px"; tipEl.style.top = y + "px";
+  }
+  function bindTips() {
+    document.querySelectorAll("[data-tip]").forEach(function (el) {
+      el.addEventListener("pointerenter", function (ev) {
+        var d; try { d = JSON.parse(el.getAttribute("data-tip")); } catch (e) { return; }
+        tipEl.textContent = "";
+        var t = document.createElement("div"); t.className = "tt"; t.textContent = pick(d.t[0], d.t[1]); tipEl.appendChild(t);
+        d.r.forEach(function (r) {
+          var row = document.createElement("div"); row.className = "tr";
+          if (r[3]) { var i = document.createElement("i"); i.style.background = r[3]; row.appendChild(i); }
+          var b = document.createElement("b"); b.textContent = r[2]; row.appendChild(b);
+          var s = document.createElement("span"); s.textContent = pick(r[0], r[1]); row.appendChild(s);
+          tipEl.appendChild(row);
+        });
+        tipEl.style.opacity = 1; move(ev);
+        var xh = el.ownerSVGElement && el.ownerSVGElement.querySelector(".xhair");
+        if (xh && el.dataset.x) { xh.setAttribute("x1", el.dataset.x); xh.setAttribute("x2", el.dataset.x); xh.style.opacity = 1; }
+      });
+      el.addEventListener("pointermove", move);
+      el.addEventListener("pointerleave", function () {
+        tipEl.style.opacity = 0;
+        var xh = el.ownerSVGElement && el.ownerSVGElement.querySelector(".xhair"); if (xh) xh.style.opacity = 0;
+      });
+    });
+  }
+  function bindSort() {
+    document.querySelectorAll("table[data-sortable]").forEach(function (tbl) {
+      tbl.querySelectorAll("th").forEach(function (th, idx) {
+        th.addEventListener("click", function () {
+          var num = th.dataset.sort === "number", asc = !th.classList.contains("asc");
+          tbl.querySelectorAll("th").forEach(function (x) { x.classList.remove("asc", "desc"); });
+          th.classList.add(asc ? "asc" : "desc");
+          var body = tbl.tBodies[0], rows = Array.prototype.slice.call(body.rows);
+          rows.sort(function (a, b) {
+            var x = a.cells[idx].dataset.v, y = b.cells[idx].dataset.v;
+            if (num) { x = parseFloat(x); y = parseFloat(y); x = isNaN(x) ? -1 : x; y = isNaN(y) ? -1 : y; return asc ? x - y : y - x; }
+            return asc ? String(x).localeCompare(y) : String(y).localeCompare(x);
+          });
+          rows.forEach(function (r) { body.appendChild(r); });
+        });
+      });
+    });
+  }
+  function store(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+  function load(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+  function setLang(l) {
+    ["bi", "en", "zh"].forEach(function (x) { document.body.classList.toggle("lang-" + x, x === l); });
+    document.querySelectorAll("[data-lang]").forEach(function (b) { b.classList.toggle("on", b.dataset.lang === l); });
+    document.documentElement.lang = l === "zh" ? "zh-CN" : "en";
+    store("ts-ci-lang", l);
+  }
+  function setTheme(t) {
+    if (t === "auto") document.documentElement.removeAttribute("data-theme"); else document.documentElement.setAttribute("data-theme", t);
+    document.querySelectorAll("[data-theme-btn]").forEach(function (b) { b.classList.toggle("on", b.dataset.themeBtn === t); });
+    store("ts-ci-theme", t);
+  }
+  document.querySelectorAll("[data-lang]").forEach(function (b) { b.addEventListener("click", function () { setLang(b.dataset.lang); }); });
+  document.querySelectorAll("[data-theme-btn]").forEach(function (b) { b.addEventListener("click", function () { setTheme(b.dataset.themeBtn); }); });
+  setLang(["bi", "en", "zh"].indexOf(load("ts-ci-lang")) >= 0 ? load("ts-ci-lang") : "bi");
+  setTheme(["auto", "light", "dark"].indexOf(load("ts-ci-theme")) >= 0 ? load("ts-ci-theme") : "auto");
+
+  // ---------- boot
+  function noData() { document.getElementById("nodata").hidden = false; }
+  fetch("data.json", {cache: "no-cache"}).then(function (r) {
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    return r.json();
+  }).then(function (data) {
+    if (!data || data.schema !== 1) throw new Error("unexpected data.json");
+    D = data;
+    D.workflows.forEach(function (w) { W[w.key] = w; });
+    renderHeader(); renderKpis(); renderWorkflowTable(); renderTrends(); renderCriticalPath();
+    renderLabels(); renderSlow(); renderFlaky(); renderNotes();
+    document.getElementById("main").hidden = false;
+    bindTips(); bindSort();
+  }).catch(function (e) { console.warn("CI dashboard:", e); noData(); });
+})();
+</script>
+</body>
+</html>
