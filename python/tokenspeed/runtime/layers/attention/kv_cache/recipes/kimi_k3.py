@@ -40,7 +40,11 @@ from functools import cached_property
 import torch
 from typing_extensions import override
 
-from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
+from tokenspeed.runtime.layers.attention.configs.dsa import (
+    DSAConfig,
+    dsa_history_gather_workspace_bytes,
+    dsa_kvp_history_prefill,
+)
 from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
@@ -366,13 +370,20 @@ class KimiK3Recipe(CacheRecipe):
 
     @override
     def workspace_bytes(self) -> int:
-        """KDA verify staging reserved outside the cache arena."""
+        """KDA verify staging reserved outside the cache arena, plus the DSA
+        history gather workspace of a KVP prefill over gathered histories
+        (``dsa_kvp_history_prefill``)."""
+        history = 0
+        if dsa_kvp_history_prefill(self.attn_config):
+            history = dsa_history_gather_workspace_bytes(
+                self.attn_config, max_model_len=self.attn_config.context_len
+            )
         if self.server_args.disaggregation_mode == "prefill":
-            return 0
+            return history
         width = max(int(self.attn_config.speculative_num_draft_tokens or 1), 1)
         if width == 1 and not self.replay_kda:
-            return 0
-        return kda_verify_workspace_bytes(
+            return history
+        return history + kda_verify_workspace_bytes(
             self.attn_config,
             self.groups(),
             draft_token_num=width,

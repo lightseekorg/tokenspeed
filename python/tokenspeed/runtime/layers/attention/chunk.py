@@ -45,11 +45,11 @@ def create_chunked_cache_kv_indices_paged(
     PAGE_SIZE: tl.constexpr,
 ):
     BLOCK_SIZE: tl.constexpr = 512
-    pid = tl.program_id(axis=0)
+    pid = tl.program_id(axis=0).to(tl.int64)
 
-    chunk_kv_indices_offset = tl.load(chunk_cum_seq_lens_ptr + pid)
+    chunk_kv_indices_offset = tl.load(chunk_cum_seq_lens_ptr + pid).to(tl.int64)
 
-    chunk_start_pos = tl.load(chunk_start_idx_ptr + pid).to(tl.int32)
+    chunk_start_pos = tl.load(chunk_start_idx_ptr + pid).to(tl.int64)
     chunk_seq_len = tl.load(chunk_seq_lens_ptr + pid).to(tl.int32)
 
     num_loop = tl.cdiv(chunk_seq_len, BLOCK_SIZE)
@@ -62,7 +62,7 @@ def create_chunked_cache_kv_indices_paged(
             page_table_ptr + pid * page_table_ptr_stride + page_idx,
             mask=mask,
         )
-        kv_slot = page_id * PAGE_SIZE + token_pos % PAGE_SIZE
+        kv_slot = page_id.to(tl.int64) * PAGE_SIZE + token_pos % PAGE_SIZE
         tl.store(
             chunk_kv_indices_ptr + chunk_kv_indices_offset + offset,
             kv_slot,

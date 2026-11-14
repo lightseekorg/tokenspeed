@@ -34,7 +34,7 @@ import torch.multiprocessing as mp
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from ci_system.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=120, suite="runtime-2gpu")
+register_cuda_ci(est_time=180, suite="runtime-2gpu")
 
 
 def _candidate_inputs(rank, rows, width, phase):
@@ -462,6 +462,18 @@ def _partial_worker(rank, degree, rendezvous):
             for _ in range(2):
                 result = combine()
             _check_partials(result, rank, degree, dtype, "normal", sink, keep_all_heads)
+            if not keep_all_heads:
+                # Records packed into the exchange's lent input combine alike.
+                lent = combine_attention_partials(
+                    output,
+                    lse,
+                    group=group,
+                    rank=rank,
+                    sink=sink,
+                    keep_all_heads=False,
+                    lend_records=True,
+                )
+                assert torch.equal(lent.view(torch.uint8), result.view(torch.uint8))
             torch.cuda.synchronize()
             dist.barrier(group=coordination)
             graph = torch.cuda.CUDAGraph()
@@ -527,6 +539,15 @@ def _records_selection(degree, tokens, device):
     return slots.to(device), lengths.to(device)
 
 
+def _records_values(degree, device):
+    """Every virtual slot's BF16 latent row, before the caches' FP8."""
+    generator = torch.Generator().manual_seed(77)
+    values = torch.randn(
+        (_records_virtual_blocks(degree) * _RECORDS_BLOCK, 576), generator=generator
+    )
+    return values.to(device=device, dtype=torch.bfloat16)
+
+
 def _records_cache(degree, rank, device):
     """This rank's FP8 cache: the owned virtual blocks at their local slots."""
     from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
@@ -534,9 +555,7 @@ def _records_cache(degree, rank, device):
     )
 
     virtual = _records_virtual_blocks(degree)
-    generator = torch.Generator().manual_seed(77)
-    values = torch.randn((virtual * _RECORDS_BLOCK, 576), generator=generator)
-    values = values.to(device=device, dtype=torch.bfloat16)
+    values = _records_values(degree, device)
     local, owned = virtual_slots_to_local(
         torch.arange(values.shape[0], device=device),
         rows_per_page=_RECORDS_BLOCK,
@@ -592,6 +611,7 @@ def _records_worker(rank, degree, rendezvous, use_pynccl):
     from tokenspeed.runtime.layers.attention.backends.paged import dsa
     from tokenspeed.runtime.layers.attention.dcp.comm import (
         gather_query_heads,
+        gather_query_heads_lent,
         gather_query_heads_padded,
         gather_query_heads_rank_major,
     )
@@ -684,6 +704,10 @@ def _records_worker(rank, degree, rendezvous, use_pynccl):
                 rank_major.permute(1, 0, 2, 3).reshape(token_major.shape),
                 token_major,
             )
+            # Through the exchange's lent input: the same bytes.
+            lent = gather_query_heads_lent(q, group)
+            assert lent.dtype == q.dtype
+            assert torch.equal(lent.view(torch.uint8), token_major)
             # 48 heads x 2 ranks = 96, like K3.1's 12 x KVP8; trtllm-gen runs 96 as 128.
             wide_heads = 48
             gathered = wide_heads * degree
@@ -736,5 +760,267 @@ def test_rank_major_core_matches_packed_partials(tmp_path, use_pynccl):
         _records_worker,
         args=(2, f"file://{tmp_path / 'rendezvous'}", use_pynccl),
         nprocs=2,
+        join=True,
+    )
+
+
+def _decode_records_leaf(dsa, group, rank, requests, records_core):
+    """The DSA leaf's head-sharded KVP decode state on an FP8 cache, verifying
+    K3.1's 4 rows per request (the 3.1 drafter's three tokens)."""
+    from types import SimpleNamespace
+
+    leaf = _records_leaf(dsa, group, rank, query_layout=False)
+    leaf.kernel_solution = None
+    leaf.decode_kernel_plan = None
+    leaf.index_topk = _RECORDS_TOPK
+    leaf.max_context_len = _records_virtual_blocks(len(group)) * _RECORDS_BLOCK
+    leaf.is_draft = False
+    leaf.spec_num_tokens = 4
+    # configure_runtime's probe on gfx950
+    # (test_dcp_decode_records_core_on_the_real_k31_selection), or its
+    # verdict where another core decodes.
+    leaf._dcp_decode_records_core = records_core
+    leaf._owned_decode_topk = True
+    leaf._dense_backend = SimpleNamespace(
+        forward_decode_metadata=SimpleNamespace(
+            num_extends=0,
+            seq_lens_k=torch.full(
+                (requests,), leaf.max_context_len, dtype=torch.int32, device="cuda"
+            ),
+            max_seq_len_k=leaf.max_context_len,
+            _dsa_kv_seq_lens=None,
+        )
+    )
+    return leaf
+
+
+def _assert_attends_live_slots(output, q, slots, lengths, degree, scaling):
+    """A decode's TP-local heads against FP32 attention over each row's live
+    virtual slots, the query and cache in the FP8 the decode cores take,
+    within what their FP8 probabilities cost
+    (test_gluon_dsa_decode_dcp_records' bounds)."""
+    keys = _records_values(degree, q.device).to(torch.float8_e4m3fn).float()
+    queries = q.to(torch.float8_e4m3fn).float()
+    expected = torch.zeros((q.shape[0], q.shape[1], 512), device=q.device)
+    for row in range(q.shape[0]):
+        live = slots[row, : int(lengths[row])].long()
+        if live.numel():
+            scores = queries[row] @ keys[live].T * scaling
+            expected[row] = torch.softmax(scores, dim=-1) @ keys[live, :512]
+    error = output.float().view_as(expected) - expected
+    assert error.abs().max() < 0.15
+    assert error.square().mean().sqrt() <= 0.02 * expected.square().mean().sqrt()
+
+
+def _decode_records_worker(rank, degree, rendezvous):
+    torch.set_num_threads(1)
+    torch.cuda.set_device(rank)
+    from types import SimpleNamespace
+
+    from tokenspeed_kernel.ops.communication._iris import (
+        IrisGroup,
+        get_or_create_context,
+    )
+    from tokenspeed_kernel.ops.communication._iris.pull_exchange import (
+        IrisPullExchange,
+    )
+
+    from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
+    from tokenspeed.runtime.distributed.comm_backend.registry import set_global_backend
+    from tokenspeed.runtime.distributed.process_group_manager import (
+        process_group_manager,
+    )
+    from tokenspeed.runtime.layers.attention.backends.paged import dsa
+    from tokenspeed.runtime.layers.attention.dcp.comm import (
+        combine_attention_partials,
+        gather_query_heads,
+        gather_query_heads_lent,
+    )
+    from tokenspeed.runtime.layers.attention.dcp.placement import (
+        compact_owned_cache_slots,
+    )
+
+    device = torch.device("cuda", rank)
+    dist.init_process_group(
+        "nccl",
+        init_method=rendezvous,
+        rank=rank,
+        world_size=degree,
+        device_id=device,
+        timeout=timedelta(seconds=300),
+    )
+    try:
+        group = tuple(range(degree))
+        coordination = dist.new_group(backend="gloo", timeout=timedelta(seconds=300))
+        process_group_manager.register_process_group("nccl", group, dist.group.WORLD)
+        process_group_manager.register_process_group("gloo", group, coordination)
+        backend = AutoBackend()
+        backend.configure(use_pynccl=True)
+        set_global_backend(backend)
+        communicator = backend.nccl._get_or_create_resources(group)["pynccl_comm"]
+        context = communicator.change_state(
+            enable=True, stream=torch.cuda.current_stream(device)
+        )
+        # The records arm must run, not only agree: count its core's launches.
+        records_core = dsa.dsa_decode_dcp_records
+        launches = []
+
+        def counted_records_core(**kwargs):
+            launches.append(tuple(kwargs["q"].shape))
+            return records_core(**kwargs)
+
+        dsa.dsa_decode_dcp_records = counted_records_core
+        cache = _records_cache(degree, rank, device)
+        pool = SimpleNamespace(quant_method=None, get_key_buffer=lambda layer_id: cache)
+        layer = SimpleNamespace(
+            layer_id=0,
+            tp_q_head_num=_RECORDS_HEADS,
+            head_dim=576,
+            v_head_dim=512,
+            scaling=192**-0.5,
+            logit_cap=0.0,
+        )
+        with context:
+            # Every launch reaches the records core. 4 requests' rows split
+            # by their live keys, which rounds the FP8 probabilities against
+            # other running maxima than the token-major decode, so they are
+            # held to FP32 attention; 128 requests' rows fill the gfx950
+            # core's grid in one split, as the token-major decode's do.
+            for requests, exact in ((4, False), (128, True)):
+                tokens = requests * 4
+                slots, lengths = _records_selection(degree, tokens, device)
+                generator = torch.Generator().manual_seed(900 + rank)
+                q = torch.randn((tokens, _RECORDS_HEADS, 576), generator=generator)
+                q = q.to(device=device, dtype=torch.bfloat16)
+                outputs = []
+                for probed in (False, True):
+                    launches.clear()
+                    leaf = _decode_records_leaf(dsa, group, rank, requests, probed)
+                    outputs.append(
+                        leaf.forward_sparse_decode(
+                            q=q,
+                            layer=layer,
+                            token_to_kv_pool=pool,
+                            bs=requests,
+                            topk_indices=slots,
+                            topk_lens=lengths,
+                        )
+                    )
+                    shape = (degree, tokens, _RECORDS_HEADS, 576)
+                    assert launches == ([shape] if probed else [])
+                off, on = outputs
+                assert off.shape == (tokens, _RECORDS_HEADS * 512)
+                if exact:
+                    # Bit for bit, signed zeros included.
+                    assert torch.equal(off.view(torch.int16), on.view(torch.int16))
+                else:
+                    for output in outputs:
+                        _assert_attends_live_slots(
+                            output, q, slots, lengths, degree, layer.scaling
+                        )
+                assert not off[0].any() and not on[0].any()
+
+                # The records core reads the query where an owned top-k's
+                # score gather landed its rider, bit for bit.
+                rider = leaf.dcp_decode_query_rider(layer, q)
+                assert rider is not None
+                gathered = rider.new_empty((degree, *rider.shape))
+                dist.all_gather_into_tensor(gathered, rider)
+                owned_slots, owned_lens = compact_owned_cache_slots(
+                    slots, lengths, leaf.cache_placement(layer)
+                )
+                launches.clear()
+                ridden = leaf.forward_sparse_decode(
+                    q=q,
+                    layer=layer,
+                    token_to_kv_pool=pool,
+                    bs=requests,
+                    topk_indices=owned_slots,
+                    topk_lens=owned_lens,
+                    topk_owned=True,
+                    gathered_query=gathered,
+                )
+                assert launches == [shape]
+                assert torch.equal(on.view(torch.int16), ridden.view(torch.int16))
+
+        # The drafter's shapes at K3.1's KVP8: 12 heads a rank, 576-wide FP8
+        # queries, 512-wide BF16 partials, 16 rows (4 verify rows of 4 requests).
+        rows, heads = 16, 12
+        exchange = IrisPullExchange(
+            IrisGroup(
+                get_or_create_context(heap_size=1 << 28),
+                dist.group.WORLD,
+                rank,
+                device,
+            ),
+            rows * heads * degree * (512 // 2 + 1) * 4,
+        )
+        exchange.peers.finish_prepare()
+        generator = torch.Generator().manual_seed(40 + rank)
+        q = torch.randn((rows, heads, 576), generator=generator)
+        q = q.to(device=device, dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+        output = torch.randn((rows, heads * degree, 512), generator=generator)
+        output = output.to(device=device, dtype=torch.bfloat16)
+        lse = (torch.randn((rows, heads * degree), generator=generator) * 3).to(device)
+        lse[1] = -torch.inf
+        output[1] = torch.nan
+        # References through NCCL, before the pull exchange is installed.
+        gathered = gather_query_heads(q, group)
+        combined = combine_attention_partials(
+            output, lse, group=group, rank=rank, sink=None, keep_all_heads=False
+        )
+        backend.iris.install_pull_exchange(group, exchange)
+
+        def lent():
+            return (
+                gather_query_heads_lent(q, group),
+                combine_attention_partials(
+                    output,
+                    lse,
+                    group=group,
+                    rank=rank,
+                    sink=None,
+                    keep_all_heads=False,
+                    lend_records=True,
+                ),
+            )
+
+        def check(query, merged):
+            assert torch.equal(query.view(torch.uint8), gathered.view(torch.uint8))
+            assert torch.equal(merged.view(torch.int16), combined.view(torch.int16))
+
+        epoch = int(exchange.state[0])
+        for _ in range(2):
+            check(*lent())
+        # Both pulled through the exchange.
+        assert int(exchange.state[0]) > epoch
+        epoch = int(exchange.state[0])
+        # Queries and records it did not lend keep NCCL and its results.
+        check(
+            gather_query_heads(q, group),
+            combine_attention_partials(
+                output, lse, group=group, rank=rank, sink=None, keep_all_heads=False
+            ),
+        )
+        assert int(exchange.state[0]) == epoch
+        torch.cuda.synchronize()
+        dist.barrier(group=coordination)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("degree", [2, 8])
+def test_rank_major_decode_core_matches_packed_partials(tmp_path, degree):
+    if not torch.cuda.is_available() or torch.cuda.device_count() < degree:
+        pytest.skip(f"requires {degree} GPUs")
+    from tokenspeed_kernel.platform import ArchVersion, current_platform
+
+    platform = current_platform()
+    if not platform.is_amd or platform.arch_version != ArchVersion(9, 5):
+        pytest.skip("the DSA decode records core registers on AMD gfx950 GPUs")
+    mp.spawn(
+        _decode_records_worker,
+        args=(degree, f"file://{tmp_path / 'rendezvous'}"),
+        nprocs=degree,
         join=True,
     )

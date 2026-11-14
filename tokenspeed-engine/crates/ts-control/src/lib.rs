@@ -43,5 +43,6 @@ pub mod relay;
 pub mod request;
 pub mod request_stats;
 pub mod sampling;
+pub mod startup;
 pub mod trace;
 pub mod transport;

@@ -39,6 +39,7 @@ if not (is_cdna4() or is_cdna5()):
         allow_module_level=True,
     )
 
+from ops.test_attention_dsa import _pack_index_k_cache  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.attention.dsa import (  # noqa: E402
     attention as gfx950_dsa_backend,
 )
@@ -388,42 +389,6 @@ _GLM52_DSA_CASES = (
         seed=309,
     ),
 )
-
-
-def _pack_index_k_cache(
-    index_k: torch.Tensor,
-    page_size: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    head_dim = index_k.shape[1]
-    num_groups = head_dim // 128
-    row_bytes = head_dim + num_groups * 4
-    num_slots = index_k.shape[0]
-    num_pages = num_slots // page_size
-    packed = torch.empty(
-        (num_slots, row_bytes),
-        device=index_k.device,
-        dtype=torch.uint8,
-    )
-    x = index_k.float().reshape(num_slots, num_groups, 128)
-    scale = x.abs().amax(dim=-1, keepdim=True).clamp_min(1.0e-6) / 448.0
-    x_fp8 = (x / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
-
-    flat = packed.reshape(-1)
-    page_bytes = page_size * row_bytes
-    fp8_view = torch.as_strided(
-        flat.view(torch.float8_e4m3fn),
-        (num_pages, page_size, head_dim),
-        (page_bytes, head_dim, 1),
-    )
-    scale_view = torch.as_strided(
-        flat.view(torch.float32),
-        (num_pages, page_size, num_groups),
-        (page_bytes // 4, num_groups, 1),
-        (page_size * head_dim) // 4,
-    )
-    fp8_view.copy_(x_fp8.reshape(num_pages, page_size, head_dim))
-    scale_view.copy_(scale.reshape(num_pages, page_size, num_groups))
-    return packed, (x_fp8.float() * scale).reshape_as(index_k)
 
 
 def _generator(device: str, seed: int) -> torch.Generator:
@@ -2534,6 +2499,110 @@ def test_dsa_dense_split_variants_compile_during_warmup() -> None:
         for tokens in (20, 32, 64, 128, 1):
             out, ref = run(tokens)
             torch.testing.assert_close(out.float(), ref.float(), rtol=8e-2, atol=8e-2)
+
+
+def _reference_lse(
+    q: torch.Tensor,
+    latent: torch.Tensor,
+    rope: torch.Tensor,
+    topk_slots: torch.Tensor,
+    topk_lens: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    keys = torch.cat([latent.float(), rope.float()], dim=-1)
+    lse = torch.full(q.shape[:2], -float("inf"), device=q.device)
+    for token in range(q.shape[0]):
+        count = int(topk_lens[token].item())
+        if count:
+            selected = keys.index_select(0, topk_slots[token, :count].long())
+            scores = (q[token].float() @ selected.T) * softmax_scale
+            lse[token] = torch.logsumexp(scores, dim=-1)
+    return lse
+
+
+@pytest.mark.skipif(not is_cdna4(), reason="the LSE output is gfx950's")
+@pytest.mark.parametrize(
+    ("api", "kv_kind", "num_kv_splits"),
+    [
+        pytest.param(gluon_dsa_decode, "bf16", 1, id="decode-bf16-one_split"),
+        pytest.param(gluon_dsa_decode, "bf16", 4, id="decode-bf16-four_splits"),
+        pytest.param(gluon_dsa_decode, "e4m3", 1, id="decode-e4m3-one_split"),
+        pytest.param(gluon_dsa_decode, "e4m3", 4, id="decode-e4m3-four_splits"),
+        pytest.param(gluon_dsa_decode, "sparse", None, id="decode-packed_sparse"),
+        pytest.param(gluon_dsa_prefill, "e4m3", 1, id="prefill-e4m3-one_split"),
+        pytest.param(gluon_dsa_prefill, "e4m3", 4, id="prefill-e4m3-four_splits"),
+        pytest.param(gluon_dsa_prefill, "sparse", None, id="prefill-packed_sparse"),
+    ],
+)
+def test_dsa_lse_matches_the_reference(
+    monkeypatch, api, kv_kind: str, num_kv_splits: int | None
+) -> None:
+    device = "cuda"
+    num_heads = 16
+    num_slots = 4096
+    topk = 2048
+    kv_lora_rank = 512
+    qk_rope_head_dim = 64
+    qk_nope_head_dim = 128
+    softmax_scale = 1.0 / math.sqrt(qk_nope_head_dim + qk_rope_head_dim)
+    generator = _generator(device, 2026)
+    if num_kv_splits is not None:
+        monkeypatch.setattr(
+            gfx950_dsa_backend, "_select_num_kv_splits", lambda **_: num_kv_splits
+        )
+    q = _randn_bf16(
+        (4, num_heads, kv_lora_rank + qk_rope_head_dim),
+        device=device,
+        generator=generator,
+    )
+    latent = _randn_bf16((num_slots, kv_lora_rank), device=device, generator=generator)
+    rope = _randn_bf16(
+        (num_slots, qk_rope_head_dim), device=device, generator=generator
+    )
+    if kv_kind == "sparse":
+        sparse_kv, ref_latent = _pack_sparse_kv(latent, rope)
+        caches = {"kv_cache": None, "sparse_kv_cache": sparse_kv}
+        ref_rope = rope
+    else:
+        dtype = torch.bfloat16 if kv_kind == "bf16" else torch.float8_e4m3fn
+        q = q.to(dtype)
+        kv_cache = torch.cat([latent, rope], dim=-1).to(dtype)
+        caches = {"kv_cache": kv_cache, "sparse_kv_cache": None}
+        ref_latent = kv_cache[:, :kv_lora_rank]
+        ref_rope = kv_cache[:, kv_lora_rank:]
+    # An empty row, a short row, a partial row and a full selection.
+    topk_lens = torch.tensor([0, 7, 700, topk], device=device, dtype=torch.int32)
+    topk_slots = torch.full((4, topk), -1, device=device, dtype=torch.int32)
+    for token in range(4):
+        count = int(topk_lens[token].item())
+        topk_slots[token, :count] = torch.randperm(
+            num_slots, device=device, generator=generator
+        )[:count]
+
+    def attend(return_lse: bool):
+        return api(
+            q=q,
+            topk_slots=topk_slots,
+            topk_lens=topk_lens,
+            max_seqlen_k=num_slots,
+            qk_nope_head_dim=qk_nope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            softmax_scale=softmax_scale,
+            page_size=64,
+            return_lse=return_lse,
+            **caches,
+        )
+
+    out, lse = attend(True)
+    assert lse.shape == (4, num_heads) and lse.dtype == torch.float32
+    assert torch.equal(out, attend(False))
+    assert torch.isneginf(lse[0]).all()
+    assert (out[0] == 0).all()
+    ref_lse = _reference_lse(
+        q, ref_latent, ref_rope, topk_slots, topk_lens, softmax_scale
+    )
+    torch.testing.assert_close(lse[1:], ref_lse[1:], rtol=0, atol=2e-2)
 
 
 @pytest.mark.skipif(

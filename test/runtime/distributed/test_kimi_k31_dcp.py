@@ -167,6 +167,9 @@ def _selection_case(
     *expected, (expected_slots, expected_counts) = _prefill_then_decode_twice(
         *whole, hidden, **run
     )
+    if sharded[2].takes_owned_decode_topk(sharded[0].attn_mqa):
+        # Each rank keeps the selected keys it owns.
+        dist.all_reduce(counts)
     assert torch.equal(counts, expected_counts)
     assert (counts == 512).all()
     # gfx950 scores KVP candidates with the Triton leaf and one rank with Gluon's.

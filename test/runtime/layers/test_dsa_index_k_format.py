@@ -26,6 +26,7 @@ and the pool writes keys in the plane's own dtype without converting.
 
 from __future__ import annotations
 
+from test.ci_system.ci_register import register_cuda_ci
 from test.runtime.dsa_index_k_test_utils import index_k_pool
 
 import pytest
@@ -44,6 +45,8 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
     index_k_field,
 )
 from tokenspeed.runtime.utils.server_args import ServerArgs
+
+register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 HEAD_DIM = 128
 PREFIX = 64
@@ -173,6 +176,8 @@ def _qcp_attn_config(spec: DSAConfig) -> AttnConfig:
         kernel_page_size=PREFIX,
         kv_cache_quant_method="none",
         pd_disaggregation_enabled=False,
+        kvp_size=2,
+        kvp_group=(0, 1),
         qcp_size=2,
         qcp_group=(0, 1),
         components=(spec,),

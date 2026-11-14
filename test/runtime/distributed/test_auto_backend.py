@@ -1,6 +1,8 @@
 import subprocess
 import sys
 import textwrap
+from importlib.util import find_spec
+from test.ci_system.ci_register import register_cuda_ci
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -8,6 +10,7 @@ import pytest
 import torch
 
 from tokenspeed.runtime.distributed.comm_backend import iris as iris_module
+from tokenspeed.runtime.distributed.comm_backend import nccl as nccl_module
 from tokenspeed.runtime.distributed.comm_backend.auto import (
     AutoBackend,
     Collective,
@@ -22,6 +25,13 @@ from tokenspeed.runtime.distributed.comm_backend.trtllm_allreduce import (
     TrtllmAllReduceBackend,
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
+
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
+
+# These cases fake AMD, whose Iris reach check imports an AMD-only package.
+needs_iris = pytest.mark.skipif(
+    find_spec("iris") is None, reason="iris is packaged for ROCm only"
+)
 
 
 def test_runtime_import_without_iris():
@@ -173,6 +183,7 @@ def test_iris_preparation_caps_only_ordinary_staging(monkeypatch):
     assert len(created) == 1
 
 
+@needs_iris
 def test_public_preparation_preserves_capacities(backend, monkeypatch):
     from tokenspeed.runtime.distributed.comm_ops import prepare_all_reduce_buffers
 
@@ -288,6 +299,52 @@ def test_nccl_collection_uses_single_tensor_path():
     assert all(output is tensor for output, tensor in zip(outputs, tensors))
 
 
+def _bytes(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.view(torch.uint8)
+
+
+@pytest.mark.parametrize(
+    "shape, dtype, dim",
+    [
+        ((5, 3, 576), torch.float8_e4m3fn, 1),  # 8-byte words
+        ((6, 7), torch.uint8, -1),  # runs of 7 bytes
+        ((1, 6), torch.bfloat16, -1),  # one outer index: no relayout
+        ((2, 3), torch.float32, 0),
+    ],
+)
+def test_nccl_all_gather_concatenates_the_ranks_inputs_along_dim(
+    monkeypatch, shape, dtype, dim
+):
+    # AMD relayouts in 8-byte words; test_comm_ops gathers through movedim.
+    monkeypatch.setattr(
+        nccl_module, "current_platform", lambda: SimpleNamespace(is_amd=True)
+    )
+    group = (0, 1, 2, 3)
+    backend = NcclBackend()
+    backend._resources[group] = {
+        "pynccl_comm": None,
+        "device_group": None,
+        "world_size": len(group),
+    }
+    inputs = [
+        (
+            torch.randint(0, 256, shape, dtype=torch.uint8).view(dtype)
+            if dtype.itemsize == 1
+            else torch.randint(-(2**15), 2**15, shape, dtype=torch.int32).to(dtype)
+        )
+        for _ in group
+    ]
+
+    def land_rank_major(output, tensor, _group):
+        _bytes(output).copy_(torch.cat([_bytes(x) for x in inputs]))
+
+    backend.all_gather_single = land_rank_major
+    out = backend.all_gather(inputs[0], group, dim)
+
+    assert out.dtype == dtype
+    assert torch.equal(_bytes(out), torch.cat([_bytes(x) for x in inputs], dim))
+
+
 def test_trtllm_collection_uses_fallback_single_tensor_path():
     fallback = Mock()
     fallback.all_reduce.side_effect = lambda tensor, _group, op: tensor
@@ -313,6 +370,7 @@ def test_force_deterministic_rsag_preserves_two_tensor_nccl_grouping(
     backend._nccl.all_reduce.assert_not_called()
 
 
+@needs_iris
 def test_amd_collection_past_iris_capacity_uses_grouped_rccl(
     backend,
     monkeypatch,
@@ -333,6 +391,7 @@ def test_amd_collection_past_iris_capacity_uses_grouped_rccl(
     backend._nccl.all_reduce_two.assert_called_once_with(*tensors, group, op=None)
 
 
+@needs_iris
 def test_acquire_all_reduce_outputs_uses_iris(backend, monkeypatch):
     monkeypatch.setattr(
         "tokenspeed.runtime.distributed.comm_backend.auto.current_platform",
@@ -357,6 +416,7 @@ def test_acquire_all_reduce_outputs_uses_iris(backend, monkeypatch):
     )
 
 
+@needs_iris
 def test_acquire_all_reduce_outputs_amd_uses_base_when_iris_is_ineligible(
     backend,
     monkeypatch,
@@ -413,6 +473,7 @@ def test_acquire_all_reduce_outputs_preserves_trtllm(backend, monkeypatch):
     backend._iris.acquire_all_reduce_outputs.assert_not_called()
 
 
+@needs_iris
 @pytest.mark.parametrize("num_outputs", [1, 2])
 def test_symmetric_outputs_route_back_to_iris(backend, monkeypatch, num_outputs):
     monkeypatch.setattr(
@@ -429,6 +490,7 @@ def test_symmetric_outputs_route_back_to_iris(backend, monkeypatch, num_outputs)
     backend._nccl.all_reduce.assert_not_called()
 
 
+@needs_iris
 def test_prepared_symmetric_outputs_bypass_default_size_gate(backend, monkeypatch):
     monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", False)
     monkeypatch.setattr(

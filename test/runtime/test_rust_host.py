@@ -530,6 +530,7 @@ def _data_plane(handle: DeviceHandle) -> HostDataPlane:
         max_encoder_tokens=None,
         attn_tp_cpu_group=None,
         epd_publisher=None,
+        starting=False,
     )
 
 

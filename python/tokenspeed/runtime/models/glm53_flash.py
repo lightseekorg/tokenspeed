@@ -1126,8 +1126,11 @@ class Glm53FlashAttention(GlmMoeDsaAttention):
         num_tokens: int,
         num_decode_tokens: int,
         topk: int,
+        query_rider: torch.Tensor | None = None,
     ) -> GlmDsaDecodeTopK:
         del topk
+        if query_rider is not None:
+            raise ValueError("GLM-5.3-Flash selects no owned decode top-k")
         writes_full_workspace = decode_start == 0 and num_decode_tokens == num_tokens
         topk_indices = self._get_decode_topk_workspace(
             num_tokens,

@@ -27,11 +27,13 @@ import torch
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
+from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     DSA_SPARSE_PAGE_SIZE,
 )
+from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 _INDEX_K_FP8_GROUP_SIZE = 128
@@ -123,10 +125,12 @@ def dsa_history_gather_workspace_bytes(
     :func:`dsa_history_gather_workspace_rows`) of latent rows in the KV cache
     dtype plus index-K rows packed in the plane's own format
     (:func:`index_k_row_bytes` of ``spec.index_k_format``: FP8 keys with
-    their scales, or bf16 keys): the sharded extend arm gathers each request
-    group's history into it, so a request's history may never exceed the
-    model length. ``DSABackend.preallocate_history_gather_workspace``
-    allocates exactly these bytes.
+    their scales, or bf16 keys); a KVP prefill over gathered histories
+    (:func:`dsa_kvp_history_prefill`) shares one buffer between the two, so
+    it holds the wider. The sharded extend arm gathers each request group's
+    history into it, so a request's history may never exceed the model
+    length. ``DSABackend.preallocate_history_gather_workspace`` allocates
+    exactly these bytes.
     """
     spec = config.component(DSAConfig)
     if spec is None:
@@ -137,9 +141,31 @@ def dsa_history_gather_workspace_bytes(
     kv_bytes = (
         spec.kv_cache_dim * torch.tensor([], dtype=config.kv_cache_dtype).element_size()
     )
-    return rows * (
-        kv_bytes + index_k_row_bytes(spec.index_head_dim, spec.index_k_format)
-    )
+    row_bytes = index_k_row_bytes(spec.index_head_dim, spec.index_k_format)
+    if dsa_kvp_history_prefill(config):
+        return rows * max(kv_bytes, row_bytes)
+    return rows * (kv_bytes + row_bytes)
+
+
+def dsa_kvp_history_prefill(config: AttnConfig) -> bool:
+    """Whether the target DSA leaf runs its KVP prefill over gathered
+    histories, and so needs the history gather workspace: each rank gathers
+    the chunk's history pages from their owners and scores and attends them
+    with its own attention-TP heads, as an unsharded cache would, in place of
+    the sharded arm's query gather and partials exchange.
+
+    The target over KVP pages without query context parallelism (which has
+    its own sharded arm) on AMD GPUs, where it is validated; NVIDIA and the
+    Ascend leaf keep their KVP prefill. A bitwise envelope keeps the sharded
+    arm too: this one attends each row in one pass where the sharded arm
+    merges per-owner partials, so it rounds differently."""
+    if config.qcp_size > 1 or config.kvp_size == 1:
+        return False
+    if config.component(DSAConfig) is None or config.is_draft:
+        return False
+    if not current_platform().is_amd:
+        return False
+    return global_server_args_dict["numerics"] not in BITWISE_ENVELOPES
 
 
 def dsa_padded_prefill_replay(

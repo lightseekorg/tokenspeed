@@ -144,6 +144,25 @@ finds the k-th largest score with the CUDA persistent-radix `persistent_topk`,
 whose atomics pick among tied scores in arrival order, and then keeps every
 candidate above that score and the first tied ones, in candidate order.
 
+When a rank needs only its own share of that selection as local cache slots,
+`dsa_select_owned_candidates` takes the ranks' gathered FP32 score planes
+(`[degree, rows, topk]`, which a declaring `dsa_index_candidates` leaf writes
+straight into a collective's send buffer through `scores_out`) and its own
+candidate positions. Every rank finds the same k-th largest score and tie
+quota from the same planes, keeps its own candidates above the score and its
+share of the first tied ones (ranks in order, then candidate order), and
+writes `local_page_table[request, position // page_size] * page_size +
+position % page_size` in candidate order, padded with -1, with the count per
+row. That is bit for bit `cuda_dsa_merge_candidates`' selection compacted to
+the rank's slots, without exchanging positions; `triton_dsa_merge_candidates`
+selects the same candidates in score order. A score plane reads an invalid
+candidate off its score, so `scores_out` holds -inf for every -1 offset.
+Only gfx950 registers it, as one launch over the gathered planes:
+`dsa_select_owned_candidates_supported` accepts a power-of-two rank count, a
+power-of-two topk of at least 512, at most 16384 gathered scores per row and
+rank chunks within 32-bit offsets, and refuses other platforms. A KVP decode
+whose sizes it refuses merges the candidates instead.
+
 ## Materialized Triton row top-k
 
 `triton_topk_from_logits(logits, topk, seq_lens=..., enable_pdl=...)` selects
@@ -570,10 +589,31 @@ the Triton leaf registers it. A `dsa_prefill` registration would make it a
 candidate for ordinary calls. The leaf runs `_dsa_dense_kv_kernel`'s
 single-split program over dense KV, with the same jitted body
 (`_dsa_dense_kv_attend`) and launch configuration. The token count is a
-runtime argument (`do_not_specialize`). `dsa_prefill_dcp_records_supported`
-accepts a size only when `dsa_prefill` would not split the keys either: the
-launch needs at least about one program per SM. Any other size raises.
-Callers check this from host sizes before they gather the query.
+runtime argument (`do_not_specialize`). The leaf accepts a size only when
+`dsa_prefill` would not split the keys either: the launch needs at least
+about one program per SM. The records ops pass their sizes (rows, every
+rank's heads, the selection width and the dtypes) as selection traits, and
+each leaf states its size rule as a `problem_filter` over them, so selection
+refuses any other size. `dsa_prefill_dcp_records_supported` and
+`dsa_decode_dcp_records_supported` are that selection, which callers make
+from host sizes before they gather the query; `dsa_select_owned_candidates`
+does the same over its gathered scores' sizes.
+
+`dsa_decode_dcp_records` is the decode counterpart, with the same layouts and
+bit-identity to `dispatch_dcp_attention_partials` over
+`dsa_decode(..., return_lse=True)`. Only gfx950's dense matrix core
+(`gluon_dsa_decode_gfx950`) registers it. Its key-split programs read the
+rank-major query, and its split reduction stores each head's output and LSE
+straight into the head owner's record. The kernels are the ones `dsa_decode`
+runs, with the heads per rank as a compile-time constant: 0 compiles the
+token-major indexing unchanged, and a model's local head count gives the
+records layout one more binary. The rank stride stays a specialized runtime
+argument, because the query's direct-to-LDS copy needs its 16-element
+alignment. `dsa_decode_dcp_records_supported` accepts a
+size only when that core splits the keys, since only the reduction writes
+records. The core splits while one program per row and 16-head block stays
+under two waves (512 programs on 256 CUs), so up to 85 rows at 96 heads. A
+BF16 query with RoPE never splits, and other platforms are refused.
 
 ### Persistent CUDA top-k dependencies
 

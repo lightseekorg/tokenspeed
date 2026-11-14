@@ -43,7 +43,9 @@ _PAGE_SIZE = 64
 _SOFTMAX_SCALE = 192**-0.5
 
 
-def _make_inputs(seqlen: int, batch_size: int = 1):
+def _make_inputs(
+    seqlen: int, batch_size: int = 1, dtype: torch.dtype = torch.float8_e4m3fn
+):
     pages_per_batch = (seqlen + _PAGE_SIZE - 1) // _PAGE_SIZE
     pages = batch_size * pages_per_batch
     q = (
@@ -56,7 +58,7 @@ def _make_inputs(seqlen: int, batch_size: int = 1):
             dtype=torch.bfloat16,
         )
         * 0.25
-    ).to(torch.float8_e4m3fn)
+    ).to(dtype)
     kv_cache = (
         torch.randn(
             pages,
@@ -67,7 +69,7 @@ def _make_inputs(seqlen: int, batch_size: int = 1):
             dtype=torch.bfloat16,
         )
         * 0.25
-    ).to(torch.float8_e4m3fn)
+    ).to(dtype)
     page_table = torch.arange(pages, device="cuda", dtype=torch.int32).view(
         batch_size, pages_per_batch
     )
@@ -457,3 +459,48 @@ def test_query_block_mla_verify_reuses_split_bucket_specialization():
     check(22, 64, _SOFTMAX_SCALE)
     with assert_no_triton_compile(*kernels):
         check(16, 72, _SOFTMAX_SCALE * 0.75)
+
+
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16])
+def test_mla_decode_batches_reuse_split_bucket_binaries(dtype):
+    """An eager batch of any size runs its own split count on the binaries
+    that a batch with the same power-of-two split bucket compiled."""
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mla import decode
+
+    if dtype == torch.float8_e4m3fn:
+        launch = gluon_mla_decode_fp8xfp8_gfx950
+        out_tol, lse_tol = dict(rtol=0.12, atol=0.12), dict(rtol=0.08, atol=0.08)
+    else:
+        launch = decode.launch_gluon_mla_decode_bf16xbf16_gfx950_bh16bn64
+        # The output rounds once to BF16: at most 4.3e-5 on these outputs of
+        # up to 0.011, and 2e-6 on the LSE (measured on MI350X).
+        out_tol, lse_tol = dict(rtol=2**-7, atol=1e-4), dict(rtol=1e-5, atol=1e-4)
+    seqlen = 16384
+
+    def check(batch_size):
+        q, kv_cache, page_table, cache_seqlens = _make_inputs(seqlen, batch_size, dtype)
+        out, lse = launch(
+            q=q,
+            kv_cache=kv_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            max_seqlen_k=seqlen,
+            qk_nope_head_dim=128,
+            kv_lora_rank=_KV_LORA_RANK,
+            qk_rope_head_dim=_ROPE_DIM,
+            softmax_scale=_SOFTMAX_SCALE,
+            return_lse=True,
+        )
+        ref_out, ref_lse = _reference(q, kv_cache, seqlen)
+        torch.testing.assert_close(out.float(), ref_out, **out_tol)
+        torch.testing.assert_close(lse, ref_lse, **lse_tol)
+
+    # Every split bucket a batch of up to 32 takes: 8 to 256 for BF16, 8 to 32
+    # for FP8, whose work cap holds the small batches at 32.
+    for batch_size in (1, 2, 4, 8, 16, 32):
+        check(batch_size)
+    with assert_no_triton_compile(
+        decode._mla_decode_gluon, decode._mla_softmax_reducev_kernel
+    ):
+        for batch_size in (3, 7, 12, 24):
+            check(batch_size)

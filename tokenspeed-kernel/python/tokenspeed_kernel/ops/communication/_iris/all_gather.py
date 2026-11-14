@@ -38,6 +38,7 @@ from tokenspeed_kernel.ops.communication._iris.all_reduce import (
 )
 from tokenspeed_kernel.ops.communication.iris import _PRODUCER_DIRECT_GL_DTYPES
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.warmup import kernel_launcher, register_triton_warmup
 
 hip_utils = triton.language.extra.hip.utils
 
@@ -137,7 +138,7 @@ class IrisAllGather:
                 == self.producer.data.data_ptr()
                 + self.producer.peers.rank * local_hidden_size * tensor.element_size()
             )
-            iris_pull_allgather_columns[(num_programs,)](
+            kernel_launcher(iris_pull_allgather_columns, (num_programs,))(
                 local,
                 self.producer.data,
                 output[start : start + chunk_rows],
@@ -171,6 +172,22 @@ def column_gather_num_warps(local_bytes: int, world_size: int) -> int:
     if world_size == 8 and local_bytes >= _COLUMN_GATHER_TWO_SUBGROUP_MIN_BYTES:
         return 2
     return 1
+
+
+def _column_gather_variants(args) -> tuple[dict, ...]:
+    """Both subgroup counts the payload size picks; only one row is published."""
+    subgroup = args["BLOCK_WORDS"] // (args["NUM_WARPS"] * args["WORDS_PER_LANE"])
+    sets = []
+    for warps in (1, 2) if args["WORLD_SIZE"] == 8 else (1,):
+        sets.append(
+            {
+                "NUM_WARPS": (warps,),
+                "num_warps": (warps,),
+                "BLOCK_WORDS": (subgroup * warps * args["WORDS_PER_LANE"],),
+                "INPUT_PUBLISHED": (False, True) if warps == 1 else (False,),
+            }
+        )
+    return tuple(sets)
 
 
 def all_gather_columns_can_run(
@@ -820,3 +837,6 @@ def iris_fused_lamport_allgather_rmsnorm(
     gl.barrier()
     for tile in gl.static_range(TILES):
         gl.store(epochs + row * TILES + tile, ((stages[tile] + 1) % 3).to(gl.int32))
+
+
+register_triton_warmup(iris_pull_allgather_columns, variants=_column_gather_variants)

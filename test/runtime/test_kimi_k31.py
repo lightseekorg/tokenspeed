@@ -2096,7 +2096,10 @@ def _k31_attention_stack(
     from tokenspeed.runtime.distributed import Mapping
     from tokenspeed.runtime.distributed.comm_manager import CommManager
     from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
-    from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
+    from tokenspeed.runtime.layers.attention.configs.dsa import (
+        DSAConfig,
+        dsa_kvp_history_prefill,
+    )
     from tokenspeed.runtime.layers.attention.kv_cache.factory import (
         create_cache_arena,
         create_cache_pool,
@@ -2210,32 +2213,31 @@ def _k31_attention_stack(
         attention.kv_b_proj.weight, attention
     )
     bind_cache_groups(attention, pool)
-    router = create_paged_router(
-        AttnConfig(
-            device="cuda",
-            dtype=torch.bfloat16,
-            kv_cache_dtype=kv_cache_dtype,
-            kv_cache_quant_method=None,
-            max_bs=4,
-            context_len=context_len,
-            speculative_num_draft_tokens=spec_width,
-            kvp_size=kvp_size,
-            kvp_rank=kvp_rank,
-            kvp_group=kvp_group,
-            components=(
-                dataclasses.replace(
-                    dsa,
-                    num_attention_heads=heads * kvp_size,
-                    num_kv_heads=heads * kvp_size,
-                    attn_tp_size=kvp_size,
-                ),
+    config = AttnConfig(
+        device="cuda",
+        dtype=torch.bfloat16,
+        kv_cache_dtype=kv_cache_dtype,
+        kv_cache_quant_method=None,
+        max_bs=4,
+        context_len=context_len,
+        speculative_num_draft_tokens=spec_width,
+        kvp_size=kvp_size,
+        kvp_rank=kvp_rank,
+        kvp_group=kvp_group,
+        components=(
+            dataclasses.replace(
+                dsa,
+                num_attention_heads=heads * kvp_size,
+                num_kv_heads=heads * kvp_size,
+                attn_tp_size=kvp_size,
             ),
         ),
-        AttentionArch.DSA,
-        backend_name="dsa",
     )
+    router = create_paged_router(config, AttentionArch.DSA, backend_name="dsa")
     router.set_cache_pool(pool)
     router.configure_runtime()
+    if dsa_kvp_history_prefill(config):
+        router.preallocate_history_gather_workspace(context_len)
     router.init_cuda_graph_state(4, max_extend_tokens=256)
     return attention, comm, router, pool
 

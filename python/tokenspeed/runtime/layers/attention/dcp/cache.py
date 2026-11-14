@@ -73,6 +73,11 @@ class HistoryGatherWorkspace:
     shared with the draft's: the two never gather at the same time, since the
     draft's extend step follows the target's forward on the same stream.
 
+    Under a KVP prefill over gathered histories (``dsa_kvp_history_prefill``)
+    ``kv`` and ``index_k`` view the same leading bytes: a layer's top-k
+    consumes its gathered index-K rows before the layer gathers its latent
+    rows, on the same stream, so the buffer holds the wider of the two.
+
     Attributes:
         rows: Row capacity, a whole number of kernel pages.
         kv: ``[rows, kv_cache_dim]`` latent rows in the KV cache dtype.
@@ -108,6 +113,8 @@ class HistoryGatherWorkspace:
 
     @property
     def nbytes(self) -> int:
+        if self.kv.data_ptr() == self.index_k.data_ptr():
+            return max(self.kv.nbytes, self.index_k.nbytes)
         return self.kv.nbytes + self.index_k.nbytes
 
 

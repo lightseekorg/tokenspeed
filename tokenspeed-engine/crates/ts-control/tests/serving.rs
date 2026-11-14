@@ -53,6 +53,7 @@ use ts_control::{
     grammar::{GrammarConfig, GrammarKey, Grammars},
     ingress::{Admission, IngressLimits, LogprobServability},
     output::{FinishLog, ForwardResult, LogprobPlan, OutputProcessor, Role, StreamedOutput},
+    startup,
     transport::EngineTransport,
 };
 use ts_l3::{
@@ -1285,7 +1286,12 @@ struct Setup {
     weight_update_failure_rank: Option<usize>,
     /// The ranks whose load prerequisites refuse until the test clears them.
     weight_load_refused: Option<fn(usize) -> bool>,
+    /// The requests each engine serves itself before its frontend attaches,
+    /// [`STARTUP_OUTPUT_TOKENS`] each.
+    startup: Vec<startup::Phase>,
 }
+
+const STARTUP_OUTPUT_TOKENS: usize = 3;
 
 impl Layout {
     /// Ranks, attention-TP ranks per replica, and engines.
@@ -1391,7 +1397,6 @@ fn run_rank<F: Frontend>(
     let tp_first = rank / tp_size * tp_size;
     let replica = Group::new(1, (tp_first..tp_first + tp_size).collect(), rank).unwrap();
     let dp = (num_engines > 1).then(|| Group::new(0, (0..world).collect(), rank).unwrap());
-    let frontend = frontend();
     let Setup {
         device_pages,
         pd,
@@ -1399,6 +1404,7 @@ fn run_rank<F: Frontend>(
         grammar,
         grammar_timeouts,
         epd_receive_enabled,
+        startup,
         ..
     } = setup;
     let role = pd.as_ref().map_or(Role::Plain, |pd| pd.role);
@@ -1440,10 +1446,11 @@ fn run_rank<F: Frontend>(
         Layout::TpKvp(_, shards) => shards,
         _ => 1,
     };
+    // Attached once the startup requests ran, as the host does.
     let mut event_loop = EventLoop::new(
         new_scheduler(tiers, role, kv_shard_count, device_pages.unwrap_or(513)),
         device,
-        frontend,
+        None,
         outputs,
         config,
         ranks,
@@ -1475,6 +1482,10 @@ fn run_rank<F: Frontend>(
             l3: store.map(|store| l3_executor(store, rank)),
         },
     );
+    if event_loop.warm_up(startup::requests(&startup, STARTUP_OUTPUT_TOKENS), stop)? {
+        return Ok(());
+    }
+    *event_loop.frontend_mut() = Some(frontend());
     event_loop.run(stop)
 }
 
@@ -1827,6 +1838,70 @@ fn assert_scripted_tokens(rank: &ScriptedRank, rid: &str, count: i32) {
     );
     assert_eq!(outputs.last().unwrap().finish_reason, Some("length"));
     assert_eq!(outputs.last().unwrap().completion_tokens, i64::from(count));
+}
+
+#[test]
+fn startup_requests_run_on_every_rank_and_leave_nothing_behind() {
+    for layout in [Layout::Single, Layout::Tp(2), Layout::Dp(2)] {
+        let (_, _, num_engines) = layout.sizes();
+        // The client's prompt is the first startup prompt of each phase.
+        let prompt = |rid| {
+            EngineRequest::Add(Box::new(TokenizedGenerateReqInput {
+                input_ids: Some(vec![1; 48]),
+                ..request(rid, 0, budget(3))
+            }))
+        };
+        let mut script: Script = vec![Vec::new(); 30];
+        script[0].push(prompt("client"));
+        script[15].push(prompt("again"));
+        let setup = Setup {
+            startup: vec![
+                startup::Phase {
+                    batch: 1,
+                    prompt_len: 48,
+                },
+                startup::Phase {
+                    batch: 2,
+                    prompt_len: 48,
+                },
+            ],
+            ..Setup::default()
+        };
+        let ranks = run_scripted(
+            layout,
+            1,
+            Tiers::DeviceOnly,
+            setup,
+            vec![script; num_engines],
+            no_reaction,
+        );
+        for rank in &ranks {
+            assert_eq!(rank.outcome, Ok(()), "{layout:?}");
+            let started: Vec<_> = rank
+                .released
+                .iter()
+                .filter(|(rid, _)| rid.starts_with(startup::RID_PREFIX))
+                .collect();
+            assert_eq!(started.len(), 3, "{layout:?}");
+            assert!(rank
+                .outputs
+                .iter()
+                .all(|output| !output.rid.starts_with(startup::RID_PREFIX)));
+        }
+        for engine in ranks.iter().filter(|rank| !rank.outputs.is_empty()) {
+            let cached = |rid: &str| {
+                engine
+                    .outputs
+                    .iter()
+                    .rfind(|output| output.rid == rid)
+                    .unwrap()
+                    .cached_tokens
+            };
+            // Startup dropped its prefixes; serving still caches.
+            assert_eq!(cached("client"), 0, "{layout:?}");
+            assert!(cached("again") > 0, "{layout:?}");
+        }
+    }
 }
 
 #[test]

@@ -51,6 +51,7 @@ __all__ = [
     "spec_matches_traits",
     "ref_compatible_with_spec",
     "spec_matches_shape_traits",
+    "traits_problem_filter",
     "warmup_selection",
 ]
 
@@ -510,12 +511,16 @@ def spec_matches_shape_traits(spec: KernelSpec, traits: dict[str, Any]) -> bool:
     * ``<dim>_max``: the value must not exceed one declared maximum.
 
     Rules those cannot express go in ``mnk_problem_filter``, a set of
-    ``(m, n, k) -> bool`` predicates of which at least one must accept.
+    ``(m, n, k) -> bool`` predicates of which at least one must accept, or,
+    for an op whose sizes are not ``m``, ``n`` and ``k``, in
+    ``problem_filter``, a set of predicates over the request's traits built
+    by :func:`traits_problem_filter`, of which at least one must accept.
 
     A declared bound is a hard requirement: a spec that declares
     ``<dim>_align``, ``<dim>_min`` or ``<dim>_max`` rejects any request that
-    does not supply ``<dim>``, and a ``mnk_problem_filter`` rejects a request
-    missing any of ``m``, ``n`` or ``k``. Exact sets are matched by value
+    does not supply ``<dim>``, a ``mnk_problem_filter`` rejects a request
+    missing any of ``m``, ``n`` or ``k``, and a ``problem_filter`` one
+    missing a trait its predicate reads. Exact sets are matched by value
     membership; for the GEMM dimensions ``batch``, ``m``, ``n`` and ``k`` that
     is also enforced here and a spec constraining one of them rejects a request
     that omits it. Dimensions a spec does not constrain are ignored.
@@ -551,7 +556,31 @@ def spec_matches_shape_traits(spec: KernelSpec, traits: dict[str, Any]) -> bool:
         if not any(problem_filter(m, n, k) for problem_filter in problem_filters):
             return False
 
+    problem_filters = spec.traits.get("problem_filter")
+    if problem_filters is not None and not any(
+        problem_filter(traits) for problem_filter in problem_filters
+    ):
+        return False
+
     return True
+
+
+def traits_problem_filter(
+    check: Callable[..., bool], *names: str
+) -> Callable[[dict[str, Any]], bool]:
+    """A ``problem_filter`` predicate: ``check`` called with the request's
+    traits ``names`` as keywords, rejecting a request missing any of them.
+
+    For a size rule traits cannot state (byte ranges, a launch geometry),
+    over sizes the op's facade passes as traits on every call.
+    """
+
+    def accepts(traits: dict[str, Any]) -> bool:
+        if any(name not in traits for name in names):
+            return False
+        return bool(check(**{name: traits[name] for name in names}))
+
+    return accepts
 
 
 def _filter_by_traits(
