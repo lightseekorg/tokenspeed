@@ -20,11 +20,14 @@
 
 """Pre-expert projection (the pooler) of one Muse Spark rank.
 
-pool, 32 tasks: one 16-row block of the rank's 512 pooler rows (BF16
-``[512, 8192]``, 256 KiB a task) times the whole BF16 MoE input ``xin``,
-rounded to BF16 like the regular path, for every row. A task puts its 16
-values of each row into every rank's ``cg``, so every rank gets the whole
-pooled rows (4096 each, rank-major).
+pool, 32 tasks a group of up to 8 rows: one 16-row block of the rank's 512
+pooler rows (BF16 ``[512, 8192]``, 256 KiB a task) times the whole BF16 MoE
+input ``xin`` of the group's rows, rounded to BF16 like the regular path. A
+task puts its 16 values of each row into every rank's ``cg``, so every rank
+gets the whole pooled rows (4096 each, rank-major). Past 8 rows the two row
+groups run on separate tasks, each streaming the same weights, rather than
+one task running the groups one after the other: the rows of K sit in LDS
+(16 KiB a row), so a task holds 8 rows at a time.
 """
 
 from __future__ import annotations
@@ -55,23 +58,28 @@ def regions() -> tuple[tuple[str, int], ...]:
     return (("cg", int(POOLED) // 2),)  # BF16 pairs of the pooled row
 
 
-def stages(bases: dict[str, int]) -> tuple[Stage, ...]:
-    """The pool stage (one task serves every row), placed by ``bases``."""
+def stages(bases: dict[str, int], rows: int) -> tuple[Stage, ...]:
+    """The pool stage for ``rows`` rows (``POOL_TASKS`` a group of up to 8
+    rows), placed by ``bases``."""
     (pool,) = placement(bases, ("pool",))
-    return (
-        Stage("pool", int(POOL_TASKS), pool, reads=("xin", "xflag"), writes=("cg",)),
-    )
+    tasks = int(POOL_TASKS) * ((rows + 7) // 8)
+    return (Stage("pool", tasks, pool, reads=("xin", "xflag"), writes=("cg",)),)
 
 
 @gluon.jit
 def pool_stage(mb, task, w, RANK: gl.constexpr, STAGE: gl.constexpr):
-    """Pool task ``task``: pooled columns ``512 RANK + 16 task ..``.
+    """Pool task ``task``: pooled columns ``512 RANK + 16 (task % 32) ..`` of
+    row group ``task // 32``.
 
     Args:
         w: This rank's pooler rows, BF16 ``[512, 8192]`` (``weights.bf16_tiles``).
     """
     R: gl.constexpr = schedule.rows(mb.plan)
     mb.stamp(STAGE, trace.START)
+    if R > 8:
+        # Past 8 rows: row group ``task // 32``, weight block ``task % 32``.
+        group = task // POOL_TASKS
+        task = task % POOL_TASKS
     tiles = bf16.load_weight_tiles(
         w,
         nb0=task,
@@ -83,16 +91,19 @@ def pool_stage(mb, task, w, RANK: gl.constexpr, STAGE: gl.constexpr):
         GROUP=1,
         GROUP_STRIDE=0,
     )
-    # One wave spins on the last row's flags first: the attention tail
-    # publishes every row at about the same time.
+    # One wave spins on the group's last row's flags first: the attention
+    # tail publishes every row at about the same time.
     lanes = gl.arange(0, 64 * gl.num_warps(), mailbox.lane_layout(gl.num_warps()))
-    mb.row(R - 1).pre_poll("xflag", lanes % (WORLD * TAIL_TASKS))
-    # The whole rows of K sit in LDS (16 KiB a row): past 8 rows, the rows
-    # go through in two passes of the weights the task holds.
     if R > 8:
-        _pool_pass(mb, tiles, 0, 8, task, RANK)
-        _pool_pass(mb, tiles, 8, R - 8, task, RANK)
+        mb.row(gl.minimum(8 * group + 7, R - 1)).pre_poll(
+            "xflag", lanes % (WORLD * TAIL_TASKS)
+        )
+        if group == 0:
+            _pool_pass(mb, tiles, 0, 8, task, RANK)
+        else:
+            _pool_pass(mb, tiles, 8, R - 8, task, RANK)
     else:
+        mb.row(R - 1).pre_poll("xflag", lanes % (WORLD * TAIL_TASKS))
         _pool_pass(mb, tiles, 0, R, task, RANK)
     mb.stamp(STAGE, trace.COMPUTED)
     mb.stamp(STAGE, trace.END)

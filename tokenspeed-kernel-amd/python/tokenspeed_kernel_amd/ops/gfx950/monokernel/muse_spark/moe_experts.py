@@ -887,22 +887,28 @@ B_TILE_BYTES = gl.constexpr(8192)  # 64 packed K x 128 columns
 
 
 @gluon.jit
-def ex1_prefetch(PLAN: gl.constexpr, task, active, table, w13, stride_we):
-    """Past 8 rows: copy the w13 B tiles (not the scales) of the lane's second
+def ex1_prefetch(PLAN: gl.constexpr, task, active, table, union, w13, stride_we):
+    """Past one row: copy the w13 B tiles (not the scales) of the lane's second
     slot for ex1 task ``task`` into LDS: 8 buffers, ``uint8 [8192]`` a K-tile,
     while the CTA waits on the routing chain for its A operand. Only the first
     slot's tiles are in flight then (in registers: a second there spills past 8
-    rows). ``table``: :func:`cta_slots`. Up to 8 rows nothing loads (a
-    placeholder).
+    rows). The slot's expert comes from ``table`` (:func:`cta_slots`) past 8
+    rows, else from ``union``. With one row a lane has one slot at most (8
+    picks over 8 lanes): nothing loads (a placeholder).
 
     The copies count in ``vmcnt`` in order, so :func:`ex1_xq`'s poll waits for
     them: by its return they have landed."""
-    if schedule.rows(PLAN) > 8:
+    R: gl.constexpr = schedule.rows(PLAN)
+    if R > 1:
         nw: gl.constexpr = gl.num_warps()
         KT: gl.constexpr = K_SLICE // 128
         blk = (task // KSPLIT) % NB1
         ks = task % KSPLIT
-        expert = lane_slot_expert(table[0], 1)
+        if R > 8:
+            expert = lane_slot_expert(table[0], 1)
+        else:
+            lane = task // (NB1 * KSPLIT)
+            expert = _slot_expert(union, lane + LANES)
         on = active & (expert >= 0)
         w_off = gl.maximum(expert, 0).to(gl.int64) * stride_we
         raw: gl.constexpr = gl.BlockedLayout([16], [64], [nw], [0])
@@ -1010,6 +1016,39 @@ def ex1_issue(
     )
 
 
+@gluon.constexpr_function
+def _p1_layout(num_warps):
+    """``[M_DUP, BLOCK_N]`` with a warp's 16 columns of the MFMA tile, a
+    row's 16 columns in 16 lanes (4 rows a store)."""
+    return gl.BlockedLayout([1, 1], [4, 16], [1, num_warps], [1, 0])
+
+
+@gluon.jit
+def _put_p1(mb, acc, k, blk, ks):
+    """Put an ex1 slot's FP32 partials ``acc [M_DUP, BLOCK_N]`` (MFMA layout)
+    into ``p1``: MFMA row ``m`` goes to row ``m``'s copy under pick ``k[m]``
+    (``k`` in ``SliceLayout(1, _p1_layout)``; -1 skips the row).
+
+    In the MFMA layout a lane holds 4 adjacent columns of a row, so each
+    8-byte store writes 4 lanes 32 bytes apart and fills a quarter of every
+    segment it touches. :func:`_p1_layout` puts a row's 16 columns of a
+    warp in 16 lanes: one store writes 128 contiguous bytes a row. Each
+    warp keeps its own columns, but the conversion moves both of a lane's
+    column bits from registers to lanes, which Triton lowers through LDS
+    with a workgroup barrier rather than lane shuffles."""
+    cl: gl.constexpr = _p1_layout(gl.num_warps())
+    v = gl.convert_layout(acc, cl)
+    m = gl.arange(0, M_DUP, gl.SliceLayout(1, cl))[:, None]
+    n = gl.arange(0, BLOCK_N, gl.SliceLayout(0, cl))[None, :]
+    at = ((k[:, None] * NB1 + blk) * KSPLIT + ks) * BLOCK_N + n
+    mb.put(
+        "p1",
+        mb.row_offset(m) + at,
+        v.to(gl.int32, bitcast=True),
+        mask=(k[:, None] >= 0) & (n >= 0),
+    )
+
+
 @gluon.jit
 def _ex1_slot(mb, task, a, tiles, union, expert):
     """Multiply the A rows by one slot's w13 ``tiles`` and publish the FP32
@@ -1020,24 +1059,17 @@ def _ex1_slot(mb, task, a, tiles, union, expert):
     p_smem, s_smem = a
     acc = _mma_rows(p_smem, s_smem, tiles)
     picks = _row_picks(union, expert, R)
-    m = gl.arange(0, M_DUP, gl.SliceLayout(1, acc.type.layout))
+    m = gl.arange(0, M_DUP, gl.SliceLayout(1, _p1_layout(gl.num_warps())))
     k = gl.full([M_DUP], -1, gl.int32, m.type.layout)
     for r in gl.static_range(R):
         k = gl.where(m == r, picks[r], k)
-    n = gl.arange(0, BLOCK_N, gl.SliceLayout(0, acc.type.layout))[None, :]
-    at = ((k[:, None] * NB1 + blk) * KSPLIT + ks) * BLOCK_N + n
-    mb.put(
-        "p1",
-        mb.row_offset(m[:, None]) + at,
-        acc.to(gl.int32, bitcast=True),
-        mask=(k[:, None] >= 0) & (n >= 0),
-    )
+    _put_p1(mb, acc, k, blk, ks)
 
 
 @gluon.jit
 def lane_slots(union, lane):
     """Past 8 rows: the expert and the row picks of each of lane ``lane``'s
-    slots, from the slot table (``union``) in one reduction, in LDS: ``(experts,
+    slots, from the slot table (``union``), in LDS: ``(experts,
     picks)``, ``int32 [16, 16]`` each, row ``k`` for slot ``lane + 8 k`` (at
     most 8 picks a row make at most 16 slots a lane). A picks row holds each
     row's pick of the slot's expert, or -1 (as :func:`_ex2_gather_lane`); an
@@ -1051,21 +1083,46 @@ def lane_slots(union, lane):
     :func:`_row_picks`) are reductions over the 128-pick table a slot."""
     nw: gl.constexpr = gl.num_warps()
     ids, owner, slot, count, table = union
+    NP: gl.constexpr = table.shape[0]
     RP: gl.constexpr = table.shape[1]
     gl.static_assert(RP == M_DUP, "past 8 rows the table has 16 row columns")
-    # [slot, pick, row]: a slot a wave, a pick a lane, the rows in registers.
-    l3: gl.constexpr = gl.BlockedLayout([1, 1, RP], [1, 64, 1], [nw, 1, 1], [2, 1, 0])
-    pl: gl.constexpr = gl.SliceLayout(0, gl.SliceLayout(2, l3))
-    j = gl.arange(0, M_DUP, gl.SliceLayout(1, gl.SliceLayout(2, l3)))[:, None, None]
-    want = lane + j * LANES
-    hit = (gl.convert_layout(owner, pl)[None, :, None] > 0) & (
-        gl.convert_layout(slot, pl)[None, :, None] == want
+    # The [slot, pick] layout below: two slots a wave, the picks over the 64
+    # lanes.
+    gl.static_assert(M_DUP == 2 * nw, "two slots a wave")
+    gl.static_assert(NP % 64 == 0, "the picks fill whole lanes")
+    # Each slot has exactly one owner pick, however many rows share its
+    # expert: a row picks an expert at most once, and the owner is its pick
+    # in the first row that chose it (later rows' picks of it are "seen",
+    # see _slots_asm); slots number the owners. So find the owner with one
+    # reduction over the picks a slot ([slot, pick]: a slot a wave, two
+    # picks a lane) and gather its table row (every row's pick of the
+    # expert) from LDS: the same values as a max over the slot's owner
+    # picks. Reducing the whole [slot, pick, row] table instead took a DPP
+    # max step per row column on every CTA.
+    l2: gl.constexpr = gl.BlockedLayout([2, NP // 64], [1, 64], [nw, 1], [1, 0])
+    j = gl.arange(0, M_DUP, gl.SliceLayout(1, l2))[:, None]
+    p = gl.arange(0, NP, gl.SliceLayout(0, l2))[None, :]
+    pl: gl.constexpr = gl.SliceLayout(0, l2)
+    hit = (gl.convert_layout(owner, pl)[None, :] > 0) & (
+        gl.convert_layout(slot, pl)[None, :] == lane + j * LANES
     )
-    t3 = gl.convert_layout(table, gl.SliceLayout(0, l3))[None, :, :]
-    picks = gl.max(gl.where(hit, t3, -1), axis=1)  # [16, RP]
-    i3 = gl.convert_layout(ids, pl)[None, :, None]
-    experts, _ = gl.broadcast(gl.max(gl.where(hit, i3, -1), axis=1), picks)
+    owner_pick = gl.max(gl.where(hit, p, -1), axis=1)  # [16]
+    expert = gl.max(gl.where(hit, gl.convert_layout(ids, pl)[None, :], -1), axis=1)
     plain: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+    table_smem = gl.allocate_shared_memory(gl.int32, [NP, RP], plain)
+    table_smem.store(table)
+    gl.barrier()
+    rl: gl.constexpr = gl.BlockedLayout([1, 1], [4, 16], [nw, 1], [1, 0])
+    # A slot without an owner (past the lane's last slot) gathers pick 0's
+    # row; ``has`` masks it to -1 below.
+    at = gl.convert_layout(gl.maximum(owner_pick, 0), gl.SliceLayout(1, rl))[:, None]
+    at = at + gl.zeros([M_DUP, RP], gl.int32, rl)
+    got = table_smem.gather(at, 0)  # [16, RP]: row k is slot lane + 8 k's
+    has = gl.convert_layout(owner_pick, gl.SliceLayout(1, rl))[:, None] >= 0
+    picks = gl.where(has, got, -1)
+    experts = gl.convert_layout(expert, gl.SliceLayout(1, rl))[:, None] + gl.zeros(
+        [M_DUP, RP], gl.int32, rl
+    )
     picks_smem = gl.allocate_shared_memory(gl.int32, [M_DUP, M_DUP], plain)
     experts_smem = gl.allocate_shared_memory(gl.int32, [M_DUP, M_DUP], plain)
     picks_smem.store(picks)
@@ -1139,16 +1196,8 @@ def _ex1_slot_picked(mb, task, a, tiles, picks_row):
     ks = task % KSPLIT
     p_smem, s_smem = a
     acc = _mma_rows(p_smem, s_smem, tiles)
-    m = gl.arange(0, M_DUP, gl.SliceLayout(1, acc.type.layout))
-    k = picks_row.load(gl.SliceLayout(1, acc.type.layout))
-    n = gl.arange(0, BLOCK_N, gl.SliceLayout(0, acc.type.layout))[None, :]
-    at = ((k[:, None] * NB1 + blk) * KSPLIT + ks) * BLOCK_N + n
-    mb.put(
-        "p1",
-        mb.row_offset(m[:, None]) + at,
-        acc.to(gl.int32, bitcast=True),
-        mask=(k[:, None] >= 0) & (n >= 0),
-    )
+    k = picks_row.load(gl.SliceLayout(1, _p1_layout(gl.num_warps())))
+    _put_p1(mb, acc, k, blk, ks)
 
 
 @gluon.jit
@@ -1173,8 +1222,8 @@ def ex1_finish(
     (``tiles``, of the lane's first slot, ``expert``) and :func:`slots`
     (``union``): multiply and publish the FP32 partial sums, then the same
     for the lane's other slots. ``table``: past 8 rows, the CTA's
-    :func:`lane_slots`; ``pre``: past 8 rows, the second slot's B tiles in LDS
-    (:func:`ex1_prefetch`)."""
+    :func:`lane_slots`; ``pre``: past one row, the second slot's B tiles in
+    LDS (:func:`ex1_prefetch`)."""
     lane = task // (NB1 * KSPLIT)
     count = union[3]
     R: gl.constexpr = schedule.rows(mb.plan)
@@ -1230,11 +1279,62 @@ def ex1_finish(
                 stride_snb,
             )
             _ex1_slot_picked(mb, task, a, tiles, picks_smem.index(k))
+    elif R > 1:
+        # Slot 1's B tiles landed in LDS during the A poll (ex1_prefetch), so
+        # the wait is free; its scales load here, and slot 2's tiles go out
+        # into registers before slot 0's product. Every CTA's waves see the
+        # copies after the barrier.
+        cdna4_async_copy.wait_group(0)
+        gl.barrier()
+        blk = (task // KSPLIT) % NB1
+        ks = task % KSPLIT
+        following = _slot_expert(union, lane + 2 * LANES)
+        more = ex1_issue(
+            task,
+            True,
+            following,
+            w13,
+            w13s,
+            stride_we,
+            stride_se,
+            stride_slin,
+            stride_snb,
+        )
+        _ex1_slot(mb, task, a, tiles, union, expert)
+        if lane + LANES < count:
+            # Slot 1's scales load after slot 0's product: not live across it.
+            expert1 = _slot_expert(union, lane + LANES)
+            second = _load_scales(
+                w13s,
+                expert1,
+                stride_se,
+                stride_slin,
+                stride_snb,
+                blk * BLOCK_N,
+                ks * (K_SLICE // 128),
+                K_SLICE // 128,
+            )
+            _ex1_slot(mb, task, a, _lds_b_tiles(pre, second), union, expert1)
+        for i in range(lane + 2 * LANES, count, LANES):
+            expert = following
+            tiles = more
+            following = _slot_expert(union, i + LANES)
+            more = ex1_issue(
+                task,
+                True,
+                following,
+                w13,
+                w13s,
+                stride_we,
+                stride_se,
+                stride_slin,
+                stride_snb,
+            )
+            _ex1_slot(mb, task, a, tiles, union, expert)
     else:
         # Each slot's loads go out before the previous slot's product. With
         # one row the loop never runs; it stays there too, since the backend
-        # schedules the slot's code around it better than without it. Past
-        # one row it fits the registers since the slots' ids sit a lane each.
+        # schedules the slot's code around it better than without it.
         following = _slot_expert(union, lane + LANES)
         more = ex1_issue(
             task,
@@ -1509,12 +1609,16 @@ def _ex2_gather_lane(
         else:
             valid = lane + ks * LANES < count
         picks_smem.slice(0, RP, dim=1).store(gl.where(valid, picks, -1))
-        if RP < M_DUP:
-            # MFMA rows past the launch's rows: no pick.
-            fill: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [nw, 1], [1, 0])
-            picks_smem.slice(RP, M_DUP - RP, dim=1).store(
-                gl.full([S, M_DUP - RP], -1, gl.int32, fill)
-            )
+        # MFMA rows past the launch's rows: no pick. A block's width must be a
+        # power of two, so the columns go in blocks [RP, 2 RP), [2 RP, 4 RP),
+        # ... up to M_DUP (one block at 8 rows, none at 16).
+        fill: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [nw, 1], [1, 0])
+        for k in gl.static_range(4):  # at most log2(M_DUP) blocks
+            # RP << k inline: a constexpr name cannot be reassigned per pass.
+            if (RP << k) < M_DUP:
+                picks_smem.slice(RP << k, RP << k, dim=1).store(
+                    gl.full([S, RP << k], -1, gl.int32, fill)
+                )
     r = gl.arange(0, RP, gl.SliceLayout(0, tl))[None, :]
     routed = picks >= 0
     first = gl.min(gl.where(routed, r, RP), axis=1)[:, None]
@@ -1578,14 +1682,31 @@ def _ex2_compute_picked(mb, task, loads, a, picks_smem, RANK: gl.constexpr):
     acc = _mma_rows(p_smem, s_smem, loads)
     out = gl.reshape(acc.to(gl.bfloat16), [M_DUP, BLOCK_N // 2, 2])
     word = mx.pack_bf16_pairs(out)
-    wl: gl.constexpr = word.type.layout
-    mm = gl.arange(0, M_DUP, gl.SliceLayout(1, wl))[:, None]
-    p = gl.arange(0, BLOCK_N // 2, gl.SliceLayout(0, wl))[None, :]
     rl: gl.constexpr = gl.BlockedLayout([1, 1], [1, 64], [gl.num_warps(), 1], [1, 0])
-    pick_of = gl.convert_layout(
-        gl.reshape(picks_smem.load(rl), [M_DUP]), gl.SliceLayout(1, wl)
-    )[:, None]
     col = (blk * BLOCK_N) % OWNED_OUT
+    R: gl.constexpr = schedule.rows(mb.plan)
+    if R >= 8:
+        # In the accumulator's layout adjacent lanes hold pairs 16 bytes
+        # apart, so each 8-byte remote store fills half of every segment it
+        # touches. Here lane i holds pair i of a row: one store writes a
+        # row's 64 pairs as 512 contiguous bytes. The same values go to the
+        # same addresses. Below 8 rows the put keeps the accumulator's layout.
+        cl: gl.constexpr = gl.BlockedLayout(
+            [1, 1], [1, 64], [gl.num_warps(), 1], [1, 0]
+        )
+        word = gl.convert_layout(word, cl)
+        mm = gl.arange(0, M_DUP, gl.SliceLayout(1, cl))[:, None]
+        p = gl.arange(0, BLOCK_N // 2, gl.SliceLayout(0, cl))[None, :]
+        pick_of = gl.convert_layout(
+            gl.reshape(picks_smem.load(rl), [M_DUP]), gl.SliceLayout(1, cl)
+        )[:, None]
+    else:
+        wl: gl.constexpr = word.type.layout
+        mm = gl.arange(0, M_DUP, gl.SliceLayout(1, wl))[:, None]
+        p = gl.arange(0, BLOCK_N // 2, gl.SliceLayout(0, wl))[None, :]
+        pick_of = gl.convert_layout(
+            gl.reshape(picks_smem.load(rl), [M_DUP]), gl.SliceLayout(1, wl)
+        )[:, None]
     at = ((RANK * TOP_K + pick_of) * OWNED_OUT + col) // 2 + p
     mb.put_peer(
         "rr",

@@ -57,27 +57,20 @@ def qkvg_kernel(scratch, step, w, a, a_stride, PLAN: gl.constexpr):
         qkvg.gate_stage(mb, task, w, a, a_stride, "gate")
 
 
-def _plan(rows: int) -> Plan:
+def _plan(rows: int, gate_halves: int) -> Plan:
     return Plan(
         grid=256,
         # The launch projects its own q | k | v (no previous launch's qnext).
-        stages=qkvg.stages({"qkvg": 0, "gate": 0}, True),
+        stages=qkvg.stages({"qkvg": 0, "gate": 0}, True, gate_halves),
         regions=qkvg.REGIONS,
         rows=rows,
         chain=1,
     )
 
 
-@pytest.mark.parametrize("rows", [1, 2, 4])
-def test_qkvg_halves_sum_to_the_bf16_rounded_fp32_projection(rows):
-    g = torch.Generator().manual_seed(rows)
-    w = (torch.randn(QKVG, HIDDEN, generator=g) / HIDDEN**0.5).to(torch.bfloat16)
-    # A row stride wider than the row checks the row addressing.
-    a_full = torch.randn(rows, HIDDEN + 64, generator=g).to(torch.bfloat16)
-    a = a_full[:, :HIDDEN]
-    plan = _plan(rows)
+def _run(w, a_full, rows: int, gate_halves: int, step: int):
+    plan = _plan(rows, gate_halves)
     scratch = torch.zeros(plan.scratch_pairs, dtype=torch.int64, device="cuda")
-    step = 3
     qkvg_kernel[(plan.grid,)](
         scratch,
         torch.full((1,), step, dtype=torch.int32, device="cuda"),
@@ -88,8 +81,36 @@ def test_qkvg_halves_sum_to_the_bf16_rounded_fp32_projection(rows):
         num_warps=8,
     )
     torch.cuda.synchronize()
+    return plan, scratch
+
+
+def _inputs(rows: int):
+    g = torch.Generator().manual_seed(rows)
+    w = (torch.randn(QKVG, HIDDEN, generator=g) / HIDDEN**0.5).to(torch.bfloat16)
+    # A row stride wider than the row checks the row addressing.
+    a_full = torch.randn(rows, HIDDEN + 64, generator=g).to(torch.bfloat16)
+    return w, a_full
+
+
+# 3 rows: the GEMV pads to 4 rows (the padding row repeats the last one).
+# gate_halves 2: two 8-row gate tasks a block.
+@pytest.mark.parametrize("gate_halves", [1, 2])
+@pytest.mark.parametrize("rows", [1, 2, 3, 4, 8, 16])
+def test_qkvg_halves_sum_to_the_bf16_rounded_fp32_projection(rows, gate_halves):
+    w, a_full = _inputs(rows)
+    a = a_full[:, :HIDDEN]
+    step = 3
+    plan, scratch = _run(w, a_full, rows, gate_halves, step)
     want, bound = ref.bf16_gemm(a, w)
     tag = launch_tag(step, 0)
+    # Every pair the tasks put, in each row's copy of both regions; payloads
+    # checks the values' tags. No other pair may be written.
+    written = torch.zeros(plan.scratch_pairs, dtype=torch.bool)
+    for r in range(rows):
+        for region, n in (("qkvg", GATE_ROW), ("gate", QKVG - GATE_ROW)):
+            start = plan.offset(region) + r * plan.row_pairs
+            written[start : start + 2 * n] = True
+    assert not torch.any(scratch.cpu()[~written])
     for r in range(rows):
         halves = []
         for region, n in (("qkvg", GATE_ROW), ("gate", QKVG - GATE_ROW)):
@@ -101,3 +122,18 @@ def test_qkvg_halves_sum_to_the_bf16_rounded_fp32_projection(rows):
         # BF16 rounding.
         err = (got.double() - want[r]).abs()
         assert torch.all(err <= bound[r]), float((err / bound[r]).max())
+
+
+# The 8-row gate tasks put exactly the 16-row tasks' words: each row's sum
+# keeps its K half, tiles and reduction order.
+@pytest.mark.parametrize("rows", [1, 8])
+def test_split_gate_puts_the_whole_block_words(rows):
+    w, a_full = _inputs(rows)
+    step = 5
+    whole_plan, whole = _run(w, a_full, rows, 1, step)
+    split_plan, split = _run(w, a_full, rows, 2, step)
+    n = 2 * (QKVG - GATE_ROW)
+    for r in range(rows):
+        a = whole.cpu()[whole_plan.offset("gate") + r * whole_plan.row_pairs :][:n]
+        b = split.cpu()[split_plan.offset("gate") + r * split_plan.row_pairs :][:n]
+        assert torch.equal(a, b)

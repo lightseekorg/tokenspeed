@@ -274,6 +274,9 @@ def worker(rank: int, port: int, args) -> None:
     )
     proj = torch.zeros(2, R, int(PROJ_WORDS), dtype=torch.int32, device=dev)
     scratch = ctx.zeros((plan.scratch_pairs,), dtype=torch.int64)
+    # With --tap every launch also stores a draft's tap, as a served tapped
+    # layer does: the residual into slot 0 of 5.
+    tap = ctx.zeros((R, 5, HIDDEN), dtype=torch.bfloat16) if args.tap else None
     ghost = torch.zeros_like(scratch)
     bases = torch.empty(TP, dtype=torch.int64, device=dev)
     bases[:gpus] = group.bases.to(dev)
@@ -350,8 +353,8 @@ def worker(rank: int, port: int, args) -> None:
             attn_ops=attn_ops,
             table_stride=table_stride,
             moe_ops=moe_ops,
-            tap=None,
-            tap_slot=None,
+            tap=tap,
+            tap_slot=0 if args.tap else None,
             warm_next=None,
             proj_in=proj[lay & 1] if args.shift else None,
             proj_out=proj[(lay + 1) & 1] if args.shift else None,
@@ -486,6 +489,11 @@ def worker(rank: int, port: int, args) -> None:
         step.fill_(500)
         launch(1)
         torch.cuda.synchronize()
+        # Every rank's tap: the draft's next-step input on each rank.
+        taps = None
+        if tap is not None:
+            taps = [torch.empty_like(tap.cpu()) for _ in range(gpus)]
+            dist.all_gather(taps, tap.cpu())
         if rank == 0:
             o = plan.offset("route")
             route = (scratch[o : o + 16] & 0xFFFFFFFF).to(torch.int32).cpu()
@@ -502,6 +510,7 @@ def worker(rank: int, port: int, args) -> None:
                     "ids": route[:8].clone(),
                     "weights": route[8:].view(torch.float32).clone(),
                     "regions": {r: v.cpu() for r, v in regions.items()},
+                    "tap": None if taps is None else torch.stack(taps),
                 },
                 args.out_save,
             )
@@ -529,6 +538,14 @@ def compare(a_path: str, b_path: str) -> bool:
     change that adds or drops one) is printed, not compared."""
     a, b = torch.load(a_path), torch.load(b_path)
     same = all(torch.equal(a[k], b[k]) for k in ("h_next", "a_out", "ids", "weights"))
+    if (a.get("tap") is None) != (b.get("tap") is None):
+        print("tap only in one file")
+    elif a.get("tap") is not None:
+        same = same and torch.equal(a["tap"], b["tap"])
+        for name, t in (("first", a["tap"]), ("second", b["tap"])):
+            if not all(torch.equal(t[0], r) for r in t[1:]):
+                print(f"tap differs between ranks in the {name} file")
+                same = False
     ra, rb = a["regions"], b["regions"]
     for name in sorted(set(ra) ^ set(rb)):
         print(f"region {name} only in {'the first' if name in ra else 'the second'}")
@@ -610,13 +627,21 @@ def main() -> None:
         default=16,
         help="passes that make the absent ranks' copies consistent",
     )
+    p.add_argument(
+        "--tap",
+        action="store_true",
+        help="every launch also stores a draft's tap (as a served tapped layer)",
+    )
     p.add_argument("--trace-out", help="save each rank's trace to PREFIX.<rank>")
     p.add_argument(
         "--stuck-dir",
         help="keep each rank's stuck-poll records in DIR/rank<r>.rec (read them "
         "with muse_spark.stuck_report after a trap)",
     )
-    p.add_argument("--out-save", help="save rank 0's outputs of a fixed launch")
+    p.add_argument(
+        "--out-save",
+        help="save rank 0's outputs (and every rank's tap) of a fixed launch",
+    )
     p.add_argument(
         "--view", nargs="+", metavar="TRACE", help="print saved traces and exit"
     )

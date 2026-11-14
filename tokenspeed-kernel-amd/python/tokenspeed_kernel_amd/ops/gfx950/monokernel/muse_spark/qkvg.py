@@ -27,7 +27,9 @@ as fast as the memory can, so the q | k | v blocks spread over 160 CTAs.
 * qkvg, 160 tasks: the q | k | v blocks (rows 0 .. 1279).
 * gate, 128 tasks: the output-gate blocks (rows 1280 .. 2303), on CTAs
   that run a qkvg task first. Attention does not wait for the gate, so its
-  weights load after the q | k | v weights.
+  weights load after the q | k | v weights. When a full layer's attention
+  has a task on every CTA (one request), each block splits into two 8-row
+  tasks over all CTAs instead: 256 tasks (``gate_halves`` 2).
 * qnext, 160 tasks (a launch whose next layer is fused too, see
   ``layer.layer_plan``): the next layer's qkvg tasks at the end of this
   launch. Their input is this launch's output rows, which the out tasks
@@ -69,14 +71,18 @@ REGIONS = (
 PROJ_WORDS = gl.constexpr(int(KSPLIT) * int(GATE_ROW))
 
 
-def stages(bases: dict[str, int], own: bool) -> tuple[Stage, ...]:
+def stages(bases: dict[str, int], own: bool, gate_halves: int) -> tuple[Stage, ...]:
     """QKVG (when the launch computes its own projection: ``own``) and gate,
-    placed by ``bases``."""
+    placed by ``bases``. ``gate_halves``: 1, a gate task a 16-row block and
+    K half; 2, two tasks of 8 rows each (half the bytes a task, twice the
+    tasks: :func:`gate_stage`)."""
+    if gate_halves not in (1, 2):
+        raise ValueError(f"gate_halves is 1 or 2, got {gate_halves}")
     qkv, gate = placement(bases, ("qkvg", "gate"))
     return (
         (Stage("qkvg", int(KSPLIT * QKV_BLOCKS), qkv, writes=("qkvg",)),) if own else ()
     ) + (
-        Stage("gate", int(KSPLIT * GATE_BLOCKS), gate, writes=("gate",)),
+        Stage("gate", int(KSPLIT * GATE_BLOCKS) * gate_halves, gate, writes=("gate",)),
     )
 
 
@@ -112,14 +118,66 @@ def _block_stage(mb, task, w, a, a_stride, FIRST: gl.constexpr, N: gl.constexpr)
     return out, half * N + blk * 16
 
 
+@gluon.constexpr_function
+def gate_halves(plan):
+    """Gate tasks a 16-row block in ``plan``: 1, or 2 (two 8-row tasks,
+    :func:`stages` ``gate_halves``)."""
+    return schedule.stage_tasks(plan, "gate") // (int(KSPLIT) * int(GATE_BLOCKS))
+
+
 @gluon.jit
-def _put_rows(mb, region: gl.constexpr, out, at):
+def _half_block_stage(mb, task, w, a, a_stride, FIRST: gl.constexpr, N: gl.constexpr):
+    """:func:`_block_stage` of half a block: task ``task`` takes rows ``8
+    (task % 2) ..`` of block ``FIRST + task // 2 // KSPLIT``, K half
+    ``task // 2 % KSPLIT``. Every row's sum is the whole-block task's
+    (same K half, tiles and reduction order)."""
     R: gl.constexpr = schedule.rows(mb.plan)
-    rows = gl.arange(0, out.shape[0], gl.SliceLayout(1, out.type.layout))[:, None]
-    for r in gl.static_range(R):
-        v = gl.sum(gl.where(rows == r, out, 0.0), axis=0)
-        i = at + gl.arange(0, 16, v.type.layout)
-        mb.row(r).put(region, i, v.to(gl.int32, bitcast=True))
+    sub = task % 2
+    blk = task // 2 // KSPLIT
+    half = task // 2 % KSPLIT
+    KITS: gl.constexpr = HIDDEN // 32 // KSPLIT
+    tiles = bf16.load_weight_half_tiles(
+        w,
+        nb=FIRST + blk,
+        K=HIDDEN,
+        kit0=half * KITS,
+        KITS=KITS,
+        SPLIT=gl.num_warps(),
+        row_half=sub,
+    )
+    x_smem = bf16.load_global_rows(
+        a, a_stride, half * (HIDDEN // KSPLIT), HIDDEN // KSPLIT, R
+    )
+    out = bf16.gemv(x_smem, tiles, FIRST=0, ROWS=R)  # FP32 [RP, 16]
+    return out, half * N + blk * 16, sub
+
+
+@gluon.jit
+def _put_rows(mb, region: gl.constexpr, out, at, row_half):
+    """Put the 16 partial sums of every row of ``out`` (FP32 ``[RP, 16]``)
+    at ``at`` of each row's copy of ``region``, in one put. The put goes out
+    from a blocked layout that holds each value in few lanes: the GEMV
+    result layout repeats each value across many lanes, and every copy
+    would be a store."""
+    R: gl.constexpr = schedule.rows(mb.plan)
+    RP: gl.constexpr = out.shape[0]
+    nw: gl.constexpr = gl.num_warps()
+    cl: gl.constexpr = gl.BlockedLayout([1, 1], [4, 16], [nw, 1], [1, 0])
+    # + 0.0 maps -0.0 to +0.0, as summing a row out of zeros did.
+    v = gl.convert_layout(out + 0.0, cl)
+    r = gl.arange(0, RP, gl.SliceLayout(1, cl))[:, None]
+    i = gl.arange(0, 16, gl.SliceLayout(0, cl))[None, :]
+    # The padding rows repeat the last row; the mask skips their stores.
+    # (i >= 0) is always true: it broadcasts the row mask to the tile's shape.
+    # ``row_half``: None puts all 16 sums of a whole-block task; 0 or 1 (a
+    # half-block task's rows) keeps those 8 sums.
+    keep = (i >= 0) if row_half is None else ((i // 8) == row_half)
+    mb.put(
+        region,
+        mb.row_offset(r) + at + i,
+        v.to(gl.int32, bitcast=True),
+        mask=(r < R) & keep,
+    )
 
 
 @gluon.jit
@@ -135,18 +193,27 @@ def qkvg_stage(mb, task, w, a, a_stride, STAGE: gl.constexpr):
     mb.stamp(STAGE, trace.START)
     out, at = _block_stage(mb, task, w, a, a_stride, 0, GATE_ROW)
     mb.stamp(STAGE, trace.COMPUTED)
-    _put_rows(mb, "qkvg", out, at)
+    _put_rows(mb, "qkvg", out, at, None)
     mb.stamp(STAGE, trace.END)
 
 
 @gluon.jit
 def gate_stage(mb, task, w, a, a_stride, STAGE: gl.constexpr):
     """Gate task ``task``: half ``task % 2`` of K of gate rows ``16 (task //
-    2) ..`` (rows ``1280 + 16 (task // 2) ..`` of ``w``), as :func:`qkvg_stage`."""
+    2) ..`` (rows ``1280 + 16 (task // 2) ..`` of ``w``), as :func:`qkvg_stage`.
+    With two tasks a block (:func:`stages` ``gate_halves`` 2), task ``task``
+    takes 8 of those rows: :func:`_half_block_stage`."""
     mb.stamp(STAGE, trace.START)
-    out, at = _block_stage(mb, task, w, a, a_stride, QKV_BLOCKS, QKVG - GATE_ROW)
-    mb.stamp(STAGE, trace.COMPUTED)
-    _put_rows(mb, "gate", out, at)
+    if gate_halves(mb.plan) == 2:
+        out, at, sub = _half_block_stage(
+            mb, task, w, a, a_stride, QKV_BLOCKS, QKVG - GATE_ROW
+        )
+        mb.stamp(STAGE, trace.COMPUTED)
+        _put_rows(mb, "gate", out, at, sub)
+    else:
+        out, at = _block_stage(mb, task, w, a, a_stride, QKV_BLOCKS, QKVG - GATE_ROW)
+        mb.stamp(STAGE, trace.COMPUTED)
+        _put_rows(mb, "gate", out, at, None)
     mb.stamp(STAGE, trace.END)
 
 

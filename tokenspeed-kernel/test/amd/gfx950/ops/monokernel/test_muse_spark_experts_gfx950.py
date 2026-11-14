@@ -109,7 +109,7 @@ def experts_kernel(
     )
     union = moe_experts.union_of(ids)
     table = moe_experts.cta_slots(PLAN, union)
-    pre1 = moe_experts.ex1_prefetch(PLAN, task1, active1, table, w13, s13_we)
+    pre1 = moe_experts.ex1_prefetch(PLAN, task1, active1, table, union, w13, s13_we)
     a1 = moe_experts.ex1_xq(mb, task1, active1, "ex1")
     if active1:
         moe_experts.ex1_finish(
@@ -343,6 +343,13 @@ def _worker(
     "rows, exr, exr_parts, distinct",
     [
         (1, 192, 1, None),
+        # 2 to 7 rows (2 to 4 pad the 16 MFMA rows in several blocks): 8
+        # distinct experts leave every lane without a second slot (its
+        # prefetch masked off), 12 mix lanes with and without one.
+        (2, 0, 4, 8),
+        (2, 0, 4, 12),
+        (3, 0, 4, None),
+        (6, 0, 4, None),
         (8, 0, 4, None),
         (8, 128, 2, None),
         (8, 0, 4, 64),

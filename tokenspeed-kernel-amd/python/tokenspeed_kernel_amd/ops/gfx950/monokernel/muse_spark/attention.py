@@ -365,17 +365,41 @@ def _group_layouts(nw):
 
 
 @gluon.jit
-def _group_softmax_step(
-    q, keys, values, valid, m, l, acc, p_layout: gl.constexpr, MASK: gl.constexpr
-):
-    """:func:`softmax_step` of every key group's own keys: ``q [G, QM, 64]``,
-    ``keys [G, 64, KW]``, ``values [G, KW, 64]``, ``valid [G, QM, KW]`` (used
-    only when ``MASK``)."""
-    pv3: gl.constexpr = acc.type.layout
-    scores = gl.zeros(
-        [q.shape[0], q.shape[1], keys.shape[2]], gl.float32, valid.type.layout
+def _key_quarters(x):
+    """``x [G, QM, 64]`` as its four ``[G, QM, 16]`` key quarters, in key
+    order. A quarter is one K step of the PV MFMA; the 4 quarters sit in
+    each thread's registers, so this only renames registers."""
+    G: gl.constexpr = x.shape[0]
+    QM: gl.constexpr = x.shape[1]
+    y = gl.reshape(
+        gl.permute(gl.reshape(x, [G, QM, 4, 16]), [0, 1, 3, 2]), [G, QM, 16, 2, 2]
     )
-    scores = gl.amd.cdna4.mfma(q, keys, scores)
+    even, odd = gl.split(y)  # quarter % 2
+    q0, q2 = gl.split(even)  # quarter // 2
+    q1, q3 = gl.split(odd)
+    return q0, q1, q2, q3
+
+
+@gluon.jit
+def _group_qk(q_w, k_slot, qk3: gl.constexpr, k3: gl.constexpr, FP8QK: gl.constexpr):
+    """The QK products ``[G, QM, KW]`` of every key group's own keys: ``q_w``
+    times the chunk's keys in LDS ``k_slot [BN, 64]``."""
+    G: gl.constexpr = q_w.shape[0]
+    QM: gl.constexpr = q_w.shape[1]
+    KW: gl.constexpr = BN // G
+    keys = k_slot.reshape([G, KW, HEAD]).permute([0, 2, 1]).load(k3)
+    if not FP8QK:
+        keys = keys.to(gl.bfloat16)  # a BF16 cache's keys as they are
+    scores = gl.zeros([G, QM, KW], gl.float32, qk3)
+    return gl.amd.cdna4.mfma(q_w, keys, scores)
+
+
+@gluon.jit
+def _group_softmax(scores, valid, m, l, MASK: gl.constexpr):
+    """The online softmax of every key group's own keys from their QK
+    products ``scores [G, QM, KW]`` (``valid [G, QM, KW]`` used only when
+    ``MASK``): the new running max and sum, the probabilities ``p`` and the
+    running output's scale ``alpha``. :func:`_group_pv` finishes the step."""
     if MASK:
         scores = gl.where(valid, scores * QK_SCALE, float("-inf"))
     else:
@@ -385,10 +409,26 @@ def _group_softmax_step(
     alpha = gl.exp2(m - m_safe)
     p = gl.exp2(scores - m_safe[:, :, None])
     l = l * alpha + gl.sum(p, axis=2)
+    return m_new, l, p, alpha
+
+
+@gluon.jit
+def _group_pv(p, alpha, v_slot, acc, p_layout: gl.constexpr):
+    """``acc alpha + p V`` for the values in LDS ``v_slot [G, KW, 64]`` (the
+    cache's dtype).
+
+    The values load a K step (16 keys) at a time, each right before its
+    MFMA, instead of the whole chunk at once: a quarter of the registers
+    hold them. The 4 MFMAs accumulate in key order, as one K = 64 MFMA
+    does."""
+    pv3: gl.constexpr = acc.type.layout
+    v3: gl.constexpr = gl.DotOperandLayout(1, pv3, 4)
     pv = gl.zeros(acc.shape, gl.float32, pv3)
-    pv = gl.amd.cdna4.mfma(gl.convert_layout(p.to(gl.bfloat16), p_layout), values, pv)
-    acc = acc * gl.convert_layout(alpha, gl.SliceLayout(2, pv3))[:, :, None] + pv
-    return m_new, l, acc
+    quarters = _key_quarters(p.to(gl.bfloat16))
+    for t in gl.static_range(4):
+        values = v_slot.slice(16 * t, 16, dim=1).load(v3).to(gl.bfloat16)
+        pv = gl.amd.cdna4.mfma(gl.convert_layout(quarters[t], p_layout), values, pv)
+    return acc * gl.convert_layout(alpha, gl.SliceLayout(2, pv3))[:, :, None] + pv
 
 
 @gluon.constexpr_function
@@ -488,7 +528,6 @@ def _group_keys(
     q3l: gl.constexpr = gl.DotOperandLayout(0, qk3, QKW)
     k3: gl.constexpr = gl.DotOperandLayout(1, qk3, QKW)
     p3: gl.constexpr = gl.DotOperandLayout(0, pv3, 4)
-    v3: gl.constexpr = gl.DotOperandLayout(1, pv3, 4)
     # Every group's copy of q: one conversion, then a broadcast in registers.
     if FP8QK:
         # q rounded once from FP32 to the cache's FP8 (as the regular path's
@@ -505,11 +544,20 @@ def _group_keys(
     m_w = gl.full([G, QM], float("-inf"), gl.float32, gl.SliceLayout(2, qk3))
     l_w = gl.zeros([G, QM], gl.float32, gl.SliceLayout(2, qk3))
     acc_w = gl.zeros([G, QM, HEAD], gl.float32, pv3)
+    # Chunk 0's QK before the loop (chunks 0 and 1 are in flight). Iteration
+    # i then runs chunk i's softmax, chunk i + 1's QK and chunk i's PV, so
+    # chunk i + 1's QK MFMAs overlap chunk i's softmax-to-PV chain. Every
+    # running state (max, sum, output) still takes the chunks in order.
+    cdna4_async_copy.wait_group(1)
+    gl.barrier()
+    scores = _group_qk(q_w, k_ring.index(0), qk3, k3, FP8QK)
     i = 0
     for c0 in range(lo, hi, BN):
         valid = c0 + ww * KW + jw < hi  # [G, 1, KW]: every row attends every key
         # As attn_stage's loop: every wave is done with the slot the next
-        # copy refills, then chunk i + 3's pages and chunk i + 2's copies.
+        # copy refills (chunk i - 1's: its keys were read for the QK in
+        # iteration i - 2, its values by the PV in iteration i - 1), then
+        # chunk i + 3's pages and chunk i + 2's copies.
         gl.barrier()
         if PAGES:
             na = _page_of(table, c0 + 3 * BN, hi)
@@ -545,22 +593,21 @@ def _group_keys(
                 cl,
             )
             pages = pages3
-        cdna4_async_copy.wait_group(2)
-        gl.barrier()
-        keys = k_ring.index(i % NBUF).reshape([G, KW, HEAD]).permute([0, 2, 1]).load(k3)
-        values = v_ring.index(i % NBUF).reshape([G, KW, HEAD]).load(v3)
-        if not FP8QK:
-            keys = keys.to(gl.bfloat16)  # a BF16 cache's keys as they are
-        values = values.to(gl.bfloat16)
         # Only the split's last chunk has keys past its end.
         if c0 + BN > hi:
-            m_w, l_w, acc_w = _group_softmax_step(
-                q_w, keys, values, valid, m_w, l_w, acc_w, p3, True
-            )
+            m_w, l_w, p, alpha = _group_softmax(scores, valid, m_w, l_w, True)
         else:
-            m_w, l_w, acc_w = _group_softmax_step(
-                q_w, keys, values, valid, m_w, l_w, acc_w, p3, False
-            )
+            m_w, l_w, p, alpha = _group_softmax(scores, valid, m_w, l_w, False)
+        if c0 + BN < hi:
+            # Chunk i + 1 has landed once only chunk i + 2's copies are
+            # outstanding; every wave sees every wave's copies after the
+            # barrier. (lo and hi are uniform: all waves take this branch.)
+            cdna4_async_copy.wait_group(1)
+            gl.barrier()
+            scores = _group_qk(q_w, k_ring.index((i + 1) % NBUF), qk3, k3, FP8QK)
+        acc_w = _group_pv(
+            p, alpha, v_ring.index(i % NBUF).reshape([G, KW, HEAD]), acc_w, p3
+        )
         i += 1
     cdna4_async_copy.wait_group(0)
     # The groups' states into one: their LSE merge, once.

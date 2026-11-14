@@ -129,16 +129,20 @@ CHAINED_BASES = {
     "pool": 224,
     "merge": 128,
     "exr": 0,
-    # 8 or 16 rows: 128 unpool tasks (moe_tail.unpool_halves); the first
-    # half on comb's CTAs, after their comb task.
+    # Up to 8 rows the comb tasks (8 a row, at most 64) take CTAs 0 .. 63;
+    # past 8 rows WIDE moves them to 192. At 8 or 16 rows the 128 unpool
+    # tasks (moe_tail.unpool_halves) take CTAs 64 .. 191, after ex2 tasks
+    # only: behind a comb task an unpool poll also waited for comb's cmb
+    # puts to the 8 ranks to be acknowledged (vmcnt counts stores in order).
+    "comb": 0,
     "unpool": 64,
 }
 
 # A launch that ends with the next layer's qkvg tasks (qnext, 160 tasks of
 # 128 KiB of weights): they take CTAs 192 .. 255 and 0 .. 95, which end their
-# expert tasks first (ex2's last lanes) or run only comb before; the
-# out tasks (8 a row) move to 96 .. 159, after comb or unpool, so no qnext
-# weight stream waits behind an out task.
+# expert tasks first (ex2's last lanes) or run only comb before (CTAs 0 .. 63
+# at 8 rows); the out tasks (8 a row) move to 96 .. 159, after comb or unpool,
+# so no qnext weight stream waits behind an out task.
 # exr runs in 2 parts on CTAs 128 .. 255, not spread over every CTA: spread,
 # its tasks on qnext's CTAs hold their qnext weight streams back. In one part
 # on 64 CTAs, the ex2 tasks behind it end after the others: the tail follows
@@ -149,8 +153,13 @@ NEXT_BASES = {**CHAINED_BASES, "qnext": 192, "out": 96, "exr": 128}
 # a row), and the router's 128 tasks from CTA 160 would wait behind tail
 # tasks there or wrap to CTAs behind oproj. The router and topk
 # take CTAs 192 .. 255 and 0 .. 63, whose last earlier task is oproj or an
-# attention task.
-WIDE = {"router": 192, "topk": 192}
+# attention task. The pool's two row groups (64 tasks) take CTAs 208 .. 255
+# and 0 .. 15, after their router task and past topk's CTAs 192 .. 207. xq's
+# 32 tasks take CTAs 160 .. 191, idle from the attention tail's end: behind a
+# pool task, an xq poll would also wait for that task's cg puts to land.
+# The comb tasks (128) take CTAs 192 .. 255 and 0 .. 63, so that unpool's
+# CTAs 64 .. 191 follow ex2 tasks only (see CHAINED_BASES).
+WIDE = {"router": 192, "topk": 192, "pool": 208, "xq": 160, "comb": 192}
 # exr's base and parts in a launch of more than 8 rows that ends with qnext:
 # spread over every CTA. From CTA 128 in 2 parts (the 8-row qnext placement),
 # exr would share CTAs 128 .. 255 with ex2's lanes 4 .. 7, whose ex2 then
@@ -166,6 +175,38 @@ def _bases(rows: int, next_qkvg: bool, *names: str) -> dict[str, int]:
         if next_qkvg:
             table = {**table, "exr": WIDE_NEXT_EXR[0]}
     return {name: table[name] for name in names}
+
+
+@gluon.jit
+def _head(
+    mb,
+    task,
+    seq_len,
+    slot,
+    k_cache,
+    v_cache,
+    cos_sin,
+    proj_in,
+    ROPE: gl.constexpr,
+    OWN: gl.constexpr,
+):
+    """The head task ``task`` (:func:`attention.head_stage`). The kernel
+    calls it before or after gate (HEAD_FIRST): one call written once."""
+    attention.head_stage(
+        mb, task, seq_len, slot, k_cache, v_cache, cos_sin, proj_in, ROPE, OWN, "head"
+    )
+
+
+def _gate_halves(full: bool, rows: int, chain: int) -> int:
+    """Gate tasks a 16-row block (qkvg.stages). With one request a full
+    layer's attention has one task on every CTA (2 KV heads x FULL_SPLITS),
+    so gate's CTAs run their attention task only after their gate task:
+    two 8-row tasks a block on every CTA halve that wait. Otherwise gate
+    stays off the attention's CTAs, a task a block."""
+    one_task_a_cta = (
+        full and rows // chain * int(attention.KV_HEADS) * FULL_SPLITS == GRID
+    )
+    return 2 if one_task_a_cta else 1
 
 
 def _exr_parts(rows: int, next_qkvg: bool) -> int:
@@ -254,13 +295,15 @@ def layer_plan(
     nq = next_qkvg
     stages = (
         (Stage("code", CODE_TASKS, 0),)
-        + qkvg.stages(_bases(rows, nq, "qkvg", "gate"), own_qkvg)
+        + qkvg.stages(
+            _bases(rows, nq, "qkvg", "gate"), own_qkvg, _gate_halves(full, rows, chain)
+        )
         + attention.stages(
             _bases(rows, nq, "head", "attn", "merge"), splits, rows, chain, own_qkvg
         )
         + attn_tail.stages(_bases(rows, nq, "oproj", "tail"), rows)
         + moe_route.stages(_bases(rows, nq, "router", "topk"), rows)
-        + moe_pool.stages(_bases(rows, nq, "pool"))
+        + moe_pool.stages(_bases(rows, nq, "pool"), rows)
         + moe_experts.stages(
             _bases(rows, nq, "slt", "xq", "ex1", "exr", "ex2"),
             rows,
@@ -382,7 +425,8 @@ def gluon_muse_spark_layer_gfx950(
     ``alpha``, ``beta`` (all 8192 columns), next input gain (all 8192
     columns), residual output, next attention input).
     ``tap``, ``tap_col``, ``tap_row``: with ``TAP``, where the residual
-    after the layer also goes, BF16 on every rank (``moe_tail.out_stage``).
+    after the layer also goes, BF16 whole rows on each rank
+    (``moe_tail.out_stage``).
     ``WHOLE_ROWS``: the residual output holds whole FP32 rows, not the owned
     columns. ``CHECK_PARITY``: fail-stop when this
     launch's parity repeats the last one's (``Mailbox.check_parity``).
@@ -460,24 +504,27 @@ def gluon_muse_spark_layer_gfx950(
         task, active = schedule.stage_task(PLAN, "qkvg")
         if active:
             qkvg.qkvg_stage(mb, task, w_qkvg, a_in, HIDDEN, "qkvg")
+    # With gate split over every CTA (_gate_halves) gate shares the head's
+    # CTAs. Without its own qkvg the head is ready at once and every
+    # attention task waits on it: it runs before gate. Otherwise (its own
+    # qkvg: the head waits on the projection, gate runs meanwhile; or gate
+    # off the head's CTAs) the head runs after gate.
+    HEAD_FIRST: gl.constexpr = (not OWN) and qkvg.gate_halves(PLAN) == 2
+    if HEAD_FIRST:
+        task, active = schedule.stage_task(PLAN, "head")
+        if active:
+            _head(
+                mb, task, seq_len, slot, k_cache, v_cache, cos_sin, proj_in, ROPE, OWN
+            )
     task, active = schedule.stage_task(PLAN, "gate")
     if active:
         qkvg.gate_stage(mb, task, w_qkvg, a_in, HIDDEN, "gate")
-    task, active = schedule.stage_task(PLAN, "head")
-    if active:
-        attention.head_stage(
-            mb,
-            task,
-            seq_len,
-            slot,
-            k_cache,
-            v_cache,
-            cos_sin,
-            proj_in,
-            ROPE,
-            OWN,
-            "head",
-        )
+    if not HEAD_FIRST:
+        task, active = schedule.stage_task(PLAN, "head")
+        if active:
+            _head(
+                mb, task, seq_len, slot, k_cache, v_cache, cos_sin, proj_in, ROPE, OWN
+            )
     # Several requests' attention tasks may outnumber the CTAs: rounds.
     G: gl.constexpr = schedule.grid(PLAN)
     attn_task, attn_rounds = schedule.stage_rounds(PLAN, "attn")
@@ -539,7 +586,7 @@ def gluon_muse_spark_layer_gfx950(
     union = moe_experts.union_of(ids)
     # Every CTA, outside the task branches: it ends in a barrier.
     slot_lds = moe_experts.cta_slots(PLAN, union)
-    pre1 = moe_experts.ex1_prefetch(PLAN, task1, active1, slot_lds, w13, s13_we)
+    pre1 = moe_experts.ex1_prefetch(PLAN, task1, active1, slot_lds, union, w13, s13_we)
     a1 = moe_experts.ex1_xq(mb, task1, active1, "ex1")
     if active1:
         moe_experts.ex1_finish(
@@ -723,10 +770,10 @@ def _launch_layer(
     """Launch one layer step of ``rows`` token rows, requests of ``chain``
     tokens (``full``: a
     full-attention, NoPE layer), or with ``compile_only`` only compile the
-    launch. ``tap`` (None, or a BF16 ``[rows+, slots, 8192]`` buffer on the
-    Iris heap) gets the residual after the layer in slot ``tap_slot`` on
-    every rank. ``warm_next`` (None, or the next launch's packed QKVG
-    weights) is warmed into the memory-side cache after the experts. With
+    launch. ``tap`` (None, or a BF16 ``[rows+, slots, 8192]`` buffer) gets
+    the residual after the layer in slot ``tap_slot`` on every rank.
+    ``warm_next`` (None, or the next launch's packed QKVG weights) is
+    warmed into the memory-side cache after the experts. With
     ``whole_rows`` the residual output (in ``moe_ops``) is whole FP32
     ``[rows, 8192]`` rows, else the rank's owned ``[rows, 1024]`` columns.
     With ``check_parity`` the launch traps when its peer-region parity
@@ -864,10 +911,10 @@ def launch_gluon_muse_spark_layer_gfx950(
         chain: Tokens a request: 1 for decode, ``k + 1`` for a verify.
         whole_rows: Every rank stores whole residual rows into ``h_out``
             (for a next layer on the regular path), not its owned columns.
-        tap: None, or a BF16 ``[rows+, slots, 8192]`` buffer on the Iris
-            symmetric heap (the same on every rank): the launch also stores
-            the residual after the layer, rounded to BF16, into slot
-            ``tap_slot`` of every rank's copy (a draft's tap).
+        tap: None, or a BF16 ``[rows+, slots, 8192]`` buffer on each rank:
+            the launch also stores the residual after the layer, rounded to
+            BF16, into slot ``tap_slot`` of this rank's buffer (a draft's
+            tap); every rank's launch stores the same values.
         tap_slot: The tap's slot, or None without ``tap``.
         warm_next: None, or the next launch's ``weights.LayerWeights``. Without
             ``proj_out`` this launch reads its QKVG weights into the

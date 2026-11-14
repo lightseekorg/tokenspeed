@@ -47,7 +47,7 @@ from tokenspeed.runtime.execution.output_layout import (  # noqa: E402
 )
 from tokenspeed.runtime.layers.paged_attention import PagedAttention  # noqa: E402
 from tokenspeed.runtime.models.muse_spark_monokernel import (  # noqa: E402
-    MAX_REQUESTS,
+    HIDDEN,
     MAX_ROWS,
     NOT_TP8,
     OTHER_CONSTANTS,
@@ -80,19 +80,20 @@ def _ctx(mode: ForwardMode, bs: int, rows: int) -> ForwardContext:
     )
 
 
-def test_decode_steps_of_up_to_max_requests_take_the_kernels() -> None:
-    """A launch computes the rows of up to MAX_REQUESTS requests: a decode
-    token each, or a speculative verify's tokens each, MAX_ROWS rows at
-    most. Prefill, more requests and wider verifies keep the regular path."""
+def test_decode_steps_of_up_to_two_requests_take_the_kernels() -> None:
+    """A launch computes the rows of one or two requests: a decode token
+    each, or a speculative verify's tokens each, 16 rows at most. Prefill,
+    more requests and wider verifies keep the regular path."""
     assert takes_monokernels(1, _ctx(ForwardMode.DECODE, 1, 1))
     assert takes_monokernels(4, _ctx(ForwardMode.DECODE, 1, 4))
     assert takes_monokernels(8, _ctx(ForwardMode.DECODE, 1, 8))
-    # Two requests' rows only while MAX_REQUESTS allows them.
-    two = MAX_REQUESTS >= 2
-    assert takes_monokernels(2, _ctx(ForwardMode.DECODE, 2, 2)) == two
-    assert takes_monokernels(MAX_ROWS, _ctx(ForwardMode.DECODE, 2, MAX_ROWS)) == two
+    # Two requests: two decode rows, or two 8-token verifies.
+    assert takes_monokernels(2, _ctx(ForwardMode.DECODE, 2, 2))
+    assert takes_monokernels(MAX_ROWS, _ctx(ForwardMode.DECODE, 2, MAX_ROWS))
     assert not takes_monokernels(MAX_ROWS + 2, _ctx(ForwardMode.DECODE, 2, 18))
     assert not takes_monokernels(3, _ctx(ForwardMode.DECODE, 3, 3))
+    # One request's chain is at most CHAIN_ROWS: 16 rows of one request don't.
+    assert not takes_monokernels(MAX_ROWS, _ctx(ForwardMode.DECODE, 1, MAX_ROWS))
     assert not takes_monokernels(1, _ctx(ForwardMode.EXTEND, 1, 1))
     assert not takes_monokernels(1, _ctx(ForwardMode.IDLE, 1, 1))
 
@@ -153,6 +154,33 @@ def test_a_launch_hands_whole_rows_where_the_model_reads_them() -> None:
     # for example because another tapped layer follows layer 0).
     assert hands_whole_rows(5, served, frozenset({1, 6}), False)
     assert not hands_whole_rows(5, served, frozenset({1, 6}), True)
+
+
+def test_the_served_drafts_taps_are_stored_by_the_launches() -> None:
+    """Muse Spark's DFlash2 draft names target layer outputs 1, 16, 30, 44
+    and 59; the target captures the residual entering the next layer, so it
+    taps layers 2, 17, 31, 45 and 60. Each follows a launching layer, so the
+    launches store all five taps (one slot each, in layer order) and the
+    launches before them keep the owned-columns hand-off."""
+    fused = dict.fromkeys(range(1, 61))
+    taps = [2, 17, 31, 45, 60]
+    slots = MuseSparkMonokernelState.store_tap_slots(fused, taps)
+    assert slots == {2: 0, 17: 1, 31: 2, 45: 3, 60: 4}
+    served, tapped = set(fused), frozenset(taps)
+    for before in (1, 16, 30, 44, 59):
+        assert not hands_whole_rows(before, served, tapped, True)
+    # Layer 60's output enters regular layer 61: whole rows either way.
+    assert hands_whole_rows(60, served, tapped, True)
+
+
+def test_a_tap_after_a_regular_layer_leaves_every_tap_to_the_capture() -> None:
+    """Layer 1's entering residual comes from regular layer 0, which no launch
+    stores: then the model's regular capture serves every tap, and the
+    launches before the other tapped layers gather whole rows for it."""
+    fused = dict.fromkeys(range(1, 61))
+    taps = [1, 17, 31]
+    assert MuseSparkMonokernelState.store_tap_slots(fused, taps) == {}
+    assert hands_whole_rows(16, set(fused), frozenset(taps), False)
 
 
 def test_a_verify_step_gives_each_row_its_token_length() -> None:
@@ -301,7 +329,9 @@ def test_the_state_allocates_what_it_reserved_on_the_iris_heap(
     """The model reserves its state's Iris heap buffers before the heap
     exists, and the heap is created with only those bytes on top of the
     communication buffers: what the state allocates once it exists is
-    exactly what was reserved, with and without the draft's taps."""
+    exactly what was reserved, with and without the draft's taps. The taps
+    are each rank's own (no peer writes or reads them), so they stay off the
+    heap."""
     from tokenspeed_kernel.ops.communication import _iris
     from tokenspeed_kernel.ops.model.muse_spark.monokernel import FusedDecodeLayer
 
@@ -340,6 +370,12 @@ def test_the_state_allocates_what_it_reserved_on_the_iris_heap(
     assert state.scratch.numel() == 4096 + 60
     assert len(state.tap_slots) == stored
     assert sum(allocated) == reserved
+    assert allocated == [_iris.allocation_bytes((4096 + 60,), torch.int64)]
+    if stored:
+        assert state.taps.shape == (MAX_ROWS, stored, HIDDEN)
+        assert state.taps.device.type == "cuda"
+    else:
+        assert state.taps is None
 
 
 def test_an_fp8_kv_cache_takes_the_kernels(monkeypatch) -> None:

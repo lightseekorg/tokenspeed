@@ -18,10 +18,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Single-request decode speed and accuracy on GSM8K.
+"""Decode speed and accuracy on GSM8K at a few requests in flight.
 
 Sends the first ``--num-prompts`` questions of the GSM8K test split to an
-OpenAI-compatible chat endpoint one at a time (greedy, streamed) and reports:
+OpenAI-compatible chat endpoint (greedy, streamed), once for each
+``--concurrency`` value with that many requests in flight, and reports for
+each run:
 
 - the per-request decode rate: output tokens after the first, divided by the
   time from the first to the last streamed token, averaged over requests
@@ -29,9 +31,10 @@ OpenAI-compatible chat endpoint one at a time (greedy, streamed) and reports:
 - the end-to-end output rate: all output tokens over the wall time, per GPU;
 - the accuracy: the last ``\\boxed{}`` answer against the reference answer.
 
-The summary ends with the CSV block that ``test/ci_system/pipeline.py`` gates
-a perf task's ``perf_reference`` on. The script exits with status 1 when the
-accuracy is below ``--min-accuracy``.
+The summary ends with the CSV block, a row a run, that
+``test/ci_system/pipeline.py`` gates a perf task's ``perf_reference`` on. The
+script exits with status 1 when any run's accuracy is below
+``--min-accuracy``.
 """
 
 import argparse
@@ -40,6 +43,8 @@ import statistics
 import sys
 import time
 import urllib.request
+from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -182,13 +187,41 @@ def stream_chat(
     return RequestResult(output_tokens, first, last, "".join(parts))
 
 
-def summary_csv(
-    config: str, results: list[RequestResult], wall_s: float, num_gpus: int
+def run_requests(
+    prompts: Sequence[str],
+    concurrency: int,
+    send: Callable[[str], RequestResult],
+) -> list[RequestResult]:
+    """``send`` every prompt, ``concurrency`` of them in flight at a time.
+
+    A new request starts as soon as one finishes, so the server sees
+    ``concurrency`` requests until the last ones drain. Returns the results in
+    prompt order.
+    """
+    if concurrency < 1:
+        raise ValueError(f"concurrency must be at least 1, not {concurrency}")
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        return list(pool.map(send, prompts))
+
+
+def summary_row(
+    config: str,
+    results: list[RequestResult],
+    wall_s: float,
+    num_gpus: int,
+    concurrency: int,
 ) -> str:
+    """One CSV row (``CSV_HEADER``'s columns) of a run at ``concurrency``."""
     rates = [r.decode_tok_s for r in results if r.decode_tok_s is not None]
     per_user = statistics.mean(rates)
     per_gpu = sum(r.output_tokens for r in results) / wall_s / num_gpus
-    return f"{CSV_HEADER}\n{config},1,{per_user:.2f},{per_gpu:.2f},N/A,N/A\n"
+    return f"{config},{concurrency},{per_user:.2f},{per_gpu:.2f},N/A,N/A"
+
+
+def summary_csv(rows: list[str]) -> str:
+    """The CSV block of ``rows`` (:func:`summary_row`) under one header: the
+    perf gate reads the rows after the first header up to a blank line."""
+    return "\n".join([CSV_HEADER, *rows]) + "\n"
 
 
 def main() -> int:
@@ -197,6 +230,14 @@ def main() -> int:
     parser.add_argument("--model", required=True)
     parser.add_argument("--config", required=True, help="Label of the CSV row.")
     parser.add_argument("--num-prompts", type=int, required=True)
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        nargs="+",
+        required=True,
+        help="Requests in flight at a time, one run each (the prompts again at "
+        "each value); each run's CSV row has it as Conc.",
+    )
     parser.add_argument("--max-tokens", type=int, required=True)
     parser.add_argument(
         "--chat-template-kwargs", type=json.loads, required=True, help="JSON object."
@@ -208,57 +249,68 @@ def main() -> int:
     args = parser.parse_args()
 
     prompts = load_gsm8k(args.num_prompts)
-    results: list[RequestResult] = []
-    correct = 0
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    start = time.perf_counter()
+    rows, failed = [], False
     with args.output.open("w") as out:
-        for i, (question, answer) in enumerate(prompts):
-            result = stream_chat(
-                args.base_url,
-                args.model,
-                question + PROMPT_SUFFIX,
-                args.max_tokens,
-                args.chat_template_kwargs,
-                args.timeout_s,
+        for concurrency in args.concurrency:
+            correct = 0
+            start = time.perf_counter()
+            results = run_requests(
+                [question + PROMPT_SUFFIX for question, _ in prompts],
+                concurrency,
+                lambda prompt: stream_chat(
+                    args.base_url,
+                    args.model,
+                    prompt,
+                    args.max_tokens,
+                    args.chat_template_kwargs,
+                    args.timeout_s,
+                ),
             )
-            ok = is_correct(result.text, answer)
-            correct += ok
-            results.append(result)
-            out.write(
-                json.dumps(
-                    {
-                        "index": i,
-                        "correct": ok,
-                        "output_tokens": result.output_tokens,
-                        "decode_tok_s": result.decode_tok_s,
-                        "reference": answer.split("####")[-1].strip(),
-                        "boxed": last_boxed(result.text),
-                    }
+            wall_s = time.perf_counter() - start
+            for i, ((_, answer), result) in enumerate(zip(prompts, results)):
+                ok = is_correct(result.text, answer)
+                correct += ok
+                out.write(
+                    json.dumps(
+                        {
+                            "concurrency": concurrency,
+                            "index": i,
+                            "correct": ok,
+                            "output_tokens": result.output_tokens,
+                            "decode_tok_s": result.decode_tok_s,
+                            "reference": answer.split("####")[-1].strip(),
+                            "boxed": last_boxed(result.text),
+                        }
+                    )
+                    + "\n"
                 )
-                + "\n"
+            accuracy = correct / len(prompts)
+            at_cap = sum(r.output_tokens >= args.max_tokens for r in results)
+            rates = [r.decode_tok_s for r in results if r.decode_tok_s is not None]
+            print(
+                f"GSM8K, {concurrency} in flight: {correct}/{len(prompts)} correct "
+                f"(accuracy {accuracy:.4f}, minimum {args.min_accuracy}), "
+                f"{at_cap} at the {args.max_tokens}-token cap"
             )
-    wall_s = time.perf_counter() - start
-
-    accuracy = correct / len(prompts)
-    at_cap = sum(r.output_tokens >= args.max_tokens for r in results)
-    rates = [r.decode_tok_s for r in results if r.decode_tok_s is not None]
-    print(
-        f"GSM8K single request: {correct}/{len(prompts)} correct "
-        f"(accuracy {accuracy:.4f}, minimum {args.min_accuracy}), "
-        f"{at_cap} at the {args.max_tokens}-token cap"
-    )
-    print(
-        f"decode tok/s per request: mean {statistics.mean(rates):.1f}, "
-        f"median {statistics.median(rates):.1f}; "
-        f"mean output tokens {statistics.mean(r.output_tokens for r in results):.1f}"
-    )
+            print(
+                f"decode tok/s per request: mean {statistics.mean(rates):.1f}, "
+                f"median {statistics.median(rates):.1f}; mean output tokens "
+                f"{statistics.mean(r.output_tokens for r in results):.1f}"
+            )
+            rows.append(
+                summary_row(args.config, results, wall_s, args.num_gpus, concurrency)
+            )
+            if accuracy < args.min_accuracy:
+                print(
+                    f"accuracy {accuracy:.4f} at {concurrency} in flight is below "
+                    f"{args.min_accuracy}",
+                    file=sys.stderr,
+                )
+                failed = True
     print()
-    print(summary_csv(args.config, results, wall_s, args.num_gpus))
-    if accuracy < args.min_accuracy:
-        print(f"accuracy {accuracy:.4f} is below {args.min_accuracy}", file=sys.stderr)
-        return 1
-    return 0
+    print(summary_csv(rows))
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
