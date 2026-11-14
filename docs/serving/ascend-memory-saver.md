@@ -48,7 +48,7 @@ that wheel with CANN `9.2.0`. It has not been rerun for the current integration.
 
 The NPU feature depends on the common memory-protocol changes in
 [PR #3397](https://github.com/lightseekorg/tokenspeed/pull/3397), pinned here
-at `97400c6eb136254021a2b1880a3e35104e4e9e5a`. It is open and Ready for
+at `a034c3cc585f5a5aa9f6f1d811f8624e66549466`. It is open and Ready for
 Review, not merged. This dependency is separate from the Ascend allocator and model support.
 
 Build the TokenSpeed Python runtime, kernel packages, native saver library,

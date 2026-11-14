@@ -1,5 +1,120 @@
 # Ascend ACL Graph Memory Saver validation report
 
+## Regression after shared persistent-buffer integration
+
+The regression ran with main `0cecb81ee588775224c7177c1db8595cc6937a0f`
+and common protocol production source `97400c6e`. Its 3,815 source paths form
+tree `9cdaec776e2b349e6c4388a4e5f9477b6b932fa9`, exactly test commit
+`ddf4af615e7890e3ad5f8b2c53778f61ebf6b3b3`. Function integration is commit
+`3a47336e94ebb2b78b2dd85f79e8fd1f4354d790`.
+
+The delivered common dependency is
+`a034c3cc585f5a5aa9f6f1d811f8624e66549466`. Its later changes affect only
+eight CUDA test/README paths. Together with four documentation updates, these
+are the only differences from the executed tree. Production, native and
+NPU-test code remain unchanged. Results remain bound to the executed tree.
+
+The shared persistent-buffer contract maps `executor_inputs`, `runtime_states`,
+`attention_state` and `workspace` to one distinct `weights` / `CPU_BACKUP` pool.
+It preserves these buffers even when model parameters use `DISCARD`. KV and
+graph pools retain their separate policies. NPU uses shared `PoolKey` ownership
+and a reentrant lock for same-pool nesting, cross-thread serialization and
+cleanup before deferred communication initialization. CUDA retains its lazy
+primary/persistent saver pools and `ContextVar` nesting. Initial and growing
+workspaces use the selected device's named owner. Existing ABI 2 callbacks
+suffice; no new public memory tag or allocator ABI was added. The production
+NCCL resume queue gate from main #3407 remains intact.
+
+Four native artifacts—host, client, scheduler extension and Ascend saver—were
+newly built for this source. The build retained verified external compiler,
+sysroot and dependency caches read-only, then regenerated the TokenSpeed crate
+fingerprints and embedded CMake inputs. This is an incremental source-bound
+build, not a scratch build or reuse of old production binaries. The stack
+remains Torch `2.9.0+cpu`, PTA `ee1742b` and CANN 9.0.0. No additional PTA
+patches or system-library replacements were introduced.
+
+| Current source gate | Root-accepted result |
+| --- | --- |
+| Official Rust formatting | Whole-workspace check passed |
+| Rust native | 410 passed; 16 ignored; nested child summaries excluded |
+| C++ scheduler | 1,517 passed; one expected ASan-only skip; exact 1,518-case inventory |
+| Fake ACL | 4 passed |
+| CPU regression | 640 main tests plus 42 subtests; 33 hardware-requiring skips; four NPU SDK cases deselected |
+| CUDA/Gluon startup unit file | Original three cases passed using real CUDA detection/Gluon imports and their original stand-ins |
+| Targeted NPU hardware | All ten targeted cases accepted: four standalone combinations, TP2 eager/graph recovery, synthetic MTP, live cancellation/retry and eager/graph callback ordering |
+| Integrated CUDA model recovery | One actual single-host TP2/EP1 eager protocol-2 Triton CPU-backup case passed: complete 135-tensor A-to-B update, A/B resume and independent fresh-B/eight-token equality; no NPU modules or ACL maps |
+
+The early 72 CPU tests are included in the 640 main-test total. The 33 skips,
+four deselections, 16 Rust ignored cases and ASan-only skip are not passes.
+JUnit suite totals include virtual subtests: the persistent/device group has
+272 actual testcase elements and the weights group has 209. These counts are
+not interchangeable with main-test and subtest totals. The three CUDA/Gluon
+unit tests do not execute an actual process group, collective, project-native
+binary or model, and do not qualify CUDA model memory recovery or ROCm.
+
+The preserved failed attempts include an obsolete test expectation for immediate
+NCCL resume, formatter command resolution and one unit-test whitespace change,
+a scoped CPU child platform fixture, an offline placeholder-model fetch, and
+CUDA compiler capability routing. A staged-runtime preflight also required two
+exact supplemental path pins for byte-identical qualified compiler-library
+aliases: 27 intended paths and 29 actual loaded paths. The original refusal
+remains recorded; no ELF, RPATH or library was changed. The original failed
+117-case startup attempt remains distinct from the successful five-file
+114-case CPU group and the
+separate three-case CUDA compiler file. Corrections preserved production gates
+and test assertions; no Rust-language or system-library workaround was used.
+
+The accepted standalone cases prove full representative owner/workspace buffer
+contents and stable virtual addresses; graph variants replay their declared
+graph. TP2 eager and graph recovery verify all 2 × 12 updated-B/fresh-B tokens,
+311 checkpoint tensors, real parameter discard, canonical persistent backup and
+original parameter addresses. These checks do **not** qualify full model-constant
+contents. Graph recovery replays original graphs per rank with zero recapture. Its
+per-rank managed mappings include 272,629,760 backup-weight bytes, 668,991,488
+discard-weight bytes, 943,718,400 KV bytes and 266,338,304 graph bytes. These
+are managed mapping measurements, not driver-free HBM. The accepted synthetic
+MTP smoke keeps weights resident through two graph/KV-discard cycles, preserves
+the two original graphs and matches full 16-token outputs and verification
+metrics. Each cycle releases 266,338,304 managed graph bytes. TTFT was not
+measured. Live 256-token cancellation/refusal and healthy retry pass without
+cancelled device mapping; post-unmap fault injection was not executed. Both
+eager and graph callback
+cases hold the public response pending for the configured 300 ms while a rank
+callback is unreturned, with one observed reply, full eight-token equality and
+943,718,400 bytes of real KV unmap/remap per rank. All ten cases exit normally
+with no forced cleanup. Forty post-run guard observations pass; source pins
+and boot identity remain unchanged, and the selected devices are idle. The integrated
+CUDA result remains separate from the three compiler-only units and does not
+qualify ROCm, EP4, cross-host or graph allocators.
+
+The standalone observations below are one run per configuration. Weights pause
+and resume are adapter micro-operations, not model frontend latency or a
+statistical performance comparison. Released bytes are managed weights backing,
+not driver-free HBM. The final column is a separate immediate per-device
+PTA driver-free snapshot difference, not an inference from native accounting.
+Native weights-pause policy accounting reports 25,165,824 backup bytes in all
+four cases plus 2,097,152 discard bytes only in the DISCARD configurations.
+These are four observations, not a production memory benchmark.
+
+| Parameter policy / execution | Weights pause ms | Weights resume ms | Managed weights released bytes | Observed driver-free increase bytes |
+| --- | ---: | ---: | ---: | ---: |
+| CPU_BACKUP / eager | 15.608 | 5.401 | 25,165,824 | 25,165,824 |
+| CPU_BACKUP / graph | 7.154 | 3.747 | 25,165,824 | 25,165,824 |
+| DISCARD / eager | 5.833 | 8.589 | 27,262,976 | 27,262,976 |
+| DISCARD / graph | 3.664 | 4.006 | 27,262,976 | 27,262,976 |
+
+The callback tests inject a 300 ms
+unanswered observation; their timings do not establish production performance,
+native ACK timestamps, global exactly-once replies or asymmetric native KV-drain
+completion. Managed backing bytes are not driver-free HBM. Unmeasured durations
+remain N/A, with measured durations reported in ms and explicit endpoints.
+
+This round does **not** rerun the historical full GSM8K or TP4/TP8 matrix. It
+does not renew the earlier 20-group acceptance or timing matrices. The records
+below retain their original source, stack and qualification limits.
+
+## Historical source-qualified results
+
 **PASS for the bounded latest-source functional scope:** root accepted all 20
 required hardware groups and the required CPU qualification. Independent
 architecture and raw-evidence reviews passed with no blocking source finding.

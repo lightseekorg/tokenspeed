@@ -1,5 +1,107 @@
 # Ascend memory saver acceptance tests
 
+## Regression after shared persistent-buffer integration
+
+The targeted integration is tested as source tree
+`9cdaec776e2b349e6c4388a4e5f9477b6b932fa9` (3,815 paths), based on main
+`0cecb81ee588775224c7177c1db8595cc6937a0f` and common protocol source
+`97400c6eb136254021a2b1880a3e35104e4e9e5a`. The current integration pins common
+head `a034c3cc585f5a5aa9f6f1d811f8624e66549466`, whose later changes are
+CUDA test/README changes, separate from the executed NPU test tree. Its CPU/native
+gates are accepted. All ten targeted NPU hardware cases are accepted: four
+standalone combinations,
+TP2 eager/graph recovery, two-cycle synthetic MTP, live cancellation/retry and
+eager/graph callback ordering. One actual integrated CUDA TP2/EP1 eager v2
+CPU-backup full-update/fresh-reference case is accepted separately. The executed
+C tree is exactly commit `ddf4af615e7890e3ad5f8b2c53778f61ebf6b3b3`. The later
+delivery delta is limited to eight CUDA test/README paths and four documentation
+paths; production, native and NPU-test code remain unchanged. Earlier hardware
+passes are not inherited. The current result summary
+and source boundaries are in the
+[validation report](../../../docs/serving/ascend-memory-saver-test-report.md#regression-after-shared-persistent-buffer-integration).
+
+The four named owners use a distinct weights-backed `CPU_BACKUP` pool even
+when parameters use `DISCARD`. These tests distinguish persistent contents from
+parameter, KV and graph policies. They require the real qualified PTA/native
+stack, with no additional PTA patches, and matching newly built TokenSpeed
+native artifacts. Run from the repository root, after configuring the documented
+CANN/PTA environment and saver/host variables. Select only the devices assigned
+to the run. The commands below are opt-in instructions, not recorded passes.
+
+### Standalone policy and execution-mode matrix
+
+Expose one physical NPU for this matrix. Bind the saver digest to the qualified
+artifact before running; do not substitute a different library to satisfy a
+failure.
+
+```bash
+suite=test/runtime/ascend_memory_saver
+RUN_OUTPUT=$(mktemp -d)
+PTA_GIT=ee1742b06d2c0e59cb0b357288ec29ee190cfd2d
+: "${QUALIFIED_SAVER_SHA256:?Set the saver SHA256 from the matching qualified build receipt}"
+
+for policy in cpu_backup discard; do
+  for mode in eager graph; do
+    python "$suite/test_persistent_buffer_roundtrip.py" \
+      --source "$PWD" \
+      --weight-policy "$policy" --execution-mode "$mode" \
+      --expected-pta-git "$PTA_GIT" \
+      --expected-library-sha256 "$QUALIFIED_SAVER_SHA256" \
+      --output "$RUN_OUTPUT/persistent-$policy-$mode.json"
+  done
+done
+```
+
+The probe checks actual named owner/workspace allocation, the distinct real PTA
+pool and native backing, full persistent values and the same virtual addresses
+after weight release/resume. Graph mode additionally checks its declared replay
+scope. These standalone tensors do not qualify TP2 model constants or a full
+model-serving workload.
+
+### TP2 full disk update and ownership witnesses
+
+Expose two physical NPUs. Set `INITIAL_CHECKPOINT` and `UPDATED_CHECKPOINT` to
+distinct compatible local Qwen3 checkpoints and set `TOKENSPEED_HOST_BINARY` to
+the matching native host. Retain the package source on `PYTHONPATH` so spawned
+workers resolve the same tree. Each output subdirectory must be new.
+
+```bash
+suite=test/runtime/ascend_memory_saver
+RUN_OUTPUT=$(mktemp -d)
+export PYTHONPATH="$PWD/python${PYTHONPATH:+:$PYTHONPATH}"
+
+for mode in eager graph; do
+  python "$suite/test_tp2_weight_recovery.py" \
+    --initial "$INITIAL_CHECKPOINT" --updated "$UPDATED_CHECKPOINT" \
+    --trace-dir "$PWD/$suite/weight_trace" \
+    --execution-mode "$mode" \
+    --output-dir "$RUN_OUTPUT/tp2-$mode"
+done
+```
+
+The recovery test requires full updated-B output equality with an independently
+loaded fresh B, real parameter discard/reload, mandatory named-buffer
+PTA/native ownership witnesses, and original graph identity/replay with zero
+recapture in graph mode. Stable addresses alone are not ownership or content
+proof. Accepted TP2 recovery evidence does not qualify full model-constant
+contents. The ownership checker keeps positive half-open ranges, full native/PTA
+joins, policy/tag classification and source-origin guards; do not disable these
+checks to turn a failure into a pass.
+
+The accepted targeted scope also includes live cancellation/refusal with healthy
+retry, eager/graph callback-return versus frontend-response observations, and
+two cycles with an existing Qwen3 synthetic-MTP fixture. A synthetic MTP smoke
+does not qualify actual EAGLE3, DFLASH or DSPARK checkpoints, complete draft
+refresh, or a broad speculative-decoding matrix. The callback's artificial
+300 ms hold does not prove native asymmetric KV drain, native ACK timestamps,
+global exactly-once wire behavior or production performance.
+
+This round does not rerun the historical full GSM8K or TP4/TP8 matrix. Existing
+result statements below keep their original source qualification. The command
+reference remains available without implying a new execution of every probe.
+
+## Existing command reference
+
 These opt-in tests exercise the real Ascend allocator and TokenSpeed serving
 path. Use one of the [documented PTA stacks](../../../docs/serving/ascend-memory-saver.md#before-you-start)
 and load its CANN environment. The original runs used Atlas A2, CANN 9.0.0,

@@ -32,7 +32,7 @@ Ascend allocator only for NPU workers that enable the saver.
 
 The shared protocol dependency is
 [PR #3397](https://github.com/lightseekorg/tokenspeed/pull/3397), pinned at
-`97400c6eb136254021a2b1880a3e35104e4e9e5a` for this integration. The PR is
+`a034c3cc585f5a5aa9f6f1d811f8624e66549466` for this integration. The PR is
 open and Ready for Review, not merged. Its request matching, cache publication, and weight commit contracts remain
 shared. Checked Ascend Saver serving selects protocol 3 and rejects an
 older local host; CUDA and ROCm retain the protocol 2 default.
