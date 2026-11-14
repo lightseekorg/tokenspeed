@@ -167,6 +167,10 @@ XCD's L2.
 - Multiple input rows require an `(N, K)` bucket in `_ROWS_CONFIGS`. Each row
   is bitwise the single-row GEMV of that row; `M` is a runtime argument and
   each power-of-two bucket uses one binary.
+- `set_gluon_rowcta_bf16_gemv_gfx950_routing` enters a shape into both tables
+  at runtime (for `gemm.mm`'s opt-in online tuning of shapes missing from
+  every table); `gluon_rowcta_bf16_gemv_rows_tile_fits_gfx950` tells whether
+  a few-row tile covers a weight.
 - `gluon_gated_rowcta_bf16_gemv_gfx950` fuses per-head weightless RMSNorm and
   sigmoid gating into a single-row projection. It matches the separate
   Triton gated norm and GEMV bitwise. `gemm.mv_weightless_rmsnorm_gated_sigmoid`
@@ -264,7 +268,8 @@ decode batches, `1 <= M <= 16`, with one program per CU.
   uses it only for the `(N, K)` shapes and M buckets (1, 2-4, 5-16) listed in
   `_PREFERRED_BUCKETS`, where it beat the default (Torch's skinny GEMM at one
   row, the decode GEMM or hipBLASLt above) in cold-cache standalone sweeps.
-  Direct calls take any supported shape.
+  Direct calls take any supported shape. `set_gluon_gemv_a16w16_gfx950_buckets`
+  enters a shape at runtime.
 - One binary per (shape, M bucket): M = 1, and M = 2-16. `M` and `N` are
   runtime arguments.
 

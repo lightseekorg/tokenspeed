@@ -20,13 +20,22 @@
 
 from __future__ import annotations
 
+import functools
+import hashlib
+import inspect
+import json
 import logging
 import os
+import statistics
+import tempfile
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any, Callable, Generator
 
+import torch.distributed as dist
 from tokenspeed_kernel.platform import PlatformInfo, current_platform
 from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
 from tokenspeed_kernel.signature import FormatSignature
@@ -40,8 +49,15 @@ __all__ = [
     "SelectionStrategy",
     "ScoreBreakdown",
     "SelectionOracle",
+    "AutotuneCache",
     "AutotuneParams",
     "SelectionPolicy",
+    "autotune_decide",
+    "autotune_environment",
+    "autotune_key",
+    "default_autotune_cache",
+    "register_autotune_benchmark",
+    "source_digest",
     "select_kernel",
     "resolve_kernel_override",
     "set_selection_policy",
@@ -781,8 +797,9 @@ def select_kernel(
     # Strategy dispatch
     strategy = _policy.get_strategy(family, mode)
 
+    final = True
     if strategy == SelectionStrategy.AUTOTUNE:
-        winner, scored = _autotune_select(
+        winner, scored, final = _autotune_select(
             candidates,
             family,
             mode,
@@ -799,8 +816,258 @@ def select_kernel(
 
     impl = registry.get_impl(winner.name)
     result = SelectedKernel(name=winner.name, impl=impl)
-    registry.cache_put(cache_key, result)
+    # An undecided autotune selection stays uncached, so a later warmup can
+    # still measure it.
+    if final:
+        registry.cache_put(cache_key, result)
     return result
+
+
+# ===-----------------------------------------------------------------------===#
+# Autotuning
+# ===-----------------------------------------------------------------------===#
+
+_AUTOTUNE_CACHE_DIR_ENV = "TOKENSPEED_KERNEL_AUTOTUNE_CACHE_DIR"
+_AUTOTUNE_CACHE_SCHEMA = 1
+
+# Given a candidate's implementation and the selection traits, return a
+# zero-argument launch of that implementation on representative inputs.
+AutotuneBenchmark = Callable[
+    [Callable[..., Any], dict[str, Any] | None], Callable[[], Any]
+]
+_autotune_benchmarks: dict[tuple[str, str], AutotuneBenchmark] = {}
+
+
+def register_autotune_benchmark(
+    family: str, mode: str, benchmark: AutotuneBenchmark
+) -> None:
+    """Let ``SelectionStrategy.AUTOTUNE`` time the candidates of an operator.
+
+    Args:
+        family: Operator family.
+        mode: Operator mode.
+        benchmark: Called with a candidate's implementation and the selection
+            traits; returns a zero-argument callable that launches it once.
+
+    Returns:
+        None. Operators without a benchmark keep the heuristic ranking.
+    """
+    _autotune_benchmarks[(family, mode)] = benchmark
+
+
+def autotune_environment() -> dict[str, object]:
+    """Return what an autotune measurement depends on besides the kernels.
+
+    The device name, architecture and compute-unit count, and the Torch,
+    HIP/CUDA and Triton versions. A change to any of them selects another
+    cache file.
+    """
+    import torch
+    from tokenspeed_kernel._triton import triton
+
+    environment: dict[str, object] = {
+        "schema": _AUTOTUNE_CACHE_SCHEMA,
+        "torch": torch.__version__,
+        "hip": torch.version.hip,
+        "cuda": torch.version.cuda,
+        "triton": getattr(triton, "__version__", None),
+    }
+    if torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        environment.update(
+            device=props.name,
+            arch=getattr(props, "gcnArchName", None) or f"{props.major}.{props.minor}",
+            compute_units=props.multi_processor_count,
+        )
+    else:
+        environment.update(device="cpu", arch=None, compute_units=None)
+    return environment
+
+
+@functools.cache
+def _file_digest(path: str) -> str:
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def source_digest(*objects: Any) -> str:
+    """Hash the source files that define ``objects`` (functions or modules).
+
+    A measurement keyed with this digest is not reused once one of the
+    compared kernels changes.
+    """
+    paths = sorted({inspect.getsourcefile(inspect.unwrap(obj)) for obj in objects})
+    digest = hashlib.sha256()
+    for path in paths:
+        digest.update(_file_digest(path).encode())
+    return digest.hexdigest()[:16]
+
+
+def autotune_key(op: str, shape: dict[str, Any], sources: str) -> str:
+    """Return the cache key of one decision: operator, shape and kernel sources."""
+    items = ",".join(f"{name}={shape[name]!r}" for name in sorted(shape))
+    return f"{op}|{items}|{sources}"
+
+
+class AutotuneCache:
+    """Autotune decisions of one device and toolchain, persisted as JSON.
+
+    Values must be JSON-serializable. Every process reads the file once;
+    writers merge their entries into the current file and replace it
+    atomically, so ranks sharing the file never read a partial one.
+    """
+
+    def __init__(self, path: Path, environment: dict[str, object]) -> None:
+        self.path = path
+        self.environment = environment
+        self._entries = self._read()
+
+    @classmethod
+    def for_environment(
+        cls, directory: Path, environment: dict[str, object]
+    ) -> AutotuneCache:
+        payload = json.dumps(environment, sort_keys=True).encode()
+        name = hashlib.sha256(payload).hexdigest()[:16]
+        return cls(directory / f"{name}.json", environment)
+
+    def _read(self) -> dict[str, Any]:
+        try:
+            data = json.loads(self.path.read_text())
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError) as error:
+            logger.warning(
+                f"[tokenspeed_kernel:autotune] ignoring {self.path}: {error}"
+            )
+            return {}
+        if data.get("environment") != self.environment:
+            return {}
+        return dict(data.get("entries", {}))
+
+    def get(self, key: str) -> Any | None:
+        return self._entries.get(key)
+
+    def put(self, key: str, value: Any, *, persist: bool) -> None:
+        self._entries[key] = value
+        if not persist:
+            return
+        entries = self._read()
+        entries[key] = value
+        self._entries.update(entries)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(
+            {"environment": self.environment, "entries": entries},
+            indent=1,
+            sort_keys=True,
+        )
+        tmp = tempfile.NamedTemporaryFile(
+            "w", dir=self.path.parent, suffix=".tmp", delete=False
+        )
+        try:
+            with tmp:
+                tmp.write(payload)
+            os.replace(tmp.name, self.path)
+        finally:
+            Path(tmp.name).unlink(missing_ok=True)
+
+
+@functools.cache
+def default_autotune_cache() -> AutotuneCache:
+    """The process's cache under ``$TOKENSPEED_KERNEL_AUTOTUNE_CACHE_DIR``.
+
+    Defaults to ``~/.cache/tokenspeed/kernel-autotune``.
+    """
+    directory = os.environ.get(_AUTOTUNE_CACHE_DIR_ENV) or str(
+        Path.home() / ".cache" / "tokenspeed" / "kernel-autotune"
+    )
+    return AutotuneCache.for_environment(Path(directory), autotune_environment())
+
+
+def _capturing() -> bool:
+    import torch
+
+    return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+
+
+def autotune_decide(
+    cache: AutotuneCache, key: str, measure: Callable[[], Any]
+) -> Any | None:
+    """Return the cached decision for ``key``, measuring it during warmup.
+
+    Only kernel warmup (outside graph capture) measures; elsewhere a miss
+    returns ``None`` and the caller keeps its heuristic. Under
+    :func:`~tokenspeed_kernel.ops.tuning.set_autotune_process_group` the
+    ranks agree on cache hits; on any miss rank 0 measures (or reuses its
+    hit) and broadcasts, so every rank takes the same decision, and only
+    rank 0 writes the file. Ranks of the group must decide the same keys in
+    the same order.
+
+    Args:
+        cache: Where decisions are looked up and stored.
+        key: The decision's :func:`autotune_key`.
+        measure: Runs the measurement; returns a JSON-serializable decision.
+
+    Returns:
+        The decision, or ``None`` on a miss outside warmup.
+    """
+    # Deferred: tuning imports FlashInfer's autotuner when it is installed.
+    from tokenspeed_kernel.ops import tuning
+
+    value = cache.get(key)
+    if not tuning.is_warming_up() or _capturing():
+        return value
+    group = tuning._autotune_process_group
+    if group is None:
+        if value is not None:
+            return value
+        value = measure()
+        cache.put(key, value, persist=True)
+        return value
+    hits = [False] * dist.get_world_size(group)
+    dist.all_gather_object(hits, value is not None, group=group)
+    if all(hits):
+        return value
+    rank = dist.get_rank(group)
+    box = [None]
+    if rank == 0:
+        box[0] = value if value is not None else measure()
+    dist.broadcast_object_list(box, src=dist.get_global_rank(group, 0), group=group)
+    value = box[0]
+    cache.put(key, value, persist=rank == 0)
+    return value
+
+
+def _time_candidates(
+    launches: list[Callable[[], Any]], params: AutotuneParams
+) -> list[float]:
+    """Median seconds per launch, timing the candidates alternately."""
+    import torch
+
+    events = params.use_cuda_events and torch.cuda.is_available()
+
+    def sync() -> None:
+        if events:
+            torch.cuda.synchronize()
+
+    for launch in launches:
+        for _ in range(params.warmup_iters):
+            launch()
+    sync()
+    samples: list[list[float]] = [[] for _ in launches]
+    for _ in range(params.bench_iters):
+        for launch, times in zip(launches, samples):
+            if events:
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                launch()
+                end.record()
+                end.synchronize()
+                times.append(start.elapsed_time(end) / 1e3)
+            else:
+                begin = time.perf_counter()
+                launch()
+                times.append(time.perf_counter() - begin)
+    return [statistics.median(times) for times in samples]
 
 
 def _autotune_select(
@@ -811,19 +1078,58 @@ def _autotune_select(
     platform: PlatformInfo,
     traits: dict[str, Any] | None,
     params: AutotuneParams,
-) -> tuple[KernelSpec, list[tuple[KernelSpec, ScoreBreakdown]]]:
+) -> tuple[KernelSpec, list[tuple[KernelSpec, ScoreBreakdown]], bool]:
     """Benchmark candidates and return the fastest.
 
-    Falls back to heuristic ranking when the autotuning infrastructure
-    (input generators, benchmark runner) is not yet available.
+    The decision comes from :func:`default_autotune_cache`, measured with the
+    operator's :func:`register_autotune_benchmark` during kernel warmup.
+    Without a benchmark, or on a miss outside warmup, the heuristic ranking
+    decides.
+
+    Returns:
+        The winner, the heuristic ranking, and whether the selection is final
+        (cacheable); a heuristic pick on a miss outside warmup is not.
     """
     scored = _rank(candidates, platform, traits)
-    winner = scored[0][0]
+    benchmark = _autotune_benchmarks.get((family, mode))
+    if benchmark is None or len(scored) == 1:
+        return scored[0][0], scored, True
+    registry = KernelRegistry.get()
+    impls = {spec.name: registry.get_impl(spec.name) for spec, _ in scored}
+    shape = {
+        "format": str(format_signature),
+        "traits": repr(sorted((traits or {}).items())),
+    }
+    key = autotune_key(f"{family}.{mode}", shape, source_digest(*impls.values()))
+
+    def measure() -> str:
+        names = list(impls)
+        times = _time_candidates(
+            [benchmark(impls[name], traits) for name in names], params
+        )
+        winner = names[times.index(min(times))]
+        logger.info(
+            f"[tokenspeed_kernel:autotune] {family!s}.{mode!s}"
+            f"({format_signature!s}) {traits}: {winner} "
+            + ", ".join(f"{n}={t * 1e6:.1f}us" for n, t in zip(names, times))
+        )
+        return winner
+
+    choice = autotune_decide(default_autotune_cache(), key, measure)
+    for spec, _ in scored:
+        if spec.name == choice:
+            return spec, scored, True
+    if choice is not None:
+        logger.warning(
+            f"[tokenspeed_kernel:autotune] cached {choice!r} is no longer a "
+            f"candidate for {family!s}.{mode!s}; using the heuristic"
+        )
+        return scored[0][0], scored, True
     logger.debug(
-        f"[tokenspeed_kernel:autotune] falling back to heuristic for {family!s}."
-        f"{mode!s}({format_signature!s})",
+        f"[tokenspeed_kernel:autotune] no measurement for {family!s}."
+        f"{mode!s}({format_signature!s}) outside warmup; using the heuristic",
     )
-    return winner, scored
+    return scored[0][0], scored, False
 
 
 @contextmanager
