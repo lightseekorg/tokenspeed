@@ -4058,7 +4058,9 @@ def test_ple_host_gather_shard_mask(store_fp8, scale_mode) -> None:
         else None
     )
     scalar = 0.5 if scale_mode == "scalar" else None
-    ple_host_gather(table, ids, out, 10, 14, scalar, scales)
+    ple_host_gather(
+        table, ids, out, 10, 14, scalar, scales, table_shards=4, background=False
+    )
     expected = torch.zeros_like(out)
     for output_row, local_row in [(1, 0), (2, 3)]:
         scale = (
