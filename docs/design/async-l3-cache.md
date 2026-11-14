@@ -212,7 +212,10 @@ L2 sizing is capped to a common count across ranks; an explicit size that
 does not fit is rejected. L2 and L3 share this allocation; attaching L3 does
 not allocate another arena. This is not an atomic reservation across containers
 or independent P/D worlds. Deployment sizing must account for their combined
-allocations, Mooncake segments/staging and independent storage owners.
+allocations, Mooncake segments/staging and independent storage owners; the
+offline `tokenspeed cache-budget` check
+([deployment Host memory budget](../configuration/host-memory-budget.md))
+sums them from an explicit manifest without changing runtime admission.
 Runtime operation/Host credits bound L3 ownership, not process RSS.
 
 Query, GET and PUT have separate bounded queues and workers. The total
