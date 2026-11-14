@@ -114,6 +114,15 @@ def dsa_quantize_index_query_mxfp4(
     return pack_index_queries(q)
 
 
+def _selects(op: str, signature, traits: dict, solution: str | None) -> bool:
+    """Whether attention ``op`` selects a kernel for ``traits``."""
+    try:
+        select_kernel("attention", op, signature, traits=traits, solution=solution)
+    except NoKernelFoundError:
+        return False
+    return True
+
+
 def dsa_interleave_rope(
     tensor: torch.Tensor,
     positions: torch.Tensor,

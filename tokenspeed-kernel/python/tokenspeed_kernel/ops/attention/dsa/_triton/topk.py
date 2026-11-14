@@ -644,6 +644,7 @@ def _index_k_write_quantize_query_kernel(
     NG: tl.constexpr,
     BLOCK_NG: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    MXFP4: tl.constexpr,
     DIM: tl.constexpr,
     HEADS_PER_PROGRAM: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
@@ -691,6 +692,7 @@ def _index_k_write_quantize_query_kernel(
             NG,
             BLOCK_NG,
             FP8_MAX,
+            MXFP4,
         )
 
 

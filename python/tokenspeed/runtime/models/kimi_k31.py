@@ -51,6 +51,9 @@ import torch
 from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
 from tokenspeed_kernel.ops.attention.dsa import (
     MXFP4_INDEX_QUERY_FORMAT,
+)
+from tokenspeed_kernel.ops.attention.dsa import cute_dsl as dsa_cute_dsl
+from tokenspeed_kernel.ops.attention.dsa import (
     dsa_decode_dcp_records_workspace_bytes,
 )
 from tokenspeed_kernel.ops.attention.mla import mla_project_value
@@ -434,6 +437,23 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
             raise ValueError(
                 "--dsa-index-k-format mxfp4 has no mxfp4-query scorer on this platform"
             )
+        # The fused decode top-k takes BF16 or unit-scale E4M3 index queries.
+        self.decode_topk_solution = (
+            None if quantized else _fused_decode_topk_solution(self.indexer)
+        )
+        # A decode round quantizes its index query in the index-K write's launch.
+        self.index_k_write_quantizes_query = self.decode_topk_solution is not None
+        # A decode chain round's norms, q_b / wq_b projection and index-K write in one launch.
+        self.decode_front = (
+            _decode_front_kernel(
+                self.indexer,
+                self.q_lora_rank,
+                self.kv_lora_rank,
+                self.q_b_proj.weight.shape[0],
+            )
+            if self.index_k_write_quantizes_query
+            else None
+        )
         self._decode_topk_indices_buffer: torch.Tensor | None = None
         self._decode_topk_lens_buffer: torch.Tensor | None = None
         self._retired_decode_workspaces: list[torch.Tensor] = []

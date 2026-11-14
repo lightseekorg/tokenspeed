@@ -320,6 +320,8 @@ class DSATokenToKVPool(MLATokenToKVPool):
             ``softmax_scale``.
         """
         buf = self.get_index_k_buffer(layer_id)
+        if self.index_k_format == "mxfp4":
+            raise ValueError("the fused index-K write takes an fp8_scaled plane")
         if buf.dtype != torch.uint8 or index_k.dtype != self.model_dtype:
             raise ValueError(
                 f"the fused index-K write takes {self.model_dtype} keys into a "
