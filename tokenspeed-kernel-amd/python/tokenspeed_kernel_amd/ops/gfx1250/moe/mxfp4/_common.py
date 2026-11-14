@@ -384,6 +384,8 @@ class MoEConfig:
 
     # TDM descriptor row-index width, not the width of pointer arithmetic.
     index_type: gl.constexpr
+    # N of K-plane weights (see create_descriptor), or 0 for N-major rows.
+    W_KPLANE_ROWS: gl.constexpr
 
     @gluon.constexpr_function
     def __init__(
@@ -405,6 +407,7 @@ class MoEConfig:
         EVEN_K=True,
         USE_GATHER=False,
         NUM_WARPS=4,
+        W_KPLANE_ROWS=0,
     ):
         self.BLOCK_M = gl.constexpr(BLOCK_M)
         self.BLOCK_N = gl.constexpr(BLOCK_N)
@@ -454,6 +457,7 @@ class MoEConfig:
             DTYPE_X in _SCALED_FORMATS and DTYPE_W in _SCALED_FORMATS
         )
         self.NUM_WARPS = gl.constexpr(NUM_WARPS)
+        self.W_KPLANE_ROWS = gl.constexpr(W_KPLANE_ROWS)
 
         BLOCK_K_SCALE = BLOCK_K // SCALE_BLOCK
         self.index_type = gl.constexpr(index_type)
@@ -572,6 +576,28 @@ class MoEConfig:
 
 
 @gluon.jit
+def make_kplane_w_descriptor(cfg: MoEConfig, w_tile_ptr, N, K):
+    """Describe K-plane weights from the first row of this program's N tile.
+
+    K-plane storage keeps each BLOCK_K step of an expert as its own row-major
+    ``[W_KPLANE_ROWS, BLOCK_K // DIV_FACTOR_W]`` slab, so one weight tile is a
+    single contiguous run instead of short pieces of every N row. ``N`` counts
+    the rows left from this tile's start in the first plane; step ``k`` sits
+    ``k * W_KPLANE_ROWS`` rows further on.
+    """
+    gl.static_assert(cfg.W_TRANSPOSE, "K-plane weights are N-major")
+    gl.static_assert(cfg.EVEN_K, "K-plane weights need whole K steps")
+    PLANE_BYTES: gl.constexpr = cfg.BLOCK_K // cfg.DIV_FACTOR_W
+    return gl.amd.cdna5.tdm.make_tensor_descriptor(
+        base=w_tile_ptr,
+        shape=((K // cfg.BLOCK_K - 1) * cfg.W_KPLANE_ROWS + N, PLANE_BYTES),
+        strides=(PLANE_BYTES, 1),
+        block_shape=(cfg.BLOCK_N, PLANE_BYTES),
+        layout=cfg.shared_layout_w,
+    )
+
+
+@gluon.jit
 def create_descriptor(
     cfg: MoEConfig,
     x_ptr,
@@ -656,7 +682,9 @@ def create_descriptor(
         else:
             x_scale_desc = gl.constexpr(0)
 
-    if cfg.W_TRANSPOSE:
+    if cfg.W_KPLANE_ROWS:
+        w_desc = make_kplane_w_descriptor(cfg, w_ptr + w_offs, N, K)
+    elif cfg.W_TRANSPOSE:
         w_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
             base=w_ptr + w_offs,
             shape=(N, K // cfg.DIV_FACTOR_W),
@@ -713,7 +741,9 @@ class MoEProgramBase:
         # descriptor.
         cfg = self.cfg
         BLOCK_K_PACKED_W: gl.constexpr = cfg.BLOCK_K // cfg.DIV_FACTOR_W
-        if cfg.W_TRANSPOSE:
+        if cfg.W_KPLANE_ROWS:
+            add_offsets = [load_idx * cfg.W_KPLANE_ROWS, 0]
+        elif cfg.W_TRANSPOSE:
             add_offsets = [0, load_idx * BLOCK_K_PACKED_W]
         else:
             add_offsets = [load_idx * BLOCK_K_PACKED_W, 0]
@@ -790,7 +820,15 @@ class MoEProgramBase:
                 ]
             )
         elif not cfg.FUSE_X_W:
-            if cfg.W_TRANSPOSE:
+            if cfg.W_KPLANE_ROWS:
+                gl.amd.cdna5.tdm.async_load(
+                    self.w_desc,
+                    [load_idx * cfg.W_KPLANE_ROWS, 0],
+                    self.w_buffer.index(load_idx % cfg.NUM_BUFFERS),
+                    pred=pred,
+                    warp_used_hint=cfg.TDM_WARP_USED_HINT_W,
+                )
+            elif cfg.W_TRANSPOSE:
                 gl.amd.cdna5.tdm.async_load(
                     self.w_desc,
                     [0, load_idx * BLOCK_K_PACKED_W],

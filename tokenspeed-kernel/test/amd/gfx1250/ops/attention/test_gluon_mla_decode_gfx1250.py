@@ -39,6 +39,7 @@ from tokenspeed_kernel.ops.attention.mla import (  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.decode import (  # noqa: E402
     _mla_decode_fwd_kernel,
     _mla_decode_fwd_reduce_kernel,
+    _query_block_shape,
     _select_num_kv_splits,
 )
 
@@ -121,8 +122,11 @@ def _relative_error(actual, expected):
             torch.float8_e4m3fn,
             id="k3-tp8-fp8",
         ),
-        # One request takes the 128-split cap, two or three pages per split.
+        # One request takes the 128-split cap, two or three pages per split,
+        # in two 32-row query blocks whose warps split the keys.
         pytest.param(12, 4, [16385], torch.float8_e4m3fn, id="k3-tp8-fp8-128-splits"),
+        # One long request in two-query halves, as in Kimi K3's c1 decode.
+        pytest.param(12, 4, [50_250], torch.float8_e4m3fn, id="k3-tp8-fp8-c1-50k"),
         pytest.param(12, 4, [129, 4097], torch.bfloat16, id="k3-tp8-bf16"),
         # 16 and 32 rows per block.
         pytest.param(4, 4, [4, 1025, 4097], torch.float8_e4m3fn, id="rows16"),
@@ -131,6 +135,22 @@ def _relative_error(actual, expected):
         pytest.param(16, 15, [15, 1025], torch.float8_e4m3fn, id="partial-block"),
         # Head blocks.
         pytest.param(128, 4, [1025, 4], torch.bfloat16, id="head-blocks"),
+        # Single-query EAGLE3 draft at TP8, one and sixteen requests: one
+        # 16-row block per request, its four warps splitting the keys.
+        pytest.param(8, 1, [50_250], torch.float8_e4m3fn, id="draft-c1"),
+        pytest.param(
+            8,
+            1,
+            [50_250 - 13 * i for i in range(16)],
+            torch.float8_e4m3fn,
+            id="draft-c16",
+        ),
+        # Lengths below a page and on page boundaries, with more splits than
+        # the shortest request has pages.
+        pytest.param(
+            12, 1, [1, 63, 64, 65, 4097], torch.float8_e4m3fn, id="draft-short"
+        ),
+        pytest.param(32, 1, [4097, 129], torch.float8_e4m3fn, id="draft-head-blocks"),
     ],
 )
 def test_query_block_mla_matches_reference(heads, queries, cache_lengths, dtype):
@@ -207,6 +227,7 @@ def test_query_block_mla_reuses_binaries_across_batch_and_table_width():
             num_q_programs=batch_size,
             max_seqlen_k=65_536,
             tile_size=_PAGE_SIZE,
+            two_per_cu=False,
         )
         for batch_size in (8, 5, 6, 7)
     }
@@ -221,17 +242,33 @@ def test_query_block_mla_reuses_binaries_across_batch_and_table_width():
 
 
 def test_query_block_mla_split_count_fills_cus():
-    def splits(requests):
+    def splits(programs, two_per_cu):
         return _select_num_kv_splits(
             num_sms=256,
-            num_q_programs=requests,
+            num_q_programs=programs,
             max_seqlen_k=65_536,
             tile_size=_PAGE_SIZE,
+            two_per_cu=two_per_cu,
         )
 
-    # Few requests spread up to 128 splits over the CUs; more requests double
-    # up to two programs per CU while every split keeps at least 12 pages.
-    assert [splits(n) for n in (1, 2, 4, 8, 16)] == [128, 128, 64, 64, 32]
+    # 64-row FP8 programs take one CU each, up to 128 splits.
+    assert [splits(n, False) for n in (1, 2, 4, 8, 16)] == [128, 128, 64, 32, 16]
+    # Smaller blocks double up to two programs per CU while every split keeps
+    # at least 12 pages.
+    assert [splits(n, True) for n in (1, 2, 4, 8, 16)] == [128, 128, 64, 64, 32]
+
+
+def test_query_block_shape_halves_blocks_for_idle_cus():
+    # Kimi K3 verify at TP8: 4 queries of 12 heads. One request at the
+    # 128-split cap fills only half of 256 CUs, so it runs as two halves of
+    # two queries each; two requests already fill them.
+    assert _query_block_shape(12, 4, requests=1, num_sms=256) == (32, 2, 1)
+    assert _query_block_shape(12, 4, requests=2, num_sms=256) == (64, 5, 1)
+    assert _query_block_shape(12, 4) == (64, 5, 1)
+    # Halving stops at one query per block and never splits heads.
+    assert _query_block_shape(16, 2, requests=1, num_sms=256) == (16, 1, 1)
+    assert _query_block_shape(128, 4, requests=1, num_sms=256) == (64, 1, 2)
+    assert _query_block_shape(48, 4, requests=1, num_sms=256) == (64, 1, 1)
 
 
 def test_query_block_mla_projected_value_composes_on_query_axis():
@@ -279,3 +316,80 @@ def test_query_block_support_on_cdna5():
     assert not supports_mla_decode_query_blocks(
         q_len=4, sliding_window=False, **{**common, "noncausal_block_size": 4}
     )
+
+
+@pytest.mark.parametrize("use_gate", [False, True], ids=["no-gate", "gate"])
+@pytest.mark.parametrize(
+    "batch_size,cache_length",
+    # Kimi K3 verify at one request and 128 splits over a 50k context, and
+    # four requests at 64 splits.
+    [(1, 50_250), (4, 4097)],
+    ids=["c1-50k", "c4-4k"],
+)
+def test_query_block_projected_value_fuses_merge_and_projection(
+    batch_size: int, cache_length: int, use_gate: bool
+) -> None:
+    from tokenspeed_kernel.workspace import capture_session
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.mla.decode import (
+        launch_gluon_mla_decode_query_blocks_projected_value_gfx1250,
+    )
+
+    heads, queries, value_dim = 12, 4, 128
+    q, cache, table, lengths = _make_inputs(
+        [cache_length + 31 * i for i in range(batch_size)], heads, queries
+    )
+    gen = torch.Generator(device="cuda").manual_seed(1)
+    weights = (
+        torch.randn(heads, _KV_LORA_RANK, value_dim, generator=gen, device="cuda")
+        / math.sqrt(_KV_LORA_RANK)
+    ).to(torch.bfloat16)
+    gate = (
+        torch.randn(
+            batch_size * queries, heads * value_dim, generator=gen, device="cuda"
+        ).to(torch.bfloat16)
+        if use_gate
+        else None
+    )
+    common = dict(
+        q=q,
+        kv_cache=cache,
+        page_table=table,
+        cache_seqlens=lengths,
+        max_seqlen_k=65_536,
+        qk_nope_head_dim=128,
+        kv_lora_rank=_KV_LORA_RANK,
+        qk_rope_head_dim=_ROPE_DIM,
+        softmax_scale=_SOFTMAX_SCALE,
+        value_weight=weights,
+        gate=gate,
+    )
+    shape = (batch_size * queries, heads * value_dim)
+    direct = torch.empty(shape, device="cuda", dtype=torch.bfloat16)
+    launch_gluon_mla_decode_query_blocks_projected_value_gfx1250(**common, out=direct)
+    dispatched = torch.empty_like(direct)
+    mla_decode_with_kvcache(**common, out=dispatched)
+    # A solution pin keeps the unfused latent decode, merge and projection.
+    composed = torch.empty_like(direct)
+    mla_decode_with_kvcache(**common, out=composed, solution="gluon")
+
+    torch.testing.assert_close(dispatched, direct, atol=0, rtol=0)
+    # Only the order of the FP32 projection sum differs from the composition,
+    # which can move a BF16 rounding by one step.
+    torch.testing.assert_close(direct, composed, atol=1e-5, rtol=2**-7)
+    reference, _ = _reference(q, cache, table, lengths)
+    projected = torch.einsum("bqhd,hdv->bqhv", reference, weights.float())
+    expected = projected.reshape(shape)
+    if gate is not None:
+        expected = expected * torch.sigmoid(gate.float())
+    assert _relative_error(direct, expected) < 0.05
+
+    # Replays reuse the arrival counters, which each launch leaves zeroed.
+    graph = torch.cuda.CUDAGraph()
+    replayed = torch.empty_like(direct)
+    with capture_session(graph), torch.cuda.graph(graph):
+        mla_decode_with_kvcache(**common, out=replayed)
+    for _ in range(3):
+        replayed.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(replayed, direct, atol=0, rtol=0)
