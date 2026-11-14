@@ -347,3 +347,16 @@ def test_view_written_in_place_matches_nccl(m):
     capacity = multimem._BUFFERS[(dev.index, HIDDEN, _group_name())].shape[0]
     assert multimem.multimem_view(capacity + 1, HIDDEN, _group_name()) is None
     dist.barrier()
+
+
+def test_a_tensor_outside_the_staging_buffer_is_refused():
+    """The multicast offset only means something inside the current buffer."""
+    from tokenspeed_kernel.ops.communication import multimem
+
+    _setup()
+    _require_multimem()
+    assert multimem.multimem_prealloc(8192, (HIDDEN,), _group_name())
+    view = multimem.multimem_view(16, HIDDEN, _group_name())
+    with pytest.raises(RuntimeError, match="view of the current staging buffer"):
+        multimem.multimem_all_reduce_staged(view.clone(), _group_name())
+    dist.barrier()

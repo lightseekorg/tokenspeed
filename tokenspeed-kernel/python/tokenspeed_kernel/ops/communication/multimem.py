@@ -189,9 +189,22 @@ def multimem_all_reduce_staged(view: torch.Tensor, group_name: str) -> torch.Ten
 
     Returns:
         The reduced view (same storage as the input).
+
+    Raises:
+        RuntimeError: ``view`` is not a contiguous view of the current staging
+            buffer (a tensor of its own, or a view of a buffer since replaced).
     """
     key = (view.device.index, view.shape[1], group_name)
     buf, handle = _BUFFERS[key], _HANDLES[key]
+    # The multicast offset is only meaningful inside the current buffer.
+    if (
+        view.untyped_storage().data_ptr() != buf.untyped_storage().data_ptr()
+        or not view.is_contiguous()
+    ):
+        raise RuntimeError(
+            "multimem_all_reduce_staged takes a contiguous view of the current "
+            "staging buffer"
+        )
     nvidia_multimem_all_reduce(
         handle.multicast_ptr + view.data_ptr() - buf.data_ptr(),
         handle.signal_pad_ptrs_dev,
