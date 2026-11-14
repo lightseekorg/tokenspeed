@@ -1420,6 +1420,75 @@ def test_flashinfer_mtp_preserves_fp16_output_dtype(device: str, require) -> Non
     torch.testing.assert_close(actual, expected)
 
 
+@pytest.mark.parametrize(("num_v_heads", "batch"), [(8, 1), (8, 3), (32, 8)])
+@pytest.mark.parametrize("scatter", [False, True])
+def test_flashinfer_mtp_reads_conv_rows_and_projection_gates(
+    device: str, num_v_heads: int, batch: int, scatter: bool, require
+) -> None:
+    """FlashInfer's FP32 verify reads q/k/v as sections of dense conv-output rows
+    and a/b as views into the projection row (16-byte aligned at 8 value heads)
+    exactly as contiguous copies. B * HV reaches its inline and warp kernels."""
+    require("attention", "gdn_decode_mtp", "flashinfer", torch.bfloat16, "q")
+    steps, dim = 4, 128
+    num_q_heads = num_v_heads // 2
+    key_width, value_width = num_q_heads * dim, num_v_heads * dim
+    rows = batch * steps
+    torch.manual_seed(5)
+    conv_rows = torch.randn(
+        rows, 2 * key_width + value_width, device=device, dtype=torch.bfloat16
+    )
+    # The input projection row: q | k | v | z | b | a.
+    projection = torch.randn(
+        rows,
+        2 * key_width + 2 * value_width + 2 * num_v_heads,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    b, a = projection[:, 2 * key_width + 2 * value_width :].split(num_v_heads, -1)
+    q, k, v = conv_rows.split([key_width, key_width, value_width], dim=-1)
+    views = (
+        q.view(batch, steps, num_q_heads, dim),
+        k.view(batch, steps, num_q_heads, dim),
+        v.view(batch, steps, num_v_heads, dim),
+        a.view(batch, steps, num_v_heads),
+        b.view(batch, steps, num_v_heads),
+    )
+    assert not any(t.is_contiguous() for t in views)
+    A_log = torch.randn(num_v_heads, device=device)
+    dt_bias = torch.randn(num_v_heads, device=device)
+    pool = torch.randn(batch * (steps + 1), num_v_heads, dim, dim, device=device) * 0.02
+    read_rows = torch.arange(batch, dtype=torch.int32, device=device) * (steps + 1)
+    write_rows = (
+        read_rows[:, None] + 1 + torch.arange(steps, dtype=torch.int32, device=device)
+    ).contiguous()
+
+    def verify(q, k, v, a, b):
+        state = pool.clone()
+        out = gdn_decode_mtp(
+            q,
+            k,
+            v,
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            b=b,
+            initial_state=state,
+            initial_state_indices=read_rows,
+            scale=None,
+            disable_state_update=not scatter,
+            use_qk_l2norm=True,
+            output_state_indices=write_rows if scatter else None,
+            tree_ancestors=None,
+            solution="flashinfer",
+        )
+        return out, state
+
+    out, state = verify(*views)
+    dense_out, dense_state = verify(*(t.contiguous() for t in views))
+    assert torch.equal(out, dense_out)
+    assert torch.equal(state, dense_state)
+
+
 @pytest.mark.parametrize("solution", ["triton", "gluon"])
 @pytest.mark.parametrize(
     ("op", "steps"),

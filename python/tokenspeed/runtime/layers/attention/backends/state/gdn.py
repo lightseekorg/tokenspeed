@@ -67,6 +67,7 @@ class GdnAttnBackend(CapacityPrefillBackend):
     # The scan reads its bounds on device, so packing would only add work to eager forwards.
     _capacity_layout_when_uncaptured = False
     _verify_scan_writes_replay = True
+    _verify_conv_writes_rows = True
 
     def __init__(
         self,
@@ -186,6 +187,7 @@ class GdnAttnBackend(CapacityPrefillBackend):
         a: torch.Tensor | None,
         b: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-        # Projection views to the dense, aligned rows FlashInfer's kernels need;
-        # skipped where the selected kernels read the views by stride.
+        # Single-token decode: projection views to the dense, aligned rows
+        # FlashInfer's kernel needs; skipped where the selected kernel reads the
+        # views by stride. A chain verify's conv update writes dense rows instead.
         return pack_gdn_projection(mixed_qkv, a, b)

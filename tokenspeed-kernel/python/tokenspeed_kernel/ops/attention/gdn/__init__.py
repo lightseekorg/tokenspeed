@@ -639,7 +639,9 @@ def gdn_decode_mtp(
         v: Value tensor shaped ``[B, T, num_v_heads, head_v_dim]``.
         A_log: Floating-point log decay parameter shaped ``[num_v_heads]``.
             Backends that require FP32 normalize it internally.
-        a: Input-dependent decay shaped ``[B, T, num_v_heads]``.
+        a: Input-dependent decay shaped ``[B, T, num_v_heads]``. Its rows may
+            be spaced wider (views into a projection row); every solution reads
+            a and b by stride.
         dt_bias: Floating-point decay bias shaped ``[num_v_heads]``. Backends
             that require FP32 normalize it internally.
         b: Update-gate (beta) input shaped ``[B, T, num_v_heads]``.
