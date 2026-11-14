@@ -47,6 +47,12 @@ def ordered(score):
     return key if score == score else Uint32(0)
 
 
+@cute.jit
+def nan_to_zero(score):
+    """``score``, or 0 for NaN, so a NaN row ranks by bias like a real row."""
+    return score if score == score else c.Float32(0)
+
+
 class RouteSitu:
     def __init__(self, batch, shared, renorm, early, roles, polled, plan=False):  # fmt: skip
         # Polled logits skip the front's completion wait at every row count.
@@ -229,7 +235,7 @@ class RouteSitu:
                 rearm(cell)
                 for i in c.range_constexpr(4):
                     raw[i] = bits_float(got[0, i])
-                scores = [sigmoid(raw[i]) for i in range(4)]
+                scores = [nan_to_zero(sigmoid(raw[i])) for i in range(4)]
                 for i in c.range_constexpr(4):
                     sig[4 * tid + i] = scores[i]
                     key[i] = ordered(scores[i] + offsets[i])
@@ -238,7 +244,7 @@ class RouteSitu:
             for i in c.range_constexpr(4):
                 expert = self.expert(tid, i)
                 if expert < self.experts:
-                    score = sigmoid(logits[token, expert])
+                    score = nan_to_zero(sigmoid(logits[token, expert]))
                     sig[expert] = score
                     key[i] = ordered(score + offsets[i])
         for i in c.range_constexpr(4):
