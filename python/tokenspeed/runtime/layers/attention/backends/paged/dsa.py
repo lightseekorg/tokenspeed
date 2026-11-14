@@ -46,7 +46,7 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+from tokenspeed.runtime.execution.query_shard import QueryShardPlan, scatter_count
 from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
 )
@@ -89,6 +89,10 @@ from tokenspeed.runtime.layers.attention.kv_cache.dsa import split_index_k_rows
 from tokenspeed.runtime.layers.attention.page_table import (
     build_prefill_kv_workspace_slots,
 )
+from tokenspeed.runtime.layers.attention.prefill_head_exchange import (
+    exchange_query_rows_padded,
+    return_head_rows,
+)
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
@@ -102,6 +106,10 @@ _LOGGED_SPARSE_LEAVES: set[tuple] = set()
 
 # Owned-width KVP index tiles span whole groups of this many pages, so tile widths take few values.
 _OWNED_INDEX_COLUMN_ALIGN = 16
+
+# Sparse prefills of at least this many rows attend every head on a row shard;
+# on GB300 at TP8 the exchanges cost less than the core saves above ~3k rows.
+_ROW_SHARD_MIN_ROWS = 4096
 
 
 def _priority_band(name: str) -> str:
@@ -269,6 +277,8 @@ class DSABackend(PagedAttentionBackend):
         # rank alone) and lands in a workspace sized for one whole history.
         self.qcp_group = tuple(config.qcp_group)
         self.qcp_rank = config.qcp_rank
+        self.attn_tp_group = tuple(config.attn_tp_group)
+        self.attn_tp_rank = config.attn_tp_rank
         if len(self.qcp_group) > 1 and spec.index_kpool is not None:
             raise ValueError("DSA query context parallelism does not support KPool")
         self.index_head_dim = spec.index_head_dim
@@ -308,6 +318,18 @@ class DSABackend(PagedAttentionBackend):
         self._non_bitwise_decode_escape: bool = (
             self.batch_invariant
             and os.environ.get("TS_DSA_ALLOW_NON_BITWISE_DECODE") == "1"
+        )
+        # With replicated KV a long sparse prefill hands each attention-TP rank
+        # a row shard with every head, so the trtllm-gen core reads each
+        # selected KV row once for all heads instead of once per rank.
+        self._row_shard_prefill: bool = (
+            platform.is_nvidia
+            and not self.batch_invariant
+            and spec.attn_tp_size > 1
+            and len(self.attn_tp_group) == spec.attn_tp_size
+            and len(self.kvp_group) == 1
+            and len(self.qcp_group) == 1
+            and self.num_attention_heads <= 128
         )
         if self._non_bitwise_decode_escape:
             logger.warning(
@@ -1582,6 +1604,28 @@ class DSABackend(PagedAttentionBackend):
                 "DSA sparse prefill physical length mismatch: "
                 f"lens={tuple(kv_seq_lens.shape)}, q_tokens={q.shape[0]}"
             )
+        if (
+            self._row_shard_prefill
+            and heads == self.num_local_heads
+            and q.shape[0] >= _ROW_SHARD_MIN_ROWS
+        ):
+            if topk_slots.dim() != 2 or topk_slots.shape[1] <= 0:
+                raise RuntimeError(
+                    "DSA sparse prefill top-k shape mismatch: "
+                    f"indices={tuple(topk_slots.shape)}"
+                )
+            out = self._forward_row_shard_sparse_prefill(
+                q_view=q.view(q.shape[0], heads, layer.head_dim),
+                layer=layer,
+                token_to_kv_pool=token_to_kv_pool,
+                kv_seq_lens=kv_seq_lens,
+                topk_slots=topk_slots,
+                topk_lens=topk_lens,
+                max_seq_len=max_seq_len,
+            )
+            if self.step_counter is not None:
+                self.step_counter.record_cache()
+            return out.reshape(-1, heads * layer.v_head_dim)
         if self.query_shard_metadata is not None:
             # A rank without rows still joins every group's gather, so the
             # sharded arm runs before the empty-query return.
@@ -1714,6 +1758,74 @@ class DSABackend(PagedAttentionBackend):
         if self.step_counter is not None:
             self.step_counter.record_cache()
         return out.reshape(-1, heads * layer.v_head_dim)
+
+    def _forward_row_shard_sparse_prefill(
+        self,
+        *,
+        q_view: torch.Tensor,
+        layer,
+        token_to_kv_pool,
+        kv_seq_lens: torch.Tensor | None,
+        topk_slots: torch.Tensor,
+        topk_lens: torch.Tensor,
+        max_seq_len: int,
+    ) -> torch.Tensor:
+        """Attend this rank's row shard with every head, return its heads of every row.
+
+        The query exchange hands each attention-TP rank its rows with every
+        rank's heads, padded to the core's head count; the inverse exchange
+        hands each rank its heads of every row back. Pure data movement around
+        the same per-head attention over the same selected slots.
+
+        Args:
+            q_view: ``[rows, local heads, head_dim]`` query of every row.
+            layer: The attention layer.
+            token_to_kv_pool: The KV pool holding the latent rows.
+            kv_seq_lens: Optional per-row physical KV lengths.
+            topk_slots: ``[rows, topk]`` selected global slots of every row.
+            topk_lens: ``[rows]`` valid selected slots per row.
+            max_seq_len: Longest visible context of the batch.
+
+        Returns:
+            ``[rows, local heads, kv_lora_rank]`` attention output.
+        """
+        if self.data_type == torch.float8_e4m3fn and q_view.dtype != self.data_type:
+            q_view = q_view.to(self.data_type)
+        group = self.attn_tp_group
+        counts = scatter_count(q_view.shape[0], len(group))
+        start = sum(counts[: self.attn_tp_rank])
+        rows = slice(start, start + counts[self.attn_tp_rank])
+        core_heads = trtllm_sparse_mla_query_heads(self.num_attention_heads)
+        out = dsa_prefill(
+            q=exchange_query_rows_padded(q_view, group, counts, core_heads),
+            kv_cache=token_to_kv_pool.get_key_buffer(layer.layer_id),
+            sparse_kv_cache=None,
+            topk_slots=topk_slots[rows],
+            topk_lens=topk_lens[rows].to(dtype=torch.int32).contiguous(),
+            kv_seq_lens=(
+                None
+                if kv_seq_lens is None
+                else kv_seq_lens[rows].to(dtype=torch.int32).contiguous()
+            ),
+            max_seqlen_k=max_seq_len,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            softmax_scale=layer.scaling,
+            page_size=self.kernel_page_size,
+            logit_cap=layer.logit_cap,
+            k_scale=1.0,
+            return_lse=False,
+            solution=self.kernel_solution,
+            kernel_plan=self.prefill_kernel_plan,
+            slot_order=self.slot_order,
+        )
+        return return_head_rows(
+            out.view(-1, core_heads, self.kv_lora_rank),
+            self.num_local_heads,
+            group,
+            counts,
+        )
 
     def _forward_dcp_records_prefill(
         self,

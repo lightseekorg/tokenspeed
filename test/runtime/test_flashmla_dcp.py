@@ -864,6 +864,7 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(
     backend.kvp_rank = rank
     backend.kvp_block_granularity = 64
     backend.kvp_virtual_block_count = 5
+    backend._row_shard_prefill = False
     backend.qcp_group = (0,)
     # The layer holds the attention-TP slice (2 of 8 heads): the sharded-head
     # combine form.
@@ -972,6 +973,7 @@ def test_dsa_prefill_partitions_candidates_and_merges_gathered_heads(
     backend.kvp_rank = rank
     backend.kvp_block_granularity = 64
     backend.kvp_virtual_block_count = 5
+    backend._row_shard_prefill = False
     backend.query_shard_metadata = None
     backend.step_counter = None
     backend.kvp_prefill_query_layout = arm != "query_layout_off"
