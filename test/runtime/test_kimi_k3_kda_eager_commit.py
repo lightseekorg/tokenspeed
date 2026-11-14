@@ -1615,9 +1615,12 @@ def test_record_decode_preserves_raw_gate_bias_and_layer_subset(
             )
 
 
+@pytest.mark.parametrize("checkpoint", [False, True])
 @pytest.mark.parametrize("draft_tokens", [None, 4])
-def test_mixed_decode_commit_matches_separate_forwards(draft_tokens):
+def test_mixed_decode_commit_matches_separate_forwards(draft_tokens, checkpoint):
     # Prefill consumes the full cache field, including every per-rank head.
+    # With ``checkpoint`` the extend row also stores its state 128 tokens in,
+    # into a third block, as an EXTEND forward of it alone does.
     class _FullWidthHarness(_Harness):
         H = 12
 
@@ -1625,8 +1628,9 @@ def test_mixed_decode_commit_matches_separate_forwards(draft_tokens):
     reference = _FullWidthHarness(
         draft_tokens=draft_tokens, eager_replay=True, seed=941
     )
-    width, prompt = actual.width, 3
+    width, prompt = actual.width, 200 if checkpoint else 3
     pages = {group: [2 + 2 * i, 3 + 2 * i] for i, group in enumerate(_STATE_GROUPS)}
+    stores = {group: 8 + i for i, group in enumerate(_STATE_GROUPS)}
     inputs = {
         name: value[: prompt + width]
         for name, value in actual.inputs(prompt + width, 943).items()
@@ -1641,6 +1645,11 @@ def test_mixed_decode_commit_matches_separate_forwards(draft_tokens):
             group: np.asarray([[0, page] for page in ids[:bs]], dtype=np.int32)
             for group, ids in pages.items()
         }
+        if checkpoint:
+            tables = {
+                group: np.column_stack((rows, [stores[group], -1][:bs]))
+                for group, rows in tables.items()
+            }
         harness.backend.init_forward_metadata(
             bs,
             1,
@@ -1655,6 +1664,9 @@ def test_mixed_decode_commit_matches_separate_forwards(draft_tokens):
             extend_replay_lens_cpu=prefix_cpu,
             extend_prompt_lens_cpu=new_cpu,
             extend_with_prefix=False,
+            extend_state_checkpoint_lens_cpu=torch.tensor(
+                [128 if checkpoint else 0], dtype=torch.int32
+            ),
             query_shard=None,
         )
 
@@ -1724,6 +1736,10 @@ def test_mixed_decode_commit_matches_separate_forwards(draft_tokens):
         expected = torch.cat((prefill, decode.reshape(-1, actual.H, D)))
         torch.testing.assert_close(output, expected, atol=2e-3, rtol=2e-3)
         for component in ("conv_state", "recurrent_state"):
+            stored = actual.pool.get_component(layer, component)[
+                stores[actual.pool.state_group_by_layer[layer]]
+            ]
+            assert bool(stored.any()) == checkpoint
             torch.testing.assert_close(
                 actual.pool.get_component(layer, component),
                 reference.pool.get_component(layer, component),
