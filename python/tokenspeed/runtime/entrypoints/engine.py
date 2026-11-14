@@ -349,9 +349,10 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
     kv_bootstrap_server = None
     metrics_relay = None
 
-    # SIGUSR1 reports a child's internal failure (a rank's host sends it as
-    # it fails), so record the failure here: an exit status alone may not
-    # tell the supervisor.
+    # A failing rank's Rust host sends SIGUSR1. SIGQUIT retains the failure
+    # exit from register_child_failure_signals (including Ctrl-\);
+    # SIGTERM and SIGINT request a clean stop. Record failure here because
+    # a child's exit status alone may not tell the supervisor.
     child_failed = False
     shutdown_signal = None
     # When the first termination was requested; schedulers still running a

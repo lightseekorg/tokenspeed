@@ -49,6 +49,7 @@ from __future__ import annotations
 import faulthandler
 import functools
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -257,6 +258,38 @@ class HostProcess:
             self._popen.kill()
 
 
+def _merge_memory_saver_preload(inherited: str, configured: str) -> str:
+    def paths(value: str) -> list[str]:
+        return [path for path in re.split(r"[:\s]+", value) if path]
+
+    def is_hook(path: str) -> bool:
+        # Match the allocator's preload library, not a directory or another DSO.
+        return (
+            re.fullmatch(
+                r"torch_memory_saver_(?:hook_mode_preload(?:_[\w-]+)?|cpp)(?:\.[\w-]+)*\.so(?:\.\d+)*",
+                os.path.basename(path),
+            )
+            is not None
+        )
+
+    parent_paths, context_paths = paths(inherited), paths(configured)
+    explicit_hook = any(is_hook(path) for path in parent_paths)
+    selected = parent_paths if explicit_hook else context_paths
+    if len({path for path in selected if is_hook(path)}) > 1:
+        raise ValueError("LD_PRELOAD names multiple memory-saver preload hooks")
+    merged = []
+    for path in selected:
+        if not is_hook(path) or path not in merged:
+            merged.append(path)
+    if explicit_hook:
+        # Keep the explicit hook and parent order, plus the context's other DSOs.
+        # Its automatic hook may differ and must not load a second allocator.
+        for path in context_paths:
+            if not is_hook(path) and path not in merged:
+                merged.append(path)
+    return ":".join(merged)
+
+
 def start_rust_host(
     binary: str,
     server_args: ServerArgs,
@@ -290,8 +323,6 @@ def start_rust_host(
     Returns:
         The process and the launcher's end of the pipe.
     """
-    parent, child = Pipe(duplex=True)
-    sentinel, held_until_exit = os.pipe()
     preexec_fn = None
     if parent_death_signal:
         preexec_fn = functools.partial(set_parent_death_signal, os.getpid())
@@ -299,10 +330,11 @@ def start_rust_host(
     with start_context:
         # Capture the memory saver's preload and library paths while active.
         host_env = os.environ.copy()
-        if any("torch_memory_saver" in path for path in inherited_preload.split(":")):
-            # Keep an explicit allocator hook and its order. Older contexts
-            # replace it; newer ones prepend a second hook the allocator rejects.
-            host_env["LD_PRELOAD"] = inherited_preload
+        preload = _merge_memory_saver_preload(
+            inherited_preload, host_env.get("LD_PRELOAD", "")
+        )
+        if preload or "LD_PRELOAD" in host_env:
+            host_env["LD_PRELOAD"] = preload
         # Set each native writer's fallback before the host initializes logging.
         level = server_args.log_level.lower()
         host_env.setdefault(
@@ -322,6 +354,9 @@ def start_rust_host(
                 "notset": "trace",
             }.get(level, level),
         )
+        # Validate preload choices before creating any child pipe descriptors.
+        parent, child = Pipe(duplex=True)
+        sentinel, held_until_exit = os.pipe()
         popen = subprocess.Popen(
             [
                 (
@@ -1664,7 +1699,7 @@ ASCEND_MEMORY_PROTOCOL_STARTUP = True
 
 
 def prepare_bootstrap(
-    control_fd: int, *, validate_memory_protocol: bool = False
+    control_fd: int, *, validate_memory_protocol: bool
 ) -> tuple[bool, Callable[..., HostBootstrap | EncodeBootstrap]]:
     """Read the launcher arguments and return the memory capability and rank starter."""
     connection = Connection(control_fd)
@@ -1710,7 +1745,7 @@ def bootstrap(
 
     The host may pass span recording for profiles. Older binaries omit it.
     """
-    _, start = prepare_bootstrap(control_fd)
+    _, start = prepare_bootstrap(control_fd, validate_memory_protocol=False)
     return start(pd_outbox, weight_update_commit_protocol, host_spans)
 
 
