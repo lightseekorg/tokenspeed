@@ -14,7 +14,8 @@ their shape and backend traits match.
 or `cudaHostRegister`ed host memory through a device-visible pointer. Random
 rows are bound by address translation, one host page per row, rather than by
 PCIe bytes, so a table that needs several fields per row should keep them in
-one packed row. `mxfp8_row_gather` reads `[D E4M3 codes | D/32 UE8M0 scales]`
+one packed row and gather it whole: a gather per column view translates every
+row again. `mxfp8_row_gather` reads `[D E4M3 codes | D/32 UE8M0 scales]`
 rows and writes them as a GEMM's group-32 MXFP8 activation: the codes and
 canonical scales that quantizing the dequantized BF16 rows (1e-4 amax floor)
 would produce, without materializing BF16.
