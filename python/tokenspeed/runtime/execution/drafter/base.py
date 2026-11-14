@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from abc import abstractmethod
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -311,6 +311,30 @@ class BaseDrafter:
         Args:
             ctx: The target forward's context.
         """
+
+    def decode_graph_query_capacities(self, bs: int) -> tuple[int, ...]:
+        """Physical target row capacities for one request-capacity bucket."""
+        return (bs * self.spec_num_tokens,)
+
+    def prepare_decode_graph_token_layout(
+        self, ctx: ForwardContext, *, actual_bs: int, padded_bs: int
+    ) -> int:
+        """Retain the native fixed-width layout unless the drafter packs queries."""
+        return padded_bs * self.spec_num_tokens
+
+    def prepare_decode_graph_token_capture_layout(
+        self, *, bs: int, query_tokens: int
+    ) -> None:
+        """Validate the native target extent before graph warmup/capture."""
+        if query_tokens != bs * self.spec_num_tokens:
+            raise ValueError("native verification requires the full query capacity")
+
+    def set_decode_graph_query_extent(self, num_tokens: int | None) -> None:
+        """Select physical target extent for capture; None restores eager policy."""
+
+    def target_forward_context(self, ctx: ForwardContext) -> AbstractContextManager:
+        """Lend temporary model inputs; restore them before sampling and commit."""
+        return nullcontext()
 
     def on_target_weights_updated(self) -> None:
         """Refresh draft-side state derived from shared target weights.

@@ -1725,6 +1725,14 @@ class ModelExecutor:
         num_decodes = ctx.bs - ctx.num_extends
         if num_decodes == 0:
             return None
+        if ctx.decode_query_indptr is not None:
+            from tokenspeed.runtime.execution.drafter.deepseek_v41_dspark import (
+                DeepseekV41DSpark,
+            )
+
+            if not isinstance(self.drafter, DeepseekV41DSpark):
+                raise ValueError("packed candidates require the V4.1 drafter")
+            return self.drafter.verify_candidates()
         n = self.config.output_length
         num_prefill_tokens = ctx.input_num_tokens - num_decodes * n
         return self.input_buffers.input_ids_buf[
@@ -1818,6 +1826,17 @@ class ModelExecutor:
                 )
             return sampled
         if num_extends == 0:
+            packed_kwargs = {}
+            if ctx.decode_query_indptr is not None:
+                from tokenspeed.runtime.sampling.backends.greedy import (
+                    GreedySamplingBackend,
+                )
+
+                if not isinstance(self.sampling_backend, GreedySamplingBackend):
+                    raise ValueError(
+                        "packed decode requires the greedy sampling backend"
+                    )
+                packed_kwargs["query_start_loc"] = ctx.decode_query_indptr
             output_tokens, accept_lengths = self.sampling_backend.verify(
                 logits_output,
                 sampling_info,
@@ -1831,6 +1850,7 @@ class ModelExecutor:
                         draft_q=self.runtime_states.future_draft_q,
                     )
                 ),
+                **packed_kwargs,
             )
             accept_lengths = self._finish_decode_verify(
                 output_tokens, accept_lengths, candidates, 0, ctx.decode_input_ids
@@ -1996,7 +2016,11 @@ class ModelExecutor:
         if self.drafter is not None:
             self.drafter.prepare_target_forward(ctx)
 
-        logits_output = self._run_target_forward(ctx)
+        if self.drafter is None:
+            logits_output = self._run_target_forward(ctx)
+        else:
+            with self.drafter.target_forward_context(ctx):
+                logits_output = self._run_target_forward(ctx)
 
         if self.config.pp_size > 1 and not self._pp_is_last_stage:
             # Mid-pipeline stage: the model returned the boundary bundle, not

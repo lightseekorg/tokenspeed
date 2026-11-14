@@ -438,6 +438,8 @@ class ForwardStepRunner:
         self.output_buffers: dict[tuple[str, int], tuple] = {}
         # The padded batch the last call replayed a decode graph at (None: eager).
         self.last_graph_bs: int | None = None
+        self._reported_query_graphs: set[tuple[str, int, int | None]] = set()
+        self._decode_query_tokens: int | None = None
         # TOKENSPEED_GRAPH_DEBUG=1: capture-time tensor-identity snapshots,
         # re-verified before every replay (graph_ptr_guard). Off by default —
         # replays then pay a single bool check.
@@ -522,9 +524,11 @@ class ForwardStepRunner:
         if self.disable:
             return {}
         ladder = sorted(self.capture_bs, reverse=True)
-        return {
-            variant: list(ladder) for variant in self._cuda_graph_capture_variants()
-        }
+        plan: dict[str, list[int]] = {}
+        for bs in ladder:
+            for variant in self._cuda_graph_capture_variants(bs):
+                plan.setdefault(variant, []).append(bs)
+        return plan
 
     def capture_ladders(self, entries: int | None) -> dict[str, CapturedLadder]:
         """Each variant's batch sizes off the plan, and the positions ``entries`` samples.
@@ -553,19 +557,45 @@ class ForwardStepRunner:
         self.graphs.clear()
         self.output_buffers.clear()
         self._metadata_snapshots.clear()
+        self._reported_query_graphs.clear()
         # The tables name no arena; only the graphs and their pool go.
         global_graph_memory_pool = None
 
-    def _cuda_graph_capture_variants(self) -> tuple[str, ...]:
-        if self.sampling_backend is None:
-            return (CUDA_GRAPH_VARIANT_DEFAULT,)
-        variants = self.sampling_backend.cuda_graph_capture_variants(
-            self.max_tokens_per_req
+    def _cuda_graph_capture_variants(self, bs: int) -> tuple[str, ...]:
+        variants = (CUDA_GRAPH_VARIANT_DEFAULT,)
+        if self.sampling_backend is not None:
+            variants = tuple(
+                dict.fromkeys(
+                    (
+                        CUDA_GRAPH_VARIANT_DEFAULT,
+                        *self.sampling_backend.cuda_graph_capture_variants(
+                            self.max_tokens_per_req
+                        ),
+                    )
+                )
+            )
+        drafter = self.drafter
+        capacities = (
+            (bs * self.max_tokens_per_req,)
+            if drafter is None
+            else drafter.decode_graph_query_capacities(bs)
         )
-        if not variants:
-            return (CUDA_GRAPH_VARIANT_DEFAULT,)
-        deduped = tuple(dict.fromkeys((CUDA_GRAPH_VARIANT_DEFAULT, *variants)))
-        return deduped
+        return tuple(
+            self._query_variant(v, capacity, bs)
+            for capacity in reversed(capacities)
+            for v in variants
+        )
+
+    def _query_variant(self, variant: str, query_tokens: int, bs: int) -> str:
+        return (
+            variant
+            if query_tokens == bs * self.max_tokens_per_req
+            else f"{variant}:query{query_tokens}"
+        )
+
+    def _split_query_variant(self, variant: str, bs: int) -> tuple[str, int]:
+        base, sep, tokens = variant.rpartition(":query")
+        return (base, int(tokens)) if sep else (variant, bs * self.max_tokens_per_req)
 
     def _prepare_sampling_capture(self, bs: int, variant: str) -> None:
         if self.sampling_backend is None:
@@ -573,7 +603,7 @@ class ForwardStepRunner:
         self.sampling_backend.prepare_capture_variant(
             bs=bs,
             num_tokens_per_req=self.max_tokens_per_req,
-            variant=variant,
+            variant=self._split_query_variant(variant, bs)[0],
         )
 
     def _cuda_graph_replay_variant(self) -> str:
@@ -582,7 +612,11 @@ class ForwardStepRunner:
         return self.sampling_backend.cuda_graph_replay_variant(self.max_tokens_per_req)
 
     def _cuda_graph_key(self, bs: int) -> tuple[str, int]:
-        variant = self._cuda_graph_replay_variant()
+        variant = self._query_variant(
+            self._cuda_graph_replay_variant(),
+            self._decode_query_tokens or bs * self.max_tokens_per_req,
+            bs,
+        )
         key = (variant, bs)
         if key in self.graphs:
             return key
@@ -730,6 +764,21 @@ class ForwardStepRunner:
             grammar_backend=self.grammar_backend,
         )
 
+        _, query_tokens = self._split_query_variant(variant, bs)
+        adaptive_layout = (
+            self.drafter is not None and query_tokens < bs * self.max_tokens_per_req
+        )
+        if adaptive_layout:
+            # Select the layout outside the graph. Runtime replay updates the
+            # same storage, while every graph records a fixed physical extent.
+            self.drafter.prepare_decode_graph_token_capture_layout(
+                bs=bs, query_tokens=query_tokens
+            )
+        if self.drafter is not None:
+            # Full capacity explicitly captures the native layout. None means
+            # eager policy selection and must not be used during graph capture.
+            self.drafter.set_decode_graph_query_extent(query_tokens)
+
         def run_once():
             # Dummy add_batch keeps grammar batches 1:1 with replays: the
             # host node pops one batch per forward.
@@ -831,6 +880,8 @@ class ForwardStepRunner:
                 snapshots["draft"] = snapshot_graph_metadata(self.draft_attn_backend)
             self._metadata_snapshots[(variant, bs)] = snapshots
 
+        if self.drafter is not None:
+            self.drafter.set_decode_graph_query_extent(None)
         return graph, out
 
     def warmup_decode_path(
@@ -1266,6 +1317,12 @@ class ForwardStepRunner:
                 block_tables_cpu=block_tables_cpu,
             )
 
+        self._decode_query_tokens = None
+        if use_graph and self.drafter is not None:
+            self._decode_query_tokens = self.drafter.prepare_decode_graph_token_layout(
+                ctx, actual_bs=bs, padded_bs=padded_bs
+            )
+
         if use_graph:
             # Runtime prepare() is called by ModelExecutor with per-request rids
             # BEFORE self.forward_step — we don't refill here to avoid clobbering
@@ -1274,6 +1331,19 @@ class ForwardStepRunner:
 
             graph_key = self._cuda_graph_key(padded_bs)
             graph = self.graphs[graph_key]
+            report_key = (*graph_key, self._decode_query_tokens)
+            if (
+                self.drafter is not None
+                and report_key not in self._reported_query_graphs
+                and len(self.drafter.decode_graph_query_capacities(padded_bs)) > 1
+            ):
+                self._reported_query_graphs.add(report_key)
+                logger.info(
+                    f"Adaptive decode graph replay: request_capacity={padded_bs}, "
+                    f"target_query_capacity={(self._decode_query_tokens or padded_bs * self.max_tokens_per_req)}, "
+                    f"full_query_capacity={padded_bs * self.max_tokens_per_req}, "
+                    f"variant={graph_key[0]}"
+                )
             if self._graph_debug:
                 self._verify_graph_metadata(graph_key)
             if self.device == "npu":
@@ -1285,20 +1355,27 @@ class ForwardStepRunner:
                         ]
                     )
             if self._expert_load_rows is not None:
-                # Every rank replays the same padded batch; the live rows are
-                # the DP-gathered live counts (this rank's own without DP).
+                query_tokens = (
+                    self._decode_query_tokens or padded_bs * self.max_tokens_per_req
+                )
+                packed = query_tokens != padded_bs * self.max_tokens_per_req
+                # Packed verification uses one agreed capacity on all ranks.
                 self._expert_load_rows.mark_padded(
-                    padded_global_num_tokens=[padded_bs * self.max_tokens_per_req]
-                    * self.world_size,
+                    padded_global_num_tokens=[query_tokens] * self.world_size,
                     live_global_num_tokens=(
-                        ctx.global_num_tokens
-                        if ctx.global_num_tokens is not None
-                        else [ctx.input_num_tokens] * self.world_size
+                        [query_tokens] * self.world_size
+                        if packed
+                        else (
+                            ctx.global_num_tokens
+                            if ctx.global_num_tokens is not None
+                            else [ctx.input_num_tokens] * self.world_size
+                        )
                     ),
                 )
             with (
-                torch.inference_mode() if self.device == "npu" else nullcontext()
-            ), nvtx_range("graph_replay", color="red"):
+                torch.inference_mode() if self.device == "npu" else nullcontext(),
+                nvtx_range("graph_replay", color="red"),
+            ):
                 if self.drafter is not None:
                     self.drafter.replay_decode_graph(graph, bs=bs, graph_bs=padded_bs)
                 else:

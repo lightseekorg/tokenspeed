@@ -97,6 +97,7 @@ __all__ = [
     "rope_weights_inplace",
     "rope_pad_query",
     "rope_quantize_fp8_grouped",
+    "verify_layout",
     "dspark_rows",
     "dspark_anchors",
     "dspark_block",
@@ -1112,6 +1113,7 @@ def dspark_anchors(
     start_pos: torch.Tensor,
     *,
     num_prefill_outputs: int,
+    decode_query_indptr: torch.Tensor | None,
 ) -> None:
     """Fill each verify row's bonus token and each decode request's anchor.
 
@@ -1121,6 +1123,10 @@ def dspark_anchors(
     remaining extend rows have no tokens and their destinations are untouched;
     ``accept_lengths`` [bs] counts accepted tokens (clamped to 1..width) and
     ``positions`` [num_decodes * width] are the decode rows' positions.
+    With ``decode_query_indptr`` [num_decodes + 1], positions instead contains
+    packed query rows and each interval must have 1..width rows. Its final
+    offset equals the logical row count, which may be below positions.numel()
+    when graph padding follows it. Output token storage still uses width.
     Every column of ``next_tokens`` [bs, spec] (int32) receives its row's
     bonus token, and ``start_pos`` [num_decodes] (int64) the position of the
     last accepted verify row. Only output-bearing request rows are written.
@@ -1131,7 +1137,8 @@ def dspark_anchors(
         raise ValueError("DSpark anchors need 0 <= num_extends <= bs and width >= 1")
     if (
         output_tokens.shape != (num_prefill_outputs + num_decodes * width,)
-        or positions.shape != (num_decodes * width,)
+        or positions.ndim != 1
+        or (decode_query_indptr is None and positions.shape != (num_decodes * width,))
         or next_tokens.shape[:1] != (bs,)
         or next_tokens.ndim != 2
         or next_tokens.dtype != torch.int32
@@ -1140,18 +1147,40 @@ def dspark_anchors(
         or start_pos.dtype != torch.int64
     ):
         raise ValueError("DSpark anchor tensors do not match the verify layout")
+    if decode_query_indptr is not None and (
+        decode_query_indptr.shape != (num_decodes + 1,)
+        or decode_query_indptr.dtype not in (torch.int32, torch.int64)
+        or not decode_query_indptr.is_contiguous()
+        or decode_query_indptr.device != positions.device
+    ):
+        raise ValueError("DSpark packed query boundaries do not match decode requests")
     for tensor in (output_tokens, accept_lengths, positions, start_pos):
         if tensor.dtype not in (torch.int32, torch.int64) or not tensor.is_contiguous():
             raise ValueError("DSpark anchor inputs must be contiguous integers")
     if not positions.is_cuda:
         rows = torch.arange(num_decodes)
-        accepted = accept_lengths[num_extends:].to(torch.int64).clamp(1, width)
+        if decode_query_indptr is None:
+            offsets = rows * width
+            query_lengths = torch.full_like(rows, width)
+        else:
+            offsets = decode_query_indptr[:-1].to(torch.int64)
+            query_lengths = decode_query_indptr.diff().to(torch.int64)
+            if (
+                decode_query_indptr[0] != 0
+                or decode_query_indptr[-1] > positions.numel()
+                or (query_lengths < 1).any()
+                or (query_lengths > width).any()
+            ):
+                raise ValueError("DSpark query intervals must be nonempty prefixes")
+        accepted = torch.minimum(
+            accept_lengths[num_extends:].to(torch.int64).clamp_min(1), query_lengths
+        )
         verify = num_prefill_outputs + rows * width + accepted - 1
         next_tokens[:num_prefill_outputs].copy_(
             output_tokens[:num_prefill_outputs, None]
         )
         next_tokens[num_extends:].copy_(output_tokens[verify, None])
-        start_pos.copy_(positions[rows * width + accepted - 1])
+        start_pos.copy_(positions[offsets + accepted - 1])
         return
     _kernel("dspark_anchors", positions)(
         output_tokens,
@@ -1162,6 +1191,7 @@ def dspark_anchors(
         width,
         next_tokens,
         start_pos,
+        decode_query_indptr,
     )
 
 
@@ -1237,6 +1267,8 @@ def decode_rows(
     actual_bs,
     num_extends,
     width,
+    *,
+    query_start_loc: torch.Tensor | None,
 ):
     """Refresh request-major decode/verify metadata in place; return None.
 
@@ -1244,6 +1276,11 @@ def decode_rows(
     entries. Outputs positions/requests are [bs * width], lengths/pool_rows
     are [bs]. Requests are batch-table rows, never request-pool indices.
     width is a positive token count; live lengths clamp to at least width.
+    When query_start_loc is supplied, its [bs + 1] CSR boundaries pack only
+    selected prefixes; width still denotes the reserved input window included
+    in seq_lens. Returned lengths end at the selected prefix, not the reserved
+    end. Live intervals must contain 1..width rows; padded intervals are empty.
+    Token capacity may include trailing graph padding. Mixed input is unsupported.
     All outputs are overwritten. Padding and leading num_extends requests
     have token coordinates -1; padding also has length 0 and pool row -1.
     """
@@ -1253,7 +1290,8 @@ def decode_rows(
     if not 0 <= num_extends <= actual_bs <= bs:
         raise ValueError("invalid live/decode batch sizes")
     if (
-        positions.shape != (bs * width,)
+        positions.ndim != 1
+        or (query_start_loc is None and positions.shape != (bs * width,))
         or requests.shape != positions.shape
         or lengths.shape != (bs,)
         or pool_rows.shape != (bs,)
@@ -1264,6 +1302,18 @@ def decode_rows(
         raise ValueError(
             "decode metadata requires request-sized and packed token vectors"
         )
+    if query_start_loc is not None:
+        if num_extends:
+            raise ValueError("packed decode queries do not support leading extends")
+        if (
+            query_start_loc.shape != (bs + 1,)
+            or query_start_loc.dtype not in (torch.int32, torch.int64)
+            or not query_start_loc.is_contiguous()
+            or query_start_loc.device != positions.device
+        ):
+            raise ValueError(
+                "packed decode requires integer query boundaries on device"
+            )
     tensors = (seq_lens, request_pool_indices, positions, requests, lengths, pool_rows)
     if any(not tensor.is_contiguous() for tensor in tensors):
         raise ValueError("decode row vectors must be contiguous")
@@ -1272,13 +1322,33 @@ def decode_rows(
     if not positions.is_cuda:
         lengths.zero_()
         lengths[:actual_bs].copy_(seq_lens[:actual_bs].clamp_min(width))
-        positions.view(bs, width).copy_(
-            lengths.to(torch.int64)[:, None] - width + torch.arange(width)
-        )
-        requests.view(bs, width).copy_(torch.arange(bs)[:, None])
-        for tensor in (positions, requests):
-            tensor[: num_extends * width].fill_(-1)
-            tensor[actual_bs * width :].fill_(-1)
+        if query_start_loc is None:
+            positions.view(bs, width).copy_(
+                lengths.to(torch.int64)[:, None] - width + torch.arange(width)
+            )
+            requests.view(bs, width).copy_(torch.arange(bs)[:, None])
+            for tensor in (positions, requests):
+                tensor[: num_extends * width].fill_(-1)
+                tensor[actual_bs * width :].fill_(-1)
+        else:
+            counts = query_start_loc.diff().to(torch.int64)
+            if (
+                query_start_loc[0] != 0
+                or query_start_loc[-1] > positions.numel()
+                or (counts[:actual_bs] < 1).any()
+                or (counts[:actual_bs] > width).any()
+                or (counts[actual_bs:] != 0).any()
+            ):
+                raise ValueError(
+                    "packed query intervals must be live prefixes or padding"
+                )
+            positions.fill_(-1)
+            requests.fill_(-1)
+            for row in range(actual_bs):
+                begin, end = int(query_start_loc[row]), int(query_start_loc[row + 1])
+                positions[begin:end] = lengths[row] - width + torch.arange(end - begin)
+                requests[begin:end] = row
+            lengths[:actual_bs] += counts[:actual_bs].to(lengths.dtype) - width
         pool_rows.fill_(-1)
         pool_rows[:actual_bs].copy_(request_pool_indices[:actual_bs])
         return
@@ -1292,6 +1362,7 @@ def decode_rows(
         actual_bs,
         num_extends,
         width,
+        query_start_loc,
     )
 
 
@@ -1700,3 +1771,107 @@ def compact_slots(slots: torch.Tensor, lengths: torch.Tensor):
         packed = slots.masked_fill(~valid, -1).gather(1, order)
         return packed, valid.sum(dim=-1, dtype=torch.int32)
     return _kernel("compact_slots", slots)(slots, lengths)
+
+
+def verify_layout(
+    scores: torch.Tensor,
+    *,
+    query_capacity: int,
+    rows_out: torch.Tensor,
+    indptr_out: torch.Tensor,
+    counts_out: torch.Tensor,
+    valid_out: torch.Tensor,
+    latest_scores: torch.Tensor | None = None,
+    request_slots: torch.Tensor | None = None,
+    active_count: torch.Tensor | None = None,
+) -> None:
+    """Allocate a shared query budget to contiguous per-request prefixes.
+
+    FP32 scores [B,D] are conditional confidence logits for D draft tokens;
+    every request receives an anchor. query_capacity is in [B,B*(D+1)].
+    Int64 outputs are packed source rows [query_capacity], CSR [B+1] and
+    counts [B]; valid_out is a scalar bool. Inputs and outputs share a device.
+    Requires GPU scores with unit column stride and B*(D+1) <= 4096.
+    Unsupported layouts raise ValueError.
+    All outputs have stable caller-owned storage and no host readback is used.
+    Optional latest_scores [slots,D] and request_slots [B] select current GPU
+    confidence by request. A non-finite latest row uses the entire history row
+    from scores. Supply both or neither; slot indices must address the table.
+
+    active_count optionally holds the live prefix length in a device scalar.
+    Its value must be in [0,B]. Padding retains one anchor but receives no draft
+    allocation; the caller masks its state writes and discards its output.
+
+    Non-finite rows require full width. If the budget cannot cover them,
+    valid_out is false and outputs describe anchor-only verification with
+    inactive padding. The caller must treat this as an invalid budget, not a
+    measured successful allocation. Counts never exceed the verified prefixes.
+    """
+    if scores.ndim != 2 or scores.dtype != torch.float32:
+        raise ValueError("verification scores must be FP32 [batch, draft width]")
+    bs, draft_width = scores.shape
+    if not scores.is_cuda:
+        raise ValueError("verification layout requires a CUDA or ROCm GPU")
+    if scores.stride(1) != 1 or (
+        latest_scores is not None
+        and latest_scores.ndim == 2
+        and latest_scores.stride(1) != 1
+    ):
+        raise ValueError("verification scores require unit column stride")
+    if bs * (draft_width + 1) > 4096:
+        raise ValueError(
+            "verification layout requires batch * (draft width + 1) <= 4096"
+        )
+    if (
+        bs < 1
+        or draft_width < 1
+        or type(query_capacity) is not int
+        or not bs <= query_capacity <= bs * (draft_width + 1)
+    ):
+        raise ValueError("invalid verification query capacity")
+    if (latest_scores is None) != (request_slots is None):
+        raise ValueError(
+            "latest confidence and request slots must be supplied together"
+        )
+    if latest_scores is not None and (
+        latest_scores.ndim != 2
+        or latest_scores.shape[1] != draft_width
+        or latest_scores.dtype != torch.float32
+        or latest_scores.device != scores.device
+        or request_slots.shape != (bs,)
+        or request_slots.dtype not in (torch.int32, torch.int64)
+        or request_slots.device != scores.device
+        or not request_slots.is_contiguous()
+    ):
+        raise ValueError("latest confidence must match the history and request slots")
+    if active_count is not None and (
+        active_count.numel() != 1
+        or active_count.dtype not in (torch.float32, torch.int32, torch.int64)
+        or active_count.device != scores.device
+    ):
+        raise ValueError("active count must be a device scalar")
+    for output, shape, dtype in (
+        (rows_out, (query_capacity,), torch.int64),
+        (indptr_out, (bs + 1,), torch.int64),
+        (counts_out, (bs,), torch.int64),
+        (valid_out, (), torch.bool),
+    ):
+        if (
+            output.shape != shape
+            or output.dtype != dtype
+            or output.device != scores.device
+            or not output.is_contiguous()
+        ):
+            raise ValueError("verification output storage does not match the budget")
+    implementation = _kernel("verify_layout", scores)
+    implementation(
+        scores,
+        query_capacity,
+        rows_out,
+        indptr_out,
+        counts_out,
+        valid_out,
+        latest_scores=latest_scores,
+        request_slots=request_slots,
+        active_count=active_count,
+    )

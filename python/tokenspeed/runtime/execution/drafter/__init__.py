@@ -211,6 +211,18 @@ def get_drafter_impl(
     Returns:
         The ``BaseDrafter`` subclass to instantiate (not an instance).
     """
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    if global_server_args_dict.get("enable_dsv41_adaptive_dspark", False):
+        from tokenspeed.runtime.models.deepseek_v41_dspark import (
+            DeepseekV41ForCausalLMDSpark,
+        )
+
+        if spec_algo != "DSPARK" or not isinstance(model, DeepseekV41ForCausalLMDSpark):
+            raise ValueError(
+                "adaptive V4.1 confidence verification requires the native V4.1 DSpark model"
+            )
+
     plugin = _PLUGIN_DRAFTERS.get(spec_algo)
     if plugin is not None:
         for model_cls, drafter_cls in plugin.scoped:
