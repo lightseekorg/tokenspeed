@@ -29,7 +29,9 @@ from pathlib import Path
 from packaging.version import Version
 
 
-def prepare_nightly(root: Path, date: str, kernel_version: str) -> str:
+def prepare_nightly(
+    root: Path, date: str, kernel_version: str, engine_version: str
+) -> str:
     if not re.fullmatch(r"[0-9]{8}", date):
         raise ValueError("Nightly date must be YYYYMMDD")
     datetime.strptime(date, "%Y%m%d")
@@ -46,6 +48,7 @@ def prepare_nightly(root: Path, date: str, kernel_version: str) -> str:
     # A manual release-candidate nightly (0.1.4rc1.post20261108) makes the same
     # release candidate of TokenSpeed, which pins exactly that kernel.
     candidate = "" if kernel.pre is None else f"rc{kernel.pre[1]}"
+    engine_version = str(Version(engine_version))
 
     pyproject = root / "python/pyproject.toml"
     original = pyproject.read_text()
@@ -59,6 +62,9 @@ def prepare_nightly(root: Path, date: str, kernel_version: str) -> str:
     updated, dependencies = re.subn(
         r'"tokenspeed-kernel[^"\n]*"', f'"tokenspeed-kernel=={kernel_version}"', updated
     )
+    updated, engine_dependencies = re.subn(
+        r'"tokenspeed-engine[^"\n]*"', f'"tokenspeed-engine=={engine_version}"', updated
+    )
     version_path = root / "python/tokenspeed/version.py"
     version_source, runtime_versions = re.subn(
         r'^__version__ = "[^"\n]+"$',
@@ -66,9 +72,9 @@ def prepare_nightly(root: Path, date: str, kernel_version: str) -> str:
         version_path.read_text(),
         flags=re.MULTILINE,
     )
-    if (versions, dependencies, runtime_versions) != (1, 1, 1):
+    if (versions, dependencies, engine_dependencies, runtime_versions) != (1, 1, 1, 1):
         raise ValueError(
-            "Expected one project version, kernel dependency and runtime version"
+            "Expected one project version, kernel dependency, engine dependency and runtime version"
         )
     pyproject.write_text(updated)
     version_path.write_text(version_source)
@@ -80,5 +86,8 @@ if __name__ == "__main__":
     parser.add_argument("root", type=Path)
     parser.add_argument("date")
     parser.add_argument("kernel_version")
+    parser.add_argument("engine_version")
     args = parser.parse_args()
-    print(prepare_nightly(args.root, args.date, args.kernel_version))
+    print(
+        prepare_nightly(args.root, args.date, args.kernel_version, args.engine_version)
+    )
