@@ -21,7 +21,8 @@
 """The standalone Triton L2 clip, the bitwise oracle of the fused head norms.
 
 Serving clips attention heads only inside ``rel_mha_head_norms``; this kernel
-runs the same ``_l2_clipped`` arithmetic one (token, head) row per program.
+runs the same ``_l2_clipped`` arithmetic one (token, head) row per program, on
+one warp like that kernel, so the sum of squares adds in the same order.
 """
 
 from __future__ import annotations
@@ -90,7 +91,6 @@ def triton_l2_clip(
             scale is not None,
             output_scale is not None,
             triton.next_power_of_2(width),
-            # Match the fused head norms' reduction tree for bitwise comparisons.
             num_warps=1,
             enable_fp_fusion=False,
         )

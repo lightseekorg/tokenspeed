@@ -20,6 +20,8 @@
 
 #include "cache/core/cache_config.h"
 
+#include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -57,6 +59,10 @@ void CacheGroupConfig::ValidateCapacityInputs() const {
     if (attn_kind == AttnKind::kSlidingWindow) {
         if (!sliding_window_tokens || *sliding_window_tokens <= 0) {
             throw std::invalid_argument(where + "sliding_window_tokens must be > 0 for sliding groups");
+        }
+        // Window arithmetic adds up to one block to it (a lookback plus a block).
+        if (*sliding_window_tokens > std::numeric_limits<std::int32_t>::max() - block_granularity) {
+            throw std::invalid_argument(where + "sliding_window_tokens plus block_granularity must fit int32");
         }
     } else if (sliding_window_tokens) {
         throw std::invalid_argument(where + "only a sliding-window group carries sliding_window_tokens");

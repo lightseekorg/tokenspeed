@@ -26,6 +26,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 #include "cache/core/cache_config.h"
@@ -137,6 +138,24 @@ TEST(ReservePrefillDemandsTest, SlidingWindowPrepaysUnrecycledGrowthUpToItsLookb
                                              .swa_prompt_after_hit_tokens = c.prompt_after_hit_tokens});
         EXPECT_EQ(demands[0].reserve_tokens, c.expected);
     }
+}
+
+TEST(ReservePrefillDemandsTest, AWindowNearInt32MaxStillCountsTheHit) {
+    // Its lookback plus a block passes INT32_MAX; the prompt's 10 tokens
+    // after the hit are far short of it, so the hit counts toward the prepay.
+    CacheGroupConfig swa = Group("swa", AttnKind::kSlidingWindow);
+    swa.sliding_window_tokens = std::numeric_limits<std::int32_t>::max();
+    const std::vector<CacheGroupConfig> groups = {swa};
+    std::vector<BlockTable> tables(1);
+    std::vector<GroupDemand> demands =
+        MakeGroupDemands(tables, groups, GroupDemand{.extent = DenseGrowth{6}}, StateStep{StateStep::Kind::kRotate});
+    ReservePrefillDemands(demands, groups,
+                          PrefillReserve{.decode_input_tokens = 2,
+                                         .completes_prefill = false,
+                                         .prompt_headroom_tokens = 30,
+                                         .swa_hit_tokens = 20,
+                                         .swa_prompt_after_hit_tokens = 10});
+    EXPECT_EQ(demands[0].reserve_tokens, 20);
 }
 
 }  // namespace
