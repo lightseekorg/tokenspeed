@@ -105,6 +105,12 @@ class BaseDrafter:
     # publish one final readiness event for the complete speculative chain.
     supports_pd_layerwise_finalization = False
 
+    # This drafter can record all of a greedy verification round in the
+    # serving ACL Graph. Its persistent state lives outside capture and it
+    # initializes its graph-private scratch before use. Separate round
+    # graphs need their own managed ACL capture path.
+    supports_ascend_memory_saver = False
+
     # Whether this drafter threads a request-token-history view into every
     # draft forward. A draft model whose config requires the history must be
     # served by a drafter that declares this, or fail at startup instead of

@@ -158,6 +158,7 @@ class Eagle(HiddenStateDrafter):
     """
 
     supports_request_token_history = True
+    supports_ascend_memory_saver = True
 
     def __init__(
         self,

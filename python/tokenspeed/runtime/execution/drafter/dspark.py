@@ -50,6 +50,7 @@ class DSpark(DFlash):
     sample_from_anchor = True
     spec_algorithm = "DSPARK"
     supports_speculative_sampling = True
+    supports_ascend_memory_saver = True
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)

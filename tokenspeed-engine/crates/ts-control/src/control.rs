@@ -50,9 +50,10 @@ use ts_wire::{
 
 /// Every memory region, in release order: the KV cache first (a PD engine
 /// deregisters it from the transfer engine before it is unmapped), NCCL last
-/// (nothing may issue a collective after it is suspended). Resume runs the
-/// reverse order.
-pub const MEMORY_REGIONS: [&str; 4] = ["kv_cache", "weights", "cuda_graph", "nccl"];
+/// (nothing may issue a collective after it is suspended). An engine exposes
+/// its configured graph region. Resume runs in reverse order.
+pub const MEMORY_REGIONS: [&str; 5] = ["kv_cache", "weights", "cuda_graph", "acl_graph", "nccl"];
+const GPU_MEMORY_REGIONS: [&str; 4] = ["kv_cache", "weights", "cuda_graph", "nccl"];
 
 /// How far a pause reaches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -631,12 +632,17 @@ impl Controls {
                 .map(|tag| (*tag).to_owned())
                 .collect());
         };
+        let known: &[&str] = if available.iter().any(|tag| tag == "acl_graph") {
+            &MEMORY_REGIONS
+        } else {
+            &GPU_MEMORY_REGIONS
+        };
         let bad: Vec<&String> = tags
             .iter()
-            .filter(|tag| !MEMORY_REGIONS.contains(&tag.as_str()))
+            .filter(|tag| !known.contains(&tag.as_str()))
             .collect();
         if !bad.is_empty() {
-            return Err(format!("invalid tags: {bad:?}; valid: {MEMORY_REGIONS:?}"));
+            return Err(format!("invalid tags: {bad:?}; valid: {known:?}"));
         }
         let unavailable: Vec<&String> =
             tags.iter().filter(|tag| !available.contains(tag)).collect();
@@ -828,6 +834,7 @@ impl Controls {
     }
 
     /// Normalize release tags and check scheduler readiness without pausing.
+    /// Ascend graph sleep also discards the shared target and draft KV arena.
     pub fn release_tags(
         &self,
         tags: Option<&[String]>,
@@ -836,7 +843,15 @@ impl Controls {
         if !self.config.memory_saver {
             return Err("memory saver not enabled (--enable-memory-saver)".to_owned());
         }
-        let tags = self.normalize_tags(tags, &MEMORY_REGIONS)?;
+        let mut tags = self.normalize_tags(tags, &MEMORY_REGIONS)?;
+        if tags.iter().any(|tag| tag == "acl_graph")
+            && !tags.iter().any(|tag| tag == "kv_cache")
+            && !self.released.iter().any(|tag| tag == "kv_cache")
+        {
+            // Normalization accepts acl_graph only on an Ascend engine. Clear
+            // its KV before sleeping the graph, including with graph backup.
+            tags.insert(0, "kv_cache".to_owned());
+        }
         let already: Vec<&String> = tags
             .iter()
             .filter(|tag| self.released.contains(tag))

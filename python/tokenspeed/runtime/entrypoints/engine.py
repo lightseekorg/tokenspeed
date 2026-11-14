@@ -201,7 +201,7 @@ def _start_ranks(
     ``utils.process.set_parent_death_signal``)."""
     binary = host_binary()
     memory_saver_adapter = TorchMemorySaverAdapter.create(
-        enable=server_args.enable_memory_saver
+        enable=server_args.enable_memory_saver, device=server_args.device
     )
     procs, readers = [], []
     for rank in _scheduler_ranks(server_args):

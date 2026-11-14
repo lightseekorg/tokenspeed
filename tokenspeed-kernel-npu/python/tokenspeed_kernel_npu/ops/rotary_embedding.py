@@ -38,16 +38,21 @@ def apply_rope(
     k_rope_out: torch.Tensor | None = None,
 ) -> None:
     """Apply RoPE to Q and K, writing into outputs or the inputs in place."""
+    # CANN RoPE requires INT64 positions, including later draft steps.
+    # Context injection rotates only K. CANN requires a non-empty query, so
+    # use K for both read-only inputs and keep only the rotated key.
+    key_only = q.numel() == 0
     q_out, k_out = torch_npu.npu_mrope(
-        positions,
-        q,
+        positions.to(torch.int64),
+        k if key_only else q,
         k,
         cos_sin_cache.to(q.dtype),
         head_size,
         mrope_section=[0, 0, 0],
         rotary_mode="half" if is_neox else "interleave",
     )
-    (q if q_rope_out is None else q_rope_out).copy_(q_out)
+    if not key_only:
+        (q if q_rope_out is None else q_rope_out).copy_(q_out)
     (k if k_rope_out is None else k_rope_out).copy_(k_out)
 
 

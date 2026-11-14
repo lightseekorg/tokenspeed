@@ -22,15 +22,16 @@ from abc import ABC
 from collections.abc import Callable
 from contextlib import contextmanager
 from contextvars import ContextVar
+from functools import cache
 
 import torch
 
-try:
-    import torch_memory_saver
 
-    _primary_memory_saver = torch_memory_saver.TorchMemorySaver()
-except ImportError:
-    pass
+@cache
+def _gpu_memory_saver():
+    from torch_memory_saver import TorchMemorySaver
+
+    return TorchMemorySaver()
 
 
 _communication_initializers: ContextVar[list[Callable[[], None]] | None] = ContextVar(
@@ -51,12 +52,32 @@ def initialize_communication(operation: Callable[[], None]) -> None:
         pending.append(operation)
 
 
+@contextmanager
+def _defer_communication_initializers():
+    pending: list[Callable[[], None]] = []
+    token = _communication_initializers.set(pending)
+    try:
+        yield
+    finally:
+        _communication_initializers.reset(token)
+    # A failed load never initializes communication. Callbacks run only after
+    # the managed allocator scope has exited.
+    for operation in pending:
+        operation()
+
+
 class TorchMemorySaverAdapter(ABC):
     @staticmethod
-    def create(enable: bool):
-        return (
-            _TorchMemorySaverAdapterReal() if enable else _TorchMemorySaverAdapterNoop()
-        )
+    def create(enable: bool, *, device: str) -> "TorchMemorySaverAdapter":
+        if not enable:
+            return _TorchMemorySaverAdapterNoop()
+        if device.split(":", 1)[0] == "npu":
+            from tokenspeed.runtime.utils.ascend_memory_saver_adapter import (
+                AscendMemorySaverAdapter,
+            )
+
+            return AscendMemorySaverAdapter()
+        return _TorchMemorySaverAdapterReal()
 
     def configure_subprocess(self):
         raise NotImplementedError
@@ -80,35 +101,25 @@ class TorchMemorySaverAdapter(ABC):
 
 class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
     def configure_subprocess(self):
-        return torch_memory_saver.configure_subprocess()
+        from torch_memory_saver import configure_subprocess
 
+        return configure_subprocess()
+
+    @contextmanager
     def region(self, tag: str | None = None, enable_cpu_backup: bool = False):
         # tag defaults to "default" in the library; pass it through explicitly so
         # weights vs kv_cache regions can be paused/resumed independently.
         # enable_cpu_backup=True offloads (and restores) contents to CPU on
         # pause (weights); False discards them (kv_cache).
-        @contextmanager
-        def active_region():
-            pending: list[Callable[[], None]] = []
-            token = _communication_initializers.set(pending)
-            try:
-                with _primary_memory_saver.region(
-                    tag=tag or "default", enable_cpu_backup=enable_cpu_backup
-                ):
-                    yield
-            finally:
-                _communication_initializers.reset(token)
-            # A failed model load never initializes communication. The original
-            # allocator region has fully exited before these callbacks run.
-            for operation in pending:
-                operation()
-
-        return active_region()
+        with _defer_communication_initializers(), _gpu_memory_saver().region(
+            tag=tag or "default", enable_cpu_backup=enable_cpu_backup
+        ):
+            yield
 
     def cuda_graph(self, graph, *, pool, stream, tag: str):
         # Requires the library's preload hook mode, which configure_subprocess
         # sets up for the scheduler processes.
-        return _primary_memory_saver.cuda_graph(
+        return _gpu_memory_saver().cuda_graph(
             cuda_graph=graph,
             pool=pool,
             stream=stream,
@@ -117,10 +128,10 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
         )
 
     def pause(self, tag: str | None = None):
-        return _primary_memory_saver.pause(tag=tag)
+        return _gpu_memory_saver().pause(tag=tag)
 
     def resume(self, tag: str | None = None):
-        return _primary_memory_saver.resume(tag=tag)
+        return _gpu_memory_saver().resume(tag=tag)
 
 
 class _TorchMemorySaverAdapterNoop(TorchMemorySaverAdapter):

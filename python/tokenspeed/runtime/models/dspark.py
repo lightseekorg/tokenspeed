@@ -94,6 +94,8 @@ class DSparkDraftModel(DFlashDraftModel):
     via the default weight loader without extra routing.
     """
 
+    supports_acl_graph_discard = True
+
     def __init__(
         self,
         config,

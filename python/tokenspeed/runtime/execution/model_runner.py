@@ -20,7 +20,11 @@
 
 from __future__ import annotations
 
+import glob
 import inspect
+import os
+from contextlib import ExitStack
+from itertools import chain
 from typing import TYPE_CHECKING
 
 import torch
@@ -48,7 +52,10 @@ from tokenspeed.runtime.model_loader.weight_utils import (
     non_unit_kv_scale_message,
     record_non_unit_kv_scales,
 )
-from tokenspeed.runtime.models.base.weight_update import weight_update_session
+from tokenspeed.runtime.models.base.weight_update import (
+    complete_weight_update_names,
+    weight_update_session,
+)
 from tokenspeed.runtime.moe.expert_location import (
     build_expert_placement,
     get_global_expert_location_metadata,
@@ -68,6 +75,10 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.configs.model_config import ModelConfig
     from tokenspeed.runtime.execution.context import ForwardContext
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
+    from tokenspeed.runtime.model_loader.loader import (
+        BaseModelLoader,
+        DefaultModelLoader,
+    )
     from tokenspeed.runtime.multimodal.inputs import MultimodalForwardContext
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
@@ -205,7 +216,7 @@ class ModelRunner:
         initialize_moe_config(server_args)
 
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=server_args.enable_memory_saver
+            enable=server_args.enable_memory_saver, device=self.device
         )
         # The target's expert placement (redundant replicas, load counters) is
         # process-global so its model picks it up while it is built and loaded.
@@ -506,6 +517,31 @@ class ModelRunner:
             logger.exception("update_weights_from_distributed failed")
             return False, str(e)
 
+    def check_ascend_mooncake_update(
+        self, models: list[torch.nn.Module]
+    ) -> tuple[bool, str]:
+        """Check the local model contract without opening the SDK or writing weights."""
+        from tokenspeed.runtime.model_loader.loader import post_load_transformed_modules
+
+        if self.model_update is None:
+            return False, "Mooncake weight updates require --model-update-config"
+        for model in models:
+            try:
+                complete_weight_update_names(model)
+                if not model.supports_weight_discard:
+                    raise ValueError(
+                        f"{type(model).__name__} has no audited Ascend in-place weight update"
+                    )
+                transformed = post_load_transformed_modules(model)
+                if transformed:
+                    raise ValueError(
+                        f"{type(model).__name__} transformed checkpoint weights at startup: "
+                        + ", ".join(transformed)
+                    )
+            except (TypeError, ValueError, NotImplementedError) as exc:
+                return False, str(exc)
+        return True, "ready for weight update"
+
     def update_weights_from_mooncake(
         self,
         version: int,
@@ -526,7 +562,8 @@ class ModelRunner:
             models: Target first, then the draft when the server's
                 ``--model-update-draft-weights`` is ``refresh``.
             require_complete: Validate the entire canonical source inventory;
-                required whenever old model weights were discarded.
+                required whenever old model weights were discarded. The Ascend
+                memory saver checks the complete stream for its in-place layout.
             snapshot: Optional SDK publication directory for this version.
 
         Returns:
@@ -542,6 +579,8 @@ class ModelRunner:
                 "update_weights_from_mooncake requires the server to start with "
                 "--model-update-config (target runner only)"
             )
+        if self.device == "npu" and self.server_args.enable_memory_saver:
+            return self._update_ascend_weights_from_mooncake(models, version, snapshot)
         device_module = torch.get_device_module(self.device)
         try:
             with weight_update_session(
@@ -560,7 +599,55 @@ class ModelRunner:
         finally:
             device_module.empty_cache()
 
-    def update_weights_from_disk(self, obj) -> tuple[bool, str]:
+    def _update_ascend_weights_from_mooncake(
+        self, models: list[torch.nn.Module], version: int, snapshot: dict | None
+    ) -> tuple[bool, str]:
+        """Stream a complete SDK version into resident Ascend parameter storage.
+
+        Models are ordered with the target first so it owns writes to shared
+        parameters. The SDK supplies ready CPU or local NPU tensors. Wait for
+        copies inside the session so every rank reports device errors before
+        post-load hooks, and wait for queued device work before freeing staging
+        cache. A failed read, an explicit SDK False, or a device error makes the
+        local update fail. The caller owns replica-wide version commit.
+        """
+        assert self.model_update is not None
+        device = torch.device(self.device, self.gpu_id)
+        device_module = torch.get_device_module(device)
+        try:
+            with ExitStack() as cleanup:
+                cleanup.callback(device_module.empty_cache)
+                # Post-load work can queue kernels even on an error path.
+                cleanup.callback(device_module.synchronize, device)
+                with weight_update_session(
+                    models,
+                    require_complete=True,
+                    cpu_group=pg_manager.get_process_group(
+                        "gloo", self.mapping.world_group
+                    ),
+                    source_device=device,
+                ):
+                    try:
+                        result = self.model_update.update(
+                            models, version, snapshot=snapshot
+                        )
+                        if result is False:
+                            raise RuntimeError(
+                                f"Model Updater SDK reported failure for version {version}"
+                            )
+                        message = str(result)
+                    finally:
+                        # Include asynchronous copy errors in rank agreement,
+                        # before any model can enter post-load collectives.
+                        device_module.synchronize(device)
+            return True, f"applied model version {version}: {message}"
+        except Exception as e:  # noqa: BLE001 - surface to the control plane
+            logger.exception("update_weights_from_mooncake failed")
+            return False, str(e)
+
+    def update_weights_from_disk(
+        self, obj, *, require_complete: bool = False
+    ) -> tuple[bool, str]:
         """Reload this worker's parameters in place from a checkpoint directory.
 
         The checkpoint is streamed the way the startup loader streams it
@@ -578,10 +665,11 @@ class ModelRunner:
         the model holds would fail partway through the load. A failure after
         tensors have reached the model says the weights may be partial.
         """
-        from tokenspeed.runtime.configs.load_config import LoadConfig
+        if require_complete and self.device == "npu":
+            return self._update_complete_ascend_disk(obj)
+
         from tokenspeed.runtime.model_loader.loader import (
             DefaultModelLoader,
-            get_model_loader,
             post_load_transformed_modules,
         )
 
@@ -605,20 +693,7 @@ class ModelRunner:
         load_format = obj.load_format or self.server_args.load_format
         consumed = 0
         try:
-            loader = get_model_loader(
-                LoadConfig(
-                    load_format=load_format,
-                    download_dir=self.server_args.download_dir,
-                    ext_yaml=self.server_args.ext_yaml,
-                    weight_loader_prefetch_checkpoints=(
-                        self.server_args.weight_loader_prefetch_checkpoints
-                    ),
-                    weight_loader_prefetch_num_threads=(
-                        self.server_args.weight_loader_prefetch_num_threads
-                    ),
-                    checkpoint_load_group=self.checkpoint_load_group,
-                )
-            )
+            loader = self._disk_reload_loader(load_format)
             if not isinstance(loader, DefaultModelLoader):
                 return False, (
                     f"load_format {load_format!r} selects "
@@ -629,6 +704,27 @@ class ModelRunner:
             shapes, problem = self._check_disk_reload(loader, model_path)
             if problem is not None:
                 return False, f"{problem}; nothing was written"
+
+            redundant_names = frozenset()
+            if require_complete:
+                # Validate canonical sources before any writes when headers are
+                # available. The session also checks the actual tensor stream.
+                redundant_sources = getattr(
+                    self.model, "weight_discard_redundant_checkpoint_names", None
+                )
+                if redundant_sources is not None:
+                    redundant_names = redundant_sources()
+                if shapes is not None:
+                    required_names = self.model.required_weight_update_names()
+                    sources = shapes.keys() - redundant_names
+                    missing = required_names - sources
+                    unexpected = sources - required_names
+                    if missing or unexpected:
+                        return False, (
+                            "Incomplete checkpoint: "
+                            f"missing={sorted(missing)}, unexpected={sorted(unexpected)}; "
+                            "nothing was written"
+                        )
             weights = loader.get_checkpoint_weights(
                 model_path, None, self.model, self.model_config.mapping
             )
@@ -636,13 +732,16 @@ class ModelRunner:
             def _counted():
                 nonlocal consumed
                 for name, tensor in weights:
+                    # A tied export can duplicate storage under a second name.
+                    if name in redundant_names:
+                        continue
                     consumed += 1
                     yield name, tensor
 
             # Same session and KV-cache scale screen as a distributed load.
             rejected: list[str] = []
             with weight_update_session(
-                [self.model], require_complete=False, cpu_group=None
+                [self.model], require_complete=require_complete, cpu_group=None
             ):
                 self.model.load_weights(
                     record_non_unit_kv_scales(
@@ -661,7 +760,9 @@ class ModelRunner:
                     f"the KV-cache scales loaded at startup ({consumed} checkpoint "
                     "tensors had reached the model)"
                 )
-            if self.device != "cpu":
+            if self.device == "npu":
+                torch.npu.synchronize(self.gpu_id)
+            elif self.device != "cpu":
                 torch.cuda.synchronize(torch.device(f"cuda:{self.gpu_id}"))
         except Exception as e:  # noqa: BLE001 - surface to the control plane
             logger.exception("update_weights_from_disk failed")
@@ -682,6 +783,276 @@ class ModelRunner:
             f"Succeeded to update model weights from {model_path} "
             f"({consumed} checkpoint tensors read)"
         )
+
+    def _disk_reload_loader(self, load_format: str) -> BaseModelLoader:
+        """Construct the checkpoint loader with the runner's startup settings.
+
+        Reuse the download, prefetch and rank-group settings used to build the
+        model. Ascend saver admission restricts the returned reader before
+        it opens a checkpoint so file checks can finish without a device
+        collective or a stale cached copy.
+        """
+        from tokenspeed.runtime.configs.load_config import LoadConfig
+        from tokenspeed.runtime.model_loader.loader import get_model_loader
+
+        return get_model_loader(
+            LoadConfig(
+                load_format=load_format,
+                download_dir=self.server_args.download_dir,
+                ext_yaml=self.server_args.ext_yaml,
+                weight_loader_prefetch_checkpoints=self.server_args.weight_loader_prefetch_checkpoints,
+                weight_loader_prefetch_num_threads=self.server_args.weight_loader_prefetch_num_threads,
+                checkpoint_load_group=self.checkpoint_load_group,
+            )
+        )
+
+    def check_ascend_disk_update(self, obj) -> tuple[bool, str]:
+        """Check saver disk formats before cache invalidation or a transaction."""
+        try:
+            self._ascend_disk_reload_loader(obj)
+        except Exception as exc:
+            return False, f"{exc}; nothing was written"
+        return True, "ready for Ascend disk weight update"
+
+    def _ascend_disk_reload_loader(self, obj) -> DefaultModelLoader:
+        """Use a direct reader and refuse an ambiguous AUTO checkpoint folder."""
+        from tokenspeed.runtime.configs.load_config import LoadFormat
+        from tokenspeed.runtime.model_loader.loader import (
+            CheckpointFileSelection,
+            DefaultModelLoader,
+        )
+        from tokenspeed.runtime.model_loader.weight_utils import (
+            filter_duplicate_safetensors_files,
+            filter_files_not_needed_for_inference,
+        )
+
+        load_format = obj.load_format or self.server_args.load_format
+        direct_formats = (
+            LoadFormat.AUTO,
+            LoadFormat.SAFETENSORS,
+            LoadFormat.PT,
+            LoadFormat.MISTRAL,
+        )
+        # Validate before constructing a custom loader. NPCACHE can retain an
+        # older checkpoint at the same path; InstantTensor is a CUDA reader.
+        if (
+            not isinstance(load_format, str)
+            or load_format.lower() not in direct_formats
+        ):
+            raise ValueError(
+                "Ascend Memory Saver disk reload requires a direct CPU checkpoint "
+                f"reader; load_format {load_format!r} is unsupported. Use "
+                "'safetensors', 'pt', 'mistral', or 'auto' with one checkpoint "
+                "file family"
+            )
+        loader = self._disk_reload_loader(load_format)
+        if type(loader) is not DefaultModelLoader:
+            raise ValueError(
+                "Ascend Memory Saver disk reload requires DefaultModelLoader"
+            )
+        fall_back_to_pt = getattr(self.model, "fall_back_to_pt_during_load", False)
+        weight_files = (
+            self.model.checkpoint_weight_files
+            if isinstance(self.model, CheckpointFileSelection)
+            else None
+        )
+        folder, _, _ = loader._prepare_weights(
+            str(obj.model_path), None, fall_back_to_pt, weight_files
+        )
+        if loader.load_config.load_format == LoadFormat.AUTO and weight_files is None:
+            # Follow startup's shard selection and exclusions, but inspect all
+            # eligible families instead of silently preferring older safetensors.
+            families = []
+            safetensors = glob.glob(os.path.join(folder, "*.safetensors"))
+            if safetensors:
+                safetensors = filter_duplicate_safetensors_files(
+                    safetensors, folder, "model.safetensors.index.json"
+                )
+            if safetensors:
+                families.append("safetensors")
+            extensions = ("bin", "pt") if fall_back_to_pt else ("bin",)
+            for extension in extensions:
+                files = filter_files_not_needed_for_inference(
+                    glob.glob(os.path.join(folder, f"*.{extension}"))
+                )
+                if files:
+                    families.append(extension)
+            if len(families) > 1:
+                raise ValueError(
+                    f"Ascend Memory Saver load_format 'auto' is ambiguous at "
+                    f"{str(obj.model_path)!r}: found checkpoint file families "
+                    f"{', '.join(families)}. Select an explicit load_format or "
+                    "publish one checkpoint family in an immutable version directory"
+                )
+        return loader
+
+    def _update_complete_ascend_disk(self, obj) -> tuple[bool, str]:
+        """Restore discarded Ascend weights after their storage is remapped.
+
+        The caller has released KV and begun a weight transaction. Every TP rank
+        reads the candidate inventory directly on CPU. The first agreement
+        prevents any write when a rank refuses that inventory. The complete
+        session validates the actual stream and gathers read and copy failures
+        again before post-load hooks. Return local success only after device
+        work completes. The host commits the replica result. A failed load leaves
+        the begun transaction invalid even when the inventory refused all writes.
+        """
+        from tokenspeed.runtime.model_loader.loader import (
+            post_load_transformed_modules,
+        )
+
+        model_path = str(obj.model_path)
+        consumed = 0
+        try:
+            # Ascend memory saver uses one single-stage TP replica. Match the
+            # Rust weight request's participants, without involving other ranks.
+            tp_group = self.mapping.attn.tp_group
+            cpu_group = (
+                pg_manager.get_process_group("gloo", tp_group)
+                if len(tp_group) > 1
+                else None
+            )
+            preparation_error = None
+            try:
+                transformed = post_load_transformed_modules(self.model)
+                if transformed:
+                    raise ValueError(
+                        f"Cannot reload transformed Ascend weights: {transformed}"
+                    )
+                loader = self._ascend_disk_reload_loader(obj)
+                shapes = self._check_complete_ascend_disk_reload(loader, model_path)
+            except Exception as exc:
+                preparation_error = exc
+            if cpu_group is not None:
+                # A header or local read error must stop peers before any
+                # rank starts writing parameters.
+                failures = [None] * torch.distributed.get_world_size(cpu_group)
+                torch.distributed.all_gather_object(
+                    failures,
+                    None if preparation_error is None else str(preparation_error),
+                    group=cpu_group,
+                )
+                if preparation_error is None:
+                    for rank, failure in enumerate(failures):
+                        if failure is not None:
+                            raise ValueError(
+                                f"Disk reload refused by group rank {rank}: {failure}"
+                            )
+            if preparation_error is not None:
+                raise preparation_error
+
+            def _counted():
+                nonlocal consumed
+                for name, tensor in loader.get_checkpoint_weights(
+                    model_path, None, self.model, self.model_config.mapping
+                ):
+                    consumed += 1
+                    yield name, tensor
+
+            # Check the actual stream again in case a checkpoint changed
+            # after preflight, and converge before entering post-load hooks.
+            with weight_update_session(
+                [self.model],
+                require_complete=True,
+                cpu_group=cpu_group,
+                source_device=torch.device("cpu"),
+            ):
+                try:
+                    self.model.load_weights(_counted())
+                    if not consumed:
+                        raise ValueError(
+                            f"no checkpoint tensors found at {model_path!r}; nothing was updated"
+                        )
+                finally:
+                    torch.npu.synchronize(self.gpu_id)
+            torch.npu.synchronize(self.gpu_id)
+        except Exception as exc:  # noqa: BLE001 - surface to the control plane
+            logger.exception("complete Ascend disk weight update failed")
+            if consumed:
+                return (
+                    False,
+                    f"{exc} (after {consumed} checkpoint tensors reached the model)",
+                )
+            return False, str(exc)
+
+        self.model_config.model_path = model_path
+        self._disk_reload_shapes = shapes
+        logger.info(f"weights reloaded from {model_path!s} ({consumed:d} tensors)")
+        return (
+            True,
+            f"Succeeded to update model weights from {model_path} ({consumed} checkpoint tensors read)",
+        )
+
+    def _check_complete_ascend_disk_reload(
+        self, loader: DefaultModelLoader, model_path: str
+    ) -> dict[str, tuple[int, ...]]:
+        """Validate canonical source names and shapes before the first TP slice.
+
+        Use only the candidate files and the live model's checkpoint contract.
+        Safetensors provides a header per shard. Binary checkpoints require a
+        bounded scan with the direct reader and a second read during loading.
+        Declared aliases are optional and have no independent destination.
+        Duplicate sources still fail. This check writes no model parameters.
+        """
+        from tokenspeed.runtime.model_loader.loader import CheckpointFileSelection
+        from tokenspeed.runtime.model_loader.weight_utils import (
+            safetensors_tensor_shapes,
+        )
+
+        required = complete_weight_update_names(self.model)
+        expected = self.model.weight_update_source_shapes()
+        redundant = self.model.weight_discard_redundant_checkpoint_names()
+        if required & redundant:
+            raise ValueError("Required checkpoint sources cannot also be aliases")
+        if missing_shapes := required - expected.keys():
+            raise ValueError(
+                f"Missing checkpoint source shapes for {sorted(missing_shapes)}; nothing was written"
+            )
+        fall_back_to_pt = getattr(self.model, "fall_back_to_pt_during_load", False)
+        weight_files = (
+            self.model.checkpoint_weight_files
+            if isinstance(self.model, CheckpointFileSelection)
+            else None
+        )
+        _, files, use_safetensors = loader._prepare_weights(
+            model_path, None, fall_back_to_pt, weight_files
+        )
+        if use_safetensors:
+            entries = chain.from_iterable(
+                safetensors_tensor_shapes([file]).items() for file in files
+            )
+        else:
+            # Binary checkpoints have no independent tensor header. Read the
+            # inventory one shard at a time so missing or oversized sources
+            # are detected before any TP loader can slice or write a tensor.
+            entries = (
+                (name, tuple(tensor.shape))
+                for name, tensor in loader.get_checkpoint_weights(
+                    model_path, None, self.model, self.model_config.mapping
+                )
+            )
+        shapes = {}
+        for name, shape in entries:
+            if name in shapes:
+                raise ValueError(
+                    f"Duplicate checkpoint weight {name!r}; nothing was written"
+                )
+            shapes[name] = shape
+        sources = shapes.keys() - redundant
+        if sources != required:
+            raise ValueError(
+                "Incomplete checkpoint: "
+                f"missing={sorted(required - sources)}, unexpected={sorted(sources - required)}; "
+                "nothing was written"
+            )
+        for name in sorted(required):
+            if shapes[name] != expected[name]:
+                raise ValueError(
+                    f"Checkpoint weight {name!r} has shape {shapes[name]}; "
+                    f"expected checkpoint shape {expected[name]} before TP slicing; "
+                    "nothing was written"
+                )
+        return shapes
 
     def _check_disk_reload(
         self, loader, model_path: str
