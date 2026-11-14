@@ -80,12 +80,16 @@ _GROUPED_SITU_MOE_CONFIGS = {
         (
             449,
             1792,
-            _GroupedMoEConfig(32, 4, use_minimum_route_chunks=False, runtime_rows=False),
+            _GroupedMoEConfig(
+                32, 4, use_minimum_route_chunks=False, runtime_rows=False
+            ),
         ),
         (
             1793,
             16384,
-            _GroupedMoEConfig(64, 4, use_minimum_route_chunks=False, runtime_rows=False),
+            _GroupedMoEConfig(
+                64, 4, use_minimum_route_chunks=False, runtime_rows=False
+            ),
         ),
     ),
 }
