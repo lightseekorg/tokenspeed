@@ -67,6 +67,44 @@ allowed helpers and checks these rules on the compiled kernels.
 
 ## GEMM
 
+### Offline-tuned BLAS solutions with TunableOp (ROCm)
+
+Dense BF16/FP16 projections that no registered kernel claims run `torch.mm`,
+which on ROCm takes hipBLASLt's heuristic solution. For skinny row counts, such
+as speculative-decoding verify steps, a measured solution can be much faster.
+TunableOp times both hipBLASLt and rocBLAS solutions, so a tuned file can list
+either kind (rocBLAS ones are named `Gemm_Rocblas_*`).
+
+Tuned files are committed in `ops/gemm/configs/`, one per GPU, named like the
+Triton kernel configs after `torch.cuda.get_device_name()` with spaces
+replaced by underscores, such as `device_name=AMD_Instinct_MI355X.csv`.
+Serving loads the file of its GPU automatically, through
+`tokenspeed_kernel.ops.gemm.hipblaslt`, once per process and before graph
+capture; `ops/gemm/hipblaslt.py` replays it read-only through PyTorch
+TunableOp. GEMMs the file does not list keep the default solution. Serving
+never tunes or rewrites the file. A GPU without a file keeps the defaults.
+
+A results file is valid only for the PyTorch, HIP, hipBLASLt and rocBLAS
+versions and the GPU architecture stamped in its `Validator` rows. On any
+mismatch the whole file is ignored with one warning and every GEMM keeps the
+default. Regenerate the file after changing the stack, on an idle GPU of the
+serving type, for each weight shape `N x K` and each row count to cover
+(captured verify or decode token counts):
+
+```bash
+python -m tokenspeed_kernel_amd.ops.gemm.hipblaslt --dtype bfloat16 \
+    --shapes 14336x5120,5120x6144,16480x5120,34816x5120,5120x17408 \
+    --rows 64,128,192,256,384,512
+```
+
+Without `--out`, the tool writes this GPU's file in `ops/gemm/configs/`. If
+the file exists with the running stack's stamp, its GEMMs are kept and only
+new ones are timed, so one file can cover several models; on another stack
+the tool stops, and the file must be deleted to re-tune. Tuning rotates
+weight copies through `--cold-bytes`, so each timing reads the weight from
+HBM as a serving step does. Another solution can sum K in another order, so
+results differ from the default within BF16 rounding.
+
 ### gfx950 BF16 projections with FP32 output
 
 `gfx950/gemm/fp16/fp32_output.py` covers measured `[N,K]` pairs `[8,4608]`,
