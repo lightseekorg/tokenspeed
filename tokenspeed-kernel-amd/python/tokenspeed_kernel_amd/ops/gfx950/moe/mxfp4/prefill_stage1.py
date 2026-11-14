@@ -913,6 +913,7 @@ def gluon_mxfp4_moe_stage1_kernel(
     OUTPUT_FP8: gl.constexpr,
     INPUT_SORTED: gl.constexpr,
     NUM_XCDS: gl.constexpr = 1,
+    EARLY_A: gl.constexpr = False,
 ):
     """Stage 1 kernel with per-token A gather and fused SwiGLU.
 
@@ -1480,6 +1481,33 @@ def gluon_mxfp4_moe_stage1_kernel(
             B_SCALE_K_STEP,
             B_GDOT128,
         )
+        if EARLY_A:
+            _prefetch_a_data_lds(
+                smem_a_slot1,
+                a_base_ptr,
+                offs_a_i32,
+                (tile0_k + 1) * a_data_k_step,
+                mask=token_mask[:, None],
+                USE_ASYNC=A_FORMAT != "e4m3",
+            )
+            cdna4_async_copy.commit_group()
+            nxt_a_scale_group0 = _load_a_scale_vgpr(
+                a_scales_ptr,
+                a_scale_base_offsets,
+                GROUP0_IDX,
+                tile0_k + 1,
+                a_scale_group_stride,
+                A_SCALE_K_STEP,
+            )
+            if BLOCK_M >= 64:
+                nxt_a_scale_group1 = _load_a_scale_vgpr(
+                    a_scales_ptr,
+                    a_scale_base_offsets,
+                    GROUP1_IDX,
+                    tile0_k + 1,
+                    a_scale_group_stride,
+                    A_SCALE_K_STEP,
+                )
         # MFMA groups 0,1 with current A[k] + current B[k].
         gate_acc_group0, up_acc_group0 = _compute_gate_up_group(
             cur_a_group0,
@@ -1508,14 +1536,15 @@ def gluon_mxfp4_moe_stage1_kernel(
             )
 
         # Prefetch A[k+1] data into LDS slot1. A-scale stays direct-to-VGPR.
-        _prefetch_a_data_lds(
-            smem_a_slot1,
-            a_base_ptr,
-            offs_a_i32,
-            (tile0_k + 1) * a_data_k_step,
-            mask=token_mask[:, None],
-            USE_ASYNC=A_FORMAT != "e4m3",
-        )
+        if not EARLY_A:
+            _prefetch_a_data_lds(
+                smem_a_slot1,
+                a_base_ptr,
+                offs_a_i32,
+                (tile0_k + 1) * a_data_k_step,
+                mask=token_mask[:, None],
+                USE_ASYNC=A_FORMAT != "e4m3",
+            )
 
         # The 128-row variant consumes the remaining two A[k] quarters while
         # the next A tile is in flight. Smaller variants have consumed their
@@ -1550,7 +1579,8 @@ def gluon_mxfp4_moe_stage1_kernel(
                 A_SCALE_K_STEP,
             )
 
-        cdna4_async_copy.commit_group()
+        if not EARLY_A:
+            cdna4_async_copy.commit_group()
 
         if BLOCK_M == 128:
             gate_acc_group2, up_acc_group2 = _compute_gate_up_group(
@@ -1586,14 +1616,17 @@ def gluon_mxfp4_moe_stage1_kernel(
             dot_a_layout,
             GROUP_MFMA_M,
         )
-        a_scale_group0 = _load_a_scale_vgpr(
-            a_scales_ptr,
-            a_scale_base_offsets,
-            GROUP0_IDX,
-            tile0_k + 1,
-            a_scale_group_stride,
-            A_SCALE_K_STEP,
-        )
+        if EARLY_A:
+            a_scale_group0 = nxt_a_scale_group0
+        else:
+            a_scale_group0 = _load_a_scale_vgpr(
+                a_scales_ptr,
+                a_scale_base_offsets,
+                GROUP0_IDX,
+                tile0_k + 1,
+                a_scale_group_stride,
+                A_SCALE_K_STEP,
+            )
         if BLOCK_M >= 64:
             cur_a_group1 = _read_a_lds_group(
                 smem_a_slot1,
@@ -1601,14 +1634,17 @@ def gluon_mxfp4_moe_stage1_kernel(
                 dot_a_layout,
                 GROUP_MFMA_M,
             )
-            a_scale_group1 = _load_a_scale_vgpr(
-                a_scales_ptr,
-                a_scale_base_offsets,
-                GROUP1_IDX,
-                tile0_k + 1,
-                a_scale_group_stride,
-                A_SCALE_K_STEP,
-            )
+            if EARLY_A:
+                a_scale_group1 = nxt_a_scale_group1
+            else:
+                a_scale_group1 = _load_a_scale_vgpr(
+                    a_scales_ptr,
+                    a_scale_base_offsets,
+                    GROUP1_IDX,
+                    tile0_k + 1,
+                    a_scale_group_stride,
+                    A_SCALE_K_STEP,
+                )
 
         # Swap B: next -> current.
         cur_b_gate = next_b_gate
@@ -1637,6 +1673,33 @@ def gluon_mxfp4_moe_stage1_kernel(
             B_SCALE_K_STEP,
             B_GDOT128,
         )
+        if EARLY_A:
+            _prefetch_a_data_lds(
+                smem_a_slot1,
+                a_base_ptr,
+                offs_a_i32,
+                (tile1_k + 1) * a_data_k_step,
+                mask=token_mask[:, None],
+                USE_ASYNC=A_FORMAT != "e4m3",
+            )
+            cdna4_async_copy.commit_group()
+            nxt_a_scale_group0 = _load_a_scale_vgpr(
+                a_scales_ptr,
+                a_scale_base_offsets,
+                GROUP0_IDX,
+                tile1_k + 1,
+                a_scale_group_stride,
+                A_SCALE_K_STEP,
+            )
+            if BLOCK_M >= 64:
+                nxt_a_scale_group1 = _load_a_scale_vgpr(
+                    a_scales_ptr,
+                    a_scale_base_offsets,
+                    GROUP1_IDX,
+                    tile1_k + 1,
+                    a_scale_group_stride,
+                    A_SCALE_K_STEP,
+                )
         gate_acc_group0, up_acc_group0 = _compute_gate_up_group(
             cur_a_group0,
             a_scale_group0,
@@ -1663,14 +1726,15 @@ def gluon_mxfp4_moe_stage1_kernel(
                 B_GDOT128,
             )
 
-        _prefetch_a_data_lds(
-            smem_a_slot1,
-            a_base_ptr,
-            offs_a_i32,
-            (tile1_k + 1) * a_data_k_step,
-            mask=token_mask[:, None],
-            USE_ASYNC=A_FORMAT != "e4m3",
-        )
+        if not EARLY_A:
+            _prefetch_a_data_lds(
+                smem_a_slot1,
+                a_base_ptr,
+                offs_a_i32,
+                (tile1_k + 1) * a_data_k_step,
+                mask=token_mask[:, None],
+                USE_ASYNC=A_FORMAT != "e4m3",
+            )
 
         if BLOCK_M == 128:
             cur_a_group2 = _read_a_lds_group(
@@ -1702,7 +1766,8 @@ def gluon_mxfp4_moe_stage1_kernel(
                 A_SCALE_K_STEP,
             )
 
-        cdna4_async_copy.commit_group()
+        if not EARLY_A:
+            cdna4_async_copy.commit_group()
 
         if BLOCK_M == 128:
             gate_acc_group2, up_acc_group2 = _compute_gate_up_group(
@@ -1737,14 +1802,17 @@ def gluon_mxfp4_moe_stage1_kernel(
             dot_a_layout,
             GROUP_MFMA_M,
         )
-        a_scale_group0 = _load_a_scale_vgpr(
-            a_scales_ptr,
-            a_scale_base_offsets,
-            GROUP0_IDX,
-            tile1_k + 1,
-            a_scale_group_stride,
-            A_SCALE_K_STEP,
-        )
+        if EARLY_A:
+            a_scale_group0 = nxt_a_scale_group0
+        else:
+            a_scale_group0 = _load_a_scale_vgpr(
+                a_scales_ptr,
+                a_scale_base_offsets,
+                GROUP0_IDX,
+                tile1_k + 1,
+                a_scale_group_stride,
+                A_SCALE_K_STEP,
+            )
         if BLOCK_M >= 64:
             cur_a_group1 = _read_a_lds_group(
                 smem_a_slot1,
@@ -1752,14 +1820,17 @@ def gluon_mxfp4_moe_stage1_kernel(
                 dot_a_layout,
                 GROUP_MFMA_M,
             )
-            a_scale_group1 = _load_a_scale_vgpr(
-                a_scales_ptr,
-                a_scale_base_offsets,
-                GROUP1_IDX,
-                tile1_k + 1,
-                a_scale_group_stride,
-                A_SCALE_K_STEP,
-            )
+            if EARLY_A:
+                a_scale_group1 = nxt_a_scale_group1
+            else:
+                a_scale_group1 = _load_a_scale_vgpr(
+                    a_scales_ptr,
+                    a_scale_base_offsets,
+                    GROUP1_IDX,
+                    tile1_k + 1,
+                    a_scale_group_stride,
+                    A_SCALE_K_STEP,
+                )
 
         cur_b_gate = next_b_gate
         b_scale_gate = next_bsc_gate
@@ -1787,6 +1858,33 @@ def gluon_mxfp4_moe_stage1_kernel(
             B_SCALE_K_STEP,
             B_GDOT128,
         )
+        if EARLY_A:
+            _prefetch_a_data_lds(
+                smem_a_slot1,
+                a_base_ptr,
+                offs_a_i32,
+                (pk + 1) * a_data_k_step,
+                mask=token_mask[:, None],
+                USE_ASYNC=A_FORMAT != "e4m3",
+            )
+            cdna4_async_copy.commit_group()
+            nxt_a_scale_group0 = _load_a_scale_vgpr(
+                a_scales_ptr,
+                a_scale_base_offsets,
+                GROUP0_IDX,
+                pk + 1,
+                a_scale_group_stride,
+                A_SCALE_K_STEP,
+            )
+            if BLOCK_M >= 64:
+                nxt_a_scale_group1 = _load_a_scale_vgpr(
+                    a_scales_ptr,
+                    a_scale_base_offsets,
+                    GROUP1_IDX,
+                    pk + 1,
+                    a_scale_group_stride,
+                    A_SCALE_K_STEP,
+                )
         gate_acc_group0, up_acc_group0 = _compute_gate_up_group(
             cur_a_group0,
             a_scale_group0,
@@ -1813,14 +1911,15 @@ def gluon_mxfp4_moe_stage1_kernel(
                 B_GDOT128,
             )
 
-        _prefetch_a_data_lds(
-            smem_a_slot1,
-            a_base_ptr,
-            offs_a_i32,
-            (pk + 1) * a_data_k_step,
-            mask=token_mask[:, None],
-            USE_ASYNC=A_FORMAT != "e4m3",
-        )
+        if not EARLY_A:
+            _prefetch_a_data_lds(
+                smem_a_slot1,
+                a_base_ptr,
+                offs_a_i32,
+                (pk + 1) * a_data_k_step,
+                mask=token_mask[:, None],
+                USE_ASYNC=A_FORMAT != "e4m3",
+            )
 
         if BLOCK_M == 128:
             cur_a_group2 = _read_a_lds_group(
@@ -1852,7 +1951,8 @@ def gluon_mxfp4_moe_stage1_kernel(
                 A_SCALE_K_STEP,
             )
 
-        cdna4_async_copy.commit_group()
+        if not EARLY_A:
+            cdna4_async_copy.commit_group()
 
         if BLOCK_M == 128:
             gate_acc_group2, up_acc_group2 = _compute_gate_up_group(
@@ -1887,14 +1987,17 @@ def gluon_mxfp4_moe_stage1_kernel(
             dot_a_layout,
             GROUP_MFMA_M,
         )
-        a_scale_group0 = _load_a_scale_vgpr(
-            a_scales_ptr,
-            a_scale_base_offsets,
-            GROUP0_IDX,
-            pk + 1,
-            a_scale_group_stride,
-            A_SCALE_K_STEP,
-        )
+        if EARLY_A:
+            a_scale_group0 = nxt_a_scale_group0
+        else:
+            a_scale_group0 = _load_a_scale_vgpr(
+                a_scales_ptr,
+                a_scale_base_offsets,
+                GROUP0_IDX,
+                pk + 1,
+                a_scale_group_stride,
+                A_SCALE_K_STEP,
+            )
         if BLOCK_M >= 64:
             cur_a_group1 = _read_a_lds_group(
                 smem_a_slot1,
@@ -1902,14 +2005,17 @@ def gluon_mxfp4_moe_stage1_kernel(
                 dot_a_layout,
                 GROUP_MFMA_M,
             )
-            a_scale_group1 = _load_a_scale_vgpr(
-                a_scales_ptr,
-                a_scale_base_offsets,
-                GROUP1_IDX,
-                pk + 1,
-                a_scale_group_stride,
-                A_SCALE_K_STEP,
-            )
+            if EARLY_A:
+                a_scale_group1 = nxt_a_scale_group1
+            else:
+                a_scale_group1 = _load_a_scale_vgpr(
+                    a_scales_ptr,
+                    a_scale_base_offsets,
+                    GROUP1_IDX,
+                    pk + 1,
+                    a_scale_group_stride,
+                    A_SCALE_K_STEP,
+                )
 
         cur_b_gate = next_b_gate
         b_scale_gate = next_bsc_gate
@@ -2547,6 +2653,10 @@ def invoke_gluon_mxfp4_moe_stage1(
         OUTPUT_FP8=output_format == "e4m3",
         INPUT_SORTED=bool(input_sorted),
         NUM_XCDS=_NUM_XCDS,
+        # Narrow tiles finish their A tile before the next one is issued, so
+        # issuing it ahead of the MFMAs hides its latency. The 128-row tile
+        # already overlaps it with its second half.
+        EARLY_A=BLOCK_M <= 64,
         num_warps=NUM_WARPS,
         # Interleaving the MFMAs with the next K tile's loads makes the 128-row
         # E2M1 tile faster. Narrower tiles lose occupancy to the extra registers
