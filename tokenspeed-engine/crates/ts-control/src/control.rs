@@ -1160,18 +1160,37 @@ mod tests {
                 successes(&controls.take_replies()),
                 [("ResumeMemoryOccupationReqOutput", false)]
             );
-            let Effect::ResumeMemory(tags) = controls.handle(
+            let effect = controls.handle(
                 resume_memory(Some(
                     release_order.iter().map(|tag| (*tag).to_owned()).collect(),
                 )),
                 None,
-            ) else {
-                panic!("the configured regions resume");
+            );
+            let tags = if release_order.contains(&"nccl") {
+                // NCCL wake must wait for the operation gate before device collectives.
+                assert!(matches!(effect, Effect::None));
+                assert!(controls.take_replies().is_empty());
+                let Some(ControlRequest::ResumeMemoryOccupation(resume)) = controls.pop_weight_op()
+                else {
+                    panic!("the NCCL resume is queued for the operation gate");
+                };
+                assert!(controls.weight_head().is_none());
+                resume.tags.expect("the queued resume has normalized tags")
+            } else {
+                let Effect::ResumeMemory(tags) = effect else {
+                    panic!("ordinary regions resume locally");
+                };
+                tags
             };
             let resume_order: Vec<_> = release_order.iter().rev().copied().collect();
             assert_eq!(
                 tags.iter().map(String::as_str).collect::<Vec<_>>(),
                 resume_order
+            );
+            controls.finish_resume(&tags);
+            assert_eq!(
+                successes(&controls.take_replies()),
+                [("ResumeMemoryOccupationReqOutput", true)]
             );
         }
     }
