@@ -33,6 +33,7 @@ from tokenspeed_kernel.ops.sampling.triton.dspark_block import (
 from tokenspeed_kernel.ops.sampling.triton.logprob_topk import logprob_topk
 from tokenspeed_kernel.ops.sampling.triton.rejection import (
     DRAFT_SAMPLE_OFFSET_SALT,
+    block_verify_coins_from_pools,
     verify_rows_no_filter_from_pools,
     verify_rows_no_filter_scratch_shape,
 )
@@ -82,6 +83,7 @@ __all__ = [
     "gumbel_sample_top_k_top_p_qrita_from_pools",
     "TOP_K_DISABLED",
     "DRAFT_SAMPLE_OFFSET_SALT",
+    "block_verify_coins_from_pools",
     "dflash2_sample_path",
     "dspark_block_candidate_tiles",
     "dspark_block_greedy_resolve",
