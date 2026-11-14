@@ -1301,7 +1301,7 @@ class ModelExecutor:
                     rows = (
                         slice(0, num_tokens)
                         if ctx.query_shard is None
-                        else ctx.query_shard.local_row_ids
+                        else self.input_buffers.query_shard.local_row_ids
                     )
                     positions = (
                         ib.mrope_positions_buf[:, rows]
@@ -1549,7 +1549,7 @@ class ModelExecutor:
         rows = (
             slice(0, ctx.input_num_tokens)
             if ctx.query_shard is None
-            else ctx.query_shard.local_row_ids
+            else self.input_buffers.query_shard.local_row_ids
         )
         positions = self._active_positions_override
         if positions is None:
@@ -2714,6 +2714,7 @@ class ModelExecutor:
 
             forward_logprobs = None
             if total_tokens == 0:
+                self.input_buffers.query_shard = None
                 settle()
                 # Fully prefix-cached prefill: no tokens to process.
                 output_tokens = torch.zeros(0, dtype=torch.int32, device=self.device)
@@ -2790,8 +2791,10 @@ class ModelExecutor:
                         input_lengths=forward_op.input_lengths[:bs],
                         size=self.config.query_shard_size,
                         rank=self.config.query_shard_rank,
-                        device=self.device,
                     )
+                self.input_buffers.prepare_query_shard(
+                    plan=query_shard, input_lengths=forward_op.input_lengths[:bs]
+                )
                 ctx = ForwardContext(
                     attn_backend=self.attn_backend,
                     token_to_kv_pool=self.token_to_kv_pool,
@@ -2807,7 +2810,7 @@ class ModelExecutor:
                     ),
                     gather_ids=gather_ids,
                     input_logprob_rows=self._input_logprob_rows(
-                        input_logprob_plan, num_extends, total_tokens, query_shard
+                        input_logprob_plan, num_extends, total_tokens
                     ),
                     sampled_top_k=sampled_top_k if num_extends > 0 else 0,
                     decode_input_ids=decode_input_ids,
@@ -3026,7 +3029,6 @@ class ModelExecutor:
         plan: InputLogprobPlan | None,
         num_extends: int,
         total_tokens: int,
-        query_shard: QueryShardPlan | None,
     ) -> InputLogprobRows | None:
         """Expand the plan into device rows, targets and slots for the logits processor.
 
@@ -3047,7 +3049,7 @@ class ModelExecutor:
         ``rows`` the ones inside its shard, as indices into it, with the
         per-rank counts of their gather and the index that puts the gathered
         rows back in plan order: host arithmetic over the shard's row tables
-        (``QueryShardPlan.split_rows``).
+        (``QueryShardInputs.split_rows``).
         """
         if plan is None:
             return None
@@ -3061,6 +3063,7 @@ class ModelExecutor:
         rows_cpu = torch.arange(plan.num_rows, dtype=torch.int64) + first_row[slots_cpu]
         split = None
         host = [rows_cpu, slots_cpu]
+        query_shard = self.input_buffers.query_shard
         if query_shard is not None and query_shard.size > 1:
             split = query_shard.split_rows(rows_cpu)
             host += [split.local_ids, split.to_rows_order]

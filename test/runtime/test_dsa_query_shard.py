@@ -45,7 +45,7 @@ import pytest
 import torch
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+from tokenspeed.runtime.execution.query_shard import QueryShardInputs, QueryShardPlan
 from tokenspeed.runtime.layers.attention.backends.paged import dsa
 from tokenspeed.runtime.layers.attention.configs.dsa import (
     INDEX_K_FORMATS,
@@ -134,17 +134,17 @@ def _page_table() -> torch.Tensor:
     return torch.tensor([[1, 2, 3, 0], [4, 5, 6, 0], [7, 8, 9, 0]], dtype=torch.int32)
 
 
-def _plan(rank: int) -> QueryShardPlan:
-    return QueryShardPlan.from_forward(
-        total_tokens=sum(EXTEND),
+def _plan(rank: int) -> QueryShardInputs:
+    return QueryShardInputs.from_plan(
+        plan=QueryShardPlan.from_forward(
+            total_tokens=sum(EXTEND), input_lengths=EXTEND, size=WORLD, rank=rank
+        ),
         input_lengths=EXTEND,
-        size=WORLD,
-        rank=rank,
         device="cpu",
     )
 
 
-def _init(backend: dsa.DSABackend, plan: QueryShardPlan) -> None:
+def _init(backend: dsa.DSABackend, plan: QueryShardInputs) -> None:
     table = _page_table()
     backend.init_forward_metadata(
         3,
@@ -178,6 +178,7 @@ def test_the_plan_groups_requests_and_slices_this_ranks_queries(rank):
     assert delegate_calls[0]["page_table_cpu"] is None
     meta = backend.require_query_shard_metadata()
     assert meta.plan is plan
+    assert backend.require_query_shard_inputs() is plan
     assert [g.requests for g in meta.groups] == [slice(0, 1), slice(1, 3)]
     assert [g.rows for g in meta.groups] == [6, 10]
     assert [g.row_base for g in meta.groups] == [0, 6]
@@ -982,3 +983,51 @@ def test_construction_probes_the_rows_leaf_the_sharded_prefill_will_need(
     finally:
         for name in (rows, plane, foreign):
             KernelRegistry.get()._unregister(name)
+
+
+@pytest.mark.parametrize("rank", [0, 3])
+def test_query_inputs_stay_out_of_forward_context_and_survive_next_step(rank):
+    from dataclasses import fields, is_dataclass
+
+    from tokenspeed.runtime.execution.context import ForwardContext
+    from tokenspeed.runtime.execution.input_buffer import InputBuffers
+    from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+
+    buffers = InputBuffers(2, 16, 0, device="cpu")
+    plan = QueryShardPlan.from_forward(
+        total_tokens=3, input_lengths=[2, 1], size=4, rank=rank
+    )
+    inputs = buffers.prepare_query_shard(plan=plan, input_lengths=[2, 1])
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=2,
+        num_extends=2,
+        input_num_tokens=3,
+        forward_mode=ForwardMode.EXTEND,
+        output_layout=ForwardOutputLayout(2, 2, 0, 1),
+        query_shard=plan,
+    )
+
+    def assert_no_tensor(value):
+        assert not isinstance(value, torch.Tensor)
+        if is_dataclass(value):
+            for field in fields(value):
+                assert_no_tensor(getattr(value, field.name))
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                assert_no_tensor(item)
+
+    assert type(ctx.query_shard) is QueryShardPlan
+    assert_no_tensor(ctx)
+    previous = inputs.local_row_ids.clone()
+    next_plan = QueryShardPlan.from_forward(
+        total_tokens=11, input_lengths=[6, 5], size=4, rank=rank
+    )
+    next_inputs = buffers.prepare_query_shard(plan=next_plan, input_lengths=[6, 5])
+    assert buffers.query_shard is next_inputs
+    assert torch.equal(inputs.local_row_ids, previous)
+    assert ctx.query_shard is plan
+    assert buffers.prepare_query_shard(plan=None, input_lengths=[]) is None
+    assert buffers.query_shard is None
+    assert torch.equal(inputs.local_row_ids, previous)

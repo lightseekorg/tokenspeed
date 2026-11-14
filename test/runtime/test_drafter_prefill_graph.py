@@ -76,7 +76,10 @@ from tokenspeed.runtime.execution.forward_batch_info import (  # noqa: E402
     CaptureHiddenMode,
     ForwardMode,
 )
-from tokenspeed.runtime.execution.query_shard import QueryShardPlan  # noqa: E402
+from tokenspeed.runtime.execution.query_shard import (  # noqa: E402
+    QueryShardInputs,
+    QueryShardPlan,
+)
 from tokenspeed.runtime.execution.tree_spec import (  # noqa: E402
     TreeSpec,
     TreeSpecConfig,
@@ -462,11 +465,11 @@ def test_rounds_a_graph_did_not_bake_run_eager(monkeypatch) -> None:
     dp = extend_input(drafter, [5], global_num_tokens=[5, 9], global_bs=[1, 1])
     assert drafter._extend_graph_route(1, dp) is None
     # A query shard of the span.
-    shard = QueryShardPlan.from_forward(
-        total_tokens=8,
+    shard = QueryShardInputs.from_plan(
+        plan=QueryShardPlan.from_forward(
+            total_tokens=8, input_lengths=[8], size=2, rank=0
+        ),
         input_lengths=[8],
-        size=2,
-        rank=0,
         device=drafter.input_buffers.seq_lens_buf.device,
     )
     sharded = extend_input(drafter, [8], query_shard=shard)

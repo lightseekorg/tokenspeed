@@ -709,14 +709,21 @@ def test_distributed_four_way_lookup(monkeypatch):
             rtol=0,
             atol=0,
         )
-        from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+        from tokenspeed.runtime.execution.query_shard import (
+            QueryShardInputs,
+            QueryShardPlan,
+        )
 
         for rows in (7, 2):
             full_ids = torch.arange(rows * 3, device=device).reshape(rows, 3) % 19
-            plan = QueryShardPlan.from_forward(
-                total_tokens=rows, input_lengths=[rows], size=4, rank=rank, device="cpu"
+            plan = QueryShardInputs.from_plan(
+                plan=QueryShardPlan.from_forward(
+                    total_tokens=rows, input_lengths=[rows], size=4, rank=rank
+                ),
+                input_lengths=[rows],
+                device="cpu",
             )
-            actual = table(full_ids[plan.local_row_ids], query_shard=plan)
+            actual = table(full_ids[plan.local_row_ids], query_shard=plan.plan)
             expected = _dequant(codes, scales)[full_ids.cpu()][plan.local_row_ids]
             torch.testing.assert_close(actual, expected.to(device), rtol=0, atol=0)
     finally:
@@ -1093,7 +1100,10 @@ def test_cuda_host_table_gather_matches_device_shard():
 
 @pytest.mark.parametrize("counts", [(2, 1, 1, 1), (1, 1, 0, 0)])
 def test_query_sharded_embedding_matches_full_lookup(monkeypatch, counts):
-    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+    from tokenspeed.runtime.execution.query_shard import (
+        QueryShardInputs,
+        QueryShardPlan,
+    )
 
     codes, scales = _weights(19, 64)
     ids = torch.arange(sum(counts) * 3).reshape(-1, 3) % 19
@@ -1112,11 +1122,11 @@ def test_query_sharded_embedding_matches_full_lookup(monkeypatch, counts):
         partials.append(table(ids, query_shard=None).flatten(1))
     total = torch.stack(partials).sum(0)
     for rank, table in enumerate(tables):
-        plan = QueryShardPlan.from_forward(
-            total_tokens=sum(counts),
+        plan = QueryShardInputs.from_plan(
+            plan=QueryShardPlan.from_forward(
+                total_tokens=sum(counts), input_lengths=[sum(counts)], size=4, rank=rank
+            ),
             input_lengths=[sum(counts)],
-            size=4,
-            rank=rank,
             device="cpu",
         )
 
@@ -1133,5 +1143,5 @@ def test_query_sharded_embedding_matches_full_lookup(monkeypatch, counts):
 
         monkeypatch.setattr(engram, "token_all_gather_rows", gather)
         monkeypatch.setattr(engram, "token_reduce_scatter", scatter)
-        actual = table(ids[plan.local_row_ids], query_shard=plan)
+        actual = table(ids[plan.local_row_ids], query_shard=plan.plan)
         torch.testing.assert_close(actual, expected[plan.local_row_ids], rtol=0, atol=0)

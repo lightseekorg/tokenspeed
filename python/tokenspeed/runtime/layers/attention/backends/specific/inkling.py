@@ -73,7 +73,7 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
     scrub_padding_tail,
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+from tokenspeed.runtime.execution.query_shard import QueryShardInputs
 from tokenspeed.runtime.layers.attention.backends.base import (
     AttentionBackend,
     reject_bounded_replay,
@@ -650,7 +650,7 @@ class InklingAttnBackend(AttentionBackend):
         extend_replay_lens_cpu: torch.Tensor,
         extend_prompt_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
-        query_shard: QueryShardPlan | None,
+        query_shard: QueryShardInputs | None,
         **kwargs,
     ):
         reject_bounded_replay(extend_replay_lens_cpu, "InklingAttentionBackend")

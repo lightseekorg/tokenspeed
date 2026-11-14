@@ -53,7 +53,7 @@ from tokenspeed_kernel.ops.attention.dsv4._triton.dcp import normalize_dcp_parti
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.distributed.comm_ops import all_gather, token_all_gather
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+from tokenspeed.runtime.execution.query_shard import QueryShardInputs
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.backends.support import CudaGraphSupport
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
@@ -180,8 +180,8 @@ class V41RowPlan(NamedTuple):
     source: V41Metadata
     query: V41Metadata
     keep_rows: torch.Tensor | None
-    source_shard: QueryShardPlan | None
-    query_shard: QueryShardPlan | None
+    source_shard: QueryShardInputs | None
+    query_shard: QueryShardInputs | None
 
 
 class V41DecoderView(NamedTuple):
@@ -210,8 +210,9 @@ class V41PrefillQueryShard(NamedTuple):
     which sampled_rows holds on the device in the view's layout.
     """
 
+    inputs: QueryShardInputs
     keep_rows: torch.Tensor
-    decoder_plan: QueryShardPlan
+    decoder_plan: QueryShardInputs
     sampled_rows: torch.Tensor
 
 
@@ -723,7 +724,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         extend_replay_lens_cpu: torch.Tensor,
         extend_prompt_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
-        query_shard: QueryShardPlan | None,
+        query_shard: QueryShardInputs | None,
         **kwargs,
     ) -> None:
         if query_shard is not None:
@@ -990,13 +991,18 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             raise RuntimeError("V4.1 metadata has not been prepared for this forward")
         return self._decoder_view
 
+    def require_query_shard_inputs(self) -> QueryShardInputs:
+        return self.prefill_query_shard().inputs
+
     def prefill_query_shard(self) -> V41PrefillQueryShard:
         """This rank's rows of the current model-wide QCP prefill."""
         if self._prefill_query_shard is None:
             raise RuntimeError("V4.1 metadata was not prepared with a query shard")
         return self._prefill_query_shard
 
-    def _partition_prefill_queries(self, plan: QueryShardPlan) -> V41PrefillQueryShard:
+    def _partition_prefill_queries(
+        self, plan: QueryShardInputs
+    ) -> V41PrefillQueryShard:
         """Derive encoder/CED row ownership without slicing cache-write plans.
 
         Planning uses host spans and the decoder view's host logits rows; it
@@ -1026,6 +1032,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         )
         local = plan.split_rows(kept_cpu).local_ids
         return V41PrefillQueryShard(
+            plan,
             self._upload_int64(local.tolist()),
             decoder_plan,
             (
@@ -1465,7 +1472,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         index_process_group,
         *,
         projected_partition: InterleavedQueryPlan | None = None,
-        query_shard: QueryShardPlan | None,
+        query_shard: QueryShardInputs | None,
     ):
         """Select/reuse request-local global rows; return (physical slots, lengths).
 
@@ -1917,7 +1924,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         requests,
         forward_mode,
         *,
-        query_shard: QueryShardPlan | None,
+        query_shard: QueryShardInputs | None,
     ) -> V41SWAQueryPlan:
         """Validate one prefill query window and retain only address scratch.
 

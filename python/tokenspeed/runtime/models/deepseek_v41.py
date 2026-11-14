@@ -992,7 +992,9 @@ def _row_plan(layer_id: int, ced_decoder_start: int, ctx: ForwardContext) -> V41
     """
     backend = ctx.attn_backend
     full = backend.query_metadata(ctx.forward_mode)
-    shard = ctx.query_shard
+    shard = (
+        backend.require_query_shard_inputs() if ctx.query_shard is not None else None
+    )
     if shard is not None:
         if not ctx.forward_mode.is_extend() or ctx.forward_mode.is_mixed():
             raise ValueError("V4.1 model query sharding requires pure prefill")
@@ -2291,7 +2293,7 @@ class DeepseekV41DecoderLayer(nn.Module):
         # do not apply the enclosing stage's full-row sizing to its local plan.
         return replace(
             ctx,
-            query_shard=plan,
+            query_shard=plan.plan,
             collective_num_tokens=None,
             collective_global_num_tokens=None,
         )
@@ -2638,7 +2640,9 @@ class DeepseekV41Model(nn.Module):
                 state.hashes[:, layer.engram.layer_hash_index],
                 state.engram_token_mask,
                 query_shard=(
-                    _row_plan(layer.layer_id, self.ced_decoder_start, ctx).source_shard
+                    _row_plan(
+                        layer.layer_id, self.ced_decoder_start, ctx
+                    ).source_shard.plan
                     if ctx.query_shard is not None
                     else None
                 ),

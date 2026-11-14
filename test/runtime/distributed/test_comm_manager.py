@@ -27,7 +27,7 @@ import torch.multiprocessing as mp
 
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+from tokenspeed.runtime.execution.query_shard import QueryShardInputs, QueryShardPlan
 
 
 def get_open_port() -> int:
@@ -282,19 +282,29 @@ QCP_HIDDEN = 16
 QCP_LENGTHS = [4, 1, 5]
 
 
-def _qcp_plan(rank: int) -> QueryShardPlan:
-    return QueryShardPlan.from_forward(
-        total_tokens=sum(QCP_LENGTHS),
+def _qcp_plan(rank: int) -> QueryShardInputs:
+    return QueryShardInputs.from_plan(
+        plan=QueryShardPlan.from_forward(
+            total_tokens=sum(QCP_LENGTHS),
+            input_lengths=QCP_LENGTHS,
+            size=QCP_WORLD,
+            rank=rank,
+        ),
         input_lengths=QCP_LENGTHS,
-        size=QCP_WORLD,
-        rank=rank,
         device="cpu",
     )
 
 
-def _qcp_ctx(plan: QueryShardPlan) -> ForwardContext:
+def _qcp_ctx(plan: QueryShardInputs) -> ForwardContext:
+    from tokenspeed.runtime.layers.attention.backends.paged.dsa import (
+        DSABackend,
+        DSAQueryShardMetadata,
+    )
+
+    backend = DSABackend.__new__(DSABackend)
+    backend.query_shard_metadata = DSAQueryShardMetadata(plan=plan, groups=())
     return ForwardContext(
-        attn_backend=None,
+        attn_backend=backend,
         token_to_kv_pool=None,
         bs=len(QCP_LENGTHS),
         num_extends=len(QCP_LENGTHS),
@@ -302,7 +312,7 @@ def _qcp_ctx(plan: QueryShardPlan) -> ForwardContext:
         forward_mode=ForwardMode.EXTEND,
         output_layout=None,
         gather_ids=torch.cumsum(torch.tensor(QCP_LENGTHS), 0) - 1,
-        query_shard=plan,
+        query_shard=plan.plan,
     )
 
 
@@ -511,13 +521,13 @@ def _qcp_main(rank: int, port: int) -> None:
     torch.manual_seed(11)
     ids = torch.randint(0, 256, (plan.total_rows,))  # the span, every rank
     replicated = embedding(ids)  # the whole span through the all-reduce path
-    sharded = embedding(ids[plan.local_row_ids], query_shard=plan)
+    sharded = embedding(ids[plan.local_row_ids], query_shard=plan.plan)
     assert sharded.shape == (plan.local_rows, QCP_HIDDEN)
     torch.testing.assert_close(sharded, replicated[plan.local_row_ids], rtol=0, atol=0)
     with pytest.raises(ValueError, match="reduces its rows"):
-        embedding(ids[plan.local_row_ids], reduce_results=False, query_shard=plan)
+        embedding(ids[plan.local_row_ids], reduce_results=False, query_shard=plan.plan)
     with pytest.raises(ValueError, match="embeds"):
-        embedding(ids, query_shard=plan)
+        embedding(ids, query_shard=plan.plan)
 
     # A dense or MoE group narrower than attention TP has no rows to gather
     # on the replicated forward, so the layout is refused.

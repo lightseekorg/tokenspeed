@@ -1421,7 +1421,10 @@ class DeepseekV3AttentionMLA(nn.Module):
                     "a query shard writes every row of the span; a partial write "
                     "count cannot be combined with it"
                 )
-            key_rows = QueryShardGather(ctx.query_shard, self.mapping.attn.qcp_group)
+            key_rows = QueryShardGather(
+                ctx.attn_backend.require_query_shard_inputs(),
+                self.mapping.attn.qcp_group,
+            )
             cache_num_tokens = ctx.query_shard.total_rows
         elif cache_num_tokens is None:
             cache_num_tokens = query_tokens

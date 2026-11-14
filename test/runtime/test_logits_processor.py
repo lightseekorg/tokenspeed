@@ -1480,7 +1480,7 @@ def test_input_logprobs_refuse_a_model_that_narrowed_its_logits_rows():
     )
 
     # A narrowing model hands over only its selected rows ...
-    with pytest.raises(ValueError, match="narrowed"):
+    with pytest.raises(ValueError, match="selected logits rows"):
         processor(
             input_ids=None,
             hidden_states=torch.randn(1, 2, device=device),
@@ -1683,7 +1683,10 @@ def test_a_sharded_forward_gathers_the_planned_rows_then_the_sampled_rows(
     sampled rows leave the shard. A FULL capture stays the shard. Every rank,
     one without planned rows included, joins both gathers."""
     from tokenspeed.runtime.execution.forward_batch_info import CaptureHiddenMode
-    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+    from tokenspeed.runtime.execution.query_shard import (
+        QueryShardInputs,
+        QueryShardPlan,
+    )
 
     # Rows 0..9, one per zigzag segment: rank 0 holds rows 0, 4, 5, rank 1
     # rows 1, 6, rank 2 rows 2, 7, rank 3 rows 3, 8, 9. Sampled rows 3, 4, 9.
@@ -1698,8 +1701,12 @@ def test_a_sharded_forward_gathers_the_planned_rows_then_the_sampled_rows(
     plan_rows = torch.tensor([0, 1, 2, 4, 5, 6, 7])
     plan_targets = torch.tensor([3, 1, 7, 4, 2, 2, 5])
     plans = [
-        QueryShardPlan.from_forward(
-            total_tokens=total, input_lengths=lengths, size=4, rank=rank, device="cpu"
+        QueryShardInputs.from_plan(
+            plan=QueryShardPlan.from_forward(
+                total_tokens=total, input_lengths=lengths, size=4, rank=rank
+            ),
+            input_lengths=lengths,
+            device="cpu",
         )
         for rank in range(4)
     ]
@@ -1744,8 +1751,12 @@ def test_a_sharded_forward_gathers_the_planned_rows_then_the_sampled_rows(
     )
 
     for rank in range(4):
-        plan = QueryShardPlan.from_forward(
-            total_tokens=total, input_lengths=lengths, size=4, rank=rank, device="cpu"
+        plan = QueryShardInputs.from_plan(
+            plan=QueryShardPlan.from_forward(
+                total_tokens=total, input_lengths=lengths, size=4, rank=rank
+            ),
+            input_lengths=lengths,
+            device="cpu",
         )
         proc = _sharded_processor(monkeypatch, 4, rank)
         split = plan.split_rows(plan_rows)
@@ -1795,7 +1806,10 @@ def test_a_last_capture_under_a_shard_is_the_gathered_sampled_rows(monkeypatch, 
     capture never selects the taps, so the forward spends no collective on
     them. ``taps=0`` is a model without taps."""
     from tokenspeed.runtime.execution.forward_batch_info import CaptureHiddenMode
-    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+    from tokenspeed.runtime.execution.query_shard import (
+        QueryShardInputs,
+        QueryShardPlan,
+    )
 
     # Rows 0..9, one per zigzag segment; sampled rows 3 and 9 on rank 3, 4 on
     # rank 0.
@@ -1825,8 +1839,12 @@ def test_a_last_capture_under_a_shard_is_the_gathered_sampled_rows(monkeypatch, 
 
     modes = (CaptureHiddenMode.LAST, CaptureHiddenMode.FULL, CaptureHiddenMode.NULL)
     for rank in range(4):
-        plan = QueryShardPlan.from_forward(
-            total_tokens=total, input_lengths=lengths, size=4, rank=rank, device="cpu"
+        plan = QueryShardInputs.from_plan(
+            plan=QueryShardPlan.from_forward(
+                total_tokens=total, input_lengths=lengths, size=4, rank=rank
+            ),
+            input_lengths=lengths,
+            device="cpu",
         )
         current["plan"] = plan
         shard = hidden[plan.local_row_ids]
@@ -1876,10 +1894,17 @@ def test_a_shard_refuses_pre_selected_rows_and_a_mismatched_head(monkeypatch):
     """A model that selected its rows before the processor has no prompt
     activations left -- the refusal fires whether or not the forward is
     sharded. And the shard's group must be the LM head's vocab-shard group."""
-    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+    from tokenspeed.runtime.execution.query_shard import (
+        QueryShardInputs,
+        QueryShardPlan,
+    )
 
-    plan = QueryShardPlan.from_forward(
-        total_tokens=4, input_lengths=[4], size=2, rank=0, device="cpu"
+    plan = QueryShardInputs.from_plan(
+        plan=QueryShardPlan.from_forward(
+            total_tokens=4, input_lengths=[4], size=2, rank=0
+        ),
+        input_lengths=[4],
+        device="cpu",
     )
     lm_head = SimpleNamespace(weight=torch.randn(8, 2))
     rows = _input_logprob_rows(
@@ -1892,7 +1917,7 @@ def test_a_shard_refuses_pre_selected_rows_and_a_mismatched_head(monkeypatch):
         gathered_to_rows=[0, 1, 2],
     )
     proc = _sharded_processor(monkeypatch, 2, 0)
-    with pytest.raises(ValueError, match="narrowed"):
+    with pytest.raises(ValueError, match="selected logits rows"):
         proc(
             input_ids=None,
             hidden_states=torch.randn(1, 2),
@@ -1956,6 +1981,57 @@ def test_a_shard_refuses_pre_selected_rows_and_a_mismatched_head(monkeypatch):
                 gather_ids=torch.tensor([3]),
                 query_shard=plan,
             ),
+        )
+
+
+@pytest.mark.parametrize("num_rows", [0, 1, 2])
+@pytest.mark.parametrize("sharded", [False, True])
+def test_selected_rows_refuse_prompt_logprobs_even_when_shapes_match(num_rows, sharded):
+    from transformers import PretrainedConfig
+
+    from tokenspeed.runtime.execution.query_shard import (
+        QueryShardInputs,
+        QueryShardPlan,
+    )
+
+    shard = (
+        QueryShardInputs.from_plan(
+            plan=QueryShardPlan.from_forward(
+                total_tokens=4, input_lengths=[4], size=2, rank=0
+            ),
+            input_lengths=[4],
+            device="cpu",
+        )
+        if sharded
+        else None
+    )
+    processor = LogitsProcessor(
+        PretrainedConfig(vocab_size=8),
+        tp_rank=0,
+        tp_size=2 if sharded else 1,
+        tp_group=(0, 1) if sharded else (0,),
+        dp_lm_head_tp=False,
+    )
+    metadata = LogitsMetadata(
+        forward_mode=ForwardMode.EXTEND,
+        query_shard=shard,
+        logits_rows_selected=True,
+        input_logprob_rows=_input_logprob_rows(
+            [0],
+            [1],
+            num_input_rows=num_rows,
+            chunk_tokens=8,
+            device="cpu",
+        ),
+    )
+    with pytest.raises(
+        ValueError, match="selected logits rows cannot provide input logprobs"
+    ):
+        processor(
+            input_ids=None,
+            hidden_states=torch.zeros(num_rows, 2),
+            lm_head=torch.nn.Linear(2, 8, bias=False),
+            logits_metadata=metadata,
         )
 
 

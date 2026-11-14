@@ -1251,7 +1251,7 @@ class ForwardStepRunner:
                 extend_replay_lens_cpu=extend_replay_lens_cpu,
                 extend_prompt_lens_cpu=extend_prompt_lens_cpu,
                 extend_state_checkpoint_lens_cpu=extend_state_checkpoint_lens_cpu,
-                query_shard=ctx.query_shard,
+                query_shard=self.input_buffers.query_shard,
                 positions=positions,
                 global_num_tokens=ctx.global_num_tokens,
                 all_decode_or_idle=ctx.all_decode_or_idle,

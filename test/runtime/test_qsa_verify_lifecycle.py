@@ -133,6 +133,7 @@ def _runner(
         req_pool_indices_buf=torch.tensor([2, 3, 0, 0], dtype=torch.int32),
         seq_lens_buf=torch.tensor([10, 10, 1, 1], dtype=torch.int32),
         state_write_req_pool_indices_buf=torch.zeros(4, dtype=torch.int32),
+        query_shard=None,
     )
     wrapper.token_to_kv_pool = SimpleNamespace(
         arena=SimpleNamespace(cache_group_specs=())

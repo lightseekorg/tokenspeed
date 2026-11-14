@@ -63,7 +63,7 @@ def _worker(rank: int, port: int, logprob_order: str, errors) -> None:
         errors[rank] = traceback.format_exc()
 
 
-def _staging_executor(shifted_ids: torch.Tensor, vocab: int):
+def _staging_executor(shifted_ids: torch.Tensor, vocab: int, query_shard):
     """Just enough of a ``ModelExecutor`` to run ``_input_logprob_rows``."""
     from tokenspeed.runtime.execution import model_executor as executor_module
     from tokenspeed.runtime.execution.nan_guard import NanGuard
@@ -73,7 +73,9 @@ def _staging_executor(shifted_ids: torch.Tensor, vocab: int):
     executor.device = "cpu"
     executor.runtime_states = SimpleNamespace(vocab_size=vocab)
     executor.config = SimpleNamespace(input_logprob_chunk_tokens=2)
-    executor.input_buffers = SimpleNamespace(shifted_prefill_ids_buf=shifted_ids)
+    executor.input_buffers = SimpleNamespace(
+        shifted_prefill_ids_buf=shifted_ids, query_shard=query_shard
+    )
     executor.nan_guard = NanGuard(max_bs=8, device="cpu")
     executor.nan_guard.reset(8)
     return executor
@@ -93,18 +95,25 @@ def _forward(
     """One sharded extend forward's exit on ``rank``; checks it against the
     unsharded computation and the other ranks' results."""
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+    from tokenspeed.runtime.execution.query_shard import (
+        QueryShardInputs,
+        QueryShardPlan,
+    )
     from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
     from tokenspeed.runtime.sampling.utils import gather_token_logprobs
 
     total = sum(lengths)
-    shard = QueryShardPlan.from_forward(
-        total_tokens=total, input_lengths=lengths, size=WORLD, rank=rank, device="cpu"
+    shard = QueryShardInputs.from_plan(
+        plan=QueryShardPlan.from_forward(
+            total_tokens=total, input_lengths=lengths, size=WORLD, rank=rank
+        ),
+        input_lengths=lengths,
+        device="cpu",
     )
     gather_ids = torch.cumsum(torch.tensor(lengths), 0) - 1
     vocab = weight.shape[0]
-    rows = _staging_executor(shifted_ids, vocab)._input_logprob_rows(
-        plan, len(lengths), total, shard
+    rows = _staging_executor(shifted_ids, vocab, shard)._input_logprob_rows(
+        plan, len(lengths), total
     )
     local = weight[rank * (vocab // WORLD) : (rank + 1) * (vocab // WORLD)]
     metadata = LogitsMetadata(
@@ -145,8 +154,8 @@ def _forward(
         assert torch.equal(other, out.input_token_logprobs)
     # And it is the tensor-parallel path's bit for bit: the same processor
     # over the replicated rows (no shard) meets the same operands per row.
-    replicated = _staging_executor(shifted_ids, vocab)._input_logprob_rows(
-        plan, len(lengths), total, None
+    replicated = _staging_executor(shifted_ids, vocab, None)._input_logprob_rows(
+        plan, len(lengths), total
     )
     reference = processor(
         input_ids=None,

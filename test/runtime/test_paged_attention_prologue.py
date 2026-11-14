@@ -235,7 +235,10 @@ def test_a_query_shard_gathers_the_rotated_latent_before_the_masked_store(
     a cache, all-gathers the rotated latent with the plan's row counts, puts
     it in span order and stores it through the owner-masked target: the same
     masked write as KVP alone, fed by every rank's rows."""
-    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+    from tokenspeed.runtime.execution.query_shard import (
+        QueryShardInputs,
+        QueryShardPlan,
+    )
     from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
 
     handed = {}
@@ -271,8 +274,12 @@ def test_a_query_shard_gathers_the_rotated_latent_before_the_masked_store(
             kv_write_target=lambda layer_id, s, m: LatentKVCache(None, False, s, m)
         ),
     )
-    plan = QueryShardPlan.from_forward(
-        total_tokens=5, input_lengths=[5], size=2, rank=0, device="cpu"
+    plan = QueryShardInputs.from_plan(
+        plan=QueryShardPlan.from_forward(
+            total_tokens=5, input_lengths=[5], size=2, rank=0
+        ),
+        input_lengths=[5],
+        device="cpu",
     )  # rows [3, 2]: this rank rotates three rows of a five-row span
     # Zigzag segments [2, 1, 1, 1]: rank 0 holds rows 0, 1 and 4.
     assert plan.local_row_ids.tolist() == [0, 1, 4]
@@ -316,7 +323,10 @@ def test_a_query_shard_gather_can_carry_extra_rows(monkeypatch):
     rotated latent, gathers both in one collective, stores the latent half
     and returns the extra half: the index-K write and the KV write share one
     gather instead of paying two."""
-    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+    from tokenspeed.runtime.execution.query_shard import (
+        QueryShardInputs,
+        QueryShardPlan,
+    )
 
     handed = {}
     rotated = torch.arange(3 * 576, dtype=torch.bfloat16).reshape(3, 576)
@@ -352,8 +362,12 @@ def test_a_query_shard_gather_can_carry_extra_rows(monkeypatch):
             kv_write_target=lambda layer_id, s, m: LatentKVCache(None, False, s, m)
         ),
     )
-    plan = QueryShardPlan.from_forward(
-        total_tokens=5, input_lengths=[5], size=2, rank=0, device="cpu"
+    plan = QueryShardInputs.from_plan(
+        plan=QueryShardPlan.from_forward(
+            total_tokens=5, input_lengths=[5], size=2, rank=0
+        ),
+        input_lengths=[5],
+        device="cpu",
     )  # rows [3, 2]
     q = torch.zeros(3, 4, 576, dtype=torch.bfloat16)
     out, gathered = layer.latent_prologue_with_rows(
@@ -385,7 +399,10 @@ def test_a_query_shard_gather_can_carry_extra_rows(monkeypatch):
 def test_extra_rows_must_keep_the_latent_half_16_byte_aligned():
     """The gathered payload is stored through a column slice, so an extra
     width that does not end on 16 bytes misaligns every latent row."""
-    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+    from tokenspeed.runtime.execution.query_shard import (
+        QueryShardInputs,
+        QueryShardPlan,
+    )
 
     layer = paged_attention.PagedAttention(
         4, 576, 1.0, num_kv_heads=1, layer_id=0, rotary_emb=None, qk_norm=None
@@ -397,8 +414,12 @@ def test_extra_rows_must_keep_the_latent_half_16_byte_aligned():
             kv_write_target=lambda layer_id, s, m: LatentKVCache(None, False, s, m)
         ),
     )
-    plan = QueryShardPlan.from_forward(
-        total_tokens=5, input_lengths=[5], size=2, rank=0, device="cpu"
+    plan = QueryShardInputs.from_plan(
+        plan=QueryShardPlan.from_forward(
+            total_tokens=5, input_lengths=[5], size=2, rank=0
+        ),
+        input_lengths=[5],
+        device="cpu",
     )  # rows [3, 2]
     with pytest.raises(ValueError, match="16-byte aligned"):
         layer.latent_prologue_with_rows(
@@ -418,7 +439,10 @@ def test_an_empty_shard_still_joins_the_gather_and_stores_its_pages(monkeypatch)
     not run on zero rows) but joins the latent all-gather with an empty
     contribution and stores the rows it owns of what the others computed;
     skipping either would hang the group or leave its pages unwritten."""
-    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+    from tokenspeed.runtime.execution.query_shard import (
+        QueryShardInputs,
+        QueryShardPlan,
+    )
 
     handed = {}
     monkeypatch.setattr(
@@ -450,8 +474,12 @@ def test_an_empty_shard_still_joins_the_gather_and_stores_its_pages(monkeypatch)
         ),
     )
     # Two rows over four ranks: ranks 2 and 3 hold nothing.
-    plan = QueryShardPlan.from_forward(
-        total_tokens=2, input_lengths=[2], size=4, rank=3, device="cpu"
+    plan = QueryShardInputs.from_plan(
+        plan=QueryShardPlan.from_forward(
+            total_tokens=2, input_lengths=[2], size=4, rank=3
+        ),
+        input_lengths=[2],
+        device="cpu",
     )
     assert plan.local_rows == 0
     q = torch.zeros(0, 4, 576, dtype=torch.bfloat16)
@@ -478,13 +506,27 @@ def test_the_dense_mla_paths_refuse_a_query_shard_before_any_early_return():
     also on a rank whose shard is empty, which must not return before the
     collectives the other ranks join -- and the absorbed projection runs the
     prologue on zero rows without the absorption GEMM."""
-    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+    from tokenspeed.runtime.execution.query_shard import (
+        QueryShardInputs,
+        QueryShardPlan,
+    )
     from tokenspeed.runtime.models import deepseek_v3
 
-    plan = QueryShardPlan.from_forward(
-        total_tokens=2, input_lengths=[2], size=4, rank=3, device="cpu"
+    plan = QueryShardInputs.from_plan(
+        plan=QueryShardPlan.from_forward(
+            total_tokens=2, input_lengths=[2], size=4, rank=3
+        ),
+        input_lengths=[2],
+        device="cpu",
     )
-    sharded = SimpleNamespace(query_shard=plan)
+    from tokenspeed.runtime.layers.attention.backends.paged.dsa import (
+        DSABackend,
+        DSAQueryShardMetadata,
+    )
+
+    backend = DSABackend.__new__(DSABackend)
+    backend.query_shard_metadata = DSAQueryShardMetadata(plan=plan, groups=())
+    sharded = SimpleNamespace(query_shard=plan.plan, attn_backend=backend)
     attention = deepseek_v3.DeepseekV3AttentionMLA.__new__(
         deepseek_v3.DeepseekV3AttentionMLA
     )

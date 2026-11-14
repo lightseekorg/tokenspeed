@@ -26,7 +26,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+from tokenspeed.runtime.execution.query_shard import QueryShardInputs, QueryShardPlan
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ci_system.ci_register import register_cuda_ci
@@ -39,11 +39,11 @@ register_cuda_ci(est_time=5, suite="runtime-1gpu")
 def test_row_payloads_survive_sharding_and_selected_row_gathers(size, lengths):
     total = sum(lengths)
     plans = [
-        QueryShardPlan.from_forward(
-            total_tokens=total,
+        QueryShardInputs.from_plan(
+            plan=QueryShardPlan.from_forward(
+                total_tokens=total, input_lengths=lengths, size=size, rank=rank
+            ),
             input_lengths=lengths,
-            size=size,
-            rank=rank,
             device="cpu",
         )
         for rank in range(size)
@@ -86,11 +86,11 @@ def test_row_payloads_survive_sharding_and_selected_row_gathers(size, lengths):
 def test_successive_row_selections_keep_their_gather_order(size, device):
     lengths = [5, 1, 9]
     plans = [
-        QueryShardPlan.from_forward(
-            total_tokens=sum(lengths),
+        QueryShardInputs.from_plan(
+            plan=QueryShardPlan.from_forward(
+                total_tokens=sum(lengths), input_lengths=lengths, size=size, rank=rank
+            ),
             input_lengths=lengths,
-            size=size,
-            rank=rank,
             device=device,
         )
         for rank in range(size)
@@ -124,11 +124,11 @@ def test_equal_segments_balance_causal_visible_key_work_per_request(size):
     )
     per_rank = []
     for rank in range(size):
-        plan = QueryShardPlan.from_forward(
-            total_tokens=sum(lengths),
+        plan = QueryShardInputs.from_plan(
+            plan=QueryShardPlan.from_forward(
+                total_tokens=sum(lengths), input_lengths=lengths, size=size, rank=rank
+            ),
             input_lengths=lengths,
-            size=size,
-            rank=rank,
             device="cpu",
         )
         per_rank.append(costs[plan.local_row_ids].sum().item())
@@ -145,8 +145,12 @@ def test_retained_rows_keep_their_original_owner(size, kept):
     span = torch.arange(45).reshape(15, 3)
     pieces, outputs = [], []
     for rank in range(size):
-        parent = QueryShardPlan.from_forward(
-            total_tokens=15, input_lengths=lengths, size=size, rank=rank, device="cpu"
+        parent = QueryShardInputs.from_plan(
+            plan=QueryShardPlan.from_forward(
+                total_tokens=15, input_lengths=lengths, size=size, rank=rank
+            ),
+            input_lengths=lengths,
+            device="cpu",
         )
         child = parent.select_rows(
             kept, input_lengths=retained_lengths, sampled_rows=samples
@@ -165,6 +169,71 @@ def test_retained_rows_keep_their_original_owner(size, kept):
     assert torch.equal(
         torch.cat(outputs)[child.sampled_to_request], span[kept][samples]
     )
+
+
+@pytest.mark.parametrize("size", [1, 2, 8])
+@pytest.mark.parametrize("lengths", [[], [1], [2, 1, 3], [17, 9, 31]])
+def test_host_layout_contains_only_counts(size, lengths):
+    from dataclasses import fields
+
+    for rank in range(size):
+        plan = QueryShardPlan.from_forward(
+            total_tokens=sum(lengths), input_lengths=lengths, size=size, rank=rank
+        )
+        for field in fields(plan):
+            value = getattr(plan, field.name)
+            assert type(value) is int or (
+                type(value) is tuple and all(type(count) is int for count in value)
+            )
+        inputs = QueryShardInputs.from_plan(
+            plan=plan, input_lengths=lengths, device="cpu"
+        )
+        assert inputs.plan is plan
+        assert plan.total_rows == sum(lengths)
+        assert plan.max_rows == max(plan.row_counts)
+        assert plan.all_equal == (len(set(plan.row_counts)) == 1)
+        assert plan.sampled_rows_total == len(lengths)
+        assert plan.local_sampled_rows == inputs.local_sampled_index.numel()
+        # The six device views share one transfer/allocation, even on empty ranks.
+        storage = inputs.span_to_gather.untyped_storage()
+        for tensor in (
+            inputs.local_row_ids,
+            inputs.gather_to_span,
+            inputs.local_index_of_row,
+            inputs.local_sampled_index,
+            inputs.sampled_to_request,
+        ):
+            assert tensor.untyped_storage().data_ptr() == storage.data_ptr()
+
+
+def test_input_lengths_must_describe_the_supplied_plan():
+    plan = QueryShardPlan.from_forward(
+        total_tokens=9, input_lengths=[4, 5], size=2, rank=0
+    )
+    with pytest.raises(ValueError, match="does not match input lengths"):
+        QueryShardInputs.from_plan(plan=plan, input_lengths=[5, 4], device="cpu")
+
+
+@pytest.mark.parametrize(
+    "counts",
+    [
+        {"row_counts": (4, 5), "local_rows_per_request": (2, 2)},
+        {"local_rows_per_request": (3, 2)},
+        {"sampled_rows_per_rank": (1, 1)},
+    ],
+)
+def test_supplied_plan_counts_are_validated(counts):
+    from dataclasses import replace
+
+    plan = QueryShardPlan.from_forward(
+        total_tokens=9, input_lengths=[4, 5], size=2, rank=0
+    )
+    with pytest.raises(
+        ValueError, match="query shard plan does not match input lengths"
+    ):
+        QueryShardInputs.from_plan(
+            plan=replace(plan, **counts), input_lengths=[4, 5], device="cpu"
+        )
 
 
 if __name__ == "__main__":

@@ -38,7 +38,7 @@ from tokenspeed_kernel.ops.attention.mla.cuda import (
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+from tokenspeed.runtime.execution.query_shard import QueryShardInputs
 from tokenspeed.runtime.layers.attention.backends.base import reject_query_shard
 from tokenspeed.runtime.layers.attention.backends.paged.base import (
     PagedAttentionBackend,
@@ -416,7 +416,7 @@ class FlashMLABackend(PagedAttentionBackend):
         extend_prefix_lens: torch.Tensor,
         extend_prefix_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
-        query_shard: QueryShardPlan | None,
+        query_shard: QueryShardInputs | None,
         page_table_cpu: torch.Tensor | None,
         **kwargs,
     ):

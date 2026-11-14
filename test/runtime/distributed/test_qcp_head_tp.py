@@ -50,6 +50,7 @@ Covered:
 
 from __future__ import annotations
 
+from dataclasses import replace
 from test.runtime.distributed._tp_layout_fakes import (
     HIDDEN,
     KV_LORA,
@@ -74,7 +75,11 @@ from tokenspeed.runtime.distributed.comm_ops import token_all_gather
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+from tokenspeed.runtime.execution.query_shard import QueryShardInputs, QueryShardPlan
+from tokenspeed.runtime.layers.attention.backends.paged.dsa import (
+    DSABackend,
+    DSAQueryShardMetadata,
+)
 
 WORLD = 4
 
@@ -160,7 +165,7 @@ class _QcpStubCore:
         assert k is None and v is None
         return self._attend(Q)
 
-    def sparse_prefill(self, plan: QueryShardPlan, *, q, layer, **kwargs):
+    def sparse_prefill(self, plan: QueryShardInputs, *, q, layer, **kwargs):
         """The backend's ``forward_sparse_prefill`` for ``layer`` (this)."""
         assert layer is self
         assert q.shape[0] == plan.local_rows
@@ -186,14 +191,22 @@ def _build(mapping: Mapping, weights: dict[str, torch.Tensor]):
     return attn
 
 
-def _extend_ctx(plan: QueryShardPlan, lengths: list[int]) -> ForwardContext:
+class _QcpBackend(DSABackend):
+    """Keep real shard metadata; replace only the unavailable GPU attention core."""
+
+    def __init__(self, plan: QueryShardInputs):
+        self.spec_num_tokens = 1
+        self.query_shard_metadata = DSAQueryShardMetadata(plan=plan, groups=())
+
+    def forward_sparse_prefill(self, **kwargs):
+        return kwargs["layer"].sparse_prefill(
+            self.require_query_shard_inputs(), **kwargs
+        )
+
+
+def _extend_ctx(plan: QueryShardInputs, lengths: list[int]) -> ForwardContext:
     return ForwardContext(
-        attn_backend=SimpleNamespace(
-            spec_num_tokens=1,
-            # Dispatches to the layer's stub, as the router dispatches to the
-            # leaf serving the layer.
-            forward_sparse_prefill=lambda **kw: kw["layer"].sparse_prefill(plan, **kw),
-        ),
+        attn_backend=_QcpBackend(plan),
         token_to_kv_pool=None,
         bs=len(lengths),
         num_extends=len(lengths),
@@ -201,7 +214,7 @@ def _extend_ctx(plan: QueryShardPlan, lengths: list[int]) -> ForwardContext:
         forward_mode=ForwardMode.EXTEND,
         output_layout=None,
         gather_ids=torch.tensor(lengths).cumsum(0) - 1,
-        query_shard=plan,
+        query_shard=plan.plan,
     )
 
 
@@ -259,11 +272,11 @@ def _worker(rank: int, rendezvous: str, tp_batch_invariant: str, lengths: list[i
     try:
         weights = attention_weights(HIDDEN)
         total = sum(lengths)
-        plan = QueryShardPlan.from_forward(
-            total_tokens=total,
+        plan = QueryShardInputs.from_plan(
+            plan=QueryShardPlan.from_forward(
+                total_tokens=total, input_lengths=lengths, size=WORLD, rank=rank
+            ),
             input_lengths=lengths,
-            size=WORLD,
-            rank=rank,
             device="cpu",
         )
         gen = torch.Generator().manual_seed(4)
@@ -403,22 +416,21 @@ def test_head_tp_row_counts_follow_the_layout():
     qcp = Mapping(
         rank=2, world_size=4, attn_tp_size=4, attn_qcp_size=4, attn_head_tp_size=4
     )
-    plan = QueryShardPlan.from_forward(
-        total_tokens=7, input_lengths=[4, 3], size=4, rank=2, device="cpu"
+    plan = QueryShardInputs.from_plan(
+        plan=QueryShardPlan.from_forward(
+            total_tokens=7, input_lengths=[4, 3], size=4, rank=2
+        ),
+        input_lengths=[4, 3],
+        device="cpu",
     )
-    sharded = SimpleNamespace(
-        global_num_tokens=None,
-        collective_global_num_tokens=None,
-        query_shard=plan,
-        collective_num_tokens=None,
-    )
+    sharded = _extend_ctx(plan, [4, 3])
     assert head_tp_row_counts(sharded, qcp, 2, collective=False) == [2, 2, 2, 1]
     assert head_tp_row_counts(sharded, qcp, 2, collective=True) == [2, 2, 2, 1]
     # A narrowing drafter reports the sampled rows; the output legs follow
     # (one row per zigzag segment: the requests' last rows 3 and 6 sit on
     # ranks 3 and 2).
     assert plan.sampled_rows_per_rank == (0, 0, 1, 1)
-    narrowed = SimpleNamespace(**{**vars(sharded), "collective_num_tokens": 2})
+    narrowed = replace(sharded, collective_num_tokens=2)
     assert head_tp_row_counts(narrowed, qcp, 1, collective=True) == [0, 0, 1, 1]
     with pytest.raises(ValueError, match="holds 0 rows"):
         head_tp_row_counts(narrowed, qcp, 0, collective=True)

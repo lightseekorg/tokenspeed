@@ -354,9 +354,9 @@ class Eagle(HiddenStateDrafter):
         ``[prefill_part || decode_part]`` under MIXED, full prefill chunks
         under EXTEND, ``base_model_output`` directly under DECODE. Under a
         query shard the ids are the shard's rows of the shifted prefill
-        ids (``QueryShardPlan.local_row_ids``) while ``gather_ids`` keep the batch's full layout, as on the
+        ids (``QueryShardInputs.local_row_ids``) while ``gather_ids`` keep the batch's full layout, as on the
         target's forward: the draft model's exit selects the shard's rows
-        with ``QueryShardPlan.local_sampled_index`` when it gathers the
+        with ``QueryShardInputs.local_sampled_index`` when it gathers the
         sampled rows across the group.
         """
         num_extends = draft_input.num_extends
@@ -466,7 +466,11 @@ class Eagle(HiddenStateDrafter):
             global_bs=draft_input.global_bs,
             all_decode_or_idle=draft_input.all_decode_or_idle,
             draft_narrowing=narrowing,
-            query_shard=draft_input.query_shard,
+            query_shard=(
+                None
+                if draft_input.query_shard is None
+                else draft_input.query_shard.plan
+            ),
         )
         # The step-0 rows: the whole span, or the target's shard of it.
         rows = (

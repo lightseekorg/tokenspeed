@@ -72,7 +72,7 @@ from tokenspeed.runtime.layers.attention.backends.support import TreeSupport
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+    from tokenspeed.runtime.execution.query_shard import QueryShardInputs
     from tokenspeed.runtime.layers.attention.backends.paged.offload_adapter import (
         KVOffloadAdapter,
     )
@@ -160,6 +160,7 @@ class CacheGroupRouter(AttentionBackend):
         self._leaf_factory = leaf_factory
         self._consumed_group_ids = consumed_group_ids
         self.leaves: dict[str, PagedAttentionBackend] = {}
+        self._query_shard_inputs: QueryShardInputs | None = None
         self._geometry: CacheGroupGeometry | None = None
         self._offload_adapter: KVOffloadAdapter | None = None
         self.is_draft = bool(is_draft)
@@ -694,7 +695,7 @@ class CacheGroupRouter(AttentionBackend):
         extend_replay_lens_cpu: torch.Tensor,
         extend_prompt_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
-        query_shard: QueryShardPlan | None,
+        query_shard: QueryShardInputs | None,
         block_tables_cpu: Mapping[str, torch.Tensor],
         **kwargs,
     ) -> None:
@@ -721,6 +722,7 @@ class CacheGroupRouter(AttentionBackend):
         del extend_prompt_lens_cpu
         reject_bounded_replay(extend_replay_lens_cpu, "CacheGroupRouter")
         del kwargs
+        self._query_shard_inputs = query_shard
         sharded = query_shard is not None and query_shard.size > 1
         # A new forward: the sparse layers' shared top-k is per forward.
         self.sparse_topk.clear()
@@ -788,6 +790,10 @@ class CacheGroupRouter(AttentionBackend):
         """The single decode path: fill the stacks from this step's tables,
         derive the decode write window, refresh every leaf in place."""
         del kwargs
+        # Draft extend preparation stages decode metadata before its prefill
+        # runs. Keep that round's query inputs until a pure decode replaces it.
+        if num_extends == 0:
+            self._query_shard_inputs = None
         self.sparse_topk.clear()
         if forward_mode.is_extend_or_mixed():
             raise RuntimeError(
@@ -855,6 +861,7 @@ class CacheGroupRouter(AttentionBackend):
         refreshes, then each leaf's own capture hook (the leaf default is
         its idle refresh; FlashMLA installs its recorded tile schedule)."""
         del kwargs
+        self._query_shard_inputs = None
         self.sparse_topk.clear()
         if not forward_mode.is_decode_or_idle():
             raise NotImplementedError(
@@ -1199,6 +1206,13 @@ class CacheGroupRouter(AttentionBackend):
     # group's index-K history through the leaf (``docs/design/unified_path.md``,
     # "Query context parallelism").
     # ------------------------------------------------------------------
+
+    def require_query_shard_inputs(self) -> QueryShardInputs:
+        if self._query_shard_inputs is None:
+            raise RuntimeError(
+                "this router has no prepared query shard inputs for the current forward"
+            )
+        return self._query_shard_inputs
 
     def require_query_shard_metadata(self):
         return self._sole_leaf(
