@@ -11,8 +11,9 @@ api_version: ci.tokenspeed.io/v1
 #
 # One server start gates both runs: the benchmark exits with status 1 when
 # either falls below --min-accuracy, and perf_reference (set from this
-# runner's runs) gates each run's decode rate: a run whose decode steps leave
-# the monokernels falls below it. The two-request run follows the one-request
+# runner's runs) gates each run's decode rate. A one-request run whose decode
+# steps leave the monokernels falls below it; at two requests it catches gross
+# regressions only (see entry 2). The two-request run follows the one-request
 # run on the same server (a warm prefix cache), so its reference assumes the
 # order --concurrency 1 2.
 name: perf-muse-spark-mxfp4-monokernel-gsm8k-single-request-mi35x
@@ -101,7 +102,9 @@ perf_threshold: 0.9
 # per request, 79.4 tok/s per GPU, 125 / 128 correct). The regular path
 # decodes about 20% slower on this recipe, below 0.9 of the reference.
 # 2: rounded down from the median of three runs on this runner (558.3 tok/s
-# per request, 121.8 tok/s per GPU, 124 / 128 correct).
+# per request, 121.8 tok/s per GPU, 124 / 128 correct). At two requests the
+# monokernel is only about 4% faster end to end than the regular path, which
+# stays above 0.9 of this reference, so this entry does not catch a fallback.
 perf_reference:
   1: [770, 79]
   2: [558, 121]

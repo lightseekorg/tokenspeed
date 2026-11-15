@@ -251,6 +251,17 @@ def main() -> int:
     prompts = load_gsm8k(args.num_prompts)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     rows, failed = [], False
+
+    def send(prompt: str) -> RequestResult:
+        return stream_chat(
+            args.base_url,
+            args.model,
+            prompt,
+            args.max_tokens,
+            args.chat_template_kwargs,
+            args.timeout_s,
+        )
+
     with args.output.open("w") as out:
         for concurrency in args.concurrency:
             correct = 0
@@ -258,14 +269,7 @@ def main() -> int:
             results = run_requests(
                 [question + PROMPT_SUFFIX for question, _ in prompts],
                 concurrency,
-                lambda prompt: stream_chat(
-                    args.base_url,
-                    args.model,
-                    prompt,
-                    args.max_tokens,
-                    args.chat_template_kwargs,
-                    args.timeout_s,
-                ),
+                send,
             )
             wall_s = time.perf_counter() - start
             for i, ((_, answer), result) in enumerate(zip(prompts, results)):
