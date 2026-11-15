@@ -54,19 +54,19 @@ fn request_events_pair_admission_with_completion_and_transfer_failure() {
             );
             let mut state = RequestState::new(vec![5, 6], 1, BTreeSet::new(), true, None, false);
             state.created_time = wall_seconds() - 1.0;
+            p.assign_admission(&mut state);
             p.register("ok".to_owned(), state);
             p.remote_prefill_done("ok", 7, 1, None);
             p.finish_remote_prefill_only("ok");
-            p.register(
-                "failed".to_owned(),
-                RequestState::new(vec![8, 9], 3, BTreeSet::new(), true, None, false),
-            );
+            let mut failed = RequestState::new(vec![8, 9], 3, BTreeSet::new(), true, None, false);
+            p.assign_admission(&mut failed);
+            p.register("failed".to_owned(), failed);
             p.fail_transfer("failed");
             p.fail_transfer("failed");
-            p.register(
-                "duplicate".to_owned(),
-                RequestState::new(vec![10, 11], 1, BTreeSet::new(), true, None, false),
-            );
+            let mut duplicate =
+                RequestState::new(vec![10, 11], 1, BTreeSet::new(), true, None, false);
+            p.assign_admission(&mut duplicate);
+            p.register("duplicate".to_owned(), duplicate);
             let mut refused = RequestState::new(vec![12], 1, BTreeSet::new(), true, None, false);
             refused.abort("duplicate request ID", true, Some(409));
             assert_eq!(

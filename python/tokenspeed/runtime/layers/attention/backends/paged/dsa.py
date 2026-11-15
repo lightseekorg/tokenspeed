@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.ops.attention.dsa import (
+    MXFP4_INDEX_QUERY_FORMAT,
     dsa_decode,
     dsa_decode_dcp_records,
     dsa_decode_dcp_records_supported,
@@ -42,6 +43,7 @@ from tokenspeed_kernel.ops.attention.dsa.flashinfer import (
     reserve_flashinfer_trtllm_dsa_buffers,
     trtllm_sparse_mla_query_heads,
 )
+from tokenspeed_kernel.ops.metadata import expand_k_row_lengths
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import KernelRegistry, priority_band_name
 from tokenspeed_kernel.selection import KernelPlan, NoKernelFoundError, select_kernel
@@ -508,8 +510,8 @@ class DSABackend(PagedAttentionBackend):
             # replay explicitly in its model code, so the class-level DSA
             # restriction does not apply to it.
             self.cuda_graph_support = CudaGraphSupport(prefill_graph=True)
-        elif spec.padded_prefill_replay and platform.is_nvidia:
-            # K3.1 narrows padded replays to live rows; validated on NVIDIA only.
+        elif spec.padded_prefill_replay:
+            # K3.1 narrows padded replays to live rows.
             self.cuda_graph_support = CudaGraphSupport(prefill_graph=True)
             padded_replay_opt_in = True
         if len(self.qcp_group) > 1:
@@ -520,9 +522,11 @@ class DSABackend(PagedAttentionBackend):
             self._probe_history_gather_topk_leaf(spec)
         # A pure KVP extend over gathered histories attends each request
         # group's history in the eager attention break, as the sharded extend
-        # arm does, so prefill capture is off here too.
+        # arm does, so prefill capture is off here too -- except under K3.1's
+        # padded replay on CDNA4, whose model code keeps the history gather
+        # inside the break and narrows the captured segments to live rows.
         self._history_prefill: bool = dsa_kvp_history_prefill(config)
-        if self._history_prefill:
+        if self._history_prefill and not (padded_replay_opt_in and platform.is_cdna4):
             self.cuda_graph_support = CudaGraphSupport(prefill_graph=False)
         # Planned sparse cores are captured only if they declare cuda_graph.
         self.cuda_graph_support = self.cuda_graph_support & CudaGraphSupport.from_plans(
@@ -751,7 +755,8 @@ class DSABackend(PagedAttentionBackend):
         plus a KPool's ``pool_size - 1`` tail slots (GLM-5.3-Flash's 2051).
         Under DCP the indexer scores the model-dtype index query and head
         weights against packed index-K pages of this leaf's page size,
-        without a solution pin (``select_dsa_topk``).
+        without a solution pin (``select_dsa_topk``); an mxfp4 plane's
+        scorers take mxfp4 queries only.
         """
         use_dcp = len(self.kvp_group) > 1
         q_dtype = (
@@ -803,13 +808,18 @@ class DSABackend(PagedAttentionBackend):
                     "dsa_index_candidates",
                     "dsa_index_candidates",
                     format_signature(
-                        q=dense_tensor_format(self.q_data_type),
+                        q=(
+                            MXFP4_INDEX_QUERY_FORMAT
+                            if self.index_k_format == "mxfp4"
+                            else dense_tensor_format(self.q_data_type)
+                        ),
                         weights=dense_tensor_format(self.q_data_type),
                     ),
                     {
                         "index_heads": self.index_n_heads,
                         "head_dim": self.index_head_dim,
                         "page_size": self.kernel_page_size,
+                        "index_k_format": self.index_k_format,
                         "index_k_layout": "packed",
                     },
                     None,
@@ -833,11 +843,14 @@ class DSABackend(PagedAttentionBackend):
         if plan is not None:
             plan.validate("attention", mode, signature, traits, None, solution, None)
             return plan.kernel.name, True
-        if mode == "dsa_index_candidates" and self.index_k_format != "fp8_scaled":
+        if mode == "dsa_index_candidates" and self.index_k_format not in (
+            "fp8_scaled",
+            "mxfp4",
+        ):
             # The facade refuses any other plane before it selects.
             raise TypeError(
-                "DSA index candidates require packed FP8 Index-K storage, "
-                f"index_k_format is {self.index_k_format!r}"
+                "DSA index candidates require fp8_scaled or mxfp4 Index-K "
+                f"storage, index_k_format is {self.index_k_format!r}"
             )
         kernel = select_kernel(
             "attention", mode, signature, traits=traits, solution=solution
@@ -1189,16 +1202,28 @@ class DSABackend(PagedAttentionBackend):
                 seq_lens_2d=metadata._dsa_seq_lens_2d,
                 page_size=self.kernel_page_size,
             )
+            self._publish_kv_seq_lens(metadata, bs)
+        elif metadata._dsa_kv_seq_lens is None:
+            self._publish_k_row_indexer_rows(metadata, seq_lens, bs, None)
+            self._publish_kv_seq_lens(metadata, bs)
         else:
-            self._publish_k_row_indexer_rows(metadata, seq_lens, bs)
-        self._publish_kv_seq_lens(metadata, bs)
+            # A target verify's allocated causal KV rows ride the same launch.
+            self._publish_k_row_indexer_rows(
+                metadata, seq_lens, bs, metadata._dsa_kv_seq_lens
+            )
 
     def _publish_k_row_indexer_rows(
-        self, metadata, seq_lens: torch.Tensor, bs: int
+        self,
+        metadata,
+        seq_lens: torch.Tensor,
+        bs: int,
+        causal_kv_seq_lens: torch.Tensor | None,
     ) -> None:
         """Rewrite the per-token indexer rows to ``seq_lens[:bs]`` (``k`` rows
         per request) and refresh their plan, both in place: fixed shapes and
-        storage, so a captured graph replays the edit."""
+        storage, so a captured graph replays the edit. ``causal_kv_seq_lens``,
+        a target verify's rows from :meth:`_publish_kv_seq_lens`, is rewritten
+        in the same launch; None leaves them alone."""
         k = self.spec_num_tokens
         rows = metadata._dsa_seq_lens_2d
         if rows.shape[0] != bs * k:
@@ -1206,7 +1231,13 @@ class DSABackend(PagedAttentionBackend):
                 "DSA draft per-token rows do not match the decode batch: "
                 f"rows={rows.shape[0]}, requests={bs}, width={k}"
             )
-        rows.copy_(_k_row_context_lengths(seq_lens[:bs], k))
+        expand_k_row_lengths(
+            seq_lens[:bs],
+            None if causal_kv_seq_lens is None else metadata.seq_lens_k[:bs],
+            k=k,
+            context_out=rows.view(-1),
+            causal_out=causal_kv_seq_lens,
+        )
         dsa_plan(
             seq_lens_2d=rows,
             page_size=self.kernel_page_size,
@@ -1260,7 +1291,7 @@ class DSABackend(PagedAttentionBackend):
             )
         bs = metadata.seq_lens_k.numel()
         metadata.seq_lens_k.copy_(frontier[:bs])
-        self._publish_k_row_indexer_rows(metadata, frontier, bs)
+        self._publish_k_row_indexer_rows(metadata, frontier, bs, None)
 
     def init_forward_metadata(
         self,
@@ -1328,7 +1359,7 @@ class DSABackend(PagedAttentionBackend):
         self.history_prefill = None
         if (
             self._history_prefill
-            and forward_mode.is_extend()
+            and forward_mode.is_extend_or_mixed()
             and num_extends > 0
             and page_table_cpu is not None
         ):
@@ -1375,7 +1406,7 @@ class DSABackend(PagedAttentionBackend):
         self._prefill_index_columns = None
         if (
             len(self.kvp_group) > 1
-            and forward_mode.is_extend()
+            and forward_mode.is_extend_or_mixed()
             and num_extends > 0
             and self.query_shard_metadata is None
             and self.history_prefill is None
@@ -1392,7 +1423,7 @@ class DSABackend(PagedAttentionBackend):
     def _plan_prefill_index_columns(
         self, page_table_cpu: torch.Tensor, seq_lens_cpu: torch.Tensor
     ) -> int:
-        """The owned width of a pure extend's KVP index tiles, in kernel pages.
+        """The owned width of the extend rows' KVP index tiles, in kernel pages.
 
         Host arithmetic over the host page table and lengths, identical on
         every rank, so every rank tiles and exchanges the same rows: the most
@@ -1415,8 +1446,8 @@ class DSABackend(PagedAttentionBackend):
     def prefill_index_columns(self) -> int | None:
         """The owned width, in kernel pages, of this forward's KVP index tiles.
 
-        Set by :meth:`init_forward_metadata` for a pure extend over KVP pages
-        (and not query-sharded): the
+        Set by :meth:`init_forward_metadata` for the extend rows of an extend
+        or mixed round over KVP pages (and not query-sharded): the
         model's KVP top-k plans each query row's owned index pages that wide
         instead of the page table's width, so a logits budget fits more rows
         per tile. ``None`` keeps the page table's width.

@@ -740,5 +740,72 @@ def test_qsa_draft_narrowing_preserves_layout_and_updates_the_frontier(
     assert next_layout.seq_lens.tolist() == [4, 1024]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+def test_qsa_split_key_writes_in_padded_tiles_match_one_write() -> None:
+    """Split-round index keys written tile by tile leave the caches one write leaves."""
+    from transformers import PretrainedConfig
+
+    from tokenspeed.runtime.layers.attention.qsa.indexer import QSAIndexer
+    from tokenspeed.runtime.layers.rotary_embedding import get_rope
+
+    device = "cuda"
+    torch.manual_seed(0)
+    config = PretrainedConfig(
+        hidden_size=16,
+        rms_norm_eps=1e-6,
+        indexer_n_heads=1,
+        indexer_kv_heads=1,
+        indexer_head_dim=8,
+        indexer_budget=2048,
+        indexer_compress_ratio=4,
+    )
+    rotary = get_rope(8, rotary_dim=8, max_position=64, base=10000)
+    # BF16 keys, as the model's projection gives them and the raw cache stores them.
+    indexer = QSAIndexer(
+        config, layer_id=1, quant_config=None, prefix="indexer", rotary_emb=rotary
+    ).to(device=device, dtype=torch.bfloat16)
+    with torch.no_grad():
+        indexer.index_qk_proj.weight.normal_()
+    pool = _qsa_pool(device=device, layer_offset=0)
+    # Two requests on pages 1 and 2, at positions 0..6 and 0..5.
+    logical = torch.cat((torch.arange(7), torch.arange(6))).to(device)
+    requests = torch.tensor([0] * 7 + [1] * 6, device=device)
+    pages = requests + 1
+    locations = (
+        logical,
+        requests,
+        (256 * pages + logical).to(torch.int32),
+        (64 * pages + logical).to(torch.int32),
+    )
+    hidden = torch.randn(logical.shape[0], 16, device=device, dtype=torch.bfloat16)
+
+    def write(tile: int) -> list[torch.Tensor]:
+        for cache in indexer.cache_fields(pool):
+            cache.zero_()
+        rows = hidden.shape[0]
+        with torch.inference_mode():
+            for start in range(0, rows, tile):
+                n = min(tile, rows - start)
+                # As the drafter stages a tile: padded rows are zero, locations too.
+                staged = []
+                for source in (hidden, logical, *locations):
+                    buf = source.new_zeros((tile, *source.shape[1:]))
+                    buf[:n] = source[start : start + n]
+                    staged.append(buf)
+                indexer.write_split_keys(staged[0], staged[1], tuple(staged[2:]), pool)
+        return [cache.clone() for cache in indexer.cache_fields(pool)]
+
+    whole = write(hidden.shape[0])
+    # Request 1's first compression group spans the second and third tiles.
+    tiled = write(4)
+    for name, one, tiles in zip(
+        ("raw", "compressed", "rope"), whole, tiled, strict=True
+    ):
+        assert torch.equal(one, tiles), (name, (one != tiles).nonzero().tolist())
+    raw, compressed, _ = whole
+    assert compressed[1, 0].any() and compressed[2, 0].any()
+    assert raw[1].any() and raw[2].any()
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

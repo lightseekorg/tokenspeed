@@ -29,6 +29,7 @@ from utils import is_nvidia
 if not is_nvidia():
     pytest.skip("requires an NVIDIA GPU", allow_module_level=True)
 from tokenspeed_kernel.ops.attention.kda.vllm_recoverssm import (
+    prepare_recoverssm_metadata,
     vllm_triton_kda_recoverssm_commit,
     vllm_triton_kda_recoverssm_verify,
 )
@@ -79,6 +80,22 @@ def _reference(
         output[:, token] = torch.einsum("bhvk,bhk->bhv", current, q32[:, token])
         states.append(current.clone())
     return (output, states)
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_record_metadata_takes_the_checkpoint_before_the_verify_window(dtype) -> None:
+    """Live rows get (slot, generation, cache length - window); others keep theirs."""
+    seq_lens = torch.tensor([9, 40, 8, 1 << 20], dtype=dtype, device="cuda")
+    metadata = torch.full((6, 3), -5, dtype=torch.int64, device="cuda")
+    prepare_recoverssm_metadata(
+        seq_lens, metadata, batch=3, generation=7, draft_token_num=8
+    )
+    assert metadata[:3].tolist() == [[0, 7, 1], [1, 7, 32], [2, 7, 0]]
+    assert (metadata[3:] == -5).all()
+    with pytest.raises(ValueError, match="INT32 or INT64"):
+        prepare_recoverssm_metadata(
+            seq_lens.float(), metadata, batch=3, generation=7, draft_token_num=8
+        )
 
 
 @pytest.mark.parametrize(

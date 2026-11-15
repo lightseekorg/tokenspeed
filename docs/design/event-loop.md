@@ -99,6 +99,22 @@ The check uses the scheduler's existing request lookup; it does not reclaim
 an id ahead of its in-flight work. Once both owners have released an id, this
 admission guard allows it again.
 
+Each accepted request gets a monotonically increasing admission identity
+before data-plane registration. The output processor allocates it once;
+the Python request record, planned forwards and snapshot/restore operations
+carry that same value. External `rid` remains the wire and scheduler lookup
+key. Reusing it after retirement creates a new admission, while chunks,
+decode steps and retraction keep the existing admission identity. Slot-state
+owners compare admissions so a recycled row cannot retain a previous
+request's stop criteria or sampling state. Identity allocation is independent
+of the sampling seed and does not retain a history of external request IDs.
+
+Cache-op adaptation resolves the admission while the host still holds the
+request record and stores it in the immutable operation. No asynchronous
+completion resolves a potentially recycled `rid` to infer slot ownership.
+The identity is local to the engine lifetime, like its slot-state images;
+it is not a cross-engine or persistent-cache key.
+
 The Rust/C++ submission bridge returns `Result`: native validation exceptions
 must never escape a `noexcept` bridge. The scheduler validates a complete
 submission batch before inserting requests. If it rejects the batch, the
@@ -984,6 +1000,9 @@ tracks slot ownership by admission, not by client request id, and seeds a
 new owner's prefix before its first forward. Consecutive chunks on the
 same owned row append their inputs without reseeding. Prefix-cache hits,
 PD landings, slot reuse and recovery into another slot use this same path.
+Only the most recently used slot can hold a request's current history. Moving
+to another slot invalidates the old ownership claim: a later restore into
+that old slot must seed again, even if no other request has used it.
 
 A model profile may declare `request_token_history_lookback`: the maximum
 number of committed tokens it reads behind its write frontier. Omission

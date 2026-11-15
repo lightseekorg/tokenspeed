@@ -80,11 +80,14 @@ def resolve_write_slots(
     graph capture reuses only what it resolved itself: one resolved eagerly
     is not recomputed when the graph replays. A caller that forks streams
     resolves before the fork, on the stream every branch is ordered after.
-    Only AMD keeps them; elsewhere every layer resolves its own.
+    Only AMD keeps them, and only for slots with a version counter; elsewhere
+    every layer resolves its own.
     """
     if placement is None:
         return loc, None
-    if not current_platform().is_amd:
+    # An inference tensor (a MIXED round's slots) has no version counter, so a
+    # rewrite between layers would go unseen.
+    if not current_platform().is_amd or loc.is_inference():
         return resolve_cache_slots(loc, placement)
     capturing = torch.cuda.is_current_stream_capturing()
     for cached_loc, version, cached_placement, captured, resolved in share.write_slots:

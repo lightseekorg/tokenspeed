@@ -429,19 +429,19 @@ def index_k_field(config, rows: int, layer_id: int) -> CacheFieldSpec:
     """
     from tokenspeed.runtime.layers.attention.configs.dsa import (
         DSAConfig,
-        dsa_index_k_row_bytes,
         index_k_plane_dtype,
+        index_k_row_bytes,
     )
 
     spec = config.component(SoftmaxAttnConfig)
     if isinstance(spec, DSAConfig):
-        # One plane layout per index_k_format: FP8 keys plus scales as uint8
-        # bytes, or the bf16 keys unquantized (configs/dsa.py).
-        if spec.index_k_format == "fp8_scaled":
+        # One plane layout per index_k_format: FP8 or MXFP4 keys plus scales
+        # as uint8 bytes, or the bf16 keys unquantized (configs/dsa.py).
+        if spec.index_k_format in ("fp8_scaled", "mxfp4"):
             return CacheFieldSpec(
                 f"layer.{layer_id}.index_k",
                 f"layer.{layer_id}.index_k",
-                (rows, dsa_index_k_row_bytes(spec.index_head_dim)),
+                (rows, index_k_row_bytes(spec.index_head_dim, spec.index_k_format)),
                 "uint8",
             )
         return CacheFieldSpec(

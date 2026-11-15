@@ -724,8 +724,8 @@ Notes:
   and output projection TP subgroups at startup.
 - On NVIDIA, prefill CUDA graphs replay with the DSA attention at eager
   breaks on the PD prefill role (with `--disaggregation-layerwise-interval 0`)
-  and on the aggregated role unless `--enable-mixed-batch` is on; elsewhere
-  prefill runs eager. `--disable-prefill-graph` turns them off. On the
+  and on the aggregated role, mixed rounds included; elsewhere prefill runs
+  eager. `--disable-prefill-graph` turns them off. On the
   aggregated role the default bucket ladder takes about 7.5 GB more per GPU,
   out of the KV cache, and adds about 7 minutes to startup;
   `--prefill-graph-capture-token-sizes` captures fewer buckets for less.
@@ -797,6 +797,8 @@ GPU_MAX_HW_QUEUES=2 tokenspeed serve moonshotai/Kimi-K3.1-Pro \
   --max-num-seqs 64 \
   --disable-kvstore \
   --enable-startup-requests \
+  --prefill-graph-max-tokens 3072 \
+  --prefill-graph-capture-token-sizes 256 512 1024 1536 2048 3072 \
   --host 0.0.0.0 \
   --port 8000
 ```
@@ -809,8 +811,12 @@ GPU_MAX_HW_QUEUES=2 tokenspeed serve moonshotai/Kimi-K3.1-Pro \
 - `--drafter-attention-backend gluon` pins the draft's MLA layers to the Gluon
   kernels and fails fast where none is registered; leaving it unset lets the
   `mla` backend select the kernels.
-- Prefill runs eager on gfx950: the DSA backend replays prefill CUDA graphs on
-  NVIDIA only.
+- Prefill CUDA graphs replay under KV parallelism too, with the DSA attention
+  and the KV history gather at eager breaks. `--prefill-graph-max-tokens 3072`
+  captures only chunks of up to 3072 new tokens; longer chunks run faster eager.
+  `--prefill-graph-capture-token-sizes` captures 6 buckets instead of the
+  default ladder's 44, which reserves about 10 GB per GPU at startup and
+  leaves too few KV cache blocks with KV parallelism at a 1M-token context.
 - `GPU_MAX_HW_QUEUES=2` gives each stream priority one hardware queue per
   compute pipe. With ROCm's default of 4, two queues share a pipe, so
   prefill's high-priority side kernels can wait behind the forward's GEMMs.
@@ -823,6 +829,8 @@ GPU_MAX_HW_QUEUES=2 tokenspeed serve moonshotai/Kimi-K3.1-Pro \
   500 output tokens run at once, and decode attends each GPU's share of the
   selected keys. See
   [KV parallelism](../serving/parallelism.md#kv-parallelism).
+  With KV parallelism, also add `--enable-mixed-batch`: decode rows then ride
+  in a prefill chunk's forward instead of waiting for it.
 - The Kimi-K3 AMD note on greedy sampling applies.
 
 ## GLM5 / GLM5.2

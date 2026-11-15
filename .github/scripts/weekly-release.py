@@ -1759,12 +1759,12 @@ class SchedulerRelease(ComponentRelease):
             raise RuntimeError("Scheduler publication is missing or yanked")
         files = {f["filename"]: f["digests"]["sha256"] for f in release["urls"]}
         if (
-            len(files) != 9
-            or sum(name.endswith(".whl") for name in files) != 8
+            len(files) != 5
+            or sum(name.endswith(".whl") for name in files) != 4
             or sum(name.endswith(".tar.gz") for name in files) != 1
         ):
             raise RuntimeError(
-                "Scheduler publication requires eight wheels and one source distribution"
+                "Scheduler publication requires four wheels and one source distribution"
             )
         return files
 
