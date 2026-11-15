@@ -1711,7 +1711,10 @@ store client reads `MC_USE_IPV6` on its own when the store starts, so export
 
 `--speculative-rejection-sample-method block --enable-speculative-sampling --sampling-backend flashinfer`
 verifies a sampled draft chain by block verification instead of token-wise
-rejection. The names follow vLLM: `--enable-speculative-sampling` is
+rejection. `--sampling-backend triton` (the ROCm path) runs it too. Because
+block verification needs whole target rows, the Triton backend skips its
+vocabulary-shard candidate selection and, unless the batch's top-k bounds the
+candidates, sorts whole rows. The names follow vLLM: `--enable-speculative-sampling` is
 `draft_sample_method=probabilistic`, and `--speculative-config` also accepts
 the `draft_sample_method` and `rejection_sample_method` keys. It supports `DSPARK` (probabilistic Markov drafting) and `EAGLE3`
 with `--speculative-eagle-topk 1`; block verification is defined on a single
@@ -1730,14 +1733,17 @@ longest accepted prefix, and samples a prefix-scaled positive residual (or a
 target bonus token). It is not a single whole-block likelihood-ratio test.
 The output uses the existing accepted-length and state rollback contract.
 
-The existing per-request proposal RNG and verifier coin streams are reused.
+The existing per-request proposal RNG is reused. The accepted length depends
+on every prefix coin, so no two verify steps of a request share a coin: the
+FlashInfer backend draws fresh coins each step, and the Triton backend keys one step's
+coins by the request's seed and the step's first verify position.
 A stochastic output difference from greedy decoding is expected; validate the
 output distribution and accuracy, rather than requiring identical token IDs.
 
 Replacing `block` with `--synthetic-acceptance-length L` (the `synthetic`
 method) gives a benchmark-only mode, the equivalent of vLLM's probabilistic
 draft sampling with synthetic rejection; for `DSPARK` it also turns on sampled
-Markov drafting.
+Markov drafting. Unlike `block`, it needs `--sampling-backend flashinfer`.
 The drafter still samples: the full-vocabulary draft logits (and DSpark's Markov
 steps) and the recorded fp32 draft probabilities all stay on the path. Verify
 gathers those probabilities and runs the standard draft-probability chain rule

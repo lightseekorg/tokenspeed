@@ -35,10 +35,18 @@ Noise streams for a request with seed ``s`` and verify offset ``o``:
 * plain draw at row ``r``: ``rand(randint(s, o + r), token_id)``;
 * coin at row ``r``: ``rand(randint(s, COIN_OFFSET_SALT + o + r), 0)``;
 * draft step ``l``: ``rand(randint(s, DRAFT_SAMPLE_OFFSET_SALT + base + l),
-  token_id)``.
+  token_id)``;
+* block verification's coins: ``rand(randint(s, BLOCK_COIN_OFFSET_SALT + o),
+  j)``, ``j = 0`` for the residual / bonus draw and ``j = 1 + i`` for prefix
+  ``i``.
 
-Plain offsets stay below ``2**40`` and draft offsets below ``2**41``, so the
-three streams never share a draw.
+Plain offsets stay below ``2**40``, draft offsets below ``2**41`` and coin
+offsets below ``2**42``, so the four streams never share a draw.
+
+Block verification's accepted length depends on every prefix coin, so a coin
+past it is conditioned high. Its coins are therefore keyed by the step's first
+verify position alone: the next step starts at a later position and draws
+fresh coins, where row-keyed coins would re-read the conditioned ones.
 """
 
 from __future__ import annotations
@@ -48,8 +56,10 @@ from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.sampling.triton.common import check_draft_q_inputs
 
 __all__ = [
+    "BLOCK_COIN_OFFSET_SALT",
     "COIN_OFFSET_SALT",
     "DRAFT_SAMPLE_OFFSET_SALT",
+    "block_verify_coins_from_pools",
     "verify_rows_no_filter_from_pools",
     "verify_rows_no_filter_scratch_shape",
 ]
@@ -57,6 +67,7 @@ __all__ = [
 # Philox offset salts of the draft and coin streams (see the module docstring).
 DRAFT_SAMPLE_OFFSET_SALT = 1 << 40
 COIN_OFFSET_SALT = 1 << 41
+BLOCK_COIN_OFFSET_SALT = 1 << 42
 # Top-p within this distance of 1 means no top-p cutoff.
 TOP_P_ONE_EPS = 1.0e-6
 
@@ -78,6 +89,30 @@ def _plain_gumbel(seed, offset, token_ids):
 def _coin(seed, offset, COIN_SALT: tl.constexpr):
     """The accept coin in ``[0, 1)`` of the row at verify offset ``offset``."""
     return tl.rand(tl.randint(seed, COIN_SALT + offset), tl.full((), 0, tl.int32))
+
+
+@triton.jit
+def _block_verify_coins_kernel(
+    req_pool_indices_ptr,
+    seed_pool_ptr,
+    offsets_pool_ptr,
+    coins_ptr,
+    final_coins_ptr,
+    coins_row_stride,
+    NUM_TOKENS_PER_REQ: tl.constexpr,
+    BLOCK_SALT: tl.constexpr,
+):
+    req_row = tl.program_id(0)
+    pool_idx = tl.load(req_pool_indices_ptr + req_row).to(tl.int64)
+    seed = tl.load(seed_pool_ptr + pool_idx).to(tl.int64)
+    offset = tl.load(offsets_pool_ptr + pool_idx).to(tl.int64)
+    step_seed = tl.randint(seed, BLOCK_SALT + offset)
+    for spec_pos in tl.static_range(NUM_TOKENS_PER_REQ):
+        tl.store(
+            coins_ptr + req_row * coins_row_stride + spec_pos,
+            tl.rand(step_seed, tl.full((), 1 + spec_pos, tl.int32)),
+        )
+    tl.store(final_coins_ptr + req_row, tl.rand(step_seed, tl.full((), 0, tl.int32)))
 
 
 @triton.jit
@@ -539,4 +574,63 @@ def verify_rows_no_filter_from_pools(
         COIN_SALT=COIN_OFFSET_SALT,
         num_warps=1,
         **common,
+    )
+
+
+def block_verify_coins_from_pools(
+    req_pool_indices: torch.Tensor,
+    seed_pool: torch.Tensor,
+    offsets_pool: torch.Tensor,
+    coins: torch.Tensor,
+    final_coins: torch.Tensor,
+) -> None:
+    """Block verification's coins, keyed by each request's seed and position.
+
+    One draw keyed by the request's first verify position holds the residual /
+    bonus coin and then the prefix coins (see the module docstring), so a
+    request's coins are the same alone, in any batch and after a retraction,
+    and no two verify steps of a request share a coin.
+
+    Args:
+        req_pool_indices: ``[bs]`` int32/int64 pool slot of each request.
+        seed_pool: Pool-indexed int64 seeds.
+        offsets_pool: Pool-indexed int64 position of each request's first
+            verify row.
+        coins: ``[bs, N]`` fp32 output with stride-1 rows: the prefix coins
+            (``uniform_samples`` of ``block_speculative_sampling``).
+        final_coins: ``[bs]`` contiguous fp32 output: the residual / bonus
+            coins (``uniform_samples_for_final_sampling``).
+
+    Returns:
+        None; ``coins`` and ``final_coins`` are written in place.
+    """
+    fn_name = "block_verify_coins_from_pools"
+    if coins.ndim != 2 or coins.dtype != torch.float32 or coins.stride(-1) != 1:
+        raise ValueError(f"{fn_name} expects fp32 [bs, N] coins with stride-1 rows")
+    bs, num_tokens_per_req = coins.shape
+    if (
+        final_coins.shape != (bs,)
+        or final_coins.dtype != torch.float32
+        or not final_coins.is_contiguous()
+    ):
+        raise ValueError(f"{fn_name} expects contiguous fp32 [{bs}] final coins")
+    if req_pool_indices.shape != (bs,) or req_pool_indices.dtype not in (
+        torch.int32,
+        torch.int64,
+    ):
+        raise ValueError(f"{fn_name} expects int32/int64 [{bs}] req_pool_indices")
+    if seed_pool.dtype != torch.int64 or offsets_pool.dtype != torch.int64:
+        raise ValueError(f"{fn_name} expects int64 seed and offset pools")
+    if bs == 0:
+        return
+    _block_verify_coins_kernel[(bs,)](
+        req_pool_indices,
+        seed_pool,
+        offsets_pool,
+        coins,
+        final_coins,
+        coins.stride(0),
+        NUM_TOKENS_PER_REQ=num_tokens_per_req,
+        BLOCK_SALT=BLOCK_COIN_OFFSET_SALT,
+        num_warps=1,
     )
