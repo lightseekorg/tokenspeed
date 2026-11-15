@@ -34,11 +34,14 @@ from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.sparse_mla import (
     _BF16_PREFILL_WAVES_PER_EU,
     _FP8_ROWS_DECODE_NUM_STAGES,
     _FP8_ROWS_PREFILL_TILES,
+    _ROWS_Q_FORMATS,
     _check_fp8_rows_scorer_inputs,
     _check_standard_decode_metadata,
     _fp8_rows_buffer_load,
     _fp8_rows_decode_shape,
     _fp8_rows_decode_splits,
+    _rows_head_dim,
+    _scaled_index_k_views,
 )
 from tokenspeed_kernel_amd.ops.gfx950.attention.dsa.standard_cache_logits import (
     gluon_dsa_decode_topk_fp8_rows_gfx950,
@@ -73,6 +76,7 @@ def _launch_prefill_rows(
     page_size,
     softmax_scale,
     page_stride,
+    index_k_format,
 ):
     rows, width = logits.shape
     if query_requests.shape != (rows,) or query_requests.dtype != torch.int32:
@@ -87,8 +91,7 @@ def _launch_prefill_rows(
     gluon_dsa_owned_prefill_topk_fp8_rows_gfx950[grid](
         q,
         q_scales,
-        index_k_cache.view(torch.float8_e4m3fn),
-        index_k_cache.view(torch.float32),
+        *_scaled_index_k_views(index_k_cache, index_k_format),
         weights,
         query_requests,
         lengths,
@@ -109,14 +112,14 @@ def _launch_prefill_rows(
         PAGE_SIZE=page_size,
         PAGE_STRIDE_BYTES=page_stride,
         NUM_HEADS=q.shape[1],
-        HEAD_DIM=q.shape[2],
+        HEAD_DIM=_rows_head_dim(q),
         ROWS=rows_per_program,
         BLOCK_N=block_n,
         CHUNK_N=chunk_n,
         WARPS_M=_BF16_PREFILL_NUM_WARPS,
         WARPS_N=1,
         NUM_STAGES=_BF16_PREFILL_NUM_STAGES,
-        Q_FP8=True,
+        Q_FORMAT=_ROWS_Q_FORMATS[q.dtype],
         USE_BUFFER_LOAD=_fp8_rows_buffer_load(index_k_cache),
         USE_BUFFER_STORE=logits.nbytes < 2**31,
         num_warps=_BF16_PREFILL_NUM_WARPS,
@@ -151,6 +154,7 @@ def launch_gluon_dsa_index_candidates_gfx950(
     query_group_size: int,
     query_requests: torch.Tensor | None,
     request_count: int | None,
+    index_k_format: str = "fp8_scaled",
 ) -> torch.Tensor:
     """Score compact pages with the exact regular-serving native arithmetic.
 
@@ -168,11 +172,12 @@ def launch_gluon_dsa_index_candidates_gfx950(
     row's of its request, as causal windows' are. The scores are the same.
     """
     page_stride = _check_fp8_rows_scorer_inputs(
-        q, q_scales, weights, index_k_cache, page_size
+        q, q_scales, weights, index_k_cache, page_size, index_k_format
     )
-    if q.dtype != torch.float8_e4m3fn:
+    if q.dtype not in (torch.float8_e4m3fn, torch.uint8):
         raise TypeError(
-            "owned-page native scorer requires FP8 queries and explicit scales"
+            "owned-page native scorer requires fp8_e4m3 or mxfp4 queries and "
+            "explicit scales"
         )
     table = _owned_query_group_metadata(q, pages, lengths, query_group_size)
     requests = table.shape[0]
@@ -201,6 +206,7 @@ def launch_gluon_dsa_index_candidates_gfx950(
             page_size,
             softmax_scale,
             page_stride,
+            index_k_format,
         )
     rows = triton.next_power_of_2(query_group_size)
     warps_m, warps_n, block_n, waves = _fp8_rows_decode_shape(
@@ -211,8 +217,7 @@ def launch_gluon_dsa_index_candidates_gfx950(
     gluon_dsa_decode_topk_fp8_rows_gfx950[(requests, splits)](
         q,
         q_scales,
-        index_k_cache.view(torch.float8_e4m3fn),
-        index_k_cache.view(torch.float32),
+        *_scaled_index_k_views(index_k_cache, index_k_format),
         weights,
         # Request lengths, unread: explicit_row_lens bounds every row.
         lengths,
@@ -234,14 +239,14 @@ def launch_gluon_dsa_index_candidates_gfx950(
         PAGE_SIZE=page_size,
         PAGE_STRIDE_BYTES=page_stride,
         NUM_HEADS=q.shape[1],
-        HEAD_DIM=q.shape[2],
+        HEAD_DIM=_rows_head_dim(q),
         ROWS=rows,
         BLOCK_N=block_n,
         CHUNK_N=_BF16_DECODE_CHUNK_N,
         WARPS_M=warps_m,
         WARPS_N=warps_n,
         NUM_STAGES=_FP8_ROWS_DECODE_NUM_STAGES,
-        Q_FP8=True,
+        Q_FORMAT=_ROWS_Q_FORMATS[q.dtype],
         USE_BUFFER_LOAD=_fp8_rows_buffer_load(index_k_cache),
         USE_BUFFER_STORE=logits.nbytes < 2**31,
         CHUNK_LOOP=splits < chunks,

@@ -795,6 +795,7 @@ if _HAS_DEEP_GEMM:
             "index_heads": frozenset({16, 32, 64}),
             "head_dim": frozenset({128}),
             "page_size": frozenset({64}),
+            "index_k_format": frozenset({"fp8_scaled"}),
             "index_k_layout": frozenset({"packed"}),
         },
     )
