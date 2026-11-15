@@ -188,6 +188,7 @@ class TritonSamplingBackend(SamplingBackend):
             global_server_args_dict["speculative_rejection_sample_method"] == "block"
             and config.enable_speculative_sampling
         )
+        self._vocab_shard_warmup = False
         self._init_triton_pool_state(config)
         self._init_triton_buffers(config)
         self._init_vocab_shard_buffers(config)
@@ -287,22 +288,29 @@ class TritonSamplingBackend(SamplingBackend):
 
         saved = (self._sample_route, self._top_k_top_p_pad)
         self._sample_route = _SAMPLE_ROUTE_GUMBEL_TOP_K
-        for pad in (_TOP_K_TOP_P_SMALL_PAD, _TOP_K_TOP_P_PAD):
-            self._top_k_top_p_pad = pad
-            for mask in masks:
-                self.sample(
-                    LogitsProcessorOutput(
-                        next_token_logits=None, vocab_shard=shard.rows(slice(0, 1))
-                    ),
-                    info(mask, 1),
-                )
-                self.verify(
-                    LogitsProcessorOutput(next_token_logits=None, vocab_shard=shard),
-                    info(mask, num_tokens_per_req),
-                    candidates,
-                    tree=None,
-                )
-        self._sample_route, self._top_k_top_p_pad = saved
+        self._vocab_shard_warmup = True
+        try:
+            for pad in (_TOP_K_TOP_P_SMALL_PAD, _TOP_K_TOP_P_PAD):
+                self._top_k_top_p_pad = pad
+                for mask in masks:
+                    self.sample(
+                        LogitsProcessorOutput(
+                            next_token_logits=None,
+                            vocab_shard=shard.rows(slice(0, 1)),
+                        ),
+                        info(mask, 1),
+                    )
+                    self.verify(
+                        LogitsProcessorOutput(
+                            next_token_logits=None, vocab_shard=shard
+                        ),
+                        info(mask, num_tokens_per_req),
+                        candidates,
+                        tree=None,
+                    )
+        finally:
+            self._vocab_shard_warmup = False
+            self._sample_route, self._top_k_top_p_pad = saved
 
     def _selects_from_vocab_shard(self, logits_output: LogitsProcessorOutput) -> bool:
         """Whether this step's route selects candidates per vocabulary shard."""
@@ -1174,13 +1182,14 @@ class TritonSamplingBackend(SamplingBackend):
         )
         accept_length = self._accept_length_buf[:bs]
 
-        # Block verification needs whole target rows. Without recorded draft
-        # distributions (the shard warmup) the target-only rule runs instead.
-        block = (
-            self._block_verify
-            and tree is None
-            and sampling_info.draft_probs is not None
-        )
+        # Block verification needs whole target rows. The shard warmup records
+        # no draft distributions, so it compiles the target-only rule instead.
+        block = self._block_verify and tree is None and not self._vocab_shard_warmup
+        if block and sampling_info.draft_probs is None:
+            raise RuntimeError(
+                "block verification on this backend requires recorded draft "
+                "probabilities"
+            )
         logits = selected = None
         if not block and self._selects_from_vocab_shard(logits_output):
             # The top-k routes read each row's presorted best candidates only;
