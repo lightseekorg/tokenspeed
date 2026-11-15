@@ -79,9 +79,7 @@ def _prepare(backend):
         SamplingParams(temperature=1.0, top_k=-1, top_p=1.0, seed=seed)
         for seed in (73, 74)
     ]
-    backend.prepare_step(
-        ["cumulative-a", "cumulative-b"], [3, 1], params, num_tokens_per_req=1
-    )
+    backend.prepare_step([24, 25], [3, 1], params, num_tokens_per_req=1)
 
 
 def _draw(backend, logits, info, *, decode):
