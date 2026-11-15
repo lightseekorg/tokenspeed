@@ -181,7 +181,7 @@ def _prepare(backend: tb.TritonSamplingBackend, device: str) -> torch.Tensor:
         sp.resolve_seed(rid)
         sp.normalize(None)
     backend.prepare_step(
-        request_ids=rids,
+        admission_ids=list(range(len(params))),
         request_pool_indices=SLOTS,
         sampling_params_list=params,
         num_tokens_per_req=N,
