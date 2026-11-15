@@ -583,35 +583,48 @@ def batched_recoverssm_commit(
     )
 
 
-@triton.jit(do_not_specialize=["batch", "generation"])
+@triton.jit(do_not_specialize=["batch", "generation", "draft_token_num"])
 def _prepare_record_metadata_kernel(
-    committed, metadata, batch, generation, BLOCK: tl.constexpr
+    seq_lens, metadata, batch, generation, draft_token_num, BLOCK: tl.constexpr
 ):
     row = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     live = row < batch
-    position = tl.load(committed + row, mask=live, other=0)
+    position = (
+        tl.load(seq_lens + row, mask=live, other=0).to(tl.int64) - draft_token_num
+    )
     tl.store(metadata + row * 3, row.to(tl.int64), mask=live)
     tl.store(metadata + row * 3 + 1, generation.to(tl.int64), mask=live)
     tl.store(metadata + row * 3 + 2, position, mask=live)
 
 
 def prepare_recoverssm_metadata(
-    committed: torch.Tensor, metadata: torch.Tensor, *, batch: int, generation: int
+    seq_lens: torch.Tensor,
+    metadata: torch.Tensor,
+    *,
+    batch: int,
+    generation: int,
+    draft_token_num: int,
 ) -> None:
     """Refresh the per-round slot, generation and checkpoint-position view.
 
-    committed contains INT64 checkpoint positions. metadata is caller-owned,
-    contiguous INT64 [max_batch, 3] storage. Only the first batch rows change.
-    generation identifies this round's workspace ownership. Return None.
+    seq_lens holds each request's INT32 or INT64 cache length after the
+    verify window; its checkpoint position is ``seq_lens - draft_token_num``.
+    metadata is caller-owned, contiguous INT64 [max_batch, 3] storage. Only
+    the first batch rows change. generation identifies this round's workspace
+    ownership. Return None.
     """
-    if committed.dtype != torch.int64 or metadata.dtype != torch.int64:
-        raise ValueError("record metadata requires INT64 positions and storage")
+    if seq_lens.dtype not in (torch.int32, torch.int64):
+        raise ValueError("record metadata reads INT32 or INT64 cache lengths")
+    if metadata.dtype != torch.int64:
+        raise ValueError("record metadata requires INT64 storage")
+    if seq_lens.ndim != 1 or seq_lens.stride(0) != 1:
+        raise ValueError("record metadata reads dense cache lengths")
     if metadata.ndim != 2 or metadata.shape[1] != 3 or (not metadata.is_contiguous()):
         raise ValueError("record metadata must be contiguous [max_batch, 3]")
-    if batch > min(committed.numel(), metadata.shape[0]) or generation < 0:
+    if batch > min(seq_lens.numel(), metadata.shape[0]) or generation < 0:
         raise ValueError("invalid record metadata batch or generation")
     if batch == 0:
         return
     _prepare_record_metadata_kernel[triton.cdiv(batch, 128),](
-        committed, metadata, batch, generation, BLOCK=128
+        seq_lens, metadata, batch, generation, draft_token_num, BLOCK=128
     )

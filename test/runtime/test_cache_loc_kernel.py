@@ -31,6 +31,7 @@ from test.runtime.conftest import requires_cuda
 from tokenspeed.runtime.execution.cache_loc_kernel import (
     compute_out_cache_loc_kernel,
     compute_out_cache_loc_uniform,
+    dflash_prepare_decode,
 )
 
 _P = 16  # kernel page size for the tests
@@ -113,6 +114,45 @@ def test_capture_replay_address_stability() -> None:
     graph.replay()
     torch.cuda.synchronize()
     assert int(out[0]) == 77 * _P
+
+
+@requires_cuda
+def test_dflash_prepare_writes_the_block_end_lengths() -> None:
+    """The block end is the clamped prefix plus the query width.
+
+    It is written beside the prefix, the anchor token, and the positions."""
+    width, verify = 4, 3
+    output_tokens = torch.arange(12, dtype=torch.int32, device="cuda").view(4, 3) + 100
+    accept_lengths = torch.tensor([1, 3, 0, 2], dtype=torch.int32, device="cuda")
+    slots = torch.tensor([2, 0, 1, 3], dtype=torch.int64, device="cuda")
+    valid = torch.tensor([10, 20, 30, 95], dtype=torch.int32, device="cuda")
+    prefix = torch.empty(4, dtype=torch.int32, device="cuda")
+    block_end = torch.empty(4, dtype=torch.int32, device="cuda")
+    block_ids = torch.zeros(4, width, dtype=torch.int32, device="cuda")
+    positions = torch.empty(4, width, dtype=torch.int64, device="cuda")
+    dflash_prepare_decode(
+        output_tokens.view(-1),
+        accept_lengths,
+        slots,
+        valid,
+        prefix,
+        block_end,
+        block_ids,
+        positions,
+        verify_width=verify,
+        draft_query_width=width,
+        max_draft_prefix=96,
+    )
+    expected = torch.minimum(valid[slots] + accept_lengths, torch.tensor(96).cuda())
+    assert torch.equal(prefix, expected.int())
+    assert torch.equal(block_end, expected.int() + width)
+    anchor = accept_lengths.clamp(1, verify).long() - 1
+    assert torch.equal(
+        block_ids[:, 0], output_tokens[torch.arange(4, device="cuda"), anchor]
+    )
+    assert torch.equal(
+        positions, expected.long()[:, None] + torch.arange(width, device="cuda")
+    )
 
 
 # --------------------------------------------------------------------------

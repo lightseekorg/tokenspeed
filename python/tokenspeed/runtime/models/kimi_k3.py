@@ -92,6 +92,11 @@ from tokenspeed_kernel.ops.gemm import (
     mv_rmsnorm_gated_sigmoid_supported,
 )
 from tokenspeed_kernel.ops.moe import (
+    kimi3_sigmoid_bias_topk_sorted,
+    kimi3_sorted_routing_accepts,
+    kimi3_sorted_routing_fuses_shared_down,
+    kimi3_sorted_routing_scratch,
+    kimi3_sorted_routing_supported,
     latent_moe_decode_pipeline_available,
     latent_moe_input_projections,
     try_latent_moe_input_projections,
@@ -2030,9 +2035,12 @@ class KimiLinearMoEGate(nn.Module):
 # this is a prefill chunk and takes the unsplit path; the scratch buffers are
 # allocated to exactly this many rows. Raise together with --max-num-seqs.
 ATTNRES_FAST_PATH_MAX_TOKENS = 32
-# Paired MI350 measurements show that stream scheduling costs more than the
-# available attention/AttnRes overlap through M=16. Preserve NVIDIA's policy.
-ATTNRES_STREAM_FORK_THRESHOLD = 16 if current_platform().is_amd else 0
+# On AMD, the cross-stream waits cost more than the attention/AttnRes overlap
+# they buy at every decode size, so AMD never forks. Preserve NVIDIA's policy.
+ATTNRES_STREAM_FORK_THRESHOLD = float("inf") if current_platform().is_amd else 0
+# On AMD the MoE routing branch also costs more in cross-stream waits than it
+# hides, so it stays on the main stream. Preserve NVIDIA's policy.
+MOE_ROUTING_STREAM_FORK = not current_platform().is_amd
 
 
 def _attnres_mlp_slot(layer_id: int) -> int:
@@ -2531,6 +2539,17 @@ class KimiLinearMoE(nn.Module):
             and self.experts.supports_precomputed_topk
             else None
         )
+        # Route and expert-sort decode rows in one launch where the MoE takes
+        # an upstream sort, which then skips its own.
+        self._fused_routing_scratch: torch.Tensor | None = (
+            kimi3_sorted_routing_scratch(
+                torch.device("cuda", torch.cuda.current_device())
+            )
+            if self.experts.sorted_route_rows
+            and self.topk.topk_config.uses_sigmoid_bias_topk
+            and kimi3_sorted_routing_supported(self.num_experts, self.top_k)
+            else None
+        )
 
         # Shared experts (SiTU dense MLP over the full hidden size).
         shared_parallel = shared_expert_mapping(
@@ -2692,6 +2711,7 @@ class KimiLinearMoE(nn.Module):
         shared_out: torch.Tensor | None = None,
         *,
         rows_replicated: bool = False,
+        defer_shared_down: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
         """Project the router, routed latent, and shared partial in one pass.
 
@@ -2704,6 +2724,8 @@ class KimiLinearMoE(nn.Module):
         ``rows_replicated`` states that every rank of the MoE group holds these
         same rows, so the Iris state may project each rank's share of the
         replicated router and routed columns and gather them.
+        With ``defer_shared_down``, the third output is the shared experts'
+        activated input instead of its down projection, which the caller owns.
         """
         self.experts._situ_input_fp8 = None
         if (
@@ -2743,6 +2765,8 @@ class KimiLinearMoE(nn.Module):
                 gate_clamp=self.shared_experts.act_fn.beta,
                 up_clamp=self.shared_experts.act_fn.linear_beta,
             )
+        if defer_shared_down:
+            return router_logits, routed_input, shared_input
         # The shared experts hold reduce_results=False, so this partial is
         # reduced by the layer's shared or joint reducer, not here.
         shared_output = kimi3_shared_down_projection(
@@ -3131,22 +3155,76 @@ class KimiLinearMoE(nn.Module):
                 and self.mapping.moe.ep_size == 1
                 and self.mapping.attn.tp_group == self.mapping.moe.tp_ep_group
             ),
+            defer_shared_down=True,
         )
+        shared_input = shared_partial = None
         if fused_inputs is not None:
-            router_logits, routed_in, shared_partial = fused_inputs
+            router_logits, routed_in, shared_input = fused_inputs
         else:
             router_logits = self.gate(hidden_states)
-            routed_in = shared_partial = None
+            routed_in = None
 
+        self.experts._situ_sorted_routes = None
+        rows = router_logits.shape[0]
+        fused_routing = (
+            self._fused_routing_scratch is not None
+            and precompute_topk
+            and not self.topk.simulate_routing
+            and rows in self.experts.sorted_route_rows
+            and kimi3_sorted_routing_accepts(router_logits)
+        )
+        shared_down = None
+        if shared_input is not None:
+            down_weight = self.shared_experts.down_proj.weight
+            if fused_routing and kimi3_sorted_routing_fuses_shared_down(
+                shared_input, down_weight, shared_out
+            ):
+                # The routing launch carries the shared down projection, which
+                # reads neither the logits nor the routes.
+                shared_down = (shared_input, down_weight, shared_out)
+            else:
+                # The shared experts hold reduce_results=False, so this partial
+                # is reduced by the layer's shared or joint reducer, not here.
+                shared_partial = kimi3_shared_down_projection(
+                    shared_input, down_weight, out=shared_out
+                )
         # Warm the auxiliary stream serially before capture enables overlap.
         with self.stream_fork.scope(
-            enable=get_is_cuda_graph_phase(),
+            enable=get_is_cuda_graph_phase() and MOE_ROUTING_STREAM_FORK,
             overlap=get_is_capture_mode(),
         ) as fork:
             with fork.branch():
-                topk_output = self.topk(
-                    hidden_states, router_logits, output_format=routing_output_format
-                )
+                if fused_routing:
+                    # The same routes as self.topk's packed gfx950 kernel, bit
+                    # for bit, plus the A8W4 MoE's expert sort of them. Called
+                    # directly, not through the registry: the sort is that
+                    # MoE's own format, so no other solution can stand in.
+                    topk_config = self.topk.topk_config
+                    topk_weights, topk_ids, *sorted_routes = (
+                        kimi3_sigmoid_bias_topk_sorted(
+                            router_logits,
+                            topk_config.correction_bias.float(),
+                            routed_scaling_factor=float(
+                                topk_config.routed_scaling_factor
+                            ),
+                            normalize_topk_weights=topk_config.renormalize,
+                            block_size=self.experts.sorted_route_block_size,
+                            scratch=self._fused_routing_scratch,
+                            shared_down=shared_down,
+                        )
+                    )
+                    if shared_down is not None:
+                        *sorted_routes, shared_partial = sorted_routes
+                    topk_output = StandardTopKOutput(
+                        topk_weights, topk_ids, router_logits
+                    )
+                    self.experts._situ_sorted_routes = tuple(sorted_routes)
+                else:
+                    topk_output = self.topk(
+                        hidden_states,
+                        router_logits,
+                        output_format=routing_output_format,
+                    )
                 if self._topk_ready is not None and precompute_topk and fork._active:
                     self._topk_ready.record(torch.cuda.current_stream())
                 if shared_partial is None:

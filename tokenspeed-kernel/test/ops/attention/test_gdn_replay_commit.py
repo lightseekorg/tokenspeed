@@ -32,10 +32,6 @@ from tokenspeed_kernel.ops.attention.gdn import (
     gdn_decode_mtp,
     gdn_replay_commit,
 )
-from tokenspeed_kernel.ops.attention.gdn.triton import (
-    _gdn_replay_commit_kernel,
-    _gdn_replay_commit_ring_kernel,
-)
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import KernelRegistry
 from utils import assert_no_triton_compile, compiled_kernels
@@ -449,10 +445,11 @@ def test_gdn_replay_commit_batch_window_and_capacity_do_not_recompile(
     H, HV, K, V = 2, 4, 128, 128
     width = H * K + HV * V + 2 * HV
     # Aligned BF16 rows take the pipelined kernel, which covers up to 8 tokens.
+    # Read from the module: another test may reload it, replacing its kernels.
     kernel, longest_window = (
-        (_gdn_replay_commit_ring_kernel, 8)
+        (gdn_triton._gdn_replay_commit_ring_kernel, 8)
         if rows_aligned
-        else (_gdn_replay_commit_kernel, 16)
+        else (gdn_triton._gdn_replay_commit_kernel, 16)
     )
 
     def commit(batch: int, tokens: int, capacity: int, layers: int):

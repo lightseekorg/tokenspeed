@@ -397,7 +397,9 @@ class TRTLLMMLABackend(PagedAttentionBackend):
         # start after the extend rows, so publish this round's split.
         metadata.num_extends = num_extends
         # clamp_min(1) is the identity, so the verify clamp is unconditional.
-        self.seq_lens_buf[:bs].copy_(seq_lens[:bs].clamp_min(metadata.q_len_per_req))
+        torch.clamp_min(
+            seq_lens[:bs], metadata.q_len_per_req, out=self.seq_lens_buf[:bs]
+        )
         self._refresh_tree_prefix(bs, self.seq_lens_buf)
         # The persistent buffer is padded to the fused-kernel block constraint;
         # columns past the router table's width stay 0 (never read: the kernel
