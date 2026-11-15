@@ -135,3 +135,7 @@ and gate loads follow it. Rows and tensor strides remain runtime arguments.
 `try_output_fp8_quant_pack` checks the input requirements and launches the
 fusion when they hold. It returns `None` when callers need to run the separate
 gate or norm and quantization operations.
+
+The shared Triton MXFP4 index-row codec lives in `_triton_mxfp4.py`.
+KV-cache writers and attention implementations use the same arithmetic without
+importing attention backend registration from a cache helper.

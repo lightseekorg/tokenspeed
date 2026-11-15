@@ -270,16 +270,11 @@ class GreedySamplingBackend(SamplingBackend):
             )
             # Retain normal verification cost before forcing benchmark acceptance.
             if self.config.synthetic_acceptance_length is not None:
-                lengths = self.synthetic_lengths(
-                    candidates, sampling_info.batch_row_offset
-                )
-                target_tokens = target_predict.gather(
-                    1, (lengths - 1).long()[:, None]
-                ).squeeze(1)
+                row_offset = sampling_info.batch_row_offset
                 self.write_synthetic_outputs(
                     candidates,
-                    target_tokens,
-                    lengths,
+                    target_predict,
+                    self._synthetic_lengths[row_offset : row_offset + bs],
                     predict,
                     accept_index,
                     accept_length,

@@ -112,6 +112,13 @@ def _make_dot_layout(
     )
 
 
+@gluon.constexpr_function
+def _key_scale_layout(dot_b_layout, block_n, head_dim):
+    """The ``mfma_scaled`` layout of a key tile's ``[block_n, head_dim / 32]``
+    UE8M0 scales."""
+    return gl.amd.cdna4.get_mfma_scale_layout(dot_b_layout, [block_n, head_dim // 32])
+
+
 @gluon.jit
 def _candidate_slots(
     positions,
@@ -1087,17 +1094,20 @@ def _load_query_group(
     ROWS: gl.constexpr,
     HEAD_DIM: gl.constexpr,
     NUM_WARPS: gl.constexpr,
-    Q_FP8: gl.constexpr,
+    Q_FORMAT: gl.constexpr,
 ):
-    # Row m = query m // 32, head head_offset + m % 32; FP8 q scales (> 0) fold into w.
+    # Row m = query m // 32, head head_offset + m % 32; fp8_e4m3 q scales (> 0)
+    # fold into w. An mxfp4 row is HEAD_DIM / 2 bytes of E2M1 codes; its
+    # scales stay apart (_load_query_scales).
+    q_bytes: gl.constexpr = HEAD_DIM // 2 if Q_FORMAT == "mxfp4" else HEAD_DIM
     layout_q: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[1, 16],
-        threads_per_warp=[64 // (HEAD_DIM // 16), HEAD_DIM // 16],
+        threads_per_warp=[64 // (q_bytes // 16), q_bytes // 16],
         warps_per_cta=[NUM_WARPS, 1],
         order=[1, 0],
     )
     m = gl.arange(0, ROWS * 32, layout=gl.SliceLayout(1, layout_q))
-    dims = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, layout_q))
+    dims = gl.arange(0, q_bytes, layout=gl.SliceLayout(0, layout_q))
     q_rows = gl.convert_layout(m_rows, gl.SliceLayout(1, layout_q))
     q_valid = gl.convert_layout(m_valid, gl.SliceLayout(1, layout_q))
     q_values = gl.amd.cdna4.buffer_load(
@@ -1121,7 +1131,7 @@ def _load_query_group(
         other=0.0,
         cache=".cg",
     ).to(gl.float32)
-    if Q_FP8:
+    if Q_FORMAT == "fp8_e4m3":
         head_weights *= gl.amd.cdna4.buffer_load(
             ptr=q_scales,
             offsets=(
@@ -1132,6 +1142,41 @@ def _load_query_group(
             cache=".cg",
         )
     return gl.convert_layout(q_values, dot_a_layout), head_weights
+
+
+@gluon.jit
+def _load_query_scales(
+    q_scales,
+    m_rows,
+    m_valid,
+    head_offset: gl.constexpr,
+    stride_qs_row,
+    stride_qs_head,
+    dot_a_layout: gl.constexpr,
+    ROWS: gl.constexpr,
+    HEAD_DIM: gl.constexpr,
+):
+    # An mxfp4 query head's HEAD_DIM / 32 UE8M0 scale bytes, one int32 word.
+    scale_layout: gl.constexpr = gl.amd.cdna4.get_mfma_scale_layout(
+        dot_a_layout, [ROWS * 32, HEAD_DIM // 32]
+    )
+    m = gl.arange(0, ROWS * 32, layout=gl.SliceLayout(1, scale_layout))
+    rows = gl.convert_layout(m_rows, gl.SliceLayout(1, scale_layout))
+    valid = gl.convert_layout(m_valid, gl.SliceLayout(1, scale_layout))
+    words = gl.amd.cdna4.buffer_load(
+        ptr=q_scales,
+        offsets=(rows * stride_qs_row + (head_offset + m % 32) * stride_qs_head).to(
+            gl.int32
+        ),
+        mask=valid,
+        other=0,
+        cache=".cg",
+    )
+    shifts = (
+        gl.arange(0, HEAD_DIM // 32, layout=gl.SliceLayout(0, scale_layout))[None, :]
+        * 8
+    )
+    return ((words[:, None] >> shifts) & 255).to(gl.uint8)
 
 
 @gluon.jit
@@ -1151,16 +1196,19 @@ def _copy_key_tile(
     PAGE_STRIDE_BYTES: gl.constexpr,
     KEY_FP8: gl.constexpr,
     USE_BUFFER_LOAD: gl.constexpr,
+    MXFP4: gl.constexpr = False,
 ):
-    # A lane copies 16 bytes of a key row; fp8_scaled pages put scales after the keys.
+    # A lane copies 16 bytes of a key row; scaled pages put scales after the keys.
+    # An mxfp4 row is HEAD_DIM / 2 bytes of nibble-packed E2M1 codes.
     vector: gl.constexpr = 16 if KEY_FP8 else 8
+    key_bytes: gl.constexpr = HEAD_DIM // 2 if MXFP4 else HEAD_DIM
     blocked: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[vector, 1],
-        threads_per_warp=[HEAD_DIM // vector, 64 // (HEAD_DIM // vector)],
+        threads_per_warp=[key_bytes // vector, 64 // (key_bytes // vector)],
         warps_per_cta=[1, NUM_WARPS],
         order=[0, 1],
     )
-    dims = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(1, blocked))[:, None]
+    dims = gl.arange(0, key_bytes, layout=gl.SliceLayout(1, blocked))[:, None]
     columns = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, blocked))
     valid = (tile_start + columns < candidate_end)[None, :]
     # Copies past the chunk are masked; clamp their slot reads into the slot buffer.
@@ -1170,7 +1218,7 @@ def _copy_key_tile(
         slots = slots.to(gl.int64)
     if KEY_FP8:
         pages = slots // PAGE_SIZE
-        rows = pages * PAGE_STRIDE_BYTES + (slots - pages * PAGE_SIZE) * HEAD_DIM
+        rows = pages * PAGE_STRIDE_BYTES + (slots - pages * PAGE_SIZE) * key_bytes
     else:
         rows = slots * HEAD_DIM
     if USE_BUFFER_LOAD:
@@ -1197,11 +1245,25 @@ def _score_rows_key_tile(
     mfma_layout: gl.constexpr,
     ROWS: gl.constexpr,
     BLOCK_N: gl.constexpr,
-    Q_FP8: gl.constexpr,
+    Q_FORMAT: gl.constexpr,
+    query_scales=None,
+    key_scales=None,
 ):
     # A 32-row MFMA block per query row: scores bitwise independent of ROWS and warps.
     accumulator = gl.zeros([ROWS * 32, BLOCK_N], dtype=gl.float32, layout=mfma_layout)
-    if Q_FP8:
+    if Q_FORMAT == "mxfp4":
+        # E2M1 queries and keys, one UE8M0 scale per 32 elements each, applied
+        # inside the MFMA.
+        head_scores = gl.amd.cdna4.mfma_scaled(
+            a=query,
+            a_scale=query_scales,
+            a_format="e2m1",
+            b=key,
+            b_scale=key_scales,
+            b_format="e2m1",
+            acc=accumulator,
+        )
+    elif Q_FORMAT == "fp8_e4m3":
         head_scores = gl.amd.cdna4.mfma_scaled(
             a=query,
             a_scale=None,
@@ -1252,10 +1314,19 @@ def _score_candidate_chunk(
     IS_DECODE: gl.constexpr,
     PAGE_STRIDE_BYTES: gl.constexpr,
     KEY_FP8: gl.constexpr,
-    Q_FP8: gl.constexpr,
+    Q_FORMAT: gl.constexpr,
     USE_BUFFER_LOAD: gl.constexpr,
     USE_BUFFER_STORE: gl.constexpr,
+    NONFINITE_TO_NEG_INF: gl.constexpr = False,
+    query_scale_0=None,
+    query_scale_1=None,
 ):
+    # mxfp4 queries score mxfp4 pages: PAGE_SIZE rows of HEAD_DIM / 2 code
+    # bytes, then each row's HEAD_DIM / 32 UE8M0 scale bytes as one int32 word
+    # (index_k_scale).
+    MXFP4: gl.constexpr = Q_FORMAT == "mxfp4"
+    tl.static_assert(not MXFP4 or (KEY_FP8 and HEAD_DIM == 128))
+    key_bytes: gl.constexpr = HEAD_DIM // 2 if MXFP4 else HEAD_DIM
     # Slots stay in LDS so slot reads never queue behind key copies on the shared vmcnt.
     slot_positions = candidate_start + gl.arange(
         0, CHUNK_N, layout=gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
@@ -1290,26 +1361,26 @@ def _score_candidate_chunk(
         scale_pages = scale_slots // PAGE_SIZE
         scale_offsets = (
             scale_pages * (PAGE_STRIDE_BYTES // 4)
-            + (PAGE_SIZE * HEAD_DIM) // 4
+            + (PAGE_SIZE * key_bytes) // 4
             + (scale_slots - scale_pages * PAGE_SIZE)
         )
         if USE_BUFFER_LOAD:
             scale_values = gl.amd.cdna4.buffer_load(
-                ptr=index_k_scale, offsets=scale_offsets, mask=slot_valid, other=0.0
+                ptr=index_k_scale, offsets=scale_offsets, mask=slot_valid, other=0
             )
         else:
             scale_values = gl.load(
-                index_k_scale + scale_offsets, mask=slot_valid, other=0.0
+                index_k_scale + scale_offsets, mask=slot_valid, other=0
             )
         scale_shared = gl.allocate_shared_memory(
-            gl.float32,
+            index_k_scale.type.element_ty,
             [CHUNK_N],
             layout=gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[0]),
             value=scale_values,
         )
         # XOR-swizzled 16-byte chunks spread 16 consecutive keys over all LDS banks.
         key_layout: gl.constexpr = gl.SwizzledSharedLayout(
-            vec=16, per_phase=1, max_phase=HEAD_DIM // 16, order=[0, 1]
+            vec=16, per_phase=1, max_phase=key_bytes // 16, order=[0, 1]
         )
     else:
         key_layout: gl.constexpr = gl.SwizzledSharedLayout(
@@ -1317,9 +1388,18 @@ def _score_candidate_chunk(
         )
     key_shared = gl.allocate_shared_memory(
         index_k.type.element_ty,
-        [NUM_STAGES, HEAD_DIM, BLOCK_N],
+        [NUM_STAGES, key_bytes, BLOCK_N],
         layout=key_layout,
     )
+    if MXFP4:
+        scale_layout: gl.constexpr = _key_scale_layout(dot_b_layout, BLOCK_N, HEAD_DIM)
+        scale_columns = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(1, scale_layout))
+        scale_shifts = (
+            gl.arange(0, HEAD_DIM // 32, layout=gl.SliceLayout(0, scale_layout))[
+                None, :
+            ]
+            * 8
+        )
     tile_count = tl.cdiv(candidate_end - candidate_start, BLOCK_N)
     for stage in gl.static_range(NUM_STAGES - 1):
         _copy_key_tile(
@@ -1338,6 +1418,7 @@ def _score_candidate_chunk(
             PAGE_STRIDE_BYTES,
             KEY_FP8,
             USE_BUFFER_LOAD,
+            MXFP4,
         )
 
     columns = gl.arange(0, BLOCK_N, layout=col_layout)
@@ -1346,8 +1427,12 @@ def _score_candidate_chunk(
         # One copy group per iteration, masked or not, so NUM_STAGES - 2 stay in flight.
         gl.amd.cdna4.async_copy.wait_group(NUM_STAGES - 2)
         key = key_shared.index(tile_id % NUM_STAGES).load(layout=dot_b_layout)
-        if KEY_FP8 and not Q_FP8:
+        if KEY_FP8 and Q_FORMAT == "bf16":
             key = key.to(gl.bfloat16)
+        key_scales = None
+        if MXFP4:
+            words = scale_shared.gather(tile_id * BLOCK_N + scale_columns, axis=0)
+            key_scales = ((words[:, None] >> scale_shifts) & 255).to(gl.uint8)
         _copy_key_tile(
             index_k,
             key_shared,
@@ -1364,18 +1449,38 @@ def _score_candidate_chunk(
             PAGE_STRIDE_BYTES,
             KEY_FP8,
             USE_BUFFER_LOAD,
+            MXFP4,
         )
         scores = _score_rows_key_tile(
-            query_0, weight_0, key, mfma_layout, ROWS, BLOCK_N, Q_FP8
+            query_0,
+            weight_0,
+            key,
+            mfma_layout,
+            ROWS,
+            BLOCK_N,
+            Q_FORMAT,
+            query_scale_0,
+            key_scales,
         )
         if NUM_HEADS == 64:
             scores += _score_rows_key_tile(
-                query_1, weight_1, key, mfma_layout, ROWS, BLOCK_N, Q_FP8
+                query_1,
+                weight_1,
+                key,
+                mfma_layout,
+                ROWS,
+                BLOCK_N,
+                Q_FORMAT,
+                query_scale_1,
+                key_scales,
             )
         scores = gl.convert_layout(scores, out_layout) * model_scale
-        if KEY_FP8:
+        if KEY_FP8 and not MXFP4:
             key_scales = scale_shared.gather(tile_id * BLOCK_N + columns, axis=0)
             scores = scores * key_scales[None, :]
+        if NONFINITE_TO_NEG_INF:
+            finite = (scores == scores) & (gl.abs(scores) != float("inf"))
+            scores = gl.where(finite, scores, -float("inf"))
         positions = tile_start + columns
         # Columns past the chunk belong to the next program.
         valid = (
@@ -1435,23 +1540,36 @@ def _multi_row_index_k_scores_body(
     IS_DECODE: gl.constexpr,
     PAGE_STRIDE_BYTES: gl.constexpr,
     KEY_FP8: gl.constexpr,
-    Q_FP8: gl.constexpr,
+    Q_FORMAT: gl.constexpr,
     USE_BUFFER_LOAD: gl.constexpr,
     USE_BUFFER_STORE: gl.constexpr,
     CHUNK_LOOP: gl.constexpr,
+    EXPLICIT_ROW_LENS: gl.constexpr = False,
+    NONFINITE_TO_NEG_INF: gl.constexpr = False,
+    ROW_RUNS: gl.constexpr = False,
 ):
     # Program (i, j): rows i on chunk j; positive key scales apply after the head sum.
+    # Q_FORMAT is "bf16"; "fp8_e4m3" with one FP32 q_scales per (row, head);
+    # or "mxfp4", E2M1 codes with HEAD_DIM / 32 UE8M0 scales per (row, head)
+    # as one int32 q_scales word, scoring mxfp4 pages.
+    # NONFINITE_TO_NEG_INF stores NaN and infinite scores as -inf.
+    # ROW_RUNS (prefill rows): row_starts holds each row's request and
+    # block_table each row's compact pages, which start at column 0 and are a
+    # prefix of a later row's of its request. Each request's rows in the block
+    # score their last row's pages.
     NUM_WARPS: gl.constexpr = WARPS_M * WARPS_N
     row_block = gl.program_id(0)
     split = gl.program_id(1)
 
+    # fp8_e4m3 and mxfp4 queries both take the scaled MFMA.
+    SCALED_MFMA: gl.constexpr = Q_FORMAT != "bf16"
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
-        instr_shape=[32, 32, 64] if Q_FP8 else [32, 32, 16],
+        instr_shape=[32, 32, 64] if SCALED_MFMA else [32, 32, 16],
         transposed=False,
         warps_per_cta=[WARPS_M, WARPS_N],
     )
-    k_width: gl.constexpr = 16 if Q_FP8 else 8
+    k_width: gl.constexpr = 16 if SCALED_MFMA else 8
     dot_a_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=mfma_layout, k_width=k_width
     )
@@ -1476,9 +1594,20 @@ def _multi_row_index_k_scores_body(
         row_valid = local_rows < q_len_per_req
         m_rows = request_id * q_len_per_req + m_local
         m_valid = m_local < q_len_per_req
-        # Row j of a request sees its first seq_len - (q_len - 1) + j keys.
-        seq_len = gl.load(seq_lens + request_id).to(gl.int32)
-        ends = gl.minimum(seq_len - (q_len_per_req - 1) + local_rows, num_candidates)
+        if EXPLICIT_ROW_LENS:
+            # Compact owned contexts do not grow on a rank when the newly
+            # appended token belongs to another rank. Preserve every row's
+            # actual local end rather than subtracting global draft offsets.
+            ends = gl.amd.cdna4.buffer_load(
+                ptr=row_ends, offsets=rows, mask=row_valid, other=0
+            ).to(gl.int32)
+            ends = gl.minimum(gl.maximum(ends, 0), num_candidates)
+        else:
+            # Row j sees seq_len - (q_len - 1) + j keys in a full context.
+            seq_len = gl.load(seq_lens + request_id).to(gl.int32)
+            ends = gl.minimum(
+                seq_len - (q_len_per_req - 1) + local_rows, num_candidates
+            )
         starts = gl.zeros([ROWS], gl.int32, layout=row_layout)
     else:
         request_id = 0
@@ -1486,12 +1615,18 @@ def _multi_row_index_k_scores_body(
         row_valid = rows < num_rows
         m_rows = row_block * ROWS + m_local
         m_valid = m_rows < num_rows
-        starts = gl.maximum(
-            gl.amd.cdna4.buffer_load(
+        if ROW_RUNS:
+            row_requests = gl.amd.cdna4.buffer_load(
                 ptr=row_starts, offsets=rows, mask=row_valid, other=0
-            ),
-            0,
-        )
+            )
+            starts = gl.zeros([ROWS], gl.int32, layout=row_layout)
+        else:
+            starts = gl.maximum(
+                gl.amd.cdna4.buffer_load(
+                    ptr=row_starts, offsets=rows, mask=row_valid, other=0
+                ),
+                0,
+            )
         ends = gl.minimum(
             gl.amd.cdna4.buffer_load(
                 ptr=row_ends, offsets=rows, mask=row_valid, other=0
@@ -1533,8 +1668,21 @@ def _multi_row_index_k_scores_body(
         ROWS,
         HEAD_DIM,
         NUM_WARPS,
-        Q_FP8,
+        Q_FORMAT,
     )
+    query_scale_0 = None
+    if Q_FORMAT == "mxfp4":
+        query_scale_0 = _load_query_scales(
+            q_scales,
+            m_rows,
+            m_valid,
+            0,
+            stride_qs_row,
+            stride_qs_head,
+            dot_a_layout,
+            ROWS,
+            HEAD_DIM,
+        )
     if NUM_HEADS == 64:
         query_1, weight_1 = _load_query_group(
             q,
@@ -1555,14 +1703,87 @@ def _multi_row_index_k_scores_body(
             ROWS,
             HEAD_DIM,
             NUM_WARPS,
-            Q_FP8,
+            Q_FORMAT,
         )
+        query_scale_1 = None
+        if Q_FORMAT == "mxfp4":
+            query_scale_1 = _load_query_scales(
+                q_scales,
+                m_rows,
+                m_valid,
+                32,
+                stride_qs_row,
+                stride_qs_head,
+                dot_a_layout,
+                ROWS,
+                HEAD_DIM,
+            )
     else:
         query_1 = query_0
         weight_1 = weight_0
+        query_scale_1 = query_scale_0
 
     row_offsets = rows.to(gl.int64) * logits_stride
-    if CHUNK_LOOP:
+    if ROW_RUNS:
+        tl.static_assert(not CHUNK_LOOP and not IS_DECODE)
+        no_request = 2147483647
+        previous = gl.min(gl.where(row_valid, row_requests, no_request), axis=0) - 1
+        # One request per pass, in ascending order; a block holds at most ROWS.
+        for _ in range(0, ROWS):
+            request = gl.min(
+                gl.where(
+                    row_valid & (row_requests > previous), row_requests, no_request
+                ),
+                axis=0,
+            )
+            in_run = row_valid & (row_requests == request)
+            run_starts = gl.where(in_run, starts, num_candidates)
+            run_ends = gl.where(in_run, ends, 0)
+            run_start = gl.maximum(gl.min(run_starts, axis=0), candidate_start)
+            run_end = gl.minimum(gl.max(run_ends, axis=0), candidate_end)
+            if run_start < run_end:
+                _score_candidate_chunk(
+                    index_k,
+                    index_k_scale,
+                    kv_workspace_slots,
+                    block_table,
+                    logits,
+                    query_0,
+                    weight_0,
+                    query_1,
+                    weight_1,
+                    run_starts,
+                    run_ends,
+                    row_offsets,
+                    gl.max(gl.where(in_run, rows, 0), axis=0),
+                    block_table_stride,
+                    model_scale,
+                    run_start,
+                    run_end,
+                    mfma_layout,
+                    dot_b_layout,
+                    out_layout,
+                    col_layout,
+                    PAGE_SIZE,
+                    NUM_HEADS,
+                    HEAD_DIM,
+                    ROWS,
+                    BLOCK_N,
+                    CHUNK_N,
+                    NUM_WARPS,
+                    NUM_STAGES,
+                    True,
+                    PAGE_STRIDE_BYTES,
+                    KEY_FP8,
+                    Q_FORMAT,
+                    USE_BUFFER_LOAD,
+                    USE_BUFFER_STORE,
+                    NONFINITE_TO_NEG_INF,
+                    query_scale_0,
+                    query_scale_1,
+                )
+            previous = request
+    elif CHUNK_LOOP:
         for chunk in range(candidate_start // CHUNK_N, tl.cdiv(candidate_end, CHUNK_N)):
             _score_candidate_chunk(
                 index_k,
@@ -1597,9 +1818,12 @@ def _multi_row_index_k_scores_body(
                 IS_DECODE,
                 PAGE_STRIDE_BYTES,
                 KEY_FP8,
-                Q_FP8,
+                Q_FORMAT,
                 USE_BUFFER_LOAD,
                 USE_BUFFER_STORE,
+                NONFINITE_TO_NEG_INF,
+                query_scale_0,
+                query_scale_1,
             )
     else:
         _score_candidate_chunk(
@@ -1635,9 +1859,12 @@ def _multi_row_index_k_scores_body(
             IS_DECODE,
             PAGE_STRIDE_BYTES,
             KEY_FP8,
-            Q_FP8,
+            Q_FORMAT,
             USE_BUFFER_LOAD,
             USE_BUFFER_STORE,
+            NONFINITE_TO_NEG_INF,
+            query_scale_0,
+            query_scale_1,
         )
 
 
@@ -1718,7 +1945,7 @@ def gluon_dsa_prefill_topk_bf16_gfx950(
         False,
         0,
         False,
-        False,
+        "bf16",
         USE_BUFFER_LOAD,
         USE_BUFFER_STORE,
         False,
@@ -1805,7 +2032,7 @@ def gluon_dsa_decode_topk_bf16_gfx950(
         True,
         0,
         False,
-        False,
+        "bf16",
         USE_BUFFER_LOAD,
         USE_BUFFER_STORE,
         False,
@@ -1817,13 +2044,17 @@ def _fp8_index_k_launch_metadata(grid, kernel, args):
     heads = args["NUM_HEADS"]
     head_dim = args["HEAD_DIM"]
     cols = args["num_candidates"]
-    q_bytes = 1 if args["Q_FP8"] else 2
+    q_format = args["Q_FORMAT"]
+    # Bytes of a 128-element query and key row with their scales.
+    q_bytes = {"bf16": 256, "fp8_e4m3": 128, "mxfp4": 68}[q_format] * head_dim // 128
+    key_bytes = (68 if q_format == "mxfp4" else 132) * head_dim // 128
+    flops = "flops16" if q_format == "bf16" else "flops8"
     # Upper bound: every row scores every candidate.
     return {
         "name": kernel.name,
-        "flops8" if args["Q_FP8"] else "flops16": 2 * rows * heads * head_dim * cols,
-        "bytes": grid[0] * cols * (head_dim + 4)
-        + grid[1] * rows * heads * head_dim * q_bytes
+        flops: 2 * rows * heads * head_dim * cols,
+        "bytes": grid[0] * cols * key_bytes
+        + grid[1] * rows * heads * q_bytes
         + rows * cols * 4,
     }
 
@@ -1863,18 +2094,20 @@ def gluon_dsa_prefill_topk_fp8_rows_gfx950(
     WARPS_M: gl.constexpr,
     WARPS_N: gl.constexpr,
     NUM_STAGES: gl.constexpr,
-    Q_FP8: gl.constexpr,
+    Q_FORMAT: gl.constexpr,
     USE_BUFFER_LOAD: gl.constexpr,
     USE_BUFFER_STORE: gl.constexpr,
 ):
-    """Prefill scorer over an fp8_scaled paged plane and BF16 or FP8 q.
+    """Prefill scorer over a scaled (fp8_scaled or mxfp4) paged plane.
 
     The grid and spans are ``gluon_dsa_prefill_topk_bf16_gfx950``'s;
     ``kv_workspace_slots`` holds plane slots of ``PAGE_SIZE``-row pages
     ``PAGE_STRIDE_BYTES`` apart, each its FP8 rows then their fp32 scales.
 
-    With ``Q_FP8``, ``q`` is E4M3 with FP32 ``q_scales[row, head]`` and the
-    keys multiply as E4M3; otherwise ``q`` is BF16 and ``q_scales`` unused.
+    ``Q_FORMAT`` is ``"fp8_e4m3"`` (FP32 ``q_scales[row, head]``, keys
+    multiplied as E4M3), ``"mxfp4"`` (E2M1 ``q`` code bytes and one int32
+    word of UE8M0 ``q_scales[row, head]``, over mxfp4 pages) or ``"bf16"``
+    (``q_scales`` unused).
     """
     _multi_row_index_k_scores_body(
         q,
@@ -1913,7 +2146,7 @@ def gluon_dsa_prefill_topk_fp8_rows_gfx950(
         False,
         PAGE_STRIDE_BYTES,
         True,
-        Q_FP8,
+        Q_FORMAT,
         USE_BUFFER_LOAD,
         USE_BUFFER_STORE,
         False,
@@ -1922,7 +2155,115 @@ def gluon_dsa_prefill_topk_fp8_rows_gfx950(
 
 @gluon.jit(
     launch_metadata=_fp8_index_k_launch_metadata,
-    do_not_specialize=("num_rows", "num_candidates", "q_len_per_req"),
+    do_not_specialize=(
+        "num_rows",
+        "num_candidates",
+        "block_table_stride",
+        "logits_stride",
+    ),
+    do_not_specialize_on_alignment=("row_requests", "row_lens", "block_table"),
+)
+def gluon_dsa_owned_prefill_topk_fp8_rows_gfx950(
+    q,
+    q_scales,
+    index_k_fp8,
+    index_k_scale,
+    weights,
+    row_requests,
+    row_lens,
+    block_table,
+    logits,
+    num_rows,
+    stride_q_row,
+    stride_q_head,
+    stride_q_dim,
+    stride_w_row,
+    stride_w_head,
+    stride_qs_row,
+    stride_qs_head,
+    block_table_stride,
+    logits_stride,
+    model_scale,
+    num_candidates,
+    PAGE_SIZE: gl.constexpr,
+    PAGE_STRIDE_BYTES: gl.constexpr,
+    NUM_HEADS: gl.constexpr,
+    HEAD_DIM: gl.constexpr,
+    ROWS: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    CHUNK_N: gl.constexpr,
+    WARPS_M: gl.constexpr,
+    WARPS_N: gl.constexpr,
+    NUM_STAGES: gl.constexpr,
+    Q_FORMAT: gl.constexpr,
+    USE_BUFFER_LOAD: gl.constexpr,
+    USE_BUFFER_STORE: gl.constexpr,
+):
+    """Prefill scorer over compact owned pages of a scaled paged plane.
+
+    The grid and spans are ``gluon_dsa_prefill_topk_fp8_rows_gfx950``'s;
+    row ``i`` (of request ``row_requests[i]``) scores its first
+    ``row_lens[i]`` slots of ``block_table[i]``'s pages, as
+    ``gluon_dsa_decode_topk_fp8_rows_gfx950`` scores a one-row group, with
+    the same arithmetic. NaN and infinite scores are stored as -inf.
+    """
+    _multi_row_index_k_scores_body(
+        q,
+        q_scales,
+        index_k_fp8,
+        index_k_scale,
+        weights,
+        block_table,
+        row_requests,
+        row_lens,
+        row_lens,
+        block_table,
+        logits,
+        num_rows,
+        stride_q_row,
+        stride_q_head,
+        stride_q_dim,
+        stride_w_row,
+        stride_w_head,
+        stride_qs_row,
+        stride_qs_head,
+        block_table_stride,
+        logits_stride,
+        model_scale,
+        num_candidates,
+        1,
+        PAGE_SIZE,
+        NUM_HEADS,
+        HEAD_DIM,
+        ROWS,
+        BLOCK_N,
+        CHUNK_N,
+        WARPS_M,
+        WARPS_N,
+        NUM_STAGES,
+        False,
+        PAGE_STRIDE_BYTES,
+        True,
+        Q_FORMAT,
+        USE_BUFFER_LOAD,
+        USE_BUFFER_STORE,
+        False,
+        False,
+        True,
+        True,
+    )
+
+
+@gluon.jit(
+    launch_metadata=_fp8_index_k_launch_metadata,
+    do_not_specialize=(
+        "num_rows",
+        "num_candidates",
+        "q_len_per_req",
+        "block_table_stride",
+        "logits_stride",
+    ),
+    do_not_specialize_on_alignment=("seq_lens", "block_table", "explicit_row_lens"),
 )
 def gluon_dsa_decode_topk_fp8_rows_gfx950(
     q,
@@ -1956,12 +2297,14 @@ def gluon_dsa_decode_topk_fp8_rows_gfx950(
     WARPS_M: gl.constexpr,
     WARPS_N: gl.constexpr,
     NUM_STAGES: gl.constexpr,
-    Q_FP8: gl.constexpr,
+    Q_FORMAT: gl.constexpr,
     USE_BUFFER_LOAD: gl.constexpr,
     USE_BUFFER_STORE: gl.constexpr,
     CHUNK_LOOP: gl.constexpr,
+    explicit_row_lens=None,
+    NONFINITE_TO_NEG_INF: gl.constexpr = False,
 ):
-    """Decode scorer over an fp8_scaled paged plane and BF16 or FP8 q.
+    """Decode scorer over a scaled (fp8_scaled or mxfp4) paged plane.
 
     The grid and spans are ``gluon_dsa_decode_topk_bf16_gfx950``'s; pages
     are ``PAGE_STRIDE_BYTES`` apart, each its FP8 rows then their fp32
@@ -1969,8 +2312,12 @@ def gluon_dsa_decode_topk_fp8_rows_gfx950(
     than chunks: program ``(i, j)`` then scores the ``j``-th equal run of the
     chunks request ``i``'s rows fill.
 
-    With ``Q_FP8``, ``q`` is E4M3 with FP32 ``q_scales[row, head]`` and the
-    keys multiply as E4M3; otherwise ``q`` is BF16 and ``q_scales`` unused.
+    ``Q_FORMAT`` is ``"fp8_e4m3"`` (FP32 ``q_scales[row, head]``, keys
+    multiplied as E4M3), ``"mxfp4"`` (E2M1 ``q`` code bytes and one int32
+    word of UE8M0 ``q_scales[row, head]``, over mxfp4 pages) or ``"bf16"``
+    (``q_scales`` unused).
+    With ``NONFINITE_TO_NEG_INF``, NaN and infinite scores are stored as
+    -inf.
     """
     _multi_row_index_k_scores_body(
         q,
@@ -1980,7 +2327,7 @@ def gluon_dsa_decode_topk_fp8_rows_gfx950(
         weights,
         block_table,
         seq_lens,
-        seq_lens,
+        seq_lens if explicit_row_lens is None else explicit_row_lens,
         seq_lens,
         block_table,
         logits,
@@ -2009,8 +2356,10 @@ def gluon_dsa_decode_topk_fp8_rows_gfx950(
         True,
         PAGE_STRIDE_BYTES,
         True,
-        Q_FP8,
+        Q_FORMAT,
         USE_BUFFER_LOAD,
         USE_BUFFER_STORE,
         CHUNK_LOOP,
+        explicit_row_lens is not None,
+        NONFINITE_TO_NEG_INF,
     )

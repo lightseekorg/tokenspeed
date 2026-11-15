@@ -589,6 +589,22 @@ normalized FP32 weights (scale 1) and INT32 IDs into caller-owned buffers.
 The routing-only kernel has no expert-plan workspace or 8,192-token limit.
 Other contracts retain their existing routers.
 
+On gfx950, `kimi3_sigmoid_bias_topk_sorted` (`_triton/kimi3_sigmoid_topk.py`)
+also sorts the routes by expert for the A8W4 SiTU decode, in one launch for
+up to 256 rows. Each row program routes one row with the packed top-k's own
+code, so ids and FP32 weights match `kimi3_sigmoid_bias_topk` bit for bit,
+writes them through to memory, sets its row's bit in each selected expert's
+arrival mask, and increments an arrival counter. One sorting program per 512
+routes follows the row programs in the grid (so every row program has
+dispatched before they wait) and polls the counter. Each sorting program
+derives the expert offsets from the masks and places its share of the routes
+at their expert's first slot plus the number of earlier rows in that expert's
+mask, in `gluon_moe_sorting`'s block-16 format. Routes within an expert
+therefore follow the flat top-k order, as `deterministic_order=True` does. The
+last sorting program leaves the caller-owned scratch zeroed, so sequential and
+graph-replayed launches can share it. The Kimi-K3 TP decode on gfx950 uses it,
+and the MoE then skips its own sort.
+
 ## Kimi-K3 front projections
 
 `try_latent_moe_input_projections` runs a registered fused implementation or
@@ -711,6 +727,22 @@ also writes the activation scales the shared expert reads: MN-major, with rows
 grouped by the BLOCK_M MegaMoE picks for the token count. The shared expert's
 SwiGLU uses the routed experts' clamp.
 
+## DeepSeek V4 MegaMoE filler rows (`deep_gemm.py`)
+
+Every MegaMoE launch, warmup included, passes the staging kernel the shared
+int32 `(live, padded)` request pair from `mega_moe_live_requests`. Staging
+writes codes and scales for every row, but each row at or past
+`num_tokens * live // padded` gets expert id -1 and weight 0. MegaMoE's
+dispatch and combine skip negative ids, so such a row's output is zero, or
+the fused shared expert's output alone. The share is right only when each
+rank stages its attention-DP group's whole padded batch, not a TP shard of
+it. The pair is (1, 1), which routes every row, except during a padded
+decode-graph replay under attention TP 1 or attention TP equal to the MoE
+TP x EP size, the layouts that give whole batches (the padding contract in
+`docs/design/unified_path.md`). Under other layouts, such as Qwen3.5's
+DP4/TP2/EP8, it stays (1, 1). The kernel reads the counts at launch, so new
+values do not recompile it.
+
 ## Kimi-K3 TP8 decode chain (`_cute_dsl/k3_decode.py`)
 
 On Blackwell with one TP8 group shared by attention and MoE, a decode forward
@@ -726,6 +758,8 @@ symmetric memory instead of NCCL collectives:
    renormalized, scaled) and gathers the full latent row. It reads the logits
    from their mailbox as they land, without waiting for the GEMM to complete,
    and every thread of a row's CTA ranks the candidates, at every row count.
+   A NaN logit (a padded graph row's) counts as a zero sigmoid, so the row
+   ranks by bias instead of tying all 896 experts.
 3. Persistent MXFP4 experts compute this rank's intermediate slice of the
    chosen experts and combine them into a weighted latent partial.
 4. One tail kernel all-reduces the partials, applies the latent RMSNorm, runs
@@ -754,7 +788,7 @@ and the all-reduces leave idle, so the chain prefetches weights into L2
 (`_cute_dsl/k3_decode_prefetch.py` has the row counts and caps). A side stream
 prefetches the MoE front's packed weight after the o-projection exit; the
 o-projection shard and the MoE layer's front, shared-expert and up-projection
-weights after the KDA input projection or the MLA core; and, once the routed
+weights after the attention input projection; and, once the routed
 experts launch, the next layer's attention weights up to a cap. At 4-7 rows the
 routed experts instead prefetch the up-projection shard and the next attention's
 weights themselves, once their last weight load is issued. The forward rejoins

@@ -968,6 +968,7 @@ class _IndexKPool:
     def __init__(self, plane: torch.Tensor):
         self.plane = plane
         self.index_k_page_size = _PAGE
+        self.index_k_format = "fp8_scaled"
 
     def get_index_k_buffer(self, layer_id: int) -> torch.Tensor:
         return self.plane
@@ -1045,6 +1046,10 @@ class _KvpPrefillBackend:
 
     def prefill_index_columns(self) -> int | None:
         return self._index_columns
+
+    def history_prefill_plan(self):
+        # The sharded extend arm, not a prefill over gathered histories.
+        return None
 
 
 class _IdentityAttnComm:

@@ -32,17 +32,22 @@ use ts_scheduler::{
 };
 
 /// Start the interpreter once per test process, with the scheduler module
-/// built in and the repository's `tokenspeed_scheduler` package importable.
+/// loaded and the repository's `tokenspeed_scheduler` package importable.
 fn interpreter() {
     static START: Once = Once::new();
     START.call_once(|| {
         // The test binary is not in a Python prefix; point at the one the
         // crate was built against.
         std::env::set_var("PYTHONHOME", env!("TS_SCHEDULER_TEST_PYTHONHOME"));
-        ts_scheduler::register_builtin_module();
         Python::initialize();
         Python::attach(|py| {
-            ts_scheduler::alias_builtin_module(py).unwrap();
+            let module = ts_scheduler::python_module(py).unwrap();
+            py.import("sys")
+                .unwrap()
+                .getattr("modules")
+                .unwrap()
+                .set_item("tokenspeed_scheduler.tokenspeed_scheduler_ext", module)
+                .unwrap();
             let package_dir = concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../../tokenspeed-scheduler/python"
@@ -150,25 +155,6 @@ fn event(kind: ForwardEventKind, request_id: &str, tokens: Vec<i32>) -> ForwardE
         reserve_num_tokens: 0,
         bootstrap_token: -1,
     }
-}
-
-#[test]
-fn the_package_imports_the_built_in_module() {
-    interpreter();
-    Python::attach(|py| {
-        let origin = run(
-            py,
-            "import tokenspeed_scheduler.tokenspeed_scheduler_ext as m\n\
-             import importlib.machinery\n\
-             result = (m.__spec__.origin, type(m.__spec__.loader).__name__, m.__name__)",
-        );
-        let (origin, loader, name): (String, String, String) = origin.extract().unwrap();
-        assert_eq!(
-            (origin.as_str(), loader.as_str()),
-            ("built-in", "type"),
-            "{name}"
-        );
-    });
 }
 
 #[test]
@@ -353,7 +339,13 @@ fn a_recording_sees_the_schedulers_phases_inside_its_calls() {
     };
     let submit = named("Scheduler::submit_requests");
     assert_eq!(submit.category, profile::HOST);
-    for phase in ["copyRequestSpecs", "Scheduler::SubmitRequests"] {
+    // With prefix caching on, a request's prompt page hashes are computed in
+    // the round it arrives, so ComputePrefixHashes runs under submit.
+    for phase in [
+        "copyRequestSpecs",
+        "Scheduler::SubmitRequests",
+        "ComputePrefixHashes",
+    ] {
         let phase = named(phase);
         assert_eq!(phase.category, profile::SCHEDULER, "{phase:?}");
         assert!(within(phase, submit), "{phase:?} outside {submit:?}");
@@ -371,7 +363,6 @@ fn a_recording_sees_the_schedulers_phases_inside_its_calls() {
         "Scheduler::scheduleLocalPrefillWork",
         "Scheduler::schedulePrefillFirstChunk",
         "Scheduler::matchPrefixAtAdmission",
-        "ComputePrefixHashes",
         "CacheCoordinator::ProbePromptPrefix",
         "CacheCoordinator::Admit",
         "planAdmission",
