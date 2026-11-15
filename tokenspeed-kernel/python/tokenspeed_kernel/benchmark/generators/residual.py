@@ -898,7 +898,6 @@ def prepare_post_norm_residual_pre_norm(
             False,
             None,
             1,
-            None,
         )
 
     return PreparedBenchmark(

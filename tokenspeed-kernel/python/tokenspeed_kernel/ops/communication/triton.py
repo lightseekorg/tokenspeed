@@ -110,7 +110,7 @@ __all__ = [
     "create_dp_sampling_state",
     "dp_sampling_gather",
     "dp_sampling_swap",
-    "multicast_publish",
+    "gather_mailbox_blocks",
     "rank_ordered_fold",
 ]
 
@@ -2398,63 +2398,91 @@ def all_gather_inner(
     )
 
 
-_PUBLISH_BLOCK = 1024
-
-
 @triton.jit
-def _publish_kernel(
-    src_ptr,
-    dst_ptr,
-    width_words,
-    src_stride_words,
-    dst_stride_words,
-    BLOCK: tl.constexpr,
+def _gather_mailbox_blocks_kernel(
+    mailbox_ptr,
+    out_ptr,
+    sentinel_word: tl.constexpr,
+    sentinel_half: tl.constexpr,
+    BLOCKS: tl.constexpr,
+    BLOCK_WIDTH: tl.constexpr,
+    BLOCK_STRIDE: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    mask = cols < width_words
-    words = tl.load(src_ptr + row * src_stride_words + cols, mask=mask, other=0)
-    tl.store(dst_ptr + row * dst_stride_words + cols, words, mask=mask)
+    row = tl.program_id(0).to(tl.int64)
+    block = tl.program_id(1)
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        # Dependents may launch now; their own wait still covers this grid's completion.
+        tl.extra.cuda.gdc_launch_dependents()
+    start = block * BLOCK_STRIDE + row * BLOCK_WIDTH
+    offsets = tl.arange(0, BLOCK_WIDTH)
+    source = mailbox_ptr.to(tl.pointer_type(tl.int16)) + start + offsets
+    halves = tl.load(source, volatile=True)
+    while tl.max((halves == sentinel_half).to(tl.int32), axis=0) != 0:
+        halves = tl.load(source, volatile=True)
+    destination = out_ptr.to(tl.pointer_type(tl.int16))
+    tl.store(
+        destination + row * (BLOCKS * BLOCK_WIDTH) + block * BLOCK_WIDTH + offsets,
+        halves,
+    )
+    words = tl.arange(0, BLOCK_WIDTH // 2)
+    tl.store(
+        mailbox_ptr.to(tl.pointer_type(tl.int32)) + start // 2 + words,
+        tl.full([BLOCK_WIDTH // 2], sentinel_word, tl.int32),
+    )
 
 
-def multicast_publish(block: torch.Tensor, destination: torch.Tensor) -> None:
-    """Store ``block`` into ``destination`` as whole 32-bit words for a Lamport reader.
+def gather_mailbox_blocks(
+    mailbox: torch.Tensor, sentinel: int, enable_pdl: bool
+) -> torch.Tensor:
+    """Gather a rank-major Lamport mailbox's rows as they arrive, re-arming what was read.
 
     Args:
-        block: Contiguous BF16 ``[rows, width]`` block, ``width`` even.
-        destination: BF16 ``[rows, width]`` view whose rows may be strided,
-            typically this rank's column block of a multicast mailbox.
+        mailbox: BF16 ``[blocks, rows, block_width]`` view of each block's
+            first rows, one block per producing rank; ``block_width`` is a
+            power of two.
+        sentinel: The 32-bit word the mailbox is armed with, whose 16-bit
+            halves agree; each half is polled until it no longer holds it.
+        enable_pdl: Enable NVIDIA programmatic dependent launch.
 
     Returns:
-        None; ``destination`` holds ``block`` bit for bit.
+        BF16 ``[rows, blocks * block_width]``, each row its blocks' rows side
+        by side.
     """
-    rows, width = block.shape
-    if block.dtype != torch.bfloat16 or destination.dtype != torch.bfloat16:
-        raise ValueError("multicast_publish moves BF16 blocks")
-    if destination.shape != (rows, width) or width % 2 or not block.is_contiguous():
-        raise ValueError(
-            "block must be a contiguous [rows, width] tensor of even width"
-        )
+    blocks, rows, block_width = mailbox.shape
+    if mailbox.dtype != torch.bfloat16 or block_width & (block_width - 1):
+        raise ValueError("the mailbox must be BF16 blocks of a power-of-two width")
     if (
-        destination.stride(1) != 1
-        or destination.stride(0) % 2
-        or destination.data_ptr() % 4
+        mailbox.stride()[1:] != (block_width, 1)
+        or mailbox.stride(0) < rows * block_width
     ):
-        raise ValueError("destination rows must be contiguous and 32-bit aligned")
-    if rows == 0 or width == 0:
-        return
-    source_words = block.view(torch.int32)
-    destination_words = destination.view(torch.int32)
-    width_words = width // 2
-    _publish_kernel[(rows, triton.cdiv(width_words, _PUBLISH_BLOCK))](
-        source_words,
-        destination_words,
-        width_words,
-        source_words.stride(0),
-        destination_words.stride(0),
-        BLOCK=_PUBLISH_BLOCK,
-        num_warps=4,
+        raise ValueError(
+            "the mailbox must be the first rows of whole contiguous blocks"
+        )
+    if not 0 <= sentinel <= 0xFFFFFFFF or (sentinel & 0xFFFF) != (sentinel >> 16):
+        raise ValueError("the mailbox sentinel is one word whose halves agree")
+    out = torch.empty(
+        (rows, blocks * block_width), dtype=mailbox.dtype, device=mailbox.device
     )
+    if rows == 0:
+        return out
+    use_pdl = enable_pdl and current_platform().is_hopper_plus
+    launch = {"launch_pdl": True} if use_pdl else {}
+    _gather_mailbox_blocks_kernel[(rows, blocks)](
+        mailbox,
+        out,
+        # The kernel compares int16 halves and stores int32 words: signed images.
+        sentinel_word=sentinel - (1 << 32) if sentinel >= 1 << 31 else sentinel,
+        sentinel_half=(sentinel & 0xFFFF) - (1 << 16 if sentinel & 0x8000 else 0),
+        BLOCKS=blocks,
+        BLOCK_WIDTH=block_width,
+        BLOCK_STRIDE=mailbox.stride(0),
+        ENABLE_PDL=use_pdl,
+        num_warps=4,
+        **launch,
+    )
+    return out
 
 
 @triton.jit(do_not_specialize=["cols", "stride_world", "stride_row", "stride_out"])
