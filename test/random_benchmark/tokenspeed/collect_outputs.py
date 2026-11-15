@@ -64,7 +64,24 @@ def _float(summary: dict, *keys: str) -> float:
     return 0.0
 
 
-def collect(sweep_dir: Path, num_gpus: int):
+def _median_tpot_ms(summary_path: Path) -> float:
+    """Median per-request TPOT from EvalScope's percentile table next to the summary."""
+    try:
+        table = json.loads(
+            (summary_path.parent / "benchmark_percentile.json").read_text()
+        )
+    except (OSError, json.JSONDecodeError) as exc:
+        print(
+            f"[warn] no TPOT percentiles beside {summary_path}: {exc}", file=sys.stderr
+        )
+        return 0.0
+    for row in table:
+        if row.get("Percentiles") == "50%":
+            return _float(row, "TPOT (ms)")
+    return 0.0
+
+
+def collect(sweep_dir: Path, num_gpus: int, tpot_stat: str = "mean"):
     rows = []
     for summary_path in sorted(sweep_dir.rglob("benchmark_summary.json")):
         config = _config_from_path(sweep_dir, summary_path)
@@ -78,7 +95,10 @@ def collect(sweep_dir: Path, num_gpus: int):
 
         # EvalScope 1.10 renamed these summary fields. Accept both spellings so
         # an unpinned CI dependency cannot silently turn real metrics into 0.
-        tpot_ms = _float(summary, "Avg TPOT (ms)", "TPOT (ms)")
+        if tpot_stat == "median":
+            tpot_ms = _median_tpot_ms(summary_path)
+        else:
+            tpot_ms = _float(summary, "Avg TPOT (ms)", "TPOT (ms)")
         tps_user = 1000.0 / tpot_ms if tpot_ms else 0.0
         output_tps = _float(summary, "Output Throughput (tok/s)")
         cache_hit = _float(summary, "KV Cache Hit Rate (%)")
@@ -140,6 +160,14 @@ def main():
         action="store_true",
         help="Also print the CSV block that a task's perf_reference gate reads.",
     )
+    parser.add_argument(
+        "--tpot-stat",
+        choices=("mean", "median"),
+        default="mean",
+        help="Per-request TPOT statistic behind Latency (tps/user). The median "
+        "ignores the few requests whose decode waits behind other prompts' "
+        "prefill, which the mean takes in and which depends on arrival order.",
+    )
     args = parser.parse_args()
 
     if not args.sweep_dir.is_dir():
@@ -147,7 +175,7 @@ def main():
     if args.num_gpus <= 0:
         sys.exit("--num-gpus must be positive")
 
-    rows = collect(args.sweep_dir, args.num_gpus)
+    rows = collect(args.sweep_dir, args.num_gpus, args.tpot_stat)
     print_table(rows)
     if args.emit_csv:
         print()

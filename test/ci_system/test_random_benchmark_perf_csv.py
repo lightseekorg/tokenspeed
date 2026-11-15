@@ -86,3 +86,50 @@ def test_random_benchmark_accepts_evalscope_1_10_metric_names(tmp_path):
     assert rows[0]["Latency (tps/user)"] == "40.0"
     assert rows[0]["Throughput (tps/gpu)"] == "4.0"
     assert rows[0]["Decoded Tok/Iter"] == "2.0"
+
+
+def test_random_benchmark_latency_can_use_median_tpot(tmp_path):
+    run_dir = tmp_path / "input_50k" / "parallel_16"
+    run_dir.mkdir(parents=True)
+    # One request waited behind the other prompts' prefill: the mean TPOT is
+    # dominated by it, the median is the decode rate.
+    (run_dir / "benchmark_summary.json").write_text(
+        json.dumps(
+            {
+                "Concurrency": 16,
+                "Avg TPOT (ms)": 14.0,
+                "Output Throughput (tok/s)": 160.0,
+                "KV Cache Hit Rate (%)": 0.0,
+                "Avg Decoded Tok/Iter": 3.9,
+            }
+        )
+    )
+    (run_dir / "benchmark_percentile.json").write_text(
+        json.dumps(
+            [
+                {"Percentiles": "25%", "TPOT (ms)": 8.0},
+                {"Percentiles": "50%", "TPOT (ms)": 8.0},
+                {"Percentiles": "max", "TPOT (ms)": 97.0},
+            ]
+        )
+    )
+
+    collector = (
+        Path(__file__).resolve().parents[1]
+        / "random_benchmark"
+        / "tokenspeed"
+        / "collect_outputs.py"
+    )
+
+    def latency(*extra):
+        result = subprocess.run(
+            [sys.executable, collector, tmp_path, "--num-gpus", "8", "--emit-csv"]
+            + list(extra),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return extract_perf_summary_rows(result.stdout)[0]["Latency (tps/user)"]
+
+    assert latency() == "71.43"
+    assert latency("--tpot-stat", "median") == "125.0"
