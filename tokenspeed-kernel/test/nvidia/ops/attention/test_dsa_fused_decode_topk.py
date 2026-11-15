@@ -592,6 +592,13 @@ def test_only_the_cute_dsl_pin_selects_the_fused_leaf() -> None:
     assert pinned.name == LEAF
 
 
+@pytest.fixture
+def pdl_on(monkeypatch):
+    """Pin PDL on, as an early release needs, whatever an earlier test left."""
+    monkeypatch.setattr(platform, "_pdl_enabled", True)
+
+
+@pytest.mark.usefixtures("pdl_on")
 @pytest.mark.parametrize("q_len", [1, 8])
 def test_an_early_release_selects_what_the_waiting_select_does(q_len) -> None:
     """Releasing the next kernel early moves its launch, not the selection."""
@@ -604,6 +611,7 @@ def test_an_early_release_selects_what_the_waiting_select_does(q_len) -> None:
     assert torch.equal(early_out, out) and torch.equal(early_lens, lens)
 
 
+@pytest.mark.usefixtures("pdl_on")
 @pytest.mark.parametrize("absorb", [False, True])
 def test_an_early_release_feeds_the_sparse_core_in_a_graph(absorb) -> None:
     """The sparse core reads the selection after its PDL wait.
@@ -692,6 +700,7 @@ def test_an_early_release_feeds_the_sparse_core_in_a_graph(absorb) -> None:
         assert not absorb or torch.equal(absorbed, expected_absorbed)
 
 
+@pytest.mark.usefixtures("pdl_on")
 def test_only_a_leaf_declaring_it_releases_early() -> None:
     """The DeepGEMM leaf never releases its dependents early: none is selected."""
     case = _case([600], 1, seed=71)
