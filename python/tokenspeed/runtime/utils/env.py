@@ -336,9 +336,6 @@ class Envs:
     TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE = EnvInt(1)
 
     # Scheduler
-    # The ts-host binary each engine rank runs; by default the one installed
-    # with the tokenspeed-engine wheel (``tokenspeed_engine.host_binary()``).
-    TOKENSPEED_HOST_BINARY = EnvStr(None)
     # The Mooncake library the Rust host's PD peer loads
     # (libtokenspeed_transfer_engine.so); by default the one installed with
     # the tokenspeed-mooncake wheel.

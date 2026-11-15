@@ -22,7 +22,7 @@
 config, its cache geometry and groups, the cache ops a plan carries and
 their acknowledgments, and the block tables a forward reads."""
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, NamedTuple
 
@@ -509,13 +509,16 @@ def _snapshot_batch_columns(op) -> tuple[Sequence, ...]:
     )
 
 
-def snapshot_ops_from_wire(op) -> list[SnapshotOp]:
+def snapshot_ops_from_wire(
+    op, *, request_admission: Callable[[str], int]
+) -> list[SnapshotOp]:
     """One ``SnapshotOp`` per request of a ``Cache.SnapshotOp`` batch."""
     rows = _check_batch_rows(op, _snapshot_batch_columns(op))
     return [
         SnapshotOp(
             op_id=int(op.op_ids[i]),
             request_id=str(op.request_ids[i]),
+            admission_id=request_admission(str(op.request_ids[i])),
             request_pool_index=int(op.request_pool_indices[i]),
             snapshot_slot=int(op.snapshot_slots[i]),
             transfers=_wire_transfers(
@@ -531,7 +534,9 @@ def snapshot_ops_from_wire(op) -> list[SnapshotOp]:
     ]
 
 
-def restore_ops_from_wire(op) -> list[RestoreOp]:
+def restore_ops_from_wire(
+    op, *, request_admission: Callable[[str], int]
+) -> list[RestoreOp]:
     """One ``RestoreOp`` per request of a ``Cache.RestoreOp`` batch."""
     rows = _check_batch_rows(
         op,
@@ -555,6 +560,7 @@ def restore_ops_from_wire(op) -> list[RestoreOp]:
             RestoreOp(
                 op_id=int(op.op_ids[i]),
                 request_id=str(op.request_ids[i]),
+                admission_id=request_admission(str(op.request_ids[i])),
                 request_pool_index=int(op.request_pool_indices[i]),
                 snapshot_slot=int(op.snapshot_slots[i]),
                 transfers=transfers,
@@ -588,13 +594,19 @@ class CacheOperations(NamedTuple):
     ]
 
 
-def cache_ops_from_plan(execution_plan) -> CacheOperations:
+def cache_ops_from_plan(
+    execution_plan, *, request_admission: Callable[[str], int]
+) -> CacheOperations:
     """Read and validate every cache op once before any owner submits work.
 
     L2 wire batches pass through; snapshot/restore batches become per-request
     operations. Host-only QUERY/GET/PUT/Cancel descriptors go to the storage
     tuple: the engine host's L3 executor runs them. Unknown kinds fail the
     whole conversion without partial submission.
+
+    ``request_admission`` resolves each snapshot/restore request while the
+    plan is adapted. The resulting op holds the identity, never a late lookup
+    of an external ID that another admission could reuse.
     """
     device: list = []
     storage: list = []
@@ -602,9 +614,13 @@ def cache_ops_from_plan(execution_plan) -> CacheOperations:
         if isinstance(op, (Cache.WriteBackOp, Cache.LoadBackOp)):
             device.append(op)
         elif isinstance(op, Cache.SnapshotOp):
-            device.extend(snapshot_ops_from_wire(op))
+            device.extend(
+                snapshot_ops_from_wire(op, request_admission=request_admission)
+            )
         elif isinstance(op, Cache.RestoreOp):
-            device.extend(restore_ops_from_wire(op))
+            device.extend(
+                restore_ops_from_wire(op, request_admission=request_admission)
+            )
         elif isinstance(
             op,
             (

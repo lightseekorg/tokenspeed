@@ -70,7 +70,7 @@ def test_verify_scores_the_final_tp_token_once(monkeypatch):
         )
     )
     backend.prepare_step(
-        ["ascend-cumulative-tp"],
+        [28],
         [1],
         [SamplingParams(temperature=1.0, top_k=-1, top_p=1.0, seed=73)],
         num_tokens_per_req=1,
