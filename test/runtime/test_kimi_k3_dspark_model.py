@@ -608,7 +608,8 @@ def test_the_one_launch_context_write_stores_the_per_layer_chains_bytes(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA kernels")
-def test_context_kv_write_respects_dcp_ownership():
+@pytest.mark.parametrize("seed", [0, 35])
+def test_context_kv_write_respects_dcp_ownership(seed):
     """Under KV parallelism each rank stores only the rows it owns.
 
     A rank writes the rows whose pages it owns, at its local slots; padding
@@ -619,7 +620,10 @@ def test_context_kv_write_respects_dcp_ownership():
 
     model = _tiny_draft(Mapping(rank=0, world_size=1))
     slots = torch.tensor([0, 128, 129, 256, 384, 512, 896, 1024, -1], device="cuda")
-    hidden = torch.randn(slots.numel(), 256, device="cuda").bfloat16()
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    hidden = torch.randn(
+        slots.numel(), 256, device="cuda", generator=generator
+    ).bfloat16()
     positions = torch.arange(slots.numel(), device="cuda")
     owned_rows = 0
     for rank in range(4):
@@ -637,7 +641,21 @@ def test_context_kv_write_respects_dcp_ownership():
             attn_backend=SimpleNamespace(cache_placement=lambda layer: placement),
         )
         for got, want in zip(actual, expected, strict=True):
-            assert torch.equal(got.view(torch.int16), want.view(torch.int16))
+            got_bits = got.view(torch.int16)
+            want_bits = want.view(torch.int16)
+            if torch.version.hip is None:
+                assert torch.equal(got_bits, want_bits)
+                continue
+            written = (want != 0).any(dim=(1, 2))
+            assert torch.equal((got != 0).any(dim=(1, 2)), written)
+            assert torch.equal(got_bits[~written], want_bits[~written])
+            rank_width = model.layers[0].self_attn.kv_lora_rank
+            assert torch.equal(got_bits[..., rank_width:], want_bits[..., rank_width:])
+            # The fused RMSNorm uses FlashInfer's reduction order, which can
+            # round one BF16 value away from the AMD Triton reference.
+            got_norm = got_bits[written, :, :rank_width].int()
+            want_norm = want_bits[written, :, :rank_width].int()
+            assert ((got_norm - want_norm).abs() <= 1).all()
         owned_rows += int(actual[0].abs().sum(dim=(1, 2)).gt(0).sum())
     # Rows 128..896 are owned by exactly one rank each; 0, 1024 and -1 by none.
     assert owned_rows == 6
