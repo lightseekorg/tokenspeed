@@ -229,3 +229,20 @@ def test_unknown_named_region_is_rejected(memory, enabled):
     with pytest.raises(KeyError, match="unknown_owner"):
         with saver.named_region("unknown_owner"):
             pytest.fail("unknown region entered its allocation scope")
+
+
+@pytest.mark.parametrize(
+    "adapter_class",
+    [adapter._TorchMemorySaverAdapterNoop, adapter._TorchMemorySaverAdapterReal],
+)
+def test_default_allocator_keeps_memory_protocol_v2(adapter_class):
+    from tokenspeed.runtime.engine.memory_protocol import (
+        supports_replica_memory_transitions,
+    )
+
+    assert not supports_replica_memory_transitions(
+        checked_startup=True,
+        memory_saver=True,
+        backend_capable=adapter_class.supports_replica_memory_transitions,
+        role="null",
+    )

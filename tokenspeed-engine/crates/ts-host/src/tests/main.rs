@@ -501,16 +501,9 @@ fn bootstrap_selects_the_memory_protocol_for_the_rank() {
                     c"legacy_profiled_bootstrap",
                 )
                 .unwrap();
-                let unchecked = PyModule::from_code(
-                    py,
-                    c"MEMORY_PROTOCOL_STARTUP = True\ndef prepare_bootstrap(fd, *, validate_memory_protocol=False):\n    return True, lambda outbox, protocol, host_spans: (fd, outbox, protocol, host_spans)",
-                    c"unchecked_bootstrap.py",
-                    c"unchecked_bootstrap",
-                )
-                .unwrap();
                 let prepared = PyModule::from_code(
                     py,
-                    c"ASCEND_MEMORY_PROTOCOL_STARTUP = True\ndef prepare_bootstrap(fd, *, validate_memory_protocol):\n    return validate_memory_protocol and replica_memory_transitions, lambda outbox, protocol, host_spans: (fd, outbox, protocol, host_spans)",
+                    c"def prepare_bootstrap(fd, *, validate_memory_protocol):\n    return validate_memory_protocol and replica_memory_transitions, lambda outbox, protocol, host_spans: (fd, outbox, protocol, host_spans)",
                     c"prepared_bootstrap.py",
                     c"prepared_bootstrap",
                 )
@@ -537,14 +530,6 @@ fn bootstrap_selects_the_memory_protocol_for_the_rank() {
                     worker.extract::<(i32, String, u32, String)>().unwrap(),
                     (7, "outbox".to_owned(), 2, "host spans".to_owned())
                 );
-                let (worker, enabled) =
-                    super::bootstrap_worker(&unchecked, 7, outbox.as_any(), host_spans.as_any())
-                        .unwrap();
-                assert!(!enabled);
-                assert_eq!(
-                    worker.extract::<(i32, String, u32, String)>().unwrap(),
-                    (7, "outbox".to_owned(), 2, "host spans".to_owned())
-                );
                 for (capability, protocol) in [(false, 2), (true, 3)] {
                     prepared
                         .setattr("replica_memory_transitions", capability)
@@ -557,6 +542,22 @@ fn bootstrap_selects_the_memory_protocol_for_the_rank() {
                         worker.extract::<(i32, String, u32, String)>().unwrap(),
                         (7, "outbox".to_owned(), protocol, "host spans".to_owned())
                     );
+                }
+                for source in [
+                    c"def prepare_bootstrap(fd, *, validate_memory_protocol):\n    raise TypeError('prepare consumed the pipe')\ndef bootstrap(*args):\n    raise AssertionError('must not retry the consumed pipe')",
+                    c"def prepare_bootstrap(fd):\n    raise AssertionError('unchecked entry must not run')\ndef bootstrap(*args):\n    raise AssertionError('must not downgrade an incompatible prepare')",
+                ] {
+                    let broken = PyModule::from_code(
+                        py,
+                        source,
+                        c"broken_bootstrap.py",
+                        c"broken_bootstrap",
+                    )
+                    .unwrap();
+                    let error =
+                        super::bootstrap_worker(&broken, 7, outbox.as_any(), host_spans.as_any())
+                            .unwrap_err();
+                    assert!(error.is_instance_of::<pyo3::exceptions::PyTypeError>(py));
                 }
             });
         },

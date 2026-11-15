@@ -37,25 +37,25 @@ register_cuda_ci(est_time=60, suite="runtime-1gpu")
 
 
 @pytest.mark.parametrize(
-    ("checked_startup", "memory_saver", "device", "role", "expected"),
+    ("checked_startup", "memory_saver", "backend_capable", "role", "expected"),
     [
-        (True, True, "npu", "prefill", True),
-        (True, True, "npu", "decode", True),
-        (True, True, "npu", "null", True),
-        (True, True, "npu", "encode", False),
-        (True, False, "npu", "prefill", False),
-        (False, True, "npu", "prefill", False),
-        (True, True, "cuda", "prefill", False),
+        (True, True, True, "prefill", True),
+        (True, True, True, "decode", True),
+        (True, True, True, "null", True),
+        (True, True, True, "encode", False),
+        (True, False, True, "prefill", False),
+        (False, True, True, "prefill", False),
+        (True, True, False, "prefill", False),
     ],
 )
-def test_memory_protocol_v3_requires_checked_ascend_serving(
-    checked_startup, memory_saver, device, role, expected
+def test_memory_protocol_v3_requires_checked_backend_capability(
+    checked_startup, memory_saver, backend_capable, role, expected
 ):
     assert (
         supports_replica_memory_transitions(
             checked_startup=checked_startup,
             memory_saver=memory_saver,
-            device=device,
+            backend_capable=backend_capable,
             role=role,
         )
         is expected

@@ -231,42 +231,64 @@ def test_draft_final_step_follows_the_complete_drafter_run():
     ]
 
 
-def test_non_final_pipeline_stage_returns_empty_probability_outputs():
-    from tokenspeed.runtime.layers.attention.backends.base import CachePoolBinding
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="requires a real device constructor"
+)
+@pytest.mark.parametrize("bs", [1, 2])
+@pytest.mark.parametrize(("pp_size", "pp_rank"), [(2, 0), (2, 1), (1, 0)])
+def test_pipeline_stage_probability_outputs(
+    tmp_path, monkeypatch, bs, pp_size, pp_rank
+):
+    from test.runtime.test_pp_executor_fixture import (
+        PipelineTransport,
+        build_pp_executor,
+    )
 
-    executor = ModelExecutor.__new__(ModelExecutor)
-    executor.attn_backend = CachePoolBinding()
-    executor.device = "cpu"
-    executor.device_module = torch.cpu
-    executor.input_buffers = SimpleNamespace(req_pool_indices_buf=torch.tensor([0]))
-    executor.grammar_runtime = None
-    executor.drafter = None
-    executor.dspark_context_producer = None
-    executor.config = SimpleNamespace(pp_size=2, pp_rank=0)
-    boundary = PPStageState(hidden_states=torch.ones((1, 4)))
-    executor._run_target_forward = lambda _ctx: boundary
+    from tokenspeed.runtime.distributed import comm_ops
+    from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 
-    # The downstream device rank is unavailable in this CPU test.
-    sent = []
-    executor._pp_send_stage_state = sent.append
+    transport = PipelineTransport()
+    # Only the peer transport is absent; construction/forward/state are real.
+    monkeypatch.setattr(comm_ops, "pp_send", transport.send)
+    monkeypatch.setattr(comm_ops, "pp_recv", transport.recv)
+    executor = build_pp_executor(
+        tmp_path, monkeypatch, device="cuda", pp_size=pp_size, pp_rank=pp_rank
+    )
+    executor.input_buffers.input_ids_buf[:bs].fill_(1)
+    executor.input_buffers.positions_buf[:bs].zero_()
+    executor.input_buffers.req_pool_indices_buf[:bs].copy_(
+        torch.arange(bs, device="cuda")
+    )
     ctx = ForwardContext(
-        attn_backend=None,
-        token_to_kv_pool=None,
-        bs=1,
-        num_extends=1,
-        output_layout=ForwardOutputLayout(1, 1, 0, 1),
-        input_num_tokens=1,
+        attn_backend=executor.attn_backend,
+        token_to_kv_pool=executor.token_to_kv_pool,
+        bs=bs,
+        num_extends=bs,
+        output_layout=ForwardOutputLayout(bs, bs, 0, bs),
+        input_num_tokens=bs,
         forward_mode=ForwardMode.EXTEND,
     )
-
     tokens, lengths, logprobs, cumulative_probs, forward_logprobs = (
-        executor._forward_step(bs=1, ctx=ctx, sampling_info=object())
+        executor._forward_step(
+            bs=bs, ctx=ctx, sampling_info=SamplingBatchInfo(device="cuda")
+        )
     )
-
-    assert sent == [boundary]
-    assert tokens.tolist() == [0]
-    assert lengths.tolist() == [1]
+    assert tokens.dtype == lengths.dtype == torch.int32
+    assert tokens.shape == lengths.shape == (bs,)
+    assert lengths.tolist() == [1] * bs
     assert (logprobs, cumulative_probs, forward_logprobs) == (None, None, None)
+    if pp_rank < pp_size - 1:
+        boundary, rank, group = transport.sent[0]
+        expected = executor.model_runner.model.model.embed_tokens(
+            torch.ones(bs, dtype=torch.int64, device="cuda")
+        )
+        torch.testing.assert_close(boundary, expected)
+        assert len(transport.sent) == 1 and (rank, group) == (1, (0, 1))
+        assert tokens.tolist() == [0] * bs
+    else:
+        assert not transport.sent
+        assert tokens.tolist() == [31] * bs
+    assert transport.received == ([(0, (0, 1))] if pp_size > 1 and pp_rank else [])
 
 
 def test_cudagraph_gc_flag_reaches_the_capture_context():
