@@ -578,32 +578,71 @@ def _chain_write(model, rows, positions, slots, planes, placement, sanitize):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA kernels")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("sanitize", [False, True])
-@pytest.mark.parametrize("rows", [1, 8, 40])
+# Seed 61 reproduced the MI355 rounding difference across an FP8 boundary.
+@pytest.mark.parametrize(("rows", "seed"), [(1, 1), (8, 8), (40, 40), (40, 61)])
 def test_the_one_launch_context_write_stores_the_per_layer_chains_bytes(
-    dtype, sanitize, rows
+    dtype, sanitize, rows, seed
 ):
     from tokenspeed.runtime.distributed.mapping import Mapping
 
     model = _tiny_draft(Mapping(rank=0, world_size=1))
-    generator = torch.Generator(device="cuda").manual_seed(rows)
+    generator = torch.Generator(device="cuda").manual_seed(seed)
     hidden = (torch.randn(rows, 256, device="cuda", generator=generator)).bfloat16()
     positions = torch.randint(4096, (rows,), device="cuda", generator=generator)
     slots = torch.randperm(127, device="cuda", generator=generator)[:rows] + 1
 
-    def planes():
+    def planes(cache_dtype):
         return [
-            torch.full((128, 1, 576), 3.0, device="cuda").to(dtype)
+            torch.full((128, 1, 576), 3.0, device="cuda").to(cache_dtype)
             for _ in model.layers
         ]
 
-    expected, actual = planes(), planes()
+    expected, actual = planes(dtype), planes(dtype)
     _chain_write(model, hidden, positions, slots, expected, None, sanitize)
     backend = SimpleNamespace(cache_placement=lambda layer: None)
     model.write_context_kv(
         hidden, positions, slots, _LatentPool(actual, sanitize), attn_backend=backend
     )
-    for got, want in zip(actual, expected, strict=True):
-        assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))
+    if torch.version.hip is None:
+        for got, want in zip(actual, expected, strict=True):
+            assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))
+            assert not torch.equal(got.float(), torch.full_like(got.float(), 3.0))
+        return
+
+    # Compare only the written RMSNorm values with tolerance. FP8 must
+    # still exactly encode the fused path's BF16 values.
+    bf16_expected, bf16_actual = expected, actual
+    if dtype != torch.bfloat16:
+        bf16_expected, bf16_actual = planes(torch.bfloat16), planes(torch.bfloat16)
+        _chain_write(model, hidden, positions, slots, bf16_expected, None, sanitize)
+        model.write_context_kv(
+            hidden,
+            positions,
+            slots,
+            _LatentPool(bf16_actual, sanitize),
+            attn_backend=backend,
+        )
+    written = torch.zeros(128, device=slots.device, dtype=torch.bool)
+    written[slots] = True
+    rank_width = model.layers[0].self_attn.kv_lora_rank
+    norm_bytes = rank_width * actual[0].element_size()
+    for got, want, got_bf16, want_bf16 in zip(
+        actual, expected, bf16_actual, bf16_expected, strict=True
+    ):
+        got_bytes = got.view(torch.uint8)
+        want_bytes = want.view(torch.uint8)
+        assert torch.equal(got_bytes[~written], want_bytes[~written])
+        assert torch.equal(got_bytes[..., norm_bytes:], want_bytes[..., norm_bytes:])
+        got_norm = got_bf16[slots, :, :rank_width].contiguous()
+        want_norm = want_bf16[slots, :, :rank_width].contiguous()
+        assert (
+            (got_norm.view(torch.int16).int() - want_norm.view(torch.int16).int()).abs()
+            <= 1
+        ).all()
+        if dtype != torch.bfloat16:
+            assert torch.equal(
+                got_bytes[slots, :, :norm_bytes], got_norm.to(dtype).view(torch.uint8)
+            )
         assert not torch.equal(got.float(), torch.full_like(got.float(), 3.0))
 
 
