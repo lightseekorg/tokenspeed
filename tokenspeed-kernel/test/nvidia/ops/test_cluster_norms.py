@@ -25,6 +25,7 @@ from __future__ import annotations
 import pytest
 import torch
 from fused_boundary_helpers import (
+    armed_blocks,
     armed_mailbox,
     assert_child_keeps_waiting,
     boundary_case,
@@ -40,7 +41,6 @@ from tokenspeed_kernel.ops.moe._cute_dsl import routed_norm as routed_cute_dsl
 from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import (
     HALF_POLLED_SENTINEL,
     AllReduceMailbox,
-    MailboxPublish,
 )
 from tokenspeed_kernel.ops.moe._triton.routed_norm import (
     triton_routed_input_scale_rmsnorm_sum_gathered as triton_routed_sum_gathered,
@@ -135,18 +135,16 @@ def test_cluster_boundary_agrees_with_triton_up_to_variance_rounding(
     args = boundary_case(boundary, rows, device)
     assert _supported(args, args[1], None, 1)
     cluster = boundary_cute_dsl.cute_dsl_post_norm_residual_pre_norm(
-        *args, False, None, 1, None
+        *args, False, None, 1
     )
-    pdl = boundary_cute_dsl.cute_dsl_post_norm_residual_pre_norm(
-        *args, True, None, 1, None
-    )
+    pdl = boundary_cute_dsl.cute_dsl_post_norm_residual_pre_norm(*args, True, None, 1)
     for got, twin in zip(cluster, pdl, strict=True):
         assert (got is None and twin is None) or torch.equal(got, twin)
-    triton = triton_boundary(*args, False, None, 1, None)
+    triton = triton_boundary(*args, False, None, 1)
     for got, twin, ref in zip(
         cluster[:2],
         triton[:2],
-        torch_post_norm_residual_pre_norm(*args, False, None, 1, None)[:2],
+        torch_post_norm_residual_pre_norm(*args, False, None, 1)[:2],
     ):
         if got is None:
             assert twin is None and ref is None
@@ -158,7 +156,7 @@ def test_cluster_boundary_agrees_with_triton_up_to_variance_rounding(
         assert torch.equal(cluster[2], cluster[1].to(torch.bfloat16))
     # The dispatcher picks the cluster kernel here.
     assert torch.equal(
-        post_norm_residual_pre_norm(*args, False, None, 1, None)[0], cluster[0]
+        post_norm_residual_pre_norm(*args, False, None, 1)[0], cluster[0]
     )
 
 
@@ -198,14 +196,14 @@ def test_cluster_kernels_decline_what_they_cannot_serve(device: str) -> None:
     narrow = (stream, branch, None, 1e-5, 0.0, alpha, beta, None, 0.0, 0.0)
     assert not _supported(narrow, branch, None, 1)
     assert torch.equal(
-        post_norm_residual_pre_norm(*narrow, False, None, 1, None)[0],
-        triton_boundary(*narrow, False, None, 1, None)[0],
+        post_norm_residual_pre_norm(*narrow, False, None, 1)[0],
+        triton_boundary(*narrow, False, None, 1)[0],
     )
     wide = boundary_case("ffn_linked", MAX_ROWS + 1, device)
     assert not _supported(wide, wide[1], None, 1)
     assert torch.equal(
-        post_norm_residual_pre_norm(*wide, False, None, 1, None)[0],
-        triton_boundary(*wide, False, None, 1, None)[0],
+        post_norm_residual_pre_norm(*wide, False, None, 1)[0],
+        triton_boundary(*wide, False, None, 1)[0],
     )
     # A misaligned alpha view declines too.
     shifted = torch.ones(WIDTH + 1, device=device)[1:]
@@ -281,7 +279,7 @@ def test_cluster_kernels_replay_from_a_cuda_graph(device: str) -> None:
     boundary_args = (*boundary_case("ffn_linked", 4, device), True, None, 1)
     routed_args = (*_routed_case(4, 8, device, 4096 + 128), True, None, None)
     eager = (
-        boundary_cute_dsl.cute_dsl_post_norm_residual_pre_norm(*boundary_args, None)[
+        boundary_cute_dsl.cute_dsl_post_norm_residual_pre_norm(*boundary_args)[
             0
         ].clone(),
         routed_cute_dsl.cute_dsl_routed_input_scale_rmsnorm_sum_gathered(
@@ -290,15 +288,13 @@ def test_cluster_kernels_replay_from_a_cuda_graph(device: str) -> None:
     )
     side = torch.cuda.Stream()
     with torch.cuda.stream(side):
-        boundary_cute_dsl.cute_dsl_post_norm_residual_pre_norm(*boundary_args, None)
+        boundary_cute_dsl.cute_dsl_post_norm_residual_pre_norm(*boundary_args)
         routed_cute_dsl.cute_dsl_routed_input_scale_rmsnorm_sum_gathered(*routed_args)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=side):
         captured = (
-            boundary_cute_dsl.cute_dsl_post_norm_residual_pre_norm(
-                *boundary_args, None
-            )[0],
+            boundary_cute_dsl.cute_dsl_post_norm_residual_pre_norm(*boundary_args)[0],
             routed_cute_dsl.cute_dsl_routed_input_scale_rmsnorm_sum_gathered(
                 *routed_args
             ),
@@ -312,30 +308,36 @@ def test_cluster_kernels_replay_from_a_cuda_graph(device: str) -> None:
 
 @pytest.mark.parametrize("device", ["cuda"])
 @pytest.mark.parametrize("rows", [1, 5, 64])
+# One block reads rows as they stand; four are the column blocks of a TP4 gather.
+@pytest.mark.parametrize("blocks", [1, 4])
 def test_cluster_boundary_gathers_an_armed_mailbox_and_re_arms_it(
-    device: str, rows: int
+    device: str, rows: int, blocks: int
 ) -> None:
     """A mailbox branch gives the plain kernel's bits; the rows read are re-armed."""
     args = boundary_case("ffn_linked", rows, device)
     stream, branch = args[:2]
-    plain = boundary_cute_dsl.cute_dsl_post_norm_residual_pre_norm(
-        *args, True, None, 1, None
-    )
-    mailbox = armed_mailbox(branch, MAX_ROWS)
-    assert _supported(args, mailbox, HALF_POLLED_SENTINEL, 1)
+    plain = boundary_cute_dsl.cute_dsl_post_norm_residual_pre_norm(*args, True, None, 1)
+    mailbox = armed_blocks(branch, MAX_ROWS, blocks)
+    assert _supported(args, mailbox[:, :rows], HALF_POLLED_SENTINEL, 1)
     got = post_norm_residual_pre_norm(
-        stream, mailbox, *args[2:], True, HALF_POLLED_SENTINEL, 1, None
+        stream, mailbox[:, :rows], *args[2:], True, HALF_POLLED_SENTINEL, 1
     )
     for ours, theirs in zip(got, plain, strict=True):
         assert torch.equal(ours, theirs)
     assert (mailbox.view(torch.int32) == -1).all()
-    # A short mailbox declines; past the ceiling is refused, never handed to Triton.
-    assert not _supported(args, mailbox[:0], HALF_POLLED_SENTINEL, 1)
+    # A view of other rows, or rows not split into blocks, declines.
+    assert not _supported(args, mailbox[:, : rows - 1], HALF_POLLED_SENTINEL, 1)
+    assert not _supported(
+        args, armed_mailbox(branch, MAX_ROWS), HALF_POLLED_SENTINEL, 1
+    )
+    # Past the ceiling is refused, never handed to Triton.
     wide = torch.cat([stream] * 65)[: MAX_ROWS + 1]
-    wide_mailbox = armed_mailbox(torch.cat([branch] * 65)[: MAX_ROWS + 1], MAX_ROWS + 1)
+    wide_mailbox = armed_blocks(
+        torch.cat([branch] * 65)[: MAX_ROWS + 1], MAX_ROWS + 1, blocks
+    )
     with pytest.raises(ValueError, match="cluster boundary"):
         post_norm_residual_pre_norm(
-            wide, wide_mailbox, *args[2:], True, HALF_POLLED_SENTINEL, 1, None
+            wide, wide_mailbox, *args[2:], True, HALF_POLLED_SENTINEL, 1
         )
     # The producer asks before publishing; 4096 channels leave no whole word per thread.
     assert boundary_gathers_mailbox(MAX_ROWS, WIDTH, 1)
@@ -364,69 +366,25 @@ def test_cluster_boundary_reduces_one_partial_per_rank_like_the_oneshot_allreduc
     for partial in sanitized[1:]:
         summed = summed + partial
     plain = boundary_cute_dsl.cute_dsl_post_norm_residual_pre_norm(
-        stream, summed, *args[2:], True, None, 1, None
+        stream, summed, *args[2:], True, None, 1
     )
-    mailbox = armed_mailbox(torch.cat(partials, dim=1), MAX_ROWS)
-    assert _supported(args, mailbox, HALF_POLLED_SENTINEL, ranks)
+    mailbox = armed_blocks(torch.cat(partials, dim=1), MAX_ROWS, ranks)
+    assert _supported(args, mailbox[:, :rows], HALF_POLLED_SENTINEL, ranks)
     got = post_norm_residual_pre_norm(
-        stream, mailbox, *args[2:], True, HALF_POLLED_SENTINEL, ranks, None
+        stream, mailbox[:, :rows], *args[2:], True, HALF_POLLED_SENTINEL, ranks
     )
     for ours, theirs in zip(got, plain, strict=True):
         assert torch.equal(ours, theirs)
     assert (mailbox.view(torch.int32) == -1).all()
     # A mailbox holding one partial per row cannot be read as four.
-    narrow = armed_mailbox(partials[0], MAX_ROWS)
+    narrow = armed_blocks(partials[0], MAX_ROWS, 1)[:, :rows]
     assert not _supported(args, narrow, HALF_POLLED_SENTINEL, ranks)
     with pytest.raises(ValueError, match="cluster boundary"):
         post_norm_residual_pre_norm(
-            stream, narrow, *args[2:], True, HALF_POLLED_SENTINEL, ranks, None
+            stream, narrow, *args[2:], True, HALF_POLLED_SENTINEL, ranks
         )
     assert boundary_gathers_mailbox(MAX_ROWS, WIDTH, ranks)
     assert not boundary_gathers_mailbox(1, WIDTH, 0)
-
-
-@pytest.mark.parametrize("device", ["cuda"])
-@pytest.mark.parametrize("rows", [1, 5, MAX_ROWS])
-@pytest.mark.parametrize("ranks", [1, 4])
-def test_cluster_boundary_publishes_this_ranks_block_before_polling(
-    device: str, rows: int, ranks: int
-) -> None:
-    """The kernel stores this rank's block itself: the bits of a mailbox the producer filled."""
-    rank = 1
-    args = boundary_case("attention" if ranks > 1 else "ffn_linked", rows, device)
-    stream = args[0]
-    torch.manual_seed(31)
-    # One partial per rank side by side, or one row of column blocks for a gather.
-    row = (torch.randn(rows, WIDTH * ranks, device=device) * 0.5).to(torch.bfloat16)
-    width = WIDTH if ranks > 1 else WIDTH // 4
-    columns = slice(rank * width, (rank + 1) * width)
-    filled = armed_mailbox(row, MAX_ROWS)
-    expected = post_norm_residual_pre_norm(
-        stream, filled, *args[2:], True, HALF_POLLED_SENTINEL, ranks, None
-    )
-    mailbox = armed_mailbox(row, MAX_ROWS)
-    mailbox[:rows, columns].view(torch.int32).fill_(-1)
-    publish = MailboxPublish(
-        row[:, columns].contiguous(), mailbox[:rows, columns], columns.start
-    )
-    got = post_norm_residual_pre_norm(
-        stream, mailbox, *args[2:], True, HALF_POLLED_SENTINEL, ranks, publish
-    )
-    for ours, theirs in zip(got, expected, strict=True):
-        assert torch.equal(ours, theirs)
-    assert (mailbox.view(torch.int32) == -1).all()
-    # A block that splits a thread's word, or a branch that is not a mailbox, is refused.
-    split = MailboxPublish(
-        row[:, 1 : width + 1].clone(), mailbox[:rows, 1 : width + 1], 1
-    )
-    with pytest.raises(ValueError, match="whole thread column slices"):
-        post_norm_residual_pre_norm(
-            stream, mailbox, *args[2:], True, HALF_POLLED_SENTINEL, ranks, split
-        )
-    with pytest.raises(ValueError, match="only a mailbox branch"):
-        boundary_cute_dsl.cute_dsl_post_norm_residual_pre_norm(
-            stream, row[:, :WIDTH].contiguous(), *args[2:], True, None, 1, publish
-        )
 
 
 _BOUNDARY_WAITER = """
@@ -437,10 +395,10 @@ stream = torch.ones(1, width, device=device)
 row = torch.full((1, width), 0.5, dtype=torch.bfloat16, device=device)
 alpha, beta = residual_gate_coefficients(torch.ones(width, device=device), 0.3, 1e-3)
 weight = torch.ones(width, dtype=torch.bfloat16, device=device)
-mailbox = torch.empty(2, width, dtype=torch.bfloat16, device=device)
-tail = (weight, 1e-8, 1.0, alpha, beta, weight, 1e-5, 1.0, True, HALF_POLLED_SENTINEL, 1, None)
+mailbox = torch.empty(1, 2, width, dtype=torch.bfloat16, device=device)
+tail = (weight, 1e-8, 1.0, alpha, beta, weight, 1e-5, 1.0, True, HALF_POLLED_SENTINEL, 1)
 def consume():
-    gated_boundary.cute_dsl_post_norm_residual_pre_norm(stream, mailbox, *tail)
+    gated_boundary.cute_dsl_post_norm_residual_pre_norm(stream, mailbox[:, :1], *tail)
 """
 
 

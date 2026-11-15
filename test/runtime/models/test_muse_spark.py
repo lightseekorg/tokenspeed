@@ -578,10 +578,10 @@ def test_muse_spark_moe_matches_torch_reference(bf16_default_dtype) -> None:
     module_.gate.process_weights_after_loading(module_.gate)
     hidden = torch.randn(5, 256, dtype=torch.bfloat16, device="cuda")
     router_input = hidden.float()
-    output, sentinel, publish = module_(
+    output, sentinel = module_(
         hidden, router_input, hidden.shape[0], hidden.shape[0], None, project=True
     )
-    assert sentinel is None and publish is None
+    assert sentinel is None
 
     logits = router_input @ module_.gate.weight
     logits *= module_.gate.multiplier
@@ -1904,10 +1904,10 @@ def test_replicated_pool_preserves_column_projection_after_reload(
 @pytest.mark.skipif(
     not current_platform().is_nvidia, reason="requires a NVIDIA CUDA pointer view"
 )
-def test_gathered_projection_hands_wider_batches_to_the_mailbox_publish(
+def test_gathered_projection_stores_its_block_into_a_rank_major_mailbox(
     monkeypatch: pytest.MonkeyPatch, bf16_default_dtype
 ) -> None:
-    """Wider rows reach the mailbox through its word publish, bit for bit; a GEMV row lands in place."""
+    """The block GEMM writes this rank's rows straight into its block, bit for bit with the projection."""
     from tokenspeed_kernel.ops.moe._cute_dsl import latent_down
 
     bound = {}
@@ -1917,7 +1917,7 @@ def test_gathered_projection_hands_wider_batches_to_the_mailbox_publish(
     monkeypatch.setattr(
         module.KimiK3LatentDownOp, "initialize", lambda **kwargs: bound.update(kwargs)
     )
-    hidden, latent, ranks, rank = 256, 128, 4, 1
+    hidden, latent, ranks, rank, max_m = 256, 128, 4, 1, 4
     with torch.device("cuda"):
         linear = module._MuseGatheredLinear(
             input_size=hidden,
@@ -1931,123 +1931,33 @@ def test_gathered_projection_hands_wider_batches_to_the_mailbox_publish(
             replicate_for_owned_rows=True,
             workspace_rows=module._GATHER_MXFP4_MAX_ROWS,
         )
+    assert bound["rank_major"] is True
     with torch.no_grad():
         linear.weight.normal_(std=hidden**-0.5)
     weight = linear._local_weight()
     shard = weight.shape[0]
-    mailbox = torch.zeros(4, latent, dtype=torch.bfloat16, device="cuda")
-    latent_down.arm_mailbox(mailbox, latent_down.HALF_POLLED_SENTINEL)
+    mailbox = torch.zeros(max_m, latent, dtype=torch.bfloat16, device="cuda")
     producer = latent_down._MulticastVaGemm(
         multicast_ptr=mailbox.data_ptr(),
         rank=rank,
         shard_dim=shard,
         latent_size=latent,
-        max_m=4,
+        max_m=max_m,
         device=mailbox.device,
         publish_gemm=bound["publish_gemm"],
+        rank_major=True,
     )
-    published_rows, expected_rows = [], []
-    publish = latent_down.multicast_publish
-
-    def record_publish(block, destination):
-        published_rows.append(block.shape[0])
-        publish(block, destination)
-
-    monkeypatch.setattr(latent_down, "multicast_publish", record_publish)
-    for tokens in (1, 3):
-        x = torch.randn(tokens, hidden, device="cuda")
-        if tokens > 1 or not module._use_mv(x, weight):
-            expected_rows.append(tokens)
-        producer(x, weight, mailbox, mailbox.data_ptr())
-        torch.cuda.synchronize()
-        assert torch.equal(
-            mailbox[:tokens, rank * shard : (rank + 1) * shard].view(torch.int16),
-            linear._project(x, weight, None).view(torch.int16),
-        )
-    assert published_rows == expected_rows
-
-
-@requires_gpu
-@pytest.mark.skipif(
-    not current_platform().is_nvidia, reason="requires a NVIDIA CUDA pointer view"
-)
-def test_gathered_projection_leaves_a_wider_block_for_the_consumer_to_publish(
-    monkeypatch: pytest.MonkeyPatch, bf16_default_dtype
-) -> None:
-    """A library GEMM's block comes back for the consumer to store; a GEMV row still lands in place."""
-    from tokenspeed_kernel.ops.moe._cute_dsl import latent_down
-
-    bound = {}
-    monkeypatch.setattr(
-        module.process_group_manager, "get_device_process_group", lambda group: group
-    )
-    monkeypatch.setattr(
-        module.KimiK3LatentDownOp, "initialize", lambda **kwargs: bound.update(kwargs)
-    )
-    hidden, latent, ranks, rank = 256, 128, 4, 1
-    with torch.device("cuda"):
-        linear = module._MuseGatheredLinear(
-            input_size=hidden,
-            output_size=latent,
-            prefix="model.layers.0.mlp.pre_expert_proj",
-            tp_rank=rank,
-            tp_size=ranks,
-            tp_group=tuple(range(ranks)),
-            layer_id=0,
-            layer_count=2,
-            replicate_for_owned_rows=True,
-            workspace_rows=module._GATHER_MXFP4_MAX_ROWS,
-        )
-    with torch.no_grad():
-        linear.weight.normal_(std=hidden**-0.5)
-    weight = linear._local_weight()
-    shard = weight.shape[0]
-    mailbox = torch.zeros(4, latent, dtype=torch.bfloat16, device="cuda")
-    producer = latent_down._MulticastVaGemm(
-        multicast_ptr=mailbox.data_ptr(),
-        rank=rank,
-        shard_dim=shard,
-        latent_size=latent,
-        max_m=4,
-        device=mailbox.device,
-        publish_gemm=bound["publish_gemm"],
-    )
-    columns = slice(rank * shard, (rank + 1) * shard)
+    blocks = mailbox.view(ranks, max_m, shard)
     for tokens in (1, 3):
         latent_down.arm_mailbox(mailbox, latent_down.HALF_POLLED_SENTINEL)
         x = torch.randn(tokens, hidden, device="cuda")
-        pending = producer.project(x, weight)
+        producer(x, weight, mailbox, mailbox.data_ptr())
         torch.cuda.synchronize()
         expected = linear._project(x, weight, None).view(torch.int16)
-        if tokens == 1 and module._use_mv(x, weight):
-            assert pending is None
-            assert torch.equal(mailbox[:tokens, columns].view(torch.int16), expected)
-            continue
-        assert pending is not None and pending.column == rank * shard
-        assert torch.equal(pending.block.view(torch.int16), expected)
-        assert pending.destination.data_ptr() == mailbox[0, columns].data_ptr()
-        assert pending.destination.stride() == (latent, 1)
-        # Nothing reached the mailbox: the consumer stores the block.
+        assert torch.equal(blocks[rank, :tokens].view(torch.int16), expected)
+        # Other ranks' blocks and the rows past the batch keep the sentinel.
+        blocks[rank, :tokens].view(torch.int16).fill_(-1)
         assert (mailbox.view(torch.int32) == -1).all()
-
-
-def test_publish_leaves_only_small_batches_to_the_consumer() -> None:
-    """Up to the row cap the consumer stores the block; wider batches keep the copy."""
-    calls: list[tuple[str, int]] = []
-
-    class _Op:
-        def publish_by_consumer(self, x, weight):
-            calls.append(("consumer", x.shape[0]))
-            return x, "pending"
-
-        def publish(self, x, weight):
-            calls.append(("copy", x.shape[0]))
-            return x
-
-    cap = module._CONSUMER_PUBLISH_MAX_ROWS
-    assert module._publish(_Op(), torch.zeros(cap, 4), None)[1] == "pending"
-    assert module._publish(_Op(), torch.zeros(cap + 1, 4), None)[1] is None
-    assert calls == [("consumer", cap), ("copy", cap + 1)]
 
 
 class _FakeMailbox:
@@ -2059,9 +1969,9 @@ class _FakeMailbox:
     def handles(self, tokens: int) -> bool:
         return tokens <= 2
 
-    def publish_by_consumer(self, x, weight):
+    def publish(self, x, weight):
         self.calls.append(("publish", x.shape[0], weight.shape[0]))
-        return x.new_full((x.shape[0], 512), float("nan")), None
+        return x.new_full((x.shape[0], 512), float("nan"))
 
     def __call__(self, x, weight, *, output_scale):
         # The real op's signature: Muse gathers BF16, never fused NVFP4.
@@ -2091,11 +2001,11 @@ def test_attention_publishes_a_served_batch_for_the_boundary_to_reduce(
     )
     width = attn.o_proj.weight.shape[1]
     one = torch.randn(1, width, dtype=torch.bfloat16, device="cuda")
-    rows, sentinel, ranks, publish = attn._project(one)
-    assert (sentinel, ranks, publish) == (0xFFFFFFFF, 4, None) and rows.isnan().all()
+    rows, sentinel, ranks = attn._project(one)
+    assert (sentinel, ranks) == (0xFFFFFFFF, 4) and rows.isnan().all()
     three = torch.randn(3, width, dtype=torch.bfloat16, device="cuda")
-    rows, sentinel, ranks, publish = attn._project(three)
-    assert (sentinel, ranks, publish) == (None, 1, None)
+    rows, sentinel, ranks = attn._project(three)
+    assert (sentinel, ranks) == (None, 1)
     assert rows.shape == (3, attn.hidden_size) and not rows.isnan().any()
     assert calls == [("publish", 1, attn.o_proj.weight.shape[0])]
 
