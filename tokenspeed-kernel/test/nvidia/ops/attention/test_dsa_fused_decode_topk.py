@@ -54,6 +54,10 @@ from tokenspeed_kernel.ops.attention.dsa import cute_dsl as dsa_cute_dsl  # noqa
 from tokenspeed_kernel.ops.attention.dsa._triton import (  # noqa: E402
     topk as dsa_triton_topk,
 )
+from tokenspeed_kernel.ops.kvcache.index_k_scale import (  # noqa: E402
+    decode_index_k_scale,
+    index_k_scale_dtype,
+)
 
 if dsa_cute_dsl._fused_indexer is None:
     pytest.skip("the fused CuTe DSL decode top-k is not built", allow_module_level=True)
@@ -116,7 +120,8 @@ def _reference_logits(q_fp8, folded, seq_lens, table, cache, q_len):
     dequantized keys of its request's pages, NaN and +inf scrubbed to -inf in
     the causal window as the scoring leaves do.
     """
-    keys, scales = _planes(cache)
+    keys, words = _planes(cache)
+    scales = decode_index_k_scale(words.contiguous())
     k = (keys.view(torch.float8_e4m3fn).double() * scales.double()[..., None]).view(
         -1, DIM
     )
@@ -357,7 +362,7 @@ def _planes(cache):
     """
     pages = cache.view(-1, PAGE * (DIM + 4))
     keys = pages[:, : PAGE * DIM].view(-1, PAGE, DIM)
-    scales = pages[:, PAGE * DIM :].view(torch.float32)
+    scales = pages[:, PAGE * DIM :].view(index_k_scale_dtype())
     return keys, scales
 
 

@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import ClassVar
 
 import torch
+from tokenspeed_kernel.ops.kvcache.index_k_scale import index_k_scale_dtype
 from typing_extensions import override
 
 from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
@@ -155,7 +156,7 @@ class HybridGlm53FlashTokenToKVPool(HybridKDATokenToKVPool):
             (buf.shape[0], rows_per_page, num_groups * scale_bytes),
             (page_stride, num_groups * scale_bytes, 1),
             buf.storage_offset() + rows_per_page * self.index_head_dim,
-        ).view(torch.float32)
+        ).view(index_k_scale_dtype())
         return values, scales
 
     def get_mla_kv_buffer(

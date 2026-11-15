@@ -1037,8 +1037,8 @@ def _assert_same_candidates(actual, expected, topk):
 
 
 @pytest.mark.skipif(
-    not (torch.cuda.is_available() and platform.is_nvidia and platform.is_hopper),
-    reason="the DeepGEMM index-candidate scorer requires NVIDIA Hopper",
+    not (torch.cuda.is_available() and platform.is_nvidia and platform.is_hopper_plus),
+    reason="the DeepGEMM index-candidate scorer requires NVIDIA Hopper or newer",
 )
 def test_owned_width_candidates_match_full_width():
     """Pages planned at the widest row's owned count select what full-width

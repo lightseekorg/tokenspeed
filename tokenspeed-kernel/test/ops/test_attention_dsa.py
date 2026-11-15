@@ -43,6 +43,11 @@ from tokenspeed_kernel.ops.attention.dsa.triton import (
 from tokenspeed_kernel.ops.attention.dsv4._triton.dcp import (
     dispatch_dcp_attention_partials,
 )
+from tokenspeed_kernel.ops.kvcache.index_k_scale import (
+    encode_index_k_scale,
+    index_k_scale_dtype,
+    round_index_k_scale,
+)
 from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.selection import NoKernelFoundError
@@ -65,7 +70,10 @@ def _pack_index_k_cache(
         dtype=torch.uint8,
     )
     x = index_k.float().reshape(num_slots, num_groups, 128)
-    scale = x.abs().amax(dim=-1, keepdim=True).clamp_min(1.0e-6) / 448.0
+    # The scale as the plane stores it (rounded up to a power of two on Blackwell).
+    scale = round_index_k_scale(
+        x.abs().amax(dim=-1, keepdim=True).clamp_min(1.0e-6) / 448.0
+    )
     x_fp8 = (x / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
 
     flat = packed.reshape(-1)
@@ -76,13 +84,15 @@ def _pack_index_k_cache(
         (page_bytes, head_dim, 1),
     )
     scale_view = torch.as_strided(
-        flat.view(torch.float32),
+        flat.view(index_k_scale_dtype()),
         (num_pages, page_size, num_groups),
         (page_bytes // 4, num_groups, 1),
         (page_size * head_dim) // 4,
     )
     fp8_view.copy_(x_fp8.reshape(num_pages, page_size, head_dim))
-    scale_view.copy_(scale.reshape(num_pages, page_size, num_groups))
+    scale_view.copy_(
+        encode_index_k_scale(scale).reshape(num_pages, page_size, num_groups)
+    )
     return packed, (x_fp8.float() * scale).reshape_as(index_k)
 
 
@@ -885,8 +895,8 @@ def test_deep_gemm_sharded_index_candidates_global_windows(device, degree):
     from tokenspeed_kernel.ops.attention.dsa import dsa_index_candidates
     from tokenspeed_kernel.platform import current_platform
 
-    if not current_platform().is_hopper:
-        pytest.skip("DeepGEMM DSA scoring requires Hopper")
+    if not current_platform().is_hopper_plus:
+        pytest.skip("DeepGEMM requires Hopper or newer")
 
     torch.manual_seed(821)
     page_size, heads, dim, topk = 64, 16, 128, 512
@@ -993,8 +1003,8 @@ def test_deep_gemm_index_candidates_graph_and_empty_rows(device, heads):
     )
     from tokenspeed_kernel.platform import current_platform
 
-    if not current_platform().is_hopper:
-        pytest.skip("DeepGEMM DSA scoring requires Hopper")
+    if not current_platform().is_hopper_plus:
+        pytest.skip("DeepGEMM requires Hopper or newer")
     table = torch.tensor(
         [[3, -1, 1, 2], [-1, -1, -1, -1]], dtype=torch.int32, device=device
     )
@@ -1063,8 +1073,8 @@ def test_deep_gemm_index_candidates_empty_shard_large_batch(device, tokens):
     from tokenspeed_kernel.ops.attention.dsa import dsa_index_candidates
     from tokenspeed_kernel.platform import current_platform
 
-    if not current_platform().is_hopper:
-        pytest.skip("DeepGEMM DSA scoring requires Hopper")
+    if not current_platform().is_hopper_plus:
+        pytest.skip("DeepGEMM requires Hopper or newer")
     q = torch.zeros(tokens, 16, 128, device=device, dtype=torch.bfloat16)
     weights = torch.ones(tokens, 16, device=device)
     cache = torch.zeros(64, 132, device=device, dtype=torch.uint8)
@@ -1106,8 +1116,8 @@ def test_deep_gemm_index_candidates_precomputed_pages(device):
     )
     from tokenspeed_kernel.platform import current_platform
 
-    if not torch.cuda.is_available() or not current_platform().is_hopper:
-        pytest.skip("DeepGEMM DSA scoring requires Hopper")
+    if not torch.cuda.is_available() or not current_platform().is_hopper_plus:
+        pytest.skip("DeepGEMM requires Hopper or newer")
     torch.manual_seed(829)
     heads, page_size = 32, 64
     # Scrambled page order, absent pages, partial tails, unknown request, empty row.

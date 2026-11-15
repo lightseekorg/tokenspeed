@@ -26,6 +26,7 @@ import torch
 from tokenspeed_kernel.ops.attention.kpool._triton.expand import (
     expand_kpool_to_flat_kv,
 )
+from tokenspeed_kernel.ops.kvcache.index_k_scale import index_k_scale_dtype
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -51,12 +52,10 @@ def _kpool_cache_views(
         (page_stride, groups * 4, 1),
         cache.storage_offset() + page_size * head_dim,
     )
-    return values.view(torch.float8_e4m3fn), scales.view(torch.float32)
+    return values.view(torch.float8_e4m3fn), scales.view(index_k_scale_dtype())
 
 
-# The DeepGEMM prefill scorer takes ``fp8_scaled`` rows on sm90 only
-# (``ops/attention/dsa/deep_gemm.py``); Blackwell selects the Triton leaf.
-if current_platform().is_hopper:
+if current_platform().is_hopper_plus:
 
     @register_kernel(
         "attention",
@@ -65,7 +64,6 @@ if current_platform().is_hopper:
         solution="deep_gemm",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
-            max_arch_version=ArchVersion(9, 0),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=frozenset({format_signature(q=dense_tensor_format(torch.bfloat16))}),

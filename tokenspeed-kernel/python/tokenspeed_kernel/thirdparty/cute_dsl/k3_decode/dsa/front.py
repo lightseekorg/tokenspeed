@@ -58,6 +58,7 @@ from tokenspeed_kernel.thirdparty.cute_dsl.k3_decode.common.primitives import (
     asm,
     at,
     bf16x2,
+    bits_float,
     float_bits,
     fma,
     launch,
@@ -85,7 +86,9 @@ HEADS, DIM = 32, 128  # index heads, index head dim
 INDEX_ROWS = HEADS * DIM
 LATENT = 512  # kv_lora_rank
 PAGE = 64  # index-K slots per page
-ROW_BYTES = DIM + 4  # a slot's FP8 key bytes, then (in the page tail) its FP32 scale
+ROW_BYTES = (
+    DIM + 4
+)  # a slot's FP8 key bytes, then (in the page tail) its UE8M0 scale word
 MAIN_WARPS = 8
 MAIN_THREADS = 32 * MAIN_WARPS
 THREADS = MAIN_THREADS + 32
@@ -144,6 +147,17 @@ def key_scale(amax):
     """max(amax, 1e-10) * fp32(1 / 448)."""
     code = "{ .reg .f32 m; max.f32 m,$1,0f2EDBE6FF; mul.f32 $0,m,0f3B124925; }"
     return code, "=f,f", (amax,)
+
+
+@asm(Int32, pure=True)
+def ue8m0_exponent(scale):
+    """Biased exponent of the power of two at or above positive ``scale``."""
+    code = (
+        "{ .reg .b32 b, e, m; .reg .pred p; mov.b32 b,$1; shr.u32 e,b,23; "
+        "and.b32 e,e,255; and.b32 m,b,0x7fffff; setp.ne.u32 p,m,0; "
+        "selp.u32 m,1,0,p; add.u32 $0,e,m; }"
+    )
+    return code, "=r,f", (scale,)
 
 
 @asm(Float32, pure=True)
@@ -595,7 +609,8 @@ class DecodeFront:
     def insert_key(self, key, slots, cache, k_w, k_b, key_eps, token, lane):
         """index_k_layernorm_fp8_scatter of row ``token`` (one warp, lane ``lane``
         holding columns [4 lane, 4 lane + 4)): the FP32 LayerNorm rounded to BF16,
-        then FP8 E4M3 with the scale max(amax, 1e-10) / 448."""
+        then FP8 E4M3 with the scale max(amax, 1e-10) / 448 rounded up to a
+        power of two."""
         x = []
         for word in load_words(at(key, token, 4 * lane), count=2, mutable=True):
             x += list(unpack_bf16(word))
@@ -612,14 +627,17 @@ class DecodeFront:
         amax = max3_f32(
             max_f32(abs_f32(y[0]), abs_f32(y[1])), abs_f32(y[2]), abs_f32(y[3])
         )
-        scale = key_scale(redux_max(amax))
+        # Blackwell planes store the scale rounded up to a power of two as four
+        # UE8M0 bytes (kvcache/index_k_scale.py); the keys quantize with it.
+        exponent = ue8m0_exponent(key_scale(redux_max(amax)))
+        scale = bits_float(exponent << 23)
         codes = pack_fp8(tuple(clamp_fp8(div_full(v, scale), Float32(448)) for v in y))
         slot = load_slot(at(slots, token), wide=self.wide_slots)
         page, offset = slot >> 6, slot & (PAGE - 1)
         base = cache.iterator + page * (PAGE * ROW_BYTES)
         store_words(base + offset * DIM + 4 * lane, (codes,))
         if lane == 0:
-            store_words(base + PAGE * DIM + offset * 4, (float_bits(scale),))
+            store_words(base + PAGE * DIM + offset * 4, (exponent * 0x01010101,))
 
     @cute.jit
     def kv_norm(self, kv_a, kv_lo, kv_hi, d_kv, eps, token, lane):

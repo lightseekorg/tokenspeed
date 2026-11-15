@@ -33,6 +33,7 @@ from tokenspeed_kernel.ops.attention.dsa.triton import (
     quantize_index_query_weights,
     scrub_nonfinite_logits,
 )
+from tokenspeed_kernel.ops.kvcache.index_k_scale import UNIT_UE8M0_X4
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -357,10 +358,56 @@ def _resolve_prefill_tile_max_seqlen_k(
     return int(candidate_lens[start:end].max().item())
 
 
-# DeepGEMM 2.8.2 scores FP8 index rows with FP32 scales (``fp8_scaled``)
-# on sm90 only; its sm100 MQA logits take block-scaled MX rows, which no
-# in-tree plane holds. Blackwell selects the Triton and CuTe DSL leaves.
-_HAS_DEEP_GEMM = platform.is_hopper and has_optional_package("deep_gemm")
+# DeepGEMM 2.8.2's sm100 MQA logits score block-scaled MX rows with BF16
+# head weights and return BF16 logits; sm90 scores FP8 rows with FP32 scales,
+# weights and logits. Blackwell ``fp8_scaled`` planes store each key's
+# power-of-two scale as four equal UE8M0 bytes (``kvcache/index_k_scale.py``),
+# which the sm100 kernels read as the MX scales of the row's four groups. The
+# FP8 queries keep their per-(token, head) scale folded into the weights and
+# pass unit MX scales, which is exact since relu commutes with a positive scale.
+_MX_SCORING = platform.is_blackwell
+_HAS_DEEP_GEMM = platform.is_hopper_plus and has_optional_package("deep_gemm")
+
+# Unit query scales, grown on demand; earlier buffers stay alive for graphs
+# captured over them.
+_unit_query_scales: dict[torch.device, list[torch.Tensor]] = {}
+
+
+def _query_scales(q_fp8: torch.Tensor) -> torch.Tensor | None:
+    """Unit MX scale words ``[*q_fp8.shape[:-1]]`` for sm100, None for sm90."""
+    if not _MX_SCORING:
+        return None
+    numel = q_fp8.numel() // q_fp8.shape[-1]
+    buffers = _unit_query_scales.setdefault(q_fp8.device, [])
+    if not buffers or buffers[-1].numel() < numel:
+        size = max(numel, 2 * buffers[-1].numel() if buffers else 0)
+        buffers.append(
+            torch.full((size,), UNIT_UE8M0_X4, dtype=torch.int32, device=q_fp8.device)
+        )
+    return buffers[-1][:numel].view(q_fp8.shape[:-1])
+
+
+def _mqa_weights(weights: torch.Tensor) -> torch.Tensor:
+    """The folded head weights as the platform's MQA logits take them."""
+    return weights.to(torch.bfloat16) if _MX_SCORING else weights
+
+
+def _request_rows(rows: int, device: torch.device) -> torch.Tensor | None:
+    """The request of every query row for the sm100 paged scheduler.
+
+    sm100 schedules one query row per request entry and takes each row's
+    request through ``indices``; the flattened rows scored here are each
+    their own request. sm90 takes no ``indices``.
+    """
+    if not _MX_SCORING:
+        return None
+    return torch.arange(rows, device=device, dtype=torch.int32)
+
+
+def _fp32_logits(logits: torch.Tensor) -> torch.Tensor:
+    """The logits as the FP32-only selectors read them; a copy of BF16 ones."""
+    return logits if logits.dtype == torch.float32 else logits.float()
+
 
 if _HAS_DEEP_GEMM:
     prepare_cuda_toolkit_env()
@@ -385,6 +432,7 @@ if _HAS_DEEP_GEMM:
             seq_lens_2d,
             page_size,
             deep_gemm.get_num_sms(),
+            indices=_request_rows(seq_lens_2d.shape[0], seq_lens_2d.device),
         )
         if out is None:
             with torch.inference_mode(False):
@@ -418,7 +466,6 @@ if _HAS_DEEP_GEMM:
         solution="deep_gemm",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
-            max_arch_version=ArchVersion(9, 0),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=frozenset({format_signature()}),
@@ -448,7 +495,6 @@ if _HAS_DEEP_GEMM:
         features=_TOPK_FEATURES,
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
-            max_arch_version=ArchVersion(9, 0),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=frozenset(
@@ -547,14 +593,16 @@ if _HAS_DEEP_GEMM:
         )
         if deep_gemm.get_pdl() != pdl_enabled():
             deep_gemm.set_pdl(pdl_enabled())
+        q_fp8 = q_fp8.view(tokens, 1, q.shape[1], q.shape[-1])
         logits = deep_gemm.fp8_fp4_paged_mqa_logits(
-            (q_fp8.view(tokens, 1, q.shape[1], q.shape[-1]), None),
+            (q_fp8, _query_scales(q_fp8)),
             kv_cache,
-            scaled_weights,
+            _mqa_weights(scaled_weights),
             seq_lens_2d,
             logits_block_table,
             plan,
             max_seq_len,
+            indices=_request_rows(tokens, q.device),
         )
         # Scrubbed compact view; the length-aware CuTe DSL top-k reads it in place.
         logits_full = _prepare_logits_for_topk(logits, seq_lens, next_n=q_len_per_req)
@@ -587,7 +635,7 @@ if _HAS_DEEP_GEMM:
             )
         elif use_ragged:
             ragged_decode_topk(
-                logits,
+                _fp32_logits(logits),
                 local_topk_offsets,
                 topk,
                 lengths=seq_lens,
@@ -598,7 +646,9 @@ if _HAS_DEEP_GEMM:
         else:
             # Batch-invariant selection, or no ragged CUDA top-k: mask each row
             # to its causal window first.
-            _row_invariant_topk(logits, row_lengths, local_topk_offsets, topk)
+            _row_invariant_topk(
+                _fp32_logits(logits), row_lengths, local_topk_offsets, topk
+            )
 
         return local_topk_to_global_slots(
             local_topk_offsets=local_topk_offsets,
@@ -618,7 +668,6 @@ if _HAS_DEEP_GEMM:
         features=_PREFILL_TOPK_FEATURES,
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
-            max_arch_version=ArchVersion(9, 0),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=frozenset(
@@ -696,7 +745,7 @@ if _HAS_DEEP_GEMM:
                 (int(page_size) * row_bytes, hd, 1),
             )
             scale_view = torch.as_strided(
-                flat.view(torch.float32),
+                flat.view(torch.int32 if _MX_SCORING else torch.float32),
                 (
                     index_k_cache.shape[0] // int(page_size),
                     int(page_size),
@@ -726,7 +775,11 @@ if _HAS_DEEP_GEMM:
         if max_logits_bytes is None:
             max_query_rows = tokens
         else:
-            max_query_rows = max(1, int(max_logits_bytes) // (seq_len_sum * 4))
+            # FP32 logits, plus the BF16 logits they are copied from on sm100.
+            logits_bytes = 6 if _MX_SCORING else 4
+            max_query_rows = max(
+                1, int(max_logits_bytes) // (seq_len_sum * logits_bytes)
+            )
         local_starts_i32 = torch.zeros_like(row_starts)
         for start in range(0, tokens, max_query_rows):
             end = min(start + max_query_rows, tokens)
@@ -739,14 +792,17 @@ if _HAS_DEEP_GEMM:
             )
             if deep_gemm.get_pdl() != pdl_enabled():
                 deep_gemm.set_pdl(pdl_enabled())
+            tile_q = q_fp8[start:end].contiguous()
             logits = deep_gemm.fp8_fp4_mqa_logits(
-                (q_fp8[start:end].contiguous(), None),
+                (tile_q, _query_scales(tile_q)),
                 kv_fp8,
-                scaled_weights[start:end].contiguous(),
+                _mqa_weights(scaled_weights[start:end].contiguous()),
                 row_starts[start:end],
                 row_ends[start:end],
                 max_seqlen_k=max(tile_max_seqlen_k, 1),
             )
+            # The TRT-LLM and lowest-index top-k read FP32.
+            logits = _fp32_logits(logits)
             logits.nan_to_num_(
                 nan=float("-inf"), posinf=float("-inf"), neginf=float("-inf")
             )
@@ -785,7 +841,6 @@ if _HAS_DEEP_GEMM:
         priority=Priority.PERFORMANT,
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
-            max_arch_version=ArchVersion(9, 0),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=frozenset(
@@ -838,20 +893,24 @@ if _HAS_DEEP_GEMM:
         # owns no rows. Read the reserved null page for empty rows, then mask
         # every dummy score using the original (zero) lengths below.
         scoring_lengths = lengths.clamp_min(1)
+        rows = _request_rows(q.shape[0], q.device)
         plan = deep_gemm.get_paged_mqa_logits_metadata(
-            scoring_lengths, page_size, deep_gemm.get_num_sms()
+            scoring_lengths, page_size, deep_gemm.get_num_sms(), indices=rows
         )
+        q_fp8 = q_fp8.view(q.shape[0], 1, q.shape[1], q.shape[2])
         logits = deep_gemm.fp8_fp4_paged_mqa_logits(
-            (q_fp8.view(q.shape[0], 1, q.shape[1], q.shape[2]), None),
+            (q_fp8, _query_scales(q_fp8)),
             index_k_cache.view(-1, page_size, 1, index_k_cache.shape[-1]),
-            weights,
+            _mqa_weights(weights),
             scoring_lengths,
             pages,
             plan,
             pages.shape[1] * page_size,
+            indices=rows,
         )
+        # Candidate scores are FP32 for the caller and the selectors alike.
         return _select_dcp_index_candidates(
-            logits,
+            _fp32_logits(logits),
             positions,
             lengths,
             causal_lens,

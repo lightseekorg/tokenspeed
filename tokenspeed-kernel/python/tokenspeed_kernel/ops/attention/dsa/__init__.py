@@ -29,6 +29,7 @@ from tokenspeed_kernel.ops.attention.dsa._triton.index_candidates import (
     compact_index_pages,
 )
 from tokenspeed_kernel.ops.attention.dsv41.triton import pack_index_queries
+from tokenspeed_kernel.ops.kvcache.index_k_scale import index_k_scale_dtype
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
@@ -252,8 +253,9 @@ def _index_k_plane_traits(
 ) -> dict:
     """``index_k_format`` / ``index_k_layout`` selection traits of a plane.
 
-    ``uint8`` planes hold FP8 keys with one fp32 scale per 128 elements
-    (``"fp8_scaled"``): ``"packed"`` as ``[slots, head_dim + 4 *
+    ``uint8`` planes hold FP8 keys with one four-byte scale word per 128
+    elements (``"fp8_scaled"``, encoded per ``kvcache/index_k_scale.py``):
+    ``"packed"`` as ``[slots, head_dim + 4 *
     head_dim / 128]`` rows, otherwise ``"page_planar"``. ``bfloat16`` planes
     hold the keys unquantized (``"bf16"``) and are only ever ``"packed"``
     ``[slots, head_dim]``. A ``uint8`` plane holds ``"mxfp4"`` keys (E2M1
@@ -357,7 +359,8 @@ def _check_index_k_rows(
 
     ``index_k_bf16`` is ``[workspace_rows, head_dim]`` bf16; ``index_k_fp8`` is
     ``[workspace_rows, head_dim]`` FP8 bytes (uint8 or float8_e4m3fn) with
-    ``index_k_scale`` ``[workspace_rows, head_dim / 128]`` fp32.
+    ``index_k_scale`` ``[workspace_rows, head_dim / 128]`` scale words in the
+    plane's encoding (``kvcache/index_k_scale.py``).
     """
     if index_k_bf16 is not None:
         if index_k_bf16.dtype != torch.bfloat16 or index_k_bf16.shape != (
@@ -380,14 +383,15 @@ def _check_index_k_rows(
             f"[{workspace_rows}, {head_dim}] as uint8 or float8_e4m3fn, got "
             f"{index_k_fp8.dtype} {tuple(index_k_fp8.shape)}"
         )
-    if index_k_scale.dtype != torch.float32 or index_k_scale.shape != (
+    scale_dtype = index_k_scale_dtype()
+    if index_k_scale.dtype != scale_dtype or index_k_scale.shape != (
         workspace_rows,
         groups,
     ):
         raise ValueError(
-            "index_k_scale holds fp32 scales [workspace_rows, head_dim / "
-            f"{_INDEX_K_FP8_GROUP_SIZE}] = [{workspace_rows}, {groups}], got "
-            f"{index_k_scale.dtype} {tuple(index_k_scale.shape)}"
+            f"index_k_scale holds {scale_dtype} scale words [workspace_rows, "
+            f"head_dim / {_INDEX_K_FP8_GROUP_SIZE}] = [{workspace_rows}, {groups}], "
+            f"got {index_k_scale.dtype} {tuple(index_k_scale.shape)}"
         )
 
 
