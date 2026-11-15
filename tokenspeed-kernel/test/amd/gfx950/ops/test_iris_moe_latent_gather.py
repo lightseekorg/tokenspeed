@@ -301,3 +301,248 @@ def test_iris_moe_latent_input_gather_bitwise() -> None:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
     mp.spawn(_latent_gather_worker, args=(port,), nprocs=8, join=True)
+
+
+def _latent_gather_routed_worker(rank: int, port: int) -> None:
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=8,
+        timeout=timedelta(seconds=180),
+    )
+    try:
+        group = dist.new_group(backend="nccl", timeout=timedelta(seconds=180))
+        dist.barrier(group=group, device_ids=[rank])
+        _check_latent_gather_routed(rank, device, group)
+    finally:
+        dist.destroy_process_group()
+
+
+def _check_latent_gather_routed(
+    rank: int, device: torch.device, group: dist.ProcessGroup
+) -> None:
+    from tokenspeed_kernel.ops.communication._iris.kimi_k3 import (
+        K3MoeRouting,
+        prepare_k3_communication,
+    )
+    from tokenspeed_kernel.ops.communication._iris.kimi_k3.latent_gather import (
+        iris_k3moe_latent_input_gather_routed,
+    )
+    from tokenspeed_kernel.ops.moe._triton.kimi3_sigmoid_topk import (
+        kimi3_sigmoid_bias_topk_sorted,
+        kimi3_sorted_routing_scratch,
+    )
+
+    state = prepare_k3_communication(
+        group=group,
+        rank_in_group=rank,
+        staged_max_numel=0,
+        producer_direct_max_numel=64 * (_LATENT + _HIDDEN),
+        attnres_max_numel=0,
+        attnres_max_rows=0,
+        enable_lamport=True,
+        sharded_max_rows=0,
+        dtype=torch.bfloat16,
+        device=device,
+        all_reduce=None,
+    )
+    generator = torch.Generator(device=device).manual_seed(20261115)
+    weight = (
+        torch.randn((_PACKED, _HIDDEN), generator=generator, device=device) / 40
+    ).to(torch.bfloat16)
+    weight[_ROUTER + _LATENT :] = (
+        torch.randn((2 * _SHARED, _HIDDEN), device=device) / 40
+    ).to(torch.bfloat16)
+    down_weight = (
+        torch.randn((_HIDDEN, _SHARED), generator=generator, device=device) / 30
+    ).to(torch.bfloat16)
+    # A coarse bias repeats values, so zero rows tie many experts' choices.
+    bias = (
+        torch.round(torch.randn((_ROUTER,), generator=generator, device=device) * 4)
+        / 80
+    )
+    beta, linear_beta, block_size = 25.0, 25.0, 16
+    reference_scratch = kimi3_sorted_routing_scratch(device)
+    routing = K3MoeRouting(
+        bias, 1.0, True, block_size, kimi3_sorted_routing_scratch(device)
+    )
+
+    def reference(hidden, quantize):
+        router, routed, situ, *fp8 = state.latent_input_gather(
+            hidden, weight, beta=beta, linear_beta=linear_beta, quantize=quantize
+        )
+        *routes, shared = kimi3_sigmoid_bias_topk_sorted(
+            router,
+            bias,
+            routed_scaling_factor=1.0,
+            normalize_topk_weights=True,
+            block_size=block_size,
+            scratch=reference_scratch,
+            shared_down=(situ, down_weight, None),
+        )
+        return router, routed, fp8[0] if fp8 else None, routes, shared
+
+    def fused(hidden, quantize):
+        assert state.can_latent_input_gather_routed(
+            hidden, weight, routing, down_weight, None
+        )
+        router, routed, routes, shared, fp8 = state.latent_input_gather_routed(
+            hidden,
+            weight,
+            beta=beta,
+            linear_beta=linear_beta,
+            routing=routing,
+            down_weight=down_weight,
+            quantize=quantize,
+        )
+        return router, routed, fp8, routes, shared
+
+    def bits(tensor):
+        if tensor.dtype == torch.float8_e4m3fn:
+            return tensor.view(torch.uint8)
+        return tensor.view(
+            torch.int16 if tensor.dtype != torch.float32 else torch.int32
+        )
+
+    def same(a, b):
+        return torch.equal(bits(a), bits(b))
+
+    def valid_sort(routes):
+        _, _, sorted_ids, sorted_weights, sorted_expert_ids, num_valid = routes
+        padded = int(num_valid[0])
+        ids = sorted_ids[:padded]
+        real = (ids >> 24) < 16
+        return (
+            num_valid,
+            ids,
+            sorted_expert_ids[: padded // block_size],
+            torch.where(real, sorted_weights[:padded], 0.0),
+        )
+
+    mismatches = {"weights": 0, "shared": 0}
+
+    def check(got, want, label):
+        router, routed, fp8, routes, shared = got
+        want_router, want_routed, want_fp8, want_routes, want_shared = want
+        assert same(router, want_router), label
+        assert same(routed, want_routed), label
+        if want_fp8 is not None:
+            assert same(fp8[0], want_fp8[0]) and same(fp8[1], want_fp8[1]), label
+        assert torch.equal(routes[1], want_routes[1]), label
+        got_sort, want_sort = valid_sort(routes), valid_sort(want_routes)
+        for a, b in zip(got_sort[:3], want_sort[:3], strict=True):
+            assert torch.equal(a, b), label
+        torch.testing.assert_close(routes[0], want_routes[0], rtol=2e-7, atol=0)
+        torch.testing.assert_close(got_sort[3], want_sort[3], rtol=2e-7, atol=0)
+        mismatches["weights"] += int((bits(routes[0]) != bits(want_routes[0])).sum())
+        torch.testing.assert_close(
+            shared.float(), want_shared.float(), rtol=1e-2, atol=1e-2
+        )
+        mismatches["shared"] += int((bits(shared) != bits(want_shared)).sum())
+
+    hidden_rows = {}
+
+    def hidden_for(rows, seed):
+        if seed not in hidden_rows:
+            source = torch.Generator(device=device).manual_seed(seed)
+            hidden = torch.randn((rows, _HIDDEN), generator=source, device=device)
+            # Zero rows tie every expert's logit: the lower expert goes first.
+            hidden[seed % rows] = 0.0
+            hidden_rows[seed] = hidden.to(torch.bfloat16)
+        return hidden_rows[seed]
+
+    producer = state.all_reduce
+    for seed, rows in enumerate((8, 2, 16, 6, 3, 12, 8, 5, 4, 15, 8)):
+        hidden = hidden_for(rows, seed)
+        quantize = seed % 3 != 1
+        want = reference(hidden, quantize)
+        check(fused(hidden, quantize), want, f"rows={rows} seed={seed}")
+        # Interleave with the MoE all-reduce, which shares the mailbox tiles.
+        reduce_rows = min(rows, 6)
+        outputs = producer.acquire_outputs(
+            ((reduce_rows, _LATENT), (reduce_rows, _HIDDEN))
+        )
+        for output in outputs:
+            output.fill_(1.0)
+        reduced = state.reduce_moe(outputs)
+        assert torch.equal(reduced[0], torch.full_like(reduced[0], 8.0))
+    assert not state.can_latent_input_gather_routed(
+        hidden_for(17, 300), weight, routing, down_weight, None
+    )
+    torch.cuda.synchronize()
+    dist.barrier(group=group, device_ids=[rank])
+
+    # Captured decode layers with one rank late, sharing the routing scratch
+    # with the separate routing kernel.
+    layers = 6
+    shared_routing = K3MoeRouting(bias, 1.0, True, block_size, reference_scratch)
+    expected = [
+        reference(hidden_for(8 + layer % 2 * 4, 400 + layer), layer % 3 != 2)
+        for layer in range(layers)
+    ]
+
+    def captured(layer):
+        hidden = hidden_for(8 + layer % 2 * 4, 400 + layer)
+        if layer % 2:
+            return reference(hidden, layer % 3 != 2)
+        router, routed, routes, shared, fp8 = state.latent_input_gather_routed(
+            hidden,
+            weight,
+            beta=beta,
+            linear_beta=linear_beta,
+            routing=shared_routing,
+            down_weight=down_weight,
+            quantize=layer % 3 != 2,
+        )
+        return router, routed, fp8, routes, shared
+
+    def flat(result):
+        router, routed, fp8, routes, shared = result
+        return [router, routed, *(fp8 or ()), *routes, shared]
+
+    for layer in range(layers):
+        captured(layer)
+    torch.cuda.synchronize()
+    dist.barrier(group=group, device_ids=[rank])
+    snapshots = None
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream), assert_no_triton_compile(
+        iris_k3moe_latent_input_gather_routed
+    ):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            results = []
+            for layer in range(layers):
+                if rank == (layer * 3 + 1) % 8:
+                    torch.cuda._sleep(100_000)
+                results.append(flat(captured(layer)))
+            snapshots = [[t.clone() for t in layer] for layer in results]
+    torch.cuda.synchronize()
+    dist.barrier(group=group, device_ids=[rank])
+    for _ in range(3):
+        graph.replay()
+        torch.cuda.synchronize()
+        for layer, (snapshot, want) in enumerate(zip(snapshots, expected, strict=True)):
+            router, routed, *rest = snapshot
+            fp8 = tuple(rest[:2]) if layer % 3 != 2 else None
+            routes = rest[2:8] if fp8 else rest[:6]
+            check(
+                (router, routed, fp8, routes, rest[-1]), want, f"replay layer {layer}"
+            )
+    dist.barrier(group=group, device_ids=[rank])
+    if rank == 0:
+        print(f"bit mismatches vs separate routing: {mismatches}", flush=True)
+
+
+@pytest.mark.skipif(
+    not current_platform().is_cdna4 or torch.cuda.device_count() < 8,
+    reason="the K3 latent-input gather runs across eight CDNA4 GPUs",
+)
+def test_iris_moe_latent_input_gather_routed() -> None:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    mp.spawn(_latent_gather_routed_worker, args=(port,), nprocs=8, join=True)

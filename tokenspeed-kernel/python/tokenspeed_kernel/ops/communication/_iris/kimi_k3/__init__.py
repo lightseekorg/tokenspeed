@@ -57,6 +57,8 @@ _K3_LATENT_GEMM_NUM_WARPS = 2
 # One-shot Lamport window (it also sums MoE top-k slots) and latent gather row limits.
 _K3_LAMPORT_MAX_ROWS = 7
 _K3_LATENT_GATHER_MAX_ROWS = K3_FUSED_DECODE_MAX_ROWS
+# Past 16 rows the gather and a separate routing launch are faster.
+_K3_LATENT_ROUTED_MAX_ROWS = 16
 # The FP8 scale rendezvous spans its slots with gl.arange, so a power of two.
 _K3_LATENT_SYNC_ROWS = 1 << (_K3_LATENT_GATHER_MAX_ROWS - 1).bit_length()
 # From 8 rows the Lamport two-shot all-reduce wins; 1024-element tiles need even rows.
@@ -156,6 +158,22 @@ class K3AttentionMix:
     def unused(cls, like: torch.Tensor) -> "K3AttentionMix":
         """Placeholder operands of a launch without a mix."""
         return cls(like, like, 0.0, like, like, like)
+
+
+@dataclass(frozen=True)
+class K3MoeRouting:
+    """A layer's sorted MoE routing as ``kimi3_sigmoid_bias_topk_sorted`` takes it.
+
+    ``correction_bias`` is the FP32 ``[896]`` selection bias and ``scratch``
+    a ``kimi3_sorted_routing_scratch`` buffer, which launches of that kernel
+    and ``latent_input_gather_routed`` may share in stream order.
+    """
+
+    correction_bias: torch.Tensor
+    routed_scaling_factor: float
+    normalize_topk_weights: bool
+    block_size: int
+    scratch: torch.Tensor
 
 
 def allreduce_residual_attnres_max_tokens(world_size: int) -> int:
@@ -280,6 +298,12 @@ class K3IrisState:
                     torch.zeros(1, dtype=torch.int32, device=all_reduce.device),
                 )
             )
+            if self.lamport is not None
+            else None
+        )
+        # Routed gather's SiTU arrival and down-projection departure counters.
+        self._latent_down_sync = (
+            torch.zeros(16, dtype=torch.int32, device=all_reduce.device)
             if self.lamport is not None
             else None
         )
@@ -756,50 +780,10 @@ class K3IrisState:
         rank = self.all_reduce.rank_in_group
         device = hidden_states.device
         block = small_batch._BLOCK_N
-        router_local = _K3_ROUTER // world_size
-        latent_local = _K3_LATENT // world_size
-        latent_tiles = -(-latent_local // block)
+        latent_tiles = -(-(_K3_LATENT // world_size) // block)
         shared_tiles = 2 * _K3_SHARED // block
-        # The replicated launch's tiles and split, so every column keeps its bits.
-        block_m, warps_m = (
-            (small_batch._BLOCK_M, 1)
-            if rows <= small_batch._BLOCK_M
-            else (small_batch._LARGE_BLOCK_M, 2)
-        )
-        split_k = small_batch._split_k(rows, _K3_PACKED_INPUT_ROWS, _K3_HIDDEN, block_m)
-        partials = torch.empty(
-            (split_k, rows, _K3_PACKED_INPUT_ROWS), dtype=torch.float32, device=device
-        )
-        split_stride = rows * _K3_PACKED_INPUT_ROWS
-        # Narrow tiles spread a rank's columns; split-K sums do not depend on the tile.
-        gemm_block = 32 if rows <= small_batch._BLOCK_M else 64
-        gemm_router_tiles = -(-router_local // gemm_block)
-        gemm_latent_tiles = -(-latent_local // gemm_block)
-        gemm_shared_tiles = 2 * _K3_SHARED // gemm_block
-        gemm_tiles = gemm_router_tiles + gemm_latent_tiles + gemm_shared_tiles
-        small_batch.gluon_latent_input_small_batch_gfx950[
-            (-(-rows // block_m) * split_k * gemm_tiles,)
-        ](
-            hidden_states,
-            packed_weight,
-            partials,
-            rows,
-            split_stride,
-            HIDDEN=_K3_HIDDEN,
-            TOTAL_N=_K3_PACKED_INPUT_ROWS,
-            BLOCK_M=block_m,
-            BLOCK_N=gemm_block,
-            BLOCK_K=small_batch._BLOCK_K,
-            SPLIT_K=split_k,
-            NUM_WARPS=_K3_LATENT_GEMM_NUM_WARPS,
-            WARPS_M=warps_m,
-            REGION0_START=rank * router_local,
-            REGION0_TILES=gemm_router_tiles,
-            REGION1_START=_K3_ROUTER + rank * latent_local,
-            REGION1_TILES=gemm_latent_tiles,
-            REGION2_START=_K3_ROUTER + _K3_LATENT,
-            REGION2_TILES=gemm_shared_tiles,
-            num_warps=_K3_LATENT_GEMM_NUM_WARPS,
+        partials, split_k, split_stride = self._latent_input_partials(
+            hidden_states, packed_weight, all_router_columns=False
         )
         router_out = torch.empty((rows, _K3_ROUTER), dtype=torch.float32, device=device)
         routed_out = torch.empty(
@@ -853,6 +837,275 @@ class K3IrisState:
         if quantize:
             return router_out, routed_out, shared_out, (routed_fp8, routed_scale)
         return router_out, routed_out, shared_out
+
+    def _latent_input_partials(
+        self,
+        hidden_states: torch.Tensor,
+        packed_weight: torch.Tensor,
+        *,
+        all_router_columns: bool,
+    ) -> tuple[torch.Tensor, int, int]:
+        """Project this rank's packed-input columns into FP32 split-K partials.
+
+        The rank's eighth of the routed columns and every shared column, plus
+        its eighth of the router columns or, with ``all_router_columns``, all
+        of them. Returns ``(partials, split_k, split_stride)``.
+        """
+        from tokenspeed_kernel_amd.ops.gfx950.moe.fp16 import (
+            latent_input_small_batch as small_batch,
+        )
+
+        rows = hidden_states.shape[0]
+        world_size = self.all_reduce.world_size
+        rank = self.all_reduce.rank_in_group
+        router_local = _K3_ROUTER // world_size
+        latent_local = _K3_LATENT // world_size
+        # The replicated launch's tiles and split, so every column keeps its bits.
+        block_m, warps_m = (
+            (small_batch._BLOCK_M, 1)
+            if rows <= small_batch._BLOCK_M
+            else (small_batch._LARGE_BLOCK_M, 2)
+        )
+        split_k = small_batch._split_k(rows, _K3_PACKED_INPUT_ROWS, _K3_HIDDEN, block_m)
+        partials = torch.empty(
+            (split_k, rows, _K3_PACKED_INPUT_ROWS),
+            dtype=torch.float32,
+            device=hidden_states.device,
+        )
+        split_stride = rows * _K3_PACKED_INPUT_ROWS
+        # Narrow tiles spread a rank's columns; split-K sums do not depend on the tile.
+        gemm_block = 32 if rows <= small_batch._BLOCK_M else 64
+        if all_router_columns:
+            router_start, gemm_router_tiles = 0, _K3_ROUTER // gemm_block
+        else:
+            router_start = rank * router_local
+            gemm_router_tiles = -(-router_local // gemm_block)
+        gemm_latent_tiles = -(-latent_local // gemm_block)
+        gemm_shared_tiles = 2 * _K3_SHARED // gemm_block
+        gemm_tiles = gemm_router_tiles + gemm_latent_tiles + gemm_shared_tiles
+        small_batch.gluon_latent_input_small_batch_gfx950[
+            (-(-rows // block_m) * split_k * gemm_tiles,)
+        ](
+            hidden_states,
+            packed_weight,
+            partials,
+            rows,
+            split_stride,
+            HIDDEN=_K3_HIDDEN,
+            TOTAL_N=_K3_PACKED_INPUT_ROWS,
+            BLOCK_M=block_m,
+            BLOCK_N=gemm_block,
+            BLOCK_K=small_batch._BLOCK_K,
+            SPLIT_K=split_k,
+            NUM_WARPS=_K3_LATENT_GEMM_NUM_WARPS,
+            WARPS_M=warps_m,
+            REGION0_START=router_start,
+            REGION0_TILES=gemm_router_tiles,
+            REGION1_START=_K3_ROUTER + rank * latent_local,
+            REGION1_TILES=gemm_latent_tiles,
+            REGION2_START=_K3_ROUTER + _K3_LATENT,
+            REGION2_TILES=gemm_shared_tiles,
+            num_warps=_K3_LATENT_GEMM_NUM_WARPS,
+        )
+        return partials, split_k, split_stride
+
+    def can_latent_input_gather_routed(
+        self,
+        hidden_states: torch.Tensor,
+        packed_weight: torch.Tensor,
+        routing: K3MoeRouting,
+        down_weight: torch.Tensor,
+        down_out: torch.Tensor | None,
+    ) -> bool:
+        """Whether ``latent_input_gather_routed`` serves these decode rows."""
+        from tokenspeed_kernel.ops.communication._iris.kimi_k3.latent_route import (
+            K3_ROUTE_SCRATCH_WORDS,
+        )
+
+        if not self.can_latent_input_gather(hidden_states, packed_weight):
+            return False
+        rows = hidden_states.shape[0]
+        device = hidden_states.device
+        block_size = routing.block_size
+        return (
+            rows <= _K3_LATENT_ROUTED_MAX_ROWS
+            and block_size > 0
+            and not block_size & (block_size - 1)
+            and all(
+                t.shape == shape
+                and t.dtype == dtype
+                and t.is_contiguous()
+                and t.device == device
+                for t, shape, dtype in (
+                    (routing.correction_bias, (_K3_ROUTER,), torch.float32),
+                    (routing.scratch, (K3_ROUTE_SCRATCH_WORDS,), torch.int32),
+                    (down_weight, (_K3_HIDDEN, _K3_SHARED), torch.bfloat16),
+                )
+            )
+            and (
+                down_out is None
+                or (
+                    down_out.shape == (rows, _K3_HIDDEN)
+                    and down_out.dtype == torch.bfloat16
+                    and down_out.device == device
+                    and down_out.stride(1) == 1
+                    and down_out.stride(0) >= _K3_HIDDEN
+                )
+            )
+        )
+
+    def latent_input_gather_routed(
+        self,
+        hidden_states: torch.Tensor,
+        packed_weight: torch.Tensor,
+        *,
+        beta: float,
+        linear_beta: float | None,
+        routing: K3MoeRouting,
+        down_weight: torch.Tensor,
+        down_out: torch.Tensor | None = None,
+        quantize: bool = False,
+    ) -> tuple:
+        """``latent_input_gather`` that also routes the rows and projects the shared experts.
+
+        Every rank also projects all router columns, so each routes its
+        replicated rows while their latent is gathered, as
+        ``kimi3_sigmoid_bias_topk_sorted`` does with ``routing``, and the
+        same launch writes the shared SiTU input's down projection by
+        ``down_weight`` (``[7168, 768]``) into ``down_out`` or a new tensor.
+
+        Returns ``(router_logits, routed_input, routes, shared_partial,
+        routed_fp8)``: the logits and latent as ``latent_input_gather``,
+        ``routes`` as ``kimi3_sigmoid_bias_topk_sorted`` returns them, the
+        BF16 ``[rows, 7168]`` down projection, and with ``quantize`` the
+        latent's ``(fp8, scale)``, else None.
+        """
+        from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+            iris_arch_policy,
+        )
+        from tokenspeed_kernel.ops.communication._iris.kimi_k3.latent_gather import (
+            iris_k3moe_latent_input_gather_routed,
+        )
+        from tokenspeed_kernel_amd.ops.gfx950.moe.fp16 import (
+            latent_input_small_batch as small_batch,
+        )
+        from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.quantize import (
+            _DYNAMIC_FP8_E4M3_MAX,
+            _DYNAMIC_FP8_MIN_AMAX,
+        )
+
+        assert self.can_latent_input_gather_routed(
+            hidden_states, packed_weight, routing, down_weight, down_out
+        )
+        if beta <= 0.0 or (linear_beta is not None and linear_beta <= 0.0):
+            raise ValueError("SiTU beta values must be positive")
+        rows = hidden_states.shape[0]
+        world_size = self.all_reduce.world_size
+        device = hidden_states.device
+        block = small_batch._BLOCK_N
+        latent_tiles = -(-(_K3_LATENT // world_size) // block)
+        situ_tiles = _K3_SHARED // block
+        down_tiles = _K3_HIDDEN // 64
+        partials, split_k, split_stride = self._latent_input_partials(
+            hidden_states, packed_weight, all_router_columns=True
+        )
+        router_out = torch.empty((rows, _K3_ROUTER), dtype=torch.float32, device=device)
+        routed_out = torch.empty(
+            (rows, _K3_LATENT), dtype=hidden_states.dtype, device=device
+        )
+        situ = torch.empty((rows, _K3_SHARED), dtype=hidden_states.dtype, device=device)
+        if down_out is None:
+            down_out = hidden_states.new_empty((rows, _K3_HIDDEN))
+        if quantize:
+            routed_fp8 = torch.empty(
+                (rows, _K3_LATENT), dtype=torch.float8_e4m3fn, device=device
+            )
+            routed_scale = torch.empty(1, dtype=torch.float32, device=device)
+        else:
+            routed_fp8, routed_scale = routed_out, router_out
+        block_size = routing.block_size
+        routes = rows * 16
+        # gluon_moe_sorting's capacity: every nonempty expert may add a partial block.
+        capacity = (
+            (routes + min(routes, _K3_ROUTER) * (block_size - 1))
+            // block_size
+            * block_size
+        )
+        topk_weights = torch.empty((rows, 16), dtype=torch.float32, device=device)
+        topk_ids = torch.empty((rows, 16), dtype=torch.int32, device=device)
+        sorted_ids = torch.empty((capacity,), dtype=torch.int32, device=device)
+        sorted_weights = torch.empty((capacity,), dtype=torch.float32, device=device)
+        sorted_expert_ids = torch.empty(
+            (-(-capacity // block_size),), dtype=torch.int32, device=device
+        )
+        num_valid_ids = torch.empty((2,), dtype=torch.int32, device=device)
+        lamport = self.lamport
+        iris_k3moe_latent_input_gather_routed[
+            (rows * (1 + latent_tiles + situ_tiles) + down_tiles + rows,)
+        ](
+            partials,
+            situ,
+            router_out,
+            routed_out,
+            routed_fp8,
+            self._latent_fp8_sync,
+            routed_scale,
+            lamport.mailbox,
+            lamport.epochs,
+            lamport.peer_mailboxes,
+            float(beta),
+            1.0 if linear_beta is None else float(linear_beta),
+            rows,
+            split_stride,
+            routing.correction_bias,
+            topk_ids,
+            topk_weights,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            routing.scratch,
+            down_weight,
+            down_out,
+            down_out.stride(0),
+            self._latent_down_sync,
+            RANK=self.all_reduce.rank_in_group,
+            WORLD_SIZE=world_size,
+            SPLIT_K=split_k,
+            TOTAL_N=_K3_PACKED_INPUT_ROWS,
+            ROUTER_N=_K3_ROUTER,
+            LATENT_N=_K3_LATENT,
+            SHARED_N=_K3_SHARED,
+            HAS_LINEAR_BETA=linear_beta is not None,
+            MAX_ELEMENTS=lamport.max_numel,
+            PEER_SIGNAL_STORE_CACHE=iris_arch_policy().peer_signal_store,
+            NUM_WARPS=4,
+            MAX_ROWS=_K3_LATENT_SYNC_ROWS,
+            ROUTED_SCALING_FACTOR=float(routing.routed_scaling_factor),
+            NORMALIZE_TOPK_WEIGHTS=routing.normalize_topk_weights,
+            BLOCK_SHIFT=block_size.bit_length() - 1,
+            DOWN_N=_K3_HIDDEN,
+            DOWN_BLOCK_M=_K3_LATENT_ROUTED_MAX_ROWS,
+            QUANTIZE=quantize,
+            MIN_AMAX=_DYNAMIC_FP8_MIN_AMAX,
+            FP8_MAX=_DYNAMIC_FP8_E4M3_MAX,
+            num_warps=4,
+        )
+        sorted_routes = (
+            topk_weights,
+            topk_ids,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+        )
+        return (
+            router_out,
+            routed_out,
+            sorted_routes,
+            down_out,
+            (routed_fp8, routed_scale) if quantize else None,
+        )
 
     def moe_row_sharded_inputs(
         self,
