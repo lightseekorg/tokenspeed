@@ -12,7 +12,7 @@ build-backend = "scikit_build_core.build"
 name = "tokenspeed-scheduler"
 version = "0.1.55"
 description = "TokenSpeed C++ scheduler with Python bindings"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "numpy",
 ]
@@ -23,10 +23,11 @@ test = [
 ]
 
 [tool.scikit-build]
-build-dir = "build"
+build-dir = "build/{wheel_tag}"
 cmake.version = ">=3.22"
 cmake.args = ["-DTOKENSPEED_SCHEDULER_BUILD_TESTS=OFF", "-DTOKENSPEED_SCHEDULER_BUILD_PYTHON=ON"]
 wheel.packages = ["python/tokenspeed_scheduler"]
+wheel.py-api = "cp312"
 
 [tool.setuptools]
 license-files = ["LICENSE"]
