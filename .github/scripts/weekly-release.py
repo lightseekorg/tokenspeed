@@ -47,7 +47,7 @@ REPO = "lightseekorg/tokenspeed"
 WHL = "lightseekorg/whl"
 IDENTITY = "243258330+lightseek-bot@users.noreply.github.com"
 STAGES = ("plan", "amd", "kernel", "tokenspeed", "index", "docker", "release")
-SCHEDULER_STAGES = ("scheduler-version", "scheduler-publish", "scheduler-dependency")
+SCHEDULER_STAGES = ("scheduler-version", "scheduler-publish")
 MLA_STAGES = ("mla-version", "mla-publish", "mla-dependency")
 PACKAGES = {
     "amd": "tokenspeed-kernel-amd",
@@ -289,14 +289,13 @@ def preflight():
     versions = {}
     for package, path in (
         ("tokenspeed-mla", "tokenspeed-kernel/python/requirements/cuda-thirdparty.txt"),
-        ("tokenspeed-scheduler", "python/pyproject.toml"),
     ):
         version = latest_version(package)
         if read_version(package) != version:
             raise RuntimeError(
                 f"{package} main version is not the latest published version {version}"
             )
-        expected = f"=={version}" if package == "tokenspeed-mla" else f">={version}"
+        expected = f"=={version}"
         if str(requirements(path)[package].specifier) != expected:
             raise RuntimeError(f"{path} must depend on {package}{expected}")
         sha = source_sha(package, version, f"release-{package}.yml")
@@ -1585,7 +1584,7 @@ class ComponentRelease(Release):
         return f"bot/{stage}-{version}"
 
     def pr_title(self, stage, version):
-        if stage == self.stages[2]:
+        if len(self.stages) == 3 and stage == self.stages[2]:
             return f"build: require {self.package} {version}"
         return super().pr_title(stage, version)
 
@@ -1619,9 +1618,10 @@ class ComponentRelease(Release):
         self.phase["base"] = command("git", "rev-parse", "HEAD")
         self.state["initial_versions"] = {self.package: current}
         self.state["versions"] = {self.package: version}
-        self.state["initial_dependency"] = str(
-            requirements(self.pr_files[self.stages[2]][0])[self.package].specifier
-        )
+        if len(self.stages) == 3:
+            self.state["initial_dependency"] = str(
+                requirements(self.pr_files[self.stages[2]][0])[self.package].specifier
+            )
         self.save()
 
     def wait_index(self, files):
@@ -1647,7 +1647,7 @@ class ComponentRelease(Release):
     def gate(self):
         current = read_version(self.package)
         version = self.state["versions"][self.package]
-        if self.stage == self.stages[2]:
+        if len(self.stages) == 3 and self.stage == self.stages[2]:
             if (
                 not self.state["stages"].get(self.stages[1], {}).get("complete")
                 or current != version
@@ -1703,30 +1703,13 @@ class SchedulerRelease(ComponentRelease):
     stages = SCHEDULER_STAGES
     packages_by_stage = {
         "scheduler-version": "tokenspeed-scheduler",
-        "scheduler-dependency": "tokenspeed-scheduler",
     }
     pr_files = {
         "scheduler-version": [PROJECTS["tokenspeed-scheduler"]],
-        "scheduler-dependency": [PROJECTS["tokenspeed"]],
     }
-    pr_body = "Keep the scheduler release ordered so TokenSpeed requires an already published version.\n"
-
-    def update_metadata(self, stage):
-        if stage == "scheduler-version":
-            return super().update_metadata(stage)
-        version = self.state["versions"]["tokenspeed-scheduler"]
-        specifier = str(
-            requirements(PROJECTS["tokenspeed"])["tokenspeed-scheduler"].specifier
-        )
-        if not re.fullmatch(r">=\d+\.\d+\.\d+", specifier) or Version(
-            specifier[2:]
-        ) > Version(version):
-            raise RuntimeError("Scheduler dependency changed outside this release")
-        replace(
-            PROJECTS["tokenspeed"],
-            r'"tokenspeed-scheduler>=[^"]+"',
-            f'"tokenspeed-scheduler>={version}"',
-        )
+    pr_body = (
+        "Publish the standalone scheduler for consumers outside TokenSpeed engine.\n"
+    )
 
     def available(self, version):
         tag = f"tokenspeed-scheduler-v{version}"

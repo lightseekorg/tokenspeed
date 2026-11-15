@@ -364,12 +364,16 @@ def test_weekly_schedule_and_failure_resume_contract():
             ("publish", f"{component}-version"),
             ("dependency", f"{component}-publish"),
         ):
+            if component == "scheduler" and job == "dependency":
+                assert "dependency" not in pipeline["jobs"]
+                continue
             stage = pipeline["jobs"][job]
             assert stage["uses"] == "./.github/workflows/weekly-release-stage.yml"
             assert stage["with"]["stage"] == f"{component}-{job}"
             assert stage["with"]["previous"] == previous
         assert pipeline["jobs"]["publish"]["needs"] == "version"
-        assert pipeline["jobs"]["dependency"]["needs"] == "publish"
+        if component == "mla":
+            assert pipeline["jobs"]["dependency"]["needs"] == "publish"
 
 
 @pytest.fixture
@@ -1036,7 +1040,7 @@ def test_version_fast_forward_refuses_main_race(
     assert command("git", "ls-remote", "origin", "refs/heads/main").split()[0] == other
 
 
-@pytest.mark.parametrize("component", ["scheduler", "mla"])
+@pytest.mark.parametrize("component", ["mla"])
 def test_component_metadata_prs_replay_exact_diffs_without_downstream_version_bump(
     release_module, version_repository, tmp_path, monkeypatch, component
 ):
@@ -1229,9 +1233,10 @@ def test_component_failed_publication_blocks_dependency_and_resumes_same_run(
     with pytest.raises(RuntimeError, match="Child workflow failed"):
         controller.run("")
     assert not controller.phase.get("complete")
-    dependency = controller_type(controller.path, f"{component}-dependency")
-    with pytest.raises(RuntimeError, match=f"Previous {component} stage"):
-        dependency.run("")
+    if component == "mla":
+        dependency = controller_type(controller.path, f"{component}-dependency")
+        with pytest.raises(RuntimeError, match=f"Previous {component} stage"):
+            dependency.run("")
     run["conclusion"] = "success"
     resumed = controller_type(controller.path, f"{component}-publish")
     if component == "mla":
@@ -1250,6 +1255,8 @@ def test_component_failed_publication_blocks_dependency_and_resumes_same_run(
         assert dispatched[0]["inputs"] == {} and len(artifact_downloads) == 2
         resumed.run("")
         assert len(dispatched) == 1 and len(artifact_downloads) == 2
+    if component == "scheduler":
+        return  # This standalone package no longer changes runtime requirements.
     bare = tmp_path / "origin.git"
     command("git", "clone", "--bare", str(version_repository), str(bare))
     command("git", "remote", "add", "origin", str(bare))

@@ -47,7 +47,7 @@ register_cuda_ci(est_time=60, suite="runtime-1gpu")
 
 from test.l3_test_utils import storage_scheduler  # noqa: E402
 
-from tokenspeed_scheduler import (  # noqa: E402
+from tokenspeed_engine import (  # noqa: E402
     AttnKind,
     Cache,
     CacheGroupConfig,
@@ -143,7 +143,7 @@ def test_both_pd_roles_are_served_with_layerwise_streaming():
     assert rust_host_refusals(pd("prefill", disaggregation_layerwise_interval=0)) == []
 
 
-def _fake_host(tmp_path, body: str) -> str:
+def _fake_host(tmp_path, body: str) -> list[str]:
     """An executable taking the host's command line, running ``body`` with
     ``connection`` and ``python`` bound."""
     path = tmp_path / "ts-host"
@@ -151,11 +151,11 @@ def _fake_host(tmp_path, body: str) -> str:
             import sys, time
             from multiprocessing.connection import Connection
             args = dict(zip(sys.argv[1::2], sys.argv[2::2]))
-            python = args["--python"]
+            python = sys.executable
             connection = Connection(int(args["--control-fd"]))
             """) + textwrap.dedent(body))
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
-    return str(path)
+    return [sys.executable, str(path)]
 
 
 def _rank_args(rank: int) -> tuple[ServerArgs, PortArgs]:

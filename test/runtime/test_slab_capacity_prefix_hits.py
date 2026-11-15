@@ -246,7 +246,7 @@ class TestSlabCapacityPrefixHits:
 
     def setup_method(self):
         pytest.importorskip(
-            "tokenspeed_scheduler",
+            "tokenspeed_engine",
             reason="tokenspeed_scheduler ext is not installed",
             exc_type=ImportError,
         )

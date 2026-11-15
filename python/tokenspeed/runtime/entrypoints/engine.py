@@ -45,7 +45,6 @@ from tokenspeed_engine import BootstrapServer
 
 from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.engine.rust_host import (
-    host_binary,
     rust_host_refusals,
     start_rust_host,
 )
@@ -201,7 +200,7 @@ def _start_ranks(
     return them with their ready pipes. ``parent_death_signal`` asks the
     kernel to kill a rank when this node dies (see
     ``utils.process.set_parent_death_signal``)."""
-    binary = host_binary()
+    command = [sys.executable, "-m", "tokenspeed_engine.host"]
     memory_saver_adapter = TorchMemorySaverAdapter.create(
         enable=server_args.enable_memory_saver
     )
@@ -211,7 +210,7 @@ def _start_ranks(
         rank_server_args.mapping = copy.deepcopy(server_args.mapping)
         rank_server_args.mapping.rank = rank
         proc, reader = start_rust_host(
-            binary,
+            command,
             rank_server_args,
             port_args,
             memory_saver_adapter.configure_subprocess(),
@@ -231,14 +230,14 @@ def _start_encode_ranks(
     pipes. The first rank dials the frontend's handshake
     (``server_args.zmq_handshake_endpoint()``), which then sends it the
     encode requests. ``parent_death_signal`` as for ``_start_ranks``."""
-    binary = host_binary()
+    command = [sys.executable, "-m", "tokenspeed_engine.host"]
     procs, readers = [], []
     for rank in _scheduler_ranks(server_args):
         rank_server_args = copy.copy(server_args)
         rank_server_args.mapping = copy.deepcopy(server_args.mapping)
         rank_server_args.mapping.rank = rank
         proc, reader = start_rust_host(
-            binary,
+            command,
             rank_server_args,
             port_args,
             contextlib.nullcontext(),

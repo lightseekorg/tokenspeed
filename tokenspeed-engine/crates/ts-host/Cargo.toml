@@ -1,6 +1,6 @@
 [package]
 name = "tokenspeed-host"
-description = "One TokenSpeed engine rank: the Rust control plane, with the data plane in an embedded interpreter"
+description = "One TokenSpeed engine rank: the Rust control plane, with the data plane in the launching Python interpreter"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,9 +8,12 @@ repository.workspace = true
 rust-version.workspace = true
 readme.workspace = true
 
-[[bin]]
-name = "ts-host"
-path = "src/main.rs"
+[lib]
+name = "_host"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+abi3 = ["pyo3/abi3-py312", "ts-scheduler/abi3"]
 
 [dependencies]
 bytes.workspace = true

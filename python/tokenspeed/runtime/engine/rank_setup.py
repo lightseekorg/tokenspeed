@@ -23,7 +23,7 @@ model config, the process groups, the request length limits and the C++
 scheduler's config. ``rust_host.bootstrap`` runs them in this order."""
 
 import torch
-from tokenspeed_scheduler import SchedulerConfig, StorageConfig
+from tokenspeed_engine import SchedulerConfig, StorageConfig
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.engine.scheduler_utils import make_config
@@ -47,14 +47,14 @@ def _implied_scheduler_policy(on: bool, field: str) -> bool:
     """Whether to turn on a scheduler policy that ``--enable-state-checkpoint-in-forward``
     implies, rather than an option of its own.
 
-    A tokenspeed-scheduler wheel released before the policy's
+    A tokenspeed-engine wheel released before the policy's
     ``SchedulerConfig`` field (0.1.49 lacks the superseded-checkpoint demotion
     and the short prompt-end drop) would raise AttributeError when it is set;
     such a wheel serves the in-forward checkpoints without the policy instead.
     """
     if on and not hasattr(SchedulerConfig(), field):
         logger.warning(
-            f"the installed tokenspeed-scheduler has no SchedulerConfig.{field}; "
+            f"the installed tokenspeed-engine has no SchedulerConfig.{field}; "
             "serving the in-forward State checkpoints without that policy"
         )
         return False

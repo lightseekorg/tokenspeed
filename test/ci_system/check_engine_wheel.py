@@ -1,4 +1,4 @@
-"""Exercise an installed wheel and its embedded Python without GPU dependencies."""
+"""Exercise an installed wheel and its host extension without GPU dependencies."""
 
 import argparse
 import json
@@ -24,14 +24,19 @@ def bootstrap(control_fd, outbox, protocol, host_spans=None):
     import _sqlite3
     import _ssl
     import zlib
-    import tokenspeed_scheduler_ext
+    import threading
+    import tokenspeed_engine._scheduler as scheduler
+    import setproctitle
     import tokenspeed_engine
 
     os.write(control_fd, json.dumps({
         "prefix": sys.prefix,
         "executable": sys.executable,
-        "scheduler": tokenspeed_scheduler_ext.__name__,
+        "scheduler": scheduler.__name__,
+        "title": setproctitle.getproctitle(),
     }).encode())
+    # A failed rank must exit even when Python finalization would wait forever.
+    threading.Thread(target=threading.Event().wait, daemon=False).start()
     raise RuntimeError("engine wheel bootstrap verified")
 """
 
@@ -39,7 +44,22 @@ def bootstrap(control_fd, outbox, protocol, host_spans=None):
 def main(expected_version: str) -> None:
     installed_version = version("tokenspeed-engine")
     assert installed_version == expected_version, installed_version
-    host = tokenspeed_engine.host_binary()
+    config = tokenspeed_engine.SchedulerConfig()
+    config.prefix_granularity = 16
+    config.max_scheduled_tokens = 64
+    config.max_batch_size = 4
+    config.num_device_pages = 64
+    config.num_snapshot_pages = 1
+    config.cache_groups = [
+        tokenspeed_engine.CacheGroupConfig(
+            group_id="full_attention",
+            block_granularity=16,
+            total_pages=64,
+            attn_kind=tokenspeed_engine.AttnKind.Full,
+        )
+    ]
+    scheduler = tokenspeed_engine.Scheduler(config)
+    assert scheduler.waiting_size() == 0
     signal_count = 0
 
     def count_failure_signal(_signum, _frame):
@@ -59,9 +79,11 @@ def main(expected_version: str) -> None:
             try:
                 completed = subprocess.run(
                     [
-                        str(host),
-                        "--python",
                         sys.executable,
+                        "-m",
+                        "tokenspeed_engine.host",
+                        "--process-title",
+                        "tokenspeed::wheel-check",
                         "--control-fd",
                         str(result.fileno()),
                         "--enable-async-logging",
@@ -86,9 +108,10 @@ def main(expected_version: str) -> None:
         assert observed == {
             "prefix": sys.prefix,
             "executable": sys.executable,
-            "scheduler": "tokenspeed_scheduler_ext",
+            "scheduler": "tokenspeed_engine._scheduler",
+            "title": "tokenspeed::wheel-check",
         }, observed
-    print("Installed extension, embedded scheduler and runtime Python verified")
+    print("Installed extensions, scheduler and runtime Python verified")
 
 
 if __name__ == "__main__":

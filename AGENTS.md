@@ -197,9 +197,9 @@ Follow this sequence:
 3. Trigger the
    [release-tokenspeed-scheduler workflow](https://github.com/lightseekorg/tokenspeed/actions/workflows/release-tokenspeed-scheduler.yml)
    from `main`. Wait for the GitHub release and PyPI publication to succeed.
-4. Once the new version is available on PyPI, update the main TokenSpeed
-   project's `tokenspeed-scheduler` dependency requirement in
-   `python/pyproject.toml` through a follow-up PR targeting `main`.
+The runtime obtains the scheduler from `tokenspeed-engine`; standalone
+scheduler releases do not change the runtime dependency. Engine wheels build
+the scheduler from the same checkout as the host.
 
 ## tokenspeed-engine
 

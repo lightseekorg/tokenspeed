@@ -93,7 +93,7 @@ PACKAGE_LIST = [
     "tokenspeed-mooncake",
     "tokenspeed-proton",
     "tokenspeed-quack",
-    "tokenspeed-scheduler",
+    "tokenspeed-engine",
     "tokenspeed-smg",
     "tokenspeed-triton",
     "tokenspeed-trtllm-kernel",

@@ -11,10 +11,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tokenspeed-engine"
-version = "0.1.0"
-description = "TokenSpeed's engine control plane: the ts-host rank binary and the Python binding of its frontend client"
+version = "0.2.0"
+description = "TokenSpeed engine control plane, scheduler and frontend client"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
+dependencies = ["numpy", "setproctitle"]
 license = "MIT"
 
 [tool.setuptools]

@@ -22,10 +22,10 @@
 
 ``ts-host`` (``tokenspeed-engine/crates/ts-host``) runs one rank: its control
 thread schedules, admits requests and emits outputs in Rust, and the
-interpreter it embeds runs the data plane. This module is everything that
+launching interpreter runs the data plane. This module is everything that
 interpreter runs, plus the launcher's side:
 
-* ``start_rust_host`` starts the binary for one rank; every launch path
+* ``start_rust_host`` starts the native host for one rank; every launch path
   starts its ranks through it.
 * ``bootstrap`` builds the rank inside the host: the model config,
   distributed init, ``build_device_side`` and the scheduler. The Rust side
@@ -51,7 +51,6 @@ import functools
 import os
 import signal
 import subprocess
-import sys
 import threading
 import time
 from contextlib import AbstractContextManager
@@ -62,9 +61,9 @@ from multiprocessing.connection import Connection
 import msgspec
 import torch
 import torch.distributed as dist
+from tokenspeed_engine import Scheduler
 from tokenspeed_kernel.compile_monitor import compile_stats
 from tokenspeed_kernel.ops.tuning import kernel_warmup
-from tokenspeed_scheduler import Scheduler
 
 from tokenspeed.runtime.cache.l3.config import L3Settings
 from tokenspeed.runtime.cache.l3.factory import l3_settings
@@ -193,17 +192,6 @@ def resolve_stop_token_ids(
 # ----------------------------------------------------------------------
 
 
-def host_binary() -> str:
-    """The ``ts-host`` executable a rank runs: ``TOKENSPEED_HOST_BINARY``, or
-    the one installed with the tokenspeed-engine wheel."""
-    override = envs.TOKENSPEED_HOST_BINARY.get()
-    if override is not None:
-        return override
-    import tokenspeed_engine
-
-    return str(tokenspeed_engine.host_binary())
-
-
 def rust_host_refusals(server_args: ServerArgs) -> list[str]:
     """What in ``server_args`` the Rust host cannot serve yet, empty when
     it can serve all of it."""
@@ -258,14 +246,14 @@ class HostProcess:
 
 
 def start_rust_host(
-    binary: str,
+    command: list[str],
     server_args: ServerArgs,
     port_args: PortArgs,
     start_context: AbstractContextManager,
     metrics_relay_endpoint: str | None,
     parent_death_signal: bool,
 ) -> tuple[HostProcess, Connection]:
-    """Start ``binary`` for the rank ``server_args.mapping.rank`` names; the
+    """Start the native host for the rank ``server_args.mapping.rank`` names; the
     caller has checked ``rust_host_refusals``.
 
     The host reads its arguments from, and reports readiness on, one end of
@@ -275,7 +263,7 @@ def start_rust_host(
     encode rank), which ``ps`` and stale-process cleanup match.
 
     Args:
-        binary: The ``ts-host`` executable.
+        command: The Python host command.
         server_args: The rank's server arguments.
         port_args: The engine's ports.
         start_context: Entered around starting the process.
@@ -319,19 +307,18 @@ def start_rust_host(
         )
         popen = subprocess.Popen(
             [
+                *command,
+                "--process-title",
                 (
                     f"tokenspeed::encode_tp{server_args.mapping.attn.tp_rank}"
                     if server_args.disaggregation_mode == "encode"
                     else rank_process_title(server_args.mapping)
                 ),
-                "--python",
-                sys.executable,
                 "--control-fd",
                 str(child.fileno()),
                 "--enable-async-logging",
                 str(server_args.enable_async_logging).lower(),
             ],
-            executable=binary,
             env=host_env,
             pass_fds=[child.fileno(), held_until_exit],
             preexec_fn=preexec_fn,
@@ -1673,17 +1660,17 @@ def bootstrap(
     ``pd_outbox`` (see ``pd/host_peer.py``). An EPD encode rank runs the
     host's encode mode instead (``epd/encode_host.py``). ``host_spans`` is
     the host's span recording, which a profile merges into its trace
-    (``engine/profiler.py``); an older host binary passes none."""
+    (``engine/profiler.py``); an older host passes none."""
     connection = Connection(control_fd)
     server_args, port_args, metrics_relay_endpoint = connection.recv()
-    # Reject an older host binary before constructing a model or process
+    # Reject an older host before constructing a model or process
     # group. Protocol 1 publishes the replica-wide decision that makes locally
     # loaded weights usable; protocol 2 also agrees the load prerequisites
-    # before any rank starts loading. A binary without protocol 1 calls
+    # before any rank starts loading. A host without protocol 1 calls
     # bootstrap with two arguments.
     if server_args.enable_memory_saver and weight_update_commit_protocol < 2:
         raise RuntimeError(
-            "Memory saver requires a ts-host binary with weight-update commit "
+            "Memory saver requires tokenspeed-engine with weight-update commit "
             "protocol 2; rebuild tokenspeed-engine together with this runtime"
         )
     if server_args.disaggregation_mode == "encode":

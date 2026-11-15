@@ -2,7 +2,7 @@
 
 This document records the design principles of the scheduler event loop: the
 Rust control plane every engine rank runs (`tokenspeed-engine/crates/ts-control`,
-started by the `ts-host` binary) and its boundary to the Python data plane
+started by `python -m tokenspeed_engine.host`) and its boundary to the Python data plane
 (`python/tokenspeed/runtime/engine/rust_host.py`). It is the reference for
 where new logic belongs, how components feed results back into the scheduler,
 and what the loop body itself is allowed to contain. The rules below are
@@ -10,7 +10,11 @@ deliberate; treat deviations as bugs in review.
 
 ## The process
 
-One engine rank is one `ts-host` process. Its threads:
+One engine rank is one Python process running the native `_host` extension.
+It uses the launcher's interpreter and environment. Rust owns signal handling
+and exits after explicit cleanup without Python finalization; the control
+loop runs on the main thread with the GIL released. The scheduler and its
+Python types live in the same host extension. Its threads:
 
 | thread | runs | holds |
 | --- | --- | --- |

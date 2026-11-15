@@ -1,7 +1,7 @@
 #!/bin/bash
-# Build and install tokenspeed-engine (the ts-host rank binary and the
+# Build and install tokenspeed-engine (the native rank host and the
 # Python binding of its frontend client) from this checkout, for ${PYTHON}
-# (python3 by default). Every engine rank runs ts-host, so every serving
+# (python3 by default). Every engine rank runs the native host, so every serving
 # install needs it.
 set -euo pipefail
 

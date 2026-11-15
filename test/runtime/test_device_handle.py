@@ -49,7 +49,7 @@ from unittest import mock
 import numpy as np
 import pytest
 import torch
-from tokenspeed_scheduler import (
+from tokenspeed_engine import (
     AttnKind,
     CacheGroupConfig,
     ExecutionEvent,

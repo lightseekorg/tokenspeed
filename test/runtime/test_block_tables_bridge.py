@@ -50,7 +50,7 @@ def _import_bridge():
 
 @pytest.fixture
 def scheduler_forward_op():
-    import tokenspeed_scheduler as ts
+    import tokenspeed_engine as ts
 
     cfg = ts.SchedulerConfig()
     cfg.prefix_granularity = 2
@@ -615,7 +615,7 @@ def _real_scheduler_module():
     not built in this environment."""
     import pytest as _pytest
 
-    ts = _pytest.importorskip("tokenspeed_scheduler")
+    ts = _pytest.importorskip("tokenspeed_engine")
     return ts
 
 

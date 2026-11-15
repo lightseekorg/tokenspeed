@@ -18,24 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""TokenSpeed's Rust engine: the rank binary and a client of its ranks.
+"""TokenSpeed engine control plane, scheduler and frontend client."""
 
-* ``host_binary()`` is ``ts-host``, one engine rank: the Rust control plane
-  with the data plane in an embedded interpreter (``tokenspeed`` launches
-  one per rank).
-* ``FrontendListener`` / ``Frontend`` connect Python to the ranks over the
-  msgpack ZMQ wire (``ts-client``), for tests and tools that drive an engine
-  (``tokenspeed.runtime.entrypoints.wire_driver``); serving frontends (SMG,
-  Dynamo) speak the wire from Rust.
-* ``L3Executor`` is the L3 storage tier's executor (``ts-l3``) for callers
-  outside a rank, such as tests over a data plane's Host pool; a rank's
-  host runs its own.
-* ``BootstrapServer`` is a disaggregated deployment's HTTP rendezvous
-  (``ts-pd``), which the launcher hosts.
-"""
-
-from pathlib import Path
-
+from tokenspeed_engine._host import scheduler as _scheduler
 from tokenspeed_engine._native import (
     BootstrapServer,
     EngineError,
@@ -52,10 +37,10 @@ __all__ = [
     "FrontendListener",
     "L3Executor",
     "PendingFrontend",
-    "host_binary",
 ]
 
 
-def host_binary() -> Path:
-    """The ``ts-host`` executable installed with this package."""
-    return Path(__file__).resolve().parent / "bin" / "ts-host"
+from tokenspeed_engine.scheduler import *  # noqa: F403
+from tokenspeed_engine.scheduler import __all__ as _scheduler_exports
+
+__all__ += _scheduler_exports

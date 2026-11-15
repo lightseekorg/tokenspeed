@@ -34,7 +34,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
-from tokenspeed_scheduler import (
+from tokenspeed_engine import (
     AttnKind,
     CacheGroupConfig,
     CacheTransferPolicy,
@@ -129,8 +129,8 @@ def cache_group_config(
             config.sink_tokens = spec.sink_tokens
         except AttributeError as error:
             raise RuntimeError(
-                "SWA sink retention requires tokenspeed-scheduler with sink_tokens "
-                "support; rebuild tokenspeed-scheduler from the matching source."
+                "SWA sink retention requires tokenspeed-engine with sink_tokens "
+                "support; rebuild tokenspeed-engine from the matching source."
             ) from error
     return config
 

@@ -211,7 +211,7 @@ def mooncake_client(master: str, *, global_segment_size: int):
 
 def storage_ops(plan):
     """The Host-only commands in a scheduler's unified cache plan."""
-    from tokenspeed_scheduler import Cache
+    from tokenspeed_engine import Cache
 
     types = (
         Cache.StorageQueryOp,
@@ -224,7 +224,7 @@ def storage_ops(plan):
 
 def storage_scheduler():
     """A small real scheduler with explicit Host-storage credits."""
-    import tokenspeed_scheduler as ts
+    import tokenspeed_engine as ts
 
     cfg = ts.SchedulerConfig()
     cfg.role = ts.SchedulerConfig.Role.Fused
