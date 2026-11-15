@@ -77,11 +77,20 @@ def _median_tpot_ms(summary_path: Path) -> float:
         return 0.0
     for row in table:
         if row.get("Percentiles") == "50%":
-            return _float(row, "TPOT (ms)")
+            tpot_ms = _float(row, "TPOT (ms)")
+            if not tpot_ms:
+                print(
+                    f"[warn] no 50% TPOT (ms) value in the percentiles beside {summary_path}",
+                    file=sys.stderr,
+                )
+            return tpot_ms
+    print(
+        f"[warn] no 50% row in the percentiles beside {summary_path}", file=sys.stderr
+    )
     return 0.0
 
 
-def collect(sweep_dir: Path, num_gpus: int, tpot_stat: str = "mean"):
+def collect(sweep_dir: Path, num_gpus: int, tpot_stat: str):
     rows = []
     for summary_path in sorted(sweep_dir.rglob("benchmark_summary.json")):
         config = _config_from_path(sweep_dir, summary_path)
@@ -163,7 +172,7 @@ def main():
     parser.add_argument(
         "--tpot-stat",
         choices=("mean", "median"),
-        default="mean",
+        required=True,
         help="Per-request TPOT statistic behind Latency (tps/user). The median "
         "ignores the few requests whose decode waits behind other prompts' "
         "prefill, which the mean takes in and which depends on arrival order.",

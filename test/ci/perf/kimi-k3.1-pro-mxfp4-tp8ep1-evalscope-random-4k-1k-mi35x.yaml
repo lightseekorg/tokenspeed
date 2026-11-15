@@ -108,7 +108,7 @@ perf:
     --no-timestamp
     --extra-args '{"ignore_eos": true}';
     PERF_STATUS=$?;
-    python3 "$REPO_ROOT/test/random_benchmark/tokenspeed/collect_outputs.py" "$OUTPUTS_DIR" --num-gpus 8 --emit-csv;
+    python3 "$REPO_ROOT/test/random_benchmark/tokenspeed/collect_outputs.py" "$OUTPUTS_DIR" --num-gpus 8 --emit-csv --tpot-stat mean;
     PARSE_STATUS=$?;
     if [ "$PERF_STATUS" -ne 0 ]; then exit "$PERF_STATUS"; fi;
     exit "$PARSE_STATUS"

@@ -35,6 +35,8 @@ def test_random_benchmark_output_can_be_gated(tmp_path):
             "--num-gpus",
             "8",
             "--emit-csv",
+            "--tpot-stat",
+            "mean",
         ],
         capture_output=True,
         text=True,
@@ -76,7 +78,16 @@ def test_random_benchmark_accepts_evalscope_1_10_metric_names(tmp_path):
         / "collect_outputs.py"
     )
     result = subprocess.run(
-        [sys.executable, collector, tmp_path, "--num-gpus", "8", "--emit-csv"],
+        [
+            sys.executable,
+            collector,
+            tmp_path,
+            "--num-gpus",
+            "8",
+            "--emit-csv",
+            "--tpot-stat",
+            "mean",
+        ],
         capture_output=True,
         text=True,
         check=True,
@@ -121,15 +132,23 @@ def test_random_benchmark_latency_can_use_median_tpot(tmp_path):
         / "collect_outputs.py"
     )
 
-    def latency(*extra):
+    def latency(stat):
         result = subprocess.run(
-            [sys.executable, collector, tmp_path, "--num-gpus", "8", "--emit-csv"]
-            + list(extra),
+            [
+                sys.executable,
+                collector,
+                tmp_path,
+                "--num-gpus",
+                "8",
+                "--emit-csv",
+                "--tpot-stat",
+                stat,
+            ],
             capture_output=True,
             text=True,
             check=True,
         )
         return extract_perf_summary_rows(result.stdout)[0]["Latency (tps/user)"]
 
-    assert latency() == "71.43"
-    assert latency("--tpot-stat", "median") == "125.0"
+    assert latency("mean") == "71.43"
+    assert latency("median") == "125.0"
