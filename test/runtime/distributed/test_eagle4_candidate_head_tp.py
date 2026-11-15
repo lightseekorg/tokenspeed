@@ -30,8 +30,8 @@ Usage:
 """
 
 import os
-import socket
 import sys
+import time
 
 import pytest
 import torch
@@ -51,12 +51,8 @@ register_cuda_ci(
 
 # Shards of 8192 tokens: wide enough that startup prepares the fused distributed argmax.
 VOCAB, HIDDEN, RANK, NUM_CANDIDATES, ROWS = 16384, 32, 8, 128, 5
-
-
-def _get_open_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]
+# The test takes under a minute; past this a rank is stuck.
+JOIN_SECONDS = 300
 
 
 def _check_greedy_candidate(rank, world_size, device):
@@ -159,13 +155,13 @@ def _check_greedy_candidate(rank, world_size, device):
     assert all(torch.equal(g, best) for g in gathered)
 
 
-def _worker(rank, world_size, port, error_dict):
+def _worker(rank, world_size, rendezvous, error_dict):
     try:
         device = torch.device(f"cuda:{rank}")
         torch.cuda.set_device(device)
         dist.init_process_group(
             backend="nccl",
-            init_method=f"tcp://localhost:{port}",
+            init_method=rendezvous,
             rank=rank,
             world_size=world_size,
         )
@@ -186,14 +182,24 @@ def _worker(rank, world_size, port, error_dict):
     not torch.cuda.is_available() or torch.cuda.device_count() < 2,
     reason="needs 2 GPUs",
 )
-def test_two_ranks_pick_the_best_of_their_gathered_candidates():
+def test_two_ranks_pick_the_best_of_their_gathered_candidates(tmp_path):
     error_dict = mp.Manager().dict()
-    mp.spawn(
+    # A file rendezvous: a probed free port can be taken before rank 0 binds it.
+    ranks = mp.spawn(
         _worker,
-        args=(2, _get_open_port(), error_dict),
+        args=(2, f"file://{tmp_path / 'rendezvous'}", error_dict),
         nprocs=2,
-        join=True,
+        join=False,
     )
+    # A rank that fails leaves its peer waiting; report it instead of hanging.
+    deadline = time.monotonic() + JOIN_SECONDS
+    while not ranks.join(timeout=5):
+        if time.monotonic() > deadline:
+            for process in ranks.processes:
+                process.kill()
+            raise RuntimeError(
+                f"ranks still running after {JOIN_SECONDS} s; reported: {dict(error_dict)}"
+            )
     if error_dict:
         raise RuntimeError("\n".join(f"rank {r}: {e}" for r, e in error_dict.items()))
 
