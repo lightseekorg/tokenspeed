@@ -1000,6 +1000,9 @@ tracks slot ownership by admission, not by client request id, and seeds a
 new owner's prefix before its first forward. Consecutive chunks on the
 same owned row append their inputs without reseeding. Prefix-cache hits,
 PD landings, slot reuse and recovery into another slot use this same path.
+Only the most recently used slot can hold a request's current history. Moving
+to another slot invalidates the old ownership claim: a later restore into
+that old slot must seed again, even if no other request has used it.
 
 A model profile may declare `request_token_history_lookback`: the maximum
 number of committed tokens it reads behind its write frontier. Omission
