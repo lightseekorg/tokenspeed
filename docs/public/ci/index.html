@@ -14,8 +14,8 @@
   --bg: #f4f3ee; --bg-grid: rgba(30, 41, 74, .045);
   --surface: #fcfcfb; --surface-hover: #f1f0ea; --surface-2: #eceae2;
   --border: rgba(11, 11, 11, .10); --border-strong: rgba(11, 11, 11, .22);
-  --text-primary: #12172a; --text-secondary: #4f5160; --text-muted: #85848a;
-  --primary: #23356b; --primary-soft: #e3e7f3; --accent: #b86f00;
+  --text-primary: #12172a; --text-secondary: #4f5160; --text-muted: #6a6970;
+  --primary: #23356b; --primary-soft: #e3e7f3; --accent: #8a5600;
   --good: #006300; --bad: #b42f2f; --grid: #e1e0d9; --axis: #c3c2b7;
   --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100;
   --board: #18213d;
@@ -184,10 +184,10 @@ body.lang-bi .mix > span[lang="zh"]::before { content: ""; }
 <header class="board rise">
   <div class="controls">
     <div class="seg" role="group" aria-label="language">
-      <button data-lang="bi" class="on">双语</button><button data-lang="en">EN</button><button data-lang="zh">中文</button>
+      <button data-lang="bi" class="on" aria-pressed="true">双语</button><button data-lang="en" aria-pressed="false">EN</button><button data-lang="zh" aria-pressed="false">中文</button>
     </div>
     <div class="seg" role="group" aria-label="theme">
-      <button data-theme-btn="auto" class="on" title="follow system">◐</button><button data-theme-btn="light" title="light">☀</button><button data-theme-btn="dark" title="dark">☾</button>
+      <button data-theme-btn="auto" class="on" aria-pressed="true" title="follow system" aria-label="follow system">◐</button><button data-theme-btn="light" aria-pressed="false" title="light" aria-label="light">☀</button><button data-theme-btn="dark" aria-pressed="false" title="dark" aria-label="dark">☾</button>
     </div>
   </div>
   <div class="eyebrow" id="repo">lightseekorg/tokenspeed · PR CI</div>
@@ -656,13 +656,13 @@ body.lang-bi .mix > span[lang="zh"]::before { content: ""; }
   function load(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
   function setLang(l) {
     ["bi", "en", "zh"].forEach(function (x) { document.body.classList.toggle("lang-" + x, x === l); });
-    document.querySelectorAll("[data-lang]").forEach(function (b) { b.classList.toggle("on", b.dataset.lang === l); });
+    document.querySelectorAll("[data-lang]").forEach(function (b) { var on = b.dataset.lang === l; b.classList.toggle("on", on); b.setAttribute("aria-pressed", String(on)); });
     document.documentElement.lang = l === "zh" ? "zh-CN" : "en";
     store("ts-ci-lang", l);
   }
   function setTheme(t) {
     if (t === "auto") document.documentElement.removeAttribute("data-theme"); else document.documentElement.setAttribute("data-theme", t);
-    document.querySelectorAll("[data-theme-btn]").forEach(function (b) { b.classList.toggle("on", b.dataset.themeBtn === t); });
+    document.querySelectorAll("[data-theme-btn]").forEach(function (b) { var on = b.dataset.themeBtn === t; b.classList.toggle("on", on); b.setAttribute("aria-pressed", String(on)); });
     store("ts-ci-theme", t);
   }
   document.querySelectorAll("[data-lang]").forEach(function (b) { b.addEventListener("click", function () { setLang(b.dataset.lang); }); });
