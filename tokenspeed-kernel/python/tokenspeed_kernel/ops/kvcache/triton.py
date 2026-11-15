@@ -33,11 +33,14 @@ from dataclasses import dataclass
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.ops.attention.dsv41.triton import _mxfp4_index_rows, _ue8m0_word
 from tokenspeed_kernel.ops.kvcache.index_k_scale import (
     index_k_scale_dtype,
     index_k_scale_ue8m0,
     index_k_scale_word,
+)
+from tokenspeed_kernel.ops.quantization._triton_mxfp4 import (
+    _mxfp4_index_rows,
+    _ue8m0_word,
 )
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
