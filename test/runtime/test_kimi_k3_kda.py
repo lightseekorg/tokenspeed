@@ -358,21 +358,23 @@ def test_two_slot_resolve_runs_once_per_group_and_groups_are_independent(
     backend = _backend("cpu", contract_pool=pool)
 
     resolve_calls = 0
+    resolved_tables = 0
     real = (
-        mamba.verify_state_blocks
+        mamba.verify_state_groups
         if backend.deferred_state_commit
         else mamba.compute_state_block_indices
     )
 
     def counting(*args, **kwargs):
-        nonlocal resolve_calls
+        nonlocal resolve_calls, resolved_tables
         resolve_calls += 1
+        resolved_tables += len(args[0]) if backend.deferred_state_commit else 1
         return real(*args, **kwargs)
 
     monkeypatch.setattr(
         mamba,
         (
-            "verify_state_blocks"
+            "verify_state_groups"
             if backend.deferred_state_commit
             else "compute_state_block_indices"
         ),
@@ -397,8 +399,10 @@ def test_two_slot_resolve_runs_once_per_group_and_groups_are_independent(
         block_tables=delivered,
     )
 
-    # One resolve per state group over its own table, never per layer.
-    assert resolve_calls == len(_STATE_GROUPS)
+    # One resolve per state group over its own table, never per layer; a
+    # verify resolves every group in one call.
+    assert resolved_tables == len(_STATE_GROUPS)
+    assert resolve_calls == (1 if backend.deferred_state_commit else len(_STATE_GROUPS))
 
     md = backend.forward_metadata
     assert tuple(sorted(md.state_in_blocks_by_group)) == _STATE_GROUPS

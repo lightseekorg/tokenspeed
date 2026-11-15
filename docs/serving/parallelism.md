@@ -996,6 +996,10 @@ CUDA IPC collectives are node-local. The mnnvl fabric workspace spans nodes.
 single-node workspace was armed for it; mnnvl serves 16-bit only) on groups
 whose fan-in is 2, 4, 8, or 16 through the armed workspace -- one-shot
 inside its traffic window, two-shot up to the workspace token capacity.
+Where FlashInfer's BT presets cover the group (8 ranks, width 7168,
+SM103), payloads of at least 1 MiB per rank instead take its owner
+reduction, which sums the ranks in order in fp32 where the Lamport kernels sum
+in BF16 (`tokenspeed_kernel/ops/communication/README.md` has the measurements).
 Cross-node groups arm the full two-shot capacity at startup. Single-node
 groups start at the one-shot window and serve larger shapes once
 model-level preparation widens the shared workspace. Other

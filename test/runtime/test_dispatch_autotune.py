@@ -751,16 +751,10 @@ class _DrafterCaptureDouble:
     def capture_prefill_graph(self, stream, observer):
         self._on_capture(stream)
 
-    def extend_graph_plan(self, token_buckets, request_counts):
+    def extend_graph_plan(self, token_buckets):
         if not self._extend_graphs:
             return {}
-        return {
-            "prefill:drafter-step0": [
-                (bucket, bs)
-                for bucket in token_buckets
-                for bs in request_counts(bucket)
-            ]
-        }
+        return {"prefill:drafter-kv": [(max(token_buckets), 1)]}
 
     def capture_extend_graphs(self, capture, *, observer):
         self._on_capture(capture.stream)
@@ -769,17 +763,6 @@ class _DrafterCaptureDouble:
 class _ObserverDouble:
     def measure(self, name):
         return nullcontext()
-
-
-@dataclass
-class _CaptureConfig:
-    """The ModelExecutorConfig fields capture_graphs() reads."""
-
-    enable_drafter_prefill_graph: bool = True
-    prefill_graph_capture_batch_sizes: list[int] | None = None
-    context_len: int = 4096
-    max_num_seqs: int = 4
-    data_parallel_size: int = 1
 
 
 class _CaptureExecutor:
@@ -792,7 +775,6 @@ class _CaptureExecutor:
     _prepare_drafter_capture_batch = ModelExecutor._prepare_drafter_capture_batch
 
     def __init__(self, *, forward_step, prefill_graph, drafter):
-        self.config = _CaptureConfig()
         self.device = "cpu"
         self.forward_step = forward_step
         self.prefill_graph = prefill_graph

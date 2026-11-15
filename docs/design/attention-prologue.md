@@ -289,16 +289,12 @@ the store. Its captured expanded pass is spent. The backends' own breaks nest
 inside these and pass through, and remain for callers that reach a backend
 directly. Prefill graphs capture the target model and replay a round with
 draft narrowing eagerly, so draft layers need no break. A narrowed draft
-step writes every row itself and skips the pre-break prologue. The drafter
-prefill graph (`--enable-drafter-prefill-graph`, see
-[unified_path.md](unified_path.md#drafter-prefill-graphs)) records a draft's
-extend step only when the draft model declares
-`supports_breakable_draft_extend`: Qwen4-Exp's MTP head runs the GQA prologue
-in the captured segment and attends at `PagedAttention.attend`, like the
-target. Qwen3.5's MTP head splits the round instead
-(a `SplitExtendDraft`): its K/V writer stores every row through
-`write_kv_at`, with no break, and step 0 runs from each request's last row as
-a decode step.
+step writes every row itself and skips the pre-break prologue. A split draft
+(a `SplitExtendDraft`: the MTP heads of Qwen3.5 and Qwen4-Exp, see
+[unified_path.md](unified_path.md#drafter-prefill-graphs)) stores every row's
+K/V of an extend round through `write_kv_at` from the drafter's K/V writer
+graph, with no break, and step 0 then runs from each request's last row as a
+decode step.
 
 ## Formats and scales
 
