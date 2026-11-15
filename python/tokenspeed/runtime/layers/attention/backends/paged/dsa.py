@@ -43,6 +43,7 @@ from tokenspeed_kernel.ops.attention.dsa.flashinfer import (
     reserve_flashinfer_trtllm_dsa_buffers,
     trtllm_sparse_mla_query_heads,
 )
+from tokenspeed_kernel.ops.metadata import expand_k_row_lengths
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import KernelRegistry, priority_band_name
 from tokenspeed_kernel.selection import KernelPlan, NoKernelFoundError, select_kernel
@@ -1201,16 +1202,28 @@ class DSABackend(PagedAttentionBackend):
                 seq_lens_2d=metadata._dsa_seq_lens_2d,
                 page_size=self.kernel_page_size,
             )
+            self._publish_kv_seq_lens(metadata, bs)
+        elif metadata._dsa_kv_seq_lens is None:
+            self._publish_k_row_indexer_rows(metadata, seq_lens, bs, None)
+            self._publish_kv_seq_lens(metadata, bs)
         else:
-            self._publish_k_row_indexer_rows(metadata, seq_lens, bs)
-        self._publish_kv_seq_lens(metadata, bs)
+            # A target verify's allocated causal KV rows ride the same launch.
+            self._publish_k_row_indexer_rows(
+                metadata, seq_lens, bs, metadata._dsa_kv_seq_lens
+            )
 
     def _publish_k_row_indexer_rows(
-        self, metadata, seq_lens: torch.Tensor, bs: int
+        self,
+        metadata,
+        seq_lens: torch.Tensor,
+        bs: int,
+        causal_kv_seq_lens: torch.Tensor | None,
     ) -> None:
         """Rewrite the per-token indexer rows to ``seq_lens[:bs]`` (``k`` rows
         per request) and refresh their plan, both in place: fixed shapes and
-        storage, so a captured graph replays the edit."""
+        storage, so a captured graph replays the edit. ``causal_kv_seq_lens``,
+        a target verify's rows from :meth:`_publish_kv_seq_lens`, is rewritten
+        in the same launch; None leaves them alone."""
         k = self.spec_num_tokens
         rows = metadata._dsa_seq_lens_2d
         if rows.shape[0] != bs * k:
@@ -1218,7 +1231,13 @@ class DSABackend(PagedAttentionBackend):
                 "DSA draft per-token rows do not match the decode batch: "
                 f"rows={rows.shape[0]}, requests={bs}, width={k}"
             )
-        rows.copy_(_k_row_context_lengths(seq_lens[:bs], k))
+        expand_k_row_lengths(
+            seq_lens[:bs],
+            None if causal_kv_seq_lens is None else metadata.seq_lens_k[:bs],
+            k=k,
+            context_out=rows.view(-1),
+            causal_out=causal_kv_seq_lens,
+        )
         dsa_plan(
             seq_lens_2d=rows,
             page_size=self.kernel_page_size,
@@ -1272,7 +1291,7 @@ class DSABackend(PagedAttentionBackend):
             )
         bs = metadata.seq_lens_k.numel()
         metadata.seq_lens_k.copy_(frontier[:bs])
-        self._publish_k_row_indexer_rows(metadata, frontier, bs)
+        self._publish_k_row_indexer_rows(metadata, frontier, bs, None)
 
     def init_forward_metadata(
         self,
