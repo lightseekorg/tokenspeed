@@ -95,8 +95,10 @@ decode-size rows on NVIDIA, the GEMM facade's FP32 output otherwise.
 
 `bf16_moe_routes` returns individual, unweighted expert outputs. Deferred MXFP4
 execution also returns a map from each original route to its output row, with
-`-1` for remote experts. Consumers normalize each route before weighting and
-summation. Combining routes before normalization changes the operation.
+`-1` for remote experts. Gluon Petit returns no map: its combine returns every
+route of each local token as `[tokens, topk, hidden]` in `topk` order. Consumers
+normalize each route before weighting and summation. Combining routes before
+normalization changes the operation.
 
 `triton_bf16_routes_moe_apply` and `gluon_bf16_routes_moe_apply` serve
 `bf16_moe_routes` as `moe.apply` kernels to layers that always finalize the
