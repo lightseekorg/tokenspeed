@@ -122,7 +122,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.10", "3.11", "3.12", "3.13"]
+        python: ["3.11", "3.12"]
         arch: [x86_64, aarch64]
         include:
           - arch: x86_64
@@ -167,12 +167,19 @@ jobs:
           PYTHON_VERSION: ${{ matrix.python }}
           EXPECTED_VERSION: ${{ needs.metadata.outputs.version }}
         run: |
-          docker run --rm \
-            -v "$PWD/dist:/wheels:ro" \
-            -v "$PWD/test/ci_system/check_engine_wheel.py:/check_engine_wheel.py:ro" \
-            -e EXPECTED_VERSION \
-            "python:${PYTHON_VERSION}-slim" \
-            sh -ec 'python -m venv /tmp/runtime; /tmp/runtime/bin/pip install --no-index /wheels/*.whl; /tmp/runtime/bin/python /check_engine_wheel.py "$EXPECTED_VERSION"'
+          versions="$PYTHON_VERSION"
+          if [ "$PYTHON_VERSION" = 3.12 ]; then
+            versions="3.12 3.13 3.14 3.15"
+          fi
+          for runtime in $versions; do
+            docker run --rm \
+              -v "$PWD/dist:/wheels:ro" \
+              -v "$PWD/test/ci_system/check_engine_wheel.py:/check_engine_wheel.py:ro" \
+              -v "$PWD/tokenspeed-scheduler/python:/scheduler:ro" \
+              -e EXPECTED_VERSION \
+              "python:${runtime}-slim" \
+              sh -ec 'python -m venv /tmp/runtime; /tmp/runtime/bin/pip install /wheels/*.whl; /tmp/runtime/bin/python /check_engine_wheel.py "$EXPECTED_VERSION" /scheduler'
+          done
 
       - name: Upload tested wheel
         uses: actions/upload-artifact@v4

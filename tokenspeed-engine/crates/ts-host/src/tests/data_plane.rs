@@ -34,7 +34,7 @@ mod cpu_benchmark;
 mod result_buffers;
 
 /// Start the interpreter once per test process, with the scheduler
-/// module built in and the repository's `tokenspeed_scheduler` package
+/// module loaded and the repository's `tokenspeed_scheduler` package
 /// importable.
 fn interpreter() {
     static START: Once = Once::new();
@@ -42,10 +42,15 @@ fn interpreter() {
         // The test binary is not in a Python prefix; point at the one the
         // crate was built against.
         std::env::set_var("PYTHONHOME", env!("TS_HOST_TEST_PYTHONHOME"));
-        ts_scheduler::register_builtin_module();
         Python::initialize();
         Python::attach(|py| {
-            ts_scheduler::alias_builtin_module(py).unwrap();
+            let module = ts_scheduler::python_module(py).unwrap();
+            py.import("sys")
+                .unwrap()
+                .getattr("modules")
+                .unwrap()
+                .set_item("tokenspeed_scheduler.tokenspeed_scheduler_ext", module)
+                .unwrap();
             let package_dir = concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../../tokenspeed-scheduler/python"

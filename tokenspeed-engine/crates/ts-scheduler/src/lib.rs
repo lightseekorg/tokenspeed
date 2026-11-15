@@ -18,12 +18,11 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! The C++ scheduler for a binary that embeds the Python data plane.
+//! The C++ scheduler shared by the native host and Python data plane.
 //!
-//! The scheduler core and its nanobind module are compiled into the binary.
-//! [`register_builtin_module`] makes the module a built-in of the embedded
-//! interpreter, so the data plane's `import tokenspeed_scheduler` resolves to
-//! this build: an [`ExecutionPlan`] the control thread gets from the
+//! The scheduler core and its nanobind module are compiled into the host.
+//! [`python_module`] imports that module into the running interpreter, so
+//! the data plane and Rust use the same build: an [`ExecutionPlan`] the control thread gets from the
 //! scheduler is the same C++ type the Python side reads, and crosses over by
 //! moving into a Python object ([`ExecutionPlan::into_python`]).
 //!
@@ -542,41 +541,42 @@ extern "C" {
     fn ts_scheduler_plan_into_python(plan: *mut ffi::ExecutionPlan) -> *mut pyffi::PyObject;
 }
 
-/// The built-in module's name; the package imports it as a submodule.
-const MODULE_NAME: &str = "tokenspeed_scheduler_ext";
-const PACKAGE_MODULE_NAME: &str = "tokenspeed_scheduler.tokenspeed_scheduler_ext";
-
-/// Register the scheduler's module as a built-in of the interpreter this
-/// process is about to start.
+/// Import the scheduler linked into the host, once per interpreter.
 ///
-/// # Panics
-///
-/// If the interpreter is already running: built-ins are fixed at start.
-pub fn register_builtin_module() {
-    // SAFETY: plain reads of interpreter state; registration only touches the
-    // inittab, which is valid before initialization.
-    unsafe {
-        assert_eq!(
-            pyffi::Py_IsInitialized(),
-            0,
-            "register the scheduler module before the interpreter starts"
-        );
-        let status = pyffi::PyImport_AppendInittab(
-            c"tokenspeed_scheduler_ext".as_ptr(),
-            Some(PyInit_tokenspeed_scheduler_ext),
-        );
-        assert_eq!(status, 0, "PyImport_AppendInittab failed");
+/// nanobind uses multi-phase initialization. The same module owns the Python
+/// types and the C++ objects driven by the Rust control loop.
+pub fn python_module(py: Python<'_>) -> PyResult<Bound<'_, pyo3::types::PyModule>> {
+    const NAME: &str = "tokenspeed_engine._scheduler";
+    let modules = py.import("sys")?.getattr("modules")?;
+    if modules.contains(NAME)? {
+        return Ok(modules.get_item(NAME)?.cast_into()?);
     }
-}
-
-/// Make `import tokenspeed_scheduler` use the built-in module rather than
-/// any compiled copy on `sys.path`. Call once, right after the interpreter
-/// starts and before anything imports the package.
-pub fn alias_builtin_module(py: Python<'_>) -> PyResult<()> {
-    let module = py.import(MODULE_NAME)?;
-    py.import("sys")?
-        .getattr("modules")?
-        .set_item(PACKAGE_MODULE_NAME, module)
+    let spec = py
+        .import("importlib.util")?
+        .call_method1("spec_from_loader", (NAME, py.None()))?;
+    // SAFETY: the GIL is held. nanobind >=2.13 returns a static PyModuleDef,
+    // and FromDefAndSpec2 returns a new module reference owned by Bound.
+    let module = unsafe {
+        let definition = PyInit_tokenspeed_scheduler_ext().cast::<pyffi::PyModuleDef>();
+        if definition.is_null() {
+            return Err(PyErr::fetch(py));
+        }
+        let api = if cfg!(feature = "abi3") {
+            3
+        } else {
+            pyffi::PYTHON_API_VERSION
+        };
+        let module = Bound::from_owned_ptr_or_err(
+            py,
+            pyffi::PyModule_FromDefAndSpec2(definition, spec.as_ptr(), api),
+        )?;
+        if pyffi::PyModule_ExecDef(module.as_ptr(), definition) != 0 {
+            return Err(PyErr::fetch(py));
+        }
+        module.cast_into::<pyo3::types::PyModule>()?
+    };
+    modules.set_item(NAME, &module)?;
+    Ok(module)
 }
 
 /// A scheduler owned by a Python `tokenspeed_scheduler.Scheduler` object and
