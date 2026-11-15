@@ -29,7 +29,6 @@ from tokenspeed_kernel.ops.attention.dsa._triton.index_candidates import (
     compact_index_pages,
 )
 from tokenspeed_kernel.ops.attention.dsv41.triton import pack_index_queries
-from tokenspeed_kernel.ops.kvcache.index_k_scale import index_k_scale_dtype
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
@@ -383,13 +382,12 @@ def _check_index_k_rows(
             f"[{workspace_rows}, {head_dim}] as uint8 or float8_e4m3fn, got "
             f"{index_k_fp8.dtype} {tuple(index_k_fp8.shape)}"
         )
-    scale_dtype = index_k_scale_dtype()
-    if index_k_scale.dtype != scale_dtype or index_k_scale.shape != (
-        workspace_rows,
-        groups,
-    ):
+    if index_k_scale.dtype not in (
+        torch.float32,
+        torch.int32,
+    ) or index_k_scale.shape != (workspace_rows, groups):
         raise ValueError(
-            f"index_k_scale holds {scale_dtype} scale words [workspace_rows, "
+            "index_k_scale holds fp32 scales or int32 UE8M0 words [workspace_rows, "
             f"head_dim / {_INDEX_K_FP8_GROUP_SIZE}] = [{workspace_rows}, {groups}], "
             f"got {index_k_scale.dtype} {tuple(index_k_scale.shape)}"
         )

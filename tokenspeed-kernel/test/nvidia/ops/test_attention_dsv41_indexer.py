@@ -1201,7 +1201,7 @@ def test_sparse_metadata_reuse_across_streams_and_graph_replay(monkeypatch):
 
 def test_full_metadata_reuses_schedule_and_refreshes_live_inputs(monkeypatch):
     queries, weights, cache, table, lengths, _, api = _sparse_inputs(4, 128, False)
-    head_weights = (weights.float(), -weights.float())
+    head_weights = (weights.to(torch.bfloat16), -weights.to(torch.bfloat16))
     capacity = table.shape[1] * 64
     schedule = Mock(wraps=api.get_paged_mqa_logits_metadata)
     monkeypatch.setattr(api, "get_paged_mqa_logits_metadata", schedule)

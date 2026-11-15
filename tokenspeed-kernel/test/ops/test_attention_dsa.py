@@ -46,6 +46,7 @@ from tokenspeed_kernel.ops.attention.dsv4._triton.dcp import (
 from tokenspeed_kernel.ops.kvcache.index_k_scale import (
     encode_index_k_scale,
     index_k_scale_dtype,
+    index_k_scale_ue8m0,
     round_index_k_scale,
 )
 from tokenspeed_kernel.ops.quantization import quantize_fp8
@@ -821,7 +822,7 @@ def test_dsa_fp8_logits_empty_tiles_graph_replay(device, explicit_rows, page_siz
         _dsa_decode_logits_fp8_kernel[(rows, (width + 63) // 64)](
             q,
             packed.view(torch.float8_e4m3fn),
-            packed.view(torch.float32),
+            packed.view(torch.int32),
             weights,
             lengths,
             table,
@@ -838,6 +839,7 @@ def test_dsa_fp8_logits_empty_tiles_graph_replay(device, explicit_rows, page_siz
             max_seq_len=width,
             num_heads=heads,
             head_dim=dim,
+            UE8M0=index_k_scale_ue8m0(),
             num_groups=1,
             softmax_scale=0.1,
             q_len_per_req=2,

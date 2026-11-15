@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import os
+from collections.abc import Callable
 
 import torch
 from tokenspeed_kernel._optional import has_optional_package, has_trtllm_kernel
@@ -368,9 +369,26 @@ def _resolve_prefill_tile_max_seqlen_k(
 _MX_SCORING = platform.is_blackwell
 _HAS_DEEP_GEMM = platform.is_hopper_plus and has_optional_package("deep_gemm")
 
-# Unit query scales, grown on demand; earlier buffers stay alive for graphs
-# captured over them.
+# The head weights the platform's MQA logits take: BF16 on sm100, FP32 on sm90.
+_MQA_WEIGHTS_DTYPE = torch.bfloat16 if _MX_SCORING else torch.float32
+
+# Constant sm100 inputs, grown on demand and never freed: graphs captured over
+# an earlier buffer keep replaying from it.
 _unit_query_scales: dict[torch.device, list[torch.Tensor]] = {}
+_request_row_ids: dict[torch.device, list[torch.Tensor]] = {}
+
+
+def _grown_constant(
+    cache: dict[torch.device, list[torch.Tensor]],
+    device: torch.device,
+    numel: int,
+    make: Callable[[int], torch.Tensor],
+) -> torch.Tensor:
+    buffers = cache.setdefault(device, [])
+    if not buffers or buffers[-1].numel() < numel:
+        size = max(numel, 2 * buffers[-1].numel() if buffers else 0)
+        buffers.append(make(size))
+    return buffers[-1][:numel]
 
 
 def _query_scales(q_fp8: torch.Tensor) -> torch.Tensor | None:
@@ -378,18 +396,15 @@ def _query_scales(q_fp8: torch.Tensor) -> torch.Tensor | None:
     if not _MX_SCORING:
         return None
     numel = q_fp8.numel() // q_fp8.shape[-1]
-    buffers = _unit_query_scales.setdefault(q_fp8.device, [])
-    if not buffers or buffers[-1].numel() < numel:
-        size = max(numel, 2 * buffers[-1].numel() if buffers else 0)
-        buffers.append(
-            torch.full((size,), UNIT_UE8M0_X4, dtype=torch.int32, device=q_fp8.device)
-        )
-    return buffers[-1][:numel].view(q_fp8.shape[:-1])
-
-
-def _mqa_weights(weights: torch.Tensor) -> torch.Tensor:
-    """The folded head weights as the platform's MQA logits take them."""
-    return weights.to(torch.bfloat16) if _MX_SCORING else weights
+    words = _grown_constant(
+        _unit_query_scales,
+        q_fp8.device,
+        numel,
+        lambda size: torch.full(
+            (size,), UNIT_UE8M0_X4, dtype=torch.int32, device=q_fp8.device
+        ),
+    )
+    return words.view(q_fp8.shape[:-1])
 
 
 def _request_rows(rows: int, device: torch.device) -> torch.Tensor | None:
@@ -401,7 +416,12 @@ def _request_rows(rows: int, device: torch.device) -> torch.Tensor | None:
     """
     if not _MX_SCORING:
         return None
-    return torch.arange(rows, device=device, dtype=torch.int32)
+    return _grown_constant(
+        _request_row_ids,
+        device,
+        rows,
+        lambda size: torch.arange(size, dtype=torch.int32, device=device),
+    )
 
 
 def _fp32_logits(logits: torch.Tensor) -> torch.Tensor:
@@ -566,7 +586,9 @@ if _HAS_DEEP_GEMM:
         )
 
         q, weights = _pad_index_heads(q, weights)
-        q_fp8, scaled_weights = quantize_index_query_weights(q, weights, softmax_scale)
+        q_fp8, scaled_weights = quantize_index_query_weights(
+            q, weights, softmax_scale, _MQA_WEIGHTS_DTYPE
+        )
 
         kv_cache = index_k_cache.view(
             -1,
@@ -597,7 +619,7 @@ if _HAS_DEEP_GEMM:
         logits = deep_gemm.fp8_fp4_paged_mqa_logits(
             (q_fp8, _query_scales(q_fp8)),
             kv_cache,
-            _mqa_weights(scaled_weights),
+            scaled_weights,
             seq_lens_2d,
             logits_block_table,
             plan,
@@ -729,7 +751,9 @@ if _HAS_DEEP_GEMM:
         out.fill_(-1)
 
         q, weights = _pad_index_heads(q, weights)
-        q_fp8, scaled_weights = quantize_index_query_weights(q, weights, softmax_scale)
+        q_fp8, scaled_weights = quantize_index_query_weights(
+            q, weights, softmax_scale, _MQA_WEIGHTS_DTYPE
+        )
         if index_k_fp8 is None or index_k_scale is None:
             hd = q.shape[-1]
             num_groups = hd // 128
@@ -796,7 +820,7 @@ if _HAS_DEEP_GEMM:
             logits = deep_gemm.fp8_fp4_mqa_logits(
                 (tile_q, _query_scales(tile_q)),
                 kv_fp8,
-                _mqa_weights(scaled_weights[start:end].contiguous()),
+                scaled_weights[start:end].contiguous(),
                 row_starts[start:end],
                 row_ends[start:end],
                 max_seqlen_k=max(tile_max_seqlen_k, 1),
@@ -886,7 +910,9 @@ if _HAS_DEEP_GEMM:
             # Compacted once per forward, shared by every tile and layer.
             pages, positions, lengths = pages.pages, pages.positions, pages.lengths
         q, weights = _pad_index_heads(q.contiguous(), weights)
-        q_fp8, weights = quantize_index_query_weights(q, weights, softmax_scale)
+        q_fp8, weights = quantize_index_query_weights(
+            q, weights, softmax_scale, _MQA_WEIGHTS_DTYPE
+        )
         if deep_gemm.get_pdl() != pdl_enabled():
             deep_gemm.set_pdl(pdl_enabled())
         # DeepGEMM's scheduler requires nonempty work even when this rank
@@ -901,7 +927,7 @@ if _HAS_DEEP_GEMM:
         logits = deep_gemm.fp8_fp4_paged_mqa_logits(
             (q_fp8, _query_scales(q_fp8)),
             index_k_cache.view(-1, page_size, 1, index_k_cache.shape[-1]),
-            _mqa_weights(weights),
+            weights,
             scoring_lengths,
             pages,
             plan,

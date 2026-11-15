@@ -117,8 +117,10 @@ def _reference_logits(q_fp8, folded, seq_lens, table, cache, q_len):
     """Scrubbed FP32 reference logits ``[tokens, block-table capacity]``.
 
     Each row's head-weighted ReLU scores of its E4M3 query against the
-    dequantized keys of its request's pages, NaN and +inf scrubbed to -inf in
-    the causal window as the scoring leaves do.
+    dequantized keys of its request's pages: exact dot products, then the
+    head weighting and reduction in FP32 so an overflowing head weight turns
+    +inf as in the kernels, and NaN and +inf scrubbed to -inf in the causal
+    window as the scoring leaves do.
     """
     keys, words = _planes(cache)
     scales = decode_index_k_scale(words.contiguous())
@@ -131,8 +133,8 @@ def _reference_logits(q_fp8, folded, seq_lens, table, cache, q_len):
     for row in range(q_fp8.shape[0]):
         pages = table[row // q_len].long()
         slots = (pages[:, None] * PAGE + offsets).reshape(-1)
-        scores = torch.relu(q_fp8[row].double() @ k[slots].T)
-        logits[row] = (folded[row].double() @ scores).float()
+        scores = torch.relu(q_fp8[row].double() @ k[slots].T).float()
+        logits[row] = (folded[row].float()[:, None] * scores).sum(0)
     dsa_triton_topk.scrub_nonfinite_logits(logits, seq_lens, next_n=q_len)
     return logits
 

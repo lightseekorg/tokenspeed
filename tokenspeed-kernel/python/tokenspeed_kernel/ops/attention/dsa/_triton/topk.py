@@ -512,7 +512,7 @@ def _quantize_index_query_heads(
     w = tl.load(weights_ptr + row * weights_row_stride + head, mask=head_mask)
     tl.store(
         weights_out_ptr + row * heads + head,
-        w.to(tl.float32) * y_s * softmax_scale,
+        (w.to(tl.float32) * y_s * softmax_scale).to(weights_out_ptr.dtype.element_ty),
         mask=head_mask,
     )
 
@@ -552,7 +552,10 @@ def _quantize_index_query_weights_kernel(
 
 
 def _quantize_index_query_weights_args(
-    q: torch.Tensor, weights: torch.Tensor, softmax_scale: float
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    softmax_scale: float,
+    weights_dtype: torch.dtype = torch.float32,
 ) -> tuple[tuple, torch.Tensor, torch.Tensor]:
     """Validate :func:`quantize_index_query_weights`' inputs (same arguments).
 
@@ -564,10 +567,12 @@ def _quantize_index_query_weights_args(
         raise ValueError("expects [tokens, heads, 128] queries and unit-stride rows")
     if weights.shape != (tokens, heads):
         raise ValueError(f"weights must have shape {(tokens, heads)}")
+    if weights_dtype not in (torch.float32, torch.bfloat16):
+        raise ValueError(f"folded weights are float32 or bfloat16, got {weights_dtype}")
     q_fp8 = torch.empty(
         (tokens, heads, dim), dtype=torch.float8_e4m3fn, device=q.device
     )
-    folded = torch.empty((tokens, heads), dtype=torch.float32, device=q.device)
+    folded = torch.empty((tokens, heads), dtype=weights_dtype, device=q.device)
     args = (
         q,
         weights,
@@ -585,7 +590,10 @@ def _quantize_index_query_weights_args(
 
 
 def quantize_index_query_weights(
-    q: torch.Tensor, weights: torch.Tensor, softmax_scale: float
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    softmax_scale: float,
+    weights_dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize index queries to E4M3 with one scale per (token, head) and fold
     that scale and ``softmax_scale`` into the head weights, in one launch.
@@ -597,12 +605,16 @@ def quantize_index_query_weights(
         q: ``[tokens, heads, 128]`` BF16 index queries, unit stride on the last dim.
         weights: ``[tokens, heads]`` head weights, unit stride on the last dim.
         softmax_scale: Constant score scale folded into the weights.
+        weights_dtype: dtype of the combined weights: FP32, or BF16 for the
+            Blackwell DeepGEMM MQA logits, rounded from the FP32 product.
 
     Returns:
         ``[tokens, heads, 128]`` contiguous E4M3 queries and ``[tokens, heads]``
-        contiguous FP32 combined weights.
+        contiguous combined weights in ``weights_dtype``.
     """
-    args, q_fp8, folded = _quantize_index_query_weights_args(q, weights, softmax_scale)
+    args, q_fp8, folded = _quantize_index_query_weights_args(
+        q, weights, softmax_scale, weights_dtype
+    )
     tokens, heads = q.shape[:2]
     if tokens:
         # One head per program while the grid is small, eight once rows fill the GPU.
