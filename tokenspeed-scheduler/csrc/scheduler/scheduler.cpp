@@ -438,6 +438,17 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
         pending_requests.push_back(std::make_unique<Request>(spec, config_.prefix_granularity, config_.role));
     }
 
+    // With prefix caching, every first admission reads the prompt's page
+    // hashes (the request keeps them). Hash them in the round the request
+    // arrives, not in the prefill round, which admits many long prompts at
+    // once. Without it, admission hashes nothing, and neither does this. Only
+    // a batch that passed validation is hashed, so a rejected one stays cheap.
+    if (!config_.disable_prefix_cache) {
+        for (const std::unique_ptr<Request>& request : pending_requests) {
+            request->PromptPrefixHashes();
+        }
+    }
+
     requests_.reserve(requests_.size() + pending_requests.size());
     for (std::size_t i = 0; i < request_specs.size(); ++i) {
         const bool inserted = requests_by_id_.emplace(request_specs[i].request_id, pending_requests[i].get()).second;
