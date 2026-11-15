@@ -422,14 +422,16 @@ def _check_selection(scores, ends, selected):
 @pytest.mark.parametrize("prepare_blocks", [False, True])
 def test_full_score_bf16_producer_masking_and_selection(paged, prepare_blocks):
     queries, weights, cache, table, lengths, _, api = _sparse_inputs(4, 128, True)
-    weights = weights.float().contiguous()
+    weights = weights.to(torch.bfloat16).contiguous()
     capacity = table.shape[1] * 64
     ends = lengths.clamp(0, capacity).to(torch.int32)
     if paged:
         safe_table = table.masked_fill((table < 0) | (table >= cache.shape[0]), 0)
         context_lens = ends[:, None]
+        # Blackwell scores one row per request entry: each row is its own request.
+        rows = torch.arange(4, device="cuda", dtype=torch.int32)
         schedule = api.get_paged_mqa_logits_metadata(
-            context_lens, 64, api.get_num_sms()
+            context_lens, 64, api.get_num_sms(), indices=rows
         )
         reference = api.fp8_fp4_paged_mqa_logits(
             q=(queries[0].view(torch.int8).unsqueeze(1), queries[1].unsqueeze(1)),
@@ -441,8 +443,7 @@ def test_full_score_bf16_producer_masking_and_selection(paged, prepare_blocks):
             block_table=safe_table,
             schedule_meta=schedule,
             max_context_len=capacity,
-            clean_logits=False,
-            logits_dtype=torch.float32,
+            indices=rows,
         )
         scores, actual_ends, blocks = deep_gemm._paged_scores(
             queries,
@@ -467,9 +468,7 @@ def test_full_score_bf16_producer_masking_and_selection(paged, prepare_blocks):
             weights=weights,
             cu_seq_len_k_start=torch.zeros_like(ends),
             cu_seq_len_k_end=ends,
-            clean_logits=False,
             max_seqlen_k=capacity,
-            logits_dtype=torch.float32,
         )
         # Dense scoring masks the MQA logits in place whether or not block
         # candidates follow; select_candidates then reads the same view.
@@ -783,15 +782,16 @@ def test_full_paged_query_tiles_match_with_large_capacity_in_graph(tokens):
         if invalid_first_page:
             table[::3, 0] = -1
             table[1::3, 1] = cache.shape[0]
-        packed_q, packed_weights = pack_index_inputs(q, weights, torch.float32)
+        packed_q, packed_weights = pack_index_inputs(q, weights, torch.bfloat16)
         api = deep_gemm._api(packed_q)
         reference_ends = lengths.clamp(0, 128).to(torch.int32)
         context_lens = reference_ends[:, None]
         safe_table = table[:, :2].masked_fill(
             (table[:, :2] < 0) | (table[:, :2] >= cache.shape[0]), 0
         )
+        rows = torch.arange(tokens, device="cuda", dtype=torch.int32)
         schedule = api.get_paged_mqa_logits_metadata(
-            context_lens, 64, api.get_num_sms()
+            context_lens, 64, api.get_num_sms(), indices=rows
         )
         reference = api.fp8_fp4_paged_mqa_logits(
             q=(
@@ -804,8 +804,7 @@ def test_full_paged_query_tiles_match_with_large_capacity_in_graph(tokens):
             block_table=safe_table,
             schedule_meta=schedule,
             max_context_len=128,
-            clean_logits=False,
-            logits_dtype=torch.float32,
+            indices=rows,
         )
         positions = torch.arange(128, device="cuda")[None, :]
         physical_pages = table[:, :2][:, positions[0] // 64]

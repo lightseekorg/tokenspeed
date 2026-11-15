@@ -885,8 +885,8 @@ def test_deep_gemm_sharded_index_candidates_global_windows(device, degree):
     from tokenspeed_kernel.ops.attention.dsa import dsa_index_candidates
     from tokenspeed_kernel.platform import current_platform
 
-    if not current_platform().is_hopper_plus:
-        pytest.skip("DeepGEMM requires Hopper or newer")
+    if not current_platform().is_hopper:
+        pytest.skip("DeepGEMM DSA scoring requires Hopper")
 
     torch.manual_seed(821)
     page_size, heads, dim, topk = 64, 16, 128, 512
@@ -993,8 +993,8 @@ def test_deep_gemm_index_candidates_graph_and_empty_rows(device, heads):
     )
     from tokenspeed_kernel.platform import current_platform
 
-    if not current_platform().is_hopper_plus:
-        pytest.skip("DeepGEMM requires Hopper or newer")
+    if not current_platform().is_hopper:
+        pytest.skip("DeepGEMM DSA scoring requires Hopper")
     table = torch.tensor(
         [[3, -1, 1, 2], [-1, -1, -1, -1]], dtype=torch.int32, device=device
     )
@@ -1063,8 +1063,8 @@ def test_deep_gemm_index_candidates_empty_shard_large_batch(device, tokens):
     from tokenspeed_kernel.ops.attention.dsa import dsa_index_candidates
     from tokenspeed_kernel.platform import current_platform
 
-    if not current_platform().is_hopper_plus:
-        pytest.skip("DeepGEMM requires Hopper or newer")
+    if not current_platform().is_hopper:
+        pytest.skip("DeepGEMM DSA scoring requires Hopper")
     q = torch.zeros(tokens, 16, 128, device=device, dtype=torch.bfloat16)
     weights = torch.ones(tokens, 16, device=device)
     cache = torch.zeros(64, 132, device=device, dtype=torch.uint8)
@@ -1106,8 +1106,8 @@ def test_deep_gemm_index_candidates_precomputed_pages(device):
     )
     from tokenspeed_kernel.platform import current_platform
 
-    if not torch.cuda.is_available() or not current_platform().is_hopper_plus:
-        pytest.skip("DeepGEMM requires Hopper or newer")
+    if not torch.cuda.is_available() or not current_platform().is_hopper:
+        pytest.skip("DeepGEMM DSA scoring requires Hopper")
     torch.manual_seed(829)
     heads, page_size = 32, 64
     # Scrambled page order, absent pages, partial tails, unknown request, empty row.

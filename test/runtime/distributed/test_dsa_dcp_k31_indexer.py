@@ -725,8 +725,8 @@ def test_k31_dcp_prefill_topk_owned_width_matches_full_width(tmp_path, degree):
         pytest.skip(f"requires {degree} CUDA GPUs")
     from tokenspeed_kernel.platform import current_platform
 
-    if not current_platform().is_hopper_plus:
-        pytest.skip("the DeepGEMM index scorer requires NVIDIA Hopper or newer")
+    if not current_platform().is_hopper:
+        pytest.skip("the DeepGEMM index scorer requires NVIDIA Hopper")
     mp.spawn(
         _owned_width_worker,
         args=(degree, f"file://{tmp_path / 'rendezvous'}"),
@@ -747,8 +747,8 @@ def test_k31_dcp_decode_topk_matches_unsharded(tmp_path, degree, columns):
     from tokenspeed_kernel.platform import current_platform
 
     # ROCm reports gfx950 as capability (9, 5); the scorer needs NVIDIA.
-    if not current_platform().is_hopper_plus:
-        pytest.skip("the DeepGEMM index scorer requires NVIDIA Hopper or newer")
+    if not current_platform().is_hopper:
+        pytest.skip("the DeepGEMM index scorer requires NVIDIA Hopper")
     if (
         columns == _WIDE_COLUMNS
         and torch.cuda.get_device_properties(0).total_memory < 32 << 30
@@ -918,8 +918,8 @@ def test_k31_dcp_prefill_topk_row_owner_matches_replicated(tmp_path, degree):
         pytest.skip(f"requires {degree} CUDA GPUs")
     from tokenspeed_kernel.platform import current_platform
 
-    if not current_platform().is_hopper_plus:
-        pytest.skip("the DeepGEMM index scorer requires NVIDIA Hopper or newer")
+    if not current_platform().is_hopper:
+        pytest.skip("the DeepGEMM index scorer requires NVIDIA Hopper")
     mp.spawn(
         _row_owner_worker,
         args=(degree, f"file://{tmp_path / 'rendezvous'}"),
@@ -1399,8 +1399,8 @@ def test_k31_kvp_prefill_padded_replay_matches_eager(tmp_path, degree):
         pytest.skip(f"requires {degree} CUDA GPUs")
     from tokenspeed_kernel.platform import current_platform
 
-    if not current_platform().is_hopper_plus:
-        pytest.skip("the DeepGEMM index scorer requires NVIDIA Hopper or newer")
+    if not current_platform().is_hopper:
+        pytest.skip("the DeepGEMM index scorer requires NVIDIA Hopper")
     mp.spawn(
         _padded_replay_worker,
         args=(degree, f"file://{tmp_path / 'rendezvous'}"),

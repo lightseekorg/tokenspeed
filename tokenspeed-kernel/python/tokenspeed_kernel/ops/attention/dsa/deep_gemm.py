@@ -104,7 +104,7 @@ def _row_invariant_topk(
 def _widen_logits_rows(logits: torch.Tensor) -> torch.Tensor:
     """Widen a DeepGEMM ``[:, :cols]`` logits slice back to its padded rows.
 
-    DeepGEMM's ``fp8_mqa_logits`` family allocates ``[rows, aligned_cols]``
+    DeepGEMM's ``fp8_fp4_mqa_logits`` family allocates ``[rows, aligned_cols]``
     and returns the slice ``[:, :cols]``, which is non-contiguous whenever
     ``cols < aligned_cols`` and would force a copy inside kernels that
     require compact rows (e.g. the CuTe DSL top-k). When the input is such a
@@ -357,7 +357,10 @@ def _resolve_prefill_tile_max_seqlen_k(
     return int(candidate_lens[start:end].max().item())
 
 
-_HAS_DEEP_GEMM = platform.is_hopper_plus and has_optional_package("deep_gemm")
+# DeepGEMM 2.8.2 scores FP8 index rows with FP32 scales (``fp8_scaled``)
+# on sm90 only; its sm100 MQA logits take block-scaled MX rows, which no
+# in-tree plane holds. Blackwell selects the Triton and CuTe DSL leaves.
+_HAS_DEEP_GEMM = platform.is_hopper and has_optional_package("deep_gemm")
 
 if _HAS_DEEP_GEMM:
     prepare_cuda_toolkit_env()
@@ -415,6 +418,7 @@ if _HAS_DEEP_GEMM:
         solution="deep_gemm",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
+            max_arch_version=ArchVersion(9, 0),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=frozenset({format_signature()}),
@@ -444,6 +448,7 @@ if _HAS_DEEP_GEMM:
         features=_TOPK_FEATURES,
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
+            max_arch_version=ArchVersion(9, 0),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=frozenset(
@@ -542,15 +547,14 @@ if _HAS_DEEP_GEMM:
         )
         if deep_gemm.get_pdl() != pdl_enabled():
             deep_gemm.set_pdl(pdl_enabled())
-        logits = deep_gemm.fp8_paged_mqa_logits(
-            q_fp8.view(tokens, 1, q.shape[1], q.shape[-1]),
+        logits = deep_gemm.fp8_fp4_paged_mqa_logits(
+            (q_fp8.view(tokens, 1, q.shape[1], q.shape[-1]), None),
             kv_cache,
             scaled_weights,
             seq_lens_2d,
             logits_block_table,
             plan,
             max_seq_len,
-            clean_logits=False,
         )
         # Scrubbed compact view; the length-aware CuTe DSL top-k reads it in place.
         logits_full = _prepare_logits_for_topk(logits, seq_lens, next_n=q_len_per_req)
@@ -614,6 +618,7 @@ if _HAS_DEEP_GEMM:
         features=_PREFILL_TOPK_FEATURES,
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
+            max_arch_version=ArchVersion(9, 0),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=frozenset(
@@ -734,13 +739,12 @@ if _HAS_DEEP_GEMM:
             )
             if deep_gemm.get_pdl() != pdl_enabled():
                 deep_gemm.set_pdl(pdl_enabled())
-            logits = deep_gemm.fp8_mqa_logits(
-                q_fp8[start:end].contiguous(),
+            logits = deep_gemm.fp8_fp4_mqa_logits(
+                (q_fp8[start:end].contiguous(), None),
                 kv_fp8,
                 scaled_weights[start:end].contiguous(),
                 row_starts[start:end],
                 row_ends[start:end],
-                clean_logits=False,
                 max_seqlen_k=max(tile_max_seqlen_k, 1),
             )
             logits.nan_to_num_(
@@ -780,7 +784,9 @@ if _HAS_DEEP_GEMM:
         features={INDEX_CANDIDATE_PAGES_FEATURE},
         priority=Priority.PERFORMANT,
         capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(9, 0), vendors=frozenset({"nvidia"})
+            min_arch_version=ArchVersion(9, 0),
+            max_arch_version=ArchVersion(9, 0),
+            vendors=frozenset({"nvidia"}),
         ),
         signatures=frozenset(
             {
@@ -835,15 +841,14 @@ if _HAS_DEEP_GEMM:
         plan = deep_gemm.get_paged_mqa_logits_metadata(
             scoring_lengths, page_size, deep_gemm.get_num_sms()
         )
-        logits = deep_gemm.fp8_paged_mqa_logits(
-            q_fp8.view(q.shape[0], 1, q.shape[1], q.shape[2]),
+        logits = deep_gemm.fp8_fp4_paged_mqa_logits(
+            (q_fp8.view(q.shape[0], 1, q.shape[1], q.shape[2]), None),
             index_k_cache.view(-1, page_size, 1, index_k_cache.shape[-1]),
             weights,
             scoring_lengths,
             pages,
             plan,
             pages.shape[1] * page_size,
-            clean_logits=False,
         )
         return _select_dcp_index_candidates(
             logits,

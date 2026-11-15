@@ -224,7 +224,9 @@ and its scale view must preserve the plane's storage offset. The packed FP8
 row above is the plane's tensor shape; in memory each page stores the key
 bytes of all its slots first, then their FP32 scales.
 
-The in-tree DeepGEMM, Triton, and Gluon leaves score `fp8_scaled` planes. A
+The in-tree DeepGEMM, Triton, and Gluon leaves score `fp8_scaled` planes;
+the DeepGEMM ones register on sm90 only, as DeepGEMM 2.8.2's sm100 MQA
+logits take block-scaled MX rows, which no in-tree plane holds. A
 leaf scoring the checkpoint's bf16 keys registers `index_k_format={"bf16"}`
 and `index_k_layout={"packed"}`, so a bf16 plane selects it and nothing else.
 A leaf that must reproduce an RL trainer's selection order also declares the

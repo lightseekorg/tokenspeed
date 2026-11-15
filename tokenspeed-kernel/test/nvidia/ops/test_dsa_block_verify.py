@@ -28,12 +28,16 @@ from ops.test_attention_dsa import _pack_index_k_cache
 from tokenspeed_kernel.numerics.torch.attention.dsa import torch_dsa_sparse_attention
 from tokenspeed_kernel.ops.attention.dsa import dsa_decode, dsa_decode_topk, dsa_plan
 
-pytestmark = pytest.mark.skipif(
+requires_blackwell = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
     reason="requires Blackwell",
 )
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9,
+    reason="DeepGEMM DSA scoring requires Hopper",
+)
 @pytest.mark.parametrize("width", [7, 8])
 def test_deep_gemm_block_verify_matches_expanded_queries(width):
     torch.manual_seed(91)
@@ -103,6 +107,7 @@ def test_deep_gemm_block_verify_matches_expanded_queries(width):
     check(captured, run(False))
 
 
+@requires_blackwell
 @pytest.mark.parametrize("width", [7, 8])
 @pytest.mark.parametrize("solution", ["flashinfer_trtllm", "triton"])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])

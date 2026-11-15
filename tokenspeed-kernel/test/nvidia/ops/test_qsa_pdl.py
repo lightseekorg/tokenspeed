@@ -784,6 +784,8 @@ def test_dsa_persistent_decode_preserves_global_pdl(
         pytest.importorskip(package)
     from tokenspeed_kernel.ops.attention.dsa import deep_gemm as dsa
 
+    if not dsa._HAS_DEEP_GEMM:
+        pytest.skip("DeepGEMM DSA scoring requires Hopper")
     if not has_ragged_decode_topk():
         pytest.skip("CUDA persistent top-k is unavailable")
     # Exercise the supported TS_DSA_DECODE_TOPK_CUTEDSL=0 configuration.
