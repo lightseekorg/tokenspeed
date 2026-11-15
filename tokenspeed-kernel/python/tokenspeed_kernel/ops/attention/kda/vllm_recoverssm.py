@@ -303,6 +303,132 @@ def vllm_triton_kda_recoverssm_commit(
 __all__ = ["vllm_triton_kda_recoverssm_commit", "vllm_triton_kda_recoverssm_verify"]
 
 
+def check_batched_commit(
+    descriptors: torch.Tensor,
+    group_indices: torch.Tensor,
+    read_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    accepted_length: torch.Tensor,
+    *,
+    draft_token_num: int,
+    head_dim: int,
+    conv_width: int,
+    record_metadata: torch.Tensor | None,
+    record_stamps: torch.Tensor | None,
+    state_dtype: torch.dtype,
+) -> bool:
+    """Check a batched commit's inputs as ``batched_recoverssm_commit`` documents them.
+
+    Returns:
+        False for an empty batch (nothing to commit), True otherwise.
+
+    Raises:
+        ValueError or TypeError for inputs outside the contract.
+    """
+    if head_dim != 128 or conv_width != 4:
+        raise ValueError("batched KDA commit requires head_dim=128 and conv_width=4")
+    layers = descriptors.shape[0]
+    if descriptors.shape != (layers, 10) or not descriptors.is_contiguous():
+        raise ValueError("descriptors must be a contiguous [layers, 10] pointer table")
+    if group_indices.shape != (layers,) or not group_indices.is_contiguous():
+        raise ValueError("group_indices must be a contiguous per-layer vector")
+    batch = accepted_length.numel()
+    if (
+        accepted_length.shape != (batch,)
+        or read_indices.ndim != 2
+        or read_indices.shape[1] != batch
+        or (write_indices.shape != read_indices.shape)
+        or any(
+            (
+                not tensor.is_contiguous()
+                for tensor in (accepted_length, read_indices, write_indices)
+            )
+        )
+    ):
+        raise ValueError(
+            "commit metadata must be contiguous [groups, batch] and [batch]"
+        )
+    if not batch:
+        return False
+    if (record_metadata is None) != (record_stamps is None):
+        raise ValueError("record metadata and stamps must be supplied together")
+    capacity = draft_token_num if record_stamps is None else record_stamps.shape[2]
+    slots = batch if record_stamps is None else record_stamps.shape[1]
+    if record_metadata is not None:
+        if record_metadata.shape != (batch, 3) or record_stamps.shape != (
+            layers,
+            slots,
+            capacity,
+            2,
+        ):
+            raise ValueError(
+                "batched replay metadata needs [batch, 3] and stamps [layers, slots, capacity, 2]"
+            )
+        if capacity < draft_token_num:
+            raise ValueError("record capacity must cover the candidate window")
+        if any(
+            (
+                x.dtype != torch.int64
+                or not x.is_contiguous()
+                or x.device != descriptors.device
+                for x in (record_metadata, record_stamps)
+            )
+        ):
+            raise ValueError(
+                "record metadata must be contiguous INT64 on the descriptor device"
+            )
+    if state_dtype not in (torch.float32, torch.bfloat16):
+        raise TypeError(f"batched KDA replay does not support {state_dtype} state")
+    return True
+
+
+def commit_kda_conv_windows(
+    descriptors: torch.Tensor,
+    group_indices: torch.Tensor,
+    read_indices: torch.Tensor,
+    write_indices: torch.Tensor,
+    accepted_length: torch.Tensor,
+    *,
+    activation_dtype: torch.dtype,
+    conv_state_dtype: torch.dtype,
+    draft_token_num: int,
+    num_heads: int,
+    head_dim: int,
+    qkv_stride: int,
+    conv_stride: int,
+) -> None:
+    """Commit every layer's accepted convolution window.
+
+    This is the history half of the batched commit.
+    """
+    from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
+        batched_kda_commit_conv_window_kernel,
+    )
+
+    layers = descriptors.shape[0]
+    batch = accepted_length.numel()
+    activation_typed = torch.empty(0, dtype=activation_dtype, device=descriptors.device)
+    conv_typed = torch.empty(0, dtype=conv_state_dtype, device=descriptors.device)
+    batched_kda_commit_conv_window_kernel[
+        layers, batch, triton.cdiv(3 * num_heads * head_dim, 128)
+    ](
+        descriptors,
+        activation_typed,
+        conv_typed,
+        group_indices,
+        read_indices,
+        write_indices,
+        accepted_length,
+        batch,
+        T=draft_token_num,
+        STRIDE_QKV=qkv_stride,
+        STRIDE_CONV=conv_stride,
+        CONV_DIM=3 * num_heads * head_dim,
+        BLOCK=128,
+        num_warps=1,
+    )
+
+
 def batched_recoverssm_commit(
     descriptors: torch.Tensor,
     group_indices: torch.Tensor,
@@ -328,8 +454,8 @@ def batched_recoverssm_commit(
 ) -> None:
     """Recover all layers from request-major raw records and commit conv.
 
-    Descriptors retain the runtime's ten-column layout. Columns 0, 2 and 8
-    hold raw QKV, conv state and recurrent state. Columns 3 and 5 hold
+    Descriptors retain the runtime's ten-column layout. Columns 0, 2, and 8
+    hold raw QKV, conv state, and recurrent state. Columns 3 and 5 hold
     correction and key/gate records. Raw records also use columns 6 and 7
     for FP32 A_log and dt_bias. Other columns are unused here
     but retained for the shared descriptor ABI. All strides count elements;
@@ -363,64 +489,24 @@ def batched_recoverssm_commit(
     accepted lengths remain GPU inputs. Selection is fixed during graph capture.
     Return None after recurrent and convolution commits on the caller stream.
     """
-    from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
-        batched_kda_commit_conv_window_kernel,
-    )
-
-    if head_dim != 128 or conv_width != 4:
-        raise ValueError("batched KDA commit requires head_dim=128 and conv_width=4")
-    layers = descriptors.shape[0]
-    if descriptors.shape != (layers, 10) or not descriptors.is_contiguous():
-        raise ValueError("descriptors must be a contiguous [layers, 10] pointer table")
-    if group_indices.shape != (layers,) or not group_indices.is_contiguous():
-        raise ValueError("group_indices must be a contiguous per-layer vector")
-    batch = accepted_length.numel()
-    if (
-        accepted_length.shape != (batch,)
-        or read_indices.ndim != 2
-        or read_indices.shape[1] != batch
-        or (write_indices.shape != read_indices.shape)
-        or any(
-            (
-                not tensor.is_contiguous()
-                for tensor in (accepted_length, read_indices, write_indices)
-            )
-        )
+    if not check_batched_commit(
+        descriptors,
+        group_indices,
+        read_indices,
+        write_indices,
+        accepted_length,
+        draft_token_num=draft_token_num,
+        head_dim=head_dim,
+        conv_width=conv_width,
+        record_metadata=record_metadata,
+        record_stamps=record_stamps,
+        state_dtype=state_dtype,
     ):
-        raise ValueError(
-            "commit metadata must be contiguous [groups, batch] and [batch]"
-        )
-    if not batch:
         return
-    if (record_metadata is None) != (record_stamps is None):
-        raise ValueError("record metadata and stamps must be supplied together")
+    layers = descriptors.shape[0]
+    batch = accepted_length.numel()
     capacity = draft_token_num if record_stamps is None else record_stamps.shape[2]
     slots = batch if record_stamps is None else record_stamps.shape[1]
-    if record_metadata is not None:
-        if record_metadata.shape != (batch, 3) or record_stamps.shape != (
-            layers,
-            slots,
-            capacity,
-            2,
-        ):
-            raise ValueError(
-                "batched replay metadata needs [batch, 3] and stamps [layers, slots, capacity, 2]"
-            )
-        if capacity < draft_token_num:
-            raise ValueError("record capacity must cover the candidate window")
-        if any(
-            (
-                x.dtype != torch.int64
-                or not x.is_contiguous()
-                or x.device != descriptors.device
-                for x in (record_metadata, record_stamps)
-            )
-        ):
-            raise ValueError(
-                "record metadata must be contiguous INT64 on the descriptor device"
-            )
-    if state_dtype not in (torch.float32, torch.bfloat16):
-        raise TypeError(f"batched KDA replay does not support {state_dtype} state")
     grid = lambda meta: (triton.cdiv(head_dim, meta["BV"]), batch, layers * num_heads)
     typed = torch.empty(0, dtype=torch.float32, device=descriptors.device)
     # The kernel types each described state page from this reference; it loads
@@ -481,24 +567,19 @@ def batched_recoverssm_commit(
         sanitize_overflow=False,
         num_stages=2,
     )
-    conv_typed = torch.empty(0, dtype=conv_state_dtype, device=descriptors.device)
-    batched_kda_commit_conv_window_kernel[
-        layers, batch, triton.cdiv(3 * num_heads * head_dim, 128)
-    ](
+    commit_kda_conv_windows(
         descriptors,
-        activation_typed,
-        conv_typed,
         group_indices,
         read_indices,
         write_indices,
         accepted_length,
-        batch,
-        T=draft_token_num,
-        STRIDE_QKV=qkv_stride,
-        STRIDE_CONV=conv_stride,
-        CONV_DIM=3 * num_heads * head_dim,
-        BLOCK=128,
-        num_warps=1,
+        activation_dtype=activation_dtype,
+        conv_state_dtype=conv_state_dtype,
+        draft_token_num=draft_token_num,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        qkv_stride=qkv_stride,
+        conv_stride=conv_stride,
     )
 
 

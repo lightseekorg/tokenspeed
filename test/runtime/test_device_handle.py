@@ -83,7 +83,13 @@ register_cuda_ci(est_time=20, suite="runtime-2gpu")
 
 
 def _execute(handle, plan, planned):
-    return handle.execute(plan, planned, cache_ops=cache_ops_from_plan(plan).device)
+    return handle.execute(
+        plan,
+        planned,
+        cache_ops=cache_ops_from_plan(
+            plan, request_admission={f"r{i}": i for i in range(1, 10)}.__getitem__
+        ).device,
+    )
 
 
 @pytest.mark.parametrize(
@@ -428,6 +434,7 @@ def _planned(*, num_extends, label=None):
         input_logprob_plan=None,
         sampled_top_k=0,
         stop_criteria=(),
+        admission_ids=(1,),
     )
 
 
@@ -1419,7 +1426,7 @@ def test_device_consumes_the_explicit_snapshot_without_reading_plan_cache():
             return ()
 
     plan = Plan()
-    prepared = cache_ops_from_plan(plan)
+    prepared = cache_ops_from_plan(plan, request_admission={}.__getitem__)
     trace = []
     handle = _handle(trace)
     handle.execute(plan, None, cache_ops=prepared.device)
@@ -1480,12 +1487,16 @@ class _SleepDeviceModule:
     def synchronize(self) -> None:
         self._trace.append("device.synchronize")
 
+    def empty_cache(self) -> None:
+        self._trace.append("device.empty_cache")
+
 
 class _SleepExecutor:
     """Only what the release/wake operations read off the executor."""
 
     def __init__(self, trace) -> None:
         self.device = "cpu"
+        self.config = SimpleNamespace(enforce_eager=False)
         self.device_module = _SleepDeviceModule(trace)
         self.token_to_kv_pool = _SleepPool(trace)
 
@@ -1549,7 +1560,19 @@ def test_kv_release_without_a_peer_only_quiesces_and_repairs():
     ]
 
 
-def test_nccl_suspend_and_resume_reach_the_communicators(monkeypatch):
+@pytest.mark.parametrize(
+    "device_type,enforce_eager,hip",
+    [
+        ("cpu", False, None),
+        ("cuda", False, None),
+        ("cuda", True, None),
+        ("cuda", False, "6.4"),
+        ("cuda", True, "6.4"),
+    ],
+)
+def test_nccl_suspend_and_resume_reach_the_communicators(
+    monkeypatch, device_type, enforce_eager, hip
+):
     from tokenspeed.runtime.execution import device as device_module
 
     trace = []
@@ -1560,8 +1583,31 @@ def test_nccl_suspend_and_resume_reach_the_communicators(monkeypatch):
         device_module, "resume_nccl_communicators", lambda: trace.append("resume")
     )
     handle = DeviceHandle(_SleepExecutor(trace))
+    handle._forward_device = torch.device(device_type)
+    handle._executor.config.enforce_eager = enforce_eager
+    monkeypatch.setattr(torch.version, "hip", hip)
+    monkeypatch.setattr(
+        torch._C,
+        "_cuda_clearCublasWorkspaces",
+        lambda: trace.append("cuBLAS.clear"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        device_module, "trim_cuda_stack", lambda: trace.append("stack.trim") or 2048
+    )
+    monkeypatch.setattr(
+        device_module,
+        "restore_cuda_stack",
+        lambda limit: trace.append(("stack.restore", limit)),
+    )
 
     handle.suspend_nccl()
     handle.resume_nccl()
 
-    assert trace == ["suspend", "resume"]
+    expected = ["device.synchronize", "suspend"]
+    if device_type == "cuda" and enforce_eager:
+        expected += ["device.synchronize", "cuBLAS.clear"]
+    expected.append("device.empty_cache")
+    if device_type == "cuda" and hip is None:
+        expected += ["stack.trim", ("stack.restore", 2048)]
+    assert trace == [*expected, "resume"]

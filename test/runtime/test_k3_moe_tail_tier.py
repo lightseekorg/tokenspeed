@@ -145,16 +145,27 @@ def test_model_prepares_routed_workspace_at_serving_limit(monkeypatch):
         torch.nn.Module.__init__(layer)
         layer.is_moe_layer = True
         layer.block_sparse_moe = moe
+        layer.k3_comm = SimpleNamespace(
+            iris_state=None, prepare_staged_projection=Mock(return_value=True)
+        )
         layers.append(layer)
+    group = tuple(range(8))
     owner = SimpleNamespace(
-        model=SimpleNamespace(layers=layers),
-        mapping=object(),
+        model=SimpleNamespace(layers=layers, iris_states={}),
+        mapping=SimpleNamespace(
+            attn=SimpleNamespace(tp_group=group),
+            moe=SimpleNamespace(tp_ep_group=group),
+        ),
         config=SimpleNamespace(hidden_size=7168, routed_expert_hidden_size=3584),
+        _prepare_decode_chain=Mock(return_value=False),
     )
     monkeypatch.setattr(kimi_k3, "prepare_k3_all_reduce_buffers", lambda **kw: False)
     assert kimi_k3.KimiLinearForCausalLM.prepare_communication_runtime(owner, 32768)
     layers[0].block_sparse_moe.comm.prepare.assert_called_once_with(32768)
     layers[1].block_sparse_moe.comm.prepare.assert_not_called()
+    # Layers share the o-projection staging; the first prepares it.
+    layers[0].k3_comm.prepare_staged_projection.assert_called_once_with(32768)
+    layers[1].k3_comm.prepare_staged_projection.assert_not_called()
 
 
 @pytest.mark.parametrize(
