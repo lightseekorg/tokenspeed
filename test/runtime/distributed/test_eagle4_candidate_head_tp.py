@@ -199,10 +199,12 @@ def test_two_ranks_pick_the_best_of_their_gathered_candidates(tmp_path):
     deadline = time.monotonic() + JOIN_SECONDS
     while not ranks.join(timeout=5):
         if time.monotonic() > deadline:
-            for process in ranks.processes:
+            # One rank at a time, so the two dumps do not interleave.
+            for rank, process in enumerate(ranks.processes):
                 if process.is_alive():
+                    print(f"rank {rank} stacks:", file=sys.stderr, flush=True)
                     os.kill(process.pid, signal.SIGUSR1)
-            time.sleep(5)
+                    time.sleep(5)
             for process in ranks.processes:
                 process.kill()
             peer = torch.cuda.can_device_access_peer(0, 1)
