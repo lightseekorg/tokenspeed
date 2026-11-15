@@ -514,12 +514,24 @@ _K31_VERIFY_BUCKETS = [
     ((1536, 1536), (44, 100)),
 ]
 
+# The K3.1 DSpark drafter's TP8 buckets: its q_a with kv_a at draft-block rows,
+# the MLP down projection, the stacked context kv_a and the context projection.
+_K31_DSPARK_BUCKETS = [
+    ((2112, 7168), (7, 14, 28)),
+    ((7168, 1792), (7, 16, 28)),
+    ((2880, 7168), (14, 32, 56)),
+    ((896, 35840), (7, 16)),
+]
+
 
 @pytest.mark.parametrize(
     "n,k,rows",
-    [pytest.param(n, k, rows, id=f"{n}x{k}") for (n, k), rows in _K31_VERIFY_BUCKETS],
+    [
+        pytest.param(n, k, rows, id=f"{n}x{k}-{rows[0]}")
+        for (n, k), rows in _K31_VERIFY_BUCKETS + _K31_DSPARK_BUCKETS
+    ],
 )
-def test_decode_gemm_k31_verify_buckets(n: int, k: int, rows: tuple[int, ...]) -> None:
+def test_decode_gemm_k31_buckets(n: int, k: int, rows: tuple[int, ...]) -> None:
     torch.manual_seed(0)
     b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
     for m in rows:
