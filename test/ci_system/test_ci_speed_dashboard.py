@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import time
 import urllib.error
 from pathlib import Path
 
@@ -29,6 +30,7 @@ import pytest
 from ci_speed_dashboard import (
     GitHub,
     aggregate,
+    fetch_jobs,
     fetch_missing_jobs,
     flakiness,
     load_cached_jobs,
@@ -272,3 +274,35 @@ def test_a_failing_job_fetch_stops_the_rest_and_the_page_still_renders(
     # already running may each try once).
     assert len(calls) <= 4
     assert build(cache)["workflow_stats"]
+
+
+def test_a_job_list_cut_short_is_not_cached(cache: Path, monkeypatch):
+    gh = GitHub("o/r", "token")
+    pages = {1: {"total_count": 150, "jobs": [{"name": "a"}] * 100}}
+    monkeypatch.setattr(
+        gh, "get", lambda path: pages.get(int(path.rsplit("page=", 1)[1]))
+    )
+    # Page 2 is missing although total_count promises 150 jobs.
+    assert fetch_jobs(gh, 1, 1) is None
+
+
+def test_fetched_count_survives_a_later_failure(cache: Path, monkeypatch):
+    day_file = cache / "runs/nvidia-b200-tests.yml/pr" / f"{NOW.date()}.json"
+    listed = json.loads(day_file.read_text())
+    listed["runs"] += [run(100 + i, 200 - i, 0, "success") for i in range(3)]
+    write_json(day_file, listed)
+    gh = GitHub("o/r", "token")
+    done_job = [job("scan", 10, 10, 9, label="ubuntu-latest")]
+
+    def get(path):
+        if "/101/" in path:
+            # Fail after the other workers have finished their fetches.
+            time.sleep(0.3)
+            raise urllib.error.HTTPError(path, 502, "bad gateway", None, None)
+        return {"total_count": 1, "jobs": done_job}
+
+    monkeypatch.setattr(gh, "get", get)
+    monkeypatch.setattr("ci_speed_dashboard.slim_job", lambda j: j)
+    runs = load_runs(cache, NOW, 14)
+    # Runs 100 and 102 were fetched before run 101 failed.
+    assert fetch_missing_jobs(gh, cache, runs, 10, 0) == 2

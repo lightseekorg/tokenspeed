@@ -390,7 +390,7 @@ body.lang-bi .mix > span[lang="zh"]::before { content: ""; }
       rows.push(["runs", "运行数", String(v[4]), null]);
       o.push('<rect class="hit" x="' + (cx - band / 2) + '" y="' + pt + '" width="' + band + '" height="' + ph + '" data-tip="' + tip([day(i).iso, day(i).iso], rows) + '"/>');
     });
-    markerDays().forEach(function (m) { var x = pl + band * m.i; o.push('<line class="marker" x1="' + x + '" x2="' + x + '" y1="' + pt + '" y2="' + (pt + ph) + '"/><text class="mlab" x="' + (x + 3) + '" y="' + (pt + 9) + '">' + esc(m.label) + "</text>"); });
+    markerDays().forEach(function (m) { var x = pl + band * m.i + band / 2; o.push('<line class="marker" x1="' + x + '" x2="' + x + '" y1="' + pt + '" y2="' + (pt + ph) + '"/><text class="mlab" x="' + (x + 3) + '" y="' + (pt + 9) + '">' + esc(m.label) + "</text>"); });
     o.push('<line class="axis" x1="' + pl + '" x2="' + (w - pr) + '" y1="' + Y(0) + '" y2="' + Y(0) + '"/>');
     o.push('<text class="axt" x="' + (pl + pw / 2) + '" y="' + (h - 6) + '" text-anchor="middle">' + tsp("PR run created (PT day)", "PR 运行创建日（太平洋时间）") + "</text>");
     o.push('<text class="axt" transform="translate(11,' + (pt + ph / 2) + ') rotate(-90)" text-anchor="middle">' + tsp("minutes (median per segment)", "分钟（各段中位数）") + "</text></svg>");

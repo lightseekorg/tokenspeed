@@ -225,6 +225,7 @@ class GitHub:
             },
         )
         for attempt in range(4):
+            wait = 5 * 2**attempt
             try:
                 with urllib.request.urlopen(req, timeout=60) as resp:
                     self.calls += 1
@@ -243,12 +244,20 @@ class GitHub:
                     raise BudgetExhausted() from e
                 if attempt == 3 or e.code not in (403, 429, 500, 502, 503, 504):
                     raise
+                # A secondary rate limit says how long to back off.
+                after = e.headers.get("Retry-After") if e.headers else None
+                if after and after.isdigit():
+                    wait = min(max(wait, int(after)), MAX_RETRY_AFTER)
             except (urllib.error.URLError, TimeoutError):
                 # Connection errors and read timeouts; HTTPError is handled above.
                 if attempt == 3:
                     raise
-            time.sleep(5 * 2**attempt)
+            time.sleep(wait)
         return None
+
+
+# Longest Retry-After wait honored before retrying, in seconds.
+MAX_RETRY_AFTER = 120
 
 
 class BudgetExhausted(Exception):
@@ -397,7 +406,10 @@ def needs_jobs(run: dict) -> bool:
     return not (WF_BY_KEY[run["wf"]].scan_gated and quick and run["run_attempt"] == 1)
 
 
-def fetch_jobs(gh: GitHub, run_id: int, attempt: int) -> list[dict]:
+def fetch_jobs(gh: GitHub, run_id: int, attempt: int) -> list[dict] | None:
+    """The attempt's whole job list, or None when pagination ended before
+    ``total_count`` jobs arrived (a page went missing), so a partial list is
+    never cached."""
     jobs: list[dict] = []
     page = 1
     while True:
@@ -405,12 +417,13 @@ def fetch_jobs(gh: GitHub, run_id: int, attempt: int) -> list[dict]:
             f"actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100&page={page}"
         )
         if r is None:
-            break
+            return None
         jobs += [slim_job(j) for j in r["jobs"]]
-        if len(jobs) >= r["total_count"] or not r["jobs"]:
-            break
+        if len(jobs) >= r["total_count"]:
+            return jobs
+        if not r["jobs"]:
+            return None
         page += 1
-    return jobs
 
 
 def fetch_missing_jobs(
@@ -429,16 +442,19 @@ def fetch_missing_jobs(
             todo.append(((pri, age), r["id"], 1))
     todo.sort()
     todo = todo[:max_new]
-    done = 0
 
     # The first failed fetch stops the rest, so an API outage does not retry
     # every queued run before the page renders from the cache.
     stop = threading.Event()
 
+    # Counted as fetches complete, so a later failure keeps the earlier ones.
+    fetched = [0]
+    lock = threading.Lock()
+
     def work(item):
         _, run_id, attempt = item
         if stop.is_set() or (gh.remaining is not None and gh.remaining < reserve):
-            return False
+            return
         try:
             jobs = fetch_jobs(gh, run_id, attempt)
         except FETCH_ERRORS:
@@ -446,11 +462,12 @@ def fetch_missing_jobs(
             raise
         if jobs and all(j["status"] == "completed" for j in jobs):
             write_json(job_path(cache, run_id, attempt), jobs)
-        return True
+        with lock:
+            fetched[0] += 1
 
     ex = concurrent.futures.ThreadPoolExecutor(4)
     try:
-        done = sum(ex.map(work, todo))
+        list(ex.map(work, todo))
     except FETCH_ERRORS as e:
         print(
             f"job fetch stopped ({e!r}); rendering with the cached data",
@@ -458,7 +475,7 @@ def fetch_missing_jobs(
         )
     finally:
         ex.shutdown(wait=True, cancel_futures=True)
-    return done
+    return fetched[0]
 
 
 def prune_cache(cache: Path, runs: list[dict], now: dt.datetime, days: int) -> int:
@@ -470,6 +487,10 @@ def prune_cache(cache: Path, runs: list[dict], now: dt.datetime, days: int) -> i
         if f.stem < oldest:
             f.unlink()
             removed += 1
+    # Left behind by a write_json interrupted before its rename.
+    for f in cache.rglob("*.tmp"):
+        f.unlink()
+        removed += 1
     keep = {str(r["id"]) for r in runs}
     for f in (cache / "jobs").glob("*.json"):
         if f.stem not in keep:
