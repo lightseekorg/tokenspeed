@@ -198,7 +198,8 @@ pub struct HistorySeeds {
 /// before the seeded tail remain unspecified. A forward seeds its committed
 /// prefix after a prefix-cache hit, a slot handoff, a retracted request's restore into
 /// another slot, or a PD decode landing. Ownership is per admission, not
-/// per request id, which clients may reuse.
+/// per request id, which clients may reuse. Only the request's latest slot
+/// holds its current history; returning to an earlier slot must seed again.
 ///
 /// A model that reads at most `lookback` committed tokens behind the
 /// frontier (an n-gram hash, say) needs only those seeded: a 200K-token
@@ -234,6 +235,12 @@ impl HistoryRows {
                 .state(rid)
                 .ok_or_else(|| CommitError::History(rid.clone()))?;
             let held = self.owners.insert(slot, state.admission) == Some(state.admission);
+            if !held {
+                // An old row becomes stale as this request advances elsewhere.
+                // Forget it on a move, including before a prefix-zero extend.
+                self.owners
+                    .retain(|other_slot, owner| *other_slot == slot || *owner != state.admission);
+            }
             let total = state.prompt_ids.len() + state.output_ids.len();
             let boundary = if i < batch.num_extends {
                 batch.extend_prefix_lens[i].max(0) as usize
@@ -2153,6 +2160,47 @@ mod tests {
         // "a" recovers into slot 1 after "b" used it: reseed its prefix.
         let recovery = rows.seeds(&history_batch(&[("a", 1, 4)], 1), &p).unwrap();
         assert_eq!(recovery.unwrap().prefix_lengths, [4]);
+    }
+
+    #[test]
+    fn a_request_returning_to_an_earlier_slot_reseeds_its_decode_history() {
+        let mut p = processor(None);
+        register_history(&mut p, "a", &[10, 11, 12, 13], &[20, 21]);
+        let mut rows = HistoryRows::new(Some(3));
+        rows.seeds(&history_batch(&[("a", 1, 0)], 1), &p).unwrap();
+        rows.seeds(&history_batch(&[("a", 2, 0)], 0), &p).unwrap();
+        // The request advanced in slot 2 before a second restore returned
+        // it to slot 1. Slot 1 still names it, but holds an older history.
+        p.states.get_mut("a").unwrap().output_ids.extend([22, 23]);
+        let restored = history_batch(&[("a", 1, 0)], 0);
+        assert_eq!(
+            rows.seeds(&restored, &p).unwrap(),
+            Some(HistorySeeds {
+                slots: vec![1],
+                prefix_lengths: vec![7],
+                tokens: vec![vec![20, 21, 22]],
+            })
+        );
+        assert_eq!(rows.seeds(&restored, &p).unwrap(), None);
+    }
+
+    #[test]
+    fn a_request_returning_to_an_earlier_slot_reseeds_its_prefill_history() {
+        let mut p = processor(None);
+        register_history(&mut p, "a", &[10, 11, 12, 13, 14, 15], &[]);
+        let mut rows = HistoryRows::new(Some(3));
+        rows.seeds(&history_batch(&[("a", 1, 0)], 1), &p).unwrap();
+        rows.seeds(&history_batch(&[("a", 2, 2)], 1), &p).unwrap();
+        let restored = history_batch(&[("a", 1, 4)], 1);
+        assert_eq!(
+            rows.seeds(&restored, &p).unwrap(),
+            Some(HistorySeeds {
+                slots: vec![1],
+                prefix_lengths: vec![4],
+                tokens: vec![vec![11, 12, 13]],
+            })
+        );
+        assert_eq!(rows.seeds(&restored, &p).unwrap(), None);
     }
 
     #[test]
