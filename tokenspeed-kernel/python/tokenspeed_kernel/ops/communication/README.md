@@ -12,6 +12,49 @@ a sequence-parallel layer: reduce a rank's share of the rows (plus the few
 rows every rank needs), work on that share, and store the result to every
 rank. Each uses channel 0 of its own buffer's signal pad for its barrier.
 
+## Plain all-reduce through FlashInfer BT
+
+`flashinfer_all_reduce` (`allreduce_fusion.py`, SM103: GB300, B300) runs
+FlashInfer's BT ("owner reduce") protocol without norm or residual: every rank
+publishes each token's row to the token's owner rank, the owner sums the ranks
+in order 0..7 in fp32, rounds once to BF16, and multicasts the sum, so every
+rank holds the rank-ordered fp32 fold. It uses FlashInfer's GB300 TP8 H7168
+presets (the first through 256 rows, the second above), so it is offered for
+8 ranks at width 7168 only.
+
+The workspace all-reduce (`trtllm_workspace_allreduce`) arms it beside the
+mnnvl workspace, at the same row capacity, and sends a plain BF16 reduction
+there when its payload is at least `PLAIN_ALL_REDUCE_MIN_BYTES` (1 MiB) per
+rank; smaller payloads keep the Lamport one-shot and two-shot kernels, which
+sum in BF16. The `fp32_acc` fold and early-release calls (`allreduce_sconv`,
+which relies on the Lamport release point) stay on Lamport too.
+The route reads only terms every rank shares, so a misaligned tensor raises
+rather than sending one rank down the other protocol. Measured on 2
+GB300 nodes (TP8 across one NVLink domain), BF16 [rows, 7168], CUDA graph of
+20 back-to-back calls / with a 256 MB L2 flush before each call, us:
+
+| rows | Lamport one/two-shot | BT | NVLS `ld_reduce` prototype |
+|-----:|---------------------:|---:|---------------------------:|
+| 8    | 5.7 / 5.7            | 6.5 / 8.4   | 11.5 / 13.6 |
+| 64   | 8.4 / 9.2            | 7.9 / 9.2   | 12.7 / 14.2 |
+| 128  | 10.8 / 11.8          | 10.2 / 11.3 | 14.1 / 15.9 |
+| 256  | 18.4 / 19.6          | 15.4 / 15.9 | 18.0 / 20.1 |
+| 512  | 32.0 / 33.8          | 25.0 / 26.0 | 29.1 / 31.5 |
+| 2048 | 106.7 / 107.5        | 83.9 / 83.9 | 90.8 / 96.6 |
+
+The in-switch reduction (`multimem.ld_reduce` into every rank's buffer after a
+cross-rank barrier, results received by polling) was prototyped and lost: its
+barrier and load round trips cost about 6 us before any data moves, and on this
+fabric `.acc::f32` did not give one rounding (14% of sums of exactly
+representable inputs differed from the rounded exact sum). FlashInfer's own
+in-switch protocol (HT, with a hand-picked tuning: FlashInfer publishes no TP8
+H7168 HT preset) also trails BT here, both with the RMSNorm epilogue: 32.6
+against 26.4 us at 512 rows.
+
+The workspace holds about 176 MB of symmetric memory per rank at 2048 rows
+(three Lamport generations of the publish and result mailboxes) and compiles
+its kernels when it is armed, before graph capture.
+
 ## Paged-row all-gather
 
 `cute_dsl_paged_row_all_gather` (SM100 and SM103: GB200, GB300) all-gathers

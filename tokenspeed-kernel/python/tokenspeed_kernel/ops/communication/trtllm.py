@@ -229,6 +229,54 @@ if current_platform().is_nvidia:
         )
         return workspace
 
+    def _try_create_plain_all_reduce(max_token_num: int, hidden_dim: int, group):
+        """Collectively build the BT plain all-reduce; None on every rank otherwise.
+
+        Votes on the local support probe before the collective creation and
+        on its result after it, as the mnnvl workspace does.
+        """
+        from tokenspeed_kernel.ops.communication.allreduce_fusion import (
+            all_reduce_supported,
+            create_all_reduce_workspace,
+        )
+
+        device = torch.device("cuda", torch.cuda.current_device())
+        ok = torch.tensor(
+            [
+                int(
+                    all_reduce_supported(
+                        group=group,
+                        hidden_size=hidden_dim,
+                        max_num_tokens=max_token_num,
+                        dtype=torch.bfloat16,
+                    )
+                )
+            ],
+            dtype=torch.int32,
+            device=device,
+        )
+        dist.all_reduce(ok, op=dist.ReduceOp.MIN, group=group)
+        if ok.item() == 0:
+            return None
+        workspace = None
+        try:
+            workspace = create_all_reduce_workspace(
+                group=group, hidden_size=hidden_dim, max_num_tokens=max_token_num
+            )
+        except Exception as exc:  # noqa: BLE001 - voted on below
+            logger.warning(f"plain BT all-reduce creation failed: {exc!s}")
+        ok = torch.tensor(
+            [int(workspace is not None)], dtype=torch.int32, device=device
+        )
+        dist.all_reduce(ok, op=dist.ReduceOp.MIN, group=group)
+        if ok.item() == 0:
+            return None
+        logger.info(
+            f"Plain BT all-reduce armed: world_size={group.size()!s} "
+            f"max_token_num={max_token_num!s} hidden_dim={hidden_dim!s}"
+        )
+        return workspace
+
     def _group_spans_nodes(group) -> bool:
         """True when the process group spans hosts.
 
@@ -278,6 +326,8 @@ if current_platform().is_nvidia:
             self.workspace_tensor = None
             self.ipc_handles = None
             self.mnnvl_workspace = None
+            # FlashInfer's BT kernels for large plain reductions, beside mnnvl.
+            self.plain_all_reduce = None
             self.world_size = None
             self.rank = None
             self.max_token_num = None
@@ -357,6 +407,11 @@ if current_platform().is_nvidia:
             self.mnnvl_workspace = _try_create_mnnvl_workspace(
                 rank, world_size, max_token_num, hidden_dim, group
             )
+            # Rank-agreed, and its rendezvous proved the group's multicast.
+            if self.mnnvl_workspace is not None:
+                self.plain_all_reduce = _try_create_plain_all_reduce(
+                    self.mnnvl_workspace.max_token_num, hidden_dim, group
+                )
 
             # With IPC skipped, mnnvl is the only workspace; if it failed to
             # arm there is nothing to fuse with -- stay uninitialized so
@@ -407,6 +462,7 @@ if current_platform().is_nvidia:
                     # symm_mem allocations are process-lifetime; dropping the
                     # reference is all we can (and need to) do here.
                     self.mnnvl_workspace = None
+                    self.plain_all_reduce = None
                     self.initialized = False
                     self.world_size = None
                     self.rank = None
@@ -939,13 +995,18 @@ if current_platform().is_nvidia:
                 once (lamport sends -0.0 as +0.0), the rank-ordered fold;
                 these calls take mnnvl where it serves, and the IPC
                 two-shot, which keeps -0.0 sums, never.
-            out: Contiguous destination of the input's shape and dtype;
-                None allocates one.
+            out: Contiguous, 16-byte aligned destination of the input's
+                shape and dtype; None allocates one.
 
         Returns:
             The reduced tensor (``out`` or a new allocation), or ``None`` when
             no workspace is armed for *group* or the shape is not served --
             the caller keeps its own (NCCL) fallback.
+
+        Raises:
+            ValueError: ``out`` is not contiguous with the input's shape and
+                dtype, or a payload the BT kernels serve is not 16-byte
+                aligned (every rank routes alike, so this is never a split).
         """
         return _workspace_allreduce(
             input_tensor,
@@ -1050,6 +1111,22 @@ if current_platform().is_nvidia:
             raise ValueError("out must be contiguous with the input's shape and dtype")
         else:
             allreduce_out = out.view(tensor_2d.shape)
+        plain = manager.plain_all_reduce
+        # Rank-agreed terms only; early-release callers keep the Lamport kernels.
+        if (
+            not fp32_acc
+            and trigger_completion_at_end
+            and plain is not None
+            and plain.serves(token_num, hidden_dim, tensor_2d.dtype)
+        ):
+            from tokenspeed_kernel.ops.communication.allreduce_fusion import (
+                all_reduce,
+            )
+
+            # Large payloads: owner reduction in rank order, fp32 accumulate.
+            _mark_captured(manager, None)
+            all_reduce(tensor_2d, plain, allreduce_out)
+            return allreduce_out.view(input_tensor.shape)
         trtllm_allreduce_fusion(
             allreduce_in=tensor_2d,
             world_size=world_size,
