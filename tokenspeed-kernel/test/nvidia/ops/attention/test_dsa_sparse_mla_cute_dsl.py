@@ -37,7 +37,7 @@ from utils import assert_no_cute_compile, is_nvidia, move_pages_past_int32
 if not is_nvidia():
     pytest.skip("requires an NVIDIA GPU", allow_module_level=True)
 pytest.importorskip("cutlass")
-from tokenspeed_kernel.platform import ArchVersion, current_platform
+from tokenspeed_kernel.platform import ArchVersion, current_platform  # noqa: E402
 
 if not ArchVersion(10, 0) <= current_platform().arch_version <= ArchVersion(10, 3):
     pytest.skip("requires SM100 or SM103", allow_module_level=True)

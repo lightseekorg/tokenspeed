@@ -579,8 +579,8 @@ def sparse_mla_decode(query, kv, slots, lens, out, softmax_scale, *, split, pdl)
     Args:
         query: E4M3 [rows, heads, 576], contiguous, at most 16 heads.
         kv: E4M3 latent cache rows [slots, 576], contiguous.
-        slots: INT32 [rows, width] global cache rows; negative entries are masked.
-        lens: INT32 [rows] live prefix of each row's slots, or None for the width.
+        slots: int32 [rows, width] global cache rows; negative entries are masked.
+        lens: int32 [rows] live prefix of each row's slots, or None for the width.
         out: BF16 [rows, heads, 512], contiguous.
         softmax_scale: Logit scale, including any key scale.
         split: CTAs per row (a cluster).

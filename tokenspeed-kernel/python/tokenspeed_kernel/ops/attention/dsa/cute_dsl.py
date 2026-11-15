@@ -869,8 +869,8 @@ if _sparse_core is not None:
             q: E4M3 ``[rows, heads, 576]`` or ``[batch, 8, heads, 576]``.
             kv_cache: Contiguous E4M3 latent cache rows (576 per slot).
             sparse_kv_cache: Must be None.
-            topk_slots: INT32 ``[rows, topk]`` global slots; -1 entries are masked.
-            topk_lens: INT32 ``[rows]`` live prefix of each row, or None.
+            topk_slots: int32 ``[rows, topk]`` global slots; -1 entries are masked.
+            topk_lens: int32 ``[rows]`` live prefix of each row, or None.
             max_seqlen_k: Unused.
             qk_nope_head_dim: 128 or 192 (the absorbed query is 576 wide).
             kv_lora_rank: 512.
@@ -910,11 +910,11 @@ if _sparse_core is not None:
         if topk_slots.shape != (rows, topk_slots.shape[-1]) or not (
             topk_slots.dtype == torch.int32 and topk_slots.is_contiguous()
         ):
-            raise ValueError("topk_slots must be contiguous INT32 [rows, topk]")
+            raise ValueError("topk_slots must be contiguous int32 [rows, topk]")
         if topk_lens is not None and (
             topk_lens.shape != (rows,) or topk_lens.dtype != torch.int32
         ):
-            raise ValueError("topk_lens must be INT32 [rows]")
+            raise ValueError("topk_lens must be int32 [rows]")
         query = q.reshape(rows, heads, _SPARSE_CORE_ROW)
         if out is None:
             output = q.new_empty(
