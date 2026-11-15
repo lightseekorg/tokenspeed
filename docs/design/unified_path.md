@@ -940,9 +940,10 @@ participate in expert-owned dispatch/combine, which never defers another reducti
 The drafter's work inside an extend forward replays from graphs too. The
 drafter declares what it records (`BaseDrafter.extend_graph_plan`), and the
 capture and the CUDA-graph memory projection read that one plan: Eagle's
-decode steps at each request count from 1 to `EXTEND_DECODE_MAX_REQUESTS` (16,
-at most `max_num_seqs`; `prefill:drafter-decode`), and a split draft's K/V
-writer over one tile of rows (`prefill:drafter-kv`, below). An extend round
+decode steps, or a block drafter's block draft, at each request count from 1
+to `EXTEND_DECODE_MAX_REQUESTS` (16, at most `max_num_seqs`;
+`prefill:drafter-decode`), and a split draft's K/V writer over one tile of rows
+(`prefill:drafter-kv`, below). An extend round
 admits a few requests (under a steady streaming load, one or two in nearly
 every round), so a larger one runs its decode steps eager; each captured
 count is a dummy extend of that many one-token requests, which the probe
@@ -975,6 +976,17 @@ without a draft sampler, token history or a top-k carried across steps, and
 one replay decision on every rank that runs the round's collectives: no
 attention DP, no pipeline. Tensor- and expert-parallel ranks run the same
 round, so they replay alike.
+
+A block drafter (DFlash, DSpark) over an MLA draft writes the round's draft
+context K/V eagerly, as its rows follow the round's tokens, and replays the
+block draft: the block forward and the proposal sampling, recorded per
+request count. The block rows of an MLA draft are decode rows whatever the
+round, so before a replay the host stages the block-end lengths and positions
+and refreshes the draft decode metadata over the graph's fixed buffers
+(`for_graph_replay`), as the decode graph's refresh does; the graph fills the
+block-end lengths in place, and the attention stays at its breaks. A round
+replays under the same conditions as Eagle's decode steps: a pure extend at a
+captured count, no attention DP, query shard or pipeline.
 
 A one-layer draft whose rows meet only at attention (the MTP heads of Qwen3.5
 and Qwen4-Exp, each a `SplitExtendDraft`) splits its extend rounds. A row's
