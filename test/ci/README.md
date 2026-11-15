@@ -61,7 +61,10 @@ runs those two directories, keeping the TRT-LLM communication and CUDA suites in
 separate processes. `ut-tokenspeed-kernel-post-submit` runs the slow files that
 `ut-tokenspeed-kernel-part-i` ignores (the non-FP8 GEMM autotune capacity test)
 on pushes to `main` only. Together the three tasks cover the kernel suite once.
-AMD runners run the whole suite in the single `ut-tokenspeed-kernel` task.
+On AMD runners, `ut-tokenspeed-kernel-part-amd-gfx950` runs
+`tokenspeed-kernel/test/amd/gfx950/` and `ut-tokenspeed-kernel-part-amd-ops`
+runs `tokenspeed-kernel/test/ops/`; `ut-tokenspeed-kernel` runs the rest, with
+the numerics, TRT-LLM communication, and CUDA suites in separate processes.
 
 All runners split the `runtime-1gpu` suite across `ut-runtime-1gpu-part-i` and
 `ut-runtime-1gpu-part-ii`, which balance test files by their registered

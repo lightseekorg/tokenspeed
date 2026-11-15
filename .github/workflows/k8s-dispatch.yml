@@ -70,6 +70,8 @@ on:
           - test/ci/ut/import-tokenspeed-kernel-mi450-sim.yaml
           - test/ci/ut/ut-tokenspeed-kernel-amd-2gpu.yaml
           - test/ci/ut/ut-tokenspeed-kernel-mi450-sim.yaml
+          - test/ci/ut/ut-tokenspeed-kernel-part-amd-gfx950.yaml
+          - test/ci/ut/ut-tokenspeed-kernel-part-amd-ops.yaml
           - test/ci/ut/ut-tokenspeed-kernel-part-i.yaml
           - test/ci/ut/ut-tokenspeed-kernel-part-ii.yaml
           - test/ci/ut/ut-tokenspeed-kernel-post-submit.yaml
