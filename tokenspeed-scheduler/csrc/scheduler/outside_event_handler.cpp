@@ -147,7 +147,10 @@ void Scheduler::settleFinishedRequests() {
 
 std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& request) {
     ProfileSpan profile_span{"Scheduler::publishCompletedPages"};
-    fsm::CacheProgress progress = request.CacheProgress();
+    // Every forward has landed. Advance the finishing owner's progress in
+    // place; its references and hash storage live through publication and
+    // Host-store pinning, until settleFinishedRequests applies ReleaseEvent.
+    fsm::CacheProgress& progress = request.CacheProgressRef();
     // The frontier is final: every forward has landed, so the State slot the
     // last kept token's forward wrote holds the state after it (slot 1, or
     // slot 0 behind a first decode that ran as a padding row:

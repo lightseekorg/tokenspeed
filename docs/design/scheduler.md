@@ -515,8 +515,12 @@ at admission like `promptEndCheckpoint`, is a possible follow-up.
 `Finishing` and nothing else; after every batch of events,
 `settleFinishedRequests` publishes the frontier of each `Finishing` request
 with no forward in flight (`kFinal`: KV tail and state, unless they are
-dead, above) and releases its pages (`ReleaseEvent`). One path for every
-schedule: a request that finished
+dead, above) and releases its pages (`ReleaseEvent`). This final publication
+advances the owner's `CacheProgress` in place: its hashes and checkpoint
+references remain alive through publication and Host-store pinning, then leave
+with `ReleaseEvent`. Finishing does not need a rollback copy of the history.
+Page-reference release still grows with the number of held pages. One path for
+every schedule: a request that finished
 quiescent settles with its Finish event — the timing every caller always
 saw — and one whose finish was decided on a landed token while the overlap
 schedule had already dispatched the next decode settles when that decode's

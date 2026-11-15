@@ -865,7 +865,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         if self.config.kv_events {
             let drained = self.scheduler.drain_kv_events();
             if let Some(publisher) = &self.kv_events {
-                publisher.publish(&drained);
+                publisher.publish(drained);
             }
         }
         // A storage operation's outcome is an acknowledgment too.
