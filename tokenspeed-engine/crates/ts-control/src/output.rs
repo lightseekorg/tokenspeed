@@ -867,6 +867,9 @@ impl OutputProcessor {
         }
         state.cached_tokens = cached_tokens;
         if state.max_new_tokens == 0 {
+            if let Some(timings) = state.timings.as_mut() {
+                timings.mark_prefill_done(wall_seconds());
+            }
             state.check_finished(false);
             return;
         }
@@ -2935,6 +2938,29 @@ mod tests {
         assert_eq!(c.outputs[0].finish_reason, Some("length"));
         assert_eq!(c.events[1].kind, ForwardEventKind::Finish);
         assert_eq!(c.released, ["r"]);
+    }
+
+    #[test]
+    fn zero_budget_returns_prompt_scores_without_emitting_the_sample() {
+        let mut p = processor(None);
+        let mut state = RequestState::new(vec![5, 6, 7], 0, BTreeSet::new(), true, None, true);
+        state.set_logprobs(crate::request::LogprobRequest {
+            start: 0,
+            top_logprobs_num: 0,
+            computes_prompt_logprobs: true,
+        });
+        register_state(&mut p, "r".to_owned(), state);
+        let prefill = batch(&[("r", 3, 0, 3)], 1);
+        let plan = p.logprob_plan(&prefill).input.unwrap();
+        let c = p
+            .commit(&prefill, Some(&plan), &scored(&plan, &[9]))
+            .unwrap();
+        let output = &c.outputs[0];
+        assert!(output.output_ids.is_empty());
+        assert_eq!(output.finish_reason, Some("length"));
+        let scores = output.input_logprobs.as_ref().unwrap();
+        assert_eq!(scores.ids, [5, 6, 7]);
+        assert_eq!(scores.values, [None, Some(0.0), Some(-1.0)]);
     }
 
     #[test]
