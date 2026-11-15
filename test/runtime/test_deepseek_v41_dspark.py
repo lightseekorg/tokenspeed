@@ -945,6 +945,7 @@ def test_checkpoint_model_config_and_no_draft_paged_attention(
         _speculative_widths_explicit=False,
         attention_backend=None,
         drafter_attention_backend=None,
+        dsa_index_k_format=None,
         load_format="auto",
         disaggregation_mode="null",
         decode_monokernel=False,

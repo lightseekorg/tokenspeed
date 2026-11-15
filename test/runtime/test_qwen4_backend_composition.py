@@ -65,6 +65,7 @@ def _config(*, is_draft: bool, width: int):
         max_bs=4,
         max_resident_requests=4,
         qcp_size=1,
+        kvp_size=1,
     )
 
 

@@ -282,8 +282,8 @@ def test_kvp_launch_passes_the_full_attention_dcp_check(tmp_path) -> None:
             False,
             True,
         ),
-        # A MIXED round would replay with decode rows in the narrowed break.
-        ({"disaggregation_mode": "null", "enable_mixed_batch": True}, False, False),
+        # A MIXED round replays with its decode rows in the narrowed break.
+        ({"disaggregation_mode": "null", "enable_mixed_batch": True}, False, True),
         ({"disaggregation_mode": "null"}, True, False),
         # --disable-prefill-graph turns it off.
         ({"disaggregation_mode": "null", "disable_prefill_graph": True}, False, False),
@@ -321,15 +321,11 @@ def test_dsa_spec_carries_the_padded_prefill_replay_admission(tmp_path) -> None:
     assert server_args.enable_mixed_batch is False
     spec = DSAConfig._spec_kwargs(server_args, model_config, False)
     assert spec["padded_prefill_replay"] is True
-    # The disable flag or a mixed batch turns it off.
+    # The disable flag turns it off.
     server_args.disable_prefill_graph = True
     spec = DSAConfig._spec_kwargs(server_args, model_config, False)
     assert spec["padded_prefill_replay"] is False
     server_args.disable_prefill_graph = False
-    server_args.enable_mixed_batch = True
-    spec = DSAConfig._spec_kwargs(server_args, model_config, False)
-    assert spec["padded_prefill_replay"] is False
-    server_args.enable_mixed_batch = False
     # The prefill role keeps its layerwise condition.
     server_args.disaggregation_mode = "prefill"
     spec = DSAConfig._spec_kwargs(server_args, model_config, False)
@@ -1000,7 +996,7 @@ def test_prefill_topk_split_scores_each_ranks_own_index_queries(monkeypatch) -> 
     fp8_scaled plane quantizes exactly those projected rows."""
     from tokenspeed.runtime.distributed import Mapping
     from tokenspeed.runtime.models import glm5
-    from tokenspeed.runtime.models.kimi_k31 import _scorers_take_fp8_index_queries
+    from tokenspeed.runtime.models.kimi_k31 import _scorers_take_quantized_index_queries
 
     torch.manual_seed(0)
     attention = _indexer_attention(index_topk=2048)
@@ -1035,7 +1031,7 @@ def test_prefill_topk_split_scores_each_ranks_own_index_queries(monkeypatch) -> 
 
     # Whole 16-row groups per rank: 560 rows, then the remaining 540.
     assert len(calls) == 2
-    fp8_queries = _scorers_take_fp8_index_queries(indexer)
+    fp8_queries = _scorers_take_quantized_index_queries(indexer)
     for (q, q_scales), rows in zip(calls, (slice(0, 560), slice(560, num_rows))):
         reference = indexer._project_query(q_lora[rows])
         if fp8_queries:
@@ -1405,7 +1401,7 @@ def test_configured_index_k_quantization_and_topk(tmp_path, phase) -> None:
 def test_k31_scores_an_fp8_scaled_plane_with_fp8_index_queries() -> None:
     """Over an fp8_scaled plane K3.1 quantizes its index query per (token,
     head), where the platform registers FP8-query scorers."""
-    from tokenspeed.runtime.models.kimi_k31 import _scorers_take_fp8_index_queries
+    from tokenspeed.runtime.models.kimi_k31 import _scorers_take_quantized_index_queries
 
     torch.manual_seed(0)
     attention = _indexer_attention(index_topk=2048)
@@ -1416,7 +1412,7 @@ def test_k31_scores_an_fp8_scaled_plane_with_fp8_index_queries() -> None:
 
     q_out, q_scales = attention._scorer_index_query(q, plane)
 
-    if _scorers_take_fp8_index_queries(attention.indexer):
+    if _scorers_take_quantized_index_queries(attention.indexer):
         _assert_fp8_index_query(q_out, q_scales, q)
     else:
         assert q_out is q and q_scales is None
@@ -1455,7 +1451,7 @@ def test_decode_topk_selects_every_visible_key_below_topk(
 ) -> None:
     from tokenspeed_kernel.ops.attention.dsa import dsa_plan
 
-    from tokenspeed.runtime.models.kimi_k31 import _scorers_take_fp8_index_queries
+    from tokenspeed.runtime.models.kimi_k31 import _scorers_take_quantized_index_queries
 
     if index_k_format == "bf16" and torch.version.hip is None:
         pytest.skip("BF16 index-K top-k kernels require AMD")
@@ -1502,7 +1498,7 @@ def test_decode_topk_selects_every_visible_key_below_topk(
     )
 
     [(q, q_scales)] = calls
-    if index_k_format == "fp8_scaled" and _scorers_take_fp8_index_queries(
+    if index_k_format == "fp8_scaled" and _scorers_take_quantized_index_queries(
         attention.indexer
     ):
         _assert_fp8_index_query(q, q_scales, indexer_output.query)
@@ -1912,15 +1908,12 @@ def test_dsa_leaf_admits_prefill_graphs_only_under_padded_replay(
 ) -> None:
     import logging
 
-    from tokenspeed_kernel.platform import current_platform
-
     from tokenspeed.runtime.layers.attention.backends.paged.dsa import DSABackend
     from tokenspeed.runtime.layers.attention.backends.support import (
         resolve_cuda_graph_support,
     )
 
-    # The leaf opts in on NVIDIA only, the one platform validated.
-    admits = padded_prefill_replay and bool(current_platform().is_nvidia)
+    admits = padded_prefill_replay
     dsa_logger = "tokenspeed.runtime.layers.attention.backends.paged.dsa"
     support_logger = "tokenspeed.runtime.layers.attention.backends.support"
     for name in (dsa_logger, support_logger):
@@ -2097,7 +2090,10 @@ def _k31_attention_stack(
     from tokenspeed.runtime.distributed import Mapping
     from tokenspeed.runtime.distributed.comm_manager import CommManager
     from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
-    from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
+    from tokenspeed.runtime.layers.attention.configs.dsa import (
+        DSAConfig,
+        dsa_kvp_history_prefill,
+    )
     from tokenspeed.runtime.layers.attention.kv_cache.factory import (
         create_cache_arena,
         create_cache_pool,
@@ -2211,33 +2207,32 @@ def _k31_attention_stack(
         attention.kv_b_proj.weight, attention
     )
     bind_cache_groups(attention, pool)
-    router = create_paged_router(
-        AttnConfig(
-            device="cuda",
-            dtype=torch.bfloat16,
-            kv_cache_dtype=kv_cache_dtype,
-            kv_cache_quant_method=None,
-            max_bs=4,
-            max_resident_requests=4,
-            context_len=context_len,
-            speculative_num_draft_tokens=spec_width,
-            kvp_size=kvp_size,
-            kvp_rank=kvp_rank,
-            kvp_group=kvp_group,
-            components=(
-                dataclasses.replace(
-                    dsa,
-                    num_attention_heads=heads * kvp_size,
-                    num_kv_heads=heads * kvp_size,
-                    attn_tp_size=kvp_size,
-                ),
+    config = AttnConfig(
+        device="cuda",
+        dtype=torch.bfloat16,
+        kv_cache_dtype=kv_cache_dtype,
+        kv_cache_quant_method=None,
+        max_bs=4,
+        max_resident_requests=4,
+        context_len=context_len,
+        speculative_num_draft_tokens=spec_width,
+        kvp_size=kvp_size,
+        kvp_rank=kvp_rank,
+        kvp_group=kvp_group,
+        components=(
+            dataclasses.replace(
+                dsa,
+                num_attention_heads=heads * kvp_size,
+                num_kv_heads=heads * kvp_size,
+                attn_tp_size=kvp_size,
             ),
         ),
-        AttentionArch.DSA,
-        backend_name="dsa",
     )
+    router = create_paged_router(config, AttentionArch.DSA, backend_name="dsa")
     router.set_cache_pool(pool)
     router.configure_runtime()
+    if dsa_kvp_history_prefill(config):
+        router.preallocate_history_gather_workspace(context_len)
     router.init_cuda_graph_state(4, max_extend_tokens=256)
     return attention, comm, router, pool
 

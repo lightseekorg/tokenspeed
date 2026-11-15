@@ -108,6 +108,13 @@ in the ROCm index.
 
 ## Scheduler releases
 
+Each Linux architecture (x86_64 and aarch64, glibc 2.28+) gets two scheduler
+wheels: `cp311-cp311` for CPython 3.11 and `cp312-abi3` for standard,
+GIL-enabled CPython 3.12 and later. Python 3.10 is no longer supported.
+The publisher audits the stable ABI and runs the scheduler Python tests with
+the same abi3 wheel on Python 3.12–3.15. Its `dry_run` input builds and tests
+the distributions without publishing them.
+
 Run **Scheduler release pipeline** manually from `main`. Its optional `version`
 must be a stable version greater than both the scheduler source and PyPI
 versions. Leave it empty to increment the greater version's patch. The three

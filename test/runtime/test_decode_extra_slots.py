@@ -257,14 +257,14 @@ def test_high_slot_bootstrap_and_reset_preserve_padding(device):
         states.slot_state_bytes(), dtype=torch.uint8, pin_memory=device == "cuda"
     )
     stream = torch.cuda.current_stream() if device == "cuda" else None
-    states.export_slot_state(5, image, stream, request_id="high-slot")
+    states.export_slot_state(5, image, stream, admission_id=1)
     if stream is not None:
         stream.synchronize()
     for row in states.slot_state_rows(5):
         row.zero_()
     for row, saved in zip(states.slot_state_rows(4), expected, strict=True):
         row.copy_(saved.logical_not() if saved.dtype == torch.bool else saved + 1)
-    states.import_slot_state(4, image, stream, request_id="high-slot")
+    states.import_slot_state(4, image, stream, admission_id=1)
     if stream is not None:
         stream.synchronize()
     assert all(

@@ -105,7 +105,8 @@ fn bench_commit_decode() {
     let mut rids: Vec<String> = Vec::with_capacity(bs);
     for i in 0..bs {
         let rid = format!("r{i}");
-        let state = RequestState::new(vec![0; 16], 1 << 30, BTreeSet::new(), true, None, false);
+        let mut state = RequestState::new(vec![0; 16], 1 << 30, BTreeSet::new(), true, None, false);
+        p.assign_admission(&mut state);
         p.register(rid.clone(), state);
         let _ = p
             .commit(
@@ -152,10 +153,15 @@ fn interpreter() {
     static START: Once = Once::new();
     START.call_once(|| {
         std::env::set_var("PYTHONHOME", env!("TS_CONTROL_TEST_PYTHONHOME"));
-        ts_scheduler::register_builtin_module();
         Python::initialize();
         Python::attach(|py| {
-            ts_scheduler::alias_builtin_module(py).unwrap();
+            let module = ts_scheduler::python_module(py).unwrap();
+            py.import("sys")
+                .unwrap()
+                .getattr("modules")
+                .unwrap()
+                .set_item("tokenspeed_scheduler.tokenspeed_scheduler_ext", module)
+                .unwrap();
             let package = concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../../tokenspeed-scheduler/python"

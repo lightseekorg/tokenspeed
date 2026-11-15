@@ -108,6 +108,8 @@ __all__ = [
     "mv",
     "MV_FP8_WEIGHT_MAX_M",
     "mv_fp8_weight",
+    "mv_rmsnorm_gated_sigmoid",
+    "mv_rmsnorm_gated_sigmoid_supported",
     "mv_weightless_rmsnorm_gated_sigmoid",
     "mv_weightless_rmsnorm_gated_sigmoid_supported",
     # Linear AttnRes partials
@@ -2161,6 +2163,111 @@ def mv_weightless_rmsnorm_gated_sigmoid(
             f"{tuple(x.shape)}, weight {tuple(weight.shape)}, {num_heads} heads"
         )
     return kernel(x, gate, weight, out, num_heads, eps)
+
+
+def _select_mv_rmsnorm_gated_sigmoid(
+    gate: torch.Tensor,
+    norm_weight: torch.Tensor,
+    weight: torch.Tensor,
+) -> SelectedKernel | None:
+    """Select the one-launch gated GEMV for ``gate``'s rows, or None."""
+    if (
+        not gate.is_cuda
+        or gate.ndim != 2
+        or gate.stride(1) != 1
+        or norm_weight.ndim != 1
+        or not norm_weight.is_contiguous()
+        or weight.ndim != 2
+        or weight.shape[1] != gate.shape[1]
+        or not weight.is_contiguous()
+        or norm_weight.device != gate.device
+        or weight.device != gate.device
+        or resolve_kernel_override("gemm", "mm", None) is not None
+    ):
+        return None
+    m, (n, k), head_dim = gate.shape[0], weight.shape, norm_weight.shape[0]
+    if head_dim == 0 or k % head_dim:
+        return None
+    try:
+        kernel = select_kernel(
+            "gemm",
+            "mv_rmsnorm_gated_sigmoid",
+            dense_format_signature(
+                ("x", "gate", "weight"), (gate.dtype, gate.dtype, weight.dtype)
+            ),
+            traits={"m": m, "n": n, "k": k, "head_dim": head_dim},
+        )
+    except NoKernelFoundError:
+        return None
+    # The launch reproduces rmsnorm_gated_sigmoid and the GEMV that mm runs on
+    # its rows bit for bit, so it only stands in where mm selects that GEMV.
+    gemv = _select_mv(m, n, k, True, gate.dtype, weight.dtype, False)
+    if gemv is not KernelRegistry.get().get_impl("gluon_gemv_a16w16_gfx950"):
+        return None
+    return kernel
+
+
+def mv_rmsnorm_gated_sigmoid_supported(
+    gate: torch.Tensor,
+    norm_weight: torch.Tensor,
+    weight: torch.Tensor,
+) -> bool:
+    """Return whether :func:`mv_rmsnorm_gated_sigmoid` serves ``gate``'s rows.
+
+    A registered kernel must take the shape, and ``mm`` must select the GEMV
+    it reproduces for the normed rows.
+
+    Args:
+        gate: Gate logits ``[M, num_heads * head_dim]`` with a unit inner
+            stride; the rows to normalize have its shape.
+        norm_weight: ``[head_dim]`` weight of the per-head RMSNorm.
+        weight: Output projection weight ``[N, num_heads * head_dim]``.
+
+    Returns:
+        ``True`` when one launch can replace ``rmsnorm_gated_sigmoid``
+        followed by ``mm``.
+    """
+    return _select_mv_rmsnorm_gated_sigmoid(gate, norm_weight, weight) is not None
+
+
+def mv_rmsnorm_gated_sigmoid(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    norm_weight: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Normalize, gate and project rows in one launch.
+
+    Computes ``mm(rmsnorm_gated_sigmoid(x, gate, norm_weight, eps, ...),
+    weight, out=out)`` bit for bit where
+    :func:`mv_rmsnorm_gated_sigmoid_supported` holds.
+
+    Args:
+        x: Contiguous BF16 rows with ``gate``'s shape.
+        gate: Gate logits with a unit inner stride.
+        norm_weight: ``[head_dim]`` weight of the per-head RMSNorm.
+        weight: ``[N, K]`` weight.
+        eps: Epsilon added to each per-head variance.
+        out: ``[M, N]`` destination.
+
+    Returns:
+        ``out``.
+    """
+    kernel = _select_mv_rmsnorm_gated_sigmoid(gate, norm_weight, weight)
+    if (
+        kernel is None
+        or x.shape != gate.shape
+        or x.dtype != gate.dtype
+        or not x.is_contiguous()
+    ):
+        raise ValueError(
+            "mv_rmsnorm_gated_sigmoid needs supported gated rows (see "
+            f"mv_rmsnorm_gated_sigmoid_supported), got x {tuple(x.shape)}, "
+            f"gate {tuple(gate.shape)}, weight {tuple(weight.shape)}"
+        )
+    return kernel(x, gate, norm_weight, weight, out, eps)
 
 
 # ===-----------------------------------------------------------------------===#

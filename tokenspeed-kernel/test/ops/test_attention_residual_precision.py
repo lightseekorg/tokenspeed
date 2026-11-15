@@ -151,12 +151,14 @@ def test_nine_source_multiquery_matches_cpu_equation(device_name, width):
         torch.bfloat16
     )
     queries = torch.randn((3, width), generator=generator, dtype=torch.float32)
-    inverse = torch.rsqrt(sources.float().square().mean(dim=-1) + 1e-6)
-    normalized = sources.float() * inverse.unsqueeze(-1)
+    # An FP64 equation: an FP32 one is off by more than the tolerance at 4608.
+    values = sources.double()
+    inverse = torch.rsqrt(values.square().mean(dim=-1) + 1e-6)
+    normalized = values * inverse.unsqueeze(-1)
     # Score the dot before applying its inverse RMS, as the reference does.
-    logits = torch.einsum("sth,qh->qts", sources.float(), queries / math.sqrt(width))
+    logits = torch.einsum("sth,qh->qts", values, queries.double() / math.sqrt(width))
     logits = logits * inverse.T.unsqueeze(0)
-    expected = torch.einsum("qts,sth->qth", logits.softmax(dim=-1), normalized)
+    expected = torch.einsum("qts,sth->qth", logits.softmax(dim=-1), normalized).float()
     moved = [value.to(device) for value in sources.unbind(0)]
     actual = attention_residual(
         moved[:-1],

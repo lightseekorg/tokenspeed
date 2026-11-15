@@ -236,6 +236,7 @@ def test_glm53_flash_decode_topk_skips_only_overwritten_workspace_fills(
         num_tokens=4,
         num_decode_tokens=num_decode_tokens,
         topk=12,
+        query_rider=None,
     )
 
     assert captured["fill_value"] == expected_fill_value
