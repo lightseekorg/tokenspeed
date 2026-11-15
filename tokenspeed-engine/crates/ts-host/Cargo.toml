@@ -19,7 +19,8 @@ abi3 = ["pyo3/abi3-py312", "ts-scheduler/abi3"]
 bytes.workspace = true
 chrono = "0.4"
 libc = "0.2"
-mimalloc = { version = "0.1", default-features = false }
+# The host is loaded after other native Python modules; static TLS can be full.
+mimalloc = { version = "0.1", default-features = false, features = ["local_dynamic_tls"] }
 pyo3 = "0.30"
 serde_json = "1"
 thiserror.workspace = true

@@ -89,7 +89,13 @@ def main(expected_version: str) -> None:
                         "--enable-async-logging",
                         "false",
                     ],
-                    env=dict(os.environ, PYTHONPATH=str(root)),
+                    # A late-loaded host must work without spare static TLS,
+                    # as when CUDA libraries have already used the reserve.
+                    env=dict(
+                        os.environ,
+                        PYTHONPATH=str(root),
+                        GLIBC_TUNABLES="glibc.rtld.optional_static_tls=0",
+                    ),
                     pass_fds=(result.fileno(),),
                     capture_output=True,
                     text=True,
