@@ -51,6 +51,7 @@ from test.runtime.drafter_prefill_graph_test_utils import (
     WIDTH,
     ToyBackend,
     ToyDraftModel,
+    ToySplitDraftModel,
     capture_input,
     extend_input,
     make_eagle,
@@ -208,6 +209,51 @@ def test_replays_match_the_eager_round() -> None:
                 assert torch.equal(window[:, 2], window[:, 0])
 
 
+def test_a_split_round_replays_what_the_narrowed_eager_round_drafts() -> None:
+    """Replayed split rounds leave the narrowed eager round's window and cache."""
+    generator = torch.Generator().manual_seed(0)
+    split, split_backend = make_eagle(device="cuda", model=ToySplitDraftModel("cuda"))
+    eager, eager_backend = make_eagle(device="cuda")
+    _capture(split, split_backend, [32, 64], lambda _bucket: [1])
+    assert split._kv_tile.ids.shape[0] == 64
+    cases = [
+        # (lengths, prefixes, final)
+        ([16], [0], True),
+        ([5], [40], True),
+        ([9, 7], [0, 100], True),
+        ([20, 3, 1], [7, 0, 300], True),
+        ([64], [128], True),
+        ([70], [0], True),
+        ([100, 60, 30, 10], [0, 0, 0, 0], True),
+        ([30], [0], False),
+        ([12, 12], [64, 0], False),
+    ]
+    with torch.inference_mode():
+        for lengths, prefixes, final in cases:
+            inputs = _inputs(lengths, generator)
+            prepare_extend(
+                split, split_backend, lengths, prefixes, final=final, ids=inputs[0]
+            )
+            # The decode-steps graphs open at step 0: no unsplit round takes them.
+            assert (
+                split._extend_graph_route(
+                    len(lengths), extend_input(split, lengths, hidden=inputs[2])
+                )
+                is None
+            ), lengths
+            window, forwards = _round(
+                split, split_backend, lengths, prefixes, final, inputs
+            )
+            want, _ = _round(eager, eager_backend, lengths, prefixes, final, inputs)
+            assert forwards == 0, lengths
+            assert torch.equal(split_backend.cache[1:], eager_backend.cache[1:])
+            if final:
+                assert torch.equal(window, want), lengths
+            else:
+                assert torch.equal(window[:, 0], want[:, 0])
+                assert torch.equal(window, window[:, :1].expand_as(window))
+
+
 def test_the_decode_steps_replay_without_a_step_0_graph() -> None:
     """A draft model whose narrowed step 0 has no breaks (the configuration
     every tensor-parallel launch takes too) records the decode steps alone:
@@ -306,17 +352,14 @@ def test_a_publication_recorded_into_the_graph_diverges_from_eager(
     )
 
 
-def test_a_replay_waits_for_a_host_load_into_the_draft_cache() -> None:
-    """The draft prologue writes K/V inside a captured segment, which holds
-    no per-layer Host-load wait, so a step-0 replay waits for the draft
-    pool's whole load first. A load still copying into the round's pages
-    (delayed on its stream) must land before the replay's writes, not over
-    them."""
+@pytest.mark.parametrize("model", [ToyDraftModel, ToySplitDraftModel])
+def test_a_replay_waits_for_a_host_load_into_the_draft_cache(model) -> None:
+    """A step-0 replay or split K/V writer lands after the draft pool's Host load."""
     sentinel = 1.0e30
     lengths, prefixes = [16], [40]
     pages = slice(1 + prefixes[0], 1 + prefixes[0] + lengths[0])
     generator = torch.Generator().manual_seed(2)
-    drafter, backend = make_eagle(device="cuda")
+    drafter, backend = make_eagle(device="cuda", model=model("cuda"))
     _capture(drafter, backend, [16], lambda _bucket: [1])
     load_stream = torch.cuda.Stream()
 

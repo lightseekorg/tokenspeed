@@ -88,6 +88,8 @@ from tokenspeed_kernel.ops.gemm import (
     kimi3_shared_situ_projection,
     linear_attnres_partials,
     linear_attnres_partials_available,
+    mv_rmsnorm_gated_sigmoid,
+    mv_rmsnorm_gated_sigmoid_supported,
 )
 from tokenspeed_kernel.ops.moe import (
     latent_moe_decode_pipeline_available,
@@ -122,6 +124,7 @@ from tokenspeed.runtime.execution.forward_step import (
 )
 from tokenspeed.runtime.layers.activation import SituAndMul
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
+from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.dense.w8a8_fp8 import w8a8_fp8_per_channel_mm
 from tokenspeed.runtime.layers.layernorm import (
     RMSNorm,
@@ -1842,6 +1845,22 @@ class KimiLinearKDA(nn.Module):
                 enable_pdl=pdl_enabled(),
             )
             return self.o_proj(values, scale=scales, ctx=ctx, out=projection_out)[0]
+        if self._o_proj_applies_output_norm(out_gate, projection_out):
+            # Decode rows: the o-projection GEMV applies the gated norm itself,
+            # bit for bit with the separate norm and mm.
+            core_out = self._recurrent_core(mixed_qkv, f_a_out, beta, ctx, None)
+            if projection_out is None:
+                projection_out = core_out.new_empty(
+                    (num_tokens, self.o_proj.weight.shape[0])
+                )
+            return mv_rmsnorm_gated_sigmoid(
+                core_out.contiguous(),
+                out_gate,
+                self.o_norm.weight,
+                self.o_proj.weight,
+                self.o_norm.variance_epsilon,
+                projection_out,
+            )
         core_out = self._recurrent_core(
             mixed_qkv, f_a_out, beta, ctx, self._output_norm(out_gate)
         )
@@ -1962,6 +1981,23 @@ class KimiLinearKDA(nn.Module):
         """The gated RMSNorm that makes the core output the BF16 o-projection input."""
         return KdaOutputNorm(out_gate, self.o_norm.weight, self.o_norm.variance_epsilon)
 
+    def _o_proj_applies_output_norm(
+        self, out_gate: torch.Tensor, projection_out: torch.Tensor | None
+    ) -> bool:
+        """Whether one o-projection GEMV launch can apply the gated norm too."""
+        if projection_out is None and (
+            self.output_parallel is not None
+            or type(self.o_proj.quant_method) is not UnquantizedLinearMethod
+            or self.o_proj.quant_method.batch_invariant
+            or self.o_proj.reduce_results
+        ):
+            # Without the producer-direct buffer, the o-projection's own matmul
+            # must be the GEMV that the fused kernel reproduces.
+            return False
+        return mv_rmsnorm_gated_sigmoid_supported(
+            out_gate, self.o_norm.weight, self.o_proj.weight
+        )
+
 
 class KimiLinearMoEGate(nn.Module):
     """Router for Kimi-K3 MoE: linear scorer + noaux_tc correction bias.
@@ -2040,8 +2076,9 @@ def _attnres_scratch(
 _IRIS_MAX_TOKENS = 8192
 _IRIS_BASELINE_PRODUCER_DIRECT_MAX_TOKENS = 48
 _IRIS_MOE_ROW_SHARD_MIN_TOKENS = 40
-# Through this many rows a replicated residual takes the Lamport reduce and gather tail.
-_IRIS_MOE_GATHER_TAIL_MAX_TOKENS = 64
+# Through this many rows a replicated residual takes the Lamport reduce and gather
+# tail; the Iris K3 fused decode row limit.
+_IRIS_MOE_GATHER_TAIL_MAX_TOKENS = 192
 # Below this, row-sharded router/latent projection idles CUs and loses (8x MI350X).
 _IRIS_MOE_ROW_INPUT_MIN_TOKENS = 4096
 
@@ -2053,8 +2090,12 @@ def prepare_k3_all_reduce_buffers(
     routed_hidden_size: int,
     max_num_tokens: int,
     states: dict[tuple[int, ...], "K3IrisState"],
+    pull_exchange_max_bytes: int = 0,
 ) -> bool:
-    """Prepare and retain each node-local group's Iris buffers before capture."""
+    """Prepare and retain each node-local group's Iris buffers before capture.
+
+    ``pull_exchange_max_bytes`` sizes the attention group's pull exchange for
+    the KVP decode's gathers and records exchange (zero omits it)."""
     if not current_platform().is_cdna4:
         return False
 
@@ -2084,6 +2125,7 @@ def prepare_k3_all_reduce_buffers(
         attnres_max_rows,
         enable_lamport,
         moe_tail_max_rows,
+        pull_exchange_max_bytes=0,
     ):
         if not backend.can_prepare_all_reduce_buffers(group, torch.bfloat16):
             return False
@@ -2097,6 +2139,13 @@ def prepare_k3_all_reduce_buffers(
                 or state.all_reduce.producer_direct_max_numel
                 < producer_direct_max_numel
                 or state.enable_lamport != enable_lamport
+                or (
+                    pull_exchange_max_bytes
+                    and (
+                        state.pull_exchange is None
+                        or state.pull_exchange.max_bytes < pull_exchange_max_bytes
+                    )
+                )
                 or (
                     attnres_max_rows
                     and (
@@ -2127,8 +2176,11 @@ def prepare_k3_all_reduce_buffers(
             dtype=torch.bfloat16,
             device=torch.device(f"cuda:{torch.cuda.current_device()}"),
             all_reduce=backend.iris.state(group, torch.bfloat16),
+            pull_exchange_max_bytes=pull_exchange_max_bytes,
         )
         backend.iris.install(group, state.all_reduce)
+        if state.pull_exchange is not None:
+            backend.iris.install_pull_exchange(group, state.pull_exchange)
         states[group] = state
         return True
 
@@ -2180,6 +2232,7 @@ def prepare_k3_all_reduce_buffers(
             attnres_max_rows=attnres_max_rows,
             enable_lamport=enable_lamport,
             moe_tail_max_rows=moe_tail_max_rows,
+            pull_exchange_max_bytes=pull_exchange_max_bytes,
         )
     if mapping.moe.tp_ep_size > 1 and not groups_are_equal:
         prepared = (
@@ -2989,12 +3042,18 @@ class KimiLinearMoE(nn.Module):
             # The optimized tail declined before consuming the producers.
             # Every ordinary projection epilogue requires a replicated prefix.
             prefix_sum = all_gather(prefix_sum, group, dim=0, backend=None)
+        # The gathered tail reads only this rank's column block of the shared rows.
+        shared_owned_columns = gather_tail
         reduced = None
         if slot_rows:
             # The MoE left its top-k slot rows (_situ_defer_topk_reduce).
             if shared_partial.data_ptr() != shared_out.data_ptr():
                 shared_out.copy_(shared_partial)
-            reduced = self.iris_state.reduce_moe(outputs, routed_partials=routed)
+            reduced = self.iris_state.reduce_moe(
+                outputs,
+                routed_partials=routed,
+                shared_owned_columns=shared_owned_columns,
+            )
         # A producer may return its own tensor instead of filling its destination.
         elif outputs is not None and all(
             partial.shape == output.shape and partial.data_ptr() == output.data_ptr()
@@ -3007,7 +3066,9 @@ class KimiLinearMoE(nn.Module):
             joined = torch.cat((routed, shared_partial), dim=-1)
         if reduced is None:
             reduced = (
-                self.iris_state.reduce_moe(joined)
+                self.iris_state.reduce_moe(
+                    joined, shared_owned_columns=shared_owned_columns
+                )
                 if isinstance(joined, tuple)
                 and self.iris_state is not None
                 and self.iris_state.all_reduce.owns_outputs(joined)
@@ -3022,12 +3083,16 @@ class KimiLinearMoE(nn.Module):
             self.iris_state is not None
             and not up_proj.narrowed
             and up_proj.solution == "auto"
-            and self.iris_state.can_moe_gather_tail(
-                routed,
-                shared,
-                prefix_sum,
-                up_proj.weight,
-                norm.weight if norm is not None else None,
+            and (
+                # Other shared columns may be undefined; the tail asserts support.
+                shared_owned_columns
+                or self.iris_state.can_moe_gather_tail(
+                    routed,
+                    shared,
+                    prefix_sum,
+                    up_proj.weight,
+                    norm.weight if norm is not None else None,
+                )
             )
         ):
             # Decode: each rank projects its weight column block, then gathers.
@@ -4858,14 +4923,18 @@ class KimiLinearForCausalLM(BaseCausalLM):
             routed_hidden_size=routed_hidden_size,
             max_num_tokens=max_num_tokens,
             states=self.model.iris_states,
+            pull_exchange_max_bytes=self._kvp_decode_exchange_bytes(),
         )
         attn_state = self.model.iris_states.get(self.mapping.attn.tp_group)
         moe_state = self.model.iris_states.get(self.mapping.moe.tp_ep_group)
         moe_comm: K3MoeTailComm | None = None
+        attn_comm: K3AttnComm | None = None
         for layer in self.model.layers:
             if not isinstance(layer, KimiLinearDecoderLayer):
                 continue
             layer.k3_comm.iris_state = attn_state
+            if attn_comm is None:
+                attn_comm = layer.k3_comm
             if not layer.is_moe_layer:
                 continue
             moe = layer.block_sparse_moe
@@ -4875,8 +4944,29 @@ class KimiLinearForCausalLM(BaseCausalLM):
                     moe_comm = moe.comm
         if moe_comm is not None:
             prepared = moe_comm.prepare(max_num_tokens) or prepared
+        if attn_comm is not None:
+            prepared = attn_comm.prepare_staged_projection(max_num_tokens) or prepared
         prepared = self._prepare_decode_chain() or prepared
         return bool(shared_mlps) or prepared
+
+    def _kvp_decode_exchange_bytes(self) -> int:
+        """The most bytes a rank sends in one KVP decode exchange of any
+        attention layer, where the KVP group is the attention TP group whose
+        K3 state holds the exchange."""
+        attn = self.mapping.attn
+        if attn.kvp_size == 1 or attn.kvp_group != attn.tp_group:
+            return 0
+        max_rows = max(_decode_graph_rows(), default=0)
+        return max(
+            (
+                layer.self_attn.kvp_decode_exchange_bytes(max_rows)
+                for layer in self.model.layers
+                if hasattr(
+                    getattr(layer, "self_attn", None), "kvp_decode_exchange_bytes"
+                )
+            ),
+            default=0,
+        )
 
     def _prepare_decode_chain(self) -> bool:
         """Bind the decode MoE chain where every MoE layer's execution plan allows it

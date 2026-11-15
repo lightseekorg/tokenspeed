@@ -25,14 +25,41 @@ PyNccl communicators for better performance. Supports torch.compile
 via custom ops.
 """
 
+import math
+
 import torch
 import torch.distributed
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.comm_backend.base import (
     CommBackend,
     CommWork,
     Group,
 )
+
+
+def _interleave_rank_chunks(
+    gathered: torch.Tensor, world_size: int, input_size: torch.Size, dim: int
+) -> torch.Tensor:
+    """Rank-major ``[world_size * input_size[0], ...]`` as the ranks' inputs
+    concatenated along ``dim``.
+
+    Each rank's chunk of an outer index is one contiguous run, copied as 8-byte
+    words when its length allows: a byte-wise strided copy (an FP8 query's)
+    runs at a fraction of the bandwidth.
+    """
+    outer = math.prod(input_size[:dim])
+    run = math.prod(input_size[dim:]) * gathered.element_size()
+    shape = input_size[:dim] + (world_size * input_size[dim],) + input_size[dim + 1 :]
+    if outer == 1:
+        return gathered.view(shape)
+    out = gathered.new_empty(shape)
+    src = gathered.view(torch.uint8).view(world_size, outer, run)
+    dst = out.view(torch.uint8).view(outer, world_size, run)
+    if run % 8 == 0:
+        src, dst = src.view(torch.int64), dst.view(torch.int64)
+    dst.copy_(src.transpose(0, 1))
+    return out
 
 
 class NcclBackend(CommBackend):
@@ -168,6 +195,10 @@ class NcclBackend(CommBackend):
         )
 
         self.all_gather_single(output_tensor, tensor, group)
+        if dim == 0:
+            return output_tensor
+        if current_platform().is_amd:
+            return _interleave_rank_chunks(output_tensor, ws, input_size, dim)
 
         output_tensor = output_tensor.reshape((ws,) + input_size)
         output_tensor = output_tensor.movedim(0, dim)

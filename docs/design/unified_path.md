@@ -20,6 +20,47 @@ path nothing exercised routinely.
 
 ## Invariants
 
+### Slot state belongs to an admission
+
+Persistent request-pool rows are reused across requests. Before a forward,
+outside graph capture/replay, the executor binds stop criteria and prepares
+sampling with the admission identities carried by `PlannedForward`. A new
+admission binds its stop criteria and initializes its sampling rows even when
+the external request ID and pool index equal a previous request's. Later
+steps of the same admission preserve sampling counts and RNG state; the
+identity never changes the request's seed.
+The host record fixes stop criteria for the lifetime of an admission, so
+stop binding uses that identity without a second key containing the criteria.
+A later request reusing the public RID still receives a new identity.
+
+A retraction keeps the admission identity. A sampler snapshot records whether
+that admission prepared the slot: an image taken before the first local
+prepare contains no previous occupant's payload. Restoring a prepared image
+claims the destination for that admission, preserving its next sampling step;
+an unprepared image requires initialization on first use. RuntimeStates
+restores its running rows but invalidates its stop-binding owner. The next
+forward rebinds the host's canonical stop criteria without clearing restored
+cache lengths, candidates or stop flags. This also covers a remote landing
+imaged before its first stop binding. Stores, restores and binding retain the
+existing execution-stream dependencies; identity checks do not replace fences.
+
+Token-derived history, including Engram's accepted n-gram tail, is rebuilt
+from the host's token history rather than copied in the retraction image.
+Engram's external-RID comparison is only one reseed trigger: local extends
+and remote-prefill slot preparation call `RuntimeStates.reset_states()`,
+which marks the tail with `ngram_needs_seed`. The first decode after remote
+prefill or a snapshot restore also carries an explicit input token, forcing
+reseed even for the same RID and slot. Later decode steps advance the accepted
+tail in place. Reusing a RID therefore does not bypass the reseed needed when
+a slot changes hands.
+
+The sampler's route and top-k padding describe the current batch, not the
+owners of all prepared slots. Their cache tracks the admissions in each
+executed batch: equally sized batches can contain different prepared requests,
+including a restored request that waits while another batch runs. Restoring
+slot ownership must preserve sampling history; it does not establish which
+batch runs next. A stable batch reuses its cached route and padding.
+
 ### One decode metadata path
 
 `AttentionBackend.refresh_decode_metadata(bs, actual_bs, req_pool_indices,
@@ -717,9 +758,9 @@ over the target and draft `child_backends()` trees once
 two graph subsystems (`ForwardStepRunner.disable`, `PrefillGraph.disable`).
 `DSABackend` disables the prefill graph (rationale on the class) unless its
 consumer narrows a padded replay to the live rows in an eager break: a KPool
-instance (GLM-5.3-Flash), and Kimi-K3.1 on the prefill role and, without
-`--enable-mixed-batch`, on the aggregated role
-(`DSAConfig.padded_prefill_replay`).
+instance (GLM-5.3-Flash), and Kimi-K3.1 on the prefill role and on the
+aggregated role, where a mixed round's decode rows ride in the narrowed break
+with the extend's (`DSAConfig.padded_prefill_replay`).
 That instance declaration follows launch arguments, so the prefill role and
 Kimi-K3.1's aggregated role check at boot that every rank plans the same
 prefill graphs (`check_rank_uniform_prefill_plan`; keyed on the role and
@@ -923,6 +964,22 @@ rank, over a draft model that declares `supports_breakable_draft_extend` (its
 draft backend also attends in the mode a break passes it). `ServerArgs`
 refuses the switch for the launches its arguments rule out, and
 `ModelExecutor` for a boot whose plan has no step-0 series.
+
+A one-layer draft whose rows meet only at attention (Qwen3.5's MTP head, a
+`SplitExtendDraft`) splits its extend rounds instead and records
+no step-0 graph. A row's draft K/V reads only that row's inputs (its shifted
+token, the target's hidden row, its position), so `write_draft_kv` runs the
+layer up to its attention prologue over every row, and step 0 then runs from
+each request's last row as one more decode step, one below the frontier: it
+rewrites that row's K/V and attends over the prefix. The K/V writer replays
+one graph over a fixed tile of rows (`EXTEND_KV_TILE_ROWS`, at most the
+largest bucket; `prefill:drafter-kv`), staging the round tile after tile with
+the padded rows written to the dummy slot, and waits for the draft pool's
+Host load first as a step-0 replay does. The steps replay the decode-steps
+graph of the round's request count. No graph bakes a token bucket and a
+request count together, so a round of up to 16 requests replays at any token
+count. A mid chunk writes its K/V and drafts nothing, as no verify follows
+it. A round under attention DP or a query shard keeps step 0 whole, eagerly.
 
 A replay is not bit-identical to a serving-time eager round in general. The
 graphs keep the kernels startup dispatch chose for them, as the decode graphs
@@ -2469,6 +2526,20 @@ dense / MoE groups that are neither 1 nor the attention TP width in
 `validate_qcp`; the shard width (`N == attn.tp_size`) in `Mapping`; and the
 attention family (GPU DSA), device, and KV cache (bf16: the gathered write is
 `latent_store`, native rows only) in `AttnConfig`, which sees them resolved.
+
+## Runtime sizes reuse binaries
+
+Runtime payload counts and page-table widths do not select new binaries.
+The small Iris all-reduce keeps fixed mailbox geometry, validates complete
+tiles on the host and uses a uniform tile predicate so runtime payload
+bounds retain coherent 16-byte peer transactions. Paged history-table row
+offsets are computed in 64 bits before multiplying by the runtime stride.
+Scalar prefix-length reads share one binary across slice alignments.
+
+`test_batch_shape_recompiles_gfx950.py` checks binary reuse across runtime sizes;
+`test_mla_prefix_chunks.py` exercises a table offset beyond 2**31.
+Full serving validation must additionally show no compilation after
+readiness with the compilation monitor enabled.
 
 ## Non-goals
 
