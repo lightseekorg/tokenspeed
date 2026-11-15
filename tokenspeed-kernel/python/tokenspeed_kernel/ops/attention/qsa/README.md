@@ -329,8 +329,8 @@ resident CTA per SM, the choice minimizes the wave count times the per-CTA
 work: each of its query rows gathers the 2048-entry prefix slots within one KV
 split and adds a fixed per-row cost fitted on SM103. Smaller grids keep the
 split rule with one query per CTA. SM107 also keeps one query per CTA, but
-FP8 calls with 24 query heads and two KV heads use one KV split once the
-unsplit grid has at least two output tiles per SM, avoiding repeated setup
+FP8 calls with 24 query heads and 2 KV heads use 1 KV split when the
+unsplit grid has at least 2 output tiles per SM, avoiding repeated setup
 and partial-output reduction. Smaller grids and other SM107 shapes retain
 their existing splits.
 
