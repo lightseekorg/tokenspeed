@@ -181,7 +181,7 @@ def _prepare(backend: tb.TritonSamplingBackend, device: str) -> torch.Tensor:
         sp.resolve_seed(rid)
         sp.normalize(None)
     backend.prepare_step(
-        request_ids=rids,
+        admission_ids=list(range(len(params))),
         request_pool_indices=SLOTS,
         sampling_params_list=params,
         num_tokens_per_req=N,
@@ -300,7 +300,21 @@ class _TargetOnly(Exception):
     pass
 
 
-def test_without_recorded_q_the_target_only_rule_runs(monkeypatch):
+def test_without_recorded_q_verify_refuses_block_verification(monkeypatch):
+    backend = _backend(monkeypatch)
+    req_pool_indices = _prepare(backend, "cpu")
+    logits, _, candidates, valid_cache_lengths = _inputs("cpu")
+
+    with pytest.raises(RuntimeError, match="recorded draft probabilities"):
+        backend.verify(
+            LogitsProcessorOutput(next_token_logits=logits),
+            _info(req_pool_indices, valid_cache_lengths, None),
+            candidates,
+            tree=None,
+        )
+
+
+def test_the_shard_warmup_runs_the_target_only_rule(monkeypatch):
     backend = _backend(monkeypatch)
     req_pool_indices = _prepare(backend, "cpu")
     logits, _, candidates, valid_cache_lengths = _inputs("cpu")
@@ -309,6 +323,7 @@ def test_without_recorded_q_the_target_only_rule_runs(monkeypatch):
         raise _TargetOnly
 
     monkeypatch.setattr(backend, "_sample_verify_targets", target_only)
+    monkeypatch.setattr(backend, "_vocab_shard_warmup", True)
     with pytest.raises(_TargetOnly):
         backend.verify(
             LogitsProcessorOutput(next_token_logits=logits),

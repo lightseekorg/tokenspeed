@@ -1711,7 +1711,7 @@ store client reads `MC_USE_IPV6` on its own when the store starts, so export
 `--speculative-rejection-sample-method block --enable-speculative-sampling --sampling-backend flashinfer`
 verifies a sampled draft chain by block verification instead of token-wise
 rejection. `--sampling-backend triton` (the ROCm path) runs it too. Because
-block verification needs whole target rows, triton skips its
+block verification needs whole target rows, the Triton backend skips its
 vocabulary-shard candidate selection and, unless the batch's top-k bounds the
 candidates, sorts whole rows. The names follow vLLM: `--enable-speculative-sampling` is
 `draft_sample_method=probabilistic`, and `--speculative-config` also accepts
@@ -1734,7 +1734,7 @@ The output uses the existing accepted-length and state rollback contract.
 
 The existing per-request proposal RNG is reused. The accepted length depends
 on every prefix coin, so no two verify steps of a request share a coin: the
-flashinfer backend draws fresh coins each step, and triton keys one step's
+FlashInfer backend draws fresh coins each step, and the Triton backend keys one step's
 coins by the request's seed and the step's first verify position.
 A stochastic output difference from greedy decoding is expected; validate the
 output distribution and accuracy, rather than requiring identical token IDs.
