@@ -35,6 +35,7 @@ def _stage_mxfp4_mega_moe_inputs_kernel(
     topk_weights,
     topk_idx_out,
     topk_weights_out,
+    live_requests,
     num_tokens,
     shared_block_m,
     hidden_stride_m: tl.constexpr,
@@ -60,6 +61,7 @@ def _stage_mxfp4_mega_moe_inputs_kernel(
     GROUP_K: tl.constexpr,
     BLOCK_TOPK: tl.constexpr,
     HAS_SHARED: tl.constexpr,
+    HAS_LIVE: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ) -> None:
     # The outputs live in the MegaMoE symmetric buffer, which the previous
@@ -139,6 +141,18 @@ def _stage_mxfp4_mega_moe_inputs_kernel(
             mask=topk_mask,
             other=0,
         ).to(tl.int64)
+        if HAS_LIVE:
+            # A padded graph replay stages the rank's whole batch, request-major
+            # with the filler requests last: route no row past the live
+            # requests' share, as MegaMoE skips negative ids in dispatch and
+            # combine. The product of two runtime counts is taken in int64.
+            live_rows = (
+                num_tokens
+                * tl.load(live_requests).to(tl.int64)
+                // tl.load(live_requests + 1)
+            )
+            filler = token_ids >= live_rows
+            ids = tl.where(filler[:, None], -1, ids)
         tl.store(
             topk_idx_out
             + token_ids[:, None] * topk_idx_stride_m
@@ -154,6 +168,8 @@ def _stage_mxfp4_mega_moe_inputs_kernel(
             mask=topk_mask,
             other=0.0,
         )
+        if HAS_LIVE:
+            weights = tl.where(filler[:, None], 0.0, weights)
         tl.store(
             topk_weights_out
             + token_ids[:, None] * topk_weights_out_stride_m
@@ -178,12 +194,20 @@ def stage_mxfp4_mega_moe_inputs(
     topk_weights_out: torch.Tensor,
     shared_x_sf: torch.Tensor | None,
     shared_block_m: int | None,
+    live_requests: torch.Tensor | None,
 ) -> None:
     """Write MegaMoE's FP8 inputs and routing into its symmetric buffer.
 
     ``shared_x_sf`` and ``shared_block_m``, both given or both None, add the
     scale view a fused shared expert reads; ``shared_block_m`` is the BLOCK_M
-    MegaMoE runs this token count with.
+    MegaMoE runs this token count with. ``live_requests``, an int32 device
+    pair (live, padded) read at launch, routes only the first
+    ``num_tokens * live // padded`` rows: a CUDA graph replayed at a padded
+    batch size stages its filler rows with expert id -1 and weight 0. That
+    needs ``hidden_states`` to be the rank's whole padded batch, request-major
+    with the same rows per request and the filler requests last, not a TP
+    shard of it (see ``mega_moe_live_requests``). Codes and scales are staged
+    for every row. None routes every row.
     """
     num_tokens, hidden_size = hidden_states.shape
     if (shared_x_sf is None) != (shared_block_m is None):
@@ -200,6 +224,10 @@ def stage_mxfp4_mega_moe_inputs(
             "DeepSeek V4 MegaMoE input staging requires topk_weights and "
             "topk_ids to have the same shape."
         )
+    if live_requests is not None and (
+        live_requests.shape != (2,) or live_requests.dtype != torch.int32
+    ):
+        raise ValueError("live_requests must be an int32 (live, padded) pair")
 
     block_k = _DEEPSEEK_V4_MEGAMOE_FP8_BLOCK_SIZE
     block_m = _stage_block_m(num_tokens)
@@ -215,6 +243,7 @@ def stage_mxfp4_mega_moe_inputs(
         topk_weights,
         topk_idx_out,
         topk_weights_out,
+        live_requests,
         num_tokens,
         shared_block_m or 1,
         hidden_states.stride(0),
@@ -240,6 +269,7 @@ def stage_mxfp4_mega_moe_inputs(
         GROUP_K=32,
         BLOCK_TOPK=block_topk,
         HAS_SHARED=shared_x_sf is not None,
+        HAS_LIVE=live_requests is not None,
         ENABLE_PDL=enable_pdl,
         num_warps=4,
         **({"launch_pdl": True} if enable_pdl else {}),

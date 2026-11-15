@@ -294,6 +294,31 @@ def live_graph_outputs(outputs: tuple, bs: int, max_tokens_per_req: int) -> tupl
     )
 
 
+def mega_moe_stages_whole_batches(
+    *, attention_tp_size: int, moe_tp_ep_size: int
+) -> bool:
+    """Whether each rank's MegaMoE input is its attention-DP group's whole batch.
+
+    MegaMoE dispatches and combines across ranks itself, so a model hands it
+    the rows the attention output leaves on the rank. With attention TP 1
+    those are the rank's own batch. With attention TP equal to the MoE TP x EP
+    size the attention output is all-reduced, so every rank holds its group's
+    whole batch. Any other attention TP reduce-scatters the batch into
+    contiguous shards (Qwen3.5's DP4/TP2/EP8), and a shard's live rows are not
+    the live requests' share of its rows. A padded decode replay therefore
+    writes MegaMoE's live-request counts (``mega_moe_live_requests``) only
+    under the first two layouts.
+
+    Args:
+        attention_tp_size: The attention TP group size.
+        moe_tp_ep_size: The MoE TP x EP group size.
+
+    Returns:
+        True when every rank stages its group's whole padded batch.
+    """
+    return attention_tp_size in (1, moe_tp_ep_size)
+
+
 class ForwardStepRunner:
     """Owns one forward step end to end: metadata prep, then execution.
 
@@ -453,6 +478,28 @@ class ForwardStepRunner:
         self._expert_load_rows: ExpertLoadRowMask | None = (
             placement.load_rows if placement is not None else None
         )
+        # MegaMoE stages a padded replay's filler rows with no experts: the
+        # replay writes its (live, padded) request counts here and (1, 1)
+        # after, so eager and prefill-graph forwards route every row. It stays
+        # None, and MegaMoE routes every row, unless every rank stages its
+        # attention-DP group's whole batch.
+        self._mega_moe_live_requests: torch.Tensor | None = None
+        whole_batches = mega_moe_stages_whole_batches(
+            attention_tp_size=config.attention_tp_size,
+            moe_tp_ep_size=config.moe_tp_ep_size,
+        )
+        if torch.device(self.device).type == "cuda" and whole_batches:
+            # Imported here: layers.moe imports this module (latent.py). The
+            # pair is state of the DeepGEMM MegaMoE solution, not a kernel op.
+            # Hooks on a registered kernel (plan["warmup"]) are reached through
+            # a MoE layer's plan, and the runner holds no MoE layer; the pair
+            # is one buffer for every MegaMoE layer, target and drafter alike.
+            from tokenspeed_kernel.ops.moe.deep_gemm import mega_moe_live_requests
+
+            from tokenspeed.runtime.layers.moe.utils import get_moe_backend
+
+            if get_moe_backend().is_mega_moe():
+                self._mega_moe_live_requests = mega_moe_live_requests(self.device)
         # The capture side stream. Created here, not in capture(): the
         # prefill graph shares it (PrefillGraph._capture_bucket reads
         # decode_wrapper.stream), and a backend may declare
@@ -1296,15 +1343,27 @@ class ForwardStepRunner:
                         else [ctx.input_num_tokens] * self.world_size
                     ),
                 )
-            with (
-                torch.inference_mode() if self.device == "npu" else nullcontext()
-            ), nvtx_range("graph_replay", color="red"):
-                if self.drafter is not None:
-                    self.drafter.replay_decode_graph(graph, bs=bs, graph_bs=padded_bs)
-                else:
-                    graph.replay()
-            if self._expert_load_rows is not None:
-                self._expert_load_rows.clear()
+            live_requests = self._mega_moe_live_requests if padded_bs != bs else None
+            if live_requests is not None:
+                live_requests[0].fill_(bs)
+                live_requests[1].fill_(padded_bs)
+            try:
+                with (
+                    torch.inference_mode() if self.device == "npu" else nullcontext()
+                ), nvtx_range("graph_replay", color="red"):
+                    if self.drafter is not None:
+                        self.drafter.replay_decode_graph(
+                            graph, bs=bs, graph_bs=padded_bs
+                        )
+                    else:
+                        graph.replay()
+            finally:
+                # Even after a failed replay: later eager forwards must not
+                # skip live rows, in MegaMoE or in the expert load counters.
+                if live_requests is not None:
+                    live_requests.fill_(1)
+                if self._expert_load_rows is not None:
+                    self._expert_load_rows.clear()
 
             result = live_graph_outputs(
                 self.output_buffers[graph_key], bs, self.max_tokens_per_req
