@@ -1327,6 +1327,7 @@ def test_configured_index_k_quantization_and_topk(tmp_path, phase) -> None:
     )
     from tokenspeed_kernel.ops.kvcache.index_k_scale import (
         decode_index_k_scale,
+        index_k_scale_ue8m0,
         round_index_k_scale,
     )
 
@@ -1364,11 +1365,12 @@ def test_configured_index_k_quantization_and_topk(tmp_path, phase) -> None:
         atol=1e-9,
     )
     # E4M3 has three mantissa bits; check the quantized values after scaling.
+    # A power-of-two scale doubles the subnormal step of the smallest values.
     torch.testing.assert_close(
         fp8.view(torch.float8_e4m3fn).float() * scales,
         normalized,
         rtol=1 / 16,
-        atol=1e-5,
+        atol=2e-5 if index_k_scale_ue8m0() else 1e-5,
     )
     indexer_output = _indexer_output(u, 1)
     common = dict(
