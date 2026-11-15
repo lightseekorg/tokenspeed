@@ -1735,7 +1735,7 @@ def test_prefill_topk_matches_the_causal_reference(prefix_len, extend_len) -> No
 def test_prefill_rows_within_topk_select_every_candidate_unscored(
     monkeypatch: pytest.MonkeyPatch, prefix_len: int, extend_len: int, scored: bool
 ) -> None:
-    """Rows seeing at most topk keys take all of them, as the scorer emits them."""
+    """Rows seeing at most topk keys take all of them, the set the scorer selects."""
     from tokenspeed.runtime.distributed import Mapping
     from tokenspeed.runtime.models import glm5
     from tokenspeed.runtime.utils.env import global_server_args_dict
@@ -1818,10 +1818,15 @@ def test_prefill_rows_within_topk_select_every_candidate_unscored(
 
     assert len(scored_calls) == int(scored)
     assert torch.equal(lens, expected_lens)
-    if scored:
-        # A row past topk comes out in the scorer's own order, not fixed run to run.
-        selected, expected = selected.sort(dim=1).values, expected.sort(dim=1).values
-    assert torch.equal(selected, expected)
+    # A leaf's own order is unspecified under the selection order: compare sets.
+    assert torch.equal(selected.sort(dim=1).values, expected.sort(dim=1).values)
+    if not scored:
+        # The shortcut emits each row's candidates by ascending position, -1 after them.
+        offsets = torch.arange(2048, device="cuda", dtype=torch.int32)
+        by_position = torch.where(
+            offsets < lens.unsqueeze(1), offsets + row_starts.unsqueeze(1), -1
+        )
+        assert torch.equal(selected, by_position)
 
 
 # ---------------------------------------------------------------- loader
