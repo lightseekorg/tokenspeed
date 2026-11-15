@@ -100,6 +100,7 @@ class MoELayer(torch.nn.Module):
         persistent_max_num_tokens_per_gpu: int | None = None,
         input_dtype: torch.dtype | None = None,
         peer_weights: MoEPeerWeights | None = None,
+        a2a_backend: str | None = None,
     ):
         super().__init__()
         self.layer_index = layer_index
@@ -172,7 +173,10 @@ class MoELayer(torch.nn.Module):
         self.num_local_experts = num_experts // self.ep_size
 
         # TODO: Unify alltoall backends at MoELayer level
-        a2a_backend = get_all2all_backend().value
+        # `None` selects the server's `--all2all-backend`. A model passes a
+        # backend, such as "none", for layers that exchange tokens themselves.
+        if a2a_backend is None:
+            a2a_backend = get_all2all_backend().value
         if a2a_backend in ("agrs", "flashinfer"):
             a2a_backend = "none"
         self._spec = MoELayerSpec(
