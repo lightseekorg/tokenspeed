@@ -156,6 +156,7 @@ def test_decode_scores(captured_logits, heads, q_len):
         index_k_cache=plane,
         q_scales=q_scales,
         slot_order="selection",
+        release_dependents_early=False,
     )
     dsa_ops.dsa_decode_topk(
         q, weights, seq_lens, table, index_k_format="mxfp4", **common
