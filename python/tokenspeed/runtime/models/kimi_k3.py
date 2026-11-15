@@ -1018,6 +1018,45 @@ class _AttentionPremix:
     out: torch.Tensor | None = None
 
 
+@dataclass
+class _GatedProjectionReduce:
+    """A layer's attention reduce, ``K3AttnComm.attn_reduce``'s operands, for
+    its KDA attention to run with the gated o-projection in one launch.
+    ``result`` receives ``(prefix_sum, hidden)`` if the attention did."""
+
+    comm: K3AttnComm
+    prefix_sum: torch.Tensor
+    combine: tuple
+    mlp_wp: torch.Tensor
+    result: tuple[torch.Tensor, torch.Tensor] | None = None
+
+    def __call__(
+        self,
+        x: torch.Tensor,
+        gate: torch.Tensor,
+        norm_weight: torch.Tensor,
+        weight: torch.Tensor,
+        norm_eps: float,
+    ) -> torch.Tensor | None:
+        """The reduced hidden rows, or None where the fused launch does not
+        serve these rows and the attention projects them itself."""
+        if not self.comm.gated_projection_reduce_available(
+            x, gate, norm_weight, weight, self.prefix_sum, self.combine, self.mlp_wp
+        ):
+            return None
+        self.result = self.comm.gated_projection_reduce(
+            x,
+            gate,
+            norm_weight,
+            weight,
+            norm_eps,
+            self.prefix_sum,
+            self.combine,
+            self.mlp_wp,
+        )
+        return self.result[1]
+
+
 # Below this, the replicated AttnRes mix costs too little to shard by rows.
 _K3_SHARDED_RESIDUAL_MIN_TOKENS = 1024
 
@@ -1822,7 +1861,10 @@ class KimiLinearKDA(nn.Module):
         *,
         projection_out: torch.Tensor | None,
         precomputed_projection: torch.Tensor | None = None,
+        output_reduce: _GatedProjectionReduce | None = None,
     ) -> torch.Tensor:
+        """This rank's o-projection partial [T, hidden], or with
+        ``output_reduce`` taking it, the reduced hidden rows."""
         if (
             hidden_states.shape[0] == 0
             and self.qkv_parallel is None
@@ -1868,6 +1910,16 @@ class KimiLinearKDA(nn.Module):
             # Decode rows: the o-projection GEMV applies the gated norm itself,
             # bit for bit with the separate norm and mm.
             core_out = self._recurrent_core(mixed_qkv, f_a_out, beta, ctx, None)
+            if output_reduce is not None:
+                reduced = output_reduce(
+                    core_out.contiguous(),
+                    out_gate,
+                    self.o_norm.weight,
+                    self.o_proj.weight,
+                    self.o_norm.variance_epsilon,
+                )
+                if reduced is not None:
+                    return reduced
             if projection_out is None:
                 projection_out = core_out.new_empty(
                     (num_tokens, self.o_proj.weight.shape[0])
@@ -4371,13 +4423,24 @@ class KimiLinearDecoderLayer(nn.Module):
         projection_out = self.k3_comm.acquire_projection_output(
             h, self.self_attn.o_proj
         )
-        with self.attn_fork.scope(
-            enable=(
-                get_is_capture_mode()
-                and num_tokens > ATTNRES_STREAM_FORK_THRESHOLD
-                and (attnres_partial_args is None or own_mlp)
-            )
-        ) as fork:
+        fork_enabled = (
+            get_is_capture_mode()
+            and num_tokens > ATTNRES_STREAM_FORK_THRESHOLD
+            and (attnres_partial_args is None or own_mlp)
+        )
+        # The mlp-side partial runs ahead on this stream, so a KDA attention
+        # can reduce in its o-projection's launch.
+        output_reduce = (
+            _GatedProjectionReduce(self.k3_comm, prefix_sum, ar_combine, self._mlp_wp)
+            if isinstance(self.self_attn, KimiLinearKDA)
+            and not fork_enabled
+            and projection_out is None
+            and ar_combine is not None
+            and prefix_sum is not None
+            else None
+        )
+        attn_kwargs = {} if output_reduce is None else {"output_reduce": output_reduce}
+        with self.attn_fork.scope(enable=fork_enabled) as fork:
             with fork.branch():
                 if next_mix is not None:
                     next_layer, _ = next_mix
@@ -4412,15 +4475,19 @@ class KimiLinearDecoderLayer(nn.Module):
                 comm_manager=self.comm_manager,
                 attnres_partial_args=attnres_partial_args,
                 projection_out=projection_out,
+                **attn_kwargs,
             )
-            if not reduce_consumes_scratch:
+            reduced = output_reduce is not None and output_reduce.result is not None
+            if reduced:
+                prefix_sum, h_fused = output_reduce.result
+            elif not reduce_consumes_scratch:
                 prefix_sum, h_fused = self._reduce_attn_accumulate(
                     attn_out,
                     prefix_sum,
                     combine=ar_combine,
                     producer_direct=projection_out is not None,
                 )
-        if reduce_consumes_scratch:
+        if reduce_consumes_scratch and not reduced:
             prefix_sum, h_fused = self._reduce_attn_accumulate(
                 attn_out,
                 prefix_sum,

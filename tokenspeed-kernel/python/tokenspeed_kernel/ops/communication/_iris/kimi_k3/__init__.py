@@ -1093,6 +1093,57 @@ class K3IrisState:
             partial, residual, score_weight, output_weight, scratch, eps
         )
 
+    def attnres_projection_supported(
+        self,
+        x: torch.Tensor,
+        gate: torch.Tensor,
+        norm_weight: torch.Tensor,
+        weight: torch.Tensor,
+        residual: torch.Tensor,
+        score_weight: torch.Tensor,
+        output_weight: torch.Tensor,
+        scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> bool:
+        """Whether ``attnres_projection_combine`` serves these rows."""
+        return self.attnres is not None and self.attnres.gated_projection_supported(
+            x, gate, norm_weight, weight, residual, score_weight, output_weight, scratch
+        )
+
+    def attnres_projection_combine(
+        self,
+        x: torch.Tensor,
+        gate: torch.Tensor,
+        norm_weight: torch.Tensor,
+        weight: torch.Tensor,
+        residual: torch.Tensor,
+        score_weight: torch.Tensor,
+        output_weight: torch.Tensor,
+        scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        *,
+        norm_eps: float,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``attnres_combine`` of ``mv_rmsnorm_gated_sigmoid(x, gate,
+        norm_weight, weight)``'s rows, projected and reduced in one launch.
+
+        The residual matches the Lamport window of ``attnres_combine`` bit for
+        bit; the hidden rows sum in another order, see
+        ``IrisAttnResState.gated_projection_lamport``.
+        """
+        assert self.attnres is not None
+        return self.attnres.gated_projection_lamport(
+            x,
+            gate,
+            norm_weight,
+            weight,
+            norm_eps,
+            residual,
+            score_weight,
+            output_weight,
+            scratch,
+            eps,
+        )
+
     def _reduce_attention_lamport(self, partial: torch.Tensor) -> torch.Tensor | None:
         from tokenspeed_kernel.ops.communication._iris.all_reduce import (
             iris_arch_policy,

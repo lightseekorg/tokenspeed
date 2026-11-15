@@ -800,6 +800,186 @@ class TestAttnResTests:
                 assert (events) == (["partial", "attention", "scope_exit", "reduce"])
                 reduce.assert_called_once()
 
+    def test_gated_projection_reduce_serves_only_the_iris_combine(self, subtests):
+        """The fused o-projection stands in only where ``attn_reduce`` would
+        take the Iris AttnRes combine, and returns that branch's pair."""
+        import tokenspeed.runtime.models.kimi_k3_comm as kimi_k3_comm
+
+        comm = kimi_k3_comm.K3AttnComm.__new__(kimi_k3_comm.K3AttnComm)
+        x = torch.randn(4, 24, dtype=torch.bfloat16)
+        gate = torch.randn_like(x)
+        norm_weight = torch.ones(8)
+        weight = torch.randn(_HIDDEN, 24, dtype=torch.bfloat16)
+        prefix = torch.randn(4, _HIDDEN, dtype=torch.bfloat16)
+        scratch = (object(), object(), object())
+        out_weight = torch.randn(_HIDDEN, dtype=torch.bfloat16)
+        combine = (scratch, object(), object(), out_weight, _EPS)
+        mlp_wp = torch.randn(_HIDDEN, dtype=torch.bfloat16)
+        hidden, residual = torch.randn_like(prefix), torch.randn_like(prefix)
+        for case, setup, expected in (
+            ("iris", {}, True),
+            ("collective", {"cute_ar": object()}, False),
+            ("vendor", {"attn_ar_fusion_ok": True}, False),
+            ("unprepared", {"iris_state": None}, False),
+            ("kernel", {"projection_supported": False}, False),
+            ("block write", {"combine": None}, False),
+            ("no prefix", {"prefix": None}, False),
+        ):
+            with (
+                subtests.test(case=case),
+                mock.patch.dict(
+                    kimi_k3_comm.global_server_args_dict,
+                    {"comm_fusion_max_num_tokens": 2048},
+                ),
+            ):
+                comm.cute_ar = setup.get("cute_ar")
+                comm.attn_ar_fusion_ok = setup.get("attn_ar_fusion_ok", False)
+                comm.iris_state = setup.get(
+                    "iris_state",
+                    SimpleNamespace(
+                        attnres_supported=mock.Mock(return_value=True),
+                        attnres_projection_supported=mock.Mock(
+                            return_value=setup.get("projection_supported", True)
+                        ),
+                        attnres_projection_combine=mock.Mock(
+                            return_value=(hidden, residual)
+                        ),
+                    ),
+                )
+                operands = (
+                    setup.get("prefix", prefix),
+                    setup.get("combine", combine),
+                    mlp_wp,
+                )
+                assert (
+                    comm.gated_projection_reduce_available(
+                        x, gate, norm_weight, weight, *operands
+                    )
+                ) == (expected)
+                if not expected:
+                    continue
+                result = comm.gated_projection_reduce(
+                    x, gate, norm_weight, weight, 1e-6, *operands
+                )
+                assert (result[0]) is (residual)
+                assert (result[1]) is (hidden)
+                fused = comm.iris_state.attnres_projection_combine
+                fused.assert_called_once()
+                args, kwargs = fused.call_args
+                assert all(
+                    actual is wanted
+                    for actual, wanted in zip(
+                        args,
+                        (x, gate, norm_weight, weight, prefix, mlp_wp, out_weight),
+                    )
+                )
+                assert (args[7]) is (scratch)
+                assert (kwargs) == ({"norm_eps": 1e-6, "eps": _EPS})
+
+    def test_kda_attention_reduces_inside_its_projection(self, subtests):
+        """Off the stream fork and the producer-direct buffer, a KDA layer
+        offers its attention the reduce; the separate reduce runs unless the
+        attention took it."""
+
+        class Fork:
+            @contextmanager
+            def scope(self, *, enable):
+                yield self
+
+            @contextmanager
+            def branch(self):
+                yield
+
+        h = SimpleNamespace(shape=(8, _HIDDEN), is_cuda=True)
+        prefix = torch.zeros(8, _HIDDEN, dtype=torch.bfloat16)
+        fused = (torch.ones_like(prefix), torch.full_like(prefix, 2.0))
+        separate = (torch.full_like(prefix, 3.0), torch.full_like(prefix, 4.0))
+        weight = mock.Mock()
+        weight.reshape.return_value = weight
+        scratch = object()
+        for kda, takes, capture, projection_out in (
+            (True, True, False, None),
+            (True, False, False, None),
+            (True, True, True, None),
+            (True, True, False, object()),
+            (False, True, False, None),
+        ):
+            with subtests.test(
+                kda=kda,
+                takes=takes,
+                capture=capture,
+                producer_direct=projection_out is not None,
+            ):
+
+                def attention(**kwargs):
+                    output_reduce = kwargs.get("output_reduce")
+                    if output_reduce is not None and takes:
+                        output_reduce.result = fused
+                        return fused[1]
+                    return object()
+
+                self_attn = (
+                    mock.Mock(spec=kimi_k3.KimiLinearKDA) if kda else mock.Mock()
+                )
+                self_attn.side_effect = attention
+                self_attn.o_proj = object()
+                layer = SimpleNamespace(
+                    _premixed_input=None,
+                    _fused_attnres_graph_available=mock.Mock(return_value=False),
+                    _mix_into_attention=mock.Mock(return_value=(h, prefix)),
+                    prev_valid_blocks=1,
+                    is_block_write_layer=False,
+                    _mlp_slot=3,
+                    _mlp_split=False,
+                    _next_attn_mix=None,
+                    _hoist_next_mlp=False,
+                    _mlp_wp=object(),
+                    mlp_res_proj=SimpleNamespace(weight=weight),
+                    mlp_res_norm=SimpleNamespace(
+                        weight=object(), variance_epsilon=_EPS
+                    ),
+                    post_attention_layernorm=SimpleNamespace(weight=object()),
+                    self_attn=self_attn,
+                    comm_manager=object(),
+                    k3_comm=SimpleNamespace(
+                        attn_ar_fusion_ok=False,
+                        acquire_projection_output=mock.Mock(
+                            return_value=projection_out
+                        ),
+                        fused_attnres_reduce_available=mock.Mock(return_value=True),
+                    ),
+                    attn_fork=Fork(),
+                    _reduce_attn_accumulate=mock.Mock(return_value=separate),
+                    is_moe_layer=False,
+                    mlp=mock.Mock(return_value=torch.zeros_like(prefix)),
+                )
+                with (
+                    mock.patch.object(kimi_k3, "ATTNRES_STREAM_FORK_THRESHOLD", 0),
+                    mock.patch.object(
+                        kimi_k3, "get_is_capture_mode", return_value=capture
+                    ),
+                    mock.patch.object(kimi_k3, "_sliced_scratch", return_value=scratch),
+                    mock.patch.object(kimi_k3, "attnres_partial"),
+                ):
+                    result, _ = kimi_k3.KimiLinearDecoderLayer.forward(
+                        layer, object(), object(), object(), [object()]
+                    )
+
+                offered = kda and not capture and projection_out is None
+                output_reduce = self_attn.call_args.kwargs.get("output_reduce")
+                assert (output_reduce is not None) == (offered)
+                if offered:
+                    assert (output_reduce.comm) is (layer.k3_comm)
+                    assert (output_reduce.prefix_sum) is (prefix)
+                    assert (output_reduce.combine[0]) is (scratch)
+                    assert (output_reduce.mlp_wp) is (layer._mlp_wp)
+                expected = fused if offered and takes else separate
+                assert (layer._reduce_attn_accumulate.call_count) == (
+                    0 if expected is fused else 1
+                )
+                assert (layer.mlp.call_args.args[0]) is (expected[1])
+                torch.testing.assert_close(result, expected[0])
+
     def test_fused_to_fallback_populates_next_split_partial(self, subtests):
         hidden_states = SimpleNamespace(shape=(4, _HIDDEN), is_cuda=True)
         block_residual = torch.zeros(3, 4, _HIDDEN, dtype=torch.bfloat16)
