@@ -24,11 +24,10 @@ import torch.distributed as dist
 
 
 def supports_replica_memory_transitions(
-    *, checked_startup: bool, memory_saver: bool, device: str, role: str
+    *, checked_startup: bool, memory_saver: bool, backend_capable: bool, role: str
 ) -> bool:
-    """Select v3 for the checked Ascend serving path."""
-    # Other devices keep the v2 memory path, including CUDA graph and NCCL.
-    return checked_startup and memory_saver and device == "npu" and role != "encode"
+    """Select v3 only when checked startup and the allocator both support it."""
+    return checked_startup and memory_saver and backend_capable and role != "encode"
 
 
 def gather_collective_addresses(

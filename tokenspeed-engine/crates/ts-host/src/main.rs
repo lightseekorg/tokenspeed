@@ -708,18 +708,12 @@ fn bootstrap_worker<'py>(
         }
         Err(error) => return Err(error),
     };
-    // Earlier bootstraps can select v2. The previous draft used a different
-    // preflight ABI, so use v3 only when both halves support this startup.
-    let checked_startup = runtime.hasattr("ASCEND_MEMORY_PROTOCOL_STARTUP")?;
-    let prepared = if checked_startup {
-        let options = PyDict::new(py);
-        options.set_item("validate_memory_protocol", true)?;
-        prepare.call((control_fd,), Some(&options))?
-    } else {
-        prepare.call1((control_fd,))?
-    };
+    // This entry point requires checked startup. Do not retry a failed call:
+    // it may already have consumed the launch pipe.
+    let options = PyDict::new(py);
+    options.set_item("validate_memory_protocol", true)?;
+    let prepared = prepare.call((control_fd,), Some(&options))?;
     let (replica_memory_transitions, start): (bool, Py<PyAny>) = prepared.extract()?;
-    let replica_memory_transitions = checked_startup && replica_memory_transitions;
     let protocol = if replica_memory_transitions {
         3_u32
     } else {

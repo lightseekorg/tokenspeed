@@ -1849,7 +1849,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             return Ok(false);
         }
         let (_, tags) = prepared.expect("every participant validated its memory call");
-        if let Some(reason) = self.refuse_memory_transition(&tags, call.release)? {
+        if let Some(reason) = self.memory_transition_refusal(&tags, call.release)? {
             self.controls
                 .refuse_memory_transition(call.release, &reason);
             return Ok(false);
@@ -2227,7 +2227,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             if self.config.controls.replica_memory_transitions {
                 // Weight and cache prerequisites may have changed while draining.
                 let tags = tags.clone();
-                if let Some(reason) = self.refuse_memory_transition(&tags, true)? {
+                if let Some(reason) = self.memory_transition_refusal(&tags, true)? {
                     self.controls.cancel_memory_release(&reason);
                     return Ok(());
                 }
@@ -2263,7 +2263,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         Ok(())
     }
 
-    fn refuse_memory_transition(
+    fn memory_transition_refusal(
         &mut self,
         tags: &[String],
         release: bool,

@@ -1694,10 +1694,6 @@ class HostBootstrap:
         self._device.shutdown_cache()
 
 
-# The native host uses this to opt into the checked rendezvous.
-ASCEND_MEMORY_PROTOCOL_STARTUP = True
-
-
 def prepare_bootstrap(
     control_fd: int, *, validate_memory_protocol: bool
 ) -> tuple[bool, Callable[..., HostBootstrap | EncodeBootstrap]]:
@@ -1708,7 +1704,9 @@ def prepare_bootstrap(
     replica_memory_transitions = supports_replica_memory_transitions(
         checked_startup=validate_memory_protocol,
         memory_saver=server_args.enable_memory_saver,
-        device=server_args.device,
+        backend_capable=TorchMemorySaverAdapter.adapter_class(
+            enable=server_args.enable_memory_saver
+        ).supports_replica_memory_transitions,
         role=role,
     )
 

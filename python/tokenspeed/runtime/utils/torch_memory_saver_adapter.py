@@ -24,6 +24,7 @@ from abc import ABC
 from collections.abc import Callable
 from contextlib import contextmanager
 from contextvars import ContextVar
+from typing import ClassVar
 
 import torch
 
@@ -71,11 +72,17 @@ def initialize_communication(operation: Callable[[], None]) -> None:
 
 
 class TorchMemorySaverAdapter(ABC):
+    # Startup reads the selected class without constructing an allocator.
+    supports_replica_memory_transitions: ClassVar[bool] = False
+
+    @staticmethod
+    def adapter_class(enable: bool) -> type["TorchMemorySaverAdapter"]:
+        """Select the backend class without allocating or initializing a device."""
+        return _TorchMemorySaverAdapterReal if enable else _TorchMemorySaverAdapterNoop
+
     @staticmethod
     def create(enable: bool):
-        return (
-            _TorchMemorySaverAdapterReal() if enable else _TorchMemorySaverAdapterNoop()
-        )
+        return TorchMemorySaverAdapter.adapter_class(enable)()
 
     def configure_subprocess(self):
         raise NotImplementedError

@@ -141,8 +141,11 @@ response, including a failure in a different serving replica.
 ## Memory transition protocol
 
 The update-commit version 2 above is unchanged. Checked host/runtime pairs
-select release/resume protocol 3 for Ascend generation roles with
-`--enable-memory-saver`, excluding encode. CUDA, ROCm and other paths retain
+select release/resume protocol 3 when the selected allocator backend declares
+coordinated transitions, with `--enable-memory-saver`, excluding encode. Startup
+reads this class capability without constructing the allocator or initializing
+a device. The independent Ascend adapter declares support; CUDA, ROCm and Noop
+adapters do not. Their paths retain
 protocol 2 and its local ACK, graph and NCCL behavior. The existing Gloo address rendezvous rejects
 mixed protocols before the Rust mesh or READY: v2 keeps its plain address,
 and legacy v2 peers reject a tagged v3 address. Prefill and Decode worlds
