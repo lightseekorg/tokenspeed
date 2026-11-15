@@ -148,9 +148,19 @@ def _configuration(rows, q_heads, kv_heads, max_seqlen_q, bf16_kv, sm_count, dev
             if rows * head_tiles_per_row <= _SMALL_MAX_CLUSTERS
             else 0
         ),
-        # The FP8 wave cost model was fitted on SM103; SM107 keeps its split rule.
+        # The FP8 wave cost model was fitted on SM103; SM107 uses its own policy.
         fp8_wave_sizing=not _is_sm107(device),
     )
+    if (
+        not bf16_kv
+        and heads_per_kv == 12
+        and kv_heads == 2
+        and rows * head_tiles_per_row >= 2 * sm_count
+        and _is_sm107(device)
+    ):
+        # Two independent output tiles per SM amortize a partial final wave.
+        # One split avoids repeated setup and partial-output reduction.
+        kv_splits = 1
     return (
         head_tile,
         query_group,
