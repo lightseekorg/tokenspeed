@@ -49,6 +49,8 @@ class HybridGlm53FlashTokenToKVPool(HybridKDATokenToKVPool):
 
     # Unlike the KDA hybrid it extends, its latent writes keep non-finite values.
     latent_write_sanitizes: ClassVar[bool] = False
+    # The recipe admits only FP8-with-scale index rows (glm53_flash.py).
+    index_k_format: ClassVar[str] = "fp8_scaled"
 
     def __init__(self, *args, pool_options: Glm53FlashPoolOptions, **kwargs):
         self.index_head_dim = pool_options.index_head_dim

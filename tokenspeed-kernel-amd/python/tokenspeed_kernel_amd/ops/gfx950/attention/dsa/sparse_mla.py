@@ -1126,6 +1126,79 @@ def _load_listed_group(
 
 
 @gluon.jit
+def _compact_listed_ends(row_counts, num_tiles, shared_ends, TILES_LOG2: gl.constexpr):
+    # Tile t's listed keys take compact slots [ends[t - 1], ends[t]); returns their total.
+    TILES: gl.constexpr = 1 << TILES_LOG2
+    W: gl.constexpr = gl.num_warps()
+    tiles = gl.arange(0, TILES, layout=_vector_layout(W, TILES // (64 * W)))
+    counts = gl.amd.cdna4.buffer_load(
+        ptr=row_counts, offsets=tiles, mask=tiles < num_tiles, other=0, cache=".cv"
+    )
+    starts, total = _block_exclusive_ranks(counts, TILES // (64 * W))
+    shared_ends.store(starts + counts)
+    gl.barrier()
+    return total
+
+
+@gluon.jit
+def _load_compact_listed(
+    tile_total,
+    overflow_count,
+    row_keys,
+    row_slots,
+    row_overflow_keys,
+    row_overflow_slots,
+    shared_ends,
+    gather_layout: gl.constexpr,
+    TILES_LOG2: gl.constexpr,
+    CHUNK: gl.constexpr,
+    SIZE: gl.constexpr,
+):
+    # Tile-listed keys in tile order, then the overflow, packed into SIZE register slots.
+    TILES: gl.constexpr = 1 << TILES_LOG2
+    flat = gl.arange(0, SIZE, layout=gather_layout)
+    # A slot's tile is the number of tiles ending at or before it.
+    tile = gl.zeros_like(flat)
+    for level in gl.static_range(TILES_LOG2):
+        probe = tile + (TILES >> (level + 1))
+        tile = gl.where(shared_ends.gather(probe - 1, axis=0) <= flat, probe, tile)
+    tile_start = gl.where(
+        tile > 0, shared_ends.gather(gl.maximum(tile - 1, 0), axis=0), 0
+    )
+    tile_offsets = tile * CHUNK + flat - tile_start
+    in_tiles = flat < tile_total
+    overflow_offsets = flat - tile_total
+    in_overflow = (flat >= tile_total) & (overflow_offsets < overflow_count)
+    keys = gl.where(
+        in_tiles,
+        gl.amd.cdna4.buffer_load(
+            ptr=row_keys, offsets=tile_offsets, mask=in_tiles, other=0, cache=".cv"
+        ),
+        gl.amd.cdna4.buffer_load(
+            ptr=row_overflow_keys,
+            offsets=overflow_offsets,
+            mask=in_overflow,
+            other=0,
+            cache=".cv",
+        ),
+    ).to(gl.uint32, bitcast=True)
+    slots = gl.where(
+        in_tiles,
+        gl.amd.cdna4.buffer_load(
+            ptr=row_slots, offsets=tile_offsets, mask=in_tiles, other=0, cache=".cv"
+        ),
+        gl.amd.cdna4.buffer_load(
+            ptr=row_overflow_slots,
+            offsets=overflow_offsets,
+            mask=in_overflow,
+            other=0,
+            cache=".cv",
+        ),
+    )
+    return keys, slots, in_tiles | in_overflow
+
+
+@gluon.jit
 def _load_listed_overflow(
     row_overflow_keys,
     row_overflow_slots,
@@ -1337,6 +1410,7 @@ def _dsa_multi_cta_select_kernel(
     TILE_GROUP: gl.constexpr,
     CHUNK: gl.constexpr,
     TIE_CAP: gl.constexpr,
+    TILES_LOG2: gl.constexpr,
 ):
     # Level 2: CTAs list bucket keys; the last to arrive resolves and re-zeroes the row.
     gl.static_assert(
@@ -1489,12 +1563,49 @@ def _dsa_multi_cta_select_kernel(
         gl.zeros([NUM_BUCKETS], gl.int32, layout=histogram_layout)
     )
     gather_layout: gl.constexpr = gl.BlockedLayout([4], [64], [W], [0])
+    SIZE: gl.constexpr = TILE_GROUP * CHUNK
     remaining = topk - greater
-    # The first tile group's keys stay in registers; the rest stream once per level.
-    gathered_keys, gathered_slots, gathered = _load_listed_group(
-        row_counts, row_keys, row_slots, 0, num_tiles, gather_layout, TILE_GROUP, CHUNK
+    shared_ends = gl.allocate_shared_memory(
+        gl.int32, [1 << TILES_LOG2], _flat_shared_layout(1 << TILES_LOG2)
     )
     spilled = (num_tiles > TILE_GROUP) | (overflow_count > 0)
+    tile_total = num_tiles * 0
+    if spilled:
+        tile_total = _compact_listed_ends(
+            row_counts, num_tiles, shared_ends, TILES_LOG2
+        )
+    visit_tiles = num_tiles
+    visit_overflow = overflow_count
+    if spilled & (tile_total + overflow_count <= SIZE):
+        # A long row's few listed keys pack into registers instead of streaming per level.
+        gathered_keys, gathered_slots, gathered = _load_compact_listed(
+            tile_total,
+            overflow_count,
+            row_keys,
+            row_slots,
+            row_overflow_keys,
+            row_overflow_slots,
+            shared_ends,
+            gather_layout,
+            TILES_LOG2,
+            CHUNK,
+            SIZE,
+        )
+        visit_tiles = gl.minimum(num_tiles, TILE_GROUP)
+        visit_overflow = overflow_count * 0
+    else:
+        # The first tile group's keys stay in registers; the rest stream once per level.
+        gathered_keys, gathered_slots, gathered = _load_listed_group(
+            row_counts,
+            row_keys,
+            row_slots,
+            0,
+            num_tiles,
+            gather_layout,
+            TILE_GROUP,
+            CHUNK,
+        )
+    spilled = (visit_tiles > TILE_GROUP) | (visit_overflow > 0)
     bucket_prefix = bucket.to(gl.uint32)
     _count_multi_cta_digits(
         shared_histogram,
@@ -1512,8 +1623,8 @@ def _dsa_multi_cta_select_kernel(
         row_slots,
         row_overflow_keys,
         row_overflow_slots,
-        num_tiles,
-        overflow_count,
+        visit_tiles,
+        visit_overflow,
         shared_histogram,
         shared_tie_keys,
         shared_tie_slots,
@@ -1556,8 +1667,8 @@ def _dsa_multi_cta_select_kernel(
                 row_slots,
                 row_overflow_keys,
                 row_overflow_slots,
-                num_tiles,
-                overflow_count,
+                visit_tiles,
+                visit_overflow,
                 shared_histogram,
                 shared_tie_keys,
                 shared_tie_slots,
@@ -1594,8 +1705,8 @@ def _dsa_multi_cta_select_kernel(
             row_slots,
             row_overflow_keys,
             row_overflow_slots,
-            num_tiles,
-            overflow_count,
+            visit_tiles,
+            visit_overflow,
             shared_histogram,
             shared_tie_keys,
             shared_tie_slots,
@@ -1637,8 +1748,8 @@ def _dsa_multi_cta_select_kernel(
                 row_slots,
                 row_overflow_keys,
                 row_overflow_slots,
-                num_tiles,
-                overflow_count,
+                visit_tiles,
+                visit_overflow,
                 shared_histogram,
                 shared_tie_keys,
                 shared_tie_slots,
@@ -2782,6 +2893,14 @@ def _oneblock_launch_plan(cols: int, *, is_decode: bool) -> _TopKLaunchPlan:
     )
 
 
+# Row-bounded selection plans for its rows' lengths, not the buffer's width:
+# a KVP owned row holds a small fraction of a wide buffer's columns, so it
+# takes the short-row tiles rather than the wide ones with the compact final pass.
+_ROW_BOUNDED_ONEBLOCK_PLAN = _oneblock_launch_plan(
+    _ONEBLOCK_RADIX_MAX_COLS, is_decode=False
+)
+
+
 def _residency_safe_homogeneous_groups(
     rows: int,
     cols: int,
@@ -3093,6 +3212,8 @@ def _dsa_multi_cta_topk(
         TILE_GROUP=tile_group,
         CHUNK=chunk,
         TIE_CAP=_MULTI_CTA_TIE_CAP,
+        # The tile-count scan gives every lane of the block at least one tile.
+        TILES_LOG2=max(tiles - 1, 64 * _MULTI_CTA_NUM_WARPS - 1).bit_length(),
         num_warps=_MULTI_CTA_NUM_WARPS,
         **extern_compile_options(),
     )
@@ -3355,7 +3476,7 @@ def gluon_dsa_row_bounded_logical_topk_gfx950(
         topk=topk,
         q_len_per_req=1,
         is_decode=False,
-        plan=_oneblock_launch_plan(cols, is_decode=False),
+        plan=_ROW_BOUNDED_ONEBLOCK_PLAN,
         out=out,
         lens_out=lens_out,
     )
@@ -4063,37 +4184,17 @@ def launch_gluon_dsa_prefill_topk_fp8_gfx950(
     return out, lens_out
 
 
-def _check_standard_scorer_inputs(
-    q: torch.Tensor,
-    q_scales: torch.Tensor | None,
-    weights: torch.Tensor,
-    index_k_cache: torch.Tensor,
-    page_size: int,
-) -> tuple[int, int, bool]:
-    if q.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
-        raise TypeError(
-            f"standard-cache DSA scorer expects BF16 or FP8 q, got {q.dtype}"
-        )
-    if weights.dtype not in (torch.bfloat16, torch.float32):
-        raise TypeError(f"DSA weights must be BF16 or FP32, got {weights.dtype}")
-    if q.dim() != 3 or q.shape[1] not in (32, 64) or q.shape[2] != 128:
-        raise ValueError(
-            "standard-cache DSA scorer requires q=[tokens, 32|64, 128], got "
-            f"{tuple(q.shape)}"
-        )
-    if weights.shape != q.shape[:2]:
-        raise ValueError(
-            f"weights must have shape {tuple(q.shape[:2])}, got {tuple(weights.shape)}"
-        )
-    if q.stride(-1) != 1 or weights.stride(-1) != 1:
-        raise ValueError("q and weights must have contiguous innermost dimensions")
+def _scaled_plane_page_stride(
+    index_k_cache: torch.Tensor, page_size: int, row_bytes: int
+) -> int:
+    """Validate a packed or page-planar index-K plane of ``row_bytes`` rows;
+    return its page stride in bytes."""
     if page_size != 64:
         raise ValueError(
             f"standard-cache DSA scorer requires page_size=64, got {page_size}"
         )
     if index_k_cache.dtype != torch.uint8:
         raise TypeError("index_k_cache must be a uint8 tensor")
-    row_bytes = 128 + 4
     if index_k_cache.dim() != 2:
         raise ValueError(
             "index_k_cache must be a packed slot matrix or page-planar matrix, "
@@ -4120,6 +4221,35 @@ def _check_standard_scorer_inputs(
         )
     if index_k_cache.storage_offset() % 4 or page_stride_bytes % 4:
         raise ValueError("index_k_cache page storage must be float32 aligned")
+    return page_stride_bytes
+
+
+def _check_standard_scorer_inputs(
+    q: torch.Tensor,
+    q_scales: torch.Tensor | None,
+    weights: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    page_size: int,
+    row_bytes: int = 128 + 4,
+) -> tuple[int, int, bool]:
+    if q.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+        raise TypeError(
+            f"standard-cache DSA scorer expects BF16 or FP8 q, got {q.dtype}"
+        )
+    if weights.dtype not in (torch.bfloat16, torch.float32):
+        raise TypeError(f"DSA weights must be BF16 or FP32, got {weights.dtype}")
+    if q.dim() != 3 or q.shape[1] not in (32, 64) or q.shape[2] != 128:
+        raise ValueError(
+            "standard-cache DSA scorer requires q=[tokens, 32|64, 128], got "
+            f"{tuple(q.shape)}"
+        )
+    if weights.shape != q.shape[:2]:
+        raise ValueError(
+            f"weights must have shape {tuple(q.shape[:2])}, got {tuple(weights.shape)}"
+        )
+    if q.stride(-1) != 1 or weights.stride(-1) != 1:
+        raise ValueError("q and weights must have contiguous innermost dimensions")
+    page_stride_bytes = _scaled_plane_page_stride(index_k_cache, page_size, row_bytes)
     if weights.device != q.device or index_k_cache.device != q.device:
         raise ValueError("q, weights, and index_k_cache must be on the same device")
     q_is_fp8 = q.dtype == torch.float8_e4m3fn
@@ -4673,18 +4803,85 @@ def launch_gluon_dsa_prefill_topk_bf16_gfx950(
     return out, lens_out
 
 
+# Bytes of one 128-element index-K row of each scaled page format.
+_SCALED_INDEX_K_ROW_BYTES = {"fp8_scaled": 128 + 4, "mxfp4": 64 + 4}
+
+
 def _check_fp8_rows_scorer_inputs(
     q: torch.Tensor,
     q_scales: torch.Tensor | None,
     weights: torch.Tensor,
     index_k_cache: torch.Tensor,
     page_size: int,
+    index_k_format: str = "fp8_scaled",
 ) -> int:
-    """Validate queries against fp8_scaled pages; return the page stride."""
-    _, page_stride_bytes, _ = _check_standard_scorer_inputs(
-        q, q_scales, weights, index_k_cache, page_size
-    )
-    return page_stride_bytes
+    """Validate queries against fp8_scaled or mxfp4 pages; return the page
+    stride. fp8_scaled pages take BF16 or E4M3 queries; mxfp4 pages take
+    only mxfp4 queries: uint8 ``[tokens, heads, 64]`` E2M1 codes and int32
+    ``[tokens, heads]`` words of four UE8M0 scales."""
+    if index_k_format not in _SCALED_INDEX_K_ROW_BYTES:
+        raise ValueError(f"no multi-row scorer for index_k_format={index_k_format!r}")
+    row_bytes = _SCALED_INDEX_K_ROW_BYTES[index_k_format]
+    if (index_k_format == "mxfp4") != (q.dtype == torch.uint8):
+        raise TypeError(
+            "mxfp4 index keys score mxfp4 (uint8) queries, and only them, "
+            f"got {q.dtype} queries for {index_k_format!r} keys"
+        )
+    if index_k_format != "mxfp4":
+        _, page_stride_bytes, _ = _check_standard_scorer_inputs(
+            q, q_scales, weights, index_k_cache, page_size, row_bytes
+        )
+        return page_stride_bytes
+    if weights.dtype not in (torch.bfloat16, torch.float32):
+        raise TypeError(f"DSA weights must be BF16 or FP32, got {weights.dtype}")
+    if q.dim() != 3 or q.shape[1] not in (32, 64) or q.shape[2] != 64:
+        raise ValueError(
+            "mxfp4 index queries must be uint8 [tokens, 32|64, 64], got "
+            f"{tuple(q.shape)}"
+        )
+    if weights.shape != q.shape[:2]:
+        raise ValueError(
+            f"weights must have shape {tuple(q.shape[:2])}, got {tuple(weights.shape)}"
+        )
+    if q.stride(-1) != 1 or weights.stride(-1) != 1:
+        raise ValueError("q and weights must have contiguous innermost dimensions")
+    if (
+        q_scales is None
+        or q_scales.dtype != torch.int32
+        or q_scales.shape != q.shape[:2]
+        or q_scales.stride(-1) != 1
+    ):
+        raise ValueError(
+            "mxfp4 queries need int32 [tokens, heads] UE8M0 scale words with a "
+            "contiguous head axis"
+        )
+    if any(t.device != q.device for t in (q_scales, weights, index_k_cache)):
+        raise ValueError("q, q_scales, weights and index_k_cache must share a device")
+    return _scaled_plane_page_stride(index_k_cache, page_size, row_bytes)
+
+
+# The multi-row scorers' Q_FORMAT of each index-query dtype.
+_ROWS_Q_FORMATS = {
+    torch.bfloat16: "bf16",
+    torch.float8_e4m3fn: "fp8_e4m3",
+    torch.uint8: "mxfp4",
+}
+
+
+def _rows_head_dim(q: torch.Tensor) -> int:
+    """Elements per query head: an mxfp4 byte packs two."""
+    return 2 * q.shape[2] if q.dtype == torch.uint8 else q.shape[2]
+
+
+def _scaled_index_k_views(
+    index_k_cache: torch.Tensor, index_k_format: str
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The key and scale pointers a multi-row scorer reads a scaled plane by:
+    FP8 keys with fp32 scales, or E2M1 code bytes with each row's UE8M0
+    scales as one int32 word."""
+    if index_k_format == "mxfp4":
+        return index_k_cache, index_k_cache.view(torch.int32)
+    return index_k_cache.view(torch.float8_e4m3fn), index_k_cache.view(torch.float32)
 
 
 def _fp8_rows_buffer_load(index_k_cache: torch.Tensor) -> bool:
@@ -4738,6 +4935,7 @@ def launch_gluon_dsa_decode_topk_fp8_rows_gfx950(
     plan: object | None = None,
     out: torch.Tensor | None = None,
     lens_out: torch.Tensor | None = None,
+    index_k_format: str = "fp8_scaled",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Score fp8_scaled paged index keys and return global top-k slots.
 
@@ -4745,7 +4943,9 @@ def launch_gluon_dsa_decode_topk_fp8_rows_gfx950(
     standard fp8_scaled pages (``launch_gluon_dsa_decode_topk_standard_gfx950``
     ``index_k_cache``) with BF16 queries, or E4M3 queries with FP32
     ``q_scales[token, head]`` on the FP8 MFMA: one program covers a request's
-    rows, so each gathered key tile serves all of them.
+    rows, so each gathered key tile serves all of them. ``index_k_format``
+    ``"mxfp4"`` pages take mxfp4 queries (``_check_fp8_rows_scorer_inputs``)
+    on the E2M1 scaled MFMA.
     """
     del plan, seq_lens_2d
     topk = int(topk)
@@ -4756,7 +4956,7 @@ def launch_gluon_dsa_decode_topk_fp8_rows_gfx950(
     if index_k_cache is None:
         raise RuntimeError("fp8_scaled multi-row scorer requires index_k_cache")
     page_stride_bytes = _check_fp8_rows_scorer_inputs(
-        q, q_scales, weights, index_k_cache, int(page_size)
+        q, q_scales, weights, index_k_cache, int(page_size), index_k_format
     )
     _check_standard_decode_metadata(q, seq_lens, block_table, q_len_per_req)
     if out is None:
@@ -4791,8 +4991,7 @@ def launch_gluon_dsa_decode_topk_fp8_rows_gfx950(
     gluon_dsa_decode_topk_fp8_rows_gfx950[grid](
         q,
         q_rows_scales,
-        index_k_cache.view(torch.float8_e4m3fn),
-        index_k_cache.view(torch.float32),
+        *_scaled_index_k_views(index_k_cache, index_k_format),
         weights,
         seq_lens,
         block_table,
@@ -4813,14 +5012,14 @@ def launch_gluon_dsa_decode_topk_fp8_rows_gfx950(
         PAGE_SIZE=int(page_size),
         PAGE_STRIDE_BYTES=page_stride_bytes,
         NUM_HEADS=q.shape[1],
-        HEAD_DIM=q.shape[2],
+        HEAD_DIM=_rows_head_dim(q),
         ROWS=rows,
         BLOCK_N=block_n,
         CHUNK_N=_BF16_DECODE_CHUNK_N,
         WARPS_M=warps_m,
         WARPS_N=warps_n,
         NUM_STAGES=num_stages,
-        Q_FP8=q_scales is not None,
+        Q_FORMAT=_ROWS_Q_FORMATS[q.dtype],
         USE_BUFFER_LOAD=_fp8_rows_buffer_load(index_k_cache),
         USE_BUFFER_STORE=logits.nbytes < 2**31,
         CHUNK_LOOP=grid[1] < chunks,
@@ -4857,6 +5056,7 @@ def launch_gluon_dsa_prefill_topk_fp8_rows_gfx950(
     max_logits_bytes: int | None = None,
     out: torch.Tensor | None = None,
     lens_out: torch.Tensor | None = None,
+    index_k_format: str = "fp8_scaled",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Score workspace rows of fp8_scaled pages and return top-k row ids.
 
@@ -4864,7 +5064,8 @@ def launch_gluon_dsa_prefill_topk_fp8_rows_gfx950(
     standard fp8_scaled pages with BF16 queries, or E4M3 queries with FP32
     ``q_scales[token, head]`` on the FP8 MFMA: ``kv_workspace_slots``
     holds plane slots, and a program shares each key tile across its
-    block of query rows.
+    block of query rows. ``index_k_format`` ``"mxfp4"`` pages take mxfp4
+    queries (``_check_fp8_rows_scorer_inputs``) on the E2M1 scaled MFMA.
     """
     del index_k_fp8, index_k_scale
     topk = int(topk)
@@ -4872,7 +5073,7 @@ def launch_gluon_dsa_prefill_topk_fp8_rows_gfx950(
     if index_k_cache is None or page_size is None:
         raise RuntimeError("fp8_scaled multi-row scorer requires cache and page_size")
     page_stride_bytes = _check_fp8_rows_scorer_inputs(
-        q, q_scales, weights, index_k_cache, int(page_size)
+        q, q_scales, weights, index_k_cache, int(page_size), index_k_format
     )
     _check_standard_prefill_metadata(q, kv_workspace_slots, row_starts, row_ends)
     if out is None:
@@ -4908,8 +5109,7 @@ def launch_gluon_dsa_prefill_topk_fp8_rows_gfx950(
         gluon_dsa_prefill_topk_fp8_rows_gfx950[grid](
             q[start:end],
             q_rows_scales[start:end],
-            index_k_cache.view(torch.float8_e4m3fn),
-            index_k_cache.view(torch.float32),
+            *_scaled_index_k_views(index_k_cache, index_k_format),
             weights[start:end],
             kv_workspace_slots,
             row_starts[start:end],
@@ -4929,14 +5129,14 @@ def launch_gluon_dsa_prefill_topk_fp8_rows_gfx950(
             PAGE_SIZE=int(page_size),
             PAGE_STRIDE_BYTES=page_stride_bytes,
             NUM_HEADS=q.shape[1],
-            HEAD_DIM=q.shape[2],
+            HEAD_DIM=_rows_head_dim(q),
             ROWS=rows_per_program,
             BLOCK_N=block_n,
             CHUNK_N=chunk_n,
             WARPS_M=_BF16_PREFILL_NUM_WARPS,
             WARPS_N=1,
             NUM_STAGES=_BF16_PREFILL_NUM_STAGES,
-            Q_FP8=q_scales is not None,
+            Q_FORMAT=_ROWS_Q_FORMATS[q.dtype],
             USE_BUFFER_LOAD=_fp8_rows_buffer_load(index_k_cache),
             USE_BUFFER_STORE=logits.nbytes < 2**31,
             num_warps=_BF16_PREFILL_NUM_WARPS,

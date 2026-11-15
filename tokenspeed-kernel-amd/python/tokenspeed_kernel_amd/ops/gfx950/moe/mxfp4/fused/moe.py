@@ -252,11 +252,10 @@ _PRECOMPUTED_MFMA_MIN_M = 4
 # a batch fills those tiles. Speculative decode never does: with EAGLE3 the
 # decode width is concurrency x num_draft_tokens, so a Kimi-K3 batch of 8 is 32
 # rows spread over hundreds of experts and the tiles are almost entirely
-# padding. Measured end to end on 8x gfx950 at 50K/500, moving this bound from
-# 16 to 64 lowers TPOT by 17% at concurrency 8 and 4% at concurrency 16, while
-# concurrency 4 -- below the bound either way -- is unchanged, and a
-# concurrency that does not cross the bound does not move.
-_SITU_WARP_DECODE_MAX_M = 64
+# padding, so speculative-verify widths take the warp decode. The bound follows
+# the Iris K3 fused decode rows to 192, so 48 requests' 4-token verify stays
+# here.
+_SITU_WARP_DECODE_MAX_M = 192
 
 
 _ROUTE_OWNED_MIN_M = 1
@@ -1867,8 +1866,12 @@ def warm_gluon_mxfp4_situ_prefill_rows(
 
     Runs the prefill once per representative row count, from BF16 rows and
     from packed E2M1 rows, with zero activations and round-robin routes. Each
-    weight geometry is prepared once per process.
+    weight geometry is prepared once per process. Rows up to
+    ``_SITU_WARP_DECODE_MAX_M`` take the warp decode, so a ``max_rows`` within
+    it warms nothing and leaves the geometry unprepared.
     """
+    if max_rows <= _SITU_WARP_DECODE_MAX_M:
+        return
     package_w13 = getattr(w13_weight, "gluon_package_prefill_weight", None)
     package_w2 = getattr(w2_weight, "gluon_package_prefill_weight", None)
     if not isinstance(package_w13, torch.Tensor) or not isinstance(

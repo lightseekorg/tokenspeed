@@ -1276,6 +1276,7 @@ def triton_dsa_merge_candidates(
     ),
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
     priority=Priority.PORTABLE,
+    traits={"index_k_format": frozenset({"fp8_scaled"})},
 )
 def triton_dsa_sharded_index_candidates(
     q: torch.Tensor,

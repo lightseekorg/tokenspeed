@@ -22,6 +22,9 @@ include = [
 [lib]
 name = "ts_scheduler"
 
+[features]
+abi3 = ["pyo3/abi3-py312"]
+
 [dependencies]
 cxx = "1.0"
 pyo3 = "0.30"
