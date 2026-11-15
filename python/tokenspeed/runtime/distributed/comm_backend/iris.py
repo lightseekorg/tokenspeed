@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     from tokenspeed_kernel.ops.communication._iris.pull_exchange import (
         IrisPullExchange,
     )
+    from tokenspeed_kernel.ops.communication._iris.word_max import LamportWordMax
     from tokenspeed_kernel.ops.communication.iris import IrisAllReduce
 
 _DEFAULT_PRODUCER_DIRECT_MAX_BYTES = 1024 * 1024
@@ -61,6 +62,7 @@ class IrisBackend(CommBackend):
         self._broadcasts: dict[Group, IrisBroadcast] = {}
         self._ordinary_all_reduces: dict[Group, ProducerAllReduce] = {}
         self._pull_exchanges: dict[Group, IrisPullExchange] = {}
+        self._word_maxes: dict[Group, LamportWordMax] = {}
         self._producer_direct_max_bytes = producer_direct_max_bytes
         self._max_numel = (
             min(producer_direct_max_bytes, _DEFAULT_ALL_REDUCE_MAX_BYTES)
@@ -170,6 +172,41 @@ class IrisBackend(CommBackend):
         if state is None or not state.can_run(tensor):
             return False
         state.run(tensor)
+        return True
+
+    def prepare_word_max(self, group: Group, max_rows: int) -> bool:
+        """Prepare the group's word MAX on its prepared all-reduce's heap."""
+        prepared = self._word_maxes.get(group)
+        if prepared is not None:
+            # Growing would move mailboxes that captured graphs hold.
+            return prepared.max_rows >= max_rows
+        from tokenspeed_kernel.ops.communication.iris import (
+            iris_lamport_word_max_supported,
+            prepare_iris_lamport_word_max,
+        )
+
+        all_reduce = self.state(group, torch.bfloat16)
+        if all_reduce is None or not iris_lamport_word_max_supported(len(group)):
+            return False
+        self._word_maxes[group] = prepare_iris_lamport_word_max(all_reduce, max_rows)
+        return True
+
+    def try_word_max(self, words: torch.Tensor, group: Group) -> bool:
+        state = self._word_maxes.get(group)
+        if (
+            state is None
+            or words.dtype != torch.int64
+            or words.dim() != 1
+            or not 0 < words.numel() <= state.max_rows
+        ):
+            return False
+        from tokenspeed_kernel.ops.communication.iris import iris_lamport_word_max
+
+        # Layout is fixed up locally; every rank still runs the same launch.
+        if words.is_contiguous():
+            iris_lamport_word_max(state, words, out=words)
+        else:
+            words.copy_(iris_lamport_word_max(state, words.contiguous()))
         return True
 
     def _create(

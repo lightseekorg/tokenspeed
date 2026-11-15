@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     from tokenspeed_kernel.ops.communication._iris.residual_rmsnorm import (
         LamportResidualRMSNorm,
     )
+    from tokenspeed_kernel.ops.communication._iris.word_max import LamportWordMax
 
 logger = logging.getLogger(__file__)
 
@@ -521,6 +522,65 @@ def iris_lamport_residual_rmsnorm(
         the sum taken in FP32 rank order and rounded once to BF16.
     """
     return state.run(tensor, residual, weight, eps)
+
+
+def iris_lamport_word_max_supported(world_size: int) -> bool:
+    """Whether the Lamport all-reduce MAX of int64 words serves a group.
+
+    Args:
+        world_size: Number of ranks in the group.
+
+    Returns:
+        Whether this device has the kernel for this group size.
+    """
+    # Iris is installed only on ROCm, so check the device before importing it.
+    if not _platform.is_cdna4:
+        return False
+    from tokenspeed_kernel.ops.communication._iris.word_max import LamportWordMax
+
+    return LamportWordMax.supported(world_size)
+
+
+def prepare_iris_lamport_word_max(
+    all_reduce: IrisAllReduce, max_rows: int
+) -> "LamportWordMax":
+    """Allocate the word MAX all-reduce's mailboxes on a prepared group's heap.
+
+    Collective: every rank of the group calls it in the same order, before
+    graph capture. The mailboxes come from the shared heap that the group's
+    first preparation sized; Iris's allocator enforces its capacity.
+
+    Args:
+        all_reduce: The group's prepared all-reduce, which supplies the peers.
+        max_rows: Most words one call reduces, at most
+            ``LamportWordMax.MAX_ROWS``.
+
+    Returns:
+        The prepared operation, used with ``iris_lamport_word_max``.
+    """
+    from tokenspeed_kernel.ops.communication._iris.word_max import LamportWordMax
+
+    state = LamportWordMax(all_reduce.peers, max_rows)
+    all_reduce.peers.finish_prepare()
+    return state
+
+
+def iris_lamport_word_max(
+    state: "LamportWordMax", words: torch.Tensor, out: torch.Tensor | None = None
+) -> torch.Tensor:
+    """Reduce every rank's int64 ``words`` with MAX in one launch.
+
+    Args:
+        state: The group's prepared operation.
+        words: Contiguous ``[rows]`` int64 words, at most the prepared rows;
+            every int64 value is exchanged exactly.
+        out: Contiguous ``[rows]`` int64 destination, ``words`` itself
+            allowed; a new tensor when None.
+
+    Returns:
+        The elementwise maximum over the group, in ``out``.
+    """
+    return state.run(words, out)
 
 
 class IrisAllReduceResidualRMSNorm(object):

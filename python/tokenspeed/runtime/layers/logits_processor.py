@@ -181,7 +181,8 @@ class VocabParallelArgmax:
     Each rank packs its shard's row maximum and global index into an int64
     key, and an all-reduce MAX over the group picks the same token the
     argmax of the gathered row would. It exchanges 8 bytes per row instead
-    of the logits shards.
+    of the logits shards, through the group's prepared word MAX where the
+    backend has one.
     """
 
     def __init__(self, tp_group: tuple[int, ...], vocab_offset: int):
@@ -191,7 +192,8 @@ class VocabParallelArgmax:
     def __call__(self, logits: torch.Tensor) -> torch.Tensor:
         keys = torch.empty(logits.shape[0], dtype=torch.int64, device=logits.device)
         vocab_parallel_argmax_keys(logits, vocab_offset=self.vocab_offset, out=keys)
-        keys = all_reduce(keys, self.tp_group, op=torch.distributed.ReduceOp.MAX)
+        if not get_global_backend().try_word_max(keys, self.tp_group):
+            keys = all_reduce(keys, self.tp_group, op=torch.distributed.ReduceOp.MAX)
         return argmax_key_index(keys, out=torch.empty_like(keys))
 
 
@@ -315,6 +317,9 @@ class LogitsProcessor(nn.Module):
     _LOGITS_AG_STATES = {}
 
     _LOGITS_DIST_ARGMAX_MAX_TOKENS = 8192
+    # Most rows the packed-key path reduces through the group's word MAX;
+    # more (a prefill's rows) keep the all-reduce.
+    _LOGITS_WORD_MAX_ROWS = 1024
     _LOGITS_DIST_ARGMAX_UNINITIALIZED = object()
     _LOGITS_DIST_ARGMAX_STATES = {}
     # Prepare every dtype supported by the fused kernel; quantized weight
@@ -755,6 +760,10 @@ class LogitsProcessor(nn.Module):
                 dtype=logits_dtype,
             )
         if state is None and not is_current_stream_capturing(lm_head.weight.device):
+            # Collective, once per group; the speculative walks share it.
+            get_global_backend().prepare_word_max(
+                self.tp_group, self._LOGITS_WORD_MAX_ROWS
+            )
             state = VocabParallelArgmax(self.tp_group, self.tp_rank * vocab_per_rank)
         return state
 

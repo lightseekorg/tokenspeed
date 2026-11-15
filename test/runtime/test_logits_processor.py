@@ -2253,3 +2253,102 @@ def test_dp_head_argmax_and_local_head_input(monkeypatch, attn_tp, head_tp, rank
         torch.testing.assert_close(
             result.next_token_logits, hidden[rank] @ head.weight.T * 2.0
         )
+
+
+@pytest.mark.parametrize("reduced", [True, False])
+def test_packed_key_argmax_reduces_through_a_prepared_word_max(monkeypatch, reduced):
+    """The packed keys take the group's word MAX where the backend prepared
+    one, and the all-reduce MAX otherwise."""
+    keys = torch.tensor([7, 3], dtype=torch.int64)
+
+    def fake_keys(logits, *, vocab_offset, out):
+        assert vocab_offset == 8
+        return out.copy_(keys)
+
+    def fake_word_max(words, group):
+        assert group == (0, 1)
+        if reduced:
+            words.add_(100)  # the group's maximum, as another rank sent it
+        return reduced
+
+    def fake_all_reduce(tensor, group, op):
+        assert not reduced, "a prepared word MAX replaces the all-reduce"
+        assert group == (0, 1) and op == torch.distributed.ReduceOp.MAX
+        return tensor + 200
+
+    monkeypatch.setattr(
+        logits_processor_module, "vocab_parallel_argmax_keys", fake_keys
+    )
+    monkeypatch.setattr(
+        logits_processor_module,
+        "argmax_key_index",
+        lambda keys, *, out: out.copy_(keys),
+    )
+    monkeypatch.setattr(
+        logits_processor_module,
+        "get_global_backend",
+        lambda: SimpleNamespace(try_word_max=fake_word_max),
+    )
+    monkeypatch.setattr(logits_processor_module, "all_reduce", fake_all_reduce)
+
+    ids = VocabParallelArgmax((0, 1), 8)(torch.zeros((2, 4)))
+    assert ids.tolist() == ([107, 103] if reduced else [207, 203])
+
+
+def test_the_packed_key_argmax_prepares_the_groups_word_max(monkeypatch):
+    """Building the packed-key argmax prepares the group's word MAX, never
+    inside capture."""
+    monkeypatch.setitem(
+        global_server_args_dict,
+        "mapping",
+        SimpleNamespace(nprocs_per_node=4),
+    )
+    monkeypatch.setattr(
+        logits_processor_module,
+        "current_platform",
+        lambda: SimpleNamespace(is_nvidia=False),
+    )
+    capturing = {"on": True}
+    monkeypatch.setattr(
+        logits_processor_module,
+        "is_current_stream_capturing",
+        lambda device: capturing["on"],
+    )
+    monkeypatch.setattr(
+        logits_processor_module.pg_manager,
+        "get_process_group",
+        lambda *a, **k: object(),
+    )
+    monkeypatch.setattr(
+        logits_processor_module.torch.distributed,
+        "all_reduce",
+        lambda tensor, **k: None,
+    )
+    prepared = []
+    monkeypatch.setattr(
+        logits_processor_module,
+        "get_global_backend",
+        lambda: SimpleNamespace(
+            prepare_word_max=lambda group, rows: prepared.append((group, rows))
+        ),
+    )
+    processor = LogitsProcessor(
+        config=SimpleNamespace(model_type="test", vocab_size=8192),
+        tp_rank=0,
+        tp_size=2,
+        tp_group=(0, 4),
+        attn_tp_size=1,
+        dp_lm_head_tp=False,
+    )
+    lm_head = SimpleNamespace(
+        weight=torch.ones((4096, 2), dtype=torch.float32),
+        num_embeddings_per_partition=4096,
+    )
+
+    assert processor._init_dist_argmax_state(lm_head, torch.float32) is None
+    assert prepared == []
+    capturing["on"] = False
+    assert isinstance(
+        processor._init_dist_argmax_state(lm_head, torch.float32), VocabParallelArgmax
+    )
+    assert prepared == [((0, 4), LogitsProcessor._LOGITS_WORD_MAX_ROWS)]
