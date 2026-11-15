@@ -40,7 +40,6 @@ from tokenspeed.runtime.layers.moe import (
     ExpertCheckpointSchema,
     build_moe_checkpoint_loader,
 )
-from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.quantization.utils import should_exclude_quant_module
 from tokenspeed.runtime.layers.vocab_parallel_embedding import ParallelLMHead
@@ -291,10 +290,12 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
                 input_ids, hidden_states, self.lm_head, logits_metadata
             )
 
-    @property
-    def draft_kv_attention(self) -> PagedAttention:
-        """The attention whose write locations the draft K/V rows take."""
-        return self.model.layers[0].attn
+    def begin_split_round(
+        self, ctx: ForwardContext, rows: int
+    ) -> tuple[torch.Tensor, ...]:
+        """Start a split round: each of ``rows`` rows' draft K/V slot."""
+        attn = self.model.layers[0].attn
+        return (ctx.attn_backend.padded_write_locations(attn, ctx.forward_mode, rows),)
 
     @torch.no_grad()
     def write_draft_kv(
@@ -303,9 +304,10 @@ class Qwen3_5ForConditionalGenerationNextN(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         captured_hidden_states: torch.Tensor,
-        slots: torch.Tensor,
+        locations: tuple[torch.Tensor, ...],
     ) -> None:
         """Step 0 over every row up to its prologue: write each row's draft K/V."""
+        (slots,) = locations
         input_embeds = self.pre_fc_norm_embedding(self.model.embed_tokens(input_ids))
         hidden_states = self.pre_fc_norm_hidden(captured_hidden_states)
         hidden_states = self.fc(torch.cat([input_embeds, hidden_states], dim=-1))
