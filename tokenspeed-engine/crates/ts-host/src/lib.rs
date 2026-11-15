@@ -18,32 +18,20 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! `ts-host`: one TokenSpeed engine rank with its control plane in Rust.
+//! One TokenSpeed engine rank with its control plane in Rust.
 //!
-//! Every launch path starts one per rank (`engine/rust_host.py` is its Python
-//! half; `TOKENSPEED_HOST_BINARY` overrides the installed binary):
-//!
-//! ```text
-//! ts-host --python <executable> --control-fd <fd> --enable-async-logging <bool>
-//! ```
-//!
-//! The rank's arguments arrive on `--control-fd`, and readiness goes back
-//! on it. The embedded interpreter builds the data plane and the scheduler;
-//! the ranks then connect their collective mesh, the replica's first member
-//! connects to the frontend, and the main thread runs the scheduling loop
-//! while the forward thread runs the data plane; the main thread takes the
-//! GIL only for the data plane's completion queries (`data_plane`).
+//! The launching Python interpreter imports this extension and enters the
+//! scheduling loop on its main thread with the GIL released. The forward
+//! thread runs the Python data plane; completion queries acquire the GIL.
 
 mod data_plane;
 mod encode;
 mod host_spans;
-mod interpreter;
 mod logging;
 mod pd;
 
 use std::{
     collections::HashSet,
-    process::ExitCode,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex, OnceLock,
@@ -99,10 +87,6 @@ const EP_GROUP: u32 = 3;
 
 #[derive(Debug, thiserror::Error)]
 enum HostError {
-    #[error(
-        "usage: ts-host --python <executable> --control-fd <fd> --enable-async-logging <bool>: {0}"
-    )]
-    Usage(String),
     #[error("{0}")]
     Interpreter(String),
     #[error("python:\n{0}")]
@@ -136,7 +120,6 @@ fn python_error(py: Python<'_>, error: PyErr) -> HostError {
 }
 
 struct Args {
-    python: String,
     control_fd: i32,
     enable_async_logging: bool,
 }
@@ -205,42 +188,6 @@ impl LauncherFailure {
             tracing::error!("{error}");
         }
     }
-}
-
-fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, HostError> {
-    let mut python = None;
-    let mut control_fd = None;
-    let mut enable_async_logging = None;
-    while let Some(flag) = args.next() {
-        let value = args
-            .next()
-            .ok_or_else(|| HostError::Usage(format!("{flag} needs a value")))?;
-        match flag.as_str() {
-            "--python" => python = Some(value),
-            "--control-fd" => {
-                control_fd = Some(
-                    value
-                        .parse()
-                        .map_err(|_| HostError::Usage(format!("bad --control-fd {value}")))?,
-                )
-            }
-            "--enable-async-logging" => {
-                enable_async_logging = Some(value.parse().map_err(|_| {
-                    HostError::Usage(format!(
-                        "bad --enable-async-logging {value}: use true or false"
-                    ))
-                })?);
-            }
-            _ => return Err(HostError::Usage(format!("unknown argument {flag}"))),
-        }
-    }
-    Ok(Args {
-        python: python.ok_or_else(|| HostError::Usage("--python is required".to_owned()))?,
-        control_fd: control_fd
-            .ok_or_else(|| HostError::Usage("--control-fd is required".to_owned()))?,
-        enable_async_logging: enable_async_logging
-            .ok_or_else(|| HostError::Usage("--enable-async-logging is required".to_owned()))?,
-    })
 }
 
 /// Load once at startup; Python is called only by the background exporter.
@@ -702,8 +649,6 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
 
     let (bootstrap, outbox, mode) = Python::attach(|py| {
         let built = (|| {
-            // Before anything imports the scheduler package.
-            ts_scheduler::alias_builtin_module(py)?;
             let outbox = Bound::new(py, pd::Outbox::new())?;
             let host_spans = Bound::new(py, host_spans::HostSpans)?;
             let bootstrap = py
@@ -988,32 +933,44 @@ fn finish_serving(
     served.and(closed)
 }
 
-fn main() -> ExitCode {
-    let args = match parse_args(std::env::args().skip(1)) {
-        Ok(args) => args,
-        Err(error) => {
-            eprintln!("{error}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let _log_guard = logging::init(args.enable_async_logging);
-    let launcher = LAUNCHER_FAILURE.get_or_init(LauncherFailure::for_parent);
-    let served = (|| {
-        interpreter::start(&args.python).map_err(HostError::Interpreter)?;
-        // The host does not finalize Python. Drain its logger on success,
-        // error and unwind if the launcher has not stopped the rank.
-        let _python_logs = logging::PythonLogGuard;
-        serve(&args, launcher)
-    })();
-    match served {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            // Errors outside generation serving still arrive after cleanup,
-            // but use the same native notification and parent checks.
-            launcher.report(&error);
-            ExitCode::FAILURE
-        }
-    }
+/// Run one rank on the calling (main) thread and exit without Python finalization.
+#[pyfunction]
+fn run_host(py: Python<'_>, control_fd: i32, enable_async_logging: bool) -> PyResult<()> {
+    py.detach(|| {
+        let args = Args {
+            control_fd,
+            enable_async_logging,
+        };
+        let log_guard = logging::init(args.enable_async_logging);
+        let launcher = LAUNCHER_FAILURE.get_or_init(LauncherFailure::for_parent);
+        let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _python_logs = logging::PythonLogGuard;
+            serve(&args, launcher)
+        }));
+        let code = match served {
+            Ok(Ok(())) => 0,
+            Ok(Err(error)) => {
+                launcher.report(error);
+                1
+            }
+            Err(_) => {
+                launcher.report("host panicked");
+                1
+            }
+        };
+        // process::exit skips Rust drops and Python finalization. Drain native
+        // logging explicitly; stuck Python threads must not keep a rank alive.
+        drop(log_guard);
+        std::process::exit(code)
+    })
+}
+
+/// The rank's native control loop and its single scheduler implementation.
+#[pymodule]
+fn _host(module: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
+    module.add("scheduler", ts_scheduler::python_module(module.py())?)?;
+    module.add_function(wrap_pyfunction!(run_host, module)?)?;
+    Ok(())
 }
 
 #[cfg(test)]

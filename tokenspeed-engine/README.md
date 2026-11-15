@@ -2,28 +2,28 @@
 
 The engine's control plane, in Rust, as
 [RFC 0002](../docs/rfcs/0002-rust-control-plane.md) describes it: every
-engine rank is a `ts-host` process that runs the scheduling loop in Rust and
-embeds CPython for the data plane. The design rules of the loop are in
+engine rank is a Python process that enters the native host extension,
+runs the scheduling loop in Rust and uses Python for the data plane. The design rules of the loop are in
 [`docs/design/event-loop.md`](../docs/design/event-loop.md).
 
 | Source crate | Published package | Role |
 | --- | --- | --- |
 | `ts-wire` | `tokenspeed-wire` | The engine IPC schema and its msgpack codec, byte-compatible with the Python structs in `python/tokenspeed/runtime/engine/io_struct.py` and `zmq_wire.py`. |
 | `ts-client` | `tokenspeed-client` | A frontend's connection to the engines: the startup handshake, request routing across attention-DP ranks, output streams, aborts, control operations and an EPD encode server's encode requests. |
-| `ts-py` | `tokenspeed-py` | `tokenspeed_engine._native`: `ts-client` for Python tests and tools (`entrypoints/wire_driver.py`), with `tokenspeed_engine.host_binary()` naming the installed `ts-host`, and `ts-l3`'s executor for Python tests over a data plane's Host pool. |
+| `ts-py` | `tokenspeed-py` | `tokenspeed_engine._native`: `ts-client` for Python tests and tools (`entrypoints/wire_driver.py`), with `ts-l3`'s executor for Python tests over a data plane's Host pool. |
 | `ts-collective` | `tokenspeed-collective` | CPU collectives among an engine's ranks over a TCP mesh: broadcast, all-gather and all-reduce, each frame checked against the collective the receiver is in. |
-| `ts-scheduler` | `tokenspeed-scheduler` | The C++ scheduler and its nanobind module compiled into the binary, with a `cxx` facade for the control thread. The module is registered as a built-in of the embedded interpreter, so the plans Python reads are the same C++ objects the control thread produced. The crate also holds the host's profile span recorder, which the C++ scheduler's spans reach through the facade. |
+| `ts-scheduler` | `tokenspeed-scheduler` | The C++ scheduler and its nanobind module compiled into `_host`, with a `cxx` facade for the control thread. The module is imported from the host extension, so the plans Python reads are the same C++ objects the control thread produced. The crate also holds the host's profile span recorder, which the C++ scheduler's spans reach through the facade. |
 | `ts-control` | `tokenspeed-control` | One rank's control plane: ingress checks, request state and output processing, the scheduling loop and its in-flight queue, cache-op acknowledgment, control operations, grammars, the expert rebalance, KV events, the engine side of the msgpack wire, and the per-round agreements among ranks. |
 | `ts-grammar` | `tokenspeed-grammar` | Grammar-constrained decoding on xgrammar's C++ library: compilation and the matchers, which the data plane drives through C entry points. |
 | `ts-metrics` | `tokenspeed-metrics` | The engine's metrics: Prometheus' multiprocess files, written directly, and the events the node's plugin relay runs output plugins on. |
 | `ts-mooncake` | `tokenspeed-mooncake` | The Mooncake transfer engine and store client through their C APIs, loaded at runtime from the `tokenspeed-mooncake` wheel. |
 | `ts-l3` | `tokenspeed-l3` | The L3 storage tier's Host-only executor ([asynchronous L3](../docs/design/async-l3-cache.md)): object naming, the Host pool's layout and ownership, bounded queues and workers, backend health, and the stores (the Mooncake store client, and an in-memory one for tests). |
 | `ts-pd` | `tokenspeed-pd` | The PD transfer peer: the P/D handshake, room states, transfer workers and the per-round agreement on transfer progress. |
-| `ts-host` | `tokenspeed-host` | The rank binary: it embeds the interpreter, has `engine/rust_host.py` build the data plane and the scheduler, and runs the loop on its main thread and the data plane on its forward thread. |
+| `ts-host` | `tokenspeed-host` | The rank extension: the launching interpreter imports it, has `engine/rust_host.py` build the data plane and the scheduler, and runs the loop on its main thread and the data plane on its forward thread. |
 
 The crates.io packages use the `tokenspeed-` prefix. Their Rust library names
 remain `ts_wire`, `ts_client`, and so on; the Python module remains `_native`,
-and the host executable remains `ts-host`. For example:
+and the host launcher remains `ts-host`, backed by the `_host` extension. For example:
 
 ```toml
 [dependencies]
@@ -90,18 +90,16 @@ installed. The scheduler source is bundled in its crate; the grammar build
 downloads the pinned, SHA256-checked xgrammar source release and therefore
 needs network access (or `FETCHCONTENT_SOURCE_DIR_XGRAMMAR` for a local copy).
 
-`ts-host` and `ts-py` link the CPython the engine runs under; build with it
-as `PYO3_PYTHON`, which needs `nanobind` and `tokenspeed-spdlog`, as the
-scheduler wheel build does:
+Install a development build with `pip install -e tokenspeed-engine` from the
+repository root. It builds both native extensions and the scheduler together.
+`tokenspeed_engine.host_binary()` still names the `ts-host` launcher. It keeps
+the existing arguments and execs the selected `--python` interpreter to enter
+`tokenspeed_engine.host`, preserving the PID and inherited descriptors.
+The host loads its linked scheduler before importing the existing
+`tokenspeed_scheduler` Python wrapper. The runtime's scheduler dependency
+and imports are unchanged.
 
-```bash
-PYO3_PYTHON=$(which python) cargo build --release -p tokenspeed-host -p tokenspeed-py
-```
-
-The `tokenspeed-engine` wheel (`pyproject.toml`, built with setuptools) carries
-`tokenspeed_engine._native` and the `ts-host` binary. To run a development
-build instead, put `_native` on the Python path and point
-`TOKENSPEED_HOST_BINARY` at the binary. `TS_HOST_LOG` sets the Rust log
+`TS_HOST_LOG` sets the Rust log
 filter (`info` by default; `ts_control=debug` logs admissions and cache-op
 acknowledgments). `TS_HOST_LOG_USE_LOCAL_TZ` switches the Rust log
 timestamps from the default UTC (`...Z`) to the machine's local time with
@@ -174,13 +172,15 @@ new post date; use **Re-run failed jobs** to retain the original version.
 Existing assets are never overwritten. A different commit requires
 a new post run, an unused rc date, or a new base version for a stable release.
 
-Wheels support Linux with glibc 2.28 or newer, x86_64 and aarch64, and
-CPython 3.10–3.13. They contain the Python extension, `ts-host`, and a private
-CPython shared library for the host process, including its built-in native
-stdlib modules. The host uses the launching interpreter's Python library
-paths and environment. Installing a wheel needs no
-Rust toolchain. Each wheel is tested in a separate Python container and venv
-by importing the extension and starting the embedded scheduler and Python.
+Wheels support Linux with glibc 2.28 or newer on x86_64 and aarch64.
+Each architecture has two wheels: `cp311-cp311` for CPython 3.11 and
+`cp312-abi3` for standard, GIL-enabled CPython 3.12 and later. Python 3.10
+is no longer supported. Both native extensions and the scheduler binding
+use the same ABI contract; no CPython shared library is bundled.
+The release workflow tests the same abi3 wheel on Python 3.12–3.15 in separate
+containers and virtual environments, including scheduler import, process
+naming and failure exit with a lingering Python thread. Installing needs
+no Rust toolchain.
 
 The build uses a full checkout because the engine also compiles the sibling
 scheduler source. No source distribution is published; source builds must

@@ -1,4 +1,4 @@
-"""Exercise an installed wheel and its embedded Python without GPU dependencies."""
+"""Exercise an installed wheel and its host extension without GPU dependencies."""
 
 import argparse
 import json
@@ -24,22 +24,42 @@ def bootstrap(control_fd, outbox, protocol, host_spans=None):
     import _sqlite3
     import _ssl
     import zlib
-    import tokenspeed_scheduler_ext
+    import threading
+    import tokenspeed_scheduler as ts
+    import setproctitle
     import tokenspeed_engine
+
+    scheduler = ts._ext
+    assert scheduler is sys.modules["tokenspeed_engine._scheduler"]
+    config = ts.SchedulerConfig()
+    config.prefix_granularity = 16
+    config.max_scheduled_tokens = 64
+    config.max_batch_size = 4
+    config.num_device_pages = 64
+    config.num_snapshot_pages = 1
+    config.cache_groups = [ts.CacheGroupConfig(
+        group_id="full_attention", block_granularity=16,
+        total_pages=64, attn_kind=ts.AttnKind.Full,
+    )]
+    assert ts.Scheduler(config).waiting_size() == 0
 
     os.write(control_fd, json.dumps({
         "prefix": sys.prefix,
         "executable": sys.executable,
-        "scheduler": tokenspeed_scheduler_ext.__name__,
+        "scheduler": scheduler.__name__,
+        "title": setproctitle.getproctitle(),
     }).encode())
+    # A failed rank must exit even when Python finalization would wait forever.
+    threading.Thread(target=threading.Event().wait, daemon=False).start()
     raise RuntimeError("engine wheel bootstrap verified")
 """
 
 
-def main(expected_version: str) -> None:
+def main(expected_version: str, scheduler_python: str) -> None:
     installed_version = version("tokenspeed-engine")
     assert installed_version == expected_version, installed_version
-    host = tokenspeed_engine.host_binary()
+    assert "tokenspeed_engine._host" not in sys.modules
+    assert os.access(tokenspeed_engine.host_binary(), os.X_OK)
     signal_count = 0
 
     def count_failure_signal(_signum, _frame):
@@ -59,7 +79,7 @@ def main(expected_version: str) -> None:
             try:
                 completed = subprocess.run(
                     [
-                        str(host),
+                        "tokenspeed::wheel-check",
                         "--python",
                         sys.executable,
                         "--control-fd",
@@ -67,7 +87,16 @@ def main(expected_version: str) -> None:
                         "--enable-async-logging",
                         "false",
                     ],
-                    env=dict(os.environ, PYTHONPATH=str(root)),
+                    # A late-loaded host must work without spare static TLS,
+                    # as when CUDA libraries have already used the reserve.
+                    env=dict(
+                        os.environ,
+                        PYTHONPATH=os.pathsep.join(
+                            [str(root), str(Path(scheduler_python).resolve())]
+                        ),
+                        GLIBC_TUNABLES="glibc.rtld.optional_static_tls=0",
+                    ),
+                    executable=tokenspeed_engine.host_binary(),
                     pass_fds=(result.fileno(),),
                     capture_output=True,
                     text=True,
@@ -86,12 +115,15 @@ def main(expected_version: str) -> None:
         assert observed == {
             "prefix": sys.prefix,
             "executable": sys.executable,
-            "scheduler": "tokenspeed_scheduler_ext",
+            "scheduler": "tokenspeed_engine._scheduler",
+            "title": "tokenspeed::wheel-check",
         }, observed
-    print("Installed extension, embedded scheduler and runtime Python verified")
+    print("Installed extensions, scheduler and runtime Python verified")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("expected_version")
-    main(parser.parse_args().expected_version)
+    parser.add_argument("scheduler_python")
+    args = parser.parse_args()
+    main(args.expected_version, args.scheduler_python)
