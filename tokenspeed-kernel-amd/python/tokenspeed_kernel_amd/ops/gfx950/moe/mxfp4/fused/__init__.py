@@ -46,6 +46,8 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused._common import (
     _extract_gluon_raw_w,
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.moe import (
+    A8W4_SORT_BLOCK_SIZE,
+    A8W4_SORTED_DECODE_ROWS,
     MXFP4SortedRoutes,
     gluon_mxfp4_fp8_precomputed_situ,
     gluon_mxfp4_sorted_down_gfx950,
@@ -64,6 +66,8 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.routing import (
 )
 
 __all__ = [
+    "A8W4_SORT_BLOCK_SIZE",
+    "A8W4_SORTED_DECODE_ROWS",
     "MXFP4SortedRoutes",
     "gluon_mxfp4_fp8_precomputed_situ",
     "gluon_mxfp4_sorted_down_gfx950",

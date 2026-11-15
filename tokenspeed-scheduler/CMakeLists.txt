@@ -103,7 +103,10 @@ if(TOKENSPEED_SCHEDULER_SANITIZE)
 endif()
 
 if(TOKENSPEED_SCHEDULER_BUILD_PYTHON)
+    find_package(Python COMPONENTS Interpreter Development.Module
+        OPTIONAL_COMPONENTS Development.SABIModule REQUIRED)
     nanobind_add_module(tokenspeed_scheduler_ext
+        STABLE_ABI
         bindings/python_module.cpp
     )
 

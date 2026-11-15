@@ -33,7 +33,10 @@ from dataclasses import dataclass
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.ops.attention.dsv41.triton import _mxfp4_index_rows, _ue8m0_word
+from tokenspeed_kernel.ops.quantization._triton_mxfp4 import (
+    _mxfp4_index_rows,
+    _ue8m0_word,
+)
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
 _PER_LAYER_GRID_CAP = int(os.environ.get("TOKENSPEED_KV_GRID_CAP", "64"))

@@ -327,8 +327,12 @@ On SM100/SM103, an FP8 grid of at least `3 * SM_count / 16` output tiles picks
 its query rows per CTA and KV splits from 1x1, 2x1, 1x2 and 1x4. With one
 resident CTA per SM, the choice minimizes the wave count times the per-CTA
 work: each of its query rows gathers the 2048-entry prefix slots within one KV
-split and adds a fixed per-row cost fitted on SM103. Smaller grids, and every
-FP8 grid on SM107, keep the split rule with one query per CTA.
+split and adds a fixed per-row cost fitted on SM103. Smaller grids keep the
+split rule with one query per CTA. SM107 also keeps one query per CTA, but
+FP8 calls with 24 query heads and 2 KV heads use 1 KV split when the
+unsplit grid has at least 2 output tiles per SM, avoiding repeated setup
+and partial-output reduction. Smaller grids and other SM107 shapes retain
+their existing splits.
 
 Within its KV split, each FP8 query row ends the prefix loop after the last
 128-entry tile holding a positive id, and runs at least one tile. The CTA

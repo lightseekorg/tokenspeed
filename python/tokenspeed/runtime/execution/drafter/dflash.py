@@ -92,8 +92,8 @@ def _resolve_block_geometry(
         ``(verify_width, draft_block_size)``.
 
     Raises:
-        ValueError: The verify width leaves no room for a draft, or the
-            checkpoint was trained at a different block size.
+        ValueError: The verify width leaves no room for a draft, or drafts
+            more than the checkpoint's block.
     """
     verify_width = int(spec_num_tokens)
     if verify_width < 2:
@@ -106,7 +106,11 @@ def _resolve_block_geometry(
     ckpt_block_size = read_checkpoint_block_size(cfg)
     if ckpt_block_size is not None:
         validate_block_widths(
-            spec_algorithm, ckpt_block_size, draft_block_size, verify_width
+            spec_algorithm,
+            ckpt_block_size,
+            draft_block_size,
+            verify_width,
+            allow_shorter=True,
         )
     return verify_width, draft_block_size
 
@@ -327,6 +331,10 @@ class DFlash(BaseDrafter):
 
         max_bs = self.input_buffers.max_bs
         self.draft_seq_lens_buf = torch.zeros(
+            (max_bs,), dtype=torch.int32, device=self.device
+        )
+        # Block-end lengths: each request's prefix plus the draft query width.
+        self.draft_block_end_lens_buf = torch.zeros(
             (max_bs,), dtype=torch.int32, device=self.device
         )
         # None means probed-and-unavailable; unset means not probed yet.
@@ -1416,7 +1424,9 @@ class DFlash(BaseDrafter):
         bs = current_tokens.shape[0]
         req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
         prefix_lens = self.draft_seq_lens_buf[:bs]
-        seq_lens_after = prefix_lens + self.draft_query_width
+        seq_lens_after = self.draft_block_end_lens_buf[:bs]
+        if not prepared:
+            torch.add(prefix_lens, self.draft_query_width, out=seq_lens_after)
 
         block_ids = self.block_ids_buf[:bs]
         # NOTE: callers (run) write current_tokens directly into
@@ -1543,6 +1553,7 @@ class DFlash(BaseDrafter):
                 req_pool_indices=self.input_buffers.req_pool_indices_buf[:bs],
                 valid_cache_lengths=self.runtime_states.valid_cache_lengths,
                 draft_seq_lens=self.draft_seq_lens_buf[:bs],
+                block_end_lens=self.draft_block_end_lens_buf[:bs],
                 block_ids=self.block_ids_buf[:bs],
                 block_positions=self.block_positions_buf[:bs],
                 verify_width=self.spec_num_tokens,

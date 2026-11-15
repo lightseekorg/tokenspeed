@@ -58,8 +58,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 
-# Extend-round graph series: step 0 (--enable-drafter-prefill-graph), decode steps.
-EXTEND_STEP0_SERIES = "prefill:drafter-step0"
+# Extend-round graph series: the decode steps after step 0.
 EXTEND_DECODE_SERIES = "prefill:drafter-decode"
 # A split extend round's draft K/V writer, one graph over a fixed tile of rows.
 EXTEND_KV_SERIES = "prefill:drafter-kv"
@@ -372,13 +371,9 @@ class BaseDrafter:
         """
 
     def extend_graph_plan(
-        self,
-        token_buckets: Sequence[int],
-        request_counts: Callable[[int], Sequence[int]],
+        self, token_buckets: Sequence[int]
     ) -> dict[str, list[tuple[int, int]]]:
-        """Every entry ``capture_extend_graphs`` can measure, per memory-projection
-        series (the executor keeps ``EXTEND_STEP0_SERIES`` only under
-        ``--enable-drafter-prefill-graph``).
+        """Each entry ``capture_extend_graphs`` can measure, per projection series.
 
         The one channel between that capture and the CUDA-graph memory
         projection, which prices exactly these entries: a series lists its
@@ -386,13 +381,12 @@ class BaseDrafter:
 
         Args:
             token_buckets: The target's prefill token buckets.
-            request_counts: The exact request counts to capture at a bucket.
 
         Returns:
             Series name -> entries; empty for a drafter without extend graphs
             or in a configuration they cannot bake.
         """
-        del token_buckets, request_counts
+        del token_buckets
         return {}
 
     def release_extend_graphs(self) -> None:

@@ -425,6 +425,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
     def _verify_state_blocks(
         self,
         bs: int,
+        padded_bs: int,
         block_tables: Mapping[str, torch.Tensor],
         *,
         pages_out: Mapping[str, torch.Tensor],
@@ -432,7 +433,11 @@ class KdaAttnBackend(CapacityPrefillBackend):
     ) -> dict[str, torch.Tensor]:
         # The scheduler names input and live pages in fixed table slots.
         tables = super()._verify_state_blocks(
-            bs, block_tables, pages_out=pages_out, live_pages_out=live_pages_out
+            bs,
+            padded_bs,
+            block_tables,
+            pages_out=pages_out,
+            live_pages_out=live_pages_out,
         )
         if (
             self._replay_commit_tables is not None
@@ -488,10 +493,11 @@ class KdaAttnBackend(CapacityPrefillBackend):
             # round's records when the same workspace slots are reused.
             self._replay_record_generation += 1
             prepare_recoverssm_metadata(
-                seq_lens[:bs].to(torch.int64) - draft_token_num,
+                seq_lens,
                 self._replay_record_metadata,
                 batch=bs,
                 generation=self._replay_record_generation,
+                draft_token_num=draft_token_num,
             )
 
     @override

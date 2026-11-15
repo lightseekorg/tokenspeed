@@ -486,7 +486,7 @@ chain: the target's rows at step 0, one row per request after; multi-depth
 MTP: the target's rows at every depth; block drafters: one forward). The
 executor never derives a drafter's step count or shape itself.
 
-Padding rows still route through the MoE layers, and under attention DP every
+Padding rows still pass through the MoE layers, and under attention DP every
 rank's filler is interleaved with the real rows in the all-gathered MoE
 input. The expert load counters (`--expert-distribution-recorder-mode stat`)
 therefore read a device-side live-row mask (`ExpertLoadRowMask`, one
@@ -495,6 +495,30 @@ owners mark from the host's padded/live counts before a padded replay — the
 decode graph in `ForwardStepRunner`, the bucket in `PrefillGraph.replay` —
 and clear right after it, on the same stream. Eager forwards are unpadded
 and read the all-True mask; the router counts a route if and only if its row is marked.
+
+DeepGEMM MegaMoE also routes no experts for the filler rows of a padded
+decode replay. `ForwardStepRunner` writes the replay's live and padded
+request counts into one int32 device pair (`mega_moe_live_requests`) that
+every MegaMoE input staging reads, and writes (1, 1) back right after the
+replay, on the same stream, also when the replay raises. Staging gives each
+row at or past `num_tokens * live // padded` expert id -1 and weight 0, which
+MegaMoE skips in dispatch and combine; a filler row's MoE output is then
+zero, or the fused shared expert's alone. Eager forwards and prefill-graph
+buckets see (1, 1) and route every row.
+
+The pair counts requests, not rows, so one pair serves the replay's forwards
+of different rows per request, such as the DeepSeek V4.1 target's rows and
+its DSpark drafter's block rows, where a row mask would need one per row
+count. The share is right only when each rank's MegaMoE input is its
+attention-DP group's whole padded batch: request-major, the same number of
+rows per request, the filler requests last. Attention TP 1 and rows
+replicated over attention TP (attention TP == MoE TP×EP) give that; they are
+the only layouts DeepSeek V4.1 admits with MegaMoE. Any other attention TP,
+such as Qwen3.5's DP4/TP2/EP8, reduce-scatters each group's rows into shards
+(`moe_input_row_segments`) that hold its live rows unevenly. The runner
+therefore writes the pair only under the first two layouts
+(`mega_moe_stages_whole_batches`); under the others it stays (1, 1) and
+MegaMoE routes every row.
 
 ### Pointer-stable per-bs views from one builder
 
@@ -533,10 +557,10 @@ slot 1 (`backends/state/checkpoint.py`). State backends
 refresh every state group's decode blocks in one prep-tape launch, up to eight
 groups; the tape loops over rows, so it covers every captured batch size.
 Target verify writes each group's committed-state blocks straight into the
-captured `state_in` buffers. The commit enqueued after the replay reads those
-buffers before the next refresh rewrites them. Verify keeps `state_out` at
-`pad_slot_id` and refills it only after a decode refresh has written live
-blocks into the same per-bs buffer.
+captured `state_in` buffers and its live blocks into `state_out`, every group
+and the graph padding rows in one launch (`verify_state_groups`, up to four
+groups). The commit enqueued after the replay reads those buffers before the
+next refresh rewrites them.
 
 After verification, GDN, KDA, and PLE resolve the accepted state's destination
 with `commit_state_pages`, once per state group and only for live requests:
@@ -917,69 +941,68 @@ The drafter's work inside an extend forward replays from graphs too. The
 drafter declares what it records (`BaseDrafter.extend_graph_plan`), and the
 capture and the CUDA-graph memory projection read that one plan: Eagle's
 decode steps at each request count from 1 to `EXTEND_DECODE_MAX_REQUESTS` (16,
-at most `max_num_seqs`; `prefill:drafter-decode`), and with
-`--enable-drafter-prefill-graph` its step 0 per target token bucket at each
-exact request count of `--prefill-graph-capture-batch-sizes`
-(`prefill:drafter-step0`). An extend round admits a few requests (under a
-steady streaming load, one or two in nearly every round), so a larger one
-runs its decode steps eager; each captured count is a dummy extend of that
-many requests, which the probe arena's floor covers. They are breakable graphs in one private pool,
-apart from the target's prefill and decode pools. Their static buffers (the
-target's hidden rows at the largest bucket) are allocated outside the
-measured windows, like the target graph's static outputs, so the utilization
-headroom funds them. A drafter's single prefill graph of its own
-(`captures_prefill_graph`, the `prefill:drafter` ladder) is a separate hook
-with its own contract.
+at most `max_num_seqs`; `prefill:drafter-decode`), and a split draft's K/V
+writer over one tile of rows (`prefill:drafter-kv`, below). An extend round
+admits a few requests (under a steady streaming load, one or two in nearly
+every round), so a larger one runs its decode steps eager; each captured
+count is a dummy extend of that many one-token requests, which the probe
+arena's floor covers. They are breakable graphs in one private pool, apart
+from the target's prefill and decode pools. Their static buffers are
+allocated outside the measured windows, like the target graph's static
+outputs, so the utilization headroom funds them. A drafter's single prefill
+graph of its own (`captures_prefill_graph`, the `prefill:drafter` ladder) is a
+separate hook with its own contract.
 
-Step 0 is token-shaped up to the narrowing and one row per request after it,
-so its graph pads the rows to the bucket and bakes the request count. The
-sequence mixers stay at their breaks (the QSA indexer, `PagedAttention.attend`),
-and so do the drafter steps that publish backend state a later break reads:
-the accepted-prefix publication, and per decode step the top-k reset, the
-seq_lens advance and the write window (`run_eager`). Recorded into a segment
-they would pin per-forward host state to the capture's batch (the indexer
-backend's active metadata, the router's published window). Step 0's context
-is one fixed object per (bucket, requests); the replay stages its inputs into
-static buffers (the target's hidden rows with a zero tail, the gather rows,
-the frontier), and its outputs land in static buffers the decode steps read.
-The draft prologue writes K/V inside a captured segment, which holds no
-per-layer Host-load wait, so a step-0 replay first waits for the draft pool's
-whole Host load, as the target's replay does on a pool that does not declare
-`layer_accesses_wait_for_load`, and skips the per-layer waits its capture
-noted; the decode-step replays, behind step 0, skip theirs too. These captures
-run each segment as soon as it is captured (`run_segments_while_capturing`):
-their breaks index with values a segment computes (the top-k rows the
-narrowing gathers, the decode steps' positions), which a capture alone leaves
+The decode steps run one row per request. The sequence mixers stay at their
+breaks (the QSA indexer, `PagedAttention.attend`), and so do the drafter
+steps that publish backend state a later break reads: per decode step the
+top-k reset, the seq_lens advance and the write window (`run_eager`).
+Recorded into a segment they would pin per-forward host state to the
+capture's batch (the indexer backend's active metadata, the router's
+published window). A replay stages its inputs into static buffers (step 0's
+proposals and hidden rows, the frontier), and the verify window lands in a
+static buffer too. These captures run each segment as soon as it is captured
+(`run_segments_while_capturing`): their breaks index with values a segment
+computes (the decode steps' positions), which a capture alone leaves
 unwritten when the break runs.
 
-A round replays only what the graphs baked: a pure extend (MIXED rounds run
-eager), no attention DP or query shard, a fitting bucket at the exact request
-count for step 0 and the exact request count for the decode steps (which also
-follow an eager step 0). The decode steps need a chain drafter of more than
-one step without a draft sampler, token history or a top-k carried across
-steps, and one replay decision on every rank that runs the round's
-collectives: no attention DP, no pipeline. Tensor- and expert-parallel ranks
-run the same round, so they replay alike. Step 0 additionally runs on one
-rank, over a draft model that declares `supports_breakable_draft_extend` (its
-draft backend also attends in the mode a break passes it). `ServerArgs`
-refuses the switch for the launches its arguments rule out, and
-`ModelExecutor` for a boot whose plan has no step-0 series.
+Step 0 runs eagerly over the round's rows, token-shaped up to the narrowing
+and one row per request after it, unless the draft splits the round (below);
+a round then replays the decode steps only where their graph holds: a pure
+extend (MIXED rounds run eager), no attention DP or query shard, a captured
+request count. The decode steps need a chain drafter of more than one step
+without a draft sampler, token history or a top-k carried across steps, and
+one replay decision on every rank that runs the round's collectives: no
+attention DP, no pipeline. Tensor- and expert-parallel ranks run the same
+round, so they replay alike.
 
-A one-layer draft whose rows meet only at attention (Qwen3.5's MTP head, a
-`SplitExtendDraft`) splits its extend rounds instead and records
-no step-0 graph. A row's draft K/V reads only that row's inputs (its shifted
-token, the target's hidden row, its position), so `write_draft_kv` runs the
-layer up to its attention prologue over every row, and step 0 then runs from
-each request's last row as one more decode step, one below the frontier: it
-rewrites that row's K/V and attends over the prefix. The K/V writer replays
+A one-layer draft whose rows meet only at attention (the MTP heads of Qwen3.5
+and Qwen4-Exp, each a `SplitExtendDraft`) splits its extend rounds. A row's
+draft cache entries read only that row's inputs (its shifted token, the
+target's hidden row, its position), so `write_draft_kv` runs the layer up to
+its attention prologue over every row and writes the row's K/V, and for
+Qwen4-Exp its QSA index key, at the locations `begin_split_round` names: the
+attention's write slots, and the indexer's logical positions, request indices
+and compressed and recent slots. Step 0 then runs from each request's last
+row as one more decode step, one below the frontier: it rewrites that row's
+K/V, selects its top-k and attends over the prefix. The K/V writer replays
 one graph over a fixed tile of rows (`EXTEND_KV_TILE_ROWS`, at most the
 largest bucket; `prefill:drafter-kv`), staging the round tile after tile with
-the padded rows written to the dummy slot, and waits for the draft pool's
-Host load first as a step-0 replay does. The steps replay the decode-steps
-graph of the round's request count. No graph bakes a token bucket and a
-request count together, so a round of up to 16 requests replays at any token
-count. A mid chunk writes its K/V and drafts nothing, as no verify follows
-it. A round under attention DP or a query shard keeps step 0 whole, eagerly.
+the padded rows at zero locations (the dummy K/V slot, no index write); a
+compression group that spans tiles reads its earlier members from the recent
+cache, as the target's chunked prefill does. The writer holds no per-layer
+Host-load wait, so the round first waits for the draft pool's whole Host
+load, as the target's replay does on a pool that does not declare
+`layer_accesses_wait_for_load`, and the decode-step replays skip the
+per-layer waits their capture noted (an eager step 0 has waited too).
+`begin_split_round` also resets the QSA draft steps' staged-key tags, which a
+narrowed step 0 resets otherwise. The steps replay the decode-steps graph of
+the round's request count, and no other round replays it. No graph bakes a
+token bucket and a request count together, so a round of up to 16 requests
+replays at any token count. A mid chunk writes its draft cache and drafts
+nothing, as no verify follows it. A round under attention DP or a query
+shard keeps step 0 whole, eagerly, and so does a draft that carries its top-k
+across steps (`index_share_for_mtp_iteration`).
 
 A replay is not bit-identical to a serving-time eager round in general. The
 graphs keep the kernels startup dispatch chose for them, as the decode graphs
@@ -1385,8 +1408,10 @@ Enumerated residue in `ForwardStepRunner.__call__`, all tied to the mechanics
 of replaying a recorded graph: input-buffer padding to the ladder bs plus the
 DFLASH sentinel req-pool rows, the DeepEP
 dispatch-mode restore (`deepep_adapter.replay()`), the sampler-variant
-`graph_key` lookup, the `TOKENSPEED_GRAPH_DEBUG` metadata verify,
-output-buffer re-slicing, the `ctx.bs` save/restore, and the replay itself
+`graph_key` lookup, the `TOKENSPEED_GRAPH_DEBUG` metadata verify, the
+filler-row marks around a padded replay (the expert load row mask and
+MegaMoE's live-request counts), output-buffer re-slicing, the `ctx.bs`
+save/restore, and the replay itself
 through the drafter (`replay_decode_graph`: EAGLE-Harness replays it on its
 round stream and launches its device-chained round behind it).
 
