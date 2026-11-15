@@ -18,32 +18,20 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! `ts-host`: one TokenSpeed engine rank with its control plane in Rust.
+//! One TokenSpeed engine rank with its control plane in Rust.
 //!
-//! Every launch path starts one per rank (`engine/rust_host.py` is its Python
-//! half; `TOKENSPEED_HOST_BINARY` overrides the installed binary):
-//!
-//! ```text
-//! ts-host --python <executable> --control-fd <fd> --enable-async-logging <bool>
-//! ```
-//!
-//! The rank's arguments arrive on `--control-fd`, and readiness goes back
-//! on it. The embedded interpreter builds the data plane and the scheduler;
-//! the ranks then connect their collective mesh, the replica's first member
-//! connects to the frontend, and the main thread runs the scheduling loop
-//! while the forward thread runs the data plane; the main thread takes the
-//! GIL only for the data plane's completion queries (`data_plane`).
+//! The launching Python interpreter imports this extension and enters the
+//! scheduling loop on its main thread with the GIL released. The forward
+//! thread runs the Python data plane; completion queries acquire the GIL.
 
 mod data_plane;
 mod encode;
 mod host_spans;
-mod interpreter;
 mod logging;
 mod pd;
 
 use std::{
     collections::HashSet,
-    process::ExitCode,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex, OnceLock,
@@ -67,6 +55,7 @@ use ts_control::{
     json_framing::{JsonFraming, MessageBoundary},
     kv_events::{KvEventPublisher, KvEventsConfig},
     output::{FinishLog, OutputProcessor, Role},
+    startup,
     transport::{EngineTransport, TransportError},
 };
 use ts_metrics::{
@@ -101,10 +90,6 @@ const EP_GROUP: u32 = 3;
 
 #[derive(Debug, thiserror::Error)]
 enum HostError {
-    #[error(
-        "usage: ts-host --python <executable> --control-fd <fd> --enable-async-logging <bool>: {0}"
-    )]
-    Usage(String),
     #[error("{0}")]
     Interpreter(String),
     #[error("python:\n{0}")]
@@ -138,7 +123,6 @@ fn python_error(py: Python<'_>, error: PyErr) -> HostError {
 }
 
 struct Args {
-    python: String,
     control_fd: i32,
     enable_async_logging: bool,
 }
@@ -209,42 +193,6 @@ impl LauncherFailure {
     }
 }
 
-fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, HostError> {
-    let mut python = None;
-    let mut control_fd = None;
-    let mut enable_async_logging = None;
-    while let Some(flag) = args.next() {
-        let value = args
-            .next()
-            .ok_or_else(|| HostError::Usage(format!("{flag} needs a value")))?;
-        match flag.as_str() {
-            "--python" => python = Some(value),
-            "--control-fd" => {
-                control_fd = Some(
-                    value
-                        .parse()
-                        .map_err(|_| HostError::Usage(format!("bad --control-fd {value}")))?,
-                )
-            }
-            "--enable-async-logging" => {
-                enable_async_logging = Some(value.parse().map_err(|_| {
-                    HostError::Usage(format!(
-                        "bad --enable-async-logging {value}: use true or false"
-                    ))
-                })?);
-            }
-            _ => return Err(HostError::Usage(format!("unknown argument {flag}"))),
-        }
-    }
-    Ok(Args {
-        python: python.ok_or_else(|| HostError::Usage("--python is required".to_owned()))?,
-        control_fd: control_fd
-            .ok_or_else(|| HostError::Usage("--control-fd is required".to_owned()))?,
-        enable_async_logging: enable_async_logging
-            .ok_or_else(|| HostError::Usage("--enable-async-logging is required".to_owned()))?,
-    })
-}
-
 /// Load once at startup; Python is called only by the background exporter.
 fn trace_provider(config: &Bound<'_, PyAny>) -> PyResult<Option<ts_control::trace::TraceProvider>> {
     let callback = config.getattr("trace_provider")?;
@@ -296,6 +244,9 @@ struct HostConfig {
     kv_total_pages: i64,
     /// Effective token capacity of the usable KV pool.
     kv_token_capacity: i64,
+    /// With `--enable-startup-requests`, what sizes the requests the engine
+    /// serves itself before it registers.
+    startup: Option<startup::Limits>,
     rank: usize,
     replica_ranks: Vec<usize>,
     pp_ranks: Option<Vec<usize>>,
@@ -554,6 +505,22 @@ impl HostConfig {
             physical_context_len: config.getattr("physical_context_len")?.extract()?,
             kv_total_pages: config.getattr("kv_total_pages")?.extract()?,
             kv_token_capacity: config.getattr("kv_token_capacity")?.extract()?,
+            startup: if config.getattr("startup_requests")?.extract()? {
+                Some(startup::Limits {
+                    max_batch_size: config.getattr("max_batch_size")?.extract()?,
+                    chunk_tokens: config.getattr("chunked_prefill_size")?.extract()?,
+                    max_prompt_len: config.getattr("max_req_input_len")?.extract()?,
+                    max_model_len: config.getattr("max_model_len")?.extract()?,
+                    token_capacity: config.getattr("kv_token_capacity")?.extract()?,
+                    page_tokens: config.getattr("prefix_granularity")?.extract()?,
+                    decode_width: config
+                        .getattr("spec_num_tokens")?
+                        .extract::<Option<usize>>()?
+                        .unwrap_or(1),
+                })
+            } else {
+                None
+            },
             rank: config.getattr("rank")?.extract()?,
             replica_ranks: config.getattr("replica_ranks")?.extract()?,
             pp_ranks: config.getattr("pp_ranks")?.extract()?,
@@ -729,8 +696,6 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
 
     let (bootstrap, outbox, mode, replica_memory_transitions) = Python::attach(|py| {
         let built = (|| {
-            // Before anything imports the scheduler package.
-            ts_scheduler::alias_builtin_module(py)?;
             let outbox = Bound::new(py, pd::Outbox::new())?;
             let host_spans = Bound::new(py, host_spans::HostSpans)?;
             let runtime = py.import("tokenspeed.runtime.engine.rust_host")?;
@@ -835,18 +800,7 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
     };
 
     // The replica's first member speaks for it.
-    let transport = if ranks.replica.index() == 0 {
-        let mut ready: EngineCoreReadyResponse = ts_wire::decode_bytes(&config.ready_response)?;
-        ready.declare_scheduler();
-        Some(EngineTransport::connect(
-            &config.handshake_address,
-            config.engine_index,
-            ready,
-            HANDSHAKE_TIMEOUT,
-        )?)
-    } else {
-        None
-    };
+    let speaks = ranks.replica.index() == 0;
     let call = |method: &str| {
         Python::attach(|py| {
             bootstrap
@@ -855,8 +809,6 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
                 .map_err(|error| python_error(py, error))
         })
     };
-    call("report_ready")?;
-    call("enter_serving")?;
 
     if config.grammar.is_some() {
         // The data plane drives the matchers through these.
@@ -953,7 +905,7 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
     let mut event_loop = EventLoop::new(
         scheduler,
         data_plane,
-        transport,
+        None::<EngineTransport>,
         outputs,
         loop_config,
         ranks,
@@ -968,7 +920,51 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
             l3,
         },
     );
-    finish_serving(event_loop.run(&stop), launcher, || {
+    // The engine registers only once its own requests ran: no client
+    // request can reach it before then.
+    let registered = (|| -> Result<bool, HostError> {
+        if let Some(limits) = config.startup {
+            let phases = limits.phases();
+            let started = std::time::Instant::now();
+            let requests = startup::requests(&phases, limits.output_tokens());
+            if event_loop.warm_up(requests, &stop)? {
+                return Ok(false);
+            }
+            tracing::info!(
+                ?phases,
+                elapsed_ms = started.elapsed().as_millis(),
+                "served the startup requests"
+            );
+        }
+        if speaks {
+            let mut ready: EngineCoreReadyResponse = ts_wire::decode_bytes(&config.ready_response)?;
+            ready.declare_scheduler();
+            *event_loop.frontend_mut() = Some(EngineTransport::connect(
+                &config.handshake_address,
+                config.engine_index,
+                ready,
+                HANDSHAKE_TIMEOUT,
+            )?);
+        }
+        call("report_ready")?;
+        call("enter_serving")?;
+        Ok(true)
+    })();
+    let served = match registered {
+        Ok(true) => event_loop.run(&stop),
+        // Stopped while serving the startup requests.
+        Ok(false) => Ok(()),
+        Err(error) => {
+            // Startup is not generation serving: its failure reaches the
+            // final error handler after cleanup.
+            drop(event_loop);
+            if let Err(close_error) = call("close") {
+                tracing::error!(%close_error, "rank cleanup also failed");
+            }
+            return Err(error);
+        }
+    };
+    finish_serving(served, launcher, || {
         // Stops the forward thread and tells the frontend the engine is gone.
         drop(event_loop);
         call("close")
@@ -995,32 +991,44 @@ fn finish_serving(
     served.and(closed)
 }
 
-fn main() -> ExitCode {
-    let args = match parse_args(std::env::args().skip(1)) {
-        Ok(args) => args,
-        Err(error) => {
-            eprintln!("{error}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let _log_guard = logging::init(args.enable_async_logging);
-    let launcher = LAUNCHER_FAILURE.get_or_init(LauncherFailure::for_parent);
-    let served = (|| {
-        interpreter::start(&args.python).map_err(HostError::Interpreter)?;
-        // The host does not finalize Python. Drain its logger on success,
-        // error and unwind if the launcher has not stopped the rank.
-        let _python_logs = logging::PythonLogGuard;
-        serve(&args, launcher)
-    })();
-    match served {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            // Errors outside generation serving still arrive after cleanup,
-            // but use the same native notification and parent checks.
-            launcher.report(&error);
-            ExitCode::FAILURE
-        }
-    }
+/// Run one rank on the calling (main) thread and exit without Python finalization.
+#[pyfunction]
+fn run_host(py: Python<'_>, control_fd: i32, enable_async_logging: bool) -> PyResult<()> {
+    py.detach(|| {
+        let args = Args {
+            control_fd,
+            enable_async_logging,
+        };
+        let log_guard = logging::init(args.enable_async_logging);
+        let launcher = LAUNCHER_FAILURE.get_or_init(LauncherFailure::for_parent);
+        let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _python_logs = logging::PythonLogGuard;
+            serve(&args, launcher)
+        }));
+        let code = match served {
+            Ok(Ok(())) => 0,
+            Ok(Err(error)) => {
+                launcher.report(error);
+                1
+            }
+            Err(_) => {
+                launcher.report("host panicked");
+                1
+            }
+        };
+        // process::exit skips Rust drops and Python finalization. Drain native
+        // logging explicitly; stuck Python threads must not keep a rank alive.
+        drop(log_guard);
+        std::process::exit(code)
+    })
+}
+
+/// The rank's native control loop and its single scheduler implementation.
+#[pymodule]
+fn _host(module: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
+    module.add("scheduler", ts_scheduler::python_module(module.py())?)?;
+    module.add_function(wrap_pyfunction!(run_host, module)?)?;
+    Ok(())
 }
 
 #[cfg(test)]

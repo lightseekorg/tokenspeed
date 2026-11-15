@@ -1488,6 +1488,8 @@ def _use_gfx1250_moe_decode(num_routed_rows: int, num_experts: int) -> bool:
 
 if platform.is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (
+        A8W4_SORT_BLOCK_SIZE,
+        A8W4_SORTED_DECODE_ROWS,
         gluon_mxfp4_fp8_precomputed_situ,
     )
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (
@@ -2082,6 +2084,10 @@ if platform.is_amd:
             "internal_activation_dtype": frozenset({"input"}),
             # Prefill rows may arrive as packed E2M1 data with CDNA4 scales.
             "supports_prequantized_input": frozenset({True}),
+            # Decode rows that sort their routes take a sort made upstream
+            # in gluon_moe_sorting's layout at this block size instead.
+            "sorted_route_rows": frozenset(A8W4_SORTED_DECODE_ROWS),
+            "sorted_route_block_size": frozenset({A8W4_SORT_BLOCK_SIZE}),
         },
         priority=Priority.SPECIALIZED,
     )
@@ -2112,8 +2118,11 @@ if platform.is_amd:
         # A producer that already quantized ``x`` leaves it for this call only.
         x_quantized = getattr(w, "_situ_input_fp8", None)
         w._situ_input_fp8 = None
+        # A router that also sorted these routes by expert leaves the sort too.
+        sorted_routes = getattr(w, "_situ_sorted_routes", None)
+        w._situ_sorted_routes = None
         rows = int(x[0].shape[0] if isinstance(x, tuple) else x.shape[0])
-        if situ_linear_beta is not None and is_warming_up() and rows > 64:
+        if situ_linear_beta is not None and is_warming_up():
             # Serving chunks pick tiles by row count, up to this warmup prefill's rows.
             warm_gluon_mxfp4_situ_prefill_rows(
                 w.w13_weight_triton_tensor,
@@ -2143,6 +2152,7 @@ if platform.is_amd:
                 # The caller reduces [M * top_k, N] slot rows itself.
                 defer_topk_reduce=getattr(w, "_situ_defer_topk_reduce", False),
                 x_quantized=x_quantized,
+                sorted_routes=sorted_routes,
             )
             if out is not None:
                 return out
@@ -3455,6 +3465,7 @@ if platform.is_amd:
         launch_gluon_latent_input_largem_gfx1250 as _largem_gfx1250_impl,
     )
 
+    _SMALL_BATCH_MAX_TOKENS = 320
     _SIGNATURES = frozenset(
         {
             format_signature(
@@ -3582,7 +3593,7 @@ if platform.is_amd:
             "weights_packed": frozenset({True}),
             "hidden_size_multiple_64": frozenset({True}),
             "inputs_contiguous": frozenset({True}),
-            "tokens": frozenset(range(1, 321)),
+            "tokens": frozenset(range(1, _SMALL_BATCH_MAX_TOKENS + 1)),
         },
     )
     def gluon_latent_input_small_batch_gfx950(**kwargs):
@@ -3597,6 +3608,7 @@ if platform.is_amd:
             packed_projection_weight_view(*weights),
             beta=kwargs["gate_clamp"],
             linear_beta=kwargs["up_clamp"],
+            warm_max_tokens=_SMALL_BATCH_MAX_TOKENS if is_warming_up() else 0,
         )
 
     @register_kernel(
@@ -3632,6 +3644,7 @@ if platform.is_amd:
             packed_weight,
             beta=kwargs["gate_clamp"],
             linear_beta=kwargs["up_clamp"],
+            warm_variants=is_warming_up(),
         )
 
     @register_kernel(
@@ -3668,6 +3681,7 @@ if platform.is_amd:
             packed_weight,
             beta=kwargs["gate_clamp"],
             linear_beta=kwargs["up_clamp"],
+            warm_variants=is_warming_up(),
         )
 
 

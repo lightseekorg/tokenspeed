@@ -31,6 +31,7 @@ from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     ProducerPull,
     iris_arch_policy,
 )
+from tokenspeed_kernel.ops.tuning import is_warming_up
 from tokenspeed_kernel.platform import current_platform
 
 REDUCE_PROGRAMS = 24
@@ -1589,7 +1590,7 @@ class IrisAllReduceShardedState:
             else attention_gather.own_rows
         )
         logits, latent = launch_gluon_latent_input_largem_routed_gfx950(
-            owned, packed_weight
+            owned, packed_weight, warm_variants=is_warming_up()
         )
         # The prefill router allocates its outputs; copy them into the gather.
         weights, ids = route(owned, logits)
@@ -1601,7 +1602,11 @@ class IrisAllReduceShardedState:
             self.join_gather(attention_gather)
         self.gather_moe_inputs(rows)
         shared = launch_gluon_latent_input_largem_shared_gfx950(
-            hidden_states, packed_weight, beta=beta, linear_beta=linear_beta
+            hidden_states,
+            packed_weight,
+            beta=beta,
+            linear_beta=linear_beta,
+            warm_variants=is_warming_up(),
         )
         return (full[0], full[1]), full[3], full[2], shared
 

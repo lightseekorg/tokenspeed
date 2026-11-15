@@ -44,6 +44,9 @@ from tokenspeed_kernel.ops.attention.prologue import (  # noqa: E402
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode  # noqa: E402
 from tokenspeed.runtime.layers import paged_attention  # noqa: E402
+from tokenspeed.runtime.layers.attention.backends.base import (  # noqa: E402
+    SparseTopKShare,
+)
 from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm, RMSNorm  # noqa: E402
 from tokenspeed.runtime.layers.rotary_embedding import (  # noqa: E402
     MRotaryEmbedding,
@@ -108,6 +111,7 @@ def _prologue(monkeypatch, *, qk_norm, mode, rows, slots):
             padded_write_locations=lambda layer, m, rows: handed.update(rows=rows)
             or slots,
             cache_placement=lambda layer: None,
+            sparse_topk=SparseTopKShare(),
             query_dtype=lambda layer, mode, activation: activation,
         ),
         token_to_kv_pool=SimpleNamespace(
@@ -167,6 +171,7 @@ def test_the_prefill_prologue_runs_over_every_row_before_the_break(monkeypatch):
                     [5, 6, 0, 0]
                 )[:rows],
                 cache_placement=lambda layer: None,
+                sparse_topk=SparseTopKShare(),
             ),
             token_to_kv_pool=SimpleNamespace(
                 kv_write_target=lambda layer_id, s, m: LatentKVCache(cache, False, s, m)
@@ -208,7 +213,9 @@ def test_the_write_lands_on_this_ranks_shard_under_kvp(monkeypatch):
     )
     ctx = SimpleNamespace(
         forward_mode=ForwardMode.EXTEND,
-        attn_backend=SimpleNamespace(cache_placement=lambda layer: placement),
+        attn_backend=SimpleNamespace(
+            cache_placement=lambda layer: placement, sparse_topk=SparseTopKShare()
+        ),
         token_to_kv_pool=SimpleNamespace(
             kv_write_target=lambda layer_id, s, m: LatentKVCache(None, False, s, m)
         ),
@@ -266,7 +273,9 @@ def test_a_query_shard_gathers_the_rotated_latent_before_the_masked_store(
     )
     ctx = SimpleNamespace(
         forward_mode=ForwardMode.EXTEND,
-        attn_backend=SimpleNamespace(cache_placement=lambda layer: placement),
+        attn_backend=SimpleNamespace(
+            cache_placement=lambda layer: placement, sparse_topk=SparseTopKShare()
+        ),
         token_to_kv_pool=SimpleNamespace(
             kv_write_target=lambda layer_id, s, m: LatentKVCache(None, False, s, m)
         ),
@@ -347,7 +356,9 @@ def test_a_query_shard_gather_can_carry_extra_rows(monkeypatch):
     )
     ctx = SimpleNamespace(
         forward_mode=ForwardMode.EXTEND,
-        attn_backend=SimpleNamespace(cache_placement=lambda layer: None),
+        attn_backend=SimpleNamespace(
+            cache_placement=lambda layer: None, sparse_topk=SparseTopKShare()
+        ),
         token_to_kv_pool=SimpleNamespace(
             kv_write_target=lambda layer_id, s, m: LatentKVCache(None, False, s, m)
         ),
@@ -392,7 +403,9 @@ def test_extra_rows_must_keep_the_latent_half_16_byte_aligned():
     )
     ctx = SimpleNamespace(
         forward_mode=ForwardMode.EXTEND,
-        attn_backend=SimpleNamespace(cache_placement=lambda layer: None),
+        attn_backend=SimpleNamespace(
+            cache_placement=lambda layer: None, sparse_topk=SparseTopKShare()
+        ),
         token_to_kv_pool=SimpleNamespace(
             kv_write_target=lambda layer_id, s, m: LatentKVCache(None, False, s, m)
         ),
@@ -444,7 +457,9 @@ def test_an_empty_shard_still_joins_the_gather_and_stores_its_pages(monkeypatch)
     )
     ctx = SimpleNamespace(
         forward_mode=ForwardMode.EXTEND,
-        attn_backend=SimpleNamespace(cache_placement=lambda layer: None),
+        attn_backend=SimpleNamespace(
+            cache_placement=lambda layer: None, sparse_topk=SparseTopKShare()
+        ),
         token_to_kv_pool=SimpleNamespace(
             kv_write_target=lambda layer_id, s, m: LatentKVCache(None, False, s, m)
         ),

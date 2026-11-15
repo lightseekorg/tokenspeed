@@ -20,6 +20,47 @@ path nothing exercised routinely.
 
 ## Invariants
 
+### Slot state belongs to an admission
+
+Persistent request-pool rows are reused across requests. Before a forward,
+outside graph capture/replay, the executor binds stop criteria and prepares
+sampling with the admission identities carried by `PlannedForward`. A new
+admission binds its stop criteria and initializes its sampling rows even when
+the external request ID and pool index equal a previous request's. Later
+steps of the same admission preserve sampling counts and RNG state; the
+identity never changes the request's seed.
+The host record fixes stop criteria for the lifetime of an admission, so
+stop binding uses that identity without a second key containing the criteria.
+A later request reusing the public RID still receives a new identity.
+
+A retraction keeps the admission identity. A sampler snapshot records whether
+that admission prepared the slot: an image taken before the first local
+prepare contains no previous occupant's payload. Restoring a prepared image
+claims the destination for that admission, preserving its next sampling step;
+an unprepared image requires initialization on first use. RuntimeStates
+restores its running rows but invalidates its stop-binding owner. The next
+forward rebinds the host's canonical stop criteria without clearing restored
+cache lengths, candidates or stop flags. This also covers a remote landing
+imaged before its first stop binding. Stores, restores and binding retain the
+existing execution-stream dependencies; identity checks do not replace fences.
+
+Token-derived history, including Engram's accepted n-gram tail, is rebuilt
+from the host's token history rather than copied in the retraction image.
+Engram's external-RID comparison is only one reseed trigger: local extends
+and remote-prefill slot preparation call `RuntimeStates.reset_states()`,
+which marks the tail with `ngram_needs_seed`. The first decode after remote
+prefill or a snapshot restore also carries an explicit input token, forcing
+reseed even for the same RID and slot. Later decode steps advance the accepted
+tail in place. Reusing a RID therefore does not bypass the reseed needed when
+a slot changes hands.
+
+The sampler's route and top-k padding describe the current batch, not the
+owners of all prepared slots. Their cache tracks the admissions in each
+executed batch: equally sized batches can contain different prepared requests,
+including a restored request that waits while another batch runs. Restoring
+slot ownership must preserve sampling history; it does not establish which
+batch runs next. A stable batch reuses its cached route and padding.
+
 ### One decode metadata path
 
 `AttentionBackend.refresh_decode_metadata(bs, actual_bs, req_pool_indices,
@@ -492,10 +533,10 @@ slot 1 (`backends/state/checkpoint.py`). State backends
 refresh every state group's decode blocks in one prep-tape launch, up to eight
 groups; the tape loops over rows, so it covers every captured batch size.
 Target verify writes each group's committed-state blocks straight into the
-captured `state_in` buffers. The commit enqueued after the replay reads those
-buffers before the next refresh rewrites them. Verify keeps `state_out` at
-`pad_slot_id` and refills it only after a decode refresh has written live
-blocks into the same per-bs buffer.
+captured `state_in` buffers and its live blocks into `state_out`, every group
+and the graph padding rows in one launch (`verify_state_groups`, up to four
+groups). The commit enqueued after the replay reads those buffers before the
+next refresh rewrites them.
 
 After verification, GDN, KDA, and PLE resolve the accepted state's destination
 with `commit_state_pages`, once per state group and only for live requests:
@@ -717,9 +758,9 @@ over the target and draft `child_backends()` trees once
 two graph subsystems (`ForwardStepRunner.disable`, `PrefillGraph.disable`).
 `DSABackend` disables the prefill graph (rationale on the class) unless its
 consumer narrows a padded replay to the live rows in an eager break: a KPool
-instance (GLM-5.3-Flash), and Kimi-K3.1 on the prefill role and, without
-`--enable-mixed-batch`, on the aggregated role
-(`DSAConfig.padded_prefill_replay`).
+instance (GLM-5.3-Flash), and Kimi-K3.1 on the prefill role and on the
+aggregated role, where a mixed round's decode rows ride in the narrowed break
+with the extend's (`DSAConfig.padded_prefill_replay`).
 That instance declaration follows launch arguments, so the prefill role and
 Kimi-K3.1's aggregated role check at boot that every rank plans the same
 prefill graphs (`check_rank_uniform_prefill_plan`; keyed on the role and
@@ -876,53 +917,68 @@ The drafter's work inside an extend forward replays from graphs too. The
 drafter declares what it records (`BaseDrafter.extend_graph_plan`), and the
 capture and the CUDA-graph memory projection read that one plan: Eagle's
 decode steps at each request count from 1 to `EXTEND_DECODE_MAX_REQUESTS` (16,
-at most `max_num_seqs`; `prefill:drafter-decode`), and with
-`--enable-drafter-prefill-graph` its step 0 per target token bucket at each
-exact request count of `--prefill-graph-capture-batch-sizes`
-(`prefill:drafter-step0`). An extend round admits a few requests (under a
-steady streaming load, one or two in nearly every round), so a larger one
-runs its decode steps eager; each captured count is a dummy extend of that
-many requests, which the probe arena's floor covers. They are breakable graphs in one private pool,
-apart from the target's prefill and decode pools. Their static buffers (the
-target's hidden rows at the largest bucket) are allocated outside the
-measured windows, like the target graph's static outputs, so the utilization
-headroom funds them. A drafter's single prefill graph of its own
-(`captures_prefill_graph`, the `prefill:drafter` ladder) is a separate hook
-with its own contract.
+at most `max_num_seqs`; `prefill:drafter-decode`), and a split draft's K/V
+writer over one tile of rows (`prefill:drafter-kv`, below). An extend round
+admits a few requests (under a steady streaming load, one or two in nearly
+every round), so a larger one runs its decode steps eager; each captured
+count is a dummy extend of that many one-token requests, which the probe
+arena's floor covers. They are breakable graphs in one private pool, apart
+from the target's prefill and decode pools. Their static buffers are
+allocated outside the measured windows, like the target graph's static
+outputs, so the utilization headroom funds them. A drafter's single prefill
+graph of its own (`captures_prefill_graph`, the `prefill:drafter` ladder) is a
+separate hook with its own contract.
 
-Step 0 is token-shaped up to the narrowing and one row per request after it,
-so its graph pads the rows to the bucket and bakes the request count. The
-sequence mixers stay at their breaks (the QSA indexer, `PagedAttention.attend`),
-and so do the drafter steps that publish backend state a later break reads:
-the accepted-prefix publication, and per decode step the top-k reset, the
-seq_lens advance and the write window (`run_eager`). Recorded into a segment
-they would pin per-forward host state to the capture's batch (the indexer
-backend's active metadata, the router's published window). Step 0's context
-is one fixed object per (bucket, requests); the replay stages its inputs into
-static buffers (the target's hidden rows with a zero tail, the gather rows,
-the frontier), and its outputs land in static buffers the decode steps read.
-The draft prologue writes K/V inside a captured segment, which holds no
-per-layer Host-load wait, so a step-0 replay first waits for the draft pool's
-whole Host load, as the target's replay does on a pool that does not declare
-`layer_accesses_wait_for_load`, and skips the per-layer waits its capture
-noted; the decode-step replays, behind step 0, skip theirs too. These captures
-run each segment as soon as it is captured (`run_segments_while_capturing`):
-their breaks index with values a segment computes (the top-k rows the
-narrowing gathers, the decode steps' positions), which a capture alone leaves
+The decode steps run one row per request. The sequence mixers stay at their
+breaks (the QSA indexer, `PagedAttention.attend`), and so do the drafter
+steps that publish backend state a later break reads: per decode step the
+top-k reset, the seq_lens advance and the write window (`run_eager`).
+Recorded into a segment they would pin per-forward host state to the
+capture's batch (the indexer backend's active metadata, the router's
+published window). A replay stages its inputs into static buffers (step 0's
+proposals and hidden rows, the frontier), and the verify window lands in a
+static buffer too. These captures run each segment as soon as it is captured
+(`run_segments_while_capturing`): their breaks index with values a segment
+computes (the decode steps' positions), which a capture alone leaves
 unwritten when the break runs.
 
-A round replays only what the graphs baked: a pure extend (MIXED rounds run
-eager), no attention DP or query shard, a fitting bucket at the exact request
-count for step 0 and the exact request count for the decode steps (which also
-follow an eager step 0). The decode steps need a chain drafter of more than
-one step without a draft sampler, token history or a top-k carried across
-steps, and one replay decision on every rank that runs the round's
-collectives: no attention DP, no pipeline. Tensor- and expert-parallel ranks
-run the same round, so they replay alike. Step 0 additionally runs on one
-rank, over a draft model that declares `supports_breakable_draft_extend` (its
-draft backend also attends in the mode a break passes it). `ServerArgs`
-refuses the switch for the launches its arguments rule out, and
-`ModelExecutor` for a boot whose plan has no step-0 series.
+Step 0 runs eagerly over the round's rows, token-shaped up to the narrowing
+and one row per request after it, unless the draft splits the round (below);
+a round then replays the decode steps only where their graph holds: a pure
+extend (MIXED rounds run eager), no attention DP or query shard, a captured
+request count. The decode steps need a chain drafter of more than one step
+without a draft sampler, token history or a top-k carried across steps, and
+one replay decision on every rank that runs the round's collectives: no
+attention DP, no pipeline. Tensor- and expert-parallel ranks run the same
+round, so they replay alike.
+
+A one-layer draft whose rows meet only at attention (the MTP heads of Qwen3.5
+and Qwen4-Exp, each a `SplitExtendDraft`) splits its extend rounds. A row's
+draft cache entries read only that row's inputs (its shifted token, the
+target's hidden row, its position), so `write_draft_kv` runs the layer up to
+its attention prologue over every row and writes the row's K/V, and for
+Qwen4-Exp its QSA index key, at the locations `begin_split_round` names: the
+attention's write slots, and the indexer's logical positions, request indices
+and compressed and recent slots. Step 0 then runs from each request's last
+row as one more decode step, one below the frontier: it rewrites that row's
+K/V, selects its top-k and attends over the prefix. The K/V writer replays
+one graph over a fixed tile of rows (`EXTEND_KV_TILE_ROWS`, at most the
+largest bucket; `prefill:drafter-kv`), staging the round tile after tile with
+the padded rows at zero locations (the dummy K/V slot, no index write); a
+compression group that spans tiles reads its earlier members from the recent
+cache, as the target's chunked prefill does. The writer holds no per-layer
+Host-load wait, so the round first waits for the draft pool's whole Host
+load, as the target's replay does on a pool that does not declare
+`layer_accesses_wait_for_load`, and the decode-step replays skip the
+per-layer waits their capture noted (an eager step 0 has waited too).
+`begin_split_round` also resets the QSA draft steps' staged-key tags, which a
+narrowed step 0 resets otherwise. The steps replay the decode-steps graph of
+the round's request count, and no other round replays it. No graph bakes a
+token bucket and a request count together, so a round of up to 16 requests
+replays at any token count. A mid chunk writes its draft cache and drafts
+nothing, as no verify follows it. A round under attention DP or a query
+shard keeps step 0 whole, eagerly, and so does a draft that carries its top-k
+across steps (`index_share_for_mtp_iteration`).
 
 A replay is not bit-identical to a serving-time eager round in general. The
 graphs keep the kernels startup dispatch chose for them, as the decode graphs
@@ -2474,6 +2530,20 @@ dense / MoE groups that are neither 1 nor the attention TP width in
 `validate_qcp`; the shard width (`N == attn.tp_size`) in `Mapping`; and the
 attention family (GPU DSA), device, and KV cache (bf16: the gathered write is
 `latent_store`, native rows only) in `AttnConfig`, which sees them resolved.
+
+## Runtime sizes reuse binaries
+
+Runtime payload counts and page-table widths do not select new binaries.
+The small Iris all-reduce keeps fixed mailbox geometry, validates complete
+tiles on the host and uses a uniform tile predicate so runtime payload
+bounds retain coherent 16-byte peer transactions. Paged history-table row
+offsets are computed in 64 bits before multiplying by the runtime stride.
+Scalar prefix-length reads share one binary across slice alignments.
+
+`test_batch_shape_recompiles_gfx950.py` checks binary reuse across runtime sizes;
+`test_mla_prefix_chunks.py` exercises a table offset beyond 2**31.
+Full serving validation must additionally show no compilation after
+readiness with the compilation monitor enabled.
 
 ## Non-goals
 

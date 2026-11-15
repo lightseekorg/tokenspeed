@@ -62,6 +62,7 @@ class UnloadedExperts(nn.Module):
         super().__init__()
         self.plan = {"weight_dtype": "bf16", "a2a_backend": "none"}
         self.supports_precomputed_topk = True
+        self.sorted_route_rows: frozenset[int] = frozenset()
         self.num_experts = num_experts
         self.activation = torch.empty(MAX_ROWS, hidden_size, dtype=torch.bfloat16)
         self.scales = torch.empty(MAX_ROWS, hidden_size // 16, dtype=torch.uint8)

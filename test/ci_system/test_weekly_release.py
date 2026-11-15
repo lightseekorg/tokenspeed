@@ -1125,8 +1125,8 @@ def test_component_failed_publication_blocks_dependency_and_resumes_same_run(
     controller.state["stages"][f"{component}-version"] = {"complete": True, "sha": sha}
     controller.save()
     files = {
-        f"scheduler-cp{python}-{arch}.whl": "a" * 64
-        for python in range(310, 314)
+        f"scheduler-{python_abi}-{arch}.whl": "a" * 64
+        for python_abi in ("cp311-cp311", "cp312-abi3")
         for arch in ("x86_64", "aarch64")
     }
     files["scheduler.tar.gz"] = "b" * 64

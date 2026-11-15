@@ -35,8 +35,8 @@ import torch
 from tokenspeed_kernel.thirdparty.cute_dsl.k3_decode.common import policy
 
 MIB = 1 << 20
-# Rows whose o-projection exit prefetches the MoE front's packed weight.
-OPROJ_DOWN = "3-8:1"
+# Rows whose o-projection exit prefetches the MoE front weight (ATTENTION_MOE has 8).
+OPROJ_DOWN = "3-7:1"
 # Rows whose attention prefetches its o-projection and the MoE layer's BF16 weights.
 ATTENTION_MOE = {"kda": "5-8:1", "mla": "8:1"}
 # Next attention's weights once the routed experts launch: MiB cap or cap.carveout.

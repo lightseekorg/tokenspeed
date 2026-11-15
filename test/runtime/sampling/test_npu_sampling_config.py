@@ -127,7 +127,7 @@ def test_hf_override_reaches_real_npu_sampling_pool(tmp_path, overrides, expecte
     requested = [p.top_k for p in params]
     for generation, order in enumerate((params, params[::-1])):
         backend.prepare_step(
-            [f"hf-cap-{generation}-{row}" for row in range(4)],
+            [generation * 4 + row + 1 for row in range(4)],
             [1, 2, 3, 4],
             order,
             num_tokens_per_req=1,

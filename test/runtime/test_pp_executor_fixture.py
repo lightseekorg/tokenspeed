@@ -226,7 +226,6 @@ def build_pp_executor(tmp_path, monkeypatch, *, device, pp_size, pp_rank):
         prefill_only=True,
         decode_only_attention=False,
         prefill_graph_capture_batch_sizes=None,
-        enable_drafter_prefill_graph=False,
         input_logprob_chunk_tokens=4,
         enable_speculative_sampling=False,
         query_shard_size=1,
