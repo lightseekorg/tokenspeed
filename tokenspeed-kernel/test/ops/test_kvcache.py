@@ -26,6 +26,7 @@ from tokenspeed_kernel.ops.kvcache.index_k_scale import (
     decode_index_k_scale,
     encode_index_k_scale,
     index_k_scale_dtype,
+    index_k_scale_ue8m0,
     round_index_k_scale,
 )
 from tokenspeed_kernel.ops.kvcache.triton import (
@@ -1405,7 +1406,7 @@ def test_index_k_scatter_mask_preserves_dummy_page(device):
     expected = before.clone()
     data, scale = _index_k_block_views(expected, 2, page_size, dim, 1)
     data[1, [1, 3]] = values.view(torch.uint8)[[1, 3]].view(torch.float8_e4m3fn)
-    scale[1, [1, 3]] = scales[[1, 3]]
+    scale[1, [1, 3]] = scales[[1, 3]].view(scale.dtype)
     assert torch.equal(cache, expected)
     assert torch.equal(cache[:64], before[:64])
 
@@ -1583,9 +1584,11 @@ def test_index_k_layernorm_fp8_scatter_quantizes_layer_norm_rows(
     # A boundary LayerNorm value may round either way, moving its scale one bf16 step.
     torch.testing.assert_close(scales, ref_scales, rtol=2**-7, atol=0)
     assert (codes == ref_codes).float().mean() > 0.99
-    # E4M3 keeps 3 mantissa bits: at most half of 32/448 of the amax off.
+    # E4M3 keeps 3 mantissa bits: at most half of 32/448 of the amax off, twice
+    # that when the scale is rounded up to a power of two.
     amax = groups.abs().amax(dim=-1, keepdim=True)
-    assert ((values.view_as(groups) - groups).abs() <= amax / 24).all()
+    step = amax / (12 if index_k_scale_ue8m0() else 24)
+    assert ((values.view_as(groups) - groups).abs() <= step).all()
     # Every byte outside the written rows and scales is untouched.
     pages = _plane_pages(buf, page_size, head_dim, ng)
     written = torch.zeros(pages.shape, dtype=torch.bool, device=device)
