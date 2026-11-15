@@ -27,6 +27,9 @@ import torch
 from tokenspeed_kernel.ops.sampling import write_synthetic_verify_outputs
 from tokenspeed_kernel.ops.sampling.triton.synthetic import _write_synthetic_outputs
 
+if not torch.cuda.is_available():
+    pytest.skip("CUDA required", allow_module_level=True)
+
 
 def _outputs(rows, width, device):
     sentinel = 7777
@@ -110,9 +113,13 @@ def test_batch_sizes_and_lengths_reuse_one_kernel():
                 assert torch.equal(actual.cpu(), ref)
 
 
-def test_misshaped_targets_are_refused():
+def test_misshaped_or_misplaced_inputs_are_refused():
     candidates, targets, lengths = _inputs(4, 8, True, seed=1)
     with pytest.raises(ValueError, match=r"targets must be \[4\] or \[4, 8\]"):
         write_synthetic_verify_outputs(
             candidates, targets[:, :3], lengths, *_outputs(4, 8, "cpu")
+        )
+    with pytest.raises(ValueError, match="share the candidates' device"):
+        write_synthetic_verify_outputs(
+            candidates, targets, lengths, *_outputs(4, 8, "cuda")
         )

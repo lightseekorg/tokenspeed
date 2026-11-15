@@ -84,12 +84,16 @@ def broadcast_block_lengths(
         None. ``rows_out`` and ``entries_out`` are written.
 
     Raises:
-        ValueError: A tensor is not the shape, dtype, or layout written, or
-            ``low > high``.
+        ValueError: A tensor is not the shape, dtype, layout, or device written,
+            or ``low > high``.
     """
     batch_size = lengths.shape[0]
     if lengths.ndim != 1 or lengths.dtype not in (torch.int32, torch.int64):
         raise ValueError("lengths must be a 1D int32/int64 tensor")
+    if lengths.stride(0) != 1:
+        raise ValueError("lengths must be dense")
+    if any(t.device != lengths.device for t in (rows_out, entries_out)):
+        raise ValueError("broadcast_block_lengths needs colocated tensors")
     if rows_out.shape != (batch_size,) or entries_out.ndim != 2:
         raise ValueError(f"rows_out must be [{batch_size}], entries_out 2D")
     if entries_out.shape[0] != batch_size or entries_out.dtype != rows_out.dtype:

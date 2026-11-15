@@ -46,6 +46,9 @@ def write_synthetic_verify_outputs(
         accept_index: Contiguous ``[rows, width]`` flat candidate index of each
             accepted token, ``-1`` past ``L``.
         accept_length: Contiguous ``[rows]``, written ``L - 1``.
+
+    Raises:
+        ValueError: A tensor is not the shape, layout, or device described.
     """
     rows, width = candidates.shape
     if targets.shape not in ((rows,), (rows, width)):
@@ -65,6 +68,11 @@ def write_synthetic_verify_outputs(
         t.is_contiguous() for t in (lengths, predict, accept_index, accept_length)
     ):
         raise ValueError("synthetic lengths and verify outputs must be contiguous")
+    if any(
+        t.device != candidates.device
+        for t in (targets, lengths, predict, accept_index, accept_length)
+    ):
+        raise ValueError("synthetic verify tensors must share the candidates' device")
     if rows == 0:
         return
     if candidates.is_cuda:

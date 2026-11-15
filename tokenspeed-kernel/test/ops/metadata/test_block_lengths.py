@@ -30,6 +30,9 @@ from tokenspeed_kernel.ops.metadata.block_lengths import (
     _broadcast_block_lengths_kernel,
 )
 
+if not torch.cuda.is_available():
+    pytest.skip("CUDA required", allow_module_level=True)
+
 
 def _write(lengths, low, high, expansion, dtype, causal=False):
     rows = torch.full((lengths.numel(),), -7, dtype=dtype, device=lengths.device)
@@ -94,3 +97,14 @@ def test_misshaped_outputs_are_refused():
         )
     with pytest.raises(ValueError, match="low 3 exceeds high 2"):
         _write(lengths, 3, 2, 8, torch.int32)
+    with pytest.raises(ValueError, match="lengths must be dense"):
+        _write(torch.ones(4, 2, dtype=torch.int32)[:, 0], 1, 2, 8, torch.int32)
+    with pytest.raises(ValueError, match="colocated"):
+        broadcast_block_lengths(
+            lengths.cuda(),
+            1,
+            2,
+            causal=False,
+            rows_out=torch.empty(4, dtype=torch.int32),
+            entries_out=torch.empty(4, 8, dtype=torch.int32),
+        )
