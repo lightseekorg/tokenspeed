@@ -606,6 +606,24 @@ order, as one batch. The batch is the round's net change: a block evicted and
 cached again within the round produces no event. Do not add per-mutation
 publish calls. They only fragment batches.
 
+The control thread drains an independent, contiguous event snapshot. The
+publisher takes ownership of that batch; its thread encodes MessagePack, frees
+the snapshot, and sends the payload. It cannot read the scheduler or retain cache
+blocks. Timestamps are taken when the control thread submits the batch, and
+sequence numbers and replay-buffer updates stay with the publisher in FIFO order.
+The Python event-list API and the published wire format remain compatible.
+
+The publisher keeps the existing bounded **batch-count** queue and blocking
+backpressure. A full queue delays its caller; accepted batches are never discarded
+to make room. Eliminating that wait would require an explicit loss/resynchronization
+protocol. A disconnected publisher logs the failed send. Its diagnostic progress
+handle counts outstanding snapshots (including a blocked producer and the active
+worker), their logical bytes and high-water marks, and enqueue-call time. These
+bytes stay charged until the send completes, even after encoding frees a snapshot.
+They exclude allocator slack and encoded replay buffers; process RSS measures
+those separately. The ownership guard releases counts on failed sends and dropped
+queued work as well as normal completion.
+
 The same reasoning fixes the metrics call: the loop records scheduler
 iteration metrics once per round, from the same pre-dispatch snapshot as the
 scheduler stats.
