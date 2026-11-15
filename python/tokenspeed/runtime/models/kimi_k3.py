@@ -4197,6 +4197,18 @@ class KimiLinearDecoderLayer(nn.Module):
                 ),
             )
 
+        # The next layer's split-path partials ride our projection when it
+        # carries both; the blocks they sweep are final once the mix above ran.
+        next_partial_args = None
+        if not residual_is_sharded:
+            args = self._next_fallback_attnres_partial_args(prefix_sum, block_residual)
+            if (
+                args is not None
+                and len(args) == 6
+                and self.self_attn.can_fuse_attnres_partials(h, args)
+            ):
+                next_partial_args = args
+
         # The collective depends on row count and topology in every forward mode.
         projection_out = self.k3_comm.acquire_projection_output(
             h,
@@ -4207,7 +4219,7 @@ class KimiLinearDecoderLayer(nn.Module):
             hidden_states=h,
             ctx=ctx,
             comm_manager=self.comm_manager,
-            attnres_partial_args=None,
+            attnres_partial_args=next_partial_args,
             projection_out=projection_out,
             **attn_kwargs,
         )
@@ -4265,7 +4277,7 @@ class KimiLinearDecoderLayer(nn.Module):
             )
 
         # Before the MoE: the next layer's PDL combine prefetches this scratch early.
-        if not prefix_is_sharded:
+        if not prefix_is_sharded and next_partial_args is None:
             self._prepare_next_fallback_attnres_partial(prefix_sum, block_residual)
         if self.is_moe_layer:
             num_global_tokens, max_num_tokens_per_gpu = (
@@ -4291,26 +4303,29 @@ class KimiLinearDecoderLayer(nn.Module):
                 stream.finish(prefix_sum, block_residual)
         return prefix_sum, block_residual
 
-    def _prepare_next_fallback_attnres_partial(
+    def _next_fallback_attnres_partial_args(
         self,
         hidden_states: torch.Tensor,
         block_residual: torch.Tensor,
-    ) -> None:
-        """Bridge a fused layer to the existing split AttnRes fallback."""
+    ) -> tuple | None:
+        """The split-path block partials a fused layer owes the next layer:
+        ``attnres_partial_dual`` arguments when the next layer's mlp-side
+        partial is hoisted here, else ``attnres_partial`` arguments, or None
+        when the next layer mixes on its own."""
         num_tokens = hidden_states.shape[0]
         if (
             self._next_attn_mix is None
             or not hidden_states.is_cuda
             or not 0 < num_tokens <= ATTNRES_FAST_PATH_MAX_TOKENS
         ):
-            return
+            return None
 
         next_layer, valid_blocks = self._next_attn_mix
         if next_layer._fused_attnres_graph_available(hidden_states, block_residual):
-            return
+            return None
         attn_scratch = _sliced_scratch(hidden_states, 1, num_tokens)
         if self._hoist_next_mlp:
-            attnres_partial_dual(
+            return (
                 block_residual[:valid_blocks],
                 next_layer._mlp_wp,
                 next_layer._attn_wp,
@@ -4318,13 +4333,26 @@ class KimiLinearDecoderLayer(nn.Module):
                 _sliced_scratch(hidden_states, next_layer._mlp_slot, num_tokens),
                 attn_scratch,
             )
+        return (
+            block_residual[:valid_blocks],
+            next_layer._attn_wp,
+            next_layer.self_attention_res_norm.variance_epsilon,
+            attn_scratch,
+        )
+
+    def _prepare_next_fallback_attnres_partial(
+        self,
+        hidden_states: torch.Tensor,
+        block_residual: torch.Tensor,
+    ) -> None:
+        """Bridge a fused layer to the existing split AttnRes fallback."""
+        args = self._next_fallback_attnres_partial_args(hidden_states, block_residual)
+        if args is None:
+            return
+        if len(args) == 6:
+            attnres_partial_dual(*args)
         else:
-            attnres_partial(
-                block_residual[:valid_blocks],
-                next_layer._attn_wp,
-                next_layer.self_attention_res_norm.variance_epsilon,
-                attn_scratch,
-            )
+            attnres_partial(*args)
 
     @torch.no_grad()
     def forward(
@@ -4371,6 +4399,12 @@ class KimiLinearDecoderLayer(nn.Module):
         # Block-write layers only: theirs cannot ride the previous sweep.
         own_mlp = split_mix and not self._mlp_split
         next_mix = self._next_attn_mix if split_mix else None
+        if next_mix is not None and next_mix[0]._fused_attnres_graph_available(
+            hidden_states, block_residual
+        ):
+            # The next layer mixes its input from the blocks and never reads
+            # a partial precomputed here.
+            next_mix = None
         sc1 = _sliced_scratch(h, 1, num_tokens) if next_mix is not None else None
         # The mlp-side combine (blocks partial + post-AR prefix) rides the
         # attention AR epilogue on the fused path.

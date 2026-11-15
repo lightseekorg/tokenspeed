@@ -29,7 +29,7 @@ kernel build is present) the CUDA kernel must match the torch fallback.
 import os
 import sys
 from contextlib import contextmanager
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -486,6 +486,7 @@ class TestAttnResTests:
                     is_moe_layer=False,
                     mlp=mlp,
                     _prepare_next_fallback_attnres_partial=mock.Mock(),
+                    _next_fallback_attnres_partial_args=mock.Mock(return_value=None),
                 )
                 layer.k3_comm = kimi_k3_comm.K3AttnComm.__new__(kimi_k3_comm.K3AttnComm)
                 layer.k3_comm.iris_state = None
@@ -529,6 +530,81 @@ class TestAttnResTests:
                     assert (post[1]) is (hidden_states)
                     assert (post[2]) is (reduced)
                     torch.testing.assert_close(result, original_prefix + reduced + 5)
+
+    def test_fused_graph_projection_carries_the_next_split_partials(self, subtests):
+        from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+        from tokenspeed.runtime.models import kimi_k3_comm
+
+        dual, single = (object(),) * 6, (object(),) * 4
+        for owed, fusable in (
+            (None, True),
+            (single, True),
+            (dual, False),
+            (dual, True),
+        ):
+            with subtests.test(owed=owed and len(owed), fusable=fusable):
+                hidden_states = torch.ones(8, 4, dtype=torch.bfloat16)
+                block_residual = torch.zeros(3, 8, 4, dtype=torch.bfloat16)
+                mixed = torch.full_like(hidden_states, 7)
+                self_attn = mock.Mock(return_value=torch.full_like(hidden_states, 2))
+                self_attn.o_proj = None
+                self_attn.can_fuse_attnres_partials.return_value = fusable
+                layer = SimpleNamespace(
+                    is_block_write_layer=True,
+                    block_write_idx=1,
+                    prev_valid_blocks=1,
+                    self_attention_res_proj=object(),
+                    self_attention_res_norm=object(),
+                    input_layernorm=object(),
+                    self_attn=self_attn,
+                    comm_manager=object(),
+                    mapping=SimpleNamespace(attn=SimpleNamespace(tp_group=object())),
+                    mlp_res_proj=object(),
+                    mlp_res_norm=object(),
+                    post_attention_layernorm=object(),
+                    is_moe_layer=False,
+                    mlp=lambda value: torch.full_like(value, 5),
+                    _prepare_next_fallback_attnres_partial=mock.Mock(),
+                    _next_fallback_attnres_partial_args=mock.Mock(return_value=owed),
+                )
+                layer.k3_comm = kimi_k3_comm.K3AttnComm.__new__(kimi_k3_comm.K3AttnComm)
+                layer.k3_comm.iris_state = None
+                layer.k3_comm.mapping = layer.mapping
+
+                with (
+                    mock.patch.object(kimi_k3, "_apply_attn_res", return_value=mixed),
+                    mock.patch.object(
+                        layer.k3_comm, "acquire_projection_output", return_value=None
+                    ),
+                    mock.patch.object(
+                        kimi_k3_comm, "all_reduce", side_effect=lambda value, _: value
+                    ),
+                ):
+                    kimi_k3.KimiLinearDecoderLayer._forward_fused_attnres_graph(
+                        layer,
+                        positions=torch.empty(0),
+                        hidden_states=hidden_states,
+                        ctx=SimpleNamespace(forward_mode=ForwardMode.DECODE),
+                        block_residual=block_residual,
+                        stream=None,
+                    )
+
+                layer._next_fallback_attnres_partial_args.assert_called_once_with(
+                    hidden_states, block_residual
+                )
+                carried = owed is dual and fusable
+                assert (self_attn.call_args.kwargs["attnres_partial_args"]) is (
+                    dual if carried else None
+                )
+                if owed is dual:
+                    self_attn.can_fuse_attnres_partials.assert_called_once_with(
+                        mixed, dual
+                    )
+                else:
+                    self_attn.can_fuse_attnres_partials.assert_not_called()
+                assert (layer._prepare_next_fallback_attnres_partial.call_count) == (
+                    0 if carried else 1
+                )
 
     def test_mixer_passes_an_explicit_residual_shard_to_moe(self, subtests):
         from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -574,6 +650,7 @@ class TestAttnResTests:
                     k3_comm=comm,
                     comm_manager=SimpleNamespace(get_num_tokens=lambda _: (4096, 4096)),
                     _prepare_next_fallback_attnres_partial=mock.Mock(),
+                    _next_fallback_attnres_partial_args=mock.Mock(return_value=None),
                 )
                 ctx = SimpleNamespace(forward_mode=mode)
                 with mock.patch.object(
@@ -1009,6 +1086,10 @@ class TestAttnResTests:
                         _next_attn_mix=(next_layer, 2),
                         _hoist_next_mlp=hoist_mlp,
                     )
+                    layer._next_fallback_attnres_partial_args = MethodType(
+                        kimi_k3.KimiLinearDecoderLayer._next_fallback_attnres_partial_args,
+                        layer,
+                    )
                     with (
                         mock.patch.object(
                             kimi_k3, "_sliced_scratch", side_effect=sliced_scratch
@@ -1136,8 +1217,8 @@ class TestAttnResTests:
                 attention_mix.out = mixed
             return output
 
-        for tail_mixes in (True, False):
-            with subtests.test(tail_mixes=tail_mixes):
+        for tail_mixes, next_fused in ((True, False), (False, False), (False, True)):
+            with subtests.test(tail_mixes=tail_mixes, next_fused=next_fused):
                 premix = (
                     kimi_k3._AttentionPremix(object(), object(), _EPS, (object(),) * 3)
                     if tail_mixes
@@ -1147,6 +1228,7 @@ class TestAttnResTests:
                     _attn_wp=object(),
                     _premixed_input=None,
                     _attention_premix=mock.Mock(return_value=premix),
+                    _fused_attnres_graph_available=mock.Mock(return_value=next_fused),
                 )
                 premixed = object()
                 layer = SimpleNamespace(
@@ -1186,7 +1268,7 @@ class TestAttnResTests:
                     mock.patch.object(
                         kimi_k3, "_sliced_scratch", return_value=object()
                     ),
-                    mock.patch.object(kimi_k3, "attnres_partial"),
+                    mock.patch.object(kimi_k3, "attnres_partial") as launch_partial,
                 ):
                     result, residual = kimi_k3.KimiLinearDecoderLayer.forward(
                         layer, positions, hidden_states, ctx, block_residual
@@ -1199,9 +1281,21 @@ class TestAttnResTests:
                     hidden_states, block_residual, premixed
                 )
                 assert layer._premixed_input is None
-                next_layer._attention_premix.assert_called_once_with(
-                    prefix, block_residual
+                next_layer._fused_attnres_graph_available.assert_called_once_with(
+                    hidden_states, block_residual
                 )
+                # A next layer that mixes from the blocks gets no partial or premix.
+                assert ([call.args[1] for call in launch_partial.call_args_list]) == (
+                    [layer._mlp_wp]
+                    if next_fused
+                    else [next_layer._attn_wp, layer._mlp_wp]
+                )
+                if next_fused:
+                    next_layer._attention_premix.assert_not_called()
+                else:
+                    next_layer._attention_premix.assert_called_once_with(
+                        prefix, block_residual
+                    )
                 moe_kwargs = layer.block_sparse_moe.call_args.kwargs
                 if tail_mixes:
                     assert (moe_kwargs["attention_mix"]) is (premix)
