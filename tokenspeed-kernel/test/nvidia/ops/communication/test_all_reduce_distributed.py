@@ -36,13 +36,13 @@ from datetime import timedelta
 import pytest
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.ops.communication import trtllm
 from tokenspeed_kernel.ops.communication.allreduce_fusion import (
     all_reduce,
     all_reduce_supported,
     create_all_reduce_workspace,
 )
 from tokenspeed_kernel.ops.communication.trtllm import (
-    _workspace_allreduce,
     ensure_workspace_initialized,
     trtllm_workspace_allreduce,
 )
@@ -187,7 +187,8 @@ def test_workspace_all_reduce_routes_by_payload(armed, rows):
 
 
 def test_an_early_release_call_keeps_the_lamport_kernels(armed):
-    out = _workspace_allreduce(
+    # Defined on NVIDIA only, so it is looked up here rather than imported.
+    out = trtllm._workspace_allreduce(
         _rounding_probe(512),
         armed,
         fp32_acc=False,
