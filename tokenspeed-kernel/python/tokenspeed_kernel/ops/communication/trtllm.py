@@ -995,13 +995,18 @@ if current_platform().is_nvidia:
                 once (lamport sends -0.0 as +0.0), the rank-ordered fold;
                 these calls take mnnvl where it serves, and the IPC
                 two-shot, which keeps -0.0 sums, never.
-            out: Contiguous destination of the input's shape and dtype;
-                None allocates one.
+            out: Contiguous, 16-byte aligned destination of the input's
+                shape and dtype; None allocates one.
 
         Returns:
             The reduced tensor (``out`` or a new allocation), or ``None`` when
             no workspace is armed for *group* or the shape is not served --
             the caller keeps its own (NCCL) fallback.
+
+        Raises:
+            ValueError: ``out`` is not contiguous with the input's shape and
+                dtype, or a payload the BT kernels serve is not 16-byte
+                aligned (every rank routes alike, so this is never a split).
         """
         return _workspace_allreduce(
             input_tensor,
@@ -1107,12 +1112,12 @@ if current_platform().is_nvidia:
         else:
             allreduce_out = out.view(tensor_2d.shape)
         plain = manager.plain_all_reduce
+        # Rank-agreed terms only; early-release callers keep the Lamport kernels.
         if (
             not fp32_acc
+            and trigger_completion_at_end
             and plain is not None
             and plain.serves(token_num, hidden_dim, tensor_2d.dtype)
-            and tensor_2d.data_ptr() % 16 == 0
-            and allreduce_out.data_ptr() % 16 == 0
         ):
             from tokenspeed_kernel.ops.communication.allreduce_fusion import (
                 all_reduce,

@@ -24,9 +24,12 @@ presets (the first through 256 rows, the second above), so it is offered for
 
 The workspace all-reduce (`trtllm_workspace_allreduce`) arms it beside the
 mnnvl workspace, at the same row capacity, and sends a plain BF16 reduction
-(not the `fp32_acc` fold) there when its payload is at least
-`PLAIN_ALL_REDUCE_MIN_BYTES` (1 MiB) per rank; smaller payloads keep the
-Lamport one-shot and two-shot kernels, which sum in BF16. Measured on 2
+there when its payload is at least `PLAIN_ALL_REDUCE_MIN_BYTES` (1 MiB) per
+rank; smaller payloads keep the Lamport one-shot and two-shot kernels, which
+sum in BF16. The `fp32_acc` fold and early-release calls (`allreduce_sconv`,
+which relies on the Lamport release point) stay on Lamport too.
+The route reads only terms every rank shares, so a misaligned tensor raises
+rather than sending one rank down the other protocol. Measured on 2
 GB300 nodes (TP8 across one NVLink domain), BF16 [rows, 7168], CUDA graph of
 20 back-to-back calls / with a 256 MB L2 flush before each call, us:
 

@@ -22,8 +22,9 @@
 
 Sums must equal the rank-ordered fp32 fold rounded once, on every rank, around
 the payload threshold and the preset split; the workspace all-reduce must send
-payloads at or above the threshold to it and smaller ones to the Lamport
-kernels (which sum in BF16, an observable difference); and a captured graph
+payloads at or above the threshold to it and smaller ones, or early-release
+calls, to the Lamport kernels (which sum in BF16, an observable difference);
+serving's row counts must compile nothing after arming; and a captured graph
 interleaving both must replay correctly. Run with 8 ranks, for example
 ``torchrun --nproc-per-node=8`` or one srun task per GPU with WORLD_SIZE, RANK,
 LOCAL_RANK, MASTER_ADDR and MASTER_PORT set.
@@ -41,12 +42,14 @@ from tokenspeed_kernel.ops.communication.allreduce_fusion import (
     create_all_reduce_workspace,
 )
 from tokenspeed_kernel.ops.communication.trtllm import (
+    _workspace_allreduce,
     ensure_workspace_initialized,
     trtllm_workspace_allreduce,
 )
 from tokenspeed_kernel.thirdparty.flashinfer.plain_all_reduce import (
     PLAIN_ALL_REDUCE_MIN_BYTES,
 )
+from utils import assert_no_cute_compile
 
 H = 7168
 CAPACITY = 2048
@@ -135,6 +138,22 @@ def test_plain_all_reduce_is_the_rank_ordered_fp32_fold(workspace, rows):
     _agree(_same_on_every_rank(out), f"agreement at {rows} rows")
 
 
+def test_served_row_counts_compile_nothing(workspace):
+    # Arming compiled the kernels; the row counts serving varies reuse them.
+    warm = _inputs(THRESHOLD_ROWS, seed=5)
+    all_reduce(warm, workspace, torch.empty_like(warm))
+    try:
+        with assert_no_cute_compile():
+            for rows in SERVED_ROWS:
+                x = _inputs(rows, seed=rows + 11)
+                all_reduce(x, workspace, torch.empty_like(x))
+        compiled = ""
+    except AssertionError as error:
+        compiled = str(error)
+    torch.cuda.synchronize()
+    _agree(not compiled, f"compile-free served rows ({compiled})")
+
+
 def test_plain_all_reduce_refuses_small_payloads(workspace):
     x = _inputs(THRESHOLD_ROWS - 1, seed=3)
     with pytest.raises(ValueError):
@@ -165,6 +184,18 @@ def test_workspace_all_reduce_routes_by_payload(armed, rows):
     torch.cuda.synchronize()
     want = 1.015625 if rows * H * 2 >= PLAIN_ALL_REDUCE_MIN_BYTES else 1.0
     _agree(bool((out == want).all()), f"route at {rows} rows")
+
+
+def test_an_early_release_call_keeps_the_lamport_kernels(armed):
+    out = _workspace_allreduce(
+        _rounding_probe(512),
+        armed,
+        fp32_acc=False,
+        out=None,
+        trigger_completion_at_end=False,
+    )
+    torch.cuda.synchronize()
+    _agree(bool((out == 1.0).all()), "early-release route")
 
 
 def test_captured_mixed_sizes_replay(armed):
