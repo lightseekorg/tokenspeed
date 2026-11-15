@@ -1568,10 +1568,12 @@ def test_decode_topk_keeps_the_best_topk_of_a_longer_history() -> None:
 @requires_gpu
 @pytest.mark.parametrize("pinned", [True, False])
 @pytest.mark.parametrize("waits_first", [True, False])
+@pytest.mark.parametrize("pdl", [True, False])
 def test_decode_topk_releases_early_only_to_a_core_that_waits_first(
-    monkeypatch, pinned, waits_first
+    monkeypatch, pinned, waits_first, pdl
 ) -> None:
-    """Only the pinned fused top-k releases early, to a core that waits first."""
+    """Only the pinned fused top-k releases early, under PDL, to a waiting core."""
+    from tokenspeed_kernel import platform
     from tokenspeed_kernel.ops.attention.dsa import cute_dsl as dsa_cute_dsl
     from tokenspeed_kernel.ops.attention.dsa import dsa_plan
 
@@ -1615,6 +1617,8 @@ def test_decode_topk_releases_early_only_to_a_core_that_waits_first(
         )
 
     monkeypatch.setattr(glm5, "dsa_decode_topk", record)
+    # As --disable-pdl leaves it: the top-k then launches without PDL.
+    monkeypatch.setattr(platform, "_pdl_enabled", pdl)
     selected = attention._compute_decode_topk_indices_portable(
         indexer_output=_indexer_output(u, 1),
         ctx=ctx,
@@ -1627,7 +1631,7 @@ def test_decode_topk_releases_early_only_to_a_core_that_waits_first(
         topk=2048,
     )
 
-    assert released == [pinned and waits_first]
+    assert released == [pinned and waits_first and pdl]
     assert int(selected.topk_lens[0]) == seq_len
 
 

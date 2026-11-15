@@ -32,7 +32,7 @@ import math
 
 import pytest
 import torch
-from utils import is_nvidia
+from utils import assert_no_cute_compile, is_nvidia, move_pages_past_int32
 
 if not is_nvidia():
     pytest.skip("requires an NVIDIA GPU", allow_module_level=True)
@@ -164,6 +164,28 @@ def test_graph_replay_follows_new_inputs():
     lens.copy_(lens2)
     graph.replay()
     torch.cuda.synchronize()
+    _check(out, q, kv, slots, lens)
+
+
+def test_cache_rows_past_int32_byte_offsets():
+    """Cache rows whose byte offsets exceed 2**31 give the near pool's output."""
+    lengths = [593 + j for j in range(8)]
+    q, kv, slots, lens = _inputs(8, 12, 2048, lengths, 5, seed=31)
+    near = _run(q, kv, slots, lens, 8)
+    (far_kv,), far_slots = move_pages_past_int32((kv,), slots)
+    assert int(far_slots.max()) * ROW >= 2**31
+    far = _run(q, far_kv, torch.where(slots >= 0, far_slots, slots), lens, 8)
+    assert torch.equal(far, near)
+    _check(far, q, kv, slots, lens)
+
+
+def test_rows_and_width_stay_runtime_arguments():
+    """A new row count and slot width reuse the compiled kernel."""
+    q, kv, slots, lens = _inputs(8, 12, 2048, [600] * 8, 0, seed=41)
+    _run(q, kv, slots, lens, 8)
+    q, kv, slots, lens = _inputs(16, 12, 1024, [300] * 16, 0, seed=42)
+    with assert_no_cute_compile():
+        out = _run(q, kv, slots, lens, 8)
     _check(out, q, kv, slots, lens)
 
 
