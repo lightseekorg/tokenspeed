@@ -591,6 +591,11 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         )
 
     def _refresh_split_kvs(self, seq_lens: torch.Tensor, q_len: int) -> None:
+        """Recompute the batch's per-request split-KV plan in place.
+
+        Counts, offsets and the chunk map land in the resident decode buffers,
+        so CUDA graph replays reuse the same storage.
+        """
         if self._decode_split_kvs_buf is None:
             return
         if self._dcp is not None:

@@ -1447,6 +1447,46 @@ def test_per_request_split_counts_reject_unsupported_inputs(invalid):
         )
 
 
+def test_per_request_split_schedule_stays_within_the_grid_limit(monkeypatch):
+    import tokenspeed_mla.mla_decode as decode
+    from tokenspeed_mla import tokenspeed_mla_decode
+
+    # The schedule math needs only a device capability and an SM count.
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (10, 0))
+    monkeypatch.setattr(decode, "get_num_sm", lambda device: 148)
+    batch, heads, q_len, min_split_kv = 1025, 16, 1, 64
+    # Natural sizing for this configuration packs 65600 chunks; the launch
+    # grid's Y dimension stops at 65535.
+    tasks = torch.zeros(
+        decode.tokenspeed_mla_decode_task_capacity(
+            batch, heads, q_len, min_split_kv, 148
+        ),
+        dtype=torch.int64,
+    )
+    workspace = torch.empty(
+        decode.tokenspeed_mla_decode_workspace_size(
+            batch, heads, q_len, 512, min_split_kv, 148
+        ),
+        dtype=torch.int8,
+    )
+    with pytest.raises(ValueError, match="65535"):
+        tokenspeed_mla_decode(
+            torch.zeros((batch, q_len, heads, 576), dtype=torch.float8_e4m3fn),
+            torch.zeros((1, 64, 576), dtype=torch.float8_e4m3fn),
+            workspace,
+            512,
+            64,
+            torch.zeros((batch, 1), dtype=torch.int32),
+            torch.ones(batch, dtype=torch.int32),
+            8192,
+            192**-0.5,
+            min_split_kv=min_split_kv,
+            block_split_kvs=torch.ones(batch, dtype=torch.int32),
+            block_split_offsets=torch.zeros(batch + 1, dtype=torch.int32),
+            block_split_tasks=tasks,
+        )
+
+
 def _check_per_request_split_gpu(
     heads, q_len, dtype_name, causal, large_workspace, batch
 ):

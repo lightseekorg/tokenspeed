@@ -25,6 +25,7 @@ import cutlass.cute as cute
 
 @cute.jit
 def compact_split_grid(o, split_kv, acc_o, tasks, cluster_m):
+    """Grid for the compact schedule: query clusters in X, chunks in Y."""
     chunks = cutlass.min(cutlass.Int64(o.shape[3]) * split_kv, tasks.shape[0])
     if cutlass.const_expr(acc_o is not None):
         chunks = cutlass.min(chunks, acc_o.shape[1])
@@ -34,6 +35,11 @@ def compact_split_grid(o, split_kv, acc_o, tasks, cluster_m):
 
 @cute.jit
 def compact_split_block_coord(offsets, tasks, params):
+    """Read the block's (request, split) from the packed int64 chunk map.
+
+    Padding clusters past the total chunk count fall back to a live request
+    with an empty split, keeping scheduler validity static.
+    """
     block = cute.arch.block_idx()
     base = offsets[0]
     total = offsets[params.problem_shape_b] - base
@@ -83,12 +89,14 @@ def make_compact_split_workspace(H, D, S, B, workspace, partial_dtype, acc_dtype
 
 @cute.jit
 def offset_split_workspace(tensor, offsets, request):
+    """Rebase a compact workspace tensor to the request's first slot."""
     if cutlass.const_expr(tensor is not None):
         # A sliced batch may begin after split zero in its original plan.
         offset = cutlass.Int64(offsets[request]) - cutlass.Int64(offsets[0])
         ptr = tensor.iterator + offset * tensor.stride[1]
         if cutlass.const_expr(len(tensor.shape) == 5):
-            # Partials start on whole slots; without the base alignment the epilogue stores narrow vectors.
+            # Partials start on whole slots; without the base alignment the
+            # epilogue stores narrow vectors.
             ptr = cute.make_ptr(
                 tensor.element_type,
                 ptr.toint(),

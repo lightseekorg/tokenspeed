@@ -376,6 +376,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             lengths, in tokens; overrides the inferred causal bound.
         :param block_split_kvs: The block split KV tensor with shape [batch_size]
         :type block_split_kvs: cute.Tensor
+        :param block_split_offsets: The per-request split offsets with shape [batch_size + 1]
+        :type block_split_offsets: cute.Tensor
+        :param block_split_tasks: The packed chunk-to-request/split map tensor
+        :type block_split_tasks: cute.Tensor
         :param softmax_scale: The scale factor for softmax
         :type softmax_scale: cutlass.Float32
         :param output_scale: The scale factor for the output
@@ -997,6 +1001,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         :type cache_seqs: cute.Tensor
         :param block_split_kvs: The per-block split_kv values tensor
         :type block_split_kvs: cute.Tensor
+        :param block_split_offsets: The per-request split offsets into the partial workspace
+        :type block_split_offsets: cute.Tensor
+        :param block_split_tasks: The packed chunk-to-request/split map tensor
+        :type block_split_tasks: cute.Tensor
         :param softmax_scale_log2: The log2 scale factor for softmax
         :type softmax_scale_log2: cutlass.Float32
         :param output_scale: The scale factor for the output
@@ -1596,6 +1604,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         :type cache_seqs: cute.Tensor
         :param block_split_kvs: Per-block split_kv values tensor (for variable split_kv)
         :type block_split_kvs: cute.Tensor
+        :param block_split_offsets: Per-request split offsets into the partial workspace
+        :type block_split_offsets: cute.Tensor
         """
         bidx, bidy, bidz = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
@@ -3596,6 +3606,8 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         :type row_sum: cutlass.Float32
         :param row_max: The row max
         :type row_max: cutlass.Float32
+        :param direct_output: Select final output instead of partial workspace
+        :type direct_output: cutlass.Constexpr
 
         :return: The MMA o consumer state
         :rtype: pipeline.PipelineState

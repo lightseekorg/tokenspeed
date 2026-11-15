@@ -94,7 +94,7 @@ PER_REQUEST_SPLIT_KV_CAPACITY = 32
 def _per_request_split_kv_width(
     max_seq_len: int, mma_qk_tiler_mn: tuple[int, int], min_split_kv: int
 ) -> int:
-    """Grid width when each request carries its own split count, without empty partitions."""
+    """Grid width with per-request split counts, without empty partitions."""
     k_tiles = ceil_div(max_seq_len, mma_qk_tiler_mn[1])
     width = max(PER_REQUEST_SPLIT_KV_CAPACITY, min_split_kv)
     return ceil_div(k_tiles, ceil_div(k_tiles, width))
@@ -164,6 +164,12 @@ def _mla_decode_split_kvs_kernel(
     output_stride,
     offset_stride,
 ):
+    """Refresh the per-request split plan buffers with one launch.
+
+    Writes each request's split count to ``out``, the exclusive split offsets
+    to ``offsets`` and the packed ``(request << 32) | split`` int64 chunk map
+    to ``tasks``, all in place.
+    """
     # Fixed tiles keep every batch size on the same compiled kernel.
     partial = tl.full((1024,), 0, tl.int64)
     for start in range(0, num_requests, 1024):
@@ -207,15 +213,17 @@ def tokenspeed_mla_decode_split_kvs(
     min_split_kv: int,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    """Write per-request KV split counts for ``tokenspeed_mla_decode(block_split_kvs=...)``.
+    """Write per-request KV split counts for per-request split decode.
 
-    A uniform split cuts every request into the same number of chunks, so the
+    The counts feed ``tokenspeed_mla_decode(block_split_kvs=...)``. A uniform
+    split cuts every request into the same number of chunks, so the
     longest request of a mixed batch sets the kernel time. This keeps the
     uniform split's chunk budget and gives each request chunks of about the
     same length, subject to rounding and the grid capacity. For one request,
     a uniform budget of one proves there is no need for partials or reduction.
     One Triton launch refreshes counts, offsets and the chunk map in place,
-    including inside a CUDA graph. The map is shared by all attention layers using this plan.
+    including inside a CUDA graph. The map is shared by all attention layers
+    using this plan.
 
     Args:
         seq_lens: int32 [B] KV lengths, as passed to the decode call.
@@ -334,7 +342,7 @@ def _get_split_kv_and_workspace_size(
     max_active_blocks: int,
     max_seq_len: int,
     torch_dtype: torch.dtype,
-    mma_qk_tiler_mn: Tuple[int, int],
+    mma_qk_tiler_mn: tuple[int, int],
     min_split_kv: int = 1,
 ) -> Tuple[int, int]:
     """Return the uniform split count and its partial-result workspace bytes."""
@@ -486,8 +494,9 @@ def _get_compiled_mla_kernel(
 
     Returns a callable that accepts (q_latent, q_rope, c_latent, c_rope,
     page_table, o, lse (None to skip), workspace, split_kv_scalar, cache_seqs,
-    block_split_kvs, softmax_scale_scalar, output_scale_scalar), plus
-    local_visible_lens when supplied.
+    block_split_kvs, softmax_scale_scalar, output_scale_scalar), plus the
+    trailing local_visible_lens, block_split_offsets and block_split_tasks,
+    the last three passed as None when unused.
 
     All scalar arguments must be pre-wrapped as Int32/Float32.
     """
@@ -1138,7 +1147,7 @@ def tokenspeed_mla_decode(
 
     block_split_kvs : torch.Tensor, optional
         Contiguous int32 [B] per-request split counts on the query device,
-        each in ``[1, the per-request split limit]``;
+        each in ``[1, the per-request split limit]``.
         They must be produced by ``tokenspeed_mla_decode_split_kvs`` with the
         same arguments (or retained slices of that plan).
         The limit is ``max(32, min_split_kv)`` (fewer when ``max_seq_len`` has
@@ -1369,10 +1378,23 @@ def tokenspeed_mla_decode(
             slots = min(B * split_kv, B * uniform_split + B - 1)
             if block_split_tasks.numel() < slots:
                 raise ValueError(f"block_split_tasks requires at least {slots} entries")
-            required = slots * H_eff * q_len_eff * (kv_lora_rank + 1) * 4
+            bytes_per_slot = H_eff * q_len_eff * (kv_lora_rank + 1) * 4
+            required = slots * bytes_per_slot
             assert (
                 workspace_buffer.numel() >= required
             ), f"workspace_buffer too small: {workspace_buffer.numel()} bytes, need {required} bytes"
+            # The compact schedule packs chunks into the grid's Y dimension,
+            # which CUDA limits to 65535.
+            chunks = min(
+                B * split_kv,
+                block_split_tasks.numel(),
+                workspace_buffer.numel() // bytes_per_slot,
+            )
+            if chunks > 65535:
+                raise ValueError(
+                    f"per-request split schedule packs {chunks} chunks into the "
+                    "launch grid's Y dimension, limited to 65535"
+                )
         # The caller reserves the aggregate split bound, including when slicing
         # a plan made for a larger batch. Kernels derive its capacity in slots.
         workspace_size = workspace_buffer.numel() if split_kv > 1 else 0

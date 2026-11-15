@@ -293,6 +293,18 @@ def test_the_metadata_fold_rows_are_every_spec_th_expanded_row() -> None:
     torch.testing.assert_close(metadata.block_seq_lens, metadata.seq_lens[0::spec])
 
 
+def _encode_split_tasks(split_kvs: torch.Tensor) -> torch.Tensor:
+    """The planner's packed int64 chunk map: ``(request << 32) | split``."""
+    return torch.tensor(
+        [
+            (request << 32) | split
+            for request, count in enumerate(split_kvs.tolist())
+            for split in range(count)
+        ],
+        dtype=torch.int64,
+    )
+
+
 def _run_cutedsl_decode(
     monkeypatch,
     *,
@@ -351,16 +363,7 @@ def _run_cutedsl_decode(
         else None
     )
     backend._decode_split_tasks_buf = (
-        torch.tensor(
-            [
-                (request << 32) | split
-                for request, count in enumerate(split_kvs.tolist())
-                for split in range(count)
-            ],
-            dtype=torch.int64,
-        )
-        if split_kvs is not None
-        else None
+        _encode_split_tasks(split_kvs) if split_kvs is not None else None
     )
 
     layer = SimpleNamespace(
@@ -402,8 +405,13 @@ def test_the_cutedsl_block_decode_carries_its_window_on_the_query_axis(
     assert captured["causal_mask"] is False
     if window >= 0:
         assert captured["block_split_kvs"] is None
+        assert captured["block_split_tasks"] is None
     else:
         torch.testing.assert_close(captured["block_split_kvs"], splits)
+        # Offsets slice by request; the task map passes whole, indexed absolutely.
+        torch.testing.assert_close(
+            captured["block_split_tasks"], _encode_split_tasks(splits)
+        )
 
 
 def test_the_cutedsl_target_verify_path_keeps_its_causal_windowless_call(monkeypatch):
@@ -417,6 +425,9 @@ def test_the_cutedsl_target_verify_path_keeps_its_causal_windowless_call(monkeyp
     assert captured["window_left"] == -1
     assert captured["causal_mask"] is True
     torch.testing.assert_close(captured["block_split_kvs"], splits)
+    torch.testing.assert_close(
+        captured["block_split_tasks"], _encode_split_tasks(splits)
+    )
 
 
 def test_a_narrower_cutedsl_draft_forward_refuses_to_drop_the_window(monkeypatch):
