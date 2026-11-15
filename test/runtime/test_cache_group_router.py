@@ -996,11 +996,11 @@ class TestCacheGroupRouterTest:
                 block_tables_cpu={},
             )
 
-    def test_page_sharded_leaves_get_the_host_table_on_pure_extends(self):
+    def test_page_sharded_leaves_get_the_host_table_on_extend_rows(self):
         """A KVP page-sharded group's leaf gets the host page table on a pure
-        extend, prefix or not (the DSA leaf bounds each rank's owned index
-        pages from it), and on a MIXED round only with a prefix (its
-        prefix-chunk gathers); other groups never get it."""
+        extend or a MIXED round, prefix or not: the DSA leaf bounds each rank's
+        owned index pages from it, and a mixed round's extend rows plan the KVP
+        history prefill as a pure extend's do. Other groups never get it."""
         router, leaves = self._router()
         # configure_runtime marks the groups whose shard count exceeds one.
         router._page_sharded_groups = frozenset({FULL})
@@ -1036,11 +1036,10 @@ class TestCacheGroupRouterTest:
             # The host mirror of the extend rows' kernel pages (holes are 0).
             assert received[FULL].tolist() == [[5, 6, 0], [9, 0, 2]]
             assert received[SWA] is None
-        received = init(ForwardMode.MIXED, 1, [0])
-        assert received[FULL] is None and received[SWA] is None
-        received = init(ForwardMode.MIXED, 1, [4])
-        assert received[FULL].tolist() == [[5, 6, 0]]
-        assert received[SWA] is None
+        for prefix in ([0], [4]):
+            received = init(ForwardMode.MIXED, 1, prefix)
+            assert received[FULL].tolist() == [[5, 6, 0]]
+            assert received[SWA] is None
 
     def test_extend_init_rejects_bounded_replay_rows(self):
         """Paged leaves write every input row unconditionally, so a replayed

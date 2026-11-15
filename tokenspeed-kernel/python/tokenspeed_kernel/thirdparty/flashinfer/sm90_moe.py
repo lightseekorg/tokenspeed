@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Private, source-versioned SM90 block-FP8 MoE modules for FlashInfer 0.7.3."""
+"""Private, source-versioned SM90 block-FP8 MoE modules for FlashInfer 0.7.4."""
 
 from __future__ import annotations
 
@@ -243,9 +243,9 @@ def _private_entrypoint(
     from flashinfer.jit import env as jit_env
     from flashinfer.jit.cpp_ext import is_cuda_version_at_least
 
-    if flashinfer.__version__ != "0.7.3":
+    if flashinfer.__version__ != "0.7.4":
         raise RuntimeError(
-            f"SM90 MoE patch requires FlashInfer 0.7.3, got {flashinfer.__version__}; "
+            f"SM90 MoE patch requires FlashInfer 0.7.4, got {flashinfer.__version__}; "
             "use mode='default' for the installed implementation"
         )
     if os.environ.get("FLASHINFER_DISABLE_JIT"):

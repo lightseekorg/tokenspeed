@@ -18,50 +18,15 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#include <charconv>
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
 #include <string_view>
 
-#include "full_cache_benchmark.h"
+#include "benchmark_report.h"
 
 namespace tokenspeed::benchmark {
 namespace {
-
-int ParseNonnegative(std::string_view value) {
-    int result = 0;
-    const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), result);
-    Require(error == std::errc{} && end == value.data() + value.size() && result >= 0, "expected nonnegative integer");
-    return result;
-}
-
-void PrintDistribution(std::vector<double> values) {
-    std::cout << "{\"samples\":[";
-    for (std::size_t i = 0; i < values.size(); ++i) {
-        if (i != 0) std::cout << ',';
-        std::cout << values[i];
-    }
-    std::ranges::sort(values);
-    const auto n = values.size();
-    std::cout << "],\"median\":" << (values[(n - 1) / 2] + values[n / 2]) / 2
-              << ",\"p95\":" << values[(n * 95 + 99) / 100 - 1] << ",\"min\":" << values.front()
-              << ",\"max\":" << values.back() << '}';
-}
-
-template <typename Sample>
-void PrintTiming(const char* name, const std::vector<Sample>& samples, Duration Sample::*member) {
-    std::vector<double> wall, cpu;
-    for (const auto& sample : samples) {
-        wall.push_back((sample.*member).wall_ms);
-        cpu.push_back((sample.*member).cpu_ms);
-    }
-    std::cout << ",\"" << name << "\":{\"wall_ms\":";
-    PrintDistribution(std::move(wall));
-    std::cout << ",\"thread_cpu_ms\":";
-    PrintDistribution(std::move(cpu));
-    std::cout << '}';
-}
 
 void Run(const FullCacheConfig& config, int warmups, int repeats, std::string_view mode, std::string_view layout) {
     Require(repeats > 0, "repeats must be positive");

@@ -502,7 +502,7 @@ pub struct OutputProcessor {
     finish_log: FinishLog,
     /// When the last commit ran, for the request stats' decode steps.
     last_commit_at: f64,
-    /// Requests registered so far, numbering each admission.
+    /// Identities allocated so far, before data-plane admission.
     admissions: u64,
     metrics_enabled: bool,
     /// Metric deltas since the event loop last drained them.
@@ -775,10 +775,23 @@ impl OutputProcessor {
         }
     }
 
-    /// Admit a request. An abort that arrived before it applies now.
-    pub fn register(&mut self, rid: String, mut state: RequestState) {
-        self.admissions += 1;
+    /// Give a new request its identity before either plane registers it.
+    pub fn assign_admission(&mut self, state: &mut RequestState) {
+        assert_eq!(
+            state.admission, 0,
+            "request already has an admission identity"
+        );
+        self.admissions = self
+            .admissions
+            .checked_add(1)
+            .expect("admission identity exhausted");
         state.admission = self.admissions;
+    }
+
+    /// Register a request whose identity was assigned before data-plane admission.
+    /// An abort that arrived before it applies now.
+    pub fn register(&mut self, rid: String, mut state: RequestState) {
+        assert_ne!(state.admission, 0, "assign an identity before registration");
         if let Some(index) = self.pending_aborts.iter().position(|(id, _)| *id == rid) {
             self.pending_aborts.remove(index);
             state.abort("AbortReq from client", false, None);
@@ -1763,9 +1776,15 @@ mod tests {
         )
     }
 
+    fn register_state(p: &mut OutputProcessor, rid: String, mut state: RequestState) {
+        p.assign_admission(&mut state);
+        p.register(rid, state);
+    }
+
     fn register(p: &mut OutputProcessor, rid: &str, prompt: i64, max_new: i64, stop: &[i32]) {
         let stops: BTreeSet<i32> = stop.iter().copied().collect();
-        p.register(
+        register_state(
+            p,
             rid.to_owned(),
             RequestState::new(vec![0; prompt as usize], max_new, stops, true, None, false),
         );
@@ -1794,7 +1813,7 @@ mod tests {
             top_logprobs_num: top_k,
             computes_prompt_logprobs,
         });
-        p.register(rid.to_owned(), state);
+        register_state(p, rid.to_owned(), state);
     }
 
     /// The forward result of a plan's rows: each row's logprob is
@@ -1823,7 +1842,7 @@ mod tests {
     fn register_history(p: &mut OutputProcessor, rid: &str, prompt: &[i32], output: &[i32]) {
         let mut state = RequestState::new(prompt.to_vec(), 8, BTreeSet::new(), true, None, false);
         state.output_ids = output.to_vec();
-        p.register(rid.to_owned(), state);
+        register_state(p, rid.to_owned(), state);
     }
 
     /// One forward over `rows` of (rid, slot, extend prefix length), the
@@ -1874,7 +1893,7 @@ mod tests {
             &state.prompt_ids,
         ));
         let mut p = processor(None);
-        p.register("r".to_owned(), state);
+        register_state(&mut p, "r".to_owned(), state);
 
         for (i, (token, expected)) in [(10, 1), (11, 2), (2, 2), (12, 2)].into_iter().enumerate() {
             let input_length = i as i32 + 1;
@@ -1924,7 +1943,7 @@ mod tests {
                         port: 8080,
                     };
                     processor.sample_ttft(&mut state, Some(&bootstrap));
-                    processor.register(rid.into(), state);
+                    register_state(&mut processor, rid.into(), state);
                     processor.bootstrapped(rid);
                     if role == Role::Prefill {
                         processor.mark_scheduled(&[rid.into()]);
@@ -2509,7 +2528,8 @@ mod tests {
     #[test]
     fn ngram_windows_follow_the_committed_tokens() {
         let mut p = OutputProcessor::new(None, 1, None, Role::Plain, NO_FINISH_LOG, true, None);
-        p.register(
+        register_state(
+            &mut p,
             "r".to_owned(),
             RequestState::new(vec![10, 11, 12, 13], 8, BTreeSet::new(), true, None, false),
         );
@@ -3022,7 +3042,8 @@ mod tests {
     #[test]
     fn sampled_logprobs_ride_with_their_tokens() {
         let mut p = processor(None);
-        p.register(
+        register_state(
+            &mut p,
             "r".to_owned(),
             RequestState::new(vec![0], 10, BTreeSet::new(), true, None, true),
         );
@@ -3038,7 +3059,8 @@ mod tests {
     fn cumulative_probabilities_follow_streamed_tokens_and_logprob_requests() {
         let mut p = processor(None);
         for (rid, logprobs) in [("scored", true), ("plain", false)] {
-            p.register(
+            register_state(
+                &mut p,
                 rid.to_owned(),
                 RequestState::new(vec![0], 4, BTreeSet::new(), true, Some(2), logprobs),
             );
@@ -3096,7 +3118,8 @@ mod tests {
     #[test]
     fn a_stop_token_cuts_cumulative_probabilities_with_its_verify_window() {
         let mut p = processor(Some(3));
-        p.register(
+        register_state(
+            &mut p,
             "r".to_owned(),
             RequestState::new(vec![0], 10, BTreeSet::from([7]), true, None, true),
         );

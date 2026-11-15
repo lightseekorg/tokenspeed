@@ -432,6 +432,7 @@ def test_physical_mla_writer_with_placement_and_explicit_history_gather(
     from types import SimpleNamespace
 
     from tokenspeed.runtime.distributed.mapping import KVP_HISTORY_GROUP_NAME
+    from tokenspeed.runtime.layers.attention.backends.base import SparseTopKShare
     from tokenspeed.runtime.layers.attention.backends.paged import flashmla
     from tokenspeed.runtime.layers.attention.dcp import cache as dcp_cache
     from tokenspeed.runtime.layers.attention.dcp.cache import (
@@ -474,6 +475,8 @@ def test_physical_mla_writer_with_placement_and_explicit_history_gather(
     )
     backend = object.__new__(flashmla.FlashMLABackend)
     backend.cache_pool = pool
+    # The runner's root node owns the share; this leaf stands in for it.
+    backend.sparse_topk = SparseTopKShare()
     backend.kvp_group = (0, 1)
     backend.kvp_rank = 0
     backend.kvp_block_granularity = 4
@@ -864,6 +867,7 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(
     backend.kvp_rank = rank
     backend.kvp_block_granularity = 64
     backend.kvp_virtual_block_count = 5
+    backend._row_shard_prefill = False
     backend.qcp_group = (0,)
     # The layer holds the attention-TP slice (2 of 8 heads): the sharded-head
     # combine form.
@@ -872,6 +876,8 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(
     # A target verify publishing no causal lengths: _k_row_causal_lengths derives them.
     backend.is_draft = False
     backend.spec_num_tokens = query_width
+    # configure_runtime's probe verdict: the records core needs an FP8 cache.
+    backend._dcp_decode_records_core = False
     backend._dense_backend = SimpleNamespace(
         forward_decode_metadata=SimpleNamespace(
             num_extends=0,
@@ -936,6 +942,31 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(
     assert (out == 7).all()
 
 
+@pytest.mark.parametrize(
+    ("kvp_group", "topk_lens"),
+    [((0,), torch.ones(1, dtype=torch.int32)), ((0, 1), None)],
+)
+def test_dsa_decode_refuses_an_owned_topk_off_a_sharded_cache_or_its_counts(
+    kvp_group, topk_lens
+):
+    from tokenspeed.runtime.layers.attention.backends.paged import dsa
+
+    # Owned slots are local cache slots; read as scheduler slots they would
+    # attend other pages.
+    backend = object.__new__(dsa.DSABackend)
+    backend.kvp_group = kvp_group
+    with pytest.raises(ValueError, match="owned decode top-k"):
+        backend.forward_sparse_decode(
+            q=torch.zeros(1, 2, 576, dtype=torch.bfloat16),
+            layer=None,
+            token_to_kv_pool=None,
+            bs=1,
+            topk_indices=torch.zeros(1, 2048, dtype=torch.int32),
+            topk_lens=topk_lens,
+            topk_owned=True,
+        )
+
+
 @pytest.mark.parametrize("rank", range(4))
 @pytest.mark.parametrize(
     "arm",
@@ -972,6 +1003,7 @@ def test_dsa_prefill_partitions_candidates_and_merges_gathered_heads(
     backend.kvp_rank = rank
     backend.kvp_block_granularity = 64
     backend.kvp_virtual_block_count = 5
+    backend._row_shard_prefill = False
     backend.query_shard_metadata = None
     backend.step_counter = None
     backend.kvp_prefill_query_layout = arm != "query_layout_off"
@@ -1033,7 +1065,7 @@ def test_dsa_prefill_partitions_candidates_and_merges_gathered_heads(
         assert lse.shape == out.shape[:-1]
         return out[:, rank * 2 : (rank + 1) * 2]
 
-    def supported(*, tokens, heads, topk):
+    def supported(*, tokens, heads, topk, q_dtype, solution):
         # Host-side sizes every rank shares: rows, gathered heads, selection width.
         sizes.append((tokens, heads, topk))
         return arm == "records"
@@ -1178,7 +1210,16 @@ def test_select_dsa_topk_merges_every_tile_once(monkeypatch):
     plans, calls, gathers = [], [], []
 
     def plan(
-        q, weights, index_k_cache, local_table, requests, causal, *, page_size, columns
+        q,
+        weights,
+        index_k_cache,
+        local_table,
+        requests,
+        causal,
+        *,
+        page_size,
+        columns,
+        index_k_format,
     ):
         # Decode's metadata plans the table's width.
         assert columns is None

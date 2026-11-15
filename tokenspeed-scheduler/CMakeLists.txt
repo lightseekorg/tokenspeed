@@ -256,4 +256,14 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
             tokenspeed_scheduler_core
             GTest::gtest
     )
+
+    add_executable(tokenspeed_scheduler_decode_rounds_benchmark EXCLUDE_FROM_ALL
+        tests/cpp/benchmark_decode_rounds.cpp
+    )
+
+    target_link_libraries(tokenspeed_scheduler_decode_rounds_benchmark
+        PRIVATE
+            tokenspeed_scheduler_core
+            GTest::gtest
+    )
 endif()

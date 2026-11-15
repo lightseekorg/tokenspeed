@@ -288,12 +288,10 @@ def validate_context_parallel_roles(
     dcp_size: int,
     qcp_size: int,
     disaggregation_mode: str,
-    enable_mixed_batch: bool,
 ) -> None:
     """Validate KVP/DCP roles and the PD-prefill-only QCP layout.
 
     Aggregated and PD decode engines require explicit DCP matching KVP.
-    Aggregated DCP requires separate prefill and decode rounds.
     """
     if dcp_size < 1:
         raise ValueError(
@@ -331,11 +329,6 @@ def validate_context_parallel_roles(
                 f"(got dcp={dcp_size}, kvp={kvp_size}): every rank of the KVP "
                 "group owns pages of every request, so all of them merge the "
                 "partials"
-            )
-        if disaggregation_mode == "null" and enable_mixed_batch:
-            raise ValueError(
-                "Aggregated DCP does not support --enable-mixed-batch; "
-                "remove it to schedule prefill and decode separately"
             )
     elif kvp_size > 1 and disaggregation_mode in ("null", "decode"):
         raise ValueError(
@@ -691,6 +684,8 @@ class ServerArgs:
     engram_host_table: bool = False
     engram_host_table_dir: str | None = None
     engram_host_table_layout: str = "auto"
+    engram_host_table_alloc: str = "auto"
+    engram_host_table_numa: str = "interleave"
     # Run each decoder layer's small decode steps as one persistent
     # monokernel launch (DECODE_MONOKERNEL_ARCHITECTURES). Off by default.
     decode_monokernel: bool = False
@@ -770,6 +765,7 @@ class ServerArgs:
     enforce_eager: bool = False
     disable_cuda_graph_padding: bool = False
     disable_autotune: bool = False
+    enable_startup_requests: bool = False
     enable_cudagraph_gc: bool = False
     disable_nccl_nvls: bool = False
     disable_symm_mem: bool = False
@@ -814,6 +810,9 @@ class ServerArgs:
     # in: as the top-k leaf emitted them (selection), or ascending (sorted,
     # batch-invariant whenever the selected set is).
     dsa_slot_order: str = "selection"
+    # Storage of Kimi-K3.1's DSA indexer key plane; None keeps its default.
+    # Other models refuse a set value.
+    dsa_index_k_format: str | None = None
     low_latency_max_num_tokens_per_gpu: int = 256
     max_cudagraph_capture_size: int | None = None
     disable_prefill_graph: bool | None = False
@@ -1428,7 +1427,6 @@ class ServerArgs:
             dcp_size=self.decode_context_parallel_size,
             qcp_size=self.mapping.attn.qcp_size,
             disaggregation_mode=self.disaggregation_mode,
-            enable_mixed_batch=self.enable_mixed_batch,
         )
         validate_qcp(
             qcp_size=self.mapping.attn.qcp_size,
@@ -1578,6 +1576,7 @@ class ServerArgs:
         # Handle KVStore settings.
         self._handle_kvstore()
         self.validate_cache_options()
+        self.validate_startup_requests()
         self.resolve_retraction_snapshot_options()
 
     @property
@@ -2448,6 +2447,22 @@ class ServerArgs:
                 "unset --disable-kvstore"
             )
 
+    def validate_startup_requests(self):
+        if not self.enable_startup_requests:
+            return
+        # A disaggregated node's requests need a peer node, and dropping the
+        # startup prefixes would delete an L3 store's shared namespace.
+        if self.disaggregation_mode != "null":
+            raise ValueError(
+                "--enable-startup-requests is not supported with "
+                "--disaggregation-mode"
+            )
+        if self.kvstore_storage_backend is not None:
+            raise ValueError(
+                "--enable-startup-requests is not supported with "
+                "--kvstore-storage-backend"
+            )
+
     def validate_cache_options(self):
         if self.kvstore_storage_backend is not None and self.pipeline_parallel_size > 1:
             raise ValueError(
@@ -3218,7 +3233,7 @@ class ServerArgs:
             dest="enable_mixed_batch",
             default=ServerArgs.enable_mixed_batch,
             help="Allow the scheduler to issue prefill and decode requests in the "
-            "same iteration. Not supported with aggregated DCP.",
+            "same iteration.",
         )
         parser.add_argument(
             "--prefill-decode-interval",
@@ -4067,8 +4082,9 @@ class ServerArgs:
             help=(
                 "Directory for shared Engram mmap files. Default: /dev/shm "
                 "when it has enough free space, otherwise /scratch or /tmp. "
-                "Used only with --engram-host-table-layout shared. Docker often "
-                "caps /dev/shm at 32-64 GiB, too small for a full V4.1 table."
+                "Used only when several ranks share tables in mmap memory (see "
+                "--engram-host-table-alloc). Docker often caps /dev/shm at "
+                "32-64 GiB, too small for a full V4.1 table."
             ),
         )
         parser.add_argument(
@@ -4082,6 +4098,36 @@ class ServerArgs:
                 "attention-TP rank holds a host shard and keeps the all-reduce "
                 "(anonymous mapping, huge-page friendly). auto: sharded when "
                 "attention TP > 1, else shared."
+            ),
+        )
+        parser.add_argument(
+            "--engram-host-table-alloc",
+            type=str,
+            choices=["auto", "cumem", "mmap"],
+            default=ServerArgs.engram_host_table_alloc,
+            help=(
+                "Host memory of shared Engram tables. cumem: pinned host-NUMA "
+                "memory from CUDA virtual memory management, which GPUs map "
+                "with 2 MiB pages, so random-row lookups miss the GPU TLB far "
+                "less than with the 4-64 KiB base pages of a registered shared "
+                "file; the ranks of a host share one copy through FABRIC handles; "
+                "fails if unavailable. mmap: a registered shared file (see "
+                "--engram-host-table-dir), or registered anonymous memory for "
+                "a single rank. auto: cumem when every rank can use it, "
+                "otherwise mmap on every rank (with a warning on NVIDIA)."
+            ),
+        )
+        parser.add_argument(
+            "--engram-host-table-numa",
+            type=str,
+            choices=["interleave", "writer"],
+            default=ServerArgs.engram_host_table_numa,
+            help=(
+                "Placement of cumem Engram tables. interleave: alternate 2 GiB "
+                "chunks over the host NUMA nodes of the GPUs the job's ranks "
+                "use on that host. writer: keep them on the NUMA node of the "
+                "GPU of the rank that loads them. A single rank's table stays "
+                "on its own GPU's node either way."
             ),
         )
         parser.add_argument(
@@ -4411,6 +4457,16 @@ class ServerArgs:
             "the library's heuristic fallback.",
         )
         parser.add_argument(
+            "--enable-startup-requests",
+            action="store_true",
+            default=ServerArgs.enable_startup_requests,
+            help="Before registering with the frontend, serve a few requests of "
+            "the engine's own (one short, one of a full prefill chunk, then a "
+            "full batch) through the ordinary serving path, so the first client "
+            "requests do not compile what that path reaches. Not supported with "
+            "--disaggregation-mode or --kvstore-storage-backend.",
+        )
+        parser.add_argument(
             "--enable-cudagraph-gc",
             action="store_true",
             help="Enable garbage collection during CUDA graph capture. If disabled (default), GC is frozen during capture to speed up the process.",
@@ -4640,7 +4696,7 @@ class ServerArgs:
             "rank attends the KV pages it owns under --kv-parallel-size and the "
             "partials are merged across the KVP group by their log-sum-exp. "
             "Requires --disaggregation-mode null or decode and must equal "
-            "--kv-parallel-size. Aggregated DCP does not support --enable-mixed-batch.",
+            "--kv-parallel-size.",
         )
         parser.add_argument(
             "--attn-head-tp-size",
@@ -4938,6 +4994,18 @@ class ServerArgs:
             "served only by cores declaring the slot_order trait (the "
             "registered batch-invariant leaves). Folded to selection by --numerics "
             "rl-bitwise.",
+        )
+        parser.add_argument(
+            "--dsa-index-k-format",
+            type=str,
+            choices=["fp8_scaled", "mxfp4"],
+            default=ServerArgs.dsa_index_k_format,
+            help="Storage of Kimi-K3.1's DSA indexer key cache; other models "
+            "refuse the flag. 'fp8_scaled' (the default): FP8 keys with one "
+            "fp32 scale per 128 elements, 132 bytes per token per layer. "
+            "'mxfp4': E2M1 keys with one UE8M0 scale per 32 elements, 68 "
+            "bytes, scored against MXFP4 queries on AMD CDNA4; refused under "
+            "bitwise numerics.",
         )
         parser.add_argument(
             "--disable-sampling-tp-sync",

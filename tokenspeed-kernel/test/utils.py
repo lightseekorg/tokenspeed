@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import ExitStack, contextmanager
 from typing import Any
 from unittest.mock import patch
@@ -109,6 +109,27 @@ def assert_no_triton_compile(*kernels: Any) -> Iterator[None]:
             f"{kernel.fn.__name__} compiled {compile_calls.call_count} new "
             "specialization(s); a per-batch value is likely passed as tl.constexpr"
         )
+
+
+def assert_warmup_covers(
+    kernels: Iterable[Any],
+    warm: Callable[[], Any],
+    run: Callable[[Any], Any],
+    sweep: Iterable[Any],
+) -> None:
+    """Fail if ``run`` compiles any of ``kernels`` for a ``sweep`` value after
+    ``warm`` prepared them from empty JIT caches.
+
+    Clearing first keeps binaries an earlier test compiled from standing in
+    for the ones ``warm`` must prepare.
+    """
+    kernels = tuple(kernels)
+    for kernel in kernels:
+        kernel.device_caches.clear()
+    warm()
+    with assert_no_triton_compile(*kernels):
+        for value in sweep:
+            run(value)
 
 
 @contextmanager
