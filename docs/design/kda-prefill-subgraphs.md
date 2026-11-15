@@ -120,8 +120,9 @@ range up to that limit, and always includes the effective limit. Without an
 explicit list, the runtime builds a relative-spacing ladder with a 16-token
 minimum step and a 512-token maximum step.
 
-If you omit capture batch sizes, each token bucket uses the minimum request
-count needed to fit within the model context, usually one. Explicit counts must
+If you omit capture batch sizes, each token bucket captures 4 requests, capped
+by the scheduler's per-rank request limit and the bucket, and at least the count
+needed to fit within the model context. Explicit counts must
 fit the scheduler's per-rank request limit. For each bucket, the runtime skips
 a count that cannot fill the bucket with positive-length requests within the
 model context. This option does not change `--max-num-seqs` or force the

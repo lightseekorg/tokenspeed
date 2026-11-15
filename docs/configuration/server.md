@@ -545,8 +545,10 @@ dummy request slots. These settings do not replace the scheduler's
 `--prefill-graph-capture-sizes` remains a compatibility alias for
 `--prefill-graph-capture-token-sizes`. Specify only one spelling per command.
 Both populate the existing `prefill_graph_capture_sizes` Python field.
-Unset token sizes use the existing default ladder. Unset batch sizes use the
-minimum request count that fits each token bucket within the model context.
+Unset token sizes use the existing default ladder. Unset batch sizes capture 4
+requests per token bucket, capped by `--max-num-seqs` per data-parallel rank and
+the bucket, and at least the request count that fits each token bucket within
+the model context.
 
 `--chunked-prefill-size` is intentionally separate from
 `--max-num-batched-tokens`: in TokenSpeed it is the scheduler's per-iteration
