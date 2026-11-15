@@ -108,6 +108,8 @@ __all__ = [
     "mv",
     "MV_FP8_WEIGHT_MAX_M",
     "mv_fp8_weight",
+    "mv_rmsnorm",
+    "mv_rmsnorm_supported",
     "mv_rmsnorm_gated_sigmoid",
     "mv_rmsnorm_gated_sigmoid_supported",
     "mv_weightless_rmsnorm_gated_sigmoid",
@@ -2268,6 +2270,120 @@ def mv_rmsnorm_gated_sigmoid(
             f"gate {tuple(gate.shape)}, weight {tuple(weight.shape)}"
         )
     return kernel(x, gate, norm_weight, weight, out, eps)
+
+
+def _select_mv_rmsnorm(
+    x: torch.Tensor,
+    norm_weight: torch.Tensor,
+    weight: torch.Tensor,
+    kv: torch.Tensor | None,
+    kv_norm_weight: torch.Tensor | None,
+) -> SelectedKernel | None:
+    """Select the one-launch RMSNorm GEMV for ``x``'s rows, or None."""
+    rows = (x,) if kv is None else (x, kv)
+    norms = (norm_weight,) if kv_norm_weight is None else (norm_weight, kv_norm_weight)
+    if (
+        not x.is_cuda
+        or (kv is None) != (kv_norm_weight is None)
+        or any(
+            t.ndim != 2 or t.shape[0] != x.shape[0] or t.dtype != x.dtype for t in rows
+        )
+        or any(
+            t.ndim != 1 or t.shape[0] != r.shape[1] or not t.is_contiguous()
+            for t, r in zip(norms, rows)
+        )
+        or weight.ndim != 2
+        or weight.shape[1] != x.shape[1]
+        or not weight.is_contiguous()
+        or any(t.device != x.device for t in (*rows, *norms, weight))
+        # The Triton rmsnorm_fused_parallel the launch reproduces loads 16-byte
+        # aligned rows in 16-byte vectors, which sets the order of its sums.
+        or any(t.stride(1) != 1 or t.stride(0) % 8 or t.data_ptr() % 16 for t in rows)
+        or resolve_kernel_override("gemm", "mm", None) is not None
+    ):
+        return None
+    m, (n, k) = x.shape[0], weight.shape
+    try:
+        kernel = select_kernel(
+            "gemm",
+            "mv_rmsnorm",
+            dense_format_signature(("x", "weight"), (x.dtype, weight.dtype)),
+            traits={"m": m, "n": n, "k": k},
+        )
+    except NoKernelFoundError:
+        return None
+    # The launch reproduces rmsnorm_fused_parallel and the GEMV that mm runs on
+    # its rows bit for bit, so it only stands in where mm selects that GEMV.
+    gemv = _select_mv(m, n, k, True, x.dtype, weight.dtype, False)
+    if gemv is not KernelRegistry.get().get_impl("gluon_gemv_a16w16_gfx950"):
+        return None
+    return kernel
+
+
+def mv_rmsnorm_supported(
+    x: torch.Tensor,
+    norm_weight: torch.Tensor,
+    weight: torch.Tensor,
+    kv: torch.Tensor | None = None,
+    kv_norm_weight: torch.Tensor | None = None,
+) -> bool:
+    """Return whether :func:`mv_rmsnorm` serves ``x``'s rows.
+
+    A registered kernel must take the shape, the rows must be 16-byte aligned,
+    and ``mm`` must select the GEMV it reproduces for the normalized rows.
+
+    Args:
+        x: Rows ``[M, K]`` to normalize, with a unit inner stride.
+        norm_weight: ``[K]`` RMSNorm weight.
+        weight: Projection weight ``[N, K]``.
+        kv: Optional ``[M, KV]`` rows normalized in place by the same launch.
+        kv_norm_weight: ``[KV]`` RMSNorm weight of ``kv``.
+
+    Returns:
+        ``True`` when one launch can replace ``rmsnorm_fused_parallel``
+        followed by ``mm``.
+    """
+    return _select_mv_rmsnorm(x, norm_weight, weight, kv, kv_norm_weight) is not None
+
+
+def mv_rmsnorm(
+    x: torch.Tensor,
+    norm_weight: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    out: torch.Tensor,
+    x_norm: torch.Tensor,
+    kv: torch.Tensor | None = None,
+    kv_norm_weight: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Normalize rows and project them in one launch.
+
+    Computes the Triton ``rmsnorm_fused_parallel(x, norm_weight, x_norm, kv,
+    kv_norm_weight, kv, eps)`` (``kv`` normalized in place when given)
+    followed by ``mm(x_norm, weight, out=out)``, bit for bit, where
+    :func:`mv_rmsnorm_supported` holds.
+
+    Args:
+        x: Rows ``[M, K]`` with a unit inner stride.
+        norm_weight: ``[K]`` RMSNorm weight.
+        weight: ``[N, K]`` weight.
+        eps: Epsilon added to each row's variance (both norms).
+        out: ``[M, N]`` destination.
+        x_norm: ``[M, K]`` destination of the normalized rows.
+        kv: Optional ``[M, KV]`` rows to normalize in place.
+        kv_norm_weight: ``[KV]`` RMSNorm weight of ``kv``.
+
+    Returns:
+        ``out``.
+    """
+    kernel = _select_mv_rmsnorm(x, norm_weight, weight, kv, kv_norm_weight)
+    if kernel is None or x_norm.shape != x.shape or x_norm.dtype != x.dtype:
+        raise ValueError(
+            "mv_rmsnorm needs supported rows (see mv_rmsnorm_supported), got x "
+            f"{tuple(x.shape)}, x_norm {tuple(x_norm.shape)}, weight "
+            f"{tuple(weight.shape)}"
+        )
+    return kernel(x, norm_weight, weight, out, x_norm, eps, kv, kv_norm_weight)
 
 
 # ===-----------------------------------------------------------------------===#
