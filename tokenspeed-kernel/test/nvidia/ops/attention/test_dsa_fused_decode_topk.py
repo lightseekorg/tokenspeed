@@ -116,26 +116,25 @@ def _row_lengths(seq_lens, q_len, width):
 def _reference_logits(q_fp8, folded, seq_lens, table, cache, q_len):
     """Scrubbed FP32 reference logits ``[tokens, block-table capacity]``.
 
-    Each row's head-weighted ReLU scores of its E4M3 query against the
-    dequantized keys of its request's pages: exact dot products, then the
-    head weighting and reduction in FP32 the way the kernels do it (ReLU as
-    ``x + |x|``, weighted and summed, halved once at the end) so an
-    overflowing head weight turns +inf exactly where theirs does, and NaN and
-    +inf scrubbed to -inf in the causal window as the scoring leaves do.
+    Each row's head-weighted ReLU scores of its E4M3 query against its
+    request's keys, in the kernels' order: exact dot products of the E4M3
+    codes, ReLU as ``x + |x|``, weighted and summed over the heads in FP32,
+    halved, and only then scaled by the key's scale. An overflowing head
+    weight thus turns +inf exactly where theirs does; NaN and +inf are
+    scrubbed to -inf in the causal window as the scoring leaves do.
     """
     keys, words = _planes(cache)
-    scales = decode_index_k_scale(words.contiguous())
-    k = (keys.view(torch.float8_e4m3fn).double() * scales.double()[..., None]).view(
-        -1, DIM
-    )
+    scales = decode_index_k_scale(words.contiguous()).reshape(-1)
+    codes = keys.view(torch.float8_e4m3fn).double().view(-1, DIM)
     width = table.shape[1]
     offsets = torch.arange(PAGE, device="cuda")
     logits = torch.empty((q_fp8.shape[0], width * PAGE), device="cuda")
     for row in range(q_fp8.shape[0]):
         pages = table[row // q_len].long()
         slots = (pages[:, None] * PAGE + offsets).reshape(-1)
-        doubled = 2 * torch.relu(q_fp8[row].double() @ k[slots].T).float()
-        logits[row] = (folded[row].float()[:, None] * doubled).sum(0) * 0.5
+        doubled = 2 * torch.relu(q_fp8[row].double() @ codes[slots].T).float()
+        weighted = (folded[row].float()[:, None] * doubled).sum(0)
+        logits[row] = weighted * 0.5 * scales[slots]
     dsa_triton_topk.scrub_nonfinite_logits(logits, seq_lens, next_n=q_len)
     return logits
 
