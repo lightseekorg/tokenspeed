@@ -608,6 +608,7 @@ def test_the_one_launch_context_write_stores_the_per_layer_chains_bytes(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA kernels")
+# Seed 35 reproduced the one-ULP BF16 RMSNorm difference on MI355.
 @pytest.mark.parametrize("seed", [0, 35])
 def test_context_kv_write_respects_dcp_ownership(seed):
     """Under KV parallelism each rank stores only the rows it owns.
