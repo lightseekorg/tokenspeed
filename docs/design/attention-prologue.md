@@ -204,7 +204,10 @@ the round's extend span, then the decode window. A forward asks for one slot
 per row it carries through `padded_write_locations(layer, mode, rows)`: the
 extend span, then a MIXED round's decode rows, then the dummy slot 0 for the
 padding. Per-mode callers, such as MLA models that split a MIXED round, keep
-using `write_locations`.
+using `write_locations`. A split draft's K/V writer
+(`PagedAttention.write_kv_at`) runs the prologue's head steps over an extend's
+rows and writes to slots its caller stages: the extend's padded write
+locations, tile by tile, and slot 0 for a padded row.
 
 Sparse KV offloading keeps `write_locations` as the authoritative-history
 accessor. Before the latent write, the caller supplies selection and positions
@@ -292,7 +295,10 @@ prefill graph (`--enable-drafter-prefill-graph`, see
 extend step only when the draft model declares
 `supports_breakable_draft_extend`: Qwen4-Exp's MTP head runs the GQA prologue
 in the captured segment and attends at `PagedAttention.attend`, like the
-target.
+target. Qwen3.5's MTP head splits the round instead
+(a `SplitExtendDraft`): its K/V writer stores every row through
+`write_kv_at`, with no break, and step 0 runs from each request's last row as
+a decode step.
 
 ## Formats and scales
 

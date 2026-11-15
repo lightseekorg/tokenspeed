@@ -136,8 +136,9 @@ def _greedy_sp(rid: str, vocab: int = VOCAB, **overrides) -> SamplingParams:
 
 def _prepare(backend, sps: list[SamplingParams], n: int = 1, slots=None):
     slots = list(range(1, len(sps) + 1)) if slots is None else slots
+    # Encode the test's seed/index request labels as integer identities.
     backend.prepare_step(
-        request_ids=[f"rid_{sp.seed}_{i}" for i, sp in enumerate(sps)],
+        admission_ids=[sp.seed * MAX_BS + i + 1 for i, sp in enumerate(sps)],
         request_pool_indices=slots,
         sampling_params_list=sps,
         num_tokens_per_req=n,
@@ -212,8 +213,8 @@ def test_flip_detection_writes_slot_state_once():
     _prepare(backend, [sp_a, sp_b], slots=[1, 3])
     torch.cuda.synchronize()
 
-    assert backend._last_rid_per_slot[1] is not None
-    assert backend._last_rid_per_slot[3] is not None
+    assert backend._last_admission_per_slot[1] is not None
+    assert backend._last_admission_per_slot[3] is not None
 
     buffers = backend.state
     assert buffers.temperature[1].item() == pytest.approx(0.7, abs=1e-2)
@@ -241,7 +242,7 @@ def test_flip_detection_writes_slot_state_once():
     assert buffers.top_k[5].item() == 128
     assert Indicator.TOP_K not in Indicator(int(buffers.indicators[5]))
 
-    # Steady state: same rid on the same slot must not re-scatter.
+    # Steady state: same admission on the same slot must not re-scatter.
     buffers.temperature[1].fill_(9.0)
     _prepare(backend, [sp_a, sp_b], slots=[1, 3])
     torch.cuda.synchronize()

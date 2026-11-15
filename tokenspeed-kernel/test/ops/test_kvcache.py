@@ -47,8 +47,10 @@ from tokenspeed_kernel.ops.kvcache.triton import (
 )
 from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
     _count_slots_by_owner,
+    _decode_visible_lengths,
     _local_visible_lengths,
     _split_slots_by_owner,
+    kvp_decode_visible_lengths,
     kvp_local_visible_lengths,
     split_slots_by_owner,
 )
@@ -91,6 +93,57 @@ def test_kvp_visible_lengths_reuses_compile_across_table_shapes(device: str) -> 
         run(3, 63, 4, 0)
         run(2, 129, 3, 13)
         run(5, 1024, 4, 16)
+
+
+@pytest.mark.parametrize(
+    "queries,offset,len_dtype", [(1, 0, torch.int32), (4, -3, torch.int64)]
+)
+def test_kvp_decode_visible_lengths_matches_the_separate_launches(
+    device: str, queries: int, offset: int, len_dtype: torch.dtype
+) -> None:
+    page, groups = 64, 6
+
+    def run(batch, cols, padding, start):
+        owned = (torch.arange(cols) % 3 == 1) | (torch.arange(cols) == 0)
+        prefix = torch.zeros((start + batch, cols + 1 + padding), dtype=torch.int32)
+        prefix[:, 1 : cols + 1] = owned.int().cumsum(0)
+        # Endpoints from below zero (clamped) through the table's last token.
+        seq_lens = torch.randint(0, cols * page + 1, (start + batch,), dtype=len_dtype)
+        seq_lens[start] = 1
+        seq_lens[-1] = cols * page
+        # Rows after ``start`` others, as a mixed round's decode rows follow its extends.
+        prefix = prefix.to(device)[start:, : cols + 1]
+        seq_lens = seq_lens.to(device)[start:]
+        endpoints = (
+            (seq_lens[:, None] + torch.arange(offset, offset + queries, device=device))
+            .clamp_min_(0)
+            .to(torch.int32)
+        )
+        local = torch.empty_like(endpoints)
+        kvp_local_visible_lengths(prefix, endpoints, page_size=page, out=local)
+        local = local.reshape(-1)
+        cache = local.clamp_min(1).repeat_interleave(groups)
+        got_local = torch.full_like(local, -7)
+        got_cache = torch.full_like(cache, -7)
+        kvp_decode_visible_lengths(
+            prefix,
+            seq_lens,
+            offset=offset,
+            queries=queries,
+            groups=groups,
+            page_size=page,
+            local_lengths=got_local,
+            cache_lengths=got_cache,
+        )
+        torch.testing.assert_close(got_local, local, rtol=0, atol=0)
+        torch.testing.assert_close(got_cache, cache, rtol=0, atol=0)
+
+    run(1, 17, 0, 0)
+    # Batch, table width, row stride and the rows' start are runtime values.
+    with assert_no_triton_compile(_decode_visible_lengths):
+        run(16, 63, 0, 0)
+        run(5, 129, 13, 3)
+        run(64, 1024, 16, 1)
 
 
 @pytest.mark.parametrize("degree", [1, 3, 4, 16])

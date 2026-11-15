@@ -99,6 +99,22 @@ The check uses the scheduler's existing request lookup; it does not reclaim
 an id ahead of its in-flight work. Once both owners have released an id, this
 admission guard allows it again.
 
+Each accepted request gets a monotonically increasing admission identity
+before data-plane registration. The output processor allocates it once;
+the Python request record, planned forwards and snapshot/restore operations
+carry that same value. External `rid` remains the wire and scheduler lookup
+key. Reusing it after retirement creates a new admission, while chunks,
+decode steps and retraction keep the existing admission identity. Slot-state
+owners compare admissions so a recycled row cannot retain a previous
+request's stop criteria or sampling state. Identity allocation is independent
+of the sampling seed and does not retain a history of external request IDs.
+
+Cache-op adaptation resolves the admission while the host still holds the
+request record and stores it in the immutable operation. No asynchronous
+completion resolves a potentially recycled `rid` to infer slot ownership.
+The identity is local to the engine lifetime, like its slot-state images;
+it is not a cross-engine or persistent-cache key.
+
 The Rust/C++ submission bridge returns `Result`: native validation exceptions
 must never escape a `noexcept` bridge. The scheduler validates a complete
 submission batch before inserting requests. If it rejects the batch, the
@@ -984,6 +1000,9 @@ tracks slot ownership by admission, not by client request id, and seeds a
 new owner's prefix before its first forward. Consecutive chunks on the
 same owned row append their inputs without reseeding. Prefix-cache hits,
 PD landings, slot reuse and recovery into another slot use this same path.
+Only the most recently used slot can hold a request's current history. Moving
+to another slot invalidates the old ownership claim: a later restore into
+that old slot must seed again, even if no other request has used it.
 
 A model profile may declare `request_token_history_lookback`: the maximum
 number of committed tokens it reads behind its write frontier. Omission
@@ -1124,6 +1143,32 @@ Later distinct failures and cleanup errors remain visible without replacing
 the original serving error.
 Failures outside generation serving use the same native notifier when
 they reach the host's final error handler; their cleanup timing is unchanged.
+
+### Startup requests
+
+Model warmup runs the model alone on a probe cache. It never reaches the
+request bookkeeping (input preparation, accepted-state commits), and the
+final cache can change kernel specializations it did prepare. With
+`--enable-startup-requests` the host closes both gaps before it registers:
+the loop starts with no frontend and `EventLoop::warm_up` serves requests of
+its own through the ordinary rounds (admission, planning, the data plane,
+commits), on every rank of the replica as a frontend's would be.
+
+`startup::Limits::phases` sizes them from the engine's limits alone: one
+one-token request, one each of a thirty-second of a prefill chunk, a
+sixteenth, one token more, and three sixteenths (the partial forwards that
+short prompts and a long prompt's last chunk run, aligned and not), one of a
+whole chunk, then `max_num_seqs` requests whose prompts cross one chunk
+boundary, each cut to what ingress
+admits and so the whole batch fits the cache. Each phase runs until every
+rank is idle, then its prefixes are flushed, so serving starts from an
+empty cache. Their outputs go nowhere and kernels prepare their compile
+variants as in model warmup. Only
+then does the host complete the frontend handshake and report ready: no
+client request waits behind them or is timed with them.
+
+A disaggregated node is refused (its requests need a peer), and so is an
+L3 store (the flush would delete its shared namespace).
 
 ## Checklist for extending the loop
 

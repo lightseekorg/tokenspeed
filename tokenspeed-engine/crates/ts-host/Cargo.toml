@@ -1,6 +1,6 @@
 [package]
 name = "tokenspeed-host"
-description = "One TokenSpeed engine rank: the Rust control plane, with the data plane in an embedded interpreter"
+description = "One TokenSpeed engine rank: the Rust control plane, with the data plane in the launching Python interpreter"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,15 +8,23 @@ repository.workspace = true
 rust-version.workspace = true
 readme.workspace = true
 
+[lib]
+name = "_host"
+crate-type = ["cdylib", "rlib"]
+
 [[bin]]
 name = "ts-host"
-path = "src/main.rs"
+path = "src/bin/ts-host.rs"
+
+[features]
+abi3 = ["pyo3/abi3-py312", "ts-scheduler/abi3"]
 
 [dependencies]
 bytes.workspace = true
 chrono = "0.4"
 libc = "0.2"
-mimalloc = { version = "0.1", default-features = false }
+# The host is loaded after other native Python modules; static TLS can be full.
+mimalloc = { version = "0.1", default-features = false, features = ["local_dynamic_tls"] }
 pyo3 = "0.30"
 serde_json = "1"
 thiserror.workspace = true

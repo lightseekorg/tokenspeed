@@ -18,11 +18,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""TokenSpeed's Rust engine: the rank binary and a client of its ranks.
+"""TokenSpeed's Rust engine: the rank launcher and a client of its ranks.
 
-* ``host_binary()`` is ``ts-host``, one engine rank: the Rust control plane
-  with the data plane in an embedded interpreter (``tokenspeed`` launches
-  one per rank).
+* ``host_binary()`` is ``ts-host``, the launcher for one engine rank. It
+  enters the native host extension using the requested Python interpreter
+  (``tokenspeed`` launches one per rank).
 * ``FrontendListener`` / ``Frontend`` connect Python to the ranks over the
   msgpack ZMQ wire (``ts-client``), for tests and tools that drive an engine
   (``tokenspeed.runtime.entrypoints.wire_driver``); serving frontends (SMG,

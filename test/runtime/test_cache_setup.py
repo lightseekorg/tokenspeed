@@ -157,7 +157,7 @@ def test_verify_preparation_calls_root_with_existing_budget_gate(
     draft_backend = Mock(spec=AttentionBackend)
     kwargs = dict(
         server_args=SimpleNamespace(speculative_num_draft_tokens=3),
-        config=SimpleNamespace(max_bs=4, qcp_size=1),
+        config=SimpleNamespace(max_bs=4, qcp_size=1, kvp_size=1),
         backend=backend,
         draft_backend=draft_backend,
         uses_paged_state_verify=uses_paged_state_verify,
@@ -1777,6 +1777,7 @@ def test_ordinary_profile_reserves_null_page_inside_budget() -> None:
         ("trtllm_mla", None, "does not support MLA DCP"),
         (None, "trtllm_mla", r"\(DCP decode\) currently requires"),
         (None, "flashmla", None),
+        (None, "gluon", None),
     ],
 )
 def test_kimi_kvp_resolves_target_and_draft_before_cache_allocation(

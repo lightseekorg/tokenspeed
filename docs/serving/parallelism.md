@@ -710,9 +710,9 @@ ts serve --model MODEL --attention-backend flashmla \
   --attn-tp-size 8 --kv-parallel-size 8 --decode-context-parallel-size 8
 ```
 
-Keep `--disaggregation-mode` at `null` and QCP at 1. Aggregated DCP requires
-separate prefill/decode rounds and rejects `--enable-mixed-batch` for all
-backends, including MLA/DSA. MLA decode remains absorbed; MLA/KDA hybrids
+Keep `--disaggregation-mode` at `null` and QCP at 1. With
+`--enable-mixed-batch`, a mixed round runs its KVP extend rows and DCP decode
+rows in one forward. MLA decode remains absorbed; MLA/KDA hybrids
 shard only MLA history. Ordinary TP with KVP = DCP = 1 is unaffected.
 
 Speculative decoding runs on a sharded cache with the backends whose DCP
@@ -1023,6 +1023,14 @@ read the sum from there (`inkling_ring_sconv_mailbox`, FP32 in rank order,
 rounded once). The model builds the mailbox in `prepare_communication_runtime`;
 each layer uses both chains or neither, so the two uses alternate the
 mailbox's parities.
+
+Past 1024 rows, a Kimi-K3 attention layer's BF16 o-projection writes its
+partial straight into the multimem staging buffer of the MoE tail's
+up-projection (`K3AttnComm.prepare_staged_projection`). The sum then runs as
+the same in-switch all-reduce instead of NCCL. The reduced rows are copied
+out, because AttnRes keeps them after the MoE tail restages the buffer. Under
+`--batch-invariant-collectives` or `--force-deterministic-rsag` the attention
+keeps its ordinary all-reduce.
 
 Under `--numerics rl-bitwise` (`--batch-invariant-collectives`) every
 reduction takes NCCL data movement plus a rank-ordered fp32 fold, and the

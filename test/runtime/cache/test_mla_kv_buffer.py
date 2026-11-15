@@ -39,6 +39,7 @@ from tokenspeed_kernel.ops.kvcache.triton import (
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
+from tokenspeed.runtime.layers.attention.backends.base import SparseTopKShare
 from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
 
 sys.path.insert(
@@ -752,7 +753,9 @@ def test_latent_prologue_hands_attention_the_cache_dtype(hybrid, dtype):
         torch.arange(3, device="cuda"),
         SimpleNamespace(
             token_to_kv_pool=pool,
-            attn_backend=SimpleNamespace(cache_placement=lambda layer: None),
+            attn_backend=SimpleNamespace(
+                cache_placement=lambda layer: None, sparse_topk=SparseTopKShare()
+            ),
         ),
         slots=torch.arange(3, device="cuda"),
         expanded=None,

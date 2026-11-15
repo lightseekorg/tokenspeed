@@ -787,6 +787,27 @@ def test_partial_transport_and_merge(degree, dtype, dim, strided, use_sink):
 
 
 @requires_cuda
+def test_partial_dispatch_writes_lent_storage():
+    torch.manual_seed(820)
+    degree, dim = 4, 33
+    outputs, lses = _partials(degree, 5, dim, torch.bfloat16, True)
+    expected = dcp.dispatch_dcp_attention_partials(outputs[0], lses[0], degree=degree)
+    # Lent storage: a view at the start of a larger buffer, stale bytes in it.
+    buffer = torch.full((expected.numel() + 64,), -5, device="cuda", dtype=torch.int32)
+    lent = buffer[: expected.numel()].view(expected.shape)
+    got = dcp.dispatch_dcp_attention_partials(
+        outputs[0], lses[0], degree=degree, out=lent
+    )
+    assert got.data_ptr() == buffer.data_ptr()
+    torch.testing.assert_close(got, expected, rtol=0, atol=0)
+    assert (buffer[expected.numel() :] == -5).all()
+    with pytest.raises(ValueError, match="contiguous int32"):
+        dcp.dispatch_dcp_attention_partials(
+            outputs[0], lses[0], degree=degree, out=lent[:, :, :1]
+        )
+
+
+@requires_cuda
 def test_candidate_and_partial_fusions_do_not_recompile():
     degree, width, topk, dim = 2, 16, 8, 16
 
