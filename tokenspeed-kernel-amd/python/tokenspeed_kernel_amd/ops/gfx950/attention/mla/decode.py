@@ -2265,6 +2265,16 @@ def _select_num_kv_splits_bh16bn128(
     *, batch: int, max_seqlen_k: int, block_n: int
 ) -> int:
     occupancy_cap = (_WAVE_WORKGROUPS // 2) // batch
+    # Past a few rows the half-wave target leaves most CUs idle (one split from
+    # 65 rows on), as in the MLA DCP decode of a drafter, which folds every
+    # draft position and head group onto the batch axis. Long-context servers
+    # aim for three waves of stage-1 workgroups, at most 32 splits per row.
+    if batch > 4 and max_seqlen_k > 16_384:
+        waves_cap = 3 * _WAVE_WORKGROUPS // batch
+        if waves_cap:
+            occupancy_cap = max(
+                occupancy_cap, min(32, 1 << (waves_cap.bit_length() - 1))
+            )
     blocks = (max_seqlen_k + block_n - 1) // block_n
     splits = max(1, min(occupancy_cap, blocks))
     # K3 TP8 decode has one request and 12 local heads. For a server capped at
