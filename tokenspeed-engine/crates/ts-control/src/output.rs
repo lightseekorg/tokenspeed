@@ -859,6 +859,10 @@ impl OutputProcessor {
             trace.transfer_done_ms = Some(trace.ms());
         }
         state.cached_tokens = cached_tokens;
+        if state.max_new_tokens == 0 {
+            state.check_finished(false);
+            return;
+        }
         state.output_ids.push(bootstrap_token);
         if let Some(tokens) = &mut state.reasoning_tokens {
             tokens.push([bootstrap_token]);
@@ -1450,7 +1454,15 @@ impl OutputProcessor {
                 _ => -1,
             };
             let before = state.output_ids.len();
-            for (j, &token) in model_ids.iter().enumerate() {
+            // Prefill may sample a token even with no generation budget.
+            // Keep it for scheduler feedback, but omit it from client output.
+            let output_ids = if state.max_new_tokens == 0 {
+                state.check_finished(hostfunc);
+                &model_ids[..0]
+            } else {
+                model_ids.as_slice()
+            };
+            for (j, &token) in output_ids.iter().enumerate() {
                 state.output_ids.push(token);
                 if let Some(tokens) = &mut state.reasoning_tokens {
                     tokens.push([token]);
@@ -2857,6 +2869,35 @@ mod tests {
             .unwrap();
         assert_eq!(c.outputs[0].finish_reason, Some("length"));
         assert_eq!(c.events[1].kind, ForwardEventKind::Finish);
+    }
+
+    #[test]
+    fn zero_budget_finishes_prefill_without_emitting_the_sample() {
+        let mut p = processor(None);
+        register(&mut p, "r", 2, 0, &[]);
+        let c = p
+            .commit(&batch(&[("r", 1, 0, 2)], 1), None, &result(&[3], &[1]))
+            .unwrap();
+        assert!(c.outputs.is_empty());
+
+        let c = p
+            .commit(&batch(&[("r", 1, 1, 2)], 1), None, &result(&[4], &[1]))
+            .unwrap();
+        assert!(c.outputs[0].output_ids.is_empty());
+        assert_eq!(c.outputs[0].finish_reason, Some("length"));
+        assert_eq!(c.events[1].kind, ForwardEventKind::Finish);
+        assert_eq!(c.released, ["r"]);
+    }
+
+    #[test]
+    fn zero_budget_finishes_remote_prefill_without_emitting_the_bootstrap() {
+        let mut p = OutputProcessor::new(None, 1, None, Role::Decode, NO_FINISH_LOG, false, None);
+        register(&mut p, "r", 2, 0, &[]);
+        p.remote_prefill_done("r", 4, 0, None);
+        let c = p.finish_remote_prefill_only("r");
+        assert!(c.outputs[0].output_ids.is_empty());
+        assert_eq!(c.outputs[0].finish_reason, Some("length"));
+        assert_eq!(c.released, ["r"]);
     }
 
     #[test]
