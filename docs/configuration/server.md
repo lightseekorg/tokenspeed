@@ -709,7 +709,8 @@ The draft and target models and the normal verification kernel still execute.
 The verification result is then overridden with synthetic acceptance before
 committing tokens and updating request state, preserving verification overhead.
 The override copies the forced draft prefix and selects the existing target
-argmax at the cutoff. It adds no second verification or target-resampling pass.
+argmax at the cutoff, in one launch. It adds no second verification or
+target-resampling pass.
 **Do not use generated text for correctness or accuracy evaluation.** Request
 termination can truncate the last verification's output.
 

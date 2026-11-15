@@ -41,6 +41,7 @@ from tokenspeed_kernel.ops.attention.mla.tokenspeed_mla import (
     tokenspeed_mla_prefill,
     warmup_compile_prefill,
 )
+from tokenspeed_kernel.ops.metadata import broadcast_block_lengths
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -532,7 +533,8 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         """Broadcast, keeping the per-request row the query-axis fold reads.
 
         The drafter calls this inside the captured graph, so the row has to be
-        written there too rather than derived from the expanded view per layer.
+        written there too rather than derived from the expanded view per layer;
+        one launch writes both.
         """
         self._copy_block_decode_seq_lens(bs, block_seq_lens)
         if self._dcp is not None:
@@ -544,13 +546,16 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         self, bs: int, block_seq_lens: torch.Tensor
     ) -> None:
         self._ensure_block_row_buffers()
-        rows = self._block_seq_lens_buf[:bs]
-        torch.clamp(
-            block_seq_lens[:bs], self.spec_num_tokens, self.max_context_len, out=rows
-        )
         expansion = self.block_decode_expansion
-        self.decode_seq_lens_buffer[: bs * expansion].view(bs, expansion).copy_(
-            rows.unsqueeze(1)
+        broadcast_block_lengths(
+            block_seq_lens[:bs],
+            self.spec_num_tokens,
+            self.max_context_len,
+            causal=False,
+            rows_out=self._block_seq_lens_buf[:bs],
+            entries_out=self.decode_seq_lens_buffer[: bs * expansion].view(
+                bs, expansion
+            ),
         )
 
     def _log_block_layout(

@@ -204,6 +204,7 @@ def dflash_prepare_decode_kernel(
     req_pool_indices_ptr,
     valid_cache_lengths_ptr,
     draft_seq_lens_ptr,
+    block_end_lens_ptr,
     block_ids_ptr,
     block_positions_ptr,
     verify_width: tl.constexpr,
@@ -219,6 +220,7 @@ def dflash_prepare_decode_kernel(
     prefix_len = old_len + accept_len
     prefix_len = tl.minimum(prefix_len, max_draft_prefix)
     tl.store(draft_seq_lens_ptr + req_idx, prefix_len)
+    tl.store(block_end_lens_ptr + req_idx, prefix_len + draft_query_width)
 
     safe_accept = tl.minimum(tl.maximum(accept_len, 1), verify_width)
     current_token = tl.load(
@@ -242,6 +244,7 @@ def dflash_prepare_decode(
     req_pool_indices: torch.Tensor,
     valid_cache_lengths: torch.Tensor,
     draft_seq_lens: torch.Tensor,
+    block_end_lens: torch.Tensor,
     block_ids: torch.Tensor,
     block_positions: torch.Tensor,
     verify_width: int,
@@ -249,7 +252,8 @@ def dflash_prepare_decode(
     max_draft_prefix: int,
 ) -> None:
     """Advance the DFLASH block anchor in one launch: the committed prefix
-    length (clamped to the draft table's capacity), the anchor token, and the
+    length (clamped to the draft table's capacity), the block-end length
+    (prefix plus ``draft_query_width``), the anchor token, and the
     block's positions. Write locations are NOT computed here — the drafter
     publishes the block window through the draft router
     (``publish_draft_step_locations``), the single slot-math owner."""
@@ -262,6 +266,7 @@ def dflash_prepare_decode(
         req_pool_indices,
         valid_cache_lengths,
         draft_seq_lens,
+        block_end_lens,
         block_ids,
         block_positions,
         verify_width=verify_width,
