@@ -219,5 +219,24 @@ def test_row_exchange_pads_every_rank_heads_and_hands_them_back(
         assert torch.equal(back, out[:, rank * heads : (rank + 1) * heads])
 
 
+def test_the_row_exchange_connects_with_a_byte_per_peer(monkeypatch):
+    group = (4, 5, 6, 7)
+    calls = []
+
+    def record(output, value, actual_group, **splits):
+        calls.append((output.shape, value.dtype, actual_group, splits))
+
+    monkeypatch.setattr(exchange, "all_to_all_single", record)
+    exchange.connect_row_exchange(group, "cpu")
+    assert calls == [
+        (
+            (4,),
+            torch.uint8,
+            group,
+            {"output_split_sizes": [1] * 4, "input_split_sizes": [1] * 4},
+        )
+    ]
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))
