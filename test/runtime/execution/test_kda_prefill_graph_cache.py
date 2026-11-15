@@ -987,8 +987,9 @@ def test_request_bucket_selection_reserves_dummy_scan_tokens(bs, tokens, expecte
 @pytest.mark.parametrize(
     "sizes,bucket,expected",
     [
-        (None, 8, [1]),
-        (None, 17, [2]),
+        (None, 8, [4]),
+        (None, 17, [4]),
+        (None, 2, [2]),
         ([1, 2, 4], 8, [1, 2, 4]),
         ([1, 2, 4], 2, [1, 2]),
         ([1, 2, 4], 17, [2, 4]),

@@ -1406,8 +1406,8 @@ def probe_arena_floor(
     """Parent blocks a probe arena needs for the widest row the boot fabricates.
 
     Both terms track a knob: the ladder is built from the resolved prefill-graph
-    ceiling, which is a default rather than zero when unset, and a configured
-    capture batch size fabricates that many rows whatever the bucket. Returned
+    ceiling, which is a default rather than zero when unset, and a capture
+    batch size, configured or the default, fabricates that many rows. Returned
     rather than inlined so a test can assert the number instead of the source.
     A narrowing model's decoder ladder (``decoder_rows_per_request`` is its
     ``max_decoder_rows_per_request``, None for other models) fabricates one
@@ -1421,13 +1421,21 @@ def probe_arena_floor(
     from tokenspeed.runtime.execution.model_executor import (
         _resolve_prefill_graph_max_tokens,
     )
+    from tokenspeed.runtime.execution.prefill_graph import (
+        PREFILL_DEFAULT_CAPTURE_REQUESTS,
+    )
     from tokenspeed.runtime.utils.server_args import STEP_SPEC_ALGORITHMS
 
     tokens = max(max_forward_tokens, _resolve_prefill_graph_max_tokens(server_args))
+    capture_batch_sizes = server_args.prefill_graph_capture_batch_sizes
+    if capture_batch_sizes is None:
+        capture_batch_sizes = [
+            min(PREFILL_DEFAULT_CAPTURE_REQUESTS, server_args.max_num_seqs)
+        ]
     return probe_arena_parent_blocks(
         max_forward_tokens=tokens,
         context_len=model_config.context_len,
-        capture_batch_sizes=server_args.prefill_graph_capture_batch_sizes,
+        capture_batch_sizes=capture_batch_sizes,
         decoder_requests=(
             0
             if decoder_rows_per_request is None
