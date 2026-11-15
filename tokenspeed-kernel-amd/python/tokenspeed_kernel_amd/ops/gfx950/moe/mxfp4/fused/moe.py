@@ -316,6 +316,8 @@ A8W4_SORTED_DECODE_ROWS = range(_A8W4_SORTED_STAGE1_MIN_M, _SITU_WARP_DECODE_MAX
 A8W4_SORT_BLOCK_SIZE = 16
 _A8W4_SORTED_XCD_SWIZZLE = 1
 _A8W4_SORTED_STAGE2_N_TILES = 4
+# Through this many tokens, 64-column warp tiles spread W2 over more programs.
+_A8W4_SORTED_STAGE2_NARROW_MAX_M = 48
 
 
 def _select_a8w4_stage2_block_n(num_tokens: int) -> int:
@@ -772,7 +774,9 @@ def gluon_mxfp4_fp8_precomputed_situ(
             (M * TOPK, N), dtype=out_dtype, device=hidden_states.device
         )
         sorted_stage2_num_warps = _A8W4_SORTED_STAGE2_N_TILES
-        sorted_stage2_block_n = 128 * sorted_stage2_num_warps
+        sorted_stage2_block_n = sorted_stage2_num_warps * (
+            64 if M <= _A8W4_SORTED_STAGE2_NARROW_MAX_M else 128
+        )
         sorted_stage2_programs = int(sorted_expert_ids.shape[0]) * triton.cdiv(
             N, sorted_stage2_block_n
         )
