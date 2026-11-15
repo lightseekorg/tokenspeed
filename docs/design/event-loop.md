@@ -99,9 +99,8 @@ The check uses the scheduler's existing request lookup; it does not reclaim
 an id ahead of its in-flight work. Once both owners have released an id, this
 admission guard allows it again.
 
-A zero generation budget still allows prompt prefill and prompt scoring. The
-output processor finishes with an empty completion at the prefill boundary.
-A sampled token can still be used for scheduler or transfer bookkeeping.
+With a zero generation budget, the engine still prefills the prompt and can
+score it, then returns an empty completion.
 
 Each accepted request gets a monotonically increasing admission identity
 before data-plane registration. The output processor allocates it once;
