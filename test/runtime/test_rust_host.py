@@ -31,6 +31,7 @@ import os
 import re
 import signal
 import stat
+import subprocess
 import sys
 import textwrap
 import threading
@@ -91,6 +92,29 @@ from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs  # noqa: E
 # ----------------------------------------------------------------------
 # The launcher's side
 # ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("options", [[], ["--enable-async-logging", "invalid"]])
+def test_rank_host_requires_an_explicit_valid_logging_mode(options):
+    # Argument refusal must happen before the host reads its launch pipe.
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "tokenspeed_engine.host",
+            "--control-fd",
+            "0",
+            "--process-title",
+            "test-rank-host",
+            *options,
+        ],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert result.returncode == 2, result.stderr
+    assert "--enable-async-logging" in result.stderr
 
 
 def test_the_default_engine_is_served():
