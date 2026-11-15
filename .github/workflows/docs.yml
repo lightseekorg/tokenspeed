@@ -16,7 +16,7 @@ on:
       - "test/ci_system/ci_speed_dashboard.py"
   schedule:
     # Refresh the CI speed dashboard (docs/public/ci) with the latest runs.
-    - cron: "17 */6 * * *"
+    - cron: "15 */6 * * *"
   workflow_dispatch:
 
 permissions:
