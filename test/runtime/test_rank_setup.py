@@ -175,6 +175,7 @@ def test_make_config_requires_and_maps_the_host_write_policy():
         max_retracted_requests=0,
         storage_config=None,
         prefill_decode_interval=0,
+        prefill_decode_min_interval=0,
     )
     # Keyword-only and required, with or without a Host tier.
     with pytest.raises(TypeError, match="host_write_policy"):
@@ -197,6 +198,26 @@ def test_the_prefill_decode_interval_reaches_the_scheduler():
     assert cfg.prefill_decode_interval == 64
 
 
+def test_the_prefill_decode_min_interval_reaches_the_scheduler():
+    args = prepare_server_args(
+        [
+            "--model",
+            "x",
+            "--max-num-seqs",
+            "8",
+            "--prefill-decode-interval",
+            "32",
+            "--prefill-decode-min-interval",
+            "2",
+        ]
+    )
+    cfg = _config(
+        args, _specs(num_host_pages=17, num_snapshot_pages=5, max_retracted=8)
+    )
+    assert cfg.prefill_decode_interval == 32
+    assert cfg.prefill_decode_min_interval == 2
+
+
 @pytest.mark.parametrize(
     "flags,error",
     [
@@ -208,6 +229,22 @@ def test_the_prefill_decode_interval_reaches_the_scheduler():
         (
             ["--prefill-decode-interval", "64", "--disaggregation-mode", "decode"],
             "needs --disaggregation-mode null",
+        ),
+        (["--prefill-decode-min-interval", "-1"], "must be non-negative"),
+        (
+            ["--prefill-decode-min-interval", "2", "--disaggregation-mode", "decode"],
+            "needs --disaggregation-mode null",
+        ),
+        (
+            [
+                "--prefill-decode-min-interval",
+                "2",
+                "--prefill-attempt-interval",
+                "4",
+                "--prefill-any-attempt-interval",
+                "64",
+            ],
+            "--prefill-decode-min-interval cannot be combined",
         ),
     ],
 )
@@ -978,6 +1015,7 @@ def test_make_config_sets_the_prefill_chunk_yield_only_when_on():
         storage_config=None,
         host_write_policy="write_through",
         prefill_decode_interval=0,
+        prefill_decode_min_interval=0,
     )
     assert make_config(**fields).prefill_chunk_yield_tokens == 0
     assert (
