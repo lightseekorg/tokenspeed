@@ -112,6 +112,7 @@ def _warmup_indexer(heads: int, device: torch.device, enable_pdl: bool) -> None:
         cache_block_size=64,
         max_decode_tokens=32,
         device=device,
+        logits_dtype=torch.bfloat16,
     )
 
 
@@ -193,11 +194,12 @@ def _paged_scores(
             queries[1].contiguous().unsqueeze(1),
         ),
         kv_cache=_mxfp4_cache_view(cache, page_size),
-        weights=weights.contiguous(),
+        weights=weights.float().contiguous(),
         context_lens=context_lens,
         block_table=table,
         schedule_meta=schedule,
         max_context_len=capacity,
+        logits_dtype=torch.bfloat16,
         indices=indices,
     )
     if prepare_blocks:
@@ -269,6 +271,7 @@ def _dense_scores(
         cu_seq_len_k_start=starts,
         cu_seq_len_k_end=packed_ends,
         max_seqlen_k=capacity,
+        logits_dtype=torch.bfloat16,
     )
     visible = lengths.clamp(0, capacity).to(torch.int32)
     # DeepSelect reads only [0, end); mask holes there without copying logits.
@@ -361,8 +364,7 @@ def index_topk(
     cache = index_cache.as_strided(
         (index_cache.shape[0], 64 * 68), (index_cache.stride(0), 1)
     )
-    # Blackwell MQA logits take BF16 head weights on every scoring path.
-    weight_dtype = torch.bfloat16
+    weight_dtype = torch.bfloat16 if sparse else torch.float32
     if isinstance(index_q, IndexQueryInput):
         queries, weights = triton_dsv41_index_query_rope_quant(
             index_q.values,

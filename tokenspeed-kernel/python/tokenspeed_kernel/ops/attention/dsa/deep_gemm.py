@@ -359,18 +359,15 @@ def _resolve_prefill_tile_max_seqlen_k(
     return int(candidate_lens[start:end].max().item())
 
 
-# DeepGEMM 2.8.2's sm100 MQA logits score block-scaled MX rows with BF16
-# head weights and return BF16 logits; sm90 scores FP8 rows with FP32 scales,
-# weights and logits. Blackwell ``fp8_scaled`` planes store each key's
-# power-of-two scale as four equal UE8M0 bytes (``kvcache/index_k_scale.py``),
-# which the sm100 kernels read as the MX scales of the row's four groups. The
-# FP8 queries keep their per-(token, head) scale folded into the weights and
-# pass unit MX scales, which is exact since relu commutes with a positive scale.
+# DeepGEMM's sm100 MQA logits score block-scaled MX rows; sm90 scores FP8 rows
+# with per-token FP32 scales. Both take FP32 head weights and return FP32
+# logits. Blackwell ``fp8_scaled`` planes store each key's power-of-two scale
+# as four equal UE8M0 bytes (``kvcache/index_k_scale.py``), which the sm100
+# kernels read as the MX scales of the row's four groups. The FP8 queries keep
+# their per-(token, head) scale folded into the weights and pass unit MX
+# scales, which is exact since relu commutes with a positive scale.
 _MX_SCORING = platform.is_blackwell
 _HAS_DEEP_GEMM = platform.is_hopper_plus and has_optional_package("deep_gemm")
-
-# The head weights the platform's MQA logits take: BF16 on sm100, FP32 on sm90.
-_MQA_WEIGHTS_DTYPE = torch.bfloat16 if _MX_SCORING else torch.float32
 
 # Constant sm100 inputs, grown on demand and never freed: graphs captured over
 # an earlier buffer keep replaying from it.
@@ -422,11 +419,6 @@ def _request_rows(rows: int, device: torch.device) -> torch.Tensor | None:
         rows,
         lambda size: torch.arange(size, dtype=torch.int32, device=device),
     )
-
-
-def _fp32_logits(logits: torch.Tensor) -> torch.Tensor:
-    """The logits as the FP32-only selectors read them; a copy of BF16 ones."""
-    return logits if logits.dtype == torch.float32 else logits.float()
 
 
 if _HAS_DEEP_GEMM:
@@ -586,9 +578,7 @@ if _HAS_DEEP_GEMM:
         )
 
         q, weights = _pad_index_heads(q, weights)
-        q_fp8, scaled_weights = quantize_index_query_weights(
-            q, weights, softmax_scale, _MQA_WEIGHTS_DTYPE
-        )
+        q_fp8, scaled_weights = quantize_index_query_weights(q, weights, softmax_scale)
 
         kv_cache = index_k_cache.view(
             -1,
@@ -654,10 +644,11 @@ if _HAS_DEEP_GEMM:
                 topk,
                 next_n=q_len_per_req,
                 out=local_topk_offsets,
+                scan_cols=max_seq_len,
             )
         elif use_ragged:
             ragged_decode_topk(
-                _fp32_logits(logits),
+                logits,
                 local_topk_offsets,
                 topk,
                 lengths=seq_lens,
@@ -668,9 +659,7 @@ if _HAS_DEEP_GEMM:
         else:
             # Batch-invariant selection, or no ragged CUDA top-k: mask each row
             # to its causal window first.
-            _row_invariant_topk(
-                _fp32_logits(logits), row_lengths, local_topk_offsets, topk
-            )
+            _row_invariant_topk(logits, row_lengths, local_topk_offsets, topk)
 
         return local_topk_to_global_slots(
             local_topk_offsets=local_topk_offsets,
@@ -751,9 +740,7 @@ if _HAS_DEEP_GEMM:
         out.fill_(-1)
 
         q, weights = _pad_index_heads(q, weights)
-        q_fp8, scaled_weights = quantize_index_query_weights(
-            q, weights, softmax_scale, _MQA_WEIGHTS_DTYPE
-        )
+        q_fp8, scaled_weights = quantize_index_query_weights(q, weights, softmax_scale)
         if index_k_fp8 is None or index_k_scale is None:
             hd = q.shape[-1]
             num_groups = hd // 128
@@ -799,11 +786,7 @@ if _HAS_DEEP_GEMM:
         if max_logits_bytes is None:
             max_query_rows = tokens
         else:
-            # FP32 logits, plus the BF16 logits they are copied from on sm100.
-            logits_bytes = 6 if _MX_SCORING else 4
-            max_query_rows = max(
-                1, int(max_logits_bytes) // (seq_len_sum * logits_bytes)
-            )
+            max_query_rows = max(1, int(max_logits_bytes) // (seq_len_sum * 4))
         local_starts_i32 = torch.zeros_like(row_starts)
         for start in range(0, tokens, max_query_rows):
             end = min(start + max_query_rows, tokens)
@@ -825,8 +808,10 @@ if _HAS_DEEP_GEMM:
                 row_ends[start:end],
                 max_seqlen_k=max(tile_max_seqlen_k, 1),
             )
-            # The TRT-LLM and lowest-index top-k read FP32.
-            logits = _fp32_logits(logits)
+            # The padded rows as one contiguous matrix: the scrub stays
+            # vectorized and the TRT-LLM top-k, which reads each row's
+            # candidate count, takes it without a copy.
+            logits = _widen_logits_rows(logits)
             logits.nan_to_num_(
                 nan=float("-inf"), posinf=float("-inf"), neginf=float("-inf")
             )
@@ -843,7 +828,7 @@ if _HAS_DEEP_GEMM:
                 tile_out.masked_fill_(tile_out >= tile_lens.view(-1, 1), -1)
             else:
                 torch.ops.trtllm.indexer_topk_prefill(
-                    logits.contiguous(),
+                    logits,
                     local_starts_i32[start:end],
                     candidate_lens[start:end].to(torch.int32).contiguous(),
                     out[start:end],
@@ -910,9 +895,7 @@ if _HAS_DEEP_GEMM:
             # Compacted once per forward, shared by every tile and layer.
             pages, positions, lengths = pages.pages, pages.positions, pages.lengths
         q, weights = _pad_index_heads(q.contiguous(), weights)
-        q_fp8, weights = quantize_index_query_weights(
-            q, weights, softmax_scale, _MQA_WEIGHTS_DTYPE
-        )
+        q_fp8, weights = quantize_index_query_weights(q, weights, softmax_scale)
         if deep_gemm.get_pdl() != pdl_enabled():
             deep_gemm.set_pdl(pdl_enabled())
         # DeepGEMM's scheduler requires nonempty work even when this rank
@@ -934,9 +917,8 @@ if _HAS_DEEP_GEMM:
             pages.shape[1] * page_size,
             indices=rows,
         )
-        # Candidate scores are FP32 for the caller and the selectors alike.
         return _select_dcp_index_candidates(
-            _fp32_logits(logits),
+            logits,
             positions,
             lengths,
             causal_lens,

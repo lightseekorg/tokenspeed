@@ -60,6 +60,7 @@ def _warmup_fp8_fp4_mqa_logits(
     index_head_dim: int,
     device: torch.device,
     max_kv_len: int,
+    logits_dtype: torch.dtype,
 ) -> None:
     """Pre-compile the ragged prefill sparse-indexer kernel."""
     head_dim_bytes = index_head_dim // 2
@@ -72,8 +73,7 @@ def _warmup_fp8_fp4_mqa_logits(
             max_kv_len, head_dim_bytes, dtype=torch.uint8, device=device
         ).view(torch.int8)
         k_scales = torch.zeros(max_kv_len, dtype=torch.int32, device=device)
-        # Blackwell MQA logits take BF16 head weights and return BF16 logits.
-        weights = torch.ones(num_tokens, num_heads, dtype=torch.bfloat16, device=device)
+        weights = torch.ones(num_tokens, num_heads, dtype=torch.float32, device=device)
         cu_start = torch.zeros(num_tokens, dtype=torch.int32, device=device)
         cu_end = torch.full((num_tokens,), max_kv_len, dtype=torch.int32, device=device)
 
@@ -84,6 +84,7 @@ def _warmup_fp8_fp4_mqa_logits(
             cu_seq_len_k_start=cu_start,
             cu_seq_len_k_end=cu_end,
             max_seqlen_k=max_kv_len,
+            logits_dtype=logits_dtype,
         )
 
 
@@ -94,6 +95,7 @@ def _warmup_fp8_fp4_paged_mqa_logits(
     cache_block_size: int,
     max_decode_tokens: int,
     device: torch.device,
+    logits_dtype: torch.dtype,
 ) -> None:
     """Pre-compile paged decode indexer and schedule-metadata kernels."""
     head_dim_bytes = index_head_dim // 2
@@ -115,7 +117,7 @@ def _warmup_fp8_fp4_paged_mqa_logits(
             (num_blocks, cache_block_size, 1, row_bytes),
             (cache_2d.stride(0), row_bytes, row_bytes, 1),
         )
-        weights = torch.ones(num_tokens, num_heads, dtype=torch.bfloat16, device=device)
+        weights = torch.ones(num_tokens, num_heads, dtype=torch.float32, device=device)
         context_lens = torch.full(
             (num_tokens, 1), cache_block_size, dtype=torch.int32, device=device
         )
@@ -137,6 +139,7 @@ def _warmup_fp8_fp4_paged_mqa_logits(
                 block_table=block_table,
                 schedule_meta=schedule_meta,
                 max_context_len=cache_block_size,
+                logits_dtype=logits_dtype,
                 indices=indices,
             )
     torch.cuda.synchronize()
@@ -149,6 +152,7 @@ def warmup_mqa_logits(
     cache_block_size: int,
     max_decode_tokens: int,
     device: torch.device,
+    logits_dtype: torch.dtype,
 ) -> None:
     """Compile packed MQA scoring and paged metadata kernels before capture."""
     _warmup_fp8_fp4_mqa_logits(
@@ -156,6 +160,7 @@ def warmup_mqa_logits(
         index_head_dim=index_head_dim,
         device=device,
         max_kv_len=4096,
+        logits_dtype=logits_dtype,
     )
     _warmup_fp8_fp4_paged_mqa_logits(
         num_heads=num_heads,
@@ -163,4 +168,5 @@ def warmup_mqa_logits(
         cache_block_size=cache_block_size,
         max_decode_tokens=max_decode_tokens,
         device=device,
+        logits_dtype=logits_dtype,
     )

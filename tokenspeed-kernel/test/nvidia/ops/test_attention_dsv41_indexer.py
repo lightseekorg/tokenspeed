@@ -422,7 +422,7 @@ def _check_selection(scores, ends, selected):
 @pytest.mark.parametrize("prepare_blocks", [False, True])
 def test_full_score_bf16_producer_masking_and_selection(paged, prepare_blocks):
     queries, weights, cache, table, lengths, _, api = _sparse_inputs(4, 128, True)
-    weights = weights.to(torch.bfloat16).contiguous()
+    weights = weights.float().contiguous()
     capacity = table.shape[1] * 64
     ends = lengths.clamp(0, capacity).to(torch.int32)
     if paged:
@@ -443,6 +443,7 @@ def test_full_score_bf16_producer_masking_and_selection(paged, prepare_blocks):
             block_table=safe_table,
             schedule_meta=schedule,
             max_context_len=capacity,
+            logits_dtype=torch.float32,
             indices=rows,
         )
         scores, actual_ends, blocks = deep_gemm._paged_scores(
@@ -469,6 +470,7 @@ def test_full_score_bf16_producer_masking_and_selection(paged, prepare_blocks):
             cu_seq_len_k_start=torch.zeros_like(ends),
             cu_seq_len_k_end=ends,
             max_seqlen_k=capacity,
+            logits_dtype=torch.float32,
         )
         # Dense scoring masks the MQA logits in place whether or not block
         # candidates follow; select_candidates then reads the same view.
@@ -782,7 +784,7 @@ def test_full_paged_query_tiles_match_with_large_capacity_in_graph(tokens):
         if invalid_first_page:
             table[::3, 0] = -1
             table[1::3, 1] = cache.shape[0]
-        packed_q, packed_weights = pack_index_inputs(q, weights, torch.bfloat16)
+        packed_q, packed_weights = pack_index_inputs(q, weights, torch.float32)
         api = deep_gemm._api(packed_q)
         reference_ends = lengths.clamp(0, 128).to(torch.int32)
         context_lens = reference_ends[:, None]
@@ -804,6 +806,7 @@ def test_full_paged_query_tiles_match_with_large_capacity_in_graph(tokens):
             block_table=safe_table,
             schedule_meta=schedule,
             max_context_len=128,
+            logits_dtype=torch.float32,
             indices=rows,
         )
         positions = torch.arange(128, device="cuda")[None, :]
