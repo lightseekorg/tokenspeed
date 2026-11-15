@@ -1381,9 +1381,9 @@ class MuseSparkMoE(nn.Module):
         # Decode-sized batches route in the top-k kernel; each token count keeps its own GEMM workspace.
         self.prepared_routing: dict[int, PreparedNvfp4Routing] = {}
         self.iris_state: MuseIrisState | None = None
-        self.nccl_owned_rows = (
+        self.nccl_owned_rows: _NcclOwnedRows | None = (
             _NcclOwnedRows(mapping.attn.tp_group)
-            if mapping.attn.tp_size > 1 and not current_platform().is_cdna4
+            if mapping.attn.tp_size > 1 and current_platform().is_nvidia
             else None
         )
         # On NVIDIA the routed-sum kernel all-reduces decode batches over EP through this mailbox.
@@ -2171,9 +2171,9 @@ class MuseSparkDecoderLayer(nn.Module):
             config.hidden_size, self.residual_gate_temperature
         )
         self.iris_state: MuseIrisState | None = None
-        self.nccl_owned_rows = (
+        self.nccl_owned_rows: _NcclOwnedRows | None = (
             _NcclOwnedRows(mapping.attn.tp_group)
-            if mapping.attn.tp_size > 1 and not current_platform().is_cdna4
+            if mapping.attn.tp_size > 1 and current_platform().is_nvidia
             else None
         )
 
@@ -2504,9 +2504,9 @@ class MuseSparkModel(BaseTransformerModel):
             weight_offset=OUTPUT_GAIN_OFFSET,
         )
         self.iris_state: MuseIrisState | None = None
-        self.nccl_owned_rows = (
+        self.nccl_owned_rows: _NcclOwnedRows | None = (
             _NcclOwnedRows(mapping.attn.tp_group)
-            if mapping.attn.tp_size > 1 and not current_platform().is_cdna4
+            if mapping.attn.tp_size > 1 and current_platform().is_nvidia
             else None
         )
         # The state that the monokernel layers share (--decode-monokernel),
