@@ -114,7 +114,8 @@ def expand_block_table_rows(
         raise ValueError("block tables beyond 2**31 entries need int64 row fields")
     if not rows.shape[0] or not out.numel():
         return
-    if not out.is_cuda and out.device.type != "npu":
+    # The Triton implementation can corrupt ragged block tables on Ascend NPU.
+    if not out.is_cuda:
         _expand_block_table_rows_torch(rows, values, out)
         return
     tiles = triton.cdiv(out.numel(), _BLOCK)

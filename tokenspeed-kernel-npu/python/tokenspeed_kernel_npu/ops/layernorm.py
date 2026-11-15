@@ -66,13 +66,8 @@ def qk_rmsnorm(
     if q.shape[-1] % head_dim or k.shape[-1] % head_dim:
         raise ValueError("q and k widths must be divisible by the head dimension")
 
-    q_shape, k_shape = q.shape, k.shape
-    q_heads = q.reshape(-1, q.shape[-1] // head_dim, head_dim)
-    k_heads = k.reshape(-1, k.shape[-1] // head_dim, head_dim)
-    q_scale = torch.rsqrt(q_heads.float().square().mean(-1, keepdim=True) + eps)
-    k_scale = torch.rsqrt(k_heads.float().square().mean(-1, keepdim=True) + eps)
-    q_out = (q_heads * q_scale.to(q.dtype) * q_weight).reshape(q_shape)
-    k_out = (k_heads * k_scale.to(k.dtype) * k_weight).reshape(k_shape)
+    q_out = rmsnorm(q.reshape(-1, head_dim), q_weight, eps).reshape_as(q)
+    k_out = rmsnorm(k.reshape(-1, head_dim), k_weight, eps).reshape_as(k)
     return q_out, k_out
 
 

@@ -534,6 +534,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             max_seqlen_k=self.max_context_len,
             max_seqlen_q=max_seqlen_q,
             schedule=schedule,
+            block_draft=self.draft_block_decode,
             solution=self.kernel_solution,
             **scale_kwargs,
         )

@@ -7,6 +7,11 @@ AMD package layout and keeps the TokenSpeed runtime vendor-neutral.
 The initial Ascend path provides paged MHA, RMSNorm, Q/K RMSNorm, rotary
 embedding, and the Triton-Ascend import adapter required by CANN 9.0.0.
 
+Per-head Q/K normalization uses native RMSNorm. RoPE supports K-only updates
+and casts only the cache rows selected by the current positions. Block-draft
+MHA dispatch exposes a `block_draft` trait so providers can register noncausal
+block implementations without changing ordinary decode calls.
+
 For development from this repository:
 
 ```bash

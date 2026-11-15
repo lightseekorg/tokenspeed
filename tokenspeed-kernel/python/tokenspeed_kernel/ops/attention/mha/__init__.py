@@ -528,6 +528,8 @@ def mha_decode_with_kvcache(
     # dispatch options
     override: str | None = None,
     solution: str | None = None,
+    *,
+    block_draft: bool = False,
 ) -> AttentionResult:
     """MHA decode with paged KV cache.
 
@@ -563,6 +565,7 @@ def mha_decode_with_kvcache(
             only kernels that read one.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
+        block_draft: Select noncausal draft-block attention via its trait.
     """
     signature, scale_kwargs, traits = _decode_selection(
         q,
@@ -579,6 +582,7 @@ def mha_decode_with_kvcache(
         v_scale,
         fp8_kv_scales,
     )
+    traits["block_draft"] = block_draft
     schedule_kwargs = {}
     if schedule is not None:
         schedule_kwargs["schedule"] = schedule
