@@ -2134,10 +2134,11 @@ release and recapture remain the orchestrator's responsibility.
 
 Replay uses a captured request capacity; live counts, row identities and
 lengths can change. The outer owner captures request capacities from
-`prefill_graph_capture_batch_sizes` (unset: the minimum count per token bucket)
+`prefill_graph_capture_batch_sizes` (unset: 4 requests, capped by `max_num_seqs`
+per DP rank and the bucket, and at least the minimum count per token bucket)
 with one variant per token bucket and request count. `ModelExecutorConfig`
 requires this field explicitly: factories forward the configured list or `None`
-for the minimum-count policy, so missing configuration wiring fails at
+for the default, so missing configuration wiring fails at
 construction. Token buckets still follow the shared prefill token ladder.
 Capture requests have positive lengths and fit the model context and request
 buffers. At replay, unused execution slots have zero convolution length,
