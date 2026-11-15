@@ -29,7 +29,11 @@ from functools import partial
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import torch
-from tokenspeed_kernel.ops.gemm.hipblaslt import load_hipblaslt_tuned_solutions
+from tokenspeed_kernel.ops.gemm.hipblaslt import (
+    hipblaslt_autotune_enabled,
+    hipblaslt_online_tuning,
+    load_hipblaslt_tuned_solutions,
+)
 from tokenspeed_kernel.ops.metadata import advance_accepted_frontier
 from tokenspeed_kernel.ops.metadata.ngram import commit_ngram_inputs
 from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
@@ -1321,6 +1325,16 @@ class ModelExecutor:
                                     self.forward_step.max_decode_bs,
                                 ),
                             ),
+                            graph_phase=False,
+                        )
+                if hipblaslt_autotune_enabled() and not self.config.prefill_only:
+                    # TOKENSPEED_HIPBLASLT_AUTOTUNE=1: one eager decode step per
+                    # captured batch size tunes the dense GEMMs the tuned file
+                    # does not list, so capture records the picks. Tuning ends
+                    # with the block, before any graph is captured.
+                    with hipblaslt_online_tuning():
+                        self.forward_step.warmup_decode_path(
+                            batch_sizes=tuple(self.forward_step.capture_bs),
                             graph_phase=False,
                         )
                 if self._samples_from_vocab_shard:

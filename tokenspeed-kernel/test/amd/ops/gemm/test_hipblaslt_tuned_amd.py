@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Offline-tuned TunableOp BLAS solutions: loading, stack check and numerics."""
+"""TunableOp BLAS solutions: loading, stack check, numerics and online tuning."""
 
 from __future__ import annotations
 
@@ -210,4 +210,48 @@ def test_serving_leaves_file_unchanged(tuned_file, tmp_path):
         cwd=tmp_path,
     )
     assert open(tuned_file, "rb").read() == before
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_online_tuning_adds_unlisted_gemms_in_memory(tuned_file, tmp_path):
+    before = open(tuned_file, "rb").read()
+    listed = next(
+        line.split(",")[2] for line in before.decode().splitlines() if "tn_" in line
+    )
+    _run_fresh_process(
+        "import torch\n"
+        "from tokenspeed_kernel.ops.gemm.hipblaslt import (\n"
+        "    hipblaslt_online_tuning, load_hipblaslt_tuned_solutions)\n"
+        "tunable = torch.cuda.tunable\n"
+        f"assert load_hipblaslt_tuned_solutions({tuned_file!r})\n"
+        f"w = torch.randn({N}, {K}, device='cuda', dtype=torch.bfloat16)\n"
+        "def mm(m):\n"
+        f"    torch.mm(torch.randn(m, {K}, device='cuda', dtype=torch.bfloat16), w.t())\n"
+        "with hipblaslt_online_tuning():\n"
+        f"    mm({TUNED_M}); mm({UNTUNED_M})\n"
+        "assert tunable.is_enabled() and not tunable.tuning_is_enabled()\n"
+        "mm(80)\n"
+        "results = {r[1]: r[2] for r in tunable.get_results()}\n"
+        # The listed GEMM keeps its solution; the unlisted one in the block is
+        # tuned; one after the block is not.
+        f"assert results.pop('tn_{N}_{TUNED_M}_{K}_ld_{K}_{K}_{N}') == {listed!r}\n"
+        f"assert list(results) == ['tn_{N}_{UNTUNED_M}_{K}_ld_{K}_{K}_{N}'], results\n",
+        cwd=tmp_path,
+    )
+    assert open(tuned_file, "rb").read() == before
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_online_tuning_without_file(tmp_path):
+    _run_fresh_process(
+        "import torch\n"
+        "from tokenspeed_kernel.ops.gemm.hipblaslt import hipblaslt_online_tuning\n"
+        "with hipblaslt_online_tuning():\n"
+        f"    x = torch.randn({UNTUNED_M}, {K}, device='cuda', dtype=torch.bfloat16)\n"
+        f"    w = torch.randn({N}, {K}, device='cuda', dtype=torch.bfloat16)\n"
+        "    torch.mm(x, w.t())\n"
+        "assert len(torch.cuda.tunable.get_results()) == 1\n",
+        cwd=tmp_path,
+    )
+    # Nothing written, not even TunableOp's default file in the working dir.
     assert list(tmp_path.iterdir()) == []

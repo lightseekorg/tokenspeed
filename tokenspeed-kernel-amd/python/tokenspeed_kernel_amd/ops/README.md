@@ -82,7 +82,8 @@ Serving loads the file of its GPU automatically, through
 `tokenspeed_kernel.ops.gemm.hipblaslt`, once per process and before graph
 capture; `ops/gemm/hipblaslt.py` replays it read-only through PyTorch
 TunableOp. GEMMs the file does not list keep the default solution. Serving
-never tunes or rewrites the file. A GPU without a file keeps the defaults.
+never rewrites the file, and tunes only with the opt-in switch below. A GPU
+without a file keeps the defaults.
 
 A results file is valid only for the PyTorch, HIP, hipBLASLt and rocBLAS
 versions and the GPU architecture stamped in its `Validator` rows. On any
@@ -104,6 +105,19 @@ the tool stops, and the file must be deleted to re-tune. Tuning rotates
 weight copies through `--cold-bytes`, so each timing reads the weight from
 HBM as a serving step does. Another solution can sum K in another order, so
 results differ from the default within BF16 rounding.
+
+To cover GEMMs the file does not list without regenerating it, such as a new
+model or a new stack, set `TOKENSPEED_HIPBLASLT_AUTOTUNE=1` (off by default).
+During kernel warmup, before graph capture, serving then runs one eager
+decode step per captured batch size inside `hipblaslt_online_tuning()`:
+TunableOp times every solution of each GEMM it has no entry for, with the
+same rotating cold-weight buffer as the tool (512 MiB), and keeps the
+fastest. GEMMs the file lists are not re-timed, and a file from another stack
+is still ignored, so then every GEMM of those steps is tuned. Tuning stops
+before capture; the picks stay in the process and nothing is written, the
+committed file included. The cost is startup time on every start and every
+rank, and picks may differ between starts and ranks within BF16 rounding;
+commit the file with the tool above to fix them.
 
 ### gfx950 BF16 projections with FP32 output
 

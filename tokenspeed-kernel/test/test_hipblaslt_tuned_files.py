@@ -18,10 +18,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Committed TunableOp BLAS files and their lookup; runs without a GPU."""
+"""Committed TunableOp BLAS files, their lookup and the online-tuning switch; no GPU."""
 
 from __future__ import annotations
 
+import contextlib
 import glob
 import os
 from unittest.mock import patch
@@ -113,3 +114,111 @@ def test_default_load_runs_once_per_process():
         load.assert_called_once_with()
     finally:
         hipblaslt._load_default.cache_clear()
+
+
+class _FakeTunable:
+    """The ``torch.cuda.tunable`` calls online tuning makes, with their state."""
+
+    def __init__(self, *, enabled: bool, results: int):
+        self.enabled = enabled
+        self.tuning = False
+        self.filename = "committed.csv" if enabled else ""
+        self.rotating_mb = 0
+        self.results = [("op", "params", "solution", 1.0)] * results
+        self.calls = []
+
+    def is_enabled(self):
+        return self.enabled
+
+    def enable(self, value):
+        self.calls.append(("enable", value))
+        self.enabled = value
+
+    def tuning_enable(self, value):
+        self.calls.append(("tuning_enable", value))
+        self.tuning = value
+
+    def record_untuned_enable(self, value):
+        self.calls.append(("record_untuned_enable", value))
+
+    def set_filename(self, name, insert_device_ordinal=False):
+        self.calls.append(("set_filename", name))
+        self.filename = name
+
+    def get_rotating_buffer_size(self):
+        return self.rotating_mb
+
+    def set_rotating_buffer_size(self, mb):
+        self.rotating_mb = mb
+
+    def get_results(self):
+        return self.results
+
+
+@contextlib.contextmanager
+def _patched_tunable(fake):
+    with (
+        patch.object(torch.cuda, "tunable", fake),
+        patch.object(torch.cuda, "synchronize"),
+    ):
+        yield
+
+
+def test_online_tuning_extends_loaded_file_in_memory():
+    fake = _FakeTunable(enabled=True, results=30)
+    with _patched_tunable(fake):
+        with hipblaslt_amd.hipblaslt_online_tuning(cold_bytes=512 * 2**20):
+            assert fake.tuning and fake.enabled
+            # New results go nowhere on disk; the committed file stays as is.
+            assert fake.filename == os.devnull
+            assert fake.rotating_mb == 512
+            fake.results = fake.results + [("op", "new", "solution", 1.0)]
+    assert not fake.tuning and fake.enabled  # replay continues
+    assert fake.filename == os.devnull
+    assert fake.rotating_mb == 0
+    # The loaded file's TunableOp state is kept, not reset.
+    assert ("enable", True) not in fake.calls
+
+
+def test_online_tuning_without_file_avoids_default_file():
+    fake = _FakeTunable(enabled=False, results=0)
+    with _patched_tunable(fake):
+        with hipblaslt_amd.hipblaslt_online_tuning():
+            assert fake.tuning and fake.enabled
+    # The file name is set before TunableOp's first lookup reads it.
+    assert fake.calls.index(("set_filename", os.devnull)) < fake.calls.index(
+        ("enable", True)
+    )
+    assert not fake.tuning and fake.enabled
+
+
+def test_online_tuning_stops_on_error():
+    fake = _FakeTunable(enabled=True, results=30)
+    with _patched_tunable(fake):
+        with pytest.raises(RuntimeError):
+            with hipblaslt_amd.hipblaslt_online_tuning():
+                raise RuntimeError("warmup failed")
+    assert not fake.tuning and fake.rotating_mb == 0
+
+
+@pytest.mark.parametrize(
+    "hip, env, expected",
+    [("7.2", None, False), ("7.2", "0", False), ("7.2", "1", True), (None, "1", False)],
+)
+def test_autotune_flag(monkeypatch, hip, env, expected):
+    if env is None:
+        monkeypatch.delenv(hipblaslt.AUTOTUNE_ENV, raising=False)
+    else:
+        monkeypatch.setenv(hipblaslt.AUTOTUNE_ENV, env)
+    with patch.object(torch.version, "hip", hip):
+        assert hipblaslt.hipblaslt_autotune_enabled() is expected
+
+
+def test_online_tuning_is_noop_off_rocm():
+    with (
+        patch.object(torch.version, "hip", None),
+        patch.object(hipblaslt_amd, "hipblaslt_online_tuning") as online,
+    ):
+        with hipblaslt.hipblaslt_online_tuning():
+            pass
+    online.assert_not_called()

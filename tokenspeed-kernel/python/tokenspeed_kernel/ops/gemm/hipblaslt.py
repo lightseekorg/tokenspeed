@@ -24,18 +24,33 @@ The runtime entry point. The tuned files (one per GPU, in-repo), loading, the
 stack check and the tuning tool live in
 ``tokenspeed_kernel_amd.ops.gemm.hipblaslt``; this module only keeps that
 AMD package out of non-ROCm processes.
+
+With ``TOKENSPEED_HIPBLASLT_AUTOTUNE=1`` (off by default), serving also tunes
+the GEMMs of its warmup decode steps that the loaded file does not list,
+before graph capture, and keeps the picks in the process
+(``hipblaslt_online_tuning``).
 """
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import logging
+import os
+from typing import ContextManager
 
 import torch
 
-__all__ = ["load_hipblaslt_tuned_solutions"]
+__all__ = [
+    "AUTOTUNE_ENV",
+    "hipblaslt_autotune_enabled",
+    "hipblaslt_online_tuning",
+    "load_hipblaslt_tuned_solutions",
+]
 
 logger = logging.getLogger(__name__)
+
+AUTOTUNE_ENV = "TOKENSPEED_HIPBLASLT_AUTOTUNE"
 
 
 def load_hipblaslt_tuned_solutions(path: str | None = None) -> bool:
@@ -76,3 +91,23 @@ def _load_default() -> bool:
     )
 
     return load_amd()
+
+
+def hipblaslt_autotune_enabled() -> bool:
+    """Whether ``TOKENSPEED_HIPBLASLT_AUTOTUNE=1`` on a ROCm build."""
+    return torch.version.hip is not None and os.environ.get(AUTOTUNE_ENV, "0") == "1"
+
+
+def hipblaslt_online_tuning() -> ContextManager[None]:
+    """Tune, inside the block, the GEMMs no loaded file lists (ROCm only).
+
+    See ``tokenspeed_kernel_amd.ops.gemm.hipblaslt.hipblaslt_online_tuning``.
+    Run it outside graph capture. A no-op context off ROCm.
+    """
+    if torch.version.hip is None:
+        return contextlib.nullcontext()
+    from tokenspeed_kernel_amd.ops.gemm.hipblaslt import (
+        hipblaslt_online_tuning as online_tuning,
+    )
+
+    return online_tuning()

@@ -37,6 +37,10 @@ Serving loads the file of its GPU read-only:
   rocBLAS or GPU architecture, is skipped as a whole (logged once), and every
   GEMM keeps the defaults.
 
+Opt-in online tuning, ``hipblaslt_online_tuning``, times the GEMMs no loaded
+file lists while a block runs (serving runs its warmup decode steps there,
+before graph capture) and keeps the picks in the process; it writes no file.
+
 Generate or extend the file with
 ``python -m tokenspeed_kernel_amd.ops.gemm.hipblaslt`` (see ``--help``) on the
 GPU and software stack that serves.
@@ -45,15 +49,19 @@ GPU and software stack that serves.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import logging
 import math
 import os
+import time
+from typing import Iterator
 
 import torch
 
 __all__ = [
     "TUNED_CONFIG_DIR",
     "hipblaslt_file_validators",
+    "hipblaslt_online_tuning",
     "hipblaslt_tuned_file",
     "load_hipblaslt_tuned_solutions",
     "tune_hipblaslt_solutions",
@@ -179,6 +187,54 @@ def load_hipblaslt_tuned_solutions(path: str | None = None) -> bool:
         f"from {path}"
     )
     return True
+
+
+@contextlib.contextmanager
+def hipblaslt_online_tuning(cold_bytes: int = 512 * 2**20) -> Iterator[None]:
+    """Tune, in this process, the GEMMs no loaded file lists.
+
+    Inside the block, the first ``torch.mm``-family GEMM of each new shape,
+    layout and dtype times every hipBLASLt and rocBLAS solution TunableOp
+    offers and keeps the fastest; GEMMs already loaded (such as from
+    ``load_hipblaslt_tuned_solutions``) are not re-timed. As in the offline
+    tool, operands rotate through ``cold_bytes`` of copies, so each timing
+    reads the weight from HBM. On exit tuning stops and TunableOp stays on,
+    so later GEMMs replay the loaded and the new solutions and other GEMMs
+    keep the default. The new solutions live in this process only: no file
+    is written, the committed one included. Use it outside graph capture.
+
+    Args:
+        cold_bytes: Rotating buffer size in bytes while tuning.
+
+    Yields:
+        None.
+    """
+    tunable = torch.cuda.tunable
+    if not tunable.is_enabled():
+        # No file loaded. Point TunableOp away from its default file in the
+        # working directory before its first lookup reads it.
+        tunable.set_filename(os.devnull, insert_device_ordinal=False)
+        tunable.record_untuned_enable(False)
+        tunable.enable(True)
+    loaded = len(tunable.get_results())
+    # TunableOp appends each new result to its file as it tunes; os.devnull
+    # keeps them in memory and the loaded file unchanged. The loaded entries
+    # stay in memory, so the file name is not restored.
+    tunable.set_filename(os.devnull, insert_device_ordinal=False)
+    rotating_mb = tunable.get_rotating_buffer_size()
+    tunable.set_rotating_buffer_size(math.ceil(cold_bytes / 2**20))
+    tunable.tuning_enable(True)
+    tic = time.perf_counter()
+    try:
+        yield
+    finally:
+        torch.cuda.synchronize()
+        tunable.tuning_enable(False)
+        tunable.set_rotating_buffer_size(rotating_mb)
+        logger.info(
+            f"Tuned {len(tunable.get_results()) - loaded} BLAS solutions "
+            f"(TunableOp) online in {time.perf_counter() - tic:.1f}s"
+        )
 
 
 def tune_hipblaslt_solutions(

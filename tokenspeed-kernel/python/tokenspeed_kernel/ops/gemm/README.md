@@ -190,6 +190,14 @@ tuning tool are in `tokenspeed-kernel-amd`
 (`tokenspeed_kernel_amd.ops.gemm`, documented in that package's
 `ops/README.md`).
 
+With `TOKENSPEED_HIPBLASLT_AUTOTUNE=1` (off by default), serving also tunes
+the dense GEMMs the file does not list. During kernel warmup, before graph
+capture, it runs one eager decode step per captured batch size with TunableOp
+tuning on, so each new GEMM times every hipBLASLt and rocBLAS solution on
+rotating cold weights and keeps the fastest. Tuning stops before capture, and
+the picks stay in the process: no file is written. Each start, and each rank,
+pays the tuning time again.
+
 ## Per-token/per-channel FP8
 
 Per-channel FP8 projections use FP8 E4M3 weights with FP32 scales per output
