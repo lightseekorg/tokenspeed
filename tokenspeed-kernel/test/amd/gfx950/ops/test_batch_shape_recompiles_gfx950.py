@@ -186,6 +186,53 @@ def test_mha_prefill_batch_size(window_left, skip_softmax_threshold):
             _check_batch_matches_single_requests(run, lengths, out, lse)
 
 
+@pytest.mark.parametrize("window_left", [-1, 100])
+def test_rel_mha_prefill_batch_size(window_left):
+    from tokenspeed_kernel_amd.ops.gfx950.attention.rmha import prefill
+
+    heads, kv_heads, dim, rel_extent = 32, 8, 128, 512
+
+    def run(lengths, single=None):
+        q, k, v, cu, cu_gpu = _prefill_inputs(heads, kv_heads, dim, lengths)
+        # Seeded apart from Q, K and V, so the bias is not a copy of Q.
+        generator = torch.Generator(device=DEVICE).manual_seed(1000 + len(lengths))
+        rel_logits = torch.randn(
+            cu[-1],
+            heads,
+            rel_extent,
+            device=DEVICE,
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        if single is not None:
+            rows = slice(cu[single], cu[single + 1])
+            q, k, v, rel_logits = q[rows], k[rows], v[rows], rel_logits[rows]
+            lengths = [lengths[single]]
+            cu = [0, lengths[0]]
+            cu_gpu = torch.tensor(cu, dtype=torch.int32, device=DEVICE)
+        return prefill.launch_gluon_rel_mha_prefill_gfx950(
+            q,
+            k,
+            v,
+            rel_logits,
+            cu_gpu,
+            cu,
+            max(lengths),
+            window_left=window_left,
+            return_lse=True,
+        )
+
+    # The batch size and longest query length are unspecialized: one compile.
+    run([5])
+    with assert_no_triton_compile(
+        prefill.gluon_rel_mha_prefill_gfx950,
+        prefill.gluon_rel_mha_prefill_sliding_gfx950,
+    ):
+        for lengths in _PREFILL_BATCHES:
+            out, lse = run(lengths)
+            _check_batch_matches_single_requests(run, lengths, out, lse)
+
+
 @pytest.mark.parametrize("window", [-1, 127])
 def test_mha_prefill_token_stride_and_request_count(window):
     from tokenspeed_kernel.numerics.torch.attention.mha import torch_dense_attention
