@@ -400,7 +400,6 @@ def test_runner_arms_mega_moe_counts_only_for_whole_batch_layouts(
         query_shard_size=1,
         query_shard_rank=0,
         enable_memory_saver=False,
-        enable_drafter_prefill_graph=False,
         data_parallel_size=world_size // attn_tp_size,
         attention_tp_size=attn_tp_size,
         moe_tp_ep_size=moe_ep_size,
