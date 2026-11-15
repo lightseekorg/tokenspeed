@@ -333,6 +333,10 @@ class DFlash(BaseDrafter):
         self.draft_seq_lens_buf = torch.zeros(
             (max_bs,), dtype=torch.int32, device=self.device
         )
+        # Block-end lengths: each request's prefix plus the draft query width.
+        self.draft_block_end_lens_buf = torch.zeros(
+            (max_bs,), dtype=torch.int32, device=self.device
+        )
         # None means probed-and-unavailable; unset means not probed yet.
         self._dist_argmax_state: object = _UNSET
         self.draft_input_lengths_buf = torch.full(
@@ -1420,7 +1424,9 @@ class DFlash(BaseDrafter):
         bs = current_tokens.shape[0]
         req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
         prefix_lens = self.draft_seq_lens_buf[:bs]
-        seq_lens_after = prefix_lens + self.draft_query_width
+        seq_lens_after = self.draft_block_end_lens_buf[:bs]
+        if not prepared:
+            torch.add(prefix_lens, self.draft_query_width, out=seq_lens_after)
 
         block_ids = self.block_ids_buf[:bs]
         # NOTE: callers (run) write current_tokens directly into
@@ -1547,6 +1553,7 @@ class DFlash(BaseDrafter):
                 req_pool_indices=self.input_buffers.req_pool_indices_buf[:bs],
                 valid_cache_lengths=self.runtime_states.valid_cache_lengths,
                 draft_seq_lens=self.draft_seq_lens_buf[:bs],
+                block_end_lens=self.draft_block_end_lens_buf[:bs],
                 block_ids=self.block_ids_buf[:bs],
                 block_positions=self.block_positions_buf[:bs],
                 verify_width=self.spec_num_tokens,
