@@ -29,7 +29,9 @@ Usage:
     python -m pytest test/runtime/distributed/test_eagle4_candidate_head_tp.py -v
 """
 
+import faulthandler
 import os
+import signal
 import sys
 import time
 
@@ -156,6 +158,8 @@ def _check_greedy_candidate(rank, world_size, device):
 
 
 def _worker(rank, world_size, rendezvous, error_dict):
+    # The test asks a stuck rank for its stacks before killing it.
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
     try:
         device = torch.device(f"cuda:{rank}")
         torch.cuda.set_device(device)
@@ -191,14 +195,20 @@ def test_two_ranks_pick_the_best_of_their_gathered_candidates(tmp_path):
         nprocs=2,
         join=False,
     )
-    # A rank that fails leaves its peer waiting; report it instead of hanging.
+    # A stuck rank prints its stacks and the test fails instead of hanging.
     deadline = time.monotonic() + JOIN_SECONDS
     while not ranks.join(timeout=5):
         if time.monotonic() > deadline:
             for process in ranks.processes:
+                if process.is_alive():
+                    os.kill(process.pid, signal.SIGUSR1)
+            time.sleep(5)
+            for process in ranks.processes:
                 process.kill()
+            peer = torch.cuda.can_device_access_peer(0, 1)
             raise RuntimeError(
-                f"ranks still running after {JOIN_SECONDS} s; reported: {dict(error_dict)}"
+                f"ranks still running after {JOIN_SECONDS} s (peer access {peer}); "
+                f"reported: {dict(error_dict)}"
             )
     if error_dict:
         raise RuntimeError("\n".join(f"rank {r}: {e}" for r, e in error_dict.items()))
