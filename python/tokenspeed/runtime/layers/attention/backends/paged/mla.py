@@ -676,7 +676,9 @@ class MLAAttnBackend(PagedAttentionBackend):
             self.forward_decode_metadata = metadata
             return
         # clamp_min(1) is the identity, so the verify clamp is unconditional.
-        self.seq_lens_buf[:bs].copy_(seq_lens[:bs].clamp_min(metadata.q_len_per_req))
+        torch.clamp_min(
+            seq_lens[:bs], metadata.q_len_per_req, out=self.seq_lens_buf[:bs]
+        )
         num_pages = page_table.shape[1]
         self.page_table_buf[:bs, :num_pages].copy_(page_table[:bs])
         if self._dcp_active:
