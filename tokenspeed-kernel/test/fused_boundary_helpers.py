@@ -113,7 +113,7 @@ def armed_blocks(rows: torch.Tensor, capacity: int, blocks: int) -> torch.Tensor
 
 def assert_child_keeps_waiting(setup: str, word: int, empty: int) -> None:
     """Assert a child consuming a word with one sentinel half left never finishes."""
-    # ``setup`` defines ``mailbox`` (one block of two rows), ``row`` and ``consume()``; streams serialize in-process.
+    # ``setup`` defines ``mailbox``, ``row`` and ``consume()``; streams serialize in-process.
     with tempfile.TemporaryDirectory() as scratch:
         marker = Path(scratch) / "reached"
         script = _WAITER.format(setup=setup, word=word, empty=empty, marker=str(marker))

@@ -856,9 +856,9 @@ def rmsnorm_nvfp4_quant(
 
     Args:
         x: BF16 rows ``[rows, width]`` with ``width`` a multiple of 16; with
-            a sentinel, the mailbox's first ``rows`` of each block, a
-            ``[blocks, rows, block_width]`` view whose rows are the blocks'
-            rows side by side, of a power-of-two width.
+            a sentinel, a ``[blocks, rows, block_width]`` view of each block's
+            first ``rows``, read as the blocks' rows side by side; the block
+            width and the side-by-side row width are powers of two.
         weight: Learned affine norm weight ``[width]``.
         eps: Epsilon added to the variance.
         weight_offset: Center added to the checkpoint weight.
