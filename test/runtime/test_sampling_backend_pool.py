@@ -3,7 +3,7 @@
 Locks the sampling backend's per-slot state machine:
 
     prepare_step(rids, pool_indices, sp_list)
-      ├─ flip detection against ``_last_rid_per_slot``
+      ├─ flip detection against ``_last_admission_per_slot``
       ├─ _reset_slot(p, sp) — scatter scalars, counts, logit_bias, gen
       └─ _prepare_step_hook — coin refill (if coin-owning backend)
 
@@ -132,7 +132,7 @@ def _assert_logit_bias_h2d_is_async(backend) -> None:
         busy = busy @ busy
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
         backend.prepare_step(
-            request_ids=["bias"],
+            admission_ids=[29],
             request_pool_indices=[5],
             sampling_params_list=[sp],
         )
@@ -162,11 +162,10 @@ class TestGreedyNoPoolState:
 
     def test_prepare_step_is_noop(self):
         b = GreedySamplingBackend(_make_config())
-        assert not (b._HAS_POOL_STATE)
-        assert not (hasattr(b, "_last_rid_per_slot"))
+        assert b.slot_state_bytes() == 0
         # Must not raise even with nonsensical inputs — short-circuits.
         b.prepare_step(
-            request_ids=["a", "b"],
+            admission_ids=[1, 2],
             request_pool_indices=[999, -1],  # would fail bounds check otherwise
             sampling_params_list=[_sp("a"), _sp("b")],
         )
@@ -189,12 +188,12 @@ class TestFlashInferFlipDetection:
         sp_a = _sp("a", temperature=0.7, top_k=50, top_p=0.9, seed=42)
         sp_b = _sp("b", temperature=1.2, top_k=20, top_p=0.8, seed=123)
         self.backend.prepare_step(
-            request_ids=["a", "b"],
+            admission_ids=[1, 2],
             request_pool_indices=[1, 3],
             sampling_params_list=[sp_a, sp_b],
         )
-        assert (self.backend._last_rid_per_slot[1]) == ("a")
-        assert (self.backend._last_rid_per_slot[3]) == ("b")
+        assert (self.backend._last_admission_per_slot[1]) == 1
+        assert (self.backend._last_admission_per_slot[3]) == 2
         _pytest_first_1 = self.backend._temperature_pool[1].item()
         _pytest_second_2 = 0.7
         _pytest_places_3 = 3
@@ -238,7 +237,7 @@ class TestFlashInferFlipDetection:
         a second time. Guard against an off-by-one in the comparison."""
         sp_a = _sp("a", temperature=0.7)
         self.backend.prepare_step(
-            request_ids=["a"],
+            admission_ids=[1],
             request_pool_indices=[2],
             sampling_params_list=[sp_a],
         )
@@ -247,7 +246,7 @@ class TestFlashInferFlipDetection:
         # will be overwritten.
         self.backend._temperature_pool[2] = 9.999
         self.backend.prepare_step(
-            request_ids=["a"],
+            admission_ids=[1],
             request_pool_indices=[2],
             sampling_params_list=[sp_a],
         )
@@ -264,18 +263,18 @@ class TestFlashInferFlipDetection:
         overwritten, new generator seeded."""
         sp_a = _sp("a", temperature=0.7, seed=1)
         self.backend.prepare_step(
-            request_ids=["a"],
+            admission_ids=[1],
             request_pool_indices=[2],
             sampling_params_list=[sp_a],
         )
         gen_a = self.backend._cpu_generator_per_slot[2]
         sp_b = _sp("b", temperature=0.3, seed=99)
         self.backend.prepare_step(
-            request_ids=["b"],
+            admission_ids=[2],
             request_pool_indices=[2],
             sampling_params_list=[sp_b],
         )
-        assert (self.backend._last_rid_per_slot[2]) == ("b")
+        assert (self.backend._last_admission_per_slot[2]) == 2
         _pytest_first_17 = self.backend._temperature_pool[2].item()
         _pytest_second_18 = 0.3
         _pytest_places_19 = 3
@@ -293,7 +292,7 @@ class TestTritonRouteSelection:
 
     def test_no_filter_step_selects_triton_gumbel(self):
         self.backend.prepare_step(
-            request_ids=["a", "b"],
+            admission_ids=[1, 2],
             request_pool_indices=[1, 2],
             sampling_params_list=[_sp("a", top_k=-1, top_p=1.0), _sp("b", top_k=-1)],
         )
@@ -301,7 +300,7 @@ class TestTritonRouteSelection:
 
     def test_finite_top_k_step_selects_triton_gumbel(self):
         self.backend.prepare_step(
-            request_ids=["a"],
+            admission_ids=[1],
             request_pool_indices=[1],
             sampling_params_list=[_sp("a", top_k=50, top_p=1.0)],
         )
@@ -310,7 +309,7 @@ class TestTritonRouteSelection:
 
     def test_finite_top_k_top_p_step_selects_triton_gumbel(self):
         self.backend.prepare_step(
-            request_ids=["a"],
+            admission_ids=[1],
             request_pool_indices=[1],
             sampling_params_list=[_sp("a", top_k=50, top_p=0.9)],
         )
@@ -318,7 +317,7 @@ class TestTritonRouteSelection:
         assert (self.backend._top_k_top_p_pad) == (64)
 
         self.backend.prepare_step(
-            request_ids=["b"],
+            admission_ids=[2],
             request_pool_indices=[1],
             sampling_params_list=[_sp("b", top_k=127, top_p=0.9)],
         )
@@ -326,7 +325,7 @@ class TestTritonRouteSelection:
 
     def test_top_p_only_step_selects_top_p_triton_gumbel(self):
         self.backend.prepare_step(
-            request_ids=["a"],
+            admission_ids=[1],
             request_pool_indices=[1],
             sampling_params_list=[_sp("a", top_k=-1, top_p=0.9)],
         )
@@ -334,7 +333,7 @@ class TestTritonRouteSelection:
 
     def test_mixed_step_selects_generic_triton_gumbel(self):
         self.backend.prepare_step(
-            request_ids=["a", "b"],
+            admission_ids=[1, 2],
             request_pool_indices=[1, 2],
             sampling_params_list=[
                 _sp("a", top_k=-1, top_p=1.0),
@@ -345,7 +344,7 @@ class TestTritonRouteSelection:
 
     def test_multi_token_no_filter_step_selects_verify_fast_path(self):
         self.backend.prepare_step(
-            request_ids=["a"],
+            admission_ids=[1],
             request_pool_indices=[1],
             sampling_params_list=[_sp("a", top_k=-1, top_p=1.0)],
             num_tokens_per_req=4,
@@ -379,7 +378,7 @@ class TestTritonRouteSelection:
         )
 
         self.backend.prepare_step(
-            request_ids=["a"],
+            admission_ids=[1],
             request_pool_indices=[1],
             sampling_params_list=[_sp("a", top_k=-1, top_p=1.0)],
             num_tokens_per_req=4,
@@ -389,7 +388,7 @@ class TestTritonRouteSelection:
         )
 
         self.backend.prepare_step(
-            request_ids=["a"],
+            admission_ids=[1],
             request_pool_indices=[1],
             sampling_params_list=[_sp("a", top_k=-1, top_p=1.0)],
             num_tokens_per_req=1,
@@ -399,7 +398,7 @@ class TestTritonRouteSelection:
         )
 
         self.backend.prepare_step(
-            request_ids=["b"],
+            admission_ids=[2],
             request_pool_indices=[1],
             sampling_params_list=[_sp("b", top_k=-1, top_p=0.9)],
             num_tokens_per_req=4,
@@ -409,7 +408,7 @@ class TestTritonRouteSelection:
         )
 
         self.backend.prepare_step(
-            request_ids=["c"],
+            admission_ids=[3],
             request_pool_indices=[1],
             sampling_params_list=[_sp("c", top_k=50, top_p=1.0)],
             num_tokens_per_req=4,
@@ -419,7 +418,7 @@ class TestTritonRouteSelection:
         )
 
         self.backend.prepare_step(
-            request_ids=["d"],
+            admission_ids=[4],
             request_pool_indices=[1],
             sampling_params_list=[_sp("d", top_k=50, top_p=0.9)],
             num_tokens_per_req=4,
@@ -431,7 +430,7 @@ class TestTritonRouteSelection:
     def test_verify_finite_top_k_top_p_uses_direct_sampler(self):
         n = 4
         self.backend.prepare_step(
-            request_ids=["a"],
+            admission_ids=[1],
             request_pool_indices=[1],
             sampling_params_list=[_sp("a", top_k=50, top_p=0.9)],
             num_tokens_per_req=n,
@@ -495,7 +494,7 @@ class TestTritonRouteSelection:
     def test_verify_top_p_only_uses_top_p_sampler(self):
         n = 4
         self.backend.prepare_step(
-            request_ids=["a"],
+            admission_ids=[1],
             request_pool_indices=[1],
             sampling_params_list=[_sp("a", top_k=-1, top_p=0.9)],
             num_tokens_per_req=n,
@@ -573,7 +572,7 @@ class TestTritonRouteSelection:
             )
         )
         backend.prepare_step(
-            request_ids=[f"r{i}" for i in range(bs)],
+            admission_ids=[i + 1 for i in range(bs)],
             request_pool_indices=list(range(1, bs + 1)),
             sampling_params_list=[
                 _sp(f"qrita_{i}", top_k=127, top_p=0.9) for i in range(bs)
@@ -660,7 +659,7 @@ class TestTritonRouteSelection:
             )
         )
         backend.prepare_step(
-            request_ids=[f"r{i}" for i in range(bs)],
+            admission_ids=[i + 1 for i in range(bs)],
             request_pool_indices=list(range(1, bs + 1)),
             sampling_params_list=[
                 _sp(f"qrita_topk_{i}", top_k=64, top_p=1.0) for i in range(bs)
@@ -770,7 +769,7 @@ class TestTritonLogprobOutputs:
         config = dataclasses.replace(_make_config(), enable_output_logprobs=True)
         backend = backend_cls(config)
         backend.prepare_step(
-            request_ids=["a", "b"],
+            admission_ids=[1, 2],
             request_pool_indices=[1, 2],
             sampling_params_list=[
                 _sp("a", top_k=-1, top_p=1.0),
@@ -894,7 +893,7 @@ class TestFlashInferFullFlipExtended:
             min_p=0.1,
         )
         self.backend.prepare_step(
-            request_ids=["a"],
+            admission_ids=[1],
             request_pool_indices=[3],
             sampling_params_list=[sp],
         )
@@ -935,7 +934,7 @@ class TestFlashInferFullFlipExtended:
         self.backend._logit_bias[2, 100] = 5.0
         sp = _sp("new", temperature=1.0)
         self.backend.prepare_step(
-            request_ids=["new"],
+            admission_ids=[3],
             request_pool_indices=[2],
             sampling_params_list=[sp],
         )
@@ -952,7 +951,7 @@ class TestFlashInferFullFlipExtended:
         sp = _sp("a", temperature=1.0)
         sp.logit_bias = {"100": 2.0, "200": -1.5}
         self.backend.prepare_step(
-            request_ids=["a"],
+            admission_ids=[1],
             request_pool_indices=[4],
             sampling_params_list=[sp],
         )
@@ -988,7 +987,7 @@ class TestFlashInferFullFlipExtended:
         sp.logit_bias = {str(VOCAB + 5): 1.0}
         with pytest.raises((AssertionError)):
             self.backend.prepare_step(
-                request_ids=["a"],
+                admission_ids=[1],
                 request_pool_indices=[1],
                 sampling_params_list=[sp],
             )
@@ -1009,7 +1008,7 @@ class TestTritonFullIndependentState:
             min_p=0.1,
         )
         self.backend.prepare_step(
-            request_ids=["a"],
+            admission_ids=[1],
             request_pool_indices=[3],
             sampling_params_list=[sp],
         )
@@ -1046,7 +1045,7 @@ class TestTritonFullIndependentState:
         self.backend._counts[2, 100] = 7
         self.backend._logit_bias[2, 100] = 5.0
         self.backend.prepare_step(
-            request_ids=["new"],
+            admission_ids=[3],
             request_pool_indices=[2],
             sampling_params_list=[_sp("new")],
         )
@@ -1063,7 +1062,7 @@ class TestTritonFullIndependentState:
         sp = _sp("a")
         sp.logit_bias = {"100": 2.0, "200": -1.5}
         self.backend.prepare_step(
-            request_ids=["a"],
+            admission_ids=[1],
             request_pool_indices=[4],
             sampling_params_list=[sp],
         )
@@ -1103,7 +1102,7 @@ class TestTritonFullIndependentState:
         assert (CUDA_GRAPH_VARIANT_TRITON_FULL_TOP_K_TOP_P_MIN_P) in (variants)
 
         self.backend.prepare_step(
-            request_ids=["a"],
+            admission_ids=[1],
             request_pool_indices=[1],
             sampling_params_list=[_sp("a", top_k=-1, top_p=1.0, min_p=0.2)],
             num_tokens_per_req=4,
@@ -1113,7 +1112,7 @@ class TestTritonFullIndependentState:
         )
 
         self.backend.prepare_step(
-            request_ids=["b"],
+            admission_ids=[2],
             request_pool_indices=[1],
             sampling_params_list=[_sp("b", top_k=64, top_p=0.9, min_p=0.05)],
             num_tokens_per_req=4,
@@ -1127,7 +1126,7 @@ class TestTritonFullIndependentState:
         sp.logit_bias = {str(VOCAB + 5): 1.0}
         with pytest.raises((AssertionError)):
             self.backend.prepare_step(
-                request_ids=["a"],
+                admission_ids=[1],
                 request_pool_indices=[1],
                 sampling_params_list=[sp],
             )
@@ -1145,13 +1144,13 @@ class TestPrepareStepGuardRails:
         pool_rows = POOL + 1
         with pytest.raises((AssertionError)):
             self.backend.prepare_step(
-                request_ids=["a"],
+                admission_ids=[1],
                 request_pool_indices=[pool_rows],  # one past the end
                 sampling_params_list=[_sp("a")],
             )
         with pytest.raises((AssertionError)):
             self.backend.prepare_step(
-                request_ids=["a"],
+                admission_ids=[1],
                 request_pool_indices=[-1],
                 sampling_params_list=[_sp("a")],
             )

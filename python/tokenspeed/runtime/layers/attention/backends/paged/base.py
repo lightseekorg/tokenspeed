@@ -257,8 +257,9 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         buffers.
 
         ``spec_num_tokens`` under block decode: one entry per block position,
-        because the block is non-causal (all positions share the block-end
-        length) and the drafter rewrites those lengths in-graph
+        because each position carries its own length (the block-end length for
+        a non-causal block, backed off per position for a causal one) and the
+        drafter rewrites those lengths in-graph
         (:meth:`fill_block_decode_seq_lens`), so they must exist as storage.
         Otherwise 1: plain decode and a vanilla MTP draft have one position
         per request, and target verify derives its causal per-position

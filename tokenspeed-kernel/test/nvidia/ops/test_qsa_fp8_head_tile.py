@@ -119,3 +119,65 @@ def test_fp8_target_and_draft_graphs_refresh_without_compilation(
         assert qsa_sparse._COMPILED_KERNELS == compiled
     finally:
         pdl_enabled(previous)
+
+
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_large_fp8_grids_refresh_across_split_boundary(enable_pdl):
+    from tokenspeed_kernel.numerics.torch.attention.qsa import (
+        torch_qsa_selected_attention,
+    )
+    from tokenspeed_kernel.thirdparty.cute_dsl import qsa_sparse
+    from tokenspeed_kernel.workspace import capture_session
+    from utils import assert_no_cute_compile
+
+    torch.manual_seed(821)
+    sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+    # Each row contributes two output tiles for this head geometry.
+    boundary = sm_count
+    query = torch.randn((16384, 24, 256), device="cuda", dtype=torch.bfloat16)
+    keys = (torch.randn((4096, 2, 256), device="cuda") * 0.25).to(torch.float8_e4m3fn)
+    values = (torch.randn((4096, 2, 256), device="cuda") * 0.25).to(torch.float8_e4m3fn)
+    keys[0].fill_(float("nan"))
+    values[0].fill_(float("nan"))
+    slots = torch.randint(1, 4096, (16384, 2051), device="cuda", dtype=torch.int32)
+    slots[:, 13::19] = 0
+    slots[::4, 1024:2048] = -1
+    qsa_sparse.warmup(query, keys, values, max_rows=16384, enable_pdl=enable_pdl)
+
+    def forward(q, selected):
+        return qsa_sparse.kernel(
+            q,
+            keys,
+            values,
+            selected,
+            scale=1 / 16,
+            max_seqlen_q=1,
+            k_scale=0.5,
+            v_scale=0.25,
+            enable_pdl=enable_pdl,
+        )
+
+    with assert_no_cute_compile():
+        for rows in (boundary - 1, boundary, boundary + 1, 16384):
+            q, selected = query[:rows], slots[:rows]
+            forward(q, selected)
+            graph = torch.cuda.CUDAGraph()
+            with capture_session(graph), torch.cuda.graph(graph):
+                output = forward(q, selected)
+            sample = torch.tensor([0, 1, rows // 2, rows - 2, rows - 1], device="cuda")
+            saved_last = selected[-1].clone()
+            for empty_last in (True, False):
+                selected[-1].copy_(
+                    torch.full_like(saved_last, -1) if empty_last else saved_last
+                )
+                q.mul_(-0.75)
+                graph.replay()
+                expected = torch_qsa_selected_attention(
+                    q[sample], keys, values, selected[sample], 1 / 16, 0.5, 0.25
+                )
+                torch.testing.assert_close(
+                    output[sample], expected, atol=2e-3, rtol=2e-2
+                )
+                if empty_last:
+                    assert torch.count_nonzero(output[-1]) == 0
+                torch.testing.assert_close(forward(q, selected), output, atol=0, rtol=0)

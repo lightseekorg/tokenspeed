@@ -232,6 +232,8 @@ class PlannedForward:
             no later scheduler activity can reach it.
         sampling_params_list: Per-slot sampling params, gathered by the loop.
             Read-only for the request's lifetime.
+        admission_ids: Immutable identities aligned with the forward's requests.
+            A new admission gets a new identity even when its rid is reused.
         dp_metadata: CPU-gathered DP metadata, None outside DP. A frozen
             dataclass of plain lists.
         grammar_inputs: Per-batch grammar state, None when no request in the
@@ -255,6 +257,7 @@ class PlannedForward:
     """
 
     forward_op: Any
+    admission_ids: tuple[int, ...]
     sampling_params_list: list
     dp_metadata: "DpForwardMetadata | None"
     grammar_inputs: Any

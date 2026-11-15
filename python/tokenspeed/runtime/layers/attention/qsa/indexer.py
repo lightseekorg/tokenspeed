@@ -364,6 +364,49 @@ class QSAIndexer(nn.Module):
         )
         return QSASelection(selected_slots, selected_blocks, self.compress_ratio)
 
+    def split_round_locations(
+        self, ctx: ForwardContext, rows: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """A split round's per-row index-key locations; resets the draft-step tags."""
+        # The draft steps then stage keys over fresh tags, as after a narrowed step 0.
+        scratch = self._draft_scratch.get((ctx.bs, self.index_qk_proj.weight.device))
+        layout = qsa_forward_layout(
+            ctx,
+            rows,
+            compressed_token_page_size=self.compressed_token_page_size,
+            recent_page_size=self.recent_page_size,
+            compress_ratio=self.compress_ratio,
+            reset_draft_tags=None if scratch is None else scratch[2],
+        )
+        return (
+            layout.logical_positions,
+            layout.request_indices,
+            layout.qsa_locs,
+            layout.recent_locs,
+        )
+
+    def write_split_keys(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        locations: tuple[torch.Tensor, ...],
+        pool,
+    ) -> None:
+        """Write and compress each row's index key at its split-round locations."""
+        logical, requests, qsa_locs, recent_locs = locations
+        _, token_k = self._project_qk_raw(hidden_states)
+        self._write_and_compress(
+            token_k,
+            positions,
+            logical,
+            requests,
+            qsa_locs,
+            recent_locs,
+            pool,
+            stage_draft=False,
+            stage_verify_buffers=None,
+        )
+
     @break_point
     def forward(
         self,

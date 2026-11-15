@@ -30,8 +30,13 @@ if TYPE_CHECKING:
     from tokenspeed_kernel.ops.communication.iris import IrisAllReduce
 
 
+# Decode rows served by the fused replicated paths: the latent input gather,
+# the Lamport two-shot reduce and the gathered MoE tail. Above it, rows shard.
+# 192 covers 48 requests' 4-token verify; the model's gather-tail and SiTU
+# warp-decode bounds and the comm's sharded-prefix floor follow it.
+K3_FUSED_DECODE_MAX_ROWS = 192
 # Decode rows with a gathered column-parallel MoE up-projection; GEMV senders to 4 rows.
-_K3_GATHER_MAX_ROWS = 64
+_K3_GATHER_MAX_ROWS = K3_FUSED_DECODE_MAX_ROWS
 _K3_GATHER_GEMV_MAX_ROWS = 4
 _K3_GATHER_LATENT = 3584
 _K3_GATHER_LOCAL_WIDTH = 896
@@ -48,10 +53,12 @@ _K3_PACKED_INPUT_ROWS = _K3_ROUTER + _K3_LATENT + 2 * _K3_SHARED
 _K3_LATENT_GEMM_NUM_WARPS = 2
 # One-shot Lamport window (it also sums MoE top-k slots) and latent gather row limits.
 _K3_LAMPORT_MAX_ROWS = 7
-_K3_LATENT_GATHER_MAX_ROWS = 64
+_K3_LATENT_GATHER_MAX_ROWS = K3_FUSED_DECODE_MAX_ROWS
+# The FP8 scale rendezvous spans its slots with gl.arange, so a power of two.
+_K3_LATENT_SYNC_ROWS = 1 << (_K3_LATENT_GATHER_MAX_ROWS - 1).bit_length()
 # From 8 rows the Lamport two-shot all-reduce wins; 1024-element tiles need even rows.
 _K3_TWO_SHOT_MIN_ROWS = 8
-_K3_TWO_SHOT_MAX_ROWS = 64
+_K3_TWO_SHOT_MAX_ROWS = K3_FUSED_DECODE_MAX_ROWS
 _K3_TWO_SHOT_ALIGN = 8 * 128
 
 
@@ -62,12 +69,13 @@ def _k3_lamport_numel(producer_direct_max_numel: int) -> int:
     rows = min(producer_direct_max_numel // (3584 + 7168), _K3_LAMPORT_MAX_ROWS)
     if not rows:
         return 0
+    gather = max(
+        _K3_LATENT_GATHER_MAX_ROWS * 1024,
+        -(-_K3_GATHER_MAX_ROWS // 16) * 16 * _K3_GATHER_LOCAL_WIDTH,
+    )
     return max(
         rows * (3584 + 7168),
-        min(
-            _K3_LATENT_GATHER_MAX_ROWS * 1024,
-            producer_direct_max_numel // 512 * 512,
-        ),
+        min(gather, producer_direct_max_numel // 512 * 512),
     )
 
 
@@ -108,6 +116,7 @@ class K3IrisState:
         attnres_max_rows: int,
         enable_lamport: bool,
         sharded_max_rows: int,
+        pull_exchange_max_bytes: int = 0,
     ):
         from tokenspeed_kernel.ops.communication._iris.all_reduce import ProducerLamport
         from tokenspeed_kernel.ops.communication._iris.kimi_k3.allreduce_sharded import (
@@ -116,8 +125,17 @@ class K3IrisState:
         from tokenspeed_kernel.ops.communication._iris.kimi_k3.attnres import (
             IrisAttnResState,
         )
+        from tokenspeed_kernel.ops.communication._iris.pull_exchange import (
+            IrisPullExchange,
+        )
 
         self.all_reduce = all_reduce
+        # K3.1's KVP decode gathers and records exchange, pulled in place.
+        self.pull_exchange = (
+            IrisPullExchange(all_reduce.peers, pull_exchange_max_bytes)
+            if pull_exchange_max_bytes
+            else None
+        )
         self.enable_lamport = enable_lamport
         self.attnres = (
             IrisAttnResState(
@@ -179,7 +197,7 @@ class K3IrisState:
             torch.cat(
                 (
                     torch.full(
-                        (_K3_LATENT_GATHER_MAX_ROWS,),
+                        (_K3_LATENT_SYNC_ROWS,),
                         -1,
                         dtype=torch.int32,
                         device=all_reduce.device,
@@ -266,6 +284,7 @@ class K3IrisState:
         tensors: tuple[torch.Tensor, ...],
         *,
         routed_partials: torch.Tensor | None = None,
+        shared_owned_columns: bool = False,
     ) -> tuple[torch.Tensor, ...]:
         """Reduce owned producer outputs using K3's existing shape policy.
 
@@ -273,6 +292,12 @@ class K3IrisState:
         rows of the MoE's top-k slots, the routed output (``tensors[0]``) is
         their slot-order sum, as the MoE's own top-k reduce would have
         written it; ``tensors[0]`` itself is not read.
+
+        ``shared_owned_columns`` promises that the caller reads only this
+        rank's column block of the shared output, as ``moe_gather_tail``
+        does. The two-shot then reduce-scatters the shared rows instead of
+        all-reducing them and leaves the other columns undefined; every
+        element it writes has the full reduction's bits.
         """
         assert self.all_reduce.owns_outputs(tensors)
         shapes = tuple(tuple(tensor.shape) for tensor in tensors)
@@ -300,7 +325,9 @@ class K3IrisState:
             return self.all_reduce.producer.views(output, shapes)
         if self._two_shot_moe_shapes(shapes):
             numel = sum(t.numel() for t in tensors)
-            if routed_partials is None:
+            if shared_owned_columns and shapes[0][1] == _K3_LATENT:
+                output = self._run_two_shot_shared_rs(numel, shapes, routed_partials)
+            elif routed_partials is None:
                 output = self._run_two_shot(numel)
             else:
                 output = self._run_two_shot_topk(numel, routed_partials, rows, width)
@@ -340,6 +367,45 @@ class K3IrisState:
         )
         return output
 
+    def _run_two_shot_shared_rs(
+        self,
+        numel: int,
+        shapes: tuple[tuple[int, ...], ...],
+        partials: torch.Tensor | None,
+    ) -> torch.Tensor:
+        from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+            iris_arch_policy,
+        )
+        from tokenspeed_kernel.ops.communication._iris.kimi_k3.moe_reduce import (
+            iris_k3moe_lamport_twoshot_shared_rs,
+        )
+
+        (rows, routed_width), (_, shared_width) = shapes
+        output = torch.empty(
+            numel, dtype=self.all_reduce.dtype, device=self.all_reduce.device
+        )
+        producer = self.all_reduce.producer.data
+        # One program a 128-element tile of every rank's routed shard or shared block.
+        iris_k3moe_lamport_twoshot_shared_rs[(numel // _K3_TWO_SHOT_ALIGN,)](
+            producer if partials is None else partials,
+            producer,
+            self.two_shot_region,
+            output,
+            self.two_shot_epochs,
+            self.two_shot_peer_addresses,
+            rows * routed_width,
+            RANK=self.all_reduce.rank_in_group,
+            WORLD_SIZE=8,
+            ROUTED_WIDTH=routed_width,
+            SHARED_WIDTH=shared_width,
+            TOPK=0 if partials is None else partials.shape[0] // rows,
+            MAX_SHARD_ELEMENTS=self.two_shot_max_numel // 8,
+            NUM_STAGES=3,
+            PEER_SIGNAL_STORE_CACHE=iris_arch_policy().peer_signal_store,
+            num_warps=1,
+        )
+        return output
+
     def _run_lamport_topk(
         self, output: torch.Tensor, partials: torch.Tensor, rows: int, width: int
     ) -> None:
@@ -351,6 +417,15 @@ class K3IrisState:
         )
 
         lamport = self.lamport
+        if (
+            rows < 1
+            or width % lamport.BLOCK_ELEMENTS
+            or output.numel() % lamport.BLOCK_ELEMENTS
+            or not rows * width < output.numel() <= lamport.max_numel
+        ):
+            raise ValueError(
+                "routed Lamport output must fit its mailbox in complete tiles"
+            )
         iris_k3moe_lamport_allreduce_topk[(output.numel() // lamport.BLOCK_ELEMENTS,)](
             partials,
             lamport.producer.data,
@@ -662,7 +737,7 @@ class K3IrisState:
             QUANTIZE=quantize,
             MIN_AMAX=_DYNAMIC_FP8_MIN_AMAX,
             FP8_MAX=_DYNAMIC_FP8_E4M3_MAX,
-            MAX_ROWS=_K3_LATENT_GATHER_MAX_ROWS,
+            MAX_ROWS=_K3_LATENT_SYNC_ROWS,
             num_warps=4,
         )
         if quantize:
@@ -955,12 +1030,14 @@ def prepare_k3_communication(
     dtype: torch.dtype,
     device: torch.device,
     all_reduce: "IrisAllReduce | None",
+    pull_exchange_max_bytes: int = 0,
 ) -> K3IrisState:
     """Prepare a group's combined K3 buffers before graph capture.
 
-    Capacities are elements except the explicitly named row capacities. Zero
-    omits that path. ``all_reduce`` shares an already prepared generic operation,
-    or None creates it. The returned state owns all model-specific storage.
+    Capacities are elements except the explicitly named row and byte
+    capacities. Zero omits that path. ``all_reduce`` shares an already
+    prepared generic operation, or None creates it. The returned state owns
+    all model-specific storage.
     """
     from tokenspeed_kernel.ops.communication._iris import (
         HEAP_HEADROOM_BYTES,
@@ -975,6 +1052,9 @@ def prepare_k3_communication(
     from tokenspeed_kernel.ops.communication._iris.kimi_k3.attnres import (
         IrisAttnResState,
     )
+    from tokenspeed_kernel.ops.communication._iris.pull_exchange import (
+        IrisPullExchange,
+    )
     from tokenspeed_kernel.ops.communication.iris import IrisAllReduce
 
     world_size = group.size()
@@ -985,6 +1065,7 @@ def prepare_k3_communication(
             attnres_max_numel,
             attnres_max_rows,
             sharded_max_rows,
+            pull_exchange_max_bytes,
         )
         < 0
     ):
@@ -1032,10 +1113,16 @@ def prepare_k3_communication(
         if sharded_max_rows
         else 0
     )
+    pull_exchange_bytes = (
+        IrisPullExchange.heap_bytes(pull_exchange_max_bytes, world_size)
+        if pull_exchange_max_bytes
+        else 0
+    )
     # Preserve the base heap's headroom for other collective operations.
     ctx = get_or_create_context(
         heap_size=max(MIN_HEAP_BYTES, total_bytes + HEAP_HEADROOM_BYTES)
-        + sharded_bytes,
+        + sharded_bytes
+        + pull_exchange_bytes,
     )
     if all_reduce is None:
         all_reduce = IrisAllReduce(
@@ -1050,6 +1137,7 @@ def prepare_k3_communication(
         attnres_max_rows=attnres_max_rows,
         enable_lamport=enable_lamport,
         sharded_max_rows=sharded_max_rows,
+        pull_exchange_max_bytes=pull_exchange_max_bytes,
     )
     all_reduce.peers.finish_prepare()
     return state

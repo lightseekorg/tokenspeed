@@ -22,6 +22,8 @@
 
 from __future__ import annotations
 
+import functools
+
 import pytest
 import torch
 from tokenspeed_kernel.ops.residual.torch import torch_attn_res_fwd
@@ -42,8 +44,11 @@ from tokenspeed_kernel.ops.residual import (  # noqa: E402
 
 if is_cdna4():
     from tokenspeed_kernel_amd.ops.gfx950.attention.kda.attn_res import (  # noqa: E402
-        attn_res_rmsnorm_gfx950 as attn_res_rmsnorm_amd,
+        attn_res_rmsnorm_gfx950,
     )
+
+    # Launched as serving does outside startup.
+    attn_res_rmsnorm_amd = functools.partial(attn_res_rmsnorm_gfx950, warmup=False)
 else:
     from tokenspeed_kernel_amd.ops.gfx1250.attention.kda.attn_res import (  # noqa: E402
         attn_res_rmsnorm_gfx1250 as attn_res_rmsnorm_amd,

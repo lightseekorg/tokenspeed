@@ -610,7 +610,7 @@ class FlashMLABackend(PagedAttentionBackend):
         # window does not resolve positions before its start (identity for
         # floor 1). Padding rows replay at seq_len 1 and clamp the same way.
         q_len = metadata.q_len_per_req
-        self.seq_lens_buf[:bs].copy_(seq_lens[:bs].clamp_min(q_len))
+        torch.clamp_min(seq_lens[:bs], q_len, out=self.seq_lens_buf[:bs])
         # Copy the router-resolved kernel page table into the persistent buffer.
         num_pages = page_table.shape[1]
         self.page_table_buf[:bs, :num_pages].copy_(page_table[:bs])

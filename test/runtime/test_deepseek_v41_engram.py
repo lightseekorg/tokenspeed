@@ -24,6 +24,8 @@ Optional local reference parity: set DEEPSEEK_V41_REFERENCE_DIR to a snapshot
 containing config.json, tokenizer.json and inference/{engram,model}.py.
 Four-device collective check: torchrun --standalone --nproc_per_node=4 -m pytest
     test/runtime/test_deepseek_v41_engram.py -k distributed_four_way
+Rerun it with -k torchrun_ranks_share for a host-NUMA cuMem table the ranks
+share through FABRIC handles.
 Use CUDA_VISIBLE_DEVICES to select only free GPUs.
 """
 
@@ -31,20 +33,29 @@ from __future__ import annotations
 
 import argparse
 import ast
+import contextlib
+import ctypes
 import gc
 import importlib.util
+import itertools
 import json
+import logging
+import mmap
 import os
 import sys
 from collections.abc import Sequence
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 import torch.nn.functional as F
 from safetensors import safe_open
 from safetensors.torch import save_file
+from tokenspeed_kernel import host_memory
 
 from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config, Mxfp8Config
@@ -54,6 +65,7 @@ from tokenspeed.runtime.models.deepseek_v41 import v41_mxfp8_config
 from tokenspeed.runtime.models.deepseek_v41_engram import (
     DeepseekV41Engram,
     EngramHashState,
+    EngramHostAlloc,
     EngramLayout,
     RowShardedEngramEmbedding,
     build_compressed_token_map,
@@ -166,6 +178,10 @@ def _mapping(rank, tp_size, world_size):
         base_gpu_id=0,
         gpu_id_step=1,
     )
+
+
+# Host tables in a registered mmap, as before host-NUMA cuMem memory existed.
+_MMAP = EngramHostAlloc("mmap", "writer")
 
 
 def _weights(rows, width):
@@ -318,7 +334,7 @@ def test_bounded_shard_loading_and_four_way_lookup(tmp_path, monkeypatch):
     outputs = []
     for rank in range(4, 8):
         embed = RowShardedEngramEmbedding(
-            rows, width, _mapping(rank, 4, 8), "cpu", False, "gpu", 1
+            rows, width, _mapping(rank, 4, 8), "cpu", False, "gpu", None, 1
         )
         with safe_open(str(path), framework="pt", device="cpu") as handle:
             for name in ("weight", "scale"):
@@ -357,7 +373,9 @@ def test_bounded_shard_loading_and_four_way_lookup(tmp_path, monkeypatch):
 
 
 def test_scale_bytes_and_loader_validation():
-    embed = RowShardedEngramEmbedding(8, 256, _mapping(0, 1, 1), "cpu", False, "gpu", 1)
+    embed = RowShardedEngramEmbedding(
+        8, 256, _mapping(0, 1, 1), "cpu", False, "gpu", None, 1
+    )
     codes = torch.ones(8, 256).to(torch.float8_e4m3fn)
     # Includes E8M0 subnormal, extreme finite and NaN encodings.
     scales = torch.arange(256, dtype=torch.uint8).reshape(8, 32)[:, :8].contiguous()
@@ -394,7 +412,7 @@ def test_scale_bytes_and_loader_validation():
 @pytest.mark.parametrize("ndim", [1, 2, 3])
 def test_embedding_noncontiguous_ids(device, ndim):
     embed = RowShardedEngramEmbedding(
-        64, 256, _mapping(0, 1, 1), device, False, "gpu", 1
+        64, 256, _mapping(0, 1, 1), device, False, "gpu", None, 1
     )
     codes = torch.randn(64, 256, device=device).to(torch.float8_e4m3fn)
     scales = torch.randint(120, 132, (64, 8), dtype=torch.uint8, device=device)
@@ -423,6 +441,7 @@ def _model(device, quant_config):
         device,
         False,
         "gpu",
+        None,
     )
 
 
@@ -519,7 +538,7 @@ def test_quantized_projection_loader_aliases_and_real_table_metadata(
     } == set(dict(model.named_parameters()))
     for rank in range(4):
         large = RowShardedEngramEmbedding(
-            384016682, 256, _mapping(rank, 4, 4), "meta", False, "gpu", 1
+            384016682, 256, _mapping(rank, 4, 4), "meta", False, "gpu", None, 1
         )
         assert large.weight.shape == (96004171, 256)
         assert large.scale.shape == (96004171, 8)
@@ -531,7 +550,7 @@ def test_quantized_projection_loader_aliases_and_real_table_metadata(
 def test_cuda_lookup_hash_and_graph_replay():
     state = EngramHashState(_config(), _Tokenizer(), "cuda:0")
     embed = RowShardedEngramEmbedding(
-        72, 32, _mapping(0, 1, 1), "cuda:0", False, "gpu", 1
+        72, 32, _mapping(0, 1, 1), "cuda:0", False, "gpu", None, 1
     )
     codes, scales = _weights(72, 32)
     embed.weight_loader(embed.weight, codes)
@@ -607,9 +626,13 @@ def test_cuda_quantized_projection_forward():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_cuda_host_table_feeds_wkv_its_mxfp8_rows():
+@pytest.mark.parametrize("alloc", ["mmap", "cumem"])
+def test_cuda_host_table_feeds_wkv_its_mxfp8_rows(alloc):
     """A shared host table hands wkv quantized rows; the output is the GPU
-    table's BF16 round trip bit for bit, eagerly and replayed."""
+    table's BF16 round trip bit for bit, eagerly and replayed, whether the
+    table is a registered mmap or 2 MiB-page host-NUMA memory."""
+    if alloc == "cumem" and host_memory.probe_host_memory(0, False):
+        pytest.skip(host_memory.probe_host_memory(0, False))
     quant = Mxfp8Config.from_config(
         {
             "quant_method": "fp8",
@@ -632,6 +655,7 @@ def test_cuda_host_table_feeds_wkv_its_mxfp8_rows():
             "cuda:0",
             host_table,
             "shared" if host_table else "gpu",
+            EngramHostAlloc(alloc, "writer") if host_table else None,
         )
         model.embed.weight_loader(model.embed.weight, codes)
         model.embed.weight_loader(model.embed.scale, scales)
@@ -645,6 +669,7 @@ def test_cuda_host_table_feeds_wkv_its_mxfp8_rows():
         models.append(model)
     gpu, host = models
     assert host.embed.serves_mxfp8_rows and not gpu.embed.serves_mxfp8_rows
+    assert (host.embed.cumem is not None) == (alloc == "cumem")
     hashes = torch.randint(0, 72, (5, 2, 6), device="cuda:0")
     hashes[1, 0, 2], hashes[3, 0, 5] = -1, 72
     ids = hashes[:, 0]
@@ -699,7 +724,9 @@ def test_distributed_four_way_lookup(monkeypatch):
     process_group_manager.init_process_group(mapping.attn.tp_group, backend="nccl")
     try:
         codes, scales = _weights(19, 64)
-        table = RowShardedEngramEmbedding(19, 64, mapping, device, False, "gpu", 1)
+        table = RowShardedEngramEmbedding(
+            19, 64, mapping, device, False, "gpu", None, 1
+        )
         table.weight_loader(table.weight, codes)
         table.weight_loader(table.scale, scales)
         ids = torch.tensor([[0, 4, 5, 9, 10, 14, 15, 18]], device=device)
@@ -753,6 +780,7 @@ def test_local_snapshot_reference_parity():
         "meta",
         False,
         "gpu",
+        None,
     )
     assert full.wkv.weight.shape == (25600, 6144)
     assert full.wkv.weight_scale_inv.shape == (25600, 192)
@@ -861,7 +889,7 @@ def test_host_table_matches_gpu_shard_and_skips_allreduce(tmp_path, monkeypatch)
     sharded = []
     for rank in range(4):
         embed = RowShardedEngramEmbedding(
-            rows, width, _mapping(rank, 4, 4), "cpu", False, "gpu", 1
+            rows, width, _mapping(rank, 4, 4), "cpu", False, "gpu", None, 1
         )
         with safe_open(str(path), framework="pt", device="cpu") as handle:
             embed.load_sharded("weight", handle.get_slice("weight"), 4)
@@ -870,7 +898,7 @@ def test_host_table_matches_gpu_shard_and_skips_allreduce(tmp_path, monkeypatch)
     gpu_path = torch.stack(sharded).sum(0)
     assert reduces
     host = RowShardedEngramEmbedding(
-        rows, width, _mapping(0, 4, 4), "cpu", True, "shared", 1
+        rows, width, _mapping(0, 4, 4), "cpu", True, "shared", _MMAP, 1
     )
     with safe_open(str(path), framework="pt", device="cpu") as handle:
         host.load_sharded("weight", handle.get_slice("weight"), 4)
@@ -884,7 +912,7 @@ def test_host_table_matches_gpu_shard_and_skips_allreduce(tmp_path, monkeypatch)
 
 def test_host_table_meta_keeps_full_rows():
     table = RowShardedEngramEmbedding(
-        384016682, 256, _mapping(0, 4, 4), "meta", True, "shared", 14
+        384016682, 256, _mapping(0, 4, 4), "meta", True, "shared", _MMAP, 14
     )
     assert table.weight.shape == (384016682, 256)
     assert table.scale.shape == (384016682, 8)
@@ -909,6 +937,36 @@ def test_engram_host_table_server_arg():
         ["--model", "x", "--engram-host-table", "--engram-host-table-layout", "sharded"]
     )
     assert args.engram_host_table_layout == "sharded"
+    assert args.engram_host_table_alloc == "auto"
+    assert args.engram_host_table_numa == "interleave"
+    args = parser.parse_args(
+        [
+            "--model",
+            "x",
+            "--engram-host-table-alloc",
+            "mmap",
+            "--engram-host-table-numa",
+            "writer",
+        ]
+    )
+    assert (args.engram_host_table_alloc, args.engram_host_table_numa) == (
+        "mmap",
+        "writer",
+    )
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--model", "x", "--engram-host-table-alloc", "thp"])
+
+
+def test_resolve_engram_host_alloc_follows_the_cli(monkeypatch):
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    monkeypatch.setitem(global_server_args_dict, "engram_host_table_alloc", "cumem")
+    monkeypatch.setitem(global_server_args_dict, "engram_host_table_numa", "writer")
+    assert engram.resolve_engram_host_alloc("gpu") is None
+    for layout in ("shared", "sharded"):
+        assert engram.resolve_engram_host_alloc(layout) == EngramHostAlloc(
+            "cumem", "writer"
+        )
 
 
 def test_resolve_engram_host_layout_auto_and_explicit():
@@ -950,9 +1008,11 @@ def test_host_sharded_table_matches_gpu_and_allreduces(tmp_path, monkeypatch):
     host_parts = []
     for rank in range(4):
         mapping = _mapping(rank, 4, 4)
-        gpu = RowShardedEngramEmbedding(rows, width, mapping, "cpu", False, "gpu", 1)
+        gpu = RowShardedEngramEmbedding(
+            rows, width, mapping, "cpu", False, "gpu", None, 1
+        )
         host = RowShardedEngramEmbedding(
-            rows, width, mapping, "cpu", True, "sharded", 1
+            rows, width, mapping, "cpu", True, "sharded", _MMAP, 1
         )
         with safe_open(str(path), framework="pt", device="cpu") as handle:
             gpu.load_sharded("weight", handle.get_slice("weight"), 4)
@@ -998,7 +1058,7 @@ def test_host_table_gathers_each_packed_row_once(monkeypatch, layout, tp_size):
     expected = _dequant(codes, scales)[ids.clamp(0, rows - 1)]
     for rank in range(tp_size):
         table = RowShardedEngramEmbedding(
-            rows, width, _mapping(rank, tp_size, 4), "cpu", True, layout, 1
+            rows, width, _mapping(rank, tp_size, 4), "cpu", True, layout, _MMAP, 1
         )
         table.weight_loader(table.weight, codes)
         table.weight_loader(table.scale, scales)
@@ -1016,7 +1076,7 @@ def test_host_table_gathers_each_packed_row_once(monkeypatch, layout, tp_size):
 
 def test_host_sharded_meta_keeps_rank_rows():
     table = RowShardedEngramEmbedding(
-        384016682, 256, _mapping(1, 4, 4), "meta", True, "sharded", 14
+        384016682, 256, _mapping(1, 4, 4), "meta", True, "sharded", _MMAP, 14
     )
     assert table.weight.shape == (96004171, 256)
     assert table.row_start == 96004171
@@ -1103,12 +1163,12 @@ def test_checkpoint_filter_skips_engram_embed_only():
 def test_cuda_host_table_gather_matches_device_shard():
     codes, scales = _weights(72, 32)
     device_embed = RowShardedEngramEmbedding(
-        72, 32, _mapping(0, 1, 1), "cuda:0", False, "gpu", 1
+        72, 32, _mapping(0, 1, 1), "cuda:0", False, "gpu", None, 1
     )
     device_embed.weight_loader(device_embed.weight, codes)
     device_embed.weight_loader(device_embed.scale, scales)
     host_embed = RowShardedEngramEmbedding(
-        72, 32, _mapping(0, 1, 1), "cpu", True, "shared", 1
+        72, 32, _mapping(0, 1, 1), "cpu", True, "shared", _MMAP, 1
     )
     host_embed.weight_loader(host_embed.weight, codes)
     host_embed.weight_loader(host_embed.scale, scales)
@@ -1133,6 +1193,62 @@ def test_cuda_host_table_gather_matches_device_shard():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cuda_shared_file_host_table_is_registered_and_gathers(tmp_path, monkeypatch):
+    """A shared table's registered-mmap fallback: the writer maps the job file
+    in the default host-table directory, registers it for the GPU and unlinks
+    it, and the GPU gathers from it like the device shard.
+
+    One process plays a host's writer: a one-rank group that reports two ranks.
+    mmap mode runs no collective that would notice, so this runs on one GPU.
+    """
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    monkeypatch.setitem(global_server_args_dict, "engram_host_table_dir", None)
+    monkeypatch.setattr(engram, "_HOST_TABLE_JOB_ID", None)
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    codes, scales = _weights(72, 32)
+    device_embed = RowShardedEngramEmbedding(
+        72, 32, _mapping(0, 1, 1), "cuda:0", False, "gpu", None, 1
+    )
+    device_embed.weight_loader(device_embed.weight, codes)
+    device_embed.weight_loader(device_embed.scale, scales)
+    dist.init_process_group(
+        "gloo",
+        init_method=(tmp_path / "rendezvous").as_uri(),
+        rank=0,
+        world_size=1,
+        timeout=timedelta(seconds=60),
+    )
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(dist, "get_world_size", lambda group=None: 2)
+            path = engram._engram_host_table_path(1, "packed", 72 * 33)
+            host_embed = RowShardedEngramEmbedding(
+                72, 32, _mapping(0, 1, 1), "cpu", True, "shared", _MMAP, 1
+            )
+    finally:
+        dist.destroy_process_group()
+    assert host_embed.cumem is None and host_embed._mmap_keep
+    assert host_embed._mmap_keep[0].filename == path
+    assert not os.path.exists(path)
+    assert host_embed.packed.is_pinned()
+    host_embed.weight_loader(host_embed.weight, codes)
+    host_embed.weight_loader(host_embed.scale, scales)
+    ids = torch.tensor([3, 4, 5, 0, 71], device="cuda:0")
+    torch.testing.assert_close(
+        host_embed(ids, query_shard=None),
+        device_embed(ids, query_shard=None),
+        rtol=0,
+        atol=0,
+    )
+    torch.cuda.synchronize()
+    packed = host_embed.packed
+    del host_embed
+    gc.collect()
+    assert not packed.is_pinned()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_cuda_host_sharded_table_matches_device_shard_and_graph_replay(
     monkeypatch,
 ):
@@ -1145,10 +1261,10 @@ def test_cuda_host_sharded_table_matches_device_shard_and_graph_replay(
     for rank in range(4):
         mapping = _mapping(rank, 4, 4)
         device_embed = RowShardedEngramEmbedding(
-            rows, width, mapping, "cuda:0", False, "gpu", 1
+            rows, width, mapping, "cuda:0", False, "gpu", None, 1
         )
         host_embed = RowShardedEngramEmbedding(
-            rows, width, mapping, "cpu", True, "sharded", 1
+            rows, width, mapping, "cpu", True, "sharded", _MMAP, 1
         )
         for embed in (device_embed, host_embed):
             embed.weight_loader(embed.weight, codes)
@@ -1165,6 +1281,50 @@ def test_cuda_host_sharded_table_matches_device_shard_and_graph_replay(
         torch.testing.assert_close(captured, expected, rtol=0, atol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cuda_cumem_host_table_gathers_and_outlives_its_module():
+    """A rank's own cuMem table gathers like the device shard, and a view of it
+    stays readable by GPU kernels after the module is gone."""
+    from tokenspeed_kernel.ops.embedding import host_gather
+
+    if host_memory.probe_host_memory(0, False):
+        pytest.skip(host_memory.probe_host_memory(0, False))
+    codes, scales = _weights(72, 32)
+    device_embed = RowShardedEngramEmbedding(
+        72, 32, _mapping(0, 1, 1), "cuda:0", False, "gpu", None, 1
+    )
+    device_embed.weight_loader(device_embed.weight, codes)
+    device_embed.weight_loader(device_embed.scale, scales)
+    host_embed = RowShardedEngramEmbedding(
+        72,
+        32,
+        _mapping(0, 1, 1),
+        "cuda:0",
+        True,
+        "shared",
+        EngramHostAlloc("cumem", "interleave"),
+        1,
+    )
+    host_embed.weight_loader(host_embed.weight, codes)
+    host_embed.weight_loader(host_embed.scale, scales)
+    assert host_embed.cumem is not None
+    assert host_embed.cumem.numa_nodes == (host_memory.host_numa_node(0),)
+    ids = torch.tensor([3, 4, 5, 0, 71], device="cuda:0")
+    torch.testing.assert_close(
+        host_embed(ids, query_shard=None),
+        device_embed(ids, query_shard=None),
+        rtol=0,
+        atol=0,
+    )
+    rows = host_embed.weight.detach().view(torch.uint8)
+    del host_embed
+    gc.collect()
+    gathered = host_gather.uint8_row_gather(rows, ids, None)
+    torch.testing.assert_close(
+        gathered.cpu(), codes.view(torch.uint8)[ids.cpu()], rtol=0, atol=0
+    )
+
+
 @pytest.mark.parametrize("counts", [(2, 1, 1, 1), (1, 1, 0, 0)])
 def test_query_sharded_embedding_matches_full_lookup(monkeypatch, counts):
     from tokenspeed.runtime.execution.query_shard import QueryShardPlan
@@ -1178,7 +1338,7 @@ def test_query_sharded_embedding_matches_full_lookup(monkeypatch, counts):
     monkeypatch.setattr(engram, "all_reduce", lambda tensor, **kwargs: tensor)
     for rank in range(4):
         table = RowShardedEngramEmbedding(
-            19, 64, _mapping(rank, 4, 4), "cpu", False, "gpu", 1
+            19, 64, _mapping(rank, 4, 4), "cpu", False, "gpu", None, 1
         )
         table.weight_loader(table.weight, codes)
         table.weight_loader(table.scale, scales)
@@ -1209,3 +1369,635 @@ def test_query_sharded_embedding_matches_full_lookup(monkeypatch, counts):
         monkeypatch.setattr(engram, "token_reduce_scatter", scatter)
         actual = table(ids[plan.local_row_ids], query_shard=plan)
         torch.testing.assert_close(actual, expected[plan.local_row_ids], rtol=0, atol=0)
+
+
+# Linux mmap constants for the file-backed stand-in of CUDA's memory mapping.
+_PROT_NONE, _PROT_READ_WRITE = 0, 3
+_MAP_SHARED, _MAP_PRIVATE, _MAP_FIXED = 0x1, 0x2, 0x10
+_MAP_ANONYMOUS, _MAP_NORESERVE = 0x20, 0x4000
+# libc mmap places the stand-in's chunks, so they are whole OS pages: 4 KiB on
+# x86, 64 KiB on aarch64 hosts such as GB300.
+_PAGE = mmap.PAGESIZE
+# Packed rows take 66 bytes (64 FP8 codes, two E8M0 scales): _ROWS of them fill
+# four pages, the last one partly, and row _STRADDLE spans the first boundary.
+_ROWS = 200 * _PAGE // 4096
+_STRADDLE = _PAGE // 66
+
+
+def _write_meminfo(root: Path, node: int, total: int, free: int) -> None:
+    directory = root / f"node{node}"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "meminfo").write_text(
+        f"Node {node} MemTotal:       {total // 1024} kB\n"
+        f"Node {node} MemFree:        {free // 1024} kB\n"
+        f"Node {node} Active(file):   0 kB\n"
+        f"Node {node} Inactive(file): 0 kB\n"
+        f"Node {node} KReclaimable:   0 kB\n"
+        f"Node {node} HugePages_Total:     0\n"
+    )
+
+
+class _ChunkFile:
+    def __init__(self, path: str, flags: int):
+        self.path = path
+        self.fd = os.open(path, flags, 0o600)
+
+
+class _FileChunkDriver:
+    """host_memory's CUDA driver calls on a host without a GPU.
+
+    Only the driver is replaced. A chunk is a file whose FABRIC handle is its
+    name, so spawned ranks import chunks by name; libc mmap places chunks at
+    reserved addresses, as cuMemMap does. Creating a chunk takes its size,
+    plus ``extra_use`` bytes that another allocation takes meanwhile, off the
+    fake node's MemFree; releasing it gives its size back. ``fail_export``
+    and ``fail_import`` make those calls fail with a driver error.
+    """
+
+    granule = _PAGE
+    _chunk_ids = itertools.count()
+
+    def __init__(
+        self,
+        directory: Path,
+        meminfo: Path,
+        numa_node: int,
+        fail_export: bool,
+        fail_import: bool,
+        extra_use: int,
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
+        self.directory = directory
+        self.meminfo = meminfo
+        self.numa_node = numa_node
+        self.fail_export = fail_export
+        self.fail_import = fail_import
+        self.extra_use = extra_use
+        self.events: list[tuple] = []
+        self._sizes: dict[str, int] = {}
+        self._nodes: dict[str, int] = {}
+        libc = ctypes.CDLL(None, use_errno=True)
+        self._mmap = libc.mmap
+        self._mmap.restype = ctypes.c_void_p
+        self._mmap.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_long,
+        ]
+        self._munmap = libc.munmap
+        self._munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+
+    def _place(self, address, nbytes, prot, flags, fd) -> int:
+        placed = self._mmap(address, nbytes, prot, flags, fd, 0)
+        if placed in (None, ctypes.c_void_p(-1).value):
+            raise OSError(ctypes.get_errno(), "mmap failed")
+        return placed
+
+    def _take(self, node: int, nbytes: int) -> None:
+        memory = host_memory.node_memory(node)
+        _write_meminfo(self.meminfo, node, memory.total, memory.free - nbytes)
+
+    def ensure_context(self, device_index: int) -> None:
+        pass
+
+    def host_numa_node(self, device_index: int) -> int:
+        return self.numa_node
+
+    def granularity(self, numa_node: int, exportable: bool) -> int:
+        return self.granule
+
+    def create(self, nbytes: int, numa_node: int, exportable: bool) -> _ChunkFile:
+        path = str(self.directory / f"chunk-{os.getpid()}-{next(self._chunk_ids)}")
+        chunk = _ChunkFile(path, os.O_RDWR | os.O_CREAT | os.O_EXCL)
+        os.ftruncate(chunk.fd, nbytes)
+        self._sizes[path], self._nodes[path] = nbytes, numa_node
+        self._take(numa_node, nbytes + self.extra_use)
+        self.events.append(("create", path, numa_node))
+        return chunk
+
+    def export(self, handle: _ChunkFile) -> bytes:
+        if self.fail_export:
+            raise RuntimeError(
+                "cuMemExportToShareableHandle failed: CUDA_ERROR_NOT_PERMITTED"
+            )
+        return handle.path.encode()
+
+    def import_handle(self, data: bytes) -> _ChunkFile:
+        if self.fail_import:
+            raise RuntimeError(
+                "cuMemImportFromShareableHandle failed: CUDA_ERROR_NOT_PERMITTED"
+            )
+        chunk = _ChunkFile(data.decode(), os.O_RDWR)
+        self.events.append(("import", chunk.path))
+        return chunk
+
+    def release(self, handle: _ChunkFile) -> None:
+        os.close(handle.fd)
+        if handle.path in self._sizes:
+            self._take(self._nodes[handle.path], -self._sizes.pop(handle.path))
+        self.events.append(("release", handle.path))
+
+    def reserve(self, nbytes: int, alignment: int) -> int:
+        flags = _MAP_PRIVATE | _MAP_ANONYMOUS | _MAP_NORESERVE
+        address = self._place(None, nbytes, _PROT_NONE, flags, -1)
+        self.events.append(("reserve", address, nbytes))
+        return address
+
+    def free(self, address: int, nbytes: int) -> None:
+        assert self._munmap(address, nbytes) == 0
+        self.events.append(("free", address, nbytes))
+
+    def map(self, address: int, nbytes: int, handle: _ChunkFile) -> None:
+        flags = _MAP_SHARED | _MAP_FIXED
+        self._place(address, nbytes, _PROT_READ_WRITE, flags, handle.fd)
+        self.events.append(("map", address, nbytes, handle.path))
+
+    def unmap(self, address: int, nbytes: int) -> None:
+        # Like cuMemUnmap, keep the range reserved until it is freed.
+        flags = _MAP_PRIVATE | _MAP_ANONYMOUS | _MAP_NORESERVE | _MAP_FIXED
+        self._place(address, nbytes, _PROT_NONE, flags, -1)
+        self.events.append(("unmap", address, nbytes))
+
+    def set_access(
+        self, address: int, nbytes: int, device_index: int, numa_node: int
+    ) -> None:
+        self.events.append(("access", address, nbytes, numa_node))
+
+    def mapped_chunks(self) -> list[tuple[str, int]]:
+        """(file, NUMA node) of every chunk mapped so far, in address order."""
+        nodes = {e[1]: e[3] for e in self.events if e[0] == "access"}
+        return [(e[3], nodes[e[1]]) for e in self.events if e[0] == "map"]
+
+    def all_released(self) -> bool:
+        def count(kind, fields):
+            return sorted(e[fields] for e in self.events if e[0] == kind)
+
+        acquired = sorted(e[1] for e in self.events if e[0] in ("create", "import"))
+        return (
+            count("map", slice(1, 3)) == count("unmap", slice(1, 3))
+            and count("reserve", slice(1, 3)) == count("free", slice(1, 3))
+            and acquired == count("release", 1)
+        )
+
+
+class _Warnings(logging.Handler):
+    def __init__(self):
+        super().__init__(logging.WARNING)
+        self.messages: list[str] = []
+
+    def emit(self, record):
+        self.messages.append(record.getMessage())
+
+
+@contextlib.contextmanager
+def _engram_warnings():
+    # The Engram logger does not propagate to pytest's capture.
+    handler = _Warnings()
+    engram.logger.addHandler(handler)
+    try:
+        yield handler.messages
+    finally:
+        engram.logger.removeHandler(handler)
+
+
+@pytest.fixture
+def file_chunks(tmp_path, monkeypatch):
+    """Install a file-backed NVIDIA host memory driver over two 1 GiB NUMA nodes."""
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    (tmp_path / "shm").mkdir()
+    monkeypatch.setitem(
+        global_server_args_dict, "engram_host_table_dir", str(tmp_path / "shm")
+    )
+    monkeypatch.setattr(host_memory, "_NODE_ROOT", tmp_path / "nodes")
+    monkeypatch.setattr(host_memory, "platform_supported", lambda: True)
+
+    def install(free: int, extra_use: int) -> _FileChunkDriver:
+        for node in (0, 1):
+            _write_meminfo(tmp_path / "nodes", node, 1 << 30, free)
+        driver = _FileChunkDriver(
+            tmp_path / "chunks", tmp_path / "nodes", 0, False, False, extra_use
+        )
+        monkeypatch.setattr(host_memory, "_driver", lambda: driver)
+        return driver
+
+    host_memory.probe_host_memory.cache_clear()
+    yield install
+    host_memory.probe_host_memory.cache_clear()
+
+
+def _expected_lookup(codes, scales, ids):
+    rows = codes.shape[0]
+    expected = _dequant(codes, scales)[ids.clamp(0, rows - 1)]
+    expected[(ids < 0) | (ids >= rows)] = 0
+    return expected
+
+
+def test_cumem_table_of_a_single_rank_is_private_and_matches_the_gpu_path(
+    file_chunks, monkeypatch
+):
+    driver = file_chunks(1 << 30, 0)
+    monkeypatch.setattr(engram, "_CUMEM_CHUNK_BYTES", _PAGE)
+    codes, scales = _weights(_ROWS, 64)
+    table = RowShardedEngramEmbedding(
+        _ROWS,
+        64,
+        _mapping(0, 1, 1),
+        "cpu",
+        True,
+        "shared",
+        EngramHostAlloc("cumem", "interleave"),
+        1,
+    )
+    table.weight_loader(table.weight, codes)
+    table.weight_loader(table.scale, scales)
+    assert table.cumem is not None and table.cumem.handles == ()
+    assert table.packed.data_ptr() == table.cumem.tensor.data_ptr()
+    # Four page-sized chunks, all on the rank's own node.
+    assert [node for _, node in driver.mapped_chunks()] == [0, 0, 0, 0]
+    assert not os.listdir(engram.global_server_args_dict["engram_host_table_dir"])
+    ids = torch.tensor([[0, _STRADDLE - 1, _STRADDLE, _ROWS - 1, -1, _ROWS]])
+    torch.testing.assert_close(
+        table(ids, query_shard=None),
+        _expected_lookup(codes, scales, ids),
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_cumem_table_mapping_outlives_the_module(file_chunks):
+    driver = file_chunks(1 << 30, 0)
+    codes, scales = _weights(19, 64)
+    table = RowShardedEngramEmbedding(
+        19,
+        64,
+        _mapping(0, 1, 1),
+        "cpu",
+        True,
+        "shared",
+        EngramHostAlloc("cumem", "writer"),
+        1,
+    )
+    table.weight_loader(table.weight, codes)
+    table.weight_loader(table.scale, scales)
+    weight = table.weight.detach()
+    del table
+    gc.collect()
+    # A surviving view keeps the mapping; reading it must not fault.
+    assert not [event for event in driver.events if event[0] == "unmap"]
+    assert torch.equal(weight.view(torch.uint8), codes.view(torch.uint8))
+    del weight
+    gc.collect()
+    assert [event[0] for event in driver.events[-3:]] == ["unmap", "free", "release"]
+    assert driver.all_released()
+
+
+def test_cumem_mode_raises_and_auto_falls_back_without_a_driver(monkeypatch):
+    # An NVIDIA host whose CUDA driver API cannot load.
+    monkeypatch.setattr(host_memory, "platform_supported", lambda: True)
+    monkeypatch.setattr(host_memory, "_driver", lambda: None)
+    host_memory.probe_host_memory.cache_clear()
+    mapping = _mapping(0, 1, 1)
+    with pytest.raises(RuntimeError, match="needs an NVIDIA GPU"):
+        RowShardedEngramEmbedding(
+            19,
+            64,
+            mapping,
+            "cpu",
+            True,
+            "shared",
+            EngramHostAlloc("cumem", "writer"),
+            1,
+        )
+    with _engram_warnings() as warnings:
+        table = RowShardedEngramEmbedding(
+            19, 64, mapping, "cpu", True, "shared", EngramHostAlloc("auto", "writer"), 1
+        )
+    assert table.cumem is None
+    # The one warning gives the reason.
+    assert len(warnings) == 1 and "falls back" in warnings[0]
+    assert "needs an NVIDIA GPU" in warnings[0]
+    codes, scales = _weights(19, 64)
+    table.weight_loader(table.weight, codes)
+    table.weight_loader(table.scale, scales)
+    ids = torch.tensor([[0, 18, 19]])
+    torch.testing.assert_close(
+        table(ids, query_shard=None),
+        _expected_lookup(codes, scales, ids),
+        rtol=0,
+        atol=0,
+    )
+    host_memory.probe_host_memory.cache_clear()
+
+
+def test_mmap_sharded_and_non_nvidia_tables_never_touch_the_driver(monkeypatch):
+    def no_driver():
+        raise AssertionError("this table must not use host-NUMA cuMem")
+
+    monkeypatch.setattr(host_memory, "_driver", no_driver)
+    host_memory.probe_host_memory.cache_clear()
+    for nvidia, layout, mode in (
+        (True, "shared", "mmap"),
+        (True, "sharded", "auto"),
+        # Off NVIDIA, auto keeps mmap without a probe, a collective or a warning.
+        (False, "shared", "auto"),
+    ):
+        monkeypatch.setattr(
+            host_memory, "platform_supported", lambda supported=nvidia: supported
+        )
+        with _engram_warnings() as warnings:
+            table = RowShardedEngramEmbedding(
+                19,
+                64,
+                _mapping(0, 1, 1),
+                "cpu",
+                True,
+                layout,
+                EngramHostAlloc(mode, "interleave"),
+                1,
+            )
+        assert table.cumem is None and not warnings
+    with pytest.raises(ValueError, match="shared layout"):
+        RowShardedEngramEmbedding(
+            19,
+            64,
+            _mapping(0, 1, 1),
+            "cpu",
+            True,
+            "sharded",
+            EngramHostAlloc("cumem", "writer"),
+            1,
+        )
+    with pytest.raises(TypeError, match="EngramHostAlloc"):
+        RowShardedEngramEmbedding(
+            19, 64, _mapping(0, 1, 1), "cpu", True, "shared", None, 1
+        )
+    with pytest.raises(ValueError, match="no host allocation"):
+        RowShardedEngramEmbedding(
+            19, 64, _mapping(0, 1, 1), "cpu", False, "gpu", _MMAP, 1
+        )
+    with pytest.raises(ValueError, match="auto, cumem or mmap"):
+        EngramHostAlloc("hugetlb", "writer")
+    with pytest.raises(ValueError, match="interleave or writer"):
+        EngramHostAlloc("auto", "local")
+    host_memory.probe_host_memory.cache_clear()
+
+
+@pytest.mark.parametrize("stage", ["before", "during"])
+def test_cumem_table_keeps_the_numa_reserve_and_says_why_it_falls_back(
+    file_chunks, monkeypatch, stage
+):
+    """Creation stops before a node drops below 5% of its memory: up front when
+    the table cannot fit, or after a chunk when other allocations shrank the
+    node meanwhile. Either way nothing stays allocated and the warning shows
+    the measured memory."""
+    monkeypatch.setattr(engram, "_CUMEM_CHUNK_BYTES", _PAGE)
+    # The node's reserve, rounded up to the kB that meminfo counts in.
+    reserve = -(-int((1 << 30) * engram._CUMEM_NUMA_RESERVE) // 1024) * 1024
+
+    def install():
+        # _ROWS rows pack into four one-page chunks. "during": each page
+        # created also loses two pages to other allocations, so the third
+        # chunk crosses (the first probe's granule costs two pages as well).
+        if stage == "before":
+            return file_chunks(reserve + 2 * _PAGE, 0)
+        return file_chunks(reserve + 8 * _PAGE, 2 * _PAGE)
+
+    driver = install()
+    expected = "would leave less" if stage == "before" else "fell below"
+    with _engram_warnings() as warnings:
+        table = RowShardedEngramEmbedding(
+            _ROWS,
+            64,
+            _mapping(0, 1, 1),
+            "cpu",
+            True,
+            "shared",
+            EngramHostAlloc("auto", "writer"),
+            1,
+        )
+    assert table.cumem is None
+    assert len(warnings) == 1 and expected in warnings[0]
+    assert "GiB available" in warnings[0] and "reserve" in warnings[0]
+    assert not driver.mapped_chunks() and driver.all_released()
+    creates = [event for event in driver.events if event[0] == "create"]
+    # The probe's granule, then nothing ("before") or three chunks ("during").
+    assert len(creates) == (1 if stage == "before" else 4)
+    install()
+    with pytest.raises(RuntimeError, match=expected):
+        RowShardedEngramEmbedding(
+            _ROWS,
+            64,
+            _mapping(0, 1, 1),
+            "cpu",
+            True,
+            "shared",
+            EngramHostAlloc("cumem", "writer"),
+            1,
+        )
+
+
+def _cumem_rank(rank: int, directory: Path, scenario: str) -> None:
+    """One of four gloo ranks building a shared cuMem table on CPU.
+
+    one_host: rank 0 creates, ranks 1-3 import. two_hosts: ranks 0-1 and 2-3
+    are two hosts, each with its own writer and table. import_fails: rank 2
+    cannot import, so every rank falls back to the shared mmap file.
+    probe_fails_two_writers: rank 3 cannot export FABRIC handles, and ranks 0
+    and 2 both write the one host's table, so every rank falls back before
+    any table memory is created. Only rank 0 warns about a fallback.
+    """
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    # These ranks stand in for GPU-less hosts: on a GPU runner the fallback
+    # scenarios would otherwise cudaHostRegister the shared file from four
+    # processes on one GPU. GPU registration of the shared file has its own
+    # test (test_cuda_shared_file_host_table_is_registered_and_gathers).
+    torch.cuda.is_available = lambda: False
+    per_host = 2 if scenario == "two_hosts" else 4
+    host = rank // per_host
+    falls_back = scenario in ("import_fails", "probe_fails_two_writers")
+    # With two writers, ranks 0 and 2 of the one host both get LOCAL_RANK 0.
+    local_ranks = 2 if scenario == "probe_fails_two_writers" else per_host
+    os.environ["LOCAL_RANK"] = str(rank % local_ranks)
+    dist.init_process_group(
+        "gloo",
+        init_method=(directory / "rendezvous").as_uri(),
+        rank=rank,
+        world_size=4,
+        timeout=timedelta(seconds=60),
+    )
+    try:
+        # Each rank reads its own copy of the fake node memory.
+        meminfo = directory / f"nodes-{rank}"
+        driver = _FileChunkDriver(
+            directory / f"chunks-{host}",
+            meminfo,
+            # GPUs 0-1 sit on NUMA node 0, GPUs 2-3 on node 1.
+            rank // 2,
+            scenario == "probe_fails_two_writers" and rank == 3,
+            scenario == "import_fails" and rank == 2,
+            0,
+        )
+        host_memory.platform_supported = lambda: True
+        host_memory._driver = lambda: driver
+        host_memory._NODE_ROOT = meminfo
+        engram.host_identity = lambda: 1000 + host
+        engram._CUMEM_CHUNK_BYTES = _PAGE
+        global_server_args_dict["engram_host_table_dir"] = str(directory / "shm")
+        numa = "writer" if scenario == "two_hosts" else "interleave"
+        with _engram_warnings() as warnings:
+            table = RowShardedEngramEmbedding(
+                _ROWS,
+                64,
+                _mapping(rank, 1, 4),
+                "cpu",
+                True,
+                "shared",
+                EngramHostAlloc("auto", numa),
+                1,
+            )
+        # One warning for the whole job, with every rank's reason.
+        assert len(warnings) == int(falls_back and rank == 0), warnings
+        path = str(directory / "table.safetensors")
+        with safe_open(path, framework="pt", device="cpu") as handle:
+            table.load_sharded("weight", handle.get_slice("weight"), 64)
+            table.load_sharded("scale", handle.get_slice("scale"), 64)
+        dist.barrier()
+        codes, scales = _weights(_ROWS, 64)
+        assert torch.equal(table.weight.view(torch.uint8), codes.view(torch.uint8))
+        assert torch.equal(table.scale, scales)
+        ids = torch.tensor([[0, _STRADDLE - 1, _STRADDLE, _ROWS - 1, -1, _ROWS]])
+        torch.testing.assert_close(
+            table(ids, query_shard=None),
+            _expected_lookup(codes, scales, ids),
+            rtol=0,
+            atol=0,
+        )
+        chunks = [None] * 4
+        dist.all_gather_object(chunks, driver.mapped_chunks())
+        if scenario == "import_fails":
+            assert table.cumem is None and driver.all_released()
+            assert chunks[2] == [] and all(len(c) == 4 for c in chunks[:2] + chunks[3:])
+            if rank == 0:
+                assert "rank 2: RuntimeError: cuMemImport" in warnings[0]
+        elif scenario == "probe_fails_two_writers":
+            assert table.cumem is None and driver.all_released()
+            # Each rank created only its probe's granule, and mapped nothing.
+            assert [event[0] for event in driver.events].count("create") == 1
+            assert chunks == [[]] * 4
+            if rank == 0:
+                assert "rank 3: RuntimeError: cuMemExport" in warnings[0]
+                assert "a host has 2 writer ranks instead of one" in warnings[0]
+        else:
+            assert table.cumem is not None
+            assert not os.listdir(directory / "shm")
+            hosts = [chunks[:2], chunks[2:]] if per_host == 2 else [chunks]
+            for host_chunks in hosts:
+                assert all(c == host_chunks[0] for c in host_chunks)
+            if scenario == "one_host":
+                # Chunks alternate over the NUMA nodes of the host's GPUs.
+                assert [node for _, node in chunks[0]] == [0, 1, 0, 1]
+            else:
+                # Each writer keeps its host's table on its own GPU's node.
+                assert [node for _, node in chunks[0]] == [0] * 4
+                assert [node for _, node in chunks[2]] == [1] * 4
+                assert not {f for f, _ in chunks[0]} & {f for f, _ in chunks[2]}
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize(
+    "scenario", ["one_host", "two_hosts", "import_fails", "probe_fails_two_writers"]
+)
+def test_ranks_share_one_cumem_table_per_host_or_fall_back_together(tmp_path, scenario):
+    codes, scales = _weights(_ROWS, 64)
+    save_file(
+        {"weight": codes, "scale": scales.view(torch.float8_e8m0fnu)},
+        str(tmp_path / "table.safetensors"),
+        metadata=None,
+    )
+    (tmp_path / "shm").mkdir()
+    for rank in range(4):
+        for node in (0, 1):
+            _write_meminfo(tmp_path / f"nodes-{rank}", node, 1 << 30, 1 << 30)
+    mp.spawn(_cumem_rank, args=(tmp_path, scenario), nprocs=4, join=True)
+
+
+def test_torchrun_ranks_share_a_cumem_host_table(monkeypatch):
+    """Four GPU ranks map one host-NUMA cuMem table through FABRIC handles.
+
+    The writer creates it in chunks alternating over the GPUs' NUMA nodes and
+    loads it; the others import it. Every rank's CPU view holds the writer's
+    bytes, and every GPU gathers rows across chunk boundaries, as BF16 and as
+    wkv's MXFP8 input, bit for bit.
+    """
+    from tokenspeed_kernel.ops.embedding import host_gather
+
+    if int(os.environ.get("WORLD_SIZE", "1")) != 4:
+        pytest.skip("launch with torchrun --nproc_per_node=4")
+    rank = int(os.environ["RANK"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    device = torch.device(f"cuda:{local_rank}")
+    torch.cuda.set_device(device)
+    # 2 MiB chunks: the 4.6 MB table spans three, and rows 31775 and 63550
+    # straddle their boundaries.
+    monkeypatch.setattr(engram, "_CUMEM_CHUNK_BYTES", 2 << 20)
+    dist.init_process_group(
+        "gloo",
+        init_method="env://",
+        rank=rank,
+        world_size=4,
+        timeout=timedelta(seconds=120),
+    )
+    try:
+        # FABRIC support is a property of the host: skip on every rank.
+        errors = [None] * 4
+        dist.all_gather_object(errors, host_memory.probe_host_memory(local_rank, True))
+        if any(errors):
+            pytest.skip(f"FABRIC host memory unavailable: {errors}")
+        rows = 70000
+        codes, scales = _weights(rows, 64)
+        table = RowShardedEngramEmbedding(
+            rows,
+            64,
+            _mapping(rank, 1, 4),
+            device,
+            True,
+            "shared",
+            EngramHostAlloc("cumem", "interleave"),
+            1,
+        )
+        assert table.cumem is not None
+        # Only the writer holds FABRIC handles; the others imported them.
+        assert bool(table.cumem.handles) == (local_rank == 0)
+        nodes = sorted({host_memory.host_numa_node(index) for index in range(4)})
+        placement = [node for _, _, node in table.cumem.chunks]
+        assert placement == [
+            nodes[index % len(nodes)] for index in range(len(placement))
+        ]
+        if local_rank == 0:
+            table.weight_loader(table.weight, codes)
+            table.weight_loader(table.scale, scales)
+        dist.barrier()
+        packed = torch.cat([codes.view(torch.uint8), scales], dim=1)
+        assert torch.equal(table.packed, packed)
+        ids = torch.tensor(
+            [[0, 31774, 31775, 31776, 63550, rows - 1, -1, rows]], device=device
+        )
+        torch.testing.assert_close(
+            table(ids, query_shard=None),
+            _expected_lookup(codes, scales, ids.cpu()).to(device),
+            rtol=0,
+            atol=0,
+        )
+        expected = host_gather.mxfp8_row_gather(packed.to(device), ids, None, None)
+        for actual, reference in zip(table.mxfp8_rows(ids), expected, strict=True):
+            assert torch.equal(actual.view(torch.uint8), reference.view(torch.uint8))
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
