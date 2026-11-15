@@ -1,0 +1,32 @@
+[
+  {
+    "name": "diagnostic-b128-p524288-s2-e0",
+    "config": {
+      "batch": 128,
+      "prompt": 524288,
+      "steps": 2,
+      "page": 64,
+      "hit_percent": 0,
+      "prefix_cache": true,
+      "events": false,
+      "profile": true,
+      "warmups": 1,
+      "repeats": 5
+    }
+  },
+  {
+    "name": "diagnostic-b128-p524288-s2-e1",
+    "config": {
+      "batch": 128,
+      "prompt": 524288,
+      "steps": 2,
+      "page": 64,
+      "hit_percent": 0,
+      "prefix_cache": true,
+      "events": true,
+      "profile": true,
+      "warmups": 1,
+      "repeats": 5
+    }
+  }
+]

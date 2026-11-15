@@ -107,6 +107,7 @@ fn bench_commit_decode() {
         let rid = format!("r{i}");
         let mut state = RequestState::new(vec![0; 16], 1 << 30, BTreeSet::new(), true, None, false);
         p.assign_admission(&mut state);
+        p.assign_admission(&mut state);
         p.register(rid.clone(), state);
         let _ = p
             .commit(
@@ -211,8 +212,24 @@ result = ts.Scheduler(cfg)
 /// decode row stores its verify window and keeps `accepted` tokens of it.
 /// Plans go to another thread, which frees them, as the host's forward
 /// thread does.
+enum PlanJob {
+    Plan(ExecutionPlan),
+    Fence(mpsc::Sender<()>),
+}
+
+fn free_plans(receiver: mpsc::Receiver<PlanJob>) {
+    for job in receiver {
+        match job {
+            PlanJob::Plan(plan) => drop(plan),
+            PlanJob::Fence(done) => {
+                let _ = done.send(());
+            }
+        }
+    }
+}
+
 struct InstantDevice {
-    plans: mpsc::Sender<ExecutionPlan>,
+    plans: mpsc::Sender<PlanJob>,
     verify_width: usize,
     accepted: i32,
 }
@@ -229,7 +246,7 @@ impl DataPlane for InstantDevice {
         plan: ExecutionPlan,
         dispatch: &Dispatch<'_>,
     ) -> Result<Option<ForwardResult>, DataPlaneError> {
-        let _ = self.plans.send(plan);
+        let _ = self.plans.send(PlanJob::Plan(plan));
         Ok(dispatch.forward.map(|batch| {
             let decodes = batch.request_ids.len() - batch.num_extends;
             let mut output_lengths = vec![1; batch.num_extends];
@@ -377,36 +394,8 @@ impl Frontend for ChurningFrontend {
     fn reply(&mut self, _: ControlOutput) {}
 }
 
-/// Run `shape`'s rounds on one rank and print the microseconds per round.
-fn bench_rounds(name: &str, shape: RoundShape) {
-    let generated = if shape.generate > 0 {
-        shape.generate
-    } else {
-        (shape.warmup_rounds + shape.rounds + 1) * shape.accepted
-    };
-    // Every row may hold its whole request, and a verify window past it.
-    let pages = shape.rows * (shape.prompt + generated + shape.verify_width + 2 * shape.page)
-        / shape.page
-        + 64;
-    let listener = Listener::bind("127.0.0.1").unwrap();
-    let address = format!("127.0.0.1:{}", listener.port().unwrap());
-    let ranks = Ranks {
-        mesh: Mesh::connect(0, listener, &[address], Duration::from_secs(5)).unwrap(),
-        replica: Group::new(1, vec![0], 0).unwrap(),
-        pp: None,
-        dp: None,
-        ep: None,
-    };
-    let (plans, freed) = mpsc::channel::<ExecutionPlan>();
-    let freeing = std::thread::spawn(move || freed.into_iter().for_each(drop));
-    let (encoder, batches) = mpsc::channel::<(Vec<StreamedOutput>, Load)>();
-    let encoding = std::thread::spawn(move || {
-        for (outputs, load) in batches {
-            let batch = ts_control::transport::output_batch(outputs, 0, load);
-            std::hint::black_box(EngineOutput::Batch(Box::new(batch)).to_frames());
-        }
-    });
-    let config = LoopConfig {
+fn round_loop_config(shape: &RoundShape, pages: usize) -> LoopConfig {
+    LoopConfig {
         in_flight_depth: 1,
         prefill_delay: None,
         limits: IngressLimits {
@@ -454,7 +443,39 @@ fn bench_rounds(name: &str, shape: RoundShape) {
         kv_events: false,
         epd_receive_enabled: false,
         eager_grammar: false,
+    }
+}
+
+/// Run `shape`'s rounds on one rank and print the microseconds per round.
+fn bench_rounds(name: &str, shape: RoundShape) {
+    let generated = if shape.generate > 0 {
+        shape.generate
+    } else {
+        (shape.warmup_rounds + shape.rounds + 1) * shape.accepted
     };
+    // Every row may hold its whole request, and a verify window past it.
+    let pages = shape.rows * (shape.prompt + generated + shape.verify_width + 2 * shape.page)
+        / shape.page
+        + 64;
+    let listener = Listener::bind("127.0.0.1").unwrap();
+    let address = format!("127.0.0.1:{}", listener.port().unwrap());
+    let ranks = Ranks {
+        mesh: Mesh::connect(0, listener, &[address], Duration::from_secs(5)).unwrap(),
+        replica: Group::new(1, vec![0], 0).unwrap(),
+        pp: None,
+        dp: None,
+        ep: None,
+    };
+    let (plans, freed) = mpsc::channel::<PlanJob>();
+    let freeing = std::thread::spawn(move || free_plans(freed));
+    let (encoder, batches) = mpsc::channel::<(Vec<StreamedOutput>, Load)>();
+    let encoding = std::thread::spawn(move || {
+        for (outputs, load) in batches {
+            let batch = ts_control::transport::output_batch(outputs, 0, load);
+            std::hint::black_box(EngineOutput::Batch(Box::new(batch)).to_frames());
+        }
+    });
+    let config = round_loop_config(&shape, pages);
     let mut event_loop = EventLoop::new(
         round_scheduler(&shape, pages),
         InstantDevice {
@@ -728,3 +749,7 @@ fn bench_round_decode_long_spec() {
         },
     );
 }
+
+#[cfg(target_os = "linux")]
+#[path = "support/finish_event_loop.rs"]
+mod finish_event_loop;
