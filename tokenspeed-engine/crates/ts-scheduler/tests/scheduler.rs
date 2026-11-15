@@ -1290,3 +1290,70 @@ fn shared_prefix_publication_follows_real_prefill_host_copy_and_put() {
         );
     }
 }
+
+#[test]
+fn rejected_forward_conversion_does_not_apply_a_partial_batch() {
+    interpreter();
+    let mut scheduler =
+        Python::attach(|py| Scheduler::from_python(&run(py, NEW_SCHEDULER)).unwrap());
+    scheduler
+        .submit_requests(&[spec("r", vec![1, 2, 3])])
+        .unwrap();
+    let plan = scheduler.next_execution_plan(true, false);
+    assert_eq!(plan.forward_batches()[0].request_ids, ["r"]);
+    let landed = event(ForwardEventKind::ExtendResult, "r", vec![7]);
+    let unsupported = event(ForwardEventKind { repr: 255 }, "r", Vec::new());
+    assert!(scheduler.advance(&[landed.clone(), unsupported]).is_err());
+    // Conversion is completed before any event is applied. The failed call
+    // does not apply the successfully converted prefix of the input.
+    assert_eq!(scheduler.request_token_size("r"), 3);
+    scheduler
+        .advance(&[landed, event(ForwardEventKind::Finish, "r", Vec::new())])
+        .unwrap();
+    assert_eq!(scheduler.active_lcm_blocks(), 0);
+    assert!(!scheduler.next_execution_plan(true, false).needs_device());
+    // A following call cannot replay events from the failed conversion.
+    scheduler.advance(&[]).unwrap();
+    assert_eq!(scheduler.sizes().running, 0);
+}
+
+#[test]
+fn python_event_lists_keep_their_payload_after_cache_clear() {
+    interpreter();
+    let code = NEW_SCHEDULER.replace(
+        "result = ts.Scheduler(cfg)",
+        "cfg.enable_kv_cache_events = True\ncfg.disable_l2_cache = True\ncfg.enable_l3_storage = False\nresult = ts.Scheduler(cfg)",
+    );
+    let owner = Python::attach(|py| run(py, &code).unbind());
+    let mut scheduler = Python::attach(|py| Scheduler::from_python(owner.bind(py)).unwrap());
+    scheduler
+        .submit_requests(&[spec("r", (1..=33).collect())])
+        .unwrap();
+    assert!(scheduler.next_execution_plan(true, false).needs_device());
+    scheduler
+        .advance(&[
+            event(ForwardEventKind::ExtendResult, "r", vec![99]),
+            event(ForwardEventKind::Finish, "r", Vec::new()),
+        ])
+        .unwrap();
+    assert!(!scheduler.next_execution_plan(true, false).needs_device());
+    Python::attach(|py| {
+        let scope = PyDict::new(py);
+        scope.set_item("scheduler", owner.bind(py)).unwrap();
+        py.run(
+            c"events = scheduler.drain_kv_events()\n\
+              assert [e.kind for e in events] == ['BlockStored'] * 3\n\
+              hashes = [e.block_hashes[0] for e in events]\n\
+              assert [e.parent_block_hash for e in events] == [None, *hashes[:-1]]\n\
+              assert scheduler.clear_cache()\n\
+              removed = scheduler.drain_kv_events()\n\
+              assert [e.kind for e in removed] == ['BlockRemoved'] * 3\n\
+              assert [e.block_hashes[0] for e in removed] == hashes[::-1]\n\
+              assert [t for e in events for t in e.token_ids] == list(range(1, 34))\n\
+              assert [e.block_size for e in events] == [16, 16, 16]",
+            Some(&scope),
+            None,
+        )
+        .unwrap();
+    });
+}

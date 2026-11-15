@@ -320,6 +320,11 @@ def test_gluon_owned_page_scorer_compiles_once_across_batches(device):
     for columns in (16, 17, 96):
         for batch in batches:
             score(*batch, columns)
+    # Decode at its full static width splits spans over the batch, one binary
+    # per bucket of request counts.
+    for requests in (5, 32):
+        score(requests, 1, 1, 4096)
+        score(requests, 4, 4, 4096)
     with assert_no_triton_compile(
         gluon_dsa_decode_topk_fp8_rows_gfx950,
         gluon_dsa_owned_prefill_topk_fp8_rows_gfx950,
@@ -330,6 +335,59 @@ def test_gluon_owned_page_scorer_compiles_once_across_batches(device):
                 score(requests, 4, 4, columns)
             for requests, rows in ((1, 65), (2, 64), (2, 100), (3, 130)):
                 score(requests, rows, 1, columns)
+        for requests in (12, 40):
+            score(requests, 1, 1, 4100)
+            score(requests, 4, 4, 4100)
+
+
+@pytest.mark.parametrize("group", [4, 5])
+def test_gluon_owned_page_decode_runs_over_the_batch_score_alike(
+    group, device, monkeypatch
+):
+    """At decode's full static width, several requests' spans are cut into
+    runs of one length over the batch: a long request, short ones and an
+    almost idle graph row score exactly as with runs per request."""
+    from tokenspeed_kernel_amd.ops.gfx950.attention.dsa import index_candidates
+
+    torch.manual_seed(41 + group)
+    columns = 4096
+    firsts = [150_000, 3000, 0, 9000, 700, 64, 20_000, 1]
+    table = torch.randint(0, 320, (len(firsts), columns), device=device)
+    table = torch.where(torch.rand(table.shape, device=device) < 0.3, -1, table)
+    table = table.to(torch.int32)
+    steps = [(r, first, group) for r, first in enumerate(firsts)]
+    requests, lens, q, q_scales, weights = _rows(steps, 32, device)
+    cache, _ = _pack_index_k_cache(
+        torch.randn(320 * PAGE_SIZE, HEAD_DIM, device=device), PAGE_SIZE
+    )
+    pages = plan_dsa_index_candidates(
+        q, weights, cache, table, requests, lens, page_size=PAGE_SIZE
+    )
+    lengths = pages.lengths.reshape(-1)
+
+    def score():
+        return index_candidates.launch_gluon_dsa_index_candidates_gfx950(
+            q,
+            q_scales,
+            weights,
+            cache,
+            pages.pages,
+            lengths,
+            page_size=PAGE_SIZE,
+            softmax_scale=0.1,
+            query_group_size=group,
+            query_requests=requests,
+            request_count=len(firsts),
+        )
+
+    batch_runs = score()
+    monkeypatch.setattr(index_candidates, "_BALANCE_MIN_REQUESTS", len(firsts) + 1)
+    request_runs = score()
+    valid = torch.arange(batch_runs.shape[1], device=device)[None, :] < lengths[:, None]
+    assert int(lengths.max()) > 64 * int(lengths.float().median())
+    torch.testing.assert_close(
+        batch_runs[valid], request_runs[valid], rtol=0, atol=0, equal_nan=True
+    )
 
 
 def test_gluon_owned_page_prefill_rows_store_past_int32_offsets(device):

@@ -515,8 +515,12 @@ at admission like `promptEndCheckpoint`, is a possible follow-up.
 `Finishing` and nothing else; after every batch of events,
 `settleFinishedRequests` publishes the frontier of each `Finishing` request
 with no forward in flight (`kFinal`: KV tail and state, unless they are
-dead, above) and releases its pages (`ReleaseEvent`). One path for every
-schedule: a request that finished
+dead, above) and releases its pages (`ReleaseEvent`). This final publication
+advances the owner's `CacheProgress` in place: its hashes and checkpoint
+references remain alive through publication and Host-store pinning, then leave
+with `ReleaseEvent`. Finishing does not need a rollback copy of the history.
+Page-reference release still grows with the number of held pages. One path for
+every schedule: a request that finished
 quiescent settles with its Finish event — the timing every caller always
 saw — and one whose finish was decided on a landed token while the overlap
 schedule had already dispatched the next decode settles when that decode's
@@ -1619,6 +1623,18 @@ a decode blocks. A capacity grant that admits a prompt (mixed mode) still runs
 and starts a new interval. The counters follow the plans alone, so mirrored
 ranks agree; under attention DP each replica counts its own rounds. The P and
 D roles refuse the knob: neither runs local prefill and decode on one engine.
+
+**Minimum interval** (`prefill_decode_min_interval` `M`, either mode; `0` is
+off): a round that schedules a local prefill chunk also owes the running
+decodes `M` decode rounds, on the same terms, but no overdue prompt suspends
+them. A suspended interval's overdue chunks then alternate with `M` decode
+rounds instead of running back to back: while a decode can run, no prefill
+round directly follows another. The price is the time-to-first-token bound:
+on top of the interval's `N`, a prompt waits `M` decode steps per prefill
+chunk the engine runs before its last one, its own included. A round that `M`
+holds back counts toward `N` like the interval's own. With `M >= N` the
+interval owes nothing `M` does not; `M` alone bounds nothing. The P and D
+roles refuse it as well.
 
 **Retraction:** the shared victim rule (§2): incomplete prefills first, then
 decode work. The Host cache decides the image's split, not whether there is

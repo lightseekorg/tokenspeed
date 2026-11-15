@@ -86,50 +86,57 @@ std::unique_ptr<tokenspeed::ExecutionPlan> next_execution_plan(tokenspeed::Sched
 
 void advance(tokenspeed::Scheduler& scheduler, rust::Slice<const ForwardEvent> events) {
     tokenspeed::ExecutionEvent execution_event;
-    for (const ForwardEvent& event : events) {
-        std::string request_id(event.request_id);
-        switch (event.kind) {
-            case ForwardEventKind::ExtendResult:
-                execution_event.With(tokenspeed::forward::ExtendResult{
-                    .request_id = std::move(request_id),
-                    .tokens = to_std({event.tokens.data(), event.tokens.size()}),
-                    .spec_candidate_ids =
-                        to_std({event.spec_candidate_ids.data(), event.spec_candidate_ids.size()}),
-                });
-                break;
-            case ForwardEventKind::Finish:
-                execution_event.With(tokenspeed::forward::Finish{.request_id = std::move(request_id)});
-                break;
-            case ForwardEventKind::Abort:
-                execution_event.With(tokenspeed::forward::Abort{.request_id = std::move(request_id)});
-                break;
-            case ForwardEventKind::UpdateReserveNumTokens:
-                execution_event.With(tokenspeed::forward::UpdateReserveNumTokens{
-                    .request_id = std::move(request_id),
-                    .reserve_num_tokens_in_next_schedule_event = event.reserve_num_tokens,
-                });
-                break;
-            case ForwardEventKind::PdBootstrapped:
-                execution_event.With(tokenspeed::pd::BootstrappedEvent(std::move(request_id)));
-                break;
-            case ForwardEventKind::PdFailed:
-                execution_event.With(tokenspeed::pd::FailedEvent(std::move(request_id)));
-                break;
-            case ForwardEventKind::PdTransferStopped:
-                execution_event.With(tokenspeed::pd::TransferStoppedEvent(std::move(request_id)));
-                break;
-            case ForwardEventKind::PdSucceeded:
-                execution_event.With(tokenspeed::pd::SucceededEvent(std::move(request_id)));
-                break;
-            case ForwardEventKind::PdRemotePrefillDone:
-                execution_event.With(
-                    tokenspeed::pd::RemotePrefillDoneEvent(std::move(request_id), event.bootstrap_token));
-                break;
-            default:
-                throw std::invalid_argument("unknown forward event kind");
+    {
+        tokenspeed::ProfileSpan conversion{"SchedulerBridge::convertForwardEvents"};
+        for (const ForwardEvent& event : events) {
+            std::string request_id(event.request_id);
+            switch (event.kind) {
+                case ForwardEventKind::ExtendResult:
+                    execution_event.With(tokenspeed::forward::ExtendResult{
+                        .request_id = std::move(request_id),
+                        .tokens = to_std({event.tokens.data(), event.tokens.size()}),
+                        .spec_candidate_ids =
+                            to_std({event.spec_candidate_ids.data(), event.spec_candidate_ids.size()}),
+                    });
+                    break;
+                case ForwardEventKind::Finish:
+                    execution_event.With(tokenspeed::forward::Finish{.request_id = std::move(request_id)});
+                    break;
+                case ForwardEventKind::Abort:
+                    execution_event.With(tokenspeed::forward::Abort{.request_id = std::move(request_id)});
+                    break;
+                case ForwardEventKind::UpdateReserveNumTokens:
+                    execution_event.With(tokenspeed::forward::UpdateReserveNumTokens{
+                        .request_id = std::move(request_id),
+                        .reserve_num_tokens_in_next_schedule_event = event.reserve_num_tokens,
+                    });
+                    break;
+                case ForwardEventKind::PdBootstrapped:
+                    execution_event.With(tokenspeed::pd::BootstrappedEvent(std::move(request_id)));
+                    break;
+                case ForwardEventKind::PdFailed:
+                    execution_event.With(tokenspeed::pd::FailedEvent(std::move(request_id)));
+                    break;
+                case ForwardEventKind::PdTransferStopped:
+                    execution_event.With(tokenspeed::pd::TransferStoppedEvent(std::move(request_id)));
+                    break;
+                case ForwardEventKind::PdSucceeded:
+                    execution_event.With(tokenspeed::pd::SucceededEvent(std::move(request_id)));
+                    break;
+                case ForwardEventKind::PdRemotePrefillDone:
+                    execution_event.With(
+                        tokenspeed::pd::RemotePrefillDoneEvent(std::move(request_id), event.bootstrap_token));
+                    break;
+                default:
+                    throw std::invalid_argument("unknown forward event kind");
+            }
         }
     }
     scheduler.Advance(execution_event);
+    {
+        tokenspeed::ProfileSpan destruction{"SchedulerBridge::destroyForwardEvents"};
+        execution_event = {};
+    }
 }
 
 void advance_head(tokenspeed::Scheduler& scheduler, rust::Slice<const StorageTickView> ticks,
@@ -264,25 +271,64 @@ CacheGroupPages cache_group_pages(const tokenspeed::Scheduler& scheduler, rust::
     };
 }
 
-rust::Vec<KvEventView> drain_kv_events(tokenspeed::Scheduler& scheduler) {
-    rust::Vec<KvEventView> views;
-    for (auto& event : scheduler.DrainKvEvents()) {
-        KvEventView view{};
-        if (auto* stored = std::get_if<tokenspeed::KvBlockStoredEvent>(&event)) {
-            view.stored = true;
-            for (auto hash : stored->block_hashes) view.block_hashes.push_back(hash);
-            view.has_parent = stored->parent_block_hash.has_value();
-            view.parent_block_hash = stored->parent_block_hash.value_or(0);
-            for (auto token : stored->token_ids) view.token_ids.push_back(token);
-            view.block_size = stored->block_size;
+std::unique_ptr<tokenspeed::KvEventBatch> drain_kv_events(tokenspeed::Scheduler& scheduler) {
+    auto batch = scheduler.DrainKvEventBatch();
+    if (batch.Empty()) return nullptr;
+    return std::make_unique<tokenspeed::KvEventBatch>(std::move(batch));
+}
+
+std::unique_ptr<tokenspeed::KvEventBatch> make_kv_event_batch(rust::Slice<const KvEventView> events) {
+    if (events.empty()) return nullptr;
+    auto batch = std::make_unique<tokenspeed::KvEventBatch>();
+    for (const auto& event : events) {
+        const std::span<const std::uint64_t> hashes{event.block_hashes.data(), event.block_hashes.size()};
+        if (event.stored) {
+            batch->Store(hashes, event.has_parent ? std::optional{event.parent_block_hash} : std::nullopt,
+                         {event.token_ids.data(), event.token_ids.size()}, event.block_size);
         } else {
-            const auto& removed = std::get<tokenspeed::KvBlockRemovedEvent>(event);
-            view.stored = false;
-            for (auto hash : removed.block_hashes) view.block_hashes.push_back(hash);
+            batch->Remove(hashes);
         }
-        views.push_back(std::move(view));
     }
-    return views;
+    return batch;
+}
+
+std::size_t kv_event_batch_size(const tokenspeed::KvEventBatch& batch) {
+    return batch.Size();
+}
+std::size_t kv_event_batch_bytes(const tokenspeed::KvEventBatch& batch) {
+    return batch.ByteSize();
+}
+rust::Slice<const std::uint8_t> kv_event_stored(const tokenspeed::KvEventBatch& batch) {
+    const auto values = batch.Stored();
+    return {values.data(), values.size()};
+}
+rust::Slice<const std::uint8_t> kv_event_has_parent(const tokenspeed::KvEventBatch& batch) {
+    const auto values = batch.HasParent();
+    return {values.data(), values.size()};
+}
+rust::Slice<const std::uint64_t> kv_event_parents(const tokenspeed::KvEventBatch& batch) {
+    const auto values = batch.Parents();
+    return {values.data(), values.size()};
+}
+rust::Slice<const std::int32_t> kv_event_block_sizes(const tokenspeed::KvEventBatch& batch) {
+    const auto values = batch.BlockSizes();
+    return {values.data(), values.size()};
+}
+rust::Slice<const std::size_t> kv_event_hash_offsets(const tokenspeed::KvEventBatch& batch) {
+    const auto values = batch.HashOffsets();
+    return {values.data(), values.size()};
+}
+rust::Slice<const std::size_t> kv_event_token_offsets(const tokenspeed::KvEventBatch& batch) {
+    const auto values = batch.TokenOffsets();
+    return {values.data(), values.size()};
+}
+rust::Slice<const std::uint64_t> kv_event_hashes(const tokenspeed::KvEventBatch& batch) {
+    const auto values = batch.Hashes();
+    return {values.data(), values.size()};
+}
+rust::Slice<const std::int32_t> kv_event_tokens(const tokenspeed::KvEventBatch& batch) {
+    const auto values = batch.Tokens();
+    return {values.data(), values.size()};
 }
 
 std::int32_t request_token_size(const tokenspeed::Scheduler& scheduler, rust::Str request_id) {

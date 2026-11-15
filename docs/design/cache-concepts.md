@@ -1639,6 +1639,14 @@ Its responsibilities:
   checks. Nothing is decided
   mid-`Admit`, so one admission may evict a boundary's last cached copy and
   then store the request's own copy without any ordering hazard.
+  The scheduler and routing view share immutable boundary descriptors. A drain
+  reads current residency once, then the routing view computes net visibility
+  changes and orders them once: removals child-first, stores parent-first.
+  Its output is an owned `KvEventBatch` with contiguous scalar/token/hash
+  columns and offsets. It holds no request, cache block, or descriptor reference,
+  so the cache can change or be cleared while an earlier batch is being encoded.
+  The Rust engine moves this snapshot across the bridge; Python's existing list
+  API materializes event objects from the same snapshot at its boundary.
   Admission may pre-hash prompt pages beyond the computed prefix. An early
   junction or retraction tail uses the parent hash at its published frontier,
   even when the request's hash memo already contains later pages.

@@ -481,7 +481,20 @@ mod ffi {
         fn active_lcm_blocks(scheduler: &Scheduler) -> i32;
         fn probe_prefill_gate(scheduler: &Scheduler) -> PrefillGateProbe;
         fn cache_group_pages(scheduler: &Scheduler, group_id: &str) -> CacheGroupPages;
-        fn drain_kv_events(scheduler: Pin<&mut Scheduler>) -> Vec<KvEventView>;
+        #[namespace = "tokenspeed"]
+        type KvEventBatch;
+        fn drain_kv_events(scheduler: Pin<&mut Scheduler>) -> UniquePtr<KvEventBatch>;
+        fn make_kv_event_batch(events: &[KvEventView]) -> UniquePtr<KvEventBatch>;
+        fn kv_event_batch_size(batch: &KvEventBatch) -> usize;
+        fn kv_event_batch_bytes(batch: &KvEventBatch) -> usize;
+        fn kv_event_stored(batch: &KvEventBatch) -> &[u8];
+        fn kv_event_has_parent(batch: &KvEventBatch) -> &[u8];
+        fn kv_event_parents(batch: &KvEventBatch) -> &[u64];
+        fn kv_event_block_sizes(batch: &KvEventBatch) -> &[i32];
+        fn kv_event_hash_offsets(batch: &KvEventBatch) -> &[usize];
+        fn kv_event_token_offsets(batch: &KvEventBatch) -> &[usize];
+        fn kv_event_hashes(batch: &KvEventBatch) -> &[u64];
+        fn kv_event_tokens(batch: &KvEventBatch) -> &[i32];
         fn request_token_size(scheduler: &Scheduler, request_id: &str) -> i32;
         fn can_abort_before_admission(scheduler: &Scheduler, request_id: &str) -> bool;
         fn storage_pending(scheduler: &Scheduler) -> bool;
@@ -541,6 +554,22 @@ extern "C" {
     fn ts_scheduler_plan_into_python(plan: *mut ffi::ExecutionPlan) -> *mut pyffi::PyObject;
 }
 
+// Execute through a Python frame, as a normal extension import does. nanobind
+// installs a Python-level atexit hook using the current frame's globals; native
+// Rust callers do not otherwise have such a frame.
+#[pyo3::pyfunction]
+fn execute_scheduler_module(module: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
+    // SAFETY: the callable holds the GIL, and the linked initializer returns
+    // this module's static definition. FromDefAndSpec2 has created the module.
+    unsafe {
+        let definition = PyInit_tokenspeed_scheduler_ext().cast::<pyffi::PyModuleDef>();
+        if definition.is_null() || pyffi::PyModule_ExecDef(module.as_ptr(), definition) != 0 {
+            return Err(PyErr::fetch(module.py()));
+        }
+    }
+    Ok(())
+}
+
 /// Import the scheduler linked into the host, once per interpreter.
 ///
 /// nanobind uses multi-phase initialization. The same module owns the Python
@@ -570,11 +599,15 @@ pub fn python_module(py: Python<'_>) -> PyResult<Bound<'_, pyo3::types::PyModule
             py,
             pyffi::PyModule_FromDefAndSpec2(definition, spec.as_ptr(), api),
         )?;
-        if pyffi::PyModule_ExecDef(module.as_ptr(), definition) != 0 {
-            return Err(PyErr::fetch(py));
-        }
         module.cast_into::<pyo3::types::PyModule>()?
     };
+    let scope = pyo3::types::PyDict::new(py);
+    scope.set_item("module", &module)?;
+    scope.set_item(
+        "execute",
+        pyo3::wrap_pyfunction!(execute_scheduler_module, py)?,
+    )?;
+    py.run(c"execute(module)", Some(&scope), None)?;
     modules.set_item(NAME, &module)?;
     Ok(module)
 }
@@ -755,9 +788,9 @@ impl Scheduler {
 
     /// The prefix-cache mutations since the last drain, in order; empty
     /// unless the scheduler was configured to record them.
-    pub fn drain_kv_events(&mut self) -> Vec<KvEventView> {
+    pub fn drain_kv_events(&mut self) -> KvEventBatch {
         let _span = profile::span("Scheduler::drain_kv_events");
-        ffi::drain_kv_events(self.pinned())
+        KvEventBatch(ffi::drain_kv_events(self.pinned()))
     }
 
     /// Drop the Device L1 and Host L2 prefix indexes (the public flush).
@@ -780,6 +813,97 @@ impl Scheduler {
     /// The most tokens one request can hold in the cache.
     pub fn max_single_request_tokens(&self) -> i32 {
         ffi::max_single_request_tokens(self.get())
+    }
+}
+
+/// An owned, immutable cache-event snapshot in contiguous native columns.
+/// It has no reference to a request, scheduler, or cache allocation and may be
+/// moved to the publisher for encoding and destruction without holding the GIL.
+/// A null native pointer is the allocation-free empty batch.
+pub struct KvEventBatch(cxx::UniquePtr<ffi::KvEventBatch>);
+
+impl Default for KvEventBatch {
+    fn default() -> Self {
+        Self(cxx::UniquePtr::null())
+    }
+}
+
+// SAFETY: this uniquely owned snapshot contains only vectors of scalar data.
+// Native mutation is not exposed, and no scheduler/Python/Device pointer is held.
+unsafe impl Send for KvEventBatch {}
+
+/// One borrowed row; its slices live as long as the batch that owns them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvEvent<'a> {
+    /// A stored boundary, otherwise a removal.
+    pub stored: bool,
+    /// Block hashes, including all hashes in a compatible multi-hash event.
+    pub block_hashes: &'a [u64],
+    /// Whether the parent hash is present (zero itself is a valid hash).
+    pub has_parent: bool,
+    /// The parent when `has_parent` is true.
+    pub parent_block_hash: u64,
+    /// Token ids carried by a store.
+    pub token_ids: &'a [i32],
+    /// Tokens in a full block.
+    pub block_size: i32,
+}
+impl KvEventBatch {
+    /// Copy independent event rows into an owned batch, preserving wire fields.
+    /// Serving receives the already-flat native snapshot from `drain_kv_events`.
+    ///
+    /// Panics if an absent parent carries a hash, or a removal carries store
+    /// fields that the wire cannot represent.
+    pub fn from_events(events: &[KvEventView]) -> Self {
+        for event in events {
+            assert!(
+                event.has_parent || event.parent_block_hash == 0,
+                "an absent parent must not carry a hash"
+            );
+            assert!(
+                event.stored
+                    || (!event.has_parent && event.token_ids.is_empty() && event.block_size == 0),
+                "a removal must not carry a store payload"
+            );
+        }
+        Self(ffi::make_kv_event_batch(events))
+    }
+    /// Number of events in this snapshot.
+    pub fn len(&self) -> usize {
+        self.0.as_ref().map_or(0, ffi::kv_event_batch_size)
+    }
+    /// Whether this snapshot has no events.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// Logical column bytes; allocated capacity and allocator metadata are excluded.
+    pub fn byte_size(&self) -> usize {
+        self.0.as_ref().map_or(0, ffi::kv_event_batch_bytes)
+    }
+    /// Iterate without allocating per-row vectors or copying token/hash data.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = KvEvent<'_>> {
+        let columns = self.0.as_ref();
+        let stored = columns.map_or(&[][..], ffi::kv_event_stored);
+        let parents = columns.map_or(&[][..], ffi::kv_event_parents);
+        let has_parent = columns.map_or(&[][..], ffi::kv_event_has_parent);
+        let block_sizes = columns.map_or(&[][..], ffi::kv_event_block_sizes);
+        let hash_offsets = columns.map_or(&[][..], ffi::kv_event_hash_offsets);
+        let token_offsets = columns.map_or(&[][..], ffi::kv_event_token_offsets);
+        let hashes = columns.map_or(&[][..], ffi::kv_event_hashes);
+        let tokens = columns.map_or(&[][..], ffi::kv_event_tokens);
+        (0..stored.len()).map(move |i| KvEvent {
+            stored: stored[i] != 0,
+            block_hashes: &hashes[hash_offsets[i]..hash_offsets[i + 1]],
+            has_parent: has_parent[i] != 0,
+            parent_block_hash: parents[i],
+            token_ids: &tokens[token_offsets[i]..token_offsets[i + 1]],
+            block_size: block_sizes[i],
+        })
+    }
+}
+impl std::fmt::Debug for KvEventBatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
     }
 }
 

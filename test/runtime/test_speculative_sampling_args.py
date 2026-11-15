@@ -118,6 +118,35 @@ def test_block_verification_requires_sampled_drafts(algorithm):
         )
 
 
+@pytest.mark.parametrize("algorithm", ["DSPARK", "EAGLE3"])
+def test_block_verification_resolves_on_the_triton_verifier(algorithm):
+    # The triton verifier runs block verification over the dense recorded q.
+    args = _args(
+        speculative_algorithm=algorithm,
+        sampling_backend="triton",
+        speculative_rejection_sample_method="block",
+    )
+    assert args.speculative_rejection_sample_method == "block"
+    assert args.enable_speculative_sampling and args.sampling_backend == "triton"
+
+
+def test_triton_refuses_the_other_sampled_draft_rules():
+    with pytest.raises(
+        ValueError,
+        match="synthetic-acceptance-length requires --sampling-backend greedy",
+    ):
+        _args(
+            speculative_algorithm="DSPARK",
+            sampling_backend="triton",
+            synthetic_acceptance_length=3.0,
+        )
+    with pytest.raises(ValueError, match="target-sampled exact match"):
+        _args(
+            sampling_backend="triton",
+            speculative_rejection_sample_method="standard",
+        )
+
+
 @pytest.mark.parametrize(
     "changes",
     [
@@ -131,6 +160,7 @@ def test_block_verification_requires_sampled_drafts(algorithm):
             "speculative_num_draft_tokens": 8,
         },
         {"sampling_backend": "flashinfer_full"},
+        {"sampling_backend": "triton_full"},
         {"sampling_backend": "greedy"},
         {"disaggregation_mode": "decode"},
     ],
