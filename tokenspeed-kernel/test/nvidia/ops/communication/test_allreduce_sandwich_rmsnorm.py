@@ -686,6 +686,8 @@ def test_a_missing_pair_launches_with_unit_multipliers(wrapper):
     [
         dict(world=1),
         dict(tokens=0),
+        dict(max_token_num=0),
+        dict(max_token_num=-1),
         dict(no_mnnvl=True),
         dict(unarmed=True),
         dict(hidden=2880),  # no whole-warp cluster partition

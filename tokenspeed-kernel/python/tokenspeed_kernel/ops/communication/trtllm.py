@@ -1405,10 +1405,10 @@ if current_platform().is_nvidia:
 
         Returns:
             ``(norm_out, residual_out)``, or None when no fused kernel serves
-            the call (one rank, no tokens, no MNNVL workspace for the group, or
-            a shape its partition cannot split). Nothing is launched then and
-            the caller runs the unfused chain; the answer depends only on state
-            every rank shares.
+            the call (one rank, no tokens, no token capacity, no MNNVL workspace
+            for the group, or a shape its partition cannot split). Nothing is
+            launched then and the caller runs the unfused chain; the answer
+            depends only on state every rank shares.
 
         Raises:
             ValueError: the tensors or the scale pair do not form a valid call.
@@ -1455,7 +1455,7 @@ if current_platform().is_nvidia:
         elif not norm_out_bf16:
             raise ValueError("norm_out_bf16=False needs token_fp8_out")
         world_size = group.size()
-        if world_size <= 1 or tokens < 1:
+        if world_size <= 1 or tokens < 1 or max_token_num < 1:
             return None
         if not ensure_workspace_initialized(
             rank=rank,
