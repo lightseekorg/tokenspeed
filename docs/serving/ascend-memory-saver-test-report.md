@@ -1,78 +1,76 @@
-# Ascend Memory Saver validation
+# Ascend Memory Saver: latest-main validation
 
-## Latest-main integration: pending
+Six NPU cases passed independent source-bound acceptance below.
+Earlier main6d/tree317 and public4c results are
+historical and are not transferred to this snapshot.
 
-Qualification for main `4f969038274c2851a7d9358bcdaa3e8181bc313d` is **PENDING**.
-The final integrated tree, fresh native build and CPU/NPU matrix have not yet
-been accepted in this report. The results below are retained history only.
-Installation belongs to the [guide](ascend-memory-saver.md), invariants to the
-[design](../design/ascend-acl-graph-memory-saver.md), and reproduction commands to
-the [smoke-test README](../../test/runtime/ascend_memory_saver/README.md).
+## Source and stack
 
-## Historical main6d source and build
-
-- Tested tree: `317649c7642aef1c36f46bf23b98f22f384f38f6` (3,826 paths),
-  preserved by [the feature snapshot](https://github.com/yanlonghu/tokenspeed/commit/6e02de4567f72bf5ad432450f4095224e6a51898).
-- Main: `6d7d29b918d1b050602cd945151dc99c076bd67f`. Common dependency:
-  public tree `4c351df13e1da62399885a4d1dd7f507cd7e8605`, commit
-  [`54dd431a7c09e22b7ac1321ac2714acf43c23b29`](https://github.com/yanlonghu/tokenspeed/commit/54dd431a7c09e22b7ac1321ac2714acf43c23b29).
+- Main: `4f969038274c2851a7d9358bcdaa3e8181bc313d`.
+- Common prerequisite: `c85e9a3656794f1bfb3f400f0a7d07a8fb0aa680`, owned by
+  [PR #3397](https://github.com/lightseekorg/tokenspeed/pull/3397).
+- Executed tree: `89e0f7101a0ba619f250d4fb271dcbd6a7167bf8`, 3,849 paths.
+  The [feature snapshot](https://github.com/yanlonghu/tokenspeed/commit/c56ff4dd2f6b52add032a61ad58b7b6dc2fbf879)
+  preserves this exact tested tree.
 - Single-host Atlas A2 / 910B3, Linux aarch64, Python 3.12, Torch `2.9.0+cpu`,
-  PTA `2.9.0-730` base `9d40ac3` plus the six
-  [official backports](ascend-memory-saver.md#before-you-start), CANN/HCCL `9.0.0`.
+  PTA `2.9.0-730` base `9d40ac3` plus six
+  [official backports](ascend-memory-saver.md#before-you-start), build `ee1742`,
+  and CANN/HCCL `9.0.0`. Stock PTA 2.13 remains historical compatibility only.
 
-Archive, Git blobs/modes and patch reconstruction matched. ABI3 host/client,
-shim and matching scheduler were rebuilt; the saver qualified for exact-source,
-ABI and artifact reuse. Installed wheel members matched loaded modules.
+Engine `_host`/`_native`, module-host shim, scheduler 0.1.57 and C++ saver were
+built normally from tree `65db98389e631a458f7192b3e1ad45ce3d10afba`.
+Production/native blobs and modes are identical in the executed tree; subsequent
+changes affect tests/docs only. Loaded modules and source/dependency identities
+were checked. This does not imply every dependency was rebuilt.
 
-## Historical CPU and native gates
+## CPU and native results
 
-| Gate | Result and counting boundary |
+| Group | Result and counting boundary |
 | --- | --- |
-| Native primary harnesses | 357 passed, 16 ignored; excludes 13 nested subprocess summaries and includes 88 serving tests. |
-| Selected CPU union | 348 passed, 21 skipped: startup/runtime 270 + compatibility 78. Its 13 startup subset consists of 6 multiprocess Gloo and 7 capability cases; not added again. |
-| Weights/session/discard | 220 passed, eight subtests, four hardware SDK parameters deselected; partial-update/F03 subsets included. |
-| Separate probes | 5 initialization refusals, 8 adapter dispatch cases, 64 selector assertions, 4 bootstrap refusals and 2 startup behaviors passed; excluded from pytest totals. |
-| Loaded identity negatives | Seven module/DSO/runtime path, hash and mapping cases passed. |
-| Native exit | Expected exit 1, one expected failure signal; three pure-C phases held GIL 1 and the original main PID/thread/thread-state without NPU initialization. |
+| Native primary harnesses | 392 passed, 18 ignored; 13 nested subprocess summaries excluded. Serving 88 and scheduler 27 are included. |
+| Startup/runtime | 271 passed, 8 skipped; no NPU initialization. |
+| Weights/session/pools | 277 passed, 35 subtests passed, 4 hardware SDK parameters deselected. XML count 312 includes the 35 subtests; it is not 312 independent cases. |
+| Fake-ACL backend | Four host-only state/fault tests passed; no device inference. |
+| Actual host trace | One positive identity case and four identity-rejection cases passed without device initialization. |
+| Native exit / no-init | Three pure-C phases observed GIL 1 and the original main PID/TID/thread-state. Expected bootstrap exit 1 and one expected failure notification; five explicit initialization attempts were refused. |
 
-Local Gloo does not qualify cross-node HCCL. The PP fixture has zero own tests
-and six device consumers skipped; it provides no PP hardware qualification.
+Groups, subtests and nested summaries are not combined into one pass total.
+Controlled exit 1 is separate from the natural model-loaded exits below.
 
-## Historical model-loaded NPU cases
+The startup subset of 13 is six real multiprocess Gloo cases plus seven capability
+cases, counted once. Its eight skips are six device PP consumers, one second-GPU
+case and one CUDA-device case; no device qualification follows from those skips.
 
-| Case | Observation |
+## Six NPU cases
+
+| Case | Observed result |
 | --- | --- |
-| TP2 v3 eager KV | Both ranks unmapped/remapped 943,718,400 bytes at the same VA; eight-token outputs matched. A 312.024823 ms Python-return test gate held the public reply until after Python returned. |
-| TP1 complete disk B discard | Two prompts × 12 tokens matched fresh B and differed from A; cache count 192 became 0/0. Original weight VAs and graph survived without recapture. Parameter pool 1,296 MiB; persistent backup 260 MiB. |
-| TP1 Memory Saver off | Eight tokens; actual scheduler exited 0 naturally. |
-| TP1 cpu_backup partial | One of 310 sources supplied a 2,048-byte norm parameter. Two prompts × eight tokens matched fresh effective B and differed from A; all 63 parameter VAs and original graph survived. |
+| TP2 protocol 3 eager KV / return hold | Both ranks physically released/remapped 943,718,400 KV bytes at the same VAs. Eight raw-prompt token IDs matched. A 300 ms Python-return hold prevented an early public reply. |
+| TP2 natural-language KV | Two prompts × eight tokens matched before/after the same per-rank KV lifecycle. No forward, logit, sampling or token override was used. |
+| TP1 cpu_backup partial | One of 310 canonical sources supplied a 2,048-byte norm parameter. Two prompts × eight tokens matched fresh effective B and differed from A; original weight VAs and graph remained. |
+| TP1 full disk B discard | Two prompts × 12 tokens matched fresh B and differed from A; old cache count 192 became 0/0. Original parameter VAs and graph remained without recapture. Cache-flush and ambiguous/unsupported-format refusals preceded writes. |
+| TP1 repository graph smoke | Three cycles discarded/remapped 254 MiB at the same VAs, poisoned pages before first replay, reused both original graphs and matched fresh outputs at batch sizes 1/3/4. Weights used CPU backup. |
+| TP1 Memory Saver off | Eight tokens; actual model-loaded scheduler/launcher exited 0 naturally. |
 
-All seven schedulers exited 0 and leased devices returned idle. The injected
-gate establishes Python-return ordering, not native wire ACK, transfer-in-flight
-timing or performance. Cancellation/retry coverage came from native serving
-tests, not live NPU in-apply cancellation.
+All eleven scheduler processes across these cases exited 0. Leases were released
+and devices returned idle. The return-hold probe establishes Python-return
+ordering, not native wire-ACK timestamps, asymmetric native drain completion,
+transfer-in-flight proof or performance. Natural-language recovery is checked
+separately. Graph-pool discard does not by itself qualify weight discard.
 
 ## Retained failures and limits
 
-PTA-loaded omitted/false exit controls observed GIL 0/current-state 0 before
-SIGABRT(-6); they remain failed negatives. The responsible third-party DSO was
-not identified. The ordinary non-NPU exit baseline was setup-blocked by missing
-`tokenspeed_triton`. Initial harness-export, spawned-directory and offline-model
-setup failures remain retained. Six out-of-scope CUDA Iris / NPU `flash_ops`
-setup failures remain unqualified after CPU deselection.
+The first graph attempt used an external backup-policy flag for a discard case.
+The first partial attempt lacked an external helper import path. Both remain
+FAIL records; only external CLI/environment setup changed before successful
+retries. Frozen production and test sources were unchanged.
 
-The test-only trace follow-up at tree
-`c03e2d78238d1c5ceb398dea81cb7a3c1970b230` retained tree317 production/native
-sources. CPU: eight passed, one built-in-extension skip; actual native identity:
-one positive and four refusals without device initialization. Its A2 TP1 run
-passed three repository-trace cycles with CPU-backed weights: 254 MiB graph
-pool release/remap at the same VAs, poison before first replay, both original
-graphs, fresh-output equality at batch sizes 1/3/4 and natural exit 0. This is
-not full weight discard or a rerun of the four-case matrix.
-
-CUDA/ROCm hardware was unavailable. Global-shape/cross-rank partial inventory
-strengthening remains deferred under #3456. Production SDK/RDMA, cross-node
-PP/EP, MTP/draft refresh, long-cycle and performance matrices were not rerun.
-Earlier TP4/8 and broader results remain in the
-[pinned historical report](https://github.com/lightseekorg/tokenspeed/blob/9bb491a36a6eb10b60713fe7d5f8ad460047f191/docs/serving/ascend-memory-saver-test-report.md),
-not latest-main acceptance.
+The ordinary non-NPU default-false native exit remains setup-blocked by missing
+`tokenspeed_triton`; source/CPU isolation is not a runtime exit PASS. CUDA/ROCm
+hardware was not run and no public or historical GPU result is inherited.
+A separate fork-only NPU PP fixture probe stopped at the existing startup guard:
+0 passed, 1 startup failure and 5 not run, before executor construction/forward.
+It supplies no PP numerical or cross-process qualification and is outside the
+core PR. Global-shape/cross-rank partial inventory remains deferred under #3456.
+Production SDK/RDMA, cross-node PP/EP, native draft refresh, long-cycle and
+performance qualification are outside this matrix.
