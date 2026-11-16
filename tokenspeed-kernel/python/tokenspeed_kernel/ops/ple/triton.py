@@ -433,6 +433,7 @@ def _ple_dilated_conv_kernel(
     ADD_GATED: tl.constexpr,
     ADD_RESIDUAL: tl.constexpr,
     BLOCK_C: tl.constexpr,
+    COMPACT: tl.constexpr,
 ):
     """Fused dilated depthwise conv + SiLU over the packed-free layout.
 
@@ -501,11 +502,10 @@ def _ple_dilated_conv_kernel(
         result = (result.to(tl.float32) + residual.to(tl.float32)).to(out_dtype)
     tl.store(out_ptr + token * C + ch, result, mask=cmask)
 
-    if WRITE_WINDOWS:
-        # The verify scratch holds one ``windows_block_rows`` row block per
-        # request whose first row is the carried state, so token ``col`` of
-        # request ``req`` owns row ``req * windows_block_rows + 1 + col``. The
-        # packed layout is one row per token instead.
+    if COMPACT:
+        wrow = req * windows_block_rows + 1 + col
+        tl.store(windows_ptr + wrow * C * STATE + ch, x, mask=cmask)
+    elif WRITE_WINDOWS:
         wrow = token.to(tl.int64)
         if SCATTER_WINDOWS:
             wrow = req * windows_block_rows + 1 + col
@@ -697,6 +697,7 @@ def _ple_conv_state_kernel(
     ENABLE_PDL: tl.constexpr,
     BLOCK_C: tl.constexpr,
     BLOCK_T: tl.constexpr,
+    compact_layout_flag=None,
 ):
     """One launch for token outputs and request states, including empty requests.
 
@@ -714,6 +715,9 @@ def _ple_conv_state_kernel(
             tl.extra.cuda.gdc_wait()
         # Successors may set up, but must wait before reading any output.
         tl.extra.cuda.gdc_launch_dependents()
+    if compact_layout_flag is not None:
+        if tl.program_id(0) == 0 and tl.program_id(1) == 0:
+            tl.store(compact_layout_flag, 1)
     token_base = tl.program_id(0)
     if BLOCK_T > 1:
         token_base = token_base.to(tl.int64) * BLOCK_T
@@ -765,6 +769,7 @@ def _ple_conv_state_kernel(
                 ADD_GATED,
                 ADD_RESIDUAL,
                 BLOCK_C,
+                compact_layout_flag is not None,
             )
     if WRITE_FINAL or SCATTER_WINDOWS:
         if tl.program_id(0) < BATCH:
@@ -892,3 +897,46 @@ register_triton_warmup(
     _ple_conv_state_kernel,
     variants=_conv_state_warmup_variants,
 )
+
+
+@triton.jit
+def _ple_verify_restore_kernel(
+    scratch,
+    src_rows,
+    dst_rows,
+    src_addresses,
+    dst_addresses,
+    layout_addresses,
+    dst_strides,
+    batch_size,
+    verify_width,
+    CHANNELS: tl.constexpr,
+    STATE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    layer = tl.program_id(2).to(tl.int64)
+    row_index = layer * batch_size + tl.program_id(0)
+    page = tl.load(dst_rows + row_index).to(tl.int64)
+    if page >= 0:
+        row = tl.load(src_rows + row_index).to(tl.int64)
+        elem = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        row_elements: tl.constexpr = CHANNELS * STATE
+        source = tl.load(src_addresses + layer).to(scratch.dtype)
+        destination = tl.load(dst_addresses + layer).to(scratch.dtype)
+        layout = tl.load(layout_addresses + layer).to(tl.pointer_type(tl.int32))
+        stride = tl.load(dst_strides + layer).to(tl.int64)
+
+        request = row // (verify_width + 1)
+        accepted = row % (verify_width + 1)
+        channel, position = elem // STATE, accepted + elem % STATE
+        carried_or_input = tl.where(
+            position < STATE,
+            channel * STATE + position,
+            (1 + position - STATE) * row_elements + channel,
+        )
+        compact_offset = request * (verify_width + 1) * row_elements + carried_or_input
+        offset = tl.where(
+            tl.load(layout) != 0, compact_offset, row * row_elements + elem
+        )
+        value = tl.load(source + offset, elem < row_elements, other=0)
+        tl.store(destination + page * stride + elem, value, elem < row_elements)

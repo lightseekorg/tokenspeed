@@ -47,6 +47,7 @@ from tokenspeed_kernel.ops.ple.triton import (
     _ple_host_gather_persistent_kernel,
     _ple_page_gather_pair_kernel,
     _ple_page_scatter_kernel,
+    _ple_verify_restore_kernel,
 )
 from tokenspeed_kernel.platform import ArchVersion, current_platform, pdl_enabled
 from tokenspeed_kernel.warmup import kernel_launcher
@@ -59,6 +60,7 @@ __all__ = [
     "prepare_ngram_reciprocals",
     "ple_page_gather_pair",
     "ple_page_scatter",
+    "ple_restore_verify_layers",
 ]
 
 
@@ -390,6 +392,7 @@ def ple_conv_sequences(
     windows: torch.Tensor | None = None,
     windows_block_rows: int = 0,
     scatter_windows: bool = False,
+    compact_layout_flag: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Dilated depthwise conv + SiLU, plus the state carried to the next step.
 
@@ -417,6 +420,8 @@ def ple_conv_sequences(
             the last dimension has to be dense.
         windows: Destination for sliding state windows. ``None`` skips them.
         windows_block_rows: Rows per request in ``windows`` when scattering.
+        compact_layout_flag: Optional device scalar destination. When supplied,
+            store compact verify inputs and mark this layout instead of windows.
         scatter_windows: Place carried state in each block's first row and token
             windows at ``req * windows_block_rows + 1 + col`` instead of packed
             rows.
@@ -427,6 +432,8 @@ def ple_conv_sequences(
         window tensor (an empty placeholder when ``windows`` is ``None``).
     """
 
+    if compact_layout_flag is not None and not scatter_windows:
+        raise ValueError("compact layout requires scattered verify scratch")
     if len(add_terms) > 2:
         raise ValueError("the fused conv epilogue folds at most two addends")
     channels = values.shape[-1]
@@ -517,6 +524,7 @@ def ple_conv_sequences(
             ENABLE_PDL=use_pdl,
             BLOCK_C=block_c,
             BLOCK_T=block_t,
+            compact_layout_flag=compact_layout_flag,
             **pdl_kwargs,
         )
     return conv_output, final_conv, windows
@@ -590,3 +598,57 @@ def ple_gate_norm(
         **({"launch_pdl": True} if use_pdl else {}),
     )
     return gated, normalized
+
+
+def ple_restore_verify_layers(
+    scratch: torch.Tensor,
+    src_rows: torch.Tensor,
+    dst_rows: torch.Tensor,
+    src_addresses: torch.Tensor,
+    dst_addresses: torch.Tensor,
+    layout_addresses: torch.Tensor,
+    dst_strides: torch.Tensor,
+    *,
+    verify_width: int,
+    batch_size: int,
+) -> None:
+    """Commit accepted PLE states for all layers in one launch.
+
+    Args:
+        scratch: A source slab with the common [rows, channels, state] geometry
+            and dtype. All layers share this row shape.
+        src_rows: Layer-major ids, encoded as request * (verify_width + 1)
+            + accepted count.
+        dst_rows: Layer-major destination page ids. Negative ids are skipped.
+        src_addresses: uint64 base addresses of the dense scratch slabs.
+        dst_addresses: uint64 base addresses of the destination slabs.
+        layout_addresses: uint64 addresses of per-layer int32 layout flags.
+            A one selects compact scratch, with the carried state in row zero
+            and one channel vector per token at the start of subsequent rows.
+            A zero selects a full state window at the source row.
+        dst_strides: Per-layer destination page strides in elements.
+        verify_width: Number of candidate tokens per request.
+        batch_size: Number of requests represented by the row tables.
+
+    Returns:
+        None. Writes state directly into the selected destination pages.
+    """
+    channels, state = scratch.shape[1:]
+    if not batch_size or not state:
+        return
+    block = 256
+    grid = (batch_size, _triton.cdiv(channels * state, block), src_addresses.numel())
+    kernel_launcher(_ple_verify_restore_kernel, grid)(
+        scratch,
+        src_rows,
+        dst_rows,
+        src_addresses,
+        dst_addresses,
+        layout_addresses,
+        dst_strides,
+        batch_size,
+        verify_width,
+        channels,
+        state,
+        block,
+    )
