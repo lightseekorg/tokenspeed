@@ -4711,21 +4711,10 @@ fn slow_schema() -> String {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_drain_cancels_the_requests_still_compiling_their_grammars() {
-    let release = ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
-        rid: None,
-        http_worker_ipc: None,
-        tags: None,
-    });
+    let release = memory_request(true, None, None);
     for (drain, undo) in [
         (pause("wait"), resume()),
-        (
-            release,
-            ControlRequest::ResumeMemoryOccupation(ResumeMemoryOccupationReqInput {
-                rid: None,
-                http_worker_ipc: None,
-                tags: None,
-            }),
-        ),
+        (release, memory_request(false, None, None)),
     ] {
         let engine = start_ranks_with(
             Layout::Single,
@@ -5057,11 +5046,7 @@ async fn a_failed_weight_load_is_committed_as_invalid_on_every_rank() {
 async fn a_released_pd_engine_refuses_requests_until_it_wakes() {
     let (prefill, decode, _wire) =
         start_pd_pair(1, Layout::Single, Tiers::DeviceOnly, Setup::default()).await;
-    let release = ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
-        rid: None,
-        http_worker_ipc: None,
-        tags: None,
-    });
+    let release = memory_request(true, None, None);
     assert_eq!(
         control(&decode, release).await,
         [("ReleaseMemoryOccupationReqOutput", true)]
@@ -5077,11 +5062,7 @@ async fn a_released_pd_engine_refuses_requests_until_it_wakes() {
          resume_memory_occupation"
             .into()
     );
-    let wake = ControlRequest::ResumeMemoryOccupation(ResumeMemoryOccupationReqInput {
-        rid: None,
-        http_worker_ipc: None,
-        tags: None,
-    });
+    let wake = memory_request(false, None, None);
     assert_eq!(
         control(&decode, wake).await,
         [("ResumeMemoryOccupationReqOutput", true)]
@@ -5198,11 +5179,7 @@ async fn pp_prefill_release_waits_for_the_remote_stage_kv_transfer() {
 #[tokio::test(flavor = "multi_thread")]
 async fn memory_is_released_after_the_drain_and_resumed_in_reverse_order() {
     let engine = start_engine(1).await;
-    let release = ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
-        rid: None,
-        http_worker_ipc: None,
-        tags: None,
-    });
+    let release = memory_request(true, None, None);
     let running = engine
         .client
         .generate(request("r1", 3, budget(20)))
@@ -5224,11 +5201,7 @@ async fn memory_is_released_after_the_drain_and_resumed_in_reverse_order() {
         control(&engine, resume()).await,
         [("ResumeSchedulerReqOutput", false)]
     );
-    let wake = ControlRequest::ResumeMemoryOccupation(ResumeMemoryOccupationReqInput {
-        rid: None,
-        http_worker_ipc: None,
-        tags: None,
-    });
+    let wake = memory_request(false, None, None);
     assert_eq!(
         control(&engine, wake).await,
         [("ResumeMemoryOccupationReqOutput", true)]
@@ -5282,6 +5255,26 @@ fn memory_request(release: bool, tags: Option<&[&str]>, id: Option<&str>) -> Con
 
 fn memory_transition(release: bool, tags: Option<&[&str]>) -> EngineRequest {
     EngineRequest::Control(Box::new(memory_request(release, tags, None)))
+}
+
+// Keep the protocol explicit while using the same real scripted scheduler/mesh.
+fn run_memory_scripted(
+    layout: Layout,
+    replica_memory_transitions: bool,
+    setup: Setup,
+    scripts: Vec<Script>,
+) -> Vec<ScriptedRank> {
+    run_scripted(
+        layout,
+        0,
+        Tiers::DeviceOnly,
+        Setup {
+            replica_memory_transitions,
+            ..setup
+        },
+        scripts,
+        no_reaction,
+    )
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -5348,13 +5341,11 @@ async fn a_wire_memory_release_with_a_list_id_is_refused_without_sleeping() {
 
 #[test]
 fn cancelling_memory_release_preserves_prefixes_when_one_rank_cannot_clear_l1() {
-    let ranks = run_scripted(
+    let ranks = run_memory_scripted(
         Layout::Tp(2),
-        0,
-        Tiers::DeviceOnly,
+        true,
         Setup {
             host_l2_rank: Some(1),
-            replica_memory_transitions: true,
             ..Setup::default()
         },
         vec![vec![
@@ -5367,7 +5358,6 @@ fn cancelling_memory_release_preserves_prefixes_when_one_rank_cannot_clear_l1() 
                 EngineRequest::Add(Box::new(request("probe", 33, budget(1)))),
             ],
         ]],
-        no_reaction,
     );
     // The warmup forward commits during the release drain. Rank 1 starts
     // a write-through finish store which pins its pages before the next
@@ -5421,17 +5411,14 @@ fn a_rank_refusing_memory_preflight_leaves_the_replica_usable() {
         4,
         budget(2),
     ))));
-    let ranks = run_scripted(
+    let ranks = run_memory_scripted(
         Layout::Tp(2),
-        0,
-        Tiers::DeviceOnly,
+        true,
         Setup {
             discard_memory_rank: Some(1),
-            replica_memory_transitions: true,
             ..Setup::default()
         },
         vec![script],
-        no_reaction,
     );
     assert_eq!(
         outcome(ranks[0].replies.clone()),
@@ -5468,13 +5455,11 @@ fn a_rank_refusing_memory_preflight_leaves_the_replica_usable() {
 
 #[test]
 fn legacy_memory_transitions_do_not_apply_replica_preflight() {
-    let ranks = run_scripted(
+    let ranks = run_memory_scripted(
         Layout::Tp(2),
-        0,
-        Tiers::DeviceOnly,
+        false,
         Setup {
             discard_memory_rank: Some(1),
-            replica_memory_transitions: false,
             ..Setup::default()
         },
         vec![vec![
@@ -5483,7 +5468,6 @@ fn legacy_memory_transitions_do_not_apply_replica_preflight() {
             vec![memory_transition(true, Some(&["kv_cache"]))],
             vec![memory_transition(false, Some(&["kv_cache"]))],
         ]],
-        no_reaction,
     );
     assert_eq!(
         outcome(ranks[0].replies.clone()),
@@ -5510,20 +5494,17 @@ fn legacy_memory_transitions_do_not_apply_replica_preflight() {
 
 #[test]
 fn legacy_memory_release_checks_l1_locally() {
-    let ranks = run_scripted(
+    let ranks = run_memory_scripted(
         Layout::Tp(2),
-        0,
-        Tiers::DeviceOnly,
+        false,
         Setup {
             host_l2_rank: Some(1),
-            replica_memory_transitions: false,
             ..Setup::default()
         },
         vec![vec![vec![
             EngineRequest::Add(Box::new(request("seed", 33, budget(1)))),
             memory_transition(true, Some(&["kv_cache"])),
         ]]],
-        no_reaction,
     );
     // Rank 1 still has a write-through finish store pinning Device L1.
     assert_eq!(
@@ -5543,18 +5524,15 @@ fn only_replica_memory_transitions_withhold_success_on_peer_device_failure() {
             if !failed_release {
                 script.push(vec![memory_transition(false, None)]);
             }
-            let ranks = run_scripted(
+            let ranks = run_memory_scripted(
                 Layout::Tp(2),
-                0,
-                Tiers::DeviceOnly,
+                replica_memory_transitions,
                 Setup {
-                    replica_memory_transitions,
                     memory_release_failure_rank: failed_release.then_some(1),
                     memory_resume_failure_rank: (!failed_release).then_some(1),
                     ..Setup::default()
                 },
                 vec![script],
-                no_reaction,
             );
             let operation = if failed_release { "release" } else { "resume" };
             assert!(ranks[1]
@@ -5588,16 +5566,11 @@ fn dp_memory_release_and_resume_wait_for_delayed_replicas() {
     scripts[0][42].push(memory_transition(false, None));
     scripts[1][50].push(memory_transition(false, Some(&["kv_cache", "weights"])));
     scripts[0][56].push(EngineRequest::Add(Box::new(request("awake", 4, budget(2)))));
-    let ranks = run_scripted(
+    let ranks = run_memory_scripted(
         Layout::TpDp { tp: 2, dp: 2 },
-        0,
-        Tiers::DeviceOnly,
-        Setup {
-            replica_memory_transitions: true,
-            ..Setup::default()
-        },
+        true,
+        Setup::default(),
         scripts,
-        no_reaction,
     );
     assert_scripted_tokens(&ranks[0], "awake", 2);
     assert_scripted_tokens(&ranks[2], "drain", 24);
@@ -5628,17 +5601,14 @@ fn dp_memory_preflight_refusal_leaves_every_replica_usable() {
     scripts[1][3].push(memory_transition(true, Some(&["weights"])));
     scripts[0][6].push(EngineRequest::Add(Box::new(request("first", 4, budget(2)))));
     scripts[1][9].push(EngineRequest::Add(Box::new(request("peer", 4, budget(2)))));
-    let ranks = run_scripted(
+    let ranks = run_memory_scripted(
         Layout::TpDp { tp: 2, dp: 2 },
-        0,
-        Tiers::DeviceOnly,
+        true,
         Setup {
             discard_memory_rank: Some(3),
-            replica_memory_transitions: true,
             ..Setup::default()
         },
         scripts,
-        no_reaction,
     );
     assert_scripted_tokens(&ranks[0], "first", 2);
     assert_scripted_tokens(&ranks[2], "peer", 2);
@@ -5663,17 +5633,14 @@ fn dp_memory_replies_follow_the_arrival_order_of_same_kind_requests() {
             memory_transition(true, None),
         ]);
     }
-    let ranks = run_scripted(
+    let ranks = run_memory_scripted(
         Layout::Dp(2),
-        0,
-        Tiers::DeviceOnly,
+        true,
         Setup {
             discard_memory_rank: Some(1),
-            replica_memory_transitions: true,
             ..Setup::default()
         },
         scripts,
-        no_reaction,
     );
     for rank in ranks {
         assert_eq!(rank.outcome, Ok(()));
@@ -5698,18 +5665,15 @@ fn dp_memory_device_failure_prevents_success_on_every_replica() {
             scripts[0][5].push(memory_transition(false, None));
             scripts[1][7].push(memory_transition(false, None));
         }
-        let ranks = run_scripted(
+        let ranks = run_memory_scripted(
             Layout::TpDp { tp: 2, dp: 2 },
-            0,
-            Tiers::DeviceOnly,
+            true,
             Setup {
-                replica_memory_transitions: true,
                 memory_release_failure_rank: failed_release.then_some(3),
                 memory_resume_failure_rank: (!failed_release).then_some(3),
                 ..Setup::default()
             },
             scripts,
-            no_reaction,
         );
         let operation = if failed_release { "release" } else { "resume" };
         assert!(ranks[3]
@@ -5747,17 +5711,14 @@ fn memory_release_uses_supported_regions_for_each_protocol() {
         }
         script[6].push(memory_transition(true, None));
         script[9].push(memory_transition(false, None));
-        let ranks = run_scripted(
+        let ranks = run_memory_scripted(
             Layout::Pp(2),
-            0,
-            Tiers::DeviceOnly,
+            coordinated,
             Setup {
-                replica_memory_transitions: coordinated,
                 legacy_nccl: !coordinated,
                 ..Setup::default()
             },
             vec![script],
-            no_reaction,
         );
 
         let mut expected_replies = Vec::new();
@@ -5807,17 +5768,7 @@ fn dp_memory_release_rejects_mismatched_tags_or_ids_and_can_retry() {
             script[6].push(memory_transition(true, None));
             script[9].push(memory_transition(false, None));
         }
-        let ranks = run_scripted(
-            Layout::Dp(2),
-            0,
-            Tiers::DeviceOnly,
-            Setup {
-                replica_memory_transitions: true,
-                ..Setup::default()
-            },
-            scripts,
-            no_reaction,
-        );
+        let ranks = run_memory_scripted(Layout::Dp(2), true, Setup::default(), scripts);
         for rank in ranks {
             assert_eq!(rank.outcome, Ok(()));
             assert_eq!(
@@ -5845,17 +5796,7 @@ fn dp_memory_release_and_resume_cannot_match_one_another() {
     }
     scripts[0][4].push(memory_transition(true, Some(&["weights"])));
     scripts[1][6].push(memory_transition(false, Some(&["kv_cache"])));
-    let ranks = run_scripted(
-        Layout::Dp(2),
-        0,
-        Tiers::DeviceOnly,
-        Setup {
-            replica_memory_transitions: true,
-            ..Setup::default()
-        },
-        scripts,
-        no_reaction,
-    );
+    let ranks = run_memory_scripted(Layout::Dp(2), true, Setup::default(), scripts);
     for (rank, observed) in ranks.into_iter().enumerate() {
         assert_eq!(observed.outcome, Ok(()));
         assert_eq!(
@@ -5888,17 +5829,7 @@ fn dp_memory_missing_release_participant_can_cancel_without_sleeping() {
         4,
         budget(2),
     ))));
-    let ranks = run_scripted(
-        Layout::Dp(2),
-        0,
-        Tiers::DeviceOnly,
-        Setup {
-            replica_memory_transitions: true,
-            ..Setup::default()
-        },
-        scripts,
-        no_reaction,
-    );
+    let ranks = run_memory_scripted(Layout::Dp(2), true, Setup::default(), scripts);
     assert_scripted_tokens(&ranks[0], "after-cancel", 2);
     assert_scripted_tokens(&ranks[1], "peer", 3);
     assert_eq!(
@@ -6149,17 +6080,7 @@ fn dp_memory_release_in_the_continue_batch_is_refused_then_retry_succeeds() {
         script[6].push(memory_transition(false, None));
     }
     scripts[0][9].push(EngineRequest::Add(Box::new(request("awake", 4, budget(2)))));
-    let ranks = run_scripted(
-        Layout::Dp(2),
-        0,
-        Tiers::DeviceOnly,
-        Setup {
-            replica_memory_transitions: true,
-            ..Setup::default()
-        },
-        scripts,
-        no_reaction,
-    );
+    let ranks = run_memory_scripted(Layout::Dp(2), true, Setup::default(), scripts);
     assert_scripted_tokens(&ranks[0], "awake", 2);
     for rank in ranks {
         assert_eq!(rank.outcome, Ok(()));
@@ -6192,17 +6113,7 @@ fn dp_memory_asymmetric_continue_refuses_current_calls_then_accepts_retry() {
             script[10].push(memory_transition(false, None));
         }
         scripts[0][13].push(EngineRequest::Add(Box::new(request("awake", 4, budget(2)))));
-        let ranks = run_scripted(
-            layout,
-            0,
-            Tiers::DeviceOnly,
-            Setup {
-                replica_memory_transitions: true,
-                ..Setup::default()
-            },
-            scripts,
-            no_reaction,
-        );
+        let ranks = run_memory_scripted(layout, true, Setup::default(), scripts);
         assert_scripted_tokens(&ranks[0], "awake", 2);
         for (rank, observed) in ranks.into_iter().enumerate() {
             assert_eq!(observed.outcome, Ok(()));
@@ -6246,17 +6157,7 @@ fn dp_memory_cancels_an_active_drain_without_clearing_peer_prefixes() {
         33,
         budget(1),
     ))));
-    let ranks = run_scripted(
-        Layout::Dp(2),
-        0,
-        Tiers::DeviceOnly,
-        Setup {
-            replica_memory_transitions: true,
-            ..Setup::default()
-        },
-        scripts,
-        no_reaction,
-    );
+    let ranks = run_memory_scripted(Layout::Dp(2), true, Setup::default(), scripts);
     assert_scripted_tokens(&ranks[0], "probe", 1);
     assert_scripted_tokens(&ranks[1], "drain", 28);
     assert!(ranks[0]
@@ -6286,17 +6187,7 @@ fn dp_memory_cancelled_resume_leaves_every_replica_asleep() {
         4,
         budget(2),
     ))));
-    let ranks = run_scripted(
-        Layout::Dp(2),
-        0,
-        Tiers::DeviceOnly,
-        Setup {
-            replica_memory_transitions: true,
-            ..Setup::default()
-        },
-        scripts,
-        no_reaction,
-    );
+    let ranks = run_memory_scripted(Layout::Dp(2), true, Setup::default(), scripts);
     assert_eq!(
         outcome(ranks[0].replies.clone()),
         [
@@ -6329,17 +6220,7 @@ fn independent_dp_replicas_can_release_and_resume_separately() {
         4,
         budget(2),
     ))));
-    let ranks = run_scripted(
-        Layout::IndependentDp(2),
-        0,
-        Tiers::DeviceOnly,
-        Setup {
-            replica_memory_transitions: true,
-            ..Setup::default()
-        },
-        scripts,
-        no_reaction,
-    );
+    let ranks = run_memory_scripted(Layout::IndependentDp(2), true, Setup::default(), scripts);
     assert_scripted_tokens(&ranks[0], "awake", 2);
     assert_scripted_tokens(&ranks[1], "unaffected", 2);
     assert_eq!(
@@ -6359,11 +6240,7 @@ fn independent_dp_replicas_can_release_and_resume_separately() {
 
 #[test]
 fn dp_memory_release_waits_for_every_rank_to_pause_and_drain() {
-    let release = ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
-        rid: None,
-        http_worker_ipc: None,
-        tags: None,
-    });
+    let release = memory_request(true, None, None);
     for peer_pause in [pause("wait"), release.clone()] {
         let peer_releases = matches!(&peer_pause, ControlRequest::ReleaseMemoryOccupation(_));
         let mut busy = vec![Vec::new(); 340];
@@ -6423,13 +6300,9 @@ fn dp_memory_release_waits_for_an_idle_peer_to_pause() {
         budget(20),
     ))));
     let mut releasing = vec![Vec::new(); 60];
-    releasing[2].push(EngineRequest::Control(Box::new(
-        ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
-            rid: None,
-            http_worker_ipc: None,
-            tags: None,
-        }),
-    )));
+    releasing[2].push(EngineRequest::Control(Box::new(memory_request(
+        true, None, None,
+    ))));
     let ranks = run_scripted(
         Layout::Dp(2),
         0,
@@ -6458,13 +6331,9 @@ fn dp_memory_resume_waits_for_every_rank_and_region_before_forwarding() {
     for wake_peer in [false, true] {
         let mut scripts = vec![vec![Vec::new(); 90]; 2];
         for (rank, script) in scripts.iter_mut().enumerate() {
-            script[0].push(EngineRequest::Control(Box::new(
-                ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
-                    rid: None,
-                    http_worker_ipc: None,
-                    tags: None,
-                }),
-            )));
+            script[0].push(EngineRequest::Control(Box::new(memory_request(
+                true, None, None,
+            ))));
             for (round, tag) in [(4 + rank * 16, "weights"), (8 + rank * 22, "kv_cache")] {
                 if rank == 1 && tag == "kv_cache" && !wake_peer {
                     continue;
@@ -6647,16 +6516,8 @@ async fn memory_release_waits_for_the_host_stores_in_flight() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_drain_cancels_the_requests_still_receiving_their_embeddings() {
-    let release = ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
-        rid: None,
-        http_worker_ipc: None,
-        tags: None,
-    });
-    let wake = ControlRequest::ResumeMemoryOccupation(ResumeMemoryOccupationReqInput {
-        rid: None,
-        http_worker_ipc: None,
-        tags: None,
-    });
+    let release = memory_request(true, None, None);
+    let wake = memory_request(false, None, None);
     for (drain, undo) in [(pause("wait"), resume()), (release, wake)] {
         let engine = start_ranks_with(
             Layout::Single,

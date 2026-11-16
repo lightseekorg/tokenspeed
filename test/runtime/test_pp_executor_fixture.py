@@ -22,6 +22,7 @@
 """Small real executor owners; only the absent PP peer uses test transport."""
 
 from dataclasses import dataclass
+from test.runtime.cache_pool_test_utils import make_arena, make_mha_memory_plan
 
 import torch
 from torch import nn
@@ -38,13 +39,7 @@ from tokenspeed.runtime.layers.attention.backends.base import (
     AttentionBackend,
     CudaGraphSupport,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
 from tokenspeed.runtime.layers.attention.kv_cache.mha import MHATokenToKVPool
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
-    CacheFieldSpec,
-    pack,
-)
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroupSpec
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
 from tokenspeed.runtime.layers.logits_processor_output import LogitsProcessorOutput
 from tokenspeed.runtime.sampling.backends.base import SamplingBackendConfig
@@ -165,6 +160,11 @@ def build_pp_executor(tmp_path, monkeypatch, *, device, pp_size, pp_rank):
         chunked_prefill_size=4,
         enforce_eager=True,
         disable_prefill_graph=True,
+        disable_cuda_graph_padding=True,
+        cudagraph_capture_sizes=[1, 2],
+        max_cudagraph_capture_size=2,
+        input_logprob_chunk_tokens=4,
+        grammar_backend="none",
     )
     for key in ("logprob_order", "numerics"):
         monkeypatch.setitem(global_server_args_dict, key, vars(args)[key])
@@ -178,19 +178,15 @@ def build_pp_executor(tmp_path, monkeypatch, *, device, pp_size, pp_rank):
         context_length=args.max_model_len,
     )
     model = DenseModel(hf, device=device, last_stage=pp_rank == pp_size - 1)
-    spec = CacheGroupSpec(
-        "full_attention",
-        "full_history",
-        rows_per_page=4,
-        entry_stride_tokens=1,
-        replayable=False,
+    plan = make_mha_memory_plan(
+        size=16,
+        prefix_granularity=4,
+        layer_num=1,
+        kv_heads=1,
+        head_dim=4,
+        dtype=torch.float32,
     )
-    fields = tuple(
-        CacheFieldSpec(f"layer.0.{p}", f"layer.0.{p}", (4, 1, 4), "float32")
-        for p in ("k", "v")
-    )
-    plan = pack(((spec, fields),), prefix_granularity=4).bind(4)
-    arena = CacheArena(plan, device, cache_group_specs=(spec,))
+    arena = make_arena(plan, device)
     pool = MHATokenToKVPool(arena, torch.float32, 1, 4, 1, 0)
     sampler = GreedySamplingBackend(
         SamplingBackendConfig(
@@ -203,40 +199,15 @@ def build_pp_executor(tmp_path, monkeypatch, *, device, pp_size, pp_rank):
             enable_tp_sync=False,
         )
     )
-    config = ModelExecutorConfig(
+    config = ModelExecutorConfig.from_server_args(
+        args,
+        facts,
+        model,
         max_req_pool_size=3,
-        output_length=1,
-        enforce_eager=True,
-        prefix_granularity=4,
-        max_num_seqs=2,
-        chunked_prefill_size=4,
-        vocab_size=32,
-        input_vocab_size=32,
-        context_len=16,
-        physical_context_len=16,
-        device=device,
         gpu_id=0,
         global_rank=pp_rank,
-        cudagraph_capture_sizes=[1, 2],
-        disable_cuda_graph_padding=True,
-        spec_topk=1,
-        max_cudagraph_capture_size=2,
-        model_is_mrope=False,
-        autotune_cache_key=None,
-        prefill_only=True,
-        decode_only_attention=False,
-        prefill_graph_capture_batch_sizes=None,
-        input_logprob_chunk_tokens=4,
-        enable_speculative_sampling=False,
-        query_shard_size=1,
-        query_shard_rank=0,
-        enable_memory_saver=False,
-        grammar_backend="none",
-        disable_prefill_graph=True,
-        pp_size=pp_size,
-        pp_rank=pp_rank,
-        world_size=pp_size,
-        pp_group=(0, 1) if pp_size > 1 else None,
+        prefix_granularity=4,
+        overlap_schedule_depth=0,
     )
     return ModelExecutor(
         config, DenseRunner(model, facts, args.mapping), DenseBackend(), pool, sampler
