@@ -103,6 +103,7 @@ from tokenspeed.runtime.layers.attention.page_table import (
     build_prefill_kv_workspace_slots,
 )
 from tokenspeed.runtime.layers.attention.prefill_head_exchange import (
+    connect_row_exchange,
     exchange_query_rows_padded,
     return_head_rows,
 )
@@ -392,6 +393,9 @@ class DSABackend(PagedAttentionBackend):
             and len(self.qcp_group) == 1
             and self.num_attention_heads <= 128
         )
+        if self._row_shard_prefill:
+            # NCCL connects the exchange's peers on its first all-to-all.
+            connect_row_exchange(self.attn_tp_group, self.device)
         if self._non_bitwise_decode_escape:
             logger.warning(
                 "TS_DSA_ALLOW_NON_BITWISE_DECODE=1: DSA decode planned without "

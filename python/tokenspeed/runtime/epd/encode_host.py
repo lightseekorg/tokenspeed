@@ -473,7 +473,7 @@ class EncodeBootstrap:
             )
         global_rank = mapping.rank
         attn_tp_rank = mapping.attn.tp_rank
-        gpu_id = mapping.rank % mapping.nprocs_per_node + server_args.base_gpu_id
+        gpu_id = mapping.gpu_id
         device = torch.device(server_args.device, gpu_id)
         faulthandler.enable()
         configure_logger(server_args, prefix=f" ATTN TP RANK {attn_tp_rank}")

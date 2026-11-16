@@ -514,8 +514,9 @@ Trainer-side contract:
 | `--max-prefill-tokens` | Prefill token budget used when chunked prefill is disabled. Defaults to `8192`. |
 | `--enable-short-prefill-first` | Prefill and aggregated servers: rank new local prefills by remaining work after Device/Host prefix reuse, including replay work, with stable ties and oldest-request protection after eight successful bypasses. Resident chunks keep priority. Off by default, preserving submission order ([scheduler §1.1](../design/scheduler.md#11-head-of-line-an-incomplete-prefill-holds-the-queue)). |
 | `--prefill-decode-interval` | After a round that runs a prefill chunk, run this many decode rounds before the next prefill round, unless no decode can run. Every chunk starts a new interval, but no prompt is held back more than this many decode rounds in total, so TTFT grows by at most this many decode steps and running decodes stall less often. Aggregated serving only. `0` (default) is off; nonzero values are mutually exclusive with the [DP prefill gate](../design/prefill-delay.md) ([scheduler §3.3](../design/scheduler.md#33-fused--one-engine-everything-local)). |
-| `--prefill-attempt-interval` | ALL attempt interval, in scheduling rounds, for the [DP prefill gate](../design/prefill-delay.md): every rank with decode work must also have eligible prefill work to open the window. Set together with `--prefill-any-attempt-interval`, with `1 <= ALL <= ANY`; leaving both unset (default) disables the gate. Aggregated (fused) serving only (`--disaggregation-mode null`); mutually exclusive with nonzero `--prefill-decode-interval`. |
-| `--prefill-any-attempt-interval` | ANY attempt interval, in scheduling rounds, for the [DP prefill gate](../design/prefill-delay.md): one eligible rank is enough to open the window. Must be set together with `--prefill-attempt-interval` and be at least its value (`1 <= ALL <= ANY`). This is an admission opportunity, not a hard TTFT deadline. Aggregated (fused) serving only (`--disaggregation-mode null`); mutually exclusive with nonzero `--prefill-decode-interval`. |
+| `--prefill-decode-min-interval` | After every round that runs a prefill chunk, run at least this many decode rounds before the next prefill round, unless no decode can run. Unlike `--prefill-decode-interval`, this floor still applies once a prompt has been held back for its full interval, so a long prompt's chunks alternate with decode rounds instead of stalling running decodes back to back. Aggregated serving only. `0` (default) is off; nonzero values are mutually exclusive with the [DP prefill gate](../design/prefill-delay.md). |
+| `--prefill-attempt-interval` | ALL attempt interval, in scheduling rounds, for the [DP prefill gate](../design/prefill-delay.md): every rank with decode work must also have eligible prefill work to open the window. Set together with `--prefill-any-attempt-interval`, with `1 <= ALL <= ANY`; leaving both unset (default) disables the gate. Aggregated (fused) serving only (`--disaggregation-mode null`); mutually exclusive with nonzero `--prefill-decode-interval` or `--prefill-decode-min-interval`. |
+| `--prefill-any-attempt-interval` | ANY attempt interval, in scheduling rounds, for the [DP prefill gate](../design/prefill-delay.md): one eligible rank is enough to open the window. Must be set together with `--prefill-attempt-interval` and be at least its value (`1 <= ALL <= ANY`). This is an admission opportunity, not a hard TTFT deadline. Aggregated (fused) serving only (`--disaggregation-mode null`); mutually exclusive with nonzero `--prefill-decode-interval` or `--prefill-decode-min-interval`. |
 | `--max-total-tokens` | Override the automatically calculated token pool size. |
 | `--enable-state-checkpoint-in-forward` | Hybrid (recurrent-state) models: the prefill forward that spans the last prefix-page boundary before a long prompt's replay tail (normally the final token) also writes the recurrent state there, so a later request that resends the prompt or diverges from it after that boundary resumes there. No extra prefill round; that forward holds one more state block. The recurrent-state checkpoints, and their KV tails, that a next turn re-rendering the end of the previous prompt and its reply cannot resume at are then kept out of the prefix cache. On prefill and fused servers this is the prompt end when it lies inside the page that boundary starts and the request did not resume past it; a prompt end published at the request's finish, as on a prefill server, is kept if the state at the boundary has left the cache by then. On fused servers it is also every finish past the prompt end, including that of a prompt too short to have such a boundary. A next turn that repeats the previous reply verbatim therefore resumes at an earlier checkpoint and recomputes the reply. Requires prefix caching; a decode server ignores it; startup refuses it unless every State group is GDN (FlashInfer prefill, a prefix granularity that is a multiple of its 64-token scan chunk), KDA, or Qwen4-Exp PLE. With prefill graphs, the GDN layers of a forward that writes one stay captured; every captured shape shares one float32 scan scratch of (largest prefill-graph token capacity / prefix granularity) recurrent states. The KDA layers of such a forward run at their eager breaks and scan each checkpointed row's tokens before its checkpoint a second time. When a request publishes an in-forward checkpoint past the one it resumed from, which its own predecessor wrote past an earlier one, that earlier checkpoint -- two turns back on the conversation -- is evicted early from the device and host caches, and no new store or eviction write-back copies it to host, unless another request also resumed from it, or acquired or republished it after the conversation's previous turn resumed there, so multi-turn traffic keeps more live prefixes cached. On a prefill server, a prompt too short for the in-forward checkpoint (by default, one no longer than the chunk budget) whose end lies inside a prefix page also leaves only its full pages in the prefix cache, with no recurrent state and no KV tail at its end; a longer prompt that repeats it whole resumes at an earlier checkpoint instead, a page-aligned prompt end keeps its state, and a fused server keeps short prompt ends. Off by default ([scheduler §1.2](../design/scheduler.md#12-state-groups-two-slots-natural-checkpoints)). |
 | `--enable-prefix-caching` / `--disable-prefix-caching` | Enable or disable prefix cache reuse. |
@@ -528,7 +529,7 @@ Trainer-side contract:
 | `--max-cudagraph-capture-size` | Largest decode batch size to capture as a device graph. |
 | `--cudagraph-capture-sizes` | Explicit decode batch sizes to capture as device graphs. |
 | `--prefill-graph-capture-token-sizes` | Total input-token capacities per forward, summed across the batch. Shorter inputs are padded. |
-| `--prefill-graph-capture-batch-sizes` | Request capacities for inline recurrent-layer (KDA, Mamba2, GDN) prefill capture. Replay selects the smallest compatible capacity that fits the batch. |
+| `--prefill-graph-capture-batch-sizes` | Request capacities for inline recurrent-layer (KDA, Mamba2, GDN) prefill capture. Replay selects the smallest compatible capacity that fits the batch, padding the missing requests. Unset: `4` (capped by `--max-num-seqs` per data-parallel rank), so a prefill round of up to 4 requests runs its recurrent layers inside the graph; a round of more requests, or one too full for the padding, runs them at eager breaks. Each added count is one more graph per token bucket, with its capture time and memory. |
 | `--retraction-snapshot-host-gb` | Explicit size, in gigabytes, of the per-rank pinned Host pool that holds a retraction image's tail (a retracted request's blocks of groups Host L2 never holds, a state group's unpublished input block, and its slot state; the published blocks, the partial last page and the live state block included, go to Host L2 and stay pinned there until the request is restored; with `--disable-kvstore` the pool holds whole images). Wins over `--retraction-snapshot-ratio` when set; `0` (the default) means not set, like `--kvstore-size` against `--kvstore-ratio`. A request a capacity retraction suspends is imaged here and resumes exactly where it stopped once the image is copied back; nothing is recomputed. When no resident's image fits -- the pool or its rows are exhausted -- the scheduler aborts the newest resident instead (finish `err_type` 524, see "Retraction snapshot pool" below), so the pool bounds how much can be suspended at once, never how long an admission waits. Fused and decode roles only; the prefill and encode roles never retract and ignore it with a log. Allowed under `--kv-parallel-size > 1`. |
 | `--retraction-snapshot-ratio` | Size of the retraction snapshot pool as a multiple of this rank's Device KV capacity (the base `--kvstore-ratio` scales too), used when `--retraction-snapshot-host-gb` is not set. Unset (the default) derives the pool at device build: 0.1 of the Device KV without the Host KVStore (whole images, kept cheap to pin; `1` makes every resident suspendable), else the image tails of `--retraction-snapshot-max-requests` requests (table below). An explicit `0` is the one way to run **without a pool**: nothing can be imaged, so every capacity block aborts its victim (the newest resident). |
 | `--retraction-snapshot-max-requests` | Slot-state image rows of the retraction snapshot pool, that is, the most requests suspended at once, and the request count the derived pool size is multiplied by. `0` (the default) derives to `--max-num-seqs / attention-DP size`, which covers every resident request of the rank; refused with `--retraction-snapshot-ratio 0`, which has no rows to size. When no row is free the scheduler aborts a resident rather than waiting. |
@@ -544,8 +545,10 @@ dummy request slots. These settings do not replace the scheduler's
 `--prefill-graph-capture-sizes` remains a compatibility alias for
 `--prefill-graph-capture-token-sizes`. Specify only one spelling per command.
 Both populate the existing `prefill_graph_capture_sizes` Python field.
-Unset token sizes use the existing default ladder. Unset batch sizes use the
-minimum request count that fits each token bucket within the model context.
+Unset token sizes use the existing default ladder. Unset batch sizes capture 4
+requests per token bucket, capped by `--max-num-seqs` per data-parallel rank and
+the bucket, and at least the request count that fits each token bucket within
+the model context.
 
 `--chunked-prefill-size` is intentionally separate from
 `--max-num-batched-tokens`: in TokenSpeed it is the scheduler's per-iteration
@@ -574,6 +577,8 @@ issue budget, while `--max-total-tokens` controls the global token pool.
 | `--pp-layer-partition` | Explicit per-stage layer counts, front to back (`"24,24,24,21"`); one entry per stage, summing to the model's layer count. Default: even split with the remainder on the front stages. |
 | `--world-size` | Total worker process count across all nodes. |
 | `--nprocs-per-node` | Worker process count per node. |
+| `--base-gpu-id` | First visible GPU ordinal used on each node. Default 0. |
+| `--gpu-id-step` | Spacing between local workers' GPU ordinals. Default 1. |
 | `--nnodes` | Number of nodes. |
 | `--node-rank` | Rank of the current node. |
 | `--dist-init-addr` | Distributed initialization address. |
@@ -709,7 +714,8 @@ The draft and target models and the normal verification kernel still execute.
 The verification result is then overridden with synthetic acceptance before
 committing tokens and updating request state, preserving verification overhead.
 The override copies the forced draft prefix and selects the existing target
-argmax at the cutoff. It adds no second verification or target-resampling pass.
+argmax at the cutoff, in one launch. It adds no second verification or
+target-resampling pass.
 **Do not use generated text for correctness or accuracy evaluation.** Request
 termination can truncate the last verification's output.
 
@@ -1709,7 +1715,10 @@ store client reads `MC_USE_IPV6` on its own when the store starts, so export
 
 `--speculative-rejection-sample-method block --enable-speculative-sampling --sampling-backend flashinfer`
 verifies a sampled draft chain by block verification instead of token-wise
-rejection. The names follow vLLM: `--enable-speculative-sampling` is
+rejection. `--sampling-backend triton` (the ROCm path) runs it too. Because
+block verification needs whole target rows, the Triton backend skips its
+vocabulary-shard candidate selection and, unless the batch's top-k bounds the
+candidates, sorts whole rows. The names follow vLLM: `--enable-speculative-sampling` is
 `draft_sample_method=probabilistic`, and `--speculative-config` also accepts
 the `draft_sample_method` and `rejection_sample_method` keys. It supports `DSPARK` (probabilistic Markov drafting) and `EAGLE3`
 with `--speculative-eagle-topk 1`; block verification is defined on a single
@@ -1728,14 +1737,17 @@ longest accepted prefix, and samples a prefix-scaled positive residual (or a
 target bonus token). It is not a single whole-block likelihood-ratio test.
 The output uses the existing accepted-length and state rollback contract.
 
-The existing per-request proposal RNG and verifier coin streams are reused.
+The existing per-request proposal RNG is reused. The accepted length depends
+on every prefix coin, so no two verify steps of a request share a coin: the
+FlashInfer backend draws fresh coins each step, and the Triton backend keys one step's
+coins by the request's seed and the step's first verify position.
 A stochastic output difference from greedy decoding is expected; validate the
 output distribution and accuracy, rather than requiring identical token IDs.
 
 Replacing `block` with `--synthetic-acceptance-length L` (the `synthetic`
 method) gives a benchmark-only mode, the equivalent of vLLM's probabilistic
 draft sampling with synthetic rejection; for `DSPARK` it also turns on sampled
-Markov drafting.
+Markov drafting. Unlike `block`, it needs `--sampling-backend flashinfer`.
 The drafter still samples: the full-vocabulary draft logits (and DSpark's Markov
 steps) and the recorded fp32 draft probabilities all stay on the path. Verify
 gathers those probabilities and runs the standard draft-probability chain rule

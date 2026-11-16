@@ -24,7 +24,8 @@ Each rank holds the same K3.1 latent rows and half of 96 query heads. Past
 the row threshold the backend hands each rank half of the rows with every
 head (padded to the core's 128), attends them and hands the heads back; each
 rank must get the attention the plain path gives its heads. A prefill under
-the threshold keeps the plain path.
+the threshold keeps the plain path. The backend connects the exchange once,
+when it is built.
 """
 
 import sys
@@ -130,7 +131,16 @@ def _worker(rank: int, rendezvous: str) -> None:
         pool.set_mla_kv_buffer(
             layer, slots, latent[..., :512], latent[..., 512:], write_mask=None
         )
+        connected = []
+        connect = dsa.connect_row_exchange
+
+        def counted_connect(group, device):
+            connected.append(group)
+            return connect(group, device)
+
+        dsa.connect_row_exchange = counted_connect
         leaf = _leaf(pool, rank)
+        assert connected == [(0, 1)]
         visible = torch.arange(1, _ROWS + 1, device="cuda", dtype=torch.int32)
         topk = torch.full((_ROWS, 2048), -1, dtype=torch.int32, device="cuda")
         for row, count in enumerate(visible.tolist()):

@@ -2781,14 +2781,17 @@ def test_sorted_situ_dispatch_and_compilation_gfx950(monkeypatch, intermediate_s
 
     run(64)
     if intermediate_size == 384:
-        run(65)
+        # Stage 2 narrows its W2 tile through _A8W4_SORTED_STAGE2_NARROW_MAX_M
+        # tokens; warm both tiles at aligned and unaligned M.
+        for tokens in (65, 32, 33):
+            run(tokens)
         with ExitStack() as stack:
             for kernel in (
                 warp_decode._warp_decode_precomputed_situ_sorted_stage1_kernel,
                 warp_decode._warp_decode_sorted_stage2_fp8_mxfp4_kernel,
             ):
                 stack.enter_context(assert_no_triton_compile(kernel))
-            for tokens in (33, 48, 70, 97, 130):
+            for tokens in (17, 48, 49, 70, 97, 130):
                 run(tokens)
 
 

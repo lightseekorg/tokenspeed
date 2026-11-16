@@ -27,15 +27,18 @@ from typing import TYPE_CHECKING
 import torch
 from tokenspeed_kernel.ops.attention.dsv4._triton.dcp import normalize_dcp_partials
 from tokenspeed_kernel.ops.attention.mla import (
+    mla_decode_query_rows,
     mla_decode_with_kvcache,
     mla_extend_with_kvcache,
     mla_prefill,
     mla_use_absorbed_extend,
     supports_mla_decode_query_blocks,
+    supports_mla_decode_query_rows,
 )
 from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
     kvp_decode_visible_lengths,
 )
+from tokenspeed_kernel.ops.metadata import broadcast_block_lengths
 from tokenspeed_kernel.selection import KernelPlan, NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
@@ -246,9 +249,9 @@ class MLAAttnBackend(PagedAttentionBackend):
         self.forward_prefill_metadata: MLAPrefillMetadata | None = None
         self.chunked_prefill_metadata: MLAPrefillMetadata | None = None
         self._query_block_decode: dict[tuple[int, int, bool], bool] = {}
+        self._query_rows: dict[tuple[torch.dtype, int, bool], bool] = {}
         self._block_page_table_buf: torch.Tensor | None = None
         self._block_seq_lens_buf: torch.Tensor | None = None
-        self._block_causal_backoff: torch.Tensor | None = None
 
         self.kvp_group = tuple(config.kvp_group)
         self.kvp_rank = config.kvp_rank
@@ -438,6 +441,34 @@ class MLAAttnBackend(PagedAttentionBackend):
             )
         return answer
 
+    def _takes_query_rows(
+        self, q_dtype: torch.dtype, q_len: int, *, return_lse: bool
+    ) -> bool:
+        """Whether a decode hands each request's rows, with their own lengths,
+        to one query-row kernel instead of one launch row per query (and head
+        group): the DCP decode with its local lengths (and LSE), or a causal
+        block draft with its backed-up entries."""
+        key = (q_dtype, q_len, return_lse)
+        answer = self._query_rows.get(key)
+        if answer is None:
+            answer = supports_mla_decode_query_rows(
+                q_dtype=q_dtype,
+                kv_dtype=self.data_type,
+                page_size=self.kernel_page_size,
+                q_len=q_len,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                return_lse=return_lse,
+                solution=self.kernel_solution,
+            )
+            self._query_rows[key] = answer
+            logger.info(
+                f"MLA {'DCP' if return_lse else 'block'} decode uses "
+                f"{'query rows' if answer else 'one launch row per query'} "
+                f"(q_len={q_len:d}, q={q_dtype!s}, kv={self.data_type!s})."
+            )
+        return answer
+
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
         super()._publish_cache_pool(cache_pool)
         self.forward_decode_metadata = None
@@ -445,7 +476,6 @@ class MLAAttnBackend(PagedAttentionBackend):
         self.chunked_prefill_metadata = None
         self._block_page_table_buf = None
         self._block_seq_lens_buf = None
-        self._block_causal_backoff = None
         self.kvp_block_granularity = None
         self.kvp_virtual_block_count = None
         self.dcp_metadata = None
@@ -619,20 +649,13 @@ class MLAAttnBackend(PagedAttentionBackend):
         self._block_seq_lens_buf = torch.zeros(
             max_bs, dtype=self.seq_lens_buf.dtype, device=self.seq_lens_buf.device
         )
-        expansion = max(self.block_decode_expansion, 1)
-        self._block_causal_backoff = torch.arange(
-            expansion - 1,
-            -1,
-            -1,
-            dtype=self.seq_lens_buf.dtype,
-            device=self.seq_lens_buf.device,
-        )
 
     def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
         """Broadcast, keeping the per-request row the query-axis fold reads.
 
         The drafter calls this inside the captured graph, so the row has to be
-        written there too rather than derived from the expanded view per layer.
+        written there too rather than derived from the expanded view per layer;
+        one launch writes both.
         """
         if self._dcp_causal_block:
             torch.clamp(
@@ -643,17 +666,18 @@ class MLAAttnBackend(PagedAttentionBackend):
             )
             return
         self._ensure_block_row_buffers(bs)
-        rows = self._block_seq_lens_buf[:bs]
-        torch.clamp(
-            block_seq_lens[:bs], self.spec_num_tokens, self.max_context_len, out=rows
-        )
         expansion = self.block_decode_expansion
-        expanded = self.decode_seq_lens_buffer[: bs * expansion].view(bs, expansion)
-        if self.draft_block_causal:
-            # rows >= spec_num_tokens = expansion, so every entry keeps >= 1 token.
-            torch.sub(rows.unsqueeze(1), self._block_causal_backoff, out=expanded)
-        else:
-            expanded.copy_(rows.unsqueeze(1))
+        broadcast_block_lengths(
+            block_seq_lens[:bs],
+            self.spec_num_tokens,
+            self.max_context_len,
+            # rows >= spec_num_tokens = expansion: a causal entry keeps >= 1 token.
+            causal=self.draft_block_causal,
+            rows_out=self._block_seq_lens_buf[:bs],
+            entries_out=self.decode_seq_lens_buffer[: bs * expansion].view(
+                bs, expansion
+            ),
+        )
 
     def _decode_views(self, bs: int) -> MLADecodeMetadata:
         """Per-bs decode metadata views over the persistent buffers.
@@ -780,6 +804,7 @@ class MLAAttnBackend(PagedAttentionBackend):
                 q, layer, token_to_kv_pool, bs, q_len_per_req, num_extends
             )
 
+        query_rows = False
         if self.block_decode_active:
             if q_len_per_req == noncausal_block_size and self._takes_query_blocks(
                 layer.tp_q_head_num, q_len_per_req, window_left >= 0
@@ -791,6 +816,21 @@ class MLAAttnBackend(PagedAttentionBackend):
                 query = q.view(bs, q_len_per_req, layer.tp_q_head_num, layer.head_dim)
                 page_table = metadata.block_page_table
                 cache_seqlens = metadata.block_seq_lens
+            elif (
+                self.draft_block_causal
+                and q_len_per_req == self.block_decode_expansion
+                and window_left < 0
+                and layer.logit_cap == 0.0
+                and kwargs.get("value_weight") is None
+                and self.decode_kernel_plan is None
+                and self._takes_query_rows(q.dtype, q_len_per_req, return_lse=False)
+            ):
+                # Every row of a request shares its KV reads, each row stopping
+                # at the length its entry was backed off to.
+                query_rows = True
+                query = q.view(bs, q_len_per_req, layer.tp_q_head_num, layer.head_dim)
+                page_table = metadata.block_page_table
+                cache_seqlens = metadata.seq_lens.view(bs, q_len_per_req)
             else:
                 # One metadata row per block position already: each at the
                 # block-end length for a non-causal draft, or backed off to its
@@ -853,7 +893,18 @@ class MLAAttnBackend(PagedAttentionBackend):
         value_weight = kwargs.get("value_weight")
         gate = kwargs.get("output_gate")
         projected_out = kwargs.get("projected_output")
-        if value_weight is not None:
+        if query_rows:
+            result = mla_decode_query_rows(
+                query,
+                kv_cache,
+                page_table,
+                cache_seqlens,
+                max_seqlen_k,
+                softmax_scale,
+                kv_lora_rank=self.kv_lora_rank,
+                solution=self.kernel_solution,
+            )
+        elif value_weight is not None:
             # Fuse projection and gate into decode to avoid materializing latent output.
             result = mla_decode_with_kvcache(
                 query,
@@ -946,27 +997,40 @@ class MLAAttnBackend(PagedAttentionBackend):
             q.view(-1, layer.tp_q_head_num, layer.head_dim), self.kvp_group
         )
         rows = query.shape[0]
-        query = query.reshape(rows * groups, 1, kernel_heads, layer.head_dim)
-        page_table = dcp.local_page_table.repeat_interleave(
-            q_len_per_req * groups, dim=0
-        )
         kv_cache = token_to_kv_pool.get_key_buffer(layer.layer_id)
         if self.data_type != kv_cache.dtype:
             kv_cache = kv_cache.to(self.data_type)
         kv_cache = kv_cache.view(-1, self.kernel_page_size, 1, self.kv_cache_dim)
-        output, lse = mla_decode_with_kvcache(
-            q=query,
-            kv_cache=kv_cache,
-            page_table=page_table,
-            cache_seqlens=cache_seqlens,
-            max_seqlen_k=self.max_context_len,
-            qk_nope_head_dim=self.qk_nope_head_dim,
-            kv_lora_rank=self.kv_lora_rank,
-            qk_rope_head_dim=self.qk_rope_head_dim,
-            softmax_scale=layer.scaling,
-            return_lse=True,
-            solution=self.kernel_solution,
-        )
+        if self._takes_query_rows(query.dtype, q_len_per_req, return_lse=True):
+            # Every row of a request shares its KV reads, each row stopping at
+            # its own local length.
+            output, lse = mla_decode_query_rows(
+                query.reshape(bs, q_len_per_req, heads, layer.head_dim),
+                kv_cache,
+                dcp.local_page_table,
+                local_lengths.view(bs, q_len_per_req),
+                self.max_context_len,
+                layer.scaling,
+                kv_lora_rank=self.kv_lora_rank,
+                return_lse=True,
+                solution=self.kernel_solution,
+            )
+        else:
+            output, lse = mla_decode_with_kvcache(
+                q=query.reshape(rows * groups, 1, kernel_heads, layer.head_dim),
+                kv_cache=kv_cache,
+                page_table=dcp.local_page_table.repeat_interleave(
+                    q_len_per_req * groups, dim=0
+                ),
+                cache_seqlens=cache_seqlens,
+                max_seqlen_k=self.max_context_len,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                softmax_scale=layer.scaling,
+                return_lse=True,
+                solution=self.kernel_solution,
+            )
         output, local_lse = normalize_dcp_partials(
             output.reshape(rows, heads, self.kv_lora_rank),
             lse.reshape(rows, heads),

@@ -98,6 +98,28 @@ def selected_prefill_with_head_exchange(
     return all_to_all_head_scatter(output, group, counts, backend=None)
 
 
+def connect_row_exchange(group: tuple[int, ...], device: torch.device | str) -> None:
+    """Run one all-to-all of a byte per peer over ``group`` before any prefill.
+
+    NCCL connects a group's peers for point-to-point traffic on its first
+    all-to-all, which took up to a second for TP8 over two GB300 nodes; paying
+    it at startup keeps it out of the first long prefill.
+
+    Args:
+        group: The ranks the row exchange spans.
+        device: This rank's device.
+    """
+    world = len(group)
+    sent = torch.zeros(world, dtype=torch.uint8, device=device)
+    all_to_all_single(
+        torch.empty_like(sent),
+        sent,
+        group,
+        output_split_sizes=[1] * world,
+        input_split_sizes=[1] * world,
+    )
+
+
 def exchange_query_rows_padded(
     q: torch.Tensor,
     group: tuple[int, ...],

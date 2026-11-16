@@ -18,45 +18,73 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""The mailbox publish writes whole words, bit for bit."""
+"""The rank-major mailbox gather reads whole blocks, bit for bit, and re-arms them."""
 
 from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.communication.triton import multicast_publish
+from fused_boundary_helpers import assert_child_keeps_waiting
+from tokenspeed_kernel.ops.communication.triton import gather_mailbox_blocks
 from tokenspeed_kernel.platform import current_platform
 
 pytestmark = pytest.mark.skipif(
     not (current_platform().is_nvidia or current_platform().is_amd),
-    reason="multicast publish needs a GPU",
+    reason="the mailbox gather needs a GPU",
 )
+
+# The half-polled sentinel: a NaN payload no GEMM emits.
+_SENTINEL = 0xFFFFFFFF
 
 
 @pytest.mark.parametrize(
-    "rows, width, slot_col", [(1, 1024, 1), (3, 1024, 1), (64, 8192, 3)]
+    "rows, blocks, block_width", [(1, 4, 1024), (5, 4, 2048), (64, 1, 8192)]
 )
-def test_publish_copies_whole_words_into_a_strided_slot(
-    rows: int, width: int, slot_col: int
+def test_gather_reads_each_blocks_rows_side_by_side_and_re_arms_them(
+    rows: int, blocks: int, block_width: int
 ) -> None:
     torch.manual_seed(1)
-    block = torch.randn(rows, width, dtype=torch.bfloat16, device="cuda")
-    block[0, :16] = -0.0
-    block[-1, 100] = 0.0
-    mailbox = torch.empty(64, 4 * width, dtype=torch.bfloat16, device="cuda")
+    expected = torch.randn(
+        rows, blocks * block_width, dtype=torch.bfloat16, device="cuda"
+    )
+    expected[0, :16] = -0.0
+    expected[-1, 100] = 0.0
+    capacity = 64
+    mailbox = torch.empty(
+        blocks, capacity, block_width, dtype=torch.bfloat16, device="cuda"
+    )
     mailbox.view(torch.int32).fill_(-1)
-    slot = mailbox[:rows, slot_col * width : (slot_col + 1) * width]
-    multicast_publish(block, slot)
-    torch.cuda.synchronize()
-    # Bit for bit, negative zeros included: the sentinel is a NaN payload.
-    assert torch.equal(slot.view(torch.int32), block.view(torch.int32))
-    # Untouched columns keep the sentinel arming.
-    assert mailbox[:rows, : slot_col * width].view(torch.int32).eq(-1).all()
-    assert mailbox[:rows, (slot_col + 1) * width :].view(torch.int32).eq(-1).all()
-    multicast_publish(block[:0], slot[:0])
-    odd = torch.zeros(rows, 4 * width + 2, dtype=torch.bfloat16, device="cuda")
-    with pytest.raises(ValueError, match="32-bit aligned"):
-        multicast_publish(block, odd[:, 1 : width + 1])
+    mailbox[:, :rows].copy_(expected.view(rows, blocks, block_width).transpose(0, 1))
+    got = gather_mailbox_blocks(mailbox[:, :rows], _SENTINEL, False)
+    # Bit for bit, negative zeros included; every word read is re-armed.
+    assert torch.equal(got.view(torch.int16), expected.view(torch.int16))
+    assert mailbox.view(torch.int32).eq(-1).all()
+    assert gather_mailbox_blocks(mailbox[:, :0], _SENTINEL, False).shape == (
+        0,
+        blocks * block_width,
+    )
+    with pytest.raises(ValueError, match="contiguous blocks"):
+        gather_mailbox_blocks(mailbox[..., : block_width // 2], _SENTINEL, False)
+
+
+_GATHER_WAITER = """
+from tokenspeed_kernel.ops.communication.triton import gather_mailbox_blocks
+row = torch.full((1, 4096), 0.5, dtype=torch.bfloat16, device=device)
+mailbox = torch.empty(4, 1, 1024, dtype=torch.bfloat16, device=device)
+def consume():
+    gather_mailbox_blocks(mailbox, HALF_POLLED_SENTINEL, True)
+"""
+
+
+@pytest.mark.skipif(
+    not current_platform().is_nvidia, reason="half-polled mailboxes require NVIDIA"
+)
+@pytest.mark.parametrize("word, empty", [(777, 0xFFFF), (2047, -65536)])
+def test_gather_waits_for_a_word_still_holding_a_sentinel_half(
+    word: int, empty: int
+) -> None:
+    """A word with either BF16 half still empty stalls its block's row."""
+    assert_child_keeps_waiting(_GATHER_WAITER, word, empty)
 
 
 @pytest.mark.skipif(

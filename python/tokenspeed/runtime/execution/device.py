@@ -1406,28 +1406,37 @@ def probe_arena_floor(
     """Parent blocks a probe arena needs for the widest row the boot fabricates.
 
     Both terms track a knob: the ladder is built from the resolved prefill-graph
-    ceiling, which is a default rather than zero when unset, and a configured
-    capture batch size fabricates that many rows whatever the bucket. Returned
+    ceiling, which is a default rather than zero when unset, and a capture
+    batch size, configured or the default, fabricates that many rows. Returned
     rather than inlined so a test can assert the number instead of the source.
     A narrowing model's decoder ladder (``decoder_rows_per_request`` is its
     ``max_decoder_rows_per_request``, None for other models) fabricates one
     request per that many rows of a bucket no wider than the token ladder's,
     and never more than ``max_num_seqs``. A chain drafter records its extend
-    rounds' decode steps at every request count up to
-    ``EXTEND_DECODE_MAX_REQUESTS``, and never more than ``max_num_seqs``.
+    rounds' decode steps, and a block drafter its block draft, at every request
+    count up to ``EXTEND_DECODE_MAX_REQUESTS``, and never more than
+    ``max_num_seqs``.
     """
     from tokenspeed.runtime.execution.cudagraph_memory import probe_arena_parent_blocks
     from tokenspeed.runtime.execution.drafter.base import EXTEND_DECODE_MAX_REQUESTS
     from tokenspeed.runtime.execution.model_executor import (
         _resolve_prefill_graph_max_tokens,
     )
-    from tokenspeed.runtime.utils.server_args import STEP_SPEC_ALGORITHMS
+    from tokenspeed.runtime.execution.prefill_graph import (
+        PREFILL_DEFAULT_CAPTURE_REQUESTS,
+    )
+    from tokenspeed.runtime.utils.server_args import EXTEND_GRAPH_SPEC_ALGORITHMS
 
     tokens = max(max_forward_tokens, _resolve_prefill_graph_max_tokens(server_args))
+    capture_batch_sizes = server_args.prefill_graph_capture_batch_sizes
+    if capture_batch_sizes is None:
+        capture_batch_sizes = [
+            min(PREFILL_DEFAULT_CAPTURE_REQUESTS, server_args.max_num_seqs)
+        ]
     return probe_arena_parent_blocks(
         max_forward_tokens=tokens,
         context_len=model_config.context_len,
-        capture_batch_sizes=server_args.prefill_graph_capture_batch_sizes,
+        capture_batch_sizes=capture_batch_sizes,
         decoder_requests=(
             0
             if decoder_rows_per_request is None
@@ -1435,7 +1444,7 @@ def probe_arena_floor(
         ),
         drafter_requests=(
             min(server_args.max_num_seqs, EXTEND_DECODE_MAX_REQUESTS)
-            if server_args.speculative_algorithm in STEP_SPEC_ALGORITHMS
+            if server_args.speculative_algorithm in EXTEND_GRAPH_SPEC_ALGORITHMS
             else 0
         ),
     )

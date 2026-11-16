@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from tokenspeed_kernel.ops.kvcache.index_k_scale import index_k_scale_dtype
 
 from tokenspeed.runtime.configs.glm53_flash_config import Glm53FlashTextConfig
 from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
@@ -216,7 +217,7 @@ def test_glm53_flash_pool_binds_paged_cache_and_request_local_tail() -> None:
     assert tuple(tail_gate.shape) == (10, 4, 128)
     values, scales = pool.index_k_block_views(index_k)
     assert values.dtype == torch.float8_e4m3fn
-    assert scales.dtype == torch.float32
+    assert scales.dtype == index_k_scale_dtype()
     assert all(
         view.untyped_storage().data_ptr() == backing_ptr
         for view in (index_k, values, scales)

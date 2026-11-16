@@ -132,8 +132,10 @@ PIPELINE_SPEC_ALGORITHMS = ("DSPARK", "MTP")
 AUX_CAPTURE_SPEC_ALGORITHMS = ("EAGLE3", "EAGLE4")
 #: Drafters that propose one token per draft step (a chain of steps + 1 tokens, or a tree).
 STEP_SPEC_ALGORITHMS = ("EAGLE3", "EAGLE4", "MTP")
+#: Drafters whose prefill rounds replay graphs recorded at each request count.
+EXTEND_GRAPH_SPEC_ALGORITHMS = (*STEP_SPEC_ALGORITHMS, "DFLASH", "DSPARK")
 # Drafters whose topk=1 chain can record sampled proposals for block
-# verification or synthetic rejection on the flashinfer backend.
+# verification (flashinfer or triton) or synthetic rejection (flashinfer).
 BLOCK_REJECTION_ALGORITHMS = ("DSPARK", "EAGLE3")
 # Verify rules, named as vLLM's rejection_sample_method.
 REJECTION_SAMPLE_METHODS = ("standard", "block", "synthetic")
@@ -461,6 +463,8 @@ class ServerArgs:
     # Decode rounds owed to the running decodes after each prefill round; 0 is
     # off (docs/design/scheduler.md §3.3).
     prefill_decode_interval: int = 0
+    # The same, owed even while an overdue prompt suspends the interval.
+    prefill_decode_min_interval: int = 0
     enable_short_prefill_first: bool = False
     # The fused engine's prefill-delay gate (docs/design/prefill-delay.md):
     # prefill work is held for a window of decode rounds and then batched, so
@@ -1922,8 +1926,9 @@ class ServerArgs:
             )
 
         # Block verification, and synthetic rejection over sampled drafts, run
-        # the sampled-chain verify on the flashinfer backend; greedy and sonic
-        # force the synthetic length over their own verify.
+        # the sampled-chain verify on the flashinfer backend (block also on
+        # triton); greedy and sonic force the synthetic length over their own
+        # verify.
         sampled_chain_verify = self.speculative_rejection_sample_method == "block" or (
             self.speculative_rejection_sample_method == "synthetic"
             and self.sampling_backend not in ("greedy", "sonic")
@@ -1933,7 +1938,10 @@ class ServerArgs:
                 not self.enable_speculative_sampling
                 or self.speculative_algorithm not in BLOCK_REJECTION_ALGORITHMS
                 or self.speculative_eagle_topk != 1
-                or self.sampling_backend != "flashinfer"
+                or not (
+                    self.sampling_backend == "flashinfer"
+                    or self._block_verifies_on_triton
+                )
                 or self.dp_sampling
                 or self.mapping.has_attn_dp
                 or self.pipeline_parallel_size != 1
@@ -1944,8 +1952,9 @@ class ServerArgs:
                     f"{self.speculative_rejection_sample_method} with sampled drafts "
                     "requires a DSPARK or EAGLE3 chain "
                     "(--speculative-eagle-topk 1), --enable-speculative-sampling, "
-                    "the flashinfer sampling backend, and aggregate TP without attention DP, "
-                    "DP sampling, pipeline parallelism, or PD disaggregation"
+                    "the flashinfer sampling backend (or triton for block), and "
+                    "aggregate TP without attention DP, DP sampling, pipeline "
+                    "parallelism, or PD disaggregation"
                 )
             if self.speculative_rejection_sample_method == "synthetic":
                 # vLLM's draft_sample_method=probabilistic with
@@ -1959,6 +1968,14 @@ class ServerArgs:
                 )
         if self.enable_speculative_sampling:
             self._validate_speculative_sampling()
+
+    @property
+    def _block_verifies_on_triton(self) -> bool:
+        """Block verification on the triton backend, which reads the dense q."""
+        return (
+            self.speculative_rejection_sample_method == "block"
+            and self.sampling_backend == "triton"
+        )
 
     @property
     def eagle_harness(self) -> bool:
@@ -2026,8 +2043,9 @@ class ServerArgs:
         distribution q, so the drafter must propose one token per step from
         its own logits (the Eagle family and the multi-depth MTP drafter) and
         the verifier must be a backend that runs the draft-prob chain kernel:
-        ``greedy`` verifies by exact match and ``triton`` by a target-sampled
-        exact match, so a dense q never enters either. The one block drafter
+        ``greedy`` verifies by exact match, so a dense q never enters it, and
+        ``triton`` by a target-sampled exact match unless it runs block
+        verification, which reads the dense q. The one block drafter
         served is DFLASH with the DFlash2 candidate selector: its walk samples
         each step from the selector's q over its top-K candidates, which only
         the ``triton`` backend verifies (sparse q); base DFLASH without the
@@ -2090,14 +2108,18 @@ class ServerArgs:
                     "the DFlash2 selector's sparse draft distribution; got "
                     f"--sampling-backend {self.sampling_backend}"
                 )
-        elif self.sampling_backend not in SPECULATIVE_SAMPLING_BACKENDS:
+        elif (
+            self.sampling_backend not in SPECULATIVE_SAMPLING_BACKENDS
+            and not self._block_verifies_on_triton
+        ):
             if self.sampling_backend == "greedy":
                 why = "verifies by exact match, so the draft distribution never enters"
             elif self.sampling_backend in ("triton", "triton_full"):
                 why = (
                     "verifies by target-sampled exact match and has no dense "
                     "draft-prob rejection kernel (triton reads only the DFlash2 "
-                    "selector's sparse q, under DFLASH)"
+                    "selector's sparse q, under DFLASH, and the dense q under "
+                    "--speculative-rejection-sample-method block)"
                 )
             else:
                 why = "has no draft-prob rejection kernel"
@@ -2817,6 +2839,14 @@ class ServerArgs:
                 "prefill engine runs no decodes and a decode engine no local "
                 "prefill rounds"
             )
+        if self.prefill_decode_min_interval < 0:
+            raise ValueError("--prefill-decode-min-interval must be non-negative")
+        if self.prefill_decode_min_interval and self.disaggregation_mode != "null":
+            raise ValueError(
+                "--prefill-decode-min-interval needs --disaggregation-mode null: "
+                "a prefill engine runs no decodes and a decode engine no local "
+                "prefill rounds"
+            )
         if self.monokernel_stuck_record_dir is not None:
             fs_type = _filesystem_type(self.monokernel_stuck_record_dir)
             if fs_type != "tmpfs":
@@ -2915,13 +2945,17 @@ class ServerArgs:
                 "the prefill delay gate applies to a fused engine "
                 "(--disaggregation-mode null) only"
             )
-        if self.prefill_decode_interval:
-            raise ValueError(
-                "--prefill-decode-interval cannot be combined with "
-                "--prefill-attempt-interval and --prefill-any-attempt-interval: "
-                "local decode intervals and the attention-DP gate use different "
-                "prefill windows"
-            )
+        for flag, interval in (
+            ("--prefill-decode-interval", self.prefill_decode_interval),
+            ("--prefill-decode-min-interval", self.prefill_decode_min_interval),
+        ):
+            if interval:
+                raise ValueError(
+                    f"{flag} cannot be combined with "
+                    "--prefill-attempt-interval and --prefill-any-attempt-interval: "
+                    "local decode intervals and the attention-DP gate use "
+                    "different prefill windows"
+                )
 
     @property
     def prefill_delay(self) -> tuple[int, int] | None:
@@ -3201,6 +3235,17 @@ class ServerArgs:
             "more than this many decode rounds in total. Trades TTFT for "
             "fewer decode stalls. Aggregated serving only. 0 (the default) is "
             "off.",
+        )
+        parser.add_argument(
+            "--prefill-decode-min-interval",
+            type=int,
+            default=ServerArgs.prefill_decode_min_interval,
+            help="After every round that runs a prefill chunk, run at least "
+            "this many decode rounds before the next prefill round, unless no "
+            "decode can run, even while --prefill-decode-interval is suspended "
+            "for a prompt it has held back in full. A long prompt's chunks "
+            "then alternate with decode rounds instead of stalling the decodes "
+            "back to back. Aggregated serving only. 0 (the default) is off.",
         )
         parser.add_argument(
             "--enable-state-checkpoint-in-forward",
@@ -4513,9 +4558,10 @@ class ServerArgs:
             nargs="+",
             help="Request capacities for inline prefill attention capture; "
             "replay rounds up to the smallest fitting captured batch size. "
-            "Unset: the minimum request count that fits each token bucket within "
-            "the model context. KDA captures a fixed request count, so each token "
-            "bucket needs one inline variant per configured request count. "
+            "Unset: 4, capped by --max-num-seqs per data-parallel rank and the "
+            "token bucket, and at least the request count that fits each token "
+            "bucket within the model context. KDA captures a fixed request count, "
+            "so each token bucket needs one inline variant per request count. "
             "Adding request counts increases capture time and memory. "
             "This does not replace the scheduler's --max-num-seqs limit. "
             "Batches without a fitting capacity retain the ordinary attention breaks.",

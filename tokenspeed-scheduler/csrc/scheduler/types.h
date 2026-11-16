@@ -113,6 +113,9 @@ struct SchedulerConfig {
     // Fused role only: decode rounds owed after a local prefill round
     // (docs/design/scheduler.md §3.3). 0 is off.
     std::int32_t prefill_decode_interval{0};
+    // Fused role only: decode rounds every local prefill round owes even
+    // while an overdue prompt suspends the interval (§3.3). 0 is off.
+    std::int32_t prefill_decode_min_interval{0};
     // P and fused roles: rank new local prefills by work after Device/Host
     // prefix reuse, keeping stable ties and resident chunks first. Only the
     // oldest waiting prompt counts successful later first admissions; after

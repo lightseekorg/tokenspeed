@@ -75,7 +75,7 @@ def _kernel_page_table():
     return table
 
 
-def _backend(degree, rank):
+def _backend(degree, rank, kv_cache_dtype=torch.bfloat16):
     spec = MLAConfig(
         backend_name="mla",
         num_attention_heads=HEADS,
@@ -92,7 +92,7 @@ def _backend(degree, rank):
     config = AttnConfig(
         device="cuda",
         dtype=torch.bfloat16,
-        kv_cache_dtype=torch.bfloat16,
+        kv_cache_dtype=kv_cache_dtype,
         kv_cache_quant_method="none",
         context_len=CONTEXT,
         max_bs=len(BLOCKS),
@@ -198,3 +198,127 @@ def test_dcp_causal_block_rows_match_the_unsharded_entries(degree, monkeypatch):
         total += local
     # Every visible token of every block row is owned by exactly one rank.
     torch.testing.assert_close(total, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("q_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_dcp_query_rows_attend_like_the_folded_rows(q_dtype, monkeypatch):
+    """A query-row kernel takes each request's gathered heads and block rows
+    whole, each row at its local length, where the folded launch takes one
+    row per query and head group: every rank's partials must agree. An FP8
+    cache's prologue hands the decode FP8 queries."""
+    degree = 8
+    kv_dtype = torch.float8_e4m3fn
+    if not _backend(degree, 0, kv_dtype)._takes_query_rows(
+        q_dtype, BLOCK, return_lse=True
+    ):
+        pytest.skip("no query-row MLA decode kernel on this platform")
+    bs = len(BLOCKS)
+    g = torch.Generator(device="cuda").manual_seed(0)
+    gathered = torch.randn(
+        bs * BLOCK,
+        HEADS * degree,
+        WIDTH,
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=g,
+    ).to(q_dtype)
+    cache = (
+        torch.randn(VIRTUAL_BLOCKS * GRANULARITY, WIDTH, device="cuda", generator=g)
+        * 0.5
+    ).to(kv_dtype)
+    captured = {}
+
+    def normalize(output, lse, local_lengths, sink):
+        captured["output"] = output.clone()
+        captured["lse"] = lse.clone()
+        captured["local"] = local_lengths.clone()
+        return output, lse
+
+    monkeypatch.setattr(
+        mla_module, "gather_query_heads_lent", lambda q, group: gathered
+    )
+    monkeypatch.setattr(mla_module, "normalize_dcp_partials", normalize)
+    monkeypatch.setattr(
+        mla_module,
+        "combine_attention_partials",
+        lambda output, lse, **_: output[:, :HEADS],
+    )
+    layer = SimpleNamespace(
+        tp_q_head_num=HEADS,
+        head_dim=WIDTH,
+        v_head_dim=KV_LORA,
+        layer_id=0,
+        scaling=192**-0.5,
+        logit_cap=0.0,
+        sliding_window_size=-1,
+    )
+    pool = SimpleNamespace(get_key_buffer=lambda layer_id: cache)
+    q = torch.zeros(bs * BLOCK, HEADS, WIDTH, dtype=q_dtype, device="cuda")
+    table = _kernel_page_table()
+    tol = 3e-2 if q_dtype == torch.float8_e4m3fn else 1e-2
+    for rank in range(degree):
+        results = []
+        for query_rows in (True, False):
+            backend = _backend(degree, rank, kv_dtype)
+            backend._query_rows[(q_dtype, BLOCK, True)] = query_rows
+            _publish(backend, table)
+            backend.forward_decode(q, None, None, layer, None, pool, bs)
+            results.append(dict(captured))
+        rows, folded = results
+        visible = (rows["local"] > 0)[:, None].expand_as(rows["lse"])
+        torch.testing.assert_close(
+            rows["output"][visible].float(),
+            folded["output"][visible].float(),
+            atol=tol,
+            rtol=tol,
+        )
+        torch.testing.assert_close(
+            rows["lse"][visible], folded["lse"][visible], atol=1e-3, rtol=1e-4
+        )
+
+
+@pytest.mark.parametrize("q_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_unsharded_query_rows_attend_like_the_expanded_entries(q_dtype, monkeypatch):
+    """Without KVP a query-row kernel takes each request's block rows whole,
+    each at its backed-up entry's length, where the expanded entries take one
+    launch row per position: both must attend alike."""
+    kv_dtype = torch.float8_e4m3fn
+    if not _backend(1, 0, kv_dtype)._takes_query_rows(q_dtype, BLOCK, return_lse=False):
+        pytest.skip("no query-row MLA decode kernel on this platform")
+    bs = len(BLOCKS)
+    g = torch.Generator(device="cuda").manual_seed(1)
+    q = torch.randn(
+        bs * BLOCK, HEADS, WIDTH, device="cuda", dtype=torch.bfloat16, generator=g
+    ).to(q_dtype)
+    cache = (
+        torch.randn(VIRTUAL_BLOCKS * GRANULARITY, WIDTH, device="cuda", generator=g)
+        * 0.5
+    ).to(kv_dtype)
+    calls = []
+    query_rows_decode = mla_module.mla_decode_query_rows
+    monkeypatch.setattr(
+        mla_module,
+        "mla_decode_query_rows",
+        lambda *args, **kwargs: calls.append(1) or query_rows_decode(*args, **kwargs),
+    )
+    layer = SimpleNamespace(
+        tp_q_head_num=HEADS,
+        head_dim=WIDTH,
+        v_head_dim=KV_LORA,
+        layer_id=0,
+        scaling=192**-0.5,
+        logit_cap=0.0,
+        sliding_window_size=-1,
+    )
+    pool = SimpleNamespace(get_key_buffer=lambda layer_id: cache)
+    table = _kernel_page_table()
+    results = []
+    for query_rows in (True, False):
+        backend = _backend(1, 0, kv_dtype)
+        backend._query_rows[(q_dtype, BLOCK, False)] = query_rows
+        _publish(backend, table)
+        results.append(backend.forward_decode(q, None, None, layer, None, pool, bs))
+    assert len(calls) == 1
+    rows, expanded = results
+    tol = 3e-2 if q_dtype == torch.float8_e4m3fn else 1e-2
+    torch.testing.assert_close(rows.float(), expanded.float(), atol=tol, rtol=tol)

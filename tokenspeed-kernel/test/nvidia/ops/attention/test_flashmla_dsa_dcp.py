@@ -985,16 +985,16 @@ def test_bounded_compact_compiles_once_across_widths():
 
 def _owned_width_index_plane(pages, generator):
     """FP8 index keys for every local page, in the block-split plane."""
-    from tokenspeed_kernel.ops.kvcache.triton import index_k_block_split_scatter
-    from tokenspeed_kernel.ops.quantization import quantize_fp8
+    from tokenspeed_kernel.ops.kvcache.triton import (
+        index_k_block_split_scatter,
+        quantize_index_k_rows,
+    )
 
     slots = pages * PAGE_SIZE
     keys = torch.randn((slots, 128), generator=generator).to(
         device="cuda", dtype=torch.bfloat16
     )
-    values, scales = quantize_fp8(
-        keys, granularity="token_group", group_size=128, scale_encoding="float32"
-    )
+    values, scales = quantize_index_k_rows(keys, group_size=128)
     plane = torch.zeros((slots, 132), dtype=torch.uint8, device="cuda")
     index_k_block_split_scatter(
         plane,

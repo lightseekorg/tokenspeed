@@ -15,7 +15,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 import math
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
@@ -29,9 +29,6 @@ from tokenspeed_kernel.platform import (
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 from tokenspeed_kernel.warmup import kernel_launcher, register_triton_warmup
-
-if TYPE_CHECKING:
-    from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import MailboxPublish
 
 
 @triton.jit
@@ -1258,11 +1255,9 @@ def _rmsnorm_nvfp4_quant_kernel(
     weight_offset: tl.constexpr,
     sentinel_word: tl.constexpr,
     sentinel_half: tl.constexpr,
-    publish_block_ptr,
-    publish_destination_ptr,
     MAILBOX: tl.constexpr,
-    PUBLISH_WORDS: tl.constexpr,
-    PUBLISH_BLOCK: tl.constexpr,
+    MAILBOX_BLOCK_WIDTH: tl.constexpr,
+    MAILBOX_BLOCK_STRIDE: tl.constexpr,
     BLOCK: tl.constexpr,
     SF_BLOCK: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
@@ -1275,27 +1270,24 @@ def _rmsnorm_nvfp4_quant_kernel(
         tl.extra.cuda.gdc_wait()
         # Dependents may launch now; their own wait still covers this grid's completion.
         tl.extra.cuda.gdc_launch_dependents()
-    if PUBLISH_WORDS > 0:
-        # Store this rank's block into every peer's mailbox row before polling it.
-        words = tl.arange(0, PUBLISH_BLOCK)
-        in_block = words < PUBLISH_WORDS
-        block_words = tl.load(
-            publish_block_ptr + row * PUBLISH_WORDS + words, mask=in_block, other=0
-        )
-        tl.store(
-            publish_destination_ptr + row * (width // 2) + words,
-            block_words,
-            mask=in_block,
-        )
     if MAILBOX:
-        # One row-wide poll load keeps the plain path's variance sum order bitwise.
-        half_ptr = x_ptr.to(tl.pointer_type(tl.int16)) + row * width + offsets
+        # One row-wide poll load over the blocks keeps the plain path's variance sum order bitwise.
+        element = (
+            (offsets // MAILBOX_BLOCK_WIDTH) * MAILBOX_BLOCK_STRIDE
+            + row * MAILBOX_BLOCK_WIDTH
+            + offsets % MAILBOX_BLOCK_WIDTH
+        )
+        half_ptr = x_ptr.to(tl.pointer_type(tl.int16)) + element
         halves = tl.load(half_ptr, mask=mask, other=0, volatile=True)
         while _mailbox_row_dirty(halves, sentinel_half):
             halves = tl.load(half_ptr, mask=mask, other=0, volatile=True)
         values = halves.to(tl.bfloat16, bitcast=True).to(tl.float32)
-        word_ptr = x_ptr.to(tl.pointer_type(tl.int32)) + row * (width // 2)
-        word_ptr += tl.arange(0, BLOCK // 2)
+        words = tl.arange(0, BLOCK // 2)
+        word_ptr = x_ptr.to(tl.pointer_type(tl.int32)) + (
+            (words // (MAILBOX_BLOCK_WIDTH // 2)) * (MAILBOX_BLOCK_STRIDE // 2)
+            + row * (MAILBOX_BLOCK_WIDTH // 2)
+            + words % (MAILBOX_BLOCK_WIDTH // 2)
+        )
         tl.store(word_ptr, tl.full([BLOCK // 2], sentinel_word, tl.int32))
     else:
         values = tl.load(x_ptr + row * width + offsets, mask=mask, other=0.0).to(
@@ -1342,24 +1334,6 @@ def _rmsnorm_nvfp4_quant_kernel(
     )
 
 
-def _publish_words(
-    publish: "MailboxPublish", rows: int, width: int, sentinel: int | None
-) -> tuple[torch.Tensor, torch.Tensor, int]:
-    """The block and its mailbox destination as 32-bit words, and the words per row."""
-    if sentinel is None:
-        raise ValueError("only a mailbox takes a block to publish")
-    block, destination = publish.block, publish.destination
-    if block.dtype != torch.bfloat16 or block.ndim != 2 or block.shape[0] != rows:
-        raise ValueError("the block must be BF16 [rows, block_width]")
-    if not block.is_contiguous() or block.shape[1] % 2 or publish.column % 2:
-        raise ValueError("the block must be contiguous whole 32-bit words")
-    if destination.shape != block.shape or destination.stride() != (width, 1):
-        raise ValueError("the destination must be the block's rows in the mailbox")
-    if not 0 <= publish.column <= width - block.shape[1]:
-        raise ValueError("the block must lie within a mailbox row")
-    return block.view(torch.int32), destination.view(torch.int32), block.shape[1] // 2
-
-
 @register_kernel(
     "quantization",
     "rmsnorm_nvfp4",
@@ -1376,12 +1350,21 @@ def triton_rmsnorm_nvfp4_quant(
     global_scale: torch.Tensor,
     mailbox_sentinel: int | None,
     enable_pdl: bool,
-    mailbox_publish: "MailboxPublish | None",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Triton kernel of :func:`tokenspeed_kernel.ops.quantization.rmsnorm_nvfp4_quant`."""
-    if x.ndim != 2 or x.dtype != torch.bfloat16 or not x.is_cuda:
-        raise ValueError("x must be a BF16 GPU tensor shaped [rows, width]")
-    rows, width = x.shape
+    if x.ndim != (2 if mailbox_sentinel is None else 3):
+        raise ValueError(
+            "x must be [rows, width] rows or a [blocks, rows, block_width] mailbox"
+        )
+    if x.dtype != torch.bfloat16 or not x.is_cuda:
+        raise ValueError("x must be a BF16 GPU tensor")
+    if mailbox_sentinel is None:
+        rows, width = x.shape
+        block_width = block_stride = width
+    else:
+        blocks, rows, block_width = x.shape
+        width = blocks * block_width
+        block_stride = x.stride(0)
     if width % NVFP4_BLOCK:
         raise ValueError(f"width must be a multiple of {NVFP4_BLOCK}, got {width}")
     if weight.shape != (width,) or weight.device != x.device:
@@ -1393,9 +1376,13 @@ def triton_rmsnorm_nvfp4_quant(
             mailbox_sentinel >> 16
         ):
             raise ValueError("the mailbox sentinel is one word whose halves agree")
-        if width & (width - 1) or not x.is_contiguous():
-            raise ValueError("a mailbox needs contiguous rows of a power-of-two width")
-    values = x.contiguous()
+        if width & (width - 1) or block_width & (block_width - 1):
+            raise ValueError("a mailbox needs power-of-two row and block widths")
+        if x.stride()[1:] != (block_width, 1) or block_stride < rows * block_width:
+            raise ValueError(
+                "a mailbox must be the first rows of whole contiguous blocks"
+            )
+    values = x if mailbox_sentinel is not None else x.contiguous()
     packed = torch.empty((rows, width // 2), dtype=torch.uint8, device=x.device)
     # flashinfer's consumers may touch the round_up(rows, 16) tail; keep that storage.
     padded_rows = (rows + 15) // 16 * 16
@@ -1410,14 +1397,6 @@ def triton_rmsnorm_nvfp4_quant(
     use_pdl = enable_pdl and current_platform().is_hopper_plus
     launch = {"launch_pdl": True} if use_pdl else {}
     sentinel = 0 if mailbox_sentinel is None else mailbox_sentinel
-    if mailbox_publish is None:
-        # An existing row of words stands in for the block, never read.
-        publish_block = publish_destination = values.view(torch.int32)
-        publish_words = 0
-    else:
-        publish_block, publish_destination, publish_words = _publish_words(
-            mailbox_publish, rows, width, mailbox_sentinel
-        )
     _rmsnorm_nvfp4_quant_kernel[(rows,)](
         values,
         weight,
@@ -1430,11 +1409,9 @@ def triton_rmsnorm_nvfp4_quant(
         # The kernel compares int16 halves and stores int32 words: signed images.
         sentinel_word=sentinel - (1 << 32) if sentinel >= 1 << 31 else sentinel,
         sentinel_half=(sentinel & 0xFFFF) - (1 << 16 if sentinel & 0x8000 else 0),
-        publish_block_ptr=publish_block,
-        publish_destination_ptr=publish_destination,
         MAILBOX=mailbox_sentinel is not None,
-        PUBLISH_WORDS=publish_words,
-        PUBLISH_BLOCK=triton.next_power_of_2(max(publish_words, 1)),
+        MAILBOX_BLOCK_WIDTH=block_width,
+        MAILBOX_BLOCK_STRIDE=block_stride,
         BLOCK=block,
         SF_BLOCK=NVFP4_BLOCK,
         ENABLE_PDL=use_pdl,
