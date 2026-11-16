@@ -43,9 +43,9 @@ people and average people is more than tenfold.
   does not justify defaulting a behavioral choice.
 * Wrappers must preserve explicitly supplied arguments and must not silently
   discard unsupported arguments.
-* Defensive fallback is discouraged. Propagate errors and fail explicitly
-  by default. Introduce fallback or automatic recovery only when justified
-  by a concrete, documented need.
+* Avoid defensive fallback. Propagate errors and fail explicitly by default.
+  Introduce fallback or automatic recovery only when justified by a concrete,
+  documented need.
 * Kernels must generalize beyond example configurations. Restrictions on
   tensor shape/layout/contiguity, communication topology, SM versions/counts,
   model names must reflect correctness requirements or measured performance
