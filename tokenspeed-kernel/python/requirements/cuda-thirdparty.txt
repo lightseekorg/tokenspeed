@@ -13,4 +13,5 @@ tokenspeed-cutedsl-kda==0.1.0.post20260923
 # Tag-capable sleep/wake allocator (region(tag, enable_cpu_backup)/pause/
 # resume). Bundles cu12/cu13 binaries; import-guarded so it's a no-op unless
 # --enable-memory-saver is set. See runtime/utils/torch_memory_saver_adapter.py.
-torch_memory_saver==0.0.9.post1
+# 0.0.10 releases managed allocations when a CUDA MemPool dies outside its region.
+torch_memory_saver==0.0.10
