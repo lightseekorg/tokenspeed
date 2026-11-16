@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+
 import pytest
 import torch
 from tokenspeed_kernel.numerics.torch.layernorm import (
@@ -15,6 +17,7 @@ from tokenspeed_kernel.ops.layernorm import (
 )
 from tokenspeed_kernel.ops.layernorm.triton import (
     _add_rmsnorm_kernel,
+    _fused_qk_rmsnorm_rope_kernel,
     _grouped_gemma_rmsnorm_kernel,
     _rmsnorm_kernel,
     fused_qk_rmsnorm_rope,
@@ -342,6 +345,48 @@ def test_fused_qk_rmsnorm_rope_matches_the_statements(
     )
     for got, want in zip(fused, contiguous, strict=True):
         assert torch.equal(got, want)
+
+
+def test_fused_qk_rmsnorm_rope_heads_do_not_depend_on_their_neighbors(
+    device: str,
+) -> None:
+    """Beam's 12 + 2 heads per rank, bit for bit each head launched alone."""
+    q, k, q_weight, k_weight, cache, positions = _rope_inputs(37, 12, 2, device)
+    q_out, k_out = _rope(q, k, q_weight, k_weight, cache, positions)
+    head_dim = q_weight.shape[0]
+    for head in range(12):
+        kv = head % 2
+        q_cols = slice(head * head_dim, (head + 1) * head_dim)
+        kv_cols = slice(kv * head_dim, (kv + 1) * head_dim)
+        alone = _rope(q[:, q_cols], k[:, kv_cols], q_weight, k_weight, cache, positions)
+        assert torch.equal(alone[0], q_out[:, q_cols])
+        assert torch.equal(alone[1], k_out[:, kv_cols])
+
+
+def test_fused_qk_rmsnorm_rope_rows_do_not_depend_on_the_call_size(
+    device: str,
+) -> None:
+    """A prefill-sized call's rows, bit for bit the same rows called alone."""
+    q, k, q_weight, k_weight, cache, positions = _rope_inputs(601, 12, 2, device)
+    whole = _rope(q, k, q_weight, k_weight, cache, positions)
+    for rows in (slice(0, 1), slice(37, 101), slice(597, 601)):
+        part = _rope(q[rows], k[rows], q_weight, k_weight, cache, positions[rows])
+        for got, want in zip(part, whole, strict=True):
+            assert torch.equal(got, want[rows])
+
+
+def test_fused_qk_rmsnorm_rope_compiles_once_per_token_block(device: str) -> None:
+    """One compile per tokens-per-program bucket, none per token count."""
+    q, k, q_weight, k_weight, cache, positions = _rope_inputs(1100, 12, 2, device)
+
+    def run(tokens: int) -> None:
+        _rope(q[:tokens], k[:tokens], q_weight, k_weight, cache, positions[:tokens])
+
+    run(1)
+    run(601)
+    with assert_no_triton_compile(_fused_qk_rmsnorm_rope_kernel):
+        for tokens in (2, 16, 37, 511, 512, 1024, 1100):
+            run(tokens)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
@@ -681,3 +726,7 @@ def test_triton_gemma_rmsnorm_compiles_once_across_batch_sizes(device: str) -> N
     with assert_no_triton_compile(_add_rmsnorm_kernel, _grouped_gemma_rmsnorm_kernel):
         for rows in (1, 16, 37, 64, 300):
             run(rows)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))
