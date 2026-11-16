@@ -1790,6 +1790,9 @@ def test_budget_allocation_graphs_are_prepared_and_reused(tmp_path, monkeypatch)
             indptr_out=indptr,
             counts_out=counts,
             valid_out=valid,
+            latest_scores=None,
+            request_slots=None,
+            active_count=None,
         )
         torch.testing.assert_close(
             drafter._verify_rows[:capacity], rows, atol=0, rtol=0

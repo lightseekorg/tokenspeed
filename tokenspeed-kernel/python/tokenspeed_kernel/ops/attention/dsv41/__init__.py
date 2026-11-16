@@ -1781,9 +1781,9 @@ def verify_layout(
     indptr_out: torch.Tensor,
     counts_out: torch.Tensor,
     valid_out: torch.Tensor,
-    latest_scores: torch.Tensor | None = None,
-    request_slots: torch.Tensor | None = None,
-    active_count: torch.Tensor | None = None,
+    latest_scores: torch.Tensor | None,
+    request_slots: torch.Tensor | None,
+    active_count: torch.Tensor | None,
 ) -> None:
     """Allocate a shared query budget to contiguous per-request prefixes.
 
@@ -1794,13 +1794,15 @@ def verify_layout(
     Requires GPU scores with unit column stride and B*(D+1) <= 4096.
     Unsupported layouts raise ValueError.
     All outputs have stable caller-owned storage and no host readback is used.
-    Optional latest_scores [slots,D] and request_slots [B] select current GPU
-    confidence by request. A non-finite latest row uses the entire history row
-    from scores. Supply both or neither; slot indices must address the table.
+    latest_scores [slots,D] and request_slots [B] select current GPU confidence
+    by request; pass None for both to use the history only. A non-finite latest
+    row uses the entire history row from scores. Supply both or neither; slot
+    indices must address the table.
 
-    active_count optionally holds the live prefix length in a device scalar.
-    Its value must be in [0,B]. Padding retains one anchor but receives no draft
-    allocation; the caller masks its state writes and discards its output.
+    active_count, when not None, holds the live prefix length in a device
+    scalar. Its value must be in [0,B]. Padding retains one anchor but receives
+    no draft allocation; the caller masks its state writes and discards its
+    output.
 
     Non-finite rows require full width. If the budget cannot cover them,
     valid_out is false and outputs describe anchor-only verification with

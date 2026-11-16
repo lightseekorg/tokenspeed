@@ -93,7 +93,14 @@ def test_layout_matches_stable_prefix_reference(bs, draft_width, extra):
     ).to("cuda")
     capacity = bs + extra
     out = outputs(scores, capacity)
-    verify_layout(scores, query_capacity=capacity, **out)
+    verify_layout(
+        scores,
+        query_capacity=capacity,
+        latest_scores=None,
+        request_slots=None,
+        active_count=None,
+        **out,
+    )
     probs = torch.sigmoid(scores.cpu().clamp(-60, 60)).cumprod(1).tolist()
     ordered = sorted(
         ((p, r, d) for r, row in enumerate(probs) for d, p in enumerate(row)),
@@ -117,17 +124,38 @@ def test_layout_matches_stable_prefix_reference(bs, draft_width, extra):
 def test_unknown_scores_require_full_prefix_and_ties_are_stable():
     scores = torch.tensor([[float("nan"), 0.0], [0.0, 0.0]], device="cuda")
     out = outputs(scores, 4)
-    verify_layout(scores, query_capacity=4, **out)
+    verify_layout(
+        scores,
+        query_capacity=4,
+        latest_scores=None,
+        request_slots=None,
+        active_count=None,
+        **out,
+    )
     assert out["valid_out"].item()
     assert out["counts_out"].tolist() == [3, 1]
     out = outputs(scores, 3)
-    verify_layout(scores, query_capacity=3, **out)
+    verify_layout(
+        scores,
+        query_capacity=3,
+        latest_scores=None,
+        request_slots=None,
+        active_count=None,
+        **out,
+    )
     assert not out["valid_out"].item()
     assert out["counts_out"].tolist() == [1, 1]
     assert out["rows_out"].tolist() == [0, 3, 0]
     scores.fill_(-1000)
     out = outputs(scores, 4)
-    verify_layout(scores, query_capacity=4, **out)
+    verify_layout(
+        scores,
+        query_capacity=4,
+        latest_scores=None,
+        request_slots=None,
+        active_count=None,
+        **out,
+    )
     assert out["counts_out"].tolist() == [2, 2]
 
 
@@ -139,17 +167,38 @@ def test_graph_replay_reads_changed_scores_and_keeps_output_storage():
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         for _ in range(3):
-            verify_layout(scores, query_capacity=12, **out)
+            verify_layout(
+                scores,
+                query_capacity=12,
+                latest_scores=None,
+                request_slots=None,
+                active_count=None,
+                **out,
+            )
     torch.cuda.current_stream().wait_stream(stream)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        verify_layout(scores, query_capacity=12, **out)
+        verify_layout(
+            scores,
+            query_capacity=12,
+            latest_scores=None,
+            request_slots=None,
+            active_count=None,
+            **out,
+        )
     for row in range(4):
         scores.fill_(-10)
         scores[row].fill_(10)
         graph.replay()
         expected = outputs(scores, 12)
-        verify_layout(scores, query_capacity=12, **expected)
+        verify_layout(
+            scores,
+            query_capacity=12,
+            latest_scores=None,
+            request_slots=None,
+            active_count=None,
+            **expected,
+        )
         for name, value in out.items():
             torch.testing.assert_close(value, expected[name], atol=0, rtol=0)
     graph.reset()
@@ -178,7 +227,14 @@ def test_layout_matches_torch_reference(bs):
             expected = outputs(scores, capacity)
             actual = outputs(scores, capacity)
             reference_layout(scores, capacity, **expected)
-            verify_layout(scores, query_capacity=capacity, **actual)
+            verify_layout(
+                scores,
+                query_capacity=capacity,
+                latest_scores=None,
+                request_slots=None,
+                active_count=None,
+                **actual,
+            )
             for name in expected:
                 torch.testing.assert_close(actual[name], expected[name], atol=0, rtol=0)
 
@@ -212,7 +268,12 @@ def test_fused_latest_scores_replay_and_history_fallback():
 
     def run():
         verify_layout(
-            history, query_capacity=24, latest_scores=latest, request_slots=slots, **out
+            history,
+            query_capacity=24,
+            latest_scores=latest,
+            request_slots=slots,
+            active_count=None,
+            **out,
         )
 
     stream = torch.cuda.Stream()
@@ -255,6 +316,7 @@ def test_latest_layout_runtime_shapes_do_not_compile():
             query_capacity=capacity,
             latest_scores=latest[:table_rows],
             request_slots=slots[:bs],
+            active_count=None,
             **out,
         )
         assert out["indptr_out"][-1].item() == capacity
@@ -278,6 +340,9 @@ def test_unsupported_layout_rejected(case):
             latest_scores=torch.randn(bs, 10, device="cuda")[:, ::2],
             request_slots=torch.arange(bs, device="cuda"),
         )
+    kwargs.setdefault("latest_scores", None)
+    kwargs.setdefault("request_slots", None)
+    kwargs.setdefault("active_count", None)
     with pytest.raises(ValueError, match="unit column stride|4096"):
         verify_layout(
             scores, query_capacity=bs * 3, **outputs(scores, bs * 3), **kwargs
@@ -287,7 +352,14 @@ def test_unsupported_layout_rejected(case):
 def test_cpu_layout_rejected():
     scores = torch.zeros(4, 5)
     with pytest.raises(ValueError, match="GPU"):
-        verify_layout(scores, query_capacity=12, **outputs(scores, 12))
+        verify_layout(
+            scores,
+            query_capacity=12,
+            latest_scores=None,
+            request_slots=None,
+            active_count=None,
+            **outputs(scores, 12),
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")

@@ -112,9 +112,17 @@ def check_allocation(drafter, slots, history, expected):
             query_capacity=q,
             latest_scores=drafter.confidence_scores,
             request_slots=slots,
+            active_count=None,
             **actual
         )
-        dsv41.verify_layout(expected, query_capacity=q, **reference)
+        dsv41.verify_layout(
+            expected,
+            query_capacity=q,
+            latest_scores=None,
+            request_slots=None,
+            active_count=None,
+            **reference
+        )
         for name in reference:
             torch.testing.assert_close(actual[name], reference[name], atol=0, rtol=0)
     torch.testing.assert_close(history, original, atol=0, rtol=0)
