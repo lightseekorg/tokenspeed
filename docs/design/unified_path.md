@@ -429,6 +429,8 @@ Row projection combines all-to-all, GEMM, and reduce-scatter.
 Use `DPColumnParallelLinear` or `DPRowParallelLinear` with `AutoBackend`.
 The backend selects fusion for supported TP2 and TP4 groups within one node.
 Fusion requires FP8 weights with FP32 scales for each 128 × 128 block.
+Projection widths must satisfy kernel alignment requirements rather than a
+model-specific shape whitelist.
 At least one rank must have 64 physical input rows.
 Smaller batches, batch-invariant collectives, and unsupported configurations use
 the ordinary projection operations. All ranks use their physical row counts to

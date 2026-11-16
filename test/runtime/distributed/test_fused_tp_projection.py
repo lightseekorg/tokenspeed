@@ -119,8 +119,11 @@ def _worker(rank, world_size, rendezvous, kind):
         scale_fmt=None,
     )
     try:
-        if kind == "row":
-            _check_row_projection(rank, world_size, device, parallel, config)
+        if kind in ("row", "generic_row"):
+            input_size, output_size = (12288, 7168) if kind == "row" else (8192, 4096)
+            _check_row_projection(
+                rank, world_size, device, parallel, config, input_size, output_size
+            )
         else:
             input_size, output_size = {
                 "column": (7168, 49376),
@@ -477,7 +480,9 @@ def _row_projection_graph_counts(world_size):
     ]
 
 
-def _check_row_projection(rank, world_size, device, parallel, config):
+def _check_row_projection(
+    rank, world_size, device, parallel, config, input_size, output_size
+):
     from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
     from tokenspeed.runtime.layers.linear import (
         DPRowParallelLinear,
@@ -490,8 +495,8 @@ def _check_row_projection(rank, world_size, device, parallel, config):
     for _ in range(2):
         with torch.device(device):
             model = DPRowParallelLinear(
-                12288,
-                7168,
+                input_size,
+                output_size,
                 parallel=parallel,
                 params_dtype=torch.bfloat16,
                 quant_config=config,
@@ -511,7 +516,9 @@ def _check_row_projection(rank, world_size, device, parallel, config):
     )
 
     def fused(x, ctx, scale=None):
-        out = torch.empty((x.shape[0], 7168), device=device, dtype=torch.bfloat16)
+        out = torch.empty(
+            (x.shape[0], output_size), device=device, dtype=torch.bfloat16
+        )
         return cute_dsl_fused_fp8_dp_row_linear(
             candidate.projection_workspace.fused_row,
             x,
@@ -525,7 +532,7 @@ def _check_row_projection(rank, world_size, device, parallel, config):
     def reference(x, ctx, scale=None):
         rows = max(ctx.collective_global_num_tokens)
         if rows == 0:
-            return x.new_empty((0, 7168), dtype=torch.bfloat16)
+            return x.new_empty((0, output_size), dtype=torch.bfloat16)
         if rows <= 128 and scale is None:
             return baseline(x, ctx=ctx)[0].clone()
         # Above 128 rows, the ordinary path uses NCCL's BF16 reduction.
@@ -584,7 +591,7 @@ def _check_row_projection(rank, world_size, device, parallel, config):
         )
     ]
     for counts in patterns:
-        x = torch.randn((counts[rank], 12288), device=device, dtype=torch.bfloat16)
+        x = torch.randn((counts[rank], input_size), device=device, dtype=torch.bfloat16)
         ctx = _context(rank, counts, counts)
         expected = reference(x, ctx)
         actual = candidate(x, ctx=ctx)[0]
@@ -595,9 +602,9 @@ def _check_row_projection(rank, world_size, device, parallel, config):
     # Neighboring quantization groups have different maxima at different lanes.
     # This catches accidental scale sharing between the eight-lane groups.
     counts = (128,) * world_size
-    x = torch.zeros((128, 12288), device=device, dtype=torch.bfloat16)
+    x = torch.zeros((128, input_size), device=device, dtype=torch.bfloat16)
     row_ids = torch.arange(128, device=device)[:, None]
-    group_ids = torch.arange(96, device=device)[None, :]
+    group_ids = torch.arange(input_size // 128, device=device)[None, :]
     columns = group_ids * 128 + (row_ids + 17 * group_ids + rank) % 128
     x.scatter_(
         1, columns, torch.exp2((group_ids % 17 - 8).float()).expand(128, -1).to(x.dtype)
@@ -623,8 +630,8 @@ def _check_row_projection(rank, world_size, device, parallel, config):
     # clustered and non-clustered reduction must preserve the zero sentinel.
     for rows in (32, 128, 256, 4608, 5120):
         counts = (rows,) * world_size
-        x = torch.zeros((rows, 12288), device=device, dtype=torch.bfloat16)
-        x[:, :: 12288 // world_size] = 448
+        x = torch.zeros((rows, input_size), device=device, dtype=torch.bfloat16)
+        x[:, :: input_size // world_size] = 448
         x[1::4].mul_(-1)
         x[2::4].mul_(8)
         x[3::4].zero_()
@@ -654,7 +661,7 @@ def _check_row_projection(rank, world_size, device, parallel, config):
     # Rebind descriptors for scalar scales, TMA scales, and clustered loads.
     for rows in (128, 576, 4608):
         counts = (rows,) * world_size
-        x = torch.randn((rows, 12288), device=device, dtype=torch.bfloat16)
+        x = torch.randn((rows, input_size), device=device, dtype=torch.bfloat16)
         ctx = _context(rank, counts, counts)
         expected = reference(x, ctx)
         actual = cute_dsl_fused_fp8_dp_row_linear(
@@ -670,7 +677,7 @@ def _check_row_projection(rank, world_size, device, parallel, config):
     baseline.weight_scale_inv.copy_(candidate.weight_scale_inv)
     counts_list = _row_projection_graph_counts(world_size)
     xs = [
-        torch.randn((c[rank], 12288), device=device, dtype=torch.bfloat16)
+        torch.randn((c[rank], input_size), device=device, dtype=torch.bfloat16)
         for c in counts_list
     ]
     ctxs = [_context(rank, c, c) for c in counts_list]
@@ -725,7 +732,7 @@ def _check_row_projection(rank, world_size, device, parallel, config):
     norm_weight = torch.randn(128, dtype=torch.bfloat16, device=device)
 
     def quantized(counts):
-        x = torch.randn((counts[rank], 12288), dtype=torch.bfloat16, device=device)
+        x = torch.randn((counts[rank], input_size), dtype=torch.bfloat16, device=device)
         gate = torch.randn_like(x)
         values, scales = quantize_fp8_with_gate(
             x, gate, norm_weight=norm_weight, eps=1e-6, enable_pdl=False
@@ -736,14 +743,19 @@ def _check_row_projection(rank, world_size, device, parallel, config):
         scales.mul_(torch.exp2((row_exponents + group_exponents).float()))
         return values, scales
 
-    empty = torch.empty((0, 12288), dtype=torch.float8_e4m3fn, device=device)
-    empty_scales = torch.empty((0, 96), dtype=torch.float32, device=device)
+    empty = torch.empty((0, input_size), dtype=torch.float8_e4m3fn, device=device)
+    empty_scales = torch.empty(
+        (0, input_size // 128), dtype=torch.float32, device=device
+    )
     empty_counts = (0,) * world_size
     empty_output = candidate(
         empty, scale=empty_scales, ctx=_context(rank, empty_counts, empty_counts)
     )[0]
     torch.testing.assert_close(
-        empty_output, empty.new_empty((0, 7168), dtype=torch.bfloat16), rtol=0, atol=0
+        empty_output,
+        empty.new_empty((0, output_size), dtype=torch.bfloat16),
+        rtol=0,
+        atol=0,
     )
     pairs = [quantized(counts) for counts in fp8_counts]
     contexts = [_context(rank, counts, counts) for counts in fp8_counts]
@@ -773,7 +785,9 @@ def _check_row_projection(rank, world_size, device, parallel, config):
     # change. Interleave BF16 to check both compiled variants share epochs safely.
     mixed_indices = (2, 3)
     bf16_inputs = [
-        torch.randn((fp8_counts[i][rank], 12288), dtype=torch.bfloat16, device=device)
+        torch.randn(
+            (fp8_counts[i][rank], input_size), dtype=torch.bfloat16, device=device
+        )
         for i in mixed_indices
     ]
     torch.cuda.synchronize()
@@ -830,6 +844,7 @@ def _check_row_projection(rank, world_size, device, parallel, config):
         ("generic_column", 4),
         ("row", 2),
         ("row", 4),
+        ("generic_row", 4),
     ),
 )
 def test_registered_tp_projection(tmp_path, kind, world_size):

@@ -182,8 +182,10 @@ def fused_tp_row_projection_supported(
         current_platform().is_nvidia
         and device.type == "cuda"
         and group_size in (2, 4)
-        and input_size == 12288
-        and output_size == 7168
+        and input_size >= group_size * 128
+        and input_size % (group_size * 128) == 0
+        and output_size >= group_size * 128
+        and output_size % (group_size * 128) == 0
         and max_rows >= 1
         and dtype == torch.bfloat16
         and torch.cuda.get_device_capability(device) in ((10, 0), (10, 3))
