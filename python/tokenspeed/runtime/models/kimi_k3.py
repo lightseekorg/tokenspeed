@@ -64,6 +64,7 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.ops.activation.triton import (
+    add3,
     attnres_combine,
     attnres_partial,
     attnres_partial_dual,
@@ -3424,14 +3425,11 @@ class KimiLinearMoE(nn.Module):
                 # then let only shared reduction overlap the finite routed
                 # work. Empty owners obey the same event/collective ordering.
                 fork.join()
-                with fork.branch_after_main():
-                    shared_output = shared_communication.reduce_outputs(
-                        shared_output, num_tokens
-                    )
-                if self.execution_plan.owns_ep_communication:
-                    # MegaMoE owns dispatch/combine inside the expert call;
-                    # its communication cannot overlap the shared collective.
-                    fork.join()
+                if not self.execution_plan.owns_ep_communication:
+                    with fork.branch_after_main():
+                        shared_output = shared_communication.reduce_outputs(
+                            shared_output, num_tokens
+                        )
 
             routing = StandardTopKOutput(
                 topk_weights=topk_weights,
@@ -3448,9 +3446,16 @@ class KimiLinearMoE(nn.Module):
             )
 
             if shared_communication is not None:
-                # Do not allow two peer-polling collectives to occupy the GPU
-                # concurrently: combine starts only after shared RS completes.
-                fork.join()
+                if self.execution_plan.owns_ep_communication:
+                    # Shared RS follows the peer-polling MoE kernel and
+                    # overlaps the routed norm and local up-projection.
+                    with fork.branch_after_main():
+                        shared_output = shared_communication.reduce_outputs(
+                            shared_output, num_tokens
+                        )
+                else:
+                    # Combine must not overlap the shared collective.
+                    fork.join()
 
             if self.execution_plan.owns_ep_communication:
                 pass
@@ -3466,6 +3471,15 @@ class KimiLinearMoE(nn.Module):
             if num_tokens > 0 and self.routed_expert_norm is not None:
                 routed_output = self.routed_expert_norm(routed_output)
 
+            projected = None
+            if (
+                shared_communication is not None
+                and self.execution_plan.owns_ep_communication
+                and num_tokens > 0
+                and not self.routed_expert_up_proj.narrowed
+            ):
+                projected, _ = self.routed_expert_up_proj(routed_output)
+
             if shared_communication is None:
                 with fork.branch():
                     if num_tokens > 0:
@@ -3480,6 +3494,8 @@ class KimiLinearMoE(nn.Module):
 
         if num_tokens == 0:
             return prefix_sum
+        if projected is not None:
+            return add3(prefix_sum, projected, shared_output)
         return self.routed_expert_up_proj.forward_add3(
             routed_output,
             prefix_sum,
@@ -4981,11 +4997,17 @@ class KimiLinearForCausalLM(BaseCausalLM):
             if weight.dtype != torch.bfloat16:
                 raise ValueError("Shared-expert TP currently requires BF16 weights")
             if communication is None:
+                decode_rows = (
+                    global_server_args_dict["max_num_seqs"]
+                    // self.mapping.attn.dp_size
+                    * _decode_verify_width()
+                )
                 communication = SharedExpertCommunication(
                     shared_mlps[0].shared_parallel,
                     max_num_tokens,
                     self.config.hidden_size,
                     weight.device,
+                    min(max_num_tokens, decode_rows),
                 )
             elif max_num_tokens > communication.capacity:
                 raise RuntimeError("Cannot grow a prepared shared-expert workspace")

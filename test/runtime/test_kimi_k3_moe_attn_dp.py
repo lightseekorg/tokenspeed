@@ -37,6 +37,7 @@ register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
 from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.layers.moe.latent import Kimi3LatentProjection
 from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput, TopKOutputFormat
 from tokenspeed.runtime.layers.moe.utils import All2AllBackend, MoeBackend
 from tokenspeed.runtime.models import kimi_k3
@@ -620,7 +621,8 @@ def test_attn_dp_fused_moe_keeps_inputs_local_and_owns_combine(
     routed = mock.Mock(
         side_effect=lambda *args, **kwargs: (events.append("experts"), latent)[1]
     )
-    up = mock.Mock(return_value=hidden + prefix)
+    up = Kimi3LatentProjection(4, 8, params_dtype=torch.bfloat16, solution="torch")
+    up.weight.data.normal_(std=0.1)
     layer = SimpleNamespace(
         execution_plan=SimpleNamespace(use_mega_moe=False, owns_ep_communication=True),
         mapping=SimpleNamespace(world_size=2, attn=SimpleNamespace(dp_rank=0)),
@@ -634,7 +636,7 @@ def test_attn_dp_fused_moe_keeps_inputs_local_and_owns_combine(
         moe_alltoall=None,
         _routed_experts=routed,
         routed_expert_norm=None,
-        routed_expert_up_proj=SimpleNamespace(forward_add3=up),
+        routed_expert_up_proj=up,
         shared_experts=mock.Mock(return_value=hidden),
         routed_hidden=4,
         top_k=2,
@@ -661,10 +663,8 @@ def test_attn_dp_fused_moe_keeps_inputs_local_and_owns_combine(
             "record_gather",
             "join_gather",
             "join",
-            "reduce",
-            "join",
             "experts",
-            "join",
+            "reduce",
         ]
     else:
         assert events == ["experts"]
@@ -679,10 +679,9 @@ def test_attn_dp_fused_moe_keeps_inputs_local_and_owns_combine(
         quantize.assert_not_called()
     if rows:
         assert call.args[0] is (payload if weight_dtype == "nvfp4" else latent)
-        torch.testing.assert_close(result, hidden + prefix)
+        torch.testing.assert_close(result, up.forward_add3(latent, prefix, hidden))
     else:
         assert result is prefix
-        up.assert_not_called()
 
 
 if __name__ == "__main__":
