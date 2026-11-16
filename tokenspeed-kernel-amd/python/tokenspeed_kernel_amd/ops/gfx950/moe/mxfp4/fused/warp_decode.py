@@ -1110,6 +1110,7 @@ def _warp_decode_stage2_load_tile(
         scale_k_lin = (sk // 8) * 256 + (sk % 4) * 64 + ((sk % 8) // 4) * 2
     scale_k_off = scale_k_lin.to(gl.int64) * stride_wsk
     s_off = (ws_expert_off + scale_row_off + scale_k_off).to(gl.int32)
+    # A decode step reads each W2 tile about once, so it streams past the caches.
     if MASK_TAIL:
         # Partial / odd final K-tile (K = intermediate dim I): mask out-of-range
         # K lanes to 0 so they contribute nothing and never over-read.
@@ -1118,11 +1119,13 @@ def _warp_decode_stage2_load_tile(
             ptr=X, offsets=a_off, mask=k_elem < i_dim, other=0.0
         )
         b_mask = k_pack < I_PACKED
-        b = gl.amd.cdna4.buffer_load(ptr=W, offsets=b_off, mask=b_mask, other=0)
+        b = gl.amd.cdna4.buffer_load(
+            ptr=W, offsets=b_off, mask=b_mask, other=0, cache=".cs"
+        )
         s = gl.amd.cdna4.buffer_load(ptr=WScale, offsets=s_off, mask=sk_valid, other=0)
     else:
         a = gl.amd.cdna4.buffer_load(ptr=X, offsets=a_off)
-        b = gl.amd.cdna4.buffer_load(ptr=W, offsets=b_off)
+        b = gl.amd.cdna4.buffer_load(ptr=W, offsets=b_off, cache=".cs")
         s = gl.amd.cdna4.buffer_load(ptr=WScale, offsets=s_off)
     return a, b, s
 
@@ -1443,7 +1446,7 @@ def _warp_decode_sorted_stage2_fp8_mxfp4_kernel(
     BLOCK_K_PACKED: gl.constexpr = BLOCK_K // 2
     BLOCK_K_SCALE: gl.constexpr = BLOCK_K // 32
     gl.static_assert(BLOCK_M == 16, "sorted W2 requires one MFMA row tile")
-    gl.static_assert(BLOCK_N == 128 * NUM_WARPS_N)
+    gl.static_assert(BLOCK_N % (64 * NUM_WARPS_N) == 0)
     gl.static_assert(BLOCK_K_PACKED == 64)
 
     pid = _xcd_chiplet_swizzle(

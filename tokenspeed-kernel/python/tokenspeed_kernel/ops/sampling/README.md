@@ -75,3 +75,13 @@ scratch as it found it, so captured walks replay as is. Against the unfused
 path the only difference is the FP32 summation order of the bias, which can
 flip a BF16 rounding and so a near-tie. In-shard exact ties go to the lowest
 id; `distributed_argmax`'s per-thread scan does not guarantee that.
+
+## Synthetic verify outputs (`write_synthetic_verify_outputs`)
+
+A benchmark run with a synthetic acceptance length `L` replaces each verify
+row's outputs: the drafts `candidates[r, 1:L]`, then the target token, zeros
+after them, the flat candidate index of each accepted token (`-1` past `L`)
+and `L - 1` accepted drafts. The target token is either given per row or read
+from the row's target predictions at column `L - 1`, and `L` past the verify
+width counts as the width. One Triton program writes one row, so a captured
+step pays one launch for the override; the CPU path is the torch reference.

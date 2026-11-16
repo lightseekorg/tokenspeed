@@ -23,16 +23,16 @@
 CUDA C++ expresses the system-scoped 64-bit packet transactions explicitly.
 Projection callers own topology admission, padding and NCCL fallback.
 
-Packet and chunk exchange support 2, 4 or 8 GPUs per process group on one
-host. Peer indexing specializes for the group size, with no implicit fallback.
+Packet and chunk exchange support 2, 4 or 8 NVLink-connected GPUs per process
+group. Peer indexing specializes for the group size, with no implicit fallback.
 """
 
-import socket
 from pathlib import Path
 
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm
+from tokenspeed_kernel.ops.communication.fabric import group_has_fabric, host_identity
 from tokenspeed_kernel.registry import register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
@@ -59,12 +59,16 @@ class TokenSpeedA2ALamportState:
 
         contracts = [None] * group.size()
         dist.all_gather_object(
-            contracts, (socket.gethostname(), max_rows, channels, blocks), group=group
+            contracts, (host_identity(), max_rows, channels, blocks), group=group
         )
-        if any(contract != contracts[0] for contract in contracts):
+        if any(contract[1:] != contracts[0][1:] for contract in contracts):
             raise ValueError(
-                "A2A requires one host and identical capacity, channels, and grid on all ranks"
+                "A2A requires identical capacity, channels, and grid on all ranks"
             )
+        if len({contract[0] for contract in contracts}) > 1 and not group_has_fabric(
+            dist.get_process_group_ranks(group)
+        ):
+            raise ValueError("Cross-node A2A requires NVLink fabric on every rank")
         self.tp_size = group.size()
         if (
             self.tp_size not in (2, 4, 8)

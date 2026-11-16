@@ -87,6 +87,16 @@ _PROFILES = {
         activation="situ",
         has_bias=False,
     ),
+    "muse_spark": _BenchmarkProfile(
+        name="muse_spark",
+        experts=256,
+        top_k=8,
+        hidden=4096,
+        logical_intermediate=4096,
+        compute_intermediate=4096,
+        activation="silu",
+        has_bias=False,
+    ),
 }
 
 
@@ -290,12 +300,15 @@ def _weights(layer, profile, rank: int) -> None:
     layer.w2_weight_scale.data.fill_(123)
 
 
-def _reference(x, ids, weights, profile):
+def _route_reference(x, ids, profile):
+    """Each selected expert's BF16 output, ``[tokens, top_k, hidden]`` in FP32."""
     xq = _quantized_reference(x, input_quantization=True)
     inter = profile.logical_intermediate
     channel = torch.arange(inter, device=x.device)
     output_cols = torch.arange(profile.hidden, device=x.device)
-    output = torch.zeros_like(x, dtype=torch.float32)
+    routes = torch.zeros(
+        (*ids.shape, profile.hidden), dtype=torch.float32, device=x.device
+    )
     # The sparse weights above select one input per matrix row. Both matrix
     # products are therefore exact FP32 multiplies, with no reduction ambiguity.
     levels = (1.0, 1.5, 2.0)
@@ -326,17 +339,24 @@ def _reference(x, ids, weights, profile):
         )
         if profile.has_bias:
             result += 0.015625 * (expert % 5 - 2)
-        # The kernel rounds each weighted route to BF16 before FP32 combine.
-        routed = (result * weights[token, slot, None]).to(torch.bfloat16).float()
-        output.index_add_(0, token, routed)
-    return output.to(torch.bfloat16)
+        routes[token, slot] = result
+    return routes
+
+
+def _reference(x, ids, weights, profile):
+    routes = _route_reference(x, ids, profile)
+    # The kernel rounds each weighted route to BF16 before FP32 combine.
+    routed = (routes * weights[..., None]).to(torch.bfloat16).float()
+    return routed.sum(dim=1).to(torch.bfloat16)
 
 
 @pytest.mark.skipif(
     int(os.environ.get("WORLD_SIZE", "1")) != 8 or not is_cdna4(),
     reason="requires torchrun with eight gfx950 GPUs",
 )
-@pytest.mark.parametrize("profile_name", ("gpt_oss_120b", "dsv4", "kimi_k3"))
+@pytest.mark.parametrize(
+    "profile_name", ("gpt_oss_120b", "dsv4", "kimi_k3", "muse_spark")
+)
 def test_distributed_petit_reference(profile_name):
     expected_root = os.environ.get("PETIT_EXPECTED_RUNTIME_ROOT")
     if expected_root is not None:
@@ -430,3 +450,190 @@ def test_distributed_petit_reference(profile_name):
                     directory / f"{profile_name}-{case}-{step}-rank{rank}.pt",
                 )
             dist.barrier()
+
+
+@pytest.mark.skipif(
+    int(os.environ.get("WORLD_SIZE", "1")) != 8 or not is_cdna4(),
+    reason="requires torchrun with eight gfx950 GPUs",
+)
+@pytest.mark.parametrize("profile_name", sorted(_PROFILES))
+def test_distributed_petit_deferred_routes(profile_name):
+    """Deferred finalize returns every unweighted route to its source rank.
+
+    Because finalized and deferred launches share one workspace, the test
+    alternates them in eager execution and CUDA graph replay with changed
+    inputs.
+    """
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    if not dist.is_initialized():
+        dist.init_process_group("nccl", timeout=timedelta(minutes=5))
+    rank = dist.get_rank()
+    device = torch.device("cuda", local_rank)
+    profile = _PROFILES[profile_name]
+    layer = _TestMoeLayer(profile, device)
+    _weights(layer, profile, rank)
+    plan = _make_plan(profile)
+    assert plan["supports_deferred_finalize"]
+    kernel_moe_process_weights(plan, layer)
+    for counts in (
+        [0, 1, 15, 16, 31, 32, 63, 64],
+        [128] * 8,
+        [1024] + [0] * 7,
+    ):
+        count = counts[rank]
+        x = torch.empty((count, profile.hidden), device=device, dtype=torch.bfloat16)
+        ids, weights = _routing(count, rank, profile, device)
+
+        def refresh(step):
+            values = torch.arange(x.numel(), device=device).reshape(x.shape)
+            input_scale = 4.0 if profile.activation == "situ" else 1.0 / 32
+            x.copy_(
+                (((values * 13 + rank * 7 + step * 17) % 127) - 63).float()
+                * input_scale
+            )
+            new_ids, new_weights = _routing(count, rank + step, profile, device)
+            if step:
+                new_ids = (new_ids % (profile.experts // 8)) + (step % 8) * (
+                    profile.experts // 8
+                )
+            ids.copy_(new_ids)
+            weights.copy_(new_weights)
+
+        def run(do_finalize):
+            return kernel_moe_apply(
+                plan,
+                x,
+                layer,
+                x.new_empty((count, 0)),
+                topk_weights=weights,
+                topk_ids=ids,
+                num_tokens_global=sum(counts),
+                max_num_tokens_per_gpu=max(counts),
+                do_finalize=do_finalize,
+                low_latency=None,
+                overlap_fn=None,
+                shared_input=None,
+                shared_weight=None,
+                shared_out=None,
+            )
+
+        refresh(0)
+        routes, route_weights, route_map = run(False)
+        assert routes.shape == (count, profile.top_k, profile.hidden)
+        assert route_weights is weights and route_map is None
+        eager_routes = routes.clone()
+        # A finalized launch reuses the workspace and must restore the weights.
+        eager_combined = run(True).clone()
+        torch.cuda.synchronize()
+        dist.barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured_routes, _, _ = run(False)
+            captured_combined = run(True)
+        for step in (0, 1, 2):
+            refresh(step)
+            graph.replay()
+            # One exact nonzero per weight row: routes match the reference bits.
+            expected = _route_reference(x, ids, profile).to(torch.bfloat16)
+            torch.testing.assert_close(captured_routes, expected, atol=0, rtol=0)
+            torch.testing.assert_close(
+                captured_combined,
+                _reference(x, ids, weights, profile),
+                atol=2e-6,
+                rtol=8e-3,
+            )
+            if step == 0:
+                torch.testing.assert_close(
+                    captured_routes, eager_routes, atol=0, rtol=0
+                )
+                torch.testing.assert_close(
+                    captured_combined, eager_combined, atol=0, rtol=0
+                )
+            dist.barrier()
+
+
+@pytest.mark.skipif(
+    int(os.environ.get("WORLD_SIZE", "1")) != 8 or not is_cdna4(),
+    reason="requires torchrun with eight gfx950 GPUs",
+)
+def test_distributed_petit_routes_follow_back_to_back_launches():
+    """Back-to-back small launches never return an earlier launch's routes.
+
+    Peers write each launch's routes into the same workspace rows; the combine
+    copies them out with coherent loads, and an ordinary kernel reads every
+    copy immediately, with no other traffic in between to evict cached lines.
+    """
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    if not dist.is_initialized():
+        dist.init_process_group("nccl", timeout=timedelta(minutes=5))
+    rank = dist.get_rank()
+    device = torch.device("cuda", local_rank)
+    profile = _PROFILES["muse_spark"]
+    layer = _TestMoeLayer(profile, device)
+    _weights(layer, profile, rank)
+    plan = _make_plan(profile)
+    kernel_moe_process_weights(plan, layer)
+    counts = [1, 2, 3, 4, 1, 2, 3, 4]
+    count = counts[rank]
+    iterations = 48
+    inputs = []
+    for step in range(iterations):
+        values = torch.arange(count * profile.hidden, device=device).reshape(
+            count, profile.hidden
+        )
+        x = ((((values * 13 + rank * 7 + step * 29) % 127) - 63).float() / 32).to(
+            torch.bfloat16
+        )
+        ids, weights = _routing(count, rank + step, profile, device)
+        inputs.append((x, ids, weights))
+    x = torch.empty_like(inputs[0][0])
+    ids = torch.empty_like(inputs[0][1])
+    weights = torch.empty_like(inputs[0][2])
+    sums = torch.empty((iterations, count, profile.top_k), device=device)
+
+    def run_all():
+        for step, (step_x, step_ids, step_weights) in enumerate(inputs):
+            x.copy_(step_x)
+            ids.copy_(step_ids)
+            weights.copy_(step_weights)
+            routes, _, _ = kernel_moe_apply(
+                plan,
+                x,
+                layer,
+                x.new_empty((count, 0)),
+                topk_weights=weights,
+                topk_ids=ids,
+                num_tokens_global=sum(counts),
+                max_num_tokens_per_gpu=max(counts),
+                do_finalize=False,
+                low_latency=None,
+                overlap_fn=None,
+                shared_input=None,
+                shared_weight=None,
+                shared_out=None,
+            )
+            sums[step].copy_(routes.float().sum(-1))
+
+    expected = torch.stack(
+        [
+            _route_reference(step_x, step_ids, profile)
+            .to(torch.bfloat16)
+            .float()
+            .sum(-1)
+            for step_x, step_ids, _ in inputs
+        ]
+    )
+    run_all()
+    torch.testing.assert_close(sums, expected, atol=0, rtol=0)
+    torch.cuda.synchronize()
+    dist.barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run_all()
+    for _ in range(3):
+        sums.zero_()
+        graph.replay()
+        torch.testing.assert_close(sums, expected, atol=0, rtol=0)
+        dist.barrier()

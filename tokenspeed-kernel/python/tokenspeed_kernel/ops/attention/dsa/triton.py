@@ -25,6 +25,7 @@ from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.dsa._triton.candidate_exchange import (
     merge_packed_index_candidates,
 )
+from tokenspeed_kernel.ops.kvcache.index_k_scale import index_k_scale_ue8m0
 from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.selection import traits_problem_filter
@@ -1216,7 +1217,7 @@ def triton_dsa_index_candidates(
     _dsa_decode_logits_fp8_kernel[(q.shape[0], triton.cdiv(width, 64))](
         q,
         index_k_cache.view(torch.float8_e4m3fn),
-        index_k_cache.view(torch.float32),
+        index_k_cache.view(torch.int32),
         weights,
         causal_lens,
         local_page_table,
@@ -1233,6 +1234,7 @@ def triton_dsa_index_candidates(
         max_seq_len=width,
         num_heads=q.shape[1],
         head_dim=q.shape[2],
+        UE8M0=index_k_scale_ue8m0(),
         num_groups=q.shape[2] // 128,
         softmax_scale=softmax_scale,
         q_len_per_req=1,

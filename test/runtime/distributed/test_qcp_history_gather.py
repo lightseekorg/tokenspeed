@@ -51,6 +51,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from tokenspeed_kernel.ops.kvcache.index_k_scale import index_k_scale_dtype
 from tokenspeed_kernel.ops.kvcache.triton_cache_placement import virtual_slots_to_local
 
 from tokenspeed.runtime.layers.attention.dcp.cache import (
@@ -465,7 +466,7 @@ def _run_index_k(
         assert keys.data_ptr() == workspace.index_k.data_ptr()
         assert torch.equal(keys, expected_keys[virtual_slots])
         if index_k_format == "fp8_scaled":
-            assert keys.dtype == torch.uint8 and scale.dtype == torch.float32
+            assert keys.dtype == torch.uint8 and scale.dtype == index_k_scale_dtype()
             assert torch.equal(scale, expected_scale[virtual_slots])
         else:
             assert keys.dtype == torch.bfloat16 and scale is None

@@ -1,5 +1,12 @@
 # Communication kernels
 
+## Peer buffers across nodes
+
+Native shared-buffer collectives and fused TP projections support cross-node
+NVLink fabric. Call `gather_fabric_map()` during distributed setup. Shared buffers
+use CUDA IPC locally and symmetric memory across nodes; release them collectively
+only after all graphs and stream consumers finish.
+
 ## Row reduce-scatter and multicast rows
 
 `triton.row_reduce_scatter` sums a set of rows of every rank's BF16 partial,

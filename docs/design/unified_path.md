@@ -493,7 +493,7 @@ chain: the target's rows at step 0, one row per request after; multi-depth
 MTP: the target's rows at every depth; block drafters: one forward). The
 executor never derives a drafter's step count or shape itself.
 
-Padding rows still route through the MoE layers, and under attention DP every
+Padding rows still pass through the MoE layers, and under attention DP every
 rank's filler is interleaved with the real rows in the all-gathered MoE
 input. The expert load counters (`--expert-distribution-recorder-mode stat`)
 therefore read a device-side live-row mask (`ExpertLoadRowMask`, one
@@ -502,6 +502,30 @@ owners mark from the host's padded/live counts before a padded replay — the
 decode graph in `ForwardStepRunner`, the bucket in `PrefillGraph.replay` —
 and clear right after it, on the same stream. Eager forwards are unpadded
 and read the all-True mask; the router counts a route if and only if its row is marked.
+
+DeepGEMM MegaMoE also routes no experts for the filler rows of a padded
+decode replay. `ForwardStepRunner` writes the replay's live and padded
+request counts into one int32 device pair (`mega_moe_live_requests`) that
+every MegaMoE input staging reads, and writes (1, 1) back right after the
+replay, on the same stream, also when the replay raises. Staging gives each
+row at or past `num_tokens * live // padded` expert id -1 and weight 0, which
+MegaMoE skips in dispatch and combine; a filler row's MoE output is then
+zero, or the fused shared expert's alone. Eager forwards and prefill-graph
+buckets see (1, 1) and route every row.
+
+The pair counts requests, not rows, so one pair serves the replay's forwards
+of different rows per request, such as the DeepSeek V4.1 target's rows and
+its DSpark drafter's block rows, where a row mask would need one per row
+count. The share is right only when each rank's MegaMoE input is its
+attention-DP group's whole padded batch: request-major, the same number of
+rows per request, the filler requests last. Attention TP 1 and rows
+replicated over attention TP (attention TP == MoE TP×EP) give that; they are
+the only layouts DeepSeek V4.1 admits with MegaMoE. Any other attention TP,
+such as Qwen3.5's DP4/TP2/EP8, reduce-scatters each group's rows into shards
+(`moe_input_row_segments`) that hold its live rows unevenly. The runner
+therefore writes the pair only under the first two layouts
+(`mega_moe_stages_whole_batches`); under the others it stays (1, 1) and
+MegaMoE routes every row.
 
 ### Pointer-stable per-bs views from one builder
 
@@ -923,9 +947,10 @@ participate in expert-owned dispatch/combine, which never defers another reducti
 The drafter's work inside an extend forward replays from graphs too. The
 drafter declares what it records (`BaseDrafter.extend_graph_plan`), and the
 capture and the CUDA-graph memory projection read that one plan: Eagle's
-decode steps at each request count from 1 to `EXTEND_DECODE_MAX_REQUESTS` (16,
-at most `max_num_seqs`; `prefill:drafter-decode`), and a split draft's K/V
-writer over one tile of rows (`prefill:drafter-kv`, below). An extend round
+decode steps, or a block drafter's block draft, at each request count from 1
+to `EXTEND_DECODE_MAX_REQUESTS` (16, at most `max_num_seqs`;
+`prefill:drafter-decode`), and a split draft's K/V writer over one tile of rows
+(`prefill:drafter-kv`, below). An extend round
 admits a few requests (under a steady streaming load, one or two in nearly
 every round), so a larger one runs its decode steps eager; each captured
 count is a dummy extend of that many one-token requests, which the probe
@@ -958,6 +983,17 @@ without a draft sampler, token history or a top-k carried across steps, and
 one replay decision on every rank that runs the round's collectives: no
 attention DP, no pipeline. Tensor- and expert-parallel ranks run the same
 round, so they replay alike.
+
+A block drafter (DFlash, DSpark) over an MLA draft writes the round's draft
+context K/V eagerly, as its rows follow the round's tokens, and replays the
+block draft: the block forward and the proposal sampling, recorded per
+request count. The block rows of an MLA draft are decode rows whatever the
+round, so before a replay the host stages the block-end lengths and positions
+and refreshes the draft decode metadata over the graph's fixed buffers
+(`for_graph_replay`), as the decode graph's refresh does; the graph fills the
+block-end lengths in place, and the attention stays at its breaks. A round
+replays under the same conditions as Eagle's decode steps: a pure extend at a
+captured count, no attention DP, query shard or pipeline.
 
 A one-layer draft whose rows meet only at attention (the MTP heads of Qwen3.5
 and Qwen4-Exp, each a `SplitExtendDraft`) splits its extend rounds. A row's
@@ -1391,8 +1427,10 @@ Enumerated residue in `ForwardStepRunner.__call__`, all tied to the mechanics
 of replaying a recorded graph: input-buffer padding to the ladder bs plus the
 DFLASH sentinel req-pool rows, the DeepEP
 dispatch-mode restore (`deepep_adapter.replay()`), the sampler-variant
-`graph_key` lookup, the `TOKENSPEED_GRAPH_DEBUG` metadata verify,
-output-buffer re-slicing, the `ctx.bs` save/restore, and the replay itself
+`graph_key` lookup, the `TOKENSPEED_GRAPH_DEBUG` metadata verify, the
+filler-row marks around a padded replay (the expert load row mask and
+MegaMoE's live-request counts), output-buffer re-slicing, the `ctx.bs`
+save/restore, and the replay itself
 through the drafter (`replay_decode_graph`: EAGLE-Harness replays it on its
 round stream and launches its device-chained round behind it).
 
@@ -2115,10 +2153,11 @@ release and recapture remain the orchestrator's responsibility.
 
 Replay uses a captured request capacity; live counts, row identities and
 lengths can change. The outer owner captures request capacities from
-`prefill_graph_capture_batch_sizes` (unset: the minimum count per token bucket)
+`prefill_graph_capture_batch_sizes` (unset: 4 requests, capped by `max_num_seqs`
+per DP rank and the bucket, and at least the minimum count per token bucket)
 with one variant per token bucket and request count. `ModelExecutorConfig`
 requires this field explicitly: factories forward the configured list or `None`
-for the minimum-count policy, so missing configuration wiring fails at
+for the default, so missing configuration wiring fails at
 construction. Token buckets still follow the shared prefill token ladder.
 Capture requests have positive lengths and fit the model context and request
 buffers. At replay, unused execution slots have zero convolution length,

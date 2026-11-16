@@ -470,7 +470,7 @@ def _kernel_page_table(block_ids: list[int], device) -> torch.Tensor:
 
 @requires_gpu
 def test_index_k_rows_round_trip_through_the_kernel_page_layout() -> None:
-    from tokenspeed_kernel.ops.quantization import quantize_fp8
+    from tokenspeed_kernel.ops.kvcache.triton import quantize_index_k_rows
 
     from tokenspeed.runtime.layers.attention.kv_cache.dsa import split_index_k_rows
     from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
@@ -494,12 +494,10 @@ def test_index_k_rows_round_trip_through_the_kernel_page_layout() -> None:
         index_head_dim=128,
         index_k_format="fp8_scaled",
     )
-    expected_fp8, expected_scale = quantize_fp8(
-        keys, granularity="token_group", group_size=128, scale_encoding="float32"
-    )
+    expected_fp8, expected_scale = quantize_index_k_rows(keys, group_size=128)
 
     assert torch.equal(fp8, expected_fp8.view(torch.uint8))
-    assert torch.equal(scale, expected_scale.reshape(200, 1))
+    assert torch.equal(scale, expected_scale)
     # The next DSA layer's plane is untouched.
     assert not pool.get_index_k_buffer(7).any()
 
@@ -531,7 +529,10 @@ _KEY_PROJECTION_WIDTHS = pytest.mark.parametrize(
 def test_the_index_k_write_applies_the_deferred_key_norm(index_k_format, width) -> None:
     """A pre-norm key handed over with its LayerNorm lands in the plane as the
     normalized key would; owned rows only."""
-    from tokenspeed_kernel.ops.kvcache.triton import index_k_block_split_scatter
+    from tokenspeed_kernel.ops.kvcache.triton import (
+        index_k_block_split_scatter,
+        quantize_index_k_rows,
+    )
     from tokenspeed_kernel.platform import current_platform
 
     from tokenspeed.runtime.layers.layernorm import LayerNorm
@@ -551,12 +552,11 @@ def test_the_index_k_write_applies_the_deferred_key_norm(index_k_format, width) 
 
     deferred.set_index_k_buffer(3, slots, keys, write_mask=owned, key_norm=norm)
     if index_k_format == "fp8_scaled" and not current_platform().is_amd:
-        # Mirror the fused FP8 rounding; NVIDIA quantize_fp8 may differ, AMD's matches.
-        normed = norm(keys).float()
-        scale = normed.abs().amax(dim=1, keepdim=True).clamp_min(1e-10) / 448.0
+        # Mirror the fused FP8 rounding and the plane's scale-word encoding.
+        codes, scale = quantize_index_k_rows(norm(keys).float(), group_size=128)
         index_k_block_split_scatter(
             eager.index_k_buffer[3],
-            (normed / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn),
+            codes,
             scale,
             slots,
             page_size=eager.index_k_page_size,
@@ -1003,13 +1003,15 @@ def test_prefill_topk_split_scores_each_ranks_own_index_queries(monkeypatch) -> 
     indexer = attention.indexer
     with torch.no_grad():
         indexer.wq_b.weight.normal_(0.0, 0.05)
-    pool, _ = _k31_pool("cuda", num_lcm_blocks=1)
+    pool, _ = _k31_pool("cuda", num_lcm_blocks=2)
     num_rows = 1100
-    slots = _slots(list(range(9)), num_rows, "cuda")
-    keys = torch.randn(num_rows, 128, device="cuda", dtype=torch.bfloat16)
+    # Behind a 1000-token prefix the last rows see more than topk keys: scored.
+    prefix = 1000
+    slots = _slots(list(range(17)), prefix + num_rows, "cuda")
+    keys = torch.randn(prefix + num_rows, 128, device="cuda", dtype=torch.bfloat16)
     pool.set_index_k_buffer(3, slots, keys, write_mask=None)
     q_lora = torch.randn(num_rows, 128, device="cuda", dtype=torch.bfloat16)
-    row_ends_cpu = torch.arange(1, num_rows + 1, dtype=torch.int64)
+    row_ends_cpu = prefix + torch.arange(1, num_rows + 1, dtype=torch.int64)
     calls = _record_scorer_queries(monkeypatch, "dsa_prefill_topk")
     monkeypatch.setattr(glm5, "all_gather_single", lambda output, input, group: None)
 
@@ -1325,6 +1327,11 @@ def test_configured_index_k_quantization_and_topk(tmp_path, phase) -> None:
         dsa_plan,
         dsa_prefill_topk,
     )
+    from tokenspeed_kernel.ops.kvcache.index_k_scale import (
+        decode_index_k_scale,
+        index_k_scale_ue8m0,
+        round_index_k_scale,
+    )
 
     from tokenspeed.runtime.layers.attention.kv_cache.dsa import split_index_k_rows
     from tokenspeed.runtime.layers.layernorm import LayerNorm
@@ -1352,15 +1359,20 @@ def test_configured_index_k_quantization_and_topk(tmp_path, phase) -> None:
         index_k_format=model_config.index_k_format,
     )
     normalized = norm(keys).float()
+    scales = decode_index_k_scale(scales)
     torch.testing.assert_close(
-        scales, normalized.abs().amax(dim=1, keepdim=True) / 448, rtol=1e-6, atol=1e-9
+        scales,
+        round_index_k_scale(normalized.abs().amax(dim=1, keepdim=True) / 448),
+        rtol=1e-6,
+        atol=1e-9,
     )
     # E4M3 has three mantissa bits; check the quantized values after scaling.
+    # A power-of-two scale doubles the subnormal step of the smallest values.
     torch.testing.assert_close(
         fp8.view(torch.float8_e4m3fn).float() * scales,
         normalized,
         rtol=1 / 16,
-        atol=1e-5,
+        atol=2e-5 if index_k_scale_ue8m0() else 1e-5,
     )
     indexer_output = _indexer_output(u, 1)
     common = dict(
@@ -1716,6 +1728,115 @@ def test_prefill_topk_matches_the_causal_reference(prefix_len, extend_len) -> No
         elif visible == seq_len:
             assert int(selected.topk_lens[row]) == topk
             assert sorted(chosen[row].tolist()) == sorted(slots[bad.numel() :].tolist())
+
+
+@requires_gpu
+@pytest.mark.parametrize(
+    "prefix_len, extend_len, scored",
+    [
+        (0, 15, False),
+        (200, 100, False),
+        (2000, 48, False),
+        (0, 2048, False),
+        # One row past topk: the round is scored.
+        (0, 2049, True),
+    ],
+)
+def test_prefill_rows_within_topk_select_every_candidate_unscored(
+    monkeypatch: pytest.MonkeyPatch, prefix_len: int, extend_len: int, scored: bool
+) -> None:
+    """Rows seeing at most topk keys take all of them, the set the scorer selects."""
+    from tokenspeed.runtime.distributed import Mapping
+    from tokenspeed.runtime.models import glm5
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    torch.manual_seed(3)
+    attention = _indexer_attention(index_topk=2048)
+    slots = 6144
+    pool, _ = _k31_pool("cuda", num_lcm_blocks=4)
+    pool.set_index_k_buffer(
+        3,
+        torch.arange(slots, device="cuda", dtype=torch.int64),
+        torch.randn(slots, 128, device="cuda", dtype=torch.bfloat16),
+        write_mask=None,
+    )
+    plane = pool.get_index_k_buffer(3)
+    # A second request of seven rows behind the first: its rows start mid-workspace.
+    seq_len = prefix_len + extend_len
+    lens_cpu = torch.cat(
+        (
+            prefix_len + torch.arange(1, extend_len + 1, dtype=torch.int64),
+            torch.arange(1, 8, dtype=torch.int64),
+        )
+    )
+    starts_cpu = torch.cat(
+        (
+            torch.zeros(extend_len, dtype=torch.int64),
+            torch.full((7,), seq_len, dtype=torch.int64),
+        )
+    )
+    rows = lens_cpu.numel()
+    q = torch.randn(rows, 32, 128, device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn(rows, 32, device="cuda", dtype=torch.bfloat16)
+    row_starts = starts_cpu.to(device="cuda", dtype=torch.int32)
+    row_ends = (starts_cpu + lens_cpu).to(device="cuda", dtype=torch.int32)
+    kv_workspace_slots = torch.arange(slots, device="cuda", dtype=torch.int64)
+    query, q_scales = attention._scorer_index_query(q, plane)
+    expected, expected_lens = glm5.dsa_prefill_topk(
+        query,
+        weights,
+        kv_workspace_slots,
+        row_starts,
+        row_ends,
+        topk=2048,
+        softmax_scale=attention.indexer.weights_softmax_scale,
+        batch_invariant=False,
+        index_k_cache=plane,
+        page_size=64,
+        q_scales=q_scales,
+        max_logits_bytes=1 << 30,
+        candidate_lens_cpu=lens_cpu,
+        slot_order=global_server_args_dict["dsa_slot_order"],
+    )
+
+    scorer, scored_calls = glm5.dsa_prefill_topk, []
+
+    def record(*args, **kwargs):
+        scored_calls.append(1)
+        return scorer(*args, **kwargs)
+
+    def no_gather(output, input, group):
+        raise AssertionError("an unscored round gathers nothing")
+
+    monkeypatch.setattr(glm5, "dsa_prefill_topk", record)
+    monkeypatch.setattr(glm5, "all_gather_single", no_gather)
+    # Rank 0 of eight would select only its share of a split round.
+    attention.prefill_topk_tp_split = not scored
+    attention.mapping = Mapping(rank=0, world_size=8, attn_tp_size=8)
+    selected, lens = attention._select_prefill_topk_rows(
+        q=q,
+        weights=weights,
+        kv_workspace_slots=kv_workspace_slots,
+        row_starts=row_starts,
+        row_ends=row_ends,
+        candidate_lens_cpu=lens_cpu,
+        index_k_cache=plane,
+        page_size=64,
+        max_logits_bytes=1 << 30,
+        topk=2048,
+    )
+
+    assert len(scored_calls) == int(scored)
+    assert torch.equal(lens, expected_lens)
+    # A leaf's own order is unspecified under the selection order: compare sets.
+    assert torch.equal(selected.sort(dim=1).values, expected.sort(dim=1).values)
+    if not scored:
+        # The shortcut emits each row's candidates by ascending position, -1 after them.
+        offsets = torch.arange(2048, device="cuda", dtype=torch.int32)
+        by_position = torch.where(
+            offsets < lens.unsqueeze(1), offsets + row_starts.unsqueeze(1), -1
+        )
+        assert torch.equal(selected, by_position)
 
 
 # ---------------------------------------------------------------- loader

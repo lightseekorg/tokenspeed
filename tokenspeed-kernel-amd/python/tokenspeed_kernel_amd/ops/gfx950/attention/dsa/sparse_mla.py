@@ -3977,9 +3977,9 @@ def launch_gluon_dsa_decode_topk_fp8_gfx950(
     topk = int(topk)
     q_len_per_req = int(q_len_per_req)
     _check_topk_contract(topk)
-    if q_len_per_req not in (1, 2, 3, 4, 5, 6):
+    if not 1 <= q_len_per_req <= 8:
         raise ValueError(
-            f"DSA Gluon top-k supports q_len_per_req=1..6, got {q_len_per_req}"
+            f"DSA Gluon top-k supports q_len_per_req=1..8, got {q_len_per_req}"
         )
     if index_k_cache is None:
         raise RuntimeError("Gluon DSA paged top-k requires an FP8 index_k_cache")
@@ -4382,8 +4382,8 @@ def launch_gluon_dsa_decode_topk_standard_gfx950(
     topk = int(topk)
     q_len_per_req = int(q_len_per_req)
     _check_topk_contract(topk)
-    if q_len_per_req not in (1, 2, 3, 4, 5, 6):
-        raise ValueError(f"q_len_per_req must be in 1..6, got {q_len_per_req}")
+    if not 1 <= q_len_per_req <= 8:
+        raise ValueError(f"q_len_per_req must be in 1..8, got {q_len_per_req}")
     if index_k_cache is None:
         raise RuntimeError("standard-cache DSA scorer requires index_k_cache")
     _, page_stride_bytes, q_is_fp8 = _check_standard_scorer_inputs(
@@ -4598,7 +4598,7 @@ def launch_gluon_dsa_decode_topk_bf16_gfx950(
         page_size: Rows per page; 64.
         topk: Slots to select; 512, 1024, or 2048.
         softmax_scale: Positive scale applied to every score.
-        q_len_per_req: Query rows per request, 1..6.
+        q_len_per_req: Query rows per request, 1..8.
         index_k_cache: Contiguous bf16 ``[slots, 128]`` plane.
         q_scales: Must be ``None``; BF16 queries carry no scales.
         seq_lens_2d: Unused; per-row bounds derive from ``seq_lens``.
@@ -4614,8 +4614,8 @@ def launch_gluon_dsa_decode_topk_bf16_gfx950(
     topk = int(topk)
     q_len_per_req = int(q_len_per_req)
     _check_topk_contract(topk)
-    if q_len_per_req not in (1, 2, 3, 4, 5, 6):
-        raise ValueError(f"q_len_per_req must be in 1..6, got {q_len_per_req}")
+    if not 1 <= q_len_per_req <= 8:
+        raise ValueError(f"q_len_per_req must be in 1..8, got {q_len_per_req}")
     if index_k_cache is None:
         raise RuntimeError("bf16 index-K scorer requires index_k_cache")
     _check_bf16_scorer_inputs(q, q_scales, weights, index_k_cache, int(page_size))
@@ -4951,8 +4951,8 @@ def launch_gluon_dsa_decode_topk_fp8_rows_gfx950(
     topk = int(topk)
     q_len_per_req = int(q_len_per_req)
     _check_topk_contract(topk)
-    if q_len_per_req not in (1, 2, 3, 4, 5, 6):
-        raise ValueError(f"q_len_per_req must be in 1..6, got {q_len_per_req}")
+    if not 1 <= q_len_per_req <= 8:
+        raise ValueError(f"q_len_per_req must be in 1..8, got {q_len_per_req}")
     if index_k_cache is None:
         raise RuntimeError("fp8_scaled multi-row scorer requires index_k_cache")
     page_stride_bytes = _check_fp8_rows_scorer_inputs(

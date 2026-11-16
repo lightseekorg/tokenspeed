@@ -1192,7 +1192,7 @@ class HostBootstrap:
         self._server_args = server_args
         self._connection = connection
         mapping = server_args.mapping
-        gpu_id = mapping.rank % mapping.nprocs_per_node + server_args.base_gpu_id
+        gpu_id = mapping.gpu_id
         self._gpu_id = gpu_id
         self._port_args = port_args
         self._memory_sampler: MemoryMetricSampler | None = None

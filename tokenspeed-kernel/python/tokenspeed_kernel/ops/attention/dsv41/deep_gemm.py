@@ -160,8 +160,13 @@ def _paged_scores(
         request_indices = (
             index_metadata.source.acquire()[2] if index_metadata is not None else None
         )
-        indices = None
-        if request_indices is not None:
+        if request_indices is None:
+            # Blackwell schedules one query row per request entry: without a
+            # grouping every row is its own request.
+            indices = torch.arange(
+                lengths.numel(), device=cache.device, dtype=torch.int32
+            )
+        else:
             # Padding must not end an active request's run with a zero length:
             # the native scheduler sizes shared KV work from the run's last row.
             padding_start = torch.iinfo(torch.int32).min
@@ -194,7 +199,6 @@ def _paged_scores(
         block_table=table,
         schedule_meta=schedule,
         max_context_len=capacity,
-        clean_logits=False,
         logits_dtype=torch.bfloat16,
         indices=indices,
     )
@@ -266,7 +270,6 @@ def _dense_scores(
         weights=weights,
         cu_seq_len_k_start=starts,
         cu_seq_len_k_end=packed_ends,
-        clean_logits=False,
         max_seqlen_k=capacity,
         logits_dtype=torch.bfloat16,
     )
@@ -490,27 +493,26 @@ def _warmup_hopper_indexer(heads: int, device: torch.device, enable_pdl: bool) -
     keys = torch.zeros((64, 128), dtype=torch.float8_e4m3fn, device=device)
     scales = torch.zeros((64,), dtype=torch.float32, device=device)
     bounds = torch.zeros((1,), dtype=torch.int32, device=device)
-    deep_gemm.fp8_mqa_logits(
-        q=q,
+    # sm90 scores FP8 rows with per-token FP32 scales: no MX query scales.
+    deep_gemm.fp8_fp4_mqa_logits(
+        q=(q, None),
         kv=(keys, scales),
         weights=weights,
         cu_seq_len_k_start=bounds,
         cu_seq_len_k_end=bounds + 64,
-        clean_logits=False,
         max_seqlen_k=64,
     )
     cache = torch.zeros((1, 64, 1, _INDEX_ROW_BYTES), dtype=torch.uint8, device=device)
     context = torch.full((1, 1), 64, dtype=torch.int32, device=device)
     table = torch.zeros((1, 1), dtype=torch.int32, device=device)
-    deep_gemm.fp8_paged_mqa_logits(
-        q.unsqueeze(1),
+    deep_gemm.fp8_fp4_paged_mqa_logits(
+        (q.unsqueeze(1), None),
         cache,
         weights,
         context,
         table,
         deep_gemm.get_paged_mqa_logits_metadata(context, 64, deep_gemm.get_num_sms()),
         64,
-        clean_logits=False,
     )
     # The selector compiles on first use, which cannot happen inside a capture:
     # compile every cluster variant of both selection capacities up front.
@@ -560,13 +562,12 @@ def _hopper_dense_scores(
     queries, keys, weights, lengths, table, pages, capacity, *, clean
 ):
     starts, ends = dense_ranges(lengths, capacity)
-    logits = _hopper_api(queries[0]).fp8_mqa_logits(
-        q=queries[0],
+    logits = _hopper_api(queries[0]).fp8_fp4_mqa_logits(
+        q=(queries[0], None),
         kv=keys,
         weights=weights,
         cu_seq_len_k_start=starts,
         cu_seq_len_k_end=ends,
-        clean_logits=False,
         max_seqlen_k=capacity,
     )
     return clean_logits(logits, ends, table, pages, capacity, 64) if clean else logits
@@ -598,15 +599,14 @@ def _hopper_paged_scores(
         (cache.shape[0], 64, 1, _INDEX_ROW_BYTES),
         (flat.stride(0), _INDEX_ROW_BYTES, _INDEX_ROW_BYTES, 1),
     )
-    logits = api.fp8_paged_mqa_logits(
-        queries[0].unsqueeze(1),
+    logits = api.fp8_fp4_paged_mqa_logits(
+        (queries[0].unsqueeze(1), None),
         view,
         weights,
         context_lens,
         table,
         schedule,
         capacity,
-        clean_logits=False,
     )
     if not clean:
         return logits.reshape(queries[0].shape[0], -1)[:, :capacity]

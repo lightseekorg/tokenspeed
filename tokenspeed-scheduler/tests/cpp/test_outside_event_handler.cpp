@@ -200,6 +200,34 @@ TEST_F(FinishOnlyHybridWriteBackTestSuite, FinishStoresDecodeMlaPagesAndTheFinal
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 10);
 }
 
+TEST_F(FinishOnlyHybridWriteBackTestSuite, FinalCheckpointSurvivesOwnerRetirementUntilHostStoreAck) {
+    Submit(RequestSpec{.request_id = "r0", .tokens = {1, 2, 3}});
+    PlanOnce();
+    SendForwardDone("r0", {4});
+    SendFinish("r0");
+    EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
+    const ExecutionPlan stores = PlanOnce();
+    ASSERT_FALSE(ExtractCacheOpsOfKind<WriteBackBatch>(stores).empty());
+    EXPECT_FALSE(scheduler_->CanClearCache()) << "the pending store still pins the final KV and State blocks";
+
+    // The finished request has gone; reusing its id also reuses the complete
+    // unaligned checkpoint while the first request's Host store is pending.
+    Submit(RequestSpec{.request_id = "r0", .tokens = {1, 2, 3, 4}});
+    const ExecutionPlan hit = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(hit.Operations());
+    ASSERT_NE(batch, nullptr);
+    ASSERT_EQ(batch->request_ids.size(), 1u);
+    EXPECT_EQ(batch->extend_prefix_lens.front(), 3);
+    AckWriteBacks(stores);
+    SendForwardDone("r0", {5});
+    SendFinish("r0");
+    const ExecutionPlan final = PlanOnce();
+    AckWriteBacks(final);
+    EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
+    EXPECT_TRUE(scheduler_->CanClearCache());
+    EXPECT_TRUE(scheduler_->ClearCache());
+}
+
 class LoadBackDoneTestSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
