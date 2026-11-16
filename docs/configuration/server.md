@@ -846,18 +846,19 @@ prefill`): that role never verifies a chain and its candidates ship without
 `q`, so it would only allocate the distribution buffer. Pass it to the decode
 role only.
 
-Requirements: `--speculative-algorithm EAGLE3` or `MTP` (`DSPARK` proposes a
-whole block greedily outside [Block verification](#block-verification-experimental);
-`DFLASH` is covered below), `--speculative-eagle-topk 1`,
+Requirements: `--speculative-algorithm EAGLE3`, `MTP`, or `DSPARK` (each
+DSpark Markov step samples its token; `DFLASH` is covered below),
+`--speculative-eagle-topk 1`,
 and `--sampling-backend flashinfer`, `flashinfer_full`, or `sonic` (`sonic`
 reads `q` at its top-128 target candidates; `greedy` verifies by exact match,
 the Triton backends by target-sampled exact match; neither reads the dense
 `q`). The drafter switches its draft model's fused TP-sharded argmax off so
 the full-vocab logits reach it, which adds the logits all-gather to every
 draft step under tensor parallelism. With `sonic` sampling vocabulary shards
-(the server logs `Sampled rows stay vocab-sharded`) and an MTP or EAGLE3 draft
-head spanning the target vocabulary, the draft steps stay sharded too (`Draft
-steps stay vocab-sharded`): each rank samples its shard of the draft logits,
+(the server logs `Sampled rows stay vocab-sharded`) and an MTP, EAGLE3, or
+DSpark draft head spanning the target vocabulary, the draft steps stay sharded
+too (`Draft steps stay vocab-sharded`; a DSpark step adds its Markov bias to
+the shard of the target head's logits, unless the head scales or softcaps them): each rank samples its shard of the draft logits,
 the ranks exchange a few values per request instead of the logits, every rank
 draws the same token, and each records `q` over its own vocabulary columns;
 its verify candidates carry that `q` through their gather. An EAGLE3 head with

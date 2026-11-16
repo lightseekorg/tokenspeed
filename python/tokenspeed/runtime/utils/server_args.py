@@ -2121,8 +2121,9 @@ class ServerArgs:
 
         The accept test needs a proposal drawn from the recorded draft
         distribution q, so the drafter must propose one token per step from
-        its own logits (the Eagle family and the multi-depth MTP drafter) and
-        the verifier must be a backend that runs the draft-prob chain kernel:
+        its own logits (the Eagle family, the multi-depth MTP drafter, and
+        DSpark's Markov steps) and the verifier must be a backend that runs
+        the draft-prob chain kernel:
         ``greedy`` verifies by exact match, so a dense q never enters it, and
         ``triton`` by a target-sampled exact match unless it runs block
         verification, which reads the dense q. The one block drafter
@@ -2150,29 +2151,8 @@ class ServerArgs:
         if self.speculative_algorithm is None:
             raise ValueError(
                 "--enable-speculative-sampling needs speculative decoding: pass "
-                "--speculative-algorithm EAGLE3 or MTP, or DFLASH with a DFlash2 "
-                "draft and --sampling-backend triton"
-            )
-        # DFLASH samples its walk only with the DFlash2 candidate selector
-        # (the verifier is checked below); DSpark samples its Markov steps only
-        # for block verification or for synthetic rejection over sampled drafts.
-        if self.speculative_algorithm in BLOCK_SPEC_ALGORITHMS and not (
-            self.speculative_algorithm == "DFLASH"
-            or (
-                self.speculative_algorithm == "DSPARK"
-                and self.speculative_rejection_sample_method in ("block", "synthetic")
-            )
-        ):
-            raise ValueError(
-                "--enable-speculative-sampling needs a chain drafter that samples "
-                "one token per step from its own distribution; "
-                f"{self.speculative_algorithm} proposes a whole block greedily"
-                + (
-                    "; pass --speculative-rejection-sample-method block (or "
-                    "synthetic) for sampled DSPARK drafting"
-                    if self.speculative_algorithm == "DSPARK"
-                    else ""
-                )
+                "--speculative-algorithm EAGLE3, MTP, or DSPARK (or DFLASH with a "
+                "DFlash2 draft and --sampling-backend triton)"
             )
         # EAGLE-Harness samples its trees (validate_eagle_harness_args).
         if self.speculative_eagle_topk != 1 and not self.eagle_harness:
