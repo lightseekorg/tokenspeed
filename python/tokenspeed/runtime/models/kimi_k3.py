@@ -4438,8 +4438,8 @@ class KimiLinearDecoderLayer(nn.Module):
                 prefix_is_sharded=False,
                 **({} if premix is None else {"attention_mix": premix}),
             )
-            if premix is not None:
-                next_mix[0]._premixed_input = premix.out
+            if next_mix is not None:
+                next_mix[0]._premixed_input = None if premix is None else premix.out
         else:
             prefix_sum = prefix_sum + self.mlp(h)
         return prefix_sum, block_residual
