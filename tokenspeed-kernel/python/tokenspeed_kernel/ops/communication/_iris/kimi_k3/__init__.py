@@ -1209,14 +1209,16 @@ def prepare_k3_communication(
         if all_reduce is None
         else 0
     )
+    attnres_lamport_rows = _k3_attnres_lamport_rows(world_size, enable_lamport)
+    attnres_lamport_bytes = 0
     if attnres_max_numel:
         total_bytes += IrisAttnResState.heap_bytes(
-            attnres_max_numel,
-            attnres_max_rows,
-            world_size,
-            dtype,
-            lamport_max_rows=_k3_attnres_lamport_rows(world_size, enable_lamport),
+            attnres_max_numel, attnres_max_rows, world_size, dtype
         )
+        if attnres_lamport_rows:
+            attnres_lamport_bytes = IrisAttnResState.lamport_heap_bytes(
+                attnres_lamport_rows, world_size, dtype
+            )
     if enable_lamport and ProducerLamport.supported(world_size, dtype):
         lamport_numel = _k3_lamport_numel(producer_direct_max_numel)
         if lamport_numel:
@@ -1237,7 +1239,8 @@ def prepare_k3_communication(
     ctx = get_or_create_context(
         heap_size=max(MIN_HEAP_BYTES, total_bytes + HEAP_HEADROOM_BYTES)
         + sharded_bytes
-        + pull_exchange_bytes,
+        + pull_exchange_bytes
+        + attnres_lamport_bytes,
     )
     if all_reduce is None:
         all_reduce = IrisAllReduce(

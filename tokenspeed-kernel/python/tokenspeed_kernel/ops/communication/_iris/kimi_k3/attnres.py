@@ -100,20 +100,15 @@ class IrisAttnResState:
 
     @staticmethod
     def heap_bytes(
-        max_numel: int,
-        max_rows: int,
-        world_size: int,
-        dtype: torch.dtype,
-        lamport_max_rows: int = 0,
+        max_numel: int, max_rows: int, world_size: int, dtype: torch.dtype
     ) -> int:
-        size = allocation_bytes((2, world_size, max_numel), dtype) + allocation_bytes(
+        return allocation_bytes((2, world_size, max_numel), dtype) + allocation_bytes(
             (2, max_rows, world_size), torch.int32
         )
-        if lamport_max_rows:
-            size += allocation_bytes(
-                _lamport_mailbox_shape(lamport_max_rows, world_size), dtype
-            )
-        return size
+
+    @staticmethod
+    def lamport_heap_bytes(max_rows: int, world_size: int, dtype: torch.dtype) -> int:
+        return allocation_bytes(_lamport_mailbox_shape(max_rows, world_size), dtype)
 
     def __init__(
         self,
