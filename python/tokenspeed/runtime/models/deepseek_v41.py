@@ -2344,6 +2344,8 @@ class DeepseekV41DecoderLayer(nn.Module):
                 packed[:, width].copy_(image_mask)
             packed = self.comm_manager.pre_mlp_comm(packed, ctx)
             x = packed[:, :width].contiguous()
+            # Local None means text-only rows, not that every peer is text-only.
+            # Keep the gathered mask: another DP rank may contribute image rows.
             image_mask = packed[:, width].bool()
         else:
             x = self.comm_manager.pre_mlp_comm(x, ctx)

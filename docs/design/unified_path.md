@@ -32,6 +32,9 @@ identity never changes the request's seed.
 The host record fixes stop criteria for the lifetime of an admission, so
 stop binding uses that identity without a second key containing the criteria.
 A later request reusing the public RID still receives a new identity.
+Adaptive DSpark confidence and verification feedback use the same admission
+identity, so a reused public RID cannot retain the previous admission’s
+predictions. Retraction preserves confidence for the restored admission.
 
 A retraction keeps the admission identity. A sampler snapshot records whether
 that admission prepared the slot: an image taken before the first local

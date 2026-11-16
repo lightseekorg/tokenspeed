@@ -2702,7 +2702,7 @@ class ModelExecutor:
                 self.drafter, "prepare_request_state"
             ):
                 self.drafter.prepare_request_state(
-                    forward_op.request_ids,
+                    admission_ids,
                     forward_op.request_pool_indices,
                     num_extends,
                 )

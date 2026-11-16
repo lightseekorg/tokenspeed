@@ -151,6 +151,7 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
         engram_max_ngram_size=4,
         engram_n_heads=1,
     )
+    target.model.mapping = _mapping(0, 1, 1)
     target.model.ced_decoder_start = 20
     target.model.decoder_uses_engram = True
     target.model.layers = nn.ModuleList(Layer(i) for i in range(40))
@@ -1431,7 +1432,7 @@ def _assert_adaptive_inputs_and_state(adapter):
         ctx.output_layout = ForwardOutputLayout(0, 0, 2, width)
         return ctx
 
-    ctx = prepare(["a", "b"], [1, 3])
+    ctx = prepare([101, 102], [1, 3])
     drafter.confidence_scores[1].copy_(torch.tensor([1, -1, 1, 1, 1], device=device))
     drafter.confidence_scores[3].copy_(torch.tensor([1, 1, -1, 1, 1], device=device))
     saved_positions = ib.positions_buf[:12].clone()
@@ -1456,7 +1457,7 @@ def _assert_adaptive_inputs_and_state(adapter):
 
     # Reusing a layout still reads this round's inputs, not the saved
     # candidates from the preceding round.
-    ctx = prepare(["a", "b"], [1, 3])
+    ctx = prepare([101, 102], [1, 3])
     changed = original.flip(0)
     ib.input_ids_buf[:12].copy_(changed)
     with drafter.target_forward_context(ctx):
@@ -1468,7 +1469,7 @@ def _assert_adaptive_inputs_and_state(adapter):
     torch.testing.assert_close(ib.input_ids_buf[:12], changed)
 
     # The allocator publishes the layout for the reordered request rows.
-    ctx = prepare(["b", "a"], [3, 1])
+    ctx = prepare([102, 101], [3, 1])
     drafter.prepare_verify_layout((3, 2), num_tokens=5)
     with pytest.raises(RuntimeError, match="target failed"):
         with drafter.target_forward_context(ctx):
@@ -1480,29 +1481,29 @@ def _assert_adaptive_inputs_and_state(adapter):
 
     image = torch.empty(drafter.slot_state_bytes(), dtype=torch.uint8, device=device)
     stream = torch.cuda.current_stream()
-    drafter.export_slot_state(1, image, stream, request_id="a")
-    drafter.import_slot_state(2, image, stream, request_id="a")
-    drafter.prepare_request_state(["a"], [2], 0)
+    drafter.export_slot_state(1, image, stream, admission_id=101)
+    drafter.import_slot_state(2, image, stream, admission_id=101)
+    drafter.prepare_request_state([101], [2], 0)
     torch.testing.assert_close(
         drafter.confidence_scores[2], drafter.confidence_scores[1]
     )
-    drafter.export_slot_state(1, image, stream, request_id="unprepared")
-    drafter.import_slot_state(0, image, stream, request_id="unprepared")
+    drafter.export_slot_state(1, image, stream, admission_id=104)
+    drafter.import_slot_state(0, image, stream, admission_id=104)
     assert torch.isposinf(drafter.confidence_scores[0]).all()
 
-    ctx = prepare(["new", "b"], [1, 3])
+    ctx = prepare([103, 102], [1, 3])
     assert torch.isposinf(drafter.confidence_scores[1]).all()
     drafter.set_decode_graph_query_extent(None)
     with drafter.target_forward_context(ctx):
         assert ctx.decode_query_indptr is None
     drafter.on_target_weights_updated()
-    ctx = prepare(["new", "b"], [1, 3])
+    ctx = prepare([103, 102], [1, 3])
     with drafter.target_forward_context(ctx):
         assert ctx.decode_query_indptr is None
         assert ctx.input_num_tokens == 12
 
     # Full-capacity execution must not reuse the previous packed layout.
-    ctx = prepare(["a", "b"], [1, 3])
+    ctx = prepare([101, 102], [1, 3])
     drafter.set_decode_graph_query_extent(12)
     with drafter.target_forward_context(ctx):
         assert ctx.decode_query_indptr is None
@@ -1515,7 +1516,7 @@ def _assert_adaptive_inputs_and_state(adapter):
 
     # One captured six-row forward must serve different live CSR layouts,
     # preserve fresh candidates, and restore full scheduler-width inputs.
-    ctx = prepare(["a", "b"], [1, 3])
+    ctx = prepare([101, 102], [1, 3])
     drafter.prepare_verify_layout((2, 3), num_tokens=6)
     drafter.set_decode_graph_query_extent(6)
 

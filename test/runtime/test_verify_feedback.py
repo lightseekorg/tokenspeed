@@ -85,7 +85,7 @@ def make_drafter():
     drafter.confidence_scores = torch.tensor(
         [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], dtype=torch.float32, device="cuda"
     )
-    drafter._confidence_request_ids = ["a", "b", "c"]
+    drafter._confidence_admission_ids = [1, 2, 3]
     return drafter
 
 
@@ -129,9 +129,9 @@ def test_allocation_uses_latest_scores_in_request_order():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
 def test_reused_slot_and_extend_do_not_leak_previous_predictions():
     drafter = make_drafter()
-    drafter.prepare_request_state(["new", "b"], [0, 1], num_extends=0)
+    drafter.prepare_request_state([4, 2], [0, 1], num_extends=0)
     check_allocation(drafter, [0, 1], [[-1, -2], [-3, -4]], [[-1, -2], [3, 4]])
-    drafter.prepare_request_state(["b"], [1], num_extends=1)
+    drafter.prepare_request_state([2], [1], num_extends=1)
     check_allocation(drafter, [1], [[-1, -2]], [[-1, -2]])
 
 

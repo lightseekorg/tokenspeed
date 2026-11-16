@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import math
 import os
+from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from importlib import metadata
@@ -158,14 +159,14 @@ class DeepseekV41DSpark(BaseDrafter):
             self.device,
         )
 
-        self.adaptive_min_batch_size = global_server_args_dict.get(
-            "dsv41_dspark_min_batch_size", 32
-        )
+        self.adaptive_min_batch_size = global_server_args_dict[
+            "dsv41_dspark_min_batch_size"
+        ]
         self.verify_graph_token_step: int | None = None
         self._verify_calibrations: tuple[VerifyCalibration, ...] = ()
         self._verify_policy_ms: float | None = None
         self.verify_budget_policy: VerifyBudgetPolicy | None = None
-        if global_server_args_dict.get("enable_dsv41_adaptive_dspark", False):
+        if global_server_args_dict["enable_dsv41_adaptive_dspark"]:
             self.verify_budget_policy = VerifyBudgetPolicy(
                 enabled=True,
                 min_batch_size=self.adaptive_min_batch_size,
@@ -186,7 +187,7 @@ class DeepseekV41DSpark(BaseDrafter):
         self._cached_verify_profiles: tuple[VerifyCalibration, ...] = ()
         self.confidence_scores: torch.Tensor | None = None
         self.confidence_features: torch.Tensor | None = None
-        self._confidence_request_ids: list[object | None] = []
+        self._confidence_admission_ids: list[int | None] = []
         self._verify_candidates: torch.Tensor | None = None
         self._graph_query_tokens: int | None = None
         self._verify_layout_counts: tuple[int, ...] | None = None
@@ -202,7 +203,7 @@ class DeepseekV41DSpark(BaseDrafter):
                 dtype=torch.float32,
                 device=self.device,
             )
-            self._confidence_request_ids = [None] * slots
+            self._confidence_admission_ids = [None] * slots
             # Stable storage: a captured packed forward reads these same
             # addresses even when the next batch has different query boundaries.
             self._verify_rows = torch.empty(
@@ -223,10 +224,10 @@ class DeepseekV41DSpark(BaseDrafter):
     def slot_state_rows(self, slot: int) -> list[torch.Tensor]:
         return [] if self.confidence_scores is None else [self.confidence_scores[slot]]
 
-    def export_slot_state(self, slot, out, stream, *, request_id: str) -> None:
+    def export_slot_state(self, slot, out, stream, *, admission_id: int) -> None:
         if (
             self.confidence_scores is not None
-            and self._confidence_request_ids[slot] != request_id
+            and self._confidence_admission_ids[slot] != admission_id
         ):
             from tokenspeed.runtime.execution.slot_state import pack_slot_rows
 
@@ -236,14 +237,14 @@ class DeepseekV41DSpark(BaseDrafter):
                 stream,
             )
         else:
-            super().export_slot_state(slot, out, stream, request_id=request_id)
+            super().export_slot_state(slot, out, stream, admission_id=admission_id)
 
-    def import_slot_state(self, slot, src, stream, *, request_id: str) -> None:
-        super().import_slot_state(slot, src, stream, request_id=request_id)
+    def import_slot_state(self, slot, src, stream, *, admission_id: int) -> None:
+        super().import_slot_state(slot, src, stream, admission_id=admission_id)
         if self.verify_feedback is not None:
             self.verify_feedback.invalidate()
         if self.confidence_scores is not None:
-            self._confidence_request_ids[slot] = request_id
+            self._confidence_admission_ids[slot] = admission_id
 
     def on_target_weights_updated(self) -> None:
         # A hot reload must not reuse or overwrite the boot checkpoint's costs.
@@ -440,24 +441,24 @@ class DeepseekV41DSpark(BaseDrafter):
 
     def prepare_request_state(
         self,
-        request_ids: list[object],
+        admission_ids: Sequence[int],
         request_pool_indices: list[int],
         num_extends: int,
     ) -> None:
-        """Reset predictions for new request identities; KV remains scheduler-owned."""
+        """Reset predictions for new admissions; KV remains scheduler-owned."""
         if self.verify_feedback is not None:
             self._poll_verify_feedback()
             self.verify_feedback.prepare(
-                request_ids, request_pool_indices, num_extends=num_extends
+                admission_ids, request_pool_indices, num_extends=num_extends
             )
         if self.confidence_scores is None:
             return
-        for row, (request, slot) in enumerate(
-            zip(request_ids, request_pool_indices, strict=True)
+        for row, (admission, slot) in enumerate(
+            zip(admission_ids, request_pool_indices, strict=True)
         ):
-            if row < num_extends or self._confidence_request_ids[slot] != request:
+            if row < num_extends or self._confidence_admission_ids[slot] != admission:
                 self.confidence_scores[slot].fill_(float("inf"))
-            self._confidence_request_ids[slot] = request
+            self._confidence_admission_ids[slot] = admission
 
     def install_verify_calibration(
         self, profiles: tuple[VerifyCalibration, ...], *, policy_ms: float
