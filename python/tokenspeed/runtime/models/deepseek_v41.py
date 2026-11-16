@@ -1691,6 +1691,26 @@ class DeepseekV41Attention(nn.Module):
             elif swa.shape[0]:
                 swa = _attention_norm(swa, self.kv_norm)
                 swa = self.rotary_emb.apply_owned(swa, positions, False)
+            if (
+                mode.is_decode()
+                and self.is_index_source
+                and rows.keep_rows is None
+                and query_gather is None
+            ):
+                # Publish this step's SWA rows on the main stream while the
+                # index branch still runs; forward_v41 then skips its write.
+                # Nothing on the index branch reads the SWA cache, and the
+                # attention that reads it follows on this stream.
+                backend.write_decode_swa(
+                    self.layer_id,
+                    swa,
+                    positions,
+                    requests,
+                    mode,
+                    swa_rope_cache=swa_rope_cache,
+                    swa_norm_weight=swa_norm_weight,
+                    swa_norm_eps=self.kv_norm.variance_epsilon,
+                )
         if overlap:
             # Aux-owned scratch can outlive this layer through source/reuse
             # records. Main consumers and allocator reuse both follow the join.

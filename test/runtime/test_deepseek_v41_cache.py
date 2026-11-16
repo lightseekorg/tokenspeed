@@ -255,6 +255,174 @@ def test_rebinding_cache_pool_drops_pool_derived_state():
     assert backend._decode_buffers is not old_buffers
 
 
+def _refresh_decode(backend, tables, actual, seq_lens):
+    backend.refresh_decode_metadata(
+        2,
+        actual,
+        torch.tensor([0, 1]),
+        torch.tensor(seq_lens),
+        forward_mode=ForwardMode.DECODE,
+        block_tables=tables,
+        num_extends=0,
+        for_graph_replay=True,
+    )
+    return backend.query_metadata(ForwardMode.DECODE)
+
+
+@pytest.mark.parametrize("rope", [False, True])
+def test_decode_swa_written_early_is_the_attention_write(monkeypatch, rope):
+    """write_decode_swa is forward_v41's own decode SWA write, issued earlier.
+
+    The cache bytes and the attention inputs match a plain forward_v41 bit
+    for bit, the write runs once, and forward_v41 skips it after an early one.
+    """
+    backend = _backend("cpu", 2)
+    tables = _tables("cpu")
+    cache_bytes = backend.cache_pool.arena.buffer
+    writes = []
+
+    def scatter(values, cache, slots, positions):
+        writes.append((values, slots, positions))
+        live = slots >= 0
+        rows = slots[live].long()
+        # A deterministic stand-in for the quantizing writers.
+        cache[rows // 64, rows % 64, :16] = (
+            values[live, :16].float().mul(7).round().to(torch.int64) % 251
+        ).to(torch.uint8)
+
+    monkeypatch.setattr(
+        dsv41,
+        "cache_scatter",
+        lambda values, cache, slots, fmt: scatter(values, cache, slots, None),
+    )
+    monkeypatch.setattr(
+        dsv41,
+        "swa_rope_scatter",
+        lambda values, positions, rope_table, cache, slots, fmt, out, weight, eps: (
+            scatter(values, cache, slots, positions)
+        ),
+    )
+    attended = []
+
+    def fused_attention(q, cache, *args):
+        # Read the SWA field the way attention would: after the write.
+        attended.append((cache.clone(), args[0], args[1]))
+        return q, q
+
+    def attention(q, cache, *args, lse):
+        attended.append((cache.clone(), args[0], args[1]))
+        return q
+
+    monkeypatch.setattr(dsv41, "selected_attention_fp8", fused_attention)
+    monkeypatch.setattr(dsv41, "selected_attention", attention)
+    meta = _refresh_decode(backend, tables, 2, [9, 70])
+    n = meta.positions.numel()
+    torch.manual_seed(7)
+    q = torch.randn(n, 64, 512).to(torch.bfloat16)
+    swa = torch.randn(n, 512).to(torch.bfloat16)
+    rope_table = torch.zeros(256, 64) if rope else None
+    norm_weight = torch.ones(512, dtype=torch.bfloat16) if rope else None
+
+    def forward(early):
+        cache_bytes.zero_()
+        writes.clear()
+        attended.clear()
+        backend.begin_indexer_forward()
+        if early:
+            backend.write_decode_swa(
+                1,
+                swa,
+                meta.positions,
+                meta.request_indices,
+                ForwardMode.DECODE,
+                swa_rope_cache=rope_table,
+                swa_norm_weight=norm_weight,
+                swa_norm_eps=1e-6,
+            )
+            # Written now, before the attention call.
+            assert len(writes) == 1
+        backend.forward_v41(
+            q,
+            swa,
+            layer_id=1,
+            positions=meta.positions,
+            request_indices=meta.request_indices,
+            forward_mode=ForwardMode.DECODE,
+            index_q=None,
+            index_weights=None,
+            attn_sink=torch.zeros(64),
+            softmax_scale=512**-0.5,
+            index_process_group=None,
+            swa_rope_cache=rope_table,
+            swa_norm_weight=norm_weight,
+            swa_norm_eps=1e-6,
+            # Only the fused path takes the deferred-RoPE SWA rows.
+            fused_decode_groups=8 if rope else None,
+            key_rows=None,
+        )
+        backend.end_indexer_forward()
+        assert len(writes) == 1 and len(attended) == 1
+        assert not backend._prepared_swa_writes
+        return cache_bytes.clone(), list(writes[0]), attended[0]
+
+    plain_bytes, plain_write, plain_attended = forward(False)
+    early_bytes, early_write, early_attended = forward(True)
+    assert plain_bytes.any() and torch.equal(early_bytes, plain_bytes)
+    values, slots, positions = early_write
+    assert values is swa and slots is meta.swa_write_slots
+    assert positions is (meta.positions if rope else None)
+    assert plain_write[0] is swa and plain_write[1] is slots
+    for got, want in zip(early_attended, plain_attended, strict=True):
+        assert torch.equal(got, want)
+
+    common = dict(swa_rope_cache=rope_table, swa_norm_weight=norm_weight)
+    write = (1, swa, meta.positions, meta.request_indices, ForwardMode.DECODE)
+    with pytest.raises(ValueError, match="decode rows only"):
+        backend.write_decode_swa(
+            *write[:4], ForwardMode.EXTEND, **common, swa_norm_eps=1e-6
+        )
+    # Rows outside the refreshed decode window are left to forward_v41.
+    writes.clear()
+    assert not backend.write_decode_swa(
+        1,
+        swa,
+        meta.positions.clone(),
+        meta.request_indices,
+        ForwardMode.DECODE,
+        **common,
+        swa_norm_eps=1e-6,
+    )
+    assert not writes and not backend._prepared_swa_writes
+    assert backend.write_decode_swa(*write, **common, swa_norm_eps=1e-6)
+    with pytest.raises(RuntimeError, match="already wrote"):
+        backend.write_decode_swa(*write, **common, swa_norm_eps=1e-6)
+    # The attention must consume the rows it wrote.
+    with pytest.raises(RuntimeError, match="other SWA rows"):
+        backend.forward_v41(
+            q,
+            swa.clone(),
+            layer_id=1,
+            positions=meta.positions,
+            request_indices=meta.request_indices,
+            forward_mode=ForwardMode.DECODE,
+            index_q=None,
+            index_weights=None,
+            attn_sink=torch.zeros(64),
+            softmax_scale=512**-0.5,
+            index_process_group=None,
+            swa_rope_cache=rope_table,
+            swa_norm_weight=norm_weight,
+            swa_norm_eps=1e-6,
+            fused_decode_groups=8 if rope else None,
+            key_rows=None,
+        )
+    # A refresh drops a write no attention consumed.
+    backend.write_decode_swa(*write, **common, swa_norm_eps=1e-6)
+    assert backend._prepared_swa_writes
+    _refresh_decode(backend, tables, 2, [9, 70])
+    assert not backend._prepared_swa_writes
+
+
 def _tables(device):
     packing = _config(device).component(DeepseekV41Config).row_layout().group_packing
     return _tables_with_packing(device, packing)
@@ -713,7 +881,7 @@ def test_decoder_view_keeps_compute_rows_and_selects_only_valid_logits():
     ) == (view.metadata, view.spans)
 
 
-def _decode_compute(backend, inputs, bs):
+def _decode_compute(backend, inputs, bs, early_swa=False):
     backend.begin_indexer_stage()
     content, scores, q, swa, iq, iw, sink = inputs
     mode = ForwardMode.DECODE
@@ -738,6 +906,20 @@ def _decode_compute(backend, inputs, bs):
             query_q, query_swa = query_q[order], query_swa[order]
             query_iq, query_iw = query_iq[order], query_iw[order]
         source = layer in (2, 20, 24)
+        if early_swa:
+            # As an index-source layer writes its SWA rows inside its fork.
+            # From layer 24 the rows are reordered, not the refreshed window,
+            # so the write declines and forward_v41 writes them.
+            backend.write_decode_swa(
+                layer,
+                query_swa,
+                pos,
+                req,
+                mode,
+                swa_rope_cache=None,
+                swa_norm_weight=None,
+                swa_norm_eps=0.0,
+            )
         outputs.append(
             backend.forward_v41(
                 query_q,
@@ -982,6 +1164,107 @@ def test_gpu_backend_decode_capture_replay_and_above_ladder(shared_pool, verify_
             query_shard=None,
         )
         assert slots.shape == (0, backend.spec.index_topk) and lens.shape == (0,)
+    torch.cuda.synchronize()
+
+
+def _seed_decode_history(backend, tables):
+    """Write a 12-token prefill history for the decode compute layers."""
+    meta = _extend(backend, tables, [12, 12], [0, 0], [0, 0], _final([12, 12], [0, 0]))
+    history = torch.randn(24, 512, device="cuda", dtype=torch.bfloat16)
+    for layer in (2, 3, 20, 24, 25):
+        dsv41.cache_scatter(
+            history,
+            backend.cache_pool.swa(layer),
+            meta.swa_write_slots,
+            backend.swa_format,
+        )
+    backend.write_global(
+        20,
+        history,
+        history[:, :128],
+        meta.positions,
+        meta.request_indices,
+        ForwardMode.EXTEND,
+        main_rope_cache=None,
+    )
+    pooled, pos, req = backend.compress(
+        2,
+        history.float(),
+        torch.randn(24, 512, device="cuda"),
+        ForwardMode.EXTEND,
+        norm_weight=None,
+        norm_eps=0.0,
+    )
+    backend.write_global(
+        2, pooled, pooled[:, :128], pos, req, ForwardMode.EXTEND, main_rope_cache=None
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_gpu_early_swa_write_replays_like_the_attention_write():
+    """A captured decode whose layers write SWA rows before forward_v41
+    (write_decode_swa) replays bit for bit like eager forward_v41 writes."""
+    torch.manual_seed(44)
+    width = 3
+    backend = _verify_backend("cuda", 2, width)
+    backend.cache_pool.arena.buffer.zero_()
+    tables = _tables("cuda")
+    inputs = (
+        torch.randn(2 * width, 512, device="cuda"),
+        torch.randn(2 * width, 512, device="cuda"),
+        torch.randn(2 * width, 2, 512, device="cuda", dtype=torch.bfloat16),
+        torch.randn(2 * width, 512, device="cuda", dtype=torch.bfloat16),
+        torch.randn(2 * width, 2, 128, device="cuda", dtype=torch.bfloat16),
+        torch.rand(2 * width, 2, device="cuda", dtype=torch.bfloat16),
+        torch.zeros(2, device="cuda"),
+    )
+    _seed_decode_history(backend, tables)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(2):
+            backend.init_forward_metadata_capture_cuda_graph(
+                2,
+                torch.zeros(2, device="cuda", dtype=torch.int64),
+                torch.ones(2, device="cuda", dtype=torch.int32),
+                ForwardMode.DECODE,
+                block_tables=tables,
+                num_tokens=2 * width,
+            )
+            _decode_compute(backend, inputs, 2 * width, early_swa=True)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            output = _decode_compute(backend, inputs, 2 * width, early_swa=True)
+    torch.cuda.current_stream().wait_stream(stream)
+    arena = backend.cache_pool.arena.buffer
+    for step, (actual, lengths) in enumerate(((2, [8, 5]), (1, [10]), (2, [11, 6]))):
+        for tensor in inputs[:-1]:
+            tensor.normal_()
+        live_tables = {
+            gid: table.flip(0) if step % 2 else table for gid, table in tables.items()
+        }
+        refresh = dict(
+            forward_mode=ForwardMode.DECODE,
+            block_tables=live_tables,
+            num_extends=0,
+            num_tokens=2 * width,
+        )
+        requests = torch.arange(actual, device="cuda", dtype=torch.int64) + step * 7
+        lens = torch.tensor(lengths, device="cuda", dtype=torch.int32)
+        before = arena.clone()
+        backend.refresh_decode_metadata(
+            2, actual, requests, lens, for_graph_replay=False, **refresh
+        )
+        expected = [t.clone() for t in _decode_compute(backend, inputs, 2 * width)]
+        expected_cache = arena.clone()
+        arena.copy_(before)
+        backend.refresh_decode_metadata(
+            2, actual, requests, lens, for_graph_replay=True, **refresh
+        )
+        graph.replay()
+        for got, want in zip(output, expected, strict=True):
+            torch.testing.assert_close(got, want, rtol=0, atol=0)
+        assert torch.equal(arena, expected_cache)
     torch.cuda.synchronize()
 
 
