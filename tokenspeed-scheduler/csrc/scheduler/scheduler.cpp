@@ -88,7 +88,8 @@ CacheKey eventKey(const CacheKey& key) {
 
 Scheduler::Scheduler(SchedulerConfig config)
     : config_{validated(std::move(config))},
-      req_pool_allocator_{config_.max_batch_size},
+      req_pool_allocator_{config_.max_resident_requests},
+      decode_slots_{config_.role == Role::kD ? config_.max_batch_size : 0},
       snapshot_slots_{config_.max_retracted_requests},
       block_pool_{config_.device_allocator.NumUsableBlocks(), slotsPerParentByGroup(config_)},
       host_pool_{hostPoolBlocks(config_), config_.host_group_packing},
@@ -468,6 +469,15 @@ std::size_t Scheduler::RetractedSize() const {
 std::size_t Scheduler::DecodingSize() const {
     return static_cast<std::size_t>(std::ranges::count_if(
         requests_, [](const std::unique_ptr<Request>& request) { return request->Is<fsm::Decoding>(); }));
+}
+
+std::size_t Scheduler::ReadyWaitingSize() const {
+    if (config_.role != Role::kD) {
+        return 0;  // Only D requests wait for a separate execution permit.
+    }
+    return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const std::unique_ptr<Request>& request) {
+        return request->Is<fsm::PrefillDone>() && !request->HasDecodeSlot();
+    }));
 }
 
 std::size_t Scheduler::PrefillSize() const {

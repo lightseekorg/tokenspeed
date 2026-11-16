@@ -279,6 +279,7 @@ def _backend(
         kv_cache_quant_method="none",
         context_len=4096,
         max_bs=8,
+        max_resident_requests=8,
         is_draft=False,
         speculative_num_draft_tokens=verify_width,
         components=(spec, mamba2),
@@ -459,6 +460,7 @@ def _super_attn_config(tp: int, kv_dtype: torch.dtype, *, is_draft: bool, device
         kernel_page_size=64,
         context_len=16384,
         max_bs=2,
+        max_resident_requests=2,
         is_draft=is_draft,
     )
 

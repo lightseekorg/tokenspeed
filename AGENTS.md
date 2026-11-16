@@ -43,6 +43,9 @@ people and average people is more than tenfold.
   does not justify defaulting a behavioral choice.
 * Wrappers must preserve explicitly supplied arguments and must not silently
   discard unsupported arguments.
+* Avoid defensive fallback. Propagate errors and fail explicitly by default.
+  Introduce fallback or automatic recovery only when justified by a concrete,
+  documented need.
 * Kernels must generalize beyond example configurations. Restrictions on
   tensor shape/layout/contiguity, communication topology, SM versions/counts,
   model names must reflect correctness requirements or measured performance
@@ -61,11 +64,10 @@ people and average people is more than tenfold.
   state, including fallback values that hide missing declarations.
 * Use the repository's full MIT license header for copyright notices; do not use
   an abbreviated copyright-only header.
-* Before creating commits, run `pre-commit run --all-files` to format.
-* Do not substitute a narrower lint command for the repository hook before
-  committing. Always run the exact `pre-commit run --all-files` command and
-  commit any formatter changes it makes.
-* When creating commits, sign off on behalf of the author.
+* Before creating commits, run exactly `pre-commit run --all-files` and
+  include any formatter changes. Do not substitute a narrower lint command.
+* When creating commits, sign off on behalf of the author. Do not list AI agents
+  as co-authors.
 
 ## Design principles
 

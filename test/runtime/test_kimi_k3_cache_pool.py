@@ -163,6 +163,7 @@ def test_kimi_k3_bf16_draft_uses_typed_view_over_fp8_target_arena() -> None:
         dtype=torch.bfloat16,
         context_len=1024,
         max_bs=1,
+        max_resident_requests=1,
         kv_cache_quant_method="none",
         components=(mla_spec,),
     )

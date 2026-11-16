@@ -89,4 +89,9 @@ private:
 using SnapshotSlotAllocator = ReqPoolAllocator;
 using SnapshotSlotIndex = ReqPoolIndex;
 
+// A decode keeps its execution permit across rounds, including finishing
+// forwards and a restore awaiting its ACK. These indices never address data.
+using DecodeSlotAllocator = ReqPoolAllocator;
+using DecodeSlotIndex = ReqPoolIndex;
+
 }  // namespace tokenspeed

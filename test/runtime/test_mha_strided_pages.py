@@ -108,6 +108,7 @@ def test_mha_pool_and_leaf_preserve_consecutive_kv_fields_with_page_padding():
         kv_cache_quant_method="none",
         context_len=4096,
         max_bs=1,
+        max_resident_requests=1,
         speculative_num_draft_tokens=8,
         components=(spec,),
     )
@@ -235,6 +236,7 @@ def test_context_write_uses_draft_router_before_proposal_publication():
             kv_cache_quant_method="none",
             context_len=512,
             max_bs=1,
+            max_resident_requests=1,
             speculative_num_draft_tokens=4,
             is_draft=draft,
             components=(component,),

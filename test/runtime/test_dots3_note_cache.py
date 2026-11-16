@@ -85,6 +85,7 @@ def _recipe(*, draft_layers: int, pd: bool):
         kv_cache_quant_method="none",
         context_len=8192,
         max_bs=2,
+        max_resident_requests=2,
         pd_disaggregation_enabled=pd,
         components=(dsa,),
     )
@@ -392,6 +393,7 @@ def test_scheduler_reuses_both_history_groups():
     config.num_snapshot_pages = 1  # The null page alone; this test does not retract.
     config.max_scheduled_tokens = 1024
     config.max_batch_size = 2
+    config.max_resident_requests = 2
     config.enable_l3_storage = False
     config.disable_l2_cache = True
     config.disable_prefix_cache = False
@@ -493,7 +495,9 @@ def dots_runtime(monkeypatch):
     from tokenspeed.runtime.layers.attention.registry import create_paged_router
 
     recipe = _recipe(draft_layers=0, pd=False)
-    recipe.attn_config = replace(recipe.attn_config, device="cuda", max_bs=3)
+    recipe.attn_config = replace(
+        recipe.attn_config, device="cuda", max_bs=3, max_resident_requests=3
+    )
     setup = recipe.setup()
     arena = CacheArena(
         _layout(recipe).bind(40),

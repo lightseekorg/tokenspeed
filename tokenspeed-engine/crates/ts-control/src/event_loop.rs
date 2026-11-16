@@ -947,10 +947,20 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         let plan = self
             .scheduler
             .next_execution_plan(allow_prefill, self.config.prefill_delay.is_some());
-        if tracing::enabled!(tracing::Level::DEBUG) {
+        let sample_ttft = self.outputs.ttft_sampling_enabled();
+        let debug = tracing::enabled!(tracing::Level::DEBUG);
+        // Reading the batch crosses FFI and copies its arrays.
+        if sample_ttft || debug {
             if let Some(batch) = plan.remote_prefill() {
-                tracing::debug!(rids = ?batch.request_ids, "remote prefill planned");
+                if sample_ttft {
+                    self.outputs.mark_planned(&batch.request_ids, true);
+                }
+                if debug {
+                    tracing::debug!(rids = ?batch.request_ids, "remote prefill planned");
+                }
             }
+        }
+        if debug {
             if let Some(batch) = plan.remote_decode() {
                 tracing::debug!(rids = ?batch.request_ids, "remote decode planned");
             }
@@ -972,6 +982,11 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             .into_iter()
             .next()
             .filter(|batch| !batch.request_ids.is_empty());
+        if sample_ttft {
+            if let Some(batch) = &forward {
+                self.outputs.mark_planned(&batch.request_ids, false);
+            }
+        }
         // The scheduler's counts as this round planned, for the metrics and
         // the batch line: nothing between the two mutates the scheduler, so
         // they are taken once, and only for a reader.
@@ -1006,6 +1021,11 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 i64::from(active_pages),
                 self.config.kv_total_pages,
                 iteration_tokens,
+            );
+            metrics.record_decode_slot_usage(
+                sizes.allocated_request_slots as i64,
+                sizes.active_decode_slots as i64,
+                sizes.ready_waiting as i64,
             );
             let total_pages = self.config.kv_total_pages;
             metrics.record_cache_occupancy(
@@ -1107,6 +1127,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             for rid in &batch.request_ids {
                 if let Some(at) = self.outputs.take_submitted_at(rid) {
                     metrics.observe_request_queue_time(at.elapsed().as_secs_f64());
+                }
+                if let Some(at) = self.outputs.take_decode_ready_at(rid) {
+                    metrics.observe_decode_ready_wait(at.elapsed().as_secs_f64());
                 }
             }
         }
@@ -2670,6 +2693,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 let resident = kv_total_pages - i64::from(sizes.empty_lcm_blocks);
                 RoundStats {
                     queued: sizes.waiting,
+                    allocated_request_slots: sizes.allocated_request_slots,
+                    active_decode_slots: sizes.active_decode_slots,
+                    ready_waiting: sizes.ready_waiting,
                     active_pages: active,
                     cached_pages: (resident - active).max(0),
                     pd: [

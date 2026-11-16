@@ -32,6 +32,9 @@ identity never changes the request's seed.
 The host record fixes stop criteria for the lifetime of an admission, so
 stop binding uses that identity without a second key containing the criteria.
 A later request reusing the public RID still receives a new identity.
+Adaptive DSpark confidence and verification feedback use the same admission
+identity, so a reused public RID cannot retain the previous admission’s
+predictions. Retraction preserves confidence for the restored admission.
 
 A retraction keeps the admission identity. A sampler snapshot records whether
 that admission prepared the slot: an image taken before the first local
@@ -134,6 +137,13 @@ output tensors allocated during capture. This applies to active and idle DP
 ranks; callers need not establish an inference context.
 
 ### Buffer sizing: the ladder is a performance subset, never a capacity limit
+
+Request slot capacity is independent of forward batch capacity. PD decode
+extra slots increase the real request range to 1..C, keep null row 0, and
+place padding at C+1. Persistent state indexed by request slot covers C+2
+rows. A batch of at most B requests can contain a slot index greater than B;
+batch-indexed inputs, metadata, graph buckets and scratch remain bounded by
+B. Passing a larger resident pool must not enlarge the execution ladder.
 
 `ForwardStepRunner` distinguishes `max_capture_bs` (top of the capture ladder,
 bounded by `max_cudagraph_capture_size`) from `max_decode_bs`
@@ -522,7 +532,7 @@ MegaMoE routes every row.
 
 ### Pointer-stable per-bs views from one builder
 
-Per-bs metadata objects (each leaf's `_decode_views_by_bs[bs]`, the router's
+Per-bs metadata objects (each leaf's `_decode_views_by_shape[(bs, num_tokens)]`, the router's
 `decode_write_locations` views) are views over the persistent buffers, built
 by a single per-bs builder shared by capture and refresh, cached per bs. A bs
 never captured (above-ladder decode, enforce-eager) builds its views lazily
@@ -2727,6 +2737,27 @@ partial-output reduction; SWA and compressor tails remain replicated. See
 [the V4.1 context-parallel contract](deepseek-v41-context-parallelism.md) for
 ownership, graph lifetime and supported configurations.
 
+### V4.1 context encoder/decoder with attention DP
+
+Ordinary EP supports attention, dense, and MoE TP1 with attention DP; other
+ordinary-EP attention-DP layouts are rejected during model construction. Its
+prefills require `--disable-prefill-graph`: CED narrowing changes each rank's
+decoder row count, which eager execution exchanges on a dedicated host
+process group before the CED source layer and again before the remaining
+decoder layers. Idle ranks enter the same exchanges and expert collectives
+with zero rows. The stage-local counts are restored after each stage; decode
+keeps the scheduler's graph-compatible counts. Fused EP retains its own
+dispatch and row-count exchange.
+
+For mixed text/image prefills, ordinary EP gathers the routing mask with
+the activations in eight additional aligned lanes. The mask therefore
+follows the same rank and row order as the gathered activations, including
+when a local CED tail is empty.
+
+The runtime's single-GPU CI task launches the two-process Gloo regression
+automatically. Its tensors stay on CPU; a visible accelerator is required
+to import the runtime's platform-dependent components.
+
 ### Distributed draft tuning
 
 The startup draft decode uses one request per attention TP rank so that
@@ -2745,3 +2776,20 @@ tuning, so startup tuning has no cross-rank collectives: the draft decode
 warmup uses `min(attn_tp_size, max_decode_bs)` requests, and an empty peer
 skips its GEMMs as it does when serving fewer requests than peers. Decode
 state stays sized by `--max-num-seqs`.
+
+
+### Adaptive DSpark query capacities
+
+Graph variants can include a query-capacity suffix (variant:queryN).
+Native full-width execution retains its original key. Packed verification
+refreshes decode_query_indptr and packed rows in persistent buffers before
+replay; V4.1 pointer-stable views are keyed by (bs, num_tokens).
+
+Attention DP ranks agree on one physical capacity while actual request
+counts may differ or be zero. Padding retains one physical anchor, contributes
+no acceptance reward, writes to the dummy slot and discards outputs.
+The live-row mask must exclude padding from expert-load accounting.
+
+DP budget metadata uses the global attention host group. Startup's
+authoritative TP packet broadcast uses a TP-local host group: different
+DP groups must not supply different roots to the same global collective.
