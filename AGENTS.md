@@ -43,6 +43,12 @@ people and average people is more than tenfold.
   does not justify defaulting a behavioral choice.
 * Wrappers must preserve explicitly supplied arguments and must not silently
   discard unsupported arguments.
+* Kernels must generalize beyond example configurations. Restrictions on
+  tensor shape/layout/contiguity, communication topology, SM versions/counts,
+  model names must reflect correctness requirements or measured performance
+  tradeoffs, not just tested configurations. Derive launch parameters from
+  inputs and hardware properties where possible. Verify the intended kernel
+  is selected; passing through a fallback can hide performance regressions.
 * Use absolute imports instead of relative imports.
 * Use f-strings for Python string interpolation, including logging messages.
   Keep format templates required by APIs such as `strftime` and logging

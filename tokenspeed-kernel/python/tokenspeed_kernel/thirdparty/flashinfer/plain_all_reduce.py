@@ -49,8 +49,8 @@ def plain_all_reduce_support_error(group, hidden_size, max_num_tokens, dtype):
     if not torch.cuda.is_available():
         return "CUDA is unavailable"
     device = torch.device("cuda", torch.cuda.current_device())
-    if torch.cuda.get_device_capability(device) != (10, 3):
-        return "the plain BT all-reduce presets are measured on SM103"
+    if torch.cuda.get_device_capability(device) < (10, 0):
+        return "the plain BT all-reduce requires SM100 or newer"
     try:
         import torch.distributed._symmetric_memory as symm_mem
         from flashinfer.comm import allreduce_fusion
