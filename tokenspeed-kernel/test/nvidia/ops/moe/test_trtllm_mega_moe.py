@@ -340,6 +340,17 @@ def run_correctness(
         output = run()
     torch.cuda.synchronize()
     _check(output, expected, "eager")
+    if (
+        capacity <= 4
+        and min(capacity, 2) * TOP_K <= 32
+        and TOP_K % 2 == 0
+        and dist.get_world_size() <= 32
+    ):
+        assert all(
+            kernel.dense_routing
+            for (kernel_capacity, _), kernel in runner.workspace.kernels.items()
+            if kernel_capacity == capacity
+        )
     # Later capacity changes overwrite producer views. Keep each graph's
     # source inputs independent so every replay stages its own data again.
     x, ids, weights = external_inputs
@@ -450,6 +461,35 @@ def run_correctness(
             f"PASS NVFP4 {activation} MegaMoE eager, graph replay, idle ranks, and shared-arena capacity switching",
             flush=True,
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(("top_k", "capacity"), [(8, 4), (32, 1)])
+def test_dense_routing_other_geometry(top_k, capacity, monkeypatch):
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("requires SM100/SM103")
+    monkeypatch.setitem(globals(), "HIDDEN", 512)
+    monkeypatch.setitem(globals(), "LOCAL_EXPERTS", 40)
+    monkeypatch.setitem(globals(), "TOP_K", top_k)
+    monkeypatch.delenv("MEGAMOE_TACTIC_AUTOTUNE", raising=False)
+    maximum = get_autotune_max_num_tokens()
+    with tempfile.TemporaryDirectory() as tmp:
+        dist.init_process_group(
+            "nccl",
+            init_method=f"file://{tmp}/rendezvous",
+            rank=0,
+            world_size=1,
+            timeout=timedelta(minutes=10),
+            device_id=torch.cuda.current_device(),
+        )
+        try:
+            set_autotune_max_num_tokens(capacity)
+            set_autotune_process_group(dist.group.WORLD)
+            run_correctness(capacity, capacity, False, "silu", 128, prequantized=True)
+        finally:
+            set_autotune_process_group(None)
+            set_autotune_max_num_tokens(maximum)
+            dist.destroy_process_group()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

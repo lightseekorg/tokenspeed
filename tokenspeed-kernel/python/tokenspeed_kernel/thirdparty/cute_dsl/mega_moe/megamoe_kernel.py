@@ -167,31 +167,16 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         *,
         world_size: int,
         num_topk: int,
-        hidden: int,
-        static_expert_shape: Optional[Tuple[int, int, int]],
         max_tokens_per_rank: int,
-        situ_beta: Optional[float],
-        situ_linear_beta: Optional[float],
-        token_back_mode: str,
-        combine_format: CombineFormat,
-        fc2_output_dtype: Type[cutlass.Numeric],
+        routing_id_dtype: Type[cutlass.Numeric],
     ) -> bool:
-        """Whether dense routing is implemented for this shape.
-
-        Its fixed routing-ID scratch and receive-metadata ballots are laid out
-        and validated for Kimi-K3 at EP16 (56 local experts) only.
-        """
+        """Check the routing limits and 8-byte ID-word layout."""
         return (
-            world_size == 16
-            and num_topk == 16
-            and hidden == 3584
-            and static_expert_shape == (56, 6144, 3584)
-            and max_tokens_per_rank in (1, 2, 4)
-            and situ_beta == 4.0
-            and situ_linear_beta == 25.0
-            and token_back_mode == "epi_warps"
-            and not combine_format.is_quantized
-            and fc2_output_dtype is cutlass.BFloat16
+            1 <= world_size <= 32
+            and 1 <= max_tokens_per_rank <= 4
+            and min(max_tokens_per_rank, 2) * num_topk <= 32
+            and routing_id_dtype in (cutlass.Int32, cutlass.Int64)
+            and num_topk % (64 // routing_id_dtype.width) == 0
         )
 
     def __init__(
@@ -247,21 +232,6 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         self.dense_routing = dense_routing
         if not isinstance(dense_routing, bool):
             raise ValueError("dense_routing must be bool")
-        if dense_routing and not self.supports_dense_routing(
-            world_size=world_size,
-            num_topk=num_topk,
-            hidden=hidden,
-            static_expert_shape=static_expert_shape,
-            max_tokens_per_rank=max_tokens_per_rank,
-            situ_beta=situ_beta,
-            situ_linear_beta=situ_linear_beta,
-            token_back_mode=token_back_mode,
-            combine_format=combine_format,
-            fc2_output_dtype=fc2_output_dtype,
-        ):
-            raise ValueError(
-                "dense_routing requires K3 EP16 capacity 1/2/4 BF16 epi_warps"
-            )
         # Checked here as well because in_kernel_fc2_reduce kernels build no
         # TopkReduce; the option list lives with the reducer.
         if (
@@ -1108,16 +1078,19 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         contract may be tightened later to have the kernel take
         ownership of the reset.
         """
-        # Dense routing reads peer ``topk_idx`` tables in their element width
-        # (``dispatch_dense_routing``) and widens the ids into Int64 scratch;
-        # only the two integer widths it is written for are accepted.
         if cutlass.const_expr(
             self.dense_routing
-            and topk_idx.element_type not in (cutlass.Int32, cutlass.Int64)
+            and not self.supports_dense_routing(
+                world_size=self.world_size,
+                num_topk=self.num_topk,
+                max_tokens_per_rank=self.max_tokens_per_rank,
+                routing_id_dtype=topk_idx.element_type,
+            )
         ):
-            raise TypeError(
-                "dense_routing requires Int32 or Int64 topk_idx, "
-                f"got {topk_idx.element_type}."
+            raise ValueError(
+                "dense_routing requires 1-32 ranks, 1-4 tokens per rank, "
+                "at most 32 IDs in the first two rows, and Int32/Int64 "
+                "routing rows containing whole 8-byte words"
             )
         # Peers fetch two adjacent ids per 8-byte word, so columns must be
         # contiguous; the row stride itself is read from the layout.

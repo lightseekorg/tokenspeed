@@ -241,27 +241,11 @@ class MegaMoEWorkspace:
         # worker fewer hidden elements so the reduction spreads over more
         # threads. The fused tail does not use the standalone reducer.
         bf16_hidden_per_thread = 2 if small_token and not fuse_bf16_reduce else 8
-        static_expert_shape = (
-            self.num_experts // self.world,
-            2 * self.intermediate,
-            self.hidden,
-        )
-        combine_format = CombineFormat.parse("bf16")
-        # With at most a few tokens per rank, dispatch scans every peer's
-        # top-k id table directly instead of the counter protocol, where the
-        # kernel implements it. The collective caller supplies one capacity
-        # for all EP ranks.
-        dense_routing = small_token and Sm100MegaMoEKernel.supports_dense_routing(
+        dense_routing = Sm100MegaMoEKernel.supports_dense_routing(
             world_size=self.world,
             num_topk=self.top_k,
-            hidden=self.hidden,
-            static_expert_shape=static_expert_shape,
             max_tokens_per_rank=capacity,
-            situ_beta=self.situ_beta,
-            situ_linear_beta=self.situ_linear_beta,
-            token_back_mode=token_back,
-            combine_format=combine_format,
-            fc2_output_dtype=cutlass.BFloat16,
+            routing_id_dtype=cutlass.Int32,
         )
         return Sm100MegaMoEKernel(
             mma_tiler_mnk=(256, tile_n, 256),
@@ -271,7 +255,11 @@ class MegaMoEWorkspace:
             token_padding_block=64,
             sf_padding_block=128,
             load_balance_mode=scheduler,
-            static_expert_shape=static_expert_shape,
+            static_expert_shape=(
+                self.num_experts // self.world,
+                2 * self.intermediate,
+                self.hidden,
+            ),
             force_static_sched=True,
             clc_bundle_size=None,
             num_sched_stages=None,
@@ -286,7 +274,7 @@ class MegaMoEWorkspace:
             fuse_bf16_reduce=fuse_bf16_reduce,
             bf16_hidden_per_thread=bf16_hidden_per_thread,
             dense_routing=dense_routing,
-            combine_format=combine_format,
+            combine_format=CombineFormat.parse("bf16"),
             non_ubulk_fc2_store=token_back != "epi_warps",
             in_kernel_fc2_reduce=False,
             token_back_mode=token_back,

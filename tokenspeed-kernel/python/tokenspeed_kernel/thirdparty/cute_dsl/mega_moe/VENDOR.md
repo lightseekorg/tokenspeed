@@ -64,9 +64,12 @@ preserving the original FP32 top-k accumulation order. Fused capacities 4
 through 32 and other shapes keep eight elements per worker. Both kernel
 constructors receive the worker width explicitly, and the cache key includes it.
 
-For the K3 SM100/SM103 EP16 shape only (56 experts per rank;
-`Sm100MegaMoEKernel.supports_dense_routing`), capacities 1, 2 and 4 read the small peer
-routing-ID table and build the original receive counts and metadata locally.
+Dense routing reads the small peer routing-ID table and builds the original
+receive counts and metadata locally. `Sm100MegaMoEKernel.supports_dense_routing`
+checks the implementation bounds: 1-32 ranks, up to four token rows, and up to
+32 routing IDs in the first two rows (top-k up to 32 at capacity 1, or 16 at
+larger capacities). Int32 IDs require an even top-k because peer loads use
+8-byte words.
 The caller supplies one capacity bound for all EP ranks. Unused token rows
 contain -1 IDs. The IDs use the existing symmetric input allocation, so
 producer views need no extra staging copy. The entry retains two grid barriers
