@@ -40,7 +40,6 @@ NATIVE_PACKAGES = {
     "tokenspeed-flashmla",
     "tokenspeed-fast-hadamard-transform",
     "tokenspeed-fa3",
-    "tokenspeed-trtllm-kernel",
     "tokenspeed-flashkda",
 }
 

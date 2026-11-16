@@ -255,6 +255,174 @@ def test_rebinding_cache_pool_drops_pool_derived_state():
     assert backend._decode_buffers is not old_buffers
 
 
+def _refresh_decode(backend, tables, actual, seq_lens):
+    backend.refresh_decode_metadata(
+        2,
+        actual,
+        torch.tensor([0, 1]),
+        torch.tensor(seq_lens),
+        forward_mode=ForwardMode.DECODE,
+        block_tables=tables,
+        num_extends=0,
+        for_graph_replay=True,
+    )
+    return backend.query_metadata(ForwardMode.DECODE)
+
+
+@pytest.mark.parametrize("rope", [False, True])
+def test_decode_swa_written_early_is_the_attention_write(monkeypatch, rope):
+    """write_decode_swa is forward_v41's own decode SWA write, issued earlier.
+
+    The cache bytes and the attention inputs match a plain forward_v41 bit
+    for bit, the write runs once, and forward_v41 skips it after an early one.
+    """
+    backend = _backend("cpu", 2)
+    tables = _tables("cpu")
+    cache_bytes = backend.cache_pool.arena.buffer
+    writes = []
+
+    def scatter(values, cache, slots, positions):
+        writes.append((values, slots, positions))
+        live = slots >= 0
+        rows = slots[live].long()
+        # A deterministic stand-in for the quantizing writers.
+        cache[rows // 64, rows % 64, :16] = (
+            values[live, :16].float().mul(7).round().to(torch.int64) % 251
+        ).to(torch.uint8)
+
+    monkeypatch.setattr(
+        dsv41,
+        "cache_scatter",
+        lambda values, cache, slots, fmt: scatter(values, cache, slots, None),
+    )
+    monkeypatch.setattr(
+        dsv41,
+        "swa_rope_scatter",
+        lambda values, positions, rope_table, cache, slots, fmt, out, weight, eps: (
+            scatter(values, cache, slots, positions)
+        ),
+    )
+    attended = []
+
+    def fused_attention(q, cache, *args):
+        # Read the SWA field the way attention would: after the write.
+        attended.append((cache.clone(), args[0], args[1]))
+        return q, q
+
+    def attention(q, cache, *args, lse):
+        attended.append((cache.clone(), args[0], args[1]))
+        return q
+
+    monkeypatch.setattr(dsv41, "selected_attention_fp8", fused_attention)
+    monkeypatch.setattr(dsv41, "selected_attention", attention)
+    meta = _refresh_decode(backend, tables, 2, [9, 70])
+    n = meta.positions.numel()
+    torch.manual_seed(7)
+    q = torch.randn(n, 64, 512).to(torch.bfloat16)
+    swa = torch.randn(n, 512).to(torch.bfloat16)
+    rope_table = torch.zeros(256, 64) if rope else None
+    norm_weight = torch.ones(512, dtype=torch.bfloat16) if rope else None
+
+    def forward(early):
+        cache_bytes.zero_()
+        writes.clear()
+        attended.clear()
+        backend.begin_indexer_forward()
+        if early:
+            backend.write_decode_swa(
+                1,
+                swa,
+                meta.positions,
+                meta.request_indices,
+                ForwardMode.DECODE,
+                swa_rope_cache=rope_table,
+                swa_norm_weight=norm_weight,
+                swa_norm_eps=1e-6,
+            )
+            # Written now, before the attention call.
+            assert len(writes) == 1
+        backend.forward_v41(
+            q,
+            swa,
+            layer_id=1,
+            positions=meta.positions,
+            request_indices=meta.request_indices,
+            forward_mode=ForwardMode.DECODE,
+            index_q=None,
+            index_weights=None,
+            attn_sink=torch.zeros(64),
+            softmax_scale=512**-0.5,
+            index_process_group=None,
+            swa_rope_cache=rope_table,
+            swa_norm_weight=norm_weight,
+            swa_norm_eps=1e-6,
+            # Only the fused path takes the deferred-RoPE SWA rows.
+            fused_decode_groups=8 if rope else None,
+            key_rows=None,
+        )
+        backend.end_indexer_forward()
+        assert len(writes) == 1 and len(attended) == 1
+        assert not backend._prepared_swa_writes
+        return cache_bytes.clone(), list(writes[0]), attended[0]
+
+    plain_bytes, plain_write, plain_attended = forward(False)
+    early_bytes, early_write, early_attended = forward(True)
+    assert plain_bytes.any() and torch.equal(early_bytes, plain_bytes)
+    values, slots, positions = early_write
+    assert values is swa and slots is meta.swa_write_slots
+    assert positions is (meta.positions if rope else None)
+    assert plain_write[0] is swa and plain_write[1] is slots
+    for got, want in zip(early_attended, plain_attended, strict=True):
+        assert torch.equal(got, want)
+
+    common = dict(swa_rope_cache=rope_table, swa_norm_weight=norm_weight)
+    write = (1, swa, meta.positions, meta.request_indices, ForwardMode.DECODE)
+    with pytest.raises(ValueError, match="decode rows only"):
+        backend.write_decode_swa(
+            *write[:4], ForwardMode.EXTEND, **common, swa_norm_eps=1e-6
+        )
+    # Rows outside the refreshed decode window are left to forward_v41.
+    writes.clear()
+    assert not backend.write_decode_swa(
+        1,
+        swa,
+        meta.positions.clone(),
+        meta.request_indices,
+        ForwardMode.DECODE,
+        **common,
+        swa_norm_eps=1e-6,
+    )
+    assert not writes and not backend._prepared_swa_writes
+    assert backend.write_decode_swa(*write, **common, swa_norm_eps=1e-6)
+    with pytest.raises(RuntimeError, match="already wrote"):
+        backend.write_decode_swa(*write, **common, swa_norm_eps=1e-6)
+    # The attention must consume the rows it wrote.
+    with pytest.raises(RuntimeError, match="other SWA rows"):
+        backend.forward_v41(
+            q,
+            swa.clone(),
+            layer_id=1,
+            positions=meta.positions,
+            request_indices=meta.request_indices,
+            forward_mode=ForwardMode.DECODE,
+            index_q=None,
+            index_weights=None,
+            attn_sink=torch.zeros(64),
+            softmax_scale=512**-0.5,
+            index_process_group=None,
+            swa_rope_cache=rope_table,
+            swa_norm_weight=norm_weight,
+            swa_norm_eps=1e-6,
+            fused_decode_groups=8 if rope else None,
+            key_rows=None,
+        )
+    # A refresh drops a write no attention consumed.
+    backend.write_decode_swa(*write, **common, swa_norm_eps=1e-6)
+    assert backend._prepared_swa_writes
+    _refresh_decode(backend, tables, 2, [9, 70])
+    assert not backend._prepared_swa_writes
+
+
 def _tables(device):
     packing = _config(device).component(DeepseekV41Config).row_layout().group_packing
     return _tables_with_packing(device, packing)
@@ -713,7 +881,7 @@ def test_decoder_view_keeps_compute_rows_and_selects_only_valid_logits():
     ) == (view.metadata, view.spans)
 
 
-def _decode_compute(backend, inputs, bs):
+def _decode_compute(backend, inputs, bs, early_swa=False):
     backend.begin_indexer_stage()
     content, scores, q, swa, iq, iw, sink = inputs
     mode = ForwardMode.DECODE
@@ -738,6 +906,20 @@ def _decode_compute(backend, inputs, bs):
             query_q, query_swa = query_q[order], query_swa[order]
             query_iq, query_iw = query_iq[order], query_iw[order]
         source = layer in (2, 20, 24)
+        if early_swa:
+            # As an index-source layer writes its SWA rows inside its fork.
+            # From layer 24 the rows are reordered, not the refreshed window,
+            # so the write declines and forward_v41 writes them.
+            backend.write_decode_swa(
+                layer,
+                query_swa,
+                pos,
+                req,
+                mode,
+                swa_rope_cache=None,
+                swa_norm_weight=None,
+                swa_norm_eps=0.0,
+            )
         outputs.append(
             backend.forward_v41(
                 query_q,
@@ -982,6 +1164,107 @@ def test_gpu_backend_decode_capture_replay_and_above_ladder(shared_pool, verify_
             query_shard=None,
         )
         assert slots.shape == (0, backend.spec.index_topk) and lens.shape == (0,)
+    torch.cuda.synchronize()
+
+
+def _seed_decode_history(backend, tables):
+    """Write a 12-token prefill history for the decode compute layers."""
+    meta = _extend(backend, tables, [12, 12], [0, 0], [0, 0], _final([12, 12], [0, 0]))
+    history = torch.randn(24, 512, device="cuda", dtype=torch.bfloat16)
+    for layer in (2, 3, 20, 24, 25):
+        dsv41.cache_scatter(
+            history,
+            backend.cache_pool.swa(layer),
+            meta.swa_write_slots,
+            backend.swa_format,
+        )
+    backend.write_global(
+        20,
+        history,
+        history[:, :128],
+        meta.positions,
+        meta.request_indices,
+        ForwardMode.EXTEND,
+        main_rope_cache=None,
+    )
+    pooled, pos, req = backend.compress(
+        2,
+        history.float(),
+        torch.randn(24, 512, device="cuda"),
+        ForwardMode.EXTEND,
+        norm_weight=None,
+        norm_eps=0.0,
+    )
+    backend.write_global(
+        2, pooled, pooled[:, :128], pos, req, ForwardMode.EXTEND, main_rope_cache=None
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_gpu_early_swa_write_replays_like_the_attention_write():
+    """A captured decode whose layers write SWA rows before forward_v41
+    (write_decode_swa) replays bit for bit like eager forward_v41 writes."""
+    torch.manual_seed(44)
+    width = 3
+    backend = _verify_backend("cuda", 2, width)
+    backend.cache_pool.arena.buffer.zero_()
+    tables = _tables("cuda")
+    inputs = (
+        torch.randn(2 * width, 512, device="cuda"),
+        torch.randn(2 * width, 512, device="cuda"),
+        torch.randn(2 * width, 2, 512, device="cuda", dtype=torch.bfloat16),
+        torch.randn(2 * width, 512, device="cuda", dtype=torch.bfloat16),
+        torch.randn(2 * width, 2, 128, device="cuda", dtype=torch.bfloat16),
+        torch.rand(2 * width, 2, device="cuda", dtype=torch.bfloat16),
+        torch.zeros(2, device="cuda"),
+    )
+    _seed_decode_history(backend, tables)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(2):
+            backend.init_forward_metadata_capture_cuda_graph(
+                2,
+                torch.zeros(2, device="cuda", dtype=torch.int64),
+                torch.ones(2, device="cuda", dtype=torch.int32),
+                ForwardMode.DECODE,
+                block_tables=tables,
+                num_tokens=2 * width,
+            )
+            _decode_compute(backend, inputs, 2 * width, early_swa=True)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            output = _decode_compute(backend, inputs, 2 * width, early_swa=True)
+    torch.cuda.current_stream().wait_stream(stream)
+    arena = backend.cache_pool.arena.buffer
+    for step, (actual, lengths) in enumerate(((2, [8, 5]), (1, [10]), (2, [11, 6]))):
+        for tensor in inputs[:-1]:
+            tensor.normal_()
+        live_tables = {
+            gid: table.flip(0) if step % 2 else table for gid, table in tables.items()
+        }
+        refresh = dict(
+            forward_mode=ForwardMode.DECODE,
+            block_tables=live_tables,
+            num_extends=0,
+            num_tokens=2 * width,
+        )
+        requests = torch.arange(actual, device="cuda", dtype=torch.int64) + step * 7
+        lens = torch.tensor(lengths, device="cuda", dtype=torch.int32)
+        before = arena.clone()
+        backend.refresh_decode_metadata(
+            2, actual, requests, lens, for_graph_replay=False, **refresh
+        )
+        expected = [t.clone() for t in _decode_compute(backend, inputs, 2 * width)]
+        expected_cache = arena.clone()
+        arena.copy_(before)
+        backend.refresh_decode_metadata(
+            2, actual, requests, lens, for_graph_replay=True, **refresh
+        )
+        graph.replay()
+        for got, want in zip(output, expected, strict=True):
+            torch.testing.assert_close(got, want, rtol=0, atol=0)
+        assert torch.equal(arena, expected_cache)
     torch.cuda.synchronize()
 
 
@@ -3120,8 +3403,8 @@ def test_one_index_graph_crosses_coverage_limits_with_padding(
     if current_platform().is_blackwell:
         from tokenspeed_kernel.ops.attention.dsv41 import deep_gemm
 
-        sparse_scores = Mock(wraps=deep_gemm._sparse_candidate_scores)
-        monkeypatch.setattr(deep_gemm, "_sparse_candidate_scores", sparse_scores)
+        sparse_scores = Mock(wraps=deep_gemm._sparse_candidate_logits)
+        monkeypatch.setattr(deep_gemm, "_sparse_candidate_logits", sparse_scores)
     cache = backend.cache_pool.index_k(20)
     logical = torch.arange(256, device="cuda")
     slots = tables[R1][0, logical // 64].long() * 64 + logical % 64
@@ -3276,6 +3559,174 @@ def test_reordered_decode_index_topk_across_kv_split():
         assert backend.sparse_topk.decode.logical_rows.tolist() == expected
 
 
+def test_decode_index_call_resolves_its_slots():
+    """Each decode source's one index_topk call also resolves its rows'
+    physical slots, which select_global returns instead of running
+    global_read_slots; they equal global_read_slots of the selected rows."""
+    backend = _backend("cpu", 2)
+    backend.refresh_decode_metadata(
+        2,
+        2,
+        torch.tensor([0, 1]),
+        torch.tensor([300, 77]),
+        forward_mode=ForwardMode.DECODE,
+        block_tables=_tables("cpu"),
+        num_extends=0,
+        for_graph_replay=True,
+    )
+    meta = backend.query_metadata(ForwardMode.DECODE)
+    q = torch.zeros(2, 2, 128, dtype=torch.bfloat16)
+    weights = torch.ones(2, 2, dtype=torch.bfloat16)
+
+    def scored(*args, **kwargs):
+        visible, out = args[4], args[12]
+        # Rows spaced 70 apart, back from the newest, span several pages. The
+        # first future row tests the slots' causality bound.
+        for ids, counts, stride in ((out[0], out[1], 70), (out[2], out[3], 3)):
+            values = (visible[:, None] - 1) // (8 if stride == 3 else 1)
+            values = values - torch.arange(ids.shape[1]) * stride
+            ids.copy_(values.masked_fill(values < 0, -1))
+            counts.copy_((ids >= 0).sum(dim=1))
+        out[0][:, -1] = visible
+        request = kwargs.get("slots")
+        if request is not None:
+            # The index_topk contract: global_slots of the selected rows.
+            request.out.copy_(
+                dsv41.global_slots(
+                    out[0],
+                    request.positions,
+                    request.requests,
+                    request.table,
+                    request.ratio,
+                    request.pages,
+                )
+            )
+        return out
+
+    layers = (2, 3, 20, 24, 25)
+    results = []
+    with patch.object(dsv41, "index_topk", side_effect=scored) as topk:
+        for layer in layers:
+            source = layer in (2, 20, 24)
+            slots, lengths = backend.select_global(
+                layer,
+                q if source else None,
+                weights if source else None,
+                meta.positions,
+                meta.request_indices,
+                ForwardMode.DECODE,
+                None,
+                query_shard=None,
+            )
+            record = backend.sparse_topk.decode
+            results.append((slots, lengths, record.logical_rows, record.owner))
+    calls = topk.call_args_list
+    assert len(calls) == 3
+    # Sources return the slots their index call wrote; Reuse layers share them.
+    for (slots, _, _, _), call in zip((results[0], results[2], results[3]), calls):
+        assert slots is call.kwargs["slots"].out
+    assert results[1][0] is results[0][0] and results[4][0] is results[3][0]
+    for slots, _, rows, owner in results:
+        expected = backend.global_read_slots(
+            owner, rows, meta.positions, meta.request_indices, ForwardMode.DECODE
+        )
+        torch.testing.assert_close(slots, expected, rtol=0, atol=0)
+    slots, _, rows, _ = results[0]
+    resolved = slots >= 0
+    assert resolved[:, :-1].equal(rows[:, :-1] >= 0) and resolved.sum() > 2
+    assert not resolved[:, -1].any()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_decode_graph_slots_match_global_read_slots():
+    """A captured decode graph, whose index calls resolve their slots, replays
+    the slots, rows, lengths and candidates of an eager selection that
+    resolves slots with global_read_slots after selecting.
+
+    Blackwell runs the native fused kernel (32 index heads); other GPUs keep
+    their selection and resolve the requested slots after it.
+    """
+    verify_width = 3
+    backend = _verify_backend("cuda", 2, verify_width)
+    packing = {
+        group.group_id: group.cache_blocks_per_lcm_block
+        for group in backend.cache_pool.arena.plan.groups
+    }
+    tables = _tables_with_packing("cuda", packing)
+    backend.cache_pool.arena.buffer.zero_()
+    torch.manual_seed(1110)
+    for owner, group in ((2, R2), (8, R2), (20, R1)):
+        logical = torch.arange(tables[group].shape[1] * 64, device="cuda")
+        for request in range(2):
+            slots = tables[group][request, logical // 64].long() * 64 + logical % 64
+            dsv41.cache_scatter(
+                torch.randn(logical.numel(), 128, device="cuda", dtype=torch.bfloat16),
+                backend.cache_pool.index_k(owner),
+                slots,
+                backend.index_format,
+            )
+    heads = 32 if current_platform().is_blackwell else 2
+    q = torch.randn(2 * verify_width, heads, 128, device="cuda", dtype=torch.bfloat16)
+    weights = torch.rand(2 * verify_width, heads, device="cuda", dtype=torch.bfloat16)
+    requests = torch.arange(2, device="cuda")
+    seq_lens = torch.zeros(2, dtype=torch.int32, device="cuda")
+
+    def refresh(lengths, use_graph):
+        seq_lens.copy_(torch.tensor(lengths, dtype=torch.int32))
+        backend.refresh_decode_metadata(
+            2,
+            sum(length > 0 for length in lengths),
+            requests,
+            seq_lens,
+            forward_mode=ForwardMode.DECODE,
+            block_tables=tables,
+            for_graph_replay=use_graph,
+        )
+
+    def run():
+        backend.begin_indexer_stage()
+        meta = backend.query_metadata(ForwardMode.DECODE)
+        outputs = []
+        for layer in (2, 3, 8, 20, 24, 28):
+            source = layer != 3
+            outputs.extend(
+                backend.select_global(
+                    layer,
+                    q if source else None,
+                    weights if source else None,
+                    meta.positions,
+                    meta.request_indices,
+                    ForwardMode.DECODE,
+                    None,
+                    query_shard=None,
+                )
+            )
+        record = backend.sparse_topk.decode
+        candidates = record.candidates
+        return outputs + [record.logical_rows, candidates.block_ids, candidates.lengths]
+
+    refresh([300, 120], True)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        run()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            captured = run()
+    torch.cuda.current_stream().wait_stream(stream)
+    for lengths in ([300, 120], [1, 65], [509, 0], [129, 257]):
+        refresh(lengths, True)
+        graph.replay()
+        fused = [tensor.clone() for tensor in captured]
+        refresh(lengths, False)
+        # Without a slot request the backend selects first and resolves the
+        # rows with global_read_slots, the path the request replaces.
+        with patch.object(dsv41, "SelectionSlots", return_value=None):
+            unfused = run()
+        for got, want in zip(fused, unfused, strict=True):
+            torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
 def test_index_geometry_reuse_and_forward_lifetime():
     backend = _backend("cpu", 2)
     tables = _tables("cpu")
@@ -3320,6 +3771,165 @@ def test_index_geometry_reuse_and_forward_lifetime():
         refreshed = prepare(positions, requests, R2, 2)
         assert refreshed is not previous
         torch.testing.assert_close(refreshed.lengths, previous.lengths - 16)
+
+
+def _score_own_history(
+    q,
+    weights,
+    cache,
+    table,
+    visible,
+    candidates,
+    topk,
+    candidate_topk,
+    block_size,
+    query_chunk,
+    score_chunk,
+    group,
+    out,
+    solution,
+    index_metadata,
+):
+    """index_topk stand-in: as in dense scoring, a row reads only [0, visible)
+    of its own table row and scores it against its own query."""
+    columns = torch.arange(table.shape[1] * 64)
+    slots = table.long().repeat_interleave(64, dim=1) * 64 + columns % 64
+    scores = torch.sin(slots * 0.7 + q.float().sum(dim=(1, 2))[:, None])
+    scores = scores.masked_fill((columns >= visible[:, None]) | (slots < 0), -torch.inf)
+    for ids, counts, k, width in (
+        (out[0], out[1], topk, 1),
+        (out[2], out[3], candidate_topk, 8),
+    ):
+        best = scores.view(len(scores), -1, width).amax(dim=2).topk(k, dim=1)
+        picked = best.indices.masked_fill(best.values == -torch.inf, 1 << 30)
+        picked = picked.sort(dim=1).values
+        ids.copy_(picked.masked_fill(picked == 1 << 30, -1))
+        counts.copy_((ids >= 0).sum(dim=1))
+    return out
+
+
+def test_early_decode_index_geometry_is_what_the_layers_build(monkeypatch):
+    """The decode prebuilds build the selection
+    geometry the index sources would build inside select_global, and prepare
+    index_topk with exactly the inputs those layers then score: selections
+    match bit for bit, and no layer builds a selection table itself."""
+    backend = _backend("cpu", 2)
+    tables = _tables("cpu")
+    seen, prepared = [], []
+
+    def scored(*args, slots=None):
+        q, _, cache, table, visible, candidates, topk = args[:7]
+        seen.append((cache, table, visible, candidates, args[7], args[9], args[14]))
+        if candidates is None:
+            out = _score_own_history(*args)
+        else:
+            # Reindex: the first rows of each query's visible candidate blocks.
+            out = args[12]
+            rows = candidates.clamp_min(0).long()[:, :, None] * 8 + torch.arange(8)
+            rows = rows.flatten(1)
+            hidden = (candidates < 0).repeat_interleave(8, dim=1)
+            rows = rows.masked_fill(hidden | (rows >= visible[:, None]), 1 << 30)
+            picked = rows.sort(dim=1).values[:, :topk]
+            out[0].copy_(picked.masked_fill(picked == 1 << 30, -1))
+            out[1].copy_((out[0] >= 0).sum(dim=1))
+        if slots is not None:
+            # Decode asks for the index_topk contract's slots: global_slots of
+            # the selected rows.
+            slots.out.copy_(
+                dsv41.global_slots(
+                    out[0],
+                    slots.positions,
+                    slots.requests,
+                    slots.table,
+                    slots.ratio,
+                    slots.pages,
+                )
+            )
+        return out
+
+    def prepare(*args):
+        prepared.append(args)
+        return True
+
+    monkeypatch.setattr(dsv41, "index_topk", scored)
+    monkeypatch.setattr(dsv41, "prepare_index_topk", prepare)
+    selection_table = Mock(wraps=dsv41.selection_table)
+    monkeypatch.setattr(dsv41, "selection_table", selection_table)
+    torch.manual_seed(12)
+    q = torch.randn(2, 32, 128, dtype=torch.bfloat16)
+    weights = torch.rand(2, 32, dtype=torch.bfloat16)
+    sources = (2, 8, 14, 20, 24, 28, 32, 36)
+
+    def forward(early):
+        meta = _refresh_decode(backend, tables, 2, [300, 140])
+        backend.begin_indexer_forward()
+        seen.clear()
+        prepared.clear()
+        selection_table.reset_mock()
+        if early:
+            backend.prepare_decode_index_geometry(ForwardMode.DECODE, index_heads=32)
+            # One table per owner group (ratio 2 and ratio 1), before any layer.
+            assert selection_table.call_count == 2
+            selection_table.reset_mock()
+        outputs = []
+        for layer in sources:
+            if early and layer == 24:
+                backend.prepare_reindex_index_geometry(
+                    ForwardMode.DECODE, index_heads=32
+                )
+            outputs.extend(
+                backend.select_global(
+                    layer,
+                    q,
+                    weights,
+                    meta.positions,
+                    meta.request_indices,
+                    ForwardMode.DECODE,
+                    None,
+                    query_shard=None,
+                )
+            )
+            if layer == 20:
+                candidates = backend.sparse_topk.decode.candidates
+                outputs.extend((candidates.block_ids, candidates.lengths))
+        built_in_layers = selection_table.call_count
+        backend.end_indexer_forward()
+        return [t.clone() for t in outputs], built_in_layers, list(seen), list(prepared)
+
+    expected, plain_tables, _, plain_prepared = forward(False)
+    actual, early_tables, layers, early_prepared = forward(True)
+    assert plain_tables == 2 and early_tables == 0 and not plain_prepared
+    for got, want in zip(actual, expected, strict=True):
+        assert torch.equal(got, want)
+    # Every source's index_topk call finds the geometry prepared for it.
+    assert len(early_prepared) == len(layers) == len(sources)
+    for args, (cache, table, visible, candidates, wanted, chunk, metadata) in zip(
+        early_prepared, layers, strict=True
+    ):
+        assert args[1] is table and args[2] is visible and args[9] is metadata
+        assert (args[4], args[5], args[6], args[7], args[8]) == (
+            backend.spec.index_topk,
+            wanted,
+            32,
+            torch.bfloat16,
+            chunk,
+        )
+        for got, want in ((args[0], cache), (args[3], candidates)):
+            assert (got is None) == (want is None)
+            if got is not None:
+                assert (got.data_ptr(), got.shape, got.stride()) == (
+                    want.data_ptr(),
+                    want.shape,
+                    want.stride(),
+                )
+    assert [args[3] is None for args in early_prepared] == [True] * 4 + [False] * 4
+    # Outside replicated-cache decode the prebuilds do nothing.
+    prepared.clear()
+    selection_table.reset_mock()
+    backend.begin_indexer_forward()
+    backend.prepare_decode_index_geometry(ForwardMode.EXTEND, index_heads=32)
+    backend.end_indexer_forward()
+    assert not prepared and not selection_table.called
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -3401,6 +4011,125 @@ def test_index_geometry_scope_preserves_all_indexer_selections_in_graph(monkeypa
         graph.replay()
         for got, want in zip(captured, expected, strict=True):
             torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_gpu_early_index_geometry_replays_like_in_layer_builds(monkeypatch):
+    """Index geometry prebuilt on the index stream at forward start and after
+    the candidate source replays, captured,
+    bit for bit like eager layers building their own; no layer builds any."""
+    backend = _backend("cuda", 2)
+    backend.spec = replace(backend.spec, index_topk=64, candidate_topk=16)
+    backend.cache_pool.arena.buffer.zero_()
+    tables = _tables("cuda")
+    torch.manual_seed(305)
+    for owner, group in ((2, R2), (8, R2), (14, R2), (20, R1)):
+        rows = tables[group].shape[1] * 64
+        logical = torch.arange(rows, device="cuda")
+        for request in range(2):
+            slots = tables[group][request, logical // 64].long() * 64 + logical % 64
+            dsv41.cache_scatter(
+                torch.randn(rows, 128, device="cuda", dtype=torch.bfloat16),
+                backend.cache_pool.index_k(owner),
+                slots,
+                backend.index_format,
+            )
+    requests = torch.tensor([0, 1], device="cuda")
+    backend.refresh_decode_metadata(
+        2,
+        2,
+        requests,
+        torch.tensor([300, 140], device="cuda", dtype=torch.int32),
+        forward_mode=ForwardMode.DECODE,
+        block_tables=tables,
+        for_graph_replay=False,
+    )
+    meta = backend.query_metadata(ForwardMode.DECODE)
+    heads = 32 if current_platform().is_blackwell else 2
+    index_q = torch.randn(2, heads, 128, device="cuda", dtype=torch.bfloat16)
+    index_weights = torch.rand(2, heads, device="cuda", dtype=torch.bfloat16)
+    selection_table = Mock(wraps=dsv41.selection_table)
+    monkeypatch.setattr(dsv41, "selection_table", selection_table)
+    aux = torch.cuda.Stream()
+
+    def on_aux(work):
+        main = torch.cuda.current_stream()
+        fork = torch.cuda.Event()
+        fork.record(main)
+        with torch.cuda.stream(aux):
+            aux.wait_event(fork)
+            result = work()
+            done = torch.cuda.Event()
+            done.record(aux)
+        main.wait_event(done)
+        return result
+
+    def forward(early):
+        backend.begin_indexer_forward()
+        if early:
+            on_aux(
+                lambda: backend.prepare_decode_index_geometry(
+                    ForwardMode.DECODE, index_heads=heads
+                )
+            )
+        selection_table.reset_mock()
+        outputs = []
+        for layer in (2, 8, 14, 20, 24, 28, 32, 36):
+            if early and layer == 24:
+                on_aux(
+                    lambda: backend.prepare_reindex_index_geometry(
+                        ForwardMode.DECODE, index_heads=heads
+                    )
+                )
+            outputs.extend(
+                on_aux(
+                    lambda layer=layer: backend.select_global(
+                        layer,
+                        index_q,
+                        index_weights,
+                        meta.positions,
+                        meta.request_indices,
+                        ForwardMode.DECODE,
+                        None,
+                        query_shard=None,
+                    )
+                )
+            )
+        candidates = backend.sparse_topk.decode.candidates
+        outputs.extend((candidates.block_ids, candidates.lengths))
+        backend.end_indexer_forward()
+        return outputs, selection_table.call_count
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        forward(True)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            captured, built_in_layers = forward(True)
+        assert built_in_layers == 0
+    torch.cuda.current_stream().wait_stream(stream)
+    for live, seq_lens in ((2, [301, 142]), (1, [320]), (2, [64, 512])):
+        index_q.normal_()
+        index_weights.uniform_()
+        for group in (R2, R1):
+            tables[group].copy_(tables[group].roll(1, dims=1))
+        backend.refresh_decode_metadata(
+            2,
+            live,
+            requests[:live],
+            torch.tensor(seq_lens, device="cuda", dtype=torch.int32),
+            forward_mode=ForwardMode.DECODE,
+            block_tables={group: table.flip(0) for group, table in tables.items()},
+            for_graph_replay=True,
+        )
+        expected, built_in_layers = forward(False)
+        assert built_in_layers == 2
+        expected = [t.clone() for t in expected]
+        graph.replay()
+        for got, want in zip(captured, expected, strict=True):
+            torch.testing.assert_close(got, want, rtol=0, atol=0)
+    torch.cuda.synchronize()
 
 
 @pytest.mark.parametrize(
