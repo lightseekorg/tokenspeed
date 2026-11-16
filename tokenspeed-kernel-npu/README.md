@@ -144,6 +144,9 @@ copies cache rows into separate KV576 and optional Indexer-K128 send planes.
 HCCL receives each plane directly at its final attention address, so there is
 no whole-history packet to unpack. For degree one, the gather kernel writes the
 attention planes directly. Cold Prefill skips history work.
+The kernel checks each 32-row tile for contiguous source slots and copies a
+matching run as one span. Arbitrary slot order keeps scalar row addresses;
+page order and tail lengths do not change the copied values.
 
 Current DSA projections pack Indexer-K128 and KV576 into 704 BF16 values per row;
 MLA carries only KV576. One uneven collective carries actual rows, then one
@@ -151,6 +154,10 @@ kernel writes the padded current attention region, compact partial pages and
 persistent owner caches. Complete current pages alias their attention region.
 The byte copies use integer views to preserve arbitrary BF16 bit patterns.
 Cache inputs accept contiguous `[rows,width]` and `[rows,1,width]`.
+Packing and current writes also use 32-row tiles. Direct rows that share one
+contiguous ownership block reuse the unpacked values for a bulk cache write.
+Partial pages and irregular slots retain per-row writes, including valid rows
+in a tile that crosses the cache extent. Both planes stay in the same kernel.
 
 For history capacity H, current capacity C, group degree D > 1 and null rows N,
 let A = ceil(C / (128 D)) * 128 D and S = max(H, ceil(C / D)). The allocation is

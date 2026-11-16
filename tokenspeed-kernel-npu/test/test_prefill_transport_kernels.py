@@ -178,6 +178,95 @@ def test_history_and_current_copies_preserve_every_byte(has_index, rows):
         exact(index, index_host)
 
 
+@pytest.mark.parametrize("has_index", [False, True])
+@pytest.mark.parametrize("layout", ["pages64", "pages128", "random", "broken_run"])
+@torch.inference_mode()
+def test_history_gather_preserves_arbitrary_slot_order(has_index, layout):
+    from tokenspeed_kernel_npu.ops._prefill_transport import gather_history
+
+    torch.npu.set_device(0)
+    cache_rows = 1024
+    if layout == "random":
+        slots = torch.randint(
+            cache_rows, (257,), generator=torch.Generator().manual_seed(71)
+        )
+    else:
+        page = 64 if layout == "pages64" else 128
+        pages = torch.tensor([4, 1, 7], dtype=torch.int64)
+        slots = (pages[:, None] * page + torch.arange(page)).reshape(-1)
+        slots = torch.cat((slots, torch.arange(17)))
+        if layout == "broken_run":
+            slots[15] = (
+                3  # A tile's first and last slots alone cannot prove contiguity.
+            )
+    kv_host = payload(cache_rows, 576, 73)
+    index_host = payload(cache_rows, 128, 79) if has_index else None
+    send_kv = torch.empty((slots.numel(), 576), dtype=torch.bfloat16, device="npu")
+    send_index = (
+        torch.empty((slots.numel(), 128), dtype=torch.bfloat16, device="npu")
+        if has_index
+        else None
+    )
+    gather_history(
+        kv_host.npu(),
+        index_host.npu() if has_index else None,
+        slots.npu(),
+        send_kv,
+        send_index,
+    )
+    exact(send_kv, kv_host[slots])
+    if has_index:
+        exact(send_index, index_host[slots])
+
+
+@pytest.mark.parametrize("has_index", [False, True])
+@torch.inference_mode()
+def test_current_cache_tail_preserves_valid_rows(has_index):
+    from tokenspeed_kernel_npu.ops._prefill_transport import pack_current, store_current
+
+    torch.npu.set_device(0)
+    rows, page, cache_rows = 32, 128, 145
+    current = payload(rows, 576, 83)
+    current_index = payload(rows, 128, 89) if has_index else None
+    cache_host = payload(cache_rows, 576, 97)
+    cache_index_host = payload(cache_rows, 128, 101) if has_index else None
+    cache = cache_host.npu()
+    cache_index = cache_index_host.npu() if has_index else None
+    packet = torch.empty(
+        (rows, 704 if has_index else 576), dtype=torch.bfloat16, device="npu"
+    )
+    pack_current(current.npu(), current_index.npu() if has_index else None, packet)
+    plane = torch.zeros((256, 576), dtype=torch.bfloat16, device="npu")
+    plane_index = (
+        torch.zeros((256, 128), dtype=torch.bfloat16, device="npu")
+        if has_index
+        else None
+    )
+    store_current(
+        packet,
+        plane,
+        plane_index,
+        cache,
+        cache_index,
+        torch.arange(page, page + rows, dtype=torch.int64, device="npu"),
+        torch.full((rows,), -1, dtype=torch.int64, device="npu"),
+        torch.ones(rows, dtype=torch.uint8, device="npu"),
+        history_rows=page,
+        send_rows=page,
+        block_rows=page,
+        virtual_blocks=2,
+        degree=1,
+        rank=0,
+    )
+    cache_host[page:] = current[: cache_rows - page]
+    exact(cache, cache_host)
+    exact(plane[page : page + rows], current)
+    if has_index:
+        cache_index_host[page:] = current_index[: cache_rows - page]
+        exact(cache_index, cache_index_host)
+        exact(plane_index[page : page + rows], current_index)
+
+
 @torch.inference_mode()
 def test_cache_addresses_beyond_int32_elements():
     from tokenspeed_kernel_npu.ops._memory import NativeBuffer
