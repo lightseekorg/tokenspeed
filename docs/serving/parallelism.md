@@ -969,7 +969,10 @@ long-context forwards.
 The initial K3 NVFP4 configuration requires `--attn-tp-size 1 --moe-tp-size 1
 --ep-size 1 --all2all-backend none`, `--disaggregation-mode prefill`,
 `--enforce-eager --prefill-graph-max-tokens 0`, and a fixed prefill token budget.
-The weight-sharing size must divide the instance size. Shared-expert and
+The routed experts run on FlashInfer's TRT-LLM-Gen kernels
+(`--moe-backend flashinfer_trtllm`) or its CuTe DSL kernels
+(`--moe-backend flashinfer_cutedsl`, 5-11% faster MoE layers at K3 prefill
+shapes on GB300). The weight-sharing size must divide the instance size. Shared-expert and
 attention-projection TP overrides must also remain local. The additional
 staging memory is allocated before KV cache sizing. Live checkpoint replacement
 requires restarting these workers.

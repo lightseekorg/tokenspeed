@@ -570,10 +570,11 @@ class MoELayer(torch.nn.Module):
             if not (
                 self._quant_kind == "nvfp4"
                 and self.activation == "situ"
-                and self.plan["solution"] == "flashinfer_trtllm"
+                and self.plan["solution"] in ("flashinfer_trtllm", "flashinfer_cutedsl")
             ):
                 raise ValueError(
-                    "Peer weights currently require FlashInfer TRTLLM NVFP4 SiTU"
+                    "Peer weights currently require FlashInfer TRTLLM or CuTe DSL "
+                    "NVFP4 SiTU"
                 )
             self._storage_spec = replace(
                 self._spec,

@@ -2057,10 +2057,11 @@ class KimiLinearMoE(nn.Module):
             and not plan.use_native
             and not plan.use_marlin
         ):
-            if not plan.use_trtllm:
+            if not (plan.use_trtllm or plan.use_cutedsl):
                 raise RuntimeError(
-                    "Kimi-K3 MXFP4 SiTU MoE requires the native, FlashInfer "
-                    "TRT-LLM, or Marlin (Hopper W4A16) backend; no portable SiTU "
+                    "Kimi-K3 SiTU MoE requires the native, FlashInfer TRT-LLM, "
+                    "FlashInfer CuTe DSL (NVFP4), or Marlin (Hopper W4A16) "
+                    "backend; no portable SiTU "
                     f"Triton fallback exists (selected MoE backend: "
                     f"{moe_backend.value!r})."
                 )
@@ -2112,7 +2113,7 @@ class KimiLinearMoE(nn.Module):
                 else (
                     _k3_trtllm_situ_internal_activation_dtype(quant_config, prefix)
                     if self.execution_plan.use_trtllm
-                    else None
+                    else "input" if self.execution_plan.use_cutedsl else None
                 )
             ),
         )
@@ -2424,10 +2425,9 @@ class KimiLinearMoE(nn.Module):
 
     def process_weights_after_loading(self, module) -> None:
         """Configure the latent projection from the processed expert input scale."""
-        if (
-            self.experts.plan["weight_dtype"] == "nvfp4"
-            and self.experts.plan["solution"] == "flashinfer_trtllm"
-        ):
+        if self.experts.plan["weight_dtype"] == "nvfp4" and self.experts.plan[
+            "solution"
+        ] in ("flashinfer_trtllm", "flashinfer_cutedsl"):
             # The loader visits this parent before its expert child.
             self.experts.process_weights_after_loading(self.experts)
             self.routed_expert_down_proj.prepare_nvfp4_output(
@@ -2448,11 +2448,12 @@ class KimiLinearMoE(nn.Module):
             plan.owns_ep_communication
             or plan.use_native
             or plan.use_trtllm
+            or plan.use_cutedsl
             or plan.use_marlin
         ):
             raise RuntimeError(
                 "Kimi-K3 has no portable SiTU Triton fallback; use the native, "
-                "FlashInfer TRT-LLM, or Marlin SiTU MoE path."
+                "FlashInfer TRT-LLM, FlashInfer CuTe DSL, or Marlin SiTU MoE path."
             )
         out = self.experts(
             hidden_states=routed_in,

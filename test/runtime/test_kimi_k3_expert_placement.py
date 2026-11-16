@@ -136,6 +136,7 @@ def test_k3_accepts_a_placement_only_on_the_attention_dp_megamoe_path(
     trtllm = Kimi3MoEExecutionPlan(
         use_native=False,
         use_trtllm=True,
+        use_cutedsl=False,
         use_mega_moe=False,
         owns_ep_communication=False,
         overlap_shared_experts=False,
