@@ -92,7 +92,9 @@ def test_masked_columns_and_rows_without_a_finite_softmax(device: str) -> None:
     logits, temperature = _inputs(6, 10000, torch.float32, device)
     # More than a whole chunk of -inf ahead of the first finite column.
     logits[0, :5000] = float("-inf")
-    logits[1, 7] = float("nan")
+    # A NaN in a chunk with no finite value still makes the row NaN.
+    logits[1, 4096:] = float("-inf")
+    logits[1, 5000] = float("nan")
     logits[2, 9000] = float("inf")
     logits[3] = float("-inf")
     # An empty chunk must add 0 even when the row's maximum is far below 0.

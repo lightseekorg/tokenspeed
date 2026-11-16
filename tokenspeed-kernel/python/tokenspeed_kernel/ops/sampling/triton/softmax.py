@@ -78,8 +78,9 @@ def _normalize_kernel(
     chunk = tl.program_id(1)
 
     # Every program of a row combines all of the row's chunks. A chunk with no
-    # value above -inf adds 0, a NaN chunk sum leaves the row NaN, and a row
-    # with no value above -inf divides 0 by 0, as torch.softmax does.
+    # value above -inf adds 0 * exp(-inf) = 0, a NaN chunk sum leaves the row
+    # NaN even when tl.max skipped the NaN, and a row with no value above -inf
+    # divides 0 by 0, as torch.softmax does.
     offs = tl.arange(0, CHUNKS_POW2)
     mask = offs < chunks
     chunk_max = tl.load(
@@ -88,8 +89,7 @@ def _normalize_kernel(
     chunk_sum = tl.load(chunk_sum_ptr + row * chunks + offs, mask=mask, other=0.0)
     row_max = tl.max(chunk_max, axis=0)
     shift = tl.where(row_max == float("-inf"), 0.0, row_max)
-    scaled = chunk_sum * tl.exp(chunk_max - shift)
-    row_sum = tl.sum(tl.where(chunk_max == float("-inf"), 0.0, scaled), axis=0)
+    row_sum = tl.sum(chunk_sum * tl.exp(chunk_max - shift), axis=0)
 
     cols = chunk * BLOCK + tl.arange(0, BLOCK)
     col_mask = cols < vocab
