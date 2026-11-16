@@ -57,9 +57,9 @@ class FusedTPProjectionState:
     """Collectively prepare a TP2/4/8 projection before graph capture.
 
     Args:
-        group: NVLink-connected GB300 ranks in weight-shard order: TP2/4 for rows,
-            TP2/4/8 for columns.
-        device: This rank's CUDA device, with 152 SMs available to the grid.
+        group: NVLink-connected SM100/SM103 ranks in weight-shard order:
+            TP2/4 for rows, TP2/4/8 for columns.
+        device: This rank's CUDA device, whose SM count bounds the resident grid.
         max_rows: Maximum physical rows on any owner.
         input_size: Full input channel count, divisible by 128.
         output_size: Padded output width, divisible by group size times 128.
@@ -89,11 +89,10 @@ class FusedTPProjectionState:
             or input_size % 128
             or output_size < group.size() * 128
             or output_size % (group.size() * 128)
-            or torch.cuda.get_device_capability(device) != (10, 3)
-            or torch.cuda.get_device_properties(device).multi_processor_count != 152
+            or torch.cuda.get_device_capability(device) not in ((10, 0), (10, 3))
         ):
             raise ValueError(
-                "Fused TP projection requires aligned widths and TP2/4/8 GB300 GPUs"
+                "Fused TP projection requires aligned widths and TP2/4/8 SM100/SM103 GPUs"
             )
         if row_parallel and (
             group.size() not in (2, 4) or input_size % (128 * group.size())
@@ -115,6 +114,12 @@ class FusedTPProjectionState:
         self.receive_width = self.shard_size * self.world_size
         self.closed = False
         self.max_rows = max_rows
+        self.active_ctas = torch.cuda.get_device_properties(
+            device
+        ).multi_processor_count
+        # Reserve a control cache line before CTA flags; align the peer epoch banks.
+        flag_words = 16 + self.active_ctas
+        epoch_offset = (flag_words + 15) // 16 * 16
         capacity = _row_bucket(max_rows, row_parallel, self.world_size)
         self.a = symm_mem.empty(
             (capacity * self.world_size, self.gemm_input_size),
@@ -131,10 +136,10 @@ class FusedTPProjectionState:
         )
         if row_parallel:
             self.receive.view(torch.int16).fill_(-32768)
-        self.ready = symm_mem.empty((168,), dtype=torch.int64, device=device)
-        self.ack = symm_mem.empty((168,), dtype=torch.int64, device=device)
+        self.ready = symm_mem.empty((flag_words,), dtype=torch.int64, device=device)
+        self.ack = symm_mem.empty((flag_words,), dtype=torch.int64, device=device)
         self.input_flags = symm_mem.empty(
-            (176 + self.world_size * 16 if row_parallel else 168,),
+            (epoch_offset + self.world_size * 16 if row_parallel else flag_words,),
             dtype=torch.int64,
             device=device,
         )
@@ -221,9 +226,10 @@ class FusedTPProjectionState:
         self.peer_ack_local = self.peer_ack
         if row_parallel:
             self.peer_input_flags = tuple(
-                from_dlpack(t[:168], assumed_align=16) for t in self.peer_tensors[5]
+                from_dlpack(t[:flag_words], assumed_align=16)
+                for t in self.peer_tensors[5]
             )
-            epoch_banks = self.input_flags[176:].view(self.world_size, 16)
+            epoch_banks = self.input_flags[epoch_offset:].view(self.world_size, 16)
             peer_epoch_banks = tuple(
                 epoch_banks[(self.rank + peer) % self.world_size]
                 for peer in range(self.world_size)
@@ -236,7 +242,7 @@ class FusedTPProjectionState:
                 self.peer_ack_local = tuple(
                     from_dlpack(bank[1:2], assumed_align=8) for bank in peer_epoch_banks
                 )
-        self.ready_cute = from_dlpack(self.ready[:168], assumed_align=16)
+        self.ready_cute = from_dlpack(self.ready, assumed_align=16)
         self.ack_cute = from_dlpack(self.ack, assumed_align=16)
         self.input_flags_cute = from_dlpack(self.input_flags, assumed_align=16)
         weight = torch.zeros(
@@ -253,8 +259,6 @@ class FusedTPProjectionState:
         torch.cuda.synchronize(device)
         dist.barrier(group=group)
         self.compiled = {}
-        # Prepared buckets can use fewer SMs; CTA zero advances inactive epochs.
-        self.active_ctas = 152
         for rows in self.row_views:
             resident_ctas = (
                 128
@@ -286,6 +290,7 @@ class FusedTPProjectionState:
             ):
                 # Keep each CTA on the same M tile and reduce idle grid work.
                 resident_ctas = 132
+            resident_ctas = min(resident_ctas, self.active_ctas)
             inputs = torch.zeros(
                 (rows, input_size), dtype=torch.bfloat16, device=device
             )

@@ -119,13 +119,25 @@ def _worker(rank, world_size, rendezvous, kind):
         scale_fmt=None,
     )
     try:
-        check = {"column": _check_column_projection, "row": _check_row_projection}[kind]
-        check(rank, world_size, device, parallel, config)
+        if kind == "row":
+            _check_row_projection(rank, world_size, device, parallel, config)
+        else:
+            input_size, output_size = {
+                "column": (7168, 49376),
+                "mla_column": (7168, 14400),
+                "small_column": (128, 256),
+                "generic_column": (4096, 8192),
+            }[kind]
+            _check_column_projection(
+                rank, world_size, device, parallel, config, input_size, output_size
+            )
     finally:
         dist.destroy_process_group()
 
 
-def _check_column_projection(rank, world_size, device, parallel, config):
+def _check_column_projection(
+    rank, world_size, device, parallel, config, input_size, output_size
+):
     from tokenspeed_kernel.ops.communication.cute_dsl import (
         create_fused_tp_column_projection_state,
         cute_dsl_fused_fp8_dp_column_linear,
@@ -146,10 +158,10 @@ def _check_column_projection(rank, world_size, device, parallel, config):
             model = torch.nn.ModuleList(
                 [
                     DPColumnParallelLinear(
-                        7168,
-                        49376,
+                        input_size,
+                        output_size,
                         padded_output_size=(
-                            (49376 + world_size * 128 - 1) // (world_size * 128)
+                            (output_size + world_size * 128 - 1) // (world_size * 128)
                         )
                         * world_size
                         * 128,
@@ -175,7 +187,7 @@ def _check_column_projection(rank, world_size, device, parallel, config):
     if world_size == 8:
         # TP8 is available only through an explicitly prepared native state.
         state = create_fused_tp_column_projection_state(
-            dist.group.WORLD, device, 4097, 7168, candidate[0].output_size
+            dist.group.WORLD, device, 4097, input_size, candidate[0].output_size
         )
     else:
         assert state is not None
@@ -233,7 +245,7 @@ def _check_column_projection(rank, world_size, device, parallel, config):
     for counts in count_cases:
         fused = uses_fusion(max(counts))
         torch.manual_seed(712 + rank)
-        x = torch.randn((counts[rank], 7168), device=device, dtype=torch.bfloat16)
+        x = torch.randn((counts[rank], input_size), device=device, dtype=torch.bfloat16)
         ctx = _context(rank, counts, counts)
         epoch = int(state.ready[0])
         for left, right in zip(baseline, candidate):
@@ -274,10 +286,10 @@ def _check_column_projection(rank, world_size, device, parallel, config):
             gathered, _ = baseline[0].comm_backend.projection_all_gather(
                 x, rows, False, baseline[0].projection_workspace
             )
-            padded = gathered.new_zeros((world_size, bucket, 7168))
-            padded[:, :rows].copy_(gathered.view(world_size, rows, 7168))
+            padded = gathered.new_zeros((world_size, bucket, input_size))
+            padded[:, :rows].copy_(gathered.view(world_size, rows, input_size))
             values, scales = quantize_fp8(
-                padded.view(world_size * bucket, 7168),
+                padded.view(world_size * bucket, input_size),
                 granularity="token_group",
                 group_size=128,
                 scale_encoding="float32",
@@ -322,17 +334,21 @@ def _check_column_projection(rank, world_size, device, parallel, config):
         for counts, _ in graph_cases
     }
     inputs = {
-        counts: torch.randn((counts[rank], 7168), device=device, dtype=torch.bfloat16)
+        counts: torch.randn(
+            (counts[rank], input_size), device=device, dtype=torch.bfloat16
+        )
         for counts in contexts
     }
     source = {}
     # Vary adjacent K-block scales to catch reuse of a stale pipeline stage.
     block_scales = torch.exp2(
-        (torch.arange(7168 // 128, device=device) % 7 - 3).float()
+        (torch.arange(input_size // 128, device=device) % 7 - 3).float()
     ).to(torch.bfloat16)
     for counts, value in inputs.items():
         sample = torch.randn_like(value)
-        sample.view(value.shape[0], 7168 // 128, 128).mul_(block_scales.view(1, -1, 1))
+        sample.view(value.shape[0], input_size // 128, 128).mul_(
+            block_scales.view(1, -1, 1)
+        )
         # Change FP8 values and scales between epochs so operand prefetch cannot
         # reuse stale data, with opposite scale shifts across owners.
         source[counts] = [
@@ -804,14 +820,24 @@ def _check_row_projection(rank, world_size, device, parallel, config):
 
 @pytest.mark.parametrize(
     ("kind", "world_size"),
-    (("column", 2), ("column", 4), ("column", 8), ("row", 2), ("row", 4)),
+    (
+        ("column", 2),
+        ("column", 4),
+        ("column", 8),
+        ("mla_column", 2),
+        ("mla_column", 4),
+        ("small_column", 2),
+        ("generic_column", 4),
+        ("row", 2),
+        ("row", 4),
+    ),
 )
 def test_registered_tp_projection(tmp_path, kind, world_size):
-    if torch.cuda.device_count() < world_size or torch.cuda.get_device_capability() != (
-        10,
-        3,
+    if (
+        torch.cuda.device_count() < world_size
+        or torch.cuda.get_device_capability() not in ((10, 0), (10, 3))
     ):
-        pytest.skip(f"requires {world_size} node-local GB300 GPUs")
+        pytest.skip(f"requires {world_size} node-local SM100/SM103 GPUs")
     mp.spawn(
         _worker,
         args=(world_size, f"file://{tmp_path / 'rendezvous'}", kind),

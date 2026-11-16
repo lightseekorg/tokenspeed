@@ -51,7 +51,7 @@ that completion also retires reads of the owner's input. Those buckets can
 reuse the same input layout without another peer join. Layout changes and
 kernels that skip padding retain the acknowledgement join.
 
-Node-local GB300 GPUs use prepared row buckets, aligned widths, and a fixed,
+Node-local SM100/SM103 GPUs use prepared row buckets, aligned widths, and a fixed,
 fully resident grid on idle GPUs. Column and row projections use their own
 bucket ladders; remote stores split GEMM tiles at owner boundaries.
 Input staging zero-fills each owner's row tail, and final stores write only
@@ -200,7 +200,7 @@ def _publish_epoch_async(
 class FusedTPProjectionKernel:
     """Fuse owner quantization, row/column-sharded FP8 GEMM and output exchange.
 
-    Use 64x128 or 128x128 tiles on node-local GB300 peers.
+    Use 64x128 or 128x128 tiles on node-local SM100/SM103 peers.
 
     Selected row buckets pair adjacent N tiles to share TMA loads of A.
     A fully resident grid and warp specialization overlap TMA,
@@ -265,6 +265,7 @@ class FusedTPProjectionKernel:
         self.num_ctas = 0
         self.gemm_ctas = 0
         self.num_cta_flags = 0
+        self.epoch_bank_offset = 0
         self.large_row_bucket = False
         self.reduction_rows = 32
         self.use_input_multicast = use_input_multicast
@@ -614,6 +615,7 @@ class FusedTPProjectionKernel:
 
         # Setup attributes that dependent on gemm inputs
         self.num_cta_flags = ready.shape[0] - 16
+        self.epoch_bank_offset = (ready.shape[0] + 15) // 16 * 16
         self.input_phase_clear = (
             self.row_parallel
             and len(peer_ready) == 4
@@ -3866,11 +3868,15 @@ class FusedTPProjectionKernel:
                     cute.arch.store(flags.iterator, epoch, sem="relaxed", scope="gpu")
                     if cutlass.const_expr(len(input_peers) == 2):
                         _publish_epoch_async(
-                            notify_address + cutlass.Int64((176 + rank * 16) * 8), epoch
+                            notify_address
+                            + cutlass.Int64((self.epoch_bank_offset + rank * 16) * 8),
+                            epoch,
                         )
                     else:
                         _publish_input_epoch(
-                            notify_address + cutlass.Int64((176 + rank * 16) * 8), epoch
+                            notify_address
+                            + cutlass.Int64((self.epoch_bank_offset + rank * 16) * 8),
+                            epoch,
                         )
                 else:
                     cute.arch.store(flags.iterator, epoch, sem="release", scope="sys")
@@ -4255,7 +4261,9 @@ class FusedTPProjectionKernel:
                 if cutlass.const_expr(self.row_parallel and self.use_input_multicast):
                     cute.arch.store(ack.iterator, epoch, sem="relaxed", scope="gpu")
                     _publish_epoch_async(
-                        notify_address + cutlass.Int64((176 + rank * 16 + 1) * 8), epoch
+                        notify_address
+                        + cutlass.Int64((self.epoch_bank_offset + rank * 16 + 1) * 8),
+                        epoch,
                     )
                 else:
                     cute.arch.store(ack.iterator, epoch, sem="release", scope="sys")
