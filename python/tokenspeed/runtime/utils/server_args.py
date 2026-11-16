@@ -447,8 +447,9 @@ class ServerArgs:
     gpu_memory_utilization: float | None = None
     max_num_seqs: int | None = None
     # Additional resident requests per attention-DP rank; forwards still use
-    # max_num_seqs. Zero leaves the request pool at its execution capacity.
-    disaggregation_decode_extra_slots: int = 0
+    # max_num_seqs. Omission adds one rank-local batch on decode; zero disables
+    # the extra capacity.
+    disaggregation_decode_extra_slots: int | None = None
     max_total_tokens: int | None = None
     chunked_prefill_size: int | None = None
     max_prefill_tokens: int = 8192
@@ -1191,6 +1192,13 @@ class ServerArgs:
                 self.max_num_seqs = 80
             else:
                 self.max_num_seqs = 160
+
+        if self.disaggregation_decode_extra_slots is None:
+            self.disaggregation_decode_extra_slots = (
+                self.max_num_seqs // self.mapping.attn.dp_size
+                if self.disaggregation_mode == "decode"
+                else 0
+            )
 
     def resolve_kernel_backends(self):
         _require_choice(
@@ -2905,6 +2913,8 @@ class ServerArgs:
 
     def validate_decode_extra_slots(self) -> None:
         extra = self.disaggregation_decode_extra_slots
+        if extra is None:
+            return
         if type(extra) is not int or extra < 0:
             raise ValueError(
                 "--disaggregation-decode-extra-slots must be a non-negative integer"
@@ -3168,7 +3178,10 @@ class ServerArgs:
             default=ServerArgs.disaggregation_decode_extra_slots,
             help="Additional resident request slots per attention-DP rank on a "
             "decode server. These receive KV without increasing the execution "
-            "concurrency set by --max-num-seqs. Defaults to zero.",
+            "concurrency set by --max-num-seqs. If omitted, defaults to "
+            "--max-num-seqs divided by the attention DP size (integer division) "
+            "on decode, and zero on other roles. Set to zero to disable the "
+            "extra capacity.",
         )
         parser.add_argument(
             "--max-total-tokens",

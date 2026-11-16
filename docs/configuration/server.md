@@ -997,13 +997,16 @@ public address used by EPD.
 ### Decode receive capacity
 
 On a decode node, --disaggregation-decode-extra-slots adds shared resident
-request slots per attention DP rank. It defaults to zero. A positive value
-is rejected on prefill, fused and encode nodes.
+request slots per attention DP rank. If omitted, it defaults to max-num-seqs
+divided by the attention DP size (integer division). Prefill, fused and
+encode nodes default to zero and reject positive values. Explicit values
+are preserved; zero disables the extra capacity.
 
-If the rank-local execution limit is B = max-num-seqs / attention DP size
+If the rank-local execution limit is B = max-num-seqs // attention DP size
 and the extra count is E, the resident pool has C = B + E real request rows.
-For example, max-num-seqs=48 and E=16 with two attention DP ranks gives
-B=24 and C=40 on each rank. TP replicas use the same rank-local limits.
+By default, E=B and C=2B. For example, max-num-seqs=48 with two attention DP
+ranks gives B=24, E=24 and C=48 on each rank. Setting E=16 instead gives
+C=40. TP replicas use the same rank-local limits.
 
 The extra rows allow KV reception and ready requests to overlap a full
 decode batch. They do not enlarge the execution batch, CUDA graph ladder,

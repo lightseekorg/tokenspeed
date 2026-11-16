@@ -31,7 +31,10 @@ from transformers import LlamaConfig
 register_cuda_ci(est_time=15, suite="runtime-1gpu")
 
 
-@pytest.mark.parametrize("dp,extra,want", [(1, 0, 8), (1, 4, 12), (2, 3, 7)])
+@pytest.mark.parametrize(
+    "dp,extra,want",
+    [(1, None, 16), (2, None, 8), (1, 0, 8), (2, 0, 4), (1, 4, 12), (2, 3, 7)],
+)
 def test_cli_extra_slots_preserve_execution_capacity(tmp_path, dp, extra, want):
     from tokenspeed.runtime.engine.rank_setup import load_model_config
     from tokenspeed.runtime.layers.attention.configs.base import model_wide_kwargs
@@ -59,15 +62,52 @@ def test_cli_extra_slots_preserve_execution_capacity(tmp_path, dp, extra, want):
             str(dp),
             "--disaggregation-mode",
             "decode",
-            "--disaggregation-decode-extra-slots",
-            str(extra),
         ]
+        + (
+            ["--disaggregation-decode-extra-slots", str(extra)]
+            if extra is not None
+            else []
+        )
     )
     args.mapping.rank = 0
     model_config = load_model_config(args, args.model, draft_of=None)
     config = model_wide_kwargs(args, model_config, False, kv_cache_dtype=torch.bfloat16)
     assert config["max_bs"] == 8 // dp
     assert config["max_resident_requests"] == want
+
+
+@pytest.mark.parametrize(
+    "max_num_seqs,want_batch,want_extra", [(None, 160, 80), (8, 8, 4), (9, 9, 4)]
+)
+def test_default_extra_slots_use_resolved_batch_and_dp(
+    max_num_seqs, want_batch, want_extra
+):
+    from tokenspeed.runtime.utils.server_args import ServerArgs
+
+    args = ServerArgs(
+        model="x",
+        max_num_seqs=max_num_seqs,
+        world_size=4,
+        attn_tp_size=2,
+        disaggregation_mode="decode",
+    )
+    assert args.mapping.attn.dp_size == 2
+    assert args.max_num_seqs == want_batch
+    assert args.disaggregation_decode_extra_slots == want_extra
+
+
+@pytest.mark.parametrize("role", ["null", "prefill", "encode"])
+@pytest.mark.parametrize("extra", [None, 0])
+def test_other_roles_have_no_extra_slots_by_default(role, extra):
+    from tokenspeed.runtime.utils.server_args import ServerArgs
+
+    args = ServerArgs(
+        model="x",
+        max_num_seqs=8,
+        disaggregation_mode=role,
+        disaggregation_decode_extra_slots=extra,
+    )
+    assert args.disaggregation_decode_extra_slots == 0
 
 
 @pytest.mark.parametrize("role", ["null", "prefill", "encode"])
