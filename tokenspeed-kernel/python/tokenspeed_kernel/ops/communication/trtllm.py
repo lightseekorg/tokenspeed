@@ -1362,7 +1362,7 @@ if current_platform().is_nvidia:
         norm_out_bf16: bool,
     ) -> tuple[torch.Tensor | None, torch.Tensor] | None:
         """All-reduce a sublayer partial and run the pre/post norm boundary on
-        the sum in one MNNVL launch.
+        the sum in one MNNVL launch per slice of at most the workspace's rows.
 
         The result is the unfused chain's::
 
@@ -1375,7 +1375,7 @@ if current_platform().is_nvidia:
         (``ops/layernorm/triton.py``) with the same operations and BF16
         rounding points; only the order of the two sum-of-squares reductions
         differs. That order does not depend on the token count, the strategy
-        or the launch geometry.
+        or the launch geometry, so a row's result does not depend on its slice.
 
         Args:
             input_tensor: This rank's contiguous BF16 ``[T, H]`` partial.
@@ -1388,7 +1388,8 @@ if current_platform().is_nvidia:
             x_scale, residual_scale: Optional multipliers of the normalized sum
                 and the residual (a missing one is 1.0); each product is
                 rounded to BF16 before the add.
-            max_token_num: Token capacity to arm the group's workspace for.
+            max_token_num: Token capacity to arm the group's workspace for, and
+                the most rows one launch takes.
             trigger_completion_at_end: Release PDL dependents after the last
                 store (otherwise after the inputs are loaded).
             launch_with_pdl: Programmatic dependent launch; None follows
@@ -1404,10 +1405,10 @@ if current_platform().is_nvidia:
 
         Returns:
             ``(norm_out, residual_out)``, or None when no fused kernel serves
-            the call (one rank, a token count outside ``[1, max_token_num]``,
-            no MNNVL workspace for the group, or a shape its partition cannot
-            split). Nothing is launched then and the caller runs the unfused
-            chain; the answer depends only on state every rank shares.
+            the call (one rank, no tokens, no token capacity, no MNNVL workspace
+            for the group, or a shape its partition cannot split). Nothing is
+            launched then and the caller runs the unfused chain; the answer
+            depends only on state every rank shares.
 
         Raises:
             ValueError: the tensors or the scale pair do not form a valid call.
@@ -1454,7 +1455,7 @@ if current_platform().is_nvidia:
         elif not norm_out_bf16:
             raise ValueError("norm_out_bf16=False needs token_fp8_out")
         world_size = group.size()
-        if world_size <= 1 or not 1 <= tokens <= max_token_num:
+        if world_size <= 1 or tokens < 1 or max_token_num < 1:
             return None
         if not ensure_workspace_initialized(
             rank=rank,
@@ -1468,37 +1469,58 @@ if current_platform().is_nvidia:
         mnnvl = manager.mnnvl_workspace
         if mnnvl is None:
             return None
-        use_oneshot = mnnvl.resolve_use_oneshot(tokens, None, hidden)
-        if not mnnvl.supports(
-            tokens,
-            hidden,
-            torch.bfloat16,
-            world_size,
-            AllReduceFusionPattern.kARSandwichResidualRMSNorm,
-            use_oneshot=use_oneshot,
+        step = min(max_token_num, mnnvl.max_token_num)
+        slices = [
+            (start, min(tokens, start + step)) for start in range(0, tokens, step)
+        ]
+        strategies = [
+            mnnvl.resolve_use_oneshot(stop - start, None, hidden)
+            for start, stop in slices
+        ]
+        if not all(
+            mnnvl.supports(
+                stop - start,
+                hidden,
+                torch.bfloat16,
+                world_size,
+                AllReduceFusionPattern.kARSandwichResidualRMSNorm,
+                use_oneshot=use_oneshot,
+            )
+            for (start, stop), use_oneshot in zip(slices, strategies)
         ):
             return None
         _mark_captured(manager, mnnvl)
         norm_out = torch.empty_like(input_tensor) if norm_out_bf16 else None
         residual_out = torch.empty_like(residual)
-        fp8_kwargs = {} if token_fp8_out is None else {"token_fp8_out": token_fp8_out}
-        trtllm_mnnvl_sandwich_norm_allreduce(
-            mnnvl,
-            input_tensor,
-            residual,
-            post_weight,
-            weight,
-            norm_out,
-            residual_out,
-            world_rank=rank,
-            use_oneshot=use_oneshot,
-            rms_eps=eps,
-            x_scale=x_scale,
-            residual_scale=residual_scale,
-            trigger_completion_at_end=trigger_completion_at_end,
-            launch_with_pdl=launch_with_pdl,
-            **fp8_kwargs,
-        )
+        # Rows are independent: a call above the workspace launches per row slice.
+        for (start, stop), use_oneshot in zip(slices, strategies):
+            fp8_kwargs = (
+                {}
+                if token_fp8_out is None
+                else {
+                    "token_fp8_out": (
+                        token_fp8_out[0][start:stop],
+                        token_fp8_out[1][start:stop],
+                    )
+                }
+            )
+            trtllm_mnnvl_sandwich_norm_allreduce(
+                mnnvl,
+                input_tensor[start:stop],
+                residual[start:stop],
+                post_weight,
+                weight,
+                None if norm_out is None else norm_out[start:stop],
+                residual_out[start:stop],
+                world_rank=rank,
+                use_oneshot=use_oneshot,
+                rms_eps=eps,
+                x_scale=x_scale,
+                residual_scale=residual_scale,
+                trigger_completion_at_end=trigger_completion_at_end,
+                launch_with_pdl=launch_with_pdl,
+                **fp8_kwargs,
+            )
         return norm_out, residual_out
 
     def allreduce_residual_attnres_combine(
