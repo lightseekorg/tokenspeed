@@ -88,6 +88,48 @@ def test_default_is_a_derived_pool_with_the_request_cap_from_max_num_seqs():
         ServerArgs(model="x", world_size=2, data_parallel_size=2, max_num_seqs=1)
 
 
+@pytest.mark.parametrize(
+    "dp,extra,cap,want",
+    [
+        (1, None, 0, 32),
+        (2, None, 0, 16),
+        (1, 0, 0, 16),
+        (2, 0, 0, 8),
+        (1, 5, 0, 21),
+        (2, 5, 0, 13),
+        (2, None, 3, 3),
+        (2, 5, 20, 20),
+    ],
+)
+def test_decode_snapshot_rows_follow_resident_capacity_unless_overridden(
+    dp, extra, cap, want
+):
+    args = ServerArgs(
+        model="x",
+        world_size=dp,
+        data_parallel_size=dp,
+        max_num_seqs=16,
+        disaggregation_mode="decode",
+        disaggregation_decode_extra_slots=extra,
+        retraction_snapshot_max_requests=cap,
+    )
+    assert args.retraction_snapshot_max_requests == want
+    assert args.max_num_seqs == 16
+
+
+@pytest.mark.parametrize("host_gb,want", [(0.0, 0), (1.0, 32)])
+def test_decode_snapshot_disable_and_size_override_with_extra_slots(host_gb, want):
+    args = ServerArgs(
+        model="x",
+        max_num_seqs=16,
+        disaggregation_mode="decode",
+        retraction_snapshot_ratio=0.0,
+        retraction_snapshot_host_gb=host_gb,
+    )
+    assert args.retraction_snapshot_max_requests == want
+    assert args.retraction_snapshot_pool_disabled == (want == 0)
+
+
 def test_explicit_size_and_ratio_pass_through_and_each_is_enough_alone():
     args = ServerArgs(model="x", retraction_snapshot_host_gb=4.0)
     assert (args.retraction_snapshot_host_gb, args.retraction_snapshot_ratio) == (
@@ -253,8 +295,39 @@ def test_resolution_order_size_then_ratio_then_derived(l2_tier):
     assert sizing.lcm_blocks == (8 * 3 if l2_tier else int(DEVICE * 0.1))
     assert sizing.source.startswith("derived")
     if not l2_tier:
-        # Explicit ratio 1 is how a deployment makes every resident suspendable.
+        # Ratio 1 matches Device blocks; request rows remain a separate limit.
         assert _resolve(_request(ratio=1.0), l2_tier=False).lcm_blocks == DEVICE
+
+
+@pytest.mark.parametrize(
+    "l2_tier,host_gb,ratio,want_blocks",
+    [
+        (True, 0.0, None, 48),
+        (False, 0.0, None, 4),
+        (True, 0.0105, None, 10),
+        (True, 0.0, 0.25, 10),
+    ],
+)
+def test_extra_residency_grows_only_automatically_sized_image_tails(
+    l2_tier, host_gb, ratio, want_blocks
+):
+    args = ServerArgs(
+        model="x",
+        max_num_seqs=8,
+        disaggregation_mode="decode",
+        disable_kvstore=not l2_tier,
+        retraction_snapshot_host_gb=host_gb,
+        retraction_snapshot_ratio=ratio,
+    )
+    request = RetractionPoolRequest(
+        host_gb=args.retraction_snapshot_host_gb,
+        ratio=args.retraction_snapshot_ratio,
+        max_retracted_requests=args.retraction_snapshot_max_requests,
+        tail_lcm_blocks_per_request=3,
+    )
+    sizing = _resolve(request, l2_tier=args.enable_kvstore)
+    assert sizing.max_retracted_requests == 16
+    assert sizing.lcm_blocks == want_blocks
 
 
 def test_ratio_zero_resolves_to_no_pool_and_too_small_sizes_are_refused():
@@ -296,7 +369,8 @@ def _model(specs, packing):
         virtual_packing=packing,
         limits=SchedulerLimits(
             role=ts.SchedulerConfig.Role.Fused,
-            max_live_requests=4,
+            max_batch_size=4,
+            max_resident_requests=4,
             max_scheduled_tokens=2048,
             max_context_len=4096,
             decode_input_tokens=1,
@@ -388,6 +462,7 @@ def _device_request(**overrides):
         contract,
         host_group_packing=contract.virtual_packing,
         max_batch_size=4,
+        max_resident_requests=4,
         max_context_len=4096,
         decode_input_tokens=1,
         overlap_schedule_depth=0,

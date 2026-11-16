@@ -156,6 +156,7 @@ class _Server:
         config.max_retracted_requests = 0
         config.max_scheduled_tokens = BUDGET
         config.max_batch_size = 1
+        config.max_resident_requests = config.max_batch_size
         config.decode_input_tokens = 1
         config.overlap_schedule_depth = 0
         config.enable_mixed_prefill_decode = False

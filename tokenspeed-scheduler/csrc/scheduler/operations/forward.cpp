@@ -977,7 +977,15 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
 
 std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                                   Request* request) {
-    std::vector<BlockTable>& tables = request->BlockTablesRef();
+    DecodeSlotIndex decode_slot;
+    fsm::ForwardResources& resources = request->ForwardResourcesRef();
+    if (config_.role == Role::kD && !resources.decode_slot.valid()) {
+        if (decode_slots_.AvailableSlots() == 0) {
+            return std::nullopt;  // Execution admission, not a KV capacity failure.
+        }
+        decode_slot = decode_slots_.Allocate();
+    }
+    std::vector<BlockTable>& tables = resources.block_tables;
     const std::int32_t num_computed_tokens = request->NumComputedTokens();
     std::int32_t reserve_tokens = request->ReserveNumTokensInNextScheduleEvent();
     if (config_.decode_input_tokens > 1) {
@@ -1027,7 +1035,7 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
     // copy-in block for it, so it is skipped even if that checkpoint has left
     // the cache since.
     const bool first_decode = request->Is<fsm::PrefillDone>();
-    fsm::CacheProgress& cache_progress = request->CacheProgressRef();
+    fsm::CacheProgress& cache_progress = resources.cache_progress;
     const bool prompt_end = first_decode && firstDecodePublishesPromptEnd(*request, cache_progress.resume_tokens);
     const StateStep state_step{prompt_end                                 ? StateStep::Kind::kRotate
                                : first_decode && config_.role == Role::kD ? StateStep::Kind::kKeep
@@ -1048,7 +1056,7 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
             coordinator_.ReleaseStateInputs(tables);
         }
         cache_progress.published_state_checkpoint_blocks.clear();
-        return fsm::ScheduleDecodeEvent{config_.decode_input_tokens};
+        return fsm::ScheduleDecodeEvent{config_.decode_input_tokens, std::move(decode_slot)};
     }
 
     StagedCacheProgress staged{cache_progress};
@@ -1081,7 +1089,7 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
                 coordinator_.RetainInputCheckpoint(cache_progress.prefix_hashes, checkpoint);
         }
     }
-    return fsm::ScheduleDecodeEvent{config_.decode_input_tokens};
+    return fsm::ScheduleDecodeEvent{config_.decode_input_tokens, std::move(decode_slot)};
 }
 
 PrefillOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::SchedulePrefillFirstChunkEvent event,
@@ -1164,7 +1172,8 @@ std::optional<PrefillOperation> Scheduler::schedulePrefillCandidate(ExecutionPla
 // once. Then decode work, by most newly releasable blocks and fewest
 // generated tokens: the needed pages with the fewest victims disturb the
 // fewest clients, and among equal frees the client that has streamed least
-// is interrupted. (On the D role everything resident is decoding.)
+// is interrupted. On D, this includes PrefillDone requests waiting for
+// their first permit and Decoding requests; RemotePrefilling is excluded.
 //
 // Only candidates whose image fits the host budgets (imageShortfall) are
 // ranked. When none does, the host side is out of room and the last resort
@@ -1783,9 +1792,10 @@ std::vector<Request*> Scheduler::rankedReadmissions(std::span<Request* const> ca
 // candidates are tried in turn (bounded) until one restores. Any landed image
 // that waited for capacity seals new-prompt admission for the round, whether
 // or not a later one restored: the pages it waits for must not go to a
-// newcomer. A readmission that found no request-pool slot stops the scan
-// without sealing -- nothing later would get a slot either, and neither would
-// a newcomer.
+// newcomer. A missing request-pool row or decode permit stops the scan without
+// adding a KV-capacity barrier. With no row, newcomers cannot enter either.
+// With no decode permit, a D node may still admit remote prefills into free
+// resident rows unless an earlier KV failure already sealed new admission.
 bool Scheduler::scheduleReadmission(AdmissionFeedback& feedback, PlanBuild& build,
                                     std::span<Request* const> candidates) {
     ProfileSpan profile_span{"Scheduler::scheduleReadmission"};
@@ -1822,6 +1832,13 @@ bool Scheduler::scheduleRestore(AdmissionFeedback& feedback, PlanBuild& build, R
     if (req_pool_allocator_.AvailableSlots() == 0) {
         spdlog::debug("[Scheduler] restore blocked: rid={} no free request slot", request->Id());
         return false;
+    }
+    DecodeSlotIndex decode_slot;
+    if (config_.role == Role::kD && std::holds_alternative<fsm::ResumeDecoding>(retracted->shape)) {
+        if (decode_slots_.AvailableSlots() == 0) {
+            return false;  // Waiting for execution must not seal KV admission.
+        }
+        decode_slot = decode_slots_.Allocate();
     }
     const auto* resumes_prefilling = std::get_if<fsm::ResumePrefilling>(&retracted->shape);
     const std::int32_t resume_reserve =
@@ -1872,8 +1889,8 @@ bool Scheduler::scheduleRestore(AdmissionFeedback& feedback, PlanBuild& build, R
     // its ACK hands it to the resumed state (an abort meanwhile must not
     // re-grant a row still being written), and shares the blob slot.
     SnapshotRestoreOperation op = tier_transfers_.StartSnapshotRestore(
-        request->Id(), req_pool_allocator_.Allocate(), retracted->blob_slot, std::move(result->load_pairs),
-        std::move(result->snapshot_pairs), retracted->cache_progress.access_epoch);
+        request->Id(), req_pool_allocator_.Allocate(), std::move(decode_slot), retracted->blob_slot,
+        std::move(result->load_pairs), std::move(result->snapshot_pairs), retracted->cache_progress.access_epoch);
     const std::uint32_t restore_op = op.op_id;
     build.snapshot_restores.push_back(std::move(op));
     request->Apply(
@@ -2270,8 +2287,8 @@ void Scheduler::buildDecodeWorkerPlan(AdmissionFeedback& feedback, PlanBuild& bu
     // it waits for would starve it.
     const bool new_prompts_sealed = scheduleReadmission(feedback, build, candidates);
 
-    // Phase 2: the decode batch. Completed prefills' first decodes go ahead
-    // of the running ones; neither consumes token budget on this role.
+    // Phase 2: the decode batch. Running requests keep their permits; ready
+    // prefills use only the remaining execution capacity.
     scheduleDecodeBatch(feedback, build, candidates);
 
     // Phase 3: at most one remote admission -- the whole prompt reserves at

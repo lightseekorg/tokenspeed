@@ -431,9 +431,11 @@ class Glm53FlashRecipe(CacheRecipe):
 
     @override
     def pool_options(self) -> Glm53FlashPoolOptions:
-        max_bs = self.attn_config.max_bs
+        max_resident_requests = self.attn_config.max_resident_requests
         if self.draft_attn_config is not None:
-            max_bs = max(max_bs, self.draft_attn_config.max_bs)
+            max_resident_requests = max(
+                max_resident_requests, self.draft_attn_config.max_resident_requests
+            )
         return Glm53FlashPoolOptions(
             index_kpool=require_positive_int(
                 "index_kpool", self._dsa_config.index_kpool
@@ -444,7 +446,7 @@ class Glm53FlashRecipe(CacheRecipe):
             ),
             # Scheduler request IDs are 1-based; row 0 and one graph-padding
             # sentinel sit outside the live range.
-            num_request_slots=max_bs + 2,
+            num_request_slots=max_resident_requests + 2,
             dsa_layer_ids=tuple(
                 layer_id
                 for layer_id, group_id in enumerate(self.group_ids)

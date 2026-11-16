@@ -448,6 +448,10 @@ class ServerArgs:
     # Memory and scheduling
     gpu_memory_utilization: float | None = None
     max_num_seqs: int | None = None
+    # Additional resident requests per attention-DP rank; forwards still use
+    # max_num_seqs. Omission adds one rank-local batch on decode; zero disables
+    # the extra capacity.
+    disaggregation_decode_extra_slots: int | None = None
     max_total_tokens: int | None = None
     chunked_prefill_size: int | None = None
     max_prefill_tokens: int = 8192
@@ -476,6 +480,10 @@ class ServerArgs:
     # Rounds between ANY attempt points: one rank's backlog opens the gate,
     # bounding how long a prefill waits. Must be >= prefill_attempt_interval.
     prefill_any_attempt_interval: int | None = None
+    # One prefill round per window: the round after a prefill round is not
+    # an ALL point while any rank decodes, so a backlog does not drain in
+    # consecutive prefill rounds. Requires prefill_attempt_interval.
+    prefill_single_round: bool = False
     # Opt-in: the prefill forward that spans a long prompt's last prefix-page
     # boundary before its replay tail (normally the final token) also writes
     # the recurrent state there, where hybrid models publish a checkpoint;
@@ -622,8 +630,8 @@ class ServerArgs:
     # explicit 0 disables the pool: every capacity block then aborts its
     # victim), else derived at device build -- 0.1 of the Device KV without
     # L2, the tails of ``retraction_snapshot_max_requests`` images with L2
-    # (cache/l2/sizing.py). The request cap derives from --max-num-seqs per
-    # attention-DP rank when 0 (resolve_retraction_snapshot_options).
+    # (cache/l2/sizing.py). When 0, the request cap derives from rank-local
+    # resident capacity, including decode extra slots (resolve_retraction_snapshot_options).
     retraction_snapshot_host_gb: float = 0.0
     retraction_snapshot_ratio: float | None = None
     retraction_snapshot_max_requests: int = 0
@@ -909,6 +917,7 @@ class ServerArgs:
         return _SPEC_OVERSHOOT_SPANS * int(self.speculative_num_draft_tokens)
 
     def __post_init__(self):
+        self.validate_decode_extra_slots()
         self.validate_weight_memory_policy()
         self.validate_forward_reload()
         self.resolve_basic_defaults()
@@ -1246,6 +1255,13 @@ class ServerArgs:
                 self.max_num_seqs = 80
             else:
                 self.max_num_seqs = 160
+
+        if self.disaggregation_decode_extra_slots is None:
+            self.disaggregation_decode_extra_slots = (
+                self.max_num_seqs // self.mapping.attn.dp_size
+                if self.disaggregation_mode == "decode"
+                else 0
+            )
 
     def resolve_kernel_backends(self):
         _require_choice(
@@ -1698,8 +1714,9 @@ class ServerArgs:
         a fraction of this rank's Device KV capacity, an explicit 0 disabling
         it; neither given means the device builder derives the size
         (``cache/l2/sizing.py``). ``--retraction-snapshot-max-requests`` 0
-        derives to the rank's running requests (``--max-num-seqs`` over the
-        attention-DP ranks), the most that can ever need an image at once.
+        derives to rank-local resident capacity C: max-num-seqs over the
+        attention-DP ranks plus decode extra slots. Explicit positive caps
+        are preserved; snapshot request rows and Host memory are separate limits.
         The prefill and encode roles never retract: their knobs are resolved
         to no pool here with a log, as the KVStore's are off on the encode
         role.
@@ -1759,22 +1776,30 @@ class ServerArgs:
                 )
             return
         if max_requests == 0:
-            # The cap is max_num_seqs per attention-DP rank: __post_init__
-            # resolves both before the cache.
-            if self.mapping is None or self.max_num_seqs is None:
+            # Extra slots are already rank-local; only the execution limit
+            # is divided by attention DP. __post_init__ resolves both first.
+            if (
+                self.mapping is None
+                or self.max_num_seqs is None
+                or self.disaggregation_decode_extra_slots is None
+            ):
                 raise ValueError(
                     "resolve_parallelism() and resolve_memory_and_scheduling() must "
                     "run before resolve_cache(): the derived "
-                    "--retraction-snapshot-max-requests is max_num_seqs per "
-                    "attention-DP rank"
+                    "--retraction-snapshot-max-requests uses rank-local "
+                    "execution capacity plus resolved decode extra slots"
                 )
             dp_size = max(self.mapping.attn.dp_size, 1)
-            self.retraction_snapshot_max_requests = self.max_num_seqs // dp_size
+            self.retraction_snapshot_max_requests = (
+                self.max_num_seqs // dp_size + self.disaggregation_decode_extra_slots
+            )
             if self.retraction_snapshot_max_requests == 0:
                 raise ValueError(
                     "the retraction snapshot pool derives its request cap from "
                     f"--max-num-seqs ({self.max_num_seqs}) per attention-DP rank "
-                    f"({dp_size}), which is 0 here; raise --max-num-seqs to at "
+                    f"({dp_size}) plus --disaggregation-decode-extra-slots "
+                    f"({self.disaggregation_decode_extra_slots}), which is 0 here; "
+                    "raise --max-num-seqs to at "
                     "least the attention-DP size or pass "
                     "--retraction-snapshot-max-requests"
                 )
@@ -2851,6 +2876,7 @@ class ServerArgs:
             )
 
     def validate(self):
+        self.validate_decode_extra_slots()
         if (
             type(self.ttft_trace_sampling_percentage) is not int
             or not 0 <= self.ttft_trace_sampling_percentage <= 100
@@ -2963,11 +2989,24 @@ class ServerArgs:
             os.environ.setdefault("TRTLLM_ENABLE_PDL", "1")
         os.environ.setdefault("TLLM_LOG_LEVEL", "INFO")
 
+    def validate_decode_extra_slots(self) -> None:
+        extra = self.disaggregation_decode_extra_slots
+        if extra is None:
+            return
+        if type(extra) is not int or extra < 0:
+            raise ValueError(
+                "--disaggregation-decode-extra-slots must be a non-negative integer"
+            )
+        if extra and self.disaggregation_mode != "decode":
+            raise ValueError(
+                "--disaggregation-decode-extra-slots requires --disaggregation-mode decode"
+            )
+
     def validate_prefill_delay(self) -> None:
         intervals = self.prefill_delay
         if intervals is None:
             return
-        attempt, any_attempt = intervals
+        attempt, any_attempt, _ = intervals
         if attempt < 1:
             raise ValueError(f"--prefill-attempt-interval must be >= 1, got {attempt}")
         if any_attempt < attempt:
@@ -2993,18 +3032,24 @@ class ServerArgs:
                 )
 
     @property
-    def prefill_delay(self) -> tuple[int, int] | None:
-        """The gate intervals, or None; reject an incompletely configured pair."""
+    def prefill_delay(self) -> tuple[int, int, bool] | None:
+        """The gate's (attempt, any, single_round) settings, or None; reject
+        an incompletely configured gate."""
         attempt = self.prefill_attempt_interval
         any_attempt = self.prefill_any_attempt_interval
         if attempt is None and any_attempt is None:
+            if self.prefill_single_round:
+                raise ValueError(
+                    "--prefill-single-round requires --prefill-attempt-interval "
+                    "and --prefill-any-attempt-interval"
+                )
             return None
         if attempt is None or any_attempt is None:
             raise ValueError(
                 "--prefill-attempt-interval and --prefill-any-attempt-interval "
                 "must be set together"
             )
-        return (attempt, any_attempt)
+        return (attempt, any_attempt, self.prefill_single_round)
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -3214,6 +3259,20 @@ class ServerArgs:
             type=int,
             default=ServerArgs.max_num_seqs,
             help="Maximum number of sequences to process concurrently.",
+        )
+        parser.add_argument(
+            "--disaggregation-decode-extra-slots",
+            type=int,
+            default=ServerArgs.disaggregation_decode_extra_slots,
+            help="Additional resident request slots per attention-DP rank on a "
+            "decode server. These receive KV without increasing the execution "
+            "concurrency set by --max-num-seqs. If omitted, defaults to "
+            "--max-num-seqs divided by the attention DP size (integer division) "
+            "on decode, and zero on other roles. Set to zero to disable the "
+            "extra capacity. Persistent request state grows with resident "
+            "capacity and can reduce the KV budget; all requests share one KV "
+            "pool. The snapshot request limit defaults to resident capacity "
+            "unless explicitly configured.",
         )
         parser.add_argument(
             "--max-total-tokens",
@@ -3444,7 +3503,8 @@ class ServerArgs:
             "aborts its victim -- the only way to get abort-only behaviour. "
             "Unset (the default) derives the size: 0.1 of the Device KV without "
             "the KVStore (whole images; an on-by-default pool must stay cheap to "
-            "pin -- pass 1 to make every resident suspendable), else the tails "
+            "pin; 1 uses Device KV's usable LCM-block count, with image rows "
+            "limited separately), else the tails "
             "of --retraction-snapshot-max-requests images (one page per group "
             "that publishes to Host L2, a request's worst case for a group that "
             "never does), the slot-state arena coming on top.",
@@ -3455,9 +3515,12 @@ class ServerArgs:
             default=ServerArgs.retraction_snapshot_max_requests,
             help="Slot-state image rows of the retraction snapshot pool, i.e. the "
             "most requests suspended at once. 0 (the default) derives to this "
-            "rank's running requests, --max-num-seqs / attention-DP size, which "
-            "covers every resident; a victim that finds no free row is aborted "
-            "rather than imaged. Refused with --retraction-snapshot-ratio 0.",
+            "rank's resident capacity C: --max-num-seqs / attention-DP size "
+            "plus --disaggregation-decode-extra-slots. An explicit positive "
+            "limit is preserved. Image rows and "
+            "Host KV space are separate limits; when no eligible image fits, "
+            "capacity recovery aborts a resident rather than imaging it. "
+            "Refused with --retraction-snapshot-ratio 0.",
         )
         parser.add_argument(
             "--debug-force-retraction-interval",
@@ -3523,6 +3586,17 @@ class ServerArgs:
             help="Prefill delay: rounds between ANY attempt points, where "
             "one rank's backlog opens the gate, bounding how long a prefill "
             "waits. Must be >= --prefill-attempt-interval.",
+        )
+        parser.add_argument(
+            "--prefill-single-round",
+            action="store_true",
+            default=ServerArgs.prefill_single_round,
+            help="Prefill delay: one prefill round per window. The round "
+            "after a prefill round is not an ALL point while any rank would "
+            "decode, so a backlog does not drain in consecutive prefill "
+            "rounds; the next ALL point is --prefill-attempt-interval rounds "
+            "later. An idle engine still admits at once. Requires "
+            "--prefill-attempt-interval.",
         )
         # Other runtime options
         parser.add_argument(

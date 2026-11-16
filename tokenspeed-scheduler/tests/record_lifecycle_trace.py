@@ -72,6 +72,7 @@ def config(case):
     cfg.max_retracted_requests = 8
     cfg.max_scheduled_tokens = 32
     cfg.max_batch_size = 4
+    cfg.max_resident_requests = cfg.max_batch_size
     cfg.decode_input_tokens = 1
     cfg.disable_l2_cache = case not in (2, 3)
     cfg.enable_l3_storage = False

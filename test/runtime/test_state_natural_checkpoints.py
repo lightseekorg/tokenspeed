@@ -58,6 +58,7 @@ def _scheduler(*, token_budget: int, with_state: bool, disable_prefix_cache: boo
         num_device_pages=64,
         max_scheduled_tokens=token_budget,
         max_batch_size=1,
+        max_resident_requests=1,
         prefix_granularity=128,
         num_host_pages=0,
         disable_l2_cache=True,

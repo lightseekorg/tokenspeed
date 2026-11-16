@@ -135,6 +135,7 @@ def _backend(state, *, width: int, max_bs: int, cls=GdnAttnBackend):
         kv_cache_quant_method="none",
         context_len=4096,
         max_bs=max_bs,
+        max_resident_requests=max_bs,
         speculative_num_draft_tokens=width,
         components=(spec, linear),
     )

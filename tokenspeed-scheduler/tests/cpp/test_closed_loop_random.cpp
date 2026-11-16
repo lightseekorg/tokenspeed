@@ -278,6 +278,7 @@ struct ClosedLoop {
             write_back ? SchedulerConfig::HostWritePolicy::kWriteBack : SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = knobs.chunk_budget > 0 ? knobs.chunk_budget : 48;
         cfg.max_batch_size = 6;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.enable_kv_cache_events = knobs.kv_events;
         cfg.decode_input_tokens = 1;
         cfg.overlap_schedule_depth = overlap_depth;
