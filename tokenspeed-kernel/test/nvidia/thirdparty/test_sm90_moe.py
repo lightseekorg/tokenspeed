@@ -180,6 +180,137 @@ def _arguments(weights, tokens, experts, hidden_size, top_k, concentrated):
     )
 
 
+def _prepared_tensors(x, ids, experts, ep_rank):
+    """Independent packing for exactly representable unit-scale FP8 inputs."""
+    tokens, topk = ids.shape
+    rows, hidden = ids.numel(), x.shape[1]
+    scale_ld = (rows + 31 * experts + 31) // 32 * 32
+    packed = torch.zeros(((rows + 3) // 4 * 4, hidden), device=x.device).to(
+        torch.float8_e4m3fn
+    )
+    scales = torch.ones((hidden // 128, scale_ld), device=x.device)
+    source = torch.zeros(rows, dtype=torch.int32, device=x.device)
+    inverse = torch.full((rows,), -1, dtype=torch.int32, device=x.device)
+    offsets = [0]
+    row = 0
+    # Host enumeration is a test producer, outside all captured device work.
+    local_ids = ids.cpu().tolist()
+    for expert in range(experts):
+        for token in range(tokens):
+            for slot in range(topk):
+                if local_ids[token][slot] != ep_rank * experts + expert:
+                    continue
+                packed[row].copy_(x[token])
+                source[row] = slot * tokens + token
+                inverse[slot * tokens + token] = row
+                row += 1
+        offsets.append(row)
+    offsets = torch.tensor(offsets, dtype=torch.int64, device=x.device)
+    return [packed, scales, source, inverse, offsets]
+
+
+def _combine_native_rows(partial, inverse, offsets, weights):
+    tokens, topk = weights.shape
+    result = torch.zeros((tokens, partial.shape[1]), device=partial.device)
+    for slot in range(topk):
+        rows = inverse.view(topk, tokens)[slot].long()
+        valid = (rows >= 0) & (rows < offsets[-1])
+        values = partial[rows.clamp(min=0)].float()
+        contribution = values * weights[:, slot, None]
+        result += torch.where(valid[:, None], contribution, 0)
+    return result.to(torch.bfloat16)
+
+
+@pytest.fixture(scope="module", params=("expected_m", "optimized"))
+def route_io_native(request):
+    _require_private_sm90()
+    return prepare_sm90_fp8_moe(
+        mode=request.param, max_num_stages_fc1=-1, max_num_stages_fc2=-1
+    ), _make_expert_weights(5, 256, 512)
+
+
+@pytest.mark.parametrize("tokens", (1, 3, 17, 257))
+@pytest.mark.parametrize("ep_size,ep_rank", ((1, 0), (8, 3)))
+def test_native_prepared_and_deferred_routes_replay(
+    route_io_native, tokens, ep_size, ep_rank
+):
+    native, weights = route_io_native
+    args = _arguments(weights, tokens, 5 * ep_size, 256, 3, False)
+    args.update(ep_size=ep_size, ep_rank=ep_rank, use_fused_finalize=False)
+    x, ids = args["input"], args["token_selected_experts"]
+
+    def refresh(frame):
+        # Every 128-channel block has maximum 448 and exact unit FP8 scale.
+        values = torch.arange(x.numel(), device=x.device).reshape_as(x)
+        x.copy_((values + frame).remainder(15) - 7)
+        x[:, ::128] = 448
+        routes = torch.arange(ids.numel(), device=x.device).reshape_as(ids)
+        ids.copy_((routes + frame + ep_rank * 5).remainder(5 * ep_size))
+
+    refresh(0)
+    prepared = _prepared_tensors(x, ids, 5, ep_rank)
+    native_rows = torch.empty((ids.numel(), 256), device=x.device, dtype=x.dtype)
+    inverse = torch.full_like(prepared[3], -2)
+    offsets = torch.empty_like(prepared[4])
+    both_partial = torch.empty_like(native_rows)
+    calls = (
+        partial(native, **args, prepared_input=prepared),
+        partial(
+            native,
+            **args,
+            output=native_rows,
+            route_map=inverse,
+            expert_offsets=offsets,
+        ),
+        partial(
+            native,
+            **args,
+            prepared_input=prepared,
+            output=both_partial,
+            route_map=prepared[3],
+            expert_offsets=prepared[4],
+        ),
+    )
+    graphs = []
+    try:
+        outputs = []
+        for call in calls:
+            for _ in range(3):
+                call()
+            graph = torch.cuda.CUDAGraph()
+            graphs.append(graph)
+            with torch.cuda.graph(graph):
+                outputs.append(call()[0])
+        for frame in range(12):
+            refresh(frame)
+            refreshed = _prepared_tensors(x, ids, 5, ep_rank)
+            for destination, source in zip(prepared, refreshed):
+                destination.copy_(source)
+            expected = native(**args)[0].clone()
+            for graph in graphs:
+                graph.replay()
+            _assert_bitwise(outputs[0], expected)
+            for result, route_map, prefixes in (
+                (native_rows, inverse, offsets),
+                (both_partial, prepared[3], prepared[4]),
+            ):
+                _assert_bitwise(
+                    _combine_native_rows(
+                        result, route_map, prefixes, args["token_final_scales"]
+                    ),
+                    expected,
+                )
+                local = (ids >= ep_rank * 5) & (ids < (ep_rank + 1) * 5)
+                assert torch.all(route_map.view(3, tokens).T[~local] == -1)
+                assert int(prefixes[-1]) == int(local.sum())
+            for current, original in zip(prepared, refreshed):
+                _assert_bitwise(current, original)
+    finally:
+        torch.cuda.synchronize()
+        for graph in graphs:
+            graph.reset()
+
+
 def _capture_calls(calls):
     graphs = []
     for call in calls:

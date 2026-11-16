@@ -373,7 +373,9 @@ def make_cutlass_fused_moe(
 
     Returns:
         A callable with FlashInfer's ``cutlass_fused_moe`` arguments and return
-        values. Private modes additionally accept ``expected_m`` (positive
+        values. Private modes accept caller-owned ``prepared_input`` tensors and
+        paired ``route_map``/``expert_offsets`` destinations as documented by
+        ``prepare_sm90_fp8_moe``. They additionally accept ``expected_m`` (positive
         uint32 or None). The caller owns the estimate and its routing assumptions.
         The mode is fixed for the callable's lifetime; create a new callable and
         recapture graphs to change it. Unsupported private builds raise at init.
@@ -404,6 +406,7 @@ def make_cutlass_fused_moe(
             optimized, max_num_stages_fc1, max_num_stages_fc2
         )
 
+    @functools.wraps(entrypoint)
     def apply(*args, **kwargs):
         if any(
             name in kwargs
