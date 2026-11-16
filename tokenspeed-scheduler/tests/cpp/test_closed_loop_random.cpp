@@ -46,7 +46,7 @@
 // admission, stranded suffix or restore) equal the sum of the drain's
 // outcomes, the dead and demoted entries it dropped included. On the P role
 // a plan leaves at most one prefill incomplete, and it runs last, after any
-// whole prompts run beside its chunk (prefill_chunk_yield_tokens): the
+// whole prompts run beside its chunk, prefill_chunk_yield_tokens or not: the
 // completing prefills form a prefix of the batch. With KV cache events on,
 // every plan's drain removes only blocks the feed stored and stores none
 // twice, alike on mirrored ranks. Once everything is acknowledged, no Host
@@ -192,9 +192,10 @@ struct ClosedLoop {
     std::uint64_t decode_only_write_backs{0};
     std::uint64_t eviction_ops{0};
     // The P role's plans with an incomplete prefill that whole prompts ran
-    // beside (prefill_chunk_yield_tokens), how many of those chunks ended on
-    // a page (with restricted State groups, a segment), and the prompts they
-    // carried.
+    // beside (filling the budget its chunk left or, with
+    // prefill_chunk_yield_tokens, given way to), how many of those chunks
+    // ended on a page (with restricted State groups, a segment), and the
+    // prompts they carried.
     std::uint64_t yielding_chunks{0};
     std::uint64_t yielding_chunks_on_page{0};
     std::uint64_t carried_prompts{0};
@@ -581,10 +582,6 @@ struct ClosedLoop {
                     carried += !prefilling.contains(id) && (resident || Serial(id) > Serial(holder)) ? 1 : 0;
                 }
                 if (carried > 0) {
-                    if (knobs.yield_tokens == 0) {
-                        throw std::logic_error("round " + std::to_string(round) +
-                                               ": a prompt was admitted behind an incomplete prefill");
-                    }
                     ++yielding_chunks;
                     carried_prompts += carried;
                     // A page, or a restricted State group's whole segment.
@@ -803,13 +800,16 @@ struct ClosedLoop {
 
 }  // namespace
 
-// 64 seeds, each of its own configuration, acknowledged op by op.
+// 64 seeds, each of its own configuration, acknowledged op by op. Without
+// prefill_chunk_yield_tokens no chunk gives way, but whole prompts still fill
+// the budget a chunk leaves.
 TEST(ClosedLoopRandomTest, PrefillRoleNeverRaisesAndDrains) {
     // Per write policy and shard count: the eviction write-backs and the
     // prefix loads the runs made.
     std::map<std::pair<bool, std::int32_t>, std::pair<std::uint64_t, std::uint64_t>> exercised;
     std::uint64_t aborts = 0;
     std::uint64_t handoffs = 0;
+    std::uint64_t filled = 0;
     for (unsigned seed = 0; seed < 64; ++seed) {
         ClosedLoop loop(seed, Role::kP, /*mirrored_ranks=*/false, LoopKnobs{});
         SCOPED_TRACE(::testing::Message() << "seed " << seed << (loop.write_back ? " write-back" : " write-through")
@@ -829,6 +829,7 @@ TEST(ClosedLoopRandomTest, PrefillRoleNeverRaisesAndDrains) {
         loads += stats.prefix_loads.ops;
         aborts += loop.aborts;
         handoffs += loop.handoffs;
+        filled += loop.carried_prompts;
     }
     // Write-back evicted, wrote back and loaded back at every shard count.
     for (const std::int32_t shards : {1, 2, 4, 8}) {
@@ -838,6 +839,7 @@ TEST(ClosedLoopRandomTest, PrefillRoleNeverRaisesAndDrains) {
     }
     EXPECT_GT(aborts, 0u);
     EXPECT_GT(handoffs, 0u);
+    EXPECT_GT(filled, 0u) << "whole prompts filled the budget a chunk left";
 }
 
 // 16 seeds, each driving two schedulers as the ranks of one replica. Seeds 16
@@ -1038,7 +1040,8 @@ TEST(ClosedLoopRandomTest, DemotionChainsNeverRaiseAndDrain) {
 // full attention alone; drawn configurations with the KV event feed;
 // restricted State groups of a two-page grain; and, with
 // enable_short_prefill_first, drawn configurations and the 24-token budget,
-// where new prompts and the fill follow the ranking -- every fourth with
+// where new prompts and the fill follow the ranking, the latter also with no
+// yield, where only the fill runs prompts beside a chunk -- every fourth with
 // mirrored ranks. Besides draining with nothing pinned, no plan leaves two
 // prefills incomplete or runs a completing prefill after the incomplete one
 // (NextPlan), so every prompt carried beside a chunk that gave way completes
@@ -1053,6 +1056,8 @@ TEST(ClosedLoopRandomTest, PrefillChunkYieldNeverRaisesAndDrains) {
     full_attention.full_attention_only = true;
     LoopKnobs short_budget_ranked = short_budget;
     short_budget_ranked.short_prefill_first = true;
+    LoopKnobs short_budget_ranked_fill_only = short_budget_ranked;
+    short_budget_ranked_fill_only.yield_tokens = 0;
     const struct {
         const char* name;
         LoopKnobs knobs;
@@ -1066,6 +1071,7 @@ TEST(ClosedLoopRandomTest, PrefillChunkYieldNeverRaisesAndDrains) {
         {"restricted State groups", LoopKnobs{.yield_tokens = 24, .state_grain = 2 * kP}},
         {"short prefill first", LoopKnobs{.yield_tokens = 24, .short_prefill_first = true}},
         {"24-token budget, short prefill first", short_budget_ranked},
+        {"24-token budget, short prefill first, no yield", short_budget_ranked_fill_only},
     };
     for (const auto& variant : variants) {
         std::uint64_t yielding_chunks = 0;
@@ -1093,7 +1099,7 @@ TEST(ClosedLoopRandomTest, PrefillChunkYieldNeverRaisesAndDrains) {
             kv_stored_events += loop.kv_stored_events;
         }
         SCOPED_TRACE(variant.name);
-        EXPECT_GT(yielding_chunks, 0u) << "chunks gave way";
+        EXPECT_GT(yielding_chunks, 0u) << "whole prompts ran beside a chunk";
         EXPECT_GE(carried, yielding_chunks);
         if (variant.knobs.full_attention_only || variant.knobs.state_grain > 1) {
             EXPECT_EQ(on_page, yielding_chunks) << "every chunk that gave way ended on a page or segment";

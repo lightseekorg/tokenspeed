@@ -70,9 +70,11 @@ constexpr std::int32_t kRetractionSafeSteps = 4096;
 // scan is bounded.
 constexpr std::int32_t kMaxRestoreAttemptsPerRound = 4;
 
-// Waiting prompts a round probes for whole prompts a chunk that cannot finish
-// may carry (SchedulerConfig::prefill_chunk_yield_tokens): each probe walks
-// the prompt's prefix pages, so the scan is bounded.
+// Waiting prompts a P-role round probes for whole prompts to run beside a
+// chunk that cannot finish -- those it gives way to
+// (SchedulerConfig::prefill_chunk_yield_tokens) and those filling the budget
+// it leaves: each probe walks the prompt's prefix pages, so the scan is
+// bounded.
 constexpr std::int32_t kMaxYieldProbesPerRound = 8;
 
 constexpr std::int32_t kMaxPrefillBypasses = 8;
@@ -1985,16 +1987,16 @@ bool Scheduler::prefillAllowed(const Request& request, const PlanBuild& build) c
 // of the waiting prompts it can carry whole (carriedPrompts, from the round's
 // once-probed wholePromptsAfter list; for a new prompt only those behind it),
 // and after it keeps the head of line those prompts are admitted complete in
-// the same forward (carryWholePrompts), their rows ahead of its own. Any
-// chunk that keeps the head of line then fills the budget it leaves the same
-// way: from the same list in submission order or, with
-// enable_short_prefill_first, from the new prompts still ranked, in rank
-// order (popShortPrefill; for a resident's chunk ranked after its
-// admission), so a protected prompt goes first. The carry keeps submission
-// order either way. The chunk is still admitted first, and a resident's
-// chunk that fails admission still stops everything behind it. A chunk whose
-// admission compacted carries and fills none: they would be later admissions
-// in the compaction's plan.
+// the same forward (carryWholePrompts), their rows ahead of its own. On the P
+// role, with or without that option, any chunk that keeps the head of line
+// then fills the budget it leaves the same way: from the same list in
+// submission order or, with enable_short_prefill_first, from the new prompts
+// still ranked, in rank order (popShortPrefill; for a resident's chunk ranked
+// after its admission), so a protected prompt goes first. The carry keeps
+// submission order either way. The chunk is still admitted first, and a
+// resident's chunk that fails admission still stops everything behind it. A
+// chunk whose admission compacted carries and fills none: they would be later
+// admissions in the compaction's plan. The fused role does neither.
 void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild& build,
                                          std::span<Request* const> candidates, bool new_prompts_sealed,
                                          std::int32_t decode_reserve) {
@@ -2066,7 +2068,7 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
             // submission order, even when it was ranked; so does the fill
             // when the prompts are not ranked.
             std::size_t from = 0;
-            if (config_.prefill_chunk_yield_tokens > 0 && !resident) {
+            if (config_.role == Role::kP && !resident) {
                 from = static_cast<std::size_t>(std::ranges::find(candidates, request) - candidates.begin()) + 1;
             }
             // Whether this chunk may hold the head of line: a resident's rest
@@ -2104,13 +2106,13 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
                 request->TrackScheduledForward();
                 if (holdsHeadOfLine(*request)) {
                     carryWholePrompts(feedback, build, candidates, carried, decode_reserve);
-                    // The budget the chunk still leaves -- whatever ended it
-                    // short of where it gave way, a junction say -- goes to
-                    // other whole prompts, admitted the same way, unless a
-                    // carried one already failed for capacity or the chunk's
-                    // admission compacted.
-                    if (config_.prefill_chunk_yield_tokens > 0 && !build.Full(config_.max_batch_size) &&
-                        !feedback.admission_failed && !lone_requests_.ActedInPlan()) {
+                    // On the P role, whatever prefill_chunk_yield_tokens, the
+                    // budget the chunk still leaves -- a junction, say, ended
+                    // it short -- goes to other whole prompts, admitted the
+                    // same way, unless a carried one already failed for
+                    // capacity or the chunk's admission compacted.
+                    if (config_.role == Role::kP && !build.Full(config_.max_batch_size) && !feedback.admission_failed &&
+                        !lone_requests_.ActedInPlan()) {
                         if (config_.enable_short_prefill_first) {
                             // With the new prompts ranked, in rank order,
                             // submitted before this prompt or not: a

@@ -631,10 +631,12 @@ private:
                                                              std::int32_t kv_page_budget, std::int32_t yield_tokens,
                                                              bool must_complete);
 
-    // SchedulerConfig::prefill_chunk_yield_tokens (docs/design/scheduler.md
-    // §1.1): a Submitted prompt a chunk that cannot finish may carry in its
-    // forward -- its position in the round's candidates, and the tokens
-    // (replay included) and KV pages the whole prompt takes.
+    // A Submitted prompt a P-role chunk that cannot finish may carry in its
+    // forward (docs/design/scheduler.md §1.1) -- one it gives way to
+    // (SchedulerConfig::prefill_chunk_yield_tokens) or one filling the budget
+    // it leaves, whatever that option: its position in the round's
+    // candidates, and the tokens (replay included) and KV pages the whole
+    // prompt takes.
     struct WholePrompt {
         std::size_t index{0};
         Request* request{nullptr};
