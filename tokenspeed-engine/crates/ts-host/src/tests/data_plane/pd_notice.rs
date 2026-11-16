@@ -130,7 +130,6 @@ fn a_decode_peer_hears_of_a_prompt_when_the_plan_with_its_last_chunk_reaches_the
         };
         pair.decode.register(rid, &bootstrap).unwrap();
         pair.prefill.register(rid, &bootstrap).unwrap();
-        pair.prefill.occupy(rid, tokens / 16, 64);
         scheduler
             .submit_requests(&[RequestSpec {
                 session_id: String::new(),
@@ -138,7 +137,7 @@ fn a_decode_peer_hears_of_a_prompt_when_the_plan_with_its_last_chunk_reaches_the
                 shared_prefix_tokens: Vec::new(),
                 peer_holder: String::new(),
                 request_id: rid.to_owned(),
-                tokens: (0..tokens as i32).map(|t| 1000 * room as i32 + t).collect(),
+                tokens: (0..tokens).map(|t| 1000 * room as i32 + t).collect(),
                 max_new_tokens: 4,
                 max_cached_prefix_tokens: i32::MAX,
             }])

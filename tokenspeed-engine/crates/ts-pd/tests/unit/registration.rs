@@ -428,9 +428,8 @@ fn an_independent_request_is_admitted_by_its_announcement_and_granted_by_its_man
     let (decode, received) = decode_socket();
     register(&peer.shared, "cache-a", "127.0.0.1:41001", decode.port());
 
-    // Not announced: the request waits, whatever the window.
+    // Not announced: the request waits.
     peer.register("r", &room(7)).unwrap();
-    peer.occupy("r", 4, 64);
     assert_eq!(peer.poll(&mut mesh, &group).unwrap(), []);
     peer.shared.handle(&wire::announce_frames(7, "cache-a"));
     assert_eq!(
@@ -462,7 +461,6 @@ fn an_independent_request_is_admitted_by_its_announcement_and_granted_by_its_man
         peer.poll(&mut mesh, &group).unwrap(),
         [PdEvent::DestinationReady("r".to_owned())]
     );
-    assert!(peer.shared.state().charged.is_empty());
 }
 
 #[test]
@@ -522,57 +520,6 @@ fn a_manifest_for_a_room_that_was_not_announced_fails_the_request() {
 }
 
 #[test]
-fn a_destination_that_does_not_allocate_holds_back_only_its_own_requests() {
-    let native = NativeLibrary::new();
-    let (mut peer, outbox, mut mesh, group) = independent_peer(&native, Duration::from_secs(60));
-    let (slow, _slow_received) = decode_socket();
-    let (healthy, _healthy_received) = decode_socket();
-    register(&peer.shared, "slow", "127.0.0.1:41001", slow.port());
-    register(&peer.shared, "healthy", "127.0.0.1:41002", healthy.port());
-    // Two destinations share a pool of 64 blocks: 32 each, one 20-block
-    // prompt outstanding at a time.
-    for (rid, number, cache) in [
-        ("slow-1", 1, "slow"),
-        ("slow-2", 2, "slow"),
-        ("slow-3", 3, "slow"),
-        ("healthy-1", 4, "healthy"),
-    ] {
-        peer.register(rid, &room(number)).unwrap();
-        peer.occupy(rid, 20, 64);
-        peer.shared.handle(&wire::announce_frames(number, cache));
-    }
-    assert_eq!(
-        peer.poll(&mut mesh, &group).unwrap(),
-        [
-            PdEvent::Bootstrapped("slow-1".to_owned()),
-            PdEvent::Bootstrapped("healthy-1".to_owned())
-        ]
-    );
-    assert_eq!(peer.poll(&mut mesh, &group).unwrap(), []);
-    // The slow destination allocates its first request: the next one in
-    // arrival order takes the room.
-    outbox.mark_pages_held(&["slow-1".to_owned()]);
-    assert_eq!(preallocate(&peer.shared, "slow", 1), Ok(()));
-    assert_eq!(
-        peer.poll(&mut mesh, &group).unwrap(),
-        [
-            PdEvent::DestinationReady("slow-1".to_owned()),
-            PdEvent::Bootstrapped("slow-2".to_owned())
-        ]
-    );
-    // A request that ends gives its room back too.
-    peer.cancel("slow-2");
-    assert_eq!(
-        peer.poll(&mut mesh, &group).unwrap(),
-        [
-            PdEvent::Failed("slow-2".to_owned()),
-            PdEvent::Stopped("slow-2".to_owned()),
-            PdEvent::Bootstrapped("slow-3".to_owned())
-        ]
-    );
-}
-
-#[test]
 fn a_request_holding_its_pages_times_out_from_then_and_its_announcer_is_told() {
     let native = NativeLibrary::new();
     let (mut peer, outbox, mut mesh, group) = independent_peer(&native, Duration::from_millis(150));
@@ -613,38 +560,6 @@ fn an_early_rank_answers_an_announcement_at_once() {
     assert_eq!(status(&received), (7, TransferPoll::Bootstrapped));
     assert!(peer.state().announced.is_empty());
     assert_eq!(preallocate(&peer, "cache-a", 7), Ok(()));
-}
-
-#[test]
-fn registrations_without_a_request_take_no_share_of_the_pool() {
-    // One live Decode rank, and the registrations of seven Decode processes
-    // that are gone: nothing here replaces them, and they have no request.
-    let native = NativeLibrary::new();
-    let (mut peer, _outbox, mut mesh, group) = independent_peer(&native, Duration::from_secs(60));
-    register(&peer.shared, "live", "127.0.0.1:41001", 42001);
-    for gone in 0..7 {
-        register(
-            &peer.shared,
-            &format!("gone-{gone}"),
-            &format!("127.0.0.1:4110{gone}"),
-            42100 + gone,
-        );
-    }
-    // The live one has the whole 64-block pool: three 20-block prompts.
-    for (rid, number) in [("a", 1), ("b", 2), ("c", 3), ("d", 4)] {
-        peer.register(rid, &room(number)).unwrap();
-        peer.occupy(rid, 20, 64);
-        peer.shared.handle(&wire::announce_frames(number, "live"));
-    }
-    assert_eq!(
-        peer.poll(&mut mesh, &group).unwrap(),
-        [
-            PdEvent::Bootstrapped("a".to_owned()),
-            PdEvent::Bootstrapped("b".to_owned()),
-            PdEvent::Bootstrapped("c".to_owned())
-        ]
-    );
-    assert_eq!(peer.poll(&mut mesh, &group).unwrap(), []);
 }
 
 #[test]
@@ -689,217 +604,7 @@ fn a_request_its_decode_node_never_announces_times_out_from_its_registration() {
 }
 
 #[test]
-fn a_request_behind_one_that_still_computes_does_not_time_out() {
-    let native = NativeLibrary::new();
-    let (mut peer, outbox, mut mesh, group) = independent_peer(&native, Duration::from_millis(150));
-    let (decode, received) = decode_socket();
-    register(&peer.shared, "cache-a", "127.0.0.1:41001", decode.port());
-    // One destination and a pool of 64 blocks: one 40-block prompt at a time.
-    for (rid, number) in [("first", 1), ("second", 2)] {
-        peer.register(rid, &room(number)).unwrap();
-        peer.occupy(rid, 40, 64);
-        peer.shared
-            .handle(&wire::announce_frames(number, "cache-a"));
-    }
-    assert_eq!(
-        peer.poll(&mut mesh, &group).unwrap(),
-        [PdEvent::Bootstrapped("first".to_owned())]
-    );
-    // `first` computes for longer than the timeout. Its destination owes
-    // nothing before it holds its pages, so `second` only waits.
-    thread::sleep(Duration::from_millis(300));
-    assert_eq!(peer.poll(&mut mesh, &group).unwrap(), []);
-    outbox.mark_pages_held(&["first".to_owned()]);
-    assert_eq!(status(&received), (1, TransferPoll::Bootstrapped));
-    assert_eq!(preallocate(&peer.shared, "cache-a", 1), Ok(()));
-    assert_eq!(
-        peer.poll(&mut mesh, &group).unwrap(),
-        [
-            PdEvent::DestinationReady("first".to_owned()),
-            PdEvent::Bootstrapped("second".to_owned())
-        ]
-    );
-}
-
-#[test]
-fn a_destination_that_stops_allocating_fails_the_requests_it_holds_back_uncomputed() {
-    let native = NativeLibrary::new();
-    let (mut peer, outbox, mut mesh, group) = independent_peer(&native, Duration::from_millis(800));
-    let (decode, received) = decode_socket();
-    register(&peer.shared, "cache-a", "127.0.0.1:41001", decode.port());
-    for (rid, number) in [("first", 1), ("second", 2)] {
-        peer.register(rid, &room(number)).unwrap();
-        peer.occupy(rid, 40, 64);
-        peer.shared
-            .handle(&wire::announce_frames(number, "cache-a"));
-    }
-    assert_eq!(
-        peer.poll(&mut mesh, &group).unwrap(),
-        [PdEvent::Bootstrapped("first".to_owned())]
-    );
-    // `first` computes for half a timeout, then holds its pages; its Decode
-    // node never allocates it. A request that arrives now waits behind it
-    // like `second`.
-    thread::sleep(Duration::from_millis(400));
-    outbox.mark_pages_held(&["first".to_owned()]);
-    assert_eq!(status(&received), (1, TransferPoll::Bootstrapped));
-    peer.register("third", &room(3)).unwrap();
-    peer.occupy("third", 40, 64);
-    peer.shared.handle(&wire::announce_frames(3, "cache-a"));
-    // A timeout after `second` registered, its destination has owed an
-    // allocation for half of one: nothing fails yet.
-    thread::sleep(Duration::from_millis(400));
-    assert_eq!(peer.poll(&mut mesh, &group).unwrap(), []);
-    // A timeout after `first` held its pages it fails, and with it the
-    // requests the window held back, none of which was admitted.
-    thread::sleep(Duration::from_millis(400));
-    assert_eq!(
-        peer.poll(&mut mesh, &group).unwrap(),
-        [
-            PdEvent::Failed("first".to_owned()),
-            PdEvent::Stopped("first".to_owned()),
-            PdEvent::Failed("second".to_owned()),
-            PdEvent::Stopped("second".to_owned()),
-            PdEvent::Failed("third".to_owned()),
-            PdEvent::Stopped("third".to_owned()),
-        ]
-    );
-    assert_eq!(
-        timeouts(&native),
-        [
-            ("bootstrapping".to_owned(), 1.0),
-            ("waiting_for_window".to_owned(), 2.0)
-        ]
-    );
-    let mut told: Vec<_> = (0..3).map(|_| status(&received)).collect();
-    told.sort_by_key(|(room, _)| *room);
-    assert_eq!(
-        told,
-        [
-            (1, TransferPoll::Failed),
-            (2, TransferPoll::Failed),
-            (3, TransferPoll::Failed)
-        ]
-    );
-    // The window is empty again: the next request for this destination is
-    // admitted.
-    peer.register("fourth", &room(4)).unwrap();
-    peer.occupy("fourth", 40, 64);
-    peer.shared.handle(&wire::announce_frames(4, "cache-a"));
-    assert_eq!(
-        peer.poll(&mut mesh, &group).unwrap(),
-        [PdEvent::Bootstrapped("fourth".to_owned())]
-    );
-}
-
-#[test]
-fn a_destination_that_allocates_slowly_fails_none_of_its_requests() {
-    let native = NativeLibrary::new();
-    let (mut peer, outbox, mut mesh, group) = independent_peer(&native, Duration::from_millis(600));
-    let (decode, received) = decode_socket();
-    register(&peer.shared, "cache-a", "127.0.0.1:41001", decode.port());
-    for (rid, number) in [("a", 1), ("b", 2), ("c", 3), ("d", 4)] {
-        peer.register(rid, &room(number)).unwrap();
-        peer.occupy(rid, 40, 64);
-        peer.shared
-            .handle(&wire::announce_frames(number, "cache-a"));
-    }
-    // One 40-block prompt at a time fits the 64-block pool. Each holds its
-    // pages at once and is allocated 0.6 timeouts later, so the last one
-    // waits 1.8 timeouts for its turn, never one whole timeout for a
-    // single allocation.
-    let mut expected = vec![PdEvent::Bootstrapped("a".to_owned())];
-    for (rid, number, next) in [
-        ("a", 1, Some("b")),
-        ("b", 2, Some("c")),
-        ("c", 3, Some("d")),
-        ("d", 4, None),
-    ] {
-        assert_eq!(peer.poll(&mut mesh, &group).unwrap(), expected);
-        outbox.mark_pages_held(&[rid.to_owned()]);
-        assert_eq!(status(&received), (number, TransferPoll::Bootstrapped));
-        thread::sleep(Duration::from_millis(180));
-        assert_eq!(peer.poll(&mut mesh, &group).unwrap(), []);
-        thread::sleep(Duration::from_millis(180));
-        assert_eq!(preallocate(&peer.shared, "cache-a", number), Ok(()));
-        expected = vec![PdEvent::DestinationReady(rid.to_owned())];
-        expected.extend(next.map(|next| PdEvent::Bootstrapped(next.to_owned())));
-    }
-    assert_eq!(peer.poll(&mut mesh, &group).unwrap(), expected);
-}
-
-#[test]
-fn a_destination_keeps_its_share_for_a_timeout_after_its_last_request() {
-    let native = NativeLibrary::new();
-    let (mut peer, _outbox, mut mesh, group) =
-        independent_peer(&native, Duration::from_millis(500));
-    let (slow, _slow_received) = decode_socket();
-    let (healthy, _healthy_received) = decode_socket();
-    register(&peer.shared, "slow", "127.0.0.1:41001", slow.port());
-    register(&peer.shared, "healthy", "127.0.0.1:41002", healthy.port());
-    // The healthy destination's only request ends.
-    peer.register("healthy-0", &room(9)).unwrap();
-    peer.occupy("healthy-0", 20, 64);
-    peer.shared.handle(&wire::announce_frames(9, "healthy"));
-    assert_eq!(
-        peer.poll(&mut mesh, &group).unwrap(),
-        [PdEvent::Bootstrapped("healthy-0".to_owned())]
-    );
-    peer.cancel("healthy-0");
-    assert_eq!(
-        peer.poll(&mut mesh, &group).unwrap(),
-        [
-            PdEvent::Failed("healthy-0".to_owned()),
-            PdEvent::Stopped("healthy-0".to_owned())
-        ]
-    );
-    // The slow destination, alone for the moment, is still held to its half
-    // of the 64-block pool: one 20-block prompt outstanding.
-    for (rid, number) in [("slow-1", 1), ("slow-2", 2), ("slow-3", 3)] {
-        peer.register(rid, &room(number)).unwrap();
-        peer.occupy(rid, 20, 64);
-        peer.shared.handle(&wire::announce_frames(number, "slow"));
-    }
-    assert_eq!(
-        peer.poll(&mut mesh, &group).unwrap(),
-        [PdEvent::Bootstrapped("slow-1".to_owned())]
-    );
-    // So the healthy destination's next request fits beside it.
-    peer.register("healthy-1", &room(4)).unwrap();
-    peer.occupy("healthy-1", 30, 64);
-    peer.shared.handle(&wire::announce_frames(4, "healthy"));
-    assert_eq!(
-        peer.poll(&mut mesh, &group).unwrap(),
-        [PdEvent::Bootstrapped("healthy-1".to_owned())]
-    );
-    let charged = |peer: &PrefillPeer| -> i64 {
-        let state = peer.shared.state();
-        state.charged.values().map(|(_, blocks)| blocks).sum()
-    };
-    assert_eq!(charged(&peer), 50);
-    // The healthy destination has no request for a timeout: its share
-    // lapses and the slow one has the whole pool.
-    peer.cancel("healthy-1");
-    assert_eq!(
-        peer.poll(&mut mesh, &group).unwrap(),
-        [
-            PdEvent::Failed("healthy-1".to_owned()),
-            PdEvent::Stopped("healthy-1".to_owned())
-        ]
-    );
-    thread::sleep(Duration::from_millis(600));
-    assert_eq!(
-        peer.poll(&mut mesh, &group).unwrap(),
-        [
-            PdEvent::Bootstrapped("slow-2".to_owned()),
-            PdEvent::Bootstrapped("slow-3".to_owned())
-        ]
-    );
-    assert_eq!(charged(&peer), 60);
-}
-
-#[test]
-fn a_room_part_of_its_decode_node_announced_takes_no_share_of_the_pool() {
+fn a_room_is_admitted_once_every_rank_of_its_decode_node_announced_it() {
     let native = NativeLibrary::new();
     let (mut peer, _outbox, mut mesh, group) = independent_peer(&native, Duration::from_secs(60));
     // One Decode node of two attention-TP ranks: one destination.
@@ -917,14 +622,14 @@ fn a_room_part_of_its_decode_node_announced_takes_no_share_of_the_pool() {
     }
     for (rid, number) in [("a", 1), ("b", 2), ("c", 3), ("d", 4)] {
         peer.register(rid, &room(number)).unwrap();
-        peer.occupy(rid, 20, 64);
         peer.shared.handle(&wire::announce_frames(number, "d-0"));
         // The fourth room's second announcement is still on its way.
         if number != 4 {
             peer.shared.handle(&wire::announce_frames(number, "d-1"));
         }
     }
-    // The node has the whole 64-block pool: three 20-block prompts.
+    // Every request the node announced is admitted at once, whatever the
+    // node has not allocated yet.
     assert_eq!(
         peer.poll(&mut mesh, &group).unwrap(),
         [
@@ -934,148 +639,29 @@ fn a_room_part_of_its_decode_node_announced_takes_no_share_of_the_pool() {
         ]
     );
     peer.shared.handle(&wire::announce_frames(4, "d-1"));
-    assert_eq!(peer.poll(&mut mesh, &group).unwrap(), []);
-}
-
-#[test]
-fn a_destination_that_allocates_its_other_requests_fails_only_the_one_it_owes() {
-    let native = NativeLibrary::new();
-    let (mut peer, outbox, mut mesh, group) = independent_peer(&native, Duration::from_millis(800));
-    let (decode, _received) = decode_socket();
-    register(&peer.shared, "cache-a", "127.0.0.1:41001", decode.port());
-    // A pool of 64 blocks and 30-block prompts: two outstanding at a time.
-    for (rid, number) in [("big", 1), ("s1", 2)] {
-        peer.register(rid, &room(number)).unwrap();
-        peer.occupy(rid, 30, 64);
-        peer.shared
-            .handle(&wire::announce_frames(number, "cache-a"));
-    }
     assert_eq!(
         peer.poll(&mut mesh, &group).unwrap(),
-        [
-            PdEvent::Bootstrapped("big".to_owned()),
-            PdEvent::Bootstrapped("s1".to_owned())
-        ]
-    );
-    // Both hold their pages. The Decode node allocates `s1` at once and
-    // never `big`; half a timeout later it allocates `s2` as promptly.
-    outbox.mark_pages_held(&["big".to_owned(), "s1".to_owned()]);
-    assert_eq!(preallocate(&peer.shared, "cache-a", 2), Ok(()));
-    assert_eq!(
-        peer.poll(&mut mesh, &group).unwrap(),
-        [PdEvent::DestinationReady("s1".to_owned())]
-    );
-    thread::sleep(Duration::from_millis(500));
-    peer.register("s2", &room(3)).unwrap();
-    peer.occupy("s2", 30, 64);
-    peer.shared.handle(&wire::announce_frames(3, "cache-a"));
-    assert_eq!(
-        peer.poll(&mut mesh, &group).unwrap(),
-        [PdEvent::Bootstrapped("s2".to_owned())]
-    );
-    outbox.mark_pages_held(&["s2".to_owned()]);
-    assert_eq!(preallocate(&peer.shared, "cache-a", 3), Ok(()));
-    assert_eq!(
-        peer.poll(&mut mesh, &group).unwrap(),
-        [PdEvent::DestinationReady("s2".to_owned())]
-    );
-    // `s3` takes the room `s2` left and computes; `late` waits behind it.
-    for (rid, number) in [("s3", 4), ("late", 5)] {
-        peer.register(rid, &room(number)).unwrap();
-        peer.occupy(rid, 30, 64);
-        peer.shared
-            .handle(&wire::announce_frames(number, "cache-a"));
-    }
-    assert_eq!(
-        peer.poll(&mut mesh, &group).unwrap(),
-        [PdEvent::Bootstrapped("s3".to_owned())]
-    );
-    // A timeout after `big` held its pages it fails, alone: its destination
-    // allocated another request half a timeout ago.
-    thread::sleep(Duration::from_millis(400));
-    assert_eq!(
-        peer.poll(&mut mesh, &group).unwrap(),
-        [
-            PdEvent::Failed("big".to_owned()),
-            PdEvent::Stopped("big".to_owned())
-        ]
-    );
-    assert_eq!(timeouts(&native), [("bootstrapping".to_owned(), 1.0)]);
-    assert_eq!(
-        peer.poll(&mut mesh, &group).unwrap(),
-        [PdEvent::Bootstrapped("late".to_owned())]
+        [PdEvent::Bootstrapped("d".to_owned())]
     );
 }
 
 #[test]
-fn a_decode_rank_that_restarted_leaves_no_share_behind() {
-    let native = NativeLibrary::new();
-    let (mut peer, _outbox, mut mesh, group) = independent_peer(&native, Duration::from_secs(60));
-    let (decode, _received) = decode_socket();
-    // The rank registers three caches in turn at its control socket, each
-    // retiring the one before, and each had a request admitted.
-    for (generation, cache) in ["gen-0", "gen-1", "gen-2"].into_iter().enumerate() {
-        register(
-            &peer.shared,
-            cache,
-            &format!("127.0.0.1:4100{generation}"),
-            decode.port(),
-        );
-        let rid = format!("warm-{generation}");
-        let number = 10 + generation as u64;
-        peer.register(&rid, &room(number)).unwrap();
-        peer.occupy(&rid, 20, 64);
-        peer.shared.handle(&wire::announce_frames(number, cache));
-        assert!(peer
-            .poll(&mut mesh, &group)
-            .unwrap()
-            .contains(&PdEvent::Bootstrapped(rid)));
-    }
-    peer.cancel("warm-2");
-    assert_eq!(
-        peer.poll(&mut mesh, &group).unwrap(),
-        [
-            PdEvent::Failed("warm-2".to_owned()),
-            PdEvent::Stopped("warm-2".to_owned())
-        ]
-    );
-    // Only the live cache is a destination: it has the whole 64-block pool,
-    // three 20-block prompts.
-    for (rid, number) in [("a", 1), ("b", 2), ("c", 3)] {
-        peer.register(rid, &room(number)).unwrap();
-        peer.occupy(rid, 20, 64);
-        peer.shared.handle(&wire::announce_frames(number, "gen-2"));
-    }
-    assert_eq!(
-        peer.poll(&mut mesh, &group).unwrap(),
-        [
-            PdEvent::Bootstrapped("a".to_owned()),
-            PdEvent::Bootstrapped("b".to_owned()),
-            PdEvent::Bootstrapped("c".to_owned())
-        ]
-    );
-}
-
-#[test]
-fn a_request_behind_prompts_this_rank_still_computes_is_reported_after_the_stall_interval() {
+fn a_request_waiting_for_its_announcement_is_reported_after_the_stall_interval() {
     use std::{io::Read, os::unix::net::UnixStream};
     let native = NativeLibrary::new();
     let (mut peer, _outbox, mut mesh, group) = independent_peer(&native, Duration::from_secs(60));
     let (decode, _received) = decode_socket();
     register(&peer.shared, "cache-a", "127.0.0.1:41001", decode.port());
-    for (rid, number) in [("ahead", 1), ("behind", 2)] {
+    for (rid, number) in [("computing", 1), ("unannounced", 2)] {
         peer.register(rid, &room(number)).unwrap();
-        peer.occupy(rid, 40, 64);
-        peer.shared
-            .handle(&wire::announce_frames(number, "cache-a"));
     }
+    peer.shared.handle(&wire::announce_frames(1, "cache-a"));
     assert_eq!(
         peer.poll(&mut mesh, &group).unwrap(),
-        [PdEvent::Bootstrapped("ahead".to_owned())]
+        [PdEvent::Bootstrapped("computing".to_owned())]
     );
-    // Both registered a stall interval ago; `ahead` still computes, so
-    // nothing times `behind` out. It is reported, as nothing that points at
-    // a fault; `ahead` is not.
+    // Both registered a stall interval ago. `computing` was admitted and
+    // waits for nothing while it computes; `unannounced` is reported.
     for sender in peer.senders.values_mut() {
         sender.started -= BOOTSTRAP_STALL;
     }
@@ -1091,72 +677,10 @@ fn a_request_behind_prompts_this_rank_still_computes_is_reported_after_the_stall
     let mut log = String::new();
     reader.read_to_string(&mut log).unwrap();
     assert!(
-        log.contains("INFO")
-            && log.contains("behind prompts this rank is still computing")
-            && log.contains("behind(room=2"),
+        log.contains("WARN")
+            && log.contains("waiting for their decode instance's announcement")
+            && log.contains("unannounced(room=2"),
         "{log}"
     );
-    assert!(
-        !log.contains("WARN") && !log.contains("ahead(room=1"),
-        "{log}"
-    );
-}
-
-#[test]
-fn a_destination_that_allocated_long_ago_is_timed_from_the_moment_it_owes() {
-    let native = NativeLibrary::new();
-    let (mut peer, outbox, mut mesh, group) = independent_peer(&native, Duration::from_millis(800));
-    let (decode, _received) = decode_socket();
-    register(&peer.shared, "cache-a", "127.0.0.1:41001", decode.port());
-    // The destination allocates a request, then owes nothing for most of a
-    // timeout.
-    peer.register("first", &room(1)).unwrap();
-    peer.occupy("first", 40, 64);
-    peer.shared.handle(&wire::announce_frames(1, "cache-a"));
-    assert_eq!(
-        peer.poll(&mut mesh, &group).unwrap(),
-        [PdEvent::Bootstrapped("first".to_owned())]
-    );
-    outbox.mark_pages_held(&["first".to_owned()]);
-    assert_eq!(preallocate(&peer.shared, "cache-a", 1), Ok(()));
-    assert_eq!(
-        peer.poll(&mut mesh, &group).unwrap(),
-        [PdEvent::DestinationReady("first".to_owned())]
-    );
-    thread::sleep(Duration::from_millis(600));
-    // One 40-block prompt at a time fits the 64-block pool: `owed` holds
-    // its pages and `behind` waits for the window.
-    for (rid, number) in [("owed", 2), ("behind", 3)] {
-        peer.register(rid, &room(number)).unwrap();
-        peer.occupy(rid, 40, 64);
-        peer.shared
-            .handle(&wire::announce_frames(number, "cache-a"));
-    }
-    assert_eq!(
-        peer.poll(&mut mesh, &group).unwrap(),
-        [PdEvent::Bootstrapped("owed".to_owned())]
-    );
-    outbox.mark_pages_held(&["owed".to_owned()]);
-    // Half a timeout after `owed` held its pages nothing fails, although
-    // the destination's last allocation is more than a timeout old.
-    thread::sleep(Duration::from_millis(400));
-    assert_eq!(peer.poll(&mut mesh, &group).unwrap(), []);
-    // A timeout after it held them both fail.
-    thread::sleep(Duration::from_millis(500));
-    assert_eq!(
-        peer.poll(&mut mesh, &group).unwrap(),
-        [
-            PdEvent::Failed("owed".to_owned()),
-            PdEvent::Stopped("owed".to_owned()),
-            PdEvent::Failed("behind".to_owned()),
-            PdEvent::Stopped("behind".to_owned())
-        ]
-    );
-    assert_eq!(
-        timeouts(&native),
-        [
-            ("bootstrapping".to_owned(), 1.0),
-            ("waiting_for_window".to_owned(), 1.0)
-        ]
-    );
+    assert!(!log.contains("computing(room=1"), "{log}");
 }

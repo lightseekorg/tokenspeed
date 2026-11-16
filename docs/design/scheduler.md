@@ -1562,11 +1562,10 @@ during the forward), attention TP 1, KVP 1, PP 1, no external encoder and a
 model without multimodal input.
 
 The peers' side of that order is in `event-loop.md` (PD): the Decode rank
-announces the room, the prefill peer sends `pd::BootstrappedEvent` while the
-destination's window has room, notifies the Decode rank when the plan that
-carries the request's last chunk goes to the device, and sends
-`pd::DestinationReadyEvent` when the manifests arrived; the Decode peer shows
-its scheduler a request only after that notice.
+announces the room, the prefill peer then sends `pd::BootstrappedEvent`,
+notifies the Decode rank when the plan that carries the request's last chunk
+goes to the device, and sends `pd::DestinationReadyEvent` when the manifests
+arrived; the Decode peer shows its scheduler a request only after that notice.
 
 **Retraction: none.** A P node's pressure valve is the transfer itself — pages
 are pinned until the peer acknowledges, then released wholesale. Retracting a

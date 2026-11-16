@@ -1342,13 +1342,6 @@ impl TransferPeer for DecodePeer {
         Ok(events)
     }
 
-    fn allocates_independently(&self) -> bool {
-        false
-    }
-
-    /// The window is the prefill node's.
-    fn occupy(&mut self, _: &str, _: i64, _: i64) {}
-
     fn record_usage(&mut self, _rid: &str, _cached_tokens: i64, _bootstrap_logprob: Option<f64>) {}
 
     fn has_in_flight(&self) -> bool {

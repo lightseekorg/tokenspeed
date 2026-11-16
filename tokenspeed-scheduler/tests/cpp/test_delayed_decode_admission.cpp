@@ -18,7 +18,6 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-#include <deque>
 #include <map>
 #include <memory>
 
@@ -525,11 +524,7 @@ TEST_F(IndependentAdmissionTest, AllocationPolicyIsExplicitOnlyForPrefill) {
 // round by round. Run() does what the transfer peers do between them:
 //   - a prompt reaches P and its destination's D scheduler in its arrival
 //     round;
-//   - P's peer admits it (pd::BootstrappedEvent on P) at once, or, with
-//     `window`, once the pages of the prompts P admitted for that destination
-//     and D has not allocated leave room for it in the destination's equal
-//     share of P's pool; a destination with none outstanding always gets one
-//     prompt in;
+//   - P's peer admits it (pd::BootstrappedEvent on P) at once;
 //   - D's peer lets D allocate the destination (pd::BootstrappedEvent on D)
 //     when P admitted the prompt's last chunk, so that P holds every page the
 //     prompt needs, or, with kAtArrival, at once: the order that deadlocks;
@@ -548,7 +543,6 @@ protected:
         std::int32_t chunk_tokens;               // P's token budget per round
         std::int32_t yield_tokens;               // P's prefill_chunk_yield_tokens
         Notice notice;
-        bool window;
     };
 
     struct Prompt {
@@ -589,11 +583,6 @@ protected:
         }
         const Scheduler::PlanOptions options{.allow_prefill = true, .apply_prefill_watermark = false};
 
-        const auto share = (setup.prefill_pages - 1) / static_cast<std::int32_t>(decodes.size());
-        // Per destination: prompts P's peer still holds back, oldest first,
-        // and the pages of those it admitted that D has not allocated.
-        std::vector<std::deque<const Prompt*>> held(decodes.size());
-        std::vector<std::int32_t> outstanding(decodes.size(), 0);
         std::map<std::string, const Prompt*> by_id;
         std::map<std::string, int> decoded;
         std::map<std::string, int> finished;
@@ -611,19 +600,7 @@ protected:
                 if (setup.notice == Notice::kAtArrival) {
                     decodes[prompt.destination]->Advance(ExecutionEvent{}.With(pd::BootstrappedEvent{prompt.id}));
                 }
-                held[prompt.destination].push_back(&prompt);
-            }
-            for (std::size_t destination = 0; destination < decodes.size(); ++destination) {
-                auto& queue = held[destination];
-                while (!queue.empty()) {
-                    const std::int32_t pages = (queue.front()->tokens + PrefixGranularity() - 1) / PrefixGranularity();
-                    if (setup.window && outstanding[destination] > 0 && outstanding[destination] + pages > share) {
-                        break;
-                    }
-                    outstanding[destination] += pages;
-                    prefill.Advance(ExecutionEvent{}.With(pd::BootstrappedEvent{queue.front()->id}));
-                    queue.pop_front();
-                }
+                prefill.Advance(ExecutionEvent{}.With(pd::BootstrappedEvent{prompt.id}));
             }
 
             const auto prefill_plan = prefill.NextExecutionPlan(options);
@@ -664,8 +641,6 @@ protected:
                 }
                 if (decode_plan.remote_prefill) {
                     for (const std::string& id : decode_plan.remote_prefill->request_ids) {
-                        outstanding[destination] -=
-                            (by_id.at(id)->tokens + PrefixGranularity() - 1) / PrefixGranularity();
                         prefill.Advance(ExecutionEvent{}.With(pd::DestinationReadyEvent{id}));
                     }
                 }
@@ -708,8 +683,7 @@ TEST_F(PrefillDecodeOrderTest, TheConvoyCompletesWhenDecodeAllocatesOnlyPromptsW
                 .decode_requests = 8,
                 .chunk_tokens = 64,
                 .yield_tokens = 0,
-                .notice = Notice::kPagesComplete,
-                .window = false};
+                .notice = Notice::kPagesComplete};
     EXPECT_EQ(Run(setup, prompts, 200).size(), prompts.size());
 
     setup.notice = Notice::kAtArrival;
@@ -739,8 +713,7 @@ TEST_F(PrefillDecodeOrderTest, ALongPromptAndCarriedShortPromptsComplete) {
                 .decode_requests = 8,
                 .chunk_tokens = 16,
                 .yield_tokens = 8,
-                .notice = Notice::kPagesComplete,
-                .window = false};
+                .notice = Notice::kPagesComplete};
     EXPECT_EQ(Run(setup, prompts, 200).size(), prompts.size());
 
     setup.notice = Notice::kAtArrival;
@@ -770,59 +743,10 @@ TEST_F(PrefillDecodeOrderTest, ALargerPromptIsNotStarvedByLaterSmallPrompts) {
                       .decode_requests = 2,
                       .chunk_tokens = 64,
                       .yield_tokens = 0,
-                      .notice = Notice::kPagesComplete,
-                      .window = false};
+                      .notice = Notice::kPagesComplete};
     const auto finished = Run(setup, prompts, 1000);
     ASSERT_EQ(finished.size(), prompts.size());
     EXPECT_LT(finished.at("W"), 59);
-}
-
-// P serves a slow destination, whose prompts decode for long in a pool that
-// holds two of them, and a healthy one. Without a window the slow
-// destination's computed prompts fill P, and the healthy destination's wait
-// behind them for allocations that come every ten rounds. With each
-// destination's outstanding prompts held to its share of P's pool, the
-// healthy destination's prompts are not delayed.
-TEST_F(PrefillDecodeOrderTest, ASlowDestinationDoesNotDelayAnotherWithinItsShare) {
-    std::vector<Prompt> prompts;
-    for (int i = 0; i < 30; ++i) {
-        prompts.push_back({.id = "slow" + std::to_string(i),
-                           .tokens = 8,
-                           .max_new_tokens = 22,
-                           .decode_rounds = 20,
-                           .arrival = i,
-                           .destination = 0});
-        prompts.push_back({.id = "healthy" + std::to_string(i),
-                           .tokens = 8,
-                           .max_new_tokens = 4,
-                           .decode_rounds = 2,
-                           .arrival = i,
-                           .destination = 1});
-    }
-    Setup setup{.prefill_pages = 21,
-                .decode_pages = {31, 65},
-                .decode_requests = 8,
-                .chunk_tokens = 16,
-                .yield_tokens = 0,
-                .notice = Notice::kPagesComplete,
-                .window = true};
-    const auto longest_healthy_wait = [&](const std::map<std::string, int>& finished) {
-        int longest = 0;
-        for (const Prompt& prompt : prompts) {
-            if (prompt.destination == 1) {
-                longest = std::max(longest, finished.at(prompt.id) - prompt.arrival);
-            }
-        }
-        return longest;
-    };
-    const auto windowed = Run(setup, prompts, 2000);
-    ASSERT_EQ(windowed.size(), prompts.size());
-    EXPECT_LE(longest_healthy_wait(windowed), 8);
-
-    setup.window = false;
-    const auto unlimited = Run(setup, prompts, 2000);
-    ASSERT_EQ(unlimited.size(), prompts.size());
-    EXPECT_GT(longest_healthy_wait(unlimited), 80);
 }
 
 }  // namespace tokenspeed::test

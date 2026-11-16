@@ -464,17 +464,6 @@ impl TransferPeer for FakePeer {
         Ok(())
     }
 
-    fn allocates_independently(&self) -> bool {
-        self.independent
-    }
-
-    fn occupy(&mut self, _: &str, _: i64, _: i64) {
-        assert!(
-            self.independent,
-            "only an independent prefill rank is told what its prompts take"
-        );
-    }
-
     /// As `ts-pd`'s peers poll: each rank reads its view of every tracked
     /// transfer, the replica agrees on the least advanced one, and the
     /// agreed state is acted on. The wire is unlocked while the replica

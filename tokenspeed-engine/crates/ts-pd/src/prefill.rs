@@ -160,11 +160,9 @@ pub struct PrefillConfig {
     pub bootstrap_payload: serde_json::Value,
     /// A request whose Decode ranks have not all pre-allocated this long
     /// after registration fails. Under independent decode allocation it
-    /// bounds the wait for the Decode node's announcement, the wait behind
-    /// a destination's window while that destination allocates nothing it
-    /// owes and, from the moment a request holds its pages, the wait for
-    /// its allocation; a destination also keeps its share of the pool this
-    /// long after its last request (`PrefillPeer::poll`).
+    /// bounds the wait for the Decode node's announcement and, from the
+    /// moment a request holds its pages, the wait for its allocation
+    /// (`PrefillPeer::poll`).
     pub bootstrap_timeout: Duration,
     /// After a transfer to a session fails, its later transfers fail fast
     /// for this long; zero disables.
@@ -312,20 +310,11 @@ struct State {
     /// each room. Together they are the request's destination.
     announced: HashMap<u64, BTreeSet<String>>,
     /// Independent: the rooms whose request holds every page of its prompt
-    /// (its last chunk went to the device), since when.
+    /// (its last chunk went to the device), since when. The marks are local
+    /// to this rank and time-based: the members of a replica would have to
+    /// agree on them, and independent allocation requires single-member
+    /// replicas today.
     pages_held: HashMap<u64, Instant>,
-    /// Independent: the admitted rooms whose destination is not allocated
-    /// yet, with that destination and the pool blocks they charge its
-    /// window.
-    charged: HashMap<u64, (BTreeSet<String>, i64)>,
-    /// Independent: the destinations that share the pool, each with the
-    /// last poll that saw a request of it tracked here and the moment it
-    /// last completed an allocation. One keeps its share for the bootstrap
-    /// timeout after the former, while its sessions stay registered. This,
-    /// the charges and the marks above are local to this rank and
-    /// time-based: the members of a replica would have to agree on them,
-    /// and independent allocation requires single-member replicas today.
-    share_holders: HashMap<BTreeSet<String>, (Instant, Option<Instant>)>,
 }
 
 impl State {
@@ -443,7 +432,6 @@ impl State {
         self.prefill_metadata.remove(&room);
         self.announced.remove(&room);
         self.pages_held.remove(&room);
-        self.charged.remove(&room);
     }
 
     /// One complete, unique Decode-rank set.
@@ -488,9 +476,8 @@ struct Shared {
     layerwise: Option<Layerwise>,
     /// The decode allocation policy this rank registered with the bootstrap
     /// server is independent: a request is admitted once its Decode node
-    /// announced it and its destination's window has room, and that node
-    /// allocates only after this rank's notice that the request holds its
-    /// pages.
+    /// announced it, and that node allocates only after this rank's notice
+    /// that the request holds its pages.
     independent: bool,
     /// Layerwise: each transfer interval's fields.
     interval_fields: Vec<Option<BTreeSet<String>>>,
@@ -518,7 +505,7 @@ impl Shared {
     }
 
     /// Fail a room and tell every destination that pre-allocated for it or
-    /// announced it. Its window charge goes back.
+    /// announced it.
     fn abort_room(&self, room: u64, reason: &str) {
         let routes: Vec<_> = {
             let mut state = self.state();
@@ -537,7 +524,6 @@ impl Shared {
             let destinations = state.destinations.remove(&room).unwrap_or_default();
             let announced = state.announced.remove(&room).unwrap_or_default();
             state.pages_held.remove(&room);
-            state.charged.remove(&room);
             let sessions: BTreeSet<&String> = destinations
                 .iter()
                 .filter(|destination| !destination.is_dummy())
@@ -992,13 +978,6 @@ impl Shared {
         state.touch(room);
         if complete {
             state.rooms.update(room, TransferPoll::Bootstrapped);
-            // The destination is allocated: its window has the room again,
-            // and the destination has shown that it allocates.
-            if let Some((destination, _)) = state.charged.remove(&room) {
-                if let Some((_, allocated)) = state.share_holders.get_mut(&destination) {
-                    *allocated = Some(Instant::now());
-                }
-            }
         }
         drop(state);
         tracing::debug!(
@@ -1845,13 +1824,9 @@ fn same_prompt_window(windows: &[&Manifest]) -> Result<(), String> {
 /// One request's transfer as the scheduling loop tracks it.
 struct Sender {
     room: u64,
-    /// What the prompt takes of the cache pool, and the pool, in its blocks
-    /// (`TransferPeer::occupy`).
-    prompt_blocks: i64,
-    pool_blocks: i64,
-    /// Independent decode allocation: this rank admitted the request (its
-    /// destination announced it and the window had room).
-    window_open: bool,
+    /// Independent decode allocation: this rank admitted the request (every
+    /// rank of its Decode node announced it).
+    announced: bool,
     /// Independent: the replica agreed on the admission, which the
     /// scheduler was told.
     admitted: bool,
@@ -1866,8 +1841,6 @@ struct Sender {
 enum Wait {
     /// Independent decode allocation: its Decode node's announcement.
     Announcement,
-    /// Independent: room in its destination's window.
-    Window,
     /// Its destination's allocation, every Decode rank's manifest.
     Allocation,
 }
@@ -2003,9 +1976,7 @@ impl PrefillPeer {
     /// waited that long (`waits`, by `order`): under early allocation the
     /// ones still bootstrapping, under independent allocation by what each
     /// waits for and since when. There a prompt that computes waits for
-    /// nothing; a request its destination's window holds back is reported
-    /// by its own wait, timed or not. One behind prompts this rank still
-    /// computes is ordinary under load: it is reported, not warned about.
+    /// nothing.
     fn log_stalls(&mut self, polls: &[i64], waits: &[(Wait, Option<Instant>)]) {
         let now = Instant::now();
         if self
@@ -2014,39 +1985,19 @@ impl PrefillPeer {
         {
             return;
         }
-        // By what the requests wait for, and whether that points at a fault.
-        let mut stalled: BTreeMap<(&'static str, bool), Vec<String>> = BTreeMap::new();
+        // By what the requests wait for.
+        let mut stalled: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
         for ((rid, &poll), &(wait, since)) in self.order.iter().zip(polls).zip(waits) {
             if poll != TransferPoll::Bootstrapping as i64 {
                 continue;
             }
             let sender = &self.senders[rid];
-            let (what, fault, since) = match (wait, since) {
-                (Wait::Allocation, since) if !self.shared.independent => {
-                    ("requests still bootstrapping", true, since)
+            let what = match wait {
+                Wait::Allocation if !self.shared.independent => "requests still bootstrapping",
+                Wait::Allocation => "requests still waiting for their decode allocation",
+                Wait::Announcement => {
+                    "requests still waiting for their decode instance's announcement"
                 }
-                (Wait::Allocation, since) => (
-                    "requests still waiting for their decode allocation",
-                    true,
-                    since,
-                ),
-                (Wait::Announcement, since) => (
-                    "requests still waiting for their decode instance's announcement",
-                    true,
-                    since,
-                ),
-                (Wait::Window, Some(_)) => (
-                    "requests held back by their destination's window behind one its decode \
-                     instance has not allocated",
-                    true,
-                    Some(sender.started),
-                ),
-                (Wait::Window, None) => (
-                    "requests held back by their destination's window behind prompts this rank \
-                     is still computing",
-                    false,
-                    Some(sender.started),
-                ),
             };
             let Some(age) = since
                 .map(|since| now - since)
@@ -2054,7 +2005,7 @@ impl PrefillPeer {
             else {
                 continue;
             };
-            let stalled = stalled.entry((what, fault)).or_default();
+            let stalled = stalled.entry(what).or_default();
             if stalled.len() < 8 {
                 stalled.push(format!(
                     "{rid}(room={}, age={:.0}s)",
@@ -2066,12 +2017,8 @@ impl PrefillPeer {
         if !stalled.is_empty() {
             self.stall_logged_at = Some(now);
         }
-        for ((what, fault), stalled) in stalled {
-            if fault {
-                tracing::warn!(?stalled, "{what}");
-            } else {
-                tracing::info!(?stalled, "{what}");
-            }
+        for (what, stalled) in stalled {
+            tracing::warn!(?stalled, "{what}");
         }
     }
 
@@ -2115,9 +2062,7 @@ impl TransferPeer for PrefillPeer {
                 rid.to_owned(),
                 Sender {
                     room,
-                    prompt_blocks: 0,
-                    pool_blocks: 0,
-                    window_open: false,
+                    announced: false,
                     admitted: false,
                     started: Instant::now(),
                     local: TransferPoll::Bootstrapping,
@@ -2132,17 +2077,6 @@ impl TransferPeer for PrefillPeer {
         Ok(())
     }
 
-    fn allocates_independently(&self) -> bool {
-        self.shared.independent
-    }
-
-    fn occupy(&mut self, rid: &str, prompt_blocks: i64, pool_blocks: i64) {
-        if let Some(sender) = self.senders.get_mut(rid) {
-            sender.prompt_blocks = prompt_blocks;
-            sender.pool_blocks = pool_blocks;
-        }
-    }
-
     fn poll(&mut self, mesh: &mut Mesh, replica: &Group) -> Result<Vec<PdEvent>, PdError> {
         if self.order.is_empty() {
             return Ok(Vec::new());
@@ -2153,127 +2087,35 @@ impl TransferPeer for PrefillPeer {
         let mut waits = Vec::with_capacity(self.order.len());
         {
             let mut state = self.shared.state();
-            let state = &mut *state;
-            let (announced, registrations) = (&state.announced, &state.registrations);
-            // Independent: a request's destination, the Decode ranks that
-            // announced its room once every rank of their node has.
-            let destination_of = |room: u64| {
-                announced.get(&room).filter(|sessions| {
-                    sessions.iter().all(|session| {
-                        registrations.get(session).is_some_and(|registration| {
-                            registration.planned.expected_decode_ranks.len() == sessions.len()
-                        })
-                    })
-                })
-            };
-            if independent {
-                // Admit, in registration order, the requests whose Decode
-                // node announced them while their destination's window has
-                // room. The destinations that had a request tracked here
-                // within the last bootstrap timeout share the pool equally,
-                // whatever else is registered; a window is that share less
-                // what the destination's admitted requests take whose
-                // manifests have not arrived. A destination with none
-                // outstanding always gets one request in, and a request held
-                // back holds back the later ones of its destination.
-                for sender in self.senders.values() {
-                    if let Some(destination) = destination_of(sender.room) {
-                        match state.share_holders.get_mut(destination) {
-                            Some((seen, _)) => *seen = now,
-                            None => {
-                                state.share_holders.insert(destination.clone(), (now, None));
-                            }
-                        }
-                    }
-                }
-                // A share lapses a timeout after its destination's last
-                // request, and at once with a session of it: a retired
-                // cache does not come back.
-                let lapse = self.bootstrap_timeout;
-                state.share_holders.retain(|sessions, (seen, _)| {
-                    now - *seen < lapse
-                        && sessions
-                            .iter()
-                            .all(|session| registrations.contains_key(session))
-                });
-                let share_holders = state.share_holders.len().max(1) as i64;
-                let mut outstanding: HashMap<BTreeSet<String>, i64> = HashMap::new();
-                for (destination, blocks) in state.charged.values() {
-                    *outstanding.entry(destination.clone()).or_default() += blocks;
-                }
-                let mut held_back: HashSet<&BTreeSet<String>> = HashSet::new();
-                for rid in &self.order {
-                    let sender = self.senders.get_mut(rid).expect("tracked");
-                    if sender.window_open || sender.concluded.is_some() {
-                        continue;
-                    }
-                    let Some(destination) = destination_of(sender.room) else {
-                        continue;
-                    };
-                    if held_back.contains(destination) {
-                        continue;
-                    }
-                    let taken = outstanding.get(destination).copied().unwrap_or(0);
-                    if taken > 0
-                        && taken + sender.prompt_blocks > sender.pool_blocks / share_holders
-                    {
-                        held_back.insert(destination);
-                        continue;
-                    }
-                    *outstanding.entry(destination.clone()).or_default() += sender.prompt_blocks;
-                    state
-                        .charged
-                        .insert(sender.room, (destination.clone(), sender.prompt_blocks));
-                    sender.window_open = true;
-                }
-            }
-            // Independent: since when each destination owes an allocation,
-            // the moment the earliest of its admitted requests that still
-            // wait for theirs held its pages. This runs after the window
-            // pass and a request that times out below keeps its charge
-            // until its room is aborted further down, so no request takes
-            // its place in the poll that fails it.
-            let mut owing_since: HashMap<&BTreeSet<String>, Instant> = HashMap::new();
-            for (room, (destination, _)) in &state.charged {
-                if let Some(&held) = state.pages_held.get(room) {
-                    owing_since
-                        .entry(destination)
-                        .and_modify(|since| *since = held.min(*since))
-                        .or_insert(held);
-                }
-            }
             for rid in &self.order {
                 let sender = self.senders.get_mut(rid).expect("tracked");
+                // Independent: a request is admitted once every rank of its
+                // Decode node announced its room.
+                if independent && !sender.announced && sender.concluded.is_none() {
+                    sender.announced = state.announced.get(&sender.room).is_some_and(|sessions| {
+                        sessions.iter().all(|session| {
+                            state
+                                .registrations
+                                .get(session)
+                                .is_some_and(|registration| {
+                                    registration.planned.expected_decode_ranks.len()
+                                        == sessions.len()
+                                })
+                        })
+                    });
+                }
                 // What the request waits for and since when; the bootstrap
                 // timeout bounds each wait. Under early allocation that is
                 // its destination, from registration. Under independent
                 // allocation: its Decode node's announcement, from
-                // registration; held back by its destination's window, an
-                // allocation that destination owes, from the later of the
-                // moment it owed one and its last completed allocation, so
-                // the requests behind one a Decode node that allocates
-                // nothing never allocates fail with it, before they are
-                // computed, and a node that allocates its other requests
-                // fails only the one it owes; once admitted nothing while
-                // it computes, then its own destination from the moment it
-                // held its pages.
+                // registration; once admitted nothing while it computes,
+                // then its destination from the moment it held its pages.
                 let (wait, since) = if !independent {
                     (Wait::Allocation, Some(sender.started))
-                } else if sender.window_open {
+                } else if sender.announced {
                     (
                         Wait::Allocation,
                         state.pages_held.get(&sender.room).copied(),
-                    )
-                } else if let Some(destination) = destination_of(sender.room) {
-                    let allocated = state
-                        .share_holders
-                        .get(destination)
-                        .and_then(|(_, allocated)| *allocated);
-                    (
-                        Wait::Window,
-                        owing_since
-                            .get(destination)
-                            .map(|&owed| owed.max(allocated.unwrap_or(owed))),
                     )
                 } else {
                     (Wait::Announcement, Some(sender.started))
@@ -2294,12 +2136,6 @@ impl TransferPeer for PrefillPeer {
                                     "bootstrapping",
                                     "when bootstrapping: the decode instance never sent their \
                                      cache manifest",
-                                ),
-                                Wait::Window => (
-                                    "waiting_for_window",
-                                    "behind their destination's window: the decode instance \
-                                     allocated nothing for the whole timeout while a request \
-                                     admitted before them held its pages here",
                                 ),
                                 Wait::Announcement => (
                                     "waiting_for_announcement",
@@ -2346,7 +2182,7 @@ impl TransferPeer for PrefillPeer {
         let admissions: Vec<i64> = self
             .order
             .iter()
-            .map(|rid| i64::from(self.senders[rid].window_open))
+            .map(|rid| i64::from(self.senders[rid].announced))
             .collect();
         let admissions = if replica.size() > 1 && independent {
             mesh.all_reduce(replica, &admissions, Reduce::Min)?

@@ -1077,10 +1077,9 @@ impl KvTransferMetrics {
 
     /// A transfer that timed out in `stage`: on the prefill node
     /// `bootstrapping`, or before an independent node admitted the request
-    /// `waiting_for_announcement` (of its decode node) and
-    /// `waiting_for_window` (its destination did not allocate an earlier
-    /// request); on the decode node `waiting_for_admission` before its
-    /// manifest went out, then `waiting_for_input`.
+    /// `waiting_for_announcement` (of its decode node); on the decode node
+    /// `waiting_for_admission` before its manifest went out, then
+    /// `waiting_for_input`.
     pub fn record_timeout(&self, stage: &str) {
         self.timeouts
             .inc(&[&self.labels[0], &self.labels[1], stage], 1.0);
