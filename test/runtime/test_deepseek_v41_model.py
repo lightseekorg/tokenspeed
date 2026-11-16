@@ -282,6 +282,7 @@ class _Backend:
         self.calls = []
         self.global_writes = {}
         self.projections = {}
+        self.swa_writes = []
 
     def query_metadata(self, mode):
         return self.meta
@@ -320,6 +321,12 @@ class _Backend:
             positions.clone(),
             requests.clone(),
         )
+
+    def write_decode_swa(self, *args, **kwargs):
+        # Index sources write their decode SWA rows early; the synthetic
+        # attention below still receives the same rows.
+        self.swa_writes.append((args, kwargs))
+        return True
 
     def forward_v41(
         self,
@@ -377,6 +384,14 @@ class _Backend:
         pass
 
     def begin_indexer_stage(self):
+        pass
+
+    def prepare_decode_index_geometry(self, forward_mode, *, index_heads):
+        # Decode builds index geometry ahead of the layers; this backend
+        # keeps none.
+        pass
+
+    def prepare_reindex_index_geometry(self, forward_mode, *, index_heads):
         pass
 
 
@@ -2082,6 +2097,149 @@ def test_attention_owner_cast_index_and_grouped_output(layer_id):
             assert attn.indexer.wk is None and attn.indexer.k_norm is None
     else:
         assert iq is iw is None and attn.indexer is None
+
+
+@pytest.mark.parametrize("layer_id", [1, 2, 3, 24])
+def test_index_source_decode_writes_swa_rows_inside_its_fork(layer_id):
+    """An index source writes its decode SWA rows right after its Q
+    projection, inside the stream fork, with the exact tensors forward_v41
+    attends; nothing forward_v41 receives changes."""
+
+    class Backend(_Backend):
+        def prepare_global_selection(self, *args, **kwargs):
+            events.append("selection")
+            return None
+
+        def write_decode_swa(self, *args, **kwargs):
+            events.append("swa_write")
+            return super().write_decode_swa(*args, **kwargs)
+
+        def forward_v41(self, q, swa, **kwargs):
+            events.append("attention")
+            self.attended.append((swa, kwargs["positions"], kwargs))
+            return super().forward_v41(q, swa, **kwargs)
+
+    class LateBackend(Backend):
+        def write_decode_swa(self, *args, **kwargs):
+            # Declines, as for rows outside the refreshed decode window:
+            # forward_v41 then writes them itself.
+            events.append("swa_write")
+            return False
+
+    torch.manual_seed(300 + layer_id)
+    config = _config()
+    attn = DeepseekV41Attention(
+        config,
+        _mapping(0, 1, 1),
+        layer_id,
+        v41._ced_decoder_start(config),
+        None,
+        f"layers.{layer_id}.attn",
+        aux_stream=None,
+    )
+    _initialize(attn)
+    attn.wq_b.register_forward_hook(lambda *args: events.append("q_projection"))
+    positions = torch.arange(6)
+    x = torch.randn(6, 128, dtype=torch.bfloat16)
+    events = []
+
+    def run(backend_type):
+        backend = backend_type(positions, torch.zeros(6, dtype=torch.int64))
+        backend.swa_writes, backend.attended = [], []
+        events.clear()
+        out = attn(positions, x, _ctx(backend, 6, ForwardMode.DECODE), True)
+        return out, backend, list(events)
+
+    expected, late, late_events = run(LateBackend)
+    actual, early, early_events = run(Backend)
+    source = layer_id in config.index_source_layer_ids
+    if source:
+        assert early_events == ["selection", "q_projection", "swa_write", "attention"]
+        assert late_events == early_events and not late.swa_writes
+        ((args, kwargs),) = early.swa_writes
+        swa, attended_positions, attended = early.attended[0]
+        assert args[0] == layer_id and args[1] is swa
+        assert args[2] is attended_positions is early.meta.positions
+        assert args[3] is attended["request_indices"] is early.meta.request_indices
+        assert args[4] is ForwardMode.DECODE
+        assert kwargs == dict(
+            swa_rope_cache=attended["swa_rope_cache"],
+            swa_norm_weight=attended["swa_norm_weight"],
+            swa_norm_eps=attended["swa_norm_eps"],
+        )
+    else:
+        assert "swa_write" not in early_events and not early.swa_writes
+        assert late_events == early_events
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    for got, want in zip(early.calls[-1][1:], late.calls[-1][1:], strict=True):
+        assert (got is None) == (want is None)
+        if isinstance(got, torch.Tensor):
+            assert torch.equal(got, want)
+
+
+@pytest.mark.parametrize("mode", [ForwardMode.EXTEND, ForwardMode.DECODE])
+def test_decode_forward_builds_index_geometry_ahead_of_its_layers(monkeypatch, mode):
+    """A decode forward builds the Full sources' geometry before its first
+    layer and the Reindex sources' right after the candidate source; a
+    backend that builds nothing ahead yields the same outputs."""
+    monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
+    monkeypatch.setattr(v41, "try_mhc_shifted_post_pre_norm", lambda *args: None)
+    torch.manual_seed(92)
+    config = _config()
+    config.engram_layer_ids = []
+    model = DeepseekV41Model(
+        config, _mapping(0, 1, 1), None, "model", False, "gpu", None
+    )
+    _initialize(model)
+    positions = torch.arange(6)
+
+    class Backend(_Backend):
+        def __init__(self, *args):
+            super().__init__(*args)
+            self.builds = []
+
+        def prepare_global_selection(self, *args, **kwargs):
+            return None
+
+        def prepare_decode_index_geometry(self, forward_mode, *, index_heads):
+            # Layers whose attention ran before the build.
+            self.builds.append(("full", len(self.calls), forward_mode, index_heads))
+
+        def prepare_reindex_index_geometry(self, forward_mode, *, index_heads):
+            self.builds.append(("reindex", len(self.calls), forward_mode, index_heads))
+
+    class PlainBackend(Backend):
+        def prepare_decode_index_geometry(self, forward_mode, *, index_heads):
+            pass
+
+        def prepare_reindex_index_geometry(self, forward_mode, *, index_heads):
+            pass
+
+    def run(backend_type):
+        backend = backend_type(positions, torch.zeros_like(positions))
+        hidden, _ = model(
+            torch.tensor([0, 3, 4, 6, 3, 4]),
+            positions,
+            _ctx(backend, 6, mode),
+            None,
+            None,
+            engram_hash_ids=None,
+            engram_token_mask=None,
+            image_mask=None,
+        )
+        return hidden, backend
+
+    expected, plain = run(PlainBackend)
+    actual, early = run(Backend)
+    assert not plain.builds
+    heads = config.index_n_heads
+    assert early.builds == (
+        [("full", 0, mode, heads), ("reindex", 21, mode, heads)]
+        if mode.is_decode()
+        else []
+    )
+    assert len(early.calls) == len(plain.calls) == config.num_hidden_layers
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 def test_full_40_layer_backbone_engram_and_final_mix(monkeypatch):

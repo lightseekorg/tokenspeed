@@ -86,12 +86,11 @@ def _native_indices(scores, lengths, topk):
     return deep_select_topk(scores, lengths, topk, output)
 
 
-def _select_topk_prepared(logits, ends, topk):
-    """Select nonempty contiguous native logits with pre-clamped int32 ends.
+def _prepared_picks(logits, ends, topk):
+    """_select_topk_prepared before finishing.
 
-    The native adapter owns both buffers. Borrow aligned logits read-only;
-    otherwise use select_topk's alignment copy. Return sorted logical IDs
-    with -1 padding, without candidate mapping or newest-block pinning.
+    Returns (indices, scores, ends, None) for finish_selection with width
+    logits.shape[1] and block size 1, or None when nothing is selectable.
     """
     _validate(logits, ends, topk, 1, None)
     input_alignment, _ = deep_select_alignment()
@@ -103,9 +102,40 @@ def _select_topk_prepared(logits, ends, topk):
         and (logits.stride(0) * logits.element_size()) % input_alignment == 0
         and logits.data_ptr() % input_alignment == 0
     ):
-        return select_topk(logits, ends, None, topk, 1)
-    indices = _native_indices(logits, ends, topk)
-    return finish_selection(indices, logits, ends, None, logits.shape[1], 1, True)
+        return _topk_picks(logits, ends, None, topk, 1)
+    return _native_indices(logits, ends, topk), logits, ends, None
+
+
+def _select_topk_prepared(logits, ends, topk):
+    """Select nonempty contiguous native logits with pre-clamped int32 ends.
+
+    The native adapter owns both buffers. Borrow aligned logits read-only;
+    otherwise use select_topk's alignment copy. Return sorted logical IDs
+    with -1 padding, without candidate mapping or newest-block pinning.
+    """
+    picks = _prepared_picks(logits, ends, topk)
+    if picks is None:
+        return torch.full(
+            (logits.shape[0], topk), -1, dtype=torch.int32, device=logits.device
+        )
+    return finish_selection(*picks, logits.shape[1], 1, True)
+
+
+def _candidate_picks(logits, valid_lengths, topk_blocks, block_size):
+    """select_candidates before finishing.
+
+    Returns (indices, scores, ends) for finish_selection without candidates,
+    or None when nothing is selectable.
+    """
+    _validate(logits, valid_lengths, topk_blocks, block_size, None)
+    if logits.shape[0] == 0 or logits.shape[1] == 0:
+        return None
+    input_alignment, _ = deep_select_alignment()
+    # block_size=1 still needs newest pin, unlike ordinary token preparation.
+    scores, ends = prepare_native_block_scores(
+        logits, valid_lengths, block_size, input_alignment // 4
+    )
+    return _native_indices(scores, ends, topk_blocks), scores, ends
 
 
 @register_kernel(
@@ -126,20 +156,45 @@ def _select_topk_prepared(logits, ends, topk):
     priority=Priority.PERFORMANT,
 )
 def select_candidates(logits, valid_lengths, topk_blocks, block_size):
-    _validate(logits, valid_lengths, topk_blocks, block_size, None)
-    if logits.shape[0] == 0 or logits.shape[1] == 0:
+    picks = _candidate_picks(logits, valid_lengths, topk_blocks, block_size)
+    if picks is None:
         return torch.full(
             (logits.shape[0], topk_blocks), -1, dtype=torch.int32, device=logits.device
         )
-    input_alignment, _ = deep_select_alignment()
-    # block_size=1 still needs newest pin, unlike ordinary token preparation.
-    scores, ends = prepare_native_block_scores(
-        logits, valid_lengths, block_size, input_alignment // 4
-    )
-    indices = _native_indices(scores, ends, topk_blocks)
+    indices, scores, ends = picks
     return finish_selection(
         indices, scores, ends, None, scores.shape[1], block_size, False
     )
+
+
+def _topk_picks(logits, valid_lengths, candidate_blocks, topk, block_size):
+    """select_topk before finishing.
+
+    Returns (indices, scores, ends, candidates) for finish_selection with
+    width logits.shape[1], or None when nothing is selectable.
+    """
+    _validate(logits, valid_lengths, topk, block_size, candidate_blocks)
+    if (
+        logits.shape[0] == 0
+        or logits.shape[1] == 0
+        or (candidate_blocks is not None and candidate_blocks.shape[1] == 0)
+    ):
+        return None
+    input_alignment, _ = deep_select_alignment()
+    if candidate_blocks is None:
+        scores, ends = prepare_native_dense_scores(
+            logits, valid_lengths, input_alignment // logits.element_size()
+        )
+        normalized = None
+    else:
+        scores, ends, normalized = prepare_candidate_scores(
+            logits,
+            valid_lengths,
+            candidate_blocks,
+            block_size,
+            input_alignment // logits.element_size(),
+        )
+    return _native_indices(scores, ends, topk), scores, ends, normalized
 
 
 @register_kernel(
@@ -160,30 +215,9 @@ def select_candidates(logits, valid_lengths, topk_blocks, block_size):
     priority=Priority.PERFORMANT,
 )
 def select_topk(logits, valid_lengths, candidate_blocks, topk, block_size):
-    _validate(logits, valid_lengths, topk, block_size, candidate_blocks)
-    if (
-        logits.shape[0] == 0
-        or logits.shape[1] == 0
-        or (candidate_blocks is not None and candidate_blocks.shape[1] == 0)
-    ):
+    picks = _topk_picks(logits, valid_lengths, candidate_blocks, topk, block_size)
+    if picks is None:
         return torch.full(
             (logits.shape[0], topk), -1, dtype=torch.int32, device=logits.device
         )
-    input_alignment, _ = deep_select_alignment()
-    if candidate_blocks is None:
-        scores, ends = prepare_native_dense_scores(
-            logits, valid_lengths, input_alignment // logits.element_size()
-        )
-        normalized = None
-    else:
-        scores, ends, normalized = prepare_candidate_scores(
-            logits,
-            valid_lengths,
-            candidate_blocks,
-            block_size,
-            input_alignment // logits.element_size(),
-        )
-    indices = _native_indices(scores, ends, topk)
-    return finish_selection(
-        indices, scores, ends, normalized, logits.shape[1], block_size, True
-    )
+    return finish_selection(*picks, logits.shape[1], block_size, True)

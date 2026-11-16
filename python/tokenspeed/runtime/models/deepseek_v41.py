@@ -1691,6 +1691,26 @@ class DeepseekV41Attention(nn.Module):
             elif swa.shape[0]:
                 swa = _attention_norm(swa, self.kv_norm)
                 swa = self.rotary_emb.apply_owned(swa, positions, False)
+            if (
+                mode.is_decode()
+                and self.is_index_source
+                and rows.keep_rows is None
+                and query_gather is None
+            ):
+                # Publish this step's SWA rows on the main stream while the
+                # index branch still runs; forward_v41 then skips its write.
+                # Nothing on the index branch reads the SWA cache, and the
+                # attention that reads it follows on this stream.
+                backend.write_decode_swa(
+                    self.layer_id,
+                    swa,
+                    positions,
+                    requests,
+                    mode,
+                    swa_rope_cache=swa_rope_cache,
+                    swa_norm_weight=swa_norm_weight,
+                    swa_norm_eps=self.kv_norm.variance_epsilon,
+                )
         if overlap:
             # Aux-owned scratch can outlive this layer through source/reuse
             # records. Main consumers and allocator reuse both follow the join.
@@ -2662,6 +2682,17 @@ class DeepseekV41Model(nn.Module):
             )
         backend = ctx.attn_backend
         backend.begin_indexer_forward()
+        # Decode builds the index sources' geometry on the auxiliary stream,
+        # off the index layers' chains, and joins the builds at the end.
+        geometry_builds = [] if ctx.forward_mode.is_decode() else None
+        if geometry_builds is not None:
+            geometry_builds.append(
+                self._index_geometry_branch(
+                    lambda: backend.prepare_decode_index_geometry(
+                        ctx.forward_mode, index_heads=self.config.index_n_heads
+                    )
+                )
+            )
         state = self.encoder_forward(
             input_ids,
             positions,
@@ -2673,10 +2704,49 @@ class DeepseekV41Model(nn.Module):
             image_mask=image_mask,
         )
         state = self.narrowing_forward(state, ctx)
+        if geometry_builds is not None:
+            # After the candidate source published its blocks; the build then
+            # overlaps the layers before the first Reindex source.
+            geometry_builds.append(
+                self._index_geometry_branch(
+                    lambda: backend.prepare_reindex_index_geometry(
+                        ctx.forward_mode, index_heads=self.config.index_n_heads
+                    )
+                )
+            )
         hidden, captured = self.decoder_forward(state, ctx)
         output = self.finish_forward(hidden, captured, ctx)
+        if geometry_builds is not None:
+            for done in geometry_builds:
+                if done is not None:
+                    torch.cuda.current_stream().wait_event(done)
         backend.end_indexer_forward()
         return output
+
+    def _index_geometry_branch(self, build) -> torch.cuda.Event | None:
+        """Run ``build`` on the auxiliary stream after the main stream's queued work.
+
+        The main stream does not wait here: index layers read the geometry on
+        the auxiliary stream, which orders them after it. A scoring call on
+        another stream waits through the index metadata's ready events; the
+        selection table and lengths carry none, so any other reader of them
+        must run on the auxiliary stream. Returns the branch's completion
+        event, which the forward joins at its end so no capture leaves it
+        unjoined. Without an auxiliary stream (CPU) the build runs in place
+        and there is nothing to join.
+        """
+        if self.aux_stream is None:
+            build()
+            return None
+        main = torch.cuda.current_stream()
+        fork = torch.cuda.Event()
+        fork.record(main)
+        with torch.cuda.stream(self.aux_stream):
+            self.aux_stream.wait_event(fork)
+            build()
+            done = torch.cuda.Event()
+            done.record(self.aux_stream)
+        return done
 
     def _run_layer(
         self,

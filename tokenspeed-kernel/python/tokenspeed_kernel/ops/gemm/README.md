@@ -1,9 +1,7 @@
 # GEMM weight preparation
 
-The optional `trtllm_kernel` extension is required for TRT-LLM's fused-A
-projection and cuBLASLt NVFP4 GEMM provider. Without it, the NVFP4 leaf is not
-registered and a direct fused-A call reports the missing package; importing
-other GEMM providers does not require the extension.
+TRT-LLM's DeepSeek V3 fused-A projection and cuBLASLt NVFP4 GEMM provider are
+built into tokenspeed-kernel's CUDA extension, adapted from TensorRT-LLM.
 
 ## Blackwell block-FP8 automatic selection
 

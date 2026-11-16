@@ -30,6 +30,11 @@ request IDs. Free decode windows use independent rows so reordering queries
 cannot truncate the history scored for an earlier row.
 Request IDs, tables, and lengths remain unchanged while sharing metadata;
 graph replay refreshes their captured producers.
+`prepare_index_topk` builds that geometry ahead of the scoring call, from the
+same table, length and candidate tensors: paged Full's sanitized tables and
+schedules, or the native sparse scorer's normalized candidates and schedule,
+under the keys `index_topk` looks up. The runtime uses it to move the builds
+off a decode layer's index chain.
 
 The paged selection cleaner writes its final aligned score layout directly.
 It masks invalid pages and initializes the last live tile's prefetch padding;
@@ -38,6 +43,25 @@ buffer with exclusive row ends, avoiding another alignment copy. Candidate
 block reduction similarly initializes only live blocks and their final aligned
 segment, and native selection uses the valid block counts. The full-width
 cleaner and generic score-preparation helpers retain their existing contracts.
+Paged Full without prepared blocks skips that copy, as dense Full does: it
+sets invalid table pages inside [0, end) to -inf in DeepGEMM's own rows
+(`mask_invalid_table_pages`) and selects from them at the cleaned copy's
+padded width. It keeps the cleaned copy when DeepGEMM's row stride misses
+DeepSelect's input alignment. The cleaner remains for prepared blocks.
+The mask runs one program per row and 1024-page chunk, so a long row's
+pages are checked in parallel rather than by one looping program.
+
+Each native selection tile finishes in one kernel (`finish_write_selection`):
+the filter and position sort of `finish_selection`, the output copy and
+counts of `write_selection`, and, when the caller passes `SelectionSlots`,
+the `global_slots` lookup. A candidate-source pass finishes its row and block
+picks in the same launch, on separate programs. Native sparse Reindex skips
+the candidate mask: rows whose candidate pool fits the selection width were
+not scored, and the kernel takes such a pool whole, as the mask's equal 0.0
+scores did; scored rows are read only on [0, end). DeepSelect does not run
+its NaN check on rows that short, so their uninitialized logits are never
+inspected. Rows, lengths, candidate blocks and slots stay bit-identical to
+the separate finish, write and slot passes.
 
 Candidate block maxima remain FP32, with the existing newest-block pinning and
 logical-position mapping. Converting BF16 scores to FP32 for this reduction
