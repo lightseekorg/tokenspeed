@@ -622,3 +622,15 @@ def test_triton_boundary_gathers_a_mailbox_with_the_ordinary_bits(
             sentinel,
             1,
         )
+    # An odd block stride would split the 32-bit words the kernel re-arms.
+    width = branch.shape[1] // blocks
+    odd = torch.empty(blocks * (rows * width + 1), dtype=torch.bfloat16, device=device)
+    with pytest.raises(ValueError, match="whole 32-bit words"):
+        triton_boundary(
+            stream,
+            odd.as_strided((blocks, rows, width), (rows * width + 1, width, 1)),
+            *args[2:],
+            True,
+            sentinel,
+            1,
+        )

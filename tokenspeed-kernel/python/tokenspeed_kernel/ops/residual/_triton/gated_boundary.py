@@ -279,6 +279,9 @@ def _launch_post_norm_residual_pre_norm(
             raise ValueError(
                 "a mailbox must be the first rows of whole contiguous blocks"
             )
+        # The kernel polls halves but re-arms 32-bit words, which must not straddle two blocks.
+        if block_width < 2 or block_stride % 2:
+            raise ValueError("a mailbox block must hold whole 32-bit words")
     if stream.dtype != torch.float32:
         raise ValueError("the residual stream must use FP32")
     if branch.dtype != torch.bfloat16:
