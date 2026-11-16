@@ -3615,6 +3615,10 @@ class KimiLinearMoE(nn.Module):
                     )
                 if num_tokens <= K3_SHARED_RS_MAX_TOKENS:
                     shared_shard = self.comm.shared_rs(shared_partial)
+                elif not prefix_is_sharded and self.mapping.moe.tp_ep_size > 1:
+                    # Beside the routed experts instead of after the join.
+                    self.comm.inject_residual(shared_partial, prefix_sum)
+                    prefix_sum = None
 
             if routed_in is None:
                 routed_in, _ = self.routed_expert_down_proj(hidden_states)
