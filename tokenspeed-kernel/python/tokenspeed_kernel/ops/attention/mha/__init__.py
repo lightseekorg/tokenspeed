@@ -531,7 +531,7 @@ def mha_decode_with_kvcache(
     override: str | None = None,
     solution: str | None = None,
     *,
-    block_draft: bool = False,
+    block_draft: bool,
 ) -> AttentionResult:
     """MHA decode with paged KV cache.
 
@@ -568,7 +568,7 @@ def mha_decode_with_kvcache(
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
         block_draft: Select noncausal draft-block attention via its trait.
-            Omission preserves ordinary decode for existing callers.
+            Pass False for ordinary decode and True for a noncausal draft block.
     """
     signature, scale_kwargs, traits = _decode_selection(
         q,
@@ -660,7 +660,7 @@ def mha_decode_schedule(
     # attention options
     *,
     window_left: int = -1,
-    block_draft: bool = False,
+    block_draft: bool,
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
     return_lse: bool = False,
@@ -747,7 +747,7 @@ def mha_decode_takes_schedule(
     v_cache: torch.Tensor,
     max_seqlen_q: int,
     window_left: int = -1,
-    block_draft: bool = False,
+    block_draft: bool,
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
     return_lse: bool = False,

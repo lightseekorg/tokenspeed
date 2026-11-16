@@ -178,6 +178,7 @@ def test_legacy_positional_arguments_keep_their_meaning(
         None,  # scales and schedule
         None,
         "triton",  # override and solution retain their positional slots
+        block_draft=False,
     )
     torch.testing.assert_close(output, inputs["q"] * 0.25 + 2.0)
     assert lse is sinks

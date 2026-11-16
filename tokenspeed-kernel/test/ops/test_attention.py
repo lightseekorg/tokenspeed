@@ -506,6 +506,7 @@ def test_mha_decode_with_kvcache(
         max_seqlen_k=max_cache_seqlen,
         max_seqlen_q=seqlen_q,
         solution=solution,
+        block_draft=False,
     )
 
     assert out.shape == q.shape
@@ -595,6 +596,7 @@ def test_mha_decode_with_kvcache_gluon_peeled_split(
         max_seqlen_k=max_seqlen_k,
         max_seqlen_q=1,
         solution="gluon",
+        block_draft=False,
     )
 
     assert out.shape == q.shape
@@ -855,6 +857,7 @@ def test_triton_mha_decode_folds_query_rows(
         return_lse=not has_sink,
         softmax_scale=scale,
         solution="triton",
+        block_draft=False,
     )
     out, lse = result if not has_sink else (result, None)
     torch.testing.assert_close(out.float(), expected_out, rtol=2e-2, atol=2e-2)
@@ -893,6 +896,7 @@ def test_triton_mha_decode_folded_no_recompile_across_batches(
             max_seqlen_q=rows,
             return_lse=True,
             solution="triton",
+            block_draft=False,
         )
 
     for rows in (8, 16):
@@ -982,6 +986,7 @@ def test_triton_mha_decode_returns_lse_at_every_batch_size(
                 return_lse=return_lse,
                 softmax_scale=scale,
                 solution="triton",
+                block_draft=False,
             )
             out = result[0] if return_lse else result
             torch.testing.assert_close(out.float(), out_ref, rtol=2e-2, atol=2e-2)

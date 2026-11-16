@@ -10,7 +10,8 @@ embedding, and the Triton-Ascend import adapter required by CANN 9.0.0.
 Per-head Q/K normalization uses native RMSNorm. RoPE supports K-only updates
 and casts only the cache rows selected by the current positions. Block-draft
 MHA dispatch exposes a `block_draft` trait so providers can register noncausal
-block implementations without changing ordinary decode calls.
+block implementations. Decode and schedule calls require an explicit
+`block_draft` value: `False` for ordinary decode and `True` for draft blocks.
 
 For development from this repository:
 
