@@ -1655,8 +1655,9 @@ class ServerArgs:
         a fraction of this rank's Device KV capacity, an explicit 0 disabling
         it; neither given means the device builder derives the size
         (``cache/l2/sizing.py``). ``--retraction-snapshot-max-requests`` 0
-        derives to the rank's running requests (``--max-num-seqs`` over the
-        attention-DP ranks), the most that can ever need an image at once.
+        derives to the rank-local execution limit B (max-num-seqs over the
+        attention-DP ranks). Extra resident slots do not increase this cap;
+        snapshot request rows and Host memory are separate limits.
         The prefill and encode roles never retract: their knobs are resolved
         to no pool here with a log, as the KVStore's are off on the encode
         role.
@@ -3215,7 +3216,9 @@ class ServerArgs:
             "concurrency set by --max-num-seqs. If omitted, defaults to "
             "--max-num-seqs divided by the attention DP size (integer division) "
             "on decode, and zero on other roles. Set to zero to disable the "
-            "extra capacity.",
+            "extra capacity. Persistent request state grows with resident "
+            "capacity and can reduce the KV budget; all requests share one KV "
+            "pool. The snapshot request limit is configured separately.",
         )
         parser.add_argument(
             "--max-total-tokens",
@@ -3446,7 +3449,8 @@ class ServerArgs:
             "aborts its victim -- the only way to get abort-only behaviour. "
             "Unset (the default) derives the size: 0.1 of the Device KV without "
             "the KVStore (whole images; an on-by-default pool must stay cheap to "
-            "pin -- pass 1 to make every resident suspendable), else the tails "
+            "pin; 1 uses Device KV's usable LCM-block count, with image rows "
+            "limited separately), else the tails "
             "of --retraction-snapshot-max-requests images (one page per group "
             "that publishes to Host L2, a request's worst case for a group that "
             "never does), the slot-state arena coming on top.",
@@ -3457,9 +3461,11 @@ class ServerArgs:
             default=ServerArgs.retraction_snapshot_max_requests,
             help="Slot-state image rows of the retraction snapshot pool, i.e. the "
             "most requests suspended at once. 0 (the default) derives to this "
-            "rank's running requests, --max-num-seqs / attention-DP size, which "
-            "covers every resident; a victim that finds no free row is aborted "
-            "rather than imaged. Refused with --retraction-snapshot-ratio 0.",
+            "rank's execution limit B, --max-num-seqs / attention-DP size. "
+            "Extra resident slots do not increase this default. Image rows and "
+            "Host KV space are separate limits; when no eligible image fits, "
+            "capacity recovery aborts a resident rather than imaging it. "
+            "Refused with --retraction-snapshot-ratio 0.",
         )
         parser.add_argument(
             "--debug-force-retraction-interval",

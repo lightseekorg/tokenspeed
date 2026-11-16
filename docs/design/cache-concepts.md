@@ -722,12 +722,16 @@ slot; `scheduler.md` §2 and §4 describe the FSM side):
   blob — goes to the **retraction snapshot pool**: a small, request-private, pinned pool
   sized like the Host L2 tier (an explicit `--retraction-snapshot-host-gb`,
   else `--retraction-snapshot-ratio` of the Device KV, else derived: by
-  default one tail per retractable request, `cache/l2/sizing.py`), never
+  default one tail per configured snapshot request row, cache/l2/sizing.py), never
   evicted, never prefix-indexed, allocated by the scheduler like the Host L2
   pool and addressed by scheduler (virtual) block id. Without the L2 tier
   (`--disable-kvstore`) the whole image goes there, and the derived default
   is a tenth of the Device KV -- an on-by-default pool stays cheap to pin;
-  `--retraction-snapshot-ratio 1` makes every resident suspendable.
+  retraction-snapshot-ratio=1 uses Device KV's usable LCM-block count for
+  snapshot KV. Image rows are limited separately and default to the
+  rank-local execution limit, excluding extra resident slots; enough Host
+  space alone does not make
+  every resident simultaneously suspendable.
 
 The runtime side is **one** `HostCacheExecutor` (`cache/l2/executor.py`)
 owning two `HostCacheStorage` buffers over the same field geometry, each with

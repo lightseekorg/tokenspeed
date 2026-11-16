@@ -91,6 +91,83 @@ def _ack(scheduler, op, kind) -> None:
         _send(scheduler, event)
 
 
+def test_fused_decode_uses_request_capacity_without_decode_permits():
+    cfg = _config(2, 2)
+    cfg.role = ts.SchedulerConfig.Role.Fused
+    scheduler = ts.Scheduler(cfg)
+    scheduler.submit_requests(
+        [
+            _spec(rid, [100 * i + 1, 100 * i + 2])
+            for i, rid in enumerate(("a", "b", "c"))
+        ]
+    )
+    assert _forward_ids(scheduler.next_execution_plan()) == ["a", "b"]
+    for rid in ("a", "b"):
+        _advance(scheduler, rid, [42])
+    assert scheduler.allocated_request_slots() == 2
+    assert scheduler.ready_waiting_size() == 0
+
+    for token in (43, 44):
+        assert _forward_ids(scheduler.next_execution_plan()) == ["a", "b"]
+        assert scheduler.decoding_size() == 2
+        assert scheduler.active_decode_slots() == 0
+        for rid in ("a", "b"):
+            _advance(scheduler, rid, [token])
+
+    _finish(scheduler, "a")
+    assert _forward_ids(scheduler.next_execution_plan()) == ["c"]
+    _advance(scheduler, "c", [42])
+    assert _forward_ids(scheduler.next_execution_plan()) == ["b", "c"]
+    assert scheduler.allocated_request_slots() == 2
+    assert scheduler.active_decode_slots() == 0
+    assert scheduler.ready_waiting_size() == 0
+    for rid in ("b", "c"):
+        _advance(scheduler, rid, [45])
+        _finish(scheduler, rid)
+    assert _forward_ids(scheduler.next_execution_plan()) == []
+    assert scheduler.allocated_request_slots() == 0
+
+
+def test_fused_decode_restores_without_reserving_a_decode_permit():
+    cfg = _config(1, 1)
+    cfg.role = ts.SchedulerConfig.Role.Fused
+    cfg.debug_force_retraction_interval = 4
+    scheduler = ts.Scheduler(cfg)
+    scheduler.submit_requests([_spec("running", [1, 2])])
+    assert _forward_ids(scheduler.next_execution_plan()) == ["running"]
+    _advance(scheduler, "running", [42])
+    for token in (43, 44):
+        assert _forward_ids(scheduler.next_execution_plan()) == ["running"]
+        _advance(scheduler, "running", [token])
+
+    retract = scheduler.next_execution_plan()
+    [snapshot] = [op for op in retract.cache if isinstance(op, ts.Cache.SnapshotOp)]
+    assert _forward_ids(retract) == []
+    assert scheduler.retracted_size() == 1
+    assert scheduler.active_decode_slots() == 0
+    _ack(scheduler, snapshot, ts.Cache.SnapshotDoneEvent)
+
+    restore = scheduler.next_execution_plan()
+    [restore_op] = [op for op in restore.cache if isinstance(op, ts.Cache.RestoreOp)]
+    assert _forward_ids(restore) == []
+    assert list(restore_op.request_ids) == ["running"]
+    assert scheduler.allocated_request_slots() == 1
+    assert scheduler.active_decode_slots() == 0
+    _ack(scheduler, restore_op, ts.Cache.RestoreDoneEvent)
+    assert scheduler.retracted_size() == 0
+    assert scheduler.decoding_size() == 1
+    assert scheduler.request_token_size("running") == 5
+
+    assert _forward_ids(scheduler.next_execution_plan()) == ["running"]
+    assert scheduler.active_decode_slots() == 0
+    assert scheduler.ready_waiting_size() == 0
+    _advance(scheduler, "running", [45])
+    _finish(scheduler, "running")
+    assert _forward_ids(scheduler.next_execution_plan()) == []
+    assert scheduler.allocated_request_slots() == 0
+    assert scheduler.active_decode_slots() == 0
+
+
 def test_remote_prefill_uses_resident_capacity_beyond_the_decode_batch():
     scheduler = ts.Scheduler(_config(2, 4))
     _submit(scheduler, "a", "b", "c", "d", "e")

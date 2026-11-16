@@ -979,7 +979,7 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
                                                                   Request* request) {
     DecodeSlotIndex decode_slot;
     fsm::ForwardResources& resources = request->ForwardResourcesRef();
-    if (config_.role != Role::kP && !resources.decode_slot.valid()) {
+    if (config_.role == Role::kD && !resources.decode_slot.valid()) {
         if (decode_slots_.AvailableSlots() == 0) {
             return std::nullopt;  // Execution admission, not a KV capacity failure.
         }
@@ -1172,7 +1172,8 @@ std::optional<PrefillOperation> Scheduler::schedulePrefillCandidate(ExecutionPla
 // once. Then decode work, by most newly releasable blocks and fewest
 // generated tokens: the needed pages with the fewest victims disturb the
 // fewest clients, and among equal frees the client that has streamed least
-// is interrupted. (On the D role everything resident is decoding.)
+// is interrupted. On D, this includes PrefillDone requests waiting for
+// their first permit and Decoding requests; RemotePrefilling is excluded.
 //
 // Only candidates whose image fits the host budgets (imageShortfall) are
 // ranked. When none does, the host side is out of room and the last resort
@@ -1833,7 +1834,7 @@ bool Scheduler::scheduleRestore(AdmissionFeedback& feedback, PlanBuild& build, R
         return false;
     }
     DecodeSlotIndex decode_slot;
-    if (std::holds_alternative<fsm::ResumeDecoding>(retracted->shape)) {
+    if (config_.role == Role::kD && std::holds_alternative<fsm::ResumeDecoding>(retracted->shape)) {
         if (decode_slots_.AvailableSlots() == 0) {
             return false;  // Waiting for execution must not seal KV admission.
         }
