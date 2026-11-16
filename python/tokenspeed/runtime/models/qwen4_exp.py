@@ -76,6 +76,7 @@ from tokenspeed.runtime.models.qwen4_exp_monokernel import (
 )
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.utils import add_prefix
+from tokenspeed.runtime.utils.cuda_stream import StreamFork
 
 logger = logging.getLogger(__name__)
 
@@ -371,6 +372,8 @@ class Qwen4ExpAttentionDecoderLayer(
             dense_batch_invariant=False,
             query_sharded=False,
         )
+        # FP8 projections keep their packed serial path.
+        self.qsa_fork = StreamFork(None if enable_fp8_attn_proj else alt_stream)
         self.indexer = None
         if getattr(config, "indexer_n_heads", None) is not None:
             from tokenspeed.runtime.layers.attention.qsa import QSAIndexer
@@ -384,18 +387,59 @@ class Qwen4ExpAttentionDecoderLayer(
             )
         self._init_qwen4_exp_extensions(config, mapping, layer_id, quant_config, prefix)
 
+    def _can_overlap_qsa(
+        self, hidden_states: torch.Tensor, ctx: ForwardContext
+    ) -> bool:
+        # Performance policy: one request with four BF16 verify rows. The
+        # indexer owns whether its cache/selection tail may use another stream.
+        return (
+            self.indexer is not None
+            and self.qsa_fork.aux_stream is not None
+            and hidden_states.is_cuda
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.shape[0] == 4
+            and ctx.bs == 1
+            and self.indexer.can_overlap(ctx, num_rows=hidden_states.shape[0])
+        )
+
     def self_attention(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
     ) -> torch.Tensor:
-        q, k, v, gate = self._project_qkv(hidden_states)
-        selected_slots = (
-            self.indexer(hidden_states, positions, ctx)
-            if self.indexer is not None
-            else None
-        )
+        overlap = self._can_overlap_qsa(hidden_states, ctx)
+        capturing = overlap and torch.cuda.is_current_stream_capturing()
+        if overlap:
+            # Project on main: GEMM providers can share stream-local workspace.
+            raw_q, token_k = self.indexer._project_qk_raw(hidden_states)
+            main_stream = torch.cuda.current_stream()
+        with self.qsa_fork.scope(enable=overlap, overlap=True):
+            if overlap:
+                with self.qsa_fork.branch():
+                    if not capturing:
+                        for tensor in (raw_q, token_k, positions):
+                            tensor.record_stream(self.qsa_fork.aux_stream)
+                    selected_slots = self.indexer.forward_projected(
+                        raw_q, token_k, positions, ctx
+                    )
+            q, k, v, gate = self._project_qkv(hidden_states)
+            if overlap:
+                # Prologue remains the sole owner of head transforms and KV
+                # writes. Core attention below consumes its prepared query.
+                q = self.attn.prologue(q, k, v, positions, ctx).q
+                k = v = None
+            else:
+                selected_slots = (
+                    self.indexer(hidden_states, positions, ctx)
+                    if self.indexer is not None
+                    else None
+                )
+        if overlap and not capturing:
+            selected_slots.record_stream(main_stream)
+            ctx.attn_backend.sparse_topk.qsa_selection.selected_blocks.record_stream(
+                main_stream
+            )
         fuse_output_quant = self._should_fuse_output_quant(gate)
         attention_output = self._attn(
             positions,

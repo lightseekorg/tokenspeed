@@ -223,7 +223,7 @@ def _norm_weights():
     ]
 
 
-@pytest.mark.parametrize("m", [1, 5, 64])
+@pytest.mark.parametrize("m", [1, 5, 64, 601])
 @pytest.mark.parametrize(
     "kernel",
     ["fused_qk_rmsnorm_rope", TRITON_FUSED_QK_RMSNORM_SSMAX, TORCH_QK_RMSNORM_SSMAX],
