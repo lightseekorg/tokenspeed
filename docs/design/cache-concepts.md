@@ -2010,9 +2010,10 @@ every plane its layers' fields touch, so a field on a plane that no other layer
 of its stage uses costs that stage the whole plane.
 
 With `--qwen4-exp-flat-kv`, all target and draft cache fields share one
-`flatkv` plane (PP=1, uniform per-view K/V heads, no MXFP8). Logical groups
-and their layer membership stay unchanged. Qwen3.8-Flash-Next retains six:
-full attention, two GDN state groups, PLE, compressed QSA and recent QSA.
+`flatkv` plane (PP=1, uniform per-view K/V heads, no MXFP8). All GDN layers
+form one state group, with each layer's SSM and convolution fields together.
+Qwen3.8-Flash-Next has five groups: full attention, GDN state, PLE, compressed
+QSA and recent QSA. Ordinary layouts retain their plane-based GDN grouping.
 The recipe sizes the shared parent to fit the largest group while tightly
 packing full-attention K/V. Each other group packs as many pages as its
 payload and stride alignment permit. A parent still belongs to one group at
@@ -2041,6 +2042,13 @@ smaller group. It does not compress useful KV data: when the ordinary layout
 already fills a full-attention parent, its KV payload per token is unchanged.
 Parent rounding, the reserved null parent and the live mix of groups determine
 the resulting allocation and request capacity.
+
+For Qwen3.8-Flash-Next at TP1 with BF16 KV and FP32 GDN state, one complete
+36-layer GDN checkpoint has 110.109375 MiB of payload and occupies one
+110.5 MiB parent, with 0.3535% payload padding. The ordinary layout uses two
+78 MiB parents for that checkpoint. The larger FlatKV parent also increases
+the null-parent cost and the allocation unit for small groups; finer GDN
+groups need not improve total hit rate or performance.
 
 Inkling's ShortConv checkpoints share the attention planes the same way: a
 kvconv group and one hiddenconv group per attention group put each layer's

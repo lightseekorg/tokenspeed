@@ -132,6 +132,15 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
             )
         return enabled
 
+    @cached_property
+    @override
+    def _num_state_groups(self) -> int:
+        # FlatKV can fit every GDN layer in one parent instead of splitting
+        # states to match the ordinary layout's K/V plane count.
+        if self._flat_kv:
+            return 1
+        return super()._num_state_groups
+
     def _flat_groups(
         self, groups: Sequence[CacheGroupDeclaration]
     ) -> tuple[CacheGroupDeclaration, ...]:

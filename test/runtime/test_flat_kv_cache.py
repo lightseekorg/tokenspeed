@@ -341,7 +341,7 @@ def test_ordinary_sink_router_keeps_raw_page_addresses(
     assert router.decode_window_locations().tolist() == [135]
 
 
-def _six_group_recipe(*, flat, device, kv_dtype):
+def _qwen4_exp_recipe(*, flat, device, kv_dtype, state_layers):
     from dataclasses import replace
     from test.runtime.test_cache_setup import _qwen4_exp_fp8_kv_recipe
 
@@ -352,7 +352,7 @@ def _six_group_recipe(*, flat, device, kv_dtype):
     )
 
     recipe = _qwen4_exp_fp8_kv_recipe(
-        layer_types=(LINEAR_ATTENTION,) * 7 + (FULL_ATTENTION,) * 2,
+        layer_types=(LINEAR_ATTENTION,) * state_layers + (FULL_ATTENTION,) * 2,
         ple_layer_ids=[2],
         hidden_size=16,
         linear=LinearAttnConfig(
@@ -361,7 +361,7 @@ def _six_group_recipe(*, flat, device, kv_dtype):
             head_k_dim=32,
             head_v_dim=32,
             conv_kernel_size=4,
-            layer_ids=tuple(range(7)),
+            layer_ids=tuple(range(state_layers)),
             tp_size=1,
         ),
         num_kv_heads=1,
@@ -383,13 +383,15 @@ def _six_group_recipe(*, flat, device, kv_dtype):
     return recipe
 
 
-def _six_group_pool(*, flat, device, kv_dtype):
+def _qwen4_exp_pool(*, flat, device, kv_dtype):
     from tokenspeed.runtime.layers.attention.kv_cache.factory import (
         create_cache_arena,
         create_cache_pool,
     )
 
-    recipe = _six_group_recipe(flat=flat, device=device, kv_dtype=kv_dtype)
+    recipe = _qwen4_exp_recipe(
+        flat=flat, device=device, kv_dtype=kv_dtype, state_layers=7
+    )
     setup = recipe.setup()
     arena = create_cache_arena(setup.spec, device=device, enable_memory_saver=False)
     pools = tuple(
@@ -410,21 +412,22 @@ def _six_group_pool(*, flat, device, kv_dtype):
 
 
 @pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float8_e4m3fn])
-def test_flat_kv_keeps_six_groups_on_one_plane(kv_dtype):
+def test_flat_kv_groups_gdn_layers_on_one_plane(kv_dtype):
     from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
         QWEN4_EXP_PLE_CACHE_GROUP,
         QWEN4_EXP_QSA_CACHE_GROUP,
         QWEN4_EXP_QSA_RECENT_CACHE_GROUP,
     )
 
-    _, arena, (target, draft) = _six_group_pool(
+    _, arena, (target, draft) = _qwen4_exp_pool(
         flat=True, device="cpu", kv_dtype=kv_dtype
     )
-    ordinary = _six_group_recipe(flat=False, device="cpu", kv_dtype=kv_dtype).setup()
+    ordinary = _qwen4_exp_recipe(
+        flat=False, device="cpu", kv_dtype=kv_dtype, state_layers=7
+    ).setup()
     assert {g.group_id for g in arena.plan.groups} == {
         "full_attention",
         "linear_attention_0",
-        "linear_attention_1",
         QWEN4_EXP_PLE_CACHE_GROUP,
         QWEN4_EXP_QSA_CACHE_GROUP,
         QWEN4_EXP_QSA_RECENT_CACHE_GROUP,
@@ -432,8 +435,19 @@ def test_flat_kv_keeps_six_groups_on_one_plane(kv_dtype):
     assert tuple(p.plane_id for p in arena.plan.planes) == ("flatkv",)
     assert {f.plane_id for f in arena.plan.fields} == {"flatkv"}
     assert {f.field_id: f.group_id for f in arena.plan.fields} == {
-        f.field_id: f.group_id for f in ordinary.spec.memory_plan.fields
+        field.field_id: (
+            "linear_attention_0"
+            if field.group_id.startswith("linear_attention_")
+            else field.group_id
+        )
+        for field in ordinary.spec.memory_plan.fields
     }
+    assert set(target.state_group_by_layer.values()) == {"linear_attention_0"}
+    assert {
+        field.group_id
+        for field in ordinary.spec.memory_plan.fields
+        if field.group_id.startswith("linear_attention_")
+    } == {"linear_attention_0", "linear_attention_1"}
     for pool in (target, draft):
         assert pool.arena is arena
         assert pool.atom_pages_per_block("full_attention", 64) > 1
@@ -449,7 +463,7 @@ def test_flat_kv_keeps_six_groups_on_one_plane(kv_dtype):
     for field in arena.plan.fields:
         if field.group_id in ("full_attention", QWEN4_EXP_QSA_CACHE_GROUP):
             assert field.page_stride_bytes % field.payload_bytes == 0
-        elif field.group_id in ("linear_attention_0", "linear_attention_1"):
+        elif field.group_id == "linear_attention_0":
             view = arena.field(field.field_id)
             assert view.stride(0) * view.element_size() == field.page_stride_bytes
 
@@ -470,7 +484,7 @@ def test_shared_plane_qsa_compression_and_recent_write(graph):
         qsa_rope_position_field,
     )
 
-    _, arena, (pool, _) = _six_group_pool(
+    _, arena, (pool, _) = _qwen4_exp_pool(
         flat=True, device="cuda", kv_dtype=torch.bfloat16
     )
     layers = (7, 8, 9)
@@ -582,10 +596,10 @@ def test_shared_plane_qsa_compression_and_recent_write(graph):
 
 
 @requires_cuda
-def test_six_group_shared_plane_copy_and_zero():
+def test_shared_plane_copy_and_zero():
     import numpy as np
 
-    _, arena, _ = _six_group_pool(flat=True, device="cuda", kv_dtype=torch.bfloat16)
+    _, arena, _ = _qwen4_exp_pool(flat=True, device="cuda", kv_dtype=torch.bfloat16)
     plan = arena.plan
     arena.buffer.fill_(219)
     for index, group in enumerate(plan.groups):
@@ -630,7 +644,7 @@ def test_shared_plane_ple_and_qsa_verify_commit(graph):
     )
     from tokenspeed.runtime.layers.attention.qsa.verify_state import QSAVerifyState
 
-    recipe, arena, (pool, _) = _six_group_pool(
+    recipe, arena, (pool, _) = _qwen4_exp_pool(
         flat=True, device="cuda", kv_dtype=torch.bfloat16
     )
     ple = Qwen4ExpPLEBackend(
@@ -696,3 +710,47 @@ def test_shared_plane_ple_and_qsa_verify_commit(graph):
         for layer in (7, 8):
             raw = arena.field(qsa_raw_key_field(layer))[recent_blocks[request].item()]
             assert torch.all(raw[:steps] == layer)
+
+
+@pytest.mark.parametrize("state_layers", [7, 36])
+def test_one_gdn_group_keeps_each_layers_input_and_output_states(state_layers):
+    from tokenspeed.runtime.layers.attention.kv_cache.factory import create_cache_pool
+
+    recipe = _qwen4_exp_recipe(
+        flat=True, device="cpu", kv_dtype=torch.bfloat16, state_layers=state_layers
+    )
+    setup = recipe.setup()
+    arena = CacheArena(
+        setup.spec.memory_plan, "cpu", cache_group_specs=setup.spec.cache_group_specs
+    )
+    pool = create_cache_pool(
+        setup.spec.layer_view(first_layer=0, num_layers=setup.num_target_layers),
+        recipe.attn_config,
+        arena,
+        num_layers=setup.num_target_layers,
+        rank=0,
+        field_layer_offset=0,
+    )
+    assert pool.state_group_by_layer == {
+        layer: "linear_attention_0" for layer in range(state_layers)
+    }
+    # Every layer uses the same group block IDs, with distinct field offsets.
+    # Read after all writes to catch aliasing between layers or input/output.
+    for layer in range(state_layers):
+        for block in (1, 2):
+            pool.get_component(layer, "conv_state")[block].reshape(-1)[0] = (
+                100 * block + layer
+            )
+            pool.get_component(layer, "recurrent_state")[block].reshape(-1)[0] = (
+                200 * block + layer
+            )
+    for layer in range(state_layers):
+        for block in (1, 2):
+            assert (
+                arena.field(f"layer.{layer}.conv")[block].reshape(-1)[0]
+                == 100 * block + layer
+            )
+            assert (
+                arena.field(f"layer.{layer}.ssm")[block].reshape(-1)[0]
+                == 200 * block + layer
+            )

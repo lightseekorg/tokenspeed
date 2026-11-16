@@ -1,0 +1,417 @@
+{
+  "benchmark": "InferenceX AgentX standalone",
+  "scope": "One 900-second sending window plus 30-second drain per configuration, after 702 warmup requests; not repeated trials or the default one-hour run.",
+  "implementation": {
+    "benchmark_base_commit": "f3593f01659632fc53160700a193ca6fe4c8de95",
+    "benchmark_patch": "flatkv-gdn-groups-benchmark.patch",
+    "benchmark_patch_sha256": "a61105bba2c6591846de79d86b2ef3ee37a9577fb440b286ef633cd29acb44db",
+    "selected_default_gdn_groups": 1,
+    "note": "The archived benchmark patch adds an explicit count override and common FlashInfer compatibility adapters. The selected runtime policy uses one GDN group under FlatKV without adding that experimental override.",
+    "benchmark_tree_sha": "5c9aa5d0caf56dff5ff69796fdc36194d577fd31"
+  },
+  "model": {
+    "id": "nvidia/Qwen3.8-Flash-Next-NVFP4",
+    "revision": "fc694b54fb0174e0913e6adf86691ef85a4ead47",
+    "target_layers": 48,
+    "draft_layers": 1,
+    "gdn_layers": 36
+  },
+  "conditions": {
+    "tp": 1,
+    "pp": 1,
+    "kv_dtype": "bfloat16",
+    "gdn_dtype": "float32",
+    "max_num_seqs": 64,
+    "client_concurrency": 64,
+    "speculative_algorithm": "MTP",
+    "speculative_num_steps": 3,
+    "speculative_num_draft_tokens": 4,
+    "synthetic_acceptance": false,
+    "context_length": 262144,
+    "chunked_prefill_size": 8192,
+    "gpu_memory_utilization": 0.8,
+    "prefix_cache": true,
+    "kvstore": true,
+    "replay_ssm": false,
+    "client_version": "agentx-harness==1.0.13",
+    "dataset": "semianalysis_cc_traces_weka_062126_256k",
+    "random_seed": 42,
+    "profile_seconds": 900,
+    "warmup_requests_per_lane": 10,
+    "server_seed": 42,
+    "state_checkpoints_in_forward": true,
+    "kvstore_write_policy": "write_back",
+    "kvstore_io_backend": "kernel",
+    "l3_storage": false,
+    "kvstore_size_gb": 192,
+    "kvstore_size_unit": "decimal GB, per server_args and L2 executor contract"
+  },
+  "hardware": "NVIDIA B300 SXM6; one independent GPU per configuration",
+  "packages": {
+    "torch": "2.14.0",
+    "flashinfer-python": "0.7.3",
+    "flashinfer-cubin": "0.7.3",
+    "flashinfer-jit-cache": "0.7.3+cu130",
+    "tokenspeed-scheduler": "0.1.57",
+    "tokenspeed-engine": "0.1.0",
+    "numpy": "2.5.5",
+    "nanobind": "3.0.1"
+  },
+  "metrics": {
+    "primary_cache_hit": "Sum of API cached prompt tokens / sum of API prompt tokens for completed profiling requests. Includes L1 and L2, excludes warmup and end-of-window cancellations.",
+    "matched_subset": "1473 common trace/turn records, with 1047109 completion tokens per configuration and under 0.001% difference in summed prompt tokens. Trace turns are matched rather than byte-identical payloads.",
+    "tier_split": "Service admission counters include end-of-window cancelled requests, so their denominator differs from completed-request API usage."
+  },
+  "runs": [
+    {
+      "gdn_groups": 1,
+      "total_cache_groups": 5,
+      "geometry": {
+        "device_parent_bytes": 115867648,
+        "device_bytes": 101384192000,
+        "device_lcm_blocks": 874,
+        "host_block_bytes": 115867648,
+        "host_lcm_blocks": 1657,
+        "host_allocated_payload_bytes": 191992692736,
+        "snapshot_pool_reported_gb": 37.08,
+        "snapshot_payload_bytes": 37077647360
+      },
+      "results": {
+        "requests": 1507.0,
+        "request_throughput_rps": 1.6204169216298578,
+        "output_token_throughput_tps": 1157.557247220068,
+        "usage_prompt_tokens": 124521783.0,
+        "usage_cached_prompt_tokens": 110589184.0,
+        "actual_cache_hit_pct": 88.81111508016232,
+        "ttft_mean_ms": 13654.329005015263,
+        "ttft_p50_ms": 6466.990201,
+        "ttft_p90_ms": 32444.6481522,
+        "ttft_p99_ms": 99089.70854946024,
+        "itl_mean_ms": 22.28867292617878,
+        "request_error_rate": 0.0,
+        "normalized_interactivity_p75_tps_per_user": 11.534630468867384,
+        "normalized_interactivity_p90_tps_per_user": 5.769723164722822,
+        "phase_completion": {
+          "completed_requests": 1507,
+          "cancelled_requests": 29,
+          "request_errors": 0,
+          "elapsed_seconds": 930.01,
+          "sending_seconds": 900,
+          "drain_grace_seconds": 30
+        },
+        "profiling_lifecycle_counters": {
+          "tokenspeed:num_preemptions_total": 5.0
+        }
+      },
+      "admission_hit_percent": {
+        "device_hit_pct": 28.600608638542504,
+        "host_hit_pct": 60.104837427089336,
+        "combined_hit_pct": 88.70544606563185
+      }
+    },
+    {
+      "gdn_groups": 6,
+      "total_cache_groups": 10,
+      "geometry": {
+        "device_parent_bytes": 20447232,
+        "device_bytes": 101091115008,
+        "device_lcm_blocks": 4943,
+        "host_block_bytes": 20447232,
+        "host_lcm_blocks": 9390,
+        "host_allocated_payload_bytes": 191999508480,
+        "snapshot_pool_reported_gb": 13.09,
+        "snapshot_payload_bytes": 13086228480
+      },
+      "results": {
+        "requests": 1547.0,
+        "request_throughput_rps": 1.6634273003026963,
+        "output_token_throughput_tps": 1189.9333106645622,
+        "usage_prompt_tokens": 126404428.0,
+        "usage_cached_prompt_tokens": 111511040.0,
+        "actual_cache_hit_pct": 88.21766908355457,
+        "ttft_mean_ms": 13105.40355952618,
+        "ttft_p50_ms": 4306.158471,
+        "ttft_p90_ms": 34625.69484940004,
+        "ttft_p99_ms": 113911.56451883994,
+        "itl_mean_ms": 23.339026751244166,
+        "request_error_rate": 0.0,
+        "normalized_interactivity_p75_tps_per_user": 12.665169790877101,
+        "normalized_interactivity_p90_tps_per_user": 6.095029212710099,
+        "phase_completion": {
+          "completed_requests": 1547,
+          "cancelled_requests": 16,
+          "request_errors": 0,
+          "elapsed_seconds": 930.01,
+          "sending_seconds": 900,
+          "drain_grace_seconds": 30
+        },
+        "profiling_lifecycle_counters": {
+          "tokenspeed:num_preemptions_total": 4.0
+        }
+      },
+      "admission_hit_percent": {
+        "device_hit_pct": 29.15215012616753,
+        "host_hit_pct": 58.96371006718368,
+        "combined_hit_pct": 88.11586019335121
+      }
+    },
+    {
+      "gdn_groups": 18,
+      "total_cache_groups": 22,
+      "geometry": {
+        "device_parent_bytes": 6815744,
+        "device_bytes": 102413369344,
+        "device_lcm_blocks": 15025,
+        "host_block_bytes": 6815744,
+        "host_lcm_blocks": 28170,
+        "host_allocated_payload_bytes": 191999508480,
+        "snapshot_pool_reported_gb": 9.6,
+        "snapshot_payload_bytes": 9596567552
+      },
+      "results": {
+        "requests": 1537.0,
+        "request_throughput_rps": 1.6526814596168418,
+        "output_token_throughput_tps": 1199.2155594496899,
+        "usage_prompt_tokens": 124644123.0,
+        "usage_cached_prompt_tokens": 109744384.0,
+        "actual_cache_hit_pct": 88.04617607201585,
+        "ttft_mean_ms": 13025.1713088432,
+        "ttft_p50_ms": 5576.944676,
+        "ttft_p90_ms": 33089.222417200006,
+        "ttft_p99_ms": 126602.45164283982,
+        "itl_mean_ms": 26.573961877869476,
+        "request_error_rate": 0.0,
+        "normalized_interactivity_p75_tps_per_user": 12.030618146880395,
+        "normalized_interactivity_p90_tps_per_user": 5.9669673327612704,
+        "phase_completion": {
+          "completed_requests": 1537,
+          "cancelled_requests": 19,
+          "request_errors": 0,
+          "elapsed_seconds": 930.0,
+          "sending_seconds": 900,
+          "drain_grace_seconds": 30
+        },
+        "profiling_lifecycle_counters": {
+          "tokenspeed:num_preemptions_total": 4.0
+        }
+      },
+      "admission_hit_percent": {
+        "device_hit_pct": 29.379806041333428,
+        "host_hit_pct": 58.52643901884675,
+        "combined_hit_pct": 87.90624506018017
+      }
+    }
+  ],
+  "matched_trace_turns": {
+    "gdn1": {
+      "requests": 1473,
+      "prompt_tokens": 119703047,
+      "cached_tokens": 106496768,
+      "output_tokens": 1047109,
+      "hit_pct": 88.96746630016861,
+      "ttft_mean_ms": 13412.036431051594,
+      "ttft_p50_ms": 6119.746991999999
+    },
+    "gdn6": {
+      "requests": 1473,
+      "prompt_tokens": 119702850,
+      "cached_tokens": 105270784,
+      "output_tokens": 1047109,
+      "hit_pct": 87.9434232351193,
+      "ttft_mean_ms": 13129.66532946368,
+      "ttft_p50_ms": 4039.388133
+    },
+    "gdn18": {
+      "requests": 1473,
+      "prompt_tokens": 119703598,
+      "cached_tokens": 105561088,
+      "output_tokens": 1047109,
+      "hit_pct": 88.18539272311598,
+      "ttft_mean_ms": 13184.475907649694,
+      "ttft_p50_ms": 5254.605176
+    }
+  },
+  "pairwise_matched_trace_turns": {
+    "gdn1_vs_gdn6": {
+      "gdn1": {
+        "requests": 1485,
+        "prompt_tokens": 121335801,
+        "cached_tokens": 108032512,
+        "output_tokens": 1054984,
+        "hit_pct": 89.03597380957662,
+        "ttft_mean_ms": 13486.9472304734,
+        "ttft_p50_ms": 6214.029632
+      },
+      "gdn6": {
+        "requests": 1485,
+        "prompt_tokens": 121335598,
+        "cached_tokens": 106806784,
+        "output_tokens": 1054984,
+        "hit_pct": 88.02592624136571,
+        "ttft_mean_ms": 13201.666723849157,
+        "ttft_p50_ms": 4128.360098
+      }
+    },
+    "gdn1_vs_gdn18": {
+      "gdn1": {
+        "requests": 1479,
+        "prompt_tokens": 120364961,
+        "cached_tokens": 106850048,
+        "output_tokens": 1058835,
+        "hit_pct": 88.77172153115224,
+        "ttft_mean_ms": 13437.1497664334,
+        "ttft_p50_ms": 6155.015015
+      },
+      "gdn18": {
+        "requests": 1479,
+        "prompt_tokens": 120365514,
+        "cached_tokens": 105914368,
+        "output_tokens": 1058835,
+        "hit_pct": 87.99394816691432,
+        "ttft_mean_ms": 13213.001217891819,
+        "ttft_p50_ms": 5335.959427
+      }
+    },
+    "gdn6_vs_gdn18": {
+      "gdn6": {
+        "requests": 1514,
+        "prompt_tokens": 122672928,
+        "cached_tokens": 108028416,
+        "output_tokens": 1084446,
+        "hit_pct": 88.06214847989934,
+        "ttft_mean_ms": 13032.168124393658,
+        "ttft_p50_ms": 4131.9148045
+      },
+      "gdn18": {
+        "requests": 1514,
+        "prompt_tokens": 122673726,
+        "cached_tokens": 108262912,
+        "output_tokens": 1084446,
+        "hit_pct": 88.25272984697637,
+        "ttft_mean_ms": 13038.330658220608,
+        "ttft_p50_ms": 5386.2377165
+      }
+    }
+  },
+  "interpretation": {
+    "cache_hit": "GDN=1 has the highest full-run and matched cache hit rates. Smaller parents did not maximize total hit rate.",
+    "performance": "GDN=6 has the lowest median TTFT and highest native normalized interactivity P75/P90. GDN=18 output throughput is 0.78% above GDN=6; its mean ITL is 13.86% higher. GDN=1 has the lowest mean ITL and P90/P99 TTFT.",
+    "memory": "Same 80% GPU memory target and 192 decimal-GB L2 budgets; actual GPU arenas and snapshot reservations vary with the layout and startup profile."
+  },
+  "validation": "All clients exited 0, request errors were 0, and native duration coverage was valid. Aggregate API prompt/cache token totals exactly matched completed per-request exports. No Traceback/CUDA/Assertion/FATAL lines occurred in the measured server logs.",
+  "reproduce": {
+    "checkout": "f3593f01659632fc53160700a193ca6fe4c8de95",
+    "apply_patch": "git apply flatkv-gdn-groups-benchmark.patch (in a separate checkout of the benchmark base commit)",
+    "source_environment": "Use matching current-source tokenspeed-engine, tokenspeed-scheduler and CUDA extensions; dependency versions above. Both measured layout and compatibility changes are in the archived patch.",
+    "server_common_arguments": [
+      "--disable-autotune",
+      "--model",
+      "nvidia/Qwen3.8-Flash-Next-NVFP4",
+      "--served-model-name",
+      "nvidia/Qwen3.8-Flash-Next-NVFP4",
+      "--trust-remote-code",
+      "--tensor-parallel-size",
+      "1",
+      "--dense-tp-size",
+      "1",
+      "--moe-tp-size",
+      "1",
+      "--expert-parallel-size",
+      "1",
+      "--data-parallel-size",
+      "1",
+      "--moe-backend",
+      "flashinfer_trtllm",
+      "--kv-cache-dtype",
+      "bfloat16",
+      "--mamba-ssm-dtype",
+      "float32",
+      "--sampling-backend",
+      "flashinfer",
+      "--speculative-algorithm",
+      "MTP",
+      "--disable-replay-ssm",
+      "--speculative-num-steps",
+      "3",
+      "--speculative-num-draft-tokens",
+      "4",
+      "--hf-overrides",
+      "{\"index_share_for_mtp_iteration\":true,\"max_position_embeddings\":262156,\"ple_offload_embedding\":true,\"ple_embed_dtype\":\"float8_e4m3fn\"}",
+      "--max-model-len",
+      "262144",
+      "--max-num-seqs",
+      "64",
+      "--chunked-prefill-size",
+      "8192",
+      "--gpu-memory-utilization",
+      "0.80",
+      "--stream-interval",
+      "1",
+      "--reasoning-parser",
+      "qwen3",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      "30000",
+      "--allow-reload-forward",
+      "--tokenizer",
+      "nvidia/Qwen3.8-Flash-Next-NVFP4",
+      "--enable-metrics",
+      "--seed",
+      "42",
+      "--enable-state-checkpoint-in-forward",
+      "--kvstore-write-policy",
+      "write_back",
+      "--kvstore-size",
+      "192",
+      "--kvstore-io-backend",
+      "kernel",
+      "--qwen4-exp-flat-kv",
+      "--metrics-port",
+      "31000"
+    ],
+    "benchmark_group_argument": "--qwen4-exp-flat-kv-gdn-groups 1 (or 6, 18)",
+    "client_arguments": [
+      "agentx",
+      "profile",
+      "--url",
+      "http://127.0.0.1:30000",
+      "--endpoint",
+      "/v1/chat/completions",
+      "--model",
+      "nvidia/Qwen3.8-Flash-Next-NVFP4",
+      "--tokenizer",
+      "nvidia/Qwen3.8-Flash-Next-NVFP4",
+      "--tokenizer-trust-remote-code",
+      "--concurrency",
+      "64",
+      "--benchmark-duration",
+      "900",
+      "--warmup-requests-per-lane",
+      "10",
+      "--public-dataset",
+      "semianalysis_cc_traces_weka_062126_256k",
+      "--random-seed",
+      "42",
+      "--server-metrics",
+      "http://127.0.0.1:31000/metrics",
+      "--output-artifact-dir",
+      "aiperf_artifacts",
+      "--max-context-length",
+      "262144"
+    ],
+    "isolation": "Start each server from empty caches. Run each configuration on an independent GPU or restart the server between configurations."
+  },
+  "selected_default_validation": {
+    "fresh_server": true,
+    "group_override_argument": false,
+    "gdn_groups": 1,
+    "total_cache_groups": 5,
+    "prompt_tokens": 19832,
+    "repeat_cached_tokens": 19712,
+    "completion": "4",
+    "runtime_cache_tests_passed": 233,
+    "flatkv_tests_passed": 26,
+    "pre_commit_all_files": "passed"
+  }
+}
