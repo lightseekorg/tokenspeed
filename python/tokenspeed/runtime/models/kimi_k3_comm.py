@@ -521,9 +521,11 @@ class K3MoeTailComm:
         the join, up-project the routed latent, add the reduced shared shard,
         and all-gather the output.
 
-    Stage 2 -- up_proj_inject_ar, for 33 or more tokens:
-        After the join, accumulate this rank's up-projection block into the
-        full shared-expert partial, then all-reduce the combined output.
+    Stage 2 -- inject_residual + up_proj_inject_ar, for 33 or more tokens:
+        Add the attention residual to this rank's block of the full
+        shared-expert partial in the shared-expert branch. After the join,
+        accumulate this rank's up-projection block into it, then all-reduce
+        the combined output.
 
     Both stage-2 patterns add the attention residual exactly once. Token count
     selects the pattern; the model controls stream scheduling independently.
@@ -698,18 +700,38 @@ class K3MoeTailComm:
             routed_latent, self.up_proj.weight, shared_shard, prefix_sum
         )
 
+    def inject_residual(
+        self, shared_partial: torch.Tensor, prefix_sum: torch.Tensor
+    ) -> None:
+        """Add the residual to this rank's shared block, in the shared branch.
+
+        Args:
+            shared_partial: Unreduced rank-local BF16 [M,H] shared-expert
+                output of a group of more than one rank, updated in place.
+            prefix_sum: Replicated BF16 [M,H] attention residual.
+        """
+        if self.mapping.moe.tp_ep_size == 1:
+            raise ValueError("A one-rank K3 MoE tail adds the residual in add3")
+        num_tokens = shared_partial.shape[0]
+        start, width = self.up_proj.shard_slice
+        target = shared_partial.view(num_tokens, self.hidden_size)
+        target[:, start : start + width] += prefix_sum.view(
+            num_tokens, self.hidden_size
+        )[:, start : start + width]
+
     def up_proj_inject_ar(
         self,
         routed_latent: torch.Tensor,
         shared_partial: torch.Tensor,
-        prefix_sum: torch.Tensor,
+        prefix_sum: torch.Tensor | None,
     ) -> torch.Tensor:
         """Inject the projection block and residual, then all-reduce after the join.
 
         Args:
             routed_latent: Replicated normalized BF16 [M,L].
             shared_partial: Unreduced rank-local BF16 [M,H] shared-expert output.
-            prefix_sum: Replicated BF16 [M,H] attention residual.
+            prefix_sum: Replicated BF16 [M,H] attention residual, or None
+                when inject_residual already added it to ``shared_partial``.
 
         Returns:
             BF16 [M,H] combined output on every rank. M33..1024 uses ordinary
@@ -717,6 +739,8 @@ class K3MoeTailComm:
         """
         num_tokens = routed_latent.shape[0]
         if self.mapping.moe.tp_ep_size == 1:
+            if prefix_sum is None:
+                raise ValueError("A one-rank K3 MoE tail adds the residual in add3")
             return self.up_proj.forward_add3(routed_latent, prefix_sum, shared_partial)
         capacity = self._stage2_capacity
         if capacity is None:
@@ -730,11 +754,10 @@ class K3MoeTailComm:
             )
             if shared_partial is None:
                 raise RuntimeError("K3 Multimem staging was not prepared")
+        if prefix_sum is not None:
+            self.inject_residual(shared_partial, prefix_sum)
         start, width = self.up_proj.shard_slice
         target = shared_partial[:, start : start + width]
-        target += prefix_sum.view(num_tokens, self.hidden_size)[
-            :, start : start + width
-        ]
         target.addmm_(routed_latent, self.up_proj.weight.t())
         if num_tokens > _MULTIMEM_AR_MIN_TOKENS:
             # The next layer reuses the symmetric staging buffer.
