@@ -171,6 +171,7 @@ def test_decode_verify_keeps_simulated_widths_and_drafts_in_the_sampler_buffers(
         bs=3,
         num_extends=0,
         decode_input_ids=None,
+        decode_query_indptr=None,
         output_layout=ForwardOutputLayout(0, 0, 3, VERIFY_WIDTH),
         sampled_top_k=0,
     )
@@ -201,6 +202,7 @@ def test_mixed_round_simulates_only_its_decode_rows():
         bs=4,
         num_extends=2,
         decode_input_ids=None,
+        decode_query_indptr=None,
         output_layout=ForwardOutputLayout(2, 2, 2, VERIFY_WIDTH),
         sampled_top_k=0,
     )

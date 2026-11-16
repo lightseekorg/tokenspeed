@@ -762,6 +762,7 @@ impl Shared {
                 return;
             }
         };
+        tracing::debug!(room, cache_id, "event=ts_prefill_manifest_received");
         {
             let mut state = self.state();
             if state
@@ -793,6 +794,8 @@ impl Shared {
         cache_id: &str,
         frames: &[Bytes],
     ) -> Result<(), String> {
+        let started = tracing::enabled!(tracing::Level::DEBUG).then(Instant::now);
+        tracing::debug!(room, cache_id, "event=ts_prefill_manifest_processing");
         let registration = self
             .state()
             .registrations
@@ -853,6 +856,15 @@ impl Shared {
         if complete {
             state.rooms.update(room, TransferPoll::Bootstrapped);
         }
+        drop(state);
+        tracing::debug!(
+            room,
+            cache_id,
+            complete,
+            expected,
+            elapsed_ms = started.map(|at| at.elapsed().as_secs_f64() * 1000.0),
+            "event=ts_prefill_manifest_accepted"
+        );
         Ok(())
     }
 
