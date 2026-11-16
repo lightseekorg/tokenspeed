@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
+from tokenspeed_kernel.ops.sampling import softmax as sampling_softmax
 from tokenspeed_kernel.ops.sampling.block_verify import block_speculative_sampling
 from tokenspeed_kernel.ops.sampling.triton import (
     _QRITA_PERCENTILE_TO_STD_TABLE,
@@ -150,7 +151,7 @@ def block_target_probs(
     Returns:
         ``[rows, V]`` contiguous fp32 probabilities.
     """
-    probs = torch.softmax(torch.div(logits.float(), temperature.view(-1, 1)), dim=-1)
+    probs = sampling_softmax(logits, temperature)
     if sample_route == _SAMPLE_ROUTE_GUMBEL_NO_FILTER:
         return probs
     if sample_route in (_SAMPLE_ROUTE_GUMBEL_TOP_K, _SAMPLE_ROUTE_GUMBEL_TOP_K_TOP_P):

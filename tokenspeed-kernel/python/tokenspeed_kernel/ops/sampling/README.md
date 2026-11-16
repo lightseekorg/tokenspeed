@@ -85,3 +85,17 @@ and `L - 1` accepted drafts. The target token is either given per row or read
 from the row's target predictions at column `L - 1`, and `L` past the verify
 width counts as the width. One Triton program writes one row, so a captured
 step pays one launch for the override; the CPU path is the torch reference.
+
+## Temperature softmax (`softmax`)
+
+`softmax(logits, temperature)` returns each row's `softmax(logits / T)` in
+FP32: the `q` a sampled draft records and the target law that block
+verification on the Triton sampler filters. NVIDIA takes FlashInfer's softmax.
+The portable Triton kernel, which AMD takes, cuts each row into chunks of up
+to 4096 columns so that a few rows of a large vocabulary still occupy many
+compute units. One launch writes each chunk's maximum and exp-sum of
+`logits / T`; a second has every program combine its row's chunks and write
+`exp(logits / T - max) / sum` for its own chunk, reading the logits again. A
+chunk with no value above -inf adds 0 to the sum rather than NaN. A row with a
+NaN or +inf, or with no value above -inf, comes back NaN, as from
+`torch.softmax`.
