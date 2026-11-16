@@ -372,6 +372,7 @@ def test_protocol_flushes_every_request_before_timer_and_arms_after_warmup():
             assert self.last_flush_ns is not None
             (request,) = requests
             assert request.input_ids == [1]
+            assert request.stream is True
             self.generated_profile_states.append(self.active)
             for count in (1, 2):
                 on_chunk(

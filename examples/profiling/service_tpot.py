@@ -599,7 +599,9 @@ def run_protocol(engine, case: dict, *, arm: str, run_id: str, write) -> None:
                 if not success:
                     raise RuntimeError("service rejected cache flush")
                 sample = StreamSample()
-                request = generate_request(case["input_ids"], case["sampling_params"])
+                request = generate_request(
+                    case["input_ids"], case["sampling_params"], stream=True
+                )
                 requested_ns = time.perf_counter_ns()
                 engine.generate([request], on_chunk=sample.add)
                 sample.finish()
