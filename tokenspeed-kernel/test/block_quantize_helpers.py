@@ -72,12 +72,13 @@ def triton_block_quantize(
     return values, scales, amax
 
 
-def triton_block_quantize_nvfp4_values(
-    x: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """NVFP4 codes, scales and row maxima of ``x``, and the BF16 values the
+def triton_block_quantize_values(
+    x: torch.Tensor, quant_format: str
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    """Codes, scales and (NVFP4) row maxima of ``x``, and the BF16 values the
     codes encode, as the serving quantizer stores them for BF16-input GEMMs."""
-    return _block_quantize_rows(x, "nvfp4", torch.empty_like(x, dtype=torch.bfloat16))
+    dequant = torch.empty_like(x, dtype=torch.bfloat16)
+    return _block_quantize_rows(x, quant_format, dequant)
 
 
 def _block_quantize_rows(x, quant_format, dequant):

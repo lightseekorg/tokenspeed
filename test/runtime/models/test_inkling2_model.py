@@ -290,6 +290,51 @@ def test_gpu_softcap_matches_the_fp32_statement_byte_for_byte() -> None:
     assert torch.equal(logits, uncapped.div_(30.0).tanh_().mul_(30.0))
 
 
+def test_sampled_rows_stay_fp32_shards_capped_as_the_gathered_rows() -> None:
+    """Under TP the sampler selects from the FP32 head shards; the last shard
+    holds the vocabulary's end before the head's padding rows, and the cap is
+    ``tanh_softcap``'s."""
+    config = _tiny_config()
+    mapping = Mapping(
+        rank=1,
+        world_size=2,
+        attn_tp_size=2,
+        attn_dp_size=1,
+        dense_tp_size=2,
+        dense_dp_size=1,
+        moe_tp_size=1,
+        moe_ep_size=2,
+        moe_dp_size=1,
+        nprocs_per_node=2,
+        nnodes=1,
+    )
+    processor = Inkling2LogitsProcessor(config.text_config, mapping)
+    head = ParallelLMHead(
+        config.text_config.padded_vocab_size,
+        config.text_config.hidden_size,
+        bias=False,
+        params_dtype=torch.bfloat16,
+        quant_config=None,
+        prefix="model.llm.unembed",
+        tp_rank=1,
+        tp_size=2,
+        tp_group=(0, 1),
+    )
+    head.quant_method = Inkling2LMHeadMethod()
+    asked = []
+
+    def supports(dtype, columns, tp_size):
+        asked.append((dtype, columns, tp_size))
+        return True
+
+    assert processor.keep_sampled_logits_vocab_sharded(head, supports)
+    # 60 of 64 head rows: the second shard's 28 real columns.
+    assert asked == [(torch.float32, 28, 2)]
+    shard = processor.sampled_vocab_shard(torch.zeros(3, 32), head)
+    assert (shard.columns, shard.vocab_start) == (28, 32)
+    assert (shard.softcap, shard.softcap_form) == (30.0, "tanh")
+
+
 def test_logits_processor_uses_common_sampled_row_selection() -> None:
     config = _tiny_config()
     head = _head(config)

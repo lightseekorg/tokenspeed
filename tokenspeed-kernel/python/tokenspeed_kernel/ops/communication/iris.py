@@ -92,6 +92,19 @@ def reserve_iris_heap(owner: str, nbytes: int) -> None:
     reserve_heap(owner, nbytes)
 
 
+def create_iris_heap() -> None:
+    """Create the shared Iris heap now, at the minimum size plus every
+    reservation, for a caller that allocates from it before any collective
+    creates it (``iris_symmetric_heap``). Every rank of the world calls it;
+    a later creator reuses the heap."""
+    from tokenspeed_kernel.ops.communication._iris import (
+        MIN_HEAP_BYTES,
+        get_or_create_context,
+    )
+
+    get_or_create_context(heap_size=MIN_HEAP_BYTES)
+
+
 def iris_heap_bytes(shape: tuple[int, ...], dtype: torch.dtype) -> int:
     """The heap bytes that an allocation of ``shape`` and ``dtype`` takes,
     alignment included."""

@@ -524,6 +524,17 @@ exact conversion) instead of materializing an fp32 copy of the `[rows, vocab]`
 tensor first; because both paths go through the one function, whatever
 rounding the kernel applies is applied to both.
 
+Under TP with a vocabulary-parallel LM head, the triton sampler's top-k
+routes keep the sampled rows as each rank's vocabulary shard
+(`SampledVocabShard`): every rank selects its shard's candidates and gathers
+only those. With output logprobs (`torch` order) each rank also sums the
+1024-column blocks of `selected_token_logprobs`'s denominator that start in
+its shard -- a block running into the next shard reads that shard's leading
+columns, gathered with the candidates -- and every rank adds the gathered
+block sums in block order. A block sum is the whole-row kernel's own
+reduction over rows of the same stride, so the logprob is the whole-row one
+bit for bit (`tokenspeed-kernel/test/ops/test_vocab_shard_logprobs.py`).
+
 This comparison requires identical logits. With an ordinary unplanned GEMM,
 changing the prompt chunk size can change projection rounding; selecting a
 logprob order alone does not make that GEMM batch invariant. Dispatch tests

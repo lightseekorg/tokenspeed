@@ -867,7 +867,8 @@ def test_triton_mha_decode_folded_no_recompile_across_batches(
     device: str, require
 ) -> None:
     """The folded decode's split count follows the batch size; it is a runtime
-    value, so serving's batch sizes share the compiled kernels."""
+    value, so serving's batch sizes share the compiled kernels. A single-row
+    decode (a plain or draft decode step) takes the same kernels."""
     from tokenspeed_kernel.ops.attention.mha._triton.decode import (
         _fwd_folded_kernel_stage1,
         _fwd_folded_kernel_stage2,
@@ -882,7 +883,7 @@ def test_triton_mha_decode_folded_no_recompile_across_batches(
         [17 + 29 * i % 700 for i in range(max_bs)], 16, 24, 4, 256, 64, device
     )
 
-    def run(bs: int, rows: int) -> None:
+    def run(bs: int, rows: int, return_lse: bool) -> None:
         mha_decode_with_kvcache(
             q=q_all[: bs * rows],
             k_cache=k_cache,
@@ -891,16 +892,17 @@ def test_triton_mha_decode_folded_no_recompile_across_batches(
             cache_seqlens=cache_seqlens[:bs],
             max_seqlen_k=page_table.shape[1] * 64,
             max_seqlen_q=rows,
-            return_lse=True,
+            return_lse=return_lse,
             solution="triton",
         )
 
-    for rows in (8, 16):
-        run(1, rows)
+    shapes = ((8, True), (16, True), (1, False))
+    for rows, return_lse in shapes:
+        run(1, rows, return_lse)
     with assert_no_triton_compile(_fwd_folded_kernel_stage1, _fwd_folded_kernel_stage2):
         for bs in (2, 3, 8, 17, 32, 64, 256):
-            for rows in (8, 16):
-                run(bs, rows)
+            for rows, return_lse in shapes:
+                run(bs, rows, return_lse)
 
 
 def _paged_cache(
@@ -948,10 +950,10 @@ def test_triton_mha_decode_returns_lse_at_every_batch_size(
     device: str, num_q_heads: int, window_left: int, require
 ) -> None:
     """The Triton decode matches an FP32 reference at every batch size, its
-    output alone (the single-row kernels, which split a small batch's keys
-    across programs) and with the natural-log LSE (the folded kernel); an
-    empty cache yields a zero output and an LSE of -inf, and a new batch size
-    or key split reuses the compiled kernels."""
+    output alone and with the natural-log LSE (both from the folded kernel,
+    which splits a small batch's keys across programs); an empty cache yields
+    a zero output and an LSE of -inf, and a new batch size or key split
+    reuses the compiled kernels."""
     from tokenspeed_kernel.ops.attention.mha._triton import decode
     from utils import assert_no_triton_compile
 
@@ -991,13 +993,7 @@ def test_triton_mha_decode_returns_lse_at_every_batch_size(
     # Warm both alignment classes of the page-table stride (16 and 2 pages).
     check([1000, 1])
     check([100])
-    kernels = (
-        decode._fwd_kernel_stage1,
-        decode._fwd_grouped_kernel_stage1,
-        decode._fwd_kernel_stage2,
-        decode._fwd_folded_kernel_stage1,
-        decode._fwd_folded_kernel_stage2,
-    )
+    kernels = (decode._fwd_folded_kernel_stage1, decode._fwd_folded_kernel_stage2)
     with assert_no_triton_compile(*kernels):
         # One request: its keys split across programs.
         check([2049])

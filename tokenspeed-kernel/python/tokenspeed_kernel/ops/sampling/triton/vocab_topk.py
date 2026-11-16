@@ -25,14 +25,22 @@
 the shard select their best in parallel, then one program per row merges the
 chunks. ``triton_vocab_topk_merge`` takes every rank's pairs to the row's
 sorted ``k`` best. A row's candidates are ordered by value, then by position
-(shard column, or rank-major slot after the gather), lowest first.
+(shard column, or rank-major slot after the gather), lowest first. For
+output logprobs the shard selection also writes the shard's final logits and
+the leading columns the previous shard's logprob blocks read
+(``vocab_logprobs.py``).
 """
 
 from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.activation.triton import (
+    tanh_softcap_scalars,
+    tanh_softcap_value,
+)
 from tokenspeed_kernel.ops.sampling import (
+    vocab_shard_topk_chunks,
     vocab_shard_topk_supports,
     vocab_topk_merge_supports,
 )
@@ -44,10 +52,8 @@ __all__ = [
     "triton_vocab_topk_merge",
 ]
 
-# Columns one program selects from. A whole vocab shard in one program leaves
-# most CUs idle at a few rows; chunks select in parallel, then one program per
-# row merges their candidates.
-_SHARD_CHUNK_COLUMNS = 2048
+# ``softcap_form`` of ``vocab_shard_topk`` as the kernel's SOFTCAP.
+_SOFTCAP_FORMS = {None: 0, "sigmoid": 1, "tanh": 2}
 
 
 @triton.jit
@@ -73,28 +79,39 @@ def _ordered_key32(x):
         "chunk_cols",
         "logit_scale",
         "softcap",
+        "inv_softcap",
         "vocab_start",
         "stride_mask",
+        "stride_v",
+        "stride_h",
+        "halo_cols",
     ]
 )
 def _vocab_shard_topk_kernel(
     logits_ptr,
     out_ptr,
     mask_ptr,
+    values_ptr,
+    halo_ptr,
     stride_l,
     stride_o,
     stride_mask,
+    stride_v,
+    stride_h,
     n_cols,
     chunk_cols,
     logit_scale,
     softcap,
+    inv_softcap,
     vocab_start,
+    halo_cols,
     K: tl.constexpr,
     K_PAD: tl.constexpr,
     BLOCK: tl.constexpr,
     SCALE: tl.constexpr,
     SOFTCAP: tl.constexpr,
     MASK: tl.constexpr,
+    VALUES: tl.constexpr,
 ):
     # Program (row, chunk) writes the chunk's best K pairs at pair block
     # ``chunk`` of the row.
@@ -107,12 +124,16 @@ def _vocab_shard_topk_kernel(
     if SCALE:
         # Rounded to the logits' dtype, as an in-place multiply would.
         x = (x.to(tl.float32) * logit_scale).to(logits_ptr.dtype.element_ty)
-    if SOFTCAP:
-        # The logits processor's softcap step for step, rounded to the logits'
-        # dtype as it stores them.
+    if SOFTCAP == 1:
+        # The logits processor's fused softcap step for step, rounded to the
+        # logits' dtype as it stores them.
         capped = x.to(tl.float32) / softcap
         capped = 2 * tl.sigmoid(2 * capped) - 1
         x = (capped * softcap).to(logits_ptr.dtype.element_ty)
+    elif SOFTCAP == 2:
+        # ``tanh_softcap``'s steps (``(x / cap).tanh() * cap``), likewise.
+        capped = tanh_softcap_value(x.to(tl.float32), inv_softcap, softcap)
+        x = capped.to(logits_ptr.dtype.element_ty)
     if MASK:
         # Token bitmask in the xgrammar layout: bit c % 32 of word c // 32 of
         # the row is set when global token c is allowed.
@@ -120,16 +141,35 @@ def _vocab_shard_topk_kernel(
         word = tl.load(mask_ptr + row * stride_mask + token // 32, mask=valid, other=0)
         allowed = ((word >> (token % 32)) & 1) != 0
         x = tl.where(allowed, x, float("-inf"))
+    if VALUES:
+        # The final logits as the whole rows hold them: at their global
+        # columns, and the shard's first ``halo_cols`` for the gather.
+        col = first + local
+        tl.store(values_ptr + row * stride_v + vocab_start + col, x, mask=valid)
+        tl.store(
+            halo_ptr + row * stride_h + col,
+            x.to(tl.float32),
+            mask=valid & (col < halo_cols),
+        )
     # Value key above, reversed column below: the largest selection keys are
     # the largest values, lowest column first among equal ones.
-    key = (_ordered_key16(x) << 15) | (BLOCK - 1 - local)
+    if logits_ptr.dtype.element_ty.primitive_bitwidth == 16:
+        key = (_ordered_key16(x) << 15) | (BLOCK - 1 - local)
+    else:
+        key = (_ordered_key32(x) << 15) | (BLOCK - 1 - local)
     key = tl.where(valid, key, -1)
     # The bitonic selection keeps a power of two; the first K are the best K.
     best = tl.topk(key, K_PAD)
     col = first + BLOCK - 1 - (best & (BLOCK - 1))
     value_key = best >> 15
-    bits = tl.where(value_key >= 0x8000, value_key ^ 0x8000, value_key ^ 0xFFFF)
-    value = bits.to(tl.uint16).to(logits_ptr.dtype.element_ty, bitcast=True)
+    if logits_ptr.dtype.element_ty.primitive_bitwidth == 16:
+        bits = tl.where(value_key >= 0x8000, value_key ^ 0x8000, value_key ^ 0xFFFF)
+        value = bits.to(tl.uint16).to(logits_ptr.dtype.element_ty, bitcast=True)
+    else:
+        bits = tl.where(
+            value_key >= 0x80000000, value_key ^ 0x80000000, value_key ^ 0xFFFFFFFF
+        )
+        value = bits.to(tl.uint32).to(tl.float32, bitcast=True)
     slots = tl.arange(0, K_PAD)
     kept = slots < K
     out_row = out_ptr + row * stride_o + chunk * 2 * K
@@ -143,7 +183,9 @@ def _vocab_shard_topk_kernel(
     "vocab_shard_topk",
     name="triton_vocab_shard_topk",
     solution="triton",
-    signatures=format_signatures("logits", "dense", {torch.bfloat16, torch.float16}),
+    signatures=format_signatures(
+        "logits", "dense", {torch.bfloat16, torch.float16, torch.float32}
+    ),
     priority=Priority.PORTABLE,
 )
 def triton_vocab_shard_topk(
@@ -154,13 +196,16 @@ def triton_vocab_shard_topk(
     out: torch.Tensor,
     *,
     softcap: float | None,
+    softcap_form: str | None,
     vocab_mask: torch.Tensor | None,
+    values_out: torch.Tensor | None,
+    halo_out: torch.Tensor | None,
 ) -> None:
     """Write each row's ``k`` best shard logits and their global ids.
 
     Args:
-        logits: ``[M, N]`` 16-bit logits of one vocab shard, unit column
-            stride; ``vocab_shard_topk_supports`` must hold.
+        logits: ``[M, N]`` 16-bit or fp32 logits of one vocab shard, unit
+            column stride; ``vocab_shard_topk_supports`` must hold.
         k: Candidates kept per row.
         logit_scale: Multiplier applied to every logit (rounded to the logits'
             dtype) before the selection, or None.
@@ -171,10 +216,20 @@ def triton_vocab_shard_topk(
         softcap: Final logit softcapping ``c`` in ``c * tanh(x / c)``, applied
             after the scale and rounded to the logits' dtype before the
             selection, or None.
+        softcap_form: How the softcap computes, as the logits processor
+            does: ``"sigmoid"`` (``c * (2 * sigmoid(2 x / c) - 1)``, the
+            fused softcap) or ``"tanh"`` (``tanh_softcap``); None without a
+            softcap.
         vocab_mask: Contiguous int32 ``[M, ceil(V / 32)]`` token bitmask over
             the whole vocabulary (bit ``t % 32`` of word ``t // 32`` set when
             token ``t`` is allowed); disallowed logits become ``-inf`` before
             the selection. None for no mask.
+        values_out: ``[M, >= vocab_start + N]`` unit-column-stride tensor of
+            the logits' dtype receiving the final (scaled, capped, masked)
+            logits at their global columns, or None.
+        halo_out: fp32 ``[M, H]`` unit-column-stride tensor receiving the
+            final logits of the shard's first ``H`` columns (those past ``N``
+            left as they are), or None.
     """
     rows, n_cols = logits.shape
     if not vocab_shard_topk_supports(logits.dtype, n_cols, k):
@@ -197,33 +252,62 @@ def triton_vocab_shard_topk(
             f"{triton.cdiv(vocab_start + n_cols, 32)}] bitmask with unit column "
             f"stride, got {vocab_mask.dtype} {tuple(vocab_mask.shape)}"
         )
+    if (softcap is None) != (softcap_form is None) or (
+        softcap_form not in _SOFTCAP_FORMS
+    ):
+        raise ValueError(f"softcap {softcap} has no form {softcap_form!r}")
+    halo_cols = 0 if halo_out is None else halo_out.shape[1]
+    if values_out is not None and (
+        values_out.dtype != logits.dtype
+        or values_out.shape[0] != rows
+        or values_out.shape[1] < vocab_start + n_cols
+        or values_out.stride(1) != 1
+    ):
+        raise ValueError(
+            f"values_out must be {logits.dtype} [{rows}, >= {vocab_start + n_cols}]"
+        )
+    if halo_out is not None and (
+        halo_out.dtype != torch.float32
+        or halo_out.shape[0] != rows
+        or halo_out.stride(1) != 1
+    ):
+        raise ValueError(f"halo_out must be fp32 [{rows}, H]")
+    if (values_out is None) != (halo_out is None):
+        raise ValueError("values_out and halo_out come together")
     if rows == 0:
         return
+    inv_softcap, softcap32 = (
+        tanh_softcap_scalars(softcap) if softcap_form == "tanh" else (1.0, softcap)
+    )
     # The shard width is fixed per server, so the chunking compiles once.
-    chunks = triton.cdiv(n_cols, _SHARD_CHUNK_COLUMNS)
-    chunk_cols = triton.cdiv(n_cols, chunks)
-    if chunk_cols < k or not vocab_topk_merge_supports(chunks, k):
-        chunks, chunk_cols = 1, n_cols
+    chunks, chunk_cols = vocab_shard_topk_chunks(n_cols, k)
     # One chunk writes straight to out; more go through a pair block each.
     picks = out if chunks == 1 else out.new_empty((rows, chunks * 2 * k))
     _vocab_shard_topk_kernel[(rows, chunks)](
         logits,
         picks,
         vocab_mask,
+        values_out,
+        halo_out,
         logits.stride(0),
         picks.stride(0),
         0 if vocab_mask is None else vocab_mask.stride(0),
+        0 if values_out is None else values_out.stride(0),
+        0 if halo_out is None else halo_out.stride(0),
         n_cols,
         chunk_cols,
         1.0 if logit_scale is None else float(logit_scale),
-        1.0 if softcap is None else float(softcap),
+        1.0 if softcap32 is None else float(softcap32),
+        float(inv_softcap),
         int(vocab_start),
+        halo_cols,
         K=k,
         K_PAD=triton.next_power_of_2(k),
         BLOCK=triton.next_power_of_2(chunk_cols),
         SCALE=logit_scale is not None,
-        SOFTCAP=softcap is not None,
+        SOFTCAP=_SOFTCAP_FORMS[softcap_form],
         MASK=vocab_mask is not None,
+        VALUES=values_out is not None,
         num_warps=4,
     )
     if chunks > 1:

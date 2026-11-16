@@ -302,7 +302,10 @@ class VocabParallelTopK:
                 vocab_start,
                 staged,
                 softcap=None,
+                softcap_form=None,
                 vocab_mask=None,
+                values_out=None,
+                halo_out=None,
             )
         else:
             if self.logit_scale is not None:
