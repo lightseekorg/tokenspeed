@@ -35,7 +35,10 @@ pub(crate) struct TtftTrace {
     received_wall: f64,
     percentage: u8,
     pub(crate) prefill_chunks: usize,
+    pub(crate) submitted_ms: Option<f64>,
     bootstrap_ms: Option<f64>,
+    pub(crate) remote_admitted_ms: Option<f64>,
+    pub(crate) planned_ms: Option<f64>,
     pub(crate) scheduled_ms: Option<f64>,
     pub(crate) prompt_done_ms: Option<f64>,
     pub(crate) transfer_done_ms: Option<f64>,
@@ -61,7 +64,10 @@ impl TtftTrace {
             received_wall: wall_seconds(),
             percentage,
             prefill_chunks: 0,
+            submitted_ms: None,
             bootstrap_ms: None,
+            remote_admitted_ms: None,
+            planned_ms: None,
             scheduled_ms: None,
             prompt_done_ms: None,
             transfer_done_ms: None,
@@ -73,6 +79,9 @@ impl TtftTrace {
     }
 
     pub(crate) fn bootstrapped(&mut self, rid: &str) {
+        if self.bootstrap_ms.is_some() {
+            return;
+        }
         self.bootstrap_ms = Some(self.ms());
         if self.role == crate::output::Role::Prefill {
             tracing::info!(
@@ -87,26 +96,42 @@ impl TtftTrace {
         }
     }
 
-    pub(crate) fn finish(&self, rid: &str, state: &RequestState) {
+    pub(crate) fn phases(&self, end: f64) -> serde_json::Value {
         use crate::output::Role;
-
-        let end = self.ms();
         let delta = |end: Option<f64>, begin: Option<f64>| end.zip(begin).map(|(b, a)| b - a);
-        let phases = match self.role {
+        match self.role {
             Role::Prefill => serde_json::json!({
                 "bootstrap": self.bootstrap_ms,
+                "registration_to_submit": self.submitted_ms,
+                "submit_to_bootstrap": delta(self.bootstrap_ms, self.submitted_ms),
                 "admission": delta(self.scheduled_ms, self.bootstrap_ms),
+                "ready_to_plan": delta(self.planned_ms, self.bootstrap_ms),
+                "plan_to_dispatch": delta(self.scheduled_ms, self.planned_ms),
                 "prefill": delta(self.prompt_done_ms, self.scheduled_ms),
                 "transfer_observe": delta(self.transfer_done_ms, self.prompt_done_ms),
                 "output_pack": delta(Some(end), self.transfer_done_ms),
             }),
             Role::Decode => serde_json::json!({
                 "bootstrap": self.bootstrap_ms,
+                "registration_to_submit": self.submitted_ms,
+                "submit_to_bootstrap": delta(self.bootstrap_ms, self.submitted_ms),
                 "transfer_observe": delta(self.transfer_done_ms, self.bootstrap_ms),
+                "remote_admission": delta(self.remote_admitted_ms, self.bootstrap_ms),
+                "admission_to_landing": delta(self.transfer_done_ms, self.remote_admitted_ms),
+                "landing_to_plan": delta(self.planned_ms, self.transfer_done_ms),
+                "plan_to_dispatch": delta(self.scheduled_ms, self.planned_ms),
                 "output_after_landing": delta(Some(end), self.transfer_done_ms),
             }),
-            Role::Plain => return,
-        };
+            Role::Plain => serde_json::Value::Null,
+        }
+    }
+
+    pub(crate) fn finish(&self, rid: &str, state: &RequestState) {
+        use crate::output::Role;
+        if self.role == Role::Plain {
+            return;
+        }
+        let end = self.ms();
         let aborted = matches!(state.finished_reason, Some(FinishReason::Abort { .. }));
         tracing::info!(
             "TTFTBreakdown {}",
@@ -116,7 +141,14 @@ impl TtftTrace {
                 "endpoint": format!("{}:{}", self.bootstrap.host, self.bootstrap.port),
                 "sampling_percentage": self.percentage, "status": if aborted { "abort" } else { "first_output" },
                 "prompt_tokens": state.prompt_len, "cached_tokens": state.cached_tokens,
-                "engine_elapsed_ms": end, "phases_ms": phases, "prefill_chunks": self.prefill_chunks,
+                "engine_elapsed_ms": end, "phases_ms": self.phases(end), "prefill_chunks": self.prefill_chunks,
+                "milestones_ms": {
+                    "registered": 0.0, "submitted": self.submitted_ms,
+                    "bootstrapped": self.bootstrap_ms, "remote_admitted": self.remote_admitted_ms,
+                    "first_planned": self.planned_ms, "first_dispatched": self.scheduled_ms,
+                    "prompt_done": self.prompt_done_ms, "transfer_done": self.transfer_done_ms,
+                    "output_prepared": end,
+                },
                 "registered_wall_s": self.received_wall,
                 "first_dispatch_ms": self.scheduled_ms,
                 "total_ms": (state.created_time > 0.0).then(|| (wall_seconds() - state.created_time).max(0.0)*1000.0),
@@ -313,6 +345,72 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+
+    fn sampled_trace(role: crate::output::Role) -> Box<TtftTrace> {
+        TtftTrace::sample(
+            100,
+            role,
+            &ts_pd::BootstrapInfo {
+                room: 4,
+                host: "prefill".into(),
+                port: 8998,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn prefill_queue_splits_bootstrap_ready_wait_and_dispatch_preparation() {
+        let mut trace = sampled_trace(crate::output::Role::Prefill);
+        trace.submitted_ms = Some(3.0);
+        trace.bootstrap_ms = Some(200.0);
+        trace.planned_ms = Some(211.0);
+        trace.scheduled_ms = Some(224.0);
+        trace.prompt_done_ms = Some(309.0);
+        trace.transfer_done_ms = Some(334.0);
+        let phases = trace.phases(340.0);
+        assert_eq!(phases["registration_to_submit"], 3.0);
+        assert_eq!(phases["submit_to_bootstrap"], 197.0);
+        assert_eq!(phases["ready_to_plan"], 11.0);
+        assert_eq!(phases["plan_to_dispatch"], 13.0);
+        assert_eq!(phases["admission"], 24.0);
+        assert_eq!(phases["prefill"], 85.0);
+        assert_eq!(phases["transfer_observe"], 25.0);
+        assert_eq!(phases["output_pack"], 6.0);
+    }
+
+    #[test]
+    fn decode_separates_landing_admission_from_waiting_for_prefill() {
+        let mut trace = sampled_trace(crate::output::Role::Decode);
+        trace.bootstrap_ms = Some(20.0);
+        trace.remote_admitted_ms = Some(30.0);
+        trace.transfer_done_ms = Some(250.0);
+        trace.planned_ms = Some(252.0);
+        trace.scheduled_ms = Some(255.0);
+        let phases = trace.phases(260.0);
+        assert_eq!(phases["remote_admission"], 10.0);
+        assert_eq!(phases["admission_to_landing"], 220.0);
+        assert_eq!(phases["transfer_observe"], 230.0);
+        assert_eq!(phases["landing_to_plan"], 2.0);
+        assert_eq!(phases["plan_to_dispatch"], 3.0);
+        assert_eq!(phases["output_after_landing"], 10.0);
+    }
+
+    #[test]
+    fn unreached_queue_boundaries_stay_null_after_abort_or_early_output() {
+        let mut trace = sampled_trace(crate::output::Role::Decode);
+        trace.bootstrap_ms = Some(20.0);
+        let phases = trace.phases(30.0);
+        for name in [
+            "remote_admission",
+            "admission_to_landing",
+            "landing_to_plan",
+            "plan_to_dispatch",
+            "output_after_landing",
+        ] {
+            assert!(phases[name].is_null(), "{phases}");
+        }
+    }
 
     #[test]
     fn the_stats_line_is_the_python_repr() {

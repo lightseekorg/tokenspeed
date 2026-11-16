@@ -18,8 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Fused block-FP8 DP column and row projections on GB300, and the fused
-paged-row all-gather on SM100 and SM103."""
+"""Fused block-FP8 DP projections and paged-row all-gather on SM100 and SM103."""
 
 import logging
 from typing import TYPE_CHECKING
@@ -76,7 +75,7 @@ def create_fused_tp_column_projection_state(
 
     Args:
         group: Two, four, or eight NVLink-connected peers, in output-shard order.
-        device: This peer's GB300 CUDA device.
+        device: This peer's SM100 or SM103 CUDA device.
         max_rows: Maximum physical rows on any owner, used to prepare row buckets.
         input_size: Full input width, divisible by 128.
         output_size: Padded output width, divisible by group size times 128.
@@ -104,7 +103,7 @@ def create_fused_tp_row_projection_state(
 
     Args:
         group: Two or four NVLink-connected peers, in input-shard order.
-        device: This peer's GB300 CUDA device.
+        device: This peer's SM100 or SM103 CUDA device.
         max_rows: Maximum physical rows on any owner, used to prepare row buckets.
         input_size: Full input width, divisible by group size times 128.
         output_size: Padded output width, divisible by group size times 128.
@@ -147,13 +146,13 @@ def fused_tp_column_projection_supported(
         current_platform().is_nvidia
         and device.type == "cuda"
         and group_size in (2, 4, 8)
-        and input_size == 7168
-        and output_size
-        == ((49376 + group_size * 128 - 1) // (group_size * 128)) * group_size * 128
+        and input_size >= 128
+        and input_size % 128 == 0
+        and output_size >= group_size * 128
+        and output_size % (group_size * 128) == 0
         and max_rows >= 1
         and dtype == torch.bfloat16
-        and torch.cuda.get_device_capability(device) == (10, 3)
-        and torch.cuda.get_device_properties(device).multi_processor_count == 152
+        and torch.cuda.get_device_capability(device) in ((10, 0), (10, 3))
     )
 
 
@@ -183,12 +182,13 @@ def fused_tp_row_projection_supported(
         current_platform().is_nvidia
         and device.type == "cuda"
         and group_size in (2, 4)
-        and input_size == 12288
-        and output_size == 7168
+        and input_size >= group_size * 128
+        and input_size % (group_size * 128) == 0
+        and output_size >= group_size * 128
+        and output_size % (group_size * 128) == 0
         and max_rows >= 1
         and dtype == torch.bfloat16
-        and torch.cuda.get_device_capability(device) == (10, 3)
-        and torch.cuda.get_device_properties(device).multi_processor_count == 152
+        and torch.cuda.get_device_capability(device) in ((10, 0), (10, 3))
     )
 
 
@@ -336,7 +336,7 @@ if current_platform().is_nvidia:
         name="cute_dsl_fused_fp8_dp_column_linear",
         solution="cute_dsl",
         capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(10, 3),
+            min_arch_version=ArchVersion(10, 0),
             max_arch_version=ArchVersion(10, 3),
             vendors=frozenset({"nvidia"}),
         ),
@@ -392,7 +392,7 @@ if current_platform().is_nvidia:
         name="cute_dsl_fused_fp8_dp_row_linear",
         solution="cute_dsl",
         capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(10, 3),
+            min_arch_version=ArchVersion(10, 0),
             max_arch_version=ArchVersion(10, 3),
             vendors=frozenset({"nvidia"}),
         ),

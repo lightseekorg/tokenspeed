@@ -735,6 +735,14 @@ impl OutputProcessor {
         self.spec_num_tokens
     }
 
+    /// Whether this rank can collect sampled PD first-output summaries.
+    pub(crate) fn ttft_sampling_enabled(&self) -> bool {
+        self.finish_log.enabled
+            && self.finish_log.ttft_percentage > 0
+            && self.role != Role::Plain
+            && tracing::enabled!(target: "ts_control::request_stats", tracing::Level::INFO)
+    }
+
     /// When `rid` reached the scheduler's waiting queue, the first time this
     /// is asked after it did: a retraction re-queues
     /// a request without re-stamping it.
@@ -746,6 +754,32 @@ impl OutputProcessor {
     pub fn mark_submitted(&mut self, rid: &str, at: Instant) {
         if let Some(state) = self.states.get_mut(rid) {
             state.submitted_at = Some(at);
+            if let Some(trace) = state.ttft.as_mut() {
+                let now = trace.ms();
+                trace.submitted_ms.get_or_insert(now);
+            }
+        }
+    }
+
+    /// Stamp the first plan selecting a sampled request, before DP agreement.
+    /// Remote admission reserves the D landing pages; it is not a forward.
+    pub fn mark_planned(&mut self, rids: &[String], remote_admission: bool) {
+        if self.finish_log.ttft_percentage == 0 {
+            return;
+        }
+        for rid in rids {
+            if let Some(trace) = self
+                .states
+                .get_mut(rid)
+                .and_then(|state| state.ttft.as_mut())
+            {
+                let now = trace.ms();
+                if remote_admission {
+                    trace.remote_admitted_ms.get_or_insert(now);
+                } else {
+                    trace.planned_ms.get_or_insert(now);
+                }
+            }
         }
     }
 
@@ -764,10 +798,7 @@ impl OutputProcessor {
         state: &mut RequestState,
         bootstrap: Option<&ts_pd::BootstrapInfo>,
     ) {
-        if self.finish_log.enabled
-            && self.finish_log.ttft_percentage > 0
-            && tracing::enabled!(target: "ts_control::request_stats", tracing::Level::INFO)
-        {
+        if self.ttft_sampling_enabled() {
             state.ttft = bootstrap.and_then(|b| {
                 request_stats::TtftTrace::sample(self.finish_log.ttft_percentage, self.role, b)
             });
@@ -1916,6 +1947,57 @@ mod tests {
     }
 
     #[test]
+    fn ttft_sampling_depends_on_pd_summary_settings_and_the_log_filter() {
+        use tracing::Level;
+
+        for (level, role, enabled, percentage, request_stats, expected) in [
+            (Level::INFO, Role::Prefill, true, 100, false, true),
+            (Level::INFO, Role::Decode, true, 100, false, true),
+            (Level::INFO, Role::Decode, true, 1, false, true),
+            (Level::INFO, Role::Prefill, true, 0, false, false),
+            (Level::INFO, Role::Decode, true, 0, true, false),
+            (Level::DEBUG, Role::Decode, true, 0, false, false),
+            (Level::WARN, Role::Decode, true, 100, true, false),
+            (Level::INFO, Role::Decode, false, 100, true, false),
+            (Level::INFO, Role::Plain, true, 100, true, false),
+            (Level::DEBUG, Role::Decode, true, 100, false, true),
+        ] {
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(level)
+                .with_writer(std::io::sink)
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                let processor = OutputProcessor::new(
+                    None,
+                    1,
+                    None,
+                    role,
+                    FinishLog {
+                        enabled,
+                        request_stats,
+                        ttft_percentage: percentage,
+                    },
+                    false,
+                    None,
+                );
+                let mut state =
+                    RequestState::new(vec![8, 9], 4, BTreeSet::new(), true, None, false);
+                // Room 4 is selected even at one percent sampling.
+                processor.sample_ttft(
+                    &mut state,
+                    Some(&ts_pd::BootstrapInfo {
+                        room: 4,
+                        host: "p".into(),
+                        port: 8080,
+                    }),
+                );
+                assert_eq!(state.ttft.is_some(), expected);
+                assert_eq!(processor.ttft_sampling_enabled(), expected);
+            });
+        }
+    }
+
+    #[test]
     fn sampled_rooms_emit_bootstrap_and_first_output_once() {
         use std::{io::Read, os::unix::net::UnixStream};
         let (writer, mut reader) = UnixStream::pair().unwrap();
@@ -1951,8 +2033,11 @@ mod tests {
                     };
                     processor.sample_ttft(&mut state, Some(&bootstrap));
                     register_state(&mut processor, rid.into(), state);
+                    processor.mark_submitted(rid, Instant::now());
+                    processor.bootstrapped(rid);
                     processor.bootstrapped(rid);
                     if role == Role::Prefill {
+                        processor.mark_planned(&[rid.into()], false);
                         processor.mark_scheduled(&[rid.into()]);
                         let committed = processor
                             .commit(&batch(&[(rid, 2, 0, 2)], 1), None, &result(&[10], &[1]))
@@ -1964,6 +2049,7 @@ mod tests {
                         }
                         processor.finish_prefill(rid);
                     } else {
+                        processor.mark_planned(&[rid.into()], true);
                         processor.remote_prefill_done(rid, 10, 1, None);
                         processor.finish_remote_prefill_only(rid);
                     }
@@ -1986,12 +2072,76 @@ mod tests {
             assert_eq!(summary["room"], 4);
             assert_eq!(summary["status"], "first_output");
             assert!(summary["phases_ms"]["bootstrap"].is_number());
+            assert!(summary["milestones_ms"]["submitted"].is_number());
         }
         assert_eq!(summaries[0]["prefill_chunks"], 1);
         assert!(summaries[0]["phases_ms"]["prefill"].is_number());
+        assert!(summaries[0]["phases_ms"]["ready_to_plan"].is_number());
+        assert!(summaries[0]["phases_ms"]["plan_to_dispatch"].is_number());
+        assert!(summaries[1]["phases_ms"]["remote_admission"].is_number());
+        assert!(summaries[1]["milestones_ms"]["first_planned"].is_null());
         assert!(summaries[0]["phases_ms"]["transfer_observe"].is_number());
         assert!(summaries[0]["phases_ms"]["output_pack"].is_number());
         assert!(summaries[1]["phases_ms"]["output_after_landing"].is_number());
+    }
+
+    #[test]
+    fn sampled_milestones_keep_the_first_submission_and_each_plan_kind() {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(std::io::sink)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let mut processor = OutputProcessor::new(
+                None,
+                1,
+                None,
+                Role::Decode,
+                FinishLog {
+                    enabled: true,
+                    request_stats: false,
+                    ttft_percentage: 100,
+                },
+                false,
+                None,
+            );
+            let mut state = RequestState::new(vec![8, 9], 4, BTreeSet::new(), true, None, false);
+            processor.sample_ttft(
+                &mut state,
+                Some(&ts_pd::BootstrapInfo {
+                    room: 4,
+                    host: "p".into(),
+                    port: 8080,
+                }),
+            );
+            register_state(&mut processor, "r".into(), state);
+            processor.mark_submitted("r", Instant::now());
+            processor.bootstrapped("r");
+            processor.mark_planned(&["r".into()], true);
+            let trace = processor.state("r").unwrap().ttft.as_ref().unwrap();
+            let first_submit = trace.submitted_ms.unwrap();
+            let remote_admitted = trace.remote_admitted_ms.unwrap();
+            assert!(trace.planned_ms.is_none());
+
+            processor.remote_prefill_done("r", 10, 0, None);
+            processor.mark_planned(&["r".into()], false);
+            processor.mark_scheduled(&["r".into()]);
+            let trace = processor.state("r").unwrap().ttft.as_ref().unwrap();
+            let first_plan = trace.planned_ms.unwrap();
+            let first_dispatch = trace.scheduled_ms.unwrap();
+            assert!(remote_admitted <= trace.transfer_done_ms.unwrap());
+            assert!(trace.transfer_done_ms.unwrap() <= first_plan);
+            assert!(first_plan <= first_dispatch);
+
+            processor.mark_submitted("r", Instant::now());
+            processor.mark_planned(&["r".into()], true);
+            processor.mark_planned(&["r".into()], false);
+            processor.mark_scheduled(&["r".into()]);
+            let trace = processor.state("r").unwrap().ttft.as_ref().unwrap();
+            assert_eq!(trace.submitted_ms, Some(first_submit));
+            assert_eq!(trace.remote_admitted_ms, Some(remote_admitted));
+            assert_eq!(trace.planned_ms, Some(first_plan));
+            assert_eq!(trace.scheduled_ms, Some(first_dispatch));
+        });
     }
 
     #[test]
