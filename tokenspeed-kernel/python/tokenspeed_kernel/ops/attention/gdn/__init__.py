@@ -485,6 +485,8 @@ def gdn_decode_step(
         traits["state_dtype"] = initial_state.dtype
     if _qkv_rows_strided(q, k, v):
         traits["strided_qkv"] = True
+    if not initial_state.is_contiguous():
+        traits["strided_state"] = True
     kernel = select_kernel(
         "attention",
         "gdn_decode_step",
@@ -794,6 +796,10 @@ def gdn_decode_mtp(
         traits["separate_output_state"] = True
     if _qkv_rows_strided(q, k, v):
         traits["strided_qkv"] = True
+    if not initial_state.is_contiguous() or (
+        output_state is not None and not output_state.is_contiguous()
+    ):
+        traits["strided_state"] = True
     kernel = select_kernel(
         "attention",
         "gdn_decode_mtp",
@@ -995,7 +1001,8 @@ def gdn_decode_supports(
         trait: ``"separate_output_state"`` (an ``output_state`` pool) or
             ``"strided_qkv"`` (q/k/v rows spaced wider than one packed
             ``q | k | v`` row, with contiguous heads; such kernels read a/b by
-            stride too).
+            stride too), or ``"strided_state"`` (dense K-last pages separated
+            by a physical row stride).
         solution: The solution the caller forces, or ``None``.
 
     Returns:

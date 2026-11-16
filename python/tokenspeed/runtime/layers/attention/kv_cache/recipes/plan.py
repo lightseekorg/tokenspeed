@@ -39,7 +39,7 @@ if TYPE_CHECKING:
 _MAX_LCM_BLOCK_BYTES = (1 << 63) - 1
 _MAX_KERNEL_PAGE_ID = (1 << 31) - 1
 
-# Fields on this plane use contiguous atom-row views and translated page IDs.
+# Full-history fields on this plane use contiguous atom views and translated IDs.
 FLAT_KV_PLANE = "flatkv"
 
 # Byte width per cache dtype name. This module stays torch-free (pure integer

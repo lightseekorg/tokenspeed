@@ -110,41 +110,19 @@ class MHATokenToKVPool(CachePool):
 
     @override
     def atom_pages_per_block(self, group_id: str, kernel_page_size: int) -> int:
-        ordinary = super().atom_pages_per_block(group_id, kernel_page_size)
-        multipliers = set()
         for (_, plane), field_id in self.layer_fields.items():
             if plane not in ("k", "v"):
                 continue
             field = self.arena.plan.field(field_id)
             if field.group_id != group_id:
                 continue
-            if (
-                field.plane_id != FLAT_KV_PLANE
-                or field.page_stride_bytes == field.payload_bytes
-            ):
-                multipliers.add(ordinary)
+            if field.plane_id != FLAT_KV_PLANE:
                 continue
             if self._layer_kv_head_counts is not None:
                 raise NotImplementedError(
                     "FlatKV atom pages currently require uniform K/V head geometry"
                 )
-            row_bytes = field.payload_bytes // field.shape[0]
-            atom_bytes = kernel_page_size * row_bytes
-            if field.page_stride_bytes % atom_bytes:
-                raise ValueError(
-                    f"cache field {field_id!r}: page stride "
-                    f"{field.page_stride_bytes} is not divisible by atom-page "
-                    f"payload {atom_bytes}"
-                )
-            multipliers.add(field.page_stride_bytes // atom_bytes)
-        if not multipliers:
-            return ordinary
-        if len(multipliers) != 1:
-            raise ValueError(
-                f"cache group {group_id!r} needs one atom-page multiplier for "
-                f"every layer sharing its page table, got {sorted(multipliers)}"
-            )
-        return multipliers.pop()
+        return super().atom_pages_per_block(group_id, kernel_page_size)
 
     def get_kv_size_bytes(self):
         # Count planned payload, not the atom view's span across neighboring

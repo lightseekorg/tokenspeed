@@ -331,26 +331,39 @@ class CacheArena:
             and field.field_id in self.offload_config.field_ids
         ):
             token_rows = spec.rows_per_page
-        if spec.attn_kind == "state" or field.shape[0] != token_rows:
-            return pages
-        if field.page_stride_bytes != field.payload_bytes:
-            if field.plane_id != FLAT_KV_PLANE:
-                return pages
-            # Only FlatKV folds physical page gaps into atom-page IDs.
-            # Ordinary padded fields keep their explicit page stride.
+        if (
+            field.plane_id == FLAT_KV_PLANE
+            and spec.attn_kind == "full_history"
+            and field.shape[0] == spec.rows_per_page
+        ):
+            # History readers use translated atom-page IDs. State and recent
+            # windows retain scheduler IDs and their explicit physical stride.
             row_bytes = field.payload_bytes // field.shape[0]
             if field.page_stride_bytes % row_bytes:
                 raise ValueError(
                     f"cache field {field.field_id!r} stride does not cover "
                     "a whole number of atom rows"
                 )
+            if field.page_stride_bytes % field.payload_bytes:
+                raise ValueError(
+                    f"cache field {field.field_id!r} stride does not cover "
+                    "a whole number of atom pages"
+                )
             span_bytes = (
                 group.page_count - 1
             ) * field.page_stride_bytes + field.payload_bytes
-            return pages.as_strided(
-                (span_bytes // row_bytes, *field.shape[1:]),
-                tuple(reversed(element_strides)),
+            pages = pages.as_strided(
+                (span_bytes // field.payload_bytes, *field.shape),
+                (field.payload_bytes // field.element_size, *reversed(element_strides)),
             )
+            if field.shape[0] != token_rows:
+                return pages
+        elif (
+            spec.attn_kind == "state"
+            or field.shape[0] != token_rows
+            or field.page_stride_bytes != field.payload_bytes
+        ):
+            return pages
         return pages.view(-1, *field.shape[1:])
 
     def field(self, field_id: str) -> torch.Tensor:

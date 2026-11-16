@@ -3965,10 +3965,10 @@ class ServerArgs:
             action="store_true",
             dest="qwen4_exp_flat_kv",
             default=ServerArgs.qwen4_exp_flat_kv,
-            help="Experimental Qwen4-Exp FlatKV layout: pack target full-attention K/V "
-            "fields into one plane and translate scheduler block IDs to "
-            "contiguous atom-page IDs before attention. Requires PP=1; "
-            "draft, recurrent, PLE and QSA side caches keep their existing groups.",
+            help="Experimental Qwen4-Exp layout: target/draft KV, recurrent, PLE "
+            "and QSA caches share one plane, preserving logical groups. "
+            "Full-history block IDs translate to contiguous atom pages; state "
+            "and recent windows use explicit strides. Requires PP=1 and non-MXFP8 KV.",
         )
         parser.add_argument(
             "--sampling-backend",

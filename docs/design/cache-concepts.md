@@ -2009,21 +2009,38 @@ make one of the engine's pipeline stages hold more bytes: a stage allocates
 every plane its layers' fields touch, so a field on a plane that no other layer
 of its stage uses costs that stage the whole plane.
 
-With `--qwen4-exp-flat-kv`, the target's full-attention K/V fields instead share
-one `flatkv` plane (PP=1 only; draft fields, GDN, PLE and QSA side groups keep
-their existing layout policy). The plane id explicitly selects contiguous
-atom-row views and atom-page translation. Other padded K/V fields, including
-sink-enabled SWA, retain page-indexed views with explicit strides and ordinary
-kernel-subpage translation. Padding alone never selects FlatKV.
-The FlatKV compute views stay contiguous without changing the
-attention kernels. For a field page stride `S`, kernel page payload `B`, and
+With `--qwen4-exp-flat-kv`, all target and draft cache fields share one
+`flatkv` plane (PP=1, uniform per-view K/V heads, no MXFP8). Logical groups
+and their layer membership stay unchanged. Qwen3.8-Flash-Next retains six:
+full attention, two GDN state groups, PLE, compressed QSA and recent QSA.
+The recipe sizes the shared parent to fit the largest group while tightly
+packing full-attention K/V. Each other group packs as many pages as its
+payload and stride alignment permit. A parent still belongs to one group at
+a time; sharing the plane does not mix their allocation or prefix matching.
+
+The plane id explicitly selects contiguous atom views for full-history
+fields: both K/V and compressed QSA. State, PLE and recent QSA retain raw
+scheduler IDs and explicit page strides. Other padded K/V fields, including
+sink-enabled SWA, retain page-indexed views with ordinary kernel-subpage
+translation. Padding alone never selects FlatKV.
+
+For a full-history field page stride `S`, kernel page payload `B`, and
 scheduler block `b` containing kernel subpage `j`, the router emits atom page
-`b * (S / B) + j`, while each field's view starts at its block-0 address. The
-address is therefore `base + b * S + j * B`, exactly the original strided
-address. Each page stride must be row-aligned, and `S` must be divisible by `B`;
-tightly packed fields reduce to the ordinary `b * r + j` mapping.
-The same atom table drives `out_cache_loc`, so
-reads and writes share the mapping.
+`b * (S / B) + j`, while each field's contiguous view starts at its block-0
+address. The address is therefore `base + b * S + j * B`, exactly the original
+strided address. `S` must be divisible by the native field-page payload;
+tightly packed fields reduce to the ordinary `b * r + j` mapping. Compressed
+QSA uses its native compressed rows when building its atom view, while its
+locations retain their raw-token units. The same atom tables drive reads
+and write locations. GDN kernels selected for padded state pages must declare
+`strided_state` support and address input and output pools with their own
+runtime page strides.
+
+A single plane removes plane-specific holes when a parent belongs to a
+smaller group. It does not compress useful KV data: when the ordinary layout
+already fills a full-attention parent, its KV payload per token is unchanged.
+Parent rounding, the reserved null parent and the live mix of groups determine
+the resulting allocation and request capacity.
 
 Inkling's ShortConv checkpoints share the attention planes the same way: a
 kvconv group and one hiddenconv group per attention group put each layer's

@@ -339,3 +339,360 @@ def test_ordinary_sink_router_keeps_raw_page_addresses(
     )
     assert router.leaves["draft_swa"].page_table_buf[0, 0].item() == 1
     assert router.decode_window_locations().tolist() == [135]
+
+
+def _six_group_recipe(*, flat, device, kv_dtype):
+    from dataclasses import replace
+    from test.runtime.test_cache_setup import _qwen4_exp_fp8_kv_recipe
+
+    from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+        FULL_ATTENTION,
+        LINEAR_ATTENTION,
+    )
+
+    recipe = _qwen4_exp_fp8_kv_recipe(
+        layer_types=(LINEAR_ATTENTION,) * 7 + (FULL_ATTENTION,) * 2,
+        ple_layer_ids=[2],
+        hidden_size=16,
+        linear=LinearAttnConfig(
+            num_k_heads=1,
+            num_v_heads=2,
+            head_k_dim=32,
+            head_v_dim=32,
+            conv_kernel_size=4,
+            layer_ids=tuple(range(7)),
+            tp_size=1,
+        ),
+        num_kv_heads=1,
+        head_dim=64,
+        mamba_ssm_dtype="float32",
+        qsa=True,
+        draft_num_kv_heads=1,
+        verify_width=4,
+        max_bs=2,
+        pp_size=1,
+        cache_budget_bytes=16 << 20,
+        device=device,
+    )
+    recipe.server_args.qwen4_exp_flat_kv = flat
+    recipe.attn_config = replace(recipe.attn_config, kv_cache_dtype=kv_dtype)
+    recipe.draft_attn_config = replace(
+        recipe.draft_attn_config, kv_cache_dtype=kv_dtype
+    )
+    return recipe
+
+
+def _six_group_pool(*, flat, device, kv_dtype):
+    from tokenspeed.runtime.layers.attention.kv_cache.factory import (
+        create_cache_arena,
+        create_cache_pool,
+    )
+
+    recipe = _six_group_recipe(flat=flat, device=device, kv_dtype=kv_dtype)
+    setup = recipe.setup()
+    arena = create_cache_arena(setup.spec, device=device, enable_memory_saver=False)
+    pools = tuple(
+        create_cache_pool(
+            setup.spec.layer_view(first_layer=offset, num_layers=count),
+            config,
+            arena,
+            num_layers=count,
+            rank=0,
+            field_layer_offset=offset,
+        )
+        for offset, count, config in (
+            (0, setup.num_target_layers, recipe.attn_config),
+            (setup.num_target_layers, setup.num_draft_layers, recipe.draft_attn_config),
+        )
+    )
+    return recipe, arena, pools
+
+
+@pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_flat_kv_keeps_six_groups_on_one_plane(kv_dtype):
+    from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
+        QWEN4_EXP_PLE_CACHE_GROUP,
+        QWEN4_EXP_QSA_CACHE_GROUP,
+        QWEN4_EXP_QSA_RECENT_CACHE_GROUP,
+    )
+
+    _, arena, (target, draft) = _six_group_pool(
+        flat=True, device="cpu", kv_dtype=kv_dtype
+    )
+    ordinary = _six_group_recipe(flat=False, device="cpu", kv_dtype=kv_dtype).setup()
+    assert {g.group_id for g in arena.plan.groups} == {
+        "full_attention",
+        "linear_attention_0",
+        "linear_attention_1",
+        QWEN4_EXP_PLE_CACHE_GROUP,
+        QWEN4_EXP_QSA_CACHE_GROUP,
+        QWEN4_EXP_QSA_RECENT_CACHE_GROUP,
+    }
+    assert tuple(p.plane_id for p in arena.plan.planes) == ("flatkv",)
+    assert {f.plane_id for f in arena.plan.fields} == {"flatkv"}
+    assert {f.field_id: f.group_id for f in arena.plan.fields} == {
+        f.field_id: f.group_id for f in ordinary.spec.memory_plan.fields
+    }
+    for pool in (target, draft):
+        assert pool.arena is arena
+        assert pool.atom_pages_per_block("full_attention", 64) > 1
+        assert pool.atom_pages_per_block(QWEN4_EXP_QSA_CACHE_GROUP, 256) > 1
+        assert pool.atom_pages_per_block(QWEN4_EXP_QSA_RECENT_CACHE_GROUP, 64) == 1
+    kv_group = arena.plan.group("full_attention")
+    kv_payload = sum(
+        f.payload_bytes for f in arena.plan.fields if f.group_id == "full_attention"
+    )
+    assert (
+        kv_payload * kv_group.cache_blocks_per_lcm_block == arena.plan.lcm_block_bytes
+    )
+    for field in arena.plan.fields:
+        if field.group_id in ("full_attention", QWEN4_EXP_QSA_CACHE_GROUP):
+            assert field.page_stride_bytes % field.payload_bytes == 0
+        elif field.group_id in ("linear_attention_0", "linear_attention_1"):
+            view = arena.field(field.field_id)
+            assert view.stride(0) * view.element_size() == field.page_stride_bytes
+
+
+@requires_cuda
+@pytest.mark.parametrize("graph", [False, True])
+def test_shared_plane_qsa_compression_and_recent_write(graph):
+    from tokenspeed_kernel.ops.attention.qsa.triton import (
+        qwen4_exp_qsa_compress_and_store,
+        qwen4_exp_qsa_recent_write,
+    )
+
+    from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
+        QWEN4_EXP_QSA_CACHE_GROUP,
+        QWEN4_EXP_QSA_RECENT_CACHE_GROUP,
+        qsa_compressed_field,
+        qsa_raw_key_field,
+        qsa_rope_position_field,
+    )
+
+    _, arena, (pool, _) = _six_group_pool(
+        flat=True, device="cuda", kv_dtype=torch.bfloat16
+    )
+    layers = (7, 8, 9)
+    keys = torch.randn(4, 1, 128, device="cuda", dtype=torch.bfloat16)
+    logical = torch.arange(4, device="cuda", dtype=torch.int64)
+    requests = torch.zeros(4, device="cuda", dtype=torch.int32)
+    positions = logical[:, None].expand(-1, 3).contiguous()
+    weight = torch.ones(128, device="cuda")
+    cos_sin = torch.cat((torch.ones(8, 64), torch.zeros(8, 64)), dim=-1).cuda()
+    stacks = GroupTableStacks(
+        [
+            GroupTableSpec(gid, grain, grain, 1, pool.atom_pages_per_block(gid, grain))
+            for gid, grain in (
+                (QWEN4_EXP_QSA_CACHE_GROUP, 256),
+                (QWEN4_EXP_QSA_RECENT_CACHE_GROUP, 64),
+            )
+        ],
+        max_bs=1,
+        max_tokens_per_req=4,
+        max_extend_tokens=0,
+        device="cuda",
+    )
+    raw_tables = {
+        gid: torch.full(
+            (1, 1),
+            1 + index * arena.plan.group(gid).cache_blocks_per_lcm_block,
+            device="cuda",
+            dtype=torch.int32,
+        )
+        for index, gid in enumerate(
+            (QWEN4_EXP_QSA_CACHE_GROUP, QWEN4_EXP_QSA_RECENT_CACHE_GROUP)
+        )
+    }
+    qsa_locs = torch.empty(4, device="cuda", dtype=torch.int32)
+    recent_locs = torch.empty_like(qsa_locs)
+
+    def run():
+        stacks.fill(1, 1, raw_tables)
+        qsa_locs.copy_(stacks.table(QWEN4_EXP_QSA_CACHE_GROUP, 1)[0, 0] * 256 + logical)
+        recent_locs.copy_(
+            stacks.table(QWEN4_EXP_QSA_RECENT_CACHE_GROUP, 1)[0, 0] * 64 + logical
+        )
+        for layer in layers:
+            raw = arena.field(qsa_raw_key_field(layer))
+            compressed = arena.field(qsa_compressed_field(layer))
+            rope = arena.field(qsa_rope_position_field(layer))
+            qwen4_exp_qsa_compress_and_store(
+                keys,
+                logical,
+                requests,
+                recent_locs,
+                raw,
+                positions,
+                rope,
+                weight,
+                1e-6,
+                cos_sin,
+                qsa_locs,
+                compressed,
+                64,
+                4,
+                256,
+                stage_verify_buffers=None,
+                stage_draft=False,
+            )
+            qwen4_exp_qsa_recent_write(
+                keys,
+                logical,
+                requests,
+                recent_locs,
+                positions,
+                raw,
+                rope,
+                64,
+                4,
+            )
+
+    run()
+    if graph:
+        torch.cuda.synchronize()
+        capture = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(capture):
+            run()
+        # Pick a different parent for each group, including its final block.
+        for index, (gid, table) in enumerate(raw_tables.items()):
+            group = arena.plan.group(gid)
+            table.fill_(group.page_count - 1 - index * group.cache_blocks_per_lcm_block)
+        keys.add_(1)
+        capture.replay()
+    expected = keys.float().mean(0)
+    expected *= torch.rsqrt(expected.square().mean(-1, keepdim=True) + 1e-6)
+    for layer in layers:
+        compressed_id = qsa_compressed_field(layer)
+        block = raw_tables[QWEN4_EXP_QSA_CACHE_GROUP].item()
+        offset = arena.plan.field_page_byte_offset(compressed_id, block)
+        actual = arena.buffer[offset : offset + 256].view(torch.bfloat16).view(1, 128)
+        torch.testing.assert_close(
+            actual.float(), expected.to(torch.bfloat16).float(), atol=0, rtol=0
+        )
+        recent_block = raw_tables[QWEN4_EXP_QSA_RECENT_CACHE_GROUP].item()
+        torch.testing.assert_close(
+            arena.field(qsa_raw_key_field(layer))[recent_block], keys, atol=0, rtol=0
+        )
+        assert arena.field(qsa_rope_position_field(layer))[recent_block].tolist() == [
+            0,
+            0,
+            0,
+        ]
+
+
+@requires_cuda
+def test_six_group_shared_plane_copy_and_zero():
+    import numpy as np
+
+    _, arena, _ = _six_group_pool(flat=True, device="cuda", kv_dtype=torch.bfloat16)
+    plan = arena.plan
+    arena.buffer.fill_(219)
+    for index, group in enumerate(plan.groups):
+        packing = group.cache_blocks_per_lcm_block
+        # Each group owns different source/destination parents, like the scheduler.
+        source = (2 * index) * packing + 1
+        destination = (2 * index + 1) * packing + 1
+        for field in (f for f in plan.fields if f.group_id == group.group_id):
+            offset = plan.field_page_byte_offset(field.field_id, source)
+            arena.buffer[offset : offset + field.payload_bytes].fill_(index + 1)
+        arena.copy_blocks(
+            {group.group_id: np.array([[source, destination]], dtype=np.int32)}
+        )
+        for field in (f for f in plan.fields if f.group_id == group.group_id):
+            offset = plan.field_page_byte_offset(field.field_id, destination)
+            assert torch.all(
+                arena.buffer[offset : offset + field.payload_bytes] == index + 1
+            )
+        arena.zero_blocks({group.group_id: np.array([destination], dtype=np.int32)})
+        for field in (f for f in plan.fields if f.group_id == group.group_id):
+            offset = plan.field_page_byte_offset(field.field_id, destination)
+            assert torch.all(arena.buffer[offset : offset + field.payload_bytes] == 0)
+            source_offset = plan.field_page_byte_offset(field.field_id, source)
+            assert torch.all(
+                arena.buffer[source_offset : source_offset + field.payload_bytes]
+                == index + 1
+            )
+
+
+@requires_cuda
+@pytest.mark.parametrize("graph", [False, True])
+def test_shared_plane_ple_and_qsa_verify_commit(graph):
+    from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp_ple import (
+        Qwen4ExpPLEBackend,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
+        QWEN4_EXP_PLE_CACHE_GROUP,
+        QWEN4_EXP_QSA_RECENT_CACHE_GROUP,
+        qsa_raw_key_field,
+        qwen4_exp_ple_context_field,
+        qwen4_exp_ple_conv_field,
+    )
+    from tokenspeed.runtime.layers.attention.qsa.verify_state import QSAVerifyState
+
+    recipe, arena, (pool, _) = _six_group_pool(
+        flat=True, device="cuda", kv_dtype=torch.bfloat16
+    )
+    ple = Qwen4ExpPLEBackend(
+        recipe.attn_config, recipe.attn_config.component(MHAConfig)
+    )
+    ple.set_cache_pool(pool)
+    ple.preallocate_verify_workspace(2, 4)
+    ple.init_cuda_graph_state(2)
+    context_id = qwen4_exp_ple_context_field(1)
+    context, conv = ple.ple_verify_scratch(context_id, 1, 2)
+    context.copy_(torch.arange(len(context), device="cuda")[:, None].expand_as(context))
+    conv.copy_(torch.arange(len(conv), device="cuda")[:, None, None].expand_as(conv))
+    qsa = QSAVerifyState(recipe.attn_config, pool)
+    qsa.preallocate_verify_workspace(2, 4)
+    recent_packing = arena.plan.group(
+        QWEN4_EXP_QSA_RECENT_CACHE_GROUP
+    ).cache_blocks_per_lcm_block
+    recent_blocks = torch.tensor(
+        [recent_packing + 1, recent_packing + 2], device="cuda", dtype=torch.int32
+    )
+    for layer in (7, 8):
+        staged, positions, logical, locations = qsa.verify_staging_buffers(layer, 2)
+        staged.fill_(layer)
+        positions.zero_()
+        logical.copy_(torch.arange(4, device="cuda")[None, :].expand_as(logical))
+        locations.copy_(recent_blocks[:, None] * 64 + logical)
+    accepted = torch.tensor([2, 3], device="cuda", dtype=torch.int32)
+    pages = torch.tensor([[1, 2], [3, 4]], device="cuda", dtype=torch.int32)
+
+    slots = torch.arange(2, device="cuda")
+    lengths = torch.tensor([7, 7], device="cuda", dtype=torch.int32)
+
+    def run():
+        ple.refresh_decode_metadata(
+            2,
+            2,
+            slots,
+            lengths,
+            forward_mode=ForwardMode.DECODE,
+            block_tables={QWEN4_EXP_PLE_CACHE_GROUP: pages},
+        )
+        ple.commit_verified_state(accepted)
+        qsa.commit_after_mtp_verify(accepted, num_extends=0)
+
+    run()
+    if graph:
+        torch.cuda.synchronize()
+        capture = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(capture):
+            run()
+        accepted.copy_(torch.tensor([1, 4], device="cuda", dtype=torch.int32))
+        capture.replay()
+    for request, (page, steps) in enumerate(
+        zip(pages[:, 1].tolist(), accepted.tolist(), strict=True)
+    ):
+        source = request * 5 + steps
+        torch.testing.assert_close(
+            arena.field(context_id)[page], context[source], atol=0, rtol=0
+        )
+        torch.testing.assert_close(
+            arena.field(qwen4_exp_ple_conv_field(1))[page], conv[source], atol=0, rtol=0
+        )
+        for layer in (7, 8):
+            raw = arena.field(qsa_raw_key_field(layer))[recent_blocks[request].item()]
+            assert torch.all(raw[:steps] == layer)

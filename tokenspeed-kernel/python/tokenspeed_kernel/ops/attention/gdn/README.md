@@ -20,7 +20,11 @@ the Triton chunked-chain candidate described below.
 Automatic BF16 state-writing verify and ordinary decode require the
 `padding_safe` trait, so the selected kernel preserves the reserved null page.
 The operator owns this policy; runtime code supplies no solution choice.
-Explicit solutions retain their documented padding contract. Read-only verify
+Explicit solutions retain their documented padding contract. Page-strided input
+or output pools require the `strided_state` trait. The portable recurrence
+uses separate runtime strides for its source and destination pools, including
+tree-parent reloads and per-token scatter. Rows themselves remain dense in
+K-last order; the row index is widened before multiplying by the stride. Read-only verify
 uses normal selection, including fallback kernels for
 unsupported WY geometry. It may read the reserved null page for padding, but
 never writes it; padded outputs are ignored.

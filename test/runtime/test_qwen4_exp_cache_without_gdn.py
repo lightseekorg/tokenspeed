@@ -47,7 +47,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.factory import (
     create_cache_arena,
     create_cache_pool,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.mha import MHATokenToKVPoolMXFP8
 from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
     QWEN4_EXP_PLE_CACHE_GROUP,
     QWEN4_EXP_QSA_CACHE_GROUP,
@@ -530,10 +529,10 @@ def test_flat_kv_rejects_pipeline_parallelism() -> None:
     recipe = _flat_kv_recipe()
     recipe.server_args.mapping.pp_size = 2
     with pytest.raises(NotImplementedError, match="PP=1"):
-        recipe.fields_for_layer(0, FULL_ATTENTION, 0)
+        recipe.setup()
 
 
-def test_flat_kv_keeps_mxfp8_draft_page_addressing() -> None:
+def test_flat_kv_rejects_mxfp8_draft_scale_addressing() -> None:
     recipe = _recipe(
         layer_types=(FULL_ATTENTION, FULL_ATTENTION), speculative=True, width=3
     )
@@ -550,26 +549,5 @@ def test_flat_kv_keeps_mxfp8_draft_page_addressing() -> None:
         kv_cache_dtype=torch.float8_e4m3fn,
         kv_cache_mxfp8=True,
     )
-    setup = recipe.setup()
-    arena = create_cache_arena(setup.spec, device="cpu", enable_memory_saver=False)
-    pool = MHATokenToKVPoolMXFP8(
-        arena, torch.float8_e4m3fn, 1, 64, 1, 0, field_layer_offset=2
-    )
-    grain = arena.plan.prefix_granularity
-    assert pool.atom_pages_per_block(FULL_ATTENTION, grain) == 1
-    key = pool.get_key_buffer(0)
-    key.view(torch.uint8)[grain + 7].fill_(56)  # FP8 value 1.
-    field_id = "layer.2.k"
-    field = arena.plan.field(field_id)
-    offset = (
-        arena.plan.field_page_byte_offset(field_id, 1)
-        + 7 * field.payload_bytes // grain
-    )
-    assert torch.all(
-        arena.buffer[offset : offset + 64].view(torch.float8_e4m3fn).float() == 1
-    )
-    k_scale, _ = pool.get_kv_scale_buffer(0)
-    k_scale.view(torch.uint8)[1].fill_(127)
-    scale_field = arena.plan.field("layer.2.k_scale")
-    offset = arena.plan.field_page_byte_offset(scale_field.field_id, 1)
-    assert torch.all(arena.buffer[offset : offset + scale_field.payload_bytes] == 127)
+    with pytest.raises(NotImplementedError, match="MXFP8 draft scale addressing"):
+        recipe.setup()

@@ -2337,3 +2337,188 @@ def test_gdn_chain_verify_compiles_once_per_launch_tier(device: str, require):
         for T in (3, 4, 5, 8, 13, 16):
             for batch in (1, 5, 9, 20, 32, 40, 65, 90, 128):
                 run(batch, T)
+
+
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    "mode", ["step", "writeback", "scatter", "tree", "readonly_tree"]
+)
+def test_gdn_decode_page_strided_state(device: str, state_dtype, mode, require):
+    """Shared-plane state pages use their input/output strides and preserve gaps."""
+    from tokenspeed_kernel.ops.attention.gdn.triton import (
+        _fused_gdn_decode_update_kernel,
+        _gdn_tree_verify_chunked_kernel,
+    )
+
+    op = "gdn_decode_step" if mode == "step" else "gdn_decode_mtp"
+    require("attention", op, "triton", torch.bfloat16, "q")
+    steps = 1 if mode == "step" else (8 if mode == "readonly_tree" else 4)
+    q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
+        device=device,
+        dtype=torch.bfloat16,
+        T=steps,
+        batch=2,
+        num_q_heads=1,
+        num_v_heads=2,
+        head_dim=32,
+        pool_size=16,
+        state_dtype=state_dtype,
+    )
+    read_rows = torch.tensor([1, 3], device=device, dtype=torch.int32)
+    output_rows = torch.arange(5, 5 + 2 * steps, device=device, dtype=torch.int32)
+    ancestors = (
+        _tree_ancestors(
+            [[-1, 0, 0, 2] + [2] * (steps - 4), [-1, -1, 1, 1] + [1] * (steps - 4)],
+            device,
+        )
+        if mode in ("tree", "readonly_tree")
+        else None
+    )
+    common = dict(
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b=b,
+        initial_state_indices=read_rows,
+        solution="triton",
+    )
+
+    def run(source, destination):
+        if mode == "step":
+            return gdn_decode_step(
+                q,
+                k,
+                v,
+                initial_state=source,
+                output_state_indices=output_rows,
+                **common,
+            )
+        return gdn_decode_mtp(
+            q,
+            k,
+            v,
+            initial_state=source,
+            output_state=destination if mode in ("scatter", "tree") else None,
+            output_state_indices=(
+                output_rows.view(2, steps) if mode in ("scatter", "tree") else None
+            ),
+            disable_state_update=mode == "readonly_tree",
+            tree_ancestors=ancestors,
+            **common,
+        )
+
+    expected_pool = pool.clone()
+    expected_destination = pool.clone()
+    expected = run(expected_pool, expected_destination)
+
+    def check(extra):
+        row_elements = pool[0].numel()
+        backing = torch.full(
+            (len(pool), row_elements + extra), 123.0, device=device, dtype=state_dtype
+        )
+        source = backing[:, :row_elements].view(pool.shape)
+        source.copy_(pool)
+        destination_backing = torch.full(
+            (len(pool), row_elements + 2 * extra),
+            124.0,
+            device=device,
+            dtype=state_dtype,
+        )
+        destination = destination_backing[:, :row_elements].view(pool.shape)
+        destination.copy_(pool)
+        actual = run(source, destination)
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        torch.testing.assert_close(source, expected_pool, atol=0, rtol=0)
+        torch.testing.assert_close(destination, expected_destination, atol=0, rtol=0)
+        assert torch.all(backing[:, row_elements:] == 123.0)
+        assert torch.all(destination_backing[:, row_elements:] == 124.0)
+
+    check(16)
+    with assert_no_triton_compile(
+        _fused_gdn_decode_update_kernel, _gdn_tree_verify_chunked_kernel
+    ):
+        check(65)
+
+
+def test_gdn_decode_state_offsets_beyond_int32(device: str, require):
+    """Only touch the last page, whose element offset exceeds signed int32."""
+    require("attention", "gdn_decode_step", "triton", torch.bfloat16, "q")
+    q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
+        device=device,
+        dtype=torch.bfloat16,
+        T=1,
+        batch=1,
+        num_q_heads=1,
+        num_v_heads=1,
+        head_dim=32,
+        pool_size=1,
+        state_dtype=torch.float32,
+    )
+    common = dict(A_log=A_log, a=a, dt_bias=dt_bias, b=b, solution="triton")
+    expected_state = pool.clone()
+    expected = gdn_decode_step(
+        q,
+        k,
+        v,
+        initial_state=expected_state,
+        initial_state_indices=torch.tensor([0], device=device, dtype=torch.int32),
+        **common,
+    )
+    far_stride = (1 << 30) + 1024
+    state = torch.empty_strided(
+        (3, 1, 32, 32),
+        (far_stride, 1024, 32, 1),
+        device=device,
+        dtype=torch.float32,
+    )
+    state[2].copy_(pool[0])
+    actual = gdn_decode_step(
+        q,
+        k,
+        v,
+        initial_state=state,
+        initial_state_indices=torch.tensor([2], device=device, dtype=torch.int32),
+        **common,
+    )
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    torch.testing.assert_close(state[2], expected_state[0], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("steps", [1, 3])
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+def test_gdn_default_selection_updates_page_strided_state(
+    device, steps, state_dtype, require
+):
+    op = "gdn_decode_step" if steps == 1 else "gdn_decode_mtp"
+    require("attention", op, "triton", torch.bfloat16, "q")
+    q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
+        device=device,
+        dtype=torch.bfloat16,
+        T=steps,
+        batch=2,
+        num_q_heads=1,
+        num_v_heads=2,
+        head_dim=128,
+        pool_size=4,
+        state_dtype=state_dtype,
+    )
+    backing = torch.full((8, 2, 128, 128), 123.0, device=device, dtype=state_dtype)
+    state = backing[::2]
+    state.copy_(pool)
+    common = dict(
+        A_log=A_log,
+        a=a.bfloat16(),
+        dt_bias=dt_bias,
+        b=b.bfloat16(),
+        initial_state_indices=torch.tensor([1, 3], device=device, dtype=torch.int32),
+    )
+    function = gdn_decode_step if steps == 1 else gdn_decode_mtp
+    kwargs = {} if steps == 1 else dict(disable_state_update=False, tree_ancestors=None)
+    expected_state = pool.clone()
+    expected = function(
+        q, k, v, initial_state=expected_state, solution="triton", **common, **kwargs
+    )
+    actual = function(q, k, v, initial_state=state, **common, **kwargs)
+    torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-3)
+    torch.testing.assert_close(state, expected_state, atol=2e-3, rtol=2e-3)
+    assert torch.all(backing[1::2] == 123.0)

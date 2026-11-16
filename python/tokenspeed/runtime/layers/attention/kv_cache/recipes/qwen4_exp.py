@@ -115,32 +115,84 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
 
     @cached_property
     def _flat_kv(self) -> bool:
-        """Whether full-attention K/V uses the experimental single plane."""
+        """Whether all cache groups share the experimental physical plane."""
         enabled = bool(self.server_args.qwen4_exp_flat_kv)
         if enabled and self.server_args.mapping.pp_size != 1:
             raise NotImplementedError(
                 "Qwen4-Exp FlatKV currently requires PP=1; PP-local repacking "
                 "has not been implemented"
             )
+        if (
+            enabled
+            and self.draft_attn_config is not None
+            and self.draft_attn_config.kv_cache_mxfp8
+        ):
+            raise NotImplementedError(
+                "Qwen4-Exp FlatKV does not support MXFP8 draft scale addressing"
+            )
         return enabled
 
-    @override
-    def fields_for_layer(
-        self, layer_id: int, group_id: str, occurrence: int
-    ) -> tuple[CacheFieldSpec, ...]:
-        fields = super().fields_for_layer(layer_id, group_id, occurrence)
-        if (
-            not self._flat_kv
-            or layer_id >= len(self.target_layer_types)
-            or self.layer_types[layer_id] != FULL_ATTENTION
-        ):
-            return fields
-        # The pool exposes each field through a contiguous atom-row view. The
-        # router folds this plane's larger page stride into its atom-page IDs.
+    def _flat_groups(
+        self, groups: Sequence[CacheGroupDeclaration]
+    ) -> tuple[CacheGroupDeclaration, ...]:
+        """Keep logical groups while putting all their fields on one plane."""
         return tuple(
-            replace(field, plane_id=FLAT_KV_PLANE, exact_page_stride=False)
-            for field in fields
+            (
+                spec,
+                tuple(
+                    replace(
+                        field,
+                        plane_id=FLAT_KV_PLANE,
+                        exact_page_stride=False,
+                        page_stride_alignment_bytes=math.lcm(
+                            field.page_stride_alignment_bytes,
+                            (
+                                field.payload_bytes
+                                if spec.attn_kind == "full_history"
+                                else field.element_size
+                            ),
+                        ),
+                    )
+                    for field in fields
+                ),
+            )
+            for spec, fields in groups
         )
+
+    @override
+    def packing(self, groups: Sequence[CacheGroupDeclaration]) -> dict[str, int] | None:
+        if not self._flat_kv:
+            return None
+        payloads = {}
+        alignments = {}
+        for spec, fields in groups:
+            size = 0
+            for field in sorted(fields, key=lambda field: field.field_id):
+                size = (
+                    -(-size // field.element_size) * field.element_size
+                    + field.payload_bytes
+                )
+            payloads[spec.group_id] = size
+            alignments[spec.group_id] = math.lcm(
+                *(
+                    math.lcm(field.element_size, field.page_stride_alignment_bytes)
+                    for field in fields
+                )
+            )
+        # Keep K/V blocks tightly packed while fitting the largest state
+        # group. Each other group takes as many aligned pages as fit there.
+        kv_alignment = alignments[FULL_ATTENTION]
+        kv_stride = -(-payloads[FULL_ATTENTION] // kv_alignment) * kv_alignment
+        parent_alignment = math.lcm(kv_stride, *alignments.values())
+        parent_bytes = -(-max(payloads.values()) // parent_alignment) * parent_alignment
+        return {
+            gid: next(
+                count
+                for count in range(parent_bytes // payload, 0, -1)
+                if parent_bytes % (count * alignments[gid]) == 0
+            )
+            for gid, payload in payloads.items()
+        }
 
     def _ple_fields(self) -> tuple[CacheFieldSpec, ...]:
         if not getattr(self._text_config, "ple_layer_ids", None):
@@ -417,6 +469,8 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
                 for spec, (_, fields) in zip(policies, extras, strict=True)
             )
         decoder_groups = super().groups()
+        if self._flat_kv:
+            return self._flat_groups((*decoder_groups, *extras))
         attention_plane_bytes = {
             field.plane_id: field.payload_bytes
             for spec, fields in decoder_groups

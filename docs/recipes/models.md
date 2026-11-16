@@ -1279,14 +1279,17 @@ object:
 
 ### Experimental FlatKV cache
 
-`--qwen4-exp-flat-kv` packs the target's full-attention K/V fields into one `flatkv`
-plane. The runtime translates scheduler block IDs to contiguous atom-page IDs
-before attention, so the existing kernels need no padded-stride support and no
-KV gather is introduced. The field page stride must be a whole number of
-kernel-page payloads. This draft currently requires PP=1 and uniform K/V head
-geometry; draft fields, GDN, PLE and QSA side caches keep their existing groups
-and plane policy. The flag is off by default and is part of the L3 storage
-identity when enabled.
+`--qwen4-exp-flat-kv` puts target and draft KV, GDN, PLE and QSA fields on
+one shared physical plane, preserving their logical groups. For
+Qwen3.8-Flash-Next these are six groups, including two GDN groups. Each group
+packs pages according to its payload and alignment. Full-history K/V and
+compressed QSA use translated atom-page IDs; state and recent windows retain
+explicit strides. No KV gather is introduced.
+
+This requires PP=1, uniform K/V heads within each compute view and non-MXFP8
+KV. It reduces padding for partially filled groups; a full-attention parent
+that was already full keeps the same useful KV bytes per token. The flag is
+off by default and is part of the L3 storage identity when enabled.
 
 ## GPT-OSS 20B / 120B
 
