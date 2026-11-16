@@ -29,7 +29,14 @@ import math
 
 import torch
 import torch.distributed
+from tokenspeed_kernel.op_profile import (
+    OpProfile,
+    current_op_metadata,
+    wrap_op_for_profiling,
+)
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.profile_communication import record_communication_route
+from tokenspeed_kernel.registry import KernelSpec
 
 from tokenspeed.runtime.distributed.comm_backend.base import (
     CommBackend,
@@ -130,6 +137,13 @@ class NcclBackend(CommBackend):
         group: Group,
         op=None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        metadata = current_op_metadata()
+        if metadata is not None:
+            metadata.update(
+                ranks=group,
+                group_name=self._group_name,
+                is_sum=op is None or op == torch.distributed.ReduceOp.SUM,
+            )
         if not isinstance(tensor, torch.Tensor):
             return super().all_reduce(tensor, group, op=op)
         res = self._get_or_create_resources(group)
@@ -137,6 +151,20 @@ class NcclBackend(CommBackend):
             return tensor
         if op is None:
             op = torch.distributed.ReduceOp.SUM
+        if metadata is not None:
+            record_communication_route(
+                ranks=tuple(group),
+                group_name=self._group_name,
+                backend="nccl",
+                workspace=None,
+                algorithm=None,
+                protocol=None,
+            )
+            metadata["comm_api"] = (
+                "pynccl"
+                if res["pynccl_comm"] is not None and not res["pynccl_comm"].disabled
+                else "torch.distributed"
+            )
         pynccl = res["pynccl_comm"]
         if pynccl is not None and not pynccl.disabled:
             pynccl.all_reduce(tensor, op=op)
@@ -160,11 +188,32 @@ class NcclBackend(CommBackend):
         collectives when the coalescing manager is unavailable (pynccl-driven
         groups, torch without ``_coalescing_manager``).
         """
+        metadata = current_op_metadata()
+        if metadata is not None:
+            metadata.update(
+                ranks=group,
+                group_name=self._group_name,
+                is_sum=op is None or op == torch.distributed.ReduceOp.SUM,
+            )
         res = self._get_or_create_resources(group)
         if res["world_size"] == 1:
             return first, second
         if op is None:
             op = torch.distributed.ReduceOp.SUM
+        if metadata is not None:
+            record_communication_route(
+                ranks=tuple(group),
+                group_name=self._group_name,
+                backend="nccl",
+                workspace=None,
+                algorithm=None,
+                protocol=None,
+            )
+            metadata["comm_api"] = (
+                "pynccl"
+                if res["pynccl_comm"] is not None and not res["pynccl_comm"].disabled
+                else "torch.distributed"
+            )
         pynccl = res["pynccl_comm"]
         coalescing = getattr(torch.distributed, "_coalescing_manager", None)
         if coalescing is None or (pynccl is not None and not pynccl.disabled):
@@ -360,3 +409,17 @@ class NcclBackend(CommBackend):
         )
         rank = group.index(torch.distributed.get_rank())
         return output[: scattered_num_tokens[rank]].contiguous()
+
+
+NcclBackend.all_reduce = wrap_op_for_profiling(
+    NcclBackend.all_reduce,
+    spec=KernelSpec(name="nccl_all_reduce", family="communication", mode="all_reduce"),
+    profile=OpProfile(cost_rule="nccl_all_reduce_sum.v1"),
+)
+NcclBackend.all_reduce_two = wrap_op_for_profiling(
+    NcclBackend.all_reduce_two,
+    spec=KernelSpec(
+        name="nccl_all_reduce_two", family="communication", mode="all_reduce"
+    ),
+    profile=OpProfile(cost_rule="nccl_all_reduce_sum.v1"),
+)

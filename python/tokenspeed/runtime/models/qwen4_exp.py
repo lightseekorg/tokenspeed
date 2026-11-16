@@ -27,6 +27,7 @@ import re
 from collections.abc import Iterable
 
 import torch
+from tokenspeed_kernel.op_profile import profiled
 from torch import nn
 
 from tokenspeed.runtime.configs.qwen4_exp_config import (
@@ -311,6 +312,7 @@ class Qwen4ExpLinearDecoderLayer(_Qwen4ExpDecoderMixin, Qwen3_5LinearDecoderLaye
             )
         self._init_qwen4_exp_extensions(config, mapping, layer_id, quant_config, prefix)
 
+    @profiled(level="layer")
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -410,6 +412,7 @@ class Qwen4ExpAttentionDecoderLayer(
             attention_output, gate if fuse_output_quant else None
         )
 
+    @profiled(level="layer")
     def forward(
         self,
         positions: torch.Tensor,

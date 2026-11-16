@@ -39,6 +39,7 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import Callable
 
 from tokenspeed_engine import FrontendListener
 
@@ -222,27 +223,38 @@ class WireDriver:
         and size, ``kv_cache_size_tokens`` (the tokens its cache holds)."""
         return list(self.frontend.engines())
 
-    def generate(self, requests: list[TokenizedGenerateReqInput]) -> list[Completion]:
+    def generate(
+        self,
+        requests: list[TokenizedGenerateReqInput],
+        *,
+        on_chunk: Callable[[str, dict, int], None] | None = None,
+    ) -> list[Completion]:
         """Run ``requests`` together; their completions, in order.
 
         A request the engine refuses completes with an ``"abort"`` finish
         reason and the refusal in its ``finish_details``.
+        An observer receives each raw chunk before aggregation, with the
+        perf-counter timestamp when its batch returned to the Python client.
         """
-        return asyncio.run(self._generate(requests))
+        return asyncio.run(self._generate(requests, on_chunk))
 
-    async def _generate(self, requests):
+    async def _generate(self, requests, on_chunk):
         completions = {request.rid: Completion() for request in requests}
         for request in requests:
             frames = [bytes(frame) for frame in self._encoder.encode(request)]
             await self.frontend.generate(frames)
         unfinished = set(completions)
         while unfinished:
-            for rid, chunk in await self.frontend.next_outputs():
+            chunks = await self.frontend.next_outputs()
+            arrival_ns = time.perf_counter_ns() if on_chunk is not None else None
+            for rid, chunk in chunks:
                 if rid not in completions:
                     # A request of an earlier call that did not finish.
                     continue
                 if isinstance(chunk, Exception):
                     raise chunk
+                if on_chunk is not None:
+                    on_chunk(rid, chunk, arrival_ns)
                 completions[rid].add(chunk)
                 if chunk["finish_reason"] is not None:
                     unfinished.discard(rid)

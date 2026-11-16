@@ -25,9 +25,18 @@ from ctypes import c_void_p
 
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.op_profile import (
+    OpProfile,
+    current_op_metadata,
+    wrap_op_for_profiling,
+)
 from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
-from tokenspeed_kernel.registry import ErrorClass, error_fn, register_kernel
+from tokenspeed_kernel.profile_communication import (
+    bind_mnnvl_workspace,
+    record_communication_route,
+)
+from tokenspeed_kernel.registry import ErrorClass, KernelSpec, error_fn, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 logger = logging.getLogger(__name__)
@@ -126,6 +135,7 @@ if current_platform().is_nvidia:
     from tokenspeed_kernel.ops.communication.fabric import fabric_allocation_supported
     from tokenspeed_kernel.thirdparty.cuda.trtllm import (
         _MNNVL_SUPPORTED_WORLD_SIZES,
+        MAX_COMM_SIZE,
         MNNVL_PREFER_IPC_BYTES,
         MNNVL_TWOSHOT_MAX_TOKEN,
         AllGatherFusionPattern,
@@ -328,6 +338,7 @@ if current_platform().is_nvidia:
             self.mnnvl_workspace = None
             # FlashInfer's BT kernels for large plain reductions, beside mnnvl.
             self.plain_all_reduce = None
+            self.mnnvl_profile_allocation: dict | None = None
             self.world_size = None
             self.rank = None
             self.max_token_num = None
@@ -412,6 +423,11 @@ if current_platform().is_nvidia:
                 self.plain_all_reduce = _try_create_plain_all_reduce(
                     self.mnnvl_workspace.max_token_num, hidden_dim, group
                 )
+            self.mnnvl_profile_allocation = (
+                bind_mnnvl_workspace(self.mnnvl_workspace, group=group)
+                if self.mnnvl_workspace is not None
+                else None
+            )
 
             # With IPC skipped, mnnvl is the only workspace; if it failed to
             # arm there is nothing to fuse with -- stay uninitialized so
@@ -463,6 +479,7 @@ if current_platform().is_nvidia:
                     # reference is all we can (and need to) do here.
                     self.mnnvl_workspace = None
                     self.plain_all_reduce = None
+                    self.mnnvl_profile_allocation = None
                     self.initialized = False
                     self.world_size = None
                     self.rank = None
@@ -666,6 +683,51 @@ if current_platform().is_nvidia:
             )
             return None
         return _mark_captured(manager, manager.workspace_tensor)
+
+    def _record_allreduce_route(
+        manager, group, workspace, use_oneshot, tensor, pattern_code
+    ):
+        metadata = current_op_metadata()
+        if metadata is None:
+            return
+        is_ipc = workspace is not None and workspace is not manager.mnnvl_workspace
+        # The lower IPC launcher has a final workspace-size downgrade. Record
+        # the strategy it will actually launch, not just the earlier heuristic.
+        if (
+            is_ipc
+            and tensor.numel() * tensor.element_size() * manager.world_size
+            > MAX_COMM_SIZE
+        ):
+            use_oneshot = False
+        metadata.update(
+            comm_pattern=int(pattern_code),
+            comm_use_oneshot=use_oneshot if workspace is not None else None,
+            comm_payload_bytes=tensor.numel() * tensor.element_size(),
+            comm_payload_element_size=tensor.element_size(),
+        )
+        allocation = manager.mnnvl_profile_allocation
+        if allocation is not None and (
+            workspace is not manager.mnnvl_workspace
+            or allocation["workspace_identity"] != id(workspace)
+            or allocation.get("multicast_ptr") != workspace.multicast_ptr
+            or allocation.get("local_ptr") != workspace.local_ptr
+        ):
+            allocation = None
+        record_communication_route(
+            ranks=tuple(dist.get_process_group_ranks(group)),
+            group_name=group.group_name,
+            backend="trtllm" if workspace is not None else "nccl",
+            workspace=("ipc" if is_ipc else "mnnvl") if workspace is not None else None,
+            algorithm=(
+                ("oneshot" if use_oneshot else "twoshot")
+                if workspace is not None
+                else None
+            ),
+            protocol=(
+                ("lamport" if is_ipc else "mnnvl") if workspace is not None else None
+            ),
+            mnnvl_allocation=allocation,
+        )
 
     def get_num_tokens_per_rank(world_size: int, total_tokens_in_group: int) -> list:
         token_list_in_group = []
@@ -1098,6 +1160,9 @@ if current_platform().is_nvidia:
             # IPC two-shot needs token_num > world_size and keeps -0.0 sums.
             if not resolved_oneshot and (token_num <= world_size or fp32_acc):
                 return None
+        metadata = current_op_metadata()
+        if metadata is not None:
+            metadata["is_sum"] = True
         if not tensor_2d.is_contiguous():
             tensor_2d = tensor_2d.contiguous()
 
@@ -1124,9 +1189,26 @@ if current_platform().is_nvidia:
             )
 
             # Large payloads: owner reduction in rank order, fp32 accumulate.
+            if metadata is not None:
+                record_communication_route(
+                    ranks=tuple(dist.get_process_group_ranks(group)),
+                    group_name=group.group_name,
+                    backend="flashinfer",
+                    workspace="bt",
+                    algorithm=None,
+                    protocol=None,
+                )
             _mark_captured(manager, None)
             all_reduce(tensor_2d, plain, allreduce_out)
             return allreduce_out.view(input_tensor.shape)
+        _record_allreduce_route(
+            manager,
+            group,
+            workspace,
+            resolved_oneshot,
+            tensor_2d,
+            AllReduceFusionPattern.kAllReduce,
+        )
         trtllm_allreduce_fusion(
             allreduce_in=tensor_2d,
             world_size=world_size,
@@ -1274,6 +1356,16 @@ if current_platform().is_nvidia:
         # IPC has its own heuristic; only MNNVL uses the workspace's frozen cap.
         if workspace is not manager.mnnvl_workspace:
             resolved_oneshot = requested_oneshot
+        metadata = current_op_metadata()
+        if metadata is not None:
+            metadata.update(
+                ranks=tuple(dist.get_process_group_ranks(group)),
+                group_name=group.group_name,
+                fused=workspace is not None,
+            )
+        _record_allreduce_route(
+            manager, group, workspace, resolved_oneshot, input_tensor, pattern_code
+        )
         if workspace is None:
             # Cross-node group, pattern/shape the mnnvl kernel cannot serve
             # (block-quant or partial-out epilogue, oversized call). Degrade to
@@ -1329,6 +1421,24 @@ if current_platform().is_nvidia:
             return quant_out, residual_out, scale_out, partial_norm_out
         else:
             return norm_out, residual_out, None, partial_norm_out
+
+    allreduce_residual_rmsnorm = wrap_op_for_profiling(
+        allreduce_residual_rmsnorm,
+        spec=KernelSpec(
+            name="trtllm_allreduce_residual_rmsnorm",
+            family="communication",
+            mode="all_reduce_residual_rmsnorm",
+        ),
+        profile=OpProfile(
+            cost_rule="all_reduce_residual_rmsnorm.v1",
+            scalar_args=(
+                "rank",
+                "block_quant_fp8",
+                "residual_reduce_scattered",
+                "has_partial_norm_out",
+            ),
+        ),
+    )
 
     def _sandwich_scale_pair(
         x_scale: float | None, residual_scale: float | None

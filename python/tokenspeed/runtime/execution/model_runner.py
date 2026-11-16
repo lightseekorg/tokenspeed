@@ -21,9 +21,11 @@
 from __future__ import annotations
 
 import inspect
+from contextlib import nullcontext
 from typing import TYPE_CHECKING
 
 import torch
+from tokenspeed_kernel.op_profile import ProfileSession
 
 from tokenspeed.runtime.configs.numerics import require_verified_numerics
 from tokenspeed.runtime.distributed.process_group_manager import (
@@ -362,12 +364,23 @@ class ModelRunner:
         if spec_step_idx is not None and self.forward_accepts_spec_step_idx:
             kwargs["spec_step_idx"] = spec_step_idx
 
-        return self.model.forward(
-            ctx,
-            input_ids,
-            positions,
-            **kwargs,
+        profile = ProfileSession.current()
+        model_scope = (
+            profile.layer(
+                self.model,
+                name=f"{type(self.model).__name__}.forward",
+                display_name="Model",
+            )
+            if profile is not None and profile.is_bound(self.model)
+            else nullcontext()
         )
+        with model_scope:
+            return self.model.forward(
+                ctx,
+                input_ids,
+                positions,
+                **kwargs,
+            )
 
     # ------------------------------------------------------------------ #
     # RL online weight sync: receive NCCL-broadcast weights from a trainer.

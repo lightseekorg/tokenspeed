@@ -26,6 +26,7 @@ from dataclasses import replace
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.op_profile import OpProfile
 from tokenspeed_kernel.ops.attention.prologue.types import (
     BOOLS,
     ROPE_STYLES,
@@ -581,6 +582,7 @@ def triton_gqa_prologue(
     "attention",
     "mla_prologue",
     name="triton_mla_prologue",
+    profile=OpProfile(cost_rule="mla_nope_prologue.v1"),
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"amd", "nvidia"})),
     signatures=format_signatures(("query",), "dense", {torch.float16, torch.bfloat16}),

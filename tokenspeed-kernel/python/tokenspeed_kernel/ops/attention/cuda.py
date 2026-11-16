@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.op_profile import OpProfile
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -18,6 +19,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
         "attention",
         "attn_merge_state",
         name="cuda_attn_merge_state",
+        profile=OpProfile(cost_rule="attention_merge_state.v1"),
         solution="cuda",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),

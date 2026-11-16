@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 import torch
+from tokenspeed_kernel.op_profile import record_selected_kernel
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry, Priority
@@ -2407,6 +2408,7 @@ def moe_apply(
     output_kwargs = {"deferred_out": deferred_out} if deferred_out is not None else {}
     if valid_token_mask is not None:
         output_kwargs["valid_token_mask"] = valid_token_mask
+    record_selected_kernel(kernel.name, plan["solution"], implementation=kernel.impl)
     return kernel(
         plan=plan,
         x=x,

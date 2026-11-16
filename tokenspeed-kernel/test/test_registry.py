@@ -215,7 +215,7 @@ class TestRegistryRegister:
         reg = KernelRegistry.get()
         spec = KernelSpec(name="test_k", family="attention", mode="decode")
         impl = dummy_impl("test_k")
-        reg.register(spec, impl)
+        assert reg.register(spec, impl) is None
 
         assert reg.get_by_name("test_k") is spec
         assert reg.get_impl("test_k") is impl
