@@ -2569,7 +2569,7 @@ workspace before sizing the arena.
 Side-stream allocations retain their own workspace owner through execution,
 separate from scratch that main-stream operations can overwrite.
 Ascend DSA/MLA Prefill gathers the batch's referenced pages into a bounded
-workspace shared by its layers. The recipe reserves the exact native allocation
+workspace shared by its layers. The recipe reserves the workspace tensor's bytes
 before sizing the cache arena; startup checks planned and allocated bytes.
 Historical KV and Indexer-K receive directly into separate attention planes;
 current rows share a packed transfer and a fused owner-cache/boundary-page write.
@@ -2587,9 +2587,10 @@ attention entry ensures the same batch/layer history exists before consumption.
 An active gather keeps layer references through its final queued read. The next
 layer reuses the storage on the executor stream; synchronous HCCL submissions
 join their internal stream onto it. `finish` clears references and retains
-storage. Raw ACL ownership bypasses the Torch caching allocator, avoiding
-retention of differently sized packets as history grows. Actual teardown waits
-for consumers before freeing; no per-layer synchronization or permanent stream
+storage. A single persistent Torch allocation avoids creating differently sized
+packets as history grows; PyTorch controls the allocation and its page policy.
+Actual teardown waits for consumers before releasing references to the allocator;
+no per-layer synchronization or permanent stream
 identity check is needed. The layout budgets the null page, current-row alignment
 and a send buffer large enough for unequal page ownership.
 A Qwen4 PD prefill role retains the target/draft cache layout for transfer,

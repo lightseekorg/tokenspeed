@@ -595,7 +595,7 @@ def test_prefill_cache_binding_needs_no_transport_library_or_buffers(monkeypatch
     assert backend._prefill_runtime is None
 
 
-def test_mla_backend_reuses_native_workspace_after_consumption(monkeypatch, tmp_path):
+def test_mla_backend_reuses_workspace_after_consumption(monkeypatch, tmp_path):
     import torch.distributed as dist
 
     import tokenspeed.runtime.distributed.process_group_manager as groups
@@ -647,9 +647,9 @@ def test_mla_backend_reuses_native_workspace_after_consumption(monkeypatch, tmp_
             has_index=False,
         ).nbytes
         assert backend.preallocate_prefill_workspace() == expected_bytes
-        address = backend._prefill_runtime._storage.bytes.data_ptr()
+        address = backend._prefill_runtime._storage.data_ptr()
         assert backend.preallocate_prefill_workspace() == expected_bytes
-        assert backend._prefill_runtime._storage.bytes.data_ptr() == address
+        assert backend._prefill_runtime._storage.data_ptr() == address
         for value in (1, 2):
             # Match the executor's synchronized warmup-to-serving handoff.
             torch.npu.synchronize()

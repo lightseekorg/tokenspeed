@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""CPU transport contracts; only device memory and device kernels are replaced."""
+"""CPU transport contracts; only device kernels and collectives are replaced."""
 
 import importlib
 import sys
@@ -27,14 +27,6 @@ from types import ModuleType
 import pytest
 import torch
 import torch.distributed as dist
-
-
-class HostBuffer:
-    def __init__(self, nbytes, device):
-        self.bytes = torch.empty(nbytes, dtype=torch.uint8)
-
-    def close(self):
-        self.bytes = None
 
 
 def pack_current(kv, index, packet):
@@ -56,14 +48,16 @@ def gather_history(kv, index, slots, send_kv, send_index):
 def transport_class(monkeypatch):
     npu = ModuleType("torch_npu")
     npu.distributed = ModuleType("torch_npu.distributed")
-    native = ModuleType("tokenspeed_kernel_npu.ops._memory")
-    native.NativeBuffer = HostBuffer
+    device = ModuleType("torch.npu")
+    device.is_available = lambda: False
+    device.synchronize = lambda device: None
+    monkeypatch.setattr(torch, "npu", device, raising=False)
     kernels = ModuleType("tokenspeed_kernel_npu.ops._prefill_transport")
     kernels.pack_current = pack_current
     kernels.gather_history = gather_history
     # Device store/owner mapping is exercised by test_mla_cp_transport on NPUs.
     kernels.store_current = lambda *args, **kwargs: None
-    for module in (npu, native, kernels):
+    for module in (npu, kernels):
         monkeypatch.setitem(sys.modules, module.__name__, module)
     monkeypatch.delitem(sys.modules, "tokenspeed_kernel_npu.ops.prefill", raising=False)
     module = importlib.import_module("tokenspeed_kernel_npu.ops.prefill")
@@ -119,7 +113,7 @@ def test_growing_history_reuses_one_allocation_without_stale_bytes(
         max_history_rows=256 * degree,
         history_null_rows=128,
     )
-    allocation = runtime._storage.bytes.data_ptr()
+    allocation = runtime._storage.data_ptr()
     allocated_bytes = runtime.workspace_bytes
     for layer, history in enumerate((128, 256, 128)):
         # Uneven pages: one owner can hold the entire batch's history.
@@ -161,7 +155,7 @@ def test_growing_history_reuses_one_allocation_without_stale_bytes(
         assert torch.count_nonzero(runtime.kv[:128]) == 0
         runtime.finish(layer)
         assert runtime.workspace_bytes == allocated_bytes
-        assert runtime._storage.bytes.data_ptr() == allocation
+        assert runtime._storage.data_ptr() == allocation
     runtime.close()
     assert runtime.workspace_bytes == 0
 

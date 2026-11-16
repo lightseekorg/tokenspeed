@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Native ownership and byte-preserving copies, independent of collectives."""
+"""Workspace reuse and byte-preserving copies, independent of collectives."""
 
 import pytest
 import torch
@@ -46,36 +46,50 @@ def exact(actual, expected):
 
 
 @torch.inference_mode()
-def test_native_buffer_owns_memory_outside_the_caching_allocator():
-    from tokenspeed_kernel_npu.ops._memory import NativeBuffer
+def test_prefill_workspace_reuses_caching_allocator_storage(monkeypatch):
+    import torch.distributed as dist
+    from tokenspeed_kernel_npu.ops.prefill import AscendDSAPrefill
 
     torch.npu.set_device(0)
-    torch.empty(1, device="npu").fill_(1)
+    monkeypatch.setattr(dist, "get_rank", lambda: 0)
+    cache_host = payload(512, 576, 7)
+    cache = cache_host.npu()
+    slots = torch.arange(128, 384, dtype=torch.int64, device="npu")
     torch.npu.synchronize()
     allocated = torch.npu.memory_allocated()
-    free_before = torch.npu.mem_get_info()[0]
-    size = 32 << 20
-    owner = NativeBuffer(size, torch.device("npu:0"))
-    owner.bytes.fill_(73)
-    torch.npu.synchronize()
-    assert torch.npu.memory_allocated() == allocated
-    free_during = torch.npu.mem_get_info()[0]
-    assert free_before - free_during >= size
-    assert torch.equal(
-        owner.bytes[:256].cpu(), torch.full((256,), 73, dtype=torch.uint8)
+    runtime = AscendDSAPrefill(
+        cache,
+        None,
+        ranks=(0,),
+        history_group=None,
+        max_current_rows=128,
+        max_history_rows=256,
+        history_null_rows=128,
     )
-    owner.close()
-    assert torch.npu.memory_allocated() == allocated
-    # ACL may retain freed huge pages in its own pool. Repeated ownership must
-    # reuse bounded device memory, rather than require immediate driver return.
-    reusable_floor = min(free_during, torch.npu.mem_get_info()[0])
-    for _ in range(4):
-        replacement = NativeBuffer(size, torch.device("npu:0"))
-        replacement.bytes.fill_(19)
+    size = runtime.workspace_bytes
+    address = runtime._storage.data_ptr()
+    torch.npu.synchronize()
+    workspace_allocated = torch.npu.memory_allocated()
+    assert workspace_allocated - allocated >= size
+    for layer, history in enumerate((128, 256, 128)):
+        runtime.prefetch(
+            layer,
+            cache,
+            None,
+            batch_key=object(),
+            total_rows=128,
+            has_history=True,
+            history_slots=slots[:history],
+            history_counts=(history,),
+        )
+        exact(runtime.kv[128 : 128 + history], cache_host[128 : 128 + history])
+        runtime.finish(layer)
         torch.npu.synchronize()
-        assert torch.npu.memory_allocated() == allocated
-        assert torch.npu.mem_get_info()[0] >= reusable_floor - (2 << 20)
-        replacement.close()
+        assert runtime._storage.data_ptr() == address
+        assert torch.npu.memory_allocated() == workspace_allocated
+    runtime.close()
+    assert runtime.workspace_bytes == 0
+    assert torch.npu.memory_allocated() == allocated
 
 
 @pytest.mark.parametrize("has_index", [False, True])
@@ -269,7 +283,6 @@ def test_current_cache_tail_preserves_valid_rows(has_index):
 
 @torch.inference_mode()
 def test_cache_addresses_beyond_int32_elements():
-    from tokenspeed_kernel_npu.ops._memory import NativeBuffer
     from tokenspeed_kernel_npu.ops._prefill_transport import (
         gather_history,
         pack_current,
@@ -279,38 +292,33 @@ def test_cache_addresses_beyond_int32_elements():
     torch.npu.set_device(0)
     page = 128
     first = (2**31 // (page * 576) + 1) * page
-    owner = NativeBuffer((first + page) * 576 * 2, torch.device("npu:0"))
-    try:
-        cache = owner.bytes.view(torch.bfloat16).view(-1, 576)
-        before = payload(1, 576, 53)
-        cache[first : first + 1].copy_(before.npu())
-        slots = torch.tensor([first], dtype=torch.int64, device="npu")
-        send = torch.empty((1, 576), dtype=torch.bfloat16, device="npu")
-        gather_history(cache, None, slots, send, None)
-        exact(send, before)
-        after = payload(1, 576, 59)
-        pack_current(after.npu(), None, send)
-        plane = torch.empty((256, 576), dtype=torch.bfloat16, device="npu")
-        store_current(
-            send,
-            plane,
-            None,
-            cache,
-            None,
-            slots,
-            torch.tensor([-1], device="npu", dtype=torch.int64),
-            torch.ones(1, device="npu", dtype=torch.bool),
-            history_rows=128,
-            send_rows=128,
-            block_rows=page,
-            virtual_blocks=first // page + 1,
-            degree=1,
-            rank=0,
-        )
-        exact(cache[first : first + 1], after)
-        del cache
-    finally:
-        owner.close()
+    cache = torch.empty((first + page, 576), dtype=torch.bfloat16, device="npu")
+    before = payload(1, 576, 53)
+    cache[first : first + 1].copy_(before.npu())
+    slots = torch.tensor([first], dtype=torch.int64, device="npu")
+    send = torch.empty((1, 576), dtype=torch.bfloat16, device="npu")
+    gather_history(cache, None, slots, send, None)
+    exact(send, before)
+    after = payload(1, 576, 59)
+    pack_current(after.npu(), None, send)
+    plane = torch.empty((256, 576), dtype=torch.bfloat16, device="npu")
+    store_current(
+        send,
+        plane,
+        None,
+        cache,
+        None,
+        slots,
+        torch.tensor([-1], device="npu", dtype=torch.int64),
+        torch.ones(1, device="npu", dtype=torch.bool),
+        history_rows=128,
+        send_rows=128,
+        block_rows=page,
+        virtual_blocks=first // page + 1,
+        degree=1,
+        rank=0,
+    )
+    exact(cache[first : first + 1], after)
 
 
 @pytest.mark.parametrize("has_index", [False, True])

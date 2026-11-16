@@ -131,10 +131,11 @@ PYTHONPATH="${PWD}/python:${PWD}/tokenspeed-kernel/python:${PWD}/tokenspeed-kern
 
 ### DSA/MLA Prefill transport
 
-The transport borrows an isolated HCCL group for cache owners and owns one
-raw ACL allocation outside the Torch caching allocator. Startup checks its
-bytes against the cache recipe's reservation. All layers of one backend reuse
-it; history length changes only views, with no allocation on the forward path.
+The transport borrows an isolated HCCL group for cache owners and allocates one
+persistent Torch tensor. Startup checks its bytes against the cache recipe's
+reservation. All layers of one backend reuse it; history length changes only
+views, with no allocation on the forward path. PyTorch owns allocation and page
+policy, and the workspace appears in its memory statistics.
 Synchronous HCCL submissions order their internal stream before subsequent work
 on the executor stream. The transport adds no user-managed communication stream,
 per-layer synchronization or permanent stream identity restriction.
@@ -171,13 +172,14 @@ There is no change to Decode history distribution.
 Prefetch may start at KDA; the attention entry ensures the same batch/layer
 history once. `finish` drops active references after the final consumer is
 queued, retaining storage for the next layer. A synchronized warmup-to-serving
-stream handoff is valid. `close` waits for queued consumers and frees native
-storage; the process-group manager retains its communicator.
+stream handoff is valid. `close` waits for queued consumers and releases tensor
+references to the Torch allocator; the process-group manager retains its
+communicator.
 
 Run `test/test_mla_cp_transport.py` with `torchrun` and an explicit `TEST_OUTPUT`
 directory. It checks shared history, empty/uneven owners, both planes, natural
 singleton-head shapes, partial pages and repeated layer reuse. CPU buffer tests
-substitute only unavailable device storage, kernels and collectives; they do
+use real Torch storage and substitute unavailable kernels and collectives; they do
 not establish hardware correctness or full-model serving capacity.
 
 `benchmarks/bench_dsa_prefill.py` measures transport, cache writes, indexer and

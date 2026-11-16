@@ -1194,8 +1194,8 @@ def _prepare_fixed_workspaces(
     same stream), so the plan budgets one workspace.
 
     Ascend prefill workspaces belong to each target/draft backend and are
-    reused by its layers. Their native allocations are included in this check
-    even though they do not appear in Torch allocator statistics.
+    reused by its layers. Their Torch-managed storage is included in this check
+    and in allocator statistics.
     """
     from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
         Qwen4ExpBackend,

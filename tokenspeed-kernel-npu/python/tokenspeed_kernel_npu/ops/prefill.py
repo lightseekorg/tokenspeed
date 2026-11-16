@@ -26,7 +26,6 @@ import torch_npu
 from tokenspeed_kernel.ops.attention.ascend_prefill_workspace import (
     AscendPrefillWorkspaceLayout,
 )
-from tokenspeed_kernel_npu.ops._memory import NativeBuffer
 from tokenspeed_kernel_npu.ops._prefill_transport import (
     gather_history,
     pack_current,
@@ -35,7 +34,7 @@ from tokenspeed_kernel_npu.ops._prefill_transport import (
 
 
 class AscendDSAPrefill:
-    """One bounded native workspace, reused by successive attention layers.
+    """One bounded Torch workspace, reused by successive attention layers.
 
     The executor orders prefetch, attention, and the next layer on its execution
     stream. HCCL's synchronous interface orders its internal communication stream
@@ -79,8 +78,10 @@ class AscendDSAPrefill:
         ):
             raise ValueError("Prefill collective group must match cache owners")
         self.history_group = history_group
-        self._storage = NativeBuffer(self.layout.nbytes, self.device)
-        storage = self._storage.bytes.view(torch.bfloat16)
+        self._storage = torch.empty(
+            self.layout.nbytes // 2, device=self.device, dtype=torch.bfloat16
+        )
+        storage = self._storage
         offset = 0
 
         def plane(rows, width):
@@ -277,12 +278,14 @@ class AscendDSAPrefill:
         self._current.clear()
 
     def close(self):
-        """Finish queued consumers and free the native workspace on cache rebind."""
+        """Finish queued consumers and release workspace references on cache rebind."""
+        if self._storage is not None:
+            # Serving may use a different stream from startup allocation.
+            # Synchronize only at teardown, never between attention layers.
+            torch.npu.synchronize(self.device)
         self.layer_id = self.batch_key = self._sources = None
         self.kv = self.index = self._current_receive = None
         self._kv = self._index = self._send = self._receive = None
         self._history_send_kv = self._history_send_index = None
         self._current.clear()
-        if self._storage is not None:
-            self._storage.close()
-            self._storage = None
+        self._storage = None

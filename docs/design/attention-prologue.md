@@ -441,15 +441,16 @@ kernel unpacks both planes, fills partial history pages and writes owner caches.
 Gathering and cache commit preserve all bits, including BF16 NaN payloads.
 
 The preceding KDA segment may submit history gathering. The attention entry
-ensures it if absent. One bounded native allocation serves successive layers;
+ensures it if absent. One bounded Torch allocation serves successive layers;
 the cache recipe reserves its bytes before sizing the persistent cache. It
-holds attention planes, send space and current-row receive space, outside the
-Torch caching allocator. It contains no per-request retained state.
+holds attention planes, send space and current-row receive space in a persistent
+tensor managed by the Torch caching allocator. It contains no per-request
+retained state.
 All user-managed Prefill work uses one execution stream and synchronous HCCL
 interfaces. Stream order protects reuse after the final attention consumer;
 `finish` drops layer references without freeing storage. Warmup may hand over
-to the serving stream after the executor's synchronization. The native owner
-synchronizes only when actually freeing storage on rebind or teardown.
+to the serving stream after the executor's synchronization. Rebind or teardown
+synchronizes queued consumers before dropping the workspace's tensor references.
 Weight preparation and Decode graph behavior remain unchanged.
 These byte-preserving gathers do not establish cross-provider bitwise equality
 for attention arithmetic or reductions.
@@ -458,7 +459,7 @@ Prefill KV transport borrows an isolated accelerator process group from the
 runtime process-group manager. All world ranks create the cache-owner groups
 in the same order when publishing the cache pool, before any forward or
 decode graph capture. A forward never creates a process group; an idle DP
-rank still participates in startup. The backend retains its native workspace
+rank still participates in startup. The backend retains its shared workspace
 across layers, while the process-group manager retains the communicator.
 
 ### V4.1 fused decode attention
