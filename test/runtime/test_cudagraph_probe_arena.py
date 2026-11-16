@@ -324,10 +324,12 @@ def test_the_floor_is_the_widest_row_count_the_probe_fabricates(
         # A narrowing decoder ladder fabricates a request per 128 rows, up to max_num_seqs.
         (None, None, 40960, 128, 80, None, 64),
         (None, None, 40960, 128, 16, None, 16),
-        # A chain drafter's decode steps fabricate min(16, max_num_seqs) requests.
+        # A chain drafter's decode steps and a block drafter's block draft
+        # fabricate min(16, max_num_seqs) requests.
         (None, None, 4096, None, 80, "MTP", 16),
         (None, None, 4096, None, 8, "EAGLE3", 8),
-        (None, None, 4096, None, 80, "DFLASH", 4),
+        (None, None, 4096, None, 80, "DFLASH", 16),
+        (None, None, 4096, None, 8, "DSPARK", 8),
     ],
 )
 def test_the_boot_floor_reads_both_knobs(
