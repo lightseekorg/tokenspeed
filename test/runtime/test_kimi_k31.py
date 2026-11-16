@@ -37,6 +37,10 @@ sys.path.insert(0, _TEST_DIR)
 sys.path.insert(0, os.path.dirname(_TEST_DIR))
 
 from test.runtime.conftest import kimi_layout, kimi_recipe, kimi_tp8_layout
+from test.runtime.dsa_index_k_test_utils import (
+    assert_top_k_up_to_ties,
+    index_candidate_scores,
+)
 
 from ci_system.ci_register import register_cuda_ci
 from tokenspeed_kernel.platform import current_platform
@@ -716,10 +720,13 @@ def test_prefill_topk_split_over_tp_matches_every_rank_selecting(
     prefix = min(slots, 40000) - num_rows
     q = torch.randn(num_rows, 32, 128, device="cuda", dtype=torch.bfloat16)
     weights = torch.randn(num_rows, 32, device="cuda", dtype=torch.bfloat16)
-    pool, _ = _k31_pool("cuda", num_lcm_blocks=(slots + 1535) // 1536)
+    page = 64
+    # The workspace starts past the reserved null page 0, as in serving.
+    kv_slots = torch.arange(page, page + slots, device="cuda", dtype=torch.int64)
+    pool, _ = _k31_pool("cuda", num_lcm_blocks=(page + slots + 1535) // 1536)
     pool.set_index_k_buffer(
         3,
-        torch.arange(slots, device="cuda", dtype=torch.int64),
+        kv_slots,
         torch.randn(slots, 128, device="cuda", dtype=torch.bfloat16),
         write_mask=None,
     )
@@ -728,12 +735,12 @@ def test_prefill_topk_split_over_tp_matches_every_rank_selecting(
     args = dict(
         q=q,
         weights=weights,
-        kv_workspace_slots=torch.arange(slots, device="cuda", dtype=torch.int64),
+        kv_workspace_slots=kv_slots,
         row_starts=torch.zeros(num_rows, device="cuda", dtype=torch.int32),
         row_ends=row_ends_cpu.to(device="cuda", dtype=torch.int32),
         candidate_lens_cpu=row_ends_cpu,
         index_k_cache=plane,
-        page_size=64,
+        page_size=page,
         max_logits_bytes=1 << 30,
         topk=2048,
     )
@@ -770,7 +777,26 @@ def test_prefill_topk_split_over_tp_matches_every_rank_selecting(
     assert projected_rows == [num_rows - 1264, 1264]
     selected = workspace_indices_to_kv_slots(selected, None)
     assert torch.equal(lens, expected_lens)
-    assert torch.equal(selected.sort(dim=1).values, expected.sort(dim=1).values)
+    mine, theirs = selected.sort(dim=1).values, expected.sort(dim=1).values
+    # Workspace page p is plane page p + 1.
+    table = torch.arange(1, 1 - (-slots // page), device="cuda", dtype=torch.int32)
+    # The top-k keeps tied candidates in atomic order, so two runs may differ on an exact tie.
+    for row in (mine != theirs).any(dim=1).nonzero().flatten().tolist():
+        query, q_scales = attention._scorer_index_query(q[row : row + 1], plane)
+        scores = index_candidate_scores(
+            query,
+            weights[row : row + 1],
+            plane,
+            table[None],
+            torch.zeros(1, device="cuda", dtype=torch.int32),
+            args["row_ends"][row : row + 1],
+            page_size=page,
+            softmax_scale=attention.indexer.weights_softmax_scale,
+            q_scales=q_scales,
+        )
+        assert_top_k_up_to_ties(
+            row, (mine[row], theirs[row]), int(row_ends_cpu[row]), scores[0], 2048
+        )
 
 
 @requires_gpu
