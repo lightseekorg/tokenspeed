@@ -2732,7 +2732,7 @@ ownership, graph lifetime and supported configurations.
 
 ### V4.1 context encoder/decoder with attention DP
 
-Ordinary EP supports attention, dense and MoE TP1 with attention DP; other
+Ordinary EP supports attention, dense, and MoE TP1 with attention DP; other
 ordinary-EP attention-DP layouts are rejected during model construction. Its
 prefills require `--disable-prefill-graph`: CED narrowing changes each rank's
 decoder row count, which eager execution exchanges on a dedicated host
