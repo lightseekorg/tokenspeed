@@ -23,13 +23,13 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <type_traits>
 
 #include "tvm_ffi_utils.h"
 
 namespace {
 
 constexpr int kHeads = 16;
-constexpr int kHeadDim = 160;
 constexpr int kTokensPerTile = 64;
 constexpr int kHeadsPerBlock = 4;
 constexpr int kLanesPerRow = 8;
@@ -86,57 +86,75 @@ __device__ __forceinline__ void sort_two_warp_keys(unsigned& left, unsigned& rig
     }
 }
 
+template <int HeadDim, bool IsFp8>
 struct LoadedRow {
-    uint4 first;
-    uint4 tail;
+    static constexpr int kRowBytes = HeadDim * (IsFp8 ? 1 : sizeof(uint16_t));
+    static constexpr int kVectors = kRowBytes / sizeof(uint4);
+    static constexpr int kVectorsPerLane = (kVectors + kLanesPerRow - 1) / kLanesPerRow;
+
+    uint4 values[kVectorsPerLane];
     uint64_t destinations;
 };
 
-__device__ __forceinline__ bool has_tail_vector(int lane_in_row) {
-    return lane_in_row < kHeadDim / 16 - kLanesPerRow;
-}
-
-__device__ __forceinline__ LoadedRow read_row(
+template <int HeadDim, bool IsFp8>
+__device__ __forceinline__ LoadedRow<HeadDim, IsFp8> read_row(
     const uint8_t* host, const uint8_t* hot, int id, int cache_row,
     uint64_t destinations, int lane_in_row
 ) {
-    LoadedRow row{{}, {}, destinations};
+    using Row = LoadedRow<HeadDim, IsFp8>;
+    Row row{{}, destinations};
     if (destinations != 0) {
-        const auto* source = host + static_cast<int64_t>(id) * kHeadDim;
+        const auto* source = host + static_cast<int64_t>(id) * Row::kRowBytes;
         if (cache_row >= 0) {
-            source = hot + static_cast<int64_t>(cache_row) * kHeadDim;
+            source = hot + static_cast<int64_t>(cache_row) * Row::kRowBytes;
         }
         const auto* vectors = reinterpret_cast<const uint4*>(source);
-        row.first = vectors[lane_in_row];
-        if (has_tail_vector(lane_in_row)) {
-            row.tail = vectors[kLanesPerRow + lane_in_row];
+        #pragma unroll
+        for (int i = 0; i < Row::kVectorsPerLane; ++i) {
+            int vector = i * kLanesPerRow + lane_in_row;
+            if (vector < Row::kVectors) {
+                row.values[i] = vectors[vector];
+            }
         }
     }
     return row;
 }
 
+template <int HeadDim, bool IsFp8>
 __device__ __forceinline__ void write_row(
-    LoadedRow row, uint16_t* out, int base_token, int head, int lane_in_row,
+    LoadedRow<HeadDim, IsFp8> row, uint16_t* out, int base_token, int head, int lane_in_row,
     float scale
 ) {
     if (row.destinations == 0) {
         return;
     }
-    bool has_tail = has_tail_vector(lane_in_row);
-    uint4 lo, hi, tail_lo, tail_hi;
-    decode_sixteen(row.first, scale, lo, hi);
-    if (has_tail) {
-        decode_sixteen(row.tail, scale, tail_lo, tail_hi);
+    using Row = LoadedRow<HeadDim, IsFp8>;
+    constexpr int kOutputVectors = IsFp8 ? 2 : 1;
+    uint4 values[kOutputVectors * Row::kVectorsPerLane];
+    #pragma unroll
+    for (int i = 0; i < Row::kVectorsPerLane; ++i) {
+        int vector = i * kLanesPerRow + lane_in_row;
+        if (vector < Row::kVectors) {
+            if constexpr (IsFp8) {
+                decode_sixteen(row.values[i], scale, values[2 * i], values[2 * i + 1]);
+            } else {
+                values[i] = row.values[i];
+            }
+        }
     }
 
     auto store = [&](int token) {
         int output_row = (base_token + token) * kHeads + head;
-        auto* dst = reinterpret_cast<uint4*>(out + static_cast<int64_t>(output_row) * kHeadDim);
-        dst[lane_in_row * 2] = lo;
-        dst[lane_in_row * 2 + 1] = hi;
-        if (has_tail) {
-            dst[(kLanesPerRow + lane_in_row) * 2] = tail_lo;
-            dst[(kLanesPerRow + lane_in_row) * 2 + 1] = tail_hi;
+        auto* dst = reinterpret_cast<uint4*>(out + static_cast<int64_t>(output_row) * HeadDim);
+        #pragma unroll
+        for (int i = 0; i < Row::kVectorsPerLane; ++i) {
+            int vector = i * kLanesPerRow + lane_in_row;
+            if (vector < Row::kVectors) {
+                dst[vector * kOutputVectors] = values[i * kOutputVectors];
+                if constexpr (IsFp8) {
+                    dst[vector * 2 + 1] = values[i * 2 + 1];
+                }
+            }
         }
     };
     do {
@@ -166,23 +184,33 @@ __device__ __forceinline__ int hot_slot(int id, int slot_bits) {
     return (static_cast<unsigned>(id) * 2654435761u) >> (32 - slot_bits);
 }
 
+__device__ __forceinline__ int local_row(int64_t id, int64_t vocab_start, int64_t vocab_end) {
+    return id >= vocab_start && id < vocab_end ? static_cast<int>(id - vocab_start) : -1;
+}
+
+template <int HeadDim, bool IsFp8>
 __device__ __forceinline__ void stage_row(
-    LoadedRow row, uint8_t* staged, int index, int lane_in_row
+    const LoadedRow<HeadDim, IsFp8>& row, uint8_t* staged, int index, int lane_in_row
 ) {
-    auto* dst = reinterpret_cast<uint4*>(staged + static_cast<int64_t>(index) * kHeadDim);
-    dst[lane_in_row] = row.first;
-    if (has_tail_vector(lane_in_row)) {
-        dst[kLanesPerRow + lane_in_row] = row.tail;
+    using Row = LoadedRow<HeadDim, IsFp8>;
+    auto* dst = reinterpret_cast<uint4*>(staged + static_cast<int64_t>(index) * Row::kRowBytes);
+    #pragma unroll
+    for (int i = 0; i < Row::kVectorsPerLane; ++i) {
+        int vector = i * kLanesPerRow + lane_in_row;
+        if (vector < Row::kVectors) {
+            dst[vector] = row.values[i];
+        }
     }
 }
 
+template <int HeadDim, bool IsFp8>
 __global__ void gather_wide_cta(const uint8_t* __restrict__ host,
                                const int64_t* __restrict__ ids,
                                const int32_t* __restrict__ tags,
                                const uint8_t* __restrict__ hot,
                                uint16_t* __restrict__ out,
                                int32_t* __restrict__ miss_slots,
-                               float scale, int slot_bits, int vocab_size,
+                               float scale, int slot_bits, int64_t vocab_start, int64_t vocab_end,
                                uint8_t* __restrict__ staged,
                                int32_t* __restrict__ winners) {
     int warp = threadIdx.x / 32;
@@ -191,19 +219,16 @@ __global__ void gather_wide_cta(const uint8_t* __restrict__ host,
     int lane_in_row = lane % kLanesPerRow;
     int base_token = blockIdx.x * kTokensPerTile;
     int head = blockIdx.y * kHeadsPerBlock + warp;
-    int64_t low = ids[(base_token + lane) * kHeads + head];
-    int64_t high = ids[(base_token + lane + 32) * kHeads + head];
-    bool valid = low >= 0 && low < vocab_size && high >= 0 && high < vocab_size;
-    int low_id = valid ? static_cast<int>(low) : 0;
-    int high_id = valid ? static_cast<int>(high) : 0;
+    int low_id = local_row(ids[(base_token + lane) * kHeads + head], vocab_start, vocab_end);
+    int high_id = local_row(ids[(base_token + lane + 32) * kHeads + head], vocab_start, vocab_end);
     int base_id = __reduce_min_sync(kFullWarp, min(low_id, high_id));
     int max_id = __reduce_max_sync(kFullWarp, max(low_id, high_id));
-    if (!__all_sync(kFullWarp, valid) || max_id - base_id >= (1 << 26)) {
+    if (base_id < 0 || max_id - base_id >= (1 << 26)) {
         for (int token = row_group; token < kTokensPerTile; token += kRowsPerRound) {
             int index = (base_token + token) * kHeads + head;
-            int64_t id = ids[index];
-            bool owned = id >= 0 && id < vocab_size;
-            int slot = owned ? hot_slot(static_cast<int>(id), slot_bits) : -1;
+            int id = local_row(ids[index], vocab_start, vocab_end);
+            bool owned = id >= 0;
+            int slot = owned ? hot_slot(id, slot_bits) : -1;
             int cache_row = owned && tags[slot] == id ? slot : -1;
             int miss = owned && cache_row < 0 ? slot : -1;
             if (lane_in_row == 0) {
@@ -213,8 +238,8 @@ __global__ void gather_wide_cta(const uint8_t* __restrict__ host,
                 }
             }
             uint64_t destinations = uint64_t{1} << token;
-            auto row = read_row(host, hot, owned ? static_cast<int>(id) : 0,
-                                cache_row, owned ? destinations : 0, lane_in_row);
+            auto row = read_row<HeadDim, IsFp8>(
+                host, hot, id, cache_row, owned ? destinations : 0, lane_in_row);
             if (miss >= 0) {
                 stage_row(row, staged, index, lane_in_row);
             }
@@ -267,8 +292,8 @@ __global__ void gather_wide_cta(const uint8_t* __restrict__ host,
         int cache_row = from_left ? cached_left : cached_right;
         uint64_t destinations = from_left ? destinations_left : destinations_right;
         int id = from_left ? id_left : id_right;
-        auto row = read_row(host, hot, id, cache_row,
-                            leader >= 0 ? destinations : uint64_t{0}, lane_in_row);
+        auto row = read_row<HeadDim, IsFp8>(
+            host, hot, id, cache_row, leader >= 0 ? destinations : uint64_t{0}, lane_in_row);
         if (row.destinations != 0 && cache_row < 0) {
             // Only the last occurrence of a repeated ID can win its cache slot.
             int token = 63 - __clzll(row.destinations);
@@ -288,24 +313,45 @@ __global__ void gather_wide_cta(const uint8_t* __restrict__ host,
 }  // namespace
 
 void ple_gather_staged(int64_t address, TensorView ids, TensorView tags, TensorView hot,
-                       TensorView out, TensorView misses, double scale, int64_t tokens,
-                       int64_t vocab_size, TensorView staged, TensorView winners) {
+                       TensorView out, TensorView misses, double scale, bool is_fp8, int64_t tokens,
+                       int64_t vocab_start, int64_t vocab_end, TensorView staged,
+                       TensorView winners) {
     TVM_FFI_ICHECK(tokens > 0 && tokens % kTokensPerTile == 0 &&
                    tokens <= INT32_MAX / kHeads);
-    TVM_FFI_ICHECK(vocab_size > 0 && vocab_size <= INT32_MAX);
+    TVM_FFI_ICHECK(vocab_start >= 0 && vocab_end > vocab_start &&
+                   vocab_end - vocab_start <= INT32_MAX);
+    int64_t dim = out.size(1);
+    TVM_FFI_ICHECK(dim == 160 || dim == 512);
+    int64_t row_bytes = dim * (is_fp8 ? 1 : sizeof(uint16_t));
+    TVM_FFI_ICHECK(hot.size(1) == row_bytes && staged.size(1) == row_bytes);
     int capacity = tags.size(0);
     TVM_FFI_ICHECK(capacity > 1 && (capacity & (capacity - 1)) == 0);
     int slot_bits = __builtin_ctz(static_cast<unsigned>(capacity));
     dim3 grid(tokens / kTokensPerTile, kHeads / kHeadsPerBlock);
-    gather_wide_cta<<<grid, kHeadsPerBlock * 32, 0, get_stream(ids.device())>>>(
-        reinterpret_cast<const uint8_t*>(address),
-        static_cast<const int64_t*>(ids.data_ptr()),
-        static_cast<const int32_t*>(tags.data_ptr()),
-        static_cast<const uint8_t*>(hot.data_ptr()),
-        static_cast<uint16_t*>(out.data_ptr()),
-        static_cast<int32_t*>(misses.data_ptr()),
-        static_cast<float>(scale), slot_bits, static_cast<int>(vocab_size),
-        static_cast<uint8_t*>(staged.data_ptr()), static_cast<int32_t*>(winners.data_ptr()));
+    auto launch = [&](auto head_dim, auto fp8) {
+        gather_wide_cta<decltype(head_dim)::value, decltype(fp8)::value>
+            <<<grid, kHeadsPerBlock * 32, 0, get_stream(ids.device())>>>(
+                reinterpret_cast<const uint8_t*>(address),
+                static_cast<const int64_t*>(ids.data_ptr()),
+                static_cast<const int32_t*>(tags.data_ptr()),
+                static_cast<const uint8_t*>(hot.data_ptr()),
+                static_cast<uint16_t*>(out.data_ptr()),
+                static_cast<int32_t*>(misses.data_ptr()),
+                static_cast<float>(scale), slot_bits, vocab_start, vocab_end,
+                static_cast<uint8_t*>(staged.data_ptr()), static_cast<int32_t*>(winners.data_ptr()));
+    };
+    auto launch_dim = [&](auto head_dim) {
+        if (is_fp8) {
+            launch(head_dim, std::true_type{});
+        } else {
+            launch(head_dim, std::false_type{});
+        }
+    };
+    if (dim == 160) {
+        launch_dim(std::integral_constant<int, 160>{});
+    } else {
+        launch_dim(std::integral_constant<int, 512>{});
+    }
     auto status = cudaPeekAtLastError();
     TVM_FFI_ICHECK_EQ(status, cudaSuccess) << cudaGetErrorString(status);
 }

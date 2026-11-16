@@ -127,6 +127,101 @@ def test_global_table_matches_unsharded_lookup(tmp_path, tp_size):
     )
 
 
+def _cached_lookup_worker(rank, rendezvous, tp_size, dim, table_dtype):
+    from tokenspeed.runtime.distributed.comm_backend import set_global_backend
+    from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.distributed.process_group_manager import (
+        process_group_manager,
+    )
+
+    device = torch.device("cuda", rank)
+    torch.cuda.set_device(device)
+    mapping = Mapping(
+        rank=rank, world_size=4, attn_tp_size=tp_size, attn_dp_size=4 // tp_size
+    )
+    process_group_manager.init_distributed(
+        mapping, rendezvous, timeout=60, device_id=device
+    )
+    try:
+        process_group_manager.init_process_group(mapping.attn.world_group)
+        set_global_backend(NcclBackend())
+        vocab, heads = 1021, 16
+        fp8 = table_dtype == torch.float8_e4m3fn
+        lookup = ple_lookup.PLELookup(
+            mapping,
+            vocab_size=vocab,
+            ngram_heads=heads,
+            head_dim=dim,
+            storage_dtype=table_dtype if fp8 else None,
+            output_dtype=torch.bfloat16,
+            offload=True,
+            prefix="",
+        )
+        full_table = (
+            (torch.arange(vocab * dim).reshape(vocab, dim) % 383 - 191) / 7
+        ).to(table_dtype)
+        lookup.load_shard(full_table, 0, 1)
+        scale = 0.125 if fp8 else 1.0
+        if fp8:
+            lookup.load_scale(torch.tensor(scale))
+
+        counts = [99, 0, 107, 131] if mapping.attn.has_dp else None
+        tokens = counts[rank] if counts is not None else 325
+        offset = rank * 53 if counts is not None else 0
+        ids = (
+            torch.arange(tokens * heads, device=device).reshape(tokens, heads) + offset
+        ) % vocab
+        layout = lookup.make_layout(counts, tokens)
+        expected = (full_table.float()[ids.cpu()] * scale).reshape(tokens, heads * dim)
+        for _ in range(2):
+            actual = lookup.finish(lookup.start(ids, layout))
+            torch.testing.assert_close(
+                actual.cpu(), expected.bfloat16(), rtol=0, atol=0
+            )
+        assert lookup._host_cache._tags is not None
+        if not fp8:
+            lookup.load_scale(torch.tensor(0.5))
+            actual = lookup.finish(lookup.start(ids, layout))
+            torch.testing.assert_close(
+                actual.cpu(), (expected * 0.5).bfloat16(), rtol=0, atol=0
+            )
+        lookup._host_cache.invalidate()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("tp_size", [1, 4], ids=["dp4", "tp4"])
+@pytest.mark.parametrize("head_dim", [160, 512])
+@pytest.mark.parametrize("table_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_sharded_host_cache_matches_unsharded_lookup(
+    tmp_path, monkeypatch, tp_size, head_dim, table_dtype
+):
+    from tokenspeed_kernel.platform import current_platform
+
+    if (
+        not current_platform().is_nvidia
+        or torch.cuda.device_count() < 4
+        or any(
+            torch.cuda.get_device_capability(rank)[0] not in (9, 10)
+            for rank in range(4)
+        )
+    ):
+        pytest.skip("requires four Hopper or Blackwell GPUs")
+    monkeypatch.setenv("TOKENSPEED_PLE_HOST_CACHE_SLOTS", "512")
+    mp.spawn(
+        _cached_lookup_worker,
+        args=(
+            (tmp_path / "cached-rendezvous").as_uri(),
+            tp_size,
+            head_dim,
+            table_dtype,
+        ),
+        nprocs=4,
+        join=True,
+    )
+
+
 def test_pure_tp_has_no_ids_collective(monkeypatch):
     mapping = _mapping_class()(rank=1, world_size=4)
     lookup = _lookup(mapping)

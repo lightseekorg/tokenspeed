@@ -21,7 +21,7 @@
 from tokenspeed_kernel._triton import tl, triton
 
 
-@triton.jit(do_not_specialize=["n", "vocab_end", "row_offset"])
+@triton.jit(do_not_specialize=["n", "vocab_start", "vocab_end", "row_offset"])
 def _ple_gather_staged_tail_kernel(
     addr,
     ids,
@@ -32,6 +32,7 @@ def _ple_gather_staged_tail_kernel(
     miss_slot,
     winners,
     n,
+    vocab_start,
     vocab_end,
     row_offset,
     scale,
@@ -42,19 +43,24 @@ def _ple_gather_staged_tail_kernel(
 ):
     row = tl.program_id(0) * R + tl.arange(0, R)
     gid = tl.load(ids + row, row < n, other=-1)
-    owned = (row < n) & (gid >= 0) & (gid < vocab_end)
-    slot = (gid.to(tl.uint32) * 2654435761) >> (32 - SLOT_BITS)
+    owned = (row < n) & (gid >= vocab_start) & (gid < vocab_end)
+    local_id = tl.where(owned, gid - vocab_start, -1).to(tl.int32)
+    slot = (local_id.to(tl.uint32) * 2654435761) >> (32 - SLOT_BITS)
     tag = tl.load(tags + slot, owned, other=-1)
-    hit = owned & (tag == gid)
+    hit = owned & (tag == local_id)
     col = tl.arange(0, C)
-    host = addr.to(tl.int64).to(tl.pointer_type(tl.float8e4nv))
-    src = tl.where(hit, hot + slot.to(tl.int64) * D, host + tl.where(owned, gid, 0) * D)
+    host = addr.to(tl.int64).to(hot.dtype)
+    host_offset = tl.where(owned, local_id, 0).to(tl.int64) * D
+    src = tl.where(hit, hot + slot.to(tl.int64) * D, host + host_offset)
     raw = tl.load(
         src[:, None] + col[None, :], owned[:, None] & (col[None, :] < D), other=0.0
     )
+    values = (
+        raw.to(tl.float32) * scale if hot.dtype.element_ty == tl.float8e4nv else raw
+    )
     tl.store(
         out + row[:, None].to(tl.int64) * D + col[None, :],
-        raw.to(tl.float32) * scale,
+        values,
         (row[:, None] < n) & (col[None, :] < D),
     )
     miss = owned & ~hit
@@ -67,7 +73,7 @@ def _ple_gather_staged_tail_kernel(
     tl.atomic_max(winners + slot, row + row_offset, mask=miss, sem="relaxed")
 
 
-@triton.jit(do_not_specialize=["rows"])
+@triton.jit(do_not_specialize=["rows", "vocab_start"])
 def _ple_fill_staged_kernel(
     ids,
     staged,
@@ -76,6 +82,7 @@ def _ple_fill_staged_kernel(
     tags,
     hot,
     rows,
+    vocab_start,
     D: tl.constexpr,
     R: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -89,6 +96,7 @@ def _ple_fill_staged_kernel(
         raw = tl.load(
             staged + row[:, None].to(tl.int64) * D + col[None, :], mask, other=0.0
         )
-        gid = tl.load(ids + row, win, other=0).to(tl.int32)
+        gid = tl.load(ids + row, win, other=0)
+        local_id = (gid - vocab_start).to(tl.int32)
         tl.store(hot + slot[:, None].to(tl.int64) * D + col[None, :], raw, mask)
-        tl.store(tags + slot, gid, win)
+        tl.store(tags + slot, local_id, win)

@@ -3544,6 +3544,7 @@ def _ple_checkpoint_loader_stub(
         torch.float8_e4m3fn if store_dtype == torch.float8_e4m3fn else None
     )
     ple.lookup._checkpoint_weight_scale = 1.0
+    ple.lookup._host_cache = None
     ple.lookup.offload_embedding = offload
     ple.lookup._compute_device = torch.device("cuda" if offload else "cpu")
 

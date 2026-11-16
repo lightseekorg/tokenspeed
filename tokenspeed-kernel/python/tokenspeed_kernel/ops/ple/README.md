@@ -1,13 +1,16 @@
 ## Host embedding cache
 
-The CUDA host lookup can cache raw FP8 embedding rows in HBM for a complete
-pinned table with 16 n-gram heads, 160 values per row, a scalar scale, and BF16
-output. The cache handles eager lookups of at least 256 tokens, including
-prefill graph breaks. Smaller lookups, captured decode, sharded tables, and
-per-row scales use the regular host gather.
+The CUDA host lookup can cache BF16 or scalar-scaled FP8 embedding rows in HBM
+for a pinned table with 16 n-gram heads, either 160 or 512 values per row,
+and BF16 output.
+Each TP or DP rank owns its cache and uses shard-local row indices as tags.
+Queries outside the shard produce zeros and leave the cache untouched. The
+cache handles eager lookups of at least 256 tokens, including prefill graph
+breaks. Smaller lookups, CUDA graph capture, and per-row scales use the
+regular host gather.
 
-The gather sorts and deduplicates IDs within each 64-token tile per head and
-writes BF16 values in input order. On a cache miss it stages the FP8 bytes
+The gather sorts and deduplicates fully owned 64-token tiles per head and
+writes BF16 values in input order. On a cache miss it stages the raw bytes
 already read over UVA. A separate stream copies the last miss for each
 direct-mapped slot from staging to HBM. The next cached gather waits for the
 fill event before reading the tags. The model owner invalidates cached rows

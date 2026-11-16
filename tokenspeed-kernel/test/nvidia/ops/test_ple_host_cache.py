@@ -29,26 +29,32 @@ from tokenspeed_kernel.ops.ple.host_cache import PLEHostCache
 from utils import assert_no_triton_compile
 
 
-def test_ple_host_cache_fill_and_gather():
+@pytest.mark.parametrize("vocab_start", [0, 113, (1 << 33) + 113])
+@pytest.mark.parametrize("dim", [160, 512])
+@pytest.mark.parametrize("table_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_ple_host_cache_fill_and_gather(vocab_start, dim, table_dtype):
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     device = torch.device("cuda", torch.cuda.current_device())
     if torch.cuda.get_device_capability(device)[0] not in (9, 10):
         pytest.skip("requires Hopper or Blackwell")
 
-    dim = PLEHostCache.HEAD_DIM
     slots = 32
-    vocab = 512
-    table = torch.arange(vocab * dim).reshape(vocab, dim) % 127 - 63
-    table = table.to(torch.float8_e4m3fn).pin_memory()
+    vocab = 509
+    vocab_end = vocab_start + vocab
+    scale = 0.125 if table_dtype == torch.float8_e4m3fn else None
+    table = (
+        ((torch.arange(512 * dim).reshape(512, dim) % 127 - 63) / 7)
+        .to(table_dtype)
+        .pin_memory()
+    )
     cache = PLEHostCache.create(
         slot_count=slots,
         table=table,
         ngram_heads=PLEHostCache.HEADS,
         output_dtype=torch.bfloat16,
-        table_shards=1,
-        vocab_start=0,
-        vocab_end=vocab,
+        vocab_start=vocab_start,
+        vocab_end=vocab_end,
         device=device,
     )
     assert cache is not None
@@ -57,17 +63,22 @@ def test_ple_host_cache_fill_and_gather():
     streams = (torch.cuda.Stream(), torch.cuda.Stream())
     ready = torch.cuda.Event()
     for step, tokens in enumerate((256, 261, 277, 512)):
-        ids = torch.arange(tokens * 16).reshape(tokens, 16) % (83 + step * 7)
+        ids = vocab_start + torch.arange(tokens * 16).reshape(tokens, 16) % (
+            83 + step * 7
+        )
+        ids[31:34] = vocab_start
+        ids[-1, 0] = vocab_end - 1
+        ids[-2, 0] = vocab_start + 12
         if step % 2:
             ids[1] = -1
-            ids[2] = 1 << 33
-        ids[31:34] = 1
-        ids[-1, 0] = 79
-        ids[-2, 0] = 12
+            ids[2] = vocab_start + (1 << 32)
+            ids[:, 3] = vocab_start - 1
+            ids[:, 4] = vocab_end
         flat = ids.flatten()
-        valid = (flat >= 0) & (flat < vocab)
-        slot = ((flat * 2654435761) & 0xFFFFFFFF) >> (32 - 5)
-        miss = valid & (tags[slot] != flat)
+        local = flat - vocab_start
+        valid = (local >= 0) & (local < vocab)
+        slot = ((local * 2654435761) & 0xFFFFFFFF) >> (32 - 5)
+        miss = valid & (tags[slot] != local)
         winners = torch.full((slots,), -1, dtype=torch.int64)
         winners.scatter_reduce_(
             0,
@@ -77,7 +88,7 @@ def test_ple_host_cache_fill_and_gather():
             include_self=True,
         )
         filled = winners >= 0
-        tags[filled] = flat[winners[filled]].to(torch.int32)
+        tags[filled] = local[winners[filled]].to(torch.int32)
         expected_tags = tags.clone()
         ids = ids.to(device)
         out = torch.empty((flat.numel(), dim), dtype=torch.bfloat16, device=device)
@@ -88,14 +99,22 @@ def test_ple_host_cache_fill_and_gather():
             stream.wait_event(ready)
         with torch.cuda.stream(stream):
             if step < 2:
-                cache.gather(table, ids, out, vocab_end=vocab, scale=0.125)
+                cache.gather(table, ids, out, scale=scale)
             else:
                 with assert_no_triton_compile(
                     _ple_gather_staged_tail_kernel, _ple_fill_staged_kernel
                 ):
-                    cache.gather(table, ids, out, vocab_end=vocab, scale=0.125)
+                    cache.gather(table, ids, out, scale=scale)
             ple_host_gather(
-                table, ids, ref, 0, vocab, 0.125, None, table_shards=1, background=False
+                table,
+                ids,
+                ref,
+                vocab_start,
+                vocab_end,
+                scale,
+                None,
+                table_shards=1 if vocab_start == 0 else 4,
+                background=False,
             )
             ready.record(stream)
         stream.synchronize()
@@ -111,5 +130,5 @@ def test_ple_host_cache_fill_and_gather():
     cache.invalidate()
     table.view(torch.uint8).fill_(0)
     out = torch.empty_like(out)
-    cache.gather(table, ids, out, vocab_end=vocab, scale=0.125)
+    cache.gather(table, ids, out, scale=scale)
     assert torch.count_nonzero(out).item() == 0

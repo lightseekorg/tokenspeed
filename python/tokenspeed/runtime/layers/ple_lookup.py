@@ -202,7 +202,7 @@ class PLELookup(nn.Module):
             if offload
             else self.ngram_embedding.weight.device
         )
-        if offload and storage_dtype == torch.float8_e4m3fn:
+        if offload:
             from tokenspeed_kernel.ops.ple.host_cache import PLEHostCache
 
             from tokenspeed.runtime.utils.env import envs
@@ -213,7 +213,6 @@ class PLELookup(nn.Module):
                 table=self.ngram_embedding.weight,
                 ngram_heads=ngram_heads,
                 output_dtype=output_dtype,
-                table_shards=self.ngram_embedding.tp_size,
                 vocab_start=shard.org_vocab_start_index,
                 vocab_end=shard.org_vocab_end_index,
                 device=self._compute_device,
@@ -311,8 +310,11 @@ class PLELookup(nn.Module):
                         self.ngram_embedding.weight,
                         gathered_ids,
                         out.view(-1, self.head_dim),
-                        vocab_end=self.ngram_embedding.shard_indices.org_vocab_end_index,
-                        scale=self._checkpoint_weight_scale,
+                        scale=(
+                            self._checkpoint_weight_scale
+                            if self.embed_store_dtype is not None
+                            else None
+                        ),
                     )
                 else:
                     self.gather_host(gathered_ids, out, background=background)
@@ -520,5 +522,7 @@ class PLELookup(nn.Module):
         else:
             # Compute-dtype target: rescale any raw FP8 rows copied before the
             # scale tensor. Future shard copies multiply by the new value.
+            if self._host_cache is not None:
+                self._host_cache.invalidate()
             self.ngram_embedding.weight.data.mul_(scale / self._checkpoint_weight_scale)
         self._checkpoint_weight_scale = scale

@@ -31,7 +31,7 @@ from tokenspeed_kernel.thirdparty.cuda.ple_host_gather import ple_staged_gather
 
 
 class PLEHostCache:
-    """Read FP8 PLE rows through an HBM cache owned by one lookup table.
+    """Read a rank's FP8 or BF16 PLE table shard through its own HBM cache.
 
     Use :meth:`create` to select the supported table layout and device. The
     table bytes must remain immutable between gathers, or the owner must call
@@ -39,16 +39,21 @@ class PLEHostCache:
     """
 
     HEADS = 16
-    HEAD_DIM = 160
+    HEAD_DIMS = (160, 512)
     TILE_TOKENS = 64
     MIN_TOKENS = 256
     MAX_TOKENS = ((1 << 31) - 1) // HEADS
     _FILL_ROWS = 16
-    _BLOCK_D = 256
 
-    def __init__(self, slot_count: int, launch):
+    def __init__(
+        self, slot_count: int, head_dim: int, vocab_start: int, vocab_end: int, launch
+    ):
         self.slot_count = slot_count
         self._slot_bits = slot_count.bit_length() - 1
+        self._head_dim = head_dim
+        self._block_dim = triton.next_power_of_2(head_dim)
+        self._vocab_start = vocab_start
+        self._vocab_end = vocab_end
         self._launch = launch
         self._tags: torch.Tensor | None = None
         self._hot: torch.Tensor | None = None
@@ -65,19 +70,17 @@ class PLEHostCache:
         table: torch.Tensor,
         ngram_heads: int,
         output_dtype: torch.dtype,
-        table_shards: int,
         vocab_start: int,
         vocab_end: int,
         device: torch.device,
     ) -> PLEHostCache | None:
-        """Select a cache for a complete pinned FP8 table.
+        """Select a cache for a pinned FP8 or BF16 table shard.
 
         Args:
             slot_count: Number of power-of-two cache slots, or zero to disable.
-            table: Pinned host table of shape ``[vocab_rows, head_dim]``.
+            table: Pinned host table of shape ``[local_vocab_rows, head_dim]``.
             ngram_heads: Number of row IDs per input token.
             output_dtype: Compute dtype of the gather output.
-            table_shards: Number of ranks owning pieces of the table.
             vocab_start: Inclusive global ID of the first local row.
             vocab_end: Exclusive global ID of the last local row.
             device: GPU consuming the table and owning the cache.
@@ -96,21 +99,24 @@ class PLEHostCache:
             not platform.is_nvidia
             or device.type != "cuda"
             or torch.cuda.get_device_capability(device)[0] not in (9, 10)
-            or table_shards != 1
             or ngram_heads != cls.HEADS
             or table.ndim != 2
-            or table.shape[1] != cls.HEAD_DIM
-            or table.dtype != torch.float8_e4m3fn
+            or table.shape[1] not in cls.HEAD_DIMS
+            or table.dtype not in (torch.float8_e4m3fn, torch.bfloat16)
             or output_dtype != torch.bfloat16
-            or vocab_start != 0
-            or not 0 < vocab_end <= min(table.shape[0], (1 << 31) - 1)
+            or not 0 <= vocab_start < vocab_end <= (1 << 63) - 1
+            or vocab_end - vocab_start > min(table.shape[0], (1 << 31) - 1)
             or table.device.type != "cpu"
             or not table.is_pinned()
             or not table.is_contiguous()
         ):
             return None
         launch = ple_staged_gather()
-        return cls(slot_count, launch) if launch is not None else None
+        return (
+            cls(slot_count, table.shape[1], vocab_start, vocab_end, launch)
+            if launch is not None
+            else None
+        )
 
     def can_gather(self, ids: torch.Tensor) -> bool:
         return (
@@ -131,22 +137,25 @@ class PLEHostCache:
         ids: torch.Tensor,
         out: torch.Tensor,
         *,
-        vocab_end: int,
-        scale: float,
+        scale: float | None,
     ) -> torch.Tensor:
-        """Fill ``out`` with a scalar-scaled FP8 lookup.
+        """Fill ``out`` with a BF16 lookup or a scalar-scaled FP8 lookup.
 
         Args:
-            table: The immutable pinned FP8 table selected by ``create``.
-            ids: Contiguous CUDA int64 IDs of shape ``[tokens, 16]``.
-            out: Contiguous CUDA BF16 output of shape ``[tokens * 16, 160]``.
-            vocab_end: Exclusive upper bound on IDs owned by the table.
-            scale: FP32 dequantization factor for the table.
+            table: The immutable pinned table selected by ``create``.
+            ids: Contiguous CUDA int64 global IDs of shape ``[tokens, 16]``.
+            out: Contiguous CUDA BF16 output of shape ``[tokens * 16, head_dim]``.
+            scale: FP32 dequantization factor for an FP8 table, or None for BF16.
 
         Returns:
-            The supplied output, ready on the current stream. A side stream
-            copies staged misses into the cache for the next cached lookup.
+            The supplied output, with rows outside the shard zeroed, ready on
+            the current stream. A side stream copies staged misses into the
+            cache for the next cached lookup.
         """
+        is_fp8 = table.dtype == torch.float8_e4m3fn
+        if is_fp8 != (scale is not None):
+            raise ValueError("PLE host cache requires a scale only for FP8")
+        scale_value = scale if scale is not None else 1.0
         device = ids.device
         stream = torch.cuda.current_stream(device)
         if self._fill_stream is None:
@@ -159,7 +168,7 @@ class PLEHostCache:
                 (self.slot_count,), -1, dtype=torch.int32, device=device
             )
             self._hot = torch.empty(
-                (self.slot_count, self.HEAD_DIM), dtype=table.dtype, device=device
+                (self.slot_count, self._head_dim), dtype=table.dtype, device=device
             )
             self._winners = torch.empty_like(self._tags)
             for buf in (self._tags, self._hot, self._winners):
@@ -182,9 +191,11 @@ class PLEHostCache:
             self._hot.view(torch.uint8),
             out,
             misses,
-            scale,
+            scale_value,
+            is_fp8,
             aligned_tokens,
-            vocab_end,
+            self._vocab_start,
+            self._vocab_end,
             staged.view(torch.uint8),
             self._winners,
         )
@@ -201,13 +212,14 @@ class PLEHostCache:
                 misses[aligned_rows:],
                 self._winners,
                 tail,
-                vocab_end,
+                self._vocab_start,
+                self._vocab_end,
                 aligned_rows,
-                scale,
+                scale_value,
                 self._slot_bits,
                 R=self._FILL_ROWS,
-                D=self.HEAD_DIM,
-                C=self._BLOCK_D,
+                D=self._head_dim,
+                C=self._block_dim,
                 num_warps=4,
             )
 
@@ -223,9 +235,10 @@ class PLEHostCache:
                 self._tags,
                 self._hot,
                 rows,
-                D=self.HEAD_DIM,
+                self._vocab_start,
+                D=self._head_dim,
                 R=self._FILL_ROWS,
-                BLOCK=self._BLOCK_D,
+                BLOCK=self._block_dim,
                 num_warps=4,
             )
             self._fill_done.record(self._fill_stream)
