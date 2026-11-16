@@ -36,7 +36,7 @@ def make_leaf(monkeypatch):
     # These tests execute real metadata kernels, but never prefill attention.
     monkeypatch.setattr(tokenspeed_mla, "warmup_compile_prefill", lambda **kwargs: None)
 
-    def make(*, queries, draft, block, rank, degree, causal=False, context=512):
+    def make(*, queries, draft, block, rank, degree, dtype, causal=False, context=512):
         spec = MLAConfig(
             backend_name="tokenspeed_mla",
             num_attention_heads=128,
@@ -53,7 +53,7 @@ def make_leaf(monkeypatch):
         config = AttnConfig(
             device="cuda",
             dtype=torch.bfloat16,
-            kv_cache_dtype=torch.bfloat16,
+            kv_cache_dtype=dtype,
             kv_cache_quant_method="",
             context_len=context,
             max_bs=8,
@@ -146,6 +146,7 @@ def test_refresh_and_draft_updates_reuse_reserved_pages(
         block=block,
         rank=rank,
         degree=degree,
+        dtype=torch.bfloat16,
         causal=causal,
     )
     blocks = [[5, 2, 8, 1], [2, 5, 1, 8], [0, 0, 0, 0]]
@@ -215,7 +216,9 @@ def test_refresh_and_draft_updates_reuse_reserved_pages(
 
 @pytest.mark.parametrize("block", [False, True])
 def test_narrower_refresh_clears_old_reserved_pages(make_leaf, block):
-    leaf = make_leaf(queries=4, draft=block, block=block, rank=0, degree=2)
+    leaf = make_leaf(
+        queries=4, draft=block, block=block, rank=0, degree=2, dtype=torch.bfloat16
+    )
     ends = torch.full((3,), 65, dtype=torch.int32, device="cuda")
     leaf.refresh_decode_metadata(
         3, 2, ends, _pages([[5, 2, 8, 1], [2, 5, 1, 8], [0, 0, 0, 0]])
@@ -239,7 +242,9 @@ def test_narrower_refresh_clears_old_reserved_pages(make_leaf, block):
 
 @pytest.mark.parametrize("block", [False, True])
 def test_capture_seeding_keeps_null_rows_empty(make_leaf, block):
-    leaf = make_leaf(queries=4, draft=block, block=block, rank=0, degree=2)
+    leaf = make_leaf(
+        queries=4, draft=block, block=block, rank=0, degree=2, dtype=torch.bfloat16
+    )
     ends = torch.ones(1, dtype=torch.int32, device="cuda")
     leaf.init_forward_metadata_capture_cuda_graph(1, ends, _pages([[0]]))
     metadata = leaf.forward_decode_metadata
@@ -249,7 +254,9 @@ def test_capture_seeding_keeps_null_rows_empty(make_leaf, block):
 
 @pytest.mark.parametrize("block", [False, True])
 def test_batch_views_share_storage_across_refresh_and_replay(make_leaf, block):
-    leaf = make_leaf(queries=4, draft=block, block=block, rank=1, degree=2)
+    leaf = make_leaf(
+        queries=4, draft=block, block=block, rank=1, degree=2, dtype=torch.bfloat16
+    )
     table = _pages([[2, 5, 8, 1]] * 8)
     ends = torch.full((8,), 129, dtype=torch.int32, device="cuda")
     leaf.refresh_decode_metadata(2, 2, ends[:2], table[:2])
@@ -275,7 +282,9 @@ def test_batch_views_share_storage_across_refresh_and_replay(make_leaf, block):
 @pytest.mark.parametrize("block", [False, True])
 @pytest.mark.parametrize("rebind", [False, True], ids=["reinitialize", "rebind"])
 def test_buffer_reset_replaces_cached_views(make_leaf, block, rebind):
-    leaf = make_leaf(queries=4, draft=block, block=block, rank=1, degree=2)
+    leaf = make_leaf(
+        queries=4, draft=block, block=block, rank=1, degree=2, dtype=torch.bfloat16
+    )
     blocks = [[2, 5, 8, 1]] * 2
     table = _pages(blocks)
     ends = torch.full((2,), 129, dtype=torch.int32, device="cuda")
@@ -308,7 +317,9 @@ def test_buffer_reset_replaces_cached_views(make_leaf, block, rebind):
 
 
 def test_replicated_leaf_has_no_dcp_storage(make_leaf):
-    leaf = make_leaf(queries=1, draft=False, block=False, rank=0, degree=1)
+    leaf = make_leaf(
+        queries=1, draft=False, block=False, rank=0, degree=1, dtype=torch.bfloat16
+    )
     table = _pages([[1, 2, 3, 4]])
     ends = torch.tensor([129], device="cuda", dtype=torch.int32)
     leaf.refresh_decode_metadata(1, 1, ends, table)
@@ -316,3 +327,73 @@ def test_replicated_leaf_has_no_dcp_storage(make_leaf):
     assert leaf._dcp is None
     leaf.advance_draft_forward_metadata(ends + 1)
     assert leaf.seq_lens_buf[0].item() == 130
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("mode", ["verify", "chain", "mtp", "block"])
+@pytest.mark.parametrize("rank", [0, 1, 3])
+def test_split_counts_use_local_lengths_and_gathered_heads(
+    make_leaf, dtype, mode, rank
+):
+    from tokenspeed_mla import tokenspeed_mla_decode_split_kvs
+
+    leaf = make_leaf(
+        queries=4,
+        draft=mode != "verify",
+        block=mode == "block",
+        rank=rank,
+        degree=4,
+        dtype=dtype,
+        context=16384,
+    )
+    leaf.configure_runtime(
+        block_granularity=128, virtual_block_count=512, shard_count=4
+    )
+    leaf.init_cuda_graph_state(8)
+    blocks = [
+        [1, 5, 9, 13] + [2 + 4 * i for i in range(28)] + [0] * 32,
+        [17 + 4 * i for i in range(64)],
+    ]
+    table = _pages(blocks)
+    ends = torch.tensor([4096, 8192], dtype=torch.int32, device="cuda")
+    leaf.refresh_decode_metadata(2, 2, ends, table)
+    counts = leaf._decode_split_kvs_buf[:2]
+
+    def advance():
+        if mode == "block":
+            leaf.fill_block_decode_seq_lens(2, ends)
+        elif mode == "chain":
+            leaf.advance_draft_forward_metadata(ends)
+        elif mode == "mtp":
+            leaf.update_draft_forward_metadata(ends)
+        else:
+            leaf.refresh_decode_metadata(2, 2, ends, table)
+
+    def check(local_lengths):
+        local = torch.tensor(local_lengths, dtype=torch.int32, device="cuda")
+        expected = torch.empty_like(local)
+        expected_offsets = torch.empty(3, dtype=torch.int32, device="cuda")
+        tokenspeed_mla_decode_split_kvs(
+            local,
+            expected,
+            expected_offsets,
+            torch.empty_like(leaf._decode_split_tasks_buf),
+            num_heads=64,
+            q_len=1 if mode == "chain" else 4,
+            max_seq_len=16384,
+            min_split_kv=1,
+            dtype=dtype,
+        )
+        torch.testing.assert_close(counts, expected, atol=0, rtol=0)
+        torch.testing.assert_close(
+            leaf._decode_split_offsets_buf[:3], expected_offsets, atol=0, rtol=0
+        )
+
+    advance()
+    check({0: [512, 8192], 1: [3584, 0], 3: [0, 0]}[rank])
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        advance()
+    ends.copy_(torch.tensor([512, 4096], device="cuda"))
+    graph.replay()
+    check([512, 4096] if rank == 0 else [0, 0])
