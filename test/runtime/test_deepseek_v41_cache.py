@@ -3670,11 +3670,6 @@ def test_decode_graph_slots_match_global_read_slots():
     weights = torch.rand(2 * verify_width, heads, device="cuda", dtype=torch.bfloat16)
     requests = torch.arange(2, device="cuda")
     seq_lens = torch.zeros(2, dtype=torch.int32, device="cuda")
-    index_topk = dsv41.index_topk
-
-    def without_slots(*args, **kwargs):
-        kwargs.pop("slots", None)
-        return index_topk(*args, **kwargs)
 
     def refresh(lengths, use_graph):
         seq_lens.copy_(torch.tensor(lengths, dtype=torch.int32))
@@ -3724,7 +3719,9 @@ def test_decode_graph_slots_match_global_read_slots():
         graph.replay()
         fused = [tensor.clone() for tensor in captured]
         refresh(lengths, False)
-        with patch.object(dsv41, "index_topk", side_effect=without_slots):
+        # Without a slot request the backend selects first and resolves the
+        # rows with global_read_slots, the path the request replaces.
+        with patch.object(dsv41, "SelectionSlots", return_value=None):
             unfused = run()
         for got, want in zip(fused, unfused, strict=True):
             torch.testing.assert_close(got, want, rtol=0, atol=0)
