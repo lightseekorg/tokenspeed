@@ -4204,7 +4204,7 @@ def test_prefill_indexer_batching_without_cuda(monkeypatch):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA platform required")
 @pytest.mark.parametrize(
     "major,minor,expected",
-    [(9, 0, False), (10, 0, True), (10, 3, True), (10, 7, False), (12, 0, False)],
+    [(9, 0, False), (10, 0, True), (10, 3, True), (10, 7, True), (12, 0, False)],
 )
 def test_prefill_indexer_native_architecture(monkeypatch, major, minor, expected):
     from tokenspeed_kernel.ops.attention.dsv41 import deep_gemm

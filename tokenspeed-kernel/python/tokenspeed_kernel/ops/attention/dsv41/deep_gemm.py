@@ -97,11 +97,7 @@ if platform.is_hopper:
 @lru_cache(maxsize=1)
 def is_native_indexer_available() -> bool:
     """Whether the current platform supports packed DeepGEMM MQA scoring."""
-    return (
-        platform.is_blackwell
-        and platform.arch_version.minor <= 3
-        and has_optional_package("deep_gemm")
-    )
+    return platform.is_blackwell and has_optional_package("deep_gemm")
 
 
 @lru_cache(maxsize=32)
