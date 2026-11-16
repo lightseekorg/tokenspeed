@@ -641,6 +641,27 @@ def index_score(
     )
 
 
+def prefill_indexer_batching_supported(index_row_bytes: int) -> bool:
+    """Return whether packed MXFP4 histories use the native batched scorer.
+
+    Args:
+        index_row_bytes: Packed index-cache row size; 68 denotes MXFP4.
+
+    Returns:
+        True for SM100–SM103 with DeepGEMM and DeepSelect available.
+        Other row formats and hosts without a CUDA device return False.
+    """
+    if index_row_bytes != 68 or not torch.cuda.is_available():
+        return False
+
+    from tokenspeed_kernel.ops.attention.dsv41.deep_gemm import (
+        is_native_indexer_available,
+    )
+    from tokenspeed_kernel.thirdparty.deep_select import is_deep_select_available
+
+    return is_native_indexer_available() and is_deep_select_available()
+
+
 def index_topk(
     index_q: torch.Tensor | IndexQueryInput,
     weights: torch.Tensor,
@@ -745,9 +766,7 @@ def index_topk(
     """
     from tokenspeed_kernel.ops.attention.dsv41.deep_gemm import (
         is_hopper_indexer_available,
-        is_native_indexer_available,
     )
-    from tokenspeed_kernel.thirdparty.deep_select import is_deep_select_available
 
     if index_metadata is not None:
         from tokenspeed_kernel.ops.attention.dsv41._metadata import IndexMetadata
@@ -773,11 +792,7 @@ def index_topk(
         and index_cache.data_ptr() % 16 == 0
     )
     native = shaped and (
-        (
-            row_bytes == 68
-            and is_native_indexer_available()
-            and is_deep_select_available()
-        )
+        prefill_indexer_batching_supported(row_bytes)
         or (row_bytes == 132 and is_hopper_indexer_available())
     )
     index_k_format = {
