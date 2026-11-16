@@ -52,7 +52,8 @@ def _chunk_stats_kernel(
         mask=cols < vocab,
         other=float("-inf"),
     )
-    x = x.to(tl.float32) / tl.load(temperature_ptr + row)
+    # Rounded division, as torch's: Triton's fp32 / is approximate on NVIDIA.
+    x = tl.div_rn(x.to(tl.float32), tl.load(temperature_ptr + row))
     # The shift is 0 for a chunk with no value above -inf, so its sum is
     # exp(-inf) = 0 rather than NaN. A NaN or +inf makes the sum NaN.
     x_max = tl.max(x, axis=0)
@@ -98,7 +99,7 @@ def _normalize_kernel(
         mask=col_mask,
         other=float("-inf"),
     )
-    x = x.to(tl.float32) / tl.load(temperature_ptr + row)
+    x = tl.div_rn(x.to(tl.float32), tl.load(temperature_ptr + row))
     tl.store(out_ptr + row * vocab + cols, tl.exp(x - shift) / row_sum, mask=col_mask)
 
 
