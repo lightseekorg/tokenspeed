@@ -1341,7 +1341,7 @@ class ModelExecutor:
         num_tokens_per_req = self.config.output_length
         logits = torch.zeros(
             (num_tokens_per_req, lm_head.num_embeddings_per_partition),
-            dtype=lm_head.weight.dtype,
+            dtype=processor.sampled_shard_dtype(lm_head),
             device=self.device,
         )
         candidates = torch.zeros(

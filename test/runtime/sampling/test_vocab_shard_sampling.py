@@ -181,9 +181,11 @@ class _Group:
     def shard(self, rank: int) -> SampledVocabShard:
         return SampledVocabShard(
             logits=self.raw[:, rank * SHARD : (rank + 1) * SHARD],
+            columns=SHARD,
             vocab_start=rank * SHARD,
             logit_scale=SCALE,
             softcap=SOFTCAP,
+            softcap_form="sigmoid",
             tp_size=RANKS,
             tp_group=tuple(range(RANKS)),
             gather_full=lambda logits: self.whole.clone(),
@@ -200,7 +202,10 @@ class _Group:
                 peer * SHARD,
                 landing[peer * rows : (peer + 1) * rows],
                 softcap=SOFTCAP,
+                softcap_form="sigmoid",
                 vocab_mask=None if self.mask is None else self.mask[:rows],
+                values_out=None,
+                halo_out=None,
             )
 
 
@@ -345,9 +350,11 @@ def test_warmup_compiles_every_candidate_count(monkeypatch, with_q, shard) -> No
     def shard_of(rows: int) -> SampledVocabShard:
         return SampledVocabShard(
             logits=raw[:rows, shard : 2 * shard],
+            columns=shard,
             vocab_start=shard,
             logit_scale=None,
             softcap=None,
+            softcap_form=None,
             tp_size=ranks,
             tp_group=tuple(range(ranks)),
             gather_full=lambda logits: raw[:rows].clone(),
@@ -363,7 +370,10 @@ def test_warmup_compiles_every_candidate_count(monkeypatch, with_q, shard) -> No
                 peer * shard,
                 landing[peer * rows : (peer + 1) * rows],
                 softcap=None,
+                softcap_form=None,
                 vocab_mask=None,
+                values_out=None,
+                halo_out=None,
             )
 
     monkeypatch.setattr(shard_module, "all_gather_single", all_gather_single)

@@ -80,7 +80,7 @@ def test_decode_rows_accumulate_in_fp32_and_round_once(rows):
 
 
 @pytest.mark.parametrize("rows", (33, 300, 2061))
-@pytest.mark.parametrize("width", ((4608, 3792), (1536, 4608)))
+@pytest.mark.parametrize("width", ((4608, 3792), (4608, 3808), (1536, 4608)))
 def test_prefill_projections_accumulate_in_fp32_and_round_once(rows, width):
     """Prefill-size Inkling2 projections (attention input, output) round
     the FP32 sum once to BF16."""

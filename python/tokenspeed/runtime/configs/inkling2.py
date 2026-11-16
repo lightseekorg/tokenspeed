@@ -57,6 +57,7 @@ class Inkling2ModelConfig(InklingModelConfig):
         attn_res_normalize_values: bool,
         mlp_gate_softcap: float,
         mlp_up_softcap: float,
+        decode_monokernel: bool = False,
         **kwargs: Any,
     ) -> None:
         required = {
@@ -122,6 +123,8 @@ class Inkling2ModelConfig(InklingModelConfig):
                 raise ValueError(f"Inkling2 requires {name}={value!r}")
             kwargs[name] = value
         super().__init__(model_max_length=model_max_length, **kwargs)
+        # --decode-monokernel (ModelConfig sets it for the serving target).
+        self.decode_monokernel = bool(decode_monokernel)
         self.max_position_embeddings = model_max_length
         self.use_value_norm_no_gamma = use_value_norm_no_gamma
         self.qk_l2_clip_threshold = qk_l2_clip_threshold

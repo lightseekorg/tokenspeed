@@ -28,13 +28,14 @@ frontend image preprocessing are not implemented here.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 
 import torch
 
 # tanh_softcap is outside the registry; its Triton kernel serves every supported vendor.
 from tokenspeed_kernel.ops.activation.triton import (
     tanh_softcap,
+    tanh_softcap_cap_normal,
     tanh_softcap_rejection,
 )
 
@@ -83,6 +84,7 @@ from tokenspeed.runtime.models.inkling2_attention import (
     Inkling2Attention,
     Inkling2ShortConvolution,
 )
+from tokenspeed.runtime.models.inkling2_monokernel import Inkling2Monokernel
 from tokenspeed.runtime.models.inkling2_sequence import (
     Inkling2SequenceParallel,
     SequenceShare,
@@ -132,6 +134,27 @@ class Inkling2LogitsProcessor(LogitsProcessor):
     def fuse_argmax(self) -> None:
         """Keep full logits so padded vocabulary rows cannot win an argmax."""
 
+    def keep_sampled_logits_vocab_sharded(
+        self,
+        lm_head: VocabParallelEmbedding,
+        supports: Callable[[torch.dtype, int, int], bool],
+    ) -> bool:
+        cap = self.logit_softcap
+        if cap is not None and cap > 0 and not tanh_softcap_cap_normal(cap):
+            # The shard selection caps as tanh_softcap does, which takes
+            # only normal FP32 caps.
+            return False
+        return super().keep_sampled_logits_vocab_sharded(lm_head, supports)
+
+    def sampled_shard_dtype(self, lm_head: VocabParallelEmbedding) -> torch.dtype:
+        """The head projects into FP32 (``Inkling2LMHeadMethod``)."""
+        return torch.float32
+
+    def sampled_shard_softcap(self) -> tuple[float | None, str | None]:
+        """``_vocab_logits``'s cap: ``tanh_softcap`` on the FP32 logits."""
+        cap = self.logit_softcap
+        return (cap, "tanh") if cap is not None and cap > 0 else (None, None)
+
     def _vocab_logits(self, logits: torch.Tensor) -> torch.Tensor:
         cap = self.logit_softcap
         if cap is not None and cap > 0:
@@ -169,6 +192,9 @@ class Inkling2DecoderLayer(nn.Module):
                 config.hidden_size, config.rms_norm_eps, torch.bfloat16, True, False
             )
 
+        # The model's monokernel seam, when it launches this layer
+        # (inkling2_monokernel.py; set after loading).
+        self.monokernel = None
         self.attn_norm = norm() if self.is_local else None
         self.q_input_norm = None if self.is_local else norm()
         self.k_input_norm = None if self.is_local else norm()
@@ -223,6 +249,11 @@ class Inkling2DecoderLayer(nn.Module):
         mailbox: Mailbox | None,
         share: SequenceShare | None,
     ) -> None:
+        if self.monokernel is not None and self.monokernel.serves(
+            self.layer_id, state, ctx, mailbox, share
+        ):
+            self.monokernel.run(self, state, ctx, log_scaling_tau)
+            return
         norms = self.input_norms()
         normalized = state.attention_input(
             self.layer_id,
@@ -391,6 +422,8 @@ class Inkling2TextModel(nn.Module):
                 for i in range(config.num_hidden_layers)
             ]
         )
+        # The decode monokernel seam (--decode-monokernel), built after loading.
+        self.monokernel: Inkling2Monokernel | None = None
         # Block-set partials run here, alongside the attention ahead of their
         # first mix.
         self.attnres_stream: torch.cuda.Stream | None = (
@@ -453,6 +486,8 @@ class Inkling2TextModel(nn.Module):
         )
         auxiliary: list[torch.Tensor] = []
         mailbox = None if ctx.forward_mode.is_extend_or_mixed() else self.decode_mailbox
+        if self.monokernel is not None:
+            self.monokernel.start_step(ctx)
         for layer_id, layer in enumerate(self.layers):
             if layer_id in self.layers_to_capture:
                 auxiliary.append(state.full_partial().to(torch.bfloat16))
@@ -461,6 +496,8 @@ class Inkling2TextModel(nn.Module):
                         len(auxiliary) - 1, auxiliary[-1]
                     )
             layer(state, ctx, tau, mailbox, share)
+        if self.monokernel is not None:
+            self.monokernel.finish_step()
         hidden = state.compute_output(self.norm)
         if auxiliary:
             auxiliary.append(hidden)
@@ -573,7 +610,12 @@ class Inkling2ForConditionalGeneration(BaseCausalLM):
 
     def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
         """Build the decode chain's mailbox and the prefill's sequence-parallel
-        buffers (eager, before capture)."""
+        buffers, and the decode monokernel's mailbox (eager, before
+        capture)."""
+        monokernel = self.model.monokernel
+        if monokernel is not None and monokernel.state is None:
+            monokernel.reserve()
+            monokernel.prepare(torch.device("cuda", torch.cuda.current_device()))
         if self.model.decode_mailbox is None:
             self.model.decode_mailbox = _decode_mailbox(self.model.config, self.mapping)
         if (
@@ -592,11 +634,16 @@ class Inkling2ForConditionalGeneration(BaseCausalLM):
 
     def post_load_weights(self) -> None:
         """Derive the fused-kernel weights from the loaded queries, norms and
-        convolution taps."""
+        convolution taps, and (with --decode-monokernel) pack the monokernel
+        layers from them."""
         self.model.attn_res.derive_score_weights()
         for layer in self.model.layers:
             layer.derive_input_norm_gains()
             layer.attn.derive_projected_taps()
+        if self.model.config.decode_monokernel:
+            if self.model.monokernel is None:
+                self.model.monokernel = Inkling2Monokernel(self.model, self.mapping)
+            self.model.monokernel.pack()
 
     def resolve_lm_head(
         self,
