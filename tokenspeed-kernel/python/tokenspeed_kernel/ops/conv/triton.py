@@ -38,6 +38,7 @@ import functools
 
 import torch
 from tokenspeed_kernel._triton import triton
+from tokenspeed_kernel.op_profile import OpProfile, record_compiled_kernel
 from tokenspeed_kernel.ops.attention.gdn.triton import (
     CausalConv1dPrefillMetadata,
 )
@@ -95,6 +96,7 @@ def _update_num_warps() -> int:
     solution="triton",
     signatures=format_signatures("x", "dense", _CONV_DTYPES),
     priority=Priority.PORTABLE,
+    profile=OpProfile(cost_rule="causal_conv1d_prefill.v1"),
 )
 def triton_causal_conv1d_prefill(
     x: torch.Tensor,
@@ -382,6 +384,11 @@ def triton_causal_conv1d_prefill_qkv(
     solution="triton",
     signatures=format_signatures("x", "dense", _CONV_DTYPES),
     priority=Priority.PORTABLE,
+    profile=OpProfile(
+        cost_rule="causal_conv1d_update.v3",
+        scalar_args=("pad_slot_id",),
+        integer_tensor_args=("conv_state_indices", "output_state_indices"),
+    ),
 )
 def triton_causal_conv1d_update(
     x: torch.Tensor,
@@ -582,7 +589,7 @@ def triton_causal_conv1d_update(
         gate_heads = replay_first_channel = 0
         replay_strides = (0, 0, 0)
 
-    _causal_conv1d_update_kernel[grid](
+    compiled = _causal_conv1d_update_kernel[grid](
         # Pointers to matrices
         x,
         weight,
@@ -645,6 +652,7 @@ def triton_causal_conv1d_update(
         ENABLE_PDL=enable_pdl,
         **({"launch_pdl": True} if enable_pdl else {}),
     )
+    record_compiled_kernel(compiled, contract_id="causal_conv1d_update.triton.v1")
     if unsqueeze:
         out = out.squeeze(-1)
     return out

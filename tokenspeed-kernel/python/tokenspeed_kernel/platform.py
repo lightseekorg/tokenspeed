@@ -73,7 +73,8 @@ def prepare_cuda_toolkit_env() -> None:
             continue
 
         os.environ["CUDA_HOME"] = str(candidate)
-        _prepend_env_path("CPATH", candidate / "include")
+        # Wheel toolkits may link their include directory to the actual headers.
+        _prepend_env_path("CPATH", (candidate / "include").resolve())
         _prepend_env_path("PATH", candidate / "bin")
         return
 

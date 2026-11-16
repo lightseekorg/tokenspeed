@@ -17,10 +17,21 @@
 
 """CUDA layernorm kernels."""
 
-from tokenspeed_kernel.registry import error_fn
+from tokenspeed_kernel.op_profile import OpProfile, wrap_op_for_profiling
+from tokenspeed_kernel.registry import KernelSpec, error_fn
 
 try:
     from tokenspeed_kernel.thirdparty.cuda.rmsnorm import rmsnorm_fused_parallel
+
+    rmsnorm_fused_parallel = wrap_op_for_profiling(
+        rmsnorm_fused_parallel,
+        spec=KernelSpec(
+            name="cuda_rmsnorm_fused_parallel",
+            family="layernorm",
+            mode="rmsnorm_fused_parallel",
+        ),
+        profile=OpProfile(cost_rule="rmsnorm_fused_parallel.v1"),
+    )
 except ImportError:
     rmsnorm_fused_parallel = error_fn
 

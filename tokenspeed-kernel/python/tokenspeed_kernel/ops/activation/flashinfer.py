@@ -35,3 +35,17 @@ if current_platform().is_nvidia:
         pass
 
 __all__ = ["gelu_and_mul", "gelu_tanh_and_mul", "silu_and_mul"]
+
+_reviewed_silu_implementation = silu_and_mul
+
+
+def record_silu_profile_engine(metadata, *, implementation):
+    """Record the actual imported binding; certify artifacts after collection."""
+    import sys
+
+    module = sys.modules.get("flashinfer")
+    metadata["activation_import_matches_binding"] = (
+        implementation is _reviewed_silu_implementation
+    )
+    metadata["activation_package_version"] = getattr(module, "__version__", None)
+    metadata["activation_source_branch"] = "flashinfer.silu_and_mul:unclamped"

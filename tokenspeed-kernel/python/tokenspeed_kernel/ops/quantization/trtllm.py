@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._optional import has_trtllm_kernel
+from tokenspeed_kernel.op_profile import OpProfile
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -87,6 +88,7 @@ if _HAS_TRTLLM_KERNEL:
         "quantization",
         "fp8_with_scale",
         name="trtllm_quantize_fp8_with_scale",
+        profile=OpProfile(cost_rule="fp8_token_group_128.v1"),
         features={"token_fp8_min_scaling"},
         solution="trtllm",
         capability=CapabilityRequirement(
@@ -133,6 +135,7 @@ if _HAS_TRTLLM_KERNEL:
         "quantization",
         "fp8_with_scale",
         name="trtllm_quantize_fp8_mn_major",
+        profile=OpProfile(cost_rule="fp8_token_group_128.v1"),
         solution="trtllm",
         capability=CapabilityRequirement(
             max_arch_version=ArchVersion(10, 9),

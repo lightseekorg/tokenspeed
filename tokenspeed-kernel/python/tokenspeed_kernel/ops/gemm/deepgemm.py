@@ -25,6 +25,7 @@ from functools import cache
 import torch
 from tokenspeed_kernel._optional import has_optional_package
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.op_profile import OpProfile
 from tokenspeed_kernel.ops.tuning import is_warming_up
 from tokenspeed_kernel.platform import (
     ArchVersion,
@@ -287,6 +288,7 @@ _BLOCK_FP8_TRAITS = {
     "gemm",
     "mm",
     name="deepgemm_mm_fp8_blockscale",
+    profile=OpProfile(cost_rule="fp8_block_mm.v1"),
     solution="deepgemm",
     capability=CapabilityRequirement(
         vendors=frozenset({"nvidia"}),

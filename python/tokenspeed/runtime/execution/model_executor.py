@@ -24,6 +24,7 @@ import contextlib
 import gc
 import time
 from collections.abc import Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
@@ -97,6 +98,7 @@ from tokenspeed.runtime.execution.types import (
     RequestHistorySeeds,
     StopCriteria,
 )
+from tokenspeed.runtime.execution.utilization_profile import RuntimeUtilizationProfile
 from tokenspeed.runtime.execution.workspace import workspace_pool
 from tokenspeed.runtime.grammar.capturable_grammar import (
     create_grammar_runtime,
@@ -624,6 +626,16 @@ class ModelExecutor:
             enable=config.enable_memory_saver
         )
         self.model_runner = model_runner
+        self.utilization_profile = RuntimeUtilizationProfile.from_env(
+            model=model_runner.model,
+            model_id=model_runner.model_config.model_path,
+            rank=config.global_rank,
+            device=config.device,
+            enforce_eager=config.enforce_eager,
+            disable_prefill_graph=config.disable_prefill_graph,
+            speculative=config.spec_algo is not None,
+            mapping=model_runner.mapping,
+        )
         self.sampling_backend = sampling_backend
         self.attn_backend = attn_backend
         self.token_to_kv_pool = token_to_kv_pool
@@ -1041,6 +1053,7 @@ class ModelExecutor:
             sampling_backend=self.sampling_backend,
             runtime_states=self.runtime_states,
             decode_graph_supported=self._graph_support.decode_graph,
+            utilization_profile=self.utilization_profile,
         )
         # Eager warmup can be DP-asymmetric; prewarm RSAG under uniform dummy inputs.
         # The prefill role never decodes: a DECODE-shaped dummy would need the
@@ -1573,6 +1586,13 @@ class ModelExecutor:
                 raise RuntimeError(
                     "a sharded extend cannot replay a prefill graph; query context "
                     "parallelism requires --disable-prefill-graph"
+                )
+            if (
+                self.utilization_profile is not None
+                and self.utilization_profile.current_step is not None
+            ):
+                self.utilization_profile.current_step.unavailable(
+                    "prefill_graph_capture_not_observed"
                 )
             return self.prefill_graph.replay(
                 ctx,
@@ -2577,6 +2597,15 @@ class ModelExecutor:
     ) -> ModelExecutionResult:
         self._reset_valid_cache_length(forward_op)
         self.log_step += 1
+        profile_identity = (
+            self.utilization_profile.begin_step(
+                step=self.log_step,
+                request_ids=forward_op.request_ids,
+                pool_indices=forward_op.request_pool_indices,
+            )
+            if self.utilization_profile is not None
+            else None
+        )
         num_extends = forward_op.num_extends()
         total_tokens = sum(forward_op.input_lengths)
         self._active_multimodal_context = multimodal_context
@@ -2848,9 +2877,18 @@ class ModelExecutor:
                             time.perf_counter() - sampling_start
                         ) * 1000.0
 
-                with nvtx_range(
-                    f"forward_step ext={num_extends} dec={bs - num_extends}",
-                    color="blue",
+                with (
+                    (
+                        self.utilization_profile.iteration(
+                            step=self.log_step, identity=profile_identity
+                        )
+                        if self.utilization_profile is not None
+                        else nullcontext()
+                    ),
+                    nvtx_range(
+                        f"forward_step ext={num_extends} dec={bs - num_extends}",
+                        color="blue",
+                    ),
                 ):
                     self._log_dp_sampling_route(bs, ctx)
                     forward_step_start = 0.0
@@ -2979,6 +3017,8 @@ class ModelExecutor:
 
                 copy_event = self.device_module.Event()
                 copy_event.record()
+                if profile_identity is not None:
+                    profile_identity.bind_result_event(copy_event)
                 if timing_enabled:
                     output_d2h_ms = (time.perf_counter() - output_d2h_start) * 1000.0
 
@@ -3008,6 +3048,7 @@ class ModelExecutor:
 
         return ModelExecutionResult(
             output_tokens=output_tokens,
+            profile_identity=profile_identity,
             output_lengths=output_lengths,
             output_logprobs=output_logprobs,
             copy_event=copy_event,

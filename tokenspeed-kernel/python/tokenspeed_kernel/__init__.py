@@ -18,8 +18,16 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from tokenspeed_kernel.profiling import (
-    bootstrap_profiling_from_env as _bootstrap_profiling_from_env,
-)
+import os as _os
 
-_bootstrap_profiling_from_env()
+# Offline readers must not load GPU profiling dependencies unless requested.
+# bootstrap_profiling_from_env remains the authority for truthy flag parsing.
+if any(
+    _os.environ.get(name)
+    for name in ("TOKENSPEED_KERNEL_PROFILE", "TOKENSPEED_KERNEL_CAPTURE_SHAPES")
+):
+    from tokenspeed_kernel.profiling import (
+        bootstrap_profiling_from_env as _bootstrap_profiling_from_env,
+    )
+
+    _bootstrap_profiling_from_env()

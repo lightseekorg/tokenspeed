@@ -25,6 +25,10 @@ import functools
 from collections.abc import Callable
 
 import torch
+from tokenspeed_kernel.op_profile import (
+    OpProfile,
+    profile_function,
+)
 from tokenspeed_kernel.ops.communication.triton import (
     TritonRSAGState,
     all_gather_inner,
@@ -288,6 +292,11 @@ def _get_fused_lm_head_gemm():
     return _FUSED_LM_HEAD_GEMM
 
 
+@profile_function(family="gemm", name="lm_head_mm", profile=OpProfile("torch_mm.v1"))
+def _profiled_lm_head_mm(A, B):
+    return torch.matmul(A, B.T)
+
+
 def _lm_head_matmul(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """Compute ``hidden_states @ weight.T``.
 
@@ -305,7 +314,7 @@ def _lm_head_matmul(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.
     should_use_fused, lm_head_gemm = _get_fused_lm_head_gemm()
     if should_use_fused is not None and should_use_fused(cast_hidden, weight):
         return lm_head_gemm(cast_hidden, weight)
-    return torch.matmul(cast_hidden, weight.T)
+    return _profiled_lm_head_mm(cast_hidden, weight)
 
 
 class LogitsProcessor(nn.Module):
@@ -1279,7 +1288,7 @@ class LogitsProcessor(nn.Module):
             return kernel_mm(cast_hidden, lm_head.weight)
         if self._use_fused_lm_head:
             return _lm_head_matmul(cast_hidden, lm_head.weight)
-        return torch.matmul(cast_hidden, lm_head.weight.T)
+        return _profiled_lm_head_mm(cast_hidden, lm_head.weight)
 
     def _get_logits(
         self,

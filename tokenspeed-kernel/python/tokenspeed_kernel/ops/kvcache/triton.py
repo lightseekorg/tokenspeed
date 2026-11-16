@@ -33,6 +33,7 @@ from dataclasses import dataclass
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.op_profile import OpProfile, wrap_op_for_profiling
 from tokenspeed_kernel.ops.kvcache.index_k_scale import (
     index_k_scale_dtype,
     index_k_scale_ue8m0,
@@ -43,6 +44,7 @@ from tokenspeed_kernel.ops.quantization._triton_mxfp4 import (
     _ue8m0_word,
 )
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.registry import KernelSpec
 
 _PER_LAYER_GRID_CAP = int(os.environ.get("TOKENSPEED_KV_GRID_CAP", "64"))
 _ALL_LAYER_GRID_CAP = int(os.environ.get("TOKENSPEED_KV_ALL_LAYER_GRID_CAP", "32"))
@@ -1502,6 +1504,15 @@ def set_mla_kv_buffer_triton(
         )
 
 
+set_mla_kv_buffer_triton = wrap_op_for_profiling(
+    set_mla_kv_buffer_triton,
+    spec=KernelSpec(
+        name="set_mla_kv_buffer_triton", family="kvcache", mode="mla_scatter"
+    ),
+    profile=OpProfile(cost_rule="mla_cache_scatter.v1"),
+)
+
+
 @dataclass(frozen=True, eq=False)
 class LatentPlanes:
     """Every layer's latent cache plane, addressed through one pointer table.
@@ -2067,6 +2078,15 @@ def get_mla_kv_buffer_triton(
             ENABLE_PDL=use_pdl,
             **extra_kwargs,
         )
+
+
+get_mla_kv_buffer_triton = wrap_op_for_profiling(
+    get_mla_kv_buffer_triton,
+    spec=KernelSpec(
+        name="get_mla_kv_buffer_triton", family="kvcache", mode="mla_gather"
+    ),
+    profile=OpProfile(cost_rule="mla_cache_gather.v1"),
+)
 
 
 # -----------------------------------------------------------------------------

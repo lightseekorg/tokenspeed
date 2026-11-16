@@ -112,6 +112,7 @@ class Plane:
     def __init__(self):
         self.calls = []
         self.admissions = []
+        self.forward_ids = []
         self.next_token = 100
         self.held = None
         self.unblock = threading.Event()
@@ -134,8 +135,9 @@ class Plane:
     def admit(self, rows):
         self.admissions.extend(rows)
 
-    def execute(self, plan, dp, ngram, grammar_advance, logprobs, history):
+    def execute(self, plan, dp, ngram, grammar_advance, logprobs, history, forward_id):
         self.note("execute")
+        self.forward_ids.append(forward_id)
         token = self.next_token
         self.next_token += 1
         if token == self.held:
@@ -317,6 +319,15 @@ fn the_forward_thread_runs_the_queue_and_the_control_thread_its_queries() {
         .unwrap()
         .unwrap();
     assert_eq!(data_plane.complete(forward).unwrap().output_tokens, [100]);
+    let forward_ids: Vec<Option<ForwardId>> = Python::attach(|py| {
+        plane
+            .bind(py)
+            .getattr("forward_ids")
+            .unwrap()
+            .extract()
+            .unwrap()
+    });
+    assert_eq!(forward_ids, [Some(forward)]);
     let polled = data_plane.poll_cache_events().unwrap();
     assert_eq!(polled.len(), 1);
     data_plane.release(&["r".to_owned()]).unwrap();

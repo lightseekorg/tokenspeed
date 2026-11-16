@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.op_profile import OpProfile, profile_function
 from tokenspeed_kernel.ops.sampling import write_synthetic_verify_outputs
 from tokenspeed_kernel.platform import current_platform
 
@@ -57,6 +58,15 @@ DEFAULT_RANDOM_SEED = 48
 CUDA_GRAPH_VARIANT_DEFAULT = "default"
 SPECULATIVE_ACCEPT_THRESHOLD_SINGLE = 1.0
 SPECULATIVE_ACCEPT_THRESHOLD_ACC = 1.0
+
+
+@profile_function(
+    family="sampling",
+    name="broadcast_verify",
+    profile=OpProfile("sampling_broadcast.v1", scalar_args=("src", "ranks")),
+)
+def _profiled_sampling_broadcast(tensor, *, src, group, ranks):
+    dist.broadcast(tensor, src=src, group=group)
 
 
 @dataclass(frozen=True)
@@ -529,7 +539,12 @@ class SamplingBackend(ABC):
                 )
             ):
                 continue
-            dist.broadcast(t, src=self._tp_src_global_rank, group=self._tp_pg)
+            _profiled_sampling_broadcast(
+                t,
+                src=self._tp_src_global_rank,
+                group=self._tp_pg,
+                ranks=tuple(self.config.tp_group),
+            )
 
     def prepare_step(
         self,

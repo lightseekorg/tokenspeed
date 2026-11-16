@@ -28,6 +28,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
+from tokenspeed_kernel.op_profile import profiled
 from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
 from tokenspeed_kernel.ops.quantization import try_output_fp8_quant_pack
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
@@ -878,6 +879,7 @@ class Qwen3_5LinearDecoderLayer(Qwen3_5DecoderLayer):
         )
         self.comm_manager = self._build_comm_manager()
 
+    @profiled(level="layer")
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1113,6 +1115,7 @@ class Qwen3_5AttentionDecoderLayer(Qwen3_5DecoderLayer):
         output = self._project_output(attn_output, gate if fuse_output_quant else None)
         return output
 
+    @profiled(level="layer")
     def forward(
         self,
         positions: torch.Tensor,

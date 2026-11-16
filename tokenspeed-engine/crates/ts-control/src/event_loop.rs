@@ -78,7 +78,7 @@ use crate::{
     l3::{L3Error, Tier},
     output::{
         CommitStats, Committed, ForwardResult, HistoryRows, HistorySeeds, InputLogprobPlan,
-        LogprobPlan, NgramWindows, OutputProcessor, StreamedOutput,
+        LogprobPlan, NgramWindows, OutputProcessor, StreamedOutput, TokenCommit,
     },
     relay::{self, RelayError},
     request::RequestGrammar,
@@ -213,6 +213,32 @@ pub trait DataPlane {
 
     /// Wait for a forward's results.
     fn complete(&mut self, pending: Self::Pending) -> Result<ForwardResult, DataPlaneError>;
+
+    /// Optional metadata-only service observation; never submits device work.
+    fn token_trace_enabled(&self) -> bool {
+        false
+    }
+    fn token_trace_id(&self, _pending: &Self::Pending) -> Option<u64> {
+        None
+    }
+    fn trace_commit(
+        &mut self,
+        _forward: u64,
+        _rows: &[TokenCommit],
+        _outputs: &[StreamedOutput],
+        _owns_frontend: bool,
+    ) -> Result<(), DataPlaneError> {
+        Ok(())
+    }
+    /// Called after sending the round's batch to the frontend returned.
+    fn trace_emit(&mut self, _outputs: &[StreamedOutput]) -> Result<(), DataPlaneError> {
+        Ok(())
+    }
+
+    /// Drop observation joins after outputs were sent, including cancellations.
+    fn trace_release(&mut self, _rids: &[String]) -> Result<(), DataPlaneError> {
+        Ok(())
+    }
 
     /// The cache ops acknowledged since the last poll, in the order they
     /// landed; never waits on the device.
@@ -912,11 +938,21 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                     .last_load_report
                     .is_none_or(|last| last.elapsed() >= Duration::from_secs(1))
             {
-                let _span = profile::span("Frontend::send");
-                self.frontend.send(outputs, load);
-                self.reported_load = Some(load);
-                self.last_load_report = Some(Instant::now());
+                let observed = (self.data_plane.token_trace_enabled() && !outputs.is_empty())
+                    .then(|| outputs.clone());
+                {
+                    let _span = profile::span("Frontend::send");
+                    self.frontend.send(outputs, load);
+                    self.reported_load = Some(load);
+                    self.last_load_report = Some(Instant::now());
+                }
+                if let Some(observed) = observed {
+                    self.data_plane.trace_emit(&observed)?;
+                }
             }
+        }
+        if self.data_plane.token_trace_enabled() && !released.is_empty() {
+            self.data_plane.trace_release(&released)?;
         }
         // A deferred pause or release resolves once the scheduler drained.
         self.finish_drain(release_pending, nccl_release_pending)?;
@@ -2641,17 +2677,31 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         while self.in_flight.len() > depth {
             let _span = profile::span("EventLoop::commit");
             let (batch, input_logprobs, pending) = self.in_flight.pop_front().expect("non-empty");
+            let trace_id = self.data_plane.token_trace_id(&pending);
             let result = self.data_plane.complete(pending)?;
             let serving_compiles = result.serving_compiles;
             let result = self.adopt_last_stage(result)?;
             let Committed {
+                token_commits,
                 events: committed_events,
                 outputs: committed_outputs,
                 released: committed_released,
                 stats,
-            } = self
-                .outputs
-                .commit(&batch, input_logprobs.as_ref(), &result)?;
+            } = self.outputs.commit_observed(
+                &batch,
+                input_logprobs.as_ref(),
+                &result,
+                trace_id.is_some(),
+            )?;
+            if let Some(forward) = trace_id {
+                let owns_frontend = self.owns_frontend();
+                self.data_plane.trace_commit(
+                    forward,
+                    &token_commits,
+                    &committed_outputs,
+                    owns_frontend,
+                )?;
+            }
             self.record_commit(stats, serving_compiles);
             if batch.num_extends == 0 {
                 self.batch_logger.record_decode(&result.output_lengths);

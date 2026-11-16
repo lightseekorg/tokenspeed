@@ -21,12 +21,13 @@ import math
 
 import torch
 from tokenspeed_kernel._optional import has_fa4_cute, has_optional_package
+from tokenspeed_kernel.op_profile import OpProfile, wrap_op_for_profiling
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
     current_platform,
 )
-from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
+from tokenspeed_kernel.registry import KernelSpec, Priority, error_fn, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 __all__ = [
@@ -559,6 +560,21 @@ elif (
                 "kernel selection"
             )
         return {}
+
+    flash_attn_varlen_func = wrap_op_for_profiling(
+        flash_attn_varlen_func,
+        spec=KernelSpec(name="fa3_mha_varlen", family="attention", mode="mha_varlen"),
+        profile=OpProfile(
+            cost_rule="attention_varlen.v1",
+            scalar_args=("causal", "window_size", "attention_chunk"),
+            integer_tensor_args=(
+                "cu_seqlens_q",
+                "cu_seqlens_k",
+                "seqused_q",
+                "seqused_k",
+            ),
+        ),
+    )
 
     @register_kernel(
         "attention",
