@@ -39,6 +39,7 @@ from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.logits_processor_output import (
     LogitsProcessorOutput as Output,
 )
+from tokenspeed.runtime.sampling.backends.base import CUDA_GRAPH_VARIANT_DEFAULT
 from tokenspeed.runtime.sampling.sampling_batch_info import (
     SamplingBatchInfo,
     request_vocab_mask,
@@ -804,7 +805,7 @@ def test_graph_padding_restores_live_output_layout(live_bs):
         ),
         _prepare_request_token_history_graph_inputs=lambda **kwargs: None,
         _prepare_decode_metadata=lambda *args, **kwargs: None,
-        _cuda_graph_key=lambda bs: bs,
+        _cuda_graph_key=lambda bs: (CUDA_GRAPH_VARIANT_DEFAULT, bs),
         _graph_debug=False,
         _expert_load_rows=None,
         _mega_moe_live_requests=live_requests,
@@ -824,14 +825,14 @@ def test_graph_padding_restores_live_output_layout(live_bs):
             seq_lens_buf=torch.ones(padded_bs),
         ),
         graphs={
-            padded_bs: SimpleNamespace(
+            (CUDA_GRAPH_VARIANT_DEFAULT, padded_bs): SimpleNamespace(
                 replay=lambda: observed.append(
                     (ctx.bs, ctx.output_layout, live_requests.tolist())
                 )
             )
         },
         output_buffers={
-            padded_bs: (
+            (CUDA_GRAPH_VARIANT_DEFAULT, padded_bs): (
                 torch.arange(padded_bs * width),
                 torch.ones(padded_bs),
                 None,

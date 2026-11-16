@@ -169,6 +169,7 @@ def _pool_and_backend(*, heads, dim, device, kernel_page_size, block_draft):
         kv_cache_quant_method="none",
         context_len=512,
         max_bs=1,
+        max_resident_requests=1,
         components=(component,),
         is_draft=block_draft,
         draft_block_decode=block_draft,

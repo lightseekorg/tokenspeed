@@ -49,11 +49,11 @@ public:
     // at the moment of its largest working set.
     std::vector<std::int64_t> SingleRequestGroupPages(std::int32_t token_limit) const;
 
-    // Child pages (null page excluded) each group holds for max_batch_size
+    // Child pages (null page excluded) each group holds for max_resident_requests
     // live requests whose histories -- first decode reservation included --
     // total max_total_tokens, no request spanning more than max_context_len.
     // For every group, one request of L tokens needs no more than this
-    // reports for max_batch_size = 1 and max_total_tokens = max_context_len
+    // reports for max_resident_requests = 1 and max_total_tokens = max_context_len
     // = L: a pool sized from it admits every request the bound accepts.
     std::vector<std::int64_t> ConcurrentGroupPages(std::int64_t max_total_tokens, std::int32_t max_context_len) const;
 

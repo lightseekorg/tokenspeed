@@ -175,6 +175,7 @@ class _ScheduledKDA:
         config.max_retracted_requests = 0
         config.max_scheduled_tokens = _P
         config.max_batch_size = 1
+        config.max_resident_requests = 1
         config.decode_input_tokens = 1
         config.overlap_schedule_depth = 0
         config.enable_mixed_prefill_decode = False

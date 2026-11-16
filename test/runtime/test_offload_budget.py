@@ -195,6 +195,7 @@ def test_remote_pd_landing_holds_the_only_hot_request_partition():
     cfg.prefix_granularity = 64
     cfg.num_device_pages = 129
     cfg.max_batch_size = 1  # The configured B is also the fixed hot partition count.
+    cfg.max_resident_requests = 1
     cfg.max_scheduled_tokens = 64
     cfg.decode_input_tokens = 1
     cfg.disable_l2_cache = True
@@ -221,17 +222,28 @@ def test_remote_pd_landing_holds_the_only_hot_request_partition():
     scheduler.advance(
         ts.ExecutionEvent().add_event(ts.PD.RemotePrefillDoneEvent("first", 100))
     )
-    scheduler.next_execution_plan()
+    decode = scheduler.next_execution_plan()
+    assert list(decode.forward[0].request_ids) == ["first"]
     event = ts.ForwardEvent.Abort()
     event.request_id = "first"
     scheduler.advance(ts.ExecutionEvent().add_event(event))
     for _ in range(4):
         plan = scheduler.next_execution_plan()
-        if plan.remote_prefill is not None:
-            assert list(plan.remote_prefill.request_ids) == ["second"]
-            break
-    else:
-        pytest.fail("released hot partition was not readmitted")
+        assert plan.remote_prefill is None
+        assert scheduler.allocated_request_slots() == 1
+        assert scheduler.active_decode_slots() == 1
+
+    # Cancellation does not retire a forward that can still write this row.
+    result = ts.ForwardEvent.ExtendResult()
+    result.request_id, result.tokens = "first", [101]
+    scheduler.advance(ts.ExecutionEvent().add_event(result))
+    assert scheduler.allocated_request_slots() == 0
+    assert scheduler.active_decode_slots() == 0
+    admitted = scheduler.next_execution_plan()
+    assert list(admitted.remote_prefill.request_ids) == ["second"]
+    assert list(admitted.remote_prefill.request_pool_indices) == list(
+        first.remote_prefill.request_pool_indices
+    )
 
 
 def test_decode_capacity_abort_releases_the_request_partition_without_recovery():
@@ -242,6 +254,7 @@ def test_decode_capacity_abort_releases_the_request_partition_without_recovery()
     cfg.num_snapshot_pages = 1
     cfg.max_retracted_requests = 0
     cfg.max_batch_size = 2
+    cfg.max_resident_requests = 2
     cfg.max_scheduled_tokens = 256
     cfg.decode_input_tokens = 1
     cfg.disable_l2_cache = True

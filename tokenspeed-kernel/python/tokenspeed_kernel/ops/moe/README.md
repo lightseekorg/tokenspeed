@@ -561,7 +561,7 @@ groups, the top 8 experts of the kept groups, their unbiased scores renormalized
   least one row, a scale that rounds to a finite zero or normal FP32). It
   launches as a programmatic dependent where `pdl_enabled()`.
 
-Beam calls the Triton kernel on NVIDIA SM90 to SM103 where the guard admits the
+Beam calls the Triton kernel on NVIDIA SM90 and newer where the guard admits the
 call and the Torch statements otherwise. The GPU tests
 (`test/nvidia/ops/moe/test_router_select_cuda.py`) pin Torch's FP32 sigmoid and
 K8 sum order first (a mismatch fails, never skips), then compare the two byte for
@@ -585,7 +585,7 @@ kernel's own finalized output.
 
 ## Kimi-K3 router
 
-On SM100/SM103, batches from 2,560 tokens use a vendored CUDA top-16 router
+On NVIDIA SM90 and newer, batches from 2,560 tokens use a vendored CUDA top-16 router
 over 896 experts. It consumes contiguous FP32 logits and bias and writes
 normalized FP32 weights (scale 1) and INT32 IDs into caller-owned buffers.
 The routing-only kernel has no expert-plan workspace or 8,192-token limit.
@@ -622,7 +622,7 @@ bound no fused kernel matches and the runtime keeps the separate path.
 (`thirdparty/cuda/kimi3_latent_front.py` and `csrc/kimi3_latent_front/`): one
 persistent launch produces the FP32 router logits, the BF16 latent input and
 the BF16 SiTU-activated shared-expert input. It is registered on SM100 and
-SM103 parts with 148 or 152 SMs (the counts the plan rules are validated for)
+SM103, with launch planning based on the device's SM count,
 for 2048 BF16 rows or more (no upper bound: the plan scales with the row
 count), Kimi-K3's replicated router/latent weights, full shared-expert weights,
 and SiTU clamps 4 and 25. Attention-DP uses it only

@@ -59,6 +59,10 @@ struct SchedulerTestAccess {
         scheduler.recordAdmittedPages(plan, result);
     }
     static std::uint64_t DecodeAdmissions(const Scheduler& scheduler) { return scheduler.decode_admissions_; }
+    static std::int32_t ResultsInFlight(Scheduler& scheduler, const std::string& request_id) {
+        const Request* request = scheduler.findRequest(request_id);
+        return request == nullptr ? 0 : request->ResultsInFlight();
+    }
     // Whether the request's prompt prefix hashes have been computed.
     static bool PromptHashed(Scheduler& scheduler, const std::string& request_id) {
         return scheduler.findRequest(request_id)->prompt_prefix_hashes_.has_value();
@@ -95,6 +99,7 @@ protected:
         cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.enable_l3_storage = false;
         cfg.cache_groups.push_back(CacheGroupConfig{
             .group_id = "full_attention",
@@ -188,6 +193,14 @@ protected:
             .tokens = tokens,
         });
         scheduler_->Advance(std::move(event));
+    }
+
+    // Cleanup for probes that cancel work after inspecting its plan. The
+    // queued forwards still land even when the request has been cancelled.
+    void DrainForwardResults(const std::string& request_id) {
+        while (SchedulerTestAccess::ResultsInFlight(*scheduler_, request_id) > 0) {
+            SendForwardDone(request_id);
+        }
     }
 
     // Send Finish (generation complete) to the scheduler. Finish-created
@@ -343,6 +356,7 @@ protected:
         cfg.host_allocator.total_pages = 0;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.enable_l3_storage = false;
         cfg.disable_l2_cache = true;
         cfg.disable_prefix_cache = false;

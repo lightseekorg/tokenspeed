@@ -307,18 +307,22 @@ def test_cluster_kernels_replay_from_a_cuda_graph(device: str) -> None:
 
 
 @pytest.mark.parametrize("device", ["cuda"])
-@pytest.mark.parametrize("rows", [1, 5, 64])
+@pytest.mark.parametrize("rows", [1, 5, 64, 200])
 # One block reads rows as they stand; four are the column blocks of a TP4 gather.
 @pytest.mark.parametrize("blocks", [1, 4])
 def test_cluster_boundary_gathers_an_armed_mailbox_and_re_arms_it(
     device: str, rows: int, blocks: int
 ) -> None:
-    """A mailbox branch gives the plain kernel's bits; the rows read are re-armed."""
+    """A mailbox branch gives an ordinary branch's bits at any row count; the rows read are re-armed."""
     args = boundary_case("ffn_linked", rows, device)
     stream, branch = args[:2]
-    plain = boundary_cute_dsl.cute_dsl_post_norm_residual_pre_norm(*args, True, None, 1)
-    mailbox = armed_blocks(branch, MAX_ROWS, blocks)
-    assert _supported(args, mailbox[:, :rows], HALF_POLLED_SENTINEL, 1)
+    plain = post_norm_residual_pre_norm(*args, True, None, 1)
+    capacity = max(rows, MAX_ROWS)
+    mailbox = armed_blocks(branch, capacity, blocks)
+    # Past the ceiling the Triton kernel reads it, as it reads an ordinary branch.
+    assert _supported(args, mailbox[:, :rows], HALF_POLLED_SENTINEL, 1) is (
+        rows <= MAX_ROWS
+    )
     got = post_norm_residual_pre_norm(
         stream, mailbox[:, :rows], *args[2:], True, HALF_POLLED_SENTINEL, 1
     )
@@ -328,20 +332,12 @@ def test_cluster_boundary_gathers_an_armed_mailbox_and_re_arms_it(
     # A view of other rows, or rows not split into blocks, declines.
     assert not _supported(args, mailbox[:, : rows - 1], HALF_POLLED_SENTINEL, 1)
     assert not _supported(
-        args, armed_mailbox(branch, MAX_ROWS), HALF_POLLED_SENTINEL, 1
+        args, armed_mailbox(branch, capacity), HALF_POLLED_SENTINEL, 1
     )
-    # Past the ceiling is refused, never handed to Triton.
-    wide = torch.cat([stream] * 65)[: MAX_ROWS + 1]
-    wide_mailbox = armed_blocks(
-        torch.cat([branch] * 65)[: MAX_ROWS + 1], MAX_ROWS + 1, blocks
-    )
-    with pytest.raises(ValueError, match="cluster boundary"):
-        post_norm_residual_pre_norm(
-            wide, wide_mailbox, *args[2:], True, HALF_POLLED_SENTINEL, 1
-        )
-    # The producer asks before publishing; 4096 channels leave no whole word per thread.
-    assert boundary_gathers_mailbox(MAX_ROWS, WIDTH, 1)
-    assert not boundary_gathers_mailbox(MAX_ROWS + 1, WIDTH, 1)
+    # The producer asks before publishing: past the ceiling a gather, never a reduction.
+    assert boundary_gathers_mailbox(MAX_ROWS + 1, WIDTH, 1)
+    assert not boundary_gathers_mailbox(MAX_ROWS + 1, WIDTH, 4)
+    # 4096 channels leave no whole word per thread.
     assert not boundary_gathers_mailbox(1, 4096, 1)
 
 

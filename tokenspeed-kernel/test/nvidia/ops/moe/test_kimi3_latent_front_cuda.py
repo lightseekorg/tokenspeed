@@ -36,7 +36,7 @@ from tokenspeed_kernel.thirdparty.cuda import kimi3_latent_front
 @pytest.fixture(scope="module")
 def weights():
     if not (current_platform().is_nvidia and kimi3_latent_front.available()):
-        pytest.skip("requires an SM100/SM103 part with 148 or 152 SMs")
+        pytest.skip("requires an SM100/SM103 device")
     torch.manual_seed(621)
     return tuple(
         (torch.randn(rows, 7168, device="cuda") / math.sqrt(7168)).bfloat16()

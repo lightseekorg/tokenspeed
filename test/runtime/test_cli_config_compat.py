@@ -406,10 +406,10 @@ class TestCLIConfigCompat:
                         if role == "decode":
                             argv.append("--disable-prefix-caching")
                         sa = self._from_cli_args_no_init(self._parse_args(argv))
-                        # resolve_cache derives the retraction snapshot request
-                        # cap from max_num_seqs per attention-DP rank, so the
-                        # mapping must be resolved first, as in __post_init__.
+                        # Resolve rank-local execution capacity and decode extra
+                        # slots before sizing snapshots, as in __post_init__.
                         sa.resolve_parallelism()
+                        sa.resolve_memory_and_scheduling()
                         sa.resolve_cache()
 
                         assert (sa.enable_kvstore) == (

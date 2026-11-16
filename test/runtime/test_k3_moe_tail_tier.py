@@ -233,11 +233,12 @@ def test_routed_implementations_use_same_second_stage(monkeypatch, enabled, defe
     torch.testing.assert_close(result, reduced, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("injected", [False, True])
 @pytest.mark.parametrize(
     "m,use_multimem",
     [(256, False), (512, False), (1024, False), (1025, True), (8193, True)],
 )
-def test_up_proj_inject_ar_selects_collective(monkeypatch, m, use_multimem):
+def test_up_proj_inject_ar_selects_collective(monkeypatch, m, use_multimem, injected):
     comm = _comm(enabled=False, capacity=16384, deferred=False)
     comm.hidden_size = 16
     comm.mapping = Mapping(
@@ -265,7 +266,12 @@ def test_up_proj_inject_ar_selects_collective(monkeypatch, m, use_multimem):
     monkeypatch.setattr(mod, "all_reduce", ordinary)
     monkeypatch.setattr(mod, "multimem_stage", stage)
     monkeypatch.setattr(mod, "multimem_all_reduce_staged", multimem)
-    output = comm.up_proj_inject_ar(latent, shared, residual)
+    if injected:
+        # The shared branch adds the residual; the tail must not add it again.
+        comm.inject_residual(shared, residual)
+        assert torch.all(shared[:, 4:6] == 4)
+        assert torch.all(shared[:, :4] == 1) and torch.all(shared[:, 6:] == 1)
+    output = comm.up_proj_inject_ar(latent, shared, None if injected else residual)
     if use_multimem:
         ordinary.assert_not_called()
         stage.assert_called_once()
@@ -278,3 +284,17 @@ def test_up_proj_inject_ar_selects_collective(monkeypatch, m, use_multimem):
         multimem.assert_not_called()
         stage.assert_not_called()
     torch.testing.assert_close(output, torch.full_like(output, 21), rtol=0, atol=0)
+
+
+def test_one_rank_tail_keeps_the_residual_in_add3():
+    comm = _comm(enabled=False, capacity=16384, deferred=False)
+    comm.mapping = SimpleNamespace(moe=SimpleNamespace(tp_ep_size=1))
+    comm.up_proj = SimpleNamespace(forward_add3=Mock())
+    latent = torch.ones(64, 3, dtype=torch.bfloat16)
+    shared = torch.ones(64, 16, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="add3"):
+        comm.inject_residual(shared, torch.ones_like(shared))
+    with pytest.raises(ValueError, match="add3"):
+        comm.up_proj_inject_ar(latent, shared, None)
+    comm.up_proj.forward_add3.assert_not_called()
+    assert torch.all(shared == 1)

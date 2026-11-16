@@ -119,6 +119,7 @@ def _scheduler(ts, make_config, *, in_forward: bool):
             num_device_pages=65,
             max_scheduled_tokens=BUDGET,
             max_batch_size=4,
+            max_resident_requests=4,
             prefix_granularity=PAGE,
             num_host_pages=0,
             disable_l2_cache=True,

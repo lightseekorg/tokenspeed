@@ -337,9 +337,11 @@ the subgroup's largest physical token count. The runtime prepares communication
 buffers before CUDA-graph capture and reuses them across layers. Shared
 experts use separate buffers. Shared AllGather finishes before routed
 dispatch, shared GEMMs finish before routed BMM, and shared ReduceScatter
-runs after dispatch and before combine. The runtime selects optimized
-collectives for supported shapes and topologies, with generic collective
-fallbacks otherwise. Place each subgroup
+runs after dispatch and before combine. With MegaMoE, shared ReduceScatter
+instead follows its fused dispatch/BMM/combine kernel and overlaps the routed
+norm and local up-projection. Native collectives cover the configured decode
+batch bound including speculative tokens; larger batches retain NCCL.
+Place each subgroup
 on a CUDA-IPC-accessible node to use the optimized paths.
 
 TP4 reduces the selected weights to approximately one quarter per GPU, not
@@ -1078,6 +1080,8 @@ Before benchmarking:
 `N` immutable expert shards and fetches remote weights while executing its own
 batch. Execution remains TP1/EP1; attention DP still identifies the serving
 workers. Omitting the option keeps resident expert weights.
+
+DWDP requires the CUDA 13 toolkit.
 
 The initial K3 NVFP4 configuration requires `--attn-tp-size 1 --moe-tp-size 1
 --ep-size 1 --all2all-backend none`, `--disaggregation-mode prefill`,

@@ -852,6 +852,8 @@ class TestCudaGraphSamplingVariants:
 
         backend = FakeSamplingBackend()
         wrapper = object.__new__(ForwardStepRunner)
+        wrapper.drafter = None
+        wrapper._decode_query_tokens = None
         wrapper.sampling_backend = backend
         wrapper.max_tokens_per_req = 4
         wrapper.graphs = {
@@ -859,7 +861,7 @@ class TestCudaGraphSamplingVariants:
             (CUDA_GRAPH_VARIANT_TRITON_VERIFY_NO_FILTER, 8): object(),
         }
 
-        assert (wrapper._cuda_graph_capture_variants()) == (
+        assert (wrapper._cuda_graph_capture_variants(bs=1)) == (
             (
                 CUDA_GRAPH_VARIANT_DEFAULT,
                 CUDA_GRAPH_VARIANT_TRITON_VERIFY_NO_FILTER,

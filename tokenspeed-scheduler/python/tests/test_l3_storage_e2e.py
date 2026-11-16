@@ -35,6 +35,7 @@ def config(*, host=32, grain=2, groups=None):
     c.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteThrough
     c.max_scheduled_tokens = 64
     c.max_batch_size = 8
+    c.max_resident_requests = c.max_batch_size
     c.enable_l3_storage = True
     c.storage_config = ts.StorageConfig(
         8,
@@ -331,6 +332,7 @@ def test_l3_preparation_with_no_free_request_slot():
         host=32, grain=2, groups=[group("full", 2, ts.AttnKind.Full, window=None)]
     )
     c.max_batch_size = 1
+    c.max_resident_requests = c.max_batch_size
     c.enable_mixed_prefill_decode = False
     c.disable_prefix_cache = False
     s = start(c)
