@@ -18,8 +18,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Projected index inputs whose preprocessing is fused into their consumer,
-and selection outputs their producer can resolve in the same launch."""
+"""Index inputs and outputs that a kernel prepares or resolves in its launch.
+
+Projected index inputs have their preprocessing fused into their consumer;
+selection outputs are resolved by their producer in the same launch.
+"""
 
 from __future__ import annotations
 
