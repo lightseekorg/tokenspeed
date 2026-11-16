@@ -217,6 +217,33 @@ class CommBackend(ABC):
             "This backend does not support mHC communication fusion"
         )
 
+    def supports_all_reduce_sconv(
+        self, x: torch.Tensor, weight: torch.Tensor, group: Group
+    ) -> bool:
+        """Whether the group can all-reduce the anticipated x and hand the sum
+        to the decode ring convolution with taps ``weight`` early."""
+        return False
+
+    def all_reduce_sconv(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        ring: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        seq_idx: torch.Tensor,
+        cache_indices: torch.Tensor,
+        has_initial_state: torch.Tensor,
+        seq_lens: torch.Tensor,
+        block_table: torch.Tensor,
+        checkpoint: torch.Tensor,
+        output_scale: float,
+        group: Group,
+    ) -> torch.Tensor:
+        """Execute admitted fusion; return the convolution output or raise."""
+        raise NotImplementedError(
+            "This backend does not support the all-reduce convolution fusion"
+        )
+
     def prepare_all_reduce_lane(self, group: Group, hidden_dim: int) -> bool:
         """Prepare an implementation-specific one-shot lane when supported."""
 
@@ -304,6 +331,50 @@ class CommBackend(ABC):
         if not shapes:
             raise ValueError("all-reduce requires at least one output")
         return tuple(like.new_empty(shape) for shape in shapes)
+
+    def acquire_exchange_input(
+        self, nbytes: int, like: torch.Tensor, group: Group
+    ) -> torch.Tensor:
+        """Acquire ``nbytes`` (uint8) for a producer to fill and a later
+        ``all_gather_single``, even ``all_to_all_single`` or
+        ``try_combine_records`` over ``group`` to send.
+
+        A backend that pulls inputs in place lends its storage, which the
+        next such exchange's producer may overwrite. Every rank of ``group``
+        asks for the same size.
+
+        Args:
+            nbytes: Size of the input.
+            like: Tensor providing the device for ordinary allocations.
+            group: Global ranks of the exchange.
+        """
+        return torch.empty((nbytes,), dtype=torch.uint8, device=like.device)
+
+    def try_combine_records(
+        self,
+        records: torch.Tensor,
+        group: Group,
+        *,
+        head_dim: int,
+        partial_dtype: torch.dtype,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor | None:
+        """Exchange DCP attention ``records`` to their head owners and combine
+        this rank's in one step, bit for bit what an even
+        ``all_to_all_single`` and ``combine_dcp_attention_partials`` give, as
+        contiguous ``[tokens, local_heads, head_dim]`` of ``output_dtype``; or
+        return None for the caller to run those. Every rank of ``group``
+        decides alike.
+
+        Args:
+            records: Contiguous int32 ``[len(group), tokens, local_heads,
+                words + 1]``: row ``r`` goes to group rank ``r``.
+            group: Global ranks of the exchange.
+            head_dim: Unpadded partial head dimension.
+            partial_dtype: The dtype the records pack.
+            output_dtype: The combined output's dtype.
+        """
+        return None
 
     @abstractmethod
     def all_gather(

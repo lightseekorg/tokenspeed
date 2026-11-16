@@ -147,3 +147,11 @@ Model plugins use these common operations through the state backend.
 Prefill source/destination index slices are runtime metadata. Both gather and
 scatter kernels ignore their pointer alignment when choosing a specialization,
 so moving a slice within a request-index buffer does not compile another kernel.
+
+## Head cache page strides
+
+`store_kv_cache` accepts dense token-row destinations and page-major
+`[pages, rows, heads, dim]` destinations. Page-major fields may share a plane:
+a slot resolves to its page at the field's page stride, then its row at the
+row stride. K and V keep separate pointers and strides so sibling fields
+and padding remain untouched.

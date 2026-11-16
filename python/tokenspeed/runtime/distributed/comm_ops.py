@@ -299,6 +299,57 @@ def all_reduce(
     return backend.all_reduce(tensor, group, op=op)
 
 
+def supports_all_reduce_sconv(
+    x: torch.Tensor, weight: torch.Tensor, group: Group
+) -> bool:
+    """Select ``all_reduce_sconv`` before scheduling the producer's all-reduce.
+
+    x describes the producer's anticipated ``[T, H]`` partial (shape, dtype,
+    device, contiguity) and weight the convolution's ``[H, W]`` taps; no
+    values are read. The backend configuration and its workspace stay fixed
+    between this query and execution.
+    """
+    return get_global_backend().supports_all_reduce_sconv(x, weight, group)
+
+
+def all_reduce_sconv(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    ring: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    seq_idx: torch.Tensor,
+    cache_indices: torch.Tensor,
+    has_initial_state: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    checkpoint: torch.Tensor,
+    output_scale: float,
+    group: Group,
+) -> torch.Tensor:
+    """Execute fusion selected by ``supports_all_reduce_sconv``: sum this
+    rank's ``[T, H]`` partial x over group and convolve the sum as
+    ``inkling_ring_sconv``'s decode kernel does (static taps, residual, no
+    activation or live publish), updating the ring. The all-reduce releases
+    the convolution before it ends, so the convolution's cold reads of its
+    taps, ring and routing run under it. Returns the ``[T, H]`` convolution,
+    bit for bit the all-reduce followed by the convolution.
+    """
+    return get_global_backend().all_reduce_sconv(
+        x,
+        weight,
+        ring,
+        cu_seqlens,
+        seq_idx,
+        cache_indices,
+        has_initial_state,
+        seq_lens,
+        block_table,
+        checkpoint,
+        output_scale,
+        group,
+    )
+
+
 def supports_all_reduce_mhc_norm(
     x: torch.Tensor, norm_weight: torch.Tensor, group: Group
 ) -> bool:
@@ -482,6 +533,49 @@ def acquire_all_reduce_outputs(
     if backend is None:
         backend = get_global_backend()
     return backend.acquire_all_reduce_outputs(shapes, like, group, op=op)
+
+
+def acquire_exchange_input(
+    nbytes: int,
+    like: torch.Tensor,
+    group: Group,
+    backend: CommBackend | None = None,
+) -> torch.Tensor:
+    """Acquire ``nbytes`` (uint8) for a producer to fill, then send with
+    :func:`all_gather_single`, an even :func:`all_to_all_single` or
+    :func:`try_combine_records`. Launches nothing.
+
+    A backend that pulls inputs in place lends its storage, which the next
+    such exchange's producer may overwrite: fill and exchange it before
+    acquiring again. Every rank of ``group`` asks for the same size.
+    """
+    if backend is None:
+        backend = get_global_backend()
+    return backend.acquire_exchange_input(nbytes, like, group)
+
+
+def try_combine_records(
+    records: torch.Tensor,
+    group: Group,
+    *,
+    head_dim: int,
+    partial_dtype: torch.dtype,
+    output_dtype: torch.dtype,
+    backend: CommBackend | None = None,
+) -> torch.Tensor | None:
+    """Exchange DCP attention ``records`` (int32 ``[len(group), tokens,
+    local_heads, words + 1]``, row ``r`` for group rank ``r``) and combine
+    this rank's in one step, as ``CommBackend.try_combine_records``; None
+    where the backend has no such step."""
+    if backend is None:
+        backend = get_global_backend()
+    return backend.try_combine_records(
+        records,
+        group,
+        head_dim=head_dim,
+        partial_dtype=partial_dtype,
+        output_dtype=output_dtype,
+    )
 
 
 def all_gather(

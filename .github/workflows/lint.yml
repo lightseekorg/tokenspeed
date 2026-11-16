@@ -91,6 +91,9 @@ jobs:
           python -m pip install "pytest>=9" packaging cryptography pyyaml
           python -m pytest -q test/ci_system/test_weekly_release.py test/ci_system/test_engine_release.py test/ci_system/test_nightly_release.py
 
+      - name: Check CI path filter and MI450 report digest
+        run: python -m pytest -q test/ci_system/test_ci_path_filter.py test/ci_system/test_mi450_sim_report_digest.py
+
       - name: Install scheduler C++ lint tools
         if: steps.scheduler_cpp_changes.outputs.changed == 'true'
         run: |

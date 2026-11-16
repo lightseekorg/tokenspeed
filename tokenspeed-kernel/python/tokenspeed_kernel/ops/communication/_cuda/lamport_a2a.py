@@ -52,6 +52,9 @@ class TokenSpeedA2ALamportState:
     """
 
     def __init__(self, group, max_rows, channels, device, blocks):
+        # The finalizer also runs if setup fails partway through.
+        self.handle = self.chunk_handle = self.chunk_flag_handle = None
+
         from tokenspeed_kernel.thirdparty.flashinfer.jit import build_cuda_module
 
         contracts = [None] * group.size()
@@ -87,8 +90,8 @@ class TokenSpeedA2ALamportState:
         self.blocks = blocks
         self.words = max_rows * channels // 2
         self.chunk_threshold_bytes = None
-        self.chunk_scratch = self.chunk_handle = self.chunk_peers = None
-        self.chunk_flags = self.chunk_flag_handle = self.chunk_flag_peers = None
+        self.chunk_scratch = self.chunk_peers = None
+        self.chunk_flags = self.chunk_flag_peers = None
         self.chunk_control = self.chunk_module = None
         self.fp8_output = self.fp8_scales = None
         self.chunk_capacity = self.words // 2
@@ -118,6 +121,13 @@ class TokenSpeedA2ALamportState:
         )
         torch.cuda.synchronize(device)
         dist.barrier(group=group)
+
+    def __del__(self) -> None:
+        # Keep scratch tensors alive while PyTorch drops the peer mappings.
+        # Freeing scratch first can abort during multicast unbind in Torch 2.9.
+        self.handle = None
+        self.chunk_handle = None
+        self.chunk_flag_handle = None
 
     def prepare_fp8_quantization(self):
         """Allocate borrowed FP8 values and MN-major FP32 scales before capture.

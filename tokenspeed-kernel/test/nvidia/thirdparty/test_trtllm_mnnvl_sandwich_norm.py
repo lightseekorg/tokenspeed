@@ -342,6 +342,28 @@ def test_rows_do_not_depend_on_the_batch_or_the_strategy(hidden):
         )
 
 
+def test_a_call_above_the_workspace_matches_its_slices():
+    """A call of more rows than the workspace holds runs as launches of its row
+    slices and gives each row the bits of that slice's own call."""
+    rank, dev = _armed()
+    tokens = 2 * MAX_TOKENS + 5
+    x, residual, post, weight = _inputs(rank, dev, tokens, 4096, "heavy", seed=7)
+    whole = _fused(x, residual, post, weight, rank, SCALE_PAIRS[0])
+    assert whole is not None
+    for start in range(0, tokens, MAX_TOKENS):
+        sl = slice(start, min(tokens, start + MAX_TOKENS))
+        part = _fused(
+            x[sl].contiguous(),
+            residual[sl].contiguous(),
+            post,
+            weight,
+            rank,
+            SCALE_PAIRS[0],
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(part[0], whole[0][sl]) and torch.equal(part[1], whole[1][sl])
+
+
 def test_graph_replays_match_eager():
     rank, dev = _armed()
     hidden, tokens = 4096, 8
@@ -398,8 +420,6 @@ def test_early_pdl_release_gives_the_same_bits(tokens, pdl):
 def test_calls_the_kernel_cannot_serve_return_none():
     rank, dev = _armed()
     x, residual, post, weight = _inputs(rank, dev, 4, 2880, "normal")
-    assert _fused(x, residual, post, weight, rank, (None, None)) is None
-    x, residual, post, weight = _inputs(rank, dev, MAX_TOKENS + 1, 2048, "normal")
     assert _fused(x, residual, post, weight, rank, (None, None)) is None
 
 

@@ -28,6 +28,7 @@ from __future__ import annotations
 import torch as _torch
 from tokenspeed_kernel.ops.sampling.logprob import blockwise_logprobs
 from tokenspeed_kernel.ops.sampling.positions import prepare_sampling_offsets
+from tokenspeed_kernel.ops.sampling.synthetic import write_synthetic_verify_outputs
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -48,6 +49,7 @@ __all__ = [
     "vocab_shard_topk_supports",
     "vocab_topk_merge",
     "vocab_topk_merge_supports",
+    "write_synthetic_verify_outputs",
 ]
 
 _SUPPORTED_DTYPES = (_torch.float16, _torch.bfloat16, _torch.float32)

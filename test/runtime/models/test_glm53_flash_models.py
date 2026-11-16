@@ -39,6 +39,7 @@ from tokenspeed.runtime.models.glm53_flash_nextn import (
     Glm53FlashForConditionalGenerationNextN,
 )
 from tokenspeed.runtime.multimodal.inputs import Modality
+from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
@@ -235,6 +236,7 @@ def test_glm53_flash_decode_topk_skips_only_overwritten_workspace_fills(
         num_tokens=4,
         num_decode_tokens=num_decode_tokens,
         topk=12,
+        query_rider=None,
     )
 
     assert captured["fill_value"] == expected_fill_value
@@ -445,6 +447,9 @@ def test_text_and_nextn_model_hierarchies(monkeypatch) -> None:
     assert causal.model.layers[0].is_kda_layer
     assert not causal.model.layers[3].is_kda_layer
     assert isinstance(nextn.model.decoder.self_attn, Glm53FlashAttention)
+    # The DSA mixin's host contract: a decode top-k fork, here on one stream.
+    fork = nextn.model.decoder.self_attn.decode_topk_fork
+    assert isinstance(fork, StreamFork) and fork.aux_stream is None
     assert isinstance(nextn.model.decoder.mlp, Glm53FlashMoE)
     assert not nextn.model.decoder.mhc
     assert (

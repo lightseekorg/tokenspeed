@@ -56,6 +56,11 @@ public:
     std::size_t NumNegativeKeys() const { return negative_.size(); }
     std::size_t NumBackupCandidates() const { return backup_candidates_.size(); }
     bool IsNegative(const CacheKey& key) const { return negative_.contains(key); }
+    // Historical successful, replica-agreed, retired PUT/accepted GET receipts. They
+    // do not pin Host memory or guarantee residence after external eviction.
+    bool WasPublished(const CacheKey& key) const { return published_.contains(key); }
+    std::size_t NumPublishedKeys() const { return published_.size(); }
+    std::uint64_t PublicationEpoch() const { return publication_epoch_; }
     // Returns an empty lease when nothing was started.
     StorageLease StartQuery(std::vector<CacheKey> keys, std::vector<std::int32_t> key_tokens);
     bool Completed(std::uint64_t id) const;
@@ -92,6 +97,7 @@ private:
     // What dropping the operation's lease does.
     void detach(std::uint64_t id) noexcept;
     void rememberNegative(const CacheKey& key);
+    void rememberPublished(const CacheKey& key);
     std::size_t availableHostCredits() const;
     CacheCoordinator& coordinator_;
     StorageConfig config_;
@@ -99,6 +105,9 @@ private:
     std::deque<CacheKey> backup_candidates_;
     std::unordered_set<CacheKey, CacheKeyHash> negative_;
     std::deque<CacheKey> negative_order_;
+    std::unordered_set<CacheKey, CacheKeyHash> published_;
+    std::deque<CacheKey> published_order_;
+    std::uint64_t publication_epoch_{1};
     std::vector<StorageOperation> commands_;
     std::uint64_t next_id_{1};
     bool pressure_gate_closed_{false};

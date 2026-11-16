@@ -65,8 +65,7 @@ and the walk from the root accepts the child holding its parent's draw
 sampled tree's draft q is not read, so each child is accepted at its target
 probability. The trees read whole rows, gathering a vocabulary shard.
 
-Not yet supported: DP-sampling, top-k output logprobs, EAGLE3 ``d2t``
-cross-vocab.
+Not yet supported: DP-sampling, top-k output logprobs.
 
 The kernels and indicator bits are sonic-sampler's, vendored in
 ``tokenspeed_kernel.thirdparty.sonic_sampler``; ``tokenspeed_kernel.ops.sampling.sonic``

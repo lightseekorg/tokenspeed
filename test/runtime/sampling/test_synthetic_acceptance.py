@@ -235,7 +235,7 @@ def test_greedy_verify_and_cuda_graph_replay(al, natural_length):
         params.append(sp)
 
     def prepare():
-        backend.prepare_step(rids, list(range(5)), params, 4)
+        backend.prepare_step(list(range(1, len(rids) + 1)), list(range(5)), params, 4)
         if al is not None:
             backend.limit_synthetic_acceptance(
                 torch.tensor([True, False, False, False], device="cuda"), 1

@@ -50,6 +50,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.ownership import (
     pipeline_cache_ownership,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+    FLAT_KV_PLANE,
     CacheFieldSpec,
     cache_dtype_name,
     pack,
@@ -128,12 +129,16 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
         self, layer_id: int, group_id: str, occurrence: int
     ) -> tuple[CacheFieldSpec, ...]:
         fields = super().fields_for_layer(layer_id, group_id, occurrence)
-        if not self._flat_kv or self.layer_types[layer_id] != FULL_ATTENTION:
+        if (
+            not self._flat_kv
+            or layer_id >= len(self.target_layer_types)
+            or self.layer_types[layer_id] != FULL_ATTENTION
+        ):
             return fields
         # The pool exposes each field through a contiguous atom-row view. The
         # router folds this plane's larger page stride into its atom-page IDs.
         return tuple(
-            replace(field, plane_id="flatkv", exact_page_stride=False)
+            replace(field, plane_id=FLAT_KV_PLANE, exact_page_stride=False)
             for field in fields
         )
 

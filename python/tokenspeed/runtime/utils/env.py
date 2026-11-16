@@ -29,6 +29,7 @@ from tokenspeed.runtime.utils.server_args import ServerArgs
 
 global_server_args_dict: dict = {
     "model": None,
+    "enable_memory_saver": ServerArgs.enable_memory_saver,
     "revision": None,
     "disaggregation_mode": ServerArgs.disaggregation_mode,
     "attention_backend": ServerArgs.attention_backend,
@@ -40,6 +41,12 @@ global_server_args_dict: dict = {
     "engram_host_table": ServerArgs.engram_host_table,
     "engram_host_table_dir": ServerArgs.engram_host_table_dir,
     "engram_host_table_layout": ServerArgs.engram_host_table_layout,
+    "engram_host_table_alloc": ServerArgs.engram_host_table_alloc,
+    "engram_host_table_numa": ServerArgs.engram_host_table_numa,
+    "decode_monokernel": ServerArgs.decode_monokernel,
+    "monokernel_stuck_record_dir": ServerArgs.monokernel_stuck_record_dir,
+    "speculative_algorithm": ServerArgs.speculative_algorithm,
+    "drafter_attention_backend": ServerArgs.drafter_attention_backend,
     "kv_cache_dtype": ServerArgs.kv_cache_dtype,
     "enable_nan_detection": ServerArgs.enable_nan_detection,
     "mapping": ServerArgs.mapping,
@@ -57,6 +64,7 @@ global_server_args_dict: dict = {
     "logprob_order": ServerArgs.logprob_order,
     "moe_combine_order": ServerArgs.moe_combine_order,
     "dsa_slot_order": ServerArgs.dsa_slot_order,
+    "dsa_index_k_format": ServerArgs.dsa_index_k_format,
     "tp_batch_invariant": ServerArgs.tp_batch_invariant,
     "head_tp_exchange_max_rows": ServerArgs.head_tp_exchange_max_rows,
     "low_latency_max_num_tokens_per_gpu": ServerArgs.low_latency_max_num_tokens_per_gpu,
@@ -83,6 +91,7 @@ global_server_args_dict: dict = {
     "moe_cutlass_fused_finalize": ServerArgs.moe_cutlass_fused_finalize,
     "moe_mxfp4_fp8_activation": ServerArgs.moe_mxfp4_fp8_activation,
     "dense_gemm_backend": ServerArgs.dense_gemm_backend,
+    "enable_fp8_attn_proj": ServerArgs.enable_fp8_attn_proj,
     "enforce_eager": ServerArgs.enforce_eager,
     "max_cudagraph_capture_size": ServerArgs.max_cudagraph_capture_size,
     "cudagraph_capture_sizes": ServerArgs.cudagraph_capture_sizes,
@@ -95,10 +104,12 @@ global_server_args_dict: dict = {
 
 
 def global_server_args_dict_update(server_args: ServerArgs):
+    """Expose native server settings to process-local runtime consumers."""
     pdl_enabled(not server_args.disable_pdl)
     global_server_args_dict.update(
         {
             "model": server_args.model,
+            "enable_memory_saver": server_args.enable_memory_saver,
             "revision": server_args.revision,
             "disaggregation_mode": server_args.disaggregation_mode,
             "attention_backend": server_args.attention_backend,
@@ -110,6 +121,10 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "engram_host_table": server_args.engram_host_table,
             "engram_host_table_dir": server_args.engram_host_table_dir,
             "engram_host_table_layout": server_args.engram_host_table_layout,
+            "engram_host_table_alloc": server_args.engram_host_table_alloc,
+            "engram_host_table_numa": server_args.engram_host_table_numa,
+            "decode_monokernel": server_args.decode_monokernel,
+            "monokernel_stuck_record_dir": server_args.monokernel_stuck_record_dir,
             "kv_cache_dtype": server_args.kv_cache_dtype,
             "enable_nan_detection": server_args.enable_nan_detection,
             "mapping": server_args.mapping,
@@ -127,12 +142,14 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "logprob_order": server_args.logprob_order,
             "moe_combine_order": server_args.moe_combine_order,
             "dsa_slot_order": server_args.dsa_slot_order,
+            "dsa_index_k_format": server_args.dsa_index_k_format,
             "tp_batch_invariant": server_args.tp_batch_invariant,
             "head_tp_exchange_max_rows": server_args.head_tp_exchange_max_rows,
             "low_latency_max_num_tokens_per_gpu": server_args.low_latency_max_num_tokens_per_gpu,
             "device": server_args.device,
             "draft_model_path_use_base": server_args.draft_model_path_use_base,
             "speculative_algorithm": server_args.speculative_algorithm,
+            "drafter_attention_backend": server_args.drafter_attention_backend,
             "speculative_num_draft_tokens": server_args.speculative_num_draft_tokens,
             "disable_pdl": server_args.disable_pdl,
             "disable_autotune": server_args.disable_autotune,
@@ -155,6 +172,7 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "moe_cutlass_fused_finalize": server_args.moe_cutlass_fused_finalize,
             "moe_mxfp4_fp8_activation": server_args.moe_mxfp4_fp8_activation,
             "dense_gemm_backend": server_args.dense_gemm_backend,
+            "enable_fp8_attn_proj": server_args.enable_fp8_attn_proj,
             "enforce_eager": server_args.enforce_eager,
             "max_cudagraph_capture_size": server_args.max_cudagraph_capture_size,
             "cudagraph_capture_sizes": server_args.cudagraph_capture_sizes,

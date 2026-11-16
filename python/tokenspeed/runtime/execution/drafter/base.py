@@ -58,6 +58,15 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 
+# Extend-round graph series: the decode steps after step 0.
+EXTEND_DECODE_SERIES = "prefill:drafter-decode"
+# A split extend round's draft K/V writer, one graph over a fixed tile of rows.
+EXTEND_KV_SERIES = "prefill:drafter-kv"
+EXTEND_KV_TILE_ROWS = 2048
+# Rounds admit a few requests each; one with more runs its decode steps eager.
+EXTEND_DECODE_MAX_REQUESTS = 16
+
+
 @dataclass(frozen=True)
 class DrafterExtendCapture:
     """What a drafter's extend-graph capture borrows from the executor."""
@@ -148,6 +157,14 @@ class BaseDrafter:
     def set_cache_pool(self, token_to_kv_pool: CachePool | None) -> None:
         """Take a replacement pool; a drafter that caches views rebuilds them."""
         self.token_to_kv_pool = token_to_kv_pool
+
+    def warmup_extend(self, num_tokens: int) -> None:
+        """Compile the draft's work for an extend of ``num_tokens`` tokens.
+
+        The startup's dummy extends drive the target model only, so a drafter
+        whose extend runs draft kernels runs them here, on every rank alike,
+        inside ``kernel_warmup``. The default has none.
+        """
 
     def bind_sampling_backend(self, sampling_backend: SamplingBackend) -> None:
         """Take the verifier's per-request sampling pools for sampled drafting.
@@ -354,12 +371,9 @@ class BaseDrafter:
         """
 
     def extend_graph_plan(
-        self,
-        token_buckets: Sequence[int],
-        request_counts: Callable[[int], Sequence[int]],
+        self, token_buckets: Sequence[int]
     ) -> dict[str, list[tuple[int, int]]]:
-        """Every entry ``capture_extend_graphs`` measures, per memory-projection
-        series (``--enable-drafter-prefill-graph``).
+        """Each entry ``capture_extend_graphs`` can measure, per projection series.
 
         The one channel between that capture and the CUDA-graph memory
         projection, which prices exactly these entries: a series lists its
@@ -367,13 +381,12 @@ class BaseDrafter:
 
         Args:
             token_buckets: The target's prefill token buckets.
-            request_counts: The exact request counts to capture at a bucket.
 
         Returns:
             Series name -> entries; empty for a drafter without extend graphs
             or in a configuration they cannot bake.
         """
-        del token_buckets, request_counts
+        del token_buckets
         return {}
 
     def release_extend_graphs(self) -> None:
@@ -415,18 +428,16 @@ class BaseDrafter:
         return slot_state_image_bytes(self.slot_state_rows(0))
 
     def export_slot_state(
-        self, slot: int, out: torch.Tensor, stream, *, request_id: str
+        self, slot: int, out: torch.Tensor, stream, *, admission_id: int
     ) -> None:
-        # The default rows are rewritten by every forward of the slot, never
-        # keyed by request; a drafter that keys them (DSpark) overrides both
-        # copies to image the prepared marker (``slot_state.py``).
-        del request_id
+        # The default exporter copies slot rows without a prepared marker.
+        del admission_id
         pack_slot_rows(self.slot_state_rows(slot), out, stream)
 
     def import_slot_state(
-        self, slot: int, src: torch.Tensor, stream, *, request_id: str
+        self, slot: int, src: torch.Tensor, stream, *, admission_id: int
     ) -> None:
-        del request_id
+        del admission_id
         unpack_slot_rows(self.slot_state_rows(slot), src, stream)
 
     @abstractmethod

@@ -1829,7 +1829,7 @@ def test_grouped_moe_block_m_selection_gfx950(
 
 @pytest.mark.parametrize("block_m", [16, 32, 64])
 @pytest.mark.parametrize(
-    "num_tokens,num_experts", [(65, 16), (72, 64), (160, 16), (2048, 16), (2049, 16)]
+    "num_tokens,num_experts", [(193, 16), (200, 64), (320, 16), (2048, 16), (2049, 16)]
 )
 def test_tp_situ_package_prefill_tiles_match_block128_gfx950(
     monkeypatch: pytest.MonkeyPatch,
@@ -2014,7 +2014,7 @@ def test_tp_situ_package_prefill_accepts_prequantized_row_shards_gfx950(
 
 
 @pytest.mark.parametrize(
-    "num_tokens,num_experts,block_m", [(2049, 16, 64), (300, 64, 16), (160, 64, 32)]
+    "num_tokens,num_experts,block_m", [(2049, 16, 64), (300, 64, 16), (320, 64, 32)]
 )
 def test_tp_situ_package_prefill_xcd_tile_order_is_exact_gfx950(
     monkeypatch: pytest.MonkeyPatch,
@@ -2735,9 +2735,8 @@ def test_sorted_situ_dispatch_and_compilation_gfx950(monkeypatch, intermediate_s
         generator=generator,
     )
     preprocess_gluon_mxfp4_gfx950_moe_weights({}, module, preshuffle=True)
-    # Exercise the low-level sorted kernels at changing M beyond the production
-    # dispatch bound, which admits M from 8 through 64.
-    monkeypatch.setattr(moe, "_SITU_WARP_DECODE_MAX_M", 130)
+    # Exercise the low-level sorted kernels at changing M within the production
+    # dispatch bound, which admits M from 8 through 192.
     if intermediate_size != 384:
 
         class UnexpectedSortedKernel:
@@ -2782,14 +2781,17 @@ def test_sorted_situ_dispatch_and_compilation_gfx950(monkeypatch, intermediate_s
 
     run(64)
     if intermediate_size == 384:
-        run(65)
+        # Stage 2 narrows its W2 tile through _A8W4_SORTED_STAGE2_NARROW_MAX_M
+        # tokens; warm both tiles at aligned and unaligned M.
+        for tokens in (65, 32, 33):
+            run(tokens)
         with ExitStack() as stack:
             for kernel in (
                 warp_decode._warp_decode_precomputed_situ_sorted_stage1_kernel,
                 warp_decode._warp_decode_sorted_stage2_fp8_mxfp4_kernel,
             ):
                 stack.enter_context(assert_no_triton_compile(kernel))
-            for tokens in (33, 48, 70, 97, 130):
+            for tokens in (17, 48, 49, 70, 97, 130):
                 run(tokens)
 
 
@@ -2995,7 +2997,7 @@ def test_tp_situ_prefill_warmup_covers_serving_rows_gfx950() -> None:
         if hasattr(kernel, "_do_compile")
     ]
     with assert_no_triton_compile(*kernels):
-        for rows in (65, 97, 128, 200, 255, 300, 513, 1000, 1500, 2047, 2049, 2600):
+        for rows in (193, 200, 255, 256, 300, 513, 1000, 1500, 2047, 2049, 2600):
             x = hidden[:rows]
             assert torch.isfinite(apply(x, rows)).all()
             assert torch.isfinite(apply(_quantize_mxfp4_activation(x), rows)).all()

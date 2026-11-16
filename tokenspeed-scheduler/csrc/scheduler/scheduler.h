@@ -149,6 +149,7 @@ public:
     static constexpr float kPrefillWatermark = 0.9F;
 
     void Advance(const ExecutionEvent& event);
+    KvEventBatch DrainKvEventBatch();
     std::vector<KvCacheEvent> DrainKvEvents();
     // Testing/control-plane operation. A successful return means the complete
     // Device L1 prefix cache was removed; Host L2 is never touched.
@@ -168,6 +169,14 @@ public:
     std::size_t StorageQuarantined() const { return storage_transfers_ ? storage_transfers_->NumQuarantined() : 0; }
     std::size_t StorageNegativeKeys() const { return storage_transfers_ ? storage_transfers_->NumNegativeKeys() : 0; }
     StorageStats GetStorageStats() const;
+    bool SharedPrefixStorageEnabled() const;
+    struct SharedPrefixPublication {
+        std::string status;
+        std::int32_t confirmed_prefix_tokens{0};
+        std::uint64_t cache_epoch{0};
+    };
+    SharedPrefixPublication GetSharedPrefixPublication(std::span<const std::int32_t> tokens,
+                                                       std::int32_t max_prefix_tokens) const;
 
     // Lifecycle counters read the current FSM state; they do not schedule work.
     std::size_t BootstrappingSize() const;
@@ -191,8 +200,9 @@ public:
     std::int32_t TotalRequestSlots() const { return req_pool_allocator_.Size(); }
     std::int32_t TotalLcmBlocks() const { return block_pool_.NumLcmBlocks(); }
     std::vector<std::int64_t> AdmissionCapacityCurve(std::int32_t token_step) const;
-    // Per-step gauges: empty parents are O(1), active parents walk the live
-    // requests' block tables. Parents resident only as cache are
+    // Per-step gauges, both O(1): the pool keeps its empty parents, the
+    // requests' block tables count the parents they hold as they change.
+    // Parents resident only as cache are
     // TotalLcmBlocks - EmptyLcmBlocks - ActiveLcmBlocks.
     std::int32_t EmptyLcmBlocks() const { return coordinator_.NumEmptyLcmBlocks(); }
     std::int32_t ActiveLcmBlocks() const;
@@ -221,6 +231,9 @@ public:
     std::int32_t HostPoolPinnedBlocks() const { return coordinator_.NumPinnedHostCachedBlocks(); }
     HostCacheStats GetHostCacheStats() const;
     std::size_t DemoteSession(const std::string& id, bool ended) { return coordinator_.DemoteSession(id, ended); }
+    std::size_t DemoteCacheGroups(const std::vector<std::string>& ids, bool ended) {
+        return coordinator_.DemoteCacheGroups(ids, ended);
+    }
     std::size_t DemoteSessions(const std::vector<std::string>& ids, bool ended) {
         return coordinator_.DemoteSessions(ids, ended);
     }
@@ -366,8 +379,9 @@ private:
         ExecutionPlan& plan, AdmissionFeedback& feedback, Request& request, StagedCacheProgress& staged,
         std::span<const GroupDemand> demands, const RequestProgress& progress,
         std::optional<CacheCoordinator::CopyInPoint> copy_in_point, bool evict_blocks_past_segments);
+    // Registers the descriptors of full pages [first_page, past_end_page).
     void registerKvEventPrefixPages(Request& request, std::span<const std::string> prefix_hashes,
-                                    std::int32_t first_page);
+                                    std::int32_t first_page, std::int32_t past_end_page);
     // The descriptors a publication mutates: its full pages from the first it
     // registers an entry under (CacheCoordinator::FirstPublishedPage) and, at
     // a tail, the partial page under its tail hash (token_ids = the rows below
@@ -713,7 +727,8 @@ private:
     // the runtime's arena, released by the FSM transition that drops the image.
     SnapshotSlotAllocator snapshot_slots_;
 
-    // Pools outlive every CacheBlockRef stored below.
+    // Pools outlive every CacheBlockRef stored below, and the coordinator
+    // every BlockTable it binds (the requests' tables, in requests_ below).
     BlockPool block_pool_;
     BlockPool host_pool_;
     BlockPool snapshot_pool_;
@@ -749,6 +764,9 @@ private:
     // prefill_decode_interval: reset by a prefill round, counted down by a
     // decode round. Derived from the plans alone, so mirrored ranks agree.
     std::int32_t prefill_deferral_rounds_left_{0};
+    // prefill_decode_min_interval: the same clock, but no overdue prompt
+    // suspends it.
+    std::int32_t prefill_min_rounds_left_{0};
 
     // Consecutive stalled rounds (trackStalledRounds); 0 after any round
     // that schedules work, leaves work in flight or aborts a request (the
@@ -769,9 +787,10 @@ private:
     // DrainKvEvents reconciles each marked boundary against its residency, so
     // the order of evictions and publications inside one admission does not
     // matter. After a drain, a descriptor exists exactly for the boundaries
-    // with a cached child.
+    // with any Device cached child, including State entries excluded from
+    // routing residency: their later mutations still need the descriptor.
     struct KvEventBoundary {
-        KvBlockStoredEvent stored;
+        KvEventDescriptorRef stored;
         // Position in the prefix chain (page index). Consumers resolve a
         // Stored event's parent_block_hash on receipt, so DrainKvEvents
         // orders each batch by depth rather than by mutation order.
@@ -784,6 +803,7 @@ private:
     // order the coordinator touches pages (evictions run suffix-first), so
     // this order carries no meaning; DrainKvEvents sorts the batch.
     std::vector<CacheKey> kv_event_boundaries_to_reconcile_;
+    KvEventPrefixView kv_event_prefix_view_;
 
     // SchedulerConfig::demote_superseded_state_checkpoints where it takes
     // effect (a model with State groups, outside the D role): what finishes

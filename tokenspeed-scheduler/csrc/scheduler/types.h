@@ -35,7 +35,8 @@ namespace tokenspeed {
 struct SchedulerConfig {
     std::int32_t prefix_granularity{};
     struct AllocatorConfig {
-        // Page 0 is the null placeholder, so usable = total - 1.
+        // Page 0 is the null placeholder, so usable = total - 1. Validate
+        // rejects a negative total_pages, which could wrap this.
         std::int32_t total_pages{};
         std::int32_t NumUsableBlocks() const { return total_pages - 1; }
     };
@@ -54,7 +55,8 @@ struct SchedulerConfig {
     // Test knob: every |N| plans the fused/D grammar retracts the oldest
     // quiescent Decoding request (N > 0) or the one Prefilling request
     // between its chunks (N < 0), bypassing ReserveCoversGeneration but not
-    // the image-fit refusal. 0 is off; non-zero requires a snapshot pool.
+    // the image-fit refusal. 0 is off; non-zero requires a snapshot pool;
+    // INT32_MIN, with no magnitude in int32, is rejected.
     // Lives here so every mirrored rank decides identically.
     std::int32_t debug_force_retraction_interval{0};
 
@@ -105,11 +107,15 @@ struct SchedulerConfig {
     bool disable_l2_cache{false};
     bool enable_l3_storage{false};
     std::optional<StorageConfig> storage_config;
+    // Device residency events require at least one continuous Full/history group.
     bool enable_kv_cache_events{false};
     bool enable_mixed_prefill_decode{false};
     // Fused role only: decode rounds owed after a local prefill round
     // (docs/design/scheduler.md §3.3). 0 is off.
     std::int32_t prefill_decode_interval{0};
+    // Fused role only: decode rounds every local prefill round owes even
+    // while an overdue prompt suspends the interval (§3.3). 0 is off.
+    std::int32_t prefill_decode_min_interval{0};
     // P and fused roles: rank new local prefills by work after Device/Host
     // prefix reuse, keeping stable ties and resident chunks first. Only the
     // oldest waiting prompt counts successful later first admissions; after

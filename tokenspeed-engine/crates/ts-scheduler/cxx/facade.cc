@@ -28,6 +28,7 @@
 #include <variant>
 #include <vector>
 
+#include "core/profile_span.h"
 #include "scheduler/execution_event.h"
 #include "ts-scheduler/src/lib.rs.h"
 
@@ -49,19 +50,29 @@ std::vector<std::int32_t> to_std(rust::Slice<const std::int32_t> values) {
     return {values.begin(), values.end()};
 }
 
+void record_profile_span(const char* name, std::int64_t begin_ns, std::int64_t end_ns) {
+    record_scheduler_span(rust::Str(name), begin_ns, end_ns);
+}
+
 }  // namespace
 
 void submit_requests(tokenspeed::Scheduler& scheduler, rust::Slice<const RequestSpec> specs) {
     std::vector<tokenspeed::RequestSpec> converted;
-    converted.reserve(specs.size());
-    for (const RequestSpec& spec : specs) {
-        converted.push_back(tokenspeed::RequestSpec{
-            .request_id = std::string(spec.request_id),
-            .session_id = std::string(spec.session_id),
-            .tokens = to_std({spec.tokens.data(), spec.tokens.size()}),
-            .max_new_tokens = spec.max_new_tokens,
-            .max_cached_prefix_tokens = spec.max_cached_prefix_tokens,
-        });
+    {
+        // Each prompt is copied across the bridge.
+        tokenspeed::ProfileSpan profile_span{"copyRequestSpecs"};
+        converted.reserve(specs.size());
+        for (const RequestSpec& spec : specs) {
+            converted.push_back(tokenspeed::RequestSpec{
+                .request_id = std::string(spec.request_id),
+                .session_id = std::string(spec.session_id),
+                .cache_group_id = std::string(spec.cache_group_id),
+                .shared_prefix_tokens = to_std({spec.shared_prefix_tokens.data(), spec.shared_prefix_tokens.size()}),
+                .tokens = to_std({spec.tokens.data(), spec.tokens.size()}),
+                .max_new_tokens = spec.max_new_tokens,
+                .max_cached_prefix_tokens = spec.max_cached_prefix_tokens,
+            });
+        }
     }
     scheduler.SubmitRequests(converted);
 }
@@ -75,50 +86,57 @@ std::unique_ptr<tokenspeed::ExecutionPlan> next_execution_plan(tokenspeed::Sched
 
 void advance(tokenspeed::Scheduler& scheduler, rust::Slice<const ForwardEvent> events) {
     tokenspeed::ExecutionEvent execution_event;
-    for (const ForwardEvent& event : events) {
-        std::string request_id(event.request_id);
-        switch (event.kind) {
-            case ForwardEventKind::ExtendResult:
-                execution_event.With(tokenspeed::forward::ExtendResult{
-                    .request_id = std::move(request_id),
-                    .tokens = to_std({event.tokens.data(), event.tokens.size()}),
-                    .spec_candidate_ids =
-                        to_std({event.spec_candidate_ids.data(), event.spec_candidate_ids.size()}),
-                });
-                break;
-            case ForwardEventKind::Finish:
-                execution_event.With(tokenspeed::forward::Finish{.request_id = std::move(request_id)});
-                break;
-            case ForwardEventKind::Abort:
-                execution_event.With(tokenspeed::forward::Abort{.request_id = std::move(request_id)});
-                break;
-            case ForwardEventKind::UpdateReserveNumTokens:
-                execution_event.With(tokenspeed::forward::UpdateReserveNumTokens{
-                    .request_id = std::move(request_id),
-                    .reserve_num_tokens_in_next_schedule_event = event.reserve_num_tokens,
-                });
-                break;
-            case ForwardEventKind::PdBootstrapped:
-                execution_event.With(tokenspeed::pd::BootstrappedEvent(std::move(request_id)));
-                break;
-            case ForwardEventKind::PdFailed:
-                execution_event.With(tokenspeed::pd::FailedEvent(std::move(request_id)));
-                break;
-            case ForwardEventKind::PdTransferStopped:
-                execution_event.With(tokenspeed::pd::TransferStoppedEvent(std::move(request_id)));
-                break;
-            case ForwardEventKind::PdSucceeded:
-                execution_event.With(tokenspeed::pd::SucceededEvent(std::move(request_id)));
-                break;
-            case ForwardEventKind::PdRemotePrefillDone:
-                execution_event.With(
-                    tokenspeed::pd::RemotePrefillDoneEvent(std::move(request_id), event.bootstrap_token));
-                break;
-            default:
-                throw std::invalid_argument("unknown forward event kind");
+    {
+        tokenspeed::ProfileSpan conversion{"SchedulerBridge::convertForwardEvents"};
+        for (const ForwardEvent& event : events) {
+            std::string request_id(event.request_id);
+            switch (event.kind) {
+                case ForwardEventKind::ExtendResult:
+                    execution_event.With(tokenspeed::forward::ExtendResult{
+                        .request_id = std::move(request_id),
+                        .tokens = to_std({event.tokens.data(), event.tokens.size()}),
+                        .spec_candidate_ids =
+                            to_std({event.spec_candidate_ids.data(), event.spec_candidate_ids.size()}),
+                    });
+                    break;
+                case ForwardEventKind::Finish:
+                    execution_event.With(tokenspeed::forward::Finish{.request_id = std::move(request_id)});
+                    break;
+                case ForwardEventKind::Abort:
+                    execution_event.With(tokenspeed::forward::Abort{.request_id = std::move(request_id)});
+                    break;
+                case ForwardEventKind::UpdateReserveNumTokens:
+                    execution_event.With(tokenspeed::forward::UpdateReserveNumTokens{
+                        .request_id = std::move(request_id),
+                        .reserve_num_tokens_in_next_schedule_event = event.reserve_num_tokens,
+                    });
+                    break;
+                case ForwardEventKind::PdBootstrapped:
+                    execution_event.With(tokenspeed::pd::BootstrappedEvent(std::move(request_id)));
+                    break;
+                case ForwardEventKind::PdFailed:
+                    execution_event.With(tokenspeed::pd::FailedEvent(std::move(request_id)));
+                    break;
+                case ForwardEventKind::PdTransferStopped:
+                    execution_event.With(tokenspeed::pd::TransferStoppedEvent(std::move(request_id)));
+                    break;
+                case ForwardEventKind::PdSucceeded:
+                    execution_event.With(tokenspeed::pd::SucceededEvent(std::move(request_id)));
+                    break;
+                case ForwardEventKind::PdRemotePrefillDone:
+                    execution_event.With(
+                        tokenspeed::pd::RemotePrefillDoneEvent(std::move(request_id), event.bootstrap_token));
+                    break;
+                default:
+                    throw std::invalid_argument("unknown forward event kind");
+            }
         }
     }
     scheduler.Advance(execution_event);
+    {
+        tokenspeed::ProfileSpan destruction{"SchedulerBridge::destroyForwardEvents"};
+        execution_event = {};
+    }
 }
 
 void advance_head(tokenspeed::Scheduler& scheduler, rust::Slice<const StorageTickView> ticks,
@@ -184,8 +202,25 @@ std::size_t demote_sessions(tokenspeed::Scheduler& scheduler, rust::Slice<const 
     return scheduler.DemoteSessions(session_ids, ended);
 }
 
+std::size_t demote_cache_groups(tokenspeed::Scheduler& scheduler, rust::Slice<const rust::String> ids, bool ended) {
+    std::vector<std::string> group_ids;
+    for (const auto& id : ids) group_ids.emplace_back(id);
+    return scheduler.DemoteCacheGroups(group_ids, ended);
+}
+
 std::size_t demote_session(tokenspeed::Scheduler& scheduler, rust::Str session_id, bool ended) {
     return scheduler.DemoteSession(std::string(session_id), ended);
+}
+
+bool shared_prefix_storage_enabled(const tokenspeed::Scheduler& scheduler) {
+    return scheduler.SharedPrefixStorageEnabled();
+}
+
+SharedPrefixPublication shared_prefix_publication(const tokenspeed::Scheduler& scheduler,
+                                                  rust::Slice<const std::int32_t> input_ids,
+                                                  std::int32_t max_prefix_tokens) {
+    const auto result = scheduler.GetSharedPrefixPublication({input_ids.data(), input_ids.size()}, max_prefix_tokens);
+    return SharedPrefixPublication{rust::String(result.status), result.confirmed_prefix_tokens, result.cache_epoch};
 }
 
 AdmissionSnapshot admission_snapshot(const tokenspeed::Scheduler& scheduler, std::int32_t token_step) {
@@ -236,25 +271,64 @@ CacheGroupPages cache_group_pages(const tokenspeed::Scheduler& scheduler, rust::
     };
 }
 
-rust::Vec<KvEventView> drain_kv_events(tokenspeed::Scheduler& scheduler) {
-    rust::Vec<KvEventView> views;
-    for (auto& event : scheduler.DrainKvEvents()) {
-        KvEventView view{};
-        if (auto* stored = std::get_if<tokenspeed::KvBlockStoredEvent>(&event)) {
-            view.stored = true;
-            for (auto hash : stored->block_hashes) view.block_hashes.push_back(hash);
-            view.has_parent = stored->parent_block_hash.has_value();
-            view.parent_block_hash = stored->parent_block_hash.value_or(0);
-            for (auto token : stored->token_ids) view.token_ids.push_back(token);
-            view.block_size = stored->block_size;
+std::unique_ptr<tokenspeed::KvEventBatch> drain_kv_events(tokenspeed::Scheduler& scheduler) {
+    auto batch = scheduler.DrainKvEventBatch();
+    if (batch.Empty()) return nullptr;
+    return std::make_unique<tokenspeed::KvEventBatch>(std::move(batch));
+}
+
+std::unique_ptr<tokenspeed::KvEventBatch> make_kv_event_batch(rust::Slice<const KvEventView> events) {
+    if (events.empty()) return nullptr;
+    auto batch = std::make_unique<tokenspeed::KvEventBatch>();
+    for (const auto& event : events) {
+        const std::span<const std::uint64_t> hashes{event.block_hashes.data(), event.block_hashes.size()};
+        if (event.stored) {
+            batch->Store(hashes, event.has_parent ? std::optional{event.parent_block_hash} : std::nullopt,
+                         {event.token_ids.data(), event.token_ids.size()}, event.block_size);
         } else {
-            const auto& removed = std::get<tokenspeed::KvBlockRemovedEvent>(event);
-            view.stored = false;
-            for (auto hash : removed.block_hashes) view.block_hashes.push_back(hash);
+            batch->Remove(hashes);
         }
-        views.push_back(std::move(view));
     }
-    return views;
+    return batch;
+}
+
+std::size_t kv_event_batch_size(const tokenspeed::KvEventBatch& batch) {
+    return batch.Size();
+}
+std::size_t kv_event_batch_bytes(const tokenspeed::KvEventBatch& batch) {
+    return batch.ByteSize();
+}
+rust::Slice<const std::uint8_t> kv_event_stored(const tokenspeed::KvEventBatch& batch) {
+    const auto values = batch.Stored();
+    return {values.data(), values.size()};
+}
+rust::Slice<const std::uint8_t> kv_event_has_parent(const tokenspeed::KvEventBatch& batch) {
+    const auto values = batch.HasParent();
+    return {values.data(), values.size()};
+}
+rust::Slice<const std::uint64_t> kv_event_parents(const tokenspeed::KvEventBatch& batch) {
+    const auto values = batch.Parents();
+    return {values.data(), values.size()};
+}
+rust::Slice<const std::int32_t> kv_event_block_sizes(const tokenspeed::KvEventBatch& batch) {
+    const auto values = batch.BlockSizes();
+    return {values.data(), values.size()};
+}
+rust::Slice<const std::size_t> kv_event_hash_offsets(const tokenspeed::KvEventBatch& batch) {
+    const auto values = batch.HashOffsets();
+    return {values.data(), values.size()};
+}
+rust::Slice<const std::size_t> kv_event_token_offsets(const tokenspeed::KvEventBatch& batch) {
+    const auto values = batch.TokenOffsets();
+    return {values.data(), values.size()};
+}
+rust::Slice<const std::uint64_t> kv_event_hashes(const tokenspeed::KvEventBatch& batch) {
+    const auto values = batch.Hashes();
+    return {values.data(), values.size()};
+}
+rust::Slice<const std::int32_t> kv_event_tokens(const tokenspeed::KvEventBatch& batch) {
+    const auto values = batch.Tokens();
+    return {values.data(), values.size()};
 }
 
 std::int32_t request_token_size(const tokenspeed::Scheduler& scheduler, rust::Str request_id) {
@@ -502,7 +576,7 @@ rust::Vec<StorageOpView> plan_storage_ops(const tokenspeed::ExecutionPlan& plan)
         views.reserve(cache_keys.size());
         for (const tokenspeed::CacheKey& key : cache_keys) {
             views.push_back(StorageKeyView{.group_id = key.group_id,
-                                           .content_hash = rust::String(key.content_hash),
+                                           .content_hash = rust::String(key.content_hash.ToString()),
                                            .page_offset = key.page_offset});
         }
         return views;
@@ -546,6 +620,10 @@ rust::Vec<StorageOpView> plan_storage_ops(const tokenspeed::ExecutionPlan& plan)
             *storage);
     }
     return out;
+}
+
+void set_profile_span_sink(bool installed) {
+    tokenspeed::SetProfileSpanSink(installed ? &record_profile_span : nullptr);
 }
 
 }  // namespace ts_scheduler

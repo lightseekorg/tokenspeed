@@ -787,13 +787,19 @@ class MHAAttnBackend(PagedAttentionBackend):
     def _get_kv_cache(self, layer: PagedAttention, token_to_kv_pool):
         # Page ids are in this leaf's kernel-page units (the router expanded
         # them), so view the cache at that size.
-        k_cache = token_to_kv_pool.get_key_buffer(layer.layer_id).view(
+        k_raw = token_to_kv_pool.get_key_buffer(layer.layer_id)
+        v_raw = token_to_kv_pool.get_value_buffer(layer.layer_id)
+        if k_raw.ndim == 4:
+            if k_raw.shape[1] != self.kernel_page_size:
+                raise ValueError("strided MHA pages must match the kernel page size")
+            return k_raw, v_raw
+        k_cache = k_raw.view(
             -1,
             self.kernel_page_size,
             layer.tp_k_head_num,
             layer.qk_head_dim,
         )
-        v_cache = token_to_kv_pool.get_value_buffer(layer.layer_id).view(
+        v_cache = v_raw.view(
             -1,
             self.kernel_page_size,
             layer.tp_v_head_num,

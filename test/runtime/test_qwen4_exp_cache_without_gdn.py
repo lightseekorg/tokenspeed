@@ -20,6 +20,8 @@
 
 """Qwen side-cache planning does not require recurrent-attention layers."""
 
+import os
+import sys
 from copy import copy
 from dataclasses import replace
 from types import SimpleNamespace
@@ -27,6 +29,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
+
+from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.layers.attention.backends.paged.group_tables import (
     GroupTableSpec,
     GroupTableStacks,
@@ -39,6 +47,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.factory import (
     create_cache_arena,
     create_cache_pool,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.mha import MHATokenToKVPoolMXFP8
 from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
     QWEN4_EXP_PLE_CACHE_GROUP,
     QWEN4_EXP_QSA_CACHE_GROUP,
@@ -477,9 +486,9 @@ def test_flat_kv_atom_pages_resolve_to_the_original_field_bytes(
                 if name == "k"
                 else pool.get_value_buffer(layer)
             )
-            for block in (1, last_block):
+            for block_column, block in enumerate((1, last_block), start=1):
                 for subpage in range(ratio):
-                    column = block * ratio + subpage
+                    column = block_column * ratio + subpage
                     atom_page = table[0, column].item()
                     row = atom_page * kernel_page_size + 3
                     value = 10 + layer * 20 + (name == "v") * 40 + subpage
@@ -522,3 +531,45 @@ def test_flat_kv_rejects_pipeline_parallelism() -> None:
     recipe.server_args.mapping.pp_size = 2
     with pytest.raises(NotImplementedError, match="PP=1"):
         recipe.fields_for_layer(0, FULL_ATTENTION, 0)
+
+
+def test_flat_kv_keeps_mxfp8_draft_page_addressing() -> None:
+    recipe = _recipe(
+        layer_types=(FULL_ATTENTION, FULL_ATTENTION), speculative=True, width=3
+    )
+    recipe.server_args.qwen4_exp_flat_kv = True
+    recipe.server_args.mapping = Mapping(rank=0, world_size=1)
+    recipe.cache_budget_bytes = 16 << 20
+    recipe.attn_config = replace(
+        recipe.attn_config,
+        components=(replace(recipe.attn_config.components[0], head_dim=64),),
+    )
+    recipe.draft_attn_config = replace(
+        recipe.draft_attn_config,
+        components=(replace(recipe.draft_attn_config.components[0], head_dim=64),),
+        kv_cache_dtype=torch.float8_e4m3fn,
+        kv_cache_mxfp8=True,
+    )
+    setup = recipe.setup()
+    arena = create_cache_arena(setup.spec, device="cpu", enable_memory_saver=False)
+    pool = MHATokenToKVPoolMXFP8(
+        arena, torch.float8_e4m3fn, 1, 64, 1, 0, field_layer_offset=2
+    )
+    grain = arena.plan.prefix_granularity
+    assert pool.atom_pages_per_block(FULL_ATTENTION, grain) == 1
+    key = pool.get_key_buffer(0)
+    key.view(torch.uint8)[grain + 7].fill_(56)  # FP8 value 1.
+    field_id = "layer.2.k"
+    field = arena.plan.field(field_id)
+    offset = (
+        arena.plan.field_page_byte_offset(field_id, 1)
+        + 7 * field.payload_bytes // grain
+    )
+    assert torch.all(
+        arena.buffer[offset : offset + 64].view(torch.float8_e4m3fn).float() == 1
+    )
+    k_scale, _ = pool.get_kv_scale_buffer(0)
+    k_scale.view(torch.uint8)[1].fill_(127)
+    scale_field = arena.plan.field("layer.2.k_scale")
+    offset = arena.plan.field_page_byte_offset(scale_field.field_id, 1)
+    assert torch.all(arena.buffer[offset : offset + scale_field.payload_bytes] == 127)

@@ -49,7 +49,7 @@ using token_span = std::span<const std::int32_t>;
 CacheKey RealKey(const std::vector<std::int32_t>& tokens, std::uint32_t group_id) {
     std::vector<token_span> pages = {token_span(tokens.data(), tokens.size())};
     std::vector<std::string> hashes = ComputePrefixHashes(pages, "");
-    return CacheKey{.group_id = group_id, .content_hash = std::move(hashes.front())};
+    return CacheKey{.group_id = group_id, .content_hash = ContentHash{std::move(hashes.front())}};
 }
 
 // Cache then free, so the page is prefix-hittable via MatchPrefix.
@@ -213,7 +213,7 @@ TEST(SwaManagerTest, SpeculativeHitsDoNotRefreshAccessEpoch) {
     const std::optional<PrefixCacheIndex::CachedBlockMetadata> after =
         mgr.CachedBlockMetadataFor(pool, speculative_location);
     ASSERT_TRUE(after);
-    EXPECT_EQ(after->last_access_epoch, before->last_access_epoch);
+    EXPECT_EQ(after->eviction.last_access_epoch, before->eviction.last_access_epoch);
 }
 
 // Pins the device-tier W=1 semantic: no lookback means every boundary is resumable,
@@ -224,7 +224,8 @@ TEST(SwaManagerTest, MatchWindowOneCoversAllAsHoles) {
     CacheKey h0 = RealKey({0, 0, 0, 0}, 0);
     CacheOnePage(mgr, pool, h0);  // a real cached page must NOT shrink or anchor the match
 
-    std::vector<CacheKey> keys{h0, CacheKey{.content_hash = "k1"}, CacheKey{.content_hash = "k2"}};
+    std::vector<CacheKey> keys{h0, CacheKey{.content_hash = ContentHash{"k1"}},
+                               CacheKey{.content_hash = ContentHash{"k2"}}};
     PrefixMatch m = mgr.Match(pool, keys, 0, 3);
     EXPECT_EQ(BlockIds(m.blocks), (std::vector<std::int32_t>{0, 0, 0}));
     EXPECT_EQ(m.NumHitBlocks(), 0);
@@ -332,13 +333,15 @@ TEST(BlockTableTest, EvictToNullIsIdempotentOnNullSlot) {
 
 TEST(GroupAllocatorTest, ExpiredSlotBoundIncludesEveryReclaimableBlock) {
     BlockPool pool(6, {1});
-    GroupAllocator allocator(/*cache_blocks_per_lcm_block=*/1, /*group_id=*/0, /*shard_count=*/1);
+    GroupAllocator allocator(/*cache_blocks_per_lcm_block=*/1, /*group_id=*/0, /*shard_count=*/1,
+                             /*kept_head_blocks=*/0);
     PrefixCacheIndex index(/*group_id=*/0);
     std::vector<CacheBlockRef> blocks = pool.AcquireBlocks(0, 6);
     ASSERT_EQ(blocks.size(), 6u);
     for (const std::int32_t slot : {2, 4}) {
-        index.Register(pool, blocks[slot], CacheKey{.content_hash = std::to_string(slot)}, /*access_epoch=*/1, slot,
-                       CacheBoundaryKind::kChunk, /*newly_cached=*/nullptr, /*session=*/nullptr);
+        index.Register(pool, blocks[slot], CacheKey{.content_hash = ContentHash{std::to_string(slot)}},
+                       /*access_epoch=*/1, slot, CacheBoundaryKind::kChunk, /*newly_cached=*/nullptr,
+                       /*session=*/nullptr);
     }
     BlockTable table = BlockTable::FromBlocks(/*group_id=*/0, std::move(blocks), /*available_tokens=*/0);
     allocator.ReclaimExpired(pool, table, 1);

@@ -306,6 +306,15 @@ class MegaMoeConfig:
             and not self.has_bias
             and activation_function is MegaMoeActivationFunction.kimi_situ
         )
+        muse_spark_config = (
+            self.world_size == 8
+            and self.num_experts == 256
+            and self.topk == 8
+            and self.model_dim == 4096
+            and self.inter_dim == 4096
+            and not self.has_bias
+            and activation_function is MegaMoeActivationFunction.silu
+        )
         deepseek_v41_config = (
             self.world_size == 8
             and (self.num_experts, self.topk) in ((384, 6), (128, 3))
@@ -318,7 +327,11 @@ class MegaMoeConfig:
             stages is MegaMoeStages.two_stage
             and activation is MegaMoeActivation.mxfp4
             and (
-                gpt_oss_config or deepseek_config or kimi_config or deepseek_v41_config
+                gpt_oss_config
+                or deepseek_config
+                or kimi_config
+                or deepseek_v41_config
+                or muse_spark_config
             )
         )
         if not supported:
@@ -416,6 +429,67 @@ class MegaMoeConfig:
         out: torch.Tensor | None = None,
         inputs: MegaMoeInputViews | None = None,
     ) -> torch.Tensor:
+        return self._launch(
+            heap,
+            w13,
+            w2,
+            fc1_scale,
+            fc2_scale,
+            num_tokens,
+            reduce_routes=True,
+            w13_bias=w13_bias,
+            w2_bias=w2_bias,
+            out=out,
+            inputs=inputs,
+        )
+
+    def run_routes(
+        self,
+        heap: object,
+        w13: torch.Tensor,
+        w2: torch.Tensor,
+        fc1_scale: torch.Tensor,
+        fc2_scale: torch.Tensor,
+        num_tokens: int,
+        *,
+        w13_bias: torch.Tensor | None,
+        w2_bias: torch.Tensor | None,
+        inputs: MegaMoeInputViews,
+    ) -> torch.Tensor:
+        """Run dispatch and both stages, returning each token's routes unsummed.
+
+        Returns ``[num_tokens, topk, model_dim]`` BF16 routes in ``topk``
+        order, each the expert output scaled by its expert weight.
+        """
+        return self._launch(
+            heap,
+            w13,
+            w2,
+            fc1_scale,
+            fc2_scale,
+            num_tokens,
+            reduce_routes=False,
+            w13_bias=w13_bias,
+            w2_bias=w2_bias,
+            out=None,
+            inputs=inputs,
+        )
+
+    def _launch(
+        self,
+        heap: object,
+        w13: torch.Tensor,
+        w2: torch.Tensor,
+        fc1_scale: torch.Tensor,
+        fc2_scale: torch.Tensor,
+        num_tokens: int,
+        *,
+        reduce_routes: bool,
+        w13_bias: torch.Tensor | None,
+        w2_bias: torch.Tensor | None,
+        out: torch.Tensor | None,
+        inputs: MegaMoeInputViews | None,
+    ) -> torch.Tensor:
         num_tokens = int(num_tokens)
         if num_tokens < 0 or num_tokens > self.max_tokens_per_rank:
             raise ValueError("invalid MegaMoE token count")
@@ -459,6 +533,7 @@ class MegaMoeConfig:
             fc2_scale,
             num_tokens,
             self._solution_id_for_tokens(num_tokens),
+            reduce_routes,
             w13_bias,
             w2_bias,
             out,

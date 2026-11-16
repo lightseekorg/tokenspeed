@@ -38,6 +38,17 @@ entry:
   ret i32 0
 }
 
+; gfx9: the same wait after a workgroup-scope release fence. The intrinsic is
+; declared not to access memory, so in the IR a store could still move below
+; the wait; the fence keeps every earlier store above it and adds no
+; instruction or cache maintenance on gfx950.
+define i32 @__tokenspeed_sync_release_wait_vmem() alwaysinline {
+entry:
+  fence syncscope("workgroup") release
+  call void @llvm.amdgcn.s.waitcnt(i32 3952)
+  ret i32 0
+}
+
 ; gfx12 and gfx1250: s_wait_storecnt 0x0.
 define i32 @__tokenspeed_sync_wait_stores() alwaysinline {
 entry:

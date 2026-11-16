@@ -173,6 +173,16 @@ def wait_vmem(_semantic):
 
 
 @tl.core.extern
+def release_wait_vmem(_semantic):
+    """:func:`wait_vmem` that also keeps this wave's earlier stores above the
+    wait (a workgroup-scope release fence first, which adds no instruction
+    on gfx950). Use it before publishing those stores with a flag. Launch
+    with :func:`extern_compile_options`.
+    """
+    return _wait("release_wait_vmem", _semantic)
+
+
+@tl.core.extern
 def wait_stores(_semantic):
     """Wait for this wave's vector stores and non-returning atomics
     (``s_wait_storecnt 0x0``) on gfx12 targets such as gfx1250. Launch with
@@ -199,6 +209,57 @@ def wave_uniform_i32(value, _semantic):
         "readfirstlane_i32",
         [value],
         (tl.int32,),
+        tl.int32,
+        is_pure=True,
+        _semantic=_semantic,
+    )
+
+
+@tl.core.extern
+def wave_ballot_i64(predicate, _semantic):
+    """Return an int64 mask of active lanes with nonzero int32 ``predicate``.
+
+    Bit l represents lane l. Launch with :func:`extern_compile_options`.
+    """
+    return _call(
+        "wave",
+        "ballot_i64",
+        [predicate],
+        (tl.int32,),
+        tl.int64,
+        is_pure=False,
+        _semantic=_semantic,
+    )
+
+
+@tl.core.extern
+def wave_popcount_i64(mask, _semantic):
+    """Return the int32 number of set bits in int64 ``mask``.
+
+    Uses ``llvm.ctpop``. Launch with :func:`extern_compile_options`.
+    """
+    return _call(
+        "wave",
+        "popcount_i64",
+        [mask],
+        (tl.int64,),
+        tl.int32,
+        is_pure=True,
+        _semantic=_semantic,
+    )
+
+
+@tl.core.extern
+def wave_mbcnt(mask, _semantic):
+    """Return the int32 count of set bits in int64 ``mask`` below this lane.
+
+    Counts across a wave of 64 lanes. Launch with :func:`extern_compile_options`.
+    """
+    return _call(
+        "wave",
+        "mbcnt",
+        [mask],
+        (tl.int64,),
         tl.int32,
         is_pure=True,
         _semantic=_semantic,

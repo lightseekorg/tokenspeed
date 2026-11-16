@@ -67,6 +67,21 @@ allowed helpers and checks these rules on the compiled kernels.
 
 ## GEMM
 
+### gfx950 BF16 projections with FP32 output
+
+`gfx950/gemm/fp16/fp32_output.py` covers measured `[N,K]` pairs `[8,4608]`,
+`[384,4608]`, `[3792,4608]` and `[4608,1536]` and returns genuine FP32 output.
+The narrow path widens BF16 products exactly and uses a fixed row-local tree.
+The wide path reuses the existing MFMA/LDS kernel with fixed 16x64x64 tiles.
+The QKV shape uses twelve fixed K partitions with FP32 partials folded in
+split order, not arrival order. Neither reduction depends on the batch size.
+The caller supplies zeroed arrival counters, which each launch resets.
+Each view must span at most 4 GiB from its base pointer, and split-K
+partial-tile element offsets must fit signed int32; larger inputs raise
+before launch rather than wrap a raw-buffer offset. The wide path copies
+operands with odd row strides or unaligned bases into aligned storage for its
+direct-to-LDS loads.
+
 ### gfx950 dense BF16 projections
 
 The gfx950 package provides dense BF16 projection kernels: an eight-wave
@@ -2295,6 +2310,18 @@ Both GEMMs overlap loads with matrix computation using double-buffered shared
 memory. Phased operand loading and scheduling barriers limit live registers;
 compiler-inserted shared-memory barriers provide inter-wave synchronization.
 
+### Precomputed expert sort for the A8W4 SiTU decode
+
+The expert-sorted A8W4 decode in `gluon_mxfp4_fp8_precomputed_situ` sorts
+its routes with `gluon_moe_sorting` (16-row blocks) before the stage GEMMs.
+A caller that already holds that metadata for the same routes passes
+`sorted_routes=(sorted_ids, sorted_weights, sorted_expert_ids,
+num_valid_ids)`, and the wrapper checks the buffers' shapes and dtypes against
+`gluon_moe_sorting`'s and skips the sort. The Kimi K3 router
+`kimi3_sigmoid_bias_topk_sorted` (tokenspeed-kernel) writes it while routing.
+The stage GEMMs do not depend on the order of routes inside an expert's
+blocks, so either sort gives the same output bit for bit.
+
 ### gfx950 dynamic-MXFP4 (A4W4) SiLU experts
 
 `gluon_mxfp4_a4w4_moe_apply_gfx950` serves MXFP4 checkpoints whose experts
@@ -2490,6 +2517,41 @@ weights, and divide out that factor at normalization. The projected-value API
 applies the existing value projection to the latent output. Graph replay reads
 updated page tables and lengths in place.
 
+### gfx950 MLA query-row decode
+
+`gluon_mla_decode_query_rows_gfx950` decodes up to 16 query rows per request
+whose visible lengths need not follow a causal offset, such as a KVP rank's
+local lengths for a draft block. The MLA DCP decode takes it for the drafter
+under KVP through `mla_decode_query_rows`.
+
+#### Contract
+
+- Queries are BF16 or FP8 E4M3 `(requests, queries, heads, 576)` with 1 to 16
+  queries and a contiguous last dimension. The cache is a contiguous FP8
+  `(pages, 64, 1, 576)`; FP8 queries require an E4M3 cache.
+- The page table is Int32 `(requests, pages)` with a unit inner stride, one
+  row per request. Row lengths are a contiguous Int32 `(requests, queries)`:
+  query `j` of request `i` sees the first `row_lengths[i, j]` tokens.
+- The output is BF16 `(requests, queries, heads, 512)`, with an optional FP32
+  log-sum-exp `(requests, queries, heads)` in natural-log units. A row with
+  no visible token has zero output and a negative-infinity log-sum-exp.
+
+#### Algorithm
+
+A program holds 64 (query, head) rows of one request and loads each 64-token
+KV tile once for all of them; each row masks the tile by its own length. FP8
+queries keep the FP8 MFMA and the scaled FP8 probabilities of the folded
+FP8 decode. BF16 queries widen the FP8 tile to BF16 in registers, as the
+folded BF16 decode does. Only the reduction order differs from the folded
+kernels.
+
+Each program needs one CU, so the split count is the one of at most 32, at
+most about three waves of 256 workgroups and at least four KV tiles per split,
+whose grid fills its last wave best. Splits store BF16 partials in a
+power-of-two bucket, and a second kernel merges them by log-sum-exp. The split
+count and page-table stride are runtime arguments, so batch sizes and table
+widths that keep the split count reuse one binary.
+
 ### gfx1250 general biased-sigmoid top-k
 
 `gluon_sigmoid_bias_topk_route_gfx1250` selects experts for shapes outside
@@ -2520,6 +2582,14 @@ format while projections use BF16 operands and FP32 accumulation. FP8 storage
 does not require native FP8 matrix arithmetic.
 
 ## Residual
+
+### gfx950 Kimi K3 AttnRes
+
+The operation mixes the current BF16 residual with up to 11 stored block
+snapshots and applies the following RMSNorm. Startup prepares both the
+prefill and small-batch launch configurations without performing additional
+residual updates. This covers eager tails even when graph capture fuses the
+corresponding layer into a collective.
 
 ### gfx1250 Kimi K3 AttnRes
 
@@ -2754,6 +2824,36 @@ above 2048 tokens adjacent CTAs take adjacent hidden blocks of one token and
 all vector accesses are non-temporal.
 
 ## Quantization
+
+### gfx950 row-major block-scaled expert GEMM
+
+`moe/block_scaled.py` consumes checkpoint-order expert rows and grouped route
+indices. It reconstructs NVFP4 (group-16 E4M3 scales) or MXFP8 (group-32
+UE8M0 scales) tiles as BF16, accumulates native BF16 MFMA products in FP32,
+and stores BF16 route rows. NVFP4 row/expert outer factors apply after the
+complete dot reduction. This is not the CDNA4-swizzled MXFP4 scale layout.
+
+Only the expert GEMMs differ: routing, quantization, capped SwiGLU and the
+BF16 boundaries use the shared portable pipeline, and each route keeps its
+flattened token/top-k slot, so the EP reduction and slot-fold order are
+unchanged. The common package selects this solution for NVFP4 only.
+
+Whole tiles of NVFP4 weights with BF16 activations (every model shape) stream
+through an LDS ring. Direct-to-LDS copies bring each K block's packed weights,
+group scales and activation rows up to three blocks ahead of the MFMA. They
+hold no registers, so a program keeps more bytes in flight than register loads
+allow. That matters at decode, where each program walks one tile's K blocks
+back to back. The weights are read as int32 words in the MFMA B-operand order,
+a word of 8 values a lane and K step. `v_cvt_scalef32_pk_f32_fp4` upcasts each
+byte to an FP32 pair, the E4M3 group scale multiplies in FP32, and one
+rounding gives BF16. Both steps are exact, so the values, and the K order of
+the 16x16x32 MFMAs, equal the masked loop's: results are bit-identical. Rows
+past an expert's count are not copied and feed only MFMA rows that are never
+stored. Ragged shapes and MXFP8 keep the masked register loop.
+
+Prefill uses 64-row NVFP4 tiles, so each weight tile is upcast once per 64
+route rows. A 2048-token chunk routes about 43 rows to an expert at top-8 over
+384 experts.
 
 ### gfx950 group-32 UE8M0 FP8 activations
 

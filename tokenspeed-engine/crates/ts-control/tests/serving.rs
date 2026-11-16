@@ -31,7 +31,7 @@ use std::{
     ffi::CString,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex, Once,
+        Arc, Mutex, Once, PoisonError,
     },
     thread,
     time::Duration,
@@ -53,6 +53,7 @@ use ts_control::{
     grammar::{GrammarConfig, GrammarKey, Grammars},
     ingress::{Admission, IngressLimits, LogprobServability},
     output::{FinishLog, ForwardResult, LogprobPlan, OutputProcessor, Role, StreamedOutput},
+    startup,
     transport::EngineTransport,
 };
 use ts_l3::{
@@ -64,7 +65,7 @@ use ts_pd::{
     RemotePrefill, TransferPeer, TransferPoll,
 };
 use ts_scheduler::{
-    CacheEvent, CacheEventKind, CacheOpKind, CacheOpView, ExecutionPlan, Scheduler,
+    profile, CacheEvent, CacheEventKind, CacheOpKind, CacheOpView, ExecutionPlan, Scheduler,
 };
 use ts_wire::{
     codec::Dict,
@@ -83,10 +84,15 @@ fn interpreter() {
     static START: Once = Once::new();
     START.call_once(|| {
         std::env::set_var("PYTHONHOME", env!("TS_CONTROL_TEST_PYTHONHOME"));
-        ts_scheduler::register_builtin_module();
         Python::initialize();
         Python::attach(|py| {
-            ts_scheduler::alias_builtin_module(py).unwrap();
+            let module = ts_scheduler::python_module(py).unwrap();
+            py.import("sys")
+                .unwrap()
+                .getattr("modules")
+                .unwrap()
+                .set_item("tokenspeed_scheduler.tokenspeed_scheduler_ext", module)
+                .unwrap();
             let package = concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../../tokenspeed-scheduler/python"
@@ -280,6 +286,8 @@ type ExecutedPlan = (usize, Vec<String>, Vec<CacheOpView>);
 /// `ack_polls` polls later, and never while `ack_gate` is closed.
 #[derive(Default)]
 struct FakeDevice {
+    /// Every data-plane admission must already have a fresh identity.
+    last_admission: u64,
     /// This rank; PD names it as a sender of a request's KV.
     rank: usize,
     /// Tokens generated per request so far.
@@ -355,6 +363,7 @@ fn toy_grammars() -> Grammars {
         any_whitespace: true,
         compile_timeout: Duration::from_secs(30),
         max_retries: 2,
+        json_framing: None,
     })
     .unwrap()
 }
@@ -657,6 +666,8 @@ impl DataPlane for FakeDevice {
 
     fn admit(&mut self, requests: &[Admission]) -> Result<(), DataPlaneError> {
         for request in requests {
+            assert!(request.state.admission > self.last_admission);
+            self.last_admission = request.state.admission;
             self.generated.insert(request.rid.clone(), 0);
             if let Some(bootstrap) = &request.bootstrap {
                 self.rooms.insert(request.rid.clone(), bootstrap.room);
@@ -1246,6 +1257,8 @@ struct Pd {
 /// What an engine runs with beyond its layout, depth and cache tiers.
 #[derive(Default, Clone)]
 struct Setup {
+    /// The fake device exposes the collective NCCL sleep region.
+    nccl_suspendable: bool,
     /// Override the ingress context limit to exercise native capacity errors.
     context_limit: Option<i64>,
     /// Override the Device pool size for capacity-pressure scenarios.
@@ -1284,7 +1297,12 @@ struct Setup {
     weight_update_failure_rank: Option<usize>,
     /// The ranks whose load prerequisites refuse until the test clears them.
     weight_load_refused: Option<fn(usize) -> bool>,
+    /// The requests each engine serves itself before its frontend attaches,
+    /// [`STARTUP_OUTPUT_TOKENS`] each.
+    startup: Vec<startup::Phase>,
 }
+
+const STARTUP_OUTPUT_TOKENS: usize = 3;
 
 impl Layout {
     /// Ranks, attention-TP ranks per replica, and engines.
@@ -1331,7 +1349,15 @@ fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopCon
         request_token_history_lookback: setup.request_token_history_lookback,
         controls: ControlConfig {
             memory_saver: true,
-            memory_regions: vec!["kv_cache".to_owned(), "weights".to_owned()],
+            memory_regions: if setup.nccl_suspendable {
+                vec![
+                    "kv_cache".to_owned(),
+                    "weights".to_owned(),
+                    "nccl".to_owned(),
+                ]
+            } else {
+                vec!["kv_cache".to_owned(), "weights".to_owned()]
+            },
             l3_weight_version: None,
             allow_reload_forward: true,
         },
@@ -1390,7 +1416,6 @@ fn run_rank<F: Frontend>(
     let tp_first = rank / tp_size * tp_size;
     let replica = Group::new(1, (tp_first..tp_first + tp_size).collect(), rank).unwrap();
     let dp = (num_engines > 1).then(|| Group::new(0, (0..world).collect(), rank).unwrap());
-    let frontend = frontend();
     let Setup {
         device_pages,
         pd,
@@ -1398,6 +1423,7 @@ fn run_rank<F: Frontend>(
         grammar,
         grammar_timeouts,
         epd_receive_enabled,
+        startup,
         ..
     } = setup;
     let role = pd.as_ref().map_or(Role::Plain, |pd| pd.role);
@@ -1439,10 +1465,11 @@ fn run_rank<F: Frontend>(
         Layout::TpKvp(_, shards) => shards,
         _ => 1,
     };
+    // Attached once the startup requests ran, as the host does.
     let mut event_loop = EventLoop::new(
         new_scheduler(tiers, role, kv_shard_count, device_pages.unwrap_or(513)),
         device,
-        frontend,
+        None,
         outputs,
         config,
         ranks,
@@ -1474,6 +1501,10 @@ fn run_rank<F: Frontend>(
             l3: store.map(|store| l3_executor(store, rank)),
         },
     );
+    if event_loop.warm_up(startup::requests(&startup, STARTUP_OUTPUT_TOKENS), stop)? {
+        return Ok(());
+    }
+    *event_loop.frontend_mut() = Some(frontend());
     event_loop.run(stop)
 }
 
@@ -1481,6 +1512,7 @@ fn run_rank<F: Frontend>(
 fn fake_device(layout: Layout, rank: usize, setup: &Setup) -> FakeDevice {
     let (world, _, _) = layout.sizes();
     FakeDevice {
+        last_admission: 0,
         rank,
         ack_polls: setup.cache_ack_polls.map_or(0, |polls| polls(rank)),
         ack_gate: if setup.held_cache_acks {
@@ -1826,6 +1858,70 @@ fn assert_scripted_tokens(rank: &ScriptedRank, rid: &str, count: i32) {
     );
     assert_eq!(outputs.last().unwrap().finish_reason, Some("length"));
     assert_eq!(outputs.last().unwrap().completion_tokens, i64::from(count));
+}
+
+#[test]
+fn startup_requests_run_on_every_rank_and_leave_nothing_behind() {
+    for layout in [Layout::Single, Layout::Tp(2), Layout::Dp(2)] {
+        let (_, _, num_engines) = layout.sizes();
+        // The client's prompt is the first startup prompt of each phase.
+        let prompt = |rid| {
+            EngineRequest::Add(Box::new(TokenizedGenerateReqInput {
+                input_ids: Some(vec![1; 48]),
+                ..request(rid, 0, budget(3))
+            }))
+        };
+        let mut script: Script = vec![Vec::new(); 30];
+        script[0].push(prompt("client"));
+        script[15].push(prompt("again"));
+        let setup = Setup {
+            startup: vec![
+                startup::Phase {
+                    batch: 1,
+                    prompt_len: 48,
+                },
+                startup::Phase {
+                    batch: 2,
+                    prompt_len: 48,
+                },
+            ],
+            ..Setup::default()
+        };
+        let ranks = run_scripted(
+            layout,
+            1,
+            Tiers::DeviceOnly,
+            setup,
+            vec![script; num_engines],
+            no_reaction,
+        );
+        for rank in &ranks {
+            assert_eq!(rank.outcome, Ok(()), "{layout:?}");
+            let started: Vec<_> = rank
+                .released
+                .iter()
+                .filter(|(rid, _)| rid.starts_with(startup::RID_PREFIX))
+                .collect();
+            assert_eq!(started.len(), 3, "{layout:?}");
+            assert!(rank
+                .outputs
+                .iter()
+                .all(|output| !output.rid.starts_with(startup::RID_PREFIX)));
+        }
+        for engine in ranks.iter().filter(|rank| !rank.outputs.is_empty()) {
+            let cached = |rid: &str| {
+                engine
+                    .outputs
+                    .iter()
+                    .rfind(|output| output.rid == rid)
+                    .unwrap()
+                    .cached_tokens
+            };
+            // Startup dropped its prefixes; serving still caches.
+            assert_eq!(cached("client"), 0, "{layout:?}");
+            assert!(cached("again") > 0, "{layout:?}");
+        }
+    }
 }
 
 #[test]
@@ -4406,6 +4502,109 @@ fn a_reload_runs_once_every_dp_engine_holds_the_same_one() {
     );
 }
 
+#[test]
+fn a_further_nccl_release_waits_for_every_already_sleeping_dp_engine() {
+    let release = |tags: &[&str]| {
+        EngineRequest::Control(Box::new(ControlRequest::ReleaseMemoryOccupation(
+            ReleaseMemoryOccupationReqInput {
+                rid: None,
+                http_worker_ipc: None,
+                tags: Some(tags.iter().map(|tag| (*tag).to_owned()).collect()),
+            },
+        )))
+    };
+    let wake = || {
+        EngineRequest::Control(Box::new(ControlRequest::ResumeMemoryOccupation(
+            ResumeMemoryOccupationReqInput {
+                rid: None,
+                http_worker_ipc: None,
+                tags: None,
+            },
+        )))
+    };
+    let mut first: Script = vec![Vec::new(); 14];
+    let mut second: Script = vec![Vec::new(); 14];
+    first[0].push(release(&["kv_cache"]));
+    second[0].push(release(&["kv_cache"]));
+    // The next release has reached only one engine. A previously completed
+    // KV release on the peer does not consent to this new device operation.
+    first[3].push(release(&["weights", "nccl"]));
+    first[7].push(wake());
+    second[7].push(wake());
+    first[8].push(EngineRequest::Control(Box::new(resume())));
+    second[8].push(EngineRequest::Control(Box::new(resume())));
+    let ranks = run_scripted(
+        Layout::Dp(2),
+        1,
+        Tiers::DeviceOnly,
+        Setup {
+            nccl_suspendable: true,
+            ..Setup::default()
+        },
+        vec![first, second],
+        no_reaction,
+    );
+    for rank in ranks {
+        assert_eq!(rank.outcome, Ok(()));
+        assert_eq!(rank.device_ops, ["release kv_cache", "resume kv_cache"]);
+    }
+}
+
+#[test]
+fn nccl_resume_waits_for_every_dp_engine() {
+    for send_peer in [false, true] {
+        let release = || {
+            EngineRequest::Control(Box::new(ControlRequest::ReleaseMemoryOccupation(
+                ReleaseMemoryOccupationReqInput {
+                    rid: None,
+                    http_worker_ipc: None,
+                    tags: None,
+                },
+            )))
+        };
+        let wake = || {
+            EngineRequest::Control(Box::new(ControlRequest::ResumeMemoryOccupation(
+                ResumeMemoryOccupationReqInput {
+                    rid: None,
+                    http_worker_ipc: None,
+                    tags: None,
+                },
+            )))
+        };
+        let mut first: Script = vec![Vec::new(); 9];
+        let mut second: Script = vec![Vec::new(); 9];
+        first[0].push(release());
+        second[0].push(release());
+        first[3].push(wake());
+        if send_peer {
+            second[5].push(wake());
+        }
+        let ranks = run_scripted(
+            Layout::Dp(2),
+            1,
+            Tiers::DeviceOnly,
+            Setup {
+                nccl_suspendable: true,
+                ..Setup::default()
+            },
+            vec![first, second],
+            no_reaction,
+        );
+        for rank in ranks {
+            assert_eq!(rank.outcome, Ok(()));
+            let expected = if send_peer {
+                vec![
+                    "release kv_cache,weights,nccl",
+                    "resume nccl,weights,kv_cache",
+                ]
+            } else {
+                vec!["release kv_cache,weights,nccl"]
+            };
+            assert_eq!(rank.device_ops, expected);
+        }
+    }
+}
+
 /// A JSON schema the toy vocabulary takes most of a second to compile.
 fn slow_schema() -> String {
     let names: Vec<String> = (0..3000).map(|i| format!("p{i}")).collect();
@@ -4565,9 +4764,9 @@ async fn flushes_and_weight_updates_run_on_every_data_parallel_rank() {
             ("UpdateWeightFromDiskReqOutput", true)
         ]
     );
-    for rank in 0..2 {
+    for rank in &engine.ranks[..2] {
         assert_eq!(
-            *engine.ranks[rank].device_ops.lock().unwrap(),
+            *rank.device_ops.lock().unwrap(),
             ["UpdateWeightFromDiskReqInput"]
         );
     }
@@ -5331,4 +5530,226 @@ fn a_flush_under_a_keep_pause_runs_once_the_cache_work_did() {
         ]
     );
     assert!(rank.cache_ops.contains(&CacheOpKind::WriteBack));
+}
+
+/// The process's one span recording: the tests that record take turns.
+static PROFILE: Mutex<()> = Mutex::new(());
+
+#[test]
+fn a_profile_keeps_the_spans_of_rounds_that_did_something() {
+    // One rank, run on this thread: its spans carry this thread's id.
+    let setup = Setup::default();
+    let config = loop_config(1, false, &setup);
+    let (mut mesh_listeners, addresses) = mesh_listeners(1);
+    let device = fake_device(Layout::Single, 0, &setup);
+    let plans = device.plans.clone();
+    // A request in the first round; the rounds after it finishes have
+    // nothing to do, as a loop waiting on a transfer.
+    const ROUNDS: usize = 40;
+    let mut script: Script = vec![Vec::new(); ROUNDS];
+    script[0] = vec![EngineRequest::Add(Box::new(request("r", 16, budget(3))))];
+    let finished = Arc::new(Mutex::new(Vec::new()));
+    let frontend = ScriptedFrontend {
+        script: script.into(),
+        react: no_reaction,
+        reacted: Vec::new(),
+        replies: Arc::new(Mutex::new(Vec::new())),
+        finished: finished.clone(),
+        outputs: Arc::new(Mutex::new(Vec::new())),
+    };
+    let spec = RankSpec {
+        rank: 0,
+        layout: Layout::Single,
+        tiers: Tiers::DeviceOnly,
+        config,
+        setup,
+        mesh_listener: mesh_listeners.pop().unwrap(),
+        addresses,
+    };
+
+    let _recording = PROFILE.lock().unwrap_or_else(PoisonError::into_inner);
+    profile::start();
+    drop(profile::span("marker"));
+    let outcome = run_rank(spec, device, None, || frontend, &AtomicBool::new(false));
+    let recording = profile::stop();
+    outcome.unwrap();
+    assert_eq!(finished.lock().unwrap().len(), 1);
+
+    // Other tests share the process: count this thread's spans only.
+    let tid = recording
+        .spans
+        .iter()
+        .find(|span| span.name == "marker")
+        .unwrap()
+        .tid;
+    let count = |name: &str| {
+        recording
+            .spans
+            .iter()
+            .filter(|span| span.tid == tid && span.name == name)
+            .count()
+    };
+    let rounds = count("EventLoop::round");
+    let forwards = plans
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, rids, _)| !rids.is_empty())
+        .count();
+    assert!(forwards > 0);
+    // Every round that dispatched or committed a forward is kept, the empty
+    // rounds are not, and a dropped round takes its phases with it.
+    assert!(
+        forwards <= rounds && rounds < ROUNDS / 2,
+        "{rounds} rounds kept"
+    );
+    assert_eq!(count("Scheduler::next_execution_plan"), rounds);
+    assert!(count("EventLoop::commit") >= forwards);
+    // The request's admission, once.
+    assert_eq!(count("ingress::admit"), 1);
+    assert_eq!(count("EventLoop::register"), 1);
+}
+
+/// What [`HeldQueryFrontend`] noted of a run.
+#[derive(Default)]
+struct RoundNotes {
+    /// Each round's start, with the plans the device had run before it.
+    starts: Vec<(i64, usize)>,
+    /// The round that let the store answer the query.
+    opened: Option<usize>,
+}
+
+/// Hands the engine one request and lets the store answer its L3 query
+/// once the loop spun `held` rounds waiting on it; gone once the request
+/// finished.
+struct HeldQueryFrontend {
+    request: Option<EngineRequest>,
+    gate: Arc<Gate>,
+    queries: Arc<Mutex<usize>>,
+    plans: Arc<Mutex<Vec<ExecutedPlan>>>,
+    held: usize,
+    finished: bool,
+    notes: Arc<Mutex<RoundNotes>>,
+}
+
+impl Frontend for HeldQueryFrontend {
+    fn receive(&mut self, _wait: Option<Duration>) -> Vec<EngineRequest> {
+        let mut notes = self.notes.lock().unwrap();
+        let round = notes.starts.len();
+        notes
+            .starts
+            .push((profile::now_ns(), self.plans.lock().unwrap().len()));
+        if notes.opened.is_none() && *self.queries.lock().unwrap() > 0 {
+            if self.held == 0 {
+                self.gate.open();
+                notes.opened = Some(round);
+            } else {
+                self.held -= 1;
+            }
+        }
+        self.request.take().into_iter().collect()
+    }
+
+    fn closed(&self) -> bool {
+        self.finished
+    }
+
+    fn send(&mut self, outputs: Vec<StreamedOutput>, _load: Load) {
+        self.finished |= outputs.iter().any(|output| output.finish_reason.is_some());
+    }
+
+    fn reply(&mut self, _output: ControlOutput) {}
+}
+
+#[test]
+fn a_profile_keeps_the_rounds_that_only_advance_storage() {
+    // One rank with L3, run on this thread. Its request waits on its L3
+    // query, then on the get that follows, before the device sees it: in
+    // between, the loop's only work is the storage operations'.
+    const HELD: usize = 20;
+    let setup = Setup::default();
+    let config = loop_config(1, false, &setup);
+    let (mut mesh_listeners, addresses) = mesh_listeners(1);
+    let device = fake_device(Layout::Single, 0, &setup);
+    let plans = device.plans.clone();
+    let store = ScriptedStore {
+        landed: None,
+        gate: Gate::closed(),
+        queries: Arc::new(Mutex::new(0)),
+        gets: Arc::new(Mutex::new(0)),
+    };
+    let (queries, gets) = (store.queries.clone(), store.gets.clone());
+    let notes = Arc::new(Mutex::new(RoundNotes::default()));
+    let frontend = HeldQueryFrontend {
+        request: Some(EngineRequest::Add(Box::new(request("r", 65, budget(2))))),
+        gate: store.gate.clone(),
+        queries: queries.clone(),
+        plans: plans.clone(),
+        held: HELD,
+        finished: false,
+        notes: notes.clone(),
+    };
+    let spec = RankSpec {
+        rank: 0,
+        layout: Layout::Single,
+        tiers: Tiers::L3,
+        config,
+        setup,
+        mesh_listener: mesh_listeners.pop().unwrap(),
+        addresses,
+    };
+
+    let _recording = PROFILE.lock().unwrap_or_else(PoisonError::into_inner);
+    profile::start();
+    drop(profile::span("marker"));
+    let outcome = run_rank(
+        spec,
+        device,
+        Some(store),
+        || frontend,
+        &AtomicBool::new(false),
+    );
+    let recording = profile::stop();
+    outcome.unwrap();
+    assert_eq!((*queries.lock().unwrap(), *gets.lock().unwrap()), (1, 1));
+
+    let notes = notes.lock().unwrap();
+    let opened = notes.opened.expect("the store held the query");
+    let (opened_ns, plans_before) = notes.starts[opened];
+    // The first round from then on that ran a plan on the device.
+    let device_round = (opened..notes.starts.len() - 1)
+        .find(|&round| notes.starts[round + 1].1 > plans_before)
+        .expect("the request reached the device");
+    let device_ns = notes.starts[device_round].0;
+    // Other tests share the process: count this thread's spans only.
+    let tid = recording
+        .spans
+        .iter()
+        .find(|span| span.name == "marker")
+        .unwrap()
+        .tid;
+    let kept_rounds = |within: &dyn Fn(i64, i64) -> bool| {
+        recording
+            .spans
+            .iter()
+            .filter(|span| {
+                span.tid == tid
+                    && span.name == "EventLoop::round"
+                    && within(span.begin_ns, span.end_ns)
+            })
+            .count()
+    };
+    // The rounds waiting on the query leave no spans, though each takes the
+    // replica's storage tick; a round taking the query's answer or starting
+    // the get does.
+    let waiting_ns = notes.starts[opened - HELD].0;
+    assert_eq!(
+        kept_rounds(&|begin, end| begin > waiting_ns && end < opened_ns),
+        0
+    );
+    assert!(
+        kept_rounds(&|_, end| end > opened_ns && end < device_ns) > 0,
+        "no round of the {} before the device's was kept",
+        device_round - opened
+    );
 }

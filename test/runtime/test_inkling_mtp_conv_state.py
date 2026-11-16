@@ -124,6 +124,7 @@ class TestInklingCacheContract:
             col_block_table={
                 "state": torch.tensor([[0, 5]], dtype=torch.int32, device="cuda")
             },
+            col_live_pages=torch.tensor([[5]], dtype=torch.int32, device="cuda"),
             num_extends=0,
         )
 
@@ -231,6 +232,7 @@ class TestInklingCacheContract:
                 "kv": torch.tensor([[0, 5]], dtype=torch.int32, device="cuda"),
                 "hidden": torch.tensor([[0, 6]], dtype=torch.int32, device="cuda"),
             },
+            col_live_pages=torch.tensor([[5], [6]], dtype=torch.int32, device="cuda"),
             num_extends=0,
         )
 
@@ -368,6 +370,9 @@ class TestInklingConvRingState:
             None,
             num_extends=0,
             publish_live=False,
+            dynamic_weights=None,
+            output_scale=1.0,
+            token_range=None,
         )
 
         for i in range(self.BS):
@@ -413,6 +418,9 @@ class TestInklingConvRingState:
             None,
             num_extends=0,
             publish_live=False,
+            dynamic_weights=None,
+            output_scale=1.0,
+            token_range=None,
         )
 
         expected = pre.clone()
@@ -456,6 +464,9 @@ class TestInklingConvRingState:
             None,
             num_extends=0,
             publish_live=False,
+            dynamic_weights=None,
+            output_scale=1.0,
+            token_range=None,
         )
 
         # Outside the channel slice (and other layers): unchanged.
@@ -543,6 +554,9 @@ class TestSconvUnifiedKernel:
             None,
             num_extends=0,
             publish_live=False,
+            dynamic_weights=None,
+            output_scale=1.0,
+            token_range=None,
         )
 
         expected = pre.clone()
@@ -601,6 +615,9 @@ class TestSconvUnifiedKernel:
             None,
             num_extends=0,
             publish_live=True,
+            dynamic_weights=None,
+            output_scale=1.0,
+            token_range=None,
         )
 
         for req, slot in ((0, 1), (1, 2)):
@@ -647,6 +664,9 @@ class TestSconvUnifiedKernel:
             None,
             num_extends=0,
             publish_live=False,
+            dynamic_weights=None,
+            output_scale=1.0,
+            token_range=None,
         )
         assert bool((checkpoint == -7).all())
 
@@ -683,6 +703,9 @@ class TestSconvUnifiedKernel:
             None,
             num_extends=1,
             publish_live=True,
+            dynamic_weights=None,
+            output_scale=1.0,
+            token_range=None,
         )
 
         zeros = torch.zeros(self.W - 1, self.DIM, device="cuda")
@@ -721,6 +744,9 @@ class TestSconvUnifiedKernel:
             field_b,
             num_extends=0,
             publish_live=True,
+            dynamic_weights=None,
+            output_scale=1.0,
+            token_range=None,
         )
 
         window = self._ref_window(torch.zeros(3, self.DIM, device="cuda"), x, self.K)
@@ -758,6 +784,9 @@ class TestSconvUnifiedKernel:
                 None,
                 num_extends=0,
                 publish_live=True,
+                dynamic_weights=None,
+                output_scale=1.0,
+                token_range=None,
             )
 
         run()  # warmup compiles outside capture

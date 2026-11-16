@@ -27,7 +27,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ts_scheduler::{ForwardBatchView, ForwardEvent, ForwardEventKind, SchedulerAbortView};
+use ts_scheduler::{profile, ForwardBatchView, ForwardEvent, ForwardEventKind, SchedulerAbortView};
 
 use ts_wire::output::FinishDetails;
 
@@ -198,7 +198,8 @@ pub struct HistorySeeds {
 /// before the seeded tail remain unspecified. A forward seeds its committed
 /// prefix after a prefix-cache hit, a slot handoff, a retracted request's restore into
 /// another slot, or a PD decode landing. Ownership is per admission, not
-/// per request id, which clients may reuse.
+/// per request id, which clients may reuse. Only the request's latest slot
+/// holds its current history; returning to an earlier slot must seed again.
 ///
 /// A model that reads at most `lookback` committed tokens behind the
 /// frontier (an n-gram hash, say) needs only those seeded: a 200K-token
@@ -234,6 +235,12 @@ impl HistoryRows {
                 .state(rid)
                 .ok_or_else(|| CommitError::History(rid.clone()))?;
             let held = self.owners.insert(slot, state.admission) == Some(state.admission);
+            if !held {
+                // An old row becomes stale as this request advances elsewhere.
+                // Forget it on a move, including before a prefix-zero extend.
+                self.owners
+                    .retain(|other_slot, owner| *other_slot == slot || *owner != state.admission);
+            }
             let total = state.prompt_ids.len() + state.output_ids.len();
             let boundary = if i < batch.num_extends {
                 batch.extend_prefix_lens[i].max(0) as usize
@@ -502,7 +509,7 @@ pub struct OutputProcessor {
     finish_log: FinishLog,
     /// When the last commit ran, for the request stats' decode steps.
     last_commit_at: f64,
-    /// Requests registered so far, numbering each admission.
+    /// Identities allocated so far, before data-plane admission.
     admissions: u64,
     metrics_enabled: bool,
     /// Metric deltas since the event loop last drained them.
@@ -775,10 +782,23 @@ impl OutputProcessor {
         }
     }
 
-    /// Admit a request. An abort that arrived before it applies now.
-    pub fn register(&mut self, rid: String, mut state: RequestState) {
-        self.admissions += 1;
+    /// Give a new request its identity before either plane registers it.
+    pub fn assign_admission(&mut self, state: &mut RequestState) {
+        assert_eq!(
+            state.admission, 0,
+            "request already has an admission identity"
+        );
+        self.admissions = self
+            .admissions
+            .checked_add(1)
+            .expect("admission identity exhausted");
         state.admission = self.admissions;
+    }
+
+    /// Register a request whose identity was assigned before data-plane admission.
+    /// An abort that arrived before it applies now.
+    pub fn register(&mut self, rid: String, mut state: RequestState) {
+        assert_ne!(state.admission, 0, "assign an identity before registration");
         if let Some(index) = self.pending_aborts.iter().position(|(id, _)| *id == rid) {
             self.pending_aborts.remove(index);
             state.abort("AbortReq from client", false, None);
@@ -1107,7 +1127,7 @@ impl OutputProcessor {
                 }
                 let lo = chunk_start.max(state.logprob_start_len);
                 let hi = (chunk_start + chunk_len).min(state.prompt_len - 1);
-                if state.wants_input_logprobs() && state.input_logprobs.is_none() && lo < hi {
+                if state.wants_input_logprobs() && !state.input_logprobs_finalized() && lo < hi {
                     row = (row_offset + lo - chunk_start, hi - lo, lo);
                     input.top_k = input.top_k.max(state.top_logprobs_num);
                 }
@@ -1230,6 +1250,7 @@ impl OutputProcessor {
         input_logprobs: Option<&InputLogprobPlan>,
         result: &ForwardResult,
     ) -> Result<Committed, CommitError> {
+        let _span = profile::span("OutputProcessor::commit");
         let rows = batch.request_ids.len();
         let check = |column, found| {
             if found == rows {
@@ -1658,7 +1679,7 @@ impl OutputProcessor {
         let input_logprobs = if state.input_logprobs_sent {
             None
         } else {
-            state.input_logprobs.clone()
+            state.input_logprobs.take()
         };
         state.input_logprobs_sent |= input_logprobs.is_some();
         let output_top_logprobs = state.output_top_logprobs.as_ref().map(|(values, ids)| {
@@ -1762,9 +1783,15 @@ mod tests {
         )
     }
 
+    fn register_state(p: &mut OutputProcessor, rid: String, mut state: RequestState) {
+        p.assign_admission(&mut state);
+        p.register(rid, state);
+    }
+
     fn register(p: &mut OutputProcessor, rid: &str, prompt: i64, max_new: i64, stop: &[i32]) {
         let stops: BTreeSet<i32> = stop.iter().copied().collect();
-        p.register(
+        register_state(
+            p,
             rid.to_owned(),
             RequestState::new(vec![0; prompt as usize], max_new, stops, true, None, false),
         );
@@ -1793,7 +1820,7 @@ mod tests {
             top_logprobs_num: top_k,
             computes_prompt_logprobs,
         });
-        p.register(rid.to_owned(), state);
+        register_state(p, rid.to_owned(), state);
     }
 
     /// The forward result of a plan's rows: each row's logprob is
@@ -1822,7 +1849,7 @@ mod tests {
     fn register_history(p: &mut OutputProcessor, rid: &str, prompt: &[i32], output: &[i32]) {
         let mut state = RequestState::new(prompt.to_vec(), 8, BTreeSet::new(), true, None, false);
         state.output_ids = output.to_vec();
-        p.register(rid.to_owned(), state);
+        register_state(p, rid.to_owned(), state);
     }
 
     /// One forward over `rows` of (rid, slot, extend prefix length), the
@@ -1865,6 +1892,7 @@ mod tests {
             schema_slot: String::new(),
             markers: Some((1, 2)),
             implicit_closer: None,
+            boundary: None,
         };
         let mut state = RequestState::new(vec![1], 10, BTreeSet::new(), true, None, false);
         state.reasoning_tokens = Some(crate::request::ReasoningTokens::new(
@@ -1872,7 +1900,7 @@ mod tests {
             &state.prompt_ids,
         ));
         let mut p = processor(None);
-        p.register("r".to_owned(), state);
+        register_state(&mut p, "r".to_owned(), state);
 
         for (i, (token, expected)) in [(10, 1), (11, 2), (2, 2), (12, 2)].into_iter().enumerate() {
             let input_length = i as i32 + 1;
@@ -1922,7 +1950,7 @@ mod tests {
                         port: 8080,
                     };
                     processor.sample_ttft(&mut state, Some(&bootstrap));
-                    processor.register(rid.into(), state);
+                    register_state(&mut processor, rid.into(), state);
                     processor.bootstrapped(rid);
                     if role == Role::Prefill {
                         processor.mark_scheduled(&[rid.into()]);
@@ -2004,6 +2032,7 @@ mod tests {
             schema_slot: String::new(),
             markers: Some((0, 2)),
             implicit_closer: None,
+            boundary: None,
         };
         let state = p.states.get_mut("a").unwrap();
         state.reasoning_tokens = Some(crate::request::ReasoningTokens::new(
@@ -2131,6 +2160,47 @@ mod tests {
         // "a" recovers into slot 1 after "b" used it: reseed its prefix.
         let recovery = rows.seeds(&history_batch(&[("a", 1, 4)], 1), &p).unwrap();
         assert_eq!(recovery.unwrap().prefix_lengths, [4]);
+    }
+
+    #[test]
+    fn a_request_returning_to_an_earlier_slot_reseeds_its_decode_history() {
+        let mut p = processor(None);
+        register_history(&mut p, "a", &[10, 11, 12, 13], &[20, 21]);
+        let mut rows = HistoryRows::new(Some(3));
+        rows.seeds(&history_batch(&[("a", 1, 0)], 1), &p).unwrap();
+        rows.seeds(&history_batch(&[("a", 2, 0)], 0), &p).unwrap();
+        // The request advanced in slot 2 before a second restore returned
+        // it to slot 1. Slot 1 still names it, but holds an older history.
+        p.states.get_mut("a").unwrap().output_ids.extend([22, 23]);
+        let restored = history_batch(&[("a", 1, 0)], 0);
+        assert_eq!(
+            rows.seeds(&restored, &p).unwrap(),
+            Some(HistorySeeds {
+                slots: vec![1],
+                prefix_lengths: vec![7],
+                tokens: vec![vec![20, 21, 22]],
+            })
+        );
+        assert_eq!(rows.seeds(&restored, &p).unwrap(), None);
+    }
+
+    #[test]
+    fn a_request_returning_to_an_earlier_slot_reseeds_its_prefill_history() {
+        let mut p = processor(None);
+        register_history(&mut p, "a", &[10, 11, 12, 13, 14, 15], &[]);
+        let mut rows = HistoryRows::new(Some(3));
+        rows.seeds(&history_batch(&[("a", 1, 0)], 1), &p).unwrap();
+        rows.seeds(&history_batch(&[("a", 2, 2)], 1), &p).unwrap();
+        let restored = history_batch(&[("a", 1, 4)], 1);
+        assert_eq!(
+            rows.seeds(&restored, &p).unwrap(),
+            Some(HistorySeeds {
+                slots: vec![1],
+                prefix_lengths: vec![4],
+                tokens: vec![vec![11, 12, 13]],
+            })
+        );
+        assert_eq!(rows.seeds(&restored, &p).unwrap(), None);
     }
 
     #[test]
@@ -2292,6 +2362,35 @@ mod tests {
         let c = p.commit(&last, Some(&plan), &scored(&plan, &[9])).unwrap();
         assert_eq!(
             c.outputs[0].input_logprobs.as_ref().unwrap().values,
+            [None, Some(0.0), Some(-1.0), Some(-2.0)]
+        );
+    }
+
+    #[test]
+    fn replay_after_sending_prompt_logprobs_does_not_regather_or_resend_them() {
+        let mut p = processor(None);
+        register_scored(&mut p, "r", vec![5, 6, 7, 8], 0, 0, true);
+        let prompt = batch(&[("r", 4, 0, 4)], 1);
+        let plan = p.logprob_plan(&prompt).input.unwrap();
+        let first = p
+            .commit(&prompt, Some(&plan), &scored(&plan, &[9]))
+            .unwrap();
+        assert_eq!(
+            first.outputs[0].input_logprobs.as_ref().unwrap().ids,
+            [5, 6, 7, 8]
+        );
+        assert!(p.state("r").unwrap().input_logprobs.is_none());
+        assert!(p.state("r").unwrap().input_logprobs_finalized());
+        // The request remains live, but a later retraction can replay its
+        // prefill. The sent marker outlives the buffers transferred above.
+        assert!(p.logprob_plan(&prompt).input.is_none());
+        let replay = p.commit(&prompt, None, &result(&[10], &[1])).unwrap();
+        assert!(replay.outputs[0].input_logprobs.is_none());
+        assert!(p.logprob_plan(&prompt).input.is_none());
+        // The first output owns its data independently of the live state.
+        drop(p);
+        assert_eq!(
+            first.outputs[0].input_logprobs.as_ref().unwrap().values,
             [None, Some(0.0), Some(-1.0), Some(-2.0)]
         );
     }
@@ -2477,7 +2576,8 @@ mod tests {
     #[test]
     fn ngram_windows_follow_the_committed_tokens() {
         let mut p = OutputProcessor::new(None, 1, None, Role::Plain, NO_FINISH_LOG, true, None);
-        p.register(
+        register_state(
+            &mut p,
             "r".to_owned(),
             RequestState::new(vec![10, 11, 12, 13], 8, BTreeSet::new(), true, None, false),
         );
@@ -2990,7 +3090,8 @@ mod tests {
     #[test]
     fn sampled_logprobs_ride_with_their_tokens() {
         let mut p = processor(None);
-        p.register(
+        register_state(
+            &mut p,
             "r".to_owned(),
             RequestState::new(vec![0], 10, BTreeSet::new(), true, None, true),
         );
@@ -3006,7 +3107,8 @@ mod tests {
     fn cumulative_probabilities_follow_streamed_tokens_and_logprob_requests() {
         let mut p = processor(None);
         for (rid, logprobs) in [("scored", true), ("plain", false)] {
-            p.register(
+            register_state(
+                &mut p,
                 rid.to_owned(),
                 RequestState::new(vec![0], 4, BTreeSet::new(), true, Some(2), logprobs),
             );
@@ -3064,7 +3166,8 @@ mod tests {
     #[test]
     fn a_stop_token_cuts_cumulative_probabilities_with_its_verify_window() {
         let mut p = processor(Some(3));
-        p.register(
+        register_state(
+            &mut p,
             "r".to_owned(),
             RequestState::new(vec![0], 10, BTreeSet::from([7]), true, None, true),
         );

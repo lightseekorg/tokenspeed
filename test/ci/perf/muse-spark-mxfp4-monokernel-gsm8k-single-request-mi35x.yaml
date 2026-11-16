@@ -1,0 +1,99 @@
+api_version: ci.tokenspeed.io/v1
+# Single-request decode speed and accuracy of the Muse Spark gfx950 decode
+# monokernel (--decode-monokernel) with its DFlash2 draft, on TP8 (MoE TP8,
+# EP1) of an MI35x 8-GPU runner, which already serves this checkpoint for its
+# AIME26 eval.
+#
+# Requests run one at a time, so every decode step has one request and every
+# verify launch 8 token rows: the target's and the draft's monokernels serve
+# all of them. Layers 0 and 61 keep the regular path.
+#
+# One server start gates both: the benchmark exits with status 1 below
+# --min-accuracy, and perf_reference (set from this runner's runs) gates the
+# decode rate: a run whose decode steps leave the monokernels falls below it.
+name: perf-muse-spark-mxfp4-monokernel-gsm8k-single-request-mi35x
+type: perf
+workflow_stage: model-test
+triggers:
+  - per-commit
+  - manual
+# The model modules this task serves; pull requests changing only other models skip it.
+model_sources:
+  - python/tokenspeed/runtime/models/muse_spark.py
+  - python/tokenspeed/runtime/models/muse_spark_audio.py
+  - python/tokenspeed/runtime/models/muse_spark_vision.py
+  - python/tokenspeed/runtime/models/muse_spark_monokernel.py
+runner:
+  labels:
+    - amd-mi35x-8gpu-test
+env:
+  CI: "true"
+  # main compiles kernels while serving under this recipe (gaps in the startup warmups); set this to error once those warmups cover them.
+  TOKENSPEED_JIT_COMPILE_CHECK: warn
+install:
+  - bash test/ci_system/install_deps_rocm.sh
+server:
+  command: >-
+    ts serve
+    --model amd/Muse-Spark-Open-816B-A42B-Quark-MXFP4
+    --served-model-name muse-spark
+    --tp 8
+    --moe-tp-size 8
+    --ep-size 1
+    --dtype bfloat16
+    --quantization mxfp4
+    --moe-backend gluon
+    --kv-cache-dtype fp8_e4m3
+    --decode-monokernel
+    --speculative-algorithm DFLASH
+    --speculative-draft-model-path RadixArk/Muse-Spark-Open-DFlash2
+    --speculative-num-steps 7
+    --speculative-num-draft-tokens 8
+    --speculative-eagle-topk 1
+    --max-model-len 65536
+    --max-num-seqs 1
+    --chunked-prefill-size 8192
+    --max-prefill-tokens 8192
+    --disable-prefill-graph
+    --gpu-memory-utilization 0.92
+    --reasoning-parser muse
+    --sampling-backend triton
+    --disable-kvstore
+    --kvstore-ratio 0.0
+    --host 127.0.0.1
+    --port 8000
+    --policy round_robin
+    --engine-startup-timeout 3000
+    --gateway-startup-timeout 600
+  ready:
+    url: http://127.0.0.1:8000/readiness
+    timeout: 3600
+    interval: 10
+perf:
+  install:
+    - python3 -m uv venv --seed --clear /tmp/single-request-bench && python3 -m uv pip install --python /tmp/single-request-bench/bin/python 'huggingface_hub==2.3.0' 'pyarrow==26.0.0'
+  # The first 128 questions of the GSM8K test split, greedy, up to 2048 output
+  # tokens, at the chat template's low reasoning effort so that answers fit.
+  command: >-
+    HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache
+    /tmp/single-request-bench/bin/python -I test/single_request_benchmark/gsm8k_decode.py
+    --base-url http://127.0.0.1:8000
+    --model muse-spark
+    --config muse-spark-mxfp4-dflash2-monokernel
+    --num-prompts 128
+    --max-tokens 2048
+    --chat-template-kwargs '{"reasoning_effort": "low"}'
+    --min-accuracy 0.88
+    --num-gpus 8
+    --timeout-s 1200
+    --output .ci-artifacts/published/gsm8k-single-request/requests.jsonl
+report:
+  github_step_summary: true
+perf_threshold: 0.9
+# Values are [Latency (tps/user), Throughput (tps/gpu)].
+#
+# Rounded down from the median of three runs on this runner (771.7 tok/s per
+# request, 79.4 tok/s per GPU, 125 / 128 correct). The regular path decodes
+# about 20% slower on this recipe, below 0.9 of the reference.
+perf_reference:
+  1: [770, 79]

@@ -42,22 +42,22 @@ import torch
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.utils.server_args import ServerArgs
+from tokenspeed.runtime.utils.spec_block_geometry import resolve_draft_query_width
 
 ComponentT = TypeVar("ComponentT", bound="AttnComponentSpec")
 
 
 def resolve_speculative_num_tokens(
-    server_args: ServerArgs, is_draft: bool = False
+    server_args: ServerArgs, is_draft: bool, *, sample_from_anchor: bool
 ) -> int:
     """Return the query width seen by this attention backend.
 
-    Target verification consumes the full candidate window. DSpark's draft
-    model samples from its anchor row, so seven draft queries produce the seven
-    proposals in an eight-token verify window.
+    Target verification consumes the full candidate window. Draft queries
+    follow the checkpoint's normalized anchor-sampling policy.
     """
     width = int(server_args.speculative_num_draft_tokens)
-    if is_draft and server_args.speculative_algorithm == "DSPARK":
-        return width - 1
+    if is_block_drafter(server_args.speculative_algorithm, is_draft):
+        return resolve_draft_query_width(width, sample_from_anchor)
     return width
 
 
@@ -228,6 +228,10 @@ class AttnConfig:
     qcp_size: int = 1
     qcp_rank: int = 0
     qcp_group: tuple[int, ...] = (0,)
+    # The attention TP group: a long sparse prefill can hand each rank a row
+    # shard with every head of it (replicated KV only).
+    attn_tp_rank: int = 0
+    attn_tp_group: tuple[int, ...] = (0,)
     components: tuple[AttnComponentSpec, ...]
 
     def __post_init__(self):
@@ -293,6 +297,13 @@ class AttnConfig:
                     raise ValueError("FlashMLA DCP decode requires CUDA")
             elif softmax.backend_name == "tokenspeed_mla":
                 pass
+            elif softmax.backend_name in ("mla", "gluon") and not softmax.is_dsa:
+                # The leaf refuses a platform without a decode kernel that
+                # returns the LSE (MLABackend.configure_runtime).
+                if self.draft_block_decode and not self.draft_block_causal:
+                    raise ValueError(
+                        "MLA DCP decode does not support non-causal block drafts"
+                    )
             elif softmax.is_dsa and softmax.backend_name in (None, "dsa"):
                 device_type = torch.device(self.device).type
                 if device_type not in ("cuda", "npu"):
@@ -313,7 +324,7 @@ class AttnConfig:
             else:
                 raise ValueError(
                     "--kv-parallel-size > 1 (DCP decode) currently requires "
-                    "DSA, FlashMLA or CuTe MLA attention"
+                    "DSA, FlashMLA, CuTe MLA or MLA attention"
                 )
 
     def component(self, cls: type[ComponentT]) -> ComponentT | None:
@@ -381,6 +392,8 @@ def model_wide_kwargs(
         qcp_size=1 if draft_unsharded else attn_mapping.qcp_size,
         qcp_rank=0 if draft_unsharded else attn_mapping.qcp_rank,
         qcp_group=(0,) if draft_unsharded else attn_mapping.qcp_group,
+        attn_tp_rank=attn_mapping.tp_rank,
+        attn_tp_group=attn_mapping.tp_group,
     )
     if server_args.speculative_algorithm is not None:
         kwargs.update(
@@ -388,7 +401,15 @@ def model_wide_kwargs(
             speculative_num_draft_tokens=(
                 speculative_num_draft_tokens
                 if speculative_num_draft_tokens is not None
-                else resolve_speculative_num_tokens(server_args, is_draft)
+                else resolve_speculative_num_tokens(
+                    server_args,
+                    is_draft,
+                    sample_from_anchor=(
+                        model_config.draft_sample_from_anchor
+                        if is_block_drafter(server_args.speculative_algorithm, is_draft)
+                        else False
+                    ),
+                )
             ),
         )
     return kwargs

@@ -50,7 +50,7 @@ namespace tokenspeed::test {
 namespace {
 
 CacheKey Key(const std::string& hash, std::uint32_t group = 0) {
-    return CacheKey{.group_id = group, .content_hash = hash, .page_offset = 0};
+    return CacheKey{.group_id = group, .content_hash = ContentHash{hash}, .page_offset = 0};
 }
 
 // The names of `names`' entries in `pool`'s eviction order.
@@ -92,7 +92,8 @@ TEST(CheckpointDemotionIndexTest, DemoteDatesBackNeverForwardSkipsHeldEntriesAnd
         << "demoted already";
     EXPECT_FALSE(index.Demote(pool, Key("a"), 15, /*write_back_holds=*/0)) << "never dates forward";
     EXPECT_FALSE(index.Demote(pool, Key("missing"), CacheCoordinator::kDemotedAccessEpoch, /*write_back_holds=*/0));
-    EXPECT_EQ(index.Inspect(pool, Key("c"))->metadata.last_access_epoch, CacheCoordinator::kDemotedAccessEpoch);
+    EXPECT_EQ(index.Inspect(pool, Key("c"))->metadata.eviction.last_access_epoch,
+              CacheCoordinator::kDemotedAccessEpoch);
     EXPECT_TRUE(index.Inspect(pool, Key("c"))->metadata.demoted);
     EXPECT_FALSE(index.Inspect(pool, Key("a"))->metadata.demoted);
     EXPECT_EQ(index.Inspect(pool, Key("c"))->metadata.max_access_epoch, 30u) << "the newest touch stays";
@@ -125,7 +126,8 @@ TEST(CheckpointDemotionIndexTest, OnlyADemotionMarksAnEntryAndATouchEndsTheMark)
     const auto demoted = [&](const char* name) { return index.Inspect(pool, Key(name))->metadata.demoted; };
     session->demoted = true;
     ASSERT_EQ(index.DemoteSession(pool, session), 2u);
-    EXPECT_EQ(index.Inspect(pool, Key("a"))->metadata.last_access_epoch, CacheCoordinator::kDemotedAccessEpoch);
+    EXPECT_EQ(index.Inspect(pool, Key("a"))->metadata.eviction.last_access_epoch,
+              CacheCoordinator::kDemotedAccessEpoch);
     EXPECT_FALSE(demoted("a"));
     EXPECT_FALSE(demoted("b"));
 
@@ -134,7 +136,7 @@ TEST(CheckpointDemotionIndexTest, OnlyADemotionMarksAnEntryAndATouchEndsTheMark)
     PrefixMatch hit =
         index.AcquireMatched(pool, std::vector<CacheKey>{Key("a")}, 0, GroupPrefixProbe{.hits = {1}}, 30, session);
     EXPECT_FALSE(demoted("a"));
-    EXPECT_EQ(index.Inspect(pool, Key("a"))->metadata.last_access_epoch, CacheCoordinator::kDemotedAccessEpoch)
+    EXPECT_EQ(index.Inspect(pool, Key("a"))->metadata.eviction.last_access_epoch, CacheCoordinator::kDemotedAccessEpoch)
         << "the session is demoted still";
 
     CacheBlockRef held = index.Find(pool, Key("b"));
@@ -142,7 +144,7 @@ TEST(CheckpointDemotionIndexTest, OnlyADemotionMarksAnEntryAndATouchEndsTheMark)
     index.MarkDemoted(pool, Key("dated"), CacheCoordinator::kDemotedAccessEpoch);
     EXPECT_TRUE(demoted("b"));
     EXPECT_FALSE(demoted("dated"));
-    EXPECT_EQ(index.Inspect(pool, Key("dated"))->metadata.last_access_epoch, 20u);
+    EXPECT_EQ(index.Inspect(pool, Key("dated"))->metadata.eviction.last_access_epoch, 20u);
 }
 
 // The holds of an eviction write-back that publishes into the entry do not
@@ -158,47 +160,49 @@ TEST(CheckpointDemotionIndexTest, DemoteDiscountsOnlyTheWriteBackHolds) {
     other.reset();
     EXPECT_FALSE(index.Demote(pool, Key("h"), CacheCoordinator::kDemotedAccessEpoch, /*write_back_holds=*/0));
     EXPECT_TRUE(index.Demote(pool, Key("h"), CacheCoordinator::kDemotedAccessEpoch, /*write_back_holds=*/1));
-    EXPECT_EQ(index.Inspect(pool, Key("h"))->metadata.last_access_epoch, CacheCoordinator::kDemotedAccessEpoch);
+    EXPECT_EQ(index.Inspect(pool, Key("h"))->metadata.eviction.last_access_epoch,
+              CacheCoordinator::kDemotedAccessEpoch);
 }
 
 TEST(CheckpointLineageTest, RecordsPublicationsAndCountsResumesUpToTwo) {
     CheckpointLineage lineage;
-    EXPECT_EQ(lineage.FindPublication("c"), nullptr);
-    lineage.RecordPublication("c", {.resumed_tokens = 20, .access_epoch = 7});
-    ASSERT_NE(lineage.FindPublication("c"), nullptr);
-    EXPECT_EQ(lineage.FindPublication("c")->resumed_tokens, 20);
-    lineage.RecordPublication("c", {.resumed_tokens = 0, .access_epoch = 9});
-    EXPECT_EQ(lineage.FindPublication("c")->resumed_tokens, 0) << "a later publication replaces the earlier";
-    EXPECT_EQ(lineage.FindPublication("c")->access_epoch, 9u);
+    EXPECT_EQ(lineage.FindPublication(ContentHash{"c"}), nullptr);
+    lineage.RecordPublication(ContentHash{"c"}, {.resumed_tokens = 20, .access_epoch = 7});
+    ASSERT_NE(lineage.FindPublication(ContentHash{"c"}), nullptr);
+    EXPECT_EQ(lineage.FindPublication(ContentHash{"c"})->resumed_tokens, 20);
+    lineage.RecordPublication(ContentHash{"c"}, {.resumed_tokens = 0, .access_epoch = 9});
+    EXPECT_EQ(lineage.FindPublication(ContentHash{"c"})->resumed_tokens, 0)
+        << "a later publication replaces the earlier";
+    EXPECT_EQ(lineage.FindPublication(ContentHash{"c"})->access_epoch, 9u);
 
-    EXPECT_EQ(lineage.Resumes("b"), 0);
-    lineage.NoteResume("b");
-    EXPECT_EQ(lineage.Resumes("b"), 1);
-    lineage.NoteResume("b");
-    lineage.NoteResume("b");
-    EXPECT_EQ(lineage.Resumes("b"), 2) << "more than one";
+    EXPECT_EQ(lineage.Resumes(ContentHash{"b"}), 0);
+    lineage.NoteResume(ContentHash{"b"});
+    EXPECT_EQ(lineage.Resumes(ContentHash{"b"}), 1);
+    lineage.NoteResume(ContentHash{"b"});
+    lineage.NoteResume(ContentHash{"b"});
+    EXPECT_EQ(lineage.Resumes(ContentHash{"b"}), 2) << "more than one";
 }
 
 // Both maps forget their oldest key past kMaxEntries; a key recorded again
 // keeps its place.
 TEST(CheckpointLineageTest, ForgetsTheOldestKeysPastItsBound) {
     CheckpointLineage lineage;
-    lineage.RecordPublication("first", {.resumed_tokens = 4, .access_epoch = 1});
-    lineage.RecordPublication("second", {.resumed_tokens = 8, .access_epoch = 2});
-    lineage.NoteResume("first");
+    lineage.RecordPublication(ContentHash{"first"}, {.resumed_tokens = 4, .access_epoch = 1});
+    lineage.RecordPublication(ContentHash{"second"}, {.resumed_tokens = 8, .access_epoch = 2});
+    lineage.NoteResume(ContentHash{"first"});
     for (std::size_t i = 0; i + 2 < CheckpointLineage::kMaxEntries; ++i) {
-        lineage.RecordPublication("p" + std::to_string(i), {});
-        lineage.NoteResume("p" + std::to_string(i));
+        lineage.RecordPublication(ContentHash{"p" + std::to_string(i)}, {});
+        lineage.NoteResume(ContentHash{"p" + std::to_string(i)});
     }
-    lineage.RecordPublication("first", {.resumed_tokens = 12, .access_epoch = 3});
-    ASSERT_NE(lineage.FindPublication("first"), nullptr) << "kMaxEntries keys fit";
-    lineage.RecordPublication("newest", {});
-    EXPECT_EQ(lineage.FindPublication("first"), nullptr) << "re-recording kept the oldest place";
-    EXPECT_NE(lineage.FindPublication("second"), nullptr);
-    EXPECT_EQ(lineage.Resumes("first"), 1);
-    lineage.NoteResume("p-last");
-    lineage.NoteResume("p-newest");
-    EXPECT_EQ(lineage.Resumes("first"), 0) << "forgotten";
+    lineage.RecordPublication(ContentHash{"first"}, {.resumed_tokens = 12, .access_epoch = 3});
+    ASSERT_NE(lineage.FindPublication(ContentHash{"first"}), nullptr) << "kMaxEntries keys fit";
+    lineage.RecordPublication(ContentHash{"newest"}, {});
+    EXPECT_EQ(lineage.FindPublication(ContentHash{"first"}), nullptr) << "re-recording kept the oldest place";
+    EXPECT_NE(lineage.FindPublication(ContentHash{"second"}), nullptr);
+    EXPECT_EQ(lineage.Resumes(ContentHash{"first"}), 1);
+    lineage.NoteResume(ContentHash{"p-last"});
+    lineage.NoteResume(ContentHash{"p-newest"});
+    EXPECT_EQ(lineage.Resumes(ContentHash{"first"}), 0) << "forgotten";
 }
 
 // One KV group and one State group, P = 2, on Device and Host.
@@ -262,7 +266,7 @@ TEST(CheckpointDemotionCoordinatorTest, BoundaryKeysLeaveTheWindowAKeptBoundaryR
     const auto keys = [&](const std::vector<std::int32_t>& kept_boundaries) {
         std::vector<std::string> names;
         for (const CacheKey& key : coordinator.BoundaryCheckpointKeys(chain, kept_boundaries)) {
-            names.push_back(std::to_string(key.group_id) + ":" + key.content_hash + "/" +
+            names.push_back(std::to_string(key.group_id) + ":" + key.content_hash.ToString() + "/" +
                             std::to_string(key.page_offset));
         }
         return names;
@@ -306,7 +310,7 @@ protected:
         const std::optional<CacheCoordinator::AdmissionResult> admitted =
             coordinator_.Admit(coordinator_.ProbePrefix({}), demands, RequestProgress{}, /*copy_in_blocks=*/{},
                                /*copy_in_point=*/std::nullopt, /*request_access_epoch=*/std::nullopt,
-                               /*evict_blocks_past_segments=*/false, session_id);
+                               /*evict_blocks_past_segments=*/false, session_id, /*cache_group_id=*/{});
         if (!admitted) {
             ADD_FAILURE() << "the admission failed";
             return {};
@@ -365,7 +369,7 @@ protected:
     std::optional<std::uint64_t> HostEpoch(const CacheKey& key) const {
         const std::optional<PrefixCacheIndex::CachedBlockSnapshot> entry =
             coordinator_.GroupPrefixIndex(static_cast<std::int32_t>(key.group_id)).Inspect(host_, key);
-        return entry ? std::optional{entry->metadata.last_access_epoch} : std::nullopt;
+        return entry ? std::optional{entry->metadata.eviction.last_access_epoch} : std::nullopt;
     }
     bool HostEntryDemoted(const CacheKey& key) const {
         const std::optional<PrefixCacheIndex::CachedBlockSnapshot> entry =
@@ -641,9 +645,10 @@ TEST_F(CheckpointDemotionWriteBackTest, ASessionsDemotedEntriesKeepTheirOwnRules
             }
             const CacheKey shorter_checkpoint = Key(shorter[1], kState);
             const CacheKey longer_checkpoint = Key(longer[3], kState);
-            ASSERT_EQ(
-                coordinator_.GroupPrefixIndex(kState).Inspect(device_, shorter_checkpoint)->metadata.last_access_epoch,
-                CacheCoordinator::kDemotedAccessEpoch);
+            ASSERT_EQ(coordinator_.GroupPrefixIndex(kState)
+                          .Inspect(device_, shorter_checkpoint)
+                          ->metadata.eviction.last_access_epoch,
+                      CacheCoordinator::kDemotedAccessEpoch);
             coordinator_.QueueCachedBlocksForStore(shorter);
             EXPECT_EQ(coordinator_.TakePendingStores().size(), 3u) << "the two pages and the checkpoint";
 

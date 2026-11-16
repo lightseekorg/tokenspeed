@@ -25,7 +25,11 @@ import functools
 from collections.abc import Callable
 
 import torch
-from tokenspeed_kernel.ops.communication.triton import all_gather_inner, create_state
+from tokenspeed_kernel.ops.communication.triton import (
+    TritonRSAGState,
+    all_gather_inner,
+    create_state,
+)
 from tokenspeed_kernel.ops.gemm import mm as kernel_mm
 from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
 from tokenspeed_kernel.ops.sampling.cute_dsl import (
@@ -622,7 +626,9 @@ class LogitsProcessor(nn.Module):
             return True
         return group_has_fabric(self.tp_group)
 
-    def _init_all_gather_state(self, lm_head: VocabParallelEmbedding):
+    def _init_all_gather_state(
+        self, lm_head: VocabParallelEmbedding, words_per_logit: int
+    ) -> TritonRSAGState | None:
         if not current_platform().is_nvidia or _force_deterministic_rsag():
             return None
 
@@ -638,13 +644,17 @@ class LogitsProcessor(nn.Module):
         if vocab_padded % (self.tp_size * 8) != 0:
             return None
 
-        key = (self.tp_group, vocab_padded, self._logits_ag_max_tokens)
+        key = (
+            self.tp_group,
+            vocab_padded * words_per_logit,
+            self._logits_ag_max_tokens,
+        )
         if key not in self._LOGITS_AG_STATES:
             self._LOGITS_AG_STATES[key] = create_state(
                 group=pg_manager.get_process_group("nccl", self.tp_group),
                 rank_in_group=self.tp_rank,
                 max_tokens=self._logits_ag_max_tokens,
-                hidden_size=vocab_padded,
+                hidden_size=vocab_padded * words_per_logit,
                 device=None,
             )
         return self._LOGITS_AG_STATES[key]
@@ -1501,7 +1511,7 @@ class LogitsProcessor(nn.Module):
                 logits, lm_head, require_full_vocab=require_full_vocab
             )
 
-        logits = logits[:, : self.config.vocab_size].contiguous()
+        logits = self._vocab_logits(logits[:, : self.config.vocab_size])
 
         if self.final_logit_softcapping:
             fused_softcap_generic(
@@ -1520,31 +1530,38 @@ class LogitsProcessor(nn.Module):
         require_full_vocab: bool,
     ) -> torch.Tensor:
         """Gather full-vocabulary logits, using a private buffer when required."""
-        # The multicast buffer/kernel is BF16-only; retain other logits dtypes
-        # through the existing collective, including when a state is cached.
+        # The multicast kernel moves BF16 words, or two words per FP32 logit.
         # A private full-vocab result never uses the shared buffer either.
-        state = (
-            self._all_gather_state
-            if logits.dtype == torch.bfloat16 and not require_full_vocab
-            else None
+        words_per_logit = (
+            {torch.bfloat16: 1, torch.float32: 2}.get(logits.dtype, 0)
+            if not require_full_vocab
+            else 0
         )
+        state = self._all_gather_state if words_per_logit else None
         if state is self._LOGITS_AG_STATE_UNINITIALIZED:
             # create_state rendezvouses; leave it for an eager call.
             if is_current_stream_capturing(logits.device):
                 state = None
             else:
-                state = self._all_gather_state = self._init_all_gather_state(lm_head)
+                state = self._all_gather_state = self._init_all_gather_state(
+                    lm_head, words_per_logit
+                )
 
-        if state is not None and logits.size(0) <= self._logits_ag_max_tokens:
+        words = logits.view(torch.bfloat16) if words_per_logit else None
+        if (
+            state is not None
+            and logits.size(0) <= self._logits_ag_max_tokens
+            and words.size(-1) * self.tp_size <= state.hidden_dim
+        ):
             # DP target and draft share this buffer; retain its entry barrier.
             # The existing plain TP path has intervening synchronization.
             logits = all_gather_inner(
                 state,
-                logits,
-                tp_hidden_dim=logits.size(-1) * self.tp_size,
+                words,
+                tp_hidden_dim=words.size(-1) * self.tp_size,
                 skip_entry_sync=not self.dp_lm_head_tp,
                 safe=False,
-            )
+            ).view(logits.dtype)
         elif (
             current_platform().is_cdna4
             and not require_full_vocab
@@ -1575,6 +1592,11 @@ class LogitsProcessor(nn.Module):
                 dim=1,
             )
         return logits
+
+    def _vocab_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """The vocabulary columns as a tensor the caller owns. ``logits`` is a
+        column slice, possibly a view of the group's shared gather buffer."""
+        return logits.contiguous()
 
     def _argmax(self, logits: torch.Tensor) -> torch.Tensor:
         state = self._prepared_dist_argmax_state(logits.dtype)

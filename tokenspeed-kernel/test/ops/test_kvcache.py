@@ -22,6 +22,13 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.kvcache.index_k_scale import (
+    decode_index_k_scale,
+    encode_index_k_scale,
+    index_k_scale_dtype,
+    index_k_scale_ue8m0,
+    round_index_k_scale,
+)
 from tokenspeed_kernel.ops.kvcache.triton import (
     _copy_page_fields_kernel,
     _copy_state_rows_kernel,
@@ -47,8 +54,10 @@ from tokenspeed_kernel.ops.kvcache.triton import (
 )
 from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
     _count_slots_by_owner,
+    _decode_visible_lengths,
     _local_visible_lengths,
     _split_slots_by_owner,
+    kvp_decode_visible_lengths,
     kvp_local_visible_lengths,
     split_slots_by_owner,
 )
@@ -91,6 +100,57 @@ def test_kvp_visible_lengths_reuses_compile_across_table_shapes(device: str) -> 
         run(3, 63, 4, 0)
         run(2, 129, 3, 13)
         run(5, 1024, 4, 16)
+
+
+@pytest.mark.parametrize(
+    "queries,offset,len_dtype", [(1, 0, torch.int32), (4, -3, torch.int64)]
+)
+def test_kvp_decode_visible_lengths_matches_the_separate_launches(
+    device: str, queries: int, offset: int, len_dtype: torch.dtype
+) -> None:
+    page, groups = 64, 6
+
+    def run(batch, cols, padding, start):
+        owned = (torch.arange(cols) % 3 == 1) | (torch.arange(cols) == 0)
+        prefix = torch.zeros((start + batch, cols + 1 + padding), dtype=torch.int32)
+        prefix[:, 1 : cols + 1] = owned.int().cumsum(0)
+        # Endpoints from below zero (clamped) through the table's last token.
+        seq_lens = torch.randint(0, cols * page + 1, (start + batch,), dtype=len_dtype)
+        seq_lens[start] = 1
+        seq_lens[-1] = cols * page
+        # Rows after ``start`` others, as a mixed round's decode rows follow its extends.
+        prefix = prefix.to(device)[start:, : cols + 1]
+        seq_lens = seq_lens.to(device)[start:]
+        endpoints = (
+            (seq_lens[:, None] + torch.arange(offset, offset + queries, device=device))
+            .clamp_min_(0)
+            .to(torch.int32)
+        )
+        local = torch.empty_like(endpoints)
+        kvp_local_visible_lengths(prefix, endpoints, page_size=page, out=local)
+        local = local.reshape(-1)
+        cache = local.clamp_min(1).repeat_interleave(groups)
+        got_local = torch.full_like(local, -7)
+        got_cache = torch.full_like(cache, -7)
+        kvp_decode_visible_lengths(
+            prefix,
+            seq_lens,
+            offset=offset,
+            queries=queries,
+            groups=groups,
+            page_size=page,
+            local_lengths=got_local,
+            cache_lengths=got_cache,
+        )
+        torch.testing.assert_close(got_local, local, rtol=0, atol=0)
+        torch.testing.assert_close(got_cache, cache, rtol=0, atol=0)
+
+    run(1, 17, 0, 0)
+    # Batch, table width, row stride and the rows' start are runtime values.
+    with assert_no_triton_compile(_decode_visible_lengths):
+        run(16, 63, 0, 0)
+        run(5, 129, 13, 3)
+        run(64, 1024, 16, 1)
 
 
 @pytest.mark.parametrize("degree", [1, 3, 4, 16])
@@ -1244,7 +1304,7 @@ def _index_k_block_views(buf, num_pages, page_size, head_dim, num_groups):
         (page_bytes, head_dim, 1),
     )
     scale_view = torch.as_strided(
-        flat.view(torch.float32),
+        flat.view(index_k_scale_dtype()),
         (num_pages, page_size, num_groups),
         (page_bytes // 4, num_groups, 1),
         (page_size * head_dim) // 4,
@@ -1274,7 +1334,11 @@ def test_index_k_block_split_scatter_matches_index_put(
     row = head_dim + ng * 4
 
     k_fp8 = torch.randn(tokens, head_dim, device=device).to(torch.float8_e4m3fn)
-    k_scale = torch.rand(tokens, ng, device=device, dtype=torch.float32) + 0.1
+    k_scale = encode_index_k_scale(
+        round_index_k_scale(
+            torch.rand(tokens, ng, device=device, dtype=torch.float32) + 0.1
+        )
+    )
     loc = torch.randperm(num_slots, device=device)[:tokens].to(loc_dtype)
     page, slot = loc.long() // page_size, loc.long() % page_size
 
@@ -1342,7 +1406,7 @@ def test_index_k_scatter_mask_preserves_dummy_page(device):
     expected = before.clone()
     data, scale = _index_k_block_views(expected, 2, page_size, dim, 1)
     data[1, [1, 3]] = values.view(torch.uint8)[[1, 3]].view(torch.float8_e4m3fn)
-    scale[1, [1, 3]] = scales[[1, 3]]
+    scale[1, [1, 3]] = scales[[1, 3]].view(scale.dtype)
     assert torch.equal(cache, expected)
     assert torch.equal(cache[:64], before[:64])
 
@@ -1470,7 +1534,7 @@ def _read_fp8_rows(buf, slots, page_size, head_dim, ng):
     take = torch.arange(slots.numel(), device=slots.device)
     codes = picked[:, : page_size * head_dim].reshape(-1, page_size, head_dim)
     codes = codes[take, row]
-    scales = picked[:, page_size * head_dim :].contiguous().view(torch.float32)
+    scales = decode_index_k_scale(picked[:, page_size * head_dim :].contiguous())
     scales = scales.view(-1, page_size, ng)[take, row]
     values = codes.view(torch.float8_e4m3fn).float().view(-1, ng, head_dim // ng)
     return codes, scales, (values * scales[..., None]).view(-1, head_dim)
@@ -1508,7 +1572,7 @@ def test_index_k_layernorm_fp8_scatter_quantizes_layer_norm_rows(
         keys.float(), (head_dim,), weight, bias, eps
     ).to(torch.bfloat16)
     groups = normed.float().view(tokens, ng, group_size)
-    ref_scales = groups.abs().amax(dim=-1).clamp_min(1e-10) / 448.0
+    ref_scales = round_index_k_scale(groups.abs().amax(dim=-1).clamp_min(1e-10) / 448.0)
     ref_codes = (
         (groups / ref_scales[..., None])
         .clamp(-448.0, 448.0)
@@ -1520,9 +1584,11 @@ def test_index_k_layernorm_fp8_scatter_quantizes_layer_norm_rows(
     # A boundary LayerNorm value may round either way, moving its scale one bf16 step.
     torch.testing.assert_close(scales, ref_scales, rtol=2**-7, atol=0)
     assert (codes == ref_codes).float().mean() > 0.99
-    # E4M3 keeps 3 mantissa bits: at most half of 32/448 of the amax off.
+    # E4M3 keeps 3 mantissa bits: at most half of 32/448 of the amax off, twice
+    # that when the scale is rounded up to a power of two.
     amax = groups.abs().amax(dim=-1, keepdim=True)
-    assert ((values.view_as(groups) - groups).abs() <= amax / 24).all()
+    step = amax / (12 if index_k_scale_ue8m0() else 24)
+    assert ((values.view_as(groups) - groups).abs() <= step).all()
     # Every byte outside the written rows and scales is untouched.
     pages = _plane_pages(buf, page_size, head_dim, ng)
     written = torch.zeros(pages.shape, dtype=torch.bool, device=device)

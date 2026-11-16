@@ -57,15 +57,19 @@ def _compile_fwd_varlen(
     is_local,
     dtype,
     paged,
-    use_pdl=False,
-    blocks_per_page=1,
-    blockscaled=False,
-    has_tau=False,
+    use_pdl,
+    blocks_per_page,
+    blockscaled,
+    has_tau,
+    out_dtype,
+    with_lse,
 ):
-    """``dtype`` is the bias/output dtype. ``blockscaled`` (paged only)
-    compiles the MXFP8 variant: fp8-e4m3 q/k/v, UE8M0 vec-32 scales (flat
-    per-token SFQ — interleaved SFQ is forbidden with varlen q — and paged
-    interleaved KV scales), fp8 V dequantized in-kernel to ``dtype``."""
+    """``dtype`` is the bias dtype and ``out_dtype`` the output dtype (the
+    bias dtype, or FP32 for an unrounded output). ``with_lse`` adds the FP32
+    natural-log LSE output. ``blockscaled`` (paged only) compiles the MXFP8
+    variant: fp8-e4m3 q/k/v, UE8M0 vec-32 scales (flat per-token SFQ —
+    interleaved SFQ is forbidden with varlen q — and paged interleaved KV
+    scales), fp8 V dequantized in-kernel to ``dtype``."""
     assert not blockscaled or paged, "blockscaled varlen requires the paged path"
     import cutlass.cute as cute
     from flash_attn.cute.cute_dsl_utils import to_cute_tensor
@@ -100,7 +104,13 @@ def _compile_fwd_varlen(
     dev = torch.device("cuda")
     data_dtype = torch.float8_e4m3fn if blockscaled else dtype
     q = torch.empty(TOTAL_Q, num_q_heads, head_dim, device=dev, dtype=data_dtype)
-    o = torch.empty(TOTAL_Q, num_q_heads, head_dim, device=dev, dtype=dtype)
+    o = torch.empty(TOTAL_Q, num_q_heads, head_dim, device=dev, dtype=out_dtype)
+    # The kernel reads LSE as (heads, rows); a transposed (rows, heads) buffer keeps rows contiguous for callers.
+    lse = (
+        torch.empty(TOTAL_Q, num_q_heads, device=dev, dtype=torch.float32)
+        if with_lse
+        else None
+    )
     bias = torch.empty(
         TOTAL_Q + 128, num_q_heads, extent + 256, device=dev, dtype=dtype
     )
@@ -159,7 +169,7 @@ def _compile_fwd_varlen(
         m_k,
         m_v,
         m_o,
-        None,  # mLSE
+        to_cute_tensor(lse.t(), assumed_align=4, leading_dim=0) if with_lse else None,
         None,  # mRowMax
         1.0 / math.sqrt(head_dim),
         m_tau,
@@ -286,11 +296,14 @@ def is_compiled_for(
     enable_pdl=False,
     blocks_per_page=1,
     blockscaled=False,
-    out_dtype=None,
+    bias_dtype=None,
     has_tau=False,
+    *,
+    output_dtype: torch.dtype | None,
+    return_lse: bool,
 ) -> bool:
     """True when the prep, shear, and fwd kernels for this config are cached."""
-    dtype = out_dtype or (torch.bfloat16 if blockscaled else q.dtype)
+    dtype = bias_dtype or (torch.bfloat16 if blockscaled else q.dtype)
     fwd_key = (
         q.shape[1],
         num_kv_heads,
@@ -303,6 +316,8 @@ def is_compiled_for(
         blocks_per_page,
         blockscaled,
         has_tau,
+        output_dtype or dtype,
+        return_lse,
     )
     shear_key = (extent, is_local, dtype, paged)
     return fwd_key in _FWD_VARLEN and shear_key in _SHEAR and "prep" in _PREP
@@ -326,7 +341,10 @@ def rel_mha_varlen_tsmha(
     q_scale: torch.Tensor | None = None,  # (total_q, H, D // 32) e8m0
     k_scale: torch.Tensor | None = None,  # (pages, h_kv, k, 32, 4, 4) e8m0
     v_scale: torch.Tensor | None = None,  # same layout as k_scale
-) -> torch.Tensor:
+    *,
+    output_dtype: torch.dtype | None,
+    return_lse: bool,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Multi-row rel-bias attention over packed varlen queries.
 
     Exactly one of ``cu_seqlens_k`` (packed prefill, K/V share the query
@@ -334,7 +352,10 @@ def rel_mha_varlen_tsmha(
     cache) must be provided. Requires ``extent % 128 == 0`` and, for the
     paged path, page_size 128. Sliding-window callers must satisfy
     ``window_left + 1 == extent`` (the sheared table is sliced to the
-    window). Returns the packed (total_q, num_q_heads, head_dim) output.
+    window). Returns the packed (total_q, num_q_heads, head_dim) output in
+    ``output_dtype`` (None keeps the bias dtype; torch.float32 stores the
+    unrounded FP32 result), plus the natural-log LSE (total_q, num_q_heads)
+    when ``return_lse``.
 
     ``enable_pdl`` launches the fwd kernel with Programmatic Dependent
     Launch (Hopper+); public attention wrappers supply the platform policy.
@@ -349,7 +370,8 @@ def rel_mha_varlen_tsmha(
     assert not blockscaled or (
         paged and k_scale is not None and v_scale is not None
     ), "MXFP8 varlen requires the paged path and all three scale tensors"
-    out_dtype = rel_logits.dtype if blockscaled else q.dtype
+    bias_dtype = rel_logits.dtype if blockscaled else q.dtype
+    out_dtype = output_dtype or bias_dtype
     blocks_per_page = 1
     if paged:
         assert (
@@ -362,38 +384,28 @@ def rel_mha_varlen_tsmha(
         rel_logits = rel_logits.contiguous()
 
     cu2blocks, blocks2batch = _get_prep()
-    shear_key = (extent, is_local, out_dtype, paged)
+    shear_key = (extent, is_local, bias_dtype, paged)
     shear = _SHEAR.get(shear_key)
     if shear is None:
-        shear = _SHEAR[shear_key] = _compile_shear(extent, is_local, out_dtype, paged)
+        shear = _SHEAR[shear_key] = _compile_shear(extent, is_local, bias_dtype, paged)
     fwd_key = (
         H,
         num_kv_heads,
         D,
         extent,
         is_local,
-        out_dtype,
+        bias_dtype,
         paged,
         enable_pdl,
         blocks_per_page,
         blockscaled,
         tau is not None,
+        out_dtype,
+        return_lse,
     )
     fwd = _FWD_VARLEN.get(fwd_key)
     if fwd is None:
-        fwd = _FWD_VARLEN[fwd_key] = _compile_fwd_varlen(
-            H,
-            num_kv_heads,
-            D,
-            extent,
-            is_local,
-            out_dtype,
-            paged,
-            enable_pdl,
-            blocks_per_page,
-            blockscaled,
-            tau is not None,
-        )
+        fwd = _FWD_VARLEN[fwd_key] = _compile_fwd_varlen(*fwd_key)
 
     cu_blocks = torch.empty(B + 1, device=dev, dtype=torch.int32)
     total_blocks_max = (total_q + B * 127) // 128
@@ -402,7 +414,7 @@ def rel_mha_varlen_tsmha(
     blocks2batch(cu_blocks, b2b)
 
     # Tail rows past total_q are TMA-read; garbage there only feeds masked-out rows.
-    bias = torch.empty(total_q + 128, H, extent + 256, device=dev, dtype=out_dtype)
+    bias = torch.empty(total_q + 128, H, extent + 256, device=dev, dtype=bias_dtype)
     seqused_k = cache_seqlens if paged else None
     shear(
         rel_logits,
@@ -421,6 +433,9 @@ def rel_mha_varlen_tsmha(
 
     scale = softmax_scale if softmax_scale is not None else 1.0 / math.sqrt(D)
     o = torch.empty(q.shape, device=dev, dtype=out_dtype)
+    lse = (
+        torch.empty(total_q, H, device=dev, dtype=torch.float32) if return_lse else None
+    )
     if blockscaled:
         # fp8 goes as uint8 via TVM-FFI; SFQ stays flat (interleaved SFQ forbidden with varlen q).
         data = lambda t: t.view(torch.uint8)
@@ -433,7 +448,7 @@ def rel_mha_varlen_tsmha(
         data(k),
         data(v),
         o,
-        None,
+        lse.t() if return_lse else None,
         None,
         scale,
         tau,
@@ -453,4 +468,6 @@ def rel_mha_varlen_tsmha(
         None,
         max_seqlen_q,
     )
+    if return_lse:
+        return o, lse
     return o

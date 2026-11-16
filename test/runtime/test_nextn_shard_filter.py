@@ -115,6 +115,56 @@ class TestFilterSafetensorsFilesByWeightNames:
 
 
 class TestLoaderSkipsFilteredShards:
+    @pytest.mark.parametrize("load_format", ["auto", "safetensors", "instanttensor"])
+    def test_exact_files_preserve_selection_outside_target_index(
+        self, tmp_path, load_format
+    ):
+        from safetensors.torch import save_file
+
+        save_file({"draft.weight": torch.arange(4)}, tmp_path / "draft.safetensors")
+        (tmp_path / "model.safetensors").write_bytes(b"not the selected checkpoint")
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {"target.weight": "model.safetensors"}})
+        )
+        loader = DefaultModelLoader(LoadConfig(load_format=load_format))
+        _, files, safe = loader._prepare_weights(
+            str(tmp_path), None, False, ("draft.safetensors",)
+        )
+        assert safe and files == [str(tmp_path / "draft.safetensors")]
+
+    @pytest.mark.parametrize("load_format", ["pt", "npcache", "mistral"])
+    def test_exact_files_reject_incompatible_formats(self, tmp_path, load_format):
+        loader = DefaultModelLoader(LoadConfig(load_format=load_format))
+        with pytest.raises(ValueError, match="require safetensors loading"):
+            loader._prepare_weights(str(tmp_path), None, False, ("draft.safetensors",))
+
+    def test_all_exact_files_are_required(self, tmp_path):
+        (tmp_path / "first.safetensors").touch()
+        loader = DefaultModelLoader(LoadConfig())
+        with pytest.raises(FileNotFoundError, match="second.safetensors"):
+            loader._prepare_weights(
+                str(tmp_path), None, True, ("first.safetensors", "second.safetensors")
+            )
+
+    def test_default_index_discovery_still_excludes_unindexed_draft(self, tmp_path):
+        from safetensors.torch import save_file
+
+        save_file({"target.weight": torch.arange(4)}, tmp_path / "model.safetensors")
+        (tmp_path / "draft.safetensors").write_bytes(b"not the selected checkpoint")
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": {"target.weight": "model.safetensors"}})
+        )
+        loader = DefaultModelLoader(
+            LoadConfig(weight_loader_prefetch_checkpoints=False)
+        )
+        weights = dict(
+            loader.get_checkpoint_weights(
+                str(tmp_path), None, torch.nn.Linear(2, 2), Mapping(rank=0)
+            )
+        )
+        assert set(weights) == {"target.weight"}
+        assert torch.equal(weights["target.weight"], torch.arange(4))
+
     def test_get_all_weights_reads_only_draft_shards(self):
         from safetensors.torch import save_file
 
@@ -177,7 +227,13 @@ class TestLoaderSkipsFilteredShards:
         # pipeline stage's draft) bound the distributed loader's collectives.
         groups = []
 
-        def capture(source, weight_name_filter, checkpoint_load_group, mapping):
+        def capture(
+            source,
+            weight_name_filter,
+            checkpoint_load_group,
+            mapping,
+            shared_weight_name_filter,
+        ):
             groups.append(checkpoint_load_group)
             return iter(())
 

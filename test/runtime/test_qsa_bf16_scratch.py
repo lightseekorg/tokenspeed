@@ -27,6 +27,7 @@ import os
 import sys
 from contextlib import ExitStack, contextmanager
 from dataclasses import replace
+from test.runtime.cache_pool_test_utils import make_mha_pool_for_groups
 from types import SimpleNamespace
 
 import pytest
@@ -54,7 +55,10 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.qwen4_exp import (
     Qwen4ExpRecipe,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.qwen35 import QwenGDNRecipe
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    FULL_ATTENTION,
+    CacheGroupSpec,
+)
 from tokenspeed.runtime.layers.attention.qsa import bf16_scratch
 from tokenspeed.runtime.layers.attention.qsa.bf16_scratch import (
     MIN_ROWS,
@@ -221,6 +225,7 @@ def _recipe(
             mamba_ssm_dtype="float32",
             disaggregation_mode=role,
             enable_qsa_prefill_bf16_scratch=enabled,
+            qwen4_exp_flat_kv=False,
             chunked_prefill_size=chunk,
         ),
         model_config=SimpleNamespace(
@@ -449,29 +454,13 @@ def _plan(*, max_rows=4096, context_len=CONTEXT_LEN):
 
 
 def _root(config, backend_name="qsa"):
-    """Composite backend over a real router; the pool is a stand-in."""
+    """Composite backend over a real router and cache pool."""
     router = attention_registry.create_paged_router(
         config, AttentionArch.MHA, backend_name=backend_name
     )
-    pool = SimpleNamespace(
-        field_layer_range=range(2),
-        _field_layer_id=lambda layer_id: layer_id,
-        paged_group_ids=tuple(_GROUPS),
-        arena=SimpleNamespace(
-            offload=None,
-            plan=SimpleNamespace(fields=[]),
-            cache_group_specs=tuple(
-                SimpleNamespace(
-                    group_id=group_id,
-                    block_granularity=granularity,
-                    attn_kind="full_history",
-                    rows_per_page=granularity,
-                    entry_stride_tokens=1,
-                    sliding_window_tokens=None,
-                )
-                for group_id, granularity in _GROUPS.items()
-            ),
-        ),
+    pool = make_mha_pool_for_groups(
+        (CacheGroupSpec(FULL_ATTENTION, "full_history", PAGE, 1, replayable=False),),
+        device="cpu",
     )
     root = Qwen4ExpBackend(config, router, None, None)
     root.set_cache_pool(pool)
@@ -532,7 +521,7 @@ def test_startup_checks_the_planned_bytes_against_the_allocation(kernels):
     plan = _plan()
     kwargs = dict(
         server_args=SimpleNamespace(speculative_num_draft_tokens=1),
-        config=SimpleNamespace(max_bs=4, qcp_size=1),
+        config=SimpleNamespace(max_bs=4, qcp_size=1, kvp_size=1),
         backend=root,
         draft_backend=None,
         uses_paged_state_verify=False,

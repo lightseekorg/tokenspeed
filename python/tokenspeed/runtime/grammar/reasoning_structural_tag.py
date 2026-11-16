@@ -58,6 +58,12 @@ import dataclasses
 import json
 from typing import Any
 
+from tokenspeed.runtime.grammar.inkling2_json import (
+    MessageBoundary,
+    inkling2_boundary,
+    inkling2_structural_tag,
+)
+
 # smg reasoning_parser name → xgrammar builtin model template. Keys
 # must match ``smg::get_available_reasoning_parsers()`` exactly. Unmapped
 # parsers fall through to the unwrapped json_schema constraint.
@@ -164,6 +170,9 @@ def structural_tag_for_reasoning_response(
     """
     if reasoning_parser == "inkling":
         return _structural_tag_for_inkling(content_format)
+    if reasoning_parser == "inkling2":
+        # reasoning_grammar picks this or an answer continuation by the prompt's end.
+        return inkling2_structural_tag(content_format, continue_final_message=False)
 
     model = _REASONING_PARSER_TO_XGRAMMAR_MODEL.get(reasoning_parser)
     if model is None:
@@ -270,6 +279,10 @@ class ReasoningGrammar:
         implicit_closer: A tool-block opener that ends reasoning without a
             closing marker (DeepSeek V4.1's spaced DSML block), when it is a
             single token. The engine excludes it from reasoning usage too.
+        boundary: For a model that writes each block's header itself
+            (Inkling2), where a prompt may end, in place of ``markers``:
+            ``continues`` then continues an empty answer header and
+            ``may_open`` follows a closed message.
     """
 
     continues: str
@@ -277,6 +290,7 @@ class ReasoningGrammar:
     schema_slot: str
     markers: tuple[int, int] | None
     implicit_closer: int | None
+    boundary: MessageBoundary | None
 
 
 def _single_token_ids(tokenizer, markers: tuple[str, ...]) -> tuple[int, ...] | None:
@@ -317,6 +331,12 @@ def reasoning_grammar(reasoning_parser: str, tokenizer) -> ReasoningGrammar | No
         )
         for opens in (True, False)
     ]
+    boundary = None
+    if reasoning_parser == "inkling2":
+        boundary = inkling2_boundary(tokenizer)
+        tags[0] = inkling2_structural_tag(
+            JSONSchemaFormat(json_schema=_SCHEMA_SLOT), continue_final_message=True
+        )
     if None in tags:
         return None
     schema_slot = json.dumps(_SCHEMA_SLOT, separators=(",", ":"))
@@ -332,4 +352,5 @@ def reasoning_grammar(reasoning_parser: str, tokenizer) -> ReasoningGrammar | No
         schema_slot=schema_slot,
         markers=_reasoning_marker_ids(reasoning_parser, tokenizer),
         implicit_closer=_reasoning_implicit_closer_id(reasoning_parser, tokenizer),
+        boundary=boundary,
     )

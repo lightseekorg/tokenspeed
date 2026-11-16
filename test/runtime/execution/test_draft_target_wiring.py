@@ -45,6 +45,13 @@ from tokenspeed.runtime.execution.model_executor import (  # noqa: E402
     drafter_accept_lengths,
 )
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+from tokenspeed.runtime.models.kimi_k3 import (  # noqa: E402
+    KimiK3ForConditionalGeneration,
+)
+from tokenspeed.runtime.models.kimi_k25 import (  # noqa: E402
+    KimiK25ForConditionalGeneration,
+)
+from tokenspeed.runtime.models.registry import ModelRegistry  # noqa: E402
 from tokenspeed.runtime.models.target_capture import (  # noqa: E402
     TargetCaptureConfigurator,
 )
@@ -805,7 +812,9 @@ def test_eagle_tree_drafting_ranks_full_vocab_logits():
 @pytest.mark.parametrize("drafter_class", [DFlash, DSpark])
 def test_block_drafter_wire_target_only_binds_resources(drafter_class):
     drafter = drafter_class.__new__(drafter_class)
-    drafter.model = SimpleNamespace()
+    # A one-rank layout: the draft's first layer reduces nothing, so the
+    # drafter's embedding lookup is left as bound.
+    drafter.model = SimpleNamespace(mapping=_mapping())
     embedding, head = object(), object()
     # wire_target asks the processor whether the target's head is vocab-sharded
     # over attention-DP ranks (DFlash replicates it for drafting only then);
@@ -833,7 +842,7 @@ def test_block_drafter_wire_target_only_binds_resources(drafter_class):
 def test_block_drafter_binds_local_embedding_on_last_pipeline_stage():
     drafter = DSpark.__new__(DSpark)
     embedding = object()
-    drafter.model = SimpleNamespace(embed_tokens=embedding)
+    drafter.model = SimpleNamespace(embed_tokens=embedding, mapping=_mapping())
     target = SimpleNamespace(
         get_input_embeddings=lambda: None,
         lm_head=object(),
@@ -909,12 +918,17 @@ def test_device_weight_update_notifies_drafter_before_returning():
 # --------------------------------------------------------------------------
 
 
-def _draft_locations(num_tokens: int) -> SimpleNamespace:
-    """The draft router's decode window: the draft writes its KV through its
-    OWN router, because the pages belong to its cache group."""
+def _draft_locations() -> SimpleNamespace:
+    """Return the draft router; the context KV lands in its own pages."""
+
+    def resolve(out, starts, width):
+        # Pages offset by 100: each slot names its position.
+        rows = 100 + starts[:, None] + torch.arange(width)
+        out[: rows.numel()] = rows.reshape(-1)
+        return out
+
     return SimpleNamespace(
-        group_ids=("full_attention",),
-        decode_window_locations=lambda: torch.arange(100, 100 + 2 * num_tokens),
+        group_ids=("full_attention",), draft_write_locations_uniform=resolve
     )
 
 
@@ -933,9 +947,20 @@ def _target_ctx(num_extends: int, num_tokens: int) -> ForwardContext:
     )
 
 
-def _sink_dflash(enabled: bool, hidden: int = 3, taps: int = 2) -> DFlash:
+class _TapTarget:
+    def __init__(self, stores_taps: bool):
+        self._stores_taps = stores_taps
+
+    def stores_capture_taps(self, ctx: ForwardContext) -> bool:
+        return self._stores_taps
+
+
+def _sink_dflash(
+    enabled: bool, hidden: int = 3, taps: int = 2, stores_taps: bool = False
+) -> DFlash:
     """A DFlash with only the capture-sink state set up."""
     drafter = DFlash.__new__(DFlash)
+    drafter.target_model = _TapTarget(stores_taps)
     drafter.hidden_size = hidden
     drafter._tap_count = taps
     drafter._tap_rows = (
@@ -944,7 +969,10 @@ def _sink_dflash(enabled: bool, hidden: int = 3, taps: int = 2) -> DFlash:
     drafter._context_written = True  # stale from a previous round
     drafter._sink_tokens = 0
     drafter.input_buffers = SimpleNamespace(positions_buf=torch.arange(16))
-    drafter.attn_backend = _draft_locations(4)
+    drafter.attn_backend = _draft_locations()
+    drafter.spec_num_tokens = 2
+    drafter.context_starts_buf = torch.zeros(2, dtype=torch.int64)
+    drafter.context_locs_buf = torch.zeros(4, dtype=torch.int32)
     return drafter
 
 
@@ -962,6 +990,57 @@ def test_dflash_arms_the_capture_sink_on_the_forward_context():
 
     assert ctx.target_capture_sink is drafter
     assert drafter._context_written is False
+
+
+def test_dflash_leaves_the_taps_to_a_target_that_stores_them():
+    drafter = _sink_dflash(enabled=True, stores_taps=True)
+    ctx = _target_ctx(num_extends=0, num_tokens=4)
+
+    drafter.prepare_target_forward(ctx)
+
+    assert ctx.target_capture_sink is None
+    assert drafter._context_written is False
+
+
+def test_every_dflash_target_answers_whether_it_stores_the_taps():
+    # A block drafter asks each round, so a target it can attach to must answer.
+    missing = sorted(
+        name
+        for name, cls in ModelRegistry.models.items()
+        if hasattr(cls, "set_dflash_layers_to_capture")
+        and not hasattr(cls, "stores_capture_taps")
+    )
+    assert missing == []
+
+
+@pytest.mark.parametrize(
+    "wrapper", [KimiK3ForConditionalGeneration, KimiK25ForConditionalGeneration]
+)
+@pytest.mark.parametrize("stores_taps", [False, True])
+def test_a_multimodal_wrapper_answers_for_its_language_model(wrapper, stores_taps):
+    target = wrapper.__new__(wrapper)
+    torch.nn.Module.__init__(target)
+    target.language_model = _TapTarget(stores_taps)
+    drafter = _sink_dflash(enabled=True)
+    drafter.target_model = target
+    ctx = _target_ctx(num_extends=0, num_tokens=4)
+
+    drafter.prepare_target_forward(ctx)
+
+    assert target.stores_capture_taps(ctx) is stores_taps
+    assert (ctx.target_capture_sink is None) is stores_taps
+
+
+@pytest.mark.parametrize(
+    "wrapper", [KimiK3ForConditionalGeneration, KimiK25ForConditionalGeneration]
+)
+def test_an_encoder_only_wrapper_refuses_to_answer_for_taps(wrapper):
+    target = wrapper.__new__(wrapper)
+    torch.nn.Module.__init__(target)
+    target.language_model = None
+
+    with pytest.raises(AttributeError, match="encoder-only"):
+        target.stores_capture_taps(_target_ctx(num_extends=0, num_tokens=4))
 
 
 @pytest.mark.parametrize(
@@ -1032,7 +1111,6 @@ def test_dflash_sink_concatenates_the_taps_and_writes_the_context_once():
 
 def test_dflash_run_refuses_a_round_whose_sink_never_completed():
     drafter = _sink_dflash(enabled=True)
-    drafter.target_model = object()
     ctx = _target_ctx(num_extends=0, num_tokens=4)
     drafter.prepare_target_forward(ctx)
     drafter.on_target_capture(0, torch.zeros(4, 3))
@@ -1059,12 +1137,12 @@ def test_context_cache_ownership_preserves_prefix_lengths(
     )
     drafter.runtime_states = SimpleNamespace(valid_cache_lengths=torch.tensor([10]))
     drafter.draft_seq_lens_buf = torch.zeros(1, dtype=torch.int32)
+    drafter.context_starts_buf = torch.zeros(1, dtype=torch.int64)
+    drafter.context_locs_buf = torch.zeros(4, dtype=torch.int32)
     drafter._write_native_cache = mock.Mock()
-    locations = torch.arange(4)
+    locations = torch.arange(4, dtype=torch.int32)
     backend = SimpleNamespace(
-        decode_window_locations=lambda: (
-            locations if not num_extends else torch.empty(0, dtype=torch.int64)
-        ),
+        draft_write_locations_uniform=lambda out, starts, width: out.copy_(locations),
         extend_span_locations=lambda: locations,
     )
     # The write locations come from the DRAFT's own router: the pages belong
@@ -1130,7 +1208,7 @@ def test_k3_setup_capture_survives_resource_binding(monkeypatch, has_pp):
     draft.projection_width = 8
     # Only a pipeline splits the taps across stages; off the pipeline the
     # drafter keeps projecting and writing the context itself.
-    draft.mapping = SimpleNamespace(has_pp=has_pp)
+    draft.mapping = _mapping(has_pp=has_pp)
     validation = mock.Mock()
     monkeypatch.setattr(kimi_k3_dspark, "validate_k3_dspark_config", validation)
     target = SimpleNamespace(
@@ -1188,9 +1266,11 @@ def test_ordinary_block_models_declare_capture_setup(family):
     draft = model_class.__new__(model_class)
     torch.nn.Module.__init__(draft)
     draft.config = SimpleNamespace(dflash_config={"target_layer_ids": [2, 7]})
-    # An unquantized draft: DFlash2 also makes its FP8 head copy here when
-    # quantized, which needs the target's real LM head.
+    # An unquantized draft without --decode-monokernel: DFlash2 also makes
+    # its FP8 head copy here when quantized, and packs its head monokernel
+    # under the switch, both from the target's real LM head.
     draft.quant_config = None
+    draft.monokernel_state = None
     target = SimpleNamespace(set_dflash_layers_to_capture=mock.Mock())
     assert isinstance(draft, TargetCaptureConfigurator)
     draft.configure_target(target, None)

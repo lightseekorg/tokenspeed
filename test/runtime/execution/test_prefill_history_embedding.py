@@ -48,6 +48,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroupSpec
 from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
 from tokenspeed.runtime.multimodal.inputs import MultimodalForwardContext
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
@@ -205,7 +206,6 @@ def _config():
         prefill_only=False,
         decode_only_attention=False,
         prefill_graph_capture_batch_sizes=[1],
-        enable_drafter_prefill_graph=False,
         input_logprob_chunk_tokens=32,
         enable_speculative_sampling=False,
         query_shard_size=1,
@@ -233,6 +233,7 @@ def test_embeddings_refresh_with_live_history_and_padding(model_cls, history_emb
         _pool(),
         ib,
         _config(),
+        memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False),
         num_warmup=1,
     )
     history_ids = torch.full((4, 64), 7, dtype=torch.int32, device="cuda")
@@ -299,6 +300,7 @@ def test_history_model_without_embedding_seam_stays_eager():
         _pool(),
         InputBuffers(2, 32, 4),
         _config(),
+        memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False),
     )
     owner.capture(entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)
     assert not owner.can_run(owner.make_dummy_batch(16, 1))
@@ -311,7 +313,12 @@ def test_dp_multimodal_restriction_follows_active_model(active):
     config.data_parallel_size = 2
     runner = _Runner(_HistoryModel(), _ModelConfig(True, active), is_multimodal=True)
     owner = PrefillGraph(
-        runner, _NoAttention(), _pool(), InputBuffers(2, 32, 4), config
+        runner,
+        _NoAttention(),
+        _pool(),
+        InputBuffers(2, 32, 4),
+        config,
+        memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False),
     )
     assert bool(owner.capture_plan) is not active
 
@@ -326,6 +333,7 @@ def test_supplied_embeddings_bypass_history_in_eager_forward():
         _pool(),
         InputBuffers(2, 32, 4),
         _config(),
+        memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False),
     )
     ctx = owner.make_dummy_batch(16, 1)
     ids = torch.arange(16, device="cuda")
@@ -345,6 +353,7 @@ def test_decode_uses_model_owned_history_embedding():
         _pool(),
         InputBuffers(2, 32, 4),
         _config(),
+        memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False),
     )
     ctx = owner.make_dummy_batch(1, 1)
     ctx.forward_mode = ForwardMode.DECODE

@@ -27,7 +27,12 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
-from tokenspeed_kernel.ops.moe import packed_projection_weight_view
+from tokenspeed_kernel.ops.communication.mailbox import MailboxTarget
+from tokenspeed_kernel.ops.moe import (
+    _bf16_routes_moe_apply,
+    _bf16_routes_moe_warmup,
+    packed_projection_weight_view,
+)
 from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
 from tokenspeed_kernel.ops.tuning import is_warming_up
 from tokenspeed_kernel.platform import (
@@ -167,6 +172,94 @@ def gluon_fp8_channel_bf16_precomputed_moe_apply(
     output = torch.empty_like(x)
     _combine(partials.view(-1, 5120), topk_weights, output, None, 0)
     return output
+
+
+if platform.is_amd:
+    from tokenspeed_kernel.ops.moe._triton.block_scaled import _block_scaled_moe_routes
+    from tokenspeed_kernel_amd.ops.gfx950.moe.block_scaled import (
+        gluon_block_scaled_moe_routes_mm_gfx950,
+    )
+
+    @register_kernel(
+        "moe",
+        "block_scaled_routes",
+        name="gluon_block_scaled_moe_routes_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset({format_signature(x=dense_tensor_format(torch.bfloat16))}),
+        traits={
+            "w13_weight_dtype": frozenset({"nvfp4", "mxfp8"}),
+            "w2_weight_dtype": frozenset({"nvfp4", "mxfp8"}),
+        },
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_block_scaled_moe_routes_gfx950(
+        x: torch.Tensor,
+        w13: torch.Tensor,
+        s13: torch.Tensor,
+        a13: torch.Tensor | None,
+        d13: torch.Tensor | None,
+        w2: torch.Tensor,
+        s2: torch.Tensor,
+        a2: torch.Tensor | None,
+        d2: torch.Tensor | None,
+        weights: torch.Tensor,
+        ids: torch.Tensor,
+        *,
+        formats: tuple[str, str],
+        experts: int,
+        expert_start: int,
+        gate_cap: float,
+        up_cap: float,
+        zero_remote_routes: bool,
+        fold_slots: bool,
+        fold_into: MailboxTarget | None,
+    ) -> torch.Tensor | None:
+        """Apply NVFP4 or MXFP8 experts with shared routing and BF16 rounding
+        boundaries. MXFP8 runs the same kernel about 1.9x faster than the
+        portable Triton GEMM at the C1 shape (w13 103 -> 54 us on MI350X)."""
+        del experts  # per-expert tiles need no global count
+        # Keep small batches narrow. Prefill reuses each weight tile across more
+        # rows. At decode, 64-wide output tiles give more tiles than the 2-per-CU
+        # persistent programs (C1 on MI350X, 7 experts: w13 168 -> 137 us).
+        # NVFP4 prefill upcasts each weight tile once per 64 rows (a 2048-token
+        # chunk routes about 43 rows to an expert): w13 1.69 -> 0.86 ms.
+        if x.shape[0] < 1024:
+            tiles = (16, 64, 256)
+        elif formats == ("nvfp4", "nvfp4"):
+            tiles = (64, 128, 128)
+        else:
+            tiles = (32, 128, 128)
+        return _block_scaled_moe_routes(
+            x,
+            w13,
+            s13,
+            a13,
+            d13,
+            w2,
+            s2,
+            a2,
+            d2,
+            weights,
+            ids,
+            formats=formats,
+            expert_start=expert_start,
+            gate_cap=gate_cap,
+            up_cap=up_cap,
+            zero_remote_routes=zero_remote_routes,
+            fold_slots=fold_slots,
+            fold_into=fold_into,
+            matmul=gluon_block_scaled_moe_routes_mm_gfx950,
+            tiles=tiles,
+            # The kernel reads BF16 activations instead of decoding NVFP4 codes
+            # for every output tile (C1 w13: 82 -> 61 us). MXFP8 codes decode
+            # cheaply in the kernel.
+            bf16_activations=formats == ("nvfp4", "nvfp4"),
+        )
 
 
 # ===-----------------------------------------------------------------------===#
@@ -732,6 +825,57 @@ if platform.is_amd:
                 output.view(num_tokens * top_k, x.shape[1]),
             )
         return output.view(num_tokens, top_k, x.shape[1])
+
+    @register_kernel(
+        "moe",
+        "apply",
+        name="gluon_bf16_routes_moe_apply",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            vendors=frozenset({"amd"}),
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+        ),
+        signatures=format_signatures("x", "dense", {torch.bfloat16}),
+        traits={
+            "weight_dtype": frozenset({"unquant"}),
+            "activation": frozenset({"silu"}),
+            "routing_mode": frozenset({"precomputed_topk"}),
+            "supports_finalize": frozenset({False}),
+            "supports_deferred_finalize": frozenset({True}),
+            "deferred_output_is_token_order": frozenset({True}),
+            "supports_deferred_out": frozenset({True}),
+            "supports_ep": frozenset({False, True}),
+            "supports_all_to_all_ep": frozenset({False}),
+            "internal_activation_dtype": frozenset({"input"}),
+            "supports_bias": frozenset({False}),
+        },
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_bf16_routes_moe_apply(
+        plan: dict,
+        x: torch.Tensor,
+        w: torch.nn.Module,
+        router_logits: torch.Tensor | None,
+        topk_weights: torch.Tensor | None = None,
+        topk_ids: torch.Tensor | None = None,
+        num_tokens_global: int | None = None,
+        max_num_tokens_per_gpu: int | None = None,
+        do_finalize: bool = True,
+        enable_pdl: bool = False,
+        deferred_out: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, None, None]:
+        """Unfinalized BF16 expert routes through ``bf16_moe_routes``.
+
+        The facade selects the Gluon route kernels where their geometry fits
+        and Triton otherwise. Selected only by layers that defer the finalize;
+        see ``_bf16_routes_moe_apply`` for the arguments and the routes.
+        """
+        del plan, router_logits, topk_weights, num_tokens_global
+        del max_num_tokens_per_gpu, enable_pdl
+        return _bf16_routes_moe_apply(x, w, topk_ids, do_finalize, deferred_out)
+
+    gluon_bf16_routes_moe_apply._tokenspeed_warmup = _bf16_routes_moe_warmup  # type: ignore[attr-defined]
 
 
 # ===-----------------------------------------------------------------------===#
@@ -1344,6 +1488,8 @@ def _use_gfx1250_moe_decode(num_routed_rows: int, num_experts: int) -> bool:
 
 if platform.is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (
+        A8W4_SORT_BLOCK_SIZE,
+        A8W4_SORTED_DECODE_ROWS,
         gluon_mxfp4_fp8_precomputed_situ,
     )
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (
@@ -1938,6 +2084,10 @@ if platform.is_amd:
             "internal_activation_dtype": frozenset({"input"}),
             # Prefill rows may arrive as packed E2M1 data with CDNA4 scales.
             "supports_prequantized_input": frozenset({True}),
+            # Decode rows that sort their routes take a sort made upstream
+            # in gluon_moe_sorting's layout at this block size instead.
+            "sorted_route_rows": frozenset(A8W4_SORTED_DECODE_ROWS),
+            "sorted_route_block_size": frozenset({A8W4_SORT_BLOCK_SIZE}),
         },
         priority=Priority.SPECIALIZED,
     )
@@ -1968,8 +2118,11 @@ if platform.is_amd:
         # A producer that already quantized ``x`` leaves it for this call only.
         x_quantized = getattr(w, "_situ_input_fp8", None)
         w._situ_input_fp8 = None
+        # A router that also sorted these routes by expert leaves the sort too.
+        sorted_routes = getattr(w, "_situ_sorted_routes", None)
+        w._situ_sorted_routes = None
         rows = int(x[0].shape[0] if isinstance(x, tuple) else x.shape[0])
-        if situ_linear_beta is not None and is_warming_up() and rows > 64:
+        if situ_linear_beta is not None and is_warming_up():
             # Serving chunks pick tiles by row count, up to this warmup prefill's rows.
             warm_gluon_mxfp4_situ_prefill_rows(
                 w.w13_weight_triton_tensor,
@@ -1999,6 +2152,7 @@ if platform.is_amd:
                 # The caller reduces [M * top_k, N] slot rows itself.
                 defer_topk_reduce=getattr(w, "_situ_defer_topk_reduce", False),
                 x_quantized=x_quantized,
+                sorted_routes=sorted_routes,
             )
             if out is not None:
                 return out
@@ -2858,12 +3012,23 @@ _DSV41_FLASH_DSPARK_PROFILE = _Profile(
     has_bias=False,
     activation="silu_clamped",
 )
+_MUSE_SPARK_PROFILE = _Profile(
+    name="muse_spark",
+    num_experts=256,
+    top_k=8,
+    model_dim=4096,
+    logical_intermediate=4096,
+    inter_dim=4096,
+    has_bias=False,
+    activation="silu",
+)
 _PROFILES = (
     _GPT_OSS_120B_PROFILE,
     _DSV4_PROFILE,
     _KIMI_K3_PROFILE,
     _DSV41_FLASH_PROFILE,
     _DSV41_FLASH_DSPARK_PROFILE,
+    _MUSE_SPARK_PROFILE,
 )
 
 
@@ -3005,19 +3170,19 @@ def _validate_layer(w: torch.nn.Module) -> _Profile:
         return profile
 
     if w.activation not in {"silu", "swiglu"} or w.swiglu_beta is not None:
-        raise ValueError("Gluon Petit DeepSeek MegaMoE requires standard SiLU")
+        raise ValueError("Gluon Petit SiLU MegaMoE requires standard SiLU")
     if w.w13_input_layout != "concatenated":
-        raise ValueError("Gluon Petit DeepSeek MegaMoE requires concatenated W13 input")
+        raise ValueError("Gluon Petit SiLU MegaMoE requires concatenated W13 input")
     swiglu_arg = getattr(w, "swiglu_arg", None)
     if swiglu_arg is not None and swiglu_arg.alpha is not None:
         raise ValueError(
-            "Gluon Petit DeepSeek MegaMoE does not support nonstandard SiLU alpha"
+            "Gluon Petit SiLU MegaMoE does not support nonstandard SiLU alpha"
         )
     if (
         getattr(w, "w13_weight_bias", None) is not None
         or getattr(w, "w2_weight_bias", None) is not None
     ):
-        raise ValueError("Gluon Petit DeepSeek MegaMoE requires bias-free experts")
+        raise ValueError("Gluon Petit SiLU MegaMoE requires bias-free experts")
 
     if profile.activation == "silu_clamped":
         if swiglu_arg is None or swiglu_arg.limit != 10.0:
@@ -3027,7 +3192,7 @@ def _validate_layer(w: torch.nn.Module) -> _Profile:
         return profile
     if swiglu_arg is not None and swiglu_arg.limit is not None:
         raise ValueError(
-            "Gluon Petit DSV4 MegaMoE does not support an activation clamp; "
+            "Gluon Petit unclamped SiLU MegaMoE does not support an activation clamp; "
             "select a backend that preserves the checkpoint activation"
         )
     return profile
@@ -3197,7 +3362,7 @@ def gluon_petit_mxfp4_megamoe_weights(plan: dict, w: torch.nn.Module) -> None:
         "weight_dtype": frozenset({"mxfp4"}),
         "activation": frozenset({"swiglu", "silu", "situ"}),
         "routing_mode": frozenset({"precomputed_topk"}),
-        "supports_deferred_finalize": frozenset({False}),
+        "supports_deferred_finalize": frozenset({False, True}),
         "supports_ep": frozenset({True}),
         "supports_all_to_all_ep": frozenset({True}),
         "a2a_backend": frozenset({"gluon_petit"}),
@@ -3221,7 +3386,7 @@ def gluon_petit_mxfp4_megamoe_apply(
     enable_pdl: bool,
     low_latency: bool | None,
     overlap_fn: Callable[[], None] | None,
-) -> torch.Tensor:
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, None]:
     """Run the fused Gluon Petit dispatch, experts, return, and combine path.
 
     Args:
@@ -3233,17 +3398,21 @@ def gluon_petit_mxfp4_megamoe_apply(
         topk_ids: Precomputed global expert ids for every local token.
         num_tokens_global: Unused global token-count hint.
         max_num_tokens_per_gpu: Largest local token count in this collective.
-        do_finalize: Whether to produce the combined output.
+        do_finalize: Whether to produce the combined output. If ``False``,
+            every local token's routes return to this rank unweighted and
+            unsummed.
         enable_pdl: Unused programmatic dependent launch setting.
         low_latency: Unused all-to-all mode hint.
         overlap_fn: Optional work to enqueue before the Petit collective.
 
     Returns:
-        Final local BF16 output with shape ``[local_tokens, model_dim]``.
+        Final local BF16 output with shape ``[local_tokens, model_dim]``. With
+        ``do_finalize=False``, ``(routes, topk_weights, None)``: ``routes``
+        holds each selected expert's unweighted BF16 output,
+        ``[local_tokens, top_k, model_dim]`` in ``topk_ids`` order, so no
+        permute map is returned.
     """
     del plan, router_logits, num_tokens_global, enable_pdl, low_latency
-    if not do_finalize:
-        raise ValueError("Gluon Petit MegaMoE does not support deferred finalize")
     if topk_weights is None or topk_ids is None:
         raise ValueError(
             "Gluon Petit MegaMoE requires precomputed top-k ids and weights"
@@ -3268,9 +3437,27 @@ def gluon_petit_mxfp4_megamoe_apply(
     if num_tokens:
         workspace.config.quantize(x.contiguous(), out=inputs)
         inputs.expert_ids.copy_(topk_ids.to(torch.int32))
-        inputs.expert_weights.copy_(topk_weights.to(torch.float32))
+        if do_finalize:
+            inputs.expert_weights.copy_(topk_weights.to(torch.float32))
+        else:
+            # Unit weights keep each route unscaled; the caller applies
+            # topk_weights after its per-route norm.
+            inputs.expert_weights.fill_(1.0)
     if overlap_fn is not None:
         overlap_fn()
+    if not do_finalize:
+        routes = workspace.config.run_routes(
+            workspace.heap,
+            state.w13_weight,
+            state.w2_weight,
+            state.w13_scale,
+            state.w2_scale,
+            num_tokens,
+            w13_bias=state.w13_bias,
+            w2_bias=state.w2_bias,
+            inputs=inputs,
+        )
+        return routes, topk_weights, None
     output = x.new_empty((num_tokens, profile.model_dim))
     return workspace.config.run(
         workspace.heap,
@@ -3311,6 +3498,7 @@ if platform.is_amd:
         launch_gluon_latent_input_largem_gfx1250 as _largem_gfx1250_impl,
     )
 
+    _SMALL_BATCH_MAX_TOKENS = 320
     _SIGNATURES = frozenset(
         {
             format_signature(
@@ -3438,7 +3626,7 @@ if platform.is_amd:
             "weights_packed": frozenset({True}),
             "hidden_size_multiple_64": frozenset({True}),
             "inputs_contiguous": frozenset({True}),
-            "tokens": frozenset(range(1, 321)),
+            "tokens": frozenset(range(1, _SMALL_BATCH_MAX_TOKENS + 1)),
         },
     )
     def gluon_latent_input_small_batch_gfx950(**kwargs):
@@ -3453,6 +3641,7 @@ if platform.is_amd:
             packed_projection_weight_view(*weights),
             beta=kwargs["gate_clamp"],
             linear_beta=kwargs["up_clamp"],
+            warm_max_tokens=_SMALL_BATCH_MAX_TOKENS if is_warming_up() else 0,
         )
 
     @register_kernel(
@@ -3488,6 +3677,7 @@ if platform.is_amd:
             packed_weight,
             beta=kwargs["gate_clamp"],
             linear_beta=kwargs["up_clamp"],
+            warm_variants=is_warming_up(),
         )
 
     @register_kernel(
@@ -3524,6 +3714,7 @@ if platform.is_amd:
             packed_weight,
             beta=kwargs["gate_clamp"],
             linear_beta=kwargs["up_clamp"],
+            warm_variants=is_warming_up(),
         )
 
 

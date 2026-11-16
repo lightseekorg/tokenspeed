@@ -23,8 +23,9 @@
 Routes plain SUM all-reduces through the group's fusion workspace (IPC
 lamport single-node, mnnvl fabric cross-node) with the strategy resolved by
 size: one-shot inside its traffic window, two-shot up to the workspace's
-token capacity. Falls back to the provided backend for unsupported shapes
-and every other op.
+token capacity, and up to twice that as two two-shot calls where
+``SPLIT_ALL_REDUCE_MAX_BYTES`` measured the pair faster than NCCL. Falls back
+to the provided backend for unsupported shapes and every other op.
 
 The workspace is owned by the kernel package's per-group registry -- the
 same workspace the fused-pattern wrappers use. ``configure_group`` arms it
@@ -38,6 +39,13 @@ from tokenspeed.runtime.distributed.comm_backend.base import CommBackend, Group
 
 # Public: dispatch layers route tensor COLLECTIONS by this one-shot window.
 MAX_ONESHOT_BYTES = 2 * 1024 * 1024
+
+# Payload bytes, by group size, up to which a plain all-reduce past the
+# workspace's row capacity still runs on the workspace as two near-equal row
+# chunks instead of NCCL. 4 B300s, bf16: the two two-shots take 0.6-0.9x
+# NCCL's time up to 4096 rows of 4608 lanes (36 MiB), 1.0-1.1x from 44 MiB.
+# On 2 ranks they lose from 2560 rows; group sizes without an entry keep NCCL.
+SPLIT_ALL_REDUCE_MAX_BYTES = {4: 36 * 1024 * 1024}
 
 
 class TrtllmAllReduceBackend(CommBackend):
@@ -138,6 +146,55 @@ class TrtllmAllReduceBackend(CommBackend):
             x, residual, post, comb, pre, weight, eps, resource["device_group"]
         )
 
+    def supports_all_reduce_sconv(
+        self, x: torch.Tensor, weight: torch.Tensor, group: Group
+    ) -> bool:
+        resource = self._resources.get(group)
+        if resource is None:
+            return False
+        from tokenspeed_kernel.ops.communication.trtllm import (
+            supports_allreduce_sconv,
+        )
+
+        return supports_allreduce_sconv(x, weight, resource["device_group"])
+
+    def all_reduce_sconv(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        ring: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        seq_idx: torch.Tensor,
+        cache_indices: torch.Tensor,
+        has_initial_state: torch.Tensor,
+        seq_lens: torch.Tensor,
+        block_table: torch.Tensor,
+        checkpoint: torch.Tensor,
+        output_scale: float,
+        group: Group,
+        *,
+        fp32_acc: bool,
+    ) -> torch.Tensor:
+        """The convolution of x's sum, summed as ``all_reduce`` (``fp32_acc``
+        False) or ``ordered_all_reduce`` (True) sum it."""
+        from tokenspeed_kernel.ops.communication.trtllm import allreduce_sconv
+
+        return allreduce_sconv(
+            x,
+            weight,
+            ring,
+            cu_seqlens,
+            seq_idx,
+            cache_indices,
+            has_initial_state,
+            seq_lens,
+            block_table,
+            checkpoint,
+            output_scale=output_scale,
+            fp32_acc=fp32_acc,
+            group=self._resources[group]["device_group"],
+        )
+
     def has_trtllm_ar(self, group: Group) -> bool:
         return group in self._resources
 
@@ -213,10 +270,68 @@ class TrtllmAllReduceBackend(CommBackend):
             result = trtllm_workspace_allreduce(
                 tensor, res["device_group"], fp32_acc=False
             )
+            if result is None and self._splits_in_two(tensor, res):
+                result = self._chunked_workspace_allreduce(
+                    tensor, res, chunks=2, fp32_acc=False
+                )
             if result is not None:
                 return result
 
         return self._fallback.all_reduce(tensor, group, op=op)
+
+    @staticmethod
+    def _workspace_rows(res: dict) -> int:
+        """Rows one workspace call serves at most on every strategy."""
+        from tokenspeed_kernel.ops.communication.trtllm import (
+            MNNVL_TWOSHOT_MAX_TOKEN,
+        )
+
+        return min(res["max_token_num"], MNNVL_TWOSHOT_MAX_TOKEN)
+
+    def _splits_in_two(self, tensor: torch.Tensor, res: dict) -> bool:
+        """Whether a plain all-reduce the workspace refused runs as two
+        two-shot calls (``SPLIT_ALL_REDUCE_MAX_BYTES``); only a workspace
+        armed through the whole two-shot range splits."""
+        from tokenspeed_kernel.ops.communication.trtllm import (
+            MNNVL_TWOSHOT_MAX_TOKEN,
+        )
+
+        if tensor.dim() == 0 or tensor.numel() == 0:
+            return False
+        rows = tensor.numel() // tensor.shape[-1]
+        max_bytes = SPLIT_ALL_REDUCE_MAX_BYTES.get(res["device_group"].size(), 0)
+        return (
+            self._workspace_rows(res) == MNNVL_TWOSHOT_MAX_TOKEN
+            and MNNVL_TWOSHOT_MAX_TOKEN < rows <= 2 * MNNVL_TWOSHOT_MAX_TOKEN
+            and tensor.numel() * tensor.element_size() <= max_bytes
+        )
+
+    @staticmethod
+    def _chunked_workspace_allreduce(
+        tensor: torch.Tensor, res: dict, chunks: int, fp32_acc: bool
+    ) -> torch.Tensor | None:
+        """Sum ``tensor`` through the workspace as ``chunks`` near-equal row
+        chunks; None when a chunk is not served."""
+        from tokenspeed_kernel.ops.communication.trtllm import (
+            trtllm_workspace_allreduce,
+        )
+
+        rows = tensor.numel() // tensor.shape[-1]
+        step = -(-rows // chunks)
+        source = tensor.reshape(rows, tensor.shape[-1])
+        out = torch.empty(source.shape, dtype=source.dtype, device=source.device)
+        for start in range(0, rows, step):
+            if (
+                trtllm_workspace_allreduce(
+                    source[start : start + step],
+                    res["device_group"],
+                    fp32_acc=fp32_acc,
+                    out=out[start : start + step],
+                )
+                is None
+            ):
+                return None
+        return out.view(tensor.shape)
 
     def ordered_all_reduce(
         self, tensor: torch.Tensor, group: Group
@@ -233,34 +348,20 @@ class TrtllmAllReduceBackend(CommBackend):
         if res is None:
             return None
         from tokenspeed_kernel.ops.communication.trtllm import (
-            MNNVL_TWOSHOT_MAX_TOKEN,
             trtllm_workspace_allreduce,
         )
 
         if tensor.dim() == 0 or tensor.numel() == 0:
             return None
         rows = tensor.numel() // tensor.shape[-1]
-        capacity = min(res["max_token_num"], MNNVL_TWOSHOT_MAX_TOKEN)
+        capacity = self._workspace_rows(res)
         if rows <= capacity:
             return trtllm_workspace_allreduce(
                 tensor, res["device_group"], fp32_acc=True
             )
-        chunks = -(-rows // capacity)
-        step = -(-rows // chunks)
-        source = tensor.reshape(rows, tensor.shape[-1])
-        out = torch.empty(source.shape, dtype=source.dtype, device=source.device)
-        for start in range(0, rows, step):
-            if (
-                trtllm_workspace_allreduce(
-                    source[start : start + step],
-                    res["device_group"],
-                    fp32_acc=True,
-                    out=out[start : start + step],
-                )
-                is None
-            ):
-                return None
-        return out.view(tensor.shape)
+        return self._chunked_workspace_allreduce(
+            tensor, res, chunks=-(-rows // capacity), fp32_acc=True
+        )
 
     def lamport_all_gather(
         self, tensor: torch.Tensor, group: Group

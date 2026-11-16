@@ -316,6 +316,7 @@ fn group_spec(value: &Value) -> GroupSpec {
         rows_per_page: optional("rows_per_page"),
         entry_stride_tokens: optional("entry_stride_tokens"),
         sliding_window_tokens: optional("sliding_window_tokens"),
+        sink_tokens: optional("sink_tokens").unwrap_or(0),
         replayable: value["replayable"].as_bool().expect("a flag"),
         transfer_policy: value["transfer_policy"].as_str().map(str::to_owned),
         shard_count: int(&value["shard_count"]),

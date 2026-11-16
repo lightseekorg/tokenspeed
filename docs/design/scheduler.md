@@ -76,11 +76,12 @@ local hits. Retraction remains an exact image restore, never an L3 re-prefill.
 The D role probes Device history and receives missing data from its peer.
 See [asynchronous L3](async-l3-cache.md) for lifetime and admission limits.
 
-A first admission with no free request-pool row skips prefix hashing and
-matching. This is a slot constraint, not a KV capacity failure: it does not
-trigger retraction. Asynchronous L3 preparation runs before forward scheduling
-and can still fetch Host data while rows are full, because it owns no row.
-Resident prefill chunks and restore admissions keep their existing paths.
+A first admission with no free request-pool row skips prefix matching; with
+prefix caching, the prompt was hashed when it was submitted. This is a slot
+constraint, not a KV capacity failure: it does not trigger retraction.
+Asynchronous L3 preparation runs before forward scheduling and can still fetch
+Host data while rows are full, because it owns no row. Resident prefill chunks
+and restore admissions keep their existing paths.
 
 **What the probe may claim.** Before the first chunk, `matchPrefixAtAdmission`
 probes the prefix cache for the prompt's leading pages and for a published
@@ -402,6 +403,16 @@ which publishes it under the boundary's page hash, like a natural checkpoint,
 with the sliding window behind it as the endpoint's window, even at a chunk
 end, never as an unproven boundary that eviction takes first
 (`cache-concepts.md`).
+For restricted State groups (`checkpoint_granularity = G > 1`), the boundary
+instead is `floor((prompt_tokens - 1) / G) * G`, including prompts that fit
+within one chunk. A prompt of at most `G` tokens therefore has no positive
+input checkpoint. The P and fused roles require this flag, prefix caching,
+and a chunk budget of at least `G`; `G` must be a multiple of the prefix page
+size. The D role neither needs this flag nor publishes its transferred state
+as a reusable restricted checkpoint. An interior checkpoint does not mean
+that every shorter aligned prefix was saved: another request can reuse only
+a boundary whose State and all required KV dependencies remain present.
+
 A boundary a chunk ends on needs none (the chunk end's slot 1 is published
 there, as at a junction). The scan emits states only whole pages from a
 forward's start, and the budget a batch's decodes leave rarely ends on a page,
@@ -504,8 +515,12 @@ at admission like `promptEndCheckpoint`, is a possible follow-up.
 `Finishing` and nothing else; after every batch of events,
 `settleFinishedRequests` publishes the frontier of each `Finishing` request
 with no forward in flight (`kFinal`: KV tail and state, unless they are
-dead, above) and releases its pages (`ReleaseEvent`). One path for every
-schedule: a request that finished
+dead, above) and releases its pages (`ReleaseEvent`). This final publication
+advances the owner's `CacheProgress` in place: its hashes and checkpoint
+references remain alive through publication and Host-store pinning, then leave
+with `ReleaseEvent`. Finishing does not need a rollback copy of the history.
+Page-reference release still grows with the number of held pages. One path for
+every schedule: a request that finished
 quiescent settles with its Finish event — the timing every caller always
 saw — and one whose finish was decided on a landed token while the overlap
 schedule had already dispatched the next decode settles when that decode's
@@ -755,6 +770,10 @@ that input reserve is not subtracted again from the remaining output budget.
 the largest prompt whose worst-case working set — dense or sliding history
 with its decode reserve and overlap-depth protection, the blocks a tail
 handover holds for one admission, two slots per State group — fits the pool.
+However large the pool, it stops at `CapacityModel::MaxRequestTokenLimit`,
+the int32 token range less what the scheduler adds past a token limit (the
+decode windows and the rounding to a block or prefix page), which
+`SubmitRequests` enforces on every request.
 It is not a live check against currently free capacity; a prompt within the
 bound can still fail admission right now and waits. What it does promise,
 with the five exceptions at the end of this section, is that such a
@@ -1604,6 +1623,18 @@ a decode blocks. A capacity grant that admits a prompt (mixed mode) still runs
 and starts a new interval. The counters follow the plans alone, so mirrored
 ranks agree; under attention DP each replica counts its own rounds. The P and
 D roles refuse the knob: neither runs local prefill and decode on one engine.
+
+**Minimum interval** (`prefill_decode_min_interval` `M`, either mode; `0` is
+off): a round that schedules a local prefill chunk also owes the running
+decodes `M` decode rounds, on the same terms, but no overdue prompt suspends
+them. A suspended interval's overdue chunks then alternate with `M` decode
+rounds instead of running back to back: while a decode can run, no prefill
+round directly follows another. The price is the time-to-first-token bound:
+on top of the interval's `N`, a prompt waits `M` decode steps per prefill
+chunk the engine runs before its last one, its own included. A round that `M`
+holds back counts toward `N` like the interval's own. With `M >= N` the
+interval owes nothing `M` does not; `M` alone bounds nothing. The P and D
+roles refuse it as well.
 
 **Retraction:** the shared victim rule (§2): incomplete prefills first, then
 decode work. The Host cache decides the image's split, not whether there is

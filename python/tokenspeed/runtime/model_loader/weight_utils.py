@@ -55,6 +55,10 @@ from tokenspeed.runtime.layers.quantization import (
     QuantizationConfig,
     get_quantization_config,
 )
+from tokenspeed.runtime.layers.quantization.inkling2 import (
+    is_inkling2_manifest_stub,
+    read_inkling2_manifest,
+)
 from tokenspeed.runtime.layers.quantization.modelopt_mixed import normalize_quant_algo
 from tokenspeed.runtime.utils import get_colorful_logger
 
@@ -176,6 +180,10 @@ def get_quant_config(
         # compressed-tensors uses a compressions_config
         hf_quant_config = getattr(model_config.hf_config, "compression_config", None)
     if hf_quant_config is not None:
+        if is_inkling2_manifest_stub(hf_quant_config):
+            hf_quant_config = read_inkling2_manifest(
+                _json_folder(model_config, load_config)
+            )
         if "quantized_layers" in hf_quant_config:
             hf_quant_path = os.path.join(
                 _json_folder(model_config, load_config), "hf_quant_config.json"
@@ -700,6 +708,51 @@ def _madvise_sequential(tensors: Iterable[torch.Tensor]) -> None:
             )
 
 
+def _safetensors_file_weights(
+    path: str,
+    accept: Callable[[str], bool],
+    shared_weight_name_filter: Callable[[str], bool] | None,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Yield checkpoint views, mapping selected weights shared and writable.
+
+    Selected tensors must remain immutable. The writable file mapping gives
+    FUSE a writeback handle when a GPU driver dirties registered file pages
+    during unregister, even though the device only reads them. The tensors
+    retain the mapping after this iterator closes; no table copy is made.
+    A checkpoint without write permission fails rather than falling back to
+    a read-only mapping.
+    """
+    mapping = None
+    with safe_open(path, framework="pt", device="cpu") as handle:
+        for name in handle.keys():
+            if not accept(name):
+                continue
+            tensor = handle.get_tensor(name)
+            if (
+                shared_weight_name_filter is not None
+                and shared_weight_name_filter(name)
+                and tensor.numel()
+            ):
+                if mapping is None:
+                    with open(path, "r+b") as file:
+                        (header_size,) = struct.unpack("<Q", file.read(8))
+                        header = json.loads(file.read(header_size))
+                        mapping = mmap.mmap(
+                            file.fileno(),
+                            0,
+                            flags=mmap.MAP_SHARED,
+                            prot=mmap.PROT_READ | mmap.PROT_WRITE,
+                        )
+                offset = 8 + header_size + header[name]["data_offsets"][0]
+                tensor = torch.frombuffer(
+                    mapping,
+                    dtype=tensor.dtype,
+                    count=tensor.numel(),
+                    offset=offset,
+                ).reshape(tensor.shape)
+            yield name, tensor
+
+
 def safetensors_weights_iterator(
     hf_weights_files: list[str],
     is_all_weights_sharded: bool = False,
@@ -709,6 +762,7 @@ def safetensors_weights_iterator(
     *,
     local_rank: int,
     local_world_size: int,
+    shared_weight_name_filter: Callable[[str], bool] | None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files.
 
@@ -720,6 +774,10 @@ def safetensors_weights_iterator(
     paced by how fast the caller actually consumes the yielded tensors. The
     pacing only works if the caller loads weights while iterating instead of
     draining the iterator into a list first.
+
+    ``shared_weight_name_filter`` selects immutable tensors whose backing
+    file must be mapped shared and writable for host registration; ``None``
+    keeps the normal safetensors storage.
     """
     if decryption_key:
         yield from safetensors_encrypted_weights_iterator(
@@ -751,7 +809,15 @@ def safetensors_weights_iterator(
         ):
             if prefetcher is not None:
                 prefetcher.wait_file(file_idx)
-            result = safetensors.torch.load_file(st_file, device="cpu")
+            result = (
+                safetensors.torch.load_file(st_file, device="cpu")
+                if shared_weight_name_filter is None
+                else dict(
+                    _safetensors_file_weights(
+                        st_file, lambda name: True, shared_weight_name_filter
+                    )
+                )
+            )
             if prefetcher is not None:
                 _madvise_sequential(result.values())
             yield from result.items()
@@ -770,11 +836,14 @@ def safetensors_filtered_weights_iterator(
     *,
     local_rank: int,
     local_world_size: int,
+    shared_weight_name_filter: Callable[[str], bool] | None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Yield accepted tensors one at a time via ``get_tensor``, never load_file.
 
     Used when a model must skip huge tables (Engram embed) that share a shard
     with ordinary weights. Rejected keys are not materialized.
+    Accepted keys selected by ``shared_weight_name_filter`` use a shared
+    writable mapping while remaining immutable to the model.
     """
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
@@ -799,11 +868,9 @@ def safetensors_filtered_weights_iterator(
         ):
             if prefetcher is not None:
                 prefetcher.wait_file(file_idx)
-            with safe_open(st_file, framework="pt", device="cpu") as handle:
-                for key in handle.keys():
-                    if not accept(key):
-                        continue
-                    yield key, handle.get_tensor(key)
+            yield from _safetensors_file_weights(
+                st_file, accept, shared_weight_name_filter
+            )
             if prefetcher is not None:
                 prefetcher.advance(file_idx)
     finally:

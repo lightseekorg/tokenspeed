@@ -24,6 +24,13 @@ import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
 from tokenspeed_kernel.ops.attention.mla._triton.page_table import resolve_group_slot
 from tokenspeed_kernel.ops.layernorm.triton import reference_rmsnorm_row
+from tokenspeed_kernel.ops.quantization._triton_mxfp4 import (
+    _e2m1_decode,
+    _e2m1_encode,
+    _mxfp4_index_rows,
+    _ue8m0_exponent,
+    _ue8m0_word,
+)
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -76,65 +83,6 @@ _INTEGER_SIGNATURES = frozenset(
     for dtype in (torch.int32, torch.int64)
 )
 _QUERY_SIGNATURES = frozenset({format_signature(x=dense_tensor_format(torch.bfloat16))})
-
-
-@triton.jit
-def _e2m1_encode(x):
-    a = tl.minimum(tl.abs(x), 6.0)
-    # Nearest, ties to even *code*, including signed zero. V4's codec is not RNE.
-    code = (
-        (a > 0.25).to(tl.int32)
-        + (a >= 0.75).to(tl.int32)
-        + (a > 1.25).to(tl.int32)
-        + (a >= 1.75).to(tl.int32)
-        + (a > 2.5).to(tl.int32)
-        + (a >= 3.5).to(tl.int32)
-        + (a > 5.0).to(tl.int32)
-    )
-    return (code | ((x.to(tl.int32, bitcast=True) >> 28) & 8)).to(tl.uint8)
-
-
-@triton.jit
-def _e2m1_decode(code):
-    a = code & 7
-    value = tl.where(
-        a < 4,
-        a.to(tl.float32) * 0.5,
-        tl.where(a == 4, 2.0, tl.where(a == 5, 3.0, tl.where(a == 6, 4.0, 6.0))),
-    )
-    return tl.where((code & 8) != 0, -value, value)
-
-
-@triton.jit
-def _ue8m0_exponent(scaled_max):
-    # Biased exponent of 2**ceil(log2(x)); matches the reference IEEE-754
-    # ceil(log2) exactly, unlike an approximate log2.
-    bits = scaled_max.to(tl.int32, bitcast=True)
-    return ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
-
-
-@triton.jit
-def _mxfp4_index_rows(groups, scaled_max, ROWS: tl.constexpr):
-    """Encode FP32 [ROWS, 4, 32] index groups as MXFP4 rows.
-
-    scaled_max is each group's floored amax / 6; callers keep the division
-    their reference uses. Returns nibble-packed E2M1 codes uint8 [ROWS, 64]
-    (even element in the low nibble) and the biased UE8M0 exponents
-    int32 [ROWS, 4].
-    """
-    exponent = _ue8m0_exponent(scaled_max)
-    scale = (exponent << 23).to(tl.float32, bitcast=True)
-    codes = _e2m1_encode(tl.div_rn(groups, scale[:, :, None])).to(tl.int32)
-    pairs = tl.reshape(codes, (ROWS, 64, 2))
-    packed = tl.sum(pairs << (tl.arange(0, 2)[None, None, :] * 4), 2).to(tl.uint8)
-    return packed, exponent
-
-
-@triton.jit
-def _ue8m0_word(exponent):
-    # Four [ROWS, 4] exponent bytes as one little-endian int32 per row.
-    word = tl.sum(exponent.to(tl.uint32) << (tl.arange(0, 4)[None, :] * 8), 1)
-    return word.to(tl.int32)
 
 
 @triton.jit
@@ -2606,12 +2554,14 @@ def triton_dsv41_dspark_block(
     return ids, positions, pre_mix, request_indices, page, row, indices
 
 
-@triton.jit(do_not_specialize=["X0", "X1"])
-def _pack_index_queries(X, V, S, X0, X1):
+@triton.jit(do_not_specialize=["X0", "X1", "X2"])
+def _pack_index_queries(X, V, S, X0, X1, X2, HEADS: tl.constexpr):
     row = tl.program_id(0).to(tl.int64)
     d = tl.arange(0, 128)
     # Widen before multiplication: large inner strides overflow int32 offsets.
-    x = tl.load(X + row * X0 + d.to(tl.int64) * X1).to(tl.float32)
+    x = tl.load(X + (row // HEADS) * X0 + (row % HEADS) * X1 + d.to(tl.int64) * X2).to(
+        tl.float32
+    )
     grouped = tl.reshape(x, (1, 4, 32))
     amax = tl.maximum(tl.max(tl.abs(grouped), 2), 6 * 2.0**-126)
     packed, exponent = _mxfp4_index_rows(grouped, tl.div_rn(amax, 6.0), 1)
@@ -2685,18 +2635,27 @@ def quantize_index_queries(index_q, weights):
 
 
 def pack_index_queries(values):
-    flat = values.reshape(-1, 128)
+    """Pack [..., H, 128] BF16 index queries into the MXFP4 index format.
+
+    ``values`` may be strided, including a column slice of a wider projection
+    or a broadcast read view; it is read in place. Returns uint8 [..., H, 64]
+    E2M1 codes and int32 [..., H] UE8M0 scale words, one per 128-value row.
+    """
     data = torch.empty(
         (*values.shape[:-1], 64), dtype=torch.uint8, device=values.device
     )
     scales = torch.empty(values.shape[:-1], dtype=torch.int32, device=values.device)
-    if flat.shape[0]:
-        _pack_index_queries[(flat.shape[0],)](
-            flat,
+    if values.numel():
+        # Token and head strides stay separate: a column slice of a wider
+        # projection would not flatten to rows without a copy.
+        heads = values.shape[-2] if values.ndim > 2 else 1
+        rows = values.reshape(-1, heads, 128)
+        _pack_index_queries[(rows.shape[0] * heads,)](
+            rows,
             data,
             scales,
-            flat.stride(0),
-            flat.stride(1),
+            *rows.stride(),
+            HEADS=heads,
             num_warps=4,
             enable_fp_fusion=False,
         )

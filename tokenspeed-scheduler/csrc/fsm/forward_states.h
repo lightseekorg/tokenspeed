@@ -100,20 +100,13 @@ struct CacheProgress {
     bool prompt_end_rotated{false};
 };
 
-inline std::vector<std::int32_t> ComputeShiftedInputIds(const TokenContainer* token_container,
-                                                        TokenContainer::Window window) {
+inline std::span<const std::int32_t> ComputeShiftedInputIds(const TokenContainer* token_container,
+                                                            TokenContainer::Window window) {
     const std::int32_t shifted_start = window.begin + 1;
     const std::int32_t shifted_end = std::min(token_container->PrefillSize(), shifted_start + window.size);
     const std::int32_t shifted_size = std::max<std::int32_t>(0, shifted_end - shifted_start);
-
-    std::vector<std::int32_t> shifted;
-    shifted.reserve(static_cast<std::size_t>(window.size));
-    if (shifted_size > 0) {
-        auto slice = token_container->TokenSlice(TokenContainer::Window{shifted_start, shifted_size});
-        shifted.insert(shifted.end(), slice.begin(), slice.end());
-    }
-    shifted.resize(static_cast<std::size_t>(window.size), -1);
-    return shifted;
+    if (shifted_size == 0) return {};
+    return token_container->TokenSlice(TokenContainer::Window{shifted_start, shifted_size});
 }
 
 // Ready data stays charged to its storage ticket until normal admission has

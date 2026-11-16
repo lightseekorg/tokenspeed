@@ -46,7 +46,7 @@ def test_a_forward_ends_with_one_new_tag_when_it_launched() -> None:
     """The step counter changes once per forward that launches: in
     finish_step, unless the last launch gave the LM head's input (and moved
     the counter itself). A forward without launches adds no kernel."""
-    state = MonokernelState(torch.device("cpu"), scratch_pairs=1)
+    state = MonokernelState(torch.zeros(1, dtype=torch.int64))
 
     def forward(launched: bool, folded: bool):
         state.start_step()
@@ -121,7 +121,7 @@ def test_a_packed_monokernel_layer_launches() -> None:
     """A packed layer returns its launch's outputs and records the launch for
     finish_step."""
     layer = _Layer()
-    layer.monokernel_state = MonokernelState(torch.device("cpu"), scratch_pairs=1)
+    layer.monokernel_state = MonokernelState(torch.zeros(1, dtype=torch.int64))
     layer.monokernel_state.start_step()
     out = layer(hidden_states=torch.zeros(1, 2), residual=None, ctx=None)
     assert out[0].tolist() == [[1.0, 1.0]] and out[1] is None

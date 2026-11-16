@@ -53,8 +53,14 @@ def test_process_weights_preserves_canonical_scales(
     canonical_scales = layer.weight_scale_inv.data.clone()
     method = _method()
 
+    original_weight = layer.weight
+    original_scales = layer.weight_scale_inv
     method.process_weights_after_loading(layer)
 
+    assert layer.weight is original_weight
+    assert layer.weight_scale_inv is original_scales
+    # Ordinary canonical weights still follow the current backend setting.
+    monkeypatch.setitem(global_server_args_dict, "dense_gemm_backend", "auto")
     assert torch.equal(layer.weight_scale_inv, canonical_scales)
 
     x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)

@@ -794,18 +794,20 @@ def test_graph_padding_restores_live_output_layout(live_bs):
     )
     observed = []
     accepted_lengths = []
+    # MegaMoE's (live, padded) request counts, (1, 1) outside a padded replay.
+    live_requests = torch.ones(2, dtype=torch.int32)
     runner = SimpleNamespace(
         _can_use_graph=lambda *args: True,
         _padded_bs=lambda *args: padded_bs,
         _pad_graph_req_pool_indices=lambda indices, bs: torch.nn.functional.pad(
             indices, (0, bs - len(indices)), value=0
         ),
-        _set_graph_state_write_indices=lambda *args: None,
         _prepare_request_token_history_graph_inputs=lambda **kwargs: None,
         _prepare_decode_metadata=lambda *args, **kwargs: None,
         _cuda_graph_key=lambda bs: bs,
         _graph_debug=False,
         _expert_load_rows=None,
+        _mega_moe_live_requests=live_requests,
         device="cuda",
         config=SimpleNamespace(spec_draft_tree=False),
         attn_backend=SimpleNamespace(
@@ -823,7 +825,9 @@ def test_graph_padding_restores_live_output_layout(live_bs):
         ),
         graphs={
             padded_bs: SimpleNamespace(
-                replay=lambda: observed.append((ctx.bs, ctx.output_layout))
+                replay=lambda: observed.append(
+                    (ctx.bs, ctx.output_layout, live_requests.tolist())
+                )
             )
         },
         output_buffers={
@@ -852,7 +856,13 @@ def test_graph_padding_restores_live_output_layout(live_bs):
         block_tables_cpu={},
         settle=lambda: None,
     )
-    assert observed == [(padded_bs, ForwardOutputLayout(0, 0, padded_bs, width))]
+    # A padded replay routes only the live requests' MegaMoE rows; an unpadded
+    # one routes every row. Either way the counts are (1, 1) afterwards.
+    counts = [live_bs, padded_bs] if live_bs < padded_bs else [1, 1]
+    assert observed == [
+        (padded_bs, ForwardOutputLayout(0, 0, padded_bs, width), counts)
+    ]
+    assert live_requests.tolist() == [1, 1]
     assert ctx.bs == live_bs
     assert ctx.output_layout is live_layout
     assert tokens.tolist() == list(range(live_bs * width))

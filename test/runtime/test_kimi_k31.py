@@ -39,6 +39,7 @@ sys.path.insert(0, os.path.dirname(_TEST_DIR))
 from test.runtime.conftest import kimi_layout, kimi_recipe, kimi_tp8_layout
 
 from ci_system.ci_register import register_cuda_ci
+from tokenspeed_kernel.platform import current_platform
 
 register_cuda_ci(est_time=60, suite="runtime-1gpu")
 
@@ -281,8 +282,8 @@ def test_kvp_launch_passes_the_full_attention_dcp_check(tmp_path) -> None:
             False,
             True,
         ),
-        # A MIXED round would replay with decode rows in the narrowed break.
-        ({"disaggregation_mode": "null", "enable_mixed_batch": True}, False, False),
+        # A MIXED round replays with its decode rows in the narrowed break.
+        ({"disaggregation_mode": "null", "enable_mixed_batch": True}, False, True),
         ({"disaggregation_mode": "null"}, True, False),
         # --disable-prefill-graph turns it off.
         ({"disaggregation_mode": "null", "disable_prefill_graph": True}, False, False),
@@ -320,15 +321,11 @@ def test_dsa_spec_carries_the_padded_prefill_replay_admission(tmp_path) -> None:
     assert server_args.enable_mixed_batch is False
     spec = DSAConfig._spec_kwargs(server_args, model_config, False)
     assert spec["padded_prefill_replay"] is True
-    # The disable flag or a mixed batch turns it off.
+    # The disable flag turns it off.
     server_args.disable_prefill_graph = True
     spec = DSAConfig._spec_kwargs(server_args, model_config, False)
     assert spec["padded_prefill_replay"] is False
     server_args.disable_prefill_graph = False
-    server_args.enable_mixed_batch = True
-    spec = DSAConfig._spec_kwargs(server_args, model_config, False)
-    assert spec["padded_prefill_replay"] is False
-    server_args.enable_mixed_batch = False
     # The prefill role keeps its layerwise condition.
     server_args.disaggregation_mode = "prefill"
     spec = DSAConfig._spec_kwargs(server_args, model_config, False)
@@ -473,7 +470,7 @@ def _kernel_page_table(block_ids: list[int], device) -> torch.Tensor:
 
 @requires_gpu
 def test_index_k_rows_round_trip_through_the_kernel_page_layout() -> None:
-    from tokenspeed_kernel.ops.quantization import quantize_fp8
+    from tokenspeed_kernel.ops.kvcache.triton import quantize_index_k_rows
 
     from tokenspeed.runtime.layers.attention.kv_cache.dsa import split_index_k_rows
     from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
@@ -497,12 +494,10 @@ def test_index_k_rows_round_trip_through_the_kernel_page_layout() -> None:
         index_head_dim=128,
         index_k_format="fp8_scaled",
     )
-    expected_fp8, expected_scale = quantize_fp8(
-        keys, granularity="token_group", group_size=128, scale_encoding="float32"
-    )
+    expected_fp8, expected_scale = quantize_index_k_rows(keys, group_size=128)
 
     assert torch.equal(fp8, expected_fp8.view(torch.uint8))
-    assert torch.equal(scale, expected_scale.reshape(200, 1))
+    assert torch.equal(scale, expected_scale)
     # The next DSA layer's plane is untouched.
     assert not pool.get_index_k_buffer(7).any()
 
@@ -534,7 +529,10 @@ _KEY_PROJECTION_WIDTHS = pytest.mark.parametrize(
 def test_the_index_k_write_applies_the_deferred_key_norm(index_k_format, width) -> None:
     """A pre-norm key handed over with its LayerNorm lands in the plane as the
     normalized key would; owned rows only."""
-    from tokenspeed_kernel.ops.kvcache.triton import index_k_block_split_scatter
+    from tokenspeed_kernel.ops.kvcache.triton import (
+        index_k_block_split_scatter,
+        quantize_index_k_rows,
+    )
     from tokenspeed_kernel.platform import current_platform
 
     from tokenspeed.runtime.layers.layernorm import LayerNorm
@@ -554,12 +552,11 @@ def test_the_index_k_write_applies_the_deferred_key_norm(index_k_format, width) 
 
     deferred.set_index_k_buffer(3, slots, keys, write_mask=owned, key_norm=norm)
     if index_k_format == "fp8_scaled" and not current_platform().is_amd:
-        # Mirror the fused FP8 rounding; NVIDIA quantize_fp8 may differ, AMD's matches.
-        normed = norm(keys).float()
-        scale = normed.abs().amax(dim=1, keepdim=True).clamp_min(1e-10) / 448.0
+        # Mirror the fused FP8 rounding and the plane's scale-word encoding.
+        codes, scale = quantize_index_k_rows(norm(keys).float(), group_size=128)
         index_k_block_split_scatter(
             eager.index_k_buffer[3],
-            (normed / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn),
+            codes,
             scale,
             slots,
             page_size=eager.index_k_page_size,
@@ -999,20 +996,22 @@ def test_prefill_topk_split_scores_each_ranks_own_index_queries(monkeypatch) -> 
     fp8_scaled plane quantizes exactly those projected rows."""
     from tokenspeed.runtime.distributed import Mapping
     from tokenspeed.runtime.models import glm5
-    from tokenspeed.runtime.models.kimi_k31 import _scorers_take_fp8_index_queries
+    from tokenspeed.runtime.models.kimi_k31 import _scorers_take_quantized_index_queries
 
     torch.manual_seed(0)
     attention = _indexer_attention(index_topk=2048)
     indexer = attention.indexer
     with torch.no_grad():
         indexer.wq_b.weight.normal_(0.0, 0.05)
-    pool, _ = _k31_pool("cuda", num_lcm_blocks=1)
+    pool, _ = _k31_pool("cuda", num_lcm_blocks=2)
     num_rows = 1100
-    slots = _slots(list(range(9)), num_rows, "cuda")
-    keys = torch.randn(num_rows, 128, device="cuda", dtype=torch.bfloat16)
+    # Behind a 1000-token prefix the last rows see more than topk keys: scored.
+    prefix = 1000
+    slots = _slots(list(range(17)), prefix + num_rows, "cuda")
+    keys = torch.randn(prefix + num_rows, 128, device="cuda", dtype=torch.bfloat16)
     pool.set_index_k_buffer(3, slots, keys, write_mask=None)
     q_lora = torch.randn(num_rows, 128, device="cuda", dtype=torch.bfloat16)
-    row_ends_cpu = torch.arange(1, num_rows + 1, dtype=torch.int64)
+    row_ends_cpu = prefix + torch.arange(1, num_rows + 1, dtype=torch.int64)
     calls = _record_scorer_queries(monkeypatch, "dsa_prefill_topk")
     monkeypatch.setattr(glm5, "all_gather_single", lambda output, input, group: None)
 
@@ -1034,7 +1033,7 @@ def test_prefill_topk_split_scores_each_ranks_own_index_queries(monkeypatch) -> 
 
     # Whole 16-row groups per rank: 560 rows, then the remaining 540.
     assert len(calls) == 2
-    fp8_queries = _scorers_take_fp8_index_queries(indexer)
+    fp8_queries = _scorers_take_quantized_index_queries(indexer)
     for (q, q_scales), rows in zip(calls, (slice(0, 560), slice(560, num_rows))):
         reference = indexer._project_query(q_lora[rows])
         if fp8_queries:
@@ -1328,6 +1327,11 @@ def test_configured_index_k_quantization_and_topk(tmp_path, phase) -> None:
         dsa_plan,
         dsa_prefill_topk,
     )
+    from tokenspeed_kernel.ops.kvcache.index_k_scale import (
+        decode_index_k_scale,
+        index_k_scale_ue8m0,
+        round_index_k_scale,
+    )
 
     from tokenspeed.runtime.layers.attention.kv_cache.dsa import split_index_k_rows
     from tokenspeed.runtime.layers.layernorm import LayerNorm
@@ -1355,15 +1359,20 @@ def test_configured_index_k_quantization_and_topk(tmp_path, phase) -> None:
         index_k_format=model_config.index_k_format,
     )
     normalized = norm(keys).float()
+    scales = decode_index_k_scale(scales)
     torch.testing.assert_close(
-        scales, normalized.abs().amax(dim=1, keepdim=True) / 448, rtol=1e-6, atol=1e-9
+        scales,
+        round_index_k_scale(normalized.abs().amax(dim=1, keepdim=True) / 448),
+        rtol=1e-6,
+        atol=1e-9,
     )
     # E4M3 has three mantissa bits; check the quantized values after scaling.
+    # A power-of-two scale doubles the subnormal step of the smallest values.
     torch.testing.assert_close(
         fp8.view(torch.float8_e4m3fn).float() * scales,
         normalized,
         rtol=1 / 16,
-        atol=1e-5,
+        atol=2e-5 if index_k_scale_ue8m0() else 1e-5,
     )
     indexer_output = _indexer_output(u, 1)
     common = dict(
@@ -1404,7 +1413,7 @@ def test_configured_index_k_quantization_and_topk(tmp_path, phase) -> None:
 def test_k31_scores_an_fp8_scaled_plane_with_fp8_index_queries() -> None:
     """Over an fp8_scaled plane K3.1 quantizes its index query per (token,
     head), where the platform registers FP8-query scorers."""
-    from tokenspeed.runtime.models.kimi_k31 import _scorers_take_fp8_index_queries
+    from tokenspeed.runtime.models.kimi_k31 import _scorers_take_quantized_index_queries
 
     torch.manual_seed(0)
     attention = _indexer_attention(index_topk=2048)
@@ -1415,7 +1424,7 @@ def test_k31_scores_an_fp8_scaled_plane_with_fp8_index_queries() -> None:
 
     q_out, q_scales = attention._scorer_index_query(q, plane)
 
-    if _scorers_take_fp8_index_queries(attention.indexer):
+    if _scorers_take_quantized_index_queries(attention.indexer):
         _assert_fp8_index_query(q_out, q_scales, q)
     else:
         assert q_out is q and q_scales is None
@@ -1454,7 +1463,7 @@ def test_decode_topk_selects_every_visible_key_below_topk(
 ) -> None:
     from tokenspeed_kernel.ops.attention.dsa import dsa_plan
 
-    from tokenspeed.runtime.models.kimi_k31 import _scorers_take_fp8_index_queries
+    from tokenspeed.runtime.models.kimi_k31 import _scorers_take_quantized_index_queries
 
     if index_k_format == "bf16" and torch.version.hip is None:
         pytest.skip("BF16 index-K top-k kernels require AMD")
@@ -1501,7 +1510,7 @@ def test_decode_topk_selects_every_visible_key_below_topk(
     )
 
     [(q, q_scales)] = calls
-    if index_k_format == "fp8_scaled" and _scorers_take_fp8_index_queries(
+    if index_k_format == "fp8_scaled" and _scorers_take_quantized_index_queries(
         attention.indexer
     ):
         _assert_fp8_index_query(q, q_scales, indexer_output.query)
@@ -1721,6 +1730,115 @@ def test_prefill_topk_matches_the_causal_reference(prefix_len, extend_len) -> No
             assert sorted(chosen[row].tolist()) == sorted(slots[bad.numel() :].tolist())
 
 
+@requires_gpu
+@pytest.mark.parametrize(
+    "prefix_len, extend_len, scored",
+    [
+        (0, 15, False),
+        (200, 100, False),
+        (2000, 48, False),
+        (0, 2048, False),
+        # One row past topk: the round is scored.
+        (0, 2049, True),
+    ],
+)
+def test_prefill_rows_within_topk_select_every_candidate_unscored(
+    monkeypatch: pytest.MonkeyPatch, prefix_len: int, extend_len: int, scored: bool
+) -> None:
+    """Rows seeing at most topk keys take all of them, the set the scorer selects."""
+    from tokenspeed.runtime.distributed import Mapping
+    from tokenspeed.runtime.models import glm5
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    torch.manual_seed(3)
+    attention = _indexer_attention(index_topk=2048)
+    slots = 6144
+    pool, _ = _k31_pool("cuda", num_lcm_blocks=4)
+    pool.set_index_k_buffer(
+        3,
+        torch.arange(slots, device="cuda", dtype=torch.int64),
+        torch.randn(slots, 128, device="cuda", dtype=torch.bfloat16),
+        write_mask=None,
+    )
+    plane = pool.get_index_k_buffer(3)
+    # A second request of seven rows behind the first: its rows start mid-workspace.
+    seq_len = prefix_len + extend_len
+    lens_cpu = torch.cat(
+        (
+            prefix_len + torch.arange(1, extend_len + 1, dtype=torch.int64),
+            torch.arange(1, 8, dtype=torch.int64),
+        )
+    )
+    starts_cpu = torch.cat(
+        (
+            torch.zeros(extend_len, dtype=torch.int64),
+            torch.full((7,), seq_len, dtype=torch.int64),
+        )
+    )
+    rows = lens_cpu.numel()
+    q = torch.randn(rows, 32, 128, device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn(rows, 32, device="cuda", dtype=torch.bfloat16)
+    row_starts = starts_cpu.to(device="cuda", dtype=torch.int32)
+    row_ends = (starts_cpu + lens_cpu).to(device="cuda", dtype=torch.int32)
+    kv_workspace_slots = torch.arange(slots, device="cuda", dtype=torch.int64)
+    query, q_scales = attention._scorer_index_query(q, plane)
+    expected, expected_lens = glm5.dsa_prefill_topk(
+        query,
+        weights,
+        kv_workspace_slots,
+        row_starts,
+        row_ends,
+        topk=2048,
+        softmax_scale=attention.indexer.weights_softmax_scale,
+        batch_invariant=False,
+        index_k_cache=plane,
+        page_size=64,
+        q_scales=q_scales,
+        max_logits_bytes=1 << 30,
+        candidate_lens_cpu=lens_cpu,
+        slot_order=global_server_args_dict["dsa_slot_order"],
+    )
+
+    scorer, scored_calls = glm5.dsa_prefill_topk, []
+
+    def record(*args, **kwargs):
+        scored_calls.append(1)
+        return scorer(*args, **kwargs)
+
+    def no_gather(output, input, group):
+        raise AssertionError("an unscored round gathers nothing")
+
+    monkeypatch.setattr(glm5, "dsa_prefill_topk", record)
+    monkeypatch.setattr(glm5, "all_gather_single", no_gather)
+    # Rank 0 of eight would select only its share of a split round.
+    attention.prefill_topk_tp_split = not scored
+    attention.mapping = Mapping(rank=0, world_size=8, attn_tp_size=8)
+    selected, lens = attention._select_prefill_topk_rows(
+        q=q,
+        weights=weights,
+        kv_workspace_slots=kv_workspace_slots,
+        row_starts=row_starts,
+        row_ends=row_ends,
+        candidate_lens_cpu=lens_cpu,
+        index_k_cache=plane,
+        page_size=64,
+        max_logits_bytes=1 << 30,
+        topk=2048,
+    )
+
+    assert len(scored_calls) == int(scored)
+    assert torch.equal(lens, expected_lens)
+    # A leaf's own order is unspecified under the selection order: compare sets.
+    assert torch.equal(selected.sort(dim=1).values, expected.sort(dim=1).values)
+    if not scored:
+        # The shortcut emits each row's candidates by ascending position, -1 after them.
+        offsets = torch.arange(2048, device="cuda", dtype=torch.int32)
+        by_position = torch.where(
+            offsets < lens.unsqueeze(1), offsets + row_starts.unsqueeze(1), -1
+        )
+        assert torch.equal(selected, by_position)
+
+
 # ---------------------------------------------------------------- loader
 
 
@@ -1910,15 +2028,12 @@ def test_dsa_leaf_admits_prefill_graphs_only_under_padded_replay(
 ) -> None:
     import logging
 
-    from tokenspeed_kernel.platform import current_platform
-
     from tokenspeed.runtime.layers.attention.backends.paged.dsa import DSABackend
     from tokenspeed.runtime.layers.attention.backends.support import (
         resolve_cuda_graph_support,
     )
 
-    # The leaf opts in on NVIDIA only, the one platform validated.
-    admits = padded_prefill_replay and bool(current_platform().is_nvidia)
+    admits = padded_prefill_replay
     dsa_logger = "tokenspeed.runtime.layers.attention.backends.paged.dsa"
     support_logger = "tokenspeed.runtime.layers.attention.backends.support"
     for name in (dsa_logger, support_logger):
@@ -2079,6 +2194,7 @@ def _k31_attention_stack(
     full_blocks: int = 0,
     context_len: int = 4096,
     q_lora_rank: int = 128,
+    alt_stream: torch.cuda.Stream | None = None,
 ):
     """A real K3.1 sparse MLA layer (id 3) over the K3.1 pool and the DSA
     router, at TP8's 12 local heads and K3's latent geometry (a narrow q
@@ -2094,7 +2210,10 @@ def _k31_attention_stack(
     from tokenspeed.runtime.distributed import Mapping
     from tokenspeed.runtime.distributed.comm_manager import CommManager
     from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
-    from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
+    from tokenspeed.runtime.layers.attention.configs.dsa import (
+        DSAConfig,
+        dsa_kvp_history_prefill,
+    )
     from tokenspeed.runtime.layers.attention.kv_cache.factory import (
         create_cache_arena,
         create_cache_pool,
@@ -2181,7 +2300,7 @@ def _k31_attention_stack(
                 layer_id=3,
                 prefix="model.layers.3.self_attn",
                 reduce_attn_results=False,
-                alt_stream=None,
+                alt_stream=alt_stream,
                 qkv_parallel=None,
                 output_parallel=None,
             )
@@ -2208,32 +2327,31 @@ def _k31_attention_stack(
         attention.kv_b_proj.weight, attention
     )
     bind_cache_groups(attention, pool)
-    router = create_paged_router(
-        AttnConfig(
-            device="cuda",
-            dtype=torch.bfloat16,
-            kv_cache_dtype=kv_cache_dtype,
-            kv_cache_quant_method=None,
-            max_bs=4,
-            context_len=context_len,
-            speculative_num_draft_tokens=spec_width,
-            kvp_size=kvp_size,
-            kvp_rank=kvp_rank,
-            kvp_group=kvp_group,
-            components=(
-                dataclasses.replace(
-                    dsa,
-                    num_attention_heads=heads * kvp_size,
-                    num_kv_heads=heads * kvp_size,
-                    attn_tp_size=kvp_size,
-                ),
+    config = AttnConfig(
+        device="cuda",
+        dtype=torch.bfloat16,
+        kv_cache_dtype=kv_cache_dtype,
+        kv_cache_quant_method=None,
+        max_bs=4,
+        context_len=context_len,
+        speculative_num_draft_tokens=spec_width,
+        kvp_size=kvp_size,
+        kvp_rank=kvp_rank,
+        kvp_group=kvp_group,
+        components=(
+            dataclasses.replace(
+                dsa,
+                num_attention_heads=heads * kvp_size,
+                num_kv_heads=heads * kvp_size,
+                attn_tp_size=kvp_size,
             ),
         ),
-        AttentionArch.DSA,
-        backend_name="dsa",
     )
+    router = create_paged_router(config, AttentionArch.DSA, backend_name="dsa")
     router.set_cache_pool(pool)
     router.configure_runtime()
+    if dsa_kvp_history_prefill(config):
+        router.preallocate_history_gather_workspace(context_len)
     router.init_cuda_graph_state(4, max_extend_tokens=256)
     return attention, comm, router, pool
 
@@ -2963,6 +3081,177 @@ def test_a_decode_chain_round_runs_the_fused_front(
     replayed = (captured.clone(), plane.clone(), latent.clone())
     plane.copy_(before[0])
     latent.copy_(before[1])
+    refresh(total)
+    with torch.no_grad():
+        eager = attention.o_proj_input(
+            step_positions, step_hidden, ctx, comm, projection=projection
+        )
+    assert torch.equal(replayed[0].view(torch.int16), eager.view(torch.int16))
+    assert torch.equal(replayed[1], plane)
+    assert torch.equal(replayed[2].view(torch.uint8), latent.view(torch.uint8))
+
+
+@requires_gpu
+@pytest.mark.parametrize("nvidia", [True, False], ids=["nvidia", "other"])
+def test_decode_rounds_fork_the_top_k_only_on_nvidia(monkeypatch, nvidia) -> None:
+    """Only NVIDIA decode rounds take the alternate stream for the top-k."""
+    from tokenspeed.runtime.models import kimi_k31
+
+    monkeypatch.setattr(
+        kimi_k31, "current_platform", lambda: SimpleNamespace(is_nvidia=nvidia)
+    )
+    aux = torch.cuda.Stream()
+    attention, *_ = _k31_attention_stack(
+        kv_cache_dtype=torch.bfloat16,
+        spec_width=1,
+        heads=12,
+        index_topk=64,
+        kvp_size=1,
+        kvp_rank=0,
+        alt_stream=aux,
+    )
+    assert attention.decode_topk_fork.aux_stream is (aux if nvidia else None)
+
+
+@requires_gpu
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not current_platform().is_nvidia,
+    reason="only NVIDIA decode rounds fork the top-k",
+)
+@pytest.mark.parametrize("spec_width", [1, 8])
+def test_a_decode_round_selects_top_k_beside_the_query_absorption(
+    monkeypatch, spec_width
+) -> None:
+    """A decode round's top-k on the alternate stream changes no bit.
+
+    With the fork's stream the top-k runs there while the main stream absorbs
+    the query and writes the latent; the output, the selection, and both caches
+    match the round on one stream, eagerly and replayed from a CUDA graph.
+    """
+    from tokenspeed_kernel.ops import gemm
+    from tokenspeed_kernel.workspace import capture_session
+
+    from tokenspeed.runtime.execution import context, forward_batch_info, output_layout
+    from tokenspeed.runtime.utils import env
+    from tokenspeed.runtime.utils.cuda_stream import StreamFork
+
+    monkeypatch.setitem(env.global_server_args_dict, "chunked_prefill_size", 8192)
+    torch.manual_seed(7)
+    prompt = 2300
+    total = prompt + 2 * spec_width
+    num_blocks = -(-total // 128)
+    attention, comm, router, pool = _k31_attention_stack(
+        kv_cache_dtype=torch.float8_e4m3fn,
+        spec_width=spec_width,
+        heads=12,
+        index_topk=2048,
+        kvp_size=1,
+        kvp_rank=0,
+        full_blocks=num_blocks,
+        context_len=max(4096, 2 * total),
+        q_lora_rank=1536,
+    )
+    attention.indexer.fuse_key_weight_projections()
+    attention.fuse_query_projections()
+    weight = attention.pack_decode_projection()
+    hidden = torch.randn(total, 256, device="cuda", dtype=torch.bfloat16)
+    order = torch.randperm(num_blocks, generator=torch.Generator().manual_seed(5))
+    blocks = (order + 1).tolist()
+    _extend_forward(
+        attention, comm, router, pool, hidden, prefix=0, end=prompt, blocks=blocks
+    )
+    plane, latent = pool.get_index_k_buffer(3), pool.get_key_buffer(3)
+    history = (plane.clone(), latent.clone())
+    topk_streams = []
+    select = attention._compute_decode_topk_indices
+
+    def record_stream(*args, **kwargs):
+        topk_streams.append(torch.cuda.current_stream())
+        return select(*args, **kwargs)
+
+    monkeypatch.setattr(attention, "_compute_decode_topk_indices", record_stream)
+    decode_mode = forward_batch_info.ForwardMode.DECODE
+    ctx = context.ForwardContext(
+        attn_backend=router,
+        token_to_kv_pool=pool,
+        bs=1,
+        num_extends=0,
+        input_num_tokens=spec_width,
+        forward_mode=decode_mode,
+        output_layout=output_layout.ForwardOutputLayout(0, 0, 1, spec_width),
+    )
+    request = torch.tensor([0], dtype=torch.int32, device="cuda")
+
+    def refresh(length, **kwargs):
+        router.refresh_decode_metadata(
+            1,
+            1,
+            request,
+            torch.tensor([length], dtype=torch.int32, device="cuda"),
+            forward_mode=decode_mode,
+            block_tables=_block_table(blocks),
+            **kwargs,
+        )
+
+    def projection(x):
+        return gemm.mm(x, weight)
+
+    step_hidden = hidden[prompt : prompt + spec_width].clone()
+    step_positions = torch.arange(prompt, prompt + spec_width, device="cuda")
+
+    def decode(fork):
+        plane.copy_(history[0])
+        latent.copy_(history[1])
+        attention.decode_topk_fork = fork
+        refresh(prompt + spec_width)
+        with torch.no_grad():
+            out = attention.o_proj_input(
+                step_positions, step_hidden, ctx, comm, projection=projection
+            ).clone()
+        selection = router.sparse_topk.decode
+        return (
+            out.view(torch.int16),
+            selection.topk_indices[:spec_width].clone(),
+            selection.topk_lens[:spec_width].clone(),
+            plane.clone(),
+            latent.clone().view(torch.uint8),
+        )
+
+    aux = torch.cuda.Stream()
+    one_stream = decode(StreamFork(None))
+    forked = decode(StreamFork(aux))
+    assert topk_streams == [torch.cuda.current_stream(), aux]
+    for got, want in zip(forked, one_stream):
+        assert torch.equal(got, want)
+
+    # Captured with the fork, the round replays the next step as one stream runs it.
+    capture = torch.cuda.Stream()
+    capture.wait_stream(torch.cuda.current_stream())
+    plane.copy_(history[0])
+    latent.copy_(history[1])
+    refresh(prompt + spec_width)
+    with torch.no_grad(), torch.cuda.stream(capture):
+        attention.o_proj_input(
+            step_positions, step_hidden, ctx, comm, projection=projection
+        )
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.no_grad(), capture_session(graph), torch.cuda.graph(
+        graph, stream=capture
+    ):
+        captured = attention.o_proj_input(
+            step_positions, step_hidden, ctx, comm, projection=projection
+        )
+    before = (plane.clone(), latent.clone())
+    step_hidden.copy_(hidden[prompt + spec_width :])
+    step_positions.copy_(torch.arange(prompt + spec_width, total, device="cuda"))
+    refresh(total, for_graph_replay=True)
+    graph.replay()
+    torch.cuda.synchronize()
+    replayed = (captured.clone(), plane.clone(), latent.clone())
+    plane.copy_(before[0])
+    latent.copy_(before[1])
+    attention.decode_topk_fork = StreamFork(None)
     refresh(total)
     with torch.no_grad():
         eager = attention.o_proj_input(

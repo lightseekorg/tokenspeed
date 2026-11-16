@@ -27,9 +27,12 @@
 
 #![allow(unsafe_code)]
 
+pub mod json_guard;
 pub mod table;
 
-use std::fmt;
+use std::{fmt, sync::Arc};
+
+pub use json_guard::{string_steps_of, JsonStringGuard};
 
 use cxx::UniquePtr;
 
@@ -135,7 +138,11 @@ pub enum GrammarKind {
 
 /// Compiles grammars against one vocabulary. Compiles may run on several
 /// threads at once: xgrammar's compiler guards its own state.
-pub struct Compiler(UniquePtr<ffi::Compiler>);
+pub struct Compiler(
+    UniquePtr<ffi::Compiler>,
+    /// The vocabulary's size, which a framed answer's guard must cover.
+    i32,
+);
 
 // SAFETY: see the type's documentation.
 unsafe impl Send for Compiler {}
@@ -146,7 +153,10 @@ impl Compiler {
     /// A compiler using up to `max_threads` threads per compile, with
     /// xgrammar's own cache off.
     pub fn new(info: &TokenizerInfo, max_threads: i32) -> Result<Self, Error> {
-        Ok(Self(ffi::new_compiler(&info.0, max_threads)?))
+        Ok(Self(
+            ffi::new_compiler(&info.0, max_threads)?,
+            info.vocab_size(),
+        ))
     }
 
     /// Compile one grammar. `any_whitespace` applies to JSON schemas.
@@ -162,12 +172,39 @@ impl Compiler {
             GrammarKind::Ebnf => ffi::compile_ebnf(&self.0, source),
             GrammarKind::StructuralTag => ffi::compile_structural_tag(&self.0, source),
         }?;
-        Ok(CompiledGrammar(compiled))
+        Ok(CompiledGrammar(compiled, None))
+    }
+
+    /// The grammar of a framed JSON answer, a structural tag: its matchers
+    /// keep protocol tokens out of JSON strings (`guard`, which must
+    /// cover the compiler's vocabulary). `starts_in_json` when the grammar
+    /// starts inside the answer's payload.
+    pub fn compile_framed_answer(
+        &self,
+        tag: &str,
+        starts_in_json: bool,
+        guard: Arc<JsonStringGuard>,
+    ) -> Result<CompiledGrammar, Error> {
+        if guard.vocab_size() != self.1 as usize {
+            return Err(Error(format!(
+                "the JSON string guard covers {} tokens but the tokenizer info {}",
+                guard.vocab_size(),
+                self.1
+            )));
+        }
+        Ok(CompiledGrammar(
+            ffi::compile_structural_tag(&self.0, tag)?,
+            Some(json_guard::Guard::new(guard, starts_in_json)),
+        ))
     }
 }
 
 /// A compiled grammar; matchers share it.
-pub struct CompiledGrammar(UniquePtr<ffi::Compiled>);
+pub struct CompiledGrammar(
+    UniquePtr<ffi::Compiled>,
+    /// The guard its matchers start with.
+    Option<json_guard::Guard>,
+);
 
 // SAFETY: a compiled grammar is immutable; matchers only read it.
 unsafe impl Send for CompiledGrammar {}
@@ -182,13 +219,20 @@ impl CompiledGrammar {
 
     /// A fresh matcher at the grammar's start.
     pub fn matcher(&self, max_rollback_tokens: i32) -> Result<Matcher, Error> {
-        Ok(Matcher(ffi::new_matcher(&self.0, max_rollback_tokens)?))
+        Ok(Matcher(
+            ffi::new_matcher(&self.0, max_rollback_tokens)?,
+            self.1.clone(),
+        ))
     }
 }
 
 /// One request's progress through its grammar. Not thread-safe: callers
 /// serialize access.
-pub struct Matcher(UniquePtr<ffi::Matcher>);
+pub struct Matcher(
+    UniquePtr<ffi::Matcher>,
+    /// The guard of a framed JSON answer.
+    Option<json_guard::Guard>,
+);
 
 // SAFETY: a matcher has no thread affinity; access is serialized by its
 // owner.
@@ -198,6 +242,9 @@ impl Matcher {
     /// Advance by one token; `false` if the grammar rejects it, leaving
     /// the matcher as it was.
     pub fn accept_token(&mut self, token: i32) -> bool {
+        if let Some(guard) = &mut self.1 {
+            return guard.accept_token(self.0.pin_mut(), token);
+        }
         ffi::matcher_accept_token(self.0.pin_mut(), token)
     }
 
@@ -214,6 +261,9 @@ impl Matcher {
         width: i64,
         row: i32,
     ) -> Result<(), Error> {
+        if let Some(guard) = &self.1 {
+            return guard.fill_bitmask(self.0.pin_mut(), data, rows, width, row);
+        }
         Ok(ffi::matcher_fill_bitmask(
             self.0.pin_mut(),
             data,
@@ -239,6 +289,16 @@ impl Matcher {
         bitmask: usize,
         width: i64,
     ) -> Result<(), Error> {
+        if self.1.is_some() {
+            return json_guard::traverse_draft_tree(
+                self,
+                next_node,
+                next_sibling,
+                draft_tokens,
+                bitmask,
+                width,
+            );
+        }
         Ok(ffi::matcher_traverse_draft_tree(
             self.0.pin_mut(),
             next_node,
@@ -251,6 +311,9 @@ impl Matcher {
 
     /// Undo the last `num_tokens` accepted tokens.
     pub fn rollback(&mut self, num_tokens: i32) -> Result<(), Error> {
+        if let Some(guard) = &mut self.1 {
+            return guard.rollback(self.0.pin_mut(), num_tokens);
+        }
         Ok(ffi::matcher_rollback(self.0.pin_mut(), num_tokens)?)
     }
 

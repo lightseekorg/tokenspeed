@@ -457,6 +457,48 @@ class AutoBackend(CommBackend):
             return self._iris.all_reduce(tensor, group, op=op)
         return self._nccl.all_reduce(tensor, group, op=op)
 
+    def supports_all_reduce_sconv(
+        self, x: torch.Tensor, weight: torch.Tensor, group: Group
+    ) -> bool:
+        # The fusion sums as the tiered dispatch's trtllm all-reduce does;
+        # the batch-invariant and deterministic routes keep fusions off.
+        return (
+            self.route(Collective.ALL_REDUCE, x, group) is Route.TIERED
+            and self._trtllm_ar.has_trtllm_ar(group)
+            and self._trtllm_ar.supports_all_reduce_sconv(x, weight, group)
+        )
+
+    def all_reduce_sconv(
+        self,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        ring: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        seq_idx: torch.Tensor,
+        cache_indices: torch.Tensor,
+        has_initial_state: torch.Tensor,
+        seq_lens: torch.Tensor,
+        block_table: torch.Tensor,
+        checkpoint: torch.Tensor,
+        output_scale: float,
+        group: Group,
+    ) -> torch.Tensor:
+        return self._trtllm_ar.all_reduce_sconv(
+            x,
+            weight,
+            ring,
+            cu_seqlens,
+            seq_idx,
+            cache_indices,
+            has_initial_state,
+            seq_lens,
+            block_table,
+            checkpoint,
+            output_scale,
+            group,
+            fp32_acc=False,
+        )
+
     def supports_all_reduce_mhc_norm(
         self, x: torch.Tensor, norm_weight: torch.Tensor, group: Group
     ) -> bool:
@@ -609,9 +651,41 @@ class AutoBackend(CommBackend):
             return self._rsag.all_gather(tensor, group, dim)
         return self._nccl.all_gather(tensor, group, dim)
 
+    def acquire_exchange_input(
+        self, nbytes: int, like: torch.Tensor, group: Group
+    ) -> torch.Tensor:
+        if self._iris_reaches(group):
+            return self._iris.acquire_exchange_input(nbytes, like, group)
+        return super().acquire_exchange_input(nbytes, like, group)
+
+    def try_combine_records(
+        self,
+        records: torch.Tensor,
+        group: Group,
+        *,
+        head_dim: int,
+        partial_dtype: torch.dtype,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor | None:
+        # The combine is the unfused one's, bit for bit, so neither the
+        # batch-invariant envelope nor determinism vetoes it.
+        if self._iris_reaches(group):
+            return self._iris.try_combine_records(
+                records,
+                group,
+                head_dim=head_dim,
+                partial_dtype=partial_dtype,
+                output_dtype=output_dtype,
+            )
+        return None
+
     def all_gather_single(
         self, output: torch.Tensor, input: torch.Tensor, group: Group
     ) -> None:
+        # Pure data movement: an input borrowed from Iris's pull exchange is
+        # pulled in place, every bit preserved.
+        if self._iris_reaches(group):
+            return self._iris.all_gather_single(output, input, group)
         return self._nccl.all_gather_single(output, input, group)
 
     def all_gather_single_async(
@@ -690,6 +764,14 @@ class AutoBackend(CommBackend):
     ) -> None:
         # Pure data movement: no reduction, so nothing to fold for the
         # batch-invariant envelope and no symmetric-memory path to veto.
+        if self._iris_reaches(group):
+            return self._iris.all_to_all_single(
+                output,
+                input,
+                group,
+                output_split_sizes=output_split_sizes,
+                input_split_sizes=input_split_sizes,
+            )
         return self._nccl.all_to_all_single(
             output,
             input,

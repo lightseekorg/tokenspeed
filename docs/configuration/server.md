@@ -21,6 +21,14 @@ For a compact compatibility table, see
 | `--download-dir` | Hugging Face download/cache directory. |
 | `--hf-overrides` | JSON overrides for model configuration values. |
 
+Models can request shared writable checkpoint mappings for selected host
+weights. Use `--load-format auto` or `--load-format safetensors` with writable
+safetensors files for these tensors. InstantTensor, `npcache`, and PyTorch
+checkpoint loading (including an `auto` fallback) reject selected weights
+instead of silently ignoring the mapping request. Weights not selected for
+shared mappings keep their existing loading behavior. No extra CLI flag is
+needed for the mapping request declared by the model.
+
 ### Checkpoint prefetch and TP shards
 
 Safetensors loading prefetches checkpoints into the OS page cache. Ranks on
@@ -79,6 +87,48 @@ its request partition is invalidated before another PD owner uses it.
 | `--mamba-ssm-dtype` | Stored linear-attention recurrent state dtype (GDN and KDA): `float32` (default) or `bfloat16`. Scans still accumulate in FP32; `bfloat16` halves state memory. |
 | `--quantization` | Weight quantization mode such as `fp8`, `nvfp4`, `w8a8_fp8`, or `compressed-tensors`. |
 | `--quantization-param-path` | JSON file of FP8 KV cache scaling factors, read only under an FP8 KV cache. KV caches run unscaled, so every factor must be 1.0, as must any KV-cache scale the checkpoint carries. |
+| `--enable-fp8-attn-proj` | Enable online FP8 QKV/O and GDN QKVZ/output projections in the Qwen3.5 or Qwen4-Exp target model. Off by default. |
+
+### Qwen FP8 attention projections
+
+Online conversion applies to floating target projection weights. It preserves
+existing FP8 configs and per-projection formats in mixed checkpoints. MTP draft
+projections follow the checkpoint.
+
+Group128 quantizes floating weights once after loading with 128×128 block
+scales and dynamically quantizes activation rows in groups of 128 channels.
+The GEMM returns the model's floating activation dtype. On SM100/SM103,
+`--dense-gemm-backend deepgemm` prepares UE8M0 weight scales and writes
+activation scales directly into the packed layout. The `auto` backend uses
+FP32 scales for this online block FP8 path.
+
+For an NVFP4 checkpoint with floating attention projections, use
+
+```bash
+--quantization nvfp4 --enable-fp8-attn-proj
+```
+
+Target models resolve the projection switch once and pass it to their layers.
+MTP backbones explicitly disable additional online FP8 projection quantization
+and retain their checkpoint quantization policy.
+
+GDN splits its input into an FP8 QKVZ GEMM and a floating BA GEMM. Any split
+QKVZ/BA projection uses BA overlap when an auxiliary stream is available,
+regardless of quantization format. The streams join before the attention boundary.
+The standard FP8 exclusions cover BA, convolution, and Mamba mixer
+projections. Explicit checkpoint exclusions also apply.
+With the switch off, floating GDN checkpoint projections stay floating even
+with a global online FP8 config. Serialized GDN projections use the
+checkpoint config.
+
+#### Projection fusion
+
+With packed DeepGEMM scales, eligible BF16 output projections fuse activation
+quantization with the full-attention sigmoid gate or GDN per-head RMSNorm and
+SiLU/sigmoid gate. This path preserves the BF16 rounding boundary and supports
+group128, CUDA Graph and PDL. Fusion requires a power-of-two head width of at
+least 128 and BF16 norm weights for GDN. Other supported projection layouts
+apply the gate or norm before a separate quantization launch.
 
 ## Numerics
 
@@ -90,6 +140,7 @@ switch an envelope folds is also available individually under `auto`.
 | --- | --- |
 | `--numerics {auto,rl-bitwise}` | `auto` uses each option's default. `rl-bitwise` folds the determinism switches (`--batch-invariant-collectives`, `--disable-autotune`, `--disable-tf32`, `--disable-pdl`, no fused all-reduce, batch-invariant MoE planning, `--sampling-stream per-request`, `--dsa-slot-order selection`) so tokens and logprobs are bitwise identical across runs and batch compositions, and the trainer-operation-order switches below so a teacher-forced pass reproduces the RL trainer's logprobs. Needs MoE TP 1 and a vocabulary that is a multiple of 32768; a model serves it only once its profile lists it. |
 | `--disable-autotune` | Disable startup FlashInfer tactic profiling. Matching caches still load; CuTe warmup continues except under pipeline parallelism. PrimTS skips extra group enumeration. |
+| `--enable-startup-requests` | Before reporting ready, the engine serves a few requests of its own through the ordinary serving path: one one-token request, one each of a thirty-second of a prefill chunk, a sixteenth, one token more, and three sixteenths, one of a full chunk, then a full batch, sized from the server's limits. The first client requests then compile nothing that path reaches. Not supported with `--disaggregation-mode` or `--kvstore-storage-backend`. See [Startup requests](../design/event-loop.md#startup-requests). |
 | `--batch-invariant-collectives` | One association order per reduction, independent of the batch: every reduction runs as NCCL data movement plus a fixed-rank-order fp32 fold (an all-reduce costs world_size x the traffic); gathers keep the multicast kernels. Folded in by `rl-bitwise`. |
 | `--force-deterministic-rsag` | NCCL and the fold only: no symmetric-memory path (multicast gathers, the trtllm/Triton all-reduce tiers, distributed argmax). Not folded in by `rl-bitwise`, under which it only moves the gathers to NCCL. |
 | `--sampling-stream {batch,per-request}` | `per-request` draws every non-greedy row from a stream keyed by the request's seed and position only, so a request samples the same tokens alone and inside any batch. Folded in by `rl-bitwise`. |
@@ -111,7 +162,7 @@ switch an envelope folds is also available individually under `auto`.
 | `--served-model-name` | The model's name in metric labels. Under `ts serve`, requests may also name the model by it; the OpenAI-compatible API lists the model path. |
 | `--api-key` | SMG gateway API key for authorization with upstream workers. |
 | `--chat-template` | Built-in chat template name or template file path (handled by the smg gateway). |
-| `--stream-interval` | Streaming buffer interval in generated tokens. Smaller values stream more frequently. |
+| `--stream-interval` | Streaming buffer size in generated tokens. The server streams the first step's tokens at once, then whenever at least this many tokens are unsent. Smaller values stream more often. |
 | `--weight-version` | Initial model-weight version, the L3 cache's namespace (see [Weight versions](#weight-versions)). Defaults to `default`. |
 | `--model-update-config` | JSON object handed to the Model Updater SDK for the Mooncake weight update. Requires the three flags below; see [Mooncake weight updates](#mooncake-weight-updates). |
 | `--model-update-sdk-module` | Import path of the Model Updater SDK module. Imported in the scheduler process on the first Mooncake update, not at startup. Required with `--model-update-config`. |
@@ -128,6 +179,28 @@ only after the load succeeds on every rank. A new `weight_version` requires
 checkpoints cannot share a namespace. Intermediate loads pass `None` to keep
 the current one until the last load flushes. Without L3 storage the engine
 keeps no version.
+
+### NPU top-p sampling
+
+The HF model config boolean `npu_sampling_top_p_top_k_cap` is **false by
+default**. Enable NPU sampling candidate truncation at startup with:
+
+```bash
+--hf-overrides '{"npu_sampling_top_p_top_k_cap": true}'
+```
+
+On `ascend_full`, a request with `top_p < 1` and omitted `top_k` (or
+`top_k=-1`) then uses an effective `top_k=4096`: select the top 4096
+candidates, normalize their probabilities, then apply top-p filtering.
+This limits the candidate set and can change the distribution compared
+with whole-vocabulary top-p sampling. Set the field to `false` for
+whole-vocabulary top-p; the override affects the loaded configuration,
+without editing the checkpoint's `config.json`.
+
+The option does not affect GPU sampling backends, `top_p=1`, greedy
+requests, or explicit finite top-k values. Existing `ascend_full` behavior
+still caps explicit finite top-k above 4096 at 4096. The same per-request
+policy applies in eager execution, graph replay and chain verification.
 
 ### Logprobs
 
@@ -266,7 +339,7 @@ restores whatever is released:
 | Tag | Memory | On resume |
 | --- | --- | --- |
 | `kv_cache` | the cache arena's device regions | zeroed; a PD engine registers it with the transfer engine again |
-| `weights` | model and draft parameters | CPU backup, or remapped and invalid until a complete update; frozen draft allocations retain CPU backup |
+| `weights` | model and draft parameters, persistent attention/runtime buffers and shared workspaces | parameters use CPU backup or remain invalid until a complete update; frozen drafts and attention/runtime buffers retain CPU backup |
 | `cuda_graph` | the decode CUDA graphs' memory pool | discarded; replays rewrite it |
 | `nccl` | NCCL communicator buffers (`ProcessGroupNCCL.suspend`); requires a PyTorch build with suspend support and NCCL 2.29.7 or later | resumed in place |
 
@@ -285,8 +358,10 @@ load that fails after it started requires a restart; an update that any rank
 refuses before loading runs on no rank and can be retried. A bare resume of all
 tags immediately after discard is therefore invalid. Sparse KV
 offload keeps its pinned Host history mapped across a release and zeroes it on
-resume. Other device memory (input buffers, communication workspaces such as
-symmetric memory or DeepEP buffers, the prefill CUDA graphs) stays resident.
+resume. Persistent attention/runtime buffers and shared workspaces are backed
+up with the `weights` tag, retaining their addresses and contents. Other device
+memory, including communication workspaces such as symmetric memory or DeepEP
+buffers and prefill CUDA graph capture pools, stays resident.
 
 With attention DP, every rank must stop admissions and drain before any rank
 releases memory. Send the release to every DP engine concurrently; a release
@@ -439,20 +514,22 @@ Trainer-side contract:
 | `--max-prefill-tokens` | Prefill token budget used when chunked prefill is disabled. Defaults to `8192`. |
 | `--enable-short-prefill-first` | Prefill and aggregated servers: rank new local prefills by remaining work after Device/Host prefix reuse, including replay work, with stable ties and oldest-request protection after eight successful bypasses. Resident chunks keep priority. Off by default, preserving submission order ([scheduler §1.1](../design/scheduler.md#11-head-of-line-an-incomplete-prefill-holds-the-queue)). |
 | `--prefill-decode-interval` | After a round that runs a prefill chunk, run this many decode rounds before the next prefill round, unless no decode can run. Every chunk starts a new interval, but no prompt is held back more than this many decode rounds in total, so TTFT grows by at most this many decode steps and running decodes stall less often. Aggregated serving only. `0` (default) is off; nonzero values are mutually exclusive with the [DP prefill gate](../design/prefill-delay.md) ([scheduler §3.3](../design/scheduler.md#33-fused--one-engine-everything-local)). |
-| `--prefill-attempt-interval` | ALL attempt interval, in scheduling rounds, for the [DP prefill gate](../design/prefill-delay.md): every rank with decode work must also have eligible prefill work to open the window. Set together with `--prefill-any-attempt-interval`, with `1 <= ALL <= ANY`; leaving both unset (default) disables the gate. Aggregated (fused) serving only (`--disaggregation-mode null`); mutually exclusive with nonzero `--prefill-decode-interval`. |
-| `--prefill-any-attempt-interval` | ANY attempt interval, in scheduling rounds, for the [DP prefill gate](../design/prefill-delay.md): one eligible rank is enough to open the window. Must be set together with `--prefill-attempt-interval` and be at least its value (`1 <= ALL <= ANY`). This is an admission opportunity, not a hard TTFT deadline. Aggregated (fused) serving only (`--disaggregation-mode null`); mutually exclusive with nonzero `--prefill-decode-interval`. |
+| `--prefill-decode-min-interval` | After every round that runs a prefill chunk, run at least this many decode rounds before the next prefill round, unless no decode can run. Unlike `--prefill-decode-interval`, this floor still applies once a prompt has been held back for its full interval, so a long prompt's chunks alternate with decode rounds instead of stalling running decodes back to back. Aggregated serving only. `0` (default) is off; nonzero values are mutually exclusive with the [DP prefill gate](../design/prefill-delay.md). |
+| `--prefill-attempt-interval` | ALL attempt interval, in scheduling rounds, for the [DP prefill gate](../design/prefill-delay.md): every rank with decode work must also have eligible prefill work to open the window. Set together with `--prefill-any-attempt-interval`, with `1 <= ALL <= ANY`; leaving both unset (default) disables the gate. Aggregated (fused) serving only (`--disaggregation-mode null`); mutually exclusive with nonzero `--prefill-decode-interval` or `--prefill-decode-min-interval`. |
+| `--prefill-any-attempt-interval` | ANY attempt interval, in scheduling rounds, for the [DP prefill gate](../design/prefill-delay.md): one eligible rank is enough to open the window. Must be set together with `--prefill-attempt-interval` and be at least its value (`1 <= ALL <= ANY`). This is an admission opportunity, not a hard TTFT deadline. Aggregated (fused) serving only (`--disaggregation-mode null`); mutually exclusive with nonzero `--prefill-decode-interval` or `--prefill-decode-min-interval`. |
 | `--max-total-tokens` | Override the automatically calculated token pool size. |
-| `--enable-state-checkpoint-in-forward` | Hybrid (recurrent-state) models: the prefill forward that spans the last prefix-page boundary before a long prompt's replay tail (normally the final token) also writes the recurrent state there, so a later request that resends the prompt or diverges from it after that boundary resumes there. No extra prefill round; that forward holds one more state block. The recurrent-state checkpoints, and their KV tails, that a next turn re-rendering the end of the previous prompt and its reply cannot resume at are then kept out of the prefix cache. On prefill and fused servers this is the prompt end when it lies inside the page that boundary starts and the request did not resume past it; a prompt end published at the request's finish, as on a prefill server, is kept if the state at the boundary has left the cache by then. On fused servers it is also every finish past the prompt end, including that of a prompt too short to have such a boundary. A next turn that repeats the previous reply verbatim therefore resumes at an earlier checkpoint and recomputes the reply. Requires prefix caching; a decode server ignores it; startup refuses it unless every State group is GDN (FlashInfer prefill, a prefix granularity that is a multiple of its 64-token scan chunk) or Qwen4-Exp PLE. With prefill graphs, the GDN layers of a forward that writes one stay captured; every captured shape shares one float32 scan scratch of (largest prefill-graph token capacity / prefix granularity) recurrent states. When a request publishes an in-forward checkpoint past the one it resumed from, which its own predecessor wrote past an earlier one, that earlier checkpoint -- two turns back on the conversation -- is evicted early from the device and host caches, and no new store or eviction write-back copies it to host, unless another request also resumed from it, or acquired or republished it after the conversation's previous turn resumed there, so multi-turn traffic keeps more live prefixes cached. On a prefill server, a prompt too short for the in-forward checkpoint (by default, one no longer than the chunk budget) whose end lies inside a prefix page also leaves only its full pages in the prefix cache, with no recurrent state and no KV tail at its end; a longer prompt that repeats it whole resumes at an earlier checkpoint instead, a page-aligned prompt end keeps its state, and a fused server keeps short prompt ends. Off by default ([scheduler §1.2](../design/scheduler.md#12-state-groups-two-slots-natural-checkpoints)). |
+| `--enable-state-checkpoint-in-forward` | Hybrid (recurrent-state) models: the prefill forward that spans the last prefix-page boundary before a long prompt's replay tail (normally the final token) also writes the recurrent state there, so a later request that resends the prompt or diverges from it after that boundary resumes there. No extra prefill round; that forward holds one more state block. The recurrent-state checkpoints, and their KV tails, that a next turn re-rendering the end of the previous prompt and its reply cannot resume at are then kept out of the prefix cache. On prefill and fused servers this is the prompt end when it lies inside the page that boundary starts and the request did not resume past it; a prompt end published at the request's finish, as on a prefill server, is kept if the state at the boundary has left the cache by then. On fused servers it is also every finish past the prompt end, including that of a prompt too short to have such a boundary. A next turn that repeats the previous reply verbatim therefore resumes at an earlier checkpoint and recomputes the reply. Requires prefix caching; a decode server ignores it; startup refuses it unless every State group is GDN (FlashInfer prefill, a prefix granularity that is a multiple of its 64-token scan chunk), KDA, or Qwen4-Exp PLE. With prefill graphs, the GDN layers of a forward that writes one stay captured; every captured shape shares one float32 scan scratch of (largest prefill-graph token capacity / prefix granularity) recurrent states. The KDA layers of such a forward run at their eager breaks and scan each checkpointed row's tokens before its checkpoint a second time. When a request publishes an in-forward checkpoint past the one it resumed from, which its own predecessor wrote past an earlier one, that earlier checkpoint -- two turns back on the conversation -- is evicted early from the device and host caches, and no new store or eviction write-back copies it to host, unless another request also resumed from it, or acquired or republished it after the conversation's previous turn resumed there, so multi-turn traffic keeps more live prefixes cached. On a prefill server, a prompt too short for the in-forward checkpoint (by default, one no longer than the chunk budget) whose end lies inside a prefix page also leaves only its full pages in the prefix cache, with no recurrent state and no KV tail at its end; a longer prompt that repeats it whole resumes at an earlier checkpoint instead, a page-aligned prompt end keeps its state, and a fused server keeps short prompt ends. Off by default ([scheduler §1.2](../design/scheduler.md#12-state-groups-two-slots-natural-checkpoints)). |
 | `--enable-prefix-caching` / `--disable-prefix-caching` | Enable or disable prefix cache reuse. |
 | `--enforce-eager` | Disable device-graph execution (CUDA Graph on CUDA, ACL Graph on NPU). |
 | `--disable-prefill-graph` | Keep prefill eager while leaving decode device graphs enabled. |
+| `--decode-monokernel` | Run each decoder layer's small decode steps as one persistent monokernel launch on gfx950 ([decode monokernel design](../design/monokernel.md)). Off by default. Models: Qwen3.8-Flash-Next (`Qwen4ExpForCausalLM`, `Qwen4ExpForConditionalGeneration`) and Muse Spark (`MuseSparkForConditionalGeneration`, with its DFlash2 draft). Startup fails when a layer cannot be packed; larger steps keep the regular path. |
+| `--monokernel-stuck-record-dir` | With `--decode-monokernel`: a directory on tmpfs (for example `/dev/shm`) where each rank keeps its stuck-poll record file; the file is GPU-registered host memory, and a disk filesystem's periodic writeback of it stalls decode. A launch poll that gives up writes what it waited for there before the launch traps, so the record outlives the process. Without it the records stay in pinned memory and are logged when the failure reaches Python. |
 | `--disable-kda-prefill-graph` | Disable KDA prefill CUDA graphs while retaining ordinary prefill and decode graph settings. Enabled by default for supported `cutedsl_kda` prefill attention when prefill graphs are enabled. |
 | `--disable-cudagraph-memory-reserve` | Size the KV cache from free memory instead of reserving what the device graphs will cost and, on CUDA, what startup keeps resident. |
 | `--max-cudagraph-capture-size` | Largest decode batch size to capture as a device graph. |
 | `--cudagraph-capture-sizes` | Explicit decode batch sizes to capture as device graphs. |
 | `--prefill-graph-capture-token-sizes` | Total input-token capacities per forward, summed across the batch. Shorter inputs are padded. |
-| `--prefill-graph-capture-batch-sizes` | Request capacities for inline recurrent-layer (KDA, Mamba2, GDN) prefill capture. Replay selects the smallest compatible capacity that fits the batch. With `--enable-drafter-prefill-graph` these request counts also select the drafter's step-0 and decode-step graphs, which replay only at the exact count (unset: one request per bucket, or the fewest that fit a bucket longer than the context length). |
-| `--enable-drafter-prefill-graph` | Also replay the speculative drafter's work inside a prefill forward from CUDA graphs: its extend step per prefill token bucket at each exact request count of `--prefill-graph-capture-batch-sizes` (unset: the fewest requests the bucket fits in the context length, one whenever the context length is at least the bucket), its decode steps per request count, attention at eager breaks. Only pure-extend forwards at a captured request count replay; mixed forwards and other request counts draft eagerly. Needs the prefill graph on one rank (no TP, EP, PP or attention DP) and a chain EAGLE-style drafter (no `--speculative-eagle-topk` > 1, no `--enable-speculative-sampling`) whose draft model declares it (Qwen4-Exp MTP without `index_share_for_mtp_iteration`) and reads no request-token history; startup refuses other launches. The graphs' memory is part of the CUDA-graph reserve; their static input buffers (the target's hidden rows at the largest bucket) come out of the `--gpu-memory-utilization` headroom. Off by default ([design](../design/unified_path.md#drafter-prefill-graphs)). |
+| `--prefill-graph-capture-batch-sizes` | Request capacities for inline recurrent-layer (KDA, Mamba2, GDN) prefill capture. Replay selects the smallest compatible capacity that fits the batch, padding the missing requests. Unset: `4` (capped by `--max-num-seqs` per data-parallel rank), so a prefill round of up to 4 requests runs its recurrent layers inside the graph; a round of more requests, or one too full for the padding, runs them at eager breaks. Each added count is one more graph per token bucket, with its capture time and memory. |
 | `--retraction-snapshot-host-gb` | Explicit size, in gigabytes, of the per-rank pinned Host pool that holds a retraction image's tail (a retracted request's blocks of groups Host L2 never holds, a state group's unpublished input block, and its slot state; the published blocks, the partial last page and the live state block included, go to Host L2 and stay pinned there until the request is restored; with `--disable-kvstore` the pool holds whole images). Wins over `--retraction-snapshot-ratio` when set; `0` (the default) means not set, like `--kvstore-size` against `--kvstore-ratio`. A request a capacity retraction suspends is imaged here and resumes exactly where it stopped once the image is copied back; nothing is recomputed. When no resident's image fits -- the pool or its rows are exhausted -- the scheduler aborts the newest resident instead (finish `err_type` 524, see "Retraction snapshot pool" below), so the pool bounds how much can be suspended at once, never how long an admission waits. Fused and decode roles only; the prefill and encode roles never retract and ignore it with a log. Allowed under `--kv-parallel-size > 1`. |
 | `--retraction-snapshot-ratio` | Size of the retraction snapshot pool as a multiple of this rank's Device KV capacity (the base `--kvstore-ratio` scales too), used when `--retraction-snapshot-host-gb` is not set. Unset (the default) derives the pool at device build: 0.1 of the Device KV without the Host KVStore (whole images, kept cheap to pin; `1` makes every resident suspendable), else the image tails of `--retraction-snapshot-max-requests` requests (table below). An explicit `0` is the one way to run **without a pool**: nothing can be imaged, so every capacity block aborts its victim (the newest resident). |
 | `--retraction-snapshot-max-requests` | Slot-state image rows of the retraction snapshot pool, that is, the most requests suspended at once, and the request count the derived pool size is multiplied by. `0` (the default) derives to `--max-num-seqs / attention-DP size`, which covers every resident request of the rank; refused with `--retraction-snapshot-ratio 0`, which has no rows to size. When no row is free the scheduler aborts a resident rather than waiting. |
@@ -468,8 +545,10 @@ dummy request slots. These settings do not replace the scheduler's
 `--prefill-graph-capture-sizes` remains a compatibility alias for
 `--prefill-graph-capture-token-sizes`. Specify only one spelling per command.
 Both populate the existing `prefill_graph_capture_sizes` Python field.
-Unset token sizes use the existing default ladder. Unset batch sizes use the
-minimum request count that fits each token bucket within the model context.
+Unset token sizes use the existing default ladder. Unset batch sizes capture 4
+requests per token bucket, capped by `--max-num-seqs` per data-parallel rank and
+the bucket, and at least the request count that fits each token bucket within
+the model context.
 
 `--chunked-prefill-size` is intentionally separate from
 `--max-num-batched-tokens`: in TokenSpeed it is the scheduler's per-iteration
@@ -482,7 +561,7 @@ issue budget, while `--max-total-tokens` controls the global token pool.
 | `--tensor-parallel-size`, `--tp` | Familiar alias for setting attention tensor parallel size. |
 | `--attn-tp-size` | Tensor parallel size for attention. |
 | `--kv-parallel-size` | KV parallelism (KVP): shard full-history KV pages (MLA/DSA latent and index-K, DeepSeek V4.1 global KV) cyclically over a consecutive subgroup of attention TP; must divide `--attn-tp-size`. Each rank then stores one shard of every request's pages, so the KV capacity per GPU grows by that factor and the DSA indexer scores only owned pages. Aggregated and PD decode engines require matching `--decode-context-parallel-size`. PD sides shard their caches independently (a transfer edge copies only the pages both its prefill rank and decode rank own); the prefill role writes them with or without `--query-context-parallel-size`. GPU MLA/DSA speculative decoding is supported within each backend's device, dtype and draft-attention capabilities: the recipe shards the draft group like the target's, FlashMLA verification uses per-query local causal lengths and GPU DSA uses causal Top-K selection; non-causal DSA block drafts remain unsupported. The Host KVStore, retraction snapshot pool and L3 storage (`--kvstore-storage-backend`) use the same cyclic owner translation. L3 keys name a payload replica so an allocation may restore on a different owner; startup rejects head-partitioned fields in page-sharded groups. For Device/Host copies, the scheduler allocates every Host block in its Device block's residue class and each rank copies the blocks it owns. |
-| `--decode-context-parallel-size` | Decode context parallelism (DCP) in aggregated or PD decode engines: every rank attends the KV pages it owns under `--kv-parallel-size` and the partials are merged across the KVP group by their log-sum-exp (`docs/serving/parallelism.md`). Requires `--disaggregation-mode null` (the default) or `decode` and must equal `--kv-parallel-size`, which requires it in turn on those roles: a sharded cache has no other decode, so the launch names the compute explicitly. Aggregated DCP rejects `--enable-mixed-batch`. The backends key the DCP path on the mapping's KVP size, which the drafter's decode-shaped steps on a sharded prefill engine take as well. 1 (default) is off. |
+| `--decode-context-parallel-size` | Decode context parallelism (DCP) in aggregated or PD decode engines: every rank attends the KV pages it owns under `--kv-parallel-size` and the partials are merged across the KVP group by their log-sum-exp (`docs/serving/parallelism.md`). Requires `--disaggregation-mode null` (the default) or `decode` and must equal `--kv-parallel-size`, which requires it in turn on those roles: a sharded cache has no other decode, so the launch names the compute explicitly. The backends key the DCP path on the mapping's KVP size, which the drafter's decode-shaped steps on a sharded prefill engine take as well. 1 (default) is off. |
 | `--attn-head-tp-size` | Shard the MLA head projections (`q_b_proj`, `kv_b_proj`, `o_proj`) by heads over this many contiguous ranks that hold different rows; the attention exchanges heads for tokens around its core. Over attention-DP ranks (needs attention TP 1, attention DP and `--disaggregation-mode decode`; each rank keeps its own KV) the layout serves decode rows only, so it sets `--disable-prefill-graph` and tunes on a decode step; it admits any `max_new_tokens`, because a retracted request resumes by restore rather than by a recovery prefill. Over the query shards of a prefill engine (must equal `--query-context-parallel-size`) the extend rows run the absorbed sparse prefill through the exchange and none of the decode-only rules apply. Defaults to the ranks holding the same rows: the attention TP size, or 1 (head-replicated) under `--query-context-parallel-size`. See [Parallelism](../serving/parallelism.md#decode-side-tp-layouts-under-attention-dp). |
 | `--lm-head-tp-size` | Vocab-shard the LM head over this many contiguous ranks. Under attention DP the default 1 replicates it; a wider group gathers distinct DP groups' rows before the logits GEMM and transposes the vocabulary shards back. Attention TP greater than one is supported; LM-head and attention TP widths must tile each other. Without attention DP it must equal the attention TP size. Not combinable with `--dp-sampling`; under attention DP, requests asking for prompt logprobs (`logprob_start_len`) are refused. |
 | `--tp-batch-invariant` | `none` (default), `attn`, or `attn+dense`: make the head-sharded `o_proj` and the dense `down_proj` column-parallel on hidden (all-gather of the reduction dim, full-K GEMM, all-to-all back to own rows) so no cross-rank sum remains outside MoE and the bits equal a TP1 full-K GEMM. `attn` needs `--attn-head-tp-size` > 1; `attn+dense` also needs a dense TP group wider than attention TP (so not under `--query-context-parallel-size`, whose dense group is 1 or the attention TP width; only `attn` applies there); both need unquantized `o_proj` / `down_proj`, judged on the checkpoint's resolved quantization (a quantized checkpoint passes when its `disable_quant_module` excludes `self_attn` and, for `attn+dense`, `dense_mlp` / `mlps`). |
@@ -534,7 +613,7 @@ for the online variant.
 | `--attention-backend` | Attention kernel backend. Common values include `mha`, `fa3`, `fa4`, `triton`, `flashinfer`, `trtllm_mla`, and `tokenspeed_mla`. Names are checked against the backend registry at startup, after plugins load, so an installed plugin's backends are accepted too. On SM103 (B300/GB300), `fa4` ranks below every other attention kernel: naming it here or in `--drafter-attention-backend` selects it, and the default selection is unchanged. |
 | `--drafter-attention-backend` | Attention backend for the speculative decoding drafter model; accepts the same names as `--attention-backend`. |
 | `--enable-qsa-prefill-bf16-scratch` | Opt-in for QSA sparse-attention models (Qwen4-Exp) with `--kv-cache-dtype fp8_e4m3` (or `fp8`) on SM100 to SM107. A target prefill call of at least 2048 query rows copies the FP8 KV pages it can read into a BF16 scratch and attends there with the CuTe QSA kernel's BF16 path instead of the FP8 prefill kernel (FlashInfer FA2 by default, or the CuTe kernel's FP8 path under a kernel override); smaller or mixed calls, calls whose context exceeds the scratch or 128 cache tokens per query row, decode, verify and drafts keep the FP8 path, and the cache stays FP8. The scratch holds one maximum-length context plus one `--chunked-prefill-size` chunk of pages, with that chunk's remapped slots and attention output; it is reserved from the KV cache budget before the pool is sized, so the pool shrinks by its size (logged at startup). Startup fails for a model without QSA layers, another KV cache dtype (`mxfp8` included), `--chunked-prefill-size` below 2048 or disabled, or a GPU without the CuTe QSA kernel. The decode role, which runs no prefill, reserves no scratch. Part of the L3 storage identity when set. Off by default. |
-| `--qwen4-exp-flat-kv` | Experimental Qwen4-Exp FlatKV layout. Packs full-attention K/V fields into one plane and translates scheduler block IDs to contiguous atom-page IDs before attention, without a KV gather or attention-kernel changes. Requires PP=1 and uniform K/V head geometry; recurrent, PLE and QSA side caches keep their existing groups and plane policy. Off by default and included in the L3 storage identity when enabled. |
+| `--qwen4-exp-flat-kv` | Experimental Qwen4-Exp FlatKV layout. Packs target full-attention K/V fields into one plane and translates scheduler block IDs to contiguous atom-page IDs before attention, without a KV gather or attention-kernel changes. Requires PP=1 and uniform K/V head geometry; draft fields, recurrent, PLE and QSA side caches keep their existing groups and plane policy. Off by default and included in the L3 storage identity when enabled. |
 | `--moe-backend` | MoE backend. |
 | `--moe-cutlass-fused-finalize` / `--no-moe-cutlass-fused-finalize` | GEMM2 atomic expert combine for unquantized FP16/BF16 MoE on `flashinfer_cutlass`, for both target and draft models. On by default and forced off by `--numerics rl-bitwise`. The fused reduction order is nondeterministic. |
 | `--moe-mxfp4-fp8-activation` | Opt-in: run MXFP4 routed experts with FP8 activations. On Hopper this is the FlashInfer cutlass W4A8 MoE (faster than the default W4A16 kernel, a few percent of extra error on expert outputs). Applies to every MXFP4 expert layer, target and draft; startup fails where the selected MoE backend has no FP8-activation kernel for a layer, when a model's routed experts are not MXFP4, when the model pins another activation precision (Kimi-K3 on Hopper Marlin), or when the layer's SwiGLU is unclamped (the W4A8 FC2 scale relies on the clamp). |
@@ -634,7 +713,8 @@ The draft and target models and the normal verification kernel still execute.
 The verification result is then overridden with synthetic acceptance before
 committing tokens and updating request state, preserving verification overhead.
 The override copies the forced draft prefix and selects the existing target
-argmax at the cutoff. It adds no second verification or target-resampling pass.
+argmax at the cutoff, in one launch. It adds no second verification or
+target-resampling pass.
 **Do not use generated text for correctness or accuracy evaluation.** Request
 termination can truncate the last verification's output.
 
@@ -778,7 +858,11 @@ head spanning the target vocabulary, the draft steps stay sharded too (`Draft
 steps stay vocab-sharded`): each rank samples its shard of the draft logits,
 the ranks exchange a few values per request instead of the logits, every rank
 draws the same token, and each records `q` over its own vocabulary columns;
-its verify candidates carry that `q` through their gather.
+its verify candidates carry that `q` through their gather. An EAGLE3 head with
+a smaller hot-token vocabulary (`d2t`) still gathers its draft logits, because
+its columns do not line up with the target's shards, but each rank records
+`q` over its own vocabulary columns only (`Draft steps gather the hot-token
+head's logits and each rank records q over its own columns`).
 
 Known limits, kept as in the reference engine for now: a landed PD request's
 first verify always rejects its shipped candidates (sentinel rows) rather than
@@ -1630,7 +1714,10 @@ store client reads `MC_USE_IPV6` on its own when the store starts, so export
 
 `--speculative-rejection-sample-method block --enable-speculative-sampling --sampling-backend flashinfer`
 verifies a sampled draft chain by block verification instead of token-wise
-rejection. The names follow vLLM: `--enable-speculative-sampling` is
+rejection. `--sampling-backend triton` (the ROCm path) runs it too. Because
+block verification needs whole target rows, the Triton backend skips its
+vocabulary-shard candidate selection and, unless the batch's top-k bounds the
+candidates, sorts whole rows. The names follow vLLM: `--enable-speculative-sampling` is
 `draft_sample_method=probabilistic`, and `--speculative-config` also accepts
 the `draft_sample_method` and `rejection_sample_method` keys. It supports `DSPARK` (probabilistic Markov drafting) and `EAGLE3`
 with `--speculative-eagle-topk 1`; block verification is defined on a single
@@ -1649,14 +1736,17 @@ longest accepted prefix, and samples a prefix-scaled positive residual (or a
 target bonus token). It is not a single whole-block likelihood-ratio test.
 The output uses the existing accepted-length and state rollback contract.
 
-The existing per-request proposal RNG and verifier coin streams are reused.
+The existing per-request proposal RNG is reused. The accepted length depends
+on every prefix coin, so no two verify steps of a request share a coin: the
+FlashInfer backend draws fresh coins each step, and the Triton backend keys one step's
+coins by the request's seed and the step's first verify position.
 A stochastic output difference from greedy decoding is expected; validate the
 output distribution and accuracy, rather than requiring identical token IDs.
 
 Replacing `block` with `--synthetic-acceptance-length L` (the `synthetic`
 method) gives a benchmark-only mode, the equivalent of vLLM's probabilistic
 draft sampling with synthetic rejection; for `DSPARK` it also turns on sampled
-Markov drafting.
+Markov drafting. Unlike `block`, it needs `--sampling-backend flashinfer`.
 The drafter still samples: the full-vocabulary draft logits (and DSpark's Markov
 steps) and the recorded fp32 draft probabilities all stay on the path. Verify
 gathers those probabilities and runs the standard draft-probability chain rule

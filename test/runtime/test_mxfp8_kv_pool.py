@@ -20,7 +20,8 @@
 Covers the interleaved scale layout (uniform and per-layer head counts), the
 size accounting, and an end-to-end set_kv_buffer -> manual dequant roundtrip
 against the original bf16 K/V, with the stored bytes equal to quantize_mxfp8's
-on finite inputs.
+on finite inputs. Also the BF16 dequant view the Inkling prefix extend reads,
+and that extend split into request groups.
 """
 
 from __future__ import annotations
@@ -418,6 +419,145 @@ def test_config_rejects_a_page_wider_than_the_scale_tile():
     config = _make_config(kernel_page_size=256)
     with pytest.raises(AssertionError, match="128-row pages"):
         _create_config_pool(config)
+
+
+def _scratch(rows: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """BF16 key and value dequant scratch rows for HEADS heads."""
+    return tuple(
+        torch.zeros(rows, HEADS * HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+        for _ in range(2)
+    )
+
+
+@pytest.mark.parametrize("window_left", [-1, 200])
+def test_dequant_view_serves_the_stored_values(window_left):
+    """BF16 pages of the view equal the dequantized cache rows; a sliding
+    window gathers only the pages it reads; rows past the length are zero."""
+    torch.manual_seed(3)
+    pool = _make_pool(128, size=4096)
+    layer = SimpleNamespace(layer_id=1)
+    seq_lens = [300, 1000]
+    width = 8
+    perm = torch.randperm(pool.arena.size // 128, device="cuda")[: 3 + width]
+    page_table = torch.zeros(len(seq_lens), width, dtype=torch.int32, device="cuda")
+    page_table[0, :3] = perm[:3].to(torch.int32)
+    page_table[1, :width] = perm[3:].to(torch.int32)
+    k_ref, v_ref = [], []
+    for b, n in enumerate(seq_lens):
+        k = torch.randn(n, HEADS, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+        v = torch.randn(n, HEADS, HEAD_DIM, device="cuda", dtype=torch.bfloat16) * 2
+        tok = torch.arange(n, device="cuda")
+        loc = page_table[b, tok // 128].long() * 128 + tok % 128
+        pool.set_kv_buffer(layer, loc, k, v)
+        k_ref.append(_dequant(*_quantize(k)).to(torch.bfloat16))
+        v_ref.append(_dequant(*_quantize(v)).to(torch.bfloat16))
+
+    k_view, v_view, view_table = pool.dequant_kv_view(
+        1,
+        page_table,
+        torch.tensor(seq_lens, dtype=torch.int32, device="cuda"),
+        1,
+        window_left,
+        128,
+        scratch=_scratch(4096),
+    )
+    assert k_view.dtype == torch.bfloat16 and k_view.shape[1:] == (128, HEADS, HEAD_DIM)
+    for b, n in enumerate(seq_lens):
+        pages = -(-n // 128)
+        # The window's first query sits at n - 1 and sees keys back to n - 2 - window.
+        first = 0 if window_left < 0 else max(0, (n - 2 - window_left) // 128 - 1)
+        for i in range(width):
+            if not first <= i < pages:
+                assert int(view_table[b, i]) == 0
+                continue
+            rows = range(i * 128, min(n, (i + 1) * 128))
+            got_k = k_view[int(view_table[b, i])]
+            got_v = v_view[int(view_table[b, i])]
+            assert torch.equal(got_k[: len(rows)], k_ref[b][rows.start : rows.stop])
+            assert torch.equal(got_v[: len(rows)], v_ref[b][rows.start : rows.stop])
+            assert not got_k[len(rows) :].any() and not got_v[len(rows) :].any()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
+    reason="the relative extend kernel needs SM100",
+)
+@pytest.mark.parametrize("return_lse", [False, True])
+# A sliding window spans the relative-logit extent: window_left + 1 == 128.
+@pytest.mark.parametrize("window_left", [-1, 127])
+def test_extend_in_request_groups_matches_one_call(window_left, return_lse):
+    """An Inkling prefix extend whose pages overflow the dequant scratch runs
+    in request groups: their rows equal one call over a scratch that holds
+    the batch, and padding rows are zero."""
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.layers.attention.backends.paged.mha import (
+        MHAAttnBackend,
+    )
+    from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
+        rel_mha_extend_mxfp8,
+    )
+
+    torch.manual_seed(5)
+    config = _make_config(kernel_page_size=128)
+    spec = config.components[0]
+    leaf = MHAAttnBackend(config, spec, kernel_page_size=128)
+    pool = _make_pool(128, size=8192)
+    layer = SimpleNamespace(
+        layer_id=1, sliding_window_size=window_left, scaling=HEAD_DIM**-0.5
+    )
+    prefix_lens, query_lens = [300, 900, 37], [64, 100, 1]
+    seq_lens = [p + n for p, n in zip(prefix_lens, query_lens)]
+    width = 8
+    page_table = (
+        torch.randperm(pool.arena.size // 128, device="cuda")[: 3 * width]
+        .to(torch.int32)
+        .view(3, width)
+    )
+    for b, n in enumerate(seq_lens):
+        tok = torch.arange(n, device="cuda")
+        loc = page_table[b, tok // 128].long() * 128 + tok % 128
+        k = torch.randn(n, HEADS, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+        pool.set_kv_buffer(layer, loc, k, torch.randn_like(k))
+    leaf.init_forward_metadata(
+        3,
+        3,
+        torch.tensor(seq_lens, dtype=torch.int32, device="cuda"),
+        page_table,
+        ForwardMode.EXTEND,
+        extend_seq_lens=torch.tensor(query_lens, dtype=torch.int32, device="cuda"),
+        extend_seq_lens_cpu=torch.tensor(query_lens),
+        extend_prefix_lens=torch.tensor(prefix_lens, dtype=torch.int32, device="cuda"),
+        extend_prefix_lens_cpu=torch.tensor(prefix_lens),
+        extend_with_prefix=True,
+        query_shard=None,
+        page_table_cpu=None,
+    )
+    real = sum(query_lens)
+    heads = spec.num_attention_heads
+    # Two padding rows, as in a bucket-shaped extend.
+    q = torch.randn(real + 2, heads, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    rel_logits = torch.randn(real + 2, heads, 128, device="cuda", dtype=torch.bfloat16)
+    tau = torch.rand(real + 2, device="cuda") + 0.5
+
+    def extend(scratch_rows: int):
+        result = rel_mha_extend_mxfp8(
+            leaf,
+            layer,
+            pool,
+            _scratch(scratch_rows),
+            q,
+            rel_logits,
+            tau,
+            output_dtype=torch.float32,
+            return_lse=return_lse,
+        )
+        return result if return_lse else (result,)
+
+    # The longest request spans 8 pages: one request per group, then one call.
+    split, whole = extend(8 * 128), extend(3 * 8 * 128)
+    for got, want in zip(split, whole):
+        assert torch.equal(got[:real], want[:real])
+        assert not got[real:].any()
 
 
 if __name__ == "__main__":

@@ -67,6 +67,8 @@ def _fwd_kernel_stage1(
     stride_buf_kh,
     stride_buf_vbs,
     stride_buf_vh,
+    stride_buf_kp,
+    stride_buf_vp,
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
@@ -144,12 +146,15 @@ def _fwd_kernel_stage1(
                 other=0,
             )
             # int64 to avoid address overflow for large (>int32 range) KV caches
-            kv_loc = physical_pages.to(tl.int64) * PAGE_SIZE + page_offsets
-            offs_buf_k = (
-                kv_loc[:, None] * stride_buf_kbs
-                + cur_kv_head * stride_buf_kh
-                + offs_d[None, :]
+            k_loc = (
+                physical_pages.to(tl.int64) * stride_buf_kp
+                + page_offsets * stride_buf_kbs
             )
+            v_loc = (
+                physical_pages.to(tl.int64) * stride_buf_vp
+                + page_offsets * stride_buf_vbs
+            )
+            offs_buf_k = k_loc[:, None] + cur_kv_head * stride_buf_kh + offs_d[None, :]
             k = tl.load(
                 K_Buffer + offs_buf_k,
                 mask=(offs_n[:, None] < split_kv_end) & (mask_d[None, :]),
@@ -163,11 +168,7 @@ def _fwd_kernel_stage1(
 
             qk = tl.where(offs_n < split_kv_end, qk, float("-inf"))
 
-            offs_buf_v = (
-                kv_loc[:, None] * stride_buf_vbs
-                + cur_kv_head * stride_buf_vh
-                + offs_dv[None, :]
-            )
+            offs_buf_v = v_loc[:, None] + cur_kv_head * stride_buf_vh + offs_dv[None, :]
             v = tl.load(
                 V_Buffer + offs_buf_v,
                 mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
@@ -239,7 +240,7 @@ def _decode_att_m_fwd(
     total_q, head_num = q.shape[0], q.shape[1]
 
     grid = (total_q, head_num, MAX_KV_SPLITS)
-    kv_group_num = q.shape[1] // k_buffer.shape[1]
+    kv_group_num = q.shape[1] // k_buffer.shape[-2]
 
     if kv_group_num == 1:
         num_warps = 4
@@ -263,10 +264,12 @@ def _decode_att_m_fwd(
         num_kv_splits,
         q.stride(0),
         q.stride(1),
-        k_buffer.stride(0),
-        k_buffer.stride(1),
-        v_buffer.stride(0),
-        v_buffer.stride(1),
+        k_buffer.stride(-3),
+        k_buffer.stride(-2),
+        v_buffer.stride(-3),
+        v_buffer.stride(-2),
+        k_buffer.stride(0) if k_buffer.ndim == 4 else k_buffer.stride(0) * page_size,
+        v_buffer.stride(0) if v_buffer.ndim == 4 else v_buffer.stride(0) * page_size,
         att_out.stride(0),
         att_out.stride(1),
         att_out.stride(2),
@@ -305,6 +308,8 @@ def _fwd_grouped_kernel_stage1(
     stride_buf_kh,
     stride_buf_vbs,
     stride_buf_vh,
+    stride_buf_kp,
+    stride_buf_vp,
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
@@ -400,12 +405,15 @@ def _fwd_grouped_kernel_stage1(
                 other=0,
             )
             # int64 to avoid address overflow for large (>int32 range) KV caches
-            kv_loc = physical_pages.to(tl.int64) * PAGE_SIZE + page_offsets
-            offs_buf_k = (
-                kv_loc[None, :] * stride_buf_kbs
-                + cur_kv_head * stride_buf_kh
-                + offs_d[:, None]
+            k_loc = (
+                physical_pages.to(tl.int64) * stride_buf_kp
+                + page_offsets * stride_buf_kbs
             )
+            v_loc = (
+                physical_pages.to(tl.int64) * stride_buf_vp
+                + page_offsets * stride_buf_vbs
+            )
+            offs_buf_k = k_loc[None, :] + cur_kv_head * stride_buf_kh + offs_d[:, None]
             k = tl.load(
                 K_Buffer + offs_buf_k,
                 mask=(offs_n[None, :] < split_kv_end) & (mask_d[:, None]),
@@ -414,9 +422,7 @@ def _fwd_grouped_kernel_stage1(
             qk = tl.dot(q, k.to(q.dtype))
             if BLOCK_DPE > 0:
                 offs_buf_kpe = (
-                    kv_loc[None, :] * stride_buf_kbs
-                    + cur_kv_head * stride_buf_kh
-                    + offs_dpe[:, None]
+                    k_loc[None, :] + cur_kv_head * stride_buf_kh + offs_dpe[:, None]
                 )
                 kpe = tl.load(
                     K_Buffer + offs_buf_kpe,
@@ -433,11 +439,7 @@ def _fwd_grouped_kernel_stage1(
                 mask_h[:, None] & (offs_n[None, :] < split_kv_end), qk, float("-inf")
             )
 
-            offs_buf_v = (
-                kv_loc[:, None] * stride_buf_vbs
-                + cur_kv_head * stride_buf_vh
-                + offs_dv[None, :]
-            )
+            offs_buf_v = v_loc[:, None] + cur_kv_head * stride_buf_vh + offs_dv[None, :]
             v = tl.load(
                 V_Buffer + offs_buf_v,
                 mask=(offs_n[:, None] < split_kv_end) & (mask_dv[None, :]),
@@ -519,7 +521,7 @@ def _decode_grouped_att_m_fwd(
     BLOCK_DV = triton.next_power_of_2(Lv)
 
     total_q, head_num = q.shape[0], q.shape[1]
-    kv_group_num = q.shape[1] // k_buffer.shape[1]
+    kv_group_num = q.shape[1] // k_buffer.shape[-2]
 
     BLOCK_H = 16
     MAX_KV_SPLITS = max_kv_splits
@@ -547,10 +549,12 @@ def _decode_grouped_att_m_fwd(
         num_kv_splits,
         q.stride(0),
         q.stride(1),
-        k_buffer.stride(0),
-        k_buffer.stride(1),
-        v_buffer.stride(0),
-        v_buffer.stride(1),
+        k_buffer.stride(-3),
+        k_buffer.stride(-2),
+        v_buffer.stride(-3),
+        v_buffer.stride(-2),
+        k_buffer.stride(0) if k_buffer.ndim == 4 else k_buffer.stride(0) * page_size,
+        v_buffer.stride(0) if v_buffer.ndim == 4 else v_buffer.stride(0) * page_size,
         att_out.stride(0),
         att_out.stride(1),
         att_out.stride(2),
@@ -849,7 +853,7 @@ def decode_attention_fwd(
     assert q.shape[0] == cache_seqlens.shape[0] * max_seqlen_q
     assert q.shape[0] <= attn_logits.shape[0]
 
-    kv_group_num = q.shape[1] // v_buffer.shape[1]
+    kv_group_num = q.shape[1] // v_buffer.shape[-2]
 
     if kv_group_num == 1:
         # MHA
@@ -922,6 +926,8 @@ def _fwd_folded_kernel_stage1(
     stride_buf_kh,
     stride_buf_vbs,
     stride_buf_vh,
+    stride_buf_kp,
+    stride_buf_vp,
     stride_mid_ob,
     stride_mid_oh,
     stride_mid_os,
@@ -931,6 +937,7 @@ def _fwd_folded_kernel_stage1(
     PAGE_SIZE: tl.constexpr,
     MAX_SEQLEN_Q: tl.constexpr,
     WINDOW_LEFT: tl.constexpr,
+    WINDOW_SINK: tl.constexpr,
     kv_group_num: tl.constexpr,
     ROW_BLOCKS: tl.constexpr,
     BLOCK_M: tl.constexpr,
@@ -977,9 +984,11 @@ def _fwd_folded_kernel_stage1(
         row_start = tl.zeros([BLOCK_M], dtype=tl.int32)
         kv_lo = 0
     kv_splits = tl.load(num_kv_splits)
-    kv_len_per_split = tl.cdiv(tl.cdiv(seq_len - kv_lo, kv_splits), BLOCK_N) * BLOCK_N
-    split_start = kv_lo + kv_len_per_split * split_kv_id
-    split_end = tl.minimum(split_start + kv_len_per_split, seq_len)
+    sink_len = tl.minimum(WINDOW_SINK, kv_lo)
+    visible_len = sink_len + seq_len - kv_lo
+    kv_len_per_split = tl.cdiv(tl.cdiv(visible_len, kv_splits), BLOCK_N) * BLOCK_N
+    split_start = kv_len_per_split * split_kv_id
+    split_end = tl.minimum(split_start + kv_len_per_split, visible_len)
 
     q = tl.load(
         Q
@@ -995,19 +1004,24 @@ def _fwd_folded_kernel_stage1(
     for start_n in range(split_start, split_end, BLOCK_N):
         offs_n = start_n + tl.arange(0, BLOCK_N)
         key_ok = offs_n < split_end
-        page_indices = offs_n // PAGE_SIZE
+        token_indices = tl.where(offs_n < sink_len, offs_n, kv_lo + offs_n - sink_len)
+        page_indices = token_indices // PAGE_SIZE
         physical_pages = tl.load(
             page_table + cur_batch * page_table_stride_b + page_indices,
             mask=key_ok,
             other=0,
         )
         # int64 to avoid address overflow for large (>int32 range) KV caches
-        kv_loc = physical_pages.to(tl.int64) * PAGE_SIZE + offs_n % PAGE_SIZE
+        k_loc = (
+            physical_pages.to(tl.int64) * stride_buf_kp
+            + (token_indices % PAGE_SIZE) * stride_buf_kbs
+        )
+        v_loc = (
+            physical_pages.to(tl.int64) * stride_buf_vp
+            + (token_indices % PAGE_SIZE) * stride_buf_vbs
+        )
         k = tl.load(
-            K_Buffer
-            + kv_loc[:, None] * stride_buf_kbs
-            + cur_kv_head * stride_buf_kh
-            + offs_d[None, :],
+            K_Buffer + k_loc[:, None] + cur_kv_head * stride_buf_kh + offs_d[None, :],
             mask=key_ok[:, None] & mask_d[None, :],
             other=0.0,
         )
@@ -1021,15 +1035,15 @@ def _fwd_folded_kernel_stage1(
         visible = (
             row_ok[:, None]
             & key_ok[None, :]
-            & (offs_n[None, :] >= row_start[:, None])
-            & (offs_n[None, :] < row_end[:, None])
+            & (
+                (token_indices[None, :] >= row_start[:, None])
+                | (token_indices[None, :] < WINDOW_SINK)
+            )
+            & (token_indices[None, :] < row_end[:, None])
         )
         qk = tl.where(visible, qk, float("-inf"))
         v = tl.load(
-            V_Buffer
-            + kv_loc[:, None] * stride_buf_vbs
-            + cur_kv_head * stride_buf_vh
-            + offs_dv[None, :],
+            V_Buffer + v_loc[:, None] + cur_kv_head * stride_buf_vh + offs_dv[None, :],
             mask=key_ok[:, None] & mask_dv[None, :],
             other=0.0,
         )
@@ -1189,6 +1203,7 @@ def decode_attention_fwd_folded(
     max_seqlen_q: int,
     page_size: int,
     window_left: int,
+    window_sink: int,
     sm_scale: float,
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
@@ -1216,7 +1231,7 @@ def decode_attention_fwd_folded(
     bs = cache_seqlens.shape[0]
     total_q, head_num, lk = q.shape
     lv = v_buffer.shape[-1]
-    kv_head_num = k_buffer.shape[1]
+    kv_head_num = k_buffer.shape[-2]
     kv_group_num = head_num // kv_head_num
     folded_rows = max_seqlen_q * kv_group_num
     block_dmodel = triton.next_power_of_2(lk)
@@ -1254,10 +1269,20 @@ def decode_attention_fwd_folded(
             num_kv_splits,
             q.stride(0),
             q.stride(1),
-            k_buffer.stride(0),
-            k_buffer.stride(1),
-            v_buffer.stride(0),
-            v_buffer.stride(1),
+            k_buffer.stride(-3),
+            k_buffer.stride(-2),
+            v_buffer.stride(-3),
+            v_buffer.stride(-2),
+            (
+                k_buffer.stride(0)
+                if k_buffer.ndim == 4
+                else k_buffer.stride(0) * page_size
+            ),
+            (
+                v_buffer.stride(0)
+                if v_buffer.ndim == 4
+                else v_buffer.stride(0) * page_size
+            ),
             att_out.stride(0),
             att_out.stride(1),
             att_out.stride(2),
@@ -1267,6 +1292,7 @@ def decode_attention_fwd_folded(
             PAGE_SIZE=page_size,
             MAX_SEQLEN_Q=max_seqlen_q,
             WINDOW_LEFT=window_left,
+            WINDOW_SINK=window_sink,
             kv_group_num=kv_group_num,
             ROW_BLOCKS=row_blocks,
             BLOCK_M=block_m,
@@ -1337,14 +1363,15 @@ def _triton_mha_decode_with_kvcache_impl(
         )
         decode_attention_fwd_folded(
             q,
-            k_cache.view(-1, k_cache.shape[2], k_cache.shape[3]),
-            v_cache.view(-1, v_cache.shape[2], v_cache.shape[3]),
+            k_cache,
+            v_cache,
             out,
             page_table,
             cache_seqlens,
             max_seqlen_q,
             k_cache.shape[1],
             window_left,
+            window_sink,
             sm_scale=softmax_scale,
             logit_cap=logit_cap,
             sinks=sinks,
@@ -1375,8 +1402,8 @@ def _triton_mha_decode_with_kvcache_impl(
     )
     decode_attention_fwd(
         q,
-        k_cache.view(-1, k_cache.shape[2], k_cache.shape[3]),
-        v_cache.view(-1, v_cache.shape[2], v_cache.shape[3]),
+        k_cache,
+        v_cache,
         out,
         page_table,
         cache_seqlens,

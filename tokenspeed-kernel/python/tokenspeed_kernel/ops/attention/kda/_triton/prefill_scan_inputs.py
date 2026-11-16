@@ -23,8 +23,11 @@
 import torch
 from tokenspeed_kernel._triton import tl, triton
 
+# Sequences per prefix-sum tile; a fixed width keeps the batch out of the key.
+_SEQUENCE_BLOCK = 32
 
-@triton.jit
+
+@triton.jit(do_not_specialize=["T", "N", "MAX_CHUNKS", "SEARCH_STEPS"])
 def _prepare_capacity_scan_kernel(
     Q,
     K,
@@ -39,8 +42,7 @@ def _prepare_capacity_scan_kernel(
     CU,
     CHUNKS,
     CHUNK_ROWS,
-    # Token, sequence and chunk counts follow the batch; runtime so every batch
-    # shape shares one binary. N_BLOCK buckets N for the per-sequence tile.
+    # Batch-shaped counts stay unspecialized, so every batch shape shares one binary.
     T,
     H: tl.constexpr,
     D: tl.constexpr,
@@ -51,7 +53,8 @@ def _prepare_capacity_scan_kernel(
     GS: tl.constexpr,
     BS: tl.constexpr,
     MAX_CHUNKS,
-    N_BLOCK: tl.constexpr,
+    SEARCH_STEPS,
+    SEQ_BLOCK: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     x = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -71,21 +74,29 @@ def _prepare_capacity_scan_kernel(
         beta_row < T,
     )
     if tl.program_id(0) == 0:
-        slot = tl.arange(0, N_BLOCK)
-        begin = tl.load(CU + slot, slot < N, 0)
-        end = tl.load(CU + slot + 1, slot < N, 0)
-        counts = tl.where(slot < N, tl.cdiv(end - begin, 16), 0)
-        ends = tl.cumsum(counts)
-        tl.store(CHUNKS + slot + 1, ends, slot < N)
         tl.store(CHUNKS, 0)
+        total = tl.full((), 0, CU.dtype.element_ty)
+        for first in range(0, N, SEQ_BLOCK):
+            slot = first + tl.arange(0, SEQ_BLOCK)
+            begin = tl.load(CU + slot, slot < N, 0)
+            end = tl.load(CU + slot + 1, slot < N, 0)
+            counts = tl.where(slot < N, tl.cdiv(end - begin, 16), 0)
+            tl.store(CHUNKS + slot + 1, total + tl.cumsum(counts), slot < N)
+            total += tl.sum(counts)
+        # The searches read chunk ends that other threads of this program stored.
+        tl.debug_barrier()
         for base in range(tl.cdiv(MAX_CHUNKS, 128)):
             index = base * 128 + tl.arange(0, 128)
-            sequence = tl.sum(
-                (index[:, None] >= ends[None, :]) & (slot[None, :] < N), 1
-            )
-            tl.store(
-                CHUNK_ROWS + index, tl.minimum(sequence, N - 1), index < MAX_CHUNKS
-            )
+            # A chunk's sequence is the number of sequence ends at or before it.
+            lo = tl.zeros((128,), tl.int32)
+            hi = tl.zeros((128,), tl.int32) + N
+            for _ in range(SEARCH_STEPS):
+                active = lo < hi
+                mid = (lo + hi) // 2
+                chunk_end = tl.load(CHUNKS + 1 + mid, active, 0)
+                lo = tl.where(active & (chunk_end <= index), mid + 1, lo)
+                hi = tl.where(active & (chunk_end > index), mid, hi)
+            tl.store(CHUNK_ROWS + index, tl.minimum(lo, N - 1), index < MAX_CHUNKS)
 
 
 def prepare_capacity_scan(q, k, v, gate, beta, boundaries):
@@ -137,7 +148,8 @@ def prepare_capacity_scan(q, k, v, gate, beta, boundaries):
         GS=gate.stride(1),
         BS=beta.stride(1),
         MAX_CHUNKS=count,
-        N_BLOCK=triton.next_power_of_2(sequences),
+        SEARCH_STEPS=sequences.bit_length(),
+        SEQ_BLOCK=_SEQUENCE_BLOCK,
         BLOCK=1024,
     )
     return oq, ok, ov, og, ob, chunks, chunk_rows

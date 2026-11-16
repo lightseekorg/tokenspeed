@@ -33,6 +33,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from tokenspeed_kernel.platform import current_platform
 
+from tokenspeed.runtime.layers.attention.backends.base import SparseTopKShare
 from tokenspeed.runtime.layers.linear import ColumnParallelLinear, RowParallelLinear
 
 sys.path.insert(
@@ -60,6 +61,7 @@ from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
 from tokenspeed.runtime.layers.quantization.utils import should_exclude_quant_module
 from tokenspeed.runtime.models import muse_spark as module
 from tokenspeed.runtime.models.base.weight_update import weight_update_session
+from tokenspeed.runtime.models.monokernel import MonokernelState
 from tokenspeed.runtime.models.muse_spark import (
     RESIDUAL_GATE_EPS,
     MuseSparkAttention,
@@ -325,6 +327,7 @@ class _AddLayer(torch.nn.Module):
 def test_forward_threads_attention_input_rows_between_layers() -> None:
     model = _stub(MuseSparkForConditionalGeneration.model_cls)
     model.layers = torch.nn.ModuleList(_AddLayer(float(i + 1)) for i in range(3))
+    model.monokernel_state = None
     hidden = torch.arange(6, dtype=torch.float32).reshape(2, 3)
     model._embed_hidden = lambda input_ids, input_embeds: input_embeds
     model.embed_tokens = SimpleNamespace(weight=torch.empty(0, dtype=torch.bfloat16))
@@ -359,7 +362,9 @@ class _CaptureSink:
 def _tapping_model(taps: list[int], with_sink: bool = True):
     """Three constant-adding layers and a draft capturing the layers in ``taps``."""
     model = _stub(MuseSparkForConditionalGeneration.model_cls)
+    model.config = SimpleNamespace(decode_monokernel=False)
     model.layers = torch.nn.ModuleList(_AddLayer(float(i + 1)) for i in range(3))
+    model.monokernel_state = None
     model._embed_hidden = lambda input_ids, input_embeds: input_embeds
     model.embed_tokens = SimpleNamespace(weight=torch.empty(0, dtype=torch.bfloat16))
     model.norm = lambda value, out_dtype: -value.to(out_dtype)
@@ -402,6 +407,60 @@ def test_forward_taps_the_residual_stream_after_each_draft_target_layer(
     # produced, and rounds what it keeps itself.
     assert [index for index, _ in sink.captures] == [0, 1]
     assert sink.captures[0][1] is aux[0] and sink.captures[1][1] is aux[1]
+
+
+class _StepState(MonokernelState):
+    """A monokernel state that records the model's calls; its launches
+    store the taps when ``stores_taps``."""
+
+    def __init__(self, stores_taps: bool, taps: torch.Tensor | None) -> None:
+        super().__init__(torch.zeros(0, dtype=torch.int64))
+        self.stores_taps = stores_taps
+        self.taps = taps
+        self.calls: list[str] = []
+
+    def start_step(self) -> None:
+        super().start_step()
+        self.calls.append("start")
+
+    def finish_step(self) -> torch.Tensor | None:
+        self.calls.append("finish")
+        return super().finish_step()
+
+    def claim_taps(self, rows, ctx) -> bool:
+        self.calls.append("claim_taps")
+        return self.stores_taps
+
+    def tap_rows(self, rows: int) -> torch.Tensor:
+        return self.taps[:rows]
+
+
+def test_a_monokernel_step_brackets_the_layers_and_keeps_the_regular_capture() -> None:
+    # With a capture sink, the launches do not store the taps: the model
+    # captures the rows the layer before the tap returned, as without
+    # monokernels, between start_step and finish_step.
+    model, sink, ctx = _tapping_model([0])  # taps the stream entering layer 1
+    state = _StepState(stores_taps=False, taps=None)
+    model.monokernel_state = state
+    hidden = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+
+    model.forward(torch.tensor([0, 1]), torch.tensor([0, 1]), ctx, hidden)
+
+    assert state.calls == ["start", "claim_taps", "finish"]
+    # A sink gets full rows unrounded (it rounds as it copies).
+    torch.testing.assert_close(sink.captures[0][1], hidden + 1.0, rtol=0, atol=0)
+
+
+def test_taps_the_launches_store_replace_the_models_captures() -> None:
+    model, sink, ctx = _tapping_model([0], with_sink=False)
+    stored = torch.full((2, 3), 7.0, dtype=torch.bfloat16)
+    model.monokernel_state = _StepState(stores_taps=True, taps=stored)
+    hidden = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+
+    _, aux = model.forward(torch.tensor([0, 1]), torch.tensor([0, 1]), ctx, hidden)
+
+    assert len(aux) == 1 and aux[0] is not None
+    torch.testing.assert_close(aux[0], stored, rtol=0, atol=0)
 
 
 def test_idle_forward_taps_nothing() -> None:
@@ -489,6 +548,7 @@ def test_muse_mxfp4_honors_quark_expert_exclusions(
     assert kept.quantized_experts is False
     assert kept.expert_quant_kind == "unquant"
     assert kept.experts.w13_weight.dtype == torch.bfloat16
+    assert kept.experts.supports_deferred_finalize is True
     assert quantized.quantized_experts is True
     assert quantized.expert_quant_kind == "mxfp4"
     assert quantized.experts.w13_weight.dtype == torch.uint8
@@ -511,13 +571,17 @@ def test_muse_spark_moe_matches_torch_reference(bf16_default_dtype) -> None:
     torch.manual_seed(21)
     for parameter in module_.parameters():
         parameter.data.normal_(mean=0.0, std=0.02)
+    # The planned expert kernel may repack its weights; keep the loaded layout.
+    w13 = module_.experts.w13_weight.detach().clone()
+    w2 = module_.experts.w2_weight.detach().clone()
+    module_.experts.process_weights_after_loading(module_.experts)
     module_.gate.process_weights_after_loading(module_.gate)
     hidden = torch.randn(5, 256, dtype=torch.bfloat16, device="cuda")
     router_input = hidden.float()
-    output, sentinel, publish = module_(
+    output, sentinel = module_(
         hidden, router_input, hidden.shape[0], hidden.shape[0], None, project=True
     )
-    assert sentinel is None and publish is None
+    assert sentinel is None
 
     logits = router_input @ module_.gate.weight
     logits *= module_.gate.multiplier
@@ -536,14 +600,12 @@ def test_muse_spark_moe_matches_torch_reference(bf16_default_dtype) -> None:
     for token in range(5):
         for slot in range(2):
             expert = int(ids[token, slot].item())
-            gate_up = (
-                compressed[token].float() @ module_.experts.w13_weight[expert].float().T
-            )
+            gate_up = compressed[token].float() @ w13[expert].float().T
             gate, up = gate_up.chunk(2)
             activated = (torch.nn.functional.silu(gate) * up).to(torch.bfloat16)
-            routes[token, slot] = (
-                activated.float() @ module_.experts.w2_weight[expert].float().T
-            ).to(torch.bfloat16)
+            routes[token, slot] = (activated.float() @ w2[expert].float().T).to(
+                torch.bfloat16
+            )
     scaled_routes = routes.float() * (module_.post_expert_norm.weight + 1.0).float()
     normalized_routes = _rmsnorm(scaled_routes, module_.post_expert_norm.eps)
     combined = (normalized_routes * route_weights[..., None]).sum(dim=1)
@@ -1156,6 +1218,7 @@ def test_owned_attention_stores_prepared_rows_once(
         attn_backend=SimpleNamespace(
             padded_write_locations=lambda *args: positions,
             cache_placement=lambda layer: None,
+            sparse_topk=SparseTopKShare(),
             query_dtype=lambda layer, mode, activation: activation,
             forward=attend,
         ),
@@ -1350,7 +1413,7 @@ def test_reloaded_gates_refresh_the_cached_coefficients_in_place() -> None:
     assert torch.equal(second[0], expected[0]) and torch.equal(second[1], expected[1])
 
 
-def test_quantized_combined_prepares_routing_once_per_token_count(
+def test_experts_combined_prepares_routing_once_per_token_count(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The experts get the prepared routing when it exists; otherwise one is prepared for next time."""
@@ -1387,7 +1450,7 @@ def test_quantized_combined_prepares_routing_once_per_token_count(
             torch.zeros(tokens, 1, dtype=torch.uint8),
         )
         weights, ids = torch.ones(tokens, 2), torch.zeros(tokens, 2, dtype=torch.int32)
-        moe._quantized_combined(
+        moe._experts_combined(
             torch.zeros(tokens, 8),
             quantized,
             weights,
@@ -1420,7 +1483,10 @@ def test_communication_fallback_frees_the_column_split_down_copy() -> None:
     owner = SimpleNamespace(
         # Muse prepares Iris communication only at attention TP4 or TP8.
         mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=1, tp_group=(0,))),
-        model=SimpleNamespace(layers=[SimpleNamespace(mlp=mlp)]),
+        model=SimpleNamespace(
+            layers=[SimpleNamespace(mlp=mlp)],
+            config=SimpleNamespace(decode_monokernel=False),
+        ),
     )
 
     prepared = MuseSparkForConditionalGeneration.prepare_communication_runtime(
@@ -1429,6 +1495,21 @@ def test_communication_fallback_frees_the_column_split_down_copy() -> None:
 
     assert prepared is False
     assert mlp.down_columns is None
+
+
+def test_decode_monokernels_without_iris_fail_startup_with_the_cause() -> None:
+    """The launches' scratch lives on the Iris heap: with --decode-monokernel,
+    a server whose Iris collectives cannot be prepared fails at startup and
+    names why, instead of at its first decode."""
+    owner = SimpleNamespace(
+        mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=1, tp_group=(0,))),
+        model=SimpleNamespace(
+            layers=[], config=SimpleNamespace(decode_monokernel=True)
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="Iris collectives are not prepared"):
+        MuseSparkForConditionalGeneration.prepare_communication_runtime(owner, 8192)
 
 
 @requires_gpu
@@ -1440,6 +1521,9 @@ def test_weight_update_is_refused_before_writing_with_a_column_split_down_copy(
     # The tiny config is too small to build the copy; attach one.
     layer.mlp.down_columns = MoEDownColumns(4, 128, 64, tp_rank=0, tp_size=8)
     norm = layer.input_layernorm.weight
+    # The parameters are allocated uninitialized and may hold NaN, which
+    # never compares equal; give the norm finite values.
+    norm.data.fill_(1.0)
     before = norm.clone()
 
     with pytest.raises(RuntimeError, match="column-split copy"):
@@ -1820,10 +1904,10 @@ def test_replicated_pool_preserves_column_projection_after_reload(
 @pytest.mark.skipif(
     not current_platform().is_nvidia, reason="requires a NVIDIA CUDA pointer view"
 )
-def test_gathered_projection_hands_wider_batches_to_the_mailbox_publish(
+def test_gathered_projection_stores_its_block_into_a_rank_major_mailbox(
     monkeypatch: pytest.MonkeyPatch, bf16_default_dtype
 ) -> None:
-    """Wider rows reach the mailbox through its word publish, bit for bit; a GEMV row lands in place."""
+    """The block GEMM writes this rank's rows straight into its block, bit for bit with the projection."""
     from tokenspeed_kernel.ops.moe._cute_dsl import latent_down
 
     bound = {}
@@ -1833,7 +1917,7 @@ def test_gathered_projection_hands_wider_batches_to_the_mailbox_publish(
     monkeypatch.setattr(
         module.KimiK3LatentDownOp, "initialize", lambda **kwargs: bound.update(kwargs)
     )
-    hidden, latent, ranks, rank = 256, 128, 4, 1
+    hidden, latent, ranks, rank, max_m = 256, 128, 4, 1, 4
     with torch.device("cuda"):
         linear = module._MuseGatheredLinear(
             input_size=hidden,
@@ -1847,123 +1931,33 @@ def test_gathered_projection_hands_wider_batches_to_the_mailbox_publish(
             replicate_for_owned_rows=True,
             workspace_rows=module._GATHER_MXFP4_MAX_ROWS,
         )
+    assert bound["rank_major"] is True
     with torch.no_grad():
         linear.weight.normal_(std=hidden**-0.5)
     weight = linear._local_weight()
     shard = weight.shape[0]
-    mailbox = torch.zeros(4, latent, dtype=torch.bfloat16, device="cuda")
-    latent_down.arm_mailbox(mailbox, latent_down.HALF_POLLED_SENTINEL)
+    mailbox = torch.zeros(max_m, latent, dtype=torch.bfloat16, device="cuda")
     producer = latent_down._MulticastVaGemm(
         multicast_ptr=mailbox.data_ptr(),
         rank=rank,
         shard_dim=shard,
         latent_size=latent,
-        max_m=4,
+        max_m=max_m,
         device=mailbox.device,
         publish_gemm=bound["publish_gemm"],
+        rank_major=True,
     )
-    published_rows, expected_rows = [], []
-    publish = latent_down.multicast_publish
-
-    def record_publish(block, destination):
-        published_rows.append(block.shape[0])
-        publish(block, destination)
-
-    monkeypatch.setattr(latent_down, "multicast_publish", record_publish)
-    for tokens in (1, 3):
-        x = torch.randn(tokens, hidden, device="cuda")
-        if tokens > 1 or not module._use_mv(x, weight):
-            expected_rows.append(tokens)
-        producer(x, weight, mailbox, mailbox.data_ptr())
-        torch.cuda.synchronize()
-        assert torch.equal(
-            mailbox[:tokens, rank * shard : (rank + 1) * shard].view(torch.int16),
-            linear._project(x, weight, None).view(torch.int16),
-        )
-    assert published_rows == expected_rows
-
-
-@requires_gpu
-@pytest.mark.skipif(
-    not current_platform().is_nvidia, reason="requires a NVIDIA CUDA pointer view"
-)
-def test_gathered_projection_leaves_a_wider_block_for_the_consumer_to_publish(
-    monkeypatch: pytest.MonkeyPatch, bf16_default_dtype
-) -> None:
-    """A library GEMM's block comes back for the consumer to store; a GEMV row still lands in place."""
-    from tokenspeed_kernel.ops.moe._cute_dsl import latent_down
-
-    bound = {}
-    monkeypatch.setattr(
-        module.process_group_manager, "get_device_process_group", lambda group: group
-    )
-    monkeypatch.setattr(
-        module.KimiK3LatentDownOp, "initialize", lambda **kwargs: bound.update(kwargs)
-    )
-    hidden, latent, ranks, rank = 256, 128, 4, 1
-    with torch.device("cuda"):
-        linear = module._MuseGatheredLinear(
-            input_size=hidden,
-            output_size=latent,
-            prefix="model.layers.0.mlp.pre_expert_proj",
-            tp_rank=rank,
-            tp_size=ranks,
-            tp_group=tuple(range(ranks)),
-            layer_id=0,
-            layer_count=2,
-            replicate_for_owned_rows=True,
-            workspace_rows=module._GATHER_MXFP4_MAX_ROWS,
-        )
-    with torch.no_grad():
-        linear.weight.normal_(std=hidden**-0.5)
-    weight = linear._local_weight()
-    shard = weight.shape[0]
-    mailbox = torch.zeros(4, latent, dtype=torch.bfloat16, device="cuda")
-    producer = latent_down._MulticastVaGemm(
-        multicast_ptr=mailbox.data_ptr(),
-        rank=rank,
-        shard_dim=shard,
-        latent_size=latent,
-        max_m=4,
-        device=mailbox.device,
-        publish_gemm=bound["publish_gemm"],
-    )
-    columns = slice(rank * shard, (rank + 1) * shard)
+    blocks = mailbox.view(ranks, max_m, shard)
     for tokens in (1, 3):
         latent_down.arm_mailbox(mailbox, latent_down.HALF_POLLED_SENTINEL)
         x = torch.randn(tokens, hidden, device="cuda")
-        pending = producer.project(x, weight)
+        producer(x, weight, mailbox, mailbox.data_ptr())
         torch.cuda.synchronize()
         expected = linear._project(x, weight, None).view(torch.int16)
-        if tokens == 1 and module._use_mv(x, weight):
-            assert pending is None
-            assert torch.equal(mailbox[:tokens, columns].view(torch.int16), expected)
-            continue
-        assert pending is not None and pending.column == rank * shard
-        assert torch.equal(pending.block.view(torch.int16), expected)
-        assert pending.destination.data_ptr() == mailbox[0, columns].data_ptr()
-        assert pending.destination.stride() == (latent, 1)
-        # Nothing reached the mailbox: the consumer stores the block.
+        assert torch.equal(blocks[rank, :tokens].view(torch.int16), expected)
+        # Other ranks' blocks and the rows past the batch keep the sentinel.
+        blocks[rank, :tokens].view(torch.int16).fill_(-1)
         assert (mailbox.view(torch.int32) == -1).all()
-
-
-def test_publish_leaves_only_small_batches_to_the_consumer() -> None:
-    """Up to the row cap the consumer stores the block; wider batches keep the copy."""
-    calls: list[tuple[str, int]] = []
-
-    class _Op:
-        def publish_by_consumer(self, x, weight):
-            calls.append(("consumer", x.shape[0]))
-            return x, "pending"
-
-        def publish(self, x, weight):
-            calls.append(("copy", x.shape[0]))
-            return x
-
-    cap = module._CONSUMER_PUBLISH_MAX_ROWS
-    assert module._publish(_Op(), torch.zeros(cap, 4), None)[1] == "pending"
-    assert module._publish(_Op(), torch.zeros(cap + 1, 4), None)[1] is None
-    assert calls == [("consumer", cap), ("copy", cap + 1)]
 
 
 class _FakeMailbox:
@@ -1975,9 +1969,9 @@ class _FakeMailbox:
     def handles(self, tokens: int) -> bool:
         return tokens <= 2
 
-    def publish_by_consumer(self, x, weight):
+    def publish(self, x, weight):
         self.calls.append(("publish", x.shape[0], weight.shape[0]))
-        return x.new_full((x.shape[0], 512), float("nan")), None
+        return x.new_full((x.shape[0], 512), float("nan"))
 
     def __call__(self, x, weight, *, output_scale):
         # The real op's signature: Muse gathers BF16, never fused NVFP4.
@@ -2007,11 +2001,11 @@ def test_attention_publishes_a_served_batch_for_the_boundary_to_reduce(
     )
     width = attn.o_proj.weight.shape[1]
     one = torch.randn(1, width, dtype=torch.bfloat16, device="cuda")
-    rows, sentinel, ranks, publish = attn._project(one)
-    assert (sentinel, ranks, publish) == (0xFFFFFFFF, 4, None) and rows.isnan().all()
+    rows, sentinel, ranks = attn._project(one)
+    assert (sentinel, ranks) == (0xFFFFFFFF, 4) and rows.isnan().all()
     three = torch.randn(3, width, dtype=torch.bfloat16, device="cuda")
-    rows, sentinel, ranks, publish = attn._project(three)
-    assert (sentinel, ranks, publish) == (None, 1, None)
+    rows, sentinel, ranks = attn._project(three)
+    assert (sentinel, ranks) == (None, 1)
     assert rows.shape == (3, attn.hidden_size) and not rows.isnan().any()
     assert calls == [("publish", 1, attn.o_proj.weight.shape[0])]
 

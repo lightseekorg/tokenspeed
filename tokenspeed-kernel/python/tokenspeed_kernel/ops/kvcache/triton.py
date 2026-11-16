@@ -33,6 +33,15 @@ from dataclasses import dataclass
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.kvcache.index_k_scale import (
+    index_k_scale_dtype,
+    index_k_scale_ue8m0,
+    index_k_scale_word,
+)
+from tokenspeed_kernel.ops.quantization._triton_mxfp4 import (
+    _mxfp4_index_rows,
+    _ue8m0_word,
+)
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
 _PER_LAYER_GRID_CAP = int(os.environ.get("TOKENSPEED_KV_GRID_CAP", "64"))
@@ -56,6 +65,7 @@ __all__ = [
     "compact_window_rows",
     "copy_page_fields",
     "copy_state_rows",
+    "dequant_gather_kv_mxfp8",
     "fused_fp8_set_kv_buffer",
     "get_mla_kv_buffer_triton",
     "index_k_block_split_scatter",
@@ -2075,6 +2085,9 @@ def _store_kv_cache_kernel(
     v_src_token_stride,
     k_dst_row_stride,
     v_dst_row_stride,
+    dst_page_size,
+    k_dst_page_stride,
+    v_dst_page_stride,
     n_kv_per_token: tl.constexpr,
     BLOCK: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
@@ -2101,12 +2114,26 @@ def _store_kv_cache_kernel(
         src = tl.load(
             v_src_ptr + row * v_src_token_stride + offsets, mask=mask, other=0
         )
-        tl.store(v_dst_ptr + dst_row * v_dst_row_stride + offsets, src, mask=mask)
+        tl.store(
+            v_dst_ptr
+            + (dst_row // dst_page_size) * v_dst_page_stride
+            + (dst_row % dst_page_size) * v_dst_row_stride
+            + offsets,
+            src,
+            mask=mask,
+        )
     else:
         src = tl.load(
             k_src_ptr + row * k_src_token_stride + offsets, mask=mask, other=0
         )
-        tl.store(k_dst_ptr + dst_row * k_dst_row_stride + offsets, src, mask=mask)
+        tl.store(
+            k_dst_ptr
+            + (dst_row // dst_page_size) * k_dst_page_stride
+            + (dst_row % dst_page_size) * k_dst_row_stride
+            + offsets,
+            src,
+            mask=mask,
+        )
 
 
 def store_kv_cache(
@@ -2123,7 +2150,8 @@ def store_kv_cache(
     launch handling both k and v rows. The last dim of all four tensors must
     be contiguous (stride == 1); the leading axis may have any stride — this
     lets src tensors come from a qkv-split view directly (no contiguous copy
-    required).
+    required). Destinations may also be ``[pages, rows, heads, dim]`` fields
+    with an explicit page stride; ``loc`` still indexes token slots.
 
     ``enable_pdl`` defaults to the platform policy; pass ``False`` to disable
     Programmatic Dependent Launch explicitly. When enabled, the kernel waits
@@ -2143,8 +2171,16 @@ def store_kv_cache(
 
     k_src_stride = k_src.stride(0) if k_src.dim() > 1 else k_src.shape[-1]
     v_src_stride = v_src.stride(0) if v_src.dim() > 1 else v_src.shape[-1]
-    k_dst_stride = k_dst.stride(0) if k_dst.dim() > 1 else k_dst.shape[-1]
-    v_dst_stride = v_dst.stride(0) if v_dst.dim() > 1 else v_dst.shape[-1]
+    k_dst_stride = (
+        k_dst.stride(-3)
+        if k_dst.dim() >= 3
+        else (k_dst.stride(0) if k_dst.dim() > 1 else k_dst.shape[-1])
+    )
+    v_dst_stride = (
+        v_dst.stride(-3)
+        if v_dst.dim() >= 3
+        else (v_dst.stride(0) if v_dst.dim() > 1 else v_dst.shape[-1])
+    )
 
     block = triton.next_power_of_2(n_kv_k)
     use_pdl = _use_pdl(enable_pdl)
@@ -2161,6 +2197,9 @@ def store_kv_cache(
         v_src_stride,
         k_dst_stride,
         v_dst_stride,
+        k_dst.shape[1] if k_dst.ndim == 4 else 1,
+        k_dst.stride(0) if k_dst.ndim == 4 else k_dst_stride,
+        v_dst.stride(0) if v_dst.ndim == 4 else v_dst_stride,
         n_kv_k,
         BLOCK=block,
         ENABLE_PDL=use_pdl,
@@ -3217,6 +3256,214 @@ def quantize_mxfp8_rows(
     return data, sf
 
 
+# -----------------------------------------------------------------------------
+# MXFP8 KV dequantize + gather (a BF16 paged view of an MXFP8 cache)
+# -----------------------------------------------------------------------------
+
+
+@triton.jit
+def _dequant_mxfp8_tile(src_ptr, sf_ptr, slot, sf_word, valid, row_stride, head_off):
+    """Dequantize [ROWS, 128] fp8 rows of one head with their packed UE8M0 words.
+
+    Rows past the request's length read as zero: the pool bytes there may be
+    stale fp8 or scale NaNs that would poison P @ V.
+    """
+    d_off = tl.arange(0, 128)
+    q8 = tl.load(
+        src_ptr + slot[:, None] * row_stride + head_off + d_off[None, :],
+        mask=valid[:, None],
+        other=0,
+    )
+    x = q8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+    packed = tl.load(sf_ptr + sf_word, mask=valid, other=0).to(tl.uint32, bitcast=True)
+    exp = (packed[:, None] >> (8 * (d_off[None, :] // 32)).to(tl.uint32)) & 0xFF
+    y = x * tl.exp2(exp.to(tl.float32) - 127.0)
+    return tl.where(valid[:, None], y, 0.0).to(tl.bfloat16)
+
+
+@triton.jit
+def _dequant_gather_kv_mxfp8_kernel(
+    k_src_ptr,  # fp8 cache rows as u8, row = slot
+    v_src_ptr,
+    k_sf_ptr,  # SF slabs as u32 (4 packed e8m0), interleaved atom layout
+    v_sf_ptr,
+    page_table_ptr,  # [B, W] int32 source pages (kernel-page units)
+    seq_lens_ptr,  # [B] int32 tokens per request
+    first_page_ptr,  # [B] int32 first gathered logical page
+    num_pages_ptr,  # [B] int32 gathered pages
+    base_page_ptr,  # [B] int32 first scratch page of the request
+    k_dst_ptr,  # bf16 scratch rows, row = scratch slot
+    v_dst_ptr,
+    out_page_table_ptr,  # [B, W] int32
+    page_table_stride,
+    out_page_table_stride,
+    src_row_stride,
+    dst_row_stride,
+    sf_page_stride,  # nheads * chunks_per_page * 128 (u32 units)
+    page_tokens,  # tokens per page of the layer's group (SF layout unit)
+    width,
+    capacity_pages,
+    KERNEL_PAGE: tl.constexpr,
+    NHEADS: tl.constexpr,
+    PAGES_PER_PROG: tl.constexpr,
+    ROWS: tl.constexpr,
+):
+    b = tl.program_id(0).to(tl.int64)
+    chunk = tl.program_id(1)
+    seq_len = tl.load(seq_lens_ptr + b)
+    first = tl.load(first_page_ptr + b)
+    count = tl.load(num_pages_ptr + b)
+    base = tl.load(base_page_ptr + b)
+    rows = tl.arange(0, ROWS)
+    d_off = tl.arange(0, 128)
+    chunks_per_page = page_tokens // 128
+    for j in range(PAGES_PER_PROG):
+        i = chunk * PAGES_PER_PROG + j
+        if i < width:
+            dst_page = base + i - first
+            keep = (i >= first) & (i < first + count) & (dst_page < capacity_pages)
+            # Pages outside the gathered range point at scratch page 0: the
+            # kernels never read them (outside the window or past the length).
+            tl.store(
+                out_page_table_ptr + b * out_page_table_stride + i,
+                tl.where(keep, dst_page, 0),
+            )
+            if keep:
+                src_page = tl.load(page_table_ptr + b * page_table_stride + i).to(
+                    tl.int64
+                )
+                for r0 in range(0, KERNEL_PAGE, ROWS):
+                    valid = i * KERNEL_PAGE + r0 + rows < seq_len
+                    slot = src_page * KERNEL_PAGE + r0 + rows
+                    dst_slot = dst_page.to(tl.int64) * KERNEL_PAGE + r0 + rows
+                    page_off = slot % page_tokens
+                    row = page_off % 128
+                    sf_word = (
+                        (slot // page_tokens) * sf_page_stride
+                        + (page_off // 128) * 128
+                        + (row % 32) * 4
+                        + row // 32
+                    )
+                    for h in tl.static_range(NHEADS):
+                        word = sf_word + h * chunks_per_page * 128
+                        dst = (
+                            dst_slot[:, None] * dst_row_stride
+                            + h * 128
+                            + d_off[None, :]
+                        )
+                        k = _dequant_mxfp8_tile(
+                            k_src_ptr,
+                            k_sf_ptr,
+                            slot,
+                            word,
+                            valid,
+                            src_row_stride,
+                            h * 128,
+                        )
+                        tl.store(k_dst_ptr + dst, k)
+                        v = _dequant_mxfp8_tile(
+                            v_src_ptr,
+                            v_sf_ptr,
+                            slot,
+                            word,
+                            valid,
+                            src_row_stride,
+                            h * 128,
+                        )
+                        tl.store(v_dst_ptr + dst, v)
+
+
+def dequant_gather_kv_mxfp8(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k_sf: torch.Tensor,
+    v_sf: torch.Tensor,
+    page_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    first_page: torch.Tensor,
+    num_pages: torch.Tensor,
+    k_out: torch.Tensor,
+    v_out: torch.Tensor,
+    out_page_table: torch.Tensor,
+    *,
+    kernel_page_size: int,
+    page_tokens: int,
+) -> None:
+    """Dequantize the MXFP8 cache pages an attention call reads into BF16 pages.
+
+    Request ``b`` reads logical pages ``[first_page[b], first_page[b] +
+    num_pages[b])`` of its ``page_table`` row; they land on consecutive
+    scratch pages (requests in batch order) and ``out_page_table`` maps them,
+    so a BF16 paged-attention kernel run on ``(k_out, v_out, out_page_table)``
+    sees exactly the dequantized cache. Other ``out_page_table`` entries are 0.
+    Rows at or past ``seq_lens[b]`` are zero. Pages beyond the scratch
+    capacity are not gathered; callers size the scratch for the batch.
+
+    Args:
+        k_cache, v_cache: fp8-e4m3 row views ``[slots, H, 128]`` (the views
+            ``quantize_store_kv_mxfp8`` writes), slot = page * kernel_page_size + row.
+        k_sf, v_sf: e8m0 scale slabs in the interleaved layout of
+            ``quantize_store_kv_mxfp8`` for ``page_tokens``.
+        page_table: ``[B, W]`` int32 source pages in kernel-page units.
+        seq_lens: ``[B]`` int32 tokens per request.
+        first_page, num_pages: ``[B]`` int32 gathered page range per request.
+        k_out, v_out: BF16 scratch rows ``[scratch_slots, H, 128]``.
+        out_page_table: ``[B, W]`` int32 output page table.
+        kernel_page_size: Tokens per page-table entry.
+        page_tokens: Tokens per page of the layer's group (multiple of 128).
+    """
+    assert page_tokens % 128 == 0
+    if k_cache.dim() != 3 or k_cache.shape[-1] != 128 or v_cache.shape != k_cache.shape:
+        raise ValueError(
+            f"MXFP8 KV caches hold [slots, heads, 128] rows: "
+            f"{tuple(k_cache.shape)} / {tuple(v_cache.shape)}"
+        )
+    if k_out.dtype != torch.bfloat16 or k_out.shape[1:] != k_cache.shape[1:]:
+        raise ValueError(
+            f"scratch {tuple(k_out.shape)} {k_out.dtype} must be BF16 rows of "
+            f"the cache's {tuple(k_cache.shape[1:])} heads"
+        )
+    if v_out.shape != k_out.shape or v_out.dtype != k_out.dtype:
+        raise ValueError("the value scratch must match the key scratch")
+    if page_table.shape != out_page_table.shape:
+        raise ValueError("out_page_table must match page_table")
+    for t in (k_cache, v_cache, k_out, v_out):
+        assert t.stride(-1) == 1 and t.stride(-2) == 128
+    b, width = page_table.shape
+    if b == 0:
+        return
+    nheads = k_cache.shape[1]
+    base_page = torch.cumsum(num_pages, 0, dtype=torch.int32) - num_pages
+    pages_per_prog = 8
+    grid = (b, triton.cdiv(width, pages_per_prog))
+    _dequant_gather_kv_mxfp8_kernel[grid](
+        k_cache.view(torch.uint8),
+        v_cache.view(torch.uint8),
+        k_sf.view(torch.uint8).reshape(-1, 4).view(torch.int32).reshape(-1),
+        v_sf.view(torch.uint8).reshape(-1, 4).view(torch.int32).reshape(-1),
+        page_table,
+        seq_lens,
+        first_page,
+        num_pages,
+        base_page,
+        k_out,
+        v_out,
+        out_page_table,
+        page_table.stride(0),
+        out_page_table.stride(0),
+        k_cache.stride(0),
+        k_out.stride(0),
+        nheads * (page_tokens // 128) * 128,
+        page_tokens,
+        width,
+        k_out.shape[0] // kernel_page_size,
+        KERNEL_PAGE=kernel_page_size,
+        NHEADS=nheads,
+        PAGES_PER_PROG=pages_per_prog,
+        ROWS=32,
+    )
+
+
 # GLM-5 DSA block-split index-K scatter
 
 
@@ -3289,7 +3536,9 @@ def index_k_block_split_scatter(
         buf: uint8 slot matrix or paged byte view. Pages may have padding
             between them; bytes within each page must be contiguous.
         index_k_fp8: ``[tokens, head_dim]`` FP8 values.
-        index_k_scale: ``[tokens, num_groups]`` float32 scales.
+        index_k_scale: ``[tokens, num_groups]`` scale words in the plane's
+            encoding (``kvcache/index_k_scale.py``): float32 scales, or the
+            int32 UE8M0 words of a Blackwell plane.
         loc: ``[tokens]`` non-negative int global slot indices (any integer
             dtype).
         write_mask: Required explicit ownership mask, or None to write all rows.
@@ -3326,8 +3575,12 @@ def index_k_block_split_scatter(
     if buf.storage_offset() % 4 or page_bytes % 4:
         raise ValueError("Index-K pages must be float32 aligned")
 
+    if index_k_scale.dtype not in (torch.float32, torch.int32):
+        raise ValueError(
+            f"index-K scale words are float32 or int32, got {index_k_scale.dtype}"
+        )
     fp8_buf = buf
-    scale_buf = buf.view(torch.float32)  # aliases the same storage
+    scale_buf = buf.view(index_k_scale.dtype)  # aliases the same storage
     k_fp8 = index_k_fp8.reshape(-1, head_dim).contiguous().view(torch.uint8)
     k_scale = index_k_scale.reshape(-1, ng).contiguous()
 
@@ -3462,7 +3715,7 @@ def index_k_layernorm_scatter(
 @triton.jit
 def _index_k_layernorm_fp8_scatter_row(
     fp8_buf_ptr,  # uint8 flat view of the paged plane
-    scale_buf_ptr,  # float32 flat view of the same storage
+    scale_buf_ptr,  # float32 (int32 for MXFP4) flat view of the same storage
     x_ptr,  # [tokens, HD] pre-norm keys, unit inner stride
     weight_ptr,  # [HD] LayerNorm weight
     bias_ptr,  # [HD] LayerNorm bias
@@ -3471,7 +3724,7 @@ def _index_k_layernorm_fp8_scatter_row(
     t,  # int64 row
     x_row_stride,
     page_bytes,  # bytes per page (page stride)
-    scale_base_off,  # float32 offset of a page's scales ((ps*hd)//4)
+    scale_base_off,  # 4-byte offset of a page's scales (code bytes // 4)
     eps,
     HAS_WRITE_MASK: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
@@ -3480,7 +3733,10 @@ def _index_k_layernorm_fp8_scatter_row(
     NG: tl.constexpr,
     BLOCK_NG: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    MXFP4: tl.constexpr,
+    UE8M0: tl.constexpr,
 ):
+    tl.static_assert(not MXFP4 or (HD == 128 and GROUP == 32))
     g = tl.arange(0, BLOCK_NG)[:, None]
     c = tl.arange(0, GROUP)[None, :]
     d = g * GROUP + c
@@ -3494,25 +3750,51 @@ def _index_k_layernorm_fp8_scatter_row(
     bias = tl.load(bias_ptr + d, mask=mask, other=0.0).to(tl.float32)
     # The keys are model-dtype rows before they are quantized.
     y = (centered * rstd * weight + bias).to(x_ptr.dtype.element_ty).to(tl.float32)
-    scale = tl.maximum(tl.max(tl.abs(y), axis=1), 1e-10) / FP8_MAX
-    codes = tl.clamp(y / scale[:, None], -FP8_MAX, FP8_MAX).to(tl.float8e4nv)
 
-    store_mask = mask
+    write = True
     if HAS_WRITE_MASK:
-        store_mask = store_mask & tl.load(write_mask_ptr + t).to(tl.int1)
+        write = tl.load(write_mask_ptr + t).to(tl.int1)
     loc = tl.load(loc_ptr + t).to(tl.int64)
     page = loc // PAGE_SIZE
     slot = loc % PAGE_SIZE
-    tl.store(
-        fp8_buf_ptr + page * page_bytes + slot * HD + d,
-        codes.to(tl.uint8, bitcast=True),
-        mask=store_mask,
-    )
-    tl.store(
-        scale_buf_ptr + page * (page_bytes // 4) + scale_base_off + slot * NG + g,
-        scale[:, None],
-        mask=store_mask,
-    )
+    if MXFP4:
+        # DSV4.1's index codec: UE8M0 2**ceil(log2(amax / 6)) per 32 elements.
+        grouped = tl.reshape(y, (1, NG, GROUP))
+        amax = tl.maximum(tl.max(tl.abs(grouped), 2), 6 * 2.0**-126)
+        packed, exponent = _mxfp4_index_rows(grouped, tl.div_rn(amax, 6.0), 1)
+        tl.store(
+            fp8_buf_ptr
+            + page * page_bytes
+            + slot * (HD // 2)
+            + tl.arange(0, HD // 2)[None, :],
+            packed,
+            mask=write,
+        )
+        tl.store(
+            scale_buf_ptr
+            + page * (page_bytes // 4)
+            + scale_base_off
+            + slot
+            + tl.arange(0, 1),
+            _ue8m0_word(exponent),
+            mask=write,
+        )
+    else:
+        scale = tl.maximum(tl.max(tl.abs(y), axis=1), 1e-10) / FP8_MAX
+        # The plane's scale-word encoding (kvcache/index_k_scale.py).
+        scale, word = index_k_scale_word(scale, UE8M0)
+        codes = tl.clamp(y / scale[:, None], -FP8_MAX, FP8_MAX).to(tl.float8e4nv)
+        store_mask = mask & write
+        tl.store(
+            fp8_buf_ptr + page * page_bytes + slot * HD + d,
+            codes.to(tl.uint8, bitcast=True),
+            mask=store_mask,
+        )
+        tl.store(
+            scale_buf_ptr + page * (page_bytes // 4) + scale_base_off + slot * NG + g,
+            word[:, None],
+            mask=store_mask,
+        )
 
 
 @triton.jit
@@ -3535,6 +3817,8 @@ def _index_k_layernorm_fp8_scatter_kernel(
     NG: tl.constexpr,
     BLOCK_NG: tl.constexpr,
     FP8_MAX: tl.constexpr,
+    MXFP4: tl.constexpr,
+    UE8M0: tl.constexpr,
 ):
     _index_k_layernorm_fp8_scatter_row(
         fp8_buf_ptr,
@@ -3556,6 +3840,8 @@ def _index_k_layernorm_fp8_scatter_kernel(
         NG,
         BLOCK_NG,
         FP8_MAX,
+        MXFP4,
+        UE8M0,
     )
 
 
@@ -3570,12 +3856,16 @@ def _index_k_layernorm_fp8_scatter_args(
     page_size: int,
     group_size: int,
     write_mask: torch.Tensor | None,
+    index_k_format: str = "fp8_scaled",
 ) -> tuple[tuple, dict[str, object]]:
     """Validate an :func:`index_k_layernorm_fp8_scatter` write (same arguments).
 
     Returns ``(args, constexprs)``: the runtime arguments and the constexprs
     ``_index_k_layernorm_fp8_scatter_kernel`` takes for it.
     """
+    if index_k_format not in ("fp8_scaled", "mxfp4"):
+        raise ValueError(f"unsupported index_k_format {index_k_format!r}")
+    mxfp4 = index_k_format == "mxfp4"
     tokens = index_k.shape[0]
     head_dim = index_k.shape[1] if index_k.ndim == 2 else -1
     if index_k.ndim != 2 or index_k.stride(-1) != 1:
@@ -3597,8 +3887,11 @@ def _index_k_layernorm_fp8_scatter_args(
         or write_mask.device != loc.device
     ):
         raise ValueError("Index-K write mask must be bool [tokens] on the slot device")
+    if mxfp4 and (head_dim != 128 or group_size != 32):
+        raise ValueError("mxfp4 index keys need head_dim 128 and group_size 32")
     ng = head_dim // group_size
-    row_bytes = head_dim + ng * 4
+    code_bytes = head_dim // 2 if mxfp4 else head_dim
+    row_bytes = code_bytes + (4 if mxfp4 else ng * 4)
     page_bytes = page_size * row_bytes
     if buf.ndim == 3:
         buf = buf.view(buf.shape[0], -1)
@@ -3615,7 +3908,8 @@ def _index_k_layernorm_fp8_scatter_args(
         raise ValueError("Index-K pages must be float32 aligned")
     args = (
         buf,
-        buf.view(torch.float32),
+        # Scale words are stored as int32 in every encoding.
+        buf.view(torch.int32),
         index_k,
         weight.contiguous(),
         bias.contiguous(),
@@ -3623,7 +3917,7 @@ def _index_k_layernorm_fp8_scatter_args(
         write_mask,
         index_k.stride(0),
         page_bytes,
-        (page_size * head_dim) // 4,
+        (page_size * code_bytes) // 4,
         float(eps),
     )
     constexprs = {
@@ -3634,8 +3928,86 @@ def _index_k_layernorm_fp8_scatter_args(
         "NG": ng,
         "BLOCK_NG": _next_power_of_two(ng),
         "FP8_MAX": float(torch.finfo(torch.float8_e4m3fn).max),
+        "MXFP4": mxfp4,
+        "UE8M0": not mxfp4 and index_k_scale_ue8m0(),
     }
     return args, constexprs
+
+
+@triton.jit
+def _quantize_index_k_rows_kernel(
+    x_ptr,
+    codes_ptr,
+    words_ptr,
+    x_row_stride,
+    HD: tl.constexpr,
+    GROUP: tl.constexpr,
+    NG: tl.constexpr,
+    BLOCK_NG: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    UE8M0: tl.constexpr,
+):
+    t = tl.program_id(0).to(tl.int64)
+    g = tl.arange(0, BLOCK_NG)[:, None]
+    c = tl.arange(0, GROUP)[None, :]
+    d = g * GROUP + c
+    mask = g < NG
+    y = tl.load(x_ptr + t * x_row_stride + d, mask=mask, other=0.0).to(tl.float32)
+    scale = tl.maximum(tl.max(tl.abs(y), axis=1), 1e-10) / FP8_MAX
+    scale, word = index_k_scale_word(scale, UE8M0)
+    codes = tl.clamp(y / scale[:, None], -FP8_MAX, FP8_MAX).to(tl.float8e4nv)
+    tl.store(codes_ptr + t * HD + d, codes, mask=mask)
+    tl.store(words_ptr + t * NG + g, word[:, None], mask=mask)
+
+
+def quantize_index_k_rows(
+    index_k: torch.Tensor, *, group_size: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize index keys to ``fp8_scaled`` rows in the plane's encoding.
+
+    Each ``group_size`` group gets the scale ``max(amax, 1e-10) / 448``, in
+    the scale-word encoding of this GPU's planes (``kvcache/index_k_scale.py``),
+    and the E4M3 codes of the clamped quotient: the rows
+    ``index_k_layernorm_fp8_scatter`` writes for already normalized keys, as
+    ``index_k_block_split_scatter`` takes them.
+
+    Args:
+        index_k: ``[tokens, head_dim]`` keys with unit inner stride.
+        group_size: Elements per scale; a power of two dividing ``head_dim``.
+
+    Returns:
+        ``[tokens, head_dim]`` E4M3 codes and ``[tokens, head_dim //
+        group_size]`` scale words (float32 scales, or int32 UE8M0 words).
+    """
+    tokens, head_dim = index_k.shape
+    if index_k.ndim != 2 or index_k.stride(-1) != 1:
+        raise ValueError("index_k must be [tokens, head_dim] with unit inner stride")
+    if group_size <= 0 or head_dim % group_size or group_size & (group_size - 1):
+        raise ValueError(
+            f"group_size {group_size} must be a power of two dividing {head_dim}"
+        )
+    ng = head_dim // group_size
+    codes = torch.empty(
+        (tokens, head_dim), dtype=torch.float8_e4m3fn, device=index_k.device
+    )
+    words = torch.empty(
+        (tokens, ng), dtype=index_k_scale_dtype(), device=index_k.device
+    )
+    if tokens:
+        _quantize_index_k_rows_kernel[(tokens,)](
+            index_k,
+            codes,
+            words.view(torch.int32),
+            index_k.stride(0),
+            HD=head_dim,
+            GROUP=group_size,
+            NG=ng,
+            BLOCK_NG=_next_power_of_two(ng),
+            FP8_MAX=float(torch.finfo(torch.float8_e4m3fn).max),
+            UE8M0=index_k_scale_ue8m0(),
+            num_warps=1,
+        )
+    return codes, words
 
 
 def index_k_layernorm_fp8_scatter(
@@ -3649,13 +4021,15 @@ def index_k_layernorm_fp8_scatter(
     page_size: int,
     group_size: int,
     write_mask: torch.Tensor | None,
+    index_k_format: str = "fp8_scaled",
 ) -> None:
     """LayerNorm pre-norm index keys and write them as fp8_scaled rows.
 
-    One launch equivalent of ``index_k_block_split_scatter(buf, *fp8(ln(x)),
-    loc, ...)`` where ``ln`` is the FP32 LayerNorm rounded to ``index_k``'s
-    dtype and ``fp8`` gives each ``group_size`` group the scale
-    ``max(amax, 1e-10) / 448`` and the E4M3 codes of the clamped quotient.
+    One launch equivalent of ``index_k_block_split_scatter(buf,
+    *quantize_index_k_rows(ln(x)), loc, ...)`` where ``ln`` is the FP32
+    LayerNorm rounded to ``index_k``'s dtype: each ``group_size`` group gets
+    the scale ``max(amax, 1e-10) / 448`` in the plane's encoding
+    (``kvcache/index_k_scale.py``) and the E4M3 codes of the clamped quotient.
 
     Args:
         buf: uint8 ``index_k_block_split_scatter`` plane: a ``[slots,
@@ -3671,6 +4045,11 @@ def index_k_layernorm_fp8_scatter(
         group_size: Elements per scale; divides ``head_dim``.
         write_mask: Optional bool ``[tokens]`` ownership mask; False rows are
             not written. None writes every row.
+        index_k_format: ``"fp8_scaled"``, or ``"mxfp4"`` for DSV4.1's index
+            codec: 64 nibble-packed E2M1 code bytes per row (even element in
+            the low nibble) and then each row's four UE8M0 exponents of
+            ``2**ceil(log2(max(amax, 6 * 2**-126) / 6))``. mxfp4 needs
+            ``head_dim`` 128 and ``group_size`` 32.
 
     Returns:
         None; ``buf`` is written in place.
@@ -3685,6 +4064,7 @@ def index_k_layernorm_fp8_scatter(
         page_size=page_size,
         group_size=group_size,
         write_mask=write_mask,
+        index_k_format=index_k_format,
     )
     if index_k.shape[0] == 0:
         return

@@ -285,6 +285,7 @@ class TestFinishTailHitCopyCudaTest:
                 max_retracted_requests=0,
                 host_write_policy="write_through",
                 prefill_decode_interval=0,
+                prefill_decode_min_interval=0,
                 storage_config=None,
                 cache_groups=[
                     ts.CacheGroupConfig(
@@ -504,6 +505,7 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
                 storage_config=None,
                 host_write_policy="write_back",
                 prefill_decode_interval=0,
+                prefill_decode_min_interval=0,
                 cache_groups=pool_to_cache_groups(pool),
             )
             scheduler = ts.Scheduler(scheduler_config)
@@ -535,7 +537,9 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
                 )
                 plan = scheduler.next_execution_plan()
                 assert list(plan.remote_decode.request_ids) == list(rids)
-                assert not cache_ops_from_plan(plan).device
+                assert not cache_ops_from_plan(
+                    plan, request_admission={}.__getitem__
+                ).device
                 assert not any(len(pages) for pages in plan.pages_to_zero.values())
                 advance_scheduler(
                     scheduler, [ts.PD.SucceededEvent(rid) for rid in rids]
@@ -544,7 +548,9 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
             def execute(plan):
                 # The round's Device work, all of it enqueued by the handle
                 # when it returns.
-                cache_ops = cache_ops_from_plan(plan).device
+                cache_ops = cache_ops_from_plan(
+                    plan, request_admission={}.__getitem__
+                ).device
                 assert handle.execute(plan, None, cache_ops=cache_ops) is None
                 return cache_ops
 
@@ -584,7 +590,9 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
                 hit_b, hit_c = forwards(plan)[0].extend_prefix_lens
                 assert (hit_b, hit_c) == (41, 32)
                 assert plan.remote_decode is None
-                (store,) = cache_ops_from_plan(plan).device
+                (store,) = cache_ops_from_plan(
+                    plan, request_admission={}.__getitem__
+                ).device
                 assert list(store.source_pinned) == [False]
                 assert [list(rows) for rows in store.src_pages] == [[tail_a, tail_e]]
                 # B copies A's tail into E's; C's new page, A's tail, is zeroed.
@@ -835,6 +843,7 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
                             request_pool_index=1,
                             snapshot_slot=1,
                             transfers=(CacheTransfer(0, z, 1, "", 0),),
+                            admission_id=1,
                         ),
                         _WriteBackOp(2, z, 2),
                     ],
@@ -851,6 +860,7 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
                             snapshot_slot=1,
                             transfers=(CacheTransfer(0, 1, y, "", 0),),
                             source_tier=(HostTier.SNAPSHOT_POOL,),
+                            admission_id=1,
                         )
                     ],
                 )
@@ -880,6 +890,7 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
                             snapshot_slot=1,
                             transfers=(CacheTransfer(0, 1, x, "", 0),),
                             source_tier=(HostTier.SNAPSHOT_POOL,),
+                            admission_id=1,
                         ),
                     ],
                 )
@@ -904,6 +915,7 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
                             snapshot_slot=1,
                             transfers=(CacheTransfer(0, 1, y, "", 0),),
                             source_tier=(HostTier.L2,),
+                            admission_id=1,
                         )
                     ],
                 )
@@ -1057,6 +1069,7 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
                                 snapshot_slot=1,
                                 transfers=(CacheTransfer(0, 1, z, "", 0),),
                                 source_tier=(HostTier.L2,),
+                                admission_id=1,
                             )
                         ],
                     )

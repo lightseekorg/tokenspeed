@@ -37,6 +37,7 @@
 
 #include "core/token_container.h"
 #include "cache/tier/transfer.h"
+#include "core/profile_span.h"
 #include "fsm/forward_events.h"
 #include "fsm/forward_states.h"
 #include "scheduler/capacity_model.h"
@@ -166,48 +167,35 @@ std::size_t Scheduler::groupIndex(const std::string& group_id) const {
 }
 
 std::vector<KvCacheEvent> Scheduler::DrainKvEvents() {
-    // An event reports the net change since the last drain: a boundary is
-    // published exactly while every child block of it is cached. Mutations
-    // mark boundaries in whatever order the coordinator touches pages, so the
-    // batch is sorted by chain depth: removals leaf-first, then Stored
-    // parent-first, because consumers resolve a Stored event's
-    // parent_block_hash against what they have already received.
-    std::vector<std::pair<std::int32_t, KvCacheEvent>> removed;
-    std::vector<std::pair<std::int32_t, KvCacheEvent>> stored;
-    for (const CacheKey& boundary : std::exchange(kv_event_boundaries_to_reconcile_, {})) {
+    return DrainKvEventBatch().ToEvents();
+}
+
+KvEventBatch Scheduler::DrainKvEventBatch() {
+    ProfileSpan profile_span{"Scheduler::DrainKvEventBatch"};
+    std::vector<KvEventMutation> mutations;
+    mutations.reserve(kv_event_boundaries_to_reconcile_.size());
+    // Residency is sampled once after the round's last mutation. Projection
+    // owns the only sort; its input need not put parents before children.
+    for (const CacheKey& boundary : kv_event_boundaries_to_reconcile_) {
         const auto it = kv_event_boundaries_.find(boundary);
-        FatalCheck(it != kv_event_boundaries_.end(),
-                   "KV event boundary marked for reconcile lost its token descriptor");
+        FatalCheck(it != kv_event_boundaries_.end(), "KV event boundary lost its token descriptor");
         KvEventBoundary& event_boundary = it->second;
         event_boundary.needs_reconcile = false;
-        // A tail's descriptor carries fewer tokens than a page.
-        const auto descriptor_tokens = static_cast<std::int32_t>(event_boundary.stored.token_ids.size());
-        const std::int32_t tail_tokens = descriptor_tokens < config_.prefix_granularity ? descriptor_tokens : 0;
-        const CacheCoordinator::BoundaryResidency residency =
-            coordinator_.DeviceBoundaryResidency(boundary, tail_tokens);
-        const bool complete = residency == CacheCoordinator::BoundaryResidency::kComplete;
-        if (complete && !event_boundary.published) {
-            stored.emplace_back(event_boundary.depth, event_boundary.stored);
-        } else if (!complete && event_boundary.published) {
-            removed.emplace_back(event_boundary.depth,
-                                 KvBlockRemovedEvent{.block_hashes = event_boundary.stored.block_hashes});
+        const auto descriptor_tokens = event_boundary.stored->token_ids.size();
+        const auto tail_tokens = descriptor_tokens < static_cast<std::size_t>(config_.prefix_granularity)
+                                     ? static_cast<std::int32_t>(descriptor_tokens)
+                                     : 0;
+        const auto status = coordinator_.GetBoundaryEventStatus(boundary, tail_tokens);
+        if (status.publishable != event_boundary.published) {
+            mutations.push_back({event_boundary.stored->block_hash,
+                                 status.publishable ? event_boundary.stored : KvEventDescriptorRef{}});
         }
-        event_boundary.published = complete;
-        if (residency == CacheCoordinator::BoundaryResidency::kNone) {
-            kv_event_boundaries_.erase(it);
-        }
+        event_boundary.published = status.publishable;
+        if (!status.has_device_entries) kv_event_boundaries_.erase(it);
     }
-    std::stable_sort(removed.begin(), removed.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
-    std::stable_sort(stored.begin(), stored.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
-    std::vector<KvCacheEvent> events;
-    events.reserve(removed.size() + stored.size());
-    for (auto& [depth, event] : removed) {
-        events.push_back(std::move(event));
-    }
-    for (auto& [depth, event] : stored) {
-        events.push_back(std::move(event));
-    }
-    return events;
+    // Cache keys own no payload; retain the allocation for the next round.
+    kv_event_boundaries_to_reconcile_.clear();
+    return kv_event_prefix_view_.ApplyMutations(mutations);
 }
 
 bool Scheduler::ClearL1Cache() {
@@ -263,31 +251,34 @@ bool Scheduler::clearCache(bool include_host) {
 }
 
 void Scheduler::registerKvEventPrefixPages(Request& request, std::span<const std::string> prefix_hashes,
-                                           std::int32_t first_page) {
+                                           std::int32_t first_page, std::int32_t past_end_page) {
     if (!config_.enable_kv_cache_events) {
         return;
     }
-    _assert(first_page >= 0 && static_cast<std::size_t>(first_page) <= prefix_hashes.size(),
+    _assert(first_page >= 0 && first_page <= past_end_page &&
+                static_cast<std::size_t>(past_end_page) <= prefix_hashes.size(),
             "KV event page range is invalid");
-    const std::vector<std::span<const std::int32_t>> token_pages =
-        request.PrefixPages(first_page, static_cast<std::int32_t>(prefix_hashes.size()));
+    const std::vector<std::span<const std::int32_t>> token_pages = request.PrefixPages(first_page, past_end_page);
     const std::span<const std::uint64_t> block_hashes = request.KvEventBlockHashes(prefix_hashes.size());
 
-    for (std::size_t i = static_cast<std::size_t>(first_page); i < prefix_hashes.size(); ++i) {
+    for (std::size_t i = static_cast<std::size_t>(first_page); i < static_cast<std::size_t>(past_end_page); ++i) {
         const std::span<const std::int32_t> tokens = token_pages[i - static_cast<std::size_t>(first_page)];
-        CacheKey key{.content_hash = prefix_hashes[i]};
+        CacheKey key{.content_hash = ContentHash{prefix_hashes[i]}};
         const std::optional<std::uint64_t> parent_hash =
             i == 0 ? std::nullopt : std::optional<std::uint64_t>{block_hashes[i - 1]};
-        KvBlockStoredEvent event{
-            .block_hashes = {block_hashes[i]},
-            .parent_block_hash = parent_hash,
-            .token_ids = std::vector<std::int32_t>(tokens.begin(), tokens.end()),
-            .block_size = config_.prefix_granularity,
-        };
-        const auto [it, inserted] = kv_event_boundaries_.try_emplace(
-            key, KvEventBoundary{.stored = std::move(event), .depth = static_cast<std::int32_t>(i)});
-        FatalCheck(inserted || (it->second.stored.block_hashes.front() == block_hashes[i] &&
-                                it->second.depth == static_cast<std::int32_t>(i)),
+        auto it = kv_event_boundaries_.find(key);
+        if (it == kv_event_boundaries_.end()) {
+            auto descriptor = std::make_shared<const KvEventDescriptor>(
+                KvEventDescriptor{.block_hash = block_hashes[i],
+                                  .parent_block_hash = parent_hash,
+                                  .token_ids = std::vector<std::int32_t>(tokens.begin(), tokens.end()),
+                                  .block_size = config_.prefix_granularity});
+            it = kv_event_boundaries_
+                     .emplace(key,
+                              KvEventBoundary{.stored = std::move(descriptor), .depth = static_cast<std::int32_t>(i)})
+                     .first;
+        }
+        FatalCheck(it->second.stored->block_hash == block_hashes[i] && it->second.depth == static_cast<std::int32_t>(i),
                    "one cache content hash mapped to different KV event blocks");
         // The next drain drops the descriptor if the publication never lands.
         markKvEventBoundaryForReconcile(key);
@@ -303,7 +294,13 @@ void Scheduler::registerKvEventPublication(Request& request, std::span<const std
     // published blocks hold them on the Device -- not after a restore brought
     // the request back on unpublished copies -- so the range starts at the
     // first page the publication registers an entry under.
-    registerKvEventPrefixPages(request, prefix_hashes, coordinator_.FirstPublishedPage(completed));
+    const auto num_pages = static_cast<std::int32_t>(prefix_hashes.size());
+    const std::int32_t first_page = coordinator_.FirstPublishedPage(completed);
+    registerKvEventPrefixPages(request, prefix_hashes, first_page, num_pages);
+    // A sliding group's sink blocks are registered again under the pages
+    // that hold them, below the window's.
+    registerKvEventPrefixPages(request, prefix_hashes, 0,
+                               std::min(coordinator_.PublishedSinkPages(completed), first_page));
     if (completed.tail) {
         registerKvEventTail(request, prefix_hashes, *completed.tail);
     }
@@ -323,7 +320,7 @@ std::vector<std::int32_t> Scheduler::kvEventTailsOf(const RetractionImage& image
             // descriptor; one with fewer tokens than a page is a tail's.
             const auto it = kv_event_boundaries_.find(eventKey(slot.key));
             FatalCheck(it != kv_event_boundaries_.end(), "an imaged published slot has no KV event descriptor");
-            const auto tail_tokens = static_cast<std::int32_t>(it->second.stored.token_ids.size());
+            const auto tail_tokens = static_cast<std::int32_t>(it->second.stored->token_ids.size());
             const std::int32_t boundary = it->second.depth * config_.prefix_granularity + tail_tokens;
             if (tail_tokens < config_.prefix_granularity && std::ranges::find(tails, boundary) == tails.end()) {
                 tails.push_back(boundary);
@@ -335,7 +332,7 @@ std::vector<std::int32_t> Scheduler::kvEventTailsOf(const RetractionImage& image
 
 void Scheduler::registerKvEventRestore(Request& request, std::span<const std::string> prefix_hashes,
                                        std::span<const std::int32_t> tails) {
-    registerKvEventPrefixPages(request, prefix_hashes, 0);
+    registerKvEventPrefixPages(request, prefix_hashes, 0, static_cast<std::int32_t>(prefix_hashes.size()));
     for (const std::int32_t boundary : tails) {
         const auto full_pages = static_cast<std::size_t>(boundary / config_.prefix_granularity);
         _assert(full_pages <= prefix_hashes.size(), "an imaged tail lies inside the request's computed pages");
@@ -359,16 +356,18 @@ void Scheduler::registerKvEventTail(Request& request, std::span<const std::strin
     const std::span<const std::int32_t> tail_tokens =
         request.TokenSlice(full_pages * config_.prefix_granularity, tail.tail_tokens);
     const CacheKey key{.content_hash = tail.hash};
-    KvBlockStoredEvent event{
-        .block_hashes = {HashKvBlock(tail_tokens, parent_hash)},
-        .parent_block_hash = parent_hash,
-        .token_ids = std::vector<std::int32_t>(tail_tokens.begin(), tail_tokens.end()),
-        .block_size = config_.prefix_granularity,
-    };
-    const auto [it, inserted] =
-        kv_event_boundaries_.try_emplace(key, KvEventBoundary{.stored = std::move(event), .depth = full_pages});
-    FatalCheck(inserted || (it->second.stored.block_hashes.front() == HashKvBlock(tail_tokens, parent_hash) &&
-                            it->second.depth == full_pages),
+    const auto hash = HashKvBlock(tail_tokens, parent_hash);
+    auto it = kv_event_boundaries_.find(key);
+    if (it == kv_event_boundaries_.end()) {
+        auto descriptor = std::make_shared<const KvEventDescriptor>(
+            KvEventDescriptor{.block_hash = hash,
+                              .parent_block_hash = parent_hash,
+                              .token_ids = std::vector<std::int32_t>(tail_tokens.begin(), tail_tokens.end()),
+                              .block_size = config_.prefix_granularity});
+        it = kv_event_boundaries_.emplace(key, KvEventBoundary{.stored = std::move(descriptor), .depth = full_pages})
+                 .first;
+    }
+    FatalCheck(it->second.stored->block_hash == hash && it->second.depth == full_pages,
                "one cache content hash mapped to different KV event blocks");
     markKvEventBoundaryForReconcile(key);
 }
@@ -385,10 +384,12 @@ void Scheduler::markKvEventBoundaryForReconcile(const CacheKey& boundary) {
 }
 
 void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
+    ProfileSpan profile_span{"Scheduler::SubmitRequests"};
     std::unordered_set<std::string> request_ids;
     request_ids.reserve(request_specs.size());
     std::vector<std::unique_ptr<Request>> pending_requests;
     pending_requests.reserve(request_specs.size());
+    const std::int32_t max_token_limit = CapacityModel::MaxRequestTokenLimit(config_);
     for (const RequestSpec& spec : request_specs) {
         if (spec.tokens.empty()) {
             throw std::invalid_argument("Scheduler: request tokens must be non-empty");
@@ -405,20 +406,37 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
         if (spec.max_new_tokens < 0) {
             throw std::invalid_argument("Scheduler: max_new_tokens must be non-negative");
         }
+        if (spec.shared_prefix_tokens.size() > 64 || std::ranges::any_of(spec.shared_prefix_tokens, [&](auto boundary) {
+                return boundary <= 0 || static_cast<std::size_t>(boundary) >= spec.tokens.size();
+            }))
+            throw std::invalid_argument("Scheduler: invalid shared prefix boundaries");
         if (spec.max_cached_prefix_tokens < 0) {
             throw std::invalid_argument("Scheduler: max_cached_prefix_tokens must be non-negative");
         }
         const std::int64_t generation_reserve =
             config_.role == Role::kP ? 0 : std::max<std::int64_t>(spec.max_new_tokens, config_.decode_input_tokens);
         const std::int64_t token_limit = static_cast<std::int64_t>(spec.tokens.size()) + generation_reserve;
-        if (token_limit > std::numeric_limits<std::int32_t>::max()) {
-            throw std::invalid_argument("Scheduler: request token limit exceeds int32 range");
+        if (token_limit > max_token_limit) {
+            throw std::invalid_argument("Scheduler: request token limit " + std::to_string(token_limit) + " exceeds " +
+                                        std::to_string(max_token_limit) +
+                                        ", the int32 token range less its decode and rounding headroom");
         }
         if (token_limit > max_single_request_tokens_) {
             throw std::invalid_argument("Scheduler: request token limit " + std::to_string(token_limit) +
                                         " exceeds cache capacity " + std::to_string(max_single_request_tokens_));
         }
         pending_requests.push_back(std::make_unique<Request>(spec, config_.prefix_granularity, config_.role));
+    }
+
+    // With prefix caching, every first admission reads the prompt's page
+    // hashes (the request keeps them). Hash them in the round the request
+    // arrives, not in the prefill round, which admits many long prompts at
+    // once. Without it, admission hashes nothing, and neither does this. Only
+    // a batch that passed validation is hashed, so a rejected one stays cheap.
+    if (!config_.disable_prefix_cache) {
+        for (const std::unique_ptr<Request>& request : pending_requests) {
+            request->PromptPrefixHashes();
+        }
     }
 
     requests_.reserve(requests_.size() + pending_requests.size());
@@ -475,6 +493,12 @@ std::size_t Scheduler::PdTransferSize() const {
 }
 
 std::int32_t Scheduler::ActiveLcmBlocks() const {
+    const std::int32_t active = coordinator_.NumActiveLcmBlocks();
+#ifndef NDEBUG
+    // Debug builds walk the live requests' tables, as the count was taken
+    // before the tables kept it, and fail on any drift. The walk sees only
+    // page-holding requests, so this must not be read while a bound table
+    // is still outside one (between Admit and the FSM event that takes it).
     std::vector<std::span<const BlockTable>> request_tables;
     request_tables.reserve(requests_.size());
     for (const auto& request : requests_) {
@@ -483,7 +507,10 @@ std::int32_t Scheduler::ActiveLcmBlocks() const {
         }
         request_tables.emplace_back(request->BlockTablesRef());
     }
-    return coordinator_.NumActiveLcmBlocks(request_tables);
+    _assert(active == coordinator_.CountActiveLcmBlocks(request_tables),
+            "the tables' active-parent count drifted from their contents");
+#endif
+    return active;
 }
 
 HostCacheStats Scheduler::GetHostCacheStats() const {
@@ -582,6 +609,7 @@ bool Scheduler::belowPrefillWatermark() const {
 }
 
 ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
+    ProfileSpan profile_span{"Scheduler::NextExecutionPlan"};
     std::vector<WriteBackOperation> write_back_operations = std::exchange(pending_write_back_operations_, {});
     // Dropping a finished request drops what it still holds elsewhere -- its
     // session's registration under its access epoch -- with it.
@@ -594,6 +622,7 @@ ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
     });
 
     if (storage_transfers_) {
+        ProfileSpan profile_span{"Scheduler::prepareStorage"};
         for (const auto& request : requests_) prepareStorage(*request);
     }
     std::vector<Request*> candidates;
@@ -738,6 +767,7 @@ void Scheduler::trackStalledRounds(std::size_t num_live_requests, bool plan_is_e
 }
 
 void Scheduler::Advance(const ExecutionEvent& event) {
+    ProfileSpan profile_span{"Scheduler::Advance"};
     for (const auto& item : event.Events()) {
         std::visit([this](const auto& inner) { handleEvent(inner); }, item);
     }

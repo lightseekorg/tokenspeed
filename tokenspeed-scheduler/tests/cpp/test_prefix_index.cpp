@@ -19,17 +19,27 @@
 // SOFTWARE.
 
 #include <gtest/gtest.h>
+#include <spdlog/sinks/stdout_sinks.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
+#include <cstring>
 #include <limits>
+#include <list>
+#include <map>
 #include <memory>
 #include <random>
+#include <stdexcept>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #include "cache/core/block_pool.h"
+#include "cache/prefix/flat_pointer_index.h"
 #include "cache/prefix/prefix_index.h"
+#include "cache/prefix/prefix_matcher.h"
 
 namespace tokenspeed::test {
 namespace {
@@ -37,7 +47,7 @@ namespace {
 constexpr std::uint32_t kGroupId = 0;
 
 CacheKey KeyOf(const std::string& content_hash) {
-    return CacheKey{.group_id = kGroupId, .content_hash = content_hash, .page_offset = 0};
+    return CacheKey{.group_id = kGroupId, .content_hash = ContentHash{content_hash}, .page_offset = 0};
 }
 
 // Registers one freshly acquired block and drops the local reference, leaving
@@ -85,8 +95,8 @@ TEST(PrefixCacheIndexInspectionTest, ReportsCurrentOwnershipWithoutPinningOrTouc
     const auto initial = index.Inspect(pool, key);
     ASSERT_TRUE(initial);
     EXPECT_EQ(initial->location, location);
-    EXPECT_EQ(initial->metadata.last_access_epoch, 10);
-    EXPECT_FALSE(initial->metadata.was_acquired);
+    EXPECT_EQ(initial->metadata.eviction.last_access_epoch, 10);
+    EXPECT_FALSE(initial->metadata.eviction.was_acquired);
     EXPECT_FALSE(initial->pinned);
 
     auto holder = index.Find(pool, key);
@@ -97,7 +107,7 @@ TEST(PrefixCacheIndexInspectionTest, ReportsCurrentOwnershipWithoutPinningOrTouc
     EXPECT_EQ(holder.use_count(), 2);
     index.Register(pool, holder, key, /*access_epoch=*/30, /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
                    /*newly_cached=*/nullptr, /*session=*/nullptr);
-    EXPECT_EQ(index.Inspect(pool, key)->metadata.last_access_epoch, 30);
+    EXPECT_EQ(index.Inspect(pool, key)->metadata.eviction.last_access_epoch, 30);
     holder = {};
     EXPECT_FALSE(index.Inspect(pool, key)->pinned);
 
@@ -117,6 +127,536 @@ TEST(PrefixCacheIndexInspectionTest, KeepsPoolsSeparateAndDoesNotClaimMissingKey
     EXPECT_FALSE(index.Inspect(device, KeyOf("absent")));
 }
 
+TEST(PrefixCacheIndexInspectionTest, EvictionKeepsItsKeyAndMetadataAfterTheEntryIsGone) {
+    BlockPool pool(1, {1});
+    PrefixCacheIndex index(0);
+    const auto key = KeyOf(std::string(64, 'a'));
+    const auto location = Cache(index, pool, key.content_hash.ToString(), 17);
+    {
+        // A handle dropped without Evict, as when recording the eviction
+        // throws, leaves the entry.
+        const PrefixCacheIndex::EvictableEntry abandoned = index.FindEvictable(pool, location);
+        ASSERT_TRUE(abandoned);
+        EXPECT_EQ(abandoned.key(), key);
+    }
+    EXPECT_TRUE(index.Contains(pool, key));
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 0);
+    PrefixCacheIndex::EvictableEntry evictable = index.FindEvictable(pool, location);
+    ASSERT_TRUE(evictable);
+    const PrefixCacheIndex::CachedBlockMetadata recorded = evictable.metadata();
+    const CacheKey removed = index.Evict(std::move(evictable));
+    EXPECT_FALSE(evictable);
+    EXPECT_EQ(removed, key);
+    EXPECT_EQ(recorded.eviction.last_access_epoch, 17);
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 1);
+    EXPECT_FALSE(index.Contains(pool, location));
+    const auto replacement = Cache(index, pool, "replacement", 18);
+    EXPECT_EQ(replacement, location);
+    EXPECT_EQ(removed, key);
+    EXPECT_EQ(index.KeyOf(pool, replacement), KeyOf("replacement"));
+}
+
+// Evict refuses a handle by aborting, not throwing: its caller may have
+// recorded the eviction already.
+void ExpectEvictAborts(PrefixCacheIndex& index, PrefixCacheIndex::EvictableEntry& handle, const char* message) {
+    EXPECT_DEATH(
+        {
+            // The default logger writes to stdout; the death test reads stderr.
+            spdlog::set_default_logger(spdlog::stderr_logger_mt("fatal-check-test"));
+            (void)index.Evict(std::move(handle));
+        },
+        message);
+}
+
+// An eviction handle finds only an entry the index alone owns, and refuses
+// to act for one whose tier or block changed since it was found: an entry
+// joined or left, the block got another owner, or it was evicted already.
+TEST(PrefixCacheIndexInspectionTest, AnEvictionHandleRefusesAnEntryItCanNoLongerVouchFor) {
+    BlockPool pool(4, {1});
+    PrefixCacheIndex index(kGroupId);
+    const auto first = Cache(index, pool, "first", 1);
+    const auto second = Cache(index, pool, "second", 1);
+    EXPECT_FALSE(index.FindEvictable(pool, CacheBlockLocation{.lcm_block_id = 4, .slot_index = 0}));
+    BlockPool other_pool(1, {1});
+    EXPECT_FALSE(index.FindEvictable(other_pool, first));
+    {
+        const CacheBlockRef holder = index.Find(pool, KeyOf("first"));
+        EXPECT_FALSE(index.FindEvictable(pool, first));
+    }
+
+    PrefixCacheIndex::EvictableEntry joined = index.FindEvictable(pool, first);
+    ASSERT_TRUE(joined);
+    Cache(index, pool, "third", 1);
+    EXPECT_THROW(joined.key(), std::runtime_error);
+    ExpectEvictAborts(index, joined, "an eviction handle outlived a change to its tier");
+
+    PrefixCacheIndex::EvictableEntry left = index.FindEvictable(pool, first);
+    ASSERT_TRUE(left);
+    ASSERT_EQ(index.Evict(pool, second), KeyOf("second"));
+    EXPECT_THROW(left.metadata(), std::runtime_error);
+
+    PrefixCacheIndex::EvictableEntry pinned = index.FindEvictable(pool, first);
+    ASSERT_TRUE(pinned);
+    const CacheBlockRef holder = index.Find(pool, KeyOf("first"));
+    ExpectEvictAborts(index, pinned, "an evictable entry stays unpinned until it is evicted");
+    EXPECT_TRUE(index.Contains(pool, KeyOf("first")));
+
+    BlockPool spare(1, {1});
+    PrefixCacheIndex fresh(kGroupId);
+    PrefixCacheIndex::EvictableEntry once = fresh.FindEvictable(spare, Cache(fresh, spare, "once", 1));
+    EXPECT_EQ(fresh.Evict(std::move(once)), KeyOf("once"));
+    EXPECT_FALSE(once);
+    EXPECT_THROW(once.key(), std::runtime_error);
+    ExpectEvictAborts(fresh, once, "an empty eviction handle has no entry");
+    EXPECT_EQ(fresh.NumEntries(spare), 0);
+}
+
+// Relocate changes the tier as joining or leaving does: a handle found
+// before it, whether for the moved entry or another one, no longer vouches
+// for its entry, even once the moved entry is unpinned again.
+TEST(PrefixCacheIndexInspectionTest, AnEvictionHandleRefusesAnEntryAfterARelocation) {
+    BlockPool pool(4, {1});
+    PrefixCacheIndex index(kGroupId);
+    const auto moved = Cache(index, pool, "moved", 1);
+    const auto other = Cache(index, pool, "other", 2);
+    PrefixCacheIndex::EvictableEntry moved_handle = index.FindEvictable(pool, moved);
+    PrefixCacheIndex::EvictableEntry other_handle = index.FindEvictable(pool, other);
+    ASSERT_TRUE(moved_handle);
+    ASSERT_TRUE(other_handle);
+    CacheBlockRef copy = pool.AcquireBlock(kGroupId);
+    const CacheBlockLocation to = copy->Location();
+    index.Relocate(pool, moved, copy);
+    copy.reset();
+    ASSERT_TRUE(index.FindEvictable(pool, to)) << "the moved entry is the index's alone again";
+
+    EXPECT_THROW(moved_handle.key(), std::runtime_error);
+    ExpectEvictAborts(index, moved_handle, "an eviction handle outlived a change to its tier");
+    EXPECT_THROW(other_handle.metadata(), std::runtime_error);
+    ExpectEvictAborts(index, other_handle, "an eviction handle outlived a change to its tier");
+    EXPECT_EQ(index.KeyOf(pool, to), KeyOf("moved"));
+    EXPECT_EQ(index.KeyOf(pool, other), KeyOf("other"));
+}
+
+// The handle shows the boundary-tree node the entry holds, still counting
+// the entry: here two groups' entries under one hash, then the last of them,
+// which takes the node along. An index never bound to a tree shows none.
+TEST(PrefixCacheIndexInspectionTest, EvictionShowsTheTreeNodeStillCountingTheEntry) {
+    BlockPool pool(2, {1, 1});
+    BoundaryTree tree(BoundaryTree::Config{.prefix_granularity = 8,
+                                           .closed_blocks_per_page = 2,
+                                           .num_state_groups = 0,
+                                           .has_prefix_closed_groups = true,
+                                           .has_host_tier = false,
+                                           .queue_dead_candidates = false},
+                      /*checkpoints=*/nullptr);
+    std::vector<PrefixCacheIndex> indexes;
+    indexes.reserve(2);
+    std::vector<CacheBlockLocation> locations;
+    for (std::uint32_t group = 0; group < 2; ++group) {
+        PrefixCacheIndex& index = indexes.emplace_back(group);
+        index.TrackBoundaries(tree, pool, /*host_pool=*/nullptr, /*state=*/false, /*closed=*/true);
+        CacheBlockRef block = pool.AcquireBlock(group);
+        locations.push_back(block->Location());
+        index.Register(pool, block, CacheKey{.group_id = group, .content_hash = ContentHash{"page"}},
+                       /*access_epoch=*/1,
+                       /*logical_block_index=*/0, CacheBoundaryKind::kChunk, /*newly_cached=*/nullptr,
+                       /*session=*/nullptr);
+    }
+    ASSERT_NE(tree.Find(ContentHash{"page"}), nullptr);
+    ASSERT_EQ(tree.Find(ContentHash{"page"})->Entries(BoundaryTree::kDevice), 2);
+
+    for (std::uint32_t group = 0; group < 2; ++group) {
+        PrefixCacheIndex::EvictableEntry evictable = indexes[group].FindEvictable(pool, locations[group]);
+        ASSERT_TRUE(evictable) << "group " << group;
+        const BoundaryTree::Node* node = evictable.boundary_node();
+        ASSERT_NE(node, nullptr) << "group " << group;
+        EXPECT_EQ(node, tree.Find(evictable.key().content_hash)) << "group " << group;
+        EXPECT_EQ(node->Entries(BoundaryTree::kDevice), 2 - static_cast<std::int32_t>(group)) << "group " << group;
+        indexes[group].Evict(std::move(evictable));
+    }
+    EXPECT_EQ(tree.Find(ContentHash{"page"}), nullptr);
+
+    BlockPool unbound_pool(1, {1});
+    PrefixCacheIndex unbound(kGroupId);
+    const CacheBlockLocation location = Cache(unbound, unbound_pool, "page", /*access_epoch=*/1);
+    PrefixCacheIndex::EvictableEntry evictable = unbound.FindEvictable(unbound_pool, location);
+    ASSERT_TRUE(evictable);
+    EXPECT_EQ(evictable.boundary_node(), nullptr);
+    EXPECT_EQ(unbound.Evict(std::move(evictable)), KeyOf("page"));
+}
+
+TEST(PrefixCacheIndexInspectionTest, PackedLocationsAcrossSegmentsSurviveEvictionAndReuse) {
+    BlockPool pool(600, {2});
+    PrefixCacheIndex index(0);
+    std::vector<CacheBlockLocation> locations;
+    for (int i = 0; i < 1200; ++i) locations.push_back(Cache(index, pool, std::to_string(i), 1));
+    for (int i = 0; i < 1200; i += 2) {
+        EXPECT_EQ(index.Evict(pool, locations[i]), KeyOf(std::to_string(i)));
+        EXPECT_FALSE(index.Contains(pool, locations[i]));
+        EXPECT_EQ(index.KeyOf(pool, locations[i + 1]), KeyOf(std::to_string(i + 1)));
+    }
+    for (int i = 0; i < 600; ++i) {
+        const auto location = Cache(index, pool, "new-" + std::to_string(i), 2);
+        EXPECT_EQ(index.KeyOf(pool, location), KeyOf("new-" + std::to_string(i)));
+    }
+    EXPECT_EQ(index.NumEntries(pool), 1200);
+}
+
+TEST(SegmentedLocationIndex, SparseLargeLocationsAndEmptySegmentsCanBeReused) {
+    SegmentedLocationIndex<int*> index(/*packing=*/64, /*parents=*/10000000, /*empty=*/nullptr);
+    int first = 1, last = 2;
+    const CacheBlockLocation low{1, 0}, high{9000000, 63};
+    index.Set(low, &first);
+    index.Set(high, &last);
+    EXPECT_EQ(index.Find(low), &first);
+    EXPECT_EQ(index.Find(high), &last);
+    EXPECT_EQ(index.Find({0, 0}), nullptr);
+    EXPECT_EQ(index.Find({9000000, 64}), nullptr);
+    EXPECT_EQ(index.Find({10000001, 0}), nullptr);
+    index.Erase(high);
+    EXPECT_EQ(index.Find(high), nullptr);
+    EXPECT_EQ(index.Find(low), &first);
+    index.Set(high, &first);
+    EXPECT_EQ(index.Find(high), &first);
+}
+
+TEST(ContentHash, PreservesOpaqueBytesAndEmptyIdentity) {
+    const std::vector<std::string> text{"",      std::string(64, '0'),   std::string(64, 'a'), std::string(64, 'A'),
+                                        "entry", std::string("a\0b", 3), std::string(63, 'f'), std::string(64, 'x')};
+    std::vector<ContentHash> hashes;
+    for (const auto& value : text) {
+        ContentHash hash(value);
+        EXPECT_EQ(hash.ToString(), value);
+        EXPECT_EQ(hash.empty(), value.empty());
+        hashes.push_back(std::move(hash));
+    }
+    EXPECT_NE(hashes[0], hashes[1]);
+    EXPECT_NE(hashes[2], hashes[3]);
+    for (std::size_t i = 0; i < hashes.size(); ++i) {
+        for (std::size_t j = i + 1; j < hashes.size(); ++j) EXPECT_NE(hashes[i], hashes[j]) << i << " " << j;
+    }
+    EXPECT_EQ(ContentHash(ContentHash::Digest{}), ContentHash(std::string(64, '0')));
+}
+
+TEST(ContentHash, CanonicalTextIsTheDigestFromEveryConstructor) {
+    std::mt19937 random(41);
+    for (int trial = 0; trial < 32; ++trial) {
+        ContentHash::Digest digest;
+        for (auto& byte : digest) byte = static_cast<std::uint8_t>(random());
+        const ContentHash expected(digest);
+        const std::string text = expected.ToString();
+        ASSERT_EQ(text.size(), 64u);
+        EXPECT_TRUE(std::ranges::all_of(text, [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); }));
+        // Characters in an array, as a string literal holds them.
+        char characters[65];
+        std::memcpy(characters, text.c_str(), sizeof(characters));
+        for (const ContentHash& hash : {ContentHash(text), ContentHash(std::string(text)), ContentHash(characters),
+                                        ContentHash(std::string_view(text))}) {
+            EXPECT_EQ(hash, expected);
+            EXPECT_EQ(hash.Hash(), expected.Hash());
+            EXPECT_EQ(hash.ToString(), text);
+            EXPECT_FALSE(hash.empty());
+        }
+    }
+}
+
+TEST(ContentHash, OpaqueKeysKeepTheirBytesAndEquality) {
+    const std::string canonical =
+        ContentHash(ContentHash::Digest{0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef}).ToString();
+    std::string uppercase = canonical;
+    std::ranges::transform(uppercase, uppercase.begin(), [](char c) { return c >= 'a' ? c - 'a' + 'A' : c; });
+    std::string high_bit = canonical;
+    high_bit[5] = static_cast<char>('0' | 0x80);
+    const std::vector<std::string> opaque{"",
+                                          "0",
+                                          canonical.substr(0, 63),
+                                          canonical + "0",
+                                          canonical.substr(0, 62),
+                                          uppercase,
+                                          canonical.substr(0, 63) + "G",
+                                          canonical.substr(0, 63) + "g",
+                                          high_bit,
+                                          std::string(64, '\0'),
+                                          "not a digest"};
+    for (const auto& text : opaque) {
+        for (const ContentHash& hash :
+             {ContentHash(text), ContentHash(std::string(text)), ContentHash(std::string_view(text))}) {
+            EXPECT_EQ(hash.ToString(), text);
+            EXPECT_EQ(hash, ContentHash(text));
+            EXPECT_NE(hash, ContentHash(canonical));
+            EXPECT_EQ(hash.empty(), text.empty());
+        }
+    }
+    EXPECT_NE(ContentHash(uppercase), ContentHash(canonical)) << "uppercase text is not the digest";
+}
+
+TEST(ContentHash, OneChangedCharacterStaysCanonicalExactlyForLowercaseDigits) {
+    const ContentHash::Digest digest{0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54, 0x32, 0x10, 0x0f, 0x1e, 0x2d,
+                                     0x3c, 0x4b, 0x5a, 0x69, 0x78, 0x87, 0x96, 0xa5, 0xb4, 0xc3, 0xd2,
+                                     0xe1, 0xf0, 0x00, 0xff, 0x11, 0xee, 0x22, 0xdd, 0x33, 0xcc};
+    const std::string canonical = ContentHash(digest).ToString();
+    for (std::size_t position = 0; position < canonical.size(); ++position) {
+        for (unsigned value = 0; value < 256; ++value) {
+            auto text = canonical;
+            text[position] = static_cast<char>(value);
+            const ContentHash hash(text);
+            const auto with_nibble = [&](int nibble) {
+                auto changed = digest;
+                auto& byte = changed[position / 2];
+                byte =
+                    static_cast<std::uint8_t>(position % 2 == 0 ? (byte & 0x0f) | nibble << 4 : (byte & 0xf0) | nibble);
+                return changed;
+            };
+            int nibble = -1;
+            if (value >= '0' && value <= '9') nibble = static_cast<int>(value - '0');
+            if (value >= 'a' && value <= 'f') nibble = static_cast<int>(value - 'a' + 10);
+            if (nibble < 0) {
+                // Opaque: it keeps its bytes and equals no digest, not even
+                // the one an uppercase digit would spell.
+                EXPECT_EQ(hash.ToString(), text) << position << " " << value;
+                EXPECT_NE(hash, ContentHash(digest)) << position << " " << value;
+                if (value >= 'A' && value <= 'F') {
+                    EXPECT_NE(hash, ContentHash(with_nibble(static_cast<int>(value - 'A' + 10))))
+                        << position << " " << value;
+                }
+                continue;
+            }
+            const auto changed = with_nibble(nibble);
+            EXPECT_EQ(hash, ContentHash(changed)) << position << " " << value;
+            EXPECT_EQ(hash.Hash(), ContentHash(changed).Hash());
+        }
+    }
+}
+
+TEST(ContentHash, EveryNoncanonicalByteRemainsOpaqueAtEveryPosition) {
+    const std::string canonical(64, 'a');
+    for (std::size_t position = 0; position < canonical.size(); ++position) {
+        for (unsigned byte = 0; byte < 256; ++byte) {
+            auto text = canonical;
+            text[position] = static_cast<char>(byte);
+            EXPECT_EQ(ContentHash(text).ToString(), text);
+        }
+    }
+}
+
+// Indexes the handle of an object that already exists under the object's
+// key; false, leaving the index unchanged, when the key is indexed already.
+template <typename Index, typename Key, typename Handle>
+bool IndexHandle(Index& index, const Key& key, Handle handle) {
+    return index.FindOrInsert(key, [handle] { return handle; }).second;
+}
+
+TEST(FlatPointerIndex, CollidingKeysSurviveGrowthWrappedClustersAndChurn) {
+    struct Entry {
+        int key;
+    };
+    struct KeyOfEntry {
+        const int& operator()(const Entry* entry) const { return entry->key; }
+    };
+    struct CollisionHash {
+        std::size_t operator()(int) const { return 15; }
+    };
+    std::array<Entry, 256> entries;
+    FlatPointerIndex<const Entry*, int, KeyOfEntry, CollisionHash> index{/*empty=*/nullptr};
+    std::map<int, const Entry*> expected;
+    for (int i = 0; i < 256; ++i) {
+        entries[i].key = i;
+        ASSERT_TRUE(IndexHandle(index, entries[i].key, &entries[i]));
+        expected.emplace(i, &entries[i]);
+    }
+    std::mt19937 random(8731);
+    for (int step = 0; step < 4096; ++step) {
+        const int key = random() % entries.size();
+        if (random() % 2) {
+            EXPECT_EQ(IndexHandle(index, key, &entries[key]), expected.emplace(key, &entries[key]).second);
+        } else {
+            const auto found = expected.find(key);
+            const Entry* removed = found == expected.end() ? nullptr : found->second;
+            EXPECT_EQ(index.ExtractObject(key, entries[key]), removed);
+            expected.erase(key);
+        }
+        EXPECT_EQ(index.size(), expected.size());
+        if (step % 31 == 0) {
+            for (int i = 0; i < 256; ++i) {
+                const auto found = expected.find(i);
+                EXPECT_EQ(index.Find(i), found == expected.end() ? nullptr : found->second);
+            }
+        }
+    }
+    for (const auto& [key, entry] : expected) {
+        EXPECT_EQ(index.Find(key), entry);
+        EXPECT_EQ(index.ExtractObject(key, *entry), entry);
+    }
+    EXPECT_TRUE(index.empty());
+    EXPECT_EQ(index.ExtractObject(0, entries[0]), nullptr);
+    EXPECT_TRUE(IndexHandle(index, 0, &entries[0]));
+    EXPECT_EQ(index.Find(0), &entries[0]);
+}
+
+// At every capacity, half the keys are homed at the last slot, a quarter at the
+// one before it and a quarter at slot 3: clusters of equal and of mixed hashes
+// wrap around the end of the table into the keys homed in front of it while
+// the table grows.
+TEST(FlatPointerIndex, ExtractObjectRemovesOnlyThatObjectAmongCollidingKeys) {
+    struct Entry {
+        int key;
+    };
+    struct KeyOfEntry {
+        const int& operator()(const Entry* entry) const { return entry->key; }
+    };
+    struct WrappingHash {
+        std::size_t operator()(int key) const {
+            constexpr std::array<std::size_t, 4> kHomes{~std::size_t{0}, ~std::size_t{0} - 1, ~std::size_t{0}, 3};
+            return kHomes[static_cast<std::size_t>(key) % kHomes.size()];
+        }
+    };
+    using Index = FlatPointerIndex<const Entry*, int, KeyOfEntry, WrappingHash>;
+    std::array<Entry, 300> entries;
+    Index index{/*empty=*/nullptr};
+    const Entry absent{0};
+    EXPECT_EQ(index.ExtractObject(absent.key, absent), nullptr);
+    std::map<int, const Entry*> expected;
+    for (int i = 0; i < 300; ++i) {
+        entries[i].key = i;
+        ASSERT_TRUE(IndexHandle(index, entries[i].key, &entries[i]));
+        expected.emplace(i, &entries[i]);
+    }
+    const auto expect_contents = [&] {
+        ASSERT_EQ(index.size(), expected.size());
+        for (int i = 0; i < 300; ++i) {
+            const auto found = expected.find(i);
+            EXPECT_EQ(index.Find(i), found == expected.end() ? nullptr : found->second) << i;
+        }
+    };
+
+    // An equal key on another object names nothing; the indexed one stays.
+    const Entry impostor{entries[120].key};
+    EXPECT_EQ(index.ExtractObject(impostor.key, impostor), nullptr);
+    expect_contents();
+    // One object out of a cluster of equal hashes, taken from its middle.
+    EXPECT_EQ(index.ExtractObject(entries[120].key, entries[120]), &entries[120]);
+    expected.erase(120);
+    expect_contents();
+    EXPECT_EQ(index.ExtractObject(entries[120].key, entries[120]), nullptr);
+
+    std::mt19937 random(5309);
+    for (int step = 0; step < 6000; ++step) {
+        const int key = static_cast<int>(random() % entries.size());
+        const bool present = expected.contains(key);
+        switch (random() % 3) {
+            case 0:
+                EXPECT_EQ(IndexHandle(index, key, &entries[key]), !present);
+                expected.emplace(key, &entries[key]);
+                break;
+            case 1:
+                EXPECT_EQ(index.ExtractObject(entries[key].key, entries[key]), present ? &entries[key] : nullptr);
+                expected.erase(key);
+                break;
+            default:
+                EXPECT_EQ(index.Find(key), present ? &entries[key] : nullptr);
+                break;
+        }
+        if (step % 97 == 0) expect_contents();
+    }
+    expect_contents();
+    for (const auto& [key, entry] : expected) EXPECT_EQ(index.ExtractObject(key, *entry), entry);
+    EXPECT_TRUE(index.empty());
+}
+
+// The owning list's end() is the empty handle: every handle the index stores,
+// returns or skips over compares against it as an iterator of the same list.
+TEST(FlatPointerIndex, ListIteratorsUseTheListEndForAbsentKeys) {
+    using List = std::list<int>;
+    struct KeyOfNode {
+        const int& operator()(List::iterator node) const { return *node; }
+    };
+    struct ShortHash {
+        std::size_t operator()(int key) const { return static_cast<std::size_t>(key % 5); }
+    };
+    List nodes;
+    FlatPointerIndex<List::iterator, int, KeyOfNode, ShortHash> index{nodes.end()};
+    EXPECT_EQ(index.Find(3), nodes.end());
+    for (int key = 0; key < 40; ++key) {
+        nodes.push_back(key);
+        ASSERT_TRUE(IndexHandle(index, key, std::prev(nodes.end())));
+    }
+    EXPECT_EQ(index.Find(40), nodes.end());
+    for (auto node = nodes.begin(); node != nodes.end();) {
+        if (*node % 3 == 0) {
+            EXPECT_EQ(index.ExtractObject(*node, *node), node);
+            node = nodes.erase(node);
+        } else {
+            ++node;
+        }
+    }
+    for (int key = 0; key < 40; ++key) {
+        const auto node = index.Find(key);
+        if (key % 3 == 0) {
+            EXPECT_EQ(node, nodes.end()) << key;
+        } else {
+            ASSERT_NE(node, nodes.end()) << key;
+            EXPECT_EQ(*node, key);
+        }
+    }
+}
+
+// FindOrInsert creates an object only for an absent key. A creation that
+// throws, also right after the table grew for it, leaves every handle as it
+// was.
+TEST(FlatPointerIndex, FindOrInsertCreatesOnlyAbsentKeysAndSurvivesAThrowingCreation) {
+    using List = std::list<int>;
+    struct KeyOfNode {
+        const int& operator()(List::iterator node) const { return *node; }
+    };
+    struct ShortHash {
+        std::size_t operator()(int key) const { return static_cast<std::size_t>(key % 7); }
+    };
+    List nodes;
+    FlatPointerIndex<List::iterator, int, KeyOfNode, ShortHash> index{nodes.end()};
+    int created = 0;
+    const auto create = [&](int key) {
+        return [&nodes, &created, key] {
+            ++created;
+            return nodes.insert(nodes.end(), key);
+        };
+    };
+    for (int key = 0; key < 100; ++key) {
+        const auto [node, inserted] = index.FindOrInsert(key, create(key));
+        EXPECT_TRUE(inserted);
+        EXPECT_EQ(*node, key);
+        const auto [again, inserted_again] = index.FindOrInsert(key, create(key));
+        EXPECT_FALSE(inserted_again);
+        EXPECT_EQ(again, node);
+        EXPECT_THROW(index.FindOrInsert(-1 - key, []() -> List::iterator { throw std::runtime_error("no node"); }),
+                     std::runtime_error);
+        EXPECT_EQ(index.size(), static_cast<std::size_t>(key + 1));
+        EXPECT_EQ(index.Find(-1 - key), nodes.end());
+    }
+    EXPECT_EQ(created, 100);
+    for (auto node = nodes.begin(); node != nodes.end(); ++node) {
+        EXPECT_EQ(index.Find(*node), node) << *node;
+    }
+}
+
+TEST(PrefixCacheIndexInspectionTest, CompleteDigestIdentitySurvivesCommonLeadingBytes) {
+    BlockPool pool(32, {1});
+    PrefixCacheIndex index(0);
+    std::vector<CacheBlockLocation> locations;
+    for (int i = 0; i < 16; ++i) {
+        std::string hash(64, '0');
+        hash.back() = "0123456789abcdef"[i];
+        locations.push_back(Cache(index, pool, hash, i + 1));
+    }
+    for (int i = 15; i >= 0; --i) {
+        std::string hash(64, '0');
+        hash.back() = "0123456789abcdef"[i];
+        EXPECT_EQ(index.KeyOf(pool, locations[i]), KeyOf(hash));
+        EXPECT_EQ(index.Evict(pool, locations[i]), KeyOf(hash));
+        EXPECT_FALSE(index.Contains(pool, KeyOf(hash)));
+    }
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 32);
+}
+
 TEST(PrefixCacheIndexInspectionTest, LongDigestsKeepNamespacesAndOffsetsDistinctAfterEviction) {
     constexpr std::int32_t count = 128;
     BlockPool pool(count, {1});
@@ -128,7 +668,7 @@ TEST(PrefixCacheIndexInspectionTest, LongDigestsKeepNamespacesAndOffsetsDistinct
         digest.back() = "0123456789abcdef"[i / 8];
         keys.push_back(CacheKey{.namespace_id = static_cast<CacheNamespaceId>(i % 2),
                                 .group_id = kGroupId,
-                                .content_hash = std::move(digest),
+                                .content_hash = ContentHash{std::move(digest)},
                                 .page_offset = (i / 2) % 4});
         CacheBlockRef block = pool.AcquireBlock(kGroupId);
         ASSERT_TRUE(block);
@@ -142,7 +682,7 @@ TEST(PrefixCacheIndexInspectionTest, LongDigestsKeepNamespacesAndOffsetsDistinct
         const auto entry = index.Inspect(pool, keys[i]);
         ASSERT_TRUE(entry);
         EXPECT_EQ(entry->location, locations[i]);
-        EXPECT_EQ(entry->metadata.logical_block_index, i);
+        EXPECT_EQ(entry->metadata.eviction.logical_block_index, i);
         CacheKey missing = keys[i];
         missing.namespace_id += 2;
         EXPECT_FALSE(index.Contains(pool, missing));
@@ -150,7 +690,9 @@ TEST(PrefixCacheIndexInspectionTest, LongDigestsKeepNamespacesAndOffsetsDistinct
         missing.page_offset += 4;
         EXPECT_FALSE(index.Contains(pool, missing));
         missing = keys[i];
-        missing.content_hash.front() = 'b';
+        auto missing_hash = missing.content_hash.ToString();
+        missing_hash.front() = 'b';
+        missing.content_hash = ContentHash{std::move(missing_hash)};
         EXPECT_FALSE(index.Contains(pool, missing));
     }
 
@@ -298,6 +840,10 @@ TEST(PrefixCacheIndexEvictionOrderTest, RepeatedOwnershipAndEpochChangesMatchFul
         const auto key = KeyOf(std::to_string(slot));
         if (pins[slot]) {
             pins[slot].reset();
+        } else if (iteration % 2 == 0) {
+            auto match = index.AcquireMatched(pool, std::vector<CacheKey>{key}, 0, GroupPrefixProbe{.hits = {1}},
+                                              random() % 13, nullptr);
+            pins[slot] = std::move(match.blocks.front());
         } else {
             pins[slot] = index.Find(pool, key);
         }
@@ -397,6 +943,47 @@ TEST(PrefixCacheIndexEvictionOrderTest, SkipsKnownPinnedEpochsUntilTheirOwnersRe
     EXPECT_EQ(DrainEvictionOrder(index, pool), (std::vector<CacheBlockLocation>{held, other}));
 }
 
+TEST(PrefixCacheIndexEvictionOrderTest, AnEpochBatchRanksAMovedEntryAtItsNewLocationWithoutHoldingItsSession) {
+    BlockPool pool(4, {1});
+    PrefixCacheIndex index(kGroupId);
+    const auto session = std::make_shared<SessionCacheTag>();
+    CacheBlockRef block = pool.AcquireBlock(kGroupId);
+    const CacheBlockLocation from = block->Location();
+    index.Register(pool, block, KeyOf("moved"), /*access_epoch=*/5, /*logical_block_index=*/3,
+                   CacheBoundaryKind::kEndpoint, /*newly_cached=*/nullptr, session);
+    block.reset();
+    const CacheBlockLocation older = Cache(index, pool, "older", /*access_epoch=*/2);
+    // Acquired at a newer epoch and released, then moved while no traversal
+    // has set it aside: its order node is re-keyed in the live order.
+    index.AcquireMatched(pool, std::vector<CacheKey>{KeyOf("moved")}, 0, GroupPrefixProbe{.hits = {1}},
+                         /*access_epoch=*/7, session);
+    CacheBlockRef copy = pool.AcquireBlock(kGroupId);
+    const CacheBlockLocation to = copy->Location();
+    index.Relocate(pool, from, copy);
+    copy.reset();
+    ASSERT_FALSE(pool.IsOccupied(from));
+
+    const long session_owners = session.use_count();
+    PrefixCacheIndex::EvictionCursor cursor;
+    std::vector<PrefixCacheIndex::EvictionCandidate> batch;
+    ASSERT_TRUE(index.NextEvictionEpoch(pool, cursor, std::numeric_limits<std::uint64_t>::max(), batch));
+    ASSERT_EQ(batch.size(), 1u);
+    EXPECT_EQ(batch[0].location, older);
+    EXPECT_EQ(batch[0].metadata.last_access_epoch, 2u);
+    EXPECT_EQ(batch[0].metadata.logical_block_index, -1);
+    EXPECT_FALSE(batch[0].metadata.was_acquired);
+    ASSERT_TRUE(index.NextEvictionEpoch(pool, cursor, std::numeric_limits<std::uint64_t>::max(), batch));
+    ASSERT_EQ(batch.size(), 2u);
+    EXPECT_EQ(batch[1].location, to);
+    EXPECT_EQ(batch[1].metadata.last_access_epoch, 7u);
+    EXPECT_EQ(batch[1].metadata.logical_block_index, 3);
+    EXPECT_EQ(batch[1].metadata.boundary_kind, CacheBoundaryKind::kEndpoint);
+    EXPECT_TRUE(batch[1].metadata.was_acquired);
+    EXPECT_EQ(session.use_count(), session_owners) << "a retained batch keeps no session alive";
+    EXPECT_EQ(index.MetadataFor(pool, to)->session, session);
+    EXPECT_EQ(index.Evict(pool, to), KeyOf("moved"));
+}
+
 TEST(PrefixCacheIndexCommonOrderTest, TracksBothTiersAndUsesOnlySourceRecency) {
     BlockPool source(4, {1});
     BlockPool peer(4, {1});
@@ -410,7 +997,7 @@ TEST(PrefixCacheIndexCommonOrderTest, TracksBothTiersAndUsesOnlySourceRecency) {
         std::vector<std::string> keys;
         PrefixCacheIndex::CommonCursor cursor;
         while (const auto entry = index.NextCommonRecentEntry(source, cursor)) {
-            keys.push_back(entry->key->content_hash);
+            keys.push_back(entry->key->content_hash.ToString());
         }
         return keys;
     };
@@ -471,8 +1058,8 @@ TEST(PrefixCacheIndexCommonOrderTest, KeepsEvictionAndCommonOrderCurrentWhenPinn
         ASSERT_TRUE(first);
         ASSERT_TRUE(second);
         EXPECT_EQ(*first->key, KeyOf("held"));
-        EXPECT_EQ(first->source.metadata.last_access_epoch, 9u);
-        EXPECT_EQ(first->peer.metadata.last_access_epoch, 40u);
+        EXPECT_EQ(first->source.metadata.eviction.last_access_epoch, 9u);
+        EXPECT_EQ(first->peer.metadata.eviction.last_access_epoch, 40u);
         EXPECT_TRUE(first->source.pinned);
         EXPECT_FALSE(first->peer.pinned);
         EXPECT_EQ(*second->key, KeyOf("other"));
@@ -495,7 +1082,7 @@ TEST(PrefixCacheIndexCommonOrderTest, KeepsEvictionAndCommonOrderCurrentWhenPinn
     ASSERT_TRUE(second);
     EXPECT_EQ(*first->key, KeyOf("other"));
     EXPECT_EQ(*second->key, KeyOf("held"));
-    EXPECT_EQ(second->source.metadata.last_access_epoch, 0u);
+    EXPECT_EQ(second->source.metadata.eviction.last_access_epoch, 0u);
     EXPECT_FALSE(second->source.pinned);
     EXPECT_FALSE(index.NextCommonRecentEntry(source, cursor));
 }
@@ -521,7 +1108,7 @@ TEST(PrefixCacheIndexCommonOrderTest, KeepsTheCommonOrderCurrentWhenAnEntryMoves
         ASSERT_TRUE(common);
         EXPECT_EQ(*common->key, KeyOf("moved"));
         EXPECT_EQ(common->source.location, to);
-        EXPECT_EQ(common->source.metadata.last_access_epoch, 4u);
+        EXPECT_EQ(common->source.metadata.eviction.last_access_epoch, 4u);
         EXPECT_TRUE(common->source.pinned);
         EXPECT_FALSE(index.NextCommonRecentEntry(source, cursor));
     }
@@ -541,19 +1128,19 @@ TEST(PrefixCacheIndexSnapshotTest, VisitsBothOwnershipKindsWithoutTouchingOrPinn
     CacheBlockRef pin = index.Find(pool, KeyOf("held"));
     std::vector<std::string> seen;
     index.ForEachEntry(pool, [&](const CacheKey& key, const PrefixCacheIndex::CachedBlockSnapshot& entry) {
-        seen.push_back(key.content_hash);
+        seen.push_back(key.content_hash.ToString());
         EXPECT_EQ(entry.pinned, key == KeyOf("held"));
-        EXPECT_FALSE(entry.metadata.was_acquired);
+        EXPECT_FALSE(entry.metadata.eviction.was_acquired);
         if (key == KeyOf("old")) {
             EXPECT_EQ(entry.location, old);
-            EXPECT_EQ(entry.metadata.last_access_epoch, 0u);
+            EXPECT_EQ(entry.metadata.eviction.last_access_epoch, 0u);
         } else if (key == KeyOf("held")) {
             EXPECT_EQ(entry.location, held);
-            EXPECT_EQ(entry.metadata.last_access_epoch, 6u);
+            EXPECT_EQ(entry.metadata.eviction.last_access_epoch, 6u);
         } else {
             EXPECT_EQ(key, KeyOf("recent"));
             EXPECT_EQ(entry.location, recent);
-            EXPECT_EQ(entry.metadata.last_access_epoch, 9u);
+            EXPECT_EQ(entry.metadata.eviction.last_access_epoch, 9u);
         }
     });
     std::ranges::sort(seen);
@@ -569,7 +1156,7 @@ TEST(PrefixCacheIndexSnapshotTest, VisitsBothOwnershipKindsWithoutTouchingOrPinn
     index.ForEachEntry(pool, [&](const CacheKey& key, const PrefixCacheIndex::CachedBlockSnapshot& entry) {
         EXPECT_FALSE(entry.pinned);
         if (key == KeyOf("held")) {
-            EXPECT_EQ(entry.metadata.last_access_epoch, 10u);
+            EXPECT_EQ(entry.metadata.eviction.last_access_epoch, 10u);
         }
     });
     EXPECT_EQ(index.Evict(pool, old), KeyOf("old"));
@@ -652,6 +1239,169 @@ TEST(PrefixCacheIndexEvictionOrderTest, AcquiringAMatchMovesTheEntryToTheRequest
     EXPECT_EQ(DrainEvictionOrder(index, pool), (std::vector<CacheBlockLocation>{untouched, matched}));
 }
 
+// Hits re-keyed to a new epoch, and entries published under it, append at
+// the end of the order and become its insertion hint. The order stays exact
+// when that last entry leaves it right away (re-keyed again, evicted, or set
+// aside by a traversal while pinned), and when appends and restores follow.
+TEST(PrefixCacheIndexEvictionOrderTest, AppendsAtTheNewestEpochAndRemovesTheLastEntry) {
+    BlockPool pool(10, {1});
+    PrefixCacheIndex index(kGroupId);
+    std::vector<CacheBlockLocation> cached;
+    std::vector<CacheKey> keys;
+    for (int i = 0; i < 6; ++i) {
+        cached.push_back(Cache(index, pool, std::to_string(i), /*access_epoch=*/1 + i));
+        keys.push_back(KeyOf(std::to_string(i)));
+    }
+    for (int i = 0; i < 4; ++i) {
+        index.AcquireMatched(pool, std::vector<CacheKey>{keys[i]}, /*begin_blocks=*/0, GroupPrefixProbe{.hits = {1}},
+                             /*access_epoch=*/10 + i, /*session=*/nullptr);
+    }
+    EXPECT_EQ(DrainEvictionOrder(index, pool),
+              (std::vector<CacheBlockLocation>{cached[4], cached[5], cached[0], cached[1], cached[2], cached[3]}));
+
+    index.AcquireMatched(pool, std::vector<CacheKey>{keys[3]}, 0, GroupPrefixProbe{.hits = {1}}, 20, nullptr);
+    const CacheBlockLocation evicted = Cache(index, pool, "evicted", 30);
+    ASSERT_TRUE(index.Evict(pool, evicted));
+    const CacheBlockLocation mid = Cache(index, pool, "mid", 15);
+    EXPECT_EQ(DrainEvictionOrder(index, pool),
+              (std::vector<CacheBlockLocation>{cached[4], cached[5], cached[0], cached[1], cached[2], mid, cached[3]}));
+
+    const CacheBlockLocation pinned = Cache(index, pool, "pinned", 40);
+    CacheBlockRef pin = index.Find(pool, KeyOf("pinned"));
+    EXPECT_EQ(DrainEvictionOrder(index, pool),
+              (std::vector<CacheBlockLocation>{cached[4], cached[5], cached[0], cached[1], cached[2], mid, cached[3]}));
+    const CacheBlockLocation before_pinned = Cache(index, pool, "before-pinned", 35);
+    const CacheBlockLocation appended = Cache(index, pool, "appended", 50);
+    pin.reset();
+    const std::vector<CacheBlockLocation> order = DrainEvictionOrder(index, pool);
+    EXPECT_EQ(order, (std::vector<CacheBlockLocation>{cached[4], cached[5], cached[0], cached[1], cached[2], mid,
+                                                      cached[3], before_pinned, pinned, appended}));
+
+    for (const CacheBlockLocation location : order) {
+        ASSERT_TRUE(index.Evict(pool, location));
+    }
+    EXPECT_EQ(index.NumEntries(pool), 0);
+    EXPECT_EQ(index.PotentiallyEvictableEntries(pool), 0u);
+}
+
+// Pages freed suffix first are reused, and published, in descending location
+// order: each lands just before the previous one, inside the order or at its
+// end.
+TEST(PrefixCacheIndexEvictionOrderTest, PublishingInDescendingLocationOrderKeepsTheOrder) {
+    BlockPool pool(10, {1});
+    PrefixCacheIndex index(kGroupId);
+    const CacheBlockLocation oldest = Cache(index, pool, "oldest", /*access_epoch=*/1);
+    const CacheBlockLocation newest = Cache(index, pool, "newest", /*access_epoch=*/9);
+    std::vector<CacheBlockRef> blocks;
+    for (int i = 0; i < 8; ++i) {
+        blocks.push_back(pool.AcquireBlock(kGroupId));
+    }
+    std::ranges::sort(blocks, {}, [](const CacheBlockRef& block) {
+        const CacheBlockLocation location = block->Location();
+        return std::pair{location.lcm_block_id, location.slot_index};
+    });
+    std::vector<CacheBlockLocation> locations;
+    for (const CacheBlockRef& block : blocks) {
+        locations.push_back(block->Location());
+    }
+    for (int i = 7; i >= 0; --i) {
+        index.Register(pool, blocks[i], KeyOf(std::to_string(i)), /*access_epoch=*/i < 4 ? 5 : 10,
+                       /*logical_block_index=*/i, CacheBoundaryKind::kChunk, /*newly_cached=*/nullptr,
+                       /*session=*/nullptr);
+    }
+    blocks.clear();
+
+    EXPECT_EQ(DrainEvictionOrder(index, pool),
+              (std::vector<CacheBlockLocation>{oldest, locations[0], locations[1], locations[2], locations[3], newest,
+                                               locations[4], locations[5], locations[6], locations[7]}));
+}
+
+TEST(PrefixCacheIndexEvictionOrderTest, AcquiredOwnersRestoreOrderOnLastReleaseAndUnwind) {
+    BlockPool pool(3, {1});
+    PrefixCacheIndex index(kGroupId);
+    const auto hit = Cache(index, pool, "hit", 10);
+    const auto other = Cache(index, pool, "other", 20);
+    const std::vector<CacheKey> keys{KeyOf("hit")};
+    const GroupPrefixProbe probe{.hits = {1}};
+    CacheBlockRef retained;
+    try {
+        auto match = index.AcquireMatched(pool, keys, 0, probe, 40, nullptr);
+        retained = match.blocks.front();
+        EXPECT_FALSE(index.Evict(pool, hit));
+        auto older = index.AcquireMatched(pool, keys, 0, probe, 5, nullptr);
+        throw 7;
+    } catch (int) {
+    }
+    EXPECT_EQ(DrainEvictionOrder(index, pool), (std::vector<CacheBlockLocation>{other}));
+    retained.reset();
+    EXPECT_EQ(DrainEvictionOrder(index, pool), (std::vector<CacheBlockLocation>{hit, other}));
+    EXPECT_EQ(index.Evict(pool, hit), KeyOf("hit"));
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 2);
+}
+
+TEST(PrefixCacheIndexEvictionOrderTest, DestroyingIndexCancelsAnAcquiredOwnersNotification) {
+    BlockPool pool(1, {1});
+    PrefixMatch match;
+    {
+        PrefixCacheIndex index(kGroupId);
+        Cache(index, pool, "hit", 10);
+        match = index.AcquireMatched(pool, std::vector<CacheKey>{KeyOf("hit")}, 0, GroupPrefixProbe{.hits = {1}}, 20,
+                                     nullptr);
+        EXPECT_EQ(match.blocks.front().use_count(), 2);
+        EXPECT_TRUE(DrainEvictionOrder(index, pool).empty());
+    }
+    EXPECT_EQ(match.blocks.front().use_count(), 1);
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 0);
+    match.blocks.clear();
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 1);
+}
+
+TEST(PrefixCacheIndexInspectionTest, ProbeLocationsRecheckIdentityAfterSlotReuse) {
+    BlockPool pool(2, {1});
+    PrefixCacheIndex index(kGroupId);
+    const auto original = Cache(index, pool, "hit", 10);
+    const auto other = Cache(index, pool, "other", 20);
+    const std::vector<CacheKey> keys{KeyOf("unused"), KeyOf("hit")};
+    FullAttnMatcher matcher;
+    const auto probe = matcher.Probe(index, pool, keys, 1, 2, nullptr);
+    ASSERT_EQ(probe.hits, (std::vector<std::uint8_t>{1}));
+    // A probe is non-owning: it neither prevents eviction nor keeps the old
+    // control object alive when the location is reused for another identity.
+    ASSERT_TRUE(index.Evict(pool, original));
+    EXPECT_EQ(Cache(index, pool, "replacement", 30), original);
+    ASSERT_TRUE(index.Evict(pool, other));
+    EXPECT_EQ(Cache(index, pool, "hit", 40), other);
+    EXPECT_EQ(index.MatchedLocations(pool, keys, 1, probe), (std::vector<CacheBlockLocation>{other}));
+    auto match = index.AcquireMatched(pool, keys, 1, probe, 50, nullptr);
+    ASSERT_EQ(match.blocks.size(), 1u);
+    EXPECT_EQ(match.blocks.front()->Location(), other);
+    EXPECT_FALSE(index.Evict(pool, other));
+    match.blocks.clear();
+    EXPECT_EQ(index.Evict(pool, other), KeyOf("hit"));
+}
+
+TEST(PrefixCacheIndexInspectionTest, ProbeLocationsDoNotConfusePoolsOrRelocatedEntries) {
+    BlockPool device(3, {1});
+    BlockPool host(3, {1});
+    PrefixCacheIndex index(kGroupId);
+    const auto from = Cache(index, device, "hit", 10);
+    Cache(index, host, "other", 10);
+    const auto host_hit = Cache(index, host, "hit", 20);
+    const std::vector<CacheKey> keys{KeyOf("hit")};
+    FullAttnMatcher matcher;
+    const auto probe = matcher.Probe(index, device, keys, 0, 1, nullptr);
+    auto copy = device.AcquireBlock(kGroupId);
+    const auto to = copy->Location();
+    index.Relocate(device, from, copy);
+    copy.reset();
+    EXPECT_EQ(index.MatchedLocations(device, keys, 0, probe), (std::vector<CacheBlockLocation>{to}));
+    EXPECT_EQ(index.MatchedLocations(host, keys, 0, probe), (std::vector<CacheBlockLocation>{host_hit}));
+    auto match = index.AcquireMatched(host, keys, 0, probe, 30, nullptr);
+    ASSERT_EQ(match.blocks.size(), 1u);
+    EXPECT_TRUE(match.blocks.front().IsOwnedBy(host));
+    EXPECT_EQ(match.blocks.front()->Location(), host_hit);
+}
+
 TEST(PrefixCacheIndexEvictionOrderTest, EvictedEntriesLeaveTheOrder) {
     BlockPool pool(3, {1});
     PrefixCacheIndex index(kGroupId);
@@ -686,7 +1436,7 @@ TEST(PrefixCacheIndexEvictionOrderTest, RelocatesAnEntryOntoItsCopyWithItsAgePin
     const CacheBlockLocation from = Cache(index, pool, "moved", /*access_epoch=*/10);
     const CacheBlockLocation other = Cache(index, pool, "other", /*access_epoch=*/20);
     publication.reset();
-    const BoundaryTree::Node* node = tree.Find("moved");
+    const BoundaryTree::Node* node = tree.Find(ContentHash{"moved"});
     ASSERT_NE(node, nullptr);
     ASSERT_EQ(node->boundary_tokens, 8);
 
@@ -707,10 +1457,10 @@ TEST(PrefixCacheIndexEvictionOrderTest, RelocatesAnEntryOntoItsCopyWithItsAgePin
     const auto moved = index.Inspect(pool, KeyOf("moved"));
     ASSERT_TRUE(moved);
     EXPECT_EQ(moved->location, to);
-    EXPECT_EQ(moved->metadata.last_access_epoch, 10u);
-    EXPECT_TRUE(moved->metadata.was_acquired);
+    EXPECT_EQ(moved->metadata.eviction.last_access_epoch, 10u);
+    EXPECT_TRUE(moved->metadata.eviction.was_acquired);
     EXPECT_TRUE(moved->pinned);
-    EXPECT_EQ(tree.Find("moved"), node);
+    EXPECT_EQ(tree.Find(ContentHash{"moved"}), node);
     EXPECT_EQ(node->Entries(BoundaryTree::kDevice), 1);
     EXPECT_EQ(node->boundary_tokens, 8);
     // Set aside while pinned; back in age order, at the new location, once
@@ -719,7 +1469,7 @@ TEST(PrefixCacheIndexEvictionOrderTest, RelocatesAnEntryOntoItsCopyWithItsAgePin
     pin.reset();
     EXPECT_EQ(DrainEvictionOrder(index, pool), (std::vector<CacheBlockLocation>{to, other}));
     EXPECT_EQ(index.Evict(pool, to), KeyOf("moved"));
-    EXPECT_EQ(tree.Find("moved"), nullptr);
+    EXPECT_EQ(tree.Find(ContentHash{"moved"}), nullptr);
 }
 
 TEST(PrefixCacheIndexEvictionOrderTest, MatchesTheEvictableSetSeenByAFullScan) {
@@ -794,10 +1544,10 @@ TEST(PrefixCacheSessionTest, TouchExistingMergesOwnershipBeforeRefreshingDemoted
             ASSERT_TRUE(entry);
             EXPECT_FALSE(entry->pinned);
             EXPECT_EQ(entry->metadata.session, visitor == owner ? owner : nullptr);
-            EXPECT_EQ(entry->metadata.last_access_epoch, demoted && visitor == owner ? 0u : 20u);
+            EXPECT_EQ(entry->metadata.eviction.last_access_epoch, demoted && visitor == owner ? 0u : 20u);
             EXPECT_EQ(index.DemoteSession(host, owner), !demoted && visitor == owner ? 1u : 0u);
             if (visitor != owner) {
-                EXPECT_EQ(index.Inspect(host, keys[0])->metadata.last_access_epoch, 20u);
+                EXPECT_EQ(index.Inspect(host, keys[0])->metadata.eviction.last_access_epoch, 20u);
             }
         }
     }
@@ -820,15 +1570,15 @@ TEST(PrefixCacheSessionTest, TouchExistingKeepsNewerEpochsAndDoesNotInsertPinOrT
     const auto skipped = index.Inspect(host, keys[1]);
     ASSERT_TRUE(present);
     ASSERT_TRUE(skipped);
-    EXPECT_EQ(present->metadata.last_access_epoch, 30u);
+    EXPECT_EQ(present->metadata.eviction.last_access_epoch, 30u);
     EXPECT_FALSE(present->metadata.session);
-    EXPECT_EQ(skipped->metadata.last_access_epoch, 30u);
+    EXPECT_EQ(skipped->metadata.eviction.last_access_epoch, 30u);
     EXPECT_EQ(skipped->metadata.session, owner);
     EXPECT_FALSE(index.Contains(host, keys[2]));
     EXPECT_EQ(host.NumEmptyLcmBlocks(), 1);
     EXPECT_FALSE(present->pinned);
     EXPECT_FALSE(skipped->pinned);
-    EXPECT_FALSE(present->metadata.was_acquired);
+    EXPECT_FALSE(present->metadata.eviction.was_acquired);
     EXPECT_EQ(sources[0].use_count(), 1);
     EXPECT_EQ(sources[2].use_count(), 1);
 }
@@ -859,10 +1609,10 @@ TEST(PrefixCacheSessionTest, DemotionAgesExclusiveIdleBlocksButProtectsSharedAnd
     other = {};
     first->demoted = true;
     EXPECT_EQ(index.DemoteSession(pool, first), 1u);
-    EXPECT_EQ(index.MetadataFor(pool, exclusive_location)->last_access_epoch, 0u);
-    EXPECT_EQ(index.MetadataFor(pool, shared_location)->last_access_epoch, 40u);
-    EXPECT_EQ(index.MetadataFor(pool, active_location)->last_access_epoch, 50u);
-    EXPECT_EQ(index.MetadataFor(pool, other_location)->last_access_epoch, 10u);
+    EXPECT_EQ(index.MetadataFor(pool, exclusive_location)->eviction.last_access_epoch, 0u);
+    EXPECT_EQ(index.MetadataFor(pool, shared_location)->eviction.last_access_epoch, 40u);
+    EXPECT_EQ(index.MetadataFor(pool, active_location)->eviction.last_access_epoch, 50u);
+    EXPECT_EQ(index.MetadataFor(pool, other_location)->eviction.last_access_epoch, 10u);
     EXPECT_EQ(DrainEvictionOrder(index, pool),
               (std::vector<CacheBlockLocation>{exclusive_location, other_location, shared_location}));
     EXPECT_FALSE(index.Evict(pool, active_location).has_value());
@@ -873,7 +1623,7 @@ TEST(PrefixCacheSessionTest, DemotionAgesExclusiveIdleBlocksButProtectsSharedAnd
     first->demoted = false;
     auto hit = index.AcquireMatched(pool, std::vector<CacheKey>{KeyOf("exclusive")}, 0, GroupPrefixProbe{.hits = {1}},
                                     60, first);
-    EXPECT_EQ(index.MetadataFor(pool, exclusive_location)->last_access_epoch, 60u);
+    EXPECT_EQ(index.MetadataFor(pool, exclusive_location)->eviction.last_access_epoch, 60u);
     hit.blocks.clear();
     EXPECT_EQ(DrainEvictionOrder(index, pool),
               (std::vector<CacheBlockLocation>{active_location, other_location, shared_location, exclusive_location}));

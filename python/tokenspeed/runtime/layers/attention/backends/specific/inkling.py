@@ -56,6 +56,7 @@ import torch
 from tokenspeed_kernel.ops.attention.rmha import (
     rel_mha_decode_with_kvcache,
     rel_mha_extend_with_kvcache,
+    rel_mha_gate_sink,
     rel_mha_plan,
     rel_mha_prefill,
 )
@@ -82,6 +83,7 @@ from tokenspeed.runtime.layers.attention.configs.base import SoftmaxAttnConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.inkling import (
     HIDDENCONV_GROUP_ID,
     KVCONV_GROUP_ID,
+    inkling_kv_dequant_scratch_shape,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     STATE_INPUT_SLOT,
@@ -98,6 +100,88 @@ logger = logging.getLogger(__name__)
 
 # Matches the runtime causal_conv1d kernels' padded-slot sentinel.
 PAD_SLOT_ID = -1
+
+
+def rel_mha_extend_mxfp8(
+    leaf,
+    layer,
+    token_to_kv_pool,
+    scratch: tuple[torch.Tensor, torch.Tensor],
+    q: torch.Tensor,
+    rel_logits: torch.Tensor,
+    tau: torch.Tensor | None,
+    *,
+    output_dtype: torch.dtype | None,
+    return_lse: bool,
+):
+    """``rel_mha_extend_with_kvcache`` over an MXFP8 KV cache.
+
+    The extend kernel reads BF16 pages, so each group of requests first has
+    the pages it reads dequantized into ``scratch`` (``[rows, width]`` BF16
+    key and value buffers, ``inkling_kv_dequant_scratch_shape``), then runs
+    the kernel on its query rows. A group holds as many requests as fit
+    when each is as long as the batch's longest. ``leaf`` is the layer's
+    paged MHA backend with its extend metadata; rows past the batch's last
+    query (padding) are zero.
+    """
+    metadata = leaf.forward_extend_metadata
+    kp = leaf.kernel_page_size
+    cu_q, cu_kv = metadata.cu_extend_seq_lens, metadata.cu_seqlens_kv
+    cu_q_cpu = metadata.cu_extend_seq_lens_cpu
+    num_reqs = len(cu_q_cpu) - 1
+    longest_pages = max(1, -(-metadata.max_seqlen_k // kp))
+    per_group = (scratch[0].shape[0] // kp) // longest_pages
+    if per_group == 0:
+        raise ValueError(
+            f"a {metadata.max_seqlen_k}-token request does not fit the "
+            f"{scratch[0].shape[0]}-token MXFP8 KV dequant scratch"
+        )
+    query_lens = cu_q[1:] - cu_q[:-1]
+    whole = per_group >= num_reqs
+    parts = []
+    for first in range(0, num_reqs, per_group):
+        last = min(first + per_group, num_reqs)
+        reqs = slice(None) if whole else slice(first, last)
+        rows = slice(None) if whole else slice(cu_q_cpu[first], cu_q_cpu[last])
+        k_cache, v_cache, page_table = token_to_kv_pool.dequant_kv_view(
+            layer.layer_id,
+            metadata.page_table[reqs],
+            metadata.seq_lens[reqs],
+            query_lens[reqs],
+            layer.sliding_window_size,
+            kp,
+            scratch=scratch,
+        )
+        parts.append(
+            rel_mha_extend_with_kvcache(
+                q=q[rows],
+                cu_seqlens_q=cu_q if whole else cu_q[first : last + 1] - cu_q[first],
+                cu_seqlens_kv=(
+                    cu_kv if whole else cu_kv[first : last + 1] - cu_kv[first]
+                ),
+                k_cache=k_cache,
+                v_cache=v_cache,
+                page_table=page_table,
+                cache_seqlens=metadata.seq_lens[reqs],
+                max_seqlen_q=metadata.max_extend_seq_len,
+                max_seqlen_k=leaf.max_context_len,
+                rel_logits=rel_logits[rows],
+                window_left=layer.sliding_window_size,
+                softmax_scale=layer.scaling,
+                tau=None if tau is None else tau[rows],
+                solution=leaf.kernel_solution,
+                output_dtype=output_dtype,
+                return_lse=return_lse,
+            )
+        )
+    if whole:
+        return parts[0]
+    results = []
+    for pieces in zip(*parts) if return_lse else (parts,):
+        full = pieces[0].new_zeros((q.shape[0], *pieces[0].shape[1:]))
+        torch.cat(pieces, out=full[: cu_q_cpu[num_reqs]])
+        results.append(full)
+    return tuple(results) if return_lse else results[0]
 
 
 @dataclass
@@ -135,6 +219,9 @@ class InklingConvMetadata:
     # Checkpoint groups: per-group two-slot tables {group: [bs, >= 2]},
     # populated by every metadata build.
     col_block_table: dict[str, torch.Tensor] | None = None
+    # Decode metadata: ``[groups, bs]`` live blocks in ``col_block_table``'s
+    # group order, the tables the post-verify commit publishes into.
+    col_live_pages: torch.Tensor | None = None
 
 
 class InklingConvStatePool:
@@ -254,11 +341,28 @@ class InklingAttnBackend(AttentionBackend):
             f"layers x {attn_config.max_bs + 2:d} slots, "
             f"{conv_pool.mem_usage_bytes() / (1 << 20):.1f} MiB",
         )
+        kv_dequant_scratch = None
+        shape = (
+            None
+            if is_draft
+            else inkling_kv_dequant_scratch_shape(text_config, attn_config)
+        )
+        if shape is not None:
+            rows, width = shape
+            k = torch.zeros(
+                rows, width, dtype=torch.bfloat16, device=attn_config.device
+            )
+            kv_dequant_scratch = (k, torch.zeros_like(k))
+            logger.info(
+                f"Inkling MXFP8 KV dequant scratch: {rows:d} tokens, "
+                f"{2 * k.numel() * k.element_size() / (1 << 30):.2f} GiB"
+            )
         return cls(
             inner,
             conv_pool,
             spec_num_tokens=spec_tokens,
             enable_layerwise_cache_ready=enable_layerwise_cache_ready,
+            kv_dequant_scratch=kv_dequant_scratch,
         )
 
     def __init__(
@@ -268,10 +372,15 @@ class InklingAttnBackend(AttentionBackend):
         *,
         spec_num_tokens: int = 1,
         enable_layerwise_cache_ready: bool = False,
+        kv_dequant_scratch: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> None:
         # Deliberately skip AttentionBackend.__init__: the wrapper mirrors inner via __getattr__.
         self.inner = inner
         self.conv_pool = conv_pool
+        # [rows, width] BF16 key and value buffers a prefix extend over an
+        # MXFP8 cache dequantizes the pages it reads into
+        # (inkling_kv_dequant_scratch_shape).
+        self.kv_dequant_scratch = kv_dequant_scratch
         # The checkpoint groups (see conv_columns_for_pool). Mandatory: the
         # sconv state always has its checkpoint bridges; there is no rolling mode.
         self.conv_columns: InklingConvColumns
@@ -300,7 +409,6 @@ class InklingAttnBackend(AttentionBackend):
         ] = {}
         # The streams' device tables for the post-verify commit, rebuilt after a registration.
         self._commit_tables: list[InklingCommitTable] | None = None
-        self._commit_groups: tuple[str, ...] = ()
 
     @property
     def _inner_max_context_len(self) -> int:
@@ -340,6 +448,8 @@ class InklingAttnBackend(AttentionBackend):
         self._pfg_cache_indices: torch.Tensor | None = None
         self._pfg_has_initial_state: torch.Tensor | None = None
         self._pfg_max_bs = 0
+        # [groups, max_bs, slots] persistent decode conv tables; _graph_col_tables views its rows.
+        self._graph_col_stack: torch.Tensor | None = None
         self._graph_col_tables: dict[str, torch.Tensor] | None = None
         self._graph_seq_lens: torch.Tensor | None = None
         self._rel_qsl_cache: dict[int, torch.Tensor] = {}
@@ -495,12 +605,13 @@ class InklingAttnBackend(AttentionBackend):
         """
         del accepted_path
         metadata = self.conv_decode_metadata
-        if num_extends > 0 or metadata is None or metadata.col_block_table is None:
+        if num_extends > 0 or metadata is None or metadata.col_live_pages is None:
             return
         if self.conv_spec_num_tokens == 1 or not self._checkpoint_streams:
             return
         if self._commit_tables is None:
-            groups = tuple(dict.fromkeys(key[3] for key in self._checkpoint_streams))
+            # A stream's group is its row of the metadata's live blocks.
+            groups = tuple(metadata.col_block_table)
             self._commit_tables = inkling_commit_tables(
                 self.conv_pool.conv_state,
                 [
@@ -508,18 +619,11 @@ class InklingAttnBackend(AttentionBackend):
                     for key, buffers in self._checkpoint_streams.items()
                 ],
             )
-            self._commit_groups = groups
         bs = accepted_lengths.shape[0]
-        live_pages = torch.stack(
-            [
-                metadata.col_block_table[group_id][:bs, STATE_LIVE_SLOT]
-                for group_id in self._commit_groups
-            ]
-        )
         inkling_ring_commit(
             self.conv_pool.conv_state,
             self._commit_tables,
-            live_pages,
+            metadata.col_live_pages[:, :bs],
             metadata.cache_indices[:bs],
             metadata.seq_lens[:bs],
             accepted_lengths,
@@ -649,8 +753,19 @@ class InklingAttnBackend(AttentionBackend):
     # ------------------------------------------------------------------
 
     def fixed_workspace_bytes(self) -> int:
-        """Return persistent ShortConv state owned outside the LCM arenas."""
-        return self.conv_pool.mem_usage_bytes()
+        """Return persistent ShortConv state and the MXFP8 KV dequant scratch,
+        owned outside the LCM arenas."""
+        scratch = sum(
+            t.numel() * t.element_size() for t in self.kv_dequant_scratch or ()
+        )
+        return (
+            self.conv_pool.mem_usage_bytes() + scratch + super().fixed_workspace_bytes()
+        )
+
+    def _graph_live_pages(self, bs: int) -> torch.Tensor:
+        """``[groups, bs]`` live blocks of the persistent decode tables: a view
+        of their stack, so the commit reads them without a copy."""
+        return self._graph_col_stack[:, :bs, STATE_LIVE_SLOT]
 
     def _spec_conv_metadata(self, bs: int) -> InklingConvMetadata:
         """Multi-token decode conv metadata over the persistent CUDA-graph
@@ -665,6 +780,7 @@ class InklingAttnBackend(AttentionBackend):
             col_block_table={
                 g: table[:bs] for g, table in self._graph_col_tables.items()
             },
+            col_live_pages=self._graph_live_pages(bs),
         )
 
     def _graph_decode_conv_metadata(self, bs: int) -> InklingConvMetadata:
@@ -677,6 +793,7 @@ class InklingAttnBackend(AttentionBackend):
             seq_idx=self._decode_qsl[:bs],
             seq_lens=self._graph_seq_lens[:bs],
             col_block_table={g: t[:bs] for g, t in self._graph_col_tables.items()},
+            col_live_pages=self._graph_live_pages(bs),
             remote_restore_mask=(
                 self._graph_remote_restore_mask[:bs]
                 if self.conv_columns["pd_endpoint_snapshots"]
@@ -795,14 +912,19 @@ class InklingAttnBackend(AttentionBackend):
         assert not save_kv_cache, "the attention prologue wrote this KV"
         rel_logits = kwargs.pop("rel_logits")
         tau = kwargs.pop("log_scaling_tau", None)
+        return_lse = kwargs.pop("return_lse", False)
+        output_dtype = kwargs.pop("output_dtype", None)
+        gate = kwargs.pop("gate", None)
+        sink = kwargs.pop("sink", None)
         inner = self.inner._leaf_for(layer)
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         metadata = inner.forward_decode_metadata
         scale_kwargs = {}
         if inner.is_mxfp8:
-            q, q_sf = inner._quantize_mxfp8_tokens(q)
+            # The FP32-output decode kernel dequantizes the MXFP8 pages it
+            # reads; the query stays BF16.
             k_sf, v_sf = token_to_kv_pool.get_kv_scale_buffer(layer.layer_id)
-            scale_kwargs = dict(q_scale=q_sf, k_scale=k_sf, v_scale=v_sf)
+            scale_kwargs = dict(k_scale=k_sf, v_scale=v_sf)
         elif inner.is_fp8:
             q = q.to(torch.float8_e4m3fn)
         k_cache, v_cache = inner._get_kv_cache(layer, token_to_kv_pool)
@@ -822,8 +944,15 @@ class InklingAttnBackend(AttentionBackend):
             softmax_scale=layer.scaling,
             tau=tau,
             solution=inner.kernel_solution,
+            output_dtype=output_dtype,
+            return_lse=return_lse,
+            gate=gate,
+            sink=sink,
             **scale_kwargs,
         )
+        if return_lse:
+            output, lse = output
+            return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim), lse
         return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
 
     def forward_extend(
@@ -841,6 +970,15 @@ class InklingAttnBackend(AttentionBackend):
         assert not save_kv_cache, "the attention prologue wrote this KV"
         rel_logits = kwargs.pop("rel_logits")
         tau = kwargs.pop("log_scaling_tau", None)
+        return_lse = kwargs.pop("return_lse", False)
+        output_dtype = kwargs.pop("output_dtype", None)
+        gate = kwargs.pop("gate", None)
+        sink = kwargs.pop("sink", None)
+        gated_dtype, gated_lse = output_dtype, return_lse
+        if gate is not None:
+            # The extend kernels leave the gate and sink to rel_mha_gate_sink,
+            # over their FP32 output and LSE: the bits the decode kernel fuses.
+            output_dtype, return_lse = torch.float32, True
         inner = self.inner._leaf_for(layer)
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         k = k.view(-1, layer.tp_k_head_num, layer.qk_head_dim)
@@ -855,8 +993,9 @@ class InklingAttnBackend(AttentionBackend):
             dtype=torch.float8_e4m3fn if inner.is_fp8 else inner.qkv_dtype,
             head_dim=inner.head_dim,
             window_left=layer.sliding_window_size,
-            return_lse=False,
+            return_lse=return_lse,
             solution=inner.kernel_solution,
+            output_dtype=output_dtype,
         )
         if metadata.max_extend_prefix_len == 0 and plan["extend_mode"] == "postwrite":
             if inner.is_fp8:
@@ -875,40 +1014,79 @@ class InklingAttnBackend(AttentionBackend):
                 softmax_scale=layer.scaling,
                 tau=tau,
                 solution=inner.kernel_solution,
+                output_dtype=output_dtype,
+                return_lse=return_lse,
             )
+            lse = None
+            if return_lse:
+                output, lse = output
             output = output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
             if output.shape[0] > _num_real:
                 output[_num_real:].zero_()
-            return output
-        scale_kwargs = {}
+                if lse is not None:
+                    lse[_num_real:].fill_(float("-inf"))
+            return self._gated(output, lse, gate, sink, layer, gated_dtype, gated_lse)
         if inner.is_mxfp8:
-            q, q_sf = inner._quantize_mxfp8_tokens(q)
-            k_sf, v_sf = token_to_kv_pool.get_kv_scale_buffer(layer.layer_id)
-            scale_kwargs = dict(q_scale=q_sf, k_scale=k_sf, v_scale=v_sf)
-        elif inner.is_fp8:
-            q = q.to(torch.float8_e4m3fn)
-        k_cache, v_cache = inner._get_kv_cache(layer, token_to_kv_pool)
-        output = rel_mha_extend_with_kvcache(
-            q=q,
-            cu_seqlens_q=metadata.cu_extend_seq_lens,
-            cu_seqlens_kv=metadata.cu_seqlens_kv,
-            k_cache=k_cache,
-            v_cache=v_cache,
-            page_table=metadata.page_table,
-            cache_seqlens=metadata.seq_lens,
-            max_seqlen_q=metadata.max_extend_seq_len,
-            max_seqlen_k=inner.max_context_len,
-            rel_logits=rel_logits,
-            window_left=layer.sliding_window_size,
-            softmax_scale=layer.scaling,
-            tau=tau,
-            solution=inner.kernel_solution,
-            **scale_kwargs,
-        )
+            if self.kv_dequant_scratch is None:
+                raise RuntimeError(
+                    "an MXFP8 KV cache needs the Inkling KV dequant scratch"
+                )
+            output = rel_mha_extend_mxfp8(
+                inner,
+                layer,
+                token_to_kv_pool,
+                self.kv_dequant_scratch,
+                q,
+                rel_logits,
+                tau,
+                output_dtype=output_dtype,
+                return_lse=return_lse,
+            )
+        else:
+            if inner.is_fp8:
+                q = q.to(torch.float8_e4m3fn)
+            k_cache, v_cache = inner._get_kv_cache(layer, token_to_kv_pool)
+            output = rel_mha_extend_with_kvcache(
+                q=q,
+                cu_seqlens_q=metadata.cu_extend_seq_lens,
+                cu_seqlens_kv=metadata.cu_seqlens_kv,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                page_table=metadata.page_table,
+                cache_seqlens=metadata.seq_lens,
+                max_seqlen_q=metadata.max_extend_seq_len,
+                max_seqlen_k=inner.max_context_len,
+                rel_logits=rel_logits,
+                window_left=layer.sliding_window_size,
+                softmax_scale=layer.scaling,
+                tau=tau,
+                solution=inner.kernel_solution,
+                output_dtype=output_dtype,
+                return_lse=return_lse,
+            )
+        lse = None
+        if return_lse:
+            output, lse = output
         output = output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
         if output.shape[0] > _num_real:
             output[_num_real:].zero_()
-        return output
+            if lse is not None:
+                lse[_num_real:].fill_(float("-inf"))
+        return self._gated(output, lse, gate, sink, layer, gated_dtype, gated_lse)
+
+    @staticmethod
+    def _gated(output, lse, gate, sink, layer, output_dtype, return_lse):
+        """``rel_mha_gate_sink`` over an extend output when the layer gates it."""
+        if gate is not None:
+            output = rel_mha_gate_sink(
+                output,
+                gate,
+                lse,
+                sink,
+                head_dim=layer.v_head_dim,
+                out_dtype=output_dtype,
+            )
+        return (output, lse) if return_lse else output
 
     def supports_narrowed_draft_decode(self, forward_mode: ForwardMode) -> bool:
         return self.inner.supports_narrowed_draft_decode(forward_mode)
@@ -1021,11 +1199,15 @@ class InklingAttnBackend(AttentionBackend):
         self._graph_seq_lens = torch.zeros(max_bs, dtype=torch.int32, device=device)
         # Wrapper-owned persistent conv tables, refreshed from block_tables
         # each decode step.
+        groups = self.conv_columns["groups"]
+        self._graph_col_stack = torch.full(
+            (len(groups), max_bs, STATE_TABLE_SLOTS),
+            1,
+            dtype=torch.int32,
+            device=device,
+        )
         self._graph_col_tables = {
-            g: torch.full(
-                (max_bs, STATE_TABLE_SLOTS), 1, dtype=torch.int32, device=device
-            )
-            for g in self.conv_columns["groups"]
+            g: self._graph_col_stack[i] for i, g in enumerate(groups)
         }
         self._graph_cache_indices = torch.full(
             (max_bs,), PAD_SLOT_ID, dtype=torch.int32, device=device
@@ -1096,31 +1278,31 @@ class InklingAttnBackend(AttentionBackend):
             **kwargs,
         )
         assert self._graph_cache_indices is not None
-        self._graph_seq_lens[:bs].copy_(seq_lens[:bs])
-        self._graph_cache_indices[:bs].copy_(req_pool_indices[:bs].to(torch.int32))
+        self._graph_cache_indices[:bs].copy_(req_pool_indices[:bs])
         if actual_bs < bs:
             # Pad rows may carry stale indices aliasing LIVE slots; PAD_SLOT_ID keeps writes off them.
             self._graph_cache_indices[actual_bs:bs].fill_(PAD_SLOT_ID)
-        dsts, srcs = [], []
+        # One batched copy (~4 us per stream copy at bs=1); the -1 fills must follow it.
+        copies = [(self._graph_seq_lens[:bs], seq_lens[:bs])]
+        fills = []
         for g, buf in self._graph_col_tables.items():
             src = block_tables.get(g)
             if src is None:
                 raise RuntimeError(
                     f"paged sconv decode: no {g!r} table in block_tables"
                 )
-            src = src[:bs, : buf.shape[1]]
-            dsts.append(buf[: src.shape[0], : src.shape[1]])
-            srcs.append(src)
-        # One launch refreshes every conv group's table; a copy per group costs ~4 us at bs=1.
-        torch._foreach_copy_(dsts, srcs)
-        for buf, src in zip(self._graph_col_tables.values(), srcs, strict=True):
-            rows, cols = src.shape
+            cols = min(src.shape[1], buf.shape[1])
+            rows = min(src.shape[0], bs)
+            copies.append((buf[:rows, :cols], src[:rows, :cols]))
             if cols < buf.shape[1]:
-                buf[:rows, cols:].fill_(-1)
+                fills.append(buf[:rows, cols:])
             if rows < bs:
-                buf[rows:bs].fill_(-1)
+                fills.append(buf[rows:bs])
             if actual_bs < min(bs, rows):
-                buf[actual_bs:bs].fill_(-1)
+                fills.append(buf[actual_bs:bs])
+        torch._foreach_copy_([dst for dst, _ in copies], [src for _, src in copies])
+        for region in fills:
+            region.fill_(-1)
         if self.conv_spec_num_tokens > 1:
             # Rebuild so the eager post-verify hook (outside the graph) sees this round's bs and mode.
             self.conv_decode_metadata = self._spec_conv_metadata(bs)

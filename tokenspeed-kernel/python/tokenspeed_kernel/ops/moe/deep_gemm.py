@@ -66,6 +66,9 @@ if _HAS_DEEP_GEMM:
 
 _MXFP4_BLOCK_SIZE = 32
 _DISABLE_WARMUP_ENV = "TOKENSPEED_DISABLE_MEGA_MOE_WARMUP"
+# The (live, padded) request counts of the forward being run; see
+# mega_moe_live_requests.
+_live_requests: torch.Tensor | None = None
 _symm_buffer_cache: dict[tuple[int, int, int, int, int, int, int, int], object] = {}
 _warmed_configs: set[
     tuple[int, torch.device, int, int, int, int, int, int, float | None, bool]
@@ -273,6 +276,39 @@ def fuse_deep_gemm_mxfp4_mega_moe_shared_expert(
     return True
 
 
+def mega_moe_live_requests(device: torch.device | str) -> torch.Tensor:
+    """Return the int32 (live, padded) device pair every MegaMoE staging reads.
+
+    Created as (1, 1) on first use and shared by every caller, so it keeps its
+    address for captured graphs. A runner that replays decode graphs at padded
+    batch sizes writes the replay's live and padded request counts before the
+    replay and (1, 1) after it: MegaMoE then routes only the first
+    ``num_tokens * live // padded`` rows, and filler rows reach no routed
+    expert. One request ratio serves forwards with different rows per
+    request, such as the DeepSeek V4.1 target's and its DSpark drafter's.
+
+    The ratio is right only when each rank's MegaMoE input is its
+    attention-DP group's whole padded batch: request-major, with the same
+    number of rows for every request and the filler requests last. Attention
+    TP 1 and rows replicated over attention TP (attention TP == MoE TP x EP)
+    give that layout; they are the only layouts DeepSeek V4.1 admits with
+    MegaMoE. A reduce-scatter shard of the batch does not: the live rows fall
+    unevenly across the shards. Under such a layout (Qwen3.5's DP4/TP2/EP8)
+    the runner leaves the pair at (1, 1), so every row is routed.
+
+    Args:
+        device: The device the pair is created on by the first call; later
+            calls return the existing pair.
+
+    Returns:
+        The shared ``[2]`` int32 tensor ``(live, padded)``.
+    """
+    global _live_requests
+    if _live_requests is None:
+        _live_requests = torch.ones(2, dtype=torch.int32, device=device)
+    return _live_requests
+
+
 def _resolve_process_group(process_group: object | None) -> object:
     if process_group is not None:
         return process_group
@@ -374,6 +410,9 @@ def _run_mega_moe(
         symm_buffer.topk_weights[:num_tokens],
         shared_x_sf,
         shared_block_m,
+        # Every launch reads the pair, so warmup compiles the variant that
+        # captured graphs replay.
+        mega_moe_live_requests(x.device),
     )
     fp8_fp4_mega_moe(
         output,

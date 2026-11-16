@@ -49,9 +49,16 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
+from tokenspeed_kernel.ops.attention.dsa import (
+    MXFP4_INDEX_QUERY_FORMAT,
+)
 from tokenspeed_kernel.ops.attention.dsa import cute_dsl as dsa_cute_dsl
+from tokenspeed_kernel.ops.attention.dsa import (
+    dsa_decode_dcp_records_workspace_bytes,
+)
 from tokenspeed_kernel.ops.attention.mla import mla_project_value
 from tokenspeed_kernel.ops.gemm import kimi3_mla_gate_projection, mm
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 from torch import nn
@@ -80,6 +87,7 @@ from tokenspeed.runtime.models.kimi_k3 import (
     KimiLinearMLAAttention,
 )
 from tokenspeed.runtime.utils import add_prefix
+from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 if TYPE_CHECKING:
@@ -236,19 +244,24 @@ class KimiK31Indexer(nn.Module):
         return self.wq_b(q_lora)[0].view(-1, self.index_n_heads, self.index_head_dim)
 
 
-def _scorers_take_fp8_index_queries(indexer: KimiK31Indexer) -> bool:
+def _scorers_take_quantized_index_queries(
+    indexer: KimiK31Indexer, index_k_format: str = "fp8_scaled"
+) -> bool:
     """Whether both paged top-k scorers (prefill and decode) of an
-    ``fp8_scaled`` plane are registered for this indexer's FP8 E4M3 queries
-    on this platform."""
+    ``index_k_format`` plane are registered for this indexer's quantized
+    queries on this platform: mxfp4 over an mxfp4 plane, else FP8 E4M3."""
+    if index_k_format == "mxfp4":
+        q_format = MXFP4_INDEX_QUERY_FORMAT
+    else:
+        q_format = dense_tensor_format(torch.float8_e4m3fn)
     signature = format_signature(
-        q=dense_tensor_format(torch.float8_e4m3fn),
-        weights=dense_tensor_format(torch.bfloat16),
+        q=q_format, weights=dense_tensor_format(torch.bfloat16)
     )
     traits = {
         "index_heads": indexer.index_n_heads,
         "head_dim": indexer.index_head_dim,
         "topk": indexer.index_topk,
-        "index_k_format": "fp8_scaled",
+        "index_k_format": index_k_format,
     }
     try:
         for mode in ("dsa_prefill_topk", "dsa_decode_topk"):
@@ -408,14 +421,25 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
         self.skip_indexer_topk = False
         # The replicated indexer lets ranks split prefill top-k rows and all-gather.
         self.prefill_topk_tp_split = True
+        # No K3.1 drafter reads the target's top-k, so KVP decode can select
+        # each rank's share as local slots.
+        self.owned_decode_topk = True
         # K-major w_kc/w_vc take the grouped GEMM unless a bitwise plan is pinned.
         self.absorbed_weights_k_major = self.absorption_kernel_plan is None
         self.indexer = KimiK31Indexer(config, prefix=add_prefix("indexer", prefix))
-        # FP8 index queries where the platform registers fp8_scaled scorers.
-        self.index_query_fp8 = _scorers_take_fp8_index_queries(self.indexer)
+        # Quantized index queries where the platform registers the plane's
+        # scorers: mxfp4 over an mxfp4 plane (its only scorers), else FP8.
+        index_k_format = global_server_args_dict["dsa_index_k_format"] or "fp8_scaled"
+        quantized = _scorers_take_quantized_index_queries(self.indexer, index_k_format)
+        self.index_query_mxfp4 = index_k_format == "mxfp4"
+        self.index_query_fp8 = quantized and not self.index_query_mxfp4
+        if self.index_query_mxfp4 and not quantized:
+            raise ValueError(
+                "--dsa-index-k-format mxfp4 has no mxfp4-query scorer on this platform"
+            )
         # The fused decode top-k takes BF16 or unit-scale E4M3 index queries.
         self.decode_topk_solution = (
-            None if self.index_query_fp8 else _fused_decode_topk_solution(self.indexer)
+            None if quantized else _fused_decode_topk_solution(self.indexer)
         )
         # A decode round quantizes its index query in the index-K write's launch.
         self.index_k_write_quantizes_query = self.decode_topk_solution is not None
@@ -433,6 +457,10 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
         self._decode_topk_indices_buffer: torch.Tensor | None = None
         self._decode_topk_lens_buffer: torch.Tensor | None = None
         self._retired_decode_workspaces: list[torch.Tensor] = []
+        # NVIDIA only: on AMD the forked round was not bit-identical to one stream.
+        self.decode_topk_fork = StreamFork(
+            alt_stream if current_platform().is_nvidia else None
+        )
         # The attention group's K3 Iris state, once communication is prepared.
         self.topk_iris_state: K3IrisState | None = None
         # [q_b_proj; indexer wq_b] stacked after load: one GEMM over q_norm.
@@ -450,6 +478,32 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
             if gathered is not None:
                 return gathered
         return super()._gather_prefill_topk_rows(local, local_lens, gather_dtype)
+
+    def kvp_decode_exchange_bytes(self, max_rows: int) -> int:
+        """Bytes one rank sends in this layer's largest KVP decode exchange of
+        up to ``max_rows`` rows: the owned top-k's score gather with the
+        query heads riding it (at most two bytes a value), or the records
+        core's key splits, which lead with the records. Zero where gfx950's
+        records core does not run."""
+        degree = self.mapping.attn.kvp_size
+        if max_rows <= 0 or not current_platform().is_cdna4:
+            return 0
+        head_dim = self.kv_lora_rank + self.qk_rope_head_dim
+        gather = max_rows * (self.index_topk * 4 + self.num_local_heads * head_dim * 2)
+        records = max(
+            dsa_decode_dcp_records_workspace_bytes(
+                tokens=rows,
+                heads=degree * self.num_local_heads,
+                topk=self.index_topk,
+                q_dtype=dtype,
+                kv_dtype=dtype,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+            )
+            for rows in range(1, max_rows + 1)
+            for dtype in (torch.float8_e4m3fn, torch.bfloat16)
+        )
+        return max(gather, records)
 
     def precomputable_qkv_a_weight(self) -> torch.Tensor | None:
         """The BF16 q_a/kv_a rows a caller may project ahead of ``forward``.
@@ -868,19 +922,20 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
             q_latent, projected_q, index_query, written_index_query = (
                 self._decode_front(q_latent, latent_cache, index_key_weights, ctx)
             )
-        return self.forward_dsa_core(
-            positions,
-            hidden_states,
-            q_latent,
-            latent_cache,
-            ctx,
-            comm_manager,
-            output_gate=output_gate,
-            projected_q=projected_q,
-            index_query=index_query,
-            index_key_weights=index_key_weights,
-            written_index_query=written_index_query,
-        )
+        with self.decode_topk_fork.scope(enable=ctx.num_extends == 0):
+            return self.forward_dsa_core(
+                positions,
+                hidden_states,
+                q_latent,
+                latent_cache,
+                ctx,
+                comm_manager,
+                output_gate=output_gate,
+                projected_q=projected_q,
+                index_query=index_query,
+                index_key_weights=index_key_weights,
+                written_index_query=written_index_query,
+            )
 
 
 class KimiK31ForConditionalGeneration(KimiK3ForConditionalGeneration):

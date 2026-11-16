@@ -1,0 +1,194 @@
+[
+  {
+    "name": "b128-p131072-s1-e0",
+    "config": {
+      "batch": 128,
+      "prompt": 131072,
+      "steps": 1,
+      "waves": 2,
+      "page": 64,
+      "overlap": 1,
+      "events": false,
+      "queue_capacity": 1,
+      "control_cpu": 20,
+      "warmups": 1,
+      "repeats": 7
+    }
+  },
+  {
+    "name": "b128-p131072-s1-e1",
+    "config": {
+      "batch": 128,
+      "prompt": 131072,
+      "steps": 1,
+      "waves": 2,
+      "page": 64,
+      "overlap": 1,
+      "events": true,
+      "queue_capacity": 1,
+      "control_cpu": 20,
+      "warmups": 1,
+      "repeats": 7
+    }
+  },
+  {
+    "name": "b128-p131072-s2-e0",
+    "config": {
+      "batch": 128,
+      "prompt": 131072,
+      "steps": 2,
+      "waves": 2,
+      "page": 64,
+      "overlap": 1,
+      "events": false,
+      "queue_capacity": 1,
+      "control_cpu": 20,
+      "warmups": 1,
+      "repeats": 7
+    }
+  },
+  {
+    "name": "b128-p131072-s2-e1",
+    "config": {
+      "batch": 128,
+      "prompt": 131072,
+      "steps": 2,
+      "waves": 2,
+      "page": 64,
+      "overlap": 1,
+      "events": true,
+      "queue_capacity": 1,
+      "control_cpu": 20,
+      "warmups": 1,
+      "repeats": 7
+    }
+  },
+  {
+    "name": "b128-p262144-s1-e0",
+    "config": {
+      "batch": 128,
+      "prompt": 262144,
+      "steps": 1,
+      "waves": 2,
+      "page": 64,
+      "overlap": 1,
+      "events": false,
+      "queue_capacity": 1,
+      "control_cpu": 20,
+      "warmups": 1,
+      "repeats": 7
+    }
+  },
+  {
+    "name": "b128-p262144-s1-e1",
+    "config": {
+      "batch": 128,
+      "prompt": 262144,
+      "steps": 1,
+      "waves": 2,
+      "page": 64,
+      "overlap": 1,
+      "events": true,
+      "queue_capacity": 1,
+      "control_cpu": 20,
+      "warmups": 1,
+      "repeats": 7
+    }
+  },
+  {
+    "name": "b128-p262144-s2-e0",
+    "config": {
+      "batch": 128,
+      "prompt": 262144,
+      "steps": 2,
+      "waves": 2,
+      "page": 64,
+      "overlap": 1,
+      "events": false,
+      "queue_capacity": 1,
+      "control_cpu": 20,
+      "warmups": 1,
+      "repeats": 7
+    }
+  },
+  {
+    "name": "b128-p262144-s2-e1",
+    "config": {
+      "batch": 128,
+      "prompt": 262144,
+      "steps": 2,
+      "waves": 2,
+      "page": 64,
+      "overlap": 1,
+      "events": true,
+      "queue_capacity": 1,
+      "control_cpu": 20,
+      "warmups": 1,
+      "repeats": 7
+    }
+  },
+  {
+    "name": "b128-p524288-s1-e0",
+    "config": {
+      "batch": 128,
+      "prompt": 524288,
+      "steps": 1,
+      "waves": 2,
+      "page": 64,
+      "overlap": 1,
+      "events": false,
+      "queue_capacity": 1,
+      "control_cpu": 20,
+      "warmups": 1,
+      "repeats": 7
+    }
+  },
+  {
+    "name": "b128-p524288-s1-e1",
+    "config": {
+      "batch": 128,
+      "prompt": 524288,
+      "steps": 1,
+      "waves": 2,
+      "page": 64,
+      "overlap": 1,
+      "events": true,
+      "queue_capacity": 1,
+      "control_cpu": 20,
+      "warmups": 1,
+      "repeats": 7
+    }
+  },
+  {
+    "name": "b128-p524288-s2-e0",
+    "config": {
+      "batch": 128,
+      "prompt": 524288,
+      "steps": 2,
+      "waves": 2,
+      "page": 64,
+      "overlap": 1,
+      "events": false,
+      "queue_capacity": 1,
+      "control_cpu": 20,
+      "warmups": 1,
+      "repeats": 7
+    }
+  },
+  {
+    "name": "b128-p524288-s2-e1",
+    "config": {
+      "batch": 128,
+      "prompt": 524288,
+      "steps": 2,
+      "waves": 2,
+      "page": 64,
+      "overlap": 1,
+      "events": true,
+      "queue_capacity": 1,
+      "control_cpu": 20,
+      "warmups": 1,
+      "repeats": 7
+    }
+  }
+]
