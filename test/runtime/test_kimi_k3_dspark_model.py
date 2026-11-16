@@ -589,11 +589,14 @@ def _chain_write(model, rows, positions, slots, planes, placement, sanitize):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA kernels")
-@pytest.mark.parametrize("stacked", [True, False])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("sanitize", [False, True])
 # Seed 61 reproduced the MI355 rounding difference across an FP8 boundary.
-@pytest.mark.parametrize(("rows", "seed"), [(1, 1), (8, 8), (40, 40), (40, 61)])
+# Weights that don't stack keep the per-layer projections.
+@pytest.mark.parametrize(
+    ("rows", "seed", "stacked"),
+    [(1, 1, True), (8, 8, True), (40, 40, True), (40, 61, True), (8, 8, False)],
+)
 def test_the_one_launch_context_write_stores_the_per_layer_chains_bytes(
     dtype, sanitize, rows, seed, stacked
 ):

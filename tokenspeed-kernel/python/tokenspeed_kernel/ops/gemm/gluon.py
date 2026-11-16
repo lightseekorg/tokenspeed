@@ -729,8 +729,8 @@ if platform.is_amd:
         return _gated_norm_gemv_a16w16_impl(x, gate, norm_weight, weight, out, eps)
 
     def _rmsnorm_gemv_a16w16_filter(m: int, n: int, k: int) -> bool:
-        # Every program normalizes all rows ahead of its MFMAs; past 8 rows
-        # that outlasts the separate norm launch it saves.
+        # Every program normalizes all rows ahead of its MFMAs, so the fused
+        # launch stops at 8 rows.
         return m <= 8 and _supports_rmsnorm_gemv(m, n, k)
 
     @register_kernel(

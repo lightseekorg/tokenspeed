@@ -85,8 +85,7 @@ _PERSISTENT_WORKSPACE_CACHE_MAXSIZE = 16
 _MULTI_CTA_MAX_ROWS = 32
 # The extra launch (~1.8 us) loses at or below this width; wider logits go multi-CTA.
 _MULTI_CTA_ONEBLOCK_MAX_COLS = 16384
-# From 8 rows the wide tiles win at every context; fewer rows keep the narrow
-# ones, which stay ahead up to about 100K keys.
+# Requests of 8 or more rows take the wide tiles; fewer rows keep the narrow ones.
 _MULTI_CTA_WIDE_MIN_ROWS = 8
 _MULTI_CTA_BLOCK_N = 2048
 _MULTI_CTA_WIDE_BLOCK_N = 4096

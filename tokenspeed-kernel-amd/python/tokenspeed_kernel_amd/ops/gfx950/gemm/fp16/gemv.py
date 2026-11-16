@@ -912,7 +912,7 @@ _PREFERRED_BUCKETS: dict[tuple[int, int], frozenset[int]] = {
     # Kimi K3 TP8.
     (1536, 1536): frozenset({4, 16}),
     (2304, 1536): frozenset({4, 16}),
-    (6400, 1536): frozenset({4, 16}),  # K3.1 stacked [q_b; wq_b] (MI355X)
+    (6400, 1536): frozenset({4, 16}),  # K3.1 stacked [q_b; wq_b]
     (3648, 7168): frozenset({4}),
     (6288, 7168): frozenset({4, 16}),
     (7168, 768): frozenset({4, 16}),

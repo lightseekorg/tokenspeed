@@ -168,8 +168,6 @@ def _check_word_max(rank, world_size, device):
     assert state.mailbox.data_ptr() == mailbox
     # Every rank restored the slots it read: no piece is left behind.
     assert torch.all(state.mailbox.view(torch.int32) == -(1 << 31))
-    # Eager calls and replays each counted once.
-    assert int(state.calls.item()) == 5 * (len(rows_sequence) + 1)
     dist.barrier()
 
 

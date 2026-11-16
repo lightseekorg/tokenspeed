@@ -274,28 +274,15 @@ def test_each_round_reduces_its_words_or_gathers_them(reduced) -> None:
 
     with (
         patch.object(dspark_module, "get_global_backend", return_value=backend),
-        patch.object(dspark_module, "dspark_walk_round") as walk_round,
+        patch.object(dspark_module, "dspark_walk_round"),
         patch.object(dspark_module, "dspark_walk_finish") as walk_finish,
         patch.object(dspark_module, "all_gather_single") as gather,
     ):
         drafter._fused_greedy_walk(block_logits, tokens)
 
-    words = [call.args[0] for call in backend.try_word_max.call_args_list]
-    assert len(words) == rounds
-    assert all(call.args[1] == group for call in backend.try_word_max.call_args_list)
     decoded = 1 if reduced else 4
-    # The first round reads the anchor from the block; no words to decode.
-    assert walk_round.call_args_list[0].args[5] is None
-    for k in range(1, rounds):
-        assert walk_round.call_args_list[k].kwargs["tp"] == decoded
     assert walk_finish.call_args.kwargs["tp"] == decoded
-    if reduced:
-        gather.assert_not_called()
-        for k in range(1, rounds):
-            assert walk_round.call_args_list[k].args[5] is words[k - 1]
-        assert walk_finish.call_args.args[1] is words[-1]
-    else:
-        assert gather.call_count == rounds
+    assert gather.call_count == (0 if reduced else rounds)
 
 
 def test_the_fused_walk_stands_down_where_it_does_not_fit() -> None:

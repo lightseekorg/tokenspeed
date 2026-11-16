@@ -395,8 +395,7 @@ def test_rmsnorm_gemv_leaves_other_rows_to_two_launches():
     n, k = 6400, 1536
     weight = torch.empty((n, k), dtype=torch.bfloat16, device="cuda")
     norm_weight = torch.empty(k, dtype=torch.bfloat16, device="cuda")
-    # One row takes the single-row GEMV, and past eight rows the norm every
-    # program runs outlasts the launch it saves.
+    # One row takes the single-row GEMV, and the fused launch stops at 8 rows.
     for m in (1, 9, 16):
         x = torch.empty((m, k), dtype=torch.bfloat16, device="cuda")
         assert not mv_rmsnorm_supported(x, norm_weight, weight)
