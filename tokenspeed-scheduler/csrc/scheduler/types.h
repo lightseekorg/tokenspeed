@@ -99,6 +99,8 @@ struct SchedulerConfig {
     // all local prefill requests in one batch. Zero leaves this unbounded.
     std::int32_t max_kv_page_num{0};
     std::int32_t max_batch_size{};
+    // Real request-pool rows, independently of the execution batch limit.
+    std::int32_t max_resident_requests{};
     std::int32_t decode_input_tokens{1};
     // Number of scheduler iterations that may be dispatched before the
     // accepted decode length is committed. The current event loop supports

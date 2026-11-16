@@ -187,6 +187,7 @@ def _msa_server_args(**overrides) -> SimpleNamespace:
         attention_backend="trtllm",
         drafter_attention_backend=None,
         max_num_seqs=16,
+        disaggregation_decode_extra_slots=0,
         data_parallel_size=1,
         attn_tp_size=4,
         max_cudagraph_capture_size=16,

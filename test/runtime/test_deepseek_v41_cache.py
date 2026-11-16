@@ -123,6 +123,7 @@ def _config(device):
         kernel_page_size=64,
         context_len=512,
         max_bs=2,
+        max_resident_requests=2,
         pd_disaggregation_enabled=False,
         speculative_num_steps=0,
         speculative_num_draft_tokens=1,
@@ -198,6 +199,7 @@ def _verify_backend(device, max_bs, verify_width):
     recipe.attn_config = replace(
         recipe.attn_config,
         max_bs=max_bs,
+        max_resident_requests=max_bs,
         speculative_num_draft_tokens=verify_width,
         components=(
             replace(
@@ -1098,6 +1100,7 @@ def test_workspace_reserves_full_paged_decode_scores(chunk, overlap_depth):
         config,
         context_len=context,
         max_bs=max_bs,
+        max_resident_requests=max_bs,
         speculative_num_draft_tokens=verify_width,
         components=(replace(spec, max_query_tokens=max(chunk, max_bs * verify_width)),),
     )
@@ -1114,7 +1117,9 @@ def test_workspace_reserves_full_paged_decode_scores(chunk, overlap_depth):
 def test_workspace_reserves_windowless_paged_prefill_scores():
     recipe = _recipe("cpu")
     context = 1 << 20
-    config = replace(recipe.attn_config, context_len=context, max_bs=1)
+    config = replace(
+        recipe.attn_config, context_len=context, max_bs=1, max_resident_requests=1
+    )
     spec = config.component(DeepseekV41Config)
 
     def workspace(queries):
@@ -4175,7 +4180,12 @@ def test_unbatched_indexer_preserves_request_windows(monkeypatch, reindex):
 
 def test_unbatched_indexer_reserves_one_history(monkeypatch):
     recipe = _index_scratch_recipe(max_query_tokens=256)
-    recipe.attn_config = replace(recipe.attn_config, max_bs=256, context_len=1 << 20)
+    recipe.attn_config = replace(
+        recipe.attn_config,
+        max_bs=256,
+        max_resident_requests=256,
+        context_len=1 << 20,
+    )
     recipe.server_args.disaggregation_mode = "prefill"
     monkeypatch.setattr(dsv41, "prefill_indexer_batching_supported", lambda _: False)
     single = recipe.workspace_bytes()

@@ -116,11 +116,12 @@ SAMPLING_BACKENDS = (
 # The per-slot buffers each sampling backend's rid-flip reset must write.
 SCATTERED_SLOT_STATE = {SonicSamplingBackend: ("state.temperature", "state.seeds")}
 
-# One request-pool geometry for every owner: max_bs decode rows, one sink row
-# (max_req_pool_size = max_bs + 1) and the graph-padding row past it.
-MAX_BS = 9
-MAX_REQ_POOL_SIZE = MAX_BS + 1
-POOL_ROWS = MAX_REQ_POOL_SIZE + 1  # 11: RuntimeStates, drafters, Inkling (max_bs + 2)
+# Forward buffers are smaller than the resident slot domain. Round trips below
+# restore slots above MAX_BS, as a decode server with extra receive slots does.
+MAX_BS = 4
+MAX_RESIDENT_REQUESTS = 9
+MAX_REQ_POOL_SIZE = MAX_RESIDENT_REQUESTS + 1
+POOL_ROWS = MAX_REQ_POOL_SIZE + 1
 SPEC_TOKENS = 4
 VOCAB = 32
 HIDDEN = 8
@@ -208,7 +209,7 @@ class _Leaf(AttentionBackend):
 def _inkling() -> InklingAttnBackend:
     conv_pool = InklingConvStatePool(
         num_layers=2,
-        num_slots=MAX_BS + 2,
+        num_slots=POOL_ROWS,
         conv_dim=HIDDEN,
         ring_size=5,
         dtype=torch.bfloat16,
@@ -221,7 +222,7 @@ def _kpool_pool() -> HybridGlm53FlashTokenToKVPool:
     pool = HybridGlm53FlashTokenToKVPool.__new__(HybridGlm53FlashTokenToKVPool)
     pool._kpool_tail_workspace = _KPoolTailWorkspace(
         options=None,
-        storage=torch.zeros((2, 2, MAX_BS + 2, 3, HIDDEN), dtype=torch.bfloat16),
+        storage=torch.zeros((2, 2, POOL_ROWS, 3, HIDDEN), dtype=torch.bfloat16),
         row_by_layer={0: 0, 1: 1},
     )
     return pool

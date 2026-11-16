@@ -106,6 +106,7 @@ def host_cache(request, io_backend):
         kv_cache_quant_method="none",
         context_len=4096,
         max_bs=2,
+        max_resident_requests=2,
     )
     recipe_args = dict(
         server_args=SimpleNamespace(

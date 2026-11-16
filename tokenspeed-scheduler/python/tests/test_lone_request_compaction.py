@@ -61,6 +61,7 @@ def _config(parents: int, chunk: int, packing: int, shards: int) -> ts.Scheduler
     cfg.max_retracted_requests = 0
     cfg.max_scheduled_tokens = chunk
     cfg.max_batch_size = 64
+    cfg.max_resident_requests = cfg.max_batch_size
     cfg.decode_input_tokens = 1
     cfg.overlap_schedule_depth = 0
     cfg.disable_prefix_cache = False

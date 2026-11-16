@@ -509,6 +509,7 @@ def test_split_counts_follow_live_lengths_during_graph_replay(cache_dtype, mode)
         kv_cache_quant_method="",
         context_len=16384,
         max_bs=4,
+        max_resident_requests=4,
         speculative_num_draft_tokens=4,
         is_draft=mode != "verify",
         draft_block_decode=mode == "block",

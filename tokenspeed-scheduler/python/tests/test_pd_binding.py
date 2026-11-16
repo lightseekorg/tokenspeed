@@ -39,6 +39,7 @@ def make_scheduler() -> Scheduler:
     cfg.prefix_granularity = 16
     cfg.max_scheduled_tokens = 32
     cfg.max_batch_size = 4
+    cfg.max_resident_requests = cfg.max_batch_size
     cfg.num_device_pages = 1024
     cfg.num_snapshot_pages = 1  # never retracts
     cfg.cache_groups = [
@@ -79,6 +80,7 @@ def test_prefill_duplicate_sources_survive_until_pd_terminal(
     cfg.prefix_granularity = 2
     cfg.max_scheduled_tokens = 8
     cfg.max_batch_size = 4
+    cfg.max_resident_requests = cfg.max_batch_size
     cfg.num_device_pages = pool_pages
     cfg.num_snapshot_pages = 1
     cfg.disable_l2_cache = True
@@ -202,6 +204,7 @@ def test_pd_counters_follow_request_state():
     cfg.prefix_granularity = 16
     cfg.max_scheduled_tokens = 32
     cfg.max_batch_size = 4
+    cfg.max_resident_requests = cfg.max_batch_size
     cfg.num_device_pages = 64
     cfg.num_snapshot_pages = 1  # never retracts
     cfg.disable_l2_cache = True
@@ -241,6 +244,7 @@ def test_prefill_role_reserves_the_decode_window_on_the_completing_chunk():
     cfg.prefix_granularity = 2
     cfg.max_scheduled_tokens = 4
     cfg.max_batch_size = 1
+    cfg.max_resident_requests = cfg.max_batch_size
     cfg.num_device_pages = 17
     cfg.num_snapshot_pages = 1  # the P role never retracts
     cfg.disable_l2_cache = True
@@ -280,6 +284,7 @@ def test_prefill_role_hands_off_without_the_draft_window():
     cfg.prefix_granularity = 1
     cfg.max_scheduled_tokens = 8
     cfg.max_batch_size = 1
+    cfg.max_resident_requests = cfg.max_batch_size
     # Page 0 plus the two-token prompt and its four-token window.
     cfg.num_device_pages = 7
     cfg.num_snapshot_pages = 1  # the P role never retracts
@@ -321,6 +326,7 @@ def test_remote_admission_lands_the_state_in_slot_one_and_decodes_in_place(
     cfg.prefix_granularity = 4
     cfg.max_scheduled_tokens = 16
     cfg.max_batch_size = 1
+    cfg.max_resident_requests = cfg.max_batch_size
     cfg.num_device_pages = 128
     cfg.num_snapshot_pages = 1  # never retracts
     cfg.decode_input_tokens = decode_input_tokens
@@ -416,6 +422,7 @@ def make_prefill_state_config(
     cfg.prefix_granularity = 2
     cfg.max_scheduled_tokens = 8
     cfg.max_batch_size = 1
+    cfg.max_resident_requests = cfg.max_batch_size
     cfg.num_device_pages = 65
     cfg.num_snapshot_pages = 1  # the P role never retracts
     cfg.disable_l2_cache = True
@@ -505,6 +512,7 @@ def test_prefill_chunk_yield_round_trips_and_is_validated():
     cfg.prefix_granularity = 16
     cfg.max_scheduled_tokens = 32
     cfg.max_batch_size = 4
+    cfg.max_resident_requests = cfg.max_batch_size
     cfg.num_device_pages = 64
     cfg.num_snapshot_pages = 1  # the P role never retracts
     cfg.disable_l2_cache = True

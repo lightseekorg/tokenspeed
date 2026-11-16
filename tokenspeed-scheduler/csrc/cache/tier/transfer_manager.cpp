@@ -619,8 +619,9 @@ std::optional<TierTransferManager::RetractionStores> TierTransferManager::StartR
 }
 
 SnapshotRestoreOperation TierTransferManager::StartSnapshotRestore(
-    const std::string& request_id, ReqPoolIndex request_pool_index, std::shared_ptr<SnapshotSlotIndex> blob_slot,
-    std::vector<BlockTransfer> load_pairs, std::vector<BlockTransfer> snapshot_pairs, std::uint64_t access_epoch) {
+    const std::string& request_id, ReqPoolIndex request_pool_index, DecodeSlotIndex decode_slot,
+    std::shared_ptr<SnapshotSlotIndex> blob_slot, std::vector<BlockTransfer> load_pairs,
+    std::vector<BlockTransfer> snapshot_pairs, std::uint64_t access_epoch) {
     _assert(request_pool_index.valid(), "a restore imports the slot-state blob into a request-pool row");
     _assert(blob_slot != nullptr && blob_slot->valid(), "a restore imports from the image's blob slot");
     for (const BlockTransfer& pair : load_pairs) {
@@ -655,6 +656,7 @@ SnapshotRestoreOperation TierTransferManager::StartSnapshotRestore(
                                                        .transfers = std::move(transfers),
                                                        .blob_slot = std::move(blob_slot),
                                                        .request_pool_index = std::move(request_pool_index),
+                                                       .decode_slot = std::move(decode_slot),
                                                        .access_epoch = access_epoch})
             .second;
     _assert(inserted, "duplicate snapshot restore op id");
@@ -670,10 +672,10 @@ std::optional<std::string> TierTransferManager::SnapshotRestoreRequest(std::uint
     return it == snapshot_restores_.end() ? std::nullopt : std::optional<std::string>{it->second.request_id};
 }
 
-ReqPoolIndex TierTransferManager::CompleteSnapshotRestore(std::uint32_t op_id, bool publish) {
+TierTransferManager::RestoredSlots TierTransferManager::CompleteSnapshotRestore(std::uint32_t op_id, bool publish) {
     auto it = snapshot_restores_.find(op_id);
     if (it == snapshot_restores_.end()) {
-        return ReqPoolIndex{};
+        return RestoredSlots{};
     }
     // The L2-tier rows are the request's own prefix pages, copied back whole:
     // publish them as they were published before the retraction.
@@ -688,9 +690,10 @@ ReqPoolIndex TierTransferManager::CompleteSnapshotRestore(std::uint32_t op_id, b
     // The row the blob was imported into goes back to the request (or, for a
     // request that is gone, to the allocator); the blob slot's last owner
     // may be this ticket.
-    ReqPoolIndex request_pool_index = std::move(it->second.request_pool_index);
+    RestoredSlots slots{.request_pool_index = std::move(it->second.request_pool_index),
+                        .decode_slot = std::move(it->second.decode_slot)};
     snapshot_restores_.erase(it);
-    return request_pool_index;
+    return slots;
 }
 
 std::vector<CacheTransfer> TierTransferManager::resolveTransfers(std::span<const BlockTransfer> block_transfers) const {

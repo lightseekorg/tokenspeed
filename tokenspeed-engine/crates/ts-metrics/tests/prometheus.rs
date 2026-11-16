@@ -155,6 +155,121 @@ fn render(directory: &Path) -> Option<String> {
 }
 
 #[test]
+fn decode_ready_wait_exports_duration_and_the_100ms_bucket() {
+    let directory = scratch_dir("decode-ready-wait");
+    let exporter = Exporter::new(&MetricsConfig {
+        prometheus_dir: Some(directory.clone()),
+        relay_endpoint: None,
+    })
+    .unwrap();
+    let engine = EngineMetrics::new(
+        &exporter,
+        &EngineLabels {
+            model_name: "m".to_owned(),
+            app_key: String::new(),
+            dp_rank: 0,
+        },
+    );
+    for seconds in [0.04, 0.1, 0.3] {
+        engine.observe_decode_ready_wait(seconds);
+    }
+    let Some(text) = render(&directory) else {
+        return;
+    };
+    let value = |name: &str, label: Option<&str>| -> f64 {
+        text.lines()
+            .find(|line| {
+                line.starts_with(&format!("{name}{{"))
+                    && label.is_none_or(|label| line.contains(label))
+            })
+            .unwrap_or_else(|| panic!("missing {name} in {text}"))
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    assert_eq!(
+        value("tokenspeed:decode_ready_wait_seconds_count", None),
+        3.0
+    );
+    assert!((value("tokenspeed:decode_ready_wait_seconds_sum", None) - 0.44).abs() < 1e-9);
+    assert_eq!(
+        value(
+            "tokenspeed:decode_ready_wait_seconds_bucket",
+            Some("le=\"0.1\"")
+        ),
+        2.0
+    );
+}
+
+#[test]
+fn decode_slot_gauges_report_occupancy_and_release_without_changing_load() {
+    let directory = scratch_dir("decode-slots");
+    let exporter = Exporter::new(&MetricsConfig {
+        prometheus_dir: Some(directory.clone()),
+        relay_endpoint: None,
+    })
+    .unwrap();
+    let engine = EngineMetrics::new(
+        &exporter,
+        &EngineLabels {
+            model_name: "m".to_owned(),
+            app_key: String::new(),
+            dp_rank: 3,
+        },
+    );
+    engine.record_scheduler_iteration(2, 5, 1, 4, 40, 0);
+    engine.record_decode_slot_usage(4, 2, 2);
+    let Some(first) = render(&directory) else {
+        return;
+    };
+    let value = |text: &str, name: &str| -> Option<f64> {
+        text.lines()
+            .find(|line| line.starts_with(&format!("{name}{{")) && line.contains("dp_rank=\"3\""))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .map(|number| number.parse().unwrap())
+    };
+    assert_eq!(value(&first, "tokenspeed:num_requests_resident"), Some(4.0));
+    assert_eq!(
+        value(&first, "tokenspeed:num_active_decode_slots"),
+        Some(2.0)
+    );
+    assert_eq!(
+        value(&first, "tokenspeed:num_decode_ready_waiting_reqs"),
+        Some(2.0)
+    );
+
+    engine.record_decode_slot_usage(3, 1, 0);
+    let released = render(&directory).expect("the same Python can render the second snapshot");
+    assert_eq!(
+        value(&released, "tokenspeed:num_requests_resident"),
+        Some(3.0)
+    );
+    assert_eq!(
+        value(&released, "tokenspeed:num_active_decode_slots"),
+        Some(1.0)
+    );
+    assert_eq!(
+        value(&released, "tokenspeed:num_decode_ready_waiting_reqs"),
+        Some(0.0)
+    );
+    assert_eq!(
+        value(&released, "tokenspeed:num_requests_running"),
+        Some(2.0)
+    );
+    assert_eq!(
+        value(&released, "tokenspeed:num_requests_inflight"),
+        Some(5.0)
+    );
+    assert_eq!(
+        value(&released, "tokenspeed:num_requests_waiting"),
+        Some(1.0)
+    );
+    std::fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
 fn l3_snapshots_export_their_growth_once_and_keep_quarantine_visible() {
     let directory = scratch_dir("l3");
     let exporter = Exporter::new(&MetricsConfig {
