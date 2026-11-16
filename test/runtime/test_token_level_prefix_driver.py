@@ -73,6 +73,7 @@ def _scheduler(*, with_state: bool = False) -> ts.Scheduler:
             num_device_pages=64 + 1,
             max_scheduled_tokens=256,
             max_batch_size=4,
+            max_resident_requests=4,
             prefix_granularity=PAGE,
             num_host_pages=0,
             disable_l2_cache=True,

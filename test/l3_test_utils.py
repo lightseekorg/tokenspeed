@@ -236,6 +236,7 @@ def storage_scheduler():
     cfg.num_snapshot_pages = 1
     cfg.max_scheduled_tokens = 8
     cfg.max_batch_size = 4
+    cfg.max_resident_requests = 4
     cfg.disable_l2_cache = False
     cfg.enable_l3_storage = True
     cfg.storage_config = ts.StorageConfig(

@@ -1402,7 +1402,9 @@ def test_decode_rows_packed_request_bounds_padding_and_replay(target, width, bs)
     out = tuple(tensor[2:-2] for tensor in storage)
 
     def prepare(actual, extends):
-        dsv41.decode_rows(seq, pools, *out, actual, extends, width)
+        dsv41.decode_rows(
+            seq, pools, *out, actual, extends, width, query_start_loc=None
+        )
 
     def check(actual, extends):
         lengths = [max(int(seq[i]), width) if i < actual else 0 for i in range(bs)]
@@ -1456,6 +1458,7 @@ def test_decode_rows_rejects_request_token_shape_confusion():
             2,
             0,
             3,
+            query_start_loc=None,
         )
 
 
@@ -1632,6 +1635,7 @@ def test_dspark_anchors_pick_last_accepted_verify_rows(device):
         next_tokens,
         start,
         num_prefill_outputs=extends,
+        decode_query_indptr=None,
     )
     # Extend rows keep their sampled token; decode rows take the token at the
     # last accepted verify row, with accept lengths clamped into 1..width.
@@ -1648,6 +1652,7 @@ def test_dspark_anchors_pick_last_accepted_verify_rows(device):
         cpu_next,
         cpu_start,
         num_prefill_outputs=extends,
+        decode_query_indptr=None,
     )
     assert torch.equal(cpu_next, next_tokens.cpu()) and torch.equal(
         cpu_start, start.cpu()
@@ -1662,6 +1667,7 @@ def test_dspark_anchors_pick_last_accepted_verify_rows(device):
             next_tokens,
             start,
             num_prefill_outputs=extends,
+            decode_query_indptr=None,
         )
 
 
@@ -1732,6 +1738,7 @@ def test_dspark_sparse_outputs_preserve_inactive_rows_without_recompile(device):
             next_tokens,
             starts,
             num_prefill_outputs=outputs,
+            decode_query_indptr=None,
         )
         assert next_tokens[:outputs, 0].tolist() == list(range(10, 10 + outputs))
         assert (next_tokens[outputs:extends] == -7).all()

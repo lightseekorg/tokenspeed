@@ -480,6 +480,7 @@ def test_each_request_of_a_block_forward_reads_its_own_length() -> None:
         kv_cache_quant_method="none",
         context_len=8192,
         max_bs=4,
+        max_resident_requests=4,
         speculative_num_draft_tokens=BLOCK_ROWS,
         is_draft=True,
         draft_block_decode=True,

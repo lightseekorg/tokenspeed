@@ -18,11 +18,14 @@
 """Static DSpark drafter.
 
 Static Markov head and fixed verify window (verify-all). Greedy by default;
-explicit block rejection enables stochastic proposals through the shared sampler.
+--enable-speculative-sampling samples each Markov step through the shared
+sampler, on this rank's vocabulary shard when the sampled rows stay sharded.
 No confidence head / SPS-STS / ragged verify.
 """
 
 from __future__ import annotations
+
+from collections.abc import Callable
 
 import torch
 
@@ -33,6 +36,7 @@ from tokenspeed_kernel.ops.sampling.cute_dsl import (
     markov_argmax_step,
     supports_markov_argmax_shape,
 )
+from typing_extensions import override
 
 from tokenspeed.runtime.distributed.comm_ops import all_gather_single
 from tokenspeed.runtime.execution.drafter._dspark_walk import (
@@ -42,6 +46,7 @@ from tokenspeed.runtime.execution.drafter._dspark_walk import (
 from tokenspeed.runtime.execution.drafter.dflash import DFlash
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
+from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.models.dspark import VanillaMarkov
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
@@ -69,10 +74,43 @@ class DSpark(DFlash):
         # Resolved by the first greedy walk outside graph capture.
         self._markov_argmax_resolved = False
         self._markov_argmax_workspace: MarkovArgmaxWorkspace | None = None
+        # Set by keep_draft_logits_vocab_sharded: sampled steps stay on this rank's shard.
+        self._samples_vocab_shard = False
 
     def require_full_draft_logits(self) -> None:
         """DSpark samples the target's shared head, not a draft-owned processor."""
         self.logits_processor.require_full_vocab_logits()
+
+    @override
+    def keep_draft_logits_vocab_sharded(
+        self,
+        supports: Callable[[torch.dtype, int, int], bool],
+        vocab_start: int,
+    ) -> bool:
+        """Sample each Markov step on this rank's shard of the target's head.
+
+        The step adds the Markov bias to the raw shard logits, so a processor
+        that scales or softcaps its logits keeps the gathered rows.
+
+        Args:
+            supports: The verifier's ``supports_vocab_shard``.
+            vocab_start: Global token id of the target head's shard column 0.
+
+        Returns:
+            Whether the sampled steps stay on this rank's shard.
+        """
+        head = self.lm_head
+        processor = self.logits_processor
+        if (
+            not isinstance(head, VocabParallelEmbedding)
+            or int(head.shard_indices.org_vocab_start_index) != vocab_start
+            or processor.logit_scale is not None
+            or processor.final_logit_softcapping
+            or not processor.keep_sampled_logits_vocab_sharded(head, supports)
+        ):
+            return False
+        self._samples_vocab_shard = True
+        return True
 
     @nvtx_range("dspark_sample_block", color="purple")
     def _sample_block(
@@ -86,9 +124,12 @@ class DSpark(DFlash):
         # Only the bias follows the previous token; the projection does not.
         block_logits = (
             self._block_base_logits(draft_hidden)
-            if self.draft_sampler is None
+            if self.draft_sampler is None or self._samples_vocab_shard
             else None
         )
+        if self.draft_sampler is not None and block_logits is not None:
+            self._sampled_shard_walk(block_logits, next_tokens)
+            return next_tokens
         if block_logits is not None and self._fused_walk_fits(block_logits):
             self._fused_greedy_walk(block_logits, next_tokens)
             return next_tokens
@@ -149,6 +190,23 @@ class DSpark(DFlash):
                 )
         next_tokens.clamp_(min=0)
         return next_tokens
+
+    def _sampled_shard_walk(
+        self, block_logits: torch.Tensor, next_tokens: torch.Tensor
+    ) -> None:
+        """Sample ``next_tokens[:, 1:]`` from this rank's shard of each step's logits."""
+        start = int(self.lm_head.shard_indices.org_vocab_start_index)
+        columns = int(block_logits.shape[-1])
+        for k in range(1, self.spec_num_tokens):
+            bias_fn = self._make_step_bias_fn(next_tokens[:, k - 1])
+            logits = block_logits[k - 1] + bias_fn(start, columns).to(
+                block_logits.dtype
+            )
+            shard = self.logits_processor.sampled_vocab_shard(logits, self.lm_head)
+            next_tokens[:, k].copy_(
+                self.draft_sampler.propose_vocab_shard(shard, step=k - 1)
+            )
+        next_tokens.clamp_(min=0)
 
     def _resolve_markov_argmax(
         self, block_logits: torch.Tensor

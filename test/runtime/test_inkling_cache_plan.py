@@ -88,6 +88,7 @@ def _setup(tp: int, kv_cache_dtype: torch.dtype, mxfp8: bool, budget_bytes: int)
         kernel_page_size=64,
         context_len=4096,
         max_bs=4,
+        max_resident_requests=4,
     )
     recipe = cache_recipe(
         "inkling",

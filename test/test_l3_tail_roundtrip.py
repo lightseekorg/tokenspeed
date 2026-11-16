@@ -76,6 +76,7 @@ def _scheduler(kinds):
     config.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteThrough
     config.max_scheduled_tokens = 64
     config.max_batch_size = 8
+    config.max_resident_requests = 8
     config.enable_l3_storage = True
     config.storage_config = ts.StorageConfig(
         8,

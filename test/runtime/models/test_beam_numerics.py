@@ -228,10 +228,7 @@ def test_the_route_weights_are_fp32_and_take_the_routed_scale_once():
     assert torch.equal(scaled, unscaled * torch.tensor(2.5, dtype=torch.float32))
 
 
-def test_beams_kernels_serve_nvidia_sm90_to_sm103():
-    """Beam calls its Triton kernels on the NVIDIA architectures their CUDA tests
-    checked byte for byte against the statements, and runs the statements on
-    every other platform."""
+def test_beams_kernels_serve_nvidia_sm90_and_newer():
     original = current_platform()
     try:
         for vendor, arch, served in (
@@ -239,8 +236,8 @@ def test_beams_kernels_serve_nvidia_sm90_to_sm103():
             ("nvidia", ArchVersion(10, 0), True),
             ("nvidia", ArchVersion(10, 3), True),
             ("nvidia", ArchVersion(8, 0), False),
-            ("nvidia", ArchVersion(10, 7), False),
-            ("nvidia", ArchVersion(12, 0), False),
+            ("nvidia", ArchVersion(10, 7), True),
+            ("nvidia", ArchVersion(12, 0), True),
             ("amd", ArchVersion(9, 5), False),
         ):
             Platform.override(
@@ -455,7 +452,7 @@ def test_logits_projection_and_softcap_dtypes(loaded, softcap):
     if softcap is not None:
         expected = (expected.float() / softcap).tanh() * softcap
     assert actual.dtype == expected.dtype
-    # On SM90 to SM103 the one-pass softcap kernel: the statement's bytes.
+    # On SM90 and newer the one-pass softcap kernel: the statement's bytes.
     assert torch.equal(actual, expected)
 
 

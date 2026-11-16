@@ -24,7 +24,7 @@ import itertools
 
 import pytest
 import torch
-from fused_boundary_helpers import boundary_case
+from fused_boundary_helpers import armed_blocks, boundary_case
 from tokenspeed_kernel.numerics.torch.layernorm import (
     torch_affine_rmsnorm,
     torch_weightless_qk_rmsnorm,
@@ -591,3 +591,46 @@ def test_single_pass_route_reduction_matches_two_pass(
             )
         else:
             assert torch.equal(output, outputs[0])
+
+
+@pytest.mark.parametrize("device", ["cuda"])
+@pytest.mark.parametrize("rows", [1, 65, 200])
+# One block reads rows as they stand; four are the column blocks of a TP4 gather.
+@pytest.mark.parametrize("blocks", [1, 4])
+def test_triton_boundary_gathers_a_mailbox_with_the_ordinary_bits(
+    device: str, rows: int, blocks: int
+) -> None:
+    """A one-block-per-rank mailbox gives an ordinary branch's bits; every word read is re-armed."""
+    # The half-polled sentinel: a NaN payload no GEMM emits.
+    sentinel = 0xFFFFFFFF
+    args = boundary_case("ffn_linked", rows, device)
+    stream, branch = args[:2]
+    plain = triton_boundary(*args, True, None, 1)
+    mailbox = armed_blocks(branch, rows + 8, blocks)
+    got = triton_boundary(stream, mailbox[:, :rows], *args[2:], True, sentinel, 1)
+    for ours, theirs in zip(got, plain, strict=True):
+        assert torch.equal(ours, theirs)
+    assert (mailbox.view(torch.int32) == -1).all()
+    with pytest.raises(ValueError, match="partials per rank"):
+        triton_boundary(stream, mailbox[:, :rows], *args[2:], True, sentinel, 2)
+    with pytest.raises(ValueError, match="contiguous blocks"):
+        triton_boundary(
+            stream,
+            torch.cat([mailbox, mailbox], dim=2)[:, :rows, : branch.shape[1] // blocks],
+            *args[2:],
+            True,
+            sentinel,
+            1,
+        )
+    # An odd block stride would split the 32-bit words the kernel re-arms.
+    width = branch.shape[1] // blocks
+    odd = torch.empty(blocks * (rows * width + 1), dtype=torch.bfloat16, device=device)
+    with pytest.raises(ValueError, match="whole 32-bit words"):
+        triton_boundary(
+            stream,
+            odd.as_strided((blocks, rows, width), (rows * width + 1, width, 1)),
+            *args[2:],
+            True,
+            sentinel,
+            1,
+        )

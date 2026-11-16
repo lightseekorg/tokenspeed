@@ -55,6 +55,7 @@ from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
     Qwen4ExpBackend,
 )
 from tokenspeed.runtime.moe.expert_load_rows import ExpertLoadRowMask
+from tokenspeed.runtime.sampling.backends.base import CUDA_GRAPH_VARIANT_DEFAULT
 
 
 def _runner(
@@ -133,6 +134,11 @@ def _runner(
         SimpleNamespace(
             attn_backend=draft_backend,
             replay_decode_graph=lambda graph, *, bs, graph_bs: graph.replay(),
+            # Native draft width (4 = max_tokens_per_req): full padded extent.
+            prepare_decode_graph_token_layout=lambda ctx, *, actual_bs, padded_bs: (
+                padded_bs * 4
+            ),
+            decode_graph_query_capacities=lambda bs: (bs * 4,),
         )
         if has_drafter
         else None
@@ -150,7 +156,8 @@ def _runner(
     wrapper._padded_bs = lambda bs, ctx: 4
     wrapper._prepare_decode_metadata = lambda *args, **kwargs: events.append("metadata")
     wrapper._init_forward_metadata = lambda *args, **kwargs: events.append("metadata")
-    wrapper._cuda_graph_key = lambda bs: bs
+    wrapper._cuda_graph_key = lambda bs: (CUDA_GRAPH_VARIANT_DEFAULT, bs)
+    wrapper._reported_query_graphs = set()
     wrapper._prepare_request_token_history_graph_inputs = lambda **kwargs: None
     wrapper._expert_load_rows = None
     wrapper._mega_moe_live_requests = None
@@ -171,8 +178,8 @@ def _runner(
         return result[0][:8], result[1][:2], None, None, None
 
     wrapper._forward_func = lambda **kwargs: execute()
-    wrapper.graphs = {4: SimpleNamespace(replay=execute)}
-    wrapper.output_buffers = {4: result}
+    wrapper.graphs = {(CUDA_GRAPH_VARIANT_DEFAULT, 4): SimpleNamespace(replay=execute)}
+    wrapper.output_buffers = {(CUDA_GRAPH_VARIANT_DEFAULT, 4): result}
     return wrapper, events, commits
 
 
@@ -293,13 +300,15 @@ def test_padded_replay_marks_filler_rows_then_restores(fail_forward, has_drafter
     wrapper._expert_load_rows = load_rows
     wrapper.world_size = 1
     seen = []
-    replay = wrapper.graphs[4].replay
+    replay = wrapper.graphs[(CUDA_GRAPH_VARIANT_DEFAULT, 4)].replay
 
     def recording_replay():
         seen.append((live_requests.tolist(), load_rows.rows(16).tolist()))
         return replay()
 
-    wrapper.graphs[4] = SimpleNamespace(replay=recording_replay)
+    wrapper.graphs[(CUDA_GRAPH_VARIANT_DEFAULT, 4)] = SimpleNamespace(
+        replay=recording_replay
+    )
     with (
         pytest.raises(RuntimeError, match="forward failed")
         if fail_forward

@@ -185,7 +185,7 @@ std::vector<std::int64_t> CapacityModel::ConcurrentGroupPages(std::int64_t max_t
     if (max_context_len < 0) {
         throw std::invalid_argument("CapacityModel: max_context_len must be >= 0");
     }
-    const std::int64_t live_requests = config_.max_batch_size;
+    const std::int64_t live_requests = config_.max_resident_requests;
     const std::int64_t decode_width = decodeWidth();
     const std::int64_t protected_tokens = protectedTokens() + DraftWindowTokens(config_);
     const std::int64_t chunk_tokens = config_.max_scheduled_tokens;

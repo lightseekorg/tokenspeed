@@ -28,13 +28,12 @@ import torch
 
 @cache
 def _module():
-    from flashinfer.jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
+    from flashinfer.jit.core import gen_jit_spec
 
     source = Path(__file__).parent / "csrc" / "kimi3_router.cu"
     return gen_jit_spec(
         "tokenspeed_kimi3_router",
         [source],
-        extra_cuda_cflags=[*sm100a_nvcc_flags, *sm103a_nvcc_flags],
         extra_include_paths=[source.parent],
         use_fast_math=False,
     ).build_and_load()

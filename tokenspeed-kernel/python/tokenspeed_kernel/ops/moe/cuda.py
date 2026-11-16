@@ -112,8 +112,7 @@ if routing_available():
     name="cuda_kimi3_sigmoid_bias_topk",
     solution="cuda",
     capability=CapabilityRequirement(
-        min_arch_version=ArchVersion(10, 0),
-        max_arch_version=ArchVersion(10, 3),
+        min_arch_version=ArchVersion(9, 0),
         vendors=frozenset({"nvidia"}),
     ),
     signatures=frozenset(
@@ -164,8 +163,6 @@ __all__ = [
     "moe_finalize_fuse_shared",
 ]
 
-# The vendored front serves SM100 and SM103 parts with the SM counts its plan
-# rules are validated for (148 and 152); ``available`` checks both.
 _FRONT_PLATFORM = current_platform()
 if _FRONT_PLATFORM.is_nvidia and kimi3_latent_front.available():
 

@@ -546,11 +546,13 @@ TEST(CheckpointRetention, ResumeGapCountsNewRequestsSinceTheCheckpointsLastUse) 
 TEST(CheckpointRetention, DefaultIsSixteenBatchesOfNewRequests) {
     SchedulerConfig config;
     config.max_batch_size = 8;
+    config.max_resident_requests = config.max_batch_size;
     EXPECT_EQ(config.CheckpointRetentionRequests(), 128);
     EXPECT_EQ(config.checkpoint_retention_leaf_distance, 0);
     config.checkpoint_retention_requests = 0;
     EXPECT_EQ(config.CheckpointRetentionRequests(), 0);
     config.max_batch_size = 1 << 20;
+    config.max_resident_requests = config.max_batch_size;
     config.checkpoint_retention_requests.reset();
     EXPECT_EQ(config.CheckpointRetentionRequests(), kMaxCheckpointRetentionRequests);
 }

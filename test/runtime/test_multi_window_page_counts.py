@@ -100,7 +100,8 @@ def _pages(specs, **kw):
         virtual_packing={spec.group_id: 1 for spec in specs},
         limits=SchedulerLimits(
             role=ts.SchedulerConfig.Role.Fused,
-            max_live_requests=defaults["max_live_requests"],
+            max_batch_size=defaults["max_live_requests"],
+            max_resident_requests=defaults["max_live_requests"],
             max_scheduled_tokens=defaults["max_scheduled_tokens"],
             max_context_len=defaults["max_context_len"],
             decode_input_tokens=1,
@@ -129,6 +130,41 @@ class TestMultiWindowPageCountsTest:
     tail its prompt end publishes (a sliding group at most its lookback for
     each, so a window of one charges neither).
     """
+
+    def test_decode_extra_residents_each_hold_two_state_slots(self):
+        specs = (
+            CacheGroupSpec(
+                group_id="history",
+                attn_kind="full_history",
+                rows_per_page=PAGE,
+                entry_stride_tokens=1,
+                replayable=False,
+                transfer_policy="full_suffix",
+            ),
+            CacheGroupSpec(
+                group_id="state",
+                attn_kind="state",
+                replayable=False,
+                transfer_policy="latest_snapshot",
+            ),
+        )
+        model = capacity_model(
+            specs,
+            prefix_granularity=PAGE,
+            virtual_packing={"history": 1, "state": 1},
+            limits=SchedulerLimits(
+                role=ts.SchedulerConfig.Role.D,
+                max_batch_size=2,
+                max_resident_requests=5,
+                max_scheduled_tokens=128,
+                max_context_len=4096,
+                decode_input_tokens=1,
+                overlap_schedule_depth=0,
+                disable_prefix_cache=False,
+            ),
+        )
+        pages = model.concurrent_group_pages(max_total_tokens=512, max_context_len=4096)
+        assert pages[1] == 10
 
     def test_each_window_budgets_independently(self):
         pages = _pages(

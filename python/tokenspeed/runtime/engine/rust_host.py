@@ -537,8 +537,9 @@ class HostConfig:
             ``--grammar-backend none``.
         eager_grammar: The forward fills grammar bitmasks from the
             matchers' committed state (``DeviceSpecs.uses_eager_grammar``).
-        prefill_delay: The fused engine's prefill-delay gate intervals,
-            (attempt, any) rounds; None plans prefill every round
+        prefill_delay: The fused engine's prefill-delay gate,
+            (attempt, any) intervals in rounds and whether a window is one
+            prefill round; None plans prefill every round
             (``ServerArgs.prefill_delay``).
     """
 
@@ -604,9 +605,9 @@ class HostConfig:
     grammar: GrammarSettings | None
     eager_grammar: bool
     # The fused engine's prefill-delay gate, (attempt, any) intervals in
-    # rounds; None plans prefill every round. See
+    # rounds and single_round; None plans prefill every round. See
     # ``ServerArgs.prefill_delay``.
-    prefill_delay: tuple[int, int] | None
+    prefill_delay: tuple[int, int, bool] | None
 
 
 def host_in_flight_depth(server_args: ServerArgs) -> int:
@@ -1192,7 +1193,7 @@ class HostBootstrap:
         self._server_args = server_args
         self._connection = connection
         mapping = server_args.mapping
-        gpu_id = mapping.rank % mapping.nprocs_per_node + server_args.base_gpu_id
+        gpu_id = mapping.gpu_id
         self._gpu_id = gpu_id
         self._port_args = port_args
         self._memory_sampler: MemoryMetricSampler | None = None
@@ -1261,6 +1262,9 @@ class HostBootstrap:
             )
             # The scheduler's request slots are per attention-DP rank.
             max_batch_size = server_args.max_num_seqs // max(mapping.attn.dp_size, 1)
+            max_resident_requests = (
+                max_batch_size + server_args.disaggregation_decode_extra_slots
+            )
             device = build_device_side(
                 server_args=server_args,
                 model_config=model_config,
@@ -1272,6 +1276,7 @@ class HostBootstrap:
                 overlap_schedule_depth=overlap_schedule_depth,
                 decode_input_tokens=decode_input_tokens,
                 max_batch_size=max_batch_size,
+                max_resident_requests=max_resident_requests,
                 kv_transfer_builder=functools.partial(
                     build_host_peer, outbox=pd_outbox
                 ),
@@ -1302,6 +1307,7 @@ class HostBootstrap:
                 storage_config=storage_config,
                 max_scheduled_tokens=server_args.chunked_prefill_size,
                 max_batch_size=max_batch_size,
+                max_resident_requests=max_resident_requests,
                 decode_input_tokens=decode_input_tokens,
                 overlap_schedule_depth=overlap_schedule_depth,
                 enable_kv_cache_events=kv_events,

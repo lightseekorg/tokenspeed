@@ -32,6 +32,21 @@ from tokenspeed_kernel.thirdparty.cuda import kimi3_latent_front as front
 @pytest.mark.parametrize(
     "rows,sm_count,expected",
     [
+        (
+            1024,
+            128,
+            dict(
+                m_tiles=8,
+                num_items=272,
+                full_items=256,
+                sk_ipc=56,
+                sk_max_seg=2,
+                sk_total=896,
+                sk_tiles=8,
+                evict_first=False,
+                grid=544,
+            ),
+        ),
         # 16 row tiles, 8 pair rows: 528 pair tiles over 76 resident clusters leave 72, more
         # than half a wave, so the plan stays whole; 152-SM parts stream evict_first up to
         # eight pair rows.
@@ -157,8 +172,3 @@ def test_front_plan_is_a_private_copy():
 def test_front_plan_refuses_rows_below_the_vendored_programs(rows):
     with pytest.raises(ValueError, match="at least 513 rows"):
         front.front_plan(rows, 152)
-
-
-def test_front_plan_refuses_unqualified_sm_counts():
-    with pytest.raises(ValueError, match="validated for"):
-        front.front_plan(4096, 132)

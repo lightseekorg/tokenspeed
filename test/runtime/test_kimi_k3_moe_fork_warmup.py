@@ -96,21 +96,31 @@ def _make_moe(fork: _SpyFork, *, num_tokens: int) -> SimpleNamespace:
         fork.events.append("up_proj_ag")
         return hidden
 
+    def inject_residual(shared_partial, prefix_sum):
+        assert fork.inside_scope and fork.inside_branch
+        assert num_tokens > 32 and prefix_sum is not None
+        fork.events.append("inject_residual")
+
     def up_proj_inject_ar(routed_latent, shared_partial, prefix_sum):
         assert not fork.inside_scope
         assert num_tokens > 32 and shared_partial.shape == hidden.shape
+        # The residual is added exactly once: in the branch or here.
+        assert (prefix_sum is None) == ("inject_residual" in fork.events)
         fork.events.append("up_proj_inject_ar")
         return hidden
 
     comm = SimpleNamespace(
         defer_finalize=False,
         shared_rs=shared_rs,
+        inject_residual=inject_residual,
         routed_ar_fusion=routed_ar_fusion,
         up_proj_ag=up_proj_ag,
         up_proj_inject_ar=up_proj_inject_ar,
     )
     return SimpleNamespace(
-        mapping=SimpleNamespace(attn=SimpleNamespace(dp_size=1)),
+        mapping=SimpleNamespace(
+            attn=SimpleNamespace(dp_size=1), moe=SimpleNamespace(tp_ep_size=8)
+        ),
         execution_plan=SimpleNamespace(use_native=False),
         native_latent_moe=None,
         decode_moe=None,
@@ -163,7 +173,7 @@ def _run(*, graph_phase: bool, capture_mode: bool, num_tokens: int) -> dict[str,
     assert len(fork.calls) == 1
     assert fork.events == (
         ["fork"]
-        + (["shared_rs"] if num_tokens <= 32 else [])
+        + (["shared_rs"] if num_tokens <= 32 else ["inject_residual"])
         + ["routed_ar_fusion", "join"]
         + (["up_proj_ag"] if num_tokens <= 32 else ["up_proj_inject_ar"])
     )
@@ -181,6 +191,30 @@ def test_moe_preserves_stream_scheduling_in_eager_warmup_and_capture(
         graph_phase=graph_phase, capture_mode=capture_mode, num_tokens=num_tokens
     )
     assert call == {"enable": graph_phase, "overlap": capture_mode}
+
+
+def test_one_rank_moe_adds_the_residual_after_the_join():
+    fork = _SpyFork()
+    moe = _make_moe(fork, num_tokens=33)
+    moe.mapping.moe.tp_ep_size = 1
+    with (
+        mock.patch(
+            "tokenspeed.runtime.models.kimi_k3.get_is_cuda_graph_phase",
+            return_value=True,
+        ),
+        mock.patch(
+            "tokenspeed.runtime.models.kimi_k3.get_is_capture_mode", return_value=True
+        ),
+    ):
+        KimiLinearMoE.forward(
+            moe,
+            torch.zeros(33, 4),
+            torch.zeros(33, 4),
+            num_global_tokens=33,
+            max_num_tokens_per_gpu=33,
+            prefix_is_sharded=False,
+        )
+    assert fork.events == ["fork", "routed_ar_fusion", "join", "up_proj_inject_ar"]
 
 
 @pytest.mark.parametrize("prequantized", [False, True])

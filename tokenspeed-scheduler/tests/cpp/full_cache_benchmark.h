@@ -80,6 +80,7 @@ inline SchedulerConfig MakeSchedulerConfig(const FullCacheConfig& workload) {
     config.max_retracted_requests = 0;
     config.max_scheduled_tokens = workload.batch_size * workload.request_tokens;
     config.max_batch_size = workload.batch_size;
+    config.max_resident_requests = config.max_batch_size;
     config.decode_input_tokens = 1;
     config.overlap_schedule_depth = 0;
     config.disable_l2_cache = true;
