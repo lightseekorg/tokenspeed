@@ -140,6 +140,9 @@ class IrisAttnResState:
         self.peer_inboxes = tuple(base + offset for base in self.heap_bases)
         assert lamport_max_rows <= ATTNRES_LAMPORT_MAX_ROWS
         self.lamport_max_rows = lamport_max_rows
+        self.lamport_mailbox: torch.Tensor | None = None
+        self.lamport_epochs: torch.Tensor | None = None
+        self.peer_lamport_mailboxes: tuple[int, ...] = ()
         if lamport_max_rows:
             self.lamport_mailbox = peers.ctx.empty(
                 _lamport_mailbox_shape(lamport_max_rows, self.world_size), dtype=dtype
