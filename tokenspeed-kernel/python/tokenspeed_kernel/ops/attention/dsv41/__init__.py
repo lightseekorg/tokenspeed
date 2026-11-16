@@ -961,8 +961,10 @@ def prepare_index_topk(
         index_metadata: That call's object from new_index_metadata.
 
     Returns:
-        True when the selected scorer prepared its geometry; False when it has
-        none to prepare (it then builds what it needs during the call).
+        True when the selected scorer has a prepare step and it ran; that step
+        may still decline inputs it does not cover and build nothing. False
+        when the scorer has no prepare step. Either way the call then builds
+        whatever it does not find.
     """
     from tokenspeed_kernel.ops.attention.dsv41._metadata import IndexMetadata
 
