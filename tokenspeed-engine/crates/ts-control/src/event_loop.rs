@@ -497,6 +497,24 @@ pub struct PrefillDelay {
     /// `attempt_interval`, otherwise the ALL points could never be reached
     /// consecutively.
     pub any_interval: u64,
+    /// `--prefill-single-round`: one prefill round per window. The round
+    /// after a prefill round is not an ALL point while any rank would
+    /// decode, so a backlog does not drain in consecutive prefill rounds;
+    /// the next ALL point is `attempt_interval` rounds later. An idle engine
+    /// still admits at once.
+    pub single_round: bool,
+}
+
+impl PrefillDelay {
+    /// Whether round `rounds` since the last prefill round is an ANY point
+    /// and whether it is an ALL point; `decoding` says whether any rank
+    /// would decode this round.
+    fn attempt_points(&self, rounds: u64, decoding: bool) -> (bool, bool) {
+        let any_point = rounds != 0 && rounds % self.any_interval == 0;
+        let all_point =
+            rounds % self.attempt_interval == 0 && !(self.single_round && rounds == 0 && decoding);
+        (any_point, all_point)
+    }
 }
 
 /// The optional subsystems a loop coordinates; each is `None` on an engine
@@ -2464,8 +2482,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             return true;
         }
         let rounds = self.rounds_since_prefill;
-        let any_point = rounds != 0 && rounds % delay.any_interval == 0;
-        let all_point = rounds % delay.attempt_interval == 0;
+        let (any_point, all_point) =
+            delay.attempt_points(rounds, self.dp_has_decode_work.iter().any(|d| *d));
         if !any_point && !all_point {
             return false;
         }
@@ -2936,5 +2954,30 @@ mod tests {
             5
         );
         assert_eq!(walks, 4);
+    }
+
+    #[test]
+    fn single_round_windows_close_the_round_after_a_prefill_while_ranks_decode() {
+        let delay = |single_round| PrefillDelay {
+            attempt_interval: 3,
+            any_interval: 6,
+            single_round,
+        };
+        let all_points = |single_round, decoding| -> Vec<u64> {
+            (0..7)
+                .filter(|&r| delay(single_round).attempt_points(r, decoding).1)
+                .collect()
+        };
+        // Draining: the round after a prefill round is an ALL point.
+        assert_eq!(all_points(false, true), [0, 3, 6]);
+        // One round per window while anything decodes.
+        assert_eq!(all_points(true, true), [3, 6]);
+        // An idle engine admits at once.
+        assert_eq!(all_points(true, false), [0, 3, 6]);
+        // ANY points are unchanged.
+        let any_points: Vec<u64> = (0..13)
+            .filter(|&r| delay(true).attempt_points(r, true).0)
+            .collect();
+        assert_eq!(any_points, [6, 12]);
     }
 }

@@ -262,7 +262,18 @@ def test_server_args_refuse_a_prefill_decode_interval_it_cannot_honor(flags, err
         (["--prefill-decode-interval", "64"], None, 64),
         (
             ["--prefill-attempt-interval", "4", "--prefill-any-attempt-interval", "64"],
-            (4, 64),
+            (4, 64, False),
+            0,
+        ),
+        (
+            [
+                "--prefill-attempt-interval",
+                "4",
+                "--prefill-any-attempt-interval",
+                "64",
+                "--prefill-single-round",
+            ],
+            (4, 64, True),
             0,
         ),
     ],
@@ -293,6 +304,22 @@ def test_prefill_delay_rejects_an_incomplete_pair_at_construction(attempt, any_a
             prefill_attempt_interval=attempt,
             prefill_any_attempt_interval=any_attempt,
         )
+
+
+def test_prefill_single_round_requires_the_gate():
+    with pytest.raises(
+        ValueError, match="--prefill-single-round requires --prefill-attempt-interval"
+    ):
+        prepare_server_args(
+            ["--model", "x", "--max-num-seqs", "8", "--prefill-single-round"]
+        )
+
+
+def test_prefill_single_round_is_rejected_without_the_gate_after_changes():
+    args = ServerArgs(model="x", max_num_seqs=8)
+    args.prefill_single_round = True
+    with pytest.raises(ValueError, match="--prefill-single-round requires"):
+        _ = args.prefill_delay
 
 
 @pytest.mark.parametrize("mixed", [False, True])

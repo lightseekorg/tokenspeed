@@ -480,6 +480,10 @@ class ServerArgs:
     # Rounds between ANY attempt points: one rank's backlog opens the gate,
     # bounding how long a prefill waits. Must be >= prefill_attempt_interval.
     prefill_any_attempt_interval: int | None = None
+    # One prefill round per window: the round after a prefill round is not
+    # an ALL point while any rank decodes, so a backlog does not drain in
+    # consecutive prefill rounds. Requires prefill_attempt_interval.
+    prefill_single_round: bool = False
     # Opt-in: the prefill forward that spans a long prompt's last prefix-page
     # boundary before its replay tail (normally the final token) also writes
     # the recurrent state there, where hybrid models publish a checkpoint;
@@ -3022,7 +3026,7 @@ class ServerArgs:
         intervals = self.prefill_delay
         if intervals is None:
             return
-        attempt, any_attempt = intervals
+        attempt, any_attempt, _ = intervals
         if attempt < 1:
             raise ValueError(f"--prefill-attempt-interval must be >= 1, got {attempt}")
         if any_attempt < attempt:
@@ -3048,18 +3052,24 @@ class ServerArgs:
                 )
 
     @property
-    def prefill_delay(self) -> tuple[int, int] | None:
-        """The gate intervals, or None; reject an incompletely configured pair."""
+    def prefill_delay(self) -> tuple[int, int, bool] | None:
+        """The gate's (attempt, any, single_round) settings, or None; reject
+        an incompletely configured gate."""
         attempt = self.prefill_attempt_interval
         any_attempt = self.prefill_any_attempt_interval
         if attempt is None and any_attempt is None:
+            if self.prefill_single_round:
+                raise ValueError(
+                    "--prefill-single-round requires --prefill-attempt-interval "
+                    "and --prefill-any-attempt-interval"
+                )
             return None
         if attempt is None or any_attempt is None:
             raise ValueError(
                 "--prefill-attempt-interval and --prefill-any-attempt-interval "
                 "must be set together"
             )
-        return (attempt, any_attempt)
+        return (attempt, any_attempt, self.prefill_single_round)
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -3596,6 +3606,17 @@ class ServerArgs:
             help="Prefill delay: rounds between ANY attempt points, where "
             "one rank's backlog opens the gate, bounding how long a prefill "
             "waits. Must be >= --prefill-attempt-interval.",
+        )
+        parser.add_argument(
+            "--prefill-single-round",
+            action="store_true",
+            default=ServerArgs.prefill_single_round,
+            help="Prefill delay: one prefill round per window. The round "
+            "after a prefill round is not an ALL point while any rank would "
+            "decode, so a backlog does not drain in consecutive prefill "
+            "rounds; the next ALL point is --prefill-attempt-interval rounds "
+            "later. An idle engine still admits at once. Requires "
+            "--prefill-attempt-interval.",
         )
         # Other runtime options
         parser.add_argument(

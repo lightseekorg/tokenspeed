@@ -2295,7 +2295,11 @@ async fn a_long_prompt_is_prefilled_in_chunks() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn delayed_long_prefill_completes_above_the_watermark() {
-    for layout in [Layout::Single, Layout::Dp(2)] {
+    for (layout, single_round) in [
+        (Layout::Single, false),
+        (Layout::Dp(2), false),
+        (Layout::Dp(2), true),
+    ] {
         for depth in [0, 1] {
             let engine = start_ranks_with(
                 layout,
@@ -2306,6 +2310,7 @@ async fn delayed_long_prefill_completes_above_the_watermark() {
                     prefill_delay: Some(PrefillDelay {
                         attempt_interval: 2,
                         any_interval: 4,
+                        single_round,
                     }),
                     ..Setup::default()
                 },
