@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+
 import pytest
 import torch
 from tokenspeed_kernel.numerics.torch.layernorm import (
@@ -344,6 +346,34 @@ def test_fused_qk_rmsnorm_rope_matches_the_statements(
         assert torch.equal(got, want)
 
 
+def test_fused_qk_rmsnorm_rope_heads_do_not_depend_on_their_neighbors(
+    device: str,
+) -> None:
+    """Beam's 12 + 2 heads per rank, bit for bit each head launched alone."""
+    q, k, q_weight, k_weight, cache, positions = _rope_inputs(37, 12, 2, device)
+    q_out, k_out = _rope(q, k, q_weight, k_weight, cache, positions)
+    head_dim = q_weight.shape[0]
+    for head in range(12):
+        kv = head % 2
+        q_cols = slice(head * head_dim, (head + 1) * head_dim)
+        kv_cols = slice(kv * head_dim, (kv + 1) * head_dim)
+        alone = _rope(q[:, q_cols], k[:, kv_cols], q_weight, k_weight, cache, positions)
+        assert torch.equal(alone[0], q_out[:, q_cols])
+        assert torch.equal(alone[1], k_out[:, kv_cols])
+
+
+def test_fused_qk_rmsnorm_rope_rows_do_not_depend_on_the_call_size(
+    device: str,
+) -> None:
+    """A prefill-sized call's rows, bit for bit the same rows called alone."""
+    q, k, q_weight, k_weight, cache, positions = _rope_inputs(601, 12, 2, device)
+    whole = _rope(q, k, q_weight, k_weight, cache, positions)
+    for rows in (slice(0, 1), slice(37, 101), slice(597, 601)):
+        part = _rope(q[rows], k[rows], q_weight, k_weight, cache, positions[rows])
+        for got, want in zip(part, whole, strict=True):
+            assert torch.equal(got, want[rows])
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("hidden_size", [128, 512, 5120])
 def test_reference_rmsnorm_matches_eager_cast_order(
@@ -681,3 +711,7 @@ def test_triton_gemma_rmsnorm_compiles_once_across_batch_sizes(device: str) -> N
     with assert_no_triton_compile(_add_rmsnorm_kernel, _grouped_gemma_rmsnorm_kernel):
         for rows in (1, 16, 37, 64, 300):
             run(rows)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))
