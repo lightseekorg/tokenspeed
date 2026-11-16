@@ -2727,6 +2727,22 @@ partial-output reduction; SWA and compressor tails remain replicated. See
 [the V4.1 context-parallel contract](deepseek-v41-context-parallelism.md) for
 ownership, graph lifetime and supported configurations.
 
+### V4.1 context encoder/decoder with attention DP
+
+Ordinary EP supports attention, dense and MoE TP1 with attention DP. Its
+prefills require `--disable-prefill-graph`: CED narrowing changes each rank's
+decoder row count, which eager execution exchanges on a dedicated host
+process group before the CED source layer and again before the remaining
+decoder layers. Idle ranks enter the same exchanges and expert collectives
+with zero rows. The stage-local counts are restored after each stage; decode
+keeps the scheduler's graph-compatible counts. Fused EP retains its own
+dispatch and row-count exchange.
+
+For mixed text/image prefills, ordinary EP gathers the routing mask with
+the activations in eight additional aligned lanes. The mask therefore
+follows the same rank and row order as the gathered activations, including
+when a local CED tail is empty.
+
 ### Distributed draft tuning
 
 The startup draft decode uses one request per attention TP rank so that
