@@ -929,6 +929,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         let plan = self
             .scheduler
             .next_execution_plan(allow_prefill, self.config.prefill_delay.is_some());
+        if let Some(batch) = plan.remote_prefill() {
+            self.outputs.mark_planned(&batch.request_ids, true);
+        }
         if tracing::enabled!(tracing::Level::DEBUG) {
             if let Some(batch) = plan.remote_prefill() {
                 tracing::debug!(rids = ?batch.request_ids, "remote prefill planned");
@@ -954,6 +957,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             .into_iter()
             .next()
             .filter(|batch| !batch.request_ids.is_empty());
+        if let Some(batch) = &forward {
+            self.outputs.mark_planned(&batch.request_ids, false);
+        }
         // The scheduler's counts as this round planned, for the metrics and
         // the batch line: nothing between the two mutates the scheduler, so
         // they are taken once, and only for a reader.

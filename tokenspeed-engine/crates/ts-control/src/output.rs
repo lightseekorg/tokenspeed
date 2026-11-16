@@ -746,6 +746,32 @@ impl OutputProcessor {
     pub fn mark_submitted(&mut self, rid: &str, at: Instant) {
         if let Some(state) = self.states.get_mut(rid) {
             state.submitted_at = Some(at);
+            if let Some(trace) = state.ttft.as_mut() {
+                let now = trace.ms();
+                trace.submitted_ms.get_or_insert(now);
+            }
+        }
+    }
+
+    /// Stamp the first plan selecting a sampled request, before DP agreement.
+    /// Remote admission reserves the D landing pages; it is not a forward.
+    pub fn mark_planned(&mut self, rids: &[String], remote_admission: bool) {
+        if self.finish_log.ttft_percentage == 0 {
+            return;
+        }
+        for rid in rids {
+            if let Some(trace) = self
+                .states
+                .get_mut(rid)
+                .and_then(|state| state.ttft.as_mut())
+            {
+                let now = trace.ms();
+                if remote_admission {
+                    trace.remote_admitted_ms.get_or_insert(now);
+                } else {
+                    trace.planned_ms.get_or_insert(now);
+                }
+            }
         }
     }
 
@@ -1951,8 +1977,11 @@ mod tests {
                     };
                     processor.sample_ttft(&mut state, Some(&bootstrap));
                     register_state(&mut processor, rid.into(), state);
+                    processor.mark_submitted(rid, Instant::now());
+                    processor.bootstrapped(rid);
                     processor.bootstrapped(rid);
                     if role == Role::Prefill {
+                        processor.mark_planned(&[rid.into()], false);
                         processor.mark_scheduled(&[rid.into()]);
                         let committed = processor
                             .commit(&batch(&[(rid, 2, 0, 2)], 1), None, &result(&[10], &[1]))
@@ -1964,6 +1993,7 @@ mod tests {
                         }
                         processor.finish_prefill(rid);
                     } else {
+                        processor.mark_planned(&[rid.into()], true);
                         processor.remote_prefill_done(rid, 10, 1, None);
                         processor.finish_remote_prefill_only(rid);
                     }
@@ -1986,12 +2016,76 @@ mod tests {
             assert_eq!(summary["room"], 4);
             assert_eq!(summary["status"], "first_output");
             assert!(summary["phases_ms"]["bootstrap"].is_number());
+            assert!(summary["milestones_ms"]["submitted"].is_number());
         }
         assert_eq!(summaries[0]["prefill_chunks"], 1);
         assert!(summaries[0]["phases_ms"]["prefill"].is_number());
+        assert!(summaries[0]["phases_ms"]["ready_to_plan"].is_number());
+        assert!(summaries[0]["phases_ms"]["plan_to_dispatch"].is_number());
+        assert!(summaries[1]["phases_ms"]["remote_admission"].is_number());
+        assert!(summaries[1]["milestones_ms"]["first_planned"].is_null());
         assert!(summaries[0]["phases_ms"]["transfer_observe"].is_number());
         assert!(summaries[0]["phases_ms"]["output_pack"].is_number());
         assert!(summaries[1]["phases_ms"]["output_after_landing"].is_number());
+    }
+
+    #[test]
+    fn sampled_milestones_keep_the_first_submission_and_each_plan_kind() {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(std::io::sink)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let mut processor = OutputProcessor::new(
+                None,
+                1,
+                None,
+                Role::Decode,
+                FinishLog {
+                    enabled: true,
+                    request_stats: false,
+                    ttft_percentage: 100,
+                },
+                false,
+                None,
+            );
+            let mut state = RequestState::new(vec![8, 9], 4, BTreeSet::new(), true, None, false);
+            processor.sample_ttft(
+                &mut state,
+                Some(&ts_pd::BootstrapInfo {
+                    room: 4,
+                    host: "p".into(),
+                    port: 8080,
+                }),
+            );
+            register_state(&mut processor, "r".into(), state);
+            processor.mark_submitted("r", Instant::now());
+            processor.bootstrapped("r");
+            processor.mark_planned(&["r".into()], true);
+            let trace = processor.state("r").unwrap().ttft.as_ref().unwrap();
+            let first_submit = trace.submitted_ms.unwrap();
+            let remote_admitted = trace.remote_admitted_ms.unwrap();
+            assert!(trace.planned_ms.is_none());
+
+            processor.remote_prefill_done("r", 10, 0, None);
+            processor.mark_planned(&["r".into()], false);
+            processor.mark_scheduled(&["r".into()]);
+            let trace = processor.state("r").unwrap().ttft.as_ref().unwrap();
+            let first_plan = trace.planned_ms.unwrap();
+            let first_dispatch = trace.scheduled_ms.unwrap();
+            assert!(remote_admitted <= trace.transfer_done_ms.unwrap());
+            assert!(trace.transfer_done_ms.unwrap() <= first_plan);
+            assert!(first_plan <= first_dispatch);
+
+            processor.mark_submitted("r", Instant::now());
+            processor.mark_planned(&["r".into()], true);
+            processor.mark_planned(&["r".into()], false);
+            processor.mark_scheduled(&["r".into()]);
+            let trace = processor.state("r").unwrap().ttft.as_ref().unwrap();
+            assert_eq!(trace.submitted_ms, Some(first_submit));
+            assert_eq!(trace.remote_admitted_ms, Some(remote_admitted));
+            assert_eq!(trace.planned_ms, Some(first_plan));
+            assert_eq!(trace.scheduled_ms, Some(first_dispatch));
+        });
     }
 
     #[test]
