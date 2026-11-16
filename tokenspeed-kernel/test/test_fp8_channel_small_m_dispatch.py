@@ -20,7 +20,7 @@
 
 """The small-M FP8 GEMM's selection, dispatch and launch arguments, on CPU.
 
-On a synthetic SM100 / SM103 / SM90 platform: which ``gemm.mm`` kernel serves
+On synthetic NVIDIA platforms: which ``gemm.mm`` kernel serves
 per-token x per-channel FP8 rows, what it receives for ``quant="fp8"``
 without ``A_scales`` (FP8 codes and ``[M, 1]`` scales, from the Triton
 quantizer up to 64 rows and from TRT-LLM's token quantizer above, as
@@ -119,7 +119,7 @@ def _weight(n: int, k: int) -> tuple[torch.Tensor, torch.Tensor]:
     return torch.zeros(n, k, dtype=FP8).t(), torch.ones(n, 1)
 
 
-@pytest.mark.parametrize("major,minor", [(10, 0), (10, 3)])
+@pytest.mark.parametrize("major,minor", [(10, 0), (10, 3), (10, 7)])
 @pytest.mark.parametrize("m", [1, 8, 9, 64])
 def test_decode_rows_reach_the_small_m_gemm_quantized_by_triton(
     arch, monkeypatch, major, minor, m
@@ -142,7 +142,8 @@ def test_decode_rows_reach_the_small_m_gemm_quantized_by_triton(
     "major,minor,m,k,expected,quantizer",
     [
         (10, 0, 65, 4096, "torch_mm_fp8_scaled", "trtllm"),
-        (10, 3, 65, 4096, "triton_mm_fp8_scaled", "trtllm"),
+        (10, 3, 65, 4096, "torch_mm_fp8_scaled", "trtllm"),
+        (10, 7, 65, 4096, "torch_mm_fp8_scaled", "trtllm"),
         (10, 0, 8, 1000, "triton_mm_fp8_scaled", "triton"),
     ],
 )
@@ -165,9 +166,8 @@ def test_other_kernels_receive_rows_quantized_per_token(
     assert call["A"].dtype == FP8 and tuple(call["A_scales"].shape) == (m, 1)
 
 
-@pytest.mark.parametrize("major,minor", [(9, 0), (12, 0)])
-def test_no_small_m_gemm_outside_sm100_to_sm103(arch, major, minor):
-    arch(major, minor)
+def test_no_small_m_gemm_below_sm100(arch):
+    arch(9, 0)
     names = {
         spec.name
         for spec in KernelRegistry.get().get_for_operator(

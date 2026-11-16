@@ -38,7 +38,7 @@ from utils import assert_no_triton_compile, kernel_supported
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
     or not kernel_supported("triton_mm_fp8_channel_small_m"),
-    reason="the small-M FP8 GEMM is registered for SM100 to SM103 (GPU only)",
+    reason="the small-M FP8 GEMM requires NVIDIA SM100 or newer",
 )
 
 FP8 = torch.float8_e4m3fn

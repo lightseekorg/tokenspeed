@@ -21,7 +21,7 @@ rank. Each uses channel 0 of its own buffer's signal pad for its barrier.
 
 ## Plain all-reduce through FlashInfer BT
 
-`flashinfer_all_reduce` (`allreduce_fusion.py`, SM103: GB300, B300) runs
+`flashinfer_all_reduce` (`allreduce_fusion.py`, SM100 and newer) runs
 FlashInfer's BT ("owner reduce") protocol without norm or residual: every rank
 publishes each token's row to the token's owner rank, the owner sums the ranks
 in order 0..7 in fp32, rounds once to BF16, and multicasts the sum, so every
