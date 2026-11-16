@@ -361,6 +361,9 @@ class AutoBackend(CommBackend):
     # ---- Public CommBackend interface ----
 
     def get_prepared_all_gather(self, group: Group, dtype: torch.dtype):
+        if current_platform().is_nvidia:
+            # One lamport exchange on the all-reduce workspace; pure data movement.
+            return self._trtllm_ar.prepared_lamport_all_gather(group, dtype)
         if (
             not current_platform().is_cdna4
             or len(group) not in (4, 8)

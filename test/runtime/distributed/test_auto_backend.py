@@ -605,6 +605,44 @@ def test_all_gather_takes_the_workspace_exchange_where_it_serves(routing, monkey
     routing._rsag.all_gather.assert_called_once_with(ROWS, GROUP, -1)
 
 
+def test_nvidia_prepares_the_workspace_exchange_for_column_gathers(
+    backend, monkeypatch
+):
+    monkeypatch.setattr(
+        "tokenspeed.runtime.distributed.comm_backend.auto.current_platform",
+        lambda: SimpleNamespace(is_nvidia=True, is_cdna4=False),
+    )
+    prepared = backend._trtllm_ar.prepared_lamport_all_gather
+    assert backend.get_prepared_all_gather(GROUP, torch.bfloat16) is (
+        prepared.return_value
+    )
+    prepared.assert_called_once_with(GROUP, torch.bfloat16)
+    backend._iris.get_prepared_all_gather.assert_not_called()
+
+
+def test_the_workspace_exchange_is_prepared_for_armed_16_bit_gathers(monkeypatch):
+    trtllm = TrtllmAllReduceBackend(fallback=Mock())
+    assert trtllm.prepared_lamport_all_gather(GROUP, torch.bfloat16) is None
+    device_group = object()
+    trtllm._resources[GROUP] = {"device_group": device_group}
+    assert trtllm.prepared_lamport_all_gather(GROUP, torch.float32) is None
+    gather = trtllm.prepared_lamport_all_gather(GROUP, torch.bfloat16)
+
+    from tokenspeed_kernel.ops.communication import trtllm as kernel_trtllm
+
+    serves = Mock(return_value=True)
+    exchange = Mock(return_value=None)
+    monkeypatch.setattr(kernel_trtllm, "trtllm_workspace_all_gather_serves", serves)
+    monkeypatch.setattr(kernel_trtllm, "trtllm_workspace_all_gather", exchange)
+    assert gather.can_run(ROWS)
+    serves.assert_called_once_with(ROWS, device_group)
+    with pytest.raises(RuntimeError, match="check can_run first"):
+        gather.run(ROWS)
+    exchange.return_value = gathered = torch.empty(4, 32, dtype=torch.bfloat16)
+    assert gather.run(ROWS) is gathered
+    exchange.assert_called_with(ROWS, device_group)
+
+
 def test_route_never_reads_the_row_count(routing, monkeypatch):
     # A site's route must not move with the batch.
     _switches(monkeypatch, force=False, invariant=True)

@@ -48,6 +48,39 @@ MAX_ONESHOT_BYTES = 2 * 1024 * 1024
 SPLIT_ALL_REDUCE_MAX_BYTES = {4: 36 * 1024 * 1024}
 
 
+class LamportAllGather:
+    """A prepared column all-gather on a group's armed mnnvl workspace.
+
+    One lamport exchange of 16-bit rows, bit for bit: ``run`` returns
+    ``[T, world * W]`` with rank ``r``'s rows in columns ``r * W``.
+    """
+
+    def __init__(self, device_group: torch.distributed.ProcessGroup) -> None:
+        self._device_group = device_group
+
+    def can_run(self, tensor: torch.Tensor) -> bool:
+        """Whether the workspace serves ``[T, W]`` rows of this shape."""
+        from tokenspeed_kernel.ops.communication.trtllm import (
+            trtllm_workspace_all_gather_serves,
+        )
+
+        return trtllm_workspace_all_gather_serves(tensor, self._device_group)
+
+    def run(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Gather ``[T, W]`` rows that ``can_run`` accepts."""
+        from tokenspeed_kernel.ops.communication.trtllm import (
+            trtllm_workspace_all_gather,
+        )
+
+        gathered = trtllm_workspace_all_gather(tensor, self._device_group)
+        if gathered is None:
+            raise RuntimeError(
+                f"the mnnvl workspace does not serve {tuple(tensor.shape)} "
+                f"{tensor.dtype} rows; check can_run first"
+            )
+        return gathered
+
+
 class TrtllmAllReduceBackend(CommBackend):
     """Backend routing plain SUM all-reduces through the fusion workspace.
 
@@ -362,6 +395,16 @@ class TrtllmAllReduceBackend(CommBackend):
         return self._chunked_workspace_allreduce(
             tensor, res, chunks=-(-rows // capacity), fp32_acc=True
         )
+
+    def prepared_lamport_all_gather(
+        self, group: Group, dtype: torch.dtype
+    ) -> LamportAllGather | None:
+        """The group's lamport column all-gather of ``dtype`` rows, or None
+        when no workspace is armed for the group or ``dtype`` is not 16-bit."""
+        res = self._resources.get(group)
+        if res is None or dtype.itemsize != 2:
+            return None
+        return LamportAllGather(res["device_group"])
 
     def lamport_all_gather(
         self, tensor: torch.Tensor, group: Group
