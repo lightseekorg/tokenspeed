@@ -577,6 +577,8 @@ issue budget, while `--max-total-tokens` controls the global token pool.
 | `--pp-layer-partition` | Explicit per-stage layer counts, front to back (`"24,24,24,21"`); one entry per stage, summing to the model's layer count. Default: even split with the remainder on the front stages. |
 | `--world-size` | Total worker process count across all nodes. |
 | `--nprocs-per-node` | Worker process count per node. |
+| `--base-gpu-id` | First visible GPU ordinal used on each node. Default 0. |
+| `--gpu-id-step` | Spacing between local workers' GPU ordinals. Default 1. |
 | `--nnodes` | Number of nodes. |
 | `--node-rank` | Rank of the current node. |
 | `--dist-init-addr` | Distributed initialization address. |
