@@ -1003,13 +1003,15 @@ def test_prefill_topk_split_scores_each_ranks_own_index_queries(monkeypatch) -> 
     indexer = attention.indexer
     with torch.no_grad():
         indexer.wq_b.weight.normal_(0.0, 0.05)
-    pool, _ = _k31_pool("cuda", num_lcm_blocks=1)
+    pool, _ = _k31_pool("cuda", num_lcm_blocks=2)
     num_rows = 1100
-    slots = _slots(list(range(9)), num_rows, "cuda")
-    keys = torch.randn(num_rows, 128, device="cuda", dtype=torch.bfloat16)
+    # Behind a 1000-token prefix the last rows see more than topk keys: scored.
+    prefix = 1000
+    slots = _slots(list(range(17)), prefix + num_rows, "cuda")
+    keys = torch.randn(prefix + num_rows, 128, device="cuda", dtype=torch.bfloat16)
     pool.set_index_k_buffer(3, slots, keys, write_mask=None)
     q_lora = torch.randn(num_rows, 128, device="cuda", dtype=torch.bfloat16)
-    row_ends_cpu = torch.arange(1, num_rows + 1, dtype=torch.int64)
+    row_ends_cpu = prefix + torch.arange(1, num_rows + 1, dtype=torch.int64)
     calls = _record_scorer_queries(monkeypatch, "dsa_prefill_topk")
     monkeypatch.setattr(glm5, "all_gather_single", lambda output, input, group: None)
 
@@ -1716,6 +1718,115 @@ def test_prefill_topk_matches_the_causal_reference(prefix_len, extend_len) -> No
         elif visible == seq_len:
             assert int(selected.topk_lens[row]) == topk
             assert sorted(chosen[row].tolist()) == sorted(slots[bad.numel() :].tolist())
+
+
+@requires_gpu
+@pytest.mark.parametrize(
+    "prefix_len, extend_len, scored",
+    [
+        (0, 15, False),
+        (200, 100, False),
+        (2000, 48, False),
+        (0, 2048, False),
+        # One row past topk: the round is scored.
+        (0, 2049, True),
+    ],
+)
+def test_prefill_rows_within_topk_select_every_candidate_unscored(
+    monkeypatch: pytest.MonkeyPatch, prefix_len: int, extend_len: int, scored: bool
+) -> None:
+    """Rows seeing at most topk keys take all of them, the set the scorer selects."""
+    from tokenspeed.runtime.distributed import Mapping
+    from tokenspeed.runtime.models import glm5
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    torch.manual_seed(3)
+    attention = _indexer_attention(index_topk=2048)
+    slots = 6144
+    pool, _ = _k31_pool("cuda", num_lcm_blocks=4)
+    pool.set_index_k_buffer(
+        3,
+        torch.arange(slots, device="cuda", dtype=torch.int64),
+        torch.randn(slots, 128, device="cuda", dtype=torch.bfloat16),
+        write_mask=None,
+    )
+    plane = pool.get_index_k_buffer(3)
+    # A second request of seven rows behind the first: its rows start mid-workspace.
+    seq_len = prefix_len + extend_len
+    lens_cpu = torch.cat(
+        (
+            prefix_len + torch.arange(1, extend_len + 1, dtype=torch.int64),
+            torch.arange(1, 8, dtype=torch.int64),
+        )
+    )
+    starts_cpu = torch.cat(
+        (
+            torch.zeros(extend_len, dtype=torch.int64),
+            torch.full((7,), seq_len, dtype=torch.int64),
+        )
+    )
+    rows = lens_cpu.numel()
+    q = torch.randn(rows, 32, 128, device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn(rows, 32, device="cuda", dtype=torch.bfloat16)
+    row_starts = starts_cpu.to(device="cuda", dtype=torch.int32)
+    row_ends = (starts_cpu + lens_cpu).to(device="cuda", dtype=torch.int32)
+    kv_workspace_slots = torch.arange(slots, device="cuda", dtype=torch.int64)
+    query, q_scales = attention._scorer_index_query(q, plane)
+    expected, expected_lens = glm5.dsa_prefill_topk(
+        query,
+        weights,
+        kv_workspace_slots,
+        row_starts,
+        row_ends,
+        topk=2048,
+        softmax_scale=attention.indexer.weights_softmax_scale,
+        batch_invariant=False,
+        index_k_cache=plane,
+        page_size=64,
+        q_scales=q_scales,
+        max_logits_bytes=1 << 30,
+        candidate_lens_cpu=lens_cpu,
+        slot_order=global_server_args_dict["dsa_slot_order"],
+    )
+
+    scorer, scored_calls = glm5.dsa_prefill_topk, []
+
+    def record(*args, **kwargs):
+        scored_calls.append(1)
+        return scorer(*args, **kwargs)
+
+    def no_gather(output, input, group):
+        raise AssertionError("an unscored round gathers nothing")
+
+    monkeypatch.setattr(glm5, "dsa_prefill_topk", record)
+    monkeypatch.setattr(glm5, "all_gather_single", no_gather)
+    # Rank 0 of eight would select only its share of a split round.
+    attention.prefill_topk_tp_split = not scored
+    attention.mapping = Mapping(rank=0, world_size=8, attn_tp_size=8)
+    selected, lens = attention._select_prefill_topk_rows(
+        q=q,
+        weights=weights,
+        kv_workspace_slots=kv_workspace_slots,
+        row_starts=row_starts,
+        row_ends=row_ends,
+        candidate_lens_cpu=lens_cpu,
+        index_k_cache=plane,
+        page_size=64,
+        max_logits_bytes=1 << 30,
+        topk=2048,
+    )
+
+    assert len(scored_calls) == int(scored)
+    assert torch.equal(lens, expected_lens)
+    # A leaf's own order is unspecified under the selection order: compare sets.
+    assert torch.equal(selected.sort(dim=1).values, expected.sort(dim=1).values)
+    if not scored:
+        # The shortcut emits each row's candidates by ascending position, -1 after them.
+        offsets = torch.arange(2048, device="cuda", dtype=torch.int32)
+        by_position = torch.where(
+            offsets < lens.unsqueeze(1), offsets + row_starts.unsqueeze(1), -1
+        )
+        assert torch.equal(selected, by_position)
 
 
 # ---------------------------------------------------------------- loader
