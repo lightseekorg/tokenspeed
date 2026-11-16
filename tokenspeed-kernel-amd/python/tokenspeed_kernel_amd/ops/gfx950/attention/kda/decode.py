@@ -1659,7 +1659,7 @@ def gluon_kda_fused_verify_gfx950(
         F_A=head_dim,
         TOKENS_PER_SEQUENCE=draft_token_num,
         TOKEN_WIDTH=triton.next_power_of_2(draft_token_num),
-        # Shorter windows prepare each token alone more cheaply.
+        # The batched preparation takes at most 16 tokens.
         BATCH_TOKENS=4 <= draft_token_num <= 16,
         VALUE_SPLITS=value_splits,
         MIXED_ROW_STRIDE=mixed_qkv.stride(0),
