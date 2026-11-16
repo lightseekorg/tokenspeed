@@ -2059,6 +2059,25 @@ def _fused_slots(rows, k, ratio, device):
     return dsv41.SelectionSlots(out, positions, requests, storage[:, ::2], ratio, 8)
 
 
+def test_selection_slots_slices_keep_out_a_view():
+    """Slicing SelectionSlots keeps out a view of the caller's tensor, and an
+    index that would copy it is rejected rather than detaching the writes."""
+    out = torch.zeros((4, 2), dtype=torch.int32)
+    slots = dsv41.SelectionSlots(
+        out,
+        torch.arange(4),
+        torch.zeros(4, dtype=torch.int64),
+        torch.zeros((1, 2), dtype=torch.int32),
+        1,
+        2,
+    )
+    part = slots[1:3]
+    part.out.fill_(7)
+    assert out[1:3].eq(7).all() and out[0].eq(0).all() and out[3].eq(0).all()
+    with pytest.raises(TypeError, match="slice indexing"):
+        slots[torch.tensor([0, 2])]
+
+
 def _finish_write_reference(rows, pool, out, slots):
     """The unfused tail: finish_selection, write_selection, then global_slots."""
     indices, scores, ends, candidates, width, block_size = rows
@@ -2161,6 +2180,74 @@ def test_fused_selection_matches_finish_write_and_global_slots(
         assert (actual_slots.out[live] < 0).any()
     if pool is not None:
         assert (expected[3] > 0).any()
+
+
+def test_mask_invalid_table_pages_rows_past_int32(triton_device):
+    """The paged mask addresses score rows whose offsets pass 2**31 elements.
+
+    Three rows a 2**30 stride apart put the last row at 2**31 elements, and a
+    guard before the base holds a sentinel that a wrapped write would hit.
+    """
+    device = triton_device
+    if device.type != "cuda":
+        pytest.skip("requires CUDA")
+    stride, guard, capacity = 2**30, 2**31, 4 * 64
+    needed = guard + 2 * stride + capacity
+    if torch.cuda.mem_get_info(device)[0] < needed * 2 + (256 << 20):
+        pytest.skip("requires 9 GiB of free device memory")
+    torch.manual_seed(62)
+    storage = torch.empty(needed, dtype=torch.bfloat16, device=device)
+    storage[:capacity].fill_(3.0)
+    values = storage[guard:].as_strided((3, capacity), (stride, 1))
+    values.copy_(torch.randn((3, capacity), dtype=torch.bfloat16, device=device))
+    table = torch.tensor([[0, 1, 2, 3], [4, 5, 6, 7], [1, -1, 3, 9]], dtype=torch.int32)
+    lengths = torch.full((3,), capacity, dtype=torch.int32, device=device)
+    reference = values.to("cpu", copy=True)
+    _mask_table_pages_reference(reference, lengths.cpu(), table, 8, 64)
+
+    implementation.mask_invalid_table_pages(values, lengths, table.to(device), 8, 64)
+    assert torch.equal(_bits(values).cpu(), _bits(reference))
+    assert torch.isneginf(values[2, 64:128]).all()
+    sentinel = storage[:capacity]
+    torch.testing.assert_close(sentinel, torch.full_like(sentinel, 3.0))
+
+
+def test_fused_selection_reads_score_rows_past_int32(triton_device):
+    """finish_write_selection reads score rows whose offsets pass 2**31 elements.
+
+    Three score rows a 2**30 stride apart put the last read at 2**31 elements;
+    a guard before the base holds large sentinel scores that a wrapped read
+    would rank first. The fused launch must match the unfused passes run on a
+    contiguous copy of the same rows.
+    """
+    device = triton_device
+    if device.type != "cuda":
+        pytest.skip("requires CUDA")
+    n, k, width = 3, 16, 96
+    stride, guard = 2**30, 2**31
+    needed = guard + 2 * stride + width
+    if torch.cuda.mem_get_info(device)[0] < needed * 2 + (256 << 20):
+        pytest.skip("requires 9 GiB of free device memory")
+    torch.manual_seed(1932)
+    storage = torch.empty(needed, dtype=torch.bfloat16, device=device)
+    storage[:width].fill_(100.0)
+    scores = storage[guard:].as_strided((n, width), (stride, 1))
+    scores.copy_(torch.randn((n, width), dtype=torch.bfloat16, device=device))
+    ends = torch.full((n,), width, dtype=torch.int32, device=device)
+    indices = torch.randint(-1, width, (n, k), dtype=torch.int32, device=device)
+
+    expected = _poisoned_outputs(n, k, 0, device)
+    _finish_write_reference(
+        (indices, scores.contiguous(), ends, None, width, 1), None, expected, None
+    )
+    actual = _poisoned_outputs(n, k, 0, device)
+    implementation.finish_write_selection(
+        (indices, scores, ends, None, width, 1), None, actual, None, False
+    )
+    for got, want in zip(actual, expected, strict=True):
+        assert torch.equal(got, want)
+    sentinel = storage[:width]
+    torch.testing.assert_close(sentinel, torch.full_like(sentinel, 100.0))
 
 
 def _deep_select_reference(scores, ends, k):

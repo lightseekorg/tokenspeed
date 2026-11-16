@@ -87,6 +87,12 @@ class SelectionSlots:
     pages: int
 
     def __getitem__(self, rows) -> SelectionSlots:
+        # A basic slice keeps out a view; advanced indexing would copy it and
+        # the selected slots would never reach the caller's tensor.
+        if not isinstance(rows, slice):
+            raise TypeError(
+                "SelectionSlots supports only slice indexing, so out stays a view"
+            )
         return SelectionSlots(
             self.out[rows],
             self.positions[rows],
