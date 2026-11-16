@@ -697,7 +697,7 @@ def _ple_conv_state_kernel(
     ENABLE_PDL: tl.constexpr,
     BLOCK_C: tl.constexpr,
     BLOCK_T: tl.constexpr,
-    compact_layout_flag=None,
+    COMPACT_WINDOWS: tl.constexpr,
 ):
     """One launch for token outputs and request states, including empty requests.
 
@@ -715,9 +715,6 @@ def _ple_conv_state_kernel(
             tl.extra.cuda.gdc_wait()
         # Successors may set up, but must wait before reading any output.
         tl.extra.cuda.gdc_launch_dependents()
-    if compact_layout_flag is not None:
-        if tl.program_id(0) == 0 and tl.program_id(1) == 0:
-            tl.store(compact_layout_flag, 1)
     token_base = tl.program_id(0)
     if BLOCK_T > 1:
         token_base = token_base.to(tl.int64) * BLOCK_T
@@ -769,7 +766,7 @@ def _ple_conv_state_kernel(
                 ADD_GATED,
                 ADD_RESIDUAL,
                 BLOCK_C,
-                compact_layout_flag is not None,
+                COMPACT_WINDOWS,
             )
     if WRITE_FINAL or SCATTER_WINDOWS:
         if tl.program_id(0) < BATCH:
@@ -906,7 +903,6 @@ def _ple_verify_restore_kernel(
     dst_rows,
     src_addresses,
     dst_addresses,
-    layout_addresses,
     dst_strides,
     batch_size,
     verify_width,
@@ -923,7 +919,6 @@ def _ple_verify_restore_kernel(
         row_elements: tl.constexpr = CHANNELS * STATE
         source = tl.load(src_addresses + layer).to(scratch.dtype)
         destination = tl.load(dst_addresses + layer).to(scratch.dtype)
-        layout = tl.load(layout_addresses + layer).to(tl.pointer_type(tl.int32))
         stride = tl.load(dst_strides + layer).to(tl.int64)
 
         request = row // (verify_width + 1)
@@ -934,9 +929,6 @@ def _ple_verify_restore_kernel(
             channel * STATE + position,
             (1 + position - STATE) * row_elements + channel,
         )
-        compact_offset = request * (verify_width + 1) * row_elements + carried_or_input
-        offset = tl.where(
-            tl.load(layout) != 0, compact_offset, row * row_elements + elem
-        )
+        offset = request * (verify_width + 1) * row_elements + carried_or_input
         value = tl.load(source + offset, elem < row_elements, other=0)
         tl.store(destination + page * stride + elem, value, elem < row_elements)

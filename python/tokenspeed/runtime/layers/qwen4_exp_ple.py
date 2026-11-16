@@ -690,15 +690,13 @@ class Qwen4ExpPLELayer(nn.Module):
         add_terms: tuple[torch.Tensor, ...] = (),
         windows_out: torch.Tensor | None = None,
         windows_block_rows: int = 0,
-        compact_layout_flag: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Short-conv over the flat batch.
 
         ``add_terms`` are full-width ``[tokens, channels]`` tensors folded into
         the conv output in order, letting callers skip separate tensor adds.
-        On CUDA, ``windows_out`` receives the carried row and per-token state
-        windows directly and the unused final-state result has zero rows. A
-        layout flag requests compact input rows instead of full windows.
+        On GPU, ``windows_out`` receives the carried state and the compact
+        per-token inputs. The unused final-state result has zero rows.
         The fallback caller fills its carried row separately.
         """
         device = values.device
@@ -728,7 +726,6 @@ class Qwen4ExpPLELayer(nn.Module):
                 add_terms=add_terms,
                 windows_out=windows_out,
                 windows_block_rows=windows_block_rows,
-                compact_layout_flag=compact_layout_flag,
             )
         conv_output, final_conv, intermediate = self._conv_sequences_torch(
             values,
@@ -763,7 +760,6 @@ class Qwen4ExpPLELayer(nn.Module):
         add_terms: tuple[torch.Tensor, ...] = (),
         windows_out: torch.Tensor | None = None,
         windows_block_rows: int = 0,
-        compact_layout_flag: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         channels = self.hc_hidden_size
         state_len = self.conv_state_len
@@ -772,6 +768,8 @@ class Qwen4ExpPLELayer(nn.Module):
             # callers passing bare positional indices pay for the scan.
             starts = torch.cumsum(lengths_t, dim=0) - lengths_t
         if windows_out is not None:
+            if not need_intermediate:
+                raise ValueError("windows_out needs need_intermediate=True")
             windows = windows_out
         elif need_intermediate:
             windows = values.new_empty((total, channels, state_len))
@@ -798,7 +796,7 @@ class Qwen4ExpPLELayer(nn.Module):
             windows=windows,
             windows_block_rows=windows_block_rows,
             scatter_windows=windows_out is not None,
-            compact_layout_flag=compact_layout_flag,
+            compact_windows=windows_out is not None,
         )
 
     def _conv_sequences_torch(
@@ -1030,13 +1028,12 @@ class Qwen4ExpPLELayer(nn.Module):
         ``[pages, hc_count * hidden, conv_state_len]`` are the pools as
         page-indexed views of the cache arena; ``page_in`` holds each
         request's input page. The kernel does the lookup, the gate and the
-        conv, and writes the state after each row's token to row ``page_out`` of
-        ``context_out`` and ``conv_out``: in decode the pools and the output
-        pages (as a :meth:`start_prefetch` plus :meth:`forward` pair would);
-        in a target verify (``T`` tokens per request, request-major rows)
-        the verify scratch, row ``r * (T + 1) + 1 + t`` for token ``t`` of
-        request ``r``. The post-verify commit copies that full window to the
-        cache page.
+        conv. Decode writes the resulting context and conv state to the
+        cache pages in ``page_out``. Target verify writes the context and
+        normalized conv input for request ``r`` and token ``t`` to scratch
+        row ``r * (T + 1) + 1 + t``, with the carried conv state in row
+        ``r * (T + 1)``. State commit reconstructs the accepted window directly
+        in the cache page.
 
         Args:
             ctx: The forward's context.
@@ -1079,7 +1076,6 @@ class Qwen4ExpPLELayer(nn.Module):
                 "a PLE verify needs its rows' scratch pages (verify_out) for "
                 f"{bs} requests of {chain} tokens"
             )
-        backend.ple_conv_layout(self.layer_id).zero_()
         return {
             "context": context,
             "conv_state": conv,
@@ -1158,11 +1154,6 @@ class Qwen4ExpPLELayer(nn.Module):
             add_terms=(gated, hidden_states),
             windows_out=conv_scratch,
             windows_block_rows=scratch_stride,
-            compact_layout_flag=(
-                plan.backend.ple_conv_layout(self.layer_id)
-                if verify and normalized.is_cuda
-                else None
-            ),
         )
 
         if verify and not flat_ids.is_cuda:

@@ -3170,7 +3170,7 @@ def test_ple_conv_epilogue_folds_full_width_adds(dtype) -> None:
 @pytest.mark.parametrize("lengths", [[1], [4], [3, 1, 5], [0, 4, 2], [0, 0]])
 @pytest.mark.parametrize("enable_pdl", [False, True])
 @pytest.mark.parametrize("graph_replay", [False, True])
-def test_ple_conv_scatters_windows_into_verify_scratch(
+def test_ple_conv_scatters_compact_inputs_into_verify_scratch(
     lengths, enable_pdl, graph_replay, monkeypatch
 ) -> None:
     if enable_pdl and (torch.version.hip or torch.cuda.get_device_capability()[0] < 9):
@@ -3228,15 +3228,16 @@ def test_ple_conv_scatters_windows_into_verify_scratch(
         scratch.zero_()
         graph.replay()
 
-    # Same conv results, with carried and token windows landing in their
-    # rollback rows and nothing else in the scratch disturbed.
+    # Compact scratch keeps the carried state and the token input vectors.
     assert torch.equal(scattered[0], packed[0])
     assert scattered[1].shape == (0, channels, state_len)
     assert scattered[2] is scratch
     initial_rows = torch.arange(bs, device="cuda") * stride
     assert torch.equal(scratch[initial_rows], initial)
     token_rows = req * stride + 1 + col
-    assert torch.equal(scratch[token_rows], packed[2])
+    compact_rows = scratch[token_rows].flatten(1)
+    assert torch.equal(compact_rows[:, :channels], values)
+    assert not compact_rows[:, channels:].any()
     untouched = torch.ones(scratch.shape[0], dtype=torch.bool, device="cuda")
     untouched[initial_rows] = False
     untouched[token_rows] = False

@@ -45,9 +45,8 @@ def test_fused_compact_verify(width, lengths, channels):
     scratch = torch.empty(
         batch * (width + 1), channels, state, device=device, dtype=dtype
     )
-    flag = torch.zeros((), device=device, dtype=torch.int32)
 
-    def conv(layout_flag):
+    def conv(compact):
         return ple_conv_sequences(
             values,
             initial,
@@ -67,31 +66,30 @@ def test_fused_compact_verify(width, lengths, channels):
             windows=scratch,
             windows_block_rows=width + 1,
             scatter_windows=True,
-            compact_layout_flag=layout_flag,
+            compact_windows=compact,
         )[0]
 
-    reference = conv(None)
+    reference = conv(False)
     full_windows = scratch.clone()
     row_elems = channels * state
     pages = torch.full((batch + 2, row_elems + 32), -123, device=device, dtype=dtype)
     out = pages[:, :row_elems].view(batch + 2, channels, state)
     src = torch.arange(batch, device=device) * (width + 1)
     dst = torch.arange(1, batch + 1, device=device)
-    scratch_addrs, page_addrs, flag_addrs = [
+    scratch_addrs, page_addrs = [
         torch.tensor([t.data_ptr()], device=device, dtype=torch.uint64)
-        for t in (scratch, pages, flag)
+        for t in (scratch, pages)
     ]
     strides = torch.tensor([pages.stride(0)], device=device, dtype=torch.int64)
 
     def run():
-        result = conv(flag)
+        result = conv(True)
         ple_restore_verify_layers(
             scratch,
             src,
             dst,
             scratch_addrs,
             page_addrs,
-            flag_addrs,
             strides,
             verify_width=width,
             batch_size=batch,

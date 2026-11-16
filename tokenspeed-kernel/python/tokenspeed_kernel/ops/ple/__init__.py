@@ -392,7 +392,7 @@ def ple_conv_sequences(
     windows: torch.Tensor | None = None,
     windows_block_rows: int = 0,
     scatter_windows: bool = False,
-    compact_layout_flag: torch.Tensor | None = None,
+    compact_windows: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Dilated depthwise conv + SiLU, plus the state carried to the next step.
 
@@ -420,8 +420,8 @@ def ple_conv_sequences(
             the last dimension has to be dense.
         windows: Destination for sliding state windows. ``None`` skips them.
         windows_block_rows: Rows per request in ``windows`` when scattering.
-        compact_layout_flag: Optional device scalar destination. When supplied,
-            store compact verify inputs and mark this layout instead of windows.
+        compact_windows: Keep one channel vector per candidate in scattered
+            verify scratch. The carried state remains in the first row.
         scatter_windows: Place carried state in each block's first row and token
             windows at ``req * windows_block_rows + 1 + col`` instead of packed
             rows.
@@ -432,7 +432,7 @@ def ple_conv_sequences(
         window tensor (an empty placeholder when ``windows`` is ``None``).
     """
 
-    if compact_layout_flag is not None and not scatter_windows:
+    if compact_windows and not scatter_windows:
         raise ValueError("compact layout requires scattered verify scratch")
     if len(add_terms) > 2:
         raise ValueError("the fused conv epilogue folds at most two addends")
@@ -524,7 +524,7 @@ def ple_conv_sequences(
             ENABLE_PDL=use_pdl,
             BLOCK_C=block_c,
             BLOCK_T=block_t,
-            compact_layout_flag=compact_layout_flag,
+            COMPACT_WINDOWS=compact_windows,
             **pdl_kwargs,
         )
     return conv_output, final_conv, windows
@@ -606,7 +606,6 @@ def ple_restore_verify_layers(
     dst_rows: torch.Tensor,
     src_addresses: torch.Tensor,
     dst_addresses: torch.Tensor,
-    layout_addresses: torch.Tensor,
     dst_strides: torch.Tensor,
     *,
     verify_width: int,
@@ -616,16 +615,13 @@ def ple_restore_verify_layers(
 
     Args:
         scratch: A source slab with the common [rows, channels, state] geometry
-            and dtype. All layers share this row shape.
+            and dtype. Each request stores its carried state in row zero and
+            one channel vector at the start of each candidate row.
         src_rows: Layer-major ids, encoded as request * (verify_width + 1)
             + accepted count.
         dst_rows: Layer-major destination page ids. Negative ids are skipped.
         src_addresses: uint64 base addresses of the dense scratch slabs.
         dst_addresses: uint64 base addresses of the destination slabs.
-        layout_addresses: uint64 addresses of per-layer int32 layout flags.
-            A one selects compact scratch, with the carried state in row zero
-            and one channel vector per token at the start of subsequent rows.
-            A zero selects a full state window at the source row.
         dst_strides: Per-layer destination page strides in elements.
         verify_width: Number of candidate tokens per request.
         batch_size: Number of requests represented by the row tables.
@@ -644,7 +640,6 @@ def ple_restore_verify_layers(
         dst_rows,
         src_addresses,
         dst_addresses,
-        layout_addresses,
         dst_strides,
         batch_size,
         verify_width,

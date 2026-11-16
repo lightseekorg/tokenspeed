@@ -1925,9 +1925,8 @@ of its stage uses costs that stage the whole plane.
 
 During CUDA PLE verify, the convolution writes the carried state and one
 normalized input per candidate to scratch. The commit reconstructs the
-accepted window directly in its cache page. Monokernels can still write full
-windows into the same allocation. A device flag per layer selects the layout
-at commit time and is set by the producer, including during graph replay.
+accepted window directly in its cache page. Regular GPU convolution and
+monokernels write the same verify layout, including during graph replay.
 
 Inkling's ShortConv checkpoints share the attention planes the same way: a
 kvconv group and one hiddenconv group per attention group put each layer's

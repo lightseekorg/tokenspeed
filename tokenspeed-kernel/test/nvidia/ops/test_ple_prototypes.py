@@ -259,6 +259,7 @@ def _conv_case(lengths, *, windows):
         kernel_size=4,
         state_len=state,
         weights_independent=True,
+        compact_windows=False,
         windows=scratch,
         windows_block_rows=stride if windows else 0,
         scatter_windows=windows,
@@ -343,6 +344,7 @@ def test_conv_token_tiles_across_request_boundaries(pdl):
             state_len=state,
             write_final=True,
             weights_independent=True,
+            compact_windows=False,
             add_terms=(gated, residual),
         )
         return args, kwargs
@@ -408,6 +410,7 @@ def test_conv_state_large_request_offset(pdl):
             state_len=state,
             write_final=False,
             weights_independent=True,
+            compact_windows=False,
             windows=windows,
             scatter_windows=False,
         )

@@ -101,7 +101,6 @@ class Qwen4ExpPLEBackend(AttentionBackend):
         self._context_field_id: str | None = None
         self._conv_field_ids: tuple[str, ...] = ()
         self._ple_verify_scratch: dict[str, torch.Tensor] = {}
-        self._ple_conv_layout: dict[str, torch.Tensor] = {}
         self._ple_verify_tables: dict | None = None
         self._ple_commit_rows: torch.Tensor | None = None
         self._verify_commit_ctx: tuple[torch.Tensor, int, int] | None = None
@@ -337,10 +336,6 @@ class Qwen4ExpPLEBackend(AttentionBackend):
                 self._ple_verify_scratch[field_id] = field.new_zeros(
                     (rows, *field.shape[1:])
                 )
-            self._ple_conv_layout = {
-                field_id: torch.zeros((), dtype=torch.int32, device=self.device)
-                for field_id in self._conv_field_ids
-            }
             self._ple_commit_rows = torch.empty(
                 (2, max_bs * len(self._conv_field_ids)),
                 dtype=torch.int64,
@@ -349,8 +344,6 @@ class Qwen4ExpPLEBackend(AttentionBackend):
             self._ple_verify_tables = self._build_verify_tables()
         return (
             sum(tensor.nbytes for tensor in self._ple_verify_scratch.values())
-            + sum(flag.nbytes for flag in self._ple_conv_layout.values())
-            + self._ple_verify_tables["conv_flags"].nbytes
             + self._ple_verify_tables["conv_element_strides"].nbytes
             + self._ple_commit_rows.nbytes
         )
@@ -375,10 +368,6 @@ class Qwen4ExpPLEBackend(AttentionBackend):
                 f"PLE verify workspace needs {rows} rows, exceeding preallocated capacity"
             )
         return context[:rows], conv[:rows]
-
-    def ple_conv_layout(self, layer_id: int) -> torch.Tensor:
-        global_id = self.cache_pool._field_layer_id(layer_id)
-        return self._ple_conv_layout[qwen4_exp_ple_conv_field(global_id)]
 
     @staticmethod
     def _u64(values: list[int], device: torch.device) -> torch.Tensor:
@@ -415,10 +404,6 @@ class Qwen4ExpPLEBackend(AttentionBackend):
             "context_dst_stride": self._i64([row_stride_i32(context_field)], device),
             "context_row_bytes": context_field[0].numel()
             * context_field.element_size(),
-            "conv_flags": self._u64(
-                [self._ple_conv_layout[f].data_ptr() for f in self._conv_field_ids],
-                device,
-            ),
             "conv_element_strides": self._i64(
                 [f.stride(0) for f in conv_fields], device
             ),
@@ -493,7 +478,6 @@ class Qwen4ExpPLEBackend(AttentionBackend):
                 dst_rows,
                 tables["conv_src"],
                 tables["conv_dst"],
-                tables["conv_flags"],
                 tables["conv_element_strides"],
                 verify_width=width,
                 batch_size=bs,

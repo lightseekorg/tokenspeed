@@ -296,9 +296,8 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
             field.field_id.endswith(".conv") for field in self._ple_fields()
         )
         # Source and destination int64 row ids, shared by every batch size.
-        # Each layer also keeps an int32 layout flag and its uint64 address
-        # and int64 destination element stride.
-        ple_commit_bytes = num_ple_layers * (2 * self.attn_config.max_bs * 8 + 20)
+        # Each layer also keeps an int64 destination element stride.
+        ple_commit_bytes = num_ple_layers * (2 * self.attn_config.max_bs + 1) * 8
         return (
             super().workspace_bytes()
             + ple_commit_bytes
