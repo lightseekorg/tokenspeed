@@ -952,9 +952,11 @@ def test_qwen4_exp_qsa_publishes_and_reuses_backend_topk(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("hybrid", [False, True])
+@pytest.mark.parametrize("projected", [False, True])
 def test_qsa_forward_uses_indexer_verify_state_without_model_binding(
     monkeypatch,
     hybrid,
+    projected,
 ) -> None:
     indexer = QSAIndexer.__new__(QSAIndexer)
     torch.nn.Module.__init__(indexer)
@@ -1031,7 +1033,16 @@ def test_qsa_forward_uses_indexer_verify_state_without_model_binding(
             input_num_tokens=rows,
             forward_mode=mode,
         )
-        result = indexer(torch.ones((rows, 4)), torch.arange(rows), ctx)
+        hidden = torch.ones((rows, 4))
+        assert indexer.can_overlap(ctx, num_rows=rows) == (
+            backend is target_backend and mode.is_decode()
+        )
+        assert not indexer.can_overlap(ctx, num_rows=rows + 1)
+        if projected:
+            raw_q, token_k = indexer._project_qk_raw(hidden)
+            result = indexer.forward_projected(raw_q, token_k, torch.arange(rows), ctx)
+        else:
+            result = indexer(hidden, torch.arange(rows), ctx)
         assert result.shape == (rows, 1)
 
     single_request_ctx = ForwardContext(
@@ -1185,8 +1196,12 @@ def test_qwen4_exp_qsa_pure_verify_skips_recent_write(monkeypatch) -> None:
 def test_qwen4_exp_draft_attention_preserves_rows_and_cache_context(
     sparse, narrow, mode
 ) -> None:
+    from tokenspeed.runtime.utils.cuda_stream import StreamFork
+
     layer = object.__new__(qwen4_exp_nextn.Qwen4ExpDraftAttentionDecoderLayer)
     torch.nn.Module.__init__(layer)
+    layer.enable_fp8_attn_proj = False
+    layer.qsa_fork = StreamFork(None)
     q = torch.arange(24, dtype=torch.float32).reshape(6, 4)
     k, v = q + 100, q + 200
     topk = torch.arange(12, dtype=torch.int32).reshape(6, 2)
@@ -4308,3 +4323,122 @@ def test_hyperconnection_attention_residual_rows(
         actual_residuals, expected_residuals, strict=True
     ):
         torch.testing.assert_close(actual_value, expected_value)
+
+
+@_requires_cuda
+@pytest.mark.skipif(torch.version.hip is not None, reason="CUDA graph ordering check")
+@pytest.mark.parametrize(
+    "hidden_size,num_heads,num_kv_heads,head_dim,index_heads,index_dim",
+    [(64, 2, 1, 32, 1, 32), (2560, 24, 4, 256, 4, 128)],
+    ids=["small", "tp1-full-width"],
+)
+@torch.inference_mode()
+def test_qsa_front_overlap_preserves_outputs_cache_and_graph_replay(
+    monkeypatch, hidden_size, num_heads, num_kv_heads, head_dim, index_heads, index_dim
+):
+    """Exercise the real layer and stream fork with tensor-only GPU kernels.
+
+    Index/cache kernels are replaced by deterministic tensor operations to
+    isolate stream ordering from the sparse-attention implementation. Model
+    projections, gating and output projection remain the real layer's path.
+    The full-width case keeps TP1 QKV/O and replicated index projection sizes;
+    this is an ordering regression, not a sparse-attention performance test.
+    """
+    from tokenspeed_kernel.ops.attention.prologue import GQAPrologueOutput
+
+    from tokenspeed.runtime.utils.cuda_stream import StreamFork
+
+    config = Qwen4ExpTextConfig(
+        vocab_size=128,
+        hidden_size=hidden_size,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=num_heads,
+        num_key_value_heads=num_kv_heads,
+        head_dim=head_dim,
+        layer_types=["linear_attention", "full_attention"],
+        hc_count=2,
+        hc_lowrank=8,
+        num_experts=None,
+        indexer_n_heads=index_heads,
+        indexer_kv_heads=1,
+        indexer_head_dim=index_dim,
+        indexer_budget=2048,
+        indexer_compress_ratio=4,
+    )
+    with torch.device("cuda"):
+        layer = Qwen4ExpAttentionDecoderLayer(
+            config,
+            Mapping(rank=0, world_size=1),
+            1,
+            enable_fp8_attn_proj=False,
+        ).to(dtype=torch.bfloat16)
+    for parameter in layer.parameters():
+        parameter.normal_(std=0.05)
+    backend = _qsa_root(kernel_page_size=64, max_bs=1, spec=4, is_draft=False)
+
+    class Pool:
+        def __init__(self):
+            self.layerwise_load_tracker = None
+
+    ctx = ForwardContext(
+        attn_backend=backend,
+        token_to_kv_pool=Pool(),
+        bs=1,
+        num_extends=0,
+        output_layout=ForwardOutputLayout(0, 0, 1, 4),
+        input_num_tokens=4,
+        forward_mode=ForwardMode.DECODE,
+    )
+    hidden = torch.randn(4, hidden_size, device="cuda", dtype=torch.bfloat16)
+    positions = torch.arange(4, device="cuda")
+    cache = torch.empty((4, num_kv_heads, head_dim), device="cuda", dtype=hidden.dtype)
+
+    def select(raw_q, token_k, positions, ctx):
+        # A slow branch makes a missing join observable in the attention output.
+        torch.cuda._sleep(100_000)
+        scores = raw_q.reshape(4, index_heads, index_dim).sum(1) + token_k[:, 0, :]
+        slots = (scores.argmax(-1) + positions).int().view(-1, 1)
+        ctx.attn_backend.sparse_topk.qsa_selection = QSASelection(slots, slots, 4)
+        return slots
+
+    def prologue(q, k, v, positions, ctx):
+        cache.copy_((k + v).reshape_as(cache))
+        return GQAPrologueOutput(q=q * 2, k=None, v=None)
+
+    def attention(q, k, v, positions, ctx, *, topk_indices):
+        if k is not None:
+            q = prologue(q, k, v, positions, ctx).q
+        keys = cache.repeat_interleave(num_heads // num_kv_heads, dim=1)
+        return (q.reshape(4, -1) + keys.reshape(4, -1) + topk_indices).contiguous()
+
+    monkeypatch.setattr(layer.indexer, "forward_projected", select)
+    monkeypatch.setattr(layer.attn, "prologue", prologue)
+    monkeypatch.setattr(layer.attn, "forward", attention)
+    serial = layer.qsa_fork
+    parallel = StreamFork(torch.cuda.Stream())
+    for _ in range(3):
+        layer.qsa_fork = parallel
+        layer.self_attention(positions, hidden, ctx)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.graph(graph, stream=capture_stream):
+        captured = layer.self_attention(positions, hidden, ctx)
+    torch.cuda.current_stream().wait_stream(capture_stream)
+    for delta in (0.1, -0.3, 0.7):
+        hidden.add_(delta)
+        positions.add_(1)
+        layer.qsa_fork = serial
+        expected = layer.self_attention(positions, hidden, ctx).clone()
+        expected_cache = cache.clone()
+        cache.fill_(-100)
+        layer.qsa_fork = parallel
+        eager = layer.self_attention(positions, hidden, ctx)
+        torch.testing.assert_close(eager, expected, atol=0, rtol=0)
+        torch.testing.assert_close(cache, expected_cache, atol=0, rtol=0)
+        cache.fill_(-100)
+        graph.replay()
+        torch.testing.assert_close(captured, expected, atol=0, rtol=0)
+        torch.testing.assert_close(cache, expected_cache, atol=0, rtol=0)

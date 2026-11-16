@@ -68,6 +68,29 @@ native cache is bf16 (`--kv-cache-dtype auto`). An fp16 model's rows round to
 it at the store, as the pool converted them on write, and its activations stay
 fp16.
 
+## QSA index overlap
+
+The Qwen QSA target can prepare its sparse selection alongside the main
+attention projections and prologue. The layer projects index Q/K on the main
+stream, then forks the indexer's existing cache-write/selection tail onto its
+auxiliary stream. Main computes Q/K/V and calls `PagedAttention.prologue` once.
+It joins the selection before core attention consumes either result, passing
+`k = v = None` to preserve the prepared-query contract. Output gating and
+projection use the same path as serial attention.
+
+The current latency policy covers a single target request with four verify
+rows. Prefill and mixed rounds, draft narrowing, layerwise load-backs, FP8
+attention projections and prefill graph breaks retain serial ordering. A layer
+without an auxiliary stream is serial too. Index geometry is derived from the
+indexer, not a fixed model width or TP topology. Eager forwards record the
+cross-stream temporary lifetimes; graph capture records fork/join dependencies
+and keeps graph-pool storage. There is no new persistent request or cache state.
+
+The model owns the batch/shape performance policy and disables the fork at
+construction for FP8 projections. `QSAIndexer.can_overlap` owns the execution
+constraints: a complete target verify batch, no live-row graph break, and no
+layerwise load-back. The model does not inspect indexer backend internals.
+
 ## Accepted inputs
 
 The entries validate each request once, from metadata only, and raise
