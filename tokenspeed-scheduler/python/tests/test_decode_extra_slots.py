@@ -127,6 +127,55 @@ def test_late_older_prefills_do_not_displace_streaming_requests():
     assert _forward_ids(scheduler.next_execution_plan()) == ["a", "d"]
 
 
+def test_decode_page_growth_keeps_its_slot_and_hands_capacity_to_a_waiter():
+    scheduler = ts.Scheduler(_config(1, 2))
+    _submit(scheduler, "running", "waiting")
+    slots = _admit_all(scheduler, ("running", "waiting"))
+    _ready(scheduler, "running", "waiting")
+    first = _find_forward_op(scheduler.next_execution_plan())
+    assert list(first.request_ids) == ["running"]
+    assert list(first.request_pool_indices) == [slots[0]]
+    pages = [int(page) for page in first.block_tables["history"][0] if page > 0]
+    _advance(scheduler, "running", [43])
+
+    for token, reserve in enumerate((1, 6, 1, 1), start=44):
+        _send(
+            scheduler,
+            _event(
+                "UpdateReserveNumTokens",
+                "running",
+                reserve_num_tokens_in_next_schedule_event=reserve,
+            ),
+        )
+        plan = scheduler.next_execution_plan()
+        op = _find_forward_op(plan)
+        assert list(op.request_ids) == ["running"]
+        assert list(op.request_pool_indices) == [slots[0]]
+        next_pages = [int(page) for page in op.block_tables["history"][0] if page > 0]
+        assert next_pages[: len(pages)] == pages
+        if reserve == 6:
+            assert len(next_pages) > len(pages)
+        assert scheduler.active_decode_slots() == 1
+        assert scheduler.allocated_request_slots() == 2
+        assert scheduler.ready_waiting_size() == 1
+        assert not plan.aborts
+        pages = next_pages
+        _advance(scheduler, "running", [token])
+
+    _finish(scheduler, "running")
+    next_op = _find_forward_op(scheduler.next_execution_plan())
+    assert list(next_op.request_ids) == ["waiting"]
+    assert list(next_op.request_pool_indices) == [slots[1]]
+    assert scheduler.active_decode_slots() == 1
+    assert scheduler.allocated_request_slots() == 1
+    assert scheduler.ready_waiting_size() == 0
+    _advance(scheduler, "waiting", [99])
+    _finish(scheduler, "waiting")
+    assert _forward_ids(scheduler.next_execution_plan()) == []
+    assert scheduler.active_decode_slots() == 0
+    assert scheduler.allocated_request_slots() == 0
+
+
 @pytest.mark.parametrize("terminal", ["Finish", "Abort"])
 def test_terminal_request_keeps_its_permit_until_overlap_results_land(terminal):
     scheduler = ts.Scheduler(_config(1, 2))

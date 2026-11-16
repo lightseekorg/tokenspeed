@@ -35,6 +35,10 @@ capacity failure. Only a failed KV admission enters the existing capacity
 recovery policy. The P role hands execution to its peer and does not consume
 a local decode permit.
 
+Forward resources belong to the request's current FSM state. Admission may
+reuse a reference to those resources within one attempt; the reference must
+not cross a state transition or outlive the request.
+
 ## 1. Admission is per chunk
 
 An optional `--chunk-prefill-kv-size` also bounds the KV read by a local

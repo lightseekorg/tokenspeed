@@ -297,6 +297,9 @@ public:
 
     bool HasDecodeSlot() const { return forwardResources("HasDecodeSlot").decode_slot.valid(); }
 
+    // The reference must not outlive the request or cross Request::Apply.
+    fsm::ForwardResources& ForwardResourcesRef() { return forwardResources("ForwardResourcesRef"); }
+
     const std::vector<BlockTable>& BlockTablesRef() const { return forwardResources("BlockTablesRef").block_tables; }
 
     std::vector<BlockTable>& BlockTablesRef() { return forwardResources("BlockTablesRef").block_tables; }

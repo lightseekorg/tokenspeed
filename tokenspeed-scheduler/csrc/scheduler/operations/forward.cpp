@@ -978,13 +978,14 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
 std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                                   Request* request) {
     DecodeSlotIndex decode_slot;
-    if (config_.role != Role::kP && !request->HasDecodeSlot()) {
+    fsm::ForwardResources& resources = request->ForwardResourcesRef();
+    if (config_.role != Role::kP && !resources.decode_slot.valid()) {
         if (decode_slots_.AvailableSlots() == 0) {
             return std::nullopt;  // Execution admission, not a KV capacity failure.
         }
         decode_slot = decode_slots_.Allocate();
     }
-    std::vector<BlockTable>& tables = request->BlockTablesRef();
+    std::vector<BlockTable>& tables = resources.block_tables;
     const std::int32_t num_computed_tokens = request->NumComputedTokens();
     std::int32_t reserve_tokens = request->ReserveNumTokensInNextScheduleEvent();
     if (config_.decode_input_tokens > 1) {
@@ -1034,7 +1035,7 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
     // copy-in block for it, so it is skipped even if that checkpoint has left
     // the cache since.
     const bool first_decode = request->Is<fsm::PrefillDone>();
-    fsm::CacheProgress& cache_progress = request->CacheProgressRef();
+    fsm::CacheProgress& cache_progress = resources.cache_progress;
     const bool prompt_end = first_decode && firstDecodePublishesPromptEnd(*request, cache_progress.resume_tokens);
     const StateStep state_step{prompt_end                                 ? StateStep::Kind::kRotate
                                : first_decode && config_.role == Role::kD ? StateStep::Kind::kKeep
