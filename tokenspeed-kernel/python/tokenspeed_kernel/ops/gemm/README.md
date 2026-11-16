@@ -244,3 +244,18 @@ scales) reads directly, so no quantization kernel runs between the two.
 DeepGEMM picks a tile configuration from the token count (one per 16 tokens)
 and JIT-compiles each on first use. `warmup_fp8_projections` launches every
 configuration up to a token bound at startup so serving never compiles.
+
+## Small-N BF16 Split-K policy
+
+`flashinfer_mm_bf16_small_n_splitk` uses FlashInfer's cached CuTe DSL Split-K
+launcher with tile `(64, 8)`, four K splits and six pipeline stages. Automatic
+SM107 dispatch admits the measured `(M,N,K) = (4,640,2560)` projection with
+PDL, contiguous BF16 operands/output and 32-byte pointer alignment. This is a
+measured performance policy, not the implementation's shape contract. Other
+shapes and unaligned views keep the existing GEMM selection; explicit overrides
+remain authoritative. FlashInfer validates the callable's wider tile support.
+
+The ordinary `mm` wrapper applies bias. The kernel preserves a supplied output
+and rejects unsupported scale arguments. Its cached callable uses runtime row
+counts, so changing M does not add specializations. The provider is optional;
+builds without this FlashInfer module retain the existing registered kernels.

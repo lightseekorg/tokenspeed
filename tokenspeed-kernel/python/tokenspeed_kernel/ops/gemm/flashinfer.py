@@ -969,6 +969,96 @@ def autotune_bf16_gemm(x: torch.Tensor, weight: torch.Tensor) -> None:
             flashinfer_bf16_gemm(sample, weight, None)
 
 
+# This is an admission policy, not a kernel shape limit. The four-row,
+# small-N projection measured a win with this tile; other shapes retain their
+# existing GEMM ranking until they have comparable performance evidence.
+def _prefer_small_n_splitk(m: int, n: int, k: int) -> bool:
+    return (m, n, k) == (4, 640, 2560)
+
+
+_bf16_splitk = None
+if platform.is_nvidia and platform.arch_version == ArchVersion(10, 7):
+    try:
+        from flashinfer.gemm.kernels import dense_bf16_gemm_sm100_splitk as _bf16_splitk
+    except ImportError:
+        # Older optional FlashInfer builds keep the existing registered GEMM.
+        pass
+
+
+if _bf16_splitk is not None:
+
+    @register_kernel(
+        "gemm",
+        "mm",
+        name="flashinfer_mm_bf16_small_n_splitk",
+        solution="flashinfer",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 7),
+            max_arch_version=ArchVersion(10, 7),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=format_signatures(("a", "b"), "dense", {torch.bfloat16}),
+        traits={
+            "mnk_problem_filter": frozenset({_prefer_small_n_splitk}),
+            "a_contiguous": frozenset({True}),
+            "b_contiguous": frozenset({True}),
+            "b_layout": frozenset({"NK"}),
+            "has_alpha": frozenset({False}),
+            "operands_aligned_32": frozenset({True}),
+            "out_aligned_32": frozenset({True}),
+            "out_contiguous": frozenset({True}),
+            "out_dtype": frozenset({torch.bfloat16}),
+            "pdl_enabled": frozenset({True}),
+        },
+        priority=Priority.SPECIALIZED + 2,
+    )
+    def flashinfer_mm_bf16_small_n_splitk(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scales: torch.Tensor | None,
+        B_scales: torch.Tensor | None,
+        out_dtype: torch.dtype,
+        *,
+        enable_pdl: bool,
+        alpha: torch.Tensor | None = None,
+        block_size: list[int] | None = None,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Compute BF16 ``A[M,K] @ B[N,K].T`` with a pinned Split-K tile.
+
+        Scales, alpha and block_size must be absent. ``out`` is preserved when
+        supplied. The provider validates layouts, alignment and tile bounds;
+        its compiled function uses runtime row counts. Registry admission is
+        narrower than this callable's supported shapes.
+        """
+        if (
+            A.dtype != torch.bfloat16
+            or B.dtype != A.dtype
+            or out_dtype != A.dtype
+            or any(
+                value is not None for value in (A_scales, B_scales, alpha, block_size)
+            )
+        ):
+            raise ValueError("Split-K BF16 GEMM requires unscaled BF16 operands")
+        if A.ndim != 2 or B.ndim != 2 or not A.is_contiguous() or not B.is_contiguous():
+            raise ValueError("Split-K BF16 GEMM requires contiguous 2D operands")
+        if out is None:
+            out = torch.empty(
+                (A.shape[0], B.shape[0]), device=A.device, dtype=out_dtype
+            )
+        if out.ndim != 2 or not out.is_contiguous():
+            raise ValueError("Split-K BF16 GEMM requires a contiguous 2D output")
+        _bf16_splitk.run_splitk_dense(
+            _canonical_bf16_view(A),
+            B.t(),
+            None,
+            _canonical_bf16_view(out),
+            enable_pdl,
+            _bf16_splitk.SplitKTactic(64, 8, 4, 6),
+        )
+        return out
+
+
 # ===-----------------------------------------------------------------------===#
 # BF16 decode GEMM on small weights: pinned FlashInfer TGV tiles (SM100/103)
 # ===-----------------------------------------------------------------------===#

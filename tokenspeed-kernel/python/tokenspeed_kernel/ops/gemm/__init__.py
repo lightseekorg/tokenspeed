@@ -199,6 +199,7 @@ _KERNELS_WITH_PDL: frozenset[str] = frozenset(
         "flashinfer_cute_dsl_mm_nvfp4",
         "flashinfer_cute_dsl_mm_nvfp4_a16",
         "flashinfer_mm_nvfp4",
+        "flashinfer_mm_bf16_small_n_splitk",
     }
 )
 
@@ -805,6 +806,10 @@ def mm(
         traits["scales_aligned_16"] = (
             A_scales is None or A_scales.data_ptr() % 16 == 0
         ) and (B_scales is None or B_scales.data_ptr() % 16 == 0)
+
+    if A.dtype == B.dtype == torch.bfloat16:
+        traits["operands_aligned_32"] = A.data_ptr() % 32 == B.data_ptr() % 32 == 0
+        traits["out_aligned_32"] = out is None or out.data_ptr() % 32 == 0
 
     signature = _gemm_format_signature(
         A, B, A_scales, B_scales, out_dtype, quant, block_size
