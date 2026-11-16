@@ -3776,6 +3776,165 @@ def test_index_geometry_reuse_and_forward_lifetime():
         torch.testing.assert_close(refreshed.lengths, previous.lengths - 16)
 
 
+def _score_own_history(
+    q,
+    weights,
+    cache,
+    table,
+    visible,
+    candidates,
+    topk,
+    candidate_topk,
+    block_size,
+    query_chunk,
+    score_chunk,
+    group,
+    out,
+    solution,
+    index_metadata,
+):
+    """index_topk stand-in: as in dense scoring, a row reads only [0, visible)
+    of its own table row and scores it against its own query."""
+    columns = torch.arange(table.shape[1] * 64)
+    slots = table.long().repeat_interleave(64, dim=1) * 64 + columns % 64
+    scores = torch.sin(slots * 0.7 + q.float().sum(dim=(1, 2))[:, None])
+    scores = scores.masked_fill((columns >= visible[:, None]) | (slots < 0), -torch.inf)
+    for ids, counts, k, width in (
+        (out[0], out[1], topk, 1),
+        (out[2], out[3], candidate_topk, 8),
+    ):
+        best = scores.view(len(scores), -1, width).amax(dim=2).topk(k, dim=1)
+        picked = best.indices.masked_fill(best.values == -torch.inf, 1 << 30)
+        picked = picked.sort(dim=1).values
+        ids.copy_(picked.masked_fill(picked == 1 << 30, -1))
+        counts.copy_((ids >= 0).sum(dim=1))
+    return out
+
+
+def test_early_decode_index_geometry_is_what_the_layers_build(monkeypatch):
+    """The decode prebuilds build the selection
+    geometry the index sources would build inside select_global, and prepare
+    index_topk with exactly the inputs those layers then score: selections
+    match bit for bit, and no layer builds a selection table itself."""
+    backend = _backend("cpu", 2)
+    tables = _tables("cpu")
+    seen, prepared = [], []
+
+    def scored(*args, slots=None):
+        q, _, cache, table, visible, candidates, topk = args[:7]
+        seen.append((cache, table, visible, candidates, args[7], args[9], args[14]))
+        if candidates is None:
+            out = _score_own_history(*args)
+        else:
+            # Reindex: the first rows of each query's visible candidate blocks.
+            out = args[12]
+            rows = candidates.clamp_min(0).long()[:, :, None] * 8 + torch.arange(8)
+            rows = rows.flatten(1)
+            hidden = (candidates < 0).repeat_interleave(8, dim=1)
+            rows = rows.masked_fill(hidden | (rows >= visible[:, None]), 1 << 30)
+            picked = rows.sort(dim=1).values[:, :topk]
+            out[0].copy_(picked.masked_fill(picked == 1 << 30, -1))
+            out[1].copy_((out[0] >= 0).sum(dim=1))
+        if slots is not None:
+            # Decode asks for the index_topk contract's slots: global_slots of
+            # the selected rows.
+            slots.out.copy_(
+                dsv41.global_slots(
+                    out[0],
+                    slots.positions,
+                    slots.requests,
+                    slots.table,
+                    slots.ratio,
+                    slots.pages,
+                )
+            )
+        return out
+
+    def prepare(*args):
+        prepared.append(args)
+        return True
+
+    monkeypatch.setattr(dsv41, "index_topk", scored)
+    monkeypatch.setattr(dsv41, "prepare_index_topk", prepare)
+    selection_table = Mock(wraps=dsv41.selection_table)
+    monkeypatch.setattr(dsv41, "selection_table", selection_table)
+    torch.manual_seed(12)
+    q = torch.randn(2, 32, 128, dtype=torch.bfloat16)
+    weights = torch.rand(2, 32, dtype=torch.bfloat16)
+    sources = (2, 8, 14, 20, 24, 28, 32, 36)
+
+    def forward(early):
+        meta = _refresh_decode(backend, tables, 2, [300, 140])
+        backend.begin_indexer_forward()
+        seen.clear()
+        prepared.clear()
+        selection_table.reset_mock()
+        if early:
+            backend.prepare_decode_index_geometry(ForwardMode.DECODE, index_heads=32)
+            # One table per owner group (ratio 2 and ratio 1), before any layer.
+            assert selection_table.call_count == 2
+            selection_table.reset_mock()
+        outputs = []
+        for layer in sources:
+            if early and layer == 24:
+                backend.prepare_reindex_index_geometry(
+                    ForwardMode.DECODE, index_heads=32
+                )
+            outputs.extend(
+                backend.select_global(
+                    layer,
+                    q,
+                    weights,
+                    meta.positions,
+                    meta.request_indices,
+                    ForwardMode.DECODE,
+                    None,
+                    query_shard=None,
+                )
+            )
+            if layer == 20:
+                candidates = backend.sparse_topk.decode.candidates
+                outputs.extend((candidates.block_ids, candidates.lengths))
+        built_in_layers = selection_table.call_count
+        backend.end_indexer_forward()
+        return [t.clone() for t in outputs], built_in_layers, list(seen), list(prepared)
+
+    expected, plain_tables, _, plain_prepared = forward(False)
+    actual, early_tables, layers, early_prepared = forward(True)
+    assert plain_tables == 2 and early_tables == 0 and not plain_prepared
+    for got, want in zip(actual, expected, strict=True):
+        assert torch.equal(got, want)
+    # Every source's index_topk call finds the geometry prepared for it.
+    assert len(early_prepared) == len(layers) == len(sources)
+    for args, (cache, table, visible, candidates, wanted, chunk, metadata) in zip(
+        early_prepared, layers, strict=True
+    ):
+        assert args[1] is table and args[2] is visible and args[9] is metadata
+        assert (args[4], args[5], args[6], args[7], args[8]) == (
+            backend.spec.index_topk,
+            wanted,
+            32,
+            torch.bfloat16,
+            chunk,
+        )
+        for got, want in ((args[0], cache), (args[3], candidates)):
+            assert (got is None) == (want is None)
+            if got is not None:
+                assert (got.data_ptr(), got.shape, got.stride()) == (
+                    want.data_ptr(),
+                    want.shape,
+                    want.stride(),
+                )
+    assert [args[3] is None for args in early_prepared] == [True] * 4 + [False] * 4
+    # Outside replicated-cache decode the prebuilds do nothing.
+    prepared.clear()
+    selection_table.reset_mock()
+    backend.begin_indexer_forward()
+    backend.prepare_decode_index_geometry(ForwardMode.EXTEND, index_heads=32)
+    backend.end_indexer_forward()
+    assert not prepared and not selection_table.called
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_index_geometry_scope_preserves_all_indexer_selections_in_graph(monkeypatch):
     backend = _backend("cuda", 2)
@@ -3855,6 +4014,125 @@ def test_index_geometry_scope_preserves_all_indexer_selections_in_graph(monkeypa
         graph.replay()
         for got, want in zip(captured, expected, strict=True):
             torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_gpu_early_index_geometry_replays_like_in_layer_builds(monkeypatch):
+    """Index geometry prebuilt on the index stream at forward start and after
+    the candidate source replays, captured,
+    bit for bit like eager layers building their own; no layer builds any."""
+    backend = _backend("cuda", 2)
+    backend.spec = replace(backend.spec, index_topk=64, candidate_topk=16)
+    backend.cache_pool.arena.buffer.zero_()
+    tables = _tables("cuda")
+    torch.manual_seed(305)
+    for owner, group in ((2, R2), (8, R2), (14, R2), (20, R1)):
+        rows = tables[group].shape[1] * 64
+        logical = torch.arange(rows, device="cuda")
+        for request in range(2):
+            slots = tables[group][request, logical // 64].long() * 64 + logical % 64
+            dsv41.cache_scatter(
+                torch.randn(rows, 128, device="cuda", dtype=torch.bfloat16),
+                backend.cache_pool.index_k(owner),
+                slots,
+                backend.index_format,
+            )
+    requests = torch.tensor([0, 1], device="cuda")
+    backend.refresh_decode_metadata(
+        2,
+        2,
+        requests,
+        torch.tensor([300, 140], device="cuda", dtype=torch.int32),
+        forward_mode=ForwardMode.DECODE,
+        block_tables=tables,
+        for_graph_replay=False,
+    )
+    meta = backend.query_metadata(ForwardMode.DECODE)
+    heads = 32 if current_platform().is_blackwell else 2
+    index_q = torch.randn(2, heads, 128, device="cuda", dtype=torch.bfloat16)
+    index_weights = torch.rand(2, heads, device="cuda", dtype=torch.bfloat16)
+    selection_table = Mock(wraps=dsv41.selection_table)
+    monkeypatch.setattr(dsv41, "selection_table", selection_table)
+    aux = torch.cuda.Stream()
+
+    def on_aux(work):
+        main = torch.cuda.current_stream()
+        fork = torch.cuda.Event()
+        fork.record(main)
+        with torch.cuda.stream(aux):
+            aux.wait_event(fork)
+            result = work()
+            done = torch.cuda.Event()
+            done.record(aux)
+        main.wait_event(done)
+        return result
+
+    def forward(early):
+        backend.begin_indexer_forward()
+        if early:
+            on_aux(
+                lambda: backend.prepare_decode_index_geometry(
+                    ForwardMode.DECODE, index_heads=heads
+                )
+            )
+        selection_table.reset_mock()
+        outputs = []
+        for layer in (2, 8, 14, 20, 24, 28, 32, 36):
+            if early and layer == 24:
+                on_aux(
+                    lambda: backend.prepare_reindex_index_geometry(
+                        ForwardMode.DECODE, index_heads=heads
+                    )
+                )
+            outputs.extend(
+                on_aux(
+                    lambda layer=layer: backend.select_global(
+                        layer,
+                        index_q,
+                        index_weights,
+                        meta.positions,
+                        meta.request_indices,
+                        ForwardMode.DECODE,
+                        None,
+                        query_shard=None,
+                    )
+                )
+            )
+        candidates = backend.sparse_topk.decode.candidates
+        outputs.extend((candidates.block_ids, candidates.lengths))
+        backend.end_indexer_forward()
+        return outputs, selection_table.call_count
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        forward(True)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            captured, built_in_layers = forward(True)
+        assert built_in_layers == 0
+    torch.cuda.current_stream().wait_stream(stream)
+    for live, seq_lens in ((2, [301, 142]), (1, [320]), (2, [64, 512])):
+        index_q.normal_()
+        index_weights.uniform_()
+        for group in (R2, R1):
+            tables[group].copy_(tables[group].roll(1, dims=1))
+        backend.refresh_decode_metadata(
+            2,
+            live,
+            requests[:live],
+            torch.tensor(seq_lens, device="cuda", dtype=torch.int32),
+            forward_mode=ForwardMode.DECODE,
+            block_tables={group: table.flip(0) for group, table in tables.items()},
+            for_graph_replay=True,
+        )
+        expected, built_in_layers = forward(False)
+        assert built_in_layers == 2
+        expected = [t.clone() for t in expected]
+        graph.replay()
+        for got, want in zip(captured, expected, strict=True):
+            torch.testing.assert_close(got, want, rtol=0, atol=0)
+    torch.cuda.synchronize()
 
 
 @pytest.mark.parametrize(

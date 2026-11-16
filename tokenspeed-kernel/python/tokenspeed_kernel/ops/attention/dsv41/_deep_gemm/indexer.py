@@ -376,6 +376,48 @@ def _sparse_candidate_logits(
     selects a fitting pool whole without reading its logits
     (finish_write_selection's short_rows_unscored).
     """
+    normalized, ends, schedule, blocks = _sparse_geometry(
+        cache,
+        page_table,
+        visible,
+        candidates,
+        api,
+        skip_score_topk=skip_score_topk,
+        index_metadata=index_metadata,
+    )
+    scores = api.fp8_fp4_paged_sparse_mqa_logits(
+        q=(
+            queries[0].contiguous().view(torch.int8).unsqueeze(1),
+            queries[1].contiguous().unsqueeze(1),
+        ),
+        kv_cache=cache.as_strided(
+            (cache.shape[0], 64, 1, 68), (cache.stride(0), 68, 68, 1)
+        ),
+        weights=weights.contiguous(),
+        metadata=schedule,
+        num_max_sparse_blocks=blocks,
+        sparse_block_kv=8,
+    )
+    return scores, ends, normalized
+
+
+def _sparse_geometry(
+    cache: torch.Tensor,
+    page_table: torch.Tensor,
+    visible: torch.Tensor,
+    candidates: torch.Tensor,
+    api: object,
+    *,
+    skip_score_topk: int,
+    index_metadata: IndexMetadata | None,
+) -> tuple[torch.Tensor, torch.Tensor, object, int]:
+    """Normalized blocks, candidate-row ends, schedule and block width of a tile.
+
+    The candidate geometry _sparse_candidate_logits scores against, built once
+    per index_metadata for these exact table, length and candidate views
+    (pointer-keyed) and reused by later calls, also from other streams;
+    prepare_index_topk builds it ahead with the same arguments.
+    """
     tokens, count = candidates.shape
     capacity = page_table.shape[1] * 64
     blocks = _sparse_blocks(count)
@@ -449,17 +491,4 @@ def _sparse_candidate_logits(
             )
     else:
         normalized, ends, schedule, *_ = geometry.acquire()
-    scores = api.fp8_fp4_paged_sparse_mqa_logits(
-        q=(
-            queries[0].contiguous().view(torch.int8).unsqueeze(1),
-            queries[1].contiguous().unsqueeze(1),
-        ),
-        kv_cache=cache.as_strided(
-            (cache.shape[0], 64, 1, 68), (cache.stride(0), 68, 68, 1)
-        ),
-        weights=weights.contiguous(),
-        metadata=schedule,
-        num_max_sparse_blocks=blocks,
-        sparse_block_kv=8,
-    )
-    return scores, ends, normalized
+    return normalized, ends, schedule, blocks

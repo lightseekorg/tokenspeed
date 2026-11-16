@@ -1967,6 +1967,102 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         self._prepared_selections[key] = (positions, requests, result)
         return result
 
+    def prepare_decode_index_geometry(
+        self, forward_mode: ForwardMode, *, index_heads: int
+    ) -> None:
+        """Build the decode Full sources' index geometry, on the caller's stream.
+
+        Builds, ahead of the layers, the selection tables and the scorer's
+        tile geometry (paged schedules) select_global builds inside the first
+        Full source of each owner group (L2 for ratio 2, L20 for ratio 1),
+        from the same kernels on the same per-forward metadata, under the
+        keys select_global and index_topk look up. Call it after
+        begin_indexer_forward, before those layers run; consumers on other
+        streams wait for it. index_heads is the indexer's head count.
+        A no-op outside replicated-cache decode.
+        """
+        for layer_id in range(len(self.spec.kv_owners)):
+            owner = self.spec.kv_owners[layer_id]
+            if self.spec.index_sources[layer_id] == layer_id == owner:
+                self._prepare_decode_index(layer_id, forward_mode, None, index_heads)
+
+    def prepare_reindex_index_geometry(
+        self, forward_mode: ForwardMode, *, index_heads: int
+    ) -> None:
+        """Build the Reindex sources' sparse scoring geometry, on the caller's stream.
+
+        Call it after the candidate source's selection, before the first
+        Reindex layer: it builds the normalized candidates and the sparse
+        schedule that layer would build, from the candidate source's
+        published blocks, which every Reindex layer of the forward shares.
+        A no-op outside replicated-cache decode or without candidates.
+        """
+        record = self.sparse_topk.decode
+        if record is None or record.candidates is None:
+            return
+        for layer_id in range(len(self.spec.kv_owners)):
+            owner = self.spec.kv_owners[layer_id]
+            if (
+                self.spec.index_sources[layer_id] == layer_id != owner
+                and record.owner == owner
+            ):
+                self._prepare_decode_index(
+                    layer_id, forward_mode, record.candidates, index_heads
+                )
+
+    def _prepare_decode_index(self, layer_id, forward_mode, candidates, index_heads):
+        """select_global's decode geometry and index_topk preparation for a source.
+
+        Mirrors select_global for replicated-cache decode over the refreshed
+        query window: one query tile, no history bound, the table trimmed to
+        the index field's pages.
+        """
+        from tokenspeed_kernel.ops.attention import dsv41
+
+        if not forward_mode.is_decode() or self.kvp_size > 1:
+            return
+        metadata = self.query_metadata(forward_mode)
+        positions, requests = metadata.positions, metadata.request_indices
+        n = positions.numel()
+        if n == 0 or self._index_selection_kind(layer_id, None) == "all":
+            return
+        if candidates is not None and not (
+            positions is candidates.positions and requests is candidates.request_indices
+        ):
+            return
+        owner = self.spec.kv_owners[layer_id]
+        source_table = metadata.block_tables[self._owner_group(owner)]
+        index_cache = self.cache_pool.index_k(owner)
+        table = source_table[:, : max(0, index_cache.shape[0] - 1)]
+        geometry = self._selection_geometry(
+            positions,
+            requests,
+            source_table,
+            table,
+            self.spec.compress_ratios[owner],
+            0,
+            n,
+            None,
+            forward_mode,
+        )
+        produce_candidates = layer_id == self.spec.candidate_source
+        dsv41.prepare_index_topk(
+            index_cache,
+            geometry.table,
+            geometry.lengths,
+            None if candidates is None else candidates.block_ids[0:n],
+            self.spec.index_topk,
+            (
+                min(self.spec.candidate_topk, table.shape[1] * 8)
+                if produce_candidates
+                else 0
+            ),
+            index_heads,
+            torch.bfloat16,
+            n,
+            geometry.kernel_metadata,
+        )
+
     def write_decode_swa(
         self,
         layer_id: int,

@@ -2473,3 +2473,235 @@ def test_native_index_topk_fused_selection_matches_the_separate_passes(
             rtol=0,
             atol=0,
         )
+
+
+def _paged_api(built, seen):
+    class Api:
+        def get_num_sms(self):
+            return 4
+
+        def get_paged_mqa_logits_metadata(self, context_lens, size, sms, indices):
+            built.append("schedule")
+            return torch.cat((context_lens.flatten(), indices, torch.tensor([sms])))
+
+        def fp8_fp4_paged_mqa_logits(self, **kwargs):
+            seen.append(kwargs)
+            rows = kwargs["context_lens"].shape[0]
+            return torch.zeros(rows, 512, dtype=torch.bfloat16)
+
+    return Api()
+
+
+def test_prepared_paged_geometry_is_the_scoring_geometry(monkeypatch):
+    """prepare_index_topk builds paged Full's tile geometry under the key the
+    scorer looks it up by: scoring uses it as built and rebuilds nothing."""
+    from tokenspeed_kernel.ops.attention.dsv41 import deep_gemm as native
+
+    rows, pages, capacity = 3, 9, 5 * 64
+    table = torch.tensor(
+        [[1, -1, 2, 3, 99], [4, 5, 6, 7, 8], [-1, 0, 1, 2, 3]], dtype=torch.int32
+    )
+    lengths = torch.tensor([200, 400, 0], dtype=torch.int32)
+    requests = torch.tensor([0, 1, 2], dtype=torch.int32)
+    built, seen = [], []
+    api = _paged_api(built, seen)
+
+    def safe(t, lens, p, cap, size):
+        built.append("table")
+        return t.masked_fill((t < 0) | (t >= p), 0), lens.clamp(0, cap).to(torch.int32)
+
+    monkeypatch.setattr(native, "_api", lambda queries: api)
+    monkeypatch.setattr(native, "_api_for", lambda heads, device: api)
+    monkeypatch.setattr(native, "safe_metadata", safe)
+    monkeypatch.setattr(native, "clean_logits_for_selection", lambda *args: args[0])
+    monkeypatch.setattr(native, "mask_invalid_table_pages", lambda *args: args[0])
+    monkeypatch.setattr(native, "deep_select_alignment", lambda: (1024, 32))
+    index_cache = torch.zeros(pages, 64, 68, dtype=torch.uint8)
+    cache = index_cache.as_strided((pages, 64 * 68), (index_cache.stride(0), 1))
+    queries = (
+        torch.zeros(rows, 32, 64, dtype=torch.uint8),
+        torch.zeros(rows, 32, dtype=torch.int32),
+    )
+
+    def score(metadata):
+        seen.clear()
+        native._paged_scores(
+            queries,
+            cache,
+            torch.zeros(rows, 32),
+            table,
+            lengths,
+            capacity,
+            64,
+            metadata,
+            0,
+            rows,
+            False,
+        )
+        return seen[0]
+
+    plain = score(dsv41.new_index_metadata(table, lengths, requests, history_rows=None))
+    assert built == ["table", "schedule"]
+    built.clear()
+    metadata = dsv41.new_index_metadata(table, lengths, requests, history_rows=None)
+    native.prepare_index_topk(
+        index_cache, table, lengths, None, 4, 0, 32, rows, metadata
+    )
+    assert built == ["table", "schedule"]
+    (entry,) = metadata.paged.values()
+    prepared = score(metadata)
+    assert built == ["table", "schedule"]
+    table_p, _, context_p, schedule_p, indices_p = entry.tensors
+    assert prepared["block_table"] is table_p
+    assert prepared["context_lens"] is context_p
+    assert prepared["schedule_meta"] is schedule_p
+    assert prepared["indices"] is indices_p
+    for name in ("block_table", "context_lens", "schedule_meta", "indices"):
+        assert torch.equal(prepared[name], plain[name])
+    # Dense (history_rows) scoring and empty tables keep no prepared geometry.
+    dense = dsv41.new_index_metadata(table, lengths, None, history_rows=(rows,))
+    native.prepare_index_topk(index_cache, table, lengths, None, 4, 0, 32, rows, dense)
+    empty = table[:, :0]
+    blank = dsv41.new_index_metadata(empty, lengths, None, history_rows=None)
+    native.prepare_index_topk(index_cache, empty, lengths, None, 4, 0, 32, rows, blank)
+    assert not dense.paged and not blank.paged and built == ["table", "schedule"]
+
+
+def test_prepared_sparse_geometry_is_the_scoring_geometry(monkeypatch):
+    """prepare_index_topk builds the native sparse scorer's normalized
+    candidates and schedule for the same views; scoring reuses them as built."""
+    from tokenspeed_kernel.ops.attention.dsv41 import deep_gemm as native
+    from tokenspeed_kernel.ops.attention.dsv41._deep_gemm import indexer
+
+    rows, pages = 3, 9
+    table = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8], [1, 0, 0, 0]], dtype=torch.int32)
+    visible = torch.tensor([100, 250, 0], dtype=torch.int32)
+    candidates = torch.tensor(
+        [[3, 0, 5, -1], [1, 2, 31, 7], [0, -1, -1, -1]], dtype=torch.int32
+    )
+    built, scored = [], []
+
+    class Normalize:
+        def __getitem__(self, grid):
+            def launch(C, L, T, normalized, sparse, context, end, *args, num_warps):
+                built.append("normalize")
+                order = C.sort(dim=1).values
+                normalized.fill_(-1)[:, : C.shape[1]] = order
+                sparse.copy_(normalized + 1)
+                context.copy_(L.clamp_min(0) * 2)
+                end.copy_(L // 3)
+
+            return launch
+
+    class Mask:
+        def __getitem__(self, grid):
+            return lambda *args: None
+
+    class Api:
+        def get_num_sms(self):
+            return 4
+
+        def get_pdl(self):
+            return False
+
+        def get_paged_sparse_mqa_logits_metadata(self, *args):
+            built.append("schedule")
+            context, table, requests, page, sparse = args[:5]
+            return torch.cat((context, requests, sparse.flatten(), table.flatten()))
+
+        def fp8_fp4_paged_sparse_mqa_logits(self, **kwargs):
+            scored.append(kwargs["metadata"])
+            width = kwargs["num_max_sparse_blocks"] * 8
+            return torch.zeros(rows, width, dtype=torch.bfloat16)
+
+    api = Api()
+    monkeypatch.setattr(indexer, "_normalize_candidate_blocks", Normalize())
+    monkeypatch.setattr(indexer, "_mask_candidate_logits", Mask())
+    monkeypatch.setattr(indexer, "_warmup_sparse_mqa", lambda *args: None)
+    monkeypatch.setattr(indexer, "deep_select_alignment", lambda: (1024, 32))
+    monkeypatch.setattr(native, "_api_for", lambda heads, device: api)
+    # Native sparse reads need 512-byte page strides.
+    index_cache = torch.zeros(pages, 4608, dtype=torch.uint8).as_strided(
+        (pages, 64, 68), (4608, 68, 1)
+    )
+    cache = index_cache.as_strided((pages, 64 * 68), (4608, 1))
+    queries = (
+        torch.zeros(rows, 32, 64, dtype=torch.uint8),
+        torch.zeros(rows, 32, dtype=torch.int32),
+    )
+
+    def score(metadata):
+        return indexer._sparse_candidate_scores(
+            queries,
+            torch.zeros(rows, 32, dtype=torch.bfloat16),
+            cache,
+            table,
+            visible,
+            candidates,
+            api,
+            skip_score_topk=4,
+            index_metadata=metadata,
+        )
+
+    plain = score(dsv41.new_index_metadata(table, visible, None, history_rows=None))
+    assert built == ["normalize", "schedule"]
+    built.clear()
+    metadata = dsv41.new_index_metadata(table, visible, None, history_rows=None)
+    native.prepare_index_topk(
+        index_cache, table, visible, candidates, 4, 0, 32, rows, metadata
+    )
+    assert built == ["normalize", "schedule"]
+    (entry,) = metadata.sparse.values()
+    prepared = score(metadata)
+    assert built == ["normalize", "schedule"]
+    normalized, ends, schedule = entry.tensors[:3]
+    assert scored[-1] is schedule and torch.equal(scored[-1], scored[0])
+    assert prepared[1] is ends and prepared[2] is normalized
+    for got, want in zip(prepared, plain, strict=True):
+        assert torch.equal(got, want)
+
+
+def test_prepare_index_topk_follows_the_selected_scorer(monkeypatch):
+    """The family call prepares through the scorer index_topk would select,
+    with the same traits, and reports False when that scorer has no preparer."""
+    from types import SimpleNamespace
+
+    from tokenspeed_kernel.selection import NoKernelFoundError
+
+    calls = []
+    scorer = {"name": "deep_gemm_dsv41_index_topk"}
+
+    def select(
+        family, mode, signature, *, features, platform, traits, solution, override
+    ):
+        calls.append((mode, solution, traits))
+        if mode == "dsv41_index_topk":
+            return SimpleNamespace(name=scorer["name"])
+        if solution != "deep_gemm":
+            raise NoKernelFoundError("no preparer")
+        return lambda *args: calls.append(args)
+
+    monkeypatch.setattr(dsv41, "select_kernel", select)
+    table = torch.ones(3, 4, dtype=torch.int32)
+    lengths = torch.tensor([10, 20, 30], dtype=torch.int32)
+    metadata = dsv41.new_index_metadata(table, lengths, None, history_rows=None)
+    cache = torch.zeros(9, 64, 68, dtype=torch.uint8)
+    args = (cache, table, lengths, None, 4, 0, 32, torch.bfloat16, 3, metadata)
+    assert dsv41.prepare_index_topk(*args)
+    (scorer_mode, scorer_solution, traits), prepare, prepared = calls
+    assert (scorer_mode, scorer_solution) == ("dsv41_index_topk", None)
+    assert prepare == ("dsv41_index_topk_prepare", "deep_gemm", traits)
+    assert traits["index_heads"] == 32 and traits["index_k_format"] == "mxfp4"
+    assert prepared == (cache, table, lengths, None, 4, 0, 32, 3, metadata)
+    calls.clear()
+    scorer["name"] = "triton_dsv41_index_topk"
+    assert not dsv41.prepare_index_topk(*args)
+    assert [call[:2] for call in calls] == [
+        ("dsv41_index_topk", None),
+        ("dsv41_index_topk_prepare", "triton"),
+    ]
+    with pytest.raises(TypeError, match="new_index_metadata"):
+        dsv41.prepare_index_topk(*args[:-1], object())
+    other = dsv41.new_index_metadata(table.clone(), lengths, None, history_rows=None)
+    with pytest.raises(ValueError, match="different table"):
+        dsv41.prepare_index_topk(*args[:-1], other)

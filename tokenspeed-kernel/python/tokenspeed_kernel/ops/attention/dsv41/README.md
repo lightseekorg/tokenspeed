@@ -30,6 +30,11 @@ request IDs. Free decode windows use independent rows so reordering queries
 cannot truncate the history scored for an earlier row.
 Request IDs, tables, and lengths remain unchanged while sharing metadata;
 graph replay refreshes their captured producers.
+`prepare_index_topk` builds that geometry ahead of the scoring call, from the
+same table, length and candidate tensors: paged Full's sanitized tables and
+schedules, or the native sparse scorer's normalized candidates and schedule,
+under the keys `index_topk` looks up. The runtime uses it to move the builds
+off a decode layer's index chain.
 
 The paged selection cleaner writes its final aligned score layout directly.
 It masks invalid pages and initializes the last live tile's prefetch padding;

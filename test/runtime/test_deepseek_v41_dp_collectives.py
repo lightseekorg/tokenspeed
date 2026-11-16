@@ -179,6 +179,14 @@ class _CpuAttentionBackend:
     def begin_indexer_stage(self):
         pass
 
+    def prepare_decode_index_geometry(self, forward_mode, *, index_heads):
+        # Decode builds index geometry ahead of the layers; this backend
+        # keeps none.
+        pass
+
+    def prepare_reindex_index_geometry(self, forward_mode, *, index_heads):
+        pass
+
     def query_metadata(self, mode):
         return self.meta
 
