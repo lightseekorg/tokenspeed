@@ -27,8 +27,28 @@ from tokenspeed_kernel.ops.residual._cute_dsl import gated_boundary as _cute_dsl
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_format_signature
 
-# A producer asks this before publishing: only the cluster boundary gathers a mailbox.
-boundary_gathers_mailbox = _cute_dsl.mailbox_boundary_supported
+# Widest row the Triton kernel holds in one block.
+_TRITON_MAX_WIDTH = 65536
+
+
+def boundary_gathers_mailbox(rows: int, width: int, ranks: int) -> bool:
+    """Whether :func:`post_norm_residual_pre_norm` reads a mailbox branch of this shape.
+
+    A producer asks this before publishing into the mailbox.
+
+    Args:
+        rows: Rows of the batch, the mailbox's first rows.
+        width: Row width.
+        ranks: Partials per mailbox row to reduce; 1 to gather.
+
+    Returns:
+        True when the kernel that serves this batch reads the mailbox: the
+        cluster kernel within its row ceiling, the Triton kernel past it for
+        a gather.
+    """
+    if ranks == 1 and rows > _cute_dsl.CLUSTER_BOUNDARY_MAX_ROWS:
+        return width & (width - 1) == 0 and 2 <= width <= _TRITON_MAX_WIDTH
+    return _cute_dsl.mailbox_boundary_supported(rows, width, ranks)
 
 
 def residual_gate_coefficients(
@@ -79,14 +99,13 @@ def post_norm_residual_pre_norm(
     two sum each row's variance in a different order, so a batch inside the ceiling and one past it agree to
     the last bit of the variance rather than bitwise; each is deterministic.
 
-    Only the cluster kernel gathers a mailbox branch: it polls the armed words
-    itself and re-arms them, so a batch it cannot serve is refused rather
-    than handed a mailbox the Triton kernel would read as it stands. The
+    Both kernels read a mailbox branch, polling the armed words and re-arming
+    them, with the same split and so the same bits as an ordinary branch. The
     mailbox holds one ``[capacity, block_width]`` block per producing rank,
-    and a row is its blocks' rows side by side. A row may hold one
-    partial per rank; the kernel then sums them in BF16 in rank order, the
-    bits the one-shot all-reduce kernel would have produced, so the all-reduce
-    launch is not needed.
+    and a row is its blocks' rows side by side. Within the cluster kernel's
+    ceiling a row may hold one partial per rank; it then sums them in BF16 in
+    rank order, the bits the one-shot all-reduce kernel would have produced,
+    so the all-reduce launch is not needed. The Triton kernel only gathers.
 
     Args:
         stream: FP32 residual stream ``[rows, width]``.

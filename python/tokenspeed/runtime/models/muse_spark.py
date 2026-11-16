@@ -148,8 +148,12 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.backends.base import DecodeKVView
 
 
-# Row limit of the generic column gather and the NVLS mailbox.
+# Row limit of the generic column gather.
 _GATHER_WORKSPACE_ROWS = 64
+# A gather mailbox moves only each rank's own block, so it beats the NCCL gather well past 64 rows.
+_GATHER_MAILBOX_ROWS = 512
+# Past this, multicasting a full partial per rank costs more than the two-shot all-reduce (128 rows: 73 us vs 29).
+_REDUCE_MAILBOX_ROWS = 64
 # Row limit of the fused gather + RMSNorm + MXFP4 pre-expert path. It is the
 # TP4 Lamport mailbox capacity (43 * 4096 elements, i.e. 172 rows of a
 # 1024-wide shard), and TP8 uses the same limit. In measurements the fused
@@ -317,7 +321,7 @@ class _MuseGatheredLinear(ColumnParallelLinear):
                 block_index=layer_id,
                 layer_count=layer_count,
                 model_scope=f"{prefix.split('.layers.')[0]}.{prefix.rsplit('.', 1)[-1]}",
-                max_m=_GATHER_WORKSPACE_ROWS,
+                max_m=_GATHER_MAILBOX_ROWS,
                 # Takes this call's weight view; the mailbox publishes wider blocks.
                 publish_gemm=partial(_block_gemm, self),
                 rank_major=True,
@@ -762,7 +766,7 @@ def _bind_mailbox(
         block_index=layer_id,
         layer_count=config.num_hidden_layers,
         model_scope=model_scope,
-        max_m=_GATHER_WORKSPACE_ROWS,
+        max_m=_REDUCE_MAILBOX_ROWS,
         # Pooled across layers: the weight must come from the call, never the closure.
         publish_gemm=lambda x, weight, out: _block_gemm(linear, x, weight, out),
         rank_major=True,
@@ -788,7 +792,7 @@ def _bind_ep_all_reduce(
         layer_count=config.num_hidden_layers,
         # Mailboxes pool across layers, so the scope excludes the layer index.
         model_scope=f"{prefix.split('.layers.')[0]}.ep_all_reduce",
-        max_m=_GATHER_WORKSPACE_ROWS,
+        max_m=_REDUCE_MAILBOX_ROWS,
         publish_gemm=_no_route_sum_gemm,
         rank_major=False,
     )
