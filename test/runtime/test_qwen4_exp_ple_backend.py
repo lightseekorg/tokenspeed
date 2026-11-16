@@ -261,7 +261,7 @@ def test_ple_idle_refresh_and_failed_refresh_disarm_verify(backend):
 def test_ple_preallocation_preserves_workspace_and_budget(backend):
     scratch = backend.ple_verify_scratch(qwen4_exp_ple_context_field(0), 0, 4)
     allocated = backend.preallocate_verify_workspace(4, 3)
-    assert allocated == 16 * (16 + 2 * 24) + 2 * 4 * 2 * 8
+    assert allocated == 16 * (16 + 2 * 24) + 2 * 4 * 2 * 8 + 2 * 20
     assert backend.preallocate_verify_workspace(2, 3) == allocated
     for bs in (1, 2, 4):
         views = backend.ple_verify_scratch(qwen4_exp_ple_context_field(0), 0, bs)
@@ -411,7 +411,8 @@ def test_ple_commit_uses_fused_kernels_and_replays_live_inputs():
     for kernel, count in (
         ("_commit_state_pages_kernel", 1),
         ("_state_verify_commit_rows_kernel", 1),
-        ("_copy_state_rows_kernel", 2),
+        ("_copy_state_rows_kernel", 1),
+        ("_ple_verify_restore_kernel", 1),
     ):
         assert sum(kernel in name for name in gpu_kernels) == count
     assert torch.all(backend._ple_commit_rows[:, 4:] == -99)
@@ -437,3 +438,50 @@ def test_ple_commit_uses_fused_kernels_and_replays_live_inputs():
             torch.testing.assert_close(field, expected, rtol=0, atol=0)
         assert torch.all(backend._ple_commit_rows[:, 4:] == -99)
     assert backend._verify_commit_ctx is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_ple_commit_compact_and_full_layers():
+    from tokenspeed_kernel.ops.ple import ple_conv_sequences
+
+    backend = _make_backend(3, False, "cuda")
+    _verify(backend)
+    expected = []
+    for layer in (0, 2):
+        initial = torch.randn(2, 4, 3, device="cuda", dtype=torch.bfloat16)
+        values = torch.randn(6, 4, device="cuda", dtype=torch.bfloat16)
+        scratch = backend._ple_verify_scratch[qwen4_exp_ple_conv_field(layer)]
+        sequence = torch.cat((initial.transpose(1, 2), values.view(2, 3, 4)), 1)
+        if layer == 0:
+            ple_conv_sequences(
+                values,
+                initial,
+                torch.ones(4, 2, device="cuda", dtype=values.dtype),
+                torch.arange(2, device="cuda").repeat_interleave(3),
+                torch.arange(3, device="cuda").repeat(2),
+                torch.full((2,), 3, device="cuda"),
+                torch.tensor([0, 3], device="cuda"),
+                total_tokens=6,
+                batch_size=2,
+                dilation=3,
+                kernel_size=2,
+                state_len=3,
+                write_final=False,
+                weights_independent=True,
+                windows=scratch,
+                windows_block_rows=4,
+                scatter_windows=True,
+                compact_layout_flag=backend.ple_conv_layout(layer),
+            )
+        else:
+            for a in range(4):
+                scratch[:8].view(2, 4, 4, 3)[:, a].copy_(
+                    sequence[:, a : a + 3].transpose(1, 2)
+                )
+        expected.append(torch.stack((sequence[0, 1:4].T, sequence[1, 3:6].T)))
+    backend.commit_verified_state(
+        torch.tensor([0, 9], device="cuda", dtype=torch.int32)
+    )
+    for layer, reference in zip((0, 2), expected, strict=True):
+        field = backend.cache_pool.arena.field(qwen4_exp_ple_conv_field(layer))
+        assert torch.equal(field[[2, 5]].view(torch.int16), reference.view(torch.int16))
