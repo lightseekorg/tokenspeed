@@ -375,7 +375,7 @@ def test_reindex_unaligned_pages_keep_candidate_filtering(monkeypatch):
     def forbid_sparse(*args, **kwargs):
         raise AssertionError("Unaligned pages must not enter the native sparse kernel")
 
-    monkeypatch.setattr(deep_gemm, "_sparse_candidate_scores", forbid_sparse)
+    monkeypatch.setattr(deep_gemm, "_sparse_candidate_logits", forbid_sparse)
     ids, counts, _, _ = dsv41.index_topk(
         q,
         weights,
