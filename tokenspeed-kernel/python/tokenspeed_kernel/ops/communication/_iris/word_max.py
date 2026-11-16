@@ -130,7 +130,8 @@ def iris_lamport_word_max(
     piece = gl.arange(0, 4, layout=gl.SliceLayout(0, layout))
     shift = (16 * piece).to(gl.int64)[None, :]
     calls = gl.load(calls_ptr)
-    stage = (calls % 2) * (WORLD_SIZE * SLOT)
+    # The int32 count wraps negative; & keeps the parity where % would not.
+    stage = (calls & 1) * (WORLD_SIZE * SLOT)
     peers = _iris_peer_pointers(mailbox, heaps, RANK)
     for start in range(0, rows, BLOCK):
         row = start + lane
