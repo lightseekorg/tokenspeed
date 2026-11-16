@@ -17,6 +17,7 @@ from tokenspeed_kernel.ops.layernorm import (
 )
 from tokenspeed_kernel.ops.layernorm.triton import (
     _add_rmsnorm_kernel,
+    _fused_qk_rmsnorm_rope_kernel,
     _grouped_gemma_rmsnorm_kernel,
     _rmsnorm_kernel,
     fused_qk_rmsnorm_rope,
@@ -372,6 +373,20 @@ def test_fused_qk_rmsnorm_rope_rows_do_not_depend_on_the_call_size(
         part = _rope(q[rows], k[rows], q_weight, k_weight, cache, positions[rows])
         for got, want in zip(part, whole, strict=True):
             assert torch.equal(got, want[rows])
+
+
+def test_fused_qk_rmsnorm_rope_compiles_once_per_token_block(device: str) -> None:
+    """One compile per tokens-per-program bucket, none per token count."""
+    q, k, q_weight, k_weight, cache, positions = _rope_inputs(1100, 12, 2, device)
+
+    def run(tokens: int) -> None:
+        _rope(q[:tokens], k[:tokens], q_weight, k_weight, cache, positions[:tokens])
+
+    run(1)
+    run(601)
+    with assert_no_triton_compile(_fused_qk_rmsnorm_rope_kernel):
+        for tokens in (2, 16, 37, 511, 512, 1024, 1100):
+            run(tokens)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
