@@ -579,9 +579,9 @@ impl TransferPeer for FakePeer {
     }
 }
 
-/// EPD: a `lost-*` request's receive fails at its second poll. Other requests
-/// land after three polls, one more
-/// on each later rank. Each landed item takes one slot of eight.
+/// EPD: a `lost-*` request's receive fails at its second poll. Other
+/// requests land after three polls, one more on each later rank. Each
+/// landed item takes one slot of eight.
 struct FakeReceiver {
     rank: usize,
     staged: Vec<(String, Vec<EmbeddingItem>, usize)>,
