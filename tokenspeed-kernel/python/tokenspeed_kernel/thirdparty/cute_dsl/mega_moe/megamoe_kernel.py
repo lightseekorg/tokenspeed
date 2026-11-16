@@ -162,6 +162,38 @@ def _layout_regions(
 class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
     """MegaMoE-complete fused dispatch + fc1 + fc2 + combine kernel."""
 
+    @staticmethod
+    def supports_dense_routing(
+        *,
+        world_size: int,
+        num_topk: int,
+        hidden: int,
+        static_expert_shape: Optional[Tuple[int, int, int]],
+        max_tokens_per_rank: int,
+        situ_beta: Optional[float],
+        situ_linear_beta: Optional[float],
+        token_back_mode: str,
+        combine_format: CombineFormat,
+        fc2_output_dtype: Type[cutlass.Numeric],
+    ) -> bool:
+        """Whether dense routing is implemented for this shape.
+
+        Its fixed routing-ID scratch and receive-metadata ballots are laid out
+        and validated for Kimi-K3 at EP16 (56 local experts) only.
+        """
+        return (
+            world_size == 16
+            and num_topk == 16
+            and hidden == 3584
+            and static_expert_shape == (56, 6144, 3584)
+            and max_tokens_per_rank in (1, 2, 4)
+            and situ_beta == 4.0
+            and situ_linear_beta == 25.0
+            and token_back_mode == "epi_warps"
+            and not combine_format.is_quantized
+            and fc2_output_dtype is cutlass.BFloat16
+        )
+
     def __init__(
         self,
         # Base-class kwargs (forwarded 1:1 to ``super().__init__``).
@@ -215,17 +247,17 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         self.dense_routing = dense_routing
         if not isinstance(dense_routing, bool):
             raise ValueError("dense_routing must be bool")
-        if dense_routing and not (
-            world_size == 16
-            and num_topk == 16
-            and hidden == 3584
-            and static_expert_shape == (56, 6144, 3584)
-            and max_tokens_per_rank in (1, 2, 4)
-            and situ_beta == 4.0
-            and situ_linear_beta == 25.0
-            and token_back_mode == "epi_warps"
-            and not combine_format.is_quantized
-            and fc2_output_dtype is cutlass.BFloat16
+        if dense_routing and not self.supports_dense_routing(
+            world_size=world_size,
+            num_topk=num_topk,
+            hidden=hidden,
+            static_expert_shape=static_expert_shape,
+            max_tokens_per_rank=max_tokens_per_rank,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            token_back_mode=token_back_mode,
+            combine_format=combine_format,
+            fc2_output_dtype=fc2_output_dtype,
         ):
             raise ValueError(
                 "dense_routing requires K3 EP16 capacity 1/2/4 BF16 epi_warps"
