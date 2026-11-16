@@ -640,6 +640,85 @@ def test_mask_invalid_table_pages_matches_the_cleaned_copy(dtype):
         run(1, float("nan"))
 
 
+def _mask_table_pages_reference(values, lengths, table, pages, size):
+    capacity = table.shape[1] * size
+    column = torch.arange(capacity, device=values.device)
+    page = table[:, column // size]
+    hole = (column[None] < lengths.clamp(0, capacity)[:, None]) & (
+        (page < 0) | (page >= pages)
+    )
+    values[:, :capacity].masked_fill_(hole, -torch.inf)
+
+
+@pytest.mark.parametrize("strided", [False, True])
+def test_mask_invalid_table_pages_graph_replay_matches_the_reference(strided):
+    """The chunk-parallel paged mask refreshes lengths, tables and logits on replay.
+
+    Every replay writes the reference's -inf stores bitwise, over 1M-token
+    tables. Warmed once for its table stride, the kernel compiles nothing more
+    across replays, row counts and table widths.
+    """
+    pages = 70
+
+    def new_table(rows, width):
+        storage = torch.empty(
+            (rows, 2 * width if strided else width), device="cuda", dtype=torch.int32
+        )
+        return storage[:, ::2] if strided else storage
+
+    def fill(storage, lengths, table, ends):
+        width = table.shape[1]
+        storage.normal_()
+        storage[:, width * 64 :] = torch.nan
+        lengths.copy_(torch.tensor(ends, device="cuda", dtype=torch.int32))
+        table.copy_(torch.randint(0, pages, table.shape, device="cuda"))
+        for row, end in enumerate(ends):
+            live = (min(max(end, 0), width * 64) + 63) // 64
+            if live:
+                table[row, torch.randint(0, live, (3,), device="cuda")] = -1
+            table[row, max(live - 1, 0)] = pages
+            table[row, live : live + 2] = -2
+
+    def check(rows, width, ends, graph=None, inputs=None):
+        storage, lengths, table = inputs or (
+            torch.empty((rows, width * 64 + 128), device="cuda", dtype=torch.bfloat16),
+            torch.empty(rows, device="cuda", dtype=torch.int32),
+            new_table(rows, width),
+        )
+        fill(storage, lengths, table, ends)
+        expected = storage.clone()
+        values = storage[:, : width * 64]
+        _mask_table_pages_reference(expected, lengths, table, pages, 64)
+        if graph is None:
+            mask_invalid_table_pages(values, lengths, table, pages, 64)
+        else:
+            graph.replay()
+        assert torch.equal(storage.view(torch.int16), expected.view(torch.int16))
+
+    rows, width = 12, 16385
+    capacity = width * 64
+    inputs = (
+        torch.empty((rows, capacity + 128), device="cuda", dtype=torch.bfloat16),
+        torch.zeros(rows, device="cuda", dtype=torch.int32),
+        new_table(rows, width),
+    )
+    check(rows, width, [0] * rows, inputs=inputs)
+    storage, lengths, table = inputs
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        mask_invalid_table_pages(storage[:, :capacity], lengths, table, pages, 64)
+    with assert_no_triton_compile(_mask_invalid_table_pages):
+        for ends in (
+            [0, 1, 63, 64, 65, 65536, 65537, 131065, 703001, 703001, capacity - 1],
+            [capacity + 9, -4, 703001, 2, 65599, 0, 1, 9999, 200000, 64, 65, 3],
+        ):
+            check(rows, width, ends + [capacity] * (rows - len(ends)), graph, inputs)
+        for small_rows, small_width in ((1, 1), (17, 65), (3, 600)):
+            span = 64 * small_width + 9
+            ends = [(7 + 613 * row) % span - 2 for row in range(small_rows)]
+            check(small_rows, small_width, ends)
+
+
 @pytest.mark.parametrize("history_rows", [(5,), (2, 3), (1, 1, 3)])
 def test_packed_dense_histories_match_paged_scoring(history_rows):
     _, _, cache, pool_table, _, _, _ = _sparse_inputs(len(history_rows), 8, False)

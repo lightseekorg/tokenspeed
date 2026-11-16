@@ -1971,3 +1971,73 @@ def test_padded_rows_view_only_within_the_native_row():
     # A row stride without room for the padded width keeps the logits.
     narrow = torch.zeros(3, 320, dtype=torch.bfloat16)
     assert native._padded_rows(narrow, 128) is narrow
+
+
+@pytest.fixture
+def triton_device():
+    """A GPU, or the CPU when TRITON_INTERPRET=1 runs the Triton kernels there."""
+    if torch.cuda.is_available():
+        return torch.device("cuda:0")
+    if os.environ.get("TRITON_INTERPRET") == "1":
+        return torch.device("cpu")
+    pytest.skip("requires CUDA/ROCm or TRITON_INTERPRET=1")
+
+
+def _bits(values):
+    return values.view(torch.int16 if values.element_size() == 2 else torch.int32)
+
+
+@pytest.mark.parametrize("table_layout", ["contiguous", "strided", "int64"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_mask_invalid_table_pages_chunks_match_the_reference(
+    triton_device, dtype, table_layout
+):
+    """The chunk-parallel paged mask writes exactly the reference's -inf stores.
+
+    1M-token tables (16385 pages, 17 chunks of 1024) with ends from below zero
+    to past the table, many not multiples of 64. Holes sit in the first chunk,
+    across a chunk boundary, in the last live chunk and on each row's last
+    page, plus past each end, where the kernel may not write; one long row has
+    no hole at all. The whole buffer, padding included, must match bitwise.
+    """
+    device = triton_device
+    torch.manual_seed(61)
+    pages, width = 70, 16385
+    capacity = width * 64
+    ends = [-5, 0, 1, 63, 64, 65, 1024 * 64, 1024 * 64 + 1, 2048 * 64 - 7]
+    ends += [703_001, 703_001, capacity - 1, capacity + 100]
+    rows = len(ends)
+    table = torch.randint(0, pages, (rows, width), dtype=torch.int32)
+    for row, end in enumerate(ends):
+        live = (min(max(end, 0), capacity) + 63) // 64
+        if row == 10:
+            continue  # A long row without holes: nothing to write.
+        table[row, [0, 3, 1023, 1024, 2047]] = torch.tensor(
+            [pages, -1, -1, -2, 99], dtype=torch.int32
+        )
+        table[row, max(live - 5, 0)] = pages + 9
+        table[row, max(live - 1, 0)] = -1
+        table[row, live : live + 4] = -1
+        table[row, 1500::977] = -3
+    if table_layout == "strided":
+        strided = torch.zeros((rows, 2 * width), dtype=torch.int32, device=device)
+        strided[:, ::2] = table.to(device)
+        device_table = strided[:, ::2]
+    else:
+        device_table = table.to(
+            device, torch.int64 if table_layout == "int64" else None
+        )
+    lengths = torch.tensor(ends, dtype=torch.int32, device=device)
+    storage = torch.randn((rows, capacity + 128), dtype=dtype, device=device)
+    storage[:, capacity:] = torch.nan
+
+    reference = storage.to("cpu", copy=True)
+    _mask_table_pages_reference(
+        reference[:, :capacity], lengths.cpu(), table, pages, 64
+    )
+    out = implementation.mask_invalid_table_pages(
+        storage[:, :capacity], lengths, device_table, pages, 64
+    )
+    assert out.data_ptr() == storage.data_ptr()
+    assert torch.equal(_bits(storage).cpu(), _bits(reference))
+    assert torch.isneginf(storage[2, 0]) and not torch.isinf(storage[10]).any()

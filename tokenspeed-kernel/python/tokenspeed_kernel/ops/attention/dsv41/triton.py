@@ -2829,25 +2829,40 @@ def mask_invalid_pages(values, lengths, history_pages, starts, pages, page_size)
 
 
 @triton.jit(
-    do_not_specialize=["X0", "L0", "T0", "T1", "TC", "NP"],
+    do_not_specialize=["X0", "L0", "T0", "TC", "NP"],
 )
 def _mask_invalid_table_pages(
-    X, L, T, X0, L0, T0, T1, TC, NP, P: tl.constexpr, B: tl.constexpr
+    X, L, T, X0, L0, T0, T1, TC, NP, P: tl.constexpr, B: tl.constexpr, G: tl.constexpr
 ):
-    # One program per query row, looping only over its live pages of its own
-    # table row: the paged counterpart of _mask_invalid_pages.
+    # Program (row, chunk) checks table pages [chunk * B, chunk * B + B) of its
+    # row, so a long row's chunks run in parallel instead of one CTA looping
+    # over them; chunks at or past the row's end do nothing. T1 is left
+    # specialized: the selection table has unit stride. This is the paged
+    # counterpart of _mask_invalid_pages.
     row = tl.program_id(0).to(tl.int64)
+    first = tl.program_id(1) * B
     end = tl.minimum(tl.maximum(tl.load(L + row * L0), 0), TC * P)
-    for first in range(0, tl.cdiv(end, P), B):
+    if first * P < end:
         page_index = first + tl.arange(0, B)
         live = page_index * P < end
-        page = tl.load(T + row * T0 + page_index * T1, live, other=0).to(tl.int64)
+        page = tl.load(T + row * T0 + page_index * T1, live, other=0)
         invalid = live & ((page < 0) | (page >= NP))
-        # Normally every live page is valid and nothing is written.
+        # Normally every live page is valid and nothing is written. Otherwise
+        # write -inf G pages at a time, rereading their ids in the store
+        # layout: a [B, P] tile would hold every register and convert the
+        # flags through shared memory even when nothing is stored.
         if tl.max(invalid.to(tl.int32), axis=0) > 0:
-            column = page_index[:, None] * P + tl.arange(0, P)[None, :]
-            value = tl.full((B, P), float("-inf"), X.dtype.element_ty)
-            tl.store(X + row * X0 + column, value, invalid[:, None] & (column < end))
+            last = tl.minimum(first + B, tl.cdiv(end, P))
+            for group in range(first, last, G):
+                index = group + tl.arange(0, G)
+                held = tl.load(T + row * T0 + index * T1, index < last, other=0)
+                hole = (index < last) & ((held < 0) | (held >= NP))
+                column = index[:, None] * P + tl.arange(0, P)[None, :]
+                tl.store(
+                    X + row * X0 + column,
+                    float("-inf"),
+                    hole[:, None] & (column < end),
+                )
 
 
 def mask_invalid_table_pages(values, lengths, table, pages, page_size):
@@ -2858,7 +2873,9 @@ def mask_invalid_table_pages(values, lengths, table, pages, page_size):
     (paged scoring). A page outside [0, pages) is invalid, as
     clean_logits_for_selection treats it, so [0, length) of every row ends up
     bit-identical to that cleaned copy. Columns at or beyond length are left
-    untouched: consumers read [0, length). Nothing is copied. Returns values.
+    untouched: consumers read [0, length). Nothing is copied. Rows are checked
+    in 1024-page chunks in parallel, so the longest row does not serialize the
+    launch. Returns values.
     """
     if (
         values.ndim != 2
@@ -2870,7 +2887,10 @@ def mask_invalid_table_pages(values, lengths, table, pages, page_size):
     ):
         raise RuntimeError("DeepGEMM returned incompatible score geometry")
     if values.shape[0] and table.shape[1]:
-        _mask_invalid_table_pages[(values.shape[0],)](
+        # 1024 pages per program keeps a 1M-token table (16385 pages) at 17
+        # programs per row, under one wave for 96 rows; 16-page store groups
+        # keep the kernel at about 30 registers.
+        _mask_invalid_table_pages[(values.shape[0], triton.cdiv(table.shape[1], 1024))](
             values,
             lengths,
             table,
@@ -2881,7 +2901,8 @@ def mask_invalid_table_pages(values, lengths, table, pages, page_size):
             table.shape[1],
             pages,
             page_size,
-            256,
+            1024,
+            max(1, 1024 // page_size),
             num_warps=4,
         )
     return values
