@@ -754,8 +754,9 @@ def index_topk(
     Blackwell paged scoring (decode and verify) uses query_chunk_size and
     optional request IDs; invalid pages before each row's end are set to -inf
     in DeepGEMM's own rows, which TopK borrows with exclusive ends (a cleaned
-    copy only when their stride misses DeepSelect's alignment). Blackwell dense scoring (prefill,
-    history_rows) scores the caller's whole batch: packed keys plus per-row
+    copy only when their stride misses DeepSelect's alignment). Blackwell
+    dense scoring (prefill, history_rows) scores the caller's whole batch:
+    packed keys plus per-row
     cu_seq_len starts, without a 128MiB inner tile. The runtime keeps one
     call's BF16 logits within index_logit_rows. DeepSelect borrows the MQA
     view; invalid pages before each row's end are set to -inf in place.

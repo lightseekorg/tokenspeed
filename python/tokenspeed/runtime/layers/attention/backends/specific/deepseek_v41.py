@@ -2075,7 +2075,8 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         swa_norm_weight: torch.Tensor | None,
         swa_norm_eps: float,
     ) -> bool:
-        """Publish a decode layer's SWA rows before its forward_v41, on the caller's stream.
+        """Publish a decode layer's SWA rows on the caller's stream, before
+        its forward_v41.
 
         This is forward_v41's own decode SWA write (same rows, slots, RoPE,
         deferred norm and cache format), issued early: an index-source layer
