@@ -10,6 +10,7 @@ recurrent KDA state still gets committed after a DSpark verify.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -19,6 +20,7 @@ from tokenspeed_kernel.ops.sampling.cute_dsl import MarkovArgmaxWorkspace
 from tokenspeed.runtime.execution.drafter import dspark as dspark_module
 from tokenspeed.runtime.execution.drafter.dspark import DSpark
 from tokenspeed.runtime.execution.input_buffer import InputBuffers
+from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.models.dspark import VanillaMarkov
 
 VOCAB = 32
@@ -351,6 +353,91 @@ def test_the_block_projection_stands_down_without_a_sharded_head() -> None:
 
     drafter.lm_head = _ShardedHead(torch.randn(0, HIDDEN))
     assert drafter._block_base_logits(torch.randn(2, 4, HIDDEN)) is None
+
+
+# --------------------------------------------------------------------------
+# Sampled steps on the vocabulary shard
+# --------------------------------------------------------------------------
+
+
+class _RecordingShardSampler:
+    """Records each step's shard and proposes its lowest-id maximum."""
+
+    def __init__(self, start: int) -> None:
+        self.start = start
+        self.steps: list[tuple[int, torch.Tensor]] = []
+
+    def propose_vocab_shard(self, shard, *, step: int) -> torch.Tensor:
+        self.steps.append((step, shard.logits.clone()))
+        return (torch.argmax(shard.logits, dim=-1) + self.start).to(torch.int32)
+
+
+def _shard_sampling_drafter(spec: int, start: int, columns: int):
+    drafter = _drafter(spec_num_tokens=spec)
+    drafter.markov_head.markov_w1.weight.data.normal_(0.0, 3.0)
+    drafter.markov_head.markov_w2.weight.data.normal_(0.0, 3.0)
+    drafter.lm_head = _ShardedHead(torch.randn(columns, HIDDEN), start=start)
+    drafter.logits_processor = Mock()
+    drafter.logits_processor.sampled_vocab_shard = lambda logits, head: (
+        SimpleNamespace(logits=logits, head=head)
+    )
+    drafter.draft_sampler = _RecordingShardSampler(start)
+    drafter._samples_vocab_shard = True
+    return drafter
+
+
+def test_sampled_steps_sample_the_biased_shard_of_their_own_position() -> None:
+    """Step k samples position k-1's shard logits plus the previous bias.
+
+    The bias is the Markov head's for the token step k-1 proposed, over this
+    rank's columns only.
+    """
+    spec, start, columns = 5, 8, 8
+    torch.manual_seed(5)
+    drafter = _shard_sampling_drafter(spec, start, columns)
+    hidden = torch.randn(2, spec, HIDDEN)
+    block = torch.zeros((2, spec), dtype=torch.int32)
+    block[:, 0] = torch.tensor([3, 30], dtype=torch.int32)
+    tokens = torch.zeros((2, spec), dtype=torch.int32)
+
+    out = drafter._sample_block(hidden, block, tokens)
+
+    sampler = drafter.draft_sampler
+    assert [step for step, _ in sampler.steps] == list(range(spec - 1))
+    weight = drafter.lm_head.weight
+    w2 = drafter.markov_head.markov_w2.weight[start : start + columns]
+    for k, (_, got) in enumerate(sampler.steps, start=1):
+        latent = drafter.markov_head.get_prev_latent(out[:, k - 1])
+        want = hidden[:, k - 1, :] @ weight.T + latent @ w2.T
+        torch.testing.assert_close(got, want)
+        assert torch.equal(out[:, k], torch.argmax(got, dim=-1) + start)
+
+
+def test_the_shard_walk_needs_raw_logits_from_the_target_head() -> None:
+    """A processor that scales or softcaps its logits keeps gathered rows.
+
+    The bias joins the raw shard logits; otherwise the walk turns on.
+    """
+    drafter = _drafter()
+    head = VocabParallelEmbedding.__new__(VocabParallelEmbedding)
+    head.shard_indices = _ShardIndices(8, 8)
+    drafter.lm_head = head
+    drafter._samples_vocab_shard = False
+    supports = Mock(return_value=True)
+    for scale, softcap in ((2.0, None), (None, 30.0)):
+        drafter.logits_processor = Mock(
+            logit_scale=scale, final_logit_softcapping=softcap
+        )
+        assert not drafter.keep_draft_logits_vocab_sharded(supports, 8)
+    drafter.logits_processor = Mock(logit_scale=None, final_logit_softcapping=None)
+    assert not drafter.keep_draft_logits_vocab_sharded(supports, 0)
+    assert not drafter._samples_vocab_shard
+
+    assert drafter.keep_draft_logits_vocab_sharded(supports, 8)
+    assert drafter._samples_vocab_shard
+    drafter.logits_processor.keep_sampled_logits_vocab_sharded.assert_called_once_with(
+        head, supports
+    )
 
 
 # --------------------------------------------------------------------------
