@@ -179,6 +179,9 @@ def _model_dtype(dtype: torch.dtype):
 _NVIDIA_ONLY = pytest.mark.skipif(
     not current_platform().is_nvidia, reason="the latent down shard is NVIDIA-only"
 )
+_AMD_ONLY = pytest.mark.skipif(
+    not current_platform().is_amd, reason="the routed latent gather is AMD-only"
+)
 
 
 class TestKimiK3RegistrationTests:
@@ -385,6 +388,7 @@ class TestKimiK3RegistrationTests:
         assert moe._latent_input_projections(hidden, rows_replicated=True) is None
         assert moe.experts._situ_input_fp8 is None
 
+    @_AMD_ONLY
     @pytest.mark.parametrize(
         "apply_kernel, quantized",
         (
