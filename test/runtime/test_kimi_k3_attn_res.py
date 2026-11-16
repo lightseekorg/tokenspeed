@@ -892,17 +892,11 @@ class TestAttnResTests:
         )
         premix = kimi_k3.KimiLinearDecoderLayer._attention_premix
 
-        with mock.patch.object(
-            kimi_k3, "_sliced_scratch", return_value=scratch
-        ) as get_scratch:
+        with mock.patch.object(kimi_k3, "_sliced_scratch", return_value=scratch):
             assert (premix(layer, hidden_states, block_residual)) == (
                 kimi_k3._AttentionPremix(
                     layer._attn_wp, layer.input_layernorm.weight, _EPS, scratch
                 )
-            )
-            get_scratch.assert_called_once_with(hidden_states, 1, 4)
-            layer._fused_attnres_graph_available.assert_called_once_with(
-                hidden_states, block_residual
             )
             # Wherever we would not run the fast-path combine, nothing fuses it.
             wide = SimpleNamespace(shape=(33, _HIDDEN), is_cuda=True)

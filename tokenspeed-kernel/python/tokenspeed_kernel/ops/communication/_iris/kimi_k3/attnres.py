@@ -582,8 +582,7 @@ def _iris_attnres_twoshot_exchange(
 ):
     """Exchange tile ``program`` of a row's column blocks.
 
-    One subgroup carries the tile, as in ``iris_lamport_twoshot_bf16_allreduce``:
-    spreading the pushes over more CUs beats wider programs.
+    One subgroup carries the tile, as in ``iris_lamport_twoshot_bf16_allreduce``.
     """
     COLUMNS: gl.constexpr = HIDDEN // WORLD_SIZE
     VECTOR: gl.constexpr = TILE // SUBGROUP_SIZE
