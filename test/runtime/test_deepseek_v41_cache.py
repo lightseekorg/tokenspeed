@@ -239,7 +239,7 @@ def test_rebinding_cache_pool_drops_pool_derived_state():
     assert backend.forward_metadata is None
     assert backend.forward_prefill_metadata is None
     assert backend.forward_decode_metadata is None
-    assert not backend._decode_views_by_bs
+    assert not backend._decode_views_by_shape
     assert backend._decode_buffers is None
     assert backend._max_decode_bs == 0
     assert not backend._swa_plans

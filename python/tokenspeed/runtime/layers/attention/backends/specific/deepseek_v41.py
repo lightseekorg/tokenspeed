@@ -373,7 +373,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         self.forward_metadata: V41Metadata | None = None
         self.forward_prefill_metadata: V41Metadata | None = None
         self.forward_decode_metadata: V41Metadata | None = None
-        self._decode_views_by_bs: dict[int, V41Metadata] = {}
+        self._decode_views_by_shape: dict[tuple[int, int], V41Metadata] = {}
         self._decode_buffers: V41Metadata | None = None
         self._max_decode_bs = 0
         self._swa_plans: dict[tuple[ForwardMode, int], V41SWAQueryPlan] = {}
@@ -447,7 +447,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         self.forward_metadata = None
         self.forward_prefill_metadata = None
         self.forward_decode_metadata = None
-        self._decode_views_by_bs.clear()
+        self._decode_views_by_shape.clear()
         self._decode_buffers = None
         self._max_decode_bs = 0
         self._swa_plans.clear()
@@ -516,13 +516,17 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             global_write_floor=None,
         )
 
-    def _decode_view(self, bs: int) -> V41Metadata:
+    def _decode_view(self, bs: int, num_tokens: int | None = None) -> V41Metadata:
         if self._decode_buffers is None or not 0 <= bs <= self._max_decode_bs:
             raise ValueError("V4.1 decode batch exceeds initialized capacity")
-        if bs not in self._decode_views_by_bs:
-            b = self._decode_buffers
+        if num_tokens is None:
             num_tokens = bs * self.spec_num_tokens
-            self._decode_views_by_bs[bs] = V41Metadata(
+        if not 0 <= num_tokens <= self._decode_buffers.positions.numel():
+            raise ValueError("V4.1 query rows exceed initialized capacity")
+        key = (bs, num_tokens)
+        if key not in self._decode_views_by_shape:
+            b = self._decode_buffers
+            self._decode_views_by_shape[key] = V41Metadata(
                 {gid: t[:bs] for gid, t in b.block_tables.items()},
                 b.positions[:num_tokens],
                 b.request_indices[:num_tokens],
@@ -535,7 +539,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 b.compressor.window(0, num_tokens),
                 None,
             )
-        return self._decode_views_by_bs[bs]
+        return self._decode_views_by_shape[key]
 
     def _check_tables(self, block_tables: Mapping[str, torch.Tensor], bs: int) -> None:
         for gid in V41_GROUP_GEOMETRY:
@@ -562,10 +566,19 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         # The target runner omits num_extends on pure decode; mixed/draft
         # refresh callers can name the leading extend window explicitly.
         num_extends = kwargs.pop("num_extends", 0)
-        # The configured width owns the shape even for callers that supply only
-        # request metadata. The runner's explicit packed count must agree.
-        if "num_tokens" in kwargs and kwargs["num_tokens"] != bs * self.spec_num_tokens:
-            raise ValueError("V4.1 num_tokens must equal batch size times verify width")
+        query_start_loc = kwargs.pop("decode_query_indptr", None)
+        num_tokens = kwargs.pop("num_tokens", bs * self.spec_num_tokens)
+        if query_start_loc is None:
+            if num_tokens != bs * self.spec_num_tokens:
+                raise ValueError(
+                    "V4.1 num_tokens must equal batch size times verify width"
+                )
+        elif self.kvp_size > 1 or num_extends:
+            # KVP's indexer currently constructs host spans with fixed strides.
+            # Refuse a packed window until that consumer takes device boundaries.
+            raise NotImplementedError(
+                "V4.1 packed decode requires KVP1 and pure decode"
+            )
         del for_graph_replay, kwargs
         self._prepared_selections.clear()
         self._index_geometry.clear()
@@ -583,7 +596,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             self._swa_plans.clear()
             self._prefill_layouts.clear()
             self._prefill_kv_batch = None
-        meta = self._decode_view(bs)
+        meta = self._decode_view(bs, num_tokens)
         from tokenspeed_kernel.ops.attention.mla._triton.page_table import (
             copy_page_table,
         )
@@ -610,6 +623,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             actual_bs,
             num_extends,
             self.spec_num_tokens,
+            query_start_loc=query_start_loc,
         )
         self._prepare_compressor(meta)
         self._refresh_decode_window(meta)
