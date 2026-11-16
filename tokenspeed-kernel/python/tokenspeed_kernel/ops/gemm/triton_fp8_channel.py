@@ -237,7 +237,6 @@ _FP8_CHANNEL_SCALE = ScaleFormat(storage_dtype=torch.float32, granularity="chann
     solution="triton",
     capability=CapabilityRequirement(
         min_arch_version=ArchVersion(10, 0),
-        max_arch_version=ArchVersion(10, 3),
         vendors=frozenset({"nvidia"}),
     ),
     signatures=format_signatures(

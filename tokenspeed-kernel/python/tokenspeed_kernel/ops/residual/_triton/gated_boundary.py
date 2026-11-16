@@ -114,11 +114,16 @@ def _post_norm_residual_pre_norm_kernel(
     post_weight_offset: tl.constexpr,
     pre_eps: tl.constexpr,
     pre_weight_offset: tl.constexpr,
+    sentinel_word: tl.constexpr,
+    sentinel_half: tl.constexpr,
     POST_HAS_WEIGHT: tl.constexpr,
     HAS_PRE: tl.constexpr,
     BLOCK: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
     RETURN_PRE_FP32: tl.constexpr,
+    MAILBOX: tl.constexpr,
+    MAILBOX_BLOCK_WIDTH: tl.constexpr,
+    MAILBOX_BLOCK_STRIDE: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     offsets = tl.arange(0, BLOCK)
@@ -130,9 +135,33 @@ def _post_norm_residual_pre_norm_kernel(
     stream = tl.load(stream_ptr + row * width + offsets, mask=mask, other=0.0).to(
         tl.float32
     )
-    values = tl.load(branch_ptr + row * width + offsets, mask=mask, other=0.0).to(
-        tl.float32
-    )
+    if MAILBOX:
+        # One row-wide poll load over the blocks keeps the plain path's variance sum order bitwise.
+        element = (
+            (offsets // MAILBOX_BLOCK_WIDTH) * MAILBOX_BLOCK_STRIDE
+            + row * MAILBOX_BLOCK_WIDTH
+            + offsets % MAILBOX_BLOCK_WIDTH
+        )
+        half_ptr = branch_ptr.to(tl.pointer_type(tl.int16)) + element
+        halves = tl.load(half_ptr, mask=mask, other=0, volatile=True)
+        while tl.max((halves == sentinel_half).to(tl.int32), axis=0) != 0:
+            halves = tl.load(half_ptr, mask=mask, other=0, volatile=True)
+        values = halves.to(tl.bfloat16, bitcast=True).to(tl.float32)
+        words = tl.arange(0, BLOCK // 2)
+        word_ptr = branch_ptr.to(tl.pointer_type(tl.int32)) + (
+            (words // (MAILBOX_BLOCK_WIDTH // 2)) * (MAILBOX_BLOCK_STRIDE // 2)
+            + row * (MAILBOX_BLOCK_WIDTH // 2)
+            + words % (MAILBOX_BLOCK_WIDTH // 2)
+        )
+        tl.store(
+            word_ptr,
+            tl.full([BLOCK // 2], sentinel_word, tl.int32),
+            mask=words < width // 2,
+        )
+    else:
+        values = tl.load(branch_ptr + row * width + offsets, mask=mask, other=0.0).to(
+            tl.float32
+        )
     if POST_HAS_WEIGHT:
         weight = tl.load(post_weight_ptr + offsets, mask=mask, other=0.0)
         values *= _centered_bf16(weight, post_weight_offset)
@@ -223,14 +252,36 @@ def _launch_post_norm_residual_pre_norm(
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """The fused layer boundary as one Triton program per row.
 
-    Same contract as the dispatcher ``post_norm_residual_pre_norm`` without a
-    mailbox branch; every step stays FP32 and only the BF16 pre-norm rounds.
+    Same contract as the dispatcher ``post_norm_residual_pre_norm``, except that
+    a mailbox branch holds one block per rank to gather, never partials to
+    reduce; every step stays FP32 and only the BF16 pre-norm rounds.
     """
-    if branch_sentinel is not None or branch_ranks != 1:
-        raise ValueError("a mailbox branch needs the cluster boundary kernel")
-    if stream.shape != branch.shape or stream.ndim != 2:
-        raise ValueError("stream and branch must share a [rows, width] shape")
-    width = stream.shape[-1]
+    if stream.ndim != 2:
+        raise ValueError("the residual stream must be [rows, width]")
+    rows, width = stream.shape
+    block_width = block_stride = width
+    if branch_sentinel is None:
+        if stream.shape != branch.shape or branch_ranks != 1:
+            raise ValueError("stream and branch must share a [rows, width] shape")
+    else:
+        if branch_ranks != 1:
+            raise ValueError("partials per rank need the cluster boundary kernel")
+        if not 0 <= branch_sentinel <= 0xFFFFFFFF or (branch_sentinel & 0xFFFF) != (
+            branch_sentinel >> 16
+        ):
+            raise ValueError("the mailbox sentinel is one word whose halves agree")
+        if branch.ndim != 3 or branch.shape[1] != rows:
+            raise ValueError("a mailbox branch is a [blocks, rows, block_width] view")
+        block_width, block_stride = branch.shape[2], branch.stride(0)
+        if branch.shape[0] * block_width != width or block_width & (block_width - 1):
+            raise ValueError("the mailbox blocks must tile the row in powers of two")
+        if branch.stride()[1:] != (block_width, 1) or block_stride < rows * block_width:
+            raise ValueError(
+                "a mailbox must be the first rows of whole contiguous blocks"
+            )
+        # The kernel polls halves but re-arms 32-bit words, which must not straddle two blocks.
+        if block_width < 2 or block_stride % 2:
+            raise ValueError("a mailbox block must hold whole 32-bit words")
     if stream.dtype != torch.float32:
         raise ValueError("the residual stream must use FP32")
     if branch.dtype != torch.bfloat16:
@@ -244,12 +295,16 @@ def _launch_post_norm_residual_pre_norm(
     if not stream.is_cuda:
         raise ValueError("all operands must be GPU tensors")
     stream_values = stream.contiguous()
-    branch_values = branch.contiguous()
-    rows = stream_values.shape[0]
+    branch_values = branch if branch_sentinel is not None else branch.contiguous()
     out_stream = torch.empty_like(stream_values)
     has_pre = pre_weight is not None
     pre_fp32 = torch.empty_like(stream_values) if has_pre and return_pre_fp32 else None
-    pre_bf16 = torch.empty_like(branch_values) if has_pre else None
+    pre_bf16 = (
+        torch.empty((rows, width), dtype=torch.bfloat16, device=stream.device)
+        if has_pre
+        else None
+    )
+    sentinel = 0 if branch_sentinel is None else branch_sentinel
     if rows == 0:
         return out_stream, pre_fp32, pre_bf16
     block = triton.next_power_of_2(width)
@@ -272,11 +327,17 @@ def _launch_post_norm_residual_pre_norm(
         post_weight_offset=post_weight_offset,
         pre_eps=pre_eps,
         pre_weight_offset=pre_weight_offset,
+        # The kernel compares int16 halves and stores int32 words: signed images.
+        sentinel_word=sentinel - (1 << 32) if sentinel >= 1 << 31 else sentinel,
+        sentinel_half=(sentinel & 0xFFFF) - (1 << 16 if sentinel & 0x8000 else 0),
         POST_HAS_WEIGHT=post_weight is not None,
         HAS_PRE=has_pre,
         BLOCK=block,
         ENABLE_PDL=use_pdl,
         RETURN_PRE_FP32=return_pre_fp32,
+        MAILBOX=branch_sentinel is not None,
+        MAILBOX_BLOCK_WIDTH=block_width,
+        MAILBOX_BLOCK_STRIDE=block_stride,
         # Six live row-wide vectors spill at 4 warps on an 8192 row.
         num_warps=16,
         **launch,

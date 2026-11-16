@@ -394,8 +394,7 @@ def all_reduce(
     solution="flashinfer_cutedsl",
     capability=CapabilityRequirement(
         vendors=frozenset({"nvidia"}),
-        min_arch_version=ArchVersion(10, 3),
-        max_arch_version=ArchVersion(10, 3),
+        min_arch_version=ArchVersion(10, 0),
     ),
     signatures=frozenset({_PLAIN_SIGNATURE}),
     traits={"hidden_size": frozenset({7168}), "tp_size": frozenset({8})},
