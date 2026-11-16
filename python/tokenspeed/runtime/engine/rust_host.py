@@ -537,8 +537,9 @@ class HostConfig:
             ``--grammar-backend none``.
         eager_grammar: The forward fills grammar bitmasks from the
             matchers' committed state (``DeviceSpecs.uses_eager_grammar``).
-        prefill_delay: The fused engine's prefill-delay gate intervals,
-            (attempt, any) rounds; None plans prefill every round
+        prefill_delay: The fused engine's prefill-delay gate,
+            (attempt, any) intervals in rounds and whether a window is one
+            prefill round; None plans prefill every round
             (``ServerArgs.prefill_delay``).
     """
 
@@ -604,9 +605,9 @@ class HostConfig:
     grammar: GrammarSettings | None
     eager_grammar: bool
     # The fused engine's prefill-delay gate, (attempt, any) intervals in
-    # rounds; None plans prefill every round. See
+    # rounds and single_round; None plans prefill every round. See
     # ``ServerArgs.prefill_delay``.
-    prefill_delay: tuple[int, int] | None
+    prefill_delay: tuple[int, int, bool] | None
 
 
 def host_in_flight_depth(server_args: ServerArgs) -> int:
