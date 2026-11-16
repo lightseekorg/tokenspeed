@@ -36,6 +36,7 @@ from tokenspeed_kernel.ops.sampling.cute_dsl import (
     markov_argmax_step,
     supports_markov_argmax_shape,
 )
+from tokenspeed_kernel.ops.sampling.triton import dspark_markov_shard_logits
 from typing_extensions import override
 
 from tokenspeed.runtime.distributed.comm_ops import all_gather_single
@@ -90,7 +91,8 @@ class DSpark(DFlash):
         """Sample each Markov step on this rank's shard of the target's head.
 
         The step adds the Markov bias to the raw shard logits, so a processor
-        that scales or softcaps its logits keeps the gathered rows.
+        that scales or softcaps its logits keeps the gathered rows, as do a
+        shard the Markov head does not cover and weights other than BF16.
 
         Args:
             supports: The verifier's ``supports_vocab_shard``.
@@ -101,11 +103,18 @@ class DSpark(DFlash):
         """
         head = self.lm_head
         processor = self.logits_processor
+        markov = self.markov_head
         if (
             not isinstance(head, VocabParallelEmbedding)
             or int(head.shard_indices.org_vocab_start_index) != vocab_start
             or processor.logit_scale is not None
             or processor.final_logit_softcapping
+            or not isinstance(markov, VanillaMarkov)
+            or vocab_start + int(head.shard_indices.num_org_elements)
+            > int(markov.markov_w2.weight.shape[0])
+            or head.weight.dtype != torch.bfloat16
+            or markov.markov_w1.weight.dtype != torch.bfloat16
+            or markov.markov_w2.weight.dtype != torch.bfloat16
             or not processor.keep_sampled_logits_vocab_sharded(head, supports)
         ):
             return False
@@ -197,10 +206,17 @@ class DSpark(DFlash):
         """Sample ``next_tokens[:, 1:]`` from this rank's shard of each step's logits."""
         start = int(self.lm_head.shard_indices.org_vocab_start_index)
         columns = int(block_logits.shape[-1])
+        embedding = self.markov_head.markov_w1.weight
+        projection = self.markov_head.markov_w2.weight[start : start + columns]
+        # Each step's record reads its logits before the next step rewrites them.
+        logits = torch.empty_like(block_logits[0])
         for k in range(1, self.spec_num_tokens):
-            bias_fn = self._make_step_bias_fn(next_tokens[:, k - 1])
-            logits = block_logits[k - 1] + bias_fn(start, columns).to(
-                block_logits.dtype
+            dspark_markov_shard_logits(
+                block_logits[k - 1],
+                next_tokens[:, k - 1],
+                embedding,
+                projection,
+                logits,
             )
             shard = self.logits_processor.sampled_vocab_shard(logits, self.lm_head)
             next_tokens[:, k].copy_(

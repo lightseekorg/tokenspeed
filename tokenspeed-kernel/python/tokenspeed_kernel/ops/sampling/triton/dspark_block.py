@@ -33,6 +33,10 @@ token id -- ``torch.argmax`` semantics over the concatenated shards.
 The bias is a tensor-core dot of the previous token's BF16 bigram row against
 the BF16 projection shard: BF16 products are exact in FP32, so this matches
 the reference's FP32 GEMM over BF16-valued weights up to accumulation order.
+
+``dspark_markov_shard_logits`` writes one step's biased shard logits for a
+sampled walk, rounded as the unfused path rounds them: the bias to the
+logits' dtype, then its sum with the base logits.
 """
 
 from __future__ import annotations
@@ -44,6 +48,7 @@ __all__ = [
     "dspark_block_candidate_tiles",
     "dspark_block_greedy_resolve",
     "dspark_block_greedy_step",
+    "dspark_markov_shard_logits",
 ]
 
 _INT64_MIN = tl.constexpr(-(1 << 63))
@@ -53,6 +58,8 @@ _LOW32 = tl.constexpr(0xFFFFFFFF)
 _ROWS = 16
 _BLOCK_V = 256
 _SUB_V = 128
+# Shard columns per program of the sampled walk's logits.
+_LOGITS_V = 64
 
 
 def dspark_block_candidate_tiles(local_vocab: int) -> int:
@@ -383,5 +390,147 @@ def dspark_block_greedy_resolve(
         TP_PAD=triton.next_power_of_2(tp),
         N_TILES=n_tiles,
         N_TILES_PAD=triton.next_power_of_2(n_tiles),
+        num_warps=4,
+    )
+
+
+@triton.jit
+def _markov_shard_logits_kernel(
+    base_ptr,
+    base_row_stride,
+    previous_ptr,
+    previous_stride,
+    embedding_ptr,
+    embedding_row_stride,
+    projection_ptr,
+    projection_row_stride,
+    out_ptr,
+    out_row_stride,
+    rows,
+    num_cols,
+    vocab_size,
+    RANK: tl.constexpr,
+    ROWS: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    tile = tl.program_id(0)
+    row_offsets = tl.program_id(1) * ROWS + tl.arange(0, ROWS)
+    row_mask = row_offsets < rows
+    previous = tl.load(
+        previous_ptr + row_offsets * previous_stride, mask=row_mask, other=0
+    ).to(tl.int64)
+    # Graph padding rows carry arbitrary tokens; keep their gathers in bounds.
+    previous = tl.minimum(tl.maximum(previous, 0), vocab_size - 1)
+    vocab_offsets = tile * BLOCK_V + tl.arange(0, BLOCK_V)
+    vocab_mask = vocab_offsets < num_cols
+    bias = tl.zeros((ROWS, BLOCK_V), tl.float32)
+    for k in tl.static_range(0, RANK, BLOCK_K):
+        rank_offsets = k + tl.arange(0, BLOCK_K)
+        rank_mask = rank_offsets < RANK
+        bigram = tl.load(
+            embedding_ptr
+            + previous[:, None] * embedding_row_stride
+            + rank_offsets[None, :],
+            mask=row_mask[:, None] & rank_mask[None, :],
+            other=0.0,
+        )
+        weight = tl.load(
+            projection_ptr
+            + vocab_offsets.to(tl.int64)[:, None] * projection_row_stride
+            + rank_offsets[None, :],
+            mask=vocab_mask[:, None] & rank_mask[None, :],
+            other=0.0,
+        )
+        bias = tl.dot(bigram, tl.trans(weight), bias)
+    mask = row_mask[:, None] & vocab_mask[None, :]
+    base = tl.load(
+        base_ptr + row_offsets[:, None] * base_row_stride + vocab_offsets[None, :],
+        mask=mask,
+        other=0.0,
+    )
+    dtype = out_ptr.dtype.element_ty
+    logits = (base.to(tl.float32) + bias.to(dtype).to(tl.float32)).to(dtype)
+    tl.store(
+        out_ptr + row_offsets[:, None] * out_row_stride + vocab_offsets[None, :],
+        logits,
+        mask=mask,
+    )
+
+
+def dspark_markov_shard_logits(
+    base_logits: torch.Tensor,
+    previous: torch.Tensor,
+    embedding: torch.Tensor,
+    projection: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """Write one sampled walk step's shard logits: base logits plus the Markov bias.
+
+    ``out = round(base_logits + round(embedding[previous] @ projection.T))``,
+    each round to the logits' dtype and the dot accumulated in FP32, as the
+    unfused path's GEMM and add compute it up to accumulation order.
+
+    Args:
+        base_logits: ``[rows, columns]`` BF16 base logits of this rank's shard,
+            unit column stride.
+        previous: ``[rows]`` int32/int64 tokens the step conditions on, in any
+            stride (the drafters pass a column of their token table); clamped
+            into the embedding.
+        embedding: ``[vocab, rank]`` BF16 bigram table, unit column stride.
+        projection: ``[columns, rank]`` BF16 projection rows of the shard's
+            columns, unit column stride.
+        out: ``[rows, columns]`` BF16 destination, unit column stride.
+
+    Returns:
+        None. ``out`` is written in place.
+
+    Raises:
+        ValueError: A tensor is not the shape, dtype or layout the kernel
+            indexes with.
+    """
+    if base_logits.ndim != 2 or out.shape != base_logits.shape:
+        raise ValueError(
+            f"base_logits and out must be the same 2D shape, got "
+            f"{tuple(base_logits.shape)} and {tuple(out.shape)}"
+        )
+    rows, columns = base_logits.shape
+    tensors = (base_logits, embedding, projection, out)
+    if any(t.dtype != torch.bfloat16 for t in tensors):
+        raise ValueError("base_logits, embedding, projection and out must be BF16")
+    if embedding.ndim != 2 or projection.ndim != 2:
+        raise ValueError("embedding and projection must be 2D")
+    rank = embedding.shape[1]
+    if projection.shape != (columns, rank):
+        raise ValueError(
+            f"projection must be [{columns}, {rank}], got {tuple(projection.shape)}"
+        )
+    if any(t.stride(1) != 1 for t in tensors):
+        raise ValueError("every tensor's last axis must be contiguous")
+    if previous.shape != (rows,) or previous.dtype not in (torch.int32, torch.int64):
+        raise ValueError(f"previous must be [{rows}] int32/int64")
+    if rows == 0:
+        return
+    # One row tile reads the projection once; 64 rows take a narrower rank slice.
+    tile_rows = min(64, max(_ROWS, triton.next_power_of_2(rows)))
+    grid = (triton.cdiv(columns, _LOGITS_V), triton.cdiv(rows, tile_rows))
+    _markov_shard_logits_kernel[grid](
+        base_logits,
+        base_logits.stride(0),
+        previous,
+        previous.stride(0),
+        embedding,
+        embedding.stride(0),
+        projection,
+        projection.stride(0),
+        out,
+        out.stride(0),
+        rows,
+        columns,
+        embedding.shape[0],
+        RANK=rank,
+        ROWS=tile_rows,
+        BLOCK_V=_LOGITS_V,
+        BLOCK_K=128 if tile_rows <= 32 else 64,
         num_warps=4,
     )
