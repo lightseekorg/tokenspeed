@@ -23,7 +23,7 @@
 import pytest
 import torch
 
-pytest.importorskip("torch_npu")
+torch_npu = pytest.importorskip("torch_npu")
 from tokenspeed_kernel_npu.ops.rotary_embedding import apply_rope
 
 
@@ -69,8 +69,6 @@ def test_selected_rope_cache(dtype, is_neox, key_only):
         if not key_only:
             torch.testing.assert_close(qo, eq, atol=0, rtol=0)
         torch.testing.assert_close(ko, ek, atol=0, rtol=0)
-
-    import torch_npu
 
     run()
     check()

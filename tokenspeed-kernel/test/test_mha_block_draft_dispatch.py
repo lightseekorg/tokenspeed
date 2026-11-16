@@ -41,6 +41,8 @@ from tokenspeed_kernel.signature import format_signatures
 def dispatch_platform(monkeypatch):
     registry = KernelRegistry.get()
     snapshot = registry.snapshot()
+    monkeypatch.setattr(mha, "_SCHEDULE_KERNELS", {})
+    monkeypatch.setattr(mha, "_SCHEDULE_PREFERS", dict(mha._SCHEDULE_PREFERS))
     original = Platform.get()
     # Do not leave a synthetic platform's launch policy in the process cache.
     monkeypatch.setattr(kernel_platform, "_pdl_enabled", False)
@@ -179,3 +181,67 @@ def test_legacy_positional_arguments_keep_their_meaning(
     )
     torch.testing.assert_close(output, inputs["q"] * 0.25 + 2.0)
     assert lse is sinks
+
+
+@pytest.mark.parametrize("draft_first", [False, True])
+def test_schedule_and_decode_share_draft_selection(
+    dispatch_platform, inputs, draft_first
+):
+    dispatch_platform("ascend")
+    common = {
+        "solution": "dispatch_test_schedule",
+        "capability": CapabilityRequirement(vendors=frozenset({"ascend"})),
+        "signatures": format_signatures(
+            ("q", "k_cache", "v_cache"), "dense", {torch.bfloat16}
+        ),
+        "priority": Priority.PLUGIN,
+    }
+    for block_draft in (False, True):
+        marker = 2 if block_draft else 1
+        name = f"test_scheduled_decode_{marker}"
+
+        def decode(q, schedule, marker=marker, **kwargs):
+            return q * schedule[0] + marker
+
+        def schedule(cache_seqlens, marker=marker, **kwargs):
+            return torch.full_like(cache_seqlens, marker)
+
+        traits = {"block_draft": frozenset({block_draft})}
+        register_kernel(
+            "attention",
+            "mha_decode_with_kvcache",
+            name=name,
+            features=frozenset({"split_schedule"}),
+            traits=traits,
+            **common,
+        )(decode)
+        register_kernel(
+            "attention",
+            "mha_decode_schedule",
+            name=f"test_schedule_{marker}",
+            traits=traits,
+            **common,
+        )(schedule)
+        mha._SCHEDULE_PREFERS[name] = lambda **kwargs: True
+
+    for block_draft in (draft_first, not draft_first):
+        options = dict(
+            q=inputs["q"],
+            k_cache=inputs["k_cache"],
+            v_cache=inputs["v_cache"],
+            max_seqlen_q=inputs["max_seqlen_q"],
+            block_draft=block_draft,
+            solution="dispatch_test_schedule",
+        )
+        assert mha.mha_decode_takes_schedule(**options)
+        schedule = mha.mha_decode_schedule(
+            **options, cache_seqlens=inputs["cache_seqlens"]
+        )
+        output = mha.mha_decode_with_kvcache(
+            **inputs,
+            block_draft=block_draft,
+            solution="dispatch_test_schedule",
+            schedule=schedule,
+        )
+        marker = 2 if block_draft else 1
+        torch.testing.assert_close(output, inputs["q"] * marker + marker)

@@ -1112,3 +1112,21 @@ def test_a_draft_takes_the_decode_monokernels_only_for_a_target_they_serve(
     assert not draft_takes_decode_monokernel(switch, muse, ["DFlashDraftModel"])
     assert not draft_takes_decode_monokernel(switch, muse, ["LlamaForCausalLMEagle3"])
     assert not draft_takes_decode_monokernel(switch, muse, [])
+
+
+@pytest.mark.parametrize("initial_rows", [0, 2])
+def test_draft_capture_does_not_replace_persistent_residual(monkeypatch, initial_rows):
+    model = DFlashDraftModel.__new__(DFlashDraftModel)
+    buffer = torch.full((initial_rows, 8), 3.0) if initial_rows else None
+    model._residual_buffer = buffer
+    # CPU tensors stand in for unavailable device graph capture.
+    monkeypatch.setattr(
+        "tokenspeed.runtime.models.dflash.is_current_stream_capturing",
+        lambda device: True,
+    )
+    residual = model._zeroed_residual(torch.ones(4, 8))
+    assert model._residual_buffer is buffer
+    assert residual.shape == (4, 8)
+    assert not residual.any()
+    if buffer is not None:
+        assert torch.all(buffer == 3)

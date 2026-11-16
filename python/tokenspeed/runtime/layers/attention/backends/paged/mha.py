@@ -440,6 +440,7 @@ class MHAAttnBackend(PagedAttentionBackend):
                     max_seqlen_q=max_seqlen_q,
                     logit_cap=layer.logit_cap,
                     sinks=sinks,
+                    block_draft=self.draft_block_decode,
                     solution=self.kernel_solution,
                     **scale_kwargs,
                 )
@@ -457,6 +458,7 @@ class MHAAttnBackend(PagedAttentionBackend):
                 logit_cap=layer.logit_cap,
                 sinks=sinks,
                 out=self.decode_schedule_buf,
+                block_draft=self.draft_block_decode,
                 solution=self.kernel_solution,
                 **scale_kwargs,
             )
