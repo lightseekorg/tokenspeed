@@ -43,6 +43,12 @@ from tokenspeed_kernel.ops.attention.dsa.triton import (
 from tokenspeed_kernel.ops.attention.dsv4._triton.dcp import (
     dispatch_dcp_attention_partials,
 )
+from tokenspeed_kernel.ops.kvcache.index_k_scale import (
+    encode_index_k_scale,
+    index_k_scale_dtype,
+    index_k_scale_ue8m0,
+    round_index_k_scale,
+)
 from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.selection import NoKernelFoundError
@@ -65,7 +71,10 @@ def _pack_index_k_cache(
         dtype=torch.uint8,
     )
     x = index_k.float().reshape(num_slots, num_groups, 128)
-    scale = x.abs().amax(dim=-1, keepdim=True).clamp_min(1.0e-6) / 448.0
+    # The scale as the plane stores it (rounded up to a power of two on Blackwell).
+    scale = round_index_k_scale(
+        x.abs().amax(dim=-1, keepdim=True).clamp_min(1.0e-6) / 448.0
+    )
     x_fp8 = (x / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
 
     flat = packed.reshape(-1)
@@ -76,13 +85,15 @@ def _pack_index_k_cache(
         (page_bytes, head_dim, 1),
     )
     scale_view = torch.as_strided(
-        flat.view(torch.float32),
+        flat.view(index_k_scale_dtype()),
         (num_pages, page_size, num_groups),
         (page_bytes // 4, num_groups, 1),
         (page_size * head_dim) // 4,
     )
     fp8_view.copy_(x_fp8.reshape(num_pages, page_size, head_dim))
-    scale_view.copy_(scale.reshape(num_pages, page_size, num_groups))
+    scale_view.copy_(
+        encode_index_k_scale(scale).reshape(num_pages, page_size, num_groups)
+    )
     return packed, (x_fp8.float() * scale).reshape_as(index_k)
 
 
@@ -811,7 +822,7 @@ def test_dsa_fp8_logits_empty_tiles_graph_replay(device, explicit_rows, page_siz
         _dsa_decode_logits_fp8_kernel[(rows, (width + 63) // 64)](
             q,
             packed.view(torch.float8_e4m3fn),
-            packed.view(torch.float32),
+            packed.view(torch.int32),
             weights,
             lengths,
             table,
@@ -828,6 +839,7 @@ def test_dsa_fp8_logits_empty_tiles_graph_replay(device, explicit_rows, page_siz
             max_seq_len=width,
             num_heads=heads,
             head_dim=dim,
+            UE8M0=index_k_scale_ue8m0(),
             num_groups=1,
             softmax_scale=0.1,
             q_len_per_req=2,

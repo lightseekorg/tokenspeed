@@ -812,7 +812,7 @@ def test_dsa_decode_scorer_table_width():
         _dsa_decode_logits_fp8_kernel.warmup(
             q,
             cache.view(torch.float8_e4m3fn),
-            cache.view(torch.float32),
+            cache.view(torch.int32),
             weights,
             lengths,
             table,
@@ -829,6 +829,7 @@ def test_dsa_decode_scorer_table_width():
             max_seq_len=columns * 64,
             num_heads=32,
             head_dim=128,
+            UE8M0=False,
             num_groups=1,
             softmax_scale=1.0,
             q_len_per_req=1,

@@ -84,6 +84,7 @@ def _ts_supported_arch() -> bool:
 _CUTE_DSL_TOPK_AVAILABLE = False
 _ClusterRunner = None
 _BaseRunner = None
+_topk_runner = None
 
 if _ts_supported_arch():
     try:
@@ -95,6 +96,7 @@ if _ts_supported_arch():
         from tokenspeed_kernel.thirdparty.cute_dsl.topk import (
             CuteDSLTopKDecodeSinglePassMultiCTARunner as _BaseRunner,
         )
+        from tokenspeed_kernel.thirdparty.cute_dsl.topk import runner as _topk_runner
 
         _CUTE_DSL_TOPK_AVAILABLE = True
     except ImportError:
@@ -116,6 +118,7 @@ def cute_dsl_decode_topk(
     *,
     next_n: int = 1,
     out: torch.Tensor | None = None,
+    scan_cols: int | None = None,
 ) -> torch.Tensor:
     """Length-aware per-row top-k over a dense indexer-logits matrix.
 
@@ -128,6 +131,10 @@ def cute_dsl_decode_topk(
         topk: Candidates to select per row (1..2048).
         next_n: Query rows per request (speculative ``q_len_per_req``); 1 for decode.
         out: Optional int32 ``[num_rows, topk]`` buffer, written in place and returned.
+        scan_cols: Columns any row can read, when ``logits`` carries allocation
+            padding past them (DeepGEMM pads rows to its KV split). The CTA
+            split then follows these columns, not the padded width, whose
+            rounding would otherwise halve the CTAs per row.
 
     Returns:
         int32 ``[num_rows, topk]`` of per-row selected column indices (unsorted).
@@ -157,6 +164,17 @@ def cute_dsl_decode_topk(
 
     logits = logits.contiguous()
     seq_lens = seq_lens.to(device=logits.device, dtype=torch.int32).contiguous()
+    chunk_size = None
+    num_cols = logits.shape[1]
+    if scan_cols is not None and 0 < scan_cols < num_cols:
+        # The base heuristic's split for the real width; the cluster runner
+        # clamps an explicit chunk to its capacity the same way for both.
+        dtype = _topk_runner._TORCH_TO_CUTLASS_DTYPE[logits.dtype]
+        _, ctas, vec = _BaseRunner._get_chunk_config(
+            dtype, int(scan_cols), None, num_rows=num_rows
+        )
+        chunk_size = -(-num_cols // ctas)
+        chunk_size = -(-chunk_size // vec) * vec
 
     if out is not None:
         if out.shape != (num_rows, topk):
@@ -176,6 +194,7 @@ def cute_dsl_decode_topk(
         topk,
         next_n,
         return_val=False,
+        chunk_size=chunk_size,
         output_indices=out,
     )
     if indices is None:
@@ -187,6 +206,7 @@ def cute_dsl_decode_topk(
             topk,
             next_n,
             return_val=False,
+            chunk_size=chunk_size,
             output_indices=out,
         )
     return indices

@@ -1558,6 +1558,10 @@ path, with no flag. Use these supported Hub revisions:
 | FP8 | `21052137` |
 | NVFP4 | `81a5ab6b` |
 
+Each sandwich all-reduce boundary (the all-reduce, the sandwich norm, and the
+next pre-norm) runs as one MNNVL launch per 2048-row slice where the workspace
+serves it, so prefill chunks above 2048 tokens fuse too.
+
 For FP8 decode, eligible MNNVL sandwich all-reduce boundaries also write
 per-token E4M3 activations and FP32 scales for the following Q/K/V/gate or
 dense gate/up projection. This reuses the BF16-rounded norm output and its

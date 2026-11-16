@@ -428,8 +428,10 @@ def test_full_score_bf16_producer_masking_and_selection(paged, prepare_blocks):
     if paged:
         safe_table = table.masked_fill((table < 0) | (table >= cache.shape[0]), 0)
         context_lens = ends[:, None]
+        # Blackwell scores one row per request entry: each row is its own request.
+        rows = torch.arange(4, device="cuda", dtype=torch.int32)
         schedule = api.get_paged_mqa_logits_metadata(
-            context_lens, 64, api.get_num_sms()
+            context_lens, 64, api.get_num_sms(), indices=rows
         )
         reference = api.fp8_fp4_paged_mqa_logits(
             q=(queries[0].view(torch.int8).unsqueeze(1), queries[1].unsqueeze(1)),
@@ -441,8 +443,8 @@ def test_full_score_bf16_producer_masking_and_selection(paged, prepare_blocks):
             block_table=safe_table,
             schedule_meta=schedule,
             max_context_len=capacity,
-            clean_logits=False,
             logits_dtype=torch.float32,
+            indices=rows,
         )
         scores, actual_ends, blocks = deep_gemm._paged_scores(
             queries,
@@ -467,7 +469,6 @@ def test_full_score_bf16_producer_masking_and_selection(paged, prepare_blocks):
             weights=weights,
             cu_seq_len_k_start=torch.zeros_like(ends),
             cu_seq_len_k_end=ends,
-            clean_logits=False,
             max_seqlen_k=capacity,
             logits_dtype=torch.float32,
         )
@@ -790,8 +791,9 @@ def test_full_paged_query_tiles_match_with_large_capacity_in_graph(tokens):
         safe_table = table[:, :2].masked_fill(
             (table[:, :2] < 0) | (table[:, :2] >= cache.shape[0]), 0
         )
+        rows = torch.arange(tokens, device="cuda", dtype=torch.int32)
         schedule = api.get_paged_mqa_logits_metadata(
-            context_lens, 64, api.get_num_sms()
+            context_lens, 64, api.get_num_sms(), indices=rows
         )
         reference = api.fp8_fp4_paged_mqa_logits(
             q=(
@@ -804,8 +806,8 @@ def test_full_paged_query_tiles_match_with_large_capacity_in_graph(tokens):
             block_table=safe_table,
             schedule_meta=schedule,
             max_context_len=128,
-            clean_logits=False,
             logits_dtype=torch.float32,
+            indices=rows,
         )
         positions = torch.arange(128, device="cuda")[None, :]
         physical_pages = table[:, :2][:, positions[0] // 64]
@@ -1202,7 +1204,7 @@ def test_sparse_metadata_reuse_across_streams_and_graph_replay(monkeypatch):
 
 def test_full_metadata_reuses_schedule_and_refreshes_live_inputs(monkeypatch):
     queries, weights, cache, table, lengths, _, api = _sparse_inputs(4, 128, False)
-    head_weights = (weights.float(), -weights.float())
+    head_weights = (weights.to(torch.bfloat16), -weights.to(torch.bfloat16))
     capacity = table.shape[1] * 64
     schedule = Mock(wraps=api.get_paged_mqa_logits_metadata)
     monkeypatch.setattr(api, "get_paged_mqa_logits_metadata", schedule)

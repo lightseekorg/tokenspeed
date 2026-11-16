@@ -24,12 +24,14 @@ from dataclasses import replace
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.kvcache.triton import set_mla_kv_buffer_triton
+from tokenspeed_kernel.ops.kvcache.triton import (
+    quantize_index_k_rows,
+    set_mla_kv_buffer_triton,
+)
 from tokenspeed_kernel.ops.kvcache.triton_cache_placement import (
     compact_kvp_pages,
     virtual_slots_to_local,
 )
-from tokenspeed_kernel.ops.quantization import quantize_fp8
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
@@ -1581,9 +1583,7 @@ def test_dsa_indexer_16_heads_with_padded_quantization_scales():
     q = torch.randn(3, 16, 128, device="cuda", dtype=torch.bfloat16)
     weights = torch.randn(3, 16, device="cuda", dtype=torch.bfloat16)
     keys = torch.randn(192, 128, device="cuda", dtype=torch.bfloat16)
-    values, scales = quantize_fp8(
-        keys, granularity="token_group", group_size=128, scale_encoding="float32"
-    )
+    values, scales = quantize_index_k_rows(keys, group_size=128)
     cache = torch.zeros(192, 132, device="cuda", dtype=torch.uint8)
     index_k_block_split_scatter(
         cache,

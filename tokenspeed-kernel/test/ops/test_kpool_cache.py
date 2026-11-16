@@ -36,6 +36,10 @@ from tokenspeed_kernel.ops.attention.kpool import (
     kpool_prefill_tail_write,
     kpool_prefill_write,
 )
+from tokenspeed_kernel.ops.kvcache.index_k_scale import (
+    encode_index_k_scale,
+    index_k_scale_dtype,
+)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
@@ -83,8 +87,15 @@ def _assert_encoded(
 ) -> None:
     actual_scales = actual_scales.reshape(-1)
     expected_scales = expected_scales.reshape(-1)
-    torch.testing.assert_close(actual_scales, expected_scales, rtol=1e-5, atol=1e-7)
-    active = expected_scales >= 0
+    if actual_scales.dtype == torch.int32:
+        # Blackwell planes store UE8M0 scale words; -1 marks unwritten rows.
+        if expected_scales.dtype == torch.float32:
+            expected_scales = encode_index_k_scale(expected_scales)
+        assert torch.equal(actual_scales, expected_scales)
+        active = expected_scales != -1
+    else:
+        torch.testing.assert_close(actual_scales, expected_scales, rtol=1e-5, atol=1e-7)
+        active = expected_scales >= 0
     actual_values = actual_values.reshape(-1, _DIM)[active]
     expected_values = expected_values.reshape(-1, _DIM)[active]
     quantum_distance = _fp8_quantum_distance(actual_values, expected_values)
@@ -192,8 +203,8 @@ def _state(
         ),
         index_scales=torch.full(
             (num_pages, _ROWS_PER_PAGE, 1),
-            -1.0,
-            dtype=torch.float32,
+            -1,
+            dtype=index_k_scale_dtype(),
             device="cuda",
         ),
         ape=torch.randn(
@@ -241,7 +252,7 @@ def test_prefill_write_matches_reference() -> None:
         4, _ROWS_PER_PAGE, _DIM, dtype=torch.float8_e4m3fn, device="cuda"
     )
     scales = torch.full(
-        (4, _ROWS_PER_PAGE, 1), -1.0, dtype=torch.float32, device="cuda"
+        (4, _ROWS_PER_PAGE, 1), -1, dtype=index_k_scale_dtype(), device="cuda"
     )
 
     kpool_prefill_write(keys, gates, write_slots, values, scales, ape)

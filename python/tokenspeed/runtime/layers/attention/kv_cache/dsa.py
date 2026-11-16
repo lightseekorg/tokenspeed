@@ -26,12 +26,13 @@ import torch
 from tokenspeed_kernel.ops.attention.dsa.triton import (
     index_k_layernorm_fp8_scatter_and_quantize_query,
 )
+from tokenspeed_kernel.ops.kvcache.index_k_scale import index_k_scale_dtype
 from tokenspeed_kernel.ops.kvcache.triton import (
     index_k_block_split_scatter,
     index_k_layernorm_fp8_scatter,
     index_k_layernorm_scatter,
+    quantize_index_k_rows,
 )
-from tokenspeed_kernel.ops.quantization import quantize_fp8
 
 from tokenspeed.runtime.layers.attention.configs.dsa import (
     index_k_plane_dtype,
@@ -68,8 +69,9 @@ def split_index_k_rows(
 
     Returns:
         ``fp8_scaled``: ``[rows, index_head_dim]`` uint8 FP8 keys and
-        ``[rows, groups]`` fp32 scales. ``bf16``: ``[rows, index_head_dim]``
-        bf16 keys and ``None``.
+        ``[rows, groups]`` scale words in the plane's encoding
+        (``tokenspeed_kernel.ops.kvcache.index_k_scale``). ``bf16``: ``[rows,
+        index_head_dim]`` bf16 keys and ``None``.
     """
     row_bytes = index_k_row_bytes(index_head_dim, index_k_format)
     if packed.dim() != 2 or packed.dtype != torch.uint8:
@@ -82,7 +84,7 @@ def split_index_k_rows(
     if index_k_format == "fp8_scaled":
         return (
             packed[:, :index_head_dim],
-            packed[:, index_head_dim:].view(torch.float32),
+            packed[:, index_head_dim:].view(index_k_scale_dtype()),
         )
     if index_k_format == "mxfp4":
         raise NotImplementedError("no top-k leaf takes mxfp4 workspace rows")
@@ -265,13 +267,9 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 f"index-K plane dtype {buf.dtype} has no write path: uint8 "
                 "(fp8_scaled) or bfloat16 (bf16)"
             )
-        index_k_fp8, index_k_scale = quantize_fp8(
-            index_k,
-            granularity="token_group",
-            group_size=_INDEX_K_FP8_GROUP_SIZE,
-            scale_encoding="float32",
+        index_k_fp8, index_k_scale = quantize_index_k_rows(
+            index_k, group_size=_INDEX_K_FP8_GROUP_SIZE
         )
-
         # Fused scatter; (page, slot_in_page) is derived from loc in-kernel.
         index_k_block_split_scatter(
             buf,
