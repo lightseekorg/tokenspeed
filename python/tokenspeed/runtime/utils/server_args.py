@@ -132,6 +132,8 @@ PIPELINE_SPEC_ALGORITHMS = ("DSPARK", "MTP")
 AUX_CAPTURE_SPEC_ALGORITHMS = ("EAGLE3", "EAGLE4")
 #: Drafters that propose one token per draft step (a chain of steps + 1 tokens, or a tree).
 STEP_SPEC_ALGORITHMS = ("EAGLE3", "EAGLE4", "MTP")
+#: Drafters whose prefill rounds replay graphs recorded at each request count.
+EXTEND_GRAPH_SPEC_ALGORITHMS = (*STEP_SPEC_ALGORITHMS, "DFLASH", "DSPARK")
 # Drafters whose topk=1 chain can record sampled proposals for block
 # verification (flashinfer or triton) or synthetic rejection (flashinfer).
 BLOCK_REJECTION_ALGORITHMS = ("DSPARK", "EAGLE3")

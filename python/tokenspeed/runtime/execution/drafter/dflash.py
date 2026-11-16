@@ -17,8 +17,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from typing import TYPE_CHECKING
+from collections.abc import Callable, Sequence
+from contextlib import AbstractContextManager
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 import torch
 from tokenspeed_kernel.ops.kvcache.triton import (
@@ -33,6 +35,11 @@ from tokenspeed_kernel.ops.sampling.cute_dsl import (
 from typing_extensions import override
 
 from tokenspeed.runtime.distributed.comm_ops import all_gather, all_gather_single
+from tokenspeed.runtime.execution.breakable_cuda_graph import (
+    BreakableCapture,
+    HandoffSlot,
+    active_forward,
+)
 from tokenspeed.runtime.execution.cache_loc_kernel import (
     dflash_prepare_decode,
 )
@@ -42,7 +49,12 @@ from tokenspeed.runtime.execution.drafter._dflash_fused_kv import (
     _get_kv_buffer_ptrs,
     forget_kv_buffer_ptrs,
 )
-from tokenspeed.runtime.execution.drafter.base import BaseDrafter
+from tokenspeed.runtime.execution.drafter.base import (
+    EXTEND_DECODE_MAX_REQUESTS,
+    EXTEND_DECODE_SERIES,
+    BaseDrafter,
+    DrafterExtendCapture,
+)
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
@@ -59,6 +71,7 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from tokenspeed.runtime.utils import get_colorful_logger
+from tokenspeed.runtime.utils.common import maybe_inference_mode
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 from tokenspeed.runtime.utils.spec_block_geometry import (
     read_checkpoint_block_size,
@@ -67,6 +80,7 @@ from tokenspeed.runtime.utils.spec_block_geometry import (
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
+    from tokenspeed.runtime.execution.memory_delta import MemoryDeltaObserver
     from tokenspeed.runtime.execution.model_runner import ModelRunner
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
@@ -74,6 +88,15 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 
 logger = get_colorful_logger(__name__)
+
+
+@dataclass(frozen=True)
+class _BlockGraph:
+    """A prefill round's captured block draft and the context it replays under."""
+
+    capture: BreakableCapture
+    # The block forward's own context, which its attention breaks read.
+    ctx: ForwardContext
 
 
 def _resolve_block_geometry(
@@ -213,6 +236,11 @@ class DFlash(BaseDrafter):
         self._greedy_gather_cap = 0
         self._init_fused_kv_helper()
         self._init_context_taps()
+        # Prefill rounds' block drafts, one graph per request count.
+        self._block_graphs: dict[int, _BlockGraph] = {}
+        self._block_graph_pool: Any | None = None
+        self._block_graph_handoffs: dict[HandoffSlot, torch.Tensor] = {}
+        self._block_graph_engaged = False
 
     @override
     def bind_sampling_backend(self, sampling_backend: SamplingBackend) -> None:
@@ -1469,21 +1497,7 @@ class DFlash(BaseDrafter):
             num_tokens=self.draft_query_width,
         )
 
-        ctx = ForwardContext(
-            attn_backend=self.attn_backend,
-            token_to_kv_pool=self.token_to_kv_pool,
-            bs=bs,
-            num_extends=metadata_num_extends,
-            output_layout=ForwardOutputLayout(
-                metadata_num_extends,
-                metadata_num_extends,
-                bs - metadata_num_extends,
-                self.draft_query_width,
-            ),
-            input_num_tokens=bs * self.draft_query_width,
-            forward_mode=ForwardMode.DECODE,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
-        )
+        ctx = self._block_context(bs, metadata_num_extends)
 
         flat_ids = block_ids.reshape(-1)
         input_embeds = self._first_layer_embeds(flat_ids)
@@ -1507,6 +1521,24 @@ class DFlash(BaseDrafter):
         next_tokens = self.next_tokens_buf[:bs]
         return self._sample_block(draft_hidden, block_ids, next_tokens)
 
+    def _block_context(self, bs: int, num_extends: int) -> ForwardContext:
+        """The block forward's context: ``bs`` requests of the draft query width."""
+        return ForwardContext(
+            attn_backend=self.attn_backend,
+            token_to_kv_pool=self.token_to_kv_pool,
+            bs=bs,
+            num_extends=num_extends,
+            output_layout=ForwardOutputLayout(
+                num_extends,
+                num_extends,
+                bs - num_extends,
+                self.draft_query_width,
+            ),
+            input_num_tokens=bs * self.draft_query_width,
+            forward_mode=ForwardMode.DECODE,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+        )
+
     def _sample_block(
         self,
         draft_hidden: torch.Tensor,
@@ -1521,6 +1553,149 @@ class DFlash(BaseDrafter):
         )
         next_tokens.clamp_(min=0)
         return next_tokens
+
+    # ------------------------------------------------------------------
+    # Prefill-round block graphs
+    # ------------------------------------------------------------------
+
+    def _block_graphs_supported(self) -> bool:
+        """Whether a pure extend round can replay its block draft as a graph.
+
+        The block rows of an MLA draft are decode rows whatever the round
+        (``_draft_native``), so one graph per request count serves every
+        prefill round of that count. Every rank running the drafter's
+        collectives must reach the same replay decision: attention DP decides
+        per rank, and pipeline stages are not validated.
+        """
+        mapping = self.draft_model_runner.mapping
+        return (
+            self.attention_kind == "kimi_mla"
+            and mapping.attn.dp_size == 1
+            and mapping.pp_size == 1
+        )
+
+    @override
+    def extend_graph_plan(
+        self, token_buckets: Sequence[int]
+    ) -> dict[str, list[tuple[int, int]]]:
+        del token_buckets
+        if not self._block_graphs_supported():
+            return {}
+        # The block forward bakes its request count exactly.
+        most = min(self.input_buffers.max_bs, EXTEND_DECODE_MAX_REQUESTS)
+        return {EXTEND_DECODE_SERIES: [(bs, bs) for bs in range(most, 0, -1)]}
+
+    @override
+    def release_extend_graphs(self) -> None:
+        """Drop the block graphs and their pool; the drafter's buffers stay."""
+        self._block_graphs.clear()
+        self._block_graph_pool = None
+        self._block_graph_handoffs = {}
+
+    @override
+    def capture_extend_graphs(
+        self, capture: DrafterExtendCapture, *, observer: MemoryDeltaObserver
+    ) -> None:
+        """Capture the block draft for each sampled request count of the plan.
+
+        Each capture follows the same dummy pure extend a live prefill round
+        prepares, warms the draft up eagerly on the capture stream (lazily
+        resolved kernel state lands outside the pool), and records into one
+        private pool apart from the target's prefill and decode pools.
+        """
+        if capture.num_warmup < 1:
+            raise ValueError("the block graphs need at least one warmup")
+        plan = capture.plan.get(EXTEND_DECODE_SERIES, ())
+        counts = (
+            [plan[i][1] for i in capture.ladders[EXTEND_DECODE_SERIES].sampled]
+            if plan
+            else []
+        )
+        self.release_extend_graphs()
+        with maybe_inference_mode():
+            for bs in counts:
+                capture.prepare_batch(bs, bs)
+                self._block_graphs[bs] = self._capture_block(
+                    bs, capture, observer.measure(EXTEND_DECODE_SERIES)
+                )
+        if self._block_graphs:
+            logger.info(
+                "drafter prefill graph: captured the block draft at requests "
+                f"{sorted(self._block_graphs)} (eager attention breaks)"
+            )
+
+    def _capture_block(
+        self,
+        bs: int,
+        capture: DrafterExtendCapture,
+        observer: AbstractContextManager[None],
+    ) -> _BlockGraph:
+        """Warm up and capture the block draft for ``bs`` requests."""
+        ctx = self._block_context(bs, 0)
+        current_tokens = self.block_ids_buf[:bs, 0]
+        cap = BreakableCapture(
+            pool=self._block_graph_pool,
+            stream=capture.stream,
+            handoff_storage=self._block_graph_handoffs,
+            run_segments_while_capturing=True,
+        )
+        cap.stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(cap.stream):
+            for _ in range(capture.num_warmup):
+                with active_forward(ctx):
+                    self._draft_native(current_tokens)
+            self._stage_block(bs)
+        torch.cuda.synchronize()
+        with observer, active_forward(ctx), cap:
+            self._draft_native(current_tokens, prepared=True)
+        if self._block_graph_pool is None:
+            self._block_graph_pool = cap.pool
+        with active_forward(ctx):
+            cap.replay()
+        return _BlockGraph(cap, ctx)
+
+    def _stage_block(self, bs: int) -> None:
+        """The block's lengths, positions and draft metadata, ahead of a replay.
+
+        What the eager block draft derives before its forward, except the
+        block-end lengths the leaves read, which the graph fills in place.
+        """
+        prefix_lens = self.draft_seq_lens_buf[:bs]
+        seq_lens_after = self.draft_block_end_lens_buf[:bs]
+        torch.add(prefix_lens, self.draft_query_width, out=seq_lens_after)
+        torch.add(
+            prefix_lens.unsqueeze(1),
+            self.block_offsets,
+            out=self.block_positions_buf[:bs],
+        )
+        self.attn_backend.refresh_decode_metadata(
+            bs,
+            bs,
+            self.input_buffers.req_pool_indices_buf[:bs],
+            seq_lens_after,
+            forward_mode=ForwardMode.DECODE,
+            block_tables=self.round_block_tables,
+            num_extends=0,
+            for_graph_replay=True,
+        )
+
+    def _replays_block(self, base_ctx: ForwardContext) -> bool:
+        """Whether this round replays its block draft rather than running it."""
+        bs = base_ctx.bs
+        if bs not in self._block_graphs or base_ctx.num_extends != bs:
+            return False
+        if base_ctx.global_num_tokens is not None:
+            return False
+        shard = base_ctx.query_shard
+        if shard is not None and shard.size > 1:
+            return False
+        if not self._block_graph_engaged:
+            self._block_graph_engaged = True
+            logger.info(
+                "drafter prefill graph ENGAGED: block draft at "
+                f"{base_ctx.input_num_tokens} tokens, {bs} requests"
+            )
+        return True
 
     @nvtx_range("drafter:dflash", color="purple")
     def run(
@@ -1569,4 +1744,10 @@ class DFlash(BaseDrafter):
             self.spec_num_tokens,
             out=current_tokens,
         )
+        if self._replays_block(base_ctx):
+            self._stage_block(bs)
+            graph = self._block_graphs[bs]
+            with active_forward(graph.ctx):
+                graph.capture.replay()
+            return self.next_tokens_buf[:bs]
         return self.draft(current_tokens)
