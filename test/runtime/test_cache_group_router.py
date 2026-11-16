@@ -1934,6 +1934,10 @@ class TestPagedLeafRebindTest:
                 "chunked_prefill_metadata",
                 "_block_page_table_buf",
                 "_block_seq_lens_buf",
+                "_decode_split_kvs_buf",
+                "_decode_split_offsets_buf",
+                "_decode_split_tasks_buf",
+                "_decode_split_tasks_storage",
                 "_dcp",
             ],
         )
