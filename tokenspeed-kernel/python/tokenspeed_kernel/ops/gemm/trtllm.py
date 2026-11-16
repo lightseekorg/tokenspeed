@@ -26,7 +26,6 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel._optional import has_trtllm_kernel
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -39,26 +38,10 @@ from tokenspeed_kernel.signature import (
     format_signatures,
     tensor_format,
 )
+from tokenspeed_kernel.thirdparty.cuda.cublaslt_fp4_gemm import cublaslt_fp4_gemm
+from tokenspeed_kernel.thirdparty.cuda.dsv3_fused_a_gemm import dsv3_fused_a_gemm
 
-_HAS_TRTLLM_KERNEL = current_platform().is_nvidia and has_trtllm_kernel()
-if _HAS_TRTLLM_KERNEL:
-    # DeepEP must initialize before TRT-LLM's static CUDA runtime.
-    import deep_ep  # noqa: F401
-    import trtllm_kernel  # noqa: F401
-
-
-# ===-----------------------------------------------------------------------===#
-# DeepSeek V3 fused-A projection: TRT-LLM (NVIDIA)
-# ===-----------------------------------------------------------------------===#
-
-
-def dsv3_fused_a_gemm(mat_a: torch.Tensor, mat_b: torch.Tensor) -> torch.Tensor:
-    """Run TRT-LLM's shape-specialized DeepSeek V3 fused-A projection."""
-    if not _HAS_TRTLLM_KERNEL:
-        raise RuntimeError(
-            "Fused-A GEMM requires a compatible trtllm_kernel package and deep_ep"
-        )
-    return torch.ops.trtllm.dsv3_fused_a_gemm_op(mat_a, mat_b, None, None)
+_IS_NVIDIA = current_platform().is_nvidia
 
 
 # ===-----------------------------------------------------------------------===#
@@ -92,21 +75,7 @@ _NVFP4_FORMAT_SIGNATURES = frozenset(
     for b_scale_dtype in _NVFP4_SCALE_DTYPES
 )
 
-# One stateful torchbind instance per output dtype. Each holds its own
-# per-shape algo cache inside C++.
-_runner_cache: dict[torch.dtype, object] = {}
-_CUBLASLT_HEURISTIC_ALGO = 0
-
-
-def _get_runner(out_dtype: torch.dtype):
-    runner = _runner_cache.get(out_dtype)
-    if runner is None:
-        runner = torch.classes.trtllm.CublasLtFP4GemmRunner(out_dtype)
-        _runner_cache[out_dtype] = runner
-    return runner
-
-
-if _HAS_TRTLLM_KERNEL:
+if _IS_NVIDIA:
 
     @register_kernel(
         "gemm",
@@ -132,20 +101,9 @@ if _HAS_TRTLLM_KERNEL:
         block_size: list[int] | None = None,
         out: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        runner = _get_runner(out_dtype)
-        output = runner.run_gemm(
-            A,
-            B.T,
-            A_scales,
-            B_scales.T,
-            alpha,
-            False,
-            _CUBLASLT_HEURISTIC_ALGO,
+        return cublaslt_fp4_gemm(
+            A, B.T, A_scales, B_scales.T, alpha, out_dtype, out=out
         )
-        if out is not None:
-            out.copy_(output)
-            return out
-        return output
 
 
 # ===-----------------------------------------------------------------------===#

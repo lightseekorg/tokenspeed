@@ -48,6 +48,7 @@ from tokenspeed_kernel.ops.quantization import (
     silu_and_mul_quantize_fp8,
 )
 from tokenspeed_kernel.ops.quantization import triton as quant_triton
+from tokenspeed_kernel.ops.quantization import trtllm as quant_trtllm
 from tokenspeed_kernel.platform import ArchVersion, Platform, pdl_enabled
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import SelectedKernel
@@ -91,10 +92,7 @@ def _stand_in_quantizer(monkeypatch, quantized):
         return quantize(x)
 
     monkeypatch.setattr(
-        torch.ops.tensorrt_llm,
-        "quantize_e4m3_activation",
-        quantize_e4m3_activation,
-        raising=False,
+        quant_trtllm, "quantize_e4m3_activation", quantize_e4m3_activation
     )
     monkeypatch.setattr(quant_triton, "fp8_quantize_per_token", fp8_quantize_per_token)
 

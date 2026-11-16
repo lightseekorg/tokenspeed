@@ -31,6 +31,7 @@ from tokenspeed_kernel.ops.quantization import (
     quantize_nvfp4,
 )
 from tokenspeed_kernel.ops.quantization import triton as quant_triton
+from tokenspeed_kernel.ops.quantization import trtllm as quant_trtllm
 from tokenspeed_kernel.ops.quantization.triton import fp8_quantize
 from tokenspeed_kernel.platform import Platform
 from tokenspeed_kernel.registry import KernelRegistry
@@ -845,7 +846,7 @@ def test_native_fp8_scales_match_canonical(
     torch.testing.assert_close(q.float(), expected_q.float(), rtol=0, atol=0)
     torch.testing.assert_close(scales, expected_scales, rtol=0, atol=0)
     # Preserve the producer's stride instead of requiring padding on every ABI.
-    _, native_scales = torch.ops.trtllm.fp8_quantize_1x128(x, False)
+    _, native_scales = quant_trtllm.fp8_quantize_1x128(x, False)
     if native_scales.ndim == 1:
         expected_stride = (1, (rows + 3) // 4 * 4)
     else:
