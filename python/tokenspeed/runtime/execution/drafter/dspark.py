@@ -290,7 +290,11 @@ class DSpark(DFlash):
             logits = self.logits_processor._get_logits(
                 flat, head, metadata, require_full_vocab=False
             )
-            return logits.view(rows, positions, -1).transpose(0, 1).contiguous()
+            # No compact copy: only the bias add and a local argmax read these
+            # slices, and both take a positions-strided row layout. The fused
+            # walk and the distributed argmax, which need compact rows, never
+            # see a replicated head.
+            return logits.view(rows, positions, -1).transpose(0, 1)
         num_org = int(head.shard_indices.num_org_elements)
         if num_org <= 0:
             return None

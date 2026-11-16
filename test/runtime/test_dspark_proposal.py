@@ -427,6 +427,26 @@ def test_a_replicated_head_walk_proposes_what_projecting_each_round_does(
     assert torch.equal(hoisted, per_round)
 
 
+def test_a_replicated_head_step_takes_the_hoisted_projection() -> None:
+    """The step adds the bias to the supplied projection instead of projecting
+    the hidden state again, and reads it in the block's positions-strided
+    layout."""
+    rows, positions = 3, 4
+    drafter = _replicated_head_drafter(positions)
+    torch.manual_seed(11)
+    hidden = torch.randn(rows, HIDDEN)
+    projected = drafter._greedy_argmax_vocab_parallel(hidden).long()
+    # A supplied projection whose winner differs from the hidden state's own.
+    target = (projected + 1) % VOCAB
+    block = torch.full((rows, positions, VOCAB), -1.0).transpose(0, 1)
+    block[1, torch.arange(rows), target] = 1.0
+    assert not block[1].is_contiguous()
+
+    got = drafter._greedy_argmax_vocab_parallel(hidden, base_logits=block[1])
+
+    assert torch.equal(got.long(), target)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the fused walk is CUDA-only")
 def test_a_replicated_head_does_not_take_the_fused_walk() -> None:
     drafter = _replicated_head_drafter(positions=6)
