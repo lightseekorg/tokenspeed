@@ -1216,6 +1216,11 @@ Set `--ttft-trace-sampling-percentage 1` on both roles to select approximately
 modulo 1000, with a threshold of ten times the percentage. A frontend owner
 records a selected request once, even when several token batches stream out.
 Pair the JSON records using `endpoint` and `room` within the same time window.
+The sampling percentage defaults to 0 (disabled); 100 selects all PD rooms.
+These INFO summaries do not require `--enable-log-request-stats`, which
+independently adds RequestStats to the request's finish log.
+When sampled summaries and event-loop DEBUG logging are disabled, these records
+add no remote-prefill batch reads. When both are enabled, they share one read.
 
 | INFO record | Boundary | Measurements |
 | --- | --- | --- |
@@ -1229,10 +1234,46 @@ the bootstrap token alone does not emit the breakdown.
 
 Schema `ts-engine-v1` measures local `phases_ms` and `engine_elapsed_ms` on a
 monotonic clock. `first_dispatch_ms` is relative to engine registration.
-`total_ms` starts at the frontend creation timestamp when supplied and ends
-when the engine prepares the output. Unreached phases and an unavailable
-creation time are JSON null. Tokenization, detokenization and delivery to the
-HTTP client belong to the gateway and fall outside this measurement.
+`milestones_ms` records registration, scheduler submission, bootstrap agreement,
+decode landing admission, the first forward plan, first dispatch, prompt
+completion, transfer observation and output preparation on that same clock.
+Unreached milestones are null. The first plan precedes attention-DP agreement;
+dispatch is the enqueue boundary, not the forward thread starting execution.
+Registration follows transport receipt, replica relay and basic ingress
+validation. `output_prepared` is the timestamp taken at the start of summary
+construction, before the streamed output is built. Thus `output_pack` and
+`output_after_landing` do not measure complete output encoding or delivery.
+For a terminal release without an output, this endpoint is the release summary.
+
+On P, all prefill chunks contribute to `prefill`; only the last chunk records
+`prompt_done`. On a streaming D request, KV and the bootstrap token record
+`transfer_done`; the summary normally waits for the next local decode commit.
+A request ended by the bootstrap token completes without that decode, and a
+non-streaming request waits until completion to prepare its output.
+
+On P, `admission` splits into `ready_to_plan` and `plan_to_dispatch`. On D,
+`transfer_observe` splits into `remote_admission` and `admission_to_landing`.
+The latter includes forward-thread waiting, page preparation, manifest delivery,
+P execution and transfer; it is not a pure network duration. `landing_to_plan`
+and `plan_to_dispatch` further split the wait before the first decode.
+`registration_to_submit` and `submit_to_bootstrap` split `bootstrap` on both
+roles. These detail fields overlap their parent phases; do not add both levels.
+
+For short diagnostic runs, `TS_HOST_LOG=info,ts_pd::decode=debug,ts_pd::prefill=debug,_host::data_plane=debug`
+also reports D route lookup, manifest queueing, P manifest receipt and validation,
+and the forward thread's Execute queue duration. Correlate Execute records by
+their request IDs and manifest records by room and cache incarnation within the
+same deployment and time window. A queued manifest is not yet delivered.
+The D route and connection durations are cumulative from connection setup;
+route resolution may use a cached route. P accepts a complete bootstrap only
+after all expected manifests arrive. Execute queue time ends when the forward
+thread dequeues the plan, before dependency waits, metadata work or GPU execution.
+
+`total_ms` starts at the caller-supplied `created_time` when available and ends
+at the same summary boundary. It may include time before Rust registration;
+`created_time` is not necessarily the gateway's HTTP arrival time. Unreached
+phases and an unavailable creation time are JSON null. Gateway output processing
+and delivery to the HTTP client occur after this measurement.
 
 ### Per-request stats
 
@@ -1253,15 +1294,15 @@ Req: chatcmpl-019ef6b7 Finish! RequestStats(status='finished', reason='stop', pr
 | `status` / `reason` | `finished` vs `aborted`; finish-reason type (`stop`/`length`/`abort`). |
 | `prompt_tokens` / `cache_tokens` / `output_tokens` | Prompt tokens, prefix-cache-hit tokens, generated tokens. |
 | `cache_hit_rate` | `cache_tokens / prompt_tokens` (0–1). |
-| `queue_ms` | Received → first scheduled into a forward batch. |
+| `queue_ms` | Request-supplied `created_time` → first dispatch into a forward batch. Includes time before Rust registration; differs from the submitted → dispatch metrics histogram. |
 | `prefill_ms` | Scheduled → prefill complete. Always `0` on a decode node, whose prompt is prefilled on the prefill node. |
 | `decode_wait_ms` | Decode nodes only: KV (with the bootstrap token) landed → first decode batch dispatch. `0` elsewhere. |
-| `ttft_ms` | Received → first output token. On a decode node the first token is the prefill node's bootstrap token, so `ttft_ms` spans received → KV landed. |
-| `total_ms` | Received → finished/aborted. |
+| `ttft_ms` | Request-supplied `created_time` → first output token. On a decode node the first token is the prefill node's bootstrap token, so the endpoint is the engine accepting the landed KV and token. |
+| `total_ms` | Request-supplied `created_time` → finished/aborted. |
 | `preempt_ms` / `preempt_count` | Wall-clock this request's decode was delayed by prefilling other requests, and the number of such interruptions. Host-side best-effort. |
 | `decode_tps` | Decode throughput (generated tokens / decode window). |
 | `acc_len` / `acc_rate` | Spec-decode acceptance length and rate (`None` when speculative decoding is off). |
-| `recv_ts` / `commit_ts` / `finish_ts` | Absolute epoch timestamps for received / scheduled / finished. |
+| `recv_ts` / `commit_ts` / `finish_ts` | Absolute epoch timestamps for request-supplied creation / first dispatch / finish. `recv_ts` is copied from `created_time`, not stamped by the Rust transport. |
 
 ### KV cache events
 
