@@ -1521,8 +1521,9 @@ of what the Device holds.
 
 **Decode allocation** (`SchedulerConfig::decode_allocation_policy`). The
 policy is this role's alone: under either one the D role allocates a
-destination for every request its transfer peer lets in. A request here
-starts in `Bootstrapping` and becomes a candidate with
+destination for every request its transfer peer lets in. A config without a
+policy is `early`, as a caller built before the policy existed sends it. A
+request here starts in `Bootstrapping` and becomes a candidate with
 `pd::BootstrappedEvent`; before that it is not probed, so it reports no
 capacity failure and stops no other prompt. Under `early` that event says
 every Decode rank allocated the request's destination, so an admitted prompt
@@ -1531,13 +1532,12 @@ has its own event, `pd::DestinationReadyEvent`
 (`Request::MarkDestinationReady`), which may come in any state: a prompt whose
 final result lands before it waits in `PrefillAwaitingDestination`, with its
 pages and request-pool slot, until the event moves it to `PrefillDone`, whose
-remote decode sends the KV. The policy is read where a final result makes
-that choice and where the prefill plan sets the capacity stop below. A
-cancellation or a failed transfer (`pd::FailedEvent`) ends a
-waiting prompt as it ends every pinned request: it parks in `PdTransferring`
-until the transfer stopped (`pd::TransferStoppedEvent`). The prompts waiting
-are bounded by the request pool's slots (`max_batch_size`) as well as by the
-pages they hold.
+remote decode sends the KV. The policy is read where a final result makes that
+choice and where the prefill plan sets the capacity stop below. A cancellation
+or a failed transfer (`pd::FailedEvent`) ends a waiting prompt as it ends
+every pinned request: it parks in `PdTransferring` until the transfer stopped
+(`pd::TransferStoppedEvent`). The prompts waiting are bounded by the request
+pool's slots (`max_batch_size`) as well as by the pages they hold.
 
 A prompt waiting for its destination holds pages that only the Decode node's
 allocation, or its transfer's failure, gives back. While one waits, a new

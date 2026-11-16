@@ -134,9 +134,9 @@ struct SchedulerConfig {
     // (transfer pins, destination layouts, transfer_policy validation) keys
     // on the role directly.
     Role role{Role::kFused};
-    // What the Decode destination gates on the P role; required there and
-    // refused elsewhere (Validate). Under either policy a prompt is admitted
-    // once pd::BootstrappedEvent arrived.
+    // What the Decode destination gates on the P role; refused elsewhere
+    // (Validate), and absent there it is kEarly. Under either policy a prompt
+    // is admitted once pd::BootstrappedEvent arrived.
     //   kEarly        that event also says every Decode rank allocated the
     //                 destination, so a prompt computes with its destination
     //                 allocated.

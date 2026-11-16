@@ -188,9 +188,10 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("decode_input_tokens", &tokenspeed::SchedulerConfig::decode_input_tokens)
         .def_rw("overlap_schedule_depth", &tokenspeed::SchedulerConfig::overlap_schedule_depth)
         .def_rw("role", &tokenspeed::SchedulerConfig::role)
-        // P role, required there and None elsewhere: Early admits a prompt
-        // once its Decode destination is allocated, Independent without
-        // waiting for it, holding only its KV transfer for the destination.
+        // P role only: None elsewhere, and None there is Early. Early admits
+        // a prompt once its Decode destination is allocated, Independent
+        // without waiting for it, holding only its KV transfer for the
+        // destination.
         .def_rw("decode_allocation_policy", &tokenspeed::SchedulerConfig::decode_allocation_policy)
         .def_prop_rw(
             "num_device_pages", [](const tokenspeed::SchedulerConfig& c) { return c.device_allocator.total_pages; },

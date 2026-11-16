@@ -63,11 +63,7 @@ void SchedulerConfig::Validate() const {
     if (max_kv_page_num < 0) {
         throw std::invalid_argument("Scheduler: max_kv_page_num must be >= 0");
     }
-    if (role == Role::kP && !decode_allocation_policy) {
-        throw std::invalid_argument(
-            "Scheduler: the P role requires an explicit decode_allocation_policy "
-            "(--disaggregation-decode-allocation-policy)");
-    }
+    // Absent on the P role it is kEarly: what a caller built before the policy existed sends.
     if (role != Role::kP && decode_allocation_policy) {
         throw std::invalid_argument(
             "Scheduler: decode_allocation_policy (--disaggregation-decode-allocation-policy) is for the P role only");

@@ -431,22 +431,26 @@ TEST_F(IndependentAdmissionSealTest, WithoutAWaitingPromptASmallerPromptPassesOn
 
 // Under early allocation the one event admits the prompt with its
 // destination allocated: its KV is sent as soon as it is computed, and the
-// destination's own event changes nothing.
+// destination's own event changes nothing. A config without a policy, as a
+// caller built before the policy existed sends it, is early.
 TEST_F(IndependentAdmissionTest, EarlyPolicySendsWithoutASeparateDestinationGrant) {
-    auto cfg = MakeConfig();
-    cfg.decode_allocation_policy = SchedulerConfig::DecodeAllocationPolicy::kEarly;
-    Scheduler early{WithHostPackingFromDevice(cfg)};
-    const Scheduler::PlanOptions options{.allow_prefill = true, .apply_prefill_watermark = false};
-    early.SubmitRequests({RequestSpec{.request_id = "r", .tokens = {1, 2, 3, 4}, .max_new_tokens = 8}});
-    early.Advance(ExecutionEvent{}.With(pd::DestinationReadyEvent{"r"}));
-    EXPECT_TRUE(FindForwardBatch(early.NextExecutionPlan(options))->request_ids.empty());
-    EXPECT_EQ(early.BootstrappingSize(), 1u);
-    early.Advance(ExecutionEvent{}.With(pd::BootstrappedEvent{"r"}));
-    ASSERT_EQ(FindForwardBatch(early.NextExecutionPlan(options))->request_ids, std::vector<std::string>{"r"});
-    early.Advance(ExecutionEvent{}.With(forward::ExtendResult{.request_id = "r", .tokens = {42}}));
-    EXPECT_EQ(early.AwaitingDestinationSize(), 0u);
-    const auto send = early.NextExecutionPlan(options);
-    EXPECT_TRUE(send.remote_decode.has_value());
+    using Policy = SchedulerConfig::DecodeAllocationPolicy;
+    for (const std::optional<Policy> policy : {std::optional{Policy::kEarly}, std::optional<Policy>{}}) {
+        auto cfg = MakeConfig();
+        cfg.decode_allocation_policy = policy;
+        Scheduler early{WithHostPackingFromDevice(cfg)};
+        const Scheduler::PlanOptions options{.allow_prefill = true, .apply_prefill_watermark = false};
+        early.SubmitRequests({RequestSpec{.request_id = "r", .tokens = {1, 2, 3, 4}, .max_new_tokens = 8}});
+        early.Advance(ExecutionEvent{}.With(pd::DestinationReadyEvent{"r"}));
+        EXPECT_TRUE(FindForwardBatch(early.NextExecutionPlan(options))->request_ids.empty());
+        EXPECT_EQ(early.BootstrappingSize(), 1u);
+        early.Advance(ExecutionEvent{}.With(pd::BootstrappedEvent{"r"}));
+        ASSERT_EQ(FindForwardBatch(early.NextExecutionPlan(options))->request_ids, std::vector<std::string>{"r"});
+        early.Advance(ExecutionEvent{}.With(forward::ExtendResult{.request_id = "r", .tokens = {42}}));
+        EXPECT_EQ(early.AwaitingDestinationSize(), 0u);
+        const auto send = early.NextExecutionPlan(options);
+        EXPECT_TRUE(send.remote_decode.has_value());
+    }
 }
 
 TEST_F(IndependentAdmissionTest, DecodeAllocatesWithoutWaitingForPrefillCompletion) {
@@ -506,10 +510,7 @@ TEST_F(IndependentAdmissionTest, DecodeAdmissionPressureDoesNotBlockPrefillCompu
     EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
 }
 
-TEST_F(IndependentAdmissionTest, AllocationPolicyIsExplicitOnlyForPrefill) {
-    auto prefill = MakeConfig();
-    prefill.decode_allocation_policy.reset();
-    EXPECT_THROW(Scheduler{WithHostPackingFromDevice(prefill)}, std::invalid_argument);
+TEST_F(IndependentAdmissionTest, AllocationPolicyIsForPrefillOnly) {
     for (const auto role : {Role::kD, Role::kFused}) {
         auto cfg = MakeConfig();
         cfg.role = role;
