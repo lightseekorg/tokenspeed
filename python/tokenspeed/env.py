@@ -96,7 +96,6 @@ PACKAGE_LIST = [
     "tokenspeed-scheduler",
     "tokenspeed-smg",
     "tokenspeed-triton",
-    "tokenspeed-trtllm-kernel",
     "torch",
     "torch-npu",
     "torch_memory_saver",
