@@ -202,7 +202,9 @@ def _gate_halves(full: bool, rows: int, chain: int) -> int:
     layer's attention has one task on every CTA (2 KV heads x FULL_SPLITS),
     so gate's CTAs run their attention task only after their gate task:
     two 8-row tasks a block on every CTA halve that wait. Otherwise gate
-    stays off the attention's CTAs, a task a block."""
+    keeps a task a block: a sliding layer's attention (at most 64 tasks)
+    stays off gate's CTAs, and a full layer of two requests runs its
+    attention in rounds over every CTA, gate's included."""
     one_task_a_cta = (
         full and rows // chain * int(attention.KV_HEADS) * FULL_SPLITS == GRID
     )
