@@ -1217,6 +1217,8 @@ Pair the JSON records using `endpoint` and `room` within the same time window.
 The sampling percentage defaults to 0 (disabled); 100 selects all PD rooms.
 These INFO summaries do not require `--enable-log-request-stats`, which
 independently adds RequestStats to the request's finish log.
+When sampled summaries and event-loop DEBUG logging are disabled, these records
+add no remote-prefill batch reads. When both are enabled, they share one read.
 
 | INFO record | Boundary | Measurements |
 | --- | --- | --- |

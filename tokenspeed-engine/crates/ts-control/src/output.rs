@@ -735,6 +735,14 @@ impl OutputProcessor {
         self.spec_num_tokens
     }
 
+    /// Whether this rank can collect sampled PD first-output summaries.
+    pub(crate) fn ttft_sampling_enabled(&self) -> bool {
+        self.finish_log.enabled
+            && self.finish_log.ttft_percentage > 0
+            && self.role != Role::Plain
+            && tracing::enabled!(target: "ts_control::request_stats", tracing::Level::INFO)
+    }
+
     /// When `rid` reached the scheduler's waiting queue, the first time this
     /// is asked after it did: a retraction re-queues
     /// a request without re-stamping it.
@@ -790,10 +798,7 @@ impl OutputProcessor {
         state: &mut RequestState,
         bootstrap: Option<&ts_pd::BootstrapInfo>,
     ) {
-        if self.finish_log.enabled
-            && self.finish_log.ttft_percentage > 0
-            && tracing::enabled!(target: "ts_control::request_stats", tracing::Level::INFO)
-        {
+        if self.ttft_sampling_enabled() {
             state.ttft = bootstrap.and_then(|b| {
                 request_stats::TtftTrace::sample(self.finish_log.ttft_percentage, self.role, b)
             });
@@ -1938,6 +1943,57 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(committed.outputs[0].reasoning_tokens, expected);
+        }
+    }
+
+    #[test]
+    fn ttft_sampling_depends_on_pd_summary_settings_and_the_log_filter() {
+        use tracing::Level;
+
+        for (level, role, enabled, percentage, request_stats, expected) in [
+            (Level::INFO, Role::Prefill, true, 100, false, true),
+            (Level::INFO, Role::Decode, true, 100, false, true),
+            (Level::INFO, Role::Decode, true, 1, false, true),
+            (Level::INFO, Role::Prefill, true, 0, false, false),
+            (Level::INFO, Role::Decode, true, 0, true, false),
+            (Level::DEBUG, Role::Decode, true, 0, false, false),
+            (Level::WARN, Role::Decode, true, 100, true, false),
+            (Level::INFO, Role::Decode, false, 100, true, false),
+            (Level::INFO, Role::Plain, true, 100, true, false),
+            (Level::DEBUG, Role::Decode, true, 100, false, true),
+        ] {
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(level)
+                .with_writer(std::io::sink)
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                let processor = OutputProcessor::new(
+                    None,
+                    1,
+                    None,
+                    role,
+                    FinishLog {
+                        enabled,
+                        request_stats,
+                        ttft_percentage: percentage,
+                    },
+                    false,
+                    None,
+                );
+                let mut state =
+                    RequestState::new(vec![8, 9], 4, BTreeSet::new(), true, None, false);
+                // Room 4 is selected even at one percent sampling.
+                processor.sample_ttft(
+                    &mut state,
+                    Some(&ts_pd::BootstrapInfo {
+                        room: 4,
+                        host: "p".into(),
+                        port: 8080,
+                    }),
+                );
+                assert_eq!(state.ttft.is_some(), expected);
+                assert_eq!(processor.ttft_sampling_enabled(), expected);
+            });
         }
     }
 
