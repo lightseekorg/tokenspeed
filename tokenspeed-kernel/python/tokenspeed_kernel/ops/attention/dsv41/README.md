@@ -46,6 +46,18 @@ DeepSelect's input alignment. The cleaner remains for prepared blocks.
 The mask runs one program per row and 1024-page chunk, so a long row's
 pages are checked in parallel rather than by one looping program.
 
+Each native selection tile finishes in one kernel (`finish_write_selection`):
+the filter and position sort of `finish_selection`, the output copy and
+counts of `write_selection`, and, when the caller passes `SelectionSlots`,
+the `global_slots` lookup. A candidate-source pass finishes its row and block
+picks in the same launch, on separate programs. Native sparse Reindex skips
+the candidate mask: rows whose candidate pool fits the selection width were
+not scored, and the kernel takes such a pool whole, as the mask's equal 0.0
+scores did; scored rows are read only on [0, end). DeepSelect does not run
+its NaN check on rows that short, so their uninitialized logits are never
+inspected. Rows, lengths, candidate blocks and slots stay bit-identical to
+the separate finish, write and slot passes.
+
 Candidate block maxima remain FP32, with the existing newest-block pinning and
 logical-position mapping. Converting BF16 scores to FP32 for this reduction
 does not recover precision lost when the producer wrote BF16. Equal BF16

@@ -1180,16 +1180,21 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         Remote selections are valid: materialized history is addressed by the
         logical IDs, not these virtual slots. Writes use local cache_slots.
         """
-        gid = self._owner_group(owner)
-        ratio = self.spec.compress_ratios[owner]
         from tokenspeed_kernel.ops.attention.dsv41 import global_slots
 
         return global_slots(
             logical_rows,
             positions,
             request_indices,
+            *self._global_slot_table(owner, forward_mode),
+        )
+
+    def _global_slot_table(self, owner: int, forward_mode: ForwardMode):
+        """The owner's (block table, ratio, page bound) global slots resolve with."""
+        gid = self._owner_group(owner)
+        return (
             self.query_metadata(forward_mode).block_tables[gid],
-            ratio,
+            self.spec.compress_ratios[owner],
             (
                 self.cache_pool.arena.runtime_contract.virtual_block_counts[gid]
                 if self.kvp_size > 1
@@ -1736,6 +1741,26 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 index_q, index_cache, candidates.block_ids if reindex else None
             )
         )
+        # When one index_topk call selects every query row (replicated-cache
+        # decode), it also resolves their physical slots, replacing
+        # global_read_slots below; the native selection does it in the kernel
+        # that finishes the picks.
+        slot_request = None
+        if (
+            forward_mode.is_decode()
+            and self.kvp_size == 1
+            and partition is None
+            and windows == [(0, n, None)]
+        ):
+            slot_request = dsv41.SelectionSlots(
+                torch.empty(
+                    (n, self.spec.index_topk), dtype=torch.int32, device=self.device
+                ),
+                positions,
+                request_indices,
+                *self._global_slot_table(owner, forward_mode),
+            )
+        selected_slots = None
         for start, stop, span in windows:
             members = self._index_window_members(span)
             window_history = (
@@ -1856,7 +1881,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 packed = all_gather(packed, self.kvp_group, dim=1)
                 dsv41.merge_index_candidates(packed, rows[start:stop], lens[start:stop])
                 continue
-            dsv41.index_topk(
+            topk_args = (
                 index_q[start:stop],
                 index_weights[start:stop],
                 scoring_cache,
@@ -1873,14 +1898,21 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 None,
                 geometry.kernel_metadata,
             )
+            if slot_request is None:
+                dsv41.index_topk(*topk_args)
+            else:
+                dsv41.index_topk(*topk_args, slots=slot_request)
+                selected_slots = slot_request.out
             del scoring_cache
         if partition is not None:
             rows, lens = partition.gather_selection(rows, lens, query_group)
         if produce_candidates:
             candidates = V41Candidates(positions, request_indices, blocks, block_lens)
-        slots = self.global_read_slots(
-            owner, rows, positions, request_indices, forward_mode
-        )
+        slots = selected_slots
+        if slots is None:
+            slots = self.global_read_slots(
+                owner, rows, positions, request_indices, forward_mode
+            )
         record = V41Selection(
             owner,
             source,

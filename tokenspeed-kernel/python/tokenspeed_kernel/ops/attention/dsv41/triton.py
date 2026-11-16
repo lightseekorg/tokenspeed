@@ -3457,6 +3457,243 @@ def write_selection(selected, candidates, out):
     )
 
 
+@triton.jit
+def _finished_ids(
+    I,
+    S,
+    E,
+    C,
+    row,
+    i,
+    I0,
+    S0,
+    NC,
+    K,
+    W,
+    BLOCK_SIZE: tl.constexpr,
+    HAS_CANDIDATES: tl.constexpr,
+    SHORT_ROWS_UNSCORED: tl.constexpr,
+):
+    # _finish_selection's filter and position sort for one row, returning the
+    # IDs it stores: valid positions ascending, then -1.
+    end = tl.load(E + row)
+    if SHORT_ROWS_UNSCORED:
+        # Sparse scoring left pools that fit K unwritten; the dropped candidate
+        # mask scored them 0.0, which selects the whole pool [0, end). Take it
+        # without reading those logits or the selector's picks for them.
+        short = end <= K
+        selected = tl.load(I + row * I0 + i, (i < K) & (end > K), other=-1)
+        selected = tl.where(short, i, selected)
+        valid = (i < K) & (selected >= 0) & (selected < end)
+        score = tl.load(S + row * S0 + selected, valid & (end > K), other=-float("inf"))
+        valid &= short | (score > -float("inf"))
+    else:
+        selected = tl.load(I + row * I0 + i, i < K, other=-1)
+        valid = (i < K) & (selected >= 0) & (selected < end)
+        score = tl.load(S + row * S0 + selected, valid, other=-float("inf"))
+        valid &= score > -float("inf")
+    position = selected
+    if HAS_CANDIDATES:
+        candidate = tl.load(C + row * NC + selected // BLOCK_SIZE, valid, other=-1)
+        position = candidate * BLOCK_SIZE + selected % BLOCK_SIZE
+        valid &= (candidate >= 0) & (position < W)
+    position = tl.where(valid, position, 2147483647)
+    position = tl.sort(position, descending=False)
+    return tl.where(position != 2147483647, position, -1)
+
+
+@triton.jit(
+    do_not_specialize=[
+        "I0",
+        "S0",
+        "NC",
+        "K",
+        "W",
+        "J0",
+        "T0",
+        "CK",
+        "TR",
+        "TC",
+        "TS0",
+        "TS1",
+        "PAGES",
+    ],
+    do_not_specialize_on_alignment=["Lengths", "BlockLengths", "P", "Req", "Table"],
+)
+def _finish_write_selection(
+    I,
+    S,
+    E,
+    C,
+    Rows,
+    Lengths,
+    J,
+    T,
+    F,
+    Blocks,
+    BlockLengths,
+    Slots,
+    P,
+    Req,
+    Table,
+    I0,
+    S0,
+    NC,
+    K,
+    W,
+    J0,
+    T0,
+    CK,
+    TR,
+    TC,
+    TS0,
+    TS1,
+    PAGES,
+    BLOCK_SIZE: tl.constexpr,
+    HAS_CANDIDATES: tl.constexpr,
+    SHORT_ROWS_UNSCORED: tl.constexpr,
+    POOL: tl.constexpr,
+    SLOTS: tl.constexpr,
+    RATIO: tl.constexpr,
+    PS: tl.constexpr,
+    RS: tl.constexpr,
+    ROW_BLOCK: tl.constexpr,
+    POOL_BLOCK: tl.constexpr,
+):
+    # Program (row, 0) finishes the row picks; (row, 1) the candidate-block
+    # picks of a pass that sources a pool, concurrently.
+    row = tl.program_id(0).to(tl.int64)
+    if tl.program_id(1) == 0:
+        i = tl.arange(0, ROW_BLOCK)
+        ids = _finished_ids(
+            I,
+            S,
+            E,
+            C,
+            row,
+            i,
+            I0,
+            S0,
+            NC,
+            K,
+            W,
+            BLOCK_SIZE,
+            HAS_CANDIDATES,
+            SHORT_ROWS_UNSCORED,
+        )
+        tl.store(Rows + row * K + i, ids, i < K)
+        tl.store(Lengths + row, tl.sum((ids >= 0).to(tl.int32)))
+        if SLOTS:
+            # _global_slots_kernel's causality bound and page lookup.
+            pos = tl.load(P + row * PS)
+            req = tl.load(Req + row * RS)
+            raw = tl.where(
+                (ids >= 0) & (ids < (pos + 1) // RATIO),
+                ids.to(tl.int64) * RATIO,
+                -1,
+            )
+            slots = resolve_group_slot(
+                Table, raw, req, TR, TC, TS0, TS1, 64, RATIO, 1, PAGES
+            )
+            tl.store(Slots + row * K + i, slots, i < K)
+        if not POOL:
+            # A pass that sources no candidates still owes empty pool counts.
+            tl.store(BlockLengths + row, tl.full((), 0, tl.int32))
+    if POOL:
+        if tl.program_id(1) == 1:
+            c = tl.arange(0, POOL_BLOCK)
+            # Candidate IDs carry no score order; publish them ascending.
+            ids = _finished_ids(J, T, F, J, row, c, J0, T0, 0, CK, 0, 1, False, False)
+            tl.store(Blocks + row * CK + c, ids, c < CK)
+            tl.store(BlockLengths + row, tl.sum((ids >= 0).to(tl.int32)))
+
+
+def finish_write_selection(rows, pool, out, slots, short_rows_unscored):
+    """Finish native picks straight into caller-owned selection outputs.
+
+    One launch replaces finish_selection, write_selection and global_slots.
+
+    Args:
+        rows: (indices, scores, ends, candidates, width, block_size) row picks,
+            as finish_selection takes them; rows are position-sorted.
+        pool: (indices, scores, ends) candidate-block picks of a pass that
+            sources candidates, or None. Without a pool, blocks must have no
+            columns and the block counts are zeroed.
+        out: Contiguous int32 (rows [N, K], lengths [N], blocks [N, CK],
+            block lengths [N]) tiles, with K and CK the pick widths.
+        slots: SelectionSlots for these N rows, or None for no slots.
+        short_rows_unscored: True when rows whose end is at most K were not
+            scored (sparse scoring with skip_score_topk = K): such rows select
+            their whole [0, end) without reading scores or picks. Their logits
+            may be uninitialized; DeepSelect skips its NaN check for them.
+
+    Bit-identical to write_selection of finish_selection(*rows, True) and
+    finish_selection(*pool, None, pool scores width, 8, False), followed by
+    global_slots of the written rows into slots.out; with
+    short_rows_unscored, to that composition run on the logits after
+    _mask_candidate_logits. Pool IDs come out ascending either way, since
+    write_selection sorts them.
+    """
+    indices, scores, ends, candidates, width, block_size = rows
+    row_ids, lengths, blocks, block_lengths = out
+    n, k = indices.shape
+    pool_indices, pool_scores, pool_ends = pool if pool is not None else (None,) * 3
+    pool_k = pool_indices.shape[1] if pool is not None else 0
+    if (
+        row_ids.shape != (n, k)
+        or lengths.shape != (n,)
+        or blocks.shape != (n, pool_k)
+        or block_lengths.shape != (n,)
+        or not all(t.is_contiguous() for t in out)
+        or (pool is not None and (pool_k == 0 or pool_indices.shape[0] != n))
+        or (slots is not None and slots.out.shape != (n, k))
+        or (slots is not None and not slots.out.is_contiguous())
+    ):
+        raise ValueError("selection outputs disagree with the picks they finish")
+    if n == 0:
+        return
+    table = slots.table if slots is not None else indices
+    kernel_launcher(_finish_write_selection, (n, 1 if pool is None else 2))(
+        indices,
+        scores,
+        ends,
+        candidates if candidates is not None else indices,
+        row_ids,
+        lengths,
+        pool_indices if pool is not None else indices,
+        pool_scores if pool is not None else scores,
+        pool_ends if pool is not None else ends,
+        blocks,
+        block_lengths,
+        slots.out if slots is not None else row_ids,
+        slots.positions if slots is not None else ends,
+        slots.requests if slots is not None else ends,
+        table,
+        indices.stride(0),
+        scores.stride(0),
+        candidates.shape[1] if candidates is not None else 0,
+        k,
+        width,
+        pool_indices.stride(0) if pool is not None else 0,
+        pool_scores.stride(0) if pool is not None else 0,
+        pool_k,
+        *(table.shape if slots is not None else (0, 0)),
+        *(table.stride() if slots is not None else (0, 0)),
+        slots.pages if slots is not None else 0,
+        block_size,
+        candidates is not None,
+        short_rows_unscored,
+        pool is not None,
+        slots is not None,
+        slots.ratio if slots is not None else 1,
+        slots.positions.stride(0) if slots is not None else 1,
+        slots.requests.stride(0) if slots is not None else 1,
+        triton.next_power_of_2(k),
+        triton.next_power_of_2(pool_k) if pool is not None else 1,
+        num_warps=8,
+    )
+
+
 @triton.jit(do_not_specialize=["BS", "ACTUAL", "EXTENDS", "TOKENS"])
 def _decode_rows_kernel(
     Seq,
@@ -4897,6 +5134,10 @@ register_triton_warmup(
 )
 register_triton_warmup(
     _write_selection, variants=({"CANDIDATE_BLOCK": _SELECTION_BLOCKS},)
+)
+register_triton_warmup(
+    _finish_write_selection,
+    variants=lambda args: ({"POOL_BLOCK": _SELECTION_BLOCKS},) if args["POOL"] else (),
 )
 # Canonical windows pass a row slice, reordered subsets an index tensor.
 register_triton_warmup(_prefill_indices_kernel, variants=({"HAS_ROWS": (False, True)},))

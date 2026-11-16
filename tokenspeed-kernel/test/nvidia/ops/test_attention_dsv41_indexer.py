@@ -49,11 +49,13 @@ from tokenspeed_kernel.ops.attention.dsv41.triton import (
     clean_logits,
     clean_logits_for_selection,
     finish_selection,
+    global_slots,
     mask_invalid_pages,
     mask_invalid_table_pages,
     pack_index_inputs,
     pack_index_queries,
     prepare_scores,
+    write_selection,
 )
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.thirdparty.deep_select import deep_select_alignment
@@ -1633,3 +1635,222 @@ def test_index_metadata_rejects_incompatible_request_indices(bad_indices):
         indices = indices.cpu()
     with pytest.raises(ValueError, match="request_indices"):
         dsv41.new_index_metadata(table, lengths, indices, history_rows=None)
+
+
+def _fused_selection_inputs(case, tokens):
+    """Decode-shaped inputs: four requests of verify rows, tables built as
+    selection_table builds them, and the owner's slot geometry (ratio 2)."""
+    torch.manual_seed(1110 + tokens)
+    # Only a candidate source over more than 65536 rows skips prepared blocks.
+    columns = 1026 if case == "source" else 40
+    pages = 2 * columns + 3
+    # Native sparse scoring needs 512-byte page strides; 4416 keeps the
+    # candidate gather.
+    stride = 4416 if case == "reindex" else 4608
+    storage = torch.empty((pages, stride), device="cuda", dtype=torch.uint8)
+    storage[:, :4096].random_(0, 256)
+    storage[:, 4096:4352].random_(123, 127)
+    cache = storage.as_strided((pages, 64, 68), (stride, 68, 1))
+    requests = torch.arange(tokens, device="cuda") // 3
+    owner = torch.randint(1, pages, (4, columns + 1), device="cuda", dtype=torch.int32)
+    owner[0, 1] = 0
+    owner[1, 0] = pages + 5
+    table = owner[requests, :columns]
+    table = table.masked_fill(table <= 0, -1)
+    lengths = torch.tensor([3, 40, 130, 1100], device="cuda")[requests]
+    positions = lengths * 2 - 3 + torch.arange(tokens, device="cuda") % 3
+    visible = ((positions + 1) // 2).clamp_min(0).to(torch.int32)
+    q = torch.randn((tokens, 32, 128), device="cuda", dtype=torch.bfloat16)
+    weights = torch.randn((tokens, 32), device="cuda", dtype=torch.bfloat16)
+    candidates = None
+    if case in ("sparse", "reindex"):
+        # Short pools (at most topk rows) go unscored; repeats, -1 and future
+        # blocks drop out, and the newest block stays a candidate.
+        candidates = torch.randint(
+            -1, columns * 8 + 4, (tokens, 128), device="cuda", dtype=torch.int32
+        )
+        candidates[:, :4] = torch.tensor([3, 3, -1, 0], device="cuda")
+        candidates[:, -1] = ((visible - 1) // 8).clamp_min(0)
+    return q, weights, cache, table, visible, positions, requests, owner, candidates
+
+
+def _separate_finish_passes(rows, pool, out, slots, short_rows_unscored):
+    """finish_write_selection as finish_selection, write_selection and
+    global_slots, on candidate-masked sparse logits."""
+    indices, scores, ends, candidates, width, block_size = rows
+    selected = finish_selection(
+        indices, scores, ends, candidates, width, block_size, True
+    )
+    chosen = None
+    if pool is not None:
+        chosen = finish_selection(*pool, None, pool[1].shape[1], 8, False)
+    write_selection(selected, chosen, out)
+    if slots is not None:
+        slots.out.copy_(
+            global_slots(
+                out[0],
+                slots.positions,
+                slots.requests,
+                slots.table,
+                slots.ratio,
+                slots.pages,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "case", ["full", "source", "source_prepared", "sparse", "reindex"]
+)
+def test_fused_selection_index_topk_matches_separate_passes_in_graph(monkeypatch, case):
+    """Native index_topk replays outputs and slots bit-identical to the
+    separate finish, write and global_slots passes on candidate-masked
+    sparse logits, including short sparse pools whose logits are never
+    scored."""
+    tokens, topk = 12, 64
+    candidate_topk = 32 if case in ("source", "source_prepared") else 0
+    inputs = _fused_selection_inputs(case, tokens)
+    q, weights, cache, table, visible, positions, requests, owner, candidates = inputs
+    slot_pages = cache.shape[0] - 2
+
+    def run(query_chunk_size):
+        slots = dsv41.SelectionSlots(
+            torch.empty((tokens, topk), device="cuda", dtype=torch.int32),
+            positions,
+            requests,
+            owner,
+            2,
+            slot_pages,
+        )
+        out = dsv41.index_topk(
+            q,
+            weights,
+            cache,
+            table,
+            visible,
+            candidates,
+            topk,
+            candidate_topk,
+            8,
+            query_chunk_size,
+            256,
+            None,
+            None,
+            solution="deep_gemm",
+            slots=slots,
+        )
+        return (*out, slots.out)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graphs = []
+    with torch.cuda.stream(stream):
+        for query_chunk_size in (5, tokens):
+            run(query_chunk_size)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                outputs = run(query_chunk_size)
+            graphs.append((graph, outputs, query_chunk_size))
+    torch.cuda.current_stream().wait_stream(stream)
+    for shift in (0, 37):
+        q.normal_()
+        weights.normal_()
+        visible.copy_((visible + shift).clamp_max(table.shape[1] * 64))
+        for graph, outputs, query_chunk_size in graphs:
+            graph.replay()
+            fused = [tensor.clone() for tensor in outputs]
+            with monkeypatch.context() as separate:
+                separate.setattr(
+                    deep_gemm, "finish_write_selection", _separate_finish_passes
+                )
+                separate.setattr(
+                    deep_gemm, "_sparse_candidate_logits", _sparse_candidate_scores
+                )
+                expected = run(query_chunk_size)
+            for got, want in zip(fused, expected, strict=True):
+                torch.testing.assert_close(got, want, rtol=0, atol=0)
+            assert (fused[1] > 0).sum() >= tokens // 2
+            assert ((fused[3] > 0).any()) == bool(candidate_topk)
+
+
+def test_fused_selection_does_not_recompile_across_batches():
+    from tokenspeed_kernel.ops.attention.dsv41.triton import (
+        _finish_write_selection,
+        finish_write_selection,
+    )
+
+    def launch(rows, pad, table_rows, table_columns, pages, pool):
+        indices = torch.randint(
+            -1, 900, (rows, 512 + pad), device="cuda", dtype=torch.int32
+        )[:, :512]
+        scores = torch.randn(rows, 1024 + 8 * pad, device="cuda")
+        ends = torch.randint(0, 1024, (rows,), device="cuda", dtype=torch.int32)
+        out = (
+            torch.empty((rows + 1, 512), device="cuda", dtype=torch.int32)[1:],
+            torch.empty(rows + pad, device="cuda", dtype=torch.int32)[pad:],
+            torch.empty((rows, 64 if pool else 0), device="cuda", dtype=torch.int32),
+            torch.empty(rows + pad, device="cuda", dtype=torch.int32)[pad:],
+        )
+        picks = None
+        if pool:
+            picks = (
+                torch.randint(0, 200, (rows, 64), device="cuda", dtype=torch.int32),
+                torch.randn(rows, 256 + pad, device="cuda"),
+                torch.randint(0, 200, (rows,), device="cuda", dtype=torch.int32),
+            )
+        storage = torch.randint(
+            0,
+            pages,
+            (table_rows, table_columns + pad),
+            device="cuda",
+            dtype=torch.int32,
+        )
+        slots = dsv41.SelectionSlots(
+            torch.empty((rows, 512), device="cuda", dtype=torch.int32),
+            torch.randint(-1, 2000, (rows + pad,), device="cuda")[pad:],
+            torch.randint(-1, table_rows, (rows + pad,), device="cuda")[pad:],
+            storage[:, :table_columns],
+            2,
+            pages,
+        )
+        finish_write_selection(
+            (indices, scores, ends, None, scores.shape[1], 1), picks, out, slots, False
+        )
+
+    for pool in (False, True):
+        launch(3, 0, 2, 16, 64, pool)
+        launch(17, 1, 7, 33, 99, pool)
+    with assert_no_triton_compile(_finish_write_selection):
+        for rows, pad, table_rows, table_columns, pages in (
+            (1, 3, 1, 1, 1),
+            (16, 0, 32, 64, 4096),
+            (33, 5, 9, 17, 77),
+        ):
+            for pool in (False, True):
+                launch(rows, pad, table_rows, table_columns, pages, pool)
+    torch.cuda.synchronize()
+
+
+def test_deep_select_leaves_short_rows_unchecked():
+    """Native sparse Reindex skips the candidate mask, so pools of at
+    most topk rows reach DeepSelect with uninitialized logits. DeepSelect's
+    contract skips its NaN check (abort) on rows that short; longer rows
+    still select their top scores."""
+    ends = torch.tensor([0, 1, 300, 512, 513, 2048], device="cuda", dtype=torch.int32)
+    scores = torch.randn(6, 2048, device="cuda", dtype=torch.bfloat16)
+    short = ends <= 512
+    scores[short] = torch.nan
+    picks = _native_indices(scores, ends, 512)
+    torch.cuda.synchronize()
+    values = scores[~short].float()
+    selected = values.gather(1, picks[~short].long())
+    torch.testing.assert_close(
+        selected.sort(1).values,
+        values.masked_fill(
+            torch.arange(2048, device="cuda")[None, :] >= ends[~short, None], -torch.inf
+        )
+        .topk(512, dim=1)
+        .values.sort(1)
+        .values,
+        rtol=0,
+        atol=0,
+    )

@@ -29,7 +29,7 @@ from tokenspeed_kernel.ops.attention.dsv4.deep_gemm import (
     warmup_mqa_logits,
 )
 from tokenspeed_kernel.ops.attention.dsv41._deep_gemm.indexer import (
-    _sparse_candidate_scores,
+    _sparse_candidate_logits,
     clean_logits_and_block_max,
     gather_index_pages,
 )
@@ -46,10 +46,10 @@ from tokenspeed_kernel.ops.attention.dsv41.cute_dsl import (
     sparse_index_scores_supported,
 )
 from tokenspeed_kernel.ops.attention.dsv41.deep_select import (
+    _candidate_picks,
     _native_indices,
-    _select_topk_prepared,
-    select_candidates,
-    select_topk,
+    _prepared_picks,
+    _topk_picks,
 )
 from tokenspeed_kernel.ops.attention.dsv41.triton import (
     _LAYOUTS,
@@ -61,13 +61,12 @@ from tokenspeed_kernel.ops.attention.dsv41.triton import (
     clean_logits,
     clean_logits_for_selection,
     dense_ranges,
-    finish_selection,
+    finish_write_selection,
     mask_invalid_pages,
     mask_invalid_table_pages,
     pack_index_inputs,
     quantize_index_queries,
     safe_metadata,
-    write_selection,
 )
 from tokenspeed_kernel.platform import (
     ArchVersion,
@@ -319,10 +318,12 @@ def _dense_scores(
     name="deep_gemm_dsv41_index_topk",
     solution="deep_gemm",
     signatures=[format_signature(x=dense_tensor_format(torch.bfloat16))],
-    # Fuses RoPE and query quantization when index_q is an IndexQueryInput.
+    # Fuses RoPE and query quantization when index_q is an IndexQueryInput,
+    # and resolves the selection's SelectionSlots in its finishing kernel.
     traits={
         "native_indexer": frozenset({True}),
         "supports_index_query_input": frozenset({True}),
+        "supports_selection_slots": frozenset({True}),
     },
     capability=CapabilityRequirement(
         min_arch_version=ArchVersion(10, 0),
@@ -346,8 +347,12 @@ def index_topk(
     process_group,
     out,
     index_metadata,
+    slots,
 ):
-    """Score bounded query tiles; cache and selections remain caller owned."""
+    """Score bounded query tiles; cache and selections remain caller owned.
+
+    slots is a SelectionSlots for every query row, or None.
+    """
     if process_group is not None or candidate_block_size != 8:
         raise ValueError(
             "Native CSA2 selection requires replicated heads and 8-row blocks"
@@ -376,6 +381,8 @@ def index_topk(
         lengths.zero_()
         blocks.fill_(-1)
         block_lengths.zero_()
+        if slots is not None:
+            slots.out.fill_(-1)
         return out
     # The caller bounds this call. Dense Full packs one or more request
     # histories; DeepSelect reads [0, end) of the MQA view without a cleaned copy.
@@ -423,8 +430,13 @@ def index_topk(
         visible = visible_lens[begin:end]
         packed = (queries[0][begin:end], queries[1][begin:end])
         candidates = None if candidate_blocks is None else candidate_blocks[begin:end]
+        tile_slots = None if slots is None else slots[begin:end]
         if sparse:
-            logits, ends, normalized = _sparse_candidate_scores(
+            # Each tile's picks finish straight into out (and slots) in one
+            # kernel, which folds in the candidate mask: it takes a pool that
+            # fits topk (left unscored) whole, and every consumer reads only
+            # [0, end) of a scored row.
+            logits, ends, normalized = _sparse_candidate_logits(
                 packed,
                 weights[begin:end],
                 cache,
@@ -436,10 +448,13 @@ def index_topk(
                 index_metadata=index_metadata,
             )
             indices = _native_indices(logits, ends, topk)
-            selected = finish_selection(
-                indices, logits, ends, normalized, capacity, 8, True
+            finish_write_selection(
+                (indices, logits, ends, normalized, capacity, 8),
+                None,
+                tuple(tensor[begin:end] for tensor in out),
+                tile_slots,
+                True,
             )
-            write_selection(selected, None, tuple(tensor[begin:end] for tensor in out))
             continue
         if dense:
             visible = visible.clamp(0, capacity).to(torch.int32)
@@ -468,32 +483,69 @@ def index_topk(
                 end,
                 prepare_blocks,
             )
-        selected = (
-            _select_topk_prepared(logits, visible, topk)
-            if candidates is None
-            else select_topk(logits, visible, candidates, topk, 8)
-        )
-        chosen = None
-        if candidate_topk and prepared_blocks is None:
-            chosen = select_candidates(logits, visible, candidate_topk, 8)
-        elif prepared_blocks is not None:
-            block_scores, block_ends = prepared_blocks
-            block_indices = _native_indices(block_scores, block_ends, candidate_topk)
-            chosen = finish_selection(
-                block_indices,
-                block_scores,
-                block_ends,
-                None,
-                block_scores.shape[1],
-                8,
-                False,
-            )
-        write_selection(
-            selected,
-            chosen,
+        _finish_tile(
+            logits,
+            visible,
+            candidates,
+            topk,
+            candidate_topk,
+            prepared_blocks,
             tuple(tensor[begin:end] for tensor in out),
+            tile_slots,
         )
     return out
+
+
+def _finish_tile(
+    logits, visible, candidates, topk, candidate_topk, prepared_blocks, out, slots
+):
+    """Select a paged or dense tile and finish it in one launch.
+
+    Runs the DeepSelect launches of _select_topk_prepared / select_topk and,
+    for a candidate source, select_candidates or the prepared block picks, in
+    the same order, then one finish_write_selection for the rows, the pool
+    and the requested slots instead of their finish, write and slot passes.
+    """
+    if candidates is None:
+        row_picks = _prepared_picks(logits, visible, topk)
+        block_size = 1
+    else:
+        row_picks = _topk_picks(logits, visible, candidates, topk, 8)
+        block_size = 8
+    if row_picks is None:
+        # Nothing is selectable: a score row without columns (then no block
+        # is either) or a Reindex pool without blocks (which sources none).
+        # Store what writing finish_selection's all -1 picks stores.
+        rows, lengths, blocks, block_lengths = out
+        rows.fill_(-1)
+        lengths.zero_()
+        blocks.fill_(-1)
+        block_lengths.zero_()
+        if slots is not None:
+            slots.out.fill_(-1)
+        return
+    pool_picks = None
+    if candidate_topk and prepared_blocks is None:
+        pool_picks = _candidate_picks(logits, visible, candidate_topk, 8)
+    elif prepared_blocks is not None:
+        block_scores, block_ends = prepared_blocks
+        pool_picks = (
+            _native_indices(block_scores, block_ends, candidate_topk),
+            block_scores,
+            block_ends,
+        )
+    if candidate_topk and pool_picks is None:
+        # No block is selectable (a score row without columns): an all -1
+        # pool, whose counts the kernel zeroes as for a pass without one.
+        out[2].fill_(-1)
+        out = (out[0], out[1], out[2][:, :0], out[3])
+    finish_write_selection(
+        (*row_picks, logits.shape[1], block_size),
+        pool_picks,
+        out,
+        slots,
+        False,
+    )
 
 
 # ---------------------------------------------------------------------------

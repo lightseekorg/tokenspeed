@@ -50,7 +50,11 @@ the block's ids, positions, HC mix and workspace addressing.
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.ops.attention.dsv41._inputs import IndexKeyInput, IndexQueryInput
+from tokenspeed_kernel.ops.attention.dsv41._inputs import (
+    IndexKeyInput,
+    IndexQueryInput,
+    SelectionSlots,
+)
 from tokenspeed_kernel.ops.attention.dsv41._metadata import index_logit_rows
 from tokenspeed_kernel.ops.attention.mla._triton.page_table import bounded_group_slots
 from tokenspeed_kernel.registry import KernelRegistry
@@ -60,6 +64,7 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 __all__ = [
     "IndexKeyInput",
     "IndexQueryInput",
+    "SelectionSlots",
     "decode_rows",
     "decode_window",
     "global_slots",
@@ -679,6 +684,7 @@ def index_topk(
     out: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None,
     solution: str | None,
     index_metadata: object | None = None,
+    slots: SelectionSlots | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Bounded Full/Reindex scoring, Top-K rows, and optional source candidates.
 
@@ -717,6 +723,10 @@ def index_topk(
             rows of one request. Table, lengths, request IDs and candidate contents must
             not change while sharing this object; graph replay refreshes the
             captured producers. A new invocation needs a fresh object.
+        slots: SelectionSlots covering the T query rows, or None (default)
+            for no slots. Its out then receives global_slots of the selected
+            row IDs. The Blackwell native selection resolves them in its
+            finishing kernel; other kernels run global_slots after selecting.
 
     Returns:
         (logical_row_ids, row_lengths, candidate_block_ids, candidate_lengths).
@@ -765,6 +775,10 @@ def index_topk(
     final tiles. Other page strides keep full scoring
     followed by candidate masking. The candidate selection semantics are the
     same; BF16 scores need not produce the FP32 path's exact Top-K at ties.
+    The Blackwell native selection finishes each tile in one kernel: the row
+    and candidate-block picks, their output tiles and the optional slots.
+    Native sparse Reindex skips the candidate mask; that kernel takes a pool
+    that fits topk whole, as the mask's equal scores did.
     """
     from tokenspeed_kernel.ops.attention.dsv41.deep_gemm import (
         is_hopper_indexer_available,
@@ -780,6 +794,8 @@ def index_topk(
     # Each target scores the index rows its own cache format stores: FP4 with
     # DeepSelect on Blackwell, FP8 with the CuTe DSL DeepSelect kernel on Hopper.
     query_values = index_q.values if isinstance(index_q, IndexQueryInput) else index_q
+    if slots is not None:
+        _validate_selection_slots(slots, query_values.shape[0], topk, page_table)
     row_bytes = index_cache.shape[2] if index_cache.ndim == 3 else 0
     shaped = (
         query_values.is_cuda
@@ -835,7 +851,7 @@ def index_topk(
             index_q.cos_sin_cache,
             index_q.weight_scale,
         )
-    return kernel(
+    args = (
         index_q,
         weights,
         index_cache,
@@ -851,6 +867,54 @@ def index_topk(
         out,
         index_metadata,
     )
+    if spec is not None and True in spec.traits.get("supports_selection_slots", ()):
+        return kernel(*args, slots)
+    result = kernel(*args)
+    if slots is not None:
+        # Kernels that take no slots select first; resolve the rows they wrote.
+        slots.out.copy_(
+            global_slots(
+                result[0],
+                slots.positions,
+                slots.requests,
+                slots.table,
+                slots.ratio,
+                slots.pages,
+            )
+        )
+    return result
+
+
+def _validate_selection_slots(slots, tokens, topk, page_table):
+    if not isinstance(slots, SelectionSlots):
+        raise TypeError("slots must be a SelectionSlots")
+    out = slots.out
+    if (
+        out.shape != (tokens, topk)
+        or out.dtype != torch.int32
+        or not out.is_contiguous()
+        or out.device != page_table.device
+    ):
+        raise ValueError(
+            "slots.out must be contiguous int32 [tokens, topk] on the table device"
+        )
+    for name, tensor in (("positions", slots.positions), ("requests", slots.requests)):
+        if (
+            tensor.shape != (tokens,)
+            or tensor.dtype not in (torch.int32, torch.int64)
+            or tensor.device != page_table.device
+        ):
+            raise ValueError(f"slots.{name} must be integer [tokens] on the device")
+    if (
+        slots.table.ndim != 2
+        or slots.table.dtype not in (torch.int32, torch.int64)
+        or slots.table.device != page_table.device
+        or slots.ratio < 1
+        or slots.pages < 0
+    ):
+        raise ValueError(
+            "slots needs an integer [requests, pages] table, ratio >= 1, pages >= 0"
+        )
 
 
 def _validate_rope(values, positions, cos_sin_cache):
