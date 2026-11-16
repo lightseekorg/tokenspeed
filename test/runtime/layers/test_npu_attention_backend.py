@@ -23,8 +23,9 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from transformers import Qwen3Config
 
-from tokenspeed.runtime.configs.model_config import AttentionArch
+from tokenspeed.runtime.configs.model_config import AttentionArch, ModelConfig
 from tokenspeed.runtime.layers import layernorm as layernorm_module
 from tokenspeed.runtime.layers.attention.backends.cache_metadata import (
     CacheBatchMetadata,
@@ -34,7 +35,10 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     CacheRuntimeContract,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroupSpec
-from tokenspeed.runtime.layers.attention.registry import _get_backend_cls
+from tokenspeed.runtime.layers.attention.registry import (
+    _get_backend_cls,
+    validate_npu_mtp_verify_width,
+)
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
@@ -79,8 +83,41 @@ def test_npu_reuses_standard_mha_backend():
     assert _get_backend_cls("mha", AttentionArch.MHA) is MHAAttnBackend
 
 
+@pytest.mark.skipif(not _NPU_AVAILABLE, reason="Ascend NPU is unavailable")
+@pytest.mark.parametrize("width", [5, 6])
+def test_npu_mtp_verify_width_uses_registered_mha_limits(tmp_path, width):
+    Qwen3Config(architectures=["Qwen3ForCausalLM"]).save_pretrained(tmp_path)
+    args = ServerArgs(
+        model=str(tmp_path),
+        device="npu",
+        attention_backend="mha",
+        sampling_backend="greedy",
+        disable_prefill_graph=True,
+        disable_pdl=True,
+        speculative_algorithm="MTP",
+        speculative_draft_model_path=str(tmp_path),
+        speculative_num_steps=width - 1,
+        speculative_num_draft_tokens=width,
+        max_num_seqs=1,
+    )
+    args.mapping.rank = 0
+    model = ModelConfig(
+        args.model,
+        server_args=args,
+        trust_remote_code=False,
+        dtype="bfloat16",
+        model_override_args=args.hf_overrides,
+    )
+
+    if width == 6:
+        with pytest.raises(ValueError, match="Unsupported NPU MHA verify width 6"):
+            validate_npu_mtp_verify_width(args, model)
+    else:
+        validate_npu_mtp_verify_width(args, model)
+    assert not torch.distributed.is_initialized()
+
+
 def test_npu_allreduce_rmsnorm_uses_device_process_group(monkeypatch):
-    norm = RMSNorm(4)
     x = torch.ones(1, 4)
     residual = torch.zeros_like(x)
     process_group = object()
@@ -108,6 +145,8 @@ def test_npu_allreduce_rmsnorm_uses_device_process_group(monkeypatch):
 
     monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
     monkeypatch.setattr(layernorm_module, "rmsnorm", reference_rmsnorm)
+    # RMSNorm binds its kernel when it is constructed.
+    norm = RMSNorm(4)
 
     output, output_residual, aux = norm.forward_with_allreduce_fusion(
         rank=0,

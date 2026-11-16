@@ -33,7 +33,11 @@ from tokenspeed.runtime.configs.utils import get_rope_theta
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.layernorm import RMSNorm
-from tokenspeed.runtime.layers.linear import QKVParallelLinear, RowParallelLinear
+from tokenspeed.runtime.layers.linear import (
+    MergedColumnParallelLinear,
+    QKVParallelLinear,
+    RowParallelLinear,
+)
 from tokenspeed.runtime.layers.mlp import GatedMLP, gated_activation
 from tokenspeed.runtime.layers.paged_attention import (
     PagedAttention,
@@ -41,6 +45,7 @@ from tokenspeed.runtime.layers.paged_attention import (
 )
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
+from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.models.base import (
     BaseCausalLM,
     BaseDecoderLayer,
@@ -206,6 +211,7 @@ class Qwen3Model(BaseTransformerModel):
 
 class Qwen3ForCausalLM(BaseCausalLM):
     model_cls = Qwen3Model
+    supports_acl_graph_discard = True
 
     def __init__(
         self,
@@ -231,6 +237,87 @@ class Qwen3ForCausalLM(BaseCausalLM):
             (".gate_up_proj.", ".gate_proj.", 0),
             (".gate_up_proj.", ".up_proj.", 1),
         ]
+
+    @property
+    def supports_weight_discard(self) -> bool:
+        # This contract covers the dense single-stage layout with full HF
+        # checkpoint tensors at each TP reader. Subclasses must opt in separately.
+        return (
+            type(self) is Qwen3ForCausalLM
+            and self.mapping.attn.tp_size == self.mapping.world_size
+            and self.mapping.attn.head_tp_size == self.mapping.attn.tp_size
+            and self.quant_config is None
+            and "Embedding" not in self.config.name_or_path
+            and all(
+                param.device.type == "npu" and param.dtype == torch.bfloat16
+                for param in self.parameters()
+            )
+        )
+
+    def required_weight_update_names(self) -> set[str]:
+        stacked = self.get_stacked_params_mapping()
+        names = set()
+        for name, _ in self.named_parameters():
+            sources = {
+                name.replace(fused, source)
+                for fused, source, _ in stacked
+                if fused in name
+            }
+            names.update(sources or {name})
+        return names
+
+    def weight_update_source_shapes(self) -> dict[str, tuple[int, ...]]:
+        # named_parameters deduplicates the LM head when it aliases the embedding.
+        stacked = self.get_stacked_params_mapping()
+        shapes = {}
+        for name, parameter in self.named_parameters():
+            module_name, _, attr = name.rpartition(".")
+            module = self.get_submodule(module_name)
+            shape = tuple(parameter.shape)
+            if isinstance(module, QKVParallelLinear):
+                for fused, source, shard in stacked:
+                    if fused in name:
+                        heads = (
+                            module.total_num_heads
+                            if shard == "q"
+                            else module.total_num_kv_heads
+                        )
+                        shapes[name.replace(fused, source)] = (
+                            heads * module.head_size,
+                            *shape[1:],
+                        )
+            elif isinstance(module, MergedColumnParallelLinear):
+                for fused, source, shard in stacked:
+                    if fused in name:
+                        shapes[name.replace(fused, source)] = (
+                            module.output_sizes[shard],
+                            *shape[1:],
+                        )
+            elif isinstance(module, RowParallelLinear) and attr == "weight":
+                shapes[name] = (shape[0], module.input_size)
+            elif isinstance(module, VocabParallelEmbedding) and attr == "weight":
+                shapes[name] = (module.org_vocab_size, *shape[1:])
+            else:
+                shapes[name] = shape
+        return shapes
+
+    def weight_discard_redundant_checkpoint_names(self) -> frozenset[str]:
+        # Some tied checkpoints also export the head. The canonical embedding
+        # key must still arrive and is the only writer of the shared storage.
+        return (
+            frozenset({"lm_head.weight"})
+            if self.lm_head is self.model.embed_tokens
+            else frozenset()
+        )
+
+    def weight_discard_preserved_tensors(self) -> tuple[torch.Tensor, ...]:
+        buffers = tuple(self.buffers())
+        rotary_tables = {
+            id(layer.self_attn.rotary_emb.cos_sin_cache) for layer in self.model.layers
+        }
+        if {id(buffer) for buffer in buffers} != rotary_tables:
+            raise ValueError("Qwen3 weight discard encountered unaudited buffers")
+        return buffers
 
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]], **kwargs: Any

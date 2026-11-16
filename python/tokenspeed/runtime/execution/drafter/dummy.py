@@ -31,6 +31,8 @@ from tokenspeed.runtime.execution.drafter.base import BaseDrafter
 class DummyDrafter(BaseDrafter):
     """Generate a repeatable candidate window without draft weights or cache."""
 
+    supports_ascend_memory_saver = True
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         if self.spec_num_tokens <= 1:

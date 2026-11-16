@@ -78,7 +78,9 @@ class _Holder:
 def _executor(monkeypatch, log, *, with_draft: bool):
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.device = "cuda"
-    executor.memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
+    executor.memory_saver_adapter = TorchMemorySaverAdapter.create(
+        enable=False, device="cpu"
+    )
     executor.config = SimpleNamespace(
         spec_algo=None,
         enforce_eager=False,

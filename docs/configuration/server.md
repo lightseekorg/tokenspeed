@@ -341,6 +341,7 @@ restores whatever is released:
 | `kv_cache` | the cache arena's device regions | zeroed; a PD engine registers it with the transfer engine again |
 | `weights` | model and draft parameters, persistent attention/runtime buffers and shared workspaces | parameters use CPU backup or remain invalid until a complete update; frozen drafts and attention/runtime buffers retain CPU backup |
 | `cuda_graph` | the decode CUDA graphs' memory pool | discarded; replays rewrite it |
+| `acl_graph` | Ascend decode graph private pools | see [Ascend Memory Saver](../serving/ascend-memory-saver.md) for eligibility, dependencies and wake order |
 | `nccl` | NCCL communicator buffers (`ProcessGroupNCCL.suspend`); requires a PyTorch build with suspend support and NCCL 2.29.7 or later | resumed in place |
 
 A release waits until the scheduler is drained, and on a disaggregated

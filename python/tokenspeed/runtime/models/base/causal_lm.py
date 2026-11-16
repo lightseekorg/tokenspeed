@@ -171,6 +171,9 @@ class BaseCausalLM(nn.Module):
     # Opt in only when complete checkpoint loading and non-parameter state
     # restoration are both defined for this model.
     supports_weight_discard: ClassVar[bool] = False
+    # Decode capture may discard its private pool only when persistent state
+    # is allocated outside capture and each replay produces its own scratch.
+    supports_acl_graph_discard: ClassVar[bool] = False
     # Opt in only when ``self.model`` returns the taps ``layers_to_capture`` names (EAGLE3, DFLASH).
     supports_aux_capture: ClassVar[bool] = False
 
@@ -209,6 +212,9 @@ class BaseCausalLM(nn.Module):
     # above. Complete sessions require each source exactly once.
     _weight_update_required_names: set[str] | None = None
     _weight_update_source_names: set[str] | None = None
+    _weight_update_source_shapes: dict[str, tuple[int, ...]] | None = None
+    _weight_update_redundant_names: frozenset[str] = frozenset()
+    _weight_update_source_device: torch.device | None = None
     _weight_update_load_failed: bool = False
     _weight_update_load_depth: int = 0
 
@@ -241,6 +247,9 @@ class BaseCausalLM(nn.Module):
         self._weight_update_non_unit_kv_scales = None
         self._weight_update_required_names = None
         self._weight_update_source_names = None
+        self._weight_update_source_shapes = None
+        self._weight_update_redundant_names = frozenset()
+        self._weight_update_source_device = None
         self._weight_update_load_failed = False
         self._weight_update_load_depth = 0
 
@@ -546,14 +555,25 @@ class BaseCausalLM(nn.Module):
             f"{type(self).__name__} does not support weight discard"
         )
 
+    def weight_discard_redundant_checkpoint_names(self) -> frozenset[str]:
+        """Optional aliases that the complete loader ignores without writing."""
+        return frozenset()
+
+    def weight_update_source_shapes(self) -> dict[str, tuple[int, ...]]:
+        """Checkpoint tensor geometry before local sharding or fusion."""
+        return {}
+
     def _record_weight_update_sources(
         self, weights: Iterable[tuple[str, torch.Tensor]]
     ) -> Iterable[tuple[str, torch.Tensor]]:
         required = self._weight_update_required_names
         received = self._weight_update_source_names
         assert required is not None and received is not None
+        redundant = self._weight_update_redundant_names
+        shapes = self._weight_update_source_shapes
+        device = self._weight_update_source_device
         for name, tensor in weights:
-            if name not in required:
+            if name not in required and name not in redundant:
                 raise ValueError(
                     f"{type(self).__name__}: unexpected checkpoint weight {name!r}"
                 )
@@ -562,6 +582,23 @@ class BaseCausalLM(nn.Module):
                     f"{type(self).__name__}: duplicate checkpoint weight {name!r}"
                 )
             received.add(name)
+            if name in redundant:
+                continue
+            if (
+                device is not None
+                and tensor.device.type != "cpu"
+                and tensor.device != device
+            ):
+                raise ValueError(
+                    f"Checkpoint weight {name!r} arrived on {tensor.device}; "
+                    f"expected CPU or {device}"
+                )
+            shape = shapes.get(name) if shapes is not None else None
+            if shape is not None and tensor.shape != shape:
+                raise ValueError(
+                    f"Checkpoint weight {name!r} has shape {tuple(tensor.shape)}; "
+                    f"expected checkpoint shape {shape} before TP slicing"
+                )
             yield name, tensor
 
     def _validate_weight_update_complete(self) -> None:
@@ -595,6 +632,9 @@ class BaseCausalLM(nn.Module):
         self._weight_update_non_unit_kv_scales = []
         self._weight_update_required_names = None
         self._weight_update_source_names = None
+        self._weight_update_source_shapes = None
+        self._weight_update_redundant_names = frozenset()
+        self._weight_update_source_device = None
         self._weight_update_load_failed = False
         self._weight_update_load_depth = 0
 
@@ -647,6 +687,9 @@ class BaseCausalLM(nn.Module):
         self._weight_update_non_unit_kv_scales = None
         self._weight_update_required_names = None
         self._weight_update_source_names = None
+        self._weight_update_source_shapes = None
+        self._weight_update_redundant_names = frozenset()
+        self._weight_update_source_device = None
         self._weight_update_load_failed = False
         self._weight_update_load_depth = 0
 
@@ -696,5 +739,7 @@ class BaseCausalLM(nn.Module):
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
 
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        if embed.device.type in ("cuda", "npu"):
+            device_module = torch.get_device_module(embed.device)
+            device_module.empty_cache()
+            device_module.synchronize()

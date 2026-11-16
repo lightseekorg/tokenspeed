@@ -993,8 +993,13 @@ fn finish_serving(
 
 /// Run one rank on the calling (main) thread and exit without Python finalization.
 #[pyfunction]
-fn run_host(py: Python<'_>, control_fd: i32, enable_async_logging: bool) -> PyResult<()> {
-    py.detach(|| {
+fn run_host(
+    py: Python<'_>,
+    control_fd: i32,
+    enable_async_logging: bool,
+    restore_gil_for_exit: bool,
+) -> PyResult<()> {
+    let code = py.detach(|| {
         let args = Args {
             control_fd,
             enable_async_logging,
@@ -1019,8 +1024,14 @@ fn run_host(py: Python<'_>, control_fd: i32, enable_async_logging: bool) -> PyRe
         // process::exit skips Rust drops and Python finalization. Drain native
         // logging explicitly; stuck Python threads must not keep a rank alive.
         drop(log_guard);
-        std::process::exit(code)
-    })
+        if !restore_gil_for_exit {
+            std::process::exit(code);
+        }
+        code
+    });
+    // Returning through detach restores the calling Python thread's saved
+    // state and GIL before native Ascend exit handlers can release objects.
+    std::process::exit(code)
 }
 
 /// The rank's native control loop and its single scheduler implementation.

@@ -383,6 +383,48 @@ def test_spawned_host_inherits_environment_from_start_context(
         proc.join(timeout=10)
 
 
+@pytest.mark.parametrize("device", ["cuda", "npu"])
+def test_only_the_npu_launcher_requests_gil_restoration(tmp_path, device):
+    binary = _fake_host(
+        tmp_path,
+        """
+        connection.recv()
+        connection.send({"status": "ready", "args": sys.argv[1:]})
+        time.sleep(600)
+        """,
+    )
+    server_args = ServerArgs(
+        model="x",
+        device=device,
+        disable_prefill_graph=device == "npu",
+        disable_pdl=device == "npu",
+    )
+    server_args.mapping.rank = 0
+    port_args = PortArgs.init_new(server_args)
+    proc, reader = start_rust_host(
+        binary, server_args, port_args, nullcontext(), None, False
+    )
+    try:
+        (ready,) = receive_ready_messages([reader], [proc])
+        args = ready["args"]
+        expected = [
+            "--python",
+            sys.executable,
+            "--control-fd",
+            args[3],
+            "--enable-async-logging",
+            str(server_args.enable_async_logging).lower(),
+        ]
+        assert int(args[3]) >= 0
+        if device == "npu":
+            expected.extend(["--restore-gil-for-exit", "true"])
+        assert args == expected
+    finally:
+        reader.close()
+        proc.terminate()
+        proc.join(timeout=10)
+
+
 @pytest.mark.parametrize(
     "inherited_preload, configured_preload",
     [pytest.param(*case[1:], id=case[0]) for case in conflicting_preload_cases()],

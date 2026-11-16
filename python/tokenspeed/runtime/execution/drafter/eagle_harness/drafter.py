@@ -136,6 +136,8 @@ class Eagle4(Eagle):
     """The EAGLE drafter over EAGLE-4's candidate head, whose logits columns
     are each row's candidate tokens, drafting trees on ``Eagle4TreeLanes``."""
 
+    supports_ascend_memory_saver = False
+
     @override
     def _make_tree_lanes(self, config: TreeSpecConfig, max_bs: int) -> Eagle4TreeLanes:
         draft_config = self.draft_model_runner.model.config

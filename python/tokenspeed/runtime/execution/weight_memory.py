@@ -65,6 +65,13 @@ def _storage(tensor: torch.Tensor) -> tuple:
     return tensor.device, tensor.untyped_storage().data_ptr()
 
 
+def parameter_layout(model: nn.Module) -> dict[str, tuple]:
+    return {
+        name: _layout(value)
+        for name, value in model.named_parameters(remove_duplicate=False)
+    }
+
+
 @dataclass(frozen=True)
 class PreservedTensor:
     tensor: torch.Tensor
@@ -137,12 +144,7 @@ class WeightMemoryState:
             # Fail at startup if the model cannot describe a complete replacement.
             if not isinstance(model.required_weight_update_names(), set):
                 raise TypeError("Required checkpoint names must be a set")
-            self.parameter_layouts.append(
-                {
-                    name: _layout(value)
-                    for name, value in model.named_parameters(remove_duplicate=False)
-                }
-            )
+            self.parameter_layouts.append(parameter_layout(model))
             for tensor in model.weight_discard_preserved_tensors():
                 if not isinstance(tensor, torch.Tensor):
                     raise TypeError("Preserved model state must contain only tensors")
@@ -258,11 +260,7 @@ class WeightMemoryState:
             return
         try:
             for model, expected in zip(self.models, self.parameter_layouts):
-                actual = {
-                    name: _layout(value)
-                    for name, value in model.named_parameters(remove_duplicate=False)
-                }
-                if actual != expected:
+                if parameter_layout(model) != expected:
                     raise RuntimeError(
                         "Weight update changed captured parameter storage"
                     )

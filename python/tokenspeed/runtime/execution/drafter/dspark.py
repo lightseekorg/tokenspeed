@@ -44,6 +44,7 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
 from tokenspeed.runtime.models.dspark import VanillaMarkov
 from tokenspeed.runtime.utils import get_colorful_logger
+from tokenspeed.runtime.utils.device_stream import is_current_stream_capturing
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 logger = get_colorful_logger(__name__)
@@ -55,6 +56,7 @@ class DSpark(DFlash):
     sample_from_anchor = True
     spec_algorithm = "DSPARK"
     supports_speculative_sampling = True
+    supports_ascend_memory_saver = True
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -162,7 +164,7 @@ class DSpark(DFlash):
         """
         if self._markov_argmax_resolved:
             return self._markov_argmax_workspace
-        if torch.cuda.is_current_stream_capturing():
+        if is_current_stream_capturing(block_logits.device):
             return None  # allocation and compilation belong to warmup
         head = self.lm_head
         state = self._ensure_dist_argmax_state(head.weight.dtype, head.weight.device)

@@ -474,6 +474,27 @@ class MHAAttnBackend(PagedAttentionBackend):
     # Forward
     # ------------------------------------------------------------------
 
+    def _decode_kernel_solution(self) -> str | None:
+        """Return a pinned solution or None for normal registry selection.
+
+        Automatic native Ascend draft MHA uses Triton for ACL capture and its
+        warmup. FIA's host lengths are set before replay, while Triton reads
+        the draft lengths computed on device inside the graph. Eager forwards
+        and explicit native selections follow the configured solution. MHA
+        subclasses retain their existing Ascend draft selection.
+        """
+        if not self.is_draft or self.device.split(":", 1)[0] != "npu":
+            return self.kernel_solution
+        if type(self) is not MHAAttnBackend:
+            # Subclasses can share this decode entry with their own routing.
+            return "triton"
+        if self.kernel_solution is not None:
+            return self.kernel_solution
+
+        from tokenspeed.runtime.execution.forward_step import is_acl_graph_forward
+
+        return "triton" if is_acl_graph_forward() else None
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -534,7 +555,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             max_seqlen_k=self.max_context_len,
             max_seqlen_q=max_seqlen_q,
             schedule=schedule,
-            solution=self.kernel_solution,
+            solution=self._decode_kernel_solution(),
             **scale_kwargs,
         )
         return output.reshape(-1, layer.tp_q_head_num * layer.v_head_dim)
