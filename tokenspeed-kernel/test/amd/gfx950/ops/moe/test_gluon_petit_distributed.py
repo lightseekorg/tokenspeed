@@ -391,7 +391,8 @@ _WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "1"))
 def test_distributed_petit_reference(profile_name):
     profile = _PROFILES[profile_name]
     if _WORLD_SIZE not in profile.world_sizes:
-        pytest.skip(f"{profile_name} is registered for EP{profile.world_sizes} only")
+        sizes = "/".join(map(str, profile.world_sizes))
+        pytest.skip(f"{profile_name} is registered for EP{sizes} only")
     expected_root = os.environ.get("PETIT_EXPECTED_RUNTIME_ROOT")
     if expected_root is not None:
         assert (
@@ -413,9 +414,13 @@ def test_distributed_petit_reference(profile_name):
     output_dir = os.environ.get("PETIT_OUTPUT_DIR")
     # Exercise empty source ranks, padding/tile boundaries and capacity, then
     # refresh both hidden states and destinations within the same captured graph.
+    # Petit picks its producer geometry per rank from the token count; for the
+    # DSpark draft it switches at 12 and 24 tokens. EP4 keeps the empty and
+    # single-token ranks and starts one rank at each switch, so one call still
+    # mixes all three geometries, as the EP8 counts do.
     for case, counts in (
         ("balanced", [16] * ws),
-        ("uneven", [0, 1, 15, 16, 31, 32, 63, 64][:: 8 // ws]),
+        ("uneven", {8: [0, 1, 15, 16, 31, 32, 63, 64], 4: [0, 1, 12, 24]}[ws]),
         ("partial_scales", [256] * ws),
         ("capacity", [1024] + [1] * (ws - 1)),
     ):
