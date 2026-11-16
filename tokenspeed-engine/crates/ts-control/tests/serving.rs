@@ -5396,7 +5396,7 @@ fn a_drain_cancels_the_requests_still_receiving_their_embeddings() {
             no_reaction,
         );
         let rank = &ranks[0];
-        assert_eq!(rank.outcome, Ok(()));
+        assert_eq!(rank.outcome, Ok(()), "{tag}");
         assert_eq!(
             outcome(rank.replies.clone()),
             [(tag, true), (undo_tag, true)]
@@ -5421,7 +5421,7 @@ fn a_drain_cancels_the_requests_still_receiving_their_embeddings() {
             .filter(|output| output.rid == "img-1")
             .flat_map(|output| output.output_ids.iter().copied())
             .collect();
-        assert_eq!(recovered, [1000, 1001, 1002]);
+        assert_eq!(recovered, [1000, 1001, 1002], "{tag}");
     }
 }
 
