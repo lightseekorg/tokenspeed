@@ -1757,6 +1757,10 @@ class DFlash(BaseDrafter):
         if self.target_model is None:
             raise RuntimeError("DFLASH drafter is not bound to a target model.")
 
+        if self.draft_sampler is not None:
+            self.draft_sampler.prepare_round(
+                accept_lengths, num_extends=base_ctx.num_extends
+            )
         if base_ctx.target_capture_sink is self and not self._context_written:
             raise RuntimeError(
                 "DFLASH armed the capture sink, but the target never handed "

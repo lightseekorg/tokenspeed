@@ -119,9 +119,12 @@ numerics.mode                       --numerics {auto, rl-bitwise}
 │                                   draw moves with its co-batch (T>0
 │                                   'packed' fails while 'rerun' passes).
 │                                   N=1 verify uses the same pool sampler.
-│                                   Multi-token verify keeps flashinfer's
-│                                   per-slot coins; its cache/scheduling
-│                                   invariance is not established here.
+│                                   FlashInfer chain verify keys uniform
+│                                   coins by the request seed, the first
+│                                   absolute position of this verify round,
+│                                   and the draw's purpose and index. The
+│                                   final draw uses a separate coin from
+│                                   the candidate acceptance decisions.
 │                                   Greedy rows additionally take
 │                                   the canonical lowest-index argmax, in
 │                                   sampling and in speculative verify
@@ -133,11 +136,10 @@ numerics.mode                       --numerics {auto, rl-bitwise}
 │                                   Under --enable-speculative-sampling the
 │                                   draft proposal is one more per-request
 │                                   stream: Gumbel-max noise keyed by the
-│                                   request's seed and a salted (position,
-│                                   step) offset (never the batch row), the
-│                                   verify coins stay per-slot, and greedy
-│                                   rows keep the canonical argmax with a
-│                                   one-hot q, so their verify is unchanged
+│                                   request's seed, the committed frontier
+│                                   after the round, and the draft step.
+│                                   Greedy rows keep the canonical argmax
+│                                   with a one-hot q.
 ├── invariance.batch                per-row-independent reductions
 │   ├── no split-KV attention       decode kernels whose split count scales
 │   │                               with batch/SM occupancy are excluded by
@@ -671,6 +673,16 @@ base model and speculative decoding each, greedy and at `temperature=1.0`
 with fixed seeds (the T>0 case is what `sampling_stream=per-request` exists
 for). A deployment that passes may advertise the contract; one that fails it
 has a bug, not a tolerance.
+
+For chain MTP, compare a fixed draft configuration with itself. The same
+verify round has the same draws when its first position, logits, candidates,
+and any recorded draft probabilities agree. Check both deterministic proposals
+and sampled proposals, and confirm that the latter actually use recorded `q`
+and accept draft tokens. Use the native sampling calibration with fresh
+per-request seeds to check the distribution of all final tokens, including
+accepted drafts, rejection replacements, and bonus tokens. A change to the
+draft model or verify width can change a fixed seed's trajectory while
+preserving the target distribution.
 
 Trainer alignment is earned against a second program, so its harness has a
 reference the engine does not produce: a **trainer dump**. For a fixed prompt
