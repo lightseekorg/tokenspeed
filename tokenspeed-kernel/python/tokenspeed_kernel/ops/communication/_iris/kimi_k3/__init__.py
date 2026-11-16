@@ -57,7 +57,8 @@ _K3_LATENT_GEMM_NUM_WARPS = 2
 # One-shot Lamport window (it also sums MoE top-k slots) and latent gather row limits.
 _K3_LAMPORT_MAX_ROWS = 7
 _K3_LATENT_GATHER_MAX_ROWS = K3_FUSED_DECODE_MAX_ROWS
-# Past 16 rows the gather and a separate routing launch are faster.
+# The latent gather routes up to this many rows; wider batches take the separate
+# routing launch.
 _K3_LATENT_ROUTED_MAX_ROWS = 16
 # The FP8 scale rendezvous spans its slots with gl.arange, so a power of two.
 _K3_LATENT_SYNC_ROWS = 1 << (_K3_LATENT_GATHER_MAX_ROWS - 1).bit_length()

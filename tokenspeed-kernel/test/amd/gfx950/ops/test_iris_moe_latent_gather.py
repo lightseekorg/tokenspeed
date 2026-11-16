@@ -422,8 +422,6 @@ def _check_latent_gather_routed(
             torch.where(real, sorted_weights[:padded], 0.0),
         )
 
-    mismatches = {"weights": 0, "shared": 0}
-
     def check(got, want, label):
         router, routed, fp8, routes, shared = got
         want_router, want_routed, want_fp8, want_routes, want_shared = want
@@ -437,11 +435,9 @@ def _check_latent_gather_routed(
             assert torch.equal(a, b), label
         torch.testing.assert_close(routes[0], want_routes[0], rtol=2e-7, atol=0)
         torch.testing.assert_close(got_sort[3], want_sort[3], rtol=2e-7, atol=0)
-        mismatches["weights"] += int((bits(routes[0]) != bits(want_routes[0])).sum())
         torch.testing.assert_close(
             shared.float(), want_shared.float(), rtol=1e-2, atol=1e-2
         )
-        mismatches["shared"] += int((bits(shared) != bits(want_shared)).sum())
 
     hidden_rows = {}
 
@@ -533,8 +529,6 @@ def _check_latent_gather_routed(
                 (router, routed, fp8, routes, rest[-1]), want, f"replay layer {layer}"
             )
     dist.barrier(group=group, device_ids=[rank])
-    if rank == 0:
-        print(f"bit mismatches vs separate routing: {mismatches}", flush=True)
 
 
 @pytest.mark.skipif(
