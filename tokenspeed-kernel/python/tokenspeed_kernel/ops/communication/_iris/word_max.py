@@ -22,7 +22,7 @@
 
 import torch
 from tokenspeed_kernel._triton import gl, gluon
-from tokenspeed_kernel.ops.communication._iris import IrisGroup
+from tokenspeed_kernel.ops.communication._iris import IrisGroup, allocation_bytes
 from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     _iris_peer_pointers,
     _iris_subgroup_any,
@@ -54,6 +54,10 @@ class LamportWordMax:
     def supported(world_size: int) -> bool:
         """Whether the kernel serves a group of ``world_size`` ranks."""
         return current_platform().is_cdna4 and world_size in (4, 8)
+
+    @staticmethod
+    def heap_bytes(max_rows: int, world_size: int) -> int:
+        return allocation_bytes((2, world_size, max_rows, 4), torch.uint32)
 
     def __init__(self, peers: IrisGroup, max_rows: int):
         if not self.supported(peers.world_size) or not (1 <= max_rows <= self.MAX_ROWS):

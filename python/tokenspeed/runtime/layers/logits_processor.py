@@ -317,9 +317,6 @@ class LogitsProcessor(nn.Module):
     _LOGITS_AG_STATES = {}
 
     _LOGITS_DIST_ARGMAX_MAX_TOKENS = 8192
-    # Most rows the packed-key path reduces through the group's word MAX;
-    # more (a prefill's rows) keep the all-reduce.
-    _LOGITS_WORD_MAX_ROWS = 1024
     _LOGITS_DIST_ARGMAX_UNINITIALIZED = object()
     _LOGITS_DIST_ARGMAX_STATES = {}
     # Prepare every dtype supported by the fused kernel; quantized weight
@@ -760,10 +757,6 @@ class LogitsProcessor(nn.Module):
                 dtype=logits_dtype,
             )
         if state is None and not is_current_stream_capturing(lm_head.weight.device):
-            # Collective, once per group; the speculative walks share it.
-            get_global_backend().prepare_word_max(
-                self.tp_group, self._LOGITS_WORD_MAX_ROWS
-            )
             state = VocabParallelArgmax(self.tp_group, self.tp_rank * vocab_per_rank)
         return state
 

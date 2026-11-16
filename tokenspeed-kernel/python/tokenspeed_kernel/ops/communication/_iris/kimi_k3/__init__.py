@@ -180,6 +180,7 @@ class K3IrisState:
         enable_lamport: bool,
         sharded_max_rows: int,
         pull_exchange_max_bytes: int = 0,
+        word_max_rows: int = 0,
     ):
         from tokenspeed_kernel.ops.communication._iris.all_reduce import ProducerLamport
         from tokenspeed_kernel.ops.communication._iris.kimi_k3.allreduce_sharded import (
@@ -191,6 +192,7 @@ class K3IrisState:
         from tokenspeed_kernel.ops.communication._iris.pull_exchange import (
             IrisPullExchange,
         )
+        from tokenspeed_kernel.ops.communication._iris.word_max import LamportWordMax
 
         self.all_reduce = all_reduce
         # K3.1's KVP decode gathers and records exchange, pulled in place.
@@ -198,6 +200,10 @@ class K3IrisState:
             IrisPullExchange(all_reduce.peers, pull_exchange_max_bytes)
             if pull_exchange_max_bytes
             else None
+        )
+        # The greedy argmax and DSpark walk's packed-key MAX.
+        self.word_max = (
+            LamportWordMax(all_reduce.peers, word_max_rows) if word_max_rows else None
         )
         self.enable_lamport = enable_lamport
         self.attnres = (
@@ -1142,6 +1148,7 @@ def prepare_k3_communication(
     device: torch.device,
     all_reduce: "IrisAllReduce | None",
     pull_exchange_max_bytes: int = 0,
+    word_max_rows: int = 0,
 ) -> K3IrisState:
     """Prepare a group's combined K3 buffers before graph capture.
 
@@ -1166,6 +1173,7 @@ def prepare_k3_communication(
     from tokenspeed_kernel.ops.communication._iris.pull_exchange import (
         IrisPullExchange,
     )
+    from tokenspeed_kernel.ops.communication._iris.word_max import LamportWordMax
     from tokenspeed_kernel.ops.communication.iris import IrisAllReduce
 
     world_size = group.size()
@@ -1177,6 +1185,7 @@ def prepare_k3_communication(
             attnres_max_rows,
             sharded_max_rows,
             pull_exchange_max_bytes,
+            word_max_rows,
         )
         < 0
     ):
@@ -1235,12 +1244,16 @@ def prepare_k3_communication(
         if pull_exchange_max_bytes
         else 0
     )
+    word_max_bytes = (
+        LamportWordMax.heap_bytes(word_max_rows, world_size) if word_max_rows else 0
+    )
     # Preserve the base heap's headroom for other collective operations.
     ctx = get_or_create_context(
         heap_size=max(MIN_HEAP_BYTES, total_bytes + HEAP_HEADROOM_BYTES)
         + sharded_bytes
         + pull_exchange_bytes
-        + attnres_lamport_bytes,
+        + attnres_lamport_bytes
+        + word_max_bytes,
     )
     if all_reduce is None:
         all_reduce = IrisAllReduce(
@@ -1256,6 +1269,7 @@ def prepare_k3_communication(
         enable_lamport=enable_lamport,
         sharded_max_rows=sharded_max_rows,
         pull_exchange_max_bytes=pull_exchange_max_bytes,
+        word_max_rows=word_max_rows,
     )
     all_reduce.peers.finish_prepare()
     return state

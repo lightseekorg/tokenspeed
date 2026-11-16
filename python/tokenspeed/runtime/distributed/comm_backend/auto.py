@@ -380,12 +380,6 @@ class AutoBackend(CommBackend):
             return False
         return self._iris.broadcast_from_first_rank(tensor, group)
 
-    def prepare_word_max(self, group: Group, max_rows: int) -> bool:
-        # The mailboxes ride the heap of the group's prepared Iris all-reduce.
-        if not self.can_prepare_all_reduce_buffers(group, torch.bfloat16):
-            return False
-        return self._iris.prepare_word_max(group, max_rows)
-
     def try_word_max(self, words: torch.Tensor, group: Group) -> bool:
         return self._iris.try_word_max(words, group)
 

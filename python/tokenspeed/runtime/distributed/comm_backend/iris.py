@@ -174,22 +174,12 @@ class IrisBackend(CommBackend):
         state.run(tensor)
         return True
 
-    def prepare_word_max(self, group: Group, max_rows: int) -> bool:
-        """Prepare the group's word MAX on its prepared all-reduce's heap."""
-        prepared = self._word_maxes.get(group)
-        if prepared is not None:
-            # Growing would move mailboxes that captured graphs hold.
-            return prepared.max_rows >= max_rows
-        from tokenspeed_kernel.ops.communication.iris import (
-            iris_lamport_word_max_supported,
-            prepare_iris_lamport_word_max,
-        )
-
-        all_reduce = self.state(group, torch.bfloat16)
-        if all_reduce is None or not iris_lamport_word_max_supported(len(group)):
-            return False
-        self._word_maxes[group] = prepare_iris_lamport_word_max(all_reduce, max_rows)
-        return True
+    def install_word_max(self, group: Group, state: "LamportWordMax") -> None:
+        """Bind a prepared word MAX without replacing captured mailboxes."""
+        previous = self._word_maxes.get(group)
+        if previous is not None and previous is not state:
+            raise RuntimeError("cannot replace a prepared Iris word max")
+        self._word_maxes[group] = state
 
     def try_word_max(self, words: torch.Tensor, group: Group) -> bool:
         state = self._word_maxes.get(group)
