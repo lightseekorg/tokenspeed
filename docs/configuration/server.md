@@ -1093,14 +1093,12 @@ it needs on the prefill server before its Decode server allocates its
 destination, so neither holds pages the other waits for. The Decode server
 announces each request to the prefill server. The prefill server admits a
 request once it is announced, and tells the Decode server when the request's
-last chunk is admitted; only then may the Decode server allocate. On the
-Decode server a noticed request is passed by later ones at most 8 times before
-no new request is shown to the scheduler, and at most 8 noticed requests are
-shown at once; only the requests of prefill servers that run `independent`
-count, so on a Decode server that also serves `early` prefill servers their
-requests pass a noticed one without limit. Every Decode server of a prefill
-server that runs `independent` must understand the announcement: an older one
-sends its manifest unannounced and fails each request at once.
+last chunk is admitted; only then may the Decode server allocate. The Decode
+server's scheduler sees every request whose notice arrived and chooses among
+them as it chooses among the requests of `early` prefill servers. Every Decode
+server of a prefill server that runs `independent` must understand the
+announcement: an older one sends its manifest unannounced and fails each
+request at once.
 
 `TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT` (120 s by default) bounds what a
 request waits for from its Decode server on the prefill server. A request its
@@ -1124,13 +1122,13 @@ the prefill server while it is queued or computed: its Decode server's waiting
 timeout ends it, and if that server is gone, it fails one timeout after it was
 computed. A computed prompt waiting for its destination publishes its last
 chunk to the prefix cache only with its transfer, so a prompt with the same
-prefix admitted meanwhile computes that chunk again. On a Decode rank, once
-the oldest noticed request was passed 8 times no new request is shown to the
-scheduler until that one is allocated or the prefill server times it out. If a
-prefill server stops after its notice, the Decode server fails the request at
-its waiting timeout; pages it had already allocated go back only when the
-prefill ranks acknowledge the cancellation, which a dead prefill process never
-does, as under `early`.
+prefix admitted meanwhile computes that chunk again. On a Decode server that
+is full, later smaller requests can be allocated ahead of a larger one, whose
+prompt keeps its pages on the prefill server until it is allocated or one of
+the two timeouts fails it. If a prefill server stops after its notice, the
+Decode server fails the request at its waiting timeout; pages it had already
+allocated go back only when the prefill ranks acknowledge the cancellation,
+which a dead prefill process never does, as under `early`.
 
 ## Observability
 
@@ -1303,8 +1301,7 @@ prefill peer is working, this rank already holds their destination pages, and
 nothing here is schedulable until the bootstrap token arrives.
 `tokenspeed:num_decode_prealloc_queue_reqs` counts the earlier wait for the peer
 to connect; when the prefill server allocates independently it also counts
-the requests waiting for that server's notice (its queueing and computation)
-and those noticed but not yet shown to the scheduler.
+the requests waiting for that server's notice (its queueing and computation).
 `tokenspeed:num_decode_transfer_queue_reqs` counts requests whose
 pages a transfer still pins, including requests that already ended (aborted or
 failed) and are only waiting for the transport to report stopped; it is a

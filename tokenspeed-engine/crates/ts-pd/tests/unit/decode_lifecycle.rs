@@ -312,76 +312,37 @@ fn an_announced_room_times_out_from_registration_and_again_from_its_notice() {
 }
 
 #[test]
-fn a_noticed_request_is_passed_a_bounded_number_of_times() {
+fn every_noticed_request_is_shown_to_the_scheduler() {
     let native = NativeLibrary::new();
     let (mut peer, _outbox, mut mesh, group) =
         setup(&native, Duration::from_secs(60), Duration::from_secs(60));
     let (_prefill, _received, server) = prefill_node(Some("independent"));
-    // Requests r<first>..r<last> arrive, connect, and are noticed in order;
-    // returns what the scheduler is shown.
-    let arrive = |peer: &mut DecodePeer, mesh: &mut Mesh, rooms: std::ops::Range<u64>| {
-        let mut shown = Vec::new();
-        for room in rooms.clone() {
-            peer.register(&format!("r{room}"), &bootstrap(server.port(), room))
-                .unwrap();
-        }
-        until(|| {
-            shown.extend(peer.poll(mesh, &group).unwrap());
-            let state = peer.shared.state();
-            rooms
-                .clone()
-                .all(|room| state.rooms.get(room) == Some(TransferPoll::Bootstrapped))
-        });
-        for room in rooms {
-            peer.shared
-                .state()
-                .apply(StatusMessage::bare(room, TransferPoll::Bootstrapped, 0));
-            shown.extend(peer.poll(mesh, &group).unwrap());
-        }
-        shown
-    };
-    let shown = |rooms: &[u64]| -> Vec<PdEvent> {
-        rooms
-            .iter()
-            .map(|room| PdEvent::Bootstrapped(format!("r{room}")))
-            .collect()
-    };
-    // The scheduler sees the eight oldest.
+    // Twelve requests arrive and connect; the scheduler sees none of them
+    // before its notice.
+    let mut shown = Vec::new();
+    for room in 0..12 {
+        peer.register(&format!("r{room}"), &bootstrap(server.port(), room))
+            .unwrap();
+    }
+    until(|| {
+        shown.extend(peer.poll(&mut mesh, &group).unwrap());
+        let state = peer.shared.state();
+        (0..12).all(|room| state.rooms.get(room) == Some(TransferPoll::Bootstrapped))
+    });
+    assert_eq!(shown, []);
+    // Their notices arrive: the scheduler sees every one, whatever it has
+    // allocated, and chooses among them.
+    for room in 0..12 {
+        peer.shared
+            .state()
+            .apply(StatusMessage::bare(room, TransferPoll::Bootstrapped, 0));
+    }
     assert_eq!(
-        arrive(&mut peer, &mut mesh, 0..12),
-        shown(&[0, 1, 2, 3, 4, 5, 6, 7])
+        peer.poll(&mut mesh, &group).unwrap(),
+        (0..12)
+            .map(|room| PdEvent::Bootstrapped(format!("r{room}")))
+            .collect::<Vec<_>>()
     );
-    // It allocates others than the oldest (their manifests go out): each
-    // time one more is shown.
-    for (allocated, next) in [(1, 8), (2, 9), (3, 10), (4, 11)] {
-        peer.shared
-            .state()
-            .rooms
-            .update(allocated, TransferPoll::WaitingForInput);
-        assert_eq!(peer.poll(&mut mesh, &group).unwrap(), shown(&[next]));
-    }
-    assert_eq!(arrive(&mut peer, &mut mesh, 12..16), []);
-    for (allocated, next) in [(5, 12), (6, 13), (7, 14)] {
-        peer.shared
-            .state()
-            .rooms
-            .update(allocated, TransferPoll::WaitingForInput);
-        assert_eq!(peer.poll(&mut mesh, &group).unwrap(), shown(&[next]));
-    }
-    // r0 was passed eight times now: nothing new is shown until it is
-    // allocated, though the requests already shown may still go first.
-    for allocated in [8, 9] {
-        peer.shared
-            .state()
-            .rooms
-            .update(allocated, TransferPoll::WaitingForInput);
-        assert_eq!(peer.poll(&mut mesh, &group).unwrap(), []);
-    }
-    peer.shared
-        .state()
-        .rooms
-        .update(0, TransferPoll::WaitingForInput);
-    assert_eq!(peer.poll(&mut mesh, &group).unwrap(), shown(&[15]));
 }
 
 #[test]

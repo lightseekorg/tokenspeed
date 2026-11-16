@@ -1048,17 +1048,15 @@ reported connecting, and the notice is kept beside the room's state, not in
 it. The manifests then reach the prefill peer, which reports
 `DestinationReady`; a manifest for a room that was not announced, or whose
 request does not hold its pages yet, fails the room, so a decode rank that
-does not follow the order fails at once. The decode scheduler may allocate
-noticed requests out of order; the decode peer bounds it: a noticed request is
-passed by later ones at most 8 times before no new one is shown, and at most 8
-are shown unallocated; rooms of an `early` route are not counted. Timeouts: on
-the prefill side the bootstrap timeout bounds what a request waits for from
-its decode node. Not announced, it runs from registration. Admitted, it runs
-from the pages-held mark to the manifests, with none while the prompt is
-queued or computes: the decode node's waiting timeout bounds that wait. On the
-decode side the waiting timeout runs from registration to the notice,
-restarted at the notice. A request that fails on the prefill side tells its
-announcing ranks as well as those that pre-allocated.
+does not follow the order fails at once. The decode scheduler sees every
+noticed request and may allocate them in any order. Timeouts: on the prefill
+side the bootstrap timeout bounds what a request waits for from its decode
+node. Not announced, it runs from registration. Admitted, it runs from the
+pages-held mark to the manifests, with none while the prompt is queued or
+computes: the decode node's waiting timeout bounds that wait. On the decode
+side the waiting timeout runs from registration to the notice, restarted at
+the notice. A request that fails on the prefill side tells its announcing
+ranks as well as those that pre-allocated.
 A peer keeps state only
 for the rooms of requests the loop tracks (a sleep waits for those alone),
 with one exception on the prefill side: a room the decode node pre-allocated
