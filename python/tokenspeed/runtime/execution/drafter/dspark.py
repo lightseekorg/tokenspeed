@@ -18,7 +18,8 @@
 """Static DSpark drafter.
 
 Static Markov head and fixed verify window (verify-all). Greedy by default;
-explicit block rejection enables stochastic proposals through the shared sampler.
+--enable-speculative-sampling samples each Markov step through the shared
+sampler, on this rank's vocabulary shard when the sampled rows stay sharded.
 No confidence head / SPS-STS / ragged verify.
 """
 
