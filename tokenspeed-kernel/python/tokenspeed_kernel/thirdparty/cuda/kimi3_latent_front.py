@@ -32,7 +32,7 @@ like ``kimi3_router``.
 
 Scope: the prefill front route of one rank holding the full shared experts
 (``shared_gate_up_weight`` of ``2 * 6144`` rows) for 513 rows or more on
-148- and 152-SM SM100/SM103 parts. Rows of at most 512 would take programs
+SM100/SM103 parts. Rows of at most 512 would take programs
 that are not vendored (the decode front and the 224-wide tile); the
 sharded-shared-expert (TP8) programs are not vendored either. There is no
 upper row bound: the row count is a runtime argument, the plan rules scale
@@ -55,8 +55,6 @@ NUM_EXPERTS = 896
 SHARED_INTERMEDIATE = 6144
 #: Compute capabilities the programs are compiled for.
 SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
-#: Physical SM counts the plan rules were validated on: 148 (B200, B300) and 152 (GB200, GB300).
-QUALIFIED_SM_COUNTS = (148, 152)
 #: Smallest row count the vendored programs serve; see the module docstring.
 MIN_TOKENS = 513
 
@@ -196,7 +194,7 @@ def front_plan(M: int, sm_count: int) -> dict[str, Any]:
 
     Args:
         M: Row count, at least ``MIN_TOKENS``.
-        sm_count: SM count of the device, one of ``QUALIFIED_SM_COUNTS``.
+        sm_count: SM count of the device.
 
     Returns:
         A copy of the plan: the kernel arguments (``m_tiles``, ``num_items``, ``full_items``,
@@ -206,10 +204,6 @@ def front_plan(M: int, sm_count: int) -> dict[str, Any]:
     if int(M) < MIN_TOKENS:
         raise ValueError(
             f"the vendored Kimi-K3 front programs serve at least {MIN_TOKENS} rows, got {M}"
-        )
-    if int(sm_count) not in QUALIFIED_SM_COUNTS:
-        raise ValueError(
-            f"the Kimi-K3 front plan rules are validated for {QUALIFIED_SM_COUNTS} SMs, got {sm_count}"
         )
     return dict(_front_plan(int(M), int(sm_count)))
 
@@ -253,8 +247,8 @@ def available(device: torch.device | None = None) -> bool:
     if not torch.cuda.is_available():
         return False
     index = torch.cuda.current_device() if device is None else _device_index(device)
-    capability, count = _device_facts(index)
-    return capability in SUPPORTED_COMPUTE_CAPABILITIES and count in QUALIFIED_SM_COUNTS
+    capability, _ = _device_facts(index)
+    return capability in SUPPORTED_COMPUTE_CAPABILITIES
 
 
 @functools.cache
