@@ -64,6 +64,10 @@ import dataclasses
 import sys
 from datetime import timedelta
 from pathlib import Path
+from test.runtime.dsa_index_k_test_utils import (
+    assert_top_k_up_to_ties,
+    index_candidate_scores,
+)
 
 import pytest
 import torch
@@ -184,20 +188,14 @@ def _index_scorer(q, weights, plane, table, requests, causal, placement):
     """The FP32 index scores the selections rank, for chosen query rows.
 
     ``scorer(rows)`` scores ``rows`` against the unsharded ``plane`` with
-    the candidate leaf the selections use, keeping every visible token as a
-    candidate, so each token carries the score the selections saw, bit for
-    bit. It returns ``[rows, longest causal length]`` scores by logical
-    position, -inf past each row's causal length.
+    the candidate leaf the selections use (:func:`index_candidate_scores`).
     """
-    from tokenspeed_kernel.ops.attention.dsa import dsa_index_candidates
-
     from tokenspeed.runtime.layers.attention.dcp.indexer import _local_index_table
 
     local_table = _local_index_table(table, placement, _PAGE)
 
     def scorer(rows: torch.Tensor) -> torch.Tensor:
-        width = int(causal[rows].max().clamp_min(1))
-        positions, values = dsa_index_candidates(
+        return index_candidate_scores(
             q[rows].contiguous(),
             weights[rows].contiguous(),
             plane,
@@ -205,57 +203,11 @@ def _index_scorer(q, weights, plane, table, requests, causal, placement):
             requests[rows].contiguous(),
             causal[rows].contiguous(),
             page_size=_PAGE,
-            # A power of two no smaller than any row's visible tokens.
-            topk=1 << (width - 1).bit_length(),
             softmax_scale=0.1,
-            initial_tokens=0,
-            local_tokens=0,
-            solution=None,
+            q_scales=None,
         )
-        scores = values.new_full((rows.numel(), width + 1), -float("inf"))
-        # Invalid candidates (-1, -inf) land in the spare last column.
-        scores.scatter_(1, torch.where(positions >= 0, positions, width).long(), values)
-        return scores[:, :width]
 
     return scorer
-
-
-def _assert_top_k_up_to_ties(row, selections, length, scores):
-    """Both ``selections`` (one row's positions, padding -1) are exact top-k
-    selections of the row's ``length`` visible tokens under ``scores`` and
-    differ only in tokens that score the k-th score T bit for bit."""
-    visible = scores[:length]
-    k = min(length, _TOPK)
-    assert k > 0, f"row {row}: no visible tokens, yet the selections differ"
-    # The k-th score, as a one-element tensor to compare bit patterns.
-    threshold = visible.topk(k).values[-1:]
-    above = int((visible > threshold).sum())
-    chosen = []
-    for selection in selections:
-        positions = selection[selection >= 0].long()
-        count = positions.numel()
-        assert count == k, f"row {row}: {count} tokens selected, expected {k}"
-        assert positions.unique().numel() == k, f"row {row}: a token selected twice"
-        past = positions[positions >= length].tolist()
-        assert not past, f"row {row}: tokens {past[:8]} past causal length {length}"
-        picked = visible[positions]
-        below = positions[picked < threshold].tolist()
-        assert not below, (
-            f"row {row}: tokens {below[:8]} score below the k-th score "
-            f"{float(threshold).hex()}"
-        )
-        missed = above - int((picked > threshold).sum())
-        assert not missed, (
-            f"row {row}: {missed} tokens above the k-th score "
-            f"{float(threshold).hex()} not selected"
-        )
-        chosen.append(set(positions.tolist()))
-    differ = sorted(chosen[0] ^ chosen[1])
-    tied = visible[differ].view(torch.int32) == threshold.view(torch.int32)
-    assert bool(tied.all()), (
-        f"row {row}: tokens {differ[:8]} differ but do not all score the k-th "
-        f"score {float(threshold).hex()} exactly"
-    )
 
 
 def _assert_same_sets(actual, expected, causal, scorer=None):
@@ -285,8 +237,8 @@ def _assert_same_sets(actual, expected, causal, scorer=None):
     for start in range(0, differ.numel(), 16):
         rows = differ[start : start + 16]
         for row, scores in zip(rows.tolist(), scorer(rows), strict=True):
-            _assert_top_k_up_to_ties(
-                row, (mine[row], theirs[row]), int(causal[row]), scores
+            assert_top_k_up_to_ties(
+                row, (mine[row], theirs[row]), int(causal[row]), scores, _TOPK
             )
 
 
