@@ -45,10 +45,12 @@ from tokenspeed_kernel.ops.attention.dsv41.deep_select import (
 from tokenspeed_kernel.ops.attention.dsv41.triton import (
     _clean_logits,
     _mask_invalid_pages,
+    _mask_invalid_table_pages,
     clean_logits,
     clean_logits_for_selection,
     finish_selection,
     mask_invalid_pages,
+    mask_invalid_table_pages,
     pack_index_inputs,
     pack_index_queries,
     prepare_scores,
@@ -590,6 +592,54 @@ def test_mask_invalid_pages_in_place_without_recompiling():
             run(histories, rows, width, width * 64 + 64)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_mask_invalid_table_pages_matches_the_cleaned_copy(dtype):
+    """Paged in-place masking equals clean_logits_for_selection on [0, end)."""
+    pages, width = 70, 65
+    capacity = width * 64
+    alignment = deep_select_alignment()[0] // torch.empty((), dtype=dtype).itemsize
+
+    def run(rows, poison):
+        storage = torch.randn((rows, capacity + 192), device="cuda", dtype=dtype)
+        storage[:, capacity:] = poison
+        values = storage[:, :capacity]
+        table = torch.randint(
+            -2, pages + 3, (rows, 2 * width), device="cuda", dtype=torch.int32
+        )[:, ::2]
+        lengths = torch.randint(
+            -3, capacity + 100, (rows,), device="cuda", dtype=torch.int32
+        )
+        lengths[0] = 0
+        ends = lengths.clamp(0, capacity)
+        expected = clean_logits_for_selection(
+            values, ends, table, pages, capacity, 64, alignment
+        )
+        before = storage.clone()
+        out = mask_invalid_table_pages(values, ends, table, pages, 64)
+        assert out.data_ptr() == values.data_ptr()
+        position = torch.arange(storage.shape[1], device="cuda")[None, :]
+        within = position < ends[:, None]
+        live = within[:, :capacity]
+        torch.testing.assert_close(
+            values[live], expected[:, :capacity][live], rtol=0, atol=0
+        )
+        # Columns at or past each end, padding included, are never written.
+        torch.testing.assert_close(
+            storage[~within], before[~within], rtol=0, atol=0, equal_nan=True
+        )
+        for row, end in enumerate(ends.tolist()):
+            if end:
+                assert torch.equal(
+                    storage[row, :end].float().topk(min(64, end)).values,
+                    expected[row, :end].float().topk(min(64, end)).values,
+                )
+
+    run(5, float("nan"))
+    with assert_no_triton_compile(_mask_invalid_table_pages):
+        run(9, 1e30)
+        run(1, float("nan"))
+
+
 @pytest.mark.parametrize("history_rows", [(5,), (2, 3), (1, 1, 3)])
 def test_packed_dense_histories_match_paged_scoring(history_rows):
     _, _, cache, pool_table, _, _, _ = _sparse_inputs(len(history_rows), 8, False)
@@ -730,6 +780,7 @@ def test_packed_dense_batch_beyond_int32_logit_offsets(candidate_topk):
 def test_full_paged_query_tiles_match_with_large_capacity_in_graph(tokens):
     # With 2049 rows the final BF16 row starts beyond 2**31 elements. Keep
     # physical storage and live histories small while exercising that address.
+    # Paged scores are masked in place in DeepGEMM's own rows.
     capacity = (1 << 20) + 64
     page_count = capacity // 64
     cache = torch.empty((2, 4352), device="cuda", dtype=torch.uint8)
@@ -1364,7 +1415,9 @@ def _run_full_scores(
 
 def _check_full_live_scores(actual, expected, lengths):
     columns = torch.arange(actual.shape[1], device="cuda")[None, :]
-    initialized = columns < ((lengths[:, None] + 1023) // 1024) * 1024
+    # Paged scores are masked in place: past each row's end they keep
+    # DeepGEMM's stale values, which DeepSelect never reads.
+    initialized = columns < lengths[:, None]
     torch.testing.assert_close(
         actual[initialized], expected[initialized], rtol=0, atol=0
     )

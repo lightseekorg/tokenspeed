@@ -38,6 +38,11 @@ buffer with exclusive row ends, avoiding another alignment copy. Candidate
 block reduction similarly initializes only live blocks and their final aligned
 segment, and native selection uses the valid block counts. The full-width
 cleaner and generic score-preparation helpers retain their existing contracts.
+Paged Full without prepared blocks skips that copy, as dense Full does: it
+sets invalid table pages inside [0, end) to -inf in DeepGEMM's own rows
+(`mask_invalid_table_pages`) and selects from them at the cleaned copy's
+padded width. It keeps the cleaned copy when DeepGEMM's row stride misses
+DeepSelect's input alignment. The cleaner remains for prepared blocks.
 
 Candidate block maxima remain FP32, with the existing newest-block pinning and
 logical-position mapping. Converting BF16 scores to FP32 for this reduction

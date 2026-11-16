@@ -1835,3 +1835,139 @@ def test_indexer_rope_weight_dispatch_graph_replay(device, rows):
         assert actual_q is queries and actual_w is weights
         torch.testing.assert_close(actual_q, expected_q, rtol=0, atol=0)
         torch.testing.assert_close(actual_w, initial_w * scale, rtol=0, atol=0)
+
+
+def _clean_selection_reference(values, lengths, table, pages, capacity, size, align):
+    """clean_logits_for_selection on [0, end); NaN marks what it leaves unspecified."""
+    width = (capacity + align - 1) // align * align
+    out = torch.full((values.shape[0], width), torch.nan, dtype=values.dtype)
+    column = torch.arange(capacity)
+    page = table[:, column // size]
+    valid = (column[None] < lengths.clamp(0, capacity)[:, None]) & (
+        (page >= 0) & (page < pages)
+    )
+    out[:, :capacity] = values[:, :capacity].masked_fill(~valid, -torch.inf)
+    return out
+
+
+def _mask_table_pages_reference(values, lengths, table, pages, size):
+    capacity = table.shape[1] * size
+    column = torch.arange(capacity)
+    page = table[:, column // size]
+    hole = (column[None] < lengths.clamp(0, capacity)[:, None]) & (
+        (page < 0) | (page >= pages)
+    )
+    values[:, :capacity].masked_fill_(hole, -torch.inf)
+    return values
+
+
+@pytest.mark.parametrize("alignment_bytes", [256, 2048])
+def test_paged_scores_mask_native_rows_in_place(monkeypatch, alignment_bytes):
+    """Paged scoring selects from DeepGEMM's rows masked in place.
+
+    The native rows come back at the cleaned copy's padded width, equal to it
+    on [0, end). When DeepGEMM's row stride misses DeepSelect's alignment,
+    paged scoring keeps the cleaned copy.
+    """
+    from tokenspeed_kernel.ops.attention.dsv41 import deep_gemm as native
+
+    rows, width, pages, capacity = 3, 5, 9, 5 * 64
+    table = torch.tensor(
+        [[1, -1, 2, 3, 99], [4, 5, 6, 7, 8], [-1, 0, 1, 2, 3]], dtype=torch.int32
+    )
+    lengths = torch.tensor([200, 400, 0], dtype=torch.int32)
+    # DeepGEMM pads each BF16 row to 1024 bytes and returns the capacity slice.
+    torch.manual_seed(5)
+    storage = torch.randn(rows, 512).to(torch.bfloat16)
+    storage[:, capacity:] = torch.nan
+    original = storage.clone()
+    calls = []
+
+    class Api:
+        def get_num_sms(self):
+            return 4
+
+        def get_paged_mqa_logits_metadata(self, context_lens, size, sms, indices):
+            return torch.zeros(sms + 1, 2, dtype=torch.int32)
+
+        def fp8_fp4_paged_mqa_logits(self, **kwargs):
+            return storage[:, : kwargs["max_context_len"]]
+
+    def clean(*args):
+        calls.append("clean")
+        return _clean_selection_reference(*args)
+
+    def mask(*args):
+        calls.append("mask")
+        return _mask_table_pages_reference(*args)
+
+    monkeypatch.setattr(native, "_api", lambda queries: Api())
+    monkeypatch.setattr(
+        native,
+        "safe_metadata",
+        lambda t, lens, p, cap, size: (
+            t.masked_fill((t < 0) | (t >= p), 0),
+            lens.clamp(0, cap).to(torch.int32),
+        ),
+    )
+    monkeypatch.setattr(native, "clean_logits_for_selection", clean)
+    monkeypatch.setattr(native, "mask_invalid_table_pages", mask)
+    monkeypatch.setattr(native, "deep_select_alignment", lambda: (alignment_bytes, 32))
+    scores, ends, blocks = native._paged_scores(
+        (
+            torch.zeros(rows, 32, 64, dtype=torch.uint8),
+            torch.zeros(rows, 32, dtype=torch.int32),
+        ),
+        torch.zeros(pages, 64 * 68, dtype=torch.uint8),
+        torch.zeros(rows, 32),
+        table,
+        lengths,
+        capacity,
+        64,
+        None,
+        0,
+        rows,
+        False,
+    )
+    alignment = alignment_bytes // 2
+    native_rows = 512 * 2 % alignment_bytes == 0
+    assert calls == (["mask"] if native_rows else ["clean"])
+    assert blocks is None and ends.tolist() == [200, 320, 0]
+    expected = _clean_selection_reference(
+        original, ends, table, pages, capacity, 64, alignment
+    )
+    assert scores.shape == expected.shape
+    for row, end in enumerate(ends.tolist()):
+        torch.testing.assert_close(scores[row, :end], expected[row, :end])
+        if end:
+            # Same top-k over [0, end) as the cleaned copy.
+            k = min(16, end)
+            torch.testing.assert_close(
+                scores[row, :end].float().topk(k).indices.sort().values,
+                expected[row, :end].float().topk(k).indices.sort().values,
+            )
+    assert torch.isinf(scores[0, 64:128]).all()
+    if native_rows:
+        assert scores.data_ptr() == storage.data_ptr()
+        assert scores.stride(0) == 512
+        # Past each row's end the native rows are left as DeepGEMM wrote them.
+        for row, end in enumerate(ends.tolist()):
+            assert torch.equal(storage[row, end:].isnan(), original[row, end:].isnan())
+            torch.testing.assert_close(
+                storage[row, end:capacity], original[row, end:capacity]
+            )
+
+
+def test_padded_rows_view_only_within_the_native_row():
+    from tokenspeed_kernel.ops.attention.dsv41 import deep_gemm as native
+
+    storage = torch.zeros(3, 512, dtype=torch.bfloat16)
+    logits = storage[:, :320]
+    padded = native._padded_rows(logits, 128)
+    assert padded.shape == (3, 384) and padded.stride() == (512, 1)
+    assert padded.data_ptr() == storage.data_ptr()
+    assert native._padded_rows(logits, 64) is logits
+    assert native._padded_rows(logits, 1024) is logits
+    # A row stride without room for the padded width keeps the logits.
+    narrow = torch.zeros(3, 320, dtype=torch.bfloat16)
+    assert native._padded_rows(narrow, 128) is narrow

@@ -63,6 +63,7 @@ from tokenspeed_kernel.ops.attention.dsv41.triton import (
     dense_ranges,
     finish_selection,
     mask_invalid_pages,
+    mask_invalid_table_pages,
     pack_index_inputs,
     quantize_index_queries,
     safe_metadata,
@@ -126,6 +127,25 @@ def _api(queries):
     if deep_gemm.get_pdl() != enabled:
         deep_gemm.set_pdl(enabled)
     return deep_gemm
+
+
+def _padded_rows(logits, alignment):
+    """View DeepGEMM's rows at the cleaned copy's padded width when they hold it.
+
+    The cleaned copy is ``alignment``-element padded; DeepGEMM pads each row
+    further (to 1024 bytes). Columns past the logits are never read: consumers
+    stop at each row's end, which is within the logits.
+    """
+    rows, columns = logits.shape
+    width = (columns + alignment - 1) // alignment * alignment
+    needed = logits.storage_offset() + (rows - 1) * logits.stride(0) + width
+    if (
+        width == columns
+        or width > logits.stride(0)
+        or needed * logits.element_size() > logits.untyped_storage().nbytes()
+    ):
+        return logits
+    return logits.as_strided((rows, width), (logits.stride(0), 1))
 
 
 def _paged_scores(
@@ -218,6 +238,17 @@ def _paged_scores(
             input_alignment,
         )
         return cleaned, lengths, (block_scores, block_ends)
+    input_alignment = deep_select_alignment()[0]
+    alignment = input_alignment // logits.element_size()
+    if logits.stride(0) * logits.element_size() % input_alignment == 0:
+        # DeepSelect borrows rows whose stride meets its alignment and reads
+        # [0, end); the block and candidate gathers mask at end too. Native
+        # rows are unspecified past the context, as the cleaned copy is past
+        # its last live tile, so only holes before end need -inf.
+        mask_invalid_table_pages(
+            logits, lengths, block_table, cache.shape[0], page_size
+        )
+        return _padded_rows(logits, alignment), lengths, None
     return (
         clean_logits_for_selection(
             logits,
@@ -226,7 +257,7 @@ def _paged_scores(
             cache.shape[0],
             capacity,
             page_size,
-            deep_select_alignment()[0] // logits.element_size(),
+            alignment,
         ),
         lengths,
         None,

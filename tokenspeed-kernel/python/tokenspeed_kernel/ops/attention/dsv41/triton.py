@@ -2829,6 +2829,65 @@ def mask_invalid_pages(values, lengths, history_pages, starts, pages, page_size)
 
 
 @triton.jit(
+    do_not_specialize=["X0", "L0", "T0", "T1", "TC", "NP"],
+)
+def _mask_invalid_table_pages(
+    X, L, T, X0, L0, T0, T1, TC, NP, P: tl.constexpr, B: tl.constexpr
+):
+    # One program per query row, looping only over its live pages of its own
+    # table row: the paged counterpart of _mask_invalid_pages.
+    row = tl.program_id(0).to(tl.int64)
+    end = tl.minimum(tl.maximum(tl.load(L + row * L0), 0), TC * P)
+    for first in range(0, tl.cdiv(end, P), B):
+        page_index = first + tl.arange(0, B)
+        live = page_index * P < end
+        page = tl.load(T + row * T0 + page_index * T1, live, other=0).to(tl.int64)
+        invalid = live & ((page < 0) | (page >= NP))
+        # Normally every live page is valid and nothing is written.
+        if tl.max(invalid.to(tl.int32), axis=0) > 0:
+            column = page_index[:, None] * P + tl.arange(0, P)[None, :]
+            value = tl.full((B, P), float("-inf"), X.dtype.element_ty)
+            tl.store(X + row * X0 + column, value, invalid[:, None] & (column < end))
+
+
+def mask_invalid_table_pages(values, lengths, table, pages, page_size):
+    """Set logits of invalid pages in [0, length) to -inf in place, per table row.
+
+    values is [rows, >= width * page_size] with unit column stride and table
+    is integer [rows, width]: row r scored its history through table row r
+    (paged scoring). A page outside [0, pages) is invalid, as
+    clean_logits_for_selection treats it, so [0, length) of every row ends up
+    bit-identical to that cleaned copy. Columns at or beyond length are left
+    untouched: consumers read [0, length). Nothing is copied. Returns values.
+    """
+    if (
+        values.ndim != 2
+        or values.stride(1) != 1
+        or table.ndim != 2
+        or values.shape[0] != lengths.numel()
+        or table.shape[0] != values.shape[0]
+        or values.shape[1] < table.shape[1] * page_size
+    ):
+        raise RuntimeError("DeepGEMM returned incompatible score geometry")
+    if values.shape[0] and table.shape[1]:
+        _mask_invalid_table_pages[(values.shape[0],)](
+            values,
+            lengths,
+            table,
+            values.stride(0),
+            lengths.stride(0),
+            table.stride(0),
+            table.stride(1),
+            table.shape[1],
+            pages,
+            page_size,
+            256,
+            num_warps=4,
+        )
+    return values
+
+
+@triton.jit(
     do_not_specialize=["L0", "O0", "N", "CAP"],
 )
 def _dense_ranges(L, OFFSET, START, END, L0, O0, N, CAP, B: tl.constexpr):
