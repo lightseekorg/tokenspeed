@@ -221,11 +221,12 @@ def _combine_native_rows(partial, inverse, offsets, weights):
     return result.to(torch.bfloat16)
 
 
-@pytest.fixture(scope="module", params=("expected_m", "optimized"))
+@pytest.fixture(scope="module", params=(("expected_m", -1), ("optimized", 4)))
 def route_io_native(request):
     _require_private_sm90()
+    mode, stages = request.param
     return prepare_sm90_fp8_moe(
-        mode=request.param, max_num_stages_fc1=-1, max_num_stages_fc2=-1
+        mode=mode, max_num_stages_fc1=stages, max_num_stages_fc2=-1
     ), _make_expert_weights(5, 256, 512)
 
 
