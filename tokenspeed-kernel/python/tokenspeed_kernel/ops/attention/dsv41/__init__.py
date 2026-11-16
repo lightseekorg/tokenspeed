@@ -649,7 +649,7 @@ def prefill_indexer_batching_supported(index_row_bytes: int) -> bool:
         index_row_bytes: Packed index-cache row size; 68 denotes MXFP4.
 
     Returns:
-        True for SM100–SM103 with DeepGEMM and DeepSelect available.
+        True on Blackwell with DeepGEMM and DeepSelect available.
         Other row formats and hosts without a CUDA device return False.
     """
     if index_row_bytes != 68 or not torch.cuda.is_available():
