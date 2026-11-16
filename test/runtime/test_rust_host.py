@@ -67,6 +67,7 @@ from tokenspeed_scheduler import (  # noqa: E402
 from tokenspeed.runtime.engine.profiler import Profiler  # noqa: E402
 from tokenspeed.runtime.engine.rank_setup import request_length_limits  # noqa: E402
 from tokenspeed.runtime.engine.rust_host import (  # noqa: E402
+    HostBootstrap,
     HostDataPlane,
     host_in_flight_depth,
     rust_host_refusals,
@@ -115,6 +116,32 @@ def test_rank_host_requires_an_explicit_valid_logging_mode(options):
     )
     assert result.returncode == 2, result.stderr
     assert "--enable-async-logging" in result.stderr
+
+
+def test_bootstrap_preserves_gpu_spacing(monkeypatch):
+    args = ServerArgs(
+        model="unavailable",
+        world_size=4,
+        nprocs_per_node=2,
+        nnodes=2,
+        attn_tp_size=4,
+        base_gpu_id=1,
+        gpu_id_step=2,
+    )
+    args.mapping.rank = 3
+
+    def unavailable_model(*args, **kwargs):
+        raise FileNotFoundError("model weights unavailable")
+
+    monkeypatch.setattr(
+        "tokenspeed.runtime.engine.rust_host.load_model_config", unavailable_model
+    )
+    host = HostBootstrap.__new__(HostBootstrap)
+    with pytest.raises(FileNotFoundError, match="model weights unavailable"):
+        host.__init__(
+            args, None, None, None, None, None, replica_memory_transitions=False
+        )
+    assert host._gpu_id == 3
 
 
 def test_the_default_engine_is_served():

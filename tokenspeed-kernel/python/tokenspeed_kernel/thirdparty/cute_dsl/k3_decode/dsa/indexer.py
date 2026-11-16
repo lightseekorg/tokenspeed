@@ -67,7 +67,7 @@ from tokenspeed_kernel.thirdparty.cute_dsl.k3_decode.common.primitives import (
 
 PAGE = 64  # keys per index-K page
 DIM = 128
-ROW_BYTES = DIM + 4  # a key's FP8 bytes, then (in the page tail) its FP32 scale
+ROW_BYTES = DIM + 4  # a key's FP8 bytes, then (in the page tail) its UE8M0 scale word
 HEADS = 32
 TILE = 128  # keys per MMA tile (two pages)
 ITEM_TILES = 16  # tiles per work item (the producer caches 32 page ids)
@@ -776,7 +776,9 @@ class IndexerScore:
                         key = k0 + t * TILE + lt
                         phase = (it // self.stages) & 1
                         cute.arch.mbarrier_wait(kv_full + stage, phase)
-                        kscale = bits_float(Uint32(sSc[lt, stage]))
+                        # Blackwell planes store the key scale as four UE8M0 bytes
+                        # (kvcache/index_k_scale.py): a power of two from its exponent.
+                        kscale = bits_float((Uint32(sSc[lt, stage]) & 0xFF) << 23)
                         cute.arch.mbarrier_arrive(sc_empty + stage)
                         cute.arch.mbarrier_wait(acc_full + acc, (it // ACCS) & 1)
                         # tcgen05.ld is .sync.aligned: reconverge the warp after

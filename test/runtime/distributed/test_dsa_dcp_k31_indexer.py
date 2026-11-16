@@ -138,8 +138,10 @@ def _page_table(placed: list[list[int]], columns: int) -> torch.Tensor:
 
 
 def _plane(keys, virtual_blocks, placement, device):
-    from tokenspeed_kernel.ops.kvcache.triton import index_k_block_split_scatter
-    from tokenspeed_kernel.ops.quantization import quantize_fp8
+    from tokenspeed_kernel.ops.kvcache.triton import (
+        index_k_block_split_scatter,
+        quantize_index_k_rows,
+    )
 
     from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
 
@@ -148,9 +150,7 @@ def _plane(keys, virtual_blocks, placement, device):
     plane = torch.zeros(
         local_blocks * _BLOCK, _DIM + 4, dtype=torch.uint8, device=device
     )
-    values, scales = quantize_fp8(
-        keys, granularity="token_group", group_size=128, scale_encoding="float32"
-    )
+    values, scales = quantize_index_k_rows(keys, group_size=128)
     slots, owned = resolve_cache_slots(
         torch.arange(keys.shape[0], device=device), placement
     )
@@ -975,13 +975,13 @@ class _IndexKPool:
 
     def set_index_k_buffer(self, layer_id, loc, keys, *, write_mask, key_norm):
         """The FP8 arm of ``DSATokenToKVPool.set_index_k_buffer``."""
-        from tokenspeed_kernel.ops.kvcache.triton import index_k_block_split_scatter
-        from tokenspeed_kernel.ops.quantization import quantize_fp8
+        from tokenspeed_kernel.ops.kvcache.triton import (
+            index_k_block_split_scatter,
+            quantize_index_k_rows,
+        )
 
         assert key_norm is None
-        values, scales = quantize_fp8(
-            keys, granularity="token_group", group_size=128, scale_encoding="float32"
-        )
+        values, scales = quantize_index_k_rows(keys, group_size=128)
         index_k_block_split_scatter(
             self.plane,
             values,

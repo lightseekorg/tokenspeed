@@ -37,16 +37,16 @@ from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import HALF_POLLED_SENTINEL
 
 device = torch.device("cuda", 0)
 {setup}
-words = mailbox.view(torch.int32)
+words = mailbox.view(-1).view(torch.int32)
 def arm():
     words.fill_(-1)
-    mailbox[:1].copy_(row)
+    mailbox.view(-1)[: row.numel()].copy_(row.view(-1))
 # Compile and prove the arrived case on a full row, so the window below is the wait alone.
 arm()
 consume()
 torch.cuda.synchronize(device)
 arm()
-words[0, {word}] = {empty}
+words[{word}] = {empty}
 torch.cuda.synchronize(device)
 open({marker!r}, "w").close()
 consume()
@@ -96,9 +96,24 @@ def armed_mailbox(rows: torch.Tensor, capacity: int) -> torch.Tensor:
     return mailbox
 
 
+def armed_blocks(rows: torch.Tensor, capacity: int, blocks: int) -> torch.Tensor:
+    """A rank-major mailbox armed with the half-polled sentinel holding ``rows`` first.
+
+    Block ``j`` holds the ``j``-th column block of ``rows``; a consumer reads
+    the ``[:, :len(rows)]`` view of the returned ``[blocks, capacity, width // blocks]``.
+    """
+    count, width = rows.shape
+    mailbox = torch.empty(
+        blocks, capacity, width // blocks, dtype=torch.bfloat16, device=rows.device
+    )
+    mailbox.view(torch.int32).fill_(-1)
+    mailbox[:, :count].copy_(rows.view(count, blocks, width // blocks).transpose(0, 1))
+    return mailbox
+
+
 def assert_child_keeps_waiting(setup: str, word: int, empty: int) -> None:
     """Assert a child consuming a word with one sentinel half left never finishes."""
-    # ``setup`` defines ``mailbox`` (two rows), ``row`` and ``consume()``; streams serialize in-process.
+    # ``setup`` defines ``mailbox``, ``row`` and ``consume()``; streams serialize in-process.
     with tempfile.TemporaryDirectory() as scratch:
         marker = Path(scratch) / "reached"
         script = _WAITER.format(setup=setup, word=word, empty=empty, marker=str(marker))

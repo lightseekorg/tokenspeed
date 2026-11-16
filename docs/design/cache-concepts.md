@@ -1161,7 +1161,11 @@ Its responsibilities:
   at all: it never constrains the boundary and never claims a hit, so its
   table is empty at first admission and the scheduler materializes it as a
   sparse private suffix from the replay window's first token
-  ([Scheduler §1.3](scheduler.md#13-bounded-replay)). Probe and admit are
+  ([Scheduler §1.3](scheduler.md#13-bounded-replay)). No probe reads its
+  keys, so the per-group keys expanded from the prompt's page hashes
+  (`PreparePrefixKeys`) leave it out; with prefix caching, the request
+  computes those hashes when it is submitted (`Scheduler::SubmitRequests`),
+  not in the round that admits it. Probe and admit are
   deliberately split so the probe can be taken once and the admission retried
   against it — the scheduler's same-round retract-and-grant re-runs a failed
   admission after freeing a victim (see `scheduler.md`) without re-probing.
@@ -1635,6 +1639,14 @@ Its responsibilities:
   checks. Nothing is decided
   mid-`Admit`, so one admission may evict a boundary's last cached copy and
   then store the request's own copy without any ordering hazard.
+  The scheduler and routing view share immutable boundary descriptors. A drain
+  reads current residency once, then the routing view computes net visibility
+  changes and orders them once: removals child-first, stores parent-first.
+  Its output is an owned `KvEventBatch` with contiguous scalar/token/hash
+  columns and offsets. It holds no request, cache block, or descriptor reference,
+  so the cache can change or be cleared while an earlier batch is being encoded.
+  The Rust engine moves this snapshot across the bridge; Python's existing list
+  API materializes event objects from the same snapshot at its boundary.
   Admission may pre-hash prompt pages beyond the computed prefix. An early
   junction or retraction tail uses the parent hash at its published frontier,
   even when the request's hash memo already contains later pages.

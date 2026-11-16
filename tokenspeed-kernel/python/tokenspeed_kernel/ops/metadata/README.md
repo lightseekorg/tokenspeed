@@ -36,3 +36,12 @@ length repeated `k` times) and the sparse decode core's causal KV rows (row
 `t` of a request sees `length + t - (k - 1)` tokens, clamped at zero). CUDA
 runs the Triton kernel; other devices run the same integer arithmetic as
 tensor ops.
+
+# Block-end lengths
+
+`broadcast_block_lengths` serves a block drafter's draft decode, where every
+query row of a request has the same cache length. It clamps each request's
+block-end length to `[low, high]` and writes it to the per-request row and to
+each of the request's entries; a block-causal draft's entry `e` of `n` gets
+`n - 1 - e` fewer tokens. CUDA runs one Triton launch for both; other devices
+run a clamp and a copy or subtraction.

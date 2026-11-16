@@ -22,6 +22,7 @@
 
 from tokenspeed_kernel.ops.metadata.accepted_frontier import advance_accepted_frontier
 from tokenspeed_kernel.ops.metadata.accepted_rows import gather_last_accepted_rows
+from tokenspeed_kernel.ops.metadata.block_lengths import broadcast_block_lengths
 from tokenspeed_kernel.ops.metadata.block_table_rows import (
     BLOCK_TABLE_ROW_FIELDS,
     expand_block_table_rows,
@@ -36,6 +37,7 @@ __all__ = [
     "Reg",
     "advance_accepted_frontier",
     "apply_stop_conditions",
+    "broadcast_block_lengths",
     "expand_block_table_rows",
     "expand_k_row_lengths",
     "gather_last_accepted_rows",

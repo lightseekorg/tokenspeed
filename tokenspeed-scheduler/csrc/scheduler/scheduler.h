@@ -149,6 +149,7 @@ public:
     static constexpr float kPrefillWatermark = 0.9F;
 
     void Advance(const ExecutionEvent& event);
+    KvEventBatch DrainKvEventBatch();
     std::vector<KvCacheEvent> DrainKvEvents();
     // Testing/control-plane operation. A successful return means the complete
     // Device L1 prefix cache was removed; Host L2 is never touched.
@@ -765,6 +766,9 @@ private:
     // prefill_decode_interval: reset by a prefill round, counted down by a
     // decode round. Derived from the plans alone, so mirrored ranks agree.
     std::int32_t prefill_deferral_rounds_left_{0};
+    // prefill_decode_min_interval: the same clock, but no overdue prompt
+    // suspends it.
+    std::int32_t prefill_min_rounds_left_{0};
 
     // Consecutive stalled rounds (trackStalledRounds); 0 after any round
     // that schedules work, leaves work in flight or aborts a request (the
@@ -788,7 +792,7 @@ private:
     // with any Device cached child, including State entries excluded from
     // routing residency: their later mutations still need the descriptor.
     struct KvEventBoundary {
-        KvBlockStoredEvent stored;
+        KvEventDescriptorRef stored;
         // Position in the prefix chain (page index). Consumers resolve a
         // Stored event's parent_block_hash on receipt, so DrainKvEvents
         // orders each batch by depth rather than by mutation order.

@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use ts_control::kv_events::{encode_batch, KvEventPublisher, KvEventsConfig};
-use ts_scheduler::KvEventView;
+use ts_scheduler::{KvEventBatch, KvEventView};
 use zeromq::{DealerSocket, Socket, SocketRecv, SocketSend, SubSocket, ZmqMessage};
 
 fn fixture_batch() -> Vec<KvEventView> {
@@ -65,10 +65,14 @@ fn a_batch_encodes_as_the_python_publisher_s() {
         env!("CARGO_MANIFEST_DIR")
     );
     let expected = std::fs::read_to_string(path).unwrap();
-    let encoded: String = encode_batch(1_700_000_000.25, &fixture_batch(), 1)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    let encoded: String = encode_batch(
+        1_700_000_000.25,
+        &KvEventBatch::from_events(&fixture_batch()),
+        1,
+    )
+    .iter()
+    .map(|byte| format!("{byte:02x}"))
+    .collect();
     assert_eq!(encoded, expected.trim());
 }
 
@@ -110,7 +114,7 @@ fn subscribers_receive_batches_and_replay_them() {
     // until one lands.
     let received = loop {
         // From the control thread, outside any runtime, as the loop does.
-        publisher.publish(&fixture_batch()[2..]);
+        publisher.publish(KvEventBatch::from_events(&fixture_batch()[2..]));
         let received = runtime.block_on(async {
             tokio::time::timeout(Duration::from_millis(200), subscriber.recv()).await
         });
@@ -145,4 +149,35 @@ fn subscribers_receive_batches_and_replay_them() {
     });
     assert_eq!(replayed.first(), Some(&seq));
     assert!(replayed.windows(2).all(|pair| pair[1] == pair[0] + 1));
+}
+
+#[test]
+fn an_owned_batch_can_be_encoded_after_its_input_is_gone_on_another_thread() {
+    let input = fixture_batch();
+    let expected = encode_batch(17.5, &KvEventBatch::from_events(&input), 3);
+    let batch = KvEventBatch::from_events(&input);
+    drop(input);
+    let encoded = std::thread::spawn(move || encode_batch(17.5, &batch, 3))
+        .join()
+        .unwrap();
+    assert_eq!(encoded, expected);
+}
+
+#[test]
+#[should_panic(expected = "an absent parent must not carry a hash")]
+fn batching_rejects_a_hash_that_an_absent_parent_would_discard() {
+    let mut events = fixture_batch();
+    events[0].has_parent = false;
+    events[0].parent_block_hash = 17;
+    KvEventBatch::from_events(&events);
+}
+
+#[test]
+#[should_panic(expected = "a removal must not carry a store payload")]
+fn batching_rejects_tokens_that_a_removal_would_discard() {
+    let mut events = fixture_batch();
+    events[0].stored = false;
+    events[0].has_parent = false;
+    events[0].parent_block_hash = 0;
+    KvEventBatch::from_events(&events);
 }

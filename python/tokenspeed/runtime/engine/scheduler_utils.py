@@ -118,6 +118,7 @@ def make_config(
     storage_config: StorageConfig | None,
     host_write_policy: str,
     prefill_decode_interval: int,
+    prefill_decode_min_interval: int,
     debug_force_retraction_interval: int = 0,
     enable_kv_cache_events: bool = False,
     decode_input_tokens: int = 1,
@@ -175,6 +176,10 @@ def make_config(
             owed to the running decodes after each round that schedules a
             prefill chunk, unless no decode can run, and the most rounds it
             holds any one prompt back in total; 0 is off. Fused role only.
+        prefill_decode_min_interval: ``--prefill-decode-min-interval``:
+            decode rounds owed after each round that schedules a prefill
+            chunk, unless no decode can run, even while an overdue prompt
+            suspends the interval; 0 is off. Fused role only.
         debug_force_retraction_interval: ``--debug-force-retraction-interval``:
             0 is off; every ``|N|`` plans the scheduler retracts the oldest
             quiescent Decoding (``N > 0``) or Prefilling (``N < 0``) request
@@ -303,6 +308,9 @@ def make_config(
         # Set only when on, like state_checkpoint_in_forward: a scheduler
         # wheel without the field still runs the default.
         cfg.prefill_decode_interval = prefill_decode_interval
+    if prefill_decode_min_interval:
+        # Set only when on, for the same reason.
+        cfg.prefill_decode_min_interval = prefill_decode_min_interval
     if enable_short_prefill_first:
         # Older scheduler wheels retain FIFO and reject an explicit opt-in.
         cfg.enable_short_prefill_first = True

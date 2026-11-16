@@ -95,8 +95,10 @@ decode-size rows on NVIDIA, the GEMM facade's FP32 output otherwise.
 
 `bf16_moe_routes` returns individual, unweighted expert outputs. Deferred MXFP4
 execution also returns a map from each original route to its output row, with
-`-1` for remote experts. Consumers normalize each route before weighting and
-summation. Combining routes before normalization changes the operation.
+`-1` for remote experts. Gluon Petit returns no map: its combine returns every
+route of each local token as `[tokens, topk, hidden]` in `topk` order. Consumers
+normalize each route before weighting and summation. Combining routes before
+normalization changes the operation.
 
 `triton_bf16_routes_moe_apply` and `gluon_bf16_routes_moe_apply` serve
 `bf16_moe_routes` as `moe.apply` kernels to layers that always finalize the
@@ -726,6 +728,22 @@ the routed output then includes the shared expert. The input staging kernel
 also writes the activation scales the shared expert reads: MN-major, with rows
 grouped by the BLOCK_M MegaMoE picks for the token count. The shared expert's
 SwiGLU uses the routed experts' clamp.
+
+## DeepSeek V4 MegaMoE filler rows (`deep_gemm.py`)
+
+Every MegaMoE launch, warmup included, passes the staging kernel the shared
+int32 `(live, padded)` request pair from `mega_moe_live_requests`. Staging
+writes codes and scales for every row, but each row at or past
+`num_tokens * live // padded` gets expert id -1 and weight 0. MegaMoE's
+dispatch and combine skip negative ids, so such a row's output is zero, or
+the fused shared expert's output alone. The share is right only when each
+rank stages its attention-DP group's whole padded batch, not a TP shard of
+it. The pair is (1, 1), which routes every row, except during a padded
+decode-graph replay under attention TP 1 or attention TP equal to the MoE
+TP x EP size, the layouts that give whole batches (the padding contract in
+`docs/design/unified_path.md`). Under other layouts, such as Qwen3.5's
+DP4/TP2/EP8, it stays (1, 1). The kernel reads the counts at launch, so new
+values do not recompile it.
 
 ## Kimi-K3 TP8 decode chain (`_cute_dsl/k3_decode.py`)
 

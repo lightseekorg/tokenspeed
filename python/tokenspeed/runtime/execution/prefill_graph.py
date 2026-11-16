@@ -134,6 +134,9 @@ PREFILL_BUCKET_MAX_STEP: int = 512
 # Replays between two logs of the per-route replay counts.
 PREFILL_ROUTE_LOG_INTERVAL: int = 256
 
+# Requests each bucket captures inline when unset; fewer requests replay it padded.
+PREFILL_DEFAULT_CAPTURE_REQUESTS: int = 4
+
 
 def get_prefill_token_buckets(config: ModelExecutorConfig) -> list[int]:
     """Padded token-count buckets to capture for the breakable prefill graph.
@@ -228,7 +231,7 @@ def resolve_prefill_capture_batch_sizes(
     """Resolve defaults, validate limits and select BS candidates for this bucket.
 
     Each request must have at least one token and fit the model context.
-    Unset configuration retains the minimum count required by the bucket.
+    Unset captures ``PREFILL_DEFAULT_CAPTURE_REQUESTS``, clamped into the valid range.
     Counts outside a particular bucket's range are skipped, not padded with
     empty sequences. Invalid configured counts fail before capture. The result
     is sorted and deduplicated; backend support is checked separately.
@@ -237,7 +240,9 @@ def resolve_prefill_capture_batch_sizes(
     maximum = config.max_num_seqs // config.data_parallel_size
     sizes = config.prefill_graph_capture_batch_sizes
     if sizes is None:
-        sizes = [minimum]
+        sizes = [
+            max(minimum, min(PREFILL_DEFAULT_CAPTURE_REQUESTS, maximum, token_bucket))
+        ]
     if any(size <= 0 or size > maximum for size in sizes):
         raise ValueError(
             "prefill graph capture batch sizes must be positive and no larger "

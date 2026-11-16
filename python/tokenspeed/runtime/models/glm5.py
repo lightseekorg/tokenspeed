@@ -122,6 +122,22 @@ def _int32_to_device(
     )
 
 
+def _select_every_candidate(
+    row_starts: torch.Tensor, row_ends: torch.Tensor, topk: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Top-k rows with at most ``topk`` candidates: every one, by position.
+
+    Returns the ``[rows, topk]`` int32 workspace indices, ``-1`` past each
+    row's candidates, and the per-row lengths, as the scored selection does.
+    """
+    lens = (row_ends - row_starts).clamp_min(0)
+    offsets = torch.arange(topk, dtype=row_starts.dtype, device=row_starts.device)
+    selected = torch.where(
+        offsets < lens.unsqueeze(1), offsets + row_starts.unsqueeze(1), -1
+    )
+    return selected, lens
+
+
 def _prefill_query_requests(
     seq_lens: torch.Tensor, row_starts: torch.Tensor
 ) -> torch.Tensor:
@@ -1031,8 +1047,12 @@ class GlmDsaSparseAttentionMixin:
         indices, ``-1`` where empty), which halves the gathered bytes.
         With ``query_proj`` set, ``q`` holds its input rows and each rank
         projects (and, see :meth:`_scorer_index_query`, quantizes) only the
-        rows it selects for.
+        rows it selects for. When no row has more than ``topk`` candidates,
+        every rank selects all of them by position without scoring.
         """
+        # The host lengths are equal on every rank, so all skip the gather together.
+        if q.shape[0] == 0 or int(candidate_lens_cpu.max()) <= topk:
+            return _select_every_candidate(row_starts, row_ends, topk)
 
         def select(rows: slice, out=None, lens_out=None):
             query, q_scales = self._scorer_index_query(
