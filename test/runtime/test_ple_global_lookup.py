@@ -311,26 +311,32 @@ def test_lookup_rejects_invalid_physical_extents(sizes):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
 @pytest.mark.parametrize("tokens", [1, 4095, 4096, 8192])
-@pytest.mark.parametrize("fp8_cache", [False, True])
-def test_host_lookup_stream_handoff(tokens, fp8_cache):
+@pytest.mark.parametrize(
+    "table_dtype, cache_slots",
+    [(torch.bfloat16, 0), (torch.bfloat16, 512), (torch.float8_e4m3fn, 512)],
+)
+def test_host_lookup_stream_handoff(tokens, table_dtype, cache_slots, monkeypatch):
     from tokenspeed_kernel.platform import current_platform
 
-    if fp8_cache and not current_platform().is_nvidia:
-        pytest.skip("FP8 PLE host cache requires NVIDIA CUDA")
+    if cache_slots and (
+        not current_platform().is_nvidia
+        or torch.cuda.get_device_capability()[0] not in (9, 10)
+    ):
+        pytest.skip("PLE host cache requires Hopper or Blackwell")
+    monkeypatch.setenv("TOKENSPEED_PLE_HOST_CACHE_SLOTS", str(cache_slots))
     mapping = _mapping_class()(rank=0, world_size=1, attn_tp_size=1, attn_dp_size=1)
     lookup = ple_lookup.PLELookup(
         mapping,
         vocab_size=256,
         ngram_heads=16,
         head_dim=160,
-        storage_dtype=torch.float8_e4m3fn if fp8_cache else None,
+        storage_dtype=table_dtype if table_dtype == torch.float8_e4m3fn else None,
         output_dtype=torch.bfloat16,
         offload=True,
         prefix="",
     )
-    table = torch.randn(256, 160, dtype=torch.bfloat16)
-    if fp8_cache:
-        table = table.to(torch.float8_e4m3fn)
+    table = torch.randn(256, 160, dtype=torch.bfloat16).to(table_dtype)
+    if cache_slots:
         assert lookup._host_cache is not None
     lookup.ngram_embedding.weight.data.copy_(table)
     ids = (

@@ -385,7 +385,6 @@ def _ple_host_gather_persistent_kernel(
     ROW_SCALE: tl.constexpr,
     BLOCK_D: tl.constexpr,
     BLOCK_R: tl.constexpr,
-    SORTED: tl.constexpr,
 ):
     for base in tl.range(tl.program_id(0).to(tl.int64) * BLOCK_R, rows, grid * BLOCK_R):
         row = base + tl.arange(0, BLOCK_R)
@@ -405,7 +404,7 @@ def _ple_host_gather_persistent_kernel(
             HAS_SCALE,
             ROW_SCALE,
             BLOCK_D,
-            SORTED,
+            True,
         )
 
 

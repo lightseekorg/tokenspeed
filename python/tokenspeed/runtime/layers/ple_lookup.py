@@ -114,8 +114,6 @@ def host_gather_ngram_rows(
     scale: float | None,
     out: torch.Tensor,
     row_scale: torch.Tensor | None = None,
-    *,
-    background: bool,
 ) -> torch.Tensor:
     """Fill ``out`` with the ``ids`` rows of a host-resident n-gram table.
 
@@ -137,7 +135,6 @@ def host_gather_ngram_rows(
         scale,
         row_scale,
         table_shards=embedding.tp_size,
-        background=background,
     )
 
 
@@ -295,15 +292,12 @@ class PLELookup(nn.Module):
                 and self.ngram_embedding_scale is None
                 and cache.can_gather(gathered_ids)
             )
-            background = use_cache or max(layout.physical_extents) < 4096
-            stream = execution_stream
-            if background:
-                if self._gather_stream is None:
-                    self._gather_stream = torch.cuda.Stream(device=ids.device)
-                stream = self._gather_stream
-                stream.wait_stream(execution_stream)
-                gathered_ids.record_stream(stream)
-                out.record_stream(stream)
+            if self._gather_stream is None:
+                self._gather_stream = torch.cuda.Stream(device=ids.device)
+            stream = self._gather_stream
+            stream.wait_stream(execution_stream)
+            gathered_ids.record_stream(stream)
+            out.record_stream(stream)
             with torch.cuda.stream(stream):
                 if use_cache:
                     cache.gather(
@@ -317,7 +311,7 @@ class PLELookup(nn.Module):
                         ),
                     )
                 else:
-                    self.gather_host(gathered_ids, out, background=background)
+                    self.gather_host(gathered_ids, out)
                 completion = torch.cuda.Event()
                 completion.record(stream)
         else:
@@ -366,9 +360,7 @@ class PLELookup(nn.Module):
             device=device,
         )
 
-    def gather_host(
-        self, ids: torch.Tensor, out: torch.Tensor, *, background: bool
-    ) -> torch.Tensor:
+    def gather_host(self, ids: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
         """Read the ``ids`` rows from host memory into ``out``.
 
         ``out`` is ``[tokens, ngram_heads * head_dim]``. Row-major order makes
@@ -393,7 +385,6 @@ class PLELookup(nn.Module):
             scale,
             out.view(-1, self.head_dim),
             row_scale=row_scale,
-            background=background,
         )
         return out
 

@@ -2,7 +2,7 @@
 
 The CUDA host lookup can cache BF16 or scalar-scaled FP8 embedding rows in HBM
 for a pinned table with 16 n-gram heads, either 160 or 512 values per row,
-and BF16 output.
+and BF16 output. Cached and regular host lookups run on the gather stream.
 Each TP or DP rank owns its cache and uses shard-local row indices as tags.
 Queries outside the shard produce zeros and leave the cache untouched. The
 cache handles eager lookups of at least 256 tokens, including prefill graph

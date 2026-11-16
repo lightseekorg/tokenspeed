@@ -114,7 +114,6 @@ def test_ple_host_cache_fill_and_gather(vocab_start, dim, table_dtype):
                 scale,
                 None,
                 table_shards=1 if vocab_start == 0 else 4,
-                background=False,
             )
             ready.record(stream)
         stream.synchronize()

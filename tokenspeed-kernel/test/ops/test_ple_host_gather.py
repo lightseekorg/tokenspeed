@@ -39,12 +39,7 @@ def test_ple_host_gather_uses_device_visible_table_pointer(monkeypatch) -> None:
     )
     monkeypatch.setattr(ple, "_ple_host_gather_kernel", kernel)
 
-    assert (
-        ple.ple_host_gather(
-            table, ids, out, 0, 4, None, None, table_shards=4, background=False
-        )
-        is out
-    )
+    assert ple.ple_host_gather(table, ids, out, 0, 4, None, None, table_shards=4) is out
     pointer.assert_called_once_with(table)
     args, kwargs = kernel.__getitem__.return_value.call_args
     assert args[0] == 12345
@@ -66,12 +61,7 @@ def test_ple_host_gather_empty_ids_skip_pointer_mapping(monkeypatch) -> None:
     )
     monkeypatch.setattr(ple, "_ple_host_gather_kernel", kernel)
 
-    assert (
-        ple.ple_host_gather(
-            table, ids, out, 0, 4, None, None, table_shards=4, background=False
-        )
-        is out
-    )
+    assert ple.ple_host_gather(table, ids, out, 0, 4, None, None, table_shards=4) is out
     pointer.assert_not_called()
     kernel.__getitem__.assert_not_called()
 
@@ -80,8 +70,7 @@ def test_ple_host_gather_empty_ids_skip_pointer_mapping(monkeypatch) -> None:
 @pytest.mark.parametrize("rows", [1, 255, 256, 257, 1027])
 @pytest.mark.parametrize("head_dim", [32, 96, 128])
 @pytest.mark.parametrize("scale_mode", ["none", "scalar", "row"])
-@pytest.mark.parametrize("background", [False, True])
-def test_host_gather_row_tiles(rows, head_dim, scale_mode, background):
+def test_host_gather_row_tiles(rows, head_dim, scale_mode):
     dtype = torch.bfloat16 if scale_mode == "none" else torch.float8_e4m3fn
     table = torch.randn(31, head_dim).to(dtype).pin_memory()
     ids = torch.arange(rows, device="cuda", dtype=torch.int64) % 40
@@ -96,7 +85,6 @@ def test_host_gather_row_tiles(rows, head_dim, scale_mode, background):
         0.5 if scale_mode == "scalar" else None,
         scales if scale_mode == "row" else None,
         table_shards=4,
-        background=background,
     )
     valid = (ids >= 3) & (ids < 34)
     local = (ids - 3).clamp(0, 30)
@@ -128,7 +116,6 @@ def test_host_gather_row_count_does_not_recompile():
             None,
             None,
             table_shards=4,
-            background=False,
         )
 
     for rows in (1, 16, 17, 256, 257):
@@ -147,9 +134,7 @@ def test_host_gather_checkpoint_scale(rows):
     ids = torch.arange(rows, device="cuda", dtype=torch.int64) % 40
     out = torch.empty((rows, 160), device="cuda", dtype=torch.bfloat16)
     scale = 0.00019931793212890625
-    ple.ple_host_gather(
-        table, ids, out, 3, 34, scale, None, table_shards=4, background=False
-    )
+    ple.ple_host_gather(table, ids, out, 3, 34, scale, None, table_shards=4)
     cpu_ids = ids.cpu()
     valid = (cpu_ids >= 3) & (cpu_ids < 34)
     expected = table.float()[(cpu_ids - 3).clamp(0, 30)] * scale
@@ -161,8 +146,7 @@ def test_host_gather_checkpoint_scale(rows):
 @pytest.mark.parametrize("rows", [32768, 32769, 131071, 131072, 131073])
 @pytest.mark.parametrize("table_shards", [1, 4])
 @pytest.mark.parametrize("scale_mode", ["none", "scalar", "row"])
-@pytest.mark.parametrize("background", [False, True])
-def test_host_gather_persistent_and_sorted(rows, table_shards, scale_mode, background):
+def test_host_gather_persistent_and_sorted(rows, table_shards, scale_mode):
     dtype = torch.bfloat16 if scale_mode == "none" else torch.float8_e4m3fn
     table = torch.randn(37, 160).to(dtype).pin_memory()
     cpu_ids = torch.arange(rows, dtype=torch.int64) % 48 - 3
@@ -182,7 +166,6 @@ def test_host_gather_persistent_and_sorted(rows, table_shards, scale_mode, backg
             scale,
             scales if scale_mode == "row" else None,
             table_shards=table_shards,
-            background=background,
         )
 
     run()
@@ -203,8 +186,7 @@ def test_host_gather_persistent_and_sorted(rows, table_shards, scale_mode, backg
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
 @pytest.mark.parametrize("table_shards", [1, 4])
-@pytest.mark.parametrize("background", [False, True])
-def test_host_gather_persistent_shapes_do_not_recompile(table_shards, background):
+def test_host_gather_persistent_shapes_do_not_recompile(table_shards):
     from tokenspeed_kernel.ops.ple.triton import (
         _ple_host_gather_kernel,
         _ple_host_gather_persistent_kernel,
@@ -225,7 +207,6 @@ def test_host_gather_persistent_shapes_do_not_recompile(table_shards, background
             None,
             None,
             table_shards=table_shards,
-            background=background,
         )
 
     for rows in (32768, 32769, 131072, 131073):
@@ -238,7 +219,7 @@ def test_host_gather_persistent_shapes_do_not_recompile(table_shards, background
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
-def test_host_gather_sorted_large_table_offset():
+def test_host_gather_large_table_offset():
     dim = 160
     table_rows = 2**31 // dim + 2
     table = torch.empty((table_rows, dim), dtype=torch.float8_e4m3fn, pin_memory=True)
@@ -248,16 +229,13 @@ def test_host_gather_sorted_large_table_offset():
     ids = torch.full((rows,), table_rows - 1, device="cuda", dtype=torch.int64)
     out = torch.empty((rows, dim), device="cuda", dtype=torch.bfloat16)
     scale = 0.00019931793212890625
-    ple.ple_host_gather(
-        table, ids, out, 0, table_rows, scale, None, table_shards=4, background=False
-    )
+    ple.ple_host_gather(table, ids, out, 0, table_rows, scale, None, table_shards=4)
     expected = (last.float() * scale).bfloat16().expand(rows, dim)
     torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
-@pytest.mark.parametrize("background", [False, True])
-def test_sorted_host_gather_on_side_stream_with_graph(background):
+def test_sorted_host_gather_on_side_stream_with_graph():
     table = torch.randn(31, 160).to(torch.float8_e4m3fn).pin_memory()
     cpu_ids = torch.arange(131073, dtype=torch.int64) % 31
     ids = cpu_ids.cuda()
@@ -279,7 +257,6 @@ def test_sorted_host_gather_on_side_stream_with_graph(background):
                 scale,
                 None,
                 table_shards=1,
-                background=background,
             )
         torch.cuda.current_stream().wait_stream(stream)
 

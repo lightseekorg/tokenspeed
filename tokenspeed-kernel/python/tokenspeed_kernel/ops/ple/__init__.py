@@ -74,7 +74,6 @@ def ple_host_gather(
     row_scale: torch.Tensor | None,
     *,
     table_shards: int,
-    background: bool,
 ) -> torch.Tensor:
     """Gather global n-gram IDs from a sharded table in pinned host memory.
 
@@ -93,9 +92,7 @@ def ple_host_gather(
             for an online-quantized FP8 table, or ``None`` for scalar scaling
             or compute-dtype storage. At most one scale mode is used.
         table_shards: Number of table partitions, or one for a complete table.
-            Selects launch geometry for the lookup's host-memory traffic.
-        background: Limit the gather grid to half the device's SM count
-            when sharing the GPU with the main computation stream.
+            Large lookups can be sorted when the table has one partition.
 
     Returns:
         The supplied ``out`` tensor, filled with gathered and dequantized rows.
@@ -108,17 +105,11 @@ def ple_host_gather(
         return out
     head_dim = out.shape[-1]
     flat_ids = ids.reshape(-1)
-    sorted_lookup = table_shards == 1 and rows >= 131072
-    block_rows = 32 if sorted_lookup else (4 if rows >= 256 else 1)
-    grid = _triton.cdiv(rows, block_rows)
-    if sorted_lookup or background:
+    if table_shards == 1 and rows >= 131072:
+        block_rows = 32
         sms = torch.cuda.get_device_properties(ids.device).multi_processor_count
-        grid_limit = max(1, sms // 2) if background else sms
-    if sorted_lookup or (background and grid > grid_limit):
-        grid = min(grid, grid_limit)
-        destination = flat_ids
-        if sorted_lookup:
-            flat_ids, destination = torch.sort(flat_ids)
+        grid = min(_triton.cdiv(rows, block_rows), sms)
+        flat_ids, destination = torch.sort(flat_ids)
         _ple_host_gather_persistent_kernel[(grid,)](
             current_platform().device_visible_data_ptr(table),
             flat_ids,
@@ -136,8 +127,7 @@ def ple_host_gather(
             ROW_SCALE=row_scale is not None,
             BLOCK_D=_triton.next_power_of_2(head_dim),
             BLOCK_R=block_rows,
-            SORTED=sorted_lookup,
-            num_warps=8 if sorted_lookup else block_rows,
+            num_warps=8,
         )
         return out
     block_rows = 4 if rows >= 256 else 1
