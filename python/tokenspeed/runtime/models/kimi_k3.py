@@ -2796,6 +2796,14 @@ class KimiLinearMoE(nn.Module):
             )
             offset += rows
 
+    def _apply_reads_gathered_fp8(self) -> bool:
+        # The A8W4 apply takes the FP8 latent the gather quantizes instead of
+        # quantizing the BF16 latent itself.
+        return (
+            self.experts.plan.get("apply_kernel_name")
+            == "gluon_mxfp4_a8w4_situ_precomputed_moe_apply"
+        )
+
     def _latent_input_projections(
         self,
         hidden_states: torch.Tensor,
@@ -2831,11 +2839,8 @@ class KimiLinearMoE(nn.Module):
                 hidden_states, self.packed_input_projection_weight
             )
         ):
-            # Project own columns and gather; A8W4 reuses the gathered FP8 latent.
-            quantize = (
-                self.experts.plan.get("apply_kernel_name")
-                == "gluon_mxfp4_a8w4_situ_precomputed_moe_apply"
-            )
+            # Project own columns and gather.
+            quantize = self._apply_reads_gathered_fp8()
             router_logits, routed_input, shared_input, *routed_fp8 = (
                 self.iris_state.latent_input_gather(
                     hidden_states,
@@ -2909,11 +2914,7 @@ class KimiLinearMoE(nn.Module):
             shared_out,
         ):
             return None
-        # A8W4 reuses the gathered FP8 latent.
-        quantize = (
-            self.experts.plan.get("apply_kernel_name")
-            == "gluon_mxfp4_a8w4_situ_precomputed_moe_apply"
-        )
+        quantize = self._apply_reads_gathered_fp8()
         router_logits, routed_input, routes, shared_partial, routed_fp8 = (
             self.iris_state.latent_input_gather_routed(
                 hidden_states,

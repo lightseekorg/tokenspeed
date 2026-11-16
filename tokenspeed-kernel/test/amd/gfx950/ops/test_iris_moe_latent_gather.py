@@ -47,20 +47,27 @@ def _require_iris():
     pytest.importorskip("tokenspeed_kernel.ops.communication._iris")
 
 
+@pytest.mark.parametrize("routed", (False, True))
 @pytest.mark.parametrize("quantize", (False, True))
 @pytest.mark.parametrize("rank", (0, 7))
-def test_latent_input_gather_codegen(rank, quantize, tmp_path):
+def test_latent_input_gather_codegen(rank, quantize, routed, tmp_path):
     """Publishers store whole words; the gathering retry rereads its words and
-    votes with one lane mask."""
+    votes with one lane mask, also in the routed kernel, which adds the router
+    and the shared down projection."""
     from tokenspeed_kernel._triton import gluon, triton
     from tokenspeed_kernel.ops.communication._iris.all_reduce import (
         iris_arch_policy,
     )
     from tokenspeed_kernel.ops.communication._iris.kimi_k3.latent_gather import (
         iris_k3moe_latent_input_gather,
+        iris_k3moe_latent_input_gather_routed,
     )
 
-    fn = iris_k3moe_latent_input_gather
+    fn = (
+        iris_k3moe_latent_input_gather_routed
+        if routed
+        else iris_k3moe_latent_input_gather
+    )
     constants = {
         "RANK": rank,
         "WORLD_SIZE": 8,
@@ -80,6 +87,14 @@ def test_latent_input_gather_codegen(rank, quantize, tmp_path):
         "FP8_MAX": 448.0,
         "MAX_ROWS": 256,
     }
+    if routed:
+        constants.update(
+            ROUTED_SCALING_FACTOR=1.0,
+            NORMALIZE_TOPK_WEIGHTS=True,
+            BLOCK_SHIFT=4,
+            DOWN_N=_HIDDEN,
+            DOWN_BLOCK_M=16,
+        )
     signature = {}
     attrs = {}
     for index, name in enumerate(fn.arg_names):
@@ -94,7 +109,7 @@ def test_latent_input_gather_codegen(rank, quantize, tmp_path):
         if name in ("beta", "linear_beta"):
             signature[name] = "fp32"
             continue
-        if name in ("tokens", "split_stride"):
+        if name in ("tokens", "split_stride", "down_out_stride"):
             signature[name] = "i32"
             continue
         signature[name] = {
@@ -104,6 +119,15 @@ def test_latent_input_gather_codegen(rank, quantize, tmp_path):
             "sync_ptr": "*i32",
             "scale_ptr": "*fp32",
             "epochs": "*i32",
+            "bias_ptr": "*fp32",
+            "topk_ids": "*i32",
+            "topk_weights": "*fp32",
+            "sorted_ids": "*i32",
+            "sorted_weights": "*fp32",
+            "sorted_expert_ids": "*i32",
+            "num_valid_ids": "*i32",
+            "route_scratch": "*i32",
+            "down_sync": "*i32",
         }.get(name, "*bf16")
         attrs[(index,)] = [["tt.divisibility", 16]]
     kernel = triton.compile(
@@ -112,8 +136,13 @@ def test_latent_input_gather_codegen(rank, quantize, tmp_path):
         options={"num_warps": 4},
     )
     assembly = kernel.asm["amdgcn"]
-    (tmp_path / f"latent-gather-rank{rank}-{quantize}.amdgcn").write_text(assembly)
-    assert not re.search(r"\bbuffer_(?:load_ushort|store_short)\b", assembly)
+    (tmp_path / f"latent-gather-rank{rank}-{quantize}-{routed}.amdgcn").write_text(
+        assembly
+    )
+    if not routed:
+        # The routed kernel also writes the SiTU input through in BF16; it
+        # publishes with the same helper.
+        assert not re.search(r"\bbuffer_(?:load_ushort|store_short)\b", assembly)
     assert re.search(r"\.vgpr_spill_count:\s+0\b", assembly)
     polls = [
         cycle
