@@ -4180,7 +4180,12 @@ def test_unbatched_indexer_preserves_request_windows(monkeypatch, reindex):
 
 def test_unbatched_indexer_reserves_one_history(monkeypatch):
     recipe = _index_scratch_recipe(max_query_tokens=256)
-    recipe.attn_config = replace(recipe.attn_config, max_bs=256, context_len=1 << 20)
+    recipe.attn_config = replace(
+        recipe.attn_config,
+        max_bs=256,
+        max_resident_requests=256,
+        context_len=1 << 20,
+    )
     recipe.server_args.disaggregation_mode = "prefill"
     monkeypatch.setattr(dsv41, "prefill_indexer_batching_supported", lambda _: False)
     single = recipe.workspace_bytes()

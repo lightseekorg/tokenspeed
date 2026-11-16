@@ -256,6 +256,8 @@ class _DenseFFN(nn.Module):
         self.use_mega_moe = False
         self.owns_ep_communication = False
         self.use_gluon_petit = False
+        self.gate = nn.Module()
+        self.gate.register_parameter("bias_vl", None)
 
     def forward(
         self,
@@ -573,14 +575,27 @@ def test_decoder_layer_requires_explicit_forward_mode():
 
 @pytest.mark.parametrize("tokens", [0, 3])
 @pytest.mark.parametrize("owns_ep", [False, True])
+@pytest.mark.parametrize("attention_dp", [False, True])
 def test_empty_decoder_rows_complete_hc_and_preserve_ep_participation(
-    monkeypatch, tokens, owns_ep
+    monkeypatch, tokens, owns_ep, attention_dp
 ):
     monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
     config = _config()
+    mapping = (
+        v41.Mapping(
+            rank=0,
+            world_size=2,
+            attn_tp_size=1,
+            dense_tp_size=1,
+            moe_tp_size=1,
+            moe_ep_size=2,
+        )
+        if attention_dp
+        else _mapping(0, 1, 1)
+    )
     layer = DeepseekV41DecoderLayer(
         config,
-        _mapping(0, 1, 1),
+        mapping,
         0,
         0,
         None,
@@ -659,15 +674,265 @@ def test_empty_decoder_rows_complete_hc_and_preserve_ep_participation(
     assert pre_out.shape == (0, 4) and pending_out is None
     torch.testing.assert_close(tap, completed.mean(1) if tokens else hidden[:, 0, :])
     assert events == (["global_kv"] if tokens else []) + (
-        ["ffn"] if owns_ep or not tokens else []
+        ["ffn"] if owns_ep or attention_dp or not tokens else []
     )
     if tokens:
         pending.finish.assert_called_once_with(hidden)
-    assert before.call_count == after.call_count == int(not owns_ep and not tokens)
+    assert (
+        before.call_count
+        == after.call_count
+        == int(not owns_ep and (attention_dp or not tokens))
+    )
     forbidden.assert_not_called()
     if owns_ep:
         with pytest.raises(ValueError, match="cannot defer its reduction"):
             layer._forward_ffn(hidden[:, 0, :], image_mask, ctx, defer_reduce=True)
+
+
+@pytest.fixture
+def ordinary_dp_model(monkeypatch):
+    """Keep real model/communication code; emulate the missing peer and kernels."""
+    from tokenspeed.runtime.distributed import comm_manager
+    from tokenspeed.runtime.distributed.process_group_manager import ProcessGroupManager
+
+    mapping = v41.Mapping(
+        rank=0,
+        world_size=2,
+        attn_tp_size=1,
+        dense_tp_size=1,
+        moe_tp_size=1,
+        moe_ep_size=2,
+    )
+    manager = ProcessGroupManager()
+    group = object()
+    manager.register_process_group("gloo", (0, 1), group, name="v41_decoder_counts")
+    monkeypatch.setattr(manager, "init_process_group", lambda *args, **kwargs: None)
+    monkeypatch.setattr(v41, "pg_manager", manager)
+    monkeypatch.setattr(v41, "get_moe_backend", lambda: MoeBackend.TRITON)
+    monkeypatch.setitem(global_server_args_dict, "disable_prefill_graph", True)
+    monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
+
+    def exchange(counts, local, *, group):
+        assert group is manager.get_process_group(
+            "gloo", (0, 1), name="v41_decoder_counts"
+        )
+        counts[:] = [local, 2]
+
+    def gather(x, group, scattered_num_tokens):
+        assert tuple(group) == (0, 1)
+        assert scattered_num_tokens[0] == len(x)
+        peer = x.new_zeros((scattered_num_tokens[1], x.shape[1]))
+        # A peer's image rows must travel with that peer's activations.
+        if x.shape[1] == 136:
+            assert x.stride(0) * x.element_size() % 16 == 0
+            peer[:, 128] = 1
+        return torch.cat((x, peer))
+
+    def scatter(x, group, scattered_num_tokens):
+        assert tuple(group) == (0, 1)
+        assert len(x) == sum(scattered_num_tokens)
+        return x[: scattered_num_tokens[0]]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", exchange)
+    monkeypatch.setattr(comm_manager, "token_all_gather", gather)
+    monkeypatch.setattr(comm_manager, "token_reduce_scatter", scatter)
+    return DeepseekV41Model(_config(), mapping, None, "model", False, "gpu", None)
+
+
+@pytest.mark.parametrize("dense_tp_size", [1, 2])
+@pytest.mark.parametrize("moe_tp_size,moe_ep_size", [(1, 2), (2, 1)])
+def test_ordinary_dp_ep_rejects_tensor_parallel_layouts(
+    monkeypatch, dense_tp_size, moe_tp_size, moe_ep_size
+):
+    monkeypatch.setattr(v41, "get_moe_backend", lambda: MoeBackend.TRITON)
+    monkeypatch.setitem(global_server_args_dict, "disable_prefill_graph", True)
+    mapping = v41.Mapping(
+        rank=0,
+        world_size=4,
+        attn_tp_size=2,
+        dense_tp_size=dense_tp_size,
+        moe_tp_size=moe_tp_size,
+        moe_ep_size=moe_ep_size,
+    )
+    with pytest.raises(
+        NotImplementedError,
+        match="ordinary attention DP/EP requires attention/dense/MoE TP1",
+    ):
+        DeepseekV41Model(_config(), mapping, None, "model", False, "gpu", None)
+
+
+@pytest.mark.parametrize(
+    "backend,attn_tp_size,dense_tp_size,moe_tp_size,moe_ep_size,disable_prefill_graph",
+    [
+        (MoeBackend.TRITON, 1, 1, 1, 2, True),
+        (MoeBackend.TRITON, 2, 2, 1, 2, False),
+        (MoeBackend.TRITON, 2, 2, 2, 1, False),
+        (MoeBackend.MEGA_MOE, 1, 1, 1, 2, False),
+    ],
+)
+def test_model_constructor_accepts_supported_parallel_layouts(
+    monkeypatch,
+    backend,
+    attn_tp_size,
+    dense_tp_size,
+    moe_tp_size,
+    moe_ep_size,
+    disable_prefill_graph,
+):
+    mapping = v41.Mapping(
+        rank=0,
+        world_size=2,
+        attn_tp_size=attn_tp_size,
+        dense_tp_size=dense_tp_size,
+        moe_tp_size=moe_tp_size,
+        moe_ep_size=moe_ep_size,
+    )
+    monkeypatch.setattr("tokenspeed.runtime.layers.moe.utils.MOE_BACKEND", backend)
+    monkeypatch.setitem(global_server_args_dict, "mapping", mapping)
+    monkeypatch.setitem(
+        global_server_args_dict, "disable_prefill_graph", disable_prefill_graph
+    )
+    monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
+    # No weights or peers are needed to exercise the real model constructor.
+    monkeypatch.setattr(pg_manager, "init_process_group", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pg_manager, "get_device_process_group", lambda group: None)
+    monkeypatch.setattr(
+        expert_module,
+        "kernel_moe_plan",
+        lambda *args, **kwargs: {
+            "solution": backend.value,
+            "support_routing": False,
+            "supports_precomputed_topk": True,
+            "supports_deferred_finalize": False,
+            "topk_weights_dtype": torch.float32,
+            "weight_preprocessor": None,
+            "warmup": None,
+        },
+    )
+    config = _loader_config()
+    config.hidden_size = 256
+    config.engram_layer_ids = []
+    with torch.device("meta"):
+        DeepseekV41Model(config, mapping, _quant(), "model", False, "gpu", None)
+
+
+def test_model_constructor_preserves_fused_ep_layout_requirement(monkeypatch):
+    monkeypatch.setattr(v41, "get_moe_backend", lambda: MoeBackend.MEGA_MOE)
+    mapping = v41.Mapping(
+        rank=0,
+        world_size=2,
+        attn_tp_size=1,
+        dense_tp_size=2,
+        moe_tp_size=1,
+        moe_ep_size=2,
+    )
+    with pytest.raises(NotImplementedError, match="requires attention TP == MoE TPxEP"):
+        DeepseekV41Model(_config(), mapping, None, "model", False, "gpu", None)
+
+
+def test_ordinary_dp_ep_requires_disabled_prefill_graph(monkeypatch):
+    monkeypatch.setattr(v41, "get_moe_backend", lambda: MoeBackend.TRITON)
+    monkeypatch.setitem(global_server_args_dict, "disable_prefill_graph", False)
+    mapping = v41.Mapping(
+        rank=0,
+        world_size=2,
+        attn_tp_size=1,
+        dense_tp_size=1,
+        moe_tp_size=1,
+        moe_ep_size=2,
+    )
+    with pytest.raises(ValueError, match="requires --disable-prefill-graph"):
+        DeepseekV41Model(_config(), mapping, None, "model", False, "gpu", None)
+
+
+def test_decoder_counts_preserve_decode_and_fused_ep_boundaries(
+    monkeypatch, ordinary_dp_model
+):
+    model = ordinary_dp_model
+    ctx = _ctx(None, 3, ForwardMode.EXTEND)
+    ctx.global_num_tokens = [9, 7]
+    assert model.decoder_collective_counts(ctx, 3) == [3, 2]
+    assert ctx.global_num_tokens == [9, 7]
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("decode and fused EP must not exchange host counts")
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", forbidden)
+    ctx.all_decode_or_idle = True
+    assert model.decoder_collective_counts(ctx, 3) is ctx.global_num_tokens
+    ctx.all_decode_or_idle = False
+    model.layers[model.ced_decoder_start].ffn.owns_ep_communication = True
+    assert model.decoder_collective_counts(ctx, 3) is None
+
+
+def test_ordinary_dp_prefill_rejects_capture(monkeypatch, ordinary_dp_model):
+    ctx = _ctx(None, 3, ForwardMode.EXTEND)
+    ctx.global_num_tokens = [9, 7]
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    with pytest.raises(RuntimeError, match="requires --disable-prefill-graph"):
+        ordinary_dp_model.decoder_collective_counts(ctx, 3)
+
+
+def test_ordinary_dp_idle_rank_joins_narrowed_expert_collectives(ordinary_dp_model):
+    model = ordinary_dp_model
+    seen = []
+    stage_counts = []
+
+    def observe(module, args):
+        seen.append(len(args[0]))
+
+    def observe_stage(module, args):
+        stage_counts.append(args[4].collective_global_num_tokens)
+
+    handles = [layer.ffn.register_forward_pre_hook(observe) for layer in model.layers]
+    handles.extend(
+        layer.register_forward_pre_hook(observe_stage) for layer in model.layers
+    )
+    ids = torch.empty(0, dtype=torch.int64)
+    ctx = _ctx(None, 0, ForwardMode.IDLE)
+    ctx.global_num_tokens = [0, 2]
+    hidden, captured = model(
+        ids,
+        ids,
+        ctx,
+        None,
+        None,
+        engram_hash_ids=None,
+        engram_token_mask=None,
+        image_mask=None,
+    )
+    for handle in handles:
+        handle.remove()
+    assert hidden.shape == (0, model.config.hidden_size) and captured is None
+    # The idle rank computes the peer's rows, then scatters an empty local result.
+    assert seen == [2] * model.config.num_hidden_layers
+    start = model.ced_decoder_start
+    assert stage_counts == [None] * start + [[0, 2]] * (len(model.layers) - start)
+    assert ctx.collective_num_tokens is ctx.collective_global_num_tokens is None
+
+
+@pytest.mark.parametrize("local_images", [False, True])
+def test_ordinary_dp_gathers_image_mask_with_activations(
+    monkeypatch, ordinary_dp_model, local_images
+):
+    layer = ordinary_dp_model.layers[0]
+    layer.ffn.gate.bias_vl = nn.Parameter(torch.ones(1))
+    x = torch.arange(3 * 128, dtype=torch.bfloat16).reshape(3, 128)
+    mask = torch.tensor([True, False, True]) if local_images else None
+    ctx = _ctx(None, 3, ForwardMode.EXTEND)
+    ctx.global_num_tokens = [3, 2]
+    expected_mask = torch.tensor([local_images, False, local_images, True, True])
+
+    def ffn(x, image_mask, total, maximum, ctx, comm_manager, out=None):
+        assert (total, maximum) == (5, 3)
+        assert x.is_contiguous()
+        torch.testing.assert_close(image_mask, expected_mask)
+        return x + image_mask[:, None] * 8
+
+    monkeypatch.setattr(layer.ffn, "forward", ffn)
+    actual = layer._forward_ffn(x, mask, ctx, defer_reduce=False)
+    torch.testing.assert_close(actual, x + expected_mask[:3, None] * 8)
 
 
 def test_idle_model_calls_every_ep_layer_with_completed_empty_state(monkeypatch):
@@ -1888,8 +2153,11 @@ def test_full_40_layer_backbone_engram_and_final_mix(monkeypatch):
     assert forwarded["input_embeds"] is forwarded["pp_inbound"] is None
 
 
+@pytest.mark.parametrize("attention_dp", [False, True])
 def test_decoder_narrowing_projects_global_from_all_rows_then_runs_the_tail(
     monkeypatch,
+    attention_dp,
+    ordinary_dp_model,
 ):
     """Layers below the candidate source see every row; the candidate source
     writes its global KV for every row and then narrows to the decoder view;
@@ -1898,8 +2166,12 @@ def test_decoder_narrowing_projects_global_from_all_rows_then_runs_the_tail(
     monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
     torch.manual_seed(7)
     config = _config()
-    model = DeepseekV41Model(
-        config, _mapping(0, 1, 1), None, "model", False, "gpu", None
+    model = (
+        ordinary_dp_model
+        if attention_dp
+        else DeepseekV41Model(
+            config, _mapping(0, 1, 1), None, "model", False, "gpu", None
+        )
     )
     _initialize(model)
     model.initialize_engram(_Tokenizer())
@@ -1924,6 +2196,8 @@ def test_decoder_narrowing_projects_global_from_all_rows_then_runs_the_tail(
     )
     backend = _Backend(positions, requests, view)
     ctx = _ctx(backend, 6, ForwardMode.EXTEND)
+    if attention_dp:
+        ctx.global_num_tokens = [6, 2]
     ctx.bs = ctx.num_extends = 2
     ctx.output_layout = ForwardOutputLayout(2, 2, 0, 1)
     ctx.capture_hidden_mode = CaptureHiddenMode.FULL
@@ -1948,6 +2222,7 @@ def test_decoder_narrowing_projects_global_from_all_rows_then_runs_the_tail(
                 hidden.shape[0],
                 layer_positions.tolist(),
                 layer_ctx.collective_num_tokens,
+                layer_ctx.collective_global_num_tokens,
                 v41._row_plan(
                     module.layer_id, module.ced_decoder_start, layer_ctx
                 ).keep_rows
@@ -1978,10 +2253,11 @@ def test_decoder_narrowing_projects_global_from_all_rows_then_runs_the_tail(
     )
     for handle in handles:
         handle.remove()
-    assert seen[19] == (6, [0, 1, 2, 3, 0, 1], None, False)
-    assert seen[20] == (6, [0, 1, 2, 3, 0, 1], 3, True)
-    assert seen[21] == (3, [3, 0, 1], 3, False)
-    assert seen[39] == (3, [3, 0, 1], 3, False)
+    counts = [3, 2] if attention_dp else None
+    assert seen[19] == (6, [0, 1, 2, 3, 0, 1], None, None, False)
+    assert seen[20] == (6, [0, 1, 2, 3, 0, 1], 3, counts, True)
+    assert seen[21] == (3, [3, 0, 1], 3, counts, False)
+    assert seen[39] == (3, [3, 0, 1], 3, counts, False)
     # Changing these batch shapes can change split-K/quantized arithmetic
     # for the retained rows. Only zero-output chunks may bypass projections.
     assert projection_rows == {"hc": 6, "qkv": 6}
