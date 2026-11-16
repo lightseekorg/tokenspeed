@@ -215,7 +215,7 @@ never convert a plane:
 
 | dtype | `index_k_format` | `index_k_layout` | row |
 | --- | --- | --- | --- |
-| `uint8` | `fp8_scaled` | `packed` | `[slots, head_dim + 4 * head_dim / 128]`: FP8 E4M3 keys followed by one fp32 scale per 128 elements |
+| `uint8` | `fp8_scaled` | `packed` | `[slots, head_dim + 4 * head_dim / 128]`: FP8 E4M3 keys followed by one four-byte scale word per 128 elements |
 | `uint8` | `fp8_scaled` | `page_planar` | any other uint8 shape: per-page planes of keys and scales, the outer page stride possibly padded |
 | `bfloat16` | `bf16` | `packed` | `[slots, head_dim]`: the keys as the indexer produced them, no scale plane |
 
@@ -224,7 +224,12 @@ and its scale view must preserve the plane's storage offset. The packed FP8
 row above is the plane's tensor shape; in memory each page stores the key
 bytes of all its slots first, then their FP32 scales.
 
-The in-tree DeepGEMM, Triton, and Gluon leaves score `fp8_scaled` planes. A
+The in-tree DeepGEMM, Triton, and Gluon leaves score `fp8_scaled` planes.
+The four-byte scale word is the fp32 scale on sm90 and, on Blackwell, that
+scale rounded up to a power of two as four equal UE8M0 bytes
+(`kvcache/index_k_scale.py`): DeepGEMM 2.8.2's sm100 MQA logits read it as
+the MX scales of the row's four 32-element groups, and every Blackwell
+writer and reader of the plane uses that encoding. A
 leaf scoring the checkpoint's bf16 keys registers `index_k_format={"bf16"}`
 and `index_k_layout={"packed"}`, so a bf16 plane selects it and nothing else.
 A leaf that must reproduce an RL trainer's selection order also declares the

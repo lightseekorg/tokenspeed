@@ -34,7 +34,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.quantization import quantize_fp8
+from tokenspeed_kernel.ops.kvcache.triton import quantize_index_k_rows
 
 from tokenspeed.runtime.layers.attention.configs.dsa import (
     index_k_plane_dtype,
@@ -104,22 +104,14 @@ def expected_index_k_rows(
     index_k_format: str, keys: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """What the pool stores for ``keys`` and the history gather hands back:
-    the bf16 keys and no scale, or their FP8 bytes (uint8) and fp32 scales as
+    the bf16 keys and no scale, or their FP8 bytes (uint8) and scale words as
     the pool's own quantizer produces them."""
     keys = keys.to(torch.bfloat16)
     if index_k_format == "bf16":
         return keys, None
-    fp8, scale = quantize_fp8(
-        keys.to(_write_device(index_k_format)),
-        granularity="token_group",
-        group_size=FP8_GROUP_SIZE,
-        scale_encoding="float32",
+    fp8, scale = quantize_index_k_rows(
+        keys.to(_write_device(index_k_format)), group_size=FP8_GROUP_SIZE
     )
-    # The quantizer's scale layout is backend-specific (flattened, possibly
-    # padded past the rows); the scatter reads it as row-major
-    # ``[rows, groups]`` (``index_k_block_split_scatter``), and so does this.
-    rows, groups = keys.shape[0], keys.shape[1] // FP8_GROUP_SIZE
-    scale = scale.reshape(-1)[: rows * groups].reshape(rows, groups)
     return fp8.view(torch.uint8).cpu(), scale.cpu()
 
 
