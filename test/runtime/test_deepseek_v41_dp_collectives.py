@@ -20,12 +20,18 @@
 
 """Two-rank CPU regression for V4.1 DP/EP collective ordering.
 
-Run with ``torchrun --standalone --nproc_per_node=2 -m pytest`` and this file.
+Run with ``torchrun --standalone --nproc_per_node=2 -m pytest`` and this file,
+or use ordinary pytest to launch the registered two-rank regression.
 """
 
 from __future__ import annotations
 
+import json
 import os
+import subprocess
+import sys
+import time
+from pathlib import Path
 from test.runtime.test_deepseek_v41_model import (
     DeepseekV41Model,
     _config,
@@ -35,9 +41,11 @@ from test.runtime.test_deepseek_v41_model import (
 )
 from types import SimpleNamespace
 
+import psutil
 import pytest
 import torch
 import torch.distributed as dist
+from ci_system.ci_register import register_cuda_ci
 from torch import nn
 
 from tokenspeed.runtime.distributed import comm_ops
@@ -52,6 +60,8 @@ from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
 from tokenspeed.runtime.layers.moe.utils import MoeBackend
 from tokenspeed.runtime.models import deepseek_v41 as v41
 from tokenspeed.runtime.utils.env import global_server_args_dict
+
+register_cuda_ci(est_time=60, suite="runtime-1gpu")
 
 
 class _GlooCommTransport:
@@ -174,6 +184,124 @@ class _CpuAttentionBackend:
 
     def decoder_view(self):
         return self.view
+
+
+def _stop_owned_process_tree(process, root, known_children):
+    """Stop a Popen process and the descendants it still owns, with bounded waits."""
+    tree_error = None
+    descendants = dict(known_children)
+    if root is not None:
+        try:
+            descendants.update(
+                (child.pid, child) for child in root.children(recursive=True)
+            )
+        except psutil.NoSuchProcess:
+            pass
+        except psutil.Error as error:
+            tree_error = error
+        except OSError as error:
+            tree_error = error
+
+    descendants = list(descendants.values())
+    for child in reversed(descendants):
+        try:
+            child.terminate()
+        except psutil.NoSuchProcess:
+            pass
+    if root is not None:
+        try:
+            root.terminate()
+        except psutil.NoSuchProcess:
+            pass
+
+    _, alive = psutil.wait_procs(descendants, timeout=2)
+    for child in alive:
+        try:
+            child.kill()
+        except psutil.NoSuchProcess:
+            pass
+    _, alive = psutil.wait_procs(alive, timeout=2)
+    running = []
+    for child in alive:
+        try:
+            if child.status() != psutil.STATUS_ZOMBIE:
+                running.append(child.pid)
+        except psutil.NoSuchProcess:
+            pass
+    if running:
+        raise TimeoutError(f"could not stop owned child processes: {running}")
+
+    if process.poll() is None:
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            if root is not None:
+                try:
+                    root.kill()
+                except psutil.NoSuchProcess:
+                    pass
+            process.wait(timeout=2)
+    if tree_error is not None:
+        raise TimeoutError("could not enumerate owned child processes") from tree_error
+
+
+def _run_gloo_workers(command, timeout):
+    """Run a subprocess tree with bounded completion and timeout cleanup."""
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        root = psutil.Process(process.pid)
+    except psutil.NoSuchProcess:
+        root = None
+    known_children = {}
+    deadline = time.monotonic() + timeout
+    try:
+        try:
+            while True:
+                if root is not None:
+                    try:
+                        known_children.update(
+                            (child.pid, child)
+                            for child in root.children(recursive=True)
+                        )
+                    except psutil.NoSuchProcess:
+                        pass
+                remaining = max(0.0, deadline - time.monotonic())
+                try:
+                    stdout, stderr = process.communicate(timeout=min(0.1, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    if time.monotonic() >= deadline:
+                        raise
+        except subprocess.TimeoutExpired as timeout_error:
+            _stop_owned_process_tree(process, root, known_children)
+            try:
+                stdout, stderr = process.communicate(timeout=2)
+            except subprocess.TimeoutExpired as cleanup_error:
+                stdout = cleanup_error.output or timeout_error.output or ""
+                stderr = cleanup_error.stderr or timeout_error.stderr or ""
+                raise TimeoutError(
+                    f"child pipes remained open after process cleanup\n"
+                    f"stdout:\n{stdout}\nstderr:\n{stderr}"
+                ) from timeout_error
+            raise TimeoutError(
+                f"command timed out after {timeout} seconds\n"
+                f"stdout:\n{stdout}\nstderr:\n{stderr}"
+            ) from timeout_error
+        return process.returncode, stdout, stderr
+    finally:
+        try:
+            _stop_owned_process_tree(process, root, known_children)
+        finally:
+            if process.stdout is not None:
+                process.stdout.close()
+            if process.stderr is not None:
+                process.stderr.close()
 
 
 def _case_rows(name, rank):
@@ -354,3 +482,83 @@ def test_dp_ep_collectives_keep_real_two_rank_data_flow(monkeypatch):
         _run_round(model, reference_model, rank, name, round_index, transport)
 
     dist.barrier()
+
+
+@pytest.mark.skipif(
+    "RANK" in os.environ,
+    reason="the distributed worker is already running under torchrun",
+)
+@pytest.mark.skipif(not dist.is_gloo_available(), reason="Gloo is required")
+def test_dp_ep_collectives_ci_runs_two_rank_gloo():
+    """Run the real distributed regression from ordinary single-process pytest."""
+    test_file = str(Path(__file__).resolve())
+    command = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        "--nproc_per_node=2",
+        "-m",
+        "pytest",
+        "-q",
+        f"{test_file}::test_dp_ep_collectives_keep_real_two_rank_data_flow",
+    ]
+    try:
+        returncode, stdout, stderr = _run_gloo_workers(command, timeout=180)
+    except TimeoutError as error:
+        pytest.fail(str(error))
+
+    assert returncode == 0, (
+        f"two-rank Gloo regression exited with {returncode}\n"
+        f"stdout:\n{stdout}\nstderr:\n{stderr}"
+    )
+
+
+@pytest.mark.parametrize("launcher_exits_early", [False, True])
+def test_gloo_worker_timeout_kills_detached_descendant(tmp_path, launcher_exits_early):
+    marker = tmp_path / "worker.json"
+    worker_code = (
+        "import json, os, psutil, signal, time\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        f"worker = psutil.Process(); open({str(marker)!r}, 'w').write("
+        "json.dumps([worker.pid, worker.create_time()]))\n"
+        "print('detached worker ready', flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    launcher_code = (
+        "import subprocess, sys, time\n"
+        f"subprocess.Popen([sys.executable, '-c', {worker_code!r}], "
+        "start_new_session=True)\n"
+        f"time.sleep({0.5 if launcher_exits_early else 60})\n"
+    )
+
+    try:
+        started = time.monotonic()
+        with pytest.raises(TimeoutError, match="command timed out"):
+            _run_gloo_workers([sys.executable, "-c", launcher_code], timeout=5)
+        assert time.monotonic() - started < 20
+
+        worker_pid, worker_create_time = json.loads(marker.read_text())
+        try:
+            worker = psutil.Process(worker_pid)
+        except psutil.NoSuchProcess:
+            return
+        if worker.create_time() == worker_create_time:
+            assert worker.status() == psutil.STATUS_ZOMBIE or not worker.is_running()
+    finally:
+        if marker.exists():
+            worker_pid, worker_create_time = json.loads(marker.read_text())
+            try:
+                worker = psutil.Process(worker_pid)
+            except psutil.NoSuchProcess:
+                pass
+            else:
+                if (
+                    worker.create_time() == worker_create_time
+                    and worker.status() != psutil.STATUS_ZOMBIE
+                ):
+                    try:
+                        worker.kill()
+                        worker.wait(timeout=2)
+                    except psutil.NoSuchProcess:
+                        pass

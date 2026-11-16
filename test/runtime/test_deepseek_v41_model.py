@@ -739,6 +739,97 @@ def ordinary_dp_model(monkeypatch):
     return DeepseekV41Model(_config(), mapping, None, "model", False, "gpu", None)
 
 
+@pytest.mark.parametrize("dense_tp_size", [1, 2])
+@pytest.mark.parametrize("moe_tp_size,moe_ep_size", [(1, 2), (2, 1)])
+def test_ordinary_dp_ep_rejects_tensor_parallel_layouts(
+    monkeypatch, dense_tp_size, moe_tp_size, moe_ep_size
+):
+    monkeypatch.setattr(v41, "get_moe_backend", lambda: MoeBackend.TRITON)
+    monkeypatch.setitem(global_server_args_dict, "disable_prefill_graph", True)
+    mapping = v41.Mapping(
+        rank=0,
+        world_size=4,
+        attn_tp_size=2,
+        dense_tp_size=dense_tp_size,
+        moe_tp_size=moe_tp_size,
+        moe_ep_size=moe_ep_size,
+    )
+    with pytest.raises(
+        NotImplementedError,
+        match="ordinary attention DP/EP requires attention/dense/MoE TP1",
+    ):
+        DeepseekV41Model(_config(), mapping, None, "model", False, "gpu", None)
+
+
+@pytest.mark.parametrize(
+    "backend,attn_tp_size,dense_tp_size,moe_tp_size,moe_ep_size,disable_prefill_graph",
+    [
+        (MoeBackend.TRITON, 1, 1, 1, 2, True),
+        (MoeBackend.TRITON, 2, 2, 1, 2, False),
+        (MoeBackend.TRITON, 2, 2, 2, 1, False),
+        (MoeBackend.MEGA_MOE, 1, 1, 1, 2, False),
+    ],
+)
+def test_model_constructor_accepts_supported_parallel_layouts(
+    monkeypatch,
+    backend,
+    attn_tp_size,
+    dense_tp_size,
+    moe_tp_size,
+    moe_ep_size,
+    disable_prefill_graph,
+):
+    mapping = v41.Mapping(
+        rank=0,
+        world_size=2,
+        attn_tp_size=attn_tp_size,
+        dense_tp_size=dense_tp_size,
+        moe_tp_size=moe_tp_size,
+        moe_ep_size=moe_ep_size,
+    )
+    monkeypatch.setattr("tokenspeed.runtime.layers.moe.utils.MOE_BACKEND", backend)
+    monkeypatch.setitem(global_server_args_dict, "mapping", mapping)
+    monkeypatch.setitem(
+        global_server_args_dict, "disable_prefill_graph", disable_prefill_graph
+    )
+    monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
+    # No weights or peers are needed to exercise the real model constructor.
+    monkeypatch.setattr(pg_manager, "init_process_group", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pg_manager, "get_device_process_group", lambda group: None)
+    monkeypatch.setattr(
+        expert_module,
+        "kernel_moe_plan",
+        lambda *args, **kwargs: {
+            "solution": backend.value,
+            "support_routing": False,
+            "supports_precomputed_topk": True,
+            "supports_deferred_finalize": False,
+            "topk_weights_dtype": torch.float32,
+            "weight_preprocessor": None,
+            "warmup": None,
+        },
+    )
+    config = _loader_config()
+    config.hidden_size = 256
+    config.engram_layer_ids = []
+    with torch.device("meta"):
+        DeepseekV41Model(config, mapping, _quant(), "model", False, "gpu", None)
+
+
+def test_model_constructor_preserves_fused_ep_layout_requirement(monkeypatch):
+    monkeypatch.setattr(v41, "get_moe_backend", lambda: MoeBackend.MEGA_MOE)
+    mapping = v41.Mapping(
+        rank=0,
+        world_size=2,
+        attn_tp_size=1,
+        dense_tp_size=2,
+        moe_tp_size=1,
+        moe_ep_size=2,
+    )
+    with pytest.raises(NotImplementedError, match="requires attention TP == MoE TPxEP"):
+        DeepseekV41Model(_config(), mapping, None, "model", False, "gpu", None)
+
+
 def test_ordinary_dp_ep_requires_disabled_prefill_graph(monkeypatch):
     monkeypatch.setattr(v41, "get_moe_backend", lambda: MoeBackend.TRITON)
     monkeypatch.setitem(global_server_args_dict, "disable_prefill_graph", False)

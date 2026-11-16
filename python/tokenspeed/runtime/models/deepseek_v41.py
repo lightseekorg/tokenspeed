@@ -47,8 +47,9 @@ keeps -- each prompt's last window (one row for a chunk that leaves its prompt
 open) plus every decode row -- after the candidate source has written the
 decoder's global KV for all rows. DSpark captures the kept rows and the model
 reports them as ``ctx.captured_rows``. PP and CP are not implemented.
-Attention and MoE TPxEP widths match, or fused EP keeps attention/dense/MoE
-TP1 rows local. Its dispatch exchanges actual counts after CED narrowing.
+Attention and MoE TPxEP widths match, or attention/dense/MoE use TP1.
+Fused EP keeps rows local and exchanges actual counts after CED narrowing.
+Ordinary attention DP/EP requires attention/dense/MoE TP1 and eager prefill.
 
 The forward is four stages on one path -- ``encoder_forward`` (embedding and
 the layers below the candidate source, one row per token), ``narrowing_forward``
@@ -2499,6 +2500,10 @@ class DeepseekV41Model(nn.Module):
         if mapping.attn.has_dp and not (
             get_moe_backend().is_gluon_petit() or get_moe_backend().is_mega_moe()
         ):
+            if not local_ep:
+                raise NotImplementedError(
+                    "V4.1 ordinary attention DP/EP requires attention/dense/MoE TP1"
+                )
             if not global_server_args_dict["disable_prefill_graph"]:
                 raise ValueError("V4.1 ordinary DP/EP requires --disable-prefill-graph")
             # Forward and scheduler threads must not interleave collectives
