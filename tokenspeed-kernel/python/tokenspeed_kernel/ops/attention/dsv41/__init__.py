@@ -50,7 +50,11 @@ the block's ids, positions, HC mix and workspace addressing.
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.ops.attention.dsv41._inputs import IndexKeyInput, IndexQueryInput
+from tokenspeed_kernel.ops.attention.dsv41._inputs import (
+    IndexKeyInput,
+    IndexQueryInput,
+    SelectionSlots,
+)
 from tokenspeed_kernel.ops.attention.dsv41._metadata import index_logit_rows
 from tokenspeed_kernel.ops.attention.mla._triton.page_table import bounded_group_slots
 from tokenspeed_kernel.registry import KernelRegistry
@@ -60,6 +64,7 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 __all__ = [
     "IndexKeyInput",
     "IndexQueryInput",
+    "SelectionSlots",
     "decode_rows",
     "decode_window",
     "global_slots",
@@ -82,6 +87,7 @@ __all__ = [
     "new_attention_schedule",
     "index_score",
     "index_topk",
+    "prepare_index_topk",
     "new_index_metadata",
     "index_logit_rows",
     "index_select_all",
@@ -679,6 +685,7 @@ def index_topk(
     out: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None,
     solution: str | None,
     index_metadata: object | None = None,
+    slots: SelectionSlots | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Bounded Full/Reindex scoring, Top-K rows, and optional source candidates.
 
@@ -717,6 +724,10 @@ def index_topk(
             rows of one request. Table, lengths, request IDs and candidate contents must
             not change while sharing this object; graph replay refreshes the
             captured producers. A new invocation needs a fresh object.
+        slots: SelectionSlots covering the T query rows, or None (default)
+            for no slots. Its out then receives global_slots of the selected
+            row IDs. The Blackwell native selection resolves them in its
+            finishing kernel; other kernels run global_slots after selecting.
 
     Returns:
         (logical_row_ids, row_lengths, candidate_block_ids, candidate_lengths).
@@ -741,9 +752,11 @@ def index_topk(
     kernel selects. This native accumulation
     differs from the portable reference's intermediate BF16 rounding.
     Blackwell paged scoring (decode and verify) uses query_chunk_size and
-    optional request IDs; its cleaned rows have native-aligned strides and are
-    borrowed by TopK with exclusive ends. Blackwell dense scoring (prefill,
-    history_rows) scores the caller's whole batch: packed keys plus per-row
+    optional request IDs; invalid pages before each row's end are set to -inf
+    in DeepGEMM's own rows, which TopK borrows with exclusive ends (a cleaned
+    copy only when their stride misses DeepSelect's alignment). Blackwell
+    dense scoring (prefill, history_rows) scores the caller's whole batch:
+    packed keys plus per-row
     cu_seq_len starts, without a 128MiB inner tile. The runtime keeps one
     call's BF16 logits within index_logit_rows. DeepSelect borrows the MQA
     view; invalid pages before each row's end are set to -inf in place.
@@ -764,11 +777,11 @@ def index_topk(
     final tiles. Other page strides keep full scoring
     followed by candidate masking. The candidate selection semantics are the
     same; BF16 scores need not produce the FP32 path's exact Top-K at ties.
+    The Blackwell native selection finishes each tile in one kernel: the row
+    and candidate-block picks, their output tiles and the optional slots.
+    Native sparse Reindex skips the candidate mask; that kernel takes a pool
+    that fits topk whole, as the mask's equal scores did.
     """
-    from tokenspeed_kernel.ops.attention.dsv41.deep_gemm import (
-        is_hopper_indexer_available,
-    )
-
     if index_metadata is not None:
         from tokenspeed_kernel.ops.attention.dsv41._metadata import IndexMetadata
 
@@ -776,47 +789,18 @@ def index_topk(
             raise TypeError("index_metadata must come from new_index_metadata")
         index_metadata.validate(page_table, visible_lens)
 
-    # Each target scores the index rows its own cache format stores: FP4 with
-    # DeepSelect on Blackwell, FP8 with the CuTe DSL DeepSelect kernel on Hopper.
     query_values = index_q.values if isinstance(index_q, IndexQueryInput) else index_q
-    row_bytes = index_cache.shape[2] if index_cache.ndim == 3 else 0
-    shaped = (
-        query_values.is_cuda
-        and process_group is None
-        and query_values.shape[1] == 32
-        and index_cache.ndim == 3
-        and index_cache.shape[1] == 64
-        and index_cache.stride(1) == row_bytes
-        and index_cache.stride(2) == 1
-        and index_cache.stride(0) < 2**31
-        and index_cache.stride(0) % 16 == 0
-        and index_cache.data_ptr() % 16 == 0
-    )
-    native = shaped and (
-        prefill_indexer_batching_supported(row_bytes)
-        or (row_bytes == 132 and is_hopper_indexer_available())
-    )
-    index_k_format = {
-        68: "mxfp4",
-        132: "fp8_scaled",
-    }.get(row_bytes, "unknown")
-    index_shards = 1
-    index_heads = query_values.shape[1]
-    if process_group is not None:
-        index_shards = torch.distributed.get_world_size(process_group)
-        index_heads *= index_shards
+    if slots is not None:
+        _validate_selection_slots(slots, query_values.shape[0], topk, page_table)
     kernel = select_kernel(
         "attention",
         "dsv41_index_topk",
         format_signature(x=dense_tensor_format(query_values.dtype)),
         features=None,
         platform=None,
-        traits={
-            "index_heads": index_heads,
-            "index_k_format": index_k_format,
-            "index_shards": index_shards,
-            "native_indexer": native,
-        },
+        traits=_index_topk_traits(
+            query_values.shape[1], query_values.is_cuda, index_cache, process_group
+        ),
         solution=solution,
         override=None,
     )
@@ -834,7 +818,7 @@ def index_topk(
             index_q.cos_sin_cache,
             index_q.weight_scale,
         )
-    return kernel(
+    args = (
         index_q,
         weights,
         index_cache,
@@ -850,6 +834,180 @@ def index_topk(
         out,
         index_metadata,
     )
+    if spec is not None and True in spec.traits.get("supports_selection_slots", ()):
+        return kernel(*args, slots)
+    result = kernel(*args)
+    if slots is not None:
+        # Kernels that take no slots select first; resolve the rows they wrote.
+        slots.out.copy_(
+            global_slots(
+                result[0],
+                slots.positions,
+                slots.requests,
+                slots.table,
+                slots.ratio,
+                slots.pages,
+            )
+        )
+    return result
+
+
+def _validate_selection_slots(slots, tokens, topk, page_table):
+    if not isinstance(slots, SelectionSlots):
+        raise TypeError("slots must be a SelectionSlots")
+    out = slots.out
+    if (
+        out.shape != (tokens, topk)
+        or out.dtype != torch.int32
+        or not out.is_contiguous()
+        or out.device != page_table.device
+    ):
+        raise ValueError(
+            "slots.out must be contiguous int32 [tokens, topk] on the table device"
+        )
+    for name, tensor in (("positions", slots.positions), ("requests", slots.requests)):
+        if (
+            tensor.shape != (tokens,)
+            or tensor.dtype not in (torch.int32, torch.int64)
+            or tensor.device != page_table.device
+        ):
+            raise ValueError(f"slots.{name} must be integer [tokens] on the device")
+    if (
+        slots.table.ndim != 2
+        or slots.table.dtype not in (torch.int32, torch.int64)
+        or slots.table.device != page_table.device
+        or slots.ratio < 1
+        or slots.pages < 0
+    ):
+        raise ValueError(
+            "slots needs an integer [requests, pages] table, ratio >= 1, pages >= 0"
+        )
+
+
+def _index_topk_traits(query_heads, query_is_cuda, index_cache, process_group):
+    """index_topk's selection traits for its query heads, cache and head group."""
+    from tokenspeed_kernel.ops.attention.dsv41.deep_gemm import (
+        is_hopper_indexer_available,
+    )
+
+    # Each target scores the index rows its own cache format stores: FP4 with
+    # DeepSelect on Blackwell, FP8 with the CuTe DSL DeepSelect kernel on Hopper.
+    row_bytes = index_cache.shape[2] if index_cache.ndim == 3 else 0
+    shaped = (
+        query_is_cuda
+        and process_group is None
+        and query_heads == 32
+        and index_cache.ndim == 3
+        and index_cache.shape[1] == 64
+        and index_cache.stride(1) == row_bytes
+        and index_cache.stride(2) == 1
+        and index_cache.stride(0) < 2**31
+        and index_cache.stride(0) % 16 == 0
+        and index_cache.data_ptr() % 16 == 0
+    )
+    native = shaped and (
+        prefill_indexer_batching_supported(row_bytes)
+        or (row_bytes == 132 and is_hopper_indexer_available())
+    )
+    index_k_format = {
+        68: "mxfp4",
+        132: "fp8_scaled",
+    }.get(row_bytes, "unknown")
+    index_shards = 1
+    index_heads = query_heads
+    if process_group is not None:
+        index_shards = torch.distributed.get_world_size(process_group)
+        index_heads *= index_shards
+    return {
+        "index_heads": index_heads,
+        "index_k_format": index_k_format,
+        "index_shards": index_shards,
+        "native_indexer": native,
+    }
+
+
+def prepare_index_topk(
+    index_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    visible_lens: torch.Tensor,
+    candidate_blocks: torch.Tensor | None,
+    topk: int,
+    candidate_topk: int,
+    query_heads: int,
+    query_dtype: torch.dtype,
+    query_chunk_size: int,
+    index_metadata: object,
+) -> bool:
+    """Build ahead the scoring geometry a later index_topk call reuses.
+
+    Prepares, into index_metadata, the per-tile geometry the scorer index_topk
+    would select builds from page_table, visible_lens and candidate_blocks
+    alone (for DeepGEMM: paged Full scoring's sanitized tables and schedules,
+    or native sparse scoring's normalized candidates and schedule), so it can
+    run earlier, e.g. on another stream, off the scoring call's critical path.
+    The later call then finds it under the same keys instead of building it;
+    consumers on other streams wait for it. The kernels and inputs are the
+    same, so selections are unchanged.
+
+    Args:
+        index_cache, page_table, visible_lens, candidate_blocks, topk,
+        candidate_topk, query_chunk_size: As the later index_topk call
+            receives them; the table, length and candidate tensors must be
+            those very tensors (or views with the same storage, shape and
+            strides), unchanged until it runs.
+        query_heads, query_dtype: Head count and dtype of that call's index
+            query values, which has no head process group (replicated heads);
+            with ``index_cache`` they select the same scorer.
+        index_metadata: That call's object from new_index_metadata.
+
+    Returns:
+        True when the selected scorer has a prepare step and it ran; that step
+        may still decline inputs it does not cover and build nothing. False
+        when the scorer has no prepare step. Either way the call then builds
+        whatever it does not find.
+    """
+    from tokenspeed_kernel.ops.attention.dsv41._metadata import IndexMetadata
+
+    if not isinstance(index_metadata, IndexMetadata):
+        raise TypeError("index_metadata must come from new_index_metadata")
+    index_metadata.validate(page_table, visible_lens)
+    signature = format_signature(x=dense_tensor_format(query_dtype))
+    traits = _index_topk_traits(query_heads, index_cache.is_cuda, index_cache, None)
+    try:
+        scorer = select_kernel(
+            "attention",
+            "dsv41_index_topk",
+            signature,
+            features=None,
+            platform=None,
+            traits=traits,
+            solution=None,
+            override=None,
+        )
+        prepare = select_kernel(
+            "attention",
+            "dsv41_index_topk_prepare",
+            signature,
+            features=None,
+            platform=None,
+            traits=traits,
+            solution=KernelRegistry.get().get_by_name(scorer.name).solution,
+            override=None,
+        )
+    except NoKernelFoundError:
+        return False
+    prepare(
+        index_cache,
+        page_table,
+        visible_lens,
+        candidate_blocks,
+        topk,
+        candidate_topk,
+        query_heads,
+        query_chunk_size,
+        index_metadata,
+    )
+    return True
 
 
 def _validate_rope(values, positions, cos_sin_cache):

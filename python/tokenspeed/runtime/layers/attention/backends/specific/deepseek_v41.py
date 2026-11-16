@@ -387,6 +387,13 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             tuple[int, int], tuple[torch.Tensor, torch.Tensor | None, object]
         ] = {}
         self._prepared_selections: dict[tuple, tuple] = {}
+        # Decode SWA rows a layer wrote before its forward_v41
+        # (write_decode_swa), keyed like _prepared_selections: positions and
+        # requests pin the ids in the key, and forward_v41 checks it attends
+        # the rows written.
+        self._prepared_swa_writes: dict[
+            tuple, tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = {}
         self._index_geometry: dict[tuple, V41IndexGeometry] = {}
         self._in_model_forward = False
         # Batched prefill attention packs requests' owner histories and SWA
@@ -460,6 +467,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         self._decode_schedules.clear()
         self._local_decode_selections.clear()
         self._prepared_selections.clear()
+        self._prepared_swa_writes.clear()
         self._index_geometry.clear()
 
     def init_cuda_graph_state(
@@ -581,6 +589,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             )
         del for_graph_replay, kwargs
         self._prepared_selections.clear()
+        self._prepared_swa_writes.clear()
         self._index_geometry.clear()
         self._decode_schedules.clear()
         self._local_decode_selections.clear()
@@ -776,6 +785,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         self._prefill_layouts.clear()
         self._prefill_kv_batch = None
         self._prepared_selections.clear()
+        self._prepared_swa_writes.clear()
         self._index_geometry.clear()
         self._decode_schedules.clear()
         self._local_decode_selections.clear()
@@ -1180,16 +1190,21 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         Remote selections are valid: materialized history is addressed by the
         logical IDs, not these virtual slots. Writes use local cache_slots.
         """
-        gid = self._owner_group(owner)
-        ratio = self.spec.compress_ratios[owner]
         from tokenspeed_kernel.ops.attention.dsv41 import global_slots
 
         return global_slots(
             logical_rows,
             positions,
             request_indices,
+            *self._global_slot_table(owner, forward_mode),
+        )
+
+    def _global_slot_table(self, owner: int, forward_mode: ForwardMode):
+        """The owner's (block table, ratio, page bound) global slots resolve with."""
+        gid = self._owner_group(owner)
+        return (
             self.query_metadata(forward_mode).block_tables[gid],
-            ratio,
+            self.spec.compress_ratios[owner],
             (
                 self.cache_pool.arena.runtime_contract.virtual_block_counts[gid]
                 if self.kvp_size > 1
@@ -1736,6 +1751,26 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 index_q, index_cache, candidates.block_ids if reindex else None
             )
         )
+        # When one index_topk call selects every query row (replicated-cache
+        # decode), it also resolves their physical slots, replacing
+        # global_read_slots below; the native selection does it in the kernel
+        # that finishes the picks.
+        slot_request = None
+        if (
+            forward_mode.is_decode()
+            and self.kvp_size == 1
+            and partition is None
+            and windows == [(0, n, None)]
+        ):
+            slot_request = dsv41.SelectionSlots(
+                torch.empty(
+                    (n, self.spec.index_topk), dtype=torch.int32, device=self.device
+                ),
+                positions,
+                request_indices,
+                *self._global_slot_table(owner, forward_mode),
+            )
+        selected_slots = None
         for start, stop, span in windows:
             members = self._index_window_members(span)
             window_history = (
@@ -1856,7 +1891,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 packed = all_gather(packed, self.kvp_group, dim=1)
                 dsv41.merge_index_candidates(packed, rows[start:stop], lens[start:stop])
                 continue
-            dsv41.index_topk(
+            topk_args = (
                 index_q[start:stop],
                 index_weights[start:stop],
                 scoring_cache,
@@ -1873,14 +1908,21 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 None,
                 geometry.kernel_metadata,
             )
+            if slot_request is None:
+                dsv41.index_topk(*topk_args)
+            else:
+                dsv41.index_topk(*topk_args, slots=slot_request)
+                selected_slots = slot_request.out
             del scoring_cache
         if partition is not None:
             rows, lens = partition.gather_selection(rows, lens, query_group)
         if produce_candidates:
             candidates = V41Candidates(positions, request_indices, blocks, block_lens)
-        slots = self.global_read_slots(
-            owner, rows, positions, request_indices, forward_mode
-        )
+        slots = selected_slots
+        if slots is None:
+            slots = self.global_read_slots(
+                owner, rows, positions, request_indices, forward_mode
+            )
         record = V41Selection(
             owner,
             source,
@@ -1924,6 +1966,183 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         key = (layer_id, forward_mode, id(positions), id(requests))
         self._prepared_selections[key] = (positions, requests, result)
         return result
+
+    def prepare_decode_index_geometry(
+        self, forward_mode: ForwardMode, *, index_heads: int
+    ) -> None:
+        """Build the decode Full sources' index geometry, on the caller's stream.
+
+        Builds, ahead of the layers, the selection tables and the scorer's
+        tile geometry (paged schedules) select_global builds inside the first
+        Full source of each owner group (L2 for ratio 2, L20 for ratio 1),
+        from the same kernels on the same per-forward metadata, under the
+        keys select_global and index_topk look up. Call it after
+        begin_indexer_forward, before those layers run; consumers on other
+        streams wait for it. index_heads is the indexer's head count.
+        A no-op outside replicated-cache decode.
+        """
+        for layer_id in range(len(self.spec.kv_owners)):
+            owner = self.spec.kv_owners[layer_id]
+            if self.spec.index_sources[layer_id] == layer_id == owner:
+                self._prepare_decode_index(layer_id, forward_mode, None, index_heads)
+
+    def prepare_reindex_index_geometry(
+        self, forward_mode: ForwardMode, *, index_heads: int
+    ) -> None:
+        """Build the Reindex sources' sparse scoring geometry, on the caller's stream.
+
+        Call it after the candidate source's selection, before the first
+        Reindex layer: it builds the normalized candidates and the sparse
+        schedule that layer would build, from the candidate source's
+        published blocks, which every Reindex layer of the forward shares.
+        A no-op outside replicated-cache decode or without candidates.
+        """
+        record = self.sparse_topk.decode
+        if record is None or record.candidates is None:
+            return
+        for layer_id in range(len(self.spec.kv_owners)):
+            owner = self.spec.kv_owners[layer_id]
+            if (
+                self.spec.index_sources[layer_id] == layer_id != owner
+                and record.owner == owner
+            ):
+                self._prepare_decode_index(
+                    layer_id, forward_mode, record.candidates, index_heads
+                )
+
+    def _prepare_decode_index(self, layer_id, forward_mode, candidates, index_heads):
+        """select_global's decode geometry and index_topk preparation for a source.
+
+        Mirrors select_global for replicated-cache decode over the refreshed
+        query window: one query tile, no history bound, the table trimmed to
+        the index field's pages.
+        """
+        from tokenspeed_kernel.ops.attention import dsv41
+
+        if not forward_mode.is_decode() or self.kvp_size > 1:
+            return
+        metadata = self.query_metadata(forward_mode)
+        positions, requests = metadata.positions, metadata.request_indices
+        n = positions.numel()
+        if n == 0 or self._index_selection_kind(layer_id, None) == "all":
+            return
+        if candidates is not None and not (
+            positions is candidates.positions and requests is candidates.request_indices
+        ):
+            return
+        owner = self.spec.kv_owners[layer_id]
+        source_table = metadata.block_tables[self._owner_group(owner)]
+        index_cache = self.cache_pool.index_k(owner)
+        table = source_table[:, : max(0, index_cache.shape[0] - 1)]
+        geometry = self._selection_geometry(
+            positions,
+            requests,
+            source_table,
+            table,
+            self.spec.compress_ratios[owner],
+            0,
+            n,
+            None,
+            forward_mode,
+        )
+        produce_candidates = layer_id == self.spec.candidate_source
+        dsv41.prepare_index_topk(
+            index_cache,
+            geometry.table,
+            geometry.lengths,
+            None if candidates is None else candidates.block_ids[0:n],
+            self.spec.index_topk,
+            (
+                min(self.spec.candidate_topk, table.shape[1] * 8)
+                if produce_candidates
+                else 0
+            ),
+            index_heads,
+            torch.bfloat16,
+            n,
+            geometry.kernel_metadata,
+        )
+
+    def write_decode_swa(
+        self,
+        layer_id: int,
+        swa_kv: torch.Tensor,
+        positions: torch.Tensor,
+        request_indices: torch.Tensor,
+        forward_mode: ForwardMode,
+        *,
+        swa_rope_cache: torch.Tensor | None,
+        swa_norm_weight: torch.Tensor | None,
+        swa_norm_eps: float,
+    ) -> bool:
+        """Publish a decode layer's SWA rows on the caller's stream, before
+        its forward_v41.
+
+        This is forward_v41's own decode SWA write (same rows, slots, RoPE,
+        deferred norm and cache format), issued early: an index-source layer
+        can write while its index branch still runs instead of after the
+        join. forward_v41 for the same layer, mode, positions and request
+        tensors then skips its write; it must receive the same ``swa_kv``.
+        Only rows of the refreshed decode window are written early; for any
+        other rows this writes nothing and returns False, and forward_v41
+        writes them as before. The arguments follow forward_v41's.
+        """
+        if not forward_mode.is_decode():
+            raise ValueError("write_decode_swa takes decode rows only")
+        n = positions.numel()
+        if (
+            not 0 <= layer_id < len(self.spec.kv_owners)
+            or request_indices.shape != positions.shape
+            or swa_kv.ndim != 2
+            or swa_kv.shape[0] != n
+        ):
+            raise ValueError("V4.1 SWA rows disagree with the decode window")
+        if swa_norm_weight is not None and swa_rope_cache is None:
+            raise ValueError("A deferred SWA norm requires the SWA RoPE cache")
+        window = self._window(positions, request_indices, forward_mode)
+        if window is None or n == 0:
+            return False
+        key = (layer_id, forward_mode, id(positions), id(request_indices))
+        if key in self._prepared_swa_writes:
+            raise RuntimeError(f"V4.1 layer {layer_id} already wrote its SWA rows")
+        self._scatter_decode_swa(
+            swa_kv,
+            positions,
+            self.cache_pool.swa(layer_id),
+            window[0].swa_write_slots,
+            swa_rope_cache,
+            swa_norm_weight,
+            swa_norm_eps,
+        )
+        self._prepared_swa_writes[key] = (positions, request_indices, swa_kv)
+        return True
+
+    def _scatter_decode_swa(
+        self,
+        swa_kv,
+        positions,
+        cache,
+        locations,
+        swa_rope_cache,
+        swa_norm_weight,
+        swa_norm_eps,
+    ) -> None:
+        from tokenspeed_kernel.ops.attention import dsv41
+
+        if swa_rope_cache is None:
+            dsv41.cache_scatter(swa_kv, cache, locations, self.swa_format)
+        else:
+            dsv41.swa_rope_scatter(
+                swa_kv,
+                positions,
+                swa_rope_cache,
+                cache,
+                locations,
+                self.swa_format,
+                None,
+                swa_norm_weight,
+                swa_norm_eps,
+            )
 
     def _swa_query_plan(
         self,
@@ -2507,19 +2726,23 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         if forward_mode.is_decode():
             # The current position cannot alias one of its previous 127 logical
             # rows. Ordinary retained-page writes therefore precede paged decode.
-            if swa_rope_cache is None:
-                dsv41.cache_scatter(swa_kv, cache, locations, self.swa_format)
-            else:
-                dsv41.swa_rope_scatter(
+            # The layer may have written them already (write_decode_swa).
+            written = self._prepared_swa_writes.pop(
+                (layer_id, forward_mode, id(positions), id(request_indices)), None
+            )
+            if written is None:
+                self._scatter_decode_swa(
                     swa_kv,
                     positions,
-                    swa_rope_cache,
                     cache,
                     locations,
-                    self.swa_format,
-                    None,
+                    swa_rope_cache,
                     swa_norm_weight,
                     swa_norm_eps,
+                )
+            elif written[2] is not swa_kv:
+                raise RuntimeError(
+                    f"V4.1 layer {layer_id} wrote other SWA rows than it attends"
                 )
             swa_slots, swa_lens = (
                 (metadata.swa_read_slots, metadata.swa_read_lens)
