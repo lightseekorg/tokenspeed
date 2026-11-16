@@ -1732,6 +1732,66 @@ def test_prefill_topk_matches_the_causal_reference(prefix_len, extend_len) -> No
 
 @requires_gpu
 @pytest.mark.parametrize(
+    "extend_len, placed, reused",
+    [
+        (300, False, True),
+        # A row past topk is scored in every layer.
+        (2100, False, False),
+        # A KV-placed cache keeps its own per-layer selection.
+        (300, True, False),
+    ],
+)
+def test_a_later_layer_reuses_an_every_candidate_selection(
+    monkeypatch: pytest.MonkeyPatch, extend_len: int, placed: bool, reused: bool
+) -> None:
+    """A layer after the first takes its every-candidate selection as is."""
+    torch.manual_seed(5)
+    attention = _indexer_attention(index_topk=2048)
+    num_blocks = (extend_len + 127) // 128
+    pool, _ = _k31_pool("cuda", num_lcm_blocks=max(2, (num_blocks + 2 + 11) // 12))
+    block_ids = list(range(2, 2 + num_blocks))[::-1]
+    slots = _slots(block_ids, extend_len, "cuda")
+    u, keys = _separable_keys(extend_len, torch.arange(0, device="cuda"), "cuda")
+    pool.set_index_k_buffer(3, slots, keys, write_mask=None)
+    page_table = torch.zeros(
+        1, max(64, 2 * num_blocks), dtype=torch.int32, device="cuda"
+    )
+    kernel_pages = _kernel_page_table(block_ids, "cuda")
+    page_table[:, : kernel_pages.shape[1]] = kernel_pages
+    backend = SimpleNamespace(
+        sparse_topk=SimpleNamespace(prefill=None),
+        chunked_prefill_metadata=SimpleNamespace(
+            extend_prefix_lens_cpu=[0],
+            extend_seq_lens_cpu=[extend_len],
+            page_table=page_table,
+        ),
+        cache_placement=lambda layer: None,
+    )
+    ctx = SimpleNamespace(attn_backend=backend, token_to_kv_pool=pool, num_extends=1)
+    first = attention._compute_prefill_topk_indices(
+        _indexer_output(u, extend_len), ctx, extend_len
+    )
+    backend.sparse_topk.prefill = first
+
+    scored = []
+
+    def score(**kwargs):
+        scored.append(kwargs["num_prefill_tokens"])
+        return first
+
+    monkeypatch.setattr(attention, "_compute_prefill_topk_indices_portable", score)
+    if placed:
+        backend.cache_placement = lambda layer: object()
+    second = attention._compute_prefill_topk_indices(
+        _indexer_output(u, extend_len), ctx, extend_len
+    )
+
+    assert second is first
+    assert scored == ([] if reused else [extend_len])
+
+
+@requires_gpu
+@pytest.mark.parametrize(
     "prefix_len, extend_len, scored",
     [
         (0, 15, False),
