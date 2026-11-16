@@ -216,8 +216,10 @@ def _combine_native_rows(partial, inverse, offsets, weights):
         rows = inverse.view(topk, tokens)[slot].long()
         valid = (rows >= 0) & (rows < offsets[-1])
         values = partial[rows.clamp(min=0)].float()
-        contribution = values * weights[:, slot, None]
-        result += torch.where(valid[:, None], contribution, 0)
+        # The native finalizer performs one FP32 FMA per slot. Separate torch
+        # multiply/add operations round twice and can change the BF16 result.
+        accumulated = torch.addcmul(result, values, weights[:, slot, None])
+        result = torch.where(valid[:, None], accumulated, result)
     return result.to(torch.bfloat16)
 
 
