@@ -985,7 +985,13 @@ def test_gpu_backend_decode_capture_replay_and_above_ladder(shared_pool, verify_
 
 @pytest.mark.parametrize("verify_width", [1, 3, 6, 8])
 @pytest.mark.parametrize("overlap_depth", [0, 1])
-def test_packed_config_and_recipe_capacity(verify_width, overlap_depth):
+@pytest.mark.parametrize("batched_indexer", [False, True])
+def test_packed_config_and_recipe_capacity(
+    monkeypatch, verify_width, overlap_depth, batched_indexer
+):
+    monkeypatch.setattr(
+        dsv41, "prefill_indexer_batching_supported", lambda _: batched_indexer
+    )
     recipe = _recipe("cpu")
     hf = recipe.model_config.hf_config
     hf.candidate_topk_blocks, hf.candidate_block_size, hf.index_topk = 2, 8, 4
@@ -1059,7 +1065,7 @@ def test_packed_config_and_recipe_capacity(verify_width, overlap_depth):
         + queries * 32 * (128 * 2 + 68)
         + queries * 24 * (512 + 128) * 12
         # One packed index history per request in a batched prefill call.
-        + config.max_bs * 576 * 68
+        + (config.max_bs if batched_indexer else 1) * 576 * 68
     )
     with pytest.raises(NotImplementedError, match="target attention"):
         DeepseekV41Config.generate(args, model, True)
@@ -2948,7 +2954,8 @@ def test_prefill_selection_skips_only_redundant_work(length):
     assert slots is record.physical_slots and lengths is record.lengths
 
 
-def test_canonical_prefill_batches_full_requests_into_one_index_topk():
+def test_canonical_prefill_batches_full_requests_into_one_index_topk(monkeypatch):
+    monkeypatch.setattr(dsv41, "prefill_indexer_batching_supported", lambda _: True)
     backend = _backend("cpu", 4)
     meta = _extend(backend, _tables("cpu"), [8, 8], [16, 16], [0, 0], [24, 24])
     q = torch.zeros(16, 2, 128, dtype=torch.bfloat16)
@@ -2995,7 +3002,8 @@ def test_canonical_prefill_batches_full_requests_into_one_index_topk():
     assert query_chunk == 16
 
 
-def test_one_request_full_window_splits_when_logits_exceed_budget():
+def test_one_request_full_window_splits_when_logits_exceed_budget(monkeypatch):
+    monkeypatch.setattr(dsv41, "prefill_indexer_batching_supported", lambda _: True)
     backend = _backend("cpu", 1)
     # 12000 rows over ~1M history columns is ~24GB of BF16 logits.
     span = V41PrefillSpan(0, 0, 2_000_000, 12_000, 0)
@@ -3033,7 +3041,8 @@ def _index_scratch_recipe(**changes):
     return recipe
 
 
-def test_index_scratch_charges_only_the_scorers_a_role_runs():
+def test_index_scratch_charges_only_the_scorers_a_role_runs(monkeypatch):
+    monkeypatch.setattr(dsv41, "prefill_indexer_batching_supported", lambda _: True)
     # 65,536 prefill rows over 512 columns: dense BF16 logits outgrow the
     # portable TopK scratch, and only a role that prefills charges them with
     # one packed history per request.
@@ -4152,3 +4161,56 @@ def test_pd_kvp_decode_config(size):
     args.speculative_algorithm = "EAGLE"
     with pytest.raises(ValueError, match="DSpark speculation only"):
         DeepseekV41Config.generate(args, model, False)
+
+
+@pytest.mark.parametrize("reindex", [False, True])
+def test_unbatched_indexer_preserves_request_windows(monkeypatch, reindex):
+    monkeypatch.setattr(dsv41, "prefill_indexer_batching_supported", lambda _: False)
+    backend = _backend("cpu", 1)
+    first = V41PrefillSpan(0, 0, 200_000, 8_000, 0)
+    second = V41PrefillSpan(1, 8_000, 200_000, 8_000, 0)
+    windows = [(0, 8_000, first), (8_000, 16_000, second)]
+    assert backend._merge_index_windows(windows, 1, reindex) == windows
+
+
+def test_unbatched_indexer_reserves_one_history(monkeypatch):
+    recipe = _index_scratch_recipe(max_query_tokens=256)
+    recipe.attn_config = replace(recipe.attn_config, max_bs=256, context_len=1 << 20)
+    recipe.server_args.disaggregation_mode = "prefill"
+    monkeypatch.setattr(dsv41, "prefill_indexer_batching_supported", lambda _: False)
+    single = recipe.workspace_bytes()
+    monkeypatch.setattr(dsv41, "prefill_indexer_batching_supported", lambda _: True)
+    batched = recipe.workspace_bytes()
+    # Paged logits dominate for this shape; only the history packing changes.
+    assert batched - single == 255 * (1 << 20) * 68
+
+
+def test_prefill_indexer_batching_without_cuda(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert not dsv41.prefill_indexer_batching_supported(68)
+    assert _index_scratch_recipe().workspace_bytes() > 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA platform required")
+@pytest.mark.parametrize(
+    "major,minor,expected",
+    [(9, 0, False), (10, 0, True), (10, 3, True), (10, 7, False), (12, 0, False)],
+)
+def test_prefill_indexer_native_architecture(monkeypatch, major, minor, expected):
+    from tokenspeed_kernel.ops.attention.dsv41 import deep_gemm
+    from tokenspeed_kernel.platform import ArchVersion
+    from tokenspeed_kernel.thirdparty import deep_select
+
+    platform = replace(
+        current_platform(), vendor="nvidia", arch_version=ArchVersion(major, minor)
+    )
+    monkeypatch.setattr(deep_gemm, "platform", platform)
+    monkeypatch.setattr(deep_gemm, "has_optional_package", lambda _: True)
+    monkeypatch.setattr(deep_select, "is_deep_select_available", lambda: True)
+    deep_gemm.is_native_indexer_available.cache_clear()
+    try:
+        assert deep_gemm.is_native_indexer_available() is expected
+        assert dsv41.prefill_indexer_batching_supported(68) is expected
+        assert not dsv41.prefill_indexer_batching_supported(132)
+    finally:
+        deep_gemm.is_native_indexer_available.cache_clear()
