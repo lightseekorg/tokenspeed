@@ -92,7 +92,13 @@ def test_request_pages_and_query_causal_spans(degree, granularity, extends, pref
             page_size=page,
             topk=2048,
             local_cache_pages=local_capacity,
-            options=AscendPrefillOptions(max(sum(extends), 1), page),
+            options=AscendPrefillOptions(
+                max(sum(extends), 1),
+                page,
+                max_history_rows=sum(
+                    (length + page - 1) // page * page for length in lengths
+                ),
+            ),
         )
         for rank in range(degree)
     ]
@@ -198,5 +204,5 @@ def test_prefill_rejects_mismatched_request_lengths():
             page_size=128,
             topk=2048,
             local_cache_pages=8,
-            options=AscendPrefillOptions(5, 128),
+            options=AscendPrefillOptions(5, 128, max_history_rows=8192),
         )

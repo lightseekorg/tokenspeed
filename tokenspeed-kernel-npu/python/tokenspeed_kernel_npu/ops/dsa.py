@@ -25,7 +25,6 @@ from __future__ import annotations
 import os
 
 import torch
-import torch.distributed as dist
 import torch_npu
 from tokenspeed_kernel_npu._triton import tl, triton
 from tokenspeed_kernel_npu.ops.prefill import AscendDSAPrefill
@@ -258,7 +257,6 @@ def interleave_rope(tensor, positions, cos_sin_cache, *, rope_dim):
 
 class AscendDSAKernels:
     def __init__(self):
-        import flash_ops
 
         library = os.environ.get("TOKENSPEED_LONGCAT_DSA_LIBRARY")
         if library:
@@ -282,6 +280,7 @@ class AscendDSAKernels:
         ranks,
         history_group,
         max_current_rows,
+        max_history_rows,
         history_null_rows,
     ):
         return AscendDSAPrefill(
@@ -290,6 +289,7 @@ class AscendDSAKernels:
             ranks=ranks,
             history_group=history_group,
             max_current_rows=max_current_rows,
+            max_history_rows=max_history_rows,
             history_null_rows=history_null_rows,
         )
 

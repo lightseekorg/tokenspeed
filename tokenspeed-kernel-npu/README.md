@@ -61,47 +61,19 @@ owner-sharded.
 Index-K RMS normalization uses the checkpoint's `rms_norm_eps` in both the
 composed path and the fused Decode prologue.
 
-The CANN 9.0/A2 CP runtime uses an isolated official HCCL process group and
-the `custom::dsa_cp_patch` ACLNN adapter from the unified `.run`.
-HCCL gathers write into preallocated receive planes. History and current rows
-share the transport's process group and communication stream.
-Indexer-K is submitted after its producer; current KV communication
-runs while Indexer computes. Sparse attention waits for KV. The preceding KDA
-layers can overlap historical gathers; cold Prefill skips those transfers.
-
-The packaged `custom::npu_dsa_cp_metadata.out` ACLNN operator prepares the compact page table shared by Indexer
-and sparse attention, cumulative lengths, causal scans and current-page aliases.
-Complete aligned pages are read directly at their receive address; only
-boundary pages are stitched. The DSA copy kernel also commits persistent owner
-rows. The unbounded configuration gathers the full cache without a CPU page
-plan. With `--chunk-prefill-kv-size`, the scheduler limits the sum of per-request
-KV page counts, including each cached prefix. Native Prefill reuses the host
-page table to compact referenced owner pages once per batch and gathers unequal
-contributions with `torch_npu.distributed.all_gather_into_tensor_uneven`;
-no device count readback is needed. Current-row gathers and mapped commits
-use the official uneven HCCL API and the ACLNN patch adapter. Reserve
-the bounded history send/receive planes, a null page and aligned current-row capacity
-before sizing the cache arena. Decode and the shared cache writer keep their
-existing contracts.
-The scheduler wheel and `ts-host` must both be rebuilt when adding this
-scheduler option, since the host embeds its own copy of the scheduler.
-Native commits use int64 write-slot scratch from the backend's dedicated
-`WorkspacePool`. Startup allocates it before KV memory profiling. The model
-recipe only declares `AscendPrefillWorkspace`; TS derives and deducts the
-communication budget before agreeing on cache capacity. Each attention backend
-allocates its communication planes together through a frozen `WorkspacePool`
-and retains that owner across layers. Those side-stream buffers stay separate
-from main-stream scratch. The native transport borrows the supplied views.
-Commit slots occupy a disjoint view in the same allocation, so other runtime
-scratch users cannot overwrite them.
+The CANN 9.0/A2 CP runtime uses an isolated official HCCL process group.
+The packaged `custom::npu_dsa_cp_metadata.out` operator prepares compact page
+tables, cumulative lengths, causal scans and current-page aliases once per batch.
+Triton kernels gather cache rows and commit current rows without changing bits;
+see [DSA/MLA Prefill transport](#dsamla-prefill-transport) for ownership and sizing.
 
 Ascend dense MLA Prefill reuses this ABI with only the 576-wide KV plane;
 it allocates no Index-K plane and retains the original head-sharded weights.
 Historical KV gathers can start in preceding KDA layers. After the local
-QKV-A projection and norms, current KV gathers on the communication stream while
-the normalized Q latent gathers over TP and QB projects this rank's heads.
+QKV-A projection and norms, current KV is gathered, followed by the normalized
+Q latent gather over TP and QB projection for this rank's heads.
 The receive table aliases aligned current pages and stitches boundary pages
-using the existing copy kernel. Each rank expands all visible KV with its own
+in the fused current-row store. Each rank expands all visible KV with its own
 KV-B weight, calls the existing dense MLA attention once per request, and
 projects its local-head output with the original O shard. CommManager retains
 the output ReduceScatter. No additional LSE merge or complete-weight copy is
@@ -159,37 +131,56 @@ PYTHONPATH="${PWD}/python:${PWD}/tokenspeed-kernel/python:${PWD}/tokenspeed-kern
 
 ### DSA/MLA Prefill transport
 
-Prefill uses official HCCL collectives and the `flash_ops`
-`custom::dsa_cp_patch` ACLNN adapter. The transport owns an isolated HCCL group
-for cache owners, with no additional user-managed communication stream.
-Synchronous submissions order HCCL's internal stream before subsequent work
-on the fixed execution stream; they need no application-owned Work handles.
-This does not force CPU completion unless blocking wait is configured.
+The transport borrows an isolated HCCL group for cache owners and owns one
+raw ACL allocation outside the Torch caching allocator. Startup checks its
+bytes against the cache recipe's reservation. All layers of one backend reuse
+it; history length changes only views, with no allocation on the forward path.
+Synchronous HCCL submissions order their internal stream before subsequent work
+on the executor stream. The transport adds no user-managed communication stream,
+per-layer synchronization or permanent stream identity restriction.
 
-History gathers only the actual referenced pages, deduplicated by owner.
-Each history/current phase gathers one packet: DSA packs Indexer-K128 and KV576
-channels into704 BF16 values per row; MLA carries only KV576. Output split
-sizes count rows. Current receive regions are128-row aligned per owner, with
-only actual rows transmitted. `dsa_cp_patch` writes owner caches and compact
-boundary pages; complete current pages can be read from the receive region.
+History includes only referenced pages, deduplicated by owner. One gather kernel
+copies cache rows into separate KV576 and optional Indexer-K128 send planes.
+HCCL receives each plane directly at its final attention address, so there is
+no whole-history packet to unpack. For degree one, the gather kernel writes the
+attention planes directly. Cold Prefill skips history work.
+
+Current DSA projections pack Indexer-K128 and KV576 into 704 BF16 values per row;
+MLA carries only KV576. One uneven collective carries actual rows, then one
+kernel writes the padded current attention region, compact partial pages and
+persistent owner caches. Complete current pages alias their attention region.
+The byte copies use integer views to preserve arbitrary BF16 bit patterns.
 Cache inputs accept contiguous `[rows,width]` and `[rows,1,width]`.
 
-Receive planes, packets, and commit slots are temporary. Prefetch may be called
-at KDA; the attention entry ensures it was submitted once for the same batch
-and layer. Concurrent consumption by another batch/layer is rejected. Tensor
-references and `record_stream` preserve storage through HCCL, unpacking,
-patching and attention. `finish` releases references after the final queued
-consumer. Shutdown drains execution before releasing the group. The transport
-records its peak owned buffer bytes; serving acceptance also measures device
-allocation/reservation peaks. `chunk_prefill_kv_size` only controls scheduler
-admission and never enables transport or fixes its buffer size.
+For history capacity H, current capacity C, group degree D > 1 and null rows N,
+let A = ceil(C / (128 D)) * 128 D and S = max(H, ceil(C / D)). The allocation is
+`2 * width * (N + H + A + S + C)` bytes. S covers an entire batch's pages on one
+owner; page placement need not balance one batch. Degree one only needs C send
+rows and no receive space. The cache recipe page-rounds
+`chunk_prefill_kv_size`, or the model context length if omitted, to obtain H.
+The scheduler enforces this summed KV-page bound, including cached prefixes.
+There is no change to Decode history distribution.
+
+Prefetch may start at KDA; the attention entry ensures the same batch/layer
+history once. `finish` drops active references after the final consumer is
+queued, retaining storage for the next layer. A synchronized warmup-to-serving
+stream handoff is valid. `close` waits for queued consumers and frees native
+storage; the process-group manager retains its communicator.
 
 Run `test/test_mla_cp_transport.py` with `torchrun` and an explicit `TEST_OUTPUT`
-directory. It covers compact shared history pages, empty/uneven owners, both
-cache planes, natural singleton-head cache shapes, boundary commits, repeated
-history ensures, and temporary-buffer release. CPU buffer checks substitute
-only unavailable NPU stream and process-group operations; they are not hardware
-acceptance.
+directory. It checks shared history, empty/uneven owners, both planes, natural
+singleton-head shapes, partial pages and repeated layer reuse. CPU buffer tests
+substitute only unavailable device storage, kernels and collectives; they do
+not establish hardware correctness or full-model serving capacity.
+
+`benchmarks/bench_dsa_prefill.py` measures transport, cache writes, indexer and
+sparse attention for one layer, excluding projections and metadata construction.
+Run it with `torchrun --standalone --nproc-per-node=8` and
+`--mode latency --histories 0 131072 524288 --layers 3 --repeat 5 --output PATH`.
+Use `--mode profile` for the timeline, or
+`--mode sweep --histories 524288 --sweep-step 8192 --layers 24 --output PATH`
+to check memory across growing histories and layer reuse. Fixed CPU inputs,
+input hashes and optional `--reference PATH` support full-output comparisons.
 
 Prepared fused Decode retains the current `npu_dcp_merge_topk` and
 `npu_dsa_merge_lse_direct` communication operators. Errors propagate without

@@ -37,13 +37,14 @@ from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slot
 
 @dataclass(frozen=True)
 class AscendPrefillOptions:
-    """Prefill token capacity and physical page geometry, independent of admission."""
+    """Physical Prefill capacities; history also bounds summed scheduler KV rows."""
 
     max_current_rows: int
     kv_page_size: int
+    max_history_rows: int
 
     def __post_init__(self):
-        if self.max_current_rows < 1 or self.kv_page_size < 1:
+        if min(self.max_current_rows, self.kv_page_size, self.max_history_rows) < 1:
             raise ValueError("Prefill needs positive token capacity and page geometry")
 
 
@@ -148,25 +149,13 @@ class AscendPrefillPlan:
     gather: AscendPrefillGatherPlan | None = None
     patch_slots: torch.Tensor | None = None
 
-    def patch(
-        self,
-        runtime,
-        layer_id,
-        slots,
-        *,
-        slots_workspace,
-        width,
-        block_rows,
-        virtual_blocks,
-    ):
-        """Commit on the compute stream using the backend-owned slots."""
-        return runtime.patch(
+    def store_current(self, runtime, layer_id, slots, *, block_rows, virtual_blocks):
+        """Write gathered current rows to their persistent and compact addresses."""
+        runtime.store_current(
             layer_id,
             slots,
             self.current_direct,
-            slots_workspace=slots_workspace,
             mapped_slots=self.patch_slots,
-            width=width,
             block_rows=block_rows,
             virtual_blocks=virtual_blocks,
         )
@@ -227,6 +216,10 @@ class AscendPrefillPlan:
             device=table.device,
             columns=table.shape[1],
         )
+        if sum(gather.row_counts) > options.max_history_rows:
+            raise ValueError(
+                "Prefill batch KV pages exceed the reserved workspace capacity"
+            )
         history_pages = (options.kv_page_size + sum(gather.row_counts)) // page_size
         patch_slots = torch.empty(rows, dtype=torch.int64, device=table.device)
         if table.device.type == "cpu":

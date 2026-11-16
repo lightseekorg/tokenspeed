@@ -78,8 +78,7 @@ def bounded_transport(rank, degree, scratch_pool, *, ranks, groups):
     runtimes = []
     for has_index in (False, True):
         capacity = AscendPrefillOptions(
-            4096 if degree == 2 else 2048,
-            kv_page_size=128,
+            4096 if degree == 2 else 2048, kv_page_size=128, max_history_rows=8192
         )
         local_rows = 4096 if degree == 2 else 2048
         cache = torch.empty((local_rows, 576), dtype=torch.bfloat16, device="npu")
@@ -94,10 +93,11 @@ def bounded_transport(rank, degree, scratch_pool, *, ranks, groups):
             ranks=ranks,
             history_group=groups[int(has_index)],
             max_current_rows=capacity.max_current_rows,
+            max_history_rows=capacity.max_history_rows,
             history_null_rows=capacity.kv_page_size,
         )
         runtimes.append(runtime)
-        assert runtime.workspace_bytes == 0
+        assert runtime.workspace_bytes == runtime.layout.nbytes
         pending = []
         for case in range(17 if degree == 2 else 16):
             page = (64, 128)[case % 2]
@@ -224,17 +224,14 @@ def bounded_transport(rank, degree, scratch_pool, *, ranks, groups):
                     width=width,
                     total_rows=rows,
                 )
-            commit_slots = torch.empty(rows, dtype=torch.int64, device="npu")
+            plan.store_current(
+                runtime,
+                case,
+                slots.to(device="npu", dtype=torch.int32),
+                block_rows=128,
+                virtual_blocks=degree * 31 + 1,
+            )
             for width, receive, owner_cache in planes:
-                plan.patch(
-                    runtime,
-                    case,
-                    slots.to(device="npu", dtype=torch.int32),
-                    slots_workspace=commit_slots,
-                    width=width,
-                    block_rows=128,
-                    virtual_blocks=degree * 31 + 1,
-                )
                 # Every logical row must resolve to the original prefix or its
                 # current producer. Shared prefix pages are transported once.
                 offset = 0
@@ -264,8 +261,8 @@ def bounded_transport(rank, degree, scratch_pool, *, ranks, groups):
                     (owner_cache.clone(), expected_cache[:, :width].contiguous())
                 )
             runtime.finish(case)
-            assert runtime.workspace_bytes == 0
-            del planes, receive, commit_slots
+            assert runtime.workspace_bytes == runtime.layout.nbytes
+            del planes, receive
             # Force scratch reuse while native operations may remain queued.
             scratch_pool.allocate(((rows,), torch.int64))[0].fill_(-1)
             results.append(

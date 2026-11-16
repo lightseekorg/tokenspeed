@@ -2568,23 +2568,30 @@ including under PP and target/draft sharing. Cache recipes reserve verify
 workspace before sizing the arena.
 Side-stream allocations retain their own workspace owner through execution,
 separate from scratch that main-stream operations can overwrite.
-Ascend DSA/MLA Prefill gathers only the batch's referenced cache pages into
-compact temporary buffers. History and current rows have separate readiness;
-DSA packs KV and Indexer-K together in each phase. Persistent cache planes stay
-separate. The batch page table defines receive addresses and owner writeback.
-`chunk_prefill_kv_size` is only the scheduler's admission budget: omitting it
-never selects a different Prefill implementation.
+Ascend DSA/MLA Prefill gathers the batch's referenced pages into a bounded
+workspace shared by its layers. The recipe reserves the exact native allocation
+before sizing the cache arena; startup checks planned and allocated bytes.
+Historical KV and Indexer-K receive directly into separate attention planes;
+current rows share a packed transfer and a fused owner-cache/boundary-page write.
+The batch page table defines compact receive addresses and owner writeback.
+
+The page-rounded `chunk_prefill_kv_size`, or model context length when omitted,
+bounds the workspace's historical rows. The bound covers the **sum** of request
+KV pages, including cached prefixes, rather than one request's length. The
+backend publishes it to scheduler startup, which applies the smaller of this
+capacity and an explicit admission bound. Decode remains limited by its cache
+arena. This option changes capacity, not the Prefill implementation.
 
 A model may submit history gathering at the first preceding KDA layer. The
 attention entry ensures the same batch/layer history exists before consumption.
-An active gather owns its tensors through the final queued read; another batch
-or layer cannot reuse those tensors. Gather, copies, commit, and consumers use
-one fixed execution stream. Synchronous HCCL submissions join their internal
-stream onto it; allocator stream tracking protects temporary storage through
-queued consumers. Finish releases references, and shutdown drains execution
-before destroying the communicator. Only one layer's receive buffers are live;
-allocation follows actual referenced pages and current rows, not cache capacity.
-The null page and receive alignment are physical overhead.
+An active gather keeps layer references through its final queued read. The next
+layer reuses the storage on the executor stream; synchronous HCCL submissions
+join their internal stream onto it. `finish` clears references and retains
+storage. Raw ACL ownership bypasses the Torch caching allocator, avoiding
+retention of differently sized packets as history grows. Actual teardown waits
+for consumers before freeing; no per-layer synchronization or permanent stream
+identity check is needed. The layout budgets the null page, current-row alignment
+and a send buffer large enough for unequal page ownership.
 A Qwen4 PD prefill role retains the target/draft cache layout for transfer,
 but reserves no speculative verify workspace: only the decode role verifies.
 

@@ -435,15 +435,22 @@ DSA Prefill uses token-local queries with all heads, gathers KV and Indexer-K,
 and returns complete output rows without Q/TopK/output/LSE exchanges. MLA
 Prefill keeps its head partition: it gathers normalized Q latents, projects
 local heads, consumes gathered KV history and current rows, and retains the
-existing output reduction. Indexer-K and KV share one BF16 transport packet
-per phase; gathering and cache commit preserve their bits.
+existing output reduction. Historical KV and Indexer-K gather directly into
+their respective attention planes. Current rows share a BF16 packet; one
+kernel unpacks both planes, fills partial history pages and writes owner caches.
+Gathering and cache commit preserve all bits, including BF16 NaN payloads.
 
 The preceding KDA segment may submit history gathering. The attention entry
-ensures it if absent. Receive and packet tensors are temporary and follow actual
-batch page geometry; fixed gather workspaces are not part of the model cache.
+ensures it if absent. One bounded native allocation serves successive layers;
+the cache recipe reserves its bytes before sizing the persistent cache. It
+holds attention planes, send space and current-row receive space, outside the
+Torch caching allocator. It contains no per-request retained state.
 All user-managed Prefill work uses one execution stream and synchronous HCCL
-interfaces. Tensor references and allocator stream tracking cover every queued
-consumer. Weight preparation and Decode graph behavior remain unchanged.
+interfaces. Stream order protects reuse after the final attention consumer;
+`finish` drops layer references without freeing storage. Warmup may hand over
+to the serving stream after the executor's synchronization. The native owner
+synchronizes only when actually freeing storage on rebind or teardown.
+Weight preparation and Decode graph behavior remain unchanged.
 These byte-preserving gathers do not establish cross-provider bitwise equality
 for attention arithmetic or reductions.
 
@@ -451,8 +458,8 @@ Prefill KV transport borrows an isolated accelerator process group from the
 runtime process-group manager. All world ranks create the cache-owner groups
 in the same order when publishing the cache pool, before any forward or
 decode graph capture. A forward never creates a process group; an idle DP
-rank still participates in startup. Temporary tensor ownership ends after
-the final consumer, while the process-group manager retains the communicator.
+rank still participates in startup. The backend retains its native workspace
+across layers, while the process-group manager retains the communicator.
 
 ### V4.1 fused decode attention
 

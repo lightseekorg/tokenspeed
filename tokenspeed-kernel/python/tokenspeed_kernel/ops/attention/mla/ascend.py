@@ -42,6 +42,7 @@ def prepare_ascend_mla_prefill(
     ranks,
     history_group,
     max_current_rows,
+    max_history_rows,
     history_null_rows,
 ):
     """Reuse the DSA HCCL gather/owner-commit transport with no Index-K plane."""
@@ -53,6 +54,7 @@ def prepare_ascend_mla_prefill(
         ranks=ranks,
         history_group=history_group,
         max_current_rows=max_current_rows,
+        max_history_rows=max_history_rows,
         history_null_rows=history_null_rows,
     )
 

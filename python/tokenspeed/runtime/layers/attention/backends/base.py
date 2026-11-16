@@ -135,6 +135,18 @@ class SparseTopKShare:
 class CachePoolBinding:
     """A node's bound cache pool."""
 
+    def preallocate_prefill_workspace(self) -> int:
+        """Allocate cache-budgeted prefill storage once for each owning backend."""
+        return sum(
+            child.preallocate_prefill_workspace() for child in self.child_backends()
+        )
+
+    @property
+    def prefill_kv_capacity(self) -> int:
+        """Maximum summed prefill KV rows supported by fixed workspace; 0 if unbounded."""
+        capacities = [child.prefill_kv_capacity for child in self.child_backends()]
+        return min((capacity for capacity in capacities if capacity), default=0)
+
     #: Slot-sized tensors a retraction image leaves out (``SlotStateExporter``):
     #: none by default; a node that keeps some names them.
     token_derived_slot_state: tuple[str, ...] = ()

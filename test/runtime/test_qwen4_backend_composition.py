@@ -179,7 +179,10 @@ def test_verify_workspace_counts_each_consumer_once_and_checks_zero_budget(
             calls.append((name, max_bs, draft_token_num))
             return nbytes
 
-        return SimpleNamespace(preallocate_verify_workspace=preallocate)
+        return SimpleNamespace(
+            preallocate_verify_workspace=preallocate,
+            preallocate_prefill_workspace=lambda: 0,
+        )
 
     config = _config(is_draft=is_draft, width=width)
     config.max_bs = 2

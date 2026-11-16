@@ -185,7 +185,6 @@ class AscendDSABackend(DSABackend):
         self._prefill_plan: AscendPrefillPlan | None = None
         self._prefill_runtime = None
         self._prefill_group = None
-        self._prefill_slots: torch.Tensor | None = None
         self._prefill_options = None
 
     @property
@@ -224,9 +223,15 @@ class AscendDSABackend(DSABackend):
         else:
             self._prefill_group = None
 
-    def prepare_prefill(self) -> int:
-        if not self.prefill_enabled or self._prefill_runtime is not None:
+    @property
+    def prefill_kv_capacity(self) -> int:
+        return self._prefill_options.max_history_rows if self.prefill_enabled else 0
+
+    def preallocate_prefill_workspace(self) -> int:
+        if not self.prefill_enabled:
             return 0
+        if self._prefill_runtime is not None:
+            return self._prefill_runtime.workspace_bytes
         if self.cache_pool is None:
             raise RuntimeError("Bind the DSA cache before preparing Prefill")
         layer_id = min(self.cache_pool.history_group_by_layer())
@@ -238,10 +243,11 @@ class AscendDSABackend(DSABackend):
             ranks=self._dcp.ranks,
             history_group=self._prefill_group,
             max_current_rows=self._prefill_options.max_current_rows,
+            max_history_rows=self._prefill_options.max_history_rows,
             history_null_rows=self._prefill_options.kv_page_size,
         )
         self._prefill_runtime = runtime
-        return 0
+        return runtime.workspace_bytes
 
     def prefetch_prefill_layer(self, layer_id):
         """Submit history at KDA, or ensure it at the attention entry."""
@@ -249,12 +255,8 @@ class AscendDSABackend(DSABackend):
         if not self.prefill_enabled or plan is None or plan.gather is None:
             raise RuntimeError("Prepare DSA Prefill page metadata first")
         if self._prefill_runtime is None:
-            self.prepare_prefill()
+            self.preallocate_prefill_workspace()
         runtime = self._prefill_runtime
-        if runtime.layer_id is None:
-            self._prefill_slots = torch.empty(
-                sum(plan.row_counts), dtype=torch.int64, device=plan.page_table.device
-            )
         runtime.prefetch(
             layer_id,
             self.cache_pool.get_key_buffer(layer_id),
@@ -281,7 +283,6 @@ class AscendDSABackend(DSABackend):
         if self._prefill_runtime is not None:
             self._prefill_runtime.close()
             self._prefill_runtime = None
-        self._prefill_slots = None
 
     def cache_placement(self, layer) -> CachePlacement | None:
         if self._ascend_placement is None:
@@ -830,12 +831,10 @@ class AscendDSABackend(DSABackend):
             width=spec.kv_cache_dim,
             total_rows=sum(plan.row_counts),
         )
-        plan.patch(
+        plan.store_current(
             runtime,
             layer.layer_id,
             out_cache_loc,
-            slots_workspace=self._prefill_slots,
-            width=spec.index_head_dim,
             block_rows=block_rows,
             virtual_blocks=virtual_blocks,
         )
@@ -858,15 +857,6 @@ class AscendDSABackend(DSABackend):
             indices = torch.empty(
                 (0, spec.index_topk), dtype=torch.int32, device=q.device
             )
-        plan.patch(
-            runtime,
-            layer.layer_id,
-            out_cache_loc,
-            slots_workspace=self._prefill_slots,
-            width=spec.kv_cache_dim,
-            block_rows=block_rows,
-            virtual_blocks=virtual_blocks,
-        )
         if self.step_counter is not None:
             self.step_counter.record_cache()
         kv_pages = runtime.kv.view(-1, self.kernel_page_size, spec.kv_cache_dim)
@@ -883,7 +873,6 @@ class AscendDSABackend(DSABackend):
         else:
             output = q.new_empty((q.shape[1], 0, spec.kv_lora_rank))
         runtime.finish(layer.layer_id)
-        self._prefill_slots = None
         return (
             output
             if head_major_output
