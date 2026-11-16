@@ -2535,14 +2535,14 @@ class ServerArgs:
             _require_choice(
                 "--disaggregation-decode-allocation-policy",
                 self.disaggregation_decode_allocation_policy,
-                ("early", "independent"),
+                ("early", "deferred"),
             )
         elif self.disaggregation_decode_allocation_policy is not None:
             raise ValueError(
                 "--disaggregation-decode-allocation-policy requires "
                 "--disaggregation-mode prefill"
             )
-        if self.disaggregation_decode_allocation_policy == "independent":
+        if self.disaggregation_decode_allocation_policy == "deferred":
             # Experimental: one attention rank per prompt, no external
             # encoder, and the KV sent from the computed prompt rather than
             # streamed during its forward. Refused, never rewritten; a
@@ -2564,7 +2564,7 @@ class ServerArgs:
             ]
             if unsupported:
                 raise ValueError(
-                    "--disaggregation-decode-allocation-policy independent does "
+                    "--disaggregation-decode-allocation-policy deferred does "
                     f"not support {', '.join(unsupported)}"
                 )
         # PD disaggregation. The prefill role keeps the ordinary graph flags:
@@ -5400,13 +5400,16 @@ class ServerArgs:
         parser.add_argument(
             "--disaggregation-decode-allocation-policy",
             type=str,
-            choices=["early", "independent"],
+            choices=["early", "deferred"],
             default=ServerArgs.disaggregation_decode_allocation_policy,
             help="Prefill servers only: what a request's Decode allocation "
             "gates. 'early' (the default) starts the prefill once every Decode "
-            "rank has allocated the destination; 'independent' (experimental) "
-            "starts it without waiting for that and holds only its KV transfer "
-            "until the destination is allocated. independent requires attention TP 1, "
+            "rank has allocated the destination; it is deprecated and will be "
+            "removed once 'deferred' supports the layouts that still need it. "
+            "'deferred' (experimental) starts the prefill without waiting for "
+            "the allocation, which the Decode server makes once the prefill "
+            "server holds every page of the prompt, and holds only its KV "
+            "transfer until then. deferred requires attention TP 1, "
             "--kv-parallel-size 1, --pipeline-parallel-size 1, no "
             "--enable-external-encoder, --disaggregation-layerwise-interval 0 "
             "and a model without multimodal input (or --language-model-only). "

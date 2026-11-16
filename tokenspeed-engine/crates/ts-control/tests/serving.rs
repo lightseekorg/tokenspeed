@@ -139,10 +139,10 @@ fn new_scheduler(
     role: Role,
     kv_shard_count: usize,
     device_pages: usize,
-    independent: bool,
+    deferred: bool,
 ) -> Scheduler {
     interpreter();
-    let policy = if independent { "Independent" } else { "Early" };
+    let policy = if deferred { "Deferred" } else { "Early" };
     let role = match role {
         Role::Plain => "Fused",
         Role::Prefill => "P",
@@ -440,11 +440,11 @@ struct FakePeer {
     role: Role,
     rank: usize,
     wire: Arc<Mutex<Wire>>,
-    /// Prefill: decode allocation is independent, so a request is admitted
+    /// Prefill: decode allocation is deferred, so a request is admitted
     /// at once and its destination's allocation has its own event.
-    independent: bool,
+    deferred: bool,
     /// Tracked requests: rid, room, bootstrapped, failure reported, and
-    /// (independent) admitted.
+    /// (deferred) admitted.
     tracked: Vec<(String, u64, bool, bool, bool)>,
 }
 
@@ -523,13 +523,13 @@ impl TransferPeer for FakePeer {
         let mut wire = self.wire.lock().unwrap();
         let mut events = Vec::new();
         let mut agreed = agreed.chunks_exact(2);
-        let independent = self.independent && role == Role::Prefill;
+        let deferred = self.deferred && role == Role::Prefill;
         self.tracked
             .retain_mut(|(rid, room, bootstrapped, failed, admitted)| {
                 let state = agreed.next().expect("one state per tracked request");
                 let (poll, retired) = (state[0], state[1]);
                 let room = wire.rooms.entry(*room).or_default();
-                if independent && !*admitted {
+                if deferred && !*admitted {
                     *admitted = true;
                     events.push(PdEvent::Bootstrapped(rid.clone()));
                 }
@@ -550,7 +550,7 @@ impl TransferPeer for FakePeer {
                     }
                     TransferPoll::Bootstrapped if !*bootstrapped => {
                         *bootstrapped = true;
-                        events.push(if independent {
+                        events.push(if deferred {
                             PdEvent::DestinationReady(rid.clone())
                         } else {
                             PdEvent::Bootstrapped(rid.clone())
@@ -1297,7 +1297,7 @@ struct Setup {
     /// Batch prefill in windows, with pressure checks for fresh admissions.
     prefill_delay: Option<PrefillDelay>,
     /// PD, prefill: admit without waiting for the decode allocation.
-    independent_admission: bool,
+    deferred_allocation: bool,
     /// Predecessors Engram reads per token.
     ngram_context_len: usize,
     /// PD: the engine's role and its peer's wire.
@@ -1463,7 +1463,7 @@ fn run_rank<F: Frontend>(
         epd_receive_enabled,
         startup,
         scheduler: scheduler_handle,
-        independent_admission,
+        deferred_allocation,
         ..
     } = setup;
     let role = pd.as_ref().map_or(Role::Plain, |pd| pd.role);
@@ -1485,7 +1485,7 @@ fn run_rank<F: Frontend>(
             role: pd.role,
             rank,
             wire: pd.wire,
-            independent: independent_admission,
+            deferred: deferred_allocation,
             tracked: Vec::new(),
         }) as Box<dyn TransferPeer + Send>
     });
@@ -1512,7 +1512,7 @@ fn run_rank<F: Frontend>(
         role,
         kv_shard_count,
         device_pages.unwrap_or(513),
-        independent_admission,
+        deferred_allocation,
     )));
     if let Some(handle) = scheduler_handle {
         *handle.lock().unwrap() = Some(scheduler.clone());
@@ -3664,14 +3664,15 @@ fn disaggregated(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn an_independent_prefill_computes_before_its_destination_and_sends_once_granted() {
+async fn a_prefill_under_deferred_allocation_computes_before_its_destination_and_sends_once_granted(
+) {
     for depth in [0, 1] {
         let (prefill, decode, _wire) = start_pd_pair(
             depth,
             Layout::Single,
             Tiers::DeviceOnly,
             Setup {
-                independent_admission: true,
+                deferred_allocation: true,
                 ..Setup::default()
             },
         )
@@ -3705,9 +3706,13 @@ async fn an_independent_prefill_computes_before_its_destination_and_sends_once_g
     }
 }
 
-/// An independent prefill engine alone, one script batch per round; no decode
-/// engine allocates any destination. Returns its rank and the wire.
-fn run_independent_prefill(depth: usize, script: Script) -> (ScriptedRank, Arc<Mutex<Wire>>) {
+/// A prefill engine under deferred allocation, alone, one script batch per
+/// round; no decode engine allocates any destination. Returns its rank and
+/// the wire.
+fn run_prefill_under_deferred_allocation(
+    depth: usize,
+    script: Script,
+) -> (ScriptedRank, Arc<Mutex<Wire>>) {
     let wire = Arc::new(Mutex::new(Wire {
         prefill_ranks: 1,
         ..Wire::default()
@@ -3721,7 +3726,7 @@ fn run_independent_prefill(depth: usize, script: Script) -> (ScriptedRank, Arc<M
                 role: Role::Prefill,
                 wire: wire.clone(),
             }),
-            independent_admission: true,
+            deferred_allocation: true,
             ..Setup::default()
         },
         vec![script],
@@ -3731,11 +3736,11 @@ fn run_independent_prefill(depth: usize, script: Script) -> (ScriptedRank, Arc<M
 }
 
 #[test]
-fn an_independent_prefill_keeps_its_kv_until_the_destination_is_allocated() {
+fn a_prefill_under_deferred_allocation_keeps_its_kv_until_the_destination_is_allocated() {
     for depth in [0, 1] {
         let mut script = vec![Vec::new(); 20];
         script[0].push(EngineRequest::Add(Box::new(disaggregated("r", 9, 40, 4))));
-        let (rank, wire) = run_independent_prefill(depth, script);
+        let (rank, wire) = run_prefill_under_deferred_allocation(depth, script);
         // One forward computed the prompt; for the rounds after it landed
         // the prompt kept its pages and sent nothing.
         assert_eq!(rank.outcome, Ok(()));
@@ -3750,7 +3755,7 @@ fn an_independent_prefill_keeps_its_kv_until_the_destination_is_allocated() {
 }
 
 #[test]
-fn a_cancelled_independent_prefill_is_released_without_its_destination() {
+fn a_cancelled_prefill_under_deferred_allocation_is_released_without_its_destination() {
     // The abort comes with the submission, so the transfer fails while the
     // prompt's forward is still out at depth 1, or four rounds later, once
     // the computed prompt waits for its destination. Either way the retired
@@ -3763,7 +3768,7 @@ fn a_cancelled_independent_prefill_is_released_without_its_destination() {
                 "doomed", 11, 40, 4,
             ))));
             script[abort_round].push(EngineRequest::Abort(vec!["doomed".to_owned()]));
-            let (rank, wire) = run_independent_prefill(depth, script);
+            let (rank, wire) = run_prefill_under_deferred_allocation(depth, script);
             assert_eq!(rank.outcome, Ok(()));
             assert_eq!(
                 rank.released
@@ -3787,7 +3792,7 @@ fn a_cancelled_independent_prefill_is_released_without_its_destination() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_waiting_independent_prefill_whose_transfer_fails_ends_with_an_abort() {
+async fn a_waiting_prefill_under_deferred_allocation_whose_transfer_fails_ends_with_an_abort() {
     // The prompt is computed and waits for its destination, then its
     // transfer fails: a bootstrap timeout, a decode node gone. Its output
     // waited for the transfer, even when its one token ended it, and its
@@ -3807,7 +3812,7 @@ async fn a_waiting_independent_prefill_whose_transfer_fails_ends_with_an_abort()
                         role: Role::Prefill,
                         wire: wire.clone(),
                     }),
-                    independent_admission: true,
+                    deferred_allocation: true,
                     ..Setup::default()
                 },
             )
@@ -3877,7 +3882,7 @@ fn a_grant_during_the_final_forward_sends_once_its_result_lands() {
                     role: Role::Prefill,
                     wire: wire.clone(),
                 }),
-                independent_admission: true,
+                deferred_allocation: true,
                 ..Setup::default()
             },
             vec![script],
@@ -3910,7 +3915,7 @@ fn a_grant_during_the_final_forward_sends_once_its_result_lands() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_keep_pause_freezes_an_independent_prefill_on_either_side_of_its_grant() {
+async fn a_keep_pause_freezes_a_prefill_under_deferred_allocation_on_either_side_of_its_grant() {
     // Frozen, the engine computes nothing and polls no transfer. A prompt
     // whose destination is allocated before it arrives is not computed until
     // the resume; a computed prompt whose destination is allocated during
@@ -3931,7 +3936,7 @@ async fn a_keep_pause_freezes_an_independent_prefill_on_either_side_of_its_grant
                         role: Role::Prefill,
                         wire: wire.clone(),
                     }),
-                    independent_admission: true,
+                    deferred_allocation: true,
                     ..Setup::default()
                 },
             )
@@ -4008,7 +4013,8 @@ async fn a_keep_pause_freezes_an_independent_prefill_on_either_side_of_its_grant
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_wait_pause_drains_a_computed_independent_prefill_once_its_destination_comes() {
+async fn a_wait_pause_drains_a_computed_prefill_under_deferred_allocation_once_its_destination_comes(
+) {
     // The scheduler holds a computed prompt until its transfer starts, so a
     // wait pause answers only after the decode engine allocated its
     // destination and its KV went out.
@@ -4026,7 +4032,7 @@ async fn a_wait_pause_drains_a_computed_independent_prefill_once_its_destination
                     role: Role::Prefill,
                     wire: wire.clone(),
                 }),
-                independent_admission: true,
+                deferred_allocation: true,
                 ..Setup::default()
             },
         )
@@ -4695,19 +4701,19 @@ async fn a_prefill_nan_ends_both_clients_once_the_transfer_failed() {
     // releases the request once, and once the transfer stopped neither its
     // pages nor its transfer hold the engine: the cache flushes, memory is
     // released, and serving goes on.
-    for (layout, independent_admission) in [
+    for (layout, deferred_allocation) in [
         (Layout::Single, false),
         (Layout::Single, true),
         (Layout::Tp(2), false),
     ] {
         for depth in [0, 1] {
-            let case = format!("{layout:?}, independent {independent_admission}, depth {depth}");
+            let case = format!("{layout:?}, deferred {deferred_allocation}, depth {depth}");
             let (prefill, decode, wire) = start_pd_pair(
                 depth,
                 layout,
                 Tiers::DeviceOnly,
                 Setup {
-                    independent_admission,
+                    deferred_allocation,
                     ..Setup::default()
                 },
             )
@@ -4801,7 +4807,7 @@ fn a_client_abort_racing_a_prefill_nan_stays_silent() {
     // that failure leaves the client, which tore down its stream, without
     // output; one after it finds the NaN abort already sent. Either way every
     // rank releases the request once and nothing is sent.
-    for (layout, independent_admission) in [
+    for (layout, deferred_allocation) in [
         (Layout::Single, false),
         (Layout::Single, true),
         (Layout::Tp(2), false),
@@ -4810,7 +4816,7 @@ fn a_client_abort_racing_a_prefill_nan_stays_silent() {
             let mut silent = Vec::new();
             for abort_round in 0..6 {
                 let case = format!(
-                    "{layout:?}, independent {independent_admission}, depth {depth}, \
+                    "{layout:?}, deferred {deferred_allocation}, depth {depth}, \
                      abort round {abort_round}"
                 );
                 let wire = Arc::new(Mutex::new(Wire {
@@ -4837,7 +4843,7 @@ fn a_client_abort_racing_a_prefill_nan_stays_silent() {
                             role: Role::Prefill,
                             wire: wire.clone(),
                         }),
-                        independent_admission,
+                        deferred_allocation,
                         ..Setup::default()
                     },
                     vec![script],
@@ -4872,7 +4878,7 @@ fn a_client_abort_racing_a_prefill_nan_stays_silent() {
                 assert_eq!(wire.lock().unwrap().rooms[&9].sent, None, "{case}");
             }
             // The aborts before the failure, then those after it.
-            let case = format!("{layout:?}, independent {independent_admission}, depth {depth}");
+            let case = format!("{layout:?}, deferred {deferred_allocation}, depth {depth}");
             assert!(silent.len() > 1 && silent.len() < 6, "{case}: {silent:?}");
             assert_eq!(silent, (0..silent.len()).collect::<Vec<_>>(), "{case}");
         }

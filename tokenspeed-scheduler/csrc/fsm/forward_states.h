@@ -262,7 +262,7 @@ struct PrefillDone : RestoreMarker {
 
     ForwardResources resources;
     TokenContainer::Window window{};
-    // Independent decode allocation: the error about this prompt's remote
+    // Deferred decode allocation: the error about this prompt's remote
     // decode not being admitted was logged.
     bool remote_decode_failure_logged{false};
 

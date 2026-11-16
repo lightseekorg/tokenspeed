@@ -720,7 +720,7 @@ the pause), as a pause is under a release. A drain (`abort`, `wait`, a
 release) cancels the admitted requests the scheduler does not hold yet, which
 end toward their clients: those compiling their grammars, and those waiting
 for their images' embeddings, which end once their receives settle — the
-drain waits for those. On a prefill engine under `independent` decode
+drain waits for those. On a prefill engine under `deferred` decode
 allocation (`scheduler.md` §3.1) the scheduler holds a request the transfer
 peer admitted before its decode destination is allocated, so a `wait` drain
 also waits for those destinations: a computed prompt is still prefilling
@@ -1027,7 +1027,7 @@ which transfers changed state; their scheduler events join the round's tail feed
 transfer aborts its request on every rank together. A prompt whose logits
 held a NaN is aborted as its forward commits, which cancels its transfer, and
 its client gets the `NumericalError` abort once that transfer failed.
-Under `independent` decode allocation (`scheduler.md` §3.1) the peers keep the
+Under `deferred` decode allocation (`scheduler.md` §3.1) the peers keep the
 order "prefill pages first": the prefill node states the policy in its route,
 and a decode rank that reads it sends `["Announce", room, cache]` to the
 room's prefill ranks once connected, again with every heartbeat until each
@@ -1037,7 +1037,7 @@ peer admits a registered request (`Bootstrapped`) once its decode ranks
 announced it: every attention-TP rank of the decode replica that holds it. The
 pages-held marks and the clocks that start at them are local to a rank and
 time-based; the members of a replica would have to agree on them, and
-`independent` requires single-member replicas. When the plan carrying a
+`deferred` requires single-member replicas. When the plan carrying a
 request's last chunk goes to the device (`ExecutionPlan::completed_prompts`,
 the scheduler's `ForwardBatch::CompletesPrompt`) the host marks it
 (`PrefillOutbox::mark_pages_held`) and the announcing ranks get the room's

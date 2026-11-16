@@ -187,7 +187,7 @@ def make_config(
         decode_allocation_policy:
             ``--disaggregation-decode-allocation-policy``, required on the
             prefill role and None on every other: ``"early"`` admits a prompt
-            once its Decode destination is allocated; ``"independent"``
+            once its Decode destination is allocated; ``"deferred"``
             admits it without waiting for the destination and holds only its
             KV transfer for it.
         debug_force_retraction_interval: ``--debug-force-retraction-interval``:
@@ -288,7 +288,7 @@ def make_config(
     cfg.role = scheduler_role(role)
     # Read here, not at import: a scheduler wheel released before the policy
     # has neither the field nor its enum and admits every prompt early, so
-    # early is left unset there and independent raises AttributeError.
+    # early is left unset there and deferred raises AttributeError.
     # ServerArgs validates the name, SchedulerConfig::Validate the role.
     if decode_allocation_policy is not None and (
         decode_allocation_policy != "early" or hasattr(cfg, "decode_allocation_policy")
@@ -296,7 +296,7 @@ def make_config(
         policies = SchedulerConfig.DecodeAllocationPolicy
         cfg.decode_allocation_policy = {
             "early": policies.Early,
-            "independent": policies.Independent,
+            "deferred": policies.Deferred,
         }[decode_allocation_policy]
     cfg.decode_input_tokens = decode_input_tokens
     cfg.overlap_schedule_depth = overlap_schedule_depth

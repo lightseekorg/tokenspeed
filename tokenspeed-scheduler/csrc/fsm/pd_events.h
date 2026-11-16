@@ -46,7 +46,7 @@ struct BootstrappedEvent : InvalidTransitionHandler<BootstrappedEvent> {
     Prefetching operator()(Prefetching&& state);
 };
 
-// P role, independent decode allocation: a computed prompt that waited for
+// P role, deferred decode allocation: a computed prompt that waited for
 // its destination sends its KV.
 struct DestinationReadyEvent : InvalidTransitionHandler<DestinationReadyEvent> {
     using InvalidTransitionHandler<DestinationReadyEvent>::operator();

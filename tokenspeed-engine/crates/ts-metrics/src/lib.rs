@@ -629,7 +629,7 @@ impl EngineMetrics {
                 exporter,
                 "tokenspeed:num_prefill_awaiting_destination_reqs",
                 "Prefill requests computed and waiting for their decode destination \
-                 (--disaggregation-decode-allocation-policy independent); \
+                 (--disaggregation-decode-allocation-policy deferred); \
                  tokenspeed:num_prefill_inflight_queue_reqs counts them too.",
                 names,
             ),
@@ -1076,9 +1076,9 @@ impl KvTransferMetrics {
     }
 
     /// A transfer that timed out in `stage`: on the prefill node
-    /// `bootstrapping`, or before an independent node admitted the request
-    /// `waiting_for_announcement` (of its decode node); on the decode node
-    /// `waiting_for_admission` before its manifest went out, then
+    /// `bootstrapping`, or before a node under deferred allocation admitted
+    /// the request `waiting_for_announcement` (of its decode node); on the
+    /// decode node `waiting_for_admission` before its manifest went out, then
     /// `waiting_for_input`.
     pub fn record_timeout(&self, stage: &str) {
         self.timeouts

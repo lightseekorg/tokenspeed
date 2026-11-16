@@ -18,7 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! Independent decode allocation's one link between the scheduler and the
+//! Deferred decode allocation's one link between the scheduler and the
 //! transfer peers: a Prefill scheduler's plans go through the data plane to
 //! a Prefill peer, and a Decode peer hears of a request when the plan
 //! carrying its prompt's last chunk is handed to the device.
@@ -39,14 +39,14 @@ mod native;
 #[path = "../../../../ts-pd/tests/support/mod.rs"]
 mod support;
 
-/// A Prefill scheduler under independent decode allocation: 16-token pages
+/// A Prefill scheduler under deferred decode allocation: 16-token pages
 /// and 64 tokens a round.
 const PREFILL_SCHEDULER: &str = r#"
 import tokenspeed_scheduler as ts
 
 cfg = ts.SchedulerConfig()
 cfg.role = ts.SchedulerConfig.Role.P
-cfg.decode_allocation_policy = ts.SchedulerConfig.DecodeAllocationPolicy.Independent
+cfg.decode_allocation_policy = ts.SchedulerConfig.DecodeAllocationPolicy.Deferred
 cfg.prefix_granularity = 16
 cfg.max_scheduled_tokens = 64
 cfg.max_batch_size = 4
@@ -77,7 +77,7 @@ fn a_decode_peer_hears_of_a_prompt_when_the_plan_with_its_last_chunk_reaches_the
         Duration::from_secs(60),
         None,
         0,
-        "independent",
+        "deferred",
     );
     let (mut mesh, group) = support::single_rank();
     let streams = Streams::Prefill(pair.prefill_outbox.clone());

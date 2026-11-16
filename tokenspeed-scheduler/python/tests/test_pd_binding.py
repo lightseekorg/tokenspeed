@@ -181,13 +181,13 @@ def test_prefill_duplicate_sources_survive_until_pd_terminal(
     assert scheduler.available_lcm_blocks() == cfg.num_device_pages - 1
 
 
-def test_independent_prefill_counts_prompts_waiting_for_their_destination():
-    """Under independent decode allocation computed prompts wait for their
+def test_prefill_under_deferred_allocation_counts_prompts_waiting_for_their_destination():
+    """Under deferred decode allocation computed prompts wait for their
     decode destination with their pages; the scheduler counts them and the
     pages in their block tables."""
     cfg = SchedulerConfig()
     cfg.role = SchedulerConfig.Role.P
-    cfg.decode_allocation_policy = SchedulerConfig.DecodeAllocationPolicy.Independent
+    cfg.decode_allocation_policy = SchedulerConfig.DecodeAllocationPolicy.Deferred
     cfg.prefix_granularity = 2
     cfg.max_scheduled_tokens = 8
     cfg.max_batch_size = 3
@@ -365,13 +365,13 @@ def test_prefill_role_hands_off_without_the_draft_window():
     assert handoff is not None and list(handoff.request_ids) == ["p"]
 
 
-def test_independent_prefill_holds_its_kv_until_the_destination_is_ready():
-    """Under independent decode allocation ``PD.BootstrappedEvent`` only admits
+def test_prefill_under_deferred_allocation_holds_its_kv_until_the_destination_is_ready():
+    """Under deferred decode allocation ``PD.BootstrappedEvent`` only admits
     a prompt; its KV is handed off once ``PD.DestinationReadyEvent`` reports
     that the Decode destination is allocated."""
     cfg = SchedulerConfig()
     cfg.role = SchedulerConfig.Role.P
-    cfg.decode_allocation_policy = SchedulerConfig.DecodeAllocationPolicy.Independent
+    cfg.decode_allocation_policy = SchedulerConfig.DecodeAllocationPolicy.Deferred
     cfg.prefix_granularity = 1
     cfg.max_scheduled_tokens = 8
     cfg.max_batch_size = 1

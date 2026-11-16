@@ -65,7 +65,7 @@ fn shared(native: &NativeLibrary) -> Shared {
         failed_session_ttl: Duration::from_secs(30),
         metrics: None,
         layerwise: None,
-        independent: false,
+        deferred: false,
         interval_fields: vec![],
         metadata_ready: Condvar::new(),
     }
@@ -303,15 +303,15 @@ fn replacement_waits_for_its_writer_without_blocking_other_registrations() {
     preallocate(&peer, "independent-cache", 7).unwrap();
 }
 
-/// A Prefill rank that allocates independently, driven as the event loop
+/// A Prefill rank under deferred decode allocation, driven as the event loop
 /// and the control socket drive it; and a Decode rank's control socket with
 /// what arrives there.
-fn independent_peer(
+fn deferred_allocation_peer(
     native: &NativeLibrary,
     bootstrap_timeout: Duration,
 ) -> (PrefillPeer, PrefillOutbox, Mesh, Group) {
     let mut shared = shared(native);
-    shared.independent = true;
+    shared.deferred = true;
     // What it counts lands in the native library's directory (`timeouts`).
     let exporter = ts_metrics::Exporter::new(&ts_metrics::MetricsConfig {
         prometheus_dir: native.path().parent().map(std::path::Path::to_path_buf),
@@ -384,7 +384,7 @@ fn announce_until_answered(
     }
 }
 
-/// The transfer timeouts the metrics of `independent_peer` counted, by
+/// The transfer timeouts the metrics of `deferred_allocation_peer` counted, by
 /// stage: the series of the Prometheus multiprocess file they write (a used
 /// length, then per series its key's length, the key padded to 8 bytes, its
 /// value and a timestamp).
@@ -422,9 +422,11 @@ fn room(room: u64) -> BootstrapInfo {
 }
 
 #[test]
-fn an_independent_request_is_admitted_by_its_announcement_and_granted_by_its_manifest() {
+fn a_request_under_deferred_allocation_is_admitted_by_its_announcement_and_granted_by_its_manifest()
+{
     let native = NativeLibrary::new();
-    let (mut peer, outbox, mut mesh, group) = independent_peer(&native, Duration::from_secs(60));
+    let (mut peer, outbox, mut mesh, group) =
+        deferred_allocation_peer(&native, Duration::from_secs(60));
     let (decode, received) = decode_socket();
     register(&peer.shared, "cache-a", "127.0.0.1:41001", decode.port());
 
@@ -466,7 +468,8 @@ fn an_independent_request_is_admitted_by_its_announcement_and_granted_by_its_man
 #[test]
 fn an_announcement_before_its_request_waits_for_it_and_expires_unclaimed() {
     let native = NativeLibrary::new();
-    let (mut peer, _outbox, mut mesh, group) = independent_peer(&native, Duration::from_secs(60));
+    let (mut peer, _outbox, mut mesh, group) =
+        deferred_allocation_peer(&native, Duration::from_secs(60));
     let (decode, received) = decode_socket();
     register(&peer.shared, "cache-a", "127.0.0.1:41001", decode.port());
     peer.shared.handle(&wire::announce_frames(7, "cache-a"));
@@ -495,7 +498,8 @@ fn a_manifest_for_a_room_that_was_not_announced_fails_the_request() {
     // A Decode rank that does not know the order (an older build, a stale
     // route) pre-allocates at once.
     let native = NativeLibrary::new();
-    let (mut peer, _outbox, mut mesh, group) = independent_peer(&native, Duration::from_secs(60));
+    let (mut peer, _outbox, mut mesh, group) =
+        deferred_allocation_peer(&native, Duration::from_secs(60));
     let (decode, received) = decode_socket();
     register(&peer.shared, "cache-a", "127.0.0.1:41001", decode.port());
     peer.register("r", &room(7)).unwrap();
@@ -522,7 +526,8 @@ fn a_manifest_for_a_room_that_was_not_announced_fails_the_request() {
 #[test]
 fn a_request_holding_its_pages_times_out_from_then_and_its_announcer_is_told() {
     let native = NativeLibrary::new();
-    let (mut peer, outbox, mut mesh, group) = independent_peer(&native, Duration::from_millis(150));
+    let (mut peer, outbox, mut mesh, group) =
+        deferred_allocation_peer(&native, Duration::from_millis(150));
     let (decode, received) = decode_socket();
     register(&peer.shared, "cache-a", "127.0.0.1:41001", decode.port());
     peer.register("r", &room(7)).unwrap();
@@ -565,7 +570,8 @@ fn an_early_rank_answers_an_announcement_at_once() {
 #[test]
 fn an_announcement_of_a_room_that_ended_binds_its_tombstone_to_the_cache() {
     let native = NativeLibrary::new();
-    let (mut peer, _outbox, _mesh, _group) = independent_peer(&native, Duration::from_secs(60));
+    let (mut peer, _outbox, _mesh, _group) =
+        deferred_allocation_peer(&native, Duration::from_secs(60));
     let (decode, received) = decode_socket();
     register(&peer.shared, "cache-a", "127.0.0.1:41001", decode.port());
     // The request ends here before its Decode rank announced it: nothing
@@ -585,7 +591,7 @@ fn an_announcement_of_a_room_that_ended_binds_its_tombstone_to_the_cache() {
 fn a_request_its_decode_node_never_announces_times_out_from_its_registration() {
     let native = NativeLibrary::new();
     let (mut peer, _outbox, mut mesh, group) =
-        independent_peer(&native, Duration::from_millis(150));
+        deferred_allocation_peer(&native, Duration::from_millis(150));
     register(&peer.shared, "cache-a", "127.0.0.1:41001", 42001);
     peer.register("r", &room(7)).unwrap();
     assert_eq!(peer.poll(&mut mesh, &group).unwrap(), []);
@@ -606,7 +612,8 @@ fn a_request_its_decode_node_never_announces_times_out_from_its_registration() {
 #[test]
 fn a_room_is_admitted_once_every_rank_of_its_decode_node_announced_it() {
     let native = NativeLibrary::new();
-    let (mut peer, _outbox, mut mesh, group) = independent_peer(&native, Duration::from_secs(60));
+    let (mut peer, _outbox, mut mesh, group) =
+        deferred_allocation_peer(&native, Duration::from_secs(60));
     // One Decode node of two attention-TP ranks: one destination.
     for (cache, session, port, rank) in [
         ("d-0", "127.0.0.1:41001", 42001, 0),
@@ -649,7 +656,8 @@ fn a_room_is_admitted_once_every_rank_of_its_decode_node_announced_it() {
 fn a_request_waiting_for_its_announcement_is_reported_after_the_stall_interval() {
     use std::{io::Read, os::unix::net::UnixStream};
     let native = NativeLibrary::new();
-    let (mut peer, _outbox, mut mesh, group) = independent_peer(&native, Duration::from_secs(60));
+    let (mut peer, _outbox, mut mesh, group) =
+        deferred_allocation_peer(&native, Duration::from_secs(60));
     let (decode, _received) = decode_socket();
     register(&peer.shared, "cache-a", "127.0.0.1:41001", decode.port());
     for (rid, number) in [("computing", 1), ("unannounced", 2)] {

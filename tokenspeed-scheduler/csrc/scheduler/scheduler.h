@@ -229,7 +229,7 @@ public:
     std::int32_t ActiveDecodeSlots() const { return decode_slots_.Size() - decode_slots_.AvailableSlots(); }
     // D-role prefill is complete but the first local decode has not acquired a permit.
     std::size_t ReadyWaitingSize() const;
-    // P role, independent admission: computed prompts waiting for their
+    // P role, deferred decode allocation: computed prompts waiting for their
     // Decode destination (PrefillAwaitingDestination, a subset of
     // PrefillSize() and RunningSize()), and the Device parents in their block
     // tables, counted as ActiveLcmBlocks() counts them; blocks held outside the

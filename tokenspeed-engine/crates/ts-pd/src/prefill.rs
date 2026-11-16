@@ -63,7 +63,7 @@ use crate::{
 };
 
 /// A request still bootstrapping this long after registration is reported.
-/// Under independent decode allocation a request is reported once it has
+/// Under deferred decode allocation a request is reported once it has
 /// waited this long for what `PrefillPeer::log_stalls` names.
 const BOOTSTRAP_STALL: Duration = Duration::from_secs(10);
 
@@ -159,7 +159,7 @@ pub struct PrefillConfig {
     /// What this rank registers there, but its control port.
     pub bootstrap_payload: serde_json::Value,
     /// A request whose Decode ranks have not all pre-allocated this long
-    /// after registration fails. Under independent decode allocation it
+    /// after registration fails. Under deferred decode allocation it
     /// bounds the wait for the Decode node's announcement and, from the
     /// moment a request holds its pages, the wait for its allocation
     /// (`PrefillPeer::poll`).
@@ -306,13 +306,13 @@ struct State {
     layerwise_rooms: HashSet<u64>,
     /// Layerwise rooms' bootstrap payloads, from their remote decode.
     prefill_metadata: HashMap<u64, (i64, Option<Vec<i32>>)>,
-    /// Independent decode allocation: the Decode sessions that announced
+    /// Deferred decode allocation: the Decode sessions that announced
     /// each room. Together they are the request's destination.
     announced: HashMap<u64, BTreeSet<String>>,
-    /// Independent: the rooms whose request holds every page of its prompt
+    /// Deferred: the rooms whose request holds every page of its prompt
     /// (its last chunk went to the device), since when. The marks are local
     /// to this rank and time-based: the members of a replica would have to
-    /// agree on them, and independent allocation requires single-member
+    /// agree on them, and deferred allocation requires single-member
     /// replicas today.
     pages_held: HashMap<u64, Instant>,
 }
@@ -475,10 +475,10 @@ struct Shared {
     metrics: Option<Arc<ts_metrics::KvTransferMetrics>>,
     layerwise: Option<Layerwise>,
     /// The decode allocation policy this rank registered with the bootstrap
-    /// server is independent: a request is admitted once its Decode node
+    /// server is deferred: a request is admitted once its Decode node
     /// announced it, and that node allocates only after this rank's notice
     /// that the request holds its pages.
-    independent: bool,
+    deferred: bool,
     /// Layerwise: each transfer interval's fields.
     interval_fields: Vec<Option<BTreeSet<String>>>,
     /// Signaled when a layerwise room's bootstrap payload arrives.
@@ -606,7 +606,7 @@ impl Shared {
                     state.cancel_room(room, Some(&cache_id));
                 }
                 Some(TransferPoll::Failed)
-            } else if !self.independent {
+            } else if !self.deferred {
                 Some(TransferPoll::Bootstrapped)
             } else {
                 state.announced.entry(room).or_default().insert(cache_id);
@@ -919,7 +919,7 @@ impl Shared {
             self.notify_failed(route, room);
             return Ok(());
         }
-        if self.independent {
+        if self.deferred {
             // A Decode rank that follows the order announces the room and
             // allocates only after this rank's notice. One that does not
             // (an older build, a stale route) fails here instead of holding
@@ -933,7 +933,7 @@ impl Shared {
             {
                 return Err(
                     "pre-allocation for a room that was not announced or does not hold its \
-                     pages yet (independent decode allocation)"
+                     pages yet (deferred decode allocation)"
                         .to_owned(),
                 );
             }
@@ -1442,13 +1442,13 @@ impl PrefillOutbox {
         self.shared.transport.restore_regions(false)
     }
 
-    /// Whether this rank allocates independently
+    /// Whether this rank defers the decode allocation
     /// ([`PrefillOutbox::mark_pages_held`]).
-    pub fn allocates_independently(&self) -> bool {
-        self.shared.independent
+    pub fn defers_allocation(&self) -> bool {
+        self.shared.deferred
     }
 
-    /// Independent decode allocation: the plan handed to the device carries
+    /// Deferred decode allocation: the plan handed to the device carries
     /// the last chunk of these requests' prompts
     /// (`ExecutionPlan::completed_prompts`). Each holds every page it needs
     /// from now on, so its announced Decode ranks are told and may allocate
@@ -1824,10 +1824,10 @@ fn same_prompt_window(windows: &[&Manifest]) -> Result<(), String> {
 /// One request's transfer as the scheduling loop tracks it.
 struct Sender {
     room: u64,
-    /// Independent decode allocation: this rank admitted the request (every
+    /// Deferred decode allocation: this rank admitted the request (every
     /// rank of its Decode node announced it).
     announced: bool,
-    /// Independent: the replica agreed on the admission, which the
+    /// Deferred: the replica agreed on the admission, which the
     /// scheduler was told.
     admitted: bool,
     started: Instant,
@@ -1839,7 +1839,7 @@ struct Sender {
 /// What a request that has not concluded waits for on this rank.
 #[derive(Clone, Copy)]
 enum Wait {
-    /// Independent decode allocation: its Decode node's announcement.
+    /// Deferred decode allocation: its Decode node's announcement.
     Announcement,
     /// Its destination's allocation, every Decode rank's manifest.
     Allocation,
@@ -1880,7 +1880,7 @@ impl PrefillPeer {
             failed_session_ttl: config.failed_session_ttl,
             metrics: config.peer.metrics.clone(),
             layerwise: config.layerwise,
-            independent: config.bootstrap_payload["decode_allocation_policy"] == "independent",
+            deferred: config.bootstrap_payload["decode_allocation_policy"] == "deferred",
             interval_fields,
             metadata_ready: Condvar::new(),
         });
@@ -1974,7 +1974,7 @@ impl PrefillPeer {
 
     /// Report, at most once per stall interval, the requests that have
     /// waited that long (`waits`, by `order`): under early allocation the
-    /// ones still bootstrapping, under independent allocation by what each
+    /// ones still bootstrapping, under deferred allocation by what each
     /// waits for and since when. There a prompt that computes waits for
     /// nothing.
     fn log_stalls(&mut self, polls: &[i64], waits: &[(Wait, Option<Instant>)]) {
@@ -1993,7 +1993,7 @@ impl PrefillPeer {
             }
             let sender = &self.senders[rid];
             let what = match wait {
-                Wait::Allocation if !self.shared.independent => "requests still bootstrapping",
+                Wait::Allocation if !self.shared.deferred => "requests still bootstrapping",
                 Wait::Allocation => "requests still waiting for their decode allocation",
                 Wait::Announcement => {
                     "requests still waiting for their decode instance's announcement"
@@ -2082,16 +2082,16 @@ impl TransferPeer for PrefillPeer {
             return Ok(Vec::new());
         }
         let now = Instant::now();
-        let independent = self.shared.independent;
+        let deferred = self.shared.deferred;
         let mut polls = Vec::with_capacity(self.order.len());
         let mut waits = Vec::with_capacity(self.order.len());
         {
             let mut state = self.shared.state();
             for rid in &self.order {
                 let sender = self.senders.get_mut(rid).expect("tracked");
-                // Independent: a request is admitted once every rank of its
+                // Deferred: a request is admitted once every rank of its
                 // Decode node announced its room.
-                if independent && !sender.announced && sender.concluded.is_none() {
+                if deferred && !sender.announced && sender.concluded.is_none() {
                     sender.announced = state.announced.get(&sender.room).is_some_and(|sessions| {
                         sessions.iter().all(|session| {
                             state
@@ -2106,11 +2106,11 @@ impl TransferPeer for PrefillPeer {
                 }
                 // What the request waits for and since when; the bootstrap
                 // timeout bounds each wait. Under early allocation that is
-                // its destination, from registration. Under independent
+                // its destination, from registration. Under deferred
                 // allocation: its Decode node's announcement, from
                 // registration; once admitted nothing while it computes,
                 // then its destination from the moment it held its pages.
-                let (wait, since) = if !independent {
+                let (wait, since) = if !deferred {
                     (Wait::Allocation, Some(sender.started))
                 } else if sender.announced {
                     (
@@ -2184,7 +2184,7 @@ impl TransferPeer for PrefillPeer {
             .iter()
             .map(|rid| i64::from(self.senders[rid].announced))
             .collect();
-        let admissions = if replica.size() > 1 && independent {
+        let admissions = if replica.size() > 1 && deferred {
             mesh.all_reduce(replica, &admissions, Reduce::Min)?
         } else {
             admissions
@@ -2237,13 +2237,13 @@ impl TransferPeer for PrefillPeer {
         {
             let sender = self.senders.get_mut(rid).expect("tracked");
             let poll = TransferPoll::from_wire(poll).unwrap_or(TransferPoll::Failed);
-            if independent && admission != 0 && !sender.admitted && poll != TransferPoll::Failed {
+            if deferred && admission != 0 && !sender.admitted && poll != TransferPoll::Failed {
                 sender.admitted = true;
                 events.push(PdEvent::Bootstrapped(rid.clone()));
             }
             if sender.local == TransferPoll::Bootstrapping && poll == TransferPoll::Bootstrapped {
                 sender.local = TransferPoll::Bootstrapped;
-                events.push(if independent {
+                events.push(if deferred {
                     PdEvent::DestinationReady(rid.clone())
                 } else {
                     PdEvent::Bootstrapped(rid.clone())

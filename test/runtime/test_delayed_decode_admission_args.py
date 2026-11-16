@@ -19,7 +19,7 @@
 # SOFTWARE.
 
 """The prefill role's decode allocation policy: early unless the launch
-chooses independent, refused on the other roles, and independent only where
+chooses deferred, refused on the other roles, and deferred only where
 it runs."""
 
 import sys
@@ -39,10 +39,10 @@ from tokenspeed.runtime.utils.server_args import (  # noqa: E402
     prepare_server_args,
 )
 
-INDEPENDENT = dict(
+DEFERRED = dict(
     model="unused",
     disaggregation_mode="prefill",
-    disaggregation_decode_allocation_policy="independent",
+    disaggregation_decode_allocation_policy="deferred",
 )
 
 
@@ -55,7 +55,7 @@ def test_prefill_admits_early_unless_the_launch_chooses():
     assert args.disaggregation_layerwise_interval == 1
 
 
-@pytest.mark.parametrize("policy", ["early", "independent"])
+@pytest.mark.parametrize("policy", ["early", "deferred"])
 def test_prefill_keeps_the_chosen_policy(policy):
     args = prepare_server_args(
         [
@@ -74,7 +74,7 @@ def test_prefill_keeps_the_chosen_policy(policy):
 
 
 def test_prefill_refuses_an_unknown_policy():
-    with pytest.raises(ValueError, match=r"must be one of \['early', 'independent'\]"):
+    with pytest.raises(ValueError, match=r"must be one of \['early', 'deferred'\]"):
         ServerArgs(
             model="unused",
             disaggregation_mode="prefill",
@@ -83,7 +83,7 @@ def test_prefill_refuses_an_unknown_policy():
 
 
 @pytest.mark.parametrize("role", ["null", "decode", "encode"])
-@pytest.mark.parametrize("policy", ["early", "independent"])
+@pytest.mark.parametrize("policy", ["early", "deferred"])
 def test_other_roles_refuse_any_policy(role, policy):
     assert (
         ServerArgs(
@@ -99,11 +99,11 @@ def test_other_roles_refuse_any_policy(role, policy):
         )
 
 
-def test_independent_admission_refuses_layerwise_transfer_without_overriding_it():
+def test_deferred_allocation_refuses_layerwise_transfer_without_overriding_it():
     with pytest.raises(
         ValueError, match="--disaggregation-layerwise-interval other than 0"
     ):
-        ServerArgs(**INDEPENDENT)
+        ServerArgs(**DEFERRED)
 
 
 @pytest.mark.parametrize(
@@ -118,9 +118,9 @@ def test_independent_admission_refuses_layerwise_transfer_without_overriding_it(
         (dict(enable_external_encoder=True), "--enable-external-encoder"),
     ],
 )
-def test_independent_admission_refuses_unsupported_layouts(layout, refused):
+def test_deferred_allocation_refuses_unsupported_layouts(layout, refused):
     with pytest.raises(ValueError, match=refused):
-        ServerArgs(**INDEPENDENT, disaggregation_layerwise_interval=0, **layout)
+        ServerArgs(**DEFERRED, disaggregation_layerwise_interval=0, **layout)
     # The same layout admits early.
     args = ServerArgs(
         model="unused",
@@ -131,18 +131,18 @@ def test_independent_admission_refuses_unsupported_layouts(layout, refused):
     assert args.disaggregation_decode_allocation_policy == "early"
 
 
-def test_independent_admission_names_every_unsupported_setting():
+def test_deferred_allocation_names_every_unsupported_setting():
     with pytest.raises(ValueError) as refusal:
-        ServerArgs(**INDEPENDENT, world_size=2, attn_tp_size=2)
+        ServerArgs(**DEFERRED, world_size=2, attn_tp_size=2)
     assert "attention TP > 1" in str(refusal.value)
     assert "--disaggregation-layerwise-interval other than 0" in str(refusal.value)
 
 
 @pytest.mark.parametrize(
     "policy, multimodal",
-    [("independent", True), ("independent", False), ("early", True)],
+    [("deferred", True), ("deferred", False), ("early", True)],
 )
-def test_a_prefill_rank_refuses_independent_admission_for_a_multimodal_model(
+def test_a_prefill_rank_refuses_deferred_allocation_for_a_multimodal_model(
     monkeypatch, policy, multimodal
 ):
     # Whether the model takes multimodal input is known once the rank read
@@ -159,10 +159,10 @@ def test_a_prefill_rank_refuses_independent_admission_for_a_multimodal_model(
         disaggregation_layerwise_interval=0,
     )
     server_args.mapping.rank = 0
-    if policy == "independent" and multimodal:
+    if policy == "deferred" and multimodal:
         with pytest.raises(
             ValueError,
-            match="independent does not support a multimodal model; serve it "
+            match="deferred does not support a multimodal model; serve it "
             "with --language-model-only",
         ):
             rust_host.HostBootstrap(server_args, None, None, None, None, None, None)

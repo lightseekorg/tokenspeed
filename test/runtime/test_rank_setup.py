@@ -395,24 +395,24 @@ def test_pd_roles_configure_their_pools_as_resolved(role):
     )
 
 
-def test_independent_admission_reaches_the_prefill_scheduler():
+def test_deferred_allocation_reaches_the_prefill_scheduler():
     args = ServerArgs(
         model="x",
         disaggregation_mode="prefill",
-        disaggregation_decode_allocation_policy="independent",
+        disaggregation_decode_allocation_policy="deferred",
         disaggregation_layerwise_interval=0,
     )
     cfg = _config(args, _specs(num_host_pages=0, num_snapshot_pages=1, max_retracted=0))
     assert (
         cfg.decode_allocation_policy
-        == ts.SchedulerConfig.DecodeAllocationPolicy.Independent
+        == ts.SchedulerConfig.DecodeAllocationPolicy.Deferred
     )
 
 
 def test_an_older_scheduler_wheel_admits_early_without_the_policy(monkeypatch):
     # tokenspeed-scheduler 0.1.54 has neither the field nor its enum and only
     # admits a prompt once its destination is allocated: a prefill server
-    # starts with early left unset, and independent fails at startup.
+    # starts with early left unset, and deferred fails at startup.
     class OldSchedulerConfig:
         pass
 
@@ -433,7 +433,7 @@ def test_an_older_scheduler_wheel_admits_early_without_the_policy(monkeypatch):
         max_num_seqs=8,
         disaggregation_mode="prefill",
         disaggregation_transfer_backend="mooncake",
-        disaggregation_decode_allocation_policy="independent",
+        disaggregation_decode_allocation_policy="deferred",
         disaggregation_layerwise_interval=0,
     )
     with pytest.raises(AttributeError, match="DecodeAllocationPolicy"):

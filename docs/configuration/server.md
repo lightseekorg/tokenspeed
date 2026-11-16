@@ -1071,24 +1071,24 @@ not update that embedded copy.
 
 `--disaggregation-decode-allocation-policy` sets what a request's Decode
 allocation gates on a prefill server; the other roles refuse the flag.
-`early`, the default, admits the prefill once every Decode rank of the
-request has allocated its destination, so the KV can stream layer by layer
-during the forward. `independent` (experimental) computes the prompt without
-waiting for the Decode allocation and holds only its KV transfer: a computed
-prompt keeps its pages until the destination is allocated, and a destination
-allocated before the prompt finishes is remembered. `independent` requires
-attention TP 1, `--kv-parallel-size 1`, `--pipeline-parallel-size 1`, no
-`--enable-external-encoder`, an explicit
-`--disaggregation-layerwise-interval 0` and a model without multimodal
-input (or `--language-model-only`); anything else is refused at
-startup.
+`early`, the default, admits the prefill once every Decode rank of the request
+has allocated its destination, so the KV can stream layer by layer during the
+forward. `early` is deprecated: it will be removed once `deferred` supports
+the layouts that still need it. `deferred` (experimental) defers the Decode
+allocation until the prefill server holds every page of the prompt: it
+computes the prompt without waiting for the allocation and holds only its KV
+transfer, and a computed prompt keeps its pages until the destination is
+allocated. `deferred` requires attention TP 1, `--kv-parallel-size 1`,
+`--pipeline-parallel-size 1`, no `--enable-external-encoder`, an explicit
+`--disaggregation-layerwise-interval 0` and a model without multimodal input
+(or `--language-model-only`); anything else is refused at startup.
 
-Under `independent`, computed prompts waiting for their destination hold
+Under `deferred`, computed prompts waiting for their destination hold
 prefill pages. While one waits, a new prompt that does not fit in the pages
 left holds back the new prompts behind it, so that smaller prompts that keep
 fitting do not starve a larger one.
 
-The two servers keep one order under `independent`: a request takes every page
+The two servers keep one order under `deferred`: a request takes every page
 it needs on the prefill server before its Decode server allocates its
 destination, so neither holds pages the other waits for. The Decode server
 announces each request to the prefill server. The prefill server admits a
@@ -1096,7 +1096,7 @@ request once it is announced, and tells the Decode server when the request's
 last chunk is admitted; only then may the Decode server allocate. The Decode
 server's scheduler sees every request whose notice arrived and chooses among
 them as it chooses among the requests of `early` prefill servers. Every Decode
-server of a prefill server that runs `independent` must understand the
+server of a prefill server that runs `deferred` must understand the
 announcement: an older one sends its manifest unannounced and fails each
 request at once.
 
@@ -1111,22 +1111,22 @@ not allocated by then. On the Decode server
 server's notice, which covers the prefill server's queue and computation, and
 then again the wait for the allocation.
 
-Known limits. With a tight prefill pool `independent` is slower than `early`
-even when every Decode server is healthy: prompts wait for destinations with
-their pages. The prefill server computes every request a Decode server
-announces, whether or not that server allocates: a Decode server that does not
-allocate keeps its computed prompts' pages on the prefill server until each
-fails, one timeout after it held its pages, and prompts for other Decode
-servers wait for those pages meanwhile. An admitted request has no timeout on
-the prefill server while it is queued or computed: its Decode server's waiting
-timeout ends it, and if that server is gone, it fails one timeout after it was
-computed. A computed prompt waiting for its destination publishes its last
-chunk to the prefix cache only with its transfer, so a prompt with the same
-prefix admitted meanwhile computes that chunk again. On a Decode server that
-is full, later smaller requests can be allocated ahead of a larger one, whose
-prompt keeps its pages on the prefill server until it is allocated or one of
-the two timeouts fails it. If a prefill server stops after its notice, the
-Decode server fails the request at its waiting timeout; pages it had already
+Known limits. With a tight prefill pool `deferred` is slower than `early` even
+when every Decode server is healthy: prompts wait for destinations with their
+pages. The prefill server computes every request a Decode server announces,
+whether or not that server allocates: a Decode server that does not allocate
+keeps its computed prompts' pages on the prefill server until each fails, one
+timeout after it held its pages, and prompts for other Decode servers wait for
+those pages meanwhile. An admitted request has no timeout on the prefill
+server while it is queued or computed: its Decode server's waiting timeout
+ends it, and if that server is gone, it fails one timeout after it held its
+pages. A computed prompt waiting for its destination publishes its last chunk
+to the prefix cache only with its transfer, so a prompt with the same prefix
+admitted meanwhile computes that chunk again. On a Decode server that is full,
+later smaller requests can be allocated ahead of a larger one, whose prompt
+keeps its pages on the prefill server until it is allocated or one of the two
+timeouts fails it. If a prefill server stops after its notice, the Decode
+server fails the request at its waiting timeout; pages it had already
 allocated go back only when the prefill ranks acknowledge the cancellation,
 which a dead prefill process never does, as under `early`.
 
@@ -1182,7 +1182,7 @@ which the `#req-state(bootstrap/prefill/remote-prefill/decode/pd-pinned)`
 suffix also lists on its own. The Prometheus waiting gauge and the router
 load snapshot report the scheduler's narrower waiting count, without the
 bootstrapping share. Under
-`--disaggregation-decode-allocation-policy independent` a prefill request
+`--disaggregation-decode-allocation-policy deferred` a prefill request
 bootstraps only until the prefill server admits it, which does not wait for
 the decode allocation; a computed prompt then stays in the `prefill` share
 until its destination is allocated and its transfer starts
@@ -1300,7 +1300,7 @@ The decode role splits that PD wait into its own gauges.
 prefill peer is working, this rank already holds their destination pages, and
 nothing here is schedulable until the bootstrap token arrives.
 `tokenspeed:num_decode_prealloc_queue_reqs` counts the earlier wait for the peer
-to connect; when the prefill server allocates independently it also counts
+to connect; when the prefill server runs `deferred` it also counts
 the requests waiting for that server's notice (its queueing and computation).
 `tokenspeed:num_decode_transfer_queue_reqs` counts requests whose
 pages a transfer still pins, including requests that already ended (aborted or
@@ -1520,11 +1520,11 @@ carry the `model_name` and `app_key` labels:
 | Metric | Type | Meaning |
 | --- | --- | --- |
 | `tokenspeed:kv_transfer_latency_seconds` | Histogram | Wall time of one KV transfer send to a peer, recorded on the prefill node (one sample per peer per transferred chunk — per layerwise interval in layerwise mode, except an interval with nothing for that peer; buckets span 1 ms to 60 s). |
-| `tokenspeed:kv_transfer_timeouts_total` | Counter | Transfers that timed out, with a bounded `stage` label: `bootstrapping` (prefill never received the cache manifest; `TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT`), `waiting_for_announcement` (the Decode server never announced the request to an independent prefill server, same timeout), `waiting_for_admission` (decode never published its manifest; `TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT`) or `waiting_for_input` (decode never received the transfer-done signal; `TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT`). |
+| `tokenspeed:kv_transfer_timeouts_total` | Counter | Transfers that timed out, with a bounded `stage` label: `bootstrapping` (prefill never received the cache manifest; `TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT`), `waiting_for_announcement` (the Decode server never announced the request to a prefill server that runs `deferred`, same timeout), `waiting_for_admission` (decode never published its manifest; `TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT`) or `waiting_for_input` (decode never received the transfer-done signal; `TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT`). |
 | `tokenspeed:kv_transfer_failures_total` | Counter | Transfers aborted on failure: send failures on the prefill node, and rooms failed on prefill-node loss (heartbeat) on the decode node. Timeouts are counted separately. |
 
 A prefill server under `--disaggregation-decode-allocation-policy
-independent` ([P/D admission](#pd-admission)) also reports its admission
+deferred` ([P/D admission](#pd-admission)) also reports its admission
 with the scheduler's metrics, which carry the `dp_rank` label too:
 
 | Metric | Type | Meaning |
@@ -1537,7 +1537,7 @@ prefill server states its policy in what it registers with the bootstrap
 server (`decode_allocation_policy`, served to Decode servers as
 `prefill_decode_allocation_policy` in `/route`).
 
-Under `independent`, `tokenspeed:num_prefill_prealloc_queue_reqs` counts the
+Under `deferred`, `tokenspeed:num_prefill_prealloc_queue_reqs` counts the
 requests the prefill server has not admitted yet, those waiting for their
 Decode server's announcement, and an admitted request not yet scheduled counts
 in `tokenspeed:num_requests_waiting`. A computed prompt waiting for its

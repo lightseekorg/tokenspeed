@@ -127,7 +127,7 @@ pub fn preallocation_route(frames: &[Bytes]) -> Result<(u64, String), WireError>
 }
 
 /// A Decode rank holds `room`'s request: its cache is the request's
-/// destination. Sent to a Prefill node that allocates independently, which
+/// destination. Sent to a Prefill node under deferred decode allocation, which
 /// answers with the room's status (`Bootstrapped`, or `Failed`) once the
 /// request holds every page of its prompt there. A Prefill rank that does
 /// not know the message drops it as a malformed pre-allocation.

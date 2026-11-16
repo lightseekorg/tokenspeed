@@ -145,7 +145,7 @@ struct State {
     /// Bootstrap address -> its route; the addresses the heartbeat watches.
     routes: HashMap<String, (Option<String>, Arc<PrefillRoute>)>,
     connections: HashMap<ConnectionKey, Arc<Vec<Target>>>,
-    /// The connected rooms whose Prefill node allocates independently: the
+    /// The connected rooms whose Prefill node defers the decode allocation: the
     /// node was told of each, and its notice admits the room here.
     announced: HashSet<u64>,
     /// The Prefill ranks whose notice arrived: the room's request holds
@@ -296,7 +296,7 @@ impl State {
             .entry(addr.to_owned())
             .or_default()
             .insert(room);
-        if route.independent {
+        if route.deferred {
             self.announced.insert(room);
         }
         self.rooms.update(room, TransferPoll::Bootstrapped);
@@ -582,7 +582,7 @@ impl Shared {
                 elapsed_ms = started.map(|at| at.elapsed().as_secs_f64() * 1000.0),
                 "event=ts_decode_connected"
             );
-            if route.independent {
+            if route.deferred {
                 // The heartbeat repeats it until every rank answered.
                 for target in targets.iter() {
                     let _ = self.transport.sockets.send_coalesced(
@@ -1306,7 +1306,7 @@ mod tests {
             dummy_tp_ranks: Vec::new(),
             expected_prefill_ranks: vec![0, 1],
             prefill_dp_size: 1,
-            independent: false,
+            deferred: false,
         }
     }
 
@@ -1320,8 +1320,8 @@ mod tests {
     #[test]
     fn a_notice_is_kept_before_the_connection_and_needs_every_expected_rank() {
         let mut state = State::default();
-        let independent = PrefillRoute {
-            independent: true,
+        let deferred = PrefillRoute {
+            deferred: true,
             ..route()
         };
         // Both ranks' notices arrive while the room still connects: they do
@@ -1332,13 +1332,13 @@ mod tests {
             state.apply(StatusMessage::bare(1, TransferPoll::Bootstrapped, rank));
         }
         assert_eq!(state.rooms.get(1), Some(TransferPoll::Bootstrapping));
-        assert!(state.attach(1, "p:1", &independent, Arc::new(Vec::new())));
+        assert!(state.attach(1, "p:1", &deferred, Arc::new(Vec::new())));
         assert_eq!(state.rooms.get(1), Some(TransferPoll::Bootstrapped));
         assert!(!state.awaiting_notice(1));
         // One rank's notice is not enough.
         state.tracked.insert(2);
         state.rooms.update(2, TransferPoll::Bootstrapping);
-        assert!(state.attach(2, "p:1", &independent, Arc::new(Vec::new())));
+        assert!(state.attach(2, "p:1", &deferred, Arc::new(Vec::new())));
         state.apply(StatusMessage::bare(2, TransferPoll::Bootstrapped, 0));
         assert!(state.awaiting_notice(2));
         state.apply(StatusMessage::bare(2, TransferPoll::Bootstrapped, 1));

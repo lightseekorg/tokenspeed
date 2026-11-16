@@ -29,14 +29,14 @@ namespace tokenspeed {
 namespace pd {
 // The transfer peer lets the request be admitted. On the D role the prefill
 // peer answered. On the P role under early decode allocation every Decode
-// rank allocated the destination; under independent decode allocation the
+// rank allocated the destination; under deferred decode allocation the
 // destination has its own event, DestinationReadyEvent.
 struct BootstrappedEvent {
     std::string request_id;
     explicit BootstrappedEvent(std::string id) : request_id(std::move(id)) {}
 };
 
-// P role, independent decode allocation: every Decode rank allocated the
+// P role, deferred decode allocation: every Decode rank allocated the
 // request's destination, so its KV may be sent once the prompt is computed.
 struct DestinationReadyEvent {
     std::string request_id;

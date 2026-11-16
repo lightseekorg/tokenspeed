@@ -213,7 +213,7 @@ fn an_announced_room_is_admitted_by_its_notice_and_repeats_its_announcement_unti
     let native = NativeLibrary::new();
     let (mut peer, _outbox, mut mesh, group) =
         setup(&native, Duration::from_millis(100), Duration::from_secs(60));
-    let (prefill, received, server) = prefill_node(Some("independent"));
+    let (prefill, received, server) = prefill_node(Some("deferred"));
     peer.register("r", &bootstrap(server.port(), 5)).unwrap();
     // Connected, the room is announced, again with every heartbeat, and the
     // scheduler does not see the request.
@@ -270,7 +270,7 @@ fn an_announced_room_times_out_from_registration_and_again_from_its_notice() {
     let native = NativeLibrary::new();
     let (mut peer, _outbox, mut mesh, group) =
         setup(&native, Duration::from_secs(60), Duration::from_millis(600));
-    let (prefill, _received, server) = prefill_node(Some("independent"));
+    let (prefill, _received, server) = prefill_node(Some("deferred"));
     // Never noticed: its Prefill node is gone, lost the request, or never
     // held its pages.
     let registered = Instant::now();
@@ -316,7 +316,7 @@ fn every_noticed_request_is_shown_to_the_scheduler() {
     let native = NativeLibrary::new();
     let (mut peer, _outbox, mut mesh, group) =
         setup(&native, Duration::from_secs(60), Duration::from_secs(60));
-    let (_prefill, _received, server) = prefill_node(Some("independent"));
+    let (_prefill, _received, server) = prefill_node(Some("deferred"));
     // Twelve requests arrive and connect; the scheduler sees none of them
     // before its notice.
     let mut shown = Vec::new();

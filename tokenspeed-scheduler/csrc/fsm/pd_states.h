@@ -82,7 +82,7 @@ private:
     std::int32_t reserve_num_tokens_in_next_schedule_event_{};
 };
 
-// P role, independent decode allocation: a computed prompt whose Decode
+// P role, deferred decode allocation: a computed prompt whose Decode
 // destination is not allocated yet (no pd::DestinationReadyEvent). It keeps
 // the resources of PrefillAwaitingResult, pinned like every page-holding P
 // state, and is never scheduled; pd::DestinationReadyEvent moves it to

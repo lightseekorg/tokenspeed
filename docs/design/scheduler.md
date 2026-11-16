@@ -1527,17 +1527,18 @@ request here starts in `Bootstrapping` and becomes a candidate with
 `pd::BootstrappedEvent`; before that it is not probed, so it reports no
 capacity failure and stops no other prompt. Under `early` that event says
 every Decode rank allocated the request's destination, so an admitted prompt
-always has one. Under `independent` the event only admits, and the destination
+always has one. Under `deferred` the event only admits, and the destination
 has its own event, `pd::DestinationReadyEvent`
 (`Request::MarkDestinationReady`), which may come in any state: a prompt whose
 final result lands before it waits in `PrefillAwaitingDestination`, with its
 pages and request-pool slot, until the event moves it to `PrefillDone`, whose
 remote decode sends the KV. The policy is read where a final result makes that
-choice and where the prefill plan sets the capacity stop below. A cancellation
-or a failed transfer (`pd::FailedEvent`) ends a waiting prompt as it ends
-every pinned request: it parks in `PdTransferring` until the transfer stopped
-(`pd::TransferStoppedEvent`). The prompts waiting are bounded by the request
-pool's slots (`max_batch_size`) as well as by the pages they hold.
+choice and where the prefill plan sets the capacity stop described in the
+following paragraph. A cancellation or a failed transfer (`pd::FailedEvent`)
+ends a waiting prompt as it ends every pinned request: it parks in
+`PdTransferring` until the transfer stopped (`pd::TransferStoppedEvent`). The
+prompts waiting are bounded by the request pool's slots (`max_batch_size`) as
+well as by the pages they hold.
 
 A prompt waiting for its destination holds pages that only the Decode node's
 allocation, or its transfer's failure, gives back. While one waits, a new
@@ -1554,10 +1555,10 @@ request's destination only after this scheduler admitted the request's last
 chunk, when it holds every page the prompt needs, so no destination is held
 for a prompt this node cannot compute. That includes the prompt's remote
 decode: the last chunk's admission reserved the decode slots it reads, so it
-takes no block. Were it ever not admitted under `independent`, the scheduler
+takes no block. Were it ever not admitted under `deferred`, the scheduler
 logs an error once for that request and leaves the prompt as it is; the
 Decode node's waiting timeout ends it.
-`independent` requires `--disaggregation-layerwise-interval 0` (no KV streams
+`deferred` requires `--disaggregation-layerwise-interval 0` (no KV streams
 during the forward), attention TP 1, KVP 1, PP 1, no external encoder and a
 model without multimodal input.
 
@@ -1570,7 +1571,7 @@ arrived; the Decode peer shows its scheduler a request only after that notice.
 **Retraction: none.** A P node's pressure valve is the transfer itself — pages
 are pinned until the peer acknowledges, then released wholesale. Retracting a
 prompt whose KV is mid-transfer would strand the decode side. Under
-`independent` decode allocation a computed prompt without a destination keeps
+`deferred` decode allocation a computed prompt without a destination keeps
 its pages too: it is neither retracted nor computed again. Lone-request
 compaction (§1.4) is gated on the same pin, so past its first admission a
 request here waits as before; the pin counts as a transfer in flight, so the
@@ -1597,7 +1598,7 @@ The PD pin is a function of the FSM
 (`Scheduler::pdTransferInFlight`). On this role every page-holding state is
 pinned until the PD ACK finishes the request: under `early` decode allocation
 the peer's decode may read the pages from the first scheduled chunk (layerwise
-streaming), under `independent` only from the remote decode on, and a prompt
+streaming), under `deferred` only from the remote decode on, and a prompt
 waiting for its destination is pinned as well. On the D role the pin is
 `RemotePrefilling`:
 the peer's prefill is writing the destination pages, and `RemotePrefillDone`
@@ -2092,7 +2093,7 @@ must use matching contracts; releases follow the sequence in AGENTS.md.
   first, and a resident chunk that fails admission still stops everything
   behind it.
 - On the P role a request is a candidate only after `pd::BootstrappedEvent`,
-  and under `independent` decode allocation its KV is sent only after
+  and under `deferred` decode allocation its KV is sent only after
   `pd::DestinationReadyEvent` (§3.1). A computed prompt waiting for that event
   is never retracted or computed again, and while one waits a new prompt that
   fails for capacity stops the new prompts behind it. The Decode node must

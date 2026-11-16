@@ -1000,16 +1000,15 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
     // The first decode spends the prompt end's copy-in blocks; a decode
     // reserves none.
     if (!admitStep(plan, feedback, *request, staged, demands, progress, /*copy_in_point=*/std::nullopt)) {
-        // Independent decode allocation rests on a prompt's remote decode
+        // Deferred decode allocation rests on a prompt's remote decode
         // taking no block: the Decode node allocated because the prompt
         // holds every page it needs. The prompt stays as it is and is tried
         // again; its Decode node's waiting timeout ends it.
         if (auto* done = request->GetIf<fsm::PrefillDone>();
-            done != nullptr &&
-            config_.decode_allocation_policy == SchedulerConfig::DecodeAllocationPolicy::kIndependent &&
+            done != nullptr && config_.decode_allocation_policy == SchedulerConfig::DecodeAllocationPolicy::kDeferred &&
             !std::exchange(done->remote_decode_failure_logged, true)) {
             spdlog::error(
-                "[Scheduler] independent decode allocation: the remote decode of request {} ({} prompt tokens) was "
+                "[Scheduler] deferred decode allocation: the remote decode of request {} ({} prompt tokens) was "
                 "not admitted: it asked for {} more tokens{}{} with {} of {} Device LCM blocks empty; the prompt "
                 "keeps its pages until its decode node gives up",
                 request->Id(), request->PrefillSize(), reserve_tokens,
@@ -2174,14 +2173,14 @@ void Scheduler::buildPrefillWorkerPlan(AdmissionFeedback& feedback, PlanBuild& b
     }
 
     schedulePeerLandings(feedback, build, candidates, /*new_prompts_sealed=*/false);
-    // Independent decode allocation: a computed prompt waiting for its
+    // Deferred decode allocation: a computed prompt waiting for its
     // destination holds pages that only the Decode node's allocation, or the
     // transfer peer's timeout, gives back. While one waits, a new prompt that
     // fails for capacity stops the new prompts behind it: smaller prompts
     // that kept fitting would take every page the waiting ones return, and
     // the larger prompt would wait for all of them to drain.
     const bool prompt_awaits_destination =
-        config_.decode_allocation_policy == SchedulerConfig::DecodeAllocationPolicy::kIndependent &&
+        config_.decode_allocation_policy == SchedulerConfig::DecodeAllocationPolicy::kDeferred &&
         AwaitingDestinationSize() > 0;
     scheduleLocalPrefillWork(feedback, build, candidates, /*new_prompts_sealed=*/false,
                              /*blocked_prompt_seals=*/prompt_awaits_destination, config_.decode_input_tokens);

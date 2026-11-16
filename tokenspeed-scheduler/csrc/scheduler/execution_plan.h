@@ -104,7 +104,7 @@ public:
     // decode batch and a restore (see buildDecodeWorkerPlan).
     //
     // P role: completed prefills whose final chunk's result has landed and
-    // whose Decode destination is allocated (under independent decode
+    // whose Decode destination is allocated (under deferred decode
     // allocation a computed prompt may wait for it); each one's decode
     // happens on the peer node, so its KV goes out. Rows are self-contained
     // (bootstrap token + drafter candidates).

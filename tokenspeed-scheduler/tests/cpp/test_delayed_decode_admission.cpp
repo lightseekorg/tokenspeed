@@ -25,12 +25,12 @@
 
 namespace tokenspeed::test {
 
-class IndependentAdmissionTest : public SchedulerTestSuite {
+class DeferredAllocationTest : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
         auto cfg = SchedulerTestSuite::MakeConfig();
         cfg.role = Role::kP;
-        cfg.decode_allocation_policy = SchedulerConfig::DecodeAllocationPolicy::kIndependent;
+        cfg.decode_allocation_policy = SchedulerConfig::DecodeAllocationPolicy::kDeferred;
         cfg.disable_l2_cache = true;
         cfg.host_allocator.total_pages = 0;
         cfg.max_scheduled_tokens = 4;
@@ -71,7 +71,7 @@ protected:
 
 // Until the transfer peer admits it a prompt is no candidate, and its
 // destination's allocation alone does not admit it.
-TEST_F(IndependentAdmissionTest, APromptThePeerHasNotAdmittedIsNotScheduled) {
+TEST_F(DeferredAllocationTest, APromptThePeerHasNotAdmittedIsNotScheduled) {
     SubmitPrompt("r", 4);
     for (int i = 0; i < 3; ++i) {
         EXPECT_TRUE(FindForwardBatch(PlanOnce())->request_ids.empty());
@@ -95,7 +95,7 @@ TEST_F(IndependentAdmissionTest, APromptThePeerHasNotAdmittedIsNotScheduled) {
     EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
 }
 
-TEST_F(IndependentAdmissionTest, FinalResultRetainsEveryGroupUntilGrant) {
+TEST_F(DeferredAllocationTest, FinalResultRetainsEveryGroupUntilGrant) {
     SubmitPrompt("r", 6);
     Admit("r");
     const auto first = PlanOnce();
@@ -146,7 +146,7 @@ TEST_F(IndependentAdmissionTest, FinalResultRetainsEveryGroupUntilGrant) {
 
 // A computed prompt waiting for its destination holds its pages and request
 // slot, as one awaiting its transfer does: both count as running.
-TEST_F(IndependentAdmissionTest, AComputedPromptWaitingForItsDestinationIsRunning) {
+TEST_F(DeferredAllocationTest, AComputedPromptWaitingForItsDestinationIsRunning) {
     SubmitPrompt("r", 4);
     Admit("r");
     EXPECT_EQ(scheduler_->RunningSize(), 0u);
@@ -163,7 +163,7 @@ TEST_F(IndependentAdmissionTest, AComputedPromptWaitingForItsDestinationIsRunnin
 }
 
 // A prompt that holds no pages yet, admitted or not, ends at once.
-TEST_F(IndependentAdmissionTest, CancellingBeforeTheFirstChunkHoldsNothing) {
+TEST_F(DeferredAllocationTest, CancellingBeforeTheFirstChunkHoldsNothing) {
     SubmitPrompt("held", 4);
     SubmitPrompt("admitted", 4, 100);
     Admit("admitted");
@@ -181,7 +181,7 @@ TEST_F(IndependentAdmissionTest, CancellingBeforeTheFirstChunkHoldsNothing) {
 }
 
 // A client abort cancels the transfer, whose retirement fails the request.
-TEST_F(IndependentAdmissionTest, CancellationIgnoresLateGrant) {
+TEST_F(DeferredAllocationTest, CancellationIgnoresLateGrant) {
     SubmitPrompt("r", 4);
     Admit("r");
     PlanOnce();
@@ -195,7 +195,7 @@ TEST_F(IndependentAdmissionTest, CancellationIgnoresLateGrant) {
 }
 
 // A forward abort on the P role waits for the transfer to retire.
-TEST_F(IndependentAdmissionTest, CancellingWhileWaitingReleasesResourcesWithoutTransfer) {
+TEST_F(DeferredAllocationTest, CancellingWhileWaitingReleasesResourcesWithoutTransfer) {
     SubmitPrompt("r", 4);
     Admit("r");
     PlanOnce();
@@ -217,7 +217,7 @@ TEST_F(IndependentAdmissionTest, CancellingWhileWaitingReleasesResourcesWithoutT
 
 // The cancellation retires while the final forward is still out: the pages
 // stay until its result lands, and a grant in between sends nothing.
-TEST_F(IndependentAdmissionTest, CancellingDuringTheFinalForwardReleasesOnceItsResultLands) {
+TEST_F(DeferredAllocationTest, CancellingDuringTheFinalForwardReleasesOnceItsResultLands) {
     SubmitPrompt("r", 4);
     Admit("r");
     ASSERT_EQ(FindForwardBatch(PlanOnce())->request_ids, std::vector<std::string>{"r"});
@@ -232,7 +232,7 @@ TEST_F(IndependentAdmissionTest, CancellingDuringTheFinalForwardReleasesOnceItsR
 
 // Once its KV is being sent, a cancelled prompt keeps its pages until the
 // transfer stopped, as under early allocation.
-TEST_F(IndependentAdmissionTest, CancellingAGrantedPromptWaitsForItsTransferToStop) {
+TEST_F(DeferredAllocationTest, CancellingAGrantedPromptWaitsForItsTransferToStop) {
     SubmitPrompt("r", 4);
     Admit("r");
     PlanOnce();
@@ -247,7 +247,7 @@ TEST_F(IndependentAdmissionTest, CancellingAGrantedPromptWaitsForItsTransferToSt
     EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
 }
 
-TEST_F(IndependentAdmissionTest, EarlyGrantIsRememberedWithoutSendingUncomputedKv) {
+TEST_F(DeferredAllocationTest, EarlyGrantIsRememberedWithoutSendingUncomputedKv) {
     SubmitPrompt("r", 6);
     Admit("r");
     Grant("r");
@@ -268,10 +268,10 @@ TEST_F(IndependentAdmissionTest, EarlyGrantIsRememberedWithoutSendingUncomputedK
     EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
 }
 
-class IndependentAdmissionFullPoolTest : public IndependentAdmissionTest, public ::testing::WithParamInterface<bool> {
+class DeferredAllocationFullPoolTest : public DeferredAllocationTest, public ::testing::WithParamInterface<bool> {
 protected:
     SchedulerConfig MakeConfig() override {
-        auto cfg = IndependentAdmissionTest::MakeConfig();
+        auto cfg = DeferredAllocationTest::MakeConfig();
         cfg.cache_groups.resize(GetParam() ? 2 : 1);
         cfg.device_allocator.total_pages = GetParam() ? 11 : 7;
         for (auto& group : cfg.cache_groups) group.total_pages = cfg.device_allocator.total_pages;
@@ -281,7 +281,7 @@ protected:
     }
 };
 
-TEST_P(IndependentAdmissionFullPoolTest, GrantDrainsCompletedPromptAndUnblocksPartialPromptInAFullPool) {
+TEST_P(DeferredAllocationFullPoolTest, GrantDrainsCompletedPromptAndUnblocksPartialPromptInAFullPool) {
     SubmitPrompt("first", 4);
     SubmitPrompt("partial", 6, 100);
     Admit("first");
@@ -313,9 +313,9 @@ TEST_P(IndependentAdmissionFullPoolTest, GrantDrainsCompletedPromptAndUnblocksPa
     EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
 }
 
-INSTANTIATE_TEST_SUITE_P(HistoryAndState, IndependentAdmissionFullPoolTest, ::testing::Bool());
+INSTANTIATE_TEST_SUITE_P(HistoryAndState, DeferredAllocationFullPoolTest, ::testing::Bool());
 
-TEST_F(IndependentAdmissionTest, GrantDuringFinalForwardSendsAsSoonAsItsResultLands) {
+TEST_F(DeferredAllocationTest, GrantDuringFinalForwardSendsAsSoonAsItsResultLands) {
     SubmitPrompt("r", 4);
     Admit("r");
     PlanOnce();
@@ -329,7 +329,7 @@ TEST_F(IndependentAdmissionTest, GrantDuringFinalForwardSendsAsSoonAsItsResultLa
     EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
 }
 
-TEST_F(IndependentAdmissionTest, DecodeFailureWhileAwaitingGrantReleasesAllSourceGroups) {
+TEST_F(DeferredAllocationTest, DecodeFailureWhileAwaitingGrantReleasesAllSourceGroups) {
     SubmitPrompt("r", 4);
     Admit("r");
     PlanOnce();
@@ -344,10 +344,10 @@ TEST_F(IndependentAdmissionTest, DecodeFailureWhileAwaitingGrantReleasesAllSourc
 // One history group of 12 usable pages. A prompt's last chunk also takes the
 // two pages its first decode window may fill: a 4-token prompt holds 4
 // pages, an 8-token one 6 and a 16-token one 10.
-class IndependentAdmissionSealTest : public IndependentAdmissionTest {
+class DeferredAllocationSealTest : public DeferredAllocationTest {
 protected:
     SchedulerConfig MakeConfig() override {
-        auto cfg = IndependentAdmissionTest::MakeConfig();
+        auto cfg = DeferredAllocationTest::MakeConfig();
         cfg.cache_groups.resize(1);
         cfg.device_allocator.total_pages = 13;
         cfg.cache_groups.front().total_pages = 13;
@@ -360,7 +360,7 @@ protected:
 // While a computed prompt waits for its destination, a new prompt that does
 // not fit stops the new prompts behind it, so the pages a waiting prompt
 // returns reach it first.
-TEST_F(IndependentAdmissionSealTest, ANewPromptThatDoesNotFitStopsLaterNewPromptsWhileAComputedPromptWaits) {
+TEST_F(DeferredAllocationSealTest, ANewPromptThatDoesNotFitStopsLaterNewPromptsWhileAComputedPromptWaits) {
     SubmitPrompt("first", 4);
     SubmitPrompt("second", 4, 50);
     Admit("first");
@@ -390,7 +390,7 @@ TEST_F(IndependentAdmissionSealTest, ANewPromptThatDoesNotFitStopsLaterNewPrompt
 
 // A prompt the transfer peer has not admitted is not probed: it reports no
 // capacity failure and stops nothing, though it would not fit.
-TEST_F(IndependentAdmissionSealTest, APromptThePeerHasNotAdmittedNeitherBlocksNorSeals) {
+TEST_F(DeferredAllocationSealTest, APromptThePeerHasNotAdmittedNeitherBlocksNorSeals) {
     SubmitPrompt("waiting", 4);
     Admit("waiting");
     ASSERT_EQ(FindForwardBatch(PlanOnce())->request_ids, std::vector<std::string>{"waiting"});
@@ -413,7 +413,7 @@ TEST_F(IndependentAdmissionSealTest, APromptThePeerHasNotAdmittedNeitherBlocksNo
 
 // With no computed prompt waiting for its destination a smaller prompt passes
 // one that does not fit, as under early allocation.
-TEST_F(IndependentAdmissionSealTest, WithoutAWaitingPromptASmallerPromptPassesOneThatDoesNotFit) {
+TEST_F(DeferredAllocationSealTest, WithoutAWaitingPromptASmallerPromptPassesOneThatDoesNotFit) {
     SubmitPrompt("sending", 4);
     Admit("sending");
     Grant("sending");
@@ -433,7 +433,7 @@ TEST_F(IndependentAdmissionSealTest, WithoutAWaitingPromptASmallerPromptPassesOn
 // destination allocated: its KV is sent as soon as it is computed, and the
 // destination's own event changes nothing. A config without a policy, as a
 // caller built before the policy existed sends it, is early.
-TEST_F(IndependentAdmissionTest, EarlyPolicySendsWithoutASeparateDestinationGrant) {
+TEST_F(DeferredAllocationTest, EarlyPolicySendsWithoutASeparateDestinationGrant) {
     using Policy = SchedulerConfig::DecodeAllocationPolicy;
     for (const std::optional<Policy> policy : {std::optional{Policy::kEarly}, std::optional<Policy>{}}) {
         auto cfg = MakeConfig();
@@ -453,7 +453,7 @@ TEST_F(IndependentAdmissionTest, EarlyPolicySendsWithoutASeparateDestinationGran
     }
 }
 
-TEST_F(IndependentAdmissionTest, DecodeAllocatesWithoutWaitingForPrefillCompletion) {
+TEST_F(DeferredAllocationTest, DecodeAllocatesWithoutWaitingForPrefillCompletion) {
     auto cfg = MakeConfig();
     cfg.role = Role::kD;
     cfg.decode_allocation_policy.reset();
@@ -474,7 +474,7 @@ TEST_F(IndependentAdmissionTest, DecodeAllocatesWithoutWaitingForPrefillCompleti
     EXPECT_EQ(decode.RemotePrefillSize(), 1u);
 }
 
-TEST_F(IndependentAdmissionTest, DecodeAdmissionPressureDoesNotBlockPrefillComputation) {
+TEST_F(DeferredAllocationTest, DecodeAdmissionPressureDoesNotBlockPrefillComputation) {
     auto cfg = MakeConfig();
     cfg.role = Role::kD;
     cfg.decode_allocation_policy.reset();
@@ -510,7 +510,7 @@ TEST_F(IndependentAdmissionTest, DecodeAdmissionPressureDoesNotBlockPrefillCompu
     EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
 }
 
-TEST_F(IndependentAdmissionTest, AllocationPolicyIsForPrefillOnly) {
+TEST_F(DeferredAllocationTest, AllocationPolicyIsForPrefillOnly) {
     for (const auto role : {Role::kD, Role::kFused}) {
         auto cfg = MakeConfig();
         cfg.role = role;
@@ -521,7 +521,7 @@ TEST_F(IndependentAdmissionTest, AllocationPolicyIsForPrefillOnly) {
     }
 }
 
-// A real P scheduler under independent allocation and real D schedulers, run
+// A real P scheduler under deferred allocation and real D schedulers, run
 // round by round. Run() does what the transfer peers do between them:
 //   - a prompt reaches P and its destination's D scheduler in its arrival
 //     round;
@@ -566,7 +566,7 @@ protected:
         config.cache_groups.front().transfer_policy = CacheTransferPolicy::FullSuffix;
         auto prefill_config = config;
         prefill_config.role = Role::kP;
-        prefill_config.decode_allocation_policy = SchedulerConfig::DecodeAllocationPolicy::kIndependent;
+        prefill_config.decode_allocation_policy = SchedulerConfig::DecodeAllocationPolicy::kDeferred;
         prefill_config.prefill_chunk_yield_tokens = setup.yield_tokens;
         prefill_config.device_allocator.total_pages = setup.prefill_pages;
         prefill_config.cache_groups.front().total_pages = setup.prefill_pages;

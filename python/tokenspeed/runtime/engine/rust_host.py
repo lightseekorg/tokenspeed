@@ -1295,14 +1295,14 @@ class HostBootstrap:
                 server_args, server_args.model, draft_of=None
             )
             # Refused here, where the model is known, like the layouts
-            # ServerArgs refuses: independent allocation is not validated
+            # ServerArgs refuses: deferred allocation is not validated
             # with multimodal inputs.
             if (
                 model_config.is_multimodal_active
-                and server_args.disaggregation_decode_allocation_policy == "independent"
+                and server_args.disaggregation_decode_allocation_policy == "deferred"
             ):
                 raise ValueError(
-                    "--disaggregation-decode-allocation-policy independent does "
+                    "--disaggregation-decode-allocation-policy deferred does "
                     "not support a multimodal model; serve it with "
                     "--language-model-only"
                 )

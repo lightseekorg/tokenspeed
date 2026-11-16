@@ -38,7 +38,7 @@
 // small for some of the images the knob takes. One P-role test turns the
 // in-forward checkpoints on for every seed and drops short prompts' ends
 // (drop_short_prompt_end_checkpoints). The P role also draws its decode
-// allocation policy, from a stream of its own; under independent allocation
+// allocation policy, from a stream of its own; under deferred allocation
 // the peer allocates destinations at a rate the seed draws, whatever a
 // prompt's progress, so computed prompts wait for theirs.
 //
@@ -151,9 +151,9 @@ struct ClosedLoop {
     bool mixed{false};
     bool capacity_retraction{false};
     std::int32_t force_retraction_interval{0};
-    // The P role's draws: independent decode allocation, and the chance a
+    // The P role's draws: deferred decode allocation, and the chance a
     // round allocates an admitted prompt's destination.
-    bool independent{false};
+    bool deferred{false};
     double grant_probability{0.7};
     // Mirrored: allocated between the two schedulers' constructions, so the
     // second one's allocations are not the first one's at a fixed offset.
@@ -166,7 +166,7 @@ struct ClosedLoop {
     struct Live {
         std::vector<std::int32_t> prompt;
         bool bootstrapped{false};
-        // Independent decode allocation: the destination is allocated, and
+        // Deferred decode allocation: the destination is allocated, and
         // the prompt's final result landed.
         bool granted{false};
         bool computed{false};
@@ -195,7 +195,7 @@ struct ClosedLoop {
 
     std::uint64_t aborts{0};
     std::uint64_t handoffs{0};
-    // Independent decode allocation: plans after which a computed prompt
+    // Deferred decode allocation: plans after which a computed prompt
     // waited for its destination, and the waiting prompts that got theirs.
     std::uint64_t waiting_plans{0};
     std::uint64_t waiting_grants{0};
@@ -295,7 +295,7 @@ struct ClosedLoop {
             overlap_depth = Rand(0, 2);
             // From a stream of its own, so the seed keeps its other draws.
             std::mt19937 policy_rng(seed + 1);
-            independent = role == Role::kP && std::uniform_int_distribution<int>(0, 1)(policy_rng) == 1;
+            deferred = role == Role::kP && std::uniform_int_distribution<int>(0, 1)(policy_rng) == 1;
             grant_probability =
                 std::vector<double>{0.05, 0.2, 0.7}[std::uniform_int_distribution<std::size_t>(0, 2)(policy_rng)];
         }
@@ -310,8 +310,8 @@ struct ClosedLoop {
         SchedulerConfig cfg{};
         cfg.role = role;
         if (role == Role::kP) {
-            cfg.decode_allocation_policy = independent ? SchedulerConfig::DecodeAllocationPolicy::kIndependent
-                                                       : SchedulerConfig::DecodeAllocationPolicy::kEarly;
+            cfg.decode_allocation_policy = deferred ? SchedulerConfig::DecodeAllocationPolicy::kDeferred
+                                                    : SchedulerConfig::DecodeAllocationPolicy::kEarly;
         }
         cfg.prefix_granularity = kP;
         cfg.device_allocator.total_pages = device_pages;
@@ -482,14 +482,14 @@ struct ClosedLoop {
     }
 
     // The transfer peer: bootstraps waiting prompts, and acknowledges (or
-    // fails) the hand-offs it was given. Under independent decode allocation
+    // fails) the hand-offs it was given. Under deferred decode allocation
     // it also allocates the admitted prompts' destinations, computed or not.
     void Peer(const ExecutionPlan* plan) {
         ExecutionEvent events;
         bool any = false;
         if (plan != nullptr && plan->remote_decode.has_value()) {
             for (const std::string& id : plan->remote_decode->request_ids) {
-                if (independent && !live[id].granted) {
+                if (deferred && !live[id].granted) {
                     throw std::logic_error("round " + std::to_string(round) + ": " + id +
                                            " sent its KV without a destination");
                 }
@@ -503,8 +503,7 @@ struct ClosedLoop {
                 state.bootstrapped = true;
                 any = true;
             }
-            if (independent && state.bootstrapped && !state.granted && !state.finished &&
-                Uniform() < grant_probability) {
+            if (deferred && state.bootstrapped && !state.granted && !state.finished && Uniform() < grant_probability) {
                 events.With(pd::DestinationReadyEvent{id});
                 waiting_grants += state.computed ? 1 : 0;
                 state.granted = true;
@@ -552,7 +551,7 @@ struct ClosedLoop {
             // The prompts waiting for their destination are exactly the
             // computed live ones without one; none under early allocation.
             const auto waiting = static_cast<std::size_t>(std::ranges::count_if(live, [this](const auto& entry) {
-                return independent && entry.second.computed && !entry.second.granted && !entry.second.finished;
+                return deferred && entry.second.computed && !entry.second.granted && !entry.second.finished;
             }));
             for (const std::unique_ptr<Scheduler>& scheduler : schedulers) {
                 if (scheduler->AwaitingDestinationSize() != waiting) {
@@ -562,11 +561,11 @@ struct ClosedLoop {
                 }
             }
             waiting_plans += waiting > 0 ? 1 : 0;
-            // Independent: a computed prompt that has its destination goes
+            // Deferred: a computed prompt that has its destination goes
             // out with this plan. Its remote decode takes no block, so it
             // never waits for one.
             for (const auto& [id, state] : live) {
-                if (independent && state.computed && state.granted && !state.transferring && !state.finished &&
+                if (deferred && state.computed && state.granted && !state.transferring && !state.finished &&
                     !(plan.remote_decode.has_value() && std::ranges::count(plan.remote_decode->request_ids, id) > 0)) {
                     throw std::logic_error("round " + std::to_string(round) + ": " + id +
                                            " has its destination and its KV was not sent");
@@ -874,9 +873,9 @@ TEST(ClosedLoopRandomTest, PrefillRoleNeverRaisesAndDrains) {
     std::uint64_t waiting_grants = 0;
     for (unsigned seed = 0; seed < 64; ++seed) {
         ClosedLoop loop(seed, Role::kP, /*mirrored_ranks=*/false, LoopKnobs{});
-        SCOPED_TRACE(::testing::Message() << "seed " << seed << (loop.write_back ? " write-back" : " write-through")
-                                          << " overlap " << loop.overlap_depth << " shards " << loop.kv_shards
-                                          << (loop.independent ? " independent" : " early"));
+        SCOPED_TRACE(::testing::Message()
+                     << "seed " << seed << (loop.write_back ? " write-back" : " write-through") << " overlap "
+                     << loop.overlap_depth << " shards " << loop.kv_shards << (loop.deferred ? " deferred" : " early"));
         try {
             loop.Run();
         } catch (const std::exception& error) {
@@ -903,7 +902,7 @@ TEST(ClosedLoopRandomTest, PrefillRoleNeverRaisesAndDrains) {
     }
     EXPECT_GT(aborts, 0u);
     EXPECT_GT(handoffs, 0u);
-    // Under independent allocation computed prompts waited for their
+    // Under deferred allocation computed prompts waited for their
     // destinations and got them.
     EXPECT_GT(waiting_plans, 0u);
     EXPECT_GT(waiting_grants, 0u);

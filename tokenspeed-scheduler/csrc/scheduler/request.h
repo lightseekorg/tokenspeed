@@ -89,7 +89,7 @@ public:
     std::int32_t PrefillDeferredRounds() const { return prefill_deferred_rounds_; }
     void NotePrefillDeferred() { ++prefill_deferred_rounds_; }
 
-    // P role, independent decode allocation: a pd::DestinationReadyEvent
+    // P role, deferred decode allocation: a pd::DestinationReadyEvent
     // arrived, so every Decode rank allocated the destination. Until then a
     // computed prompt waits for it in PrefillAwaitingDestination instead of
     // sending its KV.

@@ -79,7 +79,7 @@ mod ffi {
         UpdateReserveNumTokens,
         /// PD: the request's peers are connected (`pd::BootstrappedEvent`).
         PdBootstrapped,
-        /// PD, P role under independent decode allocation: every decode rank
+        /// PD, P role under deferred decode allocation: every decode rank
         /// allocated the request's destination
         /// (`pd::DestinationReadyEvent`).
         PdDestinationReady,
@@ -422,7 +422,7 @@ mod ffi {
         remote_prefilling: usize,
         /// PD: requests whose pages a transfer still pins.
         pd_transfer: usize,
-        /// PD, P role, independent admission: computed prompts waiting for
+        /// PD, P role, deferred decode allocation: computed prompts waiting for
         /// their decode destination; also counted in `running`, `prefilling`
         /// and `pd_transfer`.
         awaiting_destination: usize,

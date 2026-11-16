@@ -126,7 +126,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
 
     nb::enum_<tokenspeed::SchedulerConfig::DecodeAllocationPolicy>(scheduler_config, "DecodeAllocationPolicy")
         .value("Early", tokenspeed::SchedulerConfig::DecodeAllocationPolicy::kEarly)
-        .value("Independent", tokenspeed::SchedulerConfig::DecodeAllocationPolicy::kIndependent);
+        .value("Deferred", tokenspeed::SchedulerConfig::DecodeAllocationPolicy::kDeferred);
 
     nb::enum_<tokenspeed::AttnKind>(m, "AttnKind")
         .value("Full", tokenspeed::AttnKind::kFull)
@@ -189,7 +189,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("overlap_schedule_depth", &tokenspeed::SchedulerConfig::overlap_schedule_depth)
         .def_rw("role", &tokenspeed::SchedulerConfig::role)
         // P role only: None elsewhere, and None there is Early. Early admits
-        // a prompt once its Decode destination is allocated, Independent
+        // a prompt once its Decode destination is allocated, Deferred
         // without waiting for it, holding only its KV transfer for the
         // destination.
         .def_rw("decode_allocation_policy", &tokenspeed::SchedulerConfig::decode_allocation_policy)
@@ -785,7 +785,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("pd_transfer_size", &tokenspeed::Scheduler::PdTransferSize,
              "Count requests with PD-pinned pages; this resource count overlaps lifecycle states.")
         .def("awaiting_destination_size", &tokenspeed::Scheduler::AwaitingDestinationSize,
-             "P role, independent admission: count computed prompts waiting for their Decode destination "
+             "P role, deferred decode allocation: count computed prompts waiting for their Decode destination "
              "(PrefillAwaitingDestination); these are also included in prefilling_size() and pd_transfer_size().")
         .def("awaiting_destination_lcm_blocks", &tokenspeed::Scheduler::AwaitingDestinationLcmBlocks,
              "Device LCM blocks in the block tables of the prompts awaiting_destination_size() counts, counted "

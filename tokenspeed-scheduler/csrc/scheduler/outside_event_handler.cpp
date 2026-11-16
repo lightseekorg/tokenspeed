@@ -414,10 +414,10 @@ void Scheduler::handleEvent(const forward::ExtendResult& event) {
         }
         request->NoteResultLanded();
         // Under early decode allocation an admitted prompt has its
-        // destination; under independent it has one once
+        // destination; under deferred it has one once
         // pd::DestinationReadyEvent arrived.
         const bool await_destination =
-            config_.decode_allocation_policy == SchedulerConfig::DecodeAllocationPolicy::kIndependent &&
+            config_.decode_allocation_policy == SchedulerConfig::DecodeAllocationPolicy::kDeferred &&
             !request->DestinationReady();
         request->Apply(fsm::ExtendResultEvent{event.tokens, await_destination});
         if (!event.spec_candidate_ids.empty()) {
