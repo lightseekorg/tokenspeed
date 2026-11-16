@@ -2797,8 +2797,8 @@ class KimiLinearMoE(nn.Module):
             offset += rows
 
     def _apply_reads_gathered_fp8(self) -> bool:
-        # The A8W4 apply takes the FP8 latent the gather quantizes instead of
-        # quantizing the BF16 latent itself.
+        """Whether the A8W4 apply takes the FP8 latent the gather quantizes
+        instead of quantizing the BF16 latent itself."""
         return (
             self.experts.plan.get("apply_kernel_name")
             == "gluon_mxfp4_a8w4_situ_precomputed_moe_apply"

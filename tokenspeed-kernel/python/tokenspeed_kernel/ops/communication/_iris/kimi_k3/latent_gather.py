@@ -632,7 +632,7 @@ def iris_k3moe_latent_input_gather_routed(
     MIN_AMAX: gl.constexpr = 1.0e-12,
     FP8_MAX: gl.constexpr = 448.0,
 ):
-    """``iris_k3moe_latent_input_gather`` that also routes and projects the shared experts.
+    """``iris_k3moe_latent_input_gather`` with routing and shared projection.
 
     ``partial_ptr`` holds every router column's partials as well, so each
     row's router program routes the row (``_k3_route_row``) instead of

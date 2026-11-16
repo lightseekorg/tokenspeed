@@ -967,7 +967,7 @@ class K3IrisState:
         down_out: torch.Tensor | None = None,
         quantize: bool = False,
     ) -> tuple:
-        """``latent_input_gather`` that also routes the rows and projects the shared experts.
+        """``latent_input_gather`` with routing and the shared projection.
 
         Every rank also projects all router columns, so each routes its
         replicated rows while their latent is gathered, as
