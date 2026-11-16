@@ -45,6 +45,9 @@ from tokenspeed_kernel.ops.communication._iris import (  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.muse_spark import (  # noqa: E402
     draft_head,
 )
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.weights import (  # noqa: E402
+    bf16_tiles,
+)
 
 WORLD, HIDDEN = inputs.WORLD, inputs.HIDDEN
 SHARD, VOCAB, RANK_DIM, TOPK = (
@@ -369,3 +372,18 @@ def test_one_binary_serves_every_step_and_block():
     with pytest.raises(AssertionError, match="compiled 1 new"):
         with assert_no_triton_compile(draft_head.gluon_muse_spark_draft_head_gfx950):
             compile_launch(8, 2, 8)
+
+
+def test_the_lm_head_tiles_are_built_without_a_padded_copy():
+    """The packer tiles the rank's LM-head shard a chunk of 16-row blocks at
+    a time, zero-padding the last block, so startup never holds a padded
+    copy of the shard next to the tiles: the tiles equal those of the padded
+    shard, byte for byte."""
+    shard, hidden = int(draft_head.SHARD), int(draft_head.HIDDEN)
+    gen = torch.Generator(device="cuda").manual_seed(3)
+    head = torch.randn(shard, hidden, device="cuda", generator=gen).to(torch.bfloat16)
+    padded = head.new_zeros(int(draft_head.BLOCKS) * 16, hidden)
+    padded[:shard] = head
+    expected = bf16_tiles(padded)
+    got = draft_head._padded_tiles(head)
+    assert torch.equal(got.view(torch.int16), expected.view(torch.int16))
