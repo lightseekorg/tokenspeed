@@ -32,7 +32,9 @@ _TRITON_MAX_WIDTH = 65536
 
 
 def boundary_gathers_mailbox(rows: int, width: int, ranks: int) -> bool:
-    """Whether :func:`post_norm_residual_pre_norm` reads a mailbox branch of this shape; a producer asks before publishing.
+    """Whether :func:`post_norm_residual_pre_norm` reads a mailbox branch of this shape.
+
+    A producer asks this before publishing into the mailbox.
 
     Args:
         rows: Rows of the batch, the mailbox's first rows.
