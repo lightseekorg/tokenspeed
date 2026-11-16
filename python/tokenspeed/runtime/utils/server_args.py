@@ -626,8 +626,8 @@ class ServerArgs:
     # explicit 0 disables the pool: every capacity block then aborts its
     # victim), else derived at device build -- 0.1 of the Device KV without
     # L2, the tails of ``retraction_snapshot_max_requests`` images with L2
-    # (cache/l2/sizing.py). The request cap derives from --max-num-seqs per
-    # attention-DP rank when 0 (resolve_retraction_snapshot_options).
+    # (cache/l2/sizing.py). When 0, the request cap derives from rank-local
+    # resident capacity, including decode extra slots (resolve_retraction_snapshot_options).
     retraction_snapshot_host_gb: float = 0.0
     retraction_snapshot_ratio: float | None = None
     retraction_snapshot_max_requests: int = 0
@@ -1655,9 +1655,9 @@ class ServerArgs:
         a fraction of this rank's Device KV capacity, an explicit 0 disabling
         it; neither given means the device builder derives the size
         (``cache/l2/sizing.py``). ``--retraction-snapshot-max-requests`` 0
-        derives to the rank-local execution limit B (max-num-seqs over the
-        attention-DP ranks). Extra resident slots do not increase this cap;
-        snapshot request rows and Host memory are separate limits.
+        derives to rank-local resident capacity C: max-num-seqs over the
+        attention-DP ranks plus decode extra slots. Explicit positive caps
+        are preserved; snapshot request rows and Host memory are separate limits.
         The prefill and encode roles never retract: their knobs are resolved
         to no pool here with a log, as the KVStore's are off on the encode
         role.
@@ -1717,22 +1717,30 @@ class ServerArgs:
                 )
             return
         if max_requests == 0:
-            # The cap is max_num_seqs per attention-DP rank: __post_init__
-            # resolves both before the cache.
-            if self.mapping is None or self.max_num_seqs is None:
+            # Extra slots are already rank-local; only the execution limit
+            # is divided by attention DP. __post_init__ resolves both first.
+            if (
+                self.mapping is None
+                or self.max_num_seqs is None
+                or self.disaggregation_decode_extra_slots is None
+            ):
                 raise ValueError(
                     "resolve_parallelism() and resolve_memory_and_scheduling() must "
                     "run before resolve_cache(): the derived "
-                    "--retraction-snapshot-max-requests is max_num_seqs per "
-                    "attention-DP rank"
+                    "--retraction-snapshot-max-requests uses rank-local "
+                    "execution capacity plus resolved decode extra slots"
                 )
             dp_size = max(self.mapping.attn.dp_size, 1)
-            self.retraction_snapshot_max_requests = self.max_num_seqs // dp_size
+            self.retraction_snapshot_max_requests = (
+                self.max_num_seqs // dp_size + self.disaggregation_decode_extra_slots
+            )
             if self.retraction_snapshot_max_requests == 0:
                 raise ValueError(
                     "the retraction snapshot pool derives its request cap from "
                     f"--max-num-seqs ({self.max_num_seqs}) per attention-DP rank "
-                    f"({dp_size}), which is 0 here; raise --max-num-seqs to at "
+                    f"({dp_size}) plus --disaggregation-decode-extra-slots "
+                    f"({self.disaggregation_decode_extra_slots}), which is 0 here; "
+                    "raise --max-num-seqs to at "
                     "least the attention-DP size or pass "
                     "--retraction-snapshot-max-requests"
                 )
@@ -3218,7 +3226,8 @@ class ServerArgs:
             "on decode, and zero on other roles. Set to zero to disable the "
             "extra capacity. Persistent request state grows with resident "
             "capacity and can reduce the KV budget; all requests share one KV "
-            "pool. The snapshot request limit is configured separately.",
+            "pool. The snapshot request limit defaults to resident capacity "
+            "unless explicitly configured.",
         )
         parser.add_argument(
             "--max-total-tokens",
@@ -3461,8 +3470,9 @@ class ServerArgs:
             default=ServerArgs.retraction_snapshot_max_requests,
             help="Slot-state image rows of the retraction snapshot pool, i.e. the "
             "most requests suspended at once. 0 (the default) derives to this "
-            "rank's execution limit B, --max-num-seqs / attention-DP size. "
-            "Extra resident slots do not increase this default. Image rows and "
+            "rank's resident capacity C: --max-num-seqs / attention-DP size "
+            "plus --disaggregation-decode-extra-slots. An explicit positive "
+            "limit is preserved. Image rows and "
             "Host KV space are separate limits; when no eligible image fits, "
             "capacity recovery aborts a resident rather than imaging it. "
             "Refused with --retraction-snapshot-ratio 0.",

@@ -51,8 +51,9 @@ from dataclasses import dataclass
 #: KV: whole images at a price an on-by-default pool can pin. A ratio of 1
 #: gives snapshot KV the same usable LCM-block count as Device KV; enabling
 #: the KVStore moves published pages to Host L2. Neither raises the image-row
-#: cap, which defaults to execution capacity rather than resident capacity.
-#: Both Host space and rows must fit.
+#: cap, which defaults to rank-local resident capacity, including extra
+#: decode slots. Explicit positive caps are preserved; Host space and rows
+#: must both fit.
 DEFAULT_DEVICE_RATIO = 0.1
 
 
@@ -68,8 +69,8 @@ class RetractionPoolRequest:
     Attributes:
         host_gb: ``--retraction-snapshot-host-gb``; 0 is not set.
         ratio: ``--retraction-snapshot-ratio``; None is not set, 0 is no pool.
-        max_retracted_requests: Slot-state rows (explicit, or the rank-local
-            execution limit, excluding extra resident slots); 0 only with no pool.
+        max_retracted_requests: Slot-state rows (explicit, or rank-local resident
+            capacity, including extra decode slots); 0 only with no pool.
         tail_lcm_blocks_per_request: LCM blocks one image's tail needs beside
             Host L2 (``tail_lcm_blocks_per_request``), the derived size's
             unit when an L2 tier exists.

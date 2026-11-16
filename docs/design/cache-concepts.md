@@ -728,10 +728,10 @@ slot; `scheduler.md` §2 and §4 describe the FSM side):
   (`--disable-kvstore`) the whole image goes there, and the derived default
   is a tenth of the Device KV -- an on-by-default pool stays cheap to pin;
   retraction-snapshot-ratio=1 uses Device KV's usable LCM-block count for
-  snapshot KV. Image rows are limited separately and default to the
-  rank-local execution limit, excluding extra resident slots; enough Host
-  space alone does not make
-  every resident simultaneously suspendable.
+  snapshot KV. Image rows are limited separately and default to rank-local
+  resident capacity, including extra decode slots; an explicit positive cap
+  takes precedence. Both rows and Host space must fit, so the default does
+  not guarantee that every resident can be suspended.
 
 The runtime side is **one** `HostCacheExecutor` (`cache/l2/executor.py`)
 owning two `HostCacheStorage` buffers over the same field geometry, each with

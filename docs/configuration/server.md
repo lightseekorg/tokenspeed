@@ -532,7 +532,7 @@ Trainer-side contract:
 | `--prefill-graph-capture-batch-sizes` | Request capacities for inline recurrent-layer (KDA, Mamba2, GDN) prefill capture. Replay selects the smallest compatible capacity that fits the batch, padding the missing requests. Unset: `4` (capped by `--max-num-seqs` per data-parallel rank), so a prefill round of up to 4 requests runs its recurrent layers inside the graph; a round of more requests, or one too full for the padding, runs them at eager breaks. Each added count is one more graph per token bucket, with its capture time and memory. |
 | `--retraction-snapshot-host-gb` | Explicit size, in gigabytes, of the per-rank pinned Host pool that holds a retraction image's tail (a retracted request's blocks of groups Host L2 never holds, a state group's unpublished input block, and its slot state; the published blocks, the partial last page and the live state block included, go to Host L2 and stay pinned there until the request is restored; with `--disable-kvstore` the pool holds whole images). Wins over `--retraction-snapshot-ratio` when set; `0` (the default) means not set, like `--kvstore-size` against `--kvstore-ratio`. A request a capacity retraction suspends is imaged here and resumes exactly where it stopped once the image is copied back; nothing is recomputed. When no resident's image fits -- the pool or its rows are exhausted -- the scheduler aborts the newest resident instead (finish `err_type` 524, see "Retraction snapshot pool" below), so the pool bounds how much can be suspended at once, never how long an admission waits. Fused and decode roles only; the prefill and encode roles never retract and ignore it with a log. Allowed under `--kv-parallel-size > 1`. |
 | `--retraction-snapshot-ratio` | Size of the retraction snapshot pool as a multiple of this rank's Device KV capacity (the base `--kvstore-ratio` scales too), used when `--retraction-snapshot-host-gb` is not set. Unset (the default) derives the pool at device build: 0.1 of the Device KV without the Host KVStore (whole images, kept cheap to pin; `1` uses the Device KV pool's usable LCM-block count, with request rows limited separately), else the image tails of `--retraction-snapshot-max-requests` requests (table below). An explicit `0` is the one way to run **without a pool**: nothing can be imaged, so every capacity block aborts its victim (the newest resident). |
-| `--retraction-snapshot-max-requests` | Slot-state image rows of the retraction snapshot pool, that is, the most requests suspended at once, and the request count the derived pool size is multiplied by. `0` (the default) derives to `--max-num-seqs / attention-DP size`, the rank-local execution limit B; extra resident slots do not increase this default. Refused with `--retraction-snapshot-ratio 0`, which has no rows to size. When no row is free the scheduler aborts a resident rather than waiting. |
+| `--retraction-snapshot-max-requests` | Slot-state image rows of the retraction snapshot pool, that is, the most requests suspended at once, and the request count the derived pool size is multiplied by. `0` (the default) derives to the rank-local resident capacity C: B+E on decode and B on fused, where B is max-num-seqs divided by attention-DP size. An explicit positive cap is preserved. Refused with `--retraction-snapshot-ratio 0`, which has no rows to size. When no row is free the scheduler aborts a resident rather than waiting. |
 | `--debug-force-retraction-interval` | **Test only.** Every `N` scheduler plans retract the oldest quiescent decoding request (`N > 0`), or with `-N` the one prefilling request between its chunks, without capacity pressure, so a test run exercises the suspend/restore path on every request (the bitwise continuation oracle of [Numerics](../design/numerics.md)). Refused with `--retraction-snapshot-ratio 0` (no pool to image into). `0` (the default) is off; never set it in serving. |
 
 For pure prefill, token capacities count newly computed tokens, not cached
@@ -1055,9 +1055,10 @@ Other cache layouts have different costs.
 Use an explicit extra count when measuring the feature. Set E=0 at startup
 to retain C=B; shrinking a live request pool is not supported. A request
 keeps its original slot when reception completes and waits for an execution
-permit before its first decode. Extra slots do not raise the default
-snapshot request limit; see [Retraction snapshot pool](#retraction-snapshot-pool)
-for the independent request-count and Host-memory limits.
+permit before its first decode. The default snapshot request limit also
+grows to C; an explicit positive limit is preserved. See
+[Retraction snapshot pool](#retraction-snapshot-pool) for its Host-memory
+cost and independent image-storage limits.
 
 This change requires matching TokenSpeed runtime and native components, even
 when E=0. Do not mix runtime or scheduler builds from before this API change
@@ -1454,19 +1455,27 @@ The first rule that applies wins:
 
 | Arguments | Pool size | Request cap (`--retraction-snapshot-max-requests` when `0`) |
 |---|---|---|
-| `--retraction-snapshot-host-gb G` (G > 0) | `G` GB, whole LCM blocks | `--max-num-seqs / attention-DP size` |
+| `--retraction-snapshot-host-gb G` (G > 0) | `G` GB, whole LCM blocks | Rank-local resident capacity C (B+E on decode; B on fused) |
 | `--retraction-snapshot-ratio R` (R > 0) | `R` x this rank's Device LCM blocks | same |
 | `--retraction-snapshot-ratio 0` | **no pool**: a capacity block aborts its victim | `0` (an explicit cap is refused) |
-| neither, `--disable-kvstore` | 0.1 x this rank's Device LCM blocks (whole images) | same as above |
-| neither, Host KVStore on | request cap x one image tail | same as above |
+| neither, `--disable-kvstore` | 0.1 x this rank's Device LCM blocks (whole images) | C |
+| neither, Host KVStore on | request cap x one image tail | C |
 
-The default snapshot request cap is B, the rank-local execution limit,
-even when a decode rank has C=B+E resident rows. Increasing E does not
-increase this cap. It limits the number of slot-state images independently
-of the KV bytes in the snapshot pool and Host L2. Set
---retraction-snapshot-max-requests explicitly to allow more simultaneous
-images, and size the Host pools for those images; raising either limit
-alone does not guarantee that every resident can be suspended.
+The default snapshot request cap is the rank-local resident capacity C:
+B+E on decode and B on fused. An explicit positive
+--retraction-snapshot-max-requests overrides this default. The cap budgets
+simultaneous images independently of Host KV bytes. A retraction frees a
+Device request row for another admission, so continued admissions can create
+demand for more than C simultaneous images; C is a default budget, not a
+guarantee that all such requests can be suspended. Raise the explicit cap
+and provide enough Host space when the workload needs more.
+
+A larger cap allocates more slot-state rows. With Host KVStore enabled and
+neither snapshot size nor ratio specified, it also increases the derived
+tail pool. Without Host KVStore, the default snapshot KV pool remains 0.1
+of the Device KV block count; raising the row cap does not increase that
+ratio. Explicit snapshot sizes and ratios remain unchanged. In every case,
+both image rows and Host storage must fit.
 
 One image tail, per cache group, is one block for a group that publishes
 to Host L2 (a state group's unpublished input block; a history group's

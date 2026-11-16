@@ -435,3 +435,229 @@ def test_extra_request_slots_do_not_bypass_kv_admission():
     assert not plan.aborts
     assert scheduler.remote_prefilling_size() == 1
     assert scheduler.retracted_size() == 0
+
+
+def _decode_growth_blocked_by_ready_requests(snapshot_rows, snapshot_pages):
+    cfg = _config(1, 3)
+    cfg.num_device_pages = 17
+    cfg.num_snapshot_pages = snapshot_pages
+    cfg.max_retracted_requests = snapshot_rows
+    groups = cfg.cache_groups
+    groups[0].total_pages = 17
+    cfg.cache_groups = groups
+    scheduler = ts.Scheduler(cfg)
+    scheduler.submit_requests(
+        [
+            _spec("running", [1, 2]),
+            _spec("waiting-a", list(range(101, 109))),
+            _spec("waiting-b", list(range(201, 209))),
+        ]
+    )
+    for rid in ("running", "waiting-a", "waiting-b"):
+        _send(scheduler, ts.PD.BootstrappedEvent(rid))
+    _admit_all(scheduler, ("running", "waiting-a", "waiting-b"))
+    _ready(scheduler, "running")
+    assert _forward_ids(scheduler.next_execution_plan()) == ["running"]
+    _advance(scheduler, "running", [43])
+    _ready(scheduler, "waiting-a", "waiting-b")
+    assert scheduler.ready_waiting_size() == 2
+    assert scheduler.available_lcm_blocks() == 4
+    # The running request grows from 2 to 15 blocks. Both 5-block waiters
+    # must give way: the 4 free blocks plus either one's release cannot fit it.
+    _send(
+        scheduler,
+        _event(
+            "UpdateReserveNumTokens",
+            "running",
+            reserve_num_tokens_in_next_schedule_event=26,
+        ),
+    )
+    return scheduler, scheduler.next_execution_plan()
+
+
+def test_ready_waiting_requests_retract_beyond_batch_size_and_resume():
+    scheduler, pressure = _decode_growth_blocked_by_ready_requests(3, 257)
+    [snapshot] = [op for op in pressure.cache if isinstance(op, ts.Cache.SnapshotOp)]
+    assert list(snapshot.request_ids) == ["waiting-a", "waiting-b"]
+    assert _forward_ids(pressure) == ["running"]
+    assert not pressure.aborts
+    assert scheduler.retracted_size() == 2  # More suspended requests than B=1.
+    assert scheduler.allocated_request_slots() == 1
+    assert scheduler.active_decode_slots() == 1
+    assert scheduler.ready_waiting_size() == 0
+    assert scheduler.snapshot_pool_free_blocks() == 248
+    _ack(scheduler, snapshot, ts.Cache.SnapshotDoneEvent)
+    _advance(scheduler, "running", [44])
+    _send(
+        scheduler,
+        _event(
+            "UpdateReserveNumTokens",
+            "running",
+            reserve_num_tokens_in_next_schedule_event=1,
+        ),
+    )
+    busy = scheduler.next_execution_plan()
+    assert _forward_ids(busy) == ["running"]
+    assert not any(isinstance(op, ts.Cache.RestoreOp) for op in busy.cache)
+    assert not busy.aborts
+    _advance(scheduler, "running", [45])
+    _finish(scheduler, "running")
+
+    restore_a = scheduler.next_execution_plan()
+    [restore] = [op for op in restore_a.cache if isinstance(op, ts.Cache.RestoreOp)]
+    assert list(restore.request_ids) == ["waiting-a"]
+    assert _forward_ids(restore_a) == []
+    assert scheduler.allocated_request_slots() == 1
+    assert scheduler.active_decode_slots() == 0
+    _ack(scheduler, restore, ts.Cache.RestoreDoneEvent)
+    assert scheduler.ready_waiting_size() == 1
+    assert scheduler.request_token_size("waiting-a") == 9
+
+    restore_b = scheduler.next_execution_plan()
+    [restore] = [op for op in restore_b.cache if isinstance(op, ts.Cache.RestoreOp)]
+    assert list(restore.request_ids) == ["waiting-b"]
+    assert _forward_ids(restore_b) == ["waiting-a"]
+    assert list(_find_forward_op(restore_b).decode_input_ids) == [42]
+    assert scheduler.active_decode_slots() == 1
+    assert scheduler.allocated_request_slots() == 2
+    _ack(scheduler, restore, ts.Cache.RestoreDoneEvent)
+    assert scheduler.ready_waiting_size() == 1
+    assert scheduler.retracted_size() == 0
+    assert scheduler.snapshot_pool_free_blocks() == 256
+    _advance(scheduler, "waiting-a", [46])
+    assert scheduler.request_token_size("waiting-a") == 10
+    _finish(scheduler, "waiting-a")
+
+    resumed = scheduler.next_execution_plan()
+    assert _forward_ids(resumed) == ["waiting-b"]
+    assert list(_find_forward_op(resumed).decode_input_ids) == [42]
+    assert scheduler.request_token_size("waiting-b") == 9
+    assert resumed.remote_prefill is None
+    _advance(scheduler, "waiting-b", [47])
+    assert scheduler.request_token_size("waiting-b") == 10
+    _finish(scheduler, "waiting-b")
+    assert _forward_ids(scheduler.next_execution_plan()) == []
+    assert scheduler.allocated_request_slots() == 0
+    assert scheduler.active_decode_slots() == 0
+    assert scheduler.available_lcm_blocks() == 16
+    assert scheduler.snapshot_pool_free_blocks() == 256
+
+
+@pytest.mark.parametrize(
+    "snapshot_rows,snapshot_pages,suspended,aborted,limiting_arg",
+    [
+        (1, 257, ["waiting-a"], ["waiting-b"], "--retraction-snapshot-max-requests"),
+        (3, 2, [], ["waiting-b", "waiting-a"], "--retraction-snapshot-host-gb"),
+    ],
+    ids=["snapshot-rows-exhausted", "snapshot-kv-exhausted"],
+)
+def test_ready_waiting_capacity_abort_preserves_progress(
+    snapshot_rows, snapshot_pages, suspended, aborted, limiting_arg
+):
+    scheduler, pressure = _decode_growth_blocked_by_ready_requests(
+        snapshot_rows, snapshot_pages
+    )
+    snapshots = [op for op in pressure.cache if isinstance(op, ts.Cache.SnapshotOp)]
+    assert [rid for op in snapshots for rid in op.request_ids] == suspended
+    assert [abort.request_id for abort in pressure.aborts] == aborted
+    for abort in pressure.aborts:
+        assert abort.reason == ts.AbortReason.ImageDoesNotFit
+        assert limiting_arg in abort.detail
+    assert _forward_ids(pressure) == ["running"]
+    assert scheduler.retracted_size() == len(suspended)
+    assert scheduler.allocated_request_slots() == 1
+    assert scheduler.active_decode_slots() == 1
+    for snapshot in snapshots:
+        _ack(scheduler, snapshot, ts.Cache.SnapshotDoneEvent)
+    _advance(scheduler, "running", [44])
+    assert scheduler.request_token_size("running") == 5
+    _finish(scheduler, "running")
+
+    for rid in suspended:
+        plan = scheduler.next_execution_plan()
+        [restore] = [op for op in plan.cache if isinstance(op, ts.Cache.RestoreOp)]
+        assert list(restore.request_ids) == [rid]
+        assert not plan.aborts
+        _ack(scheduler, restore, ts.Cache.RestoreDoneEvent)
+        resumed = scheduler.next_execution_plan()
+        assert _forward_ids(resumed) == [rid]
+        assert list(_find_forward_op(resumed).decode_input_ids) == [42]
+        _advance(scheduler, rid, [45])
+        assert scheduler.request_token_size(rid) == 10
+        _finish(scheduler, rid)
+    drained = scheduler.next_execution_plan()
+    assert _forward_ids(drained) == []
+    assert not drained.aborts
+    assert scheduler.retracted_size() == 0
+    assert scheduler.allocated_request_slots() == 0
+    assert scheduler.active_decode_slots() == 0
+    assert scheduler.available_lcm_blocks() == 16
+    assert scheduler.snapshot_pool_free_blocks() == snapshot_pages - 1
+
+
+def test_long_decode_retracts_a_ready_request_when_reserved_headroom_runs_out():
+    cfg = _config(1, 2)
+    cfg.prefix_granularity = 64
+    cfg.num_device_pages = 193
+    cfg.num_snapshot_pages = 193
+    cfg.max_retracted_requests = 2
+    cfg.cache_groups = [
+        ts.CacheGroupConfig(
+            group_id="history",
+            block_granularity=64,
+            total_pages=193,
+            attn_kind=ts.AttnKind.Full,
+            transfer_policy=ts.CacheTransferPolicy.FullSuffix,
+        ),
+    ]
+    scheduler = ts.Scheduler(cfg)
+    requests = [
+        _spec("running", list(range(1024))),
+        _spec("waiting", list(range(10000, 12048))),
+    ]
+    for request in requests:
+        request.max_new_tokens = 9000
+    scheduler.submit_requests(requests)
+    for rid in ("running", "waiting"):
+        _send(scheduler, ts.PD.BootstrappedEvent(rid))
+    _admit_all(scheduler, ("running", "waiting"))
+    _ready(scheduler, "running", "waiting")
+    # Admission prepays 4096 generation tokens each: 80 + 96 of 192 blocks.
+    assert scheduler.available_lcm_blocks() == 16
+    victims = []
+    max_used_blocks = 0
+    for token in range(20000, 28192):
+        plan = scheduler.next_execution_plan()
+        assert _forward_ids(plan) == ["running"]
+        assert not plan.aborts
+        assert not any(isinstance(op, ts.Cache.RestoreOp) for op in plan.cache)
+        for op in plan.cache:
+            if isinstance(op, ts.Cache.SnapshotOp):
+                victims.extend(op.request_ids)
+                _ack(scheduler, op, ts.Cache.SnapshotDoneEvent)
+        max_used_blocks = max(max_used_blocks, scheduler.active_lcm_blocks())
+        _advance(scheduler, "running", [token])
+    assert victims == ["waiting"]
+    assert max_used_blocks == 192
+    assert scheduler.request_token_size("running") == 9217
+    assert scheduler.retracted_size() == 1
+    _finish(scheduler, "running")
+
+    plan = scheduler.next_execution_plan()
+    [restore] = [op for op in plan.cache if isinstance(op, ts.Cache.RestoreOp)]
+    assert list(restore.request_ids) == ["waiting"]
+    assert scheduler.active_decode_slots() == 0
+    _ack(scheduler, restore, ts.Cache.RestoreDoneEvent)
+    resumed = scheduler.next_execution_plan()
+    assert _forward_ids(resumed) == ["waiting"]
+    assert list(_find_forward_op(resumed).decode_input_ids) == [42]
+    assert scheduler.request_token_size("waiting") == 2049
+    _advance(scheduler, "waiting", [77])
+    assert scheduler.request_token_size("waiting") == 2050
+    _finish(scheduler, "waiting")
+    assert _forward_ids(scheduler.next_execution_plan()) == []
+    assert scheduler.retracted_size() == 0
+    assert scheduler.allocated_request_slots() == 0
+    assert scheduler.active_decode_slots() == 0
+    assert scheduler.available_lcm_blocks() == 192
+    assert scheduler.snapshot_pool_free_blocks() == 192

@@ -1940,11 +1940,13 @@ with no request suspended both must read empty and zero.
 the newest resident instead of imaging one; §2) and `max_retracted_requests`
 (`0` with no pool, `> 0` with one; the runtime's slot-state arena has that
 many rows plus the null row) are validated together. The P role refuses a
-snapshot pool. The runtime defaults the snapshot request cap to the
-rank-local execution limit B, independently of C=B+E resident rows. Extra
-residency does not increase the snapshot row count or guarantee enough Host
-space to image every resident. Rows and image storage must both fit; when
-no eligible image fits, capacity recovery uses the abort policy in §2.
+snapshot pool. The runtime defaults the snapshot request cap to rank-local
+resident capacity C (B+E on D, B on fused); an explicit positive cap takes
+precedence. This is a budget for suspended images: retraction frees Device
+rows for new admissions, which can create further demand for images. The
+row budget does not guarantee enough Host space. Rows and image storage
+must both fit; when no eligible image fits, capacity recovery uses the abort
+policy in §2.
 L3 addresses page-cyclic sharded groups through replica-stable
 object keys ([cache concepts](cache-concepts.md)).
 `debug_force_retraction_interval` (§2) is the only
