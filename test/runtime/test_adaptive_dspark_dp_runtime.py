@@ -73,6 +73,8 @@ def _make_drafter(mapping):
     drafter._verify_layout_counts = None
     drafter._verify_budget_graphs = {}
     drafter._verify_budget_buffers = {}
+    drafter._verify_budget_counts = {}
+    drafter._verify_budget_context_bounds = None
     return drafter
 
 
@@ -89,6 +91,18 @@ def _serving_budget(drafter, world):
         global_num_decodes=[4] * world,
     )
     return drafter.prepare_decode_graph_token_layout(ctx, actual_bs=4, padded_bs=4)
+
+
+def _publish_context_feedback(drafter, ids, slots, context_lengths):
+    drafter.verify_feedback.prepare(ids, slots, num_extends=0)
+    snapshot = drafter.verify_feedback.snapshot()
+    drafter.verify_feedback.publish(
+        snapshot,
+        [[0.0] * drafter.block_size for _ in slots],
+        context_lengths=context_lengths,
+    )
+    for _ in range(2):
+        drafter.verify_feedback.prepare(ids, slots, num_extends=0)
 
 
 @pytest.mark.skipif(
@@ -308,9 +322,22 @@ def test_budget_without_forward_thread_sync(topology):
         )
     for _ in range(2):
         drafter.verify_feedback.prepare(ids, slots, num_extends=0)
+    missing_feedback_counts = dict(drafter._verify_budget_counts)
     with _strict_serving_sync():
         selected = _serving_budget(drafter, world)
     assert selected == (12 if topology == "tp" else 24)
+    if topology != "tp" and rank == 0:
+        assert (
+            drafter._verify_budget_counts.get((4, 24, "feedback_unavailable"), 0)
+            == missing_feedback_counts.get((4, 24, "feedback_unavailable"), 0) + 1
+        )
+    # Startup must use the same DP feedback agreement, including native fallback
+    # when any rank is not ready; TP-only selection would disagree at TP1/DP>1.
+    with _strict_serving_sync():
+        startup_selected = drafter._prepare_verify_budget(
+            actual_bs=4, padded_bs=4, rank_sizes=[4] * world
+        )
+    assert startup_selected == selected
 
     drafter.verify_feedback.publish(
         drafter.verify_feedback.snapshot(), scores, context_lengths=[120] * 4
@@ -328,14 +355,116 @@ def test_budget_without_forward_thread_sync(topology):
         rtol=0,
         atol=0,
     )
-    # Startup preparation broadcasts only inside each TP group.
-    with _strict_serving_sync():
-        selected = drafter._prepare_calibrated_budget(actual_bs=4, padded_bs=4)
-    assert selected == 12
+    # Startup forces each measured tier while retaining the complete cost
+    # ladder, so host selection does the same work as the installed policy.
+    capacities = drafter.decode_graph_query_capacities(4)
+    for measured_capacity in capacities[:-1]:
+        drafter.install_verify_calibration(
+            (
+                VerifyCalibration(
+                    4,
+                    1,
+                    16384,
+                    6,
+                    1e9,
+                    tuple(
+                        (capacity, 1.0 if capacity == measured_capacity else 1e9)
+                        for capacity in capacities[:-1]
+                    ),
+                    8,
+                ),
+            ),
+            policy_ms=0.0,
+        )
+        with _strict_serving_sync():
+            selected = drafter._prepare_verify_budget(
+                actual_bs=4, padded_bs=4, rank_sizes=[4] * world
+            )
+        assert selected == measured_capacity
+        assert drafter._verify_indptr[-1].item() == measured_capacity
     torch.testing.assert_close(
         drafter._verify_budget_buffers[4].scores.cpu(),
         torch.tensor(scores),
         rtol=0,
         atol=0,
     )
+
+    capacities = drafter.decode_graph_query_capacities(4)
+
+    def profile(min_context, max_context, preferred_capacity):
+        return VerifyCalibration(
+            4,
+            min_context,
+            max_context,
+            6,
+            1e9,
+            tuple(
+                (capacity, 0.01 if capacity == preferred_capacity else 1e9)
+                for capacity in capacities[:-1]
+            ),
+            8,
+        )
+
+    profiles = (
+        profile(1, 8192, capacities[1]),
+        profile(8193, 32768, capacities[2]),
+        profile(32769, 65536, capacities[4]),
+    )
+    drafter.install_verify_calibration(profiles, policy_ms=0.0)
+
+    def assert_context_bucket(context_lengths, expected_capacity):
+        counts_before = dict(drafter._verify_budget_counts)
+        _publish_context_feedback(drafter, ids, slots, context_lengths)
+        with _strict_serving_sync():
+            selected = _serving_budget(drafter, world)
+        assert selected == expected_capacity
+        if expected_capacity != 24:
+            assert drafter._verify_indptr[-1].item() == expected_capacity
+        if rank == 0:
+            reason = "packed" if expected_capacity != 24 else "uncalibrated"
+            key = (4, expected_capacity, reason)
+            assert drafter._verify_budget_counts.get(key, 0) == (
+                counts_before.get(key, 0) + 1
+            )
+
+    # The largest active request determines a uniform calibrated cost bucket,
+    # even when one rank or several DP ranks span multiple regions.
+    assert_context_bucket([4096, 16384, 4096, 16384], capacities[2])
+    if topology != "tp":
+        contexts = [20000 if mapping.attn.dp_rank % 2 == 0 else 40000] * 4
+        assert_context_bucket(contexts, capacities[4])
+
+    # The feedback bound includes the 12-token N-2 allowance at both edges.
+    for context_length, expected in (
+        (8180, capacities[1]),
+        (8181, capacities[2]),
+        (32756, capacities[2]),
+        (32757, capacities[4]),
+    ):
+        assert_context_bucket([context_length] * 4, expected)
+    assert_context_bucket([65525] * 4, 24)
+
+    # A profile gap remains a native full-width fallback.
+    drafter.install_verify_calibration((profiles[0],), policy_ms=0.0)
+    assert_context_bucket([16384] * 4, 24)
+
+    # A covered context can still choose the native path when packed costs lose.
+    full_profile = VerifyCalibration(
+        4,
+        1,
+        8192,
+        6,
+        1.0,
+        tuple((capacity, 1e9) for capacity in capacities[:-1]),
+        8,
+    )
+    drafter.install_verify_calibration((full_profile,), policy_ms=0.0)
+    _publish_context_feedback(drafter, ids, slots, [4096] * 4)
+    full_counts_before = dict(drafter._verify_budget_counts)
+    with _strict_serving_sync():
+        assert _serving_budget(drafter, world) == 24
+    if rank == 0:
+        assert drafter._verify_budget_counts.get((4, 24, "full"), 0) == (
+            full_counts_before.get((4, 24, "full"), 0) + 1
+        )
     torch.distributed.barrier()

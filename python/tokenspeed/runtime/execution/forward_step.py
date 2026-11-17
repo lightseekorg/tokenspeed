@@ -23,7 +23,7 @@ from __future__ import annotations
 import bisect
 import dataclasses
 import gc
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import TYPE_CHECKING
 
@@ -1045,6 +1045,47 @@ class ForwardStepRunner:
         """
         return {gid: table[:bs] for gid, table in self._placeholder_tables.items()}
 
+    def decode_graph_for_profile(
+        self, *, bs: int, query_tokens: int, variant: str
+    ) -> torch.cuda.CUDAGraph | None:
+        """Look up a captured startup tier by its logical request/query extents.
+
+        None means the tier was not captured and must not be measured. Graph
+        keys and their native full-width encoding stay owned by the runner.
+        """
+        return self.graphs.get((self._query_variant(variant, query_tokens, bs), bs))
+
+    @contextmanager
+    def decode_profile_metadata(
+        self, *, bs: int, variant: str, block_tables: dict[str, torch.Tensor]
+    ) -> Iterator[Callable[[], None]]:
+        """Lend the normal metadata preparation path to startup measurements.
+
+        Before each replay, the caller fills the input buffers and invokes the
+        yielded callback. On exit, join GPU work and restore capture metadata,
+        including when measurement fails. Call only before live admission.
+        """
+
+        def prepare() -> None:
+            self._prepare_sampling_capture(bs=bs, variant=variant)
+            self._prepare_decode_metadata(
+                bs,
+                bs,
+                self.input_buffers.req_pool_indices_buf[:bs],
+                self.input_buffers.seq_lens_buf[:bs],
+                ForwardMode.DECODE,
+                use_graph=True,
+                settle=lambda: None,
+                block_tables=block_tables,
+            )
+            self.deepep_adapter.replay()
+
+        try:
+            yield prepare
+        finally:
+            torch.cuda.synchronize(self.device)
+            self._init_capture_metadata(bs)
+
     def _init_capture_metadata(self, bs: int):
         tables = self.placeholder_block_tables(bs)
         self.attn_backend.init_forward_metadata_capture_cuda_graph(
@@ -1401,11 +1442,11 @@ class ForwardStepRunner:
                             {"actual_seq_lengths_kv": seq_lens.to("cpu").tolist()}
                         ]
                     )
+            query_tokens = (
+                self._decode_query_tokens or padded_bs * self.max_tokens_per_req
+            )
+            packed = query_tokens != padded_bs * self.max_tokens_per_req
             if self._expert_load_rows is not None:
-                query_tokens = (
-                    self._decode_query_tokens or padded_bs * self.max_tokens_per_req
-                )
-                packed = query_tokens != padded_bs * self.max_tokens_per_req
                 # Packed verification uses one agreed capacity on all ranks.
                 self._expert_load_rows.mark_padded(
                     padded_global_num_tokens=[query_tokens] * self.world_size,
@@ -1419,7 +1460,11 @@ class ForwardStepRunner:
                         )
                     ),
                 )
-            live_requests = self._mega_moe_live_requests if padded_bs != bs else None
+            # MegaMoE's count pair assumes a uniform number of rows per
+            # request. Packed prefixes vary, so that mask could drop live rows.
+            live_requests = (
+                self._mega_moe_live_requests if padded_bs != bs and not packed else None
+            )
             if live_requests is not None:
                 live_requests[0].fill_(bs)
                 live_requests[1].fill_(padded_bs)

@@ -69,9 +69,11 @@ class VerifyBudgetPolicy:
     ) -> int:
         """Return the physical query budget, including one anchor per request.
 
-        Costs must cover this batch and context and include draft, verification,
-        and sampling. Adaptive costs exclude the separately measured host policy
-        overhead. Missing measurements or non-finite feedback retain full width.
+        Costs must represent this batch and the selected context bucket and
+        include draft, verification, and sampling. Add separately measured host
+        policy overhead through policy_ms. Startup wall-clock samples already
+        include policy and agreement, so use policy_ms=0 for those samples.
+        Missing measurements or non-finite feedback retain full width.
         Full width denotes native execution, not the adaptive full-width graph.
         """
         if not self.admits(batch_size=len(scores), graph_batch_size=graph_batch_size):

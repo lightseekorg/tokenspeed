@@ -21,6 +21,66 @@ The same synchronization is required for eager execution and graph replay.
 delayed global histogram atomics. It checks bucket counts, stable Top-K results
 and Top-P counter integrity for uniform and K+1 boundary inputs in both modes.
 
+## Packed probability sampling (`packed_verify.py`)
+
+`sample_probs` draws from already filtered and normalized FP32 rows.
+`verify_packed_chain` verifies CSR-packed target rows against the draft laws
+recorded when each proposal was drawn. Candidate column zero is the anchor;
+target row `i` verifies candidate column `i + 1` against draft row `i`.
+A request with `q` target rows verifies at most `q - 1` proposals and emits
+one residual or bonus token. A zero-row padding request emits nothing.
+The probability allocation may contain unused physical rows beyond the CSR
+boundary. No such row, or bonus draft row, is read.
+
+The row mapping and rejection rule follow
+[DeepInfer's sampler](https://github.com/deepseek-ai/DeepInfer/blob/a679bb86ce36e883a98a97733492b686e5b9a08e/deepinfer/model_executor/layers/sampler.py).
+The CuTe implementation operates on normalized probabilities; its RNG and
+FP32 scan have the explicit contracts below.
+
+Verification accepts a proposal `x` when `u < min(1, p(x) / q(x))`.
+At the first rejection it samples `max(p - exp(-5e-5) * q, 0)` normalized by
+its total mass. A recorded `q(x) > reject_draft_prob_threshold` marks an
+unavailable proposal and samples the full target law instead. When every
+proposal passes, the last target
+row supplies the bonus. For a zero-probability proposal, acceptance is one
+if its target probability is positive and zero otherwise. The outputs retain
+the fixed candidate width: `accept_length` includes the final token;
+`accept_index` contains `request * width + column` for that output prefix
+and -1 after it, while unused `predicts` entries are zero.
+
+The NVIDIA CuTe leaf uses one 256-thread CTA per request. Threads sum the
+vocabulary cooperatively and scan 1024-token tiles until the inverse CDF
+crosses the draw. It selects the first strict `CDF > u * total_mass` crossing,
+with the lowest-index argmax of the sampled weights as a roundoff fallback.
+A genuinely zero residual mass falls back to the target's lowest argmax.
+Proposal rows are read from the request-slot pool using `draft_pool_indices`;
+the runtime does not gather a batch-sized copy of the dense proposal table.
+Target-row and proposal-slot base addresses use 64-bit offsets, including
+the scalar acceptance reads. Far-end tests cover acceptance, rejection, and
+proposal sampling beyond 2^31 elements. Verification tests initialize only
+the addressed rows and slots.
+FP32 reduction order differs from CUDA/CUB and TileLang, so coins close to CDF boundaries
+can select different ids. This is a probability-law contract, not bitwise
+agreement with either implementation.
+
+Random numbers use Philox4x32-10. The key is the low and high 32-bit words of
+the request seed; the counter is `(position_low, position_high, rng_tag, 0)`.
+The upper 24 bits of result word zero, divided by `2**24`, form a draw in
+`[0, 1)`. `sample_probs` takes the encoded position directly. Verification
+encodes local step `i` as `positions[request] + i * 10000019`, modulo `2**64`.
+Depth streams are disjoint while a request's absolute-position span is below
+10,000,019; the native V4.1 1M context window fits within this range.
+Exported tags are `RNG_TAG_TARGET=0`, `RNG_TAG_DRAFT=1`, `RNG_TAG_ACCEPT=2`,
+`RNG_TAG_REJECT=3` and `RNG_TAG_BONUS=4`. The one-row verify case uses the
+bonus namespace too. This mapping is invariant to batch order, CSR packing
+and graph padding; its random bits need not match TileLang's generator.
+
+The compiled-function cache specializes only on device, operation, vocabulary
+and candidate width. Row counts, CSR values and tensor strides are runtime
+inputs. Warm the selected geometry before graph capture; replay uses the
+cached executable. Launches use ordinary CUDA stream ordering with PDL
+disabled, and CPU calls have no production fallback.
+
 ## Distributed argmax (`cute_dsl.py`)
 
 `distributed_argmax` returns the greedy token of logits left sharded over the

@@ -120,7 +120,7 @@ class VerifyCalibration:
         adaptive_samples: Mapping[int, Sequence[float]],
         minimum_samples: int,
     ) -> VerifyCalibration:
-        """Reduce warmed complete-step timings; the caller synchronizes ranks.
+        """Reduce warmed graph-step timings; the caller synchronizes ranks.
 
         Every sample should use the maximum rank time for the same step. Warmup
         samples must already be excluded. Kernel-time sums are not step timings.
@@ -158,18 +158,19 @@ class VerifyCalibrationCache:
     quantization, graph capacities and calibration settings. The cache does not
     infer compatibility across identities. Only the designated writer publishes;
     publication is atomic and readers treat malformed or stale files as misses.
+    Only the identity's SHA-256 digest is persisted, not its configuration values.
     """
 
-    VERSION = 1
+    VERSION = 2
 
     def __init__(self, directory: Path, *, identity: Mapping[str, object]):
         if not identity:
             raise ValueError("calibration cache requires a runtime identity")
-        self.identity_json = json.dumps(
+        identity_json = json.dumps(
             identity, sort_keys=True, separators=(",", ":"), allow_nan=False
         )
-        digest = hashlib.sha256(self.identity_json.encode()).hexdigest()
-        self.path = directory / f"verify-{digest}.json"
+        self.identity_sha256 = hashlib.sha256(identity_json.encode()).hexdigest()
+        self.path = directory / f"verify-{self.identity_sha256}.json"
 
     @staticmethod
     def _validate(profiles: Sequence[VerifyCalibration]) -> None:
@@ -187,10 +188,10 @@ class VerifyCalibrationCache:
         try:
             raw = json.loads(self.path.read_text())
             if (
-                set(raw) != {"version", "identity", "profiles"}
+                set(raw) != {"version", "identity_sha256", "profiles"}
                 or type(raw["version"]) is not int
                 or raw["version"] != self.VERSION
-                or raw["identity"] != json.loads(self.identity_json)
+                or raw["identity_sha256"] != self.identity_sha256
                 or not isinstance(raw["profiles"], list)
                 or not raw["profiles"]
             ):
@@ -218,7 +219,7 @@ class VerifyCalibrationCache:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "version": self.VERSION,
-            "identity": json.loads(self.identity_json),
+            "identity_sha256": self.identity_sha256,
             "profiles": [asdict(profile) for profile in profiles],
         }
         temporary = None
