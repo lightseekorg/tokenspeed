@@ -399,8 +399,11 @@ class TrtllmAllReduceBackend(CommBackend):
     def prepared_lamport_all_gather(
         self, group: Group, dtype: torch.dtype
     ) -> LamportAllGather | None:
-        """The group's lamport column all-gather of ``dtype`` rows, or None
-        when no workspace is armed for the group or ``dtype`` is not 16-bit."""
+        """The group's lamport column all-gather of ``dtype`` rows.
+
+        None when no workspace is armed for the group or ``dtype`` is not
+        16-bit.
+        """
         res = self._resources.get(group)
         if res is None or dtype.itemsize != 2:
             return None
