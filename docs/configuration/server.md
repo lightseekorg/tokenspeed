@@ -21,13 +21,9 @@ For a compact compatibility table, see
 | `--download-dir` | Hugging Face download/cache directory. |
 | `--hf-overrides` | JSON overrides for model configuration values. |
 
-Models can request shared writable checkpoint mappings for selected host
-weights. Use `--load-format auto` or `--load-format safetensors` with writable
-safetensors files for these tensors. InstantTensor, `npcache`, and PyTorch
-checkpoint loading (including an `auto` fallback) reject selected weights
-instead of silently ignoring the mapping request. Weights not selected for
-shared mappings keep their existing loading behavior. No extra CLI flag is
-needed for the mapping request declared by the model.
+Safetensors checkpoints only need read permission. The loader does not create
+shared writable mappings of source shards. Models that need shared writable
+host storage must own separate working storage.
 
 ### Checkpoint prefetch and TP shards
 
