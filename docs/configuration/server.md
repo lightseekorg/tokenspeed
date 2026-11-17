@@ -1637,7 +1637,8 @@ prefix cache are copied to Host L2:
 
 - `write_through` (the default): on the fused and prefill roles, every page
   the GPU caches is also copied to the Host, which keeps it after the GPU
-  evicts the page. The decode role's Host L2 holds retraction images only.
+  evicts the page. The decode role copies nothing then: its Host L2 holds
+  retraction images only.
 - `write_back`: nothing is copied when a page is cached. When the GPU
   evicts cached pages to make room for a request, or to resume a retracted
   one, it copies them to the Host in the same scheduling step, and they can
@@ -1652,8 +1653,10 @@ prompt resumes from both. The cost: a step that evicts must finish copying
 the evicted pages to the Host before its forward pass can write over them,
 so the copy adds to that step's time.
 
-`write_back` runs on the fused and prefill roles, not with
-`--disaggregation-mode decode`. Both cached and replayable sliding-window
+`write_back` runs on every role. On `--disaggregation-mode decode` the
+history a decode server evicted stays reusable from its Host: a later
+request's remote admission loads its Host hit, and the prefill server sends
+only the rest ([RFC 0005](../rfcs/0005-runtime-pd-roles.md)). Both cached and replayable sliding-window
 groups are supported. It requires Host L2,
 `--pipeline-parallel-size 1`, `--query-context-parallel-size 1` and no
 `--kvstore-storage-backend`, and a model with at most 64 cache groups;
@@ -1895,7 +1898,12 @@ request computes the prefix itself.
 | `--peer-prefix-min-fetch-tokens` | 256 | The fewest tokens past the local prefix hit worth reading from a peer. |
 
 Peer sharing needs the Host tier (`--enable-kvstore`) and prefix caching.
-It is refused with `--disaggregation-mode decode`,
+A `--disaggregation-mode decode` server serves the history it decoded, its
+prompts and replies, so the next turn's prefill server reads a reply rather
+than computing it; it never reads itself, since its prefill server sends what
+it lacks ([RFC 0005](../rfcs/0005-runtime-pd-roles.md)). Run it with
+`--kvstore-write-policy write_back` for its Host to hold what its GPU evicts.
+Peer sharing is refused with
 `--kvstore-storage-backend`, `--pipeline-parallel-size > 1` and
 `--query-context-parallel-size > 1`; the
 scheduler also refuses KV-page sharding (`--kv-parallel-size` with sharded

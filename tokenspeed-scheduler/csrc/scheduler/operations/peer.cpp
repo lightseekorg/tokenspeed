@@ -182,7 +182,9 @@ void Scheduler::preparePeer(Request& request) {
     submitted->admission.peer_prepared = true;
     const PeerConfig& limits = *config_.peer_config;
     const std::string& holder = request.PeerHolder();
-    if (holder.empty() || holder == limits.name) {
+    // The D role computes no prompt: what it lacks comes from its PD peer,
+    // so it never reads from a holder, whatever the request names.
+    if (holder.empty() || holder == limits.name || config_.role == Role::kD) {
         return;
     }
     const std::int32_t grain = config_.prefix_granularity;

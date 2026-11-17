@@ -191,8 +191,8 @@ PrefixProbe PrefixProber::ProbePrefix(std::span<const std::string> content_hashe
     });
 }
 
-PrefixProbe PrefixProber::ProbeDecodeDevicePrefix(const PromptPrefix& prompt, std::int32_t prompt_end_tokens) const {
-    ProfileSpan profile_span{"PrefixProber::ProbeDecodeDevicePrefix"};
+PrefixProbe PrefixProber::ProbeDecodePrefix(const PromptPrefix& prompt, std::int32_t prompt_end_tokens) const {
+    ProfileSpan profile_span{"PrefixProber::ProbeDecodePrefix"};
     _assert(prompt.tokens.empty() || prompt_end_tokens <= static_cast<std::int32_t>(prompt.tokens.size()),
             "the prompt end lies inside the supplied tokens");
     std::vector<std::size_t> history_match_order;
@@ -202,12 +202,12 @@ PrefixProbe PrefixProber::ProbeDecodeDevicePrefix(const PromptPrefix& prompt, st
             history_match_order.push_back(group_index);
         }
     }
-    // The D role probes the Device alone: the peer's transfer, not a Host
-    // load, fills what the Device lacks. The partial block of a KV tail is
-    // left a hole for the transfer to fill whole.
+    // The partial block of a Device KV tail is left a hole for the
+    // transfer to fill whole.
     PrefixProbe probe;
     probe.group_keys = ResolvePreparedPrefixKeys(prompt);
     probe.device = ProbeTier(prompt, *probe.group_keys, history_match_order, /*claim_partial=*/false);
+    probeDecodeHostSuffix(prompt, history_match_order, probe);
     // The peer's final state supersedes any shorter checkpoint, so a State
     // group's checkpoint counts only at exactly the prompt end: then the
     // transfer omits the group and the D claims the checkpoint as slot 0.
@@ -246,6 +246,43 @@ PrefixProbe PrefixProber::ProbeDecodeDevicePrefix(const PromptPrefix& prompt, st
         probe.state_at_prompt_end = std::move(state_hit);
     }
     return probe;
+}
+
+// The Host carries a D's history past its Device hit in whole pages: the
+// admission loads them below the landing, and the peer's transfer starts past
+// them. Full pages only, so the hit ends on a block boundary of every group
+// and no block is both loaded and landed; a Host tail would also need the
+// transfer's partial block. When the Device resumes furthest, the Host tier
+// mirrors it, as for an ordinary probe.
+void PrefixProber::probeDecodeHostSuffix(const PromptPrefix& prompt, std::span<const std::size_t> history_match_order,
+                                         PrefixProbe& probe) const {
+    if (store_.HostPool() == nullptr) {
+        return;
+    }
+    const std::int32_t device_tokens = probe.device.num_common_tokens;
+    probe.device_only_hit_tokens = device_tokens;
+    const std::int32_t page_bound = prompt.max_tokens - prompt.max_tokens % store_.PrefixGranularity();
+    PrefixProbe::Tier device = probe.device;
+    PrefixProbe::Tier host;
+    if (page_bound > device_tokens) {
+        const PromptPrefix pages{
+            .prefix_hashes = prompt.prefix_hashes,
+            .tokens = {},
+            .max_tokens = page_bound,
+            .prepared_keys = probe.group_keys,
+        };
+        ProbeHostSuffix(pages, *probe.group_keys, history_match_order, device_tokens, /*extra_hits=*/nullptr, device,
+                        host);
+    }
+    if (host.num_common_tokens > device_tokens) {
+        probe.device = std::move(device);
+        probe.host = std::move(host);
+        return;
+    }
+    probe.host = PrefixProbe::Tier{};
+    probe.host.per_group.resize(store_.Groups().size());
+    probe.host.num_common_tokens = probe.device.num_common_tokens;
+    probe.host.full_page_tokens = probe.device.full_page_tokens;
 }
 
 PreparedPrefixKeys PrefixProber::ResolvePreparedPrefixKeys(const PromptPrefix& prompt) const {

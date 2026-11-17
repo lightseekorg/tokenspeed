@@ -178,6 +178,8 @@ def _peer_args(**overrides) -> ServerArgs:
 
 def test_peer_sharing_runs_with_the_host_tier_and_prefix_caching():
     _peer_args().validate_peer_prefix_options()
+    # A decode replica holds the history it decoded (RFC 0005).
+    _peer_args(disaggregation_mode="decode").validate_peer_prefix_options()
     # Off, nothing is checked.
     _peer_args(
         peer_prefix_port=None, enable_kvstore=False
@@ -189,7 +191,6 @@ def test_peer_sharing_runs_with_the_host_tier_and_prefix_caching():
     [
         ({"enable_kvstore": False}, "--disable-kvstore"),
         ({"enable_prefix_caching": False}, "--disable-prefix-caching"),
-        ({"disaggregation_mode": "decode"}, "--disaggregation-mode decode"),
         ({"kvstore_storage_backend": "mooncake"}, "--kvstore-storage-backend"),
         ({"pipeline_parallel_size": 2}, "--pipeline-parallel-size"),
         ({"query_context_parallel_size": 2}, "--query-context-parallel-size"),

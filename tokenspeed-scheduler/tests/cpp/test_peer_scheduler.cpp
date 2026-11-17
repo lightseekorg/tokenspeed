@@ -160,20 +160,13 @@ private:
     std::map<std::uint64_t, std::int64_t> pinned_at_;
 };
 
-// Two replicas of one deployment: a holder that computed a prompt and a
-// reader that is asked to continue it; the test relays their messages as the
+// Two replicas of one deployment: a holder that holds a prefix and a reader
+// that is asked to continue it; the test relays their messages as the
 // runtime would.
-class PeerSchedulerTest : public ::testing::TestWithParam<bool> {
+class PeerPair {
 protected:
-    // The holder prefills `tokens` and finishes, publishing them.
-    void HolderComputes(const std::vector<std::int32_t>& tokens) {
-        holder_.SubmitRequests({RequestSpec{.request_id = "h", .tokens = tokens, .max_new_tokens = 1}});
-        const ExecutionPlan plan = Plan(holder_);
-        ASSERT_EQ(PrefillRows(plan).size(), 1u);
-        Send(holder_, forward::ExtendResult{.request_id = "h", .tokens = {7}});
-        Send(holder_, forward::Finish{.request_id = "h"});
-        Plan(holder_);
-    }
+    PeerPair(SchedulerConfig holder, SchedulerConfig reader)
+        : holder_{std::move(holder)}, reader_{std::move(reader)}, servicer_{holder_} {}
 
     // Relays the reader's lookups to the holder and the answers back.
     void RelayLookups() {
@@ -213,9 +206,26 @@ protected:
         return confirmed;
     }
 
-    Scheduler holder_{PeerConfigFor("holder", GetParam())};
-    Scheduler reader_{PeerConfigFor("reader", GetParam())};
-    HolderServicer servicer_{holder_};
+    Scheduler holder_;
+    Scheduler reader_;
+    HolderServicer servicer_;
+};
+
+// A holder that computed the prompt itself, on full-history and hybrid group
+// sets.
+class PeerSchedulerTest : public ::testing::TestWithParam<bool>, protected PeerPair {
+protected:
+    PeerSchedulerTest() : PeerPair(PeerConfigFor("holder", GetParam()), PeerConfigFor("reader", GetParam())) {}
+
+    // The holder prefills `tokens` and finishes, publishing them.
+    void HolderComputes(const std::vector<std::int32_t>& tokens) {
+        holder_.SubmitRequests({RequestSpec{.request_id = "h", .tokens = tokens, .max_new_tokens = 1}});
+        const ExecutionPlan plan = Plan(holder_);
+        ASSERT_EQ(PrefillRows(plan).size(), 1u);
+        Send(holder_, forward::ExtendResult{.request_id = "h", .tokens = {7}});
+        Send(holder_, forward::Finish{.request_id = "h"});
+        Plan(holder_);
+    }
 };
 
 INSTANTIATE_TEST_SUITE_P(Groups, PeerSchedulerTest, ::testing::Bool(),
@@ -458,10 +468,71 @@ TEST(PeerLandingAlignmentTest, ALocalTailHitLandsFromThePageBoundaryBelow) {
     }
 }
 
-TEST(PeerSchedulerConfigTest, PeerSharingNeedsPrefixCachingOutsideTheDRoleAndNoReplayableGroup) {
-    SchedulerConfig decode = PeerConfigFor("d");
-    decode.role = Role::kD;
-    EXPECT_THROW(decode.Validate(), std::invalid_argument);
+// A decode replica of a disaggregated deployment as the holder
+// (docs/rfcs/0005-runtime-pd-roles.md): it holds the history it decoded, the
+// prompt its PD peer sent and the reply it generated, and serves it as any
+// holder does, but never reads.
+SchedulerConfig DecodePeerConfigFor(const std::string& name) {
+    SchedulerConfig cfg = PeerConfigFor(name);
+    cfg.role = Role::kD;
+    cfg.cache_groups.front().transfer_policy = CacheTransferPolicy::FullSuffix;
+    return cfg;
+}
+
+class PeerDecodeHolderTest : public ::testing::Test, protected PeerPair {
+protected:
+    PeerDecodeHolderTest() : PeerPair(DecodePeerConfigFor("holder"), PeerConfigFor("reader")) {}
+
+    // The holder lands `prompt` from its PD peer with `first` as the peer's
+    // first token, decodes `replies` and finishes, publishing the history.
+    void HolderDecodes(const std::vector<std::int32_t>& prompt, std::int32_t first,
+                       const std::vector<std::int32_t>& replies) {
+        holder_.SubmitRequests({RequestSpec{.request_id = "d", .tokens = prompt, .max_new_tokens = 8}});
+        Send(holder_, pd::BootstrappedEvent{"d"});
+        ASSERT_TRUE(Plan(holder_).remote_prefill.has_value());
+        Send(holder_, pd::RemotePrefillDoneEvent{"d", first});
+        for (const std::int32_t token : replies) {
+            ASSERT_NE(FindForwardBatch(Plan(holder_)), nullptr);
+            Send(holder_, forward::ExtendResult{.request_id = "d", .tokens = {token}});
+        }
+        Send(holder_, forward::Finish{.request_id = "d"});
+        Plan(holder_);
+    }
+};
+
+TEST_F(PeerDecodeHolderTest, TheNextTurnReadsThePreviousReplyFromTheDecodeReplica) {
+    // The peer's first token 801, then 802 and 803 decoded here: 801 and 802
+    // were fed back, so the history the replica computed is the prompt and
+    // those two.
+    const std::vector<std::int32_t> prompt = MakeAlignedTokens(8, kP);
+    const auto history = static_cast<std::int32_t>(prompt.size()) + 2;
+    HolderDecodes(prompt, /*first=*/801, /*replies=*/{802, 803});
+    std::vector<std::int32_t> next_turn = prompt;
+    next_turn.insert(next_turn.end(), {801, 802, 803, 901, 902, 903});
+    reader_.SubmitRequests({RequestSpec{.request_id = "r", .peer_holder = "holder", .tokens = next_turn}});
+
+    EXPECT_TRUE(PrefillRows(Plan(reader_)).empty());
+    RelayLookups();
+    const ExecutionPlan landing_plan = Plan(reader_);
+    ASSERT_EQ(landing_plan.peer_fetches.size(), 1u);
+    const PeerFetchOperation fetch = landing_plan.peer_fetches.front();
+    EXPECT_EQ(fetch.begin_tokens, 0);
+    EXPECT_EQ(fetch.end_tokens, history) << "the prompt and the reply the replica computed";
+    EXPECT_EQ(Fetch(fetch, /*read_succeeds=*/true, /*head_between=*/true), history);
+    EXPECT_EQ(PrefillRows(Plan(reader_)), (std::vector<std::pair<std::string, std::int32_t>>{{"r", history}}));
+    EXPECT_EQ(holder_.GetPeerStats().leases, 0u);
+}
+
+TEST_F(PeerDecodeHolderTest, ADecodeReplicaNeverReads) {
+    holder_.SubmitRequests({RequestSpec{
+        .request_id = "d", .peer_holder = "reader", .tokens = MakeAlignedTokens(8, kP), .max_new_tokens = 4}});
+    Send(holder_, pd::BootstrappedEvent{"d"});
+    EXPECT_TRUE(Plan(holder_).remote_prefill.has_value()) << "its PD peer sends the whole prompt";
+    EXPECT_TRUE(holder_.TakePeerLookups().empty());
+}
+
+TEST(PeerSchedulerConfigTest, PeerSharingNeedsPrefixCachingAndNoReplayableGroup) {
+    EXPECT_NO_THROW(DecodePeerConfigFor("d").Validate());
     SchedulerConfig uncached = PeerConfigFor("u");
     uncached.disable_prefix_cache = true;
     EXPECT_THROW(uncached.Validate(), std::invalid_argument);

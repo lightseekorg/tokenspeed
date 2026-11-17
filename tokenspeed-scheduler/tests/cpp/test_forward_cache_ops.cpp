@@ -937,7 +937,7 @@ TEST(SchedulerConfigValidateTest, AHostCacheRequiresAnExplicitWritePolicy) {
 // fused role's snapshot pool, and supports cached and replayable windows.
 // It refuses the D role, L3 and more groups than the 64 bits that mark a
 // hash's written-back groups.
-TEST(SchedulerConfigValidateTest, WriteBackOnEveryRoleButTheDecodeRole) {
+TEST(SchedulerConfigValidateTest, WriteBackOnEveryRole) {
     const auto prefill = [] {
         SchedulerConfig config = MakeValidConfig();
         config.role = Role::kP;
@@ -963,7 +963,8 @@ TEST(SchedulerConfigValidateTest, WriteBackOnEveryRoleButTheDecodeRole) {
     SchedulerConfig decode = prefill();
     decode.role = Role::kD;
     SetTestSnapshotPool(decode);
-    ExpectRejectedNamingGroup(decode, "not available on the D role");
+    EXPECT_NO_THROW(WithHostPackingFromDevice(decode).Validate());
+    EXPECT_NO_THROW(Scheduler{WithHostPackingFromDevice(decode)});
     SchedulerConfig l3 = prefill();
     l3.enable_l3_storage = true;
     l3.storage_config = StorageConfig{4, 16, 1, 16, 32, 2, 100, 100, {8, 1048576, 1000}, {4, 524288, 500}};
