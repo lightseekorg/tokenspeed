@@ -29,9 +29,8 @@ from unittest.mock import patch
 
 import pytest
 import torch
-
-hipblaslt_amd = pytest.importorskip("tokenspeed_kernel_amd.ops.gemm.hipblaslt")
-from tokenspeed_kernel.ops.gemm import hipblaslt  # noqa: E402
+from tokenspeed_kernel.ops.gemm import hipblaslt
+from tokenspeed_kernel.ops.gemm._hipblaslt import tuning
 
 # The keys TunableOp stamps on ROCm; a file missing one is rejected at load.
 _STAMP_KEYS = {
@@ -44,24 +43,24 @@ _STAMP_KEYS = {
 
 
 def test_file_is_named_after_device():
-    assert hipblaslt_amd.hipblaslt_tuned_file("AMD Instinct MI355X") == os.path.join(
-        hipblaslt_amd.TUNED_CONFIG_DIR, "device_name=AMD_Instinct_MI355X.csv"
+    assert tuning.hipblaslt_tuned_file("AMD Instinct MI355X") == os.path.join(
+        tuning.TUNED_CONFIG_DIR, "device_name=AMD_Instinct_MI355X.csv"
     )
 
 
 def _committed_files() -> list[str]:
-    return sorted(glob.glob(os.path.join(hipblaslt_amd.TUNED_CONFIG_DIR, "*.csv")))
+    return sorted(glob.glob(os.path.join(tuning.TUNED_CONFIG_DIR, "*.csv")))
 
 
 def test_mi355x_file_is_committed():
-    assert os.path.exists(hipblaslt_amd.hipblaslt_tuned_file("AMD Instinct MI355X"))
+    assert os.path.exists(tuning.hipblaslt_tuned_file("AMD Instinct MI355X"))
 
 
 @pytest.mark.parametrize("path", _committed_files(), ids=os.path.basename)
 def test_committed_file_is_wellformed(path):
     name = os.path.basename(path)
     assert name.startswith("device_name=") and " " not in name
-    assert set(hipblaslt_amd.hipblaslt_file_validators(path)) == _STAMP_KEYS
+    assert set(tuning.hipblaslt_file_validators(path)) == _STAMP_KEYS
     entries = 0
     with open(path) as f:
         for line in f:
@@ -83,7 +82,7 @@ def test_gpu_without_file_is_skipped():
         patch.object(torch.cuda, "get_device_name", return_value="No Such GPU"),
     ):
         # Returns before TunableOp or the GPU are touched.
-        assert not hipblaslt_amd.load_hipblaslt_tuned_solutions()
+        assert not tuning.load_hipblaslt_tuned_solutions()
 
 
 def test_default_load_is_noop_off_rocm():
@@ -91,7 +90,7 @@ def test_default_load_is_noop_off_rocm():
     try:
         with (
             patch.object(torch.version, "hip", None),
-            patch.object(hipblaslt_amd, "load_hipblaslt_tuned_solutions") as load,
+            patch.object(tuning, "load_hipblaslt_tuned_solutions") as load,
         ):
             assert not hipblaslt.load_hipblaslt_tuned_solutions()
             assert not hipblaslt.load_hipblaslt_tuned_solutions()
@@ -106,7 +105,7 @@ def test_default_load_runs_once_per_process():
         with (
             patch.object(torch.version, "hip", "7.2"),
             patch.object(
-                hipblaslt_amd, "load_hipblaslt_tuned_solutions", return_value=False
+                tuning, "load_hipblaslt_tuned_solutions", return_value=False
             ) as load,
         ):
             hipblaslt.load_hipblaslt_tuned_solutions()
@@ -167,7 +166,7 @@ def _patched_tunable(fake):
 def test_online_tuning_extends_loaded_file_in_memory():
     fake = _FakeTunable(enabled=True, results=30)
     with _patched_tunable(fake):
-        with hipblaslt_amd.hipblaslt_online_tuning(cold_bytes=512 * 2**20):
+        with tuning.hipblaslt_online_tuning(cold_bytes=512 * 2**20):
             assert fake.tuning and fake.enabled
             # New results go nowhere on disk; the committed file stays as is.
             assert fake.filename == os.devnull
@@ -183,7 +182,7 @@ def test_online_tuning_extends_loaded_file_in_memory():
 def test_online_tuning_without_file_avoids_default_file():
     fake = _FakeTunable(enabled=False, results=0)
     with _patched_tunable(fake):
-        with hipblaslt_amd.hipblaslt_online_tuning():
+        with tuning.hipblaslt_online_tuning():
             assert fake.tuning and fake.enabled
     # The file name is set before TunableOp's first lookup reads it.
     assert fake.calls.index(("set_filename", os.devnull)) < fake.calls.index(
@@ -196,7 +195,7 @@ def test_online_tuning_stops_on_error():
     fake = _FakeTunable(enabled=True, results=30)
     with _patched_tunable(fake):
         with pytest.raises(RuntimeError):
-            with hipblaslt_amd.hipblaslt_online_tuning():
+            with tuning.hipblaslt_online_tuning():
                 raise RuntimeError("warmup failed")
     assert not fake.tuning and fake.rotating_mb == 0
 
@@ -217,7 +216,7 @@ def test_autotune_flag(monkeypatch, hip, env, expected):
 def test_online_tuning_is_noop_off_rocm():
     with (
         patch.object(torch.version, "hip", None),
-        patch.object(hipblaslt_amd, "hipblaslt_online_tuning") as online,
+        patch.object(tuning, "hipblaslt_online_tuning") as online,
     ):
         with hipblaslt.hipblaslt_online_tuning():
             pass

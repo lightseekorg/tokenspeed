@@ -31,7 +31,6 @@ tokenspeed-kernel-amd/
 └── python/
     └── tokenspeed_kernel_amd/
         └── ops/
-            ├── gemm/          # Offline-tuned hipBLASLt/rocBLAS solutions (TunableOp)
             ├── gfx950/
             │   ├── attention/
             │   │   ├── mha/   # Multi-head attention

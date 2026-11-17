@@ -26,9 +26,9 @@ measured solution can be much faster. PyTorch's TunableOp times both
 hipBLASLt and rocBLAS solutions, and can replay the fastest one from a results
 file, so a tuned file can list solutions from either library.
 
-Tuned files live in this package, one per GPU, named like the Triton kernel
-configs: ``configs/device_name=<torch.cuda.get_device_name()>.csv`` with
-spaces replaced by underscores (``device_name=AMD_Instinct_MI355X.csv``).
+Tuned files live next to this module, one per GPU, named like the Triton
+kernel configs: ``configs/device_name=<torch.cuda.get_device_name()>.csv``
+with spaces replaced by underscores (``device_name=AMD_Instinct_MI355X.csv``).
 Serving loads the file of its GPU read-only:
 
 * lookups only, so serving never tunes;
@@ -42,7 +42,7 @@ file lists while a block runs (serving runs its warmup decode steps there,
 before graph capture) and keeps the picks in the process; it writes no file.
 
 Generate or extend the file with
-``python -m tokenspeed_kernel_amd.ops.gemm.hipblaslt`` (see ``--help``) on the
+``python -m tokenspeed_kernel.ops.gemm._hipblaslt.tuning`` (see ``--help``) on the
 GPU and software stack that serves.
 """
 

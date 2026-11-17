@@ -20,10 +20,10 @@
 
 """Offline-tuned BLAS solutions (TunableOp) for dense GEMMs on ROCm.
 
-The runtime entry point. The tuned files (one per GPU, in-repo), loading, the
-stack check and the tuning tool live in
-``tokenspeed_kernel_amd.ops.gemm.hipblaslt``; this module only keeps that
-AMD package out of non-ROCm processes.
+The runtime entry point. The tuned files (one per GPU, in-repo, in
+``_hipblaslt/configs/``), loading, the stack check and the tuning tool live in
+``tokenspeed_kernel.ops.gemm._hipblaslt.tuning``; this module makes the calls
+no-ops on non-ROCm builds.
 
 With ``TOKENSPEED_HIPBLASLT_AUTOTUNE=1`` (off by default), serving also tunes
 the GEMMs of its warmup decode steps that the loaded file does not list,
@@ -40,6 +40,7 @@ import os
 from typing import ContextManager
 
 import torch
+from tokenspeed_kernel.ops.gemm._hipblaslt import tuning
 
 __all__ = [
     "AUTOTUNE_ENV",
@@ -56,7 +57,7 @@ AUTOTUNE_ENV = "TOKENSPEED_HIPBLASLT_AUTOTUNE"
 def load_hipblaslt_tuned_solutions(path: str | None = None) -> bool:
     """Replay the BLAS solutions (hipBLASLt or rocBLAS) in a TunableOp results file.
 
-    See ``tokenspeed_kernel_amd.ops.gemm.hipblaslt.load_hipblaslt_tuned_solutions``.
+    See ``tokenspeed_kernel.ops.gemm._hipblaslt.tuning.load_hipblaslt_tuned_solutions``.
 
     Args:
         path: TunableOp results CSV made on the same software stack and GPU
@@ -66,18 +67,14 @@ def load_hipblaslt_tuned_solutions(path: str | None = None) -> bool:
 
     Returns:
         Whether the file was loaded. False on a non-ROCm build or when the
-        AMD implementation rejects the file.
+        implementation rejects the file.
     """
     if path is None:
         return _load_default()
     if torch.version.hip is None:
         logger.warning(f"Ignoring tuned BLAS solutions {path}: not a ROCm build")
         return False
-    from tokenspeed_kernel_amd.ops.gemm.hipblaslt import (
-        load_hipblaslt_tuned_solutions as load_amd,
-    )
-
-    return load_amd(path)
+    return tuning.load_hipblaslt_tuned_solutions(path)
 
 
 @functools.cache
@@ -86,11 +83,7 @@ def _load_default() -> bool:
     # (including a skipped file's log line) should appear once.
     if torch.version.hip is None:
         return False
-    from tokenspeed_kernel_amd.ops.gemm.hipblaslt import (
-        load_hipblaslt_tuned_solutions as load_amd,
-    )
-
-    return load_amd()
+    return tuning.load_hipblaslt_tuned_solutions()
 
 
 def hipblaslt_autotune_enabled() -> bool:
@@ -101,13 +94,9 @@ def hipblaslt_autotune_enabled() -> bool:
 def hipblaslt_online_tuning() -> ContextManager[None]:
     """Tune, inside the block, the GEMMs no loaded file lists (ROCm only).
 
-    See ``tokenspeed_kernel_amd.ops.gemm.hipblaslt.hipblaslt_online_tuning``.
+    See ``tokenspeed_kernel.ops.gemm._hipblaslt.tuning.hipblaslt_online_tuning``.
     Run it outside graph capture. A no-op context off ROCm.
     """
     if torch.version.hip is None:
         return contextlib.nullcontext()
-    from tokenspeed_kernel_amd.ops.gemm.hipblaslt import (
-        hipblaslt_online_tuning as online_tuning,
-    )
-
-    return online_tuning()
+    return tuning.hipblaslt_online_tuning()
