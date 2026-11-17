@@ -1699,6 +1699,7 @@ def test_kda_fused_verify_short_windows_match_single_request_runs() -> None:
             recurrent_layout="v_major",
             store_states=False,
             replay_records=records,
+            output_norm=None,
         )
         assert output is not None
         return output[0], correction, key_gate
