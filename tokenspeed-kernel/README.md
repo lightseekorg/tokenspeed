@@ -283,6 +283,22 @@ site that keeps doing so. Calling a `@cute.jit` function directly, instead of
 the compiled function, traces it in Python on every call even when CuTe DSL
 has cached its binary, so the monitor reports such a call while serving.
 
+Across processes, `tokenspeed_kernel.cute_compile_cache` keeps `cute.compile`
+binaries in CuTe DSL's on-disk cache (`CUTE_DSL_CACHE_DIR`), which cutlass-dsl
+itself uses only for direct `@cute.jit` calls. It wraps
+`BaseDSL.compile_and_cache`, so tracing still runs and a hit skips lowering and
+ptxas (about half of the startup CuTe compile time). The key adds the source
+of the kernel's defining module, the cutlass-dsl version, the target and device
+architecture, and the compile options to cutlass-dsl's own module hash, so an
+edit to a kernel file never loads a stale binary. The runtime installs it with
+the monitor; `CUTE_DSL_DISABLE_FILE_CACHING=1` turns it off. cutlass-dsl's own
+helpers are not cached: their traces carry process addresses. The wrapped
+function is private to cutlass-dsl, so the cache installs only on the
+cutlass-dsl releases it was verified against (`_TESTED_CUTLASS_DSL`) and turns
+itself off, with one warning, when a call no longer looks as expected; widen
+the range after running `test/nvidia/test_cute_compile_cache.py` on a new
+release.
+
 A runtime argument still keys the cache: Triton specializes an integer on
 whether it is 1 or divisible by 16, and a pointer on 16-byte alignment.
 Startup warms only the classes graph capture happens to see. On the serving

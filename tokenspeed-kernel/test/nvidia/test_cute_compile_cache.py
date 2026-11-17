@@ -1,0 +1,234 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""``cute.compile`` binaries persist across processes and stay correct.
+
+Every case runs its compilations in fresh processes sharing one cache
+directory, as two server starts would.
+"""
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+import torch
+
+pytest.importorskip("cutlass")
+
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="requires an NVIDIA GPU"
+)
+
+_CHILD = Path(__file__).with_name("cute_compile_cache_child.py")
+
+_KERNEL = """
+import cutlass
+import cutlass.cute as cute
+
+
+@cute.kernel
+def _add_kernel(x: cute.Tensor, value: cutlass.Float32):
+    tidx, _, _ = cute.arch.thread_idx()
+    x[tidx] = x[tidx] + value
+
+
+@cute.jit
+def add(x: cute.Tensor, value: cutlass.Float32, threads: cutlass.Constexpr):
+    _add_kernel(x, value).launch(grid=(1, 1, 1), block=(threads, 1, 1))
+"""
+
+
+def _run(cache_dir: Path, output: Path, case: str, *extra: str) -> dict:
+    env = dict(os.environ, CUTE_DSL_CACHE_DIR=str(cache_dir))
+    env.pop("CUTE_DSL_DISABLE_FILE_CACHING", None)
+    done = subprocess.run(
+        [sys.executable, str(_CHILD), case, str(output), *extra],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    assert done.returncode == 0, done.stderr[-4000:]
+    result = json.loads(done.stdout.strip().splitlines()[-1])
+    result["stderr"] = done.stderr
+    return result
+
+
+def _entries(cache_dir: Path) -> list[Path]:
+    return sorted(cache_dir.glob("cute_dsl_*.mlir"))
+
+
+@pytest.fixture
+def kernel_file(tmp_path: Path) -> Path:
+    path = tmp_path / "kernel.py"
+    path.write_text(_KERNEL)
+    return path
+
+
+def _add(cache_dir: Path, output: Path, kernel_file: Path, *extra: str) -> dict:
+    return _run(cache_dir, output, "add", "--kernel-file", str(kernel_file), *extra)
+
+
+def test_a_second_process_loads_what_the_first_compiled(tmp_path, kernel_file):
+    cache = tmp_path / "cache"
+    first = _add(cache, tmp_path / "first.pt", kernel_file)
+    assert (first["keyed"], first["hits"]) == (1, 0)
+    assert len(_entries(cache)) == 1
+    second = _add(cache, tmp_path / "second.pt", kernel_file)
+    assert (second["keyed"], second["hits"]) == (1, 1)
+    assert len(_entries(cache)) == 1
+    assert torch.equal(
+        torch.load(tmp_path / "first.pt")[0], torch.load(tmp_path / "second.pt")[0]
+    )
+
+
+def test_processes_compiling_at_once_leave_one_loadable_entry(tmp_path, kernel_file):
+    cache = tmp_path / "cache"
+    env = dict(os.environ, CUTE_DSL_CACHE_DIR=str(cache))
+    env.pop("CUTE_DSL_DISABLE_FILE_CACHING", None)
+    racers = [
+        subprocess.Popen(
+            [
+                sys.executable,
+                str(_CHILD),
+                "add",
+                str(tmp_path / f"racer{i}.pt"),
+                "--kernel-file",
+                str(kernel_file),
+            ],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for i in range(4)
+    ]
+    for racer in racers:
+        _, stderr = racer.communicate(timeout=900)
+        assert racer.returncode == 0, stderr[-4000:]
+    assert len(_entries(cache)) == 1
+    assert not list(cache.glob("tmp.*"))
+    after = _add(cache, tmp_path / "after.pt", kernel_file)
+    assert (after["keyed"], after["hits"]) == (1, 1)
+
+
+def test_an_edit_to_the_kernel_source_misses(tmp_path, kernel_file):
+    cache = tmp_path / "cache"
+    _add(cache, tmp_path / "first.pt", kernel_file)
+    # A comment changes neither the trace nor the binary; only the source key sees it.
+    kernel_file.write_text(_KERNEL + "\n# edited\n")
+    edited = _add(cache, tmp_path / "edited.pt", kernel_file)
+    assert edited["hits"] == 0
+    assert len(_entries(cache)) == 2
+
+
+def test_another_gpu_architecture_misses(tmp_path, kernel_file):
+    cache = tmp_path / "cache"
+    major, minor = torch.cuda.get_device_capability()
+    _add(cache, tmp_path / "first.pt", kernel_file)
+    other = _add(
+        cache,
+        tmp_path / "other.pt",
+        kernel_file,
+        "--capability",
+        f"{major},{minor + 1}",
+    )
+    assert other["hits"] == 0
+    assert len(_entries(cache)) == 2
+
+
+def test_other_compile_options_miss(tmp_path, kernel_file):
+    cache = tmp_path / "cache"
+    _add(cache, tmp_path / "first.pt", kernel_file)
+    other = _add(
+        cache, tmp_path / "other.pt", kernel_file, "--options", "--opt-level 2"
+    )
+    assert other["hits"] == 0
+    assert len(_entries(cache)) == 2
+
+
+def test_a_corrupt_entry_is_recompiled_and_replaced(tmp_path, kernel_file):
+    cache = tmp_path / "cache"
+    first = _add(cache, tmp_path / "first.pt", kernel_file)
+    (entry,) = _entries(cache)
+    entry.write_bytes(b"not an MLIR bytecode file")
+    recovered = _add(cache, tmp_path / "recovered.pt", kernel_file)
+    assert recovered["hits"] == 0
+    assert torch.equal(
+        torch.load(tmp_path / "first.pt")[0], torch.load(tmp_path / "recovered.pt")[0]
+    )
+    again = _add(cache, tmp_path / "again.pt", kernel_file)
+    assert (first["hits"], again["hits"]) == (0, 1)
+
+
+@pytest.mark.parametrize(
+    "change,installed",
+    [
+        ("untested-version", False),
+        ("renamed-parameters", False),
+        ("no-cache-shape", True),
+        ("keying-error", True),
+    ],
+)
+def test_an_unknown_cutlass_dsl_turns_the_cache_off_and_still_compiles(
+    tmp_path, kernel_file, change, installed
+):
+    cache = tmp_path / "cache"
+    result = _add(
+        cache,
+        tmp_path / "out.pt",
+        kernel_file,
+        "--compiles",
+        "2",
+        "--pretend",
+        change,
+    )
+    assert result["installed"] is installed
+    assert result["keyed"] in (None, 0) and not result["hits"]
+    assert result["stderr"].count("CuTe DSL compile cache off") == 1, result["stderr"]
+    assert not _entries(cache)
+    expected = torch.arange(32, dtype=torch.float32) + 3.0
+    assert torch.equal(torch.load(tmp_path / "out.pt")[0], expected)
+
+
+@pytest.mark.parametrize(
+    "case,kernel",
+    [("stream_topk", "GuardMerge"), ("gated_residual", "FusedGatedResidualKernel")],
+)
+def test_a_loaded_kernel_matches_a_fresh_compile_bitwise(tmp_path, case, kernel):
+    cache = tmp_path / "cache"
+    fresh = _run(cache, tmp_path / "fresh.pt", case)
+    assert any(kernel in name for name in fresh["kernels"]), fresh["kernels"]
+    assert fresh["keyed"] > 0 and fresh["hits"] == 0
+    loaded = _run(cache, tmp_path / "loaded.pt", case)
+    assert loaded["hits"] == loaded["keyed"] == fresh["keyed"]
+    for expected, actual in zip(
+        torch.load(tmp_path / "fresh.pt"),
+        torch.load(tmp_path / "loaded.pt"),
+        strict=True,
+    ):
+        assert torch.equal(expected, actual)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
