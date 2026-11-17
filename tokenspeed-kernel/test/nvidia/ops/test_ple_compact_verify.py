@@ -20,7 +20,8 @@
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.ple import ple_conv_sequences, ple_restore_verify_layers
+from tokenspeed_kernel.ops.kvcache.triton import copy_state_rows
+from tokenspeed_kernel.ops.ple import ple_conv_sequences
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -84,15 +85,15 @@ def test_fused_compact_verify(width, lengths, channels):
 
     def run():
         result = conv(True)
-        ple_restore_verify_layers(
-            scratch,
-            src,
-            dst,
+        copy_state_rows(
             scratch_addrs,
             page_addrs,
-            strides,
-            verify_width=width,
-            batch_size=batch,
+            src,
+            dst,
+            row_bytes=row_elems * scratch.element_size(),
+            src_row_strides=None,
+            dst_row_strides=strides,
+            compact=(scratch, width),
         )
         return result
 

@@ -421,8 +421,7 @@ def test_ple_commit_uses_fused_kernels_and_replays_live_inputs():
     for kernel, count in (
         ("_commit_state_pages_kernel", 1),
         ("_state_verify_commit_rows_kernel", 1),
-        ("_copy_state_rows_kernel", 1),
-        ("_ple_verify_restore_kernel", 1),
+        ("_copy_state_rows_kernel", 2),
     ):
         assert sum(kernel in name for name in gpu_kernels) == count
     assert torch.all(backend._ple_commit_rows[:, 4:] == -99)

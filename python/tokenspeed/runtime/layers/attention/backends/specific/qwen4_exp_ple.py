@@ -35,7 +35,6 @@ from tokenspeed_kernel.ops.kvcache.triton import (
     copy_state_rows,
     state_verify_commit_rows,
 )
-from tokenspeed_kernel.ops.ple import ple_restore_verify_layers
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
@@ -472,15 +471,15 @@ class Qwen4ExpPLEBackend(AttentionBackend):
                 dst_row_strides=tables["context_dst_stride"],
             )
         if pages.is_cuda:
-            ple_restore_verify_layers(
-                self._ple_verify_scratch[self._conv_field_ids[0]],
-                src_rows,
-                dst_rows,
+            copy_state_rows(
                 tables["conv_src"],
                 tables["conv_dst"],
-                tables["conv_element_strides"],
-                verify_width=width,
-                batch_size=bs,
+                src_rows,
+                dst_rows,
+                row_bytes=tables["conv_row_bytes"],
+                src_row_strides=None,
+                dst_row_strides=tables["conv_element_strides"],
+                compact=(self._ple_verify_scratch[self._conv_field_ids[0]], width),
             )
         else:
             copy_state_rows(

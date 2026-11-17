@@ -47,7 +47,6 @@ from tokenspeed_kernel.ops.ple.triton import (
     _ple_host_gather_persistent_kernel,
     _ple_page_gather_pair_kernel,
     _ple_page_scatter_kernel,
-    _ple_verify_restore_kernel,
 )
 from tokenspeed_kernel.platform import ArchVersion, current_platform, pdl_enabled
 from tokenspeed_kernel.warmup import kernel_launcher
@@ -60,7 +59,6 @@ __all__ = [
     "prepare_ngram_reciprocals",
     "ple_page_gather_pair",
     "ple_page_scatter",
-    "ple_restore_verify_layers",
 ]
 
 
@@ -588,52 +586,3 @@ def ple_gate_norm(
         **({"launch_pdl": True} if use_pdl else {}),
     )
     return gated, normalized
-
-
-def ple_restore_verify_layers(
-    scratch: torch.Tensor,
-    src_rows: torch.Tensor,
-    dst_rows: torch.Tensor,
-    src_addresses: torch.Tensor,
-    dst_addresses: torch.Tensor,
-    dst_strides: torch.Tensor,
-    *,
-    verify_width: int,
-    batch_size: int,
-) -> None:
-    """Commit accepted PLE states for all layers in one launch.
-
-    Args:
-        scratch: A source slab with the common [rows, channels, state] geometry
-            and dtype. Each request stores its carried state in row zero and
-            one channel vector at the start of each candidate row.
-        src_rows: Layer-major ids, encoded as request * (verify_width + 1)
-            + accepted count.
-        dst_rows: Layer-major destination page ids. Negative ids are skipped.
-        src_addresses: uint64 base addresses of the dense scratch slabs.
-        dst_addresses: uint64 base addresses of the destination slabs.
-        dst_strides: Per-layer destination page strides in elements.
-        verify_width: Number of candidate tokens per request.
-        batch_size: Number of requests represented by the row tables.
-
-    Returns:
-        None. Writes state directly into the selected destination pages.
-    """
-    channels, state = scratch.shape[1:]
-    if not batch_size or not state:
-        return
-    block = 256
-    grid = (batch_size, _triton.cdiv(channels * state, block), src_addresses.numel())
-    kernel_launcher(_ple_verify_restore_kernel, grid)(
-        scratch,
-        src_rows,
-        dst_rows,
-        src_addresses,
-        dst_addresses,
-        dst_strides,
-        batch_size,
-        verify_width,
-        channels,
-        state,
-        block,
-    )
