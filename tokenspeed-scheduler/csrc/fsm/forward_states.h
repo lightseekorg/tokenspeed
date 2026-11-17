@@ -137,8 +137,8 @@ struct Submitted {
     TokenContainer* TokenContainerPtr() const { return admission.token_container; }
     std::int32_t PrefixGranularity() const { return admission.prefix_granularity; }
 
-    // Successful later first admissions while this is the oldest waiting prompt.
-    std::int32_t prefill_bypasses{0};
+    // Prefill work (prompt less hit) of later first admissions that went ahead while this was the oldest.
+    std::int64_t prefill_bypassed_tokens{0};
     AdmissionResources admission;
 };
 

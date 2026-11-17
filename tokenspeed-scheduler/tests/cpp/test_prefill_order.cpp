@@ -231,11 +231,12 @@ TEST_P(ShortPrefillOrderTest, EqualWorkPreservesSubmissionOrder) {
     EXPECT_EQ(batch->request_ids, (std::vector<std::string>{"first", "second"}));
 }
 
-TEST_P(ShortPrefillOrderTest, BypassLimitIsAppliedWithinOneBatch) {
-    std::vector<RequestSpec> requests{{.request_id = "old-long", .tokens = MakeTokens(128, 101), .max_new_tokens = 1}};
+// Twice the oldest prompt's 16 tokens is eight 4-token prompts, so it ages within one batch.
+TEST_P(ShortPrefillOrderTest, AgingIsAppliedWithinOneBatch) {
+    std::vector<RequestSpec> requests{{.request_id = "old-long", .tokens = MakeTokens(16, 101), .max_new_tokens = 1}};
     for (int i = 0; i < 20; ++i) {
         requests.push_back(RequestSpec{
-            .request_id = "short" + std::to_string(i), .tokens = MakeTokens(1, 1001 + i), .max_new_tokens = 1});
+            .request_id = "short" + std::to_string(i), .tokens = MakeTokens(4, 1001 + 10 * i), .max_new_tokens = 1});
     }
     Start(requests);
     const auto plan = PlanOnce();
@@ -244,19 +245,20 @@ TEST_P(ShortPrefillOrderTest, BypassLimitIsAppliedWithinOneBatch) {
     const auto old = std::find(batch->request_ids.begin(), batch->request_ids.end(), "old-long");
     ASSERT_NE(old, batch->request_ids.end());
     EXPECT_EQ(old - batch->request_ids.begin(), 8);
-    EXPECT_EQ(batch->request_ids.back(), "old-long");
-    EXPECT_EQ(batch->input_lengths.back(), 56);
+    EXPECT_EQ(batch->input_lengths.at(static_cast<std::size_t>(old - batch->request_ids.begin())), 16);
+    EXPECT_EQ(batch->request_ids.size(), 13u) << "four more short prompts fill the 64-token budget";
 }
 
-TEST_P(ShortPrefillOrderTest, EachOldestPromptGetsItsOwnBypassAllowance) {
+// Each oldest prompt's allowance counts the work that went ahead of it from when it became the oldest.
+TEST_P(ShortPrefillOrderTest, EachOldestPromptGetsItsOwnShareOfTheWork) {
     std::vector<RequestSpec> requests;
     for (int i = 0; i < 2; ++i) {
         requests.push_back(RequestSpec{
-            .request_id = "long" + std::to_string(i), .tokens = MakeTokens(128, 101 + i * 200), .max_new_tokens = 1});
+            .request_id = "long" + std::to_string(i), .tokens = MakeTokens(16, 101 + i * 200), .max_new_tokens = 1});
     }
     for (int i = 0; i < 17; ++i) {
         requests.push_back(RequestSpec{
-            .request_id = "short" + std::to_string(i), .tokens = MakeTokens(1, 1001 + i), .max_new_tokens = 1});
+            .request_id = "short" + std::to_string(i), .tokens = MakeTokens(4, 1001 + 10 * i), .max_new_tokens = 1});
     }
     Start(requests);
     std::vector<std::string> first_admissions;
@@ -282,10 +284,25 @@ TEST_P(ShortPrefillOrderTest, EachOldestPromptGetsItsOwnBypassAllowance) {
         }
     }
     EXPECT_EQ(first_admissions, expected);
-    EXPECT_EQ(tokens, 2 * 128 + 17);
+    EXPECT_EQ(tokens, 2 * 16 + 17 * 4);
     for (const auto& request : requests) {
         EXPECT_EQ(scheduler_->RequestTokenSize(request.request_id), -1);
     }
+}
+
+TEST_P(ShortPrefillOrderTest, OneTokenPromptsDoNotAgeALongPrompt) {
+    std::vector<RequestSpec> requests{{.request_id = "old-long", .tokens = MakeTokens(128, 101), .max_new_tokens = 1}};
+    for (int i = 0; i < 20; ++i) {
+        requests.push_back(RequestSpec{
+            .request_id = "short" + std::to_string(i), .tokens = MakeTokens(1, 1001 + i), .max_new_tokens = 1});
+    }
+    Start(requests);
+    const auto plan = PlanOnce();
+    const auto* batch = FindForwardBatch(plan);
+    ASSERT_NE(batch, nullptr);
+    ASSERT_EQ(batch->request_ids.size(), 21u);
+    EXPECT_EQ(batch->request_ids.back(), "old-long") << "20 tokens went ahead of 128: not aged, so last";
+    EXPECT_EQ(batch->input_lengths.back(), 44);
 }
 
 TEST_P(ShortPrefillOrderTest, ContinuousShortArrivalsAdvanceEveryEarlierLongPrompt) {
@@ -348,10 +365,11 @@ TEST_P(ShortPrefillOrderTest, ResidentPrefillKeepsItsPlaceWhenAShortPromptArrive
 }
 
 TEST_P(ShortPrefillYieldOrderTest, CarriedFirstAdmissionsProtectTheOldestWaitingPrompt) {
-    Start({RequestSpec{.request_id = "resident", .tokens = MakeTokens(224, 101), .max_new_tokens = 1}});
+    Start({RequestSpec{.request_id = "resident", .tokens = MakeTokens(256, 101), .max_new_tokens = 1}});
     Land(PlanOnce());
-    Start({RequestSpec{.request_id = "old-long", .tokens = MakeTokens(128, 501), .max_new_tokens = 1}});
-    for (int round = 0; round < 2; ++round) {
+    // 40 tokens: too long to carry in the 32 yielded tokens; it ages after 80 carried tokens.
+    Start({RequestSpec{.request_id = "old-long", .tokens = MakeTokens(40, 501), .max_new_tokens = 1}});
+    for (int round = 0; round < 3; ++round) {
         std::vector<RequestSpec> shorts;
         std::vector<std::string> expected;
         for (int i = 0; i < 4; ++i) {
@@ -375,12 +393,12 @@ TEST_P(ShortPrefillYieldOrderTest, CarriedFirstAdmissionsProtectTheOldestWaiting
     const auto plan = PlanOnce();
     const auto* batch = FindForwardBatch(plan);
     ASSERT_NE(batch, nullptr);
-    // Eight carried first admissions protect the oldest waiter. The resident
+    // Twelve carried first admissions protect the oldest waiter. The resident
     // finishes first; the protected prompt starts before the later short one.
     // The later prompt cannot fit whole beside either chunk.
     EXPECT_EQ(batch->request_ids, (std::vector<std::string>{"resident", "old-long"}));
     EXPECT_EQ(batch->input_lengths, (std::vector<std::int32_t>{32, 32}));
-    EXPECT_EQ(batch->extend_prefix_lens, (std::vector<std::int32_t>{192, 0}));
+    EXPECT_EQ(batch->extend_prefix_lens, (std::vector<std::int32_t>{224, 0}));
 }
 
 }  // namespace

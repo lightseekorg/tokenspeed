@@ -331,14 +331,26 @@ currently reusable Device or Host prefixes, plus any tokens replayed to
 regenerate replayable groups; equal work preserves submission order. Resident chunks retain priority. The policy applies to P and fused
 local prefill; D's remote admission and decode ordering are unchanged.
 
-Only the oldest waiting prompt counts successful later first admissions.
-After eight, it receives selection priority; once it starts or leaves, the
-next oldest gets its own allowance. Priority is reevaluated after each
-admission, including within one batch. Failed admissions and resident chunks
-do not count. When chunk yielding is also enabled, carried first admissions
-count toward the same allowance; the bounded carry scan retains FIFO order.
-On the fused role, a first admission granted after capacity retraction also
-counts; a resident chunk granted capacity does not.
+Only the oldest waiting prompt counts the later first admissions that go
+ahead of it, by their prefill work (prompt tokens less the hit they resume
+from). Once they have taken twice its own work (`kPrefillAgingShare`), it
+receives selection priority; once it starts or leaves, the next oldest gets
+its own allowance. Counting work rather than admissions bounds the share of
+the prefill budget an aged prompt takes to about a third while it is the
+oldest: a fixed count of short admissions would age a long prompt every few
+admissions and let its chunks hold the head of line (§1.1) for most of the
+budget, and under a backlog every mid-sized prompt would wait behind it.
+The price falls on the longest prompts: under a backlog that outlasts them
+they are served last, in submission order, each after its share. The order
+cannot shorten that wait, only move it between prompt lengths; the prefill
+budget the prefill/decode interval leaves (§3.3) bounds how fast a backlog
+drains.
+Priority is reevaluated after each admission, including within one batch.
+Failed admissions and resident chunks do not count. When chunk yielding is
+also enabled, carried first admissions count toward the same allowance; the
+bounded carry scan retains FIFO order. On the fused role, a first admission
+granted after capacity retraction also counts; a resident chunk granted
+capacity does not.
 Priority cannot bypass resource or transfer dependencies, and
 an inadmissible protected prompt does not block other admissible requests.
 

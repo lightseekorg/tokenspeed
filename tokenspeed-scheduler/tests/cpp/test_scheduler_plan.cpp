@@ -1912,9 +1912,9 @@ TEST_F(MixedPrefillDecodeIntervalCapacitySuite, AGrantedFirstAdmissionCountsTowa
         }
         SendAbortEvent("short");
 
-        // The grant was the first bypass. Seven ordinary admissions fill the
+        // The grant was the first bypass. Two ordinary admissions fill the
         // remaining allowance; each consumes the round's entire token budget.
-        for (int i = 0; i < 7; ++i) {
+        for (int i = 0; i < 2; ++i) {
             const std::string id = "s" + std::to_string(i);
             Submit(MakeRequestSpec(id, 4, /*start=*/1000 + i * 100));
             EXPECT_EQ(Round(), "P:" + id);

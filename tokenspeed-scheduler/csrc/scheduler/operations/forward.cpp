@@ -75,7 +75,8 @@ constexpr std::int32_t kMaxRestoreAttemptsPerRound = 4;
 // the prompt's prefix pages, so the scan is bounded.
 constexpr std::int32_t kMaxYieldProbesPerRound = 8;
 
-constexpr std::int32_t kMaxPrefillBypasses = 8;
+// The oldest waiting prompt ages once the work admitted ahead of it reaches this multiple of its own (scheduler.md).
+constexpr std::int64_t kPrefillAgingShare = 2;
 
 // An incomplete prefill keeps the head of line: admission reserved only this
 // chunk, and a later candidate could strand it by consuming the capacity it
@@ -84,15 +85,20 @@ bool holdsHeadOfLine(const Request& request) {
     return request.Is<fsm::Prefilling>();
 }
 
-void recordPrefillBypass(std::span<Request* const> candidates, const Request* admitted) {
+// The prefill work a first admission took: its prompt less the hit it resumed from.
+std::int64_t admittedPrefillWork(Request& admitted) {
+    return std::max<std::int64_t>(admitted.PrefillSize() - admitted.CacheProgressRef().resume_tokens, 0);
+}
+
+void recordPrefillBypass(std::span<Request* const> candidates, const Request* admitted, std::int64_t admitted_work) {
     // Count only for the oldest waiting prompt. Aging every older prompt
-    // together would disable short-work preference after eight admissions.
+    // together would disable short-work preference once a backlog builds.
     for (Request* older : candidates) {
         if (older == admitted) {
             break;
         }
         if (auto* waiting = older->GetIf<fsm::Submitted>()) {
-            waiting->prefill_bypasses = std::min(kMaxPrefillBypasses, waiting->prefill_bypasses + 1);
+            waiting->prefill_bypassed_tokens += admitted_work;
             break;
         }
     }
@@ -1554,7 +1560,7 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
                     build.remote_prefill.emplace_back(std::move(*admitted));
                 } else {
                     if (config_.enable_short_prefill_first && first_admission) {
-                        recordPrefillBypass(candidates, blocker);
+                        recordPrefillBypass(candidates, blocker, admittedPrefillWork(*blocker));
                     }
                     pushOperation(build, *blocker, std::move(*admitted));
                     blocker->TrackScheduledForward();
@@ -1759,8 +1765,12 @@ Request* popShortPrefill(std::vector<PendingPrefill>& pending) {
     // min_element preserves submission order for equal work or protected requests.
     const auto selected =
         std::min_element(pending.begin(), pending.end(), [](const PendingPrefill& a, const PendingPrefill& b) {
-            const bool aged_a = a.request->GetIf<fsm::Submitted>()->prefill_bypasses >= kMaxPrefillBypasses;
-            const bool aged_b = b.request->GetIf<fsm::Submitted>()->prefill_bypasses >= kMaxPrefillBypasses;
+            const auto aged = [](const PendingPrefill& pending) {
+                return pending.request->GetIf<fsm::Submitted>()->prefill_bypassed_tokens >=
+                       kPrefillAgingShare * std::int64_t{pending.remaining_tokens};
+            };
+            const bool aged_a = aged(a);
+            const bool aged_b = aged(b);
             if (aged_a != aged_b) {
                 return aged_a;
             }
@@ -1885,7 +1895,7 @@ void Scheduler::carryWholePrompts(AdmissionFeedback& feedback, PlanBuild& build,
                                                      build.load_backs, build.kv_page_budget, /*yield_tokens=*/0,
                                                      /*must_complete=*/true)) {
             if (config_.enable_short_prefill_first) {
-                recordPrefillBypass(candidates, request);
+                recordPrefillBypass(candidates, request, prompt.tokens);
             }
             pushOperation(build, *request, std::move(*admitted));
             request->TrackScheduledForward();
@@ -2032,7 +2042,7 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
                                                          decode_reserve, build.load_backs, build.kv_page_budget,
                                                          yield_tokens, /*must_complete=*/false)) {
                 if (short_work_first) {
-                    recordPrefillBypass(candidates, request);
+                    recordPrefillBypass(candidates, request, admittedPrefillWork(*request));
                 }
                 spdlog::debug("[Scheduler] prefill {} scheduled ({} tokens)", request->Id(), admitted->input_length);
                 pushOperation(build, *request, std::move(*admitted));
