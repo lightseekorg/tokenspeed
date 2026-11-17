@@ -1217,6 +1217,7 @@ private:
     // window; empty when the probe hit nothing or no group replays.
     std::vector<GroupDemand> replayedDemands(const PrefixProbe& prefix, std::span<const GroupDemand> demands) const;
     std::vector<CacheKey> keysForGroup(std::span<const std::string> content_hashes, std::uint32_t group_id) const;
+    PreparedPrefixKeys resolvePreparedPrefixKeys(const PromptPrefix& prompt) const;
     std::vector<std::vector<CacheKey>> buildGroupKeys(std::span<const std::string> content_hashes) const;
     template <CacheTier Tier>
     BlockPool& tierPool();

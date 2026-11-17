@@ -1251,7 +1251,7 @@ CacheCoordinator::PrefixProbe CacheCoordinator::probePrefixWithOrder(const Promp
                              prompt.tail->tail_tokens == prompt.max_tokens % prefix_granularity_),
             "an explicit tail describes the probe bound inside its last page");
     PrefixProbe out;
-    out.group_keys = prompt.prepared_keys ? prompt.prepared_keys : PreparePrefixKeys(prompt.prefix_hashes);
+    out.group_keys = resolvePreparedPrefixKeys(prompt);
     out.device = probeTier(prompt, *out.group_keys, match_order, claim_partial);
     if (host_pool_ == nullptr) {
         return out;
@@ -1271,6 +1271,20 @@ CacheCoordinator::PrefixProbe CacheCoordinator::probePrefixWithOrder(const Promp
         out.host.kv_tokens = host_kv_tokens;
     }
     return out;
+}
+
+PreparedPrefixKeys CacheCoordinator::resolvePreparedPrefixKeys(const PromptPrefix& prompt) const {
+    if (!prompt.prepared_keys) {
+        return PreparePrefixKeys(prompt.prefix_hashes);
+    }
+    const auto& keys = *prompt.prepared_keys;
+    _assert(keys.size() == groups_.size(), "prepared prefix keys must cover every cache group");
+    for (const auto i : match_order_) {
+        const auto pages_per_hash = static_cast<std::size_t>(BlocksPerBoundary(static_cast<std::int32_t>(i)));
+        _assert(keys[i].size() / pages_per_hash >= prompt.prefix_hashes.size(),
+                "prepared prefix keys do not cover the prompt hash chain");
+    }
+    return prompt.prepared_keys;
 }
 
 PreparedPrefixKeys CacheCoordinator::PreparePrefixKeys(std::span<const std::string> content_hashes) const {
@@ -1400,7 +1414,7 @@ CacheCoordinator::PrefixProbe CacheCoordinator::ProbeDecodeDevicePrefix(const Pr
     // load, fills what the Device lacks. The partial block of a KV tail is
     // left a hole for the transfer to fill whole.
     PrefixProbe probe;
-    probe.group_keys = prompt.prepared_keys ? prompt.prepared_keys : PreparePrefixKeys(prompt.prefix_hashes);
+    probe.group_keys = resolvePreparedPrefixKeys(prompt);
     probe.device = probeTier(prompt, *probe.group_keys, history_match_order, /*claim_partial=*/false);
     // The peer's final state supersedes any shorter checkpoint, so a State
     // group's checkpoint counts only at exactly the prompt end: then the
@@ -3593,8 +3607,7 @@ CacheCoordinator::StorageReservation CacheCoordinator::ReserveStoragePrefix(cons
     // The Device-only probe: the reservation matches the Host suffix (Host and
     // remote) above its boundary again, under the same Host-suffix rule as
     // admission.
-    const PreparedPrefixKeys keys =
-        prompt.prepared_keys ? prompt.prepared_keys : PreparePrefixKeys(prompt.prefix_hashes);
+    const PreparedPrefixKeys keys = resolvePreparedPrefixKeys(prompt);
     const auto& group_keys = *keys;
     const PrefixProbe::Tier device_only = probeTier(prompt, group_keys, match_order_, /*claim_partial=*/true);
     auto candidate = prompt;
