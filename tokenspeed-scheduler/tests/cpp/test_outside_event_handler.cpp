@@ -200,6 +200,34 @@ TEST_F(FinishOnlyHybridWriteBackTestSuite, FinishStoresDecodeMlaPagesAndTheFinal
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 10);
 }
 
+TEST_F(FinishOnlyHybridWriteBackTestSuite, FinalCheckpointSurvivesOwnerRetirementUntilHostStoreAck) {
+    Submit(RequestSpec{.request_id = "r0", .tokens = {1, 2, 3}});
+    PlanOnce();
+    SendForwardDone("r0", {4});
+    SendFinish("r0");
+    EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
+    const ExecutionPlan stores = PlanOnce();
+    ASSERT_FALSE(ExtractCacheOpsOfKind<WriteBackBatch>(stores).empty());
+    EXPECT_FALSE(scheduler_->CanClearCache()) << "the pending store still pins the final KV and State blocks";
+
+    // The finished request has gone; reusing its id also reuses the complete
+    // unaligned checkpoint while the first request's Host store is pending.
+    Submit(RequestSpec{.request_id = "r0", .tokens = {1, 2, 3, 4}});
+    const ExecutionPlan hit = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(hit.Operations());
+    ASSERT_NE(batch, nullptr);
+    ASSERT_EQ(batch->request_ids.size(), 1u);
+    EXPECT_EQ(batch->extend_prefix_lens.front(), 3);
+    AckWriteBacks(stores);
+    SendForwardDone("r0", {5});
+    SendFinish("r0");
+    const ExecutionPlan final = PlanOnce();
+    AckWriteBacks(final);
+    EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
+    EXPECT_TRUE(scheduler_->CanClearCache());
+    EXPECT_TRUE(scheduler_->ClearCache());
+}
+
 class LoadBackDoneTestSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
@@ -292,6 +320,7 @@ protected:
         cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 2;
         cfg.max_batch_size = 1;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.decode_input_tokens = 1;
         cfg.role = Role::kD;
         cfg.enable_l3_storage = false;
@@ -352,6 +381,7 @@ protected:
         SchedulerConfig cfg = DisaggDecodeAdmissionTestSuite::MakeConfig();
         cfg.device_allocator.total_pages = 5;
         cfg.max_batch_size = 2;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
         SetTestSnapshotPool(cfg);
         return cfg;
@@ -398,6 +428,7 @@ protected:
         cfg.host_allocator.total_pages = 7;
         cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_batch_size = 2;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
         SetTestSnapshotPool(cfg);
         return cfg;
@@ -458,6 +489,7 @@ protected:
         cfg.host_allocator.total_pages = 6;  // null parent + five retraction parents
         cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_batch_size = 3;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
         SetTestSnapshotPool(cfg);
         return cfg;
@@ -474,6 +506,7 @@ protected:
         cfg.device_allocator.total_pages = 9;
         cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
         cfg.max_batch_size = 3;
+        cfg.max_resident_requests = cfg.max_batch_size;
         SetTestSnapshotPool(cfg);
         return cfg;
     }
@@ -762,6 +795,73 @@ TEST_F(DecodeRetractionNoPrefixCacheTestSuite, RestoreUsesItsOwnImageWithPrefixC
     EXPECT_EQ(scheduler_->DecodingSize(), 1u);
 }
 
+// A D node with prefix caching disabled and no Host cache (a decode worker
+// served with --disable-prefix-caching --disable-kvstore): no admission can
+// hit a published page, so the landed request's decode steps and its finish
+// publish nothing and its pages return straight to the free pool, as the
+// fused case in test_kv_cache_lifecycle.cpp
+// (SchedulerConfig::PublishesCompletedPages).
+class DecodeNoPrefixCacheNoHostCacheTestSuite : public DisaggDecodeAdmissionTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = DisaggDecodeAdmissionTestSuite::MakeConfig();
+        cfg.disable_prefix_cache = true;
+        cfg.disable_l2_cache = true;
+        cfg.host_allocator.total_pages = 0;
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+};
+
+// Admission hashes the prompt only to probe the prefix cache: without it,
+// nothing can match and the prompt stays unhashed.
+TEST_F(DecodeNoPrefixCacheNoHostCacheTestSuite, AdmissionHashesThePromptOnlyWithPrefixCaching) {
+    for (const bool prefix_cache : {false, true}) {
+        SCOPED_TRACE(prefix_cache ? "with prefix caching" : "without prefix caching");
+        config_.disable_prefix_cache = !prefix_cache;
+        scheduler_ = std::make_unique<Scheduler>(config_);
+        Submit({MakeRequestSpec("r0", /*num_pages=*/2, /*start=*/1)});
+        SendBootstrapped("r0");
+        ASSERT_NE(FindRemoteAdmission(PlanOnce()), nullptr);
+        EXPECT_EQ(SchedulerTestAccess::PromptHashed(*scheduler_, "r0"), prefix_cache);
+    }
+}
+
+TEST_F(DecodeNoPrefixCacheNoHostCacheTestSuite, FinishedRemotePrefillLeavesNoCacheOnlyParents) {
+    const std::int32_t total = scheduler_->EmptyLcmBlocks();
+    EXPECT_EQ(total, scheduler_->AvailableLcmBlocks());
+    EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
+
+    // Two pages so a decode step crosses a page boundary.
+    Submit({MakeRequestSpec("r0", /*num_pages=*/2, /*start=*/1)});
+    SendBootstrapped("r0");
+    const ExecutionPlan admission = PlanOnce();
+    ASSERT_NE(FindRemoteAdmission(admission), nullptr);
+    SendRemotePrefillDone("r0", /*bootstrap_token=*/42);
+    EXPECT_GT(scheduler_->ActiveLcmBlocks(), 0);
+    EXPECT_EQ(scheduler_->EmptyLcmBlocks() + scheduler_->ActiveLcmBlocks(), total)
+        << "the landed request's pages are active, not cache-only";
+
+    // Two decode steps: the first already lands on a fresh page past the
+    // two-page prompt (the admission reserved the whole destination, so
+    // this stays within the already-reserved third page).
+    int tok = 43;
+    for (int step = 0; step < 2; ++step) {
+        ExecutionPlan decode = PlanOnce();
+        ASSERT_NE(FindForwardBatch(decode.Operations()), nullptr);
+        EXPECT_EQ(scheduler_->EmptyLcmBlocks() + scheduler_->ActiveLcmBlocks(), total)
+            << "still no cache-only parents mid-decode on the D role";
+        SendForwardDone("r0", {tok++});
+    }
+
+    SendFinish("r0");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
+    EXPECT_EQ(scheduler_->EmptyLcmBlocks(), total)
+        << "D role + disabled prefix caching: the finished request's pages return to the free pool";
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), total);
+}
+
 TEST_F(DecodeRetractionL2TestSuite, RemotePrefillInFlightStallsAdditionalAdmission) {
     ExecutionPlan retract;
     DriveRunningToRetraction(retract);
@@ -960,6 +1060,7 @@ protected:
         cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 4;
         cfg.max_batch_size = 4;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.disable_prefix_cache = false;
 
         CacheGroupConfig full = cfg.cache_groups.front();
@@ -1029,9 +1130,12 @@ TEST_F(PdSlidingWindowTailTestSuite, AnUnalignedHitLandsTheWindowBehindThePrivat
     EXPECT_EQ(std::ranges::count(plan.pages_to_zero.at("swa"), swa.at(6)), 1) << "the landing's own block";
     EXPECT_EQ(std::ranges::count(plan.pages_to_zero.at("swa"), swa.at(4)), 0) << "a copy destination is never zeroed";
     const auto full = destination->BlockTables().at("full").at(0);
-    ASSERT_GE(full.size(), 3u);  // the prompt, the decode slot and the D's admission headroom
+    ASSERT_GE(full.size(), 4u);  // the prompt, the decode slot and the D's admission headroom
     EXPECT_TRUE(plan.pages_to_copy.at("full").empty()) << "the full group's only tail block is the partial one";
-    EXPECT_EQ(std::ranges::count(plan.pages_to_zero.at("full"), full.at(2)), 1);
+    EXPECT_EQ(std::ranges::count(plan.pages_to_zero.at("full"), full.at(2)), 0)
+        << "the block containing token 11 ends inside the prompt: the peer fills it whole";
+    EXPECT_EQ(std::ranges::count(plan.pages_to_zero.at("full"), full.at(3)), 1)
+        << "the block holding the prompt end is partial";
     SendRemotePrefillDone("r2", /*bootstrap_token=*/79);
     const ExecutionPlan decode_plan = PlanOnce();
     const ForwardBatch* decode = FindForwardBatch(decode_plan.Operations());
@@ -1179,9 +1283,11 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, LandsThePromptEndStateInSlotOneAndDecod
     ASSERT_EQ(state.size(), 2u);
     EXPECT_EQ(state[0], 0);
     EXPECT_GT(state[1], 0);
+    // The peer fills the four prompt pages and the state's slot 1 whole:
+    // only the decode reserve page is zeroed.
     ASSERT_EQ(plan.pages_to_zero.size(), 2u);
-    EXPECT_EQ(plan.pages_to_zero.at("full"), full);
-    EXPECT_EQ(plan.pages_to_zero.at("state"), (std::vector<std::int32_t>{state[1]}));
+    EXPECT_EQ(plan.pages_to_zero.at("full"), (std::vector<std::int32_t>{full.at(4)}));
+    EXPECT_TRUE(plan.pages_to_zero.at("state").empty());
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 2);
     EXPECT_TRUE(scheduler_->PdTransferPinned("r0"));
 
@@ -1275,8 +1381,10 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, AnExactPromptEndStateHitSkipsTheStateTr
     EXPECT_TRUE(plan2.pages_to_copy.at("full").empty()) << "the hit's only tail block is the partial one";
     const auto full2 = destination2->BlockTables().at("full").at(0);
     ASSERT_EQ(full2.size(), 6u);  // five prompt pages and the decode reserve
-    EXPECT_EQ(std::ranges::count(plan2.pages_to_zero.at("full"), full2.at(4)), 1)
-        << "the block containing token 9 is a fresh page";
+    EXPECT_EQ(std::ranges::count(plan2.pages_to_zero.at("full"), full2.at(4)), 0)
+        << "the block containing token 9 is a fresh page the peer fills whole";
+    EXPECT_EQ(plan2.pages_to_zero.at("full"), (std::vector<std::int32_t>{full2.at(5)}))
+        << "only the decode reserve page is zeroed";
 }
 
 TEST_F(PdSparseDecodeAdmissionTestSuite, ExactStateHitCanFinishWithoutADecodeForward) {
@@ -1554,6 +1662,7 @@ protected:
         cfg.role = Role::kP;
         cfg.max_scheduled_tokens = 16;
         cfg.max_batch_size = 4;
+        cfg.max_resident_requests = cfg.max_batch_size;
         // Null parent plus four usable: exactly "a"'s two pages and "b"'s
         // two pages, none spare for "c".
         cfg.device_allocator.total_pages = 5;
@@ -2014,9 +2123,9 @@ TEST_F(PdTransferParkingDecodeTestSuite, FailedEventWhileRemotePrefillingParksUn
     EXPECT_FALSE(PlanSchedulesD0());
 }
 
-// Fused role: forward::Abort frees pages immediately. pdTransferInFlight is
-// always false there, so no request ever parks.
-TEST_F(SchedulerTestSuite, FusedRoleAbortFreesPagesImmediately) {
+// A fused cancellation has no PD transfer to retire, but its queued forward
+// still owns the request's pages until its result lands.
+TEST_F(SchedulerTestSuite, FusedRoleAbortWaitsForForwardCompletion) {
     const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
     Submit({MakeRequestSpec("f1", /*num_pages=*/2)});
     PlanOnce();
@@ -2024,7 +2133,9 @@ TEST_F(SchedulerTestSuite, FusedRoleAbortFreesPagesImmediately) {
     SendAbortEvent("f1");
     EXPECT_FALSE(scheduler_->PdTransferPinned("f1"));
     EXPECT_EQ(scheduler_->PdTransferSize(), 0u);
-    EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0) << "the fused role never parks: its pages free immediately";
+    EXPECT_GT(scheduler_->ActiveLcmBlocks(), 0);
+    SendForwardDone("f1");
+    EXPECT_EQ(scheduler_->ActiveLcmBlocks(), 0);
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start);
 }
 

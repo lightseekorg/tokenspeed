@@ -383,14 +383,22 @@ class CommManager:
         return scatter_count(num_tokens, self.mapping.attn.tp_size)
 
     def attn_tp_group_scattered_num_tokens(self, ctx: ForwardContext) -> list[int]:
+        counts = self.scattered_num_tokens(ctx)
+        if ctx.collective_global_num_tokens is None and ctx.global_num_tokens is None:
+            return counts
         start = self.mapping.attn.tp_size * self.mapping.attn.dp_rank
-        end = start + self.mapping.attn.tp_size
-        return self.scattered_num_tokens(ctx)[start:end]
+        return counts[start : start + self.mapping.attn.tp_size]
 
     def dense_tp_group_scattered_num_tokens(self, ctx: ForwardContext) -> list[int]:
+        counts = self.scattered_num_tokens(ctx)
+        if ctx.collective_global_num_tokens is None and ctx.global_num_tokens is None:
+            if self.mapping.dense.tp_group != self.mapping.attn.tp_group:
+                raise ValueError(
+                    "Different dense/attention groups require global token counts"
+                )
+            return counts
         start = self.mapping.dense.tp_size * self.mapping.dense.dp_rank
-        end = start + self.mapping.dense.tp_size
-        return self.scattered_num_tokens(ctx)[start:end]
+        return counts[start : start + self.mapping.dense.tp_size]
 
     def moe_tp_ep_group_scattered_num_tokens(self, ctx: ForwardContext) -> list[int]:
         tp_ep_size = self.mapping.moe.tp_ep_size

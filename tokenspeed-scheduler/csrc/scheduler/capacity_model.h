@@ -49,19 +49,25 @@ public:
     // at the moment of its largest working set.
     std::vector<std::int64_t> SingleRequestGroupPages(std::int32_t token_limit) const;
 
-    // Child pages (null page excluded) each group holds for max_batch_size
+    // Child pages (null page excluded) each group holds for max_resident_requests
     // live requests whose histories -- first decode reservation included --
     // total max_total_tokens, no request spanning more than max_context_len.
     // For every group, one request of L tokens needs no more than this
-    // reports for max_batch_size = 1 and max_total_tokens = max_context_len
+    // reports for max_resident_requests = 1 and max_total_tokens = max_context_len
     // = L: a pool sized from it admits every request the bound accepts.
     std::vector<std::int64_t> ConcurrentGroupPages(std::int64_t max_total_tokens, std::int32_t max_context_len) const;
 
     // LCM blocks that place group_pages[g] child pages in every group g.
     std::int64_t LcmBlocksNeededFor(std::span<const std::int64_t> group_pages) const;
 
-    // Largest token_limit whose SingleRequestGroupPages fit usable_lcm_blocks.
+    // Largest token_limit whose SingleRequestGroupPages fit usable_lcm_blocks,
+    // at most MaxRequestTokenLimit.
     std::int32_t MaxSingleRequestTokens(std::int64_t usable_lcm_blocks) const;
+
+    // Largest token limit (Scheduler::SubmitRequests) whose int32 token
+    // positions stay in range: INT32_MAX less what the scheduler adds past the
+    // limit, its decode windows and the rounding to a block or prefix page.
+    static std::int32_t MaxRequestTokenLimit(const SchedulerConfig& config);
 
     // Tokens of the next verify window a speculative decode reserves for its draft steps; 0 without one or on P.
     static std::int64_t DraftWindowTokens(const SchedulerConfig& config);

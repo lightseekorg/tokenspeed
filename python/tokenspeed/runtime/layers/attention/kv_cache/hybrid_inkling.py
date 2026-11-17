@@ -37,6 +37,10 @@ class HybridInklingTokenToKVPool(HybridMHATokenToKVPool):
         self, layer_id: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
         field_layer = self._field_layer_id(layer_id)
+        # The K/V short conv reads these before the layer's attention waits for
+        # its Host load, and a hit loads the input checkpoint.
+        if self.layerwise_load_tracker is not None:
+            self.layerwise_load_tracker.wait_for_layer(layer_id)
         return (
             self.arena.field(f"layer.{field_layer}.kvconv_k"),
             self.arena.field(f"layer.{field_layer}.kvconv_v"),

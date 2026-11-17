@@ -35,13 +35,19 @@ For one request and head, with S0 the [V, K] checkpoint:
     c   = beta (v - rk S0 (k e^G))          the correction record
     out = rq S0 (q e^G) + rq rk (q . k) c
 
+With the layer's output norm the kernel stores, instead of ``out``, its gated
+RMSNorm ``rmsnorm(bf16(out)) * w * sigmoid(gate)`` over the head (the
+o-projection input), as the separate norm kernel computes it from the stored
+BF16 output; only the order of the sum of squares differs.
+
 One CTA of four warps covers one (request, head). It bulk-copies the
 checkpoint into shared memory while thread t convolves channel t of q, k and
 v. For the gate projection and the checkpoint product, warp w takes 32 keys
 or 32 checkpoint rows and lane l elements [4l, 4l + 4) of each row, so every
 warp-wide load reads one contiguous row, and a transposing butterfly leaves
-each row's total in one lane. Weights are read before the programmatic
-dependency wait; activations and state after it.
+each row's total in one lane. Weights, the checkpoint and the convolution
+history are read before the programmatic dependency wait (none is written by
+the previous launch); the projection's rows after it.
 """
 
 from __future__ import annotations
@@ -55,6 +61,7 @@ from cutlass import BFloat16, Float16, Float32, Int32, Int64, const_expr, cute
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 from quack.compile_utils import make_fake_tensor
+from tokenspeed_kernel.ops.attention.kda import KdaOutputNorm
 from tokenspeed_kernel.ops.attention.kda._cute_dsl.recoverssm_verify import (
     GATE_FLOOR,
     _asm,
@@ -158,16 +165,18 @@ class FusedVerifyStep:
         capacity: int,
         bounded_gate: bool,
         has_metadata: bool,
+        gated_norm: bool,
     ) -> None:
         self.key_dim = self.value_dim = self.gate_rank = THREADS
         self.heads = heads
         self.capacity = capacity
         self.bounded_gate = bounded_gate
         self.has_metadata = has_metadata
+        self.gated_norm = gated_norm
         self.width = heads * THREADS
         # The checkpoint, then raw keys, raw queries, decays and values, then
-        # the three cross-warp norm partials; 128 bytes cover the mbarrier.
-        self.smem_bytes = 4 * (THREADS * THREADS + 4 * THREADS + 3 * WARPS) + 128
+        # the four cross-warp sum partials; 128 bytes cover the mbarrier.
+        self.smem_bytes = 4 * (THREADS * THREADS + 4 * THREADS + 4 * WARPS) + 128
 
     @cute.jit
     def __call__(
@@ -189,7 +198,10 @@ class FusedVerifyStep:
         state_indices: cute.Tensor,
         metadata: cute.Tensor | None,
         stamps: cute.Tensor | None,
+        gate: cute.Tensor | None,
+        norm_weight: cute.Tensor | None,
         lower_bound: Float32,
+        norm_eps: Float32,
         stream: CUstream,
     ):
         metadata_ptr = None
@@ -197,6 +209,13 @@ class FusedVerifyStep:
         if const_expr(self.has_metadata):
             metadata_ptr = metadata.iterator
             stamps_ptr = stamps.iterator
+        gate_ptr = None
+        norm_weight_ptr = None
+        gate_token_stride = Int64(0)
+        if const_expr(self.gated_norm):
+            gate_ptr = gate.iterator
+            norm_weight_ptr = norm_weight.iterator
+            gate_token_stride = gate.stride[0]
         self.kernel(
             qkv.iterator,
             conv_weights.iterator,
@@ -215,7 +234,10 @@ class FusedVerifyStep:
             state_indices.iterator,
             metadata_ptr,
             stamps_ptr,
+            gate_ptr,
+            norm_weight_ptr,
             lower_bound,
+            norm_eps,
             qkv.stride[0],
             conv_states.stride[0],
             f_a.stride[0],
@@ -230,6 +252,7 @@ class FusedVerifyStep:
             key_gate.stride[2],
             original.stride[0],
             out.stride[0],
+            gate_token_stride,
         ).launch(
             grid=[state_indices.shape[0], self.heads, 1],
             block=[THREADS, 1, 1],
@@ -258,7 +281,10 @@ class FusedVerifyStep:
         state_indices,
         metadata,
         stamps,
+        norm_gate,
+        norm_weight,
         lower_bound: Float32,
+        norm_eps: Float32,
         qkv_token_stride: Int64,
         conv_page_stride: Int64,
         f_a_token_stride: Int64,
@@ -273,6 +299,7 @@ class FusedVerifyStep:
         key_gate_position_stride: Int64,
         original_token_stride: Int64,
         out_token_stride: Int64,
+        gate_token_stride: Int64,
     ):
         K = self.key_dim
         V = self.value_dim
@@ -299,7 +326,7 @@ class FusedVerifyStep:
             Float32, cute.make_layout((V,)), byte_alignment=16
         )
         partials = smem.allocate_tensor(
-            Float32, cute.make_layout((3 * WARPS,)), byte_alignment=16
+            Float32, cute.make_layout((4 * WARPS,)), byte_alignment=16
         )
         barrier = smem.allocate_array(Int64, num_elems=1)
         tile_addr = Int32(tile.iterator.toint())
@@ -323,10 +350,13 @@ class FusedVerifyStep:
             _prefetch_l2(head_f_b.toint(), K * self.gate_rank * 2)
         gate_scale = _exp(_load(a_log, head).to(Float32))
         gate_bias = _load(dt_bias, head * K + tidx).to(Float32)
+        norm_scale = Float32(0.0)
+        if const_expr(self.gated_norm):
+            norm_scale = _load(norm_weight, tidx).to(Float32)
 
-        cute.arch.griddepcontrol_wait()
-        cute.arch.griddepcontrol_launch_dependents()
-
+        # The batch layout, the checkpoint and the convolution history were
+        # written before this forward, not by the previous launch: the
+        # checkpoint copy and the history loads overlap the projection too.
         token_start = Int64(_load(query_start_loc, request))
         valid = Int32(Int64(_load(query_start_loc, request + 1)) - token_start)
         page = Int64(_load(state_indices, request))
@@ -343,23 +373,30 @@ class FusedVerifyStep:
                 _bulk_load(
                     tile_addr, tile_src.toint(), V * K * 4, Int32(barrier.toint())
                 )
+        # Padding pages see a zero history, as the split producer's do.
+        history = conv_states + page * conv_page_stride
+        channels = [q_channel, k_channel, v_channel]
+        pasts = []
+        for c in cutlass.range_constexpr(3):
+            for i in cutlass.range_constexpr(CONV_TAPS - 1):
+                past = Float32(0.0)
+                if (valid > 0) & (page >= 0):
+                    past = _load(history, channels[c] * 3 + i).to(Float32)
+                pasts.append(past)
+
+        cute.arch.griddepcontrol_wait()
+        cute.arch.griddepcontrol_launch_dependents()
 
         if valid > 0:
-            # Convolution over the committed window and this row; padding pages
-            # see a zero history, as the split producer's do.
-            history = conv_states + page * conv_page_stride
+            # Convolution over the committed window and this row.
             row = qkv + token_start * qkv_token_stride
-            raw = [_load(row, channel) for channel in (q_channel, k_channel, v_channel)]
+            raw = [_load(row, channel) for channel in channels]
             taps = [q_taps, k_taps, v_taps]
-            channels = [q_channel, k_channel, v_channel]
             convolved = []
             for c in cutlass.range_constexpr(3):
                 acc = Float32(0.0)
                 for i in cutlass.range_constexpr(CONV_TAPS - 1):
-                    past = Float32(0.0)
-                    if page >= 0:
-                        past = _load(history, channels[c] * 3 + i).to(Float32)
-                    acc = acc + past * taps[c][i]
+                    acc = acc + pasts[c * (CONV_TAPS - 1) + i] * taps[c][i]
                 acc = acc + raw[c].to(Float32) * taps[c][CONV_TAPS - 1]
                 convolved.append(_bf16(_silu(acc)))
             query, key_value, value = convolved
@@ -470,6 +507,26 @@ class FusedVerifyStep:
                 # Lane l now holds value row 32 w + l, thread tidx's own channel.
                 corrected = (values[tidx] - key_scale * key_total) * beta_gate
                 output = query_scale * query_total + output_coeff * corrected
+                if const_expr(self.gated_norm):
+                    # The norm kernel's math on the BF16 output: x rsqrt(mean
+                    # x^2 + eps) w sigmoid(gate), multiplied left to right.
+                    output = _bf16(output)
+                    logit = _load(
+                        norm_gate, token_start * gate_token_stride + head * V + tidx
+                    ).to(Float32)
+                    square = cute.arch.warp_reduction_sum(output * output)
+                    if lane == 0:
+                        partials[3 * WARPS + warp] = square
+                    cute.arch.barrier()
+                    total = (
+                        partials[3 * WARPS]
+                        + partials[3 * WARPS + 1]
+                        + partials[3 * WARPS + 2]
+                        + partials[3 * WARPS + 3]
+                    )
+                    inverse_rms = _rsqrt(_div(total, Float32(V)) + norm_eps)
+                    sigmoid = _div(Float32(1.0), Float32(1.0) + _exp(-logit))
+                    output = output * inverse_rms * norm_scale * sigmoid
                 dst = out + (token_start * out_token_stride + head * V + tidx)
                 _store_if(Int32(1), dst.toint(), output, True)
                 entry = correction + (
@@ -491,6 +548,7 @@ def _compile(
     capacity: int,
     bounded_gate: bool,
     has_metadata: bool,
+    norm_dtype: torch.dtype | None,
     beta_dtype: torch.dtype,
     param_dtype: torch.dtype,
     bias_dtype: torch.dtype,
@@ -525,7 +583,13 @@ def _compile(
     if has_metadata:
         metadata = make_fake_tensor(Int64, (batch, 3))
         stamps = make_fake_tensor(Int64, (slots, capacity, 2))
-    kernel = FusedVerifyStep(heads, capacity, bounded_gate, has_metadata)
+    gate = norm_weight = None
+    if norm_dtype is not None:
+        gate = make_fake_tensor(BFloat16, (tokens, heads * value_dim))
+        norm_weight = make_fake_tensor(_DTYPES[norm_dtype], (value_dim,))
+    kernel = FusedVerifyStep(
+        heads, capacity, bounded_gate, has_metadata, norm_dtype is not None
+    )
     return cute.compile(
         kernel,
         qkv,
@@ -545,6 +609,9 @@ def _compile(
         state_indices,
         metadata,
         stamps,
+        gate,
+        norm_weight,
+        Float32(0.0),
         Float32(0.0),
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
@@ -659,6 +726,34 @@ def _check_records(
         )
 
 
+def _check_output_norm(
+    output_norm: KdaOutputNorm | None, out: torch.Tensor, head_dim: int
+) -> None:
+    """Raise ValueError unless the output norm is laid out as the kernel reads it.
+
+    The gate must be BF16 ``[tokens, heads * head_dim]`` like ``out`` with unit
+    inner stride, and the weight a dense ``[head_dim]`` vector, both on the
+    output's device.
+    """
+    if output_norm is None:
+        return
+    gate, weight = output_norm.gate, output_norm.weight
+    if (
+        gate.shape != out.shape
+        or gate.dtype != torch.bfloat16
+        or gate.stride(-1) != 1
+        or weight.shape != (head_dim,)
+        or not weight.is_contiguous()
+        or weight.dtype not in _DTYPES
+        or gate.device != out.device
+        or weight.device != out.device
+    ):
+        raise ValueError(
+            "the output norm needs a BF16 [tokens, heads * head_dim] gate with "
+            "unit inner stride and a dense [head_dim] weight"
+        )
+
+
 def fused_verify_step(
     mixed_qkv: torch.Tensor,
     conv_weights: torch.Tensor,
@@ -680,6 +775,7 @@ def fused_verify_step(
     out: torch.Tensor,
     record_metadata: torch.Tensor | None,
     record_stamps: torch.Tensor | None,
+    output_norm: KdaOutputNorm | None,
 ) -> torch.Tensor:
     """Run one-token record verify with the gate and convolution producers fused.
 
@@ -709,20 +805,23 @@ def fused_verify_step(
             records, though their pre-convolution rows are still retained.
         num_heads: Per-rank head count.
         head_dim: Head width; 128.
-        out: ``[tokens, num_heads * head_dim]`` BF16 verify output; written.
+        out: ``[tokens, num_heads * head_dim]`` BF16 verify output, or with
+            ``output_norm`` its gated RMSNorm; written.
         record_metadata: ``[batch, 3]`` int64 record slot, generation and
             start position per request, or None to record request r at slot
             r, position 0.
         record_stamps: ``[slots, capacity, 2]`` int64 start and generation of
             each record position, written with ``record_metadata``; else None.
+        output_norm: The layer's gated output RMSNorm to apply before the
+            store, or None to store the verify output.
 
     Returns:
         ``out``.
 
     Raises:
-        ValueError: If ``fused_verify_step_supported`` rejects the inputs, or
-            the record metadata and stamps are not dense INT64 views of the
-            record layout.
+        ValueError: If ``fused_verify_step_supported`` rejects the inputs, the
+            record metadata and stamps are not dense INT64 views of the record
+            layout, or the output norm's gate or weight are laid out otherwise.
     """
     if mixed_qkv.shape[0] == 0:
         return out
@@ -744,12 +843,14 @@ def fused_verify_step(
     _check_records(
         record_metadata, record_stamps, state_indices.shape[0], correction_cache
     )
+    _check_output_norm(output_norm, out, head_dim)
     bounded = lower_bound is not None
     kernel = _compile(
         num_heads,
         correction_cache.shape[2],
         bounded,
         record_metadata is not None,
+        None if output_norm is None else output_norm.weight.dtype,
         beta_logits.dtype,
         A_log.dtype,
         dt_bias.dtype,
@@ -774,6 +875,9 @@ def fused_verify_step(
         state_indices,
         record_metadata,
         record_stamps,
+        None if output_norm is None else output_norm.gate,
+        None if output_norm is None else output_norm.weight,
         float(lower_bound) if bounded else 0.0,
+        0.0 if output_norm is None else float(output_norm.eps),
     )
     return out

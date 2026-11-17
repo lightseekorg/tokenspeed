@@ -62,6 +62,8 @@ import pytest
 
 ts = pytest.importorskip("tokenspeed_scheduler")
 
+from conftest import _event  # noqa: E402
+
 P = 8
 HISTORY = "full_attention"
 STATES = ("linear_attention_0", "linear_attention_1")
@@ -90,6 +92,7 @@ def _config(
     cfg.debug_force_retraction_interval = force_retraction_interval
     cfg.max_scheduled_tokens = 48
     cfg.max_batch_size = 6
+    cfg.max_resident_requests = cfg.max_batch_size
     cfg.enable_l3_storage = False
     # A Host tier states what feeds it; Validate refuses what it cannot run.
     cfg.disable_l2_cache = host_pages == 0
@@ -133,14 +136,6 @@ def _config(
     ]
     cfg.cache_groups = groups
     return cfg
-
-
-def _event(kind: str, request_id: str, **fields):
-    event = getattr(ts.ForwardEvent, kind)()
-    event.request_id = request_id
-    for name, value in fields.items():
-        setattr(event, name, value)
-    return event
 
 
 class _Loop:
@@ -477,11 +472,6 @@ def test_random_closed_loop_never_raises(role: str, seed: int) -> None:
     ],
 )
 @pytest.mark.parametrize("host_pages", [9, 17, 33])
-@pytest.mark.skip(
-    reason="A request within MaxSingleRequestTokens can stall alone: placement "
-    "fills holes beside cached pages of a packed group, which the dense-packing "
-    "capacity bound does not count, so the loop may not drain."
-)
 def test_random_host_acks_leave_nothing_in_flight(
     policy: str,
     role: str,

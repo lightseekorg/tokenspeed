@@ -138,21 +138,25 @@ def cluster_boundary_supported(
     """
     if not _CUTE_AVAILABLE:
         return False
-    if stream.ndim != 2 or branch.ndim != 2:
+    if stream.ndim != 2:
         return False
     rows, width = stream.shape
     if branch_sentinel is None:
         if branch.shape != stream.shape or branch_ranks != 1:
             return False
-    elif branch_ranks < 1 or branch.shape[1] != width * branch_ranks:
+    elif branch.ndim != 3 or branch_ranks < 1 or branch.shape[1] != rows:
         return False
-    elif branch.shape[0] < rows:
+    elif branch.shape[0] * branch.shape[2] != width * branch_ranks:
         return False
-    # A mailbox needs whole 32-bit words per thread.
+    elif not _power_of_two(branch.shape[2]) or _mailbox_capacity(branch) < rows:
+        return False
+    # A mailbox needs whole 32-bit words per thread, within one block.
     quantum = CLUSTER_CTAS * CTA_THREADS * (1 if branch_sentinel is None else 2)
     if not 1 <= rows <= CLUSTER_BOUNDARY_MAX_ROWS:
         return False
     if width % quantum or not _power_of_two(width):
+        return False
+    if branch_sentinel is not None and branch.shape[2] % (width // quantum * 2):
         return False
     if stream.dtype != torch.float32 or branch.dtype != torch.bfloat16:
         return False
@@ -169,9 +173,20 @@ def cluster_boundary_supported(
         return False
     if not stream.is_cuda or branch.device != stream.device:
         return False
-    if not stream.is_contiguous() or not branch.is_contiguous():
+    if not stream.is_contiguous():
+        return False
+    if branch_sentinel is None and not branch.is_contiguous():
         return False
     return stream.data_ptr() % _PTR_ALIGN == 0 and branch.data_ptr() % _PTR_ALIGN == 0
+
+
+def _mailbox_capacity(branch: torch.Tensor) -> int:
+    """Rows of each block of a ``[blocks, rows, block_width]`` mailbox view, or 0 if the view is not block-major."""
+    blocks, _, block_width = branch.shape
+    capacity = branch.stride(0) // block_width
+    if branch.stride() != (capacity * block_width, block_width, 1):
+        return 0
+    return capacity
 
 
 def _compiled(
@@ -186,6 +201,7 @@ def _compiled(
     enable_pdl: bool,
     mailbox_sentinel: int | None,
     mailbox_ranks: int,
+    mailbox_shape: tuple[int, int, int] | None,
 ) -> Callable[..., None]:
     key = (
         device.index,
@@ -199,6 +215,7 @@ def _compiled(
         enable_pdl,
         mailbox_sentinel,
         mailbox_ranks,
+        mailbox_shape,
     )
 
     def build() -> Callable[..., None]:
@@ -213,17 +230,22 @@ def _compiled(
             enable_pdl,
             mailbox_sentinel,
             mailbox_ranks,
+            0 if mailbox_shape is None else mailbox_shape[1],
+            0 if mailbox_shape is None else mailbox_shape[2],
         )
         rows = cute.sym_int()
         f32_rows = _fake(cutlass.Float32, (rows, width))
         bf16_rows = _fake(cutlass.BFloat16, (rows, width))
-        # A mailbox has its own capacity, unrelated to the batch, and one
-        # partial per rank in each row.
-        branch_rows = (
-            bf16_rows
-            if mailbox_sentinel is None
-            else _fake(cutlass.BFloat16, (cute.sym_int(), width * mailbox_ranks))
-        )
+        # A mailbox view keeps its blocks' capacity as the block stride.
+        branch_rows = bf16_rows
+        if mailbox_shape is not None:
+            blocks, capacity, block_width = mailbox_shape
+            branch_rows = make_fake_tensor(
+                cutlass.BFloat16,
+                (blocks, rows, block_width),
+                (capacity * block_width, block_width, 1),
+                assumed_align=_PTR_ALIGN,
+            )
         f32_vec = _fake(cutlass.Float32, (width,))
         bf16_vec = _fake(cutlass.BFloat16, (width,))
         return cute.compile(
@@ -336,12 +358,13 @@ def cute_dsl_post_norm_residual_pre_norm(
         if has_pre
         else None
     )
-    # An absent weight is never read, so an existing BF16 row stands in, as in Triton.
+    # An absent weight or output is never touched, so existing BF16 elements stand in, as in Triton.
+    stand_in = branch.as_strided((rows, width), (width, 1))
     post_has_weight = post_weight is not None
     if post_weight is None:
-        post_weight = branch[0, :width]
+        post_weight = stand_in[0]
     if pre_weight is None:
-        pre_weight = branch[0, :width]
+        pre_weight = stand_in[0]
     compiled = _compiled(
         width,
         stream.device,
@@ -354,6 +377,11 @@ def cute_dsl_post_norm_residual_pre_norm(
         enable_pdl,
         branch_sentinel,
         branch_ranks,
+        (
+            None
+            if branch_sentinel is None
+            else (branch.shape[0], _mailbox_capacity(branch), branch.shape[2])
+        ),
     )
     # The launch goes to the current context, so bind the operands' device.
     with torch.cuda.device(stream.device):
@@ -366,7 +394,7 @@ def cute_dsl_post_norm_residual_pre_norm(
             to_cute(pre_weight, _PTR_ALIGN),
             to_cute(out_stream, _PTR_ALIGN),
             to_cute(pre_fp32 if has_pre else out_stream, _PTR_ALIGN),
-            to_cute(pre_bf16 if has_pre else branch[:, :width], _PTR_ALIGN),
+            to_cute(pre_bf16 if has_pre else stand_in, _PTR_ALIGN),
             rows,
             _stream(stream.device),
         )

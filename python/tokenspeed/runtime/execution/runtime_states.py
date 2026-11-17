@@ -122,13 +122,15 @@ class RuntimeStates:
         # (--enable-speculative-sampling), see init_draft_probs.
         self.draft_probs: torch.Tensor | None = None
         self.draft_probs_sentinel: float = 0.0
+        # Token id of draft_probs column 0: this rank's shard start when it holds its columns only.
+        self.draft_probs_vocab_start: int = 0
         # Draft trees (init_draft_trees): next round's parents next to its tokens.
         self.chain_parents: torch.Tensor | None = None
         self.future_parent_map: torch.Tensor | None = None
         self.future_draft_q: DraftTreeQ | None = None
         # Each slot's StopCriteria (bind_stop_criteria), read by the sampling
         # epilogue that cuts verify rounds where the request ends
-        # (apply_stop_conditions), and the request that last bound them.
+        # (apply_stop_conditions), and the admission that last bound them.
         self.stop_token_ids = torch.full(
             (req_pool_size + 1, MAX_STOP_TOKEN_IDS),
             -1,
@@ -141,7 +143,7 @@ class RuntimeStates:
             dtype=torch.int32,
             device=device,
         )
-        self._stop_criteria_owners: list[str | None] = [None] * (req_pool_size + 1)
+        self._stop_criteria_owners: list[int | None] = [None] * (req_pool_size + 1)
         # True once a slot's request ended on the device. A forward dispatched
         # behind the one that ended it (the overlap schedule) runs the slot as
         # a padding row: its state rows read nothing and write nothing
@@ -150,13 +152,20 @@ class RuntimeStates:
         self.stopped = torch.zeros(req_pool_size + 1, dtype=torch.bool, device=device)
 
     def init_draft_probs(
-        self, *, spec_num_tokens: int, reject_threshold: float
+        self,
+        *,
+        spec_num_tokens: int,
+        reject_threshold: float,
+        shard: tuple[int, int] | None = None,
     ) -> None:
         """Allocate the drafter's recorded proposal distributions.
 
         ``draft_probs[slot, s]`` (fp32 ``[pool + 1, spec_num_tokens, vocab]``)
         is the distribution the chain drafter sampled its step-``s`` token
         from, which the next round verifies as candidate column ``s + 1``.
+        With ``shard`` (this rank's vocabulary shard: its first token id and
+        its column count) each rank holds the distribution over its own
+        columns only, ``[pool + 1, spec_num_tokens, columns]``.
         Rows start at the sentinel ``reject_threshold + 1``: a slot whose
         drafter has not recorded this round (fresh admission, PD landing)
         rejects every candidate and samples its first token from the full
@@ -172,8 +181,10 @@ class RuntimeStates:
             )
         pool_size = self.valid_cache_lengths.shape[0]
         self.draft_probs_sentinel = float(reject_threshold) + 1.0
+        vocab_start, columns = shard or (0, self.vocab_size)
+        self.draft_probs_vocab_start = vocab_start
         self.draft_probs = torch.full(
-            (pool_size, spec_num_tokens, self.vocab_size),
+            (pool_size, spec_num_tokens, columns),
             self.draft_probs_sentinel,
             dtype=torch.float32,
             device=self.device,
@@ -420,13 +431,13 @@ class RuntimeStates:
         return slot_state_image_bytes(self.slot_state_rows(0))
 
     def export_slot_state(
-        self, slot: int, out: torch.Tensor, stream, *, request_id: str
+        self, slot: int, out: torch.Tensor, stream, *, admission_id: int
     ) -> None:
-        del request_id
+        del admission_id
         pack_slot_rows(self.slot_state_rows(slot), out, stream)
 
     def import_slot_state(
-        self, slot: int, src: torch.Tensor, stream, *, request_id: str
+        self, slot: int, src: torch.Tensor, stream, *, admission_id: int
     ) -> None:
         # The restored row is the request's next-step input in full, and the
         # imaged ``spec_candidates_ready`` says whether its candidate columns
@@ -436,8 +447,12 @@ class RuntimeStates:
         # ``decode_input_id`` (no forward of its own is in flight), and the
         # prologue verifies that id single-token exactly when the bit is
         # False -- the unretracted step would have done the same.
-        del request_id
+        del admission_id
         unpack_slot_rows(self.slot_state_rows(slot), src, stream)
+        # An image may predate the first stop binding (a remote landing).
+        # Rebind the admission's canonical criteria before its next forward,
+        # without resetting the restored running state.
+        self._stop_criteria_owners[slot] = None
 
     def reset_states(
         self,
@@ -467,25 +482,28 @@ class RuntimeStates:
 
     def bind_stop_criteria(
         self,
-        request_ids: Sequence[str],
+        admission_ids: Sequence[int],
         request_pool_indices: Sequence[int],
         stop_criteria: Sequence[StopCriteria],
     ) -> None:
-        """Write the stop criteria of every slot whose request changed.
+        """Write the stop criteria of every slot whose admission changed.
 
         Runs on the stream the forward runs on, ahead of it; a slot keeps its
-        rows while the same request holds it (a restore images them).
+        rows while the same admission holds it. Restore invalidates the
+        binding so even an image taken before first use gets canonical criteria.
+        Criteria are fixed at admission; reusing a public request ID creates
+        a new admission even when its criteria happen to be equal.
         """
-        if len(stop_criteria) != len(request_ids):
+        if len(stop_criteria) != len(admission_ids):
             raise ValueError(
-                f"{len(stop_criteria)} stop criteria for {len(request_ids)} requests"
+                f"{len(stop_criteria)} stop criteria for {len(admission_ids)} requests"
             )
         changed = [
             i
-            for i, (request_id, slot) in enumerate(
-                zip(request_ids, request_pool_indices, strict=True)
+            for i, (admission_id, slot) in enumerate(
+                zip(admission_ids, request_pool_indices, strict=True)
             )
-            if self._stop_criteria_owners[slot] != request_id
+            if self._stop_criteria_owners[slot] != admission_id
         ]
         if not changed:
             return
@@ -504,7 +522,7 @@ class RuntimeStates:
             ids = criteria.stop_token_ids
             token_ids[row, : len(ids)] = torch.tensor(ids, dtype=torch.int32)
             limits[row] = criteria.token_limit
-            self._stop_criteria_owners[request_pool_indices[i]] = request_ids[i]
+            self._stop_criteria_owners[request_pool_indices[i]] = admission_ids[i]
         slots = slots.to(self.device, non_blocking=True)
         self.stop_token_ids.index_copy_(
             0, slots, token_ids.to(self.device, non_blocking=True)

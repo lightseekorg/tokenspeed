@@ -436,7 +436,8 @@ def test_k8s_dispatch_lists_every_supported_ci_yaml():
 
 def test_kernel_ut_tasks_cover_every_test_once_per_runner():
     # NVIDIA runners split the kernel suite across part-i, part-ii and the
-    # post-submit task; AMD runs it in a single task.
+    # post-submit task; AMD splits it across the base task and the two
+    # part-amd tasks.
     root = REPO_ROOT / "tokenspeed-kernel/test"
     files = {
         path
@@ -446,7 +447,14 @@ def test_kernel_ut_tasks_cover_every_test_once_per_runner():
     assert files
     tasks = [
         load_yaml(REPO_ROOT / f"test/ci/ut/ut-tokenspeed-kernel{suffix}.yaml")
-        for suffix in ("-part-i", "-part-ii", "-post-submit", "")
+        for suffix in (
+            "-part-i",
+            "-part-ii",
+            "-post-submit",
+            "",
+            "-part-amd-gfx950",
+            "-part-amd-ops",
+        )
     ]
     labels = {label for task in tasks for label in task["runner"]["labels"]}
     # Pin the runner set so dropping a runner from every task fails here.
@@ -1480,7 +1488,7 @@ def test_mi450_installers_receive_shared_stack(tmp_path, task_name, case):
         f"{mi450_env_dump_command()} > setup-env.json\n"
         f"exit {73 if case == 'setup-failure' else 0}\n"
     )
-    (scripts / "install_deps_rocm.sh").write_text(
+    (scripts / "install_kernel_deps_rocm.sh").write_text(
         'test "$WORKSPACE" = "$PWD" || exit 1\n'
         'test "$GFX_ARCH" = gfx1250 || exit 1\n'
         f"{mi450_env_dump_command()} > deps-env.json\n"

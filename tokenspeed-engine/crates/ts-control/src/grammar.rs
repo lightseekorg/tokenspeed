@@ -34,6 +34,7 @@ use ts_grammar::{CompiledGrammar, Compiler, GrammarKind, Matcher, TokenizerInfo}
 use ts_wire::SamplingParams;
 
 use crate::codec::{Reader, Writer};
+use crate::json_framing::{JsonFraming, MessageBoundary};
 
 /// Tokens a matcher can undo (`MAX_ROLLBACK_TOKENS`).
 const MAX_ROLLBACK_TOKENS: i32 = 200;
@@ -60,6 +61,9 @@ pub struct GrammarConfig {
     /// Timeouts a grammar is retried after before it is given up on
     /// (`--grammar-compile-max-retries`).
     pub max_retries: u32,
+    /// How the model frames a JSON answer in protocol tokens; `None` unless
+    /// its reasoning parser frames JSON answers.
+    pub json_framing: Option<JsonFraming>,
 }
 
 /// How a request's JSON schema waits for the model's reasoning block
@@ -83,31 +87,40 @@ pub struct ReasoningGrammar {
     /// A tool-block opener that ends reasoning without the closing marker;
     /// excluded from reasoning usage like the explicit markers.
     pub implicit_closer: Option<i32>,
+    /// For a model whose generated blocks carry their own message headers
+    /// (Inkling2): where a prompt may end, in place of `markers`.
+    pub boundary: Option<MessageBoundary>,
 }
 
 impl ReasoningGrammar {
     /// Constrain only the answer after the reasoning block to the request's
     /// JSON schema, with the tag for how `prompt` leaves the block. A schema
-    /// that is not JSON stays as it is, for the compiler to refuse.
-    pub fn defer_schema(&self, params: &mut SamplingParams, prompt: &[i32]) {
+    /// that is not JSON stays as it is, for the compiler to refuse. A prompt
+    /// that ends where no answer can follow (`boundary`) is the request's
+    /// error.
+    pub fn defer_schema(&self, params: &mut SamplingParams, prompt: &[i32]) -> Result<(), String> {
         let Some(schema) = params.json_schema.take() else {
-            return;
+            return Ok(());
         };
         if serde_json::from_str::<serde_json::Value>(&schema).is_err() {
             params.json_schema = Some(schema);
-            return;
+            return Ok(());
         }
-        // The prompt opened the block when the last marker in it is the
-        // opener.
-        let opened = self.markers.is_none_or(|(open, close)| {
-            prompt.iter().rev().find(|&&id| id == open || id == close) == Some(&open)
-        });
+        let opened = match &self.boundary {
+            Some(boundary) => boundary.opens_answer(prompt)?,
+            // The prompt opened the block when the last marker in it is the
+            // opener.
+            None => self.markers.is_none_or(|(open, close)| {
+                prompt.iter().rev().find(|&&id| id == open || id == close) == Some(&open)
+            }),
+        };
         let tag = if opened {
             &self.continues
         } else {
             &self.may_open
         };
         params.structural_tag = Some(tag.replacen(&self.schema_slot, &schema, 1));
+        Ok(())
     }
 }
 
@@ -255,6 +268,7 @@ fn compile(
     compiler: &Compiler,
     key: &GrammarKey,
     any_whitespace: bool,
+    json_framing: Option<&JsonFraming>,
 ) -> Result<CompiledGrammar, String> {
     let failed = |error: ts_grammar::Error| format!("RuntimeError: {error}");
     match key.kind {
@@ -276,6 +290,13 @@ fn compile(
             .map_err(failed),
         "structural_tag" => {
             let tag = structural_tag(&key.source)?;
+            if let Some(framing) = json_framing {
+                if let Some((framed, starts_in_json)) = framing.frame(&tag)? {
+                    return compiler
+                        .compile_framed_answer(&framed, starts_in_json, framing.guard.clone())
+                        .map_err(failed);
+                }
+            }
             compiler
                 .compile(GrammarKind::StructuralTag, &tag, any_whitespace)
                 .map_err(failed)
@@ -343,6 +364,7 @@ impl Grammars {
         for worker in 0..COMPILE_WORKERS {
             let (compiler, shared, queue) = (compiler.clone(), shared.clone(), queue.clone());
             let any_whitespace = config.any_whitespace;
+            let json_framing = config.json_framing.clone();
             thread::Builder::new()
                 .name(format!("ts-grammar-{worker}"))
                 .spawn(move || loop {
@@ -357,7 +379,7 @@ impl Grammars {
                     {
                         *started_at = Some(Instant::now());
                     }
-                    let compiled = compile(&compiler, &key, any_whitespace);
+                    let compiled = compile(&compiler, &key, any_whitespace, json_framing.as_ref());
                     let mut state = shared.lock().expect("grammar cache lock");
                     // A timeout may have replaced the entry meanwhile; a
                     // finished compile still wins, as `record_timeout`
@@ -576,6 +598,7 @@ mod tests {
             any_whitespace: true,
             compile_timeout,
             max_retries,
+            json_framing: None,
         })
         .unwrap()
     }

@@ -538,14 +538,23 @@ class TestLmHeadMapping:
         with pytest.raises(ValueError, match="attention TP group"):
             Mapping(rank=0, world_size=4, attn_tp_size=4, lm_head_tp_size=8)
 
-    def test_under_dp_needs_attention_tp_1(self):
-        with pytest.raises(ValueError, match="attention TP 1"):
+    @pytest.mark.parametrize("rank", range(8))
+    @pytest.mark.parametrize("head_tp", [1, 2, 4, 8])
+    def test_under_dp_with_attention_tp(self, rank, head_tp):
+        mapping = Mapping(
+            rank=rank,
+            world_size=8,
+            attn_tp_size=2,
+            attn_dp_size=4,
+            lm_head_tp_size=head_tp,
+        )
+        assert mapping.lm_head.tp_size == head_tp
+        assert mapping.lm_head.tp_rank == rank % head_tp
+
+    def test_head_groups_must_align_with_attention_groups(self):
+        with pytest.raises(ValueError, match="tile each other"):
             Mapping(
-                rank=0,
-                world_size=8,
-                attn_tp_size=2,
-                attn_dp_size=4,
-                lm_head_tp_size=8,
+                rank=0, world_size=12, attn_tp_size=4, attn_dp_size=3, lm_head_tp_size=6
             )
 
     def test_must_tile_the_stage(self):

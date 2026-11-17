@@ -86,6 +86,7 @@ class _Harness:
             is_draft=False,
             speculative_num_draft_tokens=draft_tokens,
             max_bs=max_bs,
+            max_resident_requests=max_bs,
             components=(spec,),
         )
         self.config = config
@@ -750,7 +751,7 @@ def test_replay_planning_matches_allocation_and_rejects_drift():
     )
     assert planned_bytes == allocated_bytes
     server_args = SimpleNamespace(speculative_num_draft_tokens=T)
-    config = SimpleNamespace(max_bs=8, qcp_size=1)
+    config = SimpleNamespace(max_bs=8, max_resident_requests=8, qcp_size=1, kvp_size=1)
     backend = HybridLinearAttnBackend(
         AttentionBackend(harness.config, harness.config.components[0]),
         harness.backend,
@@ -1615,9 +1616,12 @@ def test_record_decode_preserves_raw_gate_bias_and_layer_subset(
             )
 
 
+@pytest.mark.parametrize("checkpoint", [False, True])
 @pytest.mark.parametrize("draft_tokens", [None, 4])
-def test_mixed_decode_commit_matches_separate_forwards(draft_tokens):
+def test_mixed_decode_commit_matches_separate_forwards(draft_tokens, checkpoint):
     # Prefill consumes the full cache field, including every per-rank head.
+    # With ``checkpoint`` the extend row also stores its state 128 tokens in,
+    # into a third block, as an EXTEND forward of it alone does.
     class _FullWidthHarness(_Harness):
         H = 12
 
@@ -1625,8 +1629,9 @@ def test_mixed_decode_commit_matches_separate_forwards(draft_tokens):
     reference = _FullWidthHarness(
         draft_tokens=draft_tokens, eager_replay=True, seed=941
     )
-    width, prompt = actual.width, 3
+    width, prompt = actual.width, 200 if checkpoint else 3
     pages = {group: [2 + 2 * i, 3 + 2 * i] for i, group in enumerate(_STATE_GROUPS)}
+    stores = {group: 8 + i for i, group in enumerate(_STATE_GROUPS)}
     inputs = {
         name: value[: prompt + width]
         for name, value in actual.inputs(prompt + width, 943).items()
@@ -1641,6 +1646,11 @@ def test_mixed_decode_commit_matches_separate_forwards(draft_tokens):
             group: np.asarray([[0, page] for page in ids[:bs]], dtype=np.int32)
             for group, ids in pages.items()
         }
+        if checkpoint:
+            tables = {
+                group: np.column_stack((rows, [stores[group], -1][:bs]))
+                for group, rows in tables.items()
+            }
         harness.backend.init_forward_metadata(
             bs,
             1,
@@ -1655,6 +1665,9 @@ def test_mixed_decode_commit_matches_separate_forwards(draft_tokens):
             extend_replay_lens_cpu=prefix_cpu,
             extend_prompt_lens_cpu=new_cpu,
             extend_with_prefix=False,
+            extend_state_checkpoint_lens_cpu=torch.tensor(
+                [128 if checkpoint else 0], dtype=torch.int32
+            ),
             query_shard=None,
         )
 
@@ -1724,6 +1737,10 @@ def test_mixed_decode_commit_matches_separate_forwards(draft_tokens):
         expected = torch.cat((prefill, decode.reshape(-1, actual.H, D)))
         torch.testing.assert_close(output, expected, atol=2e-3, rtol=2e-3)
         for component in ("conv_state", "recurrent_state"):
+            stored = actual.pool.get_component(layer, component)[
+                stores[actual.pool.state_group_by_layer[layer]]
+            ]
+            assert bool(stored.any()) == checkpoint
             torch.testing.assert_close(
                 actual.pool.get_component(layer, component),
                 reference.pool.get_component(layer, component),
@@ -1732,12 +1749,13 @@ def test_mixed_decode_commit_matches_separate_forwards(draft_tokens):
             )
 
 
-def test_standard_decode_fuses_producers_and_commits_like_split(monkeypatch):
-    """One-token decode projects the gate and convolves inside verify, as split would."""
+@pytest.mark.parametrize("draft_tokens", [None, T])
+def test_verify_fuses_producers_and_commits_like_split(monkeypatch, draft_tokens):
+    """Verify projects the gate and convolves inside its kernel, as split would."""
     import tokenspeed.runtime.layers.attention.backends.state.kda as kda_backend
 
-    fused = _Harness(draft_tokens=None, eager_replay=True, seed=1201)
-    split = _Harness(draft_tokens=None, eager_replay=True, seed=1201)
+    fused = _Harness(draft_tokens=draft_tokens, eager_replay=True, seed=1201)
+    split = _Harness(draft_tokens=draft_tokens, eager_replay=True, seed=1201)
     if not fused.backend._verify_split_producers:
         pytest.skip("split verify producers unavailable")
     convolutions = []
@@ -1753,14 +1771,14 @@ def test_standard_decode_fuses_producers_and_commits_like_split(monkeypatch):
         group_id: [2 + group * len(rpis) + i for i in range(len(rpis))]
         for group, group_id in enumerate(_STATE_GROUPS)
     }
-    seq_lens = [9] * len(rpis)
-    accepted = torch.ones(len(rpis), dtype=torch.int32, device=DEV)
+    width = fused.width
+    seq_lens = [8 + width] * len(rpis)
+    accepted = [1, width]
     for round_index in range(3):
         outputs = {}
         for name, harness in (("fused", fused), ("split", split)):
             with monkeypatch.context() as patch:
                 if name == "split":
-                    # The arrangement multi-token windows still use.
                     patch.setattr(
                         kda_backend,
                         "kda_fused_paged_verify_fuses_producers",
@@ -1770,7 +1788,10 @@ def test_standard_decode_fuses_producers_and_commits_like_split(monkeypatch):
                 outputs[name] = harness.forward(
                     harness.inputs(len(rpis), 1300 + round_index), len(rpis)
                 )
-                harness.backend.commit_verified_state(accepted, accepted_path=None)
+                harness.backend.commit_verified_state(
+                    torch.tensor(accepted, dtype=torch.int32, device=DEV),
+                    accepted_path=None,
+                )
         for got, want in zip(outputs["fused"], outputs["split"]):
             # The gate projection may round one raw gate a BF16 step apart.
             torch.testing.assert_close(
@@ -1779,7 +1800,7 @@ def test_standard_decode_fuses_producers_and_commits_like_split(monkeypatch):
                 atol=1e-3 * want.float().abs().max().item(),
                 rtol=2.0**-7,
             )
-        seq_lens = [length + 1 for length in seq_lens]
+        seq_lens = [length + count for length, count in zip(seq_lens, accepted)]
     # Only the split harness ran the separate convolution producer.
-    assert convolutions == [1] * (3 * len(split.layer_ids))
+    assert convolutions == [width] * (3 * len(split.layer_ids))
     _assert_committed_pages_equal(fused, split, pages)

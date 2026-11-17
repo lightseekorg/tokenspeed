@@ -53,6 +53,17 @@ from dataclasses import asdict, dataclass, field
 # never write the same cache line.
 REGION_ALIGN_PAIRS = 32
 
+# Production poll bound: check every ~0.5 ms and trap after about 59 s. The
+# timeout is POLL_TIMEOUT_MANTISSA << shift ticks of the 100 MHz clock: the
+# mantissa is fixed, so the bound is one compile-time shift.
+POLL_TIMEOUT_MANTISSA = 11
+DEFAULT_POLL_CHECK = 4096
+DEFAULT_POLL_TIMEOUT_SHIFT = 29
+
+
+def _aligned(pairs: int) -> int:
+    return -(-pairs // REGION_ALIGN_PAIRS) * REGION_ALIGN_PAIRS
+
 
 @dataclass(frozen=True)
 class Stage:
@@ -90,6 +101,26 @@ class Plan:
             ``r // chain``. A request's state carries from token to token.
         external: Regions the host fills before the launch (for example in a
             test that runs a suffix of a layer's stages).
+        world: Ranks that run the plan together (a tensor-parallel group).
+            Every rank runs the same plan, so the deadlock rule holds across
+            ranks too: the earliest unfinished stage on any rank reads only
+            regions that earlier stages on every rank have written.
+        peers: Regions that other ranks write (``Mailbox.put_peer``). A peer
+            region holds two copies that alternate by launch: a rank can
+            start its next launch while another rank still reads this one,
+            but it cannot get two launches ahead, because finishing the next
+            launch needs every rank's part of it.
+        flags: The peer regions whose pairs are flags
+            (``Mailbox.raise_flag_peers``: exactly ``(tag << 32) | 1``).
+            ``raise_flag_peers`` and ``Mailbox.poll_flags`` on a peer region
+            require it, so a host that stands in for absent ranks (the layer
+            bench) knows which pairs to write with that payload.
+        poll_check: Retries between realtime clock checks in tagged polls.
+            Omission selects the production interval (4096 retries).
+        poll_timeout_shift: Poll timeout in 100 MHz ticks is
+            ``POLL_TIMEOUT_MANTISSA << shift``.
+            Omission selects the production bound (29, about 59 seconds).
+            Both bounds are compile-time choices included in the plan key.
     """
 
     grid: int
@@ -98,6 +129,11 @@ class Plan:
     rows: int
     chain: int
     external: tuple[str, ...] = ()
+    world: int = 1
+    peers: tuple[str, ...] = ()
+    flags: tuple[str, ...] = ()
+    poll_check: int = DEFAULT_POLL_CHECK
+    poll_timeout_shift: int = DEFAULT_POLL_TIMEOUT_SHIFT
     # __post_init__ derives these fields: the pairs of one row of every
     # region, and the pair offset of each region in row 0.
     row_pairs: int = field(init=False)
@@ -109,18 +145,33 @@ class Plan:
             if name in offsets:
                 raise ValueError(f"duplicate mailbox region {name!r}")
             offsets[name] = offset
-            offset += -(-pairs // REGION_ALIGN_PAIRS) * REGION_ALIGN_PAIRS
+            copies = 2 if name in self.peers else 1
+            offset += copies * _aligned(pairs)
         object.__setattr__(self, "_offsets", offsets)
         object.__setattr__(self, "row_pairs", offset)
         self._check()
 
     def _check(self) -> None:
+        if not 1 <= self.poll_check <= 0xFFFFFFFF:
+            raise ValueError("poll_check must fit a positive uint32")
+        if not 0 <= self.poll_timeout_shift <= 56:
+            raise ValueError("poll_timeout_shift must be between 0 and 56 (int64 ns)")
         if self.rows < 1:
             raise ValueError("a plan serves one row at least")
         if self.chain < 1 or self.rows % self.chain:
             raise ValueError(
                 f"{self.rows} rows are not requests of {self.chain} tokens"
             )
+        if self.world < 1:
+            raise ValueError("a plan runs on one rank at least")
+        unknown = [r for r in self.peers if r not in self._offsets]
+        if unknown:
+            raise ValueError(f"unknown peer regions {unknown}")
+        if self.peers and self.world == 1:
+            raise ValueError("peer regions need a plan of more than one rank")
+        not_peers = [r for r in self.flags if r not in self.peers]
+        if not_peers:
+            raise ValueError(f"flag regions {not_peers} are not peer regions")
         written = set(self.external)
         names = set()
         for stage in self.stages:
@@ -163,6 +214,11 @@ class Plan:
             rows=self.rows,
             chain=self.chain,
             external=tuple(dict.fromkeys(external)),
+            world=self.world,
+            peers=self.peers,
+            flags=self.flags,
+            poll_check=self.poll_check,
+            poll_timeout_shift=self.poll_timeout_shift,
         )
 
     def stage(self, name: str) -> Stage:
@@ -178,8 +234,23 @@ class Plan:
         return any(stage.name == name for stage in self.stages)
 
     def offset(self, region: str) -> int:
-        """Pair offset of row 0 of ``region`` in the scratch buffer."""
+        """Pair offset of row 0 of ``region`` in the scratch buffer (copy 0
+        of a peer region)."""
         return self._offsets[region]
+
+    def is_peer(self, region: str) -> bool:
+        """Whether other ranks write ``region``."""
+        return region in self.peers
+
+    def is_flag(self, region: str) -> bool:
+        """Whether peer region ``region`` holds flags (``flags``)."""
+        return region in self.flags
+
+    def peer_copy(self, region: str) -> int:
+        """Pairs between the two copies of peer region ``region``."""
+        if region not in self.peers:
+            raise ValueError(f"{region} is not a peer region")
+        return _aligned(dict(self.regions)[region])
 
     @property
     def scratch_pairs(self) -> int:
@@ -196,6 +267,11 @@ class Plan:
             "rows": self.rows,
             "chain": self.chain,
             "external": self.external,
+            "world": self.world,
+            "peers": self.peers,
+            "flags": self.flags,
+            "poll_check": self.poll_check,
+            "poll_timeout_shift": self.poll_timeout_shift,
         }
         return PlanKey(json.dumps(fields, separators=(",", ":")), self)
 

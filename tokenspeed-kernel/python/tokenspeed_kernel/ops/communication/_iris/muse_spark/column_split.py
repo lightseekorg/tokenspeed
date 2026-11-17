@@ -134,7 +134,7 @@ def iris_pull_allgather_sorted_mxfp4_slices(
                 mask,
             )
     # The next gate/up GEMM may overwrite the slices once every peer is done.
-    WAIT_VMEM(args=[], constraints="=r,~{memory}")
+    WAIT_VMEM()
     gl.barrier()
     _iris_rendezvous(
         ready_flags + FLAG_ROWS * WORLD_SIZE,
@@ -215,7 +215,7 @@ def iris_column_routed_rmsnorm_sum_return(
         gl.amd.cdna4.buffer_store(
             squares, partial_squares, token * 8 + slots, cache=".wt"
         )
-    WAIT_STORES(args=[], constraints="=r,~{memory}")
+    WAIT_STORES()
     gl.barrier()
     _iris_rendezvous(flags, heaps, program, epoch, RANK, NUM_WARPS, False)
 
@@ -238,7 +238,7 @@ def iris_column_routed_rmsnorm_sum_return(
         gl.amd.cdna4.buffer_store(
             combined.to(gl.bfloat16), slices, token * COLUMNS + columns, cache=".wt"
         )
-    WAIT_STORES(args=[], constraints="=r,~{memory}")
+    WAIT_STORES()
     gl.barrier()
     _iris_rendezvous(
         flags + FLAG_ROWS * WORLD_SIZE, heaps, program, epoch, RANK, NUM_WARPS, False
@@ -268,7 +268,7 @@ def iris_column_routed_rmsnorm_sum_return(
                 destination + ((RANK + step) % WORLD_SIZE) * COLUMNS,
             )
     # Peers rewrite both exchange buffers on their next call.
-    WAIT_VMEM(args=[], constraints="=r,~{memory}")
+    WAIT_VMEM()
     gl.barrier()
     _iris_rendezvous(
         flags + 2 * FLAG_ROWS * WORLD_SIZE,

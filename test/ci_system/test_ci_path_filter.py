@@ -107,6 +107,7 @@ def test_shared_paths_require_every_group(path):
         "tokenspeed-kernel/python/requirements/rocm.txt",
         "tokenspeed-kernel/benchmarks/amd/unknown.json",
         "test/ci_system/install_deps_rocm.sh",
+        "test/ci_system/install_kernel_deps_rocm.sh",
         "test/ci_system/verify_rocm_stack.py",
         f"{KERNEL}/ops/attention/mha/gluon.py",
         f"{KERNEL}/ops/attention/dsv41/_gluon/indexer.py",
@@ -164,6 +165,11 @@ def test_unclassified_amd_paths_keep_both_full_suites(path):
 )
 def test_simulator_scripts_select_only_mi450(name):
     assert required_groups(f"test/ci_system/{name}") == {"amd-mi450"}
+
+
+def test_the_digest_test_needs_no_runner_group():
+    # The lint workflow runs it on every pull request.
+    assert required_groups("test/ci_system/test_mi450_sim_report_digest.py") == set()
 
 
 @pytest.mark.parametrize(

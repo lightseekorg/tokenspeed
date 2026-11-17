@@ -31,6 +31,10 @@ namespace tokenspeed {
 struct RequestSpec {
     std::string request_id;
     std::string session_id;
+    // Shared cache owner for independent sessions; empty preserves session ownership.
+    std::string cache_group_id;
+    // Remote checkpoint discovery only; content is always rehashed locally.
+    std::vector<std::int32_t> shared_prefix_tokens;
     std::vector<std::int32_t> tokens;
     std::int32_t max_new_tokens{0};
     // Upper bound on the prompt prefix the first admission's probe may claim
@@ -50,7 +54,8 @@ struct RequestSpec {
 // `already_scheduled_len + extend_len` regardless of replay_len.
 struct PrefillInfo {
     std::span<const std::int32_t> input_ids;
-    std::vector<std::int32_t> shifted_input_ids;
+    // Borrowed prompt suffix; missing positions are padded by ForwardBatch.
+    std::span<const std::int32_t> shifted_input_ids;
     std::int32_t already_scheduled_len{0};
     std::int32_t extend_len{0};
     std::int32_t replay_len{0};

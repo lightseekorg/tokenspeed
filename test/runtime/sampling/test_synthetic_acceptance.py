@@ -89,7 +89,9 @@ def test_unsupported_backend_rejects_synthetic_acceptance():
         _SUPPORTS_SYNTHETIC_ACCEPTANCE = False
 
     UnsupportedBackend(_config(None, 4, 4, "cpu"))
-    with pytest.raises(ValueError, match="requires the greedy sampling backend"):
+    with pytest.raises(
+        ValueError, match="requires the greedy or sonic sampling backend"
+    ):
         UnsupportedBackend(_config(2.6, 4, 4, "cpu"))
 
 
@@ -233,7 +235,7 @@ def test_greedy_verify_and_cuda_graph_replay(al, natural_length):
         params.append(sp)
 
     def prepare():
-        backend.prepare_step(rids, list(range(5)), params, 4)
+        backend.prepare_step(list(range(1, len(rids) + 1)), list(range(5)), params, 4)
         if al is not None:
             backend.limit_synthetic_acceptance(
                 torch.tensor([True, False, False, False], device="cuda"), 1

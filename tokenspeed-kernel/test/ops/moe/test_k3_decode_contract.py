@@ -107,7 +107,7 @@ def _attention_supports(**overrides) -> bool:
     return attention_supports(**{**ATTENTION_SERVED, **overrides})
 
 
-@pytest.mark.parametrize("rows", [6288, 3648], ids=["kda", "mla"])
+@pytest.mark.parametrize("rows", [6288, 3648, 3808], ids=["kda", "mla", "dsa"])
 def test_the_kimi_k3_tp8_attention_layers_are_served(rows):
     assert _attention_supports(projection_rows=rows)
 

@@ -38,6 +38,7 @@ from tokenspeed_kernel.ops.communication._iris.all_reduce import (
 )
 from tokenspeed_kernel.ops.communication.iris import _PRODUCER_DIRECT_GL_DTYPES
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.warmup import kernel_launcher, register_triton_warmup
 
 hip_utils = triton.language.extra.hip.utils
 
@@ -137,7 +138,7 @@ class IrisAllGather:
                 == self.producer.data.data_ptr()
                 + self.producer.peers.rank * local_hidden_size * tensor.element_size()
             )
-            iris_pull_allgather_columns[(num_programs,)](
+            kernel_launcher(iris_pull_allgather_columns, (num_programs,))(
                 local,
                 self.producer.data,
                 output[start : start + chunk_rows],
@@ -171,6 +172,22 @@ def column_gather_num_warps(local_bytes: int, world_size: int) -> int:
     if world_size == 8 and local_bytes >= _COLUMN_GATHER_TWO_SUBGROUP_MIN_BYTES:
         return 2
     return 1
+
+
+def _column_gather_variants(args) -> tuple[dict, ...]:
+    """Both subgroup counts the payload size picks; only one row is published."""
+    subgroup = args["BLOCK_WORDS"] // (args["NUM_WARPS"] * args["WORDS_PER_LANE"])
+    sets = []
+    for warps in (1, 2) if args["WORLD_SIZE"] == 8 else (1,):
+        sets.append(
+            {
+                "NUM_WARPS": (warps,),
+                "num_warps": (warps,),
+                "BLOCK_WORDS": (subgroup * warps * args["WORDS_PER_LANE"],),
+                "INPUT_PUBLISHED": (False, True) if warps == 1 else (False,),
+            }
+        )
+    return tuple(sets)
 
 
 def all_gather_columns_can_run(
@@ -359,7 +376,7 @@ def iris_pull_allgather_rows(
         + 1
     )
     if PRODUCER_WRITES_THROUGH:
-        WAIT_VMEM(args=[], constraints="=r,~{memory}")
+        WAIT_VMEM()
         gl.barrier()
         _iris_rendezvous(ready_flags, heaps, program, epoch, RANK, NUM_WARPS, False)
     else:
@@ -378,7 +395,7 @@ def iris_pull_allgather_rows(
             )
             gl.amd.cdna4.buffer_store(values, output, destination, mask)
     # The next producer may reuse the owner scratch.
-    WAIT_VMEM(args=[], constraints="=r,~{memory}")
+    WAIT_VMEM()
     gl.barrier()
     _iris_rendezvous(
         ready_flags + FLAG_ROWS * WORLD_SIZE,
@@ -443,7 +460,7 @@ def iris_fused_pull_allgather_rmsnorm_mxfp4(
         # s_waitcnt vmcnt(0) cover only its own subgroup's stores. So each
         # subgroup first waits until its stores reach L2 (s_waitcnt vmcnt(0)
         # on gfx950).
-        WAIT_STORES(args=[], constraints="=r,~{memory}")
+        WAIT_STORES()
 
     epoch_ptr = ready_flags + row * WORLD_SIZE + rank
     ready_epoch = gl.atomic_add(epoch_ptr, 1, sem="release", scope="sys") + 1
@@ -688,7 +705,7 @@ def iris_fused_lamport_allgather_rmsnorm_mxfp4(
         )
 
     # Finish clearing the consumed packs before advancing the row's stages.
-    WAIT_STORES(args=[], constraints="=r,~{memory}")
+    WAIT_STORES()
     for tile in gl.static_range(TILES):
         gl.store(epochs + row * TILES + tile, ((stages[tile] + 1) % 3).to(gl.int32))
 
@@ -816,7 +833,10 @@ def iris_fused_lamport_allgather_rmsnorm(
     gl.store(output + row * total_width + columns, values.to(gl.bfloat16))
 
     # Finish every wave's clears before advancing the row's stages.
-    WAIT_STORES(args=[], constraints="=r,~{memory}")
+    WAIT_STORES()
     gl.barrier()
     for tile in gl.static_range(TILES):
         gl.store(epochs + row * TILES + tile, ((stages[tile] + 1) % 3).to(gl.int32))
+
+
+register_triton_warmup(iris_pull_allgather_columns, variants=_column_gather_variants)

@@ -71,6 +71,8 @@ def test_hybrid_moe_dispatches_from_actual_topk_format(
 ) -> None:
     layer = MoELayer.__new__(MoELayer)
     torch.nn.Module.__init__(layer)
+    # Resident expert weights: no peer-weight reader to hold during apply.
+    layer.peer_weights = None
     layer.plan = {
         "support_routing": True,
         "supports_precomputed_topk": True,

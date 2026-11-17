@@ -12,7 +12,8 @@
 # HELP tokenspeed:kv_transfer_latency_seconds Wall time of one KV cache transfer send to a peer.
 # HELP tokenspeed:kv_transfer_size_bytes_total Bytes one KV cache transfer send moved to a peer.
 # HELP tokenspeed:kv_transfer_timeouts_total KV transfers that timed out, by transfer stage.
-# HELP tokenspeed:num_capacity_aborted_requests_total Requests the scheduler aborted because a capacity retraction could not image its victim (retraction snapshot pool, image rows or Host L2 exhausted); clients may resubmit them. Forced retractions from --debug-force-retraction-interval aborted the same way count too.
+# HELP tokenspeed:num_capacity_aborted_requests_total Requests the scheduler aborted because a capacity retraction could not image its victim (retraction snapshot pool, image rows or Host L2 exhausted), or because a lone request made no progress for 4096 consecutive scheduler plans; clients may resubmit them. Forced retractions from --debug-force-retraction-interval aborted the same way count too.
+# HELP tokenspeed:num_decode_kv_wait_reqs Decode requests waiting for the prefill peer's KV: admitted with destination pages held, with no schedulable work.
 # HELP tokenspeed:num_decode_prealloc_queue_reqs Decode requests waiting for their prefill peer to connect.
 # HELP tokenspeed:num_decode_transfer_queue_reqs Decode requests whose KV a transfer still pins.
 # HELP tokenspeed:num_free_tokens KV tokens not held by active requests (empty plus evictable).
@@ -20,7 +21,8 @@
 # HELP tokenspeed:num_preemptions_total Requests preempted by a capacity retraction: the scheduler suspended a resident request (its pages imaged to the Host snapshot pool; it later resumes by restore, nothing is recomputed) to free Device pages for a blocked admission. One increment per retraction victim per round, counted from the plan's snapshot-store ops; forced retractions from --debug-force-retraction-interval count too. A retraction whose victim cannot be imaged aborts it instead — see tokenspeed:num_capacity_aborted_requests.
 # HELP tokenspeed:num_prefill_inflight_queue_reqs Prefill requests whose KV a transfer still pins.
 # HELP tokenspeed:num_prefill_prealloc_queue_reqs Prefill requests waiting for their decode peer to connect.
-# HELP tokenspeed:num_requests_running Requests with scheduler-side generation state (decode path).
+# HELP tokenspeed:num_requests_inflight Requests admitted and not finished, including PD transfer and waiting states.
+# HELP tokenspeed:num_requests_running Requests in the scheduler's running batch: prefill, prefill-done, and decode rows.
 # HELP tokenspeed:num_requests_waiting Requests waiting in the C++ scheduler queue.
 # HELP tokenspeed:num_retracted_queue_reqs Requests suspended with a retraction image.
 # HELP tokenspeed:num_used_tokens KV tokens held by resident pages (active plus reclaimable).
@@ -51,6 +53,7 @@
 # TYPE tokenspeed:kv_transfer_size_bytes_total counter
 # TYPE tokenspeed:kv_transfer_timeouts_total counter
 # TYPE tokenspeed:num_capacity_aborted_requests_total counter
+# TYPE tokenspeed:num_decode_kv_wait_reqs gauge
 # TYPE tokenspeed:num_decode_prealloc_queue_reqs gauge
 # TYPE tokenspeed:num_decode_transfer_queue_reqs gauge
 # TYPE tokenspeed:num_free_tokens gauge
@@ -58,6 +61,7 @@
 # TYPE tokenspeed:num_preemptions_total counter
 # TYPE tokenspeed:num_prefill_inflight_queue_reqs gauge
 # TYPE tokenspeed:num_prefill_prealloc_queue_reqs gauge
+# TYPE tokenspeed:num_requests_inflight gauge
 # TYPE tokenspeed:num_requests_running gauge
 # TYPE tokenspeed:num_requests_waiting gauge
 # TYPE tokenspeed:num_retracted_queue_reqs gauge
@@ -141,6 +145,7 @@ tokenspeed:kv_transfer_size_bytes_total{app_key="",model_name="m"} 4096.0
 tokenspeed:kv_transfer_timeouts_total{app_key="",model_name="m",stage="bootstrapping"} 1.0
 tokenspeed:kv_transfer_timeouts_total{app_key="",model_name="m",stage="waiting_for_input"} 1.0
 tokenspeed:num_capacity_aborted_requests_total{app_key="",dp_rank="0",model_name="m"} 1.0
+tokenspeed:num_decode_kv_wait_reqs{app_key="",dp_rank="0",model_name="m"} 2.0
 tokenspeed:num_decode_prealloc_queue_reqs{app_key="",dp_rank="0",model_name="m"} 3.0
 tokenspeed:num_decode_transfer_queue_reqs{app_key="",dp_rank="0",model_name="m"} 4.0
 tokenspeed:num_free_tokens{app_key="",dp_rank="0",model_name="m"} 517.0
@@ -148,6 +153,7 @@ tokenspeed:num_nan_aborted_requests_total{app_key="",dp_rank="0",model_name="m"}
 tokenspeed:num_preemptions_total{app_key="",dp_rank="0",model_name="m"} 2.0
 tokenspeed:num_prefill_inflight_queue_reqs{app_key="",dp_rank="0",model_name="m"} 2.0
 tokenspeed:num_prefill_prealloc_queue_reqs{app_key="",dp_rank="0",model_name="m"} 1.0
+tokenspeed:num_requests_inflight{app_key="",dp_rank="0",model_name="m"} 4.0
 tokenspeed:num_requests_running{app_key="",dp_rank="0",model_name="m"} 1.0
 tokenspeed:num_requests_waiting{app_key="",dp_rank="0",model_name="m"} 0.0
 tokenspeed:num_retracted_queue_reqs{app_key="",dp_rank="0",model_name="m"} 1.0

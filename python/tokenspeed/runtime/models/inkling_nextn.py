@@ -252,6 +252,7 @@ class InklingForConditionalGenerationNextN(nn.Module):
             tp_rank=mapping.attn.tp_rank,
             tp_size=mapping.attn.tp_size,
             tp_group=mapping.attn.tp_group,
+            attn_tp_size=mapping.attn.tp_size,
             dp_lm_head_tp=False,
         )
 

@@ -62,11 +62,13 @@ enum class PublicationPoint {
 // point may publish the live state only when allow_state_checkpoint is true.
 // A retained in-forward checkpoint is published whenever its frontier has been
 // reached, independently of the live-state policy. The returned spans view
-// cache_progress, which must outlive their use.
+// cache_progress, which must outlive their use. Without publish_to_cache
+// (SchedulerConfig::PublishesCompletedPages: nothing would reuse the pages) it
+// hashes nothing and states only the computed tokens.
 RequestProgress AdvanceRequestProgress(const Request& request, fsm::CacheProgress& cache_progress,
                                        std::int32_t num_computed_tokens, std::int32_t prefix_granularity,
                                        bool stream_completed_to_host, PublicationPoint point,
-                                       bool allow_state_checkpoint, bool preserve_source_blocks);
+                                       bool allow_state_checkpoint, bool preserve_source_blocks, bool publish_to_cache);
 
 // A scheduling attempt advances its request's cache progress in place; unless
 // the attempt commits, the advance is undone when this goes out of scope. The

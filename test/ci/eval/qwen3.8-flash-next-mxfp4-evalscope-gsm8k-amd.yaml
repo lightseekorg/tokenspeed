@@ -12,7 +12,6 @@ model_sources:
   - python/tokenspeed/runtime/models/qwen3_vision.py
   - python/tokenspeed/runtime/models/qwen4_exp.py
   - python/tokenspeed/runtime/models/qwen4_exp_monokernel.py
-  - python/tokenspeed/runtime/models/qwen4_exp_nextn.py
 runner:
   labels:
     - amd-mi35x-2gpu-test

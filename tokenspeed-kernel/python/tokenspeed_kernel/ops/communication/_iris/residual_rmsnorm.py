@@ -254,7 +254,7 @@ def _iris_residual_rmsnorm_chunk(
             )
         # The restored markers must land before any peer can see the reduced
         # row: that is its permission to reuse this slot.
-        WAIT_STORES(args=[], constraints="=r,~{memory}")
+        WAIT_STORES()
         gather_offset = gather_ptr.to(gl.uint64) - local_base
         for delta in gl.static_range(0, WORLD_SIZE):
             peer = (RANK + delta) % WORLD_SIZE

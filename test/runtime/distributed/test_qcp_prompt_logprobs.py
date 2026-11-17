@@ -199,6 +199,7 @@ def _run(rank: int, port: int, logprob_order: str) -> None:
         tp_rank=rank,
         tp_size=WORLD,
         tp_group=group,
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
     # No symmetric-memory multicast on CPU: the vocab gather is the collective.

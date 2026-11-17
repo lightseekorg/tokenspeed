@@ -29,7 +29,8 @@ from typing import Any
 import torch
 import torch.nn as nn
 from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.ops.quantization import try_output_fp8_quant_pack
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
 from tokenspeed.runtime.configs.qwen3_5_config import (
     Qwen3_5Config,
@@ -47,6 +48,7 @@ from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.attention.linear.layernorm_gated import (
     RMSNorm as RMSNormGated,
 )
+from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
 
 # Layers - Others
 from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
@@ -70,7 +72,14 @@ from tokenspeed.runtime.layers.parameter import (
     PerTensorScaleParameter,
 )
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
-from tokenspeed.runtime.layers.quantization.utils import check_equal_or_regex_match
+from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
+from tokenspeed.runtime.layers.quantization.modelopt_mixed import ModelOptMixedConfig
+from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
+from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
+from tokenspeed.runtime.layers.quantization.utils import (
+    check_equal_or_regex_match,
+    should_exclude_quant_module,
+)
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.model_loader.weight_utils import (
@@ -104,9 +113,50 @@ from tokenspeed.runtime.utils import (
     make_layers,
     set_weight_attrs,
 )
-from tokenspeed.runtime.utils.env import envs
+from tokenspeed.runtime.utils.cuda_stream import StreamFork
+from tokenspeed.runtime.utils.env import envs, global_server_args_dict
 
 logger = logging.getLogger(__name__)
+
+
+def _get_attn_proj_quant_config(
+    quant_config: QuantizationConfig | None,
+    prefix: str,
+    *,
+    enabled: bool,
+) -> QuantizationConfig | None:
+    """Convert floating projection weights while keeping checkpoint quantization."""
+    if not enabled or isinstance(quant_config, Fp8Config):
+        return quant_config
+    if isinstance(quant_config, ModelOptMixedConfig):
+        if quant_config.is_quantized_layer(prefix):
+            return quant_config
+    elif isinstance(quant_config, Nvfp4Config):
+        if not should_exclude_quant_module(prefix, quant_config.exclude_modules):
+            return quant_config
+    elif isinstance(quant_config, Mxfp4Config):
+        if (
+            quant_config.use_dynamic_mxfp4_activations
+            or quant_config.fp8_override_route(prefix) is not None
+        ):
+            return quant_config
+    elif quant_config is not None:
+        return quant_config
+    return Fp8Config(
+        is_checkpoint_fp8_serialized=False,
+        activation_scheme="dynamic",
+        weight_block_size=[128, 128],
+    )
+
+
+def _uses_packed_fp8_output(projection: RowParallelLinear) -> bool:
+    method = projection.quant_method
+    return (
+        isinstance(method, Fp8LinearMethod)
+        and method.block_quant
+        and method.quant_config.weight_block_size[1] == 128
+        and projection.weight_scale_inv.dtype == torch.int32
+    )
 
 
 def _gdn_group_unquantized(prefix, shard_names, quant_config) -> bool:
@@ -158,11 +208,11 @@ def _input_norm(
     residual: torch.Tensor | None,
     fp8_scale: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
-    """The layer-opening add + norm, plus a static-FP8 copy for ``fp8_scale``'s projection.
+    """Layer-opening add + norm, with an optional static-FP8 copy.
 
-    Past the first layer, without attention TP and with the fused layer boundary, one
-    kernel adds, normalizes and quantizes; otherwise the communication policy runs the
-    norm and the projection quantizes for itself.
+    With a residual, no attention TP, and a fused layer boundary, a static scale
+    lets the norm also write an FP8 copy. Other layer boundaries use the
+    communication policy to run the norm.
     """
     if (
         residual is None
@@ -207,9 +257,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         layer_id: int,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        alt_stream: torch.cuda.Stream | None = None,
+        *,
+        enable_fp8_attn_proj: bool,
     ) -> None:
         super().__init__()
         self.config = config
+        self.enable_fp8_attn_proj = enable_fp8_attn_proj
         self.mapping = mapping
         self.attn_tp_rank = mapping.attn.tp_rank
         self.attn_tp_size = mapping.attn.tp_size
@@ -241,13 +295,24 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
         self.conv1d.weight.data = self.conv1d.weight.data.unsqueeze(1)
 
-        qkvz_unquant = _gdn_group_unquantized(
-            prefix, ("in_proj_qkv", "in_proj_z"), quant_config
+        if (
+            not enable_fp8_attn_proj
+            and isinstance(quant_config, Fp8Config)
+            and not quant_config.is_checkpoint_fp8_serialized
+        ):
+            # Preserve the original online-FP8 behavior: GDN stays unquantized
+            # unless attention projection quantization is explicitly enabled.
+            quant_config = None
+        qkvz_prefix = add_prefix("in_proj_qkvz", prefix)
+        qkvz_config = _get_attn_proj_quant_config(
+            quant_config, qkvz_prefix, enabled=enable_fp8_attn_proj
         )
-        ba_unquant = _gdn_group_unquantized(
-            prefix, ("in_proj_b", "in_proj_a"), quant_config
-        )
-        self._split_in_proj = quant_config is not None and (qkvz_unquant != ba_unquant)
+        if _gdn_group_unquantized(prefix, ("in_proj_qkv", "in_proj_z"), qkvz_config):
+            qkvz_config = None
+        ba_config = quant_config
+        if _gdn_group_unquantized(prefix, ("in_proj_b", "in_proj_a"), ba_config):
+            ba_config = None
+        self._split_in_proj = qkvz_config is not ba_config
         if self._split_in_proj:
             self.in_proj_qkvz = MergedColumnParallelLinear(
                 input_size=self.hidden_size,
@@ -258,11 +323,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     self.value_dim,
                 ],
                 bias=False,
-                quant_config=None if qkvz_unquant else quant_config,
+                quant_config=qkvz_config,
                 tp_rank=self.attn_tp_rank,
                 tp_size=self.attn_tp_size,
                 tp_group=self.attn_tp_group,
-                prefix=add_prefix("in_proj_qkvz", prefix),
+                prefix=qkvz_prefix,
             )
             self.in_proj_ba = MergedColumnParallelLinear(
                 input_size=self.hidden_size,
@@ -271,7 +336,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     self.num_v_heads,
                 ],
                 bias=False,
-                quant_config=None if ba_unquant else quant_config,
+                quant_config=ba_config,
                 tp_rank=self.attn_tp_rank,
                 tp_size=self.attn_tp_size,
                 tp_group=self.attn_tp_group,
@@ -280,8 +345,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             self._bind_packed_weight_loaders(self.in_proj_qkvz)
             self._bind_packed_weight_loaders(self.in_proj_ba)
         else:
-            # Both groups share the same quantization; a single fused linear is
-            # safe. qkvz_unquant == ba_unquant here.
+            # Both groups share the same quantization.
             self.in_proj_qkvzba = MergedColumnParallelLinear(
                 input_size=self.hidden_size,
                 output_sizes=[
@@ -293,7 +357,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     self.num_v_heads,
                 ],
                 bias=False,
-                quant_config=None if qkvz_unquant else quant_config,
+                quant_config=qkvz_config,
                 tp_rank=self.attn_tp_rank,
                 tp_size=self.attn_tp_size,
                 tp_group=self.attn_tp_group,
@@ -304,6 +368,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             ) // self.attn_tp_size
             self._ba_dim = (self.num_v_heads * 2) // self.attn_tp_size
             self._bind_packed_weight_loaders(self.in_proj_qkvzba)
+
+        self._ba_fork = StreamFork(alt_stream if self._split_in_proj else None)
 
         # Conv1d weight loader setup
         query_key_settings = (self.key_dim, 0, False)
@@ -363,17 +429,20 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
 
         # Output projection
+        out_prefix = add_prefix("out_proj", prefix)
         self.out_proj = RowParallelLinear(
             self.value_dim,
             self.hidden_size,
             bias=False,
             input_is_parallel=True,
             reduce_results=False,
-            quant_config=quant_config,
+            quant_config=_get_attn_proj_quant_config(
+                quant_config, out_prefix, enabled=enable_fp8_attn_proj
+            ),
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
             tp_group=self.attn_tp_group,
-            prefix=add_prefix("out_proj", prefix),
+            prefix=out_prefix,
         )
 
     @staticmethod
@@ -507,8 +576,18 @@ class Qwen3_5GatedDeltaNet(nn.Module):
     ):
         projection_input = hidden_states if hidden_fp8 is None else hidden_fp8
         if self._split_in_proj:
-            projected_states_qkvz, _ = self.in_proj_qkvz(projection_input)
-            projected_states_ba, _ = self.in_proj_ba(hidden_states)
+            main_stream = torch.cuda.current_stream(hidden_states.device)
+            # Events fork after input production and join before either output
+            # is consumed. PDL remains local to each stream, including in graphs.
+            with self._ba_fork.scope(enable=True, overlap=True) as fork:
+                with fork.branch():
+                    hidden_states.record_stream(
+                        torch.cuda.current_stream(hidden_states.device)
+                    )
+                    projected_states_ba, _ = self.in_proj_ba(hidden_states)
+                projected_states_qkvz, _ = self.in_proj_qkvz(projection_input)
+            # BA is allocated on aux but consumed on main after the join.
+            projected_states_ba.record_stream(main_stream)
             return projected_states_qkvz, projected_states_ba
         projected_all, _ = self.in_proj_qkvzba(projection_input)
         projected_states_qkvz, projected_states_ba = projected_all.split(
@@ -579,336 +658,97 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # Each head normalized on its own, rows kept whole (z may be a strided view).
         core_attn_out = core_attn_out.reshape(seq_len, -1)
         z = z.reshape(seq_len, -1)
+        if self.enable_fp8_attn_proj and _uses_packed_fp8_output(self.out_proj):
+            packed = try_output_fp8_quant_pack(
+                core_attn_out,
+                z,
+                self.norm.weight,
+                head_dim=self.head_v_dim,
+                eps=self.norm.eps,
+                sigmoid_gate=self.norm.sigmoid_gate,
+                enable_pdl=pdl_enabled(),
+            )
+            if packed is not None:
+                codes, scales = packed
+                output, _ = self.out_proj(codes, scale=scales)
+                return output
         core_attn_out = self.norm(core_attn_out, z)
         output, _ = self.out_proj(core_attn_out)
         return output
 
 
-class Qwen3_5LinearDecoderLayer(nn.Module):
-    """Qwen3.5 Decoder Layer with Linear Attention (GatedDeltaNet)."""
+def _qwen3_5_uses_sparse_moe(config: Qwen3_5TextConfig) -> bool:
+    """Qwen3.5 MLPs are dense in every layer; Qwen3.5-MoE uses sparse MoE blocks."""
+    if config.model_type == "qwen3_5_moe_text":
+        return True
+    if config.model_type == "qwen3_5_text":
+        return False
+    raise ValueError(f"Invalid model type: {config.model_type}")
 
-    def __init__(
-        self,
-        config: Qwen3_5TextConfig,
-        mapping: Mapping,
-        layer_id: int,
-        quant_config: QuantizationConfig | None = None,
-        prefix: str = "",
-        alt_stream: torch.cuda.Stream | None = None,
-    ) -> None:
-        super().__init__()
-        self.config = config
-        self.mapping = mapping
-        self.layer_id = layer_id
 
-        self.linear_attn = Qwen3_5GatedDeltaNet(
-            config, mapping, layer_id, quant_config, prefix=prefix
+def build_qwen3_5_mlp(
+    config: Qwen3_5TextConfig,
+    mapping: Mapping,
+    layer_id: int,
+    quant_config: QuantizationConfig | None,
+    alt_stream: torch.cuda.Stream | None,
+    prefix: str,
+    is_moe: bool,
+) -> nn.Module:
+    """A decoder layer's sparse MoE block or dense MLP under ``prefix``, the layer's."""
+    if is_moe:
+        return Qwen3_5MoeSparseMoeBlock(
+            config=config,
+            mapping=mapping,
+            quant_config=quant_config,
+            layer_index=layer_id,
+            alt_stream=alt_stream,
+            prefix=add_prefix("mlp", prefix),
         )
+    return Qwen3_5MoeMLP(
+        parallelism="dense",
+        mapping=mapping,
+        hidden_size=config.hidden_size,
+        intermediate_size=config.intermediate_size,
+        hidden_act=config.hidden_act,
+        quant_config=quant_config,
+        reduce_results=False,
+        prefix=add_prefix("mlp", prefix),
+    )
 
-        #  Determine the MLP type based on the model type
-        # Qwen3.5 use all layers for MLP / Qwen3.5-MoE use sparse MoE blocks
-        if config.model_type == "qwen3_5_moe_text":
-            self.mlp = Qwen3_5MoeSparseMoeBlock(
-                config=config,
-                mapping=self.mapping,
-                quant_config=quant_config,
-                layer_index=layer_id,
-                alt_stream=alt_stream,
-                prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
-            )
-            is_moe = True
-        elif config.model_type == "qwen3_5_text":
-            self.mlp = Qwen3_5MoeMLP(
-                parallelism="dense",
-                mapping=self.mapping,
-                hidden_size=config.hidden_size,
-                intermediate_size=config.intermediate_size,
-                hidden_act=config.hidden_act,
-                quant_config=quant_config,
-                reduce_results=False,
-                prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
-            )
-            is_moe = False
-        else:
-            raise ValueError(f"Invalid model type: {config.model_type}")
 
-        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = GemmaRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
+class Qwen3_5DecoderLayer(nn.Module):
+    """The norms, communication and MLP shared by both Qwen3.5 layer kinds.
 
-        self.is_moe = is_moe
-        self.comm_manager = CommManager(
+    A subclass builds its token mixer and supplies ``attention_fp8_scale`` and
+    ``attend``.
+    """
+
+    def _build_comm_manager(self) -> CommManager:
+        return CommManager(
             mapping=self.mapping,
             layer_id=self.layer_id,
-            is_moe=is_moe,
-            prev_is_moe=is_moe,
+            is_moe=self.is_moe,
+            prev_is_moe=self.is_moe,
             dense_batch_invariant=False,
             input_layernorm=self.input_layernorm,
             post_attn_layernorm=self.post_attention_layernorm,
             query_sharded=False,
         )
 
-    def forward(
+    def attention_fp8_scale(self) -> torch.Tensor | None:
+        """The static FP8 input scale of the mixer's input projection, if any."""
+        raise NotImplementedError
+
+    def attend(
         self,
+        positions: torch.Tensor | None,
         hidden_states: torch.Tensor,
-        residual: torch.Tensor | None,
-        ctx: ForwardContext,
-        aux_hidden_states: list[torch.Tensor] | None = None,
-        **kwargs,
-    ):
-        num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
-            ctx
-        )
-
-        hidden_fp4 = None
-        if not ctx.forward_mode.is_idle():
-            hidden_states, hidden_fp8, residual = _input_norm(
-                self.comm_manager,
-                self.input_layernorm,
-                hidden_states,
-                residual,
-                self.linear_attn.input_fp8_scale(),
-            )
-            capture_layer_input(self.comm_manager, residual, ctx, aux_hidden_states)
-            hidden_states = self.comm_manager.pre_attn_comm(hidden_states, ctx)
-
-            hidden_states = self.linear_attn(
-                hidden_states,
-                hidden_fp8,
-                ctx,
-            )
-            # Free the copy once consumed, as the projection frees its own quant.
-            del hidden_fp8
-
-            hidden_states, hidden_fp4, residual = _post_attn_norm(
-                self.comm_manager,
-                self.post_attention_layernorm,
-                hidden_states,
-                residual,
-                self.mlp.nvfp4_global_scale(),
-                ctx,
-            )
-        else:
-            # No rows, but the tap and its gather stay aligned across ranks.
-            capture_layer_input(
-                self.comm_manager, hidden_states, ctx, aux_hidden_states
-            )
-
-        hidden_states = self.forward_mlp(
-            hidden_states,
-            hidden_fp4,
-            residual,
-            ctx,
-            num_global_tokens,
-            max_num_tokens_per_gpu,
-        )
-
-        return hidden_states, residual
-
-    def forward_mlp(
-        self,
-        hidden_states,
-        hidden_fp4,
-        residual,
-        ctx: ForwardContext,
-        num_global_tokens,
-        max_num_tokens_per_gpu,
-    ):
-        if isinstance(self.mlp, Qwen3_5MoeSparseMoeBlock):
-            hidden_states = self.mlp(
-                hidden_states, num_global_tokens, max_num_tokens_per_gpu, ctx
-            )
-        else:
-            hidden_states = self.comm_manager.pre_mlp_comm(hidden_states, ctx)
-            hidden_states = self.mlp(hidden_states, hidden_fp4)
-            hidden_states, residual = self.comm_manager.post_mlp_fused(
-                hidden_states, residual, ctx
-            )
-        return hidden_states
-
-
-class Qwen3_5AttentionDecoderLayer(nn.Module):
-    """Qwen3.5 Decoder Layer with Full Attention."""
-
-    def __init__(
-        self,
-        config: Qwen3_5TextConfig,
-        mapping: Mapping,
-        layer_id: int,
-        quant_config: QuantizationConfig | None = None,
-        prefix: str = "",
-        alt_stream: torch.cuda.Stream | None = None,
-    ) -> None:
-        super().__init__()
-        self.config = config
-        self.mapping = mapping
-        self.hidden_size = config.hidden_size
-        self.attn_tp_rank = mapping.attn.tp_rank
-        self.attn_tp_size = mapping.attn.tp_size
-        self.attn_tp_group = mapping.attn.tp_group
-        self.total_num_heads = config.num_attention_heads
-        self.total_num_kv_heads = config.num_key_value_heads
-        validate_attention_partition(
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            self.attn_tp_size,
-        )
-        self.num_heads = self.total_num_heads // self.attn_tp_size
-        self.num_kv_heads = max(1, self.total_num_kv_heads // self.attn_tp_size)
-        self.head_dim = config.head_dim or (self.hidden_size // self.num_heads)
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim**-0.5
-        self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-
-        self.rope_scaling = get_rope_parameters(config)
-
-        self.rope_theta = self.rope_scaling.get("rope_theta", 10000)
-        self.partial_rotary_factor = self.rope_scaling.get("partial_rotary_factor", 1.0)
-        self.layer_id = layer_id
-
-        self.attn_output_gate = getattr(config, "attn_output_gate", True)
-        if self.attn_output_gate:
-            logger.warning_once("using attn output gate!")
-
-        self.rotary_emb = get_rope(
-            head_size=self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position=self.max_position_embeddings,
-            rope_scaling=self.rope_scaling,
-            base=self.rope_theta,
-            partial_rotary_factor=self.partial_rotary_factor,
-            is_neox_style=True,
-            dtype=torch.get_default_dtype(),
-        )
-
-        attn_quant_config = (
-            None
-            if quant_config and quant_config.get_name() == "nvfp4"
-            else quant_config
-        )
-
-        self.qkv_proj = QKVParallelLinear(
-            config.hidden_size,
-            self.head_dim,
-            self.total_num_heads * (1 + self.attn_output_gate),
-            self.total_num_kv_heads,
-            bias=False,
-            quant_config=attn_quant_config,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
-            tp_group=self.attn_tp_group,
-            prefix=add_prefix("qkv_proj", prefix),
-        )
-
-        self.o_proj = RowParallelLinear(
-            self.total_num_heads * self.head_dim,
-            config.hidden_size,
-            bias=False,
-            quant_config=attn_quant_config,
-            reduce_results=False,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
-            tp_group=self.attn_tp_group,
-            prefix=add_prefix("o_proj", prefix),
-        )
-
-        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.attn = PagedAttention(
-            self.num_heads,
-            self.head_dim,
-            self.scaling,
-            num_kv_heads=self.num_kv_heads,
-            layer_id=layer_id,
-            rotary_emb=self.rotary_emb,
-            qk_norm=(self.q_norm, self.k_norm),
-        )
-
-        # Dense MLP for non-MoE variant
-        if config.model_type == "qwen3_5_text":
-            self.mlp = Qwen3_5MoeMLP(
-                parallelism="dense",
-                mapping=self.mapping,
-                hidden_size=config.hidden_size,
-                intermediate_size=config.intermediate_size,
-                hidden_act=config.hidden_act,
-                quant_config=quant_config,
-                reduce_results=False,
-                prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
-            )
-            is_moe = False
-        elif config.model_type == "qwen3_5_moe_text":
-            self.mlp = Qwen3_5MoeSparseMoeBlock(
-                config=config,
-                mapping=self.mapping,
-                quant_config=quant_config,
-                layer_index=layer_id,
-                alt_stream=alt_stream,
-                prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
-            )
-            is_moe = True
-        else:
-            raise ValueError(f"Invalid model type: {config.model_type}")
-
-        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = GemmaRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-
-        self.is_moe = is_moe
-        self.comm_manager = CommManager(
-            mapping=self.mapping,
-            layer_id=self.layer_id,
-            is_moe=is_moe,
-            prev_is_moe=is_moe,
-            dense_batch_invariant=False,
-            input_layernorm=self.input_layernorm,
-            post_attn_layernorm=self.post_attention_layernorm,
-            query_sharded=False,
-        )
-
-    def _project_qkv(
-        self, hidden_states: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        """qkv_proj split into views; ``gate`` is ``None`` without ``attn_output_gate``."""
-        qkv, _ = self.qkv_proj(hidden_states)
-        if not self.attn_output_gate:
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            return q, k, v, None
-        q_gate, k, v = qkv.split([self.q_size * 2, self.kv_size, self.kv_size], dim=-1)
-        heads = q_gate.view(q_gate.shape[0], self.num_heads, 2, self.head_dim)
-        q, gate = heads.unbind(dim=2)
-        return q, k, v, gate
-
-    def _attn(
-        self,
-        positions: torch.Tensor,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        gate: torch.Tensor | None,
-        ctx: ForwardContext,
-        **kwargs,
-    ) -> torch.Tensor:
-        """Attention with the optional output gate; draft subclasses override."""
-        attn_output = self.attn(q, k, v, positions, ctx, **kwargs)
-        if gate is not None:
-            sigmoid_mul(attn_output, gate)
-        return attn_output
-
-    def self_attention(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+        hidden_fp8: torch.Tensor | None,
         ctx: ForwardContext,
     ) -> torch.Tensor:
-        """Full attention forward pass; ``hidden_states`` may be qkv_proj's FP8 copy, which only ``_project_qkv`` reads."""
-        q, k, v, gate = self._project_qkv(hidden_states)
-        attn_output = self._attn(positions, q, k, v, gate, ctx)
-        output, _ = self.o_proj(attn_output)
-        return output
+        """Run the token mixer on the normed rows or, when present, their FP8 copy."""
+        raise NotImplementedError
 
     def _maybe_narrow_residual(
         self,
@@ -918,15 +758,15 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         """Hook: subclasses narrow residual to match a sliced attn output."""
         return residual
 
-    def forward(
+    def forward_layer(
         self,
-        positions: torch.Tensor,
+        positions: torch.Tensor | None,
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         ctx: ForwardContext,
-        aux_hidden_states: list[torch.Tensor] | None = None,
-        **kwargs,
+        aux_hidden_states: list[torch.Tensor] | None,
     ):
+        """The layer's forward; ``positions`` is None for a linear-attention layer."""
         num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
             ctx
         )
@@ -938,16 +778,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 self.input_layernorm,
                 hidden_states,
                 residual,
-                self.qkv_proj.quant_method.static_fp8_input_scale(self.qkv_proj),
+                self.attention_fp8_scale(),
             )
             capture_layer_input(self.comm_manager, residual, ctx, aux_hidden_states)
             hidden_states = self.comm_manager.pre_attn_comm(hidden_states, ctx)
-            # qkv_proj is the only reader, so the FP8 copy can stand in for the rows.
-            hidden_states = self.self_attention(
-                positions=positions,
-                hidden_states=hidden_states if hidden_fp8 is None else hidden_fp8,
-                ctx=ctx,
-            )
+            hidden_states = self.attend(positions, hidden_states, hidden_fp8, ctx)
             # Free the copy once consumed, as the projection frees its own quant.
             del hidden_fp8
             residual = self._maybe_narrow_residual(residual, ctx)
@@ -998,6 +833,317 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         return hidden_states
 
 
+class Qwen3_5LinearDecoderLayer(Qwen3_5DecoderLayer):
+    """Qwen3.5 Decoder Layer with Linear Attention (GatedDeltaNet)."""
+
+    def __init__(
+        self,
+        config: Qwen3_5TextConfig,
+        mapping: Mapping,
+        layer_id: int,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+        alt_stream: torch.cuda.Stream | None = None,
+        *,
+        enable_fp8_attn_proj: bool,
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.mapping = mapping
+        self.layer_id = layer_id
+
+        self.linear_attn = Qwen3_5GatedDeltaNet(
+            config,
+            mapping,
+            layer_id,
+            quant_config,
+            prefix=prefix,
+            alt_stream=alt_stream,
+            enable_fp8_attn_proj=enable_fp8_attn_proj,
+        )
+
+        self.is_moe = _qwen3_5_uses_sparse_moe(config)
+        self.mlp = build_qwen3_5_mlp(
+            config,
+            mapping,
+            layer_id,
+            quant_config,
+            alt_stream,
+            prefix.replace(".linear_attn", ""),
+            self.is_moe,
+        )
+        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = GemmaRMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.comm_manager = self._build_comm_manager()
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        ctx: ForwardContext,
+        aux_hidden_states: list[torch.Tensor] | None = None,
+        **kwargs,
+    ):
+        return self.forward_layer(None, hidden_states, residual, ctx, aux_hidden_states)
+
+    def attention_fp8_scale(self) -> torch.Tensor | None:
+        return self.linear_attn.input_fp8_scale()
+
+    def attend(
+        self,
+        positions: torch.Tensor | None,
+        hidden_states: torch.Tensor,
+        hidden_fp8: torch.Tensor | None,
+        ctx: ForwardContext,
+    ) -> torch.Tensor:
+        return self.linear_attn(hidden_states, hidden_fp8, ctx)
+
+
+class Qwen3_5AttentionDecoderLayer(Qwen3_5DecoderLayer):
+    """Qwen3.5 Decoder Layer with Full Attention."""
+
+    def __init__(
+        self,
+        config: Qwen3_5TextConfig,
+        mapping: Mapping,
+        layer_id: int,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+        alt_stream: torch.cuda.Stream | None = None,
+        *,
+        enable_fp8_attn_proj: bool,
+    ) -> None:
+        super().__init__()
+        self.config = config
+        self.enable_fp8_attn_proj = enable_fp8_attn_proj
+        self.mapping = mapping
+        self._init_attention(config, mapping, layer_id, quant_config, prefix)
+
+        self.is_moe = _qwen3_5_uses_sparse_moe(config)
+        self.mlp = build_qwen3_5_mlp(
+            config,
+            mapping,
+            layer_id,
+            quant_config,
+            alt_stream,
+            prefix.replace(".self_attn", ""),
+            self.is_moe,
+        )
+        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = GemmaRMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+        self.comm_manager = self._build_comm_manager()
+
+    @staticmethod
+    def _uses_attention_output_gate(config: Qwen3_5TextConfig) -> bool:
+        return getattr(config, "attn_output_gate", True)
+
+    def _init_attention(
+        self,
+        config: Qwen3_5TextConfig,
+        mapping: Mapping,
+        layer_id: int,
+        quant_config: QuantizationConfig | None,
+        prefix: str,
+    ) -> None:
+        """Build the attention projections, RoPE and paged attention on the layer."""
+        self.hidden_size = config.hidden_size
+        self.attn_tp_rank = mapping.attn.tp_rank
+        self.attn_tp_size = mapping.attn.tp_size
+        self.attn_tp_group = mapping.attn.tp_group
+        self.total_num_heads = config.num_attention_heads
+        self.total_num_kv_heads = config.num_key_value_heads
+        validate_attention_partition(
+            self.total_num_heads,
+            self.total_num_kv_heads,
+            self.attn_tp_size,
+        )
+        self.num_heads = self.total_num_heads // self.attn_tp_size
+        self.num_kv_heads = max(1, self.total_num_kv_heads // self.attn_tp_size)
+        self.head_dim = config.head_dim or (self.hidden_size // self.num_heads)
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+        self.scaling = self.head_dim**-0.5
+        self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
+
+        self.rope_scaling = get_rope_parameters(config)
+
+        self.rope_theta = self.rope_scaling.get("rope_theta", 10000)
+        self.partial_rotary_factor = self.rope_scaling.get("partial_rotary_factor", 1.0)
+        self.layer_id = layer_id
+
+        self.attn_output_gate = self._uses_attention_output_gate(config)
+        if self.attn_output_gate:
+            logger.warning_once("using attn output gate!")
+
+        self.rotary_emb = get_rope(
+            head_size=self.head_dim,
+            rotary_dim=self.head_dim,
+            max_position=self.max_position_embeddings,
+            rope_scaling=self.rope_scaling,
+            base=self.rope_theta,
+            partial_rotary_factor=self.partial_rotary_factor,
+            is_neox_style=True,
+            dtype=torch.get_default_dtype(),
+        )
+
+        attn_quant_config = quant_config
+        if (
+            not self.enable_fp8_attn_proj
+            and quant_config
+            and quant_config.get_name() == "nvfp4"
+        ):
+            attn_quant_config = None
+
+        qkv_prefix = add_prefix("qkv_proj", prefix)
+        o_prefix = add_prefix("o_proj", prefix)
+        self.qkv_proj = QKVParallelLinear(
+            config.hidden_size,
+            self.head_dim,
+            self.total_num_heads * (1 + self.attn_output_gate),
+            self.total_num_kv_heads,
+            bias=False,
+            quant_config=_get_attn_proj_quant_config(
+                attn_quant_config, qkv_prefix, enabled=self.enable_fp8_attn_proj
+            ),
+            tp_rank=self.attn_tp_rank,
+            tp_size=self.attn_tp_size,
+            tp_group=self.attn_tp_group,
+            prefix=qkv_prefix,
+        )
+
+        self.o_proj = RowParallelLinear(
+            self.total_num_heads * self.head_dim,
+            config.hidden_size,
+            bias=False,
+            quant_config=_get_attn_proj_quant_config(
+                attn_quant_config, o_prefix, enabled=self.enable_fp8_attn_proj
+            ),
+            reduce_results=False,
+            tp_rank=self.attn_tp_rank,
+            tp_size=self.attn_tp_size,
+            tp_group=self.attn_tp_group,
+            prefix=o_prefix,
+        )
+
+        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.attn = PagedAttention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            num_kv_heads=self.num_kv_heads,
+            layer_id=layer_id,
+            rotary_emb=self.rotary_emb,
+            qk_norm=(self.q_norm, self.k_norm),
+        )
+
+    def _project_qkv(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """qkv_proj split into views; ``gate`` is ``None`` without ``attn_output_gate``."""
+        qkv, _ = self.qkv_proj(hidden_states)
+        if not self.attn_output_gate:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            return q, k, v, None
+        q_gate, k, v = qkv.split([self.q_size * 2, self.kv_size, self.kv_size], dim=-1)
+        heads = q_gate.view(q_gate.shape[0], self.num_heads, 2, self.head_dim)
+        q, gate = heads.unbind(dim=2)
+        return q, k, v, gate
+
+    def _attn(
+        self,
+        positions: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        gate: torch.Tensor | None,
+        ctx: ForwardContext,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Attention with the optional output gate; draft subclasses override."""
+        attn_output = self.attn(q, k, v, positions, ctx, **kwargs)
+        if gate is not None:
+            sigmoid_mul(attn_output, gate)
+        return attn_output
+
+    def _should_fuse_output_quant(self, gate: torch.Tensor | None) -> bool:
+        return (
+            self.enable_fp8_attn_proj
+            and gate is not None
+            and _uses_packed_fp8_output(self.o_proj)
+        )
+
+    def _project_output(
+        self, x: torch.Tensor, deferred_gate: torch.Tensor | None
+    ) -> torch.Tensor:
+        if deferred_gate is not None:
+            packed = try_output_fp8_quant_pack(
+                x,
+                deferred_gate,
+                None,
+                head_dim=self.head_dim,
+                eps=0.0,
+                sigmoid_gate=True,
+                enable_pdl=pdl_enabled(),
+            )
+            if packed is not None:
+                codes, scales = packed
+                output, _ = self.o_proj(codes, scale=scales)
+                return output
+            x = sigmoid_mul(x.contiguous(), deferred_gate)
+        output, _ = self.o_proj(x)
+        return output
+
+    def self_attention(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        ctx: ForwardContext,
+    ) -> torch.Tensor:
+        """Run full attention using the input rows or their static-FP8 copy."""
+        q, k, v, gate = self._project_qkv(hidden_states)
+        fuse_output_quant = self._should_fuse_output_quant(gate)
+        attn_output = self._attn(
+            positions, q, k, v, None if fuse_output_quant else gate, ctx
+        )
+        output = self._project_output(attn_output, gate if fuse_output_quant else None)
+        return output
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        ctx: ForwardContext,
+        aux_hidden_states: list[torch.Tensor] | None = None,
+        **kwargs,
+    ):
+        return self.forward_layer(
+            positions, hidden_states, residual, ctx, aux_hidden_states
+        )
+
+    def attention_fp8_scale(self) -> torch.Tensor | None:
+        return self.qkv_proj.quant_method.static_fp8_input_scale(self.qkv_proj)
+
+    def attend(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        hidden_fp8: torch.Tensor | None,
+        ctx: ForwardContext,
+    ) -> torch.Tensor:
+        # qkv_proj is the only reader, so the FP8 copy can stand in for the rows.
+        return self.self_attention(
+            positions=positions,
+            hidden_states=hidden_states if hidden_fp8 is None else hidden_fp8,
+            ctx=ctx,
+        )
+
+
 class Qwen3_5ForCausalLM(nn.Module):
     """Qwen3.5 Model with support for dense variant."""
 
@@ -1019,11 +1165,15 @@ class Qwen3_5ForCausalLM(nn.Module):
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        *,
+        enable_fp8_attn_proj: bool | None = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.mapping = mapping
         self.hidden_size = config.hidden_size
+        if enable_fp8_attn_proj is None:
+            enable_fp8_attn_proj = global_server_args_dict["enable_fp8_attn_proj"]
 
         # The shared expert overlaps the routed experts on this stream. In a
         # ROCm HIP graph, each cross-stream edge costs microseconds of queue
@@ -1056,6 +1206,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 quant_config=quant_config,
                 prefix=prefix,
                 alt_stream=alt_stream,
+                enable_fp8_attn_proj=enable_fp8_attn_proj,
             )
 
         self.layers = make_layers(

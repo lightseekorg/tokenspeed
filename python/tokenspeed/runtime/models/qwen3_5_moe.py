@@ -30,6 +30,7 @@ from tokenspeed_kernel.ops.activation.triton import (
     fused_gate_sigmoid_mul_add,
     moe_finalize_gate_add,
 )
+from tokenspeed_kernel.ops.moe import try_router_gemm_nvfp4
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
@@ -56,6 +57,7 @@ from tokenspeed.runtime.layers.moe.utils import (
     use_deepep_low_latency,
 )
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
 from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
 from tokenspeed.runtime.layers.quantization.utils import should_exclude_quant_module
 from tokenspeed.runtime.utils import add_prefix
@@ -191,6 +193,31 @@ class Qwen3_5MoeMLP(GatedMLP):
         )
 
 
+def _mxfp4_mega_moe_capacity(mapping: Mapping) -> int:
+    """Bound prefill and speculative verify rows before allocating workspace."""
+    args = global_server_args_dict
+    prefill = int(args.get("chunked_prefill_size") or 0)
+    if prefill <= 0:
+        max_model_len = args["max_model_len"]
+        if max_model_len is None or max_model_len <= 0:
+            raise ValueError(
+                "MXFP4 MegaMoE requires a positive --max-model-len "
+                "when chunked prefill is disabled"
+            )
+        prefill = args["max_prefill_tokens"] + max_model_len
+    verify_tokens = max(int(args.get("speculative_num_draft_tokens") or 1), 1)
+    per_dp_requests = int(args.get("max_num_seqs") or 0) // mapping.attn.dp_size
+    decode_batch = max(
+        per_dp_requests, int(args.get("max_cudagraph_capture_size") or 0)
+    )
+    return max(
+        prefill,
+        int(args.get("prefill_graph_max_tokens") or 0),
+        decode_batch * verify_tokens,
+        1,
+    )
+
+
 class Qwen3_5MoeSparseMoeBlock(nn.Module):
     def __init__(
         self,
@@ -279,6 +306,11 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
                 "normalize_topk_weights": config.norm_topk_prob,
             },
             routing_mode="precomputed_topk" if self.use_mega_moe else None,
+            persistent_max_num_tokens_per_gpu=(
+                _mxfp4_mega_moe_capacity(mapping)
+                if self.use_mega_moe and isinstance(quant_config, Mxfp4Config)
+                else None
+            ),
         )
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
@@ -309,6 +341,13 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         else:
             self.shared_expert = None
             self.shared_expert_gate = None
+
+    def warmup(self) -> None:
+        """Reserve and warm the selected persistent MoE backend before capture."""
+        plan = self.experts.plan
+        warmup = plan.get("warmup")
+        if warmup is not None and plan["persistent_max_num_tokens_per_gpu"] is not None:
+            warmup(plan, self.experts)
 
     def nvfp4_global_scale(self) -> torch.Tensor | None:
         """None: the experts quantize their own inputs, so no producer applies a scale."""
@@ -394,6 +433,35 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
             )
         return output
 
+    def _try_router_quantization(self, hidden_states, ctx):
+        # Keep the measured TP4 decode policy. Pre-MLP communication must leave
+        # rows unchanged, since the packed input accompanies local logits.
+        if (
+            ctx.forward_mode is None
+            or not ctx.forward_mode.is_decode()
+            or ctx.num_extends != 0
+            or ctx.query_shard is not None
+            or hidden_states.shape[0] not in (1, 4)
+        ):
+            return None
+        if not (
+            self.mapping.attn.tp_size == self.mapping.moe.tp_ep_size == 4
+            and self.mapping.moe.ep_size == 1
+        ):
+            return None
+        if not (
+            self.experts.plan.get("weight_dtype") == "nvfp4"
+            and self.experts.plan.get("solution") == "flashinfer_trtllm"
+        ):
+            return None
+        # TRT-LLM NVFP4 consumes x_quantized alongside BF16 routing input.
+        # Padded hidden rows still require its own quantizer.
+        if self.experts.gemm2_weights_fp4_shuffled.shape[1] != hidden_states.shape[1]:
+            return None
+        return try_router_gemm_nvfp4(
+            hidden_states, self.gate.weight, self.experts.w13_input_scale_quant
+        )
+
     def _forward_tp(
         self,
         hidden_states: torch.Tensor,
@@ -404,8 +472,12 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        # Gate on local (pre-comm) tokens
-        router_logits, _ = self.gate(hidden_states)
+        fused = self._try_router_quantization(hidden_states, ctx)
+        if fused is None:
+            router_logits, _ = self.gate(hidden_states)
+            x_quantized = None
+        else:
+            router_logits, x_quantized = fused
 
         # All-gather hidden_states and router_logits for topk + experts
         hidden_states = self.comm_manager.pre_mlp_comm(hidden_states, ctx)
@@ -458,6 +530,7 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
                 num_global_tokens=num_global_tokens,
                 max_num_tokens_per_gpu=max_num_tokens_per_gpu,
                 do_finalize=not fuse_finalize,
+                x_quantized=x_quantized,
             )
 
         if shared_output is not None:

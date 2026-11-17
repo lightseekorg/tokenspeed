@@ -18,3 +18,30 @@ so the bridge uploads spans instead of whole rows. CUDA runs the Triton kernel,
 whose programs stride over a row's tiles; other devices run the same fill in
 tensor ops. The reference is `torch_expand_block_table_rows` in
 `numerics/torch/metadata.py`.
+
+# Last accepted rows
+
+`gather_last_accepted_rows` copies each request's last accepted row out of a
+verify batch of `rows_per_request` rows per request: row `r *
+rows_per_request - 1 + accepted`, the accepted count clamped to the request's
+rows and the row clamped into the batch. CUDA runs one Triton launch over
+requests and column tiles; other devices run the same arithmetic as tensor
+ops. A drafter seeds its next proposals from these rows.
+
+# K-row lengths
+
+`expand_k_row_lengths` writes a k-token verify's per-token rows from the
+request lengths in one launch: the indexer's context rows (each request's
+length repeated `k` times) and the sparse decode core's causal KV rows (row
+`t` of a request sees `length + t - (k - 1)` tokens, clamped at zero). CUDA
+runs the Triton kernel; other devices run the same integer arithmetic as
+tensor ops.
+
+# Block-end lengths
+
+`broadcast_block_lengths` serves a block drafter's draft decode, where every
+query row of a request has the same cache length. It clamps each request's
+block-end length to `[low, high]` and writes it to the per-request row and to
+each of the request's entries; a block-causal draft's entry `e` of `n` gets
+`n - 1 - e` fewer tokens. CUDA runs one Triton launch for both; other devices
+run a clamp and a copy or subtraction.

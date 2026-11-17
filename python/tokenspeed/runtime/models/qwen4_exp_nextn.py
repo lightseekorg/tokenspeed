@@ -46,6 +46,7 @@ from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
 from tokenspeed.runtime.layers.quantization.utils import (
     should_exclude_quant_module,
     should_ignore_quant_layer,
@@ -54,6 +55,7 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import ParallelLMHead
 from tokenspeed.runtime.models.qwen4_exp import (
     Qwen4ExpAttentionDecoderLayer,
     Qwen4ExpModel,
+    _warmup_qwen4_moe,
     load_qwen4_exp_weights,
 )
 from tokenspeed.runtime.models.qwen4_exp_monokernel import (
@@ -70,6 +72,11 @@ def _resolve_mtp_quant_config(
         return None
     if should_exclude_quant_module("mtp.layers.0", quant_config.exclude_modules):
         return None
+    if (
+        not isinstance(quant_config, Mxfp4Config)
+        or quant_config.quant_method != "quark"
+    ):
+        return quant_config
     # AMD Quark expands an ``mtp.*`` exclusion into the MTP layer's linear
     # module names only; its fused routed experts (and ``fc_embedding``) are
     # left out of the list but stay BF16 as well.
@@ -148,6 +155,24 @@ class Qwen4ExpDraftAttentionDecoderLayer(Qwen4ExpAttentionDecoderLayer):
             sigmoid_mul(output, gate.index_select(0, rows))
         return output
 
+    def write_kv(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        locations: tuple[torch.Tensor, ...],
+        ctx: ForwardContext,
+    ) -> None:
+        """The layer up to its prologue: write each row's K/V and index key."""
+        slots, *index = locations
+        mixed, _ = self._prepare_attention(hidden_states, None, input_ids, ctx)
+        q, k, v, _ = self._project_qkv(mixed)
+        self.attn.write_kv_at(q, k, v, positions, slots, ctx)
+        if self.indexer is not None:
+            self.indexer.write_split_keys(
+                mixed, positions, tuple(index), ctx.token_to_kv_pool
+            )
+
     def forward(self, *args, **kwargs):
         ctx = kwargs["ctx"]
         hidden_states = kwargs["hidden_states"]
@@ -189,20 +214,15 @@ class Qwen4ExpDraftModel(Qwen4ExpModel):
     def __init__(self, config, mapping, quant_config=None, prefix: str = ""):
         if config.num_hidden_layers != 1:
             raise ValueError("Qwen4-Exp MTP requires exactly one decoder layer")
-        super().__init__(config, mapping, quant_config, prefix)
+        super().__init__(
+            config, mapping, quant_config, prefix, enable_fp8_attn_proj=False
+        )
 
 
 class Qwen4ExpForCausalLMNextN(nn.Module):
     """One-layer Qwen4-Exp MTP head used by TokenSpeed's MTP drafter."""
 
     compute_dsa_topk_first_step = True
-    # Its narrowed extend step keeps the sequence mixers at breakable-graph
-    # break points (the QSA indexer, ``PagedAttention.attend``) and publishes
-    # the accepted prefix through the narrowing handle, and its draft backend
-    # (the cache-group router, no state groups) attends in the mode it is
-    # passed, so the drafter may record its extend round as breakable graphs
-    # (--enable-drafter-prefill-graph).
-    supports_breakable_draft_extend = True
 
     def __init__(
         self,
@@ -264,6 +284,7 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
             tp_size=mapping.lm_head.tp_size,
             tp_group=mapping.lm_head.tp_group,
             do_argmax=True,
+            attn_tp_size=mapping.attn.tp_size,
             dp_lm_head_tp=mapping.attn.has_dp and mapping.lm_head.has_tp,
         )
 
@@ -271,6 +292,7 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
         return None
 
     def post_quant_warmup(self) -> None:
+        _warmup_qwen4_moe(self.model)
         # The draft layer is a monokernel layer unless the draft steps reuse
         # the first step's top-k (Qwen4ExpDraftModel._decode_monokernel).
         enable_decode_monokernels(self.model)
@@ -329,6 +351,33 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
         if decode_topk is None or decode_topk.shape[0] == 0:
             return dsa_topk
         return prefill_topk, decode_topk.index_select(0, gather_ids)
+
+    def begin_split_round(
+        self, ctx: ForwardContext, rows: int
+    ) -> tuple[torch.Tensor, ...]:
+        """Start a split round: each row's K/V slot and index-key locations."""
+        layer = self.model.layers[0]
+        slots = ctx.attn_backend.padded_write_locations(
+            layer.attn, ctx.forward_mode, rows
+        )
+        if layer.indexer is None:
+            return (slots,)
+        return (slots, *layer.indexer.split_round_locations(ctx, rows))
+
+    @torch.no_grad()
+    def write_draft_kv(
+        self,
+        ctx: ForwardContext,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        captured_hidden_states: torch.Tensor,
+        locations: tuple[torch.Tensor, ...],
+    ) -> None:
+        """Step 0 over every row up to its prologue: write its K/V and index key."""
+        fused = self._fuse_inputs(
+            self.model.embed_tokens(input_ids), captured_hidden_states
+        )
+        self.model.layers[0].write_kv(positions, fused, input_ids, locations, ctx)
 
     def _fuse_inputs(
         self, input_embeds: torch.Tensor, captured_hidden_states: torch.Tensor
@@ -395,13 +444,15 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
                 ctx,
                 input_embeds=fused,
             )
-        return self.logits_processor(
-            input_ids,
-            hidden_states,
-            self.lm_head,
-            LogitsMetadata.from_forward_context(ctx),
-            aux_hidden_states,
-        )
+            # The first draft step narrows verify rows to one per request.
+            # Keep that row table active through the cross-DP head exchange.
+            return self.logits_processor(
+                input_ids,
+                hidden_states,
+                self.lm_head,
+                LogitsMetadata.from_forward_context(ctx),
+                aux_hidden_states,
+            )
 
     def checkpoint_weight_name_filter(self, name: str) -> bool:
         return "mtp" in name or "shared_head" in name

@@ -28,7 +28,6 @@ model_sources:
   - python/tokenspeed/runtime/models/qwen3_vision.py
   - python/tokenspeed/runtime/models/qwen4_exp.py
   - python/tokenspeed/runtime/models/qwen4_exp_monokernel.py
-  - python/tokenspeed/runtime/models/qwen4_exp_nextn.py
 runner:
   labels:
     - amd-mi35x-2gpu-test
@@ -70,6 +69,7 @@ perf:
     --model amd/Qwen3.8-Flash-Next-Quark-MXFP4
     --config qwen3.8-flash-next-mxfp4-mtp3-monokernel
     --num-prompts 128
+    --concurrency 1
     --max-tokens 2048
     --chat-template-kwargs '{"reasoning_effort": "xhigh"}'
     --min-accuracy 0.88

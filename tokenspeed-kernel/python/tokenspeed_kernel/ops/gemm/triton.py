@@ -383,7 +383,7 @@ else:
 
 
 # ===-----------------------------------------------------------------------===#
-# FP32 decode GEMM: Triton BF16x3 (NVIDIA SM90 to SM103)
+# FP32 decode GEMM: Triton BF16x3 (NVIDIA SM90+)
 # ===-----------------------------------------------------------------------===#
 
 
@@ -394,7 +394,6 @@ register_kernel(
     solution="triton",
     capability=CapabilityRequirement(
         min_arch_version=ArchVersion(9, 0),
-        max_arch_version=ArchVersion(10, 3),
         vendors=frozenset({"nvidia"}),
     ),
     signatures=frozenset(

@@ -37,8 +37,10 @@ full prefill graph, attention and request-shaped state updates stay eager, so
 live lengths and cache addresses never enter a captured segment. A KV-cache
 read or write in an eager break waits for its layer's Host load there; one a
 captured segment makes (an attention prologue's KV write, an inline KDA
-layer's state read) holds no such wait, so ``PrefillGraph.replay`` waits for
-the plan's whole Host load before the first segment.
+layer's state read) cannot hold that wait, so the capture notes the highest
+layer each segment's accesses ask that wait for
+(:meth:`BreakableCapture.wait_before_segment`) and
+:meth:`BreakableCapture.replay` waits for it before replaying the segment.
 
 Address-stability contract (the load-bearing invariant):
 
@@ -56,7 +58,6 @@ from __future__ import annotations
 import dataclasses
 import functools
 import gc
-from collections import deque
 from collections.abc import Callable, Generator
 from contextlib import AbstractContextManager, contextmanager
 from typing import Any
@@ -81,10 +82,11 @@ __all__ = [
 ]
 
 
-# A break output's shape, dtype and device.
-HandoffKey = tuple[tuple[int, ...], torch.dtype, torch.device]
+# A leaf's shape, dtype, device and occurrence among same-shaped tuple leaves.
+HandoffKey = tuple[tuple[int, ...], torch.dtype, torch.device, int]
 # Trailing shape, dtype, device, and the output's ordinal among a capture's handoffs with them.
 HandoffSlot = tuple[tuple[int, ...], torch.dtype, torch.device, int]
+BreakOutput = torch.Tensor | tuple["BreakOutput", ...] | None
 
 # Ambient per-forward ctx; plain module state (one launch thread per rank).
 _ambient_ctx: Any = None
@@ -158,23 +160,24 @@ def _weak_ref_arg(a: Any) -> Any:
     """Hold break arg ``a`` without pinning its graph-pool blocks.
 
     A CUDA tensor becomes a :func:`weak_ref_tensor` view. A frozen dataclass
-    whose fields all hold a tensor or ``None`` (MLA's ``MLAPrologueOutput``)
-    becomes a copy with each tensor field so viewed; the copy is built field by
-    field, without running the class's ``__init__``, since this happens during
-    capture. Anything else is returned as is, so tuples, lists and other
-    dataclasses keep holding their tensors.
+    (MLA's ``MLAPrologueOutput``, KDA's ``KdaOutputNorm``) becomes a copy with
+    each tensor field so viewed and every other field kept as is, like a loose
+    scalar arg; the copy is built field by field, without running the class's
+    ``__init__``, since this happens during capture. Anything else is returned
+    as is, so tuples, lists and mutable dataclasses keep holding their tensors.
     """
     if (
         dataclasses.is_dataclass(a)
         and not isinstance(a, type)
         and a.__dataclass_params__.frozen
     ):
-        values = {f.name: getattr(a, f.name) for f in dataclasses.fields(a)}
-        if all(v is None or isinstance(v, torch.Tensor) for v in values.values()):
-            held = object.__new__(type(a))
-            for name, v in values.items():
-                object.__setattr__(held, name, weak_ref_tensor(v))
-            return held
+        held = object.__new__(type(a))
+        for f in dataclasses.fields(a):
+            v = getattr(a, f.name)
+            if isinstance(v, torch.Tensor):
+                v = weak_ref_tensor(v)
+            object.__setattr__(held, f.name, v)
+        return held
     return weak_ref_tensor(a)
 
 
@@ -231,6 +234,12 @@ class BreakableCapture:
         self.pool = pool
         self._run_segments_while_capturing = run_segments_while_capturing
         self.segments: list[Callable[[], Any]] = []
+        # Per entry of ``segments``, the (wait, layer) calls a replay makes
+        # before it: a captured segment's cache accesses hold no layerwise
+        # Host-load wait, so the capture notes the highest layer each segment
+        # asks each wait for (see wait_before_segment); breaks wait themselves.
+        self.segment_waits: list[tuple[tuple[Callable[[int], None], int], ...]] = []
+        self._current_waits: dict[Callable[[int], None], int] = {}
         self._current_graph: torch.cuda.CUDAGraph | None = None
         self._capturing = False
         if stream is None:
@@ -304,6 +313,7 @@ class BreakableCapture:
         else:
             graph.capture_begin()
         self._current_graph = graph
+        self._current_waits = {}
         self._capturing = True
 
     def _end_segment(self) -> None:
@@ -312,6 +322,7 @@ class BreakableCapture:
         assert self._current_graph is not None
         self._current_graph.capture_end()
         self.segments.append(self._current_graph.replay)
+        self.segment_waits.append(tuple(self._current_waits.items()))
         # All segments share one pool so intermediate addresses stay stable.
         if self.pool is None:
             self.pool = self._current_graph.pool()
@@ -332,13 +343,25 @@ class BreakableCapture:
             self.segments[-1]()
         result = fn()
         self.segments.append(fn)
+        self.segment_waits.append(())
         self._begin_segment()
         return result
 
+    def wait_before_segment(self, wait: Callable[[int], None], layer: int) -> None:
+        """Make every replay call ``wait(layer)`` before the segment being captured.
+
+        ``wait``'s layers must complete in order (a layerwise Host-load
+        wait): the segment keeps only the highest layer noted per wait.
+        """
+        assert self._capturing, "wait_before_segment called outside a segment"
+        self._current_waits[wait] = max(layer, self._current_waits.get(wait, layer))
+
     # -- replay ------------------------------------------------------------
 
-    def replay(self, valid_rows: int | None = None) -> None:
-        """Replay all segments in order.
+    def replay(
+        self, valid_rows: int | None = None, *, noted_waits_done: bool = False
+    ) -> None:
+        """Replay all segments in order, each behind the waits its capture noted.
 
         Breaks read the live forward context from the ambient :func:`active_forward`
         scope (the runner wraps replay in it).
@@ -348,11 +371,18 @@ class BreakableCapture:
                 each eager break, handoff rows beyond this prefix are cleared
                 before the following graph segment consumes them. ``None``
                 leaves handoff buffers unchanged.
+            noted_waits_done: The current stream has already waited for
+                everything the noted waits wait for (a prefill graph's wait
+                for the whole Host load), so the replay skips them.
         """
         previous_valid_rows = _replay_valid_rows
         _set_replay_valid_rows(valid_rows)
         try:
-            deque((run() for run in self.segments), maxlen=0)
+            for waits, run in zip(self.segment_waits, self.segments, strict=True):
+                if not noted_waits_done:
+                    for wait, layer in waits:
+                        wait(layer)
+                run()
         finally:
             _set_replay_valid_rows(previous_valid_rows)
 
@@ -392,16 +422,16 @@ def run_eager(fn: Callable[[], Any]) -> Any:
 
 def _record_break(
     cap: BreakableCapture,
-    fn: Callable[..., torch.Tensor],
-    resolve_dst: Callable[[torch.Tensor], torch.Tensor],
+    fn: Callable[..., BreakOutput],
+    resolve_dst: Callable[[BreakOutput], BreakOutput],
     args: tuple,
     kwargs: dict,
-) -> torch.Tensor:
+) -> BreakOutput:
     """Record ``fn(*args, **kwargs)`` as an eager break on ``cap`` (the one closure
     builder shared by :func:`break_here` and :func:`break_point`).
 
     Args/kwargs are bound once at capture time, with two live exceptions: (1) CUDA
-    tensor args, bare or as the fields of a frozen dataclass of tensors, carry live
+    tensor args, bare or as the tensor fields of a frozen dataclass, carry live
     values at replay because their addresses are stable: storage owned elsewhere
     (the static input buffers, weights) or graph-pool intermediates the captured
     segment rewrites before the break on every replay. The closure holds them as
@@ -428,9 +458,9 @@ def _record_break(
 
     weak_args = tuple(hold(a) for a in args)
     weak_kwargs = {k: hold(v) for k, v in kwargs.items()}
-    state: dict[str, torch.Tensor] = {}
+    state: dict[str, BreakOutput] = {}
 
-    def replay_fn() -> torch.Tensor:
+    def replay_fn() -> BreakOutput:
         live_ctx = current_forward_ctx()
 
         def sub(a: Any) -> Any:
@@ -440,9 +470,9 @@ def _record_break(
             *(sub(a) for a in weak_args),
             **{k: sub(v) for k, v in weak_kwargs.items()},
         )
-        dst = state.get("dst")
-        if dst is None:
-            dst = state["dst"] = resolve_dst(result)
+        if "dst" not in state:
+            state["dst"] = resolve_dst(result)
+        dst = state["dst"]
         _land_in(dst, result)
         if _replay_valid_rows is not None:
             scrub_padding_tail(_replay_valid_rows, dst)
@@ -459,11 +489,11 @@ def _handoff_view(cap: BreakableCapture, key: HandoffKey) -> torch.Tensor:
     in distinct storage. Storage too short for ``key`` is replaced; captures that
     already hold the old storage keep it alive.
     """
-    shape, dtype, device = key
+    shape, dtype, device, _ = key
     if not shape:
         return torch.empty(shape, dtype=dtype, device=device)
     trailing = (shape[1:], dtype, device)
-    rank = sum(1 for s, d, v in cap._handoff if s and (s[1:], d, v) == trailing)
+    rank = sum(1 for s, d, v, _ in cap._handoff if s and (s[1:], d, v) == trailing)
     slot = (*trailing, rank)
     storage = cap._handoff_storage.get(slot)
     if storage is None or storage.shape[0] < shape[0]:
@@ -474,11 +504,11 @@ def _handoff_view(cap: BreakableCapture, key: HandoffKey) -> torch.Tensor:
 
 
 def break_here(
-    fn: Callable[..., torch.Tensor],
-    dst: torch.Tensor,
+    fn: Callable[..., BreakOutput],
+    dst: BreakOutput,
     *args: Any,
     **kwargs: Any,
-) -> torch.Tensor:
+) -> BreakOutput:
     """Run ``fn(*args, **kwargs)`` as an eager break, landing its result in ``dst``.
 
     The low-level explicit-destination primitive underneath :func:`break_point`
@@ -501,7 +531,7 @@ def break_here(
     if cap is None or not cap._capturing:
         _land_in(dst, fn(*args, **kwargs))
         return dst
-    weak_dst = weak_ref_tensor(dst)
+    weak_dst = _map_output(weak_ref_tensor, dst)
     return _record_break(cap, fn, lambda _result: weak_dst, args, kwargs)
 
 
@@ -520,7 +550,9 @@ def break_point(method: Callable | None = None) -> Callable:
     output spec is needed -- it works uniformly for breaks whose output matches no
     input (MLA: ``[tokens, heads*v_head_dim]`` vs ``q``'s ``[tokens, heads*qk_head_dim]``)
     and for one wrapper that returns different shapes per call (e.g. hybrid full-attn
-    q-shaped vs GDN z-shaped). Buffers live in a per-capture shape-keyed cache
+    q-shaped vs GDN z-shaped). Plain tuples may nest tensor and None outputs;
+    their structure is fixed at capture. Same-shaped leaves of one tuple own
+    independent buffers. Buffers live in a per-capture shape-keyed cache
     (:attr:`BreakableCapture._handoff`), shared across same-shape breaks. That
     sharing relies on break outputs having strictly sequential lifetimes -- break
     K's output is consumed by K's following segment before break K+1 runs (true
@@ -531,7 +563,7 @@ def break_point(method: Callable | None = None) -> Callable:
     Inside the method ``ctx`` is live (rebound by identity at replay), so write the
     body exactly like the eager path. Loose non-tensor scalar args are frozen to
     their capture-time value -- route per-request quantities through ``ctx`` / metadata.
-    Tensor args, bare or as the fields of a frozen dataclass of tensors (e.g.
+    Tensor args, bare or as the tensor fields of a frozen dataclass (e.g.
     ``MLAPrologueOutput``), are held without owning their memory (see
     :func:`_record_break`): finish reading them before the method returns and keep
     none of them for a later break.
@@ -547,13 +579,23 @@ def break_point(method: Callable | None = None) -> Callable:
                 return method(*args, **kwargs)
             cap = BreakableCapture.current()
 
-            def resolve_dst(result: torch.Tensor) -> torch.Tensor:
-                # Handoff buffer inferred from the capture-time output, shape-keyed.
-                key = (tuple(result.shape), result.dtype, result.device)
-                dst = cap._handoff.get(key)
-                if dst is None:
-                    dst = cap._handoff[key] = _handoff_view(cap, key)
-                return dst
+            def resolve_dst(result: BreakOutput) -> BreakOutput:
+                occurrences: dict[
+                    tuple[tuple[int, ...], torch.dtype, torch.device], int
+                ] = {}
+
+                def resolve_leaf(leaf: torch.Tensor) -> torch.Tensor:
+                    # Handoff buffer inferred from the capture-time output, shape-keyed.
+                    shape_key = (tuple(leaf.shape), leaf.dtype, leaf.device)
+                    occurrence = occurrences.get(shape_key, 0)
+                    occurrences[shape_key] = occurrence + 1
+                    key = (*shape_key, occurrence)
+                    dst = cap._handoff.get(key)
+                    if dst is None:
+                        dst = cap._handoff[key] = _handoff_view(cap, key)
+                    return dst
+
+                return _map_output(resolve_leaf, result)
 
             return _record_break(cap, method, resolve_dst, args, kwargs)
 
@@ -565,7 +607,7 @@ def break_point(method: Callable | None = None) -> Callable:
 # -- padded-input helpers (the two strategies of the prefill padding contract) --
 
 
-def scrub_padding_tail(num_real_tokens: int, *tensors: torch.Tensor | None) -> None:
+def scrub_padding_tail(num_real_tokens: int, *tensors: BreakOutput) -> None:
     """Zero the padded tail rows ``[num_real_tokens:]`` of token-shaped tensors in place.
 
     Under a padded-bucket replay, an eager break receives ``bucket`` rows whose
@@ -578,7 +620,9 @@ def scrub_padding_tail(num_real_tokens: int, *tensors: torch.Tensor | None) -> N
     skipped.
     """
     for t in tensors:
-        if t is not None and num_real_tokens < t.shape[0]:
+        if type(t) is tuple:
+            scrub_padding_tail(num_real_tokens, *t)
+        elif t is not None and t.ndim > 0 and num_real_tokens < t.shape[0]:
             t[num_real_tokens:].zero_()
 
 
@@ -596,7 +640,45 @@ def slice_to_real_tokens(num_real_tokens: int, *tensors: torch.Tensor | None):
     )
 
 
-def _land_in(dst: torch.Tensor, result: torch.Tensor) -> None:
+def _map_output(
+    fn: Callable[[torch.Tensor], torch.Tensor], result: BreakOutput
+) -> BreakOutput:
+    """Map tensor leaves while preserving plain tuple and optional output structure."""
+    if isinstance(result, torch.Tensor):
+        return fn(result)
+    if type(result) is tuple:
+        return tuple(_map_output(fn, leaf) for leaf in result)
+    if result is None:
+        return None
+    raise TypeError("Break outputs must be tensors, plain tuples, or None")
+
+
+def _matching_output_leaves(
+    dst: BreakOutput, result: BreakOutput
+) -> Generator[tuple[torch.Tensor, torch.Tensor]]:
+    """Validate the captured output contract before copying any tensor leaves."""
+    if type(dst) is tuple:
+        if type(result) is not tuple or len(result) != len(dst):
+            raise ValueError("Break output structure changed after capture")
+        for destination, leaf in zip(dst, result, strict=True):
+            yield from _matching_output_leaves(destination, leaf)
+        return
+    if dst is None and result is None:
+        return
+    if not isinstance(dst, torch.Tensor) or not isinstance(result, torch.Tensor):
+        raise ValueError("Break output structure changed after capture")
+    if (
+        result.dtype != dst.dtype
+        or result.device != dst.device
+        or result.ndim != dst.ndim
+        or result.shape[1:] != dst.shape[1:]
+        or (result.ndim > 0 and result.shape[0] > dst.shape[0])
+    ):
+        raise ValueError("Break output shape, dtype, or device changed after capture")
+    yield dst, result
+
+
+def _land_in(dst: BreakOutput, result: BreakOutput) -> None:
     """Copy ``result`` into ``dst`` at a stable address.
 
     ``dst`` is the (possibly token-padded) handoff buffer the next graph segment
@@ -607,9 +689,33 @@ def _land_in(dst: torch.Tensor, result: torch.Tensor) -> None:
     when it is given the valid prefix length. No-op when the op already wrote
     ``dst`` in place.
     """
+    if type(dst) is tuple:
+        _land_tuple(dst, result)
+        return
     if result is dst:
         return
     if result.shape == dst.shape:
         dst.copy_(result)
     else:
         dst.narrow(0, 0, result.shape[0]).copy_(result)
+
+
+def _land_tuple(dst: tuple[BreakOutput, ...], result: BreakOutput) -> None:
+    """Land a tuple result leaf by leaf once every leaf matches the captured
+    structure; a result view aliasing another leaf's handoff is cloned first."""
+    pairs = list(_matching_output_leaves(dst, result))
+    sources = [
+        (
+            source.clone()
+            if any(
+                source.untyped_storage().data_ptr()
+                == other.untyped_storage().data_ptr()
+                for other, _ in pairs
+                if other is not destination
+            )
+            else source
+        )
+        for destination, source in pairs
+    ]
+    for (destination, _), source in zip(pairs, sources, strict=True):
+        _land_in(destination, source)

@@ -1256,6 +1256,8 @@ def _rmsnorm_nvfp4_quant_kernel(
     sentinel_word: tl.constexpr,
     sentinel_half: tl.constexpr,
     MAILBOX: tl.constexpr,
+    MAILBOX_BLOCK_WIDTH: tl.constexpr,
+    MAILBOX_BLOCK_STRIDE: tl.constexpr,
     BLOCK: tl.constexpr,
     SF_BLOCK: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
@@ -1269,14 +1271,23 @@ def _rmsnorm_nvfp4_quant_kernel(
         # Dependents may launch now; their own wait still covers this grid's completion.
         tl.extra.cuda.gdc_launch_dependents()
     if MAILBOX:
-        # One row-wide poll load keeps the plain path's variance sum order bitwise.
-        half_ptr = x_ptr.to(tl.pointer_type(tl.int16)) + row * width + offsets
+        # One row-wide poll load over the blocks keeps the plain path's variance sum order bitwise.
+        element = (
+            (offsets // MAILBOX_BLOCK_WIDTH) * MAILBOX_BLOCK_STRIDE
+            + row * MAILBOX_BLOCK_WIDTH
+            + offsets % MAILBOX_BLOCK_WIDTH
+        )
+        half_ptr = x_ptr.to(tl.pointer_type(tl.int16)) + element
         halves = tl.load(half_ptr, mask=mask, other=0, volatile=True)
         while _mailbox_row_dirty(halves, sentinel_half):
             halves = tl.load(half_ptr, mask=mask, other=0, volatile=True)
         values = halves.to(tl.bfloat16, bitcast=True).to(tl.float32)
-        word_ptr = x_ptr.to(tl.pointer_type(tl.int32)) + row * (width // 2)
-        word_ptr += tl.arange(0, BLOCK // 2)
+        words = tl.arange(0, BLOCK // 2)
+        word_ptr = x_ptr.to(tl.pointer_type(tl.int32)) + (
+            (words // (MAILBOX_BLOCK_WIDTH // 2)) * (MAILBOX_BLOCK_STRIDE // 2)
+            + row * (MAILBOX_BLOCK_WIDTH // 2)
+            + words % (MAILBOX_BLOCK_WIDTH // 2)
+        )
         tl.store(word_ptr, tl.full([BLOCK // 2], sentinel_word, tl.int32))
     else:
         values = tl.load(x_ptr + row * width + offsets, mask=mask, other=0.0).to(
@@ -1341,9 +1352,19 @@ def triton_rmsnorm_nvfp4_quant(
     enable_pdl: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Triton kernel of :func:`tokenspeed_kernel.ops.quantization.rmsnorm_nvfp4_quant`."""
-    if x.ndim != 2 or x.dtype != torch.bfloat16 or not x.is_cuda:
-        raise ValueError("x must be a BF16 GPU tensor shaped [rows, width]")
-    rows, width = x.shape
+    if x.ndim != (2 if mailbox_sentinel is None else 3):
+        raise ValueError(
+            "x must be [rows, width] rows or a [blocks, rows, block_width] mailbox"
+        )
+    if x.dtype != torch.bfloat16 or not x.is_cuda:
+        raise ValueError("x must be a BF16 GPU tensor")
+    if mailbox_sentinel is None:
+        rows, width = x.shape
+        block_width = block_stride = width
+    else:
+        blocks, rows, block_width = x.shape
+        width = blocks * block_width
+        block_stride = x.stride(0)
     if width % NVFP4_BLOCK:
         raise ValueError(f"width must be a multiple of {NVFP4_BLOCK}, got {width}")
     if weight.shape != (width,) or weight.device != x.device:
@@ -1355,9 +1376,13 @@ def triton_rmsnorm_nvfp4_quant(
             mailbox_sentinel >> 16
         ):
             raise ValueError("the mailbox sentinel is one word whose halves agree")
-        if width & (width - 1) or not x.is_contiguous():
-            raise ValueError("a mailbox needs contiguous rows of a power-of-two width")
-    values = x.contiguous()
+        if width & (width - 1) or block_width & (block_width - 1):
+            raise ValueError("a mailbox needs power-of-two row and block widths")
+        if x.stride()[1:] != (block_width, 1) or block_stride < rows * block_width:
+            raise ValueError(
+                "a mailbox must be the first rows of whole contiguous blocks"
+            )
+    values = x if mailbox_sentinel is not None else x.contiguous()
     packed = torch.empty((rows, width // 2), dtype=torch.uint8, device=x.device)
     # flashinfer's consumers may touch the round_up(rows, 16) tail; keep that storage.
     padded_rows = (rows + 15) // 16 * 16
@@ -1385,6 +1410,8 @@ def triton_rmsnorm_nvfp4_quant(
         sentinel_word=sentinel - (1 << 32) if sentinel >= 1 << 31 else sentinel,
         sentinel_half=(sentinel & 0xFFFF) - (1 << 16 if sentinel & 0x8000 else 0),
         MAILBOX=mailbox_sentinel is not None,
+        MAILBOX_BLOCK_WIDTH=block_width,
+        MAILBOX_BLOCK_STRIDE=block_stride,
         BLOCK=block,
         SF_BLOCK=NVFP4_BLOCK,
         ENABLE_PDL=use_pdl,

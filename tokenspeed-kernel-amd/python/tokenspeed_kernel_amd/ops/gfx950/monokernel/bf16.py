@@ -151,6 +151,47 @@ def load_row_major_tiles(
 
 
 @gluon.jit
+def load_weight_half_tiles(
+    w, nb, K: gl.constexpr, kit0, KITS: gl.constexpr, SPLIT: gl.constexpr, row_half
+):
+    """:func:`load_weight_tiles` of one 16-row block ``nb`` (``NW`` 1,
+    ``GROUP`` 1) that loads only its rows ``8 row_half .. 8 row_half + 7``:
+    half the bytes. The other rows' lanes load nothing (their values are 0). A
+    row's values, and so its sum in :func:`gemv`, are exactly those of the
+    whole-block load.
+
+    Returns:
+        One ``[SPLIT, 32, 16]`` B tile per chain step.
+    """
+    gl.static_assert(K % 32 == 0 and KITS % SPLIT == 0 and KITS <= K // 32)
+    bl: gl.constexpr = b_layout(SPLIT, 1)
+    s = gl.arange(0, SPLIT, gl.SliceLayout(1, gl.SliceLayout(2, bl)))
+    k = gl.arange(0, 32, gl.SliceLayout(0, gl.SliceLayout(2, bl)))
+    n = gl.arange(0, 16, gl.SliceLayout(0, gl.SliceLayout(1, bl)))
+    # As load_weight_tiles: lane g * 16 + n reads values 128 g + 8 n .. of
+    # the block's 512 values a k-iteration; rows 8 row_half .. are 128 bytes of
+    # each 256-byte run.
+    lane = ((k // 8) * 128 + k % 8)[None, :, None] + (n * 8)[None, None, :]
+    offset = (nb * (K // 32) + (kit0 + s)[:, None, None]) * 512 + lane
+    # (s >= 0) and (k >= 0) are always true: they broadcast the row mask to
+    # the tile's shape. A masked lane's offset goes out of the buffer's range,
+    # so it fetches nothing.
+    mine = (
+        ((n // 8) == row_half)[None, None, :]
+        & (s >= 0)[:, None, None]
+        & (k >= 0)[None, :, None]
+    )
+    tiles = ()
+    for i in gl.static_range(KITS // SPLIT):
+        tiles += (
+            cdna4.buffer_load(
+                w, offset + i * SPLIT * 512, mask=mine, other=0.0, cache=".cg"
+            ),
+        )
+    return tiles
+
+
+@gluon.jit
 def gemv(x_smem, tiles, FIRST: gl.constexpr, ROWS: gl.constexpr):
     """Activation rows times the loaded weight tiles.
 
@@ -213,6 +254,145 @@ def _with_extras(region, extra_regions):
     return (region,) + tuple(extra_regions)
 
 
+# Pairs per thread of one poll of load_rows (see "Few pairs per thread").
+POLL_PAIRS = 16
+
+
+@gluon.constexpr_function
+def _poll_group_rows(RP, KP, num_warps):
+    """Rows of one poll of :func:`load_rows`: a power of two, at most
+    ``POLL_PAIRS`` pairs per thread unless one row is wider."""
+    group = RP
+    while group > 1 and group * KP * 16 > POLL_PAIRS * 64 * num_warps:
+        group //= 2
+    return group
+
+
+@gluon.jit
+def load_word_rows(
+    mb,
+    region: gl.constexpr,
+    flags: gl.constexpr,
+    FLAGS: gl.constexpr,
+    KS: gl.constexpr,
+    R: gl.constexpr,
+):
+    """:func:`load_rows` of rows ``0 .. R - 1`` whose producers publish BF16
+    pairs as plain words in ``region`` (word ``k / 2`` of a row holds values
+    ``k, k + 1``; :meth:`Mailbox.store_words_peer`) and each raise one of
+    the ``FLAGS`` flags of the row in ``flags``. The flags are polled first,
+    then the words are loaded past the caches: half the bytes of tagged
+    pairs.
+
+    Returns:
+        ``x_smem [RP, KP, 32] bf16``, as :func:`load_rows` with ``k0 = 0``.
+    """
+    gl.static_assert(KS % 32 == 0)
+    KI: gl.constexpr = KS // 32
+    KP: gl.constexpr = triton.next_power_of_2(KI)
+    RP: gl.constexpr = triton.next_power_of_2(R)
+    nw: gl.constexpr = gl.num_warps()
+    lanes: gl.constexpr = gl.BlockedLayout([1], [64], [nw], [0])
+    f = gl.arange(0, triton.next_power_of_2(R * FLAGS), lanes)
+    mb.poll_flags(flags, mb.row_offset(gl.minimum(f // FLAGS, R - 1)) + f % FLAGS)
+    # No load may issue before every wave's poll returned.
+    gl.barrier()
+    G: gl.constexpr = _poll_group_rows(RP, KP, nw)
+    p = gl.arange(0, G * KP * 16, lanes)
+    at = p % (KP * 16)
+    word = gl.minimum(at, KS // 2 - 1)
+    stride: gl.constexpr = schedule.row_pairs(mb.plan)
+    words = gl.allocate_shared_memory(
+        gl.int32, [RP, KP, 16], mx._padded_rows([RP, KP, 16], KP * 16, 8)
+    )
+    for g in gl.static_range(RP // G):
+        row = gl.minimum(g * G + p // (KP * 16), R - 1)
+        got = mb.load_words(region, 2 * row * stride + word)
+        words.slice(g * G, G, 0).store(
+            gl.reshape(gl.where(at < KS // 2, got, 0), [G, KP, 16])
+        )
+    gl.barrier()
+    return words.reinterpret(
+        gl.bfloat16, [RP, KP, 32], mx._padded_rows([RP, KP, 32], KP * 32, 16)
+    )
+
+
+@gluon.jit
+def load_local_word_rows(
+    mb, region: gl.constexpr, k0, KS: gl.constexpr, R: gl.constexpr
+):
+    """:func:`load_rows` of BF16 rows that producers published as plain
+    words (``Mailbox.store_words`` / ``raise_flag``) in local region
+    ``region``, values ``k0 .. k0 + KS - 1`` of rows ``0 .. R - 1``. Call it
+    after the CTA polled the producers' flags (and met at a barrier). One
+    round trip: a word holds two values, so all the rows fit the registers
+    that :func:`load_rows` gives a group of rows' pairs. Unlike
+    :func:`load_word_rows` the caller polls the flags (for a slice ``k0 ..``
+    of the rows, its own subset of them).
+
+    Returns:
+        ``x_smem [RP, KP, 32] bf16``, as :func:`load_rows`.
+    """
+    gl.static_assert(KS % 32 == 0)
+    KI: gl.constexpr = KS // 32
+    KP: gl.constexpr = triton.next_power_of_2(KI)
+    RP: gl.constexpr = triton.next_power_of_2(R)
+    lanes: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
+    p = gl.arange(0, RP * KP * 16, lanes)
+    row = gl.minimum(p // (KP * 16), R - 1)
+    at = p % (KP * 16)
+    # Row r's words start at word 2 row_offset(r) (Mailbox.store_words).
+    got = mb.load_words(
+        region, 2 * mb.row_offset(row) + k0 // 2 + gl.minimum(at, KS // 2 - 1)
+    )
+    words = gl.allocate_shared_memory(
+        gl.int32, [RP, KP, 16], mx._padded_rows([RP, KP, 16], KP * 16, 8)
+    )
+    words.store(gl.reshape(gl.where(at < KS // 2, got, 0), [RP, KP, 16]))
+    gl.barrier()
+    return words.reinterpret(
+        gl.bfloat16, [RP, KP, 32], mx._padded_rows([RP, KP, 32], KP * 32, 16)
+    )
+
+
+@gluon.jit
+def load_global_rows(x, row_stride, k0, KS: gl.constexpr, R: gl.constexpr):
+    """:func:`load_rows` of BF16 rows in global memory that an earlier launch
+    wrote (row ``r`` at ``x + r * row_stride``), values ``k0 .. k0 + KS - 1``.
+    ``row_stride`` and ``k0`` are even.
+
+    The loads are plain (cacheable), so this GPU must have written the rows
+    in an earlier launch: a launch boundary makes its own writes visible to
+    them. Rows that another GPU wrote need loads past the caches (``.cv``),
+    which a stale line in this GPU's L2 cannot serve.
+
+    Returns:
+        ``x_smem [RP, KP, 32] bf16``, as :func:`load_rows`.
+    """
+    gl.static_assert(KS % 32 == 0)
+    KI: gl.constexpr = KS // 32
+    KP: gl.constexpr = triton.next_power_of_2(KI)
+    RP: gl.constexpr = triton.next_power_of_2(R)
+    lanes: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
+    p = gl.arange(0, RP * KP * 16, lanes)
+    row = gl.minimum(p // (KP * 16), R - 1)
+    at = p % (KP * 16)
+    words_ptr = x.to(gl.pointer_type(gl.int32), bitcast=True)
+    got = gl.load(
+        words_ptr + (row * row_stride + k0) // 2 + gl.minimum(at, KS // 2 - 1),
+        mask=at < KS // 2,
+        other=0,
+    )
+    words = gl.allocate_shared_memory(
+        gl.int32, [RP, KP, 16], mx._padded_rows([RP, KP, 16], KP * 16, 8)
+    )
+    words.store(gl.reshape(got, [RP, KP, 16]))
+    gl.barrier()
+    return words.reinterpret(
+        gl.bfloat16, [RP, KP, 32], mx._padded_rows([RP, KP, 32], KP * 32, 16)
+    )
+
+
 @gluon.jit
 def load_rows(
     mb,
@@ -224,11 +404,12 @@ def load_rows(
     extra_indices=(),
 ):
     """Poll BF16 rows ``0 .. R - 1``, values ``k0 .. k0 + KS - 1`` of each,
-    into LDS for :func:`gemv`, in one round trip.
+    into LDS for :func:`gemv`, in one round trip per group of rows (a wide
+    poll of many rows would hold too many registers).
 
     ``region`` holds each row as BF16 pairs (:func:`mx.put_bf16_rows`);
     ``k0`` and ``KS`` are even. ``extra_regions`` / ``extra_indices`` poll
-    other inputs of the caller in the same round trips (as
+    other inputs of the caller with the first group (as
     :func:`mx.load_mxfp4_rows`).
 
     Returns:
@@ -240,21 +421,30 @@ def load_rows(
     KI: gl.constexpr = KS // 32
     KP: gl.constexpr = triton.next_power_of_2(KI)
     RP: gl.constexpr = triton.next_power_of_2(R)
+    G: gl.constexpr = _poll_group_rows(RP, KP, gl.num_warps())
     lanes: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
-    p = gl.arange(0, RP * KP * 16, lanes)
-    row = gl.minimum(p // (KP * 16), R - 1)
+    p = gl.arange(0, G * KP * 16, lanes)
     at = p % (KP * 16)
+    pair = k0 // 2 + gl.minimum(at, KS // 2 - 1)
     stride: gl.constexpr = schedule.row_pairs(mb.plan)
-    got = mb.poll_many(
-        _with_extras(region, extra_regions),
-        (row * stride + k0 // 2 + gl.minimum(at, KS // 2 - 1),) + extra_indices,
-    )
     # Each row ends in 32 bytes of padding: rows that start on the same LDS
     # bank conflict when the MFMA lanes of a multi-row GEMV read them.
     words = gl.allocate_shared_memory(
         gl.int32, [RP, KP, 16], mx._padded_rows([RP, KP, 16], KP * 16, 8)
     )
-    words.store(gl.reshape(gl.where(at < KS // 2, got[0], 0), [RP, KP, 16]))
+    row = gl.minimum(p // (KP * 16), R - 1)
+    got = mb.poll_many(
+        _with_extras(region, extra_regions), (row * stride + pair,) + extra_indices
+    )
+    words.slice(0, G, 0).store(
+        gl.reshape(gl.where(at < KS // 2, got[0], 0), [G, KP, 16])
+    )
+    for g in gl.static_range(1, RP // G):
+        row = gl.minimum(g * G + p // (KP * 16), R - 1)
+        (more,) = mb.poll_many((region,), (row * stride + pair,))
+        words.slice(g * G, G, 0).store(
+            gl.reshape(gl.where(at < KS // 2, more, 0), [G, KP, 16])
+        )
     gl.barrier()
     x_smem = words.reinterpret(
         gl.bfloat16, [RP, KP, 32], mx._padded_rows([RP, KP, 32], KP * 32, 16)

@@ -27,6 +27,7 @@ def _make_k3_config() -> "ts.SchedulerConfig":
     cfg.num_snapshot_pages = 1  # never retracts
     cfg.max_scheduled_tokens = 64
     cfg.max_batch_size = 8
+    cfg.max_resident_requests = cfg.max_batch_size
     cfg.enable_l3_storage = False
     cfg.disable_l2_cache = True
     cfg.disable_prefix_cache = False
@@ -51,6 +52,15 @@ def _spec(request_id: str, tokens: list[int]) -> "ts.RequestSpec":
     spec.request_id = request_id
     spec.tokens = list(tokens)
     return spec
+
+
+def _event(kind: str, request_id: str, **fields):
+    """One ForwardEvent of the named kind, its fields set by keyword."""
+    event = getattr(ts.ForwardEvent, kind)()
+    event.request_id = request_id
+    for name, value in fields.items():
+        setattr(event, name, value)
+    return event
 
 
 def _advance(scheduler, request_id: str, tokens: list[int]) -> None:

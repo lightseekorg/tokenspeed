@@ -132,17 +132,25 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                std::int32_t total_pages, tokenspeed::AttnKind attn_kind,
                std::optional<std::int32_t> sliding_window_tokens, std::int32_t cache_blocks_per_lcm_block,
                tokenspeed::CacheTransferPolicy transfer_policy, std::int32_t shard_count, bool replayable,
-               std::int32_t checkpoint_granularity) {
+               std::int32_t checkpoint_granularity, std::int32_t sink_tokens) {
                 new (self) tokenspeed::CacheGroupConfig{
-                    std::move(group_id), block_granularity,      total_pages, cache_blocks_per_lcm_block,
-                    attn_kind,           sliding_window_tokens,  replayable,  transfer_policy,
-                    shard_count,         checkpoint_granularity,
+                    .group_id = std::move(group_id),
+                    .block_granularity = block_granularity,
+                    .total_pages = total_pages,
+                    .cache_blocks_per_lcm_block = cache_blocks_per_lcm_block,
+                    .attn_kind = attn_kind,
+                    .sliding_window_tokens = sliding_window_tokens,
+                    .sink_tokens = sink_tokens,
+                    .replayable = replayable,
+                    .transfer_policy = transfer_policy,
+                    .shard_count = shard_count,
+                    .checkpoint_granularity = checkpoint_granularity,
                 };
             },
             nb::arg("group_id"), nb::arg("block_granularity"), nb::arg("total_pages"), nb::arg("attn_kind"),
             nb::arg("sliding_window_tokens") = std::nullopt, nb::arg("cache_blocks_per_lcm_block") = 1,
             nb::arg("transfer_policy") = tokenspeed::CacheTransferPolicy::Unspecified, nb::arg("shard_count") = 1,
-            nb::arg("replayable") = false, nb::arg("checkpoint_granularity") = 1)
+            nb::arg("replayable") = false, nb::arg("checkpoint_granularity") = 1, nb::arg("sink_tokens") = 0)
         .def_rw("group_id", &tokenspeed::CacheGroupConfig::group_id)
         .def_rw("block_granularity", &tokenspeed::CacheGroupConfig::block_granularity)
         .def_rw("total_pages", &tokenspeed::CacheGroupConfig::total_pages)
@@ -150,6 +158,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("shard_count", &tokenspeed::CacheGroupConfig::shard_count)
         .def_rw("attn_kind", &tokenspeed::CacheGroupConfig::attn_kind)
         .def_rw("sliding_window_tokens", &tokenspeed::CacheGroupConfig::sliding_window_tokens)
+        .def_rw("sink_tokens", &tokenspeed::CacheGroupConfig::sink_tokens)
         .def_rw("replayable", &tokenspeed::CacheGroupConfig::replayable)
         .def_rw("checkpoint_granularity", &tokenspeed::CacheGroupConfig::checkpoint_granularity)
         .def_rw("transfer_policy", &tokenspeed::CacheGroupConfig::transfer_policy)
@@ -161,6 +170,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("enable_short_prefill_first", &tokenspeed::SchedulerConfig::enable_short_prefill_first)
         .def_rw("max_kv_page_num", &tokenspeed::SchedulerConfig::max_kv_page_num)
         .def_rw("max_batch_size", &tokenspeed::SchedulerConfig::max_batch_size)
+        .def_rw("max_resident_requests", &tokenspeed::SchedulerConfig::max_resident_requests)
         .def_rw("decode_input_tokens", &tokenspeed::SchedulerConfig::decode_input_tokens)
         .def_rw("overlap_schedule_depth", &tokenspeed::SchedulerConfig::overlap_schedule_depth)
         .def_rw("role", &tokenspeed::SchedulerConfig::role)
@@ -185,6 +195,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("enable_kv_cache_events", &tokenspeed::SchedulerConfig::enable_kv_cache_events)
         .def_rw("enable_mixed_prefill_decode", &tokenspeed::SchedulerConfig::enable_mixed_prefill_decode)
         .def_rw("prefill_decode_interval", &tokenspeed::SchedulerConfig::prefill_decode_interval)
+        .def_rw("prefill_decode_min_interval", &tokenspeed::SchedulerConfig::prefill_decode_min_interval)
         .def_rw("disable_prefix_cache", &tokenspeed::SchedulerConfig::disable_prefix_cache)
         .def_rw("prefix_replay_tokens", &tokenspeed::SchedulerConfig::prefix_replay_tokens)
         .def_rw("state_checkpoint_in_forward", &tokenspeed::SchedulerConfig::state_checkpoint_in_forward)
@@ -220,6 +231,9 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     nb::class_<tokenspeed::RequestSpec>(m, "RequestSpec")
         .def(nb::init<>())
         .def_rw("request_id", &tokenspeed::RequestSpec::request_id)
+        .def_rw("session_id", &tokenspeed::RequestSpec::session_id)
+        .def_rw("cache_group_id", &tokenspeed::RequestSpec::cache_group_id)
+        .def_rw("shared_prefix_tokens", &tokenspeed::RequestSpec::shared_prefix_tokens)
         .def_rw("tokens", &tokenspeed::RequestSpec::tokens)
         .def_rw("max_new_tokens", &tokenspeed::RequestSpec::max_new_tokens)
         .def_rw("max_cached_prefix_tokens", &tokenspeed::RequestSpec::max_cached_prefix_tokens);
@@ -316,7 +330,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("restore", &tokenspeed::CacheCoordinator::DeviceEvictionStats::restore)
         .def_ro("flush", &tokenspeed::CacheCoordinator::DeviceEvictionStats::flush)
         .def_ro("tail_cap", &tokenspeed::CacheCoordinator::DeviceEvictionStats::tail_cap)
-        .def_ro("dead_entry_collection", &tokenspeed::CacheCoordinator::DeviceEvictionStats::dead_entry_collection);
+        .def_ro("dead_entry_collection", &tokenspeed::CacheCoordinator::DeviceEvictionStats::dead_entry_collection)
+        .def_ro("compaction", &tokenspeed::CacheCoordinator::DeviceEvictionStats::compaction);
     nb::class_<tokenspeed::TierTransferManager::WriteBackStats>(m, "WriteBackStats")
         .def_ro("ops", &tokenspeed::TierTransferManager::WriteBackStats::ops)
         .def_ro("blocks", &tokenspeed::TierTransferManager::WriteBackStats::blocks)
@@ -350,6 +365,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("dead_entries_not_written_back", &tokenspeed::HostCacheStats::dead_entries_not_written_back)
         .def_ro("demoted_entries_not_written_back", &tokenspeed::HostCacheStats::demoted_entries_not_written_back)
         .def_ro("device_evictions", &tokenspeed::HostCacheStats::device_evictions)
+        .def_ro("lone_compactions", &tokenspeed::HostCacheStats::lone_compactions)
+        .def_ro("lone_compaction_moves", &tokenspeed::HostCacheStats::lone_compaction_moves)
         .def_ro("checkpoint_resume_gaps", &tokenspeed::HostCacheStats::checkpoint_resume_gaps);
 
     // ─── ExecutionEvent ─────────────────────────────────────────────
@@ -359,7 +376,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
 
     const auto storage_keys = [](const std::vector<tokenspeed::CacheKey>& values) {
         nb::list keys;
-        for (const auto& key : values) keys.append(nb::make_tuple(key.group_id, key.content_hash, key.page_offset));
+        for (const auto& key : values)
+            keys.append(nb::make_tuple(key.group_id, key.content_hash.ToString(), key.page_offset));
         return keys;
     };
 
@@ -609,10 +627,13 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
 
     // A request the scheduler finished on its own while building the plan:
     // the last resort of a capacity retraction whose victim's KV image did not
-    // fit the host budgets. Already Finished on every rank; the runtime fails
-    // it toward the client with `detail` as the message.
+    // fit the host budgets, or a lone request on the fused role that made no
+    // progress for Scheduler::kNoProgressAbortPlans consecutive plans. Already
+    // Finished on every rank; the runtime fails it toward the client with
+    // `detail` as the message.
     nb::enum_<tokenspeed::AbortReason>(m, "AbortReason", nb::is_arithmetic())
-        .value("ImageDoesNotFit", tokenspeed::AbortReason::kImageDoesNotFit);
+        .value("ImageDoesNotFit", tokenspeed::AbortReason::kImageDoesNotFit)
+        .value("NoProgress", tokenspeed::AbortReason::kNoProgress);
     nb::class_<tokenspeed::SchedulerAbort>(m, "SchedulerAbort")
         .def_ro("request_id", &tokenspeed::SchedulerAbort::request_id)
         .def_ro("reason", &tokenspeed::SchedulerAbort::reason)
@@ -708,6 +729,12 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
              "Count requests suspended with an image (Retracted or Restoring); a weight update must not flush "
              "while this is non-zero.")
         .def("decoding_size", &tokenspeed::Scheduler::DecodingSize, "Count requests in the Decoding FSM state.")
+        .def("allocated_request_slots", &tokenspeed::Scheduler::AllocatedRequestSlots,
+             "Count physical request rows, including unfinished restore or cancellation operations.")
+        .def("active_decode_slots", &tokenspeed::Scheduler::ActiveDecodeSlots,
+             "Count execution permits, including restore reservations and finishing forwards.")
+        .def("ready_waiting_size", &tokenspeed::Scheduler::ReadyWaitingSize,
+             "Count completed prefills waiting for their first local decode permit.")
         .def("prefilling_size", &tokenspeed::Scheduler::PrefillSize,
              "Count local/remote prefills, PrefillAwaitingResult, and PrefillDone requests.")
         .def("remote_prefilling_size", &tokenspeed::Scheduler::RemotePrefillSize,
@@ -761,7 +788,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                 page_offsets.reserve(keys.size());
                 for (const tokenspeed::CacheKey& key : keys) {
                     group_ids.push_back(key.group_id);
-                    hashes.push_back(key.content_hash);
+                    hashes.push_back(key.content_hash.ToString());
                     page_offsets.push_back(key.page_offset);
                 }
                 return std::tuple{std::move(group_ids), std::move(hashes), std::move(page_offsets)};

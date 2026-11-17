@@ -202,6 +202,7 @@ def test_engine_role_selects_warmup_and_prefill_buckets(
         prefill_graph_max_tokens=prefill_graph_max_tokens,
     )
     assert config.attention_tp_size == attention_tp_size
+    assert config.moe_tp_ep_size == 16
     assert config.data_parallel_size == 16 // attention_tp_size
     assert config.decode_only_attention is (role == "decode")
     assert config.prefill_only is (role == "prefill")
@@ -305,6 +306,9 @@ class _AutotuneExecutor:
         self._model_input_kwargs_hook = model_input_kwargs
         self._events = events
         self.device = "cpu"
+        # autotune() runs its dummy forwards on the serving stream.
+        self.device_module = torch.get_device_module(self.device)
+        self.execution_stream = self.device_module.Stream()
         # The stub gathers whole sampled rows, so autotune() runs no
         # vocab-shard warmup.
         self._samples_from_vocab_shard = False
@@ -315,6 +319,18 @@ class _AutotuneExecutor:
     def _autotune_draft_experts(self, num_tokens):
         assert tuning_module.is_warming_up()
         self._events.append(("draft_experts", num_tokens))
+
+
+class _DrafterDouble:
+    """Records the startup's extend warmup (``BaseDrafter.warmup_extend``); a
+    real drafter needs a draft model and its runner."""
+
+    def __init__(self, events):
+        self._events = events
+
+    def warmup_extend(self, num_tokens):
+        assert tuning_module.is_warming_up()
+        self._events.append(("draft_extend", num_tokens))
 
 
 class _ProcessGroupManagerDouble:
@@ -410,7 +426,7 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
         forward_step=_ForwardStepDouble(
             warmup_decode_path=draft, max_decode_bs=max_decode_bs
         ),
-        drafter=object() if speculative else None,
+        drafter=_DrafterDouble(events) if speculative else None,
         model_input_kwargs=lambda n, bs, rows: {
             "engram_hash_ids": ngram_history[rows],
             "engram_token_mask": ngram_mask[rows],
@@ -458,7 +474,10 @@ def test_startup_uses_native_buckets_without_reading_capture_sizes(
             "scrub",
             ("target", (32 if chunk_size < 0 else chunk_size)),
             *(
-                [("draft_experts", (32 if chunk_size < 0 else chunk_size))]
+                [
+                    ("draft_extend", (32 if chunk_size < 0 else chunk_size)),
+                    ("draft_experts", (32 if chunk_size < 0 else chunk_size)),
+                ]
                 if speculative
                 else []
             ),
@@ -607,7 +626,7 @@ def test_decode_only_attention_tunes_on_a_decode_step(
         forward_step=_ForwardStepDouble(
             warmup_decode_path=warmup, max_decode_bs=8, max_tokens_per_req=3
         ),
-        drafter=object() if speculative else None,
+        drafter=_DrafterDouble(events) if speculative else None,
         model_input_kwargs=no_extend_inputs,
         events=events,
     )
@@ -732,16 +751,10 @@ class _DrafterCaptureDouble:
     def capture_prefill_graph(self, stream, observer):
         self._on_capture(stream)
 
-    def extend_graph_plan(self, token_buckets, request_counts):
+    def extend_graph_plan(self, token_buckets):
         if not self._extend_graphs:
             return {}
-        return {
-            "prefill:drafter-step0": [
-                (bucket, bs)
-                for bucket in token_buckets
-                for bs in request_counts(bucket)
-            ]
-        }
+        return {"prefill:drafter-kv": [(max(token_buckets), 1)]}
 
     def capture_extend_graphs(self, capture, *, observer):
         self._on_capture(capture.stream)
@@ -750,17 +763,6 @@ class _DrafterCaptureDouble:
 class _ObserverDouble:
     def measure(self, name):
         return nullcontext()
-
-
-@dataclass
-class _CaptureConfig:
-    """The ModelExecutorConfig fields capture_graphs() reads."""
-
-    enable_drafter_prefill_graph: bool = True
-    prefill_graph_capture_batch_sizes: list[int] | None = None
-    context_len: int = 4096
-    max_num_seqs: int = 4
-    data_parallel_size: int = 1
 
 
 class _CaptureExecutor:
@@ -773,7 +775,6 @@ class _CaptureExecutor:
     _prepare_drafter_capture_batch = ModelExecutor._prepare_drafter_capture_batch
 
     def __init__(self, *, forward_step, prefill_graph, drafter):
-        self.config = _CaptureConfig()
         self.device = "cpu"
         self.forward_step = forward_step
         self.prefill_graph = prefill_graph
@@ -1286,7 +1287,9 @@ def test_situ_shared_launcher_preserves_ep_routing_and_return_contract(
     )
     fi = _FiMoeDouble(output if finalize else deferred)
     monkeypatch.setattr(mxfp4_module, "trtllm_fp4_block_scale_moe", fi)
-    monkeypatch.setattr(mxfp4_module, "trtllm_fp4_block_scale_routed_moe", fi)
+    monkeypatch.setattr(
+        mxfp4_module, "tokenspeed_trtllm_fp4_block_scale_routed_moe", fi
+    )
     monkeypatch.setattr(tuning_module, "_autotune_max_num_tokens", 9216)
     w = _RoutedWeightsDouble()
     logits = torch.randn(3, 8, dtype=torch.bfloat16)
@@ -1369,7 +1372,7 @@ class _FiGemmDouble:
         self.dispatches = []
         self._dispatch = dispatch
 
-    def _get_cache_buf(self, name, size, device):
+    def _get_stream_cache_buf(self, name, size, device):
         self.cache_buf_requests.append((name, size, device))
         return self.workspace
 
@@ -1998,3 +2001,82 @@ def test_dense_mm_override_precedes_decode_shortcut(monkeypatch, kind, numerics)
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+class _StreamDouble:
+    """A stream that records the streams it is ordered after."""
+
+    def __init__(self, name, log):
+        self.name = name
+        self._log = log
+
+    def wait_stream(self, other):
+        self._log.append(("wait", self.name, other.name))
+
+
+class _DeviceModuleDouble:
+    """Tracks the current stream through ``stream()`` like torch.cuda does."""
+
+    def __init__(self, log):
+        self._log = log
+        self.current = _StreamDouble("current", log)
+
+    def current_stream(self, device=None):
+        return self.current
+
+    def stream(self, stream):
+        module = self
+
+        class _Use:
+            def __enter__(self):
+                self.previous = module.current
+                module.current = stream
+
+            def __exit__(self, *exc):
+                module.current = self.previous
+
+        return _Use()
+
+
+@pytest.mark.parametrize("is_npu", [False, True])
+def test_startup_warmup_runs_on_the_serving_stream_only_on_npu(monkeypatch, is_npu):
+    """Ascend warms on the serving stream after the caller's writes; other
+    platforms keep the dummy forward on the caller's current stream."""
+    log = []
+    device_module = _DeviceModuleDouble(log)
+
+    def forward(**kwargs):
+        log.append(("forward", device_module.current.name))
+
+    executor = _AutotuneExecutor(
+        config=_AutotuneConfig(chunked_prefill_size=16, prefill_only=True),
+        forward=forward,
+        input_buffers=_InputBuffersDouble(
+            input_ids_buf=torch.arange(32),
+            positions_buf=torch.arange(32),
+            max_bs=8,
+            max_num_tokens=32,
+            on_fill_dummy=lambda **kwargs: None,
+        ),
+        prefill_graph=_PrefillGraphDouble(
+            make_dummy_batch=lambda n, bs: _DummyBatch(bs=bs, query_shard=None)
+        ),
+        forward_step=_ForwardStepDouble(),
+        drafter=None,
+        model_input_kwargs=lambda n, bs, rows: {},
+        events=[],
+    )
+    executor.device_module = device_module
+    executor.execution_stream = _StreamDouble("serving", log)
+    platform = type("_Platform", (), {"is_npu": is_npu})()
+    monkeypatch.setattr(executor_module, "current_platform", lambda: platform)
+    for name in ("load_autotune_cache", "save_autotune_cache"):
+        monkeypatch.setattr(executor_module, name, lambda *args: None)
+    monkeypatch.setattr(executor_module, "set_autotune_process_group", lambda g: None)
+    _tap(monkeypatch, executor_module, "autotune", lambda *args, **kwargs: None)
+    ModelExecutor.autotune(executor, keep_loaded_tactics=False)
+    if is_npu:
+        assert log == [("wait", "serving", "current"), ("forward", "serving")]
+    else:
+        assert log == [("forward", "current")]
+    assert device_module.current.name == "current"

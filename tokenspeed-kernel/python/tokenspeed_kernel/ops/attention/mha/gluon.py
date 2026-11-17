@@ -84,6 +84,10 @@ if current_platform().is_amd:
         traits={
             "head_dim": frozenset({64, 128}),
             "page_size": frozenset({64}),
+            # A plain sliding mask cannot keep leading tokens visible outside the
+            # window; an undeclared trait would serve every value and hand this
+            # leaf a window_sink it does not take.
+            "window_sink": frozenset({False}),
             "logit_cap": frozenset({False}),
             "return_lse": frozenset({False}),
             "sinks": frozenset({False, True}),
@@ -170,6 +174,10 @@ if current_platform().is_amd:
             "q_len": frozenset({1}),
             "head_dim": frozenset({64, 128}),
             "page_size": frozenset({64, 128}),
+            # A plain sliding mask cannot keep leading tokens visible outside the
+            # window; an undeclared trait would serve every value and hand this
+            # leaf a window_sink it does not take.
+            "window_sink": frozenset({False}),
             "logit_cap": frozenset({False}),
             "return_lse": frozenset({False}),
             "sinks": frozenset({False}),

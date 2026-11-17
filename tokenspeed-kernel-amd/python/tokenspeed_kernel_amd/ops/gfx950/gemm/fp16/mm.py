@@ -27,7 +27,8 @@ floating-point inputs; ``tokenspeed-kernel`` selects among them by shape.
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
+from tokenspeed_kernel_amd._extern import extern_compile_options, wait_vmem
+from tokenspeed_kernel_amd._triton import compile_ahead, gl, gluon, tl, triton
 from tokenspeed_kernel_amd.ops.gfx950._xcd import _remap_xcd
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (
     _dense16_mm_launch_metadata,
@@ -597,7 +598,7 @@ def gluon_mm_a16w16_splitk_reduce_gfx950(
     )
 
 
-@gluon.jit(launch_metadata=_dense16_mediumm_launch_metadata)
+@gluon.jit(launch_metadata=_dense16_mediumm_launch_metadata, do_not_specialize=("M",))
 def gluon_mm_a16w16_medium_gfx950(
     a_ptr,
     b_ptr,
@@ -1042,14 +1043,7 @@ def gluon_mm_a16w16_medium_gfx950(
         # invalidate cost more than the GEMM: ".wt" writes through to memory,
         # every wave waits for its stores to complete (vmcnt), and the barrier
         # orders all waves' stores before the counter bump.
-        gl.inline_asm_elementwise(
-            asm="s_waitcnt vmcnt(0)",
-            constraints="=v,0",
-            args=[offs_cm],
-            dtype=gl.int32,
-            is_pure=False,
-            pack=1,
-        )
+        wait_vmem()
         gl.barrier()
         old = gl.atomic_add(counter_ptr + tile, 1, sem="relaxed", scope="gpu")
         if old != SPLIT_K - 1:
@@ -1571,6 +1565,7 @@ def launch_gluon_mm_a16w16_medium_gfx950(
         SPLIT_K=1,
         NUM_XCDS=1,
         num_warps=warps_m * warps_n,
+        **extern_compile_options(),
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
     )
 
@@ -1682,6 +1677,8 @@ _DECODE_CONFIGS: dict[
         4: (16, 32, 256, 2, 2, 3, 1, 1),
         8: (16, 32, 256, 2, 2, 3, 1, 1),
         32: (32, 32, 256, 2, 2, 3, 1, 1),
+        64: (64, 32, 256, 2, 2, 3, 1, 8),
+        128: (64, 64, 64, 2, 2, 3, 2, 8),
     },
     # shared_gu
     (1536, 7168): {
@@ -1690,6 +1687,7 @@ _DECODE_CONFIGS: dict[
         16: (16, 16, 256, 2, 2, 2, 7, 8),
         32: (32, 32, 256, 2, 2, 3, 4, 1),
         64: (32, 32, 128, 2, 2, 2, 8, 1),
+        128: (32, 32, 64, 2, 2, 3, 4, 8),
     },
     # shared_dn
     (7168, 768): {
@@ -1698,6 +1696,8 @@ _DECODE_CONFIGS: dict[
         16: (16, 32, 256, 1, 4, 3, 1, 1),
         32: (32, 32, 256, 2, 2, 3, 1, 8),
         64: (32, 32, 256, 2, 2, 2, 1, 8),
+        128: (64, 64, 256, 2, 2, 2, 1, 8),
+        256: (64, 64, 64, 2, 2, 3, 1, 1),
     },
     # router
     (896, 7168): {
@@ -1711,6 +1711,7 @@ _DECODE_CONFIGS: dict[
     (8448, 7168): {
         16: (16, 128, 64, 1, 4, 3, 7, 1),
         32: (32, 32, 64, 2, 2, 2, 4, 8),
+        64: (64, 128, 64, 2, 2, 3, 7, 1),
     },
     # dense_dn
     (7168, 4224): {
@@ -1718,6 +1719,7 @@ _DECODE_CONFIGS: dict[
         8: (16, 32, 64, 1, 4, 3, 2, 1),
         16: (16, 32, 64, 1, 4, 3, 2, 1),
         32: (32, 32, 64, 2, 2, 3, 2, 1),
+        64: (64, 32, 64, 2, 2, 3, 2, 1),
     },
     # K3.1 indexer wq_b (replicated); up to 16 rows the GEMV takes it.
     (4096, 1536): {
@@ -1731,6 +1733,8 @@ _DECODE_CONFIGS: dict[
         16: (16, 16, 256, 2, 2, 4, 7, 8),
         32: (32, 16, 256, 2, 2, 4, 7, 8),
         64: (32, 16, 256, 2, 2, 4, 7, 8),
+        128: (32, 32, 512, 2, 2, 2, 7, 8),
+        256: (32, 32, 512, 2, 2, 2, 7, 8),
     },
     # lm_head
     (20480, 7168): {
@@ -1750,6 +1754,27 @@ _DECODE_CONFIGS: dict[
         16: (16, 32, 256, 1, 4, 3, 2, 1),
         32: (32, 32, 256, 2, 2, 3, 2, 1),
         64: (32, 32, 256, 2, 2, 3, 1, 8),
+    },
+    # K3.1 TP8 speculative-verify projections. q_b with the indexer wq_b.
+    (6400, 1536): {
+        64: (64, 32, 256, 2, 2, 3, 1, 1),
+    },
+    # KDA decay-gate up projection (f_b).
+    (1536, 128): {
+        64: (64, 16, 64, 4, 1, 2, 1, 1),
+        128: (64, 16, 64, 4, 1, 2, 1, 8),
+        256: (32, 32, 64, 2, 2, 2, 1, 1),
+    },
+    # MLA q_a with kv_a.
+    (2112, 7168): {
+        64: (64, 32, 128, 2, 2, 3, 7, 1),
+        128: (64, 64, 128, 2, 2, 2, 7, 8),
+        256: (64, 64, 64, 2, 2, 3, 4, 8),
+    },
+    # EAGLE3 MLA drafter q_b (eight heads per rank).
+    (1536, 1536): {
+        64: (32, 16, 512, 4, 1, 3, 1, 8),
+        128: (32, 32, 256, 2, 2, 3, 1, 8),
     },
     # Qwen3.8-Flash-Next TP2 per-rank projections. Its hyper-connection mix
     # GEMMs run inside gluon_hyperconnection_mix_gfx950 at decode sizes.
@@ -1821,6 +1846,7 @@ def launch_gluon_mm_a16w16_decode_gfx950(
     *,
     counters: torch.Tensor,
     out: torch.Tensor | None = None,
+    warm_variants: bool = False,
 ) -> torch.Tensor:
     """Compute decode-sized dense ``A @ B.T`` with measured split-K tiling.
 
@@ -1832,6 +1858,8 @@ def launch_gluon_mm_a16w16_decode_gfx950(
             ``gluon_mm_a16w16_decode_num_counters_gfx950(M, N, K)`` of them;
             the launch leaves them zeroed (see ``splitk.py``).
         out: Optional ``[M, N]`` destination with unit inner stride.
+        warm_variants: Also compile the configs of every other row bucket
+            measured for this ``(N, K)``, for startup warmup.
 
     Returns:
         ``[M, N]`` product in ``out_dtype``.
@@ -1865,50 +1893,74 @@ def launch_gluon_mm_a16w16_decode_gfx950(
             f"decode dense16 GEMM has no measured config for M={M}, N={N}, K={K}"
         )
 
-    block_m, block_n, block_k, warps_m, warps_n, num_buffers, split_k, num_xcds = config
     C = _resolve_output(A, (M, N), out_dtype, out, "decode dense16 GEMM")
-    num_tiles = triton.cdiv(M, block_m) * triton.cdiv(N, block_n)
-    if split_k > 1:
-        check_splitk_counters(
-            counters, num_tiles, A.device, "gfx950 decode dense16 GEMM"
+
+    def launch(config, warm: bool) -> None:
+        block_m, block_n, block_k, warps_m, warps_n, num_buffers, split_k, num_xcds = (
+            config
         )
-        partial = _get_partial_scratch(A.device, num_tiles, split_k, block_n, block_m)
-    else:
-        partial = counters = C
-    gluon_mm_a16w16_medium_gfx950[(num_tiles * split_k,)](
-        A,
-        B,
-        C,
-        C,
-        C,
-        partial,
-        counters,
-        M,
-        N,
-        K,
-        A.stride(0),
-        A.stride(1),
-        B.stride(1),
-        B.stride(0),
-        C.stride(0),
-        C.stride(1),
-        C.stride(0),
-        C.stride(1),
-        C.stride(0),
-        C.stride(1),
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        BLOCK_K=block_k,
-        WARPS_M=warps_m,
-        WARPS_N=warps_n,
-        NUM_BUFFERS=num_buffers,
-        GROUP_SIZE_M=GROUP_SIZE_M,
-        ADD3=False,
-        SPLIT_K=split_k,
-        NUM_XCDS=num_xcds,
-        num_warps=warps_m * warps_n,
-        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
-    )
+        num_tiles = triton.cdiv(M, block_m) * triton.cdiv(N, block_n)
+        if split_k == 1:
+            partial = arrivals = C
+        elif warm:
+            # Compiling reads only the pointer types and alignment.
+            partial = torch.empty(16, device=A.device, dtype=torch.float32)
+            arrivals = torch.empty(16, device=A.device, dtype=torch.int32)
+        else:
+            check_splitk_counters(
+                counters, num_tiles, A.device, "gfx950 decode dense16 GEMM"
+            )
+            partial = _get_partial_scratch(
+                A.device, num_tiles, split_k, block_n, block_m
+            )
+            arrivals = counters
+        args = (
+            A,
+            B,
+            C,
+            C,
+            C,
+            partial,
+            arrivals,
+            M,
+            N,
+            K,
+            A.stride(0),
+            A.stride(1),
+            B.stride(1),
+            B.stride(0),
+            C.stride(0),
+            C.stride(1),
+            C.stride(0),
+            C.stride(1),
+            C.stride(0),
+            C.stride(1),
+        )
+        kwargs = dict(
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_K=block_k,
+            WARPS_M=warps_m,
+            WARPS_N=warps_n,
+            NUM_BUFFERS=num_buffers,
+            GROUP_SIZE_M=GROUP_SIZE_M,
+            ADD3=False,
+            SPLIT_K=split_k,
+            NUM_XCDS=num_xcds,
+            num_warps=warps_m * warps_n,
+            **extern_compile_options(),
+            llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
+        )
+        if warm:
+            compile_ahead(gluon_mm_a16w16_medium_gfx950, *args, **kwargs)
+        else:
+            gluon_mm_a16w16_medium_gfx950[(num_tiles * split_k,)](*args, **kwargs)
+
+    if warm_variants:
+        for other in dict.fromkeys(_DECODE_CONFIGS[(N, K)].values()):
+            if other != config:
+                launch(other, warm=True)
+    launch(config, warm=False)
     return C
 
 
@@ -1998,6 +2050,7 @@ def launch_gluon_mm_a16w16_column_shard_gfx950(
         SPLIT_K=1,
         NUM_XCDS=1,
         num_warps=4,
+        **extern_compile_options(),
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
     )
     return out
@@ -2196,6 +2249,7 @@ def launch_gluon_grouped_mm_a16w16_decode_gfx950(
         STRIDE_GATE_G=0 if gate is None else gate.stride(1),
         GATE=gate is not None,
         num_warps=warps_m * warps_n,
+        **extern_compile_options(),
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
     )
     return (out.view(M, G * N), scales) if quantize else out
@@ -2304,6 +2358,7 @@ def launch_gluon_mm_a16w16_decode_add3_gfx950(
         SPLIT_K=1,
         NUM_XCDS=num_xcds,
         num_warps=warps_m * warps_n,
+        **extern_compile_options(),
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
     )
     return C

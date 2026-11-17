@@ -20,10 +20,10 @@ The workflow completes these stages in order:
    an earlier failed GPU test. Exclude disabled workflows and package
    publishers. Missing source runs, including commits inside a multi-commit
    push, require manual intervention. A change to `main` stops this release.
-   Check that the latest stable MLA and scheduler releases contain all current
-   changes in their component directories, using PyPI's published source
-   provenance and Git history. Their versions on `main` and the MLA pin in the
-   kernel and scheduler requirement in the runtime must match those releases.
+   Check that the latest stable MLA release contains all current changes in
+   its component directory, using PyPI's published source provenance and Git
+   history. Its version on `main` and the MLA pin in the kernel must match
+   that release.
    The two TokenSpeed version declarations must agree.
 2. Create a version PR for `tokenspeed-kernel-amd`, verify its exact metadata diff, merge it,
    and publish its immutable `release/<version>` source to PyPI and the wheelhouse.
@@ -36,7 +36,7 @@ The workflow completes these stages in order:
    identical distributions to the wheelhouse.
 5. Update the stable CUDA and ROCm pip indexes, preserving previous releases.
 6. Publish the existing NVIDIA Docker image for `linux/amd64` and `linux/arm64`.
-   The image installs and checks the exact released kernel, scheduler, and MLA
+   The image installs and checks the exact released kernel and MLA
    versions. Confirm both platforms are in the published manifest.
 7. Create `v<version>` at the TokenSpeed release commit with generated release
    notes, a component version table, and links to PyPI, wheelhouse releases,
@@ -108,30 +108,35 @@ in the ROCm index.
 
 ## Scheduler releases
 
+Each Linux architecture (x86_64 and aarch64, glibc 2.28+) gets two scheduler
+wheels: `cp311-cp311` for CPython 3.11 and `cp312-abi3` for standard,
+GIL-enabled CPython 3.12 and later. Python 3.10 is no longer supported.
+The publisher audits the stable ABI and runs the scheduler Python tests with
+the same abi3 wheel on Python 3.12–3.15. Its `dry_run` input builds and tests
+the distributions without publishing them.
+
 Run **Scheduler release pipeline** manually from `main`. Its optional `version`
 must be a stable version greater than both the scheduler source and PyPI
-versions. Leave it empty to increment the greater version's patch. The three
+versions. Leave it empty to increment the greater version's patch. The two
 stages are:
 
 1. Bump `tokenspeed-scheduler/pyproject.toml` through a signed metadata PR.
 2. Run the existing scheduler publisher at that exact commit on a pinned branch.
    Wait for wheel builds, GitHub release and PyPI publication. Check PyPI source
    provenance, matching distribution hashes, and availability in the pip index.
-3. Update only `tokenspeed-scheduler>=<version>` in `python/pyproject.toml` through
-   a second signed metadata PR. TokenSpeed's own version remains unchanged.
 
-Both metadata PRs merge immediately using the same bot exemption and exact-diff
+TokenSpeed uses the scheduler built into tokenspeed-engine, so no TokenSpeed
+dependency PR follows.
+
+The metadata PR merges immediately using the same bot exemption and exact-diff
 lease as biweekly releases, without waiting for main or PR CI. Publication checks
-remain mandatory. Source changes in the scheduler before the dependency merge
-stop the pipeline. The dependency PR's base can include unrelated changes.
-The two pipelines share a concurrency group and the existing token and publisher.
+remain mandatory. The two pipelines share a concurrency group and the existing
+token and publisher.
 
 If publication fails, repair its recorded child run and **re-run failed jobs** here.
 The `weekly-state-scheduler-*` artifacts retain the reserved version, PRs, pinned
-source and publisher run. A rerun never dispatches the publisher again. Until the
-dependency stage succeeds, biweekly preflight can stop on the scheduler version
-mismatch. Start a new pipeline only for a new release, not to recover a partial
-one. Pinned scheduler release branches remain available for recovery. If `main`
+source and publisher run. A rerun never dispatches the publisher again. Start a
+new pipeline only for a new release, not to recover a partial one. Pinned scheduler release branches remain available for recovery. If `main`
 moves after the pipeline records a metadata PR's base, or someone edits the
 PR, manual resolution is required. A rerun does not rebase or overwrite the
 recorded PR.

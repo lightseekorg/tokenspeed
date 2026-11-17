@@ -43,7 +43,7 @@ from __future__ import annotations
 from abc import ABC
 from collections.abc import Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -114,18 +114,22 @@ class SparseTopKShare:
     verify window); each family stores its own record type. ``qsa_metadata``
     holds QSA's layer-invariant row geometry so it is built once per forward;
     ``qsa_selection`` retains its logical candidates alongside physical slots.
+    ``write_slots`` holds the KVP-local write slots the layers resolved from
+    the round's virtual write slots (``placement.resolve_write_slots``).
     """
 
     prefill: Any | None = None
     decode: Any | None = None
     qsa_metadata: Any | None = None
     qsa_selection: Any | None = None
+    write_slots: list = field(default_factory=list)
 
     def clear(self) -> None:
         self.prefill = None
         self.decode = None
         self.qsa_metadata = None
         self.qsa_selection = None
+        self.write_slots = []
 
 
 class CachePoolBinding:
@@ -142,6 +146,14 @@ class CachePoolBinding:
     def child_backends(self) -> tuple[CachePoolBinding, ...]:
         """The nodes this one composes (graph support, pointer walk, binding); leaves: ()."""
         return ()
+
+    def fixed_workspace_bytes(self) -> int:
+        """Return recipe-reserved workspace bytes, excluding the shared arena.
+
+        Stateless leaves return zero. Owners add their allocations to the
+        children's total, without counting graph metadata or arena views.
+        """
+        return sum(child.fixed_workspace_bytes() for child in self.child_backends())
 
     def validate_cache_pool(self, cache_pool: CachePool) -> None:
         """Raise if this node or any child cannot rebind to ``cache_pool``."""
@@ -172,6 +184,20 @@ class CachePoolBinding:
         """``layer``'s decode cache view (:class:`DecodeKVView`), or None when
         this backend's decode needs more than the cache and metadata (block
         or per-tensor scales, a split schedule, another kernel family)."""
+        return None
+
+    def takes_owned_decode_topk(self, layer: PagedAttention) -> bool:
+        """Whether ``layer``'s sparse decode takes this rank's share of the
+        top-k as local cache slots (``topk_owned``) instead of the whole
+        selection as scheduler slots."""
+        return False
+
+    def dcp_decode_query_rider(
+        self, layer: PagedAttention, q: torch.Tensor
+    ) -> torch.Tensor | None:
+        """Bytes of ``q`` for an owned decode top-k's score gather to carry
+        to ``layer``'s sparse decode (``gathered_query``), or None where
+        that decode gathers its query itself."""
         return None
 
     def reads_fp8_kv_scales(self, layer: PagedAttention) -> bool:
@@ -220,17 +246,17 @@ class CachePoolBinding:
         return slot_state_image_bytes(self.slot_state_rows(0))
 
     def export_slot_state(
-        self, slot: int, out: torch.Tensor, stream, *, request_id: str
+        self, slot: int, out: torch.Tensor, stream, *, admission_id: int
     ) -> None:
         # Backend rows are rewritten by every forward and prepared at a PD
         # landing, never keyed by request: always valid, nothing to mark.
-        del request_id
+        del admission_id
         pack_slot_rows(self.slot_state_rows(slot), out, stream)
 
     def import_slot_state(
-        self, slot: int, src: torch.Tensor, stream, *, request_id: str
+        self, slot: int, src: torch.Tensor, stream, *, admission_id: int
     ) -> None:
-        del request_id
+        del admission_id
         unpack_slot_rows(self.slot_state_rows(slot), src, stream)
 
     def prepare_cache_batch(
@@ -299,6 +325,13 @@ class AttentionBackend(CachePoolBinding, ABC):
         {"full_history", "sliding_window"}
     )
 
+    # Whether this side computes a query-context shard of the extend span. The
+    # runner reads it to decide whether to hand a side the forward's shard plan:
+    # the draft of a sharded target may itself be unsharded, and a backend that
+    # cannot attend a shard refuses one (``reject_query_shard``). A subclass that
+    # skips ``__init__`` sets it from its config or the child it wraps.
+    query_sharded: bool = False
+
     @property
     def stores_in_forward_state_checkpoints(self) -> bool:
         """Whether every State group this node consumes stores in-forward checkpoints.
@@ -324,6 +357,11 @@ class AttentionBackend(CachePoolBinding, ABC):
     # This backend forwards each layer's ``sliding_window_size`` to its kernels.
     # Left False, a declared window silently widens to full-history attention.
     supports_layer_sliding_window: bool = False
+    # This backend keeps each layer's ``sliding_window_sink`` leading tokens
+    # visible outside the window. Left False, a declared sink silently
+    # degrades to plain sliding-window attention: no error, only a quality
+    # loss, so a drafter refuses the pairing up front.
+    supports_layer_window_sink: bool = False
 
     def __init__(self, config: AttnConfig, spec: SoftmaxAttnConfig) -> None:
         self.device = config.device

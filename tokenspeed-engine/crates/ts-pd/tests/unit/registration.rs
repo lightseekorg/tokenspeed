@@ -61,7 +61,6 @@ fn shared(native: &NativeLibrary) -> Shared {
             fields_by_stage: vec![vec!["layer.0.kv".to_owned(), "layer.1.state".to_owned()]],
         },
         state: Mutex::new(State::default()),
-        registration_gate: RwLock::new(()),
         status_rank: 0,
         failed_session_ttl: Duration::from_secs(30),
         metrics: None,
@@ -228,4 +227,77 @@ fn a_cancelled_room_stays_closed_until_every_decode_cache_retires() {
     assert!(peer.state().cancelled.is_empty());
     assert!(preallocate(&peer, "cache-a", 1).is_err());
     assert!(preallocate(&peer, "cache-b", 1).is_err());
+}
+
+#[test]
+fn replacement_waits_for_its_writer_without_blocking_other_registrations() {
+    let native = NativeLibrary::new();
+    let peer = Arc::new(shared(&native));
+    let source = Arc::new(vec![73u8; 32]);
+    let destination = Arc::new(vec![0u8; 32]);
+    let receiver =
+        ts_mooncake::Engine::start(peer.transport.library.clone(), "127.0.0.1", "rdma", "")
+            .unwrap();
+    peer.transport
+        .engine()
+        .register(source.as_ptr() as usize, source.len())
+        .unwrap();
+    receiver
+        .register(destination.as_ptr() as usize, destination.len())
+        .unwrap();
+    let session = receiver.session_id();
+    register(&peer, "old-cache", session, 42001);
+    preallocate(&peer, "old-cache", 1).unwrap();
+    let old = peer
+        .plan_registration(&registration("old-cache", session, 42001))
+        .unwrap();
+    native.block_writes();
+    let writer = {
+        let peer = peer.clone();
+        let source = source.clone();
+        let destination = destination.clone();
+        let old = old.clone();
+        thread::spawn(move || {
+            peer.write_copies(
+                1,
+                &old,
+                &[Copy::Spans {
+                    sources: vec![source.as_ptr() as u64],
+                    destinations: vec![destination.as_ptr() as u64],
+                    lengths: vec![32],
+                }],
+            )
+        })
+    };
+    assert!(native.wait_write_entered(Duration::from_secs(2)));
+    let (incoming, received) = mpsc::channel();
+    let replies = crate::net::Sockets::start("127.0.0.1", incoming).unwrap();
+    register(&peer, "new-cache", session, replies.port());
+    // The replacement cannot publish while the old write is inside native I/O.
+    assert!(preallocate(&peer, "new-cache", 2).is_err());
+    preallocate(&peer, "old-cache", 3).unwrap();
+    register(&peer, "independent-cache", "127.0.0.1:41003", 42003);
+    preallocate(&peer, "independent-cache", 4).unwrap();
+    // Cancellation of a deferred cache is processed before activation. Its
+    // queued manifest must not revive the cancelled room after replacement.
+    peer.handle_cancellation(&wire::cancellation_frames(2, "new-cache"));
+    let ack = received.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(
+        wire::cancellation_ack(&ack).unwrap(),
+        (2, "new-cache".to_owned(), 0)
+    );
+    let manifest = wire::preallocation_frames(2, "new-cache", Some(b"{}"));
+    peer.handle_preallocation(&manifest);
+    native.release_writes();
+    writer.join().unwrap().unwrap();
+    assert_eq!(*destination, *source);
+    peer.flush_registrations();
+    assert!(peer
+        .write_copies(1, &old, &[])
+        .unwrap_err()
+        .contains("retired"));
+    assert!(preallocate(&peer, "old-cache", 5).is_err());
+    preallocate(&peer, "new-cache", 6).unwrap();
+    assert!(!peer.state().destinations.contains_key(&2));
+    preallocate(&peer, "independent-cache", 7).unwrap();
 }

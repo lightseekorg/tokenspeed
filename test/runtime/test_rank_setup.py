@@ -30,11 +30,13 @@ here rather than at the binding on startup.
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 import re
 import sys
 from types import SimpleNamespace
 
+import huggingface_hub.constants
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -42,7 +44,7 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
-ts = pytest.importorskip("tokenspeed_scheduler")
+ts = pytest.importorskip("tokenspeed_engine.scheduler")
 
 from test.runtime.cache_pool_test_utils import (  # noqa: E402
     make_layer_group_ids,
@@ -53,6 +55,7 @@ import tokenspeed.runtime.engine.rank_setup as rank_setup  # noqa: E402
 from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig  # noqa: E402
 from tokenspeed.runtime.distributed.mapping import Mapping  # noqa: E402
 from tokenspeed.runtime.engine.rank_setup import (  # noqa: E402
+    load_model_config,
     rank_process_title,
     scheduler_config_from_args,
 )
@@ -89,6 +92,7 @@ def _config(args: ServerArgs, specs):
         storage_config=storage_config,
         max_scheduled_tokens=args.chunked_prefill_size,
         max_batch_size=args.retraction_snapshot_max_requests or 8,
+        max_resident_requests=args.retraction_snapshot_max_requests or 8,
         decode_input_tokens=1,
         overlap_schedule_depth=0,
         enable_kv_cache_events=False,
@@ -162,6 +166,7 @@ def test_make_config_requires_and_maps_the_host_write_policy():
         num_device_pages=32,
         max_scheduled_tokens=64,
         max_batch_size=8,
+        max_resident_requests=8,
         prefix_granularity=2,
         num_host_pages=0,
         disable_l2_cache=True,
@@ -172,6 +177,7 @@ def test_make_config_requires_and_maps_the_host_write_policy():
         max_retracted_requests=0,
         storage_config=None,
         prefill_decode_interval=0,
+        prefill_decode_min_interval=0,
     )
     # Keyword-only and required, with or without a Host tier.
     with pytest.raises(TypeError, match="host_write_policy"):
@@ -194,6 +200,26 @@ def test_the_prefill_decode_interval_reaches_the_scheduler():
     assert cfg.prefill_decode_interval == 64
 
 
+def test_the_prefill_decode_min_interval_reaches_the_scheduler():
+    args = prepare_server_args(
+        [
+            "--model",
+            "x",
+            "--max-num-seqs",
+            "8",
+            "--prefill-decode-interval",
+            "32",
+            "--prefill-decode-min-interval",
+            "2",
+        ]
+    )
+    cfg = _config(
+        args, _specs(num_host_pages=17, num_snapshot_pages=5, max_retracted=8)
+    )
+    assert cfg.prefill_decode_interval == 32
+    assert cfg.prefill_decode_min_interval == 2
+
+
 @pytest.mark.parametrize(
     "flags,error",
     [
@@ -205,6 +231,22 @@ def test_the_prefill_decode_interval_reaches_the_scheduler():
         (
             ["--prefill-decode-interval", "64", "--disaggregation-mode", "decode"],
             "needs --disaggregation-mode null",
+        ),
+        (["--prefill-decode-min-interval", "-1"], "must be non-negative"),
+        (
+            ["--prefill-decode-min-interval", "2", "--disaggregation-mode", "decode"],
+            "needs --disaggregation-mode null",
+        ),
+        (
+            [
+                "--prefill-decode-min-interval",
+                "2",
+                "--prefill-attempt-interval",
+                "4",
+                "--prefill-any-attempt-interval",
+                "64",
+            ],
+            "--prefill-decode-min-interval cannot be combined",
         ),
     ],
 )
@@ -220,7 +262,18 @@ def test_server_args_refuse_a_prefill_decode_interval_it_cannot_honor(flags, err
         (["--prefill-decode-interval", "64"], None, 64),
         (
             ["--prefill-attempt-interval", "4", "--prefill-any-attempt-interval", "64"],
-            (4, 64),
+            (4, 64, False),
+            0,
+        ),
+        (
+            [
+                "--prefill-attempt-interval",
+                "4",
+                "--prefill-any-attempt-interval",
+                "64",
+                "--prefill-single-round",
+            ],
+            (4, 64, True),
             0,
         ),
     ],
@@ -251,6 +304,22 @@ def test_prefill_delay_rejects_an_incomplete_pair_at_construction(attempt, any_a
             prefill_attempt_interval=attempt,
             prefill_any_attempt_interval=any_attempt,
         )
+
+
+def test_prefill_single_round_requires_the_gate():
+    with pytest.raises(
+        ValueError, match="--prefill-single-round requires --prefill-attempt-interval"
+    ):
+        prepare_server_args(
+            ["--model", "x", "--max-num-seqs", "8", "--prefill-single-round"]
+        )
+
+
+def test_prefill_single_round_is_rejected_without_the_gate_after_changes():
+    args = ServerArgs(model="x", max_num_seqs=8)
+    args.prefill_single_round = True
+    with pytest.raises(ValueError, match="--prefill-single-round requires"):
+        _ = args.prefill_delay
 
 
 @pytest.mark.parametrize("mixed", [False, True])
@@ -699,18 +768,6 @@ def test_write_back_is_refused_without_its_prerequisites(flags, refused, monkeyp
         ),
         (
             [
-                "--attn-tp-size",
-                "8",
-                "--kv-parallel-size",
-                "8",
-                "--decode-context-parallel-size",
-                "8",
-                "--enable-mixed-batch",
-            ],
-            "Aggregated DCP does not support --enable-mixed-batch",
-        ),
-        (
-            [
                 "--disaggregation-mode",
                 "prefill",
                 "--attn-tp-size",
@@ -724,7 +781,7 @@ def test_write_back_is_refused_without_its_prerequisites(flags, refused, monkeyp
             "null or decode",
         ),
     ],
-    ids=["fused_kvp_without_dcp", "fused_dcp_mixed_batch", "prefill_dcp"],
+    ids=["fused_kvp_without_dcp", "prefill_dcp"],
 )
 def test_write_back_leaves_the_context_parallel_rules_as_they_are(flags, refused):
     # A fused engine writes back over sharded pages only as the DCP engine
@@ -976,6 +1033,7 @@ def test_make_config_sets_the_prefill_chunk_yield_only_when_on():
         num_device_pages=32,
         max_scheduled_tokens=64,
         max_batch_size=8,
+        max_resident_requests=8,
         prefix_granularity=2,
         num_host_pages=0,
         disable_l2_cache=True,
@@ -987,6 +1045,7 @@ def test_make_config_sets_the_prefill_chunk_yield_only_when_on():
         storage_config=None,
         host_write_policy="write_through",
         prefill_decode_interval=0,
+        prefill_decode_min_interval=0,
     )
     assert make_config(**fields).prefill_chunk_yield_tokens == 0
     assert (
@@ -1015,3 +1074,109 @@ def test_a_rank_is_titled_by_its_parallel_ranks(mapping, title):
     # The attention TP rank always shows; another dimension only when it
     # has more than one rank.
     assert rank_process_title(mapping) == title
+
+
+_TINY_LLAMA = {
+    "model_type": "llama",
+    "architectures": ["LlamaForCausalLM"],
+    "hidden_size": 64,
+    "intermediate_size": 128,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 4,
+    "num_hidden_layers": 1,
+    "vocab_size": 128,
+    "max_position_embeddings": 256,
+}
+
+
+def _cache_repo(cache, repo: str, refs: dict[str, int]) -> None:
+    """Caches one snapshot per ref. Each snapshot's hidden size identifies it."""
+    repo_dir = cache / f"models--{repo.replace('/', '--')}"
+    (repo_dir / "refs").mkdir(parents=True)
+    for index, (ref, hidden_size) in enumerate(refs.items()):
+        commit = f"{index + 1}" * 40
+        snapshot = repo_dir / "snapshots" / commit
+        snapshot.mkdir(parents=True)
+        config = dict(_TINY_LLAMA, hidden_size=hidden_size)
+        (snapshot / "config.json").write_text(json.dumps(config))
+        (repo_dir / "refs" / ref).write_text(commit)
+
+
+@pytest.fixture
+def offline_hub(tmp_path, monkeypatch):
+    """An offline Hugging Face cache with a target and a separate draft repo.
+
+    Only the target repo has the ref ``pinned``. Repo names are unique per
+    test because loaded configs are cached.
+    """
+    repo = tmp_path.name
+    target, draft = f"org/{repo}-target", f"org/{repo}-draft"
+    _cache_repo(tmp_path, target, {"main": 64, "pinned": 48})
+    _cache_repo(tmp_path, draft, {"main": 32, "v2": 16})
+    monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_OFFLINE", True)
+    monkeypatch.setattr(huggingface_hub.constants, "HF_HUB_CACHE", str(tmp_path))
+    return target, draft
+
+
+def _target_and_draft(server_args: ServerArgs):
+    target = load_model_config(server_args, server_args.model, draft_of=None)
+    draft = load_model_config(
+        server_args, server_args.speculative_draft_model_path, draft_of=target
+    )
+    return target, draft
+
+
+@pytest.mark.parametrize("draft_revision, draft_hidden_size", [(None, 32), ("v2", 16)])
+def test_a_draft_repository_resolves_its_own_revision(
+    offline_hub, draft_revision, draft_hidden_size
+):
+    # The target's revision is a ref of the target repository only.
+    target_repo, draft_repo = offline_hub
+    args = ServerArgs(
+        model=target_repo,
+        revision="pinned",
+        speculative_algorithm="DFLASH",
+        speculative_draft_model_path=draft_repo,
+        speculative_draft_model_revision=draft_revision,
+    )
+    target, draft = _target_and_draft(args)
+    assert target.hf_config.hidden_size == 48
+    assert draft.hf_config.hidden_size == draft_hidden_size
+
+
+def test_a_draft_inside_the_target_checkpoint_shares_its_revision(offline_hub):
+    target_repo, _ = offline_hub
+    args = ServerArgs(
+        model=target_repo,
+        revision="pinned",
+        speculative_algorithm="EAGLE3",
+        speculative_draft_model_path=target_repo,
+    )
+    _, draft = _target_and_draft(args)
+    assert draft.hf_config.hidden_size == 48
+
+
+@pytest.mark.parametrize(
+    "draft, error",
+    [
+        # The draft is the target checkpoint.
+        (
+            dict(speculative_algorithm="EAGLE3", speculative_draft_model_path="org/t"),
+            "target checkpoint",
+        ),
+        # No draft model is loaded at all.
+        ({}, "no draft model is set"),
+        (
+            dict(speculative_algorithm="DUMMY", speculative_num_draft_tokens=4),
+            "no draft model is set",
+        ),
+    ],
+)
+def test_server_args_refuse_a_draft_revision_nothing_uses(draft, error):
+    with pytest.raises(ValueError, match=error):
+        ServerArgs(
+            model="org/t",
+            revision="pinned",
+            speculative_draft_model_revision="v2",
+            **draft,
+        )

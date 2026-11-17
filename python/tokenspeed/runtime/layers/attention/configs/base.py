@@ -42,22 +42,22 @@ import torch
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.utils.server_args import ServerArgs
+from tokenspeed.runtime.utils.spec_block_geometry import resolve_draft_query_width
 
 ComponentT = TypeVar("ComponentT", bound="AttnComponentSpec")
 
 
 def resolve_speculative_num_tokens(
-    server_args: ServerArgs, is_draft: bool = False
+    server_args: ServerArgs, is_draft: bool, *, sample_from_anchor: bool
 ) -> int:
     """Return the query width seen by this attention backend.
 
-    Target verification consumes the full candidate window. DSpark's draft
-    model samples from its anchor row, so seven draft queries produce the seven
-    proposals in an eight-token verify window.
+    Target verification consumes the full candidate window. Draft queries
+    follow the checkpoint's normalized anchor-sampling policy.
     """
     width = int(server_args.speculative_num_draft_tokens)
-    if is_draft and server_args.speculative_algorithm == "DSPARK":
-        return width - 1
+    if is_block_drafter(server_args.speculative_algorithm, is_draft):
+        return resolve_draft_query_width(width, sample_from_anchor)
     return width
 
 
@@ -142,6 +142,10 @@ class SoftmaxAttnConfig(AttnComponentSpec):
     """Base of the softmax-attention families (MHA / MLA / DSA / MSA)."""
 
     is_dsa: ClassVar[bool] = False
+    # Whether this family stores a latent KV page (MLA and its DSA variant) as
+    # opposed to K/V head rows (MHA, MSA). A draft of the latter kind plans an
+    # attention family of its own beside an MLA target.
+    is_latent_kv: ClassVar[bool] = False
 
     num_attention_heads: int
     num_kv_heads: int
@@ -200,6 +204,8 @@ class AttnConfig:
     # against this; user-facing limits stay on the logical context_len.
     context_len: int
     max_bs: int
+    # Real resident requests. Null row 0 and graph padding are additional rows.
+    max_resident_requests: int
     # True iff server_args.disaggregation_mode != "null"; cache recipes use
     # it to stamp transfer policies onto the cache group specs.
     pd_disaggregation_enabled: bool = False
@@ -224,9 +230,20 @@ class AttnConfig:
     qcp_size: int = 1
     qcp_rank: int = 0
     qcp_group: tuple[int, ...] = (0,)
+    # The attention TP group: a long sparse prefill can hand each rank a row
+    # shard with every head of it (replicated KV only).
+    attn_tp_rank: int = 0
+    attn_tp_group: tuple[int, ...] = (0,)
     components: tuple[AttnComponentSpec, ...]
 
     def __post_init__(self):
+        from tokenspeed.runtime.execution.request_slots import RequestSlotLayout
+
+        if type(self.max_bs) is not int or self.max_bs <= 0:
+            raise ValueError("max_bs must be a positive integer")
+        RequestSlotLayout(self.max_resident_requests)
+        if self.max_resident_requests < self.max_bs:
+            raise ValueError("max_resident_requests must be at least max_bs")
         softmax_components = [
             c for c in self.components if isinstance(c, SoftmaxAttnConfig)
         ]
@@ -269,11 +286,33 @@ class AttnConfig:
                 )
         if self.kvp_size > 1:
             softmax = softmax_components[0]
+            if self.is_draft and not softmax.is_latent_kv:
+                # A block drafter of its own attention family (DFlash: a GQA
+                # stack storing K/V head rows) shares the target's full-history
+                # group (check_block_drafter_storage), so page-sharding that
+                # group puts head-partitioned K/V inside a sharded group, which
+                # PD refuses to transfer (ts-pd layout/route.rs). Refused here,
+                # at startup, not per request once traffic arrives.
+                raise ValueError(
+                    "--kv-parallel-size > 1 page-shards the cache group a "
+                    "block drafter shares with the target, but this draft "
+                    "stores K/V head rows, which PD cannot transfer from a "
+                    "page-sharded group; launch with --kv-parallel-size 1 "
+                    "(and --query-context-parallel-size 1), or use a draft "
+                    "that plans the target's own attention"
+                )
             if softmax.backend_name == "flashmla":
                 if torch.device(self.device).type != "cuda":
                     raise ValueError("FlashMLA DCP decode requires CUDA")
             elif softmax.backend_name == "tokenspeed_mla":
                 pass
+            elif softmax.backend_name in ("mla", "gluon") and not softmax.is_dsa:
+                # The leaf refuses a platform without a decode kernel that
+                # returns the LSE (MLABackend.configure_runtime).
+                if self.draft_block_decode and not self.draft_block_causal:
+                    raise ValueError(
+                        "MLA DCP decode does not support non-causal block drafts"
+                    )
             elif softmax.is_dsa and softmax.backend_name in (None, "dsa"):
                 device_type = torch.device(self.device).type
                 if device_type not in ("cuda", "npu"):
@@ -294,7 +333,7 @@ class AttnConfig:
             else:
                 raise ValueError(
                     "--kv-parallel-size > 1 (DCP decode) currently requires "
-                    "DSA, FlashMLA or CuTe MLA attention"
+                    "DSA, FlashMLA, CuTe MLA or MLA attention"
                 )
 
     def component(self, cls: type[ComponentT]) -> ComponentT | None:
@@ -322,13 +361,21 @@ def model_wide_kwargs(
     draft_block_decode: bool = False,
     draft_block_causal: bool = False,
     speculative_num_draft_tokens: int | None = None,
+    shards_query_context: bool = False,
 ) -> dict:
     """The AttnConfig fields shared by every family's generate().
 
     The softmax family passes in the facts its policies decide (cache dtype,
     block-decode mode, and — for families that bypass the DSpark width
     convention — the raw speculative width).
+
+    ``shards_query_context`` says whether this family can compute a query
+    context parallel shard (GPU DSA through the MLA config, and V4.1). It only
+    affects a draft config; ``__post_init__`` refuses a target that cannot shard.
     """
+    max_bs = server_args.max_num_seqs // (
+        server_args.data_parallel_size or server_args.mapping.attn.dp_size
+    )
     kwargs = dict(
         device=server_args.device,
         dtype=model_config.dtype,
@@ -336,21 +383,29 @@ def model_wide_kwargs(
         kv_cache_mxfp8=kv_cache_mxfp8,
         kv_cache_quant_method=server_args.kv_cache_quant_method,
         context_len=model_config.context_len + server_args.spec_context_pad,
-        max_bs=server_args.max_num_seqs
-        // (server_args.data_parallel_size or server_args.mapping.attn.dp_size),
+        max_bs=max_bs,
+        max_resident_requests=max_bs + server_args.disaggregation_decode_extra_slots,
         pd_disaggregation_enabled=server_args.disaggregation_mode != "null",
         is_draft=is_draft,
         draft_block_decode=draft_block_decode,
         draft_block_causal=draft_block_causal,
     )
     attn_mapping = server_args.mapping.attn
+    # QCP shards the target's extend rows. A draft takes that shard only when it
+    # plans the target's own sharded attention (an MTP depth). A draft with its
+    # own ordinary attention is handed the rows the target computed and runs
+    # over them whole (the DFlash drafter builds its logits metadata with
+    # ``query_shard=None``), so it is configured unsharded.
+    draft_unsharded = is_draft and not shards_query_context
     kwargs.update(
         kvp_size=attn_mapping.kvp_size,
         kvp_rank=attn_mapping.kvp_rank,
         kvp_group=attn_mapping.kvp_group,
-        qcp_size=attn_mapping.qcp_size,
-        qcp_rank=attn_mapping.qcp_rank,
-        qcp_group=attn_mapping.qcp_group,
+        qcp_size=1 if draft_unsharded else attn_mapping.qcp_size,
+        qcp_rank=0 if draft_unsharded else attn_mapping.qcp_rank,
+        qcp_group=(0,) if draft_unsharded else attn_mapping.qcp_group,
+        attn_tp_rank=attn_mapping.tp_rank,
+        attn_tp_group=attn_mapping.tp_group,
     )
     if server_args.speculative_algorithm is not None:
         kwargs.update(
@@ -358,7 +413,15 @@ def model_wide_kwargs(
             speculative_num_draft_tokens=(
                 speculative_num_draft_tokens
                 if speculative_num_draft_tokens is not None
-                else resolve_speculative_num_tokens(server_args, is_draft)
+                else resolve_speculative_num_tokens(
+                    server_args,
+                    is_draft,
+                    sample_from_anchor=(
+                        model_config.draft_sample_from_anchor
+                        if is_block_drafter(server_args.speculative_algorithm, is_draft)
+                        else False
+                    ),
+                )
             ),
         )
     return kwargs

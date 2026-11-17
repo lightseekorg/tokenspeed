@@ -30,7 +30,7 @@ import torch
 from tokenspeed_kernel_amd._extern import (
     arithmetic_fence,
     extern_compile_options,
-    release_drain,
+    wait_vmem,
     wave_uniform_i32,
 )
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
@@ -699,7 +699,7 @@ class AttentionProgram:
             # wave's stores before the increment. The release then writes
             # back the L2 cache (BUFFER_WBL2), which makes all of those stores
             # visible to the other L2 caches.
-            release_drain()
+            wait_vmem()
         old = gl.atomic_add(
             counters_ptr + counter_offset,
             1,

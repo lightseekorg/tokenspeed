@@ -123,6 +123,7 @@ def mha_plan(
     dtype: torch.dtype,
     head_dim: int,
     window_left: int = -1,
+    window_sink: int = 0,
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
     return_lse: bool = False,
@@ -155,6 +156,13 @@ def mha_plan(
         "return_lse": return_lse,
         "sinks": sinks is not None,
         "sliding_window": window_left >= 0,
+        # Distinct from "sinks" above: that one is the attention-sink tensor
+        # FA3/FA4 take, this one is a count of leading TOKENS kept visible
+        # outside the sliding window. Like its neighbours this is a capability
+        # predicate, not the length -- a leaf declares only whether it serves a
+        # sink at all. FA3's window_size cannot express one, so a leaf declares
+        # support or the plan refuses rather than serving plain SWA.
+        "window_sink": window_sink > 0,
     }
     signature = format_signature(
         q=dense_tensor_format(dtype),
@@ -208,6 +216,9 @@ def mha_prefill(
             list[int]. Used for host-side launch metadata; must match cu_seqlens.
         max_seqlen: Maximum sequence length.
         window_left: Exclusive left sliding-window size. -1 means full attention.
+        window_sink: Number of leading tokens that stay visible outside the
+            sliding window (attention sinks, StreamingLLM). 0 disables it.
+            Distinct from ``sinks``, which is a learned per-head logit bias.
         logit_cap: Optional soft cap applied to attention logits.
         sinks: Optional attention sink tensor.
         return_lse: Whether to also return natural-log log-sum-exp values with
@@ -461,6 +472,7 @@ def _decode_selection(
     v_cache: torch.Tensor,
     max_seqlen_q: int,
     window_left: int,
+    window_sink: int,
     logit_cap: float,
     sinks: torch.Tensor | None,
     return_lse: bool,
@@ -468,6 +480,7 @@ def _decode_selection(
     k_scale: torch.Tensor | None,
     v_scale: torch.Tensor | None,
     fp8_kv_scales: tuple[float, float] | None,
+    block_draft: bool,
 ):
     """Signature, scale kwargs and traits that select a decode kernel; shared
     by mha_decode_with_kvcache and mha_decode_schedule so both pick the same
@@ -476,6 +489,7 @@ def _decode_selection(
         q, k_cache, v_cache, q_scale, k_scale, v_scale, fp8_kv_scales
     )
     traits = {
+        "block_draft": block_draft,
         "q_len": max_seqlen_q,
         "head_dim": q.shape[-1],
         "page_size": k_cache.shape[1],
@@ -483,6 +497,11 @@ def _decode_selection(
         "return_lse": return_lse,
         "sinks": sinks is not None,
         "sliding_window": window_left >= 0,
+        # FA3's window_size=(window_left, 0) is a plain sliding mask and cannot
+        # express a token sink, so this trait has to drive the selection.
+        # Declaring it only on mha_plan leaves this shared path picking FA3 and
+        # then handing it a window_sink it does not take.
+        "window_sink": window_sink > 0,
     }
     return signature, scale_kwargs, traits
 
@@ -498,6 +517,7 @@ def mha_decode_with_kvcache(
     max_seqlen_q: int,
     # attention options
     window_left: int = -1,
+    window_sink: int = 0,
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
     return_lse: bool = False,
@@ -510,6 +530,8 @@ def mha_decode_with_kvcache(
     # dispatch options
     override: str | None = None,
     solution: str | None = None,
+    *,
+    block_draft: bool,
 ) -> AttentionResult:
     """MHA decode with paged KV cache.
 
@@ -545,6 +567,8 @@ def mha_decode_with_kvcache(
             only kernels that read one.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
+        block_draft: Select noncausal draft-block attention via its trait.
+            Pass False for ordinary decode and True for a noncausal draft block.
     """
     signature, scale_kwargs, traits = _decode_selection(
         q,
@@ -552,6 +576,7 @@ def mha_decode_with_kvcache(
         v_cache,
         max_seqlen_q,
         window_left,
+        window_sink,
         logit_cap,
         sinks,
         return_lse,
@@ -559,6 +584,7 @@ def mha_decode_with_kvcache(
         k_scale,
         v_scale,
         fp8_kv_scales,
+        block_draft,
     )
     schedule_kwargs = {}
     if schedule is not None:
@@ -572,6 +598,8 @@ def mha_decode_with_kvcache(
         solution=solution,
         override=override,
     )
+    # Only the leaf the trait selected takes this argument.
+    sink_kwargs = {"window_sink": window_sink} if window_sink > 0 else {}
 
     # Record shapes
     shape_params = {
@@ -616,6 +644,7 @@ def mha_decode_with_kvcache(
             max_seqlen_k=max_seqlen_k,
             max_seqlen_q=max_seqlen_q,
             enable_pdl=pdl_enabled(),
+            **sink_kwargs,
             **scale_kwargs,
             **schedule_kwargs,
         )
@@ -631,6 +660,7 @@ def mha_decode_schedule(
     # attention options
     *,
     window_left: int = -1,
+    block_draft: bool,
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
     return_lse: bool = False,
@@ -654,7 +684,7 @@ def mha_decode_schedule(
     Args:
         q, k_cache, v_cache, cache_seqlens, max_seqlen_q, window_left,
         logit_cap, sinks, return_lse, q_scale, k_scale, v_scale,
-        fp8_kv_scales: As for :func:`mha_decode_with_kvcache`; they select the
+        fp8_kv_scales, block_draft: As for :func:`mha_decode_with_kvcache`; they select the
             same kernel.
         out: int32 [>= batch + 1, 2] tensor to write the schedule into in
             place (a persistent buffer keeps the address a captured graph
@@ -679,6 +709,7 @@ def mha_decode_schedule(
         k_scale,
         v_scale,
         fp8_kv_scales,
+        block_draft,
         solution,
     )
     if kernel is None:
@@ -716,6 +747,7 @@ def mha_decode_takes_schedule(
     v_cache: torch.Tensor,
     max_seqlen_q: int,
     window_left: int = -1,
+    block_draft: bool,
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
     return_lse: bool = False,
@@ -735,7 +767,7 @@ def mha_decode_takes_schedule(
             ``q`` shaped [rows, heads, dim]; only their metadata is read
             (meta tensors work).
         max_seqlen_q, window_left, logit_cap, sinks, return_lse, q_scale,
-        k_scale, v_scale, fp8_kv_scales, solution: As for
+        k_scale, v_scale, fp8_kv_scales, block_draft, solution: As for
             :func:`mha_decode_with_kvcache`.
     """
     return (
@@ -753,6 +785,7 @@ def mha_decode_takes_schedule(
             k_scale,
             v_scale,
             fp8_kv_scales,
+            block_draft,
             solution,
         )
         is not None
@@ -773,6 +806,7 @@ def _schedule_kernel(
     k_scale: torch.Tensor | None,
     v_scale: torch.Tensor | None,
     fp8_kv_scales: tuple[float, float] | None,
+    block_draft: bool,
     solution: str | None,
 ):
     """The schedule-reading decode kernel for these arguments
@@ -800,6 +834,7 @@ def _schedule_kernel(
         k_scale is not None,
         v_scale is not None,
         fp8_kv_scales is not None,
+        block_draft,
         solution,
     )
     if key not in _SCHEDULE_KERNELS:
@@ -817,6 +852,7 @@ def _schedule_kernel(
             k_scale,
             v_scale,
             fp8_kv_scales,
+            block_draft,
             solution,
         )
     return _SCHEDULE_KERNELS[key]
@@ -839,6 +875,7 @@ def _select_schedule_kernel(
     k_scale: torch.Tensor | None,
     v_scale: torch.Tensor | None,
     fp8_kv_scales: tuple[float, float] | None,
+    block_draft: bool,
     solution: str | None,
 ):
     signature, _, traits = _decode_selection(
@@ -847,6 +884,9 @@ def _select_schedule_kernel(
         v_cache,
         max_seqlen_q,
         window_left,
+        # The split schedule carries no sink: mha_decode_schedule takes no
+        # window_sink, so a sink-bearing layer reaches the unscheduled entry.
+        0,
         logit_cap,
         sinks,
         return_lse,
@@ -854,6 +894,7 @@ def _select_schedule_kernel(
         k_scale,
         v_scale,
         fp8_kv_scales,
+        block_draft,
     )
     try:
         decode = select_kernel(

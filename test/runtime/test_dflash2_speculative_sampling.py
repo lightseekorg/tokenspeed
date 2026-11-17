@@ -355,9 +355,9 @@ def _executor_config(spec_algo: str) -> ModelExecutorConfig:
         prefill_only=False,
         decode_only_attention=False,
         prefill_graph_capture_batch_sizes=None,
-        enable_drafter_prefill_graph=False,
         input_logprob_chunk_tokens=N,
         enable_speculative_sampling=True,
+        enable_dp_local_cuda_graph=False,
         query_shard_size=1,
         query_shard_rank=0,
         enable_memory_saver=False,
@@ -370,6 +370,8 @@ def test_dspark_keeps_the_dense_q_and_the_shared_sampler():
     # DSpark samples its Markov steps from full-vocab logits through the
     # shared draft sampler; only DFLASH (DFlash2) records a sparse q instead.
     executor = ModelExecutor.__new__(ModelExecutor)
+    # No drafter keeps its draft head sharded, so q stays over whole rows.
+    executor.drafter = None
     for spec_algo, dense in (("DFLASH", False), ("DSPARK", True)):
         executor.runtime_states = RuntimeStates(
             req_pool_size=POOL,
@@ -395,7 +397,10 @@ def test_dspark_keeps_the_dense_q_and_the_shared_sampler():
         ),
     )
     drafter.logits_processor = LogitsProcessor(
-        SimpleNamespace(vocab_size=VOCAB), do_argmax=True, dp_lm_head_tp=False
+        SimpleNamespace(vocab_size=VOCAB),
+        do_argmax=True,
+        dp_lm_head_tp=False,
+        attn_tp_size=1,
     )
 
     drafter.bind_sampling_backend(_triton_backend(enable_speculative_sampling=True))

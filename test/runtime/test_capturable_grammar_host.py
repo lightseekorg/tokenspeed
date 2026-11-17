@@ -145,6 +145,7 @@ def test_grammar_steps_replay_in_a_cuda_graph(compile_grammar):
         executor.wait_bitmask()
         seen_mask.copy_(executor.bitmask[:bs])
         executor.schedule_post_sampler(sampled, accept)
+        executor.join_post_sampler()
 
     def add(grammars):
         return executor.add_batch(grammars=grammars, bs=bs, output_layout=layout)

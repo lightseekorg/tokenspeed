@@ -21,7 +21,6 @@
 """Projection collective dispatch with separately owned persistent workspaces."""
 
 import logging
-import socket
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
@@ -419,11 +418,14 @@ class ProjectionBackend:
             "Lamport transport is unavailable for this device, dtype, or routing policy"
         )
         if use_lamport:
-            # CUDA IPC requires a node-local group. Agree on topology before
-            # any rank attempts collective native allocation.
+            # Agree on peer-memory reachability before collective allocation.
             from tokenspeed_kernel.ops.communication.cute_dsl import (
                 fused_tp_column_projection_supported,
                 fused_tp_row_projection_supported,
+            )
+            from tokenspeed_kernel.ops.communication.fabric import (
+                group_has_fabric,
+                host_identity,
             )
 
             supported = (
@@ -465,7 +467,7 @@ class ProjectionBackend:
             dist.all_gather_object(
                 hosts,
                 (
-                    socket.gethostname(),
+                    host_identity(),
                     batch_invariant,
                     fused_disabled_reason is None,
                 ),
@@ -475,7 +477,7 @@ class ProjectionBackend:
                 raise ValueError(
                     "Batch-invariant collective setting differs across ranks"
                 )
-            if len({value[0] for value in hosts}) == 1:
+            if len({value[0] for value in hosts}) == 1 or group_has_fabric(spec.group):
                 self._prepare_lamport(workspace, use_lamport_reduction)
                 if all(value[2] for value in hosts):
                     from tokenspeed_kernel.ops.communication.cute_dsl import (
@@ -507,7 +509,9 @@ class ProjectionBackend:
                 elif fused_disabled_reason is None:
                     fused_disabled_reason = "one or more peers cannot prepare fusion"
             else:
-                fused_disabled_reason = "the projection group spans multiple nodes"
+                fused_disabled_reason = (
+                    "the cross-node projection group lacks NVLink fabric"
+                )
 
         if (
             workspace.fused_column is None

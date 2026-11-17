@@ -124,6 +124,7 @@ def load_targets(
 @jit
 def verify_drafted(
     d_ptr,
+    proposals,
     u_ptr,
     h_ptr,
     l_ptr,
@@ -138,6 +139,7 @@ def verify_drafted(
     stride_c: tl.constexpr,
     stride_d: tl.constexpr,
     stride_u: tl.constexpr,
+    reject_threshold,
 ):
 
     # Extract the selected target probabilities via masked-sum HFMA reduction tree.
@@ -163,7 +165,21 @@ def verify_drafted(
             block_g,
         )
 
-    if d_ptr is not None and (indicator & 0x800) == 0:
+    if proposals is not None:
+
+        if (indicator & 0x800) == 0:
+
+            # The candidates carry the draft probabilities; a draft outside them has no target mass and is rejected below.
+            sources = tl.sum(proposals * matches, axis=1)
+
+            uniform *= sources
+
+            if reject_threshold is not None:
+
+                rejected = (sources > reject_threshold) | (targets <= 0)
+                uniform = tl.where(rejected, float("inf"), uniform)
+
+    elif d_ptr is not None and (indicator & 0x800) == 0:
 
         # Load the drafted token source probabilities.
 
@@ -174,9 +190,16 @@ def verify_drafted(
 
         uniform *= sources
 
+        if reject_threshold is not None:
+
+            # A probability above the threshold marks a slot with no proposal; a draft the target cannot emit is never accepted either.
+            rejected = (sources > reject_threshold) | (targets <= 0)
+            uniform = tl.where(rejected, float("inf"), uniform)
+
     # Compute the rejection offset(s) i.e. total accepted.
 
     marked = (uniform <= targets) & mask
+
     accepted = tl.argmin(marked, axis=0)
 
     return accepted, targets, matches
@@ -185,6 +208,7 @@ def verify_drafted(
 @jit
 def rejection_sample(
     d_ptr,
+    proposals,
     e_ptr,
     h_ptr,
     l_ptr,
@@ -205,6 +229,7 @@ def rejection_sample(
     stride_c: tl.constexpr,
     stride_d: tl.constexpr,
     stride_e: tl.constexpr,
+    reject_threshold,
 ):
 
     # Gather the rejected row from the target probabilities and indices.
@@ -234,7 +259,7 @@ def rejection_sample(
 
         residuals = scores
 
-    elif d_ptr is None or (indicator & 0x800) > 0:
+    elif (d_ptr is None and proposals is None) or (indicator & 0x800) > 0:
 
         # Masked rejection sampling under the stochastic-verify-greedy-draft regime.
 
@@ -246,7 +271,18 @@ def rejection_sample(
 
         # Load the draft probabilities for the corresponding position(s).
 
-        marginals = tl.load(d_ptr + (batch_id * stride_d) + shifts)
+        if proposals is not None:
+
+            marginals = tl.gather(proposals, rejected, axis=0).reshape((max_k,))
+
+        else:
+
+            marginals = tl.load(d_ptr + (batch_id * stride_d) + shifts)
+
+        if reject_threshold is not None:
+
+            # A sentinel row (no recorded proposal) contributes nothing: the residual is the target.
+            marginals = tl.where(marginals > reject_threshold, 0.0, marginals)
         residuals = tl.clamp(scores - marginals, 0.0, 1.0)
 
     # Apply rejection sampling to surface the next token.
@@ -307,6 +343,8 @@ def chain_speculative_verification_kernel(
     # Kernel Specific(s).
     block_g: tl.constexpr,  # Next Power-of-2 Timesteps (γ + 1) -> T.
     block_z: tl.constexpr,  # Next Power-of-2 Top-K Log-Probabilities Targets -> Z'.
+    reject_threshold=None,  # Draft Probabilities above this mark a Slot with no Proposal.
+    m_ptr=None,  # Candidate Draft Probabilities -> [ B • (γ + 1), M ], in place of ``d_ptr``.
 ) -> None:
 
     block_id = tl.program_id(axis=0)
@@ -368,10 +406,21 @@ def chain_speculative_verification_kernel(
             v_ptr, j_ptr, margin, span, cols, steps_mask, max_k
         )
 
+        if m_ptr is not None:
+
+            # Each candidate's draft probability, carried from the rank that holds its column.
+            offsets = ((margin + span) * max_k)[:, None] + cols[None, :]
+            proposals = tl.load(m_ptr + offsets, mask=steps_mask[:, None], other=0)
+
+        else:
+
+            proposals = None
+
         # Verify the drafted tokens against the target probabilities.
 
         accepted, targets, matches = verify_drafted(
             d_ptr,
+            proposals,
             u_ptr,
             h_ptr,
             l_ptr,
@@ -386,12 +435,14 @@ def chain_speculative_verification_kernel(
             stride_c,
             stride_d,
             stride_u,
+            reject_threshold,
         )
 
         # Rejection-sample the next token and conditionally update selected token(s) and score(s).
 
         token, targets, selections = rejection_sample(
             d_ptr,
+            proposals,
             e_ptr,
             h_ptr,
             l_ptr,
@@ -412,6 +463,7 @@ def chain_speculative_verification_kernel(
             stride_c,
             stride_d,
             stride_e,
+            reject_threshold,
         )
 
         if logprobs:

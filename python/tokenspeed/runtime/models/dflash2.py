@@ -26,6 +26,7 @@ from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from tokenspeed_kernel.ops.conv import dflash2_grouped_conv
 from torch import nn
@@ -34,6 +35,7 @@ from tokenspeed.runtime.distributed.comm_backend.registry import get_global_back
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping, MappingBase
+from tokenspeed.runtime.distributed.process_group_manager import process_group_manager
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
 from tokenspeed.runtime.layers.dense.fp8_weight_only import quantize_fp8_weight_rows
@@ -53,6 +55,11 @@ from tokenspeed.runtime.models.dflash import (
     _get_dflash_layer_sliding_window,
 )
 from tokenspeed.runtime.models.kimi_k3_dspark import K3DSparkAttention
+from tokenspeed.runtime.models.muse_spark_dflash2_monokernel import (
+    DFlash2MonokernelLayer,
+    DFlash2MonokernelState,
+    enable_draft_monokernels,
+)
 from tokenspeed.runtime.utils import add_prefix
 
 if TYPE_CHECKING:
@@ -322,6 +329,8 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
     ) -> None:
+        # Set before the base constructor, whose resolve_attn() reads it.
+        self._uses_mla = _dflash2_uses_mla(config)
         super().__init__(
             config=config,
             mapping=mapping,
@@ -329,40 +338,10 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
             quant_config=quant_config,
             prefix=prefix,
         )
-        self.layer_id = int(layer_id)
-        self._uses_mla = _dflash2_uses_mla(config)
         self.comm_manager = None
         # The draft's prepared reduce + norm, bound by the draft model.
         self.fused_reduce_norm: LamportResidualRMSNorm | None = None
         if self._uses_mla:
-            rope_theta, rope_scaling = _dflash2_mla_rope(config)
-            self.self_attn = K3DSparkAttention(
-                config=config,
-                mapping=mapping,
-                hidden_size=int(config.hidden_size),
-                num_heads=int(config.num_attention_heads),
-                qk_nope_head_dim=int(config.qk_nope_head_dim),
-                qk_rope_head_dim=int(config.qk_rope_head_dim),
-                v_head_dim=int(config.v_head_dim),
-                q_lora_rank=int(config.q_lora_rank),
-                kv_lora_rank=int(config.kv_lora_rank),
-                rope_theta=rope_theta,
-                rope_scaling=rope_scaling,
-                # Match training: grow the YaRN cache on demand instead of
-                # materializing K3's one-million-token limit in every layer.
-                max_position_embeddings=min(
-                    int(getattr(config, "max_position_embeddings", 32768)), 32768
-                ),
-                quant_config=quant_config,
-                layer_id=layer_id,
-                prefix=add_prefix("self_attn", prefix),
-                reduce_attn_results=False,
-            )
-            # The draft's window is its compute visibility; storage is the
-            # cache plan's (bound at startup, the target's full-history group).
-            sliding_window = _get_dflash_layer_sliding_window(config, layer_id)
-            for attention in (self.self_attn.attn_mqa, self.self_attn.attn_mha):
-                attention.sliding_window_size = sliding_window
             self.comm_manager = CommManager(
                 mapping=mapping,
                 layer_id=layer_id,
@@ -385,6 +364,40 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
         self.mlp_conv = DFlashGroupedConv(
             **conv_args, prefix=add_prefix("mlp_conv", prefix)
         )
+
+    def resolve_attn(self, prefix: str) -> nn.Module:
+        if not self._uses_mla:
+            return super().resolve_attn(prefix)
+        config = self.config
+        rope_theta, rope_scaling = _dflash2_mla_rope(config)
+        attention = K3DSparkAttention(
+            config=config,
+            mapping=self.mapping,
+            hidden_size=int(config.hidden_size),
+            num_heads=int(config.num_attention_heads),
+            qk_nope_head_dim=int(config.qk_nope_head_dim),
+            qk_rope_head_dim=int(config.qk_rope_head_dim),
+            v_head_dim=int(config.v_head_dim),
+            q_lora_rank=int(config.q_lora_rank),
+            kv_lora_rank=int(config.kv_lora_rank),
+            rope_theta=rope_theta,
+            rope_scaling=rope_scaling,
+            # Match training: grow the YaRN cache on demand instead of
+            # materializing K3's one-million-token limit in every layer.
+            max_position_embeddings=min(
+                int(getattr(config, "max_position_embeddings", 32768)), 32768
+            ),
+            quant_config=self.quant_config,
+            layer_id=self.layer_id,
+            prefix=prefix,
+            reduce_attn_results=False,
+        )
+        # The draft's window is its compute visibility; storage is the
+        # cache plan's (bound at startup, the target's full-history group).
+        sliding_window = _get_dflash_layer_sliding_window(config, self.layer_id)
+        for paged in (attention.attn_mqa, attention.attn_mha):
+            paged.sliding_window_size = sliding_window
+        return attention
 
     def forward(
         self,
@@ -437,10 +450,27 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
         return hidden_states, residual
 
 
+class DFlash2MonokernelDecoderLayer(DFlash2MonokernelLayer, DFlash2DecoderLayer):
+    """DFlash2 draft layer whose block forwards run as one monokernel launch."""
+
+
 class DFlash2DraftModel(DFlashDraftModel):
     """DFlash2 checkpoint entry class."""
 
-    decoder_layer_cls = DFlash2DecoderLayer
+    @property
+    def decoder_layer_cls(self) -> type:
+        """The layer class: the monokernel class when the draft's config has
+        ``decode_monokernel``, which load_model_config declares on every
+        draft's config: True under --decode-monokernel for the draft of a
+        target with draft monokernels (Muse Spark). Such a draft packs every
+        piece after loading or startup fails and names why
+        (:func:`enable_draft_monokernels`); other drafts keep the regular
+        class."""
+        # No default: load_model_config declares the field on every draft's
+        # config, so a config that lacks it was not built for serving.
+        if self.config.decode_monokernel:
+            return DFlash2MonokernelDecoderLayer
+        return DFlash2DecoderLayer
 
     def __init__(
         self,
@@ -464,6 +494,13 @@ class DFlash2DraftModel(DFlashDraftModel):
             _dflash2_config_value(config, "input_embedding_scale", 1.0)
         )
         self.block_size = int(_dflash2_config_value(config, "block_size"))
+        nested = getattr(config, "dflash_config", {}) or {}
+        # The candidate logits' scale and softcap (0: none): the drafter
+        # applies them, and the head monokernel bakes them in.
+        self.output_multiplier = float(nested.get("output_multiplier", 1.0))
+        self.final_logit_softcapping = float(
+            nested.get("final_logit_softcapping") or 0.0
+        )
         # The draft's prepared reduce + norm (prepare_communication_runtime).
         self.fused_reduce_norm: LamportResidualRMSNorm | None = None
         self.candidate_selector = CandidateSelector(
@@ -474,16 +511,58 @@ class DFlash2DraftModel(DFlashDraftModel):
             params_dtype=dtype,
             prefix=add_prefix("candidate_selector", prefix),
         )
+        # The state that the monokernel layers share (--decode-monokernel),
+        # set when enable_draft_monokernels packs them after loading. None
+        # runs every forward on the regular code.
+        self.monokernel_state: DFlash2MonokernelState | None = None
+
+    def run_decoder(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        ctx: ForwardContext,
+    ) -> torch.Tensor:
+        """The layers and the final norm. A block forward of one request that
+        the monokernels serve launches every layer, and the last launch runs
+        the final norm (``finish_step`` returns its output)."""
+        state = self.monokernel_state
+        if state is None:
+            return super().run_decoder(positions, hidden_states, residual, ctx)
+        state.start_step()
+        for layer in self.layers:
+            hidden_states, residual = layer(
+                positions=positions,
+                hidden_states=hidden_states,
+                ctx=ctx,
+                residual=residual,
+            )
+        lm_head_input = state.finish_step()
+        if lm_head_input is not None:
+            return lm_head_input
+        return self.final_norm(hidden_states, residual, ctx)
 
     def configure_target(self, target_model, target_config) -> None:
-        """Install the capture inputs, and the FP8 head copy if quantized.
+        """Install the capture inputs, the packed head monokernel under
+        --decode-monokernel, and the FP8 head copy if quantized.
 
-        Under ``fp8_weight_only`` the draft's candidate GEMM reads an FP8
-        copy of the target's (16-bit) head shard: the head is the largest
-        weight a draft step streams. It is made here, before the KV-cache
-        budget is profiled, so the copy's memory is counted.
+        Both head copies are made here, before the KV-cache budget is
+        profiled, so the copy's memory is counted. Under
+        --decode-monokernel the head monokernel packs a tiled copy of the
+        target's head shard (``DFlash2MonokernelState.pack_head``; the
+        drafter enables its launch when wired). Under ``fp8_weight_only``
+        the draft's candidate GEMM reads an FP8 copy of the target's
+        (16-bit) head shard: the head is the largest weight a draft step
+        streams.
         """
         super().configure_target(target_model, target_config)
+        if self.monokernel_state is not None:
+            self.monokernel_state.pack_head(
+                target_model.lm_head,
+                self.candidate_selector,
+                scale=self.output_multiplier,
+                softcap=self.final_logit_softcapping,
+            )
         if not isinstance(self.quant_config, Fp8WeightOnlyConfig):
             return
         head = target_model.lm_head
@@ -500,7 +579,10 @@ class DFlash2DraftModel(DFlashDraftModel):
         )
 
     def final_norm(
-        self, hidden_states: torch.Tensor, residual: torch.Tensor | None
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        ctx: ForwardContext,
     ) -> torch.Tensor:
         """The last layer hands back its MLP conv's partial; reduce it here."""
         if residual is None:
@@ -515,6 +597,30 @@ class DFlash2DraftModel(DFlashDraftModel):
         return hidden_states
 
     def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
+        """Prepare the draft's collectives, before cache sizing and graph
+        capture: the fused reduce + norm of the regular layers' boundaries,
+        then the draft monokernels' mailbox scratch on the Iris heap
+        (--decode-monokernel). The fused reduce + norm goes first: its
+        mailboxes are sized against the heap's headroom.
+
+        Args:
+            max_num_tokens: Most rows a forward carries.
+
+        Returns:
+            Whether the draft prepared anything.
+        """
+        prepared = self._prepare_fused_reduce_norm(max_num_tokens)
+        if self.monokernel_state is None:
+            return prepared
+        group = self.mapping.attn.tp_group
+        self.monokernel_state.prepare(
+            process_group_manager.get_device_process_group(group),
+            process_group_manager.get_process_group("gloo", group),
+            group.index(dist.get_rank()),
+        )
+        return True
+
+    def _prepare_fused_reduce_norm(self, max_num_tokens: int) -> bool:
         """Prepare the fused reduce + norm of the draft's layer boundaries.
 
         Collective: every rank prepares or declines alike, before cache
@@ -610,9 +716,18 @@ class DFlash2DraftModel(DFlashDraftModel):
             )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
-        if not self._uses_mla:
-            return super().load_weights(weights)
+        if self._uses_mla:
+            loaded = self._load_mla_weights(weights)
+        else:
+            loaded = super().load_weights(weights)
+        # Packs every piece or fails startup naming why, an MLA draft too.
+        if self.config.decode_monokernel:
+            enable_draft_monokernels(self)
+        return loaded
 
+    def _load_mla_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> set[str]:
         params = dict(self.named_parameters())
         loaded: set[str] = set()
         unexpected: list[str] = []
@@ -680,6 +795,7 @@ class DFlash2DraftModel(DFlashDraftModel):
             )
         for layer in self.layers:
             absorb_mla_kv_b_proj(layer.self_attn)
+        return loaded
 
     @torch.no_grad()
     def forward(self, *args, input_embeds: torch.Tensor | None = None, **kwargs):

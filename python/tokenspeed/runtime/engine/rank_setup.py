@@ -23,7 +23,7 @@ model config, the process groups, the request length limits and the C++
 scheduler's config. ``rust_host.bootstrap`` runs them in this order."""
 
 import torch
-from tokenspeed_scheduler import SchedulerConfig, StorageConfig
+from tokenspeed_engine.scheduler import SchedulerConfig, StorageConfig
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.engine.scheduler_utils import make_config
@@ -33,7 +33,11 @@ from tokenspeed.runtime.execution.distributed_initializer import (
 )
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.env import envs, global_server_args_dict_update
-from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
+from tokenspeed.runtime.utils.server_args import (
+    PortArgs,
+    ServerArgs,
+    draft_takes_decode_monokernel,
+)
 from tokenspeed.runtime.utils.startup_timing import startup_phase
 
 logger = get_colorful_logger(__name__)
@@ -121,16 +125,21 @@ def load_model_config(
     """
     quantization = server_args.quantization
     dtype = server_args.dtype
+    revision = server_args.revision
     if draft_of is not None:
         quantization = server_args.speculative_draft_model_quantization
+        # A revision is a branch, tag, or commit of one repository, so only a
+        # draft inside the target checkpoint can use the target's.
+        if not server_args.draft_model_path_use_base:
+            revision = server_args.speculative_draft_model_revision
         if dtype == "auto":
             # A draft is fed the target's hidden states and borrows its
             # embedding and LM head, so the two dtypes have to agree.
             dtype = draft_of.dtype
-    return ModelConfig(
+    config = ModelConfig(
         model_path,
         trust_remote_code=server_args.trust_remote_code,
-        revision=server_args.revision,
+        revision=revision,
         context_length=server_args.max_model_len,
         model_override_args=server_args.hf_overrides,
         dtype=dtype,
@@ -138,6 +147,17 @@ def load_model_config(
         server_args=server_args,
         is_draft_worker=draft_of is not None,
     )
+    if draft_of is not None:
+        # Declared on every draft's config (a draft has no config class that
+        # declares it). Only a draft with decode monokernels of a target they
+        # serve takes them (DRAFT_MONOKERNEL_TARGETS), and packs every piece
+        # or startup fails.
+        config.hf_text_config.decode_monokernel = draft_takes_decode_monokernel(
+            bool(server_args.decode_monokernel),
+            list(getattr(draft_of.hf_config, "architectures", None) or []),
+            list(getattr(config.hf_config, "architectures", None) or []),
+        )
+    return config
 
 
 @startup_phase("distributed.init")
@@ -235,6 +255,7 @@ def scheduler_config_from_args(
     storage_config: StorageConfig | None,
     max_scheduled_tokens: int,
     max_batch_size: int,
+    max_resident_requests: int,
     decode_input_tokens: int,
     overlap_schedule_depth: int,
     enable_kv_cache_events: bool,
@@ -250,6 +271,7 @@ def scheduler_config_from_args(
             when no storage backend is configured.
         max_scheduled_tokens: Per-step prefill token budget.
         max_batch_size: Rank-local batch slots.
+        max_resident_requests: Rank-local resident request slots.
         decode_input_tokens: Verify width per decode step.
         overlap_schedule_depth: Dispatched-but-uncommitted plans allowed.
         enable_kv_cache_events: Whether KV cache events are published.
@@ -267,6 +289,7 @@ def scheduler_config_from_args(
             // geometry.prefix_granularity
         ),
         max_batch_size=max_batch_size,
+        max_resident_requests=max_resident_requests,
         prefix_granularity=geometry.prefix_granularity,
         num_host_pages=specs.num_host_pages,
         disable_l2_cache=not server_args.enable_kvstore,
@@ -286,6 +309,7 @@ def scheduler_config_from_args(
         cache_groups=specs.cache_groups,
         enable_mixed_prefill_decode=server_args.enable_mixed_batch,
         prefill_decode_interval=server_args.prefill_decode_interval,
+        prefill_decode_min_interval=server_args.prefill_decode_min_interval,
         enable_short_prefill_first=server_args.enable_short_prefill_first,
         state_checkpoint_in_forward=server_args.writes_state_checkpoints_in_forward,
         demote_superseded_state_checkpoints=_implied_scheduler_policy(

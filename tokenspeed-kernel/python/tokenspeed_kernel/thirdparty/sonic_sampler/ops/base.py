@@ -80,18 +80,30 @@ def philox_key(h_ptr, l_ptr, batch_id, step):
 
 
 @jit
+def exponential_log(bits):
+    """log(E) for the exponential E = -log(u) of a uint32 Philox draw u, accurate where E is small (u near 1), where Gumbel-max winners draw."""
+
+    # u and 1 - u from the raw bits, each exact where it is small.
+    uniform = (bits.to(tl.float32) + 0.5) * 2.3283064365386963e-10
+    rest = ((~bits).to(tl.float32) + 0.5) * 2.3283064365386963e-10
+
+    series = rest * (1.0 + rest * (0.5 + rest * 0.3333333333333333))
+    exponential = tl.where(rest < 0.00390625, series, -fast_logf(uniform))
+
+    return fast_logf(exponential)
+
+
+@jit
 def philox_gumbel(key, indices):
 
     # Draw one Philox round per group of four consecutive token indices.
 
-    u0, u1, u2, u3 = tl.rand4x(key, indices // 4)
+    b0, b1, b2, b3 = tl.randint4x(key, indices // 4)
 
     lane = indices % 4
-    uniform = tl.where(
-        lane == 0, u0, tl.where(lane == 1, u1, tl.where(lane == 2, u2, u3))
-    )
+    bits = tl.where(lane == 0, b0, tl.where(lane == 1, b1, tl.where(lane == 2, b2, b3)))
 
-    return tl.log(-tl.log(tl.maximum(uniform, NOISE_FLOOR)))
+    return exponential_log(bits)
 
 
 @jit
@@ -147,7 +159,8 @@ def nucleus_masking(p_ptr, batch_id, logits, maximum, max_k: tl.constexpr):
         ladder, tl.full((1,), max_k - 1, dtype=tl.int32), axis=0
     ) * tl.load(p_ptr + batch_id).to(tl.float32)
 
-    return ladder <= scale
+    # Keep each token the mass ranked above it leaves short of p, so the one crossing p too.
+    return ladder - scores < scale
 
 
 @builtin

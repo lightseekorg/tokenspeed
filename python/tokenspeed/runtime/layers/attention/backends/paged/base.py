@@ -102,6 +102,11 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
     # Declared here as well as on AttentionBackend: the refactor made the two
     # separate roots, so a paged leaf inherits only this one.
     supports_layer_sliding_window: bool = False
+    # This leaf keeps each layer's ``sliding_window_sink`` leading tokens
+    # visible outside the window. Left False, a declared sink silently
+    # degrades to plain sliding-window attention: no error, only a quality
+    # loss. Declared alongside the window flag for the same reason.
+    supports_layer_window_sink: bool = False
     supports_mla_dcp: bool = False
     prefill_needs_host_page_table: bool = False
 
@@ -252,8 +257,9 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         buffers.
 
         ``spec_num_tokens`` under block decode: one entry per block position,
-        because the block is non-causal (all positions share the block-end
-        length) and the drafter rewrites those lengths in-graph
+        because each position carries its own length (the block-end length for
+        a non-causal block, backed off per position for a causal one) and the
+        drafter rewrites those lengths in-graph
         (:meth:`fill_block_decode_seq_lens`), so they must exist as storage.
         Otherwise 1: plain decode and a vanilla MTP draft have one position
         per request, and target verify derives its causal per-position
@@ -389,8 +395,8 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         A leaf whose :meth:`refresh_decode_metadata` is exactly those two
         copies (seq_lens clamped to :attr:`decode_seq_lens_floor`) followed
         by :meth:`publish_decode_metadata` returns them, so the router can
-        fill every such leaf with one batched copy; a leaf with any other
-        refresh returns None and refreshes itself.
+        produce its disjoint buffers together with the group tables. A leaf
+        with any other refresh returns None and refreshes itself.
 
         Args:
             bs: Requests to prepare (the padded graph batch under replay).

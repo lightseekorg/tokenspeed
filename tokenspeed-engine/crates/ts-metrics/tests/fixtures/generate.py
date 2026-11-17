@@ -82,6 +82,7 @@ def _run_scenario() -> None:
     )
     engine.record_scheduler_iteration(
         running=3,
+        inflight=5,
         waiting=2,
         num_active_pages=10,
         num_total_pages=40,
@@ -89,6 +90,7 @@ def _run_scenario() -> None:
     )
     engine.record_scheduler_iteration(
         running=1,
+        inflight=4,
         waiting=0,
         num_active_pages=4,
         num_total_pages=40,
@@ -114,7 +116,7 @@ def _run_scenario() -> None:
         used_pages=12, active_pages=8, total_pages=40, token_capacity=647
     )
     engine.record_prefill_queues(prealloc=1, inflight=2, retracted=0)
-    engine.record_decode_queues(prealloc=3, transfer=4, retracted=1)
+    engine.record_decode_queues(prealloc=3, kv_wait=2, transfer=4, retracted=1)
     engine.record_generation_tokens(25)
     engine.record_request_tokens(prompt_tokens=100, cache_hit_tokens=40)
     engine.observe_time_to_first_token(float("inf"))

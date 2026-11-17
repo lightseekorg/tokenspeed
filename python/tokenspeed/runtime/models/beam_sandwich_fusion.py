@@ -29,12 +29,13 @@ the next layer's ``input_layernorm`` or the final norm). Under
 one call of
 :func:`tokenspeed.runtime.layers.layernorm.sandwich_rmsnorm_with_allreduce`: the
 comm manager hands the partial on unreduced and the sandwich norm passes it
-through. The helper fuses the call into one MNNVL launch where the group's
-workspace serves it; elsewhere it runs the all-reduce and the two Triton norms
-the option-off forward runs, with the same arguments, so such a call equals the
-option-off boundary bit for bit. A fused call differs from it only in
-summation order: the two sums of squares, and the all-reduce sum where the
-option-off all-reduce does not take the MNNVL path (IPC, NCCL).
+through. The helper fuses the call into one MNNVL launch per slice of rows the
+group's workspace holds, where that workspace serves it; elsewhere it runs the
+all-reduce and the two Triton norms the option-off forward runs, with the same
+arguments, so such a call equals the option-off boundary bit for bit. A fused
+call differs from it only in summation order: the two sums of squares, and the
+all-reduce sum where the option-off all-reduce does not take the MNNVL path
+(IPC, NCCL).
 
 The choice is made once, at model construction, from launch options every rank
 shares, so every rank and every module of a boundary agree. The option is
@@ -261,6 +262,5 @@ def install_beam_sandwich_fusion(model: Any) -> None:
         "Beam sandwich all-reduce boundaries: through "
         "sandwich_rmsnorm_with_allreduce "
         f"(x{len(boundaries)} per forward; fused where the MNNVL workspace serves "
-        f"the call, at most {global_server_args_dict['comm_fusion_max_num_tokens']} "
-        "tokens)"
+        "the call, one launch per slice of rows it holds)"
     )

@@ -1,9 +1,7 @@
 # GEMM weight preparation
 
-The optional `trtllm_kernel` extension is required for TRT-LLM's fused-A
-projection and cuBLASLt NVFP4 GEMM provider. Without it, the NVFP4 leaf is not
-registered and a direct fused-A call reports the missing package; importing
-other GEMM providers does not require the extension.
+TRT-LLM's DeepSeek V3 fused-A projection and cuBLASLt NVFP4 GEMM provider are
+built into tokenspeed-kernel's CUDA extension, adapted from TensorRT-LLM.
 
 ## Blackwell block-FP8 automatic selection
 
@@ -60,6 +58,15 @@ scale view falls back to FlashInfer where its M range permits, or Triton.
 This scale check is conservative even when a layout copy would align the view.
 Online quantization supplies freshly allocated, aligned activations and scales.
 
+## Dense FP32 output
+
+For BF16 or FP16 inputs, `mm(..., out_dtype=torch.float32)` stores the FP32
+accumulator directly. It must not widen a result already rounded to the input
+dtype. Scaling and bias operate on that FP32 result, including when the caller
+supplies a strided output buffer. On gfx950, `gluon_mm_bf16_fp32_gfx950` serves
+measured BF16 projections; the AMD ops README records its shapes and reductions,
+which need not match a vendor GEMM bit for bit.
+
 ## Small dense projections
 
 `mv` selects the registered small-row projection implementation. Its dispatcher
@@ -84,10 +91,21 @@ through the `("gemm", "mv_weightless_rmsnorm_gated_sigmoid")` operation. A
 registered kernel serves it only where the separate gated norm and `mv` select
 the kernels it reproduces bit for bit; otherwise callers keep the two calls.
 
-On SM107, FlashInfer's TGV/CuTe DSL search supports BF16 output projections
-with weight shape `[2560, 6144]` and M <= 4. Startup tuning covers M=1/2/4.
-The kernels accumulate in FP32 and return BF16; reduction order can change
-rounding relative to the original GEMM.
+`mv_rmsnorm_gated_sigmoid` is its multi-row decode form, through the
+`("gemm", "mv_rmsnorm_gated_sigmoid")` operation: the GEMV's prologue runs the
+per-head `rmsnorm_gated_sigmoid` on 2 to 8 rows, each wave's K step one whole
+head. It stands in only where `mm` selects the GEMV it reproduces bit for bit
+on the normed rows; `mv_rmsnorm_gated_sigmoid_supported` tells callers when to
+keep the gated norm and `mm` as two calls.
+
+On SM107, BF16 projections run FlashInfer's CuTe DSL low-latency GEMM at
+M <= 32, as on SM100 and SM103, when `_sm107_cute_dsl_bf16_admits` admits the
+weight: K a multiple of 128, and either at most 8192 output columns or
+K >= 2048 and at most 96 MiB. CuTe DSL is pinned there as the measured winner;
+other weights, such as an LM head or a wide projection with a short K, keep
+cuBLASLt, which measured faster on them at 16 to 32 rows. Startup tuning
+covers M=1/2/4/8/16/32. The kernels accumulate in FP32 and return BF16;
+reduction order can change rounding relative to the original GEMM.
 
 ## Decode GEMMs on small weights
 
@@ -166,6 +184,7 @@ Per-channel FP8 projections use FP8 E4M3 weights with FP32 scales per output
 channel and dynamically quantize activations per token. This scale format is
 distinct from block scaling. Native FP8 matrix arithmetic uses FP32
 accumulators but need not match sequential FP32 arithmetic.
+The small-row Triton and PyTorch rowwise GEMMs support NVIDIA SM100 and newer.
 
 ## Startup tuning coverage
 
@@ -175,19 +194,35 @@ larger observed inputs and the enclosing native bucket. Native mappers,
 constraints, and caches are preserved. Explicit buckets and disabled profiling
 retain their semantics; small-M BF16 keeps its existing bound.
 
-## Hopper block-FP8 DeepGEMM
+## Decode-size BF16 projections
 
-`deepgemm_mm_fp8_blockscale` supports explicit `mm(..., override=...)` or
-`solution="deepgemm"` selection. Serving can opt in with
+`triton_skinny.skinny_mm` computes `x @ w.T` for up to 32 BF16 rows on NVIDIA,
+streaming the weight once. Its module docstring records the split-K fold, which
+keeps a row's result independent of the batch, and its PDL order.
+
+## Block-FP8 DeepGEMM
+
+`solution="deepgemm"` selects the appropriate block-FP8 kernel for the GPU.
+Explicit overrides are `deepgemm_mm_fp8_blockscale` on SM90 and
+`deepgemm_mm_fp8_blockscale_packed` on SM100/SM103. Serving can opt in with
 `--dense-gemm-backend deepgemm` for standard block-FP8 dense linears. The
 default `auto` route remains unchanged; routed experts use their own backend.
 
-This optional DeepGEMM integration requires Hopper, contiguous E4M3 operands
-A[M,K]/B[N,K], BF16 output, N divisible by 64, and K divisible by 128. It
-converts canonical FP32 1x128 activation and 128x128 weight scales to the
-required layout without UE8M0 rounding. Conversion is part of each call,
+This optional DeepGEMM integration supports SM90, SM100 and SM103, contiguous
+E4M3 operands A[M,K]/B[N,K], BF16 output, N divisible by 64, and K divisible
+by 128. On Hopper it converts canonical FP32 1x128 activation and 128x128
+weight scales to the required layout without UE8M0 rounding. Conversion is part of each call,
 including graph capture; no persistent weight cache is created. Unsupported
 forced calls fail explicitly. It does not claim batch-invariant numerics.
+
+On SM100/SM103, dense FP8 layers configured for DeepGEMM call
+`prepare_deepgemm_fp8_weight` after loading. It requantizes weights onto
+power-of-two scales and packs them once. The layer pins DeepGEMM for forward.
+Activations use the registered `packed_ue8m0` quantizer,
+which directly writes TMA-aligned int32 scales with initialized padding.
+GEMM consumes these packed scales without per-call copies or packing.
+The quantizer and DeepGEMM follow the global PDL setting and work in CUDA
+Graphs and on auxiliary streams. Default FP32-scale dispatch is unchanged.
 
 ## Grouped FP8 projection
 
@@ -208,3 +243,18 @@ scales) reads directly, so no quantization kernel runs between the two.
 DeepGEMM picks a tile configuration from the token count (one per 16 tokens)
 and JIT-compiles each on first use. `warmup_fp8_projections` launches every
 configuration up to a token bound at startup so serving never compiles.
+
+## Small-N BF16 Split-K policy
+
+`flashinfer_mm_bf16_small_n_splitk` uses FlashInfer's cached CuTe DSL Split-K
+launcher with tile `(64, 8)`, four K splits and six pipeline stages. Automatic
+SM107 dispatch admits the measured `(M,N,K) = (4,640,2560)` projection with
+PDL, contiguous BF16 operands/output and 32-byte pointer alignment. This is a
+measured performance policy, not the implementation's shape contract. Other
+shapes and unaligned views keep the existing GEMM selection; explicit overrides
+remain authoritative. FlashInfer validates the callable's wider tile support.
+
+The ordinary `mm` wrapper applies bias. The kernel preserves a supplied output
+and rejects unsupported scale arguments. Its cached callable uses runtime row
+counts, so changing M does not add specializations. The provider is optional;
+builds without this FlashInfer module retain the existing registered kernels.

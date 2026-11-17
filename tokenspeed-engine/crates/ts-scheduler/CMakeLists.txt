@@ -48,6 +48,9 @@ set(TOKENSPEED_SCHEDULER_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 add_subdirectory("${TOKENSPEED_SCHEDULER_DIR}" scheduler)
 
 nanobind_build_library(nanobind-static)
+if(TOKENSPEED_PYTHON_ABI3)
+    target_compile_definitions(nanobind-static PUBLIC Py_LIMITED_API=0x030C0000)
+endif()
 
 add_library(ts_scheduler_embed STATIC
     "${TOKENSPEED_SCHEDULER_DIR}/bindings/python_module.cpp"
@@ -55,4 +58,5 @@ add_library(ts_scheduler_embed STATIC
 )
 nanobind_compile_options(ts_scheduler_embed)
 target_include_directories(ts_scheduler_embed PRIVATE "${TOKENSPEED_SCHEDULER_DIR}/csrc")
+target_compile_definitions(ts_scheduler_embed PRIVATE NB_DOMAIN=tokenspeed_engine)
 target_link_libraries(ts_scheduler_embed PUBLIC tokenspeed_scheduler_core nanobind-static Python::Module)

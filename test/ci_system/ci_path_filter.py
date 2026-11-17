@@ -60,6 +60,7 @@ VENDOR_PATHS = {
     "amd": (
         "test/ci_system/cleanup_amd_gpu_state.sh",
         "test/ci_system/install_deps_rocm.sh",
+        "test/ci_system/install_kernel_deps_rocm.sh",
         "test/ci_system/install_kernel_benchmark_rocm.sh",
         "test/ci_system/kernel_benchmark_ci.py",
         "test/ci_system/verify_rocm_stack.py",
@@ -102,6 +103,9 @@ RUNNER_GROUP_PATHS = {
         )
     },
     "test/ci/deepswe": frozenset(),
+    # The lint workflow runs this test on every pull request; no runner group
+    # needs to.
+    "test/ci_system/test_mi450_sim_report_digest.py": frozenset(),
     "test/ci/run_slurm.sh": frozenset({"nvidia-gb200-slurm", "nvidia-gb300-slurm"}),
     "test/ci_system/slurm_submit.py": frozenset(
         {"nvidia-gb200-slurm", "nvidia-gb300-slurm"}

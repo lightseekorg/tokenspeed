@@ -28,7 +28,6 @@ import torch
 from tokenspeed_kernel._triton import gl, gluon, tl, triton
 from tokenspeed_kernel.ops.communication._iris import IrisGroup, allocation_bytes, iris
 from tokenspeed_kernel.ops.communication._iris.synchronization import (
-    wait_loads,
     wait_loads_stores,
     wait_stores,
     wait_vmem,
@@ -66,7 +65,6 @@ class IrisArchPolicy:
             default.
         wait_vmem: Subgroup completion of vector loads and stores; does not
             cover async or tensor copies to LDS.
-        wait_loads: Subgroup completion of vector loads.
         wait_stores: Subgroup completion of vector stores.
 
     States select this policy once at construction and pass its wait functions
@@ -79,7 +77,6 @@ class IrisArchPolicy:
     peer_payload_load: str
     peer_signal_store: str
     wait_vmem: Callable
-    wait_loads: Callable
     wait_stores: Callable
 
 
@@ -88,7 +85,6 @@ _IRIS_ARCH_POLICIES = {
         peer_payload_load=".cg",
         peer_signal_store=".wt",
         wait_vmem=wait_vmem,
-        wait_loads=wait_vmem,
         wait_stores=wait_vmem,
     ),
     # On gfx1250 a ".cg" load lowers to a non-temporal load that refetches every
@@ -98,7 +94,6 @@ _IRIS_ARCH_POLICIES = {
         peer_payload_load="",
         peer_signal_store="",
         wait_vmem=wait_loads_stores,
-        wait_loads=wait_loads,
         wait_stores=wait_stores,
     ),
 }
@@ -490,6 +485,10 @@ class ProducerLamport:
         )
 
     def run(self, out: torch.Tensor) -> None:
+        if not 0 < out.numel() <= self.max_numel or out.numel() % self.BLOCK_ELEMENTS:
+            raise ValueError(
+                "Lamport output must fit its mailbox in complete 512-element tiles"
+            )
         iris_lamport_allreduce[(out.numel() // self.BLOCK_ELEMENTS,)](
             self.producer.data,
             self.mailbox,
@@ -824,7 +823,7 @@ def _iris_lamport_exchange_tile(
     mask,
     RANK: gl.constexpr,
     WORLD_SIZE: gl.constexpr,
-    TOTAL_ELEMENTS: gl.constexpr,
+    TOTAL_ELEMENTS,
     MAX_ELEMENTS: gl.constexpr,
     NUM_STAGES: gl.constexpr,
     PEER_SIGNAL_STORE_CACHE: gl.constexpr,
@@ -892,7 +891,7 @@ def _iris_lamport_exchange_tile(
     gl.store(epochs + gl.program_id(0), ((generation + 1) % NUM_STAGES).to(gl.int32))
 
 
-@gluon.jit
+@gluon.jit(do_not_specialize=["TOTAL_ELEMENTS"])
 def iris_lamport_allreduce(
     input_sym_ptr,
     region_sym_ptr,
@@ -908,7 +907,7 @@ def iris_lamport_allreduce(
     region_7,
     RANK: gl.constexpr,
     WORLD_SIZE: gl.constexpr,
-    TOTAL_ELEMENTS: gl.constexpr,
+    TOTAL_ELEMENTS,
     MAX_ELEMENTS: gl.constexpr,
     NUM_STAGES: gl.constexpr,
     PEER_SIGNAL_STORE_CACHE: gl.constexpr,
@@ -921,14 +920,19 @@ def iris_lamport_allreduce(
     counter; negative zero is replaced with zero to preserve the empty marker.
     """
     gl.static_assert(WORLD_SIZE == 8)
-    gl.static_assert(TOTAL_ELEMENTS % 512 == 0)
-    gl.static_assert(TOTAL_ELEMENTS <= MAX_ELEMENTS)
+    # ProducerLamport.run validates the payload's tile alignment and bound.
+    # Its size follows the batch and must not choose another binary.
+    TOTAL_ELEMENTS = gl.multiple_of(TOTAL_ELEMENTS, 512)
     gl.static_assert(NUM_STAGES >= 3)
     layout: gl.constexpr = gl.BlockedLayout([1, 8], [64, 1], [1, 1], [0, 1])
     pack = gl.program_id(0) * 64 + gl.arange(0, 64, layout=gl.SliceLayout(1, layout))
     element = gl.arange(0, 8, layout=gl.SliceLayout(0, layout))
     offsets = pack[:, None] * 8 + element[None, :]
-    mask = offsets < TOTAL_ELEMENTS
+    # The host launches complete 512-element tiles. A uniform tile predicate
+    # preserves 16-byte coherent stores with a runtime payload bound.
+    mask = gl.full([64, 8], True, gl.int1, layout) & (
+        gl.program_id(0) * 512 < TOTAL_ELEMENTS
+    )
     generation = (
         gl.load(epochs + gl.program_id(0)).to(gl.uint32).to(gl.uint64) % NUM_STAGES
     )
@@ -1057,7 +1061,7 @@ def _iris_sync_rank_token(
         sem="acquire",
         scope="sys",
     )
-    WAIT_VMEM(args=[], constraints="=r,~{memory}")
+    WAIT_VMEM()
     # The acquire is subgroup-local. Keep every subgroup at the protocol
     # boundary until all of them have observed the peer ready flags; the
     # caller consumes the peer inbox immediately after this helper returns.
@@ -1609,7 +1613,7 @@ def iris_pull_twoshot(
     # releasing thread's buffer_wbl2 and s_waitcnt vmcnt(0) cover only its own
     # subgroup's stores. So each subgroup first waits until its stores reach
     # L2 (s_waitcnt vmcnt(0) on gfx950).
-    WAIT_STORES(args=[], constraints="=r,~{memory}")
+    WAIT_STORES()
     partitions_ready = gl.atomic_add(epoch_ptr, 1, sem="release", scope="sys") + 1
     _iris_sync_rank_epoch(
         ready_flags,
@@ -2804,7 +2808,7 @@ def iris_push_twoshot_allreduce(
                 mask,
                 cache=".wt",
             )
-    WAIT_STORES(args=[], constraints="=r,~{memory}")
+    WAIT_STORES()
     gl.barrier()
     _iris_rendezvous(flags, heaps, block, epoch - 1, RANK, NUM_SUBGROUPS, False)
     for tile in range(block, gl.cdiv(part, BLOCK), gl.num_programs(0)):
@@ -2830,7 +2834,7 @@ def iris_push_twoshot_allreduce(
                 cache=".wt",
             )
     # Finish inbox reads and output stores before peers can reuse the inbox.
-    WAIT_VMEM(args=[], constraints="=r,~{memory}")
+    WAIT_VMEM()
     gl.barrier()
     _iris_rendezvous(flags, heaps, block, epoch, RANK, NUM_SUBGROUPS, False)
     gl.store(epochs + block, epoch)
@@ -2881,7 +2885,7 @@ def iris_pull_twoshot_allreduce(
             result += (values[4] + values[5]) + (values[6] + values[7])
         result = result.to(gl.bfloat16)
         gl.amd.cdna4.buffer_store(result, scratch_ptr, index, mask, cache=".wt")
-    WAIT_VMEM(args=[], constraints="=r,~{memory}")
+    WAIT_VMEM()
     gl.barrier()
     _iris_rendezvous(flags, heaps, block, epoch, RANK, NUM_SUBGROUPS, False)
     for tile in range(block, gl.cdiv(part, BLOCK), gl.num_programs(0)):

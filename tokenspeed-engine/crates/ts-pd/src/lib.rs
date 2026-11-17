@@ -73,6 +73,14 @@ pub use status::TransferPoll;
 use ts_mooncake::{Engine, PageGrid};
 pub use wire::StatusMessage;
 
+/// An incarnation must not inherit the identity of a reused address.
+fn new_instance_id() -> std::io::Result<String> {
+    use std::io::Read;
+    let mut random = [0u8; 16];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
+    Ok(format!("{:032x}", u128::from_be_bytes(random)))
+}
+
 /// What one transfer copies, in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Copy {

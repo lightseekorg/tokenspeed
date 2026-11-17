@@ -45,6 +45,19 @@ def rows(plan):
 
 
 @gluon.constexpr_function
+def poll_check(plan):
+    """Retries between tagged-poll clock checks."""
+    return plan.plan.poll_check
+
+
+@gluon.constexpr_function
+def poll_timeout_shift(plan):
+    """Shift of the poll timeout's fixed mantissa
+    (``plan.POLL_TIMEOUT_MANTISSA``), in 100 MHz ticks."""
+    return plan.plan.poll_timeout_shift
+
+
+@gluon.constexpr_function
 def chain(plan):
     """Consecutive rows that are one request's tokens (``Plan.chain``)."""
     return plan.plan.chain
@@ -60,6 +73,30 @@ def row_pairs(plan):
 def region(plan, name):
     """Pair offset of row 0 of mailbox region ``name``."""
     return plan.plan.offset(name)
+
+
+@gluon.constexpr_function
+def world(plan):
+    """Ranks that run the plan together (``Plan.world``)."""
+    return plan.plan.world
+
+
+@gluon.constexpr_function
+def is_peer(plan, name):
+    """Whether other ranks write mailbox region ``name``."""
+    return plan.plan.is_peer(name)
+
+
+@gluon.constexpr_function
+def is_flag(plan, name):
+    """Whether peer region ``name`` holds flags (``Plan.flags``)."""
+    return plan.plan.is_flag(name)
+
+
+@gluon.constexpr_function
+def peer_copy(plan, name):
+    """Pairs between the two copies of peer region ``name``."""
+    return plan.plan.peer_copy(name)
 
 
 @gluon.constexpr_function
@@ -85,6 +122,12 @@ def _stage_base(plan, name):
 @gluon.constexpr_function
 def _stage_tasks(plan, name):
     return plan.plan.stage(name).tasks
+
+
+@gluon.constexpr_function
+def stage_base(plan, name):
+    """The CTA that runs task 0 of stage ``name``."""
+    return _stage_base(plan, name)
 
 
 @gluon.constexpr_function
@@ -150,12 +193,19 @@ __all__ = [
     "grid",
     "has_stage",
     "head_sleep",
+    "is_flag",
+    "is_peer",
+    "peer_copy",
+    "poll_check",
+    "poll_timeout_shift",
     "region",
     "row_pairs",
     "row_task",
     "rows",
+    "stage_base",
     "stage_event",
     "stage_rounds",
     "stage_task",
     "stage_tasks",
+    "world",
 ]

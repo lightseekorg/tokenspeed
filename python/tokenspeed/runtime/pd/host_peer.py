@@ -135,7 +135,8 @@ class DecodeSettings:
             landing addresses.
         tp_size: The attention TP size.
         tp_rank: The attention TP rank.
-        waiting_timeout_s: How long an admitted request may wait for its KV.
+        waiting_timeout_s: Maximum wait before manifest publication and, separately,
+            from publication until KV arrival; cancellation still fences remote writes.
         heartbeat_interval_s: How often the Prefill nodes' health is checked.
         heartbeat_max_failures: Failed checks after which a node is lost.
     """

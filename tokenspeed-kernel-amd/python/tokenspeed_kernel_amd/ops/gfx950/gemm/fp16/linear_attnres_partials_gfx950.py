@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel_amd._extern import extern_compile_options
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16 import gemv
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
@@ -40,7 +41,8 @@ _LANES = gl.constexpr(64)
 _PARTIAL_BLOCK = gl.constexpr(8192)
 # Tokens the GEMV-projection launch takes: the decode GEMV's MFMA tile.
 _GEMV_TOKENS = range(5, gemv.MAX_M + 1)
-_GEMV_OUTPUT_SIZES = frozenset({6288})
+# The K3 MLA q_a/kv_a/gate and KDA qkvfab projections.
+_GEMV_OUTPUT_SIZES = frozenset({3648, 6288})
 # Half the hidden size, padded to a power of two: 8 waves x 64 lanes x 8 elements.
 _HALF = gl.constexpr(4096)
 _HALF_WAVES = gl.constexpr(8)
@@ -148,7 +150,7 @@ def _dual_partial_triton_order(
     gl.store(sum_b_ptr + token, s_b)
 
 
-@gluon.jit(do_not_specialize=("num_tokens",))
+@gluon.jit(do_not_specialize=("num_blocks", "num_tokens"))
 def gluon_linear_attnres_partials_gemv_gfx950(
     hidden_ptr,
     weight_ptr,
@@ -215,7 +217,7 @@ def gluon_linear_attnres_partials_gemv_gfx950(
         )
 
 
-@gluon.jit
+@gluon.jit(do_not_specialize=("num_blocks",))
 def gluon_linear_attnres_partials_gfx950(
     hidden_ptr,
     weight_ptr,
@@ -386,7 +388,7 @@ def gluon_linear_attnres_partials_gfx950(
     gl.store(sum_b_ptr + token, sum_b)
 
 
-@gluon.jit
+@gluon.jit(do_not_specialize=("num_blocks",))
 def gluon_linear_attnres_partials_m4_gfx950(
     hidden_ptr,
     weight_ptr,
@@ -592,6 +594,7 @@ def launch_gluon_linear_attnres_partials_gfx950(
             num_stages=1,
             waves_per_eu=1,
             llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
+            **extern_compile_options(),
         )
         return out
 

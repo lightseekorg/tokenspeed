@@ -26,7 +26,7 @@ import pytest
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
-ts = pytest.importorskip("tokenspeed_scheduler")
+ts = pytest.importorskip("tokenspeed_engine.scheduler")
 
 from tokenspeed.runtime.engine.scheduler_utils import make_config
 
@@ -58,6 +58,7 @@ def _scheduler(*, token_budget: int, with_state: bool, disable_prefix_cache: boo
         num_device_pages=64,
         max_scheduled_tokens=token_budget,
         max_batch_size=1,
+        max_resident_requests=1,
         prefix_granularity=128,
         num_host_pages=0,
         disable_l2_cache=True,
@@ -68,6 +69,7 @@ def _scheduler(*, token_budget: int, with_state: bool, disable_prefix_cache: boo
         max_retracted_requests=0,
         host_write_policy="write_through",
         prefill_decode_interval=0,
+        prefill_decode_min_interval=0,
         storage_config=None,
         enable_kv_cache_events=False,
         decode_input_tokens=1,

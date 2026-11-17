@@ -61,7 +61,10 @@ runs those two directories, keeping the TRT-LLM communication and CUDA suites in
 separate processes. `ut-tokenspeed-kernel-post-submit` runs the slow files that
 `ut-tokenspeed-kernel-part-i` ignores (the non-FP8 GEMM autotune capacity test)
 on pushes to `main` only. Together the three tasks cover the kernel suite once.
-AMD runners run the whole suite in the single `ut-tokenspeed-kernel` task.
+On AMD runners, `ut-tokenspeed-kernel-part-amd-gfx950` runs
+`tokenspeed-kernel/test/amd/gfx950/` and `ut-tokenspeed-kernel-part-amd-ops`
+runs `tokenspeed-kernel/test/ops/`; `ut-tokenspeed-kernel` runs the rest, with
+the numerics, TRT-LLM communication, and CUDA suites in separate processes.
 
 All runners split the `runtime-1gpu` suite across `ut-runtime-1gpu-part-i` and
 `ut-runtime-1gpu-part-ii`, which balance test files by their registered
@@ -205,13 +208,15 @@ under `test/runtime/` or `tokenspeed-kernel/test/`; a unit-test task keeps the
 tests its definition names, as files or directories, and every test helper. A
 module there belongs to one model when it defines `EntryClass` or a task lists
 it; any other module, such as `utils.py`, is shared, and a change to it runs
-every task. The scan fails when a listed module does not exist, or imports a
+every task. Speculative-decoding draft modules (file names with `nextn`,
+`eagle`, `dflash` or `dspark`) are shared too, and `model_sources` may not list
+them. The scan fails when a listed module does not exist, or imports a
 module that belongs to one model without the task listing it too.
 
 ```yaml
 model_sources:
+  - python/tokenspeed/runtime/models/llama.py
   - python/tokenspeed/runtime/models/minimax_m3.py
-  - python/tokenspeed/runtime/models/llama_eagle3.py
 ```
 
 `changed_paths: true` hands a pull request's changed paths to the task's
@@ -261,6 +266,22 @@ the jobs create the two directories beside that cache instead. This survives
 runner pod recreation and avoids downloading the same large wheels again on
 that node. Other runner families keep their existing cache behavior because
 their cluster storage layouts may differ.
+
+The engine installer reuses `tokenspeed-engine` wheels under
+`CI_WHEEL_CACHE_DIR/tokenspeed-engine` on these runners and on Slurm's mounted
+package cache. The key covers the engine and scheduler sources, Python ABI and
+configuration, resolved Python build dependencies, Rust/C++ toolchains, native
+system packages, and compiler settings. A source change invalidates the wheel
+even without a version bump. Concurrent jobs build a missing wheel once under
+a lock, then publish it atomically after an import check. Fork PRs and local
+xgrammar source overrides bypass this cache. The installer logs cache hits and
+build/install elapsed time. Each run prunes wheel directories, orphaned build
+directories, and stale lock files untouched for 14 days; a hit refreshes the
+wheel's timestamp.
+
+The dedicated Rust workflow caches Cargo dependencies and workspace build
+artifacts, with Python/native build inputs included in the key. GPU jobs share
+only the final wheel: CMake build trees contain checkout-specific paths.
 
 B200v2 CI stores FlashInfer tactics under `tokenspeed/flashinfer-autotune`
 in the same persistent root as the package cache: an explicit `CI_CACHE_ROOT`,
@@ -399,6 +420,10 @@ MI450 simulator tasks share their ROCm and PyTorch pins through
 simulator and dependency installers in the same shell; standalone simulator
 setup loads it as well. Update that file to change the stack: its pins override
 inherited environment values. Changes to it select both MI450 tasks.
+The simulator tasks use `install_kernel_deps_rocm.sh` to install kernel
+dependencies without building the scheduler or Rust engine or installing the
+serving runtime. Full ROCm serving installs reuse that script through
+`install_deps_rocm.sh` before installing the runtime components.
 
 PR and push diffs containing only `test/ci/**/*.yaml` run only the changed tasks,
 with existing validation and runner/trigger rules. Diffs that also, or only,
@@ -760,9 +785,9 @@ This is a manual launcher, not a GitHub Actions runner. Override its defaults
 with `TS_CI_ARTIFACT_ROOT`, `TS_CI_CACHE_DIR`, or
 `TS_CI_CONTAINER_IMAGE`.
 
-The default Slurm image pins Torch 2.14.0 and FlashInfer 0.7.3 by image digest.
+The default Slurm image pins Torch 2.14.0 and FlashInfer 0.7.4 by image digest.
 When upgrading, keep the FlashInfer Python requirement, release cubin checksum,
-and runner JIT-cache version aligned. FlashInfer 0.7.3 also requires
+and runner JIT-cache version aligned. FlashInfer 0.7.4 also requires
 cuDNN frontend 1.32.0 or newer and splits its JIT cache into provider packages.
 GB200/B200 setup resolves those providers from the matching FlashInfer CUDA
 index and checks their installed versions again after dependency installation.

@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.dspark_context import (
         DSparkContextProducer,
     )
+    from tokenspeed.runtime.execution.types import DpForwardMetadata
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 
@@ -200,6 +201,10 @@ class ForwardContext:
     # Set by a target model that captures its taps on a narrowed row subset
     # (see CapturedRows); None means one captured row per input row.
     captured_rows: CapturedRows | None = None
+    # Optional packed decode-query boundaries, excluding prefill rows. None
+    # means the fixed output_layout.decode_width stride. Proposal/output
+    # storage stays fixed-width even when the target queries are packed.
+    decode_query_indptr: torch.Tensor | None = None
 
     # --- spec-decode draft (drafter-attached collaborators, per forward) ---
     # Set on the draft forwards that narrow verify-shaped rows to the
@@ -215,6 +220,23 @@ class ForwardContext:
     # forward or travels in PPStageState, never on ctx. A configured producer
     # owns context cache writes; otherwise the drafter owns them.
     dspark_context_producer: DSparkContextProducer | None = None
+
+    def apply_dp_metadata(
+        self, metadata: DpForwardMetadata | None, *, required: bool
+    ) -> None:
+        """Install gathered counts when execution spans DP workers."""
+        if metadata is None:
+            if required:
+                raise RuntimeError(
+                    "DP forward metadata must be gathered on CPU by "
+                    "the event loop before model execution."
+                )
+            return
+        self.global_num_tokens = metadata.global_num_tokens
+        self.global_bs = metadata.global_batch_size
+        self.global_num_decodes = metadata.global_num_decodes
+        self.all_decode_or_idle = metadata.all_decode_or_idle
+        self.all_extend = metadata.all_extend
 
 
 @contextmanager

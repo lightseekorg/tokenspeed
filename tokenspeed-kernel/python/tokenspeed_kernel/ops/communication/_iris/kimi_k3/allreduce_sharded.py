@@ -31,6 +31,7 @@ from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     ProducerPull,
     iris_arch_policy,
 )
+from tokenspeed_kernel.ops.tuning import is_warming_up
 from tokenspeed_kernel.platform import current_platform
 
 REDUCE_PROGRAMS = 24
@@ -72,7 +73,7 @@ def _row_partition_store_completion(
     WAIT_STORES: gl.constexpr,
 ):
     """Complete local stores, update ready flags, and wait for peer completion."""
-    WAIT_STORES(args=[], constraints="=r,~{memory}")
+    WAIT_STORES()
     gl.barrier()
     layout: gl.constexpr = gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
     peers = gl.arange(0, 8, layout=layout)
@@ -1165,7 +1166,7 @@ def iris_k3_pull_gather_topk_rows(
             gl.amd.cdna4.buffer_store(
                 value, lens_publish_ptr, offsets, mask, cache=".wt"
             )
-    WAIT_STORES(args=[], constraints="=r,~{memory}")
+    WAIT_STORES()
     gl.barrier()
     _row_partition_entry_barrier(flags, peer_flags, pid, epoch, RANK, NUM_WARPS)
     publishes = _peer_buffers_like(publish_ptr, heaps, RANK)
@@ -1589,7 +1590,7 @@ class IrisAllReduceShardedState:
             else attention_gather.own_rows
         )
         logits, latent = launch_gluon_latent_input_largem_routed_gfx950(
-            owned, packed_weight
+            owned, packed_weight, warm_variants=is_warming_up()
         )
         # The prefill router allocates its outputs; copy them into the gather.
         weights, ids = route(owned, logits)
@@ -1601,7 +1602,11 @@ class IrisAllReduceShardedState:
             self.join_gather(attention_gather)
         self.gather_moe_inputs(rows)
         shared = launch_gluon_latent_input_largem_shared_gfx950(
-            hidden_states, packed_weight, beta=beta, linear_beta=linear_beta
+            hidden_states,
+            packed_weight,
+            beta=beta,
+            linear_beta=linear_beta,
+            warm_variants=is_warming_up(),
         )
         return (full[0], full[1]), full[3], full[2], shared
 

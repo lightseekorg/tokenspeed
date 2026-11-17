@@ -136,10 +136,17 @@ def test_failed_native_initialization_releases_its_window(monkeypatch):
     monkeypatch.setattr(ascend.dist, "get_rank", lambda: 0)
     monkeypatch.setattr(ascend.dist, "all_reduce", lambda *args, **kwargs: None)
     monkeypatch.setattr(ascend.dist, "barrier", lambda *args, **kwargs: None)
-    monkeypatch.setattr(torch.npu, "synchronize", lambda: None)
+
+    class DeviceRuntime:
+        @staticmethod
+        def synchronize():
+            pass
+
+    # CPU CI has no torch.npu module; only the unavailable device fence is mocked.
+    monkeypatch.setattr(torch, "npu", DeviceRuntime(), raising=False)
     monkeypatch.setattr(ascend, "prepare_dsa_resources", lambda **kwargs: resources)
     layer = make_attention(nope=True, separate=True, independent=True)
-    with pytest.raises(ValueError, match="eight local and 64 global heads"):
+    with pytest.raises(ValueError, match="Unsupported fused DSA projection geometry"):
         ascend.AscendDSARuntime([layer], Mapping(rank=0, world_size=8, attn_tp_size=8))
     assert window.storage is None
     assert layer._fused_decode_runtime is None
@@ -359,3 +366,56 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(
     assert torch.isfinite(output).all() and output.shape == hidden.shape
     assert torch.count_nonzero(pool.latent) > 0
     assert torch.count_nonzero(leaf.index_cache) > 0
+
+
+@pytest.mark.parametrize(
+    "hidden,heads,query_rank,index_heads,supported",
+    [
+        (4096, 64, 1536, 16, False),
+        (4096, 64, 1536, 32, True),
+        (4096, 64, 1536, 64, True),
+        (2048, 32, 768, 16, True),
+        (2048, 32, 768, 32, False),
+        (2048, 32, 768, 64, False),
+    ],
+)
+def test_fused_support_uses_real_loaded_indexer_geometry(
+    hidden, heads, query_rank, index_heads, supported
+):
+    from tokenspeed.runtime.layers.attention.dsa.ascend import supports_fused_dsa_decode
+
+    config = PretrainedConfig(
+        rms_norm_eps=1e-5,
+        mla_use_nope=True,
+        mla_use_output_gate=False,
+        mla_scale_q_lora=True,
+        cli_factor=1,
+        index_n_heads=index_heads,
+        index_head_dim=128,
+        index_topk=2048,
+        index_init_tokens=16,
+        index_local_tokens=1024,
+        index_use_rope=False,
+    )
+    with torch.device("meta"):
+        layer = AscendDSAAttention(
+            config=config,
+            mapping=Mapping(rank=0, world_size=8, attn_tp_size=8, attn_kvp_size=8),
+            hidden_size=hidden,
+            num_heads=heads,
+            qk_nope_head_dim=128,
+            qk_rope_head_dim=64,
+            v_head_dim=128,
+            q_lora_rank=query_rank,
+            kv_lora_rank=512,
+            max_position_embeddings=65536,
+            layer_id=0,
+            lora_norm_eps=1e-5,
+            separate_mla_projections=True,
+            independent_selection=True,
+            prefill_enabled=False,
+        ).bfloat16()
+        layer.indexer.weights_proj.float()
+    assert supports_fused_dsa_decode(layer) == supported
+    layer.indexer.weights_proj.bfloat16()
+    assert not supports_fused_dsa_decode(layer)

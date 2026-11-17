@@ -20,10 +20,17 @@
 
 """Per-route normalization and weighted reduction entry points."""
 
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
 import torch
 from tokenspeed_kernel.ops.moe._cute_dsl import routed_norm as _cute_dsl
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_format_signature
+
+if TYPE_CHECKING:
+    from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import AllReduceMailbox
 
 
 def gather_moe_routes(
@@ -92,6 +99,24 @@ def routed_input_scale_rmsnorm_sum(
     )
 
 
+def routed_sum_reduces_mailbox(
+    gemm2_out: torch.Tensor,
+    permute_map: torch.Tensor,
+    num_tokens: int,
+    topk: int,
+    route_weights: torch.Tensor,
+    norm_weight: torch.Tensor,
+) -> bool:
+    """Whether :func:`routed_input_scale_rmsnorm_sum_gathered` takes an all-reduce mailbox here.
+
+    Only the cluster kernel reduces over ranks; a caller asks before handing
+    it a mailbox, which the Triton launches refuse.
+    """
+    return _cute_dsl.cluster_routed_sum_supported(
+        gemm2_out, permute_map, num_tokens, topk, route_weights, norm_weight
+    )
+
+
 def routed_input_scale_rmsnorm_sum_gathered(
     gemm2_out: torch.Tensor,
     permute_map: torch.Tensor,
@@ -103,6 +128,7 @@ def routed_input_scale_rmsnorm_sum_gathered(
     weight_offset: float,
     enable_pdl: bool,
     output: torch.Tensor | None,
+    all_reduce: AllReduceMailbox | None,
 ) -> torch.Tensor:
     """Normalize and reduce expert routes straight out of a deferred MoE finalize.
 
@@ -127,6 +153,10 @@ def routed_input_scale_rmsnorm_sum_gathered(
         output: Optional caller-owned contiguous output. Supplying it selects
             the portable Triton implementation so the producer can write
             directly into downstream storage.
+        all_reduce: A mailbox through which the cluster kernel also sums the
+            result over the expert-parallel ranks, in BF16 in rank order with
+            -0.0 sent as +0.0 as the one-shot all-reduce does, or None for
+            this rank's sum alone.
 
     Returns:
         Weighted route sum ``[tokens, width]`` in ``gemm2_out``'s dtype.
@@ -158,6 +188,7 @@ def routed_input_scale_rmsnorm_sum_gathered(
         weight_offset,
         enable_pdl,
         output,
+        all_reduce,
     )
 
 
@@ -165,4 +196,5 @@ __all__ = [
     "gather_moe_routes",
     "routed_input_scale_rmsnorm_sum",
     "routed_input_scale_rmsnorm_sum_gathered",
+    "routed_sum_reduces_mailbox",
 ]

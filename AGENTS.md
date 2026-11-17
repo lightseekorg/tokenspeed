@@ -43,6 +43,15 @@ people and average people is more than tenfold.
   does not justify defaulting a behavioral choice.
 * Wrappers must preserve explicitly supplied arguments and must not silently
   discard unsupported arguments.
+* Avoid defensive fallback. Propagate errors and fail explicitly by default.
+  Introduce fallback or automatic recovery only when justified by a concrete,
+  documented need.
+* Kernels must generalize beyond example configurations. Restrictions on
+  tensor shape/layout/contiguity, communication topology, SM versions/counts,
+  model names must reflect correctness requirements or measured performance
+  tradeoffs, not just tested configurations. Derive launch parameters from
+  inputs and hardware properties where possible. Verify the intended kernel
+  is selected; passing through a fallback can hide performance regressions.
 * Use absolute imports instead of relative imports.
 * Use f-strings for Python string interpolation, including logging messages.
   Keep format templates required by APIs such as `strftime` and logging
@@ -55,11 +64,10 @@ people and average people is more than tenfold.
   state, including fallback values that hide missing declarations.
 * Use the repository's full MIT license header for copyright notices; do not use
   an abbreviated copyright-only header.
-* Before creating commits, run `pre-commit run --all-files` to format.
-* Do not substitute a narrower lint command for the repository hook before
-  committing. Always run the exact `pre-commit run --all-files` command and
-  commit any formatter changes it makes.
-* When creating commits, sign off on behalf of the author.
+* Before creating commits, run exactly `pre-commit run --all-files` and
+  include any formatter changes. Do not substitute a narrower lint command.
+* When creating commits, sign off on behalf of the author. Do not list AI agents
+  as co-authors.
 
 ## Design principles
 
@@ -165,6 +173,23 @@ Inside the root `tokenspeed-scheduler/` directory:
   request itself. Avoid paired acquire/release calls, hand-kept counters and
   erase-on-teardown code spread across call sites. `CacheBlockRef`,
   `ReqPoolIndex` and `StorageLease` are the models to follow.
+* Check integer overflow in the C++ scheduler. Token counts and positions,
+  page, block and slot indices and LCM block ids are 32-bit, and they grow
+  with request length and pool size (a million-token request, a Host pool of
+  10^8 pages). Widen a factor to `std::int64_t` before multiplying, e.g.
+  pages times page size, parents times packing, tokens times bytes per
+  token, or requests times blocks per request; casting the product is too
+  late. Write rounded-up divisions and bound checks so they cannot overflow
+  themselves (`n / d + (n % d != 0)` rather than `(n + d - 1) / d` near the
+  limit). Check the range before narrowing a `std::size_t` or `std::int64_t`
+  to `std::int32_t`, including values handed to Python or the Rust engine.
+  Validate integer config fields and request limits against ranges that
+  leave room for the rounding and offsets applied later (a token limit just
+  under `INT32_MAX` overflows once rounded up to a block). Watch unsigned
+  subtraction, mixed signed/unsigned comparisons, and `std::abs` or negation
+  of a value that can be `INT32_MIN`. Reviews should check every new or
+  changed computation on such counts; when a value can reach 2^31 in a
+  supported configuration, add a test at that bound.
 
 ## tokenspeed-scheduler releases
 

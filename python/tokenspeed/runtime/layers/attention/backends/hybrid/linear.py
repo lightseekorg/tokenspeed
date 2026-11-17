@@ -150,6 +150,12 @@ class HybridLinearAttnBackend(AttentionBackend):
     def cache_placement(self, layer):
         return self._backend_for_layer(layer.layer_id).cache_placement(layer)
 
+    def takes_owned_decode_topk(self, layer):
+        return self._backend_for_layer(layer.layer_id).takes_owned_decode_topk(layer)
+
+    def dcp_decode_query_rider(self, layer, q):
+        return self._backend_for_layer(layer.layer_id).dcp_decode_query_rider(layer, q)
+
     def reads_fp8_kv_scales(self, layer):
         return self._backend_for_layer(layer.layer_id).reads_fp8_kv_scales(layer)
 
@@ -204,6 +210,11 @@ class HybridLinearAttnBackend(AttentionBackend):
     def preallocate_verify_workspace(self, max_bs: int, draft_token_num: int) -> int:
         return self.linear_attn_backend.preallocate_verify_workspace(
             max_bs, draft_token_num
+        )
+
+    def preallocate_history_gather_workspace(self, max_model_len: int) -> int:
+        return self.full_attn_backend.preallocate_history_gather_workspace(
+            max_model_len
         )
 
     def register_step_counter(self, step_counter):

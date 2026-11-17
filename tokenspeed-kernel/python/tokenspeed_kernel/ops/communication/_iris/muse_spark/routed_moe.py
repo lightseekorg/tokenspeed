@@ -104,7 +104,7 @@ def iris_fused_pull_oneshot_allreduce_routed_rmsnorm_sum(
     # wait for memory, and the releasing thread's buffer_wbl2 and s_waitcnt
     # vmcnt(0) cover only its own subgroup's stores. So each subgroup first
     # waits until its stores reach L2 (s_waitcnt vmcnt(0) on gfx950).
-    WAIT_STORES(args=[], constraints="=r,~{memory}")
+    WAIT_STORES()
 
     local_heap = _iris_group_heap_base(rank, heaps)
     epoch_ptr = ready_flags + token * WORLD_SIZE + rank
@@ -264,7 +264,7 @@ def iris_fused_lamport_allreduce_routed_rmsnorm_sum(
             sentinel, region, stage_base + peer * MAX_ELEMENTS + offsets, cache=".wt"
         )
     # Finish resetting the mailbox before advancing this tile's epoch.
-    WAIT_STORES(args=[], constraints="=r,~{memory}")
+    WAIT_STORES()
     gl.store(epochs + program, ((stage + 1) % 3).to(gl.int32))
 
 
@@ -310,7 +310,7 @@ def iris_routed_rmsnorm_weighted_sum_write_through(
         combined.to(gl.bfloat16), output, token * 4096 + columns, cache=".wt"
     )
     # Finish every subgroup's write-through stores before returning.
-    WAIT_STORES(args=[], constraints="=r,~{memory}")
+    WAIT_STORES()
     gl.barrier()
 
 
@@ -423,7 +423,7 @@ def iris_fused_routed_rmsnorm_sum_lamport_allgather(
             cache=".wt",
         )
     # Finish each subgroup's mailbox reset before it advances its tile's stage.
-    WAIT_STORES(args=[], constraints="=r,~{memory}")
+    WAIT_STORES()
     gl.store(epochs + tiles, ((stage + 1) % 3).to(gl.int32), mask=pack % 64 == 0)
 
 

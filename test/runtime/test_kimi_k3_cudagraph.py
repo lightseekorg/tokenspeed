@@ -26,6 +26,7 @@ import sys
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
 import torch
 
 # CI Registration (parsed via AST, runtime no-op)
@@ -54,6 +55,23 @@ _MAX_CTX = 256
 _FULL = "full_attention"
 
 
+@pytest.fixture(autouse=True)
+def _cpu_split_kv_planner(monkeypatch):
+    """The split-KV planner is a GPU Triton launch; the CPU metadata tests
+    stub the kernel-package entry points its refresh calls go through."""
+    monkeypatch.setattr(tokenspeed_mla_module, "get_num_sm", lambda device: 148)
+    monkeypatch.setattr(
+        tokenspeed_mla_module,
+        "tokenspeed_mla_decode_task_capacity",
+        lambda max_bs, *args: max_bs * 32,
+    )
+    monkeypatch.setattr(
+        tokenspeed_mla_module,
+        "tokenspeed_mla_decode_split_kvs",
+        lambda *args, **kwargs: None,
+    )
+
+
 def _bare_mla_backend(
     *,
     is_draft: bool = False,
@@ -65,6 +83,8 @@ def _bare_mla_backend(
     backend = object.__new__(CuteDSLMLABackend)
     backend._dcp = None
     backend.min_kv_split = 1
+    backend.kvp_group = (0,)
+    backend._num_heads_per_tp = 1
     backend._logged_block_layouts = set()
     backend.device = "cpu"
     backend.kernel_page_size = _PAGE_SIZE

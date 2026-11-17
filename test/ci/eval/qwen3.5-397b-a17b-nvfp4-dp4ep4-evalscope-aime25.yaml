@@ -9,7 +9,6 @@ triggers:
 model_sources:
   - python/tokenspeed/runtime/models/qwen3_5.py
   - python/tokenspeed/runtime/models/qwen3_5_moe.py
-  - python/tokenspeed/runtime/models/qwen3_5_nextn.py
   - python/tokenspeed/runtime/models/qwen3_vision.py
 runner:
   labels:

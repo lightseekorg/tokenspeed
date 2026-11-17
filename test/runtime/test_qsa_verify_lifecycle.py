@@ -22,10 +22,14 @@
 
 Exercise execution modes with all consumers, then each optional consumer alone.
 The same runner entry also commits ordinary hybrid targets without a Qwen4 root.
+A padded replay also marks its filler rows, in MegaMoE's live-request counts and
+the expert load row mask, and restores both, even when it fails; the runner arms
+the counts only for layouts where every rank stages its whole batch.
 """
 
 import os
 import sys
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -37,8 +41,13 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
+from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.execution.drafter.dummy import DummyDrafter
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.execution.forward_step import ForwardStepRunner
+from tokenspeed.runtime.execution.forward_step import (
+    ForwardStepRunner,
+    mega_moe_stages_whole_batches,
+)
 from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
     HybridLinearAttnBackend,
@@ -46,6 +55,8 @@ from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
 from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
     Qwen4ExpBackend,
 )
+from tokenspeed.runtime.moe.expert_load_rows import ExpertLoadRowMask
+from tokenspeed.runtime.sampling.backends.base import CUDA_GRAPH_VARIANT_DEFAULT
 
 
 def _runner(
@@ -54,10 +65,12 @@ def _runner(
     has_drafter: bool,
     consumers: tuple[str, ...],
     fail_forward: bool,
+    packed_query_tokens: int | None = None,
 ):
     events = []
     commits = {"recurrent": [], "ple": [], "qsa": []}
     wrapper = object.__new__(ForwardStepRunner)
+    wrapper.dp_local_graph = False
     wrapper.config = SimpleNamespace(
         spec_algo="MTP", max_req_pool_size=8, spec_draft_tree=False
     )
@@ -120,14 +133,16 @@ def _runner(
             commit_after_mtp_verify=lambda *args, **kwargs: events.append("draft_qsa")
         ),
     )
-    wrapper.drafter = (
-        SimpleNamespace(
-            attn_backend=draft_backend,
-            replay_decode_graph=lambda graph, *, bs, graph_bs: graph.replay(),
-        )
-        if has_drafter
-        else None
-    )
+    wrapper.drafter = None
+    if has_drafter:
+        drafter = object.__new__(DummyDrafter)
+        drafter.spec_num_tokens = 4
+        drafter.attn_backend = draft_backend
+        if packed_query_tokens is not None:
+            drafter.prepare_decode_graph_token_layout = lambda ctx, **kwargs: (
+                packed_query_tokens
+            )
+        wrapper.drafter = drafter
     wrapper.max_tokens_per_req = 4
     wrapper.input_buffers = SimpleNamespace(
         req_pool_indices_buf=torch.tensor([2, 3, 0, 0], dtype=torch.int32),
@@ -141,10 +156,12 @@ def _runner(
     wrapper._padded_bs = lambda bs, ctx: 4
     wrapper._prepare_decode_metadata = lambda *args, **kwargs: events.append("metadata")
     wrapper._init_forward_metadata = lambda *args, **kwargs: events.append("metadata")
-    wrapper._cuda_graph_key = lambda bs: bs
+    wrapper._cuda_graph_key = lambda bs: (CUDA_GRAPH_VARIANT_DEFAULT, bs)
     wrapper._prepare_request_token_history_graph_inputs = lambda **kwargs: None
     wrapper._expert_load_rows = None
+    wrapper._mega_moe_live_requests = None
     wrapper._graph_debug = False
+    wrapper._reported_query_graphs = set()
     wrapper.deepep_adapter = SimpleNamespace(replay=lambda: None)
     result = (
         torch.arange(16, dtype=torch.int32),
@@ -161,8 +178,9 @@ def _runner(
         return result[0][:8], result[1][:2], None, None, None
 
     wrapper._forward_func = lambda **kwargs: execute()
-    wrapper.graphs = {4: SimpleNamespace(replay=execute)}
-    wrapper.output_buffers = {4: result}
+    graph_key = (CUDA_GRAPH_VARIANT_DEFAULT, 4)
+    wrapper.graphs = {graph_key: SimpleNamespace(replay=execute)}
+    wrapper.output_buffers = {graph_key: result}
     return wrapper, events, commits
 
 
@@ -264,6 +282,191 @@ def test_failed_execution_does_not_commit_stale_staging(use_graph):
         _run(wrapper, ForwardMode.DECODE)
     assert events == ["metadata", "execute"]
     assert commits == {"recurrent": [], "ple": [], "qsa": []}
+
+
+@pytest.mark.parametrize("has_drafter", [False, True])
+@pytest.mark.parametrize("fail_forward", [False, True])
+def test_padded_replay_marks_filler_rows_then_restores(fail_forward, has_drafter):
+    wrapper, _, _ = _runner(
+        use_graph=True,
+        has_drafter=has_drafter,
+        consumers=(),
+        fail_forward=fail_forward,
+    )
+    live_requests = torch.ones(2, dtype=torch.int32)
+    wrapper._mega_moe_live_requests = live_requests
+    # One rank's expert load row mask: 4 padded requests of 4 rows each.
+    load_rows = ExpertLoadRowMask(Mapping(rank=0, world_size=1))
+    load_rows.reserve(16, "cpu")
+    wrapper._expert_load_rows = load_rows
+    wrapper.world_size = 1
+    seen = []
+    graph_key = (CUDA_GRAPH_VARIANT_DEFAULT, 4)
+    replay = wrapper.graphs[graph_key].replay
+
+    def recording_replay():
+        seen.append((live_requests.tolist(), load_rows.rows(16).tolist()))
+        return replay()
+
+    wrapper.graphs[graph_key] = SimpleNamespace(replay=recording_replay)
+    with (
+        pytest.raises(RuntimeError, match="forward failed")
+        if fail_forward
+        else nullcontext()
+    ):
+        _run(wrapper, ForwardMode.DECODE)
+    # MegaMoE routes, and the counters count, the rows of the 2 live of 4
+    # padded requests. The replay, even a failed one, restores (1, 1) and the
+    # all-live mask, so later eager forwards route and count every row.
+    assert seen == [([2, 4], [True] * 8 + [False] * 8)]
+    assert live_requests.tolist() == [1, 1]
+    assert load_rows.rows(16).tolist() == [True] * 16
+
+
+@pytest.mark.parametrize("fail_forward", [False, True])
+def test_packed_replay_does_not_apply_uniform_request_count_mask(fail_forward):
+    wrapper, _, _ = _runner(
+        use_graph=True,
+        has_drafter=True,
+        consumers=(),
+        fail_forward=fail_forward,
+        packed_query_tokens=6,
+    )
+    live_requests = torch.ones(2, dtype=torch.int32)
+    wrapper._mega_moe_live_requests = live_requests
+    load_rows = ExpertLoadRowMask(Mapping(rank=0, world_size=1))
+    load_rows.reserve(16, "cpu")
+    load_rows.mask.zero_()
+    wrapper._expert_load_rows = load_rows
+    wrapper.world_size = 1
+    seen = []
+    graph_key = (CUDA_GRAPH_VARIANT_DEFAULT, 4)
+    replay = wrapper.graphs[graph_key].replay
+
+    def recording_replay():
+        seen.append((live_requests.tolist(), load_rows.rows(16).tolist()))
+        return replay()
+
+    wrapper.graphs[graph_key] = SimpleNamespace(replay=recording_replay)
+    with (
+        pytest.raises(RuntimeError, match="forward failed")
+        if fail_forward
+        else nullcontext()
+    ):
+        _run(wrapper, ForwardMode.DECODE)
+    # Packed rows have unequal query lengths, so a batch-size ratio cannot
+    # identify filler requests. Keep MegaMoE's all-live counts; the row mask
+    # still marks exactly the packed query rows for expert-load accounting.
+    assert seen == [([1, 1], [True] * 6 + [False] * 10)]
+    assert live_requests.tolist() == [1, 1]
+    assert load_rows.rows(16).tolist() == [True] * 16
+
+
+@pytest.mark.parametrize(
+    "attn_tp_size,moe_ep_size,whole_batches",
+    [
+        # DeepSeek V4.1 admits MegaMoE with attention TP == MoE TP x EP (the
+        # attention all-reduce leaves every rank its group's whole batch) or
+        # with attention TP 1 (also Qwen3.5's DP8/TP1/EP8).
+        (4, 4, True),
+        (8, 8, True),
+        (1, 4, True),
+        (1, 8, True),
+        # Qwen3.5 MegaMoE under DP4/TP2/EP8 and DP2/TP4/EP8 stages
+        # reduce-scatter shards with uneven live rows: route every row.
+        (2, 8, False),
+        (4, 8, False),
+    ],
+)
+def test_whole_batch_layouts_are_attention_tp_1_or_the_moe_size(
+    attn_tp_size, moe_ep_size, whole_batches
+):
+    world_size = max(attn_tp_size, moe_ep_size)
+    mapping = Mapping(
+        rank=0,
+        world_size=world_size,
+        attn_tp_size=attn_tp_size,
+        attn_dp_size=world_size // attn_tp_size,
+        moe_tp_size=1,
+        moe_ep_size=moe_ep_size,
+    )
+    assert (
+        mega_moe_stages_whole_batches(
+            attention_tp_size=mapping.attn.tp_size,
+            moe_tp_ep_size=mapping.moe.tp_ep_size,
+        )
+        is whole_batches
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "attn_tp_size,moe_ep_size,armed",
+    # Whole-batch layouts arm the pair; Qwen3.5's DP4/TP2/EP8 does not.
+    [(4, 4, True), (1, 8, True), (2, 8, False)],
+)
+def test_runner_arms_mega_moe_counts_only_for_whole_batch_layouts(
+    monkeypatch, attn_tp_size, moe_ep_size, armed
+):
+    from tokenspeed_kernel.ops.moe.deep_gemm import mega_moe_live_requests
+
+    from tokenspeed.runtime.execution.model_executor import ModelExecutorConfig
+    from tokenspeed.runtime.layers.moe import utils as moe_utils
+
+    class Backend:
+        def init_cuda_graph_state(self, *args, **kwargs):
+            pass
+
+    monkeypatch.setattr(moe_utils, "MOE_BACKEND", moe_utils.MoeBackend.MEGA_MOE)
+    world_size = max(attn_tp_size, moe_ep_size)
+    config = ModelExecutorConfig(
+        max_req_pool_size=5,
+        output_length=1,
+        enforce_eager=False,
+        prefix_granularity=128,
+        max_num_seqs=32,
+        chunked_prefill_size=4096,
+        input_vocab_size=32,
+        vocab_size=32,
+        context_len=4096,
+        physical_context_len=4096,
+        # The runner creates the pair only on CUDA.
+        device="cuda",
+        gpu_id=0,
+        global_rank=0,
+        cudagraph_capture_sizes=[1, 2, 4],
+        disable_cuda_graph_padding=False,
+        spec_topk=1,
+        max_cudagraph_capture_size=4,
+        model_is_mrope=False,
+        autotune_cache_key=None,
+        prefill_only=False,
+        input_logprob_chunk_tokens=1024,
+        decode_only_attention=False,
+        prefill_graph_capture_batch_sizes=None,
+        enable_speculative_sampling=False,
+        enable_dp_local_cuda_graph=False,
+        query_shard_size=1,
+        query_shard_rank=0,
+        enable_memory_saver=False,
+        data_parallel_size=world_size // attn_tp_size,
+        attention_tp_size=attn_tp_size,
+        moe_tp_ep_size=moe_ep_size,
+        world_size=world_size,
+    )
+    runner = ForwardStepRunner(
+        forward_func=lambda *args, **kwargs: None,
+        attn_backend=Backend(),
+        token_to_kv_pool=SimpleNamespace(
+            arena=SimpleNamespace(cache_group_specs=(), cache_group_page_counts={})
+        ),
+        input_buffers=object(),
+        config=config,
+    )
+    # Armed, the runner's padded replays write the very pair every MegaMoE
+    # staging reads; otherwise it writes none and MegaMoE routes every row.
+    expected = mega_moe_live_requests(config.device) if armed else None
+    assert runner._mega_moe_live_requests is expected
 
 
 if __name__ == "__main__":

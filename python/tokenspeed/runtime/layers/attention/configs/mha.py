@@ -36,6 +36,22 @@ from tokenspeed.runtime.layers.attention.configs.base import (
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
+def mha_kv_cache_dtype(
+    kv_cache_dtype: str,
+    speculative_algorithm: str | None,
+    drafter_attention_backend: str | None,
+    is_draft: bool,
+) -> str:
+    """The ``--kv-cache-dtype`` an MHA cache gets: a block drafter's cache
+    stays BF16 unless the drafter attends with trtllm."""
+    if (
+        is_block_drafter(speculative_algorithm, is_draft)
+        and drafter_attention_backend != "trtllm"
+    ):
+        return "bfloat16"
+    return kv_cache_dtype
+
+
 @dataclass(kw_only=True)
 class MHAConfig(SoftmaxAttnConfig):
     # Mixed full+sliding models are ONE component carrying the inherited
@@ -50,12 +66,15 @@ class MHAConfig(SoftmaxAttnConfig):
     def generate(
         cls, server_args: ServerArgs, model_config: ModelConfig, is_draft: bool = False
     ) -> AttnConfig:
-        kv_cache_dtype = server_args.kv_cache_dtype
         draft_block_decode = is_block_drafter(
             server_args.speculative_algorithm, is_draft
         )
-        if draft_block_decode and server_args.drafter_attention_backend != "trtllm":
-            kv_cache_dtype = "bfloat16"
+        kv_cache_dtype = mha_kv_cache_dtype(
+            server_args.kv_cache_dtype,
+            server_args.speculative_algorithm,
+            server_args.drafter_attention_backend,
+            is_draft,
+        )
 
         hf_config = model_config.hf_config
         cache_layer_types = resolve_cache_layer_types(

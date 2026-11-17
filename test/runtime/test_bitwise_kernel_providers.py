@@ -91,7 +91,9 @@ def test_lm_head_uses_its_planned_method_for_all_batch_sizes(registry, with_bias
     with torch.no_grad():
         head.weight.copy_(torch.arange(head.weight.numel()).reshape_as(head.weight) % 7)
     processor = LogitsProcessor(
-        PretrainedConfig(vocab_size=8, hidden_size=4), dp_lm_head_tp=False
+        PretrainedConfig(vocab_size=8, hidden_size=4),
+        attn_tp_size=1,
+        dp_lm_head_tp=False,
     )
     metadata = LogitsMetadata(ForwardMode.DECODE, query_shard=None)
     x = torch.arange(12, dtype=torch.float32).view(3, 4)

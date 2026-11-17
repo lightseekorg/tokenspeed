@@ -33,7 +33,6 @@ from tokenspeed.runtime.configs.qwen4_exp_config import (
     Qwen4ExpConfig,
     Qwen4ExpTextConfig,
 )
-from tokenspeed.runtime.configs.utils import get_rope_parameters
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
@@ -46,19 +45,15 @@ from tokenspeed.runtime.layers.hyperconnection import (
     GatedResidualSimple,
     HyperConnectionConfig,
 )
-from tokenspeed.runtime.layers.layernorm import GemmaRMSNorm
-from tokenspeed.runtime.layers.linear import QKVParallelLinear, RowParallelLinear
 from tokenspeed.runtime.layers.moe import (
     ExpertCheckpointSchema,
     build_moe_checkpoint_loader,
 )
-from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.qwen4_exp_ple import (
     Qwen4ExpNGramEmbedding,
     Qwen4ExpPLELayer,
 )
-from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.model_loader.weight_utils import (
     default_weight_loader,
 )
@@ -71,19 +66,17 @@ from tokenspeed.runtime.models.qwen3_5 import (
     Qwen3_5GatedDeltaNet,
     Qwen3_5LinearDecoderLayer,
     _gdn_in_proj_stacked_mapping,
+    build_qwen3_5_mlp,
 )
-from tokenspeed.runtime.models.qwen3_5_moe import (
-    Qwen3_5MoeMLP,
-    Qwen3_5MoeSparseMoeBlock,
-)
+from tokenspeed.runtime.models.qwen3_5_moe import Qwen3_5MoeSparseMoeBlock
 from tokenspeed.runtime.models.qwen4_exp_monokernel import (
     DeltaMonokernelLayer,
     QSAMonokernelLayer,
     enable_decode_monokernels,
 )
-from tokenspeed.runtime.models.utils import validate_attention_partition
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.utils import add_prefix
+from tokenspeed.runtime.utils.cuda_stream import StreamFork
 
 logger = logging.getLogger(__name__)
 
@@ -94,44 +87,16 @@ def _qwen4_exp_uses_sigmoid_output_gate(config: Qwen4ExpTextConfig) -> bool:
     return getattr(config, "output_gate_type", None) == "sigmoid"
 
 
+def _warmup_qwen4_moe(model: nn.Module) -> None:
+    for module in model.modules():
+        if isinstance(module, Qwen3_5MoeSparseMoeBlock):
+            module.warmup()
+
+
 def _qwen4_exp_uses_sparse_moe(config: Qwen4ExpTextConfig) -> bool:
     """Return whether the Qwen4-Exp checkpoint has sparse experts."""
 
     return getattr(config, "num_experts", None) is not None
-
-
-def _build_qwen4_exp_mlp(
-    config: Qwen4ExpTextConfig,
-    mapping: Mapping,
-    layer_id: int,
-    quant_config: QuantizationConfig | None,
-    alt_stream: torch.cuda.Stream | None,
-    prefix: str,
-) -> tuple[nn.Module, bool]:
-    """Build a Qwen4-Exp dense or sparse MLP without changing Qwen3.5."""
-
-    is_moe = _qwen4_exp_uses_sparse_moe(config)
-    if is_moe:
-        mlp = Qwen3_5MoeSparseMoeBlock(
-            config=config,
-            mapping=mapping,
-            quant_config=quant_config,
-            layer_index=layer_id,
-            alt_stream=alt_stream,
-            prefix=add_prefix("mlp", prefix),
-        )
-    else:
-        mlp = Qwen3_5MoeMLP(
-            parallelism="dense",
-            mapping=mapping,
-            hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
-            hidden_act=config.hidden_act,
-            quant_config=quant_config,
-            reduce_results=False,
-            prefix=add_prefix("mlp", prefix),
-        )
-    return mlp, is_moe
 
 
 class _Qwen4ExpRMSNormGated(nn.Module):
@@ -145,6 +110,7 @@ class _Qwen4ExpRMSNormGated(nn.Module):
     def __init__(self, hidden_size: int, eps: float) -> None:
         super().__init__()
         self.eps = float(eps)
+        self.sigmoid_gate = True
         self.weight = nn.Parameter(torch.ones(hidden_size))
 
     def forward(self, x: torch.Tensor, z: torch.Tensor | None = None) -> torch.Tensor:
@@ -303,21 +269,31 @@ class Qwen4ExpLinearDecoderLayer(_Qwen4ExpDecoderMixin, Qwen3_5LinearDecoderLaye
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         alt_stream: torch.cuda.Stream | None = None,
+        *,
+        enable_fp8_attn_proj: bool,
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
         self.mapping = mapping
         self.layer_id = layer_id
         self.linear_attn = Qwen3_5GatedDeltaNet(
-            config, mapping, layer_id, quant_config, prefix=prefix
+            config,
+            mapping,
+            layer_id,
+            quant_config,
+            prefix=prefix,
+            alt_stream=alt_stream,
+            enable_fp8_attn_proj=enable_fp8_attn_proj,
         )
-        self.mlp, self.is_moe = _build_qwen4_exp_mlp(
+        self.is_moe = _qwen4_exp_uses_sparse_moe(config)
+        self.mlp = build_qwen3_5_mlp(
             config,
             mapping,
             layer_id,
             quant_config,
             alt_stream,
             prefix.replace(".linear_attn", ""),
+            self.is_moe,
         )
         self.input_layernorm = None
         self.post_attention_layernorm = None
@@ -368,91 +344,23 @@ class Qwen4ExpAttentionDecoderLayer(
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
         alt_stream: torch.cuda.Stream | None = None,
+        *,
+        enable_fp8_attn_proj: bool,
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
+        self.enable_fp8_attn_proj = enable_fp8_attn_proj
         self.mapping = mapping
-        self.hidden_size = config.hidden_size
-        self.attn_tp_rank = mapping.attn.tp_rank
-        self.attn_tp_size = mapping.attn.tp_size
-        self.attn_tp_group = mapping.attn.tp_group
-        self.total_num_heads = config.num_attention_heads
-        self.total_num_kv_heads = config.num_key_value_heads
-        validate_attention_partition(
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            self.attn_tp_size,
-        )
-        self.num_heads = self.total_num_heads // self.attn_tp_size
-        self.num_kv_heads = max(1, self.total_num_kv_heads // self.attn_tp_size)
-        self.head_dim = config.head_dim or (self.hidden_size // self.num_heads)
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
-        self.scaling = self.head_dim**-0.5
-        self.max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
-        self.rope_scaling = get_rope_parameters(config)
-        self.rope_theta = self.rope_scaling.get("rope_theta", 10000)
-        self.partial_rotary_factor = self.rope_scaling.get("partial_rotary_factor", 1.0)
-        self.layer_id = layer_id
-        self.attn_output_gate = self._uses_attention_output_gate(config)
-        if self.attn_output_gate:
-            logger.warning_once("using attn output gate!")
-        self.rotary_emb = get_rope(
-            head_size=self.head_dim,
-            rotary_dim=self.head_dim,
-            max_position=self.max_position_embeddings,
-            rope_scaling=self.rope_scaling,
-            base=self.rope_theta,
-            partial_rotary_factor=self.partial_rotary_factor,
-            is_neox_style=True,
-            dtype=torch.get_default_dtype(),
-        )
-        attn_quant_config = (
-            None
-            if quant_config and quant_config.get_name() == "nvfp4"
-            else quant_config
-        )
-        self.qkv_proj = QKVParallelLinear(
-            config.hidden_size,
-            self.head_dim,
-            self.total_num_heads * (1 + self.attn_output_gate),
-            self.total_num_kv_heads,
-            bias=False,
-            quant_config=attn_quant_config,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
-            tp_group=self.attn_tp_group,
-            prefix=add_prefix("qkv_proj", prefix),
-        )
-        self.o_proj = RowParallelLinear(
-            self.total_num_heads * self.head_dim,
-            config.hidden_size,
-            bias=False,
-            quant_config=attn_quant_config,
-            reduce_results=False,
-            tp_rank=self.attn_tp_rank,
-            tp_size=self.attn_tp_size,
-            tp_group=self.attn_tp_group,
-            prefix=add_prefix("o_proj", prefix),
-        )
-        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.attn = PagedAttention(
-            self.num_heads,
-            self.head_dim,
-            self.scaling,
-            num_kv_heads=self.num_kv_heads,
-            layer_id=layer_id,
-            rotary_emb=self.rotary_emb,
-            qk_norm=(self.q_norm, self.k_norm),
-        )
-        self.mlp, self.is_moe = _build_qwen4_exp_mlp(
+        self._init_attention(config, mapping, layer_id, quant_config, prefix)
+        self.is_moe = _qwen4_exp_uses_sparse_moe(config)
+        self.mlp = build_qwen3_5_mlp(
             config,
             mapping,
             layer_id,
             quant_config,
             alt_stream,
             prefix.replace(".self_attn", ""),
+            self.is_moe,
         )
         self.input_layernorm = None
         self.post_attention_layernorm = None
@@ -464,6 +372,8 @@ class Qwen4ExpAttentionDecoderLayer(
             dense_batch_invariant=False,
             query_sharded=False,
         )
+        # FP8 projections keep their packed serial path.
+        self.qsa_fork = StreamFork(None if enable_fp8_attn_proj else alt_stream)
         self.indexer = None
         if getattr(config, "indexer_n_heads", None) is not None:
             from tokenspeed.runtime.layers.attention.qsa import QSAIndexer
@@ -477,23 +387,73 @@ class Qwen4ExpAttentionDecoderLayer(
             )
         self._init_qwen4_exp_extensions(config, mapping, layer_id, quant_config, prefix)
 
+    def _can_overlap_qsa(
+        self, hidden_states: torch.Tensor, ctx: ForwardContext
+    ) -> bool:
+        # Performance policy: four BF16 verify rows per request, up to BS128
+        # on TP1. Other TP sizes retain the single-request policy.
+        max_bs = 128 if self.attn_tp_size == 1 else 1
+        return (
+            self.indexer is not None
+            and self.qsa_fork.aux_stream is not None
+            and hidden_states.is_cuda
+            and hidden_states.dtype == torch.bfloat16
+            and 1 <= ctx.bs <= max_bs
+            and hidden_states.shape[0] == ctx.bs * 4
+            and self.indexer.can_overlap(ctx, num_rows=hidden_states.shape[0])
+        )
+
     def self_attention(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
     ) -> torch.Tensor:
-        q, k, v, gate = self._project_qkv(hidden_states)
-        selected_slots = (
-            self.indexer(hidden_states, positions, ctx)
-            if self.indexer is not None
-            else None
-        )
+        overlap = self._can_overlap_qsa(hidden_states, ctx)
+        capturing = overlap and torch.cuda.is_current_stream_capturing()
+        if overlap:
+            # Project on main: GEMM providers can share stream-local workspace.
+            raw_q, token_k = self.indexer._project_qk_raw(hidden_states)
+            main_stream = torch.cuda.current_stream()
+        with self.qsa_fork.scope(enable=overlap, overlap=True):
+            if overlap:
+                with self.qsa_fork.branch():
+                    if not capturing:
+                        for tensor in (raw_q, token_k, positions):
+                            tensor.record_stream(self.qsa_fork.aux_stream)
+                    selected_slots = self.indexer.forward_projected(
+                        raw_q, token_k, positions, ctx
+                    )
+            q, k, v, gate = self._project_qkv(hidden_states)
+            if overlap:
+                # Prologue remains the sole owner of head transforms and KV
+                # writes. Core attention below consumes its prepared query.
+                q = self.attn.prologue(q, k, v, positions, ctx).q
+                k = v = None
+            else:
+                selected_slots = (
+                    self.indexer(hidden_states, positions, ctx)
+                    if self.indexer is not None
+                    else None
+                )
+        if overlap and not capturing:
+            selected_slots.record_stream(main_stream)
+            ctx.attn_backend.sparse_topk.qsa_selection.selected_blocks.record_stream(
+                main_stream
+            )
+        fuse_output_quant = self._should_fuse_output_quant(gate)
         attention_output = self._attn(
-            positions, q, k, v, gate, ctx, topk_indices=selected_slots
+            positions,
+            q,
+            k,
+            v,
+            None if fuse_output_quant else gate,
+            ctx,
+            topk_indices=selected_slots,
         )
-        output, _ = self.o_proj(attention_output)
-        return output
+        return self._project_output(
+            attention_output, gate if fuse_output_quant else None
+        )
 
     def forward(
         self,
@@ -557,8 +517,16 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         mapping: Mapping,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
+        *,
+        enable_fp8_attn_proj: bool | None = None,
     ) -> None:
-        super().__init__(config, mapping, quant_config, prefix)
+        super().__init__(
+            config,
+            mapping,
+            quant_config,
+            prefix,
+            enable_fp8_attn_proj=enable_fp8_attn_proj,
+        )
         self.norm = None
         hc_config = HyperConnectionConfig(
             hc_count=int(config.hc_count),
@@ -859,6 +827,7 @@ class Qwen4ExpForCausalLM(BaseCausalLM):
         )
 
     def post_quant_warmup(self) -> None:
+        _warmup_qwen4_moe(self.model)
         enable_decode_monokernels(self.model)
 
     @classmethod
@@ -908,6 +877,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         )
 
     def post_quant_warmup(self) -> None:
+        _warmup_qwen4_moe(self.model)
         enable_decode_monokernels(self.model)
 
     @classmethod

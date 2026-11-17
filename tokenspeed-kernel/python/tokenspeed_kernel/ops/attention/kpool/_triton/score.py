@@ -24,6 +24,10 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.kvcache.index_k_scale import (
+    index_k_scale_ue8m0,
+    index_k_scale_value,
+)
 
 
 @triton.jit
@@ -47,6 +51,7 @@ def _kpool_score_prefill_chunk_kernel(
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
     num_groups: tl.constexpr,
+    UE8M0: tl.constexpr,
     pool_size: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -89,11 +94,12 @@ def _kpool_score_prefill_chunk_kernel(
             mask=valid[:, None] & (dims[None, :] < head_dim),
             other=0.0,
         ).to(tl.float32)
-        k_scale = tl.load(
-            pooled_k_scale + scale_base + dim_start // 128,
-            mask=valid,
-            other=0.0,
-        ).to(tl.float32)
+        k_scale = index_k_scale_value(
+            tl.load(
+                pooled_k_scale + scale_base + dim_start // 128, mask=valid, other=0
+            ),
+            UE8M0,
+        )
         scores += tl.sum(k_vals * k_scale[:, None] * q_vals[None, :], axis=1)
 
     tl.store(
@@ -170,6 +176,7 @@ def _kpool_score_dense_mma_kernel(
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
     num_groups: tl.constexpr,
+    UE8M0: tl.constexpr,
     pool_size: tl.constexpr,
     softmax_scale: tl.constexpr,
     APPLY_RELU: tl.constexpr,
@@ -221,11 +228,10 @@ def _kpool_score_dense_mma_kernel(
                 mask=heads[:, None] < num_heads,
                 other=0.0,
             )
-            group_scale = tl.load(
-                pooled_k_scale + scale_base + group,
-                mask=valid_pool,
-                other=0.0,
-            ).to(tl.float32)
+            group_scale = index_k_scale_value(
+                tl.load(pooled_k_scale + scale_base + group, mask=valid_pool, other=0),
+                UE8M0,
+            )
             head_scores += (
                 tl.dot(k_tile, tl.trans(q_tile), out_dtype=tl.float32)
                 * group_scale[:, None]
@@ -341,7 +347,7 @@ def select_kpool_chunked(
     chunk_pools = triton.next_power_of_2(chunk_pools)
     block_n = min(chunk_pools, 256)
     cache_fp8 = pooled_k_cache.view(torch.float8_e4m3fn)
-    cache_fp32 = pooled_k_cache.view(torch.float32)
+    cache_fp32 = pooled_k_cache.view(torch.int32)
     result = torch.empty((num_tokens, topk_pools), dtype=torch.int32, device=q.device)
     if num_tokens == 0:
         return result
@@ -405,6 +411,7 @@ def select_kpool_chunked(
                 num_heads=num_heads,
                 head_dim=head_dim,
                 num_groups=num_groups,
+                UE8M0=index_k_scale_ue8m0(),
                 pool_size=pool_size,
                 BLOCK_N=block_n,
                 BLOCK_D=min(head_dim, 128),
@@ -554,7 +561,7 @@ def score_kpool_dense(
     _kpool_score_dense_mma_kernel[(num_tokens, num_workers)](
         q,
         pooled_k_cache.view(torch.float8_e4m3fn),
-        pooled_k_cache.view(torch.float32),
+        pooled_k_cache.view(torch.int32),
         weights,
         causal_lens,
         req_ids,
@@ -568,6 +575,7 @@ def score_kpool_dense(
         num_heads=num_heads,
         head_dim=head_dim,
         num_groups=num_groups,
+        UE8M0=index_k_scale_ue8m0(),
         pool_size=pool_size,
         softmax_scale=float(softmax_scale),
         APPLY_RELU=bool(apply_relu),

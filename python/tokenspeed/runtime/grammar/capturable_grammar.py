@@ -26,10 +26,11 @@ inside the CUDA graph and overlaps with the model forward on a side stream.
 
 Deferred advance: the matcher advance for step N's sampled tokens runs
 inside step N+1's host node, not at the tail of step N's graph.
-``schedule_post_sampler`` does a main-stream D2H of the sampler output into
-a pinned buffer shared across steps. The next step's ``fork_event``
-(recorded on main inside captured ``schedule_fill``) transitively waits for
-this D2H before the side-stream host node reads the pinned memory. Main only
+``schedule_post_sampler`` forks a D2H of the sampler output into a pinned
+buffer shared across steps onto the side stream, so the drafter does not
+wait for it, and ``join_post_sampler`` rejoins it before the step ends.
+The next step's side-stream host node reads the pinned memory after this
+D2H in stream order. Main only
 joins on ``bitmask_event`` before apply_mask, so forward(N+1) overlaps with
 the prev-step matcher advance and this step's mask fill. The shared pinned
 buffer is read-only for the next step's host node; ``post_process`` reads
@@ -188,9 +189,7 @@ class CapturableGrammarExecutor:
         self.candidates = torch.zeros((max_bs, n), dtype=torch.int32, pin_memory=True)
 
         # Sampler output copied to pinned memory at the tail of each step.
-        # Read by the NEXT step's host node (via fork_event ordering);
-        # overwritten at the next step's tail (strictly after that step's
-        # bitmask_event, hence after the host node's read).
+        # Read by the NEXT step's host node before its tail overwrites it (side stream).
         self.output_tokens = torch.zeros((n_rows,), dtype=torch.int32, pin_memory=True)
 
         self.accept_lengths = torch.zeros((max_bs,), dtype=torch.int32, pin_memory=True)
@@ -219,6 +218,8 @@ class CapturableGrammarExecutor:
         self.stream = torch.cuda.Stream()
         self.fork_event = torch.cuda.Event()
         self.bitmask_event = torch.cuda.Event()
+        self.sampled_event = torch.cuda.Event()
+        self.post_sampler_event = torch.cuda.Event()
 
     def add_batch(
         self,
@@ -309,13 +310,21 @@ class CapturableGrammarExecutor:
         output_tokens: torch.Tensor,
         accept_lengths: torch.Tensor,
     ) -> None:
-        """Main-stream D2H of sampler output into the pinned buffer."""
+        """Side-stream D2H of sampler output into the pinned buffer."""
+        self.sampled_event.record()
+        with torch.cuda.stream(self.stream):
+            torch.cuda.current_stream().wait_event(self.sampled_event)
 
-        n = output_tokens.numel()
-        self.output_tokens[:n].copy_(output_tokens.flatten(), non_blocking=True)
+            n = output_tokens.numel()
+            self.output_tokens[:n].copy_(output_tokens.flatten(), non_blocking=True)
 
-        m = accept_lengths.numel()
-        self.accept_lengths[:m].copy_(accept_lengths, non_blocking=True)
+            m = accept_lengths.numel()
+            self.accept_lengths[:m].copy_(accept_lengths, non_blocking=True)
+            self.post_sampler_event.record()
+
+    def join_post_sampler(self) -> None:
+        """Join schedule_post_sampler's copies on the main stream."""
+        torch.cuda.current_stream().wait_event(self.post_sampler_event)
 
 
 def _matchers(grammars: list) -> list:

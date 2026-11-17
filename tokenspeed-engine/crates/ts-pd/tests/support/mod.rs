@@ -184,7 +184,7 @@ pub(crate) struct Pair {
     pub(crate) decode: DecodePeer,
     pub(crate) decode_outbox: ts_pd::DecodeOutbox,
     pub(crate) bootstrap: BootstrapInfo,
-    _server: BootstrapServer,
+    pub(crate) _server: BootstrapServer,
 }
 
 pub(crate) fn pair(
@@ -203,7 +203,25 @@ pub(crate) fn pair_with(
     bootstrap_timeout: Duration,
     step_address: Option<usize>,
 ) -> Pair {
-    let server = BootstrapServer::start(0, Registry::CacheLayouts).unwrap();
+    pair_on_port(
+        library,
+        source,
+        destination,
+        bootstrap_timeout,
+        step_address,
+        0,
+    )
+}
+
+pub(crate) fn pair_on_port(
+    library: PathBuf,
+    source: &[u8],
+    destination: &[u8],
+    bootstrap_timeout: Duration,
+    step_address: Option<usize>,
+    port: u16,
+) -> Pair {
+    let server = BootstrapServer::start(port, Registry::CacheLayouts).unwrap();
     let port = server.port();
     let source_base = source.as_ptr() as u64;
     let parse = |wire: String| Contract::from_wire(wire.as_bytes()).unwrap();

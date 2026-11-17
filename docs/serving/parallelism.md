@@ -67,7 +67,7 @@ instead. Three knobs shard those weights over contiguous groups of DP ranks
 | Parameter | Use |
 | --- | --- |
 | `--attn-head-tp-size W` | Shard `q_b_proj`, `kv_b_proj`, and `o_proj` by heads over `W` contiguous ranks that hold different rows. Over DP ranks: requires attention TP 1, attention DP, `W` dividing the stage world, `num_heads % W == 0`, and a decode engine (`--disaggregation-mode decode`). Over the query shards of a prefill engine: `W` equal to `--query-context-parallel-size` (see [Query context parallelism](#query-context-parallelism-on-the-prefill-role)). |
-| `--lm-head-tp-size W` | Vocab-shard the LM head over `W` contiguous ranks. Under attention DP the default is 1 (replicated); without attention DP it must equal the attention TP size (today's layout). |
+| `--lm-head-tp-size W` | Vocab-shard the LM head over `W` contiguous ranks. Under attention DP the default is 1 (replicated); a wider group gathers distinct DP groups' rows before the logits GEMM and transposes the vocabulary shards back. Attention TP greater than one is supported; LM-head and attention TP widths must tile each other. Without attention DP it must equal the attention TP size. |
 | `--dense-tp-size W` | Already shards the dense MLPs over `W` ranks (token all-gather in, token reduce-scatter out). |
 | `--tp-batch-invariant {none,attn,attn+dense}` | Make the sharded `o_proj` (`attn`) and dense `down_proj` (`attn+dense`) column-parallel on hidden so no cross-rank sum remains outside MoE; see below. |
 
@@ -131,10 +131,35 @@ path:
 A prefill row reaching the attention is then an invariant violation and
 raises, not a configuration the operator can hit.
 
-`--lm-head-tp-size` under attention DP gathers the ranks' logits rows,
+`--lm-head-tp-size` under attention DP gathers distinct DP groups' logits rows,
 runs the vocab-shard GEMM and transposes the shards back to each rank's own
 rows (`[T_own, V]`), so sampling and logprobs downstream see the same
-full-vocab rows as a replicated head. On the decode path the row counts come
+full-vocab rows as a replicated head. With attention TP greater than one,
+only one peer writes each DP slot into a zeroed hidden-state buffer, which
+is all-reduced across the LM-head group. The vocabulary shards are gathered
+and each attention TP peer reads its DP slot. This avoids multiplying the
+LM-head GEMM rows by attention TP. LM-head and attention TP widths must tile
+each other. For example, DP4/TP2 supports an explicit LM-head TP8 while its
+default stays replicated. A shared MTP head uses the same row layout.
+When the LM-head group stays within a single attention TP group (including
+when LM-head TP equals attention TP), its peers already hold identical
+hidden states, so the input row exchange is skipped. The output still
+gathers the vocabulary unless the consumer requests greedy token IDs.
+
+For greedy heads, eligible cross-DP layouts reduce each row's vocabulary
+maximum and global token ID before selecting the owning DP rows. They use
+fused distributed argmax with alternating slot bands when supported, and
+otherwise the packed-key argmax collective, instead of gathering full logits.
+The alternating bands allow consecutive target/draft calls without an extra
+group barrier; calls sharing a state must still be ordered across streams. The
+greedy DSpark draft walk runs each Markov position (bias, add, and argmax) as
+one launch that exchanges candidates through the same slots and band order.
+Returned logits remain vocabulary-sharded and are not a full distribution. Sampled
+draft distributions and consumers requiring full logits keep the vocabulary
+exchange; padded vocabularies, softcapping, and other argmax eligibility
+limits also retain the full-logit fallback.
+
+On the decode path the row counts come
 from the per-rank token tables (every rank's logits rows are its decode
 tokens, or the live rows a narrowing draft step reported), so the step has
 no host sync. The shapes without a table -- a prefill's one row per request
@@ -146,6 +171,13 @@ TokenSpeed refuses the others with a clear error). It cannot combine with
 (`logprob_start_len`): that path pushes the prompt rows through the LM head
 in per-request chunks, a per-rank number of row exchanges the group cannot
 agree on.
+
+LM-head vocabulary gathering uses a separate communication buffer sized for
+sampling and speculative verification rows, rather than the attention prefill
+chunk. With attention DP, its capacity covers the global request limit times
+the number of speculative verification tokens (at least 128 rows). Larger
+batches, including prompt-logprob batches, fall back to NCCL without growing
+the persistent multicast buffer.
 
 `--tp-batch-invariant` replaces the two reduce-scatters of these layouts
 (after `o_proj`, after the dense `down_proj`) with column-parallel GEMMs on
@@ -305,9 +337,11 @@ the subgroup's largest physical token count. The runtime prepares communication
 buffers before CUDA-graph capture and reuses them across layers. Shared
 experts use separate buffers. Shared AllGather finishes before routed
 dispatch, shared GEMMs finish before routed BMM, and shared ReduceScatter
-runs after dispatch and before combine. The runtime selects optimized
-collectives for supported shapes and topologies, with generic collective
-fallbacks otherwise. Place each subgroup
+runs after dispatch and before combine. With MegaMoE, shared ReduceScatter
+instead follows its fused dispatch/BMM/combine kernel and overlaps the routed
+norm and local up-projection. Native collectives cover the configured decode
+batch bound including speculative tokens; larger batches retain NCCL.
+Place each subgroup
 on a CUDA-IPC-accessible node to use the optimized paths.
 
 TP4 reduces the selected weights to approximately one quarter per GPU, not
@@ -455,7 +489,9 @@ recorded load with DeepSeek's EPLB algorithm — once at startup from a
 profile record, or online from the live counters ([dynamic
 rebalancing](#dynamic-expert-rebalancing) below). Models opt in explicitly
 (`supports_expert_placement` on the model class) by building their MoE layers
-from the placement and loading every placed slot — LongCat-Flash does.
+from the placement and loading every placed slot — LongCat-Flash does, and
+Inkling2 does for static placements (it does not expose its expert weights to
+`--enable-eplb`).
 TokenSpeed refuses the placement flags for any other model, so it
 never installs a placement only to ignore it.
 `--ep-num-redundant-experts` also needs expert parallelism (`ep_size > 1`):
@@ -676,9 +712,9 @@ ts serve --model MODEL --attention-backend flashmla \
   --attn-tp-size 8 --kv-parallel-size 8 --decode-context-parallel-size 8
 ```
 
-Keep `--disaggregation-mode` at `null` and QCP at 1. Aggregated DCP requires
-separate prefill/decode rounds and rejects `--enable-mixed-batch` for all
-backends, including MLA/DSA. MLA decode remains absorbed; MLA/KDA hybrids
+Keep `--disaggregation-mode` at `null` and QCP at 1. With
+`--enable-mixed-batch`, a mixed round runs its KVP extend rows and DCP decode
+rows in one forward. MLA decode remains absorbed; MLA/KDA hybrids
 shard only MLA history. Ordinary TP with KVP = DCP = 1 is unaffected.
 
 Speculative decoding runs on a sharded cache with the backends whose DCP
@@ -962,6 +998,10 @@ CUDA IPC collectives are node-local. The mnnvl fabric workspace spans nodes.
 single-node workspace was armed for it; mnnvl serves 16-bit only) on groups
 whose fan-in is 2, 4, 8, or 16 through the armed workspace -- one-shot
 inside its traffic window, two-shot up to the workspace token capacity.
+Where FlashInfer's BT presets cover the group (8 ranks, width 7168,
+SM103), payloads of at least 1 MiB per rank instead take its owner
+reduction, which sums the ranks in order in fp32 where the Lamport kernels sum
+in BF16 (`tokenspeed_kernel/ops/communication/README.md` has the measurements).
 Cross-node groups arm the full two-shot capacity at startup. Single-node
 groups start at the one-shot window and serve larger shapes once
 model-level preparation widens the shared workspace. Other
@@ -973,6 +1013,31 @@ across nodes. Logits all-gather and distributed argmax use the same
 cross-node fallback. Layouts such as attention DP with dense TP or MoE EP
 spanning nodes need this fallback.
 
+On the tiered route, Inkling 2's output convolutions sum their producer's
+partial themselves (`all_reduce_sconv`) for target-verify decode batches the
+one-shot mnnvl lane serves: the all-reduce releases the convolution once it
+has waited for its input rather than at its end, so the convolution's cold
+reads of its taps, ring and routing run under the reduction. Other batches
+reduce in the producer with the release at the end.
+
+When the attention TP group is also the MoE EP group and the node has
+multicast memory, decode batches of up to 8 rows skip both all-reduces:
+the attention's output projection (`publish_projection`) and the MoE route
+fold store each rank's partial straight into slot `rank` of every rank's
+Lamport mailbox (`ops.communication.mailbox`), and the output convolutions
+read the sum from there (`inkling_ring_sconv_mailbox`, FP32 in rank order,
+rounded once). The model builds the mailbox in `prepare_communication_runtime`;
+each layer uses both chains or neither, so the two uses alternate the
+mailbox's parities.
+
+Past 1024 rows, a Kimi-K3 attention layer's BF16 o-projection writes its
+partial straight into the multimem staging buffer of the MoE tail's
+up-projection (`K3AttnComm.prepare_staged_projection`). The sum then runs as
+the same in-switch all-reduce instead of NCCL. The reduced rows are copied
+out, because AttnRes keeps them after the MoE tail restages the buffer. Under
+`--batch-invariant-collectives` or `--force-deterministic-rsag` the attention
+keeps its ordinary all-reduce.
+
 Under `--numerics rl-bitwise` (`--batch-invariant-collectives`) every
 reduction takes NCCL data movement plus a rank-ordered fp32 fold, and the
 gathers stay on the multicast kernels; the in-switch reduction's order moves
@@ -982,6 +1047,15 @@ and the fused all-reduce kernels are off. `--force-deterministic-rsag` keeps
 every collective on NCCL (reductions on the fold). `AutoBackend.route` is
 the one place that decides. `docs/design/numerics.md` has the measured
 basis.
+
+Under plain attention TP with replicated MLA latent KV (no KVP, no query
+context parallelism), a GPU DSA sparse prefill of at least 4096 rows runs its
+core attention on a row shard instead of a head shard. An all-to-all hands
+each rank `1 / W` of the rows with every rank's heads (padded to the
+trtllm-gen core's head count), the core attends them, and a second all-to-all
+returns each rank's heads of every row. The core then reads each selected KV
+row once for all heads instead of once per rank. The bitwise numerics
+envelopes keep the head shard.
 
 On ARM systems, [NCCL 2.29.3](https://github.com/NVIDIA/nccl/releases/tag/v2.29.3-1)
 fixes a weak compare-and-swap failure that can hang NCCL when it was compiled
@@ -999,3 +1073,44 @@ Before benchmarking:
 - confirm GPU visibility and process placement
 - compare output correctness before tuning throughput
 - keep the full launch command with benchmark results
+
+### Distributed expert-weight storage
+
+`--moe-weight-sharing-size N` enables DWDP: each prefill worker stores one of
+`N` immutable expert shards and fetches remote weights while executing its own
+batch. Execution remains TP1/EP1; attention DP still identifies the serving
+workers. Omitting the option keeps resident expert weights.
+
+DWDP requires the CUDA 13 toolkit.
+
+The initial K3 NVFP4 configuration requires `--attn-tp-size 1 --moe-tp-size 1
+--ep-size 1 --all2all-backend none`, `--disaggregation-mode prefill`,
+`--enforce-eager --prefill-graph-max-tokens 0`, and a fixed prefill token budget.
+The weight-sharing size must divide the instance size. Shared-expert and
+attention-projection TP overrides must also remain local. The additional
+staging memory is allocated before KV cache sizing. Live checkpoint replacement
+requires restarting these workers.
+
+See [distributed immutable weights](../design/distributed-weights.md) for
+storage ownership and stream-ordering invariants.
+
+Every forward streams the expert shards the worker does not own, so a DWDP
+prefill forward takes seconds whether it carries one token or the whole
+budget; the per-forward cost is paid in full by forwards well below the
+budget. Choose the chunk size and admission so forwards stay near the budget.
+Every timeout between the frontend and the decode side must then cover at
+least one full forward plus queueing: the gateway's per-worker silence bound
+(SMG `--worker-wedge-secs`, 3 s by default, after which every request on the
+worker returns 504), and in prefill/decode disaggregation
+`TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT` (120 s) and
+`TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT` (300 s), which otherwise drop
+requests queued behind a saturated decode instance as `KV transfer failed`;
+the client's stream then ends with no content and no error. A larger token
+budget also grows the MoE activation workspace, which must fit beside the
+staging pools; if startup runs out of memory there, lower
+`--gpu-memory-utilization` rather than the budget.
+
+DWDP supports local Device and Host L2 caches and auto/safetensors checkpoint
+loading. Memory-saver sleep/wake is unsupported. Shared L3 cache control and
+online expert rebalancing are currently unsupported: L3 flushes coordinate
+across DP ranks, and rebalancing changes immutable expert ownership.

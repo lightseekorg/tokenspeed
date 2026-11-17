@@ -92,7 +92,7 @@ def iris_pull_reduce_scatter(
             cache=".wt",
         )
     if EXIT_BARRIER:
-        WAIT_VMEM(args=[], constraints="=r,~{memory}")
+        WAIT_VMEM()
         gl.barrier()
         done = (
             gl.atomic_add(

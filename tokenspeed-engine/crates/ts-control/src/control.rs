@@ -145,6 +145,7 @@ pub fn gate_code(op: &ControlRequest) -> Option<i64> {
         ControlRequest::RebalanceExperts(_) => 5,
         ControlRequest::UpdateWeightFromDisk(_) => 6,
         ControlRequest::ReloadForward(_) => 7,
+        ControlRequest::ResumeMemoryOccupation(_) => 8,
         _ => return None,
     })
 }
@@ -308,8 +309,12 @@ pub struct Controls {
 pub enum Effect {
     /// Poll native slot and cache capacity on the control thread.
     AdmissionSnapshot,
+    /// Read-only query of successful shared-store object confirmations.
+    SharedPrefixPublication(String, Vec<i32>, i32),
     /// Cache metadata changes, executed by the control thread on every replica rank.
     DemoteSessions(Vec<String>, bool),
+    /// Group ownership is independent of each request session.
+    DemoteCacheGroups(Vec<String>, bool),
     /// Nothing beyond the state change and the reply.
     None,
     /// Start or stop the profiler (the data plane answers).
@@ -622,9 +627,19 @@ impl Controls {
     pub fn handle(&mut self, request: ControlRequest, release_refusal: Option<String>) -> Effect {
         match request {
             ControlRequest::DemoteSessions(request) => {
-                return Effect::DemoteSessions(request.session_ids, request.ended)
+                return Effect::DemoteSessions(request.session_ids, request.ended);
+            }
+            ControlRequest::DemoteCacheGroups(request) => {
+                return Effect::DemoteCacheGroups(request.cache_group_ids, request.ended);
             }
             ControlRequest::GetAdmission(_) => return Effect::AdmissionSnapshot,
+            ControlRequest::GetSharedPrefixPublication(request) => {
+                return Effect::SharedPrefixPublication(
+                    request.query_id,
+                    request.input_ids,
+                    request.max_prefix_tokens,
+                );
+            }
             ControlRequest::FlushCache(_) => self.flushes += 1,
             ControlRequest::PauseScheduler(pause) => self.pause(&pause.mode),
             ControlRequest::ResumeScheduler(_) => self.resume(),
@@ -641,8 +656,27 @@ impl Controls {
             ControlRequest::ReleaseMemoryOccupation(release) => {
                 self.release(release.tags.as_deref(), release_refusal);
             }
-            ControlRequest::ResumeMemoryOccupation(resume) => {
-                return self.resume_memory(resume.tags.as_deref());
+            ControlRequest::ResumeMemoryOccupation(mut resume) => {
+                if self
+                    .weight_ops
+                    .iter()
+                    .any(|op| matches!(op, ControlRequest::ResumeMemoryOccupation(_)))
+                {
+                    self.reply(resume_memory_reply(
+                        false,
+                        "a collective memory resume is pending",
+                    ));
+                    return Effect::None;
+                }
+                return match self.resume_memory(resume.tags.as_deref()) {
+                    Effect::ResumeMemory(tags) if tags.iter().any(|tag| tag == "nccl") => {
+                        resume.tags = Some(tags);
+                        self.weight_ops
+                            .push_back(ControlRequest::ResumeMemoryOccupation(resume));
+                        Effect::None
+                    }
+                    effect => effect,
+                };
             }
             ControlRequest::IsSleeping(_) => {
                 let is_sleeping = !self.released.is_empty();

@@ -28,8 +28,10 @@
 use bytes::Bytes;
 use ts_wire::{
     control::{
-        FlushCacheReqOutput, GetInternalStateReqOutput, PauseSchedulerReqInput, ProfileReq,
-        UpdateWeightsFromDistributedReqInput, UpdateWeightsFromMooncakeReqInput, PROFILE_START,
+        FlushCacheReqOutput, GetAdmissionReqOutput, GetInternalStateReqOutput,
+        GetSharedPrefixPublicationReqInput, GetSharedPrefixPublicationReqOutput,
+        PauseSchedulerReqInput, ProfileReq, UpdateWeightsFromDistributedReqInput,
+        UpdateWeightsFromMooncakeReqInput, PROFILE_START,
     },
     decode_frames, encode_frames,
     handshake::STATUS_HELLO,
@@ -194,6 +196,8 @@ fn generate_text() {
             validation_error: Some(s("rejected")),
             data_parallel_rank: Some(1),
             cache_session_id: Some(s("cache-session")),
+            cache_group_id: Some(s("cache-group")),
+            shared_prefix_tokens: vec![1, 3],
         },
     );
 }
@@ -727,5 +731,103 @@ fn handshake_ready_response() {
             image_token_id: Some(248056),
             video_token_id: Some(248057),
         },
+    );
+}
+
+#[test]
+fn admission_cache_group_contract_defaults_for_an_older_engine() {
+    let frames = fixture("control_output_admission");
+    let expected = GetAdmissionReqOutput {
+        rid: None,
+        http_worker_ipc: None,
+        success: true,
+        dp_rank: 2,
+        contract_version: 1,
+        free_slots: 7,
+        total_slots: 8,
+        available_blocks: 29,
+        total_blocks: 32,
+        host_free_blocks: 40,
+        host_total_blocks: 64,
+        retracted: 3,
+        waiting: 4,
+        max_tokens: 8192,
+        capacity_token_step: 1024,
+        capacity_blocks: vec![1, 2, 3, 4],
+        cache_group_contract: 1,
+        shared_prefix_publication_contract: 1,
+        shared_prefix_storage_enabled: true,
+    };
+    check("control_output_admission", expected.clone());
+    let Value::Array(mut fields) = decode_frames::<Value>(&frames).unwrap() else {
+        panic!("control messages must be arrays");
+    };
+    assert_eq!(fields.pop(), Some(Value::from(true)));
+    assert_eq!(fields.pop(), Some(Value::from(1_i64)));
+    assert_eq!(fields.pop(), Some(Value::from(1_i64)));
+    let legacy_frames = encode_frames(&Value::Array(fields));
+    let legacy = decode_frames::<GetAdmissionReqOutput>(&legacy_frames).unwrap();
+    assert_eq!(
+        legacy,
+        GetAdmissionReqOutput {
+            cache_group_contract: 0,
+            shared_prefix_publication_contract: 0,
+            shared_prefix_storage_enabled: false,
+            ..expected
+        }
+    );
+}
+
+#[test]
+fn generate_from_an_older_client_preserves_session_and_tokens() {
+    let frames = fixture("generate_text");
+    let original = EngineRequest::from_frames(&frames).unwrap();
+    let EngineRequest::Add(mut expected) = original else {
+        panic!("expected an ADD request");
+    };
+    let Value::Array(mut fields) = decode_frames::<Value>(&frames[1..]).unwrap() else {
+        panic!("generate messages must be arrays");
+    };
+    assert_eq!(
+        fields.pop(),
+        Some(Value::Array(vec![Value::from(1), Value::from(3)]))
+    );
+    expected.shared_prefix_tokens.clear();
+    assert_eq!(fields.pop(), Some(Value::from("cache-group")));
+    expected.cache_group_id = None;
+    let mut legacy_frames = vec![frames[0].clone()];
+    legacy_frames.extend(encode_frames(&Value::Array(fields)));
+    assert_eq!(
+        EngineRequest::from_frames(&legacy_frames).unwrap(),
+        EngineRequest::Add(expected)
+    );
+}
+
+#[test]
+fn shared_prefix_publication_nonce_rank_and_namespace_cross_python_wire() {
+    check_control(
+        "control_shared_prefix_publication",
+        ControlRequest::GetSharedPrefixPublication(GetSharedPrefixPublicationReqInput {
+            rid: None,
+            http_worker_ipc: None,
+            query_id: s("nonce-7"),
+            input_ids: vec![1, 2, 3],
+            max_prefix_tokens: 2,
+        }),
+    );
+    check_control_output(
+        "control_output_shared_prefix_publication",
+        ControlOutput::GetSharedPrefixPublication(GetSharedPrefixPublicationReqOutput {
+            rid: None,
+            http_worker_ipc: None,
+            success: true,
+            message: String::new(),
+            query_id: s("nonce-7"),
+            dp_rank: 2,
+            status: s("published"),
+            confirmed_prefix_tokens: 2,
+            storage_namespace: s("deployment-v1"),
+            cache_epoch: 7,
+        }),
     );
 }

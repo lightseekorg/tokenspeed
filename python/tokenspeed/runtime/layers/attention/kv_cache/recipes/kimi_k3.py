@@ -40,7 +40,11 @@ from functools import cached_property
 import torch
 from typing_extensions import override
 
-from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
+from tokenspeed.runtime.layers.attention.configs.dsa import (
+    DSAConfig,
+    dsa_history_gather_workspace_bytes,
+    dsa_kvp_history_prefill,
+)
 from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
@@ -326,21 +330,33 @@ class KimiK3Recipe(CacheRecipe):
 
     @override
     def check_layout(self, layout: CacheLayout) -> None:
-        """One plane per MLA layer, one per draft layer, and one index-K plane
+        """One plane per MLA layer, the draft's own, and one index-K plane
         per DSA layer -- no more.
 
         The KDA state groups pack to the MLA plane's byte width precisely so
         they ride inside those planes; a plane of their own means the packing
         did not divide and the parent grew.
+
+        A draft layer costs one plane when it plans the target's attention (an
+        MTP depth: one latent) and two when it plans its own family (a DFlash
+        GQA stack: K and V head rows), because the planes a layer occupies are
+        the fields its config declares.
         """
         num_mla_layers = sum(
             group_id == FULL_ATTENTION for group_id in self.target_group_ids
         )
-        expected = num_mla_layers + self.num_draft_layers + self.num_index_k_planes
+        planes_per_draft_layer = (
+            1
+            if self.draft_attn_config is None
+            or self.draft_attn_config.component(MLAConfig) is not None
+            else 2
+        )
+        num_draft_planes = planes_per_draft_layer * self.num_draft_layers
+        expected = num_mla_layers + num_draft_planes + self.num_index_k_planes
         if len(layout.plane_bytes) != expected:
             raise ValueError(
                 f"Kimi-K3 LCM requires {num_mla_layers} target planes (one per "
-                f"MLA layer) plus {self.num_draft_layers} draft planes and "
+                f"MLA layer) plus {num_draft_planes} draft planes and "
                 f"{self.num_index_k_planes} index-K planes, got "
                 f"{len(layout.plane_bytes)}"
             )
@@ -354,13 +370,20 @@ class KimiK3Recipe(CacheRecipe):
 
     @override
     def workspace_bytes(self) -> int:
-        """KDA verify staging reserved outside the cache arena."""
+        """KDA verify staging reserved outside the cache arena, plus the DSA
+        history gather workspace of a KVP prefill over gathered histories
+        (``dsa_kvp_history_prefill``)."""
+        history = 0
+        if dsa_kvp_history_prefill(self.attn_config):
+            history = dsa_history_gather_workspace_bytes(
+                self.attn_config, max_model_len=self.attn_config.context_len
+            )
         if self.server_args.disaggregation_mode == "prefill":
-            return 0
+            return history
         width = max(int(self.attn_config.speculative_num_draft_tokens or 1), 1)
         if width == 1 and not self.replay_kda:
-            return 0
-        return kda_verify_workspace_bytes(
+            return history
+        return history + kda_verify_workspace_bytes(
             self.attn_config,
             self.groups(),
             draft_token_num=width,

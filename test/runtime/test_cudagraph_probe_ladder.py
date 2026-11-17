@@ -77,11 +77,14 @@ def _enter(observer, result):
 def _decode_runner(capture_bs, variants=None):
     """A ForwardStepRunner with only what ``capture`` reads."""
     runner = ForwardStepRunner.__new__(ForwardStepRunner)
+    runner.dp_local_graph = False
     runner.capture_bs = list(capture_bs)
     runner.global_rank = 1
     runner.enable_cudagraph_gc = False
     runner.disable = False
     runner.max_tokens_per_req = 1
+    runner.drafter = None
+    runner._reported_query_graphs = set()
     runner.graphs = {}
     runner.output_buffers = {}
     runner._placeholder_tables = {}
@@ -128,8 +131,7 @@ def _prefill_graph(buckets, *, decoder_buckets=None, context_len=4096, sizes=Non
     graph.input_buffers = SimpleNamespace(
         input_ids_buf=torch.zeros(max(buckets), dtype=torch.int32)
     )
-    graph._embed_tokens = lambda ids: ids
-    graph._land_input_embeds = lambda _embeds, _bucket: None
+    graph._input_embeds_buf = torch.empty(max(buckets), 1)
     graph.make_dummy_batch = lambda rows, bs: graph.dummies.append((rows, bs)) or (
         SimpleNamespace(capture_hidden_mode=None, forward_mode=None, rows=rows)
     )

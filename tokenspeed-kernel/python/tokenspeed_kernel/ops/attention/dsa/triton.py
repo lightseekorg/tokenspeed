@@ -25,8 +25,10 @@ from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.dsa._triton.candidate_exchange import (
     merge_packed_index_candidates,
 )
+from tokenspeed_kernel.ops.kvcache.index_k_scale import index_k_scale_ue8m0
 from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.selection import traits_problem_filter
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 # Selected-slot DSA attention in absorbed-MLA form: the values are the latent
@@ -843,6 +845,11 @@ def _run_dsa(
         }
     ),
     traits={
+        # Up to 8 so a DFlash block_size 8 verify can select a core. The leaf
+        # never reads q_len_per_req (_run_dsa derives every shape from the
+        # tensors) and honors per-row causality through topk_lens. It declares
+        # no batch_invariant feature, so a bitwise envelope still cannot select
+        # it for width > 4.
         "q_len": frozenset({1, 2, 3, 4, 5, 6, 7, 8}),
         "qk_nope_head_dim": frozenset({128, 192, 256}),
         "kv_lora_rank": frozenset({128, 512}),
@@ -976,6 +983,13 @@ def triton_dsa_prefill(
         "topk": frozenset({512, 1024, 2048, 2049, 2050, 2051}),
         "topk_layout": frozenset({"global_slots"}),
         "logit_cap": frozenset({False}),
+        "problem_filter": frozenset(
+            {
+                traits_problem_filter(
+                    triton_dsa_prefill_dcp_records_supported, "tokens", "heads", "topk"
+                )
+            }
+        ),
     },
     priority=Priority.PORTABLE,
 )
@@ -1203,7 +1217,7 @@ def triton_dsa_index_candidates(
     _dsa_decode_logits_fp8_kernel[(q.shape[0], triton.cdiv(width, 64))](
         q,
         index_k_cache.view(torch.float8_e4m3fn),
-        index_k_cache.view(torch.float32),
+        index_k_cache.view(torch.int32),
         weights,
         causal_lens,
         local_page_table,
@@ -1220,6 +1234,7 @@ def triton_dsa_index_candidates(
         max_seq_len=width,
         num_heads=q.shape[1],
         head_dim=q.shape[2],
+        UE8M0=index_k_scale_ue8m0(),
         num_groups=q.shape[2] // 128,
         softmax_scale=softmax_scale,
         q_len_per_req=1,
@@ -1254,9 +1269,16 @@ def triton_dsa_merge_candidates(
     "dsa_index_candidates",
     name="triton_dsa_sharded_index_candidates",
     solution="triton",
-    signatures=_TOPK_SIGNATURES,
+    signatures=frozenset(
+        format_signature(
+            q=dense_tensor_format(q_dtype), weights=dense_tensor_format(w_dtype)
+        )
+        for q_dtype in (torch.bfloat16, torch.float8_e4m3fn)
+        for w_dtype in (torch.bfloat16, torch.float32)
+    ),
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
     priority=Priority.PORTABLE,
+    traits={"index_k_format": frozenset({"fp8_scaled"})},
 )
 def triton_dsa_sharded_index_candidates(
     q: torch.Tensor,
@@ -1271,8 +1293,16 @@ def triton_dsa_sharded_index_candidates(
     softmax_scale: float,
     initial_tokens: int,
     local_tokens: int,
+    q_scales: torch.Tensor | None = None,
+    query_group_size: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if current_platform().is_nvidia:
+    if q_scales is not None:
+        # Preserve the former model-side fallback's arithmetic exactly. The
+        # native leaf consumes the original FP8 values/scales directly.
+        weights = weights.float() * q_scales * float(softmax_scale)
+        q = q.to(torch.bfloat16)
+        softmax_scale = 1.0
+    elif current_platform().is_nvidia:
         quantized, weights = quantize_index_query_weights(q, weights, softmax_scale)
         q = quantized.to(torch.bfloat16)
         softmax_scale = 1.0

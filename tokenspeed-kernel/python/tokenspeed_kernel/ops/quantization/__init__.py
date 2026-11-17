@@ -29,6 +29,8 @@ from tokenspeed_kernel.signature import (
 
 __all__ = [
     "quantize_fp8",
+    "output_fp8_quant_pack",
+    "try_output_fp8_quant_pack",
     "quantize_fp8_with_gate",
     "quantize_fp8_with_scale",
     "rmsnorm_quantize_fp8",
@@ -433,7 +435,9 @@ def _select_fp8_dynamic(
     traits = {
         "granularity": granularity_trait,
         "scale_encoding": scale_encoding,
-        "scale_layout": "token_major",
+        "scale_layout": (
+            "mn_major" if scale_encoding == "packed_ue8m0" else "token_major"
+        ),
     }
     if rows is not None:
         # Rows of a 2-D x, for kernels with a row bound (``m_max``). Kernels
@@ -845,14 +849,16 @@ def rmsnorm_nvfp4_quant(
     result feeds the TRT-LLM FP4 MoE kernels directly.
 
     With ``mailbox_sentinel`` the rows are this rank's Lamport mailbox, still
-    being filled by the sharded projection's multicast stores: each program
-    polls its row until no BF16 element still holds the sentinel's half, then
-    re-arms the row, so no gather launch stands between the projection and
-    the experts.
+    being filled by the sharded projection's multicast stores, one block per
+    rank: each program polls its row until no BF16 element still holds the
+    sentinel's half, then re-arms the row, so no gather launch stands between
+    the projection and the experts.
 
     Args:
         x: BF16 rows ``[rows, width]`` with ``width`` a multiple of 16; with
-            a sentinel, the contiguous mailbox rows and a power-of-two width.
+            a sentinel, a ``[blocks, rows, block_width]`` view of each block's
+            first ``rows``, read as the blocks' rows side by side; the block
+            width and the side-by-side row width are powers of two.
         weight: Learned affine norm weight ``[width]``.
         eps: Epsilon added to the variance.
         weight_offset: Center added to the checkpoint weight.
@@ -883,6 +889,7 @@ def rmsnorm_nvfp4_quant(
 
 
 # Backend registration (side-effect imports).
+import tokenspeed_kernel.ops.quantization.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.quantization.flashinfer  # noqa: E402,F401
 import tokenspeed_kernel.ops.quantization.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.quantization.triton  # noqa: E402,F401
@@ -891,3 +898,144 @@ from tokenspeed_kernel.ops.quantization.triton import (  # noqa: E402
     triton_rmsnorm_quantize_fp8,
     triton_silu_and_mul_quantize_fp8,
 )
+
+
+def _output_fp8_quant_pack_input_error(
+    x: torch.Tensor,
+    z: torch.Tensor,
+    weight: torch.Tensor | None,
+    *,
+    head_dim: int,
+    sigmoid_gate: bool,
+) -> str | None:
+    if (
+        x.ndim != 2
+        or x.dtype != torch.bfloat16
+        or not x.is_cuda
+        or x.stride(-1) != 1
+        or head_dim < 128
+        or head_dim & (head_dim - 1)
+        or x.shape[1] % head_dim
+        or x.shape[1] % 128
+    ):
+        return "requires BF16 [M,K], K%128=0, and aligned power-of-two heads"
+    expected = (
+        x.shape if z.ndim == 2 else (x.shape[0], x.shape[1] // head_dim, head_dim)
+    )
+    if (
+        z.shape != expected
+        or z.dtype != x.dtype
+        or z.device != x.device
+        or z.stride(-1) != 1
+    ):
+        return "gate must match the activation with unit inner stride"
+    if weight is not None and (
+        weight.shape != (head_dim,)
+        or weight.dtype != x.dtype
+        or weight.device != x.device
+        or not weight.is_contiguous()
+    ):
+        return "norm weight must be contiguous BF16 [head_dim] on the input device"
+    if weight is None and not sigmoid_gate:
+        return "the unnormalized output gate must be sigmoid"
+    return None
+
+
+def _launch_output_fp8_quant_pack(
+    x: torch.Tensor,
+    z: torch.Tensor,
+    weight: torch.Tensor | None,
+    *,
+    head_dim: int,
+    eps: float,
+    sigmoid_gate: bool,
+    enable_pdl: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    kernel = select_kernel(
+        "quantization",
+        "output_fp8_packed",
+        format_signature(x=dense_tensor_format(x.dtype)),
+        traits={},
+        override=None,
+        solution=None,
+    )
+    return kernel(
+        x,
+        z,
+        weight,
+        head_dim=head_dim,
+        eps=eps,
+        sigmoid_gate=sigmoid_gate,
+        enable_pdl=enable_pdl,
+    )
+
+
+def try_output_fp8_quant_pack(
+    x: torch.Tensor,
+    z: torch.Tensor,
+    weight: torch.Tensor | None,
+    *,
+    head_dim: int,
+    eps: float,
+    sigmoid_gate: bool,
+    enable_pdl: bool,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Return fused codes and scales, or None for unsupported inputs."""
+    if (
+        _output_fp8_quant_pack_input_error(
+            x, z, weight, head_dim=head_dim, sigmoid_gate=sigmoid_gate
+        )
+        is not None
+    ):
+        return None
+    return _launch_output_fp8_quant_pack(
+        x,
+        z,
+        weight,
+        head_dim=head_dim,
+        eps=eps,
+        sigmoid_gate=sigmoid_gate,
+        enable_pdl=enable_pdl,
+    )
+
+
+def output_fp8_quant_pack(
+    x: torch.Tensor,
+    z: torch.Tensor,
+    weight: torch.Tensor | None,
+    *,
+    head_dim: int,
+    eps: float,
+    sigmoid_gate: bool,
+    enable_pdl: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse an output gate, optional per-head RMSNorm, and group128 DeepGEMM quant-pack.
+
+    Args:
+        x: BF16 [M,K] activations, unit inner stride.
+        z: BF16 gate, [M,K] or [M,H,D]; rows/heads may be strided.
+        weight: BF16 [head_dim] norm weight, or None for sigmoid-mul only.
+        head_dim: Power-of-two head width, divisible by 128.
+        eps: RMSNorm epsilon; unused without weight.
+        sigmoid_gate: True for sigmoid, False for SiLU after RMSNorm.
+        enable_pdl: Wait for the producer and signal dependent launches.
+
+    Returns:
+        E4M3 [M,K] codes and int32 packed UE8M0 [M,ceil(K/512)]
+        scales with strides [1,round_up(M,4)]. Padding is zero. The norm/gate
+        result rounds to BF16 before quantization, matching separate launches.
+    """
+    error = _output_fp8_quant_pack_input_error(
+        x, z, weight, head_dim=head_dim, sigmoid_gate=sigmoid_gate
+    )
+    if error is not None:
+        raise ValueError(error)
+    return _launch_output_fp8_quant_pack(
+        x,
+        z,
+        weight,
+        head_dim=head_dim,
+        eps=eps,
+        sigmoid_gate=sigmoid_gate,
+        enable_pdl=enable_pdl,
+    )

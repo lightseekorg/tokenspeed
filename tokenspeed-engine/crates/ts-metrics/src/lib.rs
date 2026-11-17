@@ -394,7 +394,11 @@ const ENGINE_LABELS: [&str; 3] = ["model_name", "app_key", "dp_rank"];
 pub struct EngineMetrics {
     labels: [String; 3],
     num_requests_running: Metric,
+    num_requests_inflight: Metric,
     num_requests_waiting: Metric,
+    num_requests_resident: Metric,
+    num_active_decode_slots: Metric,
+    num_decode_ready_waiting_reqs: Metric,
     kv_cache_usage: Metric,
     iteration_tokens: Metric,
     spec_decode_num_accepted_tokens: Metric,
@@ -406,6 +410,7 @@ pub struct EngineMetrics {
     num_capacity_aborted_requests: Metric,
     num_preemptions: Metric,
     request_queue_time: Metric,
+    decode_ready_wait: Metric,
     /// Resident KV occupancy: pages in use (active plus reclaimable prefix
     /// entries) over the usable pages, and the same in tokens.
     kv_token_usage: Metric,
@@ -415,6 +420,7 @@ pub struct EngineMetrics {
     num_prefill_prealloc_queue_reqs: Metric,
     num_prefill_inflight_queue_reqs: Metric,
     num_decode_prealloc_queue_reqs: Metric,
+    num_decode_kv_wait_reqs: Metric,
     num_decode_transfer_queue_reqs: Metric,
     num_retracted_queue_reqs: Metric,
     /// Request tokens: generated, prompt, and prompt tokens served from the
@@ -453,13 +459,37 @@ impl EngineMetrics {
             num_requests_running: Metric::gauge(
                 exporter,
                 "tokenspeed:num_requests_running",
-                "Requests with scheduler-side generation state (decode path).",
+                "Requests in the scheduler's running batch: prefill, prefill-done, and decode rows.",
+                names,
+            ),
+            num_requests_inflight: Metric::gauge(
+                exporter,
+                "tokenspeed:num_requests_inflight",
+                "Requests admitted and not finished, including PD transfer and waiting states.",
                 names,
             ),
             num_requests_waiting: Metric::gauge(
                 exporter,
                 "tokenspeed:num_requests_waiting",
                 "Requests waiting in the C++ scheduler queue.",
+                names,
+            ),
+            num_requests_resident: Metric::gauge(
+                exporter,
+                "tokenspeed:num_requests_resident",
+                "Requests holding a request-pool slot, including requests whose in-flight work is draining.",
+                names,
+            ),
+            num_active_decode_slots: Metric::gauge(
+                exporter,
+                "tokenspeed:num_active_decode_slots",
+                "Decode permits held by requests or their in-flight operations, including restore reservations.",
+                names,
+            ),
+            num_decode_ready_waiting_reqs: Metric::gauge(
+                exporter,
+                "tokenspeed:num_decode_ready_waiting_reqs",
+                "Resident requests whose KV is ready but that have no execution permit.",
                 names,
             ),
             kv_cache_usage: Metric::gauge(
@@ -519,7 +549,8 @@ impl EngineMetrics {
                 exporter,
                 "tokenspeed:num_capacity_aborted_requests",
                 "Requests the scheduler aborted because a capacity retraction could not image its \
-                 victim (retraction snapshot pool, image rows or Host L2 exhausted); clients may \
+                 victim (retraction snapshot pool, image rows or Host L2 exhausted), or because a \
+                 lone request made no progress for 4096 consecutive scheduler plans; clients may \
                  resubmit them. Forced retractions from --debug-force-retraction-interval aborted \
                  the same way count too.",
                 names,
@@ -547,6 +578,18 @@ impl EngineMetrics {
                 &[
                     0.3, 0.5, 0.8, 1.0, 1.5, 2.0, 2.5, 5.0, 10.0, 15.0, 20.0, 30.0, 40.0, 50.0,
                     60.0, 120.0, 240.0, 480.0, 960.0, 1920.0, 7680.0,
+                ],
+            ),
+            decode_ready_wait: Metric::histogram(
+                exporter,
+                "tokenspeed:decode_ready_wait_seconds",
+                "Wall time on the decode role from observing complete prefill KV arrival \
+                 to first decode forward dispatch, observed once per request. Requests \
+                 cancelled or finished before decode dispatch are excluded.",
+                names,
+                &[
+                    0.001, 0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.5, 1.0,
+                    2.0, 5.0, 10.0, 30.0, 60.0, 120.0,
                 ],
             ),
             kv_token_usage: Metric::gauge(
@@ -584,6 +627,12 @@ impl EngineMetrics {
                 exporter,
                 "tokenspeed:num_decode_prealloc_queue_reqs",
                 "Decode requests waiting for their prefill peer to connect.",
+                names,
+            ),
+            num_decode_kv_wait_reqs: Metric::gauge(
+                exporter,
+                "tokenspeed:num_decode_kv_wait_reqs",
+                "Decode requests waiting for the prefill peer's KV: admitted with destination pages held, with no schedulable work.",
                 names,
             ),
             num_decode_transfer_queue_reqs: Metric::gauge(
@@ -703,11 +752,12 @@ impl EngineMetrics {
     }
 
     /// One planning round's snapshot (`record_scheduler_iteration`):
-    /// requests running and waiting, the KV pages in use, and the tokens
-    /// the round forwards.
+    /// requests running and held, waiting, the KV pages in use, and the
+    /// tokens the round forwards.
     pub fn record_scheduler_iteration(
         &self,
         running: i64,
+        inflight: i64,
         waiting: i64,
         active_pages: i64,
         total_pages: i64,
@@ -720,12 +770,23 @@ impl EngineMetrics {
             0.0
         };
         self.num_requests_running.set(&labels, running as f64);
+        self.num_requests_inflight.set(&labels, inflight as f64);
         self.num_requests_waiting.set(&labels, waiting as f64);
         self.kv_cache_usage.set(&labels, ratio);
         if iteration_tokens > 0 {
             self.iteration_tokens
                 .observe(&labels, iteration_tokens as f64);
         }
+    }
+
+    /// Request-slot occupancy, separate from the frontend's load counters.
+    pub fn record_decode_slot_usage(&self, resident: i64, active_decode: i64, ready_waiting: i64) {
+        let labels = self.labels();
+        self.num_requests_resident.set(&labels, resident as f64);
+        self.num_active_decode_slots
+            .set(&labels, active_decode as f64);
+        self.num_decode_ready_waiting_reqs
+            .set(&labels, ready_waiting as f64);
     }
 
     /// A verify step's speculation counts over its decode slots.
@@ -786,6 +847,11 @@ impl EngineMetrics {
         self.request_queue_time.observe(&self.labels(), seconds);
     }
 
+    /// The decode role's KV-ready wait before its first decode dispatch.
+    pub fn observe_decode_ready_wait(&self, seconds: f64) {
+        self.decode_ready_wait.observe(&self.labels(), seconds);
+    }
+
     /// Resident KV occupancy. `used_pages` counts active and reclaimable
     /// prefix-cache pages; `active_pages` only what running requests hold.
     pub fn record_cache_occupancy(
@@ -823,12 +889,14 @@ impl EngineMetrics {
             .set(&labels, retracted.max(0) as f64);
     }
 
-    /// The decode role's PD queues: waiting for a prefill peer, transfer in
-    /// flight, and suspended requests.
-    pub fn record_decode_queues(&self, prealloc: i64, transfer: i64, retracted: i64) {
+    /// The decode role's PD queues: waiting for a prefill peer to connect,
+    /// waiting for its KV, transfer pins, and suspended requests.
+    pub fn record_decode_queues(&self, prealloc: i64, kv_wait: i64, transfer: i64, retracted: i64) {
         let labels = self.labels();
         self.num_decode_prealloc_queue_reqs
             .set(&labels, prealloc.max(0) as f64);
+        self.num_decode_kv_wait_reqs
+            .set(&labels, kv_wait.max(0) as f64);
         self.num_decode_transfer_queue_reqs
             .set(&labels, transfer.max(0) as f64);
         self.num_retracted_queue_reqs

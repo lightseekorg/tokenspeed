@@ -33,6 +33,7 @@ import sys
 from pathlib import Path
 from unittest.mock import MagicMock, Mock, patch
 
+import huggingface_hub
 import pytest
 from tokenizers import Tokenizer, models, pre_tokenizers, processors
 from transformers import BatchEncoding, PreTrainedTokenizerFast
@@ -198,6 +199,7 @@ def test_remote_v41_uses_pinned_snapshot_encoder(base_tokenizer, tmp_path):
         repo,
         revision="moving-branch",
         ignore_patterns=["*.pt", "*.safetensors", "*.bin"],
+        local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
     )
     load.assert_called_once_with(
         repo,
