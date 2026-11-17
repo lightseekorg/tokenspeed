@@ -1455,12 +1455,8 @@ pool's metrics when metrics are enabled. All carry the `model_name`,
 
 | Metric | Type | Meaning |
 | --- | --- | --- |
-| `tokenspeed:shared_l2_lookups_total` | Counter | Pool lookups of waiting prompts, with a bounded `event` label. The events overlap; do not sum them. `sent`: every lookup handed to the pool's client. `hit`: answers that pinned pool pages; among them `proxy_overflow` (the rank's proxy Host tier had no room for the hit) and `lease_expired` (the hit was given up before admission because the rank's lease on the owner's pins was lost), whose prompts were computed instead. `timeout`: misses the client answered at the lookup deadline. `abandoned`: lookups that ended without an answer (the request left first, or the scheduler refused the answer). |
-| `tokenspeed:shared_l2_failed_writes_total` | Counter | Pool writes whose completion reported a failure to the scheduler. A failed write puts nothing in the pool, with one exception: a write whose commit the owner carried out, but did not answer within `request_timeout_ms`, counts here although the pool holds its blocks. Serving goes on. |
-| `tokenspeed:shared_l2_failed_write_blocks_total` | Counter | The blocks those writes carried, counted when the scheduler takes a write's completion. The same blocks as `tokenspeed:shared_l2_dropped_write_blocks_total`, counted later; do not add the two. |
-| `tokenspeed:shared_l2_dropped_write_blocks_total` | Counter | Blocks of the pool writes that failed (at the reservation, the copy or the commit) or were dropped while the rank served without the pool, counted by the pool's client when the write ends. The same blocks as `tokenspeed:shared_l2_failed_write_blocks_total`, counted earlier; do not add the two. |
-| `tokenspeed:shared_l2_resources` | Gauge | What the rank has open at the pool now, with a bounded `resource` label: `pending_lookups`, `tickets` (hits not released yet), `writes_in_flight`. |
-| `tokenspeed:shared_l2_no_pool` | Gauge | 1 while the rank serves without the pool (its owner does not know the rank or has not answered for `no_pool_after_s`), else 0. |
+| `tokenspeed:shared_l2_lookups_total` | Counter | Pool lookups of waiting prompts, with a bounded `event` label. The events overlap; do not sum them. `sent`: every lookup sent to the pool's owner. `hit`: answers that pinned pool pages; among them `proxy_overflow` (the rank's proxy Host tier had no room for the hit), whose prompts were computed instead. |
+| `tokenspeed:shared_l2_resources` | Gauge | What the rank has open at the pool now, with a bounded `resource` label: `tickets` (hits not released yet), `writes_in_flight`. |
 
 ## TokenSpeed-specific runtime knobs
 
@@ -1930,7 +1926,7 @@ owner, then the providers, then the engines.
   | `--lcm-bytes N` | Optional; leave it out. The owner then takes the LCM block size of the first rank that joins and cuts each provider's bytes into whole blocks when it builds the pool (a provider smaller than one block stops the pool from being built: every rank's start fails with that provider's name). With it, a rank whose LCM block differs is refused with both numbers in the message, and a provider smaller than one block is refused when it joins. |
   | `--providers K` | Providers to wait for. The pool is built when all `K` have joined and the first rank reports its cache geometry; its size is fixed from then on. |
   | `--headroom-lcm-blocks H` | When fewer than `H/2` LCM blocks are empty, a write evicts back up to `H` in one pass. |
-  | `--client-timeout-s S` | A rank silent for `S` seconds loses its pins and reservations. |
+  | `--client-timeout-s S` | A rank silent for `S` seconds loses its pins and reservations, and the owner answers its next request with an error, which stops the rank's engine. A rank pings the owner whenever it has had no release or touch to send for 5 seconds; a ping fails after at most twice the rank's `request_timeout_ms`, and the engine's loop reads the failure at the head of its next round (an idle rank runs a round about every 10 ms). A running rank that cannot reach the owner therefore stops about 5 seconds plus twice its `request_timeout_ms` after the owner last heard it: keep `S` well above that, so that it stops before the owner drops its pins, and well above any pause a rank process can take (the frozen rank under *Known limits*). |
   | `--checkpoint-retention-requests R` | `--checkpoint-retention-requests` of the scheduler, counted over the lookups of every rank together, hit or miss. A rank sends one lookup for each new prompt its own GPU cache does not cover already; a prompt it covers sends none and is not counted. A rank's own default is 16 x its batch size; for the pool use about 16 x the sum of the ranks' batch sizes. `0` ranks every entry by its own last use. |
   | `--checkpoint-retention-leaf-distance D` | As the scheduler's option of that name. |
 
@@ -1942,26 +1938,22 @@ owner, then the providers, then the engines.
   the owner refuses it: the owner then has to be restarted with it.
 
 The owner keeps everything in memory, and a provider announces its memory
-only when it starts: a restarted owner waits for new providers. **A restart of
-the owner is therefore a restart of the providers too, in this order:**
+only when it starts: a restarted owner waits for new providers and knows none
+of the ranks that joined the owner before it. **A restart of the owner is
+therefore a restart of the providers and of the ranks too:** stop the ranks,
+the owner and the providers, then start the owner, the providers and the
+ranks again. A rank that is still running when its owner goes away stops by
+itself, at its first request the owner does not answer.
 
-1. Stop the owner. A rank plans loads from the hits it holds for `lease_s` at
-   most and serves without the pool after `no_pool_after_s`.
-2. Wait `lease_s + load_start_margin_s` plus the longest load. After that no
-   rank starts a load from the old providers and none is still reading them.
-3. Stop the providers, then start the owner and the providers again. The
-   ranks join the new, empty pool by themselves.
+A provider that is stopped or killed stops the ranks that use it: a load whose
+RDMA read fails and a write whose RDMA copy fails each stop the rank's engine
+and, under attention DP, its whole instance.
 
-Providers that are stopped or killed earlier stop the ranks that load from
-them: a load whose RDMA read fails stops the rank's engine and, under
-attention DP, its whole instance (see the failure table). That includes every
-rank that still holds a hit and admits its prompt before the lease runs out.
-
-A rank that is stopped or restarted, or that leaves the pool by itself (no
-answer from the owner for `no_pool_after_s`), does not release what it holds
-at the owner. The owner drops that client's pins and reservations once it has
-been silent for `--client-timeout-s`, which it checks every quarter of that
-time. Until then the pages they cover are not evicted.
+A rank that is stopped or restarted does not release what it holds at the
+owner. The owner drops that client's pins and reservations once it has been
+silent for `--client-timeout-s`, which it checks every quarter of that time.
+Until then the pages they cover are not evicted. A restarted rank joins the
+pool as a new client.
 
 **Flushing.** The engine's cache flush clears a rank's Device cache and leaves
 the pool as it is. To empty the pool, send the owner `clear`:
@@ -1986,15 +1978,12 @@ bytes`). Measured on K3 with attention DP: an LCM block of about 143 MiB and
 about three LCM blocks (about 429 MiB) a checkpoint, so about 150 checkpoints
 in a 64 GiB pool.
 
-The rank's JSON names every field; only `load_start_margin_s` may be left
-out:
+The rank's JSON names every field:
 
 ```json
 {"owner": "tcp://HOST:PORT",
  "device_names": ["mlx5_0,mlx5_1", "mlx5_0,mlx5_1"],
  "request_timeout_ms": 2000, "connect_timeout_s": 600,
- "lookup_deadline_ms": 5, "no_pool_after_s": 10, "lease_s": 20,
- "load_start_margin_s": 5,
  "load_workers": 4, "write_workers": 4,
  "scheduler": {"max_writes": 4, "max_write_keys": 512}}
 ```
@@ -2003,56 +1992,52 @@ out:
 |---|---|
 | `owner` | The owner's address. |
 | `device_names` | A list: the RDMA devices of each local GPU index, as Mooncake names them. Name the fastest GPU-side NICs. |
-| `request_timeout_ms` | How long a hello, a reservation, a commit and the first abandon wait for the owner. At most `no_pool_after_s`. |
+| `request_timeout_ms` | How long a request may wait to be sent, and again how long it may wait for the owner's answer. A request that passes either has failed, which stops the rank's engine: set it above the longest pause the owner can have. A lookup holds the rank's scheduling until it is answered or has failed, for up to twice this long (the wait to send, then the wait for the answer). |
 | `connect_timeout_s` | How long a starting rank waits for the pool to be ready; the rank fails to start after it. |
-| `lookup_deadline_ms` | A waiting prompt's lookup the owner has not answered by then counts as a miss, and the prompt is computed. |
-| `no_pool_after_s` | Without an answer from the owner for this long, the rank serves without the pool. |
-| `lease_s` | Without an answer from the owner for this long, the rank plans no load from the pool: the hits it holds count as misses. |
-| `load_start_margin_s` | Optional, 5 by default. A load is planned within `lease_s` and starts behind the forwards in flight; it may start up to this much later. A load that could not start by then fails, which stops the engine: keep the margin above the longest forward plus the longest load that may run ahead of it. |
 | `load_workers` | Threads reading one load's providers in parallel. A layer is read with one request for each provider that holds its pages, so more threads than providers are never busy. |
 | `write_workers` | Threads writing newly published blocks to the pool. |
 | `scheduler.max_writes`, `scheduler.max_write_keys` | Writes in flight at once, and blocks in one write; Device blocks stay pinned only while their write is in flight. |
 
-Two margins the settings must keep, which nothing can check for you:
+Before it plans a round, the engine's loop sends the owner one request with
+the lookup of each waiting prompt that has none yet, and waits for the answer.
+A prompt the pool holds no prefix of is a miss and is computed.
 
-1. `lease_s + load_start_margin_s` plus the longest load must stay below the
-   owner's `--client-timeout-s`. The owner drops the pins of a rank it has not
-   heard for that long; a load still running then could read pages that
-   already hold another prompt. (A rank refuses to start when `lease_s +
-   load_start_margin_s` alone is not below the owner's timeout.)
-2. The longest copy of one write must stay below `--client-timeout-s` too, for
-   the same reason on the write side: the owner frees the reservation of a rank
-   it dropped.
+A write reserves pool pages for newly published blocks, copies the blocks by
+RDMA and commits them. A block the owner gives no page (the pool holds it,
+another rank is writing it, or the pool has no room) is skipped. A rank tells
+the owner when it is done with a hit (a release) and when it reuses blocks of
+its own GPU cache that the pool holds too (a touch), and pings it whenever it
+has had neither to send for 5 seconds.
 
-A third the rank checks at start: `request_timeout_ms` must not exceed
-`no_pool_after_s`. Keep it at a second or two. No serving path waits on it,
-but a blocked request delays the next one of its thread.
+No request is sent twice, and a rank does not serve without its pool. Each of
+these failures stops the rank's engine, as a failed forward does; under
+attention DP the other ranks of the instance stop with it (they report that a
+rank left the mesh):
 
-A rank pings the owner when it has not heard it for a third of the shorter of
-`lease_s` and `no_pool_after_s`.
-
-A prompt's lookup goes out when the engine takes the request in, also while a
-forward is awaited on a replica of one rank. Before it plans, the loop waits
-up to 2 ms for the answers it has just asked for, where that leaves no device
-idle; a rank that is idle while its attention-DP peers forward is covered by
-that wait. Measured on GB300, a lookup's round trip takes 0.55 ms at the
-median and 1.7 ms at most.
-
-How a rank behaves when something fails:
-
-| What happens | What the rank does |
+| What fails | How |
 |---|---|
-| A lookup is not answered by `lookup_deadline_ms`, is refused, or is answered with anything but one well-formed hit for each prompt (a hit that names a page the pool does not have is not well formed) | The prompt counts as a miss and is computed. The owner is told to drop what that lookup pinned. |
-| A write fails at its reservation, its copy (a dead provider included) or its commit | The write is dropped and its pool pages are freed; the blocks stay in the GPU cache. A later finish offers them again. After a failed copy the pages are freed 30 s later, because RDMA writes of that copy may still arrive. Blocks of the failed write that another rank's write named meanwhile were answered to that rank as already in the pool and skipped: they reach the pool only when a request that published them finishes and offers them again. One failed write frees nothing: when the owner carried out the commit and its answer did not reach the rank within `request_timeout_ms`, the pool holds the write's blocks, complete (the copy ended before the commit), and a later offer of them is answered as already in the pool. |
-| A release, an abandon or a ping is not answered | It is sent again until it is. |
-| The owner answers with what is no reply (it cannot be decoded, or lacks a field of a reply) | The request counts as refused and the owner as not heard: a lookup is a miss, a write fails, and a release or an abandon is dropped with a warning in the log, so what it would have freed stays held until the owner drops the rank (`--client-timeout-s`). Such answers renew no lease, and after `no_pool_after_s` of them the rank serves without the pool. |
-| No answer from the owner for `lease_s`: the rank's lease on the owner's pins is lost, until the owner answers again | While the lease is lost the scheduler plans no load from the pool and drops the hits the waiting prompts hold: those prompts are computed, and a prompt admitted meanwhile reuses the rank's own GPU cache only. A load already planned still starts, up to `load_start_margin_s` after the lease ran out. |
-| The owner is paused or gone (no answer for `no_pool_after_s`), or it no longer knows the rank (it restarted, or dropped the rank) | Requests keep completing, as misses. The rank serves without the pool (`tokenspeed:shared_l2_no_pool` is 1): lookups miss at once, writes are dropped. A load planned before still starts, until `lease_s + load_start_margin_s` after the owner's last answer, from the providers of the pool the rank left. The rank keeps saying hello and joins again by itself, as a new client, once the owner and all its providers are back. |
-| A load of an admitted prompt fails: a provider died or an RDMA read failed (reported after the RDMA retries, some seconds), or the load could not start within `lease_s + load_start_margin_s` of the owner's last answer | The rank's engine stops, as for a failed forward: that forward already depends on the pages, and none of its results is returned. Under attention DP the other ranks of the instance stop with it (they report that a rank left the mesh). One dead provider therefore stops every instance that is loading from it. |
+| A lookup | The owner does not answer within `request_timeout_ms`, answers with an error (an owner that does not know the rank answers so: it restarted, or it dropped the rank after `--client-timeout-s` of silence), or answers with anything but one well-formed hit for each prompt (a hit that names a page the pool does not have is not well formed). A failed lookup is never taken for a miss. |
+| A write | Its reservation or its commit is not answered within `request_timeout_ms` or is answered with an error, or its RDMA copy fails (a dead provider included). |
+| A release, a touch or a ping | It is not answered within `request_timeout_ms` or is answered with an error. |
+| A load of an admitted prompt | A provider died or an RDMA read failed (reported after the RDMA retries, some seconds). The forward already depends on the pages; none of its results is returned. |
 
-A pool thus adds one way for an engine to stop that a Host L2 does not have:
-a load-back that fails. It stops the rank's engine and, under attention DP,
-the whole instance.
+The engine's loop reads a failed write, release, touch or ping at the head of
+its next round, before that round plans, on an idle rank as on a serving one.
+
+Known limits:
+
+* An owner that is paused or unreachable for longer than `request_timeout_ms`
+  stops every rank that uses the pool.
+* After a restart of the owner every rank has to be restarted.
+* A rank process that is frozen for longer than the owner's
+  `--client-timeout-s` loses its pins and reservations at the owner. After it
+  resumes, and until its next poll or request to the owner fails and stops it,
+  a load may read pool pages that now hold another rank's blocks, and a write
+  that was in progress may finish into pages the owner has since given to
+  another rank. That rank's entry then serves wrong KV to every rank that hits
+  it, until it is evicted. Nothing in the engine guards against this: keep
+  `--client-timeout-s` well above any pause a rank process can take, and send
+  the owner `clear` after a rank was frozen for that long.
 
 The owner admits a rank by two checks: its cache geometry (prefix page, group
 kinds and packing, LCM block bytes) and its deployment identity, the one L3
