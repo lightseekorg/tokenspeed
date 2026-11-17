@@ -422,10 +422,6 @@ mod ffi {
         remote_prefilling: usize,
         /// PD: requests whose pages a transfer still pins.
         pd_transfer: usize,
-        /// PD, P role, deferred decode allocation: computed prompts waiting for
-        /// their decode destination; also counted in `running`, `prefilling`
-        /// and `pd_transfer`.
-        awaiting_destination: usize,
         /// Cache blocks holding nothing.
         empty_lcm_blocks: i32,
     }
@@ -656,7 +652,6 @@ mod ffi {
         fn sizes(scheduler: &Scheduler) -> SchedulerSizes;
         fn active_lcm_blocks(scheduler: &Scheduler) -> i32;
         fn probe_prefill_gate(scheduler: &Scheduler) -> PrefillGateProbe;
-        fn awaiting_destination_lcm_blocks(scheduler: &Scheduler) -> i32;
         fn cache_group_pages(scheduler: &Scheduler, group_id: &str) -> CacheGroupPages;
         #[namespace = "tokenspeed"]
         type KvEventBatch;
@@ -982,15 +977,6 @@ impl Scheduler {
     pub fn probe_prefill_gate(&self) -> PrefillGateProbe {
         let _span = profile::span("Scheduler::probe_prefill_gate");
         ffi::probe_prefill_gate(self.get())
-    }
-
-    /// Cache blocks in the block tables of the prompts
-    /// `sizes().awaiting_destination` counts: what `active_lcm_blocks` reads
-    /// for every request, taken for these by walking their tables. Blocks
-    /// held outside the tables (e.g. a pending in-forward State checkpoint)
-    /// are not included.
-    pub fn awaiting_destination_lcm_blocks(&self) -> i32 {
-        ffi::awaiting_destination_lcm_blocks(self.get())
     }
 
     /// One cache group's page counts.

@@ -1523,19 +1523,9 @@ carry the `model_name` and `app_key` labels:
 | `tokenspeed:kv_transfer_timeouts_total` | Counter | Transfers that timed out, with a bounded `stage` label: `bootstrapping` (prefill never received the cache manifest; `TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT`), `waiting_for_announcement` (the Decode server never announced the request to a prefill server that runs `deferred`, same timeout), `waiting_for_admission` (decode never published its manifest; `TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT`) or `waiting_for_input` (decode never received the transfer-done signal; `TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT`). |
 | `tokenspeed:kv_transfer_failures_total` | Counter | Transfers aborted on failure: send failures on the prefill node, and rooms failed on prefill-node loss (heartbeat) on the decode node. Timeouts are counted separately. |
 
-A prefill server under `--disaggregation-decode-allocation-policy
-deferred` ([P/D admission](#pd-admission)) also reports its admission
-with the scheduler's metrics, which carry the `dp_rank` label too:
-
-| Metric | Type | Meaning |
-| --- | --- | --- |
-| `tokenspeed:num_prefill_awaiting_destination_reqs` | Gauge | Prompts computed and waiting for their decode destination, with their pages and request slot. `tokenspeed:num_prefill_inflight_queue_reqs`, the prefill requests whose pages a transfer pins, counts them too. |
-| `tokenspeed:num_prefill_awaiting_destination_pages` | Gauge | KV pages in those prompts' block tables, counted as `tokenspeed:num_free_tokens` counts pages; blocks held outside the tables (such as a pending in-forward State checkpoint) are not included. |
-
-A prefill server under `early` exports both gauges too, always 0, and every
-prefill server states its policy in what it registers with the bootstrap
-server (`decode_allocation_policy`, served to Decode servers as
-`prefill_decode_allocation_policy` in `/route`).
+Every prefill server states its policy ([P/D admission](#pd-admission)) in
+what it registers with the bootstrap server (`decode_allocation_policy`,
+served to Decode servers as `prefill_decode_allocation_policy` in `/route`).
 
 Under `deferred`, `tokenspeed:num_prefill_prealloc_queue_reqs` counts the
 requests the prefill server has not admitted yet, those waiting for their

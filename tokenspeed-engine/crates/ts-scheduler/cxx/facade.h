@@ -84,7 +84,6 @@ SharedPrefixPublication shared_prefix_publication(const tokenspeed::Scheduler& s
 SchedulerSizes sizes(const tokenspeed::Scheduler& scheduler);
 std::int32_t active_lcm_blocks(const tokenspeed::Scheduler& scheduler);
 PrefillGateProbe probe_prefill_gate(const tokenspeed::Scheduler& scheduler);
-std::int32_t awaiting_destination_lcm_blocks(const tokenspeed::Scheduler& scheduler);
 CacheGroupPages cache_group_pages(const tokenspeed::Scheduler& scheduler, rust::Str group_id);
 std::unique_ptr<tokenspeed::KvEventBatch> drain_kv_events(tokenspeed::Scheduler& scheduler);
 std::unique_ptr<tokenspeed::KvEventBatch> make_kv_event_batch(rust::Slice<const KvEventView> events);
