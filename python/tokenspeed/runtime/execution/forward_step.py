@@ -359,6 +359,13 @@ class ForwardStepRunner:
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
         self.token_to_kv_pool = token_to_kv_pool
         self.drafter = drafter
+        self.dp_local_graph = config.enable_dp_local_cuda_graph
+        if self.dp_local_graph and drafter is None:
+            raise ValueError(
+                "--enable-dp-local-cuda-graph requires a supported drafter"
+            )
+        if drafter is not None:
+            drafter.configure_decode_graph_scope(local=self.dp_local_graph)
         self.sampling_backend = sampling_backend
         self.input_buffers = input_buffers
         self.capturable_grammar = capturable_grammar
@@ -756,7 +763,7 @@ class ForwardStepRunner:
         # For DP mode, global_num_tokens must be set so that the MoE
         # all-gather comm layers know token counts for all DP ranks.
         # During capture, use uniform dummy counts across ranks.
-        if self.dp_size > 1:
+        if self.dp_size > 1 and not self.dp_local_graph:
             ctx.global_num_tokens = [bs * self.max_tokens_per_req] * self.world_size
             # global_bs must ALSO be set at capture. The draft first step's
             # collective sizing (reported via report_collective_sizing) reads
@@ -968,7 +975,7 @@ class ForwardStepRunner:
                         else CaptureHiddenMode.NULL
                     ),
                 )
-                if self.dp_size > 1:
+                if self.dp_size > 1 and not self.dp_local_graph:
                     ctx.global_num_tokens = [
                         bs * self.max_tokens_per_req
                     ] * self.world_size
@@ -1227,6 +1234,19 @@ class ForwardStepRunner:
             if global_bs is None or global_bs == 0:
                 return False
             if self.disable_padding:
+                if self.dp_local_graph:
+                    # Keep the graph/eager phase agreed even when graph shapes
+                    # differ. An idle peer uses the smallest captured graph.
+                    return all(
+                        n == 0
+                        or (
+                            n % self.max_tokens_per_req == 0
+                            and self._has_cuda_graph_for_bs(
+                                n // self.max_tokens_per_req
+                            )
+                        )
+                        for n in ctx.global_num_tokens
+                    )
                 return self._has_cuda_graph_for_bs(global_bs)
             return global_bs <= self.max_capture_bs
         if self.disable_padding:
@@ -1240,7 +1260,7 @@ class ForwardStepRunner:
         return self._padded_bs(bs, ctx)
 
     def _padded_bs(self, bs: int, ctx: ForwardContext) -> int:
-        graph_bs = self._global_graph_bs(ctx)
+        graph_bs = None if self.dp_local_graph else self._global_graph_bs(ctx)
         target_bs = graph_bs if graph_bs is not None else bs
         index = bisect.bisect_left(self.capture_bs, target_bs)
         return self.capture_bs[index]
@@ -1423,11 +1443,21 @@ class ForwardStepRunner:
             if (
                 self.drafter is not None
                 and report_key not in self._reported_query_graphs
-                and len(self.drafter.decode_graph_query_capacities(padded_bs)) > 1
+                and (
+                    self.dp_local_graph
+                    or len(self.drafter.decode_graph_query_capacities(padded_bs)) > 1
+                )
             ):
                 self._reported_query_graphs.add(report_key)
+                rank_info = (
+                    f"rank={self.global_rank}, live_requests={bs}, "
+                    if self.dp_local_graph
+                    else ""
+                )
                 logger.info(
-                    f"Adaptive decode graph replay: request_capacity={padded_bs}, "
+                    f"{'Local DP' if self.dp_local_graph else 'Adaptive'} "
+                    "decode graph replay: "
+                    f"{rank_info}request_capacity={padded_bs}, "
                     f"target_query_capacity={(self._decode_query_tokens or padded_bs * self.max_tokens_per_req)}, "
                     f"full_query_capacity={padded_bs * self.max_tokens_per_req}, "
                     f"variant={graph_key[0]}"
@@ -1447,19 +1477,26 @@ class ForwardStepRunner:
             )
             packed = query_tokens != padded_bs * self.max_tokens_per_req
             if self._expert_load_rows is not None:
-                # Packed verification uses one agreed capacity on all ranks.
-                self._expert_load_rows.mark_padded(
-                    padded_global_num_tokens=[query_tokens] * self.world_size,
-                    live_global_num_tokens=(
-                        [query_tokens] * self.world_size
-                        if packed
-                        else (
-                            ctx.global_num_tokens
-                            if ctx.global_num_tokens is not None
-                            else [ctx.input_num_tokens] * self.world_size
-                        )
-                    ),
-                )
+                if self.dp_local_graph:
+                    # This graph's MoE input contains only its local rows.
+                    # No peer physical query sizes are known or needed here.
+                    rows = self._expert_load_rows.rows(query_tokens)
+                    rows.fill_(True)
+                    if not packed:
+                        rows[bs * self.max_tokens_per_req :].fill_(False)
+                else:
+                    self._expert_load_rows.mark_padded(
+                        padded_global_num_tokens=[query_tokens] * self.world_size,
+                        live_global_num_tokens=(
+                            [query_tokens] * self.world_size
+                            if packed
+                            else (
+                                ctx.global_num_tokens
+                                if ctx.global_num_tokens is not None
+                                else [ctx.input_num_tokens] * self.world_size
+                            )
+                        ),
+                    )
             # MegaMoE's count pair assumes a uniform number of rows per
             # request. Packed prefixes vary, so that mask could drop live rows.
             live_requests = (

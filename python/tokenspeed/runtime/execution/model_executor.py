@@ -398,6 +398,7 @@ class ModelExecutorConfig:
     max_req_pool_size: int
     output_length: int
     enforce_eager: bool
+    enable_dp_local_cuda_graph: bool
     prefix_granularity: int
     max_num_seqs: int
     chunked_prefill_size: int
@@ -540,6 +541,7 @@ class ModelExecutorConfig:
             max_req_pool_size=max_req_pool_size,
             output_length=output_length,
             enforce_eager=server_args.enforce_eager,
+            enable_dp_local_cuda_graph=server_args.enable_dp_local_cuda_graph,
             prefix_granularity=prefix_granularity,
             max_num_seqs=server_args.max_num_seqs,
             chunked_prefill_size=server_args.chunked_prefill_size,

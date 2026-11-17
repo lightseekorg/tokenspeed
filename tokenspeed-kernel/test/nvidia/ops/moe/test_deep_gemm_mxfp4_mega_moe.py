@@ -83,6 +83,11 @@ def _fp8(x):
     ).reshape_as(x)
 
 
+def _dequant_fp8(weights, scales):
+    scale = torch.exp2(scales.float() - 127).repeat_interleave(32, -1)
+    return weights.float() * scale
+
+
 class Experts(nn.Module):
     def __init__(self, group):
         super().__init__()
@@ -196,3 +201,143 @@ def test_uneven_empty_and_graph_replay(group):
         graph.replay()
         torch.cuda.synchronize()
         torch.testing.assert_close(captured, actual, atol=0, rtol=0)
+
+
+def test_heterogeneous_dp_graph_replay_with_shared_expert(group):
+    if group.size() != 2:
+        pytest.skip("launch with torchrun --standalone --nproc-per-node=2")
+
+    experts = Experts(group)
+    plan = moe_plan(
+        "mxfp4",
+        activation="silu",
+        routing_mode="precomputed_topk",
+        a2a_backend="none",
+        ep_size=group.size(),
+        ispp=256,
+        hidden=512,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
+        num_experts=8,
+        top_k=2,
+        process_group=group,
+        persistent_max_num_tokens_per_gpu=256,
+        fast_math=True,
+        combine_order="rank",
+        features=frozenset(),
+        solution="mega_moe",
+    )
+    moe_process_weights(plan, experts)
+
+    generator = torch.Generator(device="cuda").manual_seed(991)
+    shared_gate_up = (torch.randn(512, 512, device="cuda", generator=generator) * 2).to(
+        torch.float8_e4m3fn
+    )
+    shared_down = (torch.randn(512, 256, device="cuda", generator=generator) * 2).to(
+        torch.float8_e4m3fn
+    )
+    shared_gate_up_scale = torch.randint(
+        120, 123, (512, 16), dtype=torch.uint8, device="cuda", generator=generator
+    )
+    shared_down_scale = torch.randint(
+        120, 123, (512, 8), dtype=torch.uint8, device="cuda", generator=generator
+    )
+    shared_reference_weights = tuple(
+        tensor.clone()
+        for tensor in (
+            shared_gate_up,
+            shared_gate_up_scale,
+            shared_down,
+            shared_down_scale,
+        )
+    )
+    assert deep_gemm.fuse_deep_gemm_mxfp4_mega_moe_shared_expert(
+        plan,
+        experts,
+        shared_gate_up,
+        shared_gate_up_scale,
+        shared_down,
+        shared_down_scale,
+    )
+    assert experts._moe_backend_state.num_shared_experts == 1
+
+    # Exercise this build's tile transitions without fixing its heuristic.
+    block_ms = {
+        rows: deep_gemm.get_block_m_for_mega_moe(2, 8, 256, rows, 2, "fp8xfp4")
+        for rows in range(1, 257)
+    }
+    transitions = [
+        (rows - 1, rows)
+        for rows in range(2, 257)
+        if block_ms[rows] != block_ms[rows - 1]
+    ][:2]
+    if not transitions:
+        pytest.skip("installed MegaMoE has no BLOCK_M transition within capacity")
+
+    # Each rank has its own token bucket at every replay position; rank 0 also
+    # exercises an empty local shard while rank 1 remains active.
+    pairs = [pair for low, high in transitions for pair in ((low, high), (high, low))]
+    pairs.append((0, transitions[-1][1]))
+    rows_by_rank = tuple(tuple(pair[rank] for pair in pairs) for rank in range(2))
+    ref_gate_up, ref_gate_up_scale, ref_down, ref_down_scale = shared_reference_weights
+    cases = []
+    for index, rows in enumerate(rows_by_rank[group.rank()]):
+        seed = 1000 + group.rank() * 10 + index
+        generator = torch.Generator(device="cuda").manual_seed(seed)
+        x = (
+            torch.randn(
+                rows, 512, device="cuda", dtype=torch.bfloat16, generator=generator
+            )
+            * 0.25
+        )
+        token_ids = torch.arange(rows, device="cuda")
+        ids = torch.stack((token_ids % 8, (token_ids + 3) % 8), -1).int()
+        scores = torch.tensor([0.3, 0.7], device="cuda").expand(rows, 2).contiguous()
+        routed = experts.reference(x, ids, scores)
+        xq = _fp8(x.float())
+        gate, up = (
+            (xq @ _dequant_fp8(ref_gate_up, ref_gate_up_scale).T)
+            .to(torch.bfloat16)
+            .float()
+            .chunk(2, -1)
+        )
+        # DeepGEMM rounds the linear accumulators to BF16, then keeps the
+        # SwiGLU result in FP32 until its per-row FP8 scale and cast.
+        shared_inter = _fp8(F.silu(gate) * up)
+        shared = shared_inter @ _dequant_fp8(ref_down, ref_down_scale).T
+        expected = routed + shared
+
+        run = partial(
+            moe_apply,
+            plan,
+            x,
+            experts,
+            None,
+            scores,
+            ids,
+            max_num_tokens_per_gpu=256,
+            do_finalize=True,
+        )
+        eager = run()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(eager.float(), expected, atol=0.002, rtol=0.02)
+        graph = torch.cuda.CUDAGraph()
+        dist.barrier(group=group)
+        with torch.cuda.graph(graph):
+            captured = run()
+        # Captured graphs borrow these external input addresses. The partial
+        # owns x/scores/ids until every graph has finished replaying.
+        cases.append((graph, captured, eager, expected, run))
+
+    # Replay the same fixed-capacity symmetric buffer through larger and
+    # smaller local shapes without host barriers between layers/rounds.
+    snapshots = []
+    for case in (*cases, *reversed(cases)):
+        graph, captured, eager, expected, _run = case
+        graph.replay()
+        snapshots.append((captured.clone(), eager, expected))
+    torch.cuda.synchronize()
+    for actual, eager, expected in snapshots:
+        torch.testing.assert_close(actual.float(), expected, atol=0.002, rtol=0.02)
+        torch.testing.assert_close(actual, eager, atol=0.002, rtol=0.02)

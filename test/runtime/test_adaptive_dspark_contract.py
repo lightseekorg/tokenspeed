@@ -36,11 +36,15 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.server_args import prepare_server_args
 
 
-def test_adaptive_opt_in_requires_v41_model(monkeypatch):
+@pytest.mark.parametrize(
+    "flag", ["enable_dsv41_adaptive_dspark", "enable_dp_local_cuda_graph"]
+)
+def test_adaptive_opt_in_requires_v41_model(monkeypatch, flag):
     model = nn.Linear(1, 1)
     monkeypatch.setitem(global_server_args_dict, "enable_dsv41_adaptive_dspark", False)
+    monkeypatch.setitem(global_server_args_dict, "enable_dp_local_cuda_graph", False)
     assert get_drafter_impl("DSPARK", model) is DSpark
-    monkeypatch.setitem(global_server_args_dict, "enable_dsv41_adaptive_dspark", True)
+    monkeypatch.setitem(global_server_args_dict, flag, True)
     with pytest.raises(ValueError, match="native V4.1 DSpark model"):
         get_drafter_impl("DSPARK", model)
 
@@ -89,6 +93,7 @@ def test_oversized_adaptive_buckets_keep_native_capture(width):
     from tokenspeed_kernel.ops.attention.dsv41 import VERIFY_LAYOUT_MAX_TOKENS
 
     drafter = DeepseekV41DSpark.__new__(DeepseekV41DSpark)
+    drafter.dp_local_graph = False
     BaseDrafter.__init__(drafter, spec_num_tokens=width)
     drafter.adaptive_min_batch_size = 4
     drafter.confidence_scores = torch.empty(1)

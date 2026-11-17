@@ -1384,8 +1384,12 @@ def test_tp1_ep2_draft_checkpoint_and_idle_schedule(monkeypatch, rank, mode):
     )
     _mock_loader_hardware(monkeypatch, mapping)
     monkeypatch.delitem(global_server_args_dict, "disaggregation_mode", raising=False)
+    config = _draft_config()
+    # Ordinary EP requires this alignment; use the same geometry for both
+    # loaded backends in the local-graph admission check below.
+    config.hidden_size = 256
     adapter = DeepseekV41ForCausalLMDSpark(
-        DeepseekV41Config(text_config=vars(_draft_config())), mapping, _quant()
+        DeepseekV41Config(text_config=vars(config)), mapping, _quant()
     )
     adapter.load_weights(_draft_checkpoint(adapter.model).items())
     # The runner's GPU initialization is outside this CPU checkpoint test.
@@ -1424,6 +1428,27 @@ def test_tp1_ep2_draft_checkpoint_and_idle_schedule(monkeypatch, rank, mode):
         == adapter.model.markov_projection.weight.shape[0]
     )
     assert adapter.checkpoint_load_report["loaded"] > 0
+
+    # This loader fixture constructs real MegaMoE layers on CPU.
+    drafter.target_model = adapter
+    drafter.configure_decode_graph_scope(local=True)
+    drafter.configure_decode_graph_scope(local=False)
+    from tokenspeed.runtime.layers.moe import expert as expert_module
+    from tokenspeed.runtime.layers.moe.utils import MoeBackend
+    from tokenspeed.runtime.models import deepseek_v41_moe as v4
+
+    with monkeypatch.context() as ordinary:
+        for module in (v41, v4, expert_module):
+            ordinary.setattr(module, "get_moe_backend", lambda: MoeBackend.TRITON)
+        layer = v41.DeepseekV41MoE(
+            adapter.model.config, mapping, _quant(), 0, "ordinary", None
+        )
+    adapter.model.layers[0].ffn = layer
+    with pytest.raises(ValueError, match="target and draft MegaMoE"):
+        drafter.configure_decode_graph_scope(local=True)
+    drafter.target_model = nn.Linear(1, 1)
+    with pytest.raises(ValueError, match="native V4.1 target model"):
+        drafter.configure_decode_graph_scope(local=True)
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
@@ -1714,6 +1739,7 @@ def test_adaptive_v41_launch_contract(field, value):
 )
 def test_verify_graph_token_capacity(bs, capacity):
     drafter = object.__new__(DeepseekV41DSpark)
+    drafter.dp_local_graph = False
     drafter.device = torch.device("cpu")
     drafter.spec_num_tokens = 6
     drafter.adaptive_min_batch_size = 1
@@ -1733,6 +1759,7 @@ def test_small_or_padded_batches_keep_full_verification(actual, padded):
     from tokenspeed.runtime.execution.drafter.verify_budget import VerifyBudgetPolicy
 
     drafter = object.__new__(DeepseekV41DSpark)
+    drafter.dp_local_graph = False
     drafter.spec_num_tokens = 6
     drafter.verify_budget_policy = VerifyBudgetPolicy(True, 32, 6, 0.02)
     drafter.draft_model = SimpleNamespace(mapping=_mapping(0, 1, 1))
@@ -1764,6 +1791,7 @@ def test_fine_verify_graph_capture_plan_and_keys():
     from tokenspeed.runtime.execution.forward_step import ForwardStepRunner
 
     drafter = object.__new__(DeepseekV41DSpark)
+    drafter.dp_local_graph = False
     drafter.device = torch.device("cpu")
     drafter.spec_num_tokens = 6
     drafter.adaptive_min_batch_size = 1
@@ -1771,6 +1799,7 @@ def test_fine_verify_graph_capture_plan_and_keys():
     drafter.confidence_scores = torch.empty(1)
     drafter.verify_graph_token_step = 8
     runner = object.__new__(ForwardStepRunner)
+    runner.dp_local_graph = False
     runner.disable = False
     runner.capture_bs = [1, 8, 16, 32]
     runner.sampling_backend = None
@@ -1828,6 +1857,7 @@ def test_budget_allocation_graphs_are_prepared_and_reused(tmp_path, monkeypatch)
     from tokenspeed.runtime.execution.drafter.verify_budget import VerifyBudgetPolicy
 
     drafter = object.__new__(DeepseekV41DSpark)
+    drafter.dp_local_graph = False
     from tokenspeed.runtime.execution.drafter.verify_calibration import (
         VerifyCalibration,
     )

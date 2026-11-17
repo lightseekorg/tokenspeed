@@ -314,6 +314,7 @@ def test_startup_profile_restores_real_decode_metadata(fail_measurement):
 
     backend = _verify_backend("cuda", 2, 4)
     runner = ForwardStepRunner.__new__(ForwardStepRunner)
+    runner.dp_local_graph = False
     runner.device = "cuda"
     runner.max_tokens_per_req = 4
     runner.input_buffers = InputBuffers(2, 8, 32, device="cuda")
@@ -364,6 +365,7 @@ def test_startup_profile_replays_the_requested_graph_capacity():
     from tokenspeed.runtime.sampling.backends.base import CUDA_GRAPH_VARIANT_DEFAULT
 
     runner = ForwardStepRunner.__new__(ForwardStepRunner)
+    runner.dp_local_graph = False
     runner.max_tokens_per_req = 4
     runner.graphs = {}
     result = torch.zeros(1, device="cuda")

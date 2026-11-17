@@ -357,6 +357,7 @@ def _executor_config(spec_algo: str) -> ModelExecutorConfig:
         prefill_graph_capture_batch_sizes=None,
         input_logprob_chunk_tokens=N,
         enable_speculative_sampling=True,
+        enable_dp_local_cuda_graph=False,
         query_shard_size=1,
         query_shard_rank=0,
         enable_memory_saver=False,
