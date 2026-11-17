@@ -3606,6 +3606,7 @@ CacheCoordinator::StorageReservation CacheCoordinator::ReserveStoragePrefix(cons
         groups.clear();
         buckets.clear();
         result.keys.clear();
+        result.blocks.clear();
         result.tail.reset();
         result.tail_prior = ContentHash{};
         PrefixProbe::Tier device = device_only;
