@@ -1258,6 +1258,11 @@ At head dimension 160 the cache uses 84 MiB for FP8 or 164 MiB for BF16 per
 shard. At head dimension 512 it uses 260 MiB or 516 MiB, respectively. Miss
 staging is temporary and adds to those amounts.
 
+Enabling the flag with offloading disabled, an unsupported table format or GPU,
+or a missing CUDA gather library fails initialization with an explicit error.
+Zero slots disables the cache with a startup message. Small lookups (fewer than
+256 tokens) and CUDA graph capture/replay still use regular host gather.
+
 ## GPT-OSS 20B / 120B
 
 Small GPT-OSS launches can start simple. Large GPT-OSS launches usually tune

@@ -20,6 +20,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import torch
 from tokenspeed_kernel._triton import triton
 from tokenspeed_kernel.ops.ple._host_cache_triton import (
@@ -28,6 +30,8 @@ from tokenspeed_kernel.ops.ple._host_cache_triton import (
 )
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.thirdparty.cuda.ple_host_gather import ple_staged_gather
+
+logger = logging.getLogger(__name__)
 
 
 class PLEHostCache:
@@ -86,39 +90,67 @@ class PLEHostCache:
             device: GPU consuming the table and owning the cache.
 
         Returns:
-            A cache with lazily allocated buffers, or ``None`` if ineligible.
+            A cache with lazily allocated buffers, or ``None`` when slots are zero.
+
+        Raises:
+            ValueError: Invalid table layout, shard bounds, or unsupported shape/dtype.
+            RuntimeError: Unsupported GPU or missing compiled CUDA gather library.
         """
         if slot_count == 0:
+            logger.info("PLE hot cache disabled by TOKENSPEED_PLE_HOST_CACHE_SLOTS=0")
             return None
         if not 2 <= slot_count <= 1 << 22 or slot_count & (slot_count - 1):
             raise ValueError(
                 "PLE cache slots must be zero or a power of two in [2, 4194304]"
             )
         platform = current_platform()
+        if not platform.is_nvidia or device.type != "cuda":
+            raise RuntimeError("PLE hot cache requires an NVIDIA CUDA device")
+        capability = torch.cuda.get_device_capability(device)
+        if capability[0] not in (9, 10):
+            raise RuntimeError(
+                f"PLE hot cache requires Hopper or Blackwell, got SM{capability[0]}{capability[1]}"
+            )
+        if table.ndim != 2:
+            raise ValueError(
+                "PLE hot cache table must have shape [local_vocab_rows, head_dim]"
+            )
         if (
-            not platform.is_nvidia
-            or device.type != "cuda"
-            or torch.cuda.get_device_capability(device)[0] not in (9, 10)
-            or ngram_heads != cls.HEADS
-            or table.ndim != 2
-            or table.shape[1] not in cls.HEAD_DIMS
-            or table.dtype not in (torch.float8_e4m3fn, torch.bfloat16)
-            or output_dtype != torch.bfloat16
-            or not 0 <= vocab_start < vocab_end <= (1 << 63) - 1
-            or vocab_end - vocab_start > min(table.shape[0], (1 << 31) - 1)
-            or table.device.type != "cpu"
+            table.device.type != "cpu"
             or not table.is_pinned()
             or not table.is_contiguous()
         ):
-            return None
+            raise ValueError("PLE hot cache requires a contiguous pinned CPU table")
+        if not 0 <= vocab_start < vocab_end <= (
+            1 << 63
+        ) - 1 or vocab_end - vocab_start > min(table.shape[0], (1 << 31) - 1):
+            raise ValueError(
+                "PLE hot cache shard bounds must fit the table and int32 local row indices"
+            )
+        if ngram_heads != cls.HEADS or table.shape[1] not in cls.HEAD_DIMS:
+            raise ValueError(
+                f"PLE hot cache supports {cls.HEADS} heads and head dimensions {cls.HEAD_DIMS}, "
+                f"got {ngram_heads} heads and dimension {table.shape[1]}"
+            )
+        if (
+            table.dtype not in (torch.float8_e4m3fn, torch.bfloat16)
+            or output_dtype != torch.bfloat16
+        ):
+            raise ValueError(
+                f"PLE hot cache requires FP8 E4M3FN or BF16 storage and BF16 output, "
+                f"got {table.dtype} storage and {output_dtype} output"
+            )
         launch = ple_staged_gather()
-        return (
-            cls(slot_count, table.shape[1], vocab_start, vocab_end, launch)
-            if launch is not None
-            else None
+        logger.info(
+            f"PLE hot cache enabled: slots={slot_count}, storage={table.dtype}, "
+            f"heads={ngram_heads}, head_dim={table.shape[1]}; "
+            f"eager lookups with {cls.MIN_TOKENS}..{cls.MAX_TOKENS} tokens use the cache; "
+            "other sizes and CUDA graph capture/replay use regular host gather"
         )
+        return cls(slot_count, table.shape[1], vocab_start, vocab_end, launch)
 
     def can_gather(self, ids: torch.Tensor) -> bool:
+        """Select cache-safe sizes; flat winner indices must fit int32."""
         return (
             self.MIN_TOKENS <= ids.shape[0] <= self.MAX_TOKENS
             and not torch.cuda.is_current_stream_capturing()
@@ -144,6 +176,7 @@ class PLEHostCache:
         Args:
             table: The immutable pinned table selected by ``create``.
             ids: Contiguous CUDA int64 global IDs of shape ``[tokens, 16]``.
+                The caller must select this path with :meth:`can_gather`.
             out: Contiguous CUDA BF16 output of shape ``[tokens * 16, head_dim]``.
             scale: FP32 dequantization factor for an FP8 table, or None for BF16.
 
@@ -176,9 +209,6 @@ class PLEHostCache:
 
         query = ids.view(-1)
         rows = query.numel()
-        # Flat row indices are also stored in int32 winner slots.
-        if not self.MIN_TOKENS <= ids.shape[0] <= self.MAX_TOKENS:
-            raise ValueError("PLE cache lookup size is outside its supported range")
         staged = torch.empty_like(out, dtype=table.dtype)
         misses = torch.empty_like(query, dtype=torch.int32)
         self._winners.fill_(-1)

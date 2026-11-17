@@ -343,7 +343,7 @@ class Qwen4ExpPLEBackend(AttentionBackend):
             self._ple_verify_tables = self._build_verify_tables()
         return (
             sum(tensor.nbytes for tensor in self._ple_verify_scratch.values())
-            + self._ple_verify_tables["conv_element_strides"].nbytes
+            + self._ple_verify_tables["conv_dst_stride"].nbytes
             + self._ple_commit_rows.nbytes
         )
 
@@ -403,20 +403,25 @@ class Qwen4ExpPLEBackend(AttentionBackend):
             "context_dst_stride": self._i64([row_stride_i32(context_field)], device),
             "context_row_bytes": context_field[0].numel()
             * context_field.element_size(),
-            "conv_element_strides": self._i64(
-                [f.stride(0) for f in conv_fields], device
-            ),
             "conv_src": self._u64(
                 [scratch.data_ptr() for scratch in conv_scratches], device
             ),
             "conv_dst": self._u64([field.data_ptr() for field in conv_fields], device),
-            "conv_src_stride": self._i64(
-                [row_stride_i32(scratch) for scratch in conv_scratches], device
+            "conv_src_stride": (
+                None
+                if context_field.is_cuda
+                else self._i64(
+                    [row_stride_i32(scratch) for scratch in conv_scratches], device
+                )
             ),
             # A plane spaces its pages by its widest tenant, so PLE layers on
             # different planes can have different page strides.
             "conv_dst_stride": self._i64(
-                [row_stride_i32(field) for field in conv_fields], device
+                [
+                    field.stride(0) if context_field.is_cuda else row_stride_i32(field)
+                    for field in conv_fields
+                ],
+                device,
             ),
             "conv_row_bytes": conv_fields[0][0].numel() * conv_fields[0].element_size(),
         }
@@ -472,20 +477,16 @@ class Qwen4ExpPLEBackend(AttentionBackend):
             )
         if pages.is_cuda:
             compact = (self._ple_verify_scratch[self._conv_field_ids[0]], width)
-            src_strides = None
-            dst_strides = tables["conv_element_strides"]
         else:
             compact = None
-            src_strides = tables["conv_src_stride"]
-            dst_strides = tables["conv_dst_stride"]
         copy_state_rows(
             tables["conv_src"],
             tables["conv_dst"],
             src_rows,
             dst_rows,
             row_bytes=tables["conv_row_bytes"],
-            src_row_strides=src_strides,
-            dst_row_strides=dst_strides,
+            src_row_strides=tables["conv_src_stride"],
+            dst_row_strides=tables["conv_dst_stride"],
             compact=compact,
         )
         self._verify_commit_ctx = None

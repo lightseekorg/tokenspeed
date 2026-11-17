@@ -153,6 +153,10 @@ class PLELookup(nn.Module):
         prefix: str,
     ):
         super().__init__()
+        if enable_hot_cache and not offload:
+            raise ValueError(
+                "--enable-ple-hot-cache requires ple_offload_embedding=true"
+            )
         from tokenspeed.runtime.layers.vocab_parallel_embedding import (
             VocabParallelEmbedding,
         )
@@ -288,11 +292,7 @@ class PLELookup(nn.Module):
         if self.offload_embedding:
             out = self.allocate_lookup_buffer(gathered_ids.shape[0], ids.device)
             cache = self._host_cache
-            use_cache = (
-                cache is not None
-                and self.ngram_embedding_scale is None
-                and cache.can_gather(gathered_ids)
-            )
+            use_cache = cache is not None and cache.can_gather(gathered_ids)
             if self._gather_stream is None:
                 self._gather_stream = torch.cuda.Stream(device=ids.device)
             stream = self._gather_stream

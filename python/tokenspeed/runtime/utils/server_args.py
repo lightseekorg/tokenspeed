@@ -3947,7 +3947,9 @@ class ServerArgs:
             default=ServerArgs.enable_ple_hot_cache,
             help="Cache frequently read rows of eligible offloaded Qwen4-Exp PLE "
             "tables in GPU memory. Disabled by default. "
-            "TOKENSPEED_PLE_HOST_CACHE_SLOTS controls the number of slots.",
+            "Requires PLE offloading and a supported table format and CUDA kernel. "
+            "Small lookups and CUDA graphs use regular host gather. "
+            "TOKENSPEED_PLE_HOST_CACHE_SLOTS controls the number of slots (0 disables).",
         )
         parser.add_argument(
             "--sampling-backend",

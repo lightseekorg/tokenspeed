@@ -6,15 +6,27 @@ and BF16 output. Cached and regular host lookups run on the gather stream.
 Each TP or DP rank owns its cache and uses shard-local row indices as tags.
 Queries outside the shard produce zeros and leave the cache untouched. The
 cache handles eager lookups of at least 256 tokens, including prefill graph
-breaks. Smaller lookups, CUDA graph capture, and per-row scales use the
-regular host gather.
+breaks. Sizes outside the supported int32 row-index range and smaller lookups
+use regular host gather. CUDA graph capture records regular host gather,
+and replay keeps that path. Per-row scales belong to the device-resident table
+path; hot cache requires offloading and supports scalar-scaled FP8 or BF16.
+
+Explicitly enabling hot cache without offloading is an error. Unsupported
+hardware, shapes or dtypes, invalid host table layouts or shard bounds, and a
+missing compiled CUDA gather library fail initialization instead of silently
+disabling the cache. Setting `TOKENSPEED_PLE_HOST_CACHE_SLOTS=0` explicitly
+disables it and logs the reason; successful initialization logs the supported
+lookup range and graph behavior.
 
 The gather sorts and deduplicates fully owned 64-token tiles per head and
-writes BF16 values in input order. On a cache miss it stages the raw bytes
+writes BF16 values in input order. A tile containing out-of-shard IDs or an
+ID span of at least `2**26` uses individual reads while retaining the cache.
+On a cache miss it stages the raw bytes
 already read over UVA. A separate stream copies the last miss for each
 direct-mapped slot from staging to HBM. The next cached gather waits for the
 fill event before reading the tags. The model owner invalidates cached rows
-before changing the embedding weights.
+before changing the embedding weights. Callers select the cached path with
+`can_gather` before invoking `gather`; the latter does not repeat size checks.
 
 ## Convolution and state
 
@@ -30,3 +42,8 @@ requested. A CTA loads the channel's weights once and broadcasts them over
 the tile. Tokens resolve their own request and position, so a tile can span a
 request boundary. Short batches and batches that write verify windows use one
 token per CTA.
+
+Verify metadata allocates only the strides used by its layout. CUDA compact
+scratch needs no source stride table and uses destination strides in state
+elements. Full-window copies on non-CUDA devices keep source and destination
+strides in int32 units.

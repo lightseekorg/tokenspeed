@@ -408,6 +408,7 @@ def test_host_cache_keeps_aligned_and_tail_rows_until_invalidated(dim, dtype):
         ids[:, 1] += len(table)
         ids[-1, 0] += 1
         out = torch.empty((ids.numel(), dim), device=device, dtype=torch.bfloat16)
+        assert cache.can_gather(ids)
         return cache.gather(table, ids, out, scale=scale).cpu().view(tokens, 16, dim)
 
     def expected(tokens):
@@ -424,6 +425,47 @@ def test_host_cache_keeps_aligned_and_tail_rows_until_invalidated(dim, dtype):
         torch.testing.assert_close(run(259), expected(259), rtol=0, atol=0)
     cache.invalidate()
     assert not run(259).any()
+
+
+def test_host_cache_reports_initialization_failures(monkeypatch, tmp_path, caplog):
+    import logging
+
+    from tokenspeed_kernel.ops.ple.host_cache import PLEHostCache
+    from tokenspeed_kernel.thirdparty.cuda import ple_host_gather as native
+
+    table = torch.ones(32, 160, dtype=torch.bfloat16).pin_memory()
+    args = dict(
+        slot_count=512,
+        table=table,
+        ngram_heads=16,
+        output_dtype=torch.bfloat16,
+        vocab_start=100,
+        vocab_end=132,
+        device=torch.device("cuda", torch.cuda.current_device()),
+    )
+    with caplog.at_level(logging.INFO):
+        assert PLEHostCache.create(**(args | {"slot_count": 0})) is None
+    assert "TOKENSPEED_PLE_HOST_CACHE_SLOTS=0" in caplog.text
+    for override, message in (
+        ({"device": torch.device("cpu")}, "NVIDIA CUDA"),
+        ({"table": table.flatten()}, "shape"),
+        ({"table": torch.ones_like(table, pin_memory=False)}, "pinned CPU"),
+        ({"table": table[:, ::2]}, "contiguous"),
+        ({"vocab_end": 133}, "shard bounds"),
+        ({"ngram_heads": 8}, "supports 16 heads"),
+        ({"table": table[:, :128].contiguous().pin_memory()}, "head dimensions"),
+        ({"table": table.float().pin_memory()}, "storage"),
+        ({"output_dtype": torch.float16}, "BF16 output"),
+    ):
+        with pytest.raises((ValueError, RuntimeError), match=message):
+            PLEHostCache.create(**(args | override))
+    native.ple_staged_gather.cache_clear()
+    monkeypatch.setattr(native, "_MODULE_PATH", tmp_path / "missing.so")
+    try:
+        with pytest.raises(RuntimeError, match="Reinstall tokenspeed-kernel"):
+            PLEHostCache.create(**args)
+    finally:
+        native.ple_staged_gather.cache_clear()
 
 
 def test_conv_state_large_request_offset(pdl):

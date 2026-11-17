@@ -55,6 +55,21 @@ def _lookup(mapping):
     )
 
 
+def test_hot_cache_requires_offloading():
+    with pytest.raises(ValueError, match="requires ple_offload_embedding=true"):
+        ple_lookup.PLELookup(
+            _mapping_class()(rank=0, world_size=1),
+            vocab_size=256,
+            ngram_heads=16,
+            head_dim=160,
+            storage_dtype=None,
+            output_dtype=torch.bfloat16,
+            offload=False,
+            enable_hot_cache=True,
+            prefix="",
+        )
+
+
 def _worker(rank, rendezvous, tp_size):
     dist.init_process_group(
         "gloo",
