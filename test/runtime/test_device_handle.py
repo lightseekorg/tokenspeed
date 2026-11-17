@@ -706,8 +706,12 @@ class _PeerOutbox:
         self._trace.append("reads_ready")
 
 
-def _peer_handle(trace):
-    handle = _handle(trace, peer_outbox=_PeerOutbox(trace))
+def _peer_handle(trace, host_cache_executor=None):
+    handle = _handle(
+        trace,
+        peer_outbox=_PeerOutbox(trace),
+        host_cache_executor=host_cache_executor,
+    )
     executor = handle._executor
     executor.copy_cache_pages = lambda pairs: trace.append("copy")
     executor.zero_cache_pages = lambda pages: trace.append("zero")
@@ -749,6 +753,31 @@ def test_peer_reads_start_behind_the_plans_device_work(wire_ops, forwards):
         ("default waits", "execution-stream"),
         ("record", handle._executor.default_stream),
         *(["forward"] if forwards else []),
+        "wait_fence",
+        "reads_ready",
+    ]
+
+
+def test_peer_reads_start_behind_the_loads_of_the_local_hit(wire_ops):
+    """A landing that extends a local Host hit: the reader's first forward
+    runs in a later plan, which does not wait for this plan's loads, so the
+    READs -- whose end releases the request -- start behind them."""
+    trace: list = []
+    handle = _peer_handle(trace, host_cache_executor=_l2_with_load_stream(trace))
+
+    _execute(
+        handle,
+        _plan(cache=[_LoadBackOp("load")], has_peer_fetches=True),
+        None,
+    )
+
+    assert trace == [
+        "write_backs",
+        ("default waits", "execution-stream"),
+        "load_backs",
+        ("default waits", "execution-stream"),
+        ("default waits", "load-stream"),
+        ("record", handle._executor.default_stream),
         "wait_fence",
         "reads_ready",
     ]
@@ -1010,17 +1039,42 @@ def _decode_peer(trace):
     return _Peer()
 
 
-def _receiving_handle(trace, *, prepare=None):
-    handle = _handle(trace, kv_transfer=_decode_peer(trace))
+def _receiving_handle(trace, *, prepare=None, host_cache_executor=None):
+    handle = _handle(
+        trace,
+        kv_transfer=_decode_peer(trace),
+        host_cache_executor=host_cache_executor,
+    )
     executor = handle._executor
     executor.prepare_remote_cache_slots = prepare or (
         lambda slots: trace.append(("prepare", slots))
     )
     executor.reset_remote_prefill_cache_lengths = lambda op: trace.append("reset")
-    executor.zero_cache_pages = lambda pages: SimpleNamespace(
-        synchronize=lambda: trace.append("wait_zeroing")
-    )
+    executor.zero_cache_pages = lambda pages: trace.append("zero")
+
+    class _Event:
+        def record(self, stream) -> None:
+            trace.append(("record", stream))
+
+        def synchronize(self) -> None:
+            trace.append("wait_fence")
+
+    executor.device_module = SimpleNamespace(Event=_Event)
     return handle
+
+
+def _l2_with_load_stream(trace):
+    """A Host L2 executor that records its submissions and names its load
+    stream."""
+    return SimpleNamespace(
+        submit_write_backs=lambda ops, *, prerequisite_stream, fence_stream: (
+            trace.append("write_backs")
+        ),
+        submit_load_backs=lambda ops, *, prerequisite_stream: trace.append(
+            "load_backs"
+        ),
+        load_stream="load-stream",
+    )
 
 
 def _remote_prefill():
@@ -1028,25 +1082,62 @@ def _remote_prefill():
 
 
 @pytest.mark.parametrize("forwards", [True, False])
-def test_a_remote_prefill_pulls_behind_the_rounds_forward(forwards):
-    """The zeroing fence the pull waits on is ordered behind the step in
-    flight; the round's forward is launched first so that wait never delays
-    its launch. A round without a batch still pulls."""
+@pytest.mark.parametrize("zeroes", [True, False])
+def test_a_remote_prefill_pulls_behind_the_rounds_forward(forwards, zeroes):
+    """The landing fence the pull waits on is recorded on the default stream
+    behind the zeroing and the forwards in flight, whether or not the plan
+    zeroes anything; the round's forward is launched first so that wait never
+    delays its launch. A round without a batch still pulls."""
     trace: list = []
     handle = _receiving_handle(trace)
     remote_prefill = _remote_prefill()
 
     _execute(
         handle,
-        _plan(pages_to_zero=[5], remote_prefill=remote_prefill),
+        _plan(pages_to_zero=[5] if zeroes else [], remote_prefill=remote_prefill),
         _planned(num_extends=0) if forwards else None,
     )
 
     assert trace == [
+        *(["zero"] if zeroes else []),
+        ("default waits", "execution-stream"),
+        ("record", handle._executor.default_stream),
         ("prepare", [3]),
         "reset",
         *(["forward"] if forwards else []),
-        "wait_zeroing",
+        "wait_fence",
+        ("pull", remote_prefill),
+    ]
+
+
+def test_a_remote_prefill_pulls_behind_the_loads_of_its_host_hit(wire_ops):
+    """A D admission's Host hit loads below its landing. The landed request's
+    first forward runs in a later plan, whose layerwise load waits name only
+    that plan's loads, so the pull -- whose end releases the request -- waits
+    for this plan's loads, and for the stores reading the victims it
+    regranted."""
+    trace: list = []
+    store, load = _WriteBackOp("store"), _LoadBackOp("load")
+    handle = _receiving_handle(trace, host_cache_executor=_l2_with_load_stream(trace))
+    remote_prefill = _remote_prefill()
+
+    _execute(
+        handle,
+        _plan(pages_to_zero=[5], cache=[store, load], remote_prefill=remote_prefill),
+        None,
+    )
+
+    assert trace == [
+        "write_backs",
+        "zero",
+        ("default waits", "execution-stream"),
+        "load_backs",
+        ("default waits", "execution-stream"),
+        ("default waits", "load-stream"),
+        ("record", handle._executor.default_stream),
+        ("prepare", [3]),
+        "reset",
+        "wait_fence",
         ("pull", remote_prefill),
     ]
 
