@@ -257,7 +257,8 @@ def _routed_sum_single_pass(num_tokens: int, block: int, has_map: bool) -> bool:
         # each program reads all of its token's routes: one launch is slower
         # from 8 to 128 tokens, about even at 136-144 and faster from 152.
         return has_map or num_tokens >= ROUTED_SUM_SINGLE_PASS_MIN_TOKENS_CDNA4
-    return False
+    # GB200, top-8 with 1/2-1/8 of the routes on this rank: one launch wins at 65-2048 tokens, widths 4096-16384.
+    return has_map and current_platform().is_nvidia
 
 
 @register_kernel(
@@ -360,19 +361,20 @@ def _routed_input_scale_rmsnorm_sum_token_kernel(
         route = token * topk + slot
         if HAS_MAP:
             row = tl.load(map_ptr + route)
-            row_mask = dim_mask & (row >= 0)
-            row = tl.maximum(row, 0).to(tl.int64)
         else:
-            row_mask = dim_mask
-            row = route.to(tl.int64)
-        values = tl.load(
-            routes_ptr + row * row_stride + dims, mask=row_mask, other=0.0
-        ).to(tl.float32)
-        product = values * norm_weight
-        variance = tl.sum(product * product, axis=0) / width
-        inv_rms = tl.rsqrt(variance + eps)
-        route_weight = tl.load(route_weights_ptr + route).to(tl.float32)
-        acc += product * inv_rms * route_weight
+            row = route
+        # A route another rank owns (-1) would add exact zeros; skip its reduction.
+        if row >= 0:
+            values = tl.load(
+                routes_ptr + row.to(tl.int64) * row_stride + dims,
+                mask=dim_mask,
+                other=0.0,
+            ).to(tl.float32)
+            product = values * norm_weight
+            variance = tl.sum(product * product, axis=0) / width
+            inv_rms = tl.rsqrt(variance + eps)
+            route_weight = tl.load(route_weights_ptr + route).to(tl.float32)
+            acc += product * inv_rms * route_weight
     tl.store(out_ptr + token * width + dims, acc, mask=dim_mask)
 
 
