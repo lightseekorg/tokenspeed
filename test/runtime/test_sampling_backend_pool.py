@@ -852,6 +852,7 @@ class TestCudaGraphSamplingVariants:
 
         backend = FakeSamplingBackend()
         wrapper = object.__new__(ForwardStepRunner)
+        wrapper.dp_local_graph = False
         wrapper.drafter = None
         wrapper._decode_query_tokens = None
         wrapper.sampling_backend = backend

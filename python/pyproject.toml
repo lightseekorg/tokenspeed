@@ -34,7 +34,13 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
 ]
 dependencies = [
-    "aiohttp",
+    # Floor at the first release line with cp312 wheels: when PyPI serves a
+    # bad Content-Type for a dependency's index page (observed for multidict),
+    # pip skips it and silently backtracks aiohttp to pre-1.0 releases that no
+    # longer declare it; those cannot even import on Python 3.12. With every
+    # admissible aiohttp requiring multidict, the same flake instead fails the
+    # resolver and the CI install retry loop handles it.
+    "aiohttp>=3.9",
     "compressed-tensors",
     "dill",
     "einops",

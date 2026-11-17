@@ -48,6 +48,7 @@ class DraftModel(nn.Module):
 
 def _make_drafter(mapping):
     drafter = object.__new__(DeepseekV41DSpark)
+    drafter.dp_local_graph = False
     drafter.draft_model = DraftModel(mapping)
     drafter.tp_group = mapping.attn.tp_group
     drafter.verify_feedback = VerifyFeedback(draft_width=5)
@@ -73,6 +74,8 @@ def _make_drafter(mapping):
     drafter._verify_layout_counts = None
     drafter._verify_budget_graphs = {}
     drafter._verify_budget_buffers = {}
+    drafter._verify_budget_counts = {}
+    drafter._verify_budget_context_bounds = None
     return drafter
 
 
@@ -89,6 +92,18 @@ def _serving_budget(drafter, world):
         global_num_decodes=[4] * world,
     )
     return drafter.prepare_decode_graph_token_layout(ctx, actual_bs=4, padded_bs=4)
+
+
+def _publish_context_feedback(drafter, ids, slots, context_lengths):
+    drafter.verify_feedback.prepare(ids, slots, num_extends=0)
+    snapshot = drafter.verify_feedback.snapshot()
+    drafter.verify_feedback.publish(
+        snapshot,
+        [[0.0] * drafter.block_size for _ in slots],
+        context_lengths=context_lengths,
+    )
+    for _ in range(2):
+        drafter.verify_feedback.prepare(ids, slots, num_extends=0)
 
 
 @pytest.mark.skipif(
@@ -308,9 +323,22 @@ def test_budget_without_forward_thread_sync(topology):
         )
     for _ in range(2):
         drafter.verify_feedback.prepare(ids, slots, num_extends=0)
+    missing_feedback_counts = dict(drafter._verify_budget_counts)
     with _strict_serving_sync():
         selected = _serving_budget(drafter, world)
     assert selected == (12 if topology == "tp" else 24)
+    if topology != "tp" and rank == 0:
+        assert (
+            drafter._verify_budget_counts.get((4, 24, "feedback_unavailable"), 0)
+            == missing_feedback_counts.get((4, 24, "feedback_unavailable"), 0) + 1
+        )
+    # Startup must use the same DP feedback agreement, including native fallback
+    # when any rank is not ready; TP-only selection would disagree at TP1/DP>1.
+    with _strict_serving_sync():
+        startup_selected = drafter._prepare_verify_budget(
+            actual_bs=4, padded_bs=4, rank_sizes=[4] * world
+        )
+    assert startup_selected == selected
 
     drafter.verify_feedback.publish(
         drafter.verify_feedback.snapshot(), scores, context_lengths=[120] * 4
@@ -328,14 +356,220 @@ def test_budget_without_forward_thread_sync(topology):
         rtol=0,
         atol=0,
     )
-    # Startup preparation broadcasts only inside each TP group.
-    with _strict_serving_sync():
-        selected = drafter._prepare_calibrated_budget(actual_bs=4, padded_bs=4)
-    assert selected == 12
+    # Startup forces each measured tier while retaining the complete cost
+    # ladder, so host selection does the same work as the installed policy.
+    capacities = drafter.decode_graph_query_capacities(4)
+    for measured_capacity in capacities[:-1]:
+        drafter.install_verify_calibration(
+            (
+                VerifyCalibration(
+                    4,
+                    1,
+                    16384,
+                    6,
+                    1e9,
+                    tuple(
+                        (capacity, 1.0 if capacity == measured_capacity else 1e9)
+                        for capacity in capacities[:-1]
+                    ),
+                    8,
+                ),
+            ),
+            policy_ms=0.0,
+        )
+        with _strict_serving_sync():
+            selected = drafter._prepare_verify_budget(
+                actual_bs=4, padded_bs=4, rank_sizes=[4] * world
+            )
+        assert selected == measured_capacity
+        assert drafter._verify_indptr[-1].item() == measured_capacity
     torch.testing.assert_close(
         drafter._verify_budget_buffers[4].scores.cpu(),
         torch.tensor(scores),
         rtol=0,
         atol=0,
     )
+
+    capacities = drafter.decode_graph_query_capacities(4)
+
+    def profile(min_context, max_context, preferred_capacity):
+        return VerifyCalibration(
+            4,
+            min_context,
+            max_context,
+            6,
+            1e9,
+            tuple(
+                (capacity, 0.01 if capacity == preferred_capacity else 1e9)
+                for capacity in capacities[:-1]
+            ),
+            8,
+        )
+
+    profiles = (
+        profile(1, 8192, capacities[1]),
+        profile(8193, 32768, capacities[2]),
+        profile(32769, 65536, capacities[4]),
+    )
+    drafter.install_verify_calibration(profiles, policy_ms=0.0)
+
+    def assert_context_bucket(context_lengths, expected_capacity):
+        counts_before = dict(drafter._verify_budget_counts)
+        _publish_context_feedback(drafter, ids, slots, context_lengths)
+        with _strict_serving_sync():
+            selected = _serving_budget(drafter, world)
+        assert selected == expected_capacity
+        if expected_capacity != 24:
+            assert drafter._verify_indptr[-1].item() == expected_capacity
+        if rank == 0:
+            reason = "packed" if expected_capacity != 24 else "uncalibrated"
+            key = (4, expected_capacity, reason)
+            assert drafter._verify_budget_counts.get(key, 0) == (
+                counts_before.get(key, 0) + 1
+            )
+
+    # The largest active request determines a uniform calibrated cost bucket,
+    # even when one rank or several DP ranks span multiple regions.
+    assert_context_bucket([4096, 16384, 4096, 16384], capacities[2])
+    if topology != "tp":
+        contexts = [20000 if mapping.attn.dp_rank % 2 == 0 else 40000] * 4
+        assert_context_bucket(contexts, capacities[4])
+
+    # The feedback bound includes the 12-token N-2 allowance at both edges.
+    for context_length, expected in (
+        (8180, capacities[1]),
+        (8181, capacities[2]),
+        (32756, capacities[2]),
+        (32757, capacities[4]),
+    ):
+        assert_context_bucket([context_length] * 4, expected)
+    assert_context_bucket([65525] * 4, 24)
+
+    # A profile gap remains a native full-width fallback.
+    drafter.install_verify_calibration((profiles[0],), policy_ms=0.0)
+    assert_context_bucket([16384] * 4, 24)
+
+    # A covered context can still choose the native path when packed costs lose.
+    full_profile = VerifyCalibration(
+        4,
+        1,
+        8192,
+        6,
+        1.0,
+        tuple((capacity, 1e9) for capacity in capacities[:-1]),
+        8,
+    )
+    drafter.install_verify_calibration((full_profile,), policy_ms=0.0)
+    _publish_context_feedback(drafter, ids, slots, [4096] * 4)
+    full_counts_before = dict(drafter._verify_budget_counts)
+    with _strict_serving_sync():
+        assert _serving_budget(drafter, world) == 24
+    if rank == 0:
+        assert drafter._verify_budget_counts.get((4, 24, "full"), 0) == (
+            full_counts_before.get((4, 24, "full"), 0) + 1
+        )
+    torch.distributed.barrier()
+
+
+@pytest.mark.skipif(
+    int(os.environ.get("WORLD_SIZE", "1")) < 2,
+    reason="requires torchrun with multiple GPUs",
+)
+@torch.inference_mode()
+def test_local_graph_budgets_allow_independent_fallback_and_padding():
+    world = int(os.environ["WORLD_SIZE"])
+    rank = int(os.environ["RANK"])
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    mapping = Mapping(
+        rank=rank,
+        world_size=world,
+        attn_tp_size=1,
+        attn_dp_size=world,
+        moe_ep_size=world,
+    )
+    process_group_manager.init_distributed(
+        mapping,
+        distributed_init_method="env://",
+        backend="nccl",
+        timeout=120,
+        device_id=torch.device("cuda", int(os.environ["LOCAL_RANK"])),
+    )
+    process_group_manager.init_process_group(tuple(range(world)), backend="nccl")
+    drafter = _make_drafter(mapping)
+    # This fixture supplies the real budget/layout owner without model weights.
+    # Loaded-model admission is exercised by the model and service tests.
+    drafter.dp_local_graph = True
+    drafter.adaptive_min_batch_size = 1
+    drafter.verify_budget_policy = VerifyBudgetPolicy(True, 1, 6, 0.02)
+    stream = torch.cuda.Stream()
+    pool = torch.cuda.graph_pool_handle()
+    for size in (1, 2, 4):
+        drafter.capture_round_graphs(size, stream=stream, pool=pool)
+    drafter.install_verify_calibration(
+        (
+            VerifyCalibration(4, 1, 16384, 6, 100.0, ((12, 1.0),), 8),
+            VerifyCalibration(2, 1, 16384, 6, 100.0, ((6, 1.0),), 8),
+        ),
+        policy_ms=0.0,
+    )
+    sizes = [((4, 3, 2, 0)[peer % 4]) for peer in range(world)]
+    actual = sizes[rank]
+    padded = (4, 4, 2, 1)[rank % 4]
+    ids, slots = [f"local-{rank}-{i}" for i in range(actual)], list(range(actual))
+    drafter.verify_feedback.prepare(ids, slots, num_extends=0)
+    if rank % 4 != 1:
+        drafter.verify_feedback.publish(
+            drafter.verify_feedback.snapshot(),
+            [[0.0] * 5 for _ in slots],
+            context_lengths=[120] * actual,
+        )
+    for _ in range(2):
+        drafter.verify_feedback.prepare(ids, slots, num_extends=0)
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=actual,
+        num_extends=0,
+        input_num_tokens=actual * 6,
+        forward_mode=ForwardMode.DECODE,
+        output_layout=ForwardOutputLayout(0, 0, actual, 6),
+        global_bs=sizes,
+        global_num_decodes=sizes,
+        global_num_tokens=[size * 6 for size in sizes],
+        all_decode_or_idle=True,
+    )
+    selected = drafter.prepare_decode_graph_token_layout(
+        ctx, actual_bs=actual, padded_bs=padded
+    )
+    expected = (12, 24, 6, 6)[rank % 4]
+    assert selected == expected
+    gathered = [None] * world
+    torch.distributed.all_gather_object(gathered, selected)
+    assert gathered == [(12, 24, 6, 6)[peer % 4] for peer in range(world)]
+    if selected != padded * 6:
+        counts = drafter._verify_indptr[: padded + 1].diff().cpu().tolist()
+        assert sum(counts) <= selected
+        assert all(1 <= count <= 6 for count in counts[:actual])
+        assert counts[actual:] == [1] * (padded - actual)
+        assert drafter._verify_budget_buffers[padded].valid.item()
+
+    # A padded rank acquiring feedback can shorten independently on its next
+    # round; no other rank needs to enter a budget collective for this call.
+    if rank % 4 == 1:
+        drafter.verify_feedback.publish(
+            drafter.verify_feedback.snapshot(),
+            [[0.0] * 5 for _ in slots],
+            context_lengths=[120] * actual,
+        )
+        for _ in range(2):
+            drafter.verify_feedback.prepare(ids, slots, num_extends=0)
+        assert (
+            drafter.prepare_decode_graph_token_layout(
+                ctx, actual_bs=actual, padded_bs=padded
+            )
+            == 12
+        )
+        counts = drafter._verify_indptr[: padded + 1].diff().cpu().tolist()
+        assert counts[-1] == 1
+        assert sum(counts) == 12
     torch.distributed.barrier()

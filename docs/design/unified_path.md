@@ -1372,7 +1372,9 @@ its candidate index and a tree uses node depth. For example, a 2049-token prompt
 predicts position 2049 whether computed as `1024 + 1024 + 1`,
 `130 cached + 1024 + 895`, or 2048 cached tokens plus one decode input.
 Constructing the base position does not implement MTP acceptance/residual RNG
-or domain separation; multi-token FlashInfer still uses its existing coins.
+or domain separation; multi-token FlashInfer uses its existing coins except
+for sampled adaptive V4.1 DSpark, whose CuTe verifier keys each draw by request,
+position and draft/acceptance/rejection/bonus namespace.
 The Triton chain verify under `--enable-speculative-sampling` (DFLASH with a
 DFlash2 draft) keys its accept coins and draft noise by salted offsets
 disjoint from these positions. A row with a recorded draft q then emits an
@@ -1381,15 +1383,17 @@ rows and rows without a q keep the position-keyed token.
 
 With `sampling_stream=per-request`, FlashInfer and FlashInferFull route both
 `sample()` and `verify(N=1)` through the existing Gumbel pool kernel, keyed by
-request seed and this absolute position. Neither consumes the CPU coin generator.
+request seed and this absolute position. Sampled adaptive V4.1 DSpark uses the
+CuTe probability sampler for both. Neither consumes the CPU coin generator.
 Random-stream policy, verification geometry, and TP agreement are separate:
 
 * `per_request_stream` selects the position-keyed direct sampler for a window
   without draft candidates. `has_draft_candidates` describes the window, not a
   model family: wider windows still require acceptance and residual sampling.
 * `_prepare_step_hook` skips coin preparation only where no coins are consumed.
-  Wider per-request windows currently fall through to `_refill_legacy_coins`;
-  they do not yet have position-keyed accept/residual randomness. That refill
+  Wider per-request windows outside sampled adaptive V4.1 DSpark fall through
+  to `_refill_legacy_coins`; they do not yet have position-keyed accept/residual
+  randomness. That refill
   owns only generator advancement and buffer writes, not sampler selection.
 * Each selected sampling implementation declares `needs_tp_sync` locally.
   The common epilogue gathers DP-owned rows or broadcasts replicated TP outputs
@@ -2806,15 +2810,63 @@ state stays sized by `--max-num-seqs`.
 ### Adaptive DSpark query capacities
 
 Graph variants can include a query-capacity suffix (variant:queryN).
-Native full-width execution retains its original key. Packed verification
-refreshes decode_query_indptr and packed rows in persistent buffers before
+Native full-width execution retains its original key. Buckets above the layout
+kernel's token bound retain only native full-width capture and replay.
+Packed verification refreshes decode_query_indptr and packed rows in persistent buffers before
 replay; V4.1 pointer-stable views are keyed by (bs, num_tokens).
+After target forward, borrowed input storage and collective counts are restored.
+The context's input_num_tokens keeps the packed target extent until sampling and
+NaN checks consume the target outputs.
 
-Attention DP ranks agree on one physical capacity while actual request
+By default attention DP ranks agree on one physical capacity while actual request
 counts may differ or be zero. Padding retains one physical anchor, contributes
 no acceptance reward, writes to the dummy slot and discards outputs.
 The live-row mask must exclude padding from expert-load accounting.
 
-DP budget metadata uses the global attention host group. Startup's
-authoritative TP packet broadcast uses a TP-local host group: different
-DP groups must not supply different roots to the same global collective.
+`--enable-dp-local-cuda-graph` selects request buckets and target query
+capacities independently on each attention-DP replica. The runner still agrees
+the graph/eager phase from global decode-or-idle metadata and the capture
+ladder bound; an idle rank replays its smallest graph and participates in the
+same EP sequence. The drafter declares support and validates the loaded target
+and draft. V4.1 DSpark with MegaMoE and attention/dense/MoE/head TP1 is the
+initial supported combination. Its captured model contexts carry local row
+counts rather than fabricated peer extents; MegaMoE's fixed-capacity symmetric
+buffer supplies the common communication geometry. Scheduler write reservations
+are unchanged.
+
+Serving and startup profiling use the same budget policy. Local DP graphs
+select from local N-2 confidence and context feedback, including padded local
+request buckets; missing local feedback retains only that rank's full width.
+This serving decision has no cross-DP collective. Shared graphs retain agreement.
+DP budget metadata uses the global attention host group; TP-only metadata
+uses a TP-local host group. Startup's authoritative TP packet broadcast also
+uses a TP-local host group: different DP groups must not supply different roots
+to the same global collective. Startup uses equal synthetic request counts on
+all ranks and measures host agreement through GPU completion with wall time.
+The native full-width measurement skips budget selection. Post-graph feedback
+collection, including pinned D2H copies/events and CPU publication, is outside
+all calibration intervals. Fresh pinned staging storage follows the overlap
+lifetime contract; reuse requires retiring both DMA and its CPU consumer.
+The drafter owns startup calibration orchestration. The runner supplies graph
+lookup by logical capacity and lends its normal metadata preparation through
+a context that synchronizes and restores capture metadata on exit.
+Packed prefixes do not have uniform rows per request, so they leave MegaMoE's
+request-ratio padding filter disabled; native fixed-width replays retain it.
+
+Serving selects a calibration interval by the local upper feedback-context
+bound for local graphs, or the global upper bound for shared graphs, including
+the lookahead margin. A heterogeneous batch does not require
+all request lengths to fit that interval. The uniform endpoint supplies a
+representative cost estimate, not a latency bound for the mixed batch; missing
+coverage of the upper bound retains native verification. Periodic host decision
+counts distinguish packed selection, full selection, missing feedback and
+missing calibration without adding device reads or collectives. Startup clears
+these counters before serving.
+
+Sampled V4.1 DSpark uses the same packed-query boundary for full-width and
+shortened verification. The sampler returns ordinary fixed-width outputs
+and an accepted length including the residual or bonus token, so runtime
+frontier and Engram commit remain shared. Proposal distributions belong to
+RuntimeStates, are invalidated at PD landing and slot reuse, and are exported
+with retraction state. Query capacity does not shorten the scheduler's
+reserved write extent. The sampled path currently requires attention TP1.

@@ -840,10 +840,15 @@ def test_public_ops_select_the_balanced_path_only_with_a_schedule(tmp_path) -> N
         [900 * PAGE_SIZE + 3, 1, 1, 1], 1, VERIFY_Q_HEADS, VERIFY_KV_HEADS, 64, 37
     )
     plain_call = dict(q=plain["q"], k_cache=plain["k_cache"], v_cache=plain["v_cache"])
-    assert not mha_decode_takes_schedule(max_seqlen_q=1, **plain_call)
+    assert not mha_decode_takes_schedule(
+        max_seqlen_q=1, **plain_call, block_draft=False
+    )
     assert (
         mha_decode_schedule(
-            cache_seqlens=plain["cache_seqlens"], max_seqlen_q=1, **plain_call
+            cache_seqlens=plain["cache_seqlens"],
+            max_seqlen_q=1,
+            **plain_call,
+            block_draft=False,
         )
         is None
     )
@@ -862,15 +867,20 @@ def test_public_ops_select_the_balanced_path_only_with_a_schedule(tmp_path) -> N
         v_cache=inputs["v_cache"],
         max_seqlen_q=VERIFY_TOKENS,
     )
-    assert mha_decode_takes_schedule(**call)
-    assert not mha_decode_takes_schedule(window_left=511, **call)
+    assert mha_decode_takes_schedule(**call, block_draft=False)
+    assert not mha_decode_takes_schedule(window_left=511, **call, block_draft=False)
     assert (
         mha_decode_schedule(
-            cache_seqlens=inputs["cache_seqlens"], window_left=511, **call
+            cache_seqlens=inputs["cache_seqlens"],
+            window_left=511,
+            **call,
+            block_draft=False,
         )
         is None
     )
-    schedule = mha_decode_schedule(cache_seqlens=inputs["cache_seqlens"], **call)
+    schedule = mha_decode_schedule(
+        cache_seqlens=inputs["cache_seqlens"], **call, block_draft=False
+    )
 
     ShapeCapture.reset()
     ShapeCapture.get().enabled = True
@@ -884,6 +894,7 @@ def test_public_ops_select_the_balanced_path_only_with_a_schedule(tmp_path) -> N
                     max_seqlen_k=1 << 20,
                     schedule=passed,
                     **call,
+                    block_draft=False,
                 ),
                 expected,
             )

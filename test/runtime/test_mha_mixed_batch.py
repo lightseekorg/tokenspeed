@@ -404,6 +404,7 @@ def _block_runtime():
     # wire_target's choice for a one-rank layout: the lookup is the input.
     drafter._first_layer_input = "full"
     runner = ForwardStepRunner.__new__(ForwardStepRunner)
+    runner.dp_local_graph = False
     runner.attn_backend, runner.draft_attn_backend = routers
     runner.drafter = drafter
     runner.max_tokens_per_req = 16
@@ -575,8 +576,10 @@ def test_block_draft_mixed_to_decode_refreshes_all_owners_and_reordered_slots(
         if for_graph_replay:
             # Select the in-graph metadata branch without constructing a GPU
             # stream or graph. The outer CPU test runner denies initialization.
-            capture.setattr(torch.cuda, "is_available", lambda: True)
-            capture.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+            capture.setattr(
+                "tokenspeed.runtime.execution.drafter.dflash.is_current_stream_capturing",
+                lambda device: True,
+            )
         drafter._update_draft_prefix_lengths(decode_ctx, next_accepts)
         assert (
             drafter.draft_seq_lens_buf[:block_bs].tolist() == block_prefixes[:block_bs]

@@ -854,6 +854,7 @@ def test_block_drafter_binds_local_embedding_on_last_pipeline_stage():
 
 def test_deepseek_dspark_wire_target_only_binds_resources():
     drafter = DeepseekV41DSpark.__new__(DeepseekV41DSpark)
+    drafter.dp_local_graph = False
     draft_head = object()
     drafter.draft_model = SimpleNamespace(lm_head=draft_head)
     target = SimpleNamespace(

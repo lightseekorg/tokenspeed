@@ -395,8 +395,8 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         A leaf whose :meth:`refresh_decode_metadata` is exactly those two
         copies (seq_lens clamped to :attr:`decode_seq_lens_floor`) followed
         by :meth:`publish_decode_metadata` returns them, so the router can
-        fill every such leaf with one batched copy; a leaf with any other
-        refresh returns None and refreshes itself.
+        produce its disjoint buffers together with the group tables. A leaf
+        with any other refresh returns None and refreshes itself.
 
         Args:
             bs: Requests to prepare (the padded graph batch under replay).

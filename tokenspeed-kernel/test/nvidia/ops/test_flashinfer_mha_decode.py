@@ -103,7 +103,9 @@ def test_repeated_and_replayed_decodes_agree(seq_lens: list[int], q_len: int):
     inputs = _inputs(seq_lens, q_len, seed=len(seq_lens) * q_len)
 
     def decode() -> torch.Tensor:
-        return mha_decode_with_kvcache(solution="flashinfer", **inputs)
+        return mha_decode_with_kvcache(
+            solution="flashinfer", **inputs, block_draft=False
+        )
 
     first = decode()
     torch.testing.assert_close(first.float(), _reference(inputs), atol=2e-2, rtol=2e-2)

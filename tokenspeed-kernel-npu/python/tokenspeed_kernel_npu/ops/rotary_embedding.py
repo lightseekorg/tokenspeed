@@ -38,16 +38,32 @@ def apply_rope(
     k_rope_out: torch.Tensor | None = None,
 ) -> None:
     """Apply RoPE to Q and K, writing into outputs or the inputs in place."""
+    if not positions.numel():
+        return
+    key_only = not q.numel()
+    # aclnnRopeWithSinCosCache requires a nonempty query even for K-only RoPE.
+    native_q = k.new_zeros((positions.numel(), head_size)) if key_only else q
+    native_positions = positions
+    cache = cos_sin_cache
+    if cache.dtype != native_q.dtype:
+        # Select live rows before casting: long-context tables can be hundreds
+        # of MB, while a decode touches only a few positions. Local positions
+        # address the selected table and preserve the original cast rounding.
+        cache = cache.index_select(0, positions.reshape(-1)).to(native_q.dtype)
+        native_positions = torch.arange(
+            positions.numel(), device=positions.device, dtype=positions.dtype
+        ).reshape_as(positions)
     q_out, k_out = torch_npu.npu_mrope(
-        positions,
-        q,
+        native_positions,
+        native_q,
         k,
-        cos_sin_cache.to(q.dtype),
+        cache,
         head_size,
         mrope_section=[0, 0, 0],
         rotary_mode="half" if is_neox else "interleave",
     )
-    (q if q_rope_out is None else q_rope_out).copy_(q_out)
+    if not key_only:
+        (q if q_rope_out is None else q_rope_out).copy_(q_out)
     (k if k_rope_out is None else k_rope_out).copy_(k_out)
 
 
