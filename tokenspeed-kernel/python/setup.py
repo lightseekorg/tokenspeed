@@ -382,12 +382,7 @@ def _ensure_cuda_compiler() -> None:
 
 # Groups compiled without -use_fast_math, to match torch or Python bit for bit.
 PRECISE_MATH_GROUPS = frozenset(
-    {
-        "eagle_harness_tree",
-        "eagle_harness_policy",
-        "eagle4_candidate",
-        "ple_host_gather",
-    }
+    {"eagle_harness_tree", "eagle_harness_policy", "eagle4_candidate"}
 )
 
 # Kernel groups: each entry produces one .so file.
