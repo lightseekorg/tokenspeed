@@ -222,8 +222,9 @@ public:
         // An additional known candidate at max_tokens, used by storage before
         // any local publication. It is a hint, never proof of cached data.
         std::optional<TailPublication> tail;
-        // Optional precomputation for exactly prefix_hashes and this
-        // coordinator. Omission expands those identities for this probe.
+        // Optional keys prepared by this coordinator from a hash chain that
+        // includes prefix_hashes as a prefix. Consumers stay within
+        // max_tokens and the prompt hash bounds.
         PreparedPrefixKeys prepared_keys;
         // Bounded request-local remote hints; no global tail-table mutation.
         std::span<const std::int32_t> shared_prefix_tokens;
