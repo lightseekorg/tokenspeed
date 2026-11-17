@@ -23,6 +23,7 @@ from __future__ import annotations
 import bisect
 import dataclasses
 import gc
+import os
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import TYPE_CHECKING
@@ -32,6 +33,7 @@ import torch.distributed as dist
 import tqdm
 from tokenspeed_kernel.workspace import capture_session
 
+from tokenspeed.runtime.execution._draft_overlap import DecodeGraphOverlap
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.cudagraph_memory import (
     CapturedLadder,
@@ -508,6 +510,59 @@ class ForwardStepRunner:
         # decode_graph=False while leaving the prefill graph on — decode
         # capture never runs then, but the attribute must still exist.
         self.stream = self.device_module.Stream()
+        self.draft_overlap: DecodeGraphOverlap | None = None
+        overlap = os.environ.get("TOKENSPEED_DRAFT_GRAPH_OVERLAP")
+        if overlap not in (None, "0", "1"):
+            raise ValueError("TOKENSPEED_DRAFT_GRAPH_OVERLAP must be 0 or 1")
+        if overlap == "1":
+            self._enable_draft_overlap()
+        if self.drafter is not None:
+            self.drafter.decode_overlap = self.draft_overlap
+
+    def _enable_draft_overlap(self) -> None:
+        """Check stream and state ownership before enabling draft-tail overlap."""
+        from tokenspeed.runtime.execution.drafter.eagle import Eagle
+
+        config = self.config
+        if (
+            torch.device(self.device).type != "cuda"
+            or torch.version.hip is not None
+            or self.disable
+            or config.pp_size != 1
+            or self.dp_size != 1
+        ):
+            raise ValueError(
+                "Draft graph overlap requires NVIDIA decode graphs, DP1/PP1"
+            )
+        drafter = self.drafter
+        if config.spec_algo != "MTP" or type(drafter) is not Eagle:
+            raise ValueError("Draft graph overlap requires the Eagle MTP drafter")
+        drafter.validate_decode_overlap()
+        if config.grammar_backend != "none":
+            raise ValueError("Draft graph overlap does not support grammar")
+        if (
+            self._expert_load_rows is not None
+            or self._mega_moe_live_requests is not None
+        ):
+            raise ValueError(
+                "Draft graph overlap does not support shared MoE row masks"
+            )
+        target_layers = set(self.token_to_kv_pool.field_layer_range)
+        draft_layers = (
+            set(self.draft_token_to_kv_pool.field_layer_range)
+            if self.draft_token_to_kv_pool is not None
+            else set()
+        )
+        if (
+            not target_layers
+            or not draft_layers
+            or not target_layers.isdisjoint(draft_layers)
+            or self.attn_backend is self.draft_attn_backend
+        ):
+            raise ValueError(
+                "Draft graph overlap requires separate target/draft cache layers and metadata"
+            )
+        self.draft_overlap = DecodeGraphOverlap()
 
     # ------------------------------------------------------------------
     # Graph capture
@@ -601,6 +656,8 @@ class ForwardStepRunner:
         """
         global global_graph_memory_pool
 
+        if self.draft_overlap is not None:
+            self.draft_overlap.release()
         self.graphs.clear()
         self.output_buffers.clear()
         self._metadata_snapshots.clear()
@@ -899,7 +956,12 @@ class ForwardStepRunner:
             )
         with observer:
             # The kernel state captured launches need lives as long as the graph.
-            with capture_session(graph), graph_capture:
+            overlap_capture = (
+                self.draft_overlap.capture(graph)
+                if self.draft_overlap is not None
+                else nullcontext()
+            )
+            with overlap_capture, capture_session(graph), graph_capture:
                 out = run_once()
             # The drafter's own graphs at this batch share the pool and the measure.
             if self.drafter is not None and variant == CUDA_GRAPH_VARIANT_DEFAULT:
@@ -1425,8 +1487,9 @@ class ForwardStepRunner:
                 live_requests[1].fill_(padded_bs)
             try:
                 with (
-                    torch.inference_mode() if self.device == "npu" else nullcontext()
-                ), nvtx_range("graph_replay", color="red"):
+                    torch.inference_mode() if self.device == "npu" else nullcontext(),
+                    nvtx_range("graph_replay", color="red"),
+                ):
                     if self.drafter is not None:
                         self.drafter.replay_decode_graph(
                             graph, bs=bs, graph_bs=padded_bs
