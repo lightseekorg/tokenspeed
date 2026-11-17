@@ -436,6 +436,10 @@ def test_extend_warmup_compiles_the_context_write_into_slot_0():
     # As the loader builds it: BF16 weights, FP32 RoPE table.
     with set_default_torch_dtype(torch.bfloat16), device:
         model = _draft(Mapping(rank=0, world_size=1, attn_tp_size=1), 1024, layers=1)
+    # Unloaded weights are uninitialized memory, which may hold NaN.
+    torch.manual_seed(0)
+    for param in model.parameters():
+        param.data.normal_(std=0.02)
     plan = make_mha_memory_plan(
         size=256,
         prefix_granularity=64,
