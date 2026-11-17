@@ -2881,10 +2881,11 @@ class KimiLinearMoE(nn.Module):
         """Project, gather and route replicated rows and run the shared down
         projection in the gather's launch.
 
-        The routes and their expert sort are those of the separate sorted
-        routing launch, bit for bit. Returns ``(routed_input, topk_output,
-        shared_partial)``, or ``None`` before launching anything when the
-        Iris state's routed gather does not serve these rows.
+        The route ids and their expert sort match the separate sorted routing
+        launch bit for bit; the FP32 weights agree up to rounding. Returns
+        ``(routed_input, topk_output, shared_partial)``, or ``None`` before
+        launching anything when the Iris state's routed gather does not serve
+        these rows.
         """
         if (
             self._fused_routing_scratch is None

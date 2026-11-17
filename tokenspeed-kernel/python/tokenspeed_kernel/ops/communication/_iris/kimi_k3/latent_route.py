@@ -125,6 +125,8 @@ def _k3_await_count(counter, target):
 
 @gluon.jit
 def _k3_ordered_key(value):
+    """Map FP32 ``value`` to a uint32 key in the same order (negative patterns
+    fully inverted, others sign-flipped) for ``_k3_top16``'s packed keys."""
     bits = value.to(gl.uint32, bitcast=True)
     sign = gl.full_like(bits, 0x80000000)
     return bits ^ gl.where((bits & sign) != 0, gl.full_like(bits, 0xFFFFFFFF), sign)
@@ -132,6 +134,7 @@ def _k3_ordered_key(value):
 
 @gluon.jit
 def _k3_popcount(words):
+    """Set bits in each 32-bit lane of the expert arrival ``words``, as int32."""
     bits = words.to(gl.uint32, bitcast=True)
     bits = bits - ((bits >> 1) & 0x55555555)
     bits = (bits & 0x33333333) + ((bits >> 2) & 0x33333333)
