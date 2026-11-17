@@ -1,0 +1,173 @@
+{
+  "comparison": "Current FlatKV with one GDN group versus previously measured FlatKV-disabled layout",
+  "scope": "Historical cross-run comparison under matching requested conditions; not a new simultaneous on/off A/B, repeated trial, or default one-hour InferenceX run. GPUs and concurrent peer workloads differed between the two recorded rounds.",
+  "benchmark": "InferenceX AgentX standalone",
+  "model": {
+    "id": "nvidia/Qwen3.8-Flash-Next-NVFP4",
+    "revision": "fc694b54fb0174e0913e6adf86691ef85a4ead47"
+  },
+  "conditions": {
+    "tp": 1,
+    "pp": 1,
+    "kv_dtype": "bfloat16",
+    "gdn_dtype": "float32",
+    "max_num_seqs": 64,
+    "client_concurrency": 64,
+    "speculative_algorithm": "MTP",
+    "speculative_num_steps": 3,
+    "speculative_num_draft_tokens": 4,
+    "synthetic_acceptance": false,
+    "context_length": 262144,
+    "chunked_prefill_size": 8192,
+    "gpu_memory_utilization": 0.8,
+    "client_version": "agentx-harness==1.0.13",
+    "dataset": "semianalysis_cc_traces_weka_062126_256k",
+    "random_seed": 42,
+    "profile_seconds": 900,
+    "warmup_requests_per_lane": 10,
+    "server_seed": 42,
+    "state_checkpoints_in_forward": true,
+    "kvstore_write_policy": "write_back",
+    "kvstore_io_backend": "kernel",
+    "kvstore_size_gb": 192,
+    "l3_storage": false,
+    "replay_ssm": false
+  },
+  "hardware": "NVIDIA B300 SXM6, TP1, independent GPU per configuration",
+  "warmup_requests_per_run": 702,
+  "sending_seconds": 900,
+  "drain_grace_seconds": 30,
+  "environment_checks": {
+    "compatibility_logic_match": true,
+    "native_engine_hashes_match": true,
+    "native_cuda_hashes_match": true,
+    "package_versions_match": true,
+    "serving_arguments_match_except_layout_and_ports": true
+  },
+  "primary_metric": "Completed profiling requests only: sum(API cached prompt tokens)/sum(API prompt tokens), including L1 and L2; excludes warmup and end-of-window cancellations.",
+  "matched_scope": "1441 common trace/turn records with 997804 completion tokens per configuration. Prompt totals differ by 648 tokens (<0.001%). Matching controls trace/turn mix but does not make the two rounds simultaneous or byte-identical.",
+  "admission_metric_scope": "Service admission counters include end-of-window cancellations; their denominator differs from completed-request API usage.",
+  "runs": [
+    {
+      "mode": "off",
+      "flatkv_enabled": false,
+      "gdn_groups": 2,
+      "total_cache_groups": 6,
+      "physical_planes": 26,
+      "results": {
+        "requests": 1454.0,
+        "actual_cache_hit_pct": 86.89982597868773,
+        "output_token_throughput_tps": 1078.3980720107122,
+        "request_throughput_rps": 1.563430270604223,
+        "ttft_mean_ms": 15714.60912868363,
+        "ttft_p50_ms": 8237.9467745,
+        "ttft_p90_ms": 37328.777832,
+        "ttft_p99_ms": 120152.85135717013,
+        "itl_mean_ms": 22.67800898787815,
+        "usage_prompt_tokens": 117552843.0,
+        "usage_cached_prompt_tokens": 102153216.0,
+        "request_error_rate": 0.0,
+        "completed_requests": 1454,
+        "drain_cancelled_requests": 23,
+        "request_errors": 0,
+        "preemptions": 2.0,
+        "normalized_interactivity_p75_tps_per_user": 9.945019045191913,
+        "normalized_interactivity_p90_tps_per_user": 5.212372458098621
+      },
+      "admission_hit_percent": {
+        "device_hit_pct": 30.104717901380756,
+        "host_hit_pct": 56.85817836766817,
+        "combined_hit_pct": 86.96289626904893
+      },
+      "geometry": {
+        "device_parent_bytes": 81788928,
+        "device_arena_bytes": 102399737856,
+        "host_l2_payload_bytes": 191999508480,
+        "host_parent_bytes": 61341696,
+        "snapshot_pool_reported_gb": 23.56,
+        "snapshot_payload_bytes": 23555211264
+      }
+    },
+    {
+      "mode": "on",
+      "flatkv_enabled": true,
+      "gdn_groups": 1,
+      "total_cache_groups": 5,
+      "physical_planes": 1,
+      "results": {
+        "requests": 1507.0,
+        "actual_cache_hit_pct": 88.81111508016232,
+        "output_token_throughput_tps": 1157.557247220068,
+        "request_throughput_rps": 1.6204169216298578,
+        "ttft_mean_ms": 13654.329005015263,
+        "ttft_p50_ms": 6466.990201,
+        "ttft_p90_ms": 32444.6481522,
+        "ttft_p99_ms": 99089.70854946024,
+        "itl_mean_ms": 22.28867292617878,
+        "usage_prompt_tokens": 124521783.0,
+        "usage_cached_prompt_tokens": 110589184.0,
+        "request_error_rate": 0.0,
+        "completed_requests": 1507,
+        "drain_cancelled_requests": 29,
+        "request_errors": 0,
+        "preemptions": 5.0,
+        "normalized_interactivity_p75_tps_per_user": 11.534630468867384,
+        "normalized_interactivity_p90_tps_per_user": 5.769723164722822
+      },
+      "admission_hit_percent": {
+        "device_hit_pct": 28.600608638542504,
+        "host_hit_pct": 60.104837427089336,
+        "combined_hit_pct": 88.70544606563185
+      },
+      "geometry": {
+        "device_parent_bytes": 115867648,
+        "device_arena_bytes": 101384192000,
+        "host_l2_payload_bytes": 191992692736,
+        "host_parent_bytes": 115867648,
+        "snapshot_pool_reported_gb": 37.08,
+        "snapshot_payload_bytes": 37077647360
+      }
+    }
+  ],
+  "matched_trace_turns": {
+    "off": {
+      "requests": 1441,
+      "prompt_tokens": 116401990,
+      "cached_tokens": 101065472,
+      "completion_tokens": 997804,
+      "hit_pct": 86.82452250172011,
+      "ttft_mean_ms": 15743.914295917417,
+      "ttft_p50_ms": 8112.030197
+    },
+    "on": {
+      "requests": 1441,
+      "prompt_tokens": 116401342,
+      "cached_tokens": 103154432,
+      "completion_tokens": 997804,
+      "hit_pct": 88.6196243338844,
+      "ttft_mean_ms": 13294.40286879528,
+      "ttft_p50_ms": 5859.370444
+    }
+  },
+  "changes_on_vs_off": {
+    "cache_hit_percentage_points": 1.911289101474594,
+    "matched_cache_hit_percentage_points": 1.795101832164292,
+    "output_token_throughput_tps_percent": 7.34044109164258,
+    "ttft_mean_ms_percent": -13.110603686017052,
+    "ttft_p50_ms_percent": -21.49754813883813,
+    "ttft_p90_ms_percent": -13.084086764858116,
+    "ttft_p99_ms_percent": -17.530289601781433,
+    "itl_mean_ms_percent": -1.7168000149725637
+  },
+  "reproduction": {
+    "source_base_commit": "f3593f01659632fc53160700a193ca6fe4c8de95",
+    "environment_patch": "flatkv-gdn-groups-benchmark.patch",
+    "configuration_reference": "flatkv-gdn-groups.json",
+    "flatkv_off": "Omit --qwen4-exp-flat-kv and --qwen4-exp-flat-kv-gdn-groups from the archived benchmark server arguments.",
+    "flatkv_on_measured": "Use --qwen4-exp-flat-kv --qwen4-exp-flat-kv-gdn-groups 1 with the archived benchmark patch.",
+    "flatkv_on_current_pr": "Use --qwen4-exp-flat-kv; one GDN group is the selected policy.",
+    "model_revision": "Pin the recorded model revision (or use a local snapshot of it) for both model and tokenizer.",
+    "note": "The original off round used the same compatibility adapter logic before formatting; native engine/CUDA binaries and dependency versions matched. These are comparisons of the recorded runs, not new measurements."
+  },
+  "interpretation": "The historical runs show higher overall and common-trace cache hit rates and higher output throughput with the selected FlatKV policy. Admission counters show a lower Device L1 share and higher Host L2 share, so this is not evidence of improved L1-only hit rate. Preemptions and drain-time cancellations increased; snapshot memory reservation also increased."
+}
