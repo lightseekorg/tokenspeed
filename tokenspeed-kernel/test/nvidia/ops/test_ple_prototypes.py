@@ -33,6 +33,7 @@ import types
 
 if __name__ == "__main__":
     root = pathlib.Path(__file__).resolve().parents[3] / "python" / "tokenspeed_kernel"
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
     for name, path in [
         ("tokenspeed_kernel", root),
         ("tokenspeed_kernel.ops", root / "ops"),
@@ -315,29 +316,34 @@ def test_conv_runtime_bounds(lengths, write_final, windows, pdl):
             torch.testing.assert_close(scratch, expected_windows, rtol=0, atol=0)
 
 
-def test_conv_token_tiles_across_request_boundaries(pdl):
+def test_conv_token_tiles_across_request_boundaries():
     platform = current_platform()
     if not platform.is_nvidia or platform.arch_version != ArchVersion(10, 3):
         pytest.skip("token-tiled convolution uses NVIDIA SM103")
 
-    lengths = (521, 0, 510)
-    total, channels, state = sum(lengths), 1027, 9
+    lengths, channels, state = (521, 0, 510), 10240, 9
     opts = {"device": "cuda", "dtype": torch.bfloat16}
-    values = torch.randn(total + 9, channels, **opts)
-    gated, residual = [
-        torch.randn(total + 9, channels + 16, **opts)[:, :channels] for _ in range(2)
-    ]
-    weight = torch.randn(channels, 4, **opts)
+    values = torch.randn(sum(lengths), channels, **opts)
     initial = torch.randn(len(lengths), channels, state, **opts)
+    weight = torch.randn(channels, 4, **opts)
+    gated, residual = [
+        torch.randn(sum(lengths), channels + 16, **opts)[:, :channels] for _ in range(2)
+    ]
 
-    def prepare(lengths, values, initial, gated, residual):
+    def run(lengths, values, initial, gated, residual):
         lens = torch.tensor(lengths, device="cuda", dtype=torch.int64)
         starts = lens.cumsum(0) - lens
-        req = torch.repeat_interleave(torch.arange(len(lengths), device="cuda"), lens)
-        col = torch.arange(sum(lengths), device="cuda") - starts[req]
-        args = (values, initial, weight, req, col, lens, starts)
-        kwargs = dict(
-            total_tokens=sum(lengths),
+        req = torch.arange(len(lengths), device="cuda").repeat_interleave(lens)
+        col = torch.arange(values.shape[0], device="cuda") - starts[req]
+        return ple_conv_sequences(
+            values,
+            initial,
+            weight,
+            req,
+            col,
+            lens,
+            starts,
+            total_tokens=values.shape[0],
             batch_size=len(lengths),
             dilation=3,
             kernel_size=4,
@@ -346,38 +352,79 @@ def test_conv_token_tiles_across_request_boundaries(pdl):
             weights_independent=True,
             compact_windows=False,
             add_terms=(gated, residual),
+        )[:2]
+
+    reference = [
+        run((length,), x, y[None], g, r)
+        for length, x, y, g, r in zip(
+            lengths,
+            values.split(lengths),
+            initial,
+            gated.split(lengths),
+            residual.split(lengths),
+            strict=True,
         )
-        return args, kwargs
+    ]
+    result = run(lengths, values, initial, gated, residual)
+    for actual, expected in zip(result, zip(*reference), strict=True):
+        torch.testing.assert_close(actual, torch.cat(expected), rtol=0, atol=0)
 
-    outputs, states = [], []
-    offset = 0
-    for request, length in enumerate(lengths):
-        rows = slice(offset, offset + length)
-        args, kwargs = prepare(
-            (length,),
-            values[rows],
-            initial[request : request + 1],
-            gated[rows],
-            residual[rows],
-        )
-        output, final, _ = ple_conv_sequences(*args, **kwargs)
-        outputs.append(output)
-        states.append(final)
-        offset += length
-    expected = torch.cat(outputs)
-    expected_final = torch.cat(states)
 
-    def check(output, final):
-        assert torch.equal(output[:total].view(torch.int16), expected.view(torch.int16))
-        assert torch.equal(final.view(torch.int16), expected_final.view(torch.int16))
+@pytest.mark.parametrize(
+    "dim, dtype",
+    [(160, torch.float8_e4m3fn), (512, torch.bfloat16)],
+    ids=["flash-fp8", "max-bf16"],
+)
+def test_host_cache_keeps_aligned_and_tail_rows_until_invalidated(dim, dtype):
+    from tokenspeed_kernel.ops.ple._host_cache_triton import (
+        _ple_fill_staged_kernel,
+        _ple_gather_staged_tail_kernel,
+    )
+    from tokenspeed_kernel.ops.ple.host_cache import PLEHostCache
+    from utils import assert_no_triton_compile
 
-    args, kwargs = prepare(lengths, values, initial, gated, residual)
-    check(*ple_conv_sequences(*args, **kwargs)[:2])
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured = ple_conv_sequences(*args, **kwargs)
-    graph.replay()
-    check(*captured[:2])
+    if not current_platform().is_nvidia or torch.cuda.get_device_capability()[
+        0
+    ] not in (9, 10):
+        pytest.skip("PLE host cache requires Hopper or Blackwell")
+    device = torch.device("cuda", torch.cuda.current_device())
+    vocab_start = 20_000_000
+    table = torch.ones(32, dim)
+    table[1].fill_(2)
+    table = table.to(dtype).pin_memory()
+    scale = 0.125 if dtype == torch.float8_e4m3fn else None
+    cache = PLEHostCache.create(
+        slot_count=512,
+        table=table,
+        ngram_heads=16,
+        output_dtype=torch.bfloat16,
+        vocab_start=vocab_start,
+        vocab_end=vocab_start + len(table),
+        device=device,
+    )
+    assert cache is not None
+
+    def run(tokens):
+        ids = torch.full((tokens, 16), vocab_start, device=device)
+        ids[:, 1] += len(table)
+        ids[-1, 0] += 1
+        out = torch.empty((ids.numel(), dim), device=device, dtype=torch.bfloat16)
+        return cache.gather(table, ids, out, scale=scale).cpu().view(tokens, 16, dim)
+
+    def expected(tokens):
+        output = torch.full((tokens, 16, dim), scale or 1.0, dtype=torch.bfloat16)
+        output[:, 1] = 0
+        output[-1, 0] *= 2
+        return output
+
+    torch.testing.assert_close(run(257), expected(257), rtol=0, atol=0)
+    table.view(torch.uint8).zero_()
+    with assert_no_triton_compile(
+        _ple_gather_staged_tail_kernel, _ple_fill_staged_kernel
+    ):
+        torch.testing.assert_close(run(259), expected(259), rtol=0, atol=0)
+    cache.invalidate()
+    assert not run(259).any()
 
 
 def test_conv_state_large_request_offset(pdl):

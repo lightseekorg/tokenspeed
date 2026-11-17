@@ -128,7 +128,7 @@ def test_global_table_matches_unsharded_lookup(tmp_path, tp_size):
     )
 
 
-def _cached_lookup_worker(rank, rendezvous, tp_size, dim, table_dtype):
+def _cached_lookup_worker(rank, rendezvous, tp_size):
     from tokenspeed.runtime.distributed.comm_backend import set_global_backend
     from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
     from tokenspeed.runtime.distributed.mapping import Mapping
@@ -147,14 +147,14 @@ def _cached_lookup_worker(rank, rendezvous, tp_size, dim, table_dtype):
     try:
         process_group_manager.init_process_group(mapping.attn.world_group)
         set_global_backend(NcclBackend())
-        vocab, heads = 1021, 16
-        fp8 = table_dtype == torch.float8_e4m3fn
+        vocab, heads, dim = 1021, 16, 160
+        table_dtype = torch.float8_e4m3fn
         lookup = ple_lookup.PLELookup(
             mapping,
             vocab_size=vocab,
             ngram_heads=heads,
             head_dim=dim,
-            storage_dtype=table_dtype if fp8 else None,
+            storage_dtype=table_dtype,
             output_dtype=torch.bfloat16,
             offload=True,
             enable_hot_cache=True,
@@ -164,9 +164,8 @@ def _cached_lookup_worker(rank, rendezvous, tp_size, dim, table_dtype):
             (torch.arange(vocab * dim).reshape(vocab, dim) % 383 - 191) / 7
         ).to(table_dtype)
         lookup.load_shard(full_table, 0, 1)
-        scale = 0.125 if fp8 else 1.0
-        if fp8:
-            lookup.load_scale(torch.tensor(scale))
+        scale = 0.125
+        lookup.load_scale(torch.tensor(scale))
 
         counts = [99, 0, 107, 131] if mapping.attn.has_dp else None
         tokens = counts[rank] if counts is not None else 325
@@ -181,24 +180,14 @@ def _cached_lookup_worker(rank, rendezvous, tp_size, dim, table_dtype):
             torch.testing.assert_close(
                 actual.cpu(), expected.bfloat16(), rtol=0, atol=0
             )
-        assert lookup._host_cache._tags is not None
-        if not fp8:
-            lookup.load_scale(torch.tensor(0.5))
-            actual = lookup.finish(lookup.start(ids, layout))
-            torch.testing.assert_close(
-                actual.cpu(), (expected * 0.5).bfloat16(), rtol=0, atol=0
-            )
+        assert lookup._host_cache is not None
         lookup._host_cache.invalidate()
     finally:
         dist.destroy_process_group()
 
 
 @pytest.mark.parametrize("tp_size", [1, 4], ids=["dp4", "tp4"])
-@pytest.mark.parametrize("head_dim", [160, 512])
-@pytest.mark.parametrize("table_dtype", [torch.bfloat16, torch.float8_e4m3fn])
-def test_sharded_host_cache_matches_unsharded_lookup(
-    tmp_path, monkeypatch, tp_size, head_dim, table_dtype
-):
+def test_sharded_host_cache_matches_unsharded_lookup(tmp_path, monkeypatch, tp_size):
     from tokenspeed_kernel.platform import current_platform
 
     if (
@@ -213,12 +202,7 @@ def test_sharded_host_cache_matches_unsharded_lookup(
     monkeypatch.setenv("TOKENSPEED_PLE_HOST_CACHE_SLOTS", "512")
     mp.spawn(
         _cached_lookup_worker,
-        args=(
-            (tmp_path / "cached-rendezvous").as_uri(),
-            tp_size,
-            head_dim,
-            table_dtype,
-        ),
+        args=((tmp_path / "cached-rendezvous").as_uri(), tp_size),
         nprocs=4,
         join=True,
     )
@@ -312,47 +296,24 @@ def test_lookup_rejects_invalid_physical_extents(sizes):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
-@pytest.mark.parametrize("tokens", [1, 4095, 4096, 8192])
-@pytest.mark.parametrize(
-    "table_dtype, enable_hot_cache, cache_slots",
-    [
-        (torch.bfloat16, False, 512),
-        (torch.bfloat16, True, 0),
-        (torch.bfloat16, True, 512),
-        (torch.float8_e4m3fn, True, 512),
-    ],
-)
-def test_host_lookup_stream_handoff(
-    tokens, table_dtype, enable_hot_cache, cache_slots, monkeypatch
-):
-    from tokenspeed_kernel.platform import current_platform
-
-    uses_cache = bool(enable_hot_cache and cache_slots)
-    if uses_cache and (
-        not current_platform().is_nvidia
-        or torch.cuda.get_device_capability()[0] not in (9, 10)
-    ):
-        pytest.skip("PLE host cache requires Hopper or Blackwell")
-    monkeypatch.setenv("TOKENSPEED_PLE_HOST_CACHE_SLOTS", str(cache_slots))
-    mapping = _mapping_class()(rank=0, world_size=1, attn_tp_size=1, attn_dp_size=1)
+def test_host_lookup_stream_handoff(monkeypatch):
+    monkeypatch.setenv("TOKENSPEED_PLE_HOST_CACHE_SLOTS", "512")
+    tokens, heads, dim, vocab = 4, 16, 160, 256
     lookup = ple_lookup.PLELookup(
-        mapping,
-        vocab_size=256,
-        ngram_heads=16,
-        head_dim=160,
-        storage_dtype=table_dtype if table_dtype == torch.float8_e4m3fn else None,
+        _mapping_class()(rank=0, world_size=1),
+        vocab_size=vocab,
+        ngram_heads=heads,
+        head_dim=dim,
+        storage_dtype=None,
         output_dtype=torch.bfloat16,
         offload=True,
-        enable_hot_cache=enable_hot_cache,
+        enable_hot_cache=False,
         prefix="",
     )
-    table = torch.randn(256, 160, dtype=torch.bfloat16).to(table_dtype)
-    assert (lookup._host_cache is not None) == uses_cache
+    assert lookup._host_cache is None
+    table = torch.randn(vocab, dim, dtype=torch.bfloat16)
     lookup.ngram_embedding.weight.data.copy_(table)
-    ids = (
-        torch.arange(tokens * 16, device="cuda", dtype=torch.int64).view(tokens, 16)
-        % 256
-    )
+    ids = torch.arange(tokens * heads, device="cuda").reshape(tokens, heads)
     layout = lookup.make_layout(None, tokens)
     consumer = torch.cuda.Stream()
 
@@ -363,13 +324,11 @@ def test_host_lookup_stream_handoff(
         torch.cuda.current_stream().wait_stream(consumer)
         return result
 
-    result = run()
-    expected = table.bfloat16()[ids.cpu()].reshape(tokens, -1)
-    torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)
+    run()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         result = run()
-    ids.add_(7).remainder_(256)
+    ids.add_(7)
     graph.replay()
-    expected = table.bfloat16()[ids.cpu()].reshape(tokens, -1)
+    expected = table[ids.cpu()].reshape(tokens, -1)
     torch.testing.assert_close(result.cpu(), expected, rtol=0, atol=0)

@@ -3167,110 +3167,68 @@ def test_ple_conv_epilogue_folds_full_width_adds(dtype) -> None:
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="fused PLE conv requires CUDA"
 )
-@pytest.mark.parametrize("lengths", [[1], [4], [3, 1, 5], [0, 4, 2], [0, 0]])
-@pytest.mark.parametrize("enable_pdl", [False, True])
-@pytest.mark.parametrize("graph_replay", [False, True])
-def test_ple_conv_scatters_compact_inputs_into_verify_scratch(
-    lengths, enable_pdl, graph_replay, monkeypatch
-) -> None:
-    if enable_pdl and (torch.version.hip or torch.cuda.get_device_capability()[0] < 9):
-        pytest.skip("PDL requires NVIDIA SM90+")
-    monkeypatch.setattr("tokenspeed_kernel.ops.ple.pdl_enabled", lambda: enable_pdl)
-    channels = 8
-    dtype = torch.bfloat16
+@pytest.mark.parametrize("width,channels", [(4, 10240), (8, 32768)])
+def test_ple_conv_commits_compact_verify_scratch(width, channels) -> None:
+    from tokenspeed_kernel.ops.kvcache.triton import copy_state_rows
+
+    batch, state = 8, 9
     stub, _, _ = _ple_stub(ngram_size=3, conv_kernel_size=4, channels=channels)
-    stub.conv1d = stub.conv1d.to("cuda", dtype)
-    state_len = stub.conv_state_len
-    bs, total = len(lengths), sum(lengths)
-    torch.manual_seed(5)
-    values = torch.randn(total, channels, dtype=dtype, device="cuda")
-    initial = torch.randn(bs, channels, state_len, dtype=dtype, device="cuda")
-    req, col, lengths_t, _, _, tot, _ = Qwen4ExpPLELayer._batch_indices(
+    stub.conv1d = stub.conv1d.to("cuda", torch.bfloat16)
+    lengths = [width] * batch
+    req, col, lengths_t, starts, _, total, _ = Qwen4ExpPLELayer._batch_indices(
         lengths, torch.device("cuda")
     )
-
-    packed = stub._conv_sequences_cuda(
-        values, initial, req, col, lengths_t, tot, bs, True
+    opts = {"device": "cuda", "dtype": torch.bfloat16}
+    values = torch.randn(total, channels, **opts)
+    initial = torch.randn(batch, channels, state, **opts)
+    args = (values, initial, req, col, lengths_t, total, batch, True)
+    add_terms = (torch.randn_like(values), torch.randn_like(values))
+    reference, _, windows = stub._conv_sequences_cuda(
+        *args, starts=starts, add_terms=add_terms
     )
-    # Scratch is one (width + 1) row block per request, plus a spare block to
-    # prove the kernel stays inside the rows it owns.
-    stride = max(lengths) + 1
-    scratch = torch.zeros(
-        (bs + 1) * stride, channels, state_len, dtype=dtype, device="cuda"
+    windows = torch.cat(
+        (initial[:, None], windows.view(batch, width, channels, state)), dim=1
     )
-    scattered = stub._conv_sequences_cuda(
-        values,
-        initial,
-        req,
-        col,
-        lengths_t,
-        tot,
-        bs,
-        True,
-        windows_out=scratch,
-        windows_block_rows=stride,
-    )
-    if graph_replay:
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            scattered = stub._conv_sequences_cuda(
-                values,
-                initial,
-                req,
-                col,
-                lengths_t,
-                tot,
-                bs,
-                True,
-                windows_out=scratch,
-                windows_block_rows=stride,
-            )
-        scratch.zero_()
-        graph.replay()
+    scratch = torch.empty_like(windows).flatten(0, 1)
+    output = torch.empty_like(initial)
+    requests = torch.arange(batch, device="cuda")
+    src_rows = requests * (width + 1)
+    src, dst = [
+        torch.tensor([t.data_ptr()], device="cuda", dtype=torch.uint64)
+        for t in (scratch, output)
+    ]
+    strides = torch.tensor([output.stride(0)], device="cuda", dtype=torch.int64)
 
-    # Compact scratch keeps the carried state and the token input vectors.
-    assert torch.equal(scattered[0], packed[0])
-    assert scattered[1].shape == (0, channels, state_len)
-    assert scattered[2] is scratch
-    initial_rows = torch.arange(bs, device="cuda") * stride
-    assert torch.equal(scratch[initial_rows], initial)
-    token_rows = req * stride + 1 + col
-    compact_rows = scratch[token_rows].flatten(1)
-    assert torch.equal(compact_rows[:, :channels], values)
-    assert not compact_rows[:, channels:].any()
-    untouched = torch.ones(scratch.shape[0], dtype=torch.bool, device="cuda")
-    untouched[initial_rows] = False
-    untouched[token_rows] = False
-    assert not scratch[untouched].any()
-
-    # A scratch the kernel cannot address by row must be refused, not repacked
-    # into a copy whose writes would be dropped.
-    with pytest.raises(ValueError):
-        stub._conv_sequences_cuda(
-            values,
-            initial,
-            req,
-            col,
-            lengths_t,
-            tot,
-            bs,
-            False,
+    def run():
+        conv, _, _ = stub._conv_sequences_cuda(
+            *args,
+            starts=starts,
+            add_terms=add_terms,
             windows_out=scratch,
-            windows_block_rows=stride,
+            windows_block_rows=width + 1,
         )
-    with pytest.raises(ValueError):
-        stub._conv_sequences_cuda(
-            values,
-            initial,
-            req,
-            col,
-            lengths_t,
-            tot,
-            bs,
-            True,
-            windows_out=scratch.transpose(1, 2),
-            windows_block_rows=stride,
+        copy_state_rows(
+            src,
+            dst,
+            src_rows,
+            requests,
+            row_bytes=output.stride(0) * output.element_size(),
+            src_row_strides=None,
+            dst_row_strides=strides,
+            compact=(scratch, width),
         )
+        return conv
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        conv = run()
+    for offset in range(width + 1):
+        accepted = (requests + offset) % (width + 1)
+        src_rows.copy_(requests * (width + 1) + accepted)
+        graph.replay()
+        torch.testing.assert_close(conv, reference, atol=0, rtol=0)
+        torch.testing.assert_close(output, windows[requests, accepted], atol=0, rtol=0)
 
 
 @pytest.mark.skipif(

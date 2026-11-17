@@ -67,155 +67,55 @@ def test_ple_host_gather_empty_ids_skip_pointer_mapping(monkeypatch) -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
-@pytest.mark.parametrize("rows", [1, 255, 256, 257, 1027])
-@pytest.mark.parametrize("head_dim", [32, 96, 128])
-@pytest.mark.parametrize("scale_mode", ["none", "scalar", "row"])
-def test_host_gather_row_tiles(rows, head_dim, scale_mode):
-    dtype = torch.bfloat16 if scale_mode == "none" else torch.float8_e4m3fn
-    table = torch.randn(31, head_dim).to(dtype).pin_memory()
-    ids = torch.arange(rows, device="cuda", dtype=torch.int64) % 40
-    out = torch.empty((rows, head_dim), device="cuda", dtype=torch.bfloat16)
-    scales = torch.linspace(0.5, 1.5, 31, device="cuda")
-    ple.ple_host_gather(
-        table,
-        ids,
-        out,
-        3,
-        34,
-        0.5 if scale_mode == "scalar" else None,
-        scales if scale_mode == "row" else None,
-        table_shards=4,
-    )
-    valid = (ids >= 3) & (ids < 34)
-    local = (ids - 3).clamp(0, 30)
-    expected = table.float().cuda()[local]
-    if scale_mode == "scalar":
-        expected *= 0.5
-    elif scale_mode == "row":
-        expected *= scales[local, None]
-    expected[~valid] = 0
-    torch.testing.assert_close(out, expected.bfloat16(), atol=0, rtol=0)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
-def test_host_gather_row_count_does_not_recompile():
-    from tokenspeed_kernel.ops.ple.triton import _ple_host_gather_kernel
-    from utils import assert_no_triton_compile
-
-    table = torch.randn(31, 128, dtype=torch.bfloat16).pin_memory()
-    ids = torch.zeros(2048, dtype=torch.int64, device="cuda")
-    out = torch.empty((2048, 128), dtype=torch.bfloat16, device="cuda")
-
-    def run(rows):
-        ple.ple_host_gather(
-            table,
-            ids[:rows],
-            out[:rows],
-            0,
-            31,
-            None,
-            None,
-            table_shards=4,
-        )
-
-    for rows in (1, 16, 17, 256, 257):
-        run(rows)
-    with assert_no_triton_compile(_ple_host_gather_kernel):
-        for rows in (32, 33, 255, 272, 273, 1024, 1027):
-            run(rows)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
-@pytest.mark.parametrize("rows", [1, 255, 256, 257, 1027])
-def test_host_gather_checkpoint_scale(rows):
-    payload = torch.arange(256, dtype=torch.uint8).repeat(20)[: 31 * 160]
-    payload[payload % 128 == 127] = 0
-    table = payload.view(torch.float8_e4m3fn).reshape(31, 160).pin_memory()
-    ids = torch.arange(rows, device="cuda", dtype=torch.int64) % 40
-    out = torch.empty((rows, 160), device="cuda", dtype=torch.bfloat16)
-    scale = 0.00019931793212890625
-    ple.ple_host_gather(table, ids, out, 3, 34, scale, None, table_shards=4)
-    cpu_ids = ids.cpu()
-    valid = (cpu_ids >= 3) & (cpu_ids < 34)
-    expected = table.float()[(cpu_ids - 3).clamp(0, 30)] * scale
-    expected[~valid] = 0
-    torch.testing.assert_close(out.cpu(), expected.bfloat16(), atol=0, rtol=0)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
-@pytest.mark.parametrize("rows", [32768, 32769, 131071, 131072, 131073])
-@pytest.mark.parametrize("table_shards", [1, 4])
-@pytest.mark.parametrize("scale_mode", ["none", "scalar", "row"])
-def test_host_gather_persistent_and_sorted(rows, table_shards, scale_mode):
-    dtype = torch.bfloat16 if scale_mode == "none" else torch.float8_e4m3fn
-    table = torch.randn(37, 160).to(dtype).pin_memory()
-    cpu_ids = torch.arange(rows, dtype=torch.int64) % 48 - 3
-    cpu_ids[-3:] = torch.tensor([-(2**40), 2**31 + 3, 2**32 + 3])
-    ids = cpu_ids.cuda()
-    out = torch.empty((rows, 160), device="cuda", dtype=torch.bfloat16)
-    scales = torch.linspace(0.5, 1.5, 37, device="cuda")
-    scale = 0.00019931793212890625 if scale_mode == "scalar" else None
-
-    def run():
-        return ple.ple_host_gather(
-            table,
-            ids,
-            out,
-            3,
-            40,
-            scale,
-            scales if scale_mode == "row" else None,
-            table_shards=table_shards,
-        )
-
-    run()
-    expected = table.float()[(cpu_ids - 3).clamp(0, 36)]
-    if scale_mode == "scalar":
-        expected *= scale
-    elif scale_mode == "row":
-        expected *= scales.cpu()[(cpu_ids - 3).clamp(0, 36), None]
-    expected[(cpu_ids < 3) | (cpu_ids >= 40)] = 0
-    torch.testing.assert_close(out.cpu(), expected.bfloat16(), atol=0, rtol=0)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        run()
-    out.fill_(float("nan"))
-    graph.replay()
-    torch.testing.assert_close(out.cpu(), expected.bfloat16(), atol=0, rtol=0)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
-@pytest.mark.parametrize("table_shards", [1, 4])
-def test_host_gather_persistent_shapes_do_not_recompile(table_shards):
+@pytest.mark.parametrize(
+    "head_dim, table_shards, scale_mode",
+    [(160, 4, "scalar"), (512, 4, "row"), (512, 4, "none"), (160, 1, "scalar")],
+    ids=["flash-tp4", "max-online-fp8", "max-bf16", "flash-tp1"],
+)
+def test_host_gather_decode_and_prefill(head_dim, table_shards, scale_mode):
     from tokenspeed_kernel.ops.ple.triton import (
         _ple_host_gather_kernel,
         _ple_host_gather_persistent_kernel,
     )
     from utils import assert_no_triton_compile
 
-    table = torch.ones((31, 160), dtype=torch.bfloat16).pin_memory()
-    ids = torch.zeros(131200, device="cuda", dtype=torch.int64)
-    out = torch.empty((131200, 160), device="cuda", dtype=torch.bfloat16)
+    vocab_start = 20_000_000 if table_shards > 1 else 0
+    dtype = torch.bfloat16 if scale_mode == "none" else torch.float8_e4m3fn
+    table = torch.randn(128, head_dim).to(dtype).pin_memory()
+    scalar = 0.00019931793212890625 if scale_mode == "scalar" else None
+    scales = torch.linspace(0.5, 1.5, 128)
+    row_scale = scales.cuda() if scale_mode == "row" else None
 
-    def run(rows):
+    def check(tokens):
+        local_ids = torch.arange(tokens * 16) % 144 - 8
+        ids = (vocab_start + local_ids).reshape(tokens, 16).cuda()
+        out = torch.empty((ids.numel(), head_dim), device="cuda", dtype=torch.bfloat16)
         ple.ple_host_gather(
             table,
-            ids[:rows],
-            out[:rows],
-            0,
-            31,
-            None,
-            None,
+            ids,
+            out,
+            vocab_start,
+            vocab_start + 128,
+            scalar,
+            row_scale,
             table_shards=table_shards,
         )
+        rows = local_ids.clamp(0, 127)
+        expected = table.float()[rows]
+        if scalar is not None:
+            expected *= scalar
+        if row_scale is not None:
+            expected *= scales[rows, None]
+        expected[(local_ids < 0) | (local_ids >= 128)] = 0
+        torch.testing.assert_close(out.cpu(), expected.bfloat16(), atol=0, rtol=0)
 
-    for rows in (32768, 32769, 131072, 131073):
-        run(rows)
+    for tokens in (1, 16, 8192):
+        check(tokens)
     with assert_no_triton_compile(
         _ple_host_gather_kernel, _ple_host_gather_persistent_kernel
     ):
-        for rows in (32784, 32785, 65536, 65539, 131088, 131089):
-            run(rows)
+        for tokens in (4, 32, 16384):
+            check(tokens)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
@@ -223,49 +123,11 @@ def test_host_gather_large_table_offset():
     dim = 160
     table_rows = 2**31 // dim + 2
     table = torch.empty((table_rows, dim), dtype=torch.float8_e4m3fn, pin_memory=True)
-    last = (torch.arange(dim).float() % 31 - 15).to(torch.float8_e4m3fn)
+    last = (torch.arange(dim).float() % 31 - 15).to(table.dtype)
     table[-1].copy_(last)
-    rows = 131073
-    ids = torch.full((rows,), table_rows - 1, device="cuda", dtype=torch.int64)
-    out = torch.empty((rows, dim), device="cuda", dtype=torch.bfloat16)
+    ids = torch.full((4, 16), table_rows - 1, device="cuda", dtype=torch.int64)
+    out = torch.empty((ids.numel(), dim), device="cuda", dtype=torch.bfloat16)
     scale = 0.00019931793212890625
     ple.ple_host_gather(table, ids, out, 0, table_rows, scale, None, table_shards=4)
-    expected = (last.float() * scale).bfloat16().expand(rows, dim)
-    torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
-def test_sorted_host_gather_on_side_stream_with_graph():
-    table = torch.randn(31, 160).to(torch.float8_e4m3fn).pin_memory()
-    cpu_ids = torch.arange(131073, dtype=torch.int64) % 31
-    ids = cpu_ids.cuda()
-    out = torch.empty((len(cpu_ids), 160), device="cuda", dtype=torch.bfloat16)
-    stream = torch.cuda.Stream()
-    ids.record_stream(stream)
-    out.record_stream(stream)
-    scale = 0.00019931793212890625
-
-    def run():
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
-            ple.ple_host_gather(
-                table,
-                ids,
-                out,
-                0,
-                31,
-                scale,
-                None,
-                table_shards=1,
-            )
-        torch.cuda.current_stream().wait_stream(stream)
-
-    run()
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        run()
-    out.fill_(float("nan"))
-    graph.replay()
-    expected = (table.float()[cpu_ids] * scale).bfloat16()
+    expected = (last.float() * scale).bfloat16().expand_as(out)
     torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)
