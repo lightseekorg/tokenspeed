@@ -253,6 +253,7 @@ def _config(rng, role, *, host_pages, policy, snapshot_pages, mixed, width):
     cfg.debug_force_retraction_interval = 3 if snapshot_pages > 1 else 0
     cfg.max_scheduled_tokens = 48
     cfg.max_batch_size = 6
+    cfg.max_resident_requests = cfg.max_batch_size
     cfg.enable_l3_storage = False
     cfg.disable_l2_cache = host_pages == 0
     cfg.host_write_policy = policy
@@ -585,6 +586,8 @@ class _Loop:
         for request_id, transfer in list(self.device.transfers.items()):
             if transfer.stops_after is not None and transfer.stops_after < self.round:
                 del self.device.transfers[request_id]
+                events.add_event(ts.PD.TransferStoppedEvent(request_id))
+                count += 1
         for request_id in sorted(self.live):
             request = self.requests[request_id]
             if not request.bootstrapped and self.rng.random() < 0.7:
@@ -810,28 +813,8 @@ def test_fused_forwards_read_their_own_prefixes(
     "abort_transfers, short_turns",
     [
         (False, False),
-        pytest.param(
-            True,
-            False,
-            marks=pytest.mark.xfail(
-                strict=True,
-                raises=ContentError,
-                reason="Known bug: an abort frees a RemotePrefilling request's "
-                "pages while the peer still writes them.",
-            ),
-            id="aborts-during-landing",
-        ),
-        pytest.param(
-            False,
-            True,
-            marks=pytest.mark.xfail(
-                strict=True,
-                raises=ContentError,
-                reason="Known bug: a remote admission whose hit is a tail inside "
-                "the history table's first block exports the null block for it.",
-            ),
-            id="first-block-tails",
-        ),
+        pytest.param(True, False, id="aborts-during-landing"),
+        pytest.param(False, True, id="first-block-tails"),
     ],
 )
 def test_decode_role_landings_and_forwards_read_their_own_prefixes(
@@ -851,13 +834,6 @@ def test_decode_role_landings_and_forwards_read_their_own_prefixes(
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=ContentError,
-    reason="Known bugs: prefix publication dedupes a chunk's pages onto another "
-    "request's blocks, and an abort or a failed transfer frees the request's "
-    "pages, while the PD transfer still reads them.",
-)
 def test_prefill_role_transfers_keep_their_pages() -> None:
     _run(
         "P",
@@ -882,6 +858,7 @@ def _scripted(role: str, groups, block_granularity: int) -> "ts.Scheduler":
     cfg.max_retracted_requests = 0
     cfg.max_scheduled_tokens = 48
     cfg.max_batch_size = 6
+    cfg.max_resident_requests = cfg.max_batch_size
     cfg.enable_l3_storage = False
     cfg.disable_l2_cache = True
     cfg.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteThrough
@@ -981,12 +958,6 @@ def test_a_finish_behind_a_masked_first_decode_publishes_the_prompt_end_state() 
         )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Known bug: the D role's first-block tail hole is exported as the "
-    "null block (reclaimed_prefix_blocks_ is not lowered when the slot is "
-    "filled).",
-)
 @pytest.mark.parametrize(
     "block_granularity, first_len, extra",
     [(8, 6, 1), (8, 3, 5), (4, 3, 2)],
