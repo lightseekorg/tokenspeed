@@ -655,6 +655,7 @@ class ServerArgs:
     # Opt-in: large QSA prefill calls over an FP8 KV cache attend a BF16 copy
     # of their pages, reserved from the KV cache budget; see the flag's help.
     enable_qsa_prefill_bf16_scratch: bool = False
+    enable_ple_hot_cache: bool = False
     sampling_backend: str | None = None
     # Random stream of the non-greedy rows of the FlashInfer sampling backends:
     # "batch" keys flashinfer's Philox stream by the batch row, so a request's
@@ -3939,6 +3940,14 @@ class ServerArgs:
             "dtype (mxfp8 included), chunked prefill below 2048 tokens or "
             "disabled, or a GPU without the CuTe QSA kernel. The decode role, "
             "which runs no prefill, reserves no scratch.",
+        )
+        parser.add_argument(
+            "--enable-ple-hot-cache",
+            action="store_true",
+            default=ServerArgs.enable_ple_hot_cache,
+            help="Cache frequently read rows of eligible offloaded Qwen4-Exp PLE "
+            "tables in GPU memory. Disabled by default. "
+            "TOKENSPEED_PLE_HOST_CACHE_SLOTS controls the number of slots.",
         )
         parser.add_argument(
             "--sampling-backend",

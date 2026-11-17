@@ -3758,6 +3758,24 @@ def _tiny_ple_config(**overrides) -> Qwen4ExpTextConfig:
     return Qwen4ExpTextConfig(**kwargs)
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_ple_hot_cache_cli_reaches_model_config(tmp_path, enabled):
+    from tokenspeed.runtime.engine.rank_setup import load_model_config
+    from tokenspeed.runtime.utils.server_args import prepare_server_args
+
+    _tiny_ple_config(
+        architectures=["Qwen4ExpForCausalLM"], ple_offload_embedding=True
+    ).save_pretrained(tmp_path)
+    argv = ["--model", str(tmp_path)]
+    if enabled:
+        argv.append("--enable-ple-hot-cache")
+    args = prepare_server_args(argv)
+    config = load_model_config(args, args.model, draft_of=None)
+
+    assert config.hf_text_config.enable_ple_hot_cache is enabled
+    assert config.hf_text_config.ple_offload_embedding is True
+
+
 @pytest.mark.parametrize(
     ("checkpoint", "ple_embed_dtype", "expect_fp8"),
     [

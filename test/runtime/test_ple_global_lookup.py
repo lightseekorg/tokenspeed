@@ -50,6 +50,7 @@ def _lookup(mapping):
         storage_dtype=None,
         output_dtype=torch.float32,
         offload=False,
+        enable_hot_cache=False,
         prefix="",
     )
 
@@ -156,6 +157,7 @@ def _cached_lookup_worker(rank, rendezvous, tp_size, dim, table_dtype):
             storage_dtype=table_dtype if fp8 else None,
             output_dtype=torch.bfloat16,
             offload=True,
+            enable_hot_cache=True,
             prefix="",
         )
         full_table = (
@@ -312,13 +314,21 @@ def test_lookup_rejects_invalid_physical_extents(sizes):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
 @pytest.mark.parametrize("tokens", [1, 4095, 4096, 8192])
 @pytest.mark.parametrize(
-    "table_dtype, cache_slots",
-    [(torch.bfloat16, 0), (torch.bfloat16, 512), (torch.float8_e4m3fn, 512)],
+    "table_dtype, enable_hot_cache, cache_slots",
+    [
+        (torch.bfloat16, False, 512),
+        (torch.bfloat16, True, 0),
+        (torch.bfloat16, True, 512),
+        (torch.float8_e4m3fn, True, 512),
+    ],
 )
-def test_host_lookup_stream_handoff(tokens, table_dtype, cache_slots, monkeypatch):
+def test_host_lookup_stream_handoff(
+    tokens, table_dtype, enable_hot_cache, cache_slots, monkeypatch
+):
     from tokenspeed_kernel.platform import current_platform
 
-    if cache_slots and (
+    uses_cache = bool(enable_hot_cache and cache_slots)
+    if uses_cache and (
         not current_platform().is_nvidia
         or torch.cuda.get_device_capability()[0] not in (9, 10)
     ):
@@ -333,11 +343,11 @@ def test_host_lookup_stream_handoff(tokens, table_dtype, cache_slots, monkeypatc
         storage_dtype=table_dtype if table_dtype == torch.float8_e4m3fn else None,
         output_dtype=torch.bfloat16,
         offload=True,
+        enable_hot_cache=enable_hot_cache,
         prefix="",
     )
     table = torch.randn(256, 160, dtype=torch.bfloat16).to(table_dtype)
-    if cache_slots:
-        assert lookup._host_cache is not None
+    assert (lookup._host_cache is not None) == uses_cache
     lookup.ngram_embedding.weight.data.copy_(table)
     ids = (
         torch.arange(tokens * 16, device="cuda", dtype=torch.int64).view(tokens, 16)

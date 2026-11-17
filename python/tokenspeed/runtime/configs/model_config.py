@@ -885,6 +885,8 @@ class ModelConfig:
             # draft's config has no such class: load_model_config declares
             # the field on it from its target.
             self.hf_text_config.decode_monokernel = True
+        if is_qwen4_exp(self.hf_config):
+            self.hf_text_config.enable_ple_hot_cache = server_args.enable_ple_hot_cache
         self.mm_attention_backend = getattr(server_args, "mm_attention_backend", None)
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 

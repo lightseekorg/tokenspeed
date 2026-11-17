@@ -149,6 +149,7 @@ class PLELookup(nn.Module):
         storage_dtype: torch.dtype | None,
         output_dtype: torch.dtype,
         offload: bool,
+        enable_hot_cache: bool,
         prefix: str,
     ):
         super().__init__()
@@ -199,7 +200,7 @@ class PLELookup(nn.Module):
             if offload
             else self.ngram_embedding.weight.device
         )
-        if offload:
+        if offload and enable_hot_cache:
             from tokenspeed_kernel.ops.ple.host_cache import PLEHostCache
 
             from tokenspeed.runtime.utils.env import envs

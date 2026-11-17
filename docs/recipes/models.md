@@ -1243,16 +1243,20 @@ object:
 - `ple_offload_embedding`: keep the PLE table in pinned host memory when `true`
   or GPU memory when `false`. When omitted, TokenSpeed enables offloading on
   NVIDIA CUDA and disables it on other platforms.
-- `TOKENSPEED_PLE_HOST_CACHE_SLOTS` controls the per-table HBM cache for
-  BF16 or scalar-scaled FP8 host lookups with 16 n-gram heads and head
-  dimension 160 or 512 on each NVIDIA rank. The default is 524288 slots.
-  At head dimension 160 the cache uses 84 MiB for FP8 or 164 MiB for BF16
-  per shard. At head dimension 512 it uses 260 MiB or 516 MiB, respectively.
-  Miss staging is temporary and adds to those amounts. Set the slot count
-  to zero to disable the cache.
 - `index_share_for_mtp_iteration: true`: reuse the QSA top-k selection across
   MTP steps. Checkpoints that already set
   `text_config.index_share_for_mtp_iteration=true` do not need this flag.
+
+### Optional PLE hot cache
+
+Pass `--enable-ple-hot-cache` to cache recently read PLE table rows in HBM.
+The cache defaults to off and applies only to offloaded BF16 or scalar-scaled
+FP8 tables with 16 n-gram heads and head dimension 160 or 512 on supported
+NVIDIA GPUs. `TOKENSPEED_PLE_HOST_CACHE_SLOTS` sets the capacity per shard
+when the flag is enabled (default 524288 slots, zero disables the cache).
+At head dimension 160 the cache uses 84 MiB for FP8 or 164 MiB for BF16 per
+shard. At head dimension 512 it uses 260 MiB or 516 MiB, respectively. Miss
+staging is temporary and adds to those amounts.
 
 ## GPT-OSS 20B / 120B
 
