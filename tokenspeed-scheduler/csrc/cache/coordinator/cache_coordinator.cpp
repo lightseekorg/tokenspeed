@@ -84,6 +84,10 @@ CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t 
 }
 
 CacheCoordinator::~CacheCoordinator() {
+    // Dropping the groups releases their Host entries, which the boundary
+    // tree reports to the mutation sink. Its owner (the scheduler) is already
+    // tearing down, so the sink goes first.
+    store_.SetMutationSink(nullptr);
     // The recorded write-backs and the index entries point at the store's
     // boundary tree and at the evictor's pending keys: drop them while both
     // still exist.
@@ -188,8 +192,8 @@ CacheCoordinator::BoundaryEventStatus CacheCoordinator::GetBoundaryEventStatus(c
     _assert(boundary.namespace_id == kDefaultCacheNamespaceId, "a tracked boundary lies in the default namespace");
     _assert(tail_tokens >= 0 && tail_tokens < store_.PrefixGranularity(), "a tail lies strictly inside a prefix page");
     const BoundaryTree::Node* node = store_.Boundaries().Find(boundary.content_hash);
-    if (node == nullptr) return {.publishable = false, .has_device_entries = false};
-    const std::int32_t device_entries = node->Entries(BoundaryTree::kDevice);
+    if (node == nullptr) return {.device_publishable = false, .host_publishable = false, .retains_descriptor = false};
+    const bool retains_descriptor = node->Entries(BoundaryTree::kDevice) > 0 || node->OnHost();
     // A continuous history group represents locality without requiring the
     // auxiliary sliding windows or sparse checkpoints at every ancestor.
     if (!store_.RoutingHistoryGroups().empty()) {
@@ -200,13 +204,16 @@ CacheCoordinator::BoundaryEventStatus CacheCoordinator::GetBoundaryEventStatus(c
             const auto i = static_cast<std::int32_t>(group);
             expected += tail_tokens > 0 ? store_.TailBlocksFor(i, tail_tokens) : store_.BlocksPerBoundary(i);
         }
-        const std::int32_t cached = node->ClosedEntries(BoundaryTree::kDevice);
-        _assert(cached <= expected, "a boundary's Device history entries lie among its keys");
-        return {.publishable = cached == expected, .has_device_entries = device_entries > 0};
+        const std::int32_t on_device = node->ClosedEntries(BoundaryTree::kDevice);
+        const std::int32_t on_host = node->ClosedEntries(BoundaryTree::kHost);
+        _assert(on_device <= expected && on_host <= expected, "a boundary's history entries lie among its keys");
+        return {.device_publishable = on_device == expected,
+                .host_publishable = on_host == expected,
+                .retains_descriptor = retains_descriptor};
     }
     // No continuous history means no ordinary prefix-residency events.
     // Scheduler configuration rejects enabling this event stream in that case.
-    return {.publishable = false, .has_device_entries = device_entries > 0};
+    return {.device_publishable = false, .host_publishable = false, .retains_descriptor = retains_descriptor};
 }
 
 bool CacheCoordinator::HoldsStateCheckpoint(const ContentHash& content_hash) const {

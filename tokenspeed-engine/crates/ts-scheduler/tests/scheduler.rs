@@ -1445,6 +1445,7 @@ fn python_event_lists_keep_their_payload_after_cache_clear() {
         py.run(
             c"events = scheduler.drain_kv_events()\n\
               assert [e.kind for e in events] == ['BlockStored'] * 3\n\
+              assert [e.medium for e in events] == [None] * 3\n\
               hashes = [e.block_hashes[0] for e in events]\n\
               assert [e.parent_block_hash for e in events] == [None, *hashes[:-1]]\n\
               assert scheduler.clear_cache()\n\

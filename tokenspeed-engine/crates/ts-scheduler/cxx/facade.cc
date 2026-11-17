@@ -436,11 +436,12 @@ std::unique_ptr<tokenspeed::KvEventBatch> make_kv_event_batch(rust::Slice<const 
     auto batch = std::make_unique<tokenspeed::KvEventBatch>();
     for (const auto& event : events) {
         const std::span<const std::uint64_t> hashes{event.block_hashes.data(), event.block_hashes.size()};
+        const auto medium = event.host ? tokenspeed::KvEventMedium::kHost : tokenspeed::KvEventMedium::kDevice;
         if (event.stored) {
             batch->Store(hashes, event.has_parent ? std::optional{event.parent_block_hash} : std::nullopt,
-                         {event.token_ids.data(), event.token_ids.size()}, event.block_size);
+                         {event.token_ids.data(), event.token_ids.size()}, event.block_size, medium);
         } else {
-            batch->Remove(hashes);
+            batch->Remove(hashes, medium);
         }
     }
     return batch;
@@ -482,6 +483,11 @@ rust::Slice<const std::uint64_t> kv_event_hashes(const tokenspeed::KvEventBatch&
 }
 rust::Slice<const std::int32_t> kv_event_tokens(const tokenspeed::KvEventBatch& batch) {
     const auto values = batch.Tokens();
+    return {values.data(), values.size()};
+}
+
+rust::Slice<const std::uint8_t> kv_event_media(const tokenspeed::KvEventBatch& batch) {
+    const auto values = batch.Media();
     return {values.data(), values.size()};
 }
 

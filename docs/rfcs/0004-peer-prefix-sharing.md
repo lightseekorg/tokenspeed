@@ -290,10 +290,15 @@ duplicate. An engine with peer sharing enables these demotion marks.
 ### Router (Dynamo)
 
 **Directory.** Engines already publish KV events. Each event gains the medium
-it concerns (Device or Host pinned), which the Dynamo indexer already models as
-`Placement { owner: (worker, dp rank), tier }`. Under write-back a Device
-eviction that writes back appears as a Device removal and a Host store. The
-indexer needs no dependency structure; the holder enforces it.
+it concerns (Device, or Host pinned as `CPU_PINNED`), which the Dynamo indexer
+already models as `Placement { owner: (worker, dp rank), tier }`; an engine
+with Host L2 publishes its Host blocks whether peer sharing is on or not.
+Each medium's stream is prefix-closed for a router that continues a Device
+match into the Host tier: a Device block is out once its parent is out on the
+Device, a Host block once its parent is out on either medium. Under
+write-back a Device eviction that writes back appears as a Device removal and,
+once the copy lands, a Host store. The indexer needs no dependency structure;
+the holder enforces it.
 
 **Scoring.** Worker scoring today credits a candidate's own Device and Host
 overlap and discounts prefill by shared-cache hits beyond its Device prefix.

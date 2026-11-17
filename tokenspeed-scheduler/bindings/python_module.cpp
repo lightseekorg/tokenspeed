@@ -91,16 +91,26 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     m.doc() = "TokenSpeed scheduler bindings";
 
     nb::module_ kv_event = m.def_submodule("KVEvent");
+    // The memory an event concerns, as vLLM's events name it: None for the
+    // GPU cache, "CPU_PINNED" for the pinned Host cache.
+    const auto medium_name = [](tokenspeed::KvEventMedium medium) -> nb::object {
+        if (medium == tokenspeed::KvEventMedium::kDevice) return nb::none();
+        return nb::str("CPU_PINNED");
+    };
     nb::class_<tokenspeed::KvBlockStoredEvent>(kv_event, "BlockStored")
         .def_prop_ro("kind", [](const tokenspeed::KvBlockStoredEvent&) { return "BlockStored"; })
         .def_ro("block_hashes", &tokenspeed::KvBlockStoredEvent::block_hashes)
         .def_ro("parent_block_hash", &tokenspeed::KvBlockStoredEvent::parent_block_hash)
         .def_ro("token_ids", &tokenspeed::KvBlockStoredEvent::token_ids)
-        .def_ro("block_size", &tokenspeed::KvBlockStoredEvent::block_size);
+        .def_ro("block_size", &tokenspeed::KvBlockStoredEvent::block_size)
+        .def_prop_ro("medium",
+                     [medium_name](const tokenspeed::KvBlockStoredEvent& event) { return medium_name(event.medium); });
 
     nb::class_<tokenspeed::KvBlockRemovedEvent>(kv_event, "BlockRemoved")
         .def_prop_ro("kind", [](const tokenspeed::KvBlockRemovedEvent&) { return "BlockRemoved"; })
-        .def_ro("block_hashes", &tokenspeed::KvBlockRemovedEvent::block_hashes);
+        .def_ro("block_hashes", &tokenspeed::KvBlockRemovedEvent::block_hashes)
+        .def_prop_ro("medium",
+                     [medium_name](const tokenspeed::KvBlockRemovedEvent& event) { return medium_name(event.medium); });
 
     auto scheduler_config = nb::class_<tokenspeed::SchedulerConfig>(m, "SchedulerConfig");
 

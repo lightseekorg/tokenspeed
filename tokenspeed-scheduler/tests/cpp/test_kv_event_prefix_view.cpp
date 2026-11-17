@@ -25,9 +25,9 @@
 
 #include <gtest/gtest.h>
 #include <optional>
-#include <array>
 #include <random>
 #include <set>
+#include <tuple>
 #include <vector>
 
 namespace tokenspeed::test {
@@ -49,7 +49,113 @@ std::vector<std::uint64_t> Hashes(const std::vector<KvCacheEvent>& events, bool 
     }
     return hashes;
 }
+constexpr std::array<bool, kNumKvEventMedia> kOnDevice{true, false};
+constexpr std::array<bool, kNumKvEventMedia> kOnHost{false, true};
+constexpr std::array<bool, kNumKvEventMedia> kOnBoth{true, true};
+
+KvEventDescriptorRef Descriptor(std::uint64_t hash, std::optional<std::uint64_t> parent) {
+    return std::make_shared<const KvEventDescriptor>(
+        KvEventDescriptor{hash, parent, {static_cast<std::int32_t>(hash)}, 1});
+}
+
+KvEventMutation Resident(std::uint64_t hash, std::optional<std::uint64_t> parent,
+                         std::array<bool, kNumKvEventMedia> media) {
+    return KvEventMutation{hash, Descriptor(hash, parent), media};
+}
+
+KvEventMutation Gone(std::uint64_t hash) {
+    return KvEventMutation{hash, {}, {}};
+}
+
+// (stored, medium, hash) per event, in batch order.
+std::vector<std::tuple<bool, KvEventMedium, std::uint64_t>> Feed(const KvEventBatch& batch) {
+    std::vector<std::tuple<bool, KvEventMedium, std::uint64_t>> feed;
+    for (const auto& event : batch.ToEvents()) {
+        if (const auto* stored = std::get_if<KvBlockStoredEvent>(&event)) {
+            feed.emplace_back(true, stored->medium, stored->block_hashes.front());
+        } else {
+            const auto& removed = std::get<KvBlockRemovedEvent>(event);
+            feed.emplace_back(false, removed.medium, removed.block_hashes.front());
+        }
+    }
+    return feed;
+}
+
+constexpr auto kD = KvEventMedium::kDevice;
+constexpr auto kH = KvEventMedium::kHost;
 }  // namespace
+
+TEST(KvEventPrefixView, AHostBoundaryUnderADeviceParentIsOutOnTheHost) {
+    KvEventPrefixView view;
+    const std::array mutations{Resident(2, 1, kOnHost), Resident(1, std::nullopt, kOnDevice)};
+    // Under write-back the tiers hold complementary parts of one prefix.
+    EXPECT_EQ(Feed(view.ApplyMutations(mutations)),
+              (std::vector<std::tuple<bool, KvEventMedium, std::uint64_t>>{{true, kD, 1}, {true, kH, 2}}));
+    // The Device stream stays closed on the Device: a Device child of a Host
+    // parent is not out there, but is on no other medium either.
+    const std::array child{Resident(3, 2, kOnDevice)};
+    EXPECT_TRUE(view.ApplyMutations(child).Empty());
+}
+
+TEST(KvEventPrefixView, AHostBoundaryWhoseParentIsOutNowhereIsNotOut) {
+    KvEventPrefixView view;
+    // The Device parent is out on no stream: its own parent is on the Host
+    // only, so the Device stream cannot hold it, and it is not on the Host.
+    const std::array chain{Resident(1, std::nullopt, kOnHost), Resident(2, 1, kOnDevice), Resident(3, 2, kOnHost)};
+    EXPECT_EQ(Feed(view.ApplyMutations(chain)),
+              (std::vector<std::tuple<bool, KvEventMedium, std::uint64_t>>{{true, kH, 1}}));
+    // Once the parent reaches the Host too, the child follows.
+    const std::array copied{Resident(2, 1, kOnBoth)};
+    EXPECT_EQ(Feed(view.ApplyMutations(copied)),
+              (std::vector<std::tuple<bool, KvEventMedium, std::uint64_t>>{{true, kH, 2}, {true, kH, 3}}));
+}
+
+TEST(KvEventPrefixView, AHostChainFollowsItsAncestorsOnEitherMedium) {
+    KvEventPrefixView view;
+    const std::array initial{Resident(1, std::nullopt, kOnDevice), Resident(2, 1, kOnHost), Resident(3, 2, kOnHost)};
+    EXPECT_EQ(Feed(view.ApplyMutations(initial)).size(), 3u);
+    // The root leaves both media: its Host descendants are no longer reachable.
+    const std::array root_gone{Gone(1)};
+    EXPECT_EQ(Feed(view.ApplyMutations(root_gone)), (std::vector<std::tuple<bool, KvEventMedium, std::uint64_t>>{
+                                                        {false, kH, 3}, {false, kH, 2}, {false, kD, 1}}));
+    // It comes back on the Host: the chain is out on the Host again.
+    const std::array root_back{Resident(1, std::nullopt, kOnHost)};
+    EXPECT_EQ(Feed(view.ApplyMutations(root_back)), (std::vector<std::tuple<bool, KvEventMedium, std::uint64_t>>{
+                                                        {true, kH, 1}, {true, kH, 2}, {true, kH, 3}}));
+}
+
+TEST(KvEventPrefixView, AWriteBackMovesABoundaryFromOneStreamToTheOther) {
+    KvEventPrefixView view;
+    const std::array cached{Resident(1, std::nullopt, kOnDevice), Resident(2, 1, kOnDevice)};
+    EXPECT_EQ(Feed(view.ApplyMutations(cached)).size(), 2u);
+    // Write-through: both media at once, two events for one boundary.
+    const std::array copied{Resident(2, 1, kOnBoth)};
+    EXPECT_EQ(Feed(view.ApplyMutations(copied)),
+              (std::vector<std::tuple<bool, KvEventMedium, std::uint64_t>>{{true, kH, 2}}));
+    // The Device copy leaves: removals come first, leaf-first.
+    const std::array evicted{Resident(2, 1, kOnHost), Resident(1, std::nullopt, kOnHost)};
+    EXPECT_EQ(Feed(view.ApplyMutations(evicted)), (std::vector<std::tuple<bool, KvEventMedium, std::uint64_t>>{
+                                                      {false, kD, 2}, {false, kD, 1}, {true, kH, 1}}));
+    EXPECT_THROW(view.ApplyMutations(std::array{KvEventMutation{4, Descriptor(4, std::nullopt), {}}}),
+                 std::invalid_argument)
+        << "a stored boundary names where it is resident";
+}
+
+TEST(KvEventPrefixView, TheMediumSurvivesTheBatchColumns) {
+    const std::vector<KvCacheEvent> events{
+        KvBlockStoredEvent{
+            .block_hashes = {7}, .parent_block_hash = 3, .token_ids = {1}, .block_size = 1, .medium = kH},
+        KvBlockRemovedEvent{.block_hashes = {3}, .medium = kH},
+        KvBlockRemovedEvent{.block_hashes = {5}},
+    };
+    const KvEventBatch batch = KvEventBatch::FromEvents(events);
+    EXPECT_EQ(std::vector<std::uint8_t>(batch.Media().begin(), batch.Media().end()),
+              (std::vector<std::uint8_t>{1, 1, 0}));
+    const auto restored = batch.ToEvents();
+    EXPECT_EQ(std::get<KvBlockStoredEvent>(restored[0]).medium, kH);
+    EXPECT_EQ(std::get<KvBlockRemovedEvent>(restored[1]).medium, kH);
+    EXPECT_EQ(std::get<KvBlockRemovedEvent>(restored[2]).medium, kD) << "the Device is the default";
+}
 
 TEST(KvEventPrefixView, MiddleEvictionWithdrawsAndRestoresResidentDescendants) {
     KvEventPrefixView view;
@@ -153,9 +259,9 @@ TEST(KvEventPrefixView, SnapshotsSurviveFurtherMutationsAndTheRoutingView) {
         KvEventPrefixView view;
         const auto parent = std::make_shared<const KvEventDescriptor>(KvEventDescriptor{1, {}, {1, 2}, 2});
         const auto child = std::make_shared<const KvEventDescriptor>(KvEventDescriptor{2, 1, {3}, 2});
-        const std::array initial{KvEventMutation{2, child}, KvEventMutation{1, parent}};
+        const std::array initial{KvEventMutation{2, child, {true, false}}, KvEventMutation{1, parent, {true, false}}};
         snapshot = view.ApplyMutations(initial);
-        const std::array removed{KvEventMutation{1, {}}, KvEventMutation{2, {}}};
+        const std::array removed{KvEventMutation{1, {}, {}}, KvEventMutation{2, {}, {}}};
         EXPECT_EQ(Hashes(view.ApplyMutations(removed).ToEvents(), false), (std::vector<std::uint64_t>{2, 1}));
     }
     const auto events = snapshot.ToEvents();

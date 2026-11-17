@@ -435,6 +435,8 @@ mod ffi {
         token_ids: Vec<i32>,
         /// Stored: tokens per block.
         block_size: i32,
+        /// The event concerns the Host cache; else the Device.
+        host: bool,
     }
 
     /// A peer lease's name: its reader and the reader's own counter
@@ -659,6 +661,7 @@ mod ffi {
         fn kv_event_token_offsets(batch: &KvEventBatch) -> &[usize];
         fn kv_event_hashes(batch: &KvEventBatch) -> &[u64];
         fn kv_event_tokens(batch: &KvEventBatch) -> &[i32];
+        fn kv_event_media(batch: &KvEventBatch) -> &[u8];
         fn request_token_size(scheduler: &Scheduler, request_id: &str) -> i32;
         fn can_abort_before_admission(scheduler: &Scheduler, request_id: &str) -> bool;
         fn storage_pending(scheduler: &Scheduler) -> bool;
@@ -1062,6 +1065,17 @@ pub struct KvEvent<'a> {
     pub token_ids: &'a [i32],
     /// Tokens in a full block.
     pub block_size: i32,
+    /// The memory the event concerns.
+    pub medium: KvEventMedium,
+}
+
+/// The memory a KV event concerns (`tokenspeed::KvEventMedium`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KvEventMedium {
+    /// The GPU cache.
+    Device,
+    /// The pinned Host cache (Host L2).
+    Host,
 }
 impl KvEventBatch {
     /// Copy independent event rows into an owned batch, preserving wire fields.
@@ -1106,6 +1120,7 @@ impl KvEventBatch {
         let token_offsets = columns.map_or(&[][..], ffi::kv_event_token_offsets);
         let hashes = columns.map_or(&[][..], ffi::kv_event_hashes);
         let tokens = columns.map_or(&[][..], ffi::kv_event_tokens);
+        let media = columns.map_or(&[][..], ffi::kv_event_media);
         (0..stored.len()).map(move |i| KvEvent {
             stored: stored[i] != 0,
             block_hashes: &hashes[hash_offsets[i]..hash_offsets[i + 1]],
@@ -1113,6 +1128,11 @@ impl KvEventBatch {
             parent_block_hash: parents[i],
             token_ids: &tokens[token_offsets[i]..token_offsets[i + 1]],
             block_size: block_sizes[i],
+            medium: if media[i] == 0 {
+                KvEventMedium::Device
+            } else {
+                KvEventMedium::Host
+            },
         })
     }
 }

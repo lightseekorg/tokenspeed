@@ -489,16 +489,20 @@ public:
     void CacheDeviceBlock(CacheBlockRef& block_ref, const CacheKey& key, std::int32_t logical_block_index,
                           CacheBoundaryKind boundary_kind, std::uint64_t access_epoch);
 
-    // Reports real device-cache entry insertions and removals. The scheduler
-    // folds the per-group mutations into one externally visible prefix event.
+    // Reports real Device cache entry insertions and removals, and changes of
+    // a boundary's Host entries (CacheMutation). The scheduler folds the
+    // per-group mutations into one externally visible prefix event per medium.
     void SetCacheMutationSink(CacheMutationSink sink) { store_.SetMutationSink(std::move(sink)); }
     struct BoundaryEventStatus {
-        bool publishable;
-        bool has_device_entries;
+        bool device_publishable;
+        bool host_publishable;
+        bool retains_descriptor;
     };
-    // Routing requires every continuous-history group on Device; auxiliary
-    // windows and State do not gate publication. Without continuous history,
-    // no boundary is publishable. Any Device entry retains the descriptor.
+    // Routing requires every continuous-history group on the medium (the
+    // Device, or the Host); auxiliary windows and State do not gate
+    // publication. Without continuous history, no boundary is publishable.
+    // Any Device entry, Host entry or pending Host store retains the
+    // descriptor: a write-back store follows the Device eviction.
     BoundaryEventStatus GetBoundaryEventStatus(const CacheKey& boundary, std::int32_t tail_tokens) const;
     // Whether every State group caches its checkpoint published under the
     // chain hash content_hash, on the Device or the Host, as the probe takes

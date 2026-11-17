@@ -1403,15 +1403,21 @@ Req: chatcmpl-019ef6b7 Finish! RequestStats(status='finished', reason='stop', pr
 
 ### KV cache events
 
-KV cache events publish reusable device prefix-cache mutations from the live
-C++ scheduler path. This initial stream does not publish Host/L2 loadback
-events. The scheduler caches block hash lineage on prefix-cache nodes, so
-publishing a stored block uses the parent node's cached hash instead of
-rebuilding the full ancestor prefix.
+KV cache events publish reusable prefix-cache mutations from the live C++
+scheduler path, on two media: the GPU cache (no medium) and, with Host L2
+(`--enable-kvstore`), the pinned Host cache (medium `CPU_PINNED`). The
+scheduler caches block hash lineage on prefix-cache nodes, so publishing a
+stored block uses the parent node's cached hash instead of rebuilding the full
+ancestor prefix.
 
-Host L2 entries publish no events. Under `--kvstore-write-policy write_back`,
-a block the GPU evicts is reported `BlockRemoved` even when it is written
-back to the Host.
+Each medium's stream is prefix-closed for a router that continues a GPU match
+into the Host tier: a GPU block is stored once its parent is stored on the
+GPU, and a Host block once its parent is stored on either medium. A block on
+both media is stored on each. Under `--kvstore-write-policy write_back`, a
+block the GPU evicts is reported `BlockRemoved` on the GPU and, once its copy
+lands, `BlockStored` on the Host. A Host block read from L3 for a prefix this
+engine never published carries no tokens to describe it and publishes
+nothing.
 
 Example:
 
@@ -1423,9 +1429,12 @@ The ZMQ publisher sends three frames: topic bytes, an 8-byte big-endian sequence
 number, and a msgpack payload. The payload is an array-like `KVEventBatch`:
 
 ```python
-[timestamp, [["BlockStored", [block_hash], parent_hash, token_ids, block_size]], attn_dp_rank]
-[timestamp, [["BlockRemoved", [block_hash]]], attn_dp_rank]
+[timestamp, [["BlockStored", [block_hash], parent_hash, token_ids, block_size, None, medium]], attn_dp_rank]
+[timestamp, [["BlockRemoved", [block_hash], medium]], attn_dp_rank]
 ```
+
+This is vLLM's layout: the `None` is `lora_id`, and `medium` is `None` for
+the GPU cache or `"CPU_PINNED"` for the Host cache.
 
 With attention data parallelism, each attention DP rank publishes on an offset
 port from the configured endpoint.

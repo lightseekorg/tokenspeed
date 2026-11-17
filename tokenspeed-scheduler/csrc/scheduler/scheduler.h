@@ -845,18 +845,20 @@ private:
     // currently out (a BlockStored not yet followed by its BlockRemoved).
     // Residency itself is the coordinator's answer, never mirrored here.
     // Cache mutations and registrations only mark a boundary for reconcile;
-    // DrainKvEvents reconciles each marked boundary against its residency, so
-    // the order of evictions and publications inside one admission does not
-    // matter. After a drain, a descriptor exists exactly for the boundaries
-    // with any Device cached child, including State entries excluded from
-    // routing residency: their later mutations still need the descriptor.
+    // DrainKvEvents reconciles each marked boundary against its residency on
+    // the Device and on the Host, so the order of evictions and publications
+    // inside one admission does not matter. After a drain, a descriptor exists
+    // exactly for the boundaries with any Device cached child, including State
+    // entries excluded from routing residency, or any Host entry or pending
+    // Host store: their later mutations still need the descriptor.
     struct KvEventBoundary {
         KvEventDescriptorRef stored;
         // Position in the prefix chain (page index). Consumers resolve a
         // Stored event's parent_block_hash on receipt, so DrainKvEvents
         // orders each batch by depth rather than by mutation order.
         std::int32_t depth{0};
-        bool published{false};
+        // Out on each medium (KvEventMedium order).
+        std::array<bool, kNumKvEventMedia> published{};
         bool needs_reconcile{false};
     };
     std::unordered_map<CacheKey, KvEventBoundary, CacheKeyHash> kv_event_boundaries_;
