@@ -140,6 +140,20 @@ class _ExtendGraph:
 
 
 @runtime_checkable
+class DraftOverlapModel(Protocol):
+    """A model whose draft tail can overlap the next target's preparation.
+
+    After step one, the tail must not read inputs or target metadata that the
+    next round refreshes, or state that the verified-result commit mutates.
+    Implementations (including subclasses) own this promise; the runtime still
+    checks history, cache ownership and the selected execution path separately.
+    """
+
+    @property
+    def supports_draft_overlap(self) -> bool: ...
+
+
+@runtime_checkable
 class SplitExtendDraft(Protocol):
     """A one-layer draft whose rows meet only at attention: its extend rounds split."""
 
@@ -262,6 +276,20 @@ class Eagle(HiddenStateDrafter):
         self._extend_graph_engaged = False
         self._kv_tile: _KVTile | None = None
         self._split_draft = isinstance(draft_model_runner.model, SplitExtendDraft)
+
+    def validate_decode_overlap(self) -> None:
+        """Check the draft tail before releasing the execution stream early."""
+        model = self.draft_model_runner.model
+        if not isinstance(model, DraftOverlapModel) or not model.supports_draft_overlap:
+            raise ValueError("Draft model does not declare support for draft overlap")
+        # The prefix event is recorded before the remaining chain steps.
+        # ServerArgs already validates verify width == draft steps + 1.
+        if self.spec_num_steps < 2:
+            raise ValueError("Draft graph overlap requires at least two draft steps")
+        if self.tree_spec is not None or self.draft_sampler is not None:
+            raise ValueError("Draft graph overlap requires a greedy draft chain")
+        if self.draft_reads_token_history:
+            raise ValueError("Draft graph overlap does not support draft token history")
 
     @override
     def slot_state_rows(self, slot: int) -> list[torch.Tensor]:
@@ -591,6 +619,9 @@ class Eagle(HiddenStateDrafter):
             self.draft_history_lengths_buf.index_copy_(
                 0, history_pool_indices, cache_start.to(torch.int32)
             )
+
+        if self.decode_overlap is not None:
+            self.decode_overlap.record_prefix()
 
         for i in range(first_step, self.spec_num_steps):
             # make a ctx every time model runner forward

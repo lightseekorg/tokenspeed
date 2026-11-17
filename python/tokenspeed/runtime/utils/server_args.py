@@ -65,7 +65,11 @@ from tokenspeed.runtime.utils import (
     nullable_str,
 )
 from tokenspeed.runtime.utils.launcher import check_dist_init_port, detect_topology
-from tokenspeed.runtime.utils.network import is_port_available, join_host_port
+from tokenspeed.runtime.utils.network import (
+    is_port_available,
+    join_host_port,
+    split_host_port,
+)
 from tokenspeed.runtime.utils.spec_block_geometry import (
     BLOCK_SPEC_ALGORITHMS,
     BLOCK_SPEC_RULES,
@@ -4013,7 +4017,8 @@ class ServerArgs:
         parser.add_argument(
             "--dist-init-addr",
             type=str,
-            help="The host address for initializing distributed backend (e.g., `192.168.0.2:25000`). "
+            help="The host address for initializing distributed backend (e.g., `192.168.0.2:25000`, "
+            "or `[fd00::2]:25000` for IPv6). "
             "Derived from the launcher environment under a multi-node Slurm step.",
         )
         parser.add_argument(
@@ -5452,11 +5457,13 @@ class PortArgs:
                 "Example: --dist-init-addr <head-node-ip>:20000"
             )
         else:
-            dist_init_addr = server_args.dist_init_addr.split(":")
-        if len(dist_init_addr) != 2:
-            raise ValueError(
-                "please provide --dist-init-addr as host:port of head node"
-            )
+            try:
+                dist_init_addr = split_host_port(server_args.dist_init_addr)
+            except ValueError:
+                raise ValueError(
+                    "please provide --dist-init-addr as host:port (or [ipv6]:port) "
+                    "of head node"
+                ) from None
 
         dist_init_host, dist_init_port = dist_init_addr
         dist_init_port = int(dist_init_port)
@@ -5506,11 +5513,11 @@ class PortArgs:
             dist_init_port += 10
 
         return PortArgs(
-            tokenizer_ipc_name=f"tcp://{dist_init_host}:{port_base}",
-            scheduler_input_ipc_name=f"tcp://{dist_init_host}:{scheduler_input_port}",
+            tokenizer_ipc_name=f"tcp://{join_host_port(dist_init_host, port_base)}",
+            scheduler_input_ipc_name=f"tcp://{join_host_port(dist_init_host, scheduler_input_port)}",
             nccl_port=port,
-            dist_init_addr=f"{dist_init_host}:{dist_init_port}",
-            rpc_ipc_name=f"tcp://{dist_init_host}:{rpc_port}",
-            metrics_ipc_name=f"tcp://{dist_init_host}:{metrics_ipc_port}",
+            dist_init_addr=join_host_port(dist_init_host, dist_init_port),
+            rpc_ipc_name=f"tcp://{join_host_port(dist_init_host, rpc_port)}",
+            metrics_ipc_name=f"tcp://{join_host_port(dist_init_host, metrics_ipc_port)}",
             tokenizer_worker_ipc_name=None,
         )
