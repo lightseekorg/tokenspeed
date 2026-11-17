@@ -184,8 +184,9 @@ Memory rules on gfx950 (coarse-grained VRAM):
 - Data that a later launch reads from another GPU follows the same rule
   without a flag: the writer stores write-through (`.wt`) and the reader
   loads past the caches (`.cv`), since a peer's store does not update the
-  reader's L2. A draft's taps, stored by the target's launches on every
-  GPU, cross launches and GPUs this way.
+  reader's L2. A draft's taps cross launches this way too: each GPU's
+  launches store its own copy, but the draft's CTAs on other XCDs would
+  otherwise read an earlier step's line from their L2.
 - Many waves that spin on `sc1` loads can starve the producers' stores, and
   the grid can then livelock. Before a poll that all waves of many CTAs make,
   `pre_poll` (or `pre_poll_spread`) lets wave 0 spin on one hint pair for each

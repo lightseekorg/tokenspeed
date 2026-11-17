@@ -90,6 +90,7 @@ class SnapshotOp:
     Attributes:
         op_id: The scheduler's ticket; the ACK carries it back.
         request_id: The victim.
+        admission_id: The immutable identity of this request admission.
         request_pool_index: The victim's slot, whose state is exported. The
             FSM frees the slot in the same plan build, and a new owner first
             writes it in a forward behind the store's fence, so the export
@@ -102,6 +103,7 @@ class SnapshotOp:
 
     op_id: int
     request_id: str
+    admission_id: int
     request_pool_index: int
     snapshot_slot: int
     transfers: tuple[CacheTransfer, ...]
@@ -114,6 +116,7 @@ class RestoreOp:
     Attributes:
         op_id: The scheduler's ticket; the ACK carries it back.
         request_id: The request resuming.
+        admission_id: The same identity the request had before retraction.
         request_pool_index: The request's NEW slot, whose state is imported.
         snapshot_slot: The arena row the store imaged into.
         transfers: Host block to Device block, both tiers.
@@ -122,6 +125,7 @@ class RestoreOp:
 
     op_id: int
     request_id: str
+    admission_id: int
     request_pool_index: int
     snapshot_slot: int
     transfers: tuple[CacheTransfer, ...]

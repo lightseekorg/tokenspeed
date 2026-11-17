@@ -198,11 +198,20 @@ void SchedulerConfig::Validate() const {
     if (prefill_decode_interval < 0) {
         throw std::invalid_argument("Scheduler: prefill_decode_interval (--prefill-decode-interval) must be >= 0");
     }
+    if (prefill_decode_min_interval < 0) {
+        throw std::invalid_argument(
+            "Scheduler: prefill_decode_min_interval (--prefill-decode-min-interval) must be >= 0");
+    }
     // Only the fused role runs local prefill rounds and decodes on one engine.
     if (prefill_decode_interval != 0 && role != Role::kFused) {
         throw std::invalid_argument(
             "Scheduler: prefill_decode_interval (--prefill-decode-interval) applies to the fused role only: a P "
             "node runs no decodes and a D node no local prefill");
+    }
+    if (prefill_decode_min_interval != 0 && role != Role::kFused) {
+        throw std::invalid_argument(
+            "Scheduler: prefill_decode_min_interval (--prefill-decode-min-interval) applies to the fused role only: "
+            "a P node runs no decodes and a D node no local prefill");
     }
     if (HasHostCache() || HasSnapshotPool()) {
         if (host_group_packing.size() != cache_groups.size()) {
@@ -233,6 +242,14 @@ void SchedulerConfig::ValidateCapacityInputs() const {
     }
     if (max_batch_size < 0) {
         throw std::invalid_argument("Scheduler: max_batch_size must be >= 0");
+    }
+    if (max_resident_requests < max_batch_size ||
+        max_resident_requests > std::numeric_limits<std::int32_t>::max() - 2) {
+        throw std::invalid_argument(
+            "Scheduler: max_resident_requests must cover max_batch_size and leave room for null and padding rows");
+    }
+    if (role != Role::kD && max_resident_requests != max_batch_size) {
+        throw std::invalid_argument("Scheduler: extra resident requests require the decode role");
     }
     if (checkpoint_retention_requests &&
         (*checkpoint_retention_requests < 0 || *checkpoint_retention_requests > kMaxCheckpointRetentionRequests)) {

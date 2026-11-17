@@ -160,10 +160,9 @@ std::vector<CacheKey> StorageTransferManager::QueryHits(std::uint64_t id) {
     return keys;
 }
 
-StorageLease StorageTransferManager::StartRead(const CacheCoordinator::PromptPrefix& prompt,
-                                               std::span<const CacheKey> hits) {
+StorageLease StorageTransferManager::StartRead(const PromptPrefix& prompt, std::span<const CacheKey> hits) {
     if (!CanStart() || hits.empty()) return {};
-    auto reservation = coordinator_.ReserveStoragePrefix(prompt, hits, availableHostCredits());
+    auto reservation = coordinator_.Storage().ReserveStoragePrefix(prompt, hits, availableHostCredits());
     if (reservation.keys.empty()) return {};
     StorageGetOperation op{nextId(), reservation.keys, {}};
     for (std::size_t i = 0; i < reservation.blocks.size(); ++i) {
@@ -225,14 +224,15 @@ void StorageTransferManager::Complete(const cache::StorageDone& event) {
                 std::erase(published_order_, ticket.keys[i]);
             }
             if (event.retired && !ticket.detached && ticket.success[i]) {
-                coordinator_.CacheHostBlock(ticket.blocks[i], ticket.keys[i], /*inherited_metadata=*/std::nullopt);
+                coordinator_.Host().CacheHostBlock(ticket.blocks[i], ticket.keys[i],
+                                                   /*inherited_metadata=*/std::nullopt);
                 // A successful accepted GET proves the immutable object also
                 // existed remotely. A later producer need not PUT it again.
                 rememberPublished(ticket.keys[i]);
             }
         }
         if (event.retired && !ticket.detached && ticket.tail) {
-            coordinator_.CacheHostTail(ticket.tail_prior, *ticket.tail);
+            coordinator_.Host().CacheHostTail(ticket.tail_prior, *ticket.tail);
         }
     }
     if (!event.retired) return;  // Quarantine is charged until a process/transport teardown proves safety.
@@ -315,7 +315,7 @@ void StorageTransferManager::StartBackups() {
         CacheKey key = std::move(backup_candidates_.front());
         backup_candidates_.pop_front();
         if (!pending.insert(key).second) continue;
-        CacheBlockRef ref = coordinator_.AcquireHostCachedBlock(key);
+        CacheBlockRef ref = coordinator_.Store().AcquireHostCachedBlock(key);
         if (!ref) {
             ++unavailable_dropped_backup_keys_;
             continue;

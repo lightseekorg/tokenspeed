@@ -72,6 +72,7 @@ def _backend(
         kv_cache_quant_method="none",
         context_len=1024,
         max_bs=16,
+        max_resident_requests=16,
         speculative_num_draft_tokens=width,
         is_draft=is_draft,
         draft_block_decode=block_decode,
@@ -391,6 +392,7 @@ def _block_runtime():
     drafter.draft_seq_lens_buf = torch.zeros(4, dtype=torch.int32)
     drafter.context_starts_buf = torch.zeros(4, dtype=torch.int64)
     drafter.context_locs_buf = torch.zeros(4 * 16, dtype=torch.int32)
+    drafter.draft_block_end_lens_buf = torch.zeros(4, dtype=torch.int32)
     drafter.block_ids_buf = torch.ones((4, 16), dtype=torch.int32)
     drafter.block_positions_buf = torch.zeros((4, 16), dtype=torch.int64)
     drafter.block_offsets = torch.arange(16, dtype=torch.int64).unsqueeze(0)
@@ -402,6 +404,7 @@ def _block_runtime():
     # wire_target's choice for a one-rank layout: the lookup is the input.
     drafter._first_layer_input = "full"
     runner = ForwardStepRunner.__new__(ForwardStepRunner)
+    runner.dp_local_graph = False
     runner.attn_backend, runner.draft_attn_backend = routers
     runner.drafter = drafter
     runner.max_tokens_per_req = 16
@@ -573,8 +576,10 @@ def test_block_draft_mixed_to_decode_refreshes_all_owners_and_reordered_slots(
         if for_graph_replay:
             # Select the in-graph metadata branch without constructing a GPU
             # stream or graph. The outer CPU test runner denies initialization.
-            capture.setattr(torch.cuda, "is_available", lambda: True)
-            capture.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+            capture.setattr(
+                "tokenspeed.runtime.execution.drafter.dflash.is_current_stream_capturing",
+                lambda device: True,
+            )
         drafter._update_draft_prefix_lengths(decode_ctx, next_accepts)
         assert (
             drafter.draft_seq_lens_buf[:block_bs].tolist() == block_prefixes[:block_bs]

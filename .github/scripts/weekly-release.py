@@ -47,7 +47,7 @@ REPO = "lightseekorg/tokenspeed"
 WHL = "lightseekorg/whl"
 IDENTITY = "243258330+lightseek-bot@users.noreply.github.com"
 STAGES = ("plan", "amd", "kernel", "tokenspeed", "index", "docker", "release")
-SCHEDULER_STAGES = ("scheduler-version", "scheduler-publish", "scheduler-dependency")
+SCHEDULER_STAGES = ("scheduler-version", "scheduler-publish")
 MLA_STAGES = ("mla-version", "mla-publish", "mla-dependency")
 PACKAGES = {
     "amd": "tokenspeed-kernel-amd",
@@ -289,7 +289,6 @@ def preflight():
     versions = {}
     for package, path in (
         ("tokenspeed-mla", "tokenspeed-kernel/python/requirements/cuda-thirdparty.txt"),
-        ("tokenspeed-scheduler", "python/pyproject.toml"),
     ):
         version = latest_version(package)
         if read_version(package) != version:
@@ -1573,7 +1572,11 @@ class Release:
 
 
 class ComponentRelease(Release):
-    """Release one component before merging its downstream requirement."""
+    """Release one component, then merge its downstream requirement if it has one.
+
+    ``stages`` is the version and publish stages, then an optional dependency
+    stage.
+    """
 
     package: str
     stages: tuple[str, ...]
@@ -1585,7 +1588,7 @@ class ComponentRelease(Release):
         return f"bot/{stage}-{version}"
 
     def pr_title(self, stage, version):
-        if stage == self.stages[2]:
+        if stage in self.stages[2:]:
             return f"build: require {self.package} {version}"
         return super().pr_title(stage, version)
 
@@ -1619,9 +1622,10 @@ class ComponentRelease(Release):
         self.phase["base"] = command("git", "rev-parse", "HEAD")
         self.state["initial_versions"] = {self.package: current}
         self.state["versions"] = {self.package: version}
-        self.state["initial_dependency"] = str(
-            requirements(self.pr_files[self.stages[2]][0])[self.package].specifier
-        )
+        if self.stages[2:]:
+            self.state["initial_dependency"] = str(
+                requirements(self.pr_files[self.stages[2]][0])[self.package].specifier
+            )
         self.save()
 
     def wait_index(self, files):
@@ -1647,7 +1651,7 @@ class ComponentRelease(Release):
     def gate(self):
         current = read_version(self.package)
         version = self.state["versions"][self.package]
-        if self.stage == self.stages[2]:
+        if self.stage in self.stages[2:]:
             if (
                 not self.state["stages"].get(self.stages[1], {}).get("complete")
                 or current != version
@@ -1701,32 +1705,11 @@ class ComponentRelease(Release):
 class SchedulerRelease(ComponentRelease):
     package = "tokenspeed-scheduler"
     stages = SCHEDULER_STAGES
-    packages_by_stage = {
-        "scheduler-version": "tokenspeed-scheduler",
-        "scheduler-dependency": "tokenspeed-scheduler",
-    }
-    pr_files = {
-        "scheduler-version": [PROJECTS["tokenspeed-scheduler"]],
-        "scheduler-dependency": [PROJECTS["tokenspeed"]],
-    }
-    pr_body = "Keep the scheduler release ordered so TokenSpeed requires an already published version.\n"
-
-    def update_metadata(self, stage):
-        if stage == "scheduler-version":
-            return super().update_metadata(stage)
-        version = self.state["versions"]["tokenspeed-scheduler"]
-        specifier = str(
-            requirements(PROJECTS["tokenspeed"])["tokenspeed-scheduler"].specifier
-        )
-        if not re.fullmatch(r">=\d+\.\d+\.\d+", specifier) or Version(
-            specifier[2:]
-        ) > Version(version):
-            raise RuntimeError("Scheduler dependency changed outside this release")
-        replace(
-            PROJECTS["tokenspeed"],
-            r'"tokenspeed-scheduler>=[^"]+"',
-            f'"tokenspeed-scheduler>={version}"',
-        )
+    packages_by_stage = {"scheduler-version": "tokenspeed-scheduler"}
+    pr_files = {"scheduler-version": [PROJECTS["tokenspeed-scheduler"]]}
+    # TokenSpeed uses the scheduler tokenspeed-engine builds in, so the
+    # standalone wheel has no downstream requirement to update.
+    pr_body = "Set the scheduler version to publish.\n"
 
     def available(self, version):
         tag = f"tokenspeed-scheduler-v{version}"
@@ -1759,12 +1742,12 @@ class SchedulerRelease(ComponentRelease):
             raise RuntimeError("Scheduler publication is missing or yanked")
         files = {f["filename"]: f["digests"]["sha256"] for f in release["urls"]}
         if (
-            len(files) != 9
-            or sum(name.endswith(".whl") for name in files) != 8
+            len(files) != 5
+            or sum(name.endswith(".whl") for name in files) != 4
             or sum(name.endswith(".tar.gz") for name in files) != 1
         ):
             raise RuntimeError(
-                "Scheduler publication requires eight wheels and one source distribution"
+                "Scheduler publication requires four wheels and one source distribution"
             )
         return files
 

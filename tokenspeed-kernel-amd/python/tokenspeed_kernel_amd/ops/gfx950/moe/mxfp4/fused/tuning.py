@@ -70,6 +70,30 @@ _GROUPED_MOE_CONFIGS = {
     for local_experts in (32, 64)
 }
 
+# SiTU package prefill, same key and entries; rows outside every range keep the
+# density-based fallback.
+_GROUPED_SITU_MOE_CONFIGS = {
+    # Kimi K3.1 at TP8. Four stage-1 warps beat fewer at 32- and 64-row
+    # tiles, and 64-row tiles beat 128-row tiles while their padding is the
+    # larger cost.
+    (3584, 384, 512, 896, 896, 16): (
+        (
+            449,
+            1792,
+            _GroupedMoEConfig(
+                32, 4, use_minimum_route_chunks=False, runtime_rows=False
+            ),
+        ),
+        (
+            1793,
+            16384,
+            _GroupedMoEConfig(
+                64, 4, use_minimum_route_chunks=False, runtime_rows=False
+            ),
+        ),
+    ),
+}
+
 
 class _RouteTileStage(NamedTuple):
     """Tile widths, prefetch depth, and wave count of one route-tiled GEMM.
@@ -291,24 +315,27 @@ def _select_grouped_moe_config(
     situ_linear_beta: float | None,
 ) -> _GroupedMoEConfig:
     """Select shape-tuned tiles and sorting, retaining density-based fallbacks."""
-    if (
-        activation_format == "e2m1"
-        and not do_finalize
-        and precomputed_routes
-        and swiglu_args == (1.0, 0.0, 0.0)
-        and situ_linear_beta is None
-    ):
-        shape = (
-            hidden_dim,
-            inter_dim,
-            stage2_k,
-            num_local_experts,
-            num_experts,
-            top_k,
-        )
-        for min_rows, max_rows, config in _GROUPED_MOE_CONFIGS.get(shape, ()):
-            if min_rows <= num_tokens <= max_rows:
-                return config
+    shape = (
+        hidden_dim,
+        inter_dim,
+        stage2_k,
+        num_local_experts,
+        num_experts,
+        top_k,
+    )
+    table = {}
+    if activation_format == "e2m1" and precomputed_routes:
+        if (
+            not do_finalize
+            and swiglu_args == (1.0, 0.0, 0.0)
+            and situ_linear_beta is None
+        ):
+            table = _GROUPED_MOE_CONFIGS
+        elif situ_linear_beta is not None:
+            table = _GROUPED_SITU_MOE_CONFIGS
+    for min_rows, max_rows, config in table.get(shape, ()):
+        if min_rows <= num_tokens <= max_rows:
+            return config
     if activation_format == "e4m3":
         return _GroupedMoEConfig(
             32 if num_tokens <= 2048 else 64,

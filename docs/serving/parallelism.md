@@ -337,9 +337,11 @@ the subgroup's largest physical token count. The runtime prepares communication
 buffers before CUDA-graph capture and reuses them across layers. Shared
 experts use separate buffers. Shared AllGather finishes before routed
 dispatch, shared GEMMs finish before routed BMM, and shared ReduceScatter
-runs after dispatch and before combine. The runtime selects optimized
-collectives for supported shapes and topologies, with generic collective
-fallbacks otherwise. Place each subgroup
+runs after dispatch and before combine. With MegaMoE, shared ReduceScatter
+instead follows its fused dispatch/BMM/combine kernel and overlaps the routed
+norm and local up-projection. Native collectives cover the configured decode
+batch bound including speculative tokens; larger batches retain NCCL.
+Place each subgroup
 on a CUDA-IPC-accessible node to use the optimized paths.
 
 TP4 reduces the selected weights to approximately one quarter per GPU, not
@@ -710,9 +712,9 @@ ts serve --model MODEL --attention-backend flashmla \
   --attn-tp-size 8 --kv-parallel-size 8 --decode-context-parallel-size 8
 ```
 
-Keep `--disaggregation-mode` at `null` and QCP at 1. Aggregated DCP requires
-separate prefill/decode rounds and rejects `--enable-mixed-batch` for all
-backends, including MLA/DSA. MLA decode remains absorbed; MLA/KDA hybrids
+Keep `--disaggregation-mode` at `null` and QCP at 1. With
+`--enable-mixed-batch`, a mixed round runs its KVP extend rows and DCP decode
+rows in one forward. MLA decode remains absorbed; MLA/KDA hybrids
 shard only MLA history. Ordinary TP with KVP = DCP = 1 is unaffected.
 
 Speculative decoding runs on a sharded cache with the backends whose DCP
@@ -996,6 +998,10 @@ CUDA IPC collectives are node-local. The mnnvl fabric workspace spans nodes.
 single-node workspace was armed for it; mnnvl serves 16-bit only) on groups
 whose fan-in is 2, 4, 8, or 16 through the armed workspace -- one-shot
 inside its traffic window, two-shot up to the workspace token capacity.
+Where FlashInfer's BT presets cover the group (8 ranks, width 7168,
+SM103), payloads of at least 1 MiB per rank instead take its owner
+reduction, which sums the ranks in order in fp32 where the Lamport kernels sum
+in BF16 (`tokenspeed_kernel/ops/communication/README.md` has the measurements).
 Cross-node groups arm the full two-shot capacity at startup. Single-node
 groups start at the one-shot window and serve larger shapes once
 model-level preparation widens the shared workspace. Other
@@ -1024,6 +1030,14 @@ rounded once). The model builds the mailbox in `prepare_communication_runtime`;
 each layer uses both chains or neither, so the two uses alternate the
 mailbox's parities.
 
+Past 1024 rows, a Kimi-K3 attention layer's BF16 o-projection writes its
+partial straight into the multimem staging buffer of the MoE tail's
+up-projection (`K3AttnComm.prepare_staged_projection`). The sum then runs as
+the same in-switch all-reduce instead of NCCL. The reduced rows are copied
+out, because AttnRes keeps them after the MoE tail restages the buffer. Under
+`--batch-invariant-collectives` or `--force-deterministic-rsag` the attention
+keeps its ordinary all-reduce.
+
 Under `--numerics rl-bitwise` (`--batch-invariant-collectives`) every
 reduction takes NCCL data movement plus a rank-ordered fp32 fold, and the
 gathers stay on the multicast kernels; the in-switch reduction's order moves
@@ -1033,6 +1047,15 @@ and the fused all-reduce kernels are off. `--force-deterministic-rsag` keeps
 every collective on NCCL (reductions on the fold). `AutoBackend.route` is
 the one place that decides. `docs/design/numerics.md` has the measured
 basis.
+
+Under plain attention TP with replicated MLA latent KV (no KVP, no query
+context parallelism), a GPU DSA sparse prefill of at least 4096 rows runs its
+core attention on a row shard instead of a head shard. An all-to-all hands
+each rank `1 / W` of the rows with every rank's heads (padded to the
+trtllm-gen core's head count), the core attends them, and a second all-to-all
+returns each rank's heads of every row. The core then reads each selected KV
+row once for all heads instead of once per rank. The bitwise numerics
+envelopes keep the head shard.
 
 On ARM systems, [NCCL 2.29.3](https://github.com/NVIDIA/nccl/releases/tag/v2.29.3-1)
 fixes a weak compare-and-swap failure that can hang NCCL when it was compiled
@@ -1057,6 +1080,8 @@ Before benchmarking:
 `N` immutable expert shards and fetches remote weights while executing its own
 batch. Execution remains TP1/EP1; attention DP still identifies the serving
 workers. Omitting the option keeps resident expert weights.
+
+DWDP requires the CUDA 13 toolkit.
 
 The initial K3 NVFP4 configuration requires `--attn-tp-size 1 --moe-tp-size 1
 --ep-size 1 --all2all-backend none`, `--disaggregation-mode prefill`,

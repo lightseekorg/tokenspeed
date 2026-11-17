@@ -40,6 +40,7 @@ protected:
         cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.enable_l3_storage = false;
         cfg.disable_l2_cache = true;
         cfg.disable_prefix_cache = true;
@@ -213,6 +214,7 @@ protected:
         cfg.device_allocator.total_pages = 32;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.disable_l2_cache = true;
         cfg.disable_prefix_cache = true;
         cfg.cache_groups.push_back(CacheGroupConfig{
@@ -332,6 +334,7 @@ TEST_F(KimiFourGroupSuite, FourTablesUseDisjointGlobalPages) {
     EXPECT_EQ(all_real.size(), fresh_positive_entries);
 
     AbortRequest("r1");
+    DrainForwardResults("r1");
     PlanOnce();
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), before);
 }
@@ -350,6 +353,7 @@ TEST_F(KimiFourGroupSuite, FinishAndAbortRestoreAllUsablePages) {
     Submit(MakeRequestSpec("aborted", /*num_pages=*/2, /*start=*/101));
     ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);
     AbortRequest("aborted");
+    DrainForwardResults("aborted");
     PlanOnce();
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), before);
 }

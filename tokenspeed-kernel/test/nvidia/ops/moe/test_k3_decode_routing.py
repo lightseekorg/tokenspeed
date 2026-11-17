@@ -23,8 +23,9 @@
 Each row's 896 router logits arrive as FP32 words in its front mailbox row. The
 route role polls and re-arms them, ranks the exact top 16 of sigmoid(logit) +
 bias (ties to the lower expert) with every thread, and writes their ids and
-scaled, renormalized sigmoids. The copy role polls the row's BF16 latent into
-``latent`` and re-arms it. Every row count takes the same ranking.
+scaled, renormalized sigmoids; a NaN logit counts as a zero sigmoid. The copy
+role polls the row's BF16 latent into ``latent`` and re-arms it. Every row
+count takes the same ranking.
 """
 
 from __future__ import annotations
@@ -150,5 +151,26 @@ def test_route_breaks_ties_to_the_lower_expert(batch):
     assert torch.equal(ids.long(), order[:, :TOP_K])
     expected = _expected_weights(logits, ids)
     torch.testing.assert_close(weights.float(), expected.float(), rtol=1e-2, atol=0)
+    assert torch.equal(latent, latent_in)
+    _assert_rearmed(box, batch)
+
+
+@pytest.mark.parametrize("batch", BATCHES)
+def test_a_nan_row_ranks_by_bias_with_zero_weights(batch):
+    """A padded graph row's NaN logits leave the other rows unchanged."""
+    generator = torch.Generator(device="cuda").manual_seed(2000 + batch)
+    logits = torch.randn(batch, EXPERTS, device="cuda", generator=generator) * 2
+    bias = torch.randn(EXPERTS, device="cuda", generator=generator) * 0.05
+    latent_in = _latent(batch, 300 + batch)
+    real_ids, real_weights, _, _ = _run(batch, logits, bias, latent_in)
+    nan_rows = torch.arange(batch, device="cuda") % 2 == 0
+    logits[nan_rows] = float("nan")
+    ids, weights, latent, box = _run(batch, logits, bias, latent_in)
+
+    by_bias = torch.sort(bias, descending=True, stable=True).indices[:TOP_K]
+    assert torch.equal(ids[nan_rows].long(), by_bias.expand(int(nan_rows.sum()), -1))
+    assert not weights[nan_rows].any()
+    assert torch.equal(ids[~nan_rows], real_ids[~nan_rows])
+    assert torch.equal(weights[~nan_rows], real_weights[~nan_rows])
     assert torch.equal(latent, latent_in)
     _assert_rearmed(box, batch)

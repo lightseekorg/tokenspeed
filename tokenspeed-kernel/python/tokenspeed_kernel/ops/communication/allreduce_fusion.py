@@ -18,13 +18,17 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""All-reduce and RMSNorm with optional expert finalization."""
+"""All-reduce with RMSNorm and optional expert finalization, or plain.
+
+The plain all-reduce runs the same FlashInfer protocols without the norm.
+"""
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
 from enum import Enum
+from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
@@ -36,6 +40,11 @@ from tokenspeed_kernel.thirdparty.flashinfer.allreduce_fusion import (
     MNNVLAllReduceFusionBackend,
     allreduce_fusion_support_error,
 )
+
+if TYPE_CHECKING:
+    from tokenspeed_kernel.thirdparty.flashinfer.plain_all_reduce import (
+        MNNVLPlainAllReduceBackend,
+    )
 
 
 class AllReduceFusionPattern(Enum):
@@ -49,6 +58,7 @@ _SIGNATURE = format_signature(
     input=dense_tensor_format(torch.bfloat16),
     gamma=dense_tensor_format(torch.bfloat16),
 )
+_PLAIN_SIGNATURE = format_signature(input=dense_tensor_format(torch.bfloat16))
 
 
 @dataclass
@@ -257,3 +267,140 @@ def flashinfer_allreduce_fusion(
         expert_weights,
         expanded_idx,
     )
+
+
+@dataclass
+class AllReduceWorkspace:
+    """Persistent protocol state of the plain all-reduce of one group.
+
+    Calls are sequential on one stream; every rank issues the same calls in
+    the same order.
+    """
+
+    backend: "MNNVLPlainAllReduceBackend"
+    kernel: SelectedKernel
+
+    def serves(self, num_tokens: int, hidden_size: int, dtype: torch.dtype) -> bool:
+        """Whether a ``[num_tokens, hidden_size]`` reduction takes this workspace.
+
+        Below a payload threshold the caller's Lamport kernels are faster.
+        """
+        return self.backend.serves(num_tokens, hidden_size, dtype)
+
+
+def all_reduce_supported(
+    *,
+    group: dist.ProcessGroup,
+    hidden_size: int,
+    max_num_tokens: int,
+    dtype: torch.dtype,
+) -> bool:
+    """Probe this rank for the plain all-reduce without allocation or collectives.
+
+    Args:
+        group: Initialized process group of the reduction.
+        hidden_size: Row width, currently 7168.
+        max_num_tokens: Positive row capacity.
+        dtype: Payload dtype; BF16 is supported.
+
+    Returns:
+        Whether this rank has the hardware, group size and FlashInfer presets.
+        Callers vote on it across the group before building the workspace.
+    """
+    # Imported here: a forward reload of the plain module re-executes nothing else.
+    from tokenspeed_kernel.thirdparty.flashinfer.plain_all_reduce import (
+        plain_all_reduce_support_error,
+    )
+
+    return (
+        plain_all_reduce_support_error(group, hidden_size, max_num_tokens, dtype)
+        is None
+    )
+
+
+def create_all_reduce_workspace(
+    *,
+    group: dist.ProcessGroup,
+    hidden_size: int,
+    max_num_tokens: int,
+) -> AllReduceWorkspace:
+    """Collectively build the plain all-reduce before graph capture.
+
+    Args:
+        group: TP8 group; every rank calls with identical arguments, in order.
+        hidden_size: Row width, currently 7168.
+        max_num_tokens: Positive row capacity.
+
+    Returns:
+        A workspace serving eager calls and graph replays.
+    """
+    from tokenspeed_kernel.thirdparty.flashinfer.plain_all_reduce import (
+        MNNVLPlainAllReduceBackend,
+        plain_all_reduce_support_error,
+    )
+
+    error = plain_all_reduce_support_error(
+        group, hidden_size, max_num_tokens, torch.bfloat16
+    )
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("the plain all-reduce must be built before graph capture")
+    if error is not None:
+        raise RuntimeError(error)
+    kernel = select_kernel(
+        "communication",
+        "all_reduce",
+        _PLAIN_SIGNATURE,
+        traits={"hidden_size": hidden_size, "tp_size": group.size()},
+        solution="flashinfer_cutedsl",
+        override=None,
+    )
+    backend = MNNVLPlainAllReduceBackend(group, hidden_size, max_num_tokens)
+    return AllReduceWorkspace(backend, kernel)
+
+
+def all_reduce(
+    input: torch.Tensor, workspace: AllReduceWorkspace, out: torch.Tensor
+) -> torch.Tensor:
+    """Sum ``input`` over the workspace's group into ``out``.
+
+    Args:
+        input: Contiguous 16-byte aligned CUDA BF16 [M, H] with
+            ``workspace.serves(M, H, torch.bfloat16)``.
+        workspace: From ``create_all_reduce_workspace``.
+        out: Contiguous 16-byte aligned CUDA BF16 [M, H] destination.
+
+    Returns:
+        ``out``: on every rank the ranks' rows summed in rank order in fp32
+        and rounded once to BF16.
+    """
+    if (
+        input.ndim != 2
+        or not workspace.serves(input.shape[0], input.shape[1], input.dtype)
+        or out.shape != input.shape
+        or out.dtype != input.dtype
+        or not input.is_contiguous()
+        or not out.is_contiguous()
+        or input.data_ptr() % 16
+        or out.data_ptr() % 16
+    ):
+        raise ValueError("the plain all-reduce does not serve these tensors")
+    return workspace.kernel.impl(input, workspace, out)
+
+
+@register_kernel(
+    "communication",
+    "all_reduce",
+    name="flashinfer_all_reduce",
+    solution="flashinfer_cutedsl",
+    capability=CapabilityRequirement(
+        vendors=frozenset({"nvidia"}),
+        min_arch_version=ArchVersion(10, 0),
+    ),
+    signatures=frozenset({_PLAIN_SIGNATURE}),
+    traits={"hidden_size": frozenset({7168}), "tp_size": frozenset({8})},
+    priority=Priority.SPECIALIZED,
+)
+def flashinfer_all_reduce(input, workspace, out):
+    """Dispatch a validated plain all-reduce to FlashInfer BT."""
+    workspace.backend.run(input, out)
+    return out

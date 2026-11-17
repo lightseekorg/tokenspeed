@@ -51,7 +51,7 @@ def exercise_owner(*, phase: str, rank: int, namespace: str) -> None:
     )
 
     import torch
-    from tokenspeed_scheduler import StorageKind
+    from tokenspeed_engine.scheduler import StorageKind
 
     from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
     from tokenspeed.runtime.cache.l2.sizing import RetractionPoolRequest

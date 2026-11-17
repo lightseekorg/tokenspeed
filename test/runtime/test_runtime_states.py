@@ -22,7 +22,7 @@ import os
 import sys
 
 import pytest
-import tokenspeed_scheduler as ts
+import tokenspeed_engine.scheduler as ts
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -215,6 +215,7 @@ def _scheduled_batch():
         num_device_pages=_PAGES,
         max_scheduled_tokens=64,
         max_batch_size=2,
+        max_resident_requests=2,
         prefix_granularity=4,
         num_host_pages=0,
         disable_l2_cache=True,
@@ -225,6 +226,7 @@ def _scheduled_batch():
         max_retracted_requests=0,
         host_write_policy="write_through",
         prefill_decode_interval=0,
+        prefill_decode_min_interval=0,
         storage_config=None,
         enable_kv_cache_events=False,
         decode_input_tokens=1,
@@ -345,13 +347,13 @@ def test_reused_rid_updates_stop_criteria(
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     states = RuntimeStates(2, 32, 32, 1, device)
-    states.bind_stop_criteria(["reused", "other"], [0, 1], [old_criteria, old_criteria])
+    states.bind_stop_criteria([1, 2], [0, 1], [old_criteria, old_criteria])
     slots = torch.tensor([0], dtype=torch.int64, device=device)
     lengths = torch.tensor([valid_length], dtype=torch.int32, device=device)
-    # A later request may reuse both the public RID and its retired slot.
+    # The reused public RID has a new admission identity in its retired slot.
     states.stopped[0] = True
     states.reset_states(slots, lengths)
-    states.bind_stop_criteria(["reused"], [0], [new_criteria])
+    states.bind_stop_criteria([3], [0], [new_criteria])
     accepted = torch.ones(1, dtype=torch.int32, device=device)
     states.apply_stop_conditions(
         slots,
@@ -375,5 +377,5 @@ def test_reused_rid_updates_stop_criteria(
     ].tolist() == list(old_criteria.stop_token_ids)
     # Binding an unchanged criterion must not clear the device's stop decision
     # while a later overlapped forward is still draining.
-    states.bind_stop_criteria(["reused"], [0], [new_criteria])
+    states.bind_stop_criteria([3], [0], [new_criteria])
     assert states.stopped[0].item() == expected_stopped

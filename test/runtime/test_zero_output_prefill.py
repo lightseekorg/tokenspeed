@@ -39,6 +39,7 @@ from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.logits_processor_output import (
     LogitsProcessorOutput as Output,
 )
+from tokenspeed.runtime.sampling.backends.base import CUDA_GRAPH_VARIANT_DEFAULT
 from tokenspeed.runtime.sampling.sampling_batch_info import (
     SamplingBatchInfo,
     request_vocab_mask,
@@ -148,6 +149,7 @@ def test_sampling_preserves_request_parameters_and_shared_outputs(
         bs=e + d,
         num_extends=e,
         decode_input_ids=None,
+        decode_query_indptr=None,
         output_layout=ForwardOutputLayout(e, p, d, width),
         sampled_top_k=0,
     )
@@ -211,7 +213,10 @@ def test_sampling_preserves_request_parameters_and_shared_outputs(
 
 def test_nan_and_oov_map_to_original_decode_rows():
     ctx = SimpleNamespace(
-        bs=3, num_extends=2, output_layout=ForwardOutputLayout(2, 1, 1, 2)
+        bs=3,
+        num_extends=2,
+        output_layout=ForwardOutputLayout(2, 1, 1, 2),
+        decode_query_indptr=None,
     )
     guard = NanGuard(3, "cpu")
     logits = torch.zeros(3, 16)
@@ -239,6 +244,7 @@ def test_dspark_anchors_do_not_read_or_write_incomplete_prefill():
         next_tokens,
         starts,
         num_prefill_outputs=1,
+        decode_query_indptr=None,
     )
     assert next_tokens.tolist() == [[11] * 3, [-7] * 3, [22] * 3]
     assert starts.tolist() == [51]
@@ -348,6 +354,7 @@ def test_selected_logits_do_not_gather_original_input_indices():
     )
     hidden = torch.arange(16).view(2, 8).float()
     processor = SimpleNamespace(
+        _sampled_shard_start=None,
         _query_shard=lambda metadata: None,
         _resolve_logits_layout_plan=lambda *args: None,
         _get_logits=lambda h, *args, **kwargs: h,
@@ -380,6 +387,7 @@ def test_zero_decoder_attention_still_runs_the_global_producer():
     attention = SimpleNamespace(
         layer_id=20,
         ced_decoder_start=20,
+        fused_q_weight=None,
         _write_global_kv=lambda hidden, *args, **kwargs: writes.append(hidden.clone()),
     )
     hidden = torch.randn(4, 8)
@@ -437,6 +445,7 @@ def test_identity_sampling_keeps_backend_buffer_aliases(decode):
         bs=2,
         num_extends=0 if decode else 2,
         decode_input_ids=None,
+        decode_query_indptr=None,
         output_layout=(
             ForwardOutputLayout(0, 0, 2, 1)
             if decode
@@ -535,6 +544,8 @@ def test_idle_graph_grammar_adds_an_identity_batch():
 
 
 def test_drafter_future_inputs_keep_original_request_rows():
+    from contextlib import nullcontext
+
     from tokenspeed.runtime.execution.types import ForwardLogprobs
 
     forward = load_symbol(
@@ -542,6 +553,9 @@ def test_drafter_future_inputs_keep_original_request_rows():
         "_forward_step",
         owner="ModelExecutor",
         ForwardLogprobs=ForwardLogprobs,
+        drafter_accept_lengths=load_symbol(
+            RUNTIME + "execution/model_executor.py", "drafter_accept_lengths"
+        ),
     )
     future_inputs = torch.full((6, 3), 77, dtype=torch.int32)
     draft_tokens = torch.tensor(
@@ -561,6 +575,7 @@ def test_drafter_future_inputs_keep_original_request_rows():
         device_module=SimpleNamespace(current_stream=lambda: None),
         drafter=SimpleNamespace(
             prepare_target_forward=lambda ctx: None,
+            target_forward_context=lambda ctx: nullcontext(),
             rewrite_verify_outputs=lambda ctx, output_tokens, accept_lengths: None,
             run=lambda **kwargs: draft_tokens,
         ),
@@ -584,7 +599,10 @@ def test_drafter_future_inputs_keep_original_request_rows():
         _record_draft_final_cache_step=lambda num_extends: None,
     )
     ctx = SimpleNamespace(
-        bs=4, num_extends=2, output_layout=ForwardOutputLayout(2, 1, 2, 3)
+        bs=4,
+        num_extends=2,
+        output_layout=ForwardOutputLayout(2, 1, 2, 3),
+        decode_query_indptr=None,
     )
     forward(executor, 4, ctx, None)
     assert future_inputs.tolist() == [
@@ -643,7 +661,10 @@ def test_layout_and_decoder_metadata_agree_on_current_prefill_target(
         spec_num_tokens=2,
         spec=SimpleNamespace(sliding_window_tokens=2, max_query_tokens=32),
         _swa_plans={},
+        _prefill_layouts={},
+        _prefill_kv_batch=None,
         _prepared_selections={},
+        _prepared_swa_writes={},
         _decode_schedules={},
         _index_geometry={},
         sparse_topk={},
@@ -794,6 +815,8 @@ def test_graph_padding_restores_live_output_layout(live_bs):
     )
     observed = []
     accepted_lengths = []
+    # MegaMoE's (live, padded) request counts, (1, 1) outside a padded replay.
+    live_requests = torch.ones(2, dtype=torch.int32)
     runner = SimpleNamespace(
         _can_use_graph=lambda *args: True,
         _padded_bs=lambda *args: padded_bs,
@@ -802,9 +825,10 @@ def test_graph_padding_restores_live_output_layout(live_bs):
         ),
         _prepare_request_token_history_graph_inputs=lambda **kwargs: None,
         _prepare_decode_metadata=lambda *args, **kwargs: None,
-        _cuda_graph_key=lambda bs: bs,
+        _cuda_graph_key=lambda bs: (CUDA_GRAPH_VARIANT_DEFAULT, bs),
         _graph_debug=False,
         _expert_load_rows=None,
+        _mega_moe_live_requests=live_requests,
         device="cuda",
         config=SimpleNamespace(spec_draft_tree=False),
         attn_backend=SimpleNamespace(
@@ -821,12 +845,14 @@ def test_graph_padding_restores_live_output_layout(live_bs):
             seq_lens_buf=torch.ones(padded_bs),
         ),
         graphs={
-            padded_bs: SimpleNamespace(
-                replay=lambda: observed.append((ctx.bs, ctx.output_layout))
+            (CUDA_GRAPH_VARIANT_DEFAULT, padded_bs): SimpleNamespace(
+                replay=lambda: observed.append(
+                    (ctx.bs, ctx.output_layout, live_requests.tolist())
+                )
             )
         },
         output_buffers={
-            padded_bs: (
+            (CUDA_GRAPH_VARIANT_DEFAULT, padded_bs): (
                 torch.arange(padded_bs * width),
                 torch.ones(padded_bs),
                 None,
@@ -851,7 +877,13 @@ def test_graph_padding_restores_live_output_layout(live_bs):
         block_tables_cpu={},
         settle=lambda: None,
     )
-    assert observed == [(padded_bs, ForwardOutputLayout(0, 0, padded_bs, width))]
+    # A padded replay routes only the live requests' MegaMoE rows; an unpadded
+    # one routes every row. Either way the counts are (1, 1) afterwards.
+    counts = [live_bs, padded_bs] if live_bs < padded_bs else [1, 1]
+    assert observed == [
+        (padded_bs, ForwardOutputLayout(0, 0, padded_bs, width), counts)
+    ]
+    assert live_requests.tolist() == [1, 1]
     assert ctx.bs == live_bs
     assert ctx.output_layout is live_layout
     assert tokens.tolist() == list(range(live_bs * width))

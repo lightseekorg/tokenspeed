@@ -191,6 +191,7 @@ class _RuntimeMixedAttention:
                 kv_cache_quant_method="none",
                 context_len=1024,
                 max_bs=3,
+                max_resident_requests=3,
                 speculative_num_draft_tokens=width,
                 is_draft=False,
                 draft_block_decode=False,

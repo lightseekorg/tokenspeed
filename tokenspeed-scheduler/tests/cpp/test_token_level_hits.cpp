@@ -93,6 +93,7 @@ protected:
         cfg.disable_l2_cache = true;
         cfg.max_scheduled_tokens = 256;
         cfg.max_batch_size = 16;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.cache_groups.push_back(CacheGroupConfig{
             .group_id = "full",
             .block_granularity = 2,  // two blocks per prefix page
@@ -216,6 +217,7 @@ TEST_F(TokenLevelHitSuite, RandomStreamsResumeAtTheLongestPublishedBoundary) {
                     }
                 }
                 SendAbortEvent(id);
+                DrainForwardResults(id);
                 PlanOnce();
             }
         }
@@ -275,6 +277,7 @@ TEST_F(TokenLevelHitWithSlidingGroupSuite, ASlidingGroupFollowsTheSameBoundaries
             ASSERT_EQ(batch->request_ids, std::vector<std::string>{id});
             EXPECT_EQ(batch->extend_prefix_lens.at(0), OracleHit(published, prompt, len)) << id;
             SendAbortEvent(id);
+            DrainForwardResults(id);
             PlanOnce();
         }
     }
@@ -296,6 +299,7 @@ protected:
         cfg.disable_l2_cache = true;
         cfg.max_scheduled_tokens = 1024;
         cfg.max_batch_size = 16;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.overlap_schedule_depth = 1;
         cfg.enable_mixed_prefill_decode = true;
         cfg.cache_groups.push_back(CacheGroupConfig{
@@ -441,6 +445,7 @@ protected:
         cfg.disable_l2_cache = true;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.enable_mixed_prefill_decode = false;
         cfg.cache_groups.push_back(CacheGroupConfig{
             .group_id = "full",
@@ -527,6 +532,7 @@ protected:
         cfg.disable_l2_cache = true;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.enable_mixed_prefill_decode = false;
         cfg.cache_groups.push_back(CacheGroupConfig{
             .group_id = "full",

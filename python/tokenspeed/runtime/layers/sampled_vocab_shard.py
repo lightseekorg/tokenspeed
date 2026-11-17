@@ -41,9 +41,10 @@ def gather_topk_pairs(
     """Every rank's packed ``vocab_shard_topk`` pairs, as ``[R, rows, 2k]``.
 
     A column gather the communication backend prepared for this group (Iris
-    on gfx950) moves the fp32 pairs as raw 16-bit words and lands rank r's
-    pairs in columns ``r * 2k`` onward of every row; otherwise they land
-    rank-major in ``landing`` through ``all_gather_single``.
+    on gfx950, the all-reduce workspace's lamport exchange on NVIDIA) moves
+    the fp32 pairs as raw 16-bit words and lands rank r's pairs in columns
+    ``r * 2k`` onward of every row; otherwise they land rank-major in
+    ``landing`` through ``all_gather_single``.
 
     Args:
         staged: This rank's contiguous fp32 ``[rows, 2k]`` pairs.

@@ -435,6 +435,7 @@ class TestInklingConvTablesRefreshTest(_RouterCase):
             kernel_page_size=2,
             context_len=MAX_NUM_PAGES * 2,
             max_bs=MAX_DECODE_BS,
+            max_resident_requests=MAX_DECODE_BS,
         )
         text = InklingModelConfig(
             hidden_size=8,

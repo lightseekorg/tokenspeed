@@ -20,11 +20,10 @@
 
 from __future__ import annotations
 
-import bisect
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 import torch
 from tokenspeed_kernel.ops.sampling.triton import logprob_topk
@@ -40,7 +39,8 @@ from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.drafter.base import (
     EXTEND_DECODE_MAX_REQUESTS,
     EXTEND_DECODE_SERIES,
-    EXTEND_STEP0_SERIES,
+    EXTEND_KV_SERIES,
+    EXTEND_KV_TILE_ROWS,
     DsaTopKState,
     HiddenDraftInput,
     HiddenStateDrafter,
@@ -110,12 +110,10 @@ class _ExtendGraphBuffers:
     """Fixed-address inputs and outputs of the extend-round graphs.
 
     The graphs record these addresses; a replay stages the round's live
-    values into them first. Sized once, for the largest planned token bucket
-    and request count.
+    values into them first. Sized once, for the plan's largest request count.
     """
 
-    # [tokens, width] the target's hidden rows, step 0's chain input; rows
-    # past the live tokens are zero, so the padded rows stay finite.
+    # [requests, width] the capture dummy's hidden rows, one per request.
     hidden_in: torch.Tensor
     # [requests] each request's last row, the rows step 0 narrows to.
     gather_ids: torch.Tensor
@@ -124,9 +122,7 @@ class _ExtendGraphBuffers:
     frontier: torch.Tensor
     # [requests, spec_num_tokens] the next verify window ``draft`` returns.
     next_tokens: torch.Tensor
-    # Step 0's proposals ([requests]) and hidden rows ([requests, width]), the
-    # decode steps' inputs. The first warmup allocates them: their dtype and
-    # width are the draft model's.
+    # The decode steps' inputs: step 0's outputs, or a split round's last rows.
     draft_ids: torch.Tensor | None = None
     hidden_out: torch.Tensor | None = None
 
@@ -143,13 +139,55 @@ class _ExtendGraph:
     ctx: ForwardContext
 
 
-class _ExtendRoute(NamedTuple):
-    """The captured graphs an extend round replays."""
+@runtime_checkable
+class DraftOverlapModel(Protocol):
+    """A model whose draft tail can overlap the next target's preparation.
 
-    # (token bucket, requests) of the step-0 graph; None runs step 0 eager.
-    first_step: tuple[int, int] | None
-    # Whether the decode steps replay their graph at this request count.
-    decode_steps: bool
+    After step one, the tail must not read inputs or target metadata that the
+    next round refreshes, or state that the verified-result commit mutates.
+    Implementations (including subclasses) own this promise; the runtime still
+    checks history, cache ownership and the selected execution path separately.
+    """
+
+    @property
+    def supports_draft_overlap(self) -> bool: ...
+
+
+@runtime_checkable
+class SplitExtendDraft(Protocol):
+    """A one-layer draft whose rows meet only at attention: its extend rounds split."""
+
+    def begin_split_round(
+        self, ctx: ForwardContext, rows: int
+    ) -> tuple[torch.Tensor, ...]:
+        """Start a split round: each of ``rows`` rows' draft cache write locations."""
+
+    def write_draft_kv(
+        self,
+        ctx: ForwardContext,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        captured_hidden_states: torch.Tensor,
+        locations: tuple[torch.Tensor, ...],
+    ) -> None:
+        """Step 0 over every row up to its prologue: write each row's draft cache."""
+
+
+@dataclass
+class _KVTile:
+    """The draft K/V writer's fixed-address inputs over one tile, and its graph."""
+
+    ids: torch.Tensor
+    positions: torch.Tensor
+    # [rows, width] the target's hidden rows.
+    hidden: torch.Tensor
+    # Each row's write locations; a padded row's are zero.
+    locations: tuple[torch.Tensor, ...]
+    graph: _ExtendGraph | None = None
+
+    def inputs(self) -> tuple[torch.Tensor, ...]:
+        """The staged inputs, in ``write_draft_kv``'s order, the locations last."""
+        return (self.ids, self.positions, self.hidden, *self.locations)
 
 
 class Eagle(HiddenStateDrafter):
@@ -230,18 +268,28 @@ class Eagle(HiddenStateDrafter):
         # Width of the full draft vocabulary the tree ranks (bind_tree).
         self.tree_vocab_size: int | None = None
 
-        # Extend-round graphs (capture_extend_graphs): step 0 per (token
-        # bucket, requests), the decode steps per request count, sharing one
-        # private pool and one handoff map. Empty until captured; a round
-        # without a fitting graph runs eager.
+        # Extend-round graphs and their one pool and handoff map; empty until captured.
         self._extend_buffers: _ExtendGraphBuffers | None = None
-        self._first_step_graphs: dict[tuple[int, int], _ExtendGraph] = {}
-        # Request count -> its captured step-0 token buckets, ascending.
-        self._first_step_buckets: dict[int, list[int]] = {}
         self._decode_steps_graphs: dict[int, _ExtendGraph] = {}
         self._extend_graph_pool: Any | None = None
         self._extend_graph_handoffs: dict[HandoffSlot, torch.Tensor] = {}
         self._extend_graph_engaged = False
+        self._kv_tile: _KVTile | None = None
+        self._split_draft = isinstance(draft_model_runner.model, SplitExtendDraft)
+
+    def validate_decode_overlap(self) -> None:
+        """Check the draft tail before releasing the execution stream early."""
+        model = self.draft_model_runner.model
+        if not isinstance(model, DraftOverlapModel) or not model.supports_draft_overlap:
+            raise ValueError("Draft model does not declare support for draft overlap")
+        # The prefix event is recorded before the remaining chain steps.
+        # ServerArgs already validates verify width == draft steps + 1.
+        if self.spec_num_steps < 2:
+            raise ValueError("Draft graph overlap requires at least two draft steps")
+        if self.tree_spec is not None or self.draft_sampler is not None:
+            raise ValueError("Draft graph overlap requires a greedy draft chain")
+        if self.draft_reads_token_history:
+            raise ValueError("Draft graph overlap does not support draft token history")
 
     @override
     def slot_state_rows(self, slot: int) -> list[torch.Tensor]:
@@ -533,9 +581,12 @@ class Eagle(HiddenStateDrafter):
         global_num_tokens: list[int] | None,
         global_bs: list[int] | None,
         all_decode_or_idle: bool,
+        first_input_ids: torch.Tensor | None,
     ) -> None:
         """Draft steps ``1 .. S - 1``: ``lanes`` rows per request (1 for a
         chain, K for a draft tree) forward from the accepted frontier.
+
+        ``first_input_ids`` (last-row tokens) start at step 0, one below the frontier.
 
         ``global_num_tokens`` / ``global_bs`` / ``all_decode_or_idle`` are the
         round's attention-DP sizing (the target forward's). The steps that
@@ -545,10 +596,11 @@ class Eagle(HiddenStateDrafter):
         seq_lens publication carry host state the next breaks read).
         """
         lanes = self.lanes_per_request
+        first_step = 1 if first_input_ids is None else 0
         # Step 1 writes at the accepted frontier (vc + accept_length after the
         # target's verify) so rotary/cache metadata stay on the accepted
         # prefix, not the rejected tail.
-        cache_start = frontier
+        cache_start = frontier if first_step == 1 else frontier - 1
 
         # +1 is the kernel's read-inclusive convention; advanced per iter.
         draft_seq_lens = self.draft_seq_lens_buf[:bs]
@@ -568,7 +620,10 @@ class Eagle(HiddenStateDrafter):
                 0, history_pool_indices, cache_start.to(torch.int32)
             )
 
-        for i in range(1, self.spec_num_steps):
+        if self.decode_overlap is not None:
+            self.decode_overlap.record_prefix()
+
+        for i in range(first_step, self.spec_num_steps):
             # make a ctx every time model runner forward
             # Multi-step decode is pure DECODE mode: one token per request.
             # global_num_tokens must reflect each rank's batch size, not the
@@ -639,7 +694,11 @@ class Eagle(HiddenStateDrafter):
             with nvtx_range("draft_forward", color="red"), lane_forward:
                 logits_output = self.draft_model_runner.forward(
                     ctx=ctx,
-                    input_ids=self._map_hot(draft_ids.reshape(-1)),
+                    input_ids=(
+                        first_input_ids
+                        if i == 0
+                        else self._map_hot(draft_ids.reshape(-1))
+                    ),
                     positions=positions,
                     captured_hidden_states=hidden,
                     spec_step_idx=i,
@@ -778,9 +837,10 @@ class Eagle(HiddenStateDrafter):
     ) -> torch.Tensor:
 
         bs = draft_input.accept_lengths.shape[0]
-        # Eager, or replaying the extend-round graphs the route names (the
-        # same steps, recorded).
-        route = self._extend_graph_route(bs, draft_input)
+        if self._splits_round(bs, draft_input):
+            return self._draft_split_extend(bs, draft_input)
+        # Step 0 eager, then the decode steps eager or replayed (the same steps).
+        replay = self._replays_decode_steps(bs, draft_input)
         buffers = self._extend_buffers
 
         # Layout: column 0 holds the last verified id (the base model's accepted token);
@@ -788,7 +848,7 @@ class Eagle(HiddenStateDrafter):
         next_tokens = self._last_verified_window(
             bs,
             draft_input,
-            out=None if route is None else buffers.next_tokens[:bs],
+            out=buffers.next_tokens[:bs] if replay else None,
         )
 
         # The runner refreshed the draft decode metadata over the target's
@@ -796,26 +856,20 @@ class Eagle(HiddenStateDrafter):
         # context is the accepted frontier; the model publishes it through
         # this handle at the moment it switches to those rows.
         frontier = self._accepted_frontier(bs, draft_input)
-        if route is not None:
-            # The graphs read the frontier where they recorded it.
+        if replay:
+            # The graph reads the frontier where it recorded it.
             frontier = buffers.frontier[:bs].copy_(frontier)
         narrowing = AcceptedPrefixPublisher(self.attn_backend, frontier)
 
-        if route is not None and route.first_step is not None:
-            dsa_topk = self._replay_first_step(route.first_step, draft_input)
-            draft_ids = buffers.draft_ids[:bs]
-            hidden = buffers.hidden_out[:bs]
-        else:
-            # First draft step. LogitsProcessor prunes `[num_prefill_tokens + num_decodes * spec_num_tokens, ...]`
-            # down to `[bs, ...]`, so logits/hidden_states arrive here already aligned to one row per request.
-            logits_output, dsa_topk = self._run_first_step(bs, draft_input, narrowing)
+        # Step 0: the logits processor prunes its outputs to one row per request.
+        logits_output, dsa_topk = self._run_first_step(bs, draft_input, narrowing)
 
-            if self.tree_lanes is None:
-                draft_ids = self.sample_draft_step(logits_output, step=0)
-                next_tokens[:, 1] = self._map_hot(draft_ids)
-                hidden = logits_output.hidden_states
-            else:
-                draft_ids, hidden = self._seed_tree_lanes(bs, logits_output, frontier)
+        if self.tree_lanes is None:
+            draft_ids = self.sample_draft_step(logits_output, step=0)
+            next_tokens[:, 1] = self._map_hot(draft_ids)
+            hidden = logits_output.hidden_states
+        else:
+            draft_ids, hidden = self._seed_tree_lanes(bs, logits_output, frontier)
 
         if self.spec_num_steps <= 1:
             return self._draft_window(bs, next_tokens)
@@ -838,11 +892,10 @@ class Eagle(HiddenStateDrafter):
         # backends that fill separate prefill/decode metadata at init
         # time.
         with self.attn_backend.override_num_extends(0):
-            if route is not None and route.decode_steps:
-                if route.first_step is None:
-                    # Step 0 ran eager: hand its outputs to the graph's inputs.
-                    buffers.draft_ids[:bs].copy_(draft_ids)
-                    buffers.hidden_out[:bs].copy_(hidden)
+            if replay:
+                # Hand step 0's outputs to the graph's inputs.
+                buffers.draft_ids[:bs].copy_(draft_ids)
+                buffers.hidden_out[:bs].copy_(hidden)
                 self._replay_decode_steps(bs)
             else:
                 self._run_multi_step_decode(
@@ -855,6 +908,7 @@ class Eagle(HiddenStateDrafter):
                     global_num_tokens=draft_input.global_num_tokens,
                     global_bs=draft_input.global_bs,
                     all_decode_or_idle=draft_input.all_decode_or_idle,
+                    first_input_ids=None,
                 )
         return self._draft_window(bs, next_tokens)
 
@@ -862,16 +916,215 @@ class Eagle(HiddenStateDrafter):
     # Extend-round CUDA graphs
     # ------------------------------------------------------------------
     #
-    # An extend round runs step 0 over the forward's rows -- token-shaped up
-    # to the narrowing, one row per request after it -- then the decode steps
-    # over one row per request. Both are recorded as breakable graphs: the QSA
-    # indexer and attention cores stay at their eager breaks (they read the
-    # live metadata), and so do the steps that publish backend state
-    # (``run_eager``). Step 0's graph (--enable-drafter-prefill-graph) pads
-    # the rows to a target prefill token bucket and bakes its request count
-    # (the rows after the narrowing); the decode steps' graph bakes the
-    # request count alone and follows step 0 eager or replayed. A round
-    # replays the graphs that fit it and runs the rest eager.
+    # The decode steps replay per request count; a split draft's cache, per tile.
+
+    def _split_extend_supported(self) -> bool:
+        """Whether extend rounds split: a split draft's chain, without attention DP."""
+        return (
+            self._split_draft
+            and self.dp_size == 1
+            and self.tree_spec is None
+            and self.draft_sampler is None
+            and not self.draft_reads_token_history
+            and not self._model_shares_mtp_topk()
+        )
+
+    def _splits_round(self, bs: int, draft_input: EagleDraftInput) -> bool:
+        """Whether this round splits: a pure extend, no DP sizing or query shard."""
+        shard = draft_input.query_shard
+        return (
+            draft_input.forward_mode.is_extend()
+            and draft_input.num_extends == bs
+            and draft_input.global_num_tokens is None
+            and (shard is None or shard.size == 1)
+            and draft_input.base_out_hidden_states.shape[0]
+            == draft_input.input_num_tokens
+            and self._split_extend_supported()
+        )
+
+    def _draft_split_extend(
+        self, bs: int, draft_input: EagleDraftInput
+    ) -> torch.Tensor:
+        """Every row's draft K/V, then steps 0 .. S - 1 from each request's last row."""
+        graph = self._decode_steps_graphs.get(bs)
+        buffers = self._extend_buffers
+        next_tokens = self._last_verified_window(
+            bs, draft_input, out=None if graph is None else buffers.next_tokens[:bs]
+        )
+        frontier = self._accepted_frontier(bs, draft_input)
+        input_ids, gather_ids = self._get_first_step_input(
+            draft_input, bs, draft_input.input_num_tokens
+        )
+        # The steps attend over the prefix: wait for the draft pool's Host load.
+        tracker = self.token_to_kv_pool.layerwise_load_tracker
+        if tracker is not None:
+            tracker.wait_for_all_layers()
+        self._write_draft_kv(bs, draft_input, input_ids)
+        if self.input_buffers.all_extends_mid_chunk:
+            # No request completes a verify after this forward (see draft).
+            return next_tokens
+        tokens = input_ids.index_select(0, gather_ids)
+        hidden = draft_input.base_out_hidden_states.index_select(0, gather_ids)
+        with self.attn_backend.override_num_extends(0):
+            if graph is None:
+                self._run_multi_step_decode(
+                    bs,
+                    tokens,
+                    hidden,
+                    next_tokens,
+                    (None, None),
+                    frontier,
+                    global_num_tokens=None,
+                    global_bs=None,
+                    all_decode_or_idle=draft_input.all_decode_or_idle,
+                    first_input_ids=tokens,
+                )
+                return next_tokens
+            buffers.frontier[:bs].copy_(frontier)
+            buffers.draft_ids[:bs].copy_(tokens)
+            buffers.hidden_out[:bs].copy_(hidden)
+            if not self._extend_graph_engaged:
+                self._extend_graph_engaged = True
+                logger.info(
+                    "drafter prefill graph ENGAGED: split draft, the steps from "
+                    f"step 0 at {bs} requests"
+                )
+            self._replay_decode_steps(bs)
+        return next_tokens
+
+    def _write_draft_kv(
+        self, bs: int, draft_input: EagleDraftInput, input_ids: torch.Tensor
+    ) -> None:
+        """Write every row's draft K/V, tile by tile when the writer's graph exists."""
+        num_tokens = draft_input.input_num_tokens
+        model = self.draft_model_runner.model
+        ctx = ForwardContext(
+            attn_backend=self.attn_backend,
+            token_to_kv_pool=self.token_to_kv_pool,
+            bs=bs,
+            num_extends=bs,
+            output_layout=ForwardOutputLayout(bs, bs, 0, 1),
+            input_num_tokens=num_tokens,
+            forward_mode=draft_input.forward_mode,
+            capture_hidden_mode=CaptureHiddenMode.LAST,
+        )
+        # The round's own layout: no top-k or row layout of the last step.
+        self._attach_dsa_topk((None, None))
+        locations = model.begin_split_round(ctx, num_tokens)
+        positions = self.input_buffers.positions_buf[:num_tokens]
+        hidden = draft_input.base_out_hidden_states
+        tile = self._kv_tile
+        if tile is None or tile.graph is None:
+            model.write_draft_kv(ctx, input_ids, positions, hidden, locations)
+            return
+        if hidden.dtype != tile.hidden.dtype or hidden.shape[1] != tile.hidden.shape[1]:
+            raise RuntimeError(
+                f"the target's hidden rows ({hidden.dtype}, width {hidden.shape[1]}) "
+                "are not the ones the draft K/V writer reads "
+                f"({tile.hidden.dtype}, width {tile.hidden.shape[1]})"
+            )
+        rows = tile.ids.shape[0]
+        for start in range(0, num_tokens, rows):
+            n = min(rows, num_tokens - start)
+            sources = (input_ids, positions, hidden, *locations)
+            for buf, src in zip(tile.inputs(), sources, strict=True):
+                buf[:n].copy_(src[start : start + n])
+                # Padded rows: finite inputs at zero locations.
+                buf[n:].zero_()
+            with active_forward(tile.graph.ctx):
+                tile.graph.capture.replay()
+
+    def _capture_kv_tile(
+        self,
+        rows: int,
+        capture: DrafterExtendCapture,
+        observer: AbstractContextManager[None],
+    ) -> None:
+        """Warm up and capture the draft K/V writer over one tile of ``rows`` rows."""
+        model = self.draft_model_runner.model
+        # A dummy extend of one tile, for the write locations' shapes.
+        capture.prepare_batch(rows, 1)
+        ctx = ForwardContext(
+            attn_backend=self.attn_backend,
+            token_to_kv_pool=self.token_to_kv_pool,
+            bs=1,
+            num_extends=1,
+            output_layout=ForwardOutputLayout(1, 1, 0, 1),
+            input_num_tokens=rows,
+            forward_mode=ForwardMode.EXTEND,
+            capture_hidden_mode=CaptureHiddenMode.LAST,
+        )
+        self._attach_dsa_topk((None, None))
+        locations = model.begin_split_round(ctx, rows)
+        width, dtype = capture.target_hidden_width, capture.target_hidden_dtype
+        tile = self._kv_tile
+        if (
+            tile is None
+            or tile.hidden.shape != (rows, width)
+            or tile.hidden.dtype != dtype
+            or [(t.dtype, t.shape[1:]) for t in tile.locations]
+            != [(t.dtype, t.shape[1:]) for t in locations]
+        ):
+            # Outside the measured capture: the utilization headroom funds them.
+            ib = self.input_buffers
+            tile = self._kv_tile = _KVTile(
+                ids=torch.empty(
+                    rows, dtype=ib.shifted_prefill_ids_buf.dtype, device=self.device
+                ),
+                positions=torch.empty(
+                    rows, dtype=ib.positions_buf.dtype, device=self.device
+                ),
+                hidden=torch.empty((rows, width), dtype=dtype, device=self.device),
+                locations=tuple(
+                    torch.empty((rows, *t.shape[1:]), dtype=t.dtype, device=self.device)
+                    for t in locations
+                ),
+            )
+        # Every row a padded one: the warmups write only at zero locations.
+        for buf in tile.inputs():
+            buf.zero_()
+
+        def body() -> None:
+            model.write_draft_kv(
+                ctx, tile.ids, tile.positions, tile.hidden, tile.locations
+            )
+
+        cap = BreakableCapture(
+            pool=self._extend_graph_pool,
+            stream=capture.stream,
+            handoff_storage=self._extend_graph_handoffs,
+        )
+        cap.stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(cap.stream):
+            for _ in range(capture.num_warmup):
+                body()
+        torch.cuda.synchronize()
+        with observer, active_forward(ctx), cap:
+            body()
+        if self._extend_graph_pool is None:
+            self._extend_graph_pool = cap.pool
+        # Capture records kernels without executing them: smoke-test a replay.
+        with active_forward(ctx):
+            cap.replay()
+        tile.graph = _ExtendGraph(cap, ctx)
+
+    def _stage_split_inputs(self, bs: int) -> None:
+        """A capture's split-step inputs: a valid token and a zero hidden row each."""
+        buffers = self._extend_buffers
+        if buffers.draft_ids is None:
+            rows = buffers.gather_ids.shape[0]
+            buffers.draft_ids = torch.empty(
+                rows,
+                dtype=self.input_buffers.shifted_prefill_ids_buf.dtype,
+                device=self.device,
+            )
+            buffers.hidden_out = torch.empty(
+                (rows, buffers.hidden_in.shape[1]),
+                dtype=buffers.hidden_in.dtype,
+                device=self.device,
+            )
+        buffers.draft_ids[:bs].fill_(1)
+        buffers.hidden_out[:bs].zero_()
 
     def _decode_steps_graphs_supported(self) -> bool:
         """Whether this configuration's extend-round decode steps can be recorded.
@@ -893,48 +1146,17 @@ class Eagle(HiddenStateDrafter):
             and self.draft_model_runner.mapping.pp_size == 1
         )
 
-    def _extend_graphs_supported(self) -> bool:
-        """Whether this configuration's extend-round step 0 can be recorded.
-
-        Only over a draft model that declares ``supports_breakable_draft_extend``:
-        its narrowed step keeps the sequence mixers at break points (an MLA
-        draft's narrowed step writes every row inside its attention and has no
-        break), and its draft attention backend honours the context a break
-        passes it (the narrowed rows attend in DECODE mode under step 0's
-        EXTEND context; a backend that substitutes the ambient context's mode
-        would not). It bakes what the decode steps bake, at any step count,
-        and runs on one rank: the tensor- and expert-parallel collectives of
-        the narrowed step are not validated.
-        """
-        return (
-            bool(
-                getattr(
-                    self.draft_model_runner.model,
-                    "supports_breakable_draft_extend",
-                    False,
-                )
-            )
-            and self.tree_spec is None
-            and self.draft_sampler is None
-            and not self.draft_reads_token_history
-            and not self._model_shares_mtp_topk()
-            and self.dp_size == 1
-            and self.world_size == 1
-        )
-
     @override
     def extend_graph_plan(
-        self,
-        token_buckets: Sequence[int],
-        request_counts: Callable[[int], Sequence[int]],
+        self, token_buckets: Sequence[int]
     ) -> dict[str, list[tuple[int, int]]]:
         plan = {}
-        if self._extend_graphs_supported():
-            plan[EXTEND_STEP0_SERIES] = [
-                (bucket, bs)
-                for bucket in sorted(token_buckets, reverse=True)
-                for bs in request_counts(bucket)
-            ]
+        if self._split_extend_supported():
+            # Its K/V writer goes with the steps, which every split round runs.
+            if self._decode_steps_graphs_supported() and token_buckets:
+                plan[EXTEND_KV_SERIES] = [
+                    (min(EXTEND_KV_TILE_ROWS, max(token_buckets)), 1)
+                ]
         if self._decode_steps_graphs_supported():
             # The steps bake their request count exactly.
             most = min(self.input_buffers.max_bs, EXTEND_DECODE_MAX_REQUESTS)
@@ -945,9 +1167,9 @@ class Eagle(HiddenStateDrafter):
     def release_extend_graphs(self) -> None:
         """Drop the extend-round graphs and their pool (they name the cache
         pool's buffers); the static buffers stay for the next capture."""
-        self._first_step_graphs.clear()
-        self._first_step_buckets.clear()
         self._decode_steps_graphs.clear()
+        if self._kv_tile is not None:
+            self._kv_tile.graph = None
         self._extend_graph_pool = None
         self._extend_graph_handoffs = {}
 
@@ -955,9 +1177,7 @@ class Eagle(HiddenStateDrafter):
     def capture_extend_graphs(
         self, capture: DrafterExtendCapture, *, observer: MemoryDeltaObserver
     ) -> None:
-        """Capture step 0 per planned (bucket, requests) and the decode steps
-        per planned request count, at the ladders' sampled positions and in
-        ladder order (the projection pairs each reading with its position).
+        """Capture the sampled decode steps, then the K/V writer, in ladder order.
 
         Each graph is warmed up eagerly on the capture stream first, so the
         lazily allocated kernel state lands outside the graph pool. The graphs
@@ -967,49 +1187,34 @@ class Eagle(HiddenStateDrafter):
         """
         if capture.num_warmup < 1:
             raise ValueError("the drafter prefill graphs need at least one warmup")
-        first_plan = capture.plan.get(EXTEND_STEP0_SERIES, ())
-        first_step = (
-            [first_plan[i] for i in capture.ladders[EXTEND_STEP0_SERIES].sampled]
-            if first_plan
-            else []
-        )
         decode_plan = capture.plan.get(EXTEND_DECODE_SERIES, ())
         decode_counts = (
             [decode_plan[i][1] for i in capture.ladders[EXTEND_DECODE_SERIES].sampled]
             if decode_plan
             else []
         )
-        # Decode-steps dummy: the count's step-0 bucket, else one token per request.
-        dummy = {bs: bs for _, bs in decode_plan}
-        for bucket, bs in sorted(first_plan, reverse=True):
-            if bs in dummy:
-                dummy[bs] = bucket
         self.release_extend_graphs()
-        # Sized for the whole plan: a full capture reuses what a probe allocated.
-        self._allocate_extend_buffers(
-            capture,
-            tokens=max([bucket for bucket, _ in first_plan] + list(dummy.values())),
-            requests=max([bs for _, bs in first_plan] + list(dummy)),
-        )
+        # Sized for the whole plan, so a full capture reuses what a probe allocated.
+        most = max((bs for _, bs in decode_plan), default=1)
+        self._allocate_extend_buffers(capture, requests=most)
         with maybe_inference_mode():
-            for bucket, bs in first_step:
-                capture.prepare_batch(bucket, bs)
-                self._stage_capture_inputs(bucket, bs)
-                self._first_step_graphs[bucket, bs] = self._capture_first_step(
-                    bucket, bs, capture, observer.measure(EXTEND_STEP0_SERIES)
-                )
             for bs in decode_counts:
-                bucket = dummy[bs]
-                capture.prepare_batch(bucket, bs)
-                self._stage_capture_inputs(bucket, bs)
-                self._run_first_step_eager(bucket, bs, capture.stream)
+                capture.prepare_batch(bs, bs)
+                self._stage_capture_inputs(bs)
+                if self._split_extend_supported():
+                    self._stage_split_inputs(bs)
+                else:
+                    self._run_first_step_eager(bs, capture.stream)
                 self._decode_steps_graphs[bs] = self._capture_decode_steps(
                     bs, capture, observer.measure(EXTEND_DECODE_SERIES)
                 )
-        self._first_step_buckets = {}
-        for bucket, bs in sorted(self._first_step_graphs):
-            self._first_step_buckets.setdefault(bs, []).append(bucket)
+            kv_plan = capture.plan.get(EXTEND_KV_SERIES, ())
+            if kv_plan and capture.ladders[EXTEND_KV_SERIES].sampled:
+                self._capture_kv_tile(
+                    kv_plan[0][0], capture, observer.measure(EXTEND_KV_SERIES)
+                )
         buffers = self._extend_buffers
+        tile = self._kv_tile
         static_bytes = sum(
             tensor.numel() * tensor.element_size()
             for tensor in (
@@ -1019,21 +1224,26 @@ class Eagle(HiddenStateDrafter):
                 buffers.next_tokens,
                 buffers.draft_ids,
                 buffers.hidden_out,
+                *(() if tile is None else tile.inputs()),
             )
             if tensor is not None
         )
+        kv_writer = (
+            ""
+            if tile is None or tile.graph is None
+            else f", the draft K/V writer at {tile.ids.shape[0]} rows"
+        )
         logger.info(
-            "drafter prefill graph: captured step 0 at (tokens, requests) "
-            f"{sorted(self._first_step_graphs)!s}, decode steps at requests "
-            f"{sorted(self._decode_steps_graphs)!s} (eager attention breaks); "
-            f"static buffers {static_bytes / (1 << 20):.1f} MiB from the "
+            "drafter prefill graph: captured decode steps at requests "
+            f"{sorted(self._decode_steps_graphs)!s}{kv_writer} (eager attention "
+            f"breaks); static buffers {static_bytes / (1 << 20):.1f} MiB from the "
             "utilization headroom"
         )
 
     def _allocate_extend_buffers(
-        self, capture: DrafterExtendCapture, *, tokens: int, requests: int
+        self, capture: DrafterExtendCapture, *, requests: int
     ) -> None:
-        """The static buffers for the plan's largest token count and request count.
+        """The static buffers for the plan's largest request count.
 
         Allocated once, outside every measured capture window: like the target
         prefill graph's static outputs, they come out of the utilization
@@ -1044,7 +1254,7 @@ class Eagle(HiddenStateDrafter):
         buffers = self._extend_buffers
         if (
             buffers is not None
-            and buffers.hidden_in.shape[0] >= tokens
+            and buffers.hidden_in.shape[0] >= requests
             and buffers.hidden_in.shape[1] == width
             and buffers.hidden_in.dtype == capture.target_hidden_dtype
             and buffers.gather_ids.shape[0] >= requests
@@ -1052,7 +1262,7 @@ class Eagle(HiddenStateDrafter):
             return
         self._extend_buffers = _ExtendGraphBuffers(
             hidden_in=torch.zeros(
-                (tokens, width), dtype=capture.target_hidden_dtype, device=self.device
+                (requests, width), dtype=capture.target_hidden_dtype, device=self.device
             ),
             gather_ids=torch.zeros(requests, dtype=torch.int64, device=self.device),
             frontier=torch.zeros(
@@ -1065,37 +1275,29 @@ class Eagle(HiddenStateDrafter):
             ),
         )
 
-    def _stage_capture_inputs(self, bucket: int, bs: int) -> None:
-        """Inputs for a dummy extend the capture prepared: valid token ids
-        and zero hidden rows on every row, its requests' last rows and
-        lengths."""
+    def _stage_capture_inputs(self, bs: int) -> None:
+        """Stage the capture dummy's one-token requests: valid ids, zero hidden."""
         ib = self.input_buffers
         buffers = self._extend_buffers
         # The dummy batch leaves the shifted ids unset; a placeholder -1 would
         # index past the embedding.
-        ib.shifted_prefill_ids_buf[:bucket].fill_(1)
-        buffers.hidden_in[:bucket].zero_()
+        ib.shifted_prefill_ids_buf[:bs].fill_(1)
+        buffers.hidden_in[:bs].zero_()
         lengths = ib.input_lengths_buf[:bs].to(torch.int64)
         buffers.gather_ids[:bs].copy_(lengths.cumsum(0) - 1)
         buffers.frontier[:bs].copy_(ib.seq_lens_buf[:bs])
 
-    def _first_step_ctx(self, bucket: int, bs: int) -> ForwardContext:
-        """Step 0's context over a ``bucket``-row graph of ``bs`` requests.
-
-        The one ``_run_first_step`` builds, over the static buffers, with the
-        token count pinned to the bucket as the target's replay pins it.
-        Every field is fixed per (bucket, requests), so the capture and its
-        replays share this one object and the breaks read it as the live
-        context.
-        """
+    def _run_first_step_eager(self, bs: int, stream: torch.cuda.Stream) -> None:
+        """Step 0 over the capture dummy, on its stream: the decode steps' inputs."""
+        ib = self.input_buffers
         buffers = self._extend_buffers
-        return ForwardContext(
+        ctx = ForwardContext(
             attn_backend=self.attn_backend,
             token_to_kv_pool=self.token_to_kv_pool,
             bs=bs,
             num_extends=bs,
             output_layout=ForwardOutputLayout(bs, bs, 0, 1),
-            input_num_tokens=bucket,
+            input_num_tokens=bs,
             forward_mode=ForwardMode.EXTEND,
             capture_hidden_mode=CaptureHiddenMode.LAST,
             gather_ids=buffers.gather_ids[:bs],
@@ -1103,44 +1305,34 @@ class Eagle(HiddenStateDrafter):
                 self.attn_backend, buffers.frontier[:bs]
             ),
         )
-
-    def _first_step_body(self, bucket: int, bs: int, ctx: ForwardContext) -> None:
-        """Step 0 and its proposal over the static buffers (what the graph records)."""
-        ib = self.input_buffers
-        buffers = self._extend_buffers
-        logits_output = self.draft_model_runner.forward(
-            ctx=ctx,
-            input_ids=ib.shifted_prefill_ids_buf[:bucket],
-            positions=ib.positions_buf[:bucket],
-            captured_hidden_states=buffers.hidden_in[:bucket],
-            spec_step_idx=0,
-        )
-        draft_ids = self.sample_draft_step(logits_output, step=0)
-        hidden = logits_output.hidden_states
-        if buffers.draft_ids is None:
-            # The first warmup, eager: allocate outside the graph pool.
-            buffers.draft_ids = torch.empty(
-                buffers.gather_ids.shape, dtype=draft_ids.dtype, device=self.device
-            )
-            buffers.hidden_out = torch.empty(
-                (buffers.gather_ids.shape[0], hidden.shape[1]),
-                dtype=hidden.dtype,
-                device=self.device,
-            )
-        buffers.draft_ids[:bs].copy_(draft_ids)
-        buffers.hidden_out[:bs].copy_(hidden)
-        buffers.next_tokens[:bs, 1] = self._map_hot(draft_ids)
-
-    def _run_first_step_eager(
-        self, bucket: int, bs: int, stream: torch.cuda.Stream
-    ) -> None:
-        """Run step 0 eagerly over the static buffers on the capture stream."""
-        ctx = self._first_step_ctx(bucket, bs)
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
             self._attach_dsa_topk((None, None))
             with active_forward(ctx):
-                self._first_step_body(bucket, bs, ctx)
+                logits_output = self.draft_model_runner.forward(
+                    ctx=ctx,
+                    input_ids=ib.shifted_prefill_ids_buf[:bs],
+                    positions=ib.positions_buf[:bs],
+                    captured_hidden_states=buffers.hidden_in[:bs],
+                    spec_step_idx=0,
+                )
+                draft_ids = self.sample_draft_step(logits_output, step=0)
+                hidden = logits_output.hidden_states
+                if buffers.draft_ids is None:
+                    # The first capture: allocate outside the graph pool.
+                    buffers.draft_ids = torch.empty(
+                        buffers.gather_ids.shape,
+                        dtype=draft_ids.dtype,
+                        device=self.device,
+                    )
+                    buffers.hidden_out = torch.empty(
+                        (buffers.gather_ids.shape[0], hidden.shape[1]),
+                        dtype=hidden.dtype,
+                        device=self.device,
+                    )
+                buffers.draft_ids[:bs].copy_(draft_ids)
+                buffers.hidden_out[:bs].copy_(hidden)
+                buffers.next_tokens[:bs, 1] = self._map_hot(draft_ids)
         torch.cuda.synchronize()
 
     def _decode_steps_body(self, bs: int) -> None:
@@ -1156,40 +1348,10 @@ class Eagle(HiddenStateDrafter):
             global_num_tokens=None,
             global_bs=None,
             all_decode_or_idle=False,
+            first_input_ids=(
+                buffers.draft_ids[:bs] if self._split_extend_supported() else None
+            ),
         )
-
-    def _capture_first_step(
-        self,
-        bucket: int,
-        bs: int,
-        capture: DrafterExtendCapture,
-        observer: AbstractContextManager[None],
-    ) -> _ExtendGraph:
-        """Warm up and capture step 0 for ``bucket`` rows and ``bs`` requests.
-
-        ``observer`` wraps the capture alone, as for the target's buckets.
-        """
-        ctx = self._first_step_ctx(bucket, bs)
-        # Its attention break takes the top-k rows the narrowing gathers in a
-        # segment: the capture must run the segments to feed it real slots.
-        cap = BreakableCapture(
-            pool=self._extend_graph_pool,
-            stream=capture.stream,
-            handoff_storage=self._extend_graph_handoffs,
-            run_segments_while_capturing=True,
-        )
-        for _ in range(capture.num_warmup):
-            self._run_first_step_eager(bucket, bs, cap.stream)
-        self._attach_dsa_topk((None, None))
-        with observer, active_forward(ctx), cap:
-            self._first_step_body(bucket, bs, ctx)
-        if self._extend_graph_pool is None:
-            self._extend_graph_pool = cap.pool
-        # Capture records kernels without executing them: smoke-test a replay.
-        self._attach_dsa_topk((None, None))
-        with active_forward(ctx):
-            cap.replay()
-        return _ExtendGraph(cap, ctx)
 
     def _capture_decode_steps(
         self,
@@ -1237,91 +1399,24 @@ class Eagle(HiddenStateDrafter):
             cap.replay()
         return _ExtendGraph(cap, ctx)
 
-    def _extend_graph_route(
-        self, bs: int, draft_input: EagleDraftInput
-    ) -> _ExtendRoute | None:
-        """The captured graphs this round replays, or None to run it eager.
-
-        Replays only what every graph baked holds: a pure extend (MIXED
-        rounds stay eager), no attention-DP sizing, no query shard; step 0
-        needs the target's hidden rows for every input row and a captured
-        bucket at least the round's tokens at exactly its request count, the
-        decode steps their request count.
-        """
-        if not (self._first_step_graphs or self._decode_steps_graphs):
-            return None
+    def _replays_decode_steps(self, bs: int, draft_input: EagleDraftInput) -> bool:
+        """Whether an unsplit pure extend replays its decode steps after step 0."""
+        if bs not in self._decode_steps_graphs or self._split_extend_supported():
+            return False
         if not draft_input.forward_mode.is_extend() or draft_input.num_extends != bs:
-            return None
+            return False
         if draft_input.global_num_tokens is not None:
-            return None
+            return False
         shard = draft_input.query_shard
         if shard is not None and shard.size > 1:
-            return None
-        num_tokens = draft_input.input_num_tokens
-        first_step = None
-        if draft_input.base_out_hidden_states.shape[0] == num_tokens:
-            buckets = self._first_step_buckets.get(bs, [])
-            index = bisect.bisect_left(buckets, num_tokens)
-            first_step = (buckets[index], bs) if index < len(buckets) else None
-        decode_steps = bs in self._decode_steps_graphs
-        if first_step is None and not decode_steps:
-            return None
-        route = _ExtendRoute(first_step, decode_steps)
+            return False
         if not self._extend_graph_engaged:
             self._extend_graph_engaged = True
             logger.info(
-                f"drafter prefill graph ENGAGED: step 0 graph={first_step!s}, "
-                f"decode steps graph={decode_steps!s} at {num_tokens} tokens, "
-                f"{bs} requests"
+                "drafter prefill graph ENGAGED: decode steps at "
+                f"{draft_input.input_num_tokens} tokens, {bs} requests"
             )
-        return route
-
-    def _replay_first_step(
-        self, key: tuple[int, int], draft_input: EagleDraftInput
-    ) -> DsaTopKState:
-        """Stage the round's inputs at the recorded addresses and replay step 0.
-
-        Returns:
-            The top-k state the decode steps start from (none: the graphs are
-            captured only for drafts that do not carry it across steps).
-        """
-        bucket, bs = key
-        graph = self._first_step_graphs[key]
-        buffers = self._extend_buffers
-        ib = self.input_buffers
-        num_tokens = draft_input.input_num_tokens
-        hidden = draft_input.base_out_hidden_states
-        if (
-            hidden.dtype != buffers.hidden_in.dtype
-            or hidden.shape[1] != buffers.hidden_in.shape[1]
-        ):
-            raise RuntimeError(
-                f"the target's hidden rows ({hidden.dtype}, width {hidden.shape[1]}) "
-                "are not the ones the drafter prefill graphs read "
-                f"({buffers.hidden_in.dtype}, width {buffers.hidden_in.shape[1]})"
-            )
-        # The first-step input patch (a final chunk's sampled token into its
-        # last shifted row) runs here, in place, exactly as on the eager path.
-        _, gather_ids = self._get_first_step_input(draft_input, bs, num_tokens)
-        buffers.gather_ids[:bs].copy_(gather_ids)
-        buffers.hidden_in[:num_tokens].copy_(hidden)
-        if num_tokens < bucket:
-            # The padded rows compute on finite inputs (zero hidden rows, token
-            # 0, position 0) and write their K/V to the dummy slot.
-            buffers.hidden_in[num_tokens:bucket].zero_()
-            ib.shifted_prefill_ids_buf[num_tokens:bucket].zero_()
-            ib.positions_buf[num_tokens:bucket].zero_()
-        # The draft prologue writes K/V inside a captured segment, which holds
-        # no per-layer Host-load wait: wait for the draft pool's whole load
-        # first, as PrefillGraph.replay does for an undeclared pool, which
-        # covers the per-layer waits the capture noted.
-        tracker = self.token_to_kv_pool.layerwise_load_tracker
-        if tracker is not None:
-            tracker.wait_for_all_layers()
-        self._attach_dsa_topk((None, None))
-        with active_forward(graph.ctx):
-            graph.capture.replay(valid_rows=num_tokens, noted_waits_done=True)
-        return (None, None)
+        return True
 
     def _replay_decode_steps(self, bs: int) -> None:
         """Replay the decode steps over the staged step-0 outputs."""

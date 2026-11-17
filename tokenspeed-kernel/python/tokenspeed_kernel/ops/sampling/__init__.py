@@ -28,6 +28,7 @@ from __future__ import annotations
 import torch as _torch
 from tokenspeed_kernel.ops.sampling.logprob import blockwise_logprobs
 from tokenspeed_kernel.ops.sampling.positions import prepare_sampling_offsets
+from tokenspeed_kernel.ops.sampling.synthetic import write_synthetic_verify_outputs
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -48,6 +49,7 @@ __all__ = [
     "vocab_shard_topk_supports",
     "vocab_topk_merge",
     "vocab_topk_merge_supports",
+    "write_synthetic_verify_outputs",
 ]
 
 _SUPPORTED_DTYPES = (_torch.float16, _torch.bfloat16, _torch.float32)
@@ -384,7 +386,7 @@ def vocab_shard_draft_stats(
         temperature_pool: ``[P]`` temperature by slot (floored at 1e-20).
         seed_pool: ``[P]`` int64 Philox seed by slot.
         offsets_pool: ``[P]`` int64 Philox offset by slot.
-        out: ``[>= M, vocab_shard_draft_stats_width(N)]`` fp32 partials.
+        out: ``[>= M, >= vocab_shard_draft_stats_width(N)]`` fp32 partials.
         logit_scale: The logits processor's multiplier, rounded to the
             logits' dtype, or None.
         softcap: The processor's final logit softcap ``c * tanh(x / c)``,

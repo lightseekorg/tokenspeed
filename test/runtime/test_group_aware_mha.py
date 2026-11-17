@@ -60,6 +60,7 @@ class TestRouterOverMhaLeavesTest:
             kv_cache_mxfp8=False,
             draft_block_decode=False,
             max_bs=8,
+            max_resident_requests=8,
             kernel_page_size=None,
         )
         spec = SimpleNamespace(

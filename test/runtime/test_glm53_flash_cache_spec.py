@@ -85,6 +85,7 @@ def _recipe(
         kv_cache_quant_method="none",
         context_len=4096,
         max_bs=16,
+        max_resident_requests=16,
         pd_disaggregation_enabled=pd_disaggregation_enabled,
         speculative_num_steps=2 if draft_layers else 0,
         speculative_num_draft_tokens=3 if draft_layers else 1,

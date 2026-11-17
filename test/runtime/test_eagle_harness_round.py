@@ -41,7 +41,7 @@ from dataclasses import dataclass
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest  # noqa: E402
-import tokenspeed_scheduler as ts  # noqa: E402
+import tokenspeed_engine.scheduler as ts  # noqa: E402
 import torch  # noqa: E402
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
 from tokenspeed_kernel.ops.sampling.eagle_harness import (  # noqa: E402
@@ -462,6 +462,7 @@ def _decode_batch(bs: int, width: int):
             num_device_pages=65,
             max_scheduled_tokens=bs * width,
             max_batch_size=bs,
+            max_resident_requests=bs,
             prefix_granularity=4,
             num_host_pages=0,
             disable_l2_cache=True,
@@ -472,6 +473,7 @@ def _decode_batch(bs: int, width: int):
             max_retracted_requests=0,
             host_write_policy="write_through",
             prefill_decode_interval=0,
+            prefill_decode_min_interval=0,
             storage_config=None,
             decode_input_tokens=width,
             cache_groups=[

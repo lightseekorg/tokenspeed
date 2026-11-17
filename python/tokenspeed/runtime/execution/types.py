@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.execution._draft_overlap import RoundFence
     from tokenspeed.runtime.grammar.capturable_grammar import (
         GrammarStepCompletion,
     )
@@ -232,6 +233,8 @@ class PlannedForward:
             no later scheduler activity can reach it.
         sampling_params_list: Per-slot sampling params, gathered by the loop.
             Read-only for the request's lifetime.
+        admission_ids: Immutable identities aligned with the forward's requests.
+            A new admission gets a new identity even when its rid is reused.
         dp_metadata: CPU-gathered DP metadata, None outside DP. A frozen
             dataclass of plain lists.
         grammar_inputs: Per-batch grammar state, None when no request in the
@@ -255,6 +258,7 @@ class PlannedForward:
     """
 
     forward_op: Any
+    admission_ids: tuple[int, ...]
     sampling_params_list: list
     dp_metadata: "DpForwardMetadata | None"
     grammar_inputs: Any
@@ -323,7 +327,7 @@ class ModelExecutionResult:
     """
 
     output_tokens: torch.Tensor
-    copy_event: torch.cuda.Event | None = None
+    copy_event: torch.cuda.Event | RoundFence | None = None
     output_lengths: torch.Tensor | None = None
     grammar_completion: GrammarStepCompletion | None = None
     # Per-position fp32 logprob of the sampled token, same layout as output_tokens.
@@ -357,7 +361,7 @@ class ModelExecutionResult:
     _synced: bool = field(default=False, init=False, repr=False, compare=False)
 
     def sync(self) -> None:
-        """Block until this result's D2H copy has landed.
+        """Block until output copies and any retained draft tail have completed.
 
         Called exactly once, by the commit (``HostDataPlane.complete``) — the
         single gate between the forward thread and the control plane.

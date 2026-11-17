@@ -263,7 +263,7 @@ def triton_vocab_shard_draft_stats(
         temperature_pool: ``[P]`` temperature by slot (floored at 1e-20).
         seed_pool: ``[P]`` int64 Philox seed by slot.
         offsets_pool: ``[P]`` int64 Philox offset by slot.
-        out: ``[>= M, vocab_shard_draft_stats_width(N)]`` fp32, unit column
+        out: ``[>= M, >= vocab_shard_draft_stats_width(N)]`` fp32, unit column
             stride: per block of ``VOCAB_SHARD_DRAFT_BLOCK`` columns,
             ``VOCAB_SHARD_DRAFT_FIELDS`` partials.
         logit_scale: The logits processor's multiplier (rounded to the

@@ -238,6 +238,7 @@ protected:
         // Force the candidates loop to break after exactly one push so the
         // tiebreaker decides which request wins.
         cfg.max_batch_size = 1;
+        cfg.max_resident_requests = cfg.max_batch_size;
         return cfg;
     }
 };
@@ -598,8 +599,8 @@ TEST(KvCacheEventStatusTest, HistoryCountsMatchPerKeyResidencyAcrossTiersAndShar
         remove(state);
         remove(swa);
         check();  // Complete history remains publishable without auxiliary state.
-        EXPECT_EQ(coordinator.DeviceBoundaryResidency(boundary, tail_tokens),
-                  CacheCoordinator::BoundaryResidency::kPartial);
+        EXPECT_EQ(coordinator.Store().DeviceBoundaryResidency(boundary, tail_tokens),
+                  CacheStore::BoundaryResidency::kPartial);
         store(device, state);
         store(device, swa);
         // Removing any sub-block of either sharded Full group withdraws the
@@ -1086,6 +1087,7 @@ protected:
         cfg.disable_l2_cache = true;
         cfg.max_scheduled_tokens = kBudget;
         cfg.max_batch_size = batch_;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.prefill_chunk_yield_tokens = yield_;
         cfg.cache_groups.push_back(CacheGroupConfig{
             .group_id = "full_attention",
@@ -1720,6 +1722,7 @@ protected:
     SchedulerConfig MakeConfig() override {
         auto cfg = PrefillDecodeIntervalSuite::MakeConfig();
         cfg.max_batch_size = 2;
+        cfg.max_resident_requests = cfg.max_batch_size;
         return cfg;
     }
 };
@@ -1941,6 +1944,115 @@ TEST_F(MixedPrefillDecodeIntervalCapacitySuite, AGrantAdmittedPromptIsNotHeldBac
     EXPECT_EQ(Round(), "P:bc");
 }
 
+class PrefillDecodeMinIntervalSuite : public PrefillDecodeIntervalSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = PrefillDecodeIntervalSuite::MakeConfig();
+        cfg.prefill_decode_min_interval = 1;
+        return cfg;
+    }
+};
+
+TEST_F(PrefillDecodeMinIntervalSuite, AnOverduePromptsChunksAlternateWithDecodeRounds) {
+    Submit(MakeRequestSpec("a", 2));
+    EXPECT_EQ(Round(), "P:a");
+    Submit(MakeRequestSpec("b", 6, /*start=*/100));
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round({"b"}), "P:b");
+    // b has been held back two rounds and suspends the interval, but every
+    // chunk still owes the minimum's decode round.
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round({"b"}), "P:b");
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round(), "P:b");
+    EXPECT_EQ(Round(), "D:ab");
+}
+
+TEST_F(PrefillDecodeMinIntervalSuite, TheMinimumAloneOwesItsRoundsAfterEveryChunk) {
+    auto cfg = MakeConfig();
+    cfg.prefill_decode_interval = 0;
+    scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(cfg));
+    Submit(MakeRequestSpec("a", 2));
+    EXPECT_EQ(Round(), "P:a");
+    Submit(MakeRequestSpec("b", 6, /*start=*/100));
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round({"b"}), "P:b");
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round({"b"}), "P:b");
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round(), "P:b");
+    EXPECT_EQ(Round(), "D:ab");
+}
+
+TEST_F(PrefillDecodeMinIntervalSuite, APromptRunsAtOnceWhenNoDecodeIsRunning) {
+    Submit(MakeRequestSpec("a", 6));
+    EXPECT_EQ(Round({"a"}), "P:a");
+    // The minimum owes a decode round, but a is the only request and has
+    // nothing to decode yet: its next chunk runs.
+    EXPECT_EQ(Round({"a"}), "P:a");
+    EXPECT_EQ(Round(), "P:a");
+    EXPECT_EQ(Round(), "D:a");
+}
+
+class MixedPrefillDecodeMinIntervalSuite : public PrefillDecodeMinIntervalSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = PrefillDecodeMinIntervalSuite::MakeConfig();
+        cfg.enable_mixed_prefill_decode = true;
+        // One decode token and a two-page chunk.
+        cfg.max_scheduled_tokens = 5;
+        return cfg;
+    }
+};
+
+TEST_F(MixedPrefillDecodeMinIntervalSuite, AnOverduePromptsMixedRoundsAlternateWithDecodeRounds) {
+    Submit(MakeRequestSpec("a", 2));
+    EXPECT_EQ(Round(), "P:a");
+    Submit(MakeRequestSpec("b", 6, /*start=*/100));
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round({"b"}), "P:ba");
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round({"b"}), "P:ba");
+    EXPECT_EQ(Round(), "D:a");
+    EXPECT_EQ(Round(), "P:ba");
+    EXPECT_EQ(Round(), "D:ab");
+}
+
+TEST(SchedulerConstructionTest, RefusesAPrefillDecodeMinIntervalOutsideTheFusedRole) {
+    const auto config = [](Role role, std::int32_t interval) {
+        SchedulerConfig cfg{};
+        cfg.role = role;
+        cfg.prefix_granularity = 2;
+        cfg.max_scheduled_tokens = 64;
+        cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
+        cfg.device_allocator.total_pages = 32;
+        cfg.disable_l2_cache = true;
+        cfg.cache_groups.push_back(CacheGroupConfig{
+            .group_id = "full_attention",
+            .block_granularity = cfg.prefix_granularity,
+            .total_pages = 32,
+        });
+        if (role != Role::kFused) {
+            cfg.cache_groups.front().transfer_policy = CacheTransferPolicy::FullSuffix;
+        }
+        SetTestSnapshotPool(cfg);
+        cfg.prefill_decode_min_interval = interval;
+        return WithHostPackingFromDevice(cfg);
+    };
+    EXPECT_NO_THROW(config(Role::kFused, 2).Validate());
+    for (const auto& [role, interval] : {std::pair{Role::kP, 2}, std::pair{Role::kD, 2}, std::pair{Role::kFused, -1}}) {
+        try {
+            config(role, interval).Validate();
+            ADD_FAILURE() << "prefill_decode_min_interval " << interval << " was accepted";
+        } catch (const std::invalid_argument& error) {
+            EXPECT_NE(std::string{error.what()}.find("prefill_decode_min_interval"), std::string::npos) << error.what();
+        }
+    }
+}
+
 TEST(SchedulerConstructionTest, RefusesAPrefillDecodeIntervalOutsideTheFusedRole) {
     const auto config = [](Role role, std::int32_t interval) {
         SchedulerConfig cfg{};
@@ -1948,6 +2060,7 @@ TEST(SchedulerConstructionTest, RefusesAPrefillDecodeIntervalOutsideTheFusedRole
         cfg.prefix_granularity = 2;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.device_allocator.total_pages = 32;
         cfg.disable_l2_cache = true;
         cfg.cache_groups.push_back(CacheGroupConfig{
@@ -2023,6 +2136,7 @@ TEST(SchedulerConstructionTest, ValidatesConfigBeforeBuildingPools) {
     cfg.prefix_granularity = 2;
     cfg.max_scheduled_tokens = 64;
     cfg.max_batch_size = 8;
+    cfg.max_resident_requests = cfg.max_batch_size;
     cfg.cache_groups.push_back(CacheGroupConfig{
         .group_id = "full_attention",
         .block_granularity = cfg.prefix_granularity,
@@ -2050,6 +2164,7 @@ TEST(SchedulerConstructionTest, PrefillChunkYieldIsAPrefillRoleOptionOfAtMostHal
         cfg.disable_l2_cache = true;
         cfg.max_scheduled_tokens = budget;
         cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.cache_groups.push_back(CacheGroupConfig{
             .group_id = "full_attention",
             .block_granularity = cfg.prefix_granularity,

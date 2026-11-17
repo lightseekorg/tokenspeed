@@ -688,4 +688,5 @@ from tokenspeed_kernel.ops.attention.kda._triton.state_pages import (  # noqa: E
     commit_state_groups,
     commit_state_pages,
     verify_state_blocks,
+    verify_state_groups,
 )

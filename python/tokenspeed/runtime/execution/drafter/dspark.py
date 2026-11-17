@@ -18,11 +18,14 @@
 """Static DSpark drafter.
 
 Static Markov head and fixed verify window (verify-all). Greedy by default;
-explicit block rejection enables stochastic proposals through the shared sampler.
+--enable-speculative-sampling samples each Markov step through the shared
+sampler, on this rank's vocabulary shard when the sampled rows stay sharded.
 No confidence head / SPS-STS / ragged verify.
 """
 
 from __future__ import annotations
+
+from collections.abc import Callable
 
 import torch
 
@@ -34,9 +37,20 @@ from tokenspeed_kernel.ops.sampling.cute_dsl import (
     supports_markov_argmax_shape,
 )
 
+# Bypasses the registry: tokenspeed-kernel has no family-level Markov logits op.
+from tokenspeed_kernel.ops.sampling.triton import dspark_markov_shard_logits
+from typing_extensions import override
+
+from tokenspeed.runtime.distributed.comm_ops import all_gather_single
+from tokenspeed.runtime.execution.drafter._dspark_walk import (
+    dspark_walk_finish,
+    dspark_walk_round,
+)
 from tokenspeed.runtime.execution.drafter.dflash import DFlash
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
+from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from tokenspeed.runtime.models.dspark import VanillaMarkov
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
@@ -58,13 +72,56 @@ class DSpark(DFlash):
                 "DSPARK requires the draft model to define a markov_head "
                 "(use a DSparkDraftModel checkpoint with markov_rank > 0)."
             )
+        self._walk_words: torch.Tensor | None = None
+        self._walk_gathered: torch.Tensor | None = None
         # Resolved by the first greedy walk outside graph capture.
         self._markov_argmax_resolved = False
         self._markov_argmax_workspace: MarkovArgmaxWorkspace | None = None
+        # Set by keep_draft_logits_vocab_sharded: sampled steps stay on this rank's shard.
+        self._samples_vocab_shard = False
 
     def require_full_draft_logits(self) -> None:
         """DSpark samples the target's shared head, not a draft-owned processor."""
         self.logits_processor.require_full_vocab_logits()
+
+    @override
+    def keep_draft_logits_vocab_sharded(
+        self,
+        supports: Callable[[torch.dtype, int, int], bool],
+        vocab_start: int,
+    ) -> bool:
+        """Sample each Markov step on this rank's shard of the target's head.
+
+        The step adds the Markov bias to the raw shard logits, so a processor
+        that scales or softcaps its logits keeps the gathered rows, as do a
+        shard the Markov head does not cover and weights other than BF16.
+
+        Args:
+            supports: The verifier's ``supports_vocab_shard``.
+            vocab_start: Global token id of the target head's shard column 0.
+
+        Returns:
+            Whether the sampled steps stay on this rank's shard.
+        """
+        head = self.lm_head
+        processor = self.logits_processor
+        markov = self.markov_head
+        if (
+            not isinstance(head, VocabParallelEmbedding)
+            or int(head.shard_indices.org_vocab_start_index) != vocab_start
+            or processor.logit_scale is not None
+            or processor.final_logit_softcapping
+            or not isinstance(markov, VanillaMarkov)
+            or vocab_start + int(head.shard_indices.num_org_elements)
+            > int(markov.markov_w2.weight.shape[0])
+            or head.weight.dtype != torch.bfloat16
+            or markov.markov_w1.weight.dtype != torch.bfloat16
+            or markov.markov_w2.weight.dtype != torch.bfloat16
+            or not processor.keep_sampled_logits_vocab_sharded(head, supports)
+        ):
+            return False
+        self._samples_vocab_shard = True
+        return True
 
     @nvtx_range("dspark_sample_block", color="purple")
     def _sample_block(
@@ -78,9 +135,15 @@ class DSpark(DFlash):
         # Only the bias follows the previous token; the projection does not.
         block_logits = (
             self._block_base_logits(draft_hidden)
-            if self.draft_sampler is None
+            if self.draft_sampler is None or self._samples_vocab_shard
             else None
         )
+        if self.draft_sampler is not None and block_logits is not None:
+            self._sampled_shard_walk(block_logits, next_tokens)
+            return next_tokens
+        if block_logits is not None and self._fused_walk_fits(block_logits):
+            self._fused_greedy_walk(block_logits, next_tokens)
+            return next_tokens
         workspace = (
             None if block_logits is None else self._resolve_markov_argmax(block_logits)
         )
@@ -138,6 +201,30 @@ class DSpark(DFlash):
                 )
         next_tokens.clamp_(min=0)
         return next_tokens
+
+    def _sampled_shard_walk(
+        self, block_logits: torch.Tensor, next_tokens: torch.Tensor
+    ) -> None:
+        """Sample ``next_tokens[:, 1:]`` from this rank's shard of each step's logits."""
+        start = int(self.lm_head.shard_indices.org_vocab_start_index)
+        columns = int(block_logits.shape[-1])
+        embedding = self.markov_head.markov_w1.weight
+        projection = self.markov_head.markov_w2.weight[start : start + columns]
+        # Each step's record reads its logits before the next step rewrites them.
+        logits = torch.empty_like(block_logits[0])
+        for k in range(1, self.spec_num_tokens):
+            dspark_markov_shard_logits(
+                block_logits[k - 1],
+                next_tokens[:, k - 1],
+                embedding,
+                projection,
+                logits,
+            )
+            shard = self.logits_processor.sampled_vocab_shard(logits, self.lm_head)
+            next_tokens[:, k].copy_(
+                self.draft_sampler.propose_vocab_shard(shard, step=k - 1)
+            )
+        next_tokens.clamp_(min=0)
 
     def _resolve_markov_argmax(
         self, block_logits: torch.Tensor
@@ -203,6 +290,98 @@ class DSpark(DFlash):
         # each slice a positions-strided row layout, which the distributed
         # argmax's compact-row kernel must not see.
         return logits.view(rows, positions, num_org).transpose(0, 1).contiguous()
+
+    def _fused_walk_fits(self, block_logits: torch.Tensor) -> bool:
+        """Whether the greedy walk can take one launch and one gather per round.
+
+        Without a distributed argmax state the generic walk takes several
+        launches and two all-gathers per round. A state, where the
+        platform has one, keeps the walk it already fuses.
+
+        Every test must come out the same on every rank: ranks taking
+        different walks would issue different collectives.
+        """
+        markov = self.markov_head
+        if not block_logits.is_cuda or not isinstance(markov, VanillaMarkov):
+            return False
+        # The probe is collective, so no rank-local test may come before it.
+        if (
+            self._ensure_dist_argmax_state(
+                self.lm_head.weight.dtype, block_logits.device
+            )
+            is not None
+        ):
+            return False
+        head = self.lm_head
+        org = int(head.org_vocab_size)
+        tp = int(self.logits_processor.tp_size)
+        latent_table = markov.markov_w1.weight
+        bias_weight = markov.markov_w2.weight
+        return (
+            # No added vocab and equal unpadded shards: no rank is left with
+            # an added lane or an empty shard, and shard ids are global ids.
+            int(head.num_embeddings) == org
+            and int(head.shard_indices.num_org_elements) * tp == org
+            and org <= int(bias_weight.shape[0])
+            and block_logits.dtype == torch.bfloat16
+            and latent_table.dtype == bias_weight.dtype == torch.bfloat16
+            and latent_table.is_contiguous()
+            and bias_weight.is_contiguous()
+        )
+
+    def _ensure_walk_buffers(self, device: torch.device) -> tuple[torch.Tensor, ...]:
+        """The walk's per-round words and their gathers, at max capacity.
+
+        Allocated once, in warmup, for the same reason as the generic walk's
+        gather scratch: graphs captured at small batch sizes must not record
+        storage that a later, larger capture frees.
+        """
+        rounds = self.spec_num_tokens - 1
+        max_bs = self.input_buffers.max_bs
+        tp = int(self.logits_processor.tp_size)
+        if self._walk_words is None or self._walk_words.device != device:
+            self._walk_words = torch.zeros(
+                (rounds, max_bs), dtype=torch.int64, device=device
+            )
+            self._walk_gathered = torch.zeros(
+                (rounds, tp * max_bs), dtype=torch.int64, device=device
+            )
+        return self._walk_words, self._walk_gathered
+
+    def _fused_greedy_walk(
+        self, block_logits: torch.Tensor, next_tokens: torch.Tensor
+    ) -> None:
+        """Fill ``next_tokens[:, 1:]`` from the anchor in column 0."""
+        rows = int(next_tokens.shape[0])
+        rounds = self.spec_num_tokens - 1
+        tp = int(self.logits_processor.tp_size)
+        start = int(self.lm_head.shard_indices.org_vocab_start_index)
+        num_org = int(block_logits.shape[-1])
+        latent_table = self.markov_head.markov_w1.weight
+        bias_weight = self.markov_head.markov_w2.weight[start : start + num_org]
+        words, gathered = self._ensure_walk_buffers(block_logits.device)
+        words = words[:, :rows]
+        words.zero_()
+        previous = None
+        for k in range(1, rounds + 1):
+            word = words[k - 1]
+            dspark_walk_round(
+                block_logits[k - 1],
+                latent_table,
+                bias_weight,
+                next_tokens,
+                word,
+                previous,
+                column=k,
+                vocab_start=start,
+                tp=tp,
+            )
+            if tp == 1:
+                previous = word
+            else:
+                previous = gathered[k - 1, : tp * rows]
+                all_gather_single(previous, word, self.logits_processor.tp_group)
+        dspark_walk_finish(next_tokens, previous, column=rounds, tp=tp)
 
     def _make_step_bias_fn(self, prev_tokens: torch.Tensor):
         """Build the per-position additive-bias hook for the Markov head.

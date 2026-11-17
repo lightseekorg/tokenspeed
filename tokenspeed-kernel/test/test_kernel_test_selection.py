@@ -166,7 +166,19 @@ def test_a_parallel_run_the_selection_empties_passes():
     env = dict(os.environ)
     env[CHANGED_PATHS_ENV] = f"{KERNEL}/ops/gemm/__init__.py"
     run = subprocess.run(
-        [sys.executable, "-m", "pytest", "-n", "2", "-p", "no:cacheprovider", __file__],
+        # Without the warnings summary, an empty run reports "no tests ran".
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-n",
+            "2",
+            "-p",
+            "no:cacheprovider",
+            "-p",
+            "no:warnings",
+            __file__,
+        ],
         cwd=repo_root,
         env=env,
         capture_output=True,

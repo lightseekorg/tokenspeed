@@ -40,7 +40,6 @@ NATIVE_PACKAGES = {
     "tokenspeed-flashmla",
     "tokenspeed-fast-hadamard-transform",
     "tokenspeed-fa3",
-    "tokenspeed-trtllm-kernel",
     "tokenspeed-flashkda",
 }
 
@@ -246,19 +245,6 @@ def install(workspace: Path, cuda_home: Path, constraints: Path) -> None:
         ],
         PYPI,
     )
-    with tempfile.TemporaryDirectory(prefix="tokenspeed-cu129-scheduler-") as build_dir:
-        # Scheduler changes intentionally accumulate without a version bump.
-        # Rebuild and reinstall the checkout instead of accepting a native
-        # extension left by an earlier run of a persistent worker.
-        pip_install(
-            [
-                "--force-reinstall",
-                "--no-deps",
-                str(workspace / "tokenspeed-scheduler"),
-                f"--config-settings=build-dir={build_dir}",
-            ],
-            PYPI,
-        )
     subprocess.run(
         ["bash", str(Path(__file__).resolve().parent / "install_tokenspeed_engine.sh")],
         env={

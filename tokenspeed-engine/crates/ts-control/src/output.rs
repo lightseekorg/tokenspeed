@@ -198,7 +198,8 @@ pub struct HistorySeeds {
 /// before the seeded tail remain unspecified. A forward seeds its committed
 /// prefix after a prefix-cache hit, a slot handoff, a retracted request's restore into
 /// another slot, or a PD decode landing. Ownership is per admission, not
-/// per request id, which clients may reuse.
+/// per request id, which clients may reuse. Only the request's latest slot
+/// holds its current history; returning to an earlier slot must seed again.
 ///
 /// A model that reads at most `lookback` committed tokens behind the
 /// frontier (an n-gram hash, say) needs only those seeded: a 200K-token
@@ -234,6 +235,12 @@ impl HistoryRows {
                 .state(rid)
                 .ok_or_else(|| CommitError::History(rid.clone()))?;
             let held = self.owners.insert(slot, state.admission) == Some(state.admission);
+            if !held {
+                // An old row becomes stale as this request advances elsewhere.
+                // Forget it on a move, including before a prefix-zero extend.
+                self.owners
+                    .retain(|other_slot, owner| *other_slot == slot || *owner != state.admission);
+            }
             let total = state.prompt_ids.len() + state.output_ids.len();
             let boundary = if i < batch.num_extends {
                 batch.extend_prefix_lens[i].max(0) as usize
@@ -502,7 +509,7 @@ pub struct OutputProcessor {
     finish_log: FinishLog,
     /// When the last commit ran, for the request stats' decode steps.
     last_commit_at: f64,
-    /// Requests registered so far, numbering each admission.
+    /// Identities allocated so far, before data-plane admission.
     admissions: u64,
     metrics_enabled: bool,
     /// Metric deltas since the event loop last drained them.
@@ -728,6 +735,14 @@ impl OutputProcessor {
         self.spec_num_tokens
     }
 
+    /// Whether this rank can collect sampled PD first-output summaries.
+    pub(crate) fn ttft_sampling_enabled(&self) -> bool {
+        self.finish_log.enabled
+            && self.finish_log.ttft_percentage > 0
+            && self.role != Role::Plain
+            && tracing::enabled!(target: "ts_control::request_stats", tracing::Level::INFO)
+    }
+
     /// When `rid` reached the scheduler's waiting queue, the first time this
     /// is asked after it did: a retraction re-queues
     /// a request without re-stamping it.
@@ -735,10 +750,46 @@ impl OutputProcessor {
         self.states.get_mut(rid)?.submitted_at.take()
     }
 
+    /// Observe KV-ready waiting once, only for a request that starts decode.
+    pub fn take_decode_ready_at(&mut self, rid: &str) -> Option<Instant> {
+        let state = self.states.get_mut(rid)?;
+        let at = state.decode_ready_at.take();
+        if state.to_abort || state.finished() {
+            return None;
+        }
+        at
+    }
+
     /// Stamp `rid`'s arrival in the scheduler's waiting queue.
     pub fn mark_submitted(&mut self, rid: &str, at: Instant) {
         if let Some(state) = self.states.get_mut(rid) {
             state.submitted_at = Some(at);
+            if let Some(trace) = state.ttft.as_mut() {
+                let now = trace.ms();
+                trace.submitted_ms.get_or_insert(now);
+            }
+        }
+    }
+
+    /// Stamp the first plan selecting a sampled request, before DP agreement.
+    /// Remote admission reserves the D landing pages; it is not a forward.
+    pub fn mark_planned(&mut self, rids: &[String], remote_admission: bool) {
+        if self.finish_log.ttft_percentage == 0 {
+            return;
+        }
+        for rid in rids {
+            if let Some(trace) = self
+                .states
+                .get_mut(rid)
+                .and_then(|state| state.ttft.as_mut())
+            {
+                let now = trace.ms();
+                if remote_admission {
+                    trace.remote_admitted_ms.get_or_insert(now);
+                } else {
+                    trace.planned_ms.get_or_insert(now);
+                }
+            }
         }
     }
 
@@ -757,10 +808,7 @@ impl OutputProcessor {
         state: &mut RequestState,
         bootstrap: Option<&ts_pd::BootstrapInfo>,
     ) {
-        if self.finish_log.enabled
-            && self.finish_log.ttft_percentage > 0
-            && tracing::enabled!(target: "ts_control::request_stats", tracing::Level::INFO)
-        {
+        if self.ttft_sampling_enabled() {
             state.ttft = bootstrap.and_then(|b| {
                 request_stats::TtftTrace::sample(self.finish_log.ttft_percentage, self.role, b)
             });
@@ -775,10 +823,23 @@ impl OutputProcessor {
         }
     }
 
-    /// Admit a request. An abort that arrived before it applies now.
-    pub fn register(&mut self, rid: String, mut state: RequestState) {
-        self.admissions += 1;
+    /// Give a new request its identity before either plane registers it.
+    pub fn assign_admission(&mut self, state: &mut RequestState) {
+        assert_eq!(
+            state.admission, 0,
+            "request already has an admission identity"
+        );
+        self.admissions = self
+            .admissions
+            .checked_add(1)
+            .expect("admission identity exhausted");
         state.admission = self.admissions;
+    }
+
+    /// Register a request whose identity was assigned before data-plane admission.
+    /// An abort that arrived before it applies now.
+    pub fn register(&mut self, rid: String, mut state: RequestState) {
+        assert_ne!(state.admission, 0, "assign an identity before registration");
         if let Some(index) = self.pending_aborts.iter().position(|(id, _)| *id == rid) {
             self.pending_aborts.remove(index);
             state.abort("AbortReq from client", false, None);
@@ -842,6 +903,9 @@ impl OutputProcessor {
         let Some(state) = self.states.get_mut(rid) else {
             return;
         };
+        if self.metrics_enabled {
+            state.decode_ready_at.get_or_insert_with(Instant::now);
+        }
         if let Some(trace) = &mut state.ttft {
             trace.transfer_done_ms = Some(trace.ms());
         }
@@ -1763,9 +1827,15 @@ mod tests {
         )
     }
 
+    fn register_state(p: &mut OutputProcessor, rid: String, mut state: RequestState) {
+        p.assign_admission(&mut state);
+        p.register(rid, state);
+    }
+
     fn register(p: &mut OutputProcessor, rid: &str, prompt: i64, max_new: i64, stop: &[i32]) {
         let stops: BTreeSet<i32> = stop.iter().copied().collect();
-        p.register(
+        register_state(
+            p,
             rid.to_owned(),
             RequestState::new(vec![0; prompt as usize], max_new, stops, true, None, false),
         );
@@ -1794,7 +1864,7 @@ mod tests {
             top_logprobs_num: top_k,
             computes_prompt_logprobs,
         });
-        p.register(rid.to_owned(), state);
+        register_state(p, rid.to_owned(), state);
     }
 
     /// The forward result of a plan's rows: each row's logprob is
@@ -1823,7 +1893,7 @@ mod tests {
     fn register_history(p: &mut OutputProcessor, rid: &str, prompt: &[i32], output: &[i32]) {
         let mut state = RequestState::new(prompt.to_vec(), 8, BTreeSet::new(), true, None, false);
         state.output_ids = output.to_vec();
-        p.register(rid.to_owned(), state);
+        register_state(p, rid.to_owned(), state);
     }
 
     /// One forward over `rows` of (rid, slot, extend prefix length), the
@@ -1874,7 +1944,7 @@ mod tests {
             &state.prompt_ids,
         ));
         let mut p = processor(None);
-        p.register("r".to_owned(), state);
+        register_state(&mut p, "r".to_owned(), state);
 
         for (i, (token, expected)) in [(10, 1), (11, 2), (2, 2), (12, 2)].into_iter().enumerate() {
             let input_length = i as i32 + 1;
@@ -1886,6 +1956,57 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(committed.outputs[0].reasoning_tokens, expected);
+        }
+    }
+
+    #[test]
+    fn ttft_sampling_depends_on_pd_summary_settings_and_the_log_filter() {
+        use tracing::Level;
+
+        for (level, role, enabled, percentage, request_stats, expected) in [
+            (Level::INFO, Role::Prefill, true, 100, false, true),
+            (Level::INFO, Role::Decode, true, 100, false, true),
+            (Level::INFO, Role::Decode, true, 1, false, true),
+            (Level::INFO, Role::Prefill, true, 0, false, false),
+            (Level::INFO, Role::Decode, true, 0, true, false),
+            (Level::DEBUG, Role::Decode, true, 0, false, false),
+            (Level::WARN, Role::Decode, true, 100, true, false),
+            (Level::INFO, Role::Decode, false, 100, true, false),
+            (Level::INFO, Role::Plain, true, 100, true, false),
+            (Level::DEBUG, Role::Decode, true, 100, false, true),
+        ] {
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(level)
+                .with_writer(std::io::sink)
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                let processor = OutputProcessor::new(
+                    None,
+                    1,
+                    None,
+                    role,
+                    FinishLog {
+                        enabled,
+                        request_stats,
+                        ttft_percentage: percentage,
+                    },
+                    false,
+                    None,
+                );
+                let mut state =
+                    RequestState::new(vec![8, 9], 4, BTreeSet::new(), true, None, false);
+                // Room 4 is selected even at one percent sampling.
+                processor.sample_ttft(
+                    &mut state,
+                    Some(&ts_pd::BootstrapInfo {
+                        room: 4,
+                        host: "p".into(),
+                        port: 8080,
+                    }),
+                );
+                assert_eq!(state.ttft.is_some(), expected);
+                assert_eq!(processor.ttft_sampling_enabled(), expected);
+            });
         }
     }
 
@@ -1924,9 +2045,12 @@ mod tests {
                         port: 8080,
                     };
                     processor.sample_ttft(&mut state, Some(&bootstrap));
-                    processor.register(rid.into(), state);
+                    register_state(&mut processor, rid.into(), state);
+                    processor.mark_submitted(rid, Instant::now());
+                    processor.bootstrapped(rid);
                     processor.bootstrapped(rid);
                     if role == Role::Prefill {
+                        processor.mark_planned(&[rid.into()], false);
                         processor.mark_scheduled(&[rid.into()]);
                         let committed = processor
                             .commit(&batch(&[(rid, 2, 0, 2)], 1), None, &result(&[10], &[1]))
@@ -1938,6 +2062,7 @@ mod tests {
                         }
                         processor.finish_prefill(rid);
                     } else {
+                        processor.mark_planned(&[rid.into()], true);
                         processor.remote_prefill_done(rid, 10, 1, None);
                         processor.finish_remote_prefill_only(rid);
                     }
@@ -1960,12 +2085,76 @@ mod tests {
             assert_eq!(summary["room"], 4);
             assert_eq!(summary["status"], "first_output");
             assert!(summary["phases_ms"]["bootstrap"].is_number());
+            assert!(summary["milestones_ms"]["submitted"].is_number());
         }
         assert_eq!(summaries[0]["prefill_chunks"], 1);
         assert!(summaries[0]["phases_ms"]["prefill"].is_number());
+        assert!(summaries[0]["phases_ms"]["ready_to_plan"].is_number());
+        assert!(summaries[0]["phases_ms"]["plan_to_dispatch"].is_number());
+        assert!(summaries[1]["phases_ms"]["remote_admission"].is_number());
+        assert!(summaries[1]["milestones_ms"]["first_planned"].is_null());
         assert!(summaries[0]["phases_ms"]["transfer_observe"].is_number());
         assert!(summaries[0]["phases_ms"]["output_pack"].is_number());
         assert!(summaries[1]["phases_ms"]["output_after_landing"].is_number());
+    }
+
+    #[test]
+    fn sampled_milestones_keep_the_first_submission_and_each_plan_kind() {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(std::io::sink)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let mut processor = OutputProcessor::new(
+                None,
+                1,
+                None,
+                Role::Decode,
+                FinishLog {
+                    enabled: true,
+                    request_stats: false,
+                    ttft_percentage: 100,
+                },
+                false,
+                None,
+            );
+            let mut state = RequestState::new(vec![8, 9], 4, BTreeSet::new(), true, None, false);
+            processor.sample_ttft(
+                &mut state,
+                Some(&ts_pd::BootstrapInfo {
+                    room: 4,
+                    host: "p".into(),
+                    port: 8080,
+                }),
+            );
+            register_state(&mut processor, "r".into(), state);
+            processor.mark_submitted("r", Instant::now());
+            processor.bootstrapped("r");
+            processor.mark_planned(&["r".into()], true);
+            let trace = processor.state("r").unwrap().ttft.as_ref().unwrap();
+            let first_submit = trace.submitted_ms.unwrap();
+            let remote_admitted = trace.remote_admitted_ms.unwrap();
+            assert!(trace.planned_ms.is_none());
+
+            processor.remote_prefill_done("r", 10, 0, None);
+            processor.mark_planned(&["r".into()], false);
+            processor.mark_scheduled(&["r".into()]);
+            let trace = processor.state("r").unwrap().ttft.as_ref().unwrap();
+            let first_plan = trace.planned_ms.unwrap();
+            let first_dispatch = trace.scheduled_ms.unwrap();
+            assert!(remote_admitted <= trace.transfer_done_ms.unwrap());
+            assert!(trace.transfer_done_ms.unwrap() <= first_plan);
+            assert!(first_plan <= first_dispatch);
+
+            processor.mark_submitted("r", Instant::now());
+            processor.mark_planned(&["r".into()], true);
+            processor.mark_planned(&["r".into()], false);
+            processor.mark_scheduled(&["r".into()]);
+            let trace = processor.state("r").unwrap().ttft.as_ref().unwrap();
+            assert_eq!(trace.submitted_ms, Some(first_submit));
+            assert_eq!(trace.remote_admitted_ms, Some(remote_admitted));
+            assert_eq!(trace.planned_ms, Some(first_plan));
+            assert_eq!(trace.scheduled_ms, Some(first_dispatch));
+        });
     }
 
     #[test]
@@ -1993,6 +2182,37 @@ mod tests {
         assert!(metrics.tpot_seconds.is_empty());
         assert_eq!(metrics.completion_tokens, 1);
         assert_eq!(p.take_request_metrics().completion_tokens, 0);
+    }
+
+    #[test]
+    fn decode_ready_wait_starts_at_kv_landing_and_is_observed_once() {
+        let mut p = OutputProcessor::new(None, 1, None, Role::Decode, NO_FINISH_LOG, true, None);
+        register(&mut p, "a", 4, 8, &[]);
+        assert!(p.take_decode_ready_at("a").is_none());
+        let before = Instant::now();
+        p.remote_prefill_done("a", 7, 0, None);
+        let after = Instant::now();
+        let ready = p.take_decode_ready_at("a").unwrap();
+        assert!(before <= ready && ready <= after);
+        assert!(p.take_decode_ready_at("a").is_none());
+
+        register(&mut p, "cancelled", 4, 8, &[]);
+        p.remote_prefill_done("cancelled", 7, 0, None);
+        p.states.get_mut("cancelled").unwrap().to_abort = true;
+        assert!(p.take_decode_ready_at("cancelled").is_none());
+
+        register(&mut p, "finished", 4, 1, &[]);
+        p.remote_prefill_done("finished", 7, 0, None);
+        p.finish_remote_prefill_only("finished");
+        assert!(p.take_decode_ready_at("finished").is_none());
+    }
+
+    #[test]
+    fn decode_ready_wait_does_not_stamp_without_metrics() {
+        let mut p = OutputProcessor::new(None, 1, None, Role::Decode, NO_FINISH_LOG, false, None);
+        register(&mut p, "a", 4, 8, &[]);
+        p.remote_prefill_done("a", 7, 0, None);
+        assert!(p.take_decode_ready_at("a").is_none());
     }
 
     #[test]
@@ -2134,6 +2354,47 @@ mod tests {
         // "a" recovers into slot 1 after "b" used it: reseed its prefix.
         let recovery = rows.seeds(&history_batch(&[("a", 1, 4)], 1), &p).unwrap();
         assert_eq!(recovery.unwrap().prefix_lengths, [4]);
+    }
+
+    #[test]
+    fn a_request_returning_to_an_earlier_slot_reseeds_its_decode_history() {
+        let mut p = processor(None);
+        register_history(&mut p, "a", &[10, 11, 12, 13], &[20, 21]);
+        let mut rows = HistoryRows::new(Some(3));
+        rows.seeds(&history_batch(&[("a", 1, 0)], 1), &p).unwrap();
+        rows.seeds(&history_batch(&[("a", 2, 0)], 0), &p).unwrap();
+        // The request advanced in slot 2 before a second restore returned
+        // it to slot 1. Slot 1 still names it, but holds an older history.
+        p.states.get_mut("a").unwrap().output_ids.extend([22, 23]);
+        let restored = history_batch(&[("a", 1, 0)], 0);
+        assert_eq!(
+            rows.seeds(&restored, &p).unwrap(),
+            Some(HistorySeeds {
+                slots: vec![1],
+                prefix_lengths: vec![7],
+                tokens: vec![vec![20, 21, 22]],
+            })
+        );
+        assert_eq!(rows.seeds(&restored, &p).unwrap(), None);
+    }
+
+    #[test]
+    fn a_request_returning_to_an_earlier_slot_reseeds_its_prefill_history() {
+        let mut p = processor(None);
+        register_history(&mut p, "a", &[10, 11, 12, 13, 14, 15], &[]);
+        let mut rows = HistoryRows::new(Some(3));
+        rows.seeds(&history_batch(&[("a", 1, 0)], 1), &p).unwrap();
+        rows.seeds(&history_batch(&[("a", 2, 2)], 1), &p).unwrap();
+        let restored = history_batch(&[("a", 1, 4)], 1);
+        assert_eq!(
+            rows.seeds(&restored, &p).unwrap(),
+            Some(HistorySeeds {
+                slots: vec![1],
+                prefix_lengths: vec![4],
+                tokens: vec![vec![11, 12, 13]],
+            })
+        );
+        assert_eq!(rows.seeds(&restored, &p).unwrap(), None);
     }
 
     #[test]
@@ -2509,7 +2770,8 @@ mod tests {
     #[test]
     fn ngram_windows_follow_the_committed_tokens() {
         let mut p = OutputProcessor::new(None, 1, None, Role::Plain, NO_FINISH_LOG, true, None);
-        p.register(
+        register_state(
+            &mut p,
             "r".to_owned(),
             RequestState::new(vec![10, 11, 12, 13], 8, BTreeSet::new(), true, None, false),
         );
@@ -3022,7 +3284,8 @@ mod tests {
     #[test]
     fn sampled_logprobs_ride_with_their_tokens() {
         let mut p = processor(None);
-        p.register(
+        register_state(
+            &mut p,
             "r".to_owned(),
             RequestState::new(vec![0], 10, BTreeSet::new(), true, None, true),
         );
@@ -3038,7 +3301,8 @@ mod tests {
     fn cumulative_probabilities_follow_streamed_tokens_and_logprob_requests() {
         let mut p = processor(None);
         for (rid, logprobs) in [("scored", true), ("plain", false)] {
-            p.register(
+            register_state(
+                &mut p,
                 rid.to_owned(),
                 RequestState::new(vec![0], 4, BTreeSet::new(), true, Some(2), logprobs),
             );
@@ -3096,7 +3360,8 @@ mod tests {
     #[test]
     fn a_stop_token_cuts_cumulative_probabilities_with_its_verify_window() {
         let mut p = processor(Some(3));
-        p.register(
+        register_state(
+            &mut p,
             "r".to_owned(),
             RequestState::new(vec![0], 10, BTreeSet::from([7]), true, None, true),
         );

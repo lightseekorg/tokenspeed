@@ -168,7 +168,9 @@ def _select_launch_config(
     These thresholds come from joint tile/stage measurements. They are not
     occupancy guarantees: query the compiled launch's occupancy separately.
     With fp8_wave_sizing, large FP8 grids pick rows/CTA and splits by wave
-    count; otherwise FP8 keeps the split rule below at every size.
+    count; otherwise this helper uses the split rule below at every size.
+    The caller qsa_sparse._configuration overrides KV splits for large SM107
+    FP8 grids with 24 query heads and 2 KV heads.
     """
     output_tiles = num_rows * head_tiles_per_row
     if not bf16_kv and fp8_wave_sizing and output_tiles * 16 >= sm_count * 3:
