@@ -142,10 +142,11 @@ backend dependencies automatically.
 pip install -e tokenspeed-kernel/python/ --no-build-isolation
 ```
 
-Install the scheduler package:
+Install the engine package, which builds the C++ scheduler in. It needs Rust,
+CMake and OpenSSL development headers (see `tokenspeed-engine/README.md`):
 
 ```bash
-pip install -e tokenspeed-scheduler/
+pip install -e tokenspeed-engine/
 ```
 
 ## Verify

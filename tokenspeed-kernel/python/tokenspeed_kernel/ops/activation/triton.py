@@ -298,7 +298,6 @@ def moe_finalize_gate_add(
 def _sigmoid_mul_kernel(
     x_ptr,
     gate_ptr,
-    n_elements,
     bias_ptr,
     hidden_dim: tl.constexpr,
     head_dim: tl.constexpr,
@@ -307,23 +306,22 @@ def _sigmoid_mul_kernel(
     BLOCK_SIZE: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
-    pid = tl.program_id(0).to(tl.int64)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-
-    row = offsets // hidden_dim
-    col = offsets % hidden_dim
+    """One program per row and BLOCK_SIZE columns of it."""
+    row = tl.program_id(0).to(tl.int64)
+    col = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = col < hidden_dim
     head = col // head_dim
-    d = col % head_dim
-    gate_addrs = gate_ptr + row * gate_row_stride + head * gate_head_stride + d
+    gate_addrs = (
+        gate_ptr + row * gate_row_stride + head * gate_head_stride + col % head_dim
+    )
+    x_addrs = x_ptr + row * hidden_dim + col
 
     if ENABLE_PDL:
         # Wait for the predecessor's stores; release dependents immediately.
         tl.extra.cuda.gdc_wait()
         tl.extra.cuda.gdc_launch_dependents()
 
-    x = tl.load(x_ptr + offsets, mask=mask).to(tl.float32)
+    x = tl.load(x_addrs, mask=mask).to(tl.float32)
     g = tl.load(gate_addrs, mask=mask).to(tl.float32)
     if bias_ptr is not None:
         # The eager FP32 sigmoid: libdevice exp and an IEEE-rounded division.
@@ -331,7 +329,7 @@ def _sigmoid_mul_kernel(
         out = x * tl.div_rn(1.0, 1.0 + libdevice.exp(-z))
     else:
         out = x * tl.sigmoid(g)
-    tl.store(x_ptr + offsets, out, mask=mask)
+    tl.store(x_addrs, out, mask=mask)
 
 
 def sigmoid_mul(
@@ -413,18 +411,19 @@ def sigmoid_mul(
         else:
             head_dim = gate_head_stride = hidden_dim // bias_heads
 
-    n = x.numel()
-    if n == 0:
+    if x.numel() == 0:
         return x
 
-    BLOCK_SIZE = 1024
-    grid = ((n + BLOCK_SIZE - 1) // BLOCK_SIZE,)
+    # Row tiles avoid a 64-bit division per element; prefill sizes take wider tiles.
+    BLOCK_SIZE = min(
+        2048 if num_tokens >= 512 else 512, triton.next_power_of_2(hidden_dim)
+    )
+    grid = (num_tokens, triton.cdiv(hidden_dim, BLOCK_SIZE))
     enable_pdl = pdl_enabled()
     pdl_kwargs = {"launch_pdl": True} if enable_pdl else {}
     _sigmoid_mul_kernel[grid](
         x,
         gate,
-        n,
         head_bias,
         hidden_dim=hidden_dim,
         head_dim=head_dim,

@@ -52,7 +52,7 @@ def _expand_block_table_rows_kernel(Rows, Values, Out, BLOCK: tl.constexpr):
     # rows' share of the table rather than the widest row.
     for tile in range(tl.program_id(1), tl.cdiv(width, BLOCK), tl.num_programs(1)):
         col = tile * BLOCK + tl.arange(0, BLOCK)
-        # Keep fully masked prefix tiles at a valid base address on NPU.
+        # Keep fully masked prefix tiles at a valid base address.
         index = tl.maximum(col - start, 0)
         value = tl.load(values + index, (col >= start) & (col < end), other=0)
         tl.store(out + col, tl.where(col < end, value, -1), col < width)
@@ -114,7 +114,10 @@ def expand_block_table_rows(
         raise ValueError("block tables beyond 2**31 entries need int64 row fields")
     if not rows.shape[0] or not out.numel():
         return
-    if not out.is_cuda and out.device.type != "npu":
+    # Use the Torch fallback on Ascend for ragged-table correctness.
+    # test/npu/test_block_table_rows.py covers alignment and long masked prefixes.
+    # This costs multiple launches and table-sized temporaries per upload.
+    if not out.is_cuda:
         _expand_block_table_rows_torch(rows, values, out)
         return
     tiles = triton.cdiv(out.numel(), _BLOCK)

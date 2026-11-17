@@ -129,7 +129,8 @@ def create_peer_weight_store(
         device: Local device for source and staging allocations.
         model_identity: Shared checkpoint/quantization identity for validation.
         pool_page_bytes: Physical staging-page size, fixed for the store lifetime.
-        copy_implementation: Explicit transfer implementation; currently ``simple``.
+        copy_implementation: Currently only ``simple`` is supported. It submits
+            each layer as one batch of copy-engine copies from a worker thread.
         solution: Registered storage implementation, currently ``cuda``.
 
     Returns:

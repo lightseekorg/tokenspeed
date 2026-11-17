@@ -1138,7 +1138,7 @@ def kimi_host_cache():
     """
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
-    ts = pytest.importorskip("tokenspeed_scheduler")
+    ts = pytest.importorskip("tokenspeed_engine.scheduler")
     from test.runtime.conftest import kda_layer_id, make_kimi_pool, mla_layer_id
 
     from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor

@@ -1530,6 +1530,7 @@ if platform.is_amd:
     from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4 import fused as fused_mxfp_gfx1250
     from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.weight_preprocess import (
         preprocess_gluon_mxfp4_gfx1250_moe_weights,
+        preprocess_gluon_mxfp4_gfx1250_situ_moe_weights,
     )
 
     def gluon_mxfp4_gfx950_moe_weights(plan: dict, w: torch.nn.Module):
@@ -1550,6 +1551,9 @@ if platform.is_amd:
 
     def gluon_mxfp4_gfx1250_moe_weights(plan: dict, w: torch.nn.Module):
         return preprocess_gluon_mxfp4_gfx1250_moe_weights(plan, w)
+
+    def gluon_mxfp4_gfx1250_situ_moe_weights(plan: dict, w: torch.nn.Module):
+        return preprocess_gluon_mxfp4_gfx1250_situ_moe_weights(plan, w)
 
     def validate_linear_mxfp4_moe_weights(plan: dict, w: torch.nn.Module) -> None:
         del plan
@@ -2418,7 +2422,7 @@ if platform.is_amd:
         "apply",
         name="gluon_mxfp4_a8w4_situ_gfx1250_precomputed_moe_apply",
         solution="gluon",
-        weight_preprocessor=gluon_mxfp4_gfx1250_moe_weights,
+        weight_preprocessor=gluon_mxfp4_gfx1250_situ_moe_weights,
         capability=CapabilityRequirement(
             vendors=frozenset({"amd"}),
             min_arch_version=ArchVersion(12, 5),
@@ -2473,6 +2477,13 @@ if platform.is_amd:
         situ_linear_beta = getattr(w, "activation_situ_linear_beta", None)
         if situ_linear_beta is None:
             raise ValueError("gfx1250 A8W4 SiTU MoE requires linear_beta")
+        if getattr(w, "_gluon_w2_is_kplane", False) and not getattr(
+            w.w2_weight_triton_tensor, "kplane_rows", 0
+        ):
+            raise ValueError(
+                "gfx1250 A8W4 SiTU MoE down weight lost its K-plane layout "
+                "attributes after preprocessing"
+            )
         w13_pc = w.w13_precision_config
         w2_pc = w.w2_precision_config
         decode = _use_gfx1250_moe_decode(
@@ -2936,7 +2947,6 @@ if platform.is_amd:
 
 # TokenSpeed adapter for the vendored Gluon Petit MegaMoE kernels.
 
-_WORLD_SIZE = 8
 _MAX_TOKENS_PER_RANK = 1024
 _GPT_OSS_SWIGLU_ALPHA = 1.702
 _GPT_OSS_SWIGLU_LIMIT = 7.0
@@ -2960,6 +2970,7 @@ class _Profile:
     inter_dim: int
     has_bias: bool
     activation: str
+    world_sizes: frozenset[int] = frozenset({8})
 
 
 _GPT_OSS_120B_PROFILE = _Profile(
@@ -3001,6 +3012,7 @@ _DSV41_FLASH_PROFILE = _Profile(
     inter_dim=2560,
     has_bias=False,
     activation="silu_clamped",
+    world_sizes=frozenset({4, 8}),
 )
 _DSV41_FLASH_DSPARK_PROFILE = _Profile(
     name="dsv41_flash_dspark",
@@ -3011,6 +3023,7 @@ _DSV41_FLASH_DSPARK_PROFILE = _Profile(
     inter_dim=2560,
     has_bias=False,
     activation="silu_clamped",
+    world_sizes=frozenset({4, 8}),
 )
 _MUSE_SPARK_PROFILE = _Profile(
     name="muse_spark",
@@ -3030,6 +3043,13 @@ _PROFILES = (
     _DSV41_FLASH_DSPARK_PROFILE,
     _MUSE_SPARK_PROFILE,
 )
+# Union over profiles, for checks made before the model is known: kernel
+# selection and the runtime's MoELayer.
+GLUON_PETIT_WORLD_SIZES = frozenset().union(*(p.world_sizes for p in _PROFILES))
+
+
+def _join_sizes(sizes: frozenset[int]) -> str:
+    return "/".join(str(size) for size in sorted(sizes))
 
 
 @dataclass
@@ -3121,13 +3141,15 @@ def _validate_layer(w: torch.nn.Module) -> _Profile:
             f"num_experts={w.num_experts}, top_k={w.top_k}, "
             f"hidden_size={w.hidden_size}, intermediate_size={w.intermediate_size}"
         )
-    if (
-        w.ep_size != _WORLD_SIZE
-        or w.tp_size != 1
-        or w.num_local_experts != profile.num_experts // _WORLD_SIZE
-    ):
+    if w.ep_size not in profile.world_sizes:
         raise ValueError(
-            "Gluon Petit MegaMoE requires EP8, TP1 and contiguous expert shards"
+            f"Gluon Petit MegaMoE supports EP{_join_sizes(profile.world_sizes)} "
+            f"for {profile.name}; got EP{w.ep_size}"
+        )
+    if w.tp_size != 1 or w.num_local_experts != profile.num_experts // w.ep_size:
+        raise ValueError(
+            "Gluon Petit MegaMoE requires TP1 and contiguous expert shards; got "
+            f"tp_size={w.tp_size}, num_local_experts={w.num_local_experts}"
         )
 
     if profile is _GPT_OSS_120B_PROFILE:
@@ -3222,14 +3244,16 @@ def _get_workspace(device: torch.device, profile: _Profile) -> _Workspace:
         raise RuntimeError(
             "Gluon Petit MegaMoE requires torch.distributed initialization"
         )
-    if dist.get_world_size() != _WORLD_SIZE:
+    world_size = dist.get_world_size()
+    if world_size not in profile.world_sizes:
         raise RuntimeError(
-            "Gluon Petit MegaMoE requires the default distributed world size 8"
+            "Gluon Petit MegaMoE supports a default distributed world size of "
+            f"{_join_sizes(profile.world_sizes)} for {profile.name}; got {world_size}"
         )
 
     petit_kernel = _import_petit_kernel()
     config = petit_kernel.MegaMoeConfig(
-        world_size=_WORLD_SIZE,
+        world_size=world_size,
         num_experts=profile.num_experts,
         topk=profile.top_k,
         model_dim=profile.model_dim,
@@ -3244,7 +3268,7 @@ def _get_workspace(device: torch.device, profile: _Profile) -> _Workspace:
         inter_dim=profile.inter_dim,
         has_bias=profile.has_bias,
     )
-    heap = petit_kernel.create_vmm_symmetric_heap(_WORLD_SIZE)
+    heap = petit_kernel.create_vmm_symmetric_heap(world_size)
     inputs = config.input_views(heap, _MAX_TOKENS_PER_RANK)
     workspace = _Workspace(config=config, heap=heap, inputs=inputs)
     _workspace_cache[key] = workspace
@@ -3366,7 +3390,7 @@ def gluon_petit_mxfp4_megamoe_weights(plan: dict, w: torch.nn.Module) -> None:
         "supports_ep": frozenset({True}),
         "supports_all_to_all_ep": frozenset({True}),
         "a2a_backend": frozenset({"gluon_petit"}),
-        "ep_size": frozenset({_WORLD_SIZE}),
+        "ep_size": GLUON_PETIT_WORLD_SIZES,
         "ispp_alignment": frozenset({1}),
         "internal_activation_dtype": frozenset({"mxfp4"}),
         "supports_bias": frozenset({True}),
@@ -3559,7 +3583,7 @@ if platform.is_amd:
         signatures=_SIGNATURES,
         priority=Priority.SPECIALIZED,
         traits={
-            "tokens_min": frozenset({1025}),
+            "tokens_min": frozenset({129}),
             "hidden_size": frozenset({7168}),
             "num_experts": frozenset({896}),
             "latent_size": frozenset({3584}),

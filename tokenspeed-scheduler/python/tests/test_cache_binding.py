@@ -131,6 +131,7 @@ def test_snapshot_pool_is_stated_explicitly():
     cfg.prefix_granularity = 16
     cfg.max_scheduled_tokens = 32
     cfg.max_batch_size = 4
+    cfg.max_resident_requests = cfg.max_batch_size
     cfg.num_device_pages = 64
     cfg.disable_l2_cache = True
     cfg.cache_groups = [
@@ -178,6 +179,7 @@ def test_host_write_policy_round_trips():
     cfg.prefix_granularity = 16
     cfg.max_scheduled_tokens = 32
     cfg.max_batch_size = 4
+    cfg.max_resident_requests = cfg.max_batch_size
     cfg.num_device_pages = 64
     cfg.num_host_pages = 9
     cfg.num_snapshot_pages = 1
@@ -222,6 +224,7 @@ def test_an_eviction_store_is_stream_ordered_and_published_at_its_ack():
     cfg.prefix_granularity = page
     cfg.max_scheduled_tokens = 256
     cfg.max_batch_size = 4
+    cfg.max_resident_requests = cfg.max_batch_size
     # Four usable pages: two 40-token prompts do not fit together.
     cfg.num_device_pages = 4 + 1
     cfg.num_host_pages = 8 + 1
@@ -445,6 +448,7 @@ def test_host_cache_stats_count_eviction_write_backs():
     cfg.prefix_granularity = page
     cfg.max_scheduled_tokens = 256
     cfg.max_batch_size = 4
+    cfg.max_resident_requests = cfg.max_batch_size
     cfg.num_device_pages = 4 + 1
     cfg.num_host_pages = 2 + 1
     cfg.num_snapshot_pages = 1

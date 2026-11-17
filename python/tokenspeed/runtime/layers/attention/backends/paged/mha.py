@@ -440,6 +440,7 @@ class MHAAttnBackend(PagedAttentionBackend):
                     max_seqlen_q=max_seqlen_q,
                     logit_cap=layer.logit_cap,
                     sinks=sinks,
+                    block_draft=self.draft_block_decode,
                     solution=self.kernel_solution,
                     **scale_kwargs,
                 )
@@ -457,6 +458,7 @@ class MHAAttnBackend(PagedAttentionBackend):
                 logit_cap=layer.logit_cap,
                 sinks=sinks,
                 out=self.decode_schedule_buf,
+                block_draft=self.draft_block_decode,
                 solution=self.kernel_solution,
                 **scale_kwargs,
             )
@@ -534,6 +536,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             max_seqlen_k=self.max_context_len,
             max_seqlen_q=max_seqlen_q,
             schedule=schedule,
+            block_draft=self.draft_block_decode,
             solution=self.kernel_solution,
             **scale_kwargs,
         )
@@ -598,6 +601,7 @@ class MHAAttnBackend(PagedAttentionBackend):
                 return_lse=True,
                 softmax_scale=layer.scaling,
                 solution="triton",
+                block_draft=False,
             )
         else:
             prefix_out, prefix_lse = self._lane_prefix_decode(
@@ -655,6 +659,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             return_lse=True,
             softmax_scale=layer.scaling,
             solution="triton",
+            block_draft=False,
         )
         out = out.view(num_reqs, heads, rows, -1).transpose(1, 2)
         lse = lse.view(num_reqs, heads, rows).transpose(1, 2)

@@ -901,3 +901,18 @@ also exercise uneven/empty owners over multiple GPUs:
 python -m torch.distributed.run --standalone --nproc-per-node=2 -m pytest -q \
   tokenspeed-kernel/test/nvidia/ops/moe/test_deep_gemm_mxfp4_mega_moe.py
 ```
+
+
+## Router projection with NVFP4 input
+
+`try_router_gemm_nvfp4` produces BF16 router logits and the packed E2M1 / linear
+E4M3 input accepted by NVFP4 MoE. Its scalar is the consumer's quantization-domain
+global scale. Routing, top-k and expert evaluation remain with the caller.
+Automatic SM107 selection covers the measured M1/M4, H2560/E512, aligned BF16/PDL
+case; other inputs retain separate projection and quantization. The Qwen caller
+also retains serial preparation for prefill, other topologies and padded expert
+widths. The CUDA producer keeps four FP32 K partials, reduces them in order, and
+rounds logits once to BF16. Compile/cache keys contain model dimensions only;
+row count stays runtime, with M1 and capacity-8 kernels built together before
+capture. The native tile is a temporary CUDA implementation preserving the
+validated arithmetic; no AOT files or task-specific loader are needed.

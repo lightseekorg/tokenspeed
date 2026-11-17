@@ -47,7 +47,7 @@ register_cuda_ci(est_time=60, suite="runtime-1gpu")
 
 from test.l3_test_utils import storage_scheduler  # noqa: E402
 
-from tokenspeed_scheduler import (  # noqa: E402
+from tokenspeed_engine.scheduler import (  # noqa: E402
     AttnKind,
     Cache,
     CacheGroupConfig,
@@ -530,6 +530,7 @@ def _scheduler(*, max_batch_size: int) -> Scheduler:
     config.prefix_granularity = 16
     config.max_scheduled_tokens = 64
     config.max_batch_size = max_batch_size
+    config.max_resident_requests = max_batch_size
     config.num_device_pages = 64
     config.num_snapshot_pages = 1
     config.cache_groups = [

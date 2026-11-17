@@ -67,7 +67,7 @@ TEST(FullCacheBenchmark, RestoresRealPrefixesAfterCacheAndSchedulerAdmissions) {
             ExpectMeasured(scheduler.plan, 1, "plan");
             EXPECT_TRUE(CacheCoordinatorTestAccess::BoundaryTreeMismatches(workload.Coordinator()).empty());
             for (const auto& hashes : workload.Histories()) {
-                const auto probe = workload.Coordinator().ProbePrefix(hashes);
+                const auto probe = workload.Coordinator().Prober().ProbePrefix(hashes);
                 EXPECT_EQ(probe.device.num_common_tokens, hashes.size() * config.page_size);
             }
         }
@@ -97,7 +97,7 @@ TEST(FullCacheBenchmark, LifecycleRestoresPrefixesWithAndWithoutEvents) {
                 }
                 EXPECT_TRUE(CacheCoordinatorTestAccess::BoundaryTreeMismatches(workload.Coordinator()).empty());
                 for (const auto& hashes : workload.Histories()) {
-                    EXPECT_EQ(workload.Coordinator().ProbePrefix(hashes).device.num_common_tokens,
+                    EXPECT_EQ(workload.Coordinator().Prober().ProbePrefix(hashes).device.num_common_tokens,
                               hashes.size() * config.page_size);
                 }
             }
@@ -114,7 +114,7 @@ TEST(FullCacheBenchmark, ShuffledPhysicalPagesRestoreTheSamePrefixes) {
             EXPECT_EQ(sample.published_prompt_pages, config.EvictedPages() - config.batch_size);
             EXPECT_TRUE(CacheCoordinatorTestAccess::BoundaryTreeMismatches(workload.Coordinator()).empty());
             for (const auto& hashes : workload.Histories()) {
-                EXPECT_EQ(workload.Coordinator().ProbePrefix(hashes).device.num_common_tokens,
+                EXPECT_EQ(workload.Coordinator().Prober().ProbePrefix(hashes).device.num_common_tokens,
                           hashes.size() * config.page_size);
             }
         }

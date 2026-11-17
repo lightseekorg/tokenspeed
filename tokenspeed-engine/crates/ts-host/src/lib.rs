@@ -271,7 +271,8 @@ struct HostConfig {
     /// The data plane fills bitmasks from the matchers' committed state.
     eager_grammar: bool,
     /// The fused role's prefill-delay gate, `(attempt_interval,
-    /// any_interval)` in rounds, when `--prefill-attempt-interval` is set.
+    /// any_interval)` in rounds plus `--prefill-single-round`, when
+    /// `--prefill-attempt-interval` is set.
     prefill_delay: Option<PrefillDelay>,
 }
 
@@ -551,10 +552,10 @@ impl HostConfig {
             eager_grammar: config.getattr("eager_grammar")?.extract()?,
             prefill_delay: match config
                 .getattr("prefill_delay")?
-                .extract::<Option<(u64, u64)>>()?
+                .extract::<Option<(u64, u64, bool)>>()?
             {
                 None => None,
-                Some((attempt_interval, any_interval)) => {
+                Some((attempt_interval, any_interval, single_round)) => {
                     if attempt_interval < 1 || any_interval < attempt_interval {
                         return Err(pyo3::exceptions::PyValueError::new_err(format!(
                             "prefill delay needs 1 <= attempt_interval <= any_interval, got \
@@ -564,6 +565,7 @@ impl HostConfig {
                     Some(PrefillDelay {
                         attempt_interval,
                         any_interval,
+                        single_round,
                     })
                 }
             },

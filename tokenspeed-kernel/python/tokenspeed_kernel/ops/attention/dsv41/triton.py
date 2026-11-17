@@ -2370,9 +2370,11 @@ def _dspark_anchors_kernel(
     POSITIONS,
     NEXT,
     START,
+    INDPTR,
     N0,
     EXTENDS,
     PREFILL_OUTPUTS,
+    RAGGED: tl.constexpr,
     WIDTH: tl.constexpr,
     SPEC: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -2381,7 +2383,15 @@ def _dspark_anchors_kernel(
     one = tl.arange(0, 1)
     decode = row >= EXTENDS
     index = row - EXTENDS
-    accepted = tl.minimum(tl.maximum(tl.load(ACCEPT + row).to(tl.int64), 1), WIDTH)
+    offset = index * WIDTH
+    query_length = tl.full((), WIDTH, tl.int64)
+    if RAGGED:
+        offset = tl.load(INDPTR + index, decode, 0).to(tl.int64)
+        end = tl.load(INDPTR + index + 1, decode, WIDTH).to(tl.int64)
+        query_length = end - offset
+    accepted = tl.minimum(
+        tl.maximum(tl.load(ACCEPT + row).to(tl.int64), 1), query_length
+    )
     active = (row < PREFILL_OUTPUTS) | decode
     verify = PREFILL_OUTPUTS + index * WIDTH + accepted - 1
     bonus = tl.load(TOKENS + tl.where(decode, verify, row), active, 0).to(tl.int32)
@@ -2392,7 +2402,7 @@ def _dspark_anchors_kernel(
         active & (columns < SPEC),
     )
     anchor_mask = decode & (one == 0)
-    anchor = tl.load(POSITIONS + index * WIDTH + accepted - 1 + one, anchor_mask, -1)
+    anchor = tl.load(POSITIONS + offset + accepted - 1 + one, anchor_mask, -1)
     tl.store(START + index + one, anchor.to(tl.int64), anchor_mask)
 
 
@@ -2415,6 +2425,7 @@ def triton_dsv41_dspark_anchors(
     width,
     next_tokens,
     start_pos,
+    decode_query_indptr,
 ):
     rows = accept_lengths.shape[0]
     if rows == 0:
@@ -2425,9 +2436,11 @@ def triton_dsv41_dspark_anchors(
         positions,
         next_tokens,
         start_pos,
+        decode_query_indptr,
         next_tokens.stride(0),
         num_extends,
         num_prefill_outputs,
+        RAGGED=decode_query_indptr is not None,
         WIDTH=width,
         SPEC=next_tokens.shape[1],
         BLOCK=triton.next_power_of_2(next_tokens.shape[1]),
@@ -2810,6 +2823,86 @@ def mask_invalid_pages(values, lengths, history_pages, starts, pages, page_size)
             pages,
             page_size,
             256,
+            num_warps=4,
+        )
+    return values
+
+
+@triton.jit(
+    do_not_specialize=["X0", "L0", "T0", "TC", "NP"],
+)
+def _mask_invalid_table_pages(
+    X, L, T, X0, L0, T0, T1, TC, NP, P: tl.constexpr, B: tl.constexpr, G: tl.constexpr
+):
+    # Program (row, chunk) checks table pages [chunk * B, chunk * B + B) of its
+    # row, so a long row's chunks run in parallel instead of one CTA looping
+    # over them; chunks at or past the row's end do nothing. T1 is left
+    # specialized: the selection table has unit stride. This is the paged
+    # counterpart of _mask_invalid_pages.
+    row = tl.program_id(0).to(tl.int64)
+    first = tl.program_id(1) * B
+    end = tl.minimum(tl.maximum(tl.load(L + row * L0), 0), TC * P)
+    if first * P < end:
+        page_index = first + tl.arange(0, B)
+        live = page_index * P < end
+        page = tl.load(T + row * T0 + page_index * T1, live, other=0)
+        invalid = live & ((page < 0) | (page >= NP))
+        # Normally every live page is valid and nothing is written. Otherwise
+        # write -inf G pages at a time, rereading their ids in the store
+        # layout: a [B, P] tile would hold every register and convert the
+        # flags through shared memory even when nothing is stored.
+        if tl.max(invalid.to(tl.int32), axis=0) > 0:
+            last = tl.minimum(first + B, tl.cdiv(end, P))
+            for group in range(first, last, G):
+                index = group + tl.arange(0, G)
+                held = tl.load(T + row * T0 + index * T1, index < last, other=0)
+                hole = (index < last) & ((held < 0) | (held >= NP))
+                column = index[:, None] * P + tl.arange(0, P)[None, :]
+                tl.store(
+                    X + row * X0 + column,
+                    float("-inf"),
+                    hole[:, None] & (column < end),
+                )
+
+
+def mask_invalid_table_pages(values, lengths, table, pages, page_size):
+    """Set logits of invalid pages in [0, length) to -inf in place, per table row.
+
+    values is [rows, >= width * page_size] with unit column stride and table
+    is integer [rows, width]: row r scored its history through table row r
+    (paged scoring). A page outside [0, pages) is invalid, as
+    clean_logits_for_selection treats it, so [0, length) of every row ends up
+    bit-identical to that cleaned copy. Columns at or beyond length are left
+    untouched: consumers read [0, length). Nothing is copied. Rows are checked
+    in 1024-page chunks in parallel, so the longest row does not serialize the
+    launch. Returns values.
+    """
+    if (
+        values.ndim != 2
+        or values.stride(1) != 1
+        or table.ndim != 2
+        or values.shape[0] != lengths.numel()
+        or table.shape[0] != values.shape[0]
+        or values.shape[1] < table.shape[1] * page_size
+    ):
+        raise RuntimeError("DeepGEMM returned incompatible score geometry")
+    if values.shape[0] and table.shape[1]:
+        # 1024 pages per program keeps a 1M-token table (16385 pages) at 17
+        # programs per row, under one wave for 96 rows; 16-page store groups
+        # keep the kernel at about 30 registers.
+        _mask_invalid_table_pages[(values.shape[0], triton.cdiv(table.shape[1], 1024))](
+            values,
+            lengths,
+            table,
+            values.stride(0),
+            lengths.stride(0),
+            table.stride(0),
+            table.stride(1),
+            table.shape[1],
+            pages,
+            page_size,
+            1024,
+            max(1, 1024 // page_size),
             num_warps=4,
         )
     return values
@@ -3364,7 +3457,244 @@ def write_selection(selected, candidates, out):
     )
 
 
-@triton.jit(do_not_specialize=["BS", "ACTUAL", "EXTENDS"])
+@triton.jit
+def _finished_ids(
+    I,
+    S,
+    E,
+    C,
+    row,
+    i,
+    I0,
+    S0,
+    NC,
+    K,
+    W,
+    BLOCK_SIZE: tl.constexpr,
+    HAS_CANDIDATES: tl.constexpr,
+    SHORT_ROWS_UNSCORED: tl.constexpr,
+):
+    # _finish_selection's filter and position sort for one row, returning the
+    # IDs it stores: valid positions ascending, then -1.
+    end = tl.load(E + row)
+    if SHORT_ROWS_UNSCORED:
+        # Sparse scoring left pools that fit K unwritten; the dropped candidate
+        # mask scored them 0.0, which selects the whole pool [0, end). Take it
+        # without reading those logits or the selector's picks for them.
+        short = end <= K
+        selected = tl.load(I + row * I0 + i, (i < K) & (end > K), other=-1)
+        selected = tl.where(short, i, selected)
+        valid = (i < K) & (selected >= 0) & (selected < end)
+        score = tl.load(S + row * S0 + selected, valid & (end > K), other=-float("inf"))
+        valid &= short | (score > -float("inf"))
+    else:
+        selected = tl.load(I + row * I0 + i, i < K, other=-1)
+        valid = (i < K) & (selected >= 0) & (selected < end)
+        score = tl.load(S + row * S0 + selected, valid, other=-float("inf"))
+        valid &= score > -float("inf")
+    position = selected
+    if HAS_CANDIDATES:
+        candidate = tl.load(C + row * NC + selected // BLOCK_SIZE, valid, other=-1)
+        position = candidate * BLOCK_SIZE + selected % BLOCK_SIZE
+        valid &= (candidate >= 0) & (position < W)
+    position = tl.where(valid, position, 2147483647)
+    position = tl.sort(position, descending=False)
+    return tl.where(position != 2147483647, position, -1)
+
+
+@triton.jit(
+    do_not_specialize=[
+        "I0",
+        "S0",
+        "NC",
+        "K",
+        "W",
+        "J0",
+        "T0",
+        "CK",
+        "TR",
+        "TC",
+        "TS0",
+        "TS1",
+        "PAGES",
+    ],
+    do_not_specialize_on_alignment=["Lengths", "BlockLengths", "P", "Req", "Table"],
+)
+def _finish_write_selection(
+    I,
+    S,
+    E,
+    C,
+    Rows,
+    Lengths,
+    J,
+    T,
+    F,
+    Blocks,
+    BlockLengths,
+    Slots,
+    P,
+    Req,
+    Table,
+    I0,
+    S0,
+    NC,
+    K,
+    W,
+    J0,
+    T0,
+    CK,
+    TR,
+    TC,
+    TS0,
+    TS1,
+    PAGES,
+    BLOCK_SIZE: tl.constexpr,
+    HAS_CANDIDATES: tl.constexpr,
+    SHORT_ROWS_UNSCORED: tl.constexpr,
+    POOL: tl.constexpr,
+    SLOTS: tl.constexpr,
+    RATIO: tl.constexpr,
+    PS: tl.constexpr,
+    RS: tl.constexpr,
+    ROW_BLOCK: tl.constexpr,
+    POOL_BLOCK: tl.constexpr,
+):
+    # Program (row, 0) finishes the row picks; (row, 1) the candidate-block
+    # picks of a pass that sources a pool, concurrently.
+    row = tl.program_id(0).to(tl.int64)
+    if tl.program_id(1) == 0:
+        i = tl.arange(0, ROW_BLOCK)
+        ids = _finished_ids(
+            I,
+            S,
+            E,
+            C,
+            row,
+            i,
+            I0,
+            S0,
+            NC,
+            K,
+            W,
+            BLOCK_SIZE,
+            HAS_CANDIDATES,
+            SHORT_ROWS_UNSCORED,
+        )
+        tl.store(Rows + row * K + i, ids, i < K)
+        tl.store(Lengths + row, tl.sum((ids >= 0).to(tl.int32)))
+        if SLOTS:
+            # _global_slots_kernel's causality bound and page lookup.
+            pos = tl.load(P + row * PS)
+            req = tl.load(Req + row * RS)
+            raw = tl.where(
+                (ids >= 0) & (ids < (pos + 1) // RATIO),
+                ids.to(tl.int64) * RATIO,
+                -1,
+            )
+            slots = resolve_group_slot(
+                Table, raw, req, TR, TC, TS0, TS1, 64, RATIO, 1, PAGES
+            )
+            tl.store(Slots + row * K + i, slots, i < K)
+        if not POOL:
+            # A pass that sources no candidates still owes empty pool counts.
+            tl.store(BlockLengths + row, tl.full((), 0, tl.int32))
+    if POOL:
+        if tl.program_id(1) == 1:
+            c = tl.arange(0, POOL_BLOCK)
+            # Candidate IDs carry no score order; publish them ascending.
+            ids = _finished_ids(J, T, F, J, row, c, J0, T0, 0, CK, 0, 1, False, False)
+            tl.store(Blocks + row * CK + c, ids, c < CK)
+            tl.store(BlockLengths + row, tl.sum((ids >= 0).to(tl.int32)))
+
+
+def finish_write_selection(rows, pool, out, slots, short_rows_unscored):
+    """Finish native picks straight into caller-owned selection outputs.
+
+    One launch replaces finish_selection, write_selection and global_slots.
+
+    Args:
+        rows: (indices, scores, ends, candidates, width, block_size) row picks,
+            as finish_selection takes them; rows are position-sorted.
+        pool: (indices, scores, ends) candidate-block picks of a pass that
+            sources candidates, or None. Without a pool, blocks must have no
+            columns and the block counts are zeroed.
+        out: Contiguous int32 (rows [N, K], lengths [N], blocks [N, CK],
+            block lengths [N]) tiles, with K and CK the pick widths.
+        slots: SelectionSlots for these N rows, or None for no slots.
+        short_rows_unscored: True when rows whose end is at most K were not
+            scored (sparse scoring with skip_score_topk = K): such rows select
+            their whole [0, end) without reading scores or picks. Their logits
+            may be uninitialized; DeepSelect skips its NaN check for them.
+
+    Bit-identical to write_selection of finish_selection(*rows, True) and
+    finish_selection(*pool, None, pool scores width, 8, False), followed by
+    global_slots of the written rows into slots.out; with
+    short_rows_unscored, to that composition run on the logits after
+    _mask_candidate_logits. Pool IDs come out ascending either way, since
+    write_selection sorts them.
+    """
+    indices, scores, ends, candidates, width, block_size = rows
+    row_ids, lengths, blocks, block_lengths = out
+    n, k = indices.shape
+    pool_indices, pool_scores, pool_ends = pool if pool is not None else (None,) * 3
+    pool_k = pool_indices.shape[1] if pool is not None else 0
+    if (
+        row_ids.shape != (n, k)
+        or lengths.shape != (n,)
+        or blocks.shape != (n, pool_k)
+        or block_lengths.shape != (n,)
+        or not all(t.is_contiguous() for t in out)
+        or (pool is not None and (pool_k == 0 or pool_indices.shape[0] != n))
+        or (slots is not None and slots.out.shape != (n, k))
+        or (slots is not None and not slots.out.is_contiguous())
+    ):
+        raise ValueError("selection outputs disagree with the picks they finish")
+    if n == 0:
+        return
+    table = slots.table if slots is not None else indices
+    kernel_launcher(_finish_write_selection, (n, 1 if pool is None else 2))(
+        indices,
+        scores,
+        ends,
+        candidates if candidates is not None else indices,
+        row_ids,
+        lengths,
+        pool_indices if pool is not None else indices,
+        pool_scores if pool is not None else scores,
+        pool_ends if pool is not None else ends,
+        blocks,
+        block_lengths,
+        slots.out if slots is not None else row_ids,
+        slots.positions if slots is not None else ends,
+        slots.requests if slots is not None else ends,
+        table,
+        indices.stride(0),
+        scores.stride(0),
+        candidates.shape[1] if candidates is not None else 0,
+        k,
+        width,
+        pool_indices.stride(0) if pool is not None else 0,
+        pool_scores.stride(0) if pool is not None else 0,
+        pool_k,
+        *(table.shape if slots is not None else (0, 0)),
+        *(table.stride() if slots is not None else (0, 0)),
+        slots.pages if slots is not None else 0,
+        block_size,
+        candidates is not None,
+        short_rows_unscored,
+        pool is not None,
+        slots is not None,
+        slots.ratio if slots is not None else 1,
+        slots.positions.stride(0) if slots is not None else 1,
+        slots.requests.stride(0) if slots is not None else 1,
+        triton.next_power_of_2(k),
+        triton.next_power_of_2(pool_k) if pool is not None else 1,
+        num_warps=8,
+    )
+
+
+@triton.jit(do_not_specialize=["BS", "ACTUAL", "EXTENDS", "TOKENS"])
 def _decode_rows_kernel(
     Seq,
     Req,
@@ -3372,24 +3702,51 @@ def _decode_rows_kernel(
     Requests,
     Lengths,
     PoolRows,
+    Indptr,
     BS,
+    TOKENS,
     ACTUAL,
     EXTENDS,
+    RAGGED: tl.constexpr,
     WIDTH: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    token = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    token = (tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)).to(tl.int64)
     row = token // WIDTH
-    length = tl.load(Seq + row, row < ACTUAL, other=0).to(tl.int64)
-    length = tl.where(row < ACTUAL, tl.maximum(length, WIDTH), 0)
-    pool = tl.load(Req + row, row < ACTUAL, other=-1)
-    live = (row >= EXTENDS) & (row < ACTUAL)
-    position = length - WIDTH + token % WIDTH
-    tl.store(Positions + token, tl.where(live, position, -1), token < BS * WIDTH)
-    tl.store(Requests + token, tl.where(live, row, -1), token < BS * WIDTH)
-    request_row = (row < BS) & (token % WIDTH == 0)
-    tl.store(Lengths + row, length, request_row)
-    tl.store(PoolRows + row, pool, request_row)
+    offset = token % WIDTH
+    if RAGGED:
+        # Upper-bound search skips empty padded request intervals. All bounds
+        # stay on device and vary between replays of the same physical graph.
+        lo = tl.full((BLOCK,), 0, tl.int64)
+        hi = tl.full((BLOCK,), BS + 1, tl.int64)
+        while tl.sum((lo < hi).to(tl.int32), 0) > 0:
+            mid = (lo + hi) // 2
+            boundary = tl.load(Indptr + mid, mid <= BS, 2147483647)
+            right = boundary <= token
+            active = lo < hi
+            lo = tl.where(active & right, mid + 1, lo)
+            hi = tl.where(active & ~right, mid, hi)
+        row = lo - 1
+        begin = tl.load(Indptr + row, (row >= 0) & (row < ACTUAL), 0)
+        offset = token - begin
+    valid_request = (row >= EXTENDS) & (row < ACTUAL)
+    length = tl.load(Seq + row, valid_request, other=0).to(tl.int64)
+    position = tl.maximum(length, WIDTH) - WIDTH + offset
+    tl.store(Positions + token, tl.where(valid_request, position, -1), token < TOKENS)
+    tl.store(Requests + token, tl.where(valid_request, row, -1), token < TOKENS)
+
+    # Request vectors have their own extent; clear them even when graph token
+    # capacity is smaller than the padded request capacity.
+    live_request = token < ACTUAL
+    length = tl.load(Seq + token, live_request, other=0).to(tl.int64)
+    length = tl.where(live_request, tl.maximum(length, WIDTH), 0)
+    if RAGGED:
+        begin = tl.load(Indptr + token, token < BS, 0)
+        end = tl.load(Indptr + token + 1, token < BS, 0)
+        length = tl.where(live_request, length - WIDTH + end - begin, 0)
+    pool = tl.load(Req + token, live_request, other=-1)
+    tl.store(Lengths + token, length, token < BS)
+    tl.store(PoolRows + token, pool, token < BS)
 
 
 @register_kernel(
@@ -3411,19 +3768,24 @@ def decode_rows(
     actual_bs,
     num_extends,
     width,
+    query_start_loc,
 ):
     """Refresh request vectors and packed token coordinates, including padding."""
-    if positions.numel():
-        _decode_rows_kernel[(triton.cdiv(positions.numel(), 256),)](
+    extent = max(positions.numel(), lengths.numel())
+    if extent:
+        _decode_rows_kernel[(triton.cdiv(extent, 256),)](
             seq_lens,
             request_pool_indices,
             positions,
             requests,
             lengths,
             pool_rows,
+            query_start_loc,
             lengths.numel(),
+            positions.numel(),
             actual_bs,
             num_extends,
+            RAGGED=query_start_loc is not None,
             WIDTH=width,
             BLOCK=256,
         )
@@ -4773,9 +5135,144 @@ register_triton_warmup(
 register_triton_warmup(
     _write_selection, variants=({"CANDIDATE_BLOCK": _SELECTION_BLOCKS},)
 )
+register_triton_warmup(
+    _finish_write_selection,
+    variants=lambda args: ({"POOL_BLOCK": _SELECTION_BLOCKS},) if args["POOL"] else (),
+)
 # Canonical windows pass a row slice, reordered subsets an index tensor.
 register_triton_warmup(_prefill_indices_kernel, variants=({"HAS_ROWS": (False, True)},))
 register_triton_warmup(
     _selection_table_kernel,
     variants=lambda args: ({"RATIO": tuple(sorted({1, args["RATIO"]}))},),
 )
+
+
+@triton.jit(
+    do_not_specialize=["BS", "CAPACITY", "STRIDE", "LATEST_STRIDE", "LATEST_ROWS"]
+)
+def _verify_layout_kernel(
+    Scores,
+    Latest,
+    Slots,
+    ActiveCount,
+    Rows,
+    Indptr,
+    Counts,
+    Valid,
+    BS,
+    CAPACITY,
+    STRIDE,
+    LATEST_STRIDE,
+    LATEST_ROWS,
+    DRAFT: tl.constexpr,
+    BLOCK: tl.constexpr,
+    USE_LATEST: tl.constexpr,
+    HAS_ACTIVE_COUNT: tl.constexpr,
+):
+    index = tl.arange(0, BLOCK).to(tl.int64)
+    request = index // DRAFT
+    column = index % DRAFT
+    active_bs = tl.load(ActiveCount).to(tl.int32) if HAS_ACTIVE_COUNT else BS
+    live = request < active_bs
+    if USE_LATEST:
+        slot = tl.load(Slots + request, request < BS, 0).to(tl.int64)
+        slot_valid = live & (slot >= 0) & (slot < LATEST_ROWS)
+        latest_finite = slot_valid
+        for j in tl.static_range(DRAFT):
+            value = tl.load(Latest + slot * LATEST_STRIDE + j, slot_valid, 0)
+            latest_finite = latest_finite & (tl.abs(value) < float("inf"))
+    finite = tl.full((BLOCK,), True, tl.int1)
+    survival = tl.full((BLOCK,), 1.0, tl.float32)
+    for j in tl.static_range(DRAFT):
+        score = tl.load(Scores + request * STRIDE + j, request < BS, 0)
+        if USE_LATEST:
+            value = tl.load(Latest + slot * LATEST_STRIDE + j, slot_valid, 0)
+            score = tl.where(latest_finite, value, score)
+        finite = finite & (tl.abs(score) < float("inf"))
+        score = tl.minimum(tl.maximum(score, -60.0), 60.0)
+        probability = tl.div_rn(1.0, 1.0 + libdevice.exp(-score))
+        survival = survival * tl.where(j <= column, probability, 1.0)
+    gain = tl.where(finite, survival, float("inf"))
+    # Positive IEEE float bits sort in numeric order. The low word makes
+    # ties deterministic in request/token order, preserving each prefix.
+    key = (gain.to(tl.uint32, bitcast=True).to(tl.uint64) << 32) | (
+        0xFFFFFFFF - index.to(tl.uint64)
+    )
+    key = tl.where(live, key, 0)
+    ordered = tl.sort(key, descending=True)
+    extra = CAPACITY - BS
+    cutoff = tl.sum(tl.where(index == extra - 1, ordered, 0), 0)
+    selected = live & (extra > 0) & (key >= cutoff)
+    unknown = tl.sum((live & ~finite & (column == 0)).to(tl.int32), 0)
+    valid = unknown * DRAFT <= extra
+    counts = tl.full((BLOCK,), 1, tl.int32)
+    for j in tl.static_range(DRAFT):
+        selected_index = tl.minimum(index * DRAFT + j, BLOCK - 1).to(tl.int32)
+        counts += tl.gather(selected.to(tl.int32), selected_index, axis=0)
+    counts = tl.where(index < BS, tl.where(valid, counts, 1), 0)
+    ends = tl.cumsum(counts, 0)
+    tl.store(Counts + index, counts.to(tl.int64), index < BS)
+    tl.store(Indptr + index + 1, ends.to(tl.int64), index < BS)
+    tl.store(Indptr, 0)
+    tl.store(Valid, valid)
+    # Upper bound over cumulative lengths maps each packed output to its owner.
+    lo = tl.full((BLOCK,), 0, tl.int32)
+    hi = tl.full((BLOCK,), BS, tl.int32)
+    while tl.sum((lo < hi).to(tl.int32), 0) > 0:
+        mid = (lo + hi) // 2
+        end = tl.gather(ends, tl.minimum(mid, BLOCK - 1), axis=0)
+        active = lo < hi
+        right = end <= index
+        lo = tl.where(active & right, mid + 1, lo)
+        hi = tl.where(active & ~right, mid, hi)
+    owner = tl.minimum(lo, BS - 1)
+    before = tl.gather(ends, tl.maximum(owner - 1, 0), axis=0)
+    before = tl.where(owner == 0, 0, before)
+    total = tl.sum(counts, 0)
+    rows = owner.to(tl.int64) * (DRAFT + 1) + index - before
+    tl.store(Rows + index, tl.where(index < total, rows, 0), index < CAPACITY)
+
+
+@register_kernel(
+    "attention",
+    "dsv41_verify_layout",
+    name="triton_dsv41_verify_layout",
+    solution="triton",
+    capability=_CAPABILITY,
+    signatures=[format_signature(x=dense_tensor_format(torch.float32))],
+    traits={},
+    priority=Priority.PORTABLE + 1,
+)
+def triton_dsv41_verify_layout(
+    scores,
+    query_capacity,
+    rows_out,
+    indptr_out,
+    counts_out,
+    valid_out,
+    latest_scores=None,
+    request_slots=None,
+    active_count=None,
+):
+    bs, draft = scores.shape
+    block = triton.next_power_of_2(bs * (draft + 1))
+    _verify_layout_kernel[(1,)](
+        scores,
+        latest_scores,
+        request_slots,
+        active_count,
+        rows_out,
+        indptr_out,
+        counts_out,
+        valid_out,
+        bs,
+        query_capacity,
+        scores.stride(0),
+        latest_scores.stride(0) if latest_scores is not None else 0,
+        latest_scores.shape[0] if latest_scores is not None else 0,
+        DRAFT=draft,
+        BLOCK=block,
+        USE_LATEST=latest_scores is not None,
+        HAS_ACTIVE_COUNT=active_count is not None,
+        num_warps=4,
+    )

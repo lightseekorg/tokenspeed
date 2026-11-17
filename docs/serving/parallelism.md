@@ -1081,6 +1081,8 @@ Before benchmarking:
 batch. Execution remains TP1/EP1; attention DP still identifies the serving
 workers. Omitting the option keeps resident expert weights.
 
+DWDP requires the CUDA 13 toolkit.
+
 The initial K3 NVFP4 configuration requires `--attn-tp-size 1 --moe-tp-size 1
 --ep-size 1 --all2all-backend none`, `--disaggregation-mode prefill`,
 `--enforce-eager --prefill-graph-max-tokens 0`, and a fixed prefill token budget.

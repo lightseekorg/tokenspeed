@@ -40,7 +40,7 @@ from test.l3_test_utils import (
 )
 
 import pytest
-import tokenspeed_scheduler as ts
+import tokenspeed_engine.scheduler as ts
 import torch
 
 # Every group's 8-byte blocks, one per LCM block: block ``b`` of any group is
@@ -76,6 +76,7 @@ def _scheduler(kinds):
     config.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteThrough
     config.max_scheduled_tokens = 64
     config.max_batch_size = 8
+    config.max_resident_requests = 8
     config.enable_l3_storage = True
     config.storage_config = ts.StorageConfig(
         8,
