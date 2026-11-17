@@ -3522,6 +3522,9 @@ CacheCoordinator::StorageQuery CacheCoordinator::SharedPrefixKeys(const PromptPr
 
 CacheCoordinator::StorageQuery CacheCoordinator::MissingStorageKeys(const PromptPrefix& prompt,
                                                                     std::size_t max_keys) const {
+    _assert(prompt.max_tokens >= 0 &&
+                static_cast<std::size_t>(prompt.max_tokens / prefix_granularity_) <= prompt.prefix_hashes.size(),
+            "storage query bound exceeds the supplied prefix hashes");
     const PrefixProbe local = ProbePromptPrefix(prompt);
     StorageQuery query;
     const auto local_tokens = std::max(local.device.num_common_tokens, local.host.num_common_tokens);
