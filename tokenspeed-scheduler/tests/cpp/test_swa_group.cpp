@@ -336,17 +336,17 @@ TEST(GroupAllocatorTest, BucketBalanceCountsKeptHeadAfterReclaim) {
     pool.RegisterGroup(0, 4, 4);
     GroupAllocator allocator(4, 0, 4, /*kept_head_blocks=*/1);
     BlockTable table;
-    ASSERT_TRUE(allocator.Acquire(pool, table, AcquirePlan{.num_blocks = 4}, 0, {}));
-    allocator.ReclaimExpired(pool, table, 4);
-    ASSERT_EQ(table.ReclaimedPrefixBlocks(), 4);
+    ASSERT_TRUE(allocator.Acquire(pool, table, AcquirePlan{.num_blocks = 8}, 0, {}));
+    allocator.ReclaimExpired(pool, table, 7);
+    ASSERT_EQ(table.ReclaimedPrefixBlocks(), 7);
     ASSERT_TRUE(table.Blocks()[0]);
     const auto head_bucket = allocator.BucketOf(table.Blocks()[0]->Location());
 
-    ASSERT_TRUE(allocator.Acquire(pool, table, AcquirePlan{.num_blocks = 3}, 0, {}));
-    for (const auto& ref : table.Blocks().subspan(4)) {
-        ASSERT_TRUE(ref);
-        EXPECT_NE(allocator.BucketOf(ref->Location()), head_bucket);
-    }
+    // The live tail keeps a second parent open with a hole in the head bucket.
+    ASSERT_TRUE(table.Blocks()[7]);
+    ASSERT_TRUE(allocator.Acquire(pool, table, AcquirePlan{.num_blocks = 1}, 0, {}));
+    ASSERT_TRUE(table.Blocks().back());
+    EXPECT_NE(allocator.BucketOf(table.Blocks().back()->Location()), head_bucket);
 }
 
 TEST(GroupAllocatorTest, BucketBalanceKeepsLiveSlotsAfterReclaimedPrefixAndInteriorHole) {
