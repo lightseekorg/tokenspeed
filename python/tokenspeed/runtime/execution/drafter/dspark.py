@@ -134,34 +134,15 @@ class DSpark(DFlash):
         next_tokens[:, 0] = block_ids[:, 0]
         sampled = self.draft_sampler is not None
         # Only the bias follows the previous token; the projection does not.
-        # Sampled rows either stay on this rank's vocab shard, which the
-        # greedy walk's raw shard projection serves, or need the gathered,
-        # scaled whole-vocabulary logits. Those hold every projected position
-        # at once, so only the positions a step reads are projected.
         full_vocab = sampled and not self._samples_vocab_shard
-        block_logits = self._block_base_logits(
-            (
-                draft_hidden[:, : self.spec_num_tokens - 1]
-                if full_vocab
-                else draft_hidden
-            ),
-            full_vocab=full_vocab,
-        )
-        if sampled and not full_vocab and block_logits is not None:
+        block_logits = self._block_base_logits(draft_hidden, full_vocab=full_vocab)
+        if sampled and self._samples_vocab_shard:
             self._sampled_shard_walk(block_logits, next_tokens)
             return next_tokens
-        if (
-            not sampled
-            and block_logits is not None
-            and self._fused_walk_fits(block_logits)
-        ):
+        if not sampled and self._fused_walk_fits(block_logits):
             self._fused_greedy_walk(block_logits, next_tokens)
             return next_tokens
-        workspace = (
-            None
-            if sampled or block_logits is None
-            else self._resolve_markov_argmax(block_logits)
-        )
+        workspace = None if sampled else self._resolve_markov_argmax(block_logits)
         for k in range(1, self.spec_num_tokens):
             if workspace is not None:
                 # One launch: bias, add, and cross-rank argmax after token k - 1.
@@ -185,33 +166,9 @@ class DSpark(DFlash):
             # out-of-range id here indexes past the embedding table.
             bias_fn = self._make_step_bias_fn(next_tokens[:, k - 1])
             if sampled:
-                if block_logits is None:
-                    # Full logits are necessary for the recorded proposal law.
-                    # require_full_vocab gives this step private TP gather
-                    # storage; successive Markov steps cannot alias a shared
-                    # comm buffer.
-                    metadata = LogitsMetadata(
-                        forward_mode=ForwardMode.DECODE, query_shard=None
-                    )
-                    logits = self.logits_processor._get_logits(
-                        draft_hidden[:, k - 1, :],
-                        self.lm_head,
-                        metadata,
-                        embedding_bias=None,
-                        plan=None,
-                        require_full_vocab=True,
-                    )
-                else:
-                    logits = block_logits[k - 1]
-                # A new tensor: the bias add leaves the hoisted block intact.
+                logits = block_logits[k - 1]
                 logits = logits + bias_fn(0, logits.shape[-1]).to(logits.dtype)
                 next_tokens[:, k].copy_(self.draft_sampler.propose(logits, step=k - 1))
-            elif block_logits is None:
-                self._greedy_argmax_vocab_parallel(
-                    draft_hidden[:, k - 1, :],
-                    out=next_tokens[:, k],
-                    bias_fn=bias_fn,
-                )
             else:
                 self._greedy_argmax_vocab_parallel(
                     draft_hidden[:, k - 1, :],
@@ -290,58 +247,35 @@ class DSpark(DFlash):
         self._markov_argmax_resolved = True
         return self._markov_argmax_workspace
 
-    def _block_base_logits(self, draft_hidden: torch.Tensor, *, full_vocab: bool):
-        """Project every block position's hidden state in one GEMM.
+    def _block_base_logits(
+        self, draft_hidden: torch.Tensor, *, full_vocab: bool
+    ) -> torch.Tensor:
+        """Project the block once; each proposal step consumes its own slice.
 
         Args:
             draft_hidden: ``[rows, positions, hidden]`` block hidden states.
-            full_vocab: The caller samples, so each position needs the
-                scaled, softcapped logits over the whole vocabulary that the
-                per-position sampled step reads. Otherwise the greedy walk's
-                input: the raw org-vocab shard of a vocab-parallel head.
+            full_vocab: Require gathered, scaled and softcapped logits for
+                sampling. Otherwise retain raw logits for a vocabulary shard;
+                replicated heads use their usual logits processing.
 
-        Returns ``[positions, rows, vocab]``: with ``full_vocab``, the whole
-        vocabulary; otherwise the org-vocab shard of a vocab-parallel head, or
-        the whole vocabulary of a replicated head (attention DP without
-        LM-head TP). None when there is no head or its shard is empty, and the
-        caller must take its own path.
+        Returns:
+            ``[positions, rows, vocab]`` logits, with zero columns for an empty
+            local vocabulary shard. Projection errors propagate to the caller.
         """
         head = self.lm_head
-        if head is None or not hasattr(head, "weight"):
-            return None
-        positions = int(draft_hidden.shape[1])
-        rows = int(draft_hidden.shape[0])
+        rows, positions, _ = draft_hidden.shape
         flat = draft_hidden.reshape(rows * positions, -1)
-        if full_vocab:
-            # The per-position sampled step's logits path for every position
-            # at once. Rows are independent through it: the private NCCL
-            # gather has no row limit, and the scale and softcap act per
-            # element. The bias add copies each slice, so the positions-
-            # strided layout never reaches the sampler.
+        if full_vocab or not hasattr(head, "shard_indices"):
+            # Full-vocabulary sampling keeps a private gather buffer across steps.
             metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None)
             logits = self.logits_processor._get_logits(
                 flat,
                 head,
                 metadata,
-                embedding_bias=None,
-                plan=None,
-                require_full_vocab=True,
+                require_full_vocab=full_vocab,
             )
-            return logits.view(rows, positions, logits.shape[-1]).transpose(0, 1)
-        if not hasattr(head, "shard_indices"):
-            # The same logits path the per-position walk would take.
-            metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None)
-            logits = self.logits_processor._get_logits(
-                flat, head, metadata, require_full_vocab=False
-            )
-            # No compact copy: only the bias add and a local argmax read these
-            # slices, and both take a positions-strided row layout. The fused
-            # walk and the distributed argmax, which need compact rows, never
-            # see a replicated head.
             return logits.view(rows, positions, logits.shape[-1]).transpose(0, 1)
         num_org = int(head.shard_indices.num_org_elements)
-        if num_org <= 0:
-            return None
         weight = head.weight
         logits = torch.matmul(flat.to(weight.dtype), weight[:num_org].T)
         # draft_hidden is [rows, positions, H]; the walk indexes by position.
