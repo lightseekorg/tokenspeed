@@ -55,6 +55,7 @@ from test.runtime.shared_l2_test_utils import (  # noqa: E402
 )
 
 import tokenspeed_engine.scheduler as ts  # noqa: E402
+from tokenspeed_kernel.platform import current_platform  # noqa: E402
 
 from tokenspeed.runtime.cache.host_storage import (  # noqa: E402
     HostCacheStorage,
@@ -102,8 +103,11 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (  # noqa:
 )
 from tokenspeed.runtime.utils.server_args import ServerArgs  # noqa: E402
 
+# The ready words are CUDA stream memory operations, called in the NVIDIA
+# driver library (``HostSignals``): torch.cuda alone is there on AMD too.
 needs_cuda = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="runs CUDA streams and their memory waits"
+    not torch.cuda.is_available() or not current_platform().is_nvidia,
+    reason="runs CUDA streams and their memory waits in the NVIDIA driver library",
 )
 
 KV, STATE = 0, 1
