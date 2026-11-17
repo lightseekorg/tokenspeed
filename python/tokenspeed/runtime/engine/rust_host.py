@@ -175,6 +175,7 @@ from tokenspeed.runtime.utils.network import (
     get_ip,
     get_local_ip_by_remote,
     join_host_port,
+    wildcard_host_for,
 )
 from tokenspeed.runtime.utils.process import set_parent_death_signal
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
@@ -1559,8 +1560,11 @@ class HostBootstrap:
                     requires_forward_coordination=specs.requires_forward_coordination,
                     shared_l3=l3 is not None,
                 ),
-                # One node's ranks reach each other on loopback.
-                collective_bind_host="127.0.0.1" if mapping.nnodes == 1 else "0.0.0.0",
+                # One node's ranks reach each other on loopback; across nodes
+                # they dial get_ip(), so listen on its family's wildcard.
+                collective_bind_host=(
+                    "127.0.0.1" if mapping.nnodes == 1 else wildcard_host_for(get_ip())
+                ),
                 multimodal=model_config.is_multimodal_active,
                 memory_saver=server_args.enable_memory_saver,
                 memory_regions=tuple(regions),

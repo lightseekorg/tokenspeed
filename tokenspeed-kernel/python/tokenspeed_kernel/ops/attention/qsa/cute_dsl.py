@@ -666,8 +666,7 @@ def cute_dsl_blackwell_qsa_sparse_attention(
     Returns:
         BF16 attention output with q's shape (``out`` when given).
 
-    Twelve query heads share one sixteen-head tile for BF16 and FP8 caches;
-    SM107 FP8 grids with fewer tiles than SMs keep two eight-head tiles.
+    Twelve query heads share one sixteen-head tile for BF16 and FP8 caches.
     Larger BF16 batches group consecutive queries only when their complete
     ordered 2048-entry prefixes match; each query keeps separate softmax state
     and three private tail slots. A distinct prefix retains one query per CTA.
@@ -679,7 +678,7 @@ def cute_dsl_blackwell_qsa_sparse_attention(
     before attention. Both launches are included in full-call benchmarks. KV
     data is gathered directly from the cache with 64-bit offsets; preparation
     neither copies KV nor caches decisions across calls or graph replays.
-    FP8 retains its synchronous gather/conversion; on SM100/SM103 its rows per
+    FP8 retains its synchronous gather/conversion; on large grids its rows per
     CTA and KV splits follow the wave count of the launch grid. BF16 gathers
     zero-fill padded entries instead of reading slot 1.
     """

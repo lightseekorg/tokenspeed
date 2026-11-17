@@ -97,7 +97,9 @@ def _reference_rows(q, k, v, selected, row_ids):
         (24, 2, 6, (576, 582, 594), torch.bfloat16),
         (24, 2, 8, (512, 520, 528), torch.bfloat16),
         (6, 1, 6, (192, 198, 204), torch.bfloat16),
-        (24, 2, 1, (41, 53, 71), torch.float8_e4m3fn),
+        # FP8: three row counts from 41 that share its launch configuration
+        # on this GPU, picked at test time.
+        (24, 2, 1, None, torch.float8_e4m3fn),
     ],
 )
 def test_qsa_dynamic_rows_reuse_compilation(
@@ -107,6 +109,17 @@ def test_qsa_dynamic_rows_reuse_compilation(
     from tokenspeed_kernel.thirdparty.cute_dsl import qsa_sparse
 
     monkeypatch.setattr(qsa_sparse, "_COMPILED_KERNELS", {})
+    if row_counts is None:
+        sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+
+        def configuration(rows):
+            return qsa_sparse._configuration(
+                rows, q_heads, kv_heads, tokens, False, sm_count, 0
+            )
+
+        shared = [r for r in range(41, 72) if configuration(r) == configuration(41)]
+        assert len(shared) >= 3
+        row_counts = (shared[0], shared[len(shared) // 2], shared[-1])
     torch.manual_seed(109)
     keys = (torch.randn(256, kv_heads, 256, device=device) * 0.25).to(cache_dtype)
     values = (torch.randn_like(keys, dtype=torch.float32) * 0.25).to(cache_dtype)

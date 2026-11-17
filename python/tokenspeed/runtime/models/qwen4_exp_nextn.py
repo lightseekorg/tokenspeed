@@ -223,6 +223,8 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
     """One-layer Qwen4-Exp MTP head used by TokenSpeed's MTP drafter."""
 
     compute_dsa_topk_first_step = True
+    # Later steps use draft-owned inputs, QSA indices and cache metadata.
+    supports_draft_overlap = True
 
     def __init__(
         self,
