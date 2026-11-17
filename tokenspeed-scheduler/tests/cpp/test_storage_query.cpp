@@ -345,7 +345,6 @@ TEST(StorageQueryTest, ReservationBudgetIncludesWarmReferencesAndPreservesWarmNo
     EXPECT_EQ(cache.coordinator.NumPinnedHostCachedBlocks(), 0);
 }
 
-
 TEST(StorageQueryTest, PreparedQueryKeysRespectShorterBoundAndKeyBudget) {
     for (const bool warm_cache : {false, true}) {
         SCOPED_TRACE(warm_cache);
