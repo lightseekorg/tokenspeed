@@ -156,7 +156,8 @@ class DraftProposalSampler:
             )
         if shard_table and vocab_map is None:
             self._shard_ranks = runtime_states.vocab_size // vocab_size
-            width = vocab_shard_draft_stats_width(vocab_size)
+            # Rows of whole 64-float groups (128 16-bit words) ride the lamport gather.
+            width = -(-vocab_shard_draft_stats_width(vocab_size) // 64) * 64
             self._shard_stats = torch.empty(
                 (max_bs, width), dtype=torch.float32, device=device
             )

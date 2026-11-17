@@ -259,7 +259,7 @@ class TestFinishTailHitCopyCudaTest:
         return make_arena(plan, "cuda")
 
     def test_the_hitters_block_holds_the_published_partial_page_byte_for_byte(self):
-        ts = pytest.importorskip("tokenspeed_scheduler")
+        ts = pytest.importorskip("tokenspeed_engine.scheduler")
         from test.runtime.scheduler_driver import (
             advance_scheduler,
             make_extend_result_event,
@@ -275,6 +275,7 @@ class TestFinishTailHitCopyCudaTest:
                 num_device_pages=page_count,
                 max_scheduled_tokens=256,
                 max_batch_size=4,
+                max_resident_requests=4,
                 prefix_granularity=self.PAGE,
                 num_host_pages=0,
                 disable_l2_cache=True,
@@ -395,7 +396,7 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
 
     @pytest.mark.parametrize("held", ["store", "forward", "forward_and_store"])
     def test_pages_a_plan_reuses_reach_the_host_as_the_prompts_left_them(self, held):
-        ts = pytest.importorskip("tokenspeed_scheduler")
+        ts = pytest.importorskip("tokenspeed_engine.scheduler")
         from test.runtime.cache_pool_test_utils import (
             make_mha_memory_plan,
             make_pool,
@@ -494,6 +495,7 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
                 ).num_device_pages,
                 max_scheduled_tokens=256,
                 max_batch_size=4,
+                max_resident_requests=4,
                 prefix_granularity=self.PAGE,
                 num_host_pages=executor.num_host_pages,
                 disable_l2_cache=False,
@@ -725,7 +727,7 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
         plan writes page X back to Host block 1 and restores the image into
         X; Host block 1 then comes back into page Y.
         """
-        ts = pytest.importorskip("tokenspeed_scheduler")
+        ts = pytest.importorskip("tokenspeed_engine.scheduler")
         from test.runtime.cache_pool_test_utils import (
             make_mha_memory_plan,
             make_pool,
@@ -942,7 +944,7 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
         writes Y back to Host block 1, and block 1 comes back into page Z
         with X's bytes.
         """
-        ts = pytest.importorskip("tokenspeed_scheduler")
+        ts = pytest.importorskip("tokenspeed_engine.scheduler")
         from test.runtime.cache_pool_test_utils import (
             make_mha_memory_plan,
             make_pool,

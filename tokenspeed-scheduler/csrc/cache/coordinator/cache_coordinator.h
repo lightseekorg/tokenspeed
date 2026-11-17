@@ -222,8 +222,9 @@ public:
         // An additional known candidate at max_tokens, used by storage before
         // any local publication. It is a hint, never proof of cached data.
         std::optional<TailPublication> tail;
-        // Optional precomputation for exactly prefix_hashes and this
-        // coordinator. Omission expands those identities for this probe.
+        // Optional keys prepared by this coordinator from a hash chain that
+        // includes prefix_hashes as a prefix. Consumers stay within
+        // max_tokens and the prompt hash bounds.
         PreparedPrefixKeys prepared_keys;
         // Bounded request-local remote hints; no global tail-table mutation.
         std::span<const std::int32_t> shared_prefix_tokens;
@@ -1216,6 +1217,7 @@ private:
     // window; empty when the probe hit nothing or no group replays.
     std::vector<GroupDemand> replayedDemands(const PrefixProbe& prefix, std::span<const GroupDemand> demands) const;
     std::vector<CacheKey> keysForGroup(std::span<const std::string> content_hashes, std::uint32_t group_id) const;
+    PreparedPrefixKeys resolvePreparedPrefixKeys(const PromptPrefix& prompt) const;
     std::vector<std::vector<CacheKey>> buildGroupKeys(std::span<const std::string> content_hashes) const;
     template <CacheTier Tier>
     BlockPool& tierPool();

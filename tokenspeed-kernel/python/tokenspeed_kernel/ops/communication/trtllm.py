@@ -86,6 +86,7 @@ __all__ = [
     "trtllm_allreduce_fusion",
     "trtllm_create_ipc_workspace_for_all_reduce_fusion",
     "trtllm_workspace_all_gather",
+    "trtllm_workspace_all_gather_serves",
     "trtllm_workspace_allreduce",
     "group_spans_nodes",
     "armed_workspace_hidden_dim",
@@ -108,6 +109,7 @@ allgather_dual_rmsnorm = error_fn
 allreduce_residual_rmsnorm = error_fn
 allreduce_sandwich_rmsnorm = error_fn
 trtllm_workspace_all_gather = error_fn
+trtllm_workspace_all_gather_serves = error_fn
 trtllm_workspace_allreduce = error_fn
 armed_workspace_hidden_dim = error_fn
 ensure_workspace_initialized = error_fn
@@ -133,6 +135,7 @@ if current_platform().is_nvidia:
         ReduceScatterFusionPattern,
         _ar_should_use_oneshot,
         _load_trtllm_comm_module,
+        mnnvl_allgather_serves,
         trtllm_allgather_fusion,
         trtllm_allreduce_fusion,
         trtllm_create_ipc_workspace_for_all_reduce_fusion,
@@ -1166,6 +1169,23 @@ if current_platform().is_nvidia:
             _mark_captured(manager, mnnvl)
         return gathered
 
+    def trtllm_workspace_all_gather_serves(
+        input_tensor: torch.Tensor,
+        group: dist.ProcessGroup,
+    ) -> bool:
+        """Whether ``trtllm_workspace_all_gather`` gathers rows of this shape.
+
+        Args:
+            input_tensor: ``[T, W]`` rows of this rank.
+            group: process group whose armed workspace to use.
+
+        Returns:
+            True when the group's mnnvl workspace serves the shape; it depends
+            on the shape only, so every rank of the group decides alike.
+        """
+        mnnvl = _manager_for_group(group).mnnvl_workspace
+        return mnnvl is not None and mnnvl_allgather_serves(input_tensor, mnnvl)
+
     def allreduce_residual_rmsnorm(
         input_tensor: torch.Tensor,
         residual: torch.Tensor,
@@ -1963,7 +1983,7 @@ if current_platform().is_nvidia:
     # Their registry modes are separate from stateless/auto-dispatched ops.
 
     class TrtllmAllGatherState:
-        """Own BF16 AllGather IPC scratch for serialized auxiliary-stream calls."""
+        """Own BF16 AllGather peer scratch for serialized auxiliary-stream calls."""
 
         def __init__(self, group, max_rows, hidden, device, oneshot):
             from tokenspeed_kernel.thirdparty.cuda.trtllm import (
@@ -1971,9 +1991,9 @@ if current_platform().is_nvidia:
             )
 
             self.tp_size = group.size()
-            if self.tp_size not in (2, 4, 8, 16) or not 0 < max_rows <= 128:
+            if self.tp_size not in (2, 4, 8, 16) or max_rows <= 0:
                 raise ValueError(
-                    "TRT-LLM one-shot gather requires TP2/4/8/16 and 1..128 rows"
+                    "TRT-LLM one-shot gather requires TP2/4/8/16 and positive rows"
                 )
             if hidden <= 0 or hidden % 128:
                 raise ValueError(
@@ -2089,6 +2109,8 @@ if current_platform().is_nvidia:
                 <= torch.cuda.get_device_properties(device).multi_processor_count
             ):
                 raise ValueError("Fused gather requires a positive, SM-bounded grid")
+            if max_rows > 128:
+                raise ValueError("Fused gather quantization supports 1..128 rows")
             self.module = load_allgather_quant_module()
             self.num_blocks = num_blocks
             super().__init__(group, max_rows, hidden, device, True)
@@ -2159,11 +2181,11 @@ if current_platform().is_nvidia:
         return state.gather(inputs)
 
     class TrtllmReduceScatterState:
-        """Own IPC scratch shared by sequential layers, not by concurrent streams.
+        """Own peer scratch shared by sequential layers, not by concurrent streams.
 
         Args:
-            group: 2/4/8/16-rank process group on a CUDA-IPC-accessible topology.
-            max_rows: Prepared physical rows per rank, at most 128.
+            group: 2/4/8/16-rank group reachable through CUDA IPC or NVLink fabric.
+            max_rows: Prepared physical rows per rank.
             hidden: Output width, a positive multiple of eight BF16 elements.
             device: Current rank's CUDA device, already selected by the caller.
         """
@@ -2174,13 +2196,9 @@ if current_platform().is_nvidia:
             )
 
             self.tp_size = group.size()
-            if (
-                self.tp_size not in (2, 4, 8, 16)
-                or not 0 < max_rows <= 128
-                or hidden <= 0
-            ):
+            if self.tp_size not in (2, 4, 8, 16) or max_rows <= 0 or hidden <= 0:
                 raise ValueError(
-                    "Lamport TRT-LLM reduction requires TP2/4/8/16, positive width and 1..128 rows"
+                    "Lamport TRT-LLM reduction requires TP2/4/8/16, positive width and rows"
                 )
             if hidden % 8:
                 raise ValueError(

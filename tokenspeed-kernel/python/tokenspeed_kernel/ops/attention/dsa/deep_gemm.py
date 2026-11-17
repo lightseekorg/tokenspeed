@@ -5,7 +5,7 @@ import os
 from collections.abc import Callable
 
 import torch
-from tokenspeed_kernel._optional import has_optional_package, has_trtllm_kernel
+from tokenspeed_kernel._optional import has_optional_package
 
 # The package defines its feature names before importing its leaves, so the
 # partially initialized package already carries them here.
@@ -423,13 +423,8 @@ def _request_rows(rows: int, device: torch.device) -> torch.Tensor | None:
 
 if _HAS_DEEP_GEMM:
     prepare_cuda_toolkit_env()
-    if has_trtllm_kernel():
-        # DeepEP must initialize before TRT-LLM's static CUDA runtime.
-        import deep_ep  # noqa: F401
     import deep_gemm
-
-    if has_trtllm_kernel():
-        import trtllm_kernel  # noqa: F401
+    from tokenspeed_kernel.thirdparty.cuda.indexer_topk import indexer_topk_prefill
 
     def _deep_gemm_paged_mqa_plan(
         *,
@@ -809,8 +804,13 @@ if _HAS_DEEP_GEMM:
                 max_seqlen_k=max(tile_max_seqlen_k, 1),
             )
             # The padded rows as one contiguous matrix: the scrub stays
-            # vectorized and the TRT-LLM top-k, which reads each row's
-            # candidate count, takes it without a copy.
+            # vectorized and the TRT-LLM top-k takes it without a copy. The
+            # padding columns hold stale allocation values, finite ones that
+            # nan_to_num_ keeps, and the TRT-LLM top-k reads whole padded
+            # rows for some launch shapes, so every column past a row's
+            # candidate count is masked out of the ranking below; otherwise
+            # a stale score can outrank a real boundary score and the
+            # selection changes with the launch shape.
             logits = _widen_logits_rows(logits)
             logits.nan_to_num_(
                 nan=float("-inf"), posinf=float("-inf"), neginf=float("-inf")
@@ -821,16 +821,23 @@ if _HAS_DEEP_GEMM:
                 initial_tokens=initial_tokens,
                 local_tokens=local_tokens,
             )
+            tile_lens = candidate_lens[start:end]
             if batch_invariant:
-                tile_lens = candidate_lens[start:end]
                 tile_out = out[start:end]
                 _row_invariant_topk(logits, tile_lens, tile_out, topk)
                 tile_out.masked_fill_(tile_out >= tile_lens.view(-1, 1), -1)
             else:
-                torch.ops.trtllm.indexer_topk_prefill(
+                col_ids = torch.arange(
+                    logits.shape[1], dtype=torch.int32, device=logits.device
+                )
+                logits.masked_fill_(
+                    col_ids.view(1, -1) >= tile_lens.to(torch.int32).view(-1, 1),
+                    float("-inf"),
+                )
+                indexer_topk_prefill(
                     logits,
                     local_starts_i32[start:end],
-                    candidate_lens[start:end].to(torch.int32).contiguous(),
+                    tile_lens.to(torch.int32).contiguous(),
                     out[start:end],
                     int(topk),
                 )

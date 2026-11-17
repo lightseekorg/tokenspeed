@@ -120,7 +120,8 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
         if enabled and self.server_args.mapping.pp_size != 1:
             raise NotImplementedError(
                 "Qwen4-Exp FlatKV currently requires PP=1; PP-local repacking "
-                "has not been implemented"
+                "has not been implemented; pass --no-qwen4-exp-flat-kv "
+                "to use the plane-based layout"
             )
         if (
             enabled
@@ -128,7 +129,8 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
             and self.draft_attn_config.kv_cache_mxfp8
         ):
             raise NotImplementedError(
-                "Qwen4-Exp FlatKV does not support MXFP8 draft scale addressing"
+                "Qwen4-Exp FlatKV does not support MXFP8 draft scale addressing; "
+                "pass --no-qwen4-exp-flat-kv to use the plane-based layout"
             )
         return enabled
 

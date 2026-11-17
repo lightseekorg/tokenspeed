@@ -722,12 +722,16 @@ slot; `scheduler.md` §2 and §4 describe the FSM side):
   blob — goes to the **retraction snapshot pool**: a small, request-private, pinned pool
   sized like the Host L2 tier (an explicit `--retraction-snapshot-host-gb`,
   else `--retraction-snapshot-ratio` of the Device KV, else derived: by
-  default one tail per retractable request, `cache/l2/sizing.py`), never
+  default one tail per configured snapshot request row, cache/l2/sizing.py), never
   evicted, never prefix-indexed, allocated by the scheduler like the Host L2
   pool and addressed by scheduler (virtual) block id. Without the L2 tier
   (`--disable-kvstore`) the whole image goes there, and the derived default
   is a tenth of the Device KV -- an on-by-default pool stays cheap to pin;
-  `--retraction-snapshot-ratio 1` makes every resident suspendable.
+  retraction-snapshot-ratio=1 uses Device KV's usable LCM-block count for
+  snapshot KV. Image rows are limited separately and default to rank-local
+  resident capacity, including extra decode slots; an explicit positive cap
+  takes precedence. Both rows and Host space must fit, so the default does
+  not guarantee that every resident can be suspended.
 
 The runtime side is **one** `HostCacheExecutor` (`cache/l2/executor.py`)
 owning two `HostCacheStorage` buffers over the same field geometry, each with
@@ -2059,8 +2063,15 @@ For Qwen3.8-Flash-Next at TP1 with BF16 KV and FP32 GDN state, one complete
 36-layer GDN checkpoint has 110.109375 MiB of payload and occupies one
 110.5 MiB parent, with 0.3535% payload padding. The ordinary layout uses two
 78 MiB parents for that checkpoint. The larger FlatKV parent also increases
-the null-parent cost and the allocation unit for small groups; finer GDN
-groups need not improve total hit rate or performance.
+the null-parent cost, the allocation unit for small groups, and the snapshot
+reservation for each request's group tails. In the recorded TP1 benchmark
+with 64 request slots, one GDN group reserved 37.08 GB for snapshots;
+experimental six- and eighteen-group layouts reserved 13.09 GB and 9.60 GB.
+Eighteen groups achieved about 3.6% higher output throughput, while one group
+had the highest hit rate and lower mean ITL and P90/P99 TTFT. The selected
+grouping trades snapshot capacity and throughput for tighter checkpoint
+packing and the measured tail-latency benefit; revisiting it must account for
+the snapshot budget and workload, as well as payload padding.
 
 Inkling's ShortConv checkpoints share the attention planes the same way: a
 kvconv group and one hiddenconv group per attention group put each layer's
@@ -2209,10 +2220,15 @@ sets both sides: the arena holds at least that many parent blocks (more when
 admitting one token per group needs more), and the concurrency is that many
 rows, capped at the scheduler's `max_bs`.
 
-The runtime divides its global `max_num_seqs` across attention DP ranks to
-produce each scheduler's rank-local `max_batch_size`. These values limit
-simultaneous sequence slots; they do **not** reserve enough history cache for
-that many maximum-length requests. Aggregate prompt and decode growth must
+The runtime divides its global max_num_seqs across attention DP ranks to
+produce each scheduler's rank-local max_batch_size, the execution capacity.
+The separate max_resident_requests sizes its request pool. A D role adds
+disaggregation-decode-extra-slots per attention DP rank to that pool so
+requests can receive KV while the model executes a full batch. Concurrent
+group sizing prices resident states, tails and protected windows against
+the resident capacity; execution scratch and checkpoint retention keep the
+execution bound. Neither value reserves enough history cache for that many
+maximum-length requests. Aggregate prompt and decode growth must
 still fit the recipe's reported token capacity. When that dynamic pool is
 overcommitted, admission can fail even though the batch still has a free
 sequence slot.

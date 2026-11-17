@@ -58,6 +58,7 @@ protected:
         cfg.max_retracted_requests = 0;
         cfg.max_scheduled_tokens = 1024;
         cfg.max_batch_size = 4;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.decode_input_tokens = c.decode_width;
         cfg.disable_prefix_cache = c.disable_prefix_cache;
         const auto add = [&](std::string id, std::int32_t grain, AttnKind kind, std::optional<std::int32_t> window,

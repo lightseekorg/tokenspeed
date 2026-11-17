@@ -109,6 +109,7 @@ def _recipe(
         kernel_page_size=64,
         context_len=1024,
         max_bs=2,
+        max_resident_requests=2,
         pd_disaggregation_enabled=False,
         speculative_num_steps=2 if speculative else 0,
         speculative_num_draft_tokens=width,
@@ -528,8 +529,12 @@ def test_flat_kv_rejects_a_stride_that_is_not_whole_atom_pages() -> None:
 def test_flat_kv_rejects_pipeline_parallelism() -> None:
     recipe = _flat_kv_recipe()
     recipe.server_args.mapping.pp_size = 2
-    with pytest.raises(NotImplementedError, match="PP=1"):
+    with pytest.raises(NotImplementedError, match=r"PP=1.*--no-qwen4-exp-flat-kv"):
         recipe.setup()
+    recipe.server_args.qwen4_exp_flat_kv = False
+    assert "flatkv" not in {
+        plane.plane_id for plane in recipe.setup().spec.memory_plan.planes
+    }
 
 
 def test_flat_kv_rejects_mxfp8_draft_scale_addressing() -> None:
@@ -549,5 +554,12 @@ def test_flat_kv_rejects_mxfp8_draft_scale_addressing() -> None:
         kv_cache_dtype=torch.float8_e4m3fn,
         kv_cache_mxfp8=True,
     )
-    with pytest.raises(NotImplementedError, match="MXFP8 draft scale addressing"):
+    with pytest.raises(
+        NotImplementedError,
+        match=r"MXFP8 draft scale addressing.*--no-qwen4-exp-flat-kv",
+    ):
         recipe.setup()
+    recipe.server_args.qwen4_exp_flat_kv = False
+    assert "flatkv" not in {
+        plane.plane_id for plane in recipe.setup().spec.memory_plan.planes
+    }

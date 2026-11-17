@@ -9,6 +9,39 @@ Companion documents: `event-loop.md` (the control/data plane split that
 consumes these plans), `cache-concepts.md` (the vocabulary below —
 prefix granularity, cache groups, LCM blocks).
 
+## Request slots and active decode capacity
+
+The rank-local max_batch_size bounds model forwards and, on a D role, active
+decode permits. The separate max_resident_requests bounds the shared request pool.
+On a D role, disaggregation-decode-extra-slots adds resident rows without
+enlarging model batches. RemotePrefilling and a PrefillDone waiting for its
+first decode hold a request row and KV pages but no execution permit. All
+these requests share one pool; extra rows are not a dedicated transfer pool.
+
+On a D role, the first local decode acquires a move-only permit and keeps it across rounds.
+Permit admission for a newly completed prefill does not displace an
+already streaming request; KV-capacity recovery follows the victim policy below.
+Restoring a Decoding request reserves a permit before issuing the restore;
+the transfer owns it until acknowledgement, including after cancellation.
+Finishing requests keep their request row, KV pages and any decode permit
+until outstanding results land.
+An abort drains those results without publishing its completed pages.
+This cancellation rule applies to all engine roles, including when the
+extra count is zero.
+Retraction relinquishes the permit once the existing in-flight guards allow
+the request to leave; readmission obtains a new one ahead of fresh work.
+
+A missing request row or decode permit is a scheduling wait, not a cache
+capacity failure. Only a failed KV admission enters the existing capacity
+recovery policy. Only the D role allocates decode permits, including during
+restore. The P role hands execution to its peer; the fused role already
+bounds resident requests by max_batch_size. Both roles report zero active
+decode permits and zero requests waiting for a permit.
+
+Forward resources belong to the request's current FSM state. Admission may
+reuse a reference to those resources within one attempt; the reference must
+not cross a state transition or outlive the request.
+
 ## 1. Admission is per chunk
 
 An optional `--chunk-prefill-kv-size` also bounds the KV read by a local
@@ -966,7 +999,7 @@ The `CapacityModel` is deliberately **config-only**: it reads every
 recipes size a pool from the same model before the arena is allocated
 (`recipes/scheduler_bridge.py` builds an unsized config and asks
 `ConcurrentGroupPages(max_total_tokens, max_context_len)` for each group's
-demand at `max_batch_size` live requests), and then lets the `Scheduler`
+demand at max_resident_requests live requests), and then lets the Scheduler
 bound requests against the pool they sized. The per-request working set —
 `decode_width + overlap_schedule_depth * decode_width` protected tokens, the
 next verify window a speculative decode's draft steps write on the roles that
@@ -1559,10 +1592,14 @@ finish (and on the transfer ACK) the D publishes its own frontier like a
 fused engine: the KV tail and slot 1 (§1.2), which is how the exact
 prompt-end checkpoint of a repeated prompt comes to exist on this node.
 
-**Retraction and restore:** victims are chosen by the shared rule in §2 —
-everything resident is decode work (prompts the peer prefilled, in
-`PrefillDone` or `Decoding`); `RemotePrefilling` is pinned by the peer's
-in-flight prefill and never a victim. The image is taken from this node's own
+**Retraction and restore:** victims are chosen by the shared rule in §2.
+PrefillDone requests waiting for their first decode permit and Decoding
+requests are eligible, subject to the reserve exemption and in-flight guards.
+RemotePrefilling is pinned by the peer's in-flight prefill and never a victim.
+Ready-waiting requests have no separate victim priority: among eligible
+requests whose images fit, the rule favors more newly releasable blocks,
+then fewer generated tokens. Restoring PrefillDone does not acquire a
+permit; its first decode does. The image is taken from this node's own
 pages and nothing crosses the PD wire: the receiver and admission record were
 already released at `RemotePrefillDone`, and the bootstrap token lives in the
 request's token container, so a `PrefillDone` victim restored to `PrefillDone`
@@ -1903,7 +1940,14 @@ with no request suspended both must read empty and zero.
 the newest resident instead of imaging one; §2) and `max_retracted_requests`
 (`0` with no pool, `> 0` with one; the runtime's slot-state arena has that
 many rows plus the null row) are validated together. The P role refuses a
-snapshot pool. L3 addresses page-cyclic sharded groups through replica-stable
+snapshot pool. The runtime defaults the snapshot request cap to rank-local
+resident capacity C (B+E on D, B on fused); an explicit positive cap takes
+precedence. This is a budget for suspended images: retraction frees Device
+rows for new admissions, which can create further demand for images. The
+row budget does not guarantee enough Host space. Rows and image storage
+must both fit; when no eligible image fits, capacity recovery uses the abort
+policy in §2.
+L3 addresses page-cyclic sharded groups through replica-stable
 object keys ([cache concepts](cache-concepts.md)).
 `debug_force_retraction_interval` (§2) is the only
 knob that chooses victims outside capacity pressure, and it is refused

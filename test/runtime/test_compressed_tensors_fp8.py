@@ -47,6 +47,7 @@ from compressed_tensors.quantization import (
     preset_name_to_scheme,
 )
 from tokenspeed_kernel.ops.quantization import triton as quant_triton
+from tokenspeed_kernel.ops.quantization import trtllm as quant_trtllm
 from tokenspeed_kernel.platform import (
     ArchVersion,
     Platform,
@@ -599,10 +600,7 @@ def _stand_ins(monkeypatch, calls, op_scale_shape="M1"):
         return SelectedKernel(kernel.name, run)
 
     monkeypatch.setattr(
-        torch.ops.tensorrt_llm,
-        "quantize_e4m3_activation",
-        quantize_e4m3_activation,
-        raising=False,
+        quant_trtllm, "quantize_e4m3_activation", quantize_e4m3_activation
     )
     monkeypatch.setattr(quant_triton, "fp8_quantize_per_token", fp8_quantize_per_token)
     monkeypatch.setattr(quant_triton, "fp8_quantize", static_quant)
@@ -697,12 +695,7 @@ def test_decode_rows_reach_the_small_m_gemm_quantized_by_triton(
 
         return SelectedKernel(kernel.name, run)
 
-    monkeypatch.setattr(
-        torch.ops.tensorrt_llm,
-        "quantize_e4m3_activation",
-        quantizer("trtllm"),
-        raising=False,
-    )
+    monkeypatch.setattr(quant_trtllm, "quantize_e4m3_activation", quantizer("trtllm"))
     monkeypatch.setattr(quant_triton, "fp8_quantize_per_token", quantizer("triton"))
     monkeypatch.setattr(gemm, "select_kernel", selected)
     x = torch.randn(tokens, 256).to(torch.bfloat16)

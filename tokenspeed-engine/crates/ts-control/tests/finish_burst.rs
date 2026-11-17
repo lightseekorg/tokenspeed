@@ -97,6 +97,7 @@ cfg.prefix_granularity = {page}
 cfg.prefix_replay_tokens = 0
 cfg.max_scheduled_tokens = {tokens}
 cfg.max_batch_size = {batch}
+cfg.max_resident_requests = {batch}
 cfg.num_device_pages = {pages} + 1
 cfg.num_snapshot_pages = 1
 cfg.disable_l2_cache = True

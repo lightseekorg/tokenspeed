@@ -1251,7 +1251,7 @@ CacheCoordinator::PrefixProbe CacheCoordinator::probePrefixWithOrder(const Promp
                              prompt.tail->tail_tokens == prompt.max_tokens % prefix_granularity_),
             "an explicit tail describes the probe bound inside its last page");
     PrefixProbe out;
-    out.group_keys = prompt.prepared_keys ? prompt.prepared_keys : PreparePrefixKeys(prompt.prefix_hashes);
+    out.group_keys = resolvePreparedPrefixKeys(prompt);
     out.device = probeTier(prompt, *out.group_keys, match_order, claim_partial);
     if (host_pool_ == nullptr) {
         return out;
@@ -1271,6 +1271,20 @@ CacheCoordinator::PrefixProbe CacheCoordinator::probePrefixWithOrder(const Promp
         out.host.kv_tokens = host_kv_tokens;
     }
     return out;
+}
+
+PreparedPrefixKeys CacheCoordinator::resolvePreparedPrefixKeys(const PromptPrefix& prompt) const {
+    if (!prompt.prepared_keys) {
+        return PreparePrefixKeys(prompt.prefix_hashes);
+    }
+    const auto& keys = *prompt.prepared_keys;
+    _assert(keys.size() == groups_.size(), "prepared prefix keys must cover every cache group");
+    for (const auto i : match_order_) {
+        const auto pages_per_hash = static_cast<std::size_t>(BlocksPerBoundary(static_cast<std::int32_t>(i)));
+        _assert(keys[i].size() / pages_per_hash >= prompt.prefix_hashes.size(),
+                "prepared prefix keys do not cover the prompt hash chain");
+    }
+    return prompt.prepared_keys;
 }
 
 PreparedPrefixKeys CacheCoordinator::PreparePrefixKeys(std::span<const std::string> content_hashes) const {
@@ -1297,7 +1311,8 @@ bool CacheCoordinator::EvictionStoresExtendPrefix(const PromptPrefix& prompt, co
 std::vector<CacheCoordinator::PrefixBoundaryAvailability> CacheCoordinator::InspectPrefixAvailability(
     const PromptPrefix& prompt) const {
     _assert(groups_.size() <= 64, "prefix availability uses one bit per cache group");
-    const auto keys = buildGroupKeys(prompt.prefix_hashes);
+    const auto prepared_keys = resolvePreparedPrefixKeys(prompt);
+    const auto& keys = *prepared_keys;
     const auto contains = [&](std::size_t i, const CacheKey& key, std::size_t tier) {
         const PrefixCacheIndex& index = groups_[i].Index();
         const bool device = tier != 1 && index.Contains(pool_, key);
@@ -1311,9 +1326,11 @@ std::vector<CacheCoordinator::PrefixBoundaryAvailability> CacheCoordinator::Insp
         if (!groups_[i].Matcher().IsPrefixClosed()) {
             continue;
         }
+        const auto block_limit =
+            prompt.prefix_hashes.size() * static_cast<std::size_t>(BlocksPerBoundary(static_cast<std::int32_t>(i)));
         for (std::size_t tier = 0; tier < 3; ++tier) {
             std::int32_t block = 0;
-            while (static_cast<std::size_t>(block) < keys[i].size() &&
+            while (static_cast<std::size_t>(block) < block_limit &&
                    contains(i, keys[i][static_cast<std::size_t>(block)], tier)) {
                 ++block;
             }
@@ -1400,7 +1417,7 @@ CacheCoordinator::PrefixProbe CacheCoordinator::ProbeDecodeDevicePrefix(const Pr
     // load, fills what the Device lacks. The partial block of a KV tail is
     // left a hole for the transfer to fill whole.
     PrefixProbe probe;
-    probe.group_keys = prompt.prepared_keys ? prompt.prepared_keys : PreparePrefixKeys(prompt.prefix_hashes);
+    probe.group_keys = resolvePreparedPrefixKeys(prompt);
     probe.device = probeTier(prompt, *probe.group_keys, history_match_order, /*claim_partial=*/false);
     // The peer's final state supersedes any shorter checkpoint, so a State
     // group's checkpoint counts only at exactly the prompt end: then the
@@ -3508,6 +3525,9 @@ CacheCoordinator::StorageQuery CacheCoordinator::SharedPrefixKeys(const PromptPr
 
 CacheCoordinator::StorageQuery CacheCoordinator::MissingStorageKeys(const PromptPrefix& prompt,
                                                                     std::size_t max_keys) const {
+    _assert(prompt.max_tokens >= 0 &&
+                static_cast<std::size_t>(prompt.max_tokens / prefix_granularity_) <= prompt.prefix_hashes.size(),
+            "storage query bound exceeds the supplied prefix hashes");
     const PrefixProbe local = ProbePromptPrefix(prompt);
     StorageQuery query;
     const auto local_tokens = std::max(local.device.num_common_tokens, local.host.num_common_tokens);
@@ -3593,18 +3613,27 @@ CacheCoordinator::StorageReservation CacheCoordinator::ReserveStoragePrefix(cons
     // The Device-only probe: the reservation matches the Host suffix (Host and
     // remote) above its boundary again, under the same Host-suffix rule as
     // admission.
-    const std::vector<std::vector<CacheKey>> group_keys = buildGroupKeys(prompt.prefix_hashes);
+    const PreparedPrefixKeys keys = resolvePreparedPrefixKeys(prompt);
+    const auto& group_keys = *keys;
     const PrefixProbe::Tier device_only = probeTier(prompt, group_keys, match_order_, /*claim_partial=*/true);
     auto candidate = prompt;
+    StorageReservation result;
+    std::vector<CacheBlockRef> warm_blocks;
+    std::vector<std::uint32_t> groups;
+    std::vector<std::int32_t> buckets;
     while (candidate.max_tokens > device_only.num_common_tokens) {
+        // Release rejected candidates' warm pins before the next probe.
+        warm_blocks.clear();
+        groups.clear();
+        buckets.clear();
+        result.keys.clear();
+        result.blocks.clear();
+        result.tail.reset();
+        result.tail_prior = ContentHash{};
         PrefixProbe::Tier device = device_only;
         PrefixProbe::Tier probe;
         probeHostSuffix(candidate, group_keys, match_order_, device_only.num_common_tokens, &remote, device, probe);
         if (probe.num_common_tokens <= device_only.num_common_tokens) return {};
-        StorageReservation result;
-        std::vector<CacheBlockRef> warm_blocks;
-        std::vector<std::uint32_t> groups;
-        std::vector<std::int32_t> buckets;
         const auto pin = [&](const CacheKey& key, std::int32_t logical_block) {
             auto ref = AcquireHostCachedBlock(key);
             if (ref) {

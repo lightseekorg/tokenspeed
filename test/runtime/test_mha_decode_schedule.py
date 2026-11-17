@@ -99,6 +99,7 @@ class _Step:
             kv_cache_quant_method="none",
             context_len=CONTEXT,
             max_bs=MAX_BS,
+            max_resident_requests=MAX_BS,
             speculative_num_draft_tokens=width,
             is_draft=is_draft,
             draft_block_decode=False,
@@ -173,6 +174,7 @@ class _Step:
             v_cache=value.view(-1, PAGE_SIZE, KV_HEADS, HEAD_DIM),
             cache_seqlens=torch.tensor(lengths, dtype=torch.int32, device="cuda"),
             max_seqlen_q=self.width,
+            block_draft=False,
         )
 
     def check(self, output: torch.Tensor, layer_id: int, lengths: list[int]) -> None:

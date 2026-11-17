@@ -40,6 +40,7 @@ use std::{
     collections::HashMap,
     sync::{mpsc, Arc, Condvar, Mutex, MutexGuard},
     thread,
+    time::Instant,
 };
 
 use bytes::Bytes;
@@ -66,6 +67,7 @@ pub type ForwardId = u64;
 
 /// One round's plan and what its forward needs besides.
 struct Execution {
+    queued_at: Option<Instant>,
     plan: ExecutionPlan,
     forward: Option<ForwardId>,
     dp: Option<DpRound>,
@@ -441,6 +443,7 @@ impl DataPlane for PythonDataPlane {
         });
         let idle_forward = dispatch.dp.is_some_and(|dp| dp.idle_forward);
         self.queue(Op::Execute(Box::new(Execution {
+            queued_at: tracing::enabled!(tracing::Level::DEBUG).then(Instant::now),
             plan,
             forward,
             dp: dispatch.dp.cloned(),
@@ -745,6 +748,7 @@ fn run(
         }
         Op::Execute(execution) => {
             let Execution {
+                queued_at,
                 plan,
                 forward,
                 dp,
@@ -753,6 +757,19 @@ fn run(
                 logprobs,
                 history,
             } = *execution;
+            if let Some(queued_at) = queued_at {
+                let batches = plan.forward_batches();
+                let forward_rids: Vec<_> = batches
+                    .iter()
+                    .flat_map(|batch| batch.request_ids.iter())
+                    .collect();
+                tracing::debug!(
+                    queue_ms = queued_at.elapsed().as_secs_f64() * 1000.0,
+                    forward_rids = ?forward_rids,
+                    remote_prefill_rids = ?plan.remote_prefill().map(|batch| batch.request_ids),
+                    "event=ts_data_plane_execute_started"
+                );
+            }
             // The plan's remote stream goes out from the data plane's
             // execution, once its device prerequisites are met.
             if let Some(streams) = streams {

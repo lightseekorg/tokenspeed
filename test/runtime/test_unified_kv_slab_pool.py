@@ -433,7 +433,7 @@ class TestStateCacheGroupPageCountTest:
 
     def setup_method(self):
         try:
-            import tokenspeed_scheduler  # noqa: F401
+            import tokenspeed_engine.scheduler  # noqa: F401
 
             from tokenspeed.runtime.layers.attention.kv_cache.recipes import (  # noqa: F401
                 scheduler_bridge,
@@ -449,7 +449,7 @@ class TestStateCacheGroupPageCountTest:
         decode_input_tokens=1,
         overlap_schedule_depth=0,
     ):
-        from tokenspeed_scheduler import SchedulerConfig
+        from tokenspeed_engine.scheduler import SchedulerConfig
 
         from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge import (
             SchedulerLimits,
@@ -468,7 +468,8 @@ class TestStateCacheGroupPageCountTest:
             virtual_packing={spec.group_id: 1 for spec in specs},
             limits=SchedulerLimits(
                 role=SchedulerConfig.Role.Fused,
-                max_live_requests=2,
+                max_batch_size=2,
+                max_resident_requests=2,
                 max_scheduled_tokens=max_scheduled_tokens,
                 max_context_len=4096,
                 decode_input_tokens=decode_input_tokens,

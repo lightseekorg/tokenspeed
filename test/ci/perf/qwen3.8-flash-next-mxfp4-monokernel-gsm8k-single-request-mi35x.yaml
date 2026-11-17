@@ -69,6 +69,7 @@ perf:
     --model amd/Qwen3.8-Flash-Next-Quark-MXFP4
     --config qwen3.8-flash-next-mxfp4-mtp3-monokernel
     --num-prompts 128
+    --concurrency 1
     --max-tokens 2048
     --chat-template-kwargs '{"reasoning_effort": "xhigh"}'
     --min-accuracy 0.88

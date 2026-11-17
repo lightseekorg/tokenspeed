@@ -517,6 +517,7 @@ Trainer-side contract:
 | `--prefill-decode-min-interval` | After every round that runs a prefill chunk, run at least this many decode rounds before the next prefill round, unless no decode can run. Unlike `--prefill-decode-interval`, this floor still applies once a prompt has been held back for its full interval, so a long prompt's chunks alternate with decode rounds instead of stalling running decodes back to back. Aggregated serving only. `0` (default) is off; nonzero values are mutually exclusive with the [DP prefill gate](../design/prefill-delay.md). |
 | `--prefill-attempt-interval` | ALL attempt interval, in scheduling rounds, for the [DP prefill gate](../design/prefill-delay.md): every rank with decode work must also have eligible prefill work to open the window. Set together with `--prefill-any-attempt-interval`, with `1 <= ALL <= ANY`; leaving both unset (default) disables the gate. Aggregated (fused) serving only (`--disaggregation-mode null`); mutually exclusive with nonzero `--prefill-decode-interval` or `--prefill-decode-min-interval`. |
 | `--prefill-any-attempt-interval` | ANY attempt interval, in scheduling rounds, for the [DP prefill gate](../design/prefill-delay.md): one eligible rank is enough to open the window. Must be set together with `--prefill-attempt-interval` and be at least its value (`1 <= ALL <= ANY`). This is an admission opportunity, not a hard TTFT deadline. Aggregated (fused) serving only (`--disaggregation-mode null`); mutually exclusive with nonzero `--prefill-decode-interval` or `--prefill-decode-min-interval`. |
+| `--prefill-single-round` | One prefill round per window for the [DP prefill gate](../design/prefill-delay.md#1-the-two-attempt-points): the round after a prefill round is not an ALL point while any rank has decode work, so a backlog does not drain in consecutive prefill rounds; the next ALL point is `--prefill-attempt-interval` rounds later. An idle engine still admits at once, and ANY points are unchanged. Off by default; requires `--prefill-attempt-interval` and `--prefill-any-attempt-interval`. |
 | `--max-total-tokens` | Override the automatically calculated token pool size. |
 | `--enable-state-checkpoint-in-forward` | Hybrid (recurrent-state) models: the prefill forward that spans the last prefix-page boundary before a long prompt's replay tail (normally the final token) also writes the recurrent state there, so a later request that resends the prompt or diverges from it after that boundary resumes there. No extra prefill round; that forward holds one more state block. The recurrent-state checkpoints, and their KV tails, that a next turn re-rendering the end of the previous prompt and its reply cannot resume at are then kept out of the prefix cache. On prefill and fused servers this is the prompt end when it lies inside the page that boundary starts and the request did not resume past it; a prompt end published at the request's finish, as on a prefill server, is kept if the state at the boundary has left the cache by then. On fused servers it is also every finish past the prompt end, including that of a prompt too short to have such a boundary. A next turn that repeats the previous reply verbatim therefore resumes at an earlier checkpoint and recomputes the reply. Requires prefix caching; a decode server ignores it; startup refuses it unless every State group is GDN (FlashInfer prefill, a prefix granularity that is a multiple of its 64-token scan chunk), KDA, or Qwen4-Exp PLE. With prefill graphs, the GDN layers of a forward that writes one stay captured; every captured shape shares one float32 scan scratch of (largest prefill-graph token capacity / prefix granularity) recurrent states. The KDA layers of such a forward run at their eager breaks and scan each checkpointed row's tokens before its checkpoint a second time. When a request publishes an in-forward checkpoint past the one it resumed from, which its own predecessor wrote past an earlier one, that earlier checkpoint -- two turns back on the conversation -- is evicted early from the device and host caches, and no new store or eviction write-back copies it to host, unless another request also resumed from it, or acquired or republished it after the conversation's previous turn resumed there, so multi-turn traffic keeps more live prefixes cached. On a prefill server, a prompt too short for the in-forward checkpoint (by default, one no longer than the chunk budget) whose end lies inside a prefix page also leaves only its full pages in the prefix cache, with no recurrent state and no KV tail at its end; a longer prompt that repeats it whole resumes at an earlier checkpoint instead, a page-aligned prompt end keeps its state, and a fused server keeps short prompt ends. Off by default ([scheduler §1.2](../design/scheduler.md#12-state-groups-two-slots-natural-checkpoints)). |
 | `--enable-prefix-caching` / `--disable-prefix-caching` | Enable or disable prefix cache reuse. |
@@ -531,8 +532,8 @@ Trainer-side contract:
 | `--prefill-graph-capture-token-sizes` | Total input-token capacities per forward, summed across the batch. Shorter inputs are padded. |
 | `--prefill-graph-capture-batch-sizes` | Request capacities for inline recurrent-layer (KDA, Mamba2, GDN) prefill capture. Replay selects the smallest compatible capacity that fits the batch, padding the missing requests. Unset: `4` (capped by `--max-num-seqs` per data-parallel rank), so a prefill round of up to 4 requests runs its recurrent layers inside the graph; a round of more requests, or one too full for the padding, runs them at eager breaks. Each added count is one more graph per token bucket, with its capture time and memory. |
 | `--retraction-snapshot-host-gb` | Explicit size, in gigabytes, of the per-rank pinned Host pool that holds a retraction image's tail (a retracted request's blocks of groups Host L2 never holds, a state group's unpublished input block, and its slot state; the published blocks, the partial last page and the live state block included, go to Host L2 and stay pinned there until the request is restored; with `--disable-kvstore` the pool holds whole images). Wins over `--retraction-snapshot-ratio` when set; `0` (the default) means not set, like `--kvstore-size` against `--kvstore-ratio`. A request a capacity retraction suspends is imaged here and resumes exactly where it stopped once the image is copied back; nothing is recomputed. When no resident's image fits -- the pool or its rows are exhausted -- the scheduler aborts the newest resident instead (finish `err_type` 524, see "Retraction snapshot pool" below), so the pool bounds how much can be suspended at once, never how long an admission waits. Fused and decode roles only; the prefill and encode roles never retract and ignore it with a log. Allowed under `--kv-parallel-size > 1`. |
-| `--retraction-snapshot-ratio` | Size of the retraction snapshot pool as a multiple of this rank's Device KV capacity (the base `--kvstore-ratio` scales too), used when `--retraction-snapshot-host-gb` is not set. Unset (the default) derives the pool at device build: 0.1 of the Device KV without the Host KVStore (whole images, kept cheap to pin; `1` makes every resident suspendable), else the image tails of `--retraction-snapshot-max-requests` requests (table below). An explicit `0` is the one way to run **without a pool**: nothing can be imaged, so every capacity block aborts its victim (the newest resident). |
-| `--retraction-snapshot-max-requests` | Slot-state image rows of the retraction snapshot pool, that is, the most requests suspended at once, and the request count the derived pool size is multiplied by. `0` (the default) derives to `--max-num-seqs / attention-DP size`, which covers every resident request of the rank; refused with `--retraction-snapshot-ratio 0`, which has no rows to size. When no row is free the scheduler aborts a resident rather than waiting. |
+| `--retraction-snapshot-ratio` | Size of the retraction snapshot pool as a multiple of this rank's Device KV capacity (the base `--kvstore-ratio` scales too), used when `--retraction-snapshot-host-gb` is not set. Unset (the default) derives the pool at device build: 0.1 of the Device KV without the Host KVStore (whole images, kept cheap to pin; `1` uses the Device KV pool's usable LCM-block count, with request rows limited separately), else the image tails of `--retraction-snapshot-max-requests` requests (table below). An explicit `0` is the one way to run **without a pool**: nothing can be imaged, so every capacity block aborts its victim (the newest resident). |
+| `--retraction-snapshot-max-requests` | Slot-state image rows of the retraction snapshot pool, that is, the most requests suspended at once, and the request count the derived pool size is multiplied by. `0` (the default) derives to the rank-local resident capacity C: B+E on decode and B on fused, where B is max-num-seqs divided by attention-DP size. An explicit positive cap is preserved. Refused with `--retraction-snapshot-ratio 0`, which has no rows to size. When no row is free the scheduler aborts a resident rather than waiting. |
 | `--debug-force-retraction-interval` | **Test only.** Every `N` scheduler plans retract the oldest quiescent decoding request (`N > 0`), or with `-N` the one prefilling request between its chunks, without capacity pressure, so a test run exercises the suspend/restore path on every request (the bitwise continuation oracle of [Numerics](../design/numerics.md)). Refused with `--retraction-snapshot-ratio 0` (no pool to image into). `0` (the default) is off; never set it in serving. |
 
 For pure prefill, token capacities count newly computed tokens, not cached
@@ -577,6 +578,8 @@ issue budget, while `--max-total-tokens` controls the global token pool.
 | `--pp-layer-partition` | Explicit per-stage layer counts, front to back (`"24,24,24,21"`); one entry per stage, summing to the model's layer count. Default: even split with the remainder on the front stages. |
 | `--world-size` | Total worker process count across all nodes. |
 | `--nprocs-per-node` | Worker process count per node. |
+| `--base-gpu-id` | First visible GPU ordinal used on each node. Default 0. |
+| `--gpu-id-step` | Spacing between local workers' GPU ordinals. Default 1. |
 | `--nnodes` | Number of nodes. |
 | `--node-rank` | Rank of the current node. |
 | `--dist-init-addr` | Distributed initialization address. |
@@ -844,18 +847,19 @@ prefill`): that role never verifies a chain and its candidates ship without
 `q`, so it would only allocate the distribution buffer. Pass it to the decode
 role only.
 
-Requirements: `--speculative-algorithm EAGLE3` or `MTP` (`DSPARK` proposes a
-whole block greedily outside [Block verification](#block-verification-experimental);
-`DFLASH` is covered below), `--speculative-eagle-topk 1`,
+Requirements: `--speculative-algorithm EAGLE3`, `MTP`, or `DSPARK` (each
+DSpark Markov step samples its token; `DFLASH` is covered below),
+`--speculative-eagle-topk 1`,
 and `--sampling-backend flashinfer`, `flashinfer_full`, or `sonic` (`sonic`
 reads `q` at its top-128 target candidates; `greedy` verifies by exact match,
 the Triton backends by target-sampled exact match; neither reads the dense
 `q`). The drafter switches its draft model's fused TP-sharded argmax off so
 the full-vocab logits reach it, which adds the logits all-gather to every
 draft step under tensor parallelism. With `sonic` sampling vocabulary shards
-(the server logs `Sampled rows stay vocab-sharded`) and an MTP or EAGLE3 draft
-head spanning the target vocabulary, the draft steps stay sharded too (`Draft
-steps stay vocab-sharded`): each rank samples its shard of the draft logits,
+(the server logs `Sampled rows stay vocab-sharded`) and an MTP, EAGLE3, or
+DSpark draft head spanning the target vocabulary, the draft steps stay sharded
+too (`Draft steps stay vocab-sharded`; a DSpark step adds its Markov bias to
+the shard of the target head's logits, unless the head scales or softcaps them): each rank samples its shard of the draft logits,
 the ranks exchange a few values per request instead of the logits, every rank
 draws the same token, and each records `q` over its own vocabulary columns;
 its verify candidates carry that `q` through their gather. An EAGLE3 head with
@@ -873,13 +877,16 @@ overflow) proposes a junk token and records the sentinel for that row, so
 verify rejects the token and samples from the full target. It never raises a
 device error.
 
-Memory: the recorded distributions take
-`(max_num_seqs + 2) x num_draft_tokens x vocab_size x 4` bytes
-(`--speculative-num-draft-tokens` fp32 rows per request-pool slot), plus a
-batch-ordered gather buffer of `max_num_seqs x num_draft_tokens x vocab_size x
-4` bytes on the verifier. 80 requests at 4 draft tokens over a 129K
-vocabulary cost about 330 MB in total. On CUDA, when the CUDA-graph memory
-reserve is on, the runtime charges both to it as startup residue, out of the
+Memory: with rank-local execution capacity B and resident capacity C,
+dense recorded distributions take (C + 2) x num_draft_tokens x V x 4 bytes,
+where V is the full vocabulary size or, for vocabulary-sharded Sonic, this
+rank's vocabulary columns. Backends that gather dense q also allocate a
+batch-ordered buffer of B_pad x num_draft_tokens x vocab_size x 4 bytes,
+where B_pad is B rounded up for the backend's sampling padding; E does not
+increase it. With full-vocabulary q, B_pad=B=C=80, 4 draft tokens and a
+129K vocabulary, the two buffers total about 330 MB. On CUDA, when the
+CUDA-graph memory reserve is on, the runtime charges both to it as startup
+residue, out of the
 KV-cache budget. Otherwise they come out of the `--gpu-memory-utilization`
 headroom.
 
@@ -902,8 +909,8 @@ probability `min(1, p'(x) / q(x))` and on rejection samples from
 request's temperature, top-k and top-p, the one the Triton backend serves.
 
 - Memory: `q` reuses the draft-tree q tables (`RuntimeStates.future_draft_q`),
-  `(max_num_seqs + 2) x (num_draft_tokens - 1) x K x 8` bytes plus two int32
-  rows of `num_draft_tokens` per slot. That is under 1 MB at 512 slots, 8
+  (C + 2) x (num_draft_tokens - 1) x K x 8 bytes, where C is the rank-local
+  resident capacity, plus two int32 rows of num_draft_tokens per slot. That is under 1 MB at 512 slots, 8
   draft tokens and `K = 16`. No dense per-vocab rows, no gather buffer, and
   the draft head keeps its shard-local top-K.
 - No proposal: a fresh admission, a PD landing and a forced single-token
@@ -998,6 +1005,71 @@ Older peers without this field are incompatible. Each Decode cache resume
 gets a new identity even if its transport IP and port are reused. The sender
 refreshes cached remote memory keys on address reuse without changing the
 public address used by EPD.
+
+### Decode receive capacity
+
+On a decode node, --disaggregation-decode-extra-slots adds shared resident
+request slots per attention DP rank. If omitted, it defaults to max-num-seqs
+divided by the attention DP size (integer division). Prefill, fused and
+encode nodes default to zero and reject positive values. Explicit values
+are preserved; zero disables the extra capacity.
+
+If the rank-local execution limit is B = max-num-seqs // attention DP size
+and the extra count is E, the resident pool has C = B + E real request rows.
+By default, E=B and C=2B. For example, max-num-seqs=48 with two attention DP
+ranks gives B=24, E=24 and C=48 on each rank. Setting E=16 instead gives
+C=40. TP replicas use the same rank-local limits.
+
+The E=B default enables the extra capacity even when the flag is omitted.
+It targets workloads where a performant execution batch leaves KV headroom,
+such as long-input, short-output agent traffic: receiving and ready requests
+can overlap that batch. It does not guarantee a full batch when prefill
+supplies too little ready work.
+
+Extra slots increase residency, not KV memory. Receiving, ready and decoding
+requests share the same LCM KV pool; E has no separate KV partition. The
+execution batch, CUDA graph ladder and single-forward scratch remain sized
+by B. Request-indexed persistent state grows with C, which can leave less
+GPU memory for the KV arena. The capacity model also charges C residents'
+working sets, including state slots, tails and protected windows. Depending
+on the model and cache layout, this can reduce the reported token capacity
+for the same arena. Receiving all C requests at their maximum context length
+is not guaranteed.
+
+For a concrete capacity-model example, fix B=32 and 4,096 usable LCM blocks
+on a D rank. Use one full-history group with 64-token pages and one State
+group, both with one child block per LCM block; prefix caching and
+speculation are disabled, decode width and overlap depth are both 1, and
+the context limit is 65,536. The model charges ceil(T/64)+C history pages
+and 2C State blocks for a concurrent token budget T:
+
+| Capacity-model example | Explicit E=0 | Default E=B |
+|---|---:|---:|
+| Resident requests C | 32 | 64 |
+| Physical request rows, including null and padding | 34 | 66 |
+| Usable LCM blocks | 4,096 | 4,096 |
+| Maximum concurrent token budget T | 256,000 | 249,856 |
+
+The token budget decreases by 6,144 (2.4%) in this example, with the same
+arena and execution limit. These are sizing-model results, not GPU benchmark
+measurements; they exclude the additional persistent tensors' memory cost.
+Other cache layouts have different costs.
+
+Use an explicit extra count when measuring the feature. Set E=0 at startup
+to retain C=B; shrinking a live request pool is not supported. A request
+keeps its original slot when reception completes and waits for an execution
+permit before its first decode. The default snapshot request limit also
+grows to C; an explicit positive limit is preserved. See
+[Retraction snapshot pool](#retraction-snapshot-pool) for its Host-memory
+cost and independent image-storage limits.
+
+This change requires matching TokenSpeed runtime and native components, even
+when E=0. Do not mix runtime or scheduler builds from before this API change
+with builds that include it. For source deployments, rebuild and install
+tokenspeed-engine and any standalone tokenspeed-scheduler from the same
+revision as the Python runtime. The serving host uses the scheduler embedded
+in tokenspeed-engine; upgrading the standalone scheduler wheel alone does
+not update that embedded copy.
 
 ## Observability
 
@@ -1117,16 +1189,47 @@ metrics on its `--prometheus-port`.
 `tokenspeed:num_requests_running` counts the rank's running batch: local
 prefill forwards, prompts whose prefill is done (about to decode on a fused
 rank, or awaiting the PD transfer on a prefill rank), and decode rows. On a
-decode rank that is the decode batch, bounded by the rank's
-`max_num_seqs / attention-DP size`; it excludes `RemotePrefilling` requests
-waiting for the prefill peer's KV.
+decode rank it includes requests whose KV has landed but that are waiting
+for an execution permit; it excludes `RemotePrefilling` requests waiting
+for the prefill peer's KV. With extra resident slots, this gauge can exceed
+the execution batch limit. The decode batch line's #running-req remains
+the actual number of rows dispatched.
 `tokenspeed:num_requests_inflight` counts every request the rank admitted and
 has not finished, including the scheduler's waiting and retracted requests and
 the PD states the batch excludes — a decode rank's `RemotePrefilling` and
 `PdTransferring` requests wait for the prefill node's KV and take no batch row.
 On a PD decode rank the inflight gauge therefore exceeds the running gauge while
-prompts wait for transfer; use `num_requests_running` for batch saturation and
-`num_requests_inflight` for how much work the rank holds.
+prompts wait for transfer. The inflight gauge also includes unadmitted work,
+so it does not measure request-slot occupancy.
+
+Three additional rank-local gauges expose the decode capacity split:
+
+| Metric | Meaning |
+| --- | --- |
+| tokenspeed:num_requests_resident | Requests holding a request-pool slot, bounded by B + E. Includes slots still held while a finished request's work drains. |
+| tokenspeed:num_active_decode_slots | Execution permits held by requests or their in-flight work, bounded by B. Includes permits reserved for restore and permits awaiting the final forward result. |
+| tokenspeed:num_decode_ready_waiting_reqs | Resident requests whose KV is ready but that have no execution permit. |
+
+The decode line reports these as #slots(resident/active-decode/ready-waiting).
+For B=36 and E=128, sustained resident=164 proves the resident pool is full;
+active-decode=36 proves the execution permits are occupied. Use the actual
+batch row count and throughput alongside these counters: draining or
+restoring work can hold a permit without dispatching a row that round.
+
+Ready-waiting counts only resident PrefillDone requests waiting for their
+first decode. It excludes Retracted requests whose snapshots are on Host,
+as well as Restoring and Finishing requests. On PD nodes,
+tokenspeed:num_retracted_queue_reqs tracks Retracted and Restoring requests
+separately.
+
+The rank-local histogram tokenspeed:decode_ready_wait_seconds measures E-queue
+wait from the decode host observing complete prefill KV arrival to the first
+decode forward dispatch. It records once per request, including requests that
+dispatch immediately, and excludes requests cancelled or finished before decode.
+It excludes prefill computation and KV transfer; dispatch is the host boundary,
+not a GPU kernel start timestamp. The 0.1-second bucket measures how many observed
+waits meet a 100 ms target. Requests still waiting have no histogram observation
+yet; read it alongside tokenspeed:num_decode_ready_waiting_reqs.
 
 The decode role splits that PD wait into its own gauges.
 `tokenspeed:num_decode_kv_wait_reqs` counts `RemotePrefilling` requests: the
@@ -1215,6 +1318,11 @@ Set `--ttft-trace-sampling-percentage 1` on both roles to select approximately
 modulo 1000, with a threshold of ten times the percentage. A frontend owner
 records a selected request once, even when several token batches stream out.
 Pair the JSON records using `endpoint` and `room` within the same time window.
+The sampling percentage defaults to 0 (disabled); 100 selects all PD rooms.
+These INFO summaries do not require `--enable-log-request-stats`, which
+independently adds RequestStats to the request's finish log.
+When sampled summaries and event-loop DEBUG logging are disabled, these records
+add no remote-prefill batch reads. When both are enabled, they share one read.
 
 | INFO record | Boundary | Measurements |
 | --- | --- | --- |
@@ -1228,10 +1336,46 @@ the bootstrap token alone does not emit the breakdown.
 
 Schema `ts-engine-v1` measures local `phases_ms` and `engine_elapsed_ms` on a
 monotonic clock. `first_dispatch_ms` is relative to engine registration.
-`total_ms` starts at the frontend creation timestamp when supplied and ends
-when the engine prepares the output. Unreached phases and an unavailable
-creation time are JSON null. Tokenization, detokenization and delivery to the
-HTTP client belong to the gateway and fall outside this measurement.
+`milestones_ms` records registration, scheduler submission, bootstrap agreement,
+decode landing admission, the first forward plan, first dispatch, prompt
+completion, transfer observation and output preparation on that same clock.
+Unreached milestones are null. The first plan precedes attention-DP agreement;
+dispatch is the enqueue boundary, not the forward thread starting execution.
+Registration follows transport receipt, replica relay and basic ingress
+validation. `output_prepared` is the timestamp taken at the start of summary
+construction, before the streamed output is built. Thus `output_pack` and
+`output_after_landing` do not measure complete output encoding or delivery.
+For a terminal release without an output, this endpoint is the release summary.
+
+On P, all prefill chunks contribute to `prefill`; only the last chunk records
+`prompt_done`. On a streaming D request, KV and the bootstrap token record
+`transfer_done`; the summary normally waits for the next local decode commit.
+A request ended by the bootstrap token completes without that decode, and a
+non-streaming request waits until completion to prepare its output.
+
+On P, `admission` splits into `ready_to_plan` and `plan_to_dispatch`. On D,
+`transfer_observe` splits into `remote_admission` and `admission_to_landing`.
+The latter includes forward-thread waiting, page preparation, manifest delivery,
+P execution and transfer; it is not a pure network duration. `landing_to_plan`
+and `plan_to_dispatch` further split the wait before the first decode.
+`registration_to_submit` and `submit_to_bootstrap` split `bootstrap` on both
+roles. These detail fields overlap their parent phases; do not add both levels.
+
+For short diagnostic runs, `TS_HOST_LOG=info,ts_pd::decode=debug,ts_pd::prefill=debug,_host::data_plane=debug`
+also reports D route lookup, manifest queueing, P manifest receipt and validation,
+and the forward thread's Execute queue duration. Correlate Execute records by
+their request IDs and manifest records by room and cache incarnation within the
+same deployment and time window. A queued manifest is not yet delivered.
+The D route and connection durations are cumulative from connection setup;
+route resolution may use a cached route. P accepts a complete bootstrap only
+after all expected manifests arrive. Execute queue time ends when the forward
+thread dequeues the plan, before dependency waits, metadata work or GPU execution.
+
+`total_ms` starts at the caller-supplied `created_time` when available and ends
+at the same summary boundary. It may include time before Rust registration;
+`created_time` is not necessarily the gateway's HTTP arrival time. Unreached
+phases and an unavailable creation time are JSON null. Gateway output processing
+and delivery to the HTTP client occur after this measurement.
 
 ### Per-request stats
 
@@ -1252,15 +1396,15 @@ Req: chatcmpl-019ef6b7 Finish! RequestStats(status='finished', reason='stop', pr
 | `status` / `reason` | `finished` vs `aborted`; finish-reason type (`stop`/`length`/`abort`). |
 | `prompt_tokens` / `cache_tokens` / `output_tokens` | Prompt tokens, prefix-cache-hit tokens, generated tokens. |
 | `cache_hit_rate` | `cache_tokens / prompt_tokens` (0–1). |
-| `queue_ms` | Received → first scheduled into a forward batch. |
+| `queue_ms` | Request-supplied `created_time` → first dispatch into a forward batch. Includes time before Rust registration; differs from the submitted → dispatch metrics histogram. |
 | `prefill_ms` | Scheduled → prefill complete. Always `0` on a decode node, whose prompt is prefilled on the prefill node. |
 | `decode_wait_ms` | Decode nodes only: KV (with the bootstrap token) landed → first decode batch dispatch. `0` elsewhere. |
-| `ttft_ms` | Received → first output token. On a decode node the first token is the prefill node's bootstrap token, so `ttft_ms` spans received → KV landed. |
-| `total_ms` | Received → finished/aborted. |
+| `ttft_ms` | Request-supplied `created_time` → first output token. On a decode node the first token is the prefill node's bootstrap token, so the endpoint is the engine accepting the landed KV and token. |
+| `total_ms` | Request-supplied `created_time` → finished/aborted. |
 | `preempt_ms` / `preempt_count` | Wall-clock this request's decode was delayed by prefilling other requests, and the number of such interruptions. Host-side best-effort. |
 | `decode_tps` | Decode throughput (generated tokens / decode window). |
 | `acc_len` / `acc_rate` | Spec-decode acceptance length and rate (`None` when speculative decoding is off). |
-| `recv_ts` / `commit_ts` / `finish_ts` | Absolute epoch timestamps for received / scheduled / finished. |
+| `recv_ts` / `commit_ts` / `finish_ts` | Absolute epoch timestamps for request-supplied creation / first dispatch / finish. `recv_ts` is copied from `created_time`, not stamped by the Rust transport. |
 
 ### KV cache events
 
@@ -1355,11 +1499,27 @@ The first rule that applies wins:
 
 | Arguments | Pool size | Request cap (`--retraction-snapshot-max-requests` when `0`) |
 |---|---|---|
-| `--retraction-snapshot-host-gb G` (G > 0) | `G` GB, whole LCM blocks | `--max-num-seqs / attention-DP size` |
+| `--retraction-snapshot-host-gb G` (G > 0) | `G` GB, whole LCM blocks | Rank-local resident capacity C (B+E on decode; B on fused) |
 | `--retraction-snapshot-ratio R` (R > 0) | `R` x this rank's Device LCM blocks | same |
 | `--retraction-snapshot-ratio 0` | **no pool**: a capacity block aborts its victim | `0` (an explicit cap is refused) |
-| neither, `--disable-kvstore` | 0.1 x this rank's Device LCM blocks (whole images) | same as above |
-| neither, Host KVStore on | request cap x one image tail | same as above |
+| neither, `--disable-kvstore` | 0.1 x this rank's Device LCM blocks (whole images) | C |
+| neither, Host KVStore on | request cap x one image tail | C |
+
+The default snapshot request cap is the rank-local resident capacity C:
+B+E on decode and B on fused. An explicit positive
+--retraction-snapshot-max-requests overrides this default. The cap budgets
+simultaneous images independently of Host KV bytes. A retraction frees a
+Device request row for another admission, so continued admissions can create
+demand for more than C simultaneous images; C is a default budget, not a
+guarantee that all such requests can be suspended. Raise the explicit cap
+and provide enough Host space when the workload needs more.
+
+A larger cap allocates more slot-state rows. With Host KVStore enabled and
+neither snapshot size nor ratio specified, it also increases the derived
+tail pool. Without Host KVStore, the default snapshot KV pool remains 0.1
+of the Device KV block count; raising the row cap does not increase that
+ratio. Explicit snapshot sizes and ratios remain unchanged. In every case,
+both image rows and Host storage must fit.
 
 One image tail, per cache group, is one block for a group that publishes
 to Host L2 (a state group's unpublished input block; a history group's
@@ -1372,10 +1532,12 @@ page, so the default is a tenth of the Device KV rather than all of it: an
 on-by-default pool must stay cheap to pin (the Device KV once is hundreds of
 gigabytes of pinned Host memory for a small model on a large GPU), and it
 still suspends a few residents; an image that does not fit aborts its
-victim. A deployment that wants every resident suspendable passes
-`--retraction-snapshot-ratio 1`, or enables the KVStore, whose tails are
-cheap. A size or ratio that holds no whole LCM block is refused,
-not rounded down to none. Each engine logs one line at startup with the
+victim. Retraction-snapshot-ratio=1 gives the snapshot KV pool the same
+usable LCM-block count as Device KV; enabling the KVStore moves published
+pages to Host L2. Neither setting raises the snapshot request cap. Suspending a larger set
+requires enough slot-state rows and enough space for its complete images
+across the snapshot pool and Host L2. A size or ratio that holds no whole
+LCM block is refused, not rounded down to none. Each engine logs one line at startup with the
 resolved pool (GB and LCM blocks, which rule sized it), the request cap
 and arena, and whether Host L2 takes the hash-complete pages; without a
 pool the line says that capacity blocks abort. The prefill and encode

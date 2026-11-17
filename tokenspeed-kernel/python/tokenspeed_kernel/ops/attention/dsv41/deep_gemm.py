@@ -29,7 +29,8 @@ from tokenspeed_kernel.ops.attention.dsv4.deep_gemm import (
     warmup_mqa_logits,
 )
 from tokenspeed_kernel.ops.attention.dsv41._deep_gemm.indexer import (
-    _sparse_candidate_scores,
+    _sparse_candidate_logits,
+    _sparse_geometry,
     clean_logits_and_block_max,
     gather_index_pages,
 )
@@ -46,10 +47,10 @@ from tokenspeed_kernel.ops.attention.dsv41.cute_dsl import (
     sparse_index_scores_supported,
 )
 from tokenspeed_kernel.ops.attention.dsv41.deep_select import (
+    _candidate_picks,
     _native_indices,
-    _select_topk_prepared,
-    select_candidates,
-    select_topk,
+    _prepared_picks,
+    _topk_picks,
 )
 from tokenspeed_kernel.ops.attention.dsv41.triton import (
     _LAYOUTS,
@@ -61,12 +62,12 @@ from tokenspeed_kernel.ops.attention.dsv41.triton import (
     clean_logits,
     clean_logits_for_selection,
     dense_ranges,
-    finish_selection,
+    finish_write_selection,
     mask_invalid_pages,
+    mask_invalid_table_pages,
     pack_index_inputs,
     quantize_index_queries,
     safe_metadata,
-    write_selection,
 )
 from tokenspeed_kernel.platform import (
     ArchVersion,
@@ -116,12 +117,93 @@ def _warmup_indexer(heads: int, device: torch.device, enable_pdl: bool) -> None:
     )
 
 
-def _api(queries):
+def _api_for(heads, device):
     enabled = pdl_enabled()
-    _warmup_indexer(queries[0].shape[1], queries[0].device, enabled)
+    _warmup_indexer(heads, device, enabled)
     if deep_gemm.get_pdl() != enabled:
         deep_gemm.set_pdl(enabled)
     return deep_gemm
+
+
+def _api(queries):
+    return _api_for(queries[0].shape[1], queries[0].device)
+
+
+def _padded_rows(logits, alignment):
+    """View DeepGEMM's rows at the cleaned copy's padded width when they hold it.
+
+    The cleaned copy is ``alignment``-element padded; DeepGEMM pads each row
+    further (to 1024 bytes). Columns past the logits are never read: consumers
+    stop at each row's end, which is within the logits.
+    """
+    rows, columns = logits.shape
+    width = (columns + alignment - 1) // alignment * alignment
+    needed = logits.storage_offset() + (rows - 1) * logits.stride(0) + width
+    if (
+        width == columns
+        or width > logits.stride(0)
+        or needed * logits.element_size() > logits.untyped_storage().nbytes()
+    ):
+        return logits
+    return logits.as_strided((rows, width), (logits.stride(0), 1))
+
+
+def _paged_geometry(
+    api,
+    cache,
+    block_table,
+    valid_lengths,
+    capacity,
+    page_size,
+    index_metadata,
+    tile_begin,
+    tile_end,
+):
+    """Sanitized table, lengths, context lengths, schedule and request ids of a tile.
+
+    Built once per index_metadata for each (tile, page count, capacity, page
+    size, SM count) and reused by later calls, also from other streams;
+    prepare_index_topk builds it ahead with the same arguments.
+    """
+    # Native TMA loads have no page upper-bound mask. Sanitize a scratch table
+    # before launching, leaving the scheduler's LCM tables unchanged.
+    key = (tile_begin, tile_end, cache.shape[0], capacity, page_size, api.get_num_sms())
+    geometry = index_metadata.paged.get(key) if index_metadata is not None else None
+    if geometry is not None:
+        return geometry.acquire()
+    table, lengths = safe_metadata(
+        block_table, valid_lengths, cache.shape[0], capacity, page_size
+    )
+    context_lens = lengths[:, None]
+    request_indices = (
+        index_metadata.source.acquire()[2] if index_metadata is not None else None
+    )
+    if request_indices is None:
+        # Blackwell schedules one query row per request entry: without a
+        # grouping every row is its own request.
+        indices = torch.arange(lengths.numel(), device=cache.device, dtype=torch.int32)
+    else:
+        # Padding must not end an active request's run with a zero length:
+        # the native scheduler sizes shared KV work from the run's last row.
+        padding_start = torch.iinfo(torch.int32).min
+        indices = torch.where(
+            lengths > 0,
+            request_indices[tile_begin:tile_end],
+            torch.arange(
+                padding_start,
+                padding_start + lengths.numel(),
+                device=cache.device,
+                dtype=torch.int32,
+            ),
+        )
+    schedule = api.get_paged_mqa_logits_metadata(
+        context_lens, page_size, api.get_num_sms(), indices=indices
+    )
+    if index_metadata is not None:
+        index_metadata.paged[key] = IndexGeometry(
+            (table, lengths, context_lens, schedule, indices)
+        )
+    return table, lengths, context_lens, schedule, indices
 
 
 def _paged_scores(
@@ -148,46 +230,17 @@ def _paged_scores(
             None,
         )
     api = _api(queries)
-    # Native TMA loads have no page upper-bound mask. Sanitize a scratch table
-    # before launching, leaving the scheduler's LCM tables unchanged.
-    key = (tile_begin, tile_end, cache.shape[0], capacity, page_size, api.get_num_sms())
-    geometry = index_metadata.paged.get(key) if index_metadata is not None else None
-    if geometry is None:
-        table, lengths = safe_metadata(
-            block_table, valid_lengths, cache.shape[0], capacity, page_size
-        )
-        context_lens = lengths[:, None]
-        request_indices = (
-            index_metadata.source.acquire()[2] if index_metadata is not None else None
-        )
-        if request_indices is None:
-            # Blackwell schedules one query row per request entry: without a
-            # grouping every row is its own request.
-            indices = torch.arange(
-                lengths.numel(), device=cache.device, dtype=torch.int32
-            )
-        else:
-            # Padding must not end an active request's run with a zero length:
-            # the native scheduler sizes shared KV work from the run's last row.
-            padding_start = torch.iinfo(torch.int32).min
-            indices = torch.where(
-                lengths > 0,
-                request_indices[tile_begin:tile_end],
-                torch.arange(
-                    padding_start,
-                    padding_start + lengths.numel(),
-                    device=cache.device,
-                    dtype=torch.int32,
-                ),
-            )
-        schedule = api.get_paged_mqa_logits_metadata(
-            context_lens, page_size, api.get_num_sms(), indices=indices
-        )
-        if index_metadata is not None:
-            geometry = IndexGeometry((table, lengths, context_lens, schedule, indices))
-            index_metadata.paged[key] = geometry
-    else:
-        table, lengths, context_lens, schedule, indices = geometry.acquire()
+    table, lengths, context_lens, schedule, indices = _paged_geometry(
+        api,
+        cache,
+        block_table,
+        valid_lengths,
+        capacity,
+        page_size,
+        index_metadata,
+        tile_begin,
+        tile_end,
+    )
     logits = api.fp8_fp4_paged_mqa_logits(
         q=(
             queries[0].contiguous().view(torch.int8).unsqueeze(1),
@@ -214,6 +267,17 @@ def _paged_scores(
             input_alignment,
         )
         return cleaned, lengths, (block_scores, block_ends)
+    input_alignment = deep_select_alignment()[0]
+    alignment = input_alignment // logits.element_size()
+    if logits.stride(0) * logits.element_size() % input_alignment == 0:
+        # DeepSelect borrows rows whose stride meets its alignment and reads
+        # [0, end); the block and candidate gathers mask at end too. Native
+        # rows are unspecified past the context, as the cleaned copy is past
+        # its last live tile, so only holes before end need -inf.
+        mask_invalid_table_pages(
+            logits, lengths, block_table, cache.shape[0], page_size
+        )
+        return _padded_rows(logits, alignment), lengths, None
     return (
         clean_logits_for_selection(
             logits,
@@ -222,7 +286,7 @@ def _paged_scores(
             cache.shape[0],
             capacity,
             page_size,
-            deep_select_alignment()[0] // logits.element_size(),
+            alignment,
         ),
         lengths,
         None,
@@ -284,10 +348,12 @@ def _dense_scores(
     name="deep_gemm_dsv41_index_topk",
     solution="deep_gemm",
     signatures=[format_signature(x=dense_tensor_format(torch.bfloat16))],
-    # Fuses RoPE and query quantization when index_q is an IndexQueryInput.
+    # Fuses RoPE and query quantization when index_q is an IndexQueryInput,
+    # and resolves the selection's SelectionSlots in its finishing kernel.
     traits={
         "native_indexer": frozenset({True}),
         "supports_index_query_input": frozenset({True}),
+        "supports_selection_slots": frozenset({True}),
     },
     capability=CapabilityRequirement(
         min_arch_version=ArchVersion(10, 0),
@@ -311,8 +377,12 @@ def index_topk(
     process_group,
     out,
     index_metadata,
+    slots,
 ):
-    """Score bounded query tiles; cache and selections remain caller owned."""
+    """Score bounded query tiles; cache and selections remain caller owned.
+
+    slots is a SelectionSlots for every query row, or None.
+    """
     if process_group is not None or candidate_block_size != 8:
         raise ValueError(
             "Native CSA2 selection requires replicated heads and 8-row blocks"
@@ -341,6 +411,8 @@ def index_topk(
         lengths.zero_()
         blocks.fill_(-1)
         block_lengths.zero_()
+        if slots is not None:
+            slots.out.fill_(-1)
         return out
     # The caller bounds this call. Dense Full packs one or more request
     # histories; DeepSelect reads [0, end) of the MQA view without a cleaned copy.
@@ -388,8 +460,13 @@ def index_topk(
         visible = visible_lens[begin:end]
         packed = (queries[0][begin:end], queries[1][begin:end])
         candidates = None if candidate_blocks is None else candidate_blocks[begin:end]
+        tile_slots = None if slots is None else slots[begin:end]
         if sparse:
-            logits, ends, normalized = _sparse_candidate_scores(
+            # Each tile's picks finish straight into out (and slots) in one
+            # kernel, which folds in the candidate mask: it takes a pool that
+            # fits topk (left unscored) whole, and every consumer reads only
+            # [0, end) of a scored row.
+            logits, ends, normalized = _sparse_candidate_logits(
                 packed,
                 weights[begin:end],
                 cache,
@@ -401,10 +478,13 @@ def index_topk(
                 index_metadata=index_metadata,
             )
             indices = _native_indices(logits, ends, topk)
-            selected = finish_selection(
-                indices, logits, ends, normalized, capacity, 8, True
+            finish_write_selection(
+                (indices, logits, ends, normalized, capacity, 8),
+                None,
+                tuple(tensor[begin:end] for tensor in out),
+                tile_slots,
+                True,
             )
-            write_selection(selected, None, tuple(tensor[begin:end] for tensor in out))
             continue
         if dense:
             visible = visible.clamp(0, capacity).to(torch.int32)
@@ -433,32 +513,145 @@ def index_topk(
                 end,
                 prepare_blocks,
             )
-        selected = (
-            _select_topk_prepared(logits, visible, topk)
-            if candidates is None
-            else select_topk(logits, visible, candidates, topk, 8)
-        )
-        chosen = None
-        if candidate_topk and prepared_blocks is None:
-            chosen = select_candidates(logits, visible, candidate_topk, 8)
-        elif prepared_blocks is not None:
-            block_scores, block_ends = prepared_blocks
-            block_indices = _native_indices(block_scores, block_ends, candidate_topk)
-            chosen = finish_selection(
-                block_indices,
-                block_scores,
-                block_ends,
-                None,
-                block_scores.shape[1],
-                8,
-                False,
-            )
-        write_selection(
-            selected,
-            chosen,
+        _finish_tile(
+            logits,
+            visible,
+            candidates,
+            topk,
+            candidate_topk,
+            prepared_blocks,
             tuple(tensor[begin:end] for tensor in out),
+            tile_slots,
         )
     return out
+
+
+def _finish_tile(
+    logits, visible, candidates, topk, candidate_topk, prepared_blocks, out, slots
+):
+    """Select a paged or dense tile and finish it in one launch.
+
+    Runs the DeepSelect launches of _select_topk_prepared / select_topk and,
+    for a candidate source, select_candidates or the prepared block picks, in
+    the same order, then one finish_write_selection for the rows, the pool
+    and the requested slots instead of their finish, write and slot passes.
+    """
+    if candidates is None:
+        row_picks = _prepared_picks(logits, visible, topk)
+        block_size = 1
+    else:
+        row_picks = _topk_picks(logits, visible, candidates, topk, 8)
+        block_size = 8
+    if row_picks is None:
+        # Nothing is selectable: a score row without columns (then no block
+        # is either) or a Reindex pool without blocks (which sources none).
+        # Store what writing finish_selection's all -1 picks stores.
+        rows, lengths, blocks, block_lengths = out
+        rows.fill_(-1)
+        lengths.zero_()
+        blocks.fill_(-1)
+        block_lengths.zero_()
+        if slots is not None:
+            slots.out.fill_(-1)
+        return
+    pool_picks = None
+    if candidate_topk and prepared_blocks is None:
+        pool_picks = _candidate_picks(logits, visible, candidate_topk, 8)
+    elif prepared_blocks is not None:
+        block_scores, block_ends = prepared_blocks
+        pool_picks = (
+            _native_indices(block_scores, block_ends, candidate_topk),
+            block_scores,
+            block_ends,
+        )
+    if candidate_topk and pool_picks is None:
+        # No block is selectable (a score row without columns): an all -1
+        # pool, whose counts the kernel zeroes as for a pass without one.
+        out[2].fill_(-1)
+        out = (out[0], out[1], out[2][:, :0], out[3])
+    finish_write_selection(
+        (*row_picks, logits.shape[1], block_size),
+        pool_picks,
+        out,
+        slots,
+        False,
+    )
+
+
+@register_kernel(
+    "attention",
+    "dsv41_index_topk_prepare",
+    name="deep_gemm_dsv41_index_topk_prepare",
+    solution="deep_gemm",
+    signatures=[format_signature(x=dense_tensor_format(torch.bfloat16))],
+    traits={"native_indexer": frozenset({True})},
+    capability=CapabilityRequirement(
+        min_arch_version=ArchVersion(10, 0),
+        max_arch_version=ArchVersion(10, 3),
+        vendors=frozenset({"nvidia"}),
+    ),
+    priority=Priority.SPECIALIZED,
+)
+def prepare_index_topk(
+    index_cache,
+    page_table,
+    visible_lens,
+    candidate_blocks,
+    topk,
+    candidate_topk,
+    query_heads,
+    query_chunk_size,
+    index_metadata,
+):
+    """Build the tile geometry deep_gemm_dsv41_index_topk reuses, ahead of it.
+
+    For each query tile, paged Full scoring's sanitized table, lengths and
+    schedule, or native sparse scoring's normalized candidates and schedule,
+    keyed in index_metadata exactly as index_topk looks them up, from the
+    same kernels on the same inputs. Dense (history_rows) scoring keeps no
+    such geometry, and pages index_topk refuses get none.
+    """
+    n = page_table.shape[0]
+    capacity = page_table.shape[1] * 64
+    if n == 0 or capacity == 0:
+        return
+    sparse = _use_sparse_candidate_scores(index_cache, candidate_blocks, candidate_topk)
+    if not sparse and (
+        index_metadata.history_rows is not None
+        or index_cache.stride(0) >= 2**31
+        or index_cache.stride(0) % 16
+        or index_cache.data_ptr() % 16
+    ):
+        return
+    cache = index_cache.as_strided(
+        (index_cache.shape[0], 64 * 68), (index_cache.stride(0), 1)
+    )
+    api = _api_for(query_heads, index_cache.device)
+    tile = max(1, query_chunk_size)
+    for begin in range(0, n, tile):
+        end = min(begin + tile, n)
+        if sparse:
+            _sparse_geometry(
+                cache,
+                page_table[begin:end],
+                visible_lens[begin:end],
+                candidate_blocks[begin:end],
+                api,
+                skip_score_topk=topk,
+                index_metadata=index_metadata,
+            )
+        else:
+            _paged_geometry(
+                api,
+                cache,
+                page_table[begin:end],
+                visible_lens[begin:end],
+                capacity,
+                64,
+                index_metadata,
+                begin,
+                end,
+            )
 
 
 # ---------------------------------------------------------------------------
