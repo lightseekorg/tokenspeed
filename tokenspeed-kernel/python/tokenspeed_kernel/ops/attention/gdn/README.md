@@ -37,6 +37,10 @@ queries include the bound input pool's layout. FlashInfer 0.7.4 uses native
 per-token scatter; its BF16 MTP path also preserves padded pool strides.
 The CuTe DSL WY leaf remains output-only, and FlashInfer MTP still writes
 within its input pool rather than accepting a separate output pool.
+Far-page GPU tests cover BF16/FP32 MTP reads, writeback, per-token scatter,
+tree verification and direct chain verification beyond 2^31 elements. They
+compare outputs and live states with dense pools and preserve guard regions
+around every state row without traversing the large gaps.
 
 The leaf reads the committed state once per value tile, forms the small WY
 output transform and computes every token's output without writing the state

@@ -2498,6 +2498,121 @@ def test_gdn_decode_state_offsets_beyond_int32(device: str, require):
     torch.testing.assert_close(state[2], expected_state[0], atol=0, rtol=0)
 
 
+@pytest.mark.parametrize(
+    ("solution", "mode", "state_dtype"),
+    [
+        (solution, mode, state_dtype)
+        for solution, mode in (
+            ("triton", "readonly"),
+            ("triton", "writeback"),
+            ("triton", "scatter"),
+            ("triton", "tree"),
+            ("triton", "readonly_tree"),
+            ("flashinfer", "readonly"),
+            ("flashinfer", "writeback"),
+            ("flashinfer", "scatter"),
+        )
+        for state_dtype in (torch.bfloat16, torch.float32)
+    ]
+    + [("triton", "chain", torch.bfloat16)],
+)
+def test_gdn_mtp_state_offsets_beyond_int32(
+    device, solution, mode, state_dtype, require
+):
+    """Read/write far pages without touching the guards around any state row."""
+    op = "gdn_chain_verify" if mode == "chain" else "gdn_decode_mtp"
+    require("attention", op, solution, torch.bfloat16, "q")
+    steps = 8 if mode == "readonly_tree" else (4 if mode == "tree" else 3)
+    q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
+        device=device,
+        dtype=torch.bfloat16,
+        T=steps,
+        batch=1,
+        num_q_heads=1,
+        num_v_heads=1,
+        head_dim=128,
+        pool_size=7,
+        state_dtype=state_dtype,
+    )
+    elements = pool[0].numel()
+    guards = []
+
+    def strided_state(stride):
+        guard = 32
+        backing = torch.empty(
+            (pool.shape[0] - 1) * stride + elements + 2 * guard,
+            dtype=pool.dtype,
+            device=device,
+        )
+        state = backing.as_strided(
+            pool.shape, (stride, elements, 128, 1), storage_offset=guard
+        )
+        state.copy_(pool)
+        for row in range(pool.shape[0]):
+            start = guard + row * stride
+            for offset in (start - guard, start + elements):
+                probe = backing[offset : offset + guard]
+                probe.fill_(123.0)
+                guards.append(probe)
+        return state
+
+    # Page 2 already lies beyond 2^31 elements. Only live rows and their
+    # guards are initialized; the multi-GiB gaps are never traversed.
+    source = strided_state((1 << 30) + elements)
+    separate_output = solution == "triton" and mode in ("scatter", "tree")
+    destination = strided_state((1 << 30) + 2 * elements) if separate_output else source
+    output_rows = (
+        torch.arange(3, 3 + steps, dtype=torch.int32, device=device).view(1, steps)
+        if mode in ("scatter", "tree")
+        else None
+    )
+    common = dict(
+        A_log=A_log,
+        a=a.bfloat16(),
+        dt_bias=dt_bias,
+        b=b.bfloat16(),
+        initial_state_indices=torch.tensor([2], device=device, dtype=torch.int32),
+        solution=solution,
+    )
+
+    def run(initial, output):
+        if mode == "chain":
+            return gdn_chain_verify(
+                q,
+                k,
+                v,
+                initial_state=initial,
+                scale=None,
+                use_qk_l2norm=True,
+                **common,
+            )
+        return gdn_decode_mtp(
+            q,
+            k,
+            v,
+            initial_state=initial,
+            output_state=output if separate_output else None,
+            output_state_indices=output_rows,
+            disable_state_update=mode in ("readonly", "readonly_tree"),
+            tree_ancestors=(
+                _tree_ancestors([[-1, 0, 0, 2] + [2] * (steps - 4)], device)
+                if mode in ("tree", "readonly_tree")
+                else None
+            ),
+            **common,
+        )
+
+    expected_source = pool.clone()
+    expected_destination = pool.clone() if separate_output else expected_source
+    expected = run(expected_source, expected_destination).clone()
+    actual = run(source, destination)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    torch.testing.assert_close(source, expected_source, atol=0, rtol=0)
+    if separate_output:
+        torch.testing.assert_close(destination, expected_destination, atol=0, rtol=0)
+    assert torch.all(torch.cat(guards) == 123.0)
+
+
 @pytest.mark.parametrize("steps", [1, 3])
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
 def test_gdn_default_selection_updates_page_strided_state(

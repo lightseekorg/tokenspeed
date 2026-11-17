@@ -54,6 +54,65 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroup
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
 
+@pytest.mark.parametrize(
+    ("parents", "kernel_page_size", "error"),
+    [
+        (262143, 256, None),
+        (262144, 256, "kernel write slot 2147483903"),
+        (262144, 1, "atom page id"),
+    ],
+)
+def test_flat_kv_pool_validates_atom_capacity_without_allocating(
+    parents, kernel_page_size, error
+):
+    history = CacheGroupSpec("history", "full_history", 256, 1, replayable=False)
+    state = CacheGroupSpec("state", "state", None, None, replayable=False)
+    fields = tuple(
+        CacheFieldSpec(
+            f"layer.0.{name}",
+            "flatkv",
+            (256, 1, 64),
+            "bfloat16",
+            exact_page_stride=False,
+        )
+        for name in ("k", "v")
+    )
+    layout = pack(
+        (
+            (history, fields),
+            (
+                state,
+                (
+                    CacheFieldSpec(
+                        "layer.1.ssm",
+                        "flatkv",
+                        (1 << 20,),
+                        "uint8",
+                        exact_page_stride=False,
+                    ),
+                ),
+            ),
+        ),
+        prefix_granularity=256,
+        cache_blocks_per_lcm_block={"history": 1, "state": 1},
+        max_padding_fraction=float("inf"),
+    )
+    arena = CacheArena(layout.bind(parents), "meta", cache_group_specs=(history, state))
+    pool = MHATokenToKVPool(
+        arena=arena,
+        dtype=torch.bfloat16,
+        head_num=1,
+        head_dim=64,
+        layer_num=1,
+        rank=0,
+    )
+    if error is None:
+        assert pool.atom_pages_per_block("history", kernel_page_size) == 32
+    else:
+        with pytest.raises(ValueError, match=error):
+            pool.atom_pages_per_block("history", kernel_page_size)
+
+
 @requires_cuda
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("graph", [False, True])
@@ -341,7 +400,7 @@ def test_ordinary_sink_router_keeps_raw_page_addresses(
     assert router.decode_window_locations().tolist() == [135]
 
 
-def _qwen4_exp_recipe(*, flat, device, kv_dtype, state_layers):
+def _qwen4_exp_recipe(*, flat, device, kv_dtype, state_layers, draft_num_kv_heads):
     from dataclasses import replace
     from test.runtime.test_cache_setup import _qwen4_exp_fp8_kv_recipe
 
@@ -368,7 +427,7 @@ def _qwen4_exp_recipe(*, flat, device, kv_dtype, state_layers):
         head_dim=64,
         mamba_ssm_dtype="float32",
         qsa=True,
-        draft_num_kv_heads=1,
+        draft_num_kv_heads=draft_num_kv_heads,
         verify_width=4,
         max_bs=2,
         pp_size=1,
@@ -383,14 +442,18 @@ def _qwen4_exp_recipe(*, flat, device, kv_dtype, state_layers):
     return recipe
 
 
-def _qwen4_exp_pool(*, flat, device, kv_dtype):
+def _qwen4_exp_pool(*, flat, device, kv_dtype, draft_num_kv_heads):
     from tokenspeed.runtime.layers.attention.kv_cache.factory import (
         create_cache_arena,
         create_cache_pool,
     )
 
     recipe = _qwen4_exp_recipe(
-        flat=flat, device=device, kv_dtype=kv_dtype, state_layers=7
+        flat=flat,
+        device=device,
+        kv_dtype=kv_dtype,
+        state_layers=7,
+        draft_num_kv_heads=draft_num_kv_heads,
     )
     setup = recipe.setup()
     arena = create_cache_arena(setup.spec, device=device, enable_memory_saver=False)
@@ -420,10 +483,14 @@ def test_flat_kv_groups_gdn_layers_on_one_plane(kv_dtype):
     )
 
     _, arena, (target, draft) = _qwen4_exp_pool(
-        flat=True, device="cpu", kv_dtype=kv_dtype
+        flat=True, device="cpu", kv_dtype=kv_dtype, draft_num_kv_heads=1
     )
     ordinary = _qwen4_exp_recipe(
-        flat=False, device="cpu", kv_dtype=kv_dtype, state_layers=7
+        flat=False,
+        device="cpu",
+        kv_dtype=kv_dtype,
+        state_layers=7,
+        draft_num_kv_heads=1,
     ).setup()
     assert {g.group_id for g in arena.plan.groups} == {
         "full_attention",
@@ -475,7 +542,11 @@ def test_qwen4_exp_default_cache_layout_respects_cli(flags, flat):
     from tokenspeed.runtime.utils.server_args import prepare_server_args
 
     recipe = _qwen4_exp_recipe(
-        flat=flat, device="cpu", kv_dtype=torch.bfloat16, state_layers=7
+        flat=flat,
+        device="cpu",
+        kv_dtype=torch.bfloat16,
+        state_layers=7,
+        draft_num_kv_heads=1,
     )
     recipe.server_args = prepare_server_args(["--model", "x", *flags])
     plan = recipe.setup().spec.memory_plan
@@ -508,7 +579,7 @@ def test_shared_plane_qsa_compression_and_recent_write(graph):
     )
 
     _, arena, (pool, _) = _qwen4_exp_pool(
-        flat=True, device="cuda", kv_dtype=torch.bfloat16
+        flat=True, device="cuda", kv_dtype=torch.bfloat16, draft_num_kv_heads=1
     )
     layers = (7, 8, 9)
     keys = torch.randn(4, 1, 128, device="cuda", dtype=torch.bfloat16)
@@ -622,7 +693,9 @@ def test_shared_plane_qsa_compression_and_recent_write(graph):
 def test_shared_plane_copy_and_zero():
     import numpy as np
 
-    _, arena, _ = _qwen4_exp_pool(flat=True, device="cuda", kv_dtype=torch.bfloat16)
+    _, arena, _ = _qwen4_exp_pool(
+        flat=True, device="cuda", kv_dtype=torch.bfloat16, draft_num_kv_heads=1
+    )
     plan = arena.plan
     arena.buffer.fill_(219)
     for index, group in enumerate(plan.groups):
@@ -668,7 +741,7 @@ def test_shared_plane_ple_and_qsa_verify_commit(graph):
     from tokenspeed.runtime.layers.attention.qsa.verify_state import QSAVerifyState
 
     recipe, arena, (pool, _) = _qwen4_exp_pool(
-        flat=True, device="cuda", kv_dtype=torch.bfloat16
+        flat=True, device="cuda", kv_dtype=torch.bfloat16, draft_num_kv_heads=1
     )
     ple = Qwen4ExpPLEBackend(
         recipe.attn_config, recipe.attn_config.component(MHAConfig)
@@ -740,7 +813,11 @@ def test_one_gdn_group_keeps_each_layers_input_and_output_states(state_layers):
     from tokenspeed.runtime.layers.attention.kv_cache.factory import create_cache_pool
 
     recipe = _qwen4_exp_recipe(
-        flat=True, device="cpu", kv_dtype=torch.bfloat16, state_layers=state_layers
+        flat=True,
+        device="cpu",
+        kv_dtype=torch.bfloat16,
+        state_layers=state_layers,
+        draft_num_kv_heads=1,
     )
     setup = recipe.setup()
     arena = CacheArena(

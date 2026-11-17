@@ -1289,8 +1289,8 @@ explicit strides. No KV gather is introduced.
 This requires PP=1, uniform K/V heads within each compute view and non-MXFP8
 KV. It reduces padding for partially filled groups; a full-attention parent
 that was already full keeps the same useful KV bytes per token. Use
-`--no-qwen4-exp-flat-kv` for the plane-based layout. The FlatKV setting is
-part of the L3 storage identity.
+`--no-qwen4-exp-flat-kv` for the plane-based layout. L3 compatibility follows
+the resulting cache layout.
 
 ## GPT-OSS 20B / 120B
 

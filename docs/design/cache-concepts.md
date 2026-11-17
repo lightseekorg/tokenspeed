@@ -2038,6 +2038,17 @@ and write locations. GDN kernels selected for padded state pages must declare
 `strided_state` support and address input and output pools with their own
 runtime page strides.
 
+Before building a group's kernel tables, the memory plan checks both its
+largest translated atom-page ID and its largest token write slot against
+signed int32. These bounds include the stride-derived multiplier, every
+kernel subpage, and the null page in the group's capacity; overflowing
+geometry fails at startup before any table value is narrowed.
+
+L3 compatibility follows the cache layout signature, including field strides,
+payloads and group packing. The FlatKV flag is not a separate KV-producer
+option, so toggling it on a model whose layout is unchanged preserves its L3
+namespace.
+
 A single plane removes plane-specific holes when a parent belongs to a
 smaller group. It does not compress useful KV data: when the ordinary layout
 already fills a full-attention parent, its KV payload per token is unchanged.

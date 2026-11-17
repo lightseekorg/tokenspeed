@@ -279,10 +279,9 @@ class CachePool(ABC):
                 f"is not divisible by kernel page size {kernel_page_size}"
             )
         ratio = granularity // kernel_page_size
-        if spec.attn_kind != "full_history":
-            return ratio
         multipliers = set()
-        for field in self.arena.plan.fields:
+        fields = self.arena.plan.fields if spec.attn_kind == "full_history" else ()
+        for field in fields:
             if (
                 field.group_id != group_id
                 or _layer_plane(
@@ -307,13 +306,20 @@ class CachePool(ABC):
                 )
             multipliers.add(field.page_stride_bytes // atom_bytes)
         if not multipliers:
-            return ratio
+            multipliers.add(ratio)
         if len(multipliers) != 1:
             raise ValueError(
                 f"cache group {group_id!r} needs one atom-page multiplier for "
                 f"every layer sharing its page table, got {sorted(multipliers)}"
             )
-        return multipliers.pop()
+        multiplier = multipliers.pop()
+        self.arena.plan.validate_kernel_page_range(
+            group_id,
+            atom_pages_per_block=multiplier,
+            kernel_subpages=ratio,
+            kernel_page_size=kernel_page_size,
+        )
+        return multiplier
 
     def history_group_by_layer(self) -> dict[int, str]:
         """View-local layer id -> the history group its KV planes

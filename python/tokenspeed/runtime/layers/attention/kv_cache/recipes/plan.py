@@ -283,6 +283,43 @@ class CacheMemoryPlan:
     def plane(self, plane_id: str) -> CachePlaneLayout:
         return self._planes_by_id[plane_id]
 
+    def validate_kernel_page_range(
+        self,
+        group_id: str,
+        *,
+        atom_pages_per_block: int,
+        kernel_subpages: int,
+        kernel_page_size: int,
+    ) -> None:
+        """Check translated page IDs and token write slots fit signed int32.
+
+        ``kernel_subpages`` is the logical pages per scheduler block;
+        ``atom_pages_per_block`` also includes any physical gaps. Capacity
+        includes the null page, so the final address uses ``page_count - 1``.
+        This check uses only metadata, never an arena allocation.
+        """
+        if (
+            kernel_subpages < 1
+            or atom_pages_per_block < kernel_subpages
+            or kernel_page_size < 1
+        ):
+            raise ValueError(f"cache group {group_id!r}: invalid kernel page geometry")
+        max_atom = (
+            (self.group(group_id).page_count - 1) * atom_pages_per_block
+            + kernel_subpages
+            - 1
+        )
+        max_slot = max_atom * kernel_page_size + kernel_page_size - 1
+        for name, value in (
+            ("atom page id", max_atom),
+            ("kernel write slot", max_slot),
+        ):
+            if value > _MAX_KERNEL_PAGE_ID:
+                raise ValueError(
+                    f"cache group {group_id!r}: {name} {value} exceeds "
+                    f"signed int32 maximum {_MAX_KERNEL_PAGE_ID}"
+                )
+
     def field_page_byte_offset(self, field_id: str, page_id: int) -> int:
         """Return one field page's byte offset in the shared cache arena."""
         field = self.field(field_id)
