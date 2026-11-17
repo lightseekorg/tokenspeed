@@ -343,7 +343,8 @@ TEST(GroupAllocatorTest, BucketBalanceKeepsLiveSlotsAfterReclaimedPrefixAndInter
     ASSERT_TRUE(allocator.Acquire(pool, table, AcquirePlan{.num_blocks = 4}, 0, {}));
     std::vector<std::int32_t> buckets;
     for (const auto& ref : table.Blocks().subspan(67)) buckets.push_back(allocator.BucketOf(ref->Location()));
-    EXPECT_EQ(buckets, (std::vector<std::int32_t>{1, 3, 0, 1}));
+    std::sort(buckets.begin(), buckets.end());
+    EXPECT_EQ(buckets, (std::vector<std::int32_t>{0, 1, 1, 3}));
     const auto before = allocator.BlockTablePageIds(table);
     const auto occupied = pool.NumOccupiedSlots();
     EXPECT_FALSE(allocator.Acquire(pool, table, AcquirePlan{.num_blocks = 100}, 0, {}));

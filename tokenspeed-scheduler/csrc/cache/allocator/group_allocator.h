@@ -508,6 +508,7 @@ private:
         std::vector<std::int32_t> loads(static_cast<std::size_t>(shard_count_), 0);
         // Shared prefix refs and allocated headroom both count. Null slots in
         // sparse tables do not own a placement and contribute nothing.
+        // Every slot below the reclaimed frontier is null.
         for (const CacheBlockRef& ref : table.Blocks().subspan(table.ReclaimedPrefixBlocks())) {
             if (ref) {
                 ++loads[static_cast<std::size_t>(ref->Location().slot_index % shard_count_)];
