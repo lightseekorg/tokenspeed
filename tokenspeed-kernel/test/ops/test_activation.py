@@ -184,6 +184,22 @@ def test_sigmoid_mul_head_bias_matches_eager(
     torch.testing.assert_close(out, ref, atol=tol, rtol=tol)
 
 
+def test_sigmoid_mul_compiles_once_per_tile_width(device: str) -> None:
+    """One compile per tile width, none per token count."""
+    x = torch.randn(1100, 12 * 128, device=device, dtype=torch.bfloat16)
+    gate = _headed_gate("strided", 1100, 12, 128, torch.bfloat16, device)
+    bias = torch.randn(12, device=device, dtype=torch.bfloat16)
+
+    def run(tokens: int) -> None:
+        sigmoid_mul(x[:tokens], gate[:tokens], head_bias=bias)
+
+    run(1)
+    run(601)
+    with assert_no_triton_compile(activation_triton._sigmoid_mul_kernel):
+        for tokens in (2, 16, 37, 511, 512, 1024, 1100):
+            run(tokens)
+
+
 @pytest.mark.parametrize("head_bias", [False, True])
 @pytest.mark.parametrize("layout", ["2d", "3d", "strided"])
 def test_sigmoid_mul_launch_arguments(

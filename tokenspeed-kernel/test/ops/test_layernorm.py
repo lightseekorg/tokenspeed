@@ -391,13 +391,15 @@ def test_fused_qk_rmsnorm_rope_compiles_once_per_token_block(device: str) -> Non
 
 
 def _qk_norm(q, k, q_weight, k_weight, positions):
+    # The in-kernel SSMax is a PTX multiply; AMD runs Beam's SSMax through Gluon.
+    positions = positions if platform.is_nvidia else None
     return qk_rmsnorm(
         q, k, q_weight, k_weight, 1e-6, weight_offset=0.0, ssmax_positions=positions
     )
 
 
 def test_qk_rmsnorm_heads_do_not_depend_on_their_neighbors(device: str) -> None:
-    """Beam's 12 + 2 heads per rank with SSMax, bit for bit each head launched alone."""
+    """Beam's 12 + 2 heads per rank, bit for bit each head launched alone."""
     q, k, q_weight, k_weight, _, positions = _rope_inputs(37, 12, 2, device)
     q_out, k_out = _qk_norm(q, k, q_weight, k_weight, positions)
     head_dim = q_weight.shape[0]
