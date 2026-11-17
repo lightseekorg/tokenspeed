@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
+from tokenspeed_kernel.ops.gemm import mm as kernel_mm
 from tokenspeed_kernel.ops.kvcache.triton import (
     LatentPlanes,
     check_mla_latent_geometry,
@@ -1034,7 +1035,7 @@ class DFlash(BaseDrafter):
         self._fused_kv_workspace_dtype = None
         self._fused_kv_proj_workspace = None
         self._fused_kv_latent_planes: LatentPlanes | None = None
-        # torch.mm(out=...) is always used; workspace pre-allocated at warmup.
+        # The projection writes into a workspace pre-allocated at warmup.
         self._fused_kv_k_buffers = []
         self._fused_kv_v_buffers = []
         if not self.uses_shared_context_projection:
@@ -1108,8 +1109,7 @@ class DFlash(BaseDrafter):
                 k_norm_rows.append(attn.k_norm.weight)
                 eps_values.append(float(attn.k_norm.variance_epsilon))
 
-            flat_kv_weight = torch.cat(kv_weight_rows, dim=0)
-            self._fused_kv_flat_weight_t = flat_kv_weight.t().contiguous()
+            self._fused_kv_flat_weight = torch.cat(kv_weight_rows, dim=0).contiguous()
             self._fused_kv_k_norm_weight = torch.stack(k_norm_rows, dim=0).contiguous()
             self._fused_kv_eps = torch.tensor(
                 eps_values, dtype=torch.float32, device=self.device
@@ -1431,7 +1431,7 @@ class DFlash(BaseDrafter):
         self._ensure_fused_workspace(total_ctx, ctx_hidden.dtype)
 
         proj_out_2d = self._fused_kv_proj_workspace[:total_ctx]
-        torch.mm(ctx_hidden, self._fused_kv_flat_weight_t, out=proj_out_2d)
+        kernel_mm(ctx_hidden.contiguous(), self._fused_kv_flat_weight, out=proj_out_2d)
 
         proj_out = proj_out_2d.view(
             total_ctx, self._fused_kv_n_layers, self._fused_kv_layer_out_dim
