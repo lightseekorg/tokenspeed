@@ -48,6 +48,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 import torch
+from tokenspeed_kernel.ops.metadata.decode_tables import prepare_decode_tables
 
 from tokenspeed.runtime.layers.attention.backends.paged.write_locations import (
     decode_write_locations,
@@ -472,6 +473,57 @@ class GroupTableStacks:
                 )
             return
         self._fill_torch(bs, actual_bs, srcs)
+
+    def fill_decode(
+        self,
+        bs: int,
+        actual_bs: int,
+        block_tables: Mapping[str, torch.Tensor],
+        seq_lens: torch.Tensor,
+        tokens_per_req: int,
+        *,
+        targets: Mapping[str, tuple[torch.Tensor, torch.Tensor, int]],
+    ) -> None:
+        """Refresh tables, write slots and disjoint leaf buffers in place.
+
+        Targets map group IDs to (lengths, table, floor), as advertised by
+        ``decode_buffer_targets``. Leaves without copy-only refreshes are absent.
+        The existing buffers remain graph-stable; no intermediate table read
+        is needed to derive write slots from the scheduler blocks.
+        """
+        if not 0 <= actual_bs <= bs <= self.max_bs:
+            raise RuntimeError(f"invalid decode batch {actual_bs=} {bs=}")
+        if not 1 <= tokens_per_req <= self.max_tokens_per_req:
+            raise RuntimeError(f"invalid decode width {tokens_per_req}")
+        if bs == 0:
+            return
+        # An idle batch has no delivered source tables. The masked kernel
+        # never reads these placeholders, including during graph warmup.
+        sources = tuple(
+            block_tables[gid] if actual_bs else self.tables[i]
+            for i, gid in enumerate(self.group_ids)
+        )
+        for gid, source in zip(self.group_ids, sources):
+            if (
+                source.ndim != 2
+                or source.dtype != torch.int32
+                or source.shape[0] < actual_bs
+            ):
+                raise RuntimeError(
+                    f"cache group {gid!r} needs a 2-D int32 table covering {actual_bs} rows"
+                )
+        prepare_decode_tables(
+            sources,
+            self.tables,
+            self.decode_locs,
+            seq_lens[:bs],
+            actual_bs=actual_bs,
+            tokens_per_req=tokens_per_req,
+            ratios=self._ratios,
+            pages=self._max_num_pages,
+            page_sizes=self.page_sizes_cpu,
+            targets=tuple(targets.get(gid) for gid in self.group_ids),
+        )
 
     def _fill_torch(
         self, bs: int, actual_bs: int, srcs: Sequence[torch.Tensor]

@@ -797,39 +797,26 @@ class CacheGroupRouter(AttentionBackend):
                 f"refresh_decode_metadata serves decode only ({forward_mode})"
             )
         self._check_live_delivery(actual_bs, block_tables)
-        self.stacks.fill(bs, actual_bs, block_tables)
-        # The window covers every request; DECODE reads skip the extend
-        # requests a MIXED round's draft refresh carries (num_extends is 0 on
-        # targets).
-        self._decode_request_offset = num_extends
-        self._refresh_decode_locations(bs, seq_lens)
-        if num_extends and self._extend_write_locations is not None:
-            self._append_decode_rows(bs, num_extends)
         targets = {
             gid: leaf.decode_buffer_targets(bs) for gid, leaf in self.leaves.items()
         }
-        batched = [gid for gid, pair in targets.items() if pair is not None]
-        if batched:
-            # One launch fills every such leaf (plus one clamp per seq_lens
-            # floor); two stream copies per leaf cost ~4 us each at bs=1.
-            floored = {}
-            for gid in batched:
-                floor = self.leaves[gid].decode_seq_lens_floor
-                if floor not in floored:
-                    floored[floor] = (
-                        seq_lens[:bs] if floor <= 1 else seq_lens[:bs].clamp_min(floor)
-                    )
-            torch._foreach_copy_(
-                [buf for gid in batched for buf in targets[gid]],
-                [
-                    src
-                    for gid in batched
-                    for src in (
-                        floored[self.leaves[gid].decode_seq_lens_floor],
-                        self.stacks.table(gid, bs),
-                    )
-                ],
-            )
+        self.stacks.fill_decode(
+            bs,
+            actual_bs,
+            block_tables,
+            seq_lens,
+            self._decode_tokens_per_req,
+            targets={
+                gid: (*pair, self.leaves[gid].decode_seq_lens_floor)
+                for gid, pair in targets.items()
+                if pair is not None
+            },
+        )
+        # Draft refreshes after mixed rounds still publish only their decode tail.
+        self._decode_request_offset = num_extends
+        self._publish_decode_locations(bs, self._decode_tokens_per_req)
+        if num_extends and self._extend_write_locations is not None:
+            self._append_decode_rows(bs, num_extends)
         for gid, leaf in self.leaves.items():
             if targets[gid] is None:
                 leaf.refresh_decode_metadata(
