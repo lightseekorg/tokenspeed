@@ -58,14 +58,6 @@ def main() -> None:
     provider.add_argument("--device-name", required=True)
     provider.add_argument("--bytes", type=int, required=True)
     args = parser.parse_args()
-    if args.service == "owner" and (
-        args.providers < 1 or args.headroom_lcm_blocks < 0 or args.client_timeout_s <= 0
-    ):
-        # No pool is built from these: said here, not to the first rank.
-        parser.error(
-            "the owner needs --providers of at least 1, --headroom-lcm-blocks of "
-            "at least 0 and a positive --client-timeout-s"
-        )
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )

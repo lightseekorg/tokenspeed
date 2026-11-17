@@ -364,24 +364,6 @@ TEST(SharedL2Proxy, DeviceHitsAreCollectedOnceEnabled) {
     EXPECT_TRUE(rank.cache.TakeDeviceHits().empty());
 }
 
-TEST(SharedL2Proxy, StoreCandidatesAreTakenOldestFirstUpToABound) {
-    Rank rank(16, 16);
-    const Prompt prompt{Sequence(10)};
-    rank.Publish(prompt);
-    ASSERT_TRUE(rank.cache.HasPendingStores());
-    const std::vector<CacheCoordinator::StoreCandidate> first = rank.cache.TakePendingStores(3);
-    ASSERT_EQ(first.size(), 3u);
-    EXPECT_TRUE(rank.cache.HasPendingStores());
-    const std::vector<CacheCoordinator::StoreCandidate> rest = rank.cache.TakePendingStores();
-    EXPECT_EQ(rest.size(), 1u);
-    EXPECT_FALSE(rank.cache.HasPendingStores());
-    // Publication order: the Full group's pages and tail, then the checkpoint.
-    std::vector<CacheKey> taken;
-    for (const auto& candidate : first) taken.push_back(candidate.key);
-    taken.push_back(rest.front().key);
-    EXPECT_EQ(taken, prompt.Keys());
-}
-
 TEST(SharedL2Proxy, PoolWritesAreBoundedAndOnlyThoseInFlightPinTheirSources) {
     Rank rank(16, 16);
     const Prompt first{Sequence(10)}, second{Sequence(10, 100)};

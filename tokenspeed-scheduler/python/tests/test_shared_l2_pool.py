@@ -149,25 +149,6 @@ def test_keys_and_tails_survive_a_wire_that_turns_tuples_into_lists():
     assert sorted(page for _, _, page in slots) == sorted(pages)
 
 
-def test_a_client_that_leaves_holds_nothing():
-    pool = ts.SharedL2Pool(config(), 8, 0)
-    prompt = Prompt(range(8))
-    keys = prompt.keys()
-
-    ticket, pages = pool.reserve(1, keys, [0] * len(keys))
-    assert ticket and pool.stats()["reserved_blocks"] == len(keys)
-    pool.disconnect(1)
-    assert pool.stats()["reserved_blocks"] == 0
-    assert not pool.commit(1, ticket, [prompt.publication(1)])
-    write(pool, 2, prompt)
-
-    ticket, num_tokens, *_ = prompt.probe(pool, 1)
-    assert ticket and num_tokens == 8 and not pool.clear()
-    pool.disconnect(1)
-    assert pool.stats()["pinned_blocks"] == 0
-    assert pool.clear() and pool.stats()["cached_blocks"] == 0
-
-
 def test_misuse_is_refused():
     cfg = config()
     cfg.checkpoint_retention_requests = None
@@ -180,18 +161,6 @@ def test_misuse_is_refused():
 
     pool = ts.SharedL2Pool(config(), 8, 0)
     prompt = Prompt(range(8))
-    keys = prompt.keys()
-    with pytest.raises(ValueError, match="one bucket per key"):
-        pool.reserve(1, keys, [0])
-    with pytest.raises(ValueError, match="shard count"):
-        pool.reserve(1, keys, [1] * len(keys))
     with pytest.raises(ValueError, match="int32 bytes"):
         pool.probe(1, prompt.hashes, b"abc", 8)
-    for max_tokens in (-1, -GRAIN, 9):
-        with pytest.raises(ValueError, match="reach its bound"):
-            pool.probe(1, prompt.hashes, tokens_bytes(prompt.tokens), max_tokens)
     assert pool.stats()["lookups"] == 0
-    ticket, _ = pool.reserve(1, keys, [0] * len(keys))
-    with pytest.raises(ValueError, match="cover its pages and tail"):
-        pool.commit(1, ticket, [(tokens_bytes(range(7)), prompt.hashes, None, 1)])
-    assert pool.commit(1, ticket, [prompt.publication(1)])

@@ -21,7 +21,7 @@
 """The request-reply wire between the owner and its clients and providers.
 
 A request is a msgpack map: ``op`` and the operation's fields. A reply is
-``{"ok": True, ...}``, or ``{"ok": False, "error": ..., "unknown_client": ...}``.
+``{"ok": True, ...}``, or ``{"ok": False, "error": ...}``.
 
 Cache keys are opaque here. A key is a tuple on both sides and an array on the
 wire, and every key the owner places travels with its bucket (its shard
@@ -38,17 +38,9 @@ import zmq
 
 
 class OwnerError(RuntimeError):
-    """The owner answered a request with an error."""
-
-
-class UnknownClientError(OwnerError):
-    """The owner holds nothing for this client: the client timed out there, or
-    the owner restarted."""
-
-
-class MalformedReplyError(OwnerError):
-    """The reply is not one of the wire's: the request is refused, and nothing
-    says that the owner handled it."""
+    """The owner answered a request with an error (an owner that does not
+    know the request's client answers so), or with something that is not a
+    reply of the wire."""
 
 
 class _ThreadSocket(threading.local):
@@ -80,10 +72,8 @@ class OwnerConnection:
         Raises:
             TimeoutError: No reply within the connection's timeout. The owner
                 may still handle the request.
-            UnknownClientError: The owner does not know the request's client.
-            MalformedReplyError: The reply cannot be decoded or lacks a field
-                of the wire's reply.
-            OwnerError: The owner rejected the request.
+            OwnerError: The owner rejected the request, or the reply cannot
+                be decoded or lacks a field of the wire's reply.
         """
         socket = self._local.socket
         if socket is None:
@@ -108,13 +98,12 @@ class OwnerConnection:
             reply = msgspec.msgpack.decode(payload, type=dict[str, Any])
             if reply["ok"]:
                 return reply
-            error = UnknownClientError if reply["unknown_client"] else OwnerError
             reason = reply["error"]
         except (msgspec.DecodeError, KeyError) as exc:
-            raise MalformedReplyError(
+            raise OwnerError(
                 f"the shared L2 owner's reply to {op!r} is not a reply: {exc!r}"
             ) from exc
-        raise error(f"the shared L2 owner rejected {op!r}: {reason}")
+        raise OwnerError(f"the shared L2 owner rejected {op!r}: {reason}")
 
     def close(self) -> None:
         with self._lock:

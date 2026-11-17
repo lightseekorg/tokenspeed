@@ -29,7 +29,7 @@ from ``lcm_bytes`` or else the first client's LCM block. One provider runs per
 node: until the pool is built, a node that announces again has restarted its
 provider, and the new one takes the earlier one's place. A client silent for
 ``client_timeout_s`` loses its pins and reservations, and its next request is
-answered ``unknown_client``.
+answered with an error.
 
 Requests (``wire``), by ``op``; every reply also carries ``ok``:
 
@@ -129,11 +129,7 @@ class SharedL2Owner:
                 except Exception as exc:
                     logger.exception("shared L2 owner request failed")
                     reply = msgspec.msgpack.encode(
-                        {
-                            "ok": False,
-                            "error": f"{type(exc).__name__}: {exc}",
-                            "unknown_client": False,
-                        }
+                        {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
                     )
                 self._socket.send_multipart([*envelope, reply])
             now = time.monotonic()
@@ -175,7 +171,6 @@ class SharedL2Owner:
             return {
                 "ok": False,
                 "error": f"client {client} has not joined the pool",
-                "unknown_client": True,
             }
         self._clients[client] = time.monotonic()
         pool = self._pool

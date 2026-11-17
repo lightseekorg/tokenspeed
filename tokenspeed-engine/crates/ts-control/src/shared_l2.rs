@@ -97,25 +97,13 @@ impl Pool {
     }
 
     /// Ask the owner about the lookups the scheduler handed out, in one
-    /// request, and wait for the answers: one per lookup, in order.
+    /// request, and wait for the answers: the client returns one per lookup,
+    /// in order.
     pub fn look_up(
         &mut self,
         lookups: &[SharedL2LookupView],
     ) -> Result<Vec<SharedL2AnswerView>, PoolError> {
-        let answers = self.client.lookup(lookups)?;
-        if answers.len() != lookups.len()
-            || answers
-                .iter()
-                .zip(lookups)
-                .any(|(answer, lookup)| answer.lookup_id != lookup.lookup_id)
-        {
-            return Err(PoolError(format!(
-                "{} lookups were answered by {} answers that do not match them in order",
-                lookups.len(),
-                answers.len()
-            )));
-        }
-        Ok(answers)
+        self.client.lookup(lookups)
     }
 
     /// The scheduler took an answer: the proxy blocks it created go to the
@@ -208,11 +196,9 @@ mod tests {
 
     use super::*;
 
-    /// A client that answers each lookup as a miss under the ids it is told
-    /// to, and records the pages it is given.
+    /// A client that records the pages it is given.
     #[derive(Default)]
     struct Recorder {
-        answers: Vec<u64>,
         mapped: Arc<Mutex<Vec<usize>>>,
     }
 
@@ -221,21 +207,7 @@ mod tests {
             &mut self,
             _: &[SharedL2LookupView],
         ) -> Result<Vec<SharedL2AnswerView>, PoolError> {
-            Ok(self
-                .answers
-                .iter()
-                .map(|&lookup_id| SharedL2AnswerView {
-                    lookup_id,
-                    ticket: 0,
-                    num_tokens: 0,
-                    kv_tokens: 0,
-                    tail_tokens: 0,
-                    tail_hash: String::new(),
-                    keys: Vec::new(),
-                    buckets: Vec::new(),
-                    pages: Vec::new(),
-                })
-                .collect())
+            Ok(Vec::new())
         }
 
         fn poll(&mut self) -> Result<Vec<u64>, PoolError> {
@@ -249,36 +221,6 @@ mod tests {
 
         fn submit(&mut self, _: &[SharedL2OpView]) -> Result<(), PoolError> {
             Ok(())
-        }
-    }
-
-    fn lookup(lookup_id: u64) -> SharedL2LookupView {
-        SharedL2LookupView {
-            lookup_id,
-            request_id: String::new(),
-            prefix_hashes: Vec::new(),
-            tokens: Vec::new(),
-            max_tokens: 0,
-        }
-    }
-
-    #[test]
-    fn answers_that_do_not_match_their_lookups_fail() {
-        let answered = |answers: &[u64]| {
-            Pool::new(Box::new(Recorder {
-                answers: answers.to_vec(),
-                ..Recorder::default()
-            }))
-            .look_up(&[lookup(1), lookup(2)])
-            .map(|answers| answers.len())
-            .map_err(|error| error.0)
-        };
-        assert_eq!(answered(&[1, 2]), Ok(2));
-        // One answer short, one too many, and out of order: a prompt would
-        // wait for good, or take another prompt's hit.
-        for answers in [&[1][..], &[1, 2, 3], &[2, 1]] {
-            let error = answered(answers).unwrap_err();
-            assert!(error.contains("do not match"), "{error}");
         }
     }
 

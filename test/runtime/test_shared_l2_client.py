@@ -59,7 +59,6 @@ from tokenspeed.runtime.cache.shared_l2.client import (  # noqa: E402
 from tokenspeed.runtime.cache.shared_l2.wire import (  # noqa: E402
     OwnerConnection,
     OwnerError,
-    UnknownClientError,
 )
 from tokenspeed.runtime.engine.rust_host import HostSharedL2  # noqa: E402
 
@@ -299,7 +298,7 @@ def test_a_lookup_by_a_rank_the_owner_does_not_know_raises(serve, join):
     # owner drops it.
     wait_until(lambda: owner.pool.disconnected)
 
-    with pytest.raises(UnknownClientError, match="has not joined the pool"):
+    with pytest.raises(OwnerError, match="has not joined the pool"):
         look_up(rank, 10, PROMPT)
 
 

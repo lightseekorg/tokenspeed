@@ -59,7 +59,6 @@ from tokenspeed.runtime.cache.shared_l2.provider import run_provider  # noqa: E4
 from tokenspeed.runtime.cache.shared_l2.wire import (  # noqa: E402
     OwnerConnection,
     OwnerError,
-    UnknownClientError,
 )
 from tokenspeed.runtime.cache.transfer.layout import (  # noqa: E402
     CacheField,
@@ -133,7 +132,7 @@ def test_a_hello_is_not_ready_until_every_provider_joined(serve):
         "ready": False,
     }
     # It has not joined either: nothing is kept for it.
-    with pytest.raises(UnknownClientError):
+    with pytest.raises(OwnerError, match="has not joined the pool"):
         owner.admin.request("ping", client=1)
 
     owner.add_provider("node1", 4)
@@ -174,7 +173,7 @@ def test_the_first_client_sets_the_geometry_and_deployment_later_ones_match(
             geometry={**GEOMETRY, "lcm_bytes": 128},
             deployment_id=deployment_id(),
         )
-    with pytest.raises(UnknownClientError):
+    with pytest.raises(OwnerError, match="has not joined the pool"):
         owner.admin.request("ping", client=3)
     assert owner.admin.request("stats")["clients"] == 2
 
@@ -263,7 +262,7 @@ def test_a_provider_smaller_than_a_block_stops_the_pool_from_being_built(serve):
     assert owner.pools == []
     with pytest.raises(OwnerError, match="pool is not ready"):
         owner.admin.request("stats")
-    with pytest.raises(UnknownClientError):
+    with pytest.raises(OwnerError, match="has not joined the pool"):
         owner.admin.request("ping", client=1)
 
 
@@ -364,7 +363,7 @@ def test_a_silent_client_loses_what_it_held_and_is_told_so(serve, connect):
     stats = owner.stats()
     assert (stats["pinned_blocks"], stats["reserved_blocks"]) == (0, 0)
     # Its next request tells it; the client that kept talking is still in.
-    with pytest.raises(UnknownClientError):
+    with pytest.raises(OwnerError, match="has not joined the pool"):
         silent.request("release", client=1, ticket=1)
     assert alive.request("ping", client=2) == {"ok": True}
     assert owner.admin.request("stats")["clients"] == 1
@@ -473,33 +472,6 @@ def test_a_provider_registers_its_memory_and_joins_the_pool(serve, monkeypatch):
         stop.set()
         provider.join()
     assert Engine.registered == {}
-
-
-@pytest.mark.parametrize(
-    "setting", ["--providers=0", "--headroom-lcm-blocks=-1", "--client-timeout-s=0"]
-)
-def test_the_owner_does_not_start_with_settings_no_pool_is_built_from(setting):
-    started = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "tokenspeed.runtime.cache.shared_l2",
-            "owner",
-            f"--address=tcp://127.0.0.1:{get_free_port()}",
-            "--providers=1",
-            "--headroom-lcm-blocks=0",
-            "--client-timeout-s=60",
-            "--checkpoint-retention-requests=0",
-            "--checkpoint-retention-leaf-distance=0",
-            # The last one named counts.
-            setting,
-        ],
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert started.returncode == 2
-    assert "the owner needs --providers of at least 1" in started.stderr
 
 
 @pytest.mark.parametrize("block_size", [[f"--lcm-bytes={LCM_BYTES}"], []])

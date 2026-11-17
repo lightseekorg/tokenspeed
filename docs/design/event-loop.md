@@ -926,8 +926,8 @@ rank.
   wait for a request), so it reads a failed ping within about that time.
 * *Failures.* Every failure of the pool is a loop error and stops the
   engine, as a failed load-back does: a lookup request the owner did not
-  answer in time or answered with an error, answers that do not match the
-  lookups one to one, an answer the scheduler cannot apply, a write that
+  answer in time or answered with an error, a reply without one hit for
+  each lookup, an answer the scheduler cannot apply, a write that
   failed at its reservation, its copy or its commit, a release or a touch
   the owner refused, a ping the owner did not answer, an owner that does not
   know the rank. A miss is only an answer in which the owner names no page
@@ -963,15 +963,10 @@ rank.
   ([scheduler](scheduler.md) §1.4). A plan that carries pool commands only
   is not handed to the data plane.
 
-Known limit: a rank process that is frozen for longer than the owner's client
-timeout loses its pins and reservations at the owner. After it resumes, and
-until its next poll or request to the owner fails and stops it, a load may
-read pool pages that now hold another rank's blocks, and a write that was in
-progress may finish into pages the owner has since given to another rank.
-That rank's entry then serves wrong KV to every rank that hits it, until it
-is evicted. No code guards against this: keep the owner's
-`--client-timeout-s` well above any pause a rank process can take, and clear
-the pool at its owner (`clear`) after a rank was frozen for that long.
+Known limit: nothing guards a rank process that was frozen for longer than
+the owner's client timeout; the
+[server configuration](../configuration/server.md#shared-l2-pool) says what
+it can read and write after it resumes, and what an operator does about it.
 
 Without a pool the loop makes none of these calls.
 

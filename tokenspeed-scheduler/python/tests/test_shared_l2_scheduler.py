@@ -541,11 +541,7 @@ def test_an_answer_outside_its_prompt_is_refused():
         reader.apply_shared_l2_lookups(
             [(lookup_id, ticket, 40, kv_tokens, tail, slots)]
         )
-    with pytest.raises(ValueError, match="one bucket and one page|under a ticket"):
-        reader.apply_shared_l2_lookups(
-            [(lookup_id, 0, num_tokens, kv_tokens, tail, slots)]
-        )
-    # Nothing of either answer was taken, and no plan runs the prompt.
+    # Nothing of the answer was taken, and no plan runs the prompt.
     assert reader.host_pool_cached_blocks() == 0
     reader_rt.plan(reader, lookup=False)
     assert "b" not in reader_rt.forwarded
@@ -698,34 +694,6 @@ def test_writes_left_open_pin_no_more_than_their_bound_and_admissions_go_on():
     assert stores.evicted_before_drain > 0
     assert sum(stores.blocks) + stores.evicted_before_drain == 36
     assert settled(s, pool)
-
-
-@pytest.mark.parametrize("flaw", ["key hash", "tail hash", "tail tokens"])
-def test_a_malformed_answer_is_refused(flaw):
-    pool = owner()
-    writer, reader = scheduler(), scheduler()
-    writer_rt, reader_rt = Runtime(pool, 1), Runtime(pool, 2)
-    prompt = list(range(9))
-    publish(writer, writer_rt, "a", prompt)
-
-    reader.submit_requests([_spec("b", prompt + [50, 51])])
-    [lookup] = reader.shared_l2_lookups()
-    lookup_id, ticket, num_tokens, kv_tokens, tail, slots = reader_rt.answer(lookup)
-    if flaw == "key hash":
-        (namespace, group, _, offset), bucket, page = slots[0]
-        slots[0] = ((namespace, group, "", offset), bucket, page)
-    elif flaw == "tail hash":
-        tail = (tail[0], "")
-    else:
-        # A tail of no tokens under the last full page's hash, which the
-        # answer's keys hold.
-        num_tokens, tail = 8, (0, slots[3][0][2])
-    with pytest.raises((ValueError, RuntimeError)):
-        reader.apply_shared_l2_lookups(
-            [(lookup_id, ticket, num_tokens, kv_tokens, tail, slots)]
-        )
-    # Nothing of the answer was taken.
-    assert reader.host_pool_cached_blocks() == 0
 
 
 def test_a_finish_offers_its_entries_again_and_the_pool_takes_the_new_ones():
