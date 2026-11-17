@@ -40,7 +40,7 @@ namespace tokenspeed {
 struct PeerConfig {
     // The name other replicas address this one by, as the router's holder
     // hint carries it. A lease names its reader by it.
-    std::string self;
+    std::string name;
     // Holder: leases held at once. A lookup past it is answered with a miss.
     std::int32_t max_leases;
     // Holder: how long a soft pin (a lookup's) and a hard pin last.
@@ -86,7 +86,7 @@ inline constexpr std::int32_t kPeerStateSlot = 1;
 // Reader -> holder: a waiting prompt's question, sent once.
 struct PeerLookupRequest {
     PeerLeaseId lease;
-    // The holder's name (PeerConfig::self there).
+    // The holder's name (PeerConfig::name there).
     std::string holder;
     // The chain hashes of the prompt's full pages below max_tokens, and its
     // tokens up to max_tokens, from which the holder hashes tails.

@@ -50,7 +50,7 @@ bool WellFormed(const cache::PeerLookup& lookup, std::int32_t prefix_granularity
 }  // namespace
 
 void PeerConfig::Validate() const {
-    if (self.empty() || max_leases <= 0 || soft_pin_us <= 0 || hard_pin_us <= 0 || lookup_timeout_us <= 0 ||
+    if (name.empty() || max_leases <= 0 || soft_pin_us <= 0 || hard_pin_us <= 0 || lookup_timeout_us <= 0 ||
         min_fetch_tokens <= 0) {
         throw std::invalid_argument("peer sharing needs a name, and positive lease limits, lifetimes and minimum");
     }
@@ -71,20 +71,20 @@ PeerAnswer PeerExports::Lookup(CacheCoordinator& coordinator, const cache::PeerL
     if (static_cast<std::int64_t>(leases_.size()) >= max_leases_) {
         return answer;
     }
-    CacheCoordinator::PrefixExport exported =
-        coordinator.ExportPrefix(coordinator.Prober().ProbePromptPrefix(Prompt(lookup.prefix_hashes, lookup.tokens,
-                                                                      lookup.max_tokens)));
+    CacheCoordinator::PrefixExport exported = coordinator.ExportPrefix(
+        coordinator.Prober().ProbePromptPrefix(Prompt(lookup.prefix_hashes, lookup.tokens, lookup.max_tokens)));
     if (exported.num_tokens == 0) {
         return answer;
     }
     const auto boundary = static_cast<std::size_t>(exported.num_tokens);
     const auto full_pages = boundary / static_cast<std::size_t>(coordinator.PrefixGranularity());
-    leases_.emplace(lookup.lease,
-                    Lease{.deadline_us = Deadline(now_us, soft_pin_us_),
-                          .prefix_hashes = {lookup.prefix_hashes.begin(),
-                                            lookup.prefix_hashes.begin() + static_cast<std::ptrdiff_t>(full_pages)},
-                          .tokens = {lookup.tokens.begin(), lookup.tokens.begin() + static_cast<std::ptrdiff_t>(boundary)},
-                          .num_tokens = exported.num_tokens});
+    leases_.emplace(
+        lookup.lease,
+        Lease{.deadline_us = Deadline(now_us, soft_pin_us_),
+              .prefix_hashes = {lookup.prefix_hashes.begin(),
+                                lookup.prefix_hashes.begin() + static_cast<std::ptrdiff_t>(full_pages)},
+              .tokens = {lookup.tokens.begin(), lookup.tokens.begin() + static_cast<std::ptrdiff_t>(boundary)},
+              .num_tokens = exported.num_tokens});
     // The exported blocks go here: the lookup only refreshed their entries.
     answer.num_tokens = exported.num_tokens;
     return answer;

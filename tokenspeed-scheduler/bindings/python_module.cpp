@@ -234,6 +234,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("session_id", &tokenspeed::RequestSpec::session_id)
         .def_rw("cache_group_id", &tokenspeed::RequestSpec::cache_group_id)
         .def_rw("shared_prefix_tokens", &tokenspeed::RequestSpec::shared_prefix_tokens)
+        .def_rw("peer_holder", &tokenspeed::RequestSpec::peer_holder)
         .def_rw("tokens", &tokenspeed::RequestSpec::tokens)
         .def_rw("max_new_tokens", &tokenspeed::RequestSpec::max_new_tokens)
         .def_rw("max_cached_prefix_tokens", &tokenspeed::RequestSpec::max_cached_prefix_tokens);
@@ -282,6 +283,17 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("pressure_high", &tokenspeed::StorageConfig::pressure_high)
         .def_ro("pressure_low", &tokenspeed::StorageConfig::pressure_low);
     scheduler_config.def_rw("storage_config", &tokenspeed::SchedulerConfig::storage_config);
+    nb::class_<tokenspeed::PeerConfig>(m, "PeerConfig")
+        .def(nb::init<std::string, std::int32_t, std::int64_t, std::int64_t, std::int64_t, std::int32_t>(),
+             nb::arg("name"), nb::arg("max_leases"), nb::arg("soft_pin_us"), nb::arg("hard_pin_us"),
+             nb::arg("lookup_timeout_us"), nb::arg("min_fetch_tokens"))
+        .def_ro("name", &tokenspeed::PeerConfig::name)
+        .def_ro("max_leases", &tokenspeed::PeerConfig::max_leases)
+        .def_ro("soft_pin_us", &tokenspeed::PeerConfig::soft_pin_us)
+        .def_ro("hard_pin_us", &tokenspeed::PeerConfig::hard_pin_us)
+        .def_ro("lookup_timeout_us", &tokenspeed::PeerConfig::lookup_timeout_us)
+        .def_ro("min_fetch_tokens", &tokenspeed::PeerConfig::min_fetch_tokens);
+    scheduler_config.def_rw("peer_config", &tokenspeed::SchedulerConfig::peer_config);
     nb::enum_<tokenspeed::StorageKind>(m, "StorageKind")
         .value("Query", tokenspeed::StorageKind::kQuery)
         .value("Get", tokenspeed::StorageKind::kGet)

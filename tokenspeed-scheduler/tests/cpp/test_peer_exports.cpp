@@ -41,7 +41,7 @@ constexpr std::uint32_t kFull = 0;
 constexpr std::uint32_t kState = 1;
 
 PeerConfig Config() {
-    return PeerConfig{.self = "holder",
+    return PeerConfig{.name = "holder",
                       .max_leases = 2,
                       .soft_pin_us = 100,
                       .hard_pin_us = 1000,
@@ -143,15 +143,16 @@ TEST_F(PeerExportsTest, ALookupAnswersTheBoundaryAndAPinExportsItsBlocksAtTheirS
 
     const PeerAnswer pinned = exports_.Pin(coordinator_, cache::PeerPin{.lease = looked_up.lease}, /*now_us=*/10);
     EXPECT_EQ(pinned.num_tokens, 2 * kP);
-    EXPECT_EQ(pinned.pages,
-              (std::vector<PeerPage>{
-                  {.group_id = kFull, .slot = 0, .tier = CacheTier::kDevice, .block_id = DeviceBlockId(kFull, hashes[0])},
-                  {.group_id = kFull, .slot = 1, .tier = CacheTier::kDevice, .block_id = DeviceBlockId(kFull, hashes[1])},
-                  {.group_id = kState,
-                   .slot = kPeerStateSlot,
-                   .tier = CacheTier::kDevice,
-                   .block_id = DeviceBlockId(kState, hashes[1])},
-              }));
+    EXPECT_EQ(
+        pinned.pages,
+        (std::vector<PeerPage>{
+            {.group_id = kFull, .slot = 0, .tier = CacheTier::kDevice, .block_id = DeviceBlockId(kFull, hashes[0])},
+            {.group_id = kFull, .slot = 1, .tier = CacheTier::kDevice, .block_id = DeviceBlockId(kFull, hashes[1])},
+            {.group_id = kState,
+             .slot = kPeerStateSlot,
+             .tier = CacheTier::kDevice,
+             .block_id = DeviceBlockId(kState, hashes[1])},
+        }));
     EXPECT_EQ(exports_.NumPinnedBlocks(), 3u);
     EXPECT_FALSE(coordinator_.ClearCache()) << "the pin holds the blocks";
 
@@ -347,7 +348,7 @@ TEST(PeerExportsHostTest, AHostSuffixIsExportedAfterTheDevicesHits) {
 TEST(PeerConfigTest, EveryLimitMustBePositiveAndTheNameSet) {
     EXPECT_NO_THROW(Config().Validate());
     PeerConfig unnamed = Config();
-    unnamed.self.clear();
+    unnamed.name.clear();
     EXPECT_THROW(unnamed.Validate(), std::invalid_argument);
     PeerConfig no_leases = Config();
     no_leases.max_leases = 0;

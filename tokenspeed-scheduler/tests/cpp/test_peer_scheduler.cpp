@@ -39,7 +39,7 @@ constexpr std::int64_t kLookupTimeoutUs = 100;
 
 // One full-history group, and with `hybrid` a sliding window and a State
 // group too.
-SchedulerConfig PeerConfigFor(const std::string& self, bool hybrid = false) {
+SchedulerConfig PeerConfigFor(const std::string& name, bool hybrid = false) {
     SchedulerConfig cfg{};
     cfg.prefix_granularity = kP;
     cfg.device_allocator.total_pages = 32;
@@ -69,7 +69,7 @@ SchedulerConfig PeerConfigFor(const std::string& self, bool hybrid = false) {
             .attn_kind = AttnKind::kState,
         });
     }
-    cfg.peer_config = PeerConfig{.self = self,
+    cfg.peer_config = PeerConfig{.name = name,
                                  .max_leases = 8,
                                  .soft_pin_us = 1000,
                                  .hard_pin_us = 1000,
@@ -143,9 +143,12 @@ protected:
         EXPECT_EQ(pinned.kind, PeerAnswerKind::kPin);
         // Every destination has a holder page at its slot.
         for (const PeerPage& destination : fetch.destinations) {
-            EXPECT_TRUE(std::ranges::any_of(pinned.pages, [&](const PeerPage& page) {
-                return page.group_id == destination.group_id && page.slot == destination.slot;
-            })) << "slot " << destination.slot;
+            EXPECT_TRUE(std::ranges::any_of(pinned.pages,
+                                            [&](const PeerPage& page) {
+                                                return page.group_id == destination.group_id &&
+                                                       page.slot == destination.slot;
+                                            }))
+                << "slot " << destination.slot;
         }
         Send(holder_, cache::PeerRelease{.lease = fetch.lease, .demote = read_succeeds});
         answers = holder_.TakePeerAnswers();
@@ -185,7 +188,8 @@ TEST_P(PeerSchedulerTest, AReaderLandsTheHoldersPrefixAndComputesTheRest) {
     EXPECT_EQ(fetch.begin_tokens, 0);
     EXPECT_EQ(fetch.end_tokens, static_cast<std::int32_t>(tokens.size()));
     const auto destinations_of = [&](std::uint32_t group) {
-        return std::ranges::count_if(fetch.destinations, [group](const PeerPage& page) { return page.group_id == group; });
+        return std::ranges::count_if(fetch.destinations,
+                                     [group](const PeerPage& page) { return page.group_id == group; });
     };
     EXPECT_EQ(destinations_of(0), static_cast<std::ptrdiff_t>(tokens.size() / kP)) << "every full page";
     if (GetParam()) {
@@ -199,8 +203,7 @@ TEST_P(PeerSchedulerTest, AReaderLandsTheHoldersPrefixAndComputesTheRest) {
     EXPECT_TRUE(PrefillRows(Plan(reader_)).empty()) << "nothing reads a landing's pages";
 
     EXPECT_EQ(Fetch(fetch, /*read_succeeds=*/true), fetch.end_tokens);
-    EXPECT_EQ(PrefillRows(Plan(reader_)),
-              (std::vector<std::pair<std::string, std::int32_t>>{{"r", fetch.end_tokens}}));
+    EXPECT_EQ(PrefillRows(Plan(reader_)), (std::vector<std::pair<std::string, std::int32_t>>{{"r", fetch.end_tokens}}));
     EXPECT_EQ(reader_.GetPeerStats().landed_tokens, static_cast<std::uint64_t>(fetch.end_tokens));
     EXPECT_EQ(holder_.GetPeerStats().leases, 0u);
 }
@@ -225,9 +228,10 @@ TEST_P(PeerSchedulerTest, AShortLandingIsAdmittedAgainFromTheLocalHit) {
 }
 
 TEST_P(PeerSchedulerTest, AMissOrAnUnansweredLookupIsAdmittedLocally) {
-    reader_.SubmitRequests({RequestSpec{.request_id = "miss", .peer_holder = "holder", .tokens = MakeAlignedTokens(4, kP)},
-                            RequestSpec{.request_id = "late",
-                                        .peer_holder = "holder", .tokens = MakeAlignedTokens(4, kP, /*start=*/500)}});
+    reader_.SubmitRequests(
+        {RequestSpec{.request_id = "miss", .peer_holder = "holder", .tokens = MakeAlignedTokens(4, kP)},
+         RequestSpec{
+             .request_id = "late", .peer_holder = "holder", .tokens = MakeAlignedTokens(4, kP, /*start=*/500)}});
     Send(reader_, cache::PeerTick{.now_us = 0});
     Plan(reader_);
     const std::vector<PeerLookupRequest> lookups = reader_.TakePeerLookups();
@@ -243,11 +247,11 @@ TEST_P(PeerSchedulerTest, AMissOrAnUnansweredLookupIsAdmittedLocally) {
 }
 
 TEST_P(PeerSchedulerTest, NoLookupWithoutAHintOrForTooShortAGain) {
-    reader_.SubmitRequests({RequestSpec{.request_id = "plain", .tokens = MakeAlignedTokens(4, kP)},
-                            RequestSpec{.request_id = "self",
-                                        .peer_holder = "reader", .tokens = MakeAlignedTokens(4, kP, 200)},
-                            // Less than a page before the replay tail: nothing worth a fetch.
-                            RequestSpec{.request_id = "short", .peer_holder = "holder", .tokens = {1, 2}}});
+    reader_.SubmitRequests(
+        {RequestSpec{.request_id = "plain", .tokens = MakeAlignedTokens(4, kP)},
+         RequestSpec{.request_id = "self", .peer_holder = "reader", .tokens = MakeAlignedTokens(4, kP, 200)},
+         // Less than a page before the replay tail: nothing worth a fetch.
+         RequestSpec{.request_id = "short", .peer_holder = "holder", .tokens = {1, 2}}});
     EXPECT_EQ(PrefillRows(Plan(reader_)).size(), 3u);
     EXPECT_TRUE(reader_.TakePeerLookups().empty());
 }
@@ -278,10 +282,8 @@ TEST_P(PeerSchedulerTest, AHolderAnswersFromItsOwnCacheAndHoldsAPinUntilTheRelea
     HolderComputes(tokens);
     const std::vector<std::int32_t> prefix(tokens.begin(), tokens.end() - 1);
     Send(holder_, cache::PeerTick{.now_us = 0});
-    Send(holder_, cache::PeerLookup{.lease = {.reader = "x", .id = 1},
-                                    .prefix_hashes = {},
-                                    .tokens = {},
-                                    .max_tokens = 0});
+    Send(holder_,
+         cache::PeerLookup{.lease = {.reader = "x", .id = 1}, .prefix_hashes = {}, .tokens = {}, .max_tokens = 0});
     std::vector<PeerAnswer> answers = holder_.TakePeerAnswers();
     ASSERT_EQ(answers.size(), 1u);
     EXPECT_EQ(answers.front().num_tokens, 0) << "a malformed lookup is a miss";

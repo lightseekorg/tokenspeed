@@ -135,7 +135,7 @@ void Scheduler::preparePeer(Request& request) {
     submitted->admission.peer_prepared = true;
     const PeerConfig& limits = *config_.peer_config;
     const std::string& holder = request.PeerHolder();
-    if (holder.empty() || holder == limits.self) {
+    if (holder.empty() || holder == limits.name) {
         return;
     }
     const std::int32_t grain = config_.prefix_granularity;
@@ -150,7 +150,7 @@ void Scheduler::preparePeer(Request& request) {
     if (max_tokens - local < limits.min_fetch_tokens) {
         return;
     }
-    PeerLeaseId lease{.reader = limits.self, .id = ++next_peer_lease_};
+    PeerLeaseId lease{.reader = limits.name, .id = ++next_peer_lease_};
     peer_lookups_.push_back(PeerLookupRequest{.lease = lease,
                                               .holder = holder,
                                               .prefix_hashes = {hashes.begin(), hashes.end()},
@@ -167,9 +167,9 @@ void Scheduler::schedulePeerLandings(AdmissionFeedback& feedback, PlanBuild& bui
         return;
     }
     ProfileSpan profile_span{"Scheduler::schedulePeerLandings"};
-    const std::int64_t kv_token_limit = config_.max_kv_page_num == 0
-                                            ? std::numeric_limits<std::int64_t>::max()
-                                            : static_cast<std::int64_t>(build.kv_page_budget) * config_.prefix_granularity;
+    const std::int64_t kv_token_limit =
+        config_.max_kv_page_num == 0 ? std::numeric_limits<std::int64_t>::max()
+                                     : static_cast<std::int64_t>(build.kv_page_budget) * config_.prefix_granularity;
     for (Request* request : candidates) {
         if (req_pool_allocator_.AvailableSlots() == 0 || lone_requests_.ActedInPlan()) {
             return;

@@ -36,7 +36,7 @@ struct RequestSpec {
     // Remote checkpoint discovery only; content is always rehashed locally.
     std::vector<std::int32_t> shared_prefix_tokens;
     // The replica the router expects to hold this prompt's prefix
-    // (PeerConfig::self there); empty for none. A hint: the holder confirms.
+    // (PeerConfig::name there); empty for none. A hint: the holder confirms.
     std::string peer_holder;
     std::vector<std::int32_t> tokens;
     std::int32_t max_new_tokens{0};
