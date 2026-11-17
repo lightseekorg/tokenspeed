@@ -118,7 +118,7 @@ and restore admissions keep their existing paths.
 
 **What the probe may claim.** Before the first chunk, `matchPrefixAtAdmission`
 probes the prefix cache for the prompt's leading pages and for a published
-tail inside the page after them (`CacheCoordinator::ProbePromptPrefix`, see
+tail inside the page after them (`PrefixProber::ProbePromptPrefix`, see
 [cache-concepts](cache-concepts.md#the-coordinator-layer-csrccachecoordinator)):
 the hit boundary `T` is a token count, and `extend_prefix_lens` carries it
 as is. The probe is bounded
@@ -823,10 +823,20 @@ evicts by whole segments, and a segment holding a block in use cannot leave
 — the request's own blocks included, such as the pages under the checkpoint
 it resumed from. So once whole segments cannot fund the admission of a
 request no other one holds pages beside, the blocks they passed over leave
-one by one (`cache-concepts.md`, `AdmissionPlanner`): alone, there is no
-release left to wait for. Only the admission's last variant takes them: an
-optional part of it — an in-forward checkpoint's block (§1.2) — is dropped
-first and never pays for such an eviction. Beside
+one by one (`LoneRequestAdmission::Admit`; `cache-concepts.md`,
+`AdmissionPlanner`): alone, there is no release left to wait for. Only the
+admission's last variant takes them: an optional part of it — an in-forward
+checkpoint's block (§1.2) — is dropped first and never pays for such an
+eviction, and neither does the optional retained input checkpoint: the
+ordinary admission lets it go and tries again first. Lone requests are kept
+out of the ordinary path. It calls the plain `Admit` and `Restore`, and hands
+over to `LoneRequestRecovery` (`scheduler/lone_request_recovery.h`) through one
+entry per kind (`AdmitFirstChunk`, `AdmitStep`, `Restore`) at the point
+its last attempt fails, not later in the build: an admission in between would
+leave the request no longer alone. A failed admission changes nothing, and
+`LoneRequestAdmission::Admit` plans as `Admit` does up to the block-by-block pass, so
+trying `Admit` first changes no outcome. The one trace lone requests leave on
+the ordinary path is the plan mark below (`ActedInPlan`). Beside
 another page holder no block leaves one by one: the request waits for that
 holder's release (on the P role, until its PD transfer is acknowledged),
 where write-through, which evicts block by block, could fund it at once.
@@ -856,9 +866,10 @@ pages beside its blocks frees holes for that group alone, never a parent for
 another. Nothing else moves a block, and a lone blocker is never retracted
 (§2). So when the block-by-block pass leaves the step unfunded, the request's
 own blocks are what stands in the way, and the last means is **lone-request
-compaction** (`CacheCoordinator::CompactLoneRequest`; from
-`admitWithKvEventTracking` after the retained-checkpoint retry, so for every
-later chunk and decode, and from the first admission): the request's blocks of
+compaction** (`LoneRequestAdmission::Compact`; from
+`LoneRequestRecovery::AdmitStep` after the retained-checkpoint retry, so for
+every later chunk and decode, and from `AdmitFirstChunk` at the first
+admission): the request's blocks of
 every packed, token-spanned group — at a first admission, the Device pages and
 tail blocks its prefix hit takes — are gathered into fewer parents, the
 parents they leave return to the empty FIFO, and the admission is retried once
@@ -920,7 +931,7 @@ each State group's prompt-end checkpoint too), is held through the
 compaction, and the retry still finds it. The cache in the vacated parents is
 left to the retry's own eviction, which can now take whole parents. A group's
 parents never increase, at most one compaction runs per plan, and each is
-counted by the coordinator (`HostCacheStats::lone_compactions`,
+counted by `LoneRequestAdmission` (`HostCacheStats::lone_compactions`,
 `lone_compaction_moves`) and logged. The plan a compaction ran in admits
 nothing more in its prefill phases, on any role (a chunk that gives way, §1.1,
 carries no whole prompt in it), and its capacity retraction takes no request
@@ -1180,7 +1191,7 @@ the image as the split planned:
 The split plans the L2 leg before anything is acquired or evicted for it. The
 slots to copy are grouped by boundary (a content hash, with every group's slot
 at it), the shallowest first, and the Host takes the leading boundaries that
-fit whole (`CacheCoordinator::NumHostBoundariesThatFit`, using the shared
+fit whole (`HostCache::NumHostBoundariesThatFit`, using the shared
 eviction planner). All rows fit jointly against shadow capacity before any
 placement is committed; the retraction (`AcquireHostBoundaries`) evicts exactly the planned
 victims and places exactly those rows. The first boundary the Host cannot take
@@ -1569,7 +1580,7 @@ claimed by an extend forward, and the capacity model charges no prefill peak
 (§1.4).
 
 **What the D probe may claim.** The remote admission probes this node's own
-Device cache (`CacheCoordinator::ProbeDecodeDevicePrefix`) so the peer
+Device cache (`PrefixProber::ProbeDecodeDevicePrefix`) so the peer
 transfers only what is missing. For the token-spanned groups it is the
 ordinary probe: `extend_prefix_lens` is the hit `T`, page-aligned or a
 published tail, and the block containing an unaligned `T` is left a hole for
@@ -1774,9 +1785,10 @@ pages:
   key since — and protected from the planner's eviction like a prefix hit).
   Every other slot becomes one row of a single
   `SnapshotRestoreOperation`, tagged with its source tier (`HostTier::kL2`
-  rows carry their key, `kSnapshotPool` rows none). Under segment eviction,
-  or when no other request holds pages (§1.4), a restore whose claims leave
-  no plan plans again claiming nothing, so every slot is a row
+  rows carry their key, `kSnapshotPool` rows none). Under segment eviction
+  (`Restore`), or when no other request holds pages (`LoneRequestAdmission::Restore`,
+  §1.4), a restore whose claims leave no plan plans again claiming nothing,
+  so every slot is a row
   (`cache-concepts.md`, `AdmissionPlanner`). A copy fills its
   destination block whole, so — as for a Host hit's load-back — only the
   reserve pages appended beyond the imaged shape are listed in
@@ -2032,7 +2044,7 @@ must use matching contracts; releases follow the sequence in AGENTS.md.
   Every source is read as it was when the plan was built. A copy destination
   is never zeroed: the zero would wipe the copy. A copy recorded after one
   that writes its source reads that copy's source instead
-  (`Scheduler::recordAdmittedPages`, which asserts as it records that no
+  (`RecordAdmittedPages`, which asserts as it records that no
   destination is zeroed or written twice), and one composed back onto its
   own source is dropped, so no copy reads a block an earlier copy of the
   plan writes and each destination is written once;

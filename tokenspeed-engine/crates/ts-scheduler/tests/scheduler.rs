@@ -364,7 +364,7 @@ fn a_recording_sees_the_schedulers_phases_inside_its_calls() {
         "Scheduler::scheduleLocalPrefillWork",
         "Scheduler::schedulePrefillFirstChunk",
         "Scheduler::matchPrefixAtAdmission",
-        "CacheCoordinator::ProbePromptPrefix",
+        "PrefixProber::ProbePromptPrefix",
         "CacheCoordinator::Admit",
         "planAdmission",
         "AdmissionPlanner::fitWithEviction",

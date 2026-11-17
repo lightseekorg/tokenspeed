@@ -76,6 +76,17 @@ disaggregation or not, speculation or not, CUDA graph or not, overlap or not:
 these are parameters of the same path, never a second path. Make the general
 path cover the case instead of adding a mode-specific branch.
 
+Rare recovery paths, the code that runs only when the ordinary path fails or
+meets a corner case, matter as much as the ordinary path, but keep them
+isolated from it. The ordinary path should read as if they did not exist: it
+hands over at the point where it fails, through one entry, instead of
+threading flags, parameters or mode checks for the rare case through its
+functions. Put recovery logic in its own functions or files, and give an API
+a separate entry for the recovery behavior rather than a boolean on the
+ordinary one. Every switch a rare case adds to the main logic costs each
+reader of it. Where one cannot be avoided, keep it to a single named
+predicate whose comment points to the recovery code.
+
 When attention needs new per-request state, first ask whether the LCM cache
 subsystem and the C++ scheduler can own it — as a cache group with its own
 block granularity, allocated, prefix-matched, transferred, and freed with the

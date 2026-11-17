@@ -53,9 +53,7 @@ public:
     // The registration of its group/session owner under the access epoch that
     // its first admission returned: held for the request's whole life, which
     // every later admission, publication and restore under that epoch lies in.
-    void HoldSessionAccess(CacheCoordinator::SessionAccess session_access) {
-        session_access_ = std::move(session_access);
-    }
+    void HoldSessionAccess(SessionAccess session_access) { session_access_ = std::move(session_access); }
 
     // Decode headroom an admission must secure before the prefill starts:
     // one safe-step window up front, plus one more per retraction suffered
@@ -376,7 +374,7 @@ private:
     std::string session_id_;
     std::string cache_group_id_;
     std::vector<std::int32_t> shared_prefix_tokens_;
-    CacheCoordinator::SessionAccess session_access_;
+    SessionAccess session_access_;
     TokenContainer token_container_;
     std::int32_t submitted_prompt_size_{0};
     std::int32_t max_new_tokens_{0};

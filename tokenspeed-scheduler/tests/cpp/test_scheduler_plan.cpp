@@ -599,8 +599,8 @@ TEST(KvCacheEventStatusTest, HistoryCountsMatchPerKeyResidencyAcrossTiersAndShar
         remove(state);
         remove(swa);
         check();  // Complete history remains publishable without auxiliary state.
-        EXPECT_EQ(coordinator.DeviceBoundaryResidency(boundary, tail_tokens),
-                  CacheCoordinator::BoundaryResidency::kPartial);
+        EXPECT_EQ(coordinator.Store().DeviceBoundaryResidency(boundary, tail_tokens),
+                  CacheStore::BoundaryResidency::kPartial);
         store(device, state);
         store(device, swa);
         // Removing any sub-block of either sharded Full group withdraws the
