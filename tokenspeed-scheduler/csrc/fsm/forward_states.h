@@ -55,7 +55,7 @@ struct CacheProgress {
     // so the next prompt resumes at the junction. Zero once passed or absent.
     std::int32_t junction_tokens{0};
     // The tail checkpoint the request resumed from on the Device
-    // (CacheCoordinator::AdmissionResult::resumed_tail_hash). The finish that
+    // (AdmissionResult::resumed_tail_hash). The finish that
     // publishes the end state marks it superseded.
     std::optional<std::string> resumed_tail_hash;
     // The in-forward State checkpoint a scheduled forward writes
@@ -156,7 +156,7 @@ struct ForwardResources {
     std::vector<BlockTable> block_tables;
     // Per cache group, the copy-in blocks the request holds for its prompt
     // end, which its first decode publishes and keeps writing past: aligned
-    // to CacheCoordinator::CopyInSlots, each reserved by the admission that
+    // to CacheStore::CopyInSlots, each reserved by the admission that
     // allocated the block of its slot, null until then. The first decode
     // spends them (CacheCoordinator::Admit); they go with the tables, so a
     // retraction releases them and a restore reserves them again. Empty
