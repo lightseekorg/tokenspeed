@@ -91,8 +91,9 @@ def test_mha_preserves_target_and_block_draft_geometry(draft, heads, name, solut
     [
         # Every row of a non-causal block reads up to the block end.
         (False, [10, 10, 10, 10, 7, 7, 7, 7]),
-        # Row i of a causal block reads up to its own position.
-        (True, [7, 8, 9, 10, 4, 5, 6, 7]),
+        # A causal block keeps one block-end entry per request; its rows
+        # decode as packed causal query rows.
+        (True, [10, 7]),
     ],
 )
 def test_block_draft_seq_lens_follow_block_causality(causal, expected):
@@ -122,7 +123,8 @@ def test_block_draft_seq_lens_follow_block_causality(causal, expected):
     )
     backend.init_cuda_graph_state(4)
     backend.fill_block_decode_seq_lens(2, torch.tensor([10, 7], dtype=torch.int32))
-    assert backend.seq_lens_buf[:8].tolist() == expected
+    assert backend.block_decode_expansion == len(expected) // 2
+    assert backend.seq_lens_buf[: len(expected)].tolist() == expected
 
 
 if __name__ == "__main__":
