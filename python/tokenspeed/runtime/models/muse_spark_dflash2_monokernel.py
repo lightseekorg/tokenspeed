@@ -22,8 +22,8 @@
 
 With ``--decode-monokernel``, the draft model builds its layers from
 ``DFlash2MonokernelDecoderLayer`` (:class:`DFlash2MonokernelLayer` before
-the regular layer class), and a draft block forward of one request runs each
-of the draft's layers as one launch of
+the regular layer class), and a draft block forward of one or two requests
+runs each of the draft's layers as one launch of
 ``tokenspeed_kernel.ops.model.muse_spark.monokernel.muse_spark_draft_layer_decode``
 on every rank of the TP8 group (``docs/design/monokernel.md``):
 
@@ -36,7 +36,7 @@ on every rank of the TP8 group (``docs/design/monokernel.md``):
 * the model's ``run_decoder`` calls ``start_step()`` before the layers and
   takes the final norm's output, which the last launch writes, from
   ``finish_step()``;
-* after a verify of one request, the drafter runs
+* after a verify of one or two requests, the drafter runs
   :meth:`DFlash2MonokernelState.write_context` in place of its context write
   (``fc`` and ``hidden_norm`` of the target's taps, then every layer's K and
   V of the verify rows into the draft cache);
@@ -50,7 +50,7 @@ on every rank of the TP8 group (``docs/design/monokernel.md``):
 * once the drafter is wired to the target,
   :meth:`DFlash2MonokernelState.enable_head` makes the packed head one more
   launch, :class:`DraftHeadMonokernel`, which the drafter runs in place of
-  its top-k and selector for one request.
+  its top-k and selector for one or two requests.
 
 The draft follows the target's rule (``docs/design/monokernel.md``): the
 switch never serves a piece without its kernel. When the layers, the context
@@ -87,6 +87,10 @@ from tokenspeed.runtime.layers.logits_processor import (
     should_apply_lm_head_quant_method,
 )
 from tokenspeed.runtime.models.monokernel import MonokernelLayer, MonokernelState
+
+# The draft serves exactly the target's steps, so it takes the target's
+# request count.
+from tokenspeed.runtime.models.muse_spark_monokernel import MAX_REQUESTS
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 logger = logging.getLogger(__name__)
@@ -132,10 +136,8 @@ SELECTOR_RANK = 256
 TOPK = 16
 STEPS = BLOCK_ROWS - 1  # the block's rows 1 .. 7 draft a token each
 CONTEXT_ROWS = 8  # one request's verify rows
-# Requests a launch serves: the same as the target's launch
-# (muse_spark_monokernel.MAX_REQUESTS). The kernels take two requests' rows;
-# serving them is left to a later change.
-MAX_REQUESTS = 1
+# MAX_REQUESTS (imported from the target): the requests a launch serves,
+# their rows one request after another.
 # The rows each launch is packed for, which also size its Iris scratch (and
 # so the draft's heap reservation): up to MAX_REQUESTS requests' blocks,
 # draft steps and verify rows.
