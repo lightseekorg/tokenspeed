@@ -471,24 +471,21 @@ class Qwen4ExpPLEBackend(AttentionBackend):
                 dst_row_strides=tables["context_dst_stride"],
             )
         if pages.is_cuda:
-            copy_state_rows(
-                tables["conv_src"],
-                tables["conv_dst"],
-                src_rows,
-                dst_rows,
-                row_bytes=tables["conv_row_bytes"],
-                src_row_strides=None,
-                dst_row_strides=tables["conv_element_strides"],
-                compact=(self._ple_verify_scratch[self._conv_field_ids[0]], width),
-            )
+            compact = (self._ple_verify_scratch[self._conv_field_ids[0]], width)
+            src_strides = None
+            dst_strides = tables["conv_element_strides"]
         else:
-            copy_state_rows(
-                tables["conv_src"],
-                tables["conv_dst"],
-                src_rows,
-                dst_rows,
-                row_bytes=tables["conv_row_bytes"],
-                src_row_strides=tables["conv_src_stride"],
-                dst_row_strides=tables["conv_dst_stride"],
-            )
+            compact = None
+            src_strides = tables["conv_src_stride"]
+            dst_strides = tables["conv_dst_stride"]
+        copy_state_rows(
+            tables["conv_src"],
+            tables["conv_dst"],
+            src_rows,
+            dst_rows,
+            row_bytes=tables["conv_row_bytes"],
+            src_row_strides=src_strides,
+            dst_row_strides=dst_strides,
+            compact=compact,
+        )
         self._verify_commit_ctx = None

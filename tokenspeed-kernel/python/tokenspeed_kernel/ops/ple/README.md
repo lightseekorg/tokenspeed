@@ -24,7 +24,7 @@ The epilogue applies SiLU, gated input and residual, rounding after each
 operation to the output dtype. Each request's final state is read from the
 same virtual sequence and does not depend on the convolution output.
 
-On NVIDIA SM103, BF16 convolution uses tiles of 8 tokens by 128 channels
+On NVIDIA SM100 and SM103, BF16 convolution uses tiles of 8 tokens by 128 channels
 when both dimensions are at least 1,024 and no per-token state windows are
 requested. A CTA loads the channel's weights once and broadcasts them over
 the tile. Tokens resolve their own request and position, so a tile can span a

@@ -54,7 +54,7 @@ from tokenspeed_kernel.ops.ple import (
     prepare_ngram_reciprocals,
 )
 from tokenspeed_kernel.ops.ple.triton import _exact_remainder
-from tokenspeed_kernel.platform import ArchVersion, current_platform
+from tokenspeed_kernel.platform import current_platform
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="PLE kernel tests require a GPU"
@@ -317,9 +317,8 @@ def test_conv_runtime_bounds(lengths, write_final, windows, pdl):
 
 
 def test_conv_token_tiles_across_request_boundaries():
-    platform = current_platform()
-    if not platform.is_nvidia or platform.arch_version != ArchVersion(10, 3):
-        pytest.skip("token-tiled convolution uses NVIDIA SM103")
+    if not current_platform().is_blackwell:
+        pytest.skip("token-tiled convolution requires NVIDIA SM100 or SM103")
 
     lengths, channels, state = (521, 0, 510), 10240, 9
     opts = {"device": "cuda", "dtype": torch.bfloat16}
