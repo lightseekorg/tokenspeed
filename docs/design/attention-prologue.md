@@ -451,7 +451,12 @@ interfaces. Stream order protects reuse after the final attention consumer;
 `finish` drops layer references without freeing storage. Warmup may hand over
 to the serving stream after the executor's synchronization. Rebind or teardown
 synchronizes queued consumers before dropping the workspace's tensor references.
-Weight preparation and Decode graph behavior remain unchanged.
+Prefill weight preparation and graph behavior remain unchanged. Decode keeps
+its numerical and causal contracts; its model runtime shares the fused prologue
+producer buffers across sequential layers and selects projection computations
+through the attention registry. The DSA module constructs its checkpoint
+projections and absorbed attention directly; it does not construct then discard
+a dense MLA projection or retain unused fused-norm children.
 These byte-preserving gathers do not establish cross-provider bitwise equality
 for attention arithmetic or reductions.
 

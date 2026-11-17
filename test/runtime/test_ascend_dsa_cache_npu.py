@@ -43,6 +43,12 @@ pytestmark = pytest.mark.skipif(
 @pytest.mark.parametrize("batch", [1, 2])
 @pytest.mark.parametrize("width", [1, 2, 4, 8])
 def test_single_rank_verify_has_per_candidate_causal_metadata(batch, width):
+    from dataclasses import replace
+
+    from tokenspeed_kernel.ops.attention.dsa.paged import (
+        select_paged_dsa_attention,
+        select_paged_dsa_indexer,
+    )
     from tokenspeed_kernel_npu.ops.dsa import AscendDSAKernels
 
     class CheckedKernels(AscendDSAKernels):
@@ -87,7 +93,7 @@ def test_single_rank_verify_has_per_candidate_causal_metadata(batch, width):
     backend.step_counter = None
     backend.kvp_group = (0,)
     backend._ascend_placement = None
-    backend._fused_group = None
+    backend._fused_decode = None
     backend._indexer_spec = SimpleNamespace(
         index_head_dim=128,
         index_topk=2048,
@@ -95,7 +101,10 @@ def test_single_rank_verify_has_per_candidate_causal_metadata(batch, width):
         kv_lora_rank=512,
         qk_rope_head_dim=64,
     )
-    backend._indexer_kernels = CheckedKernels()
+    backend._decode_indexer = replace(
+        select_paged_dsa_indexer(), select_indices=CheckedKernels().index
+    )
+    backend._decode_attention = select_paged_dsa_attention()
     backend._dcp = _AscendDSAContextParallel(
         degree=1, rank=0, ranks=(0,), virtual_block_count=None
     )

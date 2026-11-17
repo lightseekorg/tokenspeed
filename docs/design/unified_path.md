@@ -236,22 +236,43 @@ directly into persistent consumer buffers. Layers share this result within
 the forward; replay recomputes it from the live request inputs. Eager and Graph
 execution use this same path. This DSA-specific preparation retains the common
 DCP ownership semantics without changing the shared placement implementation.
-Prefill and decode shapes without a prepared fused projection use the same
-persistent metadata outputs. They exchange query and TopK candidates over the
+Decode shapes without a prepared fused projection use the same persistent
+metadata outputs. They exchange query and TopK candidates over the
 existing device group, then merge sparse-attention partials on the model stream.
 That path creates no auxiliary communicator or stream. The model adapter must
 pass ``fused=True`` after fused Prolog and ``fused=False`` after ordinary
 projections. A fused call without its packed query fails before selection;
 a live native error is never retried through the collective path. A model with
-fused decode prepared can still execute ordinary prefill or smaller decode
-buckets. Capturing collective buckets requires HCCL graph support and target
-device validation; eager or fused-only validation does not establish that.
+fused decode prepared can still execute its token-local Prefill path or smaller
+ordinary decode buckets. Capturing collective buckets requires HCCL graph support
+and target device validation; eager or fused-only validation does not establish
+that.
+
+Decode separates implementation choices, per-forward metadata and borrowed native
+resources. The backend selects Index-K storage, index selection and SFA/LSE
+callables through the `attention` registry once at construction. Its forward
+prepares owner-local metadata, commits Index-K unless the fused prologue already
+wrote it, selects indices, publishes cache completion and consumes local KV.
+The main KV write remains the prologue's responsibility. Decode exchanges queries,
+TopK candidates and attention partials; it never gathers the historical KV cache.
+The Ascend DSA model supports Indexer16/32. Indexer64 is rejected during model
+construction, before weight preparation or native resource allocation.
 
 The public ``AscendDSABackend.attention_kernels(is_prefill=...)`` hook returns
-the stage's SFA provider. Plugins may override it while preserving the
-``AscendDSAKernels`` tensor contracts and the common cache/CP metadata. Partial
-outputs use the shared DCP combine: zero empty-shard O before exchange, then
-normalize all-empty LSE rows before the native merge.
+selected SFA/merge callables, with the tensor contracts documented by
+``PagedDSAAttentionKernels``. Plugins overriding it preserve cache ownership and
+CP metadata. Partial outputs use the shared DCP combine: zero empty-shard O
+before exchange, then normalize all-empty LSE rows before the native merge.
+
+Fused DSA projection outputs are ordinary PyTorch tensors allocated once by the
+model runtime, shared by its sequential layers. Each bucket has contiguous,
+address-stable query/index-query/score buffers; layer weights remain separate.
+Model-stream ordering protects reuse after each layer's final consumer. The
+runtime is prepared before cache memory profiling, so these allocations already
+reduce the available KV budget. They require no custom allocator or independent
+Tensor shutdown protocol. Native communication registrations and SFA producer
+views retain their explicit owner: teardown drains work and destroys referencing
+graphs before clearing backend bindings and releasing the native window.
 
 For ``T`` query rows and ``H`` global heads, the BF16 gathered query occupies
 ``T * H * 576 * 2`` bytes. Each FP32 partial-output buffer occupies

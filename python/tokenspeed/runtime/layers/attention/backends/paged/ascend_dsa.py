@@ -29,6 +29,11 @@ from dataclasses import dataclass
 import torch
 from tokenspeed_kernel.ops.attention.dsa.ascend import (
     ascend_dsa_kernels,
+    validate_dsa_context_parallel,
+)
+from tokenspeed_kernel.ops.attention.dsa.paged import (
+    select_paged_dsa_attention,
+    select_paged_dsa_indexer,
 )
 from tokenspeed_kernel.platform import current_platform
 
@@ -44,7 +49,6 @@ from tokenspeed.runtime.layers.attention.dcp.ascend import (
 )
 from tokenspeed.runtime.layers.attention.dcp.placement import (
     CachePlacement,
-    resolve_cache_slots,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
@@ -110,6 +114,14 @@ class _AscendSparseSelection:
     fused: bool
 
 
+@dataclass(frozen=True)
+class _FusedDecodeBinding:
+    """Borrowed producer views; the model runtime owns their native registration."""
+
+    group: str
+    attention_outputs: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+
+
 class AscendDSABackend(DSABackend):
     """Ascend DSA execution backed by Ascend indexer and sparse-attention ops."""
 
@@ -166,8 +178,9 @@ class AscendDSABackend(DSABackend):
             raise ValueError("Ascend DSA verify supports at most 8 tokens")
         self._indexer_spec = spec
         self._indexer_kernels = ascend_dsa_kernels()
-        self._fused_group: str | None = None
-        self._fused_attention_outputs: dict[int, tuple] = {}
+        self._decode_indexer = select_paged_dsa_indexer()
+        self._decode_attention = select_paged_dsa_attention()
+        self._fused_decode: _FusedDecodeBinding | None = None
         self._collective_context: AscendDCPContext | None = None
         self._ascend_placement: _AscendCachePlacement | None = None
         if dcp.degree > 1:
@@ -178,7 +191,7 @@ class AscendDSABackend(DSABackend):
                 )
             if self.num_local_heads * dcp.degree != spec.num_attention_heads:
                 raise ValueError("DSA DCP does not reconstruct all query heads")
-            self._indexer_kernels.require_fused_context_parallel(
+            validate_dsa_context_parallel(
                 rank_size=dcp.degree, num_heads=spec.num_attention_heads
             )
         self._dcp = dcp
@@ -422,8 +435,25 @@ class AscendDSABackend(DSABackend):
             raise ValueError("Fused DSA resources must cover the CP group ranks")
         if not attention_outputs:
             raise ValueError("Fused DSA requires prepared SFA producer outputs")
-        self._fused_group = group
-        self._fused_attention_outputs = attention_outputs
+        spec = self._indexer_spec
+        for rows, outputs in attention_outputs.items():
+            expected = (
+                (spec.num_attention_heads, rows, spec.kv_lora_rank),
+                (1, rows, spec.num_attention_heads),
+                (1, rows, spec.num_attention_heads),
+            )
+            if len(outputs) != 3 or any(
+                value.shape != shape or value.dtype != torch.float32
+                for value, shape in zip(outputs, expected)
+            ):
+                raise ValueError(
+                    "Fused DSA requires prepared FP32 SFA producer outputs"
+                )
+        self._fused_decode = _FusedDecodeBinding(group, attention_outputs)
+
+    def clear_fused_decode(self) -> None:
+        """Drop borrowed views after the owner has drained/destroyed its graphs."""
+        self._fused_decode = None
 
     def _context_collectives(self) -> AscendDCPContext:
         """Use the existing device group for shapes without native fusion."""
@@ -474,166 +504,114 @@ class AscendDSABackend(DSABackend):
         positions = collective.all_gather(
             positions.to(torch.int32).contiguous(), auxiliary=False
         )[:tokens]
-        indices, valid_chunks = self._indexer_kernels.select_local(
+        indices, valid_chunks = self._decode_indexer.select_local_indices(
             local_indices, positions, self._dcp.rank
         )
         return packed_query, indices, valid_chunks
 
-    def _select_indexed(
-        self,
-        q,
-        k,
-        layer,
-        out_cache_loc,
-        pool,
-        q_ends,
-        kv_lengths,
-        table,
-        kwargs,
-        *,
-        fused: bool,
-        query_group_size: int,
-        context_parallel,
-        query_width,
+    def _prepare_decode_metadata(
+        self, layer, index_cache, locations, lengths, table, *, width, initial, window
     ):
-        """Write the index cache and select request-local sparse indices.
+        """Expand causal query rows and resolve owner-local Index-K write slots.
 
-        Query ends delimit the TND request spans; page identities and write
-        slots belong to the router. The MLA prologue already wrote KV.
+        The fused prologue prepares this same metadata before writing both
+        caches. Storage-view reuse makes subsequent layers share one result;
+        eager and graph replay refresh through the same DCP metadata owner.
         """
-        del k
-        packed_query = kwargs.get("packed_query")
-        if fused and packed_query is None:
-            raise ValueError("Fused DSA requires the fused Prolog query")
-        if not fused and packed_query is not None:
-            raise ValueError("Ordinary DSA does not accept a fused Prolog query")
-        if fused and self._fused_group is None:
-            raise RuntimeError(
-                "Initialize fused DSA resources before using packed queries"
-            )
-        spec = self._indexer_spec
-        init_tokens = kwargs["index_init_tokens"]
-        local_tokens = kwargs["index_local_tokens"]
-        if init_tokens < 0 or local_tokens < 0:
-            raise ValueError("DSA initial/local token counts must be nonnegative")
-        if init_tokens + local_tokens > spec.index_topk:
-            raise ValueError("DSA initial/local tokens exceed index_topk")
-        kernels = self._indexer_kernels
-        index_cache = pool.get_component(layer.layer_id, "dsa_index_k")
-        page = self.kernel_page_size
-        index_cache = index_cache.view(-1, page, 1, spec.index_head_dim)
         placement = self.cache_placement(layer)
-        if context_parallel or q_ends is None:
-            # Without sharding, physical kernel pages are already local. Reuse
-            # the same query expansion with identity ownership and slot mapping.
-            if placement is None:
-                if self._dcp.degree > 1:
-                    raise RuntimeError("DSA CP cache placement was not configured")
-                capacity = index_cache.shape[0]
-                if self._dcp.virtual_block_count != capacity:
-                    self._dcp.bind_virtual_block_count(capacity)
-            # Model-owned selection parameters arrive with the indexer inputs.
-            # Prepare precisely these query rows, including each verify candidate.
-            self._dcp.prepare_metadata(
-                seq_lens=kv_lengths,
-                page_table=table,
-                page_size=page,
-                block_granularity=(
-                    page if placement is None else placement.block_granularity
-                ),
-                init_tokens=init_tokens,
-                local_tokens=local_tokens,
-                query_width=query_width,
-                query_group_size=query_group_size,
-                slots=out_cache_loc,
-            )
-            local = self._dcp.metadata(start=0, end=table.shape[0] * query_width)
-            q_ends = self._dcp.query_ends
-            assert q_ends is not None
-            index_slots = self._dcp.write_slots
-            if self._dcp.degree == 1:
-                kv_lengths, table = local.seq_lens, local.page_table
-        else:
-            if placement is None:
-                index_slots = out_cache_loc
-            else:
-                local_slots, owned = resolve_cache_slots(out_cache_loc, placement)
-                index_slots = torch.where(owned, local_slots, -1)
-        if not kwargs.get("index_cache_written", False):
-            kernels.scatter(kwargs["index_key"].contiguous(), index_cache, index_slots)
-        if not context_parallel or self._dcp.degree == 1:
-            indices, valid_chunks = kernels.index(
-                kwargs["index_query"],
+        page = self.kernel_page_size
+        if placement is None:
+            if self._dcp.degree > 1:
+                raise RuntimeError("DSA CP cache placement was not configured")
+            capacity = index_cache.shape[0]
+            if self._dcp.virtual_block_count != capacity:
+                self._dcp.bind_virtual_block_count(capacity)
+        self._dcp.prepare_metadata(
+            seq_lens=lengths,
+            page_table=table,
+            page_size=page,
+            block_granularity=(
+                page if placement is None else placement.block_granularity
+            ),
+            init_tokens=initial,
+            local_tokens=window,
+            query_width=width,
+            query_group_size=width,
+            slots=locations,
+        )
+        return self._dcp.metadata(start=0, end=table.shape[0] * width)
+
+    def _select_decode_indices(
+        self,
+        query,
+        index_query,
+        index_cache,
+        weights,
+        local,
+        *,
+        initial,
+        window,
+        query_width,
+        packed_query,
+        fused: bool,
+    ):
+        """Select owner-local indices; exchange only queries and TopK candidates."""
+        kernels = self._decode_indexer
+        q_ends = self._dcp.query_ends
+        if self._dcp.degree == 1:
+            indices, valid_chunks = kernels.select_indices(
+                index_query,
                 index_cache,
-                kwargs["index_weights"],
+                weights,
                 q_ends,
-                kv_lengths,
-                table,
-                spec.index_topk,
-                init_tokens,
-                local_tokens,
+                local.seq_lens,
+                local.page_table,
+                self._indexer_spec.index_topk,
+                initial,
+                window,
             )
             return _AscendSparseSelection(
-                q,
-                indices,
-                valid_chunks,
-                q_ends,
-                kv_lengths,
-                table,
-                3,
-                False,
-                False,
-            )
-
-        # Keep each candidate's local causal end while sharing the request's
-        # page table and K tiles across its verify queries.
-        sparse_mode = 3
-        index_metadata = self._dcp.indexer_metadata(
-            q_ends, local, query_group_size=query_group_size
-        )
-        local_indices, local_values = kernels.index_partial(
-            kwargs["index_query"],
-            index_cache,
-            kwargs["index_weights"],
-            index_metadata.q_ends,
-            index_metadata.seq_lens,
-            index_metadata.page_table,
-            spec.index_topk,
-            index_metadata.init_counts,
-            index_metadata.local_counts,
-            sparse_mode=sparse_mode,
-            visible_lengths=index_metadata.visible_lengths,
-        )
-
-        if not fused:
-            packed_query, indices, valid_chunks = self._select_collective_topk(
-                q, local_indices, local_values
-            )
-            return _AscendSparseSelection(
-                packed_query,
+                query,
                 indices,
                 valid_chunks,
                 q_ends,
                 local.seq_lens,
                 local.page_table,
-                sparse_mode,
-                True,
+                3,
+                False,
                 False,
             )
 
-        if local_values.shape[
-            0
-        ] not in self._fused_attention_outputs or local_values.shape[1:] != (
-            1,
-            2048,
-        ):
-            raise ValueError("Fused DSA TopK requires a prepared [T,1,2048] shape")
-        indices, valid_chunks = kernels.merge_topk_fused(
-            local_indices,
-            local_values,
-            group=self._fused_group,
-            rank_size=self._dcp.degree,
+        # Verify candidates share page/K tiles but retain their causal ends.
+        index_metadata = self._dcp.indexer_metadata(
+            q_ends, local, query_group_size=query_width
         )
+        local_indices, local_values = kernels.select_candidates(
+            index_query,
+            index_cache,
+            weights,
+            index_metadata.q_ends,
+            index_metadata.seq_lens,
+            index_metadata.page_table,
+            self._indexer_spec.index_topk,
+            index_metadata.init_counts,
+            index_metadata.local_counts,
+            sparse_mode=3,
+            visible_lengths=index_metadata.visible_lengths,
+        )
+        if fused:
+            if local_values.shape[1:] != (1, 2048):
+                raise ValueError("Fused DSA TopK requires a prepared [T,1,2048] shape")
+            indices, valid_chunks = kernels.merge_topk(
+                local_indices,
+                local_values,
+                group=self._fused_decode.group,
+                rank_size=self._dcp.degree,
+            )
+        else:
+            packed_query, indices, valid_chunks = self._select_collective_topk(
+                query, local_indices, local_values
+            )
         return _AscendSparseSelection(
             packed_query,
             indices,
@@ -641,9 +619,9 @@ class AscendDSABackend(DSABackend):
             q_ends,
             local.seq_lens,
             local.page_table,
-            sparse_mode,
+            3,
             True,
-            True,
+            fused,
         )
 
     def attention_kernels(self, *, is_prefill: bool):
@@ -655,7 +633,7 @@ class AscendDSABackend(DSABackend):
         preserve the AscendDSAKernels tensor and empty-shard contracts and
         must not change cache ownership or CP metadata.
         """
-        return self._indexer_kernels
+        return self._decode_attention
 
     def _run_collective_attention(self, selection, kv_cache, layer, kernels):
         output, maximum, total = kernels.attention_partial(
@@ -674,6 +652,61 @@ class AscendDSABackend(DSABackend):
             output.transpose(0, 1), lse, merge=kernels.merge_partials
         )
 
+    def _run_local_attention(self, selection, kv_cache, scale, kernels):
+        """Return complete local-head rows in TND layout on one cache rank."""
+        spec = self._indexer_spec
+        # TND accepts 32/64 heads. Repeat a smaller TP shard, then keep its heads.
+        live_heads = selection.query.shape[1]
+        if not 1 <= live_heads <= 64:
+            raise ValueError("Ascend DSA requires between 1 and 64 local query heads")
+        padded_heads = 32 if live_heads <= 32 else 64
+        query = selection.query
+        if live_heads != padded_heads:
+            copies = (padded_heads + live_heads - 1) // live_heads
+            query = query.repeat(1, copies, 1)[:, :padded_heads]
+        result = kernels.attention(
+            query[..., : spec.kv_lora_rank].contiguous(),
+            query[..., spec.kv_lora_rank :].contiguous(),
+            kv_cache,
+            selection.indices,
+            selection.valid_chunks,
+            selection.q_ends,
+            selection.kv_lengths,
+            selection.table,
+            scale,
+        )
+        return result[:, :live_heads].contiguous()
+
+    def _run_fused_attention(self, selection, kv_cache, scale, kernels):
+        """Write registered SFA producers and return merged local heads [H,T,D]."""
+        binding = self._fused_decode
+        if binding is None:
+            raise RuntimeError(
+                "Initialize fused DSA resources before context-parallel execution"
+            )
+        rows = selection.query.shape[1]
+        if rows not in binding.attention_outputs:
+            raise ValueError("Fused DSA LSE requires prepared SFA producer outputs")
+        output, maximum, total = kernels.attention_partial(
+            selection.query,
+            kv_cache,
+            selection.indices,
+            selection.valid_chunks,
+            selection.q_ends,
+            selection.kv_lengths,
+            selection.table,
+            scale,
+            sparse_mode=selection.sparse_mode,
+            out=binding.attention_outputs[rows],
+        )
+        return kernels.merge_lse_direct(
+            output,
+            maximum,
+            total,
+            group=binding.group,
+            rank_size=self._dcp.degree,
+        )
+
     def _run_indexed_sparse_attention(
         self,
         selection,
@@ -683,6 +716,7 @@ class AscendDSABackend(DSABackend):
         head_major_output,
         is_prefill: bool,
     ):
+        """Consume owner-local KV and return this rank's attention-head partition."""
         spec = self._indexer_spec
         kv_cache = token_to_kv_pool.get_key_buffer(layer.layer_id).view(
             -1,
@@ -697,81 +731,25 @@ class AscendDSABackend(DSABackend):
                 f"{selection.query.shape[-1]}"
             )
         kernels = self.attention_kernels(is_prefill=is_prefill)
-        if not selection.context_parallel:
-            # TND accepts 32/64 query heads. TP can leave fewer Q heads on
-            # each rank; repeat those heads locally and keep only the first
-            # copy of the result. MLA's single latent KV head stays intact.
-            live_heads = selection.query.shape[1]
-            if live_heads < 1:
-                raise ValueError("Ascend DSA needs at least one query head")
-            if live_heads > 64:
-                raise ValueError("Ascend DSA supports at most 64 local query heads")
-            padded_heads = 32 if live_heads <= 32 else 64
-            query = selection.query
-            if live_heads != padded_heads:
-                copies = (padded_heads + live_heads - 1) // live_heads
-                query = query.repeat(1, copies, 1)[:, :padded_heads]
-            result = kernels.attention(
-                query[..., : spec.kv_lora_rank].contiguous(),
-                query[..., spec.kv_lora_rank :].contiguous(),
-                kv_cache,
-                selection.indices,
-                selection.valid_chunks,
-                selection.q_ends,
-                selection.kv_lengths,
-                selection.table,
-                layer.scaling,
+        if selection.fused:
+            result = self._run_fused_attention(
+                selection, kv_cache, layer.scaling, kernels
             )
-            result = result[:, :live_heads].contiguous()
             return (
-                result.transpose(0, 1).contiguous()
+                result
                 if head_major_output
-                else result.flatten(1)
+                else result.transpose(0, 1).contiguous().flatten(1)
             )
-
-        if not selection.fused:
+        if selection.context_parallel:
             result = self._run_collective_attention(selection, kv_cache, layer, kernels)
-            return (
-                result.transpose(0, 1).contiguous()
-                if head_major_output
-                else result.flatten(1)
+        else:
+            result = self._run_local_attention(
+                selection, kv_cache, layer.scaling, kernels
             )
-        if self._fused_group is None:
-            raise RuntimeError(
-                "Initialize fused DSA resources before context-parallel execution"
-            )
-        rows = selection.query.shape[1]
-        if rows not in self._fused_attention_outputs:
-            raise ValueError("Fused DSA LSE requires prepared SFA producer outputs")
-        output, softmax_max, softmax_sum = kernels.attention_partial(
-            selection.query,
-            kv_cache,
-            selection.indices,
-            selection.valid_chunks,
-            selection.q_ends,
-            selection.kv_lengths,
-            selection.table,
-            layer.scaling,
-            sparse_mode=selection.sparse_mode,
-            out=self._fused_attention_outputs[rows],
-        )
-        expected_shape = (spec.num_attention_heads, rows, spec.kv_lora_rank)
-        if output.shape != expected_shape:
-            raise ValueError(
-                f"Fused DSA LSE requires prepared SFA shape {expected_shape}, "
-                f"got {tuple(output.shape)}"
-            )
-        result = kernels.merge_lse_direct(
-            output,
-            softmax_max,
-            softmax_sum,
-            group=self._fused_group,
-            rank_size=self._dcp.degree,
-        )
         return (
-            result
+            result.transpose(0, 1).contiguous()
             if head_major_output
-            else result.transpose(0, 1).contiguous().flatten(1)
+            else result.flatten(1)
         )
 
     def forward_extend(
@@ -925,25 +903,57 @@ class AscendDSABackend(DSABackend):
             raise ValueError(
                 "Ascend DSA expects indexer projections, not global-slot TopK"
             )
+        initial = kwargs["index_init_tokens"]
+        window = kwargs["index_local_tokens"]
+        if initial < 0 or window < 0:
+            raise ValueError("DSA initial/local token counts must be nonnegative")
+        if initial + window > self._indexer_spec.index_topk:
+            raise ValueError("DSA initial/local tokens exceed index_topk")
+        packed_query = kwargs.get("packed_query")
+        if fused:
+            if packed_query is None:
+                raise ValueError("Fused DSA requires the fused Prolog query")
+            if self._fused_decode is None:
+                raise RuntimeError(
+                    "Initialize fused DSA resources before using packed queries"
+                )
+            if q.shape[0] not in self._fused_decode.attention_outputs:
+                raise ValueError("Fused DSA requires prepared SFA producer outputs")
+        elif packed_query is not None:
+            raise ValueError("Ordinary DSA does not accept a fused Prolog query")
+
         metadata = self.forward_decode_metadata
         start = metadata.num_extends
-        head_major_output = kwargs.pop("head_major_output", False)
-        query_lengths = metadata.seq_lens[start : start + bs]
-        query_table = metadata.page_table[start : start + bs]
-        selection = self._select_indexed(
-            q,
-            k,
+        index_cache = token_to_kv_pool.get_component(
+            layer.layer_id, "dsa_index_k"
+        ).view(-1, self.kernel_page_size, 1, self._indexer_spec.index_head_dim)
+        local = self._prepare_decode_metadata(
             layer,
+            index_cache,
             out_cache_loc,
-            token_to_kv_pool,
-            None,
-            query_lengths,
-            query_table,
-            kwargs,
-            fused=fused,
-            query_group_size=tokens_per_request,
-            context_parallel=self._dcp.degree > 1,
+            metadata.seq_lens[start : start + bs],
+            metadata.page_table[start : start + bs],
+            width=tokens_per_request,
+            initial=initial,
+            window=window,
+        )
+        # Main KV was written by MLA prologue. Fused prologue also writes Index-K;
+        # ordinary projections hand Index-K to this one owner-local store.
+        if not kwargs.get("index_cache_written", False):
+            self._decode_indexer.store_index_keys(
+                kwargs["index_key"].contiguous(), index_cache, self._dcp.write_slots
+            )
+        selection = self._select_decode_indices(
+            q,
+            kwargs["index_query"],
+            index_cache,
+            kwargs["index_weights"],
+            local,
+            initial=initial,
+            window=window,
             query_width=tokens_per_request,
+            packed_query=packed_query,
+            fused=fused,
         )
         if self.step_counter is not None:
             self.step_counter.record_cache()
@@ -951,7 +961,7 @@ class AscendDSABackend(DSABackend):
             selection,
             layer,
             token_to_kv_pool,
-            head_major_output=head_major_output,
+            head_major_output=kwargs.get("head_major_output", False),
             is_prefill=False,
         )
 

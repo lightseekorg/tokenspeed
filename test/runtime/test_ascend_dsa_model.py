@@ -20,6 +20,7 @@
 
 """Native DSA rejects old projection contracts before any device operation."""
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 import pytest
@@ -373,7 +374,7 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(
     [
         (4096, 64, 1536, 16, False),
         (4096, 64, 1536, 32, True),
-        (4096, 64, 1536, 64, True),
+        (4096, 64, 1536, 64, False),
         (2048, 32, 768, 16, True),
         (2048, 32, 768, 32, False),
         (2048, 32, 768, 64, False),
@@ -397,7 +398,12 @@ def test_fused_support_uses_real_loaded_indexer_geometry(
         index_local_tokens=1024,
         index_use_rope=False,
     )
-    with torch.device("meta"):
+    rejection = (
+        pytest.raises(NotImplementedError, match="does not support Indexer64")
+        if index_heads == 64
+        else nullcontext()
+    )
+    with torch.device("meta"), rejection:
         layer = AscendDSAAttention(
             config=config,
             mapping=Mapping(rank=0, world_size=8, attn_tp_size=8, attn_kvp_size=8),
@@ -416,6 +422,130 @@ def test_fused_support_uses_real_loaded_indexer_geometry(
             prefill_enabled=False,
         ).bfloat16()
         layer.indexer.weights_proj.float()
+    if index_heads == 64:
+        return
     assert supports_fused_dsa_decode(layer) == supported
     layer.indexer.weights_proj.bfloat16()
     assert not supports_fused_dsa_decode(layer)
+
+
+@pytest.mark.parametrize("index_heads", [16, 32])
+def test_runtime_shares_projection_buffers_and_releases_bindings(
+    monkeypatch, index_heads
+):
+    """Real model resource owner with only native projection/communication replaced."""
+    from types import SimpleNamespace
+
+    from tokenspeed_kernel.ops.attention.dsa import DSAResources
+
+    from tokenspeed.runtime.distributed.process_group_manager import (
+        process_group_manager as pg,
+    )
+    from tokenspeed.runtime.layers.attention.dsa import ascend
+
+    class Group:
+        def _get_backend(self, device):
+            return self
+
+        def get_hccl_comm_name(self, rank):
+            return "cpu-window"
+
+    class Layer:
+        def __init__(self):
+            self.num_heads = 32 if index_heads == 16 else 64
+            self.num_local_heads = self.num_heads // 8
+            self.indexer = SimpleNamespace(index_n_heads=index_heads)
+            self.q_a_proj = SimpleNamespace(weight=torch.zeros(1))
+            self.q_a_layernorm = self.kv_a_layernorm = SimpleNamespace(
+                variance_epsilon=1e-6
+            )
+            self.runtime = None
+
+        def configure_fused_decode(self, runtime):
+            self.runtime = runtime
+
+    class CpuProjection:
+        # Device weight preparation/native execution are absent; this producer
+        # writes the actual buffers supplied by the real model resource owner.
+        def __init__(self, layer, *, outputs, **kwargs):
+            self.outputs = outputs
+            self.window = None
+
+    group = Group()
+    releases = []
+    window = object()
+    heads = 32 if index_heads == 16 else 64
+    resources = DSAResources(
+        window,
+        {
+            1: (
+                torch.empty(heads, 1, 512),
+                torch.empty(1, 1, heads),
+                torch.empty(1, 1, heads),
+            )
+        },
+        releases.append,
+    )
+    monkeypatch.setattr(pg, "get_dedicated_device_group", lambda *a: group)
+    monkeypatch.setattr(pg, "init_process_group", lambda *a, **k: None)
+    monkeypatch.setattr(pg, "get_process_group", lambda *a: group)
+    monkeypatch.setattr(pg, "get_device_process_group", lambda *a: group)
+    monkeypatch.setattr(ascend.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(ascend.dist, "all_reduce", lambda *a, **k: None)
+    monkeypatch.setattr(ascend.dist, "barrier", lambda *a, **k: None)
+    monkeypatch.setattr(
+        torch, "npu", SimpleNamespace(synchronize=lambda: None), raising=False
+    )
+    monkeypatch.setattr(ascend, "prepare_dsa_resources", lambda **kw: resources)
+    monkeypatch.setattr(ascend, "_RuntimeDSADecode", CpuProjection)
+    layers = [Layer() for _ in range(3)]
+    runtime = ascend.AscendDSARuntime(
+        layers, Mapping(rank=0, world_size=8, attn_tp_size=8)
+    )
+    addresses = {
+        rows: tuple(t.data_ptr() for t in values)
+        for rows, values in runtime.projection_outputs.items()
+    }
+    unique_storage = set()
+    for number, layer in enumerate(layers):
+        for rows in (1, 8, 64, 512):
+            values = layer.runtime.outputs[rows]
+            assert tuple(t.data_ptr() for t in values) == addresses[rows]
+            for value in values:
+                value.fill_(number + rows)
+                unique_storage.add(value.untyped_storage().data_ptr())
+            torch.testing.assert_close(
+                layers[0].runtime.outputs[rows][0],
+                torch.full_like(values[0], number + rows),
+                rtol=0,
+                atol=0,
+            )
+            assert values[2].dtype == torch.float32
+    assert len(unique_storage) == 4 * 3
+
+    # A routing wrapper can disappear while its cache leaf is still referenced.
+    # Teardown must clear every successfully bound leaf, not just live roots.
+    class Router:
+        def __init__(self, children):
+            self.children = children
+
+        def child_backends(self):
+            return self.children
+
+    leaf = object.__new__(ascend.AscendDSABackend)
+    leaf._dcp = SimpleNamespace(ranks=tuple(range(8)), degree=8)
+    leaf._indexer_spec = SimpleNamespace(num_attention_heads=heads, kv_lora_rank=512)
+    leaf._fused_decode = None
+    leaf._dense_backend = Router(())
+    router = Router((leaf,))
+    runtime.bind_backend(router)
+    assert leaf._fused_decode.group == "cpu-window"
+    del router
+    borrowed = layers[0].runtime
+    runtime.close()
+    runtime.close()
+    assert releases == [window]
+    assert all(layer.runtime is None for layer in layers)
+    assert leaf._fused_decode is None
+    assert borrowed.window is None
+    assert not borrowed.outputs
