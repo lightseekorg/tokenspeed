@@ -295,7 +295,7 @@ environment stream need separate entries) to cutlass-dsl's own module hash, so
 an edit to a kernel file never loads a stale binary. The runtime installs it
 with the monitor; `CUTE_DSL_DISABLE_FILE_CACHING=1` turns it off. An unset
 `CUTE_DSL_CACHE_DIR` becomes `$XDG_CACHE_HOME/tokenspeed/cute-dsl` (beside the
-FlashInfer autotune cache), since cutlass-dsl's default under `$TMPDIR` starts
+FlashInfer autotune cache), because cutlass-dsl's default under `$TMPDIR` starts
 empty in each new container; point it at persistent storage in deployments.
 Like Triton's cache it is never pruned, and each kernel-file edit adds entries
 for that file's kernels, so clear it from time to time while developing.

@@ -106,13 +106,18 @@ _PARAMETERS = frozenset(
 )
 
 
-class _ProcessSpecific(Exception):
+class _ProcessSpecificError(Exception):
     """A TVM-FFI spec value whose only description names a process address."""
 
 
 @dataclass(frozen=True)
 class CuteCompileCacheStats:
-    """``cute.compile`` calls the cache keyed, and those that were cached."""
+    """``cute.compile`` calls the cache keyed, and those that were cached.
+
+    Attributes:
+        keyed: ``cute.compile`` calls the cache computed a key for.
+        hits: Keyed calls whose entry was already in the on-disk cache.
+    """
 
     keyed: int
     hits: int
@@ -157,6 +162,8 @@ def cute_compile_cache_key(
 
 
 class _Cache:
+    """State of the installed cache wrapping the cutlass-dsl compile entry."""
+
     def __init__(
         self, previous_compile_and_cache: Any, cutlass_dsl_version: str
     ) -> None:
@@ -204,7 +211,7 @@ class _Cache:
                 "compile_and_cache called with "
                 f"no_cache={no_cache!r}, module_hash={module_hash!r}"
             )
-        if not self._applies(dsl, call):
+        if not _applies(dsl, call):
             return None
         tvm_ffi_spec = _tvm_ffi_spec(dsl, call)
         if tvm_ffi_spec is None:
@@ -226,41 +233,42 @@ class _Cache:
         call["no_cache"] = False
         return bound, key, _entry_stat(dsl, key)
 
-    @staticmethod
-    def _applies(dsl: Any, call: dict[str, Any]) -> bool:
-        # Only what cute.compile forced uncached; CUTE_DSL_* switches cover every
-        # DSL. Kept PTX/CUBIN/SASS, from the environment or the compile options,
-        # and remark output are files a hit would not write, so those
-        # compilations run afresh.
-        envar = dsl.envar
-        options = dsl.compile_options
-        func = call.get("funcBody")
-        if (
-            not call["no_cache"]
-            or (func is not None and func.__module__.startswith("cutlass."))
-            or call["module_hash"] is not None
-            or envar.no_cache
-            or envar.disable_file_caching
-            or _switch_on("CUTE_DSL_NO_CACHE")
-            or _switch_on("CUTE_DSL_DISABLE_FILE_CACHING")
-            or envar.keep_ptx
-            or envar.keep_cubin
-            or envar.keep_sass
-            or options.dump_ptx_path is not None
-            or options.dump_cubin_path is not None
-            or options.dump_sass_path is not None
-            or options.remark_output
-        ):
-            return False
-        _share_cache_dir(dsl.name)
-        return True
+
+def _applies(dsl: Any, call: dict[str, Any]) -> bool:
+    """Whether the file cache applies to this compilation."""
+    # Only what cute.compile forced uncached; CUTE_DSL_* switches cover every
+    # DSL. Kept PTX/CUBIN/SASS, from the environment or the compile options,
+    # and remark output are files a hit would not write, so those
+    # compilations run afresh.
+    envar = dsl.envar
+    options = dsl.compile_options
+    func = call.get("funcBody")
+    if (
+        not call["no_cache"]
+        or (func is not None and func.__module__.startswith("cutlass."))
+        or call["module_hash"] is not None
+        or envar.no_cache
+        or envar.disable_file_caching
+        or _switch_on("CUTE_DSL_NO_CACHE")
+        or _switch_on("CUTE_DSL_DISABLE_FILE_CACHING")
+        or envar.keep_ptx
+        or envar.keep_cubin
+        or envar.keep_sass
+        or options.dump_ptx_path is not None
+        or options.dump_cubin_path is not None
+        or options.dump_sass_path is not None
+        or options.remark_output
+    ):
+        return False
+    _share_cache_dir(dsl.name)
+    return True
 
 
 _cache: _Cache | None = None
 
 
 def install_cute_compile_cache() -> bool:
-    """Let ``cute.compile`` read and write CuTe DSL's on-disk cache.
+    """Installs the cache, so ``cute.compile`` uses CuTe DSL's on-disk cache.
 
     Idempotent. Returns False where cutlass-dsl is missing and, with one
     warning, where it is a release the cache was not verified against or its
@@ -331,7 +339,7 @@ def _dotted(release: tuple[int, int, int]) -> str:
 
 
 def uninstall_cute_compile_cache() -> None:
-    """Restore cutlass-dsl's ``compile_and_cache`` (tests)."""
+    """Restores cutlass-dsl's ``compile_and_cache`` (tests)."""
     global _cache
     if _cache is None:
         return
@@ -366,7 +374,7 @@ def _set_default_cache_dir(value: bool) -> None:
 
 
 def _prepare_cache_dir() -> str | None:
-    """Create CuTe DSL's cache directory; why it cannot be written, or None.
+    """Creates CuTe DSL's cache directory; returns why it is unwritable, or None.
 
     An unset ``CUTE_DSL_CACHE_DIR`` points beside TokenSpeed's other caches, in
     the environment so the ranks and workers this process starts share it.
@@ -397,7 +405,7 @@ def _prepare_cache_dir() -> str | None:
 
 
 def _forget_in_memory(dsl: Any, key: str) -> None:
-    """Drop ``key`` from cutlass-dsl's in-memory cache, detaching its finalizer."""
+    """Drops ``key`` from cutlass-dsl's in-memory cache, detaching its finalizer."""
     dsl.jit_cache.delete(key)
 
 
@@ -416,7 +424,7 @@ def _tvm_ffi_spec(dsl: Any, call: dict[str, Any]) -> str | None:
     )
     try:
         return _describe(params)
-    except _ProcessSpecific:
+    except _ProcessSpecificError:
         return None
 
 
@@ -439,12 +447,12 @@ def _describe(value: Any) -> str:
         return f"{type(value).__qualname__}{_describe(vars(value))}"
     text = str(value)
     if " at 0x" in text:
-        raise _ProcessSpecific(text)
+        raise _ProcessSpecificError(text)
     return f"{type(value).__qualname__}:{text}"
 
 
 def _share_cache_dir(dsl_name: str) -> None:
-    """Point a DSL without its own cache directory at CuTe DSL's.
+    """Points a DSL without its own cache directory at CuTe DSL's.
 
     cutlass-dsl names the directory per DSL (``<NAME>_CACHE_DIR``); the
     experimental DSL would otherwise fall back to a temporary directory.
