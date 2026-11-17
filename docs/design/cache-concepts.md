@@ -2163,11 +2163,14 @@ therefore follows the same KVP ownership contract as attention writes; the
 architecture alone must not reject KVP. Backend capability and shared-group
 storage checks still apply.
 
-Kimi K3 also hosts a GQA block draft (a Qwen3-shaped DSpark draft) in the
-same MLA history group: each draft layer adds a K and a V plane at K3's
-P=128 beside the MLA latent planes, chosen from the draft config's type, and
-the KDA packing stays sized off the MLA plane. The draft's cache is an MHA
-view over the one arena, so it carries the MHA backends' KVP gate.
+The `kimi_k3` recipe also hosts a GQA block draft, such as Kimi-K3.1's
+released DSpark draft, as an MHA view over the one arena: each draft layer
+adds a K and a V plane at P=128, chosen from the draft config's type, and the
+KDA packing stays sized off the MLA plane. The planes join the MLA history
+group, unless every draft layer slides: such a draft owns a sliding-window
+group that retains its window plus one token, packed like the MLA group. KVP
+leaves that group unsharded, since PD cannot transfer K/V head rows out of a
+page-sharded group, and the draft's MHA config is built without KVP.
 
 Capacity has three shapes, all on the base class. The default is the flat
 product (`parents × tightest packing × P`). A probe arena is the third and

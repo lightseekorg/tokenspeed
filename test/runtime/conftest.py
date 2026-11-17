@@ -33,6 +33,7 @@ def kimi_recipe(
     tp_size: int = 8,
     draft_layers: int = 0,
     draft_attn: str = "mla",
+    draft_window: int | None = None,
     pd_enabled: bool = False,
     max_bs: int = 1,
     max_scheduled_tokens: int = 128,
@@ -161,7 +162,21 @@ def kimi_recipe(
         model_config=SimpleNamespace(hf_text_config=text_config),
         attn_config=attn_config,
         draft_model_config=(
-            SimpleNamespace(num_attention_layers=draft_layers) if draft_layers else None
+            SimpleNamespace(
+                num_attention_layers=draft_layers,
+                # Every draft layer slides over this HF window (speculators
+                # DSpark: 2048).
+                hf_config=(
+                    SimpleNamespace(
+                        layer_types=["sliding_attention"] * draft_layers,
+                        sliding_window=draft_window,
+                    )
+                    if draft_window is not None
+                    else None
+                ),
+            )
+            if draft_layers
+            else None
         ),
         draft_attn_config=draft_attn_config,
         cache_budget_bytes=1 << 34,

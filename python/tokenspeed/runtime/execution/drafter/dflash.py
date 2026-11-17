@@ -1008,6 +1008,24 @@ class DFlash(BaseDrafter):
         # Same order as __init__.
         self._init_context_taps()
 
+    def _draft_cache_page_sharded(self) -> bool:
+        """Whether any draft layer's cache group is page-sharded (KVP).
+
+        Asks the pool's plan, not the layers: this runs at construction,
+        before bind_cache_groups stamps the layers' groups.
+        """
+        if self.draft_model_runner.mapping.attn.kvp_size == 1:
+            return False
+        pool = self.token_to_kv_pool
+        shard_counts = {
+            str(spec.group_id): spec.shard_count
+            for spec in pool.arena.cache_group_specs
+        }
+        return any(
+            shard_counts[group_id] > 1
+            for group_id in pool.history_group_by_layer().values()
+        )
+
     def _init_fused_kv_helper(self) -> None:
         """Pre-stack KV weights, k_norm, eps, and cos_sin_cache for the bound pool."""
         self._fused_kv_enabled = False
@@ -1021,7 +1039,7 @@ class DFlash(BaseDrafter):
         self._fused_kv_v_buffers = []
         if not self.uses_shared_context_projection:
             return
-        if self.draft_model_runner.mapping.attn.kvp_size > 1:
+        if self._draft_cache_page_sharded():
             # The fused scatter takes physical slots and has no ownership
             # mask; the per-layer writer translates through the placement.
             logger.info(

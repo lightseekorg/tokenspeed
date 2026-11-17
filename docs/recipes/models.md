@@ -749,7 +749,8 @@ Notes:
   target taps one below each `aux_hidden_state_layer_ids` entry, and the mask
   token, whose trained embedding row replaces the target's. Its five GQA
   layers slide over a 2048-token window and attend causally within the block,
-  so serve it with `--drafter-attention-backend mha`. Its `block_size` of 7 is
+  so serve it with `--drafter-attention-backend mha`, which also runs it
+  under KVP. Its `block_size` of 7 is
   the number of drafted tokens, so the verify window is one larger
   (`--speculative-num-draft-tokens 8`). Other `speculators` DSpark drafts
   load the same way.
