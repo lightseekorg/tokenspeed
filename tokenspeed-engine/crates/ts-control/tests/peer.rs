@@ -57,7 +57,10 @@ fn interpreter() {
                 .unwrap()
                 .set_item("tokenspeed_scheduler.tokenspeed_scheduler_ext", module)
                 .unwrap();
-            let package = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../tokenspeed-scheduler/python");
+            let package = concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../tokenspeed-scheduler/python"
+            );
             py.import("sys")
                 .unwrap()
                 .getattr("path")
@@ -120,12 +123,13 @@ fn geometry(base: u64) -> RankGeometry {
     }
 }
 
-fn settings(name: &str, identity: &str) -> PeerSettings {
+fn settings(name: &str, weight_version: &str) -> PeerSettings {
     PeerSettings {
         name: name.to_owned(),
         bind_host: "127.0.0.1".into(),
         incarnation: 1,
-        identity: identity.to_owned(),
+        deployment_id: "deployment".into(),
+        weight_version: weight_version.to_owned(),
         timeouts: Timeouts {
             answer_us: 1_000_000,
             quarantine_us: 10_000,
@@ -141,11 +145,11 @@ struct Replica {
 }
 
 impl Replica {
-    fn start(name: &str, identity: &str, base: u64, arena: &Arena) -> Self {
+    fn start(name: &str, weight_version: &str, base: u64, arena: &Arena) -> Self {
         let scheduler = Arc::new(Mutex::new(scheduler(name, 1)));
         let port = name.rsplit(':').next().unwrap().parse().unwrap();
         let peer = Peer::start(
-            settings(name, identity),
+            settings(name, weight_version),
             0,
             vec![geometry(base)],
             port,
@@ -223,7 +227,10 @@ fn spec(request_id: &str, tokens: Vec<i32>, holder: &str) -> RequestSpec {
 /// pages holds its block id as a byte pattern.
 fn holder_computes(holder: &mut Replica, tokens: &[i32], arena: &Arena) {
     for block in 1..PAGES {
-        arena.write(HOLDER_BASE + block * PAGE_BYTES, &[block as u8; PAGE_BYTES as usize]);
+        arena.write(
+            HOLDER_BASE + block * PAGE_BYTES,
+            &[block as u8; PAGE_BYTES as usize],
+        );
     }
     holder
         .scheduler
@@ -241,7 +248,11 @@ fn holder_computes(holder: &mut Replica, tokens: &[i32], arena: &Arena) {
 
 /// Runs both replicas' rounds until the reader prefills `request`; returns
 /// the prefix it extends and the landings the reader's plans carried.
-fn rounds_until_prefill(reader: &mut Replica, holder: Option<&mut Replica>, request: &str) -> (i32, Vec<PeerFetchView>) {
+fn rounds_until_prefill(
+    reader: &mut Replica,
+    holder: Option<&mut Replica>,
+    request: &str,
+) -> (i32, Vec<PeerFetchView>) {
     let mut holder = holder;
     let mut landings = Vec::new();
     let start = Instant::now();
@@ -264,8 +275,8 @@ fn a_reader_lands_the_holders_prefix_byte_for_byte_and_computes_the_rest() {
     let arena = Arena::new(200_000);
     let holder_name = format!("127.0.0.1:{}", free_port());
     let reader_name = format!("127.0.0.1:{}", free_port());
-    let mut holder = Replica::start(&holder_name, "ns", HOLDER_BASE, &arena);
-    let mut reader = Replica::start(&reader_name, "ns", READER_BASE, &arena);
+    let mut holder = Replica::start(&holder_name, "v1", HOLDER_BASE, &arena);
+    let mut reader = Replica::start(&reader_name, "v1", READER_BASE, &arena);
     let tokens: Vec<i32> = (1..=6 * PAGE).collect();
     holder_computes(&mut holder, &tokens, &arena);
 
@@ -281,7 +292,10 @@ fn a_reader_lands_the_holders_prefix_byte_for_byte_and_computes_the_rest() {
     assert_eq!(landings.len(), 1, "one landing");
     let landing = &landings[0];
     assert_eq!(landing.begin_tokens, 0);
-    assert_eq!(prefix, landing.end_tokens, "it computes on from the landed boundary");
+    assert_eq!(
+        prefix, landing.end_tokens,
+        "it computes on from the landed boundary"
+    );
     assert!(landing.end_tokens >= 5 * PAGE);
     // Every destination holds one of the holder's pages, byte for byte.
     for destination in &landing.destinations {
@@ -289,13 +303,20 @@ fn a_reader_lands_the_holders_prefix_byte_for_byte_and_computes_the_rest() {
             READER_BASE + destination.block_id as u64 * PAGE_BYTES,
             PAGE_BYTES as usize,
         );
-        assert!(page[0] != 0 && page.iter().all(|&byte| byte == page[0]), "slot {}", destination.slot);
+        assert!(
+            page[0] != 0 && page.iter().all(|&byte| byte == page[0]),
+            "slot {}",
+            destination.slot
+        );
     }
     // The holder applied the release at its next head.
     holder.round();
     let stats = holder.scheduler.lock().peer_stats();
     assert_eq!((stats.leases, stats.pinned_blocks), (0, 0));
-    assert_eq!(reader.scheduler.lock().peer_stats().landed_tokens, landing.end_tokens as u64);
+    assert_eq!(
+        reader.scheduler.lock().peer_stats().landed_tokens,
+        landing.end_tokens as u64
+    );
 }
 
 #[test]
@@ -303,7 +324,7 @@ fn a_holder_that_never_answers_leaves_the_reader_to_compute() {
     let arena = Arena::new(200_000);
     let silent = format!("127.0.0.1:{}", free_port());
     let reader_name = format!("127.0.0.1:{}", free_port());
-    let mut reader = Replica::start(&reader_name, "ns", READER_BASE, &arena);
+    let mut reader = Replica::start(&reader_name, "v1", READER_BASE, &arena);
     let tokens: Vec<i32> = (1..=4 * PAGE).collect();
     reader
         .scheduler
@@ -319,10 +340,55 @@ fn a_holder_of_another_namespace_is_never_read() {
     let arena = Arena::new(200_000);
     let holder_name = format!("127.0.0.1:{}", free_port());
     let reader_name = format!("127.0.0.1:{}", free_port());
-    let mut holder = Replica::start(&holder_name, "other-weights", HOLDER_BASE, &arena);
-    let mut reader = Replica::start(&reader_name, "ns", READER_BASE, &arena);
+    let mut holder = Replica::start(&holder_name, "v2", HOLDER_BASE, &arena);
+    let mut reader = Replica::start(&reader_name, "v1", READER_BASE, &arena);
     let tokens: Vec<i32> = (1..=6 * PAGE).collect();
     holder_computes(&mut holder, &tokens, &arena);
+    let mut longer = tokens.clone();
+    longer.extend(1000..1000 + PAGE);
+    reader
+        .scheduler
+        .lock()
+        .submit_requests(&[spec("r", longer, &holder_name)])
+        .unwrap();
+    let (prefix, landings) = rounds_until_prefill(&mut reader, Some(&mut holder), "r");
+    assert_eq!((prefix, landings.len()), (0, 0));
+}
+
+#[test]
+fn a_reader_that_moved_to_the_holders_weights_reads_them() {
+    let arena = Arena::new(200_000);
+    let holder_name = format!("127.0.0.1:{}", free_port());
+    let reader_name = format!("127.0.0.1:{}", free_port());
+    let mut holder = Replica::start(&holder_name, "v2", HOLDER_BASE, &arena);
+    let mut reader = Replica::start(&reader_name, "v1", READER_BASE, &arena);
+    let tokens: Vec<i32> = (1..=6 * PAGE).collect();
+    holder_computes(&mut holder, &tokens, &arena);
+    reader.peer.set_weight_version("v2");
+
+    let mut longer = tokens.clone();
+    longer.extend(1000..1000 + PAGE);
+    reader
+        .scheduler
+        .lock()
+        .submit_requests(&[spec("r", longer, &holder_name)])
+        .unwrap();
+    let (prefix, landings) = rounds_until_prefill(&mut reader, Some(&mut holder), "r");
+    assert_eq!(landings.len(), 1, "one landing");
+    assert_eq!(prefix, landings[0].end_tokens);
+}
+
+#[test]
+fn a_holder_that_moved_to_new_weights_is_no_longer_read() {
+    let arena = Arena::new(200_000);
+    let holder_name = format!("127.0.0.1:{}", free_port());
+    let reader_name = format!("127.0.0.1:{}", free_port());
+    let mut holder = Replica::start(&holder_name, "v1", HOLDER_BASE, &arena);
+    let mut reader = Replica::start(&reader_name, "v1", READER_BASE, &arena);
+    let tokens: Vec<i32> = (1..=6 * PAGE).collect();
+    holder_computes(&mut holder, &tokens, &arena);
+    holder.peer.set_weight_version("v2");
+
     let mut longer = tokens.clone();
     longer.extend(1000..1000 + PAGE);
     reader

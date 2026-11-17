@@ -214,7 +214,12 @@ or a lease the holder kept for the old one.
 
 **Different models or weights:** every answer carries the holder's namespace
 identity; a reader reads only from a holder whose identity equals its own.
-Equal token hashes under different weights would otherwise land wrong KV.
+Equal token hashes under different weights would otherwise land wrong KV. The
+identity is the L3 deployment id (checkpoints, cache layout, numerics,
+parallel layout) and the weight version. A weight update must flush and name
+its `weight_version`, as with L3; once every rank holds the new weights the
+replica serves and reads under the new identity and forgets the layouts it
+knew, so replicas mid-rollout never read each other.
 
 **A late write on the reader:** a read that failed or timed out may still have
 work queued at the NIC. The reader keeps the destinations held for a
@@ -316,13 +321,28 @@ gain falls below a minimum fetch size.
 
 The first version covers what write-back covers: fused and prefill roles, with
 attention TP and KV parallelism; replicated cache groups only, no KV-page
-sharding; no pipeline stages and no query context parallelism. A prefill
+sharding; no pipeline stages and no query context parallelism. It needs the
+Host tier (`--enable-kvstore`): the Host is half of the capacity a holder
+serves, and its layout is the field list both sides read by. A prefill
 replica that reuses a peer's prefix then transfers to its decode peer through
 the ordinary PD path. Hybrid models (sliding window, State checkpoints) are in
 scope through the holder's matchers.
 
 Out of scope: a storage tier, a central owner, the decode role, sharing across
 namespaces, and moving PD itself onto the new read entry point.
+
+### Configuration
+
+`--peer-prefix-port` turns sharing on; attention-DP rank `r` binds
+`port + r`, and a replica's name is `local_ip:port`.
+`--peer-prefix-answer-timeout-ms` bounds each wait for the holder (lookup,
+layout, pin, release) and `--peer-prefix-min-fetch-tokens` the smallest read
+worth a landing. Lease lifetimes, the lease limit and the read quarantine are
+fixed (`cache/peer.py`). A process draws a random nonzero 32-bit incarnation
+at startup, which its attention-TP members share. The engine host starts one
+transfer engine per rank with the Device arena and the Host pool registered,
+and the replica's members exchange their geometries over the rank mesh before
+serving.
 
 ### Observability
 

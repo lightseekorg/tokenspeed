@@ -101,6 +101,11 @@ impl Holder {
         }
     }
 
+    /// Answer as the namespace `identity` from now on.
+    pub fn set_identity(&mut self, identity: String) {
+        self.stamp.identity = identity;
+    }
+
     /// The answer to `request`, and the endpoint it goes to.
     pub fn handle(
         &mut self,
@@ -139,7 +144,11 @@ impl Holder {
                     answer.num_tokens = looked_up.num_tokens;
                     answer.pages = looked_up.pages.clone();
                     answer.held = looked_up.num_tokens > 0
-                        && cache.pages_match(&record.lookup, looked_up.num_tokens, &looked_up.pages);
+                        && cache.pages_match(
+                            &record.lookup,
+                            looked_up.num_tokens,
+                            &looked_up.pages,
+                        );
                     if answer.held {
                         // The head after this applies the pin; until then no
                         // plan runs, and none may evict the pages.

@@ -1867,6 +1867,34 @@ On a host whose address is IPv6, the PD transfer engine sets `MC_USE_IPV6=1`
 store client reads `MC_USE_IPV6` on its own when the store starts, so export
 `MC_USE_IPV6=1` yourself when the L3 store runs on an IPv6 host.
 
+### Peer prefix sharing
+
+`--peer-prefix-port PORT` lets replicas reuse each other's cached prefixes
+(design: [RFC 0004](../rfcs/0004-peer-prefix-sharing.md)). A request the
+router sends with a holder (`peer_holder`, the holder's `host:port`) asks
+that replica how much of its prompt it caches, in its GPU or Host cache, and
+reads those pages over RDMA (Mooncake TransferEngine, one-sided READ) into
+its own GPU cache instead of computing them. Every replica serves its own
+cache the same way. If the holder does not answer, or a read fails, the
+request computes the prefix itself.
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--peer-prefix-port` | off | The port this replica's endpoint binds; attention-DP rank `r` binds `PORT + r`. |
+| `--peer-prefix-answer-timeout-ms` | 50 | How long a request waits for each of the holder's answers (lookup, pin, release). |
+| `--peer-prefix-min-fetch-tokens` | 256 | The fewest tokens past the local prefix hit worth reading from a peer. |
+
+Peer sharing needs the Host tier (`--enable-kvstore`) and prefix caching.
+It is refused with `--disaggregation-mode decode`,
+`--kvstore-storage-backend`, `--pipeline-parallel-size > 1` and
+`--query-context-parallel-size > 1`; the
+scheduler also refuses KV-page sharding (`--kv-parallel-size` with sharded
+groups). RDMA devices come from `--disaggregation-ib-device`. Replicas read
+each other only within one namespace: the same checkpoints, cache layout,
+numerics and parallel layout (the L3 deployment id), and the same
+`--weight-version`. A flushed weight update must name its `weight_version`,
+which moves the namespace, as it does for L3.
+
 ### Block verification (experimental)
 
 `--speculative-rejection-sample-method block --enable-speculative-sampling --sampling-backend flashinfer`

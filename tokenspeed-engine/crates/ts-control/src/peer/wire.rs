@@ -24,7 +24,9 @@
 //! foreign holder from the one it read from. Replies are pushed back to the
 //! reader a request names (a lease's reader is the reader's endpoint).
 
-use ts_scheduler::{PeerAnswerKind, PeerAnswerView, PeerEventKind, PeerEventView, PeerLeaseView, PeerPageView};
+use ts_scheduler::{
+    PeerAnswerKind, PeerAnswerView, PeerEventKind, PeerEventView, PeerLeaseView, PeerPageView,
+};
 
 use crate::{
     codec::{Reader, Writer},
@@ -172,6 +174,22 @@ fn read_stamp(reader: &mut Reader<'_>) -> Option<Stamp> {
         incarnation: reader.u64()?,
         identity: read_str(reader)?,
     })
+}
+
+impl RankGeometry {
+    /// The geometry as a replica's members exchange it at startup.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Writer::new();
+        write_geometry(&mut out, self);
+        out.finish()
+    }
+
+    /// What [`RankGeometry::encode`] wrote; `None` if it does not decode.
+    pub fn decode(bytes: &[u8]) -> Option<Self> {
+        let mut reader = Reader::new(bytes);
+        let geometry = read_geometry(&mut reader)?;
+        reader.finish(geometry)
+    }
 }
 
 fn write_geometry(out: &mut Writer, geometry: &RankGeometry) {
@@ -518,7 +536,13 @@ mod tests {
         for reply in [
             Reply::Layout {
                 stamp: stamp.clone(),
-                ranks: vec![geometry.clone(), RankGeometry { host: None, ..geometry }],
+                ranks: vec![
+                    geometry.clone(),
+                    RankGeometry {
+                        host: None,
+                        ..geometry.clone()
+                    },
+                ],
             },
             Reply::Answer {
                 stamp,
@@ -538,6 +562,10 @@ mod tests {
         ] {
             assert_eq!(Reply::decode(&reply.encode()), Ok(reply));
         }
+        // As a replica's members exchange it at startup.
+        let bytes = geometry.encode();
+        assert_eq!(RankGeometry::decode(&bytes), Some(geometry));
+        assert_eq!(RankGeometry::decode(&bytes[..bytes.len() - 1]), None);
     }
 
     #[test]

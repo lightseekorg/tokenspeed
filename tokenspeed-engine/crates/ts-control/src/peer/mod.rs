@@ -73,12 +73,26 @@ pub struct PeerSettings {
     pub bind_host: String,
     /// The process's incarnation.
     pub incarnation: u64,
-    /// The cache namespace: only a holder of the same identity is read.
-    pub identity: String,
+    /// The cache namespace's deployment id: everything that shapes a
+    /// cached page's bytes but the weights.
+    pub deployment_id: String,
+    /// The weight version the namespace starts at.
+    pub weight_version: String,
     /// The waits a landing allows itself.
     pub timeouts: Timeouts,
     /// How long a holder keeps a lease's record past its last request.
     pub record_lifetime: Duration,
+}
+
+impl PeerSettings {
+    /// The namespace: only a holder of the same identity is read.
+    fn identity(&self) -> String {
+        namespace(&self.deployment_id, &self.weight_version)
+    }
+}
+
+fn namespace(deployment_id: &str, weight_version: &str) -> String {
+    format!("{deployment_id}/{weight_version}")
 }
 
 /// A round's agreement could not be reached.
@@ -198,6 +212,9 @@ impl PeerFence {
 /// One member's peer sharing.
 pub struct Peer {
     settings: PeerSettings,
+    /// The namespace this member reads and serves under; a weight update
+    /// moves it.
+    identity: String,
     member: usize,
     members: usize,
     geometry: RankGeometry,
@@ -242,6 +259,7 @@ impl Peer {
             None
         };
         Ok(Self {
+            identity: settings.identity(),
             settings,
             member,
             members,
@@ -342,16 +360,26 @@ impl Peer {
 
     /// A plan's landings and lookups: the landings start, and the first
     /// member sends the lookups. Every member calls this with the same plan.
-    pub fn dispatch(&mut self, fetches: Vec<PeerFetchView>, lookups: Vec<PeerLookupView>, now_us: i64) {
+    pub fn dispatch(
+        &mut self,
+        fetches: Vec<PeerFetchView>,
+        lookups: Vec<PeerLookupView>,
+        now_us: i64,
+    ) {
         if !fetches.is_empty() {
-            self.fences
-                .push_back(fetches.iter().map(|fetch| fetch.request_id.clone()).collect());
+            self.fences.push_back(
+                fetches
+                    .iter()
+                    .map(|fetch| fetch.request_id.clone())
+                    .collect(),
+            );
         }
         let mut actions = Vec::new();
         for fetch in fetches {
             let known = self.layouts.contains_key(&fetch.holder);
             let request = fetch.request_id.clone();
-            let (landing, action) = Landing::new(fetch, self.members, known, now_us, self.settings.timeouts);
+            let (landing, action) =
+                Landing::new(fetch, self.members, known, now_us, self.settings.timeouts);
             self.landings.insert(request.clone(), landing);
             actions.push((request, action));
         }
@@ -380,6 +408,19 @@ impl Peer {
         self.fence.clone()
     }
 
+    /// The replica committed new weights under `weight_version`: it reads
+    /// and serves only that namespace from now on. The flush that goes with
+    /// the update left no landing or pin behind; the holders' layouts are
+    /// fetched again, so none of the old namespace is read.
+    pub fn set_weight_version(&mut self, weight_version: &str) {
+        self.settings.weight_version = weight_version.to_owned();
+        self.identity = self.settings.identity();
+        self.layouts.clear();
+        if let Some(endpoint) = &self.endpoint {
+            endpoint.holder.lock().set_identity(self.identity.clone());
+        }
+    }
+
     /// Landings in flight.
     pub fn num_landings(&self) -> usize {
         self.landings.len()
@@ -395,7 +436,7 @@ impl Peer {
         match reply {
             Reply::Layout { stamp, ranks } => {
                 self.asked.remove(&stamp.name);
-                if stamp.identity == self.settings.identity && ranks.len() == self.members {
+                if stamp.identity == self.identity && ranks.len() == self.members {
                     self.layouts.insert(
                         stamp.name.clone(),
                         Layout {
@@ -404,7 +445,10 @@ impl Peer {
                         },
                     );
                 } else {
-                    tracing::warn!(holder = stamp.name, "peer holder of another namespace or shape");
+                    tracing::warn!(
+                        holder = stamp.name,
+                        "peer holder of another namespace or shape"
+                    );
                 }
             }
             Reply::Answer { stamp, answer } => {
@@ -414,7 +458,7 @@ impl Peer {
                         kind: PeerEventKind::LookupAnswered,
                         lease: answer.lease.clone(),
                         // A holder of another namespace holds nothing of ours.
-                        num_tokens: if stamp.identity == self.settings.identity {
+                        num_tokens: if stamp.identity == self.identity {
                             answer.num_tokens
                         } else {
                             0
@@ -422,8 +466,10 @@ impl Peer {
                         ..empty_event()
                     }),
                     PeerAnswerKind::Pin => {
-                        if let Some((request, landing)) =
-                            self.landings.iter_mut().find(|(_, landing)| *landing.lease() == answer.lease)
+                        if let Some((request, landing)) = self
+                            .landings
+                            .iter_mut()
+                            .find(|(_, landing)| *landing.lease() == answer.lease)
                         {
                             if let Some(action) = landing.pinned(answer.clone(), trusted, now_us) {
                                 actions.push((request.clone(), action));
@@ -431,8 +477,10 @@ impl Peer {
                         }
                     }
                     _ => {
-                        if let Some(landing) =
-                            self.landings.values_mut().find(|landing| *landing.lease() == answer.lease)
+                        if let Some(landing) = self
+                            .landings
+                            .values_mut()
+                            .find(|landing| *landing.lease() == answer.lease)
                         {
                             landing.released(answer, trusted, now_us);
                         }
@@ -445,7 +493,7 @@ impl Peer {
     /// Whether an answer comes from the holder whose layout is known, in the
     /// same incarnation and namespace; a stale layout is forgotten.
     fn trust(&mut self, stamp: &Stamp) -> bool {
-        if stamp.identity != self.settings.identity {
+        if stamp.identity != self.identity {
             return false;
         }
         match self.layouts.get(&stamp.name) {
@@ -510,7 +558,9 @@ impl Peer {
                     pinned
                         .pages
                         .iter()
-                        .find(|page| page.group_id == destination.group_id && page.slot == destination.slot)
+                        .find(|page| {
+                            page.group_id == destination.group_id && page.slot == destination.slot
+                        })
                         .map(|page| (*page, *destination))
                 })
                 .collect();
@@ -551,7 +601,7 @@ fn start_endpoint(
         Stamp {
             name: settings.name.clone(),
             incarnation: settings.incarnation,
-            identity: settings.identity.clone(),
+            identity: settings.identity(),
         },
         replica,
         settings.record_lifetime,

@@ -54,6 +54,11 @@ void PeerConfig::Validate() const {
         min_fetch_tokens <= 0) {
         throw std::invalid_argument("peer sharing needs a name, and positive lease limits, lifetimes and minimum");
     }
+    // Lease ids count up from incarnation << 32: a wider incarnation would lose
+    // the bits that tell two runs of the reader apart.
+    if (incarnation == 0 || incarnation > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::invalid_argument("a peer incarnation is a nonzero 32-bit value");
+    }
 }
 
 PeerExports::PeerExports(const PeerConfig& config)

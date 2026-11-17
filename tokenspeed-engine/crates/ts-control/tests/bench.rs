@@ -428,7 +428,7 @@ fn round_loop_config(shape: &RoundShape, pages: usize) -> LoopConfig {
         controls: ControlConfig {
             memory_saver: false,
             memory_regions: Vec::new(),
-            l3_weight_version: None,
+            shared_weight_version: None,
             allow_reload_forward: false,
         },
         batch_log: BatchLogConfig {

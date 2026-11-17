@@ -672,6 +672,11 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                          }
                          return nb::cast(*plan.remote_prefill, nb::rv_policy::copy);
                      })
+        // Peer landings this plan starts: the host READs them into their
+        // destination blocks once the plan's device work before them ran (the
+        // runtime reports that through its peer outbox).
+        .def_prop_ro("has_peer_fetches",
+                     [](const tokenspeed::ExecutionPlan& plan) { return !plan.peer_fetches.empty(); })
         .def_ro("pages_to_zero", &tokenspeed::ExecutionPlan::pages_to_zero)
         .def("pages_to_zero_arrays",
              [](nb::handle self) {

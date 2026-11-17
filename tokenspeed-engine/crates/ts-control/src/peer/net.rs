@@ -45,7 +45,9 @@ impl Inbound {
     /// A message's frames, decoded.
     pub fn decode(frames: &[Bytes]) -> Result<Self, Malformed> {
         match frames {
-            [kind, payload] if kind.as_ref() == REQUEST => Request::decode(payload).map(Inbound::Request),
+            [kind, payload] if kind.as_ref() == REQUEST => {
+                Request::decode(payload).map(Inbound::Request)
+            }
             [kind, payload] if kind.as_ref() == REPLY => Reply::decode(payload).map(Inbound::Reply),
             _ => Err(Malformed),
         }
@@ -66,7 +68,10 @@ pub struct BadEndpoint(pub String);
 pub fn split_endpoint(endpoint: &str) -> Result<(&str, u16), BadEndpoint> {
     let bad = || BadEndpoint(endpoint.to_owned());
     let (host, port) = endpoint.rsplit_once(':').ok_or_else(bad)?;
-    let host = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
     if host.is_empty() {
         return Err(bad());
     }
@@ -87,7 +92,11 @@ pub enum PeerSendError {
 impl PeerNet {
     /// Bind the endpoint on `host` at `port` (0: the OS picks); every message
     /// it receives goes to `incoming`.
-    pub fn start(host: &str, port: u16, incoming: mpsc::Sender<Vec<Bytes>>) -> Result<Self, NetError> {
+    pub fn start(
+        host: &str,
+        port: u16,
+        incoming: mpsc::Sender<Vec<Bytes>>,
+    ) -> Result<Self, NetError> {
         Ok(Self {
             sockets: Sockets::start_at(host, port, incoming)?,
         })

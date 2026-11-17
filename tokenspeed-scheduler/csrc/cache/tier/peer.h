@@ -43,7 +43,8 @@ struct PeerConfig {
     std::string name;
     // This process's incarnation, which a restart changes: a reader's lease
     // ids count from it, so no lease of a restarted reader meets a holder's
-    // lease of the reader it replaced.
+    // lease of the reader it replaced. Nonzero and 32-bit: the ids count up
+    // from incarnation << 32.
     std::uint64_t incarnation;
     // Holder: leases held at once. A lookup past it is answered with a miss.
     std::int32_t max_leases;

@@ -276,7 +276,12 @@ mod tests {
     fn a_device_page_lands_every_field_page_to_page() {
         let holder = geometry(1_000_000, None);
         let reader = geometry(2_000_000, None);
-        let spans = read_spans(&holder, &reader, &[(page(0, 0, false, 7), page(0, 0, false, 3))]).unwrap();
+        let spans = read_spans(
+            &holder,
+            &reader,
+            &[(page(0, 0, false, 7), page(0, 0, false, 3))],
+        )
+        .unwrap();
         assert_eq!(spans.sources, vec![1_000_700, 1_010_700]);
         assert_eq!(spans.destinations, vec![2_000_300, 2_010_300]);
         assert_eq!(spans.lengths, vec![40, 60]);
@@ -287,7 +292,12 @@ mod tests {
         let holder = geometry(1_000_000, Some(host_pool(5_000_000)));
         let reader = geometry(2_000_000, None);
         // Block 5 is the second block of the second parent.
-        let spans = read_spans(&holder, &reader, &[(page(0, 1, true, 5), page(0, 1, false, 4))]).unwrap();
+        let spans = read_spans(
+            &holder,
+            &reader,
+            &[(page(0, 1, true, 5), page(0, 1, false, 4))],
+        )
+        .unwrap();
         assert_eq!(spans.sources, vec![5_000_400, 5_000_440]);
         assert_eq!(spans.destinations, vec![2_000_400, 2_010_400]);
         assert_eq!(spans.total_bytes(), 100);
@@ -298,21 +308,37 @@ mod tests {
         let holder = geometry(1_000_000, None);
         let reader = geometry(2_000_000, None);
         assert_eq!(
-            read_spans(&holder, &reader, &[(page(0, 0, true, 5), page(0, 0, false, 4))]),
+            read_spans(
+                &holder,
+                &reader,
+                &[(page(0, 0, true, 5), page(0, 0, false, 4))]
+            ),
             Err(GeometryError::NoHost)
         );
         assert_eq!(
-            read_spans(&holder, &reader, &[(page(0, 0, false, 5), page(0, 0, true, 4))]),
+            read_spans(
+                &holder,
+                &reader,
+                &[(page(0, 0, false, 5), page(0, 0, true, 4))]
+            ),
             Err(GeometryError::Destination)
         );
         assert!(matches!(
-            read_spans(&holder, &reader, &[(page(0, 0, false, 0), page(0, 0, false, 4))]),
+            read_spans(
+                &holder,
+                &reader,
+                &[(page(0, 0, false, 0), page(0, 0, false, 4))]
+            ),
             Err(GeometryError::Block { .. })
         ));
         let mut narrower = reader.clone();
         narrower.device[1].bytes = 59;
         assert_eq!(
-            read_spans(&holder, &narrower, &[(page(0, 0, false, 5), page(0, 0, false, 4))]),
+            read_spans(
+                &holder,
+                &narrower,
+                &[(page(0, 0, false, 5), page(0, 0, false, 4))]
+            ),
             Err(GeometryError::Field("layer.0.v".into()))
         );
         let far = RankGeometry {
@@ -323,7 +349,11 @@ mod tests {
             ..holder.clone()
         };
         assert_eq!(
-            read_spans(&far, &reader, &[(page(0, 0, false, 2), page(0, 0, false, 4))]),
+            read_spans(
+                &far,
+                &reader,
+                &[(page(0, 0, false, 2), page(0, 0, false, 4))]
+            ),
             Err(GeometryError::Overflow)
         );
     }

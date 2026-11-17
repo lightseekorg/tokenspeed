@@ -696,9 +696,9 @@ pub use ffi::{
     BlockTableView, CacheEvent, CacheEventKind, CacheGroupPages, CacheOpKind, CacheOpView,
     ForwardBatchView, ForwardEvent, ForwardEventKind, KvEventView, PeerAnswerKind, PeerAnswerView,
     PeerEventKind, PeerEventView, PeerFetchView, PeerLeaseView, PeerLookupView, PeerPageView,
-    PeerStatsView, PrefillGateProbe, PrefixHitView, RequestSpec, SchedulerAbortView, SchedulerSizes, StorageCancellationView, StorageDoneView,
-    StorageKeyView, StorageOpKind, StorageOpView, StorageStatsView, StorageTickView,
-    TransferBatchView,
+    PeerStatsView, PrefillGateProbe, PrefixHitView, RequestSpec, SchedulerAbortView,
+    SchedulerSizes, StorageCancellationView, StorageDoneView, StorageKeyView, StorageOpKind,
+    StorageOpView, StorageStatsView, StorageTickView, TransferBatchView,
 };
 
 /// What advances the scheduler at the head of a round: with L3, the agreed

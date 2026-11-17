@@ -22,6 +22,7 @@
 
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -370,6 +371,18 @@ TEST(PeerConfigTest, EveryLimitMustBePositiveAndTheNameSet) {
     PeerConfig no_pin = Config();
     no_pin.hard_pin_us = 0;
     EXPECT_THROW(no_pin.Validate(), std::invalid_argument);
+}
+
+TEST(PeerConfigTest, TheIncarnationIsANonzero32BitValue) {
+    PeerConfig widest = Config();
+    widest.incarnation = std::numeric_limits<std::uint32_t>::max();
+    EXPECT_NO_THROW(widest.Validate());
+    PeerConfig wider = Config();
+    wider.incarnation = std::uint64_t{1} << 32;
+    EXPECT_THROW(wider.Validate(), std::invalid_argument) << "its high bits would not reach the lease ids";
+    PeerConfig unset = Config();
+    unset.incarnation = 0;
+    EXPECT_THROW(unset.Validate(), std::invalid_argument);
 }
 
 }  // namespace

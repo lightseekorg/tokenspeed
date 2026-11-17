@@ -1357,7 +1357,7 @@ fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopCon
             } else {
                 vec!["kv_cache".to_owned(), "weights".to_owned()]
             },
-            l3_weight_version: None,
+            shared_weight_version: None,
             allow_reload_forward: true,
         },
         batch_log: BatchLogConfig {

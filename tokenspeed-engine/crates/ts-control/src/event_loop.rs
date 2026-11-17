@@ -80,11 +80,11 @@ use crate::{
     ingress::{self, Admission, Admitted, IngressLimits},
     kv_events::KvEventPublisher,
     l3::{L3Error, Tier},
-    peer::{Peer, PeerError},
     output::{
         CommitStats, Committed, ForwardResult, HistoryRows, HistorySeeds, InputLogprobPlan,
         LogprobPlan, NgramWindows, OutputProcessor, StreamedOutput,
     },
+    peer::{Peer, PeerError},
     relay::{self, RelayError},
     request::RequestGrammar,
 };
@@ -1948,11 +1948,14 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 if agreed && control::is_weight_load(&op) {
                     // New pages publish under the new checkpoint only once
                     // every rank holds its weights.
-                    match self.controls.commit_l3_weight_version(&op) {
+                    match self.controls.commit_shared_weight_version(&op) {
                         Err(refusal) => (false, refusal),
                         Ok(Some(version)) => {
                             if let Some(l3) = &self.l3 {
                                 l3.executor.set_weight_version(&version)?;
+                            }
+                            if let Some(peer) = &mut self.peer {
+                                peer.set_weight_version(&version);
                             }
                             (true, message)
                         }

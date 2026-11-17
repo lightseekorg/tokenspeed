@@ -551,9 +551,14 @@ mod tests {
         let port = stalled.local_addr().unwrap().port();
         let address = format!("tcp://127.0.0.1:{port}");
         let (incoming, _) = mpsc::channel();
-        let sender =
-            Sockets::with_timeouts("127.0.0.1", 0, incoming, Duration::from_secs(1), IDLE_TIMEOUT)
-                .unwrap();
+        let sender = Sockets::with_timeouts(
+            "127.0.0.1",
+            0,
+            incoming,
+            Duration::from_secs(1),
+            IDLE_TIMEOUT,
+        )
+        .unwrap();
         let (incoming, received) = mpsc::channel();
         let healthy = Sockets::start("127.0.0.1", incoming).unwrap();
         // Retry the same dead address after retirement, proving recreation too.
@@ -589,9 +594,14 @@ mod tests {
         let port = stalled.local_addr().unwrap().port();
         let address = format!("tcp://127.0.0.1:{port}");
         let (incoming, _) = mpsc::channel();
-        let sender =
-            Sockets::with_timeouts("127.0.0.1", 0, incoming, Duration::from_secs(1), IDLE_TIMEOUT)
-                .unwrap();
+        let sender = Sockets::with_timeouts(
+            "127.0.0.1",
+            0,
+            incoming,
+            Duration::from_secs(1),
+            IDLE_TIMEOUT,
+        )
+        .unwrap();
         sender
             .send_coalesced("127.0.0.1", port, vec![ascii("old")])
             .unwrap();

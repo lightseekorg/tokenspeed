@@ -147,10 +147,14 @@ impl Arena {
 impl PageReader for Arena {
     fn read(&self, _session: &str, spans: &Spans) -> Result<(), String> {
         let mut memory = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        for ((&source, &destination), &length) in
-            spans.sources.iter().zip(&spans.destinations).zip(&spans.lengths)
+        for ((&source, &destination), &length) in spans
+            .sources
+            .iter()
+            .zip(&spans.destinations)
+            .zip(&spans.lengths)
         {
-            let (source, destination, length) = (source as usize, destination as usize, length as usize);
+            let (source, destination, length) =
+                (source as usize, destination as usize, length as usize);
             if source + length > memory.len() || destination + length > memory.len() {
                 return Err("a span outside the arena".into());
             }
@@ -206,7 +210,10 @@ mod tests {
 
     #[test]
     fn a_failed_read_reports_its_failure() {
-        for reader in [Arc::new(Failing) as Arc<dyn PageReader>, Arc::new(Arena::new(4))] {
+        for reader in [
+            Arc::new(Failing) as Arc<dyn PageReader>,
+            Arc::new(Arena::new(4)),
+        ] {
             let reads = Reads::start(reader).unwrap();
             reads.submit(ReadJob {
                 request_id: "r".into(),

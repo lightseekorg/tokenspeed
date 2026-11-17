@@ -152,7 +152,9 @@ impl Landing {
 
     /// The pages to read, once the pin held and while the members read.
     pub fn pages_to_read(&self) -> Option<&PeerAnswerView> {
-        (self.phase == Phase::Read).then_some(self.pinned.as_ref()).flatten()
+        (self.phase == Phase::Read)
+            .then_some(self.pinned.as_ref())
+            .flatten()
     }
 
     /// `member`'s read ended.
@@ -184,7 +186,9 @@ impl Landing {
                 self.phase = Phase::Done(self.fetch.begin_tokens);
             }
             // An unanswered release vouches for nothing.
-            Phase::Release { read } if now_us >= self.deadline_us => self.settle(read, false, now_us),
+            Phase::Release { read } if now_us >= self.deadline_us => {
+                self.settle(read, false, now_us)
+            }
             Phase::Quarantine { until_us } if now_us >= until_us => {
                 self.phase = Phase::Done(self.fetch.begin_tokens);
             }
@@ -258,7 +262,12 @@ mod tests {
         }
     }
 
-    fn answer(kind: PeerAnswerKind, held: bool, num_tokens: i32, pages: Vec<PeerPageView>) -> PeerAnswerView {
+    fn answer(
+        kind: PeerAnswerKind,
+        held: bool,
+        num_tokens: i32,
+        pages: Vec<PeerPageView>,
+    ) -> PeerAnswerView {
         PeerAnswerView {
             lease: fetch().lease,
             kind,
@@ -272,7 +281,11 @@ mod tests {
         let (mut landing, action) = Landing::new(fetch(), 2, true, 0, TIMEOUTS);
         assert_eq!(action, Action::SendPin);
         assert_eq!(
-            landing.pinned(answer(PeerAnswerKind::Pin, true, 8, vec![page(0), page(1)]), true, 0),
+            landing.pinned(
+                answer(PeerAnswerKind::Pin, true, 8, vec![page(0), page(1)]),
+                true,
+                0
+            ),
             None
         );
         assert!(landing.pages_to_read().is_some());
@@ -283,7 +296,10 @@ mod tests {
     fn a_landing_every_member_read_and_the_holder_vouched_for_keeps_its_end() {
         let mut landing = pinned_landing();
         assert_eq!(landing.read(1, true, 5), None, "one member still reads");
-        assert_eq!(landing.read(0, true, 6), Some(Action::SendRelease { demote: true }));
+        assert_eq!(
+            landing.read(0, true, 6),
+            Some(Action::SendRelease { demote: true })
+        );
         landing.released(&answer(PeerAnswerKind::Release, true, 0, vec![]), true, 7);
         assert_eq!(landing.done(), Some(8));
     }
@@ -323,7 +339,10 @@ mod tests {
     fn a_failed_read_holds_its_destinations_through_the_quarantine() {
         let mut landing = pinned_landing();
         landing.read(0, true, 1);
-        assert_eq!(landing.read(1, false, 2), Some(Action::SendRelease { demote: false }));
+        assert_eq!(
+            landing.read(1, false, 2),
+            Some(Action::SendRelease { demote: false })
+        );
         landing.released(&answer(PeerAnswerKind::Release, true, 0, vec![]), true, 3);
         assert_eq!(landing.done(), None);
         landing.tick(1002);
@@ -338,7 +357,11 @@ mod tests {
         landing.read(0, true, 1);
         landing.read(1, true, 1);
         landing.released(&answer(PeerAnswerKind::Release, false, 0, vec![]), true, 2);
-        assert_eq!(landing.done(), Some(0), "the pages may have changed under the read");
+        assert_eq!(
+            landing.done(),
+            Some(0),
+            "the pages may have changed under the read"
+        );
 
         let mut landing = pinned_landing();
         landing.read(0, true, 1);
@@ -352,7 +375,10 @@ mod tests {
         let mut landing = pinned_landing();
         landing.read(0, true, 1);
         landing.read(0, false, 1);
-        assert_eq!(landing.read(1, true, 1), Some(Action::SendRelease { demote: true }));
+        assert_eq!(
+            landing.read(1, true, 1),
+            Some(Action::SendRelease { demote: true })
+        );
         assert_eq!(landing.read(1, true, 1), None);
         assert_eq!(landing.read(5, true, 1), None);
     }
