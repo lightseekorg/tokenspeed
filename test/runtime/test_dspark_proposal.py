@@ -35,6 +35,7 @@ def _drafter(spec_num_tokens: int = 8, vocab: int = VOCAB) -> DSpark:
     drafter.spec_num_tokens = spec_num_tokens
     drafter.lm_head = None
     drafter.draft_sampler = None  # the greedy walk
+    drafter._samples_vocab_shard = False
     # Resolved without the fused step: the default walk is the unfused one.
     drafter._markov_argmax_resolved = True
     drafter._markov_argmax_workspace = None
@@ -338,7 +339,7 @@ def test_the_block_projection_matches_projecting_each_position() -> None:
     drafter.lm_head = _ShardedHead(weight)
     draft_hidden = torch.randn(rows, positions, HIDDEN)
 
-    block = drafter._block_base_logits(draft_hidden)
+    block = drafter._block_base_logits(draft_hidden, full_vocab=False)
 
     assert block is not None
     assert block.shape == (positions, rows, VOCAB)
@@ -351,10 +352,14 @@ def test_the_block_projection_stands_down_without_a_head_or_shard() -> None:
     """Without a head, or with an empty vocab shard, the walk keeps the
     per-step path."""
     drafter = _drafter(spec_num_tokens=4)
-    assert drafter._block_base_logits(torch.randn(2, 4, HIDDEN)) is None
+    assert (
+        drafter._block_base_logits(torch.randn(2, 4, HIDDEN), full_vocab=False) is None
+    )
 
     drafter.lm_head = _ShardedHead(torch.randn(0, HIDDEN))
-    assert drafter._block_base_logits(torch.randn(2, 4, HIDDEN)) is None
+    assert (
+        drafter._block_base_logits(torch.randn(2, 4, HIDDEN), full_vocab=False) is None
+    )
 
 
 def _replicated_head_drafter(positions: int) -> DSpark:
@@ -389,7 +394,7 @@ def test_a_replicated_head_projects_the_block_in_one_call() -> None:
     drafter = _replicated_head_drafter(positions)
     draft_hidden = torch.randn(rows, positions, HIDDEN)
 
-    block = drafter._block_base_logits(draft_hidden)
+    block = drafter._block_base_logits(draft_hidden, full_vocab=False)
 
     assert block is not None and block.shape == (positions, rows, VOCAB)
     metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None)
@@ -419,7 +424,7 @@ def test_a_replicated_head_walk_proposes_what_projecting_each_round_does(
     assert drafter._markov_argmax_resolved
     assert drafter._markov_argmax_workspace is None
     # Force the per-round projection the walk used before hoisting.
-    drafter._block_base_logits = lambda draft_hidden: None
+    drafter._block_base_logits = lambda draft_hidden, *, full_vocab: None
     per_round = drafter._sample_block(
         hidden, block, torch.zeros(rows, positions, dtype=torch.long)
     ).clone()
@@ -557,6 +562,128 @@ def test_the_shard_walk_needs_raw_logits_from_a_covered_bf16_shard() -> None:
     drafter.logits_processor.keep_sampled_logits_vocab_sharded.assert_called_once_with(
         head, supports
     )
+
+
+# --------------------------------------------------------------------------
+# Sampled proposals over the block projection
+# --------------------------------------------------------------------------
+
+
+class _RecordingSampler:
+    """Stands in for ``DraftProposalSampler``, whose request pools need a
+    scheduler: records each step's logits and proposes their argmax."""
+
+    def __init__(self) -> None:
+        self.steps: list[tuple[int, torch.Tensor]] = []
+
+    def propose(self, logits: torch.Tensor, *, step: int) -> torch.Tensor:
+        assert logits.is_contiguous()
+        self.steps.append((step, logits.clone()))
+        return torch.argmax(logits, dim=-1).to(torch.int32)
+
+
+def _sampling_drafter(head_kind: str, positions: int) -> DSpark:
+    """A sampled drafter whose logits path scales, unlike a raw shard GEMM."""
+    from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
+
+    if head_kind == "replicated":
+        drafter = _replicated_head_drafter(positions)
+    else:
+        drafter = _drafter(spec_num_tokens=positions)
+        torch.manual_seed(5)
+        drafter.lm_head = _ShardedHead(torch.randn(VOCAB, HIDDEN))
+    drafter.logits_processor = LogitsProcessor(
+        SimpleNamespace(model_type="test", vocab_size=VOCAB),
+        logit_scale=0.5,
+        dp_lm_head_tp=False,
+        attn_tp_size=1,
+    )
+    drafter.draft_sampler = _RecordingSampler()
+    return drafter
+
+
+def _step_logits(drafter: DSpark, hidden: torch.Tensor) -> torch.Tensor:
+    """The per-position sampled step's logits for one position's rows."""
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
+
+    metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None)
+    return drafter.logits_processor._get_logits(
+        hidden, drafter.lm_head, metadata, require_full_vocab=True
+    )
+
+
+@pytest.mark.parametrize("head_kind", ["sharded", "replicated"])
+def test_a_sampled_block_projection_is_each_steps_full_vocab_logits(
+    head_kind,
+) -> None:
+    """Sampling needs the scaled whole-vocabulary logits, not the raw shard
+    GEMM the greedy walk reads, for every head layout."""
+    rows, positions = 3, 5
+    drafter = _sampling_drafter(head_kind, positions)
+    torch.manual_seed(7)
+    draft_hidden = torch.randn(rows, positions, HIDDEN)
+
+    block = drafter._block_base_logits(draft_hidden, full_vocab=True)
+
+    assert block is not None and block.shape == (positions, rows, VOCAB)
+    for k in range(positions):
+        torch.testing.assert_close(
+            block[k], _step_logits(drafter, draft_hidden[:, k, :])
+        )
+
+
+@pytest.mark.parametrize("head_kind", ["sharded", "replicated"])
+def test_the_sampled_walk_samples_what_projecting_each_step_does(
+    head_kind,
+) -> None:
+    rows, positions = 4, 6
+    drafter = _sampling_drafter(head_kind, positions)
+    torch.manual_seed(9)
+    hidden = torch.randn(rows, positions, HIDDEN)
+    block = torch.randint(0, VOCAB, (rows, positions))
+
+    hoisted = drafter._sample_block(
+        hidden, block, torch.zeros(rows, positions, dtype=torch.long)
+    ).clone()
+    hoisted_steps = drafter.draft_sampler.steps
+    # Force the per-step projection the sampled walk used before hoisting.
+    drafter.draft_sampler = _RecordingSampler()
+    drafter._block_base_logits = lambda draft_hidden, *, full_vocab: None
+    per_step = drafter._sample_block(
+        hidden, block, torch.zeros(rows, positions, dtype=torch.long)
+    ).clone()
+
+    assert [step for step, _ in hoisted_steps] == list(range(positions - 1))
+    for (_, got), (_, want) in zip(hoisted_steps, drafter.draft_sampler.steps):
+        torch.testing.assert_close(got, want)
+    assert torch.equal(hoisted, per_step)
+
+
+def test_the_sampled_step_reads_the_hoisted_projection() -> None:
+    """Each step samples the supplied projection plus its bias instead of
+    projecting the hidden state again, from the positions-strided block."""
+    rows, positions = 3, 5
+    drafter = _sampling_drafter("sharded", positions)
+    torch.manual_seed(11)
+    hidden = torch.randn(rows, positions, HIDDEN)
+    # A projection unrelated to the hidden states, laid out like the real one.
+    supplied = torch.randn(rows, positions - 1, VOCAB).transpose(0, 1)
+    projected: list[tuple[int, bool]] = []
+
+    def block_base_logits(draft_hidden, *, full_vocab):
+        projected.append((int(draft_hidden.shape[1]), full_vocab))
+        return supplied
+
+    drafter._block_base_logits = block_base_logits
+    tokens = torch.zeros(rows, positions, dtype=torch.long)
+    drafter._sample_block(hidden, torch.randint(0, VOCAB, (rows, positions)), tokens)
+
+    # Only the positions a step reads, over the whole vocabulary.
+    assert projected == [(positions - 1, True)]
+    for step, got in drafter.draft_sampler.steps:
+        bias = drafter._make_step_bias_fn(tokens[:, step])(0, VOCAB)
+        torch.testing.assert_close(got, supplied[step] + bias.to(supplied.dtype))
 
 
 # --------------------------------------------------------------------------
