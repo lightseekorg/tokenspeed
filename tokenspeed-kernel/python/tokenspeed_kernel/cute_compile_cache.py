@@ -53,9 +53,10 @@ process addresses, so their keys never repeat.
 
 ``compile_and_cache`` is private to cutlass-dsl. The cache installs only on the
 cutlass-dsl releases it was verified against and only when the parameters it
-reads are still there; at a call whose arguments no longer look as expected,
-or if keying fails, it turns itself off. Each case logs one warning and leaves
-compilation to cutlass-dsl exactly as without the cache.
+reads are still there; otherwise it logs one warning and leaves compilation to
+cutlass-dsl exactly as without the cache. On a verified release, a call whose
+arguments do not look as expected, or a failure while keying, is a bug and
+raises.
 """
 
 from __future__ import annotations
@@ -165,16 +166,9 @@ class _Cache:
         self.keyed = 0
         self.hits = 0
         self.cutlass_dsl_version = cutlass_dsl_version
-        self.off = False
 
     def compile_and_cache(self, dsl: Any, *args: Any, **kwargs: Any) -> Any:
-        if self.off:
-            return self.previous(dsl, *args, **kwargs)
-        try:
-            keyed = self._key(dsl, args, kwargs)
-        except Exception as error:
-            self._turn_off(f"{type(error).__name__}: {error}")
-            keyed = None
+        keyed = self._key(dsl, args, kwargs)
         if keyed is None:
             return self.previous(dsl, *args, **kwargs)
         # Only module_hash and no_cache differ from cutlass-dsl's call: the
@@ -184,12 +178,8 @@ class _Cache:
         # A cached call also keeps the function in cutlass-dsl's in-memory
         # cache for the life of the process; cute.compile callers own theirs.
         _forget_in_memory(dsl, key)
-        try:
-            # A hit leaves the entry untouched; one that failed to load is rewritten.
-            hit = before is not None and before == _entry_stat(dsl, key)
-        except Exception as error:
-            self._turn_off(f"{type(error).__name__}: {error}")
-            return result
+        # A hit leaves the entry untouched; one that failed to load is rewritten.
+        hit = before is not None and before == _entry_stat(dsl, key)
         with self.lock:
             self.keyed += 1
             self.hits += int(hit)
@@ -235,16 +225,6 @@ class _Cache:
         call["module_hash"] = key
         call["no_cache"] = False
         return bound, key, _entry_stat(dsl, key)
-
-    def _turn_off(self, reason: str) -> None:
-        with self.lock:
-            if self.off:
-                return
-            self.off = True
-        logger.warning(
-            f"CuTe DSL compile cache off: {reason}; cute.compile compiles "
-            "every kernel afresh"
-        )
 
     @staticmethod
     def _applies(dsl: Any, call: dict[str, Any]) -> bool:
@@ -294,11 +274,8 @@ def install_cute_compile_cache() -> bool:
     except ImportError:
         return False
     previous = BaseDSL.compile_and_cache
-    try:
-        version = _cutlass_dsl_version()
-        reason = _unsupported(BaseDSL, previous, version)
-    except Exception as error:
-        version, reason = "", f"{type(error).__name__}: {error}"
+    version = _cutlass_dsl_version()
+    reason = _unsupported(BaseDSL, previous, version)
     if reason is None:
         reason = _prepare_cache_dir()
     if reason is not None:
@@ -481,7 +458,12 @@ def _share_cache_dir(dsl_name: str) -> None:
 
 
 def _cutlass_dsl_version() -> str:
-    return importlib.metadata.version("nvidia-cutlass-dsl")
+    """The installed nvidia-cutlass-dsl release, or "" without package metadata."""
+    try:
+        return importlib.metadata.version("nvidia-cutlass-dsl")
+    except importlib.metadata.PackageNotFoundError:
+        # A source tree on the path: its release is unknown, so it is untested.
+        return ""
 
 
 @functools.lru_cache(maxsize=None)

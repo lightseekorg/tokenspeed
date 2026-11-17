@@ -81,9 +81,9 @@ def add(
 """
 
 
-def _run(
+def _spawn(
     cache_dir: Path | None, output: Path, case: str, *extra: str, **env_overrides: str
-) -> dict:
+) -> subprocess.CompletedProcess:
     env = dict(os.environ)
     env.pop("CUTE_DSL_CACHE_DIR", None)
     env.pop("CUTE_DSL_DISABLE_FILE_CACHING", None)
@@ -97,6 +97,13 @@ def _run(
         text=True,
         timeout=900,
     )
+    return done
+
+
+def _run(
+    cache_dir: Path | None, output: Path, case: str, *extra: str, **env_overrides: str
+) -> dict:
+    done = _spawn(cache_dir, output, case, *extra, **env_overrides)
     assert done.returncode == 0, done.stderr[-4000:]
     result = json.loads(done.stdout.strip().splitlines()[-1])
     result["stderr"] = done.stderr
@@ -321,18 +328,8 @@ def test_a_corrupt_entry_is_recompiled_and_replaced(tmp_path, kernel_file):
     assert (first["hits"], again["hits"]) == (0, 1)
 
 
-@pytest.mark.parametrize(
-    "change,installed",
-    [
-        ("untested-version", False),
-        ("renamed-parameters", False),
-        ("no-cache-shape", True),
-        ("keying-error", True),
-    ],
-)
-def test_an_unknown_cutlass_dsl_turns_the_cache_off_and_still_compiles(
-    tmp_path, kernel_file, change, installed
-):
+@pytest.mark.parametrize("change", ["untested-version", "renamed-parameters"])
+def test_an_unverified_cutlass_dsl_leaves_the_cache_off(tmp_path, kernel_file, change):
     cache = tmp_path / "cache"
     result = _add(
         cache,
@@ -343,12 +340,35 @@ def test_an_unknown_cutlass_dsl_turns_the_cache_off_and_still_compiles(
         "--pretend",
         change,
     )
-    assert result["installed"] is installed
-    assert result["keyed"] in (None, 0) and not result["hits"]
+    assert result["installed"] is False
+    assert result["keyed"] is None
     assert result["stderr"].count("CuTe DSL compile cache off") == 1, result["stderr"]
     assert not _entries(cache)
     expected = torch.arange(32, dtype=torch.float32) + 3.0
     assert torch.equal(torch.load(tmp_path / "out.pt")[0], expected)
+
+
+@pytest.mark.parametrize(
+    "change,error",
+    [("no-cache-shape", "TypeError"), ("keying-error", "AttributeError")],
+)
+def test_an_unexpected_call_on_a_verified_cutlass_dsl_raises(
+    tmp_path, kernel_file, change, error
+):
+    # On a verified release these are bugs: they fail the compilation instead
+    # of silently disabling the cache.
+    done = _spawn(
+        tmp_path / "cache",
+        tmp_path / "out.pt",
+        "add",
+        "--kernel-file",
+        str(kernel_file),
+        "--pretend",
+        change,
+    )
+    assert done.returncode != 0
+    assert error in done.stderr, done.stderr[-4000:]
+    assert not _entries(tmp_path / "cache")
 
 
 @pytest.mark.parametrize(

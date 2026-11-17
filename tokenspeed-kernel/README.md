@@ -299,13 +299,12 @@ FlashInfer autotune cache), since cutlass-dsl's default under `$TMPDIR` starts
 empty in each new container; point it at persistent storage in deployments.
 Like Triton's cache it is never pruned, and each kernel-file edit adds entries
 for that file's kernels, so clear it from time to time while developing.
-cutlass-dsl's own
-helpers are not cached: their traces carry process addresses. The wrapped
-function is private to cutlass-dsl, so the cache installs only on the
-cutlass-dsl releases it was verified against (`_TESTED_CUTLASS_DSL`) and turns
-itself off, with one warning, when a call no longer looks as expected; widen
-the range after running `test/nvidia/test_cute_compile_cache.py` on a new
-release.
+cutlass-dsl's own helpers are not cached: their traces carry process
+addresses. The wrapped function is private to cutlass-dsl, so the cache
+installs only on the cutlass-dsl releases it was verified against, and only
+when the parameters it reads are still there; otherwise it stays off with one
+warning. Verify a new release with `test/nvidia/test_cute_compile_cache.py`
+before widening that range.
 
 A runtime argument still keys the cache: Triton specializes an integer on
 whether it is 1 or divisible by 16, and a pointer on 16-byte alignment.
