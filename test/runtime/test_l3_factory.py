@@ -259,10 +259,11 @@ def test_settings_separate_the_qsa_bf16_prefill_scratch(construction):
 
 def test_settings_separate_qwen4_exp_flat_kv(construction):
     args, model, _, factory_kwargs = construction
+    assert _kv_producer_options(args, draft_dtype="")["qwen4_exp_flat_kv"] is True
+    with_flat_kv = l3_settings(args, model, None, **factory_kwargs)
+    args.qwen4_exp_flat_kv = False
     assert "qwen4_exp_flat_kv" not in _kv_producer_options(args, draft_dtype="")
     without_flat_kv = l3_settings(args, model, None, **factory_kwargs)
-    args.qwen4_exp_flat_kv = True
-    with_flat_kv = l3_settings(args, model, None, **factory_kwargs)
     assert with_flat_kv.deployment_id != without_flat_kv.deployment_id
 
 

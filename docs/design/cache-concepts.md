@@ -2009,11 +2009,12 @@ make one of the engine's pipeline stages hold more bytes: a stage allocates
 every plane its layers' fields touch, so a field on a plane that no other layer
 of its stage uses costs that stage the whole plane.
 
-With `--qwen4-exp-flat-kv`, all target and draft cache fields share one
+By default, all Qwen4-Exp target and draft cache fields share one
 `flatkv` plane (PP=1, uniform per-view K/V heads, no MXFP8). All GDN layers
 form one state group, with each layer's SSM and convolution fields together.
 Qwen3.8-Flash-Next has five groups: full attention, GDN state, PLE, compressed
-QSA and recent QSA. Ordinary layouts retain their plane-based GDN grouping.
+QSA and recent QSA. `--no-qwen4-exp-flat-kv` selects the ordinary layout,
+which retains its plane-based GDN grouping.
 The recipe sizes the shared parent to fit the largest group while tightly
 packing full-attention K/V. Each other group packs as many pages as its
 payload and stride alignment permit. A parent still belongs to one group at

@@ -468,6 +468,29 @@ def test_flat_kv_groups_gdn_layers_on_one_plane(kv_dtype):
             assert view.stride(0) * view.element_size() == field.page_stride_bytes
 
 
+@pytest.mark.parametrize(
+    ("flags", "flat"), [([], True), (["--no-qwen4-exp-flat-kv"], False)]
+)
+def test_qwen4_exp_default_cache_layout_respects_cli(flags, flat):
+    from tokenspeed.runtime.utils.server_args import prepare_server_args
+
+    recipe = _qwen4_exp_recipe(
+        flat=flat, device="cpu", kv_dtype=torch.bfloat16, state_layers=7
+    )
+    recipe.server_args = prepare_server_args(["--model", "x", *flags])
+    plan = recipe.setup().spec.memory_plan
+    if flat:
+        assert {plane.plane_id for plane in plan.planes} == {"flatkv"}
+        assert {
+            group.group_id
+            for group in plan.groups
+            if group.group_id.startswith("linear_attention_")
+        } == {"linear_attention_0"}
+    else:
+        assert "flatkv" not in {plane.plane_id for plane in plan.planes}
+        assert len(plan.planes) > 1
+
+
 @requires_cuda
 @pytest.mark.parametrize("graph", [False, True])
 def test_shared_plane_qsa_compression_and_recent_write(graph):

@@ -115,7 +115,7 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
 
     @cached_property
     def _flat_kv(self) -> bool:
-        """Whether all cache groups share the experimental physical plane."""
+        """Whether all cache groups share one physical plane."""
         enabled = bool(self.server_args.qwen4_exp_flat_kv)
         if enabled and self.server_args.mapping.pp_size != 1:
             raise NotImplementedError(
