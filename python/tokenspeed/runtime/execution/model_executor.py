@@ -24,7 +24,7 @@ import contextlib
 import gc
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
@@ -2006,6 +2006,17 @@ class ModelExecutor:
 
         if self.capturable_grammar is not None:
             self.capturable_grammar.wait_bitmask()
+
+        if ctx.decode_query_indptr is not None and sampling_info.vocab_mask is not None:
+            if self.drafter is None:
+                raise ValueError("packed grammar masks require a drafter")
+            sampling_info = replace(
+                sampling_info,
+                vocab_mask=self.drafter.pack_grammar_vocab_mask(
+                    sampling_info.vocab_mask,
+                    num_tokens=logits_output.next_token_logits.shape[0],
+                ),
+            )
 
         output_tokens, accept_lengths = self._run_sampling(
             logits_output, sampling_info, ctx, candidates

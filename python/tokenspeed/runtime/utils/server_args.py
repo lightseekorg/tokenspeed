@@ -1030,18 +1030,20 @@ class ServerArgs:
             raise ValueError(
                 "adaptive DSpark requires head and vocabulary groups to follow attention TP"
             )
+        if self.enable_output_cumulative_probs:
+            raise ValueError(
+                "V4.1 adaptive verification does not support "
+                "--enable-output-cumulative-probs"
+            )
         if (
-            self.grammar_backend != "none"
-            or self.enable_output_logprobs
-            or self.enable_output_cumulative_probs
-            or (self.enable_speculative_sampling and self.sampling_backend == "greedy")
+            (self.enable_speculative_sampling and self.sampling_backend == "greedy")
             or self.speculative_draft_tree
             or envs.TOKENSPEED_SPEC_SIMULATED_ACCEPT_LEN.get()
             or self.disable_sampling_tp_sync
         ):
             raise ValueError(
-                "V4.1 adaptive verification requires chain sampling, "
-                "grammar none, and TP synchronization"
+                "V4.1 adaptive verification requires chain sampling "
+                "and TP synchronization"
             )
 
     def validate_output_cumulative_probs(self):
