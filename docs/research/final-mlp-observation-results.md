@@ -89,7 +89,7 @@ outlier at T=512 was retained. GPU-event intervals also include host-dispatch id
 gaps. These are bounded analysis costs, not serving-throughput or decode-overhead
 claims.
 
-## What this establishes for Lazarus-style mitigation
+## Implications for conditional weight edits
 
 A separate study used harmless single-channel final-MLP marker fixtures and a
 label-blind score: rank `abs(activation) * L2(down column)`, ablate the top five,
