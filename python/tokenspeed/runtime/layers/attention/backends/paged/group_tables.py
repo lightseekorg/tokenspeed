@@ -520,6 +520,7 @@ class GroupTableStacks:
             actual_bs=actual_bs,
             tokens_per_req=tokens_per_req,
             ratios=self._ratios,
+            atom_pages_per_block=self._atom_pages,
             pages=self._max_num_pages,
             page_sizes=self.page_sizes_cpu,
             targets=tuple(targets.get(gid) for gid in self.group_ids),

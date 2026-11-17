@@ -2038,7 +2038,9 @@ strided address. `S` must be divisible by the native field-page payload;
 tightly packed fields reduce to the ordinary `b * r + j` mapping. Compressed
 QSA uses its native compressed rows when building its atom view, while its
 locations retain their raw-token units. The same atom tables drive reads
-and write locations. GDN kernels selected for padded state pages must declare
+and write locations. The fused decode refresh uses the physical multiplier
+for both outputs, separately from the logical subpage count. GDN kernels
+selected for padded state pages must declare
 `strided_state` support and address input and output pools with their own
 runtime page strides.
 
