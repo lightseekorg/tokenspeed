@@ -2049,6 +2049,11 @@ class ModelExecutor:
             self._compact_accepted_tree(ctx.bs, logits_output)
 
         if self.drafter is not None:
+            # Next-round preparation may refill the live row indices while the
+            # captured tail still publishes this round's candidates.
+            indices = self.input_buffers.state_write_req_pool_indices_buf[: ctx.bs]
+            if self.forward_step.draft_overlap is not None:
+                indices = self.forward_step.draft_overlap.snapshot(indices)
             draft_accept_lengths = accept_lengths
             if ctx.output_layout.num_decodes:
                 draft_accept_lengths = drafter_accept_lengths(
@@ -2063,7 +2068,6 @@ class ModelExecutor:
             # _update_runtime_state skips future_input_map when drafter is
             # active — drafter writes the next-round inputs directly, and the
             # row's candidate columns are real from here on.
-            indices = self.input_buffers.state_write_req_pool_indices_buf[: ctx.bs]
             for requests in (
                 ctx.output_layout.prefill_slice,
                 ctx.output_layout.decode_request_slice,
@@ -2589,6 +2593,17 @@ class ModelExecutor:
         stop_criteria: Sequence[StopCriteria],
         admission_ids: Sequence[int],
     ) -> ModelExecutionResult:
+        if self.forward_step.draft_overlap is not None:
+            self.forward_step.draft_overlap.prepare_batch(
+                tuple(zip(admission_ids, forward_op.request_pool_indices, strict=True)),
+                reset_state=(
+                    forward_op.num_extends() > 0
+                    or (
+                        request_history_seeds is not None
+                        and bool(request_history_seeds.slots)
+                    )
+                ),
+            )
         self._reset_valid_cache_length(forward_op)
         self.log_step += 1
         num_extends = forward_op.num_extends()
@@ -2997,6 +3012,8 @@ class ModelExecutor:
             # Enqueued behind the output copies; the next forward or task completes the rest.
             if self.drafter is not None and total_tokens > 0:
                 self.drafter.finish_round(ctx, self.forward_step.last_graph_bs)
+            if self.forward_step.draft_overlap is not None:
+                copy_event = self.forward_step.draft_overlap.fence_outputs(copy_event)
 
             if timing_enabled and (
                 num_extends > 0 or self.log_step < 64 or self.log_step % 100 == 0
