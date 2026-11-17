@@ -97,7 +97,7 @@ def _reference_rows(q, k, v, selected, row_ids):
         (24, 2, 6, (576, 582, 594), torch.bfloat16),
         (24, 2, 8, (512, 520, 528), torch.bfloat16),
         (6, 1, 6, (192, 198, 204), torch.bfloat16),
-        (24, 2, 1, (17, 19, 23), torch.float8_e4m3fn),
+        (24, 2, 1, (41, 53, 71), torch.float8_e4m3fn),
     ],
 )
 def test_qsa_dynamic_rows_reuse_compilation(

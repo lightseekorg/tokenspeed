@@ -21,7 +21,7 @@
 """Acceptance-history budgets through real forecasts and the native planner."""
 
 import pytest
-from tokenspeed_scheduler import ConfidenceBudgetPlanner
+from tokenspeed_engine.scheduler import ConfidenceBudgetPlanner
 
 from tokenspeed.runtime.execution.confidence_history import AcceptanceHistory
 from tokenspeed.runtime.utils.server_args import ServerArgs

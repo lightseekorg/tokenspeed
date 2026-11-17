@@ -120,8 +120,9 @@ _DISPATCH = {
     "get_trtllm_moe_sm100_module": {"_get_trtllm_moe_sm100_module_impl"},
     "_get_trtllm_moe_sm100_module_impl": {
         "gen_trtllm_gen_fused_moe_sm100_module",
-        "register_custom_op",
+        "_build_trtllm_moe_namespace",
     },
+    "_build_trtllm_moe_namespace": {"register_custom_op"},
 }
 
 

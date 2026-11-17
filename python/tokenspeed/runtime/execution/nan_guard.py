@@ -101,12 +101,29 @@ class NanGuard:
         if logits.shape[0] == 0:
             return
         if logits_output.logits_layout_plan is None:
-            invalid = torch.isnan(logits.amax(dim=-1))
+            rows = torch.isnan(logits.amax(dim=-1))
             if logits_output.query_layout is not None:
-                invalid = logits_output.query_layout.expand(
-                    invalid, token_dim=0, request_count=ctx.bs
+                rows = logits_output.query_layout.expand(
+                    rows, token_dim=0, request_count=ctx.bs
                 )
-            self._or_per_request(invalid, ctx)
+                self._or_per_request(rows, ctx)
+            elif ctx.decode_query_indptr is None:
+                self._or_per_request(rows, ctx)
+            else:
+                if ctx.num_extends or ctx.bs == 0:
+                    raise ValueError("packed NaN audit requires pure decode requests")
+                requests = torch.searchsorted(
+                    ctx.decode_query_indptr[1:],
+                    torch.arange(rows.numel(), device=rows.device),
+                    right=True,
+                )
+                hits = torch.zeros(ctx.bs, dtype=torch.int32, device=rows.device)
+                hits.scatter_add_(
+                    0,
+                    requests.clamp_max(ctx.bs - 1),
+                    (rows & (requests < ctx.bs)).to(torch.int32),
+                )
+                self.flags[: ctx.bs] |= (hits > 0).to(torch.int32)
         torch.nan_to_num_(
             logits, nan=_NEG_SANITIZED, posinf=_POS_SANITIZED, neginf=_NEG_SANITIZED
         )

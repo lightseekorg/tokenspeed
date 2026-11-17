@@ -218,7 +218,7 @@ class ConfidenceFeedback:
     def __init__(
         self, width: int, max_pending: int, max_batch_size: int, *, budget_policy: str
     ):
-        from tokenspeed_scheduler import ConfidenceBudgetPlanner
+        from tokenspeed_engine.scheduler import ConfidenceBudgetPlanner
 
         if budget_policy not in ("confidence", "history"):
             raise ValueError("confidence budget policy must be confidence or history")

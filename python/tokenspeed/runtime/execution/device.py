@@ -152,6 +152,10 @@ from tokenspeed.runtime.cache.l2.sizing import (
     RetractionPoolRequest,
     tail_lcm_blocks_per_request,
 )
+from tokenspeed.runtime.distributed.cuda_stack import (
+    restore_cuda_stack,
+    trim_cuda_stack,
+)
 from tokenspeed.runtime.distributed.nccl_suspend import (
     resume_nccl_communicators,
     suspend_nccl_communicators,
@@ -181,6 +185,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.cache.host_storage import HostCacheResources
     from tokenspeed.runtime.configs.model_config import ModelConfig
     from tokenspeed.runtime.engine.scheduler_utils import SchedulerCacheGeometry
+    from tokenspeed.runtime.execution.forward_reload import ForwardReloader
     from tokenspeed.runtime.execution.model_executor import ModelExecutor
     from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
@@ -295,6 +300,7 @@ class DeviceSpecs:
     spec_num_tokens: int
     uses_eager_grammar: bool
     supports_disaggregation: bool
+    requires_forward_coordination: bool
     supports_pd_layerwise_finalization: bool
     supports_prompt_logprobs: bool
     cache_state_group_ids: tuple[str, ...]
@@ -393,13 +399,17 @@ class DeviceHandle:
         host_cache_executor=None,
         kv_transfer=None,
         weight_memory: WeightMemoryState | None = None,
+        forward_reloader: ForwardReloader | None = None,
     ) -> None:
         # Private by convention AND by absence: nothing below returns it.
         self._executor = executor
         self._weight_memory = weight_memory
+        # Development only (--allow-reload-forward); None refuses reload_forward.
+        self._forward_reloader = forward_reloader
         # Resolved here, on the building thread, whose current device the
         # distributed init set: torch starts every new thread on device 0.
         self._forward_device = _thread_device(executor.device)
+        self._awake_cuda_stack_limit: int | None = None
         # The compact Host cache -- the L2 prefix tier, the retraction
         # snapshot pool, or both -- or None with neither. Behind the handle
         # for the same reason the pools are: its submit path launches
@@ -455,14 +465,21 @@ class DeviceHandle:
         whose sources the scheduler holds until the ACK -- rides the write
         stream and fences nothing), then the Device-to-Device block copies
         (``pages_to_copy``: a prefix hit's private copy of the block holding
-        its boundary, an owner's move off the block it just published; the
-        source may be re-granted by this very plan, so the copy precedes the
-        zeroing), then page zeroing (the new owner's
-        sanitization), then the Device-bound copies (``LoadBackOp`` and
-        ``RestoreOp``, ordered behind the zeroing: a load-back lands on
-        zeroed pages, a restore overwrites its destinations whole), the
-        transfer peer's remote streams, and finally the ``ForwardBatch``. The
-        loop hands the round over and does not branch on it.
+        its boundary, an owner's move off the block it just published, a
+        block a lone request's compaction moves; the source may be re-granted
+        by this very plan, so the copy precedes the zeroing; the execution
+        stream waits for the copies, so a later plan's stores, which order
+        behind it, read what they wrote even when no forward ran between),
+        then page zeroing (the new owner's sanitization), then the
+        Device-bound copies (``LoadBackOp`` and ``RestoreOp``, ordered behind
+        the zeroing and the forwards in flight, which may still write a
+        block freed by an abort and granted here; both overwrite their
+        destinations whole), the transfer peer's remote streams (a
+        D-node remote prefill only prepares its slots here), the
+        ``ForwardBatch``, and last the D-node remote prefill's pull, whose
+        wait on the zeroing fence would otherwise hold the forward's launch
+        until the step in flight ends. The loop hands the round over and
+        does not branch on it.
 
         A store's ``request_pool_index`` names the victim's slot, which the
         scheduler frees in the same plan build: the slot's next owner first
@@ -549,9 +566,17 @@ class DeviceHandle:
             executor.copy_cache_pages(copies)
         zero_event = executor.zero_cache_pages(pages) if pages else None
         if l2 is not None:
-            # Behind the zeroing: the loads' destinations were zeroed on the
-            # default stream, so that is the prerequisite they order after.
-            # Every plan makes the call, with a load or not: it points the
+            if cache_ops:
+                # A load's or restore's destination may be a block that a
+                # forward still in flight writes: an abort frees its request's
+                # blocks at once, and this plan may grant one to a Host hit.
+                # The copies and the zeroing wait for those forwards, but a
+                # plan may have neither (a hit whose new tokens fit its tail
+                # block), so the loads wait for them here.
+                executor.default_stream.wait_stream(executor.execution_stream)
+            # Behind the store fence, the zeroing and the forwards in flight,
+            # all on the default stream, the prerequisite the loads order
+            # after. Every plan makes the call, with a load or not: it points the
             # layerwise load waits at this plan's load or at none, so neither
             # an eager layer nor a prefill graph replay of this plan waits on
             # an earlier plan's load. Without cache ops it enqueues nothing,
@@ -572,23 +597,27 @@ class DeviceHandle:
             peer.execute(remote_decode)
         if remote_prefill is not None:
             # D role: the prompt prefills on the peer; pull its KV into the
-            # pages this plan admitted (and may be zeroing).
-            self._receive_remote_prefill(remote_prefill, zero_event)
+            # pages this plan admitted (and may be zeroing). The slots are
+            # prepared here; the pull follows the round's forward below.
+            self._prepare_remote_prefill_slots(remote_prefill)
 
         if planned is None:
-            return None
-
-        if self._role is DeviceRole.PD_PREFILL:
+            result = None
+        elif self._role is DeviceRole.PD_PREFILL:
             # A prefill chunk; the host armed its layerwise KV streaming, if
             # on, when it handed this plan over.
-            return self._launch_forward(planned, capture_next_input_ids=True)
+            result = self._launch_forward(planned, capture_next_input_ids=True)
+        else:
+            # Plain engine, or a D-role decode (the D role runs no local
+            # prefill: a retracted request resumes by restore, not by
+            # recompute). A constrained request's matcher was advanced past
+            # the prefill node's token when its RemotePrefillDoneEvent
+            # landed, so masking continues from the right state.
+            result = self._launch_forward(planned)
 
-        # Plain engine, or a D-role decode (the D role runs no local prefill:
-        # a retracted request resumes by restore, not by recompute). A
-        # constrained request's matcher was advanced past the prefill node's
-        # token when its RemotePrefillDoneEvent landed, so masking continues
-        # from the right state.
-        return self._launch_forward(planned)
+        if remote_prefill is not None:
+            self._pull_remote_prefill(remote_prefill, zero_event)
+        return result
 
     @property
     def role(self) -> DeviceRole:
@@ -649,6 +678,7 @@ class DeviceHandle:
                 input_logprob_plan=planned.input_logprob_plan,
                 sampled_top_k=planned.sampled_top_k,
                 stop_criteria=planned.stop_criteria,
+                admission_ids=planned.admission_ids,
             )
 
     def poll_cache_results(self) -> list:
@@ -675,6 +705,17 @@ class DeviceHandle:
             )
         return l2.poll_results()
 
+    def shutdown_model(self) -> None:
+        """Drain local readers, then release shared model weights
+        collectively. Called by the forward thread as its last task, after
+        the last forward's readers: the release joins the other weight
+        owners, who must all reach it."""
+        from tokenspeed.runtime.layers.moe.peer_weights import PeerWeightOwner
+
+        model = self._executor.model_runner.model
+        if isinstance(model, PeerWeightOwner):
+            model.close_peer_weights()
+
     def shutdown_cache(self) -> None:
         """Close the Host cache (the L2 tier and the snapshot pool), once the
         forward thread has stopped, having finished a drafter's pending
@@ -693,21 +734,42 @@ class DeviceHandle:
         self.settle()
         self._executor.execute_idle_forward(dp_metadata)
 
-    def _receive_remote_prefill(self, remote_prefill, zero_event) -> None:
-        """Pull a remote-prefill stream's rows' KV from the peer.
+    def _prepare_remote_prefill_slots(self, remote_prefill) -> None:
+        """Prepare a remote-prefill stream's slots, ahead of the round's
+        forward.
 
         Slot preparation and the cache-length reset touch the execution
         stream, each behind the default stream (the store fence: the slot
         may be a victim's this plan imaged, and its slot-state export reads
-        it on the write stream); the RDMA trigger is CPU-issued but writes
-        the same device pages, so it must follow them and the zeroing fence
+        it on the write stream). Stream-ordered, so it never blocks.
+
+        Args:
+            remote_prefill: The plan's remote-prefill stream; supplies the
+                admitted rows.
+        """
+        executor = self._executor
+        num_extends = remote_prefill.num_extends()
+        executor.prepare_remote_cache_slots(
+            list(remote_prefill.request_pool_indices[:num_extends])
+        )
+        executor.reset_remote_prefill_cache_lengths(remote_prefill)
+
+    def _pull_remote_prefill(self, remote_prefill, zero_event) -> None:
+        """Pull a remote-prefill stream's rows' KV from the peer, behind the
+        round's forward.
+
+        The RDMA trigger is CPU-issued but writes the device pages the slot
+        preparation touched, so it must follow them and the zeroing fence
         (Mooncake and GPUDirect writes are not ordered by the zeroing
         stream, so the destination pages must be published from sanitized
         memory). The same fence covers a retraction's stream-ordered
         write-back reading pages this admission was granted: the zero event
         is recorded on the forward thread's stream AFTER that stream waited
         on the write-back's completion, so waiting on it waits on the copy
-        too. Completion arrives through the transfer events.
+        too. The zeroing is ordered behind the step in flight, so this wait
+        holds the forward thread until that step ends; placed after the
+        round's forward is launched, it never delays that launch. Completion
+        arrives through the transfer events.
 
         Args:
             remote_prefill: The plan's remote-prefill stream; supplies the
@@ -716,12 +778,6 @@ class DeviceHandle:
                 plan zeroes nothing (an admission always zeroes its fresh
                 pages, so a granted request's receive never sees None).
         """
-        executor = self._executor
-        num_extends = remote_prefill.num_extends()
-        executor.prepare_remote_cache_slots(
-            list(remote_prefill.request_pool_indices[:num_extends])
-        )
-        executor.reset_remote_prefill_cache_lengths(remote_prefill)
         if zero_event is not None:
             zero_event.synchronize()
         self._kv_transfer.execute(remote_prefill)
@@ -734,6 +790,19 @@ class DeviceHandle:
         """Wait for all device work before a memory region is unmapped."""
         self.settle()
         self._executor.device_module.synchronize()
+
+    def empty_cache(self) -> None:
+        """Release eager cuBLAS workspaces and allocator blocks after GPU work drains."""
+        if self._forward_device.type == "cuda" and self._executor.config.enforce_eager:
+            # Graphs may retain these addresses; eager GEMMs acquire new workspaces lazily.
+            with allow_host_sync(
+                "release eager cuBLAS workspaces after device work drains"
+            ):
+                self.synchronize()
+                clear = getattr(torch._C, "_cuda_clearCublasWorkspaces", None)
+                if clear is not None:
+                    clear()
+        self._executor.device_module.empty_cache()
 
     def prepare_kv_release(self) -> None:
         """Quiesce everything that can touch the KV arena before it is unmapped.
@@ -789,13 +858,19 @@ class DeviceHandle:
             self._weight_memory.mark_kv_resumed()
 
     def suspend_nccl(self) -> None:
-        """Free the NCCL communicators' buffers; they stay usable after resume."""
-        self.settle()
+        """Drain GPU work and release NCCL buffers, allocator cache and the CUDA stack."""
+        self.synchronize()
         suspend_nccl_communicators()
+        self.empty_cache()
+        if self._forward_device.type == "cuda" and torch.version.hip is None:
+            self._awake_cuda_stack_limit = trim_cuda_stack()
 
     def resume_nccl(self) -> None:
         """Restore the NCCL communicators suspended by :meth:`suspend_nccl`."""
         self.settle()
+        if self._awake_cuda_stack_limit is not None:
+            restore_cuda_stack(self._awake_cuda_stack_limit)
+            self._awake_cuda_stack_limit = None
         resume_nccl_communicators()
 
     def run_remote_prefill_landing(
@@ -1002,6 +1077,7 @@ class DeviceHandle:
                     req.version,
                     self._mooncake_update_models(),
                     require_complete=require_complete,
+                    snapshot=req.snapshot,
                 )
             ),
             DestroyWeightsUpdateGroupReqInput: runner.destroy_weights_update_group,
@@ -1040,6 +1116,33 @@ class DeviceHandle:
             if loads_weights and state is not None and state.updating:
                 state.finish_update(success=False)
             return False, str(exc)
+
+    def reload_forward(self, req) -> tuple[bool, str]:
+        """Reload edited forward code with every peer, warm its kernels and recapture the graphs (``ReloadForwardReqInput``)."""
+        if self._forward_reloader is None:
+            return False, (
+                "forward reload is off: it is a development operation; start the "
+                "server with --allow-reload-forward"
+            )
+        self.settle()
+        executor = self._executor
+        server_args = executor.model_runner.server_args
+        # Startup warmed and captured from clean dummy inputs; serving left its own in them.
+        executor.forget_served_inputs()
+
+        def warm() -> None:
+            with current_platform().restore_stack_limit():
+                executor.autotune(keep_loaded_tactics=True)
+
+        def recapture() -> None:
+            # A rollback's recapture follows a failed capture, which left its own dummy inputs.
+            executor.forget_served_inputs()
+            recapture_graphs(executor, server_args)
+
+        with allow_host_sync("a forward reload warms kernels and captures graphs"):
+            return self._forward_reloader.reload(
+                req.modules, warm=warm, recapture=recapture
+            )
 
     def commit_weight_update(self, success: bool) -> None:
         """Apply the replica-wide result before KV wake or another forward."""
@@ -1122,6 +1225,98 @@ def arm_data_plane_sync_debug(device: str) -> None:
     logger.info(
         f"Data-plane sync debug armed ({mode!s}): host synchronizations on the "
         "serving path are reported"
+    )
+
+
+def _forward_reloader(server_args: ServerArgs, global_rank: int) -> ForwardReloader:
+    """The development reloader, planning on the first rank of the world group."""
+    from tokenspeed.runtime.distributed.process_group_manager import (
+        process_group_manager as pg_manager,
+    )
+    from tokenspeed.runtime.execution.forward_reload import ForwardReloader
+
+    mapping = server_args.mapping
+    world = mapping.world_group
+    planner_rank = world[0] if world else global_rank
+    if global_rank == planner_rank:
+        logger.warning(
+            "--allow-reload-forward: development mode, the reload_forward control "
+            "call re-executes edited code in this server; never use it in production"
+        )
+    return ForwardReloader(
+        group=(
+            pg_manager.get_process_group("gloo", world)
+            if mapping.world_size > 1
+            else None
+        ),
+        planner_rank=planner_rank,
+        is_planner=global_rank == planner_rank,
+    )
+
+
+def _replays_prefill_graphs(server_args: ServerArgs, model_config) -> bool:
+    """Whether breaks of the prefill graphs may run collectives; an instance-wide fact, so ranks agree."""
+    return server_args.disaggregation_mode == "prefill" or (
+        server_args.disaggregation_mode == "null"
+        and model_config.dsa_padded_prefill_replay
+    )
+
+
+def _warm_rebound_draft(executor, server_args: ServerArgs, *, has_draft: bool) -> None:
+    """Initialize the BLAS handle of the DFlash draft's auxiliary stream, which a rebind recreates, before capture."""
+    if (
+        has_draft
+        and server_args.speculative_algorithm == "DFLASH"
+        and not executor.config.prefill_only
+    ):
+        with torch.no_grad():
+            executor.forward_step.warmup_decode_path(
+                batch_sizes=(1,), graph_phase=False
+            )
+
+
+def _capture_serving_graphs(
+    executor, server_args: ServerArgs, replays_prefill_graphs: bool
+) -> None:
+    """Capture every graph and leave the generator and expert-load state serving starts from."""
+    from tokenspeed.runtime.execution.memory_delta import NULL_MEMORY_DELTA_OBSERVER
+    from tokenspeed.runtime.utils import set_random_seed
+
+    executor.capture_graphs(entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)
+    if server_args.enable_dsv41_adaptive_dspark:
+        from tokenspeed.runtime.execution.drafter.verify_startup import (
+            profile_dsv41_startup,
+        )
+
+        with startup_phase("dspark.profile"):
+            profile_dsv41_startup(executor)
+    if replays_prefill_graphs and not executor.prefill_graph.disable:
+        # Release capture-stream cache no forward reuses; graph pools are not freed.
+        device_module = torch.get_device_module(server_args.device)
+        before = device_module.memory_reserved() - device_module.memory_allocated()
+        device_module.empty_cache()
+        after = device_module.memory_reserved() - device_module.memory_allocated()
+        logger.info(
+            f"post-capture allocator cache: {before / 2**30:.2f} -> "
+            f"{after / 2**30:.2f} GiB"
+        )
+    # Tuning and capture draw from the generator; this is the state startup leaves.
+    set_random_seed(48)
+    start_expert_load_window(executor)
+
+
+def recapture_graphs(executor, server_args: ServerArgs) -> None:
+    """Drop the graphs and rebuild their owners on the bound pools, then capture again as startup does after its rebind."""
+    executor.release_graphs()
+    torch.get_device_module(server_args.device).empty_cache()
+    executor.set_cache_pool(executor.token_to_kv_pool, executor.draft_token_to_kv_pool)
+    _warm_rebound_draft(
+        executor, server_args, has_draft=executor.draft_model_runner is not None
+    )
+    _capture_serving_graphs(
+        executor,
+        server_args,
+        _replays_prefill_graphs(server_args, executor.model_runner.model_config),
     )
 
 
@@ -1218,28 +1413,46 @@ def probe_arena_floor(
     """Parent blocks a probe arena needs for the widest row the boot fabricates.
 
     Both terms track a knob: the ladder is built from the resolved prefill-graph
-    ceiling, which is a default rather than zero when unset, and a configured
-    capture batch size fabricates that many rows whatever the bucket. Returned
+    ceiling, which is a default rather than zero when unset, and a capture
+    batch size, configured or the default, fabricates that many rows. Returned
     rather than inlined so a test can assert the number instead of the source.
     A narrowing model's decoder ladder (``decoder_rows_per_request`` is its
     ``max_decoder_rows_per_request``, None for other models) fabricates one
     request per that many rows of a bucket no wider than the token ladder's,
-    and never more than ``max_num_seqs``.
+    and never more than ``max_num_seqs``. A chain drafter records its extend
+    rounds' decode steps, and a block drafter its block draft, at every request
+    count up to ``EXTEND_DECODE_MAX_REQUESTS``, and never more than
+    ``max_num_seqs``.
     """
     from tokenspeed.runtime.execution.cudagraph_memory import probe_arena_parent_blocks
+    from tokenspeed.runtime.execution.drafter.base import EXTEND_DECODE_MAX_REQUESTS
     from tokenspeed.runtime.execution.model_executor import (
         _resolve_prefill_graph_max_tokens,
     )
+    from tokenspeed.runtime.execution.prefill_graph import (
+        PREFILL_DEFAULT_CAPTURE_REQUESTS,
+    )
+    from tokenspeed.runtime.utils.server_args import EXTEND_GRAPH_SPEC_ALGORITHMS
 
     tokens = max(max_forward_tokens, _resolve_prefill_graph_max_tokens(server_args))
+    capture_batch_sizes = server_args.prefill_graph_capture_batch_sizes
+    if capture_batch_sizes is None:
+        capture_batch_sizes = [
+            min(PREFILL_DEFAULT_CAPTURE_REQUESTS, server_args.max_num_seqs)
+        ]
     return probe_arena_parent_blocks(
         max_forward_tokens=tokens,
         context_len=model_config.context_len,
-        capture_batch_sizes=server_args.prefill_graph_capture_batch_sizes,
+        capture_batch_sizes=capture_batch_sizes,
         decoder_requests=(
             0
             if decoder_rows_per_request is None
             else min(-(-tokens // decoder_rows_per_request), server_args.max_num_seqs)
+        ),
+        drafter_requests=(
+            min(server_args.max_num_seqs, EXTEND_DECODE_MAX_REQUESTS)
+            if server_args.speculative_algorithm in EXTEND_GRAPH_SPEC_ALGORITHMS
+            else 0
         ),
     )
 
@@ -1250,6 +1463,7 @@ def _retraction_pool_request(
     *,
     host_group_packing,
     max_batch_size: int,
+    max_resident_requests: int,
     max_context_len: int,
     decode_input_tokens: int,
     overlap_schedule_depth: int,
@@ -1280,7 +1494,8 @@ def _retraction_pool_request(
             virtual_packing=host_group_packing,
             limits=SchedulerLimits(
                 role=scheduler_role(server_args.disaggregation_mode),
-                max_live_requests=max_batch_size,
+                max_batch_size=max_batch_size,
+                max_resident_requests=max_resident_requests,
                 max_scheduled_tokens=int(server_args.chunked_prefill_size),
                 max_context_len=max_context_len,
                 decode_input_tokens=decode_input_tokens,
@@ -1311,6 +1526,7 @@ def build_device_side(
     overlap_schedule_depth: int,
     decode_input_tokens: int,
     max_batch_size: int,
+    max_resident_requests: int,
     kv_transfer_builder,
 ) -> DeviceBuild:
     """Construct the whole device side and return the three views of it.
@@ -1339,9 +1555,9 @@ def build_device_side(
             size the KV budget.
         overlap_schedule_depth: Decode KV reservation depth.
         decode_input_tokens: Tokens each decode step feeds per request.
-        max_batch_size: Rank-local scheduler batch bound; the executor
-            sizes its request pool one row past it for the graph-padding
-            sink row.
+        max_batch_size: Rank-local scheduler execution bound.
+        max_resident_requests: Rank-local request-pool bound. Null row 0 and
+            the graph-padding row sit outside the live range.
         kv_transfer_builder: Builds the PD transfer peer from the finished
             attention build, or returns None outside disaggregation: the
             host's ``build_host_peer`` (``pd/host_peer.py``), bound to the
@@ -1363,12 +1579,17 @@ def build_device_side(
         NULL_MEMORY_DELTA_OBSERVER,
         DriverMemoryDeltaObserver,
     )
-    from tokenspeed.runtime.execution.prefill_graph import narrowing_prefill_model
+    from tokenspeed.runtime.execution.prefill_graph import (
+        check_rank_uniform_prefill_plan,
+        narrowing_prefill_model,
+    )
     from tokenspeed.runtime.execution.request_slots import RequestSlotLayout
+    from tokenspeed.runtime.layers.attention.dcp.cache import (
+        prepare_prefix_history_transport,
+    )
     from tokenspeed.runtime.layers.attention.registry import (
         create_attn_components,
     )
-    from tokenspeed.runtime.utils import set_random_seed
 
     target, draft = create_model_runner(
         server_args, model_config, draft_model_config, gpu_id, global_rank
@@ -1396,6 +1617,12 @@ def build_device_side(
         target.prepare_communication_runtime(max_forward_tokens)
         if draft is not None:
             draft.prepare_communication_runtime(max_forward_tokens)
+        prepare_prefix_history_transport(
+            server_args,
+            model_config,
+            [runner.model for runner in (target, draft) if runner is not None],
+            torch.device(server_args.device, gpu_id),
+        )
     if communication_first:
         prepare_multimodal()
 
@@ -1480,7 +1707,7 @@ def build_device_side(
                 server_args=server_args,
                 model_config=model_config,
                 model=target.model,
-                max_req_pool_size=RequestSlotLayout(max_batch_size).padding,
+                max_req_pool_size=RequestSlotLayout(max_resident_requests).padding,
                 gpu_id=gpu_id,
                 global_rank=global_rank,
                 prefix_granularity=views.cache_geometry.prefix_granularity,
@@ -1493,13 +1720,24 @@ def build_device_side(
             draft_attn_backend=attention.draft_attn_backend,
             draft_token_to_kv_pool=views.draft_token_to_kv_pool,
         )
+    replays_prefill_graphs = _replays_prefill_graphs(server_args, model_config)
+    if replays_prefill_graphs:
+        # Ranks must plan alike: one rank eager while its peers replay hangs them.
+        check_rank_uniform_prefill_plan(executor.prefill_graph, server_args)
     # Once per process, before the probe: a graph keeps its capture-time tactic.
     with (
         startup_memory.measure("startup"),
         startup_phase("kernels.autotune"),
         current_platform().restore_stack_limit(),
     ):
-        executor.autotune()
+        executor.autotune(keep_loaded_tactics=False)
+    if probing and current_platform().is_nvidia:
+        # After empty_cache, reserved minus allocated is residue pinned by live buffers.
+        device_module = torch.get_device_module(server_args.device)
+        pinned = device_module.memory_reserved() - device_module.memory_allocated()
+        logger.info(
+            f"startup allocator cache after empty_cache: {pinned / 2**30:.2f} GiB"
+        )
     if probing:
         # Consumers above keep the probe's: they read only block-count-invariant fields.
         with startup_phase("graph.probe_rebind"):
@@ -1512,43 +1750,17 @@ def build_device_side(
                 requested_backends,
                 startup_resident_bytes=sum(startup_memory.samples.get("startup", ())),
             )
-        if (
-            draft is not None
-            and server_args.speculative_algorithm == "DFLASH"
-            and not executor.config.prefill_only
-        ):
-            # Rebinding recreates the draft's auxiliary stream. Graph-phase
-            # warmups bypass its overlap path, so initialize its BLAS handle
-            # eagerly again before the final capture uses that fresh stream.
-            with torch.no_grad():
-                executor.forward_step.warmup_decode_path(
-                    batch_sizes=(1,), graph_phase=False
-                )
-
-    with startup_phase("graph.capture"):
-        executor.capture_graphs(entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)
-    # Tuning and capture draw from the generator; this is the state startup leaves.
-    set_random_seed(48)
-    start_expert_load_window(executor)
-
-    # Per-rank GPU memory breakdown (weights by group, KV/graph/non-torch).
-    if attn_tp_rank == 0:
-        log_gpu_memory_summary(
-            target.model,
-            gpu_id,
-            global_rank,
-            logger,
-            device=server_args.device,
-            draft_model=draft.model if draft is not None else None,
-            kv_pool=views.token_to_kv_pool,
-            draft_kv_pool=views.draft_token_to_kv_pool,
-        )
+        _warm_rebound_draft(executor, server_args, has_draft=draft is not None)
 
     # The compact Host cache: the L2 prefix tier (--enable-kvstore), the
     # retraction snapshot pool (on by default on the roles that retract), or
     # both in one executor over the same field geometry. The executor is the
     # model executor's peer: it lays out the slot-state exporters the model
-    # executor lists, so it is built after it.
+    # executor lists, so it is built after it. It is built before the graphs
+    # are captured, over the final pools: a prefill graph's capture notes,
+    # through the layerwise load trackers it registers on them, which layer
+    # each captured segment's cache accesses reach, for its replays to wait
+    # for (BreakableCapture.wait_before_segment).
     host_cache_executor = None
     host_cache = None
     host_tail_packing = {}
@@ -1572,7 +1784,9 @@ def build_device_side(
         host_tail_packing = {
             group.group_id: packing * shards[group.group_id]
             for group, packing in zip(
-                layout.groups, compute_host_group_packing(layout), strict=True
+                layout.groups,
+                compute_host_group_packing(layout, group_specs=contract.group_specs),
+                strict=True,
             )
         }
     snapshot_pool = _retraction_pool_request(
@@ -1580,6 +1794,7 @@ def build_device_side(
         views.token_to_kv_pool.arena.runtime_contract,
         host_group_packing=host_tail_packing,
         max_batch_size=max_batch_size,
+        max_resident_requests=max_resident_requests,
         max_context_len=model_config.context_len + server_args.spec_context_pad,
         decode_input_tokens=decode_input_tokens,
         overlap_schedule_depth=overlap_schedule_depth,
@@ -1613,6 +1828,23 @@ def build_device_side(
         logger.info(
             NO_POOL.describe(host_lcm_block_bytes=0, blob_bytes=0, l2_tier=False)
         )
+
+    with startup_phase("graph.capture"):
+        _capture_serving_graphs(executor, server_args, replays_prefill_graphs)
+
+    # Per-rank GPU memory breakdown (weights by group, KV/graph/non-torch).
+    if attn_tp_rank == 0:
+        log_gpu_memory_summary(
+            target.model,
+            gpu_id,
+            global_rank,
+            logger,
+            device=server_args.device,
+            draft_model=draft.model if draft is not None else None,
+            kv_pool=views.token_to_kv_pool,
+            draft_kv_pool=views.draft_token_to_kv_pool,
+        )
+
     if host_cache_executor is not None and host_cache_executor.host_storage is not None:
         from tokenspeed.runtime.cache.host_storage import HostCacheResources
 
@@ -1659,6 +1891,7 @@ def build_device_side(
         spec_num_tokens=spec_num_tokens,
         uses_eager_grammar=executor.eager_grammar_buffers is not None,
         supports_disaggregation=views.token_to_kv_pool.arena.supports_disaggregation,
+        requires_forward_coordination=server_args.mapping.requires_forward_coordination,
         supports_pd_layerwise_finalization=_supports_pd_layerwise_finalization(
             executor, server_args.mapping
         ),
@@ -1721,6 +1954,11 @@ def build_device_side(
             host_cache_executor=host_cache_executor,
             kv_transfer=kv_transfer,
             weight_memory=weight_memory,
+            forward_reloader=(
+                _forward_reloader(server_args, global_rank)
+                if server_args.allow_reload_forward
+                else None
+            ),
         ),
     )
 

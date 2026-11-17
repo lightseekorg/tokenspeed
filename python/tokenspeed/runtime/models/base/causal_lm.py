@@ -26,7 +26,7 @@ import functools
 import inspect
 from collections.abc import Callable, Iterable
 from dataclasses import replace
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
 from torch import nn
@@ -45,6 +45,9 @@ from tokenspeed.runtime.model_loader.weight_utils import (
 )
 from tokenspeed.runtime.models.base.transformer_model import BaseTransformerModel
 from tokenspeed.runtime.utils import add_prefix
+
+if TYPE_CHECKING:
+    from tokenspeed.runtime.layers.moe import MoECheckpointLoader
 
 
 def _record_loaded_names(load_weights: Callable) -> Callable:
@@ -149,7 +152,9 @@ class BaseCausalLM(nn.Module):
     required source must arrive exactly once; the session validates all
     models before any post-load derivation. The model declares discard
     support separately and lists its non-checkpoint preserved tensors in
-    ``weight_discard_preserved_tensors``.
+    ``weight_discard_preserved_tensors``. A quantized model additionally needs
+    its resolved ``QuantizationConfig`` to opt in to discard: every complete
+    update must regenerate encoded weights and scales in their original storage.
 
     The session fields are class-level defaults so a subclass that builds
     itself without ``BaseCausalLM.__init__`` (the speculative drafts) still
@@ -157,6 +162,7 @@ class BaseCausalLM(nn.Module):
     """
 
     model_cls: type[BaseTransformerModel]
+    logits_processor_cls: ClassVar[type[LogitsProcessor]] = LogitsProcessor
     # Whether the model's MoE layers route through the process-global expert
     # placement (redundant replicas, load counters; ``moe/expert_location.py``)
     # and its loader fills every placed slot. ``build_expert_placement``
@@ -307,12 +313,13 @@ class BaseCausalLM(nn.Module):
 
     def resolve_logits_processor(self, config: PretrainedConfig) -> LogitsProcessor:
 
-        return LogitsProcessor(
+        return self.logits_processor_cls(
             config,
             skip_all_gather=self.mapping.attn.has_dp,
             tp_rank=self.mapping.lm_head.tp_rank,
             tp_size=self.mapping.lm_head.tp_size,
             tp_group=self.mapping.lm_head.tp_group,
+            attn_tp_size=self.mapping.attn.tp_size,
             dp_lm_head_tp=self.mapping.attn.has_dp and self.mapping.lm_head.has_tp,
         )
 
@@ -326,6 +333,12 @@ class BaseCausalLM(nn.Module):
                 f"{type(self).__name__} does not return aux hidden states, so "
                 "EAGLE3 and DFLASH drafts cannot attach to it"
             )
+
+    def stores_capture_taps(self, ctx: ForwardContext) -> bool:
+        """Whether this forward stores the draft's taps itself (for example in
+        its decode monokernels), so that a draft's capture sink must not read
+        them as the forward produces them."""
+        return False
 
     def set_eagle3_layers_to_capture(self, layer_ids: list[int] | None = None) -> None:
 
@@ -454,13 +467,18 @@ class BaseCausalLM(nn.Module):
 
     # Weight loading.
 
-    def get_stacked_params_mapping(self) -> list[tuple[str, str, str]]:
+    def get_stacked_params_mapping(self) -> list[tuple[str, str, int | str]]:
 
         return []
 
     def get_skip_weight_names(self) -> list[str]:
 
         return ["rotary_emb.inv_freq"]
+
+    def get_expert_checkpoint_loader(self) -> MoECheckpointLoader | None:
+        """The loader for this rank's routed experts, or None without experts."""
+
+        return None
 
     @_record_loaded_names
     def load_weights(
@@ -475,11 +493,20 @@ class BaseCausalLM(nn.Module):
         stacked_params_mapping = self.get_stacked_params_mapping()
         skip_patterns = self.get_skip_weight_names()
         params_dict: dict[str, nn.Parameter] = dict(self.named_parameters())
+        expert_loader = self.get_expert_checkpoint_loader()
         loaded: set[str] = set()
 
         for name, loaded_weight in weights:
 
             if any(pattern in name for pattern in skip_patterns):
+                continue
+
+            if expert_loader is not None and expert_loader.is_expert_checkpoint_weight(
+                name
+            ):
+                # Experts this rank does not match belong to another EP rank.
+                if expert_loader.matches(name):
+                    loaded.add(expert_loader.load(name, loaded_weight))
                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:

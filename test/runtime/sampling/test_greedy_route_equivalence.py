@@ -79,7 +79,7 @@ def _prepare_backend(backend, bs: int, num_tokens_per_req: int = 1):
     rids = [f"greedy_{i}" for i in range(bs)]
     pool_indices = list(range(bs))
     backend.prepare_step(
-        request_ids=rids,
+        admission_ids=list(range(1, len(rids) + 1)),
         request_pool_indices=pool_indices,
         sampling_params_list=[_greedy_sp(r) for r in rids],
         num_tokens_per_req=num_tokens_per_req,
@@ -180,7 +180,7 @@ def test_sample_top_k1_tie_rows_pick_a_max(backend_name):
     backend2 = _backends()[backend_name](_make_config())
     rids2 = [f"resubmitted_{i}" for i in range(bs)]
     backend2.prepare_step(
-        request_ids=rids2,
+        admission_ids=list(range(1, len(rids2) + 1)),
         request_pool_indices=list(range(bs)),
         sampling_params_list=[_greedy_sp(r) for r in rids2],
         num_tokens_per_req=1,

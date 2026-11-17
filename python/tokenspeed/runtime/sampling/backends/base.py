@@ -22,11 +22,13 @@ from __future__ import annotations
 
 import math
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.ops.sampling import write_synthetic_verify_outputs
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.distributed.comm_backend import get_global_backend
@@ -40,11 +42,14 @@ from tokenspeed.runtime.execution.slot_state import (
 )
 
 if TYPE_CHECKING:
+    from transformers import PretrainedConfig
+
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
+    from tokenspeed.runtime.layers.sampled_vocab_shard import SampledVocabShard
     from tokenspeed.runtime.sampling.dp_sampling_config import DpSamplingRuntimeConfig
     from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
     from tokenspeed.runtime.sampling.sampling_params import SamplingParams
-    from tokenspeed.runtime.sampling.tree_verify import TreeVerifyBatch
+    from tokenspeed.runtime.sampling.tree_verify import DraftTreeQ, TreeVerifyBatch
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
@@ -70,20 +75,24 @@ class SpeculativeSamplingPools:
 @dataclass
 class SamplingBackendConfig:
     synthetic_acceptance_length: float | None
-    # Draft-prob rejection sampling: verify gathers the drafter's recorded
-    # distributions by pool index into a persistent [max_pad_bs, N, vocab]
-    # fp32 buffer and runs the chain kernel's coin * q(x) < p(x) rule
-    # instead of the target-only rule. Selects the verify rule, so it is
-    # explicit.
+    # Draft-prob rejection sampling: the FlashInfer backends gather the step
+    # drafters' recorded distributions by pool index into a persistent
+    # [max_pad_bs, N, vocab] fp32 buffer, and the triton backend reads the
+    # DFlash2 walk's sparse q (SamplingBatchInfo.draft_q) in place; both run
+    # coin * q(x) < p(x) instead of the target-only rule. Selects the verify
+    # rule, so it is explicit.
     enable_speculative_sampling: bool
 
     # Random stream of the FlashInfer backends' sampled rows ("batch" or
     # "per-request", see ServerArgs.sampling_stream). Behaviour-selecting, so
     # it has no default: every constructor names the stream it wants.
     sampling_stream: str
-    # Order of the selected-token log-softmax ("torch" or "megatron", see
+    # Selected-token logprob recipe (see
     # ServerArgs.logprob_order). Behaviour-selecting, so no default either.
     logprob_order: str
+
+    # Only ascend_full applies the optional top-p candidate truncation.
+    npu_sampling_top_p_top_k_cap: bool = False
 
     enable_nan_detection: bool = False
 
@@ -104,6 +113,8 @@ class SamplingBackendConfig:
     # rejection sampling). Required to keep RNG out of the CUDA graph.
     max_bs: int = 1
     max_draft_tokens_per_req: int = 1
+    # Sizing like max_bs: with draft trees (``ServerArgs.speculative_draft_tree``) a backend allocates and warms its tree verify; the ``tree`` argument of ``verify`` picks the rule.
+    draft_tree: bool = False
 
     # Sizing for backend-owned per-request state (e.g. token-count buffers
     # for penalties in FlashInferFullSamplingBackend). Indexed by req_pool_idx, not
@@ -123,6 +134,7 @@ class SamplingBackendConfig:
         cls,
         server_args: ServerArgs,
         *,
+        hf_config: PretrainedConfig,
         max_bs: int,
         max_draft_tokens_per_req: int,
         device: str,
@@ -131,11 +143,17 @@ class SamplingBackendConfig:
         vocab_size: int = 0,
         tp_group: tuple[int, ...] | None = None,
     ) -> SamplingBackendConfig:
+        npu_sampling_top_p_top_k_cap = getattr(
+            hf_config, "npu_sampling_top_p_top_k_cap", False
+        )
+        if not isinstance(npu_sampling_top_p_top_k_cap, bool):
+            raise ValueError("HF config npu_sampling_top_p_top_k_cap must be a boolean")
 
         return cls(
             synthetic_acceptance_length=server_args.synthetic_acceptance_length,
             sampling_stream=server_args.sampling_stream,
             logprob_order=server_args.logprob_order,
+            npu_sampling_top_p_top_k_cap=npu_sampling_top_p_top_k_cap,
             enable_nan_detection=server_args.enable_nan_detection,
             enable_output_logprobs=server_args.enable_output_logprobs,
             enable_output_cumulative_probs=server_args.enable_output_cumulative_probs,
@@ -149,6 +167,7 @@ class SamplingBackendConfig:
             ),
             max_bs=max_bs,
             max_draft_tokens_per_req=max(max_draft_tokens_per_req, 1),
+            draft_tree=server_args.speculative_draft_tree,
             max_req_pool_size=max_req_pool_size,
             vocab_size=vocab_size,
             device=device,
@@ -173,7 +192,7 @@ class SamplingBackend(ABC):
 
     Per-slot state is part of the retraction image (``SlotStateExporter``):
     a restored request samples exactly as it would have unretracted, so the
-    import suppresses the rid-flip reset for the restored slot.
+    import suppresses the admission-change reset for the restored slot.
     """
 
     # Admission checks this exclusive bound. None means the backend handles
@@ -220,7 +239,8 @@ class SamplingBackend(ABC):
         if config.synthetic_acceptance_length is not None:
             if not self._SUPPORTS_SYNTHETIC_ACCEPTANCE:
                 raise ValueError(
-                    "synthetic acceptance requires the greedy sampling backend"
+                    "synthetic acceptance requires the greedy or sonic sampling "
+                    "backend, or the flashinfer backend over sampled drafts"
                 )
             al = config.synthetic_acceptance_length
             if not math.isfinite(al) or not 1 <= al <= config.max_draft_tokens_per_req:
@@ -246,21 +266,17 @@ class SamplingBackend(ABC):
                     (config.max_bs,), device=config.device
                 )
 
-        # Sentinel of "which rid currently owns each slot from this backend's
-        # point of view". rid is just a comparison value here, not a lookup
-        # key, so this is pool-keyed state (size O(pool_rows) strings), not
-        # rid-keyed state. A mismatch against the incoming rid is a flip.
-        if self._HAS_POOL_STATE:
-            pool_rows = config.max_req_pool_size + 1
-            self._last_rid_per_slot: list[str | None] = [None] * pool_rows
-            # Batch-composition version: prepare_step bumps it whenever the
-            # serving batch's membership can change — a slot flip (new
-            # request in a slot) or a size change (a retraction departs
-            # without flipping anything). Batch-aggregate facts that depend
-            # only on the mix (the Triton route/pad) cache against it and
-            # recompute only on a bump.
-            self._batch_composition_epoch: int = 0
-            self._last_step_bs: int | None = None
+        # The admission whose sampling state was prepared in each slot.
+        # A reused external request ID must still reset its previous state.
+        pool_rows = config.max_req_pool_size + 1 if self._HAS_POOL_STATE else 0
+        self._last_admission_per_slot: list[int | None] = [None] * pool_rows
+
+        # Batch-aggregate facts (the Triton route/pad) follow the admissions
+        # actually scheduled, not all prepared slots. A restored admission
+        # already owns its slot, and equally sized resident batches may
+        # alternate without any slot changing owners.
+        self._batch_composition_epoch: int = 0
+        self._last_step_admission_ids: tuple[int, ...] | None = None
 
         # Pool-indexed kernels (the Triton Gumbel-max routes, the FlashInfer
         # backends' per-request stream) take int32 pool indices and a
@@ -391,6 +407,85 @@ class SamplingBackend(ABC):
         tree verify, as agreed across TP ranks."""
         return self._accept_index_buf[: bs * num_nodes].view(bs, num_nodes)
 
+    def vocab_shard_top_k(self) -> int | None:
+        """Most candidates per row this backend selects from vocabulary shards.
+
+        A backend returning a count reads a ``LogitsProcessorOutput`` whose
+        sampled rows stayed vocab-sharded (``vocab_shard``): it selects each
+        row's best candidates per shard where its route needs no more, and
+        gathers whole rows otherwise. None (the default) reads whole rows
+        only, so the processor gathers them.
+        """
+        return None
+
+    def supports_vocab_shard(
+        self, dtype: torch.dtype, columns: int, tp_size: int
+    ) -> bool:
+        """Whether this backend selects candidates from vocabulary shards of this geometry.
+
+        The default fits the shared shard selection (``vocab_shard_topk``) and
+        merge at ``vocab_shard_top_k`` candidates.
+
+        Args:
+            dtype: The shard logits' dtype, as the processor hands them over.
+            columns: Vocabulary columns per shard.
+            tp_size: Ranks the vocabulary is sharded over.
+        """
+        from tokenspeed_kernel.ops.sampling import (
+            vocab_shard_topk_supports,
+            vocab_topk_merge_supports,
+        )
+
+        top_k = self.vocab_shard_top_k()
+        return (
+            top_k is not None
+            and vocab_shard_topk_supports(dtype, columns, top_k)
+            and vocab_topk_merge_supports(tp_size, top_k)
+        )
+
+    def verifies_vocab_shard_draft_probs(self) -> bool:
+        """Whether ``verify`` takes ``draft_probs`` over each rank's vocabulary shard.
+
+        Under ``enable_speculative_sampling`` with sharded target logits, a
+        drafter whose head is sharded alike can then record each rank's
+        columns of ``q`` only (``[P, N, V / tp]``), and never gather its
+        logits. The default reads whole-vocabulary rows.
+        """
+        return False
+
+    def warmup_vocab_shard_sampling(
+        self,
+        shard: SampledVocabShard,
+        candidates: torch.Tensor,
+        *,
+        draft_q: DraftTreeQ | None,
+        with_vocab_mask: bool,
+        draft_probs: torch.Tensor | None,
+    ) -> None:
+        """Compile what ``sample`` and ``verify`` run on vocabulary shards.
+
+        A backend whose ``vocab_shard_top_k`` returns a count overrides it.
+        Startup calls it on every TP rank before serving.
+
+        Args:
+            shard: Shard logits of the processor that feeds this backend,
+                one row per column of ``candidates``.
+            candidates: One request's ``[1, N]`` verify window, in the dtype
+                and width the server verifies.
+            draft_q: The draft q every verify reads, or None when the server
+                verifies without one.
+            with_vocab_mask: Whether the server applies grammar masks.
+            draft_probs: The runtime's dense draft distributions every verify
+                reads (whole rows, or this rank's columns), or None.
+
+        Raises:
+            NotImplementedError: This backend reads whole rows only.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} reads whole rows only; it has no "
+            "vocab-shard sampling to warm"
+        )
+
     def reads_only_argmax(self) -> bool:
         """Whether ``sample`` and ``verify`` need nothing of the target logits
         but each row's argmax, which they then take from
@@ -416,8 +511,8 @@ class SamplingBackend(ABC):
         """
         raise NotImplementedError(
             f"{type(self).__name__} has no draft-prob verify; "
-            "--enable-speculative-sampling needs the flashinfer or "
-            "flashinfer_full sampling backend"
+            "--enable-speculative-sampling needs the flashinfer, "
+            "flashinfer_full or sonic sampling backend (triton for DFLASH)"
         )
 
     def maybe_broadcast(self, *tensors: torch.Tensor) -> None:
@@ -438,7 +533,7 @@ class SamplingBackend(ABC):
 
     def prepare_step(
         self,
-        request_ids: list[str],
+        admission_ids: Sequence[int],
         request_pool_indices: list[int],
         sampling_params_list: list[SamplingParams],
         num_tokens_per_req: int = 1,
@@ -448,8 +543,8 @@ class SamplingBackend(ABC):
         Synthetic lengths refresh even for backends without pool state so
         graph replay sees fresh lengths. Pool-state backends also perform:
 
-        1. Flip detection: a slot's owning rid changed since last step
-           (first-use and rid-recycling look the same). Delegates to
+        1. Flip detection: a slot's admission identity changed since last step.
+           External request IDs can be reused after retirement. Delegates to
            _reset_slot which scatters all per-slot persistent state
            (scalars, counts, bias, generators).
         2. Per-step dynamic refill: coin buffers, etc. Delegated to the
@@ -463,29 +558,29 @@ class SamplingBackend(ABC):
             return
 
         assert (
-            len(request_ids) == len(request_pool_indices) == len(sampling_params_list)
+            len(admission_ids) == len(request_pool_indices) == len(sampling_params_list)
         ), (
             f"prepare_step expects aligned per-request lists; got "
-            f"rids={len(request_ids)}, pool_indices={len(request_pool_indices)}, "
+            f"admissions={len(admission_ids)}, pool_indices={len(request_pool_indices)}, "
             f"sp_list={len(sampling_params_list)}"
         )
 
-        pool_rows = len(self._last_rid_per_slot)
-        batch_size = len(request_pool_indices)
-        membership_changed = batch_size != self._last_step_bs
-        for rid, pool_idx, sp in zip(
-            request_ids, request_pool_indices, sampling_params_list
+        pool_rows = len(self._last_admission_per_slot)
+        step_admission_ids = tuple(admission_ids)
+        membership_changed = step_admission_ids != self._last_step_admission_ids
+        for admission_id, pool_idx, sp in zip(
+            admission_ids, request_pool_indices, sampling_params_list
         ):
             assert (
                 0 <= pool_idx < pool_rows
-            ), f"pool_idx {pool_idx} out of range [0, {pool_rows}) for rid={rid}"
-            if self._last_rid_per_slot[pool_idx] != rid:
+            ), f"pool_idx {pool_idx} out of range [0, {pool_rows}) for admission_id={admission_id}"
+            if self._last_admission_per_slot[pool_idx] != admission_id:
                 self._reset_slot(pool_idx, sp)
-                self._last_rid_per_slot[pool_idx] = rid
+                self._last_admission_per_slot[pool_idx] = admission_id
                 membership_changed = True
         if membership_changed:
             self._batch_composition_epoch += 1
-        self._last_step_bs = batch_size
+        self._last_step_admission_ids = step_admission_ids
 
         self._prepare_step_hook(
             num_tokens_per_req=num_tokens_per_req,
@@ -535,32 +630,48 @@ class SamplingBackend(ABC):
             row_offset : row_offset + force_single_token.numel()
         ].masked_fill_(force_single_token, 1)
 
+    @staticmethod
+    def sample_synthetic_targets(
+        target_probs: torch.Tensor, lengths: torch.Tensor, coins: torch.Tensor
+    ) -> torch.Tensor:
+        """Draw each row's correction/bonus token from the target distribution.
+
+        Args:
+            target_probs: ``[bs, N, V]`` verify target probabilities (after
+                temperature / top-k / top-p).
+            lengths: ``[bs]`` synthetic lengths in ``[1, N]``; the token lands
+                at verify position ``length - 1``.
+            coins: ``[bs]`` uniforms in ``(0, 1)`` prepared outside the graph.
+
+        Returns:
+            ``[bs]`` int64 token ids. Inverse-CDF sampling: greedy rows (a
+            one-hot after top-k = 1) return their argmax, and a zero-probability
+            token is never chosen.
+        """
+        bs, n, vocab = target_probs.shape
+        rows = torch.arange(bs, device=target_probs.device) * n + (lengths.long() - 1)
+        cdf = target_probs.reshape(bs * n, vocab).index_select(0, rows).cumsum_(1)
+        threshold = (coins * cdf[:, -1]).unsqueeze(1)
+        tokens = torch.searchsorted(cdf, threshold, right=True).squeeze(1)
+        return tokens.clamp_(max=vocab - 1)
+
     def write_synthetic_outputs(
         self,
         candidates: torch.Tensor,
-        target_tokens: torch.Tensor,
+        targets: torch.Tensor,
         lengths: torch.Tensor,
         predict: torch.Tensor,
         accept_index: torch.Tensor,
         accept_length: torch.Tensor,
     ) -> None:
-        """Commit a draft prefix followed by its target correction/bonus token."""
-        bs, n = candidates.shape
-        positions = torch.arange(n, device=candidates.device).expand(bs, n)
-        output = predict.view(bs, n)
-        output[:, : n - 1].copy_(candidates[:, 1:])
-        output.masked_fill_(positions >= lengths[:, None] - 1, 0)
-        output.scatter_(
-            1, (lengths - 1).long()[:, None], target_tokens.to(predict.dtype)[:, None]
+        """Commit a draft prefix followed by its target correction/bonus token.
+
+        ``targets`` is each row's token, or its ``[bs, n]`` target row whose
+        token at the cutoff is taken; ``lengths`` past ``n`` count as ``n``.
+        """
+        write_synthetic_verify_outputs(
+            candidates, targets, lengths, predict, accept_index, accept_length
         )
-        accept_index.copy_(
-            torch.where(
-                positions < lengths[:, None],
-                positions + torch.arange(bs, device=candidates.device)[:, None] * n,
-                -1,
-            )
-        )
-        accept_length.copy_(lengths - 1)
 
     def cuda_graph_capture_variants(self, num_tokens_per_req: int) -> tuple[str, ...]:
         """Return sampler-specific CUDA graph variants to capture."""
@@ -634,44 +745,62 @@ class SamplingBackend(ABC):
         unpack_slot_rows(self.slot_state_rows(slot), src, stream)
 
     def export_slot_state(
-        self, slot: int, out: torch.Tensor, stream, *, request_id: str
+        self, slot: int, out: torch.Tensor, stream, *, admission_id: int
     ) -> None:
         if not self._HAS_POOL_STATE:
             return
-        # The slot holds ``request_id``'s state only once prepare_step ran a
+        # The slot holds ``admission_id``'s state only once prepare_step ran a
         # forward for it there; a victim retracted before its first forward
         # (a PD decode role's landed request) still holds the previous
         # occupant's, so the image carries the marker alone.
-        prepared = self._last_rid_per_slot[slot] == request_id
+        prepared = self._last_admission_per_slot[slot] == admission_id
         write_prepared_marker(out, prepared)
         if prepared:
             self._export_slot_payload(slot, out[PREPARED_MARKER_BYTES:], stream)
 
     def import_slot_state(
-        self, slot: int, src: torch.Tensor, stream, *, request_id: str
+        self, slot: int, src: torch.Tensor, stream, *, admission_id: int
     ) -> None:
         if not self._HAS_POOL_STATE:
             return
         if read_prepared_marker(src):
             self._import_slot_payload(slot, src[PREPARED_MARKER_BYTES:], stream)
-            # ``prepare_step`` compares the incoming rid against this sentinel;
-            # a match is not a flip, so the restored rows are not reset as a
-            # new occupant's.
-            self._last_rid_per_slot[slot] = request_id
+            # The next prepare_step sees the same admission and preserves
+            # the restored rows instead of initializing a new occupant.
+            self._last_admission_per_slot[slot] = admission_id
         else:
             # Nobody's: the first prepare_step resets the slot from the
             # request's own SamplingParams, as it would have unretracted.
-            self._last_rid_per_slot[slot] = None
+            self._last_admission_per_slot[slot] = None
 
     def get_packed_output_d2h(
         self,
         output_tokens: torch.Tensor,
         output_lengths: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """If the backend wrote both outputs into a single contiguous GPU
-        buffer, return CPU views obtained from one D2H copy. Otherwise
-        return None and let the caller fall back to two separate D2Hs."""
-        return None
+        """One D2H of the packed predict+accept_length region.
+
+        Applies when both outputs alias into ``_output_pack_buf``, where
+        ``verify()`` lands them (and a backend's ``sample()`` may). Otherwise
+        returns None and the caller falls back to two D2Hs.
+        """
+        if (
+            output_tokens.data_ptr() != self._output_pack_buf.data_ptr()
+            or output_lengths.data_ptr() != self._accept_length_buf.data_ptr()
+        ):
+            return None
+        n_t = output_tokens.numel()
+        n_l = output_lengths.numel()
+        # Copy the whole [0, predict_max + n_l). The gap [n_t, predict_max)
+        # is stale padding (max_bs * max_n  vs.  bs * n) — small enough that
+        # the saved launch beats the wasted bandwidth.
+        size = self._predict_max + n_l
+        cpu_pack = torch.empty(size, dtype=torch.int32, pin_memory=True)
+        cpu_pack.copy_(self._output_pack_buf[:size], non_blocking=True)
+        return (
+            cpu_pack[:n_t].view(output_tokens.shape),
+            cpu_pack[self._predict_max : self._predict_max + n_l],
+        )
 
     # Backends whose verify() takes draft trees (tree=TreeVerifyBatch).
     supports_tree_verify: bool = False

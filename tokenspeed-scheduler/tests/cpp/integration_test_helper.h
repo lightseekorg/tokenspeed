@@ -37,6 +37,40 @@
 
 #include "unit_test_helper.h"
 
+namespace tokenspeed {
+
+// Reaches the coordinator and the pool behind a scheduler (its friend), so a
+// test can hold a cache entry's block as a store ticket or another holder
+// would (pinned: neither evictable nor cleared by a compaction), or read a
+// block's page id; and records an admission's pages on a plan as the plan
+// build does.
+struct SchedulerTestAccess {
+    static CacheCoordinator& Coordinator(Scheduler& scheduler) { return scheduler.coordinator_; }
+    static const BlockPool& Pool(const Scheduler& scheduler) { return scheduler.block_pool_; }
+    static BlockPool& Pool(Scheduler& scheduler) { return scheduler.block_pool_; }
+    // A metadata-only fill still needs the same token descriptors as a real
+    // publication before the coordinator notifies the event sink.
+    static void RegisterKvEventPages(Scheduler& scheduler, Request& request, std::span<const std::string> hashes,
+                                     std::int32_t first_page) {
+        scheduler.registerKvEventPrefixPages(request, hashes, first_page, static_cast<std::int32_t>(hashes.size()));
+    }
+    static void RecordAdmittedPages(Scheduler& scheduler, ExecutionPlan& plan,
+                                    const CacheCoordinator::AdmissionResult& result) {
+        scheduler.recordAdmittedPages(plan, result);
+    }
+    static std::uint64_t DecodeAdmissions(const Scheduler& scheduler) { return scheduler.decode_admissions_; }
+    static std::int32_t ResultsInFlight(Scheduler& scheduler, const std::string& request_id) {
+        const Request* request = scheduler.findRequest(request_id);
+        return request == nullptr ? 0 : request->ResultsInFlight();
+    }
+    // Whether the request's prompt prefix hashes have been computed.
+    static bool PromptHashed(Scheduler& scheduler, const std::string& request_id) {
+        return scheduler.findRequest(request_id)->prompt_prefix_hashes_.has_value();
+    }
+};
+
+}  // namespace tokenspeed
+
 namespace tokenspeed::test {
 
 // Retraction capacity for a test config that does not exercise image-fit
@@ -65,6 +99,7 @@ protected:
         cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.enable_l3_storage = false;
         cfg.cache_groups.push_back(CacheGroupConfig{
             .group_id = "full_attention",
@@ -95,7 +130,10 @@ protected:
 
     void Submit(const std::vector<RequestSpec>& specs) { scheduler_->SubmitRequests(specs); }
 
-    ExecutionPlan PlanOnce() { return scheduler_->NextExecutionPlan(); }
+    ExecutionPlan PlanOnce() {
+        return scheduler_->NextExecutionPlan(
+            Scheduler::PlanOptions{.allow_prefill = true, .apply_prefill_watermark = false});
+    }
 
     static std::vector<CacheOperation> ExtractCacheOps(const ExecutionPlan& plan) {
         std::vector<CacheOperation> result;
@@ -157,6 +195,14 @@ protected:
         scheduler_->Advance(std::move(event));
     }
 
+    // Cleanup for probes that cancel work after inspecting its plan. The
+    // queued forwards still land even when the request has been cancelled.
+    void DrainForwardResults(const std::string& request_id) {
+        while (SchedulerTestAccess::ResultsInFlight(*scheduler_, request_id) > 0) {
+            SendForwardDone(request_id);
+        }
+    }
+
     // Send Finish (generation complete) to the scheduler. Finish-created
     // transfer tickets retain writeback sources after the request reaches Finished.
     void SendFinish(const std::string& request_id) {
@@ -170,6 +216,15 @@ protected:
     void SendAbortEvent(const std::string& request_id) {
         ExecutionEvent event;
         event.With(forward::Abort{.request_id = request_id});
+        scheduler_->Advance(std::move(event));
+    }
+
+    // The PD transport's report that a failed or cancelled transfer stopped:
+    // a request an abort or a failure parked in PdTransferring returns its
+    // pages. Ignored for any other request.
+    void SendTransferStopped(const std::string& request_id) {
+        ExecutionEvent event;
+        event.With(pd::TransferStoppedEvent{request_id});
         scheduler_->Advance(std::move(event));
     }
 
@@ -243,6 +298,21 @@ inline const ForwardBatch* FindRemoteAdmission(const ExecutionPlan& plan) {
     return plan.remote_prefill ? &*plan.remote_prefill : nullptr;
 }
 
+// Whether the prefills whose chunk reaches their prompt's end form a prefix of
+// `batch`'s prefill rows, as the runtime's output layout requires
+// (ForwardOutputLayout.from_prefill, docs/design/unified_path.md).
+inline bool CompletingPrefillsFormAPrefix(const ForwardBatch& batch) {
+    bool incomplete_seen = false;
+    for (std::size_t i = 0; i < batch.NumExtends(); ++i) {
+        const bool completes = batch.extend_prefix_lens[i] + batch.input_lengths[i] == batch.prefill_lengths[i];
+        if (completes && incomplete_seen) {
+            return false;
+        }
+        incomplete_seen = incomplete_seen || !completes;
+    }
+    return true;
+}
+
 // Inserts every real (>0) page id found in `rows` into `seen`, expecting each
 // id to be new — i.e. not repeated within `rows` and disjoint from any id
 // already in `seen` (callers can chain groups through one set to assert
@@ -286,6 +356,7 @@ protected:
         cfg.host_allocator.total_pages = 0;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
         cfg.enable_l3_storage = false;
         cfg.disable_l2_cache = true;
         cfg.disable_prefix_cache = false;

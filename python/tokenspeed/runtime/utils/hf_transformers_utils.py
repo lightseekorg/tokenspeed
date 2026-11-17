@@ -31,6 +31,7 @@ import warnings
 from collections.abc import Callable
 from typing import Any
 
+import huggingface_hub
 import torch
 from huggingface_hub import snapshot_download
 from transformers import (
@@ -45,12 +46,17 @@ from transformers import (
 from tokenspeed.runtime.configs import (
     DeepseekV41Config,
     DeepseekV41TextConfig,
+    Inkling2MMConfig,
+    Inkling2ModelConfig,
+    Inkling2MTPConfig,
+    Inkling2VisionConfig,
     InklingMMConfig,
     InklingModelConfig,
     KimiK2Config,
     KimiK3Config,
     KimiK3DSparkConfig,
     KimiK25Config,
+    KimiK31Config,
     MiniMaxM3Config,
     MuseSparkConfig,
     Qwen3_5Config,
@@ -91,9 +97,14 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     KimiK2Config.model_type: KimiK2Config,
     KimiK25Config.model_type: KimiK25Config,
     KimiK3Config.model_type: KimiK3Config,
+    KimiK31Config.model_type: KimiK31Config,
     KimiK3DSparkConfig.model_type: KimiK3DSparkConfig,
     InklingModelConfig.model_type: InklingModelConfig,
     InklingMMConfig.model_type: InklingMMConfig,
+    Inkling2ModelConfig.model_type: Inkling2ModelConfig,
+    Inkling2MMConfig.model_type: Inkling2MMConfig,
+    Inkling2MTPConfig.model_type: Inkling2MTPConfig,
+    Inkling2VisionConfig.model_type: Inkling2VisionConfig,
     Glm53FlashConfig.model_type: Glm53FlashConfig,
     NemotronHConfig.model_type: NemotronHConfig,
     NemotronHOmniConfig.model_type: NemotronHOmniConfig,
@@ -374,6 +385,7 @@ def get_config(
                 model,
                 revision=revision,
                 ignore_patterns=["*.pt", "*.safetensors", "*.bin"],
+                local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
             )
 
         with get_lock(model):
@@ -457,6 +469,14 @@ def get_config(
             )
             del text_config.quantization_config["modules_to_not_convert"]
 
+    if is_draft_worker and isinstance(config, (Inkling2MMConfig, Inkling2MTPConfig)):
+        if speculative_algorithm != "DSPARK":
+            raise NotImplementedError("Inkling2 requires its separate DSpark MTP model")
+        if isinstance(config, Inkling2MMConfig):
+            config = Inkling2MTPConfig.from_target(config)
+        config._name_or_path = model
+        text_config = config
+
     # If the draft head ships in the same checkpoint as the base model,
     # rewrite the architecture in place so the model loader dispatches
     # to the *NextN / *Eagle3 entry class instead of the base one.
@@ -515,7 +535,9 @@ def get_config(
         "KimiK25Config",
         "KimiK3ForConditionalGeneration",
         "KimiK3ForConditionalGenerationNextN",
+        "KimiK31ForConditionalGeneration",
         "KimiK3Config",
+        "KimiK31Config",
         "Glm53FlashForConditionalGeneration",
         "Glm53FlashForConditionalGenerationNextN",
         "Glm53FlashConfig",
@@ -530,6 +552,8 @@ def get_config(
         "InklingForConditionalGeneration",
         "InklingForConditionalGenerationNextN",
         "InklingMMConfig",
+        "Inkling2ForConditionalGeneration",
+        "Inkling2MMConfig",
         "Qwen3OmniMoeForConditionalGeneration",
         "Qwen3OmniMoeConfig",
         "Qwen3ASRForConditionalGeneration",
@@ -578,6 +602,7 @@ def get_generation_config(
                     model,
                     revision=revision,
                     ignore_patterns=["*.pt", "*.safetensors", "*.bin"],
+                    local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
                 )
 
             with get_lock(model):
@@ -862,6 +887,7 @@ def get_tokenizer(
                 tokenizer_name,
                 revision=tokenizer_revision,
                 ignore_patterns=["*.pt", "*.safetensors", "*.bin"],
+                local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
             )
 
         with get_lock(tokenizer_name):

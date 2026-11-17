@@ -298,7 +298,7 @@ class MultimodalRuntime:
         substitute_ids = resolve_mm_pad_substitute_ids(target_model_config.hf_config)
         if substitute_ids:
             input_buffers.set_mm_pad_substitute_ids(
-                substitute_ids, target_model_config.vocab_size
+                substitute_ids, target_model_config.input_vocab_size
             )
         elif target_model_config.is_multimodal_active:
             raise ValueError(

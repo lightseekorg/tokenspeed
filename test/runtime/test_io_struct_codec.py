@@ -101,6 +101,7 @@ def _batch_token_id_out(**overrides) -> BatchTokenIDOutSlim:
         prompt_tokens=[4, 5],
         completion_tokens=[2, 1],
         cached_tokens=[0, 3],
+        reasoning_tokens=[1, 0],
         output_token_logprobs_val=[[-0.5, -0.25], []],
         output_token_logprobs_idx=[[1, 2], []],
         finish_reason_details=[None, {"type": "stop", "matched": 7}],

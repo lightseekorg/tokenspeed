@@ -48,7 +48,7 @@ def _publish_worker(rank, store_path):
         timeout=timedelta(seconds=60),
     )
     try:
-        states = RuntimeStates(5, 16, 4, device="cpu")
+        states = RuntimeStates(5, 16, 16, 4, device="cpu")
         states.init_draft_confidence(3)
         slots = torch.tensor([1, 3])
         source = torch.tensor([[0.9, 0.8, 0.7], [0.1, 0.2, 0.3]])

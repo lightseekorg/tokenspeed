@@ -219,7 +219,7 @@ class _Executor(ModelExecutor):
         self.device = "cuda"
         self.device_module = torch.cuda
         self.input_buffers = InputBuffers(8, 32, 9, device="cuda")
-        self.runtime_states = RuntimeStates(9, 16, 4, "cuda")
+        self.runtime_states = RuntimeStates(9, 16, 16, 4, "cuda")
         self.runtime_states.future_input_map.zero_()
         self.runtime_states.init_draft_confidence(3)
         self.runtime_states.draft_confidence.fill_(0.8)

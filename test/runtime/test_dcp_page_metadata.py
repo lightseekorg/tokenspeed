@@ -38,6 +38,12 @@ from tokenspeed.runtime.layers.attention.dcp.metadata import (
     PositionPreservingDCPMetadata,
     refresh_dcp_page_table_metadata,
 )
+from tokenspeed.runtime.layers.attention.dcp.placement import (
+    CachePlacement,
+    max_owned_index_pages,
+    owned_history_rows,
+    resolve_cache_slots,
+)
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
@@ -352,3 +358,193 @@ def test_verify_query_lengths_cross_ownership_boundaries(device, block_size):
                 )
                 assert metadata.local_visible_lens.tolist() == [rows, [0] * 6]
                 assert metadata.local_seq_lens.tolist() == [expected[-1], 0]
+
+
+def _skewed_index_table(seq_lens, *, degree, subpages, virtual_block_count, seed):
+    """A host kernel-page table dealing each request distinct blocks, about
+    70% of the first request's from rank 0, with stale pages past every
+    length and a wider mirror than the lengths need."""
+    generator = torch.Generator().manual_seed(seed)
+    page = 64
+    counts = [-(-length // (page * subpages)) for length in seq_lens]
+    # Block ``v`` lives on rank ``(v - 1) % degree``.
+    per_rank = (virtual_block_count - 1) // degree
+    pools = [
+        (torch.randperm(per_rank, generator=generator) * degree + rank + 1).tolist()
+        for rank in range(degree)
+    ]
+    columns = max(counts) * subpages + 5
+    table = torch.randint(
+        1,
+        virtual_block_count * subpages,
+        (len(seq_lens), columns),
+        generator=generator,
+    )
+    for request, count in enumerate(counts):
+        blocks = []
+        for index in range(count):
+            if request == 0 and index < count * 7 // 10:
+                owner = 0
+            else:
+                live = [rank for rank in range(degree) if pools[rank]]
+                owner = live[int(torch.randint(len(live), (1,), generator=generator))]
+            blocks.append(pools[owner].pop())
+        pages = [block * subpages + sub for block in blocks for sub in range(subpages)]
+        table[request, : len(pages)] = torch.tensor(pages)
+    return table.to(torch.int32)
+
+
+def _device_owned_pages(table, causal, request, placement, page):
+    """The pages a query row keeps on its rank: the DCP indexer's local table
+    (``resolve_cache_slots`` over the table's slots, as ``_local_index_table``
+    builds it) filtered as the candidate compaction filters it."""
+    slots, owned = resolve_cache_slots(table[request].long() * page, placement)
+    local = torch.where(owned, slots // page, -1)
+    starts = torch.arange(table.shape[1]) * page
+    return int(((local > 0) & (starts < causal)).sum())
+
+
+@pytest.mark.parametrize("degree", [2, 4, 8])
+@pytest.mark.parametrize("block_size", [64, 128])
+@pytest.mark.parametrize("holes", [False, True])
+def test_max_owned_index_pages_bounds_every_rank(degree, block_size, holes):
+    """The host bound covers every query row on every rank, is reached by
+    some request's last row, and ignores pages without an owner (the null
+    block, a block past the capacity) instead of refusing them."""
+    page, virtual_block_count = 64, 1 + 128 * degree
+    subpages = block_size // page
+    seq_lens = [5000, 1, 64 * 7 + 3, 130]
+    table = _skewed_index_table(
+        seq_lens,
+        degree=degree,
+        subpages=subpages,
+        virtual_block_count=virtual_block_count,
+        seed=degree * block_size + holes,
+    )
+    if holes:
+        # A null page and a page past the capacity inside request 0's length.
+        table[0, 3] = 0
+        table[0, 9] = virtual_block_count * subpages
+        with pytest.raises(ValueError, match="holes"):
+            owned_history_rows(
+                table,
+                torch.tensor(seq_lens),
+                page_size=page,
+                placement=CachePlacement(block_size, virtual_block_count, (0,), 0),
+            )
+    group = tuple(range(degree))
+    bounds, reached = set(), 0
+    for rank in group:
+        placement = CachePlacement(block_size, virtual_block_count, group, rank)
+        bounds.add(
+            max_owned_index_pages(
+                table,
+                torch.tensor(seq_lens, dtype=torch.int32),
+                page_size=page,
+                placement=placement,
+            )
+        )
+        for request, length in enumerate(seq_lens):
+            # The rows of a chunk ending at the request's length.
+            for causal in sorted({1, max(1, length // 2), max(1, length - 1), length}):
+                owned = _device_owned_pages(table, causal, request, placement, page)
+                assert owned <= min(bounds)
+            reached = max(
+                reached, _device_owned_pages(table, length, request, placement, page)
+            )
+    # Every rank computes the same bound, and it is tight.
+    assert len(bounds) == 1
+    assert bounds == {reached}
+    # One owner ([B, 0, ..., 0], a capture dummy's): all pages of the longest request.
+    one_owner = torch.full_like(table, subpages * (1 + degree))
+    assert max_owned_index_pages(
+        one_owner,
+        torch.tensor(seq_lens),
+        page_size=page,
+        placement=CachePlacement(block_size, virtual_block_count, group, 0),
+    ) == -(-max(seq_lens) // page)
+
+
+def test_max_owned_index_pages_of_no_pages_is_zero():
+    placement = CachePlacement(128, 9, (0, 1), 1)
+    for table, lengths in (
+        (torch.zeros((0, 4), dtype=torch.int32), torch.zeros(0, dtype=torch.int32)),
+        (torch.tensor([[2, 3]], dtype=torch.int32), torch.tensor([0])),
+        (torch.tensor([[0, 0]], dtype=torch.int32), torch.tensor([100])),
+    ):
+        assert (
+            max_owned_index_pages(table, lengths, page_size=64, placement=placement)
+            == 0
+        )
+    with pytest.raises(ValueError, match="rows for"):
+        max_owned_index_pages(
+            torch.zeros((2, 4), dtype=torch.int32),
+            torch.tensor([1]),
+            page_size=64,
+            placement=placement,
+        )
+
+
+def test_write_slots_are_reused_per_forward_and_slots(monkeypatch):
+    """Every layer's write at the forward's slots reuses one resolution; other
+    slots, rewritten slots and another placement resolve again, each with
+    ``resolve_cache_slots``'s result. A graph capture resolves the forward's
+    slots itself rather than reusing an eager resolution, and an eager write
+    never reuses the capture's."""
+    from types import SimpleNamespace
+
+    import tokenspeed.runtime.layers.attention.dcp.placement as placement_mod
+
+    capturing = [False]
+    monkeypatch.setattr(
+        placement_mod, "current_platform", lambda: SimpleNamespace(is_amd=True)
+    )
+    monkeypatch.setattr(
+        placement_mod.torch.cuda, "is_current_stream_capturing", lambda: capturing[0]
+    )
+    # Inside the capacity, so ranks and rewritten slots resolve differently.
+    placement = CachePlacement(128, 33, (0, 1, 2, 3), 2)
+    # The forward's SparseTopKShare field.
+    share = SimpleNamespace(write_slots=[])
+    loc = torch.arange(200, 264, dtype=torch.int64) * 7
+
+    first = placement_mod.resolve_write_slots(loc, placement, share)
+    for view in (loc, loc[:64], loc.view(64)):
+        again = placement_mod.resolve_write_slots(view, placement, share)
+        assert again[0] is first[0] and again[1] is first[1]
+    expected = resolve_cache_slots(loc, placement)
+    assert torch.equal(first[0], expected[0]) and torch.equal(first[1], expected[1])
+
+    other = replace(placement, rank=1)
+    for view, where in ((loc[:32], placement), (loc, other)):
+        result = placement_mod.resolve_write_slots(view, where, share)
+        expected = resolve_cache_slots(view, where)
+        assert torch.equal(result[0], expected[0])
+        assert torch.equal(result[1], expected[1])
+    loc.add_(128)
+    result = placement_mod.resolve_write_slots(loc, placement, share)
+    expected = resolve_cache_slots(loc, placement)
+    assert torch.equal(result[0], expected[0]) and torch.equal(result[1], expected[1])
+
+    # SparseTopKShare.clear at the next forward's metadata build.
+    share.write_slots = []
+    eager = placement_mod.resolve_write_slots(loc, placement, share)
+    capturing[0] = True
+    captured = placement_mod.resolve_write_slots(loc, placement, share)
+    assert captured[0] is not eager[0]
+    again = placement_mod.resolve_write_slots(loc, placement, share)
+    assert again[0] is captured[0]
+    capturing[0] = False
+    after = placement_mod.resolve_write_slots(loc, placement, share)
+    assert after[0] is eager[0]
+
+    # Slots made under inference mode carry no version, so they are not kept.
+    share.write_slots = []
+    with torch.inference_mode():
+        inference_loc = loc.clone()
+    for _ in range(2):
+        result = placement_mod.resolve_write_slots(inference_loc, placement, share)
+        expected = resolve_cache_slots(inference_loc, placement)
+        assert torch.equal(result[0], expected[0])
+        assert torch.equal(result[1], expected[1])
+    assert share.write_slots == []

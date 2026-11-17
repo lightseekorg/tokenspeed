@@ -187,6 +187,7 @@ def _attn_config(layer_types, window) -> AttnConfig:
         kernel_page_size=64,
         context_len=262144,
         max_bs=64,
+        max_resident_requests=64,
     )
 
 
@@ -670,6 +671,7 @@ def _drafter_config(max_position_embeddings):
         use_sliding_window=True,
         sliding_window=4096,
         layer_types=["sliding_attention"],
+        decode_monokernel=False,
         dflash_config={
             "block_size": 16,
             "conv_group_size": 16,

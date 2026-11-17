@@ -206,6 +206,7 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
                 prefix_is_sharded=prefix_is_sharded,
                 norm_weight=norm_weight,
                 eps=1e-5 if norm_weight is not None else None,
+                shared_reduced=None,
             )
         assert output is not None
         tail_kernels_warmed.add(prefix_is_sharded)
@@ -328,6 +329,7 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
                 prefix_is_sharded=False,
                 norm_weight=norm_weight,
                 eps=eps,
+                shared_reduced=None,
             )
             is None
         )
@@ -349,6 +351,7 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
                 prefix_is_sharded=False,
                 norm_weight=norm_weight,
                 eps=1e-5,
+                shared_reduced=None,
             )
             is None
         )
@@ -363,6 +366,7 @@ def _check_moe_tail(rank: int, device: torch.device, group: dist.ProcessGroup) -
                 prefix_is_sharded=True,
                 norm_weight=norm,
                 eps=1e-5,
+                shared_reduced=None,
             )
             is None
         )

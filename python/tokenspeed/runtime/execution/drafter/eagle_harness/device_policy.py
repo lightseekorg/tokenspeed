@@ -73,7 +73,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
-from tokenspeed_kernel.thirdparty.cuda.eagle_harness_policy import (
+from tokenspeed_kernel.ops.sampling.eagle_harness import (
     eagle_harness_policy_begin_round,
     eagle_harness_policy_decide_chain,
     eagle_harness_policy_decide_tree,

@@ -41,7 +41,7 @@ tensors. Two kernels are registered:
   statements of ``apply_ssmax_root10`` with Beam's constants. Admits every shape
   the statements admit.
 * ``triton_fused_qk_rmsnorm_ssmax`` (solution ``triton``, SPECIALIZED, NVIDIA
-  SM90 to SM103, checked on SM90 and SM100): one launch of the shared
+  SM90 and newer): one launch of the shared
   ``_fused_qk_rmsnorm_kernel`` through
   ``qk_rmsnorm(..., ssmax_positions=positions)`` with the constexprs
   ``ROUND_AFTER_AFFINE`` (the affine output rounded once to BF16, the value the
@@ -50,15 +50,16 @@ tensors. Two kernels are registered:
   ``2^-11`` in place of the division by 2048, one IEEE round-to-nearest
   multiply, one BF16 store; no table). It admits BF16 rank-2 ``q``/``k`` with a
   contiguous last axis and token strides covering the row (Beam's ``qkv.split``
-  column views or contiguous tensors), the head pairs ``(48, 8)`` and ``(6, 1)``
-  of head dimension 128, contiguous BF16 ``[128]`` weights, a contiguous int32 /
-  int64 ``[tokens]`` positions vector, a finite positive ``eps``, ``tokens > 0``
-  and one CUDA device. Ranked selection picks it wherever its traits admit the
-  call and keeps ``torch_qk_rmsnorm_ssmax`` everywhere else; reached by name it
-  raises on any other call (:func:`qk_rmsnorm_ssmax_rejection`), an empty batch
-  included: no in-function fallback. ``positions >= 0`` is the caller's
-  contract on both kernels, as it is for ``apply_ssmax_root10`` (never read on
-  the host: the product path runs under CUDA-graph capture).
+  column views or contiguous tensors), the head pairs ``(48, 8)``, ``(24, 4)``,
+  ``(12, 2)`` and ``(6, 1)`` of head dimension 128, contiguous BF16 ``[128]``
+  weights, a contiguous int32 / int64 ``[tokens]`` positions vector, a finite
+  positive ``eps``, ``tokens > 0`` and one CUDA device. Ranked selection picks
+  it wherever its traits admit the call and keeps ``torch_qk_rmsnorm_ssmax``
+  everywhere else; reached by name it raises on any other call
+  (:func:`qk_rmsnorm_ssmax_rejection`), an empty batch included: no in-function
+  fallback. ``positions >= 0`` is the caller's contract on both kernels, as it
+  is for ``apply_ssmax_root10`` (never read on the host: the product path runs
+  under CUDA-graph capture).
 
 The fused kernel's scale equals Torch's bit for bit on every position of
 ``[0, 2^20]`` for int32 and int64 (measured, zero mismatches), and the two kernels
@@ -99,7 +100,6 @@ __all__ = [
     "QK_RMSNORM_SSMAX_FAMILY",
     "QK_RMSNORM_SSMAX_MODE",
     "QK_RMSNORM_SSMAX_SIGNATURES",
-    "SM103",
     "SM90",
     "SSMAX_DENOMINATOR",
     "SSMAX_OFFSET",
@@ -120,9 +120,9 @@ QK_RMSNORM_SSMAX_MODE = "qk_rmsnorm_ssmax"
 TORCH_QK_RMSNORM_SSMAX = "torch_qk_rmsnorm_ssmax"
 TRITON_FUSED_QK_RMSNORM_SSMAX = "triton_fused_qk_rmsnorm_ssmax"
 # The head geometry the fused kernel admits: Beam's head dimension and its
-# (q heads, kv heads) pairs at TP1 and on the TP8 shard.
+# (q heads, kv heads) pairs at TP1 and on the TP2, TP4 and TP8 shards.
 BEAM_HEAD_DIM = 128
-BEAM_HEADS = ((48, 8), (6, 1))
+BEAM_HEADS = ((48, 8), (24, 4), (12, 2), (6, 1))
 # ``apply_ssmax_root10(q, positions, 1, 2048.0)`` in ``BeamAttention.prepare_qkv``;
 # the fused kernel carries the same constants as literals.
 SSMAX_OFFSET = 1
@@ -130,12 +130,7 @@ SSMAX_DENOMINATOR = 2048.0
 POSITION_DTYPES = (torch.int32, torch.int64)
 # The feature a call requests when it passes ``dequant``; both kernels declare it.
 DEQUANT = "dequant"
-# The architectures the fused kernel admits: NVIDIA SM90 to SM103, where Beam calls
-# its kernels; its byte identity was checked on SM90 (H200) and SM100 (GB200).
-# The capability filter states the range for ranked selection, the host guard for a
-# by-name override.
 SM90 = ArchVersion(9, 0)
-SM103 = ArchVersion(10, 3)
 # The dtypes Beam's NoPE branch produces (``BeamRMSNorm`` is built with
 # ``torch.bfloat16``; the runtime hands int64 or int32 positions). Both kernels
 # declare both signatures, so a by-name switch never changes the facade's
@@ -507,7 +502,7 @@ def qk_rmsnorm_ssmax_rejection(
     width (Beam's ``qkv.split`` column views or contiguous tensors); contiguous
     ``[128]`` weights; ``positions`` a contiguous int32 / int64 ``[tokens]``
     vector; a finite positive float ``eps`` (a kernel constexpr); every tensor a
-    CUDA tensor on ``q``'s device; one NVIDIA SM90 to SM103 device.
+    CUDA tensor on ``q``'s device; one NVIDIA SM90 or newer device.
     ``positions >= 0`` is not a clause: it is the caller's contract, as it is
     for ``apply_ssmax_root10``. The reason names the first rejecting clause; the
     device and platform clauses come last so that shape and layout findings are
@@ -598,9 +593,9 @@ def qk_rmsnorm_ssmax_rejection(
         if tensor.device != q.device:
             return f"{name} is on {tensor.device}, q is on {q.device}"
     platform = current_platform()
-    if not (platform.is_nvidia and SM90 <= platform.arch_version <= SM103):
+    if not (platform.is_nvidia and platform.arch_version >= SM90):
         return (
-            f"{TRITON_FUSED_QK_RMSNORM_SSMAX} runs on NVIDIA SM90 to SM103 only, "
+            f"{TRITON_FUSED_QK_RMSNORM_SSMAX} requires NVIDIA SM90 or newer, "
             f"got {platform.device_name}"
         )
     return ""
@@ -615,7 +610,6 @@ def qk_rmsnorm_ssmax_rejection(
     capability=CapabilityRequirement(
         vendors=frozenset({"nvidia"}),
         min_arch_version=SM90,
-        max_arch_version=SM103,
     ),
     # The same BF16 q/k/weights x int32|int64 positions signatures as
     # ``torch_qk_rmsnorm_ssmax``, so a name override between the two never
@@ -671,7 +665,7 @@ def triton_fused_qk_rmsnorm_ssmax(
 
     Raises:
         ValueError: :func:`qk_rmsnorm_ssmax_rejection` rejects the call (zero
-            tokens and a device outside SM90 to SM103 included). There is no
+            tokens and a device below NVIDIA SM90 included). There is no
             fallback to the torch statements.
     """
     rejection = qk_rmsnorm_ssmax_rejection(q, k, q_weight, k_weight, eps, positions)

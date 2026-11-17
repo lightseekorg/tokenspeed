@@ -46,7 +46,10 @@ The engine applies it to a request's ``json_schema`` at admission (the
 host's ingress), whatever frontend sent the request: ``reasoning_grammar``
 gives the host the tags for both modes, with a slot for the schema, and the
 reasoning block's marker ids, from which the host tells the mode by the
-prompt.
+prompt. The host also uses those ids to count cumulative reasoning usage;
+that accounting stays enabled when ``--grammar-backend none`` disables
+schema constraints. DeepSeek V4.1's tool-block opener is an additional
+implicit reasoning closer.
 """
 
 from __future__ import annotations
@@ -54,6 +57,12 @@ from __future__ import annotations
 import dataclasses
 import json
 from typing import Any
+
+from tokenspeed.runtime.grammar.inkling2_json import (
+    MessageBoundary,
+    inkling2_boundary,
+    inkling2_structural_tag,
+)
 
 # smg reasoning_parser name → xgrammar builtin model template. Keys
 # must match ``smg::get_available_reasoning_parsers()`` exactly. Unmapped
@@ -161,6 +170,9 @@ def structural_tag_for_reasoning_response(
     """
     if reasoning_parser == "inkling":
         return _structural_tag_for_inkling(content_format)
+    if reasoning_parser == "inkling2":
+        # reasoning_grammar picks this or an answer continuation by the prompt's end.
+        return inkling2_structural_tag(content_format, continue_final_message=False)
 
     model = _REASONING_PARSER_TO_XGRAMMAR_MODEL.get(reasoning_parser)
     if model is None:
@@ -264,24 +276,45 @@ class ReasoningGrammar:
             whether a prompt ends inside the block: it does when the last of
             them in the prompt is the opener. None when they are not single
             tokens; every prompt then counts as having opened the block.
+        implicit_closer: A tool-block opener that ends reasoning without a
+            closing marker (DeepSeek V4.1's spaced DSML block), when it is a
+            single token. The engine excludes it from reasoning usage too.
+        boundary: For a model that writes each block's header itself
+            (Inkling2), where a prompt may end, in place of ``markers``:
+            ``continues`` then continues an empty answer header and
+            ``may_open`` follows a closed message.
     """
 
     continues: str
     may_open: str
     schema_slot: str
     markers: tuple[int, int] | None
+    implicit_closer: int | None
+    boundary: MessageBoundary | None
+
+
+def _single_token_ids(tokenizer, markers: tuple[str, ...]) -> tuple[int, ...] | None:
+    ids = [tokenizer.convert_tokens_to_ids(marker) for marker in markers]
+    if not all(isinstance(i, int) for i in ids):
+        return None
+    if list(tokenizer.convert_ids_to_tokens(ids)) != list(markers):
+        return None
+    return tuple(ids)
 
 
 def _reasoning_marker_ids(reasoning_parser: str, tokenizer) -> tuple[int, int] | None:
     markers = reasoning_block_markers(reasoning_parser)
     if markers is None:
         return None
-    ids = [tokenizer.convert_tokens_to_ids(marker) for marker in markers]
-    if not all(isinstance(i, int) for i in ids):
+    ids = _single_token_ids(tokenizer, markers)
+    return (ids[0], ids[1]) if ids is not None else None
+
+
+def _reasoning_implicit_closer_id(reasoning_parser: str, tokenizer) -> int | None:
+    if reasoning_parser != "deepseek_v41":
         return None
-    if list(tokenizer.convert_ids_to_tokens(ids)) != list(markers):
-        return None
-    return ids[0], ids[1]
+    ids = _single_token_ids(tokenizer, ("<｜DSML｜ calls>",))
+    return ids[0] if ids is not None else None
 
 
 def reasoning_grammar(reasoning_parser: str, tokenizer) -> ReasoningGrammar | None:
@@ -298,6 +331,12 @@ def reasoning_grammar(reasoning_parser: str, tokenizer) -> ReasoningGrammar | No
         )
         for opens in (True, False)
     ]
+    boundary = None
+    if reasoning_parser == "inkling2":
+        boundary = inkling2_boundary(tokenizer)
+        tags[0] = inkling2_structural_tag(
+            JSONSchemaFormat(json_schema=_SCHEMA_SLOT), continue_final_message=True
+        )
     if None in tags:
         return None
     schema_slot = json.dumps(_SCHEMA_SLOT, separators=(",", ":"))
@@ -312,4 +351,6 @@ def reasoning_grammar(reasoning_parser: str, tokenizer) -> ReasoningGrammar | No
         may_open=tags[1],
         schema_slot=schema_slot,
         markers=_reasoning_marker_ids(reasoning_parser, tokenizer),
+        implicit_closer=_reasoning_implicit_closer_id(reasoning_parser, tokenizer),
+        boundary=boundary,
     )

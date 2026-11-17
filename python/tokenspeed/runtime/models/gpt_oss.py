@@ -447,6 +447,9 @@ class GptOssDecoderLayer(BaseMoEDecoderLayer):
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
     ) -> torch.Tensor:
+        """The MoE output; Petit's MoE dispatches and combines this rank's rows
+        itself, so then ``residual`` and ``ctx`` go unused and no CommManager
+        leg runs."""
 
         if not self.mlp.owns_ep_communication:
             return super().forward_mlp(

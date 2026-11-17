@@ -65,6 +65,7 @@ def test_mha_preserves_target_and_block_draft_geometry(draft, heads, name, solut
         kv_cache_quant_method="none",
         context_len=50176,
         max_bs=16,
+        max_resident_requests=16,
         speculative_num_draft_tokens=16,
         is_draft=draft,
         draft_block_decode=draft,

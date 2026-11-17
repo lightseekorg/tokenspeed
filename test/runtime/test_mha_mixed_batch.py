@@ -27,6 +27,7 @@ Registered kernel numerics and graph execution require separate GPU tests.
 
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -71,6 +72,7 @@ def _backend(
         kv_cache_quant_method="none",
         context_len=1024,
         max_bs=16,
+        max_resident_requests=16,
         speculative_num_draft_tokens=width,
         is_draft=is_draft,
         draft_block_decode=block_decode,
@@ -386,8 +388,11 @@ def _block_runtime():
     drafter = DFlash2.__new__(DFlash2)
     drafter.spec_num_tokens = drafter.draft_query_width = 16
     drafter.input_buffers = InputBuffers(4, 64, 16, device="cpu")
-    drafter.runtime_states = RuntimeStates(16, 32, 16, device="cpu")
+    drafter.runtime_states = RuntimeStates(16, 32, 32, 16, device="cpu")
     drafter.draft_seq_lens_buf = torch.zeros(4, dtype=torch.int32)
+    drafter.context_starts_buf = torch.zeros(4, dtype=torch.int64)
+    drafter.context_locs_buf = torch.zeros(4 * 16, dtype=torch.int32)
+    drafter.draft_block_end_lens_buf = torch.zeros(4, dtype=torch.int32)
     drafter.block_ids_buf = torch.ones((4, 16), dtype=torch.int32)
     drafter.block_positions_buf = torch.zeros((4, 16), dtype=torch.int64)
     drafter.block_offsets = torch.arange(16, dtype=torch.int64).unsqueeze(0)
@@ -396,6 +401,8 @@ def _block_runtime():
     drafter.token_to_kv_pool = None  # No model/cache-storage operation is reached.
     drafter.round_block_tables = None
     drafter.embed_tokens = _stop_before_weights
+    # wire_target's choice for a one-rank layout: the lookup is the input.
+    drafter._first_layer_input = "full"
     runner = ForwardStepRunner.__new__(ForwardStepRunner)
     runner.attn_backend, runner.draft_attn_backend = routers
     runner.drafter = drafter
@@ -568,8 +575,10 @@ def test_block_draft_mixed_to_decode_refreshes_all_owners_and_reordered_slots(
         if for_graph_replay:
             # Select the in-graph metadata branch without constructing a GPU
             # stream or graph. The outer CPU test runner denies initialization.
-            capture.setattr(torch.cuda, "is_available", lambda: True)
-            capture.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+            capture.setattr(
+                "tokenspeed.runtime.execution.drafter.dflash.is_current_stream_capturing",
+                lambda device: True,
+            )
         drafter._update_draft_prefix_lengths(decode_ctx, next_accepts)
         assert (
             drafter.draft_seq_lens_buf[:block_bs].tolist() == block_prefixes[:block_bs]
@@ -633,11 +642,17 @@ def _cached_attention_cpu(
     window_left,
     **kwargs
 ):
-    """CPU stand-in for the unavailable GPU operation, using its public ABI."""
+    """CPU stand-in for the unavailable GPU operation, using its public ABI.
+
+    Drops keys past max_seqlen_k so a bound below a request's length fails the
+    comparison.
+    """
     outputs = []
+    bound = kwargs.get("max_seqlen_k", cache_seqlens.max().item())
     for request, length in enumerate(cache_seqlens.tolist()):
         start, end = cu_seqlens_q[request : request + 2].tolist()
         slots = page_table[request, : (length + 15) // 16].long()
+        length = min(length, bound)
         repeats = q.shape[1] // k_cache.shape[2]
         key = k_cache[slots].flatten(0, 1)[:length].repeat_interleave(repeats, dim=1)
         value = v_cache[slots].flatten(0, 1)[:length].repeat_interleave(repeats, dim=1)
@@ -732,6 +747,74 @@ def test_mixed_forward_keeps_decode_history_and_drops_only_padding(
     assert torch.equal(key, before_key) and torch.equal(value, before_value)
 
 
+@pytest.mark.parametrize("mode", [ForwardMode.EXTEND, ForwardMode.MIXED])
+def test_cached_extend_bounds_keys_by_the_longest_request(monkeypatch, mode):
+    # The cached-prefix kernel gets the longest request's length as
+    # max_seqlen_k when the host knows every length (pure extends), and the
+    # context limit when decode lengths live only on the device (mixed).
+    backend = _backend(width=4)
+    monkeypatch.setattr(backend, "plan", lambda **kwargs: {"extend_mode": "prewrite"})
+    monkeypatch.setattr(mha, "mha_extend_with_kvcache", _cached_attention_cpu)
+    layer = PagedAttention(
+        backend.tp_q_head_num,
+        128,
+        128**-0.5,
+        backend.tp_kv_head_num,
+        0,
+        sliding_window_size=-1,
+        rotary_emb=None,
+        qk_norm=None,
+    )
+    generator = torch.Generator().manual_seed(7)
+    shape = (8, 16, backend.tp_kv_head_num, 128)
+    key = torch.randn(shape, generator=generator).to(torch.bfloat16)
+    value = torch.randn(shape, generator=generator).to(torch.bfloat16)
+    tables = torch.tensor([[1, 2], [3, 4], [5, 6]], dtype=torch.int32)
+    if mode == ForwardMode.EXTEND:
+        queries, prefixes, lengths = [3, 20, 5], [25, 0, 7], [28, 20, 12]
+        query_lengths, expected_bound = queries, 28
+    else:
+        queries, prefixes, lengths = [3, 20], [5, 0], [8, 20, 30]
+        query_lengths, expected_bound = queries + [4], 1024
+    metadata = _init(
+        backend,
+        lengths=lengths,
+        queries=queries,
+        prefixes=prefixes,
+        mode=mode,
+        tables=tables,
+    )
+    assert metadata.max_seqlen_k == expected_bound
+    query = torch.randn(
+        (sum(query_lengths), backend.tp_q_head_num, 128), generator=generator
+    ).to(torch.bfloat16)
+    output = backend.forward_extend(
+        query,
+        query[:, : backend.tp_kv_head_num],
+        query[:, : backend.tp_kv_head_num],
+        layer,
+        torch.empty(0, dtype=torch.int32),
+        _CPUCache(key, value),
+        len(lengths),
+    )
+    expected = []
+    cursor = 0
+    for request, count in enumerate(query_lengths):
+        expected.append(
+            _cached_attention_cpu(
+                q=query[cursor : cursor + count],
+                cu_seqlens_q=torch.tensor([0, count]),
+                k_cache=key,
+                v_cache=value,
+                page_table=tables[request : request + 1],
+                cache_seqlens=torch.tensor([lengths[request]]),
+                window_left=-1,
+            )
+        )
+        cursor += count
+    torch.testing.assert_close(output, torch.cat(expected).flatten(1), rtol=0, atol=0)
+
+
 def _cached_decode_cpu(*, q, **kwargs):
     # Block drafting expands each request to sixteen one-query metadata rows,
     # all seeing the same complete block (non-causal within the block).
@@ -801,6 +884,118 @@ def test_block_decode_after_mixed_excludes_poison_beyond_accepted_history_and_bl
     torch.testing.assert_close(
         output, expected[:, None, None, None].expand_as(output), rtol=0, atol=0
     )
+
+
+@pytest.mark.parametrize("for_graph_replay", [False, True])
+def test_a_block_drafter_writes_context_before_publishing_its_block(
+    monkeypatch, for_graph_replay
+):
+    """Context KV uses the draft's pages before its proposal window is published."""
+    runner, drafter, leaves, layers = _block_runtime()
+    buffers = drafter.input_buffers
+    slots = torch.tensor([7, 2, 9], dtype=torch.int64)
+    buffers.req_pool_indices_buf[:3].copy_(slots)
+    written = {}
+
+    def capture(self, hidden, positions, cache_locs, decode_only=False):
+        written["locs"] = cache_locs.tolist()
+
+    monkeypatch.setattr(DFlash2, "_write_native_cache", capture)
+    ctx = ForwardContext(
+        attn_backend=runner.attn_backend,
+        token_to_kv_pool=None,
+        bs=3,
+        num_extends=0,
+        input_num_tokens=3 * 16,
+        forward_mode=ForwardMode.DECODE,
+        output_layout=ForwardOutputLayout(0, 0, 3, 16),
+    )
+    # Only the ROW count is checked on this path; the width is free.
+    hidden = torch.zeros(3 * 16, 8)
+    for generation in (1, 2):
+        lengths = torch.tensor([19, 48, 80], dtype=torch.int32) + 16 * (generation - 1)
+        starts = (lengths - 16).tolist()
+        tables = _round_tables(leaves, slots.tolist(), generation)
+        buffers.positions_buf[: 3 * 16].copy_(
+            torch.cat([torch.arange(start, start + 16) for start in starts])
+        )
+        # Each target round restores context locations after the prior draft
+        # published its proposal window, including when replaying a graph.
+        runner._prepare_decode_metadata(
+            3,
+            3,
+            slots,
+            lengths,
+            forward_mode=ForwardMode.DECODE,
+            use_graph=for_graph_replay,
+            settle=lambda: None,
+            block_tables=tables,
+        )
+        drafter._update_native_cache_from_target(
+            ctx,
+            SimpleNamespace(hidden_states=hidden),
+            torch.ones(3, dtype=torch.int32),
+        )
+        assert written["locs"] == _expected_locations(
+            tables["draft_attention"], starts, 16
+        )
+
+        # Only after writing context does the draft switch to proposal rows.
+        runner.draft_attn_backend.publish_draft_step_locations(
+            cache_start=lengths.to(torch.int64), num_tokens=16
+        )
+        assert runner.draft_attn_backend.decode_window_locations().tolist() == (
+            _expected_locations(tables["draft_attention"], lengths.tolist(), 16)
+        )
+
+
+def test_an_unsharded_draft_is_not_handed_the_targets_query_shard(monkeypatch):
+    """A target may compute a query-context shard while its draft does not.
+
+    A draft that plans its own attention family is configured unsharded
+    (``model_wide_kwargs``'s draft_unsharded) because it is handed the rows
+    the target computed and runs its forward over them whole. Passing the
+    target's plan on would claim a sharding the draft never sees, and an MHA
+    leaf refuses one outright (``reject_query_shard``).
+    """
+    runner, drafter, leaves, layers = _block_runtime()
+    assert not runner.draft_attn_backend.query_sharded
+
+    # Record the plan each side's extend init received; the decode refresh
+    # that follows on the draft side takes no plan at all.
+    seen = []
+
+    def record(self, *args, **kwargs):
+        seen.append(kwargs.get("query_shard", "absent"))
+
+    monkeypatch.setattr(CacheGroupRouter, "init_forward_metadata", record)
+    monkeypatch.setattr(
+        CacheGroupRouter, "refresh_decode_metadata", lambda *a, **k: None
+    )
+
+    slots = torch.tensor([7, 2, 9], dtype=torch.int64)
+    lengths = torch.tensor([19, 48, 80], dtype=torch.int32)
+    query, prefix = torch.tensor([3]), torch.tensor([16])
+    runner._init_forward_metadata(
+        3,
+        1,
+        slots,
+        lengths,
+        ForwardMode.MIXED,
+        block_tables=_round_tables(leaves, slots.tolist(), 1),
+        extend_seq_lens=query,
+        extend_seq_lens_cpu=query,
+        extend_prefix_lens=prefix,
+        extend_prefix_lens_cpu=prefix,
+        extend_replay_lens_cpu=torch.zeros_like(prefix),
+        extend_prompt_lens_cpu=query + prefix,
+        extend_with_prefix=True,
+        query_shard="target-plan",
+        block_tables_cpu={},
+    )
+
+    # Two extend inits: the target's with the plan, the draft's without.
+    assert seen == ["target-plan", None]
 
 
 if __name__ == "__main__":

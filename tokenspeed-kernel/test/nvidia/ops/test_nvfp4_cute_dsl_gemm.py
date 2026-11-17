@@ -134,3 +134,17 @@ def test_unaligned_buffers_receive_the_product() -> None:
     assert returned.data_ptr() == out.data_ptr()
     _assert_same_bits(out, expected)
     assert storage[0] == 0
+
+
+def test_zero_rows_give_an_empty_product() -> None:
+    n, k = 2048, 7168
+    x, x_scales, w, w_scales, alpha = _operands(1, n, k, seed=11)
+    # An idle data-parallel rank projects no rows.
+    operands = (x[:0], x_scales, w, w_scales, alpha)
+    out = torch.empty(0, n, dtype=torch.bfloat16, device="cuda")
+
+    assert _mm(operands, _KERNEL).shape == (0, n)
+    assert _mm(operands, _KERNEL, out=out).data_ptr() == out.data_ptr()
+    # A failed launch surfaces at the next kernel.
+    torch.ones(1, device="cuda").add_(1)
+    torch.cuda.synchronize()

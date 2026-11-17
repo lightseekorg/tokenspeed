@@ -73,16 +73,17 @@ def ascend_prefill_cache_metadata(*args, **kwargs):
     return AscendDSAKernels.prefill_metadata(*args, **kwargs)
 
 
-def ascend_prepare_dsa_resources(*, group, rank):
+def ascend_prepare_dsa_resources(*, group, rank, heads):
     """Bind operator-owned views of the existing HCCL windows before capture."""
     from tokenspeed_kernel.ops.attention.dsa import DSAResources
 
     ascend_dsa_kernels()
-    window = torch.ops.custom.dsa_prepare_prolog_window(group, rank)
+    # The shared MLA/DSA entry accepts the model's actual H32/H64 geometry.
+    window = torch.ops.custom.mla_prepare_prolog_window(group, rank, heads, 8)
     try:
         prepared = {
-            rows: torch.ops.custom.dsa_prepare_lse_buffers(group, rows, rank)
-            for rows in (64, 128, 256, 512)
+            rows: torch.ops.custom.mla_prepare_lse_buffers(group, rows, rank, heads, 8)
+            for rows in (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)
         }
     except BaseException:
         torch.ops.custom.dsa_release_prolog_window(window)

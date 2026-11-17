@@ -36,6 +36,8 @@ from transformers import PretrainedConfig
 from tokenspeed.runtime.configs.model_profile import ModelProfile
 from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.layers.quantization import QUANTIZATION_METHODS
+from tokenspeed.runtime.layers.quantization.inkling2 import is_inkling2_manifest_stub
+from tokenspeed.runtime.layers.rotary_embedding import yarn_get_mscale
 from tokenspeed.runtime.plugins import ensure_loaded
 from tokenspeed.runtime.plugins.registry import resolve_model_profile
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -52,6 +54,7 @@ from tokenspeed.runtime.utils.spec_block_geometry import (
     BLOCK_SPEC_ALGORITHMS,
     count_dspark_stages,
     read_checkpoint_block_size,
+    resolve_block_sample_from_anchor,
     resolve_block_widths,
     validate_block_widths,
 )
@@ -125,6 +128,8 @@ class _AttentionFamilySpec:
     configure: Callable[[object, ServerArgs], None]
     # A name, or a function of the launch returning one (None: no default).
     default_backend: str | Callable[[ServerArgs], str | None] | None = None
+    # ``configure`` reads ``--dsa-index-k-format``; other models refuse it.
+    takes_index_k_format: bool = False
 
 
 def override_model_config(model_config, ext_yaml):
@@ -165,6 +170,30 @@ def configure_deepseek_v41_attention(model_config, server_args: ServerArgs) -> N
     model_config.scaling = hf.head_dim**-0.5
 
 
+def configure_kimi_k31_attention(model_config, server_args: ServerArgs) -> None:
+    """Kimi-K3.1: DSA geometry with the indexer's keys stored as FP8 with scales.
+
+    ``fp8_scaled`` keys take 132 bytes per token per layer against 256 for
+    ``bf16``, so 8x MI350X at the default memory utilization fits 15 rather
+    than 12 requests of 50K input tokens. AIME26 and OpenAI MRCR (2 needles,
+    up to 45K tokens) score the same on both formats within run-to-run
+    noise. The checkpoint's BF16 indexer weights (``KimiK3Config`` rejects
+    ``indexer_use_fp8: true``) do not pin the serving format of the keys.
+    ``--dsa-index-k-format mxfp4`` stores 68-byte rows instead, refused under
+    bitwise numerics.
+    """
+    _configure_dsa_geometry(model_config)
+    index_k_format = server_args.dsa_index_k_format or "fp8_scaled"
+    if index_k_format == "mxfp4" and server_args.numerics in BITWISE_ENVELOPES:
+        raise ValueError(
+            "--dsa-index-k-format mxfp4 is not supported under --numerics "
+            f"{server_args.numerics}"
+        )
+    model_config.index_k_format = index_k_format
+    # K3.1 keeps all DSA ops in one eager break narrowing padded replays to live rows.
+    model_config.dsa_padded_prefill_replay = True
+
+
 def configure_dsa_attention(model_config, server_args: ServerArgs) -> None:
     """Derive MLA latent plus DSA indexer geometry (GLM-DSA, DeepSeek-V3.2).
 
@@ -173,6 +202,11 @@ def configure_dsa_attention(model_config, server_args: ServerArgs) -> None:
     same geometry under every launch.
     """
     del server_args
+    _configure_dsa_geometry(model_config)
+
+
+def _configure_dsa_geometry(model_config) -> None:
+    """The MLA latent plus DSA indexer geometry, with ``fp8_scaled`` keys."""
     mla_config = (
         model_config.hf_text_config
         if hasattr(model_config.hf_text_config, "kv_lora_rank")
@@ -483,6 +517,13 @@ _ATTENTION_FAMILY_SPECS = (
         default_backend="dsa",
     ),
     _AttentionFamilySpec(
+        # K3's MLA plus a DSA indexer: the hybrid resolver picks the dsa leaf under KDA.
+        name="Kimi-K3.1",
+        architectures=frozenset({"KimiK31ForConditionalGeneration"}),
+        configure=configure_kimi_k31_attention,
+        takes_index_k_format=True,
+    ),
+    _AttentionFamilySpec(
         name="MLA",
         architectures=_MLA_ARCHITECTURES,
         configure=configure_mla_attention,
@@ -523,6 +564,23 @@ def _resolve_attention_family(
     return None
 
 
+def refuse_untaken_index_k_format(
+    family: _AttentionFamilySpec | None, architecture: str, server_args: ServerArgs
+) -> None:
+    """Refuse ``--dsa-index-k-format`` for a target whose attention family
+    does not read it, rather than serving the model's own format silently."""
+    if server_args.dsa_index_k_format is None or (
+        family is not None and family.takes_index_k_format
+    ):
+        return
+    takers = ", ".join(
+        s.name for s in _ATTENTION_FAMILY_SPECS if s.takes_index_k_format
+    )
+    raise ValueError(
+        f"--dsa-index-k-format applies only to {takers}, not {architecture}"
+    )
+
+
 def _is_dflash2_mla(
     hf_config: PretrainedConfig,
     hf_text_config: PretrainedConfig,
@@ -547,7 +605,9 @@ def _apply_block_spec_widths(
 
     Args:
         server_args: Server args whose speculative widths are checked, or set
-            when they were left at their defaults.
+            when they were left at their defaults. Explicit widths may draft
+            fewer tokens than the checkpoint's block, except for DeepSeek V4.1
+            DSpark, whose drafter always drafts the whole block.
         hf_config: The draft checkpoint's config.
         hf_text_config: Its text config, searched first.
 
@@ -566,7 +626,10 @@ def _apply_block_spec_widths(
             block_size,
             server_args.speculative_num_steps,
             server_args.speculative_num_draft_tokens,
+            allow_shorter=resolve_architecture(hf_config)
+            != "DeepseekV41ForCausalLMDSpark",
         )
+        return block_size
     num_steps, num_draft_tokens = resolve_block_widths(algorithm, block_size)
     server_args.speculative_num_steps = num_steps
     server_args.speculative_num_draft_tokens = num_draft_tokens
@@ -678,6 +741,7 @@ class ModelConfig:
             validate_drafter_algorithm(server_args.speculative_algorithm)
             require_plugin_draft_checkpoint(server_args)
         self.model_path = model_path
+        self.is_draft_worker = bool(is_draft_worker)
         self.revision = revision
         self.quantization = quantization
         self.mapping = server_args.mapping
@@ -729,10 +793,16 @@ class ModelConfig:
             resolved_profile[1] if resolved_profile is not None else None
         )
         self.spec_block_size: int | None = None
+        self.draft_sample_from_anchor: bool = False
         if is_draft_worker:
             self.spec_block_size = _apply_block_spec_widths(
                 server_args, self.hf_config, self.hf_text_config
             )
+            algorithm = server_args.speculative_algorithm
+            if algorithm in BLOCK_SPEC_ALGORITHMS:
+                self.draft_sample_from_anchor = resolve_block_sample_from_anchor(
+                    algorithm, self.hf_text_config, self.hf_config
+                )
         self.dspark_prefix_replay_tokens: int | None = None
         if (
             is_draft_worker
@@ -758,6 +828,13 @@ class ModelConfig:
             self.hf_text_config.dspark_num_stages = dspark_num_stages
             if self.hf_config is not self.hf_text_config:
                 self.hf_config.dspark_num_stages = dspark_num_stages
+        elif (
+            is_draft_worker
+            and resolve_architecture(self.hf_config)
+            == "Inkling2ForConditionalGenerationMTP"
+        ):
+            # Context K/V lives in the shared full-history group; nothing to replay.
+            self.dspark_prefix_replay_tokens = 0
         if (
             is_draft_worker
             and resolve_architecture(self.hf_config)
@@ -839,6 +916,13 @@ class ModelConfig:
                 "Running in encoder-only mode: the language model will not "
                 "be constructed or loaded (encode role)."
             )
+        if server_args.decode_monokernel and not is_draft_worker:
+            # The model reads the switch from its text config. ServerArgs
+            # accepts it only for DECODE_MONOKERNEL_ARCHITECTURES, whose
+            # text config classes declare the field (default False). A
+            # draft's config has no such class: load_model_config declares
+            # the field on it from its target.
+            self.hf_text_config.decode_monokernel = True
         self.mm_attention_backend = getattr(server_args, "mm_attention_backend", None)
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
@@ -878,6 +962,8 @@ class ModelConfig:
         # hook names it (configure_dsa_attention: "fp8_scaled"); None for a
         # model without an indexer, and DSAConfig refuses None.
         self.index_k_format: str | None = None
+        # Rank-uniform: all DSA ops run in one eager break that narrows padded replays.
+        self.dsa_padded_prefill_replay: bool = False
 
         # MLA/DSA families carry per-head dimension metadata that does not
         # follow the standard hidden_size / num_attention_heads derivation above.
@@ -885,6 +971,16 @@ class ModelConfig:
             self.hf_config,
             self.hf_text_config,
         )
+        # A profile's own hook answers for the flags it reads, and the target
+        # answers for the launch its drafts share.
+        if (
+            server_args is not None
+            and self.model_profile is None
+            and not is_draft_worker
+        ):
+            refuse_untaken_index_k_format(
+                attention_family, resolve_architecture(self.hf_config), server_args
+            )
         if self.model_profile is not None:
             _apply_attention_defaults(
                 server_args,
@@ -946,7 +1042,20 @@ class ModelConfig:
                 )
                 if nextn_layers is not None and nextn_layers > 0:
                     self.num_attention_layers = nextn_layers
-        self.vocab_size = self.hf_text_config.vocab_size
+        self.input_vocab_size = self.hf_text_config.vocab_size
+        self.vocab_size = getattr(self.hf_text_config, "output_vocab_size", None)
+        if self.vocab_size is None:
+            self.vocab_size = self.input_vocab_size
+
+        if not (
+            type(self.input_vocab_size) is int
+            and type(self.vocab_size) is int
+            and 0 < self.vocab_size <= self.input_vocab_size
+        ):
+            raise ValueError(
+                "Vocabulary sizes must be integers satisfying 0 < output <= input; "
+                f"got input_vocab_size={self.input_vocab_size!r}, vocab_size={self.vocab_size!r}"
+            )
 
         # Verify quantization
         self._verify_quantization()
@@ -985,10 +1094,17 @@ class ModelConfig:
 
     def _parse_quant_hf_config(self):
         quant_cfg = getattr(self.hf_config, "quantization_config", None)
+        if (
+            quant_cfg == {}
+            and resolve_architecture(self.hf_config)
+            == "Inkling2ForConditionalGenerationMTP"
+        ):
+            # The BF16 draft is explicitly unquantized; never read the target's manifest.
+            return None
         if quant_cfg is None:
             # compressed-tensors uses a "compression_config" key
             quant_cfg = getattr(self.hf_config, "compression_config", None)
-        if quant_cfg is None:
+        if quant_cfg is None or is_inkling2_manifest_stub(quant_cfg):
             # modelopt NVFP4 checkpoints store quant config in hf_quant_config.json
             # Resolve the local snapshot directory (model_path may be a HF hub ID)
             if os.path.isdir(self.model_path):
@@ -1014,6 +1130,8 @@ class ModelConfig:
                 if os.path.isfile(hf_quant_path):
                     with open(hf_quant_path, encoding="utf-8") as f:
                         hf_quant = json.load(f)
+                    if hf_quant.get("quant_method") == "inkling2":
+                        return hf_quant
                     quant_algo = hf_quant.get("quantization", {}).get("quant_algo", "")
                     if quant_algo:
                         quant_cfg = {
@@ -1208,8 +1326,10 @@ def is_multimodal_model(model_architectures: list[str] | None):
         "Qwen3ASRForConditionalGeneration",
         "KimiK25ForConditionalGeneration",
         "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
         "Glm53FlashForConditionalGeneration",
         "InklingForConditionalGeneration",
+        "Inkling2ForConditionalGeneration",
         "MiniMaxM3SparseForConditionalGeneration",
         "NemotronH_Nano_Omni_Reasoning_V3",
         "MuseSparkForConditionalGeneration",
@@ -1236,9 +1356,3 @@ def is_audio_model(model_architectures: list[str] | None):
         "MuseSparkForConditionalGeneration",
     }
     return any(arch in audio_architectures for arch in model_architectures or [])
-
-
-def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
-    if scale <= 1:
-        return 1.0
-    return 0.1 * mscale * math.log(scale) + 1.0

@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+from functools import partial
 from types import SimpleNamespace
 
 import torch
@@ -70,7 +71,7 @@ def ascend_softmax_bias_topk(
 
 
 def ascend_bf16_process_moe_weights(*, plan: dict, w: torch.nn.Module) -> None:
-    """Convert canonical TokenSpeed weights to the Ascend GMM layout."""
+    """Prepare GMM weights and load later HF updates into that layout in place."""
     if not getattr(w, "_ascend_bf16_moe_weights_processed", False):
         expected = (
             (w.num_local_experts, 2 * w.intermediate_size, w.hidden_size),
@@ -80,6 +81,14 @@ def ascend_bf16_process_moe_weights(*, plan: dict, w: torch.nn.Module) -> None:
             raise ValueError("Ascend MoE weights must use canonical W13/W2 layout")
         w.w13_weight.data = w.w13_weight.data.transpose(-1, -2).contiguous()
         w.w2_weight.data = w.w2_weight.data.transpose(-1, -2).contiguous()
+        # The checkpoint stays in HF layout after the resident weights transpose.
+        # Future loads must transpose sources and slice gate/up along the new axis.
+        w.w13_weight.weight_loader = partial(
+            w.w13_weight.weight_loader, do_transpose=True
+        )
+        w.w2_weight.weight_loader = partial(
+            w.w2_weight.weight_loader, do_transpose=True
+        )
         w._ascend_bf16_moe_weights_processed = True
 
     if plan.get("a2a_backend") != "ascend":

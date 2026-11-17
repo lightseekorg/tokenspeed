@@ -56,6 +56,7 @@ def _config(
         prefix_granularity=128,
         max_num_seqs=max_num_seqs,
         chunked_prefill_size=4096,
+        input_vocab_size=32,
         vocab_size=32,
         context_len=4096,
         physical_context_len=4096,

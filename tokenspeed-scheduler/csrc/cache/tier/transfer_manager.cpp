@@ -28,6 +28,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include "core/profile_span.h"
 #include "utils.h"
 
 namespace tokenspeed {
@@ -43,6 +44,7 @@ TierTransferManager::TierTransferManager(CacheCoordinator& coordinator) : coordi
 
 std::optional<WriteBackOperation> TierTransferManager::StartPendingStores(StoreSourceGuard guard,
                                                                           HostStoreCause cause) {
+    ProfileSpan profile_span{"TierTransferManager::StartPendingStores"};
     _assert(cause == HostStoreCause::kPublication || cause == HostStoreCause::kFinish,
             "only publication and finish drain the pending-store queue");
     WriteBackStats& stats = write_back_stats_[static_cast<std::size_t>(cause)];
@@ -114,7 +116,7 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores(StoreS
             .group_id = group_ids[i],
             .source_page = manager.ResolveCacheBlockId(*device_block_refs[i]),
             .destination_page = manager.ResolveCacheBlockId(*host_block_ref),
-            .content_hash = keys[i].content_hash,
+            .content_hash = keys[i].content_hash.ToString(),
             .page_offset = keys[i].page_offset,
         });
         // A stream-ordered store resolves the source page id and lets the
@@ -221,6 +223,7 @@ std::optional<WriteBackOperation> TierTransferManager::StartEvictionStores() {
     if (segments.empty()) {
         return std::nullopt;
     }
+    ProfileSpan profile_span{"TierTransferManager::StartEvictionStores"};
     WriteBackStats& stats = write_back_stats_[static_cast<std::size_t>(HostStoreCause::kEviction)];
     // The newest Device access first, recording order among equals: the
     // placement drops whole segments from the back, the oldest first.
@@ -302,7 +305,7 @@ std::optional<WriteBackOperation> TierTransferManager::StartEvictionStores() {
                 .group_id = member.key.group_id,
                 .source_page = allocator.ResolveDeviceCacheBlockId(member.device_location),
                 .destination_page = allocator.ResolveCacheBlockId(*host_block),
-                .content_hash = member.key.content_hash,
+                .content_hash = member.key.content_hash.ToString(),
                 .page_offset = member.key.page_offset,
             });
             tickets.push_back(StoreTicket{member.key, CacheBlockRef{}, host_block});
@@ -351,6 +354,43 @@ std::optional<WriteBackOperation> TierTransferManager::StartEvictionStores() {
         .transfers = std::move(transfers),
         .source_pinned = false,
     };
+}
+
+std::int32_t TierTransferManager::DemoteInFlightEvictions(std::span<const CacheKey> keys) {
+    if (in_flight_segments_.empty() || keys.empty()) {
+        return 0;
+    }
+    const std::unordered_set<CacheKey, CacheKeyHash> demoted_keys(keys.begin(), keys.end());
+    std::int32_t demoted = 0;
+    // Per key, the members holding its Host entry to publish into: the Host
+    // held it when the Device entry was evicted, or an earlier store
+    // published it since.
+    std::unordered_map<CacheKey, std::uint32_t, CacheKeyHash> host_entry_holds;
+    for (InFlightSegment& in_flight : in_flight_segments_) {
+        for (CacheCoordinator::EvictedBlock& member : in_flight.segment.members) {
+            if (!demoted_keys.contains(member.key)) {
+                continue;
+            }
+            const bool holds_host_entry =
+                member.host_block && member.host_block == coordinator_.FindHostCachedBlock(member.key);
+            if (holds_host_entry) {
+                ++host_entry_holds[member.key];
+            }
+            if (!member.metadata.demoted) {
+                member.metadata.eviction.last_access_epoch = CacheCoordinator::kDemotedAccessEpoch;
+                member.metadata.eviction.was_acquired = false;
+                member.metadata.demoted = true;
+                // One publishing into a Host entry counts with that entry.
+                demoted += holds_host_entry ? 0 : 1;
+            }
+        }
+    }
+    // The settlement keeps the newer of a member's date and its Host entry's,
+    // so the Host entry is dated back here.
+    for (const auto& [key, holds] : host_entry_holds) {
+        demoted += coordinator_.DemoteHostEntryHeldByWriteBack(key, holds) ? 1 : 0;
+    }
+    return demoted;
 }
 
 void TierTransferManager::CompleteLoadBack(std::uint32_t op_id) {
@@ -538,7 +578,7 @@ std::optional<TierTransferManager::RetractionStores> TierTransferManager::StartR
         const std::uint32_t op_id = nextOpId();
         std::vector<CacheTransfer> transfers = resolveTransfers(host_store_pairs);
         for (std::size_t i = 0; i < transfers.size(); ++i) {
-            transfers[i].content_hash = host_store_pairs[i].key.content_hash;
+            transfers[i].content_hash = host_store_pairs[i].key.content_hash.ToString();
             transfers[i].page_offset = host_store_pairs[i].key.page_offset;
             ++stats.blocks[transfers[i].group_id];
         }
@@ -579,8 +619,9 @@ std::optional<TierTransferManager::RetractionStores> TierTransferManager::StartR
 }
 
 SnapshotRestoreOperation TierTransferManager::StartSnapshotRestore(
-    const std::string& request_id, ReqPoolIndex request_pool_index, std::shared_ptr<SnapshotSlotIndex> blob_slot,
-    std::vector<BlockTransfer> load_pairs, std::vector<BlockTransfer> snapshot_pairs, std::uint64_t access_epoch) {
+    const std::string& request_id, ReqPoolIndex request_pool_index, DecodeSlotIndex decode_slot,
+    std::shared_ptr<SnapshotSlotIndex> blob_slot, std::vector<BlockTransfer> load_pairs,
+    std::vector<BlockTransfer> snapshot_pairs, std::uint64_t access_epoch) {
     _assert(request_pool_index.valid(), "a restore imports the slot-state blob into a request-pool row");
     _assert(blob_slot != nullptr && blob_slot->valid(), "a restore imports from the image's blob slot");
     for (const BlockTransfer& pair : load_pairs) {
@@ -615,6 +656,7 @@ SnapshotRestoreOperation TierTransferManager::StartSnapshotRestore(
                                                        .transfers = std::move(transfers),
                                                        .blob_slot = std::move(blob_slot),
                                                        .request_pool_index = std::move(request_pool_index),
+                                                       .decode_slot = std::move(decode_slot),
                                                        .access_epoch = access_epoch})
             .second;
     _assert(inserted, "duplicate snapshot restore op id");
@@ -630,10 +672,10 @@ std::optional<std::string> TierTransferManager::SnapshotRestoreRequest(std::uint
     return it == snapshot_restores_.end() ? std::nullopt : std::optional<std::string>{it->second.request_id};
 }
 
-ReqPoolIndex TierTransferManager::CompleteSnapshotRestore(std::uint32_t op_id, bool publish) {
+TierTransferManager::RestoredSlots TierTransferManager::CompleteSnapshotRestore(std::uint32_t op_id, bool publish) {
     auto it = snapshot_restores_.find(op_id);
     if (it == snapshot_restores_.end()) {
-        return ReqPoolIndex{};
+        return RestoredSlots{};
     }
     // The L2-tier rows are the request's own prefix pages, copied back whole:
     // publish them as they were published before the retraction.
@@ -648,9 +690,10 @@ ReqPoolIndex TierTransferManager::CompleteSnapshotRestore(std::uint32_t op_id, b
     // The row the blob was imported into goes back to the request (or, for a
     // request that is gone, to the allocator); the blob slot's last owner
     // may be this ticket.
-    ReqPoolIndex request_pool_index = std::move(it->second.request_pool_index);
+    RestoredSlots slots{.request_pool_index = std::move(it->second.request_pool_index),
+                        .decode_slot = std::move(it->second.decode_slot)};
     snapshot_restores_.erase(it);
-    return request_pool_index;
+    return slots;
 }
 
 std::vector<CacheTransfer> TierTransferManager::resolveTransfers(std::span<const BlockTransfer> block_transfers) const {
@@ -669,7 +712,7 @@ std::vector<CacheTransfer> TierTransferManager::resolveTransfers(std::span<const
             .group_id = block_transfer.group_id,
             .source_page = manager.ResolveCacheBlockId(*block_transfer.source),
             .destination_page = manager.ResolveCacheBlockId(*block_transfer.destination),
-            .content_hash = block_transfer.key.content_hash,
+            .content_hash = block_transfer.key.content_hash.ToString(),
             .page_offset = block_transfer.key.page_offset,
         });
     }

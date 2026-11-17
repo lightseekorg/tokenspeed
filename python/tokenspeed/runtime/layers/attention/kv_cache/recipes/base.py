@@ -63,6 +63,9 @@ if TYPE_CHECKING:
         CacheModelFamily,
         CacheSetup,
     )
+    from tokenspeed.runtime.layers.attention.qsa.bf16_scratch import (
+        QSABf16ScratchPlan,
+    )
 
 
 class CacheRecipe(ABC):
@@ -175,8 +178,12 @@ class CacheRecipe(ABC):
             None
             if policy is None
             else policy.bind(
-                request_slots=RequestSlotLayout(self.attn_config.max_bs).capacity,
-                device_rows=RequestSlotLayout(self.attn_config.max_bs).capacity
+                request_slots=RequestSlotLayout(
+                    self.attn_config.max_resident_requests
+                ).capacity,
+                device_rows=RequestSlotLayout(
+                    self.attn_config.max_resident_requests
+                ).capacity
                 * (policy.hot_tokens + policy.reserved_tokens),
             )
         )
@@ -494,13 +501,19 @@ class CacheRecipe(ABC):
         unless verify scratch lives in the pool, which then needs a row per
         request whatever pool is bound.
         """
+        serving_limits = self.probe_batch_rows is None or self.verify_scratch_in_pool()
+        max_batch_size = (
+            self.attn_config.max_bs
+            if serving_limits
+            else min(self.attn_config.max_bs, self.probe_batch_rows)
+        )
         return SchedulerLimits(
             role=scheduler_role(self.server_args.disaggregation_mode),
-            # One live request per fabricated row; serving concurrency is elsewhere.
-            max_live_requests=(
-                self.attn_config.max_bs
-                if self.probe_batch_rows is None or self.verify_scratch_in_pool()
-                else min(self.attn_config.max_bs, self.probe_batch_rows)
+            max_batch_size=max_batch_size,
+            max_resident_requests=(
+                self.attn_config.max_resident_requests
+                if serving_limits
+                else max_batch_size
             ),
             max_scheduled_tokens=int(self.server_args.chunked_prefill_size),
             max_context_len=self.attn_config.context_len,
@@ -582,6 +595,21 @@ class CacheRecipe(ABC):
     def workspace_bytes(self) -> int:
         """Cache-adjacent fixed allocation this family also needs."""
         return 0
+
+    @cached_property
+    def qsa_bf16_scratch_plan(self) -> QSABf16ScratchPlan | None:
+        """The QSA BF16 prefill scratch this engine reserves, or None.
+
+        ``--enable-qsa-prefill-bf16-scratch`` serves families with QSA
+        sparse-attention layers, which override this seam and count the plan
+        in ``workspace_bytes``; every other family refuses the flag.
+        """
+        if self.server_args.enable_qsa_prefill_bf16_scratch:
+            raise ValueError(
+                "--enable-qsa-prefill-bf16-scratch serves QSA sparse-attention "
+                f"models; this model's cache family is {self.family!r}"
+            )
+        return None
 
     def verify_scratch_in_pool(self) -> bool:
         """Whether speculative verify stages its scratch in the bound pool.

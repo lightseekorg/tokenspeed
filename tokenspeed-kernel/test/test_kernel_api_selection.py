@@ -134,6 +134,7 @@ from tokenspeed_kernel.ops.sampling import argmax as kernel_argmax
 from tokenspeed_kernel.ops.transform import (
     hadamard_transform as kernel_hadamard_transform,
 )
+from tokenspeed_kernel.ops.tuning import kernel_warmup
 from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry, Priority
 from tokenspeed_kernel.selection import NoKernelFoundError as kernel_NoKernelFoundError
@@ -317,6 +318,7 @@ def test_residual_family_exports_and_modes():
         "post_norm_residual_pre_norm_bf16",
         "residual_gate_coefficients",
         "try_mhc_shifted_post_pre_norm",
+        "try_mhc_shifted_post_pre_norm_quantize_fp8",
     }
     assert set(_residual_pkg.__all__) == expected_exports
     residual_modes = {
@@ -335,6 +337,7 @@ def test_residual_family_exports_and_modes():
         "mhc_post",
         "mhc_pre",
         "mhc_shifted_post_pre_norm",
+        "mhc_shifted_post_pre_norm_quantize_fp8",
         "normalized_dot_gate",
     }
 
@@ -367,6 +370,7 @@ def test_builtin_moe_specialized_offsets_are_intentional() -> None:
         "gluon_petit_mxfp4_megamoe_apply": Priority.SPECIALIZED + 3,
         "triton_decode_sigmoid_bias_topk": Priority.SPECIALIZED + 1,
         # Prefer packed routing while keeping overlapping Gluon selectable.
+        "triton_kimi3_packed_sigmoid_bias_topk_gfx950": Priority.SPECIALIZED + 1,
         "triton_kimi3_packed_sigmoid_bias_topk_gfx1250": Priority.SPECIALIZED + 1,
     }
     actual_offsets = {
@@ -1650,6 +1654,7 @@ def _attention_decode(
         max_seqlen_k=128,
         max_seqlen_q=1,
         solution=solution,
+        block_draft=False,
     )
 
 
@@ -1843,6 +1848,7 @@ def _attention_rel_prefill() -> object:
         cu_seqlens_cpu=[0, 4],
         max_seqlen=4,
         softmax_scale=1.0 / 64,
+        output_dtype=None,
     )
 
 
@@ -1867,6 +1873,7 @@ def _attention_rel_extend() -> object:
         max_seqlen_k=128,
         rel_logits=rel_logits,
         softmax_scale=1.0 / 64,
+        output_dtype=None,
     )
 
 
@@ -1892,6 +1899,7 @@ def _attention_rel_extend_page256_sliding() -> object:
         rel_logits=rel_logits,
         window_left=255,
         softmax_scale=1.0 / 128,
+        output_dtype=None,
     )
 
 
@@ -1914,6 +1922,10 @@ def _attention_rel_decode() -> object:
         cu_seqlens_q=cu_seqlens_q,
         max_seqlen_q=1,
         softmax_scale=1.0 / 64,
+        output_dtype=None,
+        return_lse=False,
+        gate=None,
+        sink=None,
     )
 
 
@@ -1937,6 +1949,10 @@ def _attention_rel_decode_page128_sliding() -> object:
         max_seqlen_q=1,
         window_left=127,
         softmax_scale=1.0 / 128,
+        output_dtype=None,
+        return_lse=False,
+        gate=None,
+        sink=None,
     )
 
 
@@ -1962,6 +1978,10 @@ def _attention_rel_decode_multiquery(window_left: int) -> object:
         max_seqlen_q=prediction,
         window_left=window_left,
         softmax_scale=1.0 / 128,
+        output_dtype=None,
+        return_lse=False,
+        gate=None,
+        sink=None,
     )
 
 
@@ -1993,6 +2013,10 @@ def _attention_rel_decode_page256_sliding() -> object:
         max_seqlen_q=1,
         window_left=255,
         softmax_scale=1.0 / 128,
+        output_dtype=None,
+        return_lse=False,
+        gate=None,
+        sink=None,
     )
 
 
@@ -2555,6 +2579,41 @@ def _attention_dsa_prefill_topk_standard(
         index_k_cache=index_k_cache,
         page_size=64,
         q_scales=q_scales,
+        slot_order="selection",
+    )
+
+
+def _attention_dsa_decode_topk_bf16_plane(
+    index_heads: int, weights_dtype: torch.dtype
+) -> object:
+    return _attention_dsa_pkg.dsa_decode_topk(
+        torch.empty((2, index_heads, 128), dtype=torch.bfloat16),
+        torch.empty((2, index_heads), dtype=weights_dtype),
+        torch.tensor([64, 64], dtype=torch.int32),
+        torch.zeros((2, 1), dtype=torch.int32),
+        page_size=64,
+        topk=512,
+        softmax_scale=1.0,
+        batch_invariant=False,
+        index_k_cache=torch.zeros((128, 128), dtype=torch.bfloat16),
+        slot_order="selection",
+    )
+
+
+def _attention_dsa_prefill_topk_bf16_plane(
+    index_heads: int, weights_dtype: torch.dtype
+) -> object:
+    return _attention_dsa_pkg.dsa_prefill_topk(
+        torch.empty((2, index_heads, 128), dtype=torch.bfloat16),
+        torch.empty((2, index_heads), dtype=weights_dtype),
+        torch.arange(64, dtype=torch.int64),
+        torch.tensor([0, 8], dtype=torch.int32),
+        torch.tensor([8, 16], dtype=torch.int32),
+        topk=512,
+        softmax_scale=1.0,
+        batch_invariant=False,
+        index_k_cache=torch.zeros((128, 128), dtype=torch.bfloat16),
+        page_size=64,
         slot_order="selection",
     )
 
@@ -3521,6 +3580,48 @@ def test_triton_decode_sigmoid_topk_priority_beats_broad_gluon(
     assert selected.name == "triton_decode_sigmoid_bias_topk"
 
 
+def test_gfx950_sigmoid_topk_selects_by_token_count(
+    mi350_platform: PlatformInfo,
+) -> None:
+    registry = KernelRegistry.get()
+    packed_spec = registry.get_by_name("triton_kimi3_packed_sigmoid_bias_topk_gfx950")
+    gluon_spec = registry.get_by_name("gluon_sigmoid_bias_topk_gfx950")
+    if packed_spec is None or gluon_spec is None:
+        pytest.skip("gfx950 sigmoid top-k kernels are unavailable")
+
+    signature = format_signature(
+        router_logits=dense_tensor_format(torch.float32),
+    )
+
+    def select(tokens: int, **kwargs) -> str:
+        return select_kernel(
+            "moe",
+            "sigmoid_bias_topk",
+            signature,
+            traits={"tokens": tokens, "experts": 896, "topk": 16},
+            **kwargs,
+        ).name
+
+    real_platform = Platform.get()
+    try:
+        Platform.override(mi350_platform)
+        registry.clear_cache()
+        decode = select(1)
+        verify = select(4)
+        last_packed = select(512)
+        past_packed = select(513)
+        forced_gluon = select(4, solution="gluon")
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
+
+    assert decode == "triton_decode_sigmoid_bias_topk"
+    assert verify == "triton_kimi3_packed_sigmoid_bias_topk_gfx950"
+    assert last_packed == "triton_kimi3_packed_sigmoid_bias_topk_gfx950"
+    assert past_packed == "gluon_sigmoid_bias_topk_gfx950"
+    assert forced_gluon == "gluon_sigmoid_bias_topk_gfx950"
+
+
 def test_gfx1250_sigmoid_topk_selects_by_token_count(
     mi450_platform: PlatformInfo,
 ) -> None:
@@ -3929,6 +4030,57 @@ def test_legacy_gluon_plans_keep_existing_implementation(
     assert plan["apply_kernel_name"] == expected
 
 
+def _deferred_bf16_plan(platform: PlatformInfo, **overrides) -> dict:
+    """Muse's BF16 expert plan: precomputed routes, caller-normalized."""
+    return _moe_fp8_channel_plan(
+        platform,
+        **{
+            "weight_dtype": "unquant",
+            "requires_deferred_finalize": True,
+            "ep_size": 4,
+            "ispp": 4096,
+            "hidden": 4096,
+            "swiglu_form": None,
+            "num_experts": 256,
+            "top_k": 8,
+            **overrides,
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "platform_fixture,expected",
+    [
+        ("h100_platform", "triton_bf16_routes_moe_apply"),
+        ("b200_platform", "flashinfer_trtllm_unquant_routed_moe_apply"),
+        ("b300_platform", "flashinfer_trtllm_unquant_routed_moe_apply"),
+        ("mi350_platform", "gluon_bf16_routes_moe_apply"),
+    ],
+)
+def test_deferred_bf16_plans_select_a_route_kernel(
+    platform_fixture: str, expected: str, request: pytest.FixtureRequest
+) -> None:
+    if KernelRegistry.get().get_by_name(expected) is None:
+        pytest.skip(f"{expected!r} is not registered on this host")
+    plan = _deferred_bf16_plan(request.getfixturevalue(platform_fixture))
+    assert plan["apply_kernel_name"] == expected
+    assert plan["supports_deferred_finalize"] is True
+
+
+def test_finalizing_bf16_plans_skip_the_route_kernels(
+    h100_platform: PlatformInfo,
+) -> None:
+    plan = _deferred_bf16_plan(
+        h100_platform, requires_deferred_finalize=False, ep_size=1, solution="triton"
+    )
+    assert plan["apply_kernel_name"] == "triton_bf16_precomputed_moe_apply"
+    # The only Triton kernel taking EP BF16 experts cannot finalize.
+    with pytest.raises(kernel_NoKernelFoundError):
+        _deferred_bf16_plan(
+            h100_platform, requires_deferred_finalize=False, solution="triton"
+        )
+
+
 def _select_on(platform: PlatformInfo, *args, **kwargs) -> str:
     registry = KernelRegistry.get()
     real_platform = Platform.get()
@@ -4222,6 +4374,14 @@ def test_kimi3_mxfp4_situ_selection_on_cdna4(
     _assert_moe_plan(plan, apply=kernel_name, preprocessor=preprocessor)
     assert plan["activation"] == "situ"
     assert plan["support_routing"] is False
+    # Only the TP apply reads the fused router's expert sort, at the decode
+    # widths it sorts itself.
+    if ep_size == 1:
+        assert plan["sorted_route_rows"] == frozenset(range(8, 193))
+        assert plan["sorted_route_block_size"] == 16
+    else:
+        assert plan["sorted_route_rows"] == frozenset()
+        assert plan["sorted_route_block_size"] is None
 
 
 @pytest.mark.parametrize(
@@ -6300,27 +6460,49 @@ _CASES = [
             "cdna4",
             "attention",
             operation,
-            expected,
+            # FP8 queries take the multi-row scorers; BF16 queries the standard ones.
+            f"gluon_{operation}_{'fp8_rows' if dtype == torch.float8_e4m3fn else 'standard'}"
+            "_gfx950",
             lambda heads=heads, dtype=dtype, layout=layout, invoke=invoke: invoke(
                 heads, dtype, layout
             ),
             id_suffix=(f"h{heads}-{str(dtype).removeprefix('torch.')}-{layout}"),
         )
-        for operation, expected, invoke in (
-            (
-                "dsa_decode_topk",
-                "gluon_dsa_decode_topk_standard_gfx950",
-                _attention_dsa_decode_topk_standard,
-            ),
-            (
-                "dsa_prefill_topk",
-                "gluon_dsa_prefill_topk_standard_gfx950",
-                _attention_dsa_prefill_topk_standard,
-            ),
+        for operation, invoke in (
+            ("dsa_decode_topk", _attention_dsa_decode_topk_standard),
+            ("dsa_prefill_topk", _attention_dsa_prefill_topk_standard),
         )
         for heads in (32, 64)
         for dtype in (torch.bfloat16, torch.float8_e4m3fn)
         for layout in ("packed", "page_planar")
+    ),
+    # A bf16 index-K plane selects only the bf16 scorers.
+    *(
+        _case(
+            _is_cdna4,
+            "cdna4",
+            "attention",
+            operation,
+            expected,
+            partial(invoke, heads, weights_dtype),
+            id_suffix=(
+                f"bf16-plane-h{heads}-w{str(weights_dtype).removeprefix('torch.')}"
+            ),
+        )
+        for operation, expected, invoke in (
+            (
+                "dsa_decode_topk",
+                "gluon_dsa_decode_topk_bf16_gfx950",
+                _attention_dsa_decode_topk_bf16_plane,
+            ),
+            (
+                "dsa_prefill_topk",
+                "gluon_dsa_prefill_topk_bf16_gfx950",
+                _attention_dsa_prefill_topk_bf16_plane,
+            ),
+        )
+        for heads in (32, 64)
+        for weights_dtype in (torch.bfloat16, torch.float32)
     ),
     _case(
         _is_cdna4,
@@ -7594,17 +7776,18 @@ def test_attn_merge_state_routes_to_triton_on_cdna4(
 
 
 @pytest.mark.parametrize(
-    ("entrypoint_name", "implementation_name"),
+    ("entrypoint_name", "implementation_name", "forwards_warmup"),
     [
-        ("gluon_dsa_prefill_gfx950", "_dsa_prefill_impl"),
-        ("gluon_dsa_prefill_fp8_dense_gfx950", "_dsa_prefill_impl"),
-        ("gluon_dsa_prefill_gfx1250", "_dsa_prefill_gfx1250_impl"),
-        ("gluon_dsa_prefill_fp8_dense_gfx1250", "_dsa_prefill_gfx1250_impl"),
+        ("gluon_dsa_prefill_gfx950", "_dsa_prefill_impl", True),
+        ("gluon_dsa_prefill_fp8_dense_gfx950", "_dsa_prefill_impl", True),
+        ("gluon_dsa_prefill_gfx1250", "_dsa_prefill_gfx1250_impl", False),
+        ("gluon_dsa_prefill_fp8_dense_gfx1250", "_dsa_prefill_gfx1250_impl", False),
     ],
 )
 def test_gluon_dsa_prefill_adapters_drop_unused_kv_seq_lens(
     entrypoint_name: str,
     implementation_name: str,
+    forwards_warmup: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     entrypoint = getattr(_attention_gluon_dsa, entrypoint_name, None)
@@ -7622,10 +7805,15 @@ def test_gluon_dsa_prefill_adapters_drop_unused_kv_seq_lens(
     monkeypatch.setattr(_attention_gluon_dsa, implementation_name, fake_impl)
 
     marker = object()
-    result = entrypoint(marker=marker, kv_seq_lens=object())
+    for warming_up in (False, True):
+        forwarded.clear()
+        with kernel_warmup(enabled=warming_up):
+            result = entrypoint(marker=marker, kv_seq_lens=object())
 
-    assert result is expected
-    assert forwarded == {"marker": marker}
+        assert result is expected
+        # The gfx950 launcher prepares its split variants during warmup.
+        warmup = {"warm_split_variants": warming_up} if forwards_warmup else {}
+        assert forwarded == {"marker": marker, **warmup}
 
 
 @pytest.mark.parametrize(
@@ -7992,3 +8180,83 @@ def test_kernel_api_selection(
         registry.clear_cache()
 
     assert calls == [case.expected]
+
+
+def test_fa3_declares_sinks_from_the_installed_signature(
+    h100_platform: PlatformInfo,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An FA3 build without ``sinks`` must not advertise sink support.
+
+    Attention sinks reached FA3 after these entry points stabilized. When the
+    installed build takes no ``sinks`` argument, the kernels have to declare
+    ``sinks=False`` so selection skips them for a sink-bearing graph; declaring
+    True would hand the leaf a graph it cannot serve and fail on an unexpected
+    keyword inside ``flash_attn_with_kvcache``. Reaching the leaf anyway (a
+    caller bypassing selection) must raise rather than silently compute
+    sink-free attention.
+    """
+    if (
+        not Platform.get().is_nvidia
+        or importlib.util.find_spec("flash_attn_interface") is None
+    ):
+        pytest.skip("FA3 registration simulation requires NVIDIA FA3")
+
+    # The has_sinks=True half substitutes nothing: it reads the installed
+    # signature, so it only means anything on a build that takes `sinks`. On an
+    # older build both halves probe False and the assertion below reports the
+    # environment rather than the declaration under test.
+    import inspect as _fa3_inspect
+
+    import flash_attn_interface as _installed_fa3
+
+    if (
+        "sinks"
+        not in _fa3_inspect.signature(_installed_fa3.flash_attn_with_kvcache).parameters
+    ):
+        pytest.skip("the installed FA3 build takes no `sinks` argument")
+
+    real_platform = Platform.get()
+    real_registry = KernelRegistry.get()
+    import flash_attn_interface
+
+    sink_modes = ("fa3_mha_prefill", "fa3_mha_extend_with_kvcache")
+    decode = "fa3_mha_decode_with_kvcache"
+
+    def sinkless_with_kvcache(**kwargs):
+        # The older build's signature: no `sinks` parameter at all.
+        raise AssertionError("the sinkless probe must not be launched")
+
+    try:
+        Platform.override(h100_platform)
+        for has_sinks in (True, False):
+            KernelRegistry.reset()
+            with monkeypatch.context() as patch:
+                if not has_sinks:
+                    patch.setattr(
+                        flash_attn_interface,
+                        "flash_attn_with_kvcache",
+                        sinkless_with_kvcache,
+                    )
+                importlib.reload(_attention_flash_attn)
+                assert _attention_flash_attn._FA3_HAS_SINKS is has_sinks
+                registry = KernelRegistry.get()
+                for name in (*sink_modes, decode):
+                    spec = registry.get_by_name(name)
+                    assert spec is not None, name
+                    assert spec.traits["sinks"] == (
+                        frozenset({False, True}) if has_sinks else frozenset({False})
+                    ), name
+                # A sink that reaches the leaf anyway is named, not dropped.
+                kwargs = _attention_flash_attn._fa3_sink_kwargs
+                assert kwargs(None) == ({"sinks": None} if has_sinks else {})
+                if has_sinks:
+                    sinks = torch.empty((4,), dtype=torch.float32, device="meta")
+                    assert kwargs(sinks) == {"sinks": sinks}
+                else:
+                    with pytest.raises(ValueError, match="takes no attention sinks"):
+                        kwargs(torch.empty((4,), dtype=torch.float32, device="meta"))
+    finally:
+        Platform.override(real_platform)
+        KernelRegistry._instance = real_registry
+        importlib.reload(_attention_flash_attn)

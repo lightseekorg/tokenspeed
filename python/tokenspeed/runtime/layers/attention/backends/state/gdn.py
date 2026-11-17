@@ -53,13 +53,28 @@ class GdnAttnBackend(CapacityPrefillBackend):
     The shared base already runs GDN; this class only admits capacity-shaped
     prefills, which needs a chunk-prefill kernel that reads its sequence bounds
     on device (see ``gdn_chunk_prefill_capturable``).
+
+    Args:
+        config: The model's attention configuration.
+        spec: The softmax component of ``config``.
+        writes_state_checkpoints_in_forward: Whether the scheduler may give
+            extend rows in-forward State checkpoints
+            (``--enable-state-checkpoint-in-forward``). Captured scans then
+            store them through fixed checkpoint slots, so such forwards run
+            inline too.
     """
 
     # The scan reads its bounds on device, so packing would only add work to eager forwards.
     _capacity_layout_when_uncaptured = False
     _verify_scan_writes_replay = True
 
-    def __init__(self, config: AttnConfig, spec: SoftmaxAttnConfig) -> None:
+    def __init__(
+        self,
+        config: AttnConfig,
+        spec: SoftmaxAttnConfig,
+        *,
+        writes_state_checkpoints_in_forward: bool,
+    ) -> None:
         super().__init__(config, spec)
         linear_attn = config.component(LinearAttnConfig)
         self._scan_geometry: dict[str, int | bool] = {
@@ -69,15 +84,22 @@ class GdnAttnBackend(CapacityPrefillBackend):
             "num_v_heads": linear_attn.num_v_heads // linear_attn.tp_size,
             "qk_l2norm": True,
         }
+        # A captured scan of a server writing in-forward checkpoints stores
+        # them, so the kernel that does must read its bounds on device too.
         self._prefill_capturable = gdn_chunk_prefill_capturable(
-            config.dtype, **self._scan_geometry
+            config.dtype,
+            **self._scan_geometry,
+            state_checkpoints=writes_state_checkpoints_in_forward,
         )
+        self._writes_state_checkpoints_in_forward = writes_state_checkpoints_in_forward
 
         self._head_k_dim = linear_attn.head_k_dim
         self._head_v_dim = linear_attn.head_v_dim
         # Resolved when a pool binds: the pool's prefix granularity spaces the
-        # in-forward checkpoints, and its state dtype picks the verify kernel.
+        # in-forward checkpoints (and so the interval a captured scan stores
+        # them at), and its state dtype picks the verify kernel.
         self._stores_in_forward_state_checkpoints = False
+        self._state_checkpoint_interval: int | None = None
         self._verify_reads_committed_recurrent_state = False
         self._verify_packed_qkv_views = False
         self._decode_packed_qkv_views = False
@@ -93,6 +115,15 @@ class GdnAttnBackend(CapacityPrefillBackend):
                 **self._scan_geometry,
                 interval_granularity=contract.prefix_granularity,
             )
+        )
+        # Every checkpoint offset is a multiple of that granularity, so a
+        # captured scan storing a state at each prefix page covers whichever
+        # checkpoints a forward carries.
+        self._state_checkpoint_interval = (
+            contract.prefix_granularity
+            if self._writes_state_checkpoints_in_forward
+            and self._stores_in_forward_state_checkpoints
+            else None
         )
         # Where the verify kernel takes a separate destination pool, verify
         # reads the committed state in place instead of seeding the scratch
@@ -145,6 +176,9 @@ class GdnAttnBackend(CapacityPrefillBackend):
 
     def _admits_capacity_prefill(self) -> bool:
         return self._prefill_capturable
+
+    def _capacity_checkpoint_interval(self) -> int | None:
+        return self._state_checkpoint_interval
 
     def _pack_projection(
         self,

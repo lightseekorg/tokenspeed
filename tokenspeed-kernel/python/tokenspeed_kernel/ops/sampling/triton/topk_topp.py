@@ -29,6 +29,8 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.sampling.triton.common import check_draft_q_inputs
+from tokenspeed_kernel.ops.sampling.triton.rejection import COIN_OFFSET_SALT
 
 _TOP_K_TOP_P_BLOCK_SIZE = 2048
 _TOP_K_TOP_P_PAD = 128
@@ -335,12 +337,27 @@ def _top_k_top_p_gumbel_stage2_kernel(
     seed_pool_ptr,
     offsets_pool_ptr,
     out_ptr,
+    row_accept_ptr,
+    verify_candidates_ptr,
+    slot_ptr,
+    pos_ptr,
+    q_ptr,
+    q_ids_ptr,
     candidate_row_stride: tl.constexpr,
     num_blocks: tl.constexpr,
     vocab_size: tl.constexpr,
     TOPK_PAD: tl.constexpr,
     NUM_BLOCKS_PAD: tl.constexpr,
     NUM_TOKENS_PER_REQ: tl.constexpr,
+    HAS_DRAFT_Q: tl.constexpr,
+    verify_candidates_row_stride: tl.constexpr,
+    verify_candidates_col_stride: tl.constexpr,
+    slot_pool_stride: tl.constexpr,
+    q_pool_stride: tl.constexpr,
+    q_slot_stride: tl.constexpr,
+    NUM_CANDIDATES: tl.constexpr,
+    K_PAD: tl.constexpr,
+    COIN_SALT: tl.constexpr,
 ):
     row = tl.program_id(0)
     req_row = row // NUM_TOKENS_PER_REQ
@@ -369,39 +386,56 @@ def _top_k_top_p_gumbel_stage2_kernel(
     top_logits = tl.full((TOPK_PAD,), float("-inf"), tl.float32)
     top_ids = tl.full((TOPK_PAD,), 2147483647, tl.int32)
 
-    # Stage 1 writes a sorted top-K list per vocab block. Merge those per-block
-    # lists directly instead of repeatedly scanning the full candidate scratch.
-    # Ranks at or past the row's top_k are never kept, so the merge stops there.
-    for rank in tl.range(0, tl.minimum(top_k, TOPK_PAD)):
-        pos = block_offsets * TOPK_PAD + block_cursors
-        active_blocks = block_mask & (block_cursors < TOPK_PAD)
-        head_logits = tl.load(
-            candidate_logits_ptr + row * candidate_row_stride + pos,
-            mask=active_blocks,
+    if num_blocks == 1:
+        # One sorted list (a vocabulary of one block, or candidates merged
+        # across vocab shards): the merge that follows would copy its first
+        # min(top_k, TOPK_PAD) entries, so load them in one step.
+        in_list = rank_offsets < tl.minimum(top_k, TOPK_PAD)
+        top_logits = tl.load(
+            candidate_logits_ptr + row * candidate_row_stride + rank_offsets,
+            mask=in_list,
             other=float("-inf"),
         ).to(tl.float32)
-        head_ids = tl.load(
-            candidate_ids_ptr + row * candidate_row_stride + pos,
-            mask=active_blocks,
+        top_ids = tl.load(
+            candidate_ids_ptr + row * candidate_row_stride + rank_offsets,
+            mask=in_list,
             other=2147483647,
         )
+    else:
+        # Stage 1 writes a sorted top-K list per vocab block. Merge those
+        # per-block lists directly instead of repeatedly scanning the full
+        # candidate scratch. Ranks at or past the row's top_k are never kept,
+        # so the merge stops there.
+        for rank in tl.range(0, tl.minimum(top_k, TOPK_PAD)):
+            pos = block_offsets * TOPK_PAD + block_cursors
+            active_blocks = block_mask & (block_cursors < TOPK_PAD)
+            head_logits = tl.load(
+                candidate_logits_ptr + row * candidate_row_stride + pos,
+                mask=active_blocks,
+                other=float("-inf"),
+            ).to(tl.float32)
+            head_ids = tl.load(
+                candidate_ids_ptr + row * candidate_row_stride + pos,
+                mask=active_blocks,
+                other=2147483647,
+            )
 
-        best_logit = tl.max(head_logits, axis=0)
-        best_id = tl.min(
-            tl.where(head_logits == best_logit, head_ids, 2147483647), axis=0
-        )
-        best_block = tl.min(
-            tl.where(
-                (head_logits == best_logit) & (head_ids == best_id),
-                block_offsets,
-                2147483647,
-            ),
-            axis=0,
-        )
+            best_logit = tl.max(head_logits, axis=0)
+            best_id = tl.min(
+                tl.where(head_logits == best_logit, head_ids, 2147483647), axis=0
+            )
+            best_block = tl.min(
+                tl.where(
+                    (head_logits == best_logit) & (head_ids == best_id),
+                    block_offsets,
+                    2147483647,
+                ),
+                axis=0,
+            )
 
-        top_logits = tl.where(rank_offsets == rank, best_logit, top_logits)
-        top_ids = tl.where(rank_offsets == rank, best_id, top_ids)
-        block_cursors += tl.where(block_offsets == best_block, 1, 0)
+            top_logits = tl.where(rank_offsets == rank, best_logit, top_logits)
+            top_ids = tl.where(rank_offsets == rank, best_id, top_ids)
+            block_cursors += tl.where(block_offsets == best_block, 1, 0)
 
     scaled_logits = top_logits / temperature
     max_logit = tl.max(scaled_logits, axis=0)
@@ -423,7 +457,140 @@ def _top_k_top_p_gumbel_stage2_kernel(
 
     max_score = tl.max(scores, axis=0)
     token_id = tl.min(tl.where(scores == max_score, top_ids, 2147483647), axis=0)
+    if HAS_DRAFT_Q:
+        token_id, accept = _top_k_top_p_rejection_verify(
+            token_id,
+            gumbel,
+            keep,
+            scaled_logits,
+            max_logit,
+            top_ids,
+            top_k,
+            req_row,
+            spec_pos,
+            pool_idx,
+            seed,
+            offset,
+            verify_candidates_ptr,
+            slot_ptr,
+            pos_ptr,
+            q_ptr,
+            q_ids_ptr,
+            verify_candidates_row_stride,
+            verify_candidates_col_stride,
+            slot_pool_stride,
+            q_pool_stride,
+            q_slot_stride,
+            NUM_TOKENS_PER_REQ,
+            NUM_CANDIDATES,
+            K_PAD,
+            COIN_SALT,
+            vocab_size,
+        )
+        tl.store(row_accept_ptr + row, accept.to(tl.int32))
     tl.store(out_ptr + row, token_id)
+
+
+@triton.jit
+def _top_k_top_p_rejection_verify(
+    plain_token,
+    gumbel,
+    keep,
+    scaled_logits,
+    max_logit,
+    top_ids,
+    top_k,
+    req_row,
+    spec_pos,
+    pool_idx,
+    seed,
+    offset,
+    verify_candidates_ptr,
+    slot_ptr,
+    pos_ptr,
+    q_ptr,
+    q_ids_ptr,
+    verify_candidates_row_stride: tl.constexpr,
+    verify_candidates_col_stride: tl.constexpr,
+    slot_pool_stride: tl.constexpr,
+    q_pool_stride: tl.constexpr,
+    q_slot_stride: tl.constexpr,
+    NUM_TOKENS_PER_REQ: tl.constexpr,
+    NUM_CANDIDATES: tl.constexpr,
+    K_PAD: tl.constexpr,
+    COIN_SALT: tl.constexpr,
+    VOCAB_SIZE: tl.constexpr,
+):
+    """Rejection-sampling verify of one row over its sorted top-k support.
+
+    The target distribution is the softmax over the kept tokens (after the
+    top-p and min-p cuts), normalized by the kept set's own sum. Returns
+    ``(token, accept)``: the token the row emits when the chain stops there,
+    and whether it accepts its draft. Greedy rows and rows without a recorded
+    q keep the plain draw and accept the draft when it equals that draw.
+    """
+    draft_row = spec_pos < NUM_TOKENS_PER_REQ - 1
+    draft = tl.load(
+        verify_candidates_ptr
+        + req_row * verify_candidates_row_stride
+        + (spec_pos + 1) * verify_candidates_col_stride,
+        mask=draft_row,
+        other=-1,
+    )
+    node = pool_idx.to(tl.int64) * slot_pool_stride + spec_pos + 1
+    slot = tl.load(slot_ptr + node, mask=draft_row, other=-1)
+    draft_lane = tl.load(pos_ptr + node, mask=draft_row, other=-1)
+    has_q = (slot >= 0) & (top_k != 1)
+
+    kept_weights = tl.where(keep, tl.exp(scaled_logits - max_logit), 0.0)
+    lse = max_logit + tl.log(tl.sum(kept_weights, axis=0))
+    kept_p = tl.where(keep, tl.exp(scaled_logits - lse), 0.0)
+
+    lanes = tl.arange(0, K_PAD)
+    lane_ok = (lanes < NUM_CANDIDATES) & has_q
+    q_base = (
+        pool_idx.to(tl.int64) * q_pool_stride
+        + tl.maximum(slot, 0).to(tl.int64) * q_slot_stride
+    )
+    q = tl.load(q_ptr + q_base + lanes, mask=lane_ok, other=0.0)
+    q_ids = tl.load(q_ids_ptr + q_base + lanes, mask=lane_ok, other=-1)
+    # q of each support entry; 0 off the candidate list.
+    match = (top_ids[:, None] == q_ids[None, :]) & lane_ok[None, :]
+    support_q = tl.max(tl.where(match, q[None, :], 0.0), axis=1)
+    support_is_candidate = tl.max(match.to(tl.int32), axis=1) > 0
+
+    # The draft must be a vocabulary token sitting at its recorded lane;
+    # otherwise it did not come from this q and the row falls back to the
+    # target-only rule below.
+    is_draft = lane_ok & (lanes == draft_lane) & (q_ids == draft)
+    in_vocab = (draft >= 0) & (draft < VOCAB_SIZE)
+    has_q = has_q & in_vocab & (tl.max(is_draft.to(tl.int32), axis=0) > 0)
+    q_draft = tl.max(tl.where(is_draft, q, 0.0), axis=0)
+    p_draft = tl.max(tl.where(keep & (top_ids == draft), kept_p, 0.0), axis=0)
+    coin = tl.rand(tl.randint(seed, COIN_SALT + offset), tl.full((), 0, tl.int32))
+    accept_q = (q_draft > 0.0) & (coin * q_draft < p_draft)
+
+    # Residual draw from max(p - q, 0): kept non-candidates keep their plain
+    # score, kept candidates score log(p - q) + LSE.
+    residual = kept_p - support_q
+    residual_scores = tl.where(
+        support_is_candidate,
+        tl.where(residual > 0.0, tl.log(residual) + lse, float("-inf")),
+        scaled_logits,
+    )
+    residual_scores = tl.where(keep, residual_scores + gumbel, float("-inf"))
+    best = tl.max(residual_scores, axis=0)
+    resampled = tl.min(tl.where(residual_scores == best, top_ids, 2147483647), axis=0)
+    # p <= q everywhere only through rounding; fall back to the target's mode,
+    # the first support entry.
+    mode = tl.min(
+        tl.where(keep & (scaled_logits == max_logit), top_ids, 2147483647), axis=0
+    )
+    resampled = tl.where(best == float("-inf"), mode, resampled)
+
+    token = tl.where(has_q, resampled, plain_token)
+    accept = draft_row & tl.where(has_q, accept_q, plain_token == draft)
+    return token, accept
 
 
 def _check_top_k_top_p_gumbel_inputs(
@@ -597,16 +764,433 @@ def gumbel_sample_top_k_top_p_from_pools(
         seed_pool,
         offsets_pool,
         out,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
         candidate_row_stride=candidate_ids.stride(0),
         num_blocks=num_blocks,
         vocab_size=vocab_size,
         TOPK_PAD=top_k_pad,
         NUM_BLOCKS_PAD=triton.next_power_of_2(num_blocks),
         NUM_TOKENS_PER_REQ=num_tokens_per_req,
+        # Sampling only: no draft q, so the verify-only arguments are unused.
+        HAS_DRAFT_Q=False,
+        verify_candidates_row_stride=0,
+        verify_candidates_col_stride=0,
+        slot_pool_stride=0,
+        q_pool_stride=0,
+        q_slot_stride=0,
+        NUM_CANDIDATES=1,
+        K_PAD=1,
+        COIN_SALT=0,
         num_warps=stage2_num_warps,
         num_stages=3,
     )
     return out[:rows]
+
+
+def verify_rows_top_k_top_p_from_pools(
+    logits: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    temperature_pool: torch.Tensor,
+    top_k_pool: torch.Tensor,
+    top_p_pool: torch.Tensor,
+    seed_pool: torch.Tensor,
+    offsets_pool: torch.Tensor,
+    candidate_ids: torch.Tensor,
+    candidate_logits: torch.Tensor,
+    candidates: torch.Tensor,
+    q: torch.Tensor,
+    q_ids: torch.Tensor,
+    slot: torch.Tensor,
+    pos: torch.Tensor,
+    row_accept: torch.Tensor,
+    row_token: torch.Tensor,
+    *,
+    block_size: int,
+    top_k_pad: int,
+    num_tokens_per_req: int,
+) -> None:
+    """Per-row rejection-sampling verify for top-k (and top-p) rows.
+
+    Same two kernels as ``gumbel_sample_top_k_top_p_from_pools``; stage 2
+    also evaluates the rejection rule. The target distribution of a row is
+    the softmax over its kept tokens: the ``min(top_k, top_k_pad)`` best
+    logits after the top-p cut, normalized over the kept set. Row ``r`` of
+    request ``b`` checks draft ``candidates[b, r + 1]`` against ``q[pool,
+    slot[pool, r + 1]]``, recorded at lane ``pos[pool, r + 1]``: it accepts
+    with probability ``min(1, p / q)`` and otherwise emits a draw from
+    ``max(p - q, 0)``. Greedy rows (``top_k == 1``), rows with slot ``-1``
+    and each request's last row emit the plain draw (the token
+    ``gumbel_sample_top_k_top_p_from_pools`` samples) and accept the draft
+    when it equals the draw.
+
+    Args:
+        logits: ``[bs * N, V]`` target logits, stride-1 vocabulary.
+        req_pool_indices: ``[bs]`` int32 pool slot of each request.
+        temperature_pool: ``[pool]`` fp32 temperature.
+        top_k_pool: ``[pool]`` int32 top-k.
+        top_p_pool: ``[pool]`` fp32 top-p.
+        seed_pool: ``[pool]`` int64 seed.
+        offsets_pool: ``[pool]`` int64 verify offset of each slot's row 0.
+        candidate_ids: int32 ``[bs * N, cdiv(V, block_size) * top_k_pad]``
+            stage-1 scratch.
+        candidate_logits: fp32 scratch shaped like ``candidate_ids``.
+        candidates: ``[bs, N]`` int32 verify window; column 0 is the anchor.
+        q: ``[pool, S, K]`` fp32 recorded draft probabilities.
+        q_ids: ``[pool, S, K]`` int32 their token ids.
+        slot: ``[pool, >= N]`` int32 per window node, the ``q`` row its token
+            was drawn from; ``-1`` for none.
+        pos: ``[pool, >= N]`` int32 per window node, its lane in that row.
+        row_accept: ``[bs * N]`` int32 output; 1 when row ``r < N - 1``
+            accepts draft ``x_{r+1}``, 0 otherwise and for the last row.
+        row_token: ``[bs * N]`` int32 output; the token row ``r`` emits when
+            the chain stops there.
+        block_size: Stage-1 vocabulary block.
+        top_k_pad: Most support entries per row (power of two).
+        num_tokens_per_req: Verify window width ``N``.
+
+    Returns:
+        None; ``row_accept`` and ``row_token`` are written in place.
+    """
+    if top_k_pad & (top_k_pad - 1):
+        raise ValueError("top_k_pad must be a power of two for tl.topk")
+    rows, vocab_size, num_blocks = _check_top_k_top_p_gumbel_inputs(
+        logits,
+        req_pool_indices,
+        temperature_pool,
+        top_k_pool,
+        top_p_pool,
+        None,
+        seed_pool,
+        offsets_pool,
+        candidate_ids,
+        candidate_logits,
+        row_token,
+        block_size=block_size,
+        top_k_pad=top_k_pad,
+        num_tokens_per_req=num_tokens_per_req,
+    )
+    num_candidates = check_draft_q_inputs(
+        fn_name="verify_rows_top_k_top_p_from_pools",
+        rows=rows,
+        num_tokens_per_req=num_tokens_per_req,
+        req_pool_indices=req_pool_indices,
+        candidates=candidates,
+        q=q,
+        q_ids=q_ids,
+        slot=slot,
+        pos=pos,
+        row_accept=row_accept,
+        row_token=row_token,
+    )
+    if rows == 0:
+        return
+
+    stage1_num_warps = 1 if block_size <= 1024 else 8
+    stage2_num_warps = 1 if block_size <= 1024 else 4
+
+    _top_k_top_p_candidates_stage1_kernel[(rows, num_blocks)](
+        logits,
+        req_pool_indices,
+        top_k_pool,
+        candidate_ids,
+        candidate_logits,
+        logits_row_stride=logits.stride(0),
+        candidate_row_stride=candidate_ids.stride(0),
+        vocab_size=vocab_size,
+        BLOCK_SIZE=block_size,
+        TOPK_PAD=top_k_pad,
+        NUM_TOKENS_PER_REQ=num_tokens_per_req,
+        num_warps=stage1_num_warps,
+    )
+    _top_k_top_p_gumbel_stage2_kernel[(rows,)](
+        candidate_ids,
+        candidate_logits,
+        req_pool_indices,
+        temperature_pool,
+        top_k_pool,
+        top_p_pool,
+        None,
+        seed_pool,
+        offsets_pool,
+        row_token,
+        row_accept,
+        candidates,
+        slot,
+        pos,
+        q,
+        q_ids,
+        candidate_row_stride=candidate_ids.stride(0),
+        num_blocks=num_blocks,
+        vocab_size=vocab_size,
+        TOPK_PAD=top_k_pad,
+        NUM_BLOCKS_PAD=triton.next_power_of_2(num_blocks),
+        NUM_TOKENS_PER_REQ=num_tokens_per_req,
+        HAS_DRAFT_Q=True,
+        verify_candidates_row_stride=candidates.stride(0),
+        verify_candidates_col_stride=candidates.stride(1),
+        slot_pool_stride=slot.stride(0),
+        q_pool_stride=q.stride(0),
+        q_slot_stride=q.stride(1),
+        NUM_CANDIDATES=num_candidates,
+        K_PAD=triton.next_power_of_2(num_candidates),
+        COIN_SALT=COIN_OFFSET_SALT,
+        num_warps=stage2_num_warps,
+        num_stages=3,
+    )
+
+
+def _check_sorted_candidates(
+    candidate_ids: torch.Tensor,
+    candidate_logits: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    vocab_size: int,
+    num_tokens_per_req: int,
+) -> tuple[int, int]:
+    """Validate presorted candidate lists; return ``(rows, top_k_pad)``."""
+    if candidate_ids.ndim != 2 or candidate_ids.shape != candidate_logits.shape:
+        raise ValueError(
+            "candidate_ids and candidate_logits must be 2D tensors of one shape, "
+            f"got {tuple(candidate_ids.shape)} and {tuple(candidate_logits.shape)}"
+        )
+    if candidate_ids.dtype != torch.int32 or candidate_logits.dtype != torch.float32:
+        raise ValueError("candidates must be int32 ids and fp32 logits")
+    if candidate_ids.stride(-1) != 1 or candidate_logits.stride(-1) != 1:
+        raise ValueError("candidate tensors require a stride-1 last dimension")
+    if candidate_ids.stride(0) != candidate_logits.stride(0):
+        raise ValueError("candidate tensors must share their row stride")
+    rows, top_k_pad = candidate_ids.shape
+    if top_k_pad & (top_k_pad - 1):
+        raise ValueError("candidate lists must hold a power-of-two count")
+    if vocab_size <= 0 or num_tokens_per_req <= 0:
+        raise ValueError("vocab_size and num_tokens_per_req must be positive")
+    if rows % num_tokens_per_req or req_pool_indices.shape[0] != (
+        rows // num_tokens_per_req
+    ):
+        raise ValueError(
+            f"{rows} candidate rows do not match {req_pool_indices.shape[0]} "
+            f"requests of {num_tokens_per_req} rows"
+        )
+    if req_pool_indices.dtype != torch.int32:
+        raise ValueError("req_pool_indices must be int32")
+    if out.dtype != torch.int32 or out.ndim != 1 or out.shape[0] < rows:
+        raise ValueError(f"out must be an int32 vector of at least {rows} rows")
+    return rows, top_k_pad
+
+
+def gumbel_sample_top_k_top_p_from_candidates(
+    candidate_ids: torch.Tensor,
+    candidate_logits: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    temperature_pool: torch.Tensor,
+    top_k_pool: torch.Tensor,
+    top_p_pool: torch.Tensor,
+    seed_pool: torch.Tensor,
+    offsets_pool: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    vocab_size: int,
+    num_tokens_per_req: int,
+) -> torch.Tensor:
+    """``gumbel_sample_top_k_top_p_from_pools`` on each row's best candidates.
+
+    For logits that never exist whole on one device (a vocabulary-parallel
+    head): the caller selects each row's ``top_k_pad`` best logits across the
+    shards. Given the same candidates, the stage-1 lists of the whole row
+    would merge into, the sample is bitwise the same token.
+
+    Args:
+        candidate_ids: ``[rows, top_k_pad]`` int32 token ids, descending
+            logit order, lowest id first among equal logits.
+        candidate_logits: ``[rows, top_k_pad]`` fp32 logits in that order.
+        req_pool_indices: ``[rows / num_tokens_per_req]`` int32 pool slots.
+        temperature_pool: ``[pool]`` fp32 temperature.
+        top_k_pool: ``[pool]`` int32 top-k; at most ``top_k_pad`` are kept.
+        top_p_pool: ``[pool]`` fp32 top-p.
+        seed_pool: ``[pool]`` int64 seed.
+        offsets_pool: ``[pool]`` int64 sampling offset of each slot's row 0.
+        out: int32 ``[>= rows]`` sampled token destination.
+        vocab_size: Tokens in the whole vocabulary.
+        num_tokens_per_req: Rows per request.
+
+    Returns:
+        ``out[:rows]``.
+    """
+    rows, top_k_pad = _check_sorted_candidates(
+        candidate_ids,
+        candidate_logits,
+        req_pool_indices,
+        out,
+        vocab_size=vocab_size,
+        num_tokens_per_req=num_tokens_per_req,
+    )
+    if rows == 0:
+        return out[:0]
+    _launch_presorted_stage2(
+        candidate_ids,
+        candidate_logits,
+        req_pool_indices,
+        temperature_pool,
+        top_k_pool,
+        top_p_pool,
+        seed_pool,
+        offsets_pool,
+        out,
+        None,
+        vocab_size=vocab_size,
+        num_tokens_per_req=num_tokens_per_req,
+    )
+    return out[:rows]
+
+
+def verify_rows_top_k_top_p_from_candidates(
+    candidate_ids: torch.Tensor,
+    candidate_logits: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    temperature_pool: torch.Tensor,
+    top_k_pool: torch.Tensor,
+    top_p_pool: torch.Tensor,
+    seed_pool: torch.Tensor,
+    offsets_pool: torch.Tensor,
+    candidates: torch.Tensor,
+    q: torch.Tensor,
+    q_ids: torch.Tensor,
+    slot: torch.Tensor,
+    pos: torch.Tensor,
+    row_accept: torch.Tensor,
+    row_token: torch.Tensor,
+    *,
+    vocab_size: int,
+    num_tokens_per_req: int,
+) -> None:
+    """``verify_rows_top_k_top_p_from_pools`` on each row's best candidates.
+
+    The rejection-sampling verify of the presorted lists
+    ``gumbel_sample_top_k_top_p_from_candidates`` takes; given the candidates
+    the whole row's stage-1 lists would merge into, every decision and token
+    is bitwise the same.
+
+    Args:
+        candidate_ids: ``[bs * N, top_k_pad]`` int32 token ids, descending
+            logit order, lowest id first among equal logits.
+        candidate_logits: ``[bs * N, top_k_pad]`` fp32 logits in that order.
+        req_pool_indices, temperature_pool, top_k_pool, top_p_pool, seed_pool,
+        offsets_pool, candidates, q, q_ids, slot, pos, row_accept, row_token:
+            As for ``verify_rows_top_k_top_p_from_pools``.
+        vocab_size: Tokens in the whole vocabulary.
+        num_tokens_per_req: Verify window width ``N``.
+
+    Returns:
+        None; ``row_accept`` and ``row_token`` are written in place.
+    """
+    rows, top_k_pad = _check_sorted_candidates(
+        candidate_ids,
+        candidate_logits,
+        req_pool_indices,
+        row_token,
+        vocab_size=vocab_size,
+        num_tokens_per_req=num_tokens_per_req,
+    )
+    num_candidates = check_draft_q_inputs(
+        fn_name="verify_rows_top_k_top_p_from_candidates",
+        rows=rows,
+        num_tokens_per_req=num_tokens_per_req,
+        req_pool_indices=req_pool_indices,
+        candidates=candidates,
+        q=q,
+        q_ids=q_ids,
+        slot=slot,
+        pos=pos,
+        row_accept=row_accept,
+        row_token=row_token,
+    )
+    if rows == 0:
+        return
+    _launch_presorted_stage2(
+        candidate_ids,
+        candidate_logits,
+        req_pool_indices,
+        temperature_pool,
+        top_k_pool,
+        top_p_pool,
+        seed_pool,
+        offsets_pool,
+        row_token,
+        (row_accept, candidates, slot, pos, q, q_ids, num_candidates),
+        vocab_size=vocab_size,
+        num_tokens_per_req=num_tokens_per_req,
+    )
+
+
+def _launch_presorted_stage2(
+    candidate_ids: torch.Tensor,
+    candidate_logits: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    temperature_pool: torch.Tensor,
+    top_k_pool: torch.Tensor,
+    top_p_pool: torch.Tensor,
+    seed_pool: torch.Tensor,
+    offsets_pool: torch.Tensor,
+    out: torch.Tensor,
+    draft_q: tuple | None,
+    *,
+    vocab_size: int,
+    num_tokens_per_req: int,
+) -> None:
+    """Stage 2 over one presorted list per row, with or without the draft q.
+
+    ``draft_q`` is ``(row_accept, candidates, slot, pos, q, q_ids,
+    num_candidates)`` for the rejection verify. One warp, as stage 2 of the
+    1024-column blocks runs, so the sampling math reduces in the same order.
+    """
+    rows, top_k_pad = candidate_ids.shape
+    has_q = draft_q is not None
+    if has_q:
+        row_accept, candidates, slot, pos, q, q_ids, num_candidates = draft_q
+    else:
+        row_accept = candidates = slot = pos = q = q_ids = None
+        num_candidates = 1
+    _top_k_top_p_gumbel_stage2_kernel[(rows,)](
+        candidate_ids,
+        candidate_logits,
+        req_pool_indices,
+        temperature_pool,
+        top_k_pool,
+        top_p_pool,
+        None,
+        seed_pool,
+        offsets_pool,
+        out,
+        row_accept,
+        candidates,
+        slot,
+        pos,
+        q,
+        q_ids,
+        candidate_row_stride=candidate_ids.stride(0),
+        num_blocks=1,
+        vocab_size=vocab_size,
+        TOPK_PAD=top_k_pad,
+        NUM_BLOCKS_PAD=1,
+        NUM_TOKENS_PER_REQ=num_tokens_per_req,
+        HAS_DRAFT_Q=has_q,
+        verify_candidates_row_stride=candidates.stride(0) if has_q else 0,
+        verify_candidates_col_stride=candidates.stride(1) if has_q else 0,
+        slot_pool_stride=slot.stride(0) if has_q else 0,
+        q_pool_stride=q.stride(0) if has_q else 0,
+        q_slot_stride=q.stride(1) if has_q else 0,
+        NUM_CANDIDATES=num_candidates,
+        K_PAD=triton.next_power_of_2(num_candidates),
+        COIN_SALT=COIN_OFFSET_SALT if has_q else 0,
+        num_warps=1,
+        num_stages=3,
+    )
 
 
 @triton.jit

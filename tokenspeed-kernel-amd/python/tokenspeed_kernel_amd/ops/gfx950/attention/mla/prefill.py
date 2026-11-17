@@ -25,6 +25,7 @@ from __future__ import annotations
 from typing import NamedTuple
 
 import torch
+from tokenspeed_kernel_amd._extern import extern_compile_options, wave_all_equal
 from tokenspeed_kernel_amd._triton import gl, gluon
 from tokenspeed_kernel_amd.ops.gfx950.attention._common import (
     _INV_LN2,
@@ -683,16 +684,7 @@ def _fp8_overlap_qk_and_previous_pv(
         acc1 = program.dot(p, v1, acc1)
         # A wave owns 32 query rows. Skip only if all their maxima are unchanged;
         # no deferred maximum or enlarged FP8 probability range is introduced.
-        unchanged = gl.inline_asm_elementwise(
-            asm="v_cmp_eq_f32_e64 vcc, $1, $2\n"
-            "s_cmp_eq_u64 vcc, exec\n"
-            "s_cselect_b32 $0, 1, 0",
-            constraints="=s,v,v,~{vcc},~{scc}",
-            args=[m, m_new],
-            dtype=gl.int32,
-            is_pure=False,
-            pack=1,
-        )
+        unchanged = wave_all_equal(m, m_new)
         l, alpha = gl.map_elementwise(_fp8_rescale_row, l, m, m_new, unchanged)
         acc0, acc1 = gl.map_elementwise(
             _fp8_rescale_output_pack,
@@ -1461,6 +1453,7 @@ def launch_gluon_mla_prefill_gfx950(
         num_stages=1,
         # Keep the overlapping FP8 matrix and softmax state in one register class.
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),) if is_fp8 else (),
+        **extern_compile_options(),
     )
 
     if return_lse:

@@ -809,6 +809,129 @@ def _warp_decode_precomputed_situ_stage1_kernel(
     )
 
 
+@gluon.jit(do_not_specialize=("M",))
+def _warp_decode_precomputed_situ_dedup_stage1_kernel(
+    X,
+    W,
+    WScale,
+    TopkIds,
+    Y,
+    M,
+    D,
+    i_dim,
+    stride_xm,
+    stride_xk,
+    stride_tim,
+    stride_tik,
+    stride_we,
+    stride_wk,
+    stride_wn,
+    stride_wse,
+    stride_wsk,
+    stride_wsn,
+    stride_ym,
+    stride_yn,
+    x_global_scale_ptr,
+    out_quant_scale_ptr,
+    w13_bias,
+    TOPK: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    NUM_BUFFERS: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    W_PRESHUFFLED: gl.constexpr,
+    EVEN_K: gl.constexpr,
+    HAS_BIAS: gl.constexpr,
+    SITU_BETA: gl.constexpr,
+    SITU_LINEAR_BETA: gl.constexpr,
+    EXPERT_START: gl.constexpr,
+    NUM_LOCAL_EXPERTS: gl.constexpr,
+):
+    """Route-direct W13/SiTU that loads each routed expert's W once per batch.
+
+    The CTA of a route's first token computes every token routed to the same
+    expert as one packed tile (M <= BLOCK_M) and stores each to its own
+    ``token * TOPK + slot`` row; the CTAs of the later duplicates exit.
+    """
+    pid = gl.program_id(axis=0)
+    num_pid_n = gl.cdiv(2 * i_dim, BLOCK_N)
+    slot = pid % TOPK
+    rest = pid // TOPK
+    pid_n = rest % num_pid_n
+    token = rest // num_pid_n
+    raw_expert = gl.load(
+        TopkIds + token.to(gl.int64) * stride_tim + slot * stride_tik,
+        mask=token < M,
+        other=-1,
+    ).to(gl.int32)
+    expert = raw_expert - EXPERT_START
+    expert = gl.where((expert >= 0) & (expert < NUM_LOCAL_EXPERTS), expert, -1)
+
+    ids_layout: gl.constexpr = gl.BlockedLayout([1, 4], [16, 4], [NUM_WARPS, 1], [1, 0])
+    rows = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, ids_layout))
+    cols = gl.arange(0, TOPK, layout=gl.SliceLayout(0, ids_layout))
+    ids = gl.load(
+        TopkIds + rows[:, None] * stride_tim + cols[None, :] * stride_tik,
+        mask=rows[:, None] < M,
+        other=-1,
+    ).to(gl.int32)
+    match = ids == raw_expert
+    has = gl.max(match.to(gl.int32), axis=1) > 0
+    first = gl.min(gl.where(has, rows, BLOCK_M), axis=0)
+    if (expert >= 0) & (first == token):
+        row_slot = gl.sum(gl.where(match, cols[None, :], 0), axis=1)
+        load_x_layout: gl.constexpr = _load_layout(
+            BLOCK_K, BLOCK_M, NUM_WARPS, [1, 0], 8
+        )
+        row_l: gl.constexpr = gl.SliceLayout(1, load_x_layout)
+        routed = gl.convert_layout(has, row_l)
+        row_token = gl.convert_layout(gl.where(has, rows, M), row_l)
+        packed_row = gl.convert_layout(rows * TOPK + row_slot, row_l)
+        packed_row = gl.where(routed, packed_row, 0)
+        _warp_decode_stage1_coop_compute(
+            row_token,
+            slot,
+            packed_row,
+            expert,
+            pid_n,
+            X,
+            W,
+            WScale,
+            Y,
+            M,
+            D,
+            i_dim,
+            stride_xm,
+            stride_xk,
+            stride_we,
+            stride_wk,
+            stride_wn,
+            stride_wse,
+            stride_wsk,
+            stride_wsn,
+            stride_ym,
+            stride_yn,
+            x_global_scale_ptr,
+            out_quant_scale_ptr,
+            w13_bias,
+            TOPK,
+            BLOCK_M,
+            BLOCK_N,
+            BLOCK_K,
+            NUM_BUFFERS,
+            NUM_WARPS,
+            W_PRESHUFFLED,
+            EVEN_K,
+            HAS_BIAS,
+            SITU_BETA,
+            SITU_LINEAR_BETA,
+            0.0,
+            DO_SITU=True,
+            PACKED_ROUTES=True,
+        )
+
+
 @gluon.jit(launch_metadata=_sorted_stage1_launch_metadata, do_not_specialize=("M",))
 def _warp_decode_precomputed_situ_sorted_stage1_kernel(
     X,
@@ -987,6 +1110,7 @@ def _warp_decode_stage2_load_tile(
         scale_k_lin = (sk // 8) * 256 + (sk % 4) * 64 + ((sk % 8) // 4) * 2
     scale_k_off = scale_k_lin.to(gl.int64) * stride_wsk
     s_off = (ws_expert_off + scale_row_off + scale_k_off).to(gl.int32)
+    # A decode step reads each W2 tile about once, so it streams past the caches.
     if MASK_TAIL:
         # Partial / odd final K-tile (K = intermediate dim I): mask out-of-range
         # K lanes to 0 so they contribute nothing and never over-read.
@@ -995,11 +1119,13 @@ def _warp_decode_stage2_load_tile(
             ptr=X, offsets=a_off, mask=k_elem < i_dim, other=0.0
         )
         b_mask = k_pack < I_PACKED
-        b = gl.amd.cdna4.buffer_load(ptr=W, offsets=b_off, mask=b_mask, other=0)
+        b = gl.amd.cdna4.buffer_load(
+            ptr=W, offsets=b_off, mask=b_mask, other=0, cache=".cs"
+        )
         s = gl.amd.cdna4.buffer_load(ptr=WScale, offsets=s_off, mask=sk_valid, other=0)
     else:
         a = gl.amd.cdna4.buffer_load(ptr=X, offsets=a_off)
-        b = gl.amd.cdna4.buffer_load(ptr=W, offsets=b_off)
+        b = gl.amd.cdna4.buffer_load(ptr=W, offsets=b_off, cache=".cs")
         s = gl.amd.cdna4.buffer_load(ptr=WScale, offsets=s_off)
     return a, b, s
 
@@ -1320,7 +1446,7 @@ def _warp_decode_sorted_stage2_fp8_mxfp4_kernel(
     BLOCK_K_PACKED: gl.constexpr = BLOCK_K // 2
     BLOCK_K_SCALE: gl.constexpr = BLOCK_K // 32
     gl.static_assert(BLOCK_M == 16, "sorted W2 requires one MFMA row tile")
-    gl.static_assert(BLOCK_N == 128 * NUM_WARPS_N)
+    gl.static_assert(BLOCK_N % (64 * NUM_WARPS_N) == 0)
     gl.static_assert(BLOCK_K_PACKED == 64)
 
     pid = _xcd_chiplet_swizzle(
@@ -1349,6 +1475,14 @@ def _warp_decode_sorted_stage2_fp8_mxfp4_kernel(
     b_scale_layout: gl.constexpr = gl.amd.cdna4.get_mfma_scale_layout(
         dot_b_layout, [BLOCK_N, BLOCK_K_SCALE]
     )
+    # Each warp stores whole BLOCK_N row segments: the scattered slot rows cost
+    # less as row-contiguous stores than as the MFMA layout's column fragments.
+    store_layout: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[1, BLOCK_N // 64],
+        threads_per_warp=[1, 64],
+        warps_per_cta=[NUM_WARPS_N, 1],
+        order=[1, 0],
+    )
     am_1d = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, dot_a_layout))
     am = am_1d[:, None]
     ak = gl.arange(0, BLOCK_K, layout=gl.SliceLayout(0, dot_a_layout))[None, :]
@@ -1366,18 +1500,6 @@ def _warp_decode_sorted_stage2_fp8_mxfp4_kernel(
         expert_valid = (expert >= 0) & (expert < NUM_LOCAL_EXPERTS)
         safe_expert = gl.where(expert_valid, expert, 0)
         sorted_row = pid_m * BLOCK_M + am_1d
-        encoded = gl.load(SortedIds + sorted_row)
-        token = encoded & 0xFFFFFF
-        slot = encoded >> 24
-        route_valid = (token < M) & expert_valid
-        gate = gl.load(SortedWeights + sorted_row, mask=route_valid, other=0.0).to(
-            gl.float32
-        )
-        output_row_layout: gl.constexpr = gl.SliceLayout(1, mfma_layout)
-        output_token = gl.convert_layout(token, output_row_layout)
-        output_slot = gl.convert_layout(slot, output_row_layout)
-        output_valid = gl.convert_layout(route_valid, output_row_layout)
-        output_gate = gl.convert_layout(gate, output_row_layout)[:, None]
 
         x_row_off = sorted_row[:, None].to(gl.int64) * stride_xm
         w_expert_off = safe_expert.to(gl.int64) * stride_we
@@ -1415,11 +1537,23 @@ def _warp_decode_sorted_stage2_fp8_mxfp4_kernel(
         # fmt: on
 
         acc *= gl.load(x_global_scale_ptr).to(gl.float32)
-        weighted = (output_gate * acc).to(Out.dtype.element_ty)
-        out_row = output_token * TOPK + output_slot
+        store_row = pid_m * BLOCK_M + gl.arange(
+            0, BLOCK_M, layout=gl.SliceLayout(1, store_layout)
+        )
+        encoded = gl.load(SortedIds + store_row)
+        token = encoded & 0xFFFFFF
+        slot = encoded >> 24
+        route_valid = (token < M) & expert_valid
+        gate = gl.load(SortedWeights + store_row, mask=route_valid, other=0.0).to(
+            gl.float32
+        )
+        weighted = (gate[:, None] * gl.convert_layout(acc, store_layout)).to(
+            Out.dtype.element_ty
+        )
+        out_row = token * TOPK + slot
         out_col = (
             pid_n * BLOCK_N
-            + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma_layout))[None, :]
+            + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, store_layout))[None, :]
         )
         out_offset = (
             out_row[:, None].to(gl.int64) * stride_om + out_col.to(gl.int64) * stride_on
@@ -1427,5 +1561,5 @@ def _warp_decode_sorted_stage2_fp8_mxfp4_kernel(
         gl.store(
             Out + out_offset,
             weighted,
-            mask=output_valid[:, None] & (out_col < N),
+            mask=route_valid[:, None] & (out_col < N),
         )

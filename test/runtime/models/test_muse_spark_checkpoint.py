@@ -26,6 +26,7 @@ import glob
 import json
 import os
 import sys
+from collections import Counter
 
 import pytest
 import torch
@@ -43,10 +44,14 @@ from tokenspeed.runtime.configs.muse_spark_config import (
     MuseSparkConfig,
 )
 from tokenspeed.runtime.distributed.mapping import Mapping
-from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
+from tokenspeed.runtime.layers.quantization import (
+    QUANTIZATION_METHODS,
+    QuantizationConfig,
+)
 from tokenspeed.runtime.models.muse_spark import (
     MuseSparkForConditionalGeneration,
     resolve_parameter_name,
+    resolve_per_expert_tensor,
 )
 
 _TEXT_OVERRIDES = {
@@ -108,6 +113,24 @@ def _raw_config(snapshot: str) -> dict:
         return json.load(handle)
 
 
+def _quant_config(raw: dict) -> QuantizationConfig | None:
+    """Parse the checkpoint's quantization config with the method the runtime picks."""
+    hf_quant_config = raw.get("quantization_config")
+    if hf_quant_config is None:
+        return None
+    # Same selection as ModelConfig: a registered config may claim the format,
+    # otherwise quant_method names the method.
+    method = hf_quant_config.get("quant_method", "").lower()
+    for quant_cls in QUANTIZATION_METHODS.values():
+        override = quant_cls.override_quantization_method(hf_quant_config, None)
+        if override:
+            method = override
+            break
+    if method not in QUANTIZATION_METHODS:
+        pytest.skip(f"the runtime does not load {method} checkpoints on this platform")
+    return QUANTIZATION_METHODS[method].from_config(hf_quant_config)
+
+
 def _checkpoint_tensor_names(snapshot: str) -> list[str]:
     """Return every tensor name in the snapshot, reading shard headers only."""
     from safetensors import safe_open
@@ -146,10 +169,16 @@ def test_the_checkpoint_config_builds_the_runtime_view() -> None:
 
 
 def test_the_quantization_config_keeps_the_modules_it_excludes() -> None:
-    raw = _raw_config(_snapshot())["quantization_config"]
-    quant_config = Nvfp4Config.from_config(raw)
-    assert quant_config.exclude_modules == raw["exclude_modules"]
-    assert quant_config.group_size == raw["group_size"]
+    raw = _raw_config(_snapshot())
+    quant_config = _quant_config(raw)
+    if quant_config is None:
+        pytest.skip("the cached checkpoint is not quantized")
+    hf_quant_config = raw["quantization_config"]
+    # ModelOpt lists the modules it leaves unquantized under exclude_modules,
+    # Quark under exclude.
+    excluded = hf_quant_config.get("exclude_modules") or hf_quant_config["exclude"]
+    kept = {*quant_config.exclude_modules, *quant_config.ignored_layers}
+    assert set(excluded) <= kept
 
 
 def _narrow_config(raw: dict) -> MuseSparkConfig:
@@ -172,7 +201,7 @@ def _narrow_config(raw: dict) -> MuseSparkConfig:
 def test_every_checkpoint_tensor_fills_exactly_one_parameter() -> None:
     snapshot = _snapshot()
     raw = _raw_config(snapshot)
-    quant_config = Nvfp4Config.from_config(raw["quantization_config"])
+    quant_config = _quant_config(raw)
     previous_dtype = torch.get_default_dtype()
     torch.set_default_dtype(torch.bfloat16)
     try:
@@ -189,10 +218,24 @@ def test_every_checkpoint_tensor_fills_exactly_one_parameter() -> None:
 
     parameters = set(dict(model.named_parameters()))
     filled: dict[str, list[str | None]] = {}
+    # Quark stores one tensor per expert projection; each fills one expert's
+    # rows of a fused expert parameter, the way load_weights maps it.
+    expert_rows: dict[str, list[tuple[int, int | None]]] = {}
     for name in _checkpoint_tensor_names(snapshot):
+        per_expert = resolve_per_expert_tensor(name)
+        if per_expert is not None:
+            parameter_name, expert, half = per_expert
+            expert_rows.setdefault(parameter_name, []).append((expert, half))
+            continue
         parameter_name, shard_id = resolve_parameter_name(name)
         filled.setdefault(parameter_name, []).append(shard_id)
-    assert set(filled) == parameters
+    assert set(filled).isdisjoint(expert_rows)
+    assert {*filled, *expert_rows} == parameters
+    num_experts = raw["text_config"]["num_local_experts"]
+    for parameter_name, rows in expert_rows.items():
+        halves = (0, 1) if ".w13_" in parameter_name else (None,)
+        expected = [(expert, half) for expert in range(num_experts) for half in halves]
+        assert Counter(rows) == Counter(expected), parameter_name
     for parameter_name, shards in filled.items():
         if ".qkv_proj." in parameter_name:
             # The decoder packs its output gate into the same projection.

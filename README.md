@@ -27,6 +27,8 @@ More importantly, TokenSpeed is the **Switzerland** of open-source LLM inference
 
 ## News
 
+- [2026/11] 🔥 331 output tokens/s per GPU on AgentX: Serving Kimi K3 on GB300 with TokenSpeed (Kimi K3 Optimization on GB300 — Part II) [[blog](https://lightseek.org/blog/tokenspeed-kimi-k3-agentx.html)]
+- [2026/11] [Kimi K3.1 Pro](https://huggingface.co/moonshotai/Kimi-K3.1-Pro#4-deployment-and-availability) at Day 0: Sparse attention on the Kimi K3 stack with TokenSpeed. [[blog](https://lightseek.org/blog/tokenspeed-kimi-k3-1.html)]
 - [2026/10] [EAGLE-4](https://blog.eagle.ai/blog/introducing-eagle-4) training and serving with TorchSpec and TokenSpeed. [[blog](https://lightseek.org/blog/eagle-4.html)]
 - [2026/10] Reflection's [Beam](https://developers.reflection.ai/deployment-overview) at day 0: 501B MoE serving in NVFP4 on NVIDIA GB200 with TokenSpeed. [[blog](https://lightseek.org/blog/tokenspeed-reflection-beam.html)]
 - [2026/10] 🔥 [TokenSpeed MLA 2](https://github.com/lightseekorg/tokenspeed/tree/main/tokenspeed-mla#mla-2-decode-benchmarks) for [NVIDIA Vera Rubin](https://www.nvidia.com/en-us/data-center/technologies/rubin/). [[blog](https://lightseek.org/blog/tokenspeed-mla-2.html)]

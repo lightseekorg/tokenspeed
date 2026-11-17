@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import ClassVar
 
 import torch
+from tokenspeed_kernel.ops.kvcache.index_k_scale import index_k_scale_dtype
 from typing_extensions import override
 
 from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
@@ -49,6 +50,8 @@ class HybridGlm53FlashTokenToKVPool(HybridKDATokenToKVPool):
 
     # Unlike the KDA hybrid it extends, its latent writes keep non-finite values.
     latent_write_sanitizes: ClassVar[bool] = False
+    # The recipe admits only FP8-with-scale index rows (glm53_flash.py).
+    index_k_format: ClassVar[str] = "fp8_scaled"
 
     def __init__(self, *args, pool_options: Glm53FlashPoolOptions, **kwargs):
         self.index_head_dim = pool_options.index_head_dim
@@ -102,6 +105,8 @@ class HybridGlm53FlashTokenToKVPool(HybridKDATokenToKVPool):
             raise ValueError(f"layer {layer_id} has no DSA index cache") from exc
         if buffer is None:
             raise ValueError(f"layer {layer_id} has no DSA index cache")
+        if self.layerwise_load_tracker is not None:
+            self.layerwise_load_tracker.wait_for_layer(layer_id)
         return buffer
 
     def get_kpool_buffers(
@@ -151,7 +156,7 @@ class HybridGlm53FlashTokenToKVPool(HybridKDATokenToKVPool):
             (buf.shape[0], rows_per_page, num_groups * scale_bytes),
             (page_stride, num_groups * scale_bytes, 1),
             buf.storage_offset() + rows_per_page * self.index_head_dim,
-        ).view(torch.float32)
+        ).view(index_k_scale_dtype())
         return values, scales
 
     def get_mla_kv_buffer(

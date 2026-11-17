@@ -32,7 +32,7 @@ import pytest
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
-ts = pytest.importorskip("tokenspeed_scheduler")
+ts = pytest.importorskip("tokenspeed_engine.scheduler")
 
 from tokenspeed.runtime.cache.transfer.ops import (  # noqa: E402
     CacheTransfer,
@@ -125,7 +125,9 @@ def test_plan_adapter_passes_l2_batches_and_expands_snapshot_batches(wire):
         ]
     )
 
-    ops = cache_ops_from_plan(plan).device
+    ops = cache_ops_from_plan(
+        plan, request_admission={"a": 1, "b": 2}.__getitem__
+    ).device
 
     assert ops[0] is write_back and ops[3] is load_back
     assert ops[1] == SnapshotOp(
@@ -137,10 +139,16 @@ def test_plan_adapter_passes_l2_batches_and_expands_snapshot_batches(wire):
             CacheTransfer(0, 3, 7, "", 0),
             CacheTransfer(1, 1, 2, "", 0),
         ),
+        admission_id=1,
     )
     # A victim whose every page went to L2 images its slot state alone.
     assert ops[2] == SnapshotOp(
-        op_id=5, request_id="b", request_pool_index=2, snapshot_slot=1, transfers=()
+        op_id=5,
+        request_id="b",
+        request_pool_index=2,
+        snapshot_slot=1,
+        transfers=(),
+        admission_id=2,
     )
     assert ops[4] == RestoreOp(
         op_id=6,
@@ -153,29 +161,42 @@ def test_plan_adapter_passes_l2_batches_and_expands_snapshot_batches(wire):
             CacheTransfer(1, 2, 4, "", 0),
         ),
         source_tier=(HostTier.L2, HostTier.SNAPSHOT_POOL, HostTier.SNAPSHOT_POOL),
+        admission_id=1,
     )
-    assert cache_ops_from_plan(SimpleNamespace(cache=[])).device == ()
+    assert (
+        cache_ops_from_plan(
+            SimpleNamespace(cache=[]), request_admission={"a": 1, "b": 2}.__getitem__
+        ).device
+        == ()
+    )
 
 
 def test_plan_adapter_rejects_ragged_batches_and_unknown_kinds(wire):
     with pytest.raises(ValueError, match="ragged _SnapshotBatch batch"):
         cache_ops_from_plan(
-            SimpleNamespace(cache=[_snapshot_batch(snapshot_slots=[0])])
+            SimpleNamespace(cache=[_snapshot_batch(snapshot_slots=[0])]),
+            request_admission={"a": 1, "b": 2}.__getitem__,
         )
     with pytest.raises(ValueError, match="ragged cache operation 4"):
         cache_ops_from_plan(
-            SimpleNamespace(cache=[_snapshot_batch(dst_pages=[[7], []])])
+            SimpleNamespace(cache=[_snapshot_batch(dst_pages=[[7], []])]),
+            request_admission={"a": 1, "b": 2}.__getitem__,
         )
     with pytest.raises(ValueError, match="ragged cache operation 6"):
         cache_ops_from_plan(
-            SimpleNamespace(cache=[_restore_batch(source_tiers=[[0, 1]])])
+            SimpleNamespace(cache=[_restore_batch(source_tiers=[[0, 1]])]),
+            request_admission={"a": 1, "b": 2}.__getitem__,
         )
     with pytest.raises(ValueError):
         cache_ops_from_plan(
-            SimpleNamespace(cache=[_restore_batch(source_tiers=[[0, 1, 7]])])
+            SimpleNamespace(cache=[_restore_batch(source_tiers=[[0, 1, 7]])]),
+            request_admission={"a": 1, "b": 2}.__getitem__,
         )
     with pytest.raises(TypeError, match="unsupported cache op kind: str"):
-        cache_ops_from_plan(SimpleNamespace(cache=["op"]))
+        cache_ops_from_plan(
+            SimpleNamespace(cache=["op"]),
+            request_admission={"a": 1, "b": 2}.__getitem__,
+        )
 
 
 @pytest.mark.parametrize(
@@ -198,6 +219,7 @@ def _config(**overrides):
         num_device_pages=32,
         max_scheduled_tokens=64,
         max_batch_size=8,
+        max_resident_requests=8,
         prefix_granularity=2,
         num_host_pages=0,
         disable_l2_cache=True,
@@ -207,6 +229,8 @@ def _config(**overrides):
         host_group_packing=(),
         max_retracted_requests=0,
         host_write_policy="write_through",
+        prefill_decode_interval=0,
+        prefill_decode_min_interval=0,
         storage_config=None,
     )
     fields.update(overrides)
@@ -269,7 +293,9 @@ def test_make_config_requires_storage_limits_exactly_with_l3():
 
 def test_cache_plan_keeps_storage_cancel_before_the_next_query():
     scheduler = storage_scheduler()
-    first = cache_ops_from_plan(scheduler.next_execution_plan())
+    first = cache_ops_from_plan(
+        scheduler.next_execution_plan(), request_admission={"a": 1, "b": 2}.__getitem__
+    )
     assert first.device == () and len(first.storage) == 1
     original = first.storage[0]
     assert isinstance(original, ts.Cache.StorageQueryOp)
@@ -281,7 +307,9 @@ def test_cache_plan_keeps_storage_cancel_before_the_next_query():
     request.request_id = "next"
     request.tokens = [5, 6, 7, 8]
     scheduler.submit_requests([request])
-    prepared = cache_ops_from_plan(scheduler.next_execution_plan())
+    prepared = cache_ops_from_plan(
+        scheduler.next_execution_plan(), request_admission={"a": 1, "b": 2}.__getitem__
+    )
     assert prepared.device == ()
     assert [op.kind for op in prepared.storage] == [
         ts.StorageKind.Cancel,

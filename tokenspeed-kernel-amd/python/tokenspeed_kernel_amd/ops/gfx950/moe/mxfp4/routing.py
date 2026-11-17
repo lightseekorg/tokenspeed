@@ -488,7 +488,23 @@ def invoke_sigmoid_bias_topk_route_gluon(
 # Large-M package prefill routing: one independent CTA per token.
 # ---------------------------------------------------------------------------
 @gluon.jit
-def gluon_sigmoid_bias_topk_gfx950(
+def _max_unique_key(keys):
+    """Cross-lane max of 64-bit keys whose low words are distinct (or zero).
+
+    Two 32-bit maxima (the high words, then the low words of the lanes that
+    hold the highest) pick the same key as a 64-bit max, but each reduction
+    step is one fused DPP max instead of a 64-bit compare and two selects.
+    """
+    high = (keys >> 32).to(gl.uint32)
+    best_high = gl.max(high, axis=0)
+    low = gl.where(high == best_high, keys.to(gl.uint32), 0)
+    best_low = gl.max(low, axis=0)
+    return (best_high.to(gl.uint64) << 32) | best_low.to(gl.uint64)
+
+
+@gluon.jit
+def sigmoid_bias_topk_row_gfx950(
+    token,
     logits_ptr,
     bias_ptr,
     topk_ids_ptr,
@@ -509,10 +525,30 @@ def gluon_sigmoid_bias_topk_gfx950(
     X_DTYPE: gl.constexpr,
     NUM_WARPS: gl.constexpr,
 ):
-    token = gl.program_id(0)
-    expert_layout: gl.constexpr = gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
+    """Select one token's experts as a tournament over per-lane candidates.
+
+    Each lane owns a column of experts and keeps its six best as sorted
+    heads, so a selection round is a single cross-lane max over one key per
+    lane instead of a reduction over every expert. A lane that gives up all
+    six heads may hold further winners, so the token then repeats the
+    selection over all experts; with four heads that happened often enough
+    to slow a 64-row batch down to its slowest token. Routers of at most
+    320 experts hold at most five per lane, so they extract only as many
+    heads as a lane holds and never repeat the selection.
+
+    The body of :func:`gluon_sigmoid_bias_topk_gfx950` for row ``token``, so a
+    kernel that runs other work in its other programs can route rows too.
+    """
+    LANES: gl.constexpr = 64 * NUM_WARPS
+    ROWS: gl.constexpr = (EP + LANES - 1) // LANES
+    expert_layout: gl.constexpr = gl.BlockedLayout(
+        [ROWS, 1], [1, 64], [1, NUM_WARPS], [0, 1]
+    )
+    lane_layout: gl.constexpr = gl.SliceLayout(0, expert_layout)
     topk_layout: gl.constexpr = gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
-    expert = gl.arange(0, EP, layout=expert_layout)
+    row = gl.arange(0, ROWS, layout=gl.SliceLayout(1, expert_layout))
+    lane = gl.arange(0, LANES, layout=lane_layout)
+    expert = row[:, None] * LANES + lane[None, :]
     expert_mask = expert < E
 
     logits = cdna4.buffer_load(
@@ -528,21 +564,75 @@ def gluon_sigmoid_bias_topk_gfx950(
         mask=expert_mask,
         other=0.0,
     ).to(gl.float32)
-    choice = gl.where(expert_mask, scores.to(gl.float32) + bias, -float("inf"))
+    # Order-preserving choice bits over an inverted id: ties in max go to the lower id.
+    choice_bits = (scores.to(gl.float32) + bias).to(gl.uint32, bitcast=True)
+    choice_bits ^= gl.where((choice_bits & 0x80000000) != 0, 0xFFFFFFFF, 0x80000000).to(
+        gl.uint32
+    )
+    keys = (choice_bits.to(gl.uint64) << 32) | (ROWS * LANES - 1 - expert).to(gl.uint64)
+    keys = gl.where(expert_mask, keys, 0)
+
+    # Heads past a lane's experts stay empty; only LANE_EXPERTS > 5 can exhaust all six.
+    LANE_EXPERTS: gl.constexpr = (E + LANES - 1) // LANES
+    remaining = keys
+    head_0 = gl.max(remaining, axis=0)
+    head_1 = gl.zeros([LANES], gl.uint64, lane_layout)
+    head_2 = gl.zeros([LANES], gl.uint64, lane_layout)
+    head_3 = gl.zeros([LANES], gl.uint64, lane_layout)
+    head_4 = gl.zeros([LANES], gl.uint64, lane_layout)
+    head_5 = gl.zeros([LANES], gl.uint64, lane_layout)
+    if LANE_EXPERTS > 1:
+        remaining = gl.where(remaining == head_0[None, :], 0, remaining)
+        head_1 = gl.max(remaining, axis=0)
+    if LANE_EXPERTS > 2:
+        remaining = gl.where(remaining == head_1[None, :], 0, remaining)
+        head_2 = gl.max(remaining, axis=0)
+    if LANE_EXPERTS > 3:
+        remaining = gl.where(remaining == head_2[None, :], 0, remaining)
+        head_3 = gl.max(remaining, axis=0)
+    if LANE_EXPERTS > 4:
+        remaining = gl.where(remaining == head_3[None, :], 0, remaining)
+        head_4 = gl.max(remaining, axis=0)
+    if LANE_EXPERTS > 5:
+        remaining = gl.where(remaining == head_4[None, :], 0, remaining)
+        head_5 = gl.max(remaining, axis=0)
+    taken = gl.zeros([LANES], gl.int32, lane_layout)
 
     topk_lane = gl.arange(0, TKP, layout=topk_layout)
-    selected_ids = gl.zeros([TKP], gl.int32, topk_layout)
-    selected_weights = gl.zeros([TKP], gl.float32, topk_layout)
-    sentinel = gl.full([EP], E, gl.int32, expert_layout)
+    selected_keys = gl.zeros([TKP], gl.uint64, topk_layout)
     for rank in gl.static_range(TOPK):
-        maximum = gl.max(choice, axis=0)
-        selected = gl.min(
-            gl.where((choice == maximum) & expert_mask, expert, sentinel), axis=0
-        )
-        weight = gl.sum(gl.where(expert == selected, scores, 0.0), axis=0)
-        selected_ids = gl.where(topk_lane == rank, selected, selected_ids)
-        selected_weights = gl.where(topk_lane == rank, weight, selected_weights)
-        choice = gl.where(expert == selected, -float("inf"), choice)
+        best = _max_unique_key(head_0)
+        selected_keys = gl.where(topk_lane == rank, best, selected_keys)
+        won = head_0 == best
+        taken += won.to(gl.int32)
+        head_0 = gl.where(won, head_1, head_0)
+        head_1 = gl.where(won, head_2, head_1)
+        head_2 = gl.where(won, head_3, head_2)
+        head_3 = gl.where(won, head_4, head_3)
+        head_4 = gl.where(won, head_5, head_4)
+        head_5 = gl.where(won, 0, head_5)
+    if LANE_EXPERTS > 5:
+        if gl.max(taken, axis=0) >= 6:
+            for rank in gl.static_range(TOPK):
+                best = _max_unique_key(gl.max(keys, axis=0))
+                selected_keys = gl.where(topk_lane == rank, best, selected_keys)
+                keys = gl.where(keys == best, 0, keys)
+
+    topk_mask = topk_lane < TOPK
+    selected_ids = gl.where(
+        topk_mask,
+        (ROWS * LANES - 1 - (selected_keys & 0xFFFFFFFF)).to(gl.int32),
+        0,
+    )
+    # Recomputing the selected scores reproduces their bits exactly.
+    selected_logits = cdna4.buffer_load(
+        logits_ptr,
+        (token * stride_lm + selected_ids * stride_le).to(gl.int32),
+        mask=topk_mask,
+        other=0.0,
+    ).to(gl.float32)
+    selected_weights = gl.fdiv(1.0, 1.0 + gl.exp(-selected_logits)).to(X_DTYPE)
+    selected_weights = gl.where(topk_mask, selected_weights.to(gl.float32), 0.0)
 
     if NORMALIZE_TOPK_WEIGHTS:
         selected_weights = selected_weights.to(X_DTYPE)
@@ -566,6 +656,52 @@ def gluon_sigmoid_bias_topk_gfx950(
         topk_weights_ptr,
         (token * stride_twm + topk_lane * stride_twk).to(gl.int32),
         mask=topk_mask,
+    )
+
+
+@gluon.jit
+def gluon_sigmoid_bias_topk_gfx950(
+    logits_ptr,
+    bias_ptr,
+    topk_ids_ptr,
+    topk_weights_ptr,
+    stride_lm,
+    stride_le,
+    stride_be,
+    stride_tim,
+    stride_tik,
+    stride_twm,
+    stride_twk,
+    E: gl.constexpr,
+    TOPK: gl.constexpr,
+    EP: gl.constexpr,
+    TKP: gl.constexpr,
+    NORMALIZE_TOPK_WEIGHTS: gl.constexpr,
+    ROUTED_SCALING_FACTOR: gl.constexpr,
+    X_DTYPE: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+):
+    sigmoid_bias_topk_row_gfx950(
+        gl.program_id(0),
+        logits_ptr,
+        bias_ptr,
+        topk_ids_ptr,
+        topk_weights_ptr,
+        stride_lm,
+        stride_le,
+        stride_be,
+        stride_tim,
+        stride_tik,
+        stride_twm,
+        stride_twk,
+        E,
+        TOPK,
+        EP,
+        TKP,
+        NORMALIZE_TOPK_WEIGHTS,
+        ROUTED_SCALING_FACTOR,
+        X_DTYPE,
+        NUM_WARPS,
     )
 
 
@@ -628,6 +764,7 @@ def invoke_sigmoid_bias_topk_route_prefill_gluon(
 
 __all__ = [
     "gluon_topk_route_supported",
+    "sigmoid_bias_topk_row_gfx950",
     "invoke_sigmoid_bias_topk_route_gluon",
     "invoke_sigmoid_bias_topk_route_prefill_gluon",
     "invoke_softmax_topk_route_gluon",

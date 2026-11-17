@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from fused_boundary_helpers import armed_mailbox, assert_child_keeps_waiting
+from fused_boundary_helpers import armed_blocks, assert_child_keeps_waiting
 from tokenspeed_kernel.ops.layernorm import affine_rmsnorm
 from tokenspeed_kernel.ops.quantization import rmsnorm_nvfp4_quant
 from tokenspeed_kernel.platform import current_platform
@@ -60,8 +60,8 @@ def test_rmsnorm_nvfp4_quant_matches_norm_then_flashinfer_bitwise(
     )
     assert torch.equal(packed, ref_packed.view(rows, width // 2))
     assert torch.equal(scales, ref_scales.view(rows, width // 16))
-    # The MoE kernel reads scale rows up to a multiple of 16, like flashinfer.
-    assert scales.untyped_storage().nbytes() == ref_scales.untyped_storage().nbytes()
+    # The scale storage keeps the round_up(rows, 16) tail an MoE consumer may read.
+    assert scales.untyped_storage().nbytes() == (rows + 15) // 16 * width
     pdl_packed, pdl_scales = rmsnorm_nvfp4_quant(x, *args, True)
     assert torch.equal(pdl_packed, packed) and torch.equal(pdl_scales, scales)
     assert rmsnorm_nvfp4_quant(x[:0], *args, False)[0].shape == (0, width // 2)
@@ -82,14 +82,14 @@ def test_a_mailbox_row_keeps_the_plain_path_s_summation_order(device: str) -> No
         args = (weight, 1e-5, 1.0, scale)
         plain = rmsnorm_nvfp4_quant(x, *args, None, True)
         # Capacity past the batch: the tail must stay armed and untouched.
-        mailbox = armed_mailbox(x, rows + 8)
-        got = rmsnorm_nvfp4_quant(mailbox[:rows], *args, HALF_POLLED_SENTINEL, True)
+        mailbox = armed_blocks(x, rows + 8, 4)
+        got = rmsnorm_nvfp4_quant(mailbox[:, :rows], *args, HALF_POLLED_SENTINEL, True)
         for ours, theirs in zip(got, plain, strict=True):
             assert torch.equal(ours, theirs)
         assert (mailbox.view(torch.int32) == -1).all()
-    with pytest.raises(ValueError, match="contiguous"):
+    with pytest.raises(ValueError, match="contiguous blocks"):
         rmsnorm_nvfp4_quant(
-            torch.zeros(2, 8192, device=device, dtype=torch.bfloat16)[:, :4096],
+            torch.zeros(4, 2, 2048, device=device, dtype=torch.bfloat16)[..., :1024],
             *args,
             HALF_POLLED_SENTINEL,
             False,
@@ -101,9 +101,9 @@ from tokenspeed_kernel.ops.quantization import rmsnorm_nvfp4_quant
 row = torch.full((1, 4096), 0.5, dtype=torch.bfloat16, device=device)
 weight = torch.ones(4096, dtype=torch.bfloat16, device=device)
 scale = torch.tensor([0.7], device=device)
-mailbox = torch.empty(2, 4096, dtype=torch.bfloat16, device=device)
+mailbox = torch.empty(4, 1, 1024, dtype=torch.bfloat16, device=device)
 def consume():
-    rmsnorm_nvfp4_quant(mailbox[:1], weight, 1e-5, 1.0, scale, HALF_POLLED_SENTINEL, True)
+    rmsnorm_nvfp4_quant(mailbox, weight, 1e-5, 1.0, scale, HALF_POLLED_SENTINEL, True)
 """
 
 

@@ -92,6 +92,7 @@ def test_logits_processor_dp_layout_threshold_and_modes():
         tp_rank=0,
         tp_size=4,
         tp_group=(0, 1, 2, 3),
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
     processor.configure_dp_logits_layout(_dp_runtime_config(min_bs=16))
@@ -152,24 +153,6 @@ def test_cuda_graph_req_pool_padding_uses_reserved_sink_row():
     assert padded_indices.tolist() == [7, 8, 21, 21]
 
 
-def test_cuda_graph_state_write_padding_uses_reserved_sink_row():
-    wrapper = ForwardStepRunner.__new__(ForwardStepRunner)
-    wrapper.config = SimpleNamespace(max_req_pool_size=99)
-    wrapper.input_buffers = SimpleNamespace(
-        state_write_req_pool_indices_buf=torch.full((4,), -1, dtype=torch.int64)
-    )
-    active_indices = torch.tensor([7, 8], dtype=torch.int64)
-
-    wrapper._set_graph_state_write_indices(active_indices, 4)
-
-    assert wrapper.input_buffers.state_write_req_pool_indices_buf.tolist() == [
-        7,
-        8,
-        99,
-        99,
-    ]
-
-
 def test_cuda_graph_route_uses_global_batch_for_dp_idle_rank():
     ctx = ForwardContext(
         attn_backend=None,
@@ -223,6 +206,7 @@ def test_configure_dp_sampling_sets_state():
         tp_rank=0,
         tp_size=4,
         tp_group=(0, 1, 2, 3),
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
 
@@ -280,6 +264,7 @@ def test_logits_processor_derives_dp_layout_from_effective_hidden_states(
         tp_rank=0,
         tp_size=4,
         tp_group=(0, 1, 2, 3),
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
     processor.configure_dp_logits_layout(_dp_runtime_config(min_bs=5))
@@ -327,6 +312,7 @@ def test_skip_all_gather_dp_sampling_slices_hidden_states_before_lm_head():
         tp_rank=1,
         tp_size=4,
         tp_group=(0, 1, 2, 3),
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
     processor.configure_dp_logits_layout(
@@ -361,6 +347,7 @@ def test_dp_sampling_slices_graph_effective_hidden_states_before_lm_head():
         tp_rank=2,
         tp_size=4,
         tp_group=(0, 1, 2, 3),
+        attn_tp_size=1,
         dp_lm_head_tp=False,
     )
     processor.configure_dp_logits_layout(

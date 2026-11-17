@@ -55,6 +55,7 @@ from tokenspeed.runtime.utils import hf_transformers_utils
 def _profile(**overrides) -> ModelProfile:
     fields = dict(
         configure_attention=configure_mla_attention,
+        create_attention_config=None,
         cache_family="fixture_family",
         linear_attention="fixture_linear",
         default_attention_backend="mla",
@@ -648,6 +649,7 @@ def test_profiled_linear_attention_without_linear_layers_is_rejected() -> None:
 def test_attention_instances_per_layer_has_no_fallback() -> None:
     fields = dict(
         configure_attention=configure_mla_attention,
+        create_attention_config=None,
         cache_family="fixture_family",
         linear_attention=None,
         default_attention_backend=None,

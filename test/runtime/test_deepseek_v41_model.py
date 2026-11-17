@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import ast
 import json
+import logging
 import math
 import os
 import re
@@ -49,7 +50,13 @@ import torch.nn.functional as F
 from safetensors import safe_open
 from safetensors.torch import save_file
 from tokenspeed_kernel.numerics.torch.residual import torch_mhc_mixes
-from tokenspeed_kernel.ops.gemm import mm
+from tokenspeed_kernel.ops.gemm import (
+    fp8_projection,
+    grouped_fp8_projection,
+    grouped_fp8_projection_quantize_fp8,
+    has_grouped_fp8_projection,
+    mm,
+)
 from tokenspeed_kernel.ops.moe import moe_topk
 from tokenspeed_kernel.platform import ArchVersion, current_platform, pdl_enabled
 from torch import nn
@@ -249,6 +256,8 @@ class _DenseFFN(nn.Module):
         self.use_mega_moe = False
         self.owns_ep_communication = False
         self.use_gluon_petit = False
+        self.gate = nn.Module()
+        self.gate.register_parameter("bias_vl", None)
 
     def forward(
         self,
@@ -273,6 +282,7 @@ class _Backend:
         self.calls = []
         self.global_writes = {}
         self.projections = {}
+        self.swa_writes = []
 
     def query_metadata(self, mode):
         return self.meta
@@ -312,6 +322,12 @@ class _Backend:
             requests.clone(),
         )
 
+    def write_decode_swa(self, *args, **kwargs):
+        # Index sources write their decode SWA rows early; the synthetic
+        # attention below still receives the same rows.
+        self.swa_writes.append((args, kwargs))
+        return True
+
     def forward_v41(
         self,
         q,
@@ -329,6 +345,7 @@ class _Backend:
         swa_rope_cache,
         swa_norm_weight,
         swa_norm_eps,
+        fused_decode_groups,
         out_rope_cache,
         key_rows=None,
     ):
@@ -369,6 +386,14 @@ class _Backend:
     def begin_indexer_stage(self):
         pass
 
+    def prepare_decode_index_geometry(self, forward_mode, *, index_heads):
+        # Decode builds index geometry ahead of the layers; this backend
+        # keeps none.
+        pass
+
+    def prepare_reindex_index_geometry(self, forward_mode, *, index_heads):
+        pass
+
 
 @pytest.mark.parametrize("device", ["cpu", "cuda:0"])
 @pytest.mark.parametrize("fused", [False, True])
@@ -379,8 +404,11 @@ class _Backend:
     [(0, 1, 1), (0, 4, 4), (3, 4, 4), (0, 1, 4)],
 )
 def test_lm_head_checkpoint_and_logits_follow_model_dtype(
-    device, fused, dtype, rank, tp_size, world_size
+    device, fused, dtype, rank, tp_size, world_size, monkeypatch
 ):
+    monkeypatch.setitem(
+        global_server_args_dict, "disable_deepseek_v41_token_blacklist", True
+    )
     if device != "cpu" and not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     config = _config()
@@ -402,8 +430,8 @@ def test_lm_head_checkpoint_and_logits_follow_model_dtype(
     checkpoint = torch.zeros(
         config.vocab_size, config.hidden_size, dtype=torch.bfloat16, device="cpu"
     )
-    checkpoint[start : start + 2, 0] = 1
-    checkpoint[start + 1, 1] = 2**-9
+    checkpoint[start + 3 : start + 5, 0] = 1
+    checkpoint[start + 4, 1] = 2**-9
     adapter.load_weights([("head.weight", checkpoint)])
     local = checkpoint[start : start + head.weight.shape[0]].to(
         device=device, dtype=dtype
@@ -414,7 +442,7 @@ def test_lm_head_checkpoint_and_logits_follow_model_dtype(
     hidden = torch.ones(1, config.hidden_size, dtype=torch.bfloat16, device=device)
     expected = F.linear(hidden.to(dtype), local, bias=None)
     # BF16 rounds the near tie; wider dtypes retain the second token's margin.
-    expected_token = 0 if dtype == torch.bfloat16 else 1
+    expected_token = 3 if dtype == torch.bfloat16 else 4
     assert expected.argmax(-1).item() == expected_token
 
     processor = adapter.resolve_logits_processor(SimpleNamespace(text_config=config))
@@ -435,6 +463,104 @@ def test_lm_head_checkpoint_and_logits_follow_model_dtype(
     assert output.next_token_logits.dtype == dtype
     torch.testing.assert_close(output.next_token_logits, expected, rtol=0, atol=0)
     assert output.next_token_logits.argmax(-1).item() == expected_token
+
+
+@pytest.mark.parametrize("disable_blacklist", [False, True])
+@pytest.mark.parametrize("fuse_argmax", [False, True])
+def test_generation_token_blacklist_precedes_argmax(
+    fuse_argmax, disable_blacklist, monkeypatch
+):
+    monkeypatch.setitem(
+        global_server_args_dict,
+        "disable_deepseek_v41_token_blacklist",
+        disable_blacklist,
+    )
+    config = _config()
+    config.vocab_size = 129280
+    config.hidden_size = 1
+    adapter = DeepseekV41ForCausalLM.__new__(DeepseekV41ForCausalLM)
+    nn.Module.__init__(adapter)
+    adapter.mapping = _mapping(0, 1, 1)
+    with torch.device("cpu"):
+        adapter.lm_head = adapter.resolve_lm_head(
+            SimpleNamespace(text_config=config), None, ""
+        )
+    blocked = [0, 2, 129262, 129263, 129264]
+    with torch.no_grad():
+        adapter.lm_head.weight.zero_()
+        adapter.lm_head.weight[blocked, 0] = 4
+        adapter.lm_head.weight[3, 0] = 2
+    processor = adapter.resolve_logits_processor(SimpleNamespace(text_config=config))
+    if fuse_argmax:
+        processor.fuse_argmax()
+
+    hidden = torch.ones(1, 1)
+    output = processor(
+        input_ids=torch.zeros(1, dtype=torch.int64),
+        hidden_states=hidden,
+        lm_head=adapter.lm_head,
+        logits_metadata=LogitsMetadata.from_forward_context(
+            _ctx(None, 1, ForwardMode.DECODE)
+        ),
+        aux_hidden_states=None,
+    )
+
+    expected = F.linear(hidden, adapter.lm_head.weight)
+    expected_token = 3
+    if not disable_blacklist:
+        expected[0, blocked] = float("-inf")
+    else:
+        expected_token = 0
+    torch.testing.assert_close(output.next_token_logits, expected, rtol=0, atol=0)
+    assert output.next_token_logits.argmax(-1).item() == expected_token
+    if fuse_argmax:
+        assert output.next_token_ids.item() == expected_token
+
+
+@pytest.mark.parametrize("rank", [0, 3])
+def test_generation_token_blacklist_uses_global_ids_on_vocab_shards(rank, monkeypatch):
+    monkeypatch.setitem(
+        global_server_args_dict, "disable_deepseek_v41_token_blacklist", False
+    )
+    config = _config()
+    config.vocab_size = 129280
+    config.hidden_size = 1
+    adapter = DeepseekV41ForCausalLM.__new__(DeepseekV41ForCausalLM)
+    nn.Module.__init__(adapter)
+    adapter.mapping = _mapping(rank, 4, 4)
+    with torch.device("cpu"):
+        adapter.lm_head = adapter.resolve_lm_head(
+            SimpleNamespace(text_config=config), None, ""
+        )
+    width = adapter.lm_head.weight.shape[0]
+    start = rank * width
+    blocked = [0, 2, 129262, 129263, 129264]
+    local_blocked = [
+        token_id - start for token_id in blocked if start <= token_id < start + width
+    ]
+    with torch.no_grad():
+        adapter.lm_head.weight.zero_()
+        adapter.lm_head.weight[local_blocked, 0] = 4
+        adapter.lm_head.weight[3, 0] = 2
+    processor = adapter.resolve_logits_processor(SimpleNamespace(text_config=config))
+    # Exercise the real local shard without substituting a four-rank collective.
+    processor.skip_all_gather = True
+
+    hidden = torch.ones(1, 1)
+    output = processor(
+        input_ids=torch.zeros(1, dtype=torch.int64),
+        hidden_states=hidden,
+        lm_head=adapter.lm_head,
+        logits_metadata=LogitsMetadata.from_forward_context(
+            _ctx(None, 1, ForwardMode.DECODE)
+        ),
+        aux_hidden_states=None,
+    )
+
+    expected = F.linear(hidden, adapter.lm_head.weight)
+    expected[0, local_blocked] = float("-inf")
+    torch.testing.assert_close(output.next_token_logits, expected, rtol=0, atol=0)
+    assert output.next_token_logits.argmax(-1).item() == 3
 
 
 def test_hc_post_rejects_unfinished_reduction():
@@ -464,13 +590,36 @@ def test_decoder_layer_requires_explicit_forward_mode():
 
 @pytest.mark.parametrize("tokens", [0, 3])
 @pytest.mark.parametrize("owns_ep", [False, True])
+@pytest.mark.parametrize("attention_dp", [False, True])
 def test_empty_decoder_rows_complete_hc_and_preserve_ep_participation(
-    monkeypatch, tokens, owns_ep
+    monkeypatch, tokens, owns_ep, attention_dp
 ):
     monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
     config = _config()
+    mapping = (
+        v41.Mapping(
+            rank=0,
+            world_size=2,
+            attn_tp_size=1,
+            dense_tp_size=1,
+            moe_tp_size=1,
+            moe_ep_size=2,
+        )
+        if attention_dp
+        else _mapping(0, 1, 1)
+    )
     layer = DeepseekV41DecoderLayer(
-        config, _mapping(0, 1, 1), 0, 0, None, "layers.0", None, None, False, "gpu"
+        config,
+        mapping,
+        0,
+        0,
+        None,
+        "layers.0",
+        None,
+        None,
+        False,
+        "gpu",
+        None,
     )
     _initialize(layer)
     layer.ffn.owns_ep_communication = owns_ep
@@ -540,22 +689,274 @@ def test_empty_decoder_rows_complete_hc_and_preserve_ep_participation(
     assert pre_out.shape == (0, 4) and pending_out is None
     torch.testing.assert_close(tap, completed.mean(1) if tokens else hidden[:, 0, :])
     assert events == (["global_kv"] if tokens else []) + (
-        ["ffn"] if owns_ep or not tokens else []
+        ["ffn"] if owns_ep or attention_dp or not tokens else []
     )
     if tokens:
         pending.finish.assert_called_once_with(hidden)
-    assert before.call_count == after.call_count == int(not owns_ep and not tokens)
+    assert (
+        before.call_count
+        == after.call_count
+        == int(not owns_ep and (attention_dp or not tokens))
+    )
     forbidden.assert_not_called()
     if owns_ep:
         with pytest.raises(ValueError, match="cannot defer its reduction"):
             layer._forward_ffn(hidden[:, 0, :], image_mask, ctx, defer_reduce=True)
 
 
+@pytest.fixture
+def ordinary_dp_model(monkeypatch):
+    """Keep real model/communication code; emulate the missing peer and kernels."""
+    from tokenspeed.runtime.distributed import comm_manager
+    from tokenspeed.runtime.distributed.process_group_manager import ProcessGroupManager
+
+    mapping = v41.Mapping(
+        rank=0,
+        world_size=2,
+        attn_tp_size=1,
+        dense_tp_size=1,
+        moe_tp_size=1,
+        moe_ep_size=2,
+    )
+    manager = ProcessGroupManager()
+    group = object()
+    manager.register_process_group("gloo", (0, 1), group, name="v41_decoder_counts")
+    monkeypatch.setattr(manager, "init_process_group", lambda *args, **kwargs: None)
+    monkeypatch.setattr(v41, "pg_manager", manager)
+    monkeypatch.setattr(v41, "get_moe_backend", lambda: MoeBackend.TRITON)
+    monkeypatch.setitem(global_server_args_dict, "disable_prefill_graph", True)
+    monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
+
+    def exchange(counts, local, *, group):
+        assert group is manager.get_process_group(
+            "gloo", (0, 1), name="v41_decoder_counts"
+        )
+        counts[:] = [local, 2]
+
+    def gather(x, group, scattered_num_tokens):
+        assert tuple(group) == (0, 1)
+        assert scattered_num_tokens[0] == len(x)
+        peer = x.new_zeros((scattered_num_tokens[1], x.shape[1]))
+        # A peer's image rows must travel with that peer's activations.
+        if x.shape[1] == 136:
+            assert x.stride(0) * x.element_size() % 16 == 0
+            peer[:, 128] = 1
+        return torch.cat((x, peer))
+
+    def scatter(x, group, scattered_num_tokens):
+        assert tuple(group) == (0, 1)
+        assert len(x) == sum(scattered_num_tokens)
+        return x[: scattered_num_tokens[0]]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", exchange)
+    monkeypatch.setattr(comm_manager, "token_all_gather", gather)
+    monkeypatch.setattr(comm_manager, "token_reduce_scatter", scatter)
+    return DeepseekV41Model(_config(), mapping, None, "model", False, "gpu", None)
+
+
+@pytest.mark.parametrize("dense_tp_size", [1, 2])
+@pytest.mark.parametrize("moe_tp_size,moe_ep_size", [(1, 2), (2, 1)])
+def test_ordinary_dp_ep_rejects_tensor_parallel_layouts(
+    monkeypatch, dense_tp_size, moe_tp_size, moe_ep_size
+):
+    monkeypatch.setattr(v41, "get_moe_backend", lambda: MoeBackend.TRITON)
+    monkeypatch.setitem(global_server_args_dict, "disable_prefill_graph", True)
+    mapping = v41.Mapping(
+        rank=0,
+        world_size=4,
+        attn_tp_size=2,
+        dense_tp_size=dense_tp_size,
+        moe_tp_size=moe_tp_size,
+        moe_ep_size=moe_ep_size,
+    )
+    with pytest.raises(
+        NotImplementedError,
+        match="ordinary attention DP/EP requires attention/dense/MoE TP1",
+    ):
+        DeepseekV41Model(_config(), mapping, None, "model", False, "gpu", None)
+
+
+@pytest.mark.parametrize(
+    "backend,attn_tp_size,dense_tp_size,moe_tp_size,moe_ep_size,disable_prefill_graph",
+    [
+        (MoeBackend.TRITON, 1, 1, 1, 2, True),
+        (MoeBackend.TRITON, 2, 2, 1, 2, False),
+        (MoeBackend.TRITON, 2, 2, 2, 1, False),
+        (MoeBackend.MEGA_MOE, 1, 1, 1, 2, False),
+    ],
+)
+def test_model_constructor_accepts_supported_parallel_layouts(
+    monkeypatch,
+    backend,
+    attn_tp_size,
+    dense_tp_size,
+    moe_tp_size,
+    moe_ep_size,
+    disable_prefill_graph,
+):
+    mapping = v41.Mapping(
+        rank=0,
+        world_size=2,
+        attn_tp_size=attn_tp_size,
+        dense_tp_size=dense_tp_size,
+        moe_tp_size=moe_tp_size,
+        moe_ep_size=moe_ep_size,
+    )
+    monkeypatch.setattr("tokenspeed.runtime.layers.moe.utils.MOE_BACKEND", backend)
+    monkeypatch.setitem(global_server_args_dict, "mapping", mapping)
+    monkeypatch.setitem(
+        global_server_args_dict, "disable_prefill_graph", disable_prefill_graph
+    )
+    monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
+    # No weights or peers are needed to exercise the real model constructor.
+    monkeypatch.setattr(pg_manager, "init_process_group", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pg_manager, "get_device_process_group", lambda group: None)
+    monkeypatch.setattr(
+        expert_module,
+        "kernel_moe_plan",
+        lambda *args, **kwargs: {
+            "solution": backend.value,
+            "support_routing": False,
+            "supports_precomputed_topk": True,
+            "supports_deferred_finalize": False,
+            "topk_weights_dtype": torch.float32,
+            "weight_preprocessor": None,
+            "warmup": None,
+        },
+    )
+    config = _loader_config()
+    config.hidden_size = 256
+    config.engram_layer_ids = []
+    with torch.device("meta"):
+        DeepseekV41Model(config, mapping, _quant(), "model", False, "gpu", None)
+
+
+def test_model_constructor_preserves_fused_ep_layout_requirement(monkeypatch):
+    monkeypatch.setattr(v41, "get_moe_backend", lambda: MoeBackend.MEGA_MOE)
+    mapping = v41.Mapping(
+        rank=0,
+        world_size=2,
+        attn_tp_size=1,
+        dense_tp_size=2,
+        moe_tp_size=1,
+        moe_ep_size=2,
+    )
+    with pytest.raises(NotImplementedError, match="requires attention TP == MoE TPxEP"):
+        DeepseekV41Model(_config(), mapping, None, "model", False, "gpu", None)
+
+
+def test_ordinary_dp_ep_requires_disabled_prefill_graph(monkeypatch):
+    monkeypatch.setattr(v41, "get_moe_backend", lambda: MoeBackend.TRITON)
+    monkeypatch.setitem(global_server_args_dict, "disable_prefill_graph", False)
+    mapping = v41.Mapping(
+        rank=0,
+        world_size=2,
+        attn_tp_size=1,
+        dense_tp_size=1,
+        moe_tp_size=1,
+        moe_ep_size=2,
+    )
+    with pytest.raises(ValueError, match="requires --disable-prefill-graph"):
+        DeepseekV41Model(_config(), mapping, None, "model", False, "gpu", None)
+
+
+def test_decoder_counts_preserve_decode_and_fused_ep_boundaries(
+    monkeypatch, ordinary_dp_model
+):
+    model = ordinary_dp_model
+    ctx = _ctx(None, 3, ForwardMode.EXTEND)
+    ctx.global_num_tokens = [9, 7]
+    assert model.decoder_collective_counts(ctx, 3) == [3, 2]
+    assert ctx.global_num_tokens == [9, 7]
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("decode and fused EP must not exchange host counts")
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", forbidden)
+    ctx.all_decode_or_idle = True
+    assert model.decoder_collective_counts(ctx, 3) is ctx.global_num_tokens
+    ctx.all_decode_or_idle = False
+    model.layers[model.ced_decoder_start].ffn.owns_ep_communication = True
+    assert model.decoder_collective_counts(ctx, 3) is None
+
+
+def test_ordinary_dp_prefill_rejects_capture(monkeypatch, ordinary_dp_model):
+    ctx = _ctx(None, 3, ForwardMode.EXTEND)
+    ctx.global_num_tokens = [9, 7]
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    with pytest.raises(RuntimeError, match="requires --disable-prefill-graph"):
+        ordinary_dp_model.decoder_collective_counts(ctx, 3)
+
+
+def test_ordinary_dp_idle_rank_joins_narrowed_expert_collectives(ordinary_dp_model):
+    model = ordinary_dp_model
+    seen = []
+    stage_counts = []
+
+    def observe(module, args):
+        seen.append(len(args[0]))
+
+    def observe_stage(module, args):
+        stage_counts.append(args[4].collective_global_num_tokens)
+
+    handles = [layer.ffn.register_forward_pre_hook(observe) for layer in model.layers]
+    handles.extend(
+        layer.register_forward_pre_hook(observe_stage) for layer in model.layers
+    )
+    ids = torch.empty(0, dtype=torch.int64)
+    ctx = _ctx(None, 0, ForwardMode.IDLE)
+    ctx.global_num_tokens = [0, 2]
+    hidden, captured = model(
+        ids,
+        ids,
+        ctx,
+        None,
+        None,
+        engram_hash_ids=None,
+        engram_token_mask=None,
+        image_mask=None,
+    )
+    for handle in handles:
+        handle.remove()
+    assert hidden.shape == (0, model.config.hidden_size) and captured is None
+    # The idle rank computes the peer's rows, then scatters an empty local result.
+    assert seen == [2] * model.config.num_hidden_layers
+    start = model.ced_decoder_start
+    assert stage_counts == [None] * start + [[0, 2]] * (len(model.layers) - start)
+    assert ctx.collective_num_tokens is ctx.collective_global_num_tokens is None
+
+
+@pytest.mark.parametrize("local_images", [False, True])
+def test_ordinary_dp_gathers_image_mask_with_activations(
+    monkeypatch, ordinary_dp_model, local_images
+):
+    layer = ordinary_dp_model.layers[0]
+    layer.ffn.gate.bias_vl = nn.Parameter(torch.ones(1))
+    x = torch.arange(3 * 128, dtype=torch.bfloat16).reshape(3, 128)
+    mask = torch.tensor([True, False, True]) if local_images else None
+    ctx = _ctx(None, 3, ForwardMode.EXTEND)
+    ctx.global_num_tokens = [3, 2]
+    expected_mask = torch.tensor([local_images, False, local_images, True, True])
+
+    def ffn(x, image_mask, total, maximum, ctx, comm_manager, out=None):
+        assert (total, maximum) == (5, 3)
+        assert x.is_contiguous()
+        torch.testing.assert_close(image_mask, expected_mask)
+        return x + image_mask[:, None] * 8
+
+    monkeypatch.setattr(layer.ffn, "forward", ffn)
+    actual = layer._forward_ffn(x, mask, ctx, defer_reduce=False)
+    torch.testing.assert_close(actual, x + expected_mask[:3, None] * 8)
+
+
 def test_idle_model_calls_every_ep_layer_with_completed_empty_state(monkeypatch):
     monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
     config = _config()
     config.engram_layer_ids = []
-    model = DeepseekV41Model(config, _mapping(0, 1, 1), None, "model", False, "gpu")
+    model = DeepseekV41Model(
+        config, _mapping(0, 1, 1), None, "model", False, "gpu", None
+    )
     model.mapping = SimpleNamespace(attn=SimpleNamespace(has_dp=True))
     calls = []
     for layer in model.layers:
@@ -603,7 +1004,9 @@ def test_cache_only_narrowing_handoff_has_no_pending_hc(monkeypatch, attention_d
     monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
     config = _config()
     config.engram_layer_ids = []
-    model = DeepseekV41Model(config, _mapping(0, 1, 1), None, "model", False, "gpu")
+    model = DeepseekV41Model(
+        config, _mapping(0, 1, 1), None, "model", False, "gpu", None
+    )
     _initialize(model)
     model.mapping = SimpleNamespace(attn=SimpleNamespace(has_dp=attention_dp))
     model.dspark_capture_layers = (20, 21, 39)
@@ -901,6 +1304,7 @@ def test_attention_reduction_precedes_hc_join_unless_fusible(
         None,
         False,
         "gpu",
+        None,
     )
     _initialize(layer)
     positions = torch.arange(3)
@@ -1015,6 +1419,7 @@ def test_shifted_mhc_consumes_reduced_rows_and_reuses_ffn_mixes(
         None,
         False,
         "gpu",
+        None,
     )
     _initialize(layer)
     positions = torch.arange(tokens)
@@ -1302,6 +1707,7 @@ def test_single_pass_two_layer_chain_and_comb_orientation(monkeypatch):
             None,
             False,
             "gpu",
+            None,
         )
         for i in (0, 1)
     ]
@@ -1392,6 +1798,7 @@ def test_cross_layer_reduction_uses_consumer_norm(monkeypatch, fusion, mode):
             None,
             False,
             "gpu",
+            None,
         )
         for i in range(2)
     ]
@@ -1499,7 +1906,9 @@ def test_cross_layer_chain_preserves_engram_taps_and_stage_handoffs(
     monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
     torch.manual_seed(91)
     config = _config()
-    model = v41.DeepseekV41Model(config, _mapping(0, 1, 1), None, "model", False, "gpu")
+    model = v41.DeepseekV41Model(
+        config, _mapping(0, 1, 1), None, "model", False, "gpu", None
+    )
     _initialize(model)
     model.initialize_engram(_Tokenizer())
     model.dspark_capture_layers = (1, 3, 14, 19, 20, 21, 39)
@@ -1690,11 +2099,156 @@ def test_attention_owner_cast_index_and_grouped_output(layer_id):
         assert iq is iw is None and attn.indexer is None
 
 
+@pytest.mark.parametrize("layer_id", [1, 2, 3, 24])
+def test_index_source_decode_writes_swa_rows_inside_its_fork(layer_id):
+    """An index source writes its decode SWA rows right after its Q
+    projection, inside the stream fork, with the exact tensors forward_v41
+    attends; nothing forward_v41 receives changes."""
+
+    class Backend(_Backend):
+        def prepare_global_selection(self, *args, **kwargs):
+            events.append("selection")
+            return None
+
+        def write_decode_swa(self, *args, **kwargs):
+            events.append("swa_write")
+            return super().write_decode_swa(*args, **kwargs)
+
+        def forward_v41(self, q, swa, **kwargs):
+            events.append("attention")
+            self.attended.append((swa, kwargs["positions"], kwargs))
+            return super().forward_v41(q, swa, **kwargs)
+
+    class LateBackend(Backend):
+        def write_decode_swa(self, *args, **kwargs):
+            # Declines, as for rows outside the refreshed decode window:
+            # forward_v41 then writes them itself.
+            events.append("swa_write")
+            return False
+
+    torch.manual_seed(300 + layer_id)
+    config = _config()
+    attn = DeepseekV41Attention(
+        config,
+        _mapping(0, 1, 1),
+        layer_id,
+        v41._ced_decoder_start(config),
+        None,
+        f"layers.{layer_id}.attn",
+        aux_stream=None,
+    )
+    _initialize(attn)
+    attn.wq_b.register_forward_hook(lambda *args: events.append("q_projection"))
+    positions = torch.arange(6)
+    x = torch.randn(6, 128, dtype=torch.bfloat16)
+    events = []
+
+    def run(backend_type):
+        backend = backend_type(positions, torch.zeros(6, dtype=torch.int64))
+        backend.swa_writes, backend.attended = [], []
+        events.clear()
+        out = attn(positions, x, _ctx(backend, 6, ForwardMode.DECODE), True)
+        return out, backend, list(events)
+
+    expected, late, late_events = run(LateBackend)
+    actual, early, early_events = run(Backend)
+    source = layer_id in config.index_source_layer_ids
+    if source:
+        assert early_events == ["selection", "q_projection", "swa_write", "attention"]
+        assert late_events == early_events and not late.swa_writes
+        ((args, kwargs),) = early.swa_writes
+        swa, attended_positions, attended = early.attended[0]
+        assert args[0] == layer_id and args[1] is swa
+        assert args[2] is attended_positions is early.meta.positions
+        assert args[3] is attended["request_indices"] is early.meta.request_indices
+        assert args[4] is ForwardMode.DECODE
+        assert kwargs == dict(
+            swa_rope_cache=attended["swa_rope_cache"],
+            swa_norm_weight=attended["swa_norm_weight"],
+            swa_norm_eps=attended["swa_norm_eps"],
+        )
+    else:
+        assert "swa_write" not in early_events and not early.swa_writes
+        assert late_events == early_events
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    for got, want in zip(early.calls[-1][1:], late.calls[-1][1:], strict=True):
+        assert (got is None) == (want is None)
+        if isinstance(got, torch.Tensor):
+            assert torch.equal(got, want)
+
+
+@pytest.mark.parametrize("mode", [ForwardMode.EXTEND, ForwardMode.DECODE])
+def test_decode_forward_builds_index_geometry_ahead_of_its_layers(monkeypatch, mode):
+    """A decode forward builds the Full sources' geometry before its first
+    layer and the Reindex sources' right after the candidate source; a
+    backend that builds nothing ahead yields the same outputs."""
+    monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
+    monkeypatch.setattr(v41, "try_mhc_shifted_post_pre_norm", lambda *args: None)
+    torch.manual_seed(92)
+    config = _config()
+    config.engram_layer_ids = []
+    model = DeepseekV41Model(
+        config, _mapping(0, 1, 1), None, "model", False, "gpu", None
+    )
+    _initialize(model)
+    positions = torch.arange(6)
+
+    class Backend(_Backend):
+        def __init__(self, *args):
+            super().__init__(*args)
+            self.builds = []
+
+        def prepare_global_selection(self, *args, **kwargs):
+            return None
+
+        def prepare_decode_index_geometry(self, forward_mode, *, index_heads):
+            # Layers whose attention ran before the build.
+            self.builds.append(("full", len(self.calls), forward_mode, index_heads))
+
+        def prepare_reindex_index_geometry(self, forward_mode, *, index_heads):
+            self.builds.append(("reindex", len(self.calls), forward_mode, index_heads))
+
+    class PlainBackend(Backend):
+        def prepare_decode_index_geometry(self, forward_mode, *, index_heads):
+            pass
+
+        def prepare_reindex_index_geometry(self, forward_mode, *, index_heads):
+            pass
+
+    def run(backend_type):
+        backend = backend_type(positions, torch.zeros_like(positions))
+        hidden, _ = model(
+            torch.tensor([0, 3, 4, 6, 3, 4]),
+            positions,
+            _ctx(backend, 6, mode),
+            None,
+            None,
+            engram_hash_ids=None,
+            engram_token_mask=None,
+            image_mask=None,
+        )
+        return hidden, backend
+
+    expected, plain = run(PlainBackend)
+    actual, early = run(Backend)
+    assert not plain.builds
+    heads = config.index_n_heads
+    assert early.builds == (
+        [("full", 0, mode, heads), ("reindex", 21, mode, heads)]
+        if mode.is_decode()
+        else []
+    )
+    assert len(early.calls) == len(plain.calls) == config.num_hidden_layers
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 def test_full_40_layer_backbone_engram_and_final_mix(monkeypatch):
     monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
     torch.manual_seed(7)
     config = _config()
-    model = DeepseekV41Model(config, _mapping(0, 1, 1), None, "model", False, "gpu")
+    model = DeepseekV41Model(
+        config, _mapping(0, 1, 1), None, "model", False, "gpu", None
+    )
     _initialize(model)
     model.initialize_engram(_Tokenizer())
     ids = torch.tensor([0, 3, 4, 6])
@@ -1757,8 +2311,11 @@ def test_full_40_layer_backbone_engram_and_final_mix(monkeypatch):
     assert forwarded["input_embeds"] is forwarded["pp_inbound"] is None
 
 
+@pytest.mark.parametrize("attention_dp", [False, True])
 def test_decoder_narrowing_projects_global_from_all_rows_then_runs_the_tail(
     monkeypatch,
+    attention_dp,
+    ordinary_dp_model,
 ):
     """Layers below the candidate source see every row; the candidate source
     writes its global KV for every row and then narrows to the decoder view;
@@ -1767,7 +2324,13 @@ def test_decoder_narrowing_projects_global_from_all_rows_then_runs_the_tail(
     monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
     torch.manual_seed(7)
     config = _config()
-    model = DeepseekV41Model(config, _mapping(0, 1, 1), None, "model", False, "gpu")
+    model = (
+        ordinary_dp_model
+        if attention_dp
+        else DeepseekV41Model(
+            config, _mapping(0, 1, 1), None, "model", False, "gpu", None
+        )
+    )
     _initialize(model)
     model.initialize_engram(_Tokenizer())
     # Taps at, before and after the narrowing layer all reach the drafter in
@@ -1791,6 +2354,8 @@ def test_decoder_narrowing_projects_global_from_all_rows_then_runs_the_tail(
     )
     backend = _Backend(positions, requests, view)
     ctx = _ctx(backend, 6, ForwardMode.EXTEND)
+    if attention_dp:
+        ctx.global_num_tokens = [6, 2]
     ctx.bs = ctx.num_extends = 2
     ctx.output_layout = ForwardOutputLayout(2, 2, 0, 1)
     ctx.capture_hidden_mode = CaptureHiddenMode.FULL
@@ -1815,6 +2380,7 @@ def test_decoder_narrowing_projects_global_from_all_rows_then_runs_the_tail(
                 hidden.shape[0],
                 layer_positions.tolist(),
                 layer_ctx.collective_num_tokens,
+                layer_ctx.collective_global_num_tokens,
                 v41._row_plan(
                     module.layer_id, module.ced_decoder_start, layer_ctx
                 ).keep_rows
@@ -1845,10 +2411,11 @@ def test_decoder_narrowing_projects_global_from_all_rows_then_runs_the_tail(
     )
     for handle in handles:
         handle.remove()
-    assert seen[19] == (6, [0, 1, 2, 3, 0, 1], None, False)
-    assert seen[20] == (6, [0, 1, 2, 3, 0, 1], 3, True)
-    assert seen[21] == (3, [3, 0, 1], 3, False)
-    assert seen[39] == (3, [3, 0, 1], 3, False)
+    counts = [3, 2] if attention_dp else None
+    assert seen[19] == (6, [0, 1, 2, 3, 0, 1], None, None, False)
+    assert seen[20] == (6, [0, 1, 2, 3, 0, 1], 3, counts, True)
+    assert seen[21] == (3, [3, 0, 1], 3, counts, False)
+    assert seen[39] == (3, [3, 0, 1], 3, counts, False)
     # Changing these batch shapes can change split-K/quantized arithmetic
     # for the retained rows. Only zero-output chunks may bypass projections.
     assert projection_rows == {"hc": 6, "qkv": 6}
@@ -1878,7 +2445,9 @@ def test_staged_forward_pads_like_the_prefill_graph(monkeypatch):
     monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
     torch.manual_seed(7)
     config = _config()
-    model = DeepseekV41Model(config, _mapping(0, 1, 1), None, "model", False, "gpu")
+    model = DeepseekV41Model(
+        config, _mapping(0, 1, 1), None, "model", False, "gpu", None
+    )
     _initialize(model)
     model.initialize_engram(_Tokenizer())
     model.dspark_capture_layers = (19, 20, 39)
@@ -2019,7 +2588,9 @@ def test_staged_forward_pads_like_the_prefill_graph(monkeypatch):
     draft.num_hidden_layers, draft.engram_layer_ids = 2, []
     draft.kv_source_layer_ids = draft.index_source_layer_ids = []
     draft.compress_ratios = [0, 0]
-    stack = DeepseekV41Model(draft, _mapping(0, 1, 1), None, "draft", False, "gpu")
+    stack = DeepseekV41Model(
+        draft, _mapping(0, 1, 1), None, "draft", False, "gpu", None
+    )
     _initialize(stack)
     plain = _Backend(positions, requests)
     ctx = _ctx(plain, 6, ForwardMode.EXTEND)
@@ -2220,6 +2791,203 @@ def test_sharded_state_load_prepares_fp8_scales_from_loaded_state(
     torch.testing.assert_close(model.proj(x)[0], source.proj(x)[0], rtol=0, atol=0)
 
 
+class _TinyFp8WoAModel(BaseCausalLM):
+    """One V4.1 attention layer behind the V4.1 wo_a loading and warmup hooks."""
+
+    def __init__(self, config):
+        mapping = _mapping(0, 1, 1)
+        super().__init__(config=SimpleNamespace(), mapping=mapping, encoder_only=True)
+        layer = nn.Module()
+        layer.attn = DeepseekV41Attention(
+            config,
+            mapping,
+            0,
+            0,
+            v41_mxfp8_config(_quant()),
+            "layers.0.attn",
+            aux_stream=None,
+        )
+        self.model = nn.Module()
+        self.model.layers = nn.ModuleList([layer])
+
+    def post_load_weights(self):
+        DeepseekV41ForCausalLM.post_load_weights(self)
+
+    def post_quant_warmup(self):
+        DeepseekV41ForCausalLM.post_quant_warmup(self)
+
+
+@pytest.mark.skipif(
+    not (
+        torch.cuda.is_available()
+        # The test's o_lora_rank and wo_a input width.
+        and has_grouped_fp8_projection(torch.device("cuda"), 128, 512)
+    ),
+    reason="needs a grouped FP8 kernel for wo_a",
+)
+@torch.inference_mode()
+def test_sharded_state_load_restores_fp8_wo_a(monkeypatch, tmp_path):
+    """A state dict saved after loading FP8 wo_a fits a freshly built model,
+    and the sharded-state load rederives the kernels' wo_a and wo_b scales."""
+    monkeypatch.setitem(global_server_args_dict, "dense_gemm_backend", "auto")
+    monkeypatch.setattr(v41, "_max_forward_tokens", lambda: 32)
+    config = _config()
+    config.hidden_size = 256
+    config.num_attention_heads = config.o_groups = 2
+    config.head_dim, config.qk_rope_head_dim = 512, 64
+    config.q_lora_rank = 128
+    # A 128-wide wo_a group output lets FP8 kernels serve wo_a and wo_b.
+    config.o_lora_rank = 128
+    torch.manual_seed(17)
+    with torch.device("cuda"):
+        source = _TinyFp8WoAModel(config)
+        a_codes = torch.randn(256, 512).to(torch.float8_e4m3fn)
+        a_scales = torch.randint(118, 124, (8, 16), dtype=torch.uint8)
+        b_codes = torch.randn(256, 256).to(torch.float8_e4m3fn)
+        b_scales = torch.randint(118, 124, (8, 8), dtype=torch.uint8)
+    pending = {}
+    for field, tensor in (("weight", a_codes), ("scale", a_scales)):
+        DeepseekV41ForCausalLM._load_wo_a(
+            source, f"layers.0.attn.wo_a.{field}", tensor, pending
+        )
+    source.load_weights(
+        [
+            ("model.layers.0.attn.wo_b.weight", b_codes),
+            ("model.layers.0.attn.wo_b.weight_scale_inv", b_scales),
+        ]
+    )
+    source.post_load_weights()
+    save_file(
+        {name: value.contiguous() for name, value in source.state_dict().items()},
+        str(tmp_path / "model-rank-0-part-0.safetensors"),
+    )
+
+    monkeypatch.setattr(
+        loader_module,
+        "_initialize_model",
+        lambda model_config, load_config: _TinyFp8WoAModel(config),
+    )
+    loader = loader_module.ShardedStateLoader(LoadConfig(load_format="sharded_state"))
+    model = loader.load_model(
+        model_config=SimpleNamespace(
+            model_path=str(tmp_path),
+            revision=None,
+            dtype=torch.bfloat16,
+            mapping=SimpleNamespace(rank=0),
+        ),
+        device_config=SimpleNamespace(device="cuda"),
+    )
+    attn = model.model.layers[0].attn
+    assert attn.wo_a_fp8 and attn.wo_b_fp8
+    _assert_fp8_wo_a_matches_checkpoint(attn, a_codes, a_scales, b_codes, b_scales)
+    with pytest.raises(ValueError, match="BF16 wo_a"):
+        DeepseekV41ForCausalLM._load_wo_a(
+            model, "layers.0.attn.wo_a.weight", a_codes.bfloat16(), {}
+        )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not current_platform().is_blackwell_plus,
+    reason="requires Blackwell MXFP8",
+)
+@pytest.mark.parametrize("layer_id", [0, 20, 24])
+@pytest.mark.parametrize("rows", ["all", "narrowed", "partitioned"])
+@torch.inference_mode()
+def test_cuda_swizzled_query_scales_match_canonical(monkeypatch, layer_id, rows):
+    """wq_b and the indexer's wq_b read the fused norm's F8_128x4 scales as
+    written. A narrowed batch keeps the canonical scales it selects rows of; an
+    indexer partition quantizes its local BF16 rows into the same codes."""
+    from tokenspeed.runtime.layers.attention.query_partition import (
+        InterleavedQueryPlan,
+    )
+
+    class Partitioned(_Backend):
+        def __init__(self, positions, requests, view):
+            super().__init__(positions, requests, view)
+            self.selections = []
+
+        def plan_indexer_queries(self, *args):
+            return InterleavedQueryPlan(total_rows=6, rank=1, size=2)
+
+        def prepare_global_selection(
+            self, layer_id, index_q, index_weights, *args, **kwargs
+        ):
+            assert kwargs["projected_partition"] is not None
+            self.selections.append((index_q.clone(), index_weights.clone()))
+            return None
+
+    monkeypatch.setitem(global_server_args_dict, "dense_gemm_backend", "auto")
+    previous_pdl = pdl_enabled()
+    pdl_enabled(True)
+    try:
+        config = _config()
+        config.q_lora_rank = 128
+        torch.manual_seed(23)
+        with torch.device("cuda:0"):
+            attn = DeepseekV41Attention(
+                config,
+                _mapping(0, 1, 1),
+                layer_id,
+                layer_id if rows == "narrowed" else v41._ced_decoder_start(config),
+                v41_mxfp8_config(_quant()),
+                f"layers.{layer_id}.attn",
+                aux_stream=None,
+            )
+        _initialize(attn)
+        for module in attn.modules():
+            if isinstance(module, LinearBase):
+                module.quant_method.process_weights_after_loading(module)
+        # Prepared for at least one layout its GEMM reads without a repack.
+        assert v41._scale_layouts(attn.wq_b) != frozenset({"canonical"})
+        positions = torch.arange(6, device="cuda:0")
+        requests = torch.zeros(6, dtype=torch.int64, device="cuda:0")
+        x = torch.randn(6, 128, dtype=torch.bfloat16, device="cuda:0")
+        layouts = []
+        quantize = v41.rmsnorm_quantize_fp8_group32
+
+        def recording(*args, **kwargs):
+            layouts.append(kwargs["scale_layout"])
+            return quantize(*args, **kwargs)
+
+        monkeypatch.setattr(v41, "rmsnorm_quantize_fp8_group32", recording)
+
+        def run():
+            view = None
+            if rows == "narrowed":
+                keep = torch.tensor([1, 3, 5], device="cuda:0")
+                query = SimpleNamespace(
+                    positions=positions[keep], request_indices=requests[keep]
+                )
+                view = V41DecoderView(query, None, (), keep, None)
+            backend = (Partitioned if rows == "partitioned" else _Backend)(
+                positions, requests, view
+            )
+            out = attn(
+                positions, x, _ctx(backend, 6, ForwardMode.EXTEND), reduce_output=True
+            )
+            selections = backend.selections if rows == "partitioned" else []
+            return out, [*backend.calls[-1][1:5], *sum(selections, ())]
+
+        actual, actual_inputs = run()
+        monkeypatch.setattr(
+            v41, "_scale_layouts", lambda layer: frozenset({"canonical"})
+        )
+        expected, expected_inputs = run()
+        # Narrowing selects rows of the scales, which only canonical allows.
+        assert (layouts[0] == "canonical") == (rows == "narrowed")
+        assert layouts[1] == "canonical"
+        if rows == "partitioned" and attn.indexer is not None:
+            assert len(actual_inputs) == 6
+        assert torch.equal(actual, expected)
+        assert len(actual_inputs) == len(expected_inputs)
+        for got, want in zip(actual_inputs, expected_inputs):
+            assert (got is None) == (want is None)
+            if got is not None:
+                assert torch.equal(got, want)
+    finally:
+        pdl_enabled(previous_pdl)
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available() or not current_platform().is_blackwell_plus,
     reason="requires Blackwell MXFP8",
@@ -2314,15 +3082,20 @@ def test_cuda_fp8_weight_update_preserves_graph(monkeypatch):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
-    "execution_mode", ["eager", "decode", "prefill", "split_prefill_graph"]
+    "execution_mode", ["eager", "decode", "prefill", "split_prefill_graph", "packed"]
 )
 def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch, tmp_path, execution_mode):
+    monkeypatch.setitem(
+        global_server_args_dict, "disable_deepseek_v41_token_blacklist", True
+    )
     config = _config()
     config.hidden_size = 256
     config.moe_intermediate_size = 256
     config.num_attention_heads = config.o_groups = config.index_n_heads = 2
     config.head_dim, config.index_head_dim = 512, 128
     config.qk_rope_head_dim, config.q_lora_rank = 64, 128
+    # A 128-wide wo_a group output lets FP8 kernels serve wo_a and wo_b.
+    config.o_lora_rank = 128
     monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
     torch.manual_seed(41)
     with torch.device("cuda:0"):
@@ -2333,11 +3106,35 @@ def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch, tmp_path, execution_mode
             is_multimodal_active=False,
             mm_attention_backend=None,
         )
-    adapter.load_weights(
-        _bind_engram_tables(adapter, _checkpoint(config), tmp_path).items()
-    )
+    weights = _checkpoint(config)
+    adapter.load_weights(_bind_engram_tables(adapter, weights, tmp_path).items())
     adapter.initialize_engram(_Tokenizer())
     model = adapter.model
+    # GPUs with a grouped FP8 kernel run wo_a on its FP8 codes and feed wo_b
+    # its FP8 output; other GPUs dequantize wo_a.
+    fp8_wo_a = has_grouped_fp8_projection(
+        torch.device("cuda:0"),
+        config.o_lora_rank,
+        config.num_attention_heads * config.head_dim // config.o_groups,
+    )
+    for layer in model.layers:
+        assert layer.attn.wo_a_fp8 is fp8_wo_a
+        assert layer.attn.wo_b_fp8 is (True if fp8_wo_a else None)
+        assert layer.attn.wo_a.weight.dtype == (
+            torch.float8_e4m3fn if fp8_wo_a else torch.bfloat16
+        )
+    if fp8_wo_a and execution_mode == "eager":
+        _assert_fp8_wo_a_matches_checkpoint(
+            model.layers[0].attn,
+            *(
+                weights[f"layers.0.attn.{name}"]
+                for name in ("wo_a.weight", "wo_a.scale")
+            ),
+            *(
+                weights[f"layers.0.attn.{name}"]
+                for name in ("wo_b.weight", "wo_b.scale")
+            ),
+        )
     for module in model.modules():
         if isinstance(module, LinearBase):
             module.quant_method.process_weights_after_loading(module)
@@ -2391,6 +3188,9 @@ def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch, tmp_path, execution_mode
     assert decoded.shape == (1, 256) and torch.isfinite(decoded).all()
     if execution_mode == "eager":
         return
+    if execution_mode == "packed":
+        _assert_packed_verify_rounds(adapter)
+        return
     if execution_mode == "prefill":
         _assert_chunked_prefill_replays_and_narrows(adapter, backend, tables)
         return
@@ -2401,6 +3201,195 @@ def test_cuda_40_layer_real_flatkv_and_moe(monkeypatch, tmp_path, execution_mode
     _assert_decode_graph_matches_eager(
         adapter, backend, tables, "cuda:0", ((6, 1), (7, 1), (8, 1), (1, 0), (9, 1))
     )
+
+
+def _dequantize_checkpoint(codes, scales):
+    exponents = scales.view(torch.uint8).repeat_interleave(32, 0)
+    exponents = exponents.repeat_interleave(32, 1).cuda().to(torch.int32)
+    return codes.cuda().float() * (exponents << 23).view(torch.float32)
+
+
+def _dequantize_packed(codes, scales):
+    exponents = torch.stack(
+        [(scales >> (8 * byte)) & 255 for byte in range(4)], dim=-1
+    ).flatten(-2)
+    values = codes.float().unflatten(-1, (-1, 32))
+    return (values * (exponents << 23).view(torch.float32)[..., None]).flatten(-2)
+
+
+def _assert_fp8_wo_a_matches_checkpoint(attn, a_codes, a_scales, b_codes, b_scales):
+    """The loaded FP8 wo_a and wo_b compute the checkpoint's dequantized
+    projections of their FP8-rounded inputs."""
+    groups, rank = attn.n_local_groups, attn.o_lora_rank
+    torch.manual_seed(5)
+    out = torch.randn(9, attn.n_local_heads, 512, device="cuda").bfloat16()
+    x, x_scales = attn.rotary_emb.inverse_quantize_grouped(
+        out, torch.arange(9, device="cuda"), groups
+    )
+    wo_a = attn.wo_a.weight.view(groups, rank, -1)
+    actual = grouped_fp8_projection(x, x_scales, wo_a, attn.wo_a_scales, None)
+    expected = torch.einsum(
+        "tgk,grk->tgr",
+        _dequantize_packed(x, x_scales).double(),
+        _dequantize_checkpoint(a_codes, a_scales).view(groups, rank, -1).double(),
+    )
+    torch.testing.assert_close(actual.double(), expected, rtol=2**-8, atol=1e-3)
+    z, z_scales = grouped_fp8_projection_quantize_fp8(
+        x, x_scales, wo_a, attn.wo_a_scales
+    )
+    actual = fp8_projection(z, z_scales, attn.wo_b.weight, attn.wo_b_scales, None)
+    expected = _dequantize_packed(z, z_scales).double() @ (
+        _dequantize_checkpoint(b_codes, b_scales).double().T
+    )
+    torch.testing.assert_close(actual.double(), expected, rtol=2**-8, atol=1e-3)
+
+
+@torch.inference_mode()
+def _assert_packed_verify_rounds(adapter):
+    """Real target layers across shortened windows and rejected suffixes.
+
+    Acceptance is supplied deliberately to exercise boundary cases; this is a
+    target/cache equivalence test, not an autonomous speculative serving loop.
+    """
+    from test.runtime.test_deepseek_v41_cache import _verify_backend
+
+    device, width = "cuda:0", 4
+    backend = _verify_backend(device, 2, width)
+    backend.cache_pool.arena.buffer.zero_()
+    tables = _tables(device)
+    model = adapter.model
+    vocab = len(_Tokenizer())
+    histories = [list(range(12)), [i % vocab for i in range(20, 33)]]
+
+    def inputs(candidates):
+        ids, previous = [], []
+        for history, row in zip(histories, candidates, strict=True):
+            combined = history + row
+            for column, token in enumerate(row):
+                position = len(history) + column
+                ids.append(token)
+                previous.append(
+                    [
+                        combined[position - back] if position >= back else -1
+                        for back in (1, 2, 3)
+                    ]
+                )
+        return (torch.tensor(ids, device=device), torch.tensor(previous, device=device))
+
+    prompt_ids = torch.tensor(histories[0] + histories[1], device=device)
+    prompt_previous = torch.tensor(
+        [
+            [row[i - back] if i >= back else -1 for back in (1, 2, 3)]
+            for row in histories
+            for i in range(len(row))
+        ],
+        device=device,
+    )
+    lengths = [len(row) for row in histories]
+    meta = _extend(backend, tables, lengths, [0, 0], [0, 1], lengths)
+    ctx = _ctx(backend, len(prompt_ids), ForwardMode.EXTEND)
+    ctx.bs = ctx.num_extends = 2
+    ctx.output_layout = ForwardOutputLayout(2, 2, 0, 1)
+    mask = torch.ones_like(prompt_ids, dtype=torch.bool)
+    model(
+        prompt_ids,
+        meta.positions,
+        ctx,
+        None,
+        None,
+        engram_hash_ids=model.engram_hash(prompt_ids, prompt_previous, mask),
+        engram_token_mask=mask,
+        image_mask=None,
+    )
+    arena = backend.cache_pool.arena.buffer
+    caches = [arena.clone(), arena.clone()]
+
+    for step, (selected, accepted) in enumerate(
+        [
+            ([2, 3], [1, 2]),
+            ([4, 1], [3, 1]),
+            ([1, 4], [1, 3]),
+        ]
+    ):
+        candidates = [
+            [(40 + step * 12 + request * 4 + i) % vocab for i in range(width)]
+            for request in range(2)
+        ]
+        ids, previous = inputs(candidates)
+        kept = torch.tensor(
+            [r * width + col for r in range(2) for col in range(selected[r])],
+            device=device,
+        )
+        outputs = []
+        for packed in (False, True):
+            arena.copy_(caches[int(packed)])
+            rows = kept if packed else torch.arange(2 * width, device=device)
+            offsets = (
+                torch.tensor([0, selected[0], sum(selected)], device=device)
+                if packed
+                else None
+            )
+            backend.refresh_decode_metadata(
+                2,
+                2,
+                torch.tensor([0, 1], device=device),
+                torch.tensor([len(row) + width for row in histories], device=device),
+                num_tokens=len(rows),
+                decode_query_indptr=offsets,
+                forward_mode=ForwardMode.DECODE,
+                block_tables=tables,
+                for_graph_replay=False,
+            )
+            meta = backend.query_metadata(ForwardMode.DECODE)
+            ctx = _ctx(backend, len(rows), ForwardMode.DECODE)
+            ctx.bs = 2
+            ctx.output_layout = ForwardOutputLayout(0, 0, 2, width)
+            ctx.decode_query_indptr = offsets
+            mask = torch.ones_like(rows, dtype=torch.bool)
+            hidden, _ = model(
+                ids[rows],
+                meta.positions,
+                ctx,
+                None,
+                None,
+                engram_hash_ids=model.engram_hash(ids[rows], previous[rows], mask),
+                engram_token_mask=mask,
+                image_mask=None,
+            )
+            outputs.append(hidden.clone())
+            caches[int(packed)].copy_(arena)
+        torch.testing.assert_close(outputs[1], outputs[0][kept])
+        processor = adapter.resolve_logits_processor(
+            SimpleNamespace(text_config=model.config)
+        )
+        logits = []
+        for hidden in outputs:
+            logits.append(
+                processor(
+                    input_ids=torch.zeros(
+                        len(hidden), dtype=torch.int64, device=device
+                    ),
+                    hidden_states=hidden,
+                    lm_head=adapter.lm_head,
+                    logits_metadata=LogitsMetadata.from_forward_context(
+                        _ctx(None, len(hidden), ForwardMode.DECODE)
+                    ),
+                    aux_hidden_states=None,
+                ).next_token_logits.clone()
+            )
+        reference, actual = logits[0][kept], logits[1]
+        torch.testing.assert_close(actual, reference, rtol=1.6e-2, atol=1e-4)
+        torch.testing.assert_close(
+            actual.argmax(-1), reference.argmax(-1), rtol=0, atol=0
+        )
+        error = actual.float() - reference.float()
+        print(
+            f"packed round={step} rows={len(kept)} "
+            f"logit_max_abs={error.abs().max().item():.6g} "
+            f"logit_rmse={error.square().mean().sqrt().item():.6g}"
+        )
+        for request, count in enumerate(accepted):
+            histories[request].extend(candidates[request][:count])
 
 
 @torch.inference_mode()
@@ -3733,10 +4722,12 @@ def test_model_qcp_ced_communication_and_outputs(
         # Real model/communication classes; weights are unnecessary when testing
         # stage layouts and output gathering, so allocate them on meta.
         with torch.device("meta"):
-            model = DeepseekV41Model(config, mapping, _quant(), "model", False, "gpu")
+            model = DeepseekV41Model(
+                config, mapping, _quant(), "model", False, "gpu", None
+            )
         backend = _backend("cpu", 2)
         plan = QueryShardPlan.from_forward(
-            total_tokens=total, input_lengths=lengths, size=4, rank=rank
+            total_tokens=total, input_lengths=lengths, size=4, rank=rank, device="cpu"
         )
         meta = _extend(
             backend,
@@ -3781,18 +4772,22 @@ def test_model_qcp_ced_communication_and_outputs(
             view.metadata.request_indices[samples], meta.request_indices[sample_encoder]
         )
         expected = full_hidden[samples]
-        counts = plan.rows_per_rank(sample_encoder)
+        split = local.decoder_plan.split_rows(samples)
+        counts = split.rows_per_rank
+        gathered_samples = expected[torch.argsort(split.to_rows_order)]
 
         def gather(payload, group, row_counts, backend=None):
             assert group == mapping.attn.qcp_group
             assert row_counts == list(counts)
             first = sum(counts[:rank])
-            torch.testing.assert_close(payload, expected[first : first + counts[rank]])
-            return expected.clone()
+            torch.testing.assert_close(
+                payload, gathered_samples[first : first + counts[rank]]
+            )
+            return gathered_samples.clone()
 
         monkeypatch.setattr(comm_ops, "token_all_gather", gather)
         actual, captured = model.finish_forward(
-            full_hidden[local.decoder_plan.local_slice], [], ctx
+            full_hidden[local.decoder_plan.local_row_ids], [], ctx
         )
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         assert actual.shape[0] == sum(complete)
@@ -3808,9 +4803,9 @@ def test_model_qcp_ced_communication_and_outputs(
             assert row_counts == list(local.decoder_plan.row_counts)
             expected_taps = torch.cat(taps, dim=-1)
             torch.testing.assert_close(
-                payload, expected_taps[local.decoder_plan.local_slice], rtol=0, atol=0
+                payload, expected_taps[local.decoder_plan.local_row_ids], rtol=0, atol=0
             )
-            return expected_taps.clone()
+            return local.decoder_plan.to_gather_order(expected_taps)
 
         monkeypatch.setattr(
             "tokenspeed.runtime.models.deepseek_v41.token_all_gather_rows",
@@ -3818,8 +4813,8 @@ def test_model_qcp_ced_communication_and_outputs(
         )
         ctx.capture_hidden_mode = CaptureHiddenMode.FULL
         actual, captured = model.finish_forward(
-            full_hidden[local.decoder_plan.local_slice],
-            [tap[local.decoder_plan.local_slice] for tap in taps],
+            full_hidden[local.decoder_plan.local_row_ids],
+            [tap[local.decoder_plan.local_row_ids] for tap in taps],
             ctx,
         )
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
@@ -3951,6 +4946,7 @@ def test_distributed_model_qcp_four_way(monkeypatch, tmp_path):
                         input_lengths=[length],
                         size=4,
                         rank=rank,
+                        device=device,
                     )
                     if sharded
                     else None
@@ -3966,7 +4962,7 @@ def test_distributed_model_qcp_four_way(monkeypatch, tmp_path):
                 )
                 ctx = _ctx(backend, length, ForwardMode.EXTEND)
                 ctx.query_shard = plan
-                rows = plan.local_slice if plan is not None else slice(None)
+                rows = plan.local_row_ids if plan is not None else slice(None)
                 result, _ = adapter.model(
                     ids[rows],
                     meta.positions[rows],
@@ -4006,8 +5002,8 @@ def test_distributed_model_qcp_four_way(monkeypatch, tmp_path):
             taps = [full, -full]
             ctx.capture_hidden_mode = CaptureHiddenMode.FULL
             actual, captured = adapter.model.finish_forward(
-                full[local.decoder_plan.local_slice],
-                [tap[local.decoder_plan.local_slice] for tap in taps],
+                full[local.decoder_plan.local_row_ids],
+                [tap[local.decoder_plan.local_row_ids] for tap in taps],
                 ctx,
             )
             expected = full[torch.tensor(view.logits_rows_cpu, device=device)]
@@ -4016,3 +5012,60 @@ def test_distributed_model_qcp_four_way(monkeypatch, tmp_path):
                 torch.testing.assert_close(actual_tap, expected_tap, rtol=0, atol=0)
     finally:
         torch.distributed.destroy_process_group()
+
+
+@pytest.mark.parametrize("case", ["fused", "limit_differs", "kernel_declines"])
+def test_mega_moe_takes_the_shared_expert_once(monkeypatch, caplog, case):
+    """The MoE hands its FP8 shared expert to a kernel that fuses it, once, and
+    keeps it, saying why, when MegaMoE would clamp it with a different SwiGLU
+    limit or the kernel declines it."""
+    metadata = vars(_loader_config())
+    metadata["hidden_size"] = 256
+    metadata["moe_intermediate_size"] = 256
+    config = v41.DeepseekV41Config(text_config=metadata).text_config
+    mapping = _mapping(1, 1, 2)
+    _mock_loader_hardware(monkeypatch, mapping)
+    platform = replace(
+        current_platform(), vendor="nvidia", arch_version=ArchVersion(10, 0)
+    )
+    monkeypatch.setattr(v41, "current_platform", lambda: platform)
+    moe = v41.DeepseekV41MoE(config, mapping, _quant(), 0, "ffn", None)
+    shared = moe.shared_experts
+    assert shared.gate_up_proj.weight.dtype == torch.float8_e4m3fn
+    if case == "limit_differs":
+        shared.act_fn.swiglu_limit = 2 * moe.experts.swiglu_arg.limit
+    calls = []
+
+    def fuse(plan, layer, *tensors):
+        calls.append((layer, tensors))
+        return case == "fused"
+
+    moe.experts.plan["fuse_shared_expert"] = fuse
+    # The mocked loader hardware stubs the routed weight processing.
+    moe.experts._weights_processed = True
+    caplog.set_level(logging.INFO, logger=v4.__name__)
+    moe.process_weights_after_loading(moe)
+    moe.process_weights_after_loading(moe)
+
+    assert moe.shared_expert_fused is (case == "fused")
+    unfused = [
+        r.getMessage() for r in caplog.records if "outside MegaMoE" in r.getMessage()
+    ]
+    if case != "fused":
+        assert len(unfused) == 2
+        assert all(message.startswith("Layer 0 ") for message in unfused)
+        expected = "SwiGLU limit" if case == "limit_differs" else "weight shapes"
+        assert all(expected in message for message in unfused)
+        assert len(calls) == (0 if case == "limit_differs" else 2)
+        return
+    assert unfused == []
+    assert len(calls) == 1
+    layer, tensors = calls[0]
+    assert layer is moe.experts
+    params = (
+        shared.gate_up_proj.weight,
+        shared.gate_up_proj.weight_scale_inv,
+        shared.down_proj.weight,
+        shared.down_proj.weight_scale_inv,
+    )
+    assert all(t.data_ptr() == p.data_ptr() for t, p in zip(tensors, params))

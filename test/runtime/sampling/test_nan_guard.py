@@ -22,10 +22,10 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import torch
 
+from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.nan_guard import NanGuard
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.logits_processor_output import LogitsProcessorOutput
@@ -34,7 +34,11 @@ NAN = float("nan")
 
 
 def _ctx(bs: int, num_extends: int = 0, width: int = 1):
-    return SimpleNamespace(
+    return ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        input_num_tokens=num_extends + (bs - num_extends) * width,
+        forward_mode=ForwardMode.from_num_extends(num_extends, bs),
         bs=bs,
         num_extends=num_extends,
         output_layout=ForwardOutputLayout(

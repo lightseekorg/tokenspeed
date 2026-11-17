@@ -316,6 +316,7 @@ fn group_spec(value: &Value) -> GroupSpec {
         rows_per_page: optional("rows_per_page"),
         entry_stride_tokens: optional("entry_stride_tokens"),
         sliding_window_tokens: optional("sliding_window_tokens"),
+        sink_tokens: optional("sink_tokens").unwrap_or(0),
         replayable: value["replayable"].as_bool().expect("a flag"),
         transfer_policy: value["transfer_policy"].as_str().map(str::to_owned),
         shard_count: int(&value["shard_count"]),
@@ -454,6 +455,7 @@ fn replay(fixture: &Fixture, kind: &str, args: &Value) -> Result<Value, LayoutEr
                 endpoint: "decode".to_owned(),
                 port: 1,
                 session_id: "decode:1".to_owned(),
+                cache_id: "captured-cache".to_owned(),
                 arena_base: 1,
                 layout: fixture.contract(&registration["peer_layout"]).clone(),
                 tp_size: int(&registration["decode_tp_size"]),
@@ -506,7 +508,11 @@ fn replay(fixture: &Fixture, kind: &str, args: &Value) -> Result<Value, LayoutEr
             )
         }
         "registration_from_zmq" => {
-            let info = RegistrationInfo::from_frames(&frames(&args["frames"]))?;
+            // Captured Python peers predate cache identities; retain their
+            // layout/planning oracle while supplying the new protocol field.
+            let mut registration = frames(&args["frames"]);
+            registration.push(Bytes::from_static(b"captured-cache"));
+            let info = RegistrationInfo::from_frames(&registration)?;
             json!({
                 "endpoint": info.endpoint,
                 "dst_port": info.port,
@@ -521,7 +527,7 @@ fn replay(fixture: &Fixture, kind: &str, args: &Value) -> Result<Value, LayoutEr
             let info = Preallocation::from_frames(&frames(&args["frames"]))?;
             json!({
                 "room": info.room,
-                "session_id": info.session_id,
+                "session_id": info.cache_id,
                 "manifest": info.manifest.as_ref().map(manifest_json),
             })
         }

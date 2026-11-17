@@ -21,6 +21,7 @@
 #include "scheduler/operations/prefill_chunk.h"
 
 #include <algorithm>
+#include <numeric>
 
 #include "utils.h"
 
@@ -89,13 +90,36 @@ std::int32_t PrefillChunkTokens(const CacheCoordinator& coordinator, std::int32_
     return ChunkKeepingFinalWindow(plain, unscheduled, window);
 }
 
+std::int32_t YieldingChunkBudget(const CacheCoordinator& coordinator, std::int32_t first_pos, bool resumes_hit,
+                                 std::int32_t unscheduled, std::int32_t token_budget, std::int32_t yield_tokens) {
+    if (yield_tokens <= 0) {
+        return token_budget;
+    }
+    _assert(first_pos >= 0 && unscheduled >= 0 && token_budget >= 0, "prefill positions must be non-negative");
+    const std::int32_t replay = resumes_hit ? coordinator.ReplayTokens(first_pos) : 0;
+    if (static_cast<std::int64_t>(unscheduled) + replay <= token_budget) {
+        return token_budget;
+    }
+    const std::int32_t page = coordinator.PrefixGranularity();
+    const std::int32_t grain = coordinator.CheckpointGranularity();
+    const std::int32_t align = grain > 1 ? std::lcm(page, grain) : page;
+    const std::int64_t reach = static_cast<std::int64_t>(first_pos) + token_budget - replay - yield_tokens;
+    const std::int64_t end = reach > 0 ? reach / align * align : 0;
+    if (end - first_pos < std::max(align, MinPrefillChunkTokens(coordinator))) {
+        return token_budget;
+    }
+    return static_cast<std::int32_t>(end - first_pos + replay);
+}
+
 std::int32_t MinPrefillChunkTokens(const CacheCoordinator& coordinator) {
     // A hit chunk re-feeds up to one replay window and then still needs room
     // to carry the prompt's final window whole, or at least a prefix page of
     // new tokens when the window is smaller than a page.
+    // At most max_scheduled_tokens (SchedulerConfig::ValidateCapacityInputs).
     const std::int32_t window = coordinator.ReplayWindowTokens();
-    return std::max(coordinator.CheckpointGranularity() > 1 ? coordinator.CheckpointGranularity() : 0,
-                    window > 0 ? window + std::max(window, coordinator.PrefixGranularity()) : 0);
+    return std::max(
+        coordinator.CheckpointGranularity() > 1 ? coordinator.CheckpointGranularity() : 0,
+        window > 0 ? CheckedInt32(std::int64_t{window} + std::max(window, coordinator.PrefixGranularity())) : 0);
 }
 
 }  // namespace tokenspeed

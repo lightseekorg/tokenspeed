@@ -140,6 +140,7 @@ def _capture(sources, key_gate, correction, rows):
         recurrent_layout="v_major",
         store_states=False,
         replay_records=records,
+        output_norm=None,
         g_raw=gate.view(-1, DIM),
         **producers,
     )

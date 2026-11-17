@@ -75,7 +75,7 @@ shape only -- 256 experts in 8 groups, group score over the top 2, 4 kept groups
 top-8, a contiguous FP32 ``[rows, 256]`` CUDA tensor with a positive row count and
 a contiguous FP32 ``[256]`` bias on the same device -- and a scale the kernel can
 hold as an FP32 constant; Beam calls the kernel where the guard admits the call on
-NVIDIA SM100 to SM103 and runs the Torch statements otherwise.
+NVIDIA SM90 and newer and runs the Torch statements otherwise.
 """
 
 from __future__ import annotations

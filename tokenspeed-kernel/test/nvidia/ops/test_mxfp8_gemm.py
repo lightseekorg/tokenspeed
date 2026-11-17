@@ -476,6 +476,38 @@ class TestPreparedMxfp8:
         )
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
+    @pytest.mark.parametrize("rows", [1, 129])
+    def test_prepacked_mm_reads_swizzled_activation_scales_as_given(self, rows):
+        from tokenspeed_kernel.ops.quantization.triton import (
+            triton_rmsnorm_fp8_group32_ue8m0,
+        )
+
+        weight = torch.randn(512, 1280, device="cuda").to(torch.float8_e4m3fn)
+        weight_scales = torch.randint(
+            120, 126, (512, 40), device="cuda", dtype=torch.uint8
+        )
+        prepared = prepare_mxfp8_weight_scales(weight, weight_scales)
+        x = torch.randn(rows, 1280, device="cuda", dtype=torch.bfloat16)
+        norm = torch.randn(1280, device="cuda", dtype=torch.bfloat16)
+        _, codes, scales = triton_rmsnorm_fp8_group32_ue8m0(
+            x, norm, 1e-6, scale_layout="canonical"
+        )
+        _, swizzled_codes, swizzled = triton_rmsnorm_fp8_group32_ue8m0(
+            x, norm, 1e-6, scale_layout="swizzled"
+        )
+        arguments = dict(
+            B_scales=prepared,
+            out_dtype=x.dtype,
+            quant="mxfp8",
+            block_size=[1, 32],
+            prepacked_scales=True,
+        )
+        expected = mm(codes, weight, A_scales=scales, **arguments)
+        actual = mm(swizzled_codes, weight, A_scales=swizzled, **arguments)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        with pytest.raises(ValueError, match="F8_128x4"):
+            mm(swizzled_codes, weight, A_scales=swizzled[:-4], **arguments)
+
     @pytest.mark.parametrize("argument", ["alpha", "solution", "override"])
     def test_prepacked_mm_rejects_arguments_it_cannot_honor(self, argument):
         weight = torch.randn(256, 128, device="cuda").to(torch.float8_e4m3fn)
@@ -510,10 +542,12 @@ def test_rmsnorm_group32_quantization_replay(rows, hidden):
 
     x = torch.randn(rows, hidden + 32, device="cuda", dtype=torch.bfloat16)[:, :hidden]
     weight = torch.ones(hidden, device="cuda", dtype=torch.bfloat16)
-    triton_rmsnorm_fp8_group32_ue8m0(x, weight, 1e-6)
+    triton_rmsnorm_fp8_group32_ue8m0(x, weight, 1e-6, scale_layout="canonical")
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        normalized, codes, scales = triton_rmsnorm_fp8_group32_ue8m0(x, weight, 1e-6)
+        normalized, codes, scales = triton_rmsnorm_fp8_group32_ue8m0(
+            x, weight, 1e-6, scale_layout="canonical"
+        )
     for magnitude in [1.0, 1e-8, 0.0]:
         x.normal_().mul_(magnitude)
         graph.replay()
@@ -529,6 +563,73 @@ def test_rmsnorm_group32_quantization_replay(rows, hidden):
             )
 
 
+@pytest.mark.parametrize("rows", [0, 1, 17, 128, 129, 256])
+@pytest.mark.parametrize("hidden", [96, 1280])
+def test_rmsnorm_group32_swizzled_scales(rows, hidden):
+    from tokenspeed_kernel.ops.quantization.triton import (
+        triton_rmsnorm_fp8_group32_ue8m0,
+    )
+
+    torch.manual_seed(0)
+    x = torch.randn(rows, hidden + 32, device="cuda", dtype=torch.bfloat16)[:, :hidden]
+    if rows:
+        x[0] = 0.0
+        x[-1, 32:64] = 1e-7
+    weight = torch.randn(hidden, device="cuda", dtype=torch.bfloat16)
+    normalized, codes, scales = triton_rmsnorm_fp8_group32_ue8m0(
+        x, weight, 1e-6, scale_layout="canonical"
+    )
+    # Leave stale bytes for the swizzled scales to land on (several blocks, as
+    # the outputs allocated before them may take the same size): the kernel
+    # must write every padding byte itself.
+    count = -(-rows // 128) * 128 * -(-hidden // 128) * 4
+    stale = [
+        torch.full((count,), 0xFF, device="cuda", dtype=torch.uint8) for _ in range(4)
+    ]
+    del stale
+    actual = triton_rmsnorm_fp8_group32_ue8m0(x, weight, 1e-6, scale_layout="swizzled")
+    for got, expected in zip(actual[:2], (normalized, codes)):
+        assert torch.equal(got.view(torch.uint8), expected.view(torch.uint8))
+    assert torch.equal(actual[2], swizzle_mxfp8_scale(scales, rows, hidden))
+    # The same codes and scales the prepacked GEMM's BF16 path quantizes into.
+    prepacked_codes, prepacked_scales = _quantize_fp8_group32_swizzled(normalized)
+    assert torch.equal(actual[1].view(torch.uint8), prepacked_codes.view(torch.uint8))
+    assert torch.equal(actual[2], prepacked_scales)
+
+
+@pytest.mark.parametrize("rows", [0, 1, 17, 128, 129, 256])
+@pytest.mark.parametrize("hidden", [128, 1280, 5120])
+def test_rmsnorm_group32_packed_scales(rows, hidden):
+    """Packed words carry the canonical bytes in DeepGEMM's MN-major layout."""
+    from tokenspeed_kernel.ops.quantization.triton import (
+        triton_rmsnorm_fp8_group32_ue8m0,
+    )
+
+    torch.manual_seed(0)
+    x = torch.randn(rows, hidden + 32, device="cuda", dtype=torch.bfloat16)[:, :hidden]
+    if rows:
+        x[0] = 0.0
+        x[-1, 32:64] = 1e-7
+    weight = torch.randn(hidden, device="cuda", dtype=torch.bfloat16)
+    normalized, codes, canonical = triton_rmsnorm_fp8_group32_ue8m0(
+        x, weight, 1e-6, scale_layout="canonical"
+    )
+    actual = triton_rmsnorm_fp8_group32_ue8m0(x, weight, 1e-6, scale_layout="packed")
+    for got, expected in zip(actual[:2], (normalized, codes)):
+        assert torch.equal(got.view(torch.uint8), expected.view(torch.uint8))
+    words = actual[2]
+    assert words.dtype == torch.int32
+    assert words.shape == (rows, hidden // 128)
+    # MN-major: the row stride is one and each column starts 16-byte aligned.
+    assert words.stride() == (1, -(-rows // 4) * 4)
+    # Four canonical bytes little-endian per word, groups ascending.
+    shifts = torch.arange(4, device=canonical.device, dtype=torch.int32) * 8
+    expected = (
+        canonical.to(torch.int32).reshape(rows, hidden // 128, 4) << shifts
+    ).sum(-1)
+    assert torch.equal(words.contiguous(), expected)
+
+
 def test_rmsnorm_group32_quantization_dynamic_rows():
     from tokenspeed_kernel.ops.quantization.triton import (
         _rmsnorm_fp8_group32_ue8m0,
@@ -536,12 +637,17 @@ def test_rmsnorm_group32_quantization_dynamic_rows():
     )
     from utils import assert_no_triton_compile
 
-    x = torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(256, 128, device="cuda", dtype=torch.bfloat16)
     weight = torch.ones(128, device="cuda", dtype=torch.bfloat16)
-    triton_rmsnorm_fp8_group32_ue8m0(x[:17], weight, 1e-6)
+    layouts = ("canonical", "swizzled", "packed")
+    for layout in layouts:
+        triton_rmsnorm_fp8_group32_ue8m0(x[:17], weight, 1e-6, scale_layout=layout)
     with assert_no_triton_compile(_rmsnorm_fp8_group32_ue8m0):
-        for rows in (1, 16, 33, 64):
-            triton_rmsnorm_fp8_group32_ue8m0(x[::2][:rows], weight, 1e-6)
+        for layout in layouts:
+            for rows in (1, 16, 33, 64, 128, 129):
+                triton_rmsnorm_fp8_group32_ue8m0(
+                    x[::2][:rows], weight, 1e-6, scale_layout=layout
+                )
 
 
 def test_group32_infinite_amax_keeps_finite_codes_zero():

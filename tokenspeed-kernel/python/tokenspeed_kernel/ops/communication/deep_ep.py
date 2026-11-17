@@ -20,7 +20,6 @@
 
 from __future__ import annotations
 
-import importlib.util
 import logging
 import os
 from enum import Enum, IntEnum, auto
@@ -28,6 +27,7 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel._optional import has_optional_package
 from tokenspeed_kernel.ops.communication.fabric import fabric_allocation_supported
 from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import current_platform
@@ -97,7 +97,7 @@ class _MissingBuffer(metaclass=_MissingBufferMeta):
         _raise_deepep_unavailable()
 
 
-if current_platform().is_nvidia and importlib.util.find_spec("deep_ep") is not None:
+if current_platform().is_nvidia and has_optional_package("deep_ep"):
     from deep_ep import Buffer
 else:
     Buffer = _MissingBuffer

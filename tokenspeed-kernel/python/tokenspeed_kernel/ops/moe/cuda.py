@@ -4,9 +4,15 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, pdl_enabled
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+    pdl_enabled,
+)
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from tokenspeed_kernel.thirdparty.cuda import kimi3_latent_front
 from tokenspeed_kernel.thirdparty.cuda.kimi3_router import sigmoid_bias_topk
 from tokenspeed_kernel.thirdparty.cuda.moe import moe_finalize_fuse_shared
 from tokenspeed_kernel.thirdparty.cuda.routing import (
@@ -106,8 +112,7 @@ if routing_available():
     name="cuda_kimi3_sigmoid_bias_topk",
     solution="cuda",
     capability=CapabilityRequirement(
-        min_arch_version=ArchVersion(10, 0),
-        max_arch_version=ArchVersion(10, 3),
+        min_arch_version=ArchVersion(9, 0),
         vendors=frozenset({"nvidia"}),
     ),
     signatures=frozenset(
@@ -157,3 +162,113 @@ __all__ = [
     "cuda_kimi3_sigmoid_bias_topk",
     "moe_finalize_fuse_shared",
 ]
+
+_FRONT_PLATFORM = current_platform()
+if _FRONT_PLATFORM.is_nvidia and kimi3_latent_front.available():
+
+    @register_kernel(
+        "moe",
+        "latent_input",
+        name="cuda_latent_input",
+        solution="cuda",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 3),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    hidden_states=dense_tensor_format(torch.bfloat16),
+                    router_weight=dense_tensor_format(torch.bfloat16),
+                    routed_weight=dense_tensor_format(torch.bfloat16),
+                    shared_gate_up_weight=dense_tensor_format(torch.bfloat16),
+                )
+            }
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            # The fused front pays off from 2048 rows; smaller batches keep the separate
+            # projections (see ops/moe/README.md, "Kimi-K3 front projections"). There is
+            # no upper bound: the plan scales with the row count.
+            "tokens_min": frozenset({2048}),
+            "gate_clamp": frozenset({4.0}),
+            "hidden_size": frozenset({kimi3_latent_front.HIDDEN}),
+            "inputs_contiguous": frozenset({True}),
+            "latent_size": frozenset({kimi3_latent_front.LATENT}),
+            "num_experts": frozenset({kimi3_latent_front.NUM_EXPERTS}),
+            "shared_size": frozenset({kimi3_latent_front.SHARED_INTERMEDIATE}),
+            "up_clamp": frozenset({25.0}),
+        },
+    )
+    def cuda_latent_input(
+        hidden_states: torch.Tensor,
+        router_weight: torch.Tensor,
+        routed_weight: torch.Tensor,
+        shared_gate_up_weight: torch.Tensor,
+        *,
+        gate_clamp: float,
+        up_clamp: float | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Fused Kimi-K3 router / latent / shared-input projections; see kimi3_latent_front."""
+        if gate_clamp != 4.0 or up_clamp != 25.0:
+            raise ValueError("the Kimi-K3 CUDA front requires SiTU clamps 4 and 25")
+        rows = hidden_states.shape[0]
+        logits = torch.empty(
+            (rows, router_weight.shape[0]),
+            device=hidden_states.device,
+            dtype=torch.float32,
+        )
+        latent = hidden_states.new_empty((rows, routed_weight.shape[0]))
+        shared_act = hidden_states.new_empty(
+            (rows, shared_gate_up_weight.shape[0] // 2)
+        )
+        return kimi3_latent_front.front(
+            hidden_states,
+            router_weight,
+            routed_weight,
+            shared_gate_up_weight,
+            logits,
+            latent,
+            shared_act,
+        )
+
+    __all__.append("cuda_latent_input")
+
+
+@register_kernel(
+    "moe",
+    "router_gemm_nvfp4",
+    name="cuda_router_gemm_nvfp4",
+    solution="cuda",
+    capability=CapabilityRequirement(
+        vendors=frozenset({"nvidia"}),
+        min_arch_version=ArchVersion(10, 7),
+        max_arch_version=ArchVersion(10, 7),
+    ),
+    signatures=frozenset(
+        {
+            format_signature(
+                hidden_states=dense_tensor_format(torch.bfloat16),
+                router_weight=dense_tensor_format(torch.bfloat16),
+            )
+        }
+    ),
+    traits={
+        # Admission follows the measured producer; the CUDA tile also supports
+        # other model dimensions without specializing on runtime row counts.
+        "tokens": frozenset({1, 4}),
+        "hidden_size": frozenset({2560}),
+        "num_experts": frozenset({512}),
+        "inputs_contiguous": frozenset({True}),
+        "inputs_aligned_16": frozenset({True}),
+        "pdl_enabled": frozenset({True}),
+    },
+    priority=Priority.SPECIALIZED,
+)
+def cuda_router_gemm_nvfp4(hidden_states, router_weight, quant_scale):
+    if not pdl_enabled():
+        raise ValueError("router GEMM NVFP4 requires PDL")
+    from tokenspeed_kernel.thirdparty.cuda.router_gemm_nvfp4 import router_gemm_nvfp4
+
+    return router_gemm_nvfp4(hidden_states, router_weight, quant_scale)

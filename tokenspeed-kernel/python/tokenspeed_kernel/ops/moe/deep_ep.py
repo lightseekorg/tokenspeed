@@ -20,12 +20,12 @@
 
 from __future__ import annotations
 
-import importlib.util
 import logging
 from collections.abc import Callable
 from types import SimpleNamespace
 
 import torch
+from tokenspeed_kernel._optional import has_optional_package
 from tokenspeed_kernel.ops.communication.deep_ep import DeepEPDispatcher, DeepEPMode
 from tokenspeed_kernel.ops.moe.marlin import (
     MXFP4_BLOCK,
@@ -77,11 +77,11 @@ logger = logging.getLogger(__name__)
 
 _warned_about_requantization = False
 
-if (
-    platform.is_hopper_plus
-    and importlib.util.find_spec("deep_ep") is not None
-    and importlib.util.find_spec("deep_gemm") is not None
-):
+_HAS_DEEP_EP_GEMM = platform.is_hopper_plus and has_optional_package(
+    "deep_ep", "deep_gemm"
+)
+
+if _HAS_DEEP_EP_GEMM:
     prepare_cuda_toolkit_env()
     from deep_gemm import (
         get_mn_major_tma_aligned_tensor,
@@ -93,11 +93,7 @@ if (
     )
 
 
-if (
-    platform.is_hopper_plus
-    and importlib.util.find_spec("deep_ep") is not None
-    and importlib.util.find_spec("deep_gemm") is not None
-):
+if _HAS_DEEP_EP_GEMM:
     from tokenspeed_kernel.ops.activation.triton import (
         fused_swiglu_fp8_ue8m0,
         fused_swiglu_fp8_ue8m0_masked_packed,
@@ -848,7 +844,7 @@ def marlin_mxfp4_deepep_moe_apply(
 
 
 # These kernels need both DeepEP buffers and FlashInfer quantizers.
-if platform.is_nvidia and importlib.util.find_spec("deep_ep") is not None:
+if platform.is_nvidia and has_optional_package("deep_ep"):
     from flashinfer import (
         scaled_fp4_grouped_quantize,
         silu_and_mul_scaled_nvfp4_experts_quantize,

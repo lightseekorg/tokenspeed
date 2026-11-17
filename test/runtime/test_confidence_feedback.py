@@ -39,7 +39,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA feed
 
 
 def _owners(width, *, budget_policy):
-    states = RuntimeStates(8, 16, width, device="cuda")
+    states = RuntimeStates(8, 16, 16, width, device="cuda")
     states.init_draft_confidence(width - 1)
     feedback = ConfidenceFeedback(width, 4, 4, budget_policy=budget_policy)
     for queries in range(1, width + 1):
@@ -181,9 +181,9 @@ def test_restored_device_generation_rebases_a_new_host_owner():
     _round(states, feedback, "restored", 1, [0.1, 0.1], prefill=True, accepted=0)
     _round(states, feedback, "restored", 1, [0.1, 0.1], prefill=False, accepted=1)
     image = torch.empty(states.slot_state_bytes(), dtype=torch.uint8, device="cuda")
-    states.export_slot_state(1, image, None, request_id="restored")
+    states.export_slot_state(1, image, None, admission_id=1)
     _round(states, feedback, "replacement", 1, [0.9, 0.9], prefill=True, accepted=0)
-    states.import_slot_state(2, image, None, request_id="restored")
+    states.import_slot_state(2, image, None, admission_id=1)
     for _ in range(2):
         _round(states, feedback, "restored", 2, [0.1, 0.1], prefill=False, accepted=1)
     feedback.prepare(["restored"], [2], ForwardOutputLayout(0, 0, 1, 3))

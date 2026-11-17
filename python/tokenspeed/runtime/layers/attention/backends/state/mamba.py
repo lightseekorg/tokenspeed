@@ -51,12 +51,18 @@ from tokenspeed_kernel.ops.attention.gdn.triton import (
     set_total_chunks_hint,
     set_total_chunks_hint_uniform,
 )
+from tokenspeed_kernel.ops.attention.kda import (
+    KdaOutputNorm,
+    apply_kda_output_norm,
+)
 from tokenspeed_kernel.ops.attention.kda.triton import (
     commit_state_pages,
-    verify_state_blocks,
+    verify_state_groups,
 )
 from tokenspeed_kernel.ops.conv import (
+    PREFILL_QKV_CHANNEL_MULTIPLE,
     causal_conv1d_fn,
+    causal_conv1d_qkv_fn,
     causal_conv1d_update,
 )
 from tokenspeed_kernel.ops.kvcache.triton import (
@@ -208,7 +214,8 @@ class MambaForwardMetadata:
     # chunked scan's plan for them (its interval, buffer and the buffer row of
     # each checkpoint); None when the forward writes none. A MIXED forward
     # that runs its decode rows apart writes them through its extend rows'
-    # metadata alone (_prepare_mixed_verify_metadata).
+    # metadata alone (_prepare_mixed_verify_metadata). Capacity metadata may
+    # instead keep fixed slots here (``CapacityPrefillMetadata``).
     state_checkpoints: InForwardStateCheckpoints | None = None
     scan_state_checkpoints: GdnStateCheckpoints | None = None
     scan_checkpoint_rows: torch.Tensor | None = None
@@ -223,6 +230,18 @@ class MambaForwardMetadata:
     def scrub_padding(self, *tensors: torch.Tensor | None) -> None:
         """Zero the padded tail rows of token-shaped inputs in place."""
         scrub_padding_tail(self.prefill_token_extent, *tensors)
+
+
+def _prefill_conv_writes_qkv(key_split_dim: int, value_split_dim: int) -> bool:
+    """Whether the prefill convolution writes q, k and v rows itself (AMD).
+
+    The direct write skips the q/k/v split pass and leaves the same values.
+    """
+    return (
+        current_platform().is_amd
+        and key_split_dim % PREFILL_QKV_CHANNEL_MULTIPLE == 0
+        and value_split_dim % PREFILL_QKV_CHANNEL_MULTIPLE == 0
+    )
 
 
 @dataclass
@@ -487,6 +506,7 @@ class MambaAttnBackend(AttentionBackend):
     def _verify_state_blocks(
         self,
         bs: int,
+        padded_bs: int,
         block_tables: Mapping[str, torch.Tensor],
         *,
         pages_out: Mapping[str, torch.Tensor],
@@ -497,21 +517,29 @@ class MambaAttnBackend(AttentionBackend):
         Verify reads the committed state from the input slot (slot 0 when it
         holds a block, else the live slot 1); speculative outputs stay out of
         the state slab, and the accepted state is committed back to slot 1 by
-        ``commit_state_after_acceptance``. Writes each group's in
-        pages into ``pages_out[group][:bs]`` and returns the per-group tables
-        (kept for the commit's page resolve).
+        ``commit_state_after_acceptance``. Writes each group's in pages into
+        ``pages_out[group][:bs]`` and ``pad_slot_id`` into rows
+        ``[bs, padded_bs)``, in one launch for up to four groups on CUDA, and
+        returns the per-group tables (kept for the commit's page resolve).
         """
-        tables: dict[str, torch.Tensor] = {}
-        for group_id in self._state_groups():
-            rows = self._state_rows(block_tables, group_id)
-            verify_state_blocks(
-                rows,
-                batch_size=bs,
-                pages_out=pages_out[group_id],
-                live_pages_out=(
-                    None if live_pages_out is None else live_pages_out[group_id]
-                ),
-            )
+        groups = self._state_groups()
+        tables = {
+            group_id: self._state_rows(block_tables, group_id) for group_id in groups
+        }
+        verify_state_groups(
+            [tables[group_id] for group_id in groups],
+            batch_size=bs,
+            padded_batch_size=padded_bs,
+            pages_out=[pages_out[group_id] for group_id in groups],
+            live_pages_out=(
+                None
+                if live_pages_out is None
+                else [live_pages_out[group_id] for group_id in groups]
+            ),
+            pad_page=self.pad_slot_id,
+        )
+        for group_id in groups:
+            rows = tables[group_id]
             commit_rows = self._verify_commit_tables[group_id]
             commit_rows[bs:].zero_()
             commit_rows[:bs].copy_(rows[:bs, :STATE_TABLE_SLOTS])
@@ -635,6 +663,7 @@ class MambaAttnBackend(AttentionBackend):
         ssm_element_st = []
         conv_bytes: int | None = None
         ssm_bytes: int | None = None
+        ssm_rows_aligned = True
 
         for layer_id in layer_ids:
             conv, ssm = self._state_components(layer_id)
@@ -652,6 +681,10 @@ class MambaAttnBackend(AttentionBackend):
             ssm_src.append(ssm.data_ptr())
             ssm_src_st.append(row_stride_i32(ssm))
             ssm_element_st.append(ssm.stride(0))
+            ssm_rows_aligned &= (
+                ssm.data_ptr() % 16 == 0
+                and ssm.stride(0) * ssm.element_size() % 16 == 0
+            )
             if not self.replay_ssm:
                 ssm_dst.append(ssm_scratch.data_ptr())
                 ssm_dst_st.append(row_stride_i32(ssm_scratch))
@@ -675,6 +708,7 @@ class MambaAttnBackend(AttentionBackend):
             "ssm_element_stride": _i64(ssm_element_st),
             "ssm_scratch_stride": None if self.replay_ssm else _i64(ssm_dst_st),
             "ssm_bytes": ssm_bytes,
+            "ssm_rows_aligned": ssm_rows_aligned,
             "group_sel": _i64(group_sel),
             "num_layers": len(layer_ids),
         }
@@ -814,7 +848,12 @@ class MambaAttnBackend(AttentionBackend):
         Families with another recurrence replace the kernel; the payload,
         tables and page resolution stay shared.
         """
-        gdn_replay_commit(payload, parameters, **tables)
+        gdn_replay_commit(
+            payload,
+            parameters,
+            rows_aligned=self._verify_copy_tables_get()["ssm_rows_aligned"],
+            **tables,
+        )
 
     def tree_support(self) -> TreeSupport:
         return TreeSupport(
@@ -1455,6 +1494,7 @@ class MambaAttnBackend(AttentionBackend):
                 # The commit runs before the next refresh, so it may read the captured pages.
                 verify_tables = self._verify_state_blocks(
                     real_bs,
+                    bs,
                     block_tables,
                     pages_out=state_in_blocks_by_group,
                     live_pages_out=state_out_blocks_by_group,
@@ -1467,12 +1507,9 @@ class MambaAttnBackend(AttentionBackend):
                 self._prepare_verify_records(real_bs, seq_lens, draft_token_num)
             else:
                 self._verify_commit_ctx = None
-            for group_id in self._state_groups():
-                if real_bs < bs:
-                    state_in_blocks_by_group[group_id][real_bs:].fill_(self.pad_slot_id)
-                    state_out_blocks_by_group[group_id][real_bs:].fill_(
-                        self.pad_slot_id
-                    )
+                for group_id in self._state_groups():
+                    state_in_blocks_by_group[group_id].fill_(self.pad_slot_id)
+                    state_out_blocks_by_group[group_id].fill_(self.pad_slot_id)
         elif self.state_paging_active:
             # The state block resolve runs once per state group over the real
             # rows. Padded rows get pad_slot_id (-1), which state kernels skip,
@@ -1558,10 +1595,14 @@ class MambaAttnBackend(AttentionBackend):
 
     # ---- Forward ----
 
-    def _layer_state(
+    def layer_state(
         self, layer_id: int
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Resolve one recurrent layer's page indices and component views."""
+        """One recurrent layer's ``(state_in, state_out, conv, ssm)``.
+
+        ``state_in`` / ``state_out`` are the batch rows' input and output state
+        pages (-1 for padding rows); ``conv`` / ``ssm`` the layer's state pools.
+        """
         metadata = self.forward_metadata
         state_in_by_group = metadata.state_in_blocks_by_group
         group_id = self._state_group_for(layer_id)
@@ -1576,6 +1617,43 @@ class MambaAttnBackend(AttentionBackend):
             metadata.state_out_blocks_by_group[group_id],
             conv_states,
             ssm_states,
+        )
+
+    def fused_verify_operands(
+        self, layer_id: int, a_log: torch.Tensor, dt_bias: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """What a fused kernel needs to run one recurrent layer's target
+        verify itself, in place of :meth:`forward_extend`.
+
+        Returns ``(conv scratch [rows, *conv], scratch rows [bs * T] int32,
+        replay payload [bs * T, width])``: token ``t`` of request ``r`` writes
+        its conv window to scratch row ``r * (T + 1) + 1 + t`` and its
+        ``[k | v | a | b]`` to payload row ``r * T + t``, as the regular verify
+        does; the post-verify commit then reads them. It also stores the
+        layer's replay parameters on first use, as the regular verify does.
+
+        Raises:
+            RuntimeError: Not a target verify with ReplaySSM.
+        """
+        metadata = self.forward_metadata
+        replay = self._gdn_replay
+        if (
+            metadata.mamba_output_indices is None
+            or not self.replay_ssm
+            or replay is None
+        ):
+            raise RuntimeError("a fused verify needs a target verify with ReplaySSM")
+        slot = replay.layer_ids.index(layer_id)
+        if layer_id not in replay.initialized_layers:
+            # Model-static; copied once during warmup, before graph capture.
+            replay.parameters[slot, 0].copy_(a_log)
+            replay.parameters[slot, 1].copy_(dt_bias)
+            replay.initialized_layers.add(layer_id)
+        grid = metadata.mamba_output_indices
+        return (
+            self._verify_scratch[layer_id][0],
+            grid.reshape(-1),
+            replay.payload[slot, : grid.numel()],
         )
 
     def forward_decode(
@@ -1631,10 +1709,11 @@ class MambaAttnBackend(AttentionBackend):
         dt_bias = kwargs["dt_bias"]
         D = kwargs.get("D")
         layer_id = kwargs["layer_id"]
+        output_norm = kwargs.get("output_norm")
 
         # Read the page holding position n-1 and write the page holding
         # position n. Padding rows use -1 and are skipped by both kernels.
-        state_in_blocks, state_out_blocks, conv_states, ssm_states = self._layer_state(
+        state_in_blocks, state_out_blocks, conv_states, ssm_states = self.layer_state(
             layer_id
         )
         read_indices = state_in_blocks
@@ -1657,7 +1736,7 @@ class MambaAttnBackend(AttentionBackend):
             lower_bound=gate_lower_bound,
         )
         if fused_out is not None:
-            return fused_out
+            return apply_kda_output_norm(fused_out, output_norm)
 
         # Stride-aware decoders consume packed projection views directly.
         # Otherwise a family whose model hands over projection views makes them
@@ -1694,7 +1773,7 @@ class MambaAttnBackend(AttentionBackend):
         key = key.view(seq_len, 1, num_heads, head_k_dim)
         value = value.view(seq_len, 1, value.shape[1] // head_v_dim, head_v_dim)
 
-        return self._decode_scan(
+        core_attn_out = self._decode_scan(
             query,
             key,
             value,
@@ -1712,6 +1791,7 @@ class MambaAttnBackend(AttentionBackend):
             beta_raw=beta_raw,
             lower_bound=gate_lower_bound,
         )
+        return apply_kda_output_norm(core_attn_out, output_norm)
 
     def _decode(
         self,
@@ -1873,6 +1953,8 @@ class MambaAttnBackend(AttentionBackend):
                     value = inputs.get(name)
                     if value is not None:
                         inputs[name] = value[begin:end]
+                if inputs.get("output_norm") is not None:
+                    inputs["output_norm"] = inputs["output_norm"].rows(begin, end)
                 self.forward_metadata = part_metadata
                 output = self.forward_extend(
                     q,
@@ -1936,6 +2018,7 @@ class MambaAttnBackend(AttentionBackend):
         layer_id = kwargs["layer_id"]
         seq_len = kwargs["seq_len"]
         verify_queries = kwargs.get("verify_queries")
+        output_norm = kwargs.get("output_norm")
 
         is_target_verify = (
             forward_mode.is_decode_or_idle() and self.deferred_state_commit
@@ -1945,11 +2028,12 @@ class MambaAttnBackend(AttentionBackend):
 
         conv_replay = None
         conv_rows = None
+        conv_qkv = None
         if is_target_verify:
             draft_token_num = self.speculative_num_draft_tokens
             batch_size = bs if verify_queries is None else verify_queries.batch_size
             output_indices = self.forward_metadata.mamba_output_indices
-            state_in_blocks, _, conv_comp, ssm_comp = self._layer_state(layer_id)
+            state_in_blocks, _, conv_comp, ssm_comp = self.layer_state(layer_id)
             conv_scratch, ssm_scratch = self._verify_scratch[layer_id]
             fused_out = self._verify(
                 mixed_qkv,
@@ -1974,6 +2058,7 @@ class MambaAttnBackend(AttentionBackend):
                 attn_tp_size=attn_tp_size,
                 head_v_dim=head_v_dim,
                 lower_bound=gate_lower_bound,
+                output_norm=output_norm,
             )
             if fused_out is not None:
                 return fused_out
@@ -2032,7 +2117,7 @@ class MambaAttnBackend(AttentionBackend):
             )
         else:
             state_in_blocks, state_out_blocks, conv_states, ssm_states = (
-                self._layer_state(layer_id)
+                self.layer_state(layer_id)
             )
             recurrent_state, has_initial_states = _prepare_cache_prefill_state_inputs(
                 conv_states,
@@ -2055,32 +2140,56 @@ class MambaAttnBackend(AttentionBackend):
             checkpoints = self.forward_metadata.state_checkpoints
             if checkpoints is not None:
                 # The conv state at a checkpoint is the window of the
-                # conv's inputs just before it (oldest first).
+                # conv's inputs just before it (oldest first). The masked
+                # writer skips the -1 blocks of capacity metadata's unused
+                # checkpoint slots.
                 window = conv_states.shape[-1]
                 rows = checkpoints.token_index.unsqueeze(1) + torch.arange(
                     -window, 0, device=checkpoints.token_index.device
                 )
-                conv_states[
-                    checkpoints.blocks_by_group[self._state_group_for(layer_id)].long()
-                ] = (mixed_qkv[rows].transpose(1, 2).to(conv_states.dtype))
+                store_state_rows(
+                    mixed_qkv[rows].transpose(1, 2).unsqueeze(1),
+                    conv_states.unsqueeze(1),
+                    checkpoints.blocks_by_group[self._state_group_for(layer_id)],
+                )
 
             mixed_qkv_t = mixed_qkv.transpose(0, 1)
-            mixed_qkv = causal_conv1d_fn(
-                mixed_qkv_t,
-                conv_weights,
-                bias,
-                activation=activation,
-                conv_states=conv_states,
-                has_initial_state=has_initial_states,
-                cache_indices=conv_cache_indices,
-                query_start_loc=query_start_loc,
-                prefill_metadata=self.forward_metadata.conv_prefill_metadata,
-            ).transpose(0, 1)[:seq_len]
-            if extend_seq_lens_cpu is not None:
-                # The convolution allocates its output uninitialized and gives
-                # the padded rows no work, so the rows a capacity scan reads
-                # past the live tokens are zeroed again here.
-                self.forward_metadata.scrub_padding(mixed_qkv)
+            if _prefill_conv_writes_qkv(
+                key_dim // attn_tp_size, value_dim // attn_tp_size
+            ):
+                # The convolution writes q, k and v rows directly; no split pass.
+                conv_qkv = tuple(
+                    rows[:seq_len]
+                    for rows in causal_conv1d_qkv_fn(
+                        mixed_qkv_t,
+                        conv_weights,
+                        bias,
+                        activation=activation,
+                        conv_states=conv_states,
+                        has_initial_state=has_initial_states,
+                        cache_indices=conv_cache_indices,
+                        query_start_loc=query_start_loc,
+                        prefill_metadata=self.forward_metadata.conv_prefill_metadata,
+                        key_dim=key_dim // attn_tp_size,
+                    )
+                )
+                if extend_seq_lens_cpu is not None:
+                    self.forward_metadata.scrub_padding(*conv_qkv)
+            else:
+                mixed_qkv = causal_conv1d_fn(
+                    mixed_qkv_t,
+                    conv_weights,
+                    bias,
+                    activation=activation,
+                    conv_states=conv_states,
+                    has_initial_state=has_initial_states,
+                    cache_indices=conv_cache_indices,
+                    query_start_loc=query_start_loc,
+                    prefill_metadata=self.forward_metadata.conv_prefill_metadata,
+                ).transpose(0, 1)[:seq_len]
+                if extend_seq_lens_cpu is not None:
+                    # The conv leaves padding rows unset; a capacity scan reads them.
+                    self.forward_metadata.scrub_padding(mixed_qkv)
 
         key_split_dim = key_dim // attn_tp_size
         value_split_dim = value_dim // attn_tp_size
@@ -2107,9 +2216,16 @@ class MambaAttnBackend(AttentionBackend):
             and self._tree_node_states is None
         ):
             scan_replay, replay_inputs = replay_inputs[0], None
+        if conv_qkv is not None:
+            query, key, value = (
+                rows.view(1, seq_len, -1, head_dim)
+                for rows, head_dim in zip(
+                    conv_qkv, (head_k_dim, head_k_dim, head_v_dim)
+                )
+            )
         # Scans supporting strided QKV consume views of the convolution output.
         # Replay payloads still need the split kernel to save recovery inputs.
-        if (
+        elif (
             (
                 is_target_verify
                 and (
@@ -2208,7 +2324,7 @@ class MambaAttnBackend(AttentionBackend):
             )
             # The final state goes to the live slot. Capacity metadata pads the
             # request dimension with -1 blocks whose dummy scan result the
-            # masked writer drops.
+            # masked writer drops; it skips unused checkpoint slots alike.
             store_state_rows(last_recurrent_state, ssm_states, state_out_blocks)
             if metadata.state_checkpoints is not None:
                 store_state_rows(
@@ -2227,7 +2343,7 @@ class MambaAttnBackend(AttentionBackend):
                     core_attn_out[0] if core_attn_out.ndim == 4 else core_attn_out
                 )
 
-        return core_attn_out
+        return apply_kda_output_norm(core_attn_out, output_norm)
 
     def _replay_inputs(
         self,
@@ -2279,6 +2395,7 @@ class MambaAttnBackend(AttentionBackend):
         attn_tp_size: int,
         head_v_dim: int,
         lower_bound: float | None,
+        output_norm: KdaOutputNorm | None,
     ) -> torch.Tensor | None:
         """Whole-round verify attempt; ``None`` falls through to the shared flow.
 
@@ -2313,6 +2430,8 @@ class MambaAttnBackend(AttentionBackend):
             attn_tp_size: Attention tensor-parallel size.
             head_v_dim: Value head dimension.
             lower_bound: KDA decay clamp.
+            output_norm: KDA's gated output norm, applied to the returned
+                output; None returns the attention output.
 
         Returns:
             The layer output when a fused kernel ran, else None.

@@ -658,6 +658,7 @@ class TestDeepseekV4Config:
             config=SimpleNamespace(num_experts_per_tok=2, norm_topk_prob=True),
             n_shared_experts=1,
             shared_experts=shared_experts,
+            shared_expert_fused=False,
             stream_fork=StreamFork(None),
             routed_scaling_factor=1.0,
             experts=routed_experts,
@@ -788,6 +789,8 @@ class TestDeepseekV4Config:
 
         class FakeBackend:
             draft_block_decode = False
+            # The runner asks a draft side whether it takes a query shard.
+            query_sharded = False
             cache_consumer_attn_kinds = frozenset({"full_history", "sliding_window"})
 
             def refresh_decode_metadata(self, *args, **kwargs):
@@ -823,6 +826,8 @@ class TestDeepseekV4Config:
 
         class FakeBackend:
             draft_block_decode = False
+            # The runner asks a draft side whether it takes a query shard.
+            query_sharded = False
 
             def __init__(self, key):
                 self.key = key
@@ -869,6 +874,8 @@ class TestDeepseekV4Config:
 
         class FakeBackend:
             draft_block_decode = False
+            # The runner asks a draft side whether it takes a query shard.
+            query_sharded = False
             cache_consumer_attn_kinds = frozenset({"full_history", "sliding_window"})
 
             def __init__(self, key):
@@ -922,6 +929,8 @@ class TestDeepseekV4Config:
 
         class FakeBackend:
             draft_block_decode = False
+            # The runner asks a draft side whether it takes a query shard.
+            query_sharded = False
             cache_consumer_attn_kinds = frozenset({"full_history", "sliding_window"})
 
             def __init__(self, key):
@@ -974,6 +983,8 @@ class TestDeepseekV4Config:
 
         class FakeBackend:
             draft_block_decode = False
+            # The runner asks a draft side whether it takes a query shard.
+            query_sharded = False
             cache_consumer_attn_kinds = frozenset({"full_history", "sliding_window"})
 
             def __init__(self, key):

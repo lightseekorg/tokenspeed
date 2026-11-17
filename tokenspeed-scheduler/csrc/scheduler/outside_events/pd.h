@@ -32,9 +32,18 @@ struct BootstrappedEvent {
     explicit BootstrappedEvent(std::string id) : request_id(std::move(id)) {}
 };
 
+// The transfer failed. It may still be stopping: the pages return with
+// TransferStoppedEvent.
 struct FailedEvent {
     std::string request_id;
     explicit FailedEvent(std::string id) : request_id(std::move(id)) {}
+};
+
+// A transfer that failed or was cancelled stopped: no reader or writer on
+// any rank touches the request's pages any more.
+struct TransferStoppedEvent {
+    std::string request_id;
+    explicit TransferStoppedEvent(std::string id) : request_id(std::move(id)) {}
 };
 
 struct SucceededEvent {
@@ -51,6 +60,7 @@ struct RemotePrefillDoneEvent {
 
 }  // namespace pd
 
-using PDEvent = std::variant<pd::BootstrappedEvent, pd::FailedEvent, pd::SucceededEvent, pd::RemotePrefillDoneEvent>;
+using PDEvent = std::variant<pd::BootstrappedEvent, pd::FailedEvent, pd::TransferStoppedEvent, pd::SucceededEvent,
+                             pd::RemotePrefillDoneEvent>;
 
 }  // namespace tokenspeed

@@ -17,27 +17,26 @@
 
 """Architecture-selected FlashAttention kernels for relative MHA."""
 
-import importlib.util
 import math
 
 import torch
+from tokenspeed_kernel._optional import has_fa4_cute
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
     current_platform,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.signature import (
+    dense_tensor_format,
+    format_signature,
+    format_signatures,
+    tensor_format,
+)
 
 platform = current_platform()
 
-if (
-    platform.is_nvidia
-    and platform.is_blackwell
-    and importlib.util.find_spec("flash_attn") is not None
-    and importlib.util.find_spec("quack") is not None
-    and importlib.util.find_spec("flash_attn.cute") is not None
-):
+if platform.is_nvidia and platform.is_blackwell and has_fa4_cute():
     from flash_attn.cute import flash_attn_varlen_func
 
     # Relative-attention kernels support both SM100 and SM103.
@@ -126,6 +125,20 @@ if (
         {torch.float8_e4m3fn},
         scale=_MXFP8_KV_BLOCK_SCALE,
     )
+    # A BF16 query over an MXFP8 K/V cache.
+    _MXFP8_KV_ATTENTION_SIGNATURES = frozenset(
+        {
+            format_signature(
+                q=dense_tensor_format(torch.bfloat16),
+                k_cache=tensor_format(
+                    "mxfp8", torch.float8_e4m3fn, scale=_MXFP8_KV_BLOCK_SCALE
+                ),
+                v_cache=tensor_format(
+                    "mxfp8", torch.float8_e4m3fn, scale=_MXFP8_KV_BLOCK_SCALE
+                ),
+            )
+        }
+    )
 
     @register_kernel(
         "attention",
@@ -141,6 +154,7 @@ if (
         ),
         priority=Priority.SPECIALIZED,
         traits={
+            "fp32_output": frozenset({False}),
             "head_dim": _FA4_BLACKWELL_PREFILL_HEAD_DIMS,
             "return_lse": frozenset({False, True}),
             "sliding_window": frozenset({False, True}),
@@ -184,6 +198,8 @@ if (
                     False,
                     enable_pdl,
                     has_tau=tau is not None,
+                    output_dtype=None,
+                    return_lse=False,
                 )
                 or not torch.cuda.is_current_stream_capturing()
             ):
@@ -200,6 +216,8 @@ if (
                     softmax_scale=softmax_scale,
                     tau=tau,
                     enable_pdl=enable_pdl,
+                    output_dtype=None,
+                    return_lse=False,
                 )
         if tau is not None:
             # The fork fallback lacks fused tau; fold it into q and the bias.
@@ -238,6 +256,7 @@ if (
         ),
         priority=Priority.SPECIALIZED,
         traits={
+            "fp32_output": frozenset({False}),
             "head_dim": _FA4_BLACKWELL_DECODE_HEAD_DIMS,
             "return_lse": frozenset({False, True}),
             "sliding_window": frozenset({False, True}),
@@ -288,6 +307,8 @@ if (
                     True,
                     enable_pdl,
                     has_tau=tau is not None,
+                    output_dtype=None,
+                    return_lse=False,
                 )
                 or not torch.cuda.is_current_stream_capturing()
             ):
@@ -305,6 +326,8 @@ if (
                     softmax_scale=softmax_scale,
                     tau=tau,
                     enable_pdl=enable_pdl,
+                    output_dtype=None,
+                    return_lse=False,
                 )
         if tau is not None:
             # The fork fallback lacks fused tau; fold it into q and the bias.
@@ -344,6 +367,7 @@ if (
         ),
         priority=Priority.SPECIALIZED,
         traits={
+            "fp32_output": frozenset({False}),
             "head_dim": _FA4_BLACKWELL_DECODE_HEAD_DIMS,
             "return_lse": frozenset({False}),
             "sliding_window": frozenset({False, True}),
@@ -400,8 +424,17 @@ if (
                     enable_pdl,
                     prediction=_pred,
                     has_tau=tau is not None,
+                    output_dtype=None,
+                    return_lse=False,
+                    gated=False,
                 )
-                and v2_buffers_ready(q, window_left, page_table, prediction=_pred)
+                and v2_buffers_ready(
+                    q,
+                    window_left,
+                    page_table,
+                    num_kv_heads=k_cache.shape[2],
+                    prediction=_pred,
+                )
             ):
                 # v2 returns (rows, H*D); every other route returns q.shape.
                 # Zero-copy view keeps the public op's contract uniform.
@@ -417,6 +450,10 @@ if (
                     tau=tau,
                     enable_pdl=enable_pdl,
                     prediction=_pred,
+                    output_dtype=None,
+                    return_lse=False,
+                    gate=None,
+                    sink=None,
                 ).view(q.shape)
         if (
             _TSMHA_REL_DECODE
@@ -485,6 +522,386 @@ if (
         )
         return out
 
+    # FP32-output variants: genuine FP32 stores from the tokenspeed-mha kernels, no rounded fallback.
+    def _require_tsmha_fp32(
+        q: torch.Tensor,
+        num_kv_heads: int,
+        rel_logits: torch.Tensor,
+        window_left: int,
+        batch: int,
+    ) -> None:
+        extent = rel_logits.shape[-1]
+        if not (
+            extent % 128 == 0
+            and (window_left < 0 or window_left + 1 == extent)
+            and q.shape[1] % num_kv_heads == 0
+            and batch <= 1024
+        ):
+            raise RuntimeError(
+                "FP32-output rel attention needs extent % 128 == 0, "
+                "window_left + 1 == extent for a sliding window, whole GQA "
+                f"groups and B <= 1024 (got extent {extent}, window_left "
+                f"{window_left}, heads {q.shape[1]}/{num_kv_heads}, B {batch})"
+            )
+
+    @register_kernel(
+        "attention",
+        "rel_mha_prefill",
+        name="fa4_rel_mha_prefill_fp32",
+        solution="fa4",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 0),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=format_signatures(
+            ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "fp32_output": frozenset({True}),
+            "head_dim": frozenset({64, 96, 128}),
+            "return_lse": frozenset({False, True}),
+            "sliding_window": frozenset({False, True}),
+        },
+    )
+    def fa4_rel_mha_prefill_fp32(
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        rel_logits: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        cu_seqlens_cpu: list[int],
+        max_seqlen: int,
+        window_left: int = -1,
+        return_lse: bool = False,
+        softmax_scale: float | None = None,
+        tau: torch.Tensor | None = None,
+        enable_pdl: bool = False,
+        *,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        assert output_dtype == torch.float32
+        _require_tsmha_fp32(
+            q, k.shape[1], rel_logits, window_left, cu_seqlens.shape[0] - 1
+        )
+        from tokenspeed_kernel.ops.attention.rmha._cute_dsl.rel_extend import (
+            is_compiled_for,
+            rel_mha_varlen_tsmha,
+        )
+
+        if (
+            not is_compiled_for(
+                q,
+                k.shape[1],
+                rel_logits.shape[-1],
+                window_left >= 0,
+                False,
+                enable_pdl,
+                has_tau=tau is not None,
+                output_dtype=output_dtype,
+                return_lse=return_lse,
+            )
+            and torch.cuda.is_current_stream_capturing()
+        ):
+            raise RuntimeError(
+                "FP32 rel prefill kernel not compiled before CUDA-graph "
+                "capture; run this config eagerly first"
+            )
+        return rel_mha_varlen_tsmha(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens,
+            max_seqlen_q=max_seqlen,
+            rel_logits=rel_logits,
+            window_left=window_left,
+            max_seqlen_k=max_seqlen,
+            cu_seqlens_k=cu_seqlens,
+            softmax_scale=softmax_scale,
+            tau=tau,
+            enable_pdl=enable_pdl,
+            output_dtype=output_dtype,
+            return_lse=return_lse,
+        )
+
+    @register_kernel(
+        "attention",
+        "rel_mha_extend_with_kvcache",
+        name="fa4_rel_mha_extend_with_kvcache_fp32",
+        solution="fa4",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 0),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=format_signatures(
+            ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "fp32_output": frozenset({True}),
+            "head_dim": frozenset({64, 96, 128}),
+            "page_size": frozenset({128, 256}),
+            "return_lse": frozenset({False, True}),
+            "sliding_window": frozenset({False, True}),
+        },
+    )
+    def fa4_rel_mha_extend_with_kvcache_fp32(
+        q: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        cu_seqlens_kv: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        max_seqlen_q: int,
+        max_seqlen_k: int,
+        rel_logits: torch.Tensor,
+        window_left: int = -1,
+        return_lse: bool = False,
+        softmax_scale: float | None = None,
+        tau: torch.Tensor | None = None,
+        enable_pdl: bool = False,
+        # Call parity with the dispatcher's unconditional scale pass; dense only.
+        q_scale: torch.Tensor | None = None,
+        k_scale: torch.Tensor | None = None,
+        v_scale: torch.Tensor | None = None,
+        *,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        assert output_dtype == torch.float32
+        assert q_scale is None and k_scale is None and v_scale is None
+        _require_tsmha_fp32(
+            q, k_cache.shape[2], rel_logits, window_left, cu_seqlens_q.shape[0] - 1
+        )
+        from tokenspeed_kernel.ops.attention.rmha._cute_dsl.rel_extend import (
+            is_compiled_for,
+            rel_mha_varlen_tsmha,
+        )
+
+        if (
+            not is_compiled_for(
+                q,
+                k_cache.shape[2],
+                rel_logits.shape[-1],
+                window_left >= 0,
+                True,
+                enable_pdl,
+                k_cache.shape[1] // 128,
+                has_tau=tau is not None,
+                output_dtype=output_dtype,
+                return_lse=return_lse,
+            )
+            and torch.cuda.is_current_stream_capturing()
+        ):
+            raise RuntimeError(
+                "FP32 rel extend kernel not compiled before CUDA-graph "
+                "capture; run this config eagerly first"
+            )
+        return rel_mha_varlen_tsmha(
+            q=q,
+            k=k_cache,
+            v=v_cache,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q,
+            rel_logits=rel_logits,
+            window_left=window_left,
+            max_seqlen_k=max_seqlen_k,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            softmax_scale=softmax_scale,
+            tau=tau,
+            enable_pdl=enable_pdl,
+            output_dtype=output_dtype,
+            return_lse=return_lse,
+        )
+
+    @register_kernel(
+        "attention",
+        "rel_mha_decode_with_kvcache",
+        name="fa4_rel_mha_decode_with_kvcache_fp32",
+        solution="fa4",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 0),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=format_signatures(
+            ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
+        ),
+        priority=Priority.SPECIALIZED,
+        traits={
+            "fp32_output": frozenset({True}),
+            "gate_sink": frozenset({False, True}),
+            "head_dim": frozenset({64, 128}),
+            "page_size": frozenset({64, 128, 256}),
+            "return_lse": frozenset({False, True}),
+            "sliding_window": frozenset({False, True}),
+        },
+    )
+    def fa4_rel_mha_decode_with_kvcache_fp32(
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        max_seqlen_k: int,
+        rel_logits: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        max_seqlen_q: int = 1,
+        window_left: int = -1,
+        softmax_scale: float | None = None,
+        tau: torch.Tensor | None = None,
+        enable_pdl: bool = False,
+        # Call parity with the dispatcher's unconditional scale pass. Only
+        # the MXFP8-KV registration below passes k_scale/v_scale.
+        q_scale: torch.Tensor | None = None,
+        k_scale: torch.Tensor | None = None,
+        v_scale: torch.Tensor | None = None,
+        *,
+        output_dtype: torch.dtype,
+        return_lse: bool = False,
+        gate: torch.Tensor | None,
+        sink: torch.Tensor | None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # The gate and sink apply to the unrounded FP32 result in the
+        # reduction epilogue, which then stores output_dtype once.
+        assert gate is not None or output_dtype == torch.float32
+        assert q_scale is None
+        batch = cache_seqlens.shape[0]
+        if max_seqlen_q > 1 and not (
+            q.shape[0] == batch * max_seqlen_q and page_table.shape[0] == batch
+        ):
+            raise RuntimeError(
+                "FP32 rel decode needs the same number of query rows per "
+                f"request (got {q.shape[0]} rows for {batch} requests of "
+                f"{max_seqlen_q})"
+            )
+        from tokenspeed_kernel.ops.attention.rmha._cute_dsl.rel_decode_v2 import (
+            is_compiled_for_v2,
+            rel_mha_decode_tsmha_v2,
+            v2_buffers_ready,
+        )
+
+        rel_logits = rel_logits.reshape(q.shape[0], q.shape[1], -1)
+        if torch.cuda.is_current_stream_capturing() and not (
+            is_compiled_for_v2(
+                q,
+                k_cache,
+                rel_logits,
+                window_left,
+                enable_pdl,
+                prediction=max_seqlen_q,
+                has_tau=tau is not None,
+                output_dtype=output_dtype,
+                return_lse=return_lse,
+                gated=gate is not None,
+            )
+            and v2_buffers_ready(
+                q,
+                window_left,
+                page_table,
+                num_kv_heads=k_cache.shape[2],
+                prediction=max_seqlen_q,
+            )
+        ):
+            raise RuntimeError(
+                "FP32 rel decode kernel or its split-KV workspaces not ready "
+                "before CUDA-graph capture; run this batch size eagerly first"
+            )
+        result = rel_mha_decode_tsmha_v2(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            rel_logits=rel_logits,
+            window_left=window_left,
+            softmax_scale=softmax_scale,
+            tau=tau,
+            enable_pdl=enable_pdl,
+            prediction=max_seqlen_q,
+            output_dtype=output_dtype,
+            return_lse=return_lse,
+            gate=gate,
+            sink=sink,
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
+        if return_lse:
+            out, lse = result
+            return out.view(q.shape), lse
+        return result.view(q.shape)
+
+    @register_kernel(
+        "attention",
+        "rel_mha_decode_with_kvcache",
+        name="fa4_rel_mha_decode_with_kvcache_fp32_mxfp8_kv",
+        solution="fa4",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 0),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=_MXFP8_KV_ATTENTION_SIGNATURES,
+        priority=Priority.SPECIALIZED,
+        traits={
+            "fp32_output": frozenset({True}),
+            "gate_sink": frozenset({False, True}),
+            "head_dim": frozenset({128}),
+            "page_size": frozenset({128}),
+            "return_lse": frozenset({False, True}),
+            "sliding_window": frozenset({False, True}),
+        },
+    )
+    def fa4_rel_mha_decode_with_kvcache_fp32_mxfp8_kv(
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        max_seqlen_k: int,
+        rel_logits: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        max_seqlen_q: int,
+        window_left: int,
+        softmax_scale: float | None,
+        tau: torch.Tensor | None,
+        enable_pdl: bool,
+        q_scale: torch.Tensor | None,
+        k_scale: torch.Tensor,
+        v_scale: torch.Tensor,
+        *,
+        output_dtype: torch.dtype,
+        return_lse: bool,
+        gate: torch.Tensor | None,
+        sink: torch.Tensor | None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """FP32-output decode of a BF16 query over an MXFP8 K/V cache.
+
+        The kernel dequantizes K and V to BF16 in shared memory: the result
+        is the BF16 kernel's on the dequantized cache, bit for bit.
+        """
+        return fa4_rel_mha_decode_with_kvcache_fp32(
+            q,
+            k_cache,
+            v_cache,
+            page_table,
+            cache_seqlens,
+            max_seqlen_k,
+            rel_logits,
+            cu_seqlens_q,
+            max_seqlen_q,
+            window_left,
+            softmax_scale,
+            tau,
+            enable_pdl,
+            q_scale,
+            k_scale,
+            v_scale,
+            output_dtype=output_dtype,
+            return_lse=return_lse,
+            gate=gate,
+            sink=sink,
+        )
+
     @register_kernel(
         "attention",
         "rel_mha_decode_with_kvcache",
@@ -497,6 +914,7 @@ if (
         signatures=_MXFP8_ATTENTION_SIGNATURES,
         priority=Priority.SPECIALIZED,
         traits={
+            "fp32_output": frozenset({False}),
             "head_dim": frozenset({128}),
             "return_lse": frozenset({False}),
             "sliding_window": frozenset({False, True}),
@@ -582,6 +1000,7 @@ if (
         signatures=_MXFP8_ATTENTION_SIGNATURES,
         priority=Priority.SPECIALIZED,
         traits={
+            "fp32_output": frozenset({False}),
             "head_dim": frozenset({128}),
             "return_lse": frozenset({False}),
             "sliding_window": frozenset({False, True}),
@@ -636,8 +1055,10 @@ if (
                 enable_pdl,
                 k_cache.shape[1] // 128,
                 blockscaled=True,
-                out_dtype=rel_logits.dtype,
+                bias_dtype=rel_logits.dtype,
                 has_tau=tau is not None,
+                output_dtype=None,
+                return_lse=False,
             )
             and torch.cuda.is_current_stream_capturing()
         ):
@@ -663,4 +1084,6 @@ if (
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale,
+            output_dtype=None,
+            return_lse=False,
         )

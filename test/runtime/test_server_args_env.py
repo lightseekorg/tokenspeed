@@ -72,3 +72,72 @@ def test_prefill_kv_limit_reaches_model_initialization_and_can_be_disabled():
     finally:
         global_server_args_dict.clear()
         global_server_args_dict.update(original)
+
+
+@pytest.mark.parametrize("rate", ["0", "1", "100"])
+def test_pd_ttft_sampling_percentage(rate):
+    args = prepare_server_args(
+        ["--model", "x", "--ttft-trace-sampling-percentage", rate]
+    )
+    assert args.ttft_trace_sampling_percentage == int(rate)
+
+
+@pytest.mark.parametrize("rate", ["-1", "101"])
+def test_invalid_pd_ttft_sampling_percentage(rate):
+    with pytest.raises(ValueError, match="ttft-trace-sampling-percentage"):
+        prepare_server_args(["--model", "x", "--ttft-trace-sampling-percentage", rate])
+
+
+def test_request_time_stats_compatibility_flag():
+    assert prepare_server_args(
+        ["--model", "x", "--enable-request-time-stats-logging"]
+    ).enable_log_request_stats
+
+
+def test_adaptive_dspark_rejects_synthetic_acceptance():
+    argv = [
+        "--model",
+        "x",
+        "--speculative-algorithm",
+        "DSPARK",
+        "--sampling-backend",
+        "greedy",
+        "--grammar-backend",
+        "none",
+        "--disable-prefill-graph",
+        "--enable-dsv41-adaptive-dspark",
+    ]
+    for length in ("4", "4.5"):
+        with pytest.raises(ValueError, match="real acceptance"):
+            prepare_server_args(argv + ["--synthetic-acceptance-length", length])
+
+
+def test_adaptive_dspark_cli_reaches_runtime_and_resets():
+    original = global_server_args_dict.copy()
+    try:
+        args = prepare_server_args(
+            [
+                "--model",
+                "x",
+                "--speculative-algorithm",
+                "DSPARK",
+                "--sampling-backend",
+                "greedy",
+                "--grammar-backend",
+                "none",
+                "--disable-prefill-graph",
+                "--enable-dsv41-adaptive-dspark",
+                "--dsv41-dspark-min-batch-size",
+                "64",
+            ]
+        )
+        global_server_args_dict_update(args)
+        assert global_server_args_dict["enable_dsv41_adaptive_dspark"] is True
+        assert global_server_args_dict["dsv41_dspark_min_batch_size"] == 64
+        args = prepare_server_args(["--model", "x"])
+        global_server_args_dict_update(args)
+        assert global_server_args_dict["enable_dsv41_adaptive_dspark"] is False
+        assert global_server_args_dict["dsv41_dspark_min_batch_size"] == 32
+    finally:
+        global_server_args_dict.clear()
+        global_server_args_dict.update(original)

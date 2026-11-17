@@ -37,6 +37,10 @@ Exports two entry points:
   legacy ``(M, 2)`` layout (one extra elementwise copy off the hot path). The
   runtime no longer uses this layout — kept for tests / future logprob users.
 
+The distributed argmax (:func:`distributed_argmax`) and the fused greedy
+DSpark Markov step built on its slots (:func:`markov_argmax_step`) are
+described in this directory's ``README.md``.
+
 Platform support:
 
 The CuTe DSL kernel ships only for NVIDIA Hopper/Blackwell (sm_90..<sm_120).
@@ -58,14 +62,18 @@ from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 __all__ = [
+    "MarkovArgmaxWorkspace",
     "argmax",
     "argmax_pair",
     "create_dist_argmax_state",
+    "create_markov_argmax_workspace",
     "supports_dist_argmax_shape",
+    "supports_markov_argmax_shape",
     "try_create_dist_argmax_state",
     "cute_dsl_argmax",
     "distributed_argmax",
     "is_available",
+    "markov_argmax_step",
 ]
 
 _argmax_kernel_impl = error_fn
@@ -83,6 +91,13 @@ _MIN_VOCAB_SIZE = 4096
 
 # The async copy requires 128-byte alignment.
 _VOCAB_SIZE_ALIGNMENT = 32
+
+# Fused Markov step: 4 warp pairs per CTA, each halving one 16-row group's rank dim.
+_MARKOV_WARPS = 8
+_MARKOV_K_SPLIT = 2
+_MARKOV_GROUPS_PER_CTA = _MARKOV_WARPS // _MARKOV_K_SPLIT
+_MARKOV_MAX_ROW_TILES = 8  # 8-row MMA tiles: at most 64 batch rows per CTA
+_MARKOV_KEY_NONE = -(1 << 63)  # empty candidate key, below every real one
 
 
 def _ts_supported_arch() -> bool:
@@ -905,6 +920,763 @@ if _CUTE_AVAILABLE:
                 mO_max[local_row_idx] = warp_max.to(mO_max.element_type)
                 mO_idx[local_row_idx] = warp_argmax.to(mO_idx.element_type)
 
+    # Fused greedy DSpark Markov step (see MarkovArgmaxStepKernel).
+
+    def _inline_asm(result, code, constraints, operands, *, effects, loc, ip):
+        """One inline-PTX block; a tuple ``result`` returns a tuple of values."""
+        if result is None:
+            ir_type = None
+        elif isinstance(result, tuple):
+            ir_type = llvm.StructType.get_literal([dtype.mlir_type for dtype in result])
+        else:
+            ir_type = result.mlir_type
+        value = llvm.inline_asm(
+            ir_type,
+            [operand.ir_value(loc=loc, ip=ip) for operand in operands],
+            code,
+            constraints,
+            has_side_effects=effects,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+        if result is None:
+            return None
+        if isinstance(result, tuple):
+            return tuple(
+                dtype(llvm.extractvalue(dtype.mlir_type, value, [i], loc=loc, ip=ip))
+                for i, dtype in enumerate(result)
+            )
+        return result(value)
+
+    @dsl_user_op
+    def _ld_global_nc_v4(addr: cutlass.Int64, *, loc=None, ip=None):
+        return _inline_asm(
+            (Int32,) * 4,
+            "ld.global.nc.v4.b32 {$0,$1,$2,$3}, [$4];",
+            "=r,=r,=r,=r,l",
+            [cutlass.Int64(addr)],
+            effects=False,
+            loc=loc,
+            ip=ip,
+        )
+
+    @dsl_user_op
+    def _ld_shared_v4(addr: Int32, *, loc=None, ip=None):
+        # Written by cp.async before a barrier: never hoisted above it.
+        return _inline_asm(
+            (Int32,) * 4,
+            "ld.shared.v4.b32 {$0,$1,$2,$3}, [$4];",
+            "=r,=r,=r,=r,r",
+            [Int32(addr)],
+            effects=True,
+            loc=loc,
+            ip=ip,
+        )
+
+    @dsl_user_op
+    def _ld_global_b32(addr: cutlass.Int64, *, loc=None, ip=None) -> Int32:
+        return _inline_asm(
+            Int32,
+            "ld.global.b32 $0, [$1];",
+            "=r,l",
+            [cutlass.Int64(addr)],
+            effects=True,
+            loc=loc,
+            ip=ip,
+        )
+
+    @dsl_user_op
+    def _cp_async_16(
+        dst: Int32, src: cutlass.Int64, src_bytes: Int32, *, loc=None, ip=None
+    ) -> None:
+        # src_bytes 0 zero-fills the 16 destination bytes without reading src.
+        _inline_asm(
+            None,
+            "cp.async.cg.shared.global [$0], [$1], 16, $2;",
+            "r,l,r",
+            [Int32(dst), cutlass.Int64(src), Int32(src_bytes)],
+            effects=True,
+            loc=loc,
+            ip=ip,
+        )
+
+    @dsl_user_op
+    def _mma_m16n8k16(a, b, c, *, bf16: bool, loc=None, ip=None):
+        """``c + a @ b`` on tensor cores: a 16x16, b 16x8, FP32 accumulators."""
+        kind = "bf16" if bf16 else "f16"
+        code = (
+            f"mma.sync.aligned.m16n8k16.row.col.f32.{kind}.{kind}.f32 "
+            "{$0,$1,$2,$3}, {$4,$5,$6,$7}, {$8,$9}, {$10,$11,$12,$13};"
+        )
+        return _inline_asm(
+            (cutlass.Float32,) * 4,
+            code,
+            "=f,=f,=f,=f,r,r,r,r,r,r,f,f,f,f",
+            [*a, *b, *c],
+            effects=False,
+            loc=loc,
+            ip=ip,
+        )
+
+    @dsl_user_op
+    def _ld_half_as_f32(
+        addr: cutlass.Int64, *, bf16: bool, loc=None, ip=None
+    ) -> cutlass.Float32:
+        kind = "bf16" if bf16 else "f16"
+        return _inline_asm(
+            cutlass.Float32,
+            f"{{ .reg .b16 h; ld.global.nc.b16 h, [$1]; cvt.f32.{kind} $0, h; }}",
+            "=f,l",
+            [cutlass.Int64(addr)],
+            effects=False,
+            loc=loc,
+            ip=ip,
+        )
+
+    @dsl_user_op
+    def _bias_add_rounded(
+        bias: cutlass.Float32,
+        base: cutlass.Float32,
+        *,
+        bf16: bool,
+        loc=None,
+        ip=None,
+    ) -> cutlass.Float32:
+        """``round(base + round(bias))`` in the 16-bit logits dtype, as FP32."""
+        kind = "bf16" if bf16 else "f16"
+        code = (
+            f"{{ .reg .b16 h; .reg .f32 s; cvt.rn.{kind}.f32 h, $1; "
+            f"cvt.f32.{kind} s, h; add.rn.f32 s, s, $2; "
+            f"cvt.rn.{kind}.f32 h, s; cvt.f32.{kind} $0, h; }}"
+        )
+        return _inline_asm(
+            cutlass.Float32,
+            code,
+            "=f,f,f",
+            [cutlass.Float32(bias), cutlass.Float32(base)],
+            effects=False,
+            loc=loc,
+            ip=ip,
+        )
+
+    @dsl_user_op
+    def _red_max_s64(
+        addr: cutlass.Int64, value: cutlass.Int64, *, loc=None, ip=None
+    ) -> None:
+        _inline_asm(
+            None,
+            "red.relaxed.gpu.global.max.s64 [$0], $1;",
+            "l,l",
+            [cutlass.Int64(addr), cutlass.Int64(value)],
+            effects=True,
+            loc=loc,
+            ip=ip,
+        )
+
+    @dsl_user_op
+    def _atom_add_acq_rel_gpu_u32(
+        addr: cutlass.Int64, value: Int32, *, loc=None, ip=None
+    ) -> Int32:
+        return _inline_asm(
+            Int32,
+            "atom.acq_rel.gpu.global.add.u32 $0, [$1], $2;",
+            "=r,l,r",
+            [cutlass.Int64(addr), Int32(value)],
+            effects=True,
+            loc=loc,
+            ip=ip,
+        )
+
+    @dsl_user_op
+    def _ld_relaxed_gpu_b64(addr: cutlass.Int64, *, loc=None, ip=None) -> cutlass.Int64:
+        return _inline_asm(
+            cutlass.Int64,
+            "ld.relaxed.gpu.global.b64 $0, [$1];",
+            "=l,l",
+            [cutlass.Int64(addr)],
+            effects=True,
+            loc=loc,
+            ip=ip,
+        )
+
+    @dsl_user_op
+    def _st_relaxed_gpu_b64(
+        addr: cutlass.Int64, value: cutlass.Int64, *, loc=None, ip=None
+    ) -> None:
+        _inline_asm(
+            None,
+            "st.relaxed.gpu.global.b64 [$0], $1;",
+            "l,l",
+            [cutlass.Int64(addr), cutlass.Int64(value)],
+            effects=True,
+            loc=loc,
+            ip=ip,
+        )
+
+    @dsl_user_op
+    def _st_relaxed_gpu_u32(addr: cutlass.Int64, value: Int32, *, loc=None, ip=None):
+        _inline_asm(
+            None,
+            "st.relaxed.gpu.global.u32 [$0], $1;",
+            "l,r",
+            [cutlass.Int64(addr), Int32(value)],
+            effects=True,
+            loc=loc,
+            ip=ip,
+        )
+
+    @dsl_user_op
+    def _st_global_b32(addr: cutlass.Int64, value: Int32, *, loc=None, ip=None):
+        _inline_asm(
+            None,
+            "st.global.b32 [$0], $1;",
+            "l,r",
+            [cutlass.Int64(addr), Int32(value)],
+            effects=True,
+            loc=loc,
+            ip=ip,
+        )
+
+    @dsl_user_op
+    def _poll_slot(
+        addr: cutlass.Int64, active: Int32, *, loc=None, ip=None
+    ) -> cutlass.Int64:
+        """The slot word, or a bare ready flag on an inactive lane.
+
+        Flag and payload share one 64-bit word, so a relaxed load sees them
+        together and independent polls can be in flight at once.
+        """
+        code = (
+            "{ .reg .pred p; .reg .b64 v; setp.ne.s32 p, $2, 0; "
+            "mov.b64 v, 0x8000000000000000; @p ld.relaxed.sys.global.b64 v, [$1]; "
+            "mov.b64 $0, v; }"
+        )
+        return _inline_asm(
+            cutlass.Int64,
+            code,
+            "=l,l,r",
+            [cutlass.Int64(addr), Int32(active)],
+            effects=True,
+            loc=loc,
+            ip=ip,
+        )
+
+    @dsl_user_op
+    def _clear_slot_flag(
+        addr: cutlass.Int64, active: Int32, *, loc=None, ip=None
+    ) -> None:
+        code = (
+            "{ .reg .pred p; .reg .b64 old; setp.ne.s32 p, $2, 0; "
+            "@p atom.relaxed.sys.global.and.b64 old, [$0], $1; }"
+        )
+        _inline_asm(
+            None,
+            code,
+            "l,l,r",
+            [
+                cutlass.Int64(addr),
+                cutlass.Int64(0x7FFFFFFFFFFFFFFF),
+                Int32(active),
+            ],
+            effects=True,
+            loc=loc,
+            ip=ip,
+        )
+
+    @cute.jit
+    def _argmax_key(value: cutlass.Float32, index: Int32) -> cutlass.Int64:
+        """Pack ``(value, index)`` into one int64 that orders like the argmax.
+
+        A larger key is a larger value, then a lower index. -inf and NaN never
+        win (the empty key), as under the distributed argmax's strict
+        comparison; -0.0 ties with +0.0.
+        """
+        key = cutlass.Int64(_MARKOV_KEY_NONE)
+        if value > cutlass.Float32(float("-inf")):
+            bits = value.bitcast(Int32)
+            if bits == Int32(-2147483648):
+                bits = Int32(0)
+            if bits < Int32(0):
+                bits = bits ^ Int32(0x7FFFFFFF)
+            key = (bits.to(cutlass.Int64) << cutlass.Int64(32)) | (
+                Int32(0x7FFFFFFF) - index
+            ).to(cutlass.Int64)
+        return key
+
+    @cute.jit
+    def _decode_argmax_key(key: cutlass.Int64):
+        """``(value, index)`` of a key; the empty key is ``(-inf, 0x7FFFFFFF)``."""
+        value = cutlass.Float32(float("-inf"))
+        index = Int32(0x7FFFFFFF)
+        if key != cutlass.Int64(_MARKOV_KEY_NONE):
+            bits = (key >> cutlass.Int64(32)).to(Int32)
+            if bits < Int32(0):
+                bits = bits ^ Int32(0x7FFFFFFF)
+            value = bits.bitcast(cutlass.Float32)
+            index = Int32(0x7FFFFFFF) - (key & cutlass.Int64(0xFFFFFFFF)).to(Int32)
+        return value, index
+
+    @cute.jit
+    def _max_key(a: cutlass.Int64, b: cutlass.Int64) -> cutlass.Int64:
+        result = a
+        if b > a:
+            result = b
+        return result
+
+    class MarkovArgmaxStepKernel:
+        """One greedy DSpark Markov step over a vocabulary-sharded head.
+
+        For row ``m`` and shard column ``v``: ``bias = embedding[prev[m]] .
+        projection[v]`` accumulated in FP32 and rounded to the logits dtype,
+        ``logit = round(base[m, v] + bias)``, and ``out[m]`` is the global
+        token of the largest logit over every rank's shard (lowest token id
+        on ties; 0 if no logit beats -inf).
+
+        Grid ``(shard_rows / 64, ceil(rows / rows_per_cta))``. A CTA gathers
+        its rows' previous-token latents into shared memory; each of its four
+        warp pairs takes 16 projection rows, the two warps of a pair splitting
+        the rank dimension, and multiplies them by the latents on tensor
+        cores. The CTA's best logit per row is folded into one int64 key per
+        row in global memory; the CTA that finishes last exchanges the keys
+        with the other ranks through the distributed argmax's slots, writes
+        ``out`` and resets the scratch for the next launch.
+        """
+
+        def __init__(
+            self,
+            dtype,
+            vocab_per_rank: int,
+            rank_dim: int,
+            row_tiles: int,
+            world_size: int,
+            rank: int,
+        ):
+            self.bf16 = dtype is cutlass.BFloat16
+            self.N = vocab_per_rank
+            self.row_tiles = row_tiles
+            self.rows_per_cta = 8 * row_tiles
+            self.world_size = world_size
+            self.rank = rank
+            self.threads = 32 * _MARKOV_WARPS
+            self.groups = vocab_per_rank // 16
+            self.chunks_per_warp = rank_dim // (64 * _MARKOV_K_SPLIT)
+            self.row_bytes = 2 * rank_dim
+            # 64 spare bytes per row keep the B-fragment loads conflict-free.
+            self.latent_stride = self.row_bytes + 64
+            self.latent_chunks = self.rows_per_cta * self.row_bytes // 16
+            self.peers = 1 << (world_size - 1).bit_length()
+            self.peer_steps = self.peers.bit_length() - 1
+            self.rows_per_warp_pass = 32 // self.peers
+            rows_per_unroll = _MARKOV_WARPS * self.rows_per_warp_pass
+            self.exchange_unroll = -(-self.rows_per_cta // rows_per_unroll)
+            self.rows_per_pass = self.exchange_unroll * rows_per_unroll
+            self.smem_bytes = (
+                self.rows_per_cta * self.latent_stride
+                + _MARKOV_GROUPS_PER_CTA * 4 * row_tiles * 32 * 4
+                + _MARKOV_GROUPS_PER_CTA * self.rows_per_cta * 8
+                + 16
+                + 4 * 128
+            )
+
+        @cute.jit
+        def __call__(
+            self,
+            base_ptr: cutlass.Int64,
+            prev_ptr: cutlass.Int64,
+            prev_stride: Int32,
+            out_ptr: cutlass.Int64,
+            out_stride: Int32,
+            embedding_ptr: cutlass.Int64,
+            embedding_rows: Int32,
+            projection_ptr: cutlass.Int64,
+            vocab_start: Int32,
+            rows: Int32,
+            keys_ptr: cutlass.Int64,
+            ctas_done_ptr: cutlass.Int64,
+            slot_ptrs: cutlass.Int64,
+            slot_multicast_ptr: cutlass.Int64,
+            round_id_ptr: cutlass.Int64,
+            stream: cuda.CUstream,
+        ):
+            grid_x = -(-self.groups // _MARKOV_GROUPS_PER_CTA)
+            grid_y = (rows + (self.rows_per_cta - 1)) // self.rows_per_cta
+            self.kernel(
+                base_ptr,
+                prev_ptr,
+                prev_stride,
+                out_ptr,
+                out_stride,
+                embedding_ptr,
+                embedding_rows,
+                projection_ptr,
+                vocab_start,
+                rows,
+                keys_ptr,
+                ctas_done_ptr,
+                slot_ptrs,
+                slot_multicast_ptr,
+                round_id_ptr,
+            ).launch(
+                grid=[grid_x, grid_y, 1],
+                block=[self.threads, 1, 1],
+                smem=self.smem_bytes,
+                stream=stream,
+            )
+
+        @cute.kernel
+        def kernel(
+            self,
+            base_ptr: cutlass.Int64,
+            prev_ptr: cutlass.Int64,
+            prev_stride: Int32,
+            out_ptr: cutlass.Int64,
+            out_stride: Int32,
+            embedding_ptr: cutlass.Int64,
+            embedding_rows: Int32,
+            projection_ptr: cutlass.Int64,
+            vocab_start: Int32,
+            rows: Int32,
+            keys_ptr: cutlass.Int64,
+            ctas_done_ptr: cutlass.Int64,
+            slot_ptrs: cutlass.Int64,
+            slot_multicast_ptr: cutlass.Int64,
+            round_id_ptr: cutlass.Int64,
+        ):
+            tidx, _, _ = cute.arch.thread_idx()
+            bidx, bidy, _ = cute.arch.block_idx()
+            grid_x, grid_y, _ = cute.arch.grid_dim()
+            warp = tidx // 32
+            lane = tidx % 32
+            g = lane // 4
+            t = lane % 4
+            row0 = bidy * self.rows_per_cta
+
+            smem = cutlass.utils.SmemAllocator()
+            latent = smem.allocate_array(
+                cutlass.Int8,
+                num_elems=self.rows_per_cta * self.latent_stride,
+                byte_alignment=128,
+            )
+            partial = cute.make_tensor(
+                smem.allocate_array(
+                    cutlass.Float32,
+                    num_elems=_MARKOV_GROUPS_PER_CTA * 4 * self.row_tiles * 32,
+                    byte_alignment=128,
+                ),
+                cute.make_layout(
+                    (_MARKOV_GROUPS_PER_CTA, 4 * self.row_tiles, 32),
+                    stride=(4 * self.row_tiles * 32, 32, 1),
+                ),
+            )
+            cand = cute.make_tensor(
+                smem.allocate_array(
+                    cutlass.Int64,
+                    num_elems=_MARKOV_GROUPS_PER_CTA * self.rows_per_cta,
+                    byte_alignment=128,
+                ),
+                cute.make_layout(
+                    (_MARKOV_GROUPS_PER_CTA, self.rows_per_cta),
+                    stride=(self.rows_per_cta, 1),
+                ),
+            )
+            last_cta = cute.make_tensor(
+                smem.allocate_array(Int32, num_elems=4, byte_alignment=16),
+                cute.make_layout(4),
+            )
+            latent_base = latent.toint()
+
+            # Groups past the shard (a partial last CTA) reload the last one.
+            group_in_cta = warp // _MARKOV_K_SPLIT
+            k_part = warp % _MARKOV_K_SPLIT
+            group = bidx * _MARKOV_GROUPS_PER_CTA + group_in_cta
+            load_group = group
+            if group >= self.groups:
+                load_group = Int32(self.groups - 1)
+            row_g = projection_ptr + (load_group * 16 + g).to(cutlass.Int64) * (
+                self.row_bytes
+            )
+            row_g8 = row_g + 8 * self.row_bytes
+            # Lane t holds rank columns 8t.. and 32+8t.. of each 64-wide chunk.
+            first_byte = k_part * (self.chunks_per_warp * 128) + t * 16
+            a_words = []
+            for c in cutlass.range_constexpr(self.chunks_per_warp):
+                offset = (first_byte + c * 128).to(cutlass.Int64)
+                a_words.append(
+                    (
+                        (
+                            _ld_global_nc_v4(row_g + offset),
+                            _ld_global_nc_v4(row_g8 + offset),
+                        ),
+                        (
+                            _ld_global_nc_v4(row_g + offset + 64),
+                            _ld_global_nc_v4(row_g8 + offset + 64),
+                        ),
+                    )
+                )
+
+            # Latent rows of the clamped previous tokens; padding rows zero-filled.
+            chunks_per_row = self.row_bytes // 16
+            for i in cutlass.range_constexpr(
+                (self.latent_chunks + self.threads - 1) // self.threads
+            ):
+                chunk = tidx + i * self.threads
+                if chunk < self.latent_chunks:
+                    gather_row = chunk // chunks_per_row
+                    gather_part = chunk % chunks_per_row
+                    gather_req = row0 + gather_row
+                    token = Int32(0)
+                    src_bytes = Int32(0)
+                    if gather_req < rows:
+                        token = _ld_global_b32(
+                            prev_ptr
+                            + gather_req.to(cutlass.Int64)
+                            * prev_stride.to(cutlass.Int64)
+                            * 4
+                        )
+                        src_bytes = Int32(16)
+                    if token < Int32(0):
+                        token = Int32(0)
+                    if token > embedding_rows - 1:
+                        token = embedding_rows - 1
+                    _cp_async_16(
+                        latent_base
+                        + gather_row * self.latent_stride
+                        + gather_part * 16,
+                        embedding_ptr
+                        + token.to(cutlass.Int64) * self.row_bytes
+                        + (gather_part * 16).to(cutlass.Int64),
+                        src_bytes,
+                    )
+            cute.arch.cp_async_commit_group()
+            cute.arch.cp_async_wait_group(0)
+            cute.arch.barrier()
+
+            acc = []
+            for j in cutlass.range_constexpr(self.row_tiles):
+                acc.append(
+                    (
+                        cutlass.Float32(0.0),
+                        cutlass.Float32(0.0),
+                        cutlass.Float32(0.0),
+                        cutlass.Float32(0.0),
+                    )
+                )
+            for c in cutlass.range_constexpr(self.chunks_per_warp):
+                b_offset = first_byte + c * 128
+                for j in cutlass.range_constexpr(self.row_tiles):
+                    b_addr = latent_base + (8 * j + g) * self.latent_stride + b_offset
+                    b_words = (_ld_shared_v4(b_addr), _ld_shared_v4(b_addr + 64))
+                    for i in cutlass.range_constexpr(4):
+                        # k slots (2t, 2t+1), (2t+8, 2t+9) = lane words w, w + 1.
+                        a_g, a_g8 = a_words[c][i // 2]
+                        b_vec = b_words[i // 2]
+                        w = 2 * (i % 2)
+                        acc[j] = _mma_m16n8k16(
+                            (a_g[w], a_g8[w], a_g[w + 1], a_g8[w + 1]),
+                            (b_vec[w], b_vec[w + 1]),
+                            acc[j],
+                            bf16=self.bf16,
+                        )
+
+            # The second warp of each pair hands its half of the dot over.
+            if k_part == 1:
+                for j in cutlass.range_constexpr(self.row_tiles):
+                    for q in cutlass.range_constexpr(4):
+                        partial[group_in_cta, 4 * j + q, lane] = acc[j][q]
+            cute.arch.barrier()
+            if k_part == 0:
+                for j in cutlass.range_constexpr(self.row_tiles):
+                    for e in cutlass.range_constexpr(2):
+                        # acc[j][2h+e]: shard row 16*group+g+8h, request 8j+2t+e.
+                        req = row0 + 8 * j + 2 * t + e
+                        req_load = req
+                        if req >= rows:
+                            req_load = rows - 1
+                        lane_best = cutlass.Int64(_MARKOV_KEY_NONE)
+                        for h in cutlass.range_constexpr(2):
+                            column = load_group * 16 + g + 8 * h
+                            bias = (
+                                acc[j][2 * h + e]
+                                + partial[group_in_cta, 4 * j + 2 * h + e, lane]
+                            )
+                            base = _ld_half_as_f32(
+                                base_ptr
+                                + (
+                                    req_load.to(cutlass.Int64) * self.N
+                                    + column.to(cutlass.Int64)
+                                )
+                                * 2,
+                                bf16=self.bf16,
+                            )
+                            logit = _bias_add_rounded(bias, base, bf16=self.bf16)
+                            lane_best = _max_key(
+                                lane_best, _argmax_key(logit, vocab_start + column)
+                            )
+                        if req >= rows:
+                            lane_best = cutlass.Int64(_MARKOV_KEY_NONE)
+                        if group >= self.groups:
+                            lane_best = cutlass.Int64(_MARKOV_KEY_NONE)
+                        for s in cutlass.range_constexpr(3):
+                            lane_best = _max_key(
+                                lane_best,
+                                cute.arch.shuffle_sync_bfly(lane_best, offset=4 << s),
+                            )
+                        if g == 0:
+                            cand[group_in_cta, 8 * j + 2 * t + e] = lane_best
+            cute.arch.barrier()
+
+            if tidx < self.rows_per_cta:
+                cta_best = cand[0, tidx]
+                for q in cutlass.range_constexpr(1, _MARKOV_GROUPS_PER_CTA):
+                    cta_best = _max_key(cta_best, cand[q, tidx])
+                key_row = row0 + tidx
+                if key_row < rows:
+                    if cta_best != cutlass.Int64(_MARKOV_KEY_NONE):
+                        _red_max_s64(keys_ptr + key_row.to(cutlass.Int64) * 8, cta_best)
+            # Publish this CTA's keys before counting it done.
+            cute.arch.fence_acq_rel_gpu()
+            cute.arch.barrier()
+            if tidx == 0:
+                done = _atom_add_acq_rel_gpu_u32(ctas_done_ptr, Int32(1))
+                is_last = Int32(0)
+                if done == grid_x * grid_y - 1:
+                    is_last = Int32(1)
+                last_cta[0] = is_last
+            cute.arch.barrier()
+            if last_cta[0] != Int32(0):
+                cute.arch.fence_acq_rel_gpu()
+                if tidx == 0:
+                    _st_relaxed_gpu_u32(ctas_done_ptr, Int32(0))
+                if cutlass.const_expr(self.world_size == 1):
+                    for own_row in cutlass.range(tidx, rows, self.threads):
+                        own_addr = keys_ptr + own_row.to(cutlass.Int64) * 8
+                        own_key = _ld_relaxed_gpu_b64(own_addr)
+                        _st_relaxed_gpu_b64(own_addr, cutlass.Int64(_MARKOV_KEY_NONE))
+                        _, own_winner = _decode_argmax_key(own_key)
+                        if own_winner == Int32(0x7FFFFFFF):
+                            own_winner = Int32(0)
+                        _st_global_b32(
+                            out_ptr
+                            + own_row.to(cutlass.Int64)
+                            * out_stride.to(cutlass.Int64)
+                            * 4,
+                            own_winner,
+                        )
+                else:
+                    self._exchange(
+                        tidx,
+                        warp,
+                        lane,
+                        rows,
+                        out_ptr,
+                        out_stride,
+                        keys_ptr,
+                        slot_ptrs,
+                        slot_multicast_ptr,
+                        round_id_ptr,
+                    )
+
+        @cute.jit
+        def _exchange(
+            self,
+            tidx: Int32,
+            warp: Int32,
+            lane: Int32,
+            rows: Int32,
+            out_ptr: cutlass.Int64,
+            out_stride: Int32,
+            keys_ptr: cutlass.Int64,
+            slot_ptrs: cutlass.Int64,
+            slot_multicast_ptr: cutlass.Int64,
+            round_id_ptr: cutlass.Int64,
+        ):
+            """The distributed argmax's handshake for every row, in one CTA.
+
+            Same slots, band ping-pong, and payload as ``DistArgmaxKernel``:
+            each row's candidate is multicast to slot ``(row, band, rank)``
+            on every rank, each rank reads all ``world_size`` slots of the row
+            and clears their flags, and ``round_id`` advances once per launch
+            after every row is done.
+            """
+            round_bit = (ptx_ld_global_u32(round_id_ptr) & Int32(1)).to(cutlass.Int64)
+            for post_row in cutlass.range(tidx, rows, self.threads):
+                post_addr = keys_ptr + post_row.to(cutlass.Int64) * 8
+                post_key = _ld_relaxed_gpu_b64(post_addr)
+                _st_relaxed_gpu_b64(post_addr, cutlass.Int64(_MARKOV_KEY_NONE))
+                post_value, post_index = _decode_argmax_key(post_key)
+                post_slot = (
+                    post_row.to(cutlass.Int64) * 2 + round_bit
+                ) * self.world_size + self.rank
+                ptx_multimem_st_release_u64(
+                    slot_multicast_ptr + post_slot * 8,
+                    pack_argmax_payload_u64(post_value, post_index),
+                )
+
+            local_slots = ptx_ld_acquire_sys_u64(slot_ptrs + self.rank * 8)
+            segment = lane // self.peers
+            peer = lane % self.peers
+            ready = cutlass.Int64(1) << cutlass.Int64(63)
+            for first in cutlass.range(0, rows, self.rows_per_pass):
+                # Issue every poll of this pass before waiting on any.
+                row_ids = []
+                actives = []
+                addrs = []
+                payloads = []
+                for u in cutlass.range_constexpr(self.exchange_unroll):
+                    row = (
+                        first
+                        + (u * _MARKOV_WARPS + warp) * self.rows_per_warp_pass
+                        + segment
+                    )
+                    active = Int32(0)
+                    if row < rows:
+                        if peer < self.world_size:
+                            active = Int32(1)
+                    addr = (
+                        local_slots
+                        + (
+                            (row.to(cutlass.Int64) * 2 + round_bit) * self.world_size
+                            + peer.to(cutlass.Int64)
+                        )
+                        * 8
+                    )
+                    row_ids.append(row)
+                    actives.append(active)
+                    addrs.append(addr)
+                    payloads.append(_poll_slot(addr, active))
+                for u in cutlass.range_constexpr(self.exchange_unroll):
+                    payload = payloads[u]
+                    while (payload & ready) == cutlass.Int64(0):
+                        payload = _poll_slot(addrs[u], actives[u])
+                    _clear_slot_flag(addrs[u], actives[u])
+                    peer_value, peer_index = unpack_argmax_payload_u64(payload)
+                    peer_key = _argmax_key(peer_value, peer_index)
+                    if actives[u] == Int32(0):
+                        peer_key = cutlass.Int64(_MARKOV_KEY_NONE)
+                    for s in cutlass.range_constexpr(self.peer_steps):
+                        peer_key = _max_key(
+                            peer_key,
+                            cute.arch.shuffle_sync_bfly(peer_key, offset=1 << s),
+                        )
+                    if peer == 0:
+                        if row_ids[u] < rows:
+                            _, winner = _decode_argmax_key(peer_key)
+                            if winner == Int32(0x7FFFFFFF):
+                                winner = Int32(0)
+                            _st_global_b32(
+                                out_ptr
+                                + row_ids[u].to(cutlass.Int64)
+                                * out_stride.to(cutlass.Int64)
+                                * 4,
+                                winner,
+                            )
+            # Every row has read its band: advance the band once per launch.
+            cute.arch.barrier()
+            if tidx == 0:
+                ptx_atomic_add_acq_rel_sys_u32(round_id_ptr, Int32(1))
+
 
 _dist_argmax_compile_cache: dict[tuple, object] = {}
 
@@ -1193,3 +1965,260 @@ def distributed_argmax(
         out_idx = torch.empty((M,), dtype=torch.int64, device=device)
     _dist_argmax_invoke_kernel(state, logits, out_max, out_idx)
     return out_max, out_idx
+
+
+# Fused greedy DSpark Markov step — kernel + operator sharing the slots above.
+
+
+@dataclass
+class MarkovArgmaxWorkspace:
+    """Scratch and compiled kernels of :func:`markov_argmax_step`.
+
+    ``keys`` holds one packed candidate per row and ``ctas_done`` counts the
+    CTAs of a launch. Every launch leaves both as it found them (empty keys,
+    zero), so a captured step replays without host-side resets.
+    """
+
+    state: DistArgmaxState | None
+    device: torch.device
+    max_rows: int
+    vocab_per_rank: int
+    rank_dim: int
+    dtype: torch.dtype
+    keys: torch.Tensor
+    ctas_done: torch.Tensor
+    kernels: dict[int, object]
+
+
+def supports_markov_argmax_shape(
+    vocab_per_rank: int, rank_dim: int, dtype: torch.dtype
+) -> bool:
+    """Whether :func:`markov_argmax_step` covers a shard of this geometry.
+
+    Args:
+        vocab_per_rank: Shard columns of the base logits (projection rows).
+        rank_dim: Markov rank: width of the embedding and projection rows.
+        dtype: Dtype of the base logits, embedding, and projection.
+
+    Returns:
+        True when the kernel covers the geometry. The verdict follows from
+        the model config alone, so every rank reaches the same one.
+    """
+    return (
+        dtype in (torch.bfloat16, torch.float16)
+        and 0 < vocab_per_rank < 0x7FFFFFFF
+        and vocab_per_rank % 16 == 0
+        and rank_dim % 128 == 0
+        and 128 <= rank_dim <= 512
+    )
+
+
+def _markov_row_tiles(rows: int) -> int:
+    """MMA row tiles (8 rows each) one CTA covers for a ``rows``-row step."""
+    tiles = 1
+    while tiles < _MARKOV_MAX_ROW_TILES and 8 * tiles < rows:
+        tiles *= 2
+    return tiles
+
+
+_markov_argmax_compile_cache: dict[tuple, object] = {}
+
+
+def _compile_markov_argmax(
+    dtype: torch.dtype,
+    vocab_per_rank: int,
+    rank_dim: int,
+    row_tiles: int,
+    world_size: int,
+    rank: int,
+):
+    """Compile one specialization; pointers and sizes are runtime arguments."""
+    kernel = MarkovArgmaxStepKernel(
+        torch2cute_dtype_map[dtype],
+        vocab_per_rank,
+        rank_dim,
+        row_tiles,
+        world_size,
+        rank,
+    )
+    # Placeholder values: every argument below is dynamic in the kernel.
+    return cute.compile(
+        kernel, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0, cuda.CUstream(0)
+    )
+
+
+def create_markov_argmax_workspace(
+    state: DistArgmaxState | None,
+    *,
+    device: torch.device,
+    max_rows: int,
+    vocab_per_rank: int,
+    rank_dim: int,
+    dtype: torch.dtype,
+) -> MarkovArgmaxWorkspace:
+    """Allocate the step's scratch and compile every kernel it can select.
+
+    Call before CUDA graph capture: neither allocation nor compilation can be
+    captured, and the step picks its kernel by row count.
+
+    Args:
+        state: Distributed-argmax state whose slots the step exchanges
+            candidates through, or None when one rank holds the whole
+            vocabulary.
+        device: CUDA device of the logits; must be ``state.device`` when a
+            state is given.
+        max_rows: Most rows any step will pass.
+        vocab_per_rank: Columns of this rank's shard.
+        rank_dim: Markov rank.
+        dtype: Dtype of the base logits, embedding, and projection.
+
+    Returns:
+        The workspace to pass to :func:`markov_argmax_step`.
+
+    Raises:
+        RuntimeError: CuTe DSL is unavailable here, or a capture is running.
+        ValueError: The geometry, group, or row bound is unsupported.
+    """
+    if not _CUTE_AVAILABLE:
+        raise RuntimeError("markov_argmax_step requires CuTe DSL on NVIDIA sm_90+")
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("Create the Markov argmax workspace before graph capture")
+    if not supports_markov_argmax_shape(vocab_per_rank, rank_dim, dtype):
+        raise ValueError(
+            f"unsupported Markov argmax geometry: vocab_per_rank={vocab_per_rank}, "
+            f"rank_dim={rank_dim}, dtype={dtype}"
+        )
+    world_size = 1 if state is None else state.world_size
+    rank = 0 if state is None else state.rank_in_group
+    if state is not None:
+        if world_size < 2:
+            raise ValueError("a distributed-argmax state needs at least two ranks")
+        if state.skip_ping_pong:
+            raise ValueError(
+                "the step alternates slot bands; skip_ping_pong is unsupported"
+            )
+        if device != state.device:
+            raise ValueError(f"device {device} differs from state {state.device}")
+        if max_rows > state.max_M:
+            raise ValueError(f"max_rows {max_rows} exceeds state.max_M {state.max_M}")
+    if max_rows < 1:
+        raise ValueError(f"max_rows must be positive, got {max_rows}")
+    kernels = {}
+    for rows in range(1, max_rows + 1):
+        tiles = _markov_row_tiles(rows)
+        key = (dtype, vocab_per_rank, rank_dim, tiles, world_size, rank)
+        if key not in _markov_argmax_compile_cache:
+            _markov_argmax_compile_cache[key] = _compile_markov_argmax(*key)
+        kernels[tiles] = _markov_argmax_compile_cache[key]
+    return MarkovArgmaxWorkspace(
+        state=state,
+        device=device,
+        max_rows=max_rows,
+        vocab_per_rank=vocab_per_rank,
+        rank_dim=rank_dim,
+        dtype=dtype,
+        keys=torch.full(
+            (max_rows,), _MARKOV_KEY_NONE, dtype=torch.int64, device=device
+        ),
+        ctas_done=torch.zeros(1, dtype=torch.int32, device=device),
+        kernels=kernels,
+    )
+
+
+def markov_argmax_step(
+    workspace: MarkovArgmaxWorkspace,
+    base_logits: torch.Tensor,
+    prev_tokens: torch.Tensor,
+    embedding: torch.Tensor,
+    projection: torch.Tensor,
+    vocab_start: int,
+    out: torch.Tensor,
+) -> None:
+    """One greedy DSpark Markov step in one kernel launch.
+
+    For row ``m``, with ``p = clamp(prev_tokens[m], 0, embedding.shape[0] -
+    1)``: ``bias = embedding[p] @ projection.T`` accumulated in FP32 and
+    rounded to the logits dtype, ``logits = base_logits[m] + bias`` rounded
+    to the logits dtype, and ``out[m]`` receives the global token id
+    (``vocab_start`` + shard column) of the largest logit over every rank of
+    the workspace's group. Ties go to the lowest token id; a row whose
+    logits never beat -inf (all -inf or NaN) yields 0. With a state, every
+    rank calls in lockstep with the same row count, like
+    :func:`distributed_argmax`, whose slots and band order it shares.
+
+    Args:
+        workspace: From :func:`create_markov_argmax_workspace`.
+        base_logits: ``[rows, vocab_per_rank]`` contiguous base logits of
+            this rank's shard.
+        prev_tokens: ``[rows]`` int32 previous tokens, any stride.
+        embedding: ``[vocab, rank_dim]`` contiguous Markov embedding.
+        projection: ``[vocab_per_rank, rank_dim]`` contiguous projection rows
+            of this rank's shard.
+        vocab_start: Global token id of shard column 0.
+        out: ``[rows]`` int32 destination, any stride. It may be another
+            column of the table ``prev_tokens`` reads.
+
+    Returns:
+        None. ``out`` is written in place.
+
+    Raises:
+        ValueError: A tensor's shape, dtype, layout, or device does not match
+            the workspace, or ``rows`` exceeds ``workspace.max_rows``.
+    """
+    if base_logits.dim() != 2 or not base_logits.is_contiguous():
+        raise ValueError("base_logits must be a contiguous [rows, vocab] tensor")
+    rows, vocab = base_logits.shape
+    expected = {
+        "base_logits": (base_logits, (rows, workspace.vocab_per_rank), workspace.dtype),
+        "embedding": (
+            embedding,
+            (embedding.shape[0], workspace.rank_dim),
+            workspace.dtype,
+        ),
+        "projection": (
+            projection,
+            (workspace.vocab_per_rank, workspace.rank_dim),
+            workspace.dtype,
+        ),
+        "prev_tokens": (prev_tokens, (rows,), torch.int32),
+        "out": (out, (rows,), torch.int32),
+    }
+    for name, (tensor, shape, dtype) in expected.items():
+        if tuple(tensor.shape) != shape or tensor.dtype != dtype:
+            raise ValueError(
+                f"{name} must be {dtype} of shape {shape}; got {tensor.dtype} "
+                f"of shape {tuple(tensor.shape)}"
+            )
+        if tensor.device != workspace.device:
+            raise ValueError(f"{name} is on {tensor.device}, not {workspace.device}")
+    if not (embedding.is_contiguous() and projection.is_contiguous()):
+        raise ValueError("embedding and projection must be contiguous")
+    if embedding.data_ptr() % 16 or projection.data_ptr() % 16:
+        raise ValueError("embedding and projection rows are read in 16-byte words")
+    if embedding.shape[0] < 1:
+        raise ValueError("embedding must have at least one row")
+    if rows > workspace.max_rows:
+        raise ValueError(f"rows {rows} exceeds workspace.max_rows {workspace.max_rows}")
+    if not 0 <= vocab_start < 0x7FFFFFFF - vocab:
+        raise ValueError(f"vocab_start {vocab_start} overflows the 31-bit token id")
+    if rows == 0:
+        return
+    state = workspace.state
+    workspace.kernels[_markov_row_tiles(rows)](
+        base_logits.data_ptr(),
+        prev_tokens.data_ptr(),
+        prev_tokens.stride(0),
+        out.data_ptr(),
+        out.stride(0),
+        embedding.data_ptr(),
+        embedding.shape[0],
+        projection.data_ptr(),
+        vocab_start,
+        rows,
+        workspace.keys.data_ptr(),
+        workspace.ctas_done.data_ptr(),
+        0 if state is None else state.slot_handle.buffer_ptrs_dev,
+        0 if state is None else state.slot_handle.multicast_ptr,
+        0 if state is None else state.round_id_gpu.data_ptr(),
+        cuda.CUstream(torch.cuda.current_stream(workspace.device).cuda_stream),
+    )

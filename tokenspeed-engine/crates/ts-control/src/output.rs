@@ -27,7 +27,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ts_scheduler::{ForwardBatchView, ForwardEvent, ForwardEventKind, SchedulerAbortView};
+use ts_scheduler::{profile, ForwardBatchView, ForwardEvent, ForwardEventKind, SchedulerAbortView};
 
 use ts_wire::output::FinishDetails;
 
@@ -185,25 +185,41 @@ pub struct HistorySeeds {
     pub slots: Vec<i32>,
     /// Each slot's committed prefix length.
     pub prefix_lengths: Vec<i64>,
-    /// Each slot's committed prefix.
+    /// Each slot's committed prefix, or only its last tokens when the model
+    /// reads a bounded lookback: they end at the prefix length.
     pub tokens: Vec<Vec<i32>>,
 }
 
 /// Which request's committed tokens each history row holds.
 ///
 /// Every forward appends its inputs to its slot's row at the committed
-/// frontier, so a row holds a request's tokens from position 0 once it
-/// started there at position 0 or was seeded there, until another request
-/// runs in the slot. A forward seeds its committed prefix otherwise: after
-/// a prefix-cache hit, a slot handoff, a retracted request's restore into
+/// frontier, so a row holds the request's readable committed tokens until
+/// another request runs in the slot. With a bounded lookback, positions
+/// before the seeded tail remain unspecified. A forward seeds its committed
+/// prefix after a prefix-cache hit, a slot handoff, a retracted request's restore into
 /// another slot, or a PD decode landing. Ownership is per admission, not
-/// per request id, which clients may reuse.
+/// per request id, which clients may reuse. Only the request's latest slot
+/// holds its current history; returning to an earlier slot must seed again.
+///
+/// A model that reads at most `lookback` committed tokens behind the
+/// frontier (an n-gram hash, say) needs only those seeded: a 200K-token
+/// prefix-cache hit then ships a few tokens to the device, not the prefix.
 #[derive(Debug, Default)]
 pub struct HistoryRows {
     owners: HashMap<i32, u64>,
+    lookback: Option<usize>,
 }
 
 impl HistoryRows {
+    /// Rows whose seeds carry the last `lookback` committed tokens, or the
+    /// whole prefix with None.
+    pub fn new(lookback: Option<usize>) -> Self {
+        Self {
+            owners: HashMap::new(),
+            lookback,
+        }
+    }
+
     /// Record `batch`'s slot ownership and the prefixes it must seed, or
     /// `None` when no row needs one. Called once per dispatched forward, in
     /// dispatch order.
@@ -219,6 +235,12 @@ impl HistoryRows {
                 .state(rid)
                 .ok_or_else(|| CommitError::History(rid.clone()))?;
             let held = self.owners.insert(slot, state.admission) == Some(state.admission);
+            if !held {
+                // An old row becomes stale as this request advances elsewhere.
+                // Forget it on a move, including before a prefix-zero extend.
+                self.owners
+                    .retain(|other_slot, owner| *other_slot == slot || *owner != state.admission);
+            }
             let total = state.prompt_ids.len() + state.output_ids.len();
             let boundary = if i < batch.num_extends {
                 batch.extend_prefix_lens[i].max(0) as usize
@@ -231,13 +253,15 @@ impl HistoryRows {
             if boundary > total {
                 return Err(CommitError::History(rid.clone()));
             }
+            let start = self.lookback.map_or(0, |n| boundary.saturating_sub(n));
             let prompt = &state.prompt_ids;
             let prefix: Vec<i32> = if boundary <= prompt.len() {
-                prompt[..boundary].to_vec()
+                prompt[start..boundary].to_vec()
             } else {
                 prompt
                     .iter()
                     .chain(&state.output_ids[..boundary - prompt.len()])
+                    .skip(start)
                     .copied()
                     .collect()
             };
@@ -264,6 +288,8 @@ pub struct StreamedOutput {
     pub completion_tokens: i64,
     /// Prompt tokens served from the prefix cache.
     pub cached_tokens: i64,
+    /// Reasoning tokens generated so far, excluding structural markers.
+    pub reasoning_tokens: i64,
     /// Logprobs of `output_ids`; empty when not requested.
     pub output_logprobs: Vec<f64>,
     /// Cumulative probability mass of `output_ids`; empty without diagnostics
@@ -449,6 +475,8 @@ pub struct FinishLog {
     /// `--enable-log-request-stats`: the timing summary replaces the
     /// accept-length line.
     pub request_stats: bool,
+    /// Percentage of PD rooms to trace through their first output.
+    pub ttft_percentage: u8,
 }
 
 /// Per-request latency samples and token totals since the last drain.
@@ -481,7 +509,7 @@ pub struct OutputProcessor {
     finish_log: FinishLog,
     /// When the last commit ran, for the request stats' decode steps.
     last_commit_at: f64,
-    /// Requests registered so far, numbering each admission.
+    /// Identities allocated so far, before data-plane admission.
     admissions: u64,
     metrics_enabled: bool,
     /// Metric deltas since the event loop last drained them.
@@ -568,19 +596,28 @@ impl OutputProcessor {
 
     /// Stamp the first dispatch of `rids`, for the request stats.
     pub fn mark_scheduled(&mut self, rids: &[String]) {
-        if !(self.finish_log.request_stats || self.trace.is_some()) {
+        let stats = self.finish_log.request_stats || self.trace.is_some();
+        if !stats && self.finish_log.ttft_percentage == 0 {
             return;
         }
-        let now = wall_seconds();
+        let now = stats.then(wall_seconds);
         for rid in rids {
-            if let Some(timings) = self.states.get_mut(rid).and_then(|s| s.timings.as_mut()) {
-                timings.mark_scheduled(now);
+            if let Some(state) = self.states.get_mut(rid) {
+                if let (Some(timings), Some(now)) = (state.timings.as_mut(), now) {
+                    timings.mark_scheduled(now);
+                }
+                if let Some(trace) = state.ttft.as_mut() {
+                    if trace.scheduled_ms.is_none() {
+                        trace.scheduled_ms = Some(trace.ms());
+                    }
+                }
             }
         }
     }
 
     /// Log a request's stats line as it leaves the processor.
     fn log_end(&mut self, rid: &str, state: &RequestState) {
+        self.log_finished(rid, state);
         if self.metrics_enabled {
             // Cache and prompt totals feed the derived cache metrics.
             self.prompt_tokens += state.prompt_len.max(0) as u64;
@@ -588,19 +625,39 @@ impl OutputProcessor {
             self.completion_tokens += state.output_ids.len() as u64;
             self.collect_request_latencies(state);
         }
-        if !self.finish_log.enabled {
-            return;
+    }
+
+    fn log_finished(&self, rid: &str, state: &RequestState) {
+        if let Some(trace) = &state.ttft {
+            trace.finish(rid, state);
         }
-        if let Some(timings) = &state.timings {
+        if self.finish_log.enabled && tracing::enabled!(tracing::Level::INFO) {
+            let finished_at = wall_seconds();
+            let stats = state
+                .timings
+                .as_ref()
+                .filter(|_| self.finish_log.request_stats)
+                .map(|timings| {
+                    request_stats::stats_line(
+                        rid,
+                        state,
+                        timings,
+                        finished_at,
+                        self.spec_num_tokens,
+                    )
+                });
             tracing::info!(
-                "{}",
-                request_stats::stats_line(
-                    rid,
-                    state,
-                    timings,
-                    wall_seconds(),
-                    self.spec_num_tokens
-                )
+                rid,
+                role = ?self.role,
+                prompt_tokens = state.prompt_len,
+                completion_tokens = state.output_ids.len(),
+                finish_reason = state.finished_reason.as_ref().map(FinishReason::wire_type),
+                abort_reason = state.finished_reason.as_ref().and_then(FinishReason::abort_message),
+                cached_tokens = state.cached_tokens,
+                e2e_latency_s = (state.created_time > 0.0)
+                    .then(|| (finished_at - state.created_time).max(0.0)),
+                request_stats = stats.as_deref(),
+                "event=ts_request_finished"
             );
         }
     }
@@ -678,6 +735,14 @@ impl OutputProcessor {
         self.spec_num_tokens
     }
 
+    /// Whether this rank can collect sampled PD first-output summaries.
+    pub(crate) fn ttft_sampling_enabled(&self) -> bool {
+        self.finish_log.enabled
+            && self.finish_log.ttft_percentage > 0
+            && self.role != Role::Plain
+            && tracing::enabled!(target: "ts_control::request_stats", tracing::Level::INFO)
+    }
+
     /// When `rid` reached the scheduler's waiting queue, the first time this
     /// is asked after it did: a retraction re-queues
     /// a request without re-stamping it.
@@ -685,10 +750,46 @@ impl OutputProcessor {
         self.states.get_mut(rid)?.submitted_at.take()
     }
 
+    /// Observe KV-ready waiting once, only for a request that starts decode.
+    pub fn take_decode_ready_at(&mut self, rid: &str) -> Option<Instant> {
+        let state = self.states.get_mut(rid)?;
+        let at = state.decode_ready_at.take();
+        if state.to_abort || state.finished() {
+            return None;
+        }
+        at
+    }
+
     /// Stamp `rid`'s arrival in the scheduler's waiting queue.
     pub fn mark_submitted(&mut self, rid: &str, at: Instant) {
         if let Some(state) = self.states.get_mut(rid) {
             state.submitted_at = Some(at);
+            if let Some(trace) = state.ttft.as_mut() {
+                let now = trace.ms();
+                trace.submitted_ms.get_or_insert(now);
+            }
+        }
+    }
+
+    /// Stamp the first plan selecting a sampled request, before DP agreement.
+    /// Remote admission reserves the D landing pages; it is not a forward.
+    pub fn mark_planned(&mut self, rids: &[String], remote_admission: bool) {
+        if self.finish_log.ttft_percentage == 0 {
+            return;
+        }
+        for rid in rids {
+            if let Some(trace) = self
+                .states
+                .get_mut(rid)
+                .and_then(|state| state.ttft.as_mut())
+            {
+                let now = trace.ms();
+                if remote_admission {
+                    trace.remote_admitted_ms.get_or_insert(now);
+                } else {
+                    trace.planned_ms.get_or_insert(now);
+                }
+            }
         }
     }
 
@@ -702,10 +803,43 @@ impl OutputProcessor {
         self.states.get(rid)
     }
 
-    /// Admit a request. An abort that arrived before it applies now.
-    pub fn register(&mut self, rid: String, mut state: RequestState) {
-        self.admissions += 1;
+    pub(crate) fn sample_ttft(
+        &self,
+        state: &mut RequestState,
+        bootstrap: Option<&ts_pd::BootstrapInfo>,
+    ) {
+        if self.ttft_sampling_enabled() {
+            state.ttft = bootstrap.and_then(|b| {
+                request_stats::TtftTrace::sample(self.finish_log.ttft_percentage, self.role, b)
+            });
+        }
+    }
+
+    pub(crate) fn bootstrapped(&mut self, rid: &str) {
+        if self.finish_log.ttft_percentage > 0 {
+            if let Some(trace) = self.states.get_mut(rid).and_then(|s| s.ttft.as_mut()) {
+                trace.bootstrapped(rid);
+            }
+        }
+    }
+
+    /// Give a new request its identity before either plane registers it.
+    pub fn assign_admission(&mut self, state: &mut RequestState) {
+        assert_eq!(
+            state.admission, 0,
+            "request already has an admission identity"
+        );
+        self.admissions = self
+            .admissions
+            .checked_add(1)
+            .expect("admission identity exhausted");
         state.admission = self.admissions;
+    }
+
+    /// Register a request whose identity was assigned before data-plane admission.
+    /// An abort that arrived before it applies now.
+    pub fn register(&mut self, rid: String, mut state: RequestState) {
+        assert_ne!(state.admission, 0, "assign an identity before registration");
         if let Some(index) = self.pending_aborts.iter().position(|(id, _)| *id == rid) {
             self.pending_aborts.remove(index);
             state.abort("AbortReq from client", false, None);
@@ -716,6 +850,16 @@ impl OutputProcessor {
         }
         if self.finish_log.request_stats || self.trace.is_some() {
             state.timings = Some(RequestTimings::default());
+        }
+        if self.finish_log.enabled {
+            tracing::info!(
+                rid,
+                role = ?self.role,
+                session_id = state.session_id.as_deref(),
+                input_tokens = state.prompt_len,
+                max_new_tokens = state.max_new_tokens,
+                "event=ts_request_accepted"
+            );
         }
         self.states.insert(rid, state);
     }
@@ -728,6 +872,9 @@ impl OutputProcessor {
         let Some(mut state) = self.states.remove(rid) else {
             return committed;
         };
+        if let Some(trace) = &mut state.ttft {
+            trace.transfer_done_ms = Some(trace.ms());
+        }
         if !state.finished() {
             state.finished_reason = Some(FinishReason::Length(state.output_ids.len() as i64));
         }
@@ -756,8 +903,17 @@ impl OutputProcessor {
         let Some(state) = self.states.get_mut(rid) else {
             return;
         };
+        if self.metrics_enabled {
+            state.decode_ready_at.get_or_insert_with(Instant::now);
+        }
+        if let Some(trace) = &mut state.ttft {
+            trace.transfer_done_ms = Some(trace.ms());
+        }
         state.cached_tokens = cached_tokens;
         state.output_ids.push(bootstrap_token);
+        if let Some(tokens) = &mut state.reasoning_tokens {
+            tokens.push([bootstrap_token]);
+        }
         if (self.metrics_enabled || state.timings.is_some()) && state.first_token_time == 0.0 {
             // The decode node never samples this token; its arrival is the
             // decode role's first-token boundary.
@@ -780,11 +936,18 @@ impl OutputProcessor {
         // its own matcher, or every decode step would mask from a state one
         // token behind.
         if let Some(grammar) = &state.grammar {
-            grammar
+            if !grammar
                 .matcher
                 .lock()
                 .expect("matcher lock")
-                .accept_token(bootstrap_token);
+                .accept_token(bootstrap_token)
+            {
+                tracing::warn!(
+                    rid,
+                    token = bootstrap_token,
+                    "grammar rejected the remote bootstrap token"
+                );
+            }
         }
         state.check_finished(false);
     }
@@ -819,28 +982,24 @@ impl OutputProcessor {
         committed
     }
 
-    /// A request's PD transfer failed. The scheduler already released it
-    /// on the event; the client gets an abort, unless it ended before and
-    /// tore down its stream.
+    /// A request's PD transfer failed. A computed prefill still needs its
+    /// final output; only a client abort or an already-sent final stays silent.
+    /// The scheduler keeps its pages until the transfer and local forwards retire.
     pub fn fail_transfer(&mut self, rid: &str) -> Committed {
         let mut committed = Committed::default();
         let Some(mut state) = self.states.remove(rid) else {
             return committed;
         };
-        if !state.finished() {
-            state.abort("PD/EPD remote transfer failed or timed out", false, None);
-            state.finished_output = false;
-            committed.outputs =
-                Self::stream_state(rid, &mut state, self.stream_interval, self.spec_num_tokens)
-                    .into_iter()
-                    .collect();
-        } else if state.abort_notify_client {
-            state.finished_output = false;
+        if !state.to_abort && !state.finished_output {
+            state.abort("PD/EPD remote transfer failed or timed out", true, None);
+        }
+        if state.abort_notify_client {
             committed.outputs =
                 Self::stream_state(rid, &mut state, self.stream_interval, self.spec_num_tokens)
                     .into_iter()
                     .collect();
         }
+        self.log_finished(rid, &state);
         self.trace_end(rid, &state);
         committed.released.push(rid.to_owned());
         committed
@@ -848,6 +1007,12 @@ impl OutputProcessor {
 
     /// Abort a request now, or when it registers if it has not yet.
     pub fn mark_abort(&mut self, rid: &str, notify_client: bool) {
+        tracing::debug!(
+            rid,
+            notify_client,
+            registered = self.states.contains_key(rid),
+            "abort requested"
+        );
         if let Some(state) = self.states.get_mut(rid) {
             let message = if notify_client {
                 "Aborted by pause"
@@ -883,6 +1048,7 @@ impl OutputProcessor {
             self.pending_aborts.remove(index);
         }
         state.finished_output = false;
+        self.log_finished(rid, &state);
         Self::stream_state(rid, &mut state, self.stream_interval, self.spec_num_tokens)
             .into_iter()
             .collect()
@@ -908,6 +1074,7 @@ impl OutputProcessor {
                     .into_iter()
                     .collect();
         }
+        self.log_finished(rid, &state);
         committed.released.push(rid.to_owned());
         committed
     }
@@ -925,6 +1092,7 @@ impl OutputProcessor {
             return committed;
         };
         if !state.finished() {
+            tracing::warn!(rid, reason, status_code, "request failed before scheduling");
             state.abort(reason, true, status_code);
         }
         if !state.to_abort || state.abort_notify_client {
@@ -1003,7 +1171,7 @@ impl OutputProcessor {
                 }
                 let lo = chunk_start.max(state.logprob_start_len);
                 let hi = (chunk_start + chunk_len).min(state.prompt_len - 1);
-                if state.wants_input_logprobs() && state.input_logprobs.is_none() && lo < hi {
+                if state.wants_input_logprobs() && !state.input_logprobs_finalized() && lo < hi {
                     row = (row_offset + lo - chunk_start, hi - lo, lo);
                     input.top_k = input.top_k.max(state.top_logprobs_num);
                 }
@@ -1126,6 +1294,7 @@ impl OutputProcessor {
         input_logprobs: Option<&InputLogprobPlan>,
         result: &ForwardResult,
     ) -> Result<Committed, CommitError> {
+        let _span = profile::span("OutputProcessor::commit");
         let rows = batch.request_ids.len();
         let check = |column, found| {
             if found == rows {
@@ -1233,6 +1402,18 @@ impl OutputProcessor {
                 continue;
             };
             if i < batch.num_extends {
+                if let Some(trace) = &mut state.ttft {
+                    trace.prefill_chunks += 1;
+                }
+                tracing::debug!(
+                    rid,
+                    prefix_tokens = batch.extend_prefix_lens[i],
+                    cached_tokens = state.cached_tokens,
+                    chunk_tokens = batch.input_lengths[i],
+                    prompt_tokens = batch.prefill_lengths[i],
+                    last_chunk = !mid_chunk,
+                    "prefill chunk committed"
+                );
                 state.computed_length =
                     i64::from(batch.input_lengths[i] + batch.extend_prefix_lens[i]);
             } else {
@@ -1260,6 +1441,13 @@ impl OutputProcessor {
                         rid: rid.clone(),
                         detail,
                     })?;
+            }
+            if !is_decode {
+                if let Some(trace) = &mut state.ttft {
+                    if trace.prompt_done_ms.is_none() {
+                        trace.prompt_done_ms = Some(trace.ms());
+                    }
+                }
             }
             if let Some(timings) = state.timings.as_mut() {
                 timings.mark_prefill_done(stats_now);
@@ -1315,6 +1503,9 @@ impl OutputProcessor {
             let before = state.output_ids.len();
             for (j, &token) in model_ids.iter().enumerate() {
                 state.output_ids.push(token);
+                if let Some(tokens) = &mut state.reasoning_tokens {
+                    tokens.push([token]);
+                }
                 if !hostfunc {
                     if let Some(grammar) = &state.grammar {
                         let mut matcher = grammar.matcher.lock().expect("matcher lock");
@@ -1491,6 +1682,17 @@ impl OutputProcessor {
         if state.finished() {
             state.finished_output = true;
         }
+        if let Some(trace) = state.ttft.take() {
+            trace.finish(rid, state);
+        }
+        tracing::debug!(
+            rid,
+            prompt_tokens = state.prompt_len,
+            cached_tokens = state.cached_tokens,
+            output_tokens = state.output_ids.len(),
+            finished = state.finished(),
+            "stream output"
+        );
         let sent = state.send_token_offset;
         let output_ids = state.output_ids[sent..].to_vec();
         state.send_token_offset = state.output_ids.len();
@@ -1521,7 +1723,7 @@ impl OutputProcessor {
         let input_logprobs = if state.input_logprobs_sent {
             None
         } else {
-            state.input_logprobs.clone()
+            state.input_logprobs.take()
         };
         state.input_logprobs_sent |= input_logprobs.is_some();
         let output_top_logprobs = state.output_top_logprobs.as_ref().map(|(values, ids)| {
@@ -1537,6 +1739,7 @@ impl OutputProcessor {
             prompt_tokens: state.prompt_len,
             completion_tokens: state.output_ids.len() as i64,
             cached_tokens: state.cached_tokens,
+            reasoning_tokens: state.reasoning_tokens.map_or(0, |tokens| tokens.count()),
             output_logprobs,
             output_token_cumulative_probs,
             finish_details: state.finished_reason.as_ref().map(FinishReason::details),
@@ -1609,6 +1812,7 @@ mod tests {
     const NO_FINISH_LOG: FinishLog = FinishLog {
         enabled: false,
         request_stats: false,
+        ttft_percentage: 0,
     };
 
     fn processor(spec_num_tokens: Option<usize>) -> OutputProcessor {
@@ -1623,9 +1827,15 @@ mod tests {
         )
     }
 
+    fn register_state(p: &mut OutputProcessor, rid: String, mut state: RequestState) {
+        p.assign_admission(&mut state);
+        p.register(rid, state);
+    }
+
     fn register(p: &mut OutputProcessor, rid: &str, prompt: i64, max_new: i64, stop: &[i32]) {
         let stops: BTreeSet<i32> = stop.iter().copied().collect();
-        p.register(
+        register_state(
+            p,
             rid.to_owned(),
             RequestState::new(vec![0; prompt as usize], max_new, stops, true, None, false),
         );
@@ -1654,7 +1864,7 @@ mod tests {
             top_logprobs_num: top_k,
             computes_prompt_logprobs,
         });
-        p.register(rid.to_owned(), state);
+        register_state(p, rid.to_owned(), state);
     }
 
     /// The forward result of a plan's rows: each row's logprob is
@@ -1683,7 +1893,7 @@ mod tests {
     fn register_history(p: &mut OutputProcessor, rid: &str, prompt: &[i32], output: &[i32]) {
         let mut state = RequestState::new(prompt.to_vec(), 8, BTreeSet::new(), true, None, false);
         state.output_ids = output.to_vec();
-        p.register(rid.to_owned(), state);
+        register_state(p, rid.to_owned(), state);
     }
 
     /// One forward over `rows` of (rid, slot, extend prefix length), the
@@ -1719,6 +1929,235 @@ mod tests {
     }
 
     #[test]
+    fn commits_accumulate_reasoning_usage() {
+        let grammar = crate::grammar::ReasoningGrammar {
+            continues: String::new(),
+            may_open: String::new(),
+            schema_slot: String::new(),
+            markers: Some((1, 2)),
+            implicit_closer: None,
+            boundary: None,
+        };
+        let mut state = RequestState::new(vec![1], 10, BTreeSet::new(), true, None, false);
+        state.reasoning_tokens = Some(crate::request::ReasoningTokens::new(
+            &grammar,
+            &state.prompt_ids,
+        ));
+        let mut p = processor(None);
+        register_state(&mut p, "r".to_owned(), state);
+
+        for (i, (token, expected)) in [(10, 1), (11, 2), (2, 2), (12, 2)].into_iter().enumerate() {
+            let input_length = i as i32 + 1;
+            let committed = p
+                .commit(
+                    &batch(&[("r", input_length, 0, 1)], usize::from(i == 0)),
+                    None,
+                    &result(&[token], &[1]),
+                )
+                .unwrap();
+            assert_eq!(committed.outputs[0].reasoning_tokens, expected);
+        }
+    }
+
+    #[test]
+    fn ttft_sampling_depends_on_pd_summary_settings_and_the_log_filter() {
+        use tracing::Level;
+
+        for (level, role, enabled, percentage, request_stats, expected) in [
+            (Level::INFO, Role::Prefill, true, 100, false, true),
+            (Level::INFO, Role::Decode, true, 100, false, true),
+            (Level::INFO, Role::Decode, true, 1, false, true),
+            (Level::INFO, Role::Prefill, true, 0, false, false),
+            (Level::INFO, Role::Decode, true, 0, true, false),
+            (Level::DEBUG, Role::Decode, true, 0, false, false),
+            (Level::WARN, Role::Decode, true, 100, true, false),
+            (Level::INFO, Role::Decode, false, 100, true, false),
+            (Level::INFO, Role::Plain, true, 100, true, false),
+            (Level::DEBUG, Role::Decode, true, 100, false, true),
+        ] {
+            let subscriber = tracing_subscriber::fmt()
+                .with_max_level(level)
+                .with_writer(std::io::sink)
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                let processor = OutputProcessor::new(
+                    None,
+                    1,
+                    None,
+                    role,
+                    FinishLog {
+                        enabled,
+                        request_stats,
+                        ttft_percentage: percentage,
+                    },
+                    false,
+                    None,
+                );
+                let mut state =
+                    RequestState::new(vec![8, 9], 4, BTreeSet::new(), true, None, false);
+                // Room 4 is selected even at one percent sampling.
+                processor.sample_ttft(
+                    &mut state,
+                    Some(&ts_pd::BootstrapInfo {
+                        room: 4,
+                        host: "p".into(),
+                        port: 8080,
+                    }),
+                );
+                assert_eq!(state.ttft.is_some(), expected);
+                assert_eq!(processor.ttft_sampling_enabled(), expected);
+            });
+        }
+    }
+
+    #[test]
+    fn sampled_rooms_emit_bootstrap_and_first_output_once() {
+        use std::{io::Read, os::unix::net::UnixStream};
+        let (writer, mut reader) = UnixStream::pair().unwrap();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || writer.try_clone().unwrap())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            for role in [Role::Prefill, Role::Decode] {
+                let mut processor = OutputProcessor::new(
+                    None,
+                    1,
+                    None,
+                    role,
+                    FinishLog {
+                        enabled: true,
+                        request_stats: false,
+                        ttft_percentage: 1,
+                    },
+                    false,
+                    None,
+                );
+                // Python zlib.crc32 of the decimal room, modulo 1000:
+                // room 4 lands in bucket 8, room 5 is outside the sample.
+                for (room, rid) in [(4, "kept"), (5, "skipped")] {
+                    let mut state =
+                        RequestState::new(vec![8, 9], 1, BTreeSet::new(), true, None, false);
+                    let bootstrap = ts_pd::BootstrapInfo {
+                        room,
+                        host: "p".into(),
+                        port: 8080,
+                    };
+                    processor.sample_ttft(&mut state, Some(&bootstrap));
+                    register_state(&mut processor, rid.into(), state);
+                    processor.mark_submitted(rid, Instant::now());
+                    processor.bootstrapped(rid);
+                    processor.bootstrapped(rid);
+                    if role == Role::Prefill {
+                        processor.mark_planned(&[rid.into()], false);
+                        processor.mark_scheduled(&[rid.into()]);
+                        let committed = processor
+                            .commit(&batch(&[(rid, 2, 0, 2)], 1), None, &result(&[10], &[1]))
+                            .unwrap();
+                        assert!(committed.outputs.is_empty());
+                        if rid == "kept" {
+                            let trace = processor.state(rid).unwrap().ttft.as_ref().unwrap();
+                            assert!(trace.transfer_done_ms.is_none());
+                        }
+                        processor.finish_prefill(rid);
+                    } else {
+                        processor.mark_planned(&[rid.into()], true);
+                        processor.remote_prefill_done(rid, 10, 1, None);
+                        processor.finish_remote_prefill_only(rid);
+                    }
+                }
+            }
+        });
+        let mut log = String::new();
+        reader.read_to_string(&mut log).unwrap();
+        let records = |marker| {
+            log.lines()
+                .filter_map(|line| line.split_once(marker))
+                .map(|(_, data)| serde_json::from_str::<serde_json::Value>(data).unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(records("TTFTBootstrap ").len(), 1, "{log}");
+        let summaries = records("TTFTBreakdown ");
+        assert_eq!(summaries.len(), 2, "{log}");
+        for summary in &summaries {
+            assert_eq!(summary["rid"], "kept");
+            assert_eq!(summary["room"], 4);
+            assert_eq!(summary["status"], "first_output");
+            assert!(summary["phases_ms"]["bootstrap"].is_number());
+            assert!(summary["milestones_ms"]["submitted"].is_number());
+        }
+        assert_eq!(summaries[0]["prefill_chunks"], 1);
+        assert!(summaries[0]["phases_ms"]["prefill"].is_number());
+        assert!(summaries[0]["phases_ms"]["ready_to_plan"].is_number());
+        assert!(summaries[0]["phases_ms"]["plan_to_dispatch"].is_number());
+        assert!(summaries[1]["phases_ms"]["remote_admission"].is_number());
+        assert!(summaries[1]["milestones_ms"]["first_planned"].is_null());
+        assert!(summaries[0]["phases_ms"]["transfer_observe"].is_number());
+        assert!(summaries[0]["phases_ms"]["output_pack"].is_number());
+        assert!(summaries[1]["phases_ms"]["output_after_landing"].is_number());
+    }
+
+    #[test]
+    fn sampled_milestones_keep_the_first_submission_and_each_plan_kind() {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(std::io::sink)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let mut processor = OutputProcessor::new(
+                None,
+                1,
+                None,
+                Role::Decode,
+                FinishLog {
+                    enabled: true,
+                    request_stats: false,
+                    ttft_percentage: 100,
+                },
+                false,
+                None,
+            );
+            let mut state = RequestState::new(vec![8, 9], 4, BTreeSet::new(), true, None, false);
+            processor.sample_ttft(
+                &mut state,
+                Some(&ts_pd::BootstrapInfo {
+                    room: 4,
+                    host: "p".into(),
+                    port: 8080,
+                }),
+            );
+            register_state(&mut processor, "r".into(), state);
+            processor.mark_submitted("r", Instant::now());
+            processor.bootstrapped("r");
+            processor.mark_planned(&["r".into()], true);
+            let trace = processor.state("r").unwrap().ttft.as_ref().unwrap();
+            let first_submit = trace.submitted_ms.unwrap();
+            let remote_admitted = trace.remote_admitted_ms.unwrap();
+            assert!(trace.planned_ms.is_none());
+
+            processor.remote_prefill_done("r", 10, 0, None);
+            processor.mark_planned(&["r".into()], false);
+            processor.mark_scheduled(&["r".into()]);
+            let trace = processor.state("r").unwrap().ttft.as_ref().unwrap();
+            let first_plan = trace.planned_ms.unwrap();
+            let first_dispatch = trace.scheduled_ms.unwrap();
+            assert!(remote_admitted <= trace.transfer_done_ms.unwrap());
+            assert!(trace.transfer_done_ms.unwrap() <= first_plan);
+            assert!(first_plan <= first_dispatch);
+
+            processor.mark_submitted("r", Instant::now());
+            processor.mark_planned(&["r".into()], true);
+            processor.mark_planned(&["r".into()], false);
+            processor.mark_scheduled(&["r".into()]);
+            let trace = processor.state("r").unwrap().ttft.as_ref().unwrap();
+            assert_eq!(trace.submitted_ms, Some(first_submit));
+            assert_eq!(trace.remote_admitted_ms, Some(remote_admitted));
+            assert_eq!(trace.planned_ms, Some(first_plan));
+            assert_eq!(trace.scheduled_ms, Some(first_dispatch));
+        });
+    }
+
+    #[test]
     fn request_latency_samples_use_the_prefill_boundaries() {
         let mut p = OutputProcessor::new(
             None,
@@ -1746,14 +2185,59 @@ mod tests {
     }
 
     #[test]
-    fn a_decode_landing_sets_the_first_token_boundary() {
+    fn decode_ready_wait_starts_at_kv_landing_and_is_observed_once() {
+        let mut p = OutputProcessor::new(None, 1, None, Role::Decode, NO_FINISH_LOG, true, None);
+        register(&mut p, "a", 4, 8, &[]);
+        assert!(p.take_decode_ready_at("a").is_none());
+        let before = Instant::now();
+        p.remote_prefill_done("a", 7, 0, None);
+        let after = Instant::now();
+        let ready = p.take_decode_ready_at("a").unwrap();
+        assert!(before <= ready && ready <= after);
+        assert!(p.take_decode_ready_at("a").is_none());
+
+        register(&mut p, "cancelled", 4, 8, &[]);
+        p.remote_prefill_done("cancelled", 7, 0, None);
+        p.states.get_mut("cancelled").unwrap().to_abort = true;
+        assert!(p.take_decode_ready_at("cancelled").is_none());
+
+        register(&mut p, "finished", 4, 1, &[]);
+        p.remote_prefill_done("finished", 7, 0, None);
+        p.finish_remote_prefill_only("finished");
+        assert!(p.take_decode_ready_at("finished").is_none());
+    }
+
+    #[test]
+    fn decode_ready_wait_does_not_stamp_without_metrics() {
+        let mut p = OutputProcessor::new(None, 1, None, Role::Decode, NO_FINISH_LOG, false, None);
+        register(&mut p, "a", 4, 8, &[]);
+        p.remote_prefill_done("a", 7, 0, None);
+        assert!(p.take_decode_ready_at("a").is_none());
+    }
+
+    #[test]
+    fn a_decode_landing_sets_the_first_token_boundary_and_reasoning_usage() {
         let mut p =
             OutputProcessor::new(None, 1, Some(4096), Role::Decode, NO_FINISH_LOG, true, None);
         register(&mut p, "a", 4, 8, &[]);
+        let grammar = crate::grammar::ReasoningGrammar {
+            continues: String::new(),
+            may_open: String::new(),
+            schema_slot: String::new(),
+            markers: Some((0, 2)),
+            implicit_closer: None,
+            boundary: None,
+        };
+        let state = p.states.get_mut("a").unwrap();
+        state.reasoning_tokens = Some(crate::request::ReasoningTokens::new(
+            &grammar,
+            &state.prompt_ids,
+        ));
         p.remote_prefill_done("a", 7, 0, None);
         let state = p.state("a").expect("still registered");
         assert!(state.first_token_time > 0.0);
         assert_eq!(state.output_ids, vec![7]);
+        assert_eq!(state.reasoning_tokens.unwrap().count(), 1);
     }
 
     #[test]
@@ -1766,6 +2250,7 @@ mod tests {
             FinishLog {
                 enabled: true,
                 request_stats: true,
+                ttft_percentage: 0,
             },
             false,
             None,
@@ -1785,6 +2270,7 @@ mod tests {
             None,
         );
         assert!(line.contains("ttft_ms=1000.0,"), "{line}");
+        assert!(line.contains("prefill_ms=0.0,"), "{line}");
         assert!(line.contains("decode_tps=0.5,"), "{line}");
     }
 
@@ -1871,6 +2357,47 @@ mod tests {
     }
 
     #[test]
+    fn a_request_returning_to_an_earlier_slot_reseeds_its_decode_history() {
+        let mut p = processor(None);
+        register_history(&mut p, "a", &[10, 11, 12, 13], &[20, 21]);
+        let mut rows = HistoryRows::new(Some(3));
+        rows.seeds(&history_batch(&[("a", 1, 0)], 1), &p).unwrap();
+        rows.seeds(&history_batch(&[("a", 2, 0)], 0), &p).unwrap();
+        // The request advanced in slot 2 before a second restore returned
+        // it to slot 1. Slot 1 still names it, but holds an older history.
+        p.states.get_mut("a").unwrap().output_ids.extend([22, 23]);
+        let restored = history_batch(&[("a", 1, 0)], 0);
+        assert_eq!(
+            rows.seeds(&restored, &p).unwrap(),
+            Some(HistorySeeds {
+                slots: vec![1],
+                prefix_lengths: vec![7],
+                tokens: vec![vec![20, 21, 22]],
+            })
+        );
+        assert_eq!(rows.seeds(&restored, &p).unwrap(), None);
+    }
+
+    #[test]
+    fn a_request_returning_to_an_earlier_slot_reseeds_its_prefill_history() {
+        let mut p = processor(None);
+        register_history(&mut p, "a", &[10, 11, 12, 13, 14, 15], &[]);
+        let mut rows = HistoryRows::new(Some(3));
+        rows.seeds(&history_batch(&[("a", 1, 0)], 1), &p).unwrap();
+        rows.seeds(&history_batch(&[("a", 2, 2)], 1), &p).unwrap();
+        let restored = history_batch(&[("a", 1, 4)], 1);
+        assert_eq!(
+            rows.seeds(&restored, &p).unwrap(),
+            Some(HistorySeeds {
+                slots: vec![1],
+                prefix_lengths: vec![4],
+                tokens: vec![vec![11, 12, 13]],
+            })
+        );
+        assert_eq!(rows.seeds(&restored, &p).unwrap(), None);
+    }
+
+    #[test]
     fn a_reused_request_id_does_not_inherit_the_row() {
         // Clients may reuse a finished request's id; at batch size 1 the
         // new request lands in the same slot. Ownership follows the
@@ -1889,6 +2416,75 @@ mod tests {
                 tokens: vec![vec![50, 51, 52]],
             })
         );
+    }
+
+    #[test]
+    fn a_bounded_lookback_seeds_only_the_prefix_tail() {
+        let mut p = processor(None);
+        register_history(&mut p, "a", &[10, 11, 12, 13], &[20, 21]);
+        register_history(&mut p, "b", &[30, 31], &[]);
+        let seeds = HistoryRows::new(Some(3))
+            .seeds(&history_batch(&[("a", 1, 5), ("b", 2, 2)], 2), &p)
+            .unwrap();
+        // The tail ends at the prefix length and may span prompt and
+        // output; a prefix shorter than the lookback ships whole.
+        assert_eq!(
+            seeds,
+            Some(HistorySeeds {
+                slots: vec![1, 2],
+                prefix_lengths: vec![5, 2],
+                tokens: vec![vec![12, 13, 20], vec![30, 31]],
+            })
+        );
+        let in_prompt = HistoryRows::new(Some(2))
+            .seeds(&history_batch(&[("a", 1, 3)], 1), &p)
+            .unwrap();
+        assert_eq!(in_prompt.unwrap().tokens, [vec![11, 12]]);
+    }
+
+    #[test]
+    fn bounded_seeds_preserve_landing_reuse_and_recovery() {
+        for lookback in [0, 1, 3, 100] {
+            let mut p = processor(None);
+            register_history(&mut p, "a", &[10, 11, 12, 13], &[20, 21]);
+            register_history(&mut p, "b", &[30, 31], &[]);
+            let mut rows = HistoryRows::new(Some(lookback));
+            // A PD landing excludes the last output: it is the decode input.
+            let landing = history_batch(&[("a", 1, 0)], 0);
+            let seed = rows.seeds(&landing, &p).unwrap().unwrap();
+            let prefix = [10, 11, 12, 13, 20];
+            assert_eq!(seed.prefix_lengths, [5]);
+            assert_eq!(seed.tokens[0], prefix[5_usize.saturating_sub(lookback)..]);
+            assert_eq!(rows.seeds(&landing, &p).unwrap(), None);
+            // A prefix hit takes over the slot, then the original request recovers.
+            let handoff = rows
+                .seeds(&history_batch(&[("b", 1, 2)], 1), &p)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                handoff.tokens[0],
+                [30, 31][2_usize.saturating_sub(lookback)..]
+            );
+            let recovery = rows
+                .seeds(&history_batch(&[("a", 1, 4)], 1), &p)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                recovery.tokens[0],
+                prefix[4_usize.saturating_sub(lookback)..4]
+            );
+            // Finishing and reusing the client id must still create a new owner.
+            p.states.remove("a");
+            register_history(&mut p, "a", &[50, 51, 52, 53], &[]);
+            let reused = rows
+                .seeds(&history_batch(&[("a", 1, 3)], 1), &p)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                reused.tokens[0],
+                [50, 51, 52][3_usize.saturating_sub(lookback)..]
+            );
+        }
     }
 
     #[test]
@@ -1960,6 +2556,35 @@ mod tests {
         let c = p.commit(&last, Some(&plan), &scored(&plan, &[9])).unwrap();
         assert_eq!(
             c.outputs[0].input_logprobs.as_ref().unwrap().values,
+            [None, Some(0.0), Some(-1.0), Some(-2.0)]
+        );
+    }
+
+    #[test]
+    fn replay_after_sending_prompt_logprobs_does_not_regather_or_resend_them() {
+        let mut p = processor(None);
+        register_scored(&mut p, "r", vec![5, 6, 7, 8], 0, 0, true);
+        let prompt = batch(&[("r", 4, 0, 4)], 1);
+        let plan = p.logprob_plan(&prompt).input.unwrap();
+        let first = p
+            .commit(&prompt, Some(&plan), &scored(&plan, &[9]))
+            .unwrap();
+        assert_eq!(
+            first.outputs[0].input_logprobs.as_ref().unwrap().ids,
+            [5, 6, 7, 8]
+        );
+        assert!(p.state("r").unwrap().input_logprobs.is_none());
+        assert!(p.state("r").unwrap().input_logprobs_finalized());
+        // The request remains live, but a later retraction can replay its
+        // prefill. The sent marker outlives the buffers transferred above.
+        assert!(p.logprob_plan(&prompt).input.is_none());
+        let replay = p.commit(&prompt, None, &result(&[10], &[1])).unwrap();
+        assert!(replay.outputs[0].input_logprobs.is_none());
+        assert!(p.logprob_plan(&prompt).input.is_none());
+        // The first output owns its data independently of the live state.
+        drop(p);
+        assert_eq!(
+            first.outputs[0].input_logprobs.as_ref().unwrap().values,
             [None, Some(0.0), Some(-1.0), Some(-2.0)]
         );
     }
@@ -2087,9 +2712,66 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_transfer_ends_a_prefill_that_finished_computing() {
+        let mut p = OutputProcessor::new(None, 1, None, Role::Prefill, NO_FINISH_LOG, true, None);
+        register(&mut p, "r", 3, 1, &[]);
+        let committed = p
+            .commit(&batch(&[("r", 3, 0, 3)], 1), None, &result(&[9], &[1]))
+            .unwrap();
+        assert!(committed.outputs.is_empty());
+        let state = p.state("r").unwrap();
+        assert!(state.finished());
+        assert!(!state.finished_output);
+        assert!(!state.to_abort);
+
+        // The transfer can fail before the next round applies pause(abort).
+        let failed = p.fail_transfer("r");
+        assert_eq!(failed.outputs.len(), 1);
+        assert_eq!(failed.outputs[0].finish_reason, Some("abort"));
+        assert_eq!(failed.outputs[0].output_ids, [9]);
+        assert_eq!(failed.released, ["r"]);
+        assert!(p.state("r").is_none());
+        assert!(p.fail_transfer("r").outputs.is_empty());
+        assert!(p.finish_prefill("r").outputs.is_empty());
+    }
+
+    #[test]
+    fn a_failed_transfer_aborts_an_unfinished_request() {
+        let mut p = processor(None);
+        register(&mut p, "r", 3, 4, &[]);
+        let failed = p.fail_transfer("r");
+        assert_eq!(failed.outputs.len(), 1);
+        assert_eq!(failed.outputs[0].finish_reason, Some("abort"));
+        assert_eq!(failed.released, ["r"]);
+    }
+
+    #[test]
+    fn a_failed_transfer_preserves_client_and_pause_abort_notifications() {
+        for max_new in [1, 4] {
+            for notify in [false, true] {
+                let mut p =
+                    OutputProcessor::new(None, 1, None, Role::Prefill, NO_FINISH_LOG, true, None);
+                register(&mut p, "r", 3, max_new, &[]);
+                p.commit(&batch(&[("r", 3, 0, 3)], 1), None, &result(&[9], &[1]))
+                    .unwrap();
+                p.mark_abort("r", notify);
+
+                let failed = p.fail_transfer("r");
+                assert_eq!(failed.outputs.len(), usize::from(notify));
+                if notify {
+                    assert_eq!(failed.outputs[0].finish_reason, Some("abort"));
+                }
+                assert_eq!(failed.released, ["r"]);
+                assert!(p.state("r").is_none());
+            }
+        }
+    }
+
+    #[test]
     fn ngram_windows_follow_the_committed_tokens() {
         let mut p = OutputProcessor::new(None, 1, None, Role::Plain, NO_FINISH_LOG, true, None);
-        p.register(
+        register_state(
+            &mut p,
             "r".to_owned(),
             RequestState::new(vec![10, 11, 12, 13], 8, BTreeSet::new(), true, None, false),
         );
@@ -2602,7 +3284,8 @@ mod tests {
     #[test]
     fn sampled_logprobs_ride_with_their_tokens() {
         let mut p = processor(None);
-        p.register(
+        register_state(
+            &mut p,
             "r".to_owned(),
             RequestState::new(vec![0], 10, BTreeSet::new(), true, None, true),
         );
@@ -2618,7 +3301,8 @@ mod tests {
     fn cumulative_probabilities_follow_streamed_tokens_and_logprob_requests() {
         let mut p = processor(None);
         for (rid, logprobs) in [("scored", true), ("plain", false)] {
-            p.register(
+            register_state(
+                &mut p,
                 rid.to_owned(),
                 RequestState::new(vec![0], 4, BTreeSet::new(), true, Some(2), logprobs),
             );
@@ -2676,7 +3360,8 @@ mod tests {
     #[test]
     fn a_stop_token_cuts_cumulative_probabilities_with_its_verify_window() {
         let mut p = processor(Some(3));
-        p.register(
+        register_state(
+            &mut p,
             "r".to_owned(),
             RequestState::new(vec![0], 10, BTreeSet::from([7]), true, None, true),
         );

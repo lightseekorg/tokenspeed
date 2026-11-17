@@ -30,11 +30,17 @@ zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime
 ureq = { version = "2", default-features = false, features = ["tls"] }
 
 [dev-dependencies]
+rustix = { version = "1", features = ["time"] }
+tracing-subscriber = "0.3"
 mimalloc = { version = "0.1", default-features = false }
 pyo3 = "0.30"
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 ts-client = { package = "tokenspeed-client", version = "0.1.0", path = "../ts-client" }
+
+[[bench]]
+name = "engine_cpu"
+harness = false
 
 [lints]
 workspace = true

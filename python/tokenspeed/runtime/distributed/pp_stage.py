@@ -223,8 +223,9 @@ class PPStageState:
     # own (full-size) buffer with these rows; its block-write layers fill the
     # rest.
     block_residual: torch.Tensor | None = None
-    # Sum of projected target taps, [num_tokens, draft_hidden], in float32.
-    # The final stage normalizes it once and materializes draft context KV.
+    # Sum of projected target taps over this rank's projection columns,
+    # [num_tokens, draft_hidden / attention TP], in float32. The final stage
+    # gathers and normalizes it once and materializes draft context KV.
     projected_context: torch.Tensor | None = None
 
     def tensors(self) -> list[torch.Tensor]:

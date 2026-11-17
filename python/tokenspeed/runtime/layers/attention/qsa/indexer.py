@@ -33,6 +33,7 @@ from tokenspeed_kernel.platform import pdl_enabled
 from torch import nn
 
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
+    BreakableCapture,
     break_point,
     current_valid_rows,
     slice_to_real_tokens,
@@ -130,7 +131,8 @@ class QSAIndexer(nn.Module):
             tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         ] = {}
 
-    def _fields(self, pool):
+    def cache_fields(self, pool):
+        """``(raw_key, compressed, rope_position)`` views of this layer."""
         layer_id = pool._field_layer_id(self.layer_id)
         raw = pool.arena.field(qsa_raw_key_field(layer_id))
         compressed = pool.arena.field(qsa_compressed_field(layer_id))
@@ -162,29 +164,42 @@ class QSAIndexer(nn.Module):
         )
         return values.reshape(3, -1).T
 
-    def _draft_scratch_buffers(
-        self,
-        token_k: torch.Tensor,
-        position_values: torch.Tensor,
-        bs: int,
+    def draft_scratch(
+        self, bs: int, key_dtype: torch.dtype, device: torch.device
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return the request-local raw-key ring for one draft MTP round."""
+        """The request-local raw-key ring of one draft MTP round: raw keys
+        ``[bs, compress_ratio, 1, dim]``, int64 group-start positions ``[bs,
+        3]`` and int64 position tags ``[bs, compress_ratio]``. One set per
+        batch size and device, shared by the regular path and the
+        monokernel."""
 
-        key = (bs, token_k.device)
+        key = (bs, device)
         scratch = self._draft_scratch.get(key)
         if scratch is None:
             scratch = (
-                token_k.new_empty((bs, self.compress_ratio, 1, self.index_head_dim)),
-                position_values.new_empty((bs, 3)),
+                torch.empty(
+                    (bs, self.compress_ratio, 1, self.index_head_dim),
+                    dtype=key_dtype,
+                    device=device,
+                ),
+                torch.empty((bs, 3), dtype=torch.int64, device=device),
                 torch.full(
                     (bs, self.compress_ratio),
                     _DRAFT_INVALID_POSITION,
                     dtype=torch.int64,
-                    device=token_k.device,
+                    device=device,
                 ),
             )
             self._draft_scratch[key] = scratch
+        elif scratch[0].dtype != key_dtype:
+            raise RuntimeError("QSA draft scratch requested with another key dtype")
         return scratch
+
+    def reset_draft_tags(
+        self, bs: int, key_dtype: torch.dtype, device: torch.device
+    ) -> None:
+        """Start a draft round: no staged key of an earlier round matches."""
+        self.draft_scratch(bs, key_dtype, device)[2].fill_(_DRAFT_INVALID_POSITION)
 
     @staticmethod
     def _draft_accepted_write_mask(
@@ -228,7 +243,7 @@ class QSAIndexer(nn.Module):
         ),
         stage_verify_rows: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
-        raw, compressed, position_cache = self._fields(pool)
+        raw, compressed, position_cache = self.cache_fields(pool)
         position_values = self._position_values(rope_positions)
         rotary = self.rotary_emb
         if query is not None and not rotary.is_neox_style:
@@ -352,6 +367,76 @@ class QSAIndexer(nn.Module):
         )
         return QSASelection(selected_slots, selected_blocks, self.compress_ratio)
 
+    def split_round_locations(
+        self, ctx: ForwardContext, rows: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """A split round's per-row index-key locations; resets the draft-step tags."""
+        # The draft steps then stage keys over fresh tags, as after a narrowed step 0.
+        scratch = self._draft_scratch.get((ctx.bs, self.index_qk_proj.weight.device))
+        layout = qsa_forward_layout(
+            ctx,
+            rows,
+            compressed_token_page_size=self.compressed_token_page_size,
+            recent_page_size=self.recent_page_size,
+            compress_ratio=self.compress_ratio,
+            reset_draft_tags=None if scratch is None else scratch[2],
+        )
+        return (
+            layout.logical_positions,
+            layout.request_indices,
+            layout.qsa_locs,
+            layout.recent_locs,
+        )
+
+    def write_split_keys(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        locations: tuple[torch.Tensor, ...],
+        pool,
+    ) -> None:
+        """Write and compress each row's index key at its split-round locations."""
+        logical, requests, qsa_locs, recent_locs = locations
+        _, token_k = self._project_qk_raw(hidden_states)
+        self._write_and_compress(
+            token_k,
+            positions,
+            logical,
+            requests,
+            qsa_locs,
+            recent_locs,
+            pool,
+            stage_draft=False,
+            stage_verify_buffers=None,
+        )
+
+    def can_overlap(self, ctx: ForwardContext, *, num_rows: int) -> bool:
+        """Whether the projected tail can run on the caller's auxiliary stream.
+
+        Only a complete target verify batch is eligible. Graph breaks need the
+        live-row slicing in ``forward``; load-backs retain their stream ordering.
+        The caller separately selects the shapes worth overlapping.
+        """
+        if (
+            not ctx.forward_mode.is_decode()
+            or ctx.num_extends != 0
+            or ctx.draft_narrowing is not None
+        ):
+            return False
+        if (
+            BreakableCapture.current() is not None
+            or current_valid_rows() is not None
+            or ctx.token_to_kv_pool.layerwise_load_tracker is not None
+        ):
+            return False
+        backend = qwen4_exp_backend(ctx.attn_backend).indexer_backend
+        return (
+            backend is not None
+            and not backend.is_draft
+            and backend.spec_num_tokens > 1
+            and num_rows == ctx.bs * backend.spec_num_tokens
+        )
+
     @break_point
     def forward(
         self,
@@ -379,10 +464,26 @@ class QSAIndexer(nn.Module):
                 else positions[:num_real]
             )
         raw_q, token_k = self._project_qk_raw(hidden_states)
+        return self.forward_projected(raw_q, token_k, positions, ctx)
+
+    def forward_projected(
+        self,
+        raw_q: torch.Tensor,
+        token_k: torch.Tensor,
+        positions: torch.Tensor,
+        ctx: ForwardContext,
+    ) -> torch.Tensor:
+        """Write index keys and select slots from already projected rows.
+
+        The caller owns projection and stream ordering. Prefill continues to
+        enter through ``forward`` so its graph break and live-row slicing stay
+        outside this shared tail.
+        """
+        num_rows = raw_q.shape[0]
         pool = ctx.token_to_kv_pool
         if pool.layerwise_load_tracker is not None:
             pool.layerwise_load_tracker.wait_for_layer(self.layer_id)
-        _, compressed, _ = self._fields(pool)
+        _, compressed, _ = self.cache_fields(pool)
         backend = qwen4_exp_backend(ctx.attn_backend).indexer_backend
         if backend is None:
             raise RuntimeError("QSA requires an indexer backend")
@@ -402,14 +503,10 @@ class QSAIndexer(nn.Module):
         if is_draft_decode_step and token_k.shape[0] != ctx.bs:
             raise RuntimeError("QSA draft decode requires one row per request")
         if is_draft_first_step or is_draft_decode_step:
-            draft_scratch = self._draft_scratch_buffers(
-                token_k,
-                self._position_values(positions),
-                ctx.bs,
-            )
+            draft_scratch = self.draft_scratch(ctx.bs, token_k.dtype, token_k.device)
         layout = qsa_forward_layout(
             ctx,
-            hidden_states.shape[0],
+            num_rows,
             compressed_token_page_size=self.compressed_token_page_size,
             recent_page_size=self.recent_page_size,
             compress_ratio=self.compress_ratio,
@@ -437,10 +534,7 @@ class QSAIndexer(nn.Module):
         shared_topk = None
         if self.share_topk_for_mtp_iteration:
             shared_topk = ctx.attn_backend.sparse_topk.decode
-            if (
-                shared_topk is not None
-                and shared_topk.shape[0] < hidden_states.shape[0]
-            ):
+            if shared_topk is not None and shared_topk.shape[0] < num_rows:
                 raise RuntimeError(
                     "QSA MTP top-k reuse requires target-aligned step-0 indices"
                 )
@@ -471,7 +565,7 @@ class QSAIndexer(nn.Module):
             ),
         )
         if shared_topk is not None:
-            return shared_topk[: hidden_states.shape[0]]
+            return shared_topk[:num_rows]
         if q is None:
             raise RuntimeError("QSA fused query preparation did not return queries")
         selection = self._select(

@@ -75,6 +75,10 @@ def test_decode_reads_pages_past_int32_range(window_left: int) -> None:
             window_left=window_left,
             softmax_scale=1.0 / HEAD_DIM,
             solution="gluon",
+            output_dtype=None,
+            return_lse=False,
+            gate=None,
+            sink=None,
         )
 
     expected = decode(k_cache, v_cache, page_table)
@@ -113,6 +117,7 @@ def test_extend_reads_pages_past_int32_range(window_left: int) -> None:
             window_left=window_left,
             softmax_scale=1.0 / HEAD_DIM,
             solution="gluon",
+            output_dtype=None,
         )
 
     expected = extend(k_cache, v_cache, page_table)

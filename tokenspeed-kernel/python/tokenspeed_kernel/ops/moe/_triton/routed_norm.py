@@ -22,11 +22,16 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
+
+if TYPE_CHECKING:
+    from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import AllReduceMailbox
 
 _FLOAT_DTYPES = {torch.float16, torch.bfloat16, torch.float32}
 
@@ -230,6 +235,31 @@ def _routed_sum_block(
 ROUTED_SUM_SINGLE_PASS_MAX_TOKENS = 4
 
 
+# CDNA4: one program per token holds a block of up to this many features in
+# registers without spilling (8 waves; a 16384 block spills).
+ROUTED_SUM_SINGLE_PASS_MAX_BLOCK_CDNA4 = 8192
+
+# CDNA4, complete routes: one program per token wins from this many tokens.
+ROUTED_SUM_SINGLE_PASS_MIN_TOKENS_CDNA4 = 152
+
+
+def _routed_sum_single_pass(num_tokens: int, block: int, has_map: bool) -> bool:
+    """Whether one program per token reduces the routes instead of two launches.
+
+    ``has_map`` is True when routes are read through a permute map.
+    """
+    if num_tokens <= ROUTED_SUM_SINGLE_PASS_MAX_TOKENS:
+        return True
+    if current_platform().is_cdna4 and block <= ROUTED_SUM_SINGLE_PASS_MAX_BLOCK_CDNA4:
+        # MI355X, route width 4096, top-8, graph replay: gathered routes (a
+        # permute map with about 1/8 of the routes present) are faster in one
+        # launch at every count from 1 to 8192 tokens. With complete routes
+        # each program reads all of its token's routes: one launch is slower
+        # from 8 to 128 tokens, about even at 136-144 and faster from 152.
+        return has_map or num_tokens >= ROUTED_SUM_SINGLE_PASS_MIN_TOKENS_CDNA4
+    return False
+
+
 @register_kernel(
     "moe",
     "routed_input_scale_rmsnorm_sum",
@@ -293,7 +323,7 @@ def triton_routed_input_scale_rmsnorm_sum(
         eps,
         weight_offset,
         block,
-        num_tokens <= ROUTED_SUM_SINGLE_PASS_MAX_TOKENS,
+        _routed_sum_single_pass(num_tokens, block, has_map=False),
         enable_pdl,
     )
     return output
@@ -440,8 +470,11 @@ def triton_routed_input_scale_rmsnorm_sum_gathered(
     weight_offset: float,
     enable_pdl: bool,
     output: torch.Tensor | None,
+    all_reduce: AllReduceMailbox | None,
 ) -> torch.Tensor:
     """Triton kernel of the routed normalized reduction dispatcher."""
+    if all_reduce is not None:
+        raise ValueError("an all-reduce mailbox needs the cluster routed sum")
     width = norm_weight.shape[0]
     if gemm2_out.ndim != 2 or gemm2_out.stride(1) != 1 or gemm2_out.shape[1] < width:
         raise ValueError("gemm2_out must be row-major [rows, >= width]")
@@ -479,7 +512,7 @@ def triton_routed_input_scale_rmsnorm_sum_gathered(
         eps,
         weight_offset,
         block,
-        num_tokens <= ROUTED_SUM_SINGLE_PASS_MAX_TOKENS,
+        _routed_sum_single_pass(num_tokens, block, has_map=True),
         enable_pdl,
     )
     return output

@@ -29,6 +29,7 @@ the normalized branches.
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel_amd._extern import extern_compile_options, wait_vmem
 from tokenspeed_kernel_amd._triton import gl, gluon
 
 cdna4 = gl.amd.cdna4
@@ -189,14 +190,7 @@ def gluon_hyperconnection_mix_gfx950(
         # Publish the partial without an acq_rel atomic: ".wt" writes
         # through, each wave waits for its stores (vmcnt), and the barrier
         # orders every wave's stores before the counter bump.
-        gl.inline_asm_elementwise(
-            asm="s_waitcnt vmcnt(0)",
-            constraints="=v,0",
-            args=[offs_cm],
-            dtype=gl.int32,
-            is_pure=False,
-            pack=1,
-        )
+        wait_vmem()
         gl.barrier()
         arrived = gl.atomic_add(counter_ptr + tile, 1, sem="relaxed", scope="gpu")
         if arrived != SPLIT_K - 1:
@@ -524,6 +518,7 @@ def launch_gluon_hyperconnection_mix_gfx950(
         WARPS_M=warps_m,
         WARPS_N=warps_n,
         num_warps=warps_m * warps_n,
+        **extern_compile_options(),
     )
 
     block_m, block_h, block_r, warps_m = _up_config(rows)

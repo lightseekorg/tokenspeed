@@ -94,7 +94,18 @@ def _run_v2(q, k_cache, v_cache, table, kv_lens, rel, window_left):
 
     seqlens = torch.tensor(kv_lens, device=q.device, dtype=torch.int32)
     out = rel_mha_decode_tsmha_v2(
-        q, k_cache, v_cache, table, seqlens, rel, window_left, SCALE
+        q,
+        k_cache,
+        v_cache,
+        table,
+        seqlens,
+        rel,
+        window_left,
+        SCALE,
+        output_dtype=None,
+        return_lse=False,
+        gate=None,
+        sink=None,
     )
     return out.view(q.shape[0], NUM_Q_HEADS, HEAD_DIM)
 

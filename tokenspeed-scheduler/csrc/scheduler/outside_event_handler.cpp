@@ -21,6 +21,9 @@
 #include "scheduler/scheduler.h"
 
 #include <algorithm>
+#include <array>
+#include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -28,6 +31,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include "core/profile_span.h"
 #include "fsm/forward_events.h"
 #include "fsm/forward_states.h"
 #include "fsm/pd_events.h"
@@ -50,12 +54,31 @@ void Scheduler::handleEvent(const pd::FailedEvent& event) {
     if (request == nullptr || request->Is<fsm::Finished>()) {
         return;
     }
-    request->Apply(fsm::AbortEvent{&coordinator_});
+    abortRequest(*request);
+}
+
+void Scheduler::handleEvent(const pd::TransferStoppedEvent& event) {
+    Request* request = findRequest(event.request_id);
+    fsm::PdTransferring* transferring = request == nullptr ? nullptr : request->GetIf<fsm::PdTransferring>();
+    if (transferring == nullptr) {
+        return;
+    }
+    // Transport retirement does not fence this engine's queued forwards.
+    if (request->ResultsInFlight() > 0) {
+        transferring->transfer_stopped = true;
+        return;
+    }
+    request->Apply(fsm::TransferStoppedEvent{&coordinator_});
 }
 
 void Scheduler::handleEvent(const pd::SucceededEvent& event) {
     Request* request = findRequest(event.request_id);
     if (request == nullptr || request->IsAnyOf<fsm::Finishing, fsm::Finished>()) {
+        return;
+    }
+    if (request->Is<fsm::PdTransferring>()) {
+        // A success also retires the transfer, but local forwards may remain.
+        handleEvent(pd::TransferStoppedEvent{event.request_id});
         return;
     }
     if (!request->Is<fsm::PrefillDone>() && !request->Is<fsm::Decoding>()) {
@@ -80,6 +103,11 @@ void Scheduler::handleEvent(const pd::RemotePrefillDoneEvent& event) {
         request->Apply(fsm::RemotePrefillDoneEvent{event.bootstrap_token});
         return;
     }
+    if (request->Is<fsm::PdTransferring>()) {
+        // A success also retires the transfer, but local forwards may remain.
+        handleEvent(pd::TransferStoppedEvent{event.request_id});
+        return;
+    }
     if (request->IsAnyOf<fsm::PrefillDone, fsm::Decoding, fsm::Finishing, fsm::Finished>()) {
         return;
     }
@@ -89,6 +117,9 @@ void Scheduler::handleEvent(const pd::RemotePrefillDoneEvent& event) {
 
 void Scheduler::handleEvent(const forward::Finish& event) {
     if (Request* request = findRequest(event.request_id)) {
+        if (request->Is<fsm::PdTransferring>()) {
+            return;  // it ended already; only its transfer is still stopping
+        }
         if (pdTransferInFlight(*request)) {
             throw std::logic_error("PD Finish received while transfer pages are pinned");
         }
@@ -97,36 +128,46 @@ void Scheduler::handleEvent(const forward::Finish& event) {
 }
 
 void Scheduler::settleFinishedRequests() {
+    ProfileSpan profile_span{"Scheduler::settleFinishedRequests"};
     for (const std::unique_ptr<Request>& request : requests_) {
+        const auto* transferring = request->GetIf<fsm::PdTransferring>();
+        if (transferring != nullptr && transferring->transfer_stopped && request->ResultsInFlight() == 0) {
+            request->Apply(fsm::TransferStoppedEvent{&coordinator_});
+            continue;
+        }
         if (!request->Is<fsm::Finishing>() || request->ResultsInFlight() > 0) {
             continue;
         }
-        if (auto store = publishCompletedPages(*request)) {
-            pending_write_back_operations_.push_back(std::move(*store));
+        if (request->GetIf<fsm::Finishing>()->publish_completed_pages) {
+            if (auto store = publishCompletedPages(*request)) {
+                pending_write_back_operations_.push_back(std::move(*store));
+            }
         }
         request->Apply(fsm::ReleaseEvent{&coordinator_});
     }
 }
 
 std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& request) {
-    fsm::CacheProgress progress = request.CacheProgress();
-    // The frontier is final: every forward has landed, so the live state slot
-    // holds the state after the last consumed token and the KV rows below it
-    // are complete.
+    ProfileSpan profile_span{"Scheduler::publishCompletedPages"};
+    // Every forward has landed. Advance the finishing owner's progress in
+    // place; its references and hash storage live through publication and
+    // Host-store pinning, until settleFinishedRequests applies ReleaseEvent.
+    fsm::CacheProgress& progress = request.CacheProgressRef();
+    // The frontier is final: every forward has landed, so the State slot the
+    // last kept token's forward wrote holds the state after it (slot 1, or
+    // slot 0 behind a first decode that ran as a padding row:
+    // CompletedPages::state_slot) and the KV rows below it are complete.
     const std::int32_t num_computed_tokens = request.NumComputedTokens();
     RequestProgress completed = AdvanceRequestProgress(
         request, progress, num_computed_tokens, coordinator_.PrefixGranularity(),
         /*stream_completed_to_host=*/false,
         finishCheckpointIsDead(request, progress) ? PublicationPoint::kChunk : PublicationPoint::kFinal,
         /*allow_state_checkpoint=*/coordinator_.CheckpointGranularity() == 1 ||
-            (config_.role != Role::kD && num_computed_tokens <= request.PrefillSize()));
-    std::vector<std::string> store_hashes = progress.prefix_hashes;
+            (config_.role != Role::kD && num_computed_tokens <= request.PrefillSize()),
+        /*preserve_source_blocks=*/false, /*publish_to_cache=*/config_.PublishesCompletedPages());
     if (completed.completed_pages) {
         registerKvEventPublication(request, progress.prefix_hashes, *completed.completed_pages);
         coordinator_.CacheCompletedBlocks(request.BlockTablesRef(), completed, progress.access_epoch);
-        if (completed.completed_pages->tail) {
-            store_hashes.push_back(completed.completed_pages->tail->hash);
-        }
     }
     // The end state this finish publishes supersedes the checkpoint the turn
     // resumed from (MarkSupersededStateInput). A finish that publishes no end
@@ -137,16 +178,30 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
     // that fails earlier (a failed PD transfer) publishes and marks nothing,
     // and an end state that is the input itself (a D request that claimed its
     // prompt-end checkpoint and leaves before any decode) supersedes nothing.
-    if (progress.resumed_tail_hash && !(completed.completed_pages && completed.completed_pages->tail &&
-                                        completed.completed_pages->tail->hash == *progress.resumed_tail_hash)) {
-        coordinator_.MarkSupersededStateInput(*progress.resumed_tail_hash, progress.access_epoch);
+    // Nor does a short prompt end left unpublished (shortPromptEndIsDropped):
+    // such a prompt writes no in-forward checkpoint either, so the input can
+    // still be the deepest checkpoint a next turn extending the prompt resumes
+    // at, and it ages like any cache entry.
+    if (progress.resumed_tail_hash && !shortPromptEndIsDropped(request) &&
+        !(completed.completed_pages && completed.completed_pages->tail &&
+          completed.completed_pages->tail->hash == ContentHash{*progress.resumed_tail_hash})) {
+        coordinator_.MarkSupersededStateInput(ContentHash{*progress.resumed_tail_hash}, progress.access_epoch);
+    }
+    if (checkpoint_lineage_) {
+        demoteSupersededCheckpoint(progress);
+        recordCheckpointPublication(progress);
     }
     coordinator_.RefreshRetainedCheckpoint(progress.retained_input_checkpoint, progress.access_epoch);
     if (!config_.StreamsDeviceCacheToHost()) {
         return std::nullopt;
     }
     // Every published entry of the request streams: its pages, its tail and
-    // the state checkpoint published with the frontier.
+    // the state checkpoint published with the frontier; a demoted entry
+    // under its pages is not stored.
+    std::vector<std::string> store_hashes = progress.prefix_hashes;
+    if (completed.completed_pages && completed.completed_pages->tail) {
+        store_hashes.push_back(completed.completed_pages->tail->hash.ToString());
+    }
     coordinator_.QueueCachedBlocksForStore(store_hashes);
     // The request's pages are released right after this (ReleaseEvent); the
     // pinned ticket keeps them cached and unevictable until the copy ACKs.
@@ -203,7 +258,36 @@ bool Scheduler::promptEndIsCoveredByCheckpoint(const Request& request, const fsm
     }
     const auto checkpoint_pages = static_cast<std::size_t>(checkpoint / coordinator_.PrefixGranularity());
     return checkpoint_pages <= progress.prefix_hashes.size() &&
-           coordinator_.HoldsStateCheckpoint(progress.prefix_hashes[checkpoint_pages - 1]);
+           coordinator_.HoldsStateCheckpoint(ContentHash{progress.prefix_hashes[checkpoint_pages - 1]});
+}
+
+// With drop_short_prompt_end_checkpoints (P role, in-forward checkpoint): a
+// prompt too short for a pre-tail checkpoint (PrefillStateCheckpointTokens
+// is 0) that ends inside a page ends in a tail a re-rendered next turn does
+// not resume at, and an identical prompt's probe stops short of its last
+// token; its state is keyed by that tail. The finish publishes the full pages
+// only. A page-aligned end keeps its state: it is a chain boundary a longer
+// prompt resumes from. A model without State groups keeps its tails. Unlike
+// a covered prompt end (promptEndIsCoveredByCheckpoint) it needs no
+// checkpoint to exist: it reads only the prompt, so it holds whatever the
+// cache holds. Nothing before the finish -- the PD ACK -- depends on it: the
+// P role reserves no copy-in block for its prompt end
+// (firstDecodePublishesPromptEnd), its remote decode publishes like a chunk
+// end, and it never retracts.
+bool Scheduler::shortPromptEndIsDropped(const Request& request) const {
+    const std::int32_t prompt = request.PrefillSize();
+    if (!config_.drop_short_prompt_end_checkpoints || request.NumComputedTokens() != prompt ||
+        prompt % coordinator_.PrefixGranularity() == 0 ||
+        PrefillStateCheckpointTokens(coordinator_, prompt, config_.max_scheduled_tokens,
+                                     config_.prefix_replay_tokens) != 0) {
+        return false;
+    }
+    for (std::int32_t i = 0; i < coordinator_.NumGroups(); ++i) {
+        if (coordinator_.GroupIsState(static_cast<std::size_t>(i))) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // With the in-forward checkpoint, a finish at a covered prompt end
@@ -218,17 +302,19 @@ bool Scheduler::promptEndIsCoveredByCheckpoint(const Request& request, const fsm
 // F past the prompt end publishes like a chunk end too: a next turn that
 // re-renders the generated reply diverges before F, and without its state the
 // tail is no point a hybrid model can resume at. The prompt end was the
-// first decode's to publish or skip (scheduleDecode). A model without State
-// groups keeps its tails: there they are resume points of their own. The D
-// role publishes its frontier as ever. (Validate requires prefix caching with
-// the in-forward checkpoint on the other roles.)
+// first decode's to publish or skip (scheduleDecode). With
+// drop_short_prompt_end_checkpoints the P role's finish also publishes a
+// short prompt's end like a chunk end (shortPromptEndIsDropped). A model
+// without State groups keeps its tails: there they are resume points of
+// their own. The D role publishes its frontier as ever. (Validate requires
+// prefix caching with the in-forward checkpoint on the other roles.)
 bool Scheduler::finishCheckpointIsDead(const Request& request, const fsm::CacheProgress& progress) const {
     if (!config_.state_checkpoint_in_forward || config_.role == Role::kD) {
         return false;
     }
     const std::int32_t frontier = request.NumComputedTokens();
     if (frontier == request.PrefillSize()) {
-        return promptEndIsCoveredByCheckpoint(request, progress);
+        return shortPromptEndIsDropped(request) || promptEndIsCoveredByCheckpoint(request, progress);
     }
     if (frontier < request.PrefillSize()) {
         return false;
@@ -241,6 +327,64 @@ bool Scheduler::finishCheckpointIsDead(const Request& request, const fsm::CacheP
     return false;
 }
 
+void Scheduler::demoteSupersededCheckpoint(const fsm::CacheProgress& progress) {
+    const std::int32_t page = coordinator_.PrefixGranularity();
+    const std::int32_t checkpoint = progress.published_state_checkpoint_tokens;
+    const std::int32_t resumed = progress.resume_tokens;
+    const std::span<const std::string> chain(progress.prefix_hashes);
+    if (checkpoint <= resumed || checkpoint / page > static_cast<std::int32_t>(chain.size()) || resumed <= 0 ||
+        resumed % page != 0) {
+        return;  // no checkpoint past a page boundary the request resumed from
+    }
+    // R's publication, when R is a recorded in-forward checkpoint, names
+    // where R's request resumed. The chain hash at R fixes every page before
+    // it, so that boundary lies on this request's chain too.
+    const CheckpointLineage::Publication* resumed_publication =
+        checkpoint_lineage_->FindPublication(ContentHash{chain[static_cast<std::size_t>(resumed / page) - 1]});
+    if (resumed_publication == nullptr) {
+        return;
+    }
+    const std::int32_t superseded = resumed_publication->resumed_tokens;
+    if (superseded <= 0 || superseded >= resumed || superseded % page != 0) {
+        return;
+    }
+    const ContentHash superseded_hash{chain[static_cast<std::size_t>(superseded / page) - 1]};
+    if (checkpoint_lineage_->FindPublication(superseded_hash) == nullptr) {
+        return;  // two turns back is no recorded in-forward checkpoint
+    }
+    // Shared -- another first admission resumed there too, or an acquisition
+    // or publication there is newer than the one R's request made when it
+    // resumed there: a fork, or a system prompt every new conversation
+    // resumes at. It stays.
+    if (checkpoint_lineage_->Resumes(superseded_hash) != 1 ||
+        coordinator_.LatestStateAccessEpoch(superseded_hash) > resumed_publication->access_epoch) {
+        return;
+    }
+    // R and C stay resumable with the window blocks they resume with: a
+    // sliding window wider than a turn reaches back behind the boundary.
+    const std::array<std::int32_t, 2> kept_boundaries{resumed, checkpoint};
+    const std::vector<CacheKey> keys =
+        coordinator_.BoundaryCheckpointKeys(chain.first(static_cast<std::size_t>(superseded / page)), kept_boundaries);
+    std::int32_t demoted = coordinator_.DemoteEntries(keys);
+    // Under the write-back policy an eviction may still be carrying one of
+    // them to the Host: it lands demoted as well.
+    demoted += tier_transfers_.DemoteInFlightEvictions(keys);
+    demoted_checkpoint_entries_ += static_cast<std::uint64_t>(demoted);
+}
+
+void Scheduler::recordCheckpointPublication(const fsm::CacheProgress& progress) {
+    const std::int32_t page = coordinator_.PrefixGranularity();
+    const std::int32_t checkpoint = progress.published_state_checkpoint_tokens;
+    const std::int32_t resumed = progress.resume_tokens;
+    if (checkpoint <= resumed || checkpoint / page > static_cast<std::int32_t>(progress.prefix_hashes.size())) {
+        return;  // no in-forward checkpoint past the point it resumed from
+    }
+    checkpoint_lineage_->RecordPublication(
+        ContentHash{progress.prefix_hashes[static_cast<std::size_t>(checkpoint / page) - 1]},
+        CheckpointLineage::Publication{.resumed_tokens = resumed % page == 0 ? resumed : 0,
+                                       .access_epoch = progress.access_epoch});
+}
+
 void Scheduler::handleEvent(const forward::UpdateReserveNumTokens& event) {
     if (Request* request = findRequest(event.request_id)) {
         request->Apply(fsm::UpdateReserveNumTokensEvent{event.reserve_num_tokens_in_next_schedule_event});
@@ -249,6 +393,12 @@ void Scheduler::handleEvent(const forward::UpdateReserveNumTokens& event) {
 
 void Scheduler::handleEvent(const forward::ExtendResult& event) {
     if (Request* request = findRequest(event.request_id)) {
+        // Only a prefill chunk's result is a span: a decode batch would add
+        // one per row.
+        std::optional<ProfileSpan> profile_span;
+        if (!request->Is<fsm::Decoding>()) {
+            profile_span.emplace("Scheduler::handlePrefillResult");
+        }
         request->NoteResultLanded();
         request->Apply(fsm::ExtendResultEvent{event.tokens});
         if (!event.spec_candidate_ids.empty()) {
@@ -259,7 +409,18 @@ void Scheduler::handleEvent(const forward::ExtendResult& event) {
 
 void Scheduler::handleEvent(const forward::Abort& event) {
     if (Request* request = findRequest(event.request_id)) {
-        request->Apply(fsm::AbortEvent{&coordinator_});
+        abortRequest(*request);
+    }
+}
+
+void Scheduler::abortRequest(Request& request) {
+    if (pdTransferInFlight(request)) {
+        // The transport stops the transfer; the pages wait for it.
+        request.Apply(fsm::StopPdTransferEvent{});
+    } else if (request.ResultsInFlight() > 0) {
+        request.Apply(fsm::AbortInFlightEvent{});
+    } else {
+        request.Apply(fsm::AbortEvent{&coordinator_});
     }
 }
 
@@ -308,12 +469,15 @@ void Scheduler::handleEvent(const cache::RestoreDone& event) {
         // The ACK republishes the L2-tier destinations into the Device index,
         // a KV-event mutation of boundaries whose descriptors DrainKvEvents
         // dropped when the victim's pages left the Device: register them
-        // again first, as a first chunk does for the load-backs it issues.
-        registerKvEventPrefixPages(*request, restoring->resources.cache_progress.prefix_hashes, 0);
+        // again first -- the prefix chain and any tail a State checkpoint of
+        // the image sits at -- as a first chunk does for the load-backs it
+        // issues.
+        registerKvEventRestore(*request, restoring->resources.cache_progress.prefix_hashes, restoring->kv_event_tails);
     }
-    ReqPoolIndex request_pool_index = tier_transfers_.CompleteSnapshotRestore(event.op_id, /*publish=*/resumes);
+    TierTransferManager::RestoredSlots slots =
+        tier_transfers_.CompleteSnapshotRestore(event.op_id, /*publish=*/resumes);
     if (resumes) {
-        request->Apply(fsm::RestoreDoneEvent{std::move(request_pool_index)});
+        request->Apply(fsm::RestoreDoneEvent{std::move(slots.request_pool_index), std::move(slots.decode_slot)});
     }
     // Otherwise the row and the blob slot return with the ticket: the request
     // that would have used them is gone.

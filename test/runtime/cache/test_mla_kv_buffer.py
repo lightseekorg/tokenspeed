@@ -31,6 +31,7 @@ from tokenspeed_kernel.ops.embedding import (
 )
 from tokenspeed_kernel.ops.embedding.triton import apply_rope_mla_set_kv_buffer_triton
 from tokenspeed_kernel.ops.kvcache.triton import (
+    LatentPlanes,
     get_mla_kv_buffer_triton,
     mla_latent_norm_rope_scatter,
     set_mla_kv_buffer_triton,
@@ -38,6 +39,7 @@ from tokenspeed_kernel.ops.kvcache.triton import (
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
+from tokenspeed.runtime.layers.attention.backends.base import SparseTopKShare
 from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
 
 sys.path.insert(
@@ -212,6 +214,7 @@ def test_pool_scatter_quantizes_without_materializing_fp8_sources(monkeypatch):
     pool.dtype = torch.float8_e4m3fn
     pool.store_dtype = torch.uint8
     pool.latent_write_sanitizes = False
+    pool.layerwise_load_tracker = None
     storage = torch.empty(8, TOTAL_DIM, device="cuda", dtype=torch.uint8)
     pool.kv_buffer = [storage]
     k_nope = torch.randn(2, 1, NOPE_DIM, device="cuda", dtype=torch.bfloat16)
@@ -750,7 +753,9 @@ def test_latent_prologue_hands_attention_the_cache_dtype(hybrid, dtype):
         torch.arange(3, device="cuda"),
         SimpleNamespace(
             token_to_kv_pool=pool,
-            attn_backend=SimpleNamespace(cache_placement=lambda layer: None),
+            attn_backend=SimpleNamespace(
+                cache_placement=lambda layer: None, sparse_topk=SparseTopKShare()
+            ),
         ),
         slots=torch.arange(3, device="cuda"),
         expanded=None,
@@ -837,7 +842,7 @@ def test_stacked_latent_write_matches_norm_rope_then_scatter(dtype, is_neox, san
     positions = torch.randint(256, (n_loc,), device="cuda")
     loc = torch.randperm(n_slots, device="cuda")[:n_loc].to(torch.int32)
     sentinel = torch.full(
-        (n_slots, TOTAL_DIM), 7.5, device="cuda", dtype=torch.bfloat16
+        (n_slots, 1, TOTAL_DIM), 7.5, device="cuda", dtype=torch.bfloat16
     ).to(dtype)
     buffers = [sentinel.clone() for _ in range(n_layers)]
 
@@ -848,9 +853,8 @@ def test_stacked_latent_write_matches_norm_rope_then_scatter(dtype, is_neox, san
         cos_sin,
         positions,
         loc,
-        torch.tensor([b.data_ptr() for b in buffers], dtype=torch.int64, device="cuda"),
-        buffers[0].stride(0),
-        dtype,
+        LatentPlanes.from_buffers(buffers),
+        write_mask=None,
         is_neox=is_neox,
         sanitize=sanitize,
     )
@@ -866,7 +870,7 @@ def test_stacked_latent_write_matches_norm_rope_then_scatter(dtype, is_neox, san
             is_neox,
         ).squeeze(1)
         expected = sentinel.float()
-        expected[loc.long()] = torch.cat(
+        expected[loc.long(), 0] = torch.cat(
             (normed * norm_weight[layer].float(), rope), dim=-1
         )
         torch.testing.assert_close(

@@ -42,15 +42,36 @@ def project(tmp_path):
     return tmp_path
 
 
-def test_nightly_versions_and_kernel_dependency_share_date(project):
+def test_nightly_pins_kernel_date_and_actual_engine_version(project):
     base_version = tomllib.loads((project / "python/pyproject.toml").read_text())[
         "project"
     ]["version"]
-    version = PREPARE(project, "20260930", "0.1.3.post20260930")
+    version = PREPARE(project, "20260930", "0.1.3.post20260930", "0.1.0.post20261001")
     metadata = tomllib.loads((project / "python/pyproject.toml").read_text())["project"]
     assert metadata["version"] == version == f"{base_version}.post20260930"
     kernel = [d for d in metadata["dependencies"] if d.startswith("tokenspeed-kernel")]
     assert kernel == ["tokenspeed-kernel==0.1.3.post20260930"]
+    engine = [d for d in metadata["dependencies"] if d.startswith("tokenspeed-engine")]
+    assert engine == ["tokenspeed-engine==0.1.0.post20261001"]
+    assert (
+        runpy.run_path(str(project / "python/tokenspeed/version.py"))["__version__"]
+        == version
+    )
+
+
+def test_release_candidate_kernel_nightly_makes_a_tokenspeed_release_candidate(
+    project,
+):
+    base_version = tomllib.loads((project / "python/pyproject.toml").read_text())[
+        "project"
+    ]["version"]
+    version = PREPARE(
+        project, "20261108", "0.1.4rc1.post20261108", "0.1.0.post20261108"
+    )
+    metadata = tomllib.loads((project / "python/pyproject.toml").read_text())["project"]
+    assert metadata["version"] == version == f"{base_version}rc1.post20261108"
+    pins = [d for d in metadata["dependencies"] if d.startswith("tokenspeed-kernel")]
+    assert pins == ["tokenspeed-kernel==0.1.4rc1.post20261108"]
     assert (
         runpy.run_path(str(project / "python/tokenspeed/version.py"))["__version__"]
         == version
@@ -65,7 +86,24 @@ def test_invalid_or_mismatched_date_does_not_change_metadata(project, date, kern
     path = project / "python/pyproject.toml"
     original = path.read_bytes()
     with pytest.raises(ValueError):
-        PREPARE(project, date, kernel)
+        PREPARE(project, date, kernel, "0.1.0.post20260930")
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    "kernel",
+    [
+        "0.1.4.post20261108.dev1",
+        "0.1.4.post20261108+exp1",
+        "0.1.4a1.post20261108",
+        "0.1.4rc1.post20261108.dev1",
+    ],
+)
+def test_kernel_with_anything_but_a_release_candidate_is_refused(project, kernel):
+    path = project / "python/pyproject.toml"
+    original = path.read_bytes()
+    with pytest.raises(ValueError):
+        PREPARE(project, "20261108", kernel, "0.1.0.post20261108")
     assert path.read_bytes() == original
 
 
@@ -117,3 +155,55 @@ def test_tokenspeed_index_preserves_kernel_and_history(tmp_path, variant):
     assert kernel.read_text() == "existing kernel links\n"
     UPDATE(wheelhouse, release, dist.parent, "tokenspeed", variant, replace=True)
     assert index.read_text() == updated
+
+
+@pytest.mark.parametrize(
+    "variant,version,roots",
+    [
+        ("engine-release", "0.1.0", [""]),
+        ("engine-nightly", "0.1.0rc20261112", ["nightly", "nightly/rocm7.2"]),
+    ],
+)
+def test_engine_indexes_preserve_history_and_reject_replacement(
+    tmp_path, variant, version, roots
+):
+    wheelhouse = tmp_path / "wheelhouse"
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    name = f"tokenspeed_engine-{version}-cp312-cp312-manylinux_2_28_x86_64.whl"
+    (dist / name).write_bytes(b"wheel")
+    url = f"https://github.com/lightseekorg/whl/releases/download/tokenspeed-engine-v{version}/{name}"
+    release = {
+        "assets": [
+            {"name": name, "browser_download_url": url, "digest": f"sha256:{'a' * 64}"}
+        ]
+    }
+    for directory in roots:
+        root = wheelhouse / directory
+        (root / "tokenspeed-engine").mkdir(parents=True)
+        (root / "tokenspeed-engine/index.html").write_text("older engine links\n")
+        (root / "index.html").write_text('<a href="existing/">existing</a><br>\n')
+
+    paths = UPDATE(wheelhouse, release, dist, "tokenspeed-engine", variant)
+    snapshot = {path: (wheelhouse / path).read_text() for path in paths}
+    for directory in roots:
+        root = wheelhouse / directory
+        contents = (root / "tokenspeed-engine/index.html").read_text()
+        assert contents.startswith("older engine links\n")
+        assert f'{url}#sha256={"a" * 64}' in contents
+        assert 'href="tokenspeed-engine/"' in (root / "index.html").read_text()
+        assert 'href="existing/"' in (root / "index.html").read_text()
+    if variant == "engine-nightly":
+        assert 'href="rocm7.2/"' in (wheelhouse / "nightly/index.html").read_text()
+        assert not (wheelhouse / "tokenspeed-engine").exists()
+    else:
+        assert not (wheelhouse / "nightly").exists()
+
+    UPDATE(wheelhouse, release, dist, "tokenspeed-engine", variant)
+    assert snapshot == {path: (wheelhouse / path).read_text() for path in paths}
+    release["assets"][0]["digest"] = f"sha256:{'b' * 64}"
+    with pytest.raises(ValueError, match="digest changed"):
+        UPDATE(wheelhouse, release, dist, "tokenspeed-engine", variant)
+    with pytest.raises(ValueError, match="must not be replaced"):
+        UPDATE(wheelhouse, release, dist, "tokenspeed-engine", variant, replace=True)
+    assert snapshot == {path: (wheelhouse / path).read_text() for path in paths}

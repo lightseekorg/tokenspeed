@@ -25,7 +25,6 @@ from ..common.primitives import (
     redux,
     sigmoid,
     store_words,
-    view,
 )
 from ..gemm.projection import PreparedProjection
 from ..gemm.ws_gemm import WsGemm
@@ -48,11 +47,15 @@ def ordered(score):
     return key if score == score else Uint32(0)
 
 
+@cute.jit
+def nan_to_zero(score):
+    """``score``, or 0 for NaN, so a NaN row ranks by bias like a real row."""
+    return score if score == score else c.Float32(0)
+
+
 class RouteSitu:
     def __init__(self, batch, shared, renorm, early, roles, polled, plan=False):  # fmt: skip
-        # B>8: few registers, so routing CTAs co-reside with the front and the fused
-        # shared expert, and polled logits skip the front's completion wait.
-        self.lean = batch > 8
+        # Polled logits skip the front's completion wait at every row count.
         self.batch, self.shared, self.experts, self.renorm = batch, shared, 896, renorm
         # early: release the persistent experts at entry (safe once down drains first);
         # polled: logits arrive as FP32 words in mailbox columns [3584, 5376) (Lamport);
@@ -105,7 +108,7 @@ class RouteSitu:
 
     @cute.jit
     def select(self, key, threshold, buffers):
-        """B>8 candidates (keys at or above ``threshold``) append to ``dense`` at a
+        """Candidates (keys at or above ``threshold``) append to ``dense`` at a
         per-warp offset from the shared count, then rank themselves: 8 threads per
         candidate (4 past 32 candidates) each count their share of the candidates above
         it (key, then lower expert). Ranks below 16 store the expert and its sigmoid."""
@@ -205,17 +208,16 @@ class RouteSitu:
     @cute.jit
     def route(self, logits, bias, ids, weights, scale, token, tid, mailbox):
         """Exact top16 by threads [0, 256): candidates at or above the 16th largest
-        lane-group maximum are compacted and ranked by an unrolled 64-way compare."""
+        lane-group maximum are ranked by every thread (``select``)."""
         warp, lane = tid // 32, tid % 32
         smem = c.utils.SmemAllocator()
         km = alloc(smem, Uint32, (8, 32))
-        cand, dense = (alloc(smem, Uint64, shape) for shape in ((8, 128), 64))
+        cand = alloc(smem, Uint64, 1024)
         sig = alloc(smem, c.Float32, 1024)
-        counts = alloc(smem, Int32, 8)
         cutoff = alloc(smem, Uint32, 1)
         chosen = alloc(smem, Int32, 16)
-        if c.const_expr(self.lean):  # candidate count; the chosen experts' sigmoids
-            found, picked = alloc(smem, Int32, 1), alloc(smem, c.Float32, 16)
+        # The candidate count; the chosen experts' sigmoids.
+        found, picked = alloc(smem, Int32, 1), alloc(smem, c.Float32, 16)
         # Thread t owns experts t + 256 i, or 4 t + i when polling 16-byte chunks.
         offsets = cute.make_rmem_tensor(4, c.Float32)
         for i in c.range_constexpr(4):  # bias is a weight: load before the wait
@@ -227,36 +229,29 @@ class RouteSitu:
         for i in c.range_constexpr(4):
             key[i] = Uint32(0)
         if c.const_expr(self.polled):
-            if tid < 224:
+            if tid < 224:  # all four experts: one block, no branches
                 cell = mailbox.iterator + token * mailbox.shape[2] + 3584 + tid * 8
                 got = poll(cell, 0, 1)
                 rearm(cell)
                 for i in c.range_constexpr(4):
                     raw[i] = bits_float(got[0, i])
-                if c.const_expr(self.lean):  # all four experts: one block, no branches
-                    scores = [sigmoid(raw[i]) for i in range(4)]
-                    for i in c.range_constexpr(4):
-                        sig[4 * tid + i] = scores[i]
-                        key[i] = ordered(scores[i] + offsets[i])
-            if c.const_expr(not self.lean):
-                cute.arch.griddepcontrol_wait()
+                scores = [nan_to_zero(sigmoid(raw[i])) for i in range(4)]
+                for i in c.range_constexpr(4):
+                    sig[4 * tid + i] = scores[i]
+                    key[i] = ordered(scores[i] + offsets[i])
         else:
             cute.arch.griddepcontrol_wait()
             for i in c.range_constexpr(4):
-                if self.expert(tid, i) < self.experts:
-                    raw[i] = logits[token, self.expert(tid, i)]
-        for i in c.range_constexpr(4):
-            expert = self.expert(tid, i)
-            if c.const_expr(not (self.lean and self.polled)):  # noqa: SIM102
+                expert = self.expert(tid, i)
                 if expert < self.experts:
-                    score = sigmoid(raw[i])
+                    score = nan_to_zero(sigmoid(logits[token, expert]))
                     sig[expert] = score
                     key[i] = ordered(score + offsets[i])
+        for i in c.range_constexpr(4):
             top = max(top, key[i])
         km[warp, lane] = top
-        if c.const_expr(self.lean):  # noqa: SIM102
-            if tid == 0:
-                found[0] = Int32(0)
+        if tid == 0:
+            found[0] = Int32(0)
         cute.arch.sync_threads()
         if warp == 0:
             group = km[0, lane]
@@ -271,73 +266,8 @@ class RouteSitu:
             if lane == 0:
                 cutoff[0] = low
         cute.arch.sync_threads()
-        if c.const_expr(self.lean):
-            dense = view(cand.iterator, 0, Uint64, (1024,))
-            self.select(key, cutoff[0], (dense, sig, chosen, picked, found))
-            self.publish(chosen, picked, ids, weights, scale, token)
-            return
-        threshold, offset = cutoff[0], Int32(0)
-        for i in c.range_constexpr(4):
-            expert = self.expert(tid, i)
-            hit = (expert < self.experts) & (key[i] >= threshold)
-            ballot = cute.arch.vote_ballot_sync(hit)
-            if hit:
-                below = cute.arch.popc(ballot & ((Uint32(1) << lane) - Uint32(1)))
-                packed = (Uint64(key[i]) << 32) | Uint64(~Uint32(expert))
-                cand[warp, offset + below] = packed
-            offset += cute.arch.popc(ballot)
-        if lane == 0:
-            counts[warp] = offset
-        cute.arch.sync_threads()
-        if warp == 0:
-            n = Int32(0)
-            for v in c.range_constexpr(8):
-                n += counts[v]
-            for half in c.range_constexpr(2):  # compact the regions densely
-                index = lane + 32 * half
-                rest, region = Int32(index), Int32(0)
-                for v in c.range_constexpr(8):
-                    if (region == v) & (rest >= counts[v]):
-                        rest -= counts[v]
-                        region += 1
-                value = Uint64(0)
-                if index < n:
-                    value = cand[region, rest]
-                dense[index] = value
-            cute.arch.sync_warp()
-            if n <= 64:
-                for half in c.range_constexpr(2):
-                    mine, rank = dense[lane + 32 * half], Int32(0)
-                    for j in c.range_constexpr(64):
-                        rank += Int32(dense[j] > mine)
-                    if (lane + 32 * half < n) & (rank < 16):
-                        chosen[rank] = Int32(~Uint32(mine))
-            else:  # rare: rank every candidate against all regions
-                for q in range(lane, n, 32):
-                    rest, region = Int32(q), Int32(0)
-                    for v in c.range_constexpr(8):
-                        if (region == v) & (rest >= counts[v]):
-                            rest -= counts[v]
-                            region += 1
-                    mine, rank = cand[region, rest], Int32(0)
-                    for v in c.range_constexpr(8):
-                        for j in range(counts[v]):
-                            rank += Int32(cand[v, j] > mine)
-                    if rank < 16:
-                        chosen[rank] = Int32(~Uint32(mine))
-            cute.arch.sync_warp()
-            expert, value = chosen[lane % 16], c.Float32(0)
-            if lane < 16:
-                ids[token, lane] = expert
-                value = sig[expert]
-            total = value
-            for shift in c.range_constexpr(4):
-                total += cute.arch.shuffle_sync_bfly(total, 1 << shift)
-            if lane < 16:
-                value = value * scale
-                if c.const_expr(self.renorm):
-                    value = div_rn(value, total + c.Float32(1e-20))
-                weights[token, lane] = c.BFloat16(value)
+        self.select(key, cutoff[0], (cand, sig, chosen, picked, found))
+        self.publish(chosen, picked, ids, weights, scale, token)
 
 
 # Front GEMM geometry "ks.kb.tg.rt.ch" per batch, by packed rows (TP8 560, TP16 288),
@@ -359,6 +289,14 @@ FUSED, SPLIT = "9-64:1", "9-12:6,13-24:4,25-64:2"
 # q=1 B32: 3 SMs, -5.4% step). Verify steps (q > 1) share experts among a request's q
 # tokens: TP8 DL7 M16/32/64 -5.9/-12.9/-1.1%, TP16 M32 -5.9%.
 SPLITS = {8: ("25-32:3", "13-16:6,25-32:4,33-64:3"), 16: ("", "25-32:3")}
+# Split-K shared-expert batches whose routing kernel releases the persistent experts
+# at entry (``RouteSitu.early``): their launch and prologue (mbarriers, tensor maps,
+# TMEM, x image; ~3.8 us after a late release at TP8 B5, all after the ids exist)
+# overlap the cross-rank logit wait and the ranking. The routing kernel starts after
+# the shared expert's split-K gate/up GEMM has taken its SMs, so the early experts
+# do not starve it. GB300 TP8 K3.1 DSpark k=4 step, ms: DCP8 R1 136K 9.465 -> 9.371,
+# TP8 R1 32K 8.858 -> 8.794.
+EARLY_ROUTE = {8: "5-8:1", 16: ""}
 # Split batches whose front GEMM rows join the gate/up kernel as extra M-tiles (one
 # kernel instead of two that slow each other ~2x side by side).
 MERGED = {8: "41-64:1", 16: "33-64:1"}
@@ -404,8 +342,12 @@ def front_geometry(batch, n, ks, kb=None, tg=None, rt=None, ch=None):
 
 
 @functools.cache
-def compile_route(batch, shared, renorm, roles, device, polled=False, plan=False):
-    kernel = RouteSitu(batch, shared, renorm, batch <= 2, roles, polled, plan)
+def compile_route(
+    batch, shared, renorm, roles, device, polled=False, plan=False, early=None
+):
+    """``early`` (default: B<=2) releases the persistent experts at entry."""
+    early = batch <= 2 if early is None else early
+    kernel = RouteSitu(batch, shared, renorm, early, roles, polled, plan)
     f32 = c.Float32
     args: tuple = (fake((batch, 896), None, f32), fake((896,), None, f32))
     args += (fake((batch, 16), None, c.Int32), fake((batch, 16)), fake((1, 64, WIDTH)))
@@ -466,13 +408,18 @@ class SharedFront:
             self.merged_args = to_cute(self.merged_maps, 64), to_cute(self.unused)
             geometry = (n, n - shard, valid, box.buffer.shape[-1])
         self.plans: dict[int, tuple] = {}
+        early = batch_table(EARLY_ROUTE[tp])
+        self.early = {b for b in batches if early.get(b) and b <= 8 and b not in fused}
         for b in batches:
             views = tuple(t[:b] for t in storage)
             logits, gate, ids, weights, h, _, latent = map(to_cute, views)
             front = compile_publish(n, n - shard, valid, b, dev, front_ks(b, n))
             planned = plan is not None and b > 8
             roles = (True, True, False)
-            route = compile_route(b, shared, renorm, roles, dev, True, planned)
+            released = b in self.early or None
+            route = compile_route(
+                b, shared, renorm, roles, dev, True, planned, released
+            )
             situ = compile_route(b, shared, renorm, (False, False, True), dev)
             args = (logits, bias, ids, weights, self.box[0], latent, gate, h)
             extra = (to_cute(plan),) if planned else ()
@@ -508,6 +455,11 @@ class SharedFront:
 
     def planned(self, batch):
         return bool(self.plans[batch][5])
+
+    def gated(self, batch):
+        """``EARLY_ROUTE`` batches: their split-K shared expert runs on the urgent
+        side stream and their tail does not join it (``PreparedMoE.finish``)."""
+        return batch in self.early
 
     def shared_expert(self, x, tail):
         """The shared expert's rows into the tail's RS mailboxes (``tail.push``); the

@@ -34,13 +34,19 @@ import re
 import struct
 import sys
 import time
+from contextlib import ExitStack
 from dataclasses import dataclass
+from unittest.mock import patch
 
 import pytest
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
+from tokenspeed_kernel.ops.sampling.eagle_harness._triton import (
+    policy as policy_kernels,
+)
+from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.execution.drafter.eagle_harness import device_policy
 from tokenspeed.runtime.execution.drafter.eagle_harness.config import (
@@ -59,13 +65,14 @@ from tokenspeed.runtime.execution.drafter.eagle_harness.device_policy import (
 register_cuda_ci(
     est_time=30,
     suite="runtime-1gpu",
-    disabled_on_runners=["amd-*"],
-    disabled_on_runners_reason="the eagle_harness policy kernels are NVIDIA-only",
+    disabled_on_runners=["amd-mi45*"],
+    disabled_on_runners_reason="the eagle_harness kernels are built for NVIDIA and gfx950 only",
 )
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.version.hip is not None,
-    reason="needs an NVIDIA GPU",
+    not torch.cuda.is_available()
+    or not (current_platform().is_nvidia or current_platform().is_cdna4),
+    reason="the eagle_harness kernels are built for NVIDIA and gfx950 only",
 )
 
 _DEVICE = torch.device("cuda")
@@ -522,6 +529,56 @@ def test_device_replays_recorded_tree_rounds(
         _assert_round(policy, outcome)
         got.append(outcome.recorded())
     assert got == _RECORDED[name, batch_size]
+
+
+@pytest.mark.skipif(
+    not current_platform().is_amd, reason="the Triton policy build serves AMD"
+)
+def test_triton_policy_kernels_do_not_recompile_across_rounds(tmp_path) -> None:
+    """Depths, batch sizes and history lengths are runtime arguments of the
+    Triton build: after one depth of one round, every later round (other batch
+    sizes, every depth, longer histories) reuses the compiled kernels."""
+    s = _HIGH
+    _write_cost_dir(
+        str(tmp_path), (1, 2, 4), _TARGET_WIDTHS, _DRAFT_WIDTHS, bs_slope=0.2, cliff=0.0
+    )
+    policy = _policy(
+        load_cost_data(str(tmp_path / "cost")),
+        topk=s.topk,
+        depth=s.depth,
+        verify=s.verify,
+    )
+    device = _DeviceDrafter(policy, 8)
+    rounds = list(_rounds(8, 6, s.topk, s.depth, s.verify, s.max_count))
+
+    def load(bs: int, i: int) -> None:
+        cache_len, deltas, draft_count, scores = rounds[i]
+        top = torch.tensor([scores] * bs)
+        device.load(
+            _Round(bs, cache_len * bs, False, torch.tensor(deltas), top, draft_count)
+        )
+
+    load(1, 0)
+    policy.next_round(1)
+    policy.begin_round(device.live_rows, device.frontier, device.sampled)
+    policy.decide(1, device.work_deltas)
+    policy.select_verify(device.top_scores)
+    kernels = (
+        policy_kernels._policy_begin_round_kernel,
+        policy_kernels._policy_decide_kernel,
+        policy_kernels._policy_select_verify_kernel,
+    )
+    with ExitStack() as stack:
+        compiles = [
+            stack.enter_context(
+                patch.object(kernel, "_do_compile", wraps=kernel._do_compile)
+            )
+            for kernel in kernels
+        ]
+        for i, bs in enumerate((2, 5, 8, 3, 1)):
+            load(bs, i + 1)
+            device.step()
+    assert [c.call_count for c in compiles] == [0, 0, 0]
 
 
 @pytest.mark.parametrize("sampled", [False, True])

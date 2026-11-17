@@ -1042,6 +1042,7 @@ def prepare_kda_fused_paged_verify(
             solution=request.solution,
             store_states=store_states,
             replay_records=record_payload,
+            output_norm=None,
             **producers,
         )
 
@@ -1193,6 +1194,7 @@ def prepare_kda_replay_commit(
                 if split_producers
                 else None
             ),
+            output_norm=None,
         )
         if output is None:
             raise BenchmarkCaseError(

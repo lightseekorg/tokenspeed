@@ -2,28 +2,28 @@
 
 The engine's control plane, in Rust, as
 [RFC 0002](../docs/rfcs/0002-rust-control-plane.md) describes it: every
-engine rank is a `ts-host` process that runs the scheduling loop in Rust and
-embeds CPython for the data plane. The design rules of the loop are in
+engine rank is a Python process that enters the native host extension,
+runs the scheduling loop in Rust and uses Python for the data plane. The design rules of the loop are in
 [`docs/design/event-loop.md`](../docs/design/event-loop.md).
 
 | Source crate | Published package | Role |
 | --- | --- | --- |
 | `ts-wire` | `tokenspeed-wire` | The engine IPC schema and its msgpack codec, byte-compatible with the Python structs in `python/tokenspeed/runtime/engine/io_struct.py` and `zmq_wire.py`. |
 | `ts-client` | `tokenspeed-client` | A frontend's connection to the engines: the startup handshake, request routing across attention-DP ranks, output streams, aborts, control operations and an EPD encode server's encode requests. |
-| `ts-py` | `tokenspeed-py` | `tokenspeed_engine._native`: `ts-client` for Python tests and tools (`entrypoints/wire_driver.py`), with `tokenspeed_engine.host_binary()` naming the installed `ts-host`, and `ts-l3`'s executor for Python tests over a data plane's Host pool. |
+| `ts-py` | `tokenspeed-py` | `tokenspeed_engine._native`: `ts-client` for Python tests and tools (`entrypoints/wire_driver.py`), with `ts-l3`'s executor for Python tests over a data plane's Host pool. |
 | `ts-collective` | `tokenspeed-collective` | CPU collectives among an engine's ranks over a TCP mesh: broadcast, all-gather and all-reduce, each frame checked against the collective the receiver is in. |
-| `ts-scheduler` | `tokenspeed-scheduler` | The C++ scheduler and its nanobind module compiled into the binary, with a `cxx` facade for the control thread. The module is registered as a built-in of the embedded interpreter, so the plans Python reads are the same C++ objects the control thread produced. |
+| `ts-scheduler` | `tokenspeed-scheduler` | The C++ scheduler and its nanobind module compiled into `_host`, with a `cxx` facade for the control thread. The module is imported from the host extension, so the plans Python reads are the same C++ objects the control thread produced. The crate also holds the host's profile span recorder, which the C++ scheduler's spans reach through the facade. |
 | `ts-control` | `tokenspeed-control` | One rank's control plane: ingress checks, request state and output processing, the scheduling loop and its in-flight queue, cache-op acknowledgment, control operations, grammars, the expert rebalance, KV events, the engine side of the msgpack wire, and the per-round agreements among ranks. |
 | `ts-grammar` | `tokenspeed-grammar` | Grammar-constrained decoding on xgrammar's C++ library: compilation and the matchers, which the data plane drives through C entry points. |
 | `ts-metrics` | `tokenspeed-metrics` | The engine's metrics: Prometheus' multiprocess files, written directly, and the events the node's plugin relay runs output plugins on. |
 | `ts-mooncake` | `tokenspeed-mooncake` | The Mooncake transfer engine and store client through their C APIs, loaded at runtime from the `tokenspeed-mooncake` wheel. |
 | `ts-l3` | `tokenspeed-l3` | The L3 storage tier's Host-only executor ([asynchronous L3](../docs/design/async-l3-cache.md)): object naming, the Host pool's layout and ownership, bounded queues and workers, backend health, and the stores (the Mooncake store client, and an in-memory one for tests). |
 | `ts-pd` | `tokenspeed-pd` | The PD transfer peer: the P/D handshake, room states, transfer workers and the per-round agreement on transfer progress. |
-| `ts-host` | `tokenspeed-host` | The rank binary: it embeds the interpreter, has `engine/rust_host.py` build the data plane and the scheduler, and runs the loop on its main thread and the data plane on its forward thread. |
+| `ts-host` | `tokenspeed-host` | The rank extension: the launching interpreter imports it, has `engine/rust_host.py` build the data plane and the scheduler, and runs the loop on its main thread and the data plane on its forward thread. |
 
 The crates.io packages use the `tokenspeed-` prefix. Their Rust library names
 remain `ts_wire`, `ts_client`, and so on; the Python module remains `_native`,
-and the host executable remains `ts-host`. For example:
+and the host launcher remains `ts-host`, backed by the `_host` extension. For example:
 
 ```toml
 [dependencies]
@@ -31,6 +31,10 @@ ts-client = { package = "tokenspeed-client", version = "0.1.0" }
 ```
 
 ## Wire conformance
+
+The [Rust engine CPU benchmark](crates/ts-control/benches/README.md) measures
+long-request ingress, prompt logprobs and high-frequency output streaming with
+the real wire, control and client classes, without a GPU or model weights.
 
 `crates/ts-wire/tests/fixtures/` holds messages written by the Python encoder.
 `cargo test` decodes each one, compares it field by field with the values the
@@ -55,7 +59,29 @@ for a token that came without one, so the column never misaligns with the
 tokens. An older producer defaults this column to empty; older readers skip
 it.
 
+The appended `reasoning_tokens` column is cumulative per request, like
+`completion_tokens`, and excludes reasoning-block delimiters. The control plane
+counts committed token ids before detokenization, including a PD prefill's
+bootstrap token. An older producer defaults the column to empty and its output
+rows report zero; older readers skip the appended column. `ts-client` output
+chunks, the Python chunk dictionaries, and `WireDriver.Completion` expose the
+same cumulative count.
+
+Completed prompt logprobs move from request state into the first output that
+ships them. The state retains the fact that they are final after transferring
+the buffers, so a retraction's replay neither gathers nor sends them again.
+The frontend likewise consumes a decoded batch into independently owned
+per-request chunks. A queued chunk owns its arrays until consumption or
+cancellation; one slow request need not retain another request's payload.
+
 ## Building
+
+Snapshot SDK updates carry a complete publication directory in the optional
+`UpdateWeightsFromMooncakeReqInput.snapshot` map. The native host and Python
+runtime must be built together to transport this field. The existing global
+commit and memory-saver rules still apply. The configured SDK updater receives
+`update_weights(models, version=..., snapshot=...)`. Tensor data remains in the
+SDK's store. Requests without a snapshot retain the existing SDK protocol.
 
 The native crates target Linux and need a C++ compiler, CMake, OpenSSL
 development headers, and Python development headers. Set `PYO3_PYTHON` to
@@ -64,20 +90,109 @@ installed. The scheduler source is bundled in its crate; the grammar build
 downloads the pinned, SHA256-checked xgrammar source release and therefore
 needs network access (or `FETCHCONTENT_SOURCE_DIR_XGRAMMAR` for a local copy).
 
-`ts-host` and `ts-py` link the CPython the engine runs under; build with it
-as `PYO3_PYTHON`, which needs `nanobind` and `tokenspeed-spdlog`, as the
-scheduler wheel build does:
+Install a development build with `pip install -e tokenspeed-engine` from the
+repository root. It builds both native extensions and the scheduler together.
+`tokenspeed_engine.host_binary()` still names the `ts-host` launcher. It keeps
+the existing arguments and execs the selected `--python` interpreter to enter
+`tokenspeed_engine.host`, preserving the PID and inherited descriptors.
+`tokenspeed_engine.scheduler` is the scheduler's Python API, the same names
+`tokenspeed_scheduler` exports, served by the scheduler linked into `_host`.
+TokenSpeed imports it, so it needs no separate `tokenspeed-scheduler` install,
+and a rank's plans and the Python types come from one build.
+
+`TS_HOST_LOG` sets the Rust log
+filter (`info` by default; `ts_control=debug` logs admissions and cache-op
+acknowledgments). `TS_HOST_LOG_USE_LOCAL_TZ` switches the Rust log
+timestamps from the default UTC (`...Z`) to the machine's local time with
+an explicit UTC offset (`...+08:00`); truthy values are `1`, `true`, `on`
+and `yes`, case-insensitive, matching dynamo's `DYN_LOG_USE_LOCAL_TZ`.
+
+## Releasing Python wheels
+
+**Build and Release TokenSpeed** first builds, tests and publishes an engine
+post release to the wheel repository, then builds and publishes TokenSpeed.
+Both use the same source commit; for a nightly this is the kernel nightly's
+commit. TokenSpeed nightlies pin the actual engine version returned by the
+release workflow, including any post-date advancement. Stable TokenSpeed
+releases retain their existing engine dependency range. These automatic
+engine releases do not upload to PyPI. A TokenSpeed nightly dry run also
+builds and tests the engine without publishing either package.
+
+Use **Release TokenSpeed Engine** in GitHub Actions. Select `dry-run` to
+build and test wheels, or `publish` on `main` to upload them. Choose a
+`release_type` (`post` by default):
+
+| Type | Example with base version `0.1.0` | Destination |
+| --- | --- | --- |
+| `release` | `0.1.0` | `lightseekorg/whl`, then PyPI |
+| `post` | `0.1.0.post20261111` | `lightseekorg/whl` by default |
+| `rc` | `0.1.0rc20261112` | `lightseekorg/whl` only |
+
+For a `post` release, explicitly enable `publish_post_to_pypi` to also upload
+the tested wheels to PyPI after the wheel repository publication succeeds.
+This option defaults to false and is accepted only for `post`. Post versions
+on PyPI sort above their base version and participate in normal pip upgrades.
+
+For `post` and `rc`, `version_date` defaults to the current UTC date
+(`YYYYMMDD`). A `post` run checks existing engine releases in `lightseekorg/whl`
+and advances by calendar days until it finds an unused post version. If
+`0.1.0.post20261111` exists, another run can publish `0.1.0.post20261112`
+on the same day. This date is a version identifier and can be ahead of the
+actual build date. Only an explicit `rc` selection produces an rc; it uses
+the requested date without automatic advancement.
+
+Leave `version_date` empty for a stable `release`. The workflow resolves the
+version once and changes the Python package version only in the build
+checkout. The committed base version and Rust crate versions stay unchanged.
+
+Wheels are attached to
+[`lightseekorg/whl` releases](https://github.com/lightseekorg/whl/releases)
+under `tokenspeed-engine-v<VERSION>`. Only `rc` is marked as a GitHub
+prerelease; `post` uses a normal GitHub release. The workflow also creates or
+updates the pip indexes
+in the wheel repository's `gh-pages` branch, retaining historical links and
+adding SHA256 hashes. No manual directory preparation is needed. GitHub
+Pages serves an index update after its deployment finishes.
 
 ```bash
-PYO3_PYTHON=$(which python) cargo build --release -p tokenspeed-host -p tokenspeed-py
+# Stable wheels mirrored from a release.
+pip install --index-url https://lightseek.org/whl/ tokenspeed-engine
+# Post releases and explicitly selected release candidates.
+pip install --index-url https://lightseek.org/whl/nightly/ tokenspeed-engine
+pip install --pre --index-url https://lightseek.org/whl/nightly/ 'tokenspeed-engine==0.1.0rc20261112'
 ```
 
-The `tokenspeed-engine` wheel (`pyproject.toml`, built with setuptools) carries
-`tokenspeed_engine._native` and the `ts-host` binary. To run a development
-build instead, put `_native` on the Python path and point
-`TOKENSPEED_HOST_BINARY` at the binary. `TS_HOST_LOG` sets the Rust log
-filter (`info` by default; `ts_control=debug` logs admissions and cache-op
-acknowledgments).
+The existing `https://lightseek.org/whl/nightly/rocm7.2/` index receives the
+same engine post/rc wheels. An rc sorts below the same base version's final
+and post releases, so pin the exact version when testing it. Merge a base
+version bump before the next stable release.
+
+Use **Re-run failed jobs** to upload missing files from the same source
+commit. **Re-run all jobs** resolves the version again and may allocate a
+new post date; use **Re-run failed jobs** to retain the original version.
+Existing assets are never overwritten. A different commit requires
+a new post run, an unused rc date, or a new base version for a stable release.
+
+Wheels support Linux with glibc 2.28 or newer on x86_64 and aarch64.
+Each architecture has two wheels: `cp311-cp311` for CPython 3.11 and
+`cp312-abi3` for standard, GIL-enabled CPython 3.12 and later. Python 3.10
+is no longer supported. Both native extensions and the scheduler binding
+use the same ABI contract; no CPython shared library is bundled.
+The release workflow tests the same abi3 wheel on Python 3.12–3.15 in separate
+containers and virtual environments, including scheduler import, process
+naming and failure exit with a lingering Python thread. Installing needs
+no Rust toolchain.
+
+The build uses a full checkout because the engine also compiles the sibling
+scheduler source. No source distribution is published; source builds must
+use the repository checkout and the dependencies described above.
+
+Configure the `tokenspeed-engine` project's PyPI Trusted Publisher with
+owner `lightseekorg`, repository `tokenspeed`, workflow filename
+`release-tokenspeed-engine.yml`, and GitHub environment `pypi`. Publication
+uses GitHub OIDC and does not require a stored PyPI token.
+The workflow also needs `LIGHTSEEK_BOT_TOKEN` with release and contents write access to
+`lightseekorg/whl`, authenticated as `lightseek-bot`.
 
 ## Releasing Rust crates
 

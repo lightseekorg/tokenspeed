@@ -48,6 +48,8 @@ V41_WINDOW_SIZE = 128
 # Shared caller/recipe bound for native prefill query and output scratch.
 V41_PREFILL_QUERY_TILE = 2048
 V41_TAIL_ROWS = 2
+# Worst-case requests whose KV the batched prefill attention workspace holds.
+V41_PREFILL_KV_WORKSPACE_REQUESTS = 4
 
 # (physical rows per page, raw tokens per row). Table columns remain absolute
 # even when the scheduler releases expired SWA/tail blocks into null holes.
@@ -221,3 +223,32 @@ def v41_table_widths(context_len: int, reservation_tokens: int) -> dict[str, int
         gid: (context_len + reservation_tokens + rows * stride - 1) // (rows * stride)
         for gid, (rows, stride) in V41_GROUP_GEOMETRY.items()
     }
+
+
+def v41_prefill_kv_workspace_rows(
+    context_len: int,
+    max_query_tokens: int,
+    kv_owners: tuple[int, ...],
+    compress_ratios: tuple[int, ...],
+) -> int:
+    """Return BF16 512-wide rows of the batched prefill attention workspace.
+
+    A worst-case request needs its owner history (context_len // ratio rows at
+    the smallest owner ratio), a full SWA window and every step query row. The
+    workspace holds V41_PREFILL_KV_WORKSPACE_REQUESTS such requests, so any one
+    request fits a batch.
+
+    Args:
+        context_len: Maximum raw-token context length.
+        max_query_tokens: Maximum query rows in one forward.
+        kv_owners: Per-layer KV owner, -1 for SWA-only layers.
+        compress_ratios: Per-layer compression ratio.
+
+    Returns:
+        Row capacity.
+    """
+    ratios = [compress_ratios[owner] for owner in set(kv_owners) if owner >= 0]
+    history = context_len // min(ratios) if ratios else 0
+    return V41_PREFILL_KV_WORKSPACE_REQUESTS * (
+        history + V41_WINDOW_SIZE + max_query_tokens
+    )

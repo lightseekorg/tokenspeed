@@ -20,7 +20,6 @@
 
 #pragma once
 
-#include <algorithm>
 #include <limits>
 #include <optional>
 #include <span>
@@ -74,6 +73,7 @@ public:
 
     void Remove(std::uint32_t group_id, CacheBlockLocation location) {
         shadow_.Remove(group_id, location);
+        ++removals_;
         trackCheckpoint(group_id, location, 1);
     }
     void Restore(std::uint32_t group_id, CacheBlockLocation location) {
@@ -85,11 +85,20 @@ public:
         return shadow_.HolesByBucket(group_index);
     }
 
+    // Stops at the first selection after which the demand fits. A demand
+    // short by n parents cannot fit before n more Removes
+    // (ShadowOccupancy::ParentShortfall), so the fit is asked only then.
     template <typename SelectNext>
     bool SelectUntilFits(std::span<const std::vector<std::int64_t>> needed, std::span<const std::int64_t> dense,
                          std::span<const std::int64_t> pairs, SelectNext&& select_next) {
-        while (!Fits(needed, dense, pairs)) {
+        std::int64_t shortfall = shadow_.ParentShortfall(needed, dense, pairs);
+        std::int64_t asked_at = removals_;
+        while (shortfall > 0) {
             if (!select_next()) return false;
+            if (removals_ - asked_at >= shortfall) {
+                shortfall = shadow_.ParentShortfall(needed, dense, pairs);
+                asked_at = removals_;
+            }
         }
         return true;
     }
@@ -98,18 +107,17 @@ public:
     template <typename VictimSet>
     void Minimize(std::vector<VictimSet>& victims, std::span<const std::vector<std::int64_t>> needed,
                   std::span<const std::int64_t> dense, std::span<const std::int64_t> pairs) {
-        std::vector<VictimSet> required;
-        required.reserve(victims.size());
         for (auto it = victims.rbegin(); it != victims.rend(); ++it) {
             if (it->members.empty()) continue;
             for (const auto& member : it->members) Restore(member.group_id, member.location);
             if (!Fits(needed, dense, pairs)) {
                 for (const auto& member : it->members) Remove(member.group_id, member.location);
-                required.push_back(std::move(*it));
+            } else {
+                it->members.clear();
             }
         }
-        std::ranges::reverse(required);
-        victims = std::move(required);
+        // The sets kept stay in selection order.
+        std::erase_if(victims, [](const auto& set) { return set.members.empty(); });
     }
 
 private:
@@ -133,6 +141,9 @@ private:
     const BlockPool& pool_;
     const std::vector<CacheGroup>& groups_;
     ShadowOccupancy shadow_;
+    // Removes so far; a Restore never brings a fit closer, so it is not
+    // subtracted (SelectUntilFits).
+    std::int64_t removals_{0};
     bool tracks_checkpoints_{false};
     CacheEvictionCandidates::RemovedCheckpoints removed_checkpoints_;
     std::optional<CacheEvictionCandidates> candidates_;

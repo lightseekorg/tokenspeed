@@ -42,6 +42,12 @@ def _merge_traces(args: argparse.Namespace) -> None:
     merge_traces_main(args.merge_args)
 
 
+def _reload_forward(args: argparse.Namespace) -> None:
+    from tokenspeed.cli.reload_forward import main as reload_forward_main
+
+    reload_forward_main(args)
+
+
 def _version(args: argparse.Namespace) -> None:
     from tokenspeed.version import __version__
 
@@ -90,6 +96,16 @@ def main() -> None:
         "timeline.",
     )
     merge_traces_parser.set_defaults(func=_merge_traces, merge_args=[])
+
+    reload_parser = subparsers.add_parser(
+        "reload-forward",
+        help="Development: reload edited forward code into a running server "
+        "started with --allow-reload-forward and recapture its CUDA graphs.",
+    )
+    from tokenspeed.cli.reload_forward import add_arguments as add_reload_arguments
+
+    add_reload_arguments(reload_parser)
+    reload_parser.set_defaults(func=_reload_forward)
 
     version_parser = subparsers.add_parser(
         "version",

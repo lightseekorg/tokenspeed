@@ -26,6 +26,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.models import kimi_k3_comm as mod
 
 
@@ -144,16 +145,27 @@ def test_model_prepares_routed_workspace_at_serving_limit(monkeypatch):
         torch.nn.Module.__init__(layer)
         layer.is_moe_layer = True
         layer.block_sparse_moe = moe
+        layer.k3_comm = SimpleNamespace(
+            iris_state=None, prepare_staged_projection=Mock(return_value=True)
+        )
         layers.append(layer)
+    group = tuple(range(8))
     owner = SimpleNamespace(
-        model=SimpleNamespace(layers=layers),
-        mapping=object(),
+        model=SimpleNamespace(layers=layers, iris_states={}),
+        mapping=SimpleNamespace(
+            attn=SimpleNamespace(tp_group=group),
+            moe=SimpleNamespace(tp_ep_group=group),
+        ),
         config=SimpleNamespace(hidden_size=7168, routed_expert_hidden_size=3584),
+        _prepare_decode_chain=Mock(return_value=False),
     )
     monkeypatch.setattr(kimi_k3, "prepare_k3_all_reduce_buffers", lambda **kw: False)
     assert kimi_k3.KimiLinearForCausalLM.prepare_communication_runtime(owner, 32768)
     layers[0].block_sparse_moe.comm.prepare.assert_called_once_with(32768)
     layers[1].block_sparse_moe.comm.prepare.assert_not_called()
+    # Layers share the o-projection staging; the first prepares it.
+    layers[0].k3_comm.prepare_staged_projection.assert_called_once_with(32768)
+    layers[1].k3_comm.prepare_staged_projection.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -221,14 +233,17 @@ def test_routed_implementations_use_same_second_stage(monkeypatch, enabled, defe
     torch.testing.assert_close(result, reduced, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("injected", [False, True])
 @pytest.mark.parametrize(
     "m,use_multimem",
     [(256, False), (512, False), (1024, False), (1025, True), (8193, True)],
 )
-def test_up_proj_inject_ar_selects_collective(monkeypatch, m, use_multimem):
+def test_up_proj_inject_ar_selects_collective(monkeypatch, m, use_multimem, injected):
     comm = _comm(enabled=False, capacity=16384, deferred=False)
     comm.hidden_size = 16
-    comm.mapping = SimpleNamespace(moe=SimpleNamespace(tp_ep_group=tuple(range(8))))
+    comm.mapping = Mapping(
+        rank=0, world_size=8, attn_tp_size=8, moe_tp_size=8, moe_ep_size=1
+    )
     comm.up_proj = SimpleNamespace(
         shard_slice=(4, 2), weight=torch.full((2, 3), 2, dtype=torch.bfloat16)
     )
@@ -251,7 +266,12 @@ def test_up_proj_inject_ar_selects_collective(monkeypatch, m, use_multimem):
     monkeypatch.setattr(mod, "all_reduce", ordinary)
     monkeypatch.setattr(mod, "multimem_stage", stage)
     monkeypatch.setattr(mod, "multimem_all_reduce_staged", multimem)
-    output = comm.up_proj_inject_ar(latent, shared, residual)
+    if injected:
+        # The shared branch adds the residual; the tail must not add it again.
+        comm.inject_residual(shared, residual)
+        assert torch.all(shared[:, 4:6] == 4)
+        assert torch.all(shared[:, :4] == 1) and torch.all(shared[:, 6:] == 1)
+    output = comm.up_proj_inject_ar(latent, shared, None if injected else residual)
     if use_multimem:
         ordinary.assert_not_called()
         stage.assert_called_once()
@@ -264,3 +284,17 @@ def test_up_proj_inject_ar_selects_collective(monkeypatch, m, use_multimem):
         multimem.assert_not_called()
         stage.assert_not_called()
     torch.testing.assert_close(output, torch.full_like(output, 21), rtol=0, atol=0)
+
+
+def test_one_rank_tail_keeps_the_residual_in_add3():
+    comm = _comm(enabled=False, capacity=16384, deferred=False)
+    comm.mapping = SimpleNamespace(moe=SimpleNamespace(tp_ep_size=1))
+    comm.up_proj = SimpleNamespace(forward_add3=Mock())
+    latent = torch.ones(64, 3, dtype=torch.bfloat16)
+    shared = torch.ones(64, 16, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="add3"):
+        comm.inject_residual(shared, torch.ones_like(shared))
+    with pytest.raises(ValueError, match="add3"):
+        comm.up_proj_inject_ar(latent, shared, None)
+    comm.up_proj.forward_add3.assert_not_called()
+    assert torch.all(shared == 1)

@@ -150,7 +150,8 @@ def test_compact_gdn_prefixes_and_commits_survive_uniform_verify_tactics(
                 max_bs=batch,
                 device="cuda",
                 replay_ssm=replay,
-            )
+            ),
+            writes_state_checkpoints_in_forward=False,
         )
         backend.set_kv_pool(pool)
         backend.init_cuda_graph_state(batch)
@@ -355,7 +356,7 @@ def test_equal_scores_choose_request_then_position():
 
 
 def test_slot_confidence_generations_are_reset_and_restored():
-    states = RuntimeStates(5, 16, 4, device="cpu")
+    states = RuntimeStates(5, 16, 16, 4, device="cpu")
     states.init_draft_confidence(3)
     slots = torch.tensor([1])
     first = torch.tensor([[0.9, 0.8, 0.7]])
@@ -366,8 +367,8 @@ def test_slot_confidence_generations_are_reset_and_restored():
     torch.testing.assert_close(states.draft_confidence[slots], second)
     assert states.draft_confidence_generation[1].item() == 2
     image = torch.empty(states.slot_state_bytes(), dtype=torch.uint8)
-    states.export_slot_state(1, image, None, request_id="request")
-    states.import_slot_state(2, image, None, request_id="request")
+    states.export_slot_state(1, image, None, admission_id=1)
+    states.import_slot_state(2, image, None, admission_id=1)
     torch.testing.assert_close(states.draft_confidence[2], second[0])
     torch.testing.assert_close(states.previous_draft_confidence[2], first[0])
     assert states.draft_confidence_generation[2].item() == 2
@@ -379,7 +380,7 @@ def test_slot_confidence_generations_are_reset_and_restored():
 
 
 def test_planner_accounts_for_full_round_cost_and_prefers_smaller_ties():
-    from tokenspeed_scheduler import ConfidenceBudgetPlanner
+    from tokenspeed_engine.scheduler import ConfidenceBudgetPlanner
 
     planner = ConfidenceBudgetPlanner(3)
     planner.observe(2, 2, 1.0)
@@ -394,7 +395,7 @@ def test_planner_accounts_for_full_round_cost_and_prefers_smaller_ties():
 
 
 def test_planner_uses_shared_query_graphs_and_anchor_only_without_timings():
-    from tokenspeed_scheduler import ConfidenceBudgetPlanner
+    from tokenspeed_engine.scheduler import ConfidenceBudgetPlanner
 
     planner = ConfidenceBudgetPlanner(4)
     rates = [[0.8] * 3 for _ in range(4)]
@@ -406,7 +407,7 @@ def test_planner_uses_shared_query_graphs_and_anchor_only_without_timings():
 
 
 def test_live_cost_corrects_unvisited_large_query_graphs():
-    from tokenspeed_scheduler import ConfidenceBudgetPlanner
+    from tokenspeed_engine.scheduler import ConfidenceBudgetPlanner
 
     planner = ConfidenceBudgetPlanner(4)
     for queries in (4, 6, 8, 12, 16):
@@ -421,7 +422,7 @@ def test_live_cost_corrects_unvisited_large_query_graphs():
 
 
 def test_graph_cost_correction_ignores_isolated_slow_samples():
-    from tokenspeed_scheduler import ConfidenceBudgetPlanner
+    from tokenspeed_engine.scheduler import ConfidenceBudgetPlanner
 
     planner = ConfidenceBudgetPlanner(4)
     for queries in (4, 8, 12, 16):

@@ -37,7 +37,6 @@ from tokenspeed.runtime.configs.minimax_m3_config import (
     MiniMaxM3Config,
     MiniMaxM3VisionConfig,
 )
-from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.distributed.utils import divide
 from tokenspeed.runtime.execution.context import ForwardContext
@@ -74,7 +73,11 @@ from tokenspeed.runtime.layers.quantization.mxfp8_nvfp4 import (
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
-from tokenspeed.runtime.models.base import BaseCausalLM, BaseTransformerModel
+from tokenspeed.runtime.models.base import (
+    BaseCausalLM,
+    BaseDecoderLayer,
+    BaseTransformerModel,
+)
 from tokenspeed.runtime.models.utils import validate_attention_partition
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.multimodal.embedder import (
@@ -568,7 +571,7 @@ class MiniMaxM3Attention(nn.Module):
         return output
 
 
-class MiniMaxM3DecoderLayer(nn.Module):
+class MiniMaxM3DecoderLayer(BaseDecoderLayer[MiniMaxM3VLTextConfig]):
     """Decoder layer selected as dense or MoE by ``mlp_layer_types``."""
 
     def __init__(
@@ -580,99 +583,61 @@ class MiniMaxM3DecoderLayer(nn.Module):
         prefix: str = "",
         alt_stream: torch.cuda.Stream | None = None,
     ) -> None:
-        super().__init__()
-        self.mapping = mapping
-        self.layer_id = layer_id
-        self.is_moe_layer = config.mlp_layer_types[layer_id] == "sparse"
-        previous_is_moe_layer = (
-            layer_id > 0 and config.mlp_layer_types[layer_id - 1] == "sparse"
+        # Set before the base constructor, whose resolve_mlp() reads it.
+        self.alt_stream = alt_stream
+        super().__init__(
+            config=config,
+            layer_id=layer_id,
+            mapping=mapping,
+            quant_config=quant_config,
+            prefix=prefix,
         )
 
-        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = GemmaRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+    @property
+    def is_moe_layer(self) -> bool:
+        return self.config.mlp_layer_types[self.layer_id] == "sparse"
+
+    @property
+    def is_prev_moe_layer(self) -> bool:
+        return (
+            self.layer_id > 0
+            and self.config.mlp_layer_types[self.layer_id - 1] == "sparse"
         )
-        self.self_attn = MiniMaxM3Attention(
-            config=config,
-            mapping=mapping,
-            layer_id=layer_id,
-            quant_config=quant_config,
+
+    def resolve_norm(self) -> nn.Module:
+        return GemmaRMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
+
+    def resolve_attn(self, prefix: str) -> nn.Module:
+        return MiniMaxM3Attention(
+            config=self.config,
+            mapping=self.mapping,
+            layer_id=self.layer_id,
+            quant_config=self.quant_config,
             prefix=add_prefix("self_attn", prefix),
         )
+
+    def resolve_mlp(self, prefix: str) -> nn.Module:
         if self.is_moe_layer:
-            self.mlp = MiniMaxM3SparseMoeBlock(
-                config=config,
-                mapping=mapping,
-                quant_config=quant_config,
-                layer_index=layer_id,
+            return MiniMaxM3SparseMoeBlock(
+                config=self.config,
+                mapping=self.mapping,
+                quant_config=self.quant_config,
+                layer_index=self.layer_id,
                 prefix=add_prefix("block_sparse_moe", prefix),
-                alt_stream=alt_stream,
+                alt_stream=self.alt_stream,
             )
-        else:
-            self.mlp = GatedMLP.tensor_parallel(
-                hidden_size=config.hidden_size,
-                intermediate_size=config.dense_intermediate_size,
-                activation=SwigluOAI(config.swiglu_alpha, config.swiglu_limit),
-                tp_rank=mapping.dense.tp_rank,
-                tp_size=mapping.dense.tp_size,
-                tp_group=mapping.dense.tp_group,
-                reduce_results=False,
-                fusions=(),
-                quant_config=quant_config,
-                prefix=add_prefix("mlp", prefix),
-            )
-        self.comm_manager = CommManager(
-            mapping=mapping,
-            layer_id=layer_id,
-            is_moe=self.is_moe_layer,
-            prev_is_moe=previous_is_moe_layer,
-            dense_batch_invariant=False,
-            input_layernorm=self.input_layernorm,
-            post_attn_layernorm=self.post_attention_layernorm,
-            query_sharded=False,
+        return GatedMLP.tensor_parallel(
+            hidden_size=self.config.hidden_size,
+            intermediate_size=self.config.dense_intermediate_size,
+            activation=SwigluOAI(self.config.swiglu_alpha, self.config.swiglu_limit),
+            tp_rank=self.mapping.dense.tp_rank,
+            tp_size=self.mapping.dense.tp_size,
+            tp_group=self.mapping.dense.tp_group,
+            reduce_results=False,
+            fusions=(),
+            quant_config=self.quant_config,
+            prefix=add_prefix("mlp", prefix),
         )
-
-    def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        ctx: ForwardContext,
-        residual: torch.Tensor | None,
-        aux_hidden_states: list[torch.Tensor] | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
-            ctx
-        )
-
-        if not ctx.forward_mode.is_idle():
-            hidden_states, residual = self.comm_manager.input_reduce_norm(
-                hidden_states, residual
-            )
-            if aux_hidden_states is not None:
-                aux_hidden_states.append(
-                    self.comm_manager.gather_residual(residual, ctx).clone()
-                )
-            hidden_states = self.comm_manager.pre_attn_comm(hidden_states, ctx)
-            hidden_states = self.self_attn(
-                positions=positions,
-                hidden_states=hidden_states,
-                ctx=ctx,
-            )
-            hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
-                hidden_states, residual, ctx
-            )
-
-        hidden_states = self.comm_manager.pre_mlp_comm(hidden_states, ctx)
-        if self.is_moe_layer:
-            hidden_states = self.mlp(
-                hidden_states, num_global_tokens, max_num_tokens_per_gpu
-            )
-        else:
-            hidden_states = self.mlp(hidden_states)
-        hidden_states, residual = self.comm_manager.post_mlp_fused(
-            hidden_states, residual, ctx
-        )
-        return hidden_states, residual
 
 
 class MiniMaxM3Model(BaseTransformerModel):

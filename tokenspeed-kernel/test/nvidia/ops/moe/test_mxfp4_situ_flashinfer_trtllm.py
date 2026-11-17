@@ -231,6 +231,43 @@ def test_flashinfer_situ_kernel_routing_deferred_matches_finalized() -> None:
 
 
 @requires_flashinfer_situ
+def test_swiglu_defaults_match_silu_times_up() -> None:
+    from tokenspeed_kernel.ops.moe.flashinfer import (
+        flashinfer_trtllm_mxfp4_moe_apply,
+        flashinfer_trtllm_mxfp4_moe_weights,
+    )
+
+    # Two FP4 ones per byte, scaled by 2**-4 for every projection.
+    raw = {
+        "w13_weight": torch.full(
+            (NUM_EXPERTS, 2 * ISPP, HIDDEN // 2), 0x22, dtype=torch.uint8
+        ),
+        "w13_scale": torch.full(
+            (NUM_EXPERTS, 2 * ISPP, HIDDEN // 32), 123, dtype=torch.uint8
+        ),
+        "w2_weight": torch.full(
+            (NUM_EXPERTS, HIDDEN, ISPP // 2), 0x22, dtype=torch.uint8
+        ),
+        "w2_scale": torch.full(
+            (NUM_EXPERTS, HIDDEN, ISPP // 32), 123, dtype=torch.uint8
+        ),
+    }
+    w = _MoEWeights(raw).cuda()
+    flashinfer_trtllm_mxfp4_moe_weights({}, w)
+    x = torch.full((4, HIDDEN), 0.25, dtype=torch.bfloat16, device="cuda")
+    ids = torch.arange(4 * TOP_K, dtype=torch.int32, device="cuda").reshape(4, TOP_K)
+    weights = torch.full(ids.shape, 1 / TOP_K, dtype=torch.bfloat16, device="cuda")
+    actual = flashinfer_trtllm_mxfp4_moe_apply(
+        {}, x, w, None, topk_ids=ids, topk_weights=weights
+    )
+    gate_up = x.float().sum(dim=-1, keepdim=True) / 16
+    expected = torch.nn.functional.silu(gate_up) * gate_up * (ISPP / 16)
+    torch.testing.assert_close(
+        actual.float(), expected.expand_as(actual), rtol=0.05, atol=0.0
+    )
+
+
+@requires_flashinfer_situ
 @pytest.mark.parametrize("num_tokens", [0, 4, 1025])
 @pytest.mark.parametrize("precomputed", [False, True])
 def test_swiglu_deferred_finalize(num_tokens, precomputed, monkeypatch) -> None:

@@ -172,6 +172,71 @@ def _verify_chain_greedy(
     )
 
 
+def verify_packed_chain_greedy(
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_length: torch.Tensor,
+    candidates: torch.Tensor,
+    target_predict: torch.Tensor,
+    query_start_loc: torch.Tensor,
+) -> None:
+    """Verify packed target predictions into ordinary fixed-width output buffers.
+
+    ``candidates`` and ``accept_index`` are [requests, proposal_width],
+    ``predicts`` is flat storage of the same size, and ``accept_length`` is
+    [requests]. ``target_predict`` contains packed argmax IDs (possibly with
+    trailing graph padding); ``query_start_loc`` is their [requests + 1] CSR.
+    Live intervals contain 1..proposal_width rows; an empty interval is an
+    inactive request. Returned lengths include the target bonus token.
+
+    Reuses the ordinary chain verifier with device offsets, including for
+    confidence query layouts. Acceptance is capped at the number of computed
+    query rows; a match at the last computed prediction
+    is emitted as the bonus and must not advance beyond its input KV row.
+    The caller retains ownership of TP output agreement and stop conditions.
+    """
+    if candidates.ndim != 2:
+        raise ValueError("packed greedy candidates must be a matrix")
+    bs, width = candidates.shape
+    if (
+        width < 1
+        or target_predict.ndim != 1
+        or query_start_loc.shape != (bs + 1,)
+        or query_start_loc.dtype not in (torch.int32, torch.int64)
+        or predicts.shape != (bs * width,)
+        or accept_index.shape != (bs, width)
+        or accept_length.shape != (bs,)
+    ):
+        raise ValueError("packed greedy verification buffers disagree")
+    tensors = (predicts, accept_index, accept_length, target_predict, query_start_loc)
+    if any(t.device != candidates.device for t in tensors):
+        raise ValueError("packed verification tensors must share a device")
+    lengths = query_start_loc.diff()
+    if not candidates.is_cuda and (
+        query_start_loc[0] != 0
+        or query_start_loc[-1] > target_predict.numel()
+        or (lengths < 0).any()
+        or (lengths > width).any()
+    ):
+        raise ValueError("packed target intervals must fit proposal storage")
+    if bs == 0 or target_predict.numel() == 0:
+        predicts.zero_()
+        accept_index.fill_(-1)
+        accept_length.zero_()
+        return
+    _verify_chain_greedy(
+        predicts,
+        accept_index,
+        accept_length,
+        candidates,
+        target_predict,
+        bs,
+        width,
+        query_start_loc=query_start_loc,
+    )
+    accept_length += 1
+
+
 class GreedySamplingBackend(SamplingBackend):
     """Greedy-only backend: argmax for single-step, chain-greedy verify for
     multi-step verification. No flashinfer / min_p / penalty machinery, no
@@ -190,7 +255,6 @@ class GreedySamplingBackend(SamplingBackend):
     supports_compact_verify = True
 
     def __init__(self, config: SamplingBackendConfig) -> None:
-
         super().__init__(config)
 
         self._ones_buf = torch.ones(
@@ -214,7 +278,6 @@ class GreedySamplingBackend(SamplingBackend):
         logits_output: LogitsProcessorOutput,
         sampling_info: SamplingBatchInfo,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-
         logits = logits_output.next_token_logits
         # Grammar bitmask apply — captured inside the CUDA graph. Buffer is
         # pre-bound by bind_grammar_mask_buf; non-grammar rows stay all-ones
@@ -250,8 +313,18 @@ class GreedySamplingBackend(SamplingBackend):
         candidates: torch.Tensor,
         *,
         tree: TreeVerifyBatch | None,
+        query_start_loc: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-
+        if query_start_loc is not None and logits_output.query_layout is not None:
+            raise ValueError("packed verification requires one query layout")
+        if query_start_loc is not None and (
+            tree is not None
+            or sampling_info.vocab_mask is not None
+            or self.config.synthetic_acceptance_length is not None
+            or self.config.enable_output_logprobs
+            or self.config.enable_output_cumulative_probs
+        ):
+            raise ValueError("packed greedy verification requires plain chain sampling")
         bs = candidates.shape[0]
         num_tokens_per_req = candidates.shape[1]
         query_layout = logits_output.query_layout
@@ -289,10 +362,23 @@ class GreedySamplingBackend(SamplingBackend):
             and not (query_layout is not None and sampling_info.vocab_mask is not None)
             else sampling_argmax(logits)
         )
-        if query_layout is None:
+        if query_layout is None and query_start_loc is None:
             target_predict = target_predict.reshape(bs, num_tokens_per_req)
 
-        if tree is not None:
+        if query_start_loc is not None or query_layout is not None:
+            verify_packed_chain_greedy(
+                predict,
+                accept_index,
+                accept_length,
+                candidates.to(torch.int32),
+                target_predict,
+                (
+                    query_start_loc
+                    if query_layout is None
+                    else query_layout.query_offsets[: bs + 1]
+                ),
+            )
+        elif tree is not None:
             # The accepted path rides in accept_index so the TP broadcast below carries it.
             verify_tree(
                 predict,
@@ -319,16 +405,11 @@ class GreedySamplingBackend(SamplingBackend):
             )
             # Retain normal verification cost before forcing benchmark acceptance.
             if self.config.synthetic_acceptance_length is not None:
-                lengths = self.synthetic_lengths(
-                    candidates, sampling_info.batch_row_offset
-                )
-                target_tokens = target_predict.gather(
-                    1, (lengths - 1).long()[:, None]
-                ).squeeze(1)
+                row_offset = sampling_info.batch_row_offset
                 self.write_synthetic_outputs(
                     candidates,
-                    target_tokens,
-                    lengths,
+                    target_predict,
+                    self._synthetic_lengths[row_offset : row_offset + bs],
                     predict,
                     accept_index,
                     accept_length,

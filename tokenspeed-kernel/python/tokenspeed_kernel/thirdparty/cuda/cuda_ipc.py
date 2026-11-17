@@ -58,10 +58,11 @@ class Function:
 
 def find_loaded_library(lib_name) -> Optional[str]:
     """
-    According to according to https://man7.org/linux/man-pages/man5/proc_pid_maps.5.html,
+    According to https://man7.org/linux/man-pages/man5/proc_pid_maps.5.html,
     the file `/proc/self/maps` contains the memory maps of the process, which includes the
     shared libraries loaded by the process. We can use this file to find the path of the
-    a loaded library.
+    loaded library. Match the name before `.so` exactly to exclude similarly named
+    compiler stubs, and prefer paths outside a `stubs` directory.
     """  # noqa
     candidates = []
     with open("/proc/self/maps") as f:
@@ -71,7 +72,8 @@ def find_loaded_library(lib_name) -> Optional[str]:
             start = line.index("/")
             path = line[start:].strip()
             filename = path.split("/")[-1]
-            if filename.rpartition(".so")[0].startswith(lib_name):
+            # Match the SONAME base exactly: libcudart_stub is not libcudart.
+            if filename.rpartition(".so")[0] == lib_name:
                 candidates.append(path)
     if not candidates:
         # the library is not loaded in the current process
@@ -213,13 +215,44 @@ class CudaRTLibrary:
 if current_platform().is_nvidia:
     cudart = CudaRTLibrary()
 
+    class _FabricSharedBuffer(list[int]):
+        """Peer addresses retaining their symmetric allocation and mappings."""
+
+        def __init__(self, size_in_bytes: int, group: ProcessGroup):
+            import torch.distributed._symmetric_memory as symm_mem
+
+            self.tensor = symm_mem.empty(
+                size_in_bytes, dtype=torch.uint8, device="cuda"
+            )
+            self.handle = symm_mem.rendezvous(self.tensor, group)
+            super().__init__(self.handle.buffer_ptrs)
+
+        def close(self, group: ProcessGroup) -> None:
+            torch.cuda.synchronize()
+            dist.barrier(group=group)
+            self.handle = None
+            self.tensor = None
+            self.clear()
+            dist.barrier(group=group)
+
     def create_shared_buffer(
         size_in_bytes: int, group: Optional[ProcessGroup] = None
     ) -> List[int]:
-        pointer = cudart.cudaMalloc(size_in_bytes)
-        handle = cudart.cudaIpcGetMemHandle(pointer)
+        from tokenspeed_kernel.ops.communication.fabric import (
+            group_has_fabric,
+            group_host_span,
+        )
+
         if group is None:
             group = dist.group.WORLD
+        ranks = dist.get_process_group_ranks(group)
+        span = group_host_span(ranks)
+        if span is not None and span > 1:
+            if not group_has_fabric(ranks):
+                raise RuntimeError("Cross-node shared buffers require NVLink fabric")
+            return _FabricSharedBuffer(size_in_bytes, group)
+        pointer = cudart.cudaMalloc(size_in_bytes)
+        handle = cudart.cudaIpcGetMemHandle(pointer)
         world_size = dist.get_world_size(group=group)
         rank = dist.get_rank(group=group)
         handles = [None] * world_size
@@ -241,6 +274,9 @@ if current_platform().is_nvidia:
         """Collectively close peer mappings before freeing the exported allocation."""
         if group is None:
             group = dist.group.WORLD
+        if isinstance(pointers, _FabricSharedBuffer):
+            pointers.close(group)
+            return
         rank = dist.get_rank(group=group)
         cudart.cudaDeviceSynchronize()
         for peer, pointer in enumerate(pointers):

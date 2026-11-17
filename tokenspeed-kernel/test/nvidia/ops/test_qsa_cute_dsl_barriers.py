@@ -62,8 +62,11 @@ def _run_delayed_pv(bf16_smem_slots: int) -> None:
         bf16_kv: bool,
         sm_count: int,
         wide_cluster_capacity: int,
+        *,
+        fp8_wave_sizing: bool,
     ) -> tuple[int, int, int, bool]:
         del num_rows, head_tiles_per_row, bf16_kv, sm_count, wide_cluster_capacity
+        del fp8_wave_sizing
         return 4, 1, bf16_smem_slots, True
 
     torch.manual_seed(239)

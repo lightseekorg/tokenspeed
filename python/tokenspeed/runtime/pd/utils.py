@@ -54,7 +54,9 @@ class StepCounter:
     COUNT_NUM_MAX: int = 2**62
 
     def __init__(self, device: str, gpu_id: int):
-        self.d_ready_cache_step = torch.tensor(0, dtype=torch.int64).cuda(gpu_id)
+        self.d_ready_cache_step = torch.tensor(
+            0, dtype=torch.int64, device=torch.device(device, gpu_id)
+        )
         self.h_ready_cache_step = torch.tensor(0, dtype=torch.int64, pin_memory=True)
 
     def record_cache(self):

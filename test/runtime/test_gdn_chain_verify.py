@@ -135,10 +135,15 @@ def _backend(state, *, width: int, max_bs: int, cls=GdnAttnBackend):
         kv_cache_quant_method="none",
         context_len=4096,
         max_bs=max_bs,
+        max_resident_requests=max_bs,
         speculative_num_draft_tokens=width,
         components=(spec, linear),
     )
-    backend = cls(config, spec)
+    backend = (
+        GdnAttnBackend(config, spec, writes_state_checkpoints_in_forward=False)
+        if cls is GdnAttnBackend
+        else cls(config, spec)
+    )
     backend.set_kv_pool(pool)
     backend.init_cuda_graph_state(max_bs)
     backend.preallocate_verify_workspace(max_bs, width)

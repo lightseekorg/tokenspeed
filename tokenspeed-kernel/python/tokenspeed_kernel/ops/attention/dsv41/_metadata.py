@@ -20,7 +20,22 @@
 
 """Invocation-owned index geometry, never persistent request or KV state."""
 
+import os
+
 import torch
+
+# One prefill index_topk call's [query rows, history columns] BF16 logits stay
+# within this many bytes; lowering it trades reserved memory for more calls.
+# Every logits producer and consumer addresses rows in 64 bits, so rows *
+# columns may exceed 2**31.
+INDEX_LOGIT_BYTES = (
+    int(os.environ.get("TOKENSPEED_PREFILL_INDEX_LOGITS_MB", "10240")) << 20
+)
+
+
+def index_logit_rows(columns: int) -> int:
+    """Most query rows whose [rows, columns] BF16 logits fit one index_topk call."""
+    return max(1, INDEX_LOGIT_BYTES // (max(1, columns) * 2))
 
 
 class IndexGeometry:
@@ -45,7 +60,7 @@ class IndexGeometry:
 
 
 class IndexMetadata:
-    def __init__(self, table, lengths, request_indices):
+    def __init__(self, table, lengths, request_indices, history_rows):
         if request_indices is not None and (
             request_indices.shape != lengths.shape
             or request_indices.dtype != torch.int32
@@ -58,6 +73,9 @@ class IndexMetadata:
                 "on the table device, with fewer than 2**31 rows"
             )
         self.source = IndexGeometry((table, lengths, request_indices))
+        # Query rows per run that shares one request history, in table order.
+        # None means every row may address its own history (decode/verify).
+        self.history_rows = history_rows
         self.paged = {}
         self.sparse = {}
 

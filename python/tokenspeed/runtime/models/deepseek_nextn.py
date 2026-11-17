@@ -214,6 +214,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             tp_rank=self.mapping.lm_head.tp_rank,
             tp_size=self.mapping.lm_head.tp_size,
             tp_group=self.mapping.lm_head.tp_group,
+            attn_tp_size=self.mapping.attn.tp_size,
             dp_lm_head_tp=self.mapping.attn.has_dp and self.mapping.lm_head.has_tp,
         )
 
@@ -232,10 +233,11 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
                 ctx,
                 captured_hidden_states=captured_hidden_states,
             )
-        logits_metadata = LogitsMetadata.from_forward_context(ctx)
-        return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, logits_metadata
-        )
+            # Keep the narrowed draft row counts active through the head exchange.
+            logits_metadata = LogitsMetadata.from_forward_context(ctx)
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head, logits_metadata
+            )
 
     def get_hot_token_id(self):
         # MTP drafts every vocab token; the hot-token-id mechanism is an

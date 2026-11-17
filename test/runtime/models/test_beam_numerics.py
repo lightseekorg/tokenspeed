@@ -228,10 +228,7 @@ def test_the_route_weights_are_fp32_and_take_the_routed_scale_once():
     assert torch.equal(scaled, unscaled * torch.tensor(2.5, dtype=torch.float32))
 
 
-def test_beams_kernels_serve_nvidia_sm90_to_sm103():
-    """Beam calls its Triton kernels on the NVIDIA architectures their CUDA tests
-    checked byte for byte against the statements, and runs the statements on
-    every other platform."""
+def test_beams_kernels_serve_nvidia_sm90_and_newer():
     original = current_platform()
     try:
         for vendor, arch, served in (
@@ -239,8 +236,8 @@ def test_beams_kernels_serve_nvidia_sm90_to_sm103():
             ("nvidia", ArchVersion(10, 0), True),
             ("nvidia", ArchVersion(10, 3), True),
             ("nvidia", ArchVersion(8, 0), False),
-            ("nvidia", ArchVersion(10, 7), False),
-            ("nvidia", ArchVersion(12, 0), False),
+            ("nvidia", ArchVersion(10, 7), True),
+            ("nvidia", ArchVersion(12, 0), True),
             ("amd", ArchVersion(9, 5), False),
         ):
             Platform.override(
@@ -380,6 +377,25 @@ def test_norm_and_qk_boundaries(loaded):
         )
 
 
+def test_the_bf16_qkv_and_gate_projections_run_as_one_gemm(loaded):
+    """Unquantized Q/K/V and output gate weights become views of one buffer:
+    one GEMM gives both projections' outputs, and a write to either
+    projection's weight reaches it, as weight updates do."""
+    model, _ = loaded
+    attention = model.model.layers[0].self_attn
+    attention.process_weights_after_loading(attention)
+    fused = attention.qkv_gate_bf16
+    rows = attention.qkv_proj.weight.shape[0]
+    assert attention.qkv_proj.weight.data_ptr() == fused.data_ptr()
+    assert attention.gate_proj.weight.data_ptr() == fused[rows:].data_ptr()
+    x = torch.linspace(-1, 1, 5 * 128, device="cuda").reshape(5, 128).bfloat16()
+    qkv, gate = attention.project_qkv_gate(x)
+    torch.testing.assert_close(qkv, attention.qkv_proj(x)[0])
+    torch.testing.assert_close(gate, attention.gate_proj(x)[0])
+    attention.gate_proj.weight.data.zero_()
+    assert not attention.project_qkv_gate(x)[1].any()
+
+
 def test_shared_dense_router_and_moe(loaded):
     model, weights = loaded
     hidden = torch.linspace(-1, 1, 2 * 128, device="cuda").reshape(2, 128).bfloat16()
@@ -436,8 +452,31 @@ def test_logits_projection_and_softcap_dtypes(loaded, softcap):
     if softcap is not None:
         expected = (expected.float() / softcap).tanh() * softcap
     assert actual.dtype == expected.dtype
-    # On SM90 to SM103 the one-pass softcap kernel: the statement's bytes.
+    # On SM90 and newer the one-pass softcap kernel: the statement's bytes.
     assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("softcap", [None, 30.0])
+def test_a_vocab_shard_is_capped_as_its_slice_of_the_whole_rows(loaded, softcap):
+    # A sampler reading each rank's vocabulary shard sees the capped rows' slice.
+    model, weights = loaded
+    config = copy(model.config)
+    config.final_logit_softcapping = softcap
+    processor = BeamLogitsProcessor(config, model.mapping)
+    hidden = torch.linspace(-1, 1, 2 * 128, device="cuda").reshape(2, 128).bfloat16()
+    whole = processor._get_logits(
+        hidden,
+        model.lm_head,
+        None,
+        embedding_bias=None,
+        plan=None,
+        require_full_vocab=False,
+    )
+    raw = F.linear(hidden, weights["lm_head.weight"])
+    columns = slice(whole.shape[1] // 4, whole.shape[1] // 2)
+    shard = processor._capped(raw[:, columns].contiguous())
+    assert processor.sampled_shard_dtype(model.lm_head) == whole.dtype
+    assert torch.equal(shard, whole[:, columns])
 
 
 @pytest.mark.parametrize("softcap", [None, 30.0])

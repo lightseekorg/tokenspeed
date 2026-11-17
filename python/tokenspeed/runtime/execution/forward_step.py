@@ -170,6 +170,75 @@ global_graph_memory_pool = None
 DecodeGraphKey = tuple[str, int]
 
 
+def prepare_draft_extend_metadata(
+    draft_attn_backend: AttentionBackend,
+    drafter: BaseDrafter,
+    *,
+    padded_bs: int,
+    num_extends: int,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    forward_mode: ForwardMode,
+    **kwargs,
+) -> None:
+    """The draft backend's metadata for an extend or mixed forward.
+
+    One draft metadata contract for every backend family, the same two steps
+    as the pure-decode path: the prefill init reads the accepted-prefix
+    seq_lens view, then the unified refresh prepares the draft's step-1+
+    decode metadata. Drafters republish their in-loop seq_lens edits through
+    advance_draft_forward_metadata / update_draft_forward_metadata. Called by
+    the forward step for every extend and by the drafter prefill graph's
+    capture for its dummy extends, so both prepare the same state.
+
+    Args:
+        draft_attn_backend: The draft model's attention backend.
+        drafter: The drafter; its ``draft_seq_lens_buf`` is seeded for the
+            round (the DFLASH drafter reads it directly; Eagle advances it per
+            step), and it takes the round's ``block_tables``.
+        padded_bs: Requests in the forward.
+        num_extends: Leading extend requests.
+        req_pool_indices: ``[padded_bs]`` request-pool slots.
+        seq_lens: ``[>= padded_bs]`` cache lengths after this forward.
+        forward_mode: EXTEND or MIXED.
+        **kwargs: The target's extend metadata arguments, passed on unchanged
+            (the extend lengths, ``block_tables`` and the rest).
+    """
+    draft_seq_lens = drafter.draft_seq_lens_buf[:padded_bs]
+    draft_seq_lens.copy_(seq_lens[:padded_bs])
+    if not draft_attn_backend.query_sharded:
+        # A sharded target may have an unsharded draft (``draft_unsharded`` in
+        # ``model_wide_kwargs``): passing the target's plan on would claim a
+        # sharding the draft never sees, and a backend that cannot attend one
+        # refuses it (``reject_query_shard``).
+        kwargs = {**kwargs, "query_shard": None}
+    draft_attn_backend.init_forward_metadata(
+        bs=padded_bs,
+        num_extends=num_extends,
+        req_pool_indices=req_pool_indices,
+        seq_lens=seq_lens,
+        forward_mode=forward_mode,
+        **kwargs,
+    )
+    # Step two: the draft's step-1+ decode metadata for this round, via the
+    # same refresh the pure-decode path uses. Plain 1-token rows --
+    # deliberately NOT the packed verify width: V4's packed-decode arm would
+    # clobber forward_prefill_metadata with a DECODE-mode object and break the
+    # draft's first-step prefill. Refresh writes decode-slot metadata only, so
+    # rounds that run no decode steps (vanilla MTP extend depths, DFLASH block
+    # decode) simply leave it unread or overwrite it per step.
+    draft_attn_backend.refresh_decode_metadata(
+        padded_bs,
+        padded_bs,
+        req_pool_indices,
+        draft_seq_lens,
+        forward_mode=ForwardMode.DECODE,
+        num_extends=num_extends,
+        block_tables=kwargs.get("block_tables"),
+    )
+    drafter.round_block_tables = kwargs.get("block_tables")
+
+
 class DeepEPCudaGraphRunnerAdapter:
     """Manages DeepEP dispatch mode consistency across CUDA graph capture/replay.
 
@@ -244,6 +313,31 @@ def live_graph_outputs(outputs: tuple, bs: int, max_tokens_per_req: int) -> tupl
         None if cumulative_probs is None else cumulative_probs[:rows],
         None,
     )
+
+
+def mega_moe_stages_whole_batches(
+    *, attention_tp_size: int, moe_tp_ep_size: int
+) -> bool:
+    """Whether each rank's MegaMoE input is its attention-DP group's whole batch.
+
+    MegaMoE dispatches and combines across ranks itself, so a model hands it
+    the rows the attention output leaves on the rank. With attention TP 1
+    those are the rank's own batch. With attention TP equal to the MoE TP x EP
+    size the attention output is all-reduced, so every rank holds its group's
+    whole batch. Any other attention TP reduce-scatters the batch into
+    contiguous shards (Qwen3.5's DP4/TP2/EP8), and a shard's live rows are not
+    the live requests' share of its rows. A padded decode replay therefore
+    writes MegaMoE's live-request counts (``mega_moe_live_requests``) only
+    under the first two layouts.
+
+    Args:
+        attention_tp_size: The attention TP group size.
+        moe_tp_ep_size: The MoE TP x EP group size.
+
+    Returns:
+        True when every rank stages its group's whole padded batch.
+    """
+    return attention_tp_size in (1, moe_tp_ep_size)
 
 
 class ForwardStepRunner:
@@ -369,25 +463,30 @@ class ForwardStepRunner:
         )
         # Backends alias their cache_seqlens buffer. Draft backend aliases
         # the drafter-owned draft_seq_lens to keep InputBuffers read-only.
-        attn_backend.init_cuda_graph_state(
-            self.max_decode_bs,
-            cache_group_specs=tuple(token_to_kv_pool.arena.cache_group_specs),
-            cache_group_page_counts=(token_to_kv_pool.arena.cache_group_page_counts),
-            max_tokens_per_req=self.max_tokens_per_req,
-            overlap_schedule_depth=self.overlap_schedule_depth,
-            max_extend_tokens=config.prefill_graph_max_tokens,
-        )
-        if draft_attn_backend is not None:
-            draft_attn_backend.init_cuda_graph_state(
+        with self.memory_saver_adapter.named_region("attention_state"):
+            attn_backend.init_cuda_graph_state(
                 self.max_decode_bs,
-                cache_group_specs=tuple(draft_token_to_kv_pool.arena.cache_group_specs),
+                cache_group_specs=tuple(token_to_kv_pool.arena.cache_group_specs),
                 cache_group_page_counts=(
-                    draft_token_to_kv_pool.arena.cache_group_page_counts
+                    token_to_kv_pool.arena.cache_group_page_counts
                 ),
                 max_tokens_per_req=self.max_tokens_per_req,
                 overlap_schedule_depth=self.overlap_schedule_depth,
                 max_extend_tokens=config.prefill_graph_max_tokens,
             )
+            if draft_attn_backend is not None:
+                draft_attn_backend.init_cuda_graph_state(
+                    self.max_decode_bs,
+                    cache_group_specs=tuple(
+                        draft_token_to_kv_pool.arena.cache_group_specs
+                    ),
+                    cache_group_page_counts=(
+                        draft_token_to_kv_pool.arena.cache_group_page_counts
+                    ),
+                    max_tokens_per_req=self.max_tokens_per_req,
+                    overlap_schedule_depth=self.overlap_schedule_depth,
+                    max_extend_tokens=config.prefill_graph_max_tokens,
+                )
 
         # One placeholder table set serves capture, the idle replay and any
         # pre-contract warmup: per published group, a zero (null-page) table
@@ -418,6 +517,8 @@ class ForwardStepRunner:
         self.output_buffers: dict[DecodeGraphKey, tuple] = {}
         # The padded batch the last call replayed a decode graph at (None: eager).
         self.last_graph_bs: int | None = None
+        self._reported_query_graphs: set[tuple[str, int, int | None]] = set()
+        self._decode_query_tokens: int | None = None
         # TOKENSPEED_GRAPH_DEBUG=1: capture-time tensor-identity snapshots,
         # re-verified before every replay (graph_ptr_guard). Off by default —
         # replays then pay a single bool check.
@@ -433,6 +534,28 @@ class ForwardStepRunner:
         self._expert_load_rows: ExpertLoadRowMask | None = (
             placement.load_rows if placement is not None else None
         )
+        # MegaMoE stages a padded replay's filler rows with no experts: the
+        # replay writes its (live, padded) request counts here and (1, 1)
+        # after, so eager and prefill-graph forwards route every row. It stays
+        # None, and MegaMoE routes every row, unless every rank stages its
+        # attention-DP group's whole batch.
+        self._mega_moe_live_requests: torch.Tensor | None = None
+        whole_batches = mega_moe_stages_whole_batches(
+            attention_tp_size=config.attention_tp_size,
+            moe_tp_ep_size=config.moe_tp_ep_size,
+        )
+        if torch.device(self.device).type == "cuda" and whole_batches:
+            # Imported here: layers.moe imports this module (latent.py). The
+            # pair is state of the DeepGEMM MegaMoE solution, not a kernel op.
+            # Hooks on a registered kernel (plan["warmup"]) are reached through
+            # a MoE layer's plan, and the runner holds no MoE layer; the pair
+            # is one buffer for every MegaMoE layer, target and drafter alike.
+            from tokenspeed_kernel.ops.moe.deep_gemm import mega_moe_live_requests
+
+            from tokenspeed.runtime.layers.moe.utils import get_moe_backend
+
+            if get_moe_backend().is_mega_moe():
+                self._mega_moe_live_requests = mega_moe_live_requests(self.device)
         # The capture side stream. Created here, not in capture(): the
         # prefill graph shares it (PrefillGraph._capture_bucket reads
         # decode_wrapper.stream), and a backend may declare
@@ -522,9 +645,11 @@ class ForwardStepRunner:
         ladder = sorted(self.capture_bs, reverse=True)
         if self.segmented_decode is not None:
             return self.segmented_decode.capture_plan
-        return {
-            variant: list(ladder) for variant in self._cuda_graph_capture_variants()
-        }
+        plan: dict[str, list[int]] = {}
+        for bs in ladder:
+            for variant in self._cuda_graph_capture_variants(bs):
+                plan.setdefault(variant, []).append(bs)
+        return plan
 
     def capture_ladders(self, entries: int | None) -> dict[str, CapturedLadder]:
         """Each variant's batch sizes off the plan, and the positions ``entries`` samples.
@@ -555,19 +680,45 @@ class ForwardStepRunner:
             self.segmented_decode.release()
         self.output_buffers.clear()
         self._metadata_snapshots.clear()
+        self._reported_query_graphs.clear()
         # The tables name no arena; only the graphs and their pool go.
         global_graph_memory_pool = None
 
-    def _cuda_graph_capture_variants(self) -> tuple[str, ...]:
-        if self.sampling_backend is None:
-            return (CUDA_GRAPH_VARIANT_DEFAULT,)
-        variants = self.sampling_backend.cuda_graph_capture_variants(
-            self.max_tokens_per_req
+    def _cuda_graph_capture_variants(self, bs: int) -> tuple[str, ...]:
+        variants = (CUDA_GRAPH_VARIANT_DEFAULT,)
+        if self.sampling_backend is not None:
+            variants = tuple(
+                dict.fromkeys(
+                    (
+                        CUDA_GRAPH_VARIANT_DEFAULT,
+                        *self.sampling_backend.cuda_graph_capture_variants(
+                            self.max_tokens_per_req
+                        ),
+                    )
+                )
+            )
+        drafter = self.drafter
+        capacities = (
+            (bs * self.max_tokens_per_req,)
+            if drafter is None
+            else drafter.decode_graph_query_capacities(bs)
         )
-        if not variants:
-            return (CUDA_GRAPH_VARIANT_DEFAULT,)
-        deduped = tuple(dict.fromkeys((CUDA_GRAPH_VARIANT_DEFAULT, *variants)))
-        return deduped
+        return tuple(
+            self._query_variant(v, capacity, bs)
+            for capacity in reversed(capacities)
+            for v in variants
+        )
+
+    def _query_variant(self, variant: str, query_tokens: int, bs: int) -> str:
+        return (
+            variant
+            if query_tokens == bs * self.max_tokens_per_req
+            else f"{variant}:query{query_tokens}"
+        )
+
+    def _split_query_variant(self, variant: str, bs: int) -> tuple[str, int]:
+        base, sep, tokens = variant.rpartition(":query")
+        return (base, int(tokens)) if sep else (variant, bs * self.max_tokens_per_req)
 
     def _prepare_sampling_capture(self, bs: int, variant: str) -> None:
         if self.sampling_backend is None:
@@ -575,7 +726,7 @@ class ForwardStepRunner:
         self.sampling_backend.prepare_capture_variant(
             bs=bs,
             num_tokens_per_req=self.max_tokens_per_req,
-            variant=variant,
+            variant=self._split_query_variant(variant, bs)[0],
         )
 
     def _capture_key(self, variant: str, bs: int) -> DecodeGraphKey:
@@ -608,7 +759,11 @@ class ForwardStepRunner:
         return self.sampling_backend.cuda_graph_replay_variant(self.max_tokens_per_req)
 
     def _cuda_graph_key(self, bs: int) -> DecodeGraphKey:
-        variant = self._cuda_graph_replay_variant()
+        variant = self._query_variant(
+            self._cuda_graph_replay_variant(),
+            self._decode_query_tokens or bs * self.max_tokens_per_req,
+            bs,
+        )
         key = (variant, bs)
         if key in self.graphs:
             return key
@@ -734,6 +889,11 @@ class ForwardStepRunner:
                 if self.runtime_states is not None
                 else None
             ),
+            draft_q=(
+                self.runtime_states.future_draft_q
+                if self.runtime_states is not None
+                else None
+            ),
             vocab_size=self.vocab_size,
             device=self.device,
         )
@@ -754,6 +914,21 @@ class ForwardStepRunner:
             capturable=self.capturable_grammar,
             grammar_backend=self.grammar_backend,
         )
+
+        _, query_tokens = self._split_query_variant(variant, bs)
+        adaptive_layout = (
+            self.drafter is not None and query_tokens < bs * self.max_tokens_per_req
+        )
+        if adaptive_layout:
+            # Select the layout outside the graph. Runtime replay updates the
+            # same storage, while every graph records a fixed physical extent.
+            self.drafter.prepare_decode_graph_token_capture_layout(
+                bs=bs, query_tokens=query_tokens
+            )
+        if self.drafter is not None:
+            # Full capacity explicitly captures the native layout. None means
+            # eager policy selection and must not be used during graph capture.
+            self.drafter.set_decode_graph_query_extent(query_tokens)
 
         def run_once():
             # Dummy add_batch keeps grammar batches 1:1 with replays: the
@@ -856,6 +1031,8 @@ class ForwardStepRunner:
                 snapshots["draft"] = snapshot_graph_metadata(self.draft_attn_backend)
             self._metadata_snapshots[self._capture_key(variant, bs)] = snapshots
 
+        if self.drafter is not None:
+            self.drafter.set_decode_graph_query_extent(None)
         return graph, out
 
     def warmup_decode_path(
@@ -915,6 +1092,11 @@ class ForwardStepRunner:
                     ),
                     draft_probs=(
                         self.runtime_states.draft_probs
+                        if self.runtime_states is not None
+                        else None
+                    ),
+                    draft_q=(
+                        self.runtime_states.future_draft_q
                         if self.runtime_states is not None
                         else None
                     ),
@@ -1083,43 +1265,16 @@ class ForwardStepRunner:
             **kwargs,
         )
         if self.draft_attn_backend is not None:
-            # One draft metadata contract for every backend family, the same
-            # two steps as the pure-decode path: the prefill init reads the
-            # accepted-prefix seq_lens view, then the unified refresh prepares
-            # the draft's step-1+ decode metadata. Drafters republish their
-            # in-loop seq_lens edits through advance_draft_forward_metadata /
-            # update_draft_forward_metadata. The copy below seeds the
-            # drafter-owned buffer for the round (the DFLASH drafter reads it
-            # directly; Eagle advances it per step).
-            draft_seq_lens = self.drafter.draft_seq_lens_buf[:padded_bs]
-            draft_seq_lens.copy_(seq_lens[:padded_bs])
-            draft_extend_kwargs = dict(kwargs)
-            self.draft_attn_backend.init_forward_metadata(
-                bs=padded_bs,
+            prepare_draft_extend_metadata(
+                self.draft_attn_backend,
+                self.drafter,
+                padded_bs=padded_bs,
                 num_extends=num_extends,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 forward_mode=forward_mode,
-                **draft_extend_kwargs,
+                **kwargs,
             )
-            # Step two: the draft's step-1+ decode metadata for this round,
-            # via the same refresh the pure-decode path uses. Plain 1-token
-            # rows — deliberately NOT the packed verify width: V4's
-            # packed-decode arm would clobber forward_prefill_metadata with a
-            # DECODE-mode object and break the draft's first-step prefill.
-            # Refresh writes decode-slot metadata only, so rounds that run no
-            # decode steps (vanilla MTP extend depths, DFLASH block decode)
-            # simply leave it unread or overwrite it per step.
-            self.draft_attn_backend.refresh_decode_metadata(
-                padded_bs,
-                padded_bs,
-                req_pool_indices,
-                draft_seq_lens,
-                forward_mode=ForwardMode.DECODE,
-                num_extends=num_extends,
-                block_tables=kwargs.get("block_tables"),
-            )
-            self.drafter.round_block_tables = kwargs.get("block_tables")
 
     def _global_graph_bs(self, ctx: ForwardContext) -> int | None:
         if self.dp_size <= 1 or ctx.global_num_tokens is None:
@@ -1181,16 +1336,6 @@ class ForwardStepRunner:
             [active_req_pool_indices, active_req_pool_indices.new_zeros(pad)]
         )
 
-    def _set_graph_state_write_indices(
-        self, active_req_pool_indices: torch.Tensor, padded_bs: int
-    ) -> None:
-        state_indices = self.input_buffers.state_write_req_pool_indices_buf[:padded_bs]
-        active_bs = active_req_pool_indices.shape[0]
-        if active_bs > 0:
-            state_indices[:active_bs].copy_(active_req_pool_indices)
-        if active_bs < padded_bs:
-            state_indices[active_bs:padded_bs].fill_(int(self.config.max_req_pool_size))
-
     def __call__(
         self,
         bs: int,
@@ -1223,9 +1368,9 @@ class ForwardStepRunner:
         The ``extend_*`` lengths are the ``[:num_extends]`` slices of the
         input buffers on every call — empty for a pure decode or the idle
         replay, which never read them. ``block_tables_cpu`` mirrors
-        ``block_tables`` on the host (the same group keys; empty at bs 0) for
-        backends that plan an extend from the tables without waiting on the
-        device.
+        ``block_tables`` on the host (the same group keys) for backends that
+        plan an extend from the tables without waiting on the device; a pure
+        decode, which plans nothing from them, gets none.
 
         ``settle`` finishes what the inputs still wait on (a pending draft
         round): a decode calls it once the target's decode metadata, which
@@ -1292,7 +1437,6 @@ class ForwardStepRunner:
             req_pool_indices = self.input_buffers.req_pool_indices_buf[:padded_bs]
 
         if use_graph:
-            self._set_graph_state_write_indices(active_req_pool_indices, padded_bs)
             self._prepare_request_token_history_graph_inputs(
                 active_bs=bs, padded_bs=padded_bs
             )
@@ -1356,6 +1500,12 @@ class ForwardStepRunner:
                 block_tables_cpu=block_tables_cpu,
             )
 
+        self._decode_query_tokens = None
+        if use_graph and self.drafter is not None:
+            self._decode_query_tokens = self.drafter.prepare_decode_graph_token_layout(
+                ctx, actual_bs=bs, padded_bs=padded_bs
+            )
+
         if self.segmented_decode is not None and ctx.verify_queries is not None:
             self.segmented_decode.bind_round(
                 ctx,
@@ -1372,6 +1522,19 @@ class ForwardStepRunner:
 
             graph_key = self._cuda_graph_key(padded_bs)
             graph = self.graphs[graph_key]
+            report_key = (*graph_key, self._decode_query_tokens)
+            if (
+                self.drafter is not None
+                and report_key not in self._reported_query_graphs
+                and len(self.drafter.decode_graph_query_capacities(padded_bs)) > 1
+            ):
+                self._reported_query_graphs.add(report_key)
+                logger.info(
+                    f"Adaptive decode graph replay: request_capacity={padded_bs}, "
+                    f"target_query_capacity={(self._decode_query_tokens or padded_bs * self.max_tokens_per_req)}, "
+                    f"full_query_capacity={padded_bs * self.max_tokens_per_req}, "
+                    f"variant={graph_key[0]}"
+                )
             if self._graph_debug:
                 self._verify_graph_metadata(graph_key)
             if self.device == "npu":
@@ -1383,26 +1546,44 @@ class ForwardStepRunner:
                         ]
                     )
             if self._expert_load_rows is not None:
-                # Every rank replays the same padded batch; the live rows are
-                # the DP-gathered live counts (this rank's own without DP).
+                query_tokens = (
+                    self._decode_query_tokens or padded_bs * self.max_tokens_per_req
+                )
+                packed = query_tokens != padded_bs * self.max_tokens_per_req
+                # Packed verification uses one agreed capacity on all ranks.
                 self._expert_load_rows.mark_padded(
-                    padded_global_num_tokens=[padded_bs * self.max_tokens_per_req]
-                    * self.world_size,
+                    padded_global_num_tokens=[query_tokens] * self.world_size,
                     live_global_num_tokens=(
-                        ctx.global_num_tokens
-                        if ctx.global_num_tokens is not None
-                        else [ctx.input_num_tokens] * self.world_size
+                        [query_tokens] * self.world_size
+                        if packed
+                        else (
+                            ctx.global_num_tokens
+                            if ctx.global_num_tokens is not None
+                            else [ctx.input_num_tokens] * self.world_size
+                        )
                     ),
                 )
-            with (
-                torch.inference_mode() if self.device == "npu" else nullcontext()
-            ), nvtx_range("graph_replay", color="red"):
-                if self.drafter is not None:
-                    self.drafter.replay_decode_graph(graph, bs=bs, graph_bs=padded_bs)
-                else:
-                    graph.replay()
-            if self._expert_load_rows is not None:
-                self._expert_load_rows.clear()
+            live_requests = self._mega_moe_live_requests if padded_bs != bs else None
+            if live_requests is not None:
+                live_requests[0].fill_(bs)
+                live_requests[1].fill_(padded_bs)
+            try:
+                with (
+                    torch.inference_mode() if self.device == "npu" else nullcontext()
+                ), nvtx_range("graph_replay", color="red"):
+                    if self.drafter is not None:
+                        self.drafter.replay_decode_graph(
+                            graph, bs=bs, graph_bs=padded_bs
+                        )
+                    else:
+                        graph.replay()
+            finally:
+                # Even after a failed replay: later eager forwards must not
+                # skip live rows, in MegaMoE or in the expert load counters.
+                if live_requests is not None:
+                    live_requests.fill_(1)
+                if self._expert_load_rows is not None:
+                    self._expert_load_rows.clear()
 
             result = live_graph_outputs(
                 self.output_buffers[graph_key], bs, self.max_tokens_per_req

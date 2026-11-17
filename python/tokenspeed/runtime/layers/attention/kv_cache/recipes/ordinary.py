@@ -41,6 +41,7 @@ from tokenspeed.runtime.layers.attention.configs.base import (
 from tokenspeed.runtime.layers.attention.configs.dsa import (
     DSAConfig,
     dsa_history_gather_workspace_bytes,
+    dsa_kvp_history_prefill,
 )
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import MSA_PAGE_SIZE
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
@@ -159,14 +160,26 @@ class OrdinaryRecipe(CacheRecipe):
         one whole history of latent rows plus index-K rows packed in the
         plane's format, reserved before the arena is sized
         (``AttnConfig.__post_init__`` has already pinned the family to GPU DSA
-        for ``qcp_size > 1``). One workspace serves the target and the draft
-        (the draft gathers into the target's buffers), so the two must pack
-        index-K rows in the same format; a draft naming another is refused
-        here, where both configs are visible."""
+        for ``qcp_size > 1``). One workspace serves the target and a draft that
+        gathers into the target's buffers, so those two must pack index-K rows
+        in the same format; a draft naming another is refused here, where both
+        configs are visible. A draft that takes no query-context shard
+        (``qcp_size == 1``: its own ordinary attention, as under DFlash) runs
+        no gather and shares no workspace, so its format is not constrained.
+        A KVP prefill over gathered histories (``dsa_kvp_history_prefill``)
+        reserves the same workspace for the target alone."""
+        if dsa_kvp_history_prefill(self.attn_config):
+            return dsa_history_gather_workspace_bytes(
+                self.attn_config, max_model_len=self.attn_config.context_len
+            )
         if self.attn_config.qcp_size == 1:
             return 0
         target = self.attn_config.component(DSAConfig)
-        if self.draft_attn_config is not None and target is not None:
+        if (
+            self.draft_attn_config is not None
+            and self.draft_attn_config.qcp_size > 1
+            and target is not None
+        ):
             draft = self.draft_attn_config.component(DSAConfig)
             draft_format = None if draft is None else draft.index_k_format
             if draft_format != target.index_k_format:
@@ -313,12 +326,12 @@ def _config_layer_fields(
     rows = prefix_granularity
     if isinstance(spec, DSAConfig):
         return _mla_layer_fields(config, rows, layer_id, occurrence) + (
-            _index_k_field(config, rows, layer_id),
+            index_k_field(config, rows, layer_id),
         )
     if isinstance(spec, MSAConfig):
         fields = _mha_layer_fields(config, rows, layer_id, occurrence)
         if local_layer_id in spec.sparse_layer_ids:
-            fields += (_index_k_field(config, rows, layer_id),)
+            fields += (index_k_field(config, rows, layer_id),)
         return fields
     if isinstance(spec, MLAConfig):
         return _mla_layer_fields(config, rows, layer_id, occurrence)
@@ -406,23 +419,29 @@ def _mla_layer_fields(config, rows: int, layer_id: int, occurrence: int):
     )
 
 
-def _index_k_field(config, rows: int, layer_id: int) -> CacheFieldSpec:
-    """The sparse indexer's key row for one layer (DSA bytes, MSA elements)."""
+def index_k_field(config, rows: int, layer_id: int) -> CacheFieldSpec:
+    """The sparse indexer's key rows for one layer (DSA bytes, MSA elements).
+
+    Args:
+        config: The attention config owning the layer.
+        rows: Token rows per cache page: the recipe's prefix granularity.
+        layer_id: The layer's id in the merged plan.
+    """
     from tokenspeed.runtime.layers.attention.configs.dsa import (
         DSAConfig,
-        dsa_index_k_row_bytes,
         index_k_plane_dtype,
+        index_k_row_bytes,
     )
 
     spec = config.component(SoftmaxAttnConfig)
     if isinstance(spec, DSAConfig):
-        # One plane layout per index_k_format: FP8 keys plus scales as uint8
-        # bytes, or the bf16 keys unquantized (configs/dsa.py).
-        if spec.index_k_format == "fp8_scaled":
+        # One plane layout per index_k_format: FP8 or MXFP4 keys plus scales
+        # as uint8 bytes, or the bf16 keys unquantized (configs/dsa.py).
+        if spec.index_k_format in ("fp8_scaled", "mxfp4"):
             return CacheFieldSpec(
                 f"layer.{layer_id}.index_k",
                 f"layer.{layer_id}.index_k",
-                (rows, dsa_index_k_row_bytes(spec.index_head_dim)),
+                (rows, index_k_row_bytes(spec.index_head_dim, spec.index_k_format)),
                 "uint8",
             )
         return CacheFieldSpec(

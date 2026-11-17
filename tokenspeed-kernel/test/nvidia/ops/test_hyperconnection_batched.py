@@ -340,7 +340,7 @@ def test_projection_and_batch_loops(rows, tile, monkeypatch):
             # has fewer resident clusters than logical jobs.
             workspaces = list(cute_fused._WORKSPACES.values())
             assert any(
-                epochs.numel() == 2 * ((rows + 31) // 32) for _, epochs in workspaces
+                epochs.numel() == 2 * ((rows + 31) // 32) for _, _, epochs in workspaces
             )
 
 
@@ -428,7 +428,7 @@ def test_serialized_stream_graphs_share_plans_and_workspaces(monkeypatch):
                 output = mix(stream_values, 0.25, True)
             stream.synchronize()
             states.append((stream, stream_values, graph, output))
-    for storage, epochs in cute_fused._WORKSPACES.values():
+    for storage, _, epochs in cute_fused._WORKSPACES.values():
         storage.fill_(0x7FC1)
         epochs.fill_(2**32 - 1)
     torch.cuda.synchronize()
@@ -446,44 +446,43 @@ def test_serialized_stream_graphs_share_plans_and_workspaces(monkeypatch):
             )
 
 
-def test_stream_capacity_selects_worker_key_without_stream_key(monkeypatch):
+def test_stream_capacity_preserves_mutable_graph_replay(monkeypatch):
+    from utils import assert_no_cute_compile
+
     _reset_caches(monkeypatch)
     pdl_enabled(True)
     streams = [torch.cuda.Stream(), torch.cuda.Stream()]
-    stream_ids = {int(stream.cuda_stream) for stream in streams}
-    resident_workers = dict(zip(stream_ids, (1, 2)))
-
-    def fake_compile(kernel, *operands):
-        return mock.Mock()
-
-    def fake_capacity(compiled, kernel, device, stream):
-        stream_id = int(torch.cuda.current_stream(device).cuda_stream)
-        return kernel.clusters * resident_workers[stream_id]
-
-    values = inputs(97, torch.bfloat16, True)
-    with (
-        mock.patch.object(
-            cute_fused.cute_ext, "compile", side_effect=fake_compile
-        ) as compile_kernel,
-        mock.patch.object(cute_fused, "_capacity", side_effect=fake_capacity),
-    ):
-        for stream in streams:
-            stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(stream):
-                mix(values, 0.25, True)
-            stream.synchronize()
-
-    assert compile_kernel.call_count == 4
-    static_keys = {plan_key[:-2] for plan_key in cute_fused._PLANS}
-    assert len(static_keys) == 1
-    assert {(plan_key[-2], plan_key[-1]) for plan_key in cute_fused._PLANS} == {
-        (1, 1),
-        (1, 4),
-        (2, 1),
-        (2, 2),
+    resident_workers = {
+        int(stream.cuda_stream): i + 1 for i, stream in enumerate(streams)
     }
-    assert {capacity_key[0] for capacity_key in cute_fused._CAPACITIES} == stream_ids
-    assert {workspace_key[2] for workspace_key in cute_fused._WORKSPACES} == {1, 2}
+    real_capacity = cute_fused._capacity
+
+    def limited_capacity(compiled, kernel, device, stream):
+        # Model two smaller contexts while executing real kernels on the GPU.
+        return min(
+            real_capacity(compiled, kernel, device, stream),
+            kernel.physical_clusters * resident_workers[int(stream)],
+        )
+
+    monkeypatch.setattr(cute_fused, "_capacity", limited_capacity)
+    values = [inputs(97, torch.bfloat16, True) for _ in streams]
+    graphs = []
+    outputs = []
+    for stream, tensors in zip(streams, values, strict=True):
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            mix(tensors, 0.25, True)
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            outputs.append(mix(tensors, 0.25, True))
+        graphs.append(graph)
+    with assert_no_cute_compile():
+        for graph, tensors, actual in zip(graphs, values, outputs, strict=True):
+            tensors[0].mul_(-0.75)
+            graph.replay()
+            torch.cuda.synchronize()
+            check(actual, reference(tensors, 0.25), torch.bfloat16)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -566,11 +565,41 @@ def test_compiled_capacity_guards_cooperative_grid(monkeypatch):
         assert kernel.clusters * kernel.workers <= clusters
 
 
-def test_kernel_configuration_is_complete_at_construction():
-    def make(token_tile):
-        return cute_fused.FusedGatedResidualKernel(
+def test_oversized_pipeline_rejects_shared_memory_budget():
+    with pytest.raises(ValueError, match="shared|memory"):
+        cute_fused.FusedGatedResidualKernel(
+            hc_count=4,
+            hidden_size=2560,
+            lowrank=320,
+            up_k=128,
+            down_k_order="interleaved",
+            down_token_parts=1,
+            epilogue_threads=128,
+            token_major_up=False,
+            up_token_tail_overlap=False,
+            up_output_parts=1,
+            up_token_parts=1,
+            up_stage_counts=None,
+            rotate_up_k=False,
+            partial_stride=352,
+            reduction_groups=1,
+            token_tile_batches=1,
+            up_clusters=0,
+            pin_up_activation=False,
+            reuse_down_storage=False,
+            evict_up_weights_first=True,
+            evict_down_weights_first=False,
+            pipelines_per_cta=1,
+            up_columns=256,
+            pipeline_shared_budget=1024,
+            down_pair_reduction="auto",
+            down_producer_mode="auto",
+            up_activation_ready_mode="auto",
+            up_l2_prefetch_k=0,
+            up_sigmoid_mode="exp_rcp",
+            down_x_cache_mode="native",
             projection_tile=64,
-            token_tile=token_tile,
+            token_tile=8,
             projection_rows=324,
             split_k=4,
             projection_tiles=1,
@@ -585,13 +614,6 @@ def test_kernel_configuration_is_complete_at_construction():
             single_tile=True,
             full_tiles=True,
         )
-
-    small = make(8)
-    wide = make(64)
-    assert (small.n, small.slot_rows, small.tmem_columns) == (8, 16, 32)
-    assert (wide.n, wide.slot_rows, wide.tmem_columns) == (64, 64, 64)
-    assert "configure" not in vars(type(small))
-    assert "smem_bytes" not in vars(small)
 
 
 def test_exact_override_rejects_unvalidated_row_count():

@@ -98,8 +98,9 @@ def test_public_sigmoid_bias_topk_dispatch_uses_gluon_kernel(
 def test_public_sigmoid_bias_topk_uses_per_token_float32_route(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    logits = torch.zeros((2, 896), device="cuda", dtype=torch.float32)
-    correction_bias = torch.zeros(896, device="cuda", dtype=torch.float32)
+    # 896 experts at these rows select the packed Kimi K3 kernel instead.
+    logits = torch.zeros((2, 384), device="cuda", dtype=torch.float32)
+    correction_bias = torch.zeros(384, device="cuda", dtype=torch.float32)
     sentinel_ids = torch.empty((2, 16), device="cuda", dtype=torch.int32)
     sentinel_weights = torch.empty((2, 16), device="cuda", dtype=torch.float32)
 

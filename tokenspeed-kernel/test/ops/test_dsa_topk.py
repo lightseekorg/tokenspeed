@@ -28,6 +28,8 @@ Covers the per-solution wrappers behind ``deep_gemm_dsa_decode_topk``:
     compression ratio, plus row-aligned (widened) logits equivalence.
   * ``combine_topk_weights`` (Triton): bit-exactness against the unfused
     ``weights.float() * q_scale * softmax_scale`` reference chain.
+  * ``quantize_index_query_weights`` (Triton): one compile per heads-per-program
+    bucket (its parity with the NVIDIA quantizer is under ``test/nvidia/ops``).
   * ``_prepare_logits_for_topk``: widening of DeepGEMM's narrowed logits
     slices plus the in-place NaN/inf -> -inf scrub.
 
@@ -49,7 +51,10 @@ from tokenspeed_kernel.ops.attention.dsa.cute_dsl import (
     has_cute_dsl_decode_topk,
 )
 from tokenspeed_kernel.ops.attention.dsa.deep_gemm import _prepare_logits_for_topk
-from tokenspeed_kernel.ops.attention.dsa.triton import combine_topk_weights
+from tokenspeed_kernel.ops.attention.dsa.triton import (
+    combine_topk_weights,
+    quantize_index_query_weights,
+)
 
 requires_kernel = pytest.mark.skipif(
     not (torch.cuda.is_available() and has_cute_dsl_decode_topk()),
@@ -279,23 +284,52 @@ def test_combine_topk_weights_empty():
 
 
 # ---------------------------------------------------------------------------
+# quantize_index_query_weights (one launch for the query quantizer and combine)
+# ---------------------------------------------------------------------------
+@requires_cuda
+def test_quantize_index_query_weights_compiles_once_per_bucket():
+    """Token count, row pitches and the score scale stay runtime arguments
+    within one heads-per-program bucket."""
+    from tokenspeed_kernel.ops.attention.dsa._triton.topk import (
+        _quantize_index_query_weights_kernel,
+    )
+    from utils import assert_no_triton_compile
+
+    def run(tokens, query_pitch, weights_pitch, softmax_scale):
+        rows = torch.randn(tokens, query_pitch, device="cuda", dtype=torch.bfloat16)
+        q = rows[:, : 32 * 128].view(tokens, 32, 128)
+        fused = torch.randn(tokens, weights_pitch, device="cuda", dtype=torch.bfloat16)
+        quantize_index_query_weights(q, fused[:, -32:], softmax_scale)
+
+    run(3, 32 * 128, 160, 0.5)
+    with assert_no_triton_compile(_quantize_index_query_weights_kernel):
+        # A split view of a stacked projection, then contiguous queries.
+        run(7, 5632, 160, 0.25)
+        run(127, 32 * 128, 192, 0.125)
+
+
+# ---------------------------------------------------------------------------
 # _prepare_logits_for_topk (DeepGEMM narrowed-logits widening + NaN/inf scrub)
 # ---------------------------------------------------------------------------
-def test_prepare_logits_for_topk_widens_and_scrubs():
-    base = torch.arange(4 * 256, dtype=torch.float32).view(4, 256)
-    expected = base.clone()
-    # Non-finite values inside the window and in the padding columns alike.
+@requires_cuda
+def test_prepare_logits_for_topk_widens_and_scrubs_each_rows_candidates():
+    base = torch.arange(4 * 256, dtype=torch.float32, device="cuda").view(4, 256)
     base[0, 10] = float("nan")
     base[1, 20] = float("inf")
+    base[2, 100] = float("nan")  # past row 2's 64 candidates
     base[2, 200] = float("-inf")  # padding column (>= 192)
-    expected[0, 10] = expected[1, 20] = expected[2, 200] = float("-inf")
+    expected = base.clone()
+    expected[0, 10] = expected[1, 20] = float("-inf")
     narrow = base[:, :192]
     assert not narrow.is_contiguous()
+    lengths = torch.tensor([192, 192, 64, 0], device="cuda", dtype=torch.int32)
 
-    full = _prepare_logits_for_topk(narrow)
+    full = _prepare_logits_for_topk(narrow, lengths, next_n=1)
 
     assert full.shape == (4, 256) and full.is_contiguous()
-    assert torch.equal(full, expected)
+    # Scrubbed within each row's candidates, untouched past them.
+    assert torch.equal(full.isnan(), expected.isnan())
+    assert torch.equal(full.nan_to_num(), expected.nan_to_num())
     # The scrub is in place: the narrow slice aliases the cleaned storage.
     assert narrow[0, 10] == float("-inf") and narrow[1, 20] == float("-inf")
     # In-place edits through the widened view alias the narrow slice.
@@ -303,24 +337,62 @@ def test_prepare_logits_for_topk_widens_and_scrubs():
     assert narrow[1, 0] == -1.0
 
 
-def test_prepare_logits_for_topk_passthrough_still_scrubs():
-    # Already-compact logits: same object back, values scrubbed in place.
-    compact = torch.zeros(4, 256)
-    compact[3, 5] = float("nan")
-    assert _prepare_logits_for_topk(compact) is compact
-    assert compact[3, 5] == float("-inf")
+@requires_cuda
+def test_prepare_logits_for_topk_scrub_follows_lengths_not_width():
+    from tokenspeed_kernel.ops.attention.dsa._triton.topk import (
+        _scrub_nonfinite_logits_kernel,
+    )
+    from utils import assert_no_triton_compile
+
+    def run(width, lengths):
+        logits = torch.full((len(lengths), width), float("nan"), device="cuda")
+        _prepare_logits_for_topk(
+            logits, torch.tensor(lengths, device="cuda", dtype=torch.int32), next_n=1
+        )
+        return logits
+
+    run(1024, [3])
+    with assert_no_triton_compile(_scrub_nonfinite_logits_kernel):
+        for width, lengths in ((4096, [4096, 17]), (70000, [1, 70000, 65536])):
+            logits = run(width, lengths)
+            for row, length in enumerate(lengths):
+                assert (logits[row, :length] == float("-inf")).all()
+                assert logits[row, length:].isnan().all()
+
+
+@requires_cuda
+def test_prepare_logits_for_topk_scrubs_each_verify_rows_causal_candidates():
+    # Two requests of three verify rows: row j of a request of length L sees
+    # L - 2 + j candidates; a request shorter than its rows clamps at zero.
+    seq_lens = torch.tensor([10, 1], device="cuda", dtype=torch.int32)
+    logits = torch.full((6, 16), float("nan"), device="cuda")
+
+    _prepare_logits_for_topk(logits, seq_lens, next_n=3)
+
+    for row, length in enumerate((8, 9, 10, 0, 0, 1)):
+        assert (logits[row, :length] == float("-inf")).all()
+        assert logits[row, length:].isnan().all()
+
+
+@requires_cuda
+def test_prepare_logits_for_topk_scrubs_only_inside_a_column_slice():
     # Column slices don't own their full rows: no widening, scrub only the
     # slice (the storage outside the view must stay untouched).
-    owner = torch.full((4, 256), float("nan"))
+    owner = torch.full((4, 256), float("nan"), device="cuda")
     col_slice = owner[:, 64:192]
-    assert _prepare_logits_for_topk(col_slice) is col_slice
+    lengths = torch.full((4,), 128, device="cuda", dtype=torch.int32)
+    assert _prepare_logits_for_topk(col_slice, lengths, next_n=1) is col_slice
     assert (col_slice == float("-inf")).all()
     assert owner[:, :64].isnan().all() and owner[:, 192:].isnan().all()
+
+
+def test_prepare_logits_for_topk_other_layouts_scrub_whole():
+    lengths = torch.zeros(4, dtype=torch.int32)
     # Non-unit column stride: no widening, scrubbed in place.
     strided = torch.full((4, 256), float("inf"))[:, ::2]
-    assert _prepare_logits_for_topk(strided) is strided
+    assert _prepare_logits_for_topk(strided, lengths, next_n=1) is strided
     assert (strided == float("-inf")).all()
     # 3-D tensors: no widening, scrubbed in place.
     cube = torch.full((2, 3, 4), float("nan"))
-    assert _prepare_logits_for_topk(cube) is cube
+    assert _prepare_logits_for_topk(cube, lengths[:2], next_n=1) is cube
     assert (cube == float("-inf")).all()

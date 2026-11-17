@@ -35,6 +35,6 @@ namespace tokenspeed {
 using Event = std::variant<cache::StorageTick, cache::StorageDetach, cache::StorageDone, cache::WriteBackDone,
                            cache::LoadBackDone, cache::SnapshotDone, cache::RestoreDone, forward::ExtendResult,
                            forward::Finish, forward::Abort, forward::UpdateReserveNumTokens, pd::BootstrappedEvent,
-                           pd::FailedEvent, pd::SucceededEvent, pd::RemotePrefillDoneEvent>;
+                           pd::FailedEvent, pd::TransferStoppedEvent, pd::SucceededEvent, pd::RemotePrefillDoneEvent>;
 
 }  // namespace tokenspeed

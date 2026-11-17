@@ -110,6 +110,13 @@ async fn streams_tokens_until_finished() {
     let last = chunks.last().unwrap();
     assert_eq!(last.finish_reason.as_deref(), Some("length"));
     assert_eq!((last.prompt_tokens, last.completion_tokens), (3, 3));
+    assert_eq!(
+        chunks
+            .iter()
+            .map(|chunk| chunk.reasoning_tokens)
+            .collect::<Vec<_>>(),
+        [10, 20, 30]
+    );
     assert!(chunks[..2].iter().all(|c| c.finish_reason.is_none()));
     assert!(chunks
         .iter()

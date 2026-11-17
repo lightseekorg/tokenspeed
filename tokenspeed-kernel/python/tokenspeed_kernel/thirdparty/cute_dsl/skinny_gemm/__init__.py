@@ -8,12 +8,12 @@
 
 from __future__ import annotations
 
-import importlib.util
 import threading
 from dataclasses import dataclass
 from typing import Any
 
 import torch
+from tokenspeed_kernel._optional import has_optional_package
 from tokenspeed_kernel.platform import pdl_enabled
 
 MAX_M = 16
@@ -42,7 +42,7 @@ class SkinnyGemmConfig:
 
 
 def _cutedsl_available() -> bool:
-    if importlib.util.find_spec("quack") is None:
+    if not has_optional_package("quack"):
         return False
     try:
         import cutlass  # noqa: F401

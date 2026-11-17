@@ -60,6 +60,12 @@ pub struct BatchLogConfig {
 pub struct RoundStats {
     /// Requests in the waiting queue.
     pub queued: usize,
+    /// Requests holding a request-pool slot, including draining requests.
+    pub allocated_request_slots: usize,
+    /// Execution permits held by requests or in-flight operations.
+    pub active_decode_slots: usize,
+    /// Requests whose KV is ready but that have no execution permit.
+    pub ready_waiting: usize,
     /// KV pages held by running requests.
     pub active_pages: i64,
     /// KV pages holding only cache entries.
@@ -103,8 +109,12 @@ impl BatchLogger {
         let [bootstrap, prefill, remote_prefill, decode, pinned] = stats.pd;
         format!(
             ", #queue-req: {}, #req-state(bootstrap/prefill/remote-prefill/decode/pd-pinned): \
-             {bootstrap}/{prefill}/{remote_prefill}/{decode}/{pinned}",
-            stats.queued + bootstrap
+             {bootstrap}/{prefill}/{remote_prefill}/{decode}/{pinned}, \
+             #slots(resident/active-decode/ready-waiting): {}/{}/{}",
+            stats.queued + bootstrap,
+            stats.allocated_request_slots,
+            stats.active_decode_slots,
+            stats.ready_waiting
         )
     }
 
@@ -285,6 +295,9 @@ mod tests {
         });
         let stats = RoundStats {
             queued: 0,
+            allocated_request_slots: 0,
+            active_decode_slots: 0,
+            ready_waiting: 0,
             active_pages: 1,
             cached_pages: 0,
             pd: [0; 5],
@@ -313,6 +326,9 @@ mod tests {
         });
         let stats = RoundStats {
             queued: 0,
+            allocated_request_slots: 0,
+            active_decode_slots: 0,
+            ready_waiting: 0,
             active_pages: 1,
             cached_pages: 0,
             pd: [0; 5],

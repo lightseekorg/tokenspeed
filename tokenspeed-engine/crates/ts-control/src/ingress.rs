@@ -28,12 +28,15 @@
 use std::collections::BTreeSet;
 
 use ts_pd::{BootstrapInfo, EmbeddingItem};
-use ts_scheduler::RequestSpec;
+use ts_scheduler::{profile, RequestSpec};
 use ts_wire::{SamplingParams, StrOrList, TokenizedGenerateReqInput};
 
 use crate::{
     grammar::ReasoningGrammar,
-    request::{LogprobRequest, RequestState, MAX_CACHE_SESSION_ID_BYTES, MAX_STOP_TOKEN_IDS},
+    request::{
+        LogprobRequest, ReasoningTokens, RequestState, MAX_CACHE_SESSION_ID_BYTES,
+        MAX_STOP_TOKEN_IDS,
+    },
     sampling,
 };
 
@@ -63,6 +66,9 @@ pub struct IngressLimits {
     /// How a JSON schema waits for the reasoning block; `None` without a
     /// grammar, a reasoning parser, or xgrammar's template for it.
     pub reasoning: Option<ReasoningGrammar>,
+    /// The reasoning parser's token markers, independent of whether grammar
+    /// constraints are enabled; `None` when the parser has no known template.
+    pub reasoning_usage: Option<ReasoningGrammar>,
     /// Which logprobs beyond the sampled tokens' the engine returns.
     pub logprobs: LogprobServability,
 }
@@ -94,7 +100,7 @@ impl LogprobServability {
     /// Why the engine cannot compute this prompt's logprobs, or `None`.
     fn prompt_logprobs_refusal(
         &self,
-        input_ids: &[i32],
+        target_ids: &[i32],
         has_multimodal_inputs: bool,
         vocab_size: i64,
     ) -> Option<String> {
@@ -113,13 +119,13 @@ impl LogprobServability {
                     .to_owned(),
             );
         }
-        let outside = input_ids
+        let outside = target_ids
             .iter()
             .any(|&id| id < 0 || i64::from(id) >= vocab_size);
         outside.then(|| {
             format!(
-                "prompt logprobs need every prompt token id inside the vocabulary \
-                 [0, {vocab_size}); input_ids contains one outside it."
+                "prompt logprobs need every scored target token id inside the vocabulary \
+                 [0, {vocab_size}); the scored input_ids suffix contains one outside it."
             )
         })
     }
@@ -208,6 +214,7 @@ pub enum Admitted {
 
 /// Admit `request`, or `None` if it carries no single request id to answer.
 pub fn admit(mut request: TokenizedGenerateReqInput, limits: &IngressLimits) -> Option<Admitted> {
+    let _span = profile::span("ingress::admit");
     let rid = match request.rid.take() {
         Some(StrOrList::One(rid)) => rid,
         _ => {
@@ -231,12 +238,14 @@ pub fn admit(mut request: TokenizedGenerateReqInput, limits: &IngressLimits) -> 
     });
     let mut params = request.sampling_params;
     sampling::resolve(&mut params, &rid);
-    if let Some(reasoning) = &limits.reasoning {
-        reasoning.defer_schema(
-            &mut params,
-            request.input_ids.as_deref().unwrap_or_default(),
-        );
-    }
+    let unanswerable = limits.reasoning.as_ref().and_then(|reasoning| {
+        reasoning
+            .defer_schema(
+                &mut params,
+                request.input_ids.as_deref().unwrap_or_default(),
+            )
+            .err()
+    });
     // Checked as the client sent them: the context clamp below is the
     // engine's, so `min_new_tokens` is bounded by the budget asked for, not
     // the one the context leaves (the request then finishes at its length).
@@ -244,6 +253,7 @@ pub fn admit(mut request: TokenizedGenerateReqInput, limits: &IngressLimits) -> 
         .validation_error
         .clone()
         .or_else(|| embeddings.as_ref().err().cloned())
+        .or(unanswerable)
         .or_else(|| {
             request
                 .cache_session_id
@@ -254,6 +264,22 @@ pub fn admit(mut request: TokenizedGenerateReqInput, limits: &IngressLimits) -> 
                         "cache_session_id exceeds the limit of {MAX_CACHE_SESSION_ID_BYTES} UTF-8 bytes"
                     )
                 })
+        })
+        .or_else(|| {
+            request
+                .cache_group_id
+                .as_ref()
+                .filter(|id| id.len() > MAX_CACHE_SESSION_ID_BYTES)
+                .map(|_| {
+                    format!(
+                        "cache_group_id exceeds the limit of {MAX_CACHE_SESSION_ID_BYTES} UTF-8 bytes"
+                    )
+                })
+        })
+        .or_else(|| {
+            (request.shared_prefix_tokens.len() > 64 || request.shared_prefix_tokens.iter().any(|&boundary|
+                boundary <= 0 || boundary as usize >= request.input_ids.as_ref().map_or(0, Vec::len)))
+                .then(|| "shared_prefix_tokens requires at most 64 positive boundaries shorter than the input".to_owned())
         })
         .or_else(|| {
             refusal(
@@ -288,6 +314,10 @@ pub fn admit(mut request: TokenizedGenerateReqInput, limits: &IngressLimits) -> 
         params.stream_interval,
         request.return_logprob,
     );
+    state.reasoning_tokens = limits
+        .reasoning_usage
+        .as_ref()
+        .map(|grammar| ReasoningTokens::new(grammar, &state.prompt_ids));
     state.created_time = request.created_time;
     state.session_id = request
         .session_params
@@ -339,6 +369,8 @@ pub fn admit(mut request: TokenizedGenerateReqInput, limits: &IngressLimits) -> 
     let spec = RequestSpec {
         request_id: rid.clone(),
         session_id: request.cache_session_id.unwrap_or_default(),
+        cache_group_id: request.cache_group_id.unwrap_or_default(),
+        shared_prefix_tokens: request.shared_prefix_tokens,
         tokens: request.input_ids.unwrap_or_default(),
         max_new_tokens: max_new_tokens.clamp(0, i64::from(i32::MAX)) as i32,
         // Prompt logprobs need logits from their start on, so the admission
@@ -511,10 +543,10 @@ fn refusal(
             ));
         }
         if start >= 0 && start < input_len - 1 {
-            // Only prompt logprobs need every id inside the vocabulary, so
-            // the ids are walked here and not on admission's common path.
+            // A scored row predicts the next token. Earlier context may use
+            // input-only ids that the output head cannot score.
             if let Some(reason) = limits.logprobs.prompt_logprobs_refusal(
-                input_ids,
+                &input_ids[start as usize + 1..],
                 request.has_multimodal_inputs,
                 limits.vocab_size,
             ) {
@@ -572,7 +604,7 @@ mod tests {
     use ts_wire::{Modality, MultimodalDataItem, MultimodalInputs, Value};
 
     use super::*;
-    use crate::request::FinishReason;
+    use crate::{json_framing::MessageBoundary, request::FinishReason};
 
     fn limits() -> IngressLimits {
         IngressLimits {
@@ -586,6 +618,7 @@ mod tests {
             multimodal: false,
             grammar: false,
             reasoning: None,
+            reasoning_usage: None,
             logprobs: LogprobServability {
                 supports_prompt_logprobs: true,
                 logprob_order: "torch".to_owned(),
@@ -711,6 +744,49 @@ mod tests {
             let message = refused_message(admit(request, &limits()).unwrap());
             assert!(message.contains("cache_session_id"), "{message}");
             assert!(message.contains("4096 UTF-8 bytes"), "{message}");
+        }
+    }
+
+    #[test]
+    fn shared_prefix_hints_are_bounded_and_preserve_normal_admission() {
+        let mut valid = request("r1", vec![1, 2, 3, 4], SamplingParams::default());
+        valid.shared_prefix_tokens = vec![1, 3];
+        let Some(Admitted::Run(admission)) = admit(valid, &limits()) else {
+            panic!("expected valid hints")
+        };
+        assert_eq!(admission.spec.shared_prefix_tokens, [1, 3]);
+        assert_eq!(admission.spec.max_cached_prefix_tokens, i32::MAX);
+        for hints in [vec![0], vec![-1], vec![4], vec![1; 65]] {
+            let mut invalid = request("r1", vec![1, 2, 3, 4], SamplingParams::default());
+            invalid.shared_prefix_tokens = hints;
+            assert!(refused_message(admit(invalid, &limits()).unwrap())
+                .contains("shared_prefix_tokens"));
+        }
+    }
+
+    #[test]
+    fn cache_groups_do_not_replace_sessions_or_change_tokens() {
+        for group_id in [
+            None,
+            Some(String::new()),
+            Some("g".repeat(4096)),
+            Some("🦀".repeat(1024)),
+        ] {
+            let mut request = request("r1", vec![1, 2, 3], SamplingParams::default());
+            request.cache_session_id = Some("independent-session".to_owned());
+            request.cache_group_id = group_id.clone();
+            let Some(Admitted::Run(admission)) = admit(request, &limits()) else {
+                panic!("expected admission for a bounded cache group");
+            };
+            assert_eq!(admission.spec.session_id, "independent-session");
+            assert_eq!(admission.spec.cache_group_id, group_id.unwrap_or_default());
+            assert_eq!(admission.spec.tokens, [1, 2, 3]);
+        }
+        for group_id in ["g".repeat(4097), format!("{}g", "🦀".repeat(1024))] {
+            let mut request = request("r1", vec![1, 2, 3], SamplingParams::default());
+            request.cache_group_id = Some(group_id);
+            let message = refused_message(admit(request, &limits()).unwrap());
+            assert!(message.contains("cache_group_id"), "{message}");
         }
     }
 
@@ -851,6 +927,8 @@ mod tests {
             may_open: r#"{"may_open":SLOT}"#.to_owned(),
             schema_slot: "SLOT".to_owned(),
             markers: Some((7, 8)),
+            implicit_closer: None,
+            boundary: None,
         };
         let admitted = |limits: &IngressLimits, prompt: Vec<i32>, schema: &str| {
             let params = SamplingParams {
@@ -921,6 +999,66 @@ mod tests {
     }
 
     #[test]
+    fn a_json_answer_needs_a_prompt_that_ends_at_a_message_boundary() {
+        // Block headers are 5 (model) 6 (text); 9 closes a message and 10 ends the turn.
+        let limits = IngressLimits {
+            grammar: true,
+            reasoning: Some(ReasoningGrammar {
+                continues: r#"{"continues":SLOT}"#.to_owned(),
+                may_open: r#"{"may_open":SLOT}"#.to_owned(),
+                schema_slot: "SLOT".to_owned(),
+                markers: None,
+                implicit_closer: None,
+                boundary: Some(MessageBoundary {
+                    open_answer: vec![5, 6],
+                    closed: vec![vec![9], vec![9, 10]],
+                }),
+            }),
+            ..limits()
+        };
+        let schema = r#"{"type":"object"}"#;
+        let admit_with = |prompt: Vec<i32>| {
+            let params = SamplingParams {
+                json_schema: Some(schema.to_owned()),
+                ..Default::default()
+            };
+            admit(request("r", prompt, params), &limits).expect("one request id")
+        };
+        let tag = |admitted: Admitted| match admitted {
+            Admitted::Run(admission) => admission.sampling_params.structural_tag,
+            Admitted::Refused { .. } => panic!("expected admission"),
+        };
+        // An empty answer header: the reply is the payload.
+        assert_eq!(
+            tag(admit_with(vec![1, 9, 5, 6])).as_deref(),
+            Some(r#"{"continues":{"type":"object"}}"#)
+        );
+        // A closed message, or no prompt: the reply writes its own blocks.
+        for prompt in [vec![1, 9], vec![1, 9, 10], vec![]] {
+            assert_eq!(
+                tag(admit_with(prompt)).as_deref(),
+                Some(r#"{"may_open":{"type":"object"}}"#)
+            );
+        }
+        // A prompt that ends inside another block cannot take a JSON answer.
+        for prompt in [vec![1, 9, 5], vec![1, 9, 5, 6, 2]] {
+            let Admitted::Refused { state, .. } = admit_with(prompt) else {
+                panic!("expected a refusal");
+            };
+            let message = state
+                .finished_reason
+                .as_ref()
+                .and_then(FinishReason::abort_message)
+                .expect("refused requests abort")
+                .to_owned();
+            assert!(
+                message.contains("closed message or an empty assistant text header"),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
     fn prompt_logprobs_bound_the_cached_prefix() {
         let limits = IngressLimits {
             enable_output_logprobs: true,
@@ -960,6 +1098,63 @@ mod tests {
         assert_eq!(admission.spec.max_cached_prefix_tokens, i32::MAX);
         assert!(!admission.state.wants_input_logprobs());
         assert!(admission.state.returns_input_logprobs);
+    }
+
+    #[test]
+    fn prompt_logprobs_accept_input_only_context() {
+        let limits = IngressLimits {
+            vocab_size: 64,
+            enable_output_logprobs: true,
+            ..limits()
+        };
+        for (input_ids, start) in [
+            (vec![100, 10, 11, 12], 0),
+            (vec![100, 100, 11, 12], 1),
+            (vec![100, 100, 100, 12], 2),
+            (vec![100, 100, 100, 100], 3),
+        ] {
+            let scored = TokenizedGenerateReqInput {
+                return_logprob: true,
+                logprob_start_len: start,
+                ..request(
+                    "input-only-context",
+                    input_ids.clone(),
+                    SamplingParams::default(),
+                )
+            };
+            let Some(Admitted::Run(admission)) = admit(scored, &limits) else {
+                panic!("unscored context must not be checked against the output vocabulary");
+            };
+            assert_eq!(admission.state.prompt_ids, input_ids);
+            assert_eq!(
+                admission.state.input_logprob_rows.as_ref().map(Vec::len),
+                (start < 3).then_some((3 - start) as usize)
+            );
+        }
+    }
+
+    #[test]
+    fn prompt_logprobs_refuse_targets_outside_the_output_vocabulary() {
+        let limits = IngressLimits {
+            vocab_size: 64,
+            enable_output_logprobs: true,
+            ..limits()
+        };
+        for start in 0..3 {
+            for target_position in start + 1..4 {
+                for target in [-1, 64, 100] {
+                    let mut input_ids = vec![10; 4];
+                    input_ids[target_position] = target;
+                    let scored = TokenizedGenerateReqInput {
+                        return_logprob: true,
+                        logprob_start_len: start as i64,
+                        ..request("invalid-target", input_ids, SamplingParams::default())
+                    };
+                    assert!(refused_message(admit(scored, &limits).unwrap())
+                        .contains("inside the vocabulary"));
+                }
+            }
+        }
     }
 
     #[test]

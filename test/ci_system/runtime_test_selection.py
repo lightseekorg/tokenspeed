@@ -1,0 +1,154 @@
+"""Select the runtime test files that a pull request's changes can reach.
+
+CI lists a pull request's changed paths in ``TOKENSPEED_CI_CHANGED_PATHS``.
+The runtime tests narrow only when every change is Markdown, a test file, or a
+model module: a module directly under the models package that defines
+``EntryClass``. Then only these runtime test files run:
+
+- The changed ones.
+- The tests that import a changed model module or a module built on it, or
+  that name one of them, so ``gpt_oss`` matches ``openai/gpt-oss-20b``.
+- The tests that import any of these, directly or through other test files.
+
+Any other change runs every test.
+"""
+
+from __future__ import annotations
+
+import ast
+import re
+from pathlib import Path
+
+CHANGED_PATHS_ENV = "TOKENSPEED_CI_CHANGED_PATHS"
+MODEL_DIRECTORY = "python/tokenspeed/runtime/models"
+MODEL_PACKAGE = "tokenspeed.runtime.models"
+RUNTIME_TEST_DIRECTORY = "test/runtime"
+KERNEL_TEST_DIRECTORY = "tokenspeed-kernel/test"
+
+
+def imported_modules(path: Path) -> set[str]:
+    """Modules named by any import statement in ``path``.
+
+    Imports inside functions count, and a name after ``from ... import`` counts
+    as a submodule.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    modules: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            modules.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            modules.add(node.module)
+            modules.update(f"{node.module}.{alias.name}" for alias in node.names)
+    return modules
+
+
+def model_names(modules: set[str]) -> set[str]:
+    """Modules directly under the models package (by name) among ``modules``."""
+    prefix = f"{MODEL_PACKAGE}."
+    return {
+        module[len(prefix) :].split(".")[0]
+        for module in modules
+        if module.startswith(prefix)
+    }
+
+
+def test_module_names(test: str) -> set[str]:
+    """Names that import the test file ``test``.
+
+    They are test.runtime.<name>, runtime.<name> and <name>.
+    """
+    dotted = test.removesuffix(".py").replace("/", ".")
+    return {dotted, dotted.removeprefix("test."), Path(test).stem}
+
+
+def squashed(text: str) -> str:
+    """``text`` lowercased without ``_``, ``-`` and ``.``.
+
+    The module ``qwen3_5`` then matches the checkpoint ``Qwen3.5-35B``.
+    """
+    return re.sub(r"[_.-]", "", text.lower())
+
+
+def model_modules(repo_root: Path) -> dict[str, Path]:
+    """The model modules by name.
+
+    A model module sits directly under the models package and defines
+    ``EntryClass``.
+    """
+    return {
+        path.stem: path
+        for path in sorted((repo_root / MODEL_DIRECTORY).glob("*.py"))
+        if re.search(r"^EntryClass\s*=", path.read_text(encoding="utf-8"), re.M)
+    }
+
+
+def models_built_on(changed: set[str], repo_root: Path) -> set[str]:
+    """``changed`` and the modules built on them.
+
+    These are the modules directly under the models package that import one of
+    ``changed``, directly or through other such modules.
+    """
+    importers: dict[str, set[str]] = {}
+    for path in sorted((repo_root / MODEL_DIRECTORY).glob("*.py")):
+        for imported in model_names(imported_modules(path)):
+            importers.setdefault(imported, set()).add(path.stem)
+    reached: set[str] = set()
+    pending = list(changed)
+    while pending:
+        name = pending.pop()
+        if name in reached:
+            continue
+        reached.add(name)
+        pending.extend(importers.get(name, set()))
+    return reached
+
+
+def select_runtime_tests(
+    test_files: list[str], changed_paths: list[str], repo_root: Path
+) -> list[str] | None:
+    """The repository-relative ``test_files`` that the changes can reach.
+
+    It is None when a change can reach any of them.
+    """
+    models = model_modules(repo_root)
+    changed_tests: set[str] = set()
+    changed_models: set[str] = set()
+    for path in changed_paths:
+        name = Path(path).name
+        if path.endswith(".md"):
+            continue
+        if path.startswith(f"{KERNEL_TEST_DIRECTORY}/") and name.startswith("test_"):
+            continue
+        if path.startswith(f"{RUNTIME_TEST_DIRECTORY}/") and name.startswith("test_"):
+            changed_tests.add(path)
+            continue
+        stem = name.removesuffix(".py")
+        if path == f"{MODEL_DIRECTORY}/{name}" and stem in models:
+            changed_models.add(stem)
+            continue
+        return None
+    reached = models_built_on(changed_models, repo_root) if changed_models else set()
+    names = {squashed(name) for name in reached}
+    # Every runtime test file, so that an unselected one still links others.
+    sources = {
+        path.relative_to(repo_root).as_posix(): path
+        for path in sorted((repo_root / RUNTIME_TEST_DIRECTORY).rglob("*.py"))
+    }
+    imports = {test: imported_modules(path) for test, path in sources.items()}
+    affected: set[str] = set()
+    for test, path in sources.items():
+        imports_model = bool(model_names(imports[test]) & reached)
+        text = squashed(path.read_text(encoding="utf-8"))
+        names_model = any(name in text for name in names)
+        if test in changed_tests or imports_model or names_model:
+            affected.add(test)
+    # A test that imports an affected test file, or a deleted one, is affected too.
+    pending = list(affected | changed_tests)
+    while pending:
+        modules = test_module_names(pending.pop())
+        for test in sources:
+            if test not in affected and imports[test] & modules:
+                affected.add(test)
+                pending.append(test)
+    return [test for test in test_files if test in affected]

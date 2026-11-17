@@ -60,8 +60,10 @@ VENDOR_PATHS = {
     "amd": (
         "test/ci_system/cleanup_amd_gpu_state.sh",
         "test/ci_system/install_deps_rocm.sh",
+        "test/ci_system/install_kernel_deps_rocm.sh",
         "test/ci_system/install_kernel_benchmark_rocm.sh",
         "test/ci_system/kernel_benchmark_ci.py",
+        "test/ci_system/verify_rocm_stack.py",
         "tokenspeed-kernel-amd",
         "tokenspeed-kernel/benchmarks/amd",
         "tokenspeed-kernel/python/requirements/rocm.txt",
@@ -93,7 +95,6 @@ RUNNER_GROUP_PATHS = {
     **{
         f"test/ci_system/{name}": frozenset({"amd-mi450"})
         for name in (
-            "mi450_rocjitsu_worker_python.sh",
             "mi450_sim_env.sh",
             "mi450_sim_report_digest.py",
             "run_mi450_rocjitsu.sh",
@@ -102,6 +103,9 @@ RUNNER_GROUP_PATHS = {
         )
     },
     "test/ci/deepswe": frozenset(),
+    # The lint workflow runs this test on every pull request; no runner group
+    # needs to.
+    "test/ci_system/test_mi450_sim_report_digest.py": frozenset(),
     "test/ci/run_slurm.sh": frozenset({"nvidia-gb200-slurm", "nvidia-gb300-slurm"}),
     "test/ci_system/slurm_submit.py": frozenset(
         {"nvidia-gb200-slurm", "nvidia-gb300-slurm"}
@@ -392,6 +396,11 @@ def parse_args() -> argparse.Namespace:
         help="GitHub event name; workflow_dispatch always enables the workflow.",
     )
     parser.add_argument(
+        "--full-tests",
+        action="store_true",
+        help="A reviewer asked for every test (pr_test_scope.py): run this group.",
+    )
+    parser.add_argument(
         "--repo-root",
         type=Path,
         required=True,
@@ -407,7 +416,7 @@ def main() -> None:
         for line in args.changed_files.read_text(encoding="utf-8").splitlines()
         if line.strip()
     }
-    run_vendor_tests = should_run(
+    run_vendor_tests = args.full_tests or should_run(
         paths, args.runner_group, args.event_name, args.repo_root
     )
     run_import_check = should_run_import_check(

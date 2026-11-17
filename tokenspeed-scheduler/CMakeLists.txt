@@ -9,6 +9,11 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(TOKENSPEED_SCHEDULER_BUILD_PYTHON "Build Python bindings" OFF)
 option(TOKENSPEED_SCHEDULER_BUILD_TESTS "Build tests" OFF)
+set(TOKENSPEED_SCHEDULER_SANITIZE "" CACHE STRING
+    "Sanitizers to build the core library and everything linking it with, such as address;undefined (empty: none)")
+if(TOKENSPEED_SCHEDULER_SANITIZE MATCHES "^(ON|TRUE|YES|Y|1)$")
+    message(FATAL_ERROR "TOKENSPEED_SCHEDULER_SANITIZE lists sanitizers, such as address;undefined")
+endif()
 
 include(FetchContent)
 
@@ -82,8 +87,26 @@ target_compile_definitions(tokenspeed_scheduler_core
         OPENSSL_SUPPRESS_DEPRECATED
 )
 
+# PUBLIC, so the tests, benchmarks and bindings that link the core are
+# instrumented and linked with the sanitizer runtimes as well.
+if(TOKENSPEED_SCHEDULER_SANITIZE)
+    list(JOIN TOKENSPEED_SCHEDULER_SANITIZE "," tokenspeed_scheduler_sanitizers)
+    target_compile_options(tokenspeed_scheduler_core
+        PUBLIC
+            -fsanitize=${tokenspeed_scheduler_sanitizers}
+            -fno-omit-frame-pointer
+    )
+    target_link_options(tokenspeed_scheduler_core
+        PUBLIC
+            -fsanitize=${tokenspeed_scheduler_sanitizers}
+    )
+endif()
+
 if(TOKENSPEED_SCHEDULER_BUILD_PYTHON)
+    find_package(Python COMPONENTS Interpreter Development.Module
+        OPTIONAL_COMPONENTS Development.SABIModule REQUIRED)
     nanobind_add_module(tokenspeed_scheduler_ext
+        STABLE_ABI
         bindings/python_module.cpp
     )
 
@@ -111,7 +134,9 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
     FetchContent_MakeAvailable(googletest)
 
     add_executable(tokenspeed_scheduler_tests
+        tests/cpp/test_kv_event_prefix_view.cpp
         tests/cpp/test_prefix_hasher.cpp
+        tests/cpp/test_profile_span.cpp
         tests/cpp/test_prefix_index.cpp
         tests/cpp/test_tail_table.cpp
         tests/cpp/test_boundary_tree.cpp
@@ -119,27 +144,37 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_cache_block_ref.cpp
         tests/cpp/test_full_attn_group.cpp
         tests/cpp/test_swa_group.cpp
+        tests/cpp/test_swa_sink.cpp
         tests/cpp/test_match_host_pages.cpp
         tests/cpp/test_cache_coordinator.cpp
         tests/cpp/test_checkpoint_retention.cpp
+        tests/cpp/test_checkpoint_demotion.cpp
         tests/cpp/test_storage_query.cpp
         tests/cpp/test_state_checkpoints.cpp
         tests/cpp/test_joint_match_invariants.cpp
         tests/cpp/test_forward_cache_ops.cpp
         tests/cpp/test_prefill_chunk.cpp
+        tests/cpp/test_prefill_order.cpp
+        tests/cpp/test_prefill_gate.cpp
         tests/cpp/test_group_demands.cpp
+        tests/cpp/test_group_geometry.cpp
+        tests/cpp/test_token_position_bounds.cpp
         tests/cpp/test_forward_batch.cpp
+        tests/cpp/test_full_cache_benchmark.cpp
         tests/cpp/test_kv_cache_lifecycle.cpp
         tests/cpp/test_cache_scenarios.cpp
         tests/cpp/test_scheduler_plan.cpp
         tests/cpp/test_token_level_hits.cpp
         tests/cpp/test_outside_event_handler.cpp
+        tests/cpp/test_pd_replayable.cpp
         tests/cpp/test_cache_operations.cpp
         tests/cpp/test_pending_prefix_store.cpp
         tests/cpp/test_req_pool_allocator.cpp
         tests/cpp/test_capacity_model.cpp
         tests/cpp/test_shadow_occupancy.cpp
+        tests/cpp/test_flat_hash_map.cpp
         tests/cpp/test_closed_loop_random.cpp
+        tests/cpp/test_lone_request_compaction.cpp
         tests/cpp/test_utils.cpp
     )
 
@@ -204,5 +239,34 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         PRIVATE
             csrc
             tests/cpp
+    )
+
+    add_executable(tokenspeed_scheduler_forward_batch_benchmark EXCLUDE_FROM_ALL
+        tests/cpp/benchmark_forward_batch.cpp
+    )
+
+    target_link_libraries(tokenspeed_scheduler_forward_batch_benchmark
+        PRIVATE
+            tokenspeed_scheduler_core
+    )
+
+    add_executable(tokenspeed_scheduler_full_cache_benchmark EXCLUDE_FROM_ALL
+        tests/cpp/benchmark_full_cache.cpp
+    )
+
+    target_link_libraries(tokenspeed_scheduler_full_cache_benchmark
+        PRIVATE
+            tokenspeed_scheduler_core
+            GTest::gtest
+    )
+
+    add_executable(tokenspeed_scheduler_decode_rounds_benchmark EXCLUDE_FROM_ALL
+        tests/cpp/benchmark_decode_rounds.cpp
+    )
+
+    target_link_libraries(tokenspeed_scheduler_decode_rounds_benchmark
+        PRIVATE
+            tokenspeed_scheduler_core
+            GTest::gtest
     )
 endif()

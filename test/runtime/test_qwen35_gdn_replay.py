@@ -427,7 +427,9 @@ def test_gdn_backend_resolves_verify_state_path_from_the_kernel():
 
     conv, recurrent = _initial_pools()
     pool = _ContractPool({0: ("linear_attention", conv, recurrent)})
-    backend = GdnAttnBackend(*_config(replay=False))
+    backend = GdnAttnBackend(
+        *_config(replay=False), writes_state_checkpoints_in_forward=False
+    )
     backend.set_kv_pool(pool)
 
     def supports(op, trait):

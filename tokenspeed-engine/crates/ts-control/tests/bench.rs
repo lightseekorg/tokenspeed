@@ -52,6 +52,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 const NO_FINISH_LOG: FinishLog = FinishLog {
     enabled: false,
     request_stats: false,
+    ttft_percentage: 0,
 };
 
 /// (rid, input_length, extend_prefix_len, prefill_length)
@@ -104,7 +105,9 @@ fn bench_commit_decode() {
     let mut rids: Vec<String> = Vec::with_capacity(bs);
     for i in 0..bs {
         let rid = format!("r{i}");
-        let state = RequestState::new(vec![0; 16], 1 << 30, BTreeSet::new(), true, None, false);
+        let mut state = RequestState::new(vec![0; 16], 1 << 30, BTreeSet::new(), true, None, false);
+        p.assign_admission(&mut state);
+        p.assign_admission(&mut state);
         p.register(rid.clone(), state);
         let _ = p
             .commit(
@@ -151,10 +154,15 @@ fn interpreter() {
     static START: Once = Once::new();
     START.call_once(|| {
         std::env::set_var("PYTHONHOME", env!("TS_CONTROL_TEST_PYTHONHOME"));
-        ts_scheduler::register_builtin_module();
         Python::initialize();
         Python::attach(|py| {
-            ts_scheduler::alias_builtin_module(py).unwrap();
+            let module = ts_scheduler::python_module(py).unwrap();
+            py.import("sys")
+                .unwrap()
+                .getattr("modules")
+                .unwrap()
+                .set_item("tokenspeed_scheduler.tokenspeed_scheduler_ext", module)
+                .unwrap();
             let package = concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../../tokenspeed-scheduler/python"
@@ -179,6 +187,7 @@ cfg = ts.SchedulerConfig()
 cfg.prefix_granularity = {page}
 cfg.max_scheduled_tokens = {tokens}
 cfg.max_batch_size = {rows}
+cfg.max_resident_requests = {rows}
 cfg.num_device_pages = {pages} + 1
 cfg.num_snapshot_pages = 1
 cfg.cache_groups = [ts.CacheGroupConfig(group_id="full_attention", block_granularity={page},
@@ -204,8 +213,24 @@ result = ts.Scheduler(cfg)
 /// decode row stores its verify window and keeps `accepted` tokens of it.
 /// Plans go to another thread, which frees them, as the host's forward
 /// thread does.
+enum PlanJob {
+    Plan(ExecutionPlan),
+    Fence(mpsc::Sender<()>),
+}
+
+fn free_plans(receiver: mpsc::Receiver<PlanJob>) {
+    for job in receiver {
+        match job {
+            PlanJob::Plan(plan) => drop(plan),
+            PlanJob::Fence(done) => {
+                let _ = done.send(());
+            }
+        }
+    }
+}
+
 struct InstantDevice {
-    plans: mpsc::Sender<ExecutionPlan>,
+    plans: mpsc::Sender<PlanJob>,
     verify_width: usize,
     accepted: i32,
 }
@@ -222,7 +247,7 @@ impl DataPlane for InstantDevice {
         plan: ExecutionPlan,
         dispatch: &Dispatch<'_>,
     ) -> Result<Option<ForwardResult>, DataPlaneError> {
-        let _ = self.plans.send(plan);
+        let _ = self.plans.send(PlanJob::Plan(plan));
         Ok(dispatch.forward.map(|batch| {
             let decodes = batch.request_ids.len() - batch.num_extends;
             let mut output_lengths = vec![1; batch.num_extends];
@@ -278,6 +303,10 @@ impl DataPlane for InstantDevice {
     }
 
     fn release_memory(&mut self, _: &[String]) -> Result<(), DataPlaneError> {
+        unreachable!("no control operation in the benchmark")
+    }
+
+    fn reload_forward(&mut self, _: &ControlRequest) -> Result<(bool, String), DataPlaneError> {
         unreachable!("no control operation in the benchmark")
     }
 
@@ -366,6 +395,58 @@ impl Frontend for ChurningFrontend {
     fn reply(&mut self, _: ControlOutput) {}
 }
 
+fn round_loop_config(shape: &RoundShape, pages: usize) -> LoopConfig {
+    LoopConfig {
+        in_flight_depth: 1,
+        prefill_delay: None,
+        limits: IngressLimits {
+            vocab_size: 1 << 17,
+            eos_token_ids: vec![2],
+            top_k_exclusive_max: Some(ts_control::sampling::TOP_K_FUSED_MAX),
+            max_model_len: 1 << 24,
+            max_req_input_len: 1 << 20,
+            enable_output_logprobs: false,
+            requires_bootstrap: false,
+            multimodal: false,
+            grammar: false,
+            reasoning: None,
+            reasoning_usage: None,
+            logprobs: LogprobServability {
+                supports_prompt_logprobs: true,
+                logprob_order: "torch".to_owned(),
+                pipeline_parallel: false,
+                disaggregated: false,
+                lm_head_tp_under_dp: false,
+                computes_prompt_logprobs: true,
+            },
+        },
+        kv_total_pages: pages as i64,
+        kv_token_capacity: (pages * shape.page) as i64,
+        ngram_context_len: 0,
+        request_token_history: false,
+        request_token_history_lookback: None,
+        controls: ControlConfig {
+            memory_saver: false,
+            memory_regions: Vec::new(),
+            l3_weight_version: None,
+            allow_reload_forward: false,
+        },
+        batch_log: BatchLogConfig {
+            enabled: false,
+            decode_log_interval: 40,
+            num_total_pages: pages as i64,
+            spec_num_steps: 0,
+            dp_rank: 0,
+            disaggregated: false,
+            cache_state_group_ids: Vec::new(),
+            log_spec_accept_lengths: false,
+        },
+        kv_events: false,
+        epd_receive_enabled: false,
+        eager_grammar: false,
+    }
+}
+
 /// Run `shape`'s rounds on one rank and print the microseconds per round.
 fn bench_rounds(name: &str, shape: RoundShape) {
     let generated = if shape.generate > 0 {
@@ -386,8 +467,8 @@ fn bench_rounds(name: &str, shape: RoundShape) {
         dp: None,
         ep: None,
     };
-    let (plans, freed) = mpsc::channel::<ExecutionPlan>();
-    let freeing = std::thread::spawn(move || freed.into_iter().for_each(drop));
+    let (plans, freed) = mpsc::channel::<PlanJob>();
+    let freeing = std::thread::spawn(move || free_plans(freed));
     let (encoder, batches) = mpsc::channel::<(Vec<StreamedOutput>, Load)>();
     let encoding = std::thread::spawn(move || {
         for (outputs, load) in batches {
@@ -395,51 +476,7 @@ fn bench_rounds(name: &str, shape: RoundShape) {
             std::hint::black_box(EngineOutput::Batch(Box::new(batch)).to_frames());
         }
     });
-    let config = LoopConfig {
-        in_flight_depth: 1,
-        limits: IngressLimits {
-            vocab_size: 1 << 17,
-            eos_token_ids: vec![2],
-            top_k_exclusive_max: Some(ts_control::sampling::TOP_K_FUSED_MAX),
-            max_model_len: 1 << 24,
-            max_req_input_len: 1 << 20,
-            enable_output_logprobs: false,
-            requires_bootstrap: false,
-            multimodal: false,
-            grammar: false,
-            reasoning: None,
-            logprobs: LogprobServability {
-                supports_prompt_logprobs: true,
-                logprob_order: "torch".to_owned(),
-                pipeline_parallel: false,
-                disaggregated: false,
-                lm_head_tp_under_dp: false,
-                computes_prompt_logprobs: true,
-            },
-        },
-        kv_total_pages: pages as i64,
-        kv_token_capacity: (pages * shape.page) as i64,
-        ngram_context_len: 0,
-        request_token_history: false,
-        controls: ControlConfig {
-            memory_saver: false,
-            memory_regions: Vec::new(),
-            l3_weight_version: None,
-        },
-        batch_log: BatchLogConfig {
-            enabled: false,
-            decode_log_interval: 40,
-            num_total_pages: pages as i64,
-            spec_num_steps: 0,
-            dp_rank: 0,
-            disaggregated: false,
-            cache_state_group_ids: Vec::new(),
-            log_spec_accept_lengths: false,
-        },
-        kv_events: false,
-        epd_receive_enabled: false,
-        eager_grammar: false,
-    };
+    let config = round_loop_config(&shape, pages);
     let mut event_loop = EventLoop::new(
         round_scheduler(&shape, pages),
         InstantDevice {
@@ -713,3 +750,7 @@ fn bench_round_decode_long_spec() {
         },
     );
 }
+
+#[cfg(target_os = "linux")]
+#[path = "support/finish_event_loop.rs"]
+mod finish_event_loop;

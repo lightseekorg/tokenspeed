@@ -33,6 +33,7 @@ from tokenspeed_kernel.ops.activation.triton import (
     attnres_partial_dual,
     fused_gate_sigmoid_mul_add,
     fused_swiglu_fp8_ue8m0,
+    moe_finalize_gate_add,
     sigmoid_mul,
     silu_and_mul,
     situ_and_mul,
@@ -155,6 +156,48 @@ def test_fused_gate_sigmoid_mul_add_waits_for_published_inputs():
     pdl_enabled(overwrite=True)
     pdl = fused_gate_sigmoid_mul_add(
         target_hidden, target_weight, target_shared, target_final
+    )
+    assert torch.equal(pdl, serial)
+
+
+def test_moe_finalize_gate_add_waits_for_published_inputs():
+    tokens, hidden_dim, top_k = 17, 2560, 10
+    rows = tokens * top_k + 5
+    gemm2_out = torch.randn(rows, hidden_dim, device="cuda", dtype=torch.bfloat16)
+    permuted = torch.randperm(rows, device="cuda")[: tokens * top_k].to(torch.int32)
+    permuted[::7] = -1
+    weights = torch.rand(tokens, top_k, device="cuda").to(torch.bfloat16)
+    hidden = torch.randn(tokens, hidden_dim, device="cuda", dtype=torch.bfloat16)
+    gate_weight = torch.randn(hidden_dim, device="cuda", dtype=torch.bfloat16) * 0.02
+    shared = torch.randn_like(hidden)
+    serial = moe_finalize_gate_add(
+        gemm2_out, permuted, weights, hidden, gate_weight, shared
+    )
+    target_gemm2, target_weights, target_hidden, target_gate, target_shared = (
+        _unpublished(gemm2_out, weights, hidden, gate_weight, shared)
+    )
+    # Unpublished route rows read as remote routes, which also change the sum.
+    target_permuted = torch.full_like(permuted, -1)
+
+    _publish(
+        (gemm2_out, permuted, weights, hidden, gate_weight, shared),
+        (
+            target_gemm2,
+            target_permuted,
+            target_weights,
+            target_hidden,
+            target_gate,
+            target_shared,
+        ),
+    )
+    pdl_enabled(overwrite=True)
+    pdl = moe_finalize_gate_add(
+        target_gemm2,
+        target_permuted,
+        target_weights,
+        target_hidden,
+        target_gate,
+        target_shared,
     )
     assert torch.equal(pdl, serial)
 

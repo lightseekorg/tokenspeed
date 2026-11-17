@@ -39,6 +39,7 @@ from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.logits_processor_output import (
     LogitsProcessorOutput as Output,
 )
+from tokenspeed.runtime.sampling.backends.base import CUDA_GRAPH_VARIANT_DEFAULT
 from tokenspeed.runtime.sampling.sampling_batch_info import (
     SamplingBatchInfo,
     request_vocab_mask,
@@ -319,6 +320,7 @@ def test_zero_rows_return_before_lm_head_and_retain_empty_taps():
     output = forward(
         SimpleNamespace(
             config=SimpleNamespace(vocab_size=32),
+            attn_tp_size=1,
             dp_lm_head_tp=False,
             _query_shard=lambda metadata: None,
         ),
@@ -500,7 +502,9 @@ def test_idle_graph_grammar_adds_an_identity_batch():
         token_to_kv_pool=None,
         input_buffers=buffers,
         runtime_states=SimpleNamespace(
-            valid_cache_lengths=torch.zeros(1), vocab_size=32
+            valid_cache_lengths=torch.zeros(1),
+            input_vocab_size=32,
+            vocab_size=32,
         ),
         device="cpu",
         default_stream=None,
@@ -567,6 +571,7 @@ def test_drafter_future_inputs_keep_original_request_rows():
             future_input_map=future_inputs,
             valid_cache_lengths=torch.zeros(6, dtype=torch.int32),
             mark_spec_candidates_drafted=lambda rows: drafted.extend(rows.tolist()),
+            input_vocab_size=64,
             vocab_size=64,
         ),
         input_buffers=SimpleNamespace(
@@ -790,6 +795,8 @@ def test_graph_padding_restores_live_output_layout(live_bs):
     )
     observed = []
     accepted_lengths = []
+    # MegaMoE's (live, padded) request counts, (1, 1) outside a padded replay.
+    live_requests = torch.ones(2, dtype=torch.int32)
     runner = SimpleNamespace(
         confidence_feedback=None,
         segmented_decode=None,
@@ -799,12 +806,12 @@ def test_graph_padding_restores_live_output_layout(live_bs):
         _pad_graph_req_pool_indices=lambda indices, bs: torch.nn.functional.pad(
             indices, (0, bs - len(indices)), value=0
         ),
-        _set_graph_state_write_indices=lambda *args: None,
         _prepare_request_token_history_graph_inputs=lambda **kwargs: None,
         _prepare_decode_metadata=lambda *args, **kwargs: None,
-        _cuda_graph_key=lambda bs: bs,
+        _cuda_graph_key=lambda bs: (CUDA_GRAPH_VARIANT_DEFAULT, bs),
         _graph_debug=False,
         _expert_load_rows=None,
+        _mega_moe_live_requests=live_requests,
         device="cuda",
         config=SimpleNamespace(spec_draft_tree=False),
         attn_backend=SimpleNamespace(
@@ -821,12 +828,14 @@ def test_graph_padding_restores_live_output_layout(live_bs):
             seq_lens_buf=torch.ones(padded_bs),
         ),
         graphs={
-            padded_bs: SimpleNamespace(
-                replay=lambda: observed.append((ctx.bs, ctx.output_layout))
+            (CUDA_GRAPH_VARIANT_DEFAULT, padded_bs): SimpleNamespace(
+                replay=lambda: observed.append(
+                    (ctx.bs, ctx.output_layout, live_requests.tolist())
+                )
             )
         },
         output_buffers={
-            padded_bs: (
+            (CUDA_GRAPH_VARIANT_DEFAULT, padded_bs): (
                 torch.arange(padded_bs * width),
                 torch.ones(padded_bs),
                 None,
@@ -851,7 +860,13 @@ def test_graph_padding_restores_live_output_layout(live_bs):
         block_tables_cpu={},
         settle=lambda: None,
     )
-    assert observed == [(padded_bs, ForwardOutputLayout(0, 0, padded_bs, width))]
+    # A padded replay routes only the live requests' MegaMoE rows; an unpadded
+    # one routes every row. Either way the counts are (1, 1) afterwards.
+    counts = [live_bs, padded_bs] if live_bs < padded_bs else [1, 1]
+    assert observed == [
+        (padded_bs, ForwardOutputLayout(0, 0, padded_bs, width), counts)
+    ]
+    assert live_requests.tolist() == [1, 1]
     assert ctx.bs == live_bs
     assert ctx.output_layout is live_layout
     assert tokens.tolist() == list(range(live_bs * width))

@@ -14,8 +14,8 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.hf_transformers_utils import _CONFIG_REGISTRY, get_config
 
 
-def _tiny_qwen3_moe_config() -> Qwen3MoeConfig:
-    return Qwen3MoeConfig(
+def _tiny_qwen3_moe_config(**overrides) -> Qwen3MoeConfig:
+    fields = dict(
         architectures=["Qwen3MoeForCausalLM"],
         vocab_size=64,
         hidden_size=16,
@@ -29,6 +29,7 @@ def _tiny_qwen3_moe_config() -> Qwen3MoeConfig:
         num_experts_per_tok=2,
         moe_intermediate_size=8,
     )
+    return Qwen3MoeConfig(**(fields | overrides))
 
 
 def _single_rank_mapping() -> Mapping:
@@ -113,6 +114,31 @@ class TestQwen3MoeConfig:
         assert not (model.model.layers[0].comm_manager.prev_is_moe)
         assert model.model.layers[1].comm_manager.prev_is_moe
 
+    def test_dense_layer_between_moe_layers_sets_both_neighbors(self):
+        from tokenspeed.runtime.models.qwen3_5_moe import (
+            Qwen3_5MoeMLP,
+            Qwen3_5MoeSparseMoeBlock,
+        )
+        from tokenspeed.runtime.models.qwen3_moe import Qwen3MoeForCausalLM
+
+        model = Qwen3MoeForCausalLM(
+            _tiny_qwen3_moe_config(num_hidden_layers=3, mlp_only_layers=[1]),
+            mapping=_single_rank_mapping(),
+        )
+
+        layers = model.model.layers
+        assert [type(layer.mlp) for layer in layers] == [
+            Qwen3_5MoeSparseMoeBlock,
+            Qwen3_5MoeMLP,
+            Qwen3_5MoeSparseMoeBlock,
+        ]
+        assert [layer.comm_manager.is_moe for layer in layers] == [True, False, True]
+        assert [layer.comm_manager.prev_is_moe for layer in layers] == [
+            False,
+            True,
+            False,
+        ]
+
     def test_loads_unfused_expert_weights_into_moe_layer(self):
         from tokenspeed.runtime.models.qwen3_moe import Qwen3MoeForCausalLM
 
@@ -191,7 +217,7 @@ class TestQwen3MoeConfig:
                 hidden_states,
                 ctx,
                 residual,
-                cos_sin=None,
+                aux_hidden_states=None,
             ):
                 return hidden_states, residual
 

@@ -328,7 +328,7 @@ class InputBuffers:
             self.ngram_prefix_buf[:bs],
             self.ngram_hash_ids_buf[:refresh_tokens],
             total_tokens,
-            runtime_states.vocab_size,
+            runtime_states.input_vocab_size,
             uniform_length,
             self.ngram_hash_params,
         )
@@ -386,7 +386,7 @@ class InputBuffers:
 
         Args:
             substitute_ids: in-vocab token id per media modality.
-            vocab_size: target vocabulary size, for validation.
+            vocab_size: target input vocabulary size, for validation.
         """
         invalid = {
             modality: token_id
@@ -721,6 +721,22 @@ class InputBuffers:
                 out=self.input_ids_buf[:total_tokens].view(-1, width),
             )
 
+        width = runtime_states.future_input_map.shape[1]
+        if (
+            num_extends < batch_size
+            and width > 1
+            and runtime_states.vocab_size < runtime_states.input_vocab_size
+        ):
+            # Only draft columns index output probabilities. Column 0 may be
+            # an explicit input-only token, as may any token in the prompt.
+            prefill_tokens = sum(forward_op.input_lengths[:num_extends])
+            candidates = self.input_ids_buf[prefill_tokens:total_tokens].view(
+                -1, width
+            )[:, 1:]
+            # Preserve the verifier's defensive output bound even when the
+            # embedding admits a larger input-only token range.
+            candidates.clamp_(0, runtime_states.vocab_size - 1)
+
         # Defensive clamp of the target-model IDs into the valid vocab range.
         # Decode IDs come from future_input_map, written by the previous
         # sampler/drafter; a stale/corrupt value must not reach the captured
@@ -729,7 +745,7 @@ class InputBuffers:
         # final chunk's last row (patched by the drafter with the round's
         # sampled token), and every id the drafters consume is sampled or
         # substituted in-vocab by construction.
-        vocab_size = runtime_states.vocab_size
+        vocab_size = runtime_states.input_vocab_size
         self.fill_ngram_inputs(ngram_inputs, total_tokens, runtime_states, forward_op)
         self.input_ids_buf[:total_tokens].clamp_(0, vocab_size - 1)
 

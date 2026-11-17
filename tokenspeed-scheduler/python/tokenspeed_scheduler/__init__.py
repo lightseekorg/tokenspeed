@@ -27,6 +27,14 @@ arrays are empty on decode-only batches. Use ``.tolist()`` for Python integers,
 or ``np.array(view, dtype=np.int32, copy=True)`` for writable storage (including
 when passing the data to PyTorch). The explicit dtype also accepts token lists
 from older scheduler releases without changing the result's dtype.
+
+``Forward.Batch.block_table_windows()`` gives each group's read-only int32
+row windows and its absolute column count. Each window starts at
+``max(pages - window_width, 0)``. The ``(released, pages)`` pairs from
+``block_table_spans()`` mark the released prefix (0) and the start of
+row padding (-1). ``block_tables_arrays()`` materializes the absolute rows
+on demand and returns read-only views of the batch's cached tables.
+All three views keep the batch alive.
 """
 
 import tokenspeed_scheduler.tokenspeed_scheduler_ext as _ext
