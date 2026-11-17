@@ -608,6 +608,7 @@ def test_all_gather_takes_the_workspace_exchange_where_it_serves(routing, monkey
 def test_nvidia_prepares_the_workspace_exchange_for_column_gathers(
     backend, monkeypatch
 ):
+    _switches(monkeypatch, force=False, invariant=False)
     monkeypatch.setattr(
         "tokenspeed.runtime.distributed.comm_backend.auto.current_platform",
         lambda: SimpleNamespace(is_nvidia=True, is_cdna4=False),
@@ -618,6 +619,10 @@ def test_nvidia_prepares_the_workspace_exchange_for_column_gathers(
     )
     prepared.assert_called_once_with(GROUP, torch.bfloat16)
     backend._iris.get_prepared_all_gather.assert_not_called()
+    # The NCCL-only knob takes no symmetric-memory path, gathers included.
+    _switches(monkeypatch, force=True, invariant=False)
+    assert backend.get_prepared_all_gather(GROUP, torch.bfloat16) is None
+    prepared.assert_called_once()
 
 
 def test_the_workspace_exchange_is_prepared_for_armed_16_bit_gathers(monkeypatch):
