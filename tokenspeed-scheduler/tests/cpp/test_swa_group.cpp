@@ -331,6 +331,24 @@ TEST(BlockTableTest, EvictToNullIsIdempotentOnNullSlot) {
     EXPECT_FALSE(table.Blocks()[0]);
 }
 
+TEST(GroupAllocatorTest, BucketBalanceCountsKeptHeadAfterReclaim) {
+    BlockPool pool(8, {4});
+    pool.RegisterGroup(0, 4, 4);
+    GroupAllocator allocator(4, 0, 4, /*kept_head_blocks=*/1);
+    BlockTable table;
+    ASSERT_TRUE(allocator.Acquire(pool, table, AcquirePlan{.num_blocks = 4}, 0, {}));
+    allocator.ReclaimExpired(pool, table, 4);
+    ASSERT_EQ(table.ReclaimedPrefixBlocks(), 4);
+    ASSERT_TRUE(table.Blocks()[0]);
+    const auto head_bucket = allocator.BucketOf(table.Blocks()[0]->Location());
+
+    ASSERT_TRUE(allocator.Acquire(pool, table, AcquirePlan{.num_blocks = 3}, 0, {}));
+    for (const auto& ref : table.Blocks().subspan(4)) {
+        ASSERT_TRUE(ref);
+        EXPECT_NE(allocator.BucketOf(ref->Location()), head_bucket);
+    }
+}
+
 TEST(GroupAllocatorTest, BucketBalanceKeepsLiveSlotsAfterReclaimedPrefixAndInteriorHole) {
     BlockPool pool(8, {4});
     pool.RegisterGroup(0, 4, 4);
