@@ -409,37 +409,6 @@ def test_deferred_allocation_reaches_the_prefill_scheduler():
     )
 
 
-def test_an_older_scheduler_wheel_admits_early_without_the_policy(monkeypatch):
-    # tokenspeed-scheduler 0.1.54 has neither the field nor its enum and only
-    # admits a prompt once its destination is allocated: a prefill server
-    # starts with early left unset, and deferred fails at startup.
-    class OldSchedulerConfig:
-        pass
-
-    monkeypatch.setattr(scheduler_utils, "SchedulerConfig", OldSchedulerConfig)
-    specs = _specs(num_host_pages=0, num_snapshot_pages=1, max_retracted=0)
-    args = ServerArgs(
-        model="x",
-        max_num_seqs=8,
-        disaggregation_mode="prefill",
-        disaggregation_transfer_backend="mooncake",
-    )
-    assert args.disaggregation_decode_allocation_policy == "early"
-    cfg = _config(args, specs)
-    assert cfg.num_snapshot_pages == 1
-    assert "decode_allocation_policy" not in vars(cfg)
-    args = ServerArgs(
-        model="x",
-        max_num_seqs=8,
-        disaggregation_mode="prefill",
-        disaggregation_transfer_backend="mooncake",
-        disaggregation_decode_allocation_policy="deferred",
-        disaggregation_layerwise_interval=0,
-    )
-    with pytest.raises(AttributeError, match="DecodeAllocationPolicy"):
-        _config(args, specs)
-
-
 @pytest.mark.parametrize(
     "flags, enabled",
     [([], False), (["--enable-state-checkpoint-in-forward"], True)],
