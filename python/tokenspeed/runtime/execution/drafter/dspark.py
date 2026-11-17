@@ -36,6 +36,8 @@ from tokenspeed_kernel.ops.sampling.cute_dsl import (
     markov_argmax_step,
     supports_markov_argmax_shape,
 )
+
+# Bypasses the registry: tokenspeed-kernel has no family-level Markov logits op.
 from tokenspeed_kernel.ops.sampling.triton import dspark_markov_shard_logits
 from typing_extensions import override
 
