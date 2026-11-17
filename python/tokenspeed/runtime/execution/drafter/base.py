@@ -43,6 +43,7 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbe
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.execution._draft_overlap import DecodeGraphOverlap
     from tokenspeed.runtime.execution.context import ForwardContext
     from tokenspeed.runtime.execution.cudagraph_memory import CapturedLadder
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -156,6 +157,7 @@ class BaseDrafter:
         # Bound by ``bind_sampling_backend`` under --enable-speculative-sampling;
         # None keeps the argmax proposal.
         self.draft_sampler: DraftProposalSampler | None = None
+        self.decode_overlap: DecodeGraphOverlap | None = None
 
     def set_cache_pool(self, token_to_kv_pool: CachePool | None) -> None:
         """Take a replacement pool; a drafter that caches views rebuilds them."""
@@ -530,14 +532,19 @@ class BaseDrafter:
         ``graph_bs``, the forward's stream ordered after it; a drafter may
         start its round behind it on another stream. Default: replays it on
         the current stream."""
-        del bs, graph_bs
-        graph.replay()
+        del graph_bs
+        if self.decode_overlap is None:
+            graph.replay()
+        else:
+            self.decode_overlap.replay(graph, live_rows=bs)
 
     def finish_round(self, ctx: ForwardContext, graph_bs: int | None) -> None:
         """Draft after the forward at its decode graph's padded batch (None: eager)."""
 
     def complete_round(self) -> None:
-        """Finish a round ``finish_round`` left pending (the next round's inputs)."""
+        """Finish a round left pending after replay or ``finish_round``."""
+        if self.decode_overlap is not None:
+            self.decode_overlap.settle()
 
     def capture_round_graphs(
         self, graph_bs: int, *, stream: torch.cuda.Stream, pool: tuple[int, int]
