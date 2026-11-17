@@ -242,7 +242,9 @@ def interleave_rope(tensor, positions, cos_sin_cache, *, rope_dim):
         return tensor
     rotary = tensor[..., :rope_dim]
     tail = tensor[..., rope_dim:]
-    cos_sin = cos_sin_cache.index_select(0, positions.flatten())
+    # The native operator requires cos/sin to share the activation dtype, while
+    # the rotary cache is built in float32.
+    cos_sin = cos_sin_cache.index_select(0, positions.flatten()).to(tensor.dtype)
     cos, sin = cos_sin.chunk(2, dim=-1)
     cos = cos.repeat(1, 2).view(-1, 1, 1, rope_dim)
     sin = sin.repeat(1, 2).view(-1, 1, 1, rope_dim)
@@ -250,7 +252,15 @@ def interleave_rope(tensor, positions, cos_sin_cache, *, rope_dim):
         rotary.reshape(rotary.shape[0], -1, 1, rope_dim),
         cos,
         sin,
-    ).reshape_as(rotary)
+    )
+    # aclnnInterleaveRope emits even lanes first, then odd lanes. Restore the
+    # interleaved pair layout the indexer and the cache use.
+    half = rope_dim // 2
+    rotated = (
+        torch.stack((rotated[..., :half], rotated[..., half:]), dim=-1)
+        .flatten(-2)
+        .reshape_as(rotary)
+    )
     if tail.shape[-1] == 0:
         return rotated
     return torch.cat((rotated, tail), dim=-1)
