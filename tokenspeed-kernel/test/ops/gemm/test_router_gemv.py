@@ -102,11 +102,11 @@ def test_tf32_router_rounds_like_cublas_where_cublas_uses_tf32(
     x.view(torch.int32)[1, 0] = 0x7FFFFFFF
     counters = fp32_router_gemv_counters(columns, torch.device(device))
 
-    def no_cublas(*args: object) -> torch.Tensor:
-        raise AssertionError("3-32 rows must not fall back to torch.matmul")
+    def no_cublas(*args: object, **kwargs: object) -> torch.Tensor:
+        raise AssertionError("3-32 rows must not fall back to torch.addmm")
 
     with monkeypatch.context() as patch:
-        patch.setattr(torch, "matmul", no_cublas)
+        patch.setattr(torch, "addmm", no_cublas)
         out = fp32_router_gemv(x, weight, 0.125, counters, False)
         for enable_pdl in (False, True):
             again = fp32_router_gemv(x, weight, 0.125, counters, enable_pdl)
