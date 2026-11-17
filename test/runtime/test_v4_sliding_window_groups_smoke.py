@@ -41,7 +41,7 @@ def compute_cache_group_pages(
     overlap_schedule_depth,
 ):
     """Child pages per group (null page excluded) from the scheduler's model."""
-    from tokenspeed_scheduler import SchedulerConfig
+    from tokenspeed_engine.scheduler import SchedulerConfig
 
     model = capacity_model(
         specs,

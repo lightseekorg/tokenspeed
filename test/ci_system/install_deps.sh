@@ -193,19 +193,9 @@ pip_install_with_retry pip3 install tokenspeed-kernel/python/ --no-build-isolati
 show_nvcc_cache_stats after
 
 # ============================================================
-# Step 5: Install TokenSpeed Scheduler (C++)
+# Step 5: Install TokenSpeed Engine (with the C++ scheduler)
 # ============================================================
-echo "=== Step 5: Install TokenSpeed Scheduler ==="
-pip_install_with_retry pip3 install cmake ninja
-# Scheduler changes intentionally accumulate without a version bump. Build in
-# a fresh directory so a persistent runner cannot reuse a same-version native
-# extension left by an earlier checkout.
-SCHEDULER_BUILD_DIR="$(mktemp -d)"
-pip_install_with_retry pip3 install --force-reinstall --no-deps \
-    tokenspeed-scheduler/ \
-    --config-settings="build-dir=${SCHEDULER_BUILD_DIR}"
-rm -rf "${SCHEDULER_BUILD_DIR}"
-echo "=== Step 5b: Install TokenSpeed Engine ==="
+echo "=== Step 5: Install TokenSpeed Engine ==="
 WORKSPACE="${WORKSPACE}" bash "${SCRIPT_DIR}/install_tokenspeed_engine.sh"
 
 # ============================================================

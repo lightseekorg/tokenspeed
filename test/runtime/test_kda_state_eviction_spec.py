@@ -48,7 +48,7 @@ import pytest
 import torch
 from ci_system.ci_register import register_cuda_ci
 
-ts = pytest.importorskip("tokenspeed_scheduler")
+ts = pytest.importorskip("tokenspeed_engine.scheduler")
 
 from test.runtime.scheduler_driver import (  # noqa: E402
     advance_scheduler,

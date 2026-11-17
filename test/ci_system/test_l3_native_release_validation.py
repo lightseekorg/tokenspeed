@@ -1063,7 +1063,14 @@ def run_interrupted(
 
     def send_signals() -> None:
         deadline = time.monotonic() + 10.0
-        while not parent_pidfile.exists() and time.monotonic() < deadline:
+        # The parent publishes its PID before spawning the child. Wait for
+        # both writes before interrupting the process group.
+        while time.monotonic() < deadline:
+            if all(
+                path.exists() and path.stat().st_size > 0
+                for path in (parent_pidfile, child_pidfile)
+            ):
+                break
             time.sleep(0.02)
         for sig, delay in signals:
             time.sleep(delay)

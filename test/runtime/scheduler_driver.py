@@ -25,7 +25,7 @@ Python binding."""
 
 from collections.abc import Sequence
 
-from tokenspeed_scheduler import ExecutionEvent, ForwardEvent, RequestSpec
+from tokenspeed_engine.scheduler import ExecutionEvent, ForwardEvent, RequestSpec
 
 # "No bound" for RequestSpec.max_cached_prefix_tokens (the C++ default).
 UNBOUNDED_CACHED_PREFIX_TOKENS = 2**31 - 1

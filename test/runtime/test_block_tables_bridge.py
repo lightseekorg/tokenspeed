@@ -40,7 +40,7 @@ def _exact_spans(arrays):
 
 
 def _import_bridge():
-    """Import the bridge; skip if torch / tokenspeed_scheduler ext absent."""
+    """Import the bridge; skip if torch / tokenspeed_engine.scheduler ext absent."""
     from tokenspeed.runtime.engine.scheduler_utils import (
         block_tables_from_forward_op,
     )
@@ -50,7 +50,7 @@ def _import_bridge():
 
 @pytest.fixture
 def scheduler_forward_op():
-    import tokenspeed_scheduler as ts
+    import tokenspeed_engine.scheduler as ts
 
     cfg = ts.SchedulerConfig()
     cfg.prefix_granularity = 2
@@ -88,7 +88,7 @@ class TestBlockTablesBridgeTest:
             self.bridge = _import_bridge()
         except (ImportError, ModuleNotFoundError) as exc:
             pytest.skip(
-                f"cache bridge unavailable (needs torch + tokenspeed_scheduler "
+                f"cache bridge unavailable (needs torch + tokenspeed_engine.scheduler "
                 f"extension): {exc}"
             )
         import torch
@@ -616,7 +616,7 @@ def _real_scheduler_module():
     not built in this environment."""
     import pytest as _pytest
 
-    ts = _pytest.importorskip("tokenspeed_scheduler")
+    ts = _pytest.importorskip("tokenspeed_engine.scheduler")
     return ts
 
 

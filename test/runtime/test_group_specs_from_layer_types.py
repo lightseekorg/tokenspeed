@@ -466,7 +466,7 @@ def _fake_pool(specs, *, packing: int) -> SimpleNamespace:
 
 class TestPoolToCacheGroupsIntegrationTest:
     """pool_to_cache_groups converts published specs to a multi-group
-    scheduler config. Needs torch + the tokenspeed_scheduler ext; skips
+    scheduler config. Needs torch + the tokenspeed_engine.scheduler ext; skips
     where those are absent."""
 
     def _import_converter(self):
@@ -477,7 +477,7 @@ class TestPoolToCacheGroupsIntegrationTest:
         except (ImportError, ModuleNotFoundError) as exc:
             pytest.skip(
                 f"pool_to_cache_groups unavailable (needs torch + "
-                f"tokenspeed_scheduler ext): {exc}"
+                f"tokenspeed_engine.scheduler ext): {exc}"
             )
         return pool_to_cache_groups
 
