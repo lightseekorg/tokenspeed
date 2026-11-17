@@ -1505,7 +1505,7 @@ def triton_gemma_rmsnorm(
 
 
 # Rows each gated RMSNorm program normalizes when one warp covers a row.
-GATED_RMSNORM_ROWS_PER_PROGRAM = 4
+GATED_RMSNORM_ROWS_PER_PROGRAM = 8
 
 
 @register_kernel(

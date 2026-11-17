@@ -26,6 +26,7 @@ import pytest
 import torch
 from tokenspeed_kernel.numerics.torch.layernorm import torch_gated_rmsnorm
 from tokenspeed_kernel.ops.layernorm import gated_rmsnorm
+from tokenspeed_kernel.ops.layernorm._triton.gated_rmsnorm import gated_rmsnorm_kernel
 from tokenspeed_kernel.ops.layernorm.triton import GATED_RMSNORM_ROWS_PER_PROGRAM
 from tokenspeed_kernel.platform import current_platform
 
@@ -89,6 +90,54 @@ def test_gated_rmsnorm_rows_are_independent_of_their_neighbours(device):
     for row in (0, ROWS_PER_PROGRAM - 1, ROWS_PER_PROGRAM, x.shape[0] - 1):
         alone = gated_rmsnorm(x[row : row + 1], weight, z[row : row + 1], **kwargs)
         torch.testing.assert_close(full[row : row + 1], alone, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("norm_before_gate", [True, False])
+def test_gated_rmsnorm_row_blocks_match_one_row_programs(
+    norm_before_gate: bool, device: str
+) -> None:
+    """Every row of a row block equals a one-row, one-warp program bit for bit."""
+    torch.manual_seed(2)
+    x = torch.randn(
+        2048 * ROWS_PER_PROGRAM + 5, 128, device=device, dtype=torch.bfloat16
+    )
+    z = torch.randn_like(x)
+    weight = torch.randn(128, device=device, dtype=torch.bfloat16)
+    out = gated_rmsnorm(
+        x,
+        weight,
+        z,
+        eps=1e-6,
+        group_size=None,
+        norm_before_gate=norm_before_gate,
+        sigmoid_gate=False,
+        fp8_scale=None,
+        weights_independent=True,
+    )
+    single = torch.empty_like(x)
+    gated_rmsnorm_kernel[(x.shape[0], 1)](
+        x,
+        single,
+        weight,
+        z,
+        None,
+        x.stride(0),
+        single.stride(0),
+        z.stride(0),
+        x.shape[0],
+        128,
+        1e-6,
+        BLOCK_M=1,
+        BLOCK_N=128,
+        NORM_BEFORE_GATE=norm_before_gate,
+        SIGMOID_GATE=False,
+        ENABLE_PDL=False,
+        WEIGHTS_INDEPENDENT=True,
+        OUT_FP8=False,
+        SHARED_WEIGHT=False,
+        num_warps=1,
+    )
+    torch.testing.assert_close(out, single, rtol=0, atol=0)
 
 
 def test_one_group_weight_on_whole_rows_matches_one_row_per_group(device):
