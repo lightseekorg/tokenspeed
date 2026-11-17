@@ -64,7 +64,9 @@ def test_off_leaves_the_monitor_uninstalled(monkeypatch, uninstall):
     assert compile_monitor.is_serving()
 
 
-def test_off_still_caches_cute_dsl_binaries(monkeypatch, uninstall, tmp_path):
+def test_off_still_installs_the_cute_dsl_compile_cache(
+    monkeypatch, uninstall, tmp_path
+):
     pytest.importorskip("cutlass")
     monkeypatch.setenv("TOKENSPEED_JIT_COMPILE_CHECK", "off")
     jit_compile_check.install_jit_compile_check()

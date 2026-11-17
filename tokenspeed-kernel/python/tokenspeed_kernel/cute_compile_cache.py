@@ -44,9 +44,10 @@ it to ``$XDG_CACHE_HOME/tokenspeed/cute-dsl`` (``~/.cache`` without
 cutlass-dsl's own default under ``$TMPDIR`` starts empty in every new container.
 A directory that cannot be written leaves the cache off. Like Triton's cache it
 is never pruned. A cached compilation is not kept in cutlass-dsl's in-memory
-cache, so callers own their compiled functions as with plain ``cute.compile``. cutlass-dsl writes entries
-atomically (a temporary directory, then a rename) and ignores, with a warning,
-an entry that fails its CRC or does not load; that kernel is recompiled.
+cache, so callers own their compiled functions as with plain ``cute.compile``.
+cutlass-dsl writes entries atomically (a temporary directory, then a rename)
+and ignores, with a warning, an entry that fails its CRC or does not load; that
+kernel is recompiled.
 cutlass-dsl's own helpers (``HardwareInfo``) are not cached: their traces carry
 process addresses, so their keys never repeat.
 
@@ -249,7 +250,8 @@ class _Cache:
     def _applies(dsl: Any, call: dict[str, Any]) -> bool:
         # Only what cute.compile forced uncached; CUTE_DSL_* switches cover every
         # DSL. Kept PTX/CUBIN/SASS, from the environment or the compile options,
-        # are files a hit would not write, so those compilations run afresh.
+        # and remark output are files a hit would not write, so those
+        # compilations run afresh.
         envar = dsl.envar
         options = dsl.compile_options
         func = call.get("funcBody")
@@ -267,6 +269,7 @@ class _Cache:
             or options.dump_ptx_path is not None
             or options.dump_cubin_path is not None
             or options.dump_sass_path is not None
+            or options.remark_output
         ):
             return False
         _share_cache_dir(dsl.name)
@@ -333,8 +336,8 @@ def _unsupported(base_dsl: type, compile_and_cache: Any, version: str) -> str | 
 
     if not callable(getattr(cache_helpers, "get_default_generated_ir_path", None)):
         return "cutlass-dsl's get_default_generated_ir_path is missing"
-    if not isinstance(getattr(cache_helpers.JitCacheDict(), "_dict", None), dict):
-        return "cutlass-dsl's JitCacheDict no longer keeps its entries in _dict"
+    if not callable(getattr(cache_helpers.JitCacheDict, "delete", None)):
+        return "cutlass-dsl's JitCacheDict.delete is missing"
     return None
 
 
@@ -418,9 +421,7 @@ def _prepare_cache_dir() -> str | None:
 
 def _forget_in_memory(dsl: Any, key: str) -> None:
     """Drop ``key`` from cutlass-dsl's in-memory cache, detaching its finalizer."""
-    entry = dsl.jit_cache._dict.pop(key, None)
-    if entry is not None and entry[1] is not None:
-        entry[1].detach()
+    dsl.jit_cache.delete(key)
 
 
 def _tvm_ffi_spec(dsl: Any, call: dict[str, Any]) -> str | None:
