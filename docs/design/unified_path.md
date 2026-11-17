@@ -2850,171 +2850,70 @@ reserved write extent. The sampled path currently requires attention TP1.
 
 ## DSpark confidence verification
 
-Qwen4-Exp targets can use a separate DSpark checkpoint whose capture contract
-is the FP32 mean of the four HC branches at the requested layer inputs. The
-draft configures these taps before cache construction through
-`TargetCaptureConfigurator`; the target materializes a deferred residual
-before capturing it. The drafter loads its own Markov and scalar confidence
-heads and shares the target embedding and LM head.
+Qwen4-Exp targets can use a separate DSpark checkpoint. The draft configures
+its input taps through `TargetCaptureConfigurator`, before cache construction;
+the target materializes deferred residuals and captures the FP32 mean of its
+four HC branches. The confidence head consumes final-normalized draft hidden
+states and the previous-token Markov latent.
 
-The experimental `--speculative-verify-policy confidence` selects a per-round
-query budget.
-The `history` policy uses the same graph stages and cost planner, with completed
-acceptance history estimating the budget's output. It keeps an EMA of each
-request's prefix-survival probabilities with observation weight 0.25. A
-rejection identifies every longer prefix as unsuccessful; a fully accepted
-budget leaves its longer prefixes unknown. For that unknown tail, the latest
-available N-2 model probabilities extrapolate from the empirical prefix, so
-the cost planner can expand when the expected output gain pays for the time.
-The observed-only curve is also scored to report how often tail prediction
-actually increases Q. A full-window success has no unknown tail.
+`--speculative-verify-policy confidence` chooses Q from completed probabilities.
+`history` uses the same planner with a per-request EMA of prefix survival
+(weight 0.25). Rejection marks longer prefixes unsuccessful; full acceptance
+leaves the unseen tail unknown. Model confidence extrapolates that tail, so a
+short budget can grow when predicted output pays for the extra time.
 
-History is keyed by candidate generation: a sample publishing generation G
-reports acceptance of G-1. Selection uses the newest completed acceptance no
-newer than N-2, without waiting for a later CUDA event. Four immutable EMA
-snapshots bound the host cache, and diagnostics report the actual generation
-lag and history coverage. Missing history falls back to the existing model
-scores or empirical prior. Recompute and request-slot reuse discard history
-with the other expendable host feedback. Device prefix allocation still uses
-the latest confidence for both policies; no additional device state or graph
-ladder is introduced.
+Host feedback is expendable. It keys request lifetimes by scheduler admission
+ID and checks a device generation published with candidate scores. Generation
+N uses only completed N-2 feedback, without waiting for N-1. Acceptance in a
+packet describes its predecessor, so history can be older. Slot reuse and
+recompute invalidate feedback; restoration can rebase its generation. Both
+score generations and the device counter live in `RuntimeStates` and are
+imaged by `SlotStateExporter`. The latest GPU scores allocate this round's
+prefixes; missing host scores use observed conditional acceptance with a
+Beta(1, 1) cold prior.
 
-The C++ `ConfidenceBudgetPlanner` scores `(request capacity, query capacity)`
-budgets by expected committed tokens per round. These are cost-model keys,
-not graph keys: target execution and verification are captured by query capacity
-Q, and draft execution and state commit independently by request capacity B. The query ladder is
-the deduplicated union of the configured request capacities times 1..width.
-For request capacities `[1, 2, 4, 8, 16]` and width 8, this is 24 target graphs
-plus 5 draft graphs, rather than 40 complete-round graphs.
-Startup composes the independently timed target and draft stages. Completed
-whole-round feedback replaces those estimates online and includes metadata
-refresh and submission overhead. The complete forward is warmed at startup
-before capturing its two stages.
-Rank zero selects the bucket and agrees it over a named host group managed by
-the existing process-group manager. Its forward-thread broadcasts cannot share
-the event loop's request-broadcast sequence.
-Online feedback is bounded and asynchronous: only completed CUDA events are
-read. A budget for draft generation N uses generation N-2, tagged by request
-lifetime and checked against a device counter published beside the scores.
-The host key is the scheduler admission ID, so a reused client request ID
-cannot inherit another admission's feedback.
-Feedback copies the newly published scores; host selection defers their use by
-generation. Copying only the previous scores would unnecessarily wait for one
-additional forward to complete. Previous scores travel in the same sample only
-to compare the just-verified candidates with their actual acceptance.
-The counter is reset and imaged with the candidate state. A restored request
-can rebase the host's expendable counter against its first completed sample.
-Scores survive rounds that omit a request; reusing its slot evicts them, and
-prefill invalidates pending samples from before recomputation. Missing or
-wrong-generation scores use measured per-position conditional acceptance,
-with a Beta(1, 1) cold-start prior, rather than assuming perfect acceptance.
-The latest device
-confidence allocates contiguous prefixes inside that budget. Ties use request
-then position order. A fresh request verifies only its anchor.
-The drafter broadcasts rank zero's scores on the device group before publishing
-them. Local floating-point differences must not change per-request prefixes
-across ranks: different acceptance lengths would split their scheduler state.
+`VerifyBudgetPlanner` shares prefix rewards with the ordinary `VerifyBudgetPolicy`.
+It chooses expected committed tokens per time, preferring smaller Q on ties.
+Startup costs compose target and draft timings; completed whole-round timings
+correct those costs, including unvisited Q buckets. Budget keys `(B,Q)` are
+cost keys, not graph keys. Rank zero chooses and agrees the budget over a
+separate host group; the event loop holds no confidence tensors.
 
-All captured Q values in the feasible request range compete on expected output
-per time, including graphs captured for another request capacity. Startup costs
-are baselines, separate from completed live timings. The last 5,000 live samples
-estimate a nonnegative per-query correction to the full startup curve: each Q
-with at least ten samples contributes its median, and their median is applied
-to every Q. This prevents unvisited large graphs from retaining empty-cache
-costs. Each graph also retains its last nine live samples. Completed feedback
-reports allocated and effective queries, padding, predicted and accepted lengths
-for the same requests, and conditional confidence error. Acceptance is copied
-before stop truncation, and positions after the first mismatch are censored.
-The SpecForge DSpark head consumes the draft's final-normalized hidden state
-and the previous-token Markov latent; target-layer taps are a separate input.
+Target execution and verification are captured by Q, and draft execution plus
+accepted-state commit by B. Q is the union of capture batch sizes times 1..width;
+for `[1,2,4,8,16]` and width 8, that means 24 target and 5 draft graphs.
+Warmup, ordinary capture and stage capture share the runner's context, sampling
+and grammar setup. Eager forwards run the same executor stages.
 
-`VerifyQueryLayout` owns persistent prefix lengths, offsets, request/column
-indices and bidirectional row maps. A target graph's request capacity is
-`min(max_capture_bs, Q)`, determined by Q alone; inactive requests have zero
-query lengths and null state destinations. The actual request count remains
-on the outer forward. Qwen4-Exp packs model inputs once and keeps the static
-query bucket through HC, attention, GDN, PLE and MLP. The body returns compact
-hidden states and taps. With a compact-capable sampler, the common model exit
-keeps Q rows through the LM head and argmax. Bucket filler is zeroed before
-projection, and verification reads each request's predictions directly through
-device prefix offsets. It emits at most that prefix's length, including its
-target correction or bonus token; zero-length requests emit nothing. The final
-token buffers retain the maximum request window for stop processing and state
-commit. NaN attribution, grammar masks and optional scalar logprobs use the
-same row maps without expanding vocabulary scores.
+`VerifyQueryLayout` owns persistent lengths, offsets and row maps. Q determines
+the target request capacity, `min(max_capture_bs,Q)`; inactive requests have
+zero lengths. The target keeps Q rows through its body, LM head and argmax.
+The shared packed verifier reads prefix offsets and emits ordinary maximum-width
+token buffers. Grammar, NaN attribution and scalar diagnostics use the same maps.
+Only target taps, tokens and lengths cross the stage boundary; handoff buffers
+have no vocabulary dimension or request-slot ownership.
 
-The greedy sampler supports this compact interface. Other samplers and
-synthetic-acceptance benchmarks retain their existing maximum-window score
-layout. Confidence layouts and adaptive V4.1 verification share the packed
-greedy verifier: device prefix offsets address predictions directly, while the
-same chain kernel retains sampled row-decision verification. DSpark publishes
-confidence after its proposal walk, so fused greedy walks and ordinary walks
-both record the actual predecessor tokens and advance the same generation.
-Both eager and graph forwards call the same executor stages. The Q
-graph includes prefix selection, target body, LM head and argmax, NaN audit,
-grammar masking, verification, optional scalar diagnostics and stop processing.
-Returned taps are concatenated while compact, expanded to the Q graph's request
-capacity and copied with tokens and lengths into persistent handoff buffers.
-Those buffers have no vocabulary dimension and do not retain request-slot state.
+The B graph reads those buffers at fixed addresses and performs context
+projection, KV writes, drafting, confidence publication, state commit and
+frontier advance. Commits run once, after drafting. GDN and PLE copy scheduler
+state tables into persistent buffers during refresh; `prepare_state_commit_capture`
+arms null destinations before capture. Target metadata is refreshed for Q and
+then B. Metadata delivery, input/output transfers, host budget selection and
+feedback remain outside both graphs. Explicit temporary inputs run the same
+stages eagerly. Filler rows have null destinations and zero acceptance and
+never contribute to expert-load accounting.
 
-The B graph reads a prefix of those buffers at fixed addresses, independently of
-Q. It includes context projection and KV writes, draft input preparation, native
-draft execution, confidence and candidate publication, accepted-state commit and
-frontier advance. Context projection remains outside the target graph; its B
-bucket can be smaller than the Q graph's request capacity. Padding has null
-cache destinations and zero accepted lengths. The outer forward slices tokens,
-lengths and scalar diagnostics back to the actual request count.
+The prologue gathers selected write slots. QSA stages keys by original
+request/column; MHA and TRT-LLM use causal lengths per compact row. Unsupported
+leaves reject this layout before capture. GDN convolution and recurrence read
+device offsets; supported output-only 128-wide heads with windows up to sixteen
+use the same CuTe WY kernel as uniform verification. Replay payloads and state
+commit retain maximum width. PLE uses the same request/column map and ignores
+filler. Cache admission and rollback always reserve the maximum window.
 
-Accepted-state commits run once after drafting, through the runner's common
-completion hook. GDN and PLE copy delivered state block tables into persistent
-metadata during refresh, so a commit graph never binds a transient scheduler
-table. Before capturing a B graph, `prepare_state_commit_capture` arms null-page
-commit inputs through the backend tree; ordinary idle refresh stays disarmed.
-Capture therefore records commit kernels even though no request is live.
-
-Metadata delivery and refresh, host budget selection and feedback, input uploads
-and output D2H remain outside the graphs. Target metadata is refreshed to the Q
-capacity before its graph and to the B capacity before the draft/commit graph.
-Temporary position tensors, multimodal overrides, explicit decode IDs or
-nonpersistent sampling inputs use the same stages eagerly so supplied arguments
-remain effective. Views of the persistent position buffers remain capturable.
-Neither stage changes cache ownership or the accepted-prefix commit protocol.
-Expert load counters map that same device-validity mask through the ordinary
-TP partition and MoE group order, so filler rows never affect placement feedback.
-
-The attention prologue gathers write slots in the selected order. QSA derives
-logical positions from the original window start and stages each key at its
-original request/column, while sparse attention consumes per-query physical
-slots. Dense MHA and TRT-LLM decode use one causal cache length per compact row.
-Unsupported paged leaves reject compact verification before capture.
-
-GDN convolution and recurrence read device offsets, skip empty requests and
-compute only selected prefixes. Output-only GDN verification with 128-wide
-heads and request widths up to sixteen uses the same CuTe WY kernel as uniform
-verification. It reads packed Q/K/V directly and clears graph filler in that
-launch; unsupported geometry and state-writing verification retain the portable
-recurrence. State destinations retain maximum verify
-width. ReplaySSM writes raw k/v/a/b into that same request-major layout so the
-existing accepted-prefix commit reconstructs the selected state. PLE reuses the
-device request/column map for hashing, lookup and dilated convolution; negative
-columns denote filler and never write context or convolution checkpoints.
-Cache allocation, rollback capacity and commit protocols remain maximum-width.
-
-Acceptance is limited to the selected prefix before stop conditions, frontier
-updates, draft anchoring or state commit. Cache admission still reserves the
-maximum verify window. Both confidence generations live with candidates in
-`RuntimeStates`, are reset on slot admission and are imaged by
-`SlotStateExporter` on retraction. Host feedback is an expendable cost-model
-cache and never reconstructs device request state.
-
-The policy currently requires NVIDIA, a Qwen4-Exp target, a separate DSpark
-checkpoint with complete confidence weights, and one attention-DP/pipeline
-rank. PD, trees and draft-prob rejection sampling are rejected at startup.
-Mixed and prefill rounds retain full-width execution and produce confidence
-for the next decode. Unspecified legacy launch policies resolve explicitly to
-`fixed` at argument normalization. Single-GPU and TP2/EP2 smoke runs cover
-adaptive graphs, reuse of Q=8 as request counts change, and compact eager
-verification with graph metadata identity checks enabled. Full-budget
-and adaptive output parity acceptance, distributed performance and multimodal
-validation remain outstanding. Serving with automatic kernel selection does not
-establish batch-invariant target numerics.
+The adaptive scope remains NVIDIA Qwen4-Exp, a separate DSpark checkpoint with
+complete confidence weights, greedy chains and attention DP=1/PP=1. PD, trees
+and draft-probability rejection sampling are rejected. Mixed/prefill rounds
+retain full width. Full-checkpoint token/state equivalence and multimodal
+validation remain outstanding; automatic kernel selection does not establish
+batch-invariant target numerics.

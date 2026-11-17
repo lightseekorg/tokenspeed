@@ -826,6 +826,66 @@ class ForwardStepRunner:
             decode_width=self.max_tokens_per_req,
         )
 
+    def _queue_capture_grammar(self, ctx: ForwardContext) -> None:
+        if self.capturable_grammar is not None:
+            self.capturable_grammar.add_batch(
+                grammars=[None] * ctx.bs,
+                bs=ctx.bs,
+                has_candidates=False,
+                output_layout=ctx.output_layout,
+            )
+
+    def _capture_context(
+        self, bs: int, *, queries: VerifyQueryLayout | None
+    ) -> ForwardContext:
+        """One dummy decode layout for warmup, round graphs and stage graphs."""
+        ctx = ForwardContext(
+            attn_backend=self.attn_backend,
+            token_to_kv_pool=self.token_to_kv_pool,
+            bs=bs,
+            num_extends=0,
+            output_layout=ForwardOutputLayout(0, 0, bs, self.max_tokens_per_req),
+            input_num_tokens=bs * self.max_tokens_per_req,
+            forward_mode=ForwardMode.DECODE,
+            all_decode_or_idle=True,
+            capture_hidden_mode=(
+                CaptureHiddenMode.FULL
+                if self.drafter is not None
+                else CaptureHiddenMode.NULL
+            ),
+            verify_queries=queries,
+        )
+        if self.dp_size > 1 and not self.dp_local_graph:
+            # Match serving's collective geometry, including draft step zero.
+            ctx.global_num_tokens = [bs * self.max_tokens_per_req] * self.world_size
+            ctx.global_bs = [bs] * self.world_size
+            ctx.global_num_decodes = [bs] * self.world_size
+        return ctx
+
+    def _capture_sampling_info(self, bs: int) -> SamplingBatchInfo:
+        from tokenspeed.runtime.grammar.capturable_grammar import bind_grammar_mask_buf
+
+        states = self.runtime_states
+        info = SamplingBatchInfo(
+            req_pool_indices=self.input_buffers.req_pool_indices_buf[:bs],
+            valid_cache_lengths=(
+                states.valid_cache_lengths if states is not None else None
+            ),
+            draft_probs=states.draft_probs if states is not None else None,
+            draft_q=states.future_draft_q if states is not None else None,
+            vocab_size=self.vocab_size,
+            device=self.device,
+        )
+        bind_grammar_mask_buf(
+            info,
+            self.eager_grammar_buffers,
+            bs,
+            spec=self.drafter is not None,
+            capturable=self.capturable_grammar,
+            grammar_backend=self.grammar_backend,
+        )
+        return info
+
     def _capture_one(
         self,
         bs: int,
@@ -841,86 +901,8 @@ class ForwardStepRunner:
         graph = graph_cls()
         self._prepare_request_token_history_graph_inputs(active_bs=0, padded_bs=bs)
 
-        capture_forward_mode = ForwardMode.DECODE
-        ctx = ForwardContext(
-            attn_backend=self.attn_backend,
-            token_to_kv_pool=self.token_to_kv_pool,
-            bs=bs,
-            num_extends=0,
-            output_layout=ForwardOutputLayout(0, 0, bs, self.max_tokens_per_req),
-            input_num_tokens=bs * self.max_tokens_per_req,
-            forward_mode=capture_forward_mode,
-            # A decode graph is only ever replayed when every DP rank is
-            # decoding or idle (see _can_use_graph), so capture must record that
-            # same answer. Leaving the default False would let capture-time code
-            # take a different path than replay -- for DeepEP MoE that means
-            # recording the normal-mode legs, whose host-side receive counts
-            # cannot be captured at all.
-            all_decode_or_idle=True,
-            capture_hidden_mode=(
-                CaptureHiddenMode.FULL
-                if self.drafter is not None
-                else CaptureHiddenMode.NULL
-            ),
-        )
-
-        # For DP mode, global_num_tokens must be set so that the MoE
-        # all-gather comm layers know token counts for all DP ranks.
-        # During capture, use uniform dummy counts across ranks.
-        if self.dp_size > 1 and not self.dp_local_graph:
-            ctx.global_num_tokens = [bs * self.max_tokens_per_req] * self.world_size
-            # global_bs must ALSO be set at capture. The draft first step's
-            # collective sizing (reported via report_collective_sizing) reads
-            # global_bs; if left None at capture it records a single-rank
-            # layout (fallback branch in comm_manager), but at replay global_bs
-            # is the live per-rank batch list -> multi-rank layout. The mismatch
-            # makes the captured (frozen-offset) gather read uninitialized
-            # symm-mem -> NaN draft logits -> accept_rate 0. Set the matching
-            # uniform dummy.
-            ctx.global_bs = [bs] * self.world_size
-            ctx.global_num_decodes = [bs] * self.world_size
-
-        # The sampler has a single pool-indexed route: greedy requests are
-        # served by top_k=1 in the pool buffers, so capture and every replay
-        # record the same top_k_top_p sampling path.
-        ibd = self.input_buffers
-        sampling_info = SamplingBatchInfo(
-            req_pool_indices=ibd.req_pool_indices_buf[:bs],
-            valid_cache_lengths=(
-                self.runtime_states.valid_cache_lengths
-                if self.runtime_states is not None
-                else None
-            ),
-            draft_probs=(
-                self.runtime_states.draft_probs
-                if self.runtime_states is not None
-                else None
-            ),
-            draft_q=(
-                self.runtime_states.future_draft_q
-                if self.runtime_states is not None
-                else None
-            ),
-            vocab_size=self.vocab_size,
-            device=self.device,
-        )
-
-        from tokenspeed.runtime.grammar.capturable_grammar import (
-            bind_grammar_mask_buf,
-        )
-
-        # Bind whichever grammar buffer is active so the captured sampler
-        # records the apply_vocab_mask call. At replay, runtime fills the
-        # bound buffer in place (host node for capturable, sync H2D for
-        # eager) — the captured graph reads from the same memory.
-        bind_grammar_mask_buf(
-            sampling_info,
-            self.eager_grammar_buffers,
-            bs,
-            spec=self.drafter is not None,
-            capturable=self.capturable_grammar,
-            grammar_backend=self.grammar_backend,
-        )
+        ctx = self._capture_context(bs, queries=None)
+        sampling_info = self._capture_sampling_info(bs)
 
         _, query_tokens = self._split_query_variant(variant, bs)
         adaptive_layout = (
@@ -940,13 +922,7 @@ class ForwardStepRunner:
         def run_once():
             # Dummy add_batch keeps grammar batches 1:1 with replays: the
             # host node pops one batch per forward.
-            if self.capturable_grammar is not None:
-                self.capturable_grammar.add_batch(
-                    grammars=[None] * bs,
-                    bs=bs,
-                    has_candidates=False,
-                    output_layout=ctx.output_layout,
-                )
+            self._queue_capture_grammar(ctx)
             return self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
 
         global _is_cuda_graph_phase
@@ -1060,69 +1036,15 @@ class ForwardStepRunner:
                 self._prepare_request_token_history_graph_inputs(
                     active_bs=0, padded_bs=bs
                 )
-                ctx = ForwardContext(
-                    attn_backend=self.attn_backend,
-                    token_to_kv_pool=self.token_to_kv_pool,
-                    bs=bs,
-                    num_extends=0,
-                    output_layout=ForwardOutputLayout(
-                        0, 0, bs, self.max_tokens_per_req
-                    ),
-                    input_num_tokens=bs * self.max_tokens_per_req,
-                    forward_mode=ForwardMode.DECODE,
-                    # Match _capture_one: the lazy state this warms up (DeepEP
-                    # buffers among it) must be the state capture will record.
-                    all_decode_or_idle=True,
-                    capture_hidden_mode=(
-                        CaptureHiddenMode.FULL
-                        if self.drafter is not None
-                        else CaptureHiddenMode.NULL
-                    ),
-                )
-                if self.segmented_decode is not None:
-                    ctx.verify_queries = self.query_layout(
-                        bs, bs * self.max_tokens_per_req
-                    )
-                if self.dp_size > 1 and not self.dp_local_graph:
-                    ctx.global_num_tokens = [
-                        bs * self.max_tokens_per_req
-                    ] * self.world_size
-                    ctx.global_bs = [bs] * self.world_size
-                    ctx.global_num_decodes = [bs] * self.world_size
-
-                sampling_info = SamplingBatchInfo(
-                    req_pool_indices=self.input_buffers.req_pool_indices_buf[:bs],
-                    valid_cache_lengths=(
-                        self.runtime_states.valid_cache_lengths
-                        if self.runtime_states is not None
-                        else None
-                    ),
-                    draft_probs=(
-                        self.runtime_states.draft_probs
-                        if self.runtime_states is not None
-                        else None
-                    ),
-                    draft_q=(
-                        self.runtime_states.future_draft_q
-                        if self.runtime_states is not None
-                        else None
-                    ),
-                    vocab_size=self.vocab_size,
-                    device=self.device,
-                )
-
-                from tokenspeed.runtime.grammar.capturable_grammar import (
-                    bind_grammar_mask_buf,
-                )
-
-                bind_grammar_mask_buf(
-                    sampling_info,
-                    self.eager_grammar_buffers,
+                ctx = self._capture_context(
                     bs,
-                    spec=self.drafter is not None,
-                    capturable=self.capturable_grammar,
-                    grammar_backend=self.grammar_backend,
+                    queries=(
+                        self.query_layout(bs, bs * self.max_tokens_per_req)
+                        if self.segmented_decode is not None
+                        else None
+                    ),
                 )
+                sampling_info = self._capture_sampling_info(bs)
 
                 self.device_module.synchronize()
                 dist.barrier()
@@ -1130,13 +1052,7 @@ class ForwardStepRunner:
                     bs=bs,
                     variant=CUDA_GRAPH_VARIANT_DEFAULT,
                 )
-                if self.capturable_grammar is not None:
-                    self.capturable_grammar.add_batch(
-                        grammars=[None] * bs,
-                        bs=bs,
-                        has_candidates=False,
-                        output_layout=ctx.output_layout,
-                    )
+                self._queue_capture_grammar(ctx)
                 self.input_buffers.seq_lens_buf[:bs].fill_(self.max_tokens_per_req)
                 self._init_capture_metadata(bs)
                 self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)

@@ -21,9 +21,9 @@
 """Acceptance-history budgets through real forecasts and the native planner."""
 
 import pytest
-from tokenspeed_engine.scheduler import ConfidenceBudgetPlanner
 
 from tokenspeed.runtime.execution.confidence_history import AcceptanceHistory
+from tokenspeed.runtime.execution.drafter.verify_budget import VerifyBudgetPlanner
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
@@ -51,7 +51,7 @@ def test_same_length_distinguishes_rejection_from_budget_limit(censored):
     history = AcceptanceHistory(6, observation_weight=0.25)
     history.observe(1, queries=3 if censored else 6, accepted=3)
     forecast = history.forecast([0.9] * 5, maximum_generation=1)
-    planner = ConfidenceBudgetPlanner(6)
+    planner = VerifyBudgetPlanner(6)
     for queries, cost in [(3, 1.0), (4, 1.1), (6, 3.0)]:
         planner.set_baseline(1, queries, cost)
     assert planner.select(1, [forecast.observed_rates]) == 3
@@ -65,7 +65,7 @@ def test_anchor_only_budget_recovers_after_a_previous_rejection():
     forecast = history.forecast([0.9] * 5, maximum_generation=2)
     assert forecast.censored
     assert forecast.rates == pytest.approx([0.9] * 5)
-    planner = ConfidenceBudgetPlanner(6)
+    planner = VerifyBudgetPlanner(6)
     planner.set_baseline(1, 1, 1.0)
     planner.set_baseline(1, 6, 1.5)
     assert planner.select(1, [forecast.rates]) == 6

@@ -203,8 +203,6 @@ class SamplingBackend(ABC):
     # Packed target rows use query_start_loc CSR offsets; candidates and
     # outputs retain their fixed per-request width (see verify()).
     supports_packed_verify: bool = False
-    # Compact logits carry their persistent query layout with the scores.
-    supports_compact_verify: bool = False
 
     # Subclasses that hold per-pool-idx state (scalars like temperature /
     # top_k, plus large rows like _counts / _logit_bias) flip this to True

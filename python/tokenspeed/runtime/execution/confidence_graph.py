@@ -35,20 +35,11 @@ import torch.distributed as dist
 from tokenspeed_kernel.workspace import capture_session
 
 from tokenspeed.runtime.execution.context import ForwardContext
-from tokenspeed.runtime.execution.cudagraph_memory import (
-    CapturedLadder,
-    probe_positions,
-)
-from tokenspeed.runtime.execution.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardMode,
-)
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.graph_ptr_guard import (
     snapshot_graph_metadata,
     verify_graph_metadata,
 )
-from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
-from tokenspeed.runtime.grammar.capturable_grammar import bind_grammar_mask_buf
 from tokenspeed.runtime.layers.logits_processor_output import LogitsProcessorOutput
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -164,14 +155,6 @@ class ConfidenceDecodeGraphs:
             "drafter": sorted(self.runner.capture_bs, reverse=True),
         }
 
-    def capture_ladders(self, entries: int | None) -> dict[str, CapturedLadder]:
-        return {
-            f"decode:{name}": CapturedLadder(
-                sizes, probe_positions(len(sizes), entries)
-            )
-            for name, sizes in self.capture_plan.items()
-        }
-
     def bind_round(
         self,
         ctx: ForwardContext,
@@ -223,40 +206,6 @@ class ConfidenceDecodeGraphs:
             block_tables=draft.round_block_tables,
             num_extends=0 if draft.attention_kind == "kimi_mla" else bs,
         )
-
-    def _context(self, capacity: int, queries: int) -> ForwardContext:
-        return ForwardContext(
-            attn_backend=self.runner.attn_backend,
-            token_to_kv_pool=self.runner.token_to_kv_pool,
-            bs=capacity,
-            num_extends=0,
-            input_num_tokens=capacity * self.width,
-            forward_mode=ForwardMode.DECODE,
-            output_layout=ForwardOutputLayout(0, 0, capacity, self.width),
-            capture_hidden_mode=CaptureHiddenMode.FULL,
-            all_decode_or_idle=True,
-            verify_queries=self.runner.query_layout(capacity, queries),
-        )
-
-    def _sampling_info(self, capacity: int) -> SamplingBatchInfo:
-        runner = self.runner
-        states = runner.runtime_states
-        info = SamplingBatchInfo(
-            req_pool_indices=runner.input_buffers.req_pool_indices_buf[:capacity],
-            valid_cache_lengths=states.valid_cache_lengths,
-            draft_probs=states.draft_probs,
-            vocab_size=runner.vocab_size,
-            device=runner.device,
-        )
-        bind_grammar_mask_buf(
-            info,
-            runner.eager_grammar_buffers,
-            capacity,
-            spec=True,
-            capturable=runner.capturable_grammar,
-            grammar_backend=runner.grammar_backend,
-        )
-        return info
 
     @staticmethod
     def _same_sampling_inputs(
@@ -376,16 +325,6 @@ class ConfidenceDecodeGraphs:
             self.runner.commit_forward(ctx, result)
         return live_graph_outputs(result, ctx.bs, self.width)
 
-    def _queue_grammar(self, ctx: ForwardContext) -> None:
-        grammar = self.runner.capturable_grammar
-        if grammar is not None:
-            grammar.add_batch(
-                grammars=[None] * ctx.bs,
-                bs=ctx.bs,
-                has_candidates=False,
-                output_layout=ctx.output_layout,
-            )
-
     def _capture(
         self,
         run: Callable,
@@ -444,7 +383,7 @@ class ConfidenceDecodeGraphs:
     def capture(self, *, entries: int | None, observer: MemoryDeltaObserver) -> None:
         runner = self.runner
         logger.info(f"Capturing confidence stages: {self.capture_plan}")
-        ladders = self.capture_ladders(entries)
+        ladders = runner.capture_ladders(entries)
         draft_sizes = self.capture_plan["drafter"]
         runner.warmup_decode_path(
             tuple(draft_sizes[index] for index in ladders["decode:drafter"].sampled),
@@ -460,16 +399,19 @@ class ConfidenceDecodeGraphs:
                     batch_size=capacity, total_tokens=capacity * self.width
                 )
                 runner.input_buffers.seq_lens_buf[:capacity].fill_(self.width)
-                ctx = self._context(
-                    capacity, size if name == "target" else capacity * self.width
+                ctx = runner._capture_context(
+                    capacity,
+                    queries=runner.query_layout(
+                        capacity, size if name == "target" else capacity * self.width
+                    ),
                 )
                 if name == "target":
-                    info = self._sampling_info(capacity)
+                    info = runner._capture_sampling_info(capacity)
                     run = lambda ctx=ctx, info=info: self._publish_target(ctx, info)
                     prepare = lambda capacity=capacity: self._refresh_target(
                         capacity, capture=True
                     )
-                    before_run = lambda ctx=ctx: self._queue_grammar(ctx)
+                    before_run = lambda ctx=ctx: runner._queue_capture_grammar(ctx)
                     backends = {"target": runner.attn_backend}
                 else:
                     info = None

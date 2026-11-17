@@ -269,6 +269,8 @@ class _Runner(ForwardStepRunner):
         self.capture_bs = [1, 2, 4]
         self.max_capture_bs = 4
         self.max_decode_bs = 8
+        self.disable = False
+        self.dp_size = self.world_size = 1
         self.dp_local_graph = False
         self.device = "cuda"
         self.vocab_size = 16
@@ -377,7 +379,7 @@ def _inputs(executor, runner, slots, *, queries, step, graph):
     runner.segmented_decode.bind_round(
         ctx, actual_bs=batch, block_tables={}, use_graph=graph
     )
-    info = runner.segmented_decode._sampling_info(batch)
+    info = runner._capture_sampling_info(batch)
     return ctx, info
 
 

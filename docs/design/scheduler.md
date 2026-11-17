@@ -2144,14 +2144,3 @@ retirement, then for any outstanding local forward. Repeated cancellation
 cannot restart a transfer wait after its retirement event has arrived. Destroying
 the request destroys this state, so reusing a client request ID cannot inherit
 an old abort.
-
-
-## Confidence verification budgets
-
-`ConfidenceBudgetPlanner` is a host-only cost model for DSpark verify rounds.
-Its inputs are completed older confidence scores and a measured full-round
-latency per `(request capacity, query capacity)` graph. It maximizes expected
-committed tokens per time and chooses the smaller bucket on ties. It does not
-change admission, block ownership or the maximum reserved decode window.
-The forward runner applies the selected budget to the latest device scores;
-the event loop holds no confidence tensors and issues no new GPU work.

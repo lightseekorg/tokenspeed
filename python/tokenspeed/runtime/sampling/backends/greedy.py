@@ -56,7 +56,6 @@ def _verify_chain_greedy_torch(
     target_predict: torch.Tensor,  # [bs, N] int64 (argmax output)
     batch_size: int,
     num_draft_tokens: int,
-    query_start_loc: torch.Tensor | None = None,
 ) -> None:
     """Pure-torch equivalent of tokenspeed_kernel.verify_chain_greedy.
 
@@ -65,25 +64,14 @@ def _verify_chain_greedy_torch(
 
     bs = batch_size
     n = num_draft_tokens
-    pos = torch.arange(n, device=candidates.device).unsqueeze(0)
-    lengths = torch.full((bs,), n, device=candidates.device, dtype=torch.int64)
-    if query_start_loc is not None:
-        lengths = query_start_loc[1:] - query_start_loc[:-1]
-        rows = query_start_loc[:-1, None] + pos
-        flat = target_predict.reshape(-1)
-        # A sentinel also makes an entirely empty compact input safe to gather.
-        rows = torch.where(pos < lengths[:, None], rows, flat.numel())
-        flat = torch.cat((flat, flat.new_zeros(1)))
-        target_predict = flat.index_select(0, rows.flatten().long()).view(bs, n)
 
     # For i in 1..n-1: candidates[b, i] accepted iff it equals target_predict[b, i-1].
     # Accepted prefix length per row = longest-leading-1s of the match array.
-    match = (candidates[:, 1:] == target_predict[:, :-1].to(candidates.dtype)) & (
-        pos[:, 1:] < lengths[:, None]
-    )
+    match = candidates[:, 1:] == target_predict[:, :-1].to(
+        candidates.dtype
+    )  # [bs, n-1]
     leading = torch.cumprod(match.to(torch.int32), dim=1)  # [bs, n-1]
     num_accepted = leading.sum(dim=1).to(torch.int32)  # [bs]
-    num_accepted = torch.where(lengths > 0, num_accepted, -1)
 
     # Fill all of `predicts` with target_predict; slots outside the accepted
     # prefix are harmless because accept_index keeps them at -1 and callers
@@ -92,6 +80,7 @@ def _verify_chain_greedy_torch(
     predicts.copy_(target_predict.reshape(-1).to(torch.int32))
 
     device = candidates.device
+    pos = torch.arange(n, device=device).unsqueeze(0)  # [1, n]
     batch_off = torch.arange(bs, device=device).unsqueeze(1) * n  # [bs, 1]
     flat_idx = (batch_off + pos).to(torch.int32)  # [bs, n]
     valid = pos <= num_accepted.unsqueeze(1)  # [bs, n]
@@ -107,23 +96,7 @@ def _verify_chain_greedy(
     target_predict: torch.Tensor,
     batch_size: int,
     num_draft_tokens: int,
-    query_start_loc: torch.Tensor | None = None,
 ) -> None:
-
-    if query_start_loc is not None and candidates.is_cuda:
-        # The legacy CUDA ABI only describes uniform target windows. The shared
-        # portable verifier reads compact predictions through device offsets.
-        verify_chain_target_sampled(
-            predicts=predicts,
-            accept_index=accept_index,
-            accept_token_num=accept_token_num,
-            candidates=candidates,
-            target_sampled=target_predict,
-            write_rejected_targets=True,
-            query_start_loc=query_start_loc,
-        )
-        return
-
     # Prefer the CUDA kernel when available AND the tensors are on CUDA.
     if _verify_chain_greedy_cuda is not error_fn and candidates.is_cuda:
         # The CUDA kernel writes only accepted indices; other implementations
@@ -168,7 +141,6 @@ def _verify_chain_greedy(
         target_predict=target_predict,
         batch_size=batch_size,
         num_draft_tokens=num_draft_tokens,
-        query_start_loc=query_start_loc,
     )
 
 
@@ -224,17 +196,36 @@ def verify_packed_chain_greedy(
         accept_index.fill_(-1)
         accept_length.zero_()
         return
+    if candidates.is_cuda:
+        verify_chain_target_sampled(
+            predicts,
+            accept_index,
+            accept_length,
+            candidates,
+            target_predict,
+            write_rejected_targets=True,
+            query_start_loc=query_start_loc,
+        )
+        accept_length += 1
+        return
+    columns = torch.arange(width, device=candidates.device)[None, :]
+    rows = query_start_loc[:-1, None].to(torch.int64) + columns
+    expanded = target_predict[rows.clamp(0, target_predict.numel() - 1)]
+    expanded = torch.where(columns < lengths[:, None], expanded, -1)
     _verify_chain_greedy(
         predicts,
         accept_index,
         accept_length,
         candidates,
-        target_predict,
+        expanded,
         bs,
         width,
-        query_start_loc=query_start_loc,
     )
-    accept_length += 1
+    accept_length.copy_(torch.minimum(accept_length + 1, lengths))
+    accept_index.masked_fill_(columns >= accept_length[:, None], -1)
+    # The OOV guard audits the whole fixed output window, including unused
+    # columns. Keep those IDs valid; acceptance indices still mark them absent.
+    predicts.view(bs, width).masked_fill_(columns >= lengths[:, None], 0)
 
 
 class GreedySamplingBackend(SamplingBackend):
@@ -252,7 +243,6 @@ class GreedySamplingBackend(SamplingBackend):
     _SUPPORTS_SYNTHETIC_ACCEPTANCE = True
     _SUPPORTS_OUTPUT_CUMULATIVE_PROBS = True
     supports_tree_verify = True
-    supports_compact_verify = True
     supports_packed_verify = True
 
     def __init__(self, config: SamplingBackendConfig) -> None:
@@ -316,9 +306,22 @@ class GreedySamplingBackend(SamplingBackend):
         tree: TreeVerifyBatch | None,
         query_start_loc: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if query_start_loc is not None and logits_output.query_layout is not None:
-            raise ValueError("packed verification requires one query layout")
-        if query_start_loc is not None and (
+        bs, num_tokens_per_req = candidates.shape
+        query_layout = logits_output.query_layout
+        if query_layout is not None:
+            if query_start_loc is not None:
+                raise ValueError("packed verification requires one query layout")
+            if (
+                tree is not None
+                or query_layout.width != num_tokens_per_req
+                or query_layout.batch_size < bs
+                or self.config.synthetic_acceptance_length is not None
+            ):
+                raise ValueError(
+                    "compact greedy verification requires matching chain prefixes"
+                )
+            query_start_loc = query_layout.query_offsets[: bs + 1]
+        elif query_start_loc is not None and (
             tree is not None
             or sampling_info.vocab_mask is not None
             or self.config.synthetic_acceptance_length is not None
@@ -326,18 +329,6 @@ class GreedySamplingBackend(SamplingBackend):
             or self.config.enable_output_cumulative_probs
         ):
             raise ValueError("packed greedy verification requires plain chain sampling")
-        bs = candidates.shape[0]
-        num_tokens_per_req = candidates.shape[1]
-        query_layout = logits_output.query_layout
-        if query_layout is not None and (
-            tree is not None
-            or query_layout.width != num_tokens_per_req
-            or query_layout.batch_size < bs
-            or self.config.synthetic_acceptance_length is not None
-        ):
-            raise ValueError(
-                "compact greedy verification requires matching chain prefixes"
-            )
 
         predict = self._predict_buf[: bs * num_tokens_per_req]
         accept_index = self._accept_index_buf[: bs * num_tokens_per_req].view(
@@ -363,21 +354,17 @@ class GreedySamplingBackend(SamplingBackend):
             and not (query_layout is not None and sampling_info.vocab_mask is not None)
             else sampling_argmax(logits)
         )
-        if query_layout is None and query_start_loc is None:
+        if query_start_loc is None:
             target_predict = target_predict.reshape(bs, num_tokens_per_req)
 
-        if query_start_loc is not None or query_layout is not None:
+        if query_start_loc is not None:
             verify_packed_chain_greedy(
                 predict,
                 accept_index,
                 accept_length,
                 candidates.to(torch.int32),
                 target_predict,
-                (
-                    query_start_loc
-                    if query_layout is None
-                    else query_layout.query_offsets[: bs + 1]
-                ),
+                query_start_loc,
             )
         elif tree is not None:
             # The accepted path rides in accept_index so the TP broadcast below carries it.
@@ -398,11 +385,6 @@ class GreedySamplingBackend(SamplingBackend):
                 target_predict=target_predict,
                 batch_size=bs,
                 num_draft_tokens=num_tokens_per_req,
-                query_start_loc=(
-                    None
-                    if query_layout is None
-                    else query_layout.query_offsets[: bs + 1]
-                ),
             )
             # Retain normal verification cost before forcing benchmark acceptance.
             if self.config.synthetic_acceptance_length is not None:

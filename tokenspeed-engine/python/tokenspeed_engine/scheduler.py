@@ -47,7 +47,6 @@ AttnKind = _ext.AttnKind
 CacheGroupConfig = _ext.CacheGroupConfig
 CacheTransferPolicy = _ext.CacheTransferPolicy
 CapacityModel = _ext.CapacityModel
-ConfidenceBudgetPlanner = _ext.ConfidenceBudgetPlanner
 ExecutionEvent = _ext.ExecutionEvent
 ExecutionPlan = _ext.ExecutionPlan
 RequestSpec = _ext.RequestSpec
@@ -99,7 +98,6 @@ __all__ = [
     "CacheGroupConfig",
     "CacheTransferPolicy",
     "CapacityModel",
-    "ConfidenceBudgetPlanner",
     # Execution plan & operations
     "ExecutionPlan",
     "SchedulerAbort",

@@ -78,7 +78,6 @@ class VerifyQueryLayout:
         self.expanded_valid = torch.zeros(
             batch_size * width, dtype=torch.bool, device=device
         )
-        self._requests = torch.arange(batch_size, device=device)
         self._columns = torch.arange(width, device=device)
         self._queries = torch.arange(query_capacity, device=device)
 
@@ -129,7 +128,7 @@ class VerifyQueryLayout:
     def pack(self, values: torch.Tensor, *, token_dim: int) -> torch.Tensor:
         """Gather selected query rows; graph filler rows have zero values."""
         if token_dim == 0:
-            return self.pack_rows((values,))[0]
+            return gather_query_rows((values,), self.packed_rows, self.packed_valid)[0]
         result = values.index_select(token_dim, self.packed_rows.clamp_min(0))
         shape = [1] * result.ndim
         shape[token_dim] = self.query_capacity
@@ -153,17 +152,9 @@ class VerifyQueryLayout:
         shape[token_dim] = count * self.width
         return torch.where(valid.view(shape), result, torch.zeros_like(result))
 
-    def pack_rows(self, values: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
-        """Gather aligned model inputs in one launch."""
-        return gather_query_rows(values, self.packed_rows, self.packed_valid)
-
     def mask_compact_rows(self, values: torch.Tensor) -> torch.Tensor:
         """Zero bucket filler without reading its unspecified activations."""
         return gather_query_rows((values,), self._queries, self.packed_valid)[0]
-
-    def expand_rows(self, values: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
-        """Restore aligned model outputs in one launch."""
-        return gather_query_rows(values, self.expanded_rows, self.expanded_valid)
 
     def causal_metadata(
         self, seq_lens: torch.Tensor, page_table: torch.Tensor
@@ -219,11 +210,13 @@ class ConfidenceFeedback:
     def __init__(
         self, width: int, max_pending: int, max_batch_size: int, *, budget_policy: str
     ):
-        from tokenspeed_engine.scheduler import ConfidenceBudgetPlanner
+        from tokenspeed.runtime.execution.drafter.verify_budget import (
+            VerifyBudgetPlanner,
+        )
 
         if budget_policy not in ("confidence", "history"):
             raise ValueError("confidence budget policy must be confidence or history")
-        self.planner = ConfidenceBudgetPlanner(width)
+        self.planner = VerifyBudgetPlanner(width)
         self.budget_policy = budget_policy
         self.width = width
         self.max_pending = max_pending

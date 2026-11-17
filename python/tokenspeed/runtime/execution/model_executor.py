@@ -2077,7 +2077,7 @@ class ModelExecutor:
                 active,
             )
             if (
-                self.sampling_backend.supports_compact_verify
+                self.sampling_backend.supports_packed_verify
                 and self.sampling_backend.config.synthetic_acceptance_length is None
                 and self._simulated_accept_length is None
             ):
