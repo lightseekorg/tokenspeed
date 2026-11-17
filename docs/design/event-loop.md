@@ -1024,9 +1024,7 @@ obtain the normal retirement acknowledgments.
 **PD** (`pd`, `ts-pd`). Requests register with the transfer peer when submitted
 to the scheduler, before cache admission. Every round the replica agrees on
 which transfers changed state; their scheduler events join the round's tail feedback, and a failed
-transfer aborts its request on every rank together. A prompt whose logits
-held a NaN is aborted as its forward commits, which cancels its transfer, and
-its client gets the `NumericalError` abort once that transfer failed.
+transfer aborts its request on every rank together.
 Under `deferred` decode allocation (`scheduler.md` §3.1) the peers keep the
 order "prefill pages first": the prefill node states the policy in its route,
 and a decode rank that reads it sends `["Announce", room, cache]` to the
