@@ -80,6 +80,7 @@ __all__ = [
     "launch_gluon_gemv_a16w8_gfx950",
     "launch_gluon_rmsnorm_gemv_a16w16_gfx950",
     "prefers_gluon_gemv_a16w16_gfx950",
+    "prefers_gluon_rmsnorm_gemv_a16w16_gfx950",
     "supports_gluon_gated_norm_gemv_a16w16_gfx950",
     "supports_gluon_gemv_a16w16_gfx950",
     "supports_gluon_gemv_a16w8_gfx950",
@@ -1185,6 +1186,20 @@ def supports_gluon_rmsnorm_gemv_a16w16_gfx950(m: int, n: int, k: int) -> bool:
     return (
         num_warps == NUM_WARPS and k % k_iter == 0 and k <= _RMSNORM_MAX_ITERS * k_iter
     )
+
+
+# Decode shapes (N, K) and the most rows at which the RMSNorm GEMV beat
+# rmsnorm_fused_parallel followed by this GEMV, in MALL-cold graph replay on
+# MI355X. Every program normalizes all rows ahead of its MFMAs, so the win
+# turns into a loss as rows grow; shapes not listed keep the two launches.
+_RMSNORM_PREFERRED_MAX_M: dict[tuple[int, int], int] = {
+    (6400, 1536): 8,  # K3.1 stacked [q_b; wq_b]
+}
+
+
+def prefers_gluon_rmsnorm_gemv_a16w16_gfx950(m: int, n: int, k: int) -> bool:
+    """Whether the RMSNorm GEMV measured faster than its two launches here."""
+    return m <= _RMSNORM_PREFERRED_MAX_M.get((n, k), 0)
 
 
 def launch_gluon_rmsnorm_gemv_a16w16_gfx950(

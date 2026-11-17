@@ -110,6 +110,9 @@ if platform.is_amd:
         prefers_gluon_gemv_a16w16_gfx950 as _prefers_gemv_a16w16,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
+        prefers_gluon_rmsnorm_gemv_a16w16_gfx950 as _prefers_rmsnorm_gemv,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
         supports_gluon_gated_norm_gemv_a16w16_gfx950 as _supports_gated_norm_gemv,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
@@ -729,9 +732,7 @@ if platform.is_amd:
         return _gated_norm_gemv_a16w16_impl(x, gate, norm_weight, weight, out, eps)
 
     def _rmsnorm_gemv_a16w16_filter(m: int, n: int, k: int) -> bool:
-        # Every program normalizes all rows ahead of its MFMAs, so the fused
-        # launch stops at 8 rows.
-        return m <= 8 and _supports_rmsnorm_gemv(m, n, k)
+        return _prefers_rmsnorm_gemv(m, n, k) and _supports_rmsnorm_gemv(m, n, k)
 
     @register_kernel(
         "gemm",

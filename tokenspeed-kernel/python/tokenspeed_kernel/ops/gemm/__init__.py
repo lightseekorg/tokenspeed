@@ -56,7 +56,7 @@ from tokenspeed_kernel.platform import (
     pdl_enabled,
 )
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
-from tokenspeed_kernel.registry import KernelRegistry
+from tokenspeed_kernel.registry import KernelRegistry, Priority
 from tokenspeed_kernel.selection import (
     KernelPlan,
     NoKernelFoundError,
@@ -2317,10 +2317,17 @@ def _select_mv_rmsnorm(
         )
     except NoKernelFoundError:
         return None
+    registry = KernelRegistry.get()
+    # Fusing pays only at the rows a kernel was measured faster than the two
+    # launches, which shape-tuned registrations declare; a portable one would
+    # take every row count.
+    spec = registry.get_by_name(kernel.name)
+    if spec is None or spec.priority < Priority.SPECIALIZED:
+        return None
     # The launch reproduces rmsnorm_fused_parallel and the GEMV that mm runs on
     # its rows bit for bit, so it only stands in where mm selects that GEMV.
     gemv = _select_mv(m, n, k, True, x.dtype, weight.dtype, False)
-    if gemv is not KernelRegistry.get().get_impl("gluon_gemv_a16w16_gfx950"):
+    if gemv is not registry.get_impl("gluon_gemv_a16w16_gfx950"):
         return None
     return kernel
 
@@ -2334,8 +2341,10 @@ def mv_rmsnorm_supported(
 ) -> bool:
     """Return whether :func:`mv_rmsnorm` serves ``x``'s rows.
 
-    A registered kernel must take the shape, the rows must be 16-byte aligned,
-    and ``mm`` must select the GEMV it reproduces for the normalized rows.
+    A shape-tuned kernel (``Priority.SPECIALIZED`` or above) must take the
+    shape at this row count, which it does only where it measured faster than
+    the two launches; the rows must be 16-byte aligned, and ``mm`` must select
+    the GEMV it reproduces for the normalized rows.
 
     Args:
         x: Rows ``[M, K]`` to normalize, with a unit inner stride.
