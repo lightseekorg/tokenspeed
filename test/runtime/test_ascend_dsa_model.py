@@ -38,6 +38,7 @@ def make_attention(
     config = PretrainedConfig(
         rms_norm_eps=1e-6,
         mla_use_nope=nope,
+        index_use_rope=False,
         mla_use_output_gate=False,
         mla_scale_q_lora=scale_q,
         cli_factor=1,
@@ -57,33 +58,15 @@ def make_attention(
         v_head_dim=4,
         q_lora_rank=4,
         kv_lora_rank=4,
-        max_position_embeddings=16,
         layer_id=0,
         lora_norm_eps=1e-6,
-        separate_mla_projections=separate,
-        independent_selection=independent,
         prefill_enabled=prefill_enabled,
     )
 
 
-def test_rotary_model_preserves_requested_positions():
-    attention = make_attention(nope=False, separate=True, independent=True)
-    rotary = attention.rotary_emb
-    positions = torch.tensor([0, 7], dtype=torch.int64)
-    # Exercise the actual rotary module's table construction with two positions.
-    coeff = rotary.cos_sin_cache[positions]
-    assert torch.equal(coeff[0, :2], torch.ones(2))
-    assert torch.equal(coeff[0, 2:], torch.zeros(2))
-    assert not torch.equal(coeff[0], coeff[1])
-    inverse = 1 / (rotary.base ** (torch.arange(0, 4, 2).double() / 4))
-    angles = positions.double()[:, None] * inverse
-    expected = torch.cat((angles.cos(), angles.sin()), -1)
-    torch.testing.assert_close(coeff.double(), expected, atol=1e-6, rtol=1e-6)
-
-
-def test_rejects_old_projection_layout():
-    with pytest.raises(ValueError, match="separate checkpoint"):
-        make_attention(nope=True, separate=False, independent=True)
+def test_rotary_model_rejected_at_initialization():
+    with pytest.raises(ValueError, match="RoPE disabled"):
+        make_attention(nope=False, separate=True, independent=True)
 
 
 def test_unprepared_weights_fail_before_device_execution():
@@ -97,18 +80,13 @@ def test_unprepared_weights_fail_before_device_execution():
         attention(None, torch.zeros((64, 4096)), Context(), None)
 
 
-def test_rejects_shared_cross_layer_selection():
-    with pytest.raises(ValueError, match="independent per-layer selection"):
-        make_attention(nope=True, separate=True, independent=False)
-
-
 def test_failed_native_initialization_releases_its_window(monkeypatch):
     from tokenspeed_kernel.ops.attention.dsa import DSAResources
 
     from tokenspeed.runtime.distributed.process_group_manager import (
         process_group_manager as pg,
     )
-    from tokenspeed.runtime.layers.attention.dsa import ascend
+    from tokenspeed.runtime.layers.attention.dsa import ascend_tp_kvp as ascend
 
     # Substitute only communication and its native window. The real fused
     # constructor rejects this small model after the resource has been acquired.
@@ -148,7 +126,9 @@ def test_failed_native_initialization_releases_its_window(monkeypatch):
     monkeypatch.setattr(ascend, "prepare_dsa_resources", lambda **kwargs: resources)
     layer = make_attention(nope=True, separate=True, independent=True)
     with pytest.raises(ValueError, match="Unsupported fused DSA projection geometry"):
-        ascend.AscendDSARuntime([layer], Mapping(rank=0, world_size=8, attn_tp_size=8))
+        ascend.AscendDSATPKVPRuntime(
+            [layer], Mapping(rank=0, world_size=8, attn_tp_size=8)
+        )
     assert window.storage is None
     assert layer._fused_decode_runtime is None
 
@@ -172,23 +152,11 @@ def test_prefill_weight_preparation_follows_model_opt_in(
                 )
             )
     attention.process_weights_after_loading()
-    if not prefill_enabled:
-        assert attention._prefill_weights is None
-    else:
-        weights = attention._prefill_weights
-        assert weights is not None
-        for actual, expected in zip(
-            weights,
-            (
-                attention.q_b_proj.weight,
-                attention.w_kc,
-                attention.w_vc,
-                attention.o_proj.weight,
-            ),
-        ):
-            torch.testing.assert_close(actual, expected)
-        attention.process_weights_after_loading()
-        assert attention._prefill_weights is weights
+    assert attention.q_b_proj.weight.shape == (16, 4)
+    assert attention.o_proj.weight.shape == (8, 8)
+    pointers = (attention.w_kc.data_ptr(), attention.w_vc.data_ptr())
+    attention.process_weights_after_loading()
+    assert pointers == (attention.w_kc.data_ptr(), attention.w_vc.data_ptr())
 
 
 @pytest.mark.parametrize("rows", [1, 1025, 2049])
@@ -233,7 +201,7 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(
         # index-cache tensor and publishes when its device work would finish.
         def __init__(self):
             self._prefill_options = None
-            self._prefill_plan = QuerySpan()
+            self._prefill = QuerySpan()
             self.step_counter = None
             self.index_cache = torch.zeros(rows, 1, 4, dtype=torch.bfloat16)
             self.counter_before_index = None
@@ -383,7 +351,9 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(
 def test_fused_support_uses_real_loaded_indexer_geometry(
     hidden, heads, query_rank, index_heads, supported
 ):
-    from tokenspeed.runtime.layers.attention.dsa.ascend import supports_fused_dsa_decode
+    from tokenspeed.runtime.layers.attention.dsa.ascend_tp_kvp import (
+        supports_fused_dsa_decode,
+    )
 
     config = PretrainedConfig(
         rms_norm_eps=1e-5,
@@ -414,11 +384,8 @@ def test_fused_support_uses_real_loaded_indexer_geometry(
             v_head_dim=128,
             q_lora_rank=query_rank,
             kv_lora_rank=512,
-            max_position_embeddings=65536,
             layer_id=0,
             lora_norm_eps=1e-5,
-            separate_mla_projections=True,
-            independent_selection=True,
             prefill_enabled=False,
         ).bfloat16()
         layer.indexer.weights_proj.float()
@@ -441,7 +408,7 @@ def test_runtime_shares_projection_buffers_and_releases_bindings(
     from tokenspeed.runtime.distributed.process_group_manager import (
         process_group_manager as pg,
     )
-    from tokenspeed.runtime.layers.attention.dsa import ascend
+    from tokenspeed.runtime.layers.attention.dsa import ascend_tp_kvp as ascend
 
     class Group:
         def _get_backend(self, device):
@@ -497,9 +464,9 @@ def test_runtime_shares_projection_buffers_and_releases_bindings(
         torch, "npu", SimpleNamespace(synchronize=lambda: None), raising=False
     )
     monkeypatch.setattr(ascend, "prepare_dsa_resources", lambda **kw: resources)
-    monkeypatch.setattr(ascend, "_RuntimeDSADecode", CpuProjection)
+    monkeypatch.setattr(ascend, "_LayerDSATPKVPDecode", CpuProjection)
     layers = [Layer() for _ in range(3)]
-    runtime = ascend.AscendDSARuntime(
+    runtime = ascend.AscendDSATPKVPRuntime(
         layers, Mapping(rank=0, world_size=8, attn_tp_size=8)
     )
     addresses = {
@@ -533,19 +500,31 @@ def test_runtime_shares_projection_buffers_and_releases_bindings(
             return self.children
 
     leaf = object.__new__(ascend.AscendDSABackend)
-    leaf._dcp = SimpleNamespace(ranks=tuple(range(8)), degree=8)
-    leaf._indexer_spec = SimpleNamespace(num_attention_heads=heads, kv_lora_rank=512)
-    leaf._fused_decode = None
+    from tokenspeed.runtime.layers.attention.dsa import ascend_kvp_decode
+    from tokenspeed.runtime.layers.attention.dsa.ascend_kvp_decode import (
+        AscendDSATPKVPDecode,
+    )
+
+    monkeypatch.setattr(
+        ascend_kvp_decode, "validate_dsa_context_parallel", lambda **kw: None
+    )
+    leaf._kvp_ranks = tuple(range(8))
+    leaf._decode = object.__new__(AscendDSATPKVPDecode)
+    leaf._decode._dcp = SimpleNamespace(ranks=tuple(range(8)), degree=8)
+    leaf._decode._indexer_spec = SimpleNamespace(
+        num_attention_heads=heads, kv_lora_rank=512
+    )
+    leaf._decode._fused_decode = None
     leaf._dense_backend = Router(())
     router = Router((leaf,))
     runtime.bind_backend(router)
-    assert leaf._fused_decode.group == "cpu-window"
+    assert leaf._decode._fused_decode.group == "cpu-window"
     del router
     borrowed = layers[0].runtime
     runtime.close()
     runtime.close()
     assert releases == [window]
     assert all(layer.runtime is None for layer in layers)
-    assert leaf._fused_decode is None
+    assert leaf._decode._fused_decode is None
     assert borrowed.window is None
     assert not borrowed.outputs

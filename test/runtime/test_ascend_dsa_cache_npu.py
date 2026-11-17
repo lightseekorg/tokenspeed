@@ -28,11 +28,14 @@ import torch
 
 from tokenspeed.runtime.layers.attention.backends.paged.ascend_dsa import (
     AscendDSABackend,
-    _AscendDSAContextParallel,
 )
+from tokenspeed.runtime.layers.attention.dcp.ascend import AscendDCPMetadata
 from tokenspeed.runtime.layers.attention.dcp.placement import (
     CachePlacement,
     resolve_cache_slots,
+)
+from tokenspeed.runtime.layers.attention.dsa.ascend_local_decode import (
+    AscendDSALocalDecode,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -101,17 +104,22 @@ def test_single_rank_verify_has_per_candidate_causal_metadata(batch, width):
         kv_lora_rank=512,
         qk_rope_head_dim=64,
     )
-    backend._decode_indexer = replace(
+    backend._indexer_spec.num_attention_heads = heads
+    backend._decode = AscendDSALocalDecode(
+        SimpleNamespace(max_bs=batch, speculative_num_draft_tokens=width),
+        backend._indexer_spec,
+        page_size=page,
+    )
+    backend._decode.indexer = replace(
         select_paged_dsa_indexer(), select_indices=CheckedKernels().index
     )
-    backend._decode_attention = select_paged_dsa_attention()
-    backend._dcp = _AscendDSAContextParallel(
-        degree=1, rank=0, ranks=(0,), virtual_block_count=None
-    )
-    backend._dcp.allocate_decode_buffers(rows, 3, "npu")
+    backend._decode.allocate_decode_buffers(rows, 3, "npu")
     backend._dense_backend = SimpleNamespace(
         forward_decode_metadata=SimpleNamespace(
-            num_extends=prefix_rows, seq_lens=lengths, page_table=table
+            num_extends=prefix_rows,
+            seq_lens=lengths,
+            page_table=table,
+            q_len_per_req=width,
         )
     )
     pool = SimpleNamespace(
@@ -121,7 +129,7 @@ def test_single_rank_verify_has_per_candidate_causal_metadata(batch, width):
     layer = SimpleNamespace(layer_id=0, scaling=576**-0.5, logit_cap=0)
 
     def run():
-        backend._clear_forward_scratch()
+        backend._decode.refresh(backend.forward_decode_metadata)
         return backend.forward_decode(
             query,
             None,
@@ -143,10 +151,10 @@ def test_single_rank_verify_has_per_candidate_causal_metadata(batch, width):
         causal = torch.stack(
             [torch.arange(int(n) - width + 1, int(n) + 1) for n in ends]
         )
-        assert backend._dcp.seq_lens.cpu().tolist() == causal.flatten().tolist()
-        assert backend._dcp.query_ends.cpu().tolist() == list(range(1, rows + 1))
+        assert backend._decode.seq_lens.cpu().tolist() == causal.flatten().tolist()
+        assert backend._decode.query_ends.cpu().tolist() == list(range(1, rows + 1))
         slots = physical_slots(ends, pages)
-        assert torch.equal(backend._dcp.write_slots.cpu(), slots)
+        assert torch.equal(backend._decode.write_slots.cpu(), slots)
         written = index_cache.view(-1, 128)[slots.npu()].cpu()
         torch.testing.assert_close(
             written, index_keys.cpu().view(rows, 128), rtol=0, atol=0
@@ -168,7 +176,10 @@ def test_single_rank_verify_has_per_candidate_causal_metadata(batch, width):
     graph = torch.npu.NPUGraph()
     with torch.npu.graph(graph):
         replayed = run()
-    pointers = (backend._dcp.page_table.data_ptr(), backend._dcp.seq_lens.data_ptr())
+    pointers = (
+        backend._decode.page_table.data_ptr(),
+        backend._decode.seq_lens.data_ptr(),
+    )
     for changed in (False, True, False):
         ends = endpoints + 5 if changed else endpoints
         pages = host_pages.flip(0) if changed else host_pages
@@ -179,8 +190,8 @@ def test_single_rank_verify_has_per_candidate_causal_metadata(batch, width):
         torch.npu.synchronize()
         check(replayed, ends, pages)
         assert (
-            backend._dcp.page_table.data_ptr(),
-            backend._dcp.seq_lens.data_ptr(),
+            backend._decode.page_table.data_ptr(),
+            backend._decode.seq_lens.data_ptr(),
         ) == pointers
     graph.reset()
 
@@ -209,7 +220,7 @@ def test_dcp_local_storage_replay(rank, block_size):
     placement = CachePlacement(block_size, virtual_count, tuple(range(degree)), rank)
     table = torch.zeros((8, 4 * subpages), dtype=torch.int32, device="npu")
     lengths = torch.zeros(8, dtype=torch.int32, device="npu")
-    dcp = _AscendDSAContextParallel(
+    dcp = AscendDCPMetadata(
         degree=degree,
         rank=rank,
         ranks=tuple(range(degree)),
@@ -347,7 +358,7 @@ def test_dcp_metadata_feeds_indexer_and_sparse_attention(endpoint):
         )
         kernels.scatter(keys, index_cache, local)
         kernels.scatter(kv, kv_cache, local)
-        dcp = _AscendDSAContextParallel(
+        dcp = AscendDCPMetadata(
             degree=degree,
             rank=rank,
             ranks=tuple(range(degree)),

@@ -104,6 +104,14 @@ def test_dsa_name_resolves_to_the_device_implementation(name):
     assert _get_backend_cls(name, AttentionArch.DSA) is expected
 
 
+def test_ascend_dsa_storage_accepts_a_selected_numerical_backend(monkeypatch):
+    config, _ = _config(monkeypatch, "npu", "plugin_dsa_numerics")
+    assert config.kvp_size == 8
+    # This extension does not relax the CUDA backend selection contract.
+    with pytest.raises(ValueError, match="kv-parallel-size"):
+        _config(monkeypatch, "cuda", "plugin_dsa_numerics")
+
+
 @pytest.mark.parametrize("name", [None, "dsa"])
 @pytest.mark.parametrize("device", ["cuda", "npu"])
 def test_dsa_dcp_config_accepts_the_common_name(monkeypatch, device, name):

@@ -73,6 +73,13 @@ def ascend_prefill_cache_metadata(*args, **kwargs):
     return AscendDSAKernels.prefill_metadata(*args, **kwargs)
 
 
+def ascend_prepare_dsa_prefill(*args, **kwargs):
+    """Create shared KV/Index-K transport without binding numerical operators."""
+    from tokenspeed_kernel_npu.ops.dsa import AscendDSAKernels
+
+    return AscendDSAKernels.prepare_prefill(*args, **kwargs)
+
+
 def ascend_prepare_dsa_resources(*, group, rank, heads):
     """Bind operator-owned views of the existing HCCL windows before capture."""
     from tokenspeed_kernel.ops.attention.dsa import DSAResources
@@ -111,7 +118,10 @@ def validate_dsa_prolog(*, index_heads):
 
 
 def ascend_dsa_store_index_keys(*args, **kwargs):
-    return ascend_dsa_kernels().scatter(*args, **kwargs)
+    # Cache writes do not depend on either numerical Indexer/SFA provider.
+    from tokenspeed_kernel_npu.ops.dsa import AscendDSAKernels
+
+    return AscendDSAKernels.scatter(*args, **kwargs)
 
 
 def ascend_dsa_paged_select_indices(*args, **kwargs):

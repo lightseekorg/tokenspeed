@@ -29,33 +29,29 @@ from dataclasses import dataclass
 import torch
 from tokenspeed_kernel.ops.attention.dsa.ascend import (
     ascend_dsa_kernels,
-    validate_dsa_context_parallel,
-)
-from tokenspeed_kernel.ops.attention.dsa.paged import (
-    select_paged_dsa_attention,
-    select_paged_dsa_indexer,
 )
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.layers.attention.ascend_prefill import (
+    AscendPrefill,
+    AscendPrefillCache,
+)
 from tokenspeed.runtime.layers.attention.backends.paged.dsa import DSABackend
 from tokenspeed.runtime.layers.attention.backends.paged.mla import MLAAttnBackend
-from tokenspeed.runtime.layers.attention.dcp.ascend import (
-    AscendDCPContext,
-    AscendDCPMetadata,
-    AscendPrefillCache,
-    AscendPrefillPlan,
-)
 from tokenspeed.runtime.layers.attention.dcp.placement import (
     CachePlacement,
 )
+from tokenspeed.runtime.layers.attention.dsa.ascend_kvp_decode import (
+    AscendDSATPKVPDecode,
+)
+from tokenspeed.runtime.layers.attention.dsa.ascend_local_decode import (
+    AscendDSALocalDecode,
+)
+from tokenspeed.runtime.layers.attention.dsa.ascend_prefill import run_prefill_attention
 from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.layers.attention.registry import register_backend
-
-# Retain the name used by external native-operator verification fixtures.
-_AscendDSAContextParallel = AscendDCPMetadata
 
 # Fixed page geometry of Ascend SparseFlashAttentionDecode.
 ASCEND_SFAD_PAGE_SIZE = 128
@@ -63,18 +59,18 @@ ASCEND_SFAD_PAGE_SIZE = 128
 
 def ascend_dsa_prefill_backend(backend):
     """Find the DSA leaf without adding model hooks to shared router nodes."""
-    if isinstance(backend, AscendDSABackend):
+    if isinstance(backend, DSABackend):
         return backend
     leaves = []
     pending = list(backend.child_backends())
     while pending:
         node = pending.pop()
-        if isinstance(node, AscendDSABackend):
+        if isinstance(node, DSABackend):
             leaves.append(node)
         else:
             pending.extend(node.child_backends())
     if len(leaves) != 1:
-        raise ValueError("DSA Prefill prefetch needs exactly one DSA cache leaf")
+        raise ValueError("DSA Prefill needs exactly one DSA cache leaf")
     return leaves[0]
 
 
@@ -99,27 +95,6 @@ def prepare_ascend_dsa_cp_metadata(
         local_tokens=window_tokens,
     )
     return slots
-
-
-@dataclass(frozen=True)
-class _AscendSparseSelection:
-    query: torch.Tensor
-    indices: torch.Tensor
-    valid_chunks: torch.Tensor
-    q_ends: torch.Tensor
-    kv_lengths: torch.Tensor
-    table: torch.Tensor
-    sparse_mode: int
-    context_parallel: bool
-    fused: bool
-
-
-@dataclass(frozen=True)
-class _FusedDecodeBinding:
-    """Borrowed producer views; the model runtime owns their native registration."""
-
-    group: str
-    attention_outputs: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
 
 
 class AscendDSABackend(DSABackend):
@@ -165,38 +140,29 @@ class AscendDSABackend(DSABackend):
             raise ValueError("Ascend DSA requires BF16 KV cache")
         if config.kv_cache_quant_method not in (None, "none"):
             raise ValueError("Ascend DSA cache format is selected by kv_cache_dtype")
-        dcp = AscendDCPMetadata(
-            degree=int(config.kvp_size),
-            rank=int(config.kvp_rank),
-            ranks=tuple(config.kvp_group),
-            virtual_block_count=None,
-        )
         super().__init__(config, spec, kernel_page_size=kernel_page_size)
         if self.is_draft:
             raise ValueError("Ascend DSA draft attention is disabled")
         if self.spec_num_tokens > 8:
             raise ValueError("Ascend DSA verify supports at most 8 tokens")
         self._indexer_spec = spec
-        self._indexer_kernels = ascend_dsa_kernels()
-        self._decode_indexer = select_paged_dsa_indexer()
-        self._decode_attention = select_paged_dsa_attention()
-        self._fused_decode: _FusedDecodeBinding | None = None
-        self._collective_context: AscendDCPContext | None = None
-        self._ascend_placement: _AscendCachePlacement | None = None
-        if dcp.degree > 1:
-            if spec.attn_tp_size != dcp.degree:
-                raise ValueError(
-                    "DSA requires DCP to span the complete head-TP group, got "
-                    f"dcp={dcp.degree}, head_tp={spec.attn_tp_size}"
-                )
-            if self.num_local_heads * dcp.degree != spec.num_attention_heads:
-                raise ValueError("DSA DCP does not reconstruct all query heads")
-            validate_dsa_context_parallel(
-                rank_size=dcp.degree, num_heads=spec.num_attention_heads
+        self._kvp_degree = int(config.kvp_size)
+        self._kvp_ranks = tuple(config.kvp_group)
+        self._ascend_placement = None
+        if self._kvp_degree == 1:
+            if spec.attn_tp_size != 1:
+                raise ValueError("Local DSA Decode requires TP1/KVP1")
+            self._decode = AscendDSALocalDecode(
+                config, spec, page_size=kernel_page_size
             )
-        self._dcp = dcp
-        self._prefill_plan: AscendPrefillPlan | None = None
-        self._prefill_runtime = None
+        else:
+            if spec.attn_tp_size != self._kvp_degree:
+                raise ValueError("DSA KV sharding must span its attention group")
+            self._decode = AscendDSATPKVPDecode(
+                config, spec, page_size=kernel_page_size
+            )
+        self._indexer_kernels = ascend_dsa_kernels()
+        self._prefill: AscendPrefill | None = None
         self._prefill_group = None
         self._prefill_options = None
 
@@ -209,29 +175,22 @@ class AscendDSABackend(DSABackend):
         return self.prefill_enabled
 
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
-        self.close_prefill()
+        self._prefill = None
         self._ascend_placement = None
-        self._dcp.clear_forward_metadata()
         super()._publish_cache_pool(cache_pool)
         self._prefill_options = (
             cache_pool.prefill_options
             if isinstance(cache_pool, AscendPrefillCache)
             else None
         )
-        self._prefill_plan = None
-        if self._dcp.degree > 1:
-            counts = cache_pool.arena.runtime_contract.virtual_block_counts
-            if FULL_ATTENTION not in counts:
-                raise ValueError("DSA CP requires a full-attention cache group")
-            self._dcp.bind_virtual_block_count(counts[FULL_ATTENTION])
         # Every world rank creates the cache-owner groups before any forward.
-        if self.prefill_enabled and self._dcp.degree > 1:
+        if self.prefill_enabled and self._kvp_degree > 1:
             from tokenspeed.runtime.distributed.process_group_manager import (
                 process_group_manager,
             )
 
             self._prefill_group = process_group_manager.get_dedicated_device_group(
-                self._dcp.ranks, "prefill-history"
+                self._kvp_ranks, "prefill-history"
             )
         else:
             self._prefill_group = None
@@ -243,8 +202,8 @@ class AscendDSABackend(DSABackend):
     def preallocate_prefill_workspace(self) -> int:
         if not self.prefill_enabled:
             return 0
-        if self._prefill_runtime is not None:
-            return self._prefill_runtime.workspace_bytes
+        if self._prefill is not None:
+            return self._prefill.runtime.workspace_bytes
         if self.cache_pool is None:
             raise RuntimeError("Bind the DSA cache before preparing Prefill")
         layer_id = min(self.cache_pool.history_group_by_layer())
@@ -253,49 +212,24 @@ class AscendDSABackend(DSABackend):
         runtime = self._indexer_kernels.prepare_prefill(
             kv,
             index,
-            ranks=self._dcp.ranks,
+            ranks=self._kvp_ranks,
             history_group=self._prefill_group,
             max_current_rows=self._prefill_options.max_current_rows,
             max_history_rows=self._prefill_options.max_history_rows,
             history_null_rows=self._prefill_options.kv_page_size,
         )
-        self._prefill_runtime = runtime
+        self._prefill = AscendPrefill(
+            options=self._prefill_options,
+            page_size=self.kernel_page_size,
+            topk=self._indexer_spec.index_topk,
+            runtime=runtime,
+        )
         return runtime.workspace_bytes
 
-    def prefetch_prefill_layer(self, layer_id):
-        """Submit history at KDA, or ensure it at the attention entry."""
-        plan = self._prefill_plan
-        if not self.prefill_enabled or plan is None or plan.gather is None:
-            raise RuntimeError("Prepare DSA Prefill page metadata first")
-        if self._prefill_runtime is None:
-            self.preallocate_prefill_workspace()
-        runtime = self._prefill_runtime
-        runtime.prefetch(
-            layer_id,
-            self.cache_pool.get_key_buffer(layer_id),
-            self.cache_pool.get_component(layer_id, "dsa_index_k"),
-            batch_key=plan,
-            total_rows=sum(plan.row_counts),
-            has_history=not plan.cold,
-            history_slots=plan.gather.send_slots,
-            history_counts=plan.gather.row_counts,
-        )
-
-    def start_prefill_index(self, layer_id, index_key):
-        """Enqueue current Index-K as soon as the local projection is ready."""
-        if self._prefill_runtime is None or self._prefill_plan is None:
-            raise RuntimeError("Prepare DSA Prefill before its Index-K projection")
-        self._prefill_runtime.gather_current(
-            layer_id,
-            index_key,
-            width=128,
-            total_rows=sum(self._prefill_plan.row_counts),
-        )
-
-    def close_prefill(self) -> None:
-        if self._prefill_runtime is not None:
-            self._prefill_runtime.close()
-            self._prefill_runtime = None
+    def configure_runtime(self, **kwargs):
+        super().configure_runtime(**kwargs)
+        if self._kvp_degree > 1:
+            self._decode.bind_cache(super().cache_placement(None))
 
     def cache_placement(self, layer) -> CachePlacement | None:
         if self._ascend_placement is None:
@@ -310,14 +244,9 @@ class AscendDSABackend(DSABackend):
                 )
         return self._ascend_placement
 
-    def _clear_forward_scratch(self) -> None:
-        self._dcp.clear_forward_metadata()
-        self._prefill_plan = None
-
     def init_cuda_graph_state(self, max_bs: int) -> None:
-        self._clear_forward_scratch()
         super().init_cuda_graph_state(max_bs)
-        self._dcp.allocate_decode_buffers(
+        self._decode.allocate_decode_buffers(
             max_bs * self.spec_num_tokens, self.max_num_pages, self.device
         )
 
@@ -331,7 +260,6 @@ class AscendDSABackend(DSABackend):
         num_extends: int = 0,
         for_graph_replay: bool = False,
     ) -> None:
-        self._clear_forward_scratch()
         self._dense_backend.refresh_decode_metadata(
             bs,
             actual_bs,
@@ -340,6 +268,7 @@ class AscendDSABackend(DSABackend):
             num_extends=num_extends,
             for_graph_replay=for_graph_replay,
         )
+        self._decode.refresh(self.forward_decode_metadata)
 
     def init_forward_metadata(
         self,
@@ -356,7 +285,6 @@ class AscendDSABackend(DSABackend):
         extend_with_prefix: bool,
         **kwargs,
     ):
-        self._clear_forward_scratch()
         if not (forward_mode.is_extend_or_mixed() or forward_mode.is_idle()):
             raise RuntimeError(
                 "DSA decode metadata goes through refresh_decode_metadata; "
@@ -381,375 +309,21 @@ class AscendDSABackend(DSABackend):
             if cmeta is not None:
                 self._prefill_page_table = page_table[:num_extends]
                 cmeta.page_table = self._prefill_page_table
-        self._prefill_plan = None
+        if bs > num_extends:
+            self._decode.refresh(self.forward_decode_metadata)
         if num_extends > 0 and self.prefill_enabled:
-            layer_id = min(self.cache_pool.history_group_by_layer())
-            local_rows = self.cache_pool.get_key_buffer(layer_id).numel() // 576
-            self._prefill_plan = AscendPrefillPlan.build(
+            self._prefill.prepare(
                 self.forward_prefill_metadata,
                 self.cache_placement(None),
-                degree=self._dcp.degree,
-                rank=self._dcp.rank,
-                page_size=self.kernel_page_size,
-                topk=self._indexer_spec.index_topk,
-                local_cache_pages=local_rows // self.kernel_page_size,
                 page_table_cpu=kwargs.get("page_table_cpu"),
-                options=self._prefill_options,
             )
 
     def prepare_prolog_metadata(self, locations, *, init_tokens, local_tokens):
-        """Prepare slots and attention metadata once before the first Prolog."""
-        metadata = self.forward_decode_metadata
-        placement = self._ascend_placement
-        assert placement is not None
-        requests = metadata.seq_lens.shape[0] - metadata.num_extends
-        if requests <= 0 or locations.numel() % requests:
-            raise ValueError("DSA write slots must cover complete query groups")
-        width = locations.numel() // requests
-        self._dcp.prepare_metadata(
-            seq_lens=metadata.seq_lens[metadata.num_extends :],
-            page_table=metadata.page_table[metadata.num_extends :],
-            page_size=self.kernel_page_size,
-            block_granularity=placement.block_granularity,
+        return self._decode.prepare_prolog_metadata(
+            locations,
+            self.forward_decode_metadata,
             init_tokens=init_tokens,
             local_tokens=local_tokens,
-            query_width=width,
-            query_group_size=width,
-            slots=locations,
-        )
-        slots = self._dcp.write_slots
-        assert slots is not None
-        return slots
-
-    def configure_fused_decode(
-        self,
-        *,
-        group: str,
-        ranks: tuple[int, ...],
-        attention_outputs: dict[int, tuple],
-    ) -> None:
-        """Bind CP resources and stable producer outputs outside capture."""
-        if self._dcp.degree <= 1 or not group:
-            raise ValueError("DSA fusion requires a context-parallel communicator")
-        if tuple(ranks) != tuple(self._dcp.ranks):
-            raise ValueError("Fused DSA resources must cover the CP group ranks")
-        if not attention_outputs:
-            raise ValueError("Fused DSA requires prepared SFA producer outputs")
-        spec = self._indexer_spec
-        for rows, outputs in attention_outputs.items():
-            expected = (
-                (spec.num_attention_heads, rows, spec.kv_lora_rank),
-                (1, rows, spec.num_attention_heads),
-                (1, rows, spec.num_attention_heads),
-            )
-            if len(outputs) != 3 or any(
-                value.shape != shape or value.dtype != torch.float32
-                for value, shape in zip(outputs, expected)
-            ):
-                raise ValueError(
-                    "Fused DSA requires prepared FP32 SFA producer outputs"
-                )
-        self._fused_decode = _FusedDecodeBinding(group, attention_outputs)
-
-    def clear_fused_decode(self) -> None:
-        """Drop borrowed views after the owner has drained/destroyed its graphs."""
-        self._fused_decode = None
-
-    def _context_collectives(self) -> AscendDCPContext:
-        """Use the existing device group for shapes without native fusion."""
-        if self._collective_context is None:
-            self._collective_context = AscendDCPContext(
-                degree=self._dcp.degree,
-                rank=self._dcp.rank,
-                ranks=self._dcp.ranks,
-                auxiliary_namespace=None,
-            )
-        if not self._collective_context.ready:
-            raise RuntimeError("Ascend DSA CP process group was not configured")
-        return self._collective_context
-
-    def _select_collective_topk(self, q, local_indices, local_values):
-        collective = self._context_collectives()
-        degree = self._dcp.degree
-        tokens, _, candidates = local_values.shape
-        padded_tokens = (tokens + degree - 1) // degree * degree
-        if padded_tokens != tokens:
-            local_values = torch.cat(
-                (
-                    local_values,
-                    torch.full(
-                        (padded_tokens - tokens, 1, candidates),
-                        float("-inf"),
-                        dtype=local_values.dtype,
-                        device=local_values.device,
-                    ),
-                )
-            )
-        rows = padded_tokens // degree
-        received = torch.empty(
-            degree * rows * candidates,
-            dtype=local_values.dtype,
-            device=local_values.device,
-        )
-        collective.all_to_all(
-            received, local_values.squeeze(1).contiguous().view(-1), auxiliary=False
-        )
-        packed_query = collective.all_gather(q.contiguous(), auxiliary=False).view(
-            degree, *q.shape
-        )
-        values = received.view(degree, rows, candidates).transpose(0, 1)
-        _, positions = values.reshape(rows, degree * candidates).topk(
-            self._indexer_spec.index_topk, dim=1
-        )
-        positions = collective.all_gather(
-            positions.to(torch.int32).contiguous(), auxiliary=False
-        )[:tokens]
-        indices, valid_chunks = self._decode_indexer.select_local_indices(
-            local_indices, positions, self._dcp.rank
-        )
-        return packed_query, indices, valid_chunks
-
-    def _prepare_decode_metadata(
-        self, layer, index_cache, locations, lengths, table, *, width, initial, window
-    ):
-        """Expand causal query rows and resolve owner-local Index-K write slots.
-
-        The fused prologue prepares this same metadata before writing both
-        caches. Storage-view reuse makes subsequent layers share one result;
-        eager and graph replay refresh through the same DCP metadata owner.
-        """
-        placement = self.cache_placement(layer)
-        page = self.kernel_page_size
-        if placement is None:
-            if self._dcp.degree > 1:
-                raise RuntimeError("DSA CP cache placement was not configured")
-            capacity = index_cache.shape[0]
-            if self._dcp.virtual_block_count != capacity:
-                self._dcp.bind_virtual_block_count(capacity)
-        self._dcp.prepare_metadata(
-            seq_lens=lengths,
-            page_table=table,
-            page_size=page,
-            block_granularity=(
-                page if placement is None else placement.block_granularity
-            ),
-            init_tokens=initial,
-            local_tokens=window,
-            query_width=width,
-            query_group_size=width,
-            slots=locations,
-        )
-        return self._dcp.metadata(start=0, end=table.shape[0] * width)
-
-    def _select_decode_indices(
-        self,
-        query,
-        index_query,
-        index_cache,
-        weights,
-        local,
-        *,
-        initial,
-        window,
-        query_width,
-        packed_query,
-        fused: bool,
-    ):
-        """Select owner-local indices; exchange only queries and TopK candidates."""
-        kernels = self._decode_indexer
-        q_ends = self._dcp.query_ends
-        if self._dcp.degree == 1:
-            indices, valid_chunks = kernels.select_indices(
-                index_query,
-                index_cache,
-                weights,
-                q_ends,
-                local.seq_lens,
-                local.page_table,
-                self._indexer_spec.index_topk,
-                initial,
-                window,
-            )
-            return _AscendSparseSelection(
-                query,
-                indices,
-                valid_chunks,
-                q_ends,
-                local.seq_lens,
-                local.page_table,
-                3,
-                False,
-                False,
-            )
-
-        # Verify candidates share page/K tiles but retain their causal ends.
-        index_metadata = self._dcp.indexer_metadata(
-            q_ends, local, query_group_size=query_width
-        )
-        local_indices, local_values = kernels.select_candidates(
-            index_query,
-            index_cache,
-            weights,
-            index_metadata.q_ends,
-            index_metadata.seq_lens,
-            index_metadata.page_table,
-            self._indexer_spec.index_topk,
-            index_metadata.init_counts,
-            index_metadata.local_counts,
-            sparse_mode=3,
-            visible_lengths=index_metadata.visible_lengths,
-        )
-        if fused:
-            if local_values.shape[1:] != (1, 2048):
-                raise ValueError("Fused DSA TopK requires a prepared [T,1,2048] shape")
-            indices, valid_chunks = kernels.merge_topk(
-                local_indices,
-                local_values,
-                group=self._fused_decode.group,
-                rank_size=self._dcp.degree,
-            )
-        else:
-            packed_query, indices, valid_chunks = self._select_collective_topk(
-                query, local_indices, local_values
-            )
-        return _AscendSparseSelection(
-            packed_query,
-            indices,
-            valid_chunks,
-            q_ends,
-            local.seq_lens,
-            local.page_table,
-            3,
-            True,
-            fused,
-        )
-
-    def attention_kernels(self, *, is_prefill: bool):
-        """Return the SFA provider for the explicit prefill/decode stage.
-
-        Plugins may override this hook to supply stage-specific ``attention``
-        and ``attention_partial`` implementations. ``is_prefill`` identifies
-        extend calls; false identifies decode/verify calls. The provider must
-        preserve the AscendDSAKernels tensor and empty-shard contracts and
-        must not change cache ownership or CP metadata.
-        """
-        return self._decode_attention
-
-    def _run_collective_attention(self, selection, kv_cache, layer, kernels):
-        output, maximum, total = kernels.attention_partial(
-            selection.query,
-            kv_cache,
-            selection.indices,
-            selection.valid_chunks,
-            selection.q_ends,
-            selection.kv_lengths,
-            selection.table,
-            layer.scaling,
-            sparse_mode=selection.sparse_mode,
-        )
-        lse = (maximum + total.log()).squeeze(0)
-        return self._context_collectives().combine(
-            output.transpose(0, 1), lse, merge=kernels.merge_partials
-        )
-
-    def _run_local_attention(self, selection, kv_cache, scale, kernels):
-        """Return complete local-head rows in TND layout on one cache rank."""
-        spec = self._indexer_spec
-        # TND accepts 32/64 heads. Repeat a smaller TP shard, then keep its heads.
-        live_heads = selection.query.shape[1]
-        if not 1 <= live_heads <= 64:
-            raise ValueError("Ascend DSA requires between 1 and 64 local query heads")
-        padded_heads = 32 if live_heads <= 32 else 64
-        query = selection.query
-        if live_heads != padded_heads:
-            copies = (padded_heads + live_heads - 1) // live_heads
-            query = query.repeat(1, copies, 1)[:, :padded_heads]
-        result = kernels.attention(
-            query[..., : spec.kv_lora_rank].contiguous(),
-            query[..., spec.kv_lora_rank :].contiguous(),
-            kv_cache,
-            selection.indices,
-            selection.valid_chunks,
-            selection.q_ends,
-            selection.kv_lengths,
-            selection.table,
-            scale,
-        )
-        return result[:, :live_heads].contiguous()
-
-    def _run_fused_attention(self, selection, kv_cache, scale, kernels):
-        """Write registered SFA producers and return merged local heads [H,T,D]."""
-        binding = self._fused_decode
-        if binding is None:
-            raise RuntimeError(
-                "Initialize fused DSA resources before context-parallel execution"
-            )
-        rows = selection.query.shape[1]
-        if rows not in binding.attention_outputs:
-            raise ValueError("Fused DSA LSE requires prepared SFA producer outputs")
-        output, maximum, total = kernels.attention_partial(
-            selection.query,
-            kv_cache,
-            selection.indices,
-            selection.valid_chunks,
-            selection.q_ends,
-            selection.kv_lengths,
-            selection.table,
-            scale,
-            sparse_mode=selection.sparse_mode,
-            out=binding.attention_outputs[rows],
-        )
-        return kernels.merge_lse_direct(
-            output,
-            maximum,
-            total,
-            group=binding.group,
-            rank_size=self._dcp.degree,
-        )
-
-    def _run_indexed_sparse_attention(
-        self,
-        selection,
-        layer,
-        token_to_kv_pool,
-        *,
-        head_major_output,
-        is_prefill: bool,
-    ):
-        """Consume owner-local KV and return this rank's attention-head partition."""
-        spec = self._indexer_spec
-        kv_cache = token_to_kv_pool.get_key_buffer(layer.layer_id).view(
-            -1,
-            self.kernel_page_size,
-            1,
-            spec.kv_cache_dim,
-        )
-        expected_width = spec.kv_lora_rank + spec.qk_rope_head_dim
-        if selection.query.shape[-1] != expected_width:
-            raise ValueError(
-                f"Ascend DSA query width must be {expected_width}, got "
-                f"{selection.query.shape[-1]}"
-            )
-        kernels = self.attention_kernels(is_prefill=is_prefill)
-        if selection.fused:
-            result = self._run_fused_attention(
-                selection, kv_cache, layer.scaling, kernels
-            )
-            return (
-                result
-                if head_major_output
-                else result.transpose(0, 1).contiguous().flatten(1)
-            )
-        if selection.context_parallel:
-            result = self._run_collective_attention(selection, kv_cache, layer, kernels)
-        else:
-            result = self._run_local_attention(
-                selection, kv_cache, layer.scaling, kernels
-            )
-        return (
-            result.transpose(0, 1).contiguous()
-            if head_major_output
-            else result.flatten(1)
         )
 
     def forward_extend(
@@ -776,81 +350,30 @@ class AscendDSABackend(DSABackend):
         ):
             raise ValueError("Prefill init/local token counts must fit index_topk")
         head_major_output = kwargs.pop("head_major_output", False)
-        kernels, spec, dcp = self._indexer_kernels, self._indexer_spec, self._dcp
-        placement = self.cache_placement(layer)
-        self.prefetch_prefill_layer(layer.layer_id)
-        plan, runtime = self._prefill_plan, self._prefill_runtime
-        if plan is None or runtime is None:
-            raise RuntimeError(
-                "Prepare DSA Prefill workspace and metadata before forward"
-            )
-        if (
-            q.shape[0] != plan.row_counts[dcp.rank]
-            or q.shape[1] != spec.num_attention_heads
-        ):
+        spec, prefill = self._indexer_spec, self._prefill
+        if q.shape[:2] != (prefill.row_counts[prefill.rank], spec.num_attention_heads):
             raise ValueError(
                 "Prefill needs token-local queries with all attention heads"
             )
-        if placement is None:
-            block_rows, virtual_blocks = (
-                self.kernel_page_size,
-                runtime.local_rows // self.kernel_page_size,
-            )
-        else:
-            block_rows, virtual_blocks = (
-                placement.block_granularity,
-                placement.virtual_block_count,
-            )
-        # Gather both current producers together before index selection.
-        self.start_prefill_index(layer.layer_id, kwargs["index_key"].contiguous())
-        runtime.gather_current(
-            layer.layer_id,
+        prefill_kv, prefill_index = prefill.prepare_layer(
+            self.cache_pool.get_key_buffer(layer.layer_id),
+            self.cache_pool.get_component(layer.layer_id, "dsa_index_k"),
             kwargs["prefill_latent"].contiguous(),
-            width=spec.kv_cache_dim,
-            total_rows=sum(plan.row_counts),
-        )
-        plan.store_current(
-            runtime,
-            layer.layer_id,
+            kwargs["index_key"].contiguous(),
             out_cache_loc,
-            block_rows=block_rows,
-            virtual_blocks=virtual_blocks,
         )
-        index_pages = runtime.index.view(
-            -1, self.kernel_page_size, 1, spec.index_head_dim
-        )
-        if q.shape[0]:
-            indices = kernels.prefill_index(
-                kwargs["index_query"],
-                index_pages,
-                kwargs["index_weights"],
-                plan.query_cu,
-                plan.key_cu,
-                plan.index_table,
-                spec.index_topk,
-                initial,
-                window,
-            )
-        else:
-            indices = torch.empty(
-                (0, spec.index_topk), dtype=torch.int32, device=q.device
-            )
         if self.step_counter is not None:
             self.step_counter.record_cache()
-        kv_pages = runtime.kv.view(-1, self.kernel_page_size, spec.kv_cache_dim)
-        if q.shape[0]:
-            output = kernels.prefill_attention(
-                q,
-                kv_pages,
-                indices,
-                plan.scan_count,
-                plan.page_table,
-                plan.query_seq,
-                layer.scaling,
-            )
-        else:
-            output = q.new_empty((q.shape[1], 0, spec.kv_lora_rank))
-        runtime.finish(layer.layer_id)
+        output = run_prefill_attention(
+            q,
+            layer,
+            prefill,
+            prefill_kv,
+            prefill_index,
+            kernels=self._indexer_kernels,
+            spec=spec,
+            **kwargs,
+        )
         return (
             output
             if head_major_output
@@ -909,61 +432,20 @@ class AscendDSABackend(DSABackend):
             raise ValueError("DSA initial/local token counts must be nonnegative")
         if initial + window > self._indexer_spec.index_topk:
             raise ValueError("DSA initial/local tokens exceed index_topk")
-        packed_query = kwargs.get("packed_query")
-        if fused:
-            if packed_query is None:
-                raise ValueError("Fused DSA requires the fused Prolog query")
-            if self._fused_decode is None:
-                raise RuntimeError(
-                    "Initialize fused DSA resources before using packed queries"
-                )
-            if q.shape[0] not in self._fused_decode.attention_outputs:
-                raise ValueError("Fused DSA requires prepared SFA producer outputs")
-        elif packed_query is not None:
-            raise ValueError("Ordinary DSA does not accept a fused Prolog query")
-
-        metadata = self.forward_decode_metadata
-        start = metadata.num_extends
-        index_cache = token_to_kv_pool.get_component(
-            layer.layer_id, "dsa_index_k"
-        ).view(-1, self.kernel_page_size, 1, self._indexer_spec.index_head_dim)
-        local = self._prepare_decode_metadata(
-            layer,
-            index_cache,
-            out_cache_loc,
-            metadata.seq_lens[start : start + bs],
-            metadata.page_table[start : start + bs],
-            width=tokens_per_request,
-            initial=initial,
-            window=window,
-        )
-        # Main KV was written by MLA prologue. Fused prologue also writes Index-K;
-        # ordinary projections hand Index-K to this one owner-local store.
-        if not kwargs.get("index_cache_written", False):
-            self._decode_indexer.store_index_keys(
-                kwargs["index_key"].contiguous(), index_cache, self._dcp.write_slots
-            )
-        selection = self._select_decode_indices(
+        output = self._decode.forward(
             q,
-            kwargs["index_query"],
-            index_cache,
-            kwargs["index_weights"],
-            local,
-            initial=initial,
-            window=window,
-            query_width=tokens_per_request,
-            packed_query=packed_query,
-            fused=fused,
-        )
-        if self.step_counter is not None:
-            self.step_counter.record_cache()
-        return self._run_indexed_sparse_attention(
-            selection,
+            k,
+            v,
             layer,
+            out_cache_loc,
             token_to_kv_pool,
-            head_major_output=kwargs.get("head_major_output", False),
-            is_prefill=False,
+            bs,
+            fused=fused,
+            metadata=self.forward_decode_metadata,
+            step_counter=self.step_counter,
+            **kwargs,
         )
+        return output
 
 
 if current_platform().is_npu:

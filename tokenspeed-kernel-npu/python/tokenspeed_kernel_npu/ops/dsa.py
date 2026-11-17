@@ -687,7 +687,8 @@ class AscendDSAKernels:
             self._full_scan_chunks[key] = chunks
         return chunks
 
-    def scatter(self, x, cache, locations):
+    @staticmethod
+    def scatter(x, cache, locations):
         width = x.shape[-1]
         if x.dtype != torch.bfloat16 or cache.dtype != x.dtype:
             raise ValueError("LongCatDSA scatter requires BF16")

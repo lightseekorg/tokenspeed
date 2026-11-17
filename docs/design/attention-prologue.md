@@ -412,6 +412,22 @@ this platform cannot run, or whose traits exclude the request, raises.
 
 ## Ascend integration
 
+Numerical variants can retain the same storage and communication owners.
+`AscendDSAAttention._prepare_lora_scales` isolates native norm-weight folding
+from checkpoint projection preparation. A variant that scales after the BF16
+norm output overrides that step and supplies its own numerical forward.
+`AscendDSABackend._compute_prefill_attention` consumes the committed Prefill
+planes and returns head-major output; the enclosing forward still owns current
+row exchange, cache writes and the transport's completion. `AscendPrefillPlan`
+carries `key_row_count`, computed from host lengths for the active query shard,
+so a TND consumer can size its views without reading device lengths back.
+Additional fixed scratch belongs to the backend, is shared across its layers,
+and must be reserved by the cache recipe before allocation.
+`AscendDSABackend._select_dsa_kernels` binds the numerical adapter and validates
+its communication requirements during construction. Prefill transport and
+Index-K scatter are data-only entry points; they do not load the native fused
+Indexer/SFA library when a variant selects different arithmetic.
+
 Shared Ascend DSA and MLA components own attention execution. Models supply
 configuration and checkpoint weights; kernel selection and weight preparation
 belong to the `attention` family in `tokenspeed-kernel`. Weight preparation
@@ -419,10 +435,10 @@ preserves coefficients and dtype.
 
 DSA's indexer uses the normalized Q latent before the main attention's Q-LoRA
 scale. Prefill and fused Decode with 16/32 Indexer heads scale the BF16 main
-Q projection result; the 64-head fused path retains scaled weight panels.
+Q projection result. Indexer64 is unsupported.
 The shared Q norm and indexer query projection remain unscaled. Indexer score
 projections retain FP32 and include `index_head_dim**-0.5 * index_n_heads**-0.5`;
-the 16-head fused path applies this factor after projection, while 32/64-head
+the 16-head fused path applies this factor after projection, while 32-head
 paths fold it into FP32 weights. These rounding boundaries do not establish
 cross-provider bitwise equality.
 
@@ -500,3 +516,24 @@ K and V fields share a plane. Prologue and context scatters resolve a token
 slot as ``page * page_stride + row * row_stride``; flattening these pages
 would discard the gap occupied by the other field. Dense row caches keep
 their existing three-dimensional views.
+
+
+### Ascend DSA execution ownership
+
+DSA Prefill prepares its batch metadata and reusable transport in
+`attention/ascend_prefill.py`. Numerical Prefill calls live in
+`attention/dsa/ascend_prefill.py`. Each layer gathers its history at the attention
+entry and commits current KV/Index-K before selection; there is no early-model
+prefetch, active-layer deduplication, finish call or workspace close protocol.
+
+`attention/dsa/ascend_local_decode.py` owns TP1/KVP1 Decode, including single-token
+and multi-token causal metadata. It has no DCP metadata or communicator. The
+TP/KVP implementation is in `ascend_kvp_decode.py`; its fused projection and
+communication registration owner are in `ascend_tp_kvp.py`. Native resource
+release remains explicit after graph teardown; PyTorch buffers follow owner
+lifetime and are reused across layers.
+
+Token-local Prefill loads complete projection weights directly. The existing
+host mapping still describes KV ownership and query groups. A Prefill replica
+using full projections must not execute head-sharded Decode; construct the
+separate TP/KVP Decode replica with Prefill disabled. Local Decode requires TP1.
