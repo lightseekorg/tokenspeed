@@ -5154,6 +5154,9 @@ protected:
     virtual std::int32_t Window() const { return 2; }
     virtual std::int32_t Grain() const { return 1; }
     virtual Role ServingRole() const { return Role::kFused; }
+    // The seed on the Host alone: L2 on (write-through), and Run clears the
+    // Device cache once the seed finishes.
+    virtual bool HostOnlySeed() const { return false; }
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg{};
         cfg.role = ServingRole();
@@ -5164,7 +5167,8 @@ protected:
         cfg.max_batch_size = 8;
         cfg.max_resident_requests = cfg.max_batch_size;
         cfg.enable_l3_storage = false;
-        cfg.disable_l2_cache = true;
+        cfg.disable_l2_cache = !HostOnlySeed();
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.disable_prefix_cache = false;
         cfg.cache_groups = {
             MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kFull),
@@ -5204,6 +5208,7 @@ protected:
         std::vector<std::pair<std::int32_t, std::int32_t>> chunks;
         for (int round = 0; round < 8; ++round) {
             const ExecutionPlan plan = PlanOnce();
+            AckWriteBacks(plan);
             const ForwardBatch* batch = FindForwardBatch(plan);
             if (batch == nullptr || batch->NumExtends() == 0) {
                 continue;
@@ -5228,16 +5233,20 @@ protected:
         const RequestSpec seed = MakeRequestSpec("seed", seed_pages);
         Submit(seed);
         PrefillAll("seed");
-        PlanOnce();
+        AckWriteBacks(PlanOnce());
         SendForwardDone("seed", {43});
         SendFinish("seed");
-        PlanOnce();
+        AckWriteBacks(PlanOnce());
+        if (HostOnlySeed()) {
+            EXPECT_TRUE(scheduler_->ClearL1Cache());
+        }
         Outcome out;
         Submit(Diverging(seed, "first", diverge, 1000));
         out.first_chunks = PrefillAll("first");
         Submit(Diverging(seed, "third", diverge, 3000));
         for (int round = 0; round < 6 && out.third_resumed < 0; ++round) {
             const ExecutionPlan plan = PlanOnce();
+            AckWriteBacks(plan);
             const ForwardBatch* batch = FindForwardBatch(plan);
             if (batch == nullptr) {
                 continue;
@@ -5297,6 +5306,33 @@ TEST_F(JunctionReachRestrictedSuite, TheJunctionStaysOnTheCheckpointGrid) {
     EXPECT_EQ(out.first_chunks, (Chunks{{0, 8}, {8, 8}}));
     EXPECT_EQ(out.third_resumed, 8);
     EXPECT_EQ(out.unresumable_kv, 8u);
+}
+
+// The same on the Host: the seed on the Host alone, its full-history run
+// reaches 10, off the G = 4 grid, so the Host's reach stays at 8 too.
+class JunctionReachRestrictedHostSuite : public JunctionReachRestrictedSuite {
+protected:
+    bool HostOnlySeed() const override { return true; }
+};
+
+TEST_F(JunctionReachRestrictedHostSuite, TheHostReachStaysOnTheCheckpointGrid) {
+    const Outcome out = Run(/*seed_pages=*/8, /*diverge=*/10);
+    EXPECT_EQ(out.third_resumed, 8);
+    EXPECT_EQ(out.unresumable_kv, 8u);
+}
+
+// A sliding-only model with the seed on the Host alone: the Host's
+// full-history run past a missing window makes no junction either.
+class JunctionReachSlidingOnlyHostSuite : public JunctionReachSlidingOnlySuite {
+protected:
+    bool HostOnlySeed() const override { return true; }
+};
+
+TEST_F(JunctionReachSlidingOnlyHostSuite, AHostMissingWindowCutsNothingWithoutAStateGroup) {
+    const Outcome out = Run(/*seed_pages=*/6, /*diverge=*/6);
+    EXPECT_EQ(out.first_chunks, (Chunks{{0, 8}, {8, 4}}));
+    EXPECT_EQ(out.third_resumed, 0);
+    EXPECT_EQ(out.unresumable_kv, 0u);
 }
 
 // The D role's probe leaves the State groups out (its prompt arrives by
