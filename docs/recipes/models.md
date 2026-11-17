@@ -1211,7 +1211,7 @@ launch command.
 ### NVIDIA
 
 ```bash
-ts serve \
+FLASHINFER_ROUTING_FORCE_BLOCK_PER_TOKEN=0 ts serve \
     --model Qwen/Qwen3.8-Flash-Next-FP8 \
     --trust-remote-code \
     --tensor-parallel-size 4 \
@@ -1220,6 +1220,31 @@ ts serve \
     --speculative-algorithm MTP \
     --speculative-num-steps 3
 ```
+
+`FLASHINFER_ROUTING_FORCE_BLOCK_PER_TOKEN=0` selects FlashInfer's MoE routing
+kernels for this model's routes (512 experts, top-10, softmax). By default, from
+32 to 256 tokens per MoE call, FlashInfer splits routing into a block-per-token
+top-k kernel and a permutation kernel. With the variable set, it runs one fused
+single-cluster kernel instead. From 257 to 1024 tokens it uses the
+warp-per-token top-k kernel instead of the block-per-token one. The routed
+experts and weights are bit-identical either way, and calls below 32 or above
+1024 tokens are unchanged.
+
+FlashInfer reads the variable once per process and applies it to every route,
+and sigmoid-with-bias routes (DeepSeek-V3 style) are faster split, so set it
+only for this model.
+
+Measured on one SM107 GPU, Qwen3.8-Flash-Next-NVFP4 at TP1, MTP 3 steps:
+
+| decode batch | routing per MoE layer | decode step |
+|---|---|---|
+| 1 | 4.4 -> 4.4 us | -0.6% (noise) |
+| 8 | 13.3 -> 9.2 us | -3.5% (median of 3 runs) |
+| 32 | 15.7 -> 12.0 us | -2.9% |
+| 64 | 18.3 -> 15.3 us | -1.3% |
+| 128 | 21.0 -> 20.7 us | -0.1% |
+
+A 16k-token prefill chunk is unchanged.
 
 ### AMD
 
