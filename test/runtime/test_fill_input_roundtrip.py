@@ -31,7 +31,7 @@ import sys
 
 import pytest
 import torch
-from tokenspeed_scheduler import (
+from tokenspeed_engine.scheduler import (
     AttnKind,
     CacheGroupConfig,
     RequestSpec,

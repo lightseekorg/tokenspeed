@@ -24,7 +24,7 @@ from dataclasses import replace
 from test.ci_system.ci_register import register_cuda_ci
 
 import pytest
-import tokenspeed_scheduler as ts
+import tokenspeed_engine.scheduler as ts
 
 from tokenspeed.runtime.layers.attention.kv_cache.offload_config import KVOffloadPolicy
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (

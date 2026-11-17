@@ -2417,7 +2417,7 @@ def test_qwen4_exp_cache_recipe_adds_ple_and_qsa_groups() -> None:
     assert fields[qsa_rope_position_field(1)].dtype == "int64"
 
     def group_pages(max_tokens: int) -> dict[str, int]:
-        from tokenspeed_scheduler import SchedulerConfig
+        from tokenspeed_engine.scheduler import SchedulerConfig
 
         specs = setup.spec.cache_group_specs
         model = capacity_model(

@@ -33,7 +33,7 @@ from test.l3_test_utils import StorageOp, run_storage
 import pytest
 import torch
 from tokenspeed_engine import L3Executor
-from tokenspeed_scheduler import StorageKind
+from tokenspeed_engine.scheduler import StorageKind
 from transformers import Qwen3Config
 
 from tokenspeed.runtime.cache.host_storage import HostCacheResources, HostCacheStorage

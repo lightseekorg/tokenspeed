@@ -47,7 +47,7 @@ register_cuda_ci(est_time=60, suite="runtime-1gpu")
 
 from test.l3_test_utils import storage_scheduler  # noqa: E402
 
-from tokenspeed_scheduler import (  # noqa: E402
+from tokenspeed_engine.scheduler import (  # noqa: E402
     AttnKind,
     Cache,
     CacheGroupConfig,

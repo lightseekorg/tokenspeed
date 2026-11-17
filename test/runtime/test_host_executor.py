@@ -115,7 +115,7 @@ def _load_executor_module_without_triton(*, force_isolated=False):
     lanes.pinned_host_bytes = Mock(side_effect=lambda nbytes: nbytes)
     lanes.load_stream_priority = Mock(return_value=None)
     lanes.new_cache_stream = Mock()
-    scheduler = ModuleType("tokenspeed_scheduler")
+    scheduler = ModuleType("tokenspeed_engine.scheduler")
 
     class Cache:
         class WriteBackOp:
@@ -158,7 +158,7 @@ def _load_executor_module_without_triton(*, force_isolated=False):
     runtime_utils.get_device_module = Mock(return_value=Mock())
     fake_modules = {
         "tokenspeed_kernel.ops.kvcache.host_transfer": host_transfer,
-        "tokenspeed_scheduler": scheduler,
+        "tokenspeed_engine.scheduler": scheduler,
         "tokenspeed.runtime.cache.l2.layerwise_load": layerwise_load,
         "tokenspeed.runtime.cache.host_storage": storage,
         "tokenspeed.runtime.cache.transfer.lanes": lanes,
@@ -1124,7 +1124,7 @@ class TestGroupAwareWireTest:
     def test_optional_dependency_shim_restores_existing_modules(self):
         protected_names = (
             "tokenspeed_kernel.ops.kvcache.host_transfer",
-            "tokenspeed_scheduler",
+            "tokenspeed_engine.scheduler",
             "tokenspeed.runtime.cache.l2.layerwise_load",
             "tokenspeed.runtime.cache.host_storage",
             "tokenspeed.runtime.cache.transfer.lanes",
