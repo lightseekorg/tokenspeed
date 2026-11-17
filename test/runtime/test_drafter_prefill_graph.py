@@ -348,6 +348,7 @@ def _target_prefill_graph() -> prefill_graph_module.PrefillGraph:
         prefill_graph_capture_batch_sizes=None,
         input_logprob_chunk_tokens=1024,
         enable_speculative_sampling=False,
+        enable_dp_local_cuda_graph=False,
         query_shard_size=1,
         query_shard_rank=0,
         enable_memory_saver=False,
