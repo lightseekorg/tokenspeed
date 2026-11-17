@@ -390,15 +390,16 @@ class Qwen4ExpAttentionDecoderLayer(
     def _can_overlap_qsa(
         self, hidden_states: torch.Tensor, ctx: ForwardContext
     ) -> bool:
-        # Performance policy: one request with four BF16 verify rows. The
-        # indexer owns whether its cache/selection tail may use another stream.
+        # Performance policy: four BF16 verify rows per request, up to BS128
+        # on TP1. Other TP sizes retain the single-request policy.
+        max_bs = 128 if self.attn_tp_size == 1 else 1
         return (
             self.indexer is not None
             and self.qsa_fork.aux_stream is not None
             and hidden_states.is_cuda
             and hidden_states.dtype == torch.bfloat16
-            and hidden_states.shape[0] == 4
-            and ctx.bs == 1
+            and 1 <= ctx.bs <= max_bs
+            and hidden_states.shape[0] == ctx.bs * 4
             and self.indexer.can_overlap(ctx, num_rows=hidden_states.shape[0])
         )
 

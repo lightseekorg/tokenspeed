@@ -4328,13 +4328,24 @@ def test_hyperconnection_attention_residual_rows(
 @_requires_cuda
 @pytest.mark.skipif(torch.version.hip is not None, reason="CUDA graph ordering check")
 @pytest.mark.parametrize(
-    "hidden_size,num_heads,num_kv_heads,head_dim,index_heads,index_dim",
-    [(64, 2, 1, 32, 1, 32), (2560, 24, 4, 256, 4, 128)],
-    ids=["small", "tp1-full-width"],
+    "hidden_size,num_heads,num_kv_heads,head_dim,index_heads,index_dim,bs",
+    [
+        (64, 2, 1, 32, 1, 32, 1),
+        (2560, 24, 4, 256, 4, 128, 1),
+        (2560, 24, 4, 256, 4, 128, 128),
+    ],
+    ids=["small", "tp1-full-width", "tp1-bs128"],
 )
 @torch.inference_mode()
 def test_qsa_front_overlap_preserves_outputs_cache_and_graph_replay(
-    monkeypatch, hidden_size, num_heads, num_kv_heads, head_dim, index_heads, index_dim
+    monkeypatch,
+    hidden_size,
+    num_heads,
+    num_kv_heads,
+    head_dim,
+    index_heads,
+    index_dim,
+    bs,
 ):
     """Exercise the real layer and stream fork with tensor-only GPU kernels.
 
@@ -4375,7 +4386,8 @@ def test_qsa_front_overlap_preserves_outputs_cache_and_graph_replay(
         ).to(dtype=torch.bfloat16)
     for parameter in layer.parameters():
         parameter.normal_(std=0.05)
-    backend = _qsa_root(kernel_page_size=64, max_bs=1, spec=4, is_draft=False)
+    rows = bs * 4
+    backend = _qsa_root(kernel_page_size=64, max_bs=bs, spec=4, is_draft=False)
 
     class Pool:
         def __init__(self):
@@ -4384,20 +4396,22 @@ def test_qsa_front_overlap_preserves_outputs_cache_and_graph_replay(
     ctx = ForwardContext(
         attn_backend=backend,
         token_to_kv_pool=Pool(),
-        bs=1,
+        bs=bs,
         num_extends=0,
-        output_layout=ForwardOutputLayout(0, 0, 1, 4),
-        input_num_tokens=4,
+        output_layout=ForwardOutputLayout(0, 0, bs, 4),
+        input_num_tokens=rows,
         forward_mode=ForwardMode.DECODE,
     )
-    hidden = torch.randn(4, hidden_size, device="cuda", dtype=torch.bfloat16)
-    positions = torch.arange(4, device="cuda")
-    cache = torch.empty((4, num_kv_heads, head_dim), device="cuda", dtype=hidden.dtype)
+    hidden = torch.randn(rows, hidden_size, device="cuda", dtype=torch.bfloat16)
+    positions = torch.arange(rows, device="cuda")
+    cache = torch.empty(
+        (rows, num_kv_heads, head_dim), device="cuda", dtype=hidden.dtype
+    )
 
     def select(raw_q, token_k, positions, ctx):
         # A slow branch makes a missing join observable in the attention output.
         torch.cuda._sleep(100_000)
-        scores = raw_q.reshape(4, index_heads, index_dim).sum(1) + token_k[:, 0, :]
+        scores = raw_q.reshape(rows, index_heads, index_dim).sum(1) + token_k[:, 0, :]
         slots = (scores.argmax(-1) + positions).int().view(-1, 1)
         ctx.attn_backend.sparse_topk.qsa_selection = QSASelection(slots, slots, 4)
         return slots
@@ -4410,15 +4424,26 @@ def test_qsa_front_overlap_preserves_outputs_cache_and_graph_replay(
         if k is not None:
             q = prologue(q, k, v, positions, ctx).q
         keys = cache.repeat_interleave(num_heads // num_kv_heads, dim=1)
-        return (q.reshape(4, -1) + keys.reshape(4, -1) + topk_indices).contiguous()
+        return (
+            q.reshape(rows, -1) + keys.reshape(rows, -1) + topk_indices
+        ).contiguous()
 
     monkeypatch.setattr(layer.indexer, "forward_projected", select)
     monkeypatch.setattr(layer.attn, "prologue", prologue)
     monkeypatch.setattr(layer.attn, "forward", attention)
     serial = layer.qsa_fork
     parallel = StreamFork(torch.cuda.Stream())
+    layer.qsa_fork = parallel
+    assert layer._can_overlap_qsa(hidden, ctx)
+    oversized_ctx = replace(
+        ctx,
+        bs=129,
+        input_num_tokens=129 * 4,
+        output_layout=ForwardOutputLayout(0, 0, 129, 4),
+    )
+    oversized = hidden.new_empty((129 * 4, hidden_size))
+    assert not layer._can_overlap_qsa(oversized, oversized_ctx)
     for _ in range(3):
-        layer.qsa_fork = parallel
         layer.self_attention(positions, hidden, ctx)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()

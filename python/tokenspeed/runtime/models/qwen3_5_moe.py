@@ -30,6 +30,7 @@ from tokenspeed_kernel.ops.activation.triton import (
     fused_gate_sigmoid_mul_add,
     moe_finalize_gate_add,
 )
+from tokenspeed_kernel.ops.moe import try_router_gemm_nvfp4
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
@@ -432,6 +433,35 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
             )
         return output
 
+    def _try_router_quantization(self, hidden_states, ctx):
+        # Keep the measured TP4 decode policy. Pre-MLP communication must leave
+        # rows unchanged, since the packed input accompanies local logits.
+        if (
+            ctx.forward_mode is None
+            or not ctx.forward_mode.is_decode()
+            or ctx.num_extends != 0
+            or ctx.query_shard is not None
+            or hidden_states.shape[0] not in (1, 4)
+        ):
+            return None
+        if not (
+            self.mapping.attn.tp_size == self.mapping.moe.tp_ep_size == 4
+            and self.mapping.moe.ep_size == 1
+        ):
+            return None
+        if not (
+            self.experts.plan.get("weight_dtype") == "nvfp4"
+            and self.experts.plan.get("solution") == "flashinfer_trtllm"
+            and self.experts.supports_prequantized_input
+        ):
+            return None
+        # This consumer's padded hidden rows require its own quantizer.
+        if self.experts.gemm2_weights_fp4_shuffled.shape[1] != hidden_states.shape[1]:
+            return None
+        return try_router_gemm_nvfp4(
+            hidden_states, self.gate.weight, self.experts.w13_input_scale_quant
+        )
+
     def _forward_tp(
         self,
         hidden_states: torch.Tensor,
@@ -442,8 +472,12 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        # Gate on local (pre-comm) tokens
-        router_logits, _ = self.gate(hidden_states)
+        fused = self._try_router_quantization(hidden_states, ctx)
+        if fused is None:
+            router_logits, _ = self.gate(hidden_states)
+            x_quantized = None
+        else:
+            router_logits, x_quantized = fused
 
         # All-gather hidden_states and router_logits for topk + experts
         hidden_states = self.comm_manager.pre_mlp_comm(hidden_states, ctx)
@@ -496,6 +530,7 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
                 num_global_tokens=num_global_tokens,
                 max_num_tokens_per_gpu=max_num_tokens_per_gpu,
                 do_finalize=not fuse_finalize,
+                x_quantized=x_quantized,
             )
 
         if shared_output is not None:
