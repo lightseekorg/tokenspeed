@@ -72,7 +72,10 @@ def chain_verify_coins(
         slots: Int32 or int64 [B] pool indices in verify row order.
         seed_pool: Contiguous int64 request seeds, indexed by slot.
         offsets_pool: Contiguous int64 first target positions, indexed by slot.
-            Positions are nonnegative and fit in int32.
+            Positions must be in ``[0, 2**31)`` for the Philox counter layout.
+            Runtime requests are bounded by the scheduler's
+            ``CapacityModel::MaxRequestTokenLimit``, which reserves headroom
+            for verify windows, overlapping steps, and block rounding.
         coins: Contiguous fp32 [B, N] accept coin output.
         final_coins: Contiguous fp32 [B] residual/bonus coin output.
 
