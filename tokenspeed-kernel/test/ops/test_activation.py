@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sys
+
 import pytest
 import tokenspeed_kernel.ops.activation.triton as activation_triton
 import torch
@@ -156,10 +158,17 @@ def _headed_gate(
 @pytest.mark.parametrize("bias_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("layout", ["2d", "3d", "strided"])
+# Decode rows on one narrow tile; prefill rows on two wide tiles, the second partly masked.
+@pytest.mark.parametrize("tokens,heads", [(19, 8), (600, 24)])
 def test_sigmoid_mul_head_bias_matches_eager(
-    layout: str, dtype: torch.dtype, bias_dtype: torch.dtype, device: str
+    tokens: int,
+    heads: int,
+    layout: str,
+    dtype: torch.dtype,
+    bias_dtype: torch.dtype,
+    device: str,
 ) -> None:
-    tokens, heads, head_dim = 19, 8, 128
+    head_dim = 128
     x = torch.randn(tokens, heads * head_dim, device=device, dtype=dtype)
     gate = _headed_gate(layout, tokens, heads, head_dim, dtype, device)
     bias = torch.randn(heads, device=device)
@@ -198,8 +207,7 @@ def test_sigmoid_mul_launch_arguments(
     assert sigmoid_mul(x, gate, bias) is x
 
     ((args, kwargs),) = launches
-    assert args[0] is x and args[1] is gate and args[2] == x.numel()
-    assert args[3] is bias
+    assert args[0] is x and args[1] is gate and args[2] is bias
     width = heads * head_dim
     split_2d = head_dim if head_bias else width
     assert kwargs == {
@@ -207,7 +215,7 @@ def test_sigmoid_mul_launch_arguments(
         "head_dim": split_2d if layout == "2d" else head_dim,
         "gate_row_stride": gate.stride(0),
         "gate_head_stride": split_2d if layout == "2d" else gate.stride(1),
-        "BLOCK_SIZE": 1024,
+        "BLOCK_SIZE": width,
         "ENABLE_PDL": False,
     }
 
@@ -733,3 +741,7 @@ def test_relu2_contract(device: str) -> None:
         relu2(x, torch.empty_like(x), fp8_scale=torch.ones(1, device=device))
     with pytest.raises(ValueError, match="dense columns"):
         relu2(x.t(), x.t(), fp8_scale=None)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

@@ -17,6 +17,7 @@ from tokenspeed_kernel.ops.layernorm import (
 )
 from tokenspeed_kernel.ops.layernorm.triton import (
     _add_rmsnorm_kernel,
+    _fused_qk_rmsnorm_kernel,
     _fused_qk_rmsnorm_rope_kernel,
     _grouped_gemma_rmsnorm_kernel,
     _rmsnorm_kernel,
@@ -385,6 +386,50 @@ def test_fused_qk_rmsnorm_rope_compiles_once_per_token_block(device: str) -> Non
     run(1)
     run(601)
     with assert_no_triton_compile(_fused_qk_rmsnorm_rope_kernel):
+        for tokens in (2, 16, 37, 511, 512, 1024, 1100):
+            run(tokens)
+
+
+def _qk_norm(q, k, q_weight, k_weight, positions):
+    return qk_rmsnorm(
+        q, k, q_weight, k_weight, 1e-6, weight_offset=0.0, ssmax_positions=positions
+    )
+
+
+def test_qk_rmsnorm_heads_do_not_depend_on_their_neighbors(device: str) -> None:
+    """Beam's 12 + 2 heads per rank with SSMax, bit for bit each head launched alone."""
+    q, k, q_weight, k_weight, _, positions = _rope_inputs(37, 12, 2, device)
+    q_out, k_out = _qk_norm(q, k, q_weight, k_weight, positions)
+    head_dim = q_weight.shape[0]
+    for head in range(12):
+        kv = head % 2
+        q_cols = slice(head * head_dim, (head + 1) * head_dim)
+        kv_cols = slice(kv * head_dim, (kv + 1) * head_dim)
+        alone = _qk_norm(q[:, q_cols], k[:, kv_cols], q_weight, k_weight, positions)
+        assert torch.equal(alone[0], q_out[:, q_cols])
+        assert torch.equal(alone[1], k_out[:, kv_cols])
+
+
+def test_qk_rmsnorm_rows_do_not_depend_on_the_call_size(device: str) -> None:
+    """A prefill-sized call's rows, bit for bit the same rows called alone."""
+    q, k, q_weight, k_weight, _, positions = _rope_inputs(601, 12, 2, device)
+    whole = _qk_norm(q, k, q_weight, k_weight, positions)
+    for rows in (slice(0, 1), slice(37, 101), slice(597, 601)):
+        part = _qk_norm(q[rows], k[rows], q_weight, k_weight, positions[rows])
+        for got, want in zip(part, whole, strict=True):
+            assert torch.equal(got, want[rows])
+
+
+def test_qk_rmsnorm_compiles_once_per_token_block(device: str) -> None:
+    """One compile per tokens-per-program bucket, none per token count."""
+    q, k, q_weight, k_weight, _, positions = _rope_inputs(1100, 12, 2, device)
+
+    def run(tokens: int) -> None:
+        _qk_norm(q[:tokens], k[:tokens], q_weight, k_weight, positions[:tokens])
+
+    run(1)
+    run(601)
+    with assert_no_triton_compile(_fused_qk_rmsnorm_kernel):
         for tokens in (2, 16, 37, 511, 512, 1024, 1100):
             run(tokens)
 
