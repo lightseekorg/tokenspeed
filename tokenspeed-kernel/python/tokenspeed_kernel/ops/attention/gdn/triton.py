@@ -1183,6 +1183,7 @@ def triton_gdn_decode_mtp_chain(
         ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
     ),
     priority=Priority.PORTABLE,
+    traits={"strided_state": frozenset({False, True})},
 )
 def triton_gdn_chain_verify(
     q: torch.Tensor,

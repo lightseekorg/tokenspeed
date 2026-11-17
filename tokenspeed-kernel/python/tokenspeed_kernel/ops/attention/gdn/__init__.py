@@ -478,6 +478,7 @@ def gdn_decode_step(
         "padding_safe": _requires_padding_safe_decode(
             initial_state.dtype, output_only=False, solution=solution
         ),
+        "strided_state": not initial_state.is_contiguous(),
     }
     if solution != "flashinfer":
         # Only the legacy FlashInfer solution retains its old padding contract.
@@ -485,8 +486,6 @@ def gdn_decode_step(
         traits["state_dtype"] = initial_state.dtype
     if _qkv_rows_strided(q, k, v):
         traits["strided_qkv"] = True
-    if not initial_state.is_contiguous():
-        traits["strided_state"] = True
     kernel = select_kernel(
         "attention",
         "gdn_decode_step",
@@ -785,6 +784,8 @@ def gdn_decode_mtp(
         )
         and _chain_rows_dense(q, k, v, a, b),
         "replay_payload": replay_payload is not None,
+        "strided_state": not initial_state.is_contiguous()
+        or (output_state is not None and not output_state.is_contiguous()),
     }
     if solution != "flashinfer" and not output_only:
         # Only the legacy FlashInfer solution retains its old padding contract;
@@ -796,10 +797,6 @@ def gdn_decode_mtp(
         traits["separate_output_state"] = True
     if _qkv_rows_strided(q, k, v):
         traits["strided_qkv"] = True
-    if not initial_state.is_contiguous() or (
-        output_state is not None and not output_state.is_contiguous()
-    ):
-        traits["strided_state"] = True
     kernel = select_kernel(
         "attention",
         "gdn_decode_mtp",
@@ -895,7 +892,10 @@ def gdn_chain_verify(
         "attention",
         "gdn_chain_verify",
         signature,
-        traits={"head_dim": head_dim},
+        traits={
+            "head_dim": head_dim,
+            "strided_state": not initial_state.is_contiguous(),
+        },
         solution=solution,
         override=override,
     )

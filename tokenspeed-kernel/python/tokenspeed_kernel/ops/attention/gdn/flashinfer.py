@@ -389,7 +389,7 @@ if is_decode_available():
             "state_dtype": frozenset({torch.float32}),
             "separate_output_state": frozenset({False}),
             "strided_qkv": frozenset({False}),
-            "strided_state": frozenset({False}),
+            "strided_state": frozenset({False, True}),
         },
     )
     def flashinfer_gdn_decode_mtp(

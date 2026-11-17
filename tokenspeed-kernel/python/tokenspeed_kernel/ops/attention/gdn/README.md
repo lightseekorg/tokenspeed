@@ -29,6 +29,15 @@ uses normal selection, including fallback kernels for
 unsupported WY geometry. It may read the reserved null page for padding, but
 never writes it; padded outputs are ignored.
 
+Decode and verify registrations for Triton, CuTe DSL, Gluon and FlashInfer
+accept `strided_state=True` within their existing execution contracts. The
+operator derives this trait from both state pools, and runtime capability
+queries include the bound input pool's layout. FlashInfer 0.7.4 uses native
+4D pool indexing for padded FP32 state, including final-state writeback and
+per-token scatter; its BF16 MTP path also preserves padded pool strides.
+The CuTe DSL WY leaf remains output-only, and FlashInfer MTP still writes
+within its input pool rather than accepting a separate output pool.
+
 The leaf reads the committed state once per value tile, forms the small WY
 output transform and computes every token's output without writing the state
 pool or materializing node states. An optional payload receives exact raw
