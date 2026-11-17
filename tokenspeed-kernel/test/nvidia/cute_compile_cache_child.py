@@ -21,7 +21,8 @@
 """One process of test_cute_compile_cache: compile, run, report.
 
 Usage: python cute_compile_cache_child.py <case> <output.pt> [--kernel-file F]
-[--options S] [--capability M,N] [--compiles N] [--pretend CHANGE]. Prints one
+[--options S] [--stream explicit|env] [--capability M,N] [--compiles N]
+[--pretend CHANGE]. Prints one
 JSON line: whether the cache installed, its keyed compilations and hits, and
 the CuTe DSL kernels the monitor saw compile. ``--pretend`` stands in for a
 cutlass-dsl release the cache does not know.
@@ -99,6 +100,33 @@ def _add(kernel_file: str, options: str | None, compiles: int) -> list[torch.Ten
     return [x]
 
 
+def _add_tvm_ffi(kernel_file: str, stream: str) -> list[torch.Tensor]:
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import from_dlpack, make_fake_stream
+
+    spec = importlib.util.spec_from_file_location("cute_cache_case_kernel", kernel_file)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    x = torch.arange(32, device="cuda", dtype=torch.float32)
+    # The same trace either way; only the TVM-FFI entry attached after
+    # compiling takes the stream argument or reads the environment stream.
+    env_stream = stream == "env"
+    compiled = cute.compile(
+        module.add,
+        from_dlpack(x),
+        cutlass.Float32(1.5),
+        32,
+        make_fake_stream(use_tvm_ffi_env_stream=env_stream),
+        options="--enable-tvm-ffi",
+    )
+    if env_stream:
+        compiled(x, 1.5)
+    else:
+        compiled(x, 1.5, torch.cuda.current_stream())
+    return [x]
+
+
 def _gated_residual() -> list[torch.Tensor]:
     from tokenspeed_kernel.ops.residual import (
         gated_residual_mix,
@@ -164,10 +192,13 @@ def _stream_topk() -> list[torch.Tensor]:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("case", choices=("add", "gated_residual", "stream_topk"))
+    parser.add_argument(
+        "case", choices=("add", "add_tvm_ffi", "gated_residual", "stream_topk")
+    )
     parser.add_argument("output")
     parser.add_argument("--kernel-file")
     parser.add_argument("--options")
+    parser.add_argument("--stream", choices=("explicit", "env"))
     parser.add_argument("--capability")
     parser.add_argument("--compiles", type=int, default=1)
     parser.add_argument("--pretend", choices=_CHANGES)
@@ -185,6 +216,8 @@ def main() -> None:
     compile_monitor.install_compile_monitor("warn")
     if args.case == "add":
         outputs = _add(args.kernel_file, args.options, args.compiles)
+    elif args.case == "add_tvm_ffi":
+        outputs = _add_tvm_ffi(args.kernel_file, args.stream)
     elif args.case == "gated_residual":
         outputs = _gated_residual()
     else:

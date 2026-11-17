@@ -58,8 +58,36 @@ def add(x: cute.Tensor, value: cutlass.Float32, threads: cutlass.Constexpr):
 """
 
 
-def _run(cache_dir: Path, output: Path, case: str, *extra: str) -> dict:
-    env = dict(os.environ, CUTE_DSL_CACHE_DIR=str(cache_dir))
+_TVM_FFI_KERNEL = """
+import cuda.bindings.driver as cuda
+import cutlass
+import cutlass.cute as cute
+
+
+@cute.kernel
+def _add_kernel(x: cute.Tensor, value: cutlass.Float32):
+    tidx, _, _ = cute.arch.thread_idx()
+    x[tidx] = x[tidx] + value
+
+
+@cute.jit
+def add(
+    x: cute.Tensor,
+    value: cutlass.Float32,
+    threads: cutlass.Constexpr,
+    stream: cuda.CUstream,
+):
+    _add_kernel(x, value).launch(grid=(1, 1, 1), block=(threads, 1, 1), stream=stream)
+"""
+
+
+def _run(
+    cache_dir: Path | None, output: Path, case: str, *extra: str, **env_overrides: str
+) -> dict:
+    env = dict(os.environ, **env_overrides)
+    env.pop("CUTE_DSL_CACHE_DIR", None)
+    if cache_dir is not None:
+        env["CUTE_DSL_CACHE_DIR"] = str(cache_dir)
     env.pop("CUTE_DSL_DISABLE_FILE_CACHING", None)
     done = subprocess.run(
         [sys.executable, str(_CHILD), case, str(output), *extra],
@@ -165,6 +193,58 @@ def test_other_compile_options_miss(tmp_path, kernel_file):
     )
     assert other["hits"] == 0
     assert len(_entries(cache)) == 2
+
+
+def test_tvm_ffi_stream_conventions_keep_separate_entries(tmp_path):
+    # An explicit stream and the TVM-FFI environment stream trace the same IR;
+    # loading one's entry for the other fails at its first call.
+    kernel_file = tmp_path / "kernel.py"
+    kernel_file.write_text(_TVM_FFI_KERNEL)
+    cache = tmp_path / "cache"
+
+    def run(name: str, stream: str) -> dict:
+        return _run(
+            cache,
+            tmp_path / f"{name}.pt",
+            "add_tvm_ffi",
+            "--kernel-file",
+            str(kernel_file),
+            "--stream",
+            stream,
+        )
+
+    explicit = run("explicit", "explicit")
+    env = run("env", "env")
+    assert (explicit["hits"], env["hits"]) == (0, 0)
+    assert len(_entries(cache)) == 2
+    again = {stream: run(f"{stream}_again", stream) for stream in ("explicit", "env")}
+    assert again["explicit"]["hits"] == again["env"]["hits"] == 1
+    expected = torch.arange(32, dtype=torch.float32) + 1.5
+    for name in ("explicit", "env", "explicit_again", "env_again"):
+        assert torch.equal(torch.load(tmp_path / f"{name}.pt")[0], expected)
+
+
+def test_an_unset_cache_dir_persists_under_the_cache_home(tmp_path, kernel_file):
+    cache_home = tmp_path / "cache_home"
+    first = _run(
+        None,
+        tmp_path / "first.pt",
+        "add",
+        "--kernel-file",
+        str(kernel_file),
+        XDG_CACHE_HOME=str(cache_home),
+    )
+    assert first["hits"] == 0
+    assert len(_entries(cache_home / "tokenspeed" / "cute-dsl")) == 1
+    second = _run(
+        None,
+        tmp_path / "second.pt",
+        "add",
+        "--kernel-file",
+        str(kernel_file),
+        XDG_CACHE_HOME=str(cache_home),
+    )
+    assert second["hits"] == 1
 
 
 def test_a_corrupt_entry_is_recompiled_and_replaced(tmp_path, kernel_file):

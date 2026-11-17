@@ -28,14 +28,21 @@ one point every compilation passes after tracing, and lets those compilations
 use the same cache under a key that covers what can change the binary: the
 traced module's hash (its IR, cutlass-dsl's version, the DSL's compile-affecting
 environment and compile options), the source of the kernel's defining module,
-the installed cutlass-dsl version, the GPU architecture and the compile options.
-Tracing still runs; a hit skips lowering and ptxas.
+the installed cutlass-dsl version, the GPU architecture, the compile options
+and, with ``--enable-tvm-ffi``, the TVM-FFI argument spec. cutlass-dsl attaches
+the TVM-FFI entry only after compiling, so the traced module does not see it:
+an explicit stream and the TVM-FFI environment stream trace the same IR but
+need different entries. Tracing still runs; a hit skips lowering and ptxas.
 
 CuTe DSL's own switches apply: ``CUTE_DSL_DISABLE_FILE_CACHING`` or
 ``CUTE_DSL_NO_CACHE`` turn it off (for the experimental DSL too), and keeping
 PTX/CUBIN/SASS artifacts compiles afresh. Entries of every cutlass-dsl DSL go
-to CuTe DSL's directory (``CUTE_DSL_CACHE_DIR``, else cutlass-dsl's default)
-unless the DSL's own ``<NAME>_CACHE_DIR`` is set. cutlass-dsl writes entries
+to CuTe DSL's directory unless the DSL's own ``<NAME>_CACHE_DIR`` is set. That
+directory is ``CUTE_DSL_CACHE_DIR``; when it is unset, installing the cache sets
+it to ``$XDG_CACHE_HOME/tokenspeed/cute-dsl`` (``~/.cache`` without
+``XDG_CACHE_HOME``), beside TokenSpeed's FlashInfer autotune cache, because
+cutlass-dsl's own default under ``$TMPDIR`` starts empty in every new container.
+Like Triton's cache it is never pruned. cutlass-dsl writes entries
 atomically (a temporary directory, then a rename) and ignores, with a warning,
 an entry that fails its CRC or does not load; that kernel is recompiled.
 cutlass-dsl's own helpers (``HardwareInfo``) are not cached: their traces carry
@@ -81,8 +88,21 @@ _TESTED_CUTLASS_DSL = ((4, 8, 0), (4, 8, 1))
 
 # The BaseDSL.compile_and_cache parameters the cache reads or sets.
 _PARAMETERS = frozenset(
-    {"module", "module_hash", "function_name", "no_cache", "funcBody"}
+    {
+        "module",
+        "module_hash",
+        "function_name",
+        "sig",
+        "no_cache",
+        "full_args",
+        "full_kwargs",
+        "funcBody",
+    }
 )
+
+
+class _ProcessSpecific(Exception):
+    """A TVM-FFI spec value whose only description names a process address."""
 
 
 @dataclass(frozen=True)
@@ -99,6 +119,7 @@ def cute_compile_cache_key(
     cutlass_dsl_version: str,
     gpu_arch: str,
     compile_options: str,
+    tvm_ffi_spec: str,
 ) -> str:
     """The cache key of one compilation.
 
@@ -109,6 +130,8 @@ def cute_compile_cache_key(
         cutlass_dsl_version: Installed ``nvidia-cutlass-dsl`` version.
         gpu_arch: Target and device architecture.
         compile_options: The DSL's compile options as a string.
+        tvm_ffi_spec: The TVM-FFI argument spec attached after compiling, as
+            text; empty without ``--enable-tvm-ffi``.
 
     Returns:
         A hex digest naming the cache entry.
@@ -121,6 +144,7 @@ def cute_compile_cache_key(
         cutlass_dsl_version,
         gpu_arch,
         compile_options,
+        tvm_ffi_spec,
     ):
         digest.update(part.encode())
         digest.update(b"\0")
@@ -185,12 +209,21 @@ class _Cache:
             )
         if not self._applies(dsl, call):
             return None
+        tvm_ffi_spec = _tvm_ffi_spec(dsl, call)
+        if tvm_ffi_spec is None:
+            # Left uncached, as cute.compile asked: its key could never repeat.
+            logger.debug(
+                f"CuTe DSL compile cache skips {call['function_name']}: its "
+                "TVM-FFI spec names process addresses"
+            )
+            return None
         key = cute_compile_cache_key(
             dsl.get_module_hash(call["module"], call["function_name"]),
             _source_digest(call.get("funcBody")),
             self.cutlass_dsl_version,
             _gpu_arch(dsl),
             dsl.compile_options.to_str(),
+            tvm_ffi_spec,
         )
         call["module_hash"] = key
         call["no_cache"] = False
@@ -257,6 +290,7 @@ def install_cute_compile_cache() -> bool:
             "every kernel afresh"
         )
         return False
+    _use_persistent_cache_dir()
     cache = _Cache(previous, version)
 
     @functools.wraps(previous)
@@ -322,6 +356,61 @@ def cute_compile_cache_stats() -> CuteCompileCacheStats | None:
 
 def _switch_on(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _use_persistent_cache_dir() -> None:
+    """Point an unset ``CUTE_DSL_CACHE_DIR`` beside TokenSpeed's other caches.
+
+    Set in the environment so the ranks and workers this process starts share it.
+    """
+    if os.environ.get("CUTE_DSL_CACHE_DIR"):
+        return
+    cache_home = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    os.environ["CUTE_DSL_CACHE_DIR"] = os.path.join(
+        cache_home, "tokenspeed", "cute-dsl"
+    )
+
+
+def _tvm_ffi_spec(dsl: Any, call: dict[str, Any]) -> str | None:
+    """The TVM-FFI argument spec cutlass-dsl attaches after compiling, as text.
+
+    Empty without ``--enable-tvm-ffi``; None when a spec value can only be
+    described by a process address, so the call cannot be keyed.
+    """
+    if not dsl.compile_options.enable_tvm_ffi:
+        return ""
+    # CutlassBaseDSL.compile_and_cache sets the converter before it reaches
+    # BaseDSL.compile_and_cache, and builds the attached entry from its params.
+    params, _, _ = dsl._tvm_ffi_args_spec_converter(
+        call["function_name"], call["sig"], call["full_args"], call["full_kwargs"]
+    )
+    try:
+        return _describe(params)
+    except _ProcessSpecific:
+        return None
+
+
+def _describe(value: Any) -> str:
+    """Text for a TVM-FFI spec value that is the same in every process."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return repr(value)
+    if isinstance(value, (list, tuple)):
+        return f"[{','.join(_describe(item) for item in value)}]"
+    if isinstance(value, dict):
+        items = sorted(value.items(), key=lambda item: repr(item[0]))
+        return "{" + ",".join(f"{key!r}:{_describe(v)}" for key, v in items) + "}"
+    if inspect.isfunction(value):
+        cells = [cell.cell_contents for cell in value.__closure__ or ()]
+        return (
+            f"{value.__module__}.{value.__qualname__}"
+            f"{_describe(cells)}{_describe(value.__defaults__)}"
+        )
+    if hasattr(value, "__dict__") and not inspect.ismethod(value):
+        return f"{type(value).__qualname__}{_describe(vars(value))}"
+    text = str(value)
+    if " at 0x" in text:
+        raise _ProcessSpecific(text)
+    return f"{type(value).__qualname__}:{text}"
 
 
 def _share_cache_dir(dsl_name: str) -> None:
