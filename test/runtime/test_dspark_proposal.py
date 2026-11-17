@@ -373,10 +373,15 @@ class _RecordingShardSampler:
 
 
 def _shard_sampling_drafter(spec: int, start: int, columns: int):
+    """A CUDA shard walk over BF16 eighths, so every logit is exact."""
     drafter = _drafter(spec_num_tokens=spec)
-    drafter.markov_head.markov_w1.weight.data.normal_(0.0, 3.0)
-    drafter.markov_head.markov_w2.weight.data.normal_(0.0, 3.0)
-    drafter.lm_head = _ShardedHead(torch.randn(columns, HIDDEN), start=start)
+    markov = drafter.markov_head
+    markov.markov_w1.weight.data = _eighths(VOCAB, RANK, seed=7)
+    markov.markov_w2.weight.data = _eighths(VOCAB, RANK, seed=8)
+    drafter.markov_head = markov.to("cuda")
+    drafter.lm_head = _ShardedHead(
+        _eighths(columns, HIDDEN, seed=9).cuda(), start=start
+    )
     drafter.logits_processor = Mock()
     drafter.logits_processor.sampled_vocab_shard = lambda logits, head: (
         SimpleNamespace(logits=logits, head=head)
@@ -386,6 +391,9 @@ def _shard_sampling_drafter(spec: int, start: int, columns: int):
     return drafter
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="the shard walk's logits are a GPU kernel"
+)
 def test_sampled_steps_sample_the_biased_shard_of_their_own_position() -> None:
     """Step k samples position k-1's shard logits plus the previous bias.
 
@@ -393,12 +401,11 @@ def test_sampled_steps_sample_the_biased_shard_of_their_own_position() -> None:
     rank's columns only.
     """
     spec, start, columns = 5, 8, 8
-    torch.manual_seed(5)
     drafter = _shard_sampling_drafter(spec, start, columns)
-    hidden = torch.randn(2, spec, HIDDEN)
-    block = torch.zeros((2, spec), dtype=torch.int32)
+    hidden = _eighths(2, spec, HIDDEN, seed=10).cuda()
+    block = torch.zeros((2, spec), dtype=torch.int32, device="cuda")
     block[:, 0] = torch.tensor([3, 30], dtype=torch.int32)
-    tokens = torch.zeros((2, spec), dtype=torch.int32)
+    tokens = torch.zeros((2, spec), dtype=torch.int32, device="cuda")
 
     out = drafter._sample_block(hidden, block, tokens)
 
@@ -409,19 +416,27 @@ def test_sampled_steps_sample_the_biased_shard_of_their_own_position() -> None:
     for k, (_, got) in enumerate(sampler.steps, start=1):
         latent = drafter.markov_head.get_prev_latent(out[:, k - 1])
         want = hidden[:, k - 1, :] @ weight.T + latent @ w2.T
-        torch.testing.assert_close(got, want)
+        assert torch.equal(got, want)
         assert torch.equal(out[:, k], torch.argmax(got, dim=-1) + start)
 
 
-def test_the_shard_walk_needs_raw_logits_from_the_target_head() -> None:
-    """A processor that scales or softcaps its logits keeps gathered rows.
+def _gate_head(columns: int, start: int, dtype=torch.bfloat16):
+    head = VocabParallelEmbedding.__new__(VocabParallelEmbedding)
+    head.shard_indices = _ShardIndices(columns, start)
+    head.weight = torch.zeros(columns, HIDDEN, dtype=dtype)
+    return head
 
-    The bias joins the raw shard logits; otherwise the walk turns on.
+
+def test_the_shard_walk_needs_raw_logits_from_a_covered_bf16_shard() -> None:
+    """The shard walk stays off unless its kernel computes what gathered rows would.
+
+    The bias joins the raw shard logits, so a processor that scales or
+    softcaps them keeps gathered rows, as do a shard past the Markov rows
+    and weights other than BF16.
     """
     drafter = _drafter()
-    head = VocabParallelEmbedding.__new__(VocabParallelEmbedding)
-    head.shard_indices = _ShardIndices(8, 8)
-    drafter.lm_head = head
+    drafter.markov_head = drafter.markov_head.to(torch.bfloat16)
+    drafter.lm_head = _gate_head(8, 8)
     drafter._samples_vocab_shard = False
     supports = Mock(return_value=True)
     for scale, softcap in ((2.0, None), (None, 30.0)):
@@ -431,8 +446,13 @@ def test_the_shard_walk_needs_raw_logits_from_the_target_head() -> None:
         assert not drafter.keep_draft_logits_vocab_sharded(supports, 8)
     drafter.logits_processor = Mock(logit_scale=None, final_logit_softcapping=None)
     assert not drafter.keep_draft_logits_vocab_sharded(supports, 0)
+    drafter.lm_head = _gate_head(8, VOCAB - 4)
+    assert not drafter.keep_draft_logits_vocab_sharded(supports, VOCAB - 4)
+    drafter.lm_head = _gate_head(8, 8, dtype=torch.float16)
+    assert not drafter.keep_draft_logits_vocab_sharded(supports, 8)
     assert not drafter._samples_vocab_shard
 
+    head = drafter.lm_head = _gate_head(8, 8)
     assert drafter.keep_draft_logits_vocab_sharded(supports, 8)
     assert drafter._samples_vocab_shard
     drafter.logits_processor.keep_sampled_logits_vocab_sharded.assert_called_once_with(
