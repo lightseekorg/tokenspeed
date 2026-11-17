@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <optional>
 
+#include "cache/tier/peer.h"
 #include "cache/tier/storage.h"
 #include <vector>
 
@@ -109,6 +110,9 @@ struct SchedulerConfig {
     bool disable_l2_cache{false};
     bool enable_l3_storage{false};
     std::optional<StorageConfig> storage_config;
+    // Sharing cached prefixes with other replicas
+    // (docs/rfcs/0004-peer-prefix-sharing.md); absent turns it off.
+    std::optional<PeerConfig> peer_config;
     // Device residency events require at least one continuous Full/history group.
     bool enable_kv_cache_events{false};
     bool enable_mixed_prefill_decode{false};

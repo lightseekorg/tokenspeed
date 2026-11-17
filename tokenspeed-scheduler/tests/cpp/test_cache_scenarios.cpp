@@ -48,7 +48,8 @@ namespace {
 
 static_assert(
     std::is_same_v<decltype(std::declval<fsm::SchedulePrefillFirstChunkEvent&>()(std::declval<fsm::Submitted&&>())),
-                   std::variant<fsm::PrefillDone, fsm::PrefillAwaitingResult, fsm::Prefilling, fsm::RemotePrefilling>>);
+                   std::variant<fsm::PrefillDone, fsm::PrefillAwaitingResult, fsm::Prefilling, fsm::RemotePrefilling,
+                                fsm::PeerLanding>>);
 static_assert(std::is_same_v<decltype(std::declval<fsm::SchedulePrefillEvent&>()(std::declval<fsm::Prefilling&&>())),
                              std::variant<fsm::PrefillDone, fsm::PrefillAwaitingResult, fsm::Prefilling>>);
 

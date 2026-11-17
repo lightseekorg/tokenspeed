@@ -104,7 +104,8 @@ Scheduler::Scheduler(SchedulerConfig config)
       tier_transfers_{coordinator_},
       storage_transfers_{config_.enable_l3_storage
                              ? std::make_unique<StorageTransferManager>(coordinator_, *config_.storage_config)
-                             : nullptr} {
+                             : nullptr},
+      peer_exports_{config_.peer_config ? std::make_unique<PeerExports>(*config_.peer_config) : nullptr} {
     // config_.Validate() already ran; the body only derives state from it.
     cache_group_ids_.reserve(config_.cache_groups.size());
     for (const CacheGroupConfig& group : config_.cache_groups) {
@@ -127,7 +128,9 @@ Scheduler::Scheduler(SchedulerConfig config)
     if (config_.demote_superseded_state_checkpoints && config_.role != Role::kD && has_state_group) {
         checkpoint_lineage_.emplace();
     }
-    coordinator_.SetCheckpointDemotion(checkpoint_lineage_.has_value());
+    // A peer's complete read demotes the holder's copy (PeerExports::Release)
+    // through the same marks.
+    coordinator_.SetCheckpointDemotion(checkpoint_lineage_.has_value() || peer_exports_ != nullptr);
 
     if (const char* level = std::getenv("SPDLOG_LEVEL")) {
         spdlog::set_level(spdlog::level::from_str(level));
@@ -623,6 +626,10 @@ ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
     if (storage_transfers_) {
         ProfileSpan profile_span{"Scheduler::prepareStorage"};
         for (const auto& request : requests_) prepareStorage(*request);
+    }
+    if (peer_exports_) {
+        ProfileSpan profile_span{"Scheduler::preparePeer"};
+        for (const auto& request : requests_) preparePeer(*request);
     }
     std::vector<Request*> candidates;
     candidates.reserve(requests_.size());

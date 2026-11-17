@@ -35,9 +35,11 @@
 #include "cache/coordinator/cache_coordinator.h"
 #include "cache/core/block_pool.h"
 #include "cache/tier/transfer_manager.h"
+#include "cache/tier/peer_exports.h"
 #include "cache/tier/storage_manager.h"
 #include "fsm/forward_events.h"
 #include "fsm/pd_events.h"
+#include "fsm/peer_events.h"
 #include "resource/allocator/req_pool_allocator.h"
 #include "scheduler/checkpoint_lineage.h"
 #include "scheduler/execution_event.h"
@@ -178,6 +180,21 @@ public:
     };
     SharedPrefixPublication GetSharedPrefixPublication(std::span<const std::int32_t> tokens,
                                                        std::int32_t max_prefix_tokens) const;
+
+    // Peer prefix sharing (docs/rfcs/0004-peer-prefix-sharing.md): what this
+    // replica answered other replicas, and asked them, since the last take.
+    // Mirrored ranks produce the same; the runtime sends one replica's.
+    std::vector<PeerAnswer> TakePeerAnswers() { return std::exchange(peer_answers_, {}); }
+    std::vector<PeerLookupRequest> TakePeerLookups() { return std::exchange(peer_lookups_, {}); }
+    struct PeerStats {
+        std::size_t leases{0};
+        std::size_t pinned_blocks{0};
+        std::size_t looking_requests{0};
+        std::size_t landing_requests{0};
+        std::uint64_t landed_tokens{0};
+        std::uint64_t failed_landings{0};
+    };
+    PeerStats GetPeerStats() const;
 
     // Lifecycle counters read the current FSM state; they do not schedule work.
     std::size_t BootstrappingSize() const;
@@ -346,10 +363,14 @@ private:
     // a chunk's forward; one that would not is skipped (no capacity failure),
     // and one whose in-forward checkpoint block does not fit fails for
     // capacity rather than ending at the checkpoint.
+    // peer_landing_tokens, when positive, is the end of a peer landing: the
+    // first chunk is [hit, end), filled from the holder instead of computed
+    // (fsm::PrefillSource::kPeer). Zero computes it, or on the D role lands
+    // the whole prompt from the PD peer.
     FirstChunkOutcome schedulePrefillFirstChunk(ExecutionPlan& plan, AdmissionFeedback& feedback, Request* request,
                                                 std::int32_t remaining, std::int32_t decode_input_tokens,
                                                 std::int64_t kv_token_limit, std::int32_t yield_tokens,
-                                                bool must_complete);
+                                                bool must_complete, std::int32_t peer_landing_tokens);
     std::optional<fsm::SchedulePrefillEvent> schedulePrefill(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                              Request* request, std::int32_t remaining,
                                                              std::int32_t reserve_num_tokens_in_next_schedule_event,
@@ -474,6 +495,15 @@ private:
     // while a transfer may still touch its pages.
     void abortRequest(Request& request);
 
+    // A waiting prompt with a peer hint asks its holder, once; one past its
+    // wait gives the holder up.
+    void preparePeer(Request& request);
+    void handleEvent(const cache::PeerTick& event);
+    void handleEvent(const cache::PeerLookup& event);
+    void handleEvent(const cache::PeerPin& event);
+    void handleEvent(const cache::PeerRelease& event);
+    void handleEvent(const cache::PeerLookupAnswered& event);
+    void handleEvent(const cache::PeerFetchDone& event);
     void handleEvent(const cache::StorageTick& event);
     void handleEvent(const cache::StorageDone& event);
     void handleEvent(const cache::StorageDetach& event);
@@ -709,6 +739,13 @@ private:
     bool prefillDeferralExhausted(std::span<Request* const> candidates) const;
     bool belowPrefillWatermark() const;
     bool prefillAllowed(const Request& request, const PlanBuild& build) const;
+    // Admits the waiting prompts whose holder answered with more than their
+    // local hit, each as a landing (fsm::PrefillSource::kPeer) that rides
+    // ExecutionPlan::peer_fetches beside the batch, taking no token budget
+    // and no batch row. One that did not fit keeps its hit, and no local
+    // admission takes it this round.
+    void schedulePeerLandings(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
+                              bool new_prompts_sealed);
     void scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                                   bool new_prompts_sealed, std::int32_t decode_reserve);
     void scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates);
@@ -728,6 +765,15 @@ private:
     CacheCoordinator coordinator_;
     TierTransferManager tier_transfers_;
     std::unique_ptr<StorageTransferManager> storage_transfers_;
+    // Peer prefix sharing, when configured: the holder's leases, the peer
+    // clock, the reader's lease counter and what goes out to other replicas.
+    std::unique_ptr<PeerExports> peer_exports_;
+    std::int64_t peer_now_us_{0};
+    std::uint64_t next_peer_lease_{0};
+    std::vector<PeerAnswer> peer_answers_;
+    std::vector<PeerLookupRequest> peer_lookups_;
+    std::uint64_t peer_landed_tokens_{0};
+    std::uint64_t peer_failed_landings_{0};
     std::int64_t storage_now_us_{0};
     std::uint64_t storage_wait_timeouts_{0};
     std::uint64_t storage_ready_expirations_{0};

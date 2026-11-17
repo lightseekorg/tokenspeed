@@ -23,6 +23,7 @@
 #include "core/profile_span.h"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <limits>
 #include <memory>
@@ -33,6 +34,7 @@
 #include <iterator>
 #include <utility>
 
+#include "cache/tier/peer.h"
 #include "cache/prefix/prefix_matcher.h"
 #include "utils.h"
 
@@ -336,6 +338,95 @@ CacheCoordinator::AcquiredPrefix CacheCoordinator::acquirePrefix(PrefixProbe&& p
         }
     }
     return out;
+}
+
+CacheCoordinator::PrefixExport CacheCoordinator::ExportPrefix(PrefixProbe&& probe) {
+    PrefixExport out{.num_tokens = std::max(probe.device.num_common_tokens, probe.host.num_common_tokens)};
+    if (out.num_tokens == 0) {
+        return out;
+    }
+    // The Device's hits are claimed only when it resumes at all, as Admit
+    // claims them; the Host suffix's follow them in the table.
+    const bool device_claims = probe.device.num_common_tokens > 0;
+    out.access_epoch = history_.IssueAccessEpoch();
+    AcquiredPrefix acquired = acquirePrefix(std::move(probe), out.access_epoch);
+    const auto exported = [&](std::size_t i, std::int32_t slot, CacheTier tier, CacheBlockRef block) {
+        const BlockPool& pool = tier == CacheTier::kDevice ? store_.DevicePool() : *store_.HostPool();
+        const std::optional<CacheKey> key = store_.Groups()[i].Index().KeyOf(pool, block);
+        FatalCheck(key.has_value(), "an exported block has no entry");
+        return ExportedBlock{.key = *key, .slot = slot, .tier = tier, .block = std::move(block)};
+    };
+    for (std::size_t i = 0; i < store_.Groups().size(); ++i) {
+        std::vector<CacheBlockRef> device_blocks;
+        if (device_claims && !acquired.device.per_group.empty()) {
+            device_blocks = std::move(acquired.device.per_group[i].blocks);
+        }
+        std::vector<CacheBlockRef> host_blocks;
+        if (!acquired.host.per_group.empty()) {
+            host_blocks = std::move(acquired.host.per_group[i].blocks);
+        }
+        if (GroupIsState(i)) {
+            // One checkpoint, the Device's first.
+            for (auto [blocks, tier] :
+                 {std::pair{&device_blocks, CacheTier::kDevice}, std::pair{&host_blocks, CacheTier::kHost}}) {
+                const auto it = std::ranges::find_if(*blocks, [](const CacheBlockRef& block) { return bool(block); });
+                if (it != blocks->end()) {
+                    out.blocks.push_back(exported(i, kPeerStateSlot, tier, std::move(*it)));
+                    break;
+                }
+            }
+            continue;
+        }
+        const auto export_tier = [&](std::vector<CacheBlockRef>& blocks, CacheTier tier, std::int32_t first_slot) {
+            for (std::size_t j = 0; j < blocks.size(); ++j) {
+                if (blocks[j]) {
+                    out.blocks.push_back(
+                        exported(i, first_slot + static_cast<std::int32_t>(j), tier, std::move(blocks[j])));
+                }
+            }
+        };
+        export_tier(device_blocks, CacheTier::kDevice, 0);
+        export_tier(host_blocks, CacheTier::kHost, static_cast<std::int32_t>(device_blocks.size()));
+    }
+    return out;
+}
+
+std::int32_t CacheCoordinator::DemoteExportedChain(std::span<const CacheKey> keys, std::uint64_t access_epoch) {
+    std::unordered_map<ContentHash, std::vector<CacheKey>> by_boundary;
+    const BoundaryTree::Node* deepest = nullptr;
+    for (const CacheKey& key : keys) {
+        by_boundary[key.content_hash].push_back(key);
+        const BoundaryTree::Node* node = store_.Boundaries().Find(key.content_hash);
+        if (node != nullptr && (deepest == nullptr || node->boundary_tokens > deepest->boundary_tokens)) {
+            deepest = node;
+        }
+    }
+    const auto accessed_since = [&](const CacheKey& key) {
+        for (const BlockPool* pool : std::array<const BlockPool*, 2>{&store_.DevicePool(), store_.HostPool()}) {
+            if (pool == nullptr) {
+                continue;
+            }
+            const auto entry = store_.Groups()[key.group_id].Index().Inspect(*pool, key);
+            if (entry && entry->metadata.eviction.last_access_epoch > access_epoch) {
+                return true;
+            }
+        }
+        return false;
+    };
+    std::vector<CacheKey> chain;
+    const BoundaryTree::Node* below = nullptr;
+    for (const BoundaryTree::Node* node = deepest; node != nullptr; below = node, node = node->parent) {
+        bool branches = false;
+        for (const BoundaryTree::Node* child = node->first_child; child != nullptr; child = child->next_sibling) {
+            branches |= child != below;
+        }
+        const auto exported = by_boundary.find(node->hash);
+        if (branches || exported == by_boundary.end() || std::ranges::any_of(exported->second, accessed_since)) {
+            break;
+        }
+        chain.insert(chain.end(), exported->second.begin(), exported->second.end());
+    }
+    return DemoteEntries(chain);
 }
 
 // A full-pool census, and deliberately so: whether a parent is reclaimable
