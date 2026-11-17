@@ -417,8 +417,10 @@ def _markov_shard_logits_kernel(
     tile = tl.program_id(0)
     row_offsets = tl.program_id(1) * ROWS + tl.arange(0, ROWS)
     row_mask = row_offsets < rows
+    # Row strides scale by the request index: widen before the multiply.
+    rows64 = row_offsets.to(tl.int64)
     previous = tl.load(
-        previous_ptr + row_offsets * previous_stride, mask=row_mask, other=0
+        previous_ptr + rows64 * previous_stride, mask=row_mask, other=0
     ).to(tl.int64)
     # Graph padding rows carry arbitrary tokens; keep their gathers in bounds.
     previous = tl.minimum(tl.maximum(previous, 0), vocab_size - 1)
@@ -445,14 +447,14 @@ def _markov_shard_logits_kernel(
         bias = tl.dot(bigram, tl.trans(weight), bias)
     mask = row_mask[:, None] & vocab_mask[None, :]
     base = tl.load(
-        base_ptr + row_offsets[:, None] * base_row_stride + vocab_offsets[None, :],
+        base_ptr + rows64[:, None] * base_row_stride + vocab_offsets[None, :],
         mask=mask,
         other=0.0,
     )
     dtype = out_ptr.dtype.element_ty
     logits = (base.to(tl.float32) + bias.to(dtype).to(tl.float32)).to(dtype)
     tl.store(
-        out_ptr + row_offsets[:, None] * out_row_stride + vocab_offsets[None, :],
+        out_ptr + rows64[:, None] * out_row_stride + vocab_offsets[None, :],
         logits,
         mask=mask,
     )
