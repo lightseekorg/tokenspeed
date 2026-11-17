@@ -171,20 +171,52 @@ def _ref_rope(tensor, positions, cos_sin_cache, rotary_dim, sections=None):
 
 
 def test_qwen4_exp_qsa_compress_and_store_matches_torch(device: str) -> None:
-    torch.manual_seed(5)
-    ratio, head_dim, rotary_dim, recent_page_size = 4, 16, 8, 64
-    compressed_token_page_size, rows_per_page = 256, 64
     # Rows 1 and 2 end compression groups; row 1's group spans the batch
     # start (cached fallback plus cached group-start positions), row 2 has
     # no valid compressed slot and must not write.
-    logical = torch.tensor([10, 11, 15], device=device)
-    requests = torch.tensor([0, 0, 0], device=device)
-    token_k = torch.randn(3, 1, head_dim, device=device, dtype=torch.bfloat16)
+    _check_compress_and_store(
+        device,
+        seed=5,
+        logical=[10, 11, 15],
+        requests=[0, 0, 0],
+        recent_locs=[130, 131, 134],
+        qsa_locs=[0, 263, 0],
+    )
+
+
+def test_qwen4_exp_qsa_compress_and_store_keeps_requests_apart(device: str) -> None:
+    # Rows 5 and 6 end groups next to rows of the other request or other positions.
+    _check_compress_and_store(
+        device,
+        seed=11,
+        logical=[5, 9, 9, 7, 10, 11, 11],
+        requests=[0, 1, 0, 0, 0, 1, 0],
+        recent_locs=[133, 201, 137, 135, 138, 203, 139],
+        qsa_locs=[0, 0, 0, 0, 0, 300, 263],
+    )
+
+
+def _check_compress_and_store(
+    device: str,
+    *,
+    seed: int,
+    logical: list[int],
+    requests: list[int],
+    recent_locs: list[int],
+    qsa_locs: list[int],
+) -> None:
+    torch.manual_seed(seed)
+    ratio, head_dim, rotary_dim, recent_page_size = 4, 16, 8, 64
+    compressed_token_page_size, rows_per_page = 256, 64
+    rows = len(logical)
+    logical = torch.tensor(logical, device=device)
+    requests = torch.tensor(requests, device=device)
+    token_k = torch.randn(rows, 1, head_dim, device=device, dtype=torch.bfloat16)
     raw = torch.randn(4, ratio, 1, head_dim, device=device, dtype=torch.bfloat16)
-    position_values = torch.randint(0, 48, (3, 3), device=device, dtype=torch.int64)
+    position_values = torch.randint(0, 48, (rows, 3), device=device, dtype=torch.int64)
     position_cache = torch.randint(0, 48, (4, 3), device=device, dtype=torch.int64)
-    recent_locs = torch.tensor([130, 131, 134], device=device, dtype=torch.int32)
-    qsa_locs = torch.tensor([0, 263, 0], device=device, dtype=torch.int32)
+    recent_locs = torch.tensor(recent_locs, device=device, dtype=torch.int32)
+    qsa_locs = torch.tensor(qsa_locs, device=device, dtype=torch.int32)
     norm_weight = torch.rand(head_dim, device=device) + 0.5
     epsilon = 1e-6
     cos_sin_cache = torch.randn(64, rotary_dim, device=device)
@@ -223,14 +255,14 @@ def test_qwen4_exp_qsa_compress_and_store_matches_torch(device: str) -> None:
         recent_page_size,
         ratio,
     )
-    pooled = pooled.reshape(3, head_dim).float()
+    pooled = pooled.reshape(rows, head_dim).float()
     normed = (
         pooled
         * torch.rsqrt(pooled.pow(2).mean(dim=-1, keepdim=True) + epsilon)
         * norm_weight
     )
     rotated = _ref_rope(
-        normed.view(3, 1, head_dim),
+        normed.view(rows, 1, head_dim),
         first_positions.T,
         cos_sin_cache,
         rotary_dim,

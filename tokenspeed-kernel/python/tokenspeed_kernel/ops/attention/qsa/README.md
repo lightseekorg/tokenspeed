@@ -273,6 +273,12 @@ but contribute zero complete blocks to scoring and top-k selection.
 Compressed-key RoPE is read only at compression write boundaries. Non-boundary
 draft rows may have valid raw-key tags before their group-start header is staged.
 
+The compression kernel runs on the decode critical path, beside the attention
+projections on the other stream, so it is latency-bound: a chain of dependent
+loads. With a fused query, a second program per row normalizes and rotates the
+query, keeping those loads off the key chain, and the compression-group tags
+are masked loads that issue together rather than one branch per member.
+
 Each recent-cache page owns a separate raw-key ring. A later token suppresses
 an earlier writer only when both address the same physical page and ring slot.
 Prefill must leave the last raw keys and group-start positions in every page

@@ -335,6 +335,8 @@ def _qwen4_exp_qsa_compress_and_store_kernel(
         # Successors may prepare now; their waits still protect these outputs.
         tl.extra.cuda.gdc_launch_dependents()
     row = tl.program_id(0)
+    # A second program per row normalizes and rotates the query, off the key chain.
+    query_program = tl.program_id(1) == 1
     half = rotary_dim // 2
     half_offsets = tl.arange(0, BLOCK_HALF)
     half_mask = half_offsets < half
@@ -346,7 +348,7 @@ def _qwen4_exp_qsa_compress_and_store_kernel(
     recent_loc = tl.load(recent_locs + row).to(tl.int64)
     page = tl.maximum(recent_loc, 0) // recent_page_size
 
-    if HAS_QUERY:
+    if HAS_QUERY and query_program:
         query_axes = tl.arange(0, 4)
         query_axis_mask = query_axes < 3
         query_positions = tl.load(
@@ -458,6 +460,9 @@ def _qwen4_exp_qsa_compress_and_store_kernel(
                 mask=pass_mask,
             )
 
+    if query_program:
+        return
+
     # Gather the compression group and average its raw keys. Members still
     # present in the current batch come from the input keys; older members
     # fall back to the raw cache page. The fused path must finish these
@@ -469,12 +474,17 @@ def _qwen4_exp_qsa_compress_and_store_kernel(
         offset = COMPRESS_RATIO - 1 - member
         source = row - offset
         expected = position - offset
-        from_current = source >= 0
+        # Masked loads instead of a branch let every member's tag loads issue at once.
         safe_source = tl.maximum(source, 0)
-        if from_current:
-            from_current = (
-                tl.load(request_indices + source).to(tl.int64) == request
-            ) & (tl.load(logical_positions + source).to(tl.int64) == expected)
+        source_request = tl.load(
+            request_indices + safe_source, mask=source >= 0, other=-1
+        ).to(tl.int64)
+        source_position = tl.load(
+            logical_positions + safe_source, mask=source >= 0, other=-1
+        ).to(tl.int64)
+        from_current = (
+            (source >= 0) & (source_request == request) & (source_position == expected)
+        )
         slot = (expected % COMPRESS_RATIO + COMPRESS_RATIO) % COMPRESS_RATIO
         from_draft = False
         if HAS_DRAFT:
@@ -561,12 +571,18 @@ def _qwen4_exp_qsa_compress_and_store_kernel(
     # Group-start RoPE positions: current batch row or cached page header.
     head_source = row - (COMPRESS_RATIO - 1)
     head_expected = position - (COMPRESS_RATIO - 1)
-    from_current_head = head_source >= 0
     safe_head_source = tl.maximum(head_source, 0)
-    if from_current_head:
-        from_current_head = (
-            tl.load(request_indices + head_source).to(tl.int64) == request
-        ) & (tl.load(logical_positions + head_source).to(tl.int64) == head_expected)
+    head_request = tl.load(
+        request_indices + safe_head_source, mask=head_source >= 0, other=-1
+    ).to(tl.int64)
+    head_position = tl.load(
+        logical_positions + safe_head_source, mask=head_source >= 0, other=-1
+    ).to(tl.int64)
+    from_current_head = (
+        (head_source >= 0)
+        & (head_request == request)
+        & (head_position == head_expected)
+    )
     head_slot = (head_expected % COMPRESS_RATIO + COMPRESS_RATIO) % COMPRESS_RATIO
     from_draft_head = False
     if HAS_DRAFT:
@@ -905,7 +921,9 @@ def qwen4_exp_qsa_compress_and_store(
     # kernel reads it through its strides directly, and index tensors are
     # cast in-kernel, so no host-side copy/cast kernel is launched.
     use_pdl = _is_nvidia and enable_pdl
-    kernel_launcher(_qwen4_exp_qsa_compress_and_store_kernel, (rows,))(
+    kernel_launcher(
+        _qwen4_exp_qsa_compress_and_store_kernel, (rows, 2 if has_query else 1)
+    )(
         token_k,
         query,
         query_norm_weight,
