@@ -76,7 +76,7 @@ def tuned(tmp_path_factory):
     assert load_autotune_cache(path, None, 0)
 
 
-@pytest.mark.parametrize("m", [1, 2, 3, 4])
+@pytest.mark.parametrize("m", [1, 2, 3, 4, 8, 17, 32])
 @pytest.mark.parametrize("seed", [7, 23, 41])
 def test_tuned_projection_and_changed_input_graph(m, seed):
     x, w = inputs(m, seed)
@@ -85,6 +85,8 @@ def test_tuned_projection_and_changed_input_graph(m, seed):
     assert fi.flashinfer_joint_bf16_supported(x, w, out)
     assert mm(x, w, out=out) is out
     check_result(out, x, w)
+    # mm() took the CuTe DSL path, not cuBLASLt.
+    assert torch.equal(fi.flashinfer_bf16_gemm(x, w, None), out)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
@@ -104,7 +106,7 @@ def test_tuned_projection_and_changed_input_graph(m, seed):
         assert torch.all(storage[m * N :] == 42)
 
 
-@pytest.mark.parametrize("m", [1, 3, 4])
+@pytest.mark.parametrize("m", [1, 3, 4, 32])
 def test_pdl_and_cancellation(m):
     x, w = inputs(m, 91)
     x[:, K // 2 :] = -x[:, : K // 2]
@@ -121,7 +123,7 @@ def test_pdl_and_cancellation(m):
         pdl_enabled(previous)
 
 
-@pytest.mark.parametrize("m", [5, 17, 32, 48, 128, 192])
+@pytest.mark.parametrize("m", [33, 48, 128, 192])
 def test_larger_rows_keep_original_gemm(m):
     x, w = inputs(m, 99)
     out = torch.empty(m, N, dtype=x.dtype, device=x.device)
@@ -133,8 +135,8 @@ def test_larger_rows_keep_original_gemm(m):
 def test_other_projections_and_invalid_layouts_keep_original_gemm():
     x, w = inputs(4, 10)
     for a, b in [
-        (x[:, :2560].contiguous(), w[:, :2560].contiguous()),
-        (x, w[:512]),
+        # K % 128 != 0
+        (x[:, :2112].contiguous(), w[:, :2112].contiguous()),
         (x[:, ::2], w[:, ::2]),
     ]:
         assert not fi.flashinfer_joint_bf16_supported(a, b, None)
