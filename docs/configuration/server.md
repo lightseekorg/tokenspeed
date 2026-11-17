@@ -1921,10 +1921,11 @@ owner, then the providers, then the engines.
 
 * `provider --owner ADDRESS --hostname HOST --device-name NICS --bytes B`: one
   per node, hosting `B` bytes of pool memory registered for RDMA. A provider
-  announces its memory once, at start. Until the pool is built, a provider
-  that announces from a node that has announced before (its provider was
-  started again) takes the place of the earlier one. Once the pool is built
-  the owner refuses it: the owner then has to be restarted with it.
+  announces its memory once, at start, and the owner counts every
+  announcement as one provider: a provider that is started again counts as one
+  more until `--providers` have joined, and is refused after that. The owner
+  cannot tell that the earlier one's memory is gone, so restart the owner
+  together with a provider.
 
 The owner keeps everything in memory, and a provider announces its memory
 only when it starts: a restarted owner waits for new providers and knows none

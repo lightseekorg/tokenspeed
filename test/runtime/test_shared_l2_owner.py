@@ -190,31 +190,6 @@ def test_providers_join_before_the_pool_runs_with_whole_lcm_blocks(serve, connec
         owner.add_provider("node2", 8)
 
 
-def test_a_node_that_announces_again_replaces_its_earlier_provider(serve):
-    owner = serve(num_providers=2, joined_providers=0)
-    hello = dict(client=1, geometry=GEOMETRY, deployment_id=deployment_id())
-    # node0's provider restarts before the pool is built: a new Mooncake
-    # session, and the memory the earlier one announced is gone.
-    owner.add_provider("node0:17001", 8)
-    owner.add_provider("node0:17002", 4)
-    assert not owner.admin.request("hello", **hello)["ready"]
-
-    owner.add_provider("node1:17001", 8)
-    # Again, with every provider there and no pool yet.
-    owner.add_provider("node0:17003", 2)
-    with pytest.raises(OwnerError, match="every expected provider"):
-        owner.add_provider("node2:17001", 8)
-
-    assert owner.admin.request("hello", **hello)["providers"] == [
-        {"session": "node1:17001", "base": 1 << 40, "lcm_blocks": 8, "start": 0},
-        {"session": "node0:17003", "base": 1 << 40, "lcm_blocks": 2, "start": 8},
-    ]
-    assert owner.pool.num_lcm_blocks == 10
-    # The pool's memory is settled: a provider that restarts now is refused.
-    with pytest.raises(OwnerError, match="cannot join a running pool"):
-        owner.add_provider("node0:17004", 8)
-
-
 def test_without_a_block_size_the_first_client_sets_the_providers_shares(serve):
     owner = serve(num_providers=2, joined_providers=0, lcm_bytes=None)
     # Providers join with their bytes, whatever a block will hold.

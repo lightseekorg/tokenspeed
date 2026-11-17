@@ -25,9 +25,9 @@ holds no bytes. The pool is built when every expected provider has joined and
 the first client reports its cache geometry; later clients must match that
 geometry and the deployment the pool caches for. A provider joins with its
 bytes; its share of the pool, in LCM blocks, is settled when the pool is built,
-from ``lcm_bytes`` or else the first client's LCM block. One provider runs per
-node: until the pool is built, a node that announces again has restarted its
-provider, and the new one takes the earlier one's place. A client silent for
+from ``lcm_bytes`` or else the first client's LCM block. Every announcement
+is one provider: one that is started again counts as one more, or is refused
+once every expected provider has joined. A client silent for
 ``client_timeout_s`` loses its pins and reservations, and its next request is
 answered with an error.
 
@@ -214,18 +214,6 @@ class SharedL2Owner:
         if self._pool is not None:
             raise RuntimeError("providers cannot join a running pool")
         session, size = str(request["session"]), int(request["bytes"])
-        # One provider runs per node, so a session of a node that has joined
-        # is that node's provider started again: the memory the earlier one
-        # announced is gone.
-        node = session.rsplit(":", 1)[0]
-        for earlier in self._joined:
-            if earlier["session"].rsplit(":", 1)[0] == node:
-                logger.warning(
-                    f"shared L2 provider {session} takes the place of "
-                    f"{earlier['session']}, which its node announced before"
-                )
-                self._joined.remove(earlier)
-                break
         if len(self._joined) == self._num_providers:
             raise RuntimeError("every expected provider has already joined")
         # Without a block size yet, the pool's creation checks the provider.
