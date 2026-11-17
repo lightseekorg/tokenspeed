@@ -215,7 +215,7 @@ The trade-off: a junction publishes one checkpoint, and reaching past a
 missing window moves it from the producer's chunk end below the coverage
 (the last boundary with a window, where the cut used to land) up to the
 coverage itself. A later prompt diverging between the two finds neither and
-resumes at the next checkpoint below (e.g. a producer chunk end at 8, a
+resumes at the next checkpoint below (for example, a producer chunk end at 8, a
 coverage of 10: a prompt diverging at 9 resumed at 8 before and now at 0).
 The common case it serves is the opposite one: siblings that share the whole
 prefix up to the coverage, which now resume there instead of a chunk earlier.
