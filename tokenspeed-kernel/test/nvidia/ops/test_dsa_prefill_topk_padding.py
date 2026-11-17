@@ -41,14 +41,11 @@ platform = current_platform()
 if not (torch.cuda.is_available() and platform.is_nvidia and platform.is_hopper_plus):
     pytest.skip("the DeepGEMM DSA top-k needs a Hopper+ GPU", allow_module_level=True)
 
-from tokenspeed_kernel._optional import (  # noqa: E402
-    has_optional_package,
-    has_trtllm_kernel,
-)
+from tokenspeed_kernel._optional import has_optional_package  # noqa: E402
 
-if not has_optional_package("deep_gemm") or not has_trtllm_kernel():
+if not has_optional_package("deep_gemm"):
     pytest.skip(
-        "the default DSA prefill top-k needs deep_gemm and trtllm_kernel",
+        "the default DSA prefill top-k needs deep_gemm",
         allow_module_level=True,
     )
 

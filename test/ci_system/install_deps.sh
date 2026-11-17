@@ -333,7 +333,6 @@ from flashinfer_jit_cache_installer import install_url_if_needed
 
 checked_packages = (
     "torch",
-    "tokenspeed-trtllm-kernel",
     "tokenspeed-cutedsl-kda",
     "flashinfer-python",
     "nvidia-cudnn-frontend",

@@ -50,15 +50,3 @@ def has_fa4_cute() -> bool:
         the ``flash_attn.cute`` submodule are all importable.
     """
     return has_optional_package("flash_attn", "quack", "flash_attn.cute")
-
-
-def has_trtllm_kernel() -> bool:
-    """Whether TRT-LLM's kernel package is present with its DeepEP partner.
-
-    DeepEP must initialize before TRT-LLM's static CUDA runtime, so the two
-    are probed as one stack.
-
-    Returns:
-        True when both ``trtllm_kernel`` and ``deep_ep`` are importable.
-    """
-    return has_optional_package("trtllm_kernel", "deep_ep")
