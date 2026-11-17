@@ -31,6 +31,9 @@ from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
 _RELU2_FP8_MAX = tl.constexpr(448.0)
 
+# From this many tokens each finalize program covers a row, not 1024 columns.
+_FINALIZE_ROW_PROGRAM_MIN_TOKENS = 512
+
 __all__ = [
     "add3",
     "fused_gate_sigmoid_mul_add",
@@ -272,7 +275,10 @@ def moe_finalize_gate_add(
     expanded_idx_to_permuted_idx = expanded_idx_to_permuted_idx.reshape(-1).contiguous()
     BLOCK = triton.next_power_of_2(hidden_dim)
     num_warps = 4 if BLOCK <= 2048 else (8 if BLOCK <= 4096 else 16)
-    chunk = min(BLOCK, 1024)
+    if num_tokens >= _FINALIZE_ROW_PROGRAM_MIN_TOKENS:
+        chunk = BLOCK
+    else:
+        chunk = min(BLOCK, 1024)
     enable_pdl = pdl_enabled()
     _moe_finalize_gate_add_kernel[(num_tokens, triton.cdiv(hidden_dim, chunk))](
         gemm2_out,
