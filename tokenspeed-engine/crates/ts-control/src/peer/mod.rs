@@ -339,6 +339,7 @@ impl Peer {
             .filter_map(|(request, landing)| landing.done().map(|tokens| (request.clone(), tokens)))
             .collect();
         for (request, num_tokens) in done {
+            tracing::debug!(request, num_tokens, "peer landing done");
             self.landings.remove(&request);
             self.fenced.remove(&request);
             self.reading.remove(&request);
@@ -378,6 +379,14 @@ impl Peer {
         for fetch in fetches {
             let known = self.layouts.contains_key(&fetch.holder);
             let request = fetch.request_id.clone();
+            tracing::debug!(
+                request,
+                holder = fetch.holder,
+                begin = fetch.begin_tokens,
+                end = fetch.end_tokens,
+                layout_known = known,
+                "peer landing started"
+            );
             let (landing, action) =
                 Landing::new(fetch, self.members, known, now_us, self.settings.timeouts);
             self.landings.insert(request.clone(), landing);
@@ -471,6 +480,13 @@ impl Peer {
                             .iter_mut()
                             .find(|(_, landing)| *landing.lease() == answer.lease)
                         {
+                            tracing::debug!(
+                                request,
+                                held = answer.held,
+                                trusted,
+                                num_tokens = answer.num_tokens,
+                                "peer pin answered"
+                            );
                             if let Some(action) = landing.pinned(answer.clone(), trusted, now_us) {
                                 actions.push((request.clone(), action));
                             }
