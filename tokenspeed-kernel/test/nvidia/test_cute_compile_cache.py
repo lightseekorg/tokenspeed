@@ -84,11 +84,12 @@ def add(
 def _run(
     cache_dir: Path | None, output: Path, case: str, *extra: str, **env_overrides: str
 ) -> dict:
-    env = dict(os.environ, **env_overrides)
+    env = dict(os.environ)
     env.pop("CUTE_DSL_CACHE_DIR", None)
+    env.pop("CUTE_DSL_DISABLE_FILE_CACHING", None)
     if cache_dir is not None:
         env["CUTE_DSL_CACHE_DIR"] = str(cache_dir)
-    env.pop("CUTE_DSL_DISABLE_FILE_CACHING", None)
+    env.update(env_overrides)
     done = subprocess.run(
         [sys.executable, str(_CHILD), case, str(output), *extra],
         env=env,
@@ -245,6 +246,65 @@ def test_an_unset_cache_dir_persists_under_the_cache_home(tmp_path, kernel_file)
         XDG_CACHE_HOME=str(cache_home),
     )
     assert second["hits"] == 1
+
+
+def test_an_unwritable_cache_dir_turns_the_cache_off(tmp_path, kernel_file):
+    # cutlass-dsl creates the directory outside its error handling when it
+    # writes an entry; a directory under a regular file can never be created.
+    blocker = tmp_path / "blocker"
+    blocker.write_text("")
+    result = _add(blocker / "cache", tmp_path / "out.pt", kernel_file)
+    assert result["installed"] is False
+    assert result["stderr"].count("CuTe DSL compile cache off") == 1, result["stderr"]
+    expected = torch.arange(32, dtype=torch.float32) + 1.5
+    assert torch.equal(torch.load(tmp_path / "out.pt")[0], expected)
+
+
+def test_kept_compiler_artifacts_are_never_served_from_the_cache(tmp_path, kernel_file):
+    cache, dump = tmp_path / "cache", tmp_path / "dump"
+    dump.mkdir()
+    for name in ("first", "second"):
+        for kept in dump.iterdir():
+            kept.unlink()
+        result = _add(
+            cache,
+            tmp_path / f"{name}.pt",
+            kernel_file,
+            f"--options=--keep-ptx --keep-cubin --dump-dir {dump}",
+        )
+        assert result["keyed"] == 0
+        assert sorted(path.suffix for path in dump.iterdir()) == [".cubin", ".ptx"]
+    assert not _entries(cache)
+
+
+def test_disabling_file_caching_writes_no_entry(tmp_path, kernel_file):
+    cache = tmp_path / "cache"
+    for name in ("first", "second"):
+        result = _run(
+            cache,
+            tmp_path / f"{name}.pt",
+            "add",
+            "--kernel-file",
+            str(kernel_file),
+            CUTE_DSL_DISABLE_FILE_CACHING="1",
+        )
+        assert result["keyed"] == 0
+    assert not _entries(cache)
+
+
+def test_dropped_compiled_functions_are_released(tmp_path, kernel_file):
+    cache = tmp_path / "cache"
+    for name in ("first", "second"):
+        result = _run(
+            cache,
+            tmp_path / f"{name}.pt",
+            "add_dropped",
+            "--kernel-file",
+            str(kernel_file),
+        )
+        assert result["keyed"] == 3
+        assert result["alive"] == 0
+    assert result["hits"] == 3
 
 
 def test_a_corrupt_entry_is_recompiled_and_replaced(tmp_path, kernel_file):

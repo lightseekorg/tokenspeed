@@ -42,7 +42,9 @@ directory is ``CUTE_DSL_CACHE_DIR``; when it is unset, installing the cache sets
 it to ``$XDG_CACHE_HOME/tokenspeed/cute-dsl`` (``~/.cache`` without
 ``XDG_CACHE_HOME``), beside TokenSpeed's FlashInfer autotune cache, because
 cutlass-dsl's own default under ``$TMPDIR`` starts empty in every new container.
-Like Triton's cache it is never pruned. cutlass-dsl writes entries
+A directory that cannot be written leaves the cache off. Like Triton's cache it
+is never pruned. A cached compilation is not kept in cutlass-dsl's in-memory
+cache, so callers own their compiled functions as with plain ``cute.compile``. cutlass-dsl writes entries
 atomically (a temporary directory, then a rename) and ignores, with a warning,
 an entry that fails its CRC or does not load; that kernel is recompiled.
 cutlass-dsl's own helpers (``HardwareInfo``) are not cached: their traces carry
@@ -64,6 +66,7 @@ import inspect
 import logging
 import os
 import re
+import tempfile
 import threading
 from dataclasses import dataclass
 from typing import Any
@@ -175,11 +178,14 @@ class _Cache:
             return self.previous(dsl, *args, **kwargs)
         # Only module_hash and no_cache differ from cutlass-dsl's call: the
         # arguments of a direct @cute.jit call, which cutlass-dsl caches itself.
-        bound, key, in_memory, before = keyed
+        bound, key, before = keyed
         result = self.previous(*bound.args, **bound.kwargs)
+        # A cached call also keeps the function in cutlass-dsl's in-memory
+        # cache for the life of the process; cute.compile callers own theirs.
+        _forget_in_memory(dsl, key)
         try:
             # A hit leaves the entry untouched; one that failed to load is rewritten.
-            hit = in_memory or (before is not None and before == _entry_stat(dsl, key))
+            hit = before is not None and before == _entry_stat(dsl, key)
         except Exception as error:
             self._turn_off(f"{type(error).__name__}: {error}")
             return result
@@ -194,7 +200,7 @@ class _Cache:
 
     def _key(
         self, dsl: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
-    ) -> tuple[inspect.BoundArguments, str, bool, tuple[int, int] | None] | None:
+    ) -> tuple[inspect.BoundArguments, str, tuple[int, int] | None] | None:
         """The call keyed for the file cache, or None where the cache does not apply."""
         bound = self.signature.bind(dsl, *args, **kwargs)
         call = bound.arguments
@@ -227,7 +233,7 @@ class _Cache:
         )
         call["module_hash"] = key
         call["no_cache"] = False
-        return bound, key, dsl.jit_cache.get(key) is not None, _entry_stat(dsl, key)
+        return bound, key, _entry_stat(dsl, key)
 
     def _turn_off(self, reason: str) -> None:
         with self.lock:
@@ -241,8 +247,11 @@ class _Cache:
 
     @staticmethod
     def _applies(dsl: Any, call: dict[str, Any]) -> bool:
-        # Only what cute.compile forced uncached; CUTE_DSL_* switches cover every DSL.
+        # Only what cute.compile forced uncached; CUTE_DSL_* switches cover every
+        # DSL. Kept PTX/CUBIN/SASS, from the environment or the compile options,
+        # are files a hit would not write, so those compilations run afresh.
         envar = dsl.envar
+        options = dsl.compile_options
         func = call.get("funcBody")
         if (
             not call["no_cache"]
@@ -255,6 +264,9 @@ class _Cache:
             or envar.keep_ptx
             or envar.keep_cubin
             or envar.keep_sass
+            or options.dump_ptx_path is not None
+            or options.dump_cubin_path is not None
+            or options.dump_sass_path is not None
         ):
             return False
         _share_cache_dir(dsl.name)
@@ -284,13 +296,14 @@ def install_cute_compile_cache() -> bool:
         reason = _unsupported(BaseDSL, previous, version)
     except Exception as error:
         version, reason = "", f"{type(error).__name__}: {error}"
+    if reason is None:
+        reason = _prepare_cache_dir()
     if reason is not None:
         logger.warning(
             f"CuTe DSL compile cache off: {reason}; cute.compile compiles "
             "every kernel afresh"
         )
         return False
-    _use_persistent_cache_dir()
     cache = _Cache(previous, version)
 
     @functools.wraps(previous)
@@ -320,6 +333,8 @@ def _unsupported(base_dsl: type, compile_and_cache: Any, version: str) -> str | 
 
     if not callable(getattr(cache_helpers, "get_default_generated_ir_path", None)):
         return "cutlass-dsl's get_default_generated_ir_path is missing"
+    if not isinstance(getattr(cache_helpers.JitCacheDict(), "_dict", None), dict):
+        return "cutlass-dsl's JitCacheDict no longer keeps its entries in _dict"
     return None
 
 
@@ -344,6 +359,9 @@ def uninstall_cute_compile_cache() -> None:
 
     BaseDSL.compile_and_cache = _cache.previous
     _cache = None
+    if _default_cache_dir_set:
+        os.environ.pop("CUTE_DSL_CACHE_DIR", None)
+        _set_default_cache_dir(False)
 
 
 def cute_compile_cache_stats() -> CuteCompileCacheStats | None:
@@ -358,17 +376,51 @@ def _switch_on(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
-def _use_persistent_cache_dir() -> None:
-    """Point an unset ``CUTE_DSL_CACHE_DIR`` beside TokenSpeed's other caches.
+# Whether installing set CUTE_DSL_CACHE_DIR, so uninstalling can unset it.
+_default_cache_dir_set = False
 
-    Set in the environment so the ranks and workers this process starts share it.
+
+def _set_default_cache_dir(value: bool) -> None:
+    global _default_cache_dir_set
+    _default_cache_dir_set = value
+
+
+def _prepare_cache_dir() -> str | None:
+    """Create CuTe DSL's cache directory; why it cannot be written, or None.
+
+    An unset ``CUTE_DSL_CACHE_DIR`` points beside TokenSpeed's other caches, in
+    the environment so the ranks and workers this process starts share it.
+    cutlass-dsl creates the directory outside its own error handling when it
+    writes an entry, so an unwritable one would fail every cached compilation.
     """
-    if os.environ.get("CUTE_DSL_CACHE_DIR"):
-        return
-    cache_home = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
-    os.environ["CUTE_DSL_CACHE_DIR"] = os.path.join(
-        cache_home, "tokenspeed", "cute-dsl"
-    )
+    if not os.environ.get("CUTE_DSL_CACHE_DIR"):
+        cache_home = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+        if os.path.isabs(cache_home):
+            os.environ["CUTE_DSL_CACHE_DIR"] = os.path.join(
+                cache_home, "tokenspeed", "cute-dsl"
+            )
+            _set_default_cache_dir(True)
+    from cutlass.base_dsl.cache_helpers import get_default_generated_ir_path
+
+    path = get_default_generated_ir_path("CUTE_DSL")
+    try:
+        os.makedirs(path, exist_ok=True)
+        # cutlass-dsl writes each entry through a temporary directory there.
+        with tempfile.TemporaryDirectory(dir=path):
+            pass
+    except OSError as error:
+        if _default_cache_dir_set:
+            os.environ.pop("CUTE_DSL_CACHE_DIR", None)
+            _set_default_cache_dir(False)
+        return f"cache directory {path} cannot be written ({error})"
+    return None
+
+
+def _forget_in_memory(dsl: Any, key: str) -> None:
+    """Drop ``key`` from cutlass-dsl's in-memory cache, detaching its finalizer."""
+    entry = dsl.jit_cache._dict.pop(key, None)
+    if entry is not None and entry[1] is not None:
+        entry[1].detach()
 
 
 def _tvm_ffi_spec(dsl: Any, call: dict[str, Any]) -> str | None:

@@ -44,6 +44,9 @@ from tokenspeed_kernel.cute_compile_cache import (
     install_cute_compile_cache,
 )
 
+# Extra fields a case adds to the printed report.
+_REPORT: dict = {}
+
 _CHANGES = ("untested-version", "renamed-parameters", "no-cache-shape", "keying-error")
 
 
@@ -97,6 +100,31 @@ def _add(kernel_file: str, options: str | None, compiles: int) -> list[torch.Ten
             module.add, from_dlpack(x), cutlass.Float32(1.5), 32, **kwargs
         )
         compiled(from_dlpack(x), cutlass.Float32(1.5))
+    return [x]
+
+
+def _add_dropped(kernel_file: str) -> list[torch.Tensor]:
+    import gc
+    import weakref
+
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import from_dlpack
+
+    spec = importlib.util.spec_from_file_location("cute_cache_case_kernel", kernel_file)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    x = torch.arange(32, device="cuda", dtype=torch.float32)
+    alive = []
+    for threads in (8, 16, 32):
+        compiled = cute.compile(
+            module.add, from_dlpack(x), cutlass.Float32(1.5), threads
+        )
+        compiled(from_dlpack(x), cutlass.Float32(1.5))
+        alive.append(weakref.ref(compiled))
+        del compiled
+    gc.collect()
+    _REPORT["alive"] = sum(ref() is not None for ref in alive)
     return [x]
 
 
@@ -193,7 +221,8 @@ def _stream_topk() -> list[torch.Tensor]:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "case", choices=("add", "add_tvm_ffi", "gated_residual", "stream_topk")
+        "case",
+        choices=("add", "add_dropped", "add_tvm_ffi", "gated_residual", "stream_topk"),
     )
     parser.add_argument("output")
     parser.add_argument("--kernel-file")
@@ -216,6 +245,8 @@ def main() -> None:
     compile_monitor.install_compile_monitor("warn")
     if args.case == "add":
         outputs = _add(args.kernel_file, args.options, args.compiles)
+    elif args.case == "add_dropped":
+        outputs = _add_dropped(args.kernel_file)
     elif args.case == "add_tvm_ffi":
         outputs = _add_tvm_ffi(args.kernel_file, args.stream)
     elif args.case == "gated_residual":
@@ -237,6 +268,7 @@ def main() -> None:
                 "keyed": None if stats is None else stats.keyed,
                 "hits": None if stats is None else stats.hits,
                 "kernels": kernels,
+                **_REPORT,
             }
         )
     )
