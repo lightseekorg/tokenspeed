@@ -1211,7 +1211,7 @@ launch command.
 ### NVIDIA
 
 ```bash
-FLASHINFER_ROUTING_FORCE_BLOCK_PER_TOKEN=0 ts serve \
+ts serve \
     --model Qwen/Qwen3.8-Flash-Next-FP8 \
     --trust-remote-code \
     --tensor-parallel-size 4 \
@@ -1221,18 +1221,25 @@ FLASHINFER_ROUTING_FORCE_BLOCK_PER_TOKEN=0 ts serve \
     --speculative-num-steps 3
 ```
 
-`FLASHINFER_ROUTING_FORCE_BLOCK_PER_TOKEN=0` selects FlashInfer's MoE routing
-kernels for this model's routes (512 experts, top-10, softmax). By default, from
-32 to 256 tokens per MoE call, FlashInfer splits routing into a block-per-token
-top-k kernel and a permutation kernel. With the variable set, it runs one fused
-single-cluster kernel instead. From 257 to 1024 tokens it uses the
-warp-per-token top-k kernel instead of the block-per-token one. The routed
-experts and weights are bit-identical either way, and calls below 32 or above
-1024 tokens are unchanged.
+On SM107, also set `FLASHINFER_ROUTING_FORCE_BLOCK_PER_TOKEN=0` (FlashInfer
+0.7.4) in the server's environment. It changes which routing kernels FlashInfer
+runs for this model's routes (512 experts, top-10, softmax). By default, from
+32 to 256 tokens per MoE call, FlashInfer splits routing into a
+block-per-token top-k kernel and a permutation kernel; with the variable set,
+it runs one fused single-cluster kernel. From 257 to 1024 tokens it uses the
+warp-per-token top-k kernel instead of the block-per-token one. Calls below 32
+or above 1024 tokens are unchanged, and the routed experts and weights are
+bit-identical either way. With MTP 3 steps, a decode step routes 4 tokens per
+request, so a batch of 8 requests makes 32-token calls.
 
-FlashInfer reads the variable once per process and applies it to every route,
-and sigmoid-with-bias routes (DeepSeek-V3 style) are faster split, so set it
-only for this model.
+FlashInfer's default for this route comes from a routing-only sweep that
+covered SM100 and SM103 as well, and FlashInfer labels the variable a
+benchmarking override. The timings below were measured only on SM107, with the
+NVFP4 checkpoint at TP1 (BF16 router logits), so they are not a measurement of
+the FP8 command above; the token ranges, which depend only on the expert count,
+top-k and token count, are the same for it. FlashInfer reads the variable once
+per process for all of its custom (non-grouped) routing, whose default was
+tuned across expert counts and top-k, so set it only for this model.
 
 Measured on one SM107 GPU, Qwen3.8-Flash-Next-NVFP4 at TP1, MTP 3 steps:
 
