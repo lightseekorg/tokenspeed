@@ -103,10 +103,11 @@ struct PeerLookupRequest {
 
 enum class PeerAnswerKind { kLookup, kPin, kRelease };
 
-// Holder -> reader. A lookup's answer carries the boundary the holder can
-// resume the prompt at (0: a miss) and soft-pins it; a pin's, the boundary
-// the hard pin holds (no longer than the lookup's) and its pages; a
-// release's, whether the hard pin held for its whole life.
+// Holder -> reader, answered at once from the holder's cache as it stands,
+// without a scheduling round: a lookup's answer carries the boundary the
+// holder can resume the prompt at (0: a miss) and the pages to read; a pin's,
+// whether those pages are still the ones (held: true); a release's, whether
+// the pages stayed untouched from the pin to the release.
 struct PeerAnswer {
     PeerLeaseId lease;
     PeerAnswerKind kind{PeerAnswerKind::kLookup};
@@ -138,7 +139,9 @@ struct PeerTick {
     std::int64_t now_us{0};
 };
 
-// Holder: a reader's lookup, pin and release, as every member applies them.
+// Holder: a reader's lookup, pin and release, as every member applies them
+// at the head of the round after the holder answered them: the lookup's soft
+// pin, the pin's block references, the release's demotion.
 struct PeerLookup {
     PeerLeaseId lease;
     std::vector<std::string> prefix_hashes;
@@ -147,6 +150,10 @@ struct PeerLookup {
 };
 struct PeerPin {
     PeerLeaseId lease;
+    // The boundary and pages the holder told the reader it may read: the pin
+    // holds exactly these, or nothing.
+    std::int32_t num_tokens{0};
+    std::vector<PeerPage> pages;
 };
 struct PeerRelease {
     PeerLeaseId lease;

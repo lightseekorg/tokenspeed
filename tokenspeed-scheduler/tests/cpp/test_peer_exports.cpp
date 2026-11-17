@@ -107,12 +107,26 @@ protected:
         return entry && entry->metadata.demoted;
     }
 
-    // Looks the first `tokens` up, pins and releases them, asking to demote.
-    PeerAnswer ReadAndRelease(std::uint64_t id, const std::vector<std::int32_t>& tokens, bool demote) {
-        const PeerAnswer looked_up =
-            exports_.Lookup(coordinator_, Lookup(id, tokens, static_cast<std::int32_t>(tokens.size())), 0);
-        exports_.Pin(coordinator_, cache::PeerPin{.lease = looked_up.lease}, 0);
-        return exports_.Release(coordinator_, cache::PeerRelease{.lease = looked_up.lease, .demote = demote});
+    // Answers a lookup and applies its soft pin, as the head after it does.
+    PeerAnswer LookUp(const cache::PeerLookup& lookup, std::int64_t now_us = 0) {
+        const PeerAnswer answer = PeerExports::AnswerLookup(coordinator_, lookup);
+        exports_.Lookup(coordinator_, lookup, now_us);
+        return answer;
+    }
+    // Applies the pin of what `answer` named.
+    void PinAnswer(const PeerAnswer& answer, std::int64_t now_us = 0) {
+        exports_.Pin(coordinator_,
+                     cache::PeerPin{.lease = answer.lease, .num_tokens = answer.num_tokens, .pages = answer.pages},
+                     now_us);
+    }
+    // Looks the first `tokens` up, pins and releases them, asking to demote;
+    // returns whether the pin held.
+    bool ReadAndRelease(std::uint64_t id, const std::vector<std::int32_t>& tokens, bool demote) {
+        const PeerAnswer answer = LookUp(Lookup(id, tokens, static_cast<std::int32_t>(tokens.size())));
+        PinAnswer(answer);
+        const bool held = exports_.Held(answer.lease);
+        exports_.Release(coordinator_, cache::PeerRelease{.lease = answer.lease, .demote = demote});
+        return held;
     }
 
     std::int32_t DeviceBlockId(std::uint32_t group, const std::string& hash) const {
@@ -131,21 +145,16 @@ protected:
     PeerExports exports_{Config()};
 };
 
-TEST_F(PeerExportsTest, ALookupAnswersTheBoundaryAndAPinExportsItsBlocksAtTheirSlots) {
+TEST_F(PeerExportsTest, ALookupIsAnsweredWithItsPagesAtTheirSlotsWithoutHoldingThem) {
     const std::vector<std::int32_t> tokens = MakeTokens(3 * kP);
     Publish({tokens.begin(), tokens.begin() + 2 * kP});
     const std::vector<std::string> hashes = PageHashes(tokens);
 
-    const PeerAnswer looked_up = exports_.Lookup(coordinator_, Lookup(1, tokens, 3 * kP), /*now_us=*/0);
-    EXPECT_EQ(looked_up.kind, PeerAnswerKind::kLookup);
-    EXPECT_EQ(looked_up.num_tokens, 2 * kP);
-    EXPECT_TRUE(looked_up.pages.empty());
-    EXPECT_EQ(exports_.NumPinnedBlocks(), 0u) << "a soft pin holds no block";
-
-    const PeerAnswer pinned = exports_.Pin(coordinator_, cache::PeerPin{.lease = looked_up.lease}, /*now_us=*/10);
-    EXPECT_EQ(pinned.num_tokens, 2 * kP);
+    const PeerAnswer answer = PeerExports::AnswerLookup(coordinator_, Lookup(1, tokens, 3 * kP));
+    EXPECT_EQ(answer.kind, PeerAnswerKind::kLookup);
+    EXPECT_EQ(answer.num_tokens, 2 * kP);
     EXPECT_EQ(
-        pinned.pages,
+        answer.pages,
         (std::vector<PeerPage>{
             {.group_id = kFull, .slot = 0, .tier = CacheTier::kDevice, .block_id = DeviceBlockId(kFull, hashes[0])},
             {.group_id = kFull, .slot = 1, .tier = CacheTier::kDevice, .block_id = DeviceBlockId(kFull, hashes[1])},
@@ -154,107 +163,106 @@ TEST_F(PeerExportsTest, ALookupAnswersTheBoundaryAndAPinExportsItsBlocksAtTheirS
              .tier = CacheTier::kDevice,
              .block_id = DeviceBlockId(kState, hashes[1])},
         }));
+    EXPECT_EQ(exports_.NumLeases(), 0u) << "answering changes nothing";
+    EXPECT_TRUE(coordinator_.ClearCache());
+}
+
+TEST_F(PeerExportsTest, APinHoldsExactlyTheAnsweredPagesUntilTheRelease) {
+    const std::vector<std::int32_t> tokens = MakeTokens(2 * kP);
+    Publish(tokens);
+    const PeerAnswer answer = LookUp(Lookup(1, tokens, 2 * kP));
+    EXPECT_EQ(exports_.NumPinnedBlocks(), 0u) << "a soft pin holds no block";
+    PinAnswer(answer);
+    EXPECT_TRUE(exports_.Held(answer.lease));
     EXPECT_EQ(exports_.NumPinnedBlocks(), 3u);
     EXPECT_FALSE(coordinator_.ClearCache()) << "the pin holds the blocks";
 
-    const PeerAnswer released = exports_.Release(coordinator_, cache::PeerRelease{.lease = looked_up.lease});
-    EXPECT_EQ(released.kind, PeerAnswerKind::kRelease);
-    EXPECT_TRUE(released.held);
+    exports_.Release(coordinator_, cache::PeerRelease{.lease = answer.lease});
     EXPECT_EQ(exports_.NumLeases(), 0u);
     EXPECT_TRUE(coordinator_.ClearCache());
 }
 
-TEST_F(PeerExportsTest, APinNeverReachesPastTheLookedUpBoundary) {
-    const std::vector<std::int32_t> tokens = MakeTokens(4 * kP);
-    Publish({tokens.begin(), tokens.begin() + kP});
-    const PeerAnswer looked_up = exports_.Lookup(coordinator_, Lookup(1, tokens, 4 * kP), /*now_us=*/0);
-    ASSERT_EQ(looked_up.num_tokens, kP);
-    // A longer prefix published after the lookup is not what the reader admitted.
-    Publish({tokens.begin(), tokens.begin() + 3 * kP});
-
-    const PeerAnswer pinned = exports_.Pin(coordinator_, cache::PeerPin{.lease = looked_up.lease}, /*now_us=*/0);
-    EXPECT_EQ(pinned.num_tokens, kP);
-    EXPECT_EQ(pinned.pages.size(), 2u) << "one KV page and its checkpoint";
-}
-
-TEST_F(PeerExportsTest, AnExpiredPinLetsItsBlocksGoAndItsReleaseReportsIt) {
+TEST_F(PeerExportsTest, APinOfPagesThatChangedHoldsNothing) {
     const std::vector<std::int32_t> tokens = MakeTokens(2 * kP);
     Publish(tokens);
-    const PeerAnswer looked_up = exports_.Lookup(coordinator_, Lookup(1, tokens, 2 * kP), /*now_us=*/0);
-    ASSERT_EQ(exports_.Pin(coordinator_, cache::PeerPin{.lease = looked_up.lease}, /*now_us=*/0).num_tokens, 2 * kP);
+    PeerAnswer answer = LookUp(Lookup(1, tokens, 2 * kP));
+    answer.pages.back().block_id += 1;  // not what the cache holds
+    PinAnswer(answer);
+    EXPECT_FALSE(exports_.Held(answer.lease));
+    EXPECT_EQ(exports_.NumLeases(), 0u);
+    EXPECT_TRUE(coordinator_.ClearCache());
+}
+
+TEST_F(PeerExportsTest, PagesMatchUpToTheAnsweredBoundaryEvenAfterALongerPublication) {
+    const std::vector<std::int32_t> tokens = MakeTokens(4 * kP);
+    Publish({tokens.begin(), tokens.begin() + kP});
+    const cache::PeerLookup lookup = Lookup(1, tokens, 4 * kP);
+    const PeerAnswer answer = LookUp(lookup);
+    ASSERT_EQ(answer.num_tokens, kP);
+    // A longer prefix published after the answer is not what the reader admitted.
+    Publish({tokens.begin(), tokens.begin() + 3 * kP});
+    EXPECT_TRUE(PeerExports::Matches(coordinator_, lookup, answer.num_tokens, answer.pages));
+    PinAnswer(answer);
+    EXPECT_TRUE(exports_.Held(answer.lease));
+    EXPECT_EQ(exports_.NumPinnedBlocks(), 2u) << "one KV page and its checkpoint";
+
+    exports_.Release(coordinator_, cache::PeerRelease{.lease = answer.lease});
+    ASSERT_TRUE(coordinator_.ClearCache());
+    EXPECT_FALSE(PeerExports::Matches(coordinator_, lookup, answer.num_tokens, answer.pages)) << "the pages left";
+}
+
+TEST_F(PeerExportsTest, AnExpiredPinLetsItsBlocksGoAndIsNoLongerHeld) {
+    const std::vector<std::int32_t> tokens = MakeTokens(2 * kP);
+    Publish(tokens);
+    const PeerAnswer answer = LookUp(Lookup(1, tokens, 2 * kP));
+    PinAnswer(answer);
 
     exports_.Expire(/*now_us=*/999);
     EXPECT_EQ(exports_.NumPinnedBlocks(), 3u) << "before its deadline";
     exports_.Expire(/*now_us=*/1000);
     EXPECT_EQ(exports_.NumPinnedBlocks(), 0u);
+    EXPECT_FALSE(exports_.Held(answer.lease));
     EXPECT_TRUE(coordinator_.ClearCache());
     EXPECT_EQ(exports_.NumLeases(), 1u) << "the tombstone";
-    EXPECT_FALSE(exports_.Release(coordinator_, cache::PeerRelease{.lease = looked_up.lease}).held);
-    EXPECT_EQ(exports_.NumLeases(), 0u);
-}
-
-TEST_F(PeerExportsTest, AnUnreleasedTombstoneGoesAfterAnotherPinLifetime) {
-    const std::vector<std::int32_t> tokens = MakeTokens(2 * kP);
-    Publish(tokens);
-    const PeerAnswer looked_up = exports_.Lookup(coordinator_, Lookup(1, tokens, 2 * kP), /*now_us=*/0);
-    ASSERT_GT(exports_.Pin(coordinator_, cache::PeerPin{.lease = looked_up.lease}, /*now_us=*/0).num_tokens, 0);
-    exports_.Expire(/*now_us=*/1000);
     exports_.Expire(/*now_us=*/2000);
     EXPECT_EQ(exports_.NumLeases(), 0u);
 }
 
-TEST_F(PeerExportsTest, ASoftPinExpiresAndAPinAfterItMisses) {
+TEST_F(PeerExportsTest, ASoftPinExpiresAndAPinAfterItHoldsNothing) {
     const std::vector<std::int32_t> tokens = MakeTokens(2 * kP);
     Publish(tokens);
-    const PeerAnswer looked_up = exports_.Lookup(coordinator_, Lookup(1, tokens, 2 * kP), /*now_us=*/0);
-    ASSERT_EQ(looked_up.num_tokens, 2 * kP);
+    const PeerAnswer answer = LookUp(Lookup(1, tokens, 2 * kP));
     exports_.Expire(/*now_us=*/100);
     EXPECT_EQ(exports_.NumLeases(), 0u);
-
-    const PeerAnswer pinned = exports_.Pin(coordinator_, cache::PeerPin{.lease = looked_up.lease}, /*now_us=*/100);
-    EXPECT_EQ(pinned.num_tokens, 0);
-    EXPECT_TRUE(pinned.pages.empty());
-    EXPECT_FALSE(exports_.Release(coordinator_, cache::PeerRelease{.lease = looked_up.lease}).held);
+    PinAnswer(answer, /*now_us=*/100);
+    EXPECT_FALSE(exports_.Held(answer.lease));
 }
 
-TEST_F(PeerExportsTest, APinOfAPrefixEvictedSinceTheLookupMisses) {
+TEST_F(PeerExportsTest, ALookupPastTheLeaseLimitOrNotCoveringItsBoundIsNoLease) {
     const std::vector<std::int32_t> tokens = MakeTokens(2 * kP);
     Publish(tokens);
-    const PeerAnswer looked_up = exports_.Lookup(coordinator_, Lookup(1, tokens, 2 * kP), /*now_us=*/0);
-    ASSERT_EQ(looked_up.num_tokens, 2 * kP);
-    // A soft pin holds nothing: the cache may still let the prefix go.
-    ASSERT_TRUE(coordinator_.ClearCache());
-
-    EXPECT_EQ(exports_.Pin(coordinator_, cache::PeerPin{.lease = looked_up.lease}, /*now_us=*/0).num_tokens, 0);
-    EXPECT_EQ(exports_.NumLeases(), 0u);
-}
-
-TEST_F(PeerExportsTest, ALookupPastTheLeaseLimitOrNotCoveringItsBoundMisses) {
-    const std::vector<std::int32_t> tokens = MakeTokens(2 * kP);
-    Publish(tokens);
-    EXPECT_GT(exports_.Lookup(coordinator_, Lookup(1, tokens, 2 * kP), 0).num_tokens, 0);
-    EXPECT_GT(exports_.Lookup(coordinator_, Lookup(2, tokens, 2 * kP), 0).num_tokens, 0);
-    EXPECT_EQ(exports_.Lookup(coordinator_, Lookup(3, tokens, 2 * kP), 0).num_tokens, 0) << "two leases at most";
-    EXPECT_EQ(exports_.NumLeases(), 2u);
+    LookUp(Lookup(1, tokens, 2 * kP));
+    LookUp(Lookup(2, tokens, 2 * kP));
+    LookUp(Lookup(3, tokens, 2 * kP));
+    EXPECT_EQ(exports_.NumLeases(), 2u) << "two leases at most";
     // A lookup repeated under a lease starts that lease over.
-    EXPECT_GT(exports_.Lookup(coordinator_, Lookup(2, tokens, 2 * kP), 0).num_tokens, 0);
+    LookUp(Lookup(2, tokens, 2 * kP));
     EXPECT_EQ(exports_.NumLeases(), 2u);
 
     cache::PeerLookup short_tokens = Lookup(4, tokens, 2 * kP);
     short_tokens.tokens.pop_back();
     cache::PeerLookup missing_hash = Lookup(4, tokens, 2 * kP);
     missing_hash.prefix_hashes.pop_back();
-    // Releasing a soft pin frees its lease and reports no hard pin.
-    EXPECT_FALSE(exports_.Release(coordinator_, cache::PeerRelease{.lease = {.reader = "reader", .id = 1}}).held);
-    EXPECT_EQ(exports_.Lookup(coordinator_, short_tokens, 0).num_tokens, 0);
-    EXPECT_EQ(exports_.Lookup(coordinator_, missing_hash, 0).num_tokens, 0);
+    EXPECT_EQ(PeerExports::AnswerLookup(coordinator_, short_tokens).num_tokens, 0);
+    EXPECT_EQ(PeerExports::AnswerLookup(coordinator_, missing_hash).num_tokens, 0);
+    EXPECT_FALSE(PeerExports::Matches(coordinator_, missing_hash, kP, {}));
 }
 
 TEST_F(PeerExportsTest, AReleaseAfterACompleteReadDemotesTheLeafChain) {
     const std::vector<std::int32_t> tokens = MakeTokens(2 * kP);
     Publish(tokens);
     const std::vector<std::string> hashes = PageHashes(tokens);
-    EXPECT_TRUE(ReadAndRelease(1, tokens, /*demote=*/true).held);
+    EXPECT_TRUE(ReadAndRelease(1, tokens, /*demote=*/true));
     EXPECT_TRUE(Demoted(kFull, hashes[0]));
     EXPECT_TRUE(Demoted(kFull, hashes[1]));
     EXPECT_TRUE(Demoted(kState, hashes[1]));
@@ -276,11 +284,11 @@ TEST_F(PeerExportsTest, NothingIsDemotedThatWasAccessedSinceThePin) {
     const std::vector<std::int32_t> tokens = MakeTokens(2 * kP);
     Publish(tokens);
     const std::vector<std::string> hashes = PageHashes(tokens);
-    const PeerAnswer looked_up = exports_.Lookup(coordinator_, Lookup(1, tokens, 2 * kP), 0);
-    exports_.Pin(coordinator_, cache::PeerPin{.lease = looked_up.lease}, 0);
+    const PeerAnswer answer = LookUp(Lookup(1, tokens, 2 * kP));
+    PinAnswer(answer);
     // Another reader's lookup refreshes the same entries.
-    exports_.Lookup(coordinator_, Lookup(2, tokens, 2 * kP), 0);
-    EXPECT_TRUE(exports_.Release(coordinator_, cache::PeerRelease{.lease = looked_up.lease, .demote = true}).held);
+    LookUp(Lookup(2, tokens, 2 * kP));
+    exports_.Release(coordinator_, cache::PeerRelease{.lease = answer.lease, .demote = true});
     EXPECT_FALSE(Demoted(kFull, hashes[1]));
     EXPECT_FALSE(Demoted(kState, hashes[1]));
 }
@@ -292,10 +300,10 @@ TEST_F(PeerExportsTest, NoDemotionUnlessAskedOrAfterAPinThatExpired) {
     ReadAndRelease(1, tokens, /*demote=*/false);
     EXPECT_FALSE(Demoted(kFull, hashes[1]));
 
-    const PeerAnswer looked_up = exports_.Lookup(coordinator_, Lookup(2, tokens, 2 * kP), 0);
-    exports_.Pin(coordinator_, cache::PeerPin{.lease = looked_up.lease}, 0);
+    const PeerAnswer answer = LookUp(Lookup(2, tokens, 2 * kP));
+    PinAnswer(answer);
     exports_.Expire(/*now_us=*/1000);
-    EXPECT_FALSE(exports_.Release(coordinator_, cache::PeerRelease{.lease = looked_up.lease, .demote = true}).held);
+    exports_.Release(coordinator_, cache::PeerRelease{.lease = answer.lease, .demote = true});
     EXPECT_FALSE(Demoted(kFull, hashes[1]));
 }
 
@@ -335,15 +343,20 @@ TEST(PeerExportsHostTest, AHostSuffixIsExportedAfterTheDevicesHits) {
                                       std::nullopt);
     host_block.reset();
 
-    const PeerAnswer looked_up = exports.Lookup(coordinator, Lookup(1, tokens, 2 * kP), /*now_us=*/0);
-    ASSERT_EQ(looked_up.num_tokens, 2 * kP);
-    const PeerAnswer pinned = exports.Pin(coordinator, cache::PeerPin{.lease = looked_up.lease}, /*now_us=*/0);
-    ASSERT_EQ(pinned.pages.size(), 2u);
-    EXPECT_EQ(pinned.pages[0].slot, 0);
-    EXPECT_EQ(pinned.pages[0].tier, CacheTier::kDevice);
-    EXPECT_EQ(pinned.pages[1],
+    const PeerAnswer answer = PeerExports::AnswerLookup(coordinator, Lookup(1, tokens, 2 * kP));
+    ASSERT_EQ(answer.num_tokens, 2 * kP);
+    ASSERT_EQ(answer.pages.size(), 2u);
+    EXPECT_EQ(answer.pages[0].slot, 0);
+    EXPECT_EQ(answer.pages[0].tier, CacheTier::kDevice);
+    EXPECT_EQ(answer.pages[1],
               (PeerPage{.group_id = kFull, .slot = 1, .tier = CacheTier::kHost, .block_id = host_block_id}));
-    exports.Release(coordinator, cache::PeerRelease{.lease = looked_up.lease});
+    // The pin acquires the same pages the answer listed.
+    exports.Lookup(coordinator, Lookup(1, tokens, 2 * kP), /*now_us=*/0);
+    exports.Pin(coordinator,
+                cache::PeerPin{.lease = answer.lease, .num_tokens = answer.num_tokens, .pages = answer.pages},
+                /*now_us=*/0);
+    EXPECT_TRUE(exports.Held(answer.lease));
+    exports.Release(coordinator, cache::PeerRelease{.lease = answer.lease});
 }
 
 TEST(PeerConfigTest, EveryLimitMustBePositiveAndTheNameSet) {

@@ -149,6 +149,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     cache_group_id: str | None = None
     # Bounded remote checkpoint hints; actual input tokens still determine keys.
     shared_prefix_tokens: list[int] = []
+    # The replica the router expects to hold this prompt's prefix (peer prefix
+    # sharing); a hint the holder confirms.
+    peer_holder: str | None = None
     # array_like declaration order is the wire contract; append new fields here.
 
 

@@ -371,6 +371,7 @@ pub fn admit(mut request: TokenizedGenerateReqInput, limits: &IngressLimits) -> 
         session_id: request.cache_session_id.unwrap_or_default(),
         cache_group_id: request.cache_group_id.unwrap_or_default(),
         shared_prefix_tokens: request.shared_prefix_tokens,
+        peer_holder: request.peer_holder.unwrap_or_default(),
         tokens: request.input_ids.unwrap_or_default(),
         max_new_tokens: max_new_tokens.clamp(0, i64::from(i32::MAX)) as i32,
         // Prompt logprobs need logits from their start on, so the admission

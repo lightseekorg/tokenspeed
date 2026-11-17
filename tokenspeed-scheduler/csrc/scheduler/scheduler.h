@@ -181,11 +181,24 @@ public:
     SharedPrefixPublication GetSharedPrefixPublication(std::span<const std::int32_t> tokens,
                                                        std::int32_t max_prefix_tokens) const;
 
-    // Peer prefix sharing (docs/rfcs/0004-peer-prefix-sharing.md): what this
-    // replica answered other replicas, and asked them, since the last take.
-    // Mirrored ranks produce the same; the runtime sends one replica's.
-    std::vector<PeerAnswer> TakePeerAnswers() { return std::exchange(peer_answers_, {}); }
+    // Peer prefix sharing (docs/rfcs/0004-peer-prefix-sharing.md).
+    //
+    // A reader's lookups since the last take; mirrored ranks produce the
+    // same, and the runtime sends one replica's.
     std::vector<PeerLookupRequest> TakePeerLookups() { return std::exchange(peer_lookups_, {}); }
+    // A holder's answers: reads of the cache as it stands, which the runtime
+    // gives between rounds (PeerExports). What a message changes reaches
+    // every member as its event at the next round's head.
+    PeerAnswer AnswerPeerLookup(const cache::PeerLookup& lookup) const {
+        return PeerExports::AnswerLookup(coordinator_, lookup);
+    }
+    bool PeerPagesMatch(const cache::PeerLookup& lookup, std::int32_t num_tokens,
+                        std::span<const PeerPage> pages) const {
+        return PeerExports::Matches(coordinator_, lookup, num_tokens, pages);
+    }
+    bool PeerLeaseHeld(const PeerLeaseId& lease) const { return peer_exports_ && peer_exports_->Held(lease); }
+    // Plans built so far: no cache entry leaves between two plans.
+    std::int64_t PlanCalls() const { return plan_calls_; }
     struct PeerStats {
         std::size_t leases{0};
         std::size_t pinned_blocks{0};
@@ -782,7 +795,6 @@ private:
     std::unique_ptr<PeerExports> peer_exports_;
     std::int64_t peer_now_us_{0};
     std::uint64_t next_peer_lease_{0};
-    std::vector<PeerAnswer> peer_answers_;
     std::vector<PeerLookupRequest> peer_lookups_;
     std::uint64_t peer_landed_tokens_{0};
     std::uint64_t peer_failed_landings_{0};

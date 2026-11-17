@@ -59,23 +59,69 @@ void PeerConfig::Validate() const {
 PeerExports::PeerExports(const PeerConfig& config)
     : max_leases_{config.max_leases}, soft_pin_us_{config.soft_pin_us}, hard_pin_us_{config.hard_pin_us} {}
 
-PeerAnswer PeerExports::Lookup(CacheCoordinator& coordinator, const cache::PeerLookup& lookup, std::int64_t now_us) {
+namespace {
+
+// The lookup's prompt up to `num_tokens` (at most its own bound).
+PromptPrefix PromptUpTo(const cache::PeerLookup& lookup, std::int32_t num_tokens, std::int32_t prefix_granularity) {
+    const auto pages = static_cast<std::size_t>(num_tokens / prefix_granularity);
+    return Prompt(std::span{lookup.prefix_hashes}.first(pages),
+                  std::span{lookup.tokens}.first(static_cast<std::size_t>(num_tokens)), num_tokens);
+}
+
+std::vector<PeerPage> Pages(const PrefixProber::PrefixListing& listing) {
+    std::vector<PeerPage> pages;
+    pages.reserve(listing.pages.size());
+    for (const PrefixProber::ListedPage& page : listing.pages) {
+        pages.push_back(
+            PeerPage{.group_id = page.key.group_id, .slot = page.slot, .tier = page.tier, .block_id = page.block_id});
+    }
+    return pages;
+}
+
+}  // namespace
+
+PeerAnswer PeerExports::AnswerLookup(const CacheCoordinator& coordinator, const cache::PeerLookup& lookup) {
     PeerAnswer answer{.lease = lookup.lease, .kind = PeerAnswerKind::kLookup};
-    // A lookup repeated under the same lease starts it over.
-    leases_.erase(lookup.lease);
     if (!WellFormed(lookup, coordinator.PrefixGranularity())) {
         spdlog::warn("[Peer] lookup {}#{} does not cover its bound; answered as a miss", lookup.lease.reader,
                      lookup.lease.id);
         return answer;
     }
-    if (static_cast<std::int64_t>(leases_.size()) >= max_leases_) {
-        return answer;
+    const PrefixProber::PrefixListing listing = coordinator.Prober().ListPrefix(
+        coordinator.Prober().ProbePromptPrefix(Prompt(lookup.prefix_hashes, lookup.tokens, lookup.max_tokens)));
+    answer.num_tokens = listing.num_tokens;
+    answer.pages = Pages(listing);
+    return answer;
+}
+
+bool PeerExports::Matches(const CacheCoordinator& coordinator, const cache::PeerLookup& lookup, std::int32_t num_tokens,
+                          std::span<const PeerPage> pages) {
+    if (!WellFormed(lookup, coordinator.PrefixGranularity()) || num_tokens <= 0 || num_tokens > lookup.max_tokens) {
+        return false;
+    }
+    const PrefixProber::PrefixListing listing = coordinator.Prober().ListPrefix(
+        coordinator.Prober().ProbePromptPrefix(PromptUpTo(lookup, num_tokens, coordinator.PrefixGranularity())));
+    return listing.num_tokens == num_tokens && std::ranges::equal(Pages(listing), pages);
+}
+
+bool PeerExports::Held(const PeerLeaseId& lease) const {
+    const auto it = leases_.find(lease);
+    return it != leases_.end() && it->second.phase == Phase::kHard;
+}
+
+void PeerExports::Lookup(CacheCoordinator& coordinator, const cache::PeerLookup& lookup, std::int64_t now_us) {
+    // A lookup repeated under the same lease starts it over.
+    leases_.erase(lookup.lease);
+    if (!WellFormed(lookup, coordinator.PrefixGranularity()) ||
+        static_cast<std::int64_t>(leases_.size()) >= max_leases_) {
+        return;
     }
     CacheCoordinator::PrefixExport exported = coordinator.ExportPrefix(
         coordinator.Prober().ProbePromptPrefix(Prompt(lookup.prefix_hashes, lookup.tokens, lookup.max_tokens)));
     if (exported.num_tokens == 0) {
-        return answer;
+        return;
     }
+    // The exported blocks go here: the soft pin only refreshed their entries.
     const auto boundary = static_cast<std::size_t>(exported.num_tokens);
     const auto full_pages = boundary / static_cast<std::size_t>(coordinator.PrefixGranularity());
     leases_.emplace(
@@ -85,61 +131,61 @@ PeerAnswer PeerExports::Lookup(CacheCoordinator& coordinator, const cache::PeerL
                                 lookup.prefix_hashes.begin() + static_cast<std::ptrdiff_t>(full_pages)},
               .tokens = {lookup.tokens.begin(), lookup.tokens.begin() + static_cast<std::ptrdiff_t>(boundary)},
               .num_tokens = exported.num_tokens});
-    // The exported blocks go here: the lookup only refreshed their entries.
-    answer.num_tokens = exported.num_tokens;
-    return answer;
 }
 
-PeerAnswer PeerExports::Pin(CacheCoordinator& coordinator, const cache::PeerPin& pin, std::int64_t now_us) {
-    PeerAnswer answer{.lease = pin.lease, .kind = PeerAnswerKind::kPin};
+void PeerExports::Pin(CacheCoordinator& coordinator, const cache::PeerPin& pin, std::int64_t now_us) {
     const auto it = leases_.find(pin.lease);
     if (it == leases_.end() || it->second.phase != Phase::kSoft) {
-        return answer;
+        return;
     }
     Lease& lease = it->second;
-    CacheCoordinator::PrefixExport exported = coordinator.ExportPrefix(
-        coordinator.Prober().ProbePromptPrefix(Prompt(lease.prefix_hashes, lease.tokens, lease.num_tokens)));
-    if (exported.num_tokens == 0) {
+    if (pin.num_tokens <= 0 || pin.num_tokens > lease.num_tokens) {
         leases_.erase(it);
-        return answer;
+        return;
     }
-    lease.phase = Phase::kHard;
-    lease.deadline_us = Deadline(now_us, hard_pin_us_);
-    lease.num_tokens = exported.num_tokens;
-    lease.access_epoch = exported.access_epoch;
-    answer.num_tokens = exported.num_tokens;
-    answer.pages.reserve(exported.blocks.size());
-    lease.pins.reserve(exported.blocks.size());
-    lease.keys.reserve(exported.blocks.size());
-    for (CacheCoordinator::ExportedBlock& block : exported.blocks) {
-        const auto group = static_cast<std::int32_t>(block.key.group_id);
-        answer.pages.push_back(PeerPage{
+    const auto pages = static_cast<std::size_t>(pin.num_tokens / coordinator.PrefixGranularity());
+    CacheCoordinator::PrefixExport exported = coordinator.ExportPrefix(coordinator.Prober().ProbePromptPrefix(
+        Prompt(std::span{lease.prefix_hashes}.first(pages),
+               std::span{lease.tokens}.first(static_cast<std::size_t>(pin.num_tokens)), pin.num_tokens)));
+    // The pin holds what its answer named, or nothing: the blocks it just
+    // acquired go back with the lease.
+    std::vector<PeerPage> acquired;
+    acquired.reserve(exported.blocks.size());
+    for (const CacheCoordinator::ExportedBlock& block : exported.blocks) {
+        acquired.push_back(PeerPage{
             .group_id = block.key.group_id,
             .slot = block.slot,
             .tier = block.tier,
-            .block_id = coordinator.Allocator(group).ResolveCacheBlockId(*block.block),
+            .block_id =
+                coordinator.Allocator(static_cast<std::int32_t>(block.key.group_id)).ResolveCacheBlockId(*block.block),
         });
+    }
+    if (exported.num_tokens != pin.num_tokens || acquired != pin.pages) {
+        leases_.erase(it);
+        return;
+    }
+    lease.phase = Phase::kHard;
+    lease.deadline_us = Deadline(now_us, hard_pin_us_);
+    lease.access_epoch = exported.access_epoch;
+    for (CacheCoordinator::ExportedBlock& block : exported.blocks) {
         lease.pins.push_back(std::move(block.block));
         lease.keys.push_back(std::move(block.key));
     }
-    return answer;
 }
 
-PeerAnswer PeerExports::Release(CacheCoordinator& coordinator, const cache::PeerRelease& release) {
-    PeerAnswer answer{.lease = release.lease, .kind = PeerAnswerKind::kRelease};
+void PeerExports::Release(CacheCoordinator& coordinator, const cache::PeerRelease& release) {
     const auto it = leases_.find(release.lease);
     if (it == leases_.end()) {
-        return answer;
+        return;
     }
-    answer.held = it->second.phase == Phase::kHard;
+    const bool held = it->second.phase == Phase::kHard;
     // The pins go first: a demotion skips an entry anything holds.
     Lease lease = std::move(it->second);
     leases_.erase(it);
     lease.pins.clear();
-    if (answer.held && release.demote) {
+    if (held && release.demote) {
         coordinator.DemoteExportedChain(lease.keys, lease.access_epoch);
     }
-    return answer;
 }
 
 void PeerExports::Expire(std::int64_t now_us) {

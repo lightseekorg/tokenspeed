@@ -23,9 +23,12 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <variant>
 #include <vector>
 
 #include "integration_test_helper.h"
@@ -104,6 +107,59 @@ std::vector<std::pair<std::string, std::int32_t>> PrefillRows(const ExecutionPla
     return rows;
 }
 
+// The holder's runtime half, as the engine host runs it: every message is
+// answered at once from the scheduler's reads, and what it changes is queued
+// for the next round's head, ahead of every other event.
+class HolderServicer {
+public:
+    explicit HolderServicer(Scheduler& holder) : holder_{holder} {}
+
+    PeerAnswer Lookup(const PeerLookupRequest& request) {
+        const cache::PeerLookup lookup{.lease = request.lease,
+                                       .prefix_hashes = request.prefix_hashes,
+                                       .tokens = request.tokens,
+                                       .max_tokens = request.max_tokens};
+        const PeerAnswer answer = holder_.AnswerPeerLookup(lookup);
+        lookups_.insert_or_assign(request.lease.id, std::pair{lookup, answer});
+        pending_.With(lookup);
+        return answer;
+    }
+    PeerAnswer Pin(const PeerLeaseId& lease) {
+        const auto& [lookup, looked_up] = lookups_.at(lease.id);
+        const bool matches = holder_.PeerPagesMatch(lookup, looked_up.num_tokens, looked_up.pages);
+        if (matches) {
+            pending_.With(cache::PeerPin{.lease = lease, .num_tokens = looked_up.num_tokens, .pages = looked_up.pages});
+            pinned_at_.insert_or_assign(lease.id, holder_.PlanCalls());
+        }
+        return PeerAnswer{.lease = lease, .kind = PeerAnswerKind::kPin, .held = matches};
+    }
+    PeerAnswer Release(const PeerLeaseId& lease, bool demote) {
+        // Untouched from the pin: no plan ran since it, or its pin held.
+        const auto pinned = pinned_at_.find(lease.id);
+        const bool held =
+            pinned != pinned_at_.end() && (holder_.PlanCalls() == pinned->second || holder_.PeerLeaseHeld(lease));
+        pending_.With(cache::PeerRelease{.lease = lease, .demote = demote && held});
+        return PeerAnswer{.lease = lease, .kind = PeerAnswerKind::kRelease, .held = held};
+    }
+    // The next round's head: the clock, then the queued changes in order.
+    void Head(std::int64_t now_us = 0) {
+        ExecutionEvent event;
+        event.With(cache::PeerTick{.now_us = now_us});
+        for (auto& queued : pending_.Events()) {
+            std::visit([&](auto& inner) { event.With(std::move(inner)); }, queued);
+        }
+        pending_ = ExecutionEvent{};
+        holder_.Advance(std::move(event));
+    }
+    const PeerAnswer& Answer(const PeerLeaseId& lease) const { return lookups_.at(lease.id).second; }
+
+private:
+    Scheduler& holder_;
+    ExecutionEvent pending_;
+    std::map<std::uint64_t, std::pair<cache::PeerLookup, PeerAnswer>> lookups_;
+    std::map<std::uint64_t, std::int64_t> pinned_at_;
+};
+
 // Two replicas of one deployment: a holder that computed a prompt and a
 // reader that is asked to continue it; the test relays their messages as the
 // runtime would.
@@ -119,49 +175,47 @@ protected:
         Plan(holder_);
     }
 
-    // Relays the reader's lookups to the holder and the holder's answers back.
+    // Relays the reader's lookups to the holder and the answers back.
     void RelayLookups() {
         for (const PeerLookupRequest& lookup : reader_.TakePeerLookups()) {
             EXPECT_EQ(lookup.holder, "holder");
-            Send(holder_, cache::PeerLookup{.lease = lookup.lease,
-                                            .prefix_hashes = lookup.prefix_hashes,
-                                            .tokens = lookup.tokens,
-                                            .max_tokens = lookup.max_tokens});
-        }
-        for (const PeerAnswer& answer : holder_.TakePeerAnswers()) {
-            ASSERT_EQ(answer.kind, PeerAnswerKind::kLookup);
+            const PeerAnswer answer = servicer_.Lookup(lookup);
             Send(reader_, cache::PeerLookupAnswered{.lease = answer.lease, .num_tokens = answer.num_tokens});
         }
     }
 
     // Runs a landing as the runtime does: pins it at the holder, (reads,)
-    // releases it and reports the boundary confirmed.
-    std::int32_t Fetch(const PeerFetchOperation& fetch, bool read_succeeds) {
-        Send(holder_, cache::PeerPin{.lease = fetch.lease});
-        std::vector<PeerAnswer> answers = holder_.TakePeerAnswers();
-        EXPECT_EQ(answers.size(), 1u);
-        const PeerAnswer pinned = answers.front();
-        EXPECT_EQ(pinned.kind, PeerAnswerKind::kPin);
+    // releases it and reports the boundary confirmed. The holder's head runs
+    // between the pin and the release when `head_between` is set.
+    std::int32_t Fetch(const PeerFetchOperation& fetch, bool read_succeeds, bool head_between = false) {
+        const PeerAnswer pinned = servicer_.Pin(fetch.lease);
         // Every destination has a holder page at its slot.
+        const PeerAnswer& looked_up = servicer_.Answer(fetch.lease);
         for (const PeerPage& destination : fetch.destinations) {
-            EXPECT_TRUE(std::ranges::any_of(pinned.pages,
+            EXPECT_TRUE(std::ranges::any_of(looked_up.pages,
                                             [&](const PeerPage& page) {
                                                 return page.group_id == destination.group_id &&
                                                        page.slot == destination.slot;
                                             }))
                 << "slot " << destination.slot;
         }
-        Send(holder_, cache::PeerRelease{.lease = fetch.lease, .demote = read_succeeds});
-        answers = holder_.TakePeerAnswers();
-        const bool held = answers.size() == 1 && answers.front().held;
+        if (head_between) {
+            servicer_.Head();
+            Plan(holder_);
+        }
+        const PeerAnswer released = servicer_.Release(fetch.lease, read_succeeds && pinned.held);
         const std::int32_t confirmed =
-            read_succeeds && held && pinned.num_tokens == fetch.end_tokens ? fetch.end_tokens : fetch.begin_tokens;
+            read_succeeds && pinned.held && released.held && looked_up.num_tokens == fetch.end_tokens
+                ? fetch.end_tokens
+                : fetch.begin_tokens;
         Send(reader_, cache::PeerFetchDone{.request_id = fetch.request_id, .num_tokens = confirmed});
+        servicer_.Head();
         return confirmed;
     }
 
     Scheduler holder_{PeerConfigFor("holder", GetParam())};
     Scheduler reader_{PeerConfigFor("reader", GetParam())};
+    HolderServicer servicer_{holder_};
 };
 
 INSTANTIATE_TEST_SUITE_P(Groups, PeerSchedulerTest, ::testing::Bool(),
@@ -213,7 +267,7 @@ TEST_P(PeerSchedulerTest, AReaderLandsTheHoldersPrefixAndComputesTheRest) {
     }
     EXPECT_TRUE(PrefillRows(Plan(reader_)).empty()) << "nothing reads a landing's pages";
 
-    EXPECT_EQ(Fetch(fetch, /*read_succeeds=*/true), fetch.end_tokens);
+    EXPECT_EQ(Fetch(fetch, /*read_succeeds=*/true, /*head_between=*/true), fetch.end_tokens);
     EXPECT_EQ(PrefillRows(Plan(reader_)), (std::vector<std::pair<std::string, std::int32_t>>{{"r", fetch.end_tokens}}));
     EXPECT_EQ(reader_.GetPeerStats().landed_tokens, static_cast<std::uint64_t>(fetch.end_tokens));
     EXPECT_EQ(holder_.GetPeerStats().leases, 0u);
@@ -289,17 +343,50 @@ TEST_P(PeerSchedulerTest, AnAbortWhileLandingWaitsForTheFetchToEnd) {
     EXPECT_EQ(reader_.GetPeerStats().landing_requests, 0u);
 }
 
-TEST_P(PeerSchedulerTest, AHolderAnswersFromItsOwnCacheAndHoldsAPinUntilTheRelease) {
-    const std::vector<std::int32_t> tokens = MakeAlignedTokens(4, kP);
+TEST_P(PeerSchedulerTest, AHolderAnswersBetweenRoundsAndItsPinHoldsAcrossAPlan) {
+    const std::vector<std::int32_t> tokens = MakeAlignedTokens(8, kP);
     HolderComputes(tokens);
-    const std::vector<std::int32_t> prefix(tokens.begin(), tokens.end() - 1);
-    Send(holder_, cache::PeerTick{.now_us = 0});
-    Send(holder_,
-         cache::PeerLookup{.lease = {.reader = "x", .id = 1}, .prefix_hashes = {}, .tokens = {}, .max_tokens = 0});
-    std::vector<PeerAnswer> answers = holder_.TakePeerAnswers();
-    ASSERT_EQ(answers.size(), 1u);
-    EXPECT_EQ(answers.front().num_tokens, 0) << "a malformed lookup is a miss";
+    std::vector<std::int32_t> longer = tokens;
+    longer.insert(longer.end(), {901, 902});
+    reader_.SubmitRequests({RequestSpec{.request_id = "r", .peer_holder = "holder", .tokens = longer}});
+    Plan(reader_);
+    RelayLookups();
+    EXPECT_EQ(holder_.GetPeerStats().leases, 0u) << "answering changes nothing until the head";
+    servicer_.Head();
+    EXPECT_EQ(holder_.GetPeerStats().leases, 1u);
+    const ExecutionPlan landing_plan = Plan(reader_);
+    ASSERT_EQ(landing_plan.peer_fetches.size(), 1u);
+    const PeerLeaseId lease = landing_plan.peer_fetches.front().lease;
+
+    ASSERT_TRUE(servicer_.Pin(lease).held);
+    servicer_.Head();
+    EXPECT_GT(holder_.GetPeerStats().pinned_blocks, 0u);
+    // A plan between the pin and the release: the pin held the pages.
+    Plan(holder_);
+    EXPECT_TRUE(servicer_.Release(lease, /*demote=*/false).held);
+    servicer_.Head();
     EXPECT_EQ(holder_.GetPeerStats().leases, 0u);
+    EXPECT_EQ(holder_.GetPeerStats().pinned_blocks, 0u);
+}
+
+TEST_P(PeerSchedulerTest, AReleaseAfterAPlanThePinMissedIsNotHeld) {
+    const std::vector<std::int32_t> tokens = MakeAlignedTokens(8, kP);
+    HolderComputes(tokens);
+    std::vector<std::int32_t> longer = tokens;
+    longer.insert(longer.end(), {901, 902});
+    reader_.SubmitRequests({RequestSpec{.request_id = "r", .peer_holder = "holder", .tokens = longer}});
+    Plan(reader_);
+    RelayLookups();
+    servicer_.Head();
+    const ExecutionPlan landing_plan = Plan(reader_);
+    ASSERT_EQ(landing_plan.peer_fetches.size(), 1u);
+    const PeerLeaseId lease = landing_plan.peer_fetches.front().lease;
+    ASSERT_TRUE(servicer_.Pin(lease).held);
+    // The lookup's soft pin expired before the head applied the pin, which
+    // then holds nothing; a plan ran since the pin's answer.
+    servicer_.Head(/*now_us=*/1'000'000);
+    Plan(holder_);
+    EXPECT_FALSE(servicer_.Release(lease, /*demote=*/true).held);
 }
 
 // A local hit that ends inside a page (a tail) ends inside a block, which a
@@ -321,13 +408,9 @@ TEST(PeerLandingAlignmentTest, ALocalTailHitLandsFromThePageBoundaryBelow) {
     }
     reader.SubmitRequests({RequestSpec{.request_id = "r", .peer_holder = "holder", .tokens = tokens}});
     Plan(reader);
+    HolderServicer servicer{holder};
     for (const PeerLookupRequest& lookup : reader.TakePeerLookups()) {
-        Send(holder, cache::PeerLookup{.lease = lookup.lease,
-                                       .prefix_hashes = lookup.prefix_hashes,
-                                       .tokens = lookup.tokens,
-                                       .max_tokens = lookup.max_tokens});
-    }
-    for (const PeerAnswer& answer : holder.TakePeerAnswers()) {
+        const PeerAnswer answer = servicer.Lookup(lookup);
         ASSERT_GT(answer.num_tokens, 2 * kP);
         Send(reader, cache::PeerLookupAnswered{.lease = answer.lease, .num_tokens = answer.num_tokens});
     }

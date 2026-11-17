@@ -22,6 +22,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -31,24 +32,40 @@
 
 namespace tokenspeed {
 
-// The holder's half of peer prefix sharing: one lease per reader's lookup.
-// A lookup soft-pins the prefix it answers -- it refreshes the entries, so
-// they leave last, and keeps the prompt -- and a pin turns that into block
-// references, which hold the pages on their tier until the release or the
-// pin's deadline. A pin that expired leaves a tombstone, so the release that
-// follows reports that it did not hold. The scheduler applies every call in
-// a plan, from events its replica agreed on, so mirrored ranks hold the same
-// leases.
+// The holder's half of peer prefix sharing. Answers are reads: the
+// replica's first member gives them as soon as a message arrives, while the
+// scheduler is idle between rounds, from the cache as it stands. What the
+// messages change -- a lookup's soft pin, a pin's block references, a
+// release's demotion -- every member applies at the head of the next round,
+// before anything else, in the order the answers were given, so mirrored
+// ranks hold the same leases and the answers held in between: nothing leaves
+// the cache outside a plan, and no plan runs between an answer and the head
+// that applies it.
+//
+// A soft pin refreshes the looked-up entries, so they leave last, and keeps
+// the prompt; a pin holds the exact pages its answer named, or nothing if
+// they changed. A pin that expired leaves a tombstone, so a release that
+// follows does not count it as held.
 class PeerExports {
 public:
     explicit PeerExports(const PeerConfig& config);
 
-    PeerAnswer Lookup(CacheCoordinator& coordinator, const cache::PeerLookup& lookup, std::int64_t now_us);
-    PeerAnswer Pin(CacheCoordinator& coordinator, const cache::PeerPin& pin, std::int64_t now_us);
+    // The answers.
+    static PeerAnswer AnswerLookup(const CacheCoordinator& coordinator, const cache::PeerLookup& lookup);
+    // Whether the lookup's prompt, up to num_tokens, still resolves to
+    // exactly `pages`.
+    static bool Matches(const CacheCoordinator& coordinator, const cache::PeerLookup& lookup, std::int32_t num_tokens,
+                        std::span<const PeerPage> pages);
+    // Whether the lease's pin holds its pages now.
+    bool Held(const PeerLeaseId& lease) const;
+
+    // The changes, applied at the head.
+    void Lookup(CacheCoordinator& coordinator, const cache::PeerLookup& lookup, std::int64_t now_us);
+    void Pin(CacheCoordinator& coordinator, const cache::PeerPin& pin, std::int64_t now_us);
     // A release that asks for it, after a pin that held, demotes the pinned
     // prefix's leaf chain (CacheCoordinator::DemoteExportedChain): the
     // reader has its own copy now.
-    PeerAnswer Release(CacheCoordinator& coordinator, const cache::PeerRelease& release);
+    void Release(CacheCoordinator& coordinator, const cache::PeerRelease& release);
     // Lets every lease past its deadline go: a soft pin is forgotten, a hard
     // pin's blocks go back and its tombstone stays for one more hard-pin
     // lifetime.
@@ -62,8 +79,8 @@ private:
     struct Lease {
         Phase phase{Phase::kSoft};
         std::int64_t deadline_us{0};
-        // The prompt up to the looked-up boundary: a pin probes it again, so
-        // it never pins past what the reader admitted.
+        // The prompt up to the looked-up boundary; a pin probes it again up
+        // to the boundary its answer named.
         std::vector<std::string> prefix_hashes;
         std::vector<std::int32_t> tokens;
         std::int32_t num_tokens{0};

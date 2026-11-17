@@ -74,17 +74,17 @@ void Scheduler::handleEvent(const cache::PeerTick& event) {
 
 void Scheduler::handleEvent(const cache::PeerLookup& event) {
     if (!peer_exports_) throw std::invalid_argument("a peer lookup without configured peer sharing");
-    peer_answers_.push_back(peer_exports_->Lookup(coordinator_, event, peer_now_us_));
+    peer_exports_->Lookup(coordinator_, event, peer_now_us_);
 }
 
 void Scheduler::handleEvent(const cache::PeerPin& event) {
     if (!peer_exports_) throw std::invalid_argument("a peer pin without configured peer sharing");
-    peer_answers_.push_back(peer_exports_->Pin(coordinator_, event, peer_now_us_));
+    peer_exports_->Pin(coordinator_, event, peer_now_us_);
 }
 
 void Scheduler::handleEvent(const cache::PeerRelease& event) {
     if (!peer_exports_) throw std::invalid_argument("a peer release without configured peer sharing");
-    peer_answers_.push_back(peer_exports_->Release(coordinator_, event));
+    peer_exports_->Release(coordinator_, event);
 }
 
 void Scheduler::handleEvent(const cache::PeerLookupAnswered& event) {

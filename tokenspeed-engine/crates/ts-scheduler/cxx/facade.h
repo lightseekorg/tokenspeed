@@ -50,6 +50,13 @@ struct StorageCancellationView;
 struct StorageDoneView;
 struct StorageStatsView;
 struct PrefixHitView;
+struct PeerEventView;
+struct PeerAnswerView;
+struct PeerLookupView;
+struct PeerFetchView;
+struct PeerStatsView;
+struct PeerLeaseView;
+struct PeerPageView;
 
 void submit_requests(tokenspeed::Scheduler& scheduler, rust::Slice<const RequestSpec> specs);
 std::unique_ptr<tokenspeed::ExecutionPlan> next_execution_plan(tokenspeed::Scheduler& scheduler,
@@ -58,6 +65,14 @@ void advance(tokenspeed::Scheduler& scheduler, rust::Slice<const ForwardEvent> e
 void advance_head(tokenspeed::Scheduler& scheduler, rust::Slice<const StorageTickView> ticks,
                   rust::Slice<const StorageCancellationView> cancellations,
                   rust::Slice<const StorageDoneView> done, rust::Slice<const CacheEvent> cache_events);
+void advance_peer(tokenspeed::Scheduler& scheduler, std::int64_t now_us, rust::Slice<const PeerEventView> events);
+rust::Vec<PeerLookupView> take_peer_lookups(tokenspeed::Scheduler& scheduler);
+PeerAnswerView answer_peer_lookup(const tokenspeed::Scheduler& scheduler, const PeerEventView& lookup);
+bool peer_pages_match(const tokenspeed::Scheduler& scheduler, const PeerEventView& lookup, std::int32_t num_tokens,
+                      rust::Slice<const PeerPageView> pages);
+bool peer_lease_held(const tokenspeed::Scheduler& scheduler, const PeerLeaseView& lease);
+std::int64_t plan_calls(const tokenspeed::Scheduler& scheduler);
+PeerStatsView peer_stats(const tokenspeed::Scheduler& scheduler);
 std::size_t demote_sessions(tokenspeed::Scheduler& scheduler, rust::Slice<const rust::String> ids, bool ended);
 std::size_t demote_session(tokenspeed::Scheduler& scheduler, rust::Str session_id, bool ended);
 std::size_t demote_cache_groups(tokenspeed::Scheduler& scheduler, rust::Slice<const rust::String> ids, bool ended);
@@ -102,6 +117,7 @@ rust::Vec<TransferBatchView> plan_remote_prefill_transfer(const tokenspeed::Exec
 rust::Vec<SchedulerAbortView> plan_aborts(const tokenspeed::ExecutionPlan& plan);
 rust::Vec<CacheOpView> plan_cache_ops(const tokenspeed::ExecutionPlan& plan);
 rust::Vec<StorageOpView> plan_storage_ops(const tokenspeed::ExecutionPlan& plan);
+rust::Vec<PeerFetchView> plan_peer_fetches(const tokenspeed::ExecutionPlan& plan);
 
 void set_profile_span_sink(bool installed);
 
