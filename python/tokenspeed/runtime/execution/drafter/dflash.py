@@ -958,22 +958,26 @@ class DFlash(BaseDrafter):
             )
 
     def warmup_extend(self, num_tokens: int) -> None:
-        """Project ``num_tokens`` rows of zero taps, as an extend's context
-        write does (``_write_native_cache``). The projection ends in a column
-        all-gather over the attention TP group; a decode warmup whose context
-        write takes the draft monokernels never reaches it. Warm both long
-        and short chunks because the gather chooses its subgroup count by
-        the rank-local payload size."""
+        """Write the context of ``num_tokens`` rows of zero taps, as an extend
+        does (``_write_native_cache``), all into slot 0, the dummy slot padded
+        rows write to. The projection ends in a column all-gather over the
+        attention TP group, and the per-layer K/V write runs kernels such as
+        the K norm at head width; a decode warmup whose context write takes
+        the draft monokernels or the fused write reaches neither. Warm both
+        long and short chunks because the gather chooses its subgroup count
+        by the rank-local payload size."""
         model = self.draft_model_runner.model
         taps = torch.zeros(
             (num_tokens, model.context_in_features),
             dtype=model.context_dtype,
             device=self.device,
         )
-        with torch.inference_mode():
-            model.project_target_hidden(taps)
-            if num_tokens > _SHORT_CONTEXT_PROJECTION_ROWS:
-                model.project_target_hidden(taps[:_SHORT_CONTEXT_PROJECTION_ROWS])
+        positions = torch.zeros(num_tokens, dtype=torch.int64, device=self.device)
+        slots = torch.zeros(num_tokens, dtype=torch.int32, device=self.device)
+        self._write_native_cache(taps, positions, slots)
+        if num_tokens > _SHORT_CONTEXT_PROJECTION_ROWS:
+            rows = _SHORT_CONTEXT_PROJECTION_ROWS
+            self._write_native_cache(taps[:rows], positions[:rows], slots[:rows])
 
     def set_cache_pool(self, token_to_kv_pool: CachePool | None) -> None:
         """The stacked KV views and their raw pointers name the old arena."""
