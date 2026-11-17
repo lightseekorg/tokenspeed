@@ -439,6 +439,13 @@ alive. An EPD encode rank does the same and counts its vision-tower batches,
 which every rank of its attention-TP group forms alike. The young
 generations still collect automatically.
 
+Graph capture runs before that mark and collects for its own reason: a
+collection inside a capture would run CUDA graph destructors on a capturing
+stream, so each capture collects first. `ModelExecutor.capture_graphs`
+freezes the heap once around every capture (decode, prefill and drafter
+graphs), so each of those collections walks only what the captures created;
+`--enable-cudagraph-gc` keeps the heap unfrozen.
+
 ### Profiling the issuing thread
 
 Profiling must include the forward thread that issues device work. Batch and
