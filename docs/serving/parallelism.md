@@ -325,6 +325,7 @@ requires gated MLA with Q-LoRA. TokenSpeed rejects gated MLA without Q-LoRA
 even with replicated projections. MLA Q-B, KV-B, KDA convolution and
 norms keep their existing mapping. Target-model projection settings do not
 change the draft model.
+Kimi-K3.1 sparse MLA (DSA) supports the same QKV and output projection settings.
 
 Each sharded computation restores complete outputs to the original token owner:
 
@@ -341,6 +342,9 @@ runs after dispatch and before combine. The runtime selects optimized
 collectives for supported shapes and topologies, with generic collective
 fallbacks otherwise. Place each subgroup
 on a CUDA-IPC-accessible node to use the optimized paths.
+
+These projection settings apply to DEP; DWDP still requires them to be `1`.
+Shared-expert TP requires BF16 weights.
 
 TP4 reduces the selected weights to approximately one quarter per GPU, not
 total model memory or latency. Communication and padding can outweigh GEMM

@@ -389,11 +389,6 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
         qkv_parallel: DenseLayerMapping | None,
         output_parallel: DenseLayerMapping | None,
     ) -> None:
-        if qkv_parallel is not None or output_parallel is not None:
-            raise NotImplementedError(
-                "Kimi-K3.1 DSA layers run attention TP only; unset "
-                "TOKENSPEED_KIMI_K3_QKV_PROJ_TP_SIZE / TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE"
-            )
         if not config.mla_use_output_gate:
             raise ValueError("Kimi-K3.1 DSA layers require the gated MLA layout")
         super().__init__(
@@ -557,8 +552,16 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
     ) -> torch.Tensor:
         """``precomputed_qkv_a`` holds ``hidden_states @ precomputable_qkv_a_weight().T``."""
         if hidden_states.shape[0] == 0:
-            # No rows and no projection collective (attention TP only).
-            return hidden_states
+            # The parent joins QKV/O collectives without local attention work.
+            return super().forward(
+                positions,
+                hidden_states,
+                ctx,
+                comm_manager,
+                block_scale=block_scale,
+                attnres_partial_args=attnres_partial_args,
+                projection_out=projection_out,
+            )
         if precomputed_qkv_a is None:
             q_a, latent_cache, gate = self._project_qkv_gate_a(
                 hidden_states, ctx, comm_manager, block_scale, attnres_partial_args

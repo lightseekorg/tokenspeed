@@ -434,6 +434,9 @@ Smaller batches, batch-invariant collectives, and unsupported configurations use
 the ordinary projection operations. All ranks use their physical row counts to
 select the same path.
 
+Kimi-K3.1 sparse MLA uses the same projection layers. Empty token owners run
+the parent MLA projection collectives and skip local DSA work.
+
 Both fused kernels accept BF16 inputs and return BF16 outputs.
 Row projection also accepts E4M3 inputs with FP32 scales per 128 channels.
 Pass the scales to `DPRowParallelLinear.forward` through its `scale` argument.
