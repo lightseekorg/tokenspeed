@@ -25,7 +25,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.ops.residual import try_mhc_shifted_post_pre_norm
+from tokenspeed_kernel.ops.residual import (
+    try_mhc_shifted_post_pre_norm,
+    try_mhc_shifted_post_pre_norm_quantize_fp8,
+)
 from tokenspeed_kernel.platform import current_platform
 
 pytestmark = pytest.mark.skipif(
@@ -106,6 +109,41 @@ def test_shifted_mhc_matches_reference(tokens, hidden, iters):
         torch.testing.assert_close(got, ref, atol=0.02, rtol=0.01)
     for name, original in before.items():
         torch.testing.assert_close(args[name], original, atol=0, rtol=0)
+
+
+def _group32_reference(y):
+    """UE8M0 exponents and E4M3 codes the group-32 quantizers write for y."""
+    groups = y.float().unflatten(-1, (-1, 32))
+    raw = groups.abs().amax(-1).clamp_min(1e-4) * (1.0 / 448.0)
+    bits = raw.view(torch.int32)
+    exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(torch.int32)
+    inverse = (exponent << 23).view(torch.float32)
+    codes = (groups / inverse[..., None]).flatten(-2).to(torch.float8_e4m3fn)
+    return exponent, codes
+
+
+@pytest.mark.parametrize(
+    "tokens,hidden", [(1, 1024), (17, 5120), (257, 5120), (2048, 5120)]
+)
+def test_shifted_mhc_quantize_fp8_matches_group32_reference(tokens, hidden):
+    args = _inputs(tokens, hidden, 20)
+    plain = try_mhc_shifted_post_pre_norm(**args)
+    actual = try_mhc_shifted_post_pre_norm_quantize_fp8(**args)
+    assert plain is not None and actual is not None
+    for got, ref in zip(actual[:5], plain, strict=True):
+        torch.testing.assert_close(got, ref, atol=0.02, rtol=0.01)
+    y, codes, packed = actual[1], actual[5], actual[6]
+    assert codes.dtype == torch.float8_e4m3fn and codes.shape == (tokens, hidden)
+    assert packed.dtype == torch.int32 and packed.shape == (tokens, hidden // 128)
+    # MN-major words, the token count padded to four for TMA.
+    assert packed.stride() == (1, (tokens + 3) // 4 * 4)
+    shifts = torch.arange(4, device=packed.device) * 8
+    exponent = ((packed[..., None] >> shifts) & 255).flatten(-2).to(torch.int32)
+    expected_exponent, expected_codes = _group32_reference(y)
+    torch.testing.assert_close(exponent, expected_exponent, atol=0, rtol=0)
+    torch.testing.assert_close(
+        codes.view(torch.uint8), expected_codes.view(torch.uint8), atol=0, rtol=0
+    )
 
 
 @pytest.mark.parametrize("tokens", [33, 512, 8192])

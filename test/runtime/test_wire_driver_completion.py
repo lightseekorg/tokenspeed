@@ -33,7 +33,7 @@ register_cuda_ci(est_time=5, suite="runtime-1gpu")
 from tokenspeed.runtime.entrypoints.wire_driver import Completion
 
 
-def _chunk(ids, logprobs, cumulative_probs, reason):
+def _chunk(ids, logprobs, cumulative_probs, reason, reasoning_tokens=0):
     return {
         "output_ids": ids,
         "output_token_logprobs": logprobs,
@@ -42,6 +42,7 @@ def _chunk(ids, logprobs, cumulative_probs, reason):
         "finish_details": None if reason is None else {"type": reason},
         "prompt_tokens": 3,
         "completion_tokens": 3,
+        "reasoning_tokens": reasoning_tokens,
         "cached_tokens": 0,
         "input_token_logprobs": None,
         "spec_verify_ct": None,
@@ -51,11 +52,12 @@ def _chunk(ids, logprobs, cumulative_probs, reason):
 
 def test_completion_joins_diagnostics_with_their_tokens_and_logprobs():
     completion = Completion()
-    completion.add(_chunk([4, 9], [-0.2, -2.0], [0.8, 0.99], None))
-    completion.add(_chunk([2], [-0.4], [0.9], "stop"))
+    completion.add(_chunk([4, 9], [-0.2, -2.0], [0.8, 0.99], None, reasoning_tokens=2))
+    completion.add(_chunk([2], [-0.4], [0.9], "stop", reasoning_tokens=5))
     assert completion.output_ids == [4, 9, 2]
     assert completion.output_token_logprobs == [-0.2, -2.0, -0.4]
     assert completion.output_token_cumulative_probs == [0.8, 0.99, 0.9]
+    assert completion.reasoning_tokens == 5
     assert completion.finish_reason == "stop"
 
 

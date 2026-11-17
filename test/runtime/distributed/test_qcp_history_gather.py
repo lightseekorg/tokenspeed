@@ -24,30 +24,38 @@ Four ranks own the pages of a sharded cache group cyclically. Each rank holds
 its owned rows of a deterministic reference plane; the gather must rebuild
 every request group's history in position order on every rank, with the
 per-rank split counted on the host from the page table. Also covered: a rank
-that owns no row of a group still joins the collective, non-bf16 rows (packed
-index-K bytes, fp32 scales, fp8 latent) travel through a bf16-only gather
-backend byte-identically, the replicated (``placement=None``) path is a local
-gather, the host owner rule agrees with the kernel's per-rank translation, and
+that owns no row of a group still joins the collective, every rank sends an
+equal share (its rows, then a null-page tail), rows of any dtype (packed
+index-K bytes, fp32 scales, fp8 latent, odd byte widths) land byte-identical,
+the replicated (``placement=None``) path is a local gather, the host owner
+rule agrees with the kernel's per-rank translation, and
 the DSA leaf's index-K history gather rebuilds the plane in its own format
-(``fp8_scaled`` bytes and scales, or ``bf16`` keys).
+(``fp8_scaled`` bytes and scales, or ``bf16`` keys), and the KVP history
+prefill's page gathers land every history row of both planes at the slot its
+plan maps the row to.
 """
 
 from __future__ import annotations
 
 import socket
+import sys
+from pathlib import Path
 from test.runtime.dsa_index_k_test_utils import (
     expected_index_k_rows,
     index_k_pool,
     write_index_k_plane,
 )
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from tokenspeed_kernel.ops.kvcache.index_k_scale import index_k_scale_dtype
 from tokenspeed_kernel.ops.kvcache.triton_cache_placement import virtual_slots_to_local
 
 from tokenspeed.runtime.layers.attention.dcp.cache import (
+    all_gather_history_rows,
     gather_history_rows,
     plan_history_gather,
 )
@@ -56,9 +64,16 @@ from tokenspeed.runtime.layers.attention.dcp.placement import (
     cyclic_slot_owner,
     owned_history_rows,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.dsa import split_index_k_rows
 from tokenspeed.runtime.layers.attention.page_table import (
     build_prefill_kv_workspace_slots,
 )
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=60, suite="runtime-1gpu")
+
 
 WORLD = 4
 PAGE = 2  # kernel page size
@@ -127,34 +142,27 @@ def _get_open_port() -> int:
         return s.getsockname()[1]
 
 
-def _worker(rank: int, port: int, errors) -> None:
+def _worker(rank: int, run, port: int, errors, *args) -> None:
     try:
-        _run(rank, port)
+        run(rank, port, *args)
     except Exception:  # pragma: no cover - reported to the parent
         import traceback
 
         errors[rank] = traceback.format_exc()
 
 
-class _Bf16OnlyBackend:
-    """The production low-latency token all-gather moves bf16 rows only
-    (``TritonRSAGBackend`` asserts the dtype); this stand-in enforces that
-    and delegates the data movement to the NCCL-style padded gather."""
-
-    def __init__(self, delegate) -> None:
-        self.delegate = delegate
-        self.gathered_dtypes: list[torch.dtype] = []
-
-    def token_all_gather(self, tensor, group, scattered_num_tokens):
-        assert tensor.dtype == torch.bfloat16, f"RSAG gather of {tensor.dtype}"
-        self.gathered_dtypes.append(tensor.dtype)
-        return self.delegate.token_all_gather(tensor, group, scattered_num_tokens)
-
-    def __getattr__(self, name):
-        return getattr(self.delegate, name)
+def _spawn(run, *args) -> None:
+    """``run(rank, port, *args)`` on every rank, raising the ranks' errors."""
+    port = _get_open_port()
+    errors = mp.Manager().dict()
+    mp.spawn(_worker, args=(run, port, errors, *args), nprocs=WORLD, join=True)
+    if errors:
+        raise RuntimeError("\n".join(f"rank {r}: {e}" for r, e in errors.items()))
 
 
-def _run(rank: int, port: int) -> None:
+def _join_kvp_group(rank: int, port: int, wrap=lambda backend: backend):
+    """Join the KVP group over gloo, whose process group also stands in for
+    its NCCL one, and register ``wrap`` of the NCCL backend."""
     from tokenspeed.runtime.distributed.comm_backend import registry
     from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
     from tokenspeed.runtime.distributed.mapping import Mapping
@@ -174,12 +182,36 @@ def _run(rank: int, port: int) -> None:
     pg_manager.register_process_group(
         "nccl", group, pg_manager.get_process_group("gloo", group)
     )
-    # Not the deterministic NCCL route: every history gather must be
-    # dtype-safe for the bf16-only low-latency solution.
     global_server_args_dict["force_deterministic_rsag"] = False
-    backend = _Bf16OnlyBackend(NcclBackend())
+    backend = wrap(NcclBackend())
     registry._global_backend = backend
+    return backend
 
+
+class _RecordingBackend:
+    """Records the history gathers' equal-share all-gathers (the shape every
+    rank sends) and delegates the data movement to the NCCL backend; the
+    history gather must not take the token all-gather, whose low-latency
+    solution is bf16-only."""
+
+    def __init__(self, delegate) -> None:
+        self.delegate = delegate
+        self.sent_shapes: list[tuple[int, ...]] = []
+
+    def all_gather_single(self, output, input, group):
+        assert output.shape[0] == len(group) * input.shape[0]
+        self.sent_shapes.append(tuple(input.shape))
+        return self.delegate.all_gather_single(output, input, group)
+
+    def token_all_gather(self, tensor, group, scattered_num_tokens):
+        raise AssertionError("the history gather took the token all-gather")
+
+    def __getattr__(self, name):
+        return getattr(self.delegate, name)
+
+
+def _run(rank: int, port: int) -> None:
+    backend = _join_kvp_group(rank, port, _RecordingBackend)
     placement = _placement(rank)
     table = _page_table()
     owned = owned_history_rows(table, SEQ_LENS, page_size=PAGE, placement=placement)
@@ -204,23 +236,45 @@ def _run(rank: int, port: int) -> None:
         plan = plan_history_gather(
             virtual_slots, placement=placement, owned_rows_per_rank=counts
         )
-        assert plan.rows == rows
-        local = plane.index_select(0, plan.local_fetch_slots)
-        assert local.shape[0] == counts[rank]
+        assert plan.rows == rows and plan.send_rows == max(counts)
+        local = plane.index_select(0, plan.send_slots)
+        assert local.shape[0] == max(counts)
         assert not torch.isnan(
-            local.float()
+            local[: counts[rank]].float()
         ).any(), "fetched a row this rank does not own"
+        # The tail is the null page (slot 0), which no rank's rows occupy.
+        assert torch.equal(
+            plan.send_slots[counts[rank] :],
+            plan.send_slots.new_zeros(max(counts) - counts[rank]),
+        )
         out = gather_history_rows(plan, local, out=workspace)
         torch.testing.assert_close(out, _reference(virtual_slots), rtol=0, atol=0)
+        # Without the read-back the rows stay rank-major: position i is row
+        # gathered_index[i] of the all-gather output.
+        rank_major = all_gather_history_rows(
+            plan,
+            plane.index_select(0, plan.send_slots),
+            out=torch.empty(
+                (len(plan.group) * plan.send_rows + 1, DIM), dtype=local.dtype
+            ),
+        )
+        assert rank_major.shape[0] == len(plan.group) * plan.send_rows
+        torch.testing.assert_close(
+            rank_major[plan.gathered_index.to(torch.int64)],
+            _reference(virtual_slots),
+            rtol=0,
+            atol=0,
+        )
         if requests == slice(2, 3):
             assert counts[2] == 0 and counts[3] == 0
 
         # The non-bf16 payloads of the indexer (packed uint8 index-K rows,
-        # fp32 scales) and an fp8 latent travel as bf16 pairs of their bytes
-        # and land byte-identical.
+        # fp32 scales), an fp8 latent and an odd byte width travel as their
+        # bytes and land byte-identical.
         reference = _reference(virtual_slots)
         for dtype, width in (
             (torch.uint8, 132),
+            (torch.uint8, 3),
             (torch.float32, 3),
             (torch.float8_e4m3fn, DIM),
         ):
@@ -233,13 +287,22 @@ def _run(rank: int, port: int) -> None:
             )
             assert out.dtype == dtype and out.shape == (rows, width)
             assert torch.equal(out.view(torch.uint8), full.view(torch.uint8))
-        with pytest.raises(ValueError, match="even byte width"):
+            rank_major = all_gather_history_rows(
+                plan,
+                _typed_rows(plane.index_select(0, plan.send_slots), dtype, width),
+                out=torch.empty((len(plan.group) * plan.send_rows, width), dtype=dtype),
+            )
+            assert torch.equal(
+                rank_major.view(torch.uint8)[plan.gathered_index.to(torch.int64)],
+                full.view(torch.uint8),
+            )
+        with pytest.raises(ValueError, match="sends"):
             gather_history_rows(
                 plan,
-                torch.zeros((counts[rank], 3), dtype=torch.uint8),
+                torch.zeros((max(counts) + 1, 3), dtype=torch.uint8),
                 out=torch.empty((rows, 3), dtype=torch.uint8),
             )
-    assert backend.gathered_dtypes and set(backend.gathered_dtypes) == {torch.bfloat16}
+    assert backend.sent_shapes
 
     dist.barrier()
     dist.destroy_process_group()
@@ -254,12 +317,40 @@ def _typed_rows(rows: torch.Tensor, dtype: torch.dtype, width: int) -> torch.Ten
     return raw.repeat(1, repeats)[:, :width_bytes].contiguous().view(dtype)
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn, torch.uint8])
+@pytest.mark.parametrize("rows", [0, 1, 5])
+def test_rank_major_history_preserves_single_owner_bytes(dtype, rows):
+    plan = plan_history_gather(
+        torch.arange(rows), placement=None, owned_rows_per_rank=[rows]
+    )
+    width = 4
+    row_bytes = width * torch.empty((), dtype=dtype).element_size()
+    # Raw bytes exercise NaNs and signed zero without numerical comparison.
+    pattern = torch.tensor([0, 128, 255, 127], dtype=torch.uint8)
+    payload = pattern.repeat((rows * row_bytes + 3) // 4)[: rows * row_bytes]
+    local = payload.reshape(rows, row_bytes).view(dtype)
+    out = torch.empty((rows + 1, width), dtype=dtype)
+    out.view(torch.uint8).fill_(37)
+    result = all_gather_history_rows(plan, local, out=out)
+    assert result.shape == (rows, width)
+    assert torch.equal(result.view(torch.uint8), local.view(torch.uint8))
+    assert torch.all(out[rows:].view(torch.uint8) == 37)
+
+
+@pytest.mark.parametrize("invalid", ["send_rows", "capacity", "width", "dtype"])
+def test_rank_major_history_rejects_invalid_buffers(invalid):
+    plan = plan_history_gather(torch.arange(3), placement=None, owned_rows_per_rank=[3])
+    local = torch.zeros((2 if invalid == "send_rows" else 3, 4))
+    out = torch.empty(
+        (2 if invalid == "capacity" else 3, 5 if invalid == "width" else 4),
+        dtype=torch.int32 if invalid == "dtype" else torch.float32,
+    )
+    with pytest.raises(ValueError):
+        all_gather_history_rows(plan, local, out=out)
+
+
 def test_history_gather_rebuilds_every_group_in_position_order():
-    port = _get_open_port()
-    errors = mp.Manager().dict()
-    mp.spawn(_worker, args=(port, errors), nprocs=WORLD, join=True)
-    if errors:
-        raise RuntimeError("\n".join(f"rank {r}: {e}" for r, e in errors.items()))
+    _spawn(_run)
 
 
 # --- the DSA leaf's index-K history gather, per plane format ------------------
@@ -276,7 +367,9 @@ def _index_k_keys() -> torch.Tensor:
     )
 
 
-def _local_index_k_planes(index_k_format: str) -> list[torch.Tensor]:
+def _local_index_k_planes(
+    index_k_format: str, page_size: int = GRANULARITY
+) -> list[torch.Tensor]:
     """Every rank's physical index-K plane: the virtual slots it owns, written
     at their local slots through the pool's production write path (built in
     the parent, so the gloo workers stay host-only)."""
@@ -296,7 +389,7 @@ def _local_index_k_planes(index_k_format: str) -> list[torch.Tensor]:
             write_index_k_plane(
                 index_k_format,
                 head_dim=INDEX_HEAD_DIM,
-                page_size=GRANULARITY,
+                page_size=page_size,
                 slots=local_pages * GRANULARITY,
                 loc=local[owned],
                 keys=keys[owned],
@@ -330,37 +423,16 @@ def _run_index_k(
     rank: int,
     port: int,
     index_k_format: str,
-    plane: torch.Tensor,
+    planes: list[torch.Tensor],
     expected: tuple[torch.Tensor, torch.Tensor | None],
 ) -> None:
-    from tokenspeed.runtime.distributed.comm_backend import registry
-    from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
-    from tokenspeed.runtime.distributed.mapping import Mapping
-    from tokenspeed.runtime.distributed.process_group_manager import (
-        process_group_manager as pg_manager,
-    )
     from tokenspeed.runtime.layers.attention.backends.paged.dsa import (
         QueryShardHistoryGroup,
     )
-    from tokenspeed.runtime.utils.env import global_server_args_dict
 
-    mapping = Mapping(
-        rank=rank, world_size=WORLD, attn_tp_size=WORLD, attn_kvp_size=WORLD
-    )
-    pg_manager.init_distributed(
-        mapping, distributed_init_method=f"tcp://127.0.0.1:{port}", backend="gloo"
-    )
-    group = mapping.attn.kvp_group
-    pg_manager.init_process_group(group, backend="gloo")
-    pg_manager.register_process_group(
-        "nccl", group, pg_manager.get_process_group("gloo", group)
-    )
-    global_server_args_dict["force_deterministic_rsag"] = False
-    backend_comm = _Bf16OnlyBackend(NcclBackend())
-    registry._global_backend = backend_comm
-
+    backend_comm = _join_kvp_group(rank, port, _RecordingBackend)
     leaf = _dsa_leaf(rank, index_k_format, max_model_len=int(SEQ_LENS.sum()))
-    pool = index_k_pool(plane, head_dim=INDEX_HEAD_DIM, page_size=GRANULARITY)
+    pool = index_k_pool(planes[rank], head_dim=INDEX_HEAD_DIM, page_size=GRANULARITY)
     expected_keys, expected_scale = expected
     placement = leaf.cache_placement(None)
     assert placement == _placement(rank)
@@ -394,26 +466,15 @@ def _run_index_k(
         assert keys.data_ptr() == workspace.index_k.data_ptr()
         assert torch.equal(keys, expected_keys[virtual_slots])
         if index_k_format == "fp8_scaled":
-            assert keys.dtype == torch.uint8 and scale.dtype == torch.float32
+            assert keys.dtype == torch.uint8 and scale.dtype == index_k_scale_dtype()
             assert torch.equal(scale, expected_scale[virtual_slots])
         else:
             assert keys.dtype == torch.bfloat16 and scale is None
         row_base += rows
-    assert set(backend_comm.gathered_dtypes) == {torch.bfloat16}
+    assert backend_comm.sent_shapes
 
     dist.barrier()
     dist.destroy_process_group()
-
-
-def _index_k_worker(
-    rank: int, port: int, index_k_format: str, planes, expected, errors
-):
-    try:
-        _run_index_k(rank, port, index_k_format, planes[rank], expected)
-    except Exception:  # pragma: no cover - reported to the parent
-        import traceback
-
-        errors[rank] = traceback.format_exc()
 
 
 @pytest.mark.parametrize("index_k_format", ["fp8_scaled", "bf16"])
@@ -425,19 +486,88 @@ def test_the_dsa_leaf_gathers_the_index_k_history_in_the_planes_format(
     plane's own format -- the bytes the pool's write path stored: FP8 bytes
     plus fp32 scales, or bf16 keys with no scale (the
     ``index_k_fp8``/``index_k_scale`` and ``index_k_bf16`` rows of
-    ``dsa_prefill_topk``) -- through the bf16-only collective."""
+    ``dsa_prefill_topk``) -- through one equal-share byte all-gather."""
     planes = _local_index_k_planes(index_k_format)
     expected = expected_index_k_rows(index_k_format, _index_k_keys())
-    port = _get_open_port()
-    errors = mp.Manager().dict()
-    mp.spawn(
-        _index_k_worker,
-        args=(port, index_k_format, planes, expected, errors),
-        nprocs=WORLD,
-        join=True,
+    _spawn(_run_index_k, index_k_format, planes, expected)
+
+
+# --- the KVP history prefill's page gathers -----------------------------------
+
+# Chunks continuing cached prefixes of SEQ_LENS - EXTEND rows.
+EXTEND = torch.tensor([3, 2, 7], dtype=torch.int64)
+
+
+def _run_history_pages(
+    rank: int,
+    port: int,
+    planes: list[torch.Tensor],
+    expected: tuple[torch.Tensor, torch.Tensor],
+) -> None:
+    _join_kvp_group(rank, port)
+    # 16 pages: requests 0 and 1 share a group (the busiest owner sends 4 of
+    # their pages, 16 gathered); request 2 gathers alone.
+    leaf = _dsa_leaf(rank, "fp8_scaled", max_model_len=32)
+    leaf._history_prefill = True
+    table = _page_table()
+    plan = leaf._plan_history_prefill(
+        num_extends=3,
+        page_table_cpu=table,
+        extend_seq_lens_cpu=EXTEND,
+        extend_prefix_lens_cpu=SEQ_LENS - EXTEND,
     )
-    if errors:
-        raise RuntimeError("\n".join(f"rank {r}: {e}" for r, e in errors.items()))
+    latent = _local_plane(rank)
+    index_pool = index_k_pool(planes[rank], head_dim=INDEX_HEAD_DIM, page_size=PAGE)
+    pool = SimpleNamespace(
+        get_key_buffer=lambda layer_id: latent,
+        get_index_k_buffer=index_pool.get_index_k_buffer,
+        index_k_page_size=PAGE,
+    )
+    layer = SimpleNamespace(layer_id=0)
+    expected_keys, expected_scale = expected
+    first = 0
+    for group_ in plan.groups:
+        rows = int(SEQ_LENS[group_.requests].sum())
+        virtual_slots = build_prefill_kv_workspace_slots(
+            page_table=table[group_.requests],
+            seq_lens=SEQ_LENS[group_.requests],
+            max_seq_len=int(SEQ_LENS[group_.requests].max()),
+            page_size=PAGE,
+            device=torch.device("cpu"),
+            num_tokens=rows,
+        )
+        slots = plan.slots[first : first + rows]
+        first += rows
+        # Every history row at its slot; no slot reaches a padding page (the
+        # foreign rows of a rank's plane are NaN).
+        kv = leaf.gather_history_kv_pages(layer, pool, group_)
+        assert kv.shape == (WORLD * group_.send_pages * PAGE, DIM)
+        torch.testing.assert_close(kv[slots], _reference(virtual_slots), rtol=0, atol=0)
+        plane = leaf.gather_history_index_k_pages(0, pool, group_)
+        keys, scale = split_index_k_rows(
+            index_k_pool(
+                plane, head_dim=INDEX_HEAD_DIM, page_size=PAGE
+            ).gather_index_k_rows(0, slots, index_k_format="fp8_scaled"),
+            index_head_dim=INDEX_HEAD_DIM,
+            index_k_format="fp8_scaled",
+        )
+        assert torch.equal(keys, expected_keys[virtual_slots])
+        assert torch.equal(scale, expected_scale[virtual_slots])
+    assert first == int(SEQ_LENS.sum())
+
+    dist.barrier()
+    dist.destroy_process_group()
+
+
+def test_the_history_prefill_gathers_every_row_to_its_planned_slot():
+    """The KVP history prefill's page gathers over page-sharded ``fp8_scaled``
+    planes (one all-gather per plane and request group) land every history
+    row of the latent and index-K planes at the slot its plan maps it to, on
+    every rank -- the slots the prefill top-k scores through and the sparse
+    core reads."""
+    planes = _local_index_k_planes("fp8_scaled", page_size=PAGE)
+    expected = expected_index_k_rows("fp8_scaled", _index_k_keys())
+    _spawn(_run_history_pages, planes, expected)
 
 
 def test_replicated_group_gathers_locally_without_a_collective():
@@ -456,11 +586,11 @@ def test_replicated_group_gathers_locally_without_a_collective():
     plan = plan_history_gather(
         virtual_slots, placement=None, owned_rows_per_rank=[rows]
     )
-    assert plan.group == (0,) and torch.equal(plan.local_fetch_slots, virtual_slots)
+    assert plan.group == (0,) and torch.equal(plan.send_slots, virtual_slots)
     plane = _reference(torch.arange(VIRTUAL_BLOCKS * GRANULARITY))
     out = gather_history_rows(
         plan,
-        plane.index_select(0, plan.local_fetch_slots),
+        plane.index_select(0, plan.send_slots),
         out=torch.empty((rows, DIM), dtype=torch.bfloat16),
     )
     torch.testing.assert_close(out, _reference(virtual_slots), rtol=0, atol=0)

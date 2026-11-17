@@ -33,12 +33,16 @@ use std::{
     collections::VecDeque,
     sync::mpsc as std_mpsc,
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use bytes::Bytes;
-use ts_scheduler::KvEventView;
+use ts_scheduler::{profile, KvEventBatch};
 use zeromq::{PubSocket, RouterSocket, Socket, SocketRecv, SocketSend, ZmqError, ZmqMessage};
+
+mod stats;
+use stats::PendingBatch;
+pub use stats::{KvEventProgress, KvEventStats};
 
 /// How long shutdown waits for queued batches to go out
 /// (`ZmqEventPublisher.SHUTDOWN_TIMEOUT`).
@@ -99,30 +103,30 @@ pub fn offset_endpoint_port(endpoint: &str, dp_rank: i64) -> Result<String, KvEv
 
 /// One round's events as the publisher's payload (`KVEventBatch`): the
 /// time, the events and this rank's attention-DP rank.
-pub fn encode_batch(timestamp: f64, events: &[KvEventView], dp_rank: i64) -> Vec<u8> {
+pub fn encode_batch(timestamp: f64, events: &KvEventBatch, dp_rank: i64) -> Vec<u8> {
     let mut encoder = ts_wire::msgpack::Encoder::new();
     encoder.array_len(3);
     encoder.float(timestamp);
     encoder.array_len(events.len());
-    for event in events {
+    for event in events.iter() {
         if event.stored {
             encoder.array_len(5);
             encoder.str("BlockStored");
-            hashes(&mut encoder, &event.block_hashes);
+            hashes(&mut encoder, event.block_hashes);
             if event.has_parent {
                 encoder.uint(event.parent_block_hash);
             } else {
                 encoder.nil();
             }
             encoder.array_len(event.token_ids.len());
-            for &token in &event.token_ids {
+            for &token in event.token_ids {
                 encoder.int(i64::from(token));
             }
             encoder.int(i64::from(event.block_size));
         } else {
             encoder.array_len(2);
             encoder.str("BlockRemoved");
-            hashes(&mut encoder, &event.block_hashes);
+            hashes(&mut encoder, event.block_hashes);
         }
     }
     encoder.int(dp_rank);
@@ -141,11 +145,16 @@ fn bind_address(endpoint: &str) -> String {
     endpoint.replace("://*:", "://0.0.0.0:")
 }
 
+struct Publication {
+    timestamp: f64,
+    events: KvEventBatch,
+}
+
 /// One rank's publisher; dropping it sends what is queued, for up to a
 /// second.
 pub struct KvEventPublisher {
-    queue: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
-    dp_rank: i64,
+    queue: Option<tokio::sync::mpsc::Sender<PendingBatch<Publication>>>,
+    progress: KvEventProgress,
     done: std_mpsc::Receiver<()>,
 }
 
@@ -183,7 +192,8 @@ impl KvEventPublisher {
             None => None,
         };
         tracing::info!(endpoint, replay = ?replay_endpoint, "publishing KV cache events");
-        let (queue, batches) = tokio::sync::mpsc::channel::<Vec<u8>>(config.max_queue_size.max(1));
+        let (queue, batches) =
+            tokio::sync::mpsc::channel::<PendingBatch<Publication>>(config.max_queue_size.max(1));
         let (done_tx, done) = std_mpsc::channel();
         let state = PublisherState {
             publisher,
@@ -191,6 +201,7 @@ impl KvEventPublisher {
             topic: Bytes::from(config.topic.clone().into_bytes()),
             buffer: VecDeque::new(),
             buffer_steps: config.buffer_steps,
+            dp_rank,
             next_seq: 0,
         };
         thread::Builder::new()
@@ -201,22 +212,35 @@ impl KvEventPublisher {
             })?;
         Ok(Self {
             queue: Some(queue),
-            dp_rank,
+            progress: KvEventProgress::default(),
             done,
         })
     }
 
-    /// Queue one round's events; waits while the queue is full.
-    pub fn publish(&self, events: &[KvEventView]) {
+    /// Observe queued and in-flight data without extending worker lifetime.
+    pub fn progress(&self) -> KvEventProgress {
+        self.progress.clone()
+    }
+
+    /// Move one round's independent snapshot to the publisher. Encoding and
+    /// snapshot destruction run on its thread. This call still waits when the
+    /// bounded queue is full: accepted events retain FIFO/replay semantics.
+    pub fn publish(&self, events: KvEventBatch) {
         if events.is_empty() {
             return;
         }
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0.0, |elapsed| elapsed.as_secs_f64());
-        let payload = encode_batch(timestamp, events, self.dp_rank);
         if let Some(queue) = &self.queue {
-            if queue.blocking_send(payload).is_err() {
+            let bytes = events.byte_size();
+            let pending = self
+                .progress
+                .track(Publication { timestamp, events }, bytes);
+            let start = Instant::now();
+            let result = queue.blocking_send(pending);
+            self.progress.enqueued(start.elapsed());
+            if result.is_err() {
                 tracing::warn!("the KV event publisher stopped; dropping a batch");
             }
         }
@@ -239,15 +263,31 @@ struct PublisherState {
     topic: Bytes,
     buffer: VecDeque<(u64, Bytes)>,
     buffer_steps: usize,
+    dp_rank: i64,
     next_seq: u64,
 }
 
 impl PublisherState {
-    async fn run(mut self, mut batches: tokio::sync::mpsc::Receiver<Vec<u8>>) {
+    async fn run(mut self, mut batches: tokio::sync::mpsc::Receiver<PendingBatch<Publication>>) {
         loop {
             tokio::select! {
                 batch = batches.recv() => match batch {
-                    Some(payload) => self.send(payload).await,
+                    Some(PendingBatch {payload, lease}) => {
+                        let Publication {timestamp, events} = payload;
+                        let encoded = {
+                            let _span = profile::span("KvEvents::encode");
+                            encode_batch(timestamp, &events, self.dp_rank)
+                        };
+                        {
+                            let _span = profile::span("KvEvents::releaseBatch");
+                            drop(events);
+                        }
+                        {
+                            let _span = profile::span("KvEvents::send");
+                            self.send(encoded).await;
+                        }
+                        lease.complete();
+                    },
                     None => return,
                 },
                 request = recv_replay(&mut self.replay) => match request {
@@ -331,5 +371,62 @@ mod tests {
             "tcp://*:5559"
         );
         assert!(offset_endpoint_port("ipc:///tmp/x", 1).is_err());
+    }
+
+    #[test]
+    fn a_full_queue_blocks_until_capacity_returns_and_preserves_owned_batches() {
+        use std::sync::mpsc::TryRecvError;
+        use ts_scheduler::KvEventView;
+        let batch = |hash| {
+            KvEventBatch::from_events(&[KvEventView {
+                stored: false,
+                block_hashes: vec![hash],
+                has_parent: false,
+                parent_block_hash: 0,
+                token_ids: Vec::new(),
+                block_size: 0,
+            }])
+        };
+        let (queue, mut receiver) = tokio::sync::mpsc::channel(1);
+        let (done_tx, done) = std_mpsc::channel();
+        let publisher = KvEventPublisher {
+            queue: Some(queue),
+            progress: KvEventProgress::default(),
+            done,
+        };
+        let progress = publisher.progress();
+        publisher.publish(batch(11));
+        let (returned_tx, returned_rx) = std_mpsc::channel();
+        let sender = thread::spawn(move || {
+            publisher.publish(batch(29));
+            returned_tx.send(()).unwrap();
+            publisher
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while progress.snapshot().pending_batches != 2 {
+            assert!(
+                Instant::now() < deadline,
+                "second publication never entered the queue"
+            );
+            thread::yield_now();
+        }
+        assert_eq!(returned_rx.try_recv(), Err(TryRecvError::Empty));
+        let first = receiver.blocking_recv().unwrap();
+        assert_eq!(
+            first.payload.events.iter().next().unwrap().block_hashes,
+            [11]
+        );
+        returned_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let second = receiver.blocking_recv().unwrap();
+        assert_eq!(
+            second.payload.events.iter().next().unwrap().block_hashes,
+            [29]
+        );
+        drop(first);
+        drop(second);
+        assert_eq!(progress.snapshot().pending_batches, 0);
+        assert_eq!(progress.snapshot().peak_pending_batches, 2);
+        done_tx.send(()).unwrap();
+        drop(sender.join().unwrap());
     }
 }

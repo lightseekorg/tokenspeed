@@ -22,6 +22,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import torch
 from tokenspeed_kernel.platform import (
     ArchVersion,
@@ -29,7 +31,50 @@ from tokenspeed_kernel.platform import (
     current_platform,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.selection import resolve_kernel_override
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+
+logger = logging.getLogger(__name__)
+_topk_availability_reported = False
+
+
+def warn_if_cuda_topk_unavailable(
+    dtype: torch.dtype,
+    topk: int,
+    *,
+    solution: str | None,
+    override: str | None,
+) -> None:
+    """Warn once for eligible score dtype/topk and call-site solution/override.
+
+    Resolves override precedence before reporting; returns None without changing
+    selection. Calls excluding native CUDA do not consume the one-time report.
+    """
+    global _topk_availability_reported
+    if (
+        _topk_availability_reported
+        or dtype != torch.float32
+        or topk not in (512, 1024, 2048)
+        or not current_platform().is_hopper_plus
+    ):
+        return
+    override = resolve_kernel_override("attention", "qsa_block_topk_select", override)
+    if (override or solution) not in (None, "cuda", "cuda_qsa_block_topk_select"):
+        return
+    from tokenspeed_kernel.thirdparty.cuda.dsv4_attention import (
+        persistent_topk_unavailable_reason,
+    )
+
+    reason = persistent_topk_unavailable_reason()
+    _topk_availability_reported = True
+    if reason is not None:
+        logger.warning(
+            f"[tokenspeed_kernel] cuda_qsa_block_topk_select not registered: {reason}. "
+            "Rebuild/reinstall tokenspeed-kernel's dsv4_attention CUDA group and "
+            "restart (ops/attention/qsa/README.md). "
+            "TOKENSPEED_KERNEL_VERBOSE=1 logs the selected implementation."
+        )
+
 
 if current_platform().is_nvidia:
     from tokenspeed_kernel.ops.attention.dsa.cuda import (

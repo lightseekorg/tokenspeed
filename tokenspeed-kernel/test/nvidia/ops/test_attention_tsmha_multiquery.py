@@ -163,6 +163,10 @@ def test_dispatch_native_multiq(page, rel_extent, window_left, kv_lens, k_new) -
             max_seqlen_q=k_new,
             window_left=window_left,
             softmax_scale=SCALE,
+            output_dtype=None,
+            return_lse=False,
+            gate=None,
+            sink=None,
         ).view(B * k_new, NUM_Q_HEADS, HEAD_DIM)
     finally:
         v2mod.rel_mha_decode_tsmha_v2 = orig
@@ -234,6 +238,10 @@ def test_v2_native_prediction_vs_reference(
         window_left,
         SCALE,
         prediction=k_new,
+        output_dtype=None,
+        return_lse=False,
+        gate=None,
+        sink=None,
     ).view(B * k_new, NUM_Q_HEADS, HEAD_DIM)
 
     ref = _reference(q, ks, vs, rel, kv_lens, k_new, rel_extent, window_left)

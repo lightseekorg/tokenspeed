@@ -93,7 +93,7 @@ class TestL3FlatKvRoundTripTest:
         )
 
     def test_cp_restores_history_on_a_new_owner_and_keeps_state_rank_local(self):
-        from tokenspeed_scheduler import StorageKind
+        from tokenspeed_engine.scheduler import StorageKind
 
         from tokenspeed.runtime.cache.l2.sizing import RetractionPoolRequest
         from tokenspeed.runtime.cache.transfer.ownership import BlockOwnerTranslation
@@ -362,7 +362,7 @@ class TestL3FlatKvRoundTripTest:
     def _exercise_qwen(self, *, phase, namespace, mooncake, io_backend):
         from test.runtime.test_cache_setup import _qwen_gdn_setup
 
-        from tokenspeed_scheduler import StorageKind
+        from tokenspeed_engine.scheduler import StorageKind
 
         from tokenspeed.runtime.layers.attention.kv_cache.factory import (
             create_cache_arena,
@@ -509,7 +509,7 @@ class TestL3FlatKvRoundTripTest:
 
             pool = SyntheticPool()
             executor = self._host_executor(pool, io_backend=io_backend, host_ratio=1.0)
-            from tokenspeed_scheduler import StorageKind
+            from tokenspeed_engine.scheduler import StorageKind
 
             cleanup.callback(executor.shutdown)
             l3 = host_storage_executor(

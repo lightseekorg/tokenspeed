@@ -38,6 +38,7 @@ from cutlass.cute.typing import Float32, Int32
 from cutlass.cutlass_dsl import T, dsl_user_op
 from tokenspeed_kernel.thirdparty.cute_dsl.argmax import (
     elem_pointer,
+    mbarrier_wait_acquire_cluster,
     store_shared_remote,
 )
 from tokenspeed_kernel.thirdparty.cute_dsl.latent_moe_tail.primitives import (
@@ -171,7 +172,7 @@ def publish_to_cluster(
             cute.arch.mbarrier_arrive_and_expect_tx(mbar_ptr, peers * 4)
         if lane < peers:
             store_shared_remote(value, slot, mbar_ptr, peer_cta_rank_in_cluster=lane)
-    cute.arch.mbarrier_wait(mbar_ptr, phase=0)
+    mbarrier_wait_acquire_cluster(mbar_ptr, 0)
 
 
 class ClusterBoundaryKernel:
@@ -193,6 +194,11 @@ class ClusterBoundaryKernel:
             16-bit halves agree, or None for an ordinary branch tensor.
         mailbox_ranks: Partials per mailbox row, side by side; 1 reads the
             row as it stands, more sums them in BF16 in rank order.
+        mailbox_capacity: Rows each mailbox block holds.
+        mailbox_block_width: Columns of one mailbox block. The mailbox is
+            ``[blocks, mailbox_capacity, mailbox_block_width]``, one block per
+            producing rank, and a row's ``width * mailbox_ranks`` columns are
+            the blocks' rows side by side.
 
     The call takes the boundary's tensors, then ``rows`` and the stream; an
     absent weight or pre-norm output takes any tensor of its dtype, never read.
@@ -210,6 +216,8 @@ class ClusterBoundaryKernel:
         use_pdl: bool,
         mailbox_sentinel: int | None,
         mailbox_ranks: int,
+        mailbox_capacity: int,
+        mailbox_block_width: int,
     ) -> None:
         if mailbox_sentinel is not None and (
             not 0 <= mailbox_sentinel <= 0xFFFFFFFF
@@ -220,6 +228,14 @@ class ClusterBoundaryKernel:
             raise ValueError("partials are reduced from a mailbox, one or more per row")
         self.width = width
         self.per_thread = width // (CLUSTER_CTAS * CTA_THREADS)
+        if mailbox_sentinel is not None and (
+            mailbox_capacity < 1
+            or mailbox_block_width % self.per_thread
+            or (width * mailbox_ranks) % mailbox_block_width
+        ):
+            raise ValueError("a thread's columns must lie within one mailbox block")
+        self.mailbox_capacity = mailbox_capacity
+        self.mailbox_block_width = mailbox_block_width
         self.mailbox_sentinel = mailbox_sentinel
         self.mailbox_ranks = mailbox_ranks
         self.post_has_weight = post_has_weight
@@ -361,11 +377,18 @@ class ClusterBoundaryKernel:
             # in rank order, each input stripped of -0.0 first, exactly as the
             # one-shot all-reduce kernel sums the same partials.
             ranks = self.mailbox_ranks
-            word_ptr = branch.iterator + row * (width * ranks) + col0
+            block_width: cutlass.Constexpr = self.mailbox_block_width
+            block_rows: cutlass.Constexpr = self.mailbox_capacity * block_width
             for w in cutlass.range_constexpr(per_thread // 2):
                 acc = Uint32(0)
                 for r in cutlass.range_constexpr(ranks):
-                    word_at = word_ptr + (r * width + 2 * w)
+                    column = r * width + col0
+                    word_at = branch.iterator + (
+                        (column // block_width) * block_rows
+                        + row * block_width
+                        + column % block_width
+                        + 2 * w
+                    )
                     word = load_volatile_u32(word_at)
                     while word_is_dirty(word, self.mailbox_sentinel):
                         word = load_volatile_u32(word_at)

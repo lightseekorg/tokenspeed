@@ -101,6 +101,23 @@ def infer_multimodal_encoder_dtype(model: torch.nn.Module) -> str | None:
     return None
 
 
+def validate_output_vocabulary(model: torch.nn.Module, vocab_size: int) -> None:
+    """Check the loaded target's logical logits width before allocating samplers."""
+    # Models without logits (encoder workers and intermediate PP stages) have
+    # no output vocabulary. Inspect the model interface, not padded/sharded weights.
+    processor = getattr(model, "logits_processor", None)
+    if processor is None:
+        return
+    actual = processor.config.vocab_size
+    if actual != vocab_size:
+        raise ValueError(
+            f"{type(model).__name__} produces a logical output vocabulary of "
+            f"{actual}, but the runtime vocab_size is {vocab_size}. "
+            "The model must construct its output head and logits processor "
+            "with the checkpoint's output_vocab_size."
+        )
+
+
 class ModelRunner:
     def __init__(
         self,
@@ -229,6 +246,8 @@ class ModelRunner:
             checkpoint_load_group=self.checkpoint_load_group,
             is_draft_worker=self.is_draft_worker,
         )
+        if not self.is_draft_worker:
+            validate_output_vocabulary(self.model, self.model_config.vocab_size)
         self._model_forward_accepts_spec_step_idx = self._forward_accepts_kwarg(
             self.model, "spec_step_idx"
         )
@@ -327,7 +346,6 @@ class ModelRunner:
         input_embeds: torch.Tensor | None = None,
         multimodal_context: MultimodalForwardContext | None = None,
         spec_step_idx: int | None = None,
-        kv_sync_event: "torch.cuda.Event | None" = None,
         pp_inbound=None,
         **kwargs,
     ) -> LogitsProcessorOutput:
@@ -343,8 +361,6 @@ class ModelRunner:
             kwargs["multimodal_context"] = multimodal_context
         if spec_step_idx is not None and self.forward_accepts_spec_step_idx:
             kwargs["spec_step_idx"] = spec_step_idx
-        if kv_sync_event is not None:
-            kwargs["kv_sync_event"] = kv_sync_event
 
         return self.model.forward(
             ctx,
@@ -443,6 +459,11 @@ class ModelRunner:
         """Receive trainer-broadcast weights over the NCCL group and load them."""
         import torch.distributed as dist
 
+        if self.mapping.moe_weight_sharing_size is not None:
+            return (
+                False,
+                "Peer expert weights are immutable; restart to change the checkpoint",
+            )
         pg = self._weight_update_pg
         if pg is None:
             return False, "weight update group not initialized"
@@ -486,15 +507,19 @@ class ModelRunner:
             return False, str(e)
 
     def update_weights_from_mooncake(
-        self, version: int, models: list[torch.nn.Module], *, require_complete: bool
+        self,
+        version: int,
+        models: list[torch.nn.Module],
+        *,
+        require_complete: bool,
+        snapshot: dict | None = None,
     ) -> tuple[bool, str]:
         """Read one committed weight-store version into ``models`` in place.
 
         Runs on the forward thread. The SDK streams partial ``load_weights``
-        calls, so the models are bracketed in a weight-update session; the
-        SDK's device staging buffers are released afterwards -- also when the
-        read failed partway -- because PyTorch would otherwise keep the blocks
-        cached against the KV arena.
+        calls, so the models are bracketed in a weight-update session. Wait for
+        the runner's accelerator to complete the update before acknowledging it
+        and clear its allocator cache on both success and failure.
 
         Args:
             version: The committed version to load.
@@ -502,15 +527,22 @@ class ModelRunner:
                 ``--model-update-draft-weights`` is ``refresh``.
             require_complete: Validate the entire canonical source inventory;
                 required whenever old model weights were discarded.
+            snapshot: Optional SDK publication directory for this version.
 
         Returns:
             ``(ok, message)`` for the control plane.
         """
+        if self.mapping.moe_weight_sharing_size is not None:
+            return (
+                False,
+                "Peer expert weights are immutable; restart to change the checkpoint",
+            )
         if self.model_update is None:
             return False, (
                 "update_weights_from_mooncake requires the server to start with "
                 "--model-update-config (target runner only)"
             )
+        device_module = torch.get_device_module(self.device)
         try:
             with weight_update_session(
                 models,
@@ -519,14 +551,14 @@ class ModelRunner:
                     "gloo", self.mapping.world_group
                 ),
             ):
-                result = self.model_update.update(models, version)
-            torch.cuda.synchronize(torch.device(f"cuda:{self.gpu_id}"))
+                result = self.model_update.update(models, version, snapshot=snapshot)
+            device_module.synchronize(self.gpu_id)
             return True, f"applied model version {version}: {result}"
         except Exception as e:  # noqa: BLE001 - surface to the control plane
             logger.exception("update_weights_from_mooncake failed")
             return False, str(e)
         finally:
-            torch.cuda.empty_cache()
+            device_module.empty_cache()
 
     def update_weights_from_disk(self, obj) -> tuple[bool, str]:
         """Reload this worker's parameters in place from a checkpoint directory.
@@ -553,6 +585,11 @@ class ModelRunner:
             post_load_transformed_modules,
         )
 
+        if self.mapping.moe_weight_sharing_size is not None:
+            return (
+                False,
+                "Peer expert weights are immutable; restart to change the checkpoint",
+            )
         model_path = str(obj.model_path)
         transformed = post_load_transformed_modules(self.model)
         if transformed:
@@ -662,13 +699,19 @@ class ModelRunner:
             ``(shapes, problem)``: the checkpoint's tensor shapes (None when
             it is not safetensors) and why it must be refused (None if not).
         """
+        from tokenspeed.runtime.model_loader.loader import CheckpointFileSelection
         from tokenspeed.runtime.model_loader.weight_utils import (
             safetensors_tensor_shapes,
         )
 
         fall_back_to_pt = getattr(self.model, "fall_back_to_pt_during_load", False)
+        weight_files = (
+            self.model.checkpoint_weight_files
+            if isinstance(self.model, CheckpointFileSelection)
+            else None
+        )
         _, files, use_safetensors = loader._prepare_weights(
-            model_path, None, fall_back_to_pt
+            model_path, None, fall_back_to_pt, weight_files
         )
         if not use_safetensors:
             return None, None
@@ -684,6 +727,7 @@ class ModelRunner:
                     self.model_config.model_path,
                     getattr(self.model_config, "revision", None),
                     fall_back_to_pt,
+                    weight_files,
                 )
                 held = safetensors_tensor_shapes(held_files) if held_safetensors else {}
             except Exception as e:  # noqa: BLE001 - only the shape check is lost

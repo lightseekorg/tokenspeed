@@ -21,7 +21,6 @@ jobs:
     outputs:
       version: ${{ steps.metadata.outputs.version }}
       kernel: ${{ steps.metadata.outputs.kernel }}
-      scheduler: ${{ steps.metadata.outputs.scheduler }}
       mla: ${{ steps.metadata.outputs.mla }}
     steps:
       - name: Checkout repository
@@ -54,17 +53,12 @@ jobs:
               r'^BASE_VERSION = "([^"]+)"$',
               Path("tokenspeed-kernel/python/setup.py").read_text(), re.M
           )[1]
-          scheduler = next(
-              d.removeprefix("tokenspeed-scheduler>=")
-              for d in project["dependencies"]
-              if d.startswith("tokenspeed-scheduler>=")
-          )
           mla = next(
               line.removeprefix("tokenspeed-mla==")
               for line in Path("tokenspeed-kernel/python/requirements/cuda-thirdparty.txt").read_text().splitlines()
               if line.startswith("tokenspeed-mla==")
           )
-          for component in (kernel, scheduler, mla):
+          for component in (kernel, mla):
               if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", component):
                   raise SystemExit("Release Docker requires stable component versions")
 
@@ -73,7 +67,6 @@ jobs:
           ) as output:
               print(f"version={version}", file=output)
               print(f"kernel={kernel}", file=output)
-              print(f"scheduler={scheduler}", file=output)
               print(f"mla={mla}", file=output)
           print(f"::notice::Docker image tag: {version}")
           PY
@@ -127,7 +120,6 @@ jobs:
           file: docker/Dockerfile.release
           build-args: |
             TOKENSPEED_KERNEL_VERSION=${{ needs.metadata.outputs.kernel }}
-            TOKENSPEED_SCHEDULER_VERSION=${{ needs.metadata.outputs.scheduler }}
             TOKENSPEED_MLA_VERSION=${{ needs.metadata.outputs.mla }}
           platforms: ${{ matrix.platform }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true

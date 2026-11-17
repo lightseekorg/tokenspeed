@@ -134,8 +134,10 @@ def test_mtp_fp8_block_scales_load_into_local_ep_expert(
 
 
 @pytest.mark.parametrize("ep_rank", [0, 1])
-@pytest.mark.parametrize("quant_kind", ["nvfp4", "mxfp4"])
-@pytest.mark.parametrize("fused", [False, True])
+# NVFP4 keeps w2's activation scale per local expert, so it has no fused form.
+@pytest.mark.parametrize(
+    ("quant_kind", "fused"), [("nvfp4", False), ("mxfp4", False), ("mxfp4", True)]
+)
 def test_activation_scales_use_all_checkpoint_experts(ep_rank, quant_kind, fused):
     layer = torch.nn.Module()
     if quant_kind == "nvfp4":

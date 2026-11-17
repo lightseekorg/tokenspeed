@@ -127,6 +127,9 @@ class KimiLinearConfig(PretrainedConfig):
     * **KDA** (``linear_attn_config``) consumed by the linear-attention layers
       and, via the mixed-layer protocol properties below, by the hybrid
       KV-cache allocator.
+    * **DSA** (``dsa_config``, Kimi-K3.1 only): the lightning indexer on the
+      MLA layers, exposed as ``index_topk`` / ``index_head_dim`` /
+      ``index_n_heads`` for ``configure_dsa_attention``.
 
     The ``layers_block_type`` / ``layer_types`` / ``linear_layer_ids`` /
     ``full_attention_layer_ids``
@@ -179,6 +182,7 @@ class KimiLinearConfig(PretrainedConfig):
         attn_res_block_size: int | None = 12,
         num_nextn_predict_layers: int = 0,
         linear_attn_config: dict | None = None,
+        dsa_config: dict | None = None,
         pad_token_id: int = 163839,
         bos_token_id: int = 163584,
         eos_token_id: int = 163586,
@@ -244,6 +248,20 @@ class KimiLinearConfig(PretrainedConfig):
         if self.linear_attn_config.get("kda_layers") is None:
             raise ValueError("linear_attn_config must provide 'kda_layers'")
 
+        # Absent (Kimi-K3), the DSA fields stay None and the MLA layers dense.
+        self.dsa_config = dsa_config
+        self.index_topk: int | None = None
+        self.index_head_dim: int | None = None
+        self.index_n_heads: int | None = None
+        self.dsa_layer_ids: list[int] = []
+        if dsa_config is not None:
+            (
+                self.index_topk,
+                self.index_head_dim,
+                self.index_n_heads,
+                self.dsa_layer_ids,
+            ) = _parse_dsa_config(dsa_config, self.full_attention_layer_ids)
+
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
@@ -253,6 +271,10 @@ class KimiLinearConfig(PretrainedConfig):
         )
 
     # ----- helpers -----
+
+    def is_dsa_layer(self, layer_idx: int) -> bool:
+        """Whether ``layer_idx`` (0-based) is an MLA layer with a DSA indexer."""
+        return layer_idx in self.dsa_layer_ids
 
     def is_kda_layer(self, layer_idx: int) -> bool:
         """Whether ``layer_idx`` (0-based) is a KDA linear-attention layer.
@@ -293,6 +315,102 @@ class KimiLinearConfig(PretrainedConfig):
         return [
             i for i, t in enumerate(self.layers_block_type) if t == _ATTENTION_LAYER
         ]
+
+
+# Unknown dsa_config keys fail the parse: they may change the indexer's semantics.
+_DSA_CONFIG_KEYS = frozenset(
+    {
+        "dsa_layers",
+        "index_topk",
+        "index_head_dim",
+        "index_num_heads",
+        "index_rope_dim",
+        "index_k_norm_type",
+        "index_topk_freq",
+        "index_skip_topk_offset",
+    }
+)
+# Absent from the released checkpoint, whose indexer weights are BF16.
+_OPTIONAL_DSA_CONFIG_KEYS = frozenset({"indexer_use_fp8"})
+
+
+def _positive_int(dsa_config: dict, key: str) -> int:
+    value = dsa_config[key]
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"dsa_config.{key} must be a positive integer, got {value!r}")
+    return value
+
+
+def _parse_dsa_config(
+    dsa_config: dict, full_attention_layer_ids: list[int]
+) -> tuple[int, int, int, list[int]]:
+    """Validate Kimi-K3.1's ``dsa_config`` against the implemented indexer.
+
+    The implemented indexer has no RoPE part, a LayerNorm key norm, BF16
+    weights, and its own top-k on every DSA layer. A config asking for
+    anything else fails here instead of serving different numerics.
+
+    Args:
+        dsa_config: The text config's ``dsa_config`` mapping.
+        full_attention_layer_ids: 0-based MLA layer ids from
+            ``linear_attn_config``.
+
+    Returns:
+        ``(index_topk, index_head_dim, index_n_heads, dsa_layer_ids)`` with
+        0-based layer ids.
+    """
+    if not isinstance(dsa_config, dict):
+        raise TypeError(f"dsa_config must be a mapping, got {type(dsa_config)}")
+    keys = set(dsa_config)
+    missing = _DSA_CONFIG_KEYS - keys
+    unknown = keys - _DSA_CONFIG_KEYS - _OPTIONAL_DSA_CONFIG_KEYS
+    if missing or unknown:
+        raise ValueError(
+            "dsa_config keys differ from the implemented indexer: missing "
+            f"{sorted(missing)}, unknown {sorted(unknown)}"
+        )
+    if dsa_config["index_rope_dim"] != 0:
+        raise NotImplementedError(
+            "Kimi DSA indexer implements index_rope_dim=0 only, got "
+            f"{dsa_config['index_rope_dim']!r}"
+        )
+    if dsa_config["index_k_norm_type"] != "layernorm":
+        raise NotImplementedError(
+            "Kimi DSA indexer implements index_k_norm_type='layernorm' only, got "
+            f"{dsa_config['index_k_norm_type']!r}"
+        )
+    if dsa_config.get("indexer_use_fp8", False) is not False:
+        raise NotImplementedError(
+            "Kimi DSA indexer implements BF16 indexer weights "
+            f"(indexer_use_fp8=False) only, got {dsa_config['indexer_use_fp8']!r}"
+        )
+    if dsa_config["index_topk_freq"] != 1:
+        raise NotImplementedError(
+            "Kimi DSA indexer computes its own top-k on every DSA layer "
+            f"(index_topk_freq=1) only, got {dsa_config['index_topk_freq']!r}"
+        )
+    # The skip offset only places shared layers when index_topk_freq > 1.
+    _positive_int(dsa_config, "index_skip_topk_offset")
+    layers = dsa_config["dsa_layers"]
+    if not isinstance(layers, (list, tuple)) or any(
+        isinstance(layer, bool) or not isinstance(layer, int) for layer in layers
+    ):
+        raise ValueError("dsa_config.dsa_layers must list 1-based layer numbers")
+    dsa_layer_ids = sorted(layer - 1 for layer in layers)
+    if len(set(dsa_layer_ids)) != len(dsa_layer_ids) or dsa_layer_ids != sorted(
+        full_attention_layer_ids
+    ):
+        raise ValueError(
+            "dsa_config.dsa_layers must name every full-attention layer exactly "
+            f"once; got {sorted(layers)}, full-attention layers (1-based) are "
+            f"{[layer + 1 for layer in full_attention_layer_ids]}"
+        )
+    return (
+        _positive_int(dsa_config, "index_topk"),
+        _positive_int(dsa_config, "index_head_dim"),
+        _positive_int(dsa_config, "index_num_heads"),
+        dsa_layer_ids,
+    )
 
 
 def _default_linear_attn_config() -> dict:
@@ -361,3 +479,13 @@ class KimiK3Config(PretrainedConfig):
     @property
     def vocab_size(self) -> int:
         return self.text_config.vocab_size
+
+
+class KimiK31Config(KimiK3Config):
+    """Kimi-K3.1: the Kimi-K3 config whose text config carries ``dsa_config``."""
+
+    model_type = "kimi_k31"
+
+    # Explicit, so transformers keeps KimiK3Config's sub-config construction.
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)

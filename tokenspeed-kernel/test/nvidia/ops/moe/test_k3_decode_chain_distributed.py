@@ -201,24 +201,34 @@ def _reference(weights, x):
 MOE_LAYERS = 5
 
 
-@pytest.fixture(scope="module", params=(1, 8), ids=("decode", "verify-8"))
-def chain(request):
-    """The chain for every row count, built for plain decode or a verify width
-    of 8 (which picks the shared expert's verify splits)."""
+@pytest.fixture(scope="module")
+def moe_weights():
+    """Every MoE layer's weights and this rank's experts in the serving layout."""
     rank, device = _setup()
     _require_multicast()
-    from tokenspeed_kernel.ops.moe._cute_dsl.k3_decode import KimiK3DecodeMoE
-
     first = _Weights(device, 1234)
     weights = (first,) + tuple(
         _Weights(device, 1234 + ordinal, experts=first)
         for ordinal in range(1, MOE_LAYERS)
     )
-    experts = _serving_experts(first, rank)
+    return weights, _serving_experts(first, rank)
+
+
+def _moe_chain(moe_weights, verify_width, decoders):
+    """The owner and every MoE layer's chain, for every row count.
+
+    MoE layer i follows decoder layer i and prefetches decoder layer i + 1's
+    weights.
+    """
+    from tokenspeed_kernel.ops.moe._cute_dsl.k3_decode import KimiK3DecodeMoE
+
+    weights, experts = moe_weights
+    following = [(d.in_proj, d.self_attn.o_proj.weight) for d in decoders[0][1:]]
+    rank = dist.get_rank()
     owner = KimiK3DecodeMoE(
         group=dist.group.WORLD,
         batches=BATCHES,
-        verify_width=request.param,
+        verify_width=verify_width,
         moe_layers=MOE_LAYERS,
         beta=BETA,
         linear_beta=LINEAR_BETA,
@@ -228,7 +238,7 @@ def chain(request):
     layers = [
         owner.layer(
             ordinal=ordinal,
-            layer_idx=1 + 3 * ordinal,
+            layer_idx=ordinal,
             router=w.router,
             correction_bias=w.bias,
             routed_scaling_factor=SCALE,
@@ -243,11 +253,71 @@ def chain(request):
             norm_weight=w.norm,
             norm_eps=EPS,
             up_shard=w.up[up_rows].contiguous(),
+            next_attention=following[ordinal] if ordinal < len(following) else (),
         )
         for ordinal, w in enumerate(weights)
     ]
-    yield weights, layers, device, owner
+    return owner, layers
+
+
+@pytest.fixture(scope="module", params=(1, 8), ids=("decode", "verify-8"))
+def chain(request, moe_weights, decoders):
+    """The chain for every row count, built for plain decode or a verify width of 8.
+
+    A verify width of 8 picks the shared expert's verify splits.
+    """
+    owner, layers = _moe_chain(moe_weights, request.param, decoders)
+    yield moe_weights[0], layers, owner.device, owner
     dist.barrier()
+
+
+def _revert(policy, patch):
+    """Set one scheduling policy that only moves work back to its old tables.
+
+    late-release: the B5-8 routing kernel releases the experts at exit, and the
+    shared expert joins the main stream before the tail.
+    no-prefetch: no L2 prefetch, neither on the side stream nor in the experts.
+    """
+    from tokenspeed_kernel.ops.moe._cute_dsl import k3_decode_prefetch
+    from tokenspeed_kernel.thirdparty.cute_dsl.k3_decode.moe import front
+
+    if policy == "late-release":
+        patch.setitem(front.EARLY_ROUTE, TP, "")
+    else:
+        patch.setattr(k3_decode_prefetch, "OPROJ_DOWN", "")
+        patch.setattr(k3_decode_prefetch, "NEXT_ATTENTION", "")
+        patch.setattr(k3_decode_prefetch, "EXPERTS_AHEAD", "")
+        patch.setitem(k3_decode_prefetch.ATTENTION_MOE, "kda", "")
+        patch.setitem(k3_decode_prefetch.ATTENTION_MOE, "mla", "")
+
+
+@pytest.fixture(scope="module", params=("late-release", "no-prefetch"))
+def reverted(request):
+    return request.param
+
+
+@pytest.fixture(scope="module")
+def reverted_chain(reverted, chain, moe_weights, decoders):
+    """``chain`` (same weights and verify width) with one policy reverted.
+
+    It must match ``chain`` bit for bit.
+    """
+    with pytest.MonkeyPatch.context() as patch:
+        _revert(reverted, patch)
+        owner, layers = _moe_chain(moe_weights, chain[3].verify_width, decoders)
+    yield moe_weights[0], layers, owner.device, owner
+    dist.barrier()
+
+
+def _assert_arms_differ(reverted, chain, reverted_chain):
+    """The default chain takes the policy where the reverted one does not."""
+    (_, layers, _, owner), (_, other, _, other_owner) = chain, reverted_chain
+    if reverted == "late-release":
+        gated = [b for b in BATCHES if layers[0].chain.front.gated(b)]
+        assert gated and not any(other[0].chain.front.gated(b) for b in BATCHES)
+    else:
+        assert owner.prefetch.launches and owner.prefetch.tables
+        assert not other_owner.prefetch.launches and not other_owner.prefetch.tables
 
 
 def _inputs(batch, device, seed):
@@ -267,11 +337,16 @@ def _assert_close(weights, x, residual, out):
 
 
 def _step(layers, x, residual):
-    """Every MoE layer in model order, each accumulating onto the previous output."""
+    """Every MoE layer in model order, each accumulating onto the previous output.
+
+    The step ends by rejoining the chain's side streams, as the model's forward
+    does.
+    """
     outputs = []
     for layer in layers:
         residual = layer.run(x, residual)
         outputs.append(residual)
+    layers[0].owner.join()
     return outputs
 
 
@@ -306,11 +381,11 @@ def test_chain_follows_changing_row_counts_eagerly(chain):
         _check_step(weights, x, residual, outputs)
 
 
-def test_chain_follows_changing_row_counts_in_cuda_graphs(chain):
-    """One graph per row count, replayed in the same mixed order with fresh inputs:
-    every layer re-arms what it read, and the first one also what the last layer
-    may have published at the largest row count."""
-    weights, layers, device, _ = chain
+def _captured_steps(layers, device):
+    """(graph, x, residual, outputs) of one captured ``_step`` per row count.
+
+    Each is warmed up eagerly on a side stream first.
+    """
     graphs = {}
     for batch in BATCHES:
         x, residual = _inputs(batch, device, batch)
@@ -324,6 +399,17 @@ def test_chain_follows_changing_row_counts_in_cuda_graphs(chain):
         with torch.cuda.graph(graph):
             outputs = _step(layers, x, residual)
         graphs[batch] = graph, x, residual, outputs
+    return graphs
+
+
+def test_chain_follows_changing_row_counts_in_cuda_graphs(chain):
+    """One graph per row count, replayed in the same mixed order with fresh inputs.
+
+    Every layer re-arms what it read, and the first one also what the last layer
+    may have published at the largest row count.
+    """
+    weights, layers, device, _ = chain
+    graphs = _captured_steps(layers, device)
     for step, batch in enumerate(SEQUENCE):
         graph, x, residual, outputs = graphs[batch]
         fresh_x, fresh_residual = _inputs(batch, device, 3000 + step)
@@ -334,8 +420,41 @@ def test_chain_follows_changing_row_counts_in_cuda_graphs(chain):
         _check_step(weights, x, residual, outputs)
 
 
-# Per-rank o-projection input width (12 heads of 128) and the input projections.
-K_ATTN, MLA_ROWS, KDA_ROWS = 1536, 3648, 6288
+def _assert_equal(actual, expected, what):
+    for i, (a, e) in enumerate(zip(actual, expected, strict=True)):
+        assert torch.equal(a, e), f"{what}: layer {i}"
+
+
+def test_reverted_scheduling_matches_bit_for_bit(reverted, chain, reverted_chain):
+    """A scheduling policy only moves work.
+
+    The chain eagerly and in CUDA graphs equals the chain with the policy
+    reverted, run eagerly, at every row count.
+    """
+    _assert_arms_differ(reverted, chain, reverted_chain)
+    _, layers, device, _ = chain
+    other = reverted_chain[1]
+    for batch in BATCHES:
+        x, residual = _inputs(batch, device, 5000 + batch)
+        expected = _step(other, x, residual)
+        actual = _step(layers, x, residual)
+        torch.cuda.synchronize()
+        _assert_equal(actual, expected, f"eager, {batch} rows")
+    graphs = _captured_steps(layers, device)
+    for step, batch in enumerate(SEQUENCE):
+        graph, x, residual, outputs = graphs[batch]
+        fresh_x, fresh_residual = _inputs(batch, device, 6000 + step)
+        x.copy_(fresh_x)
+        residual.copy_(fresh_residual)
+        graph.replay()
+        expected = _step(other, x, residual)
+        torch.cuda.synchronize()
+        _assert_equal(outputs, expected, f"step {step} ({batch} rows)")
+
+
+# Per-rank o-projection input width (12 heads of 128) and the input projections;
+# a Kimi-K3.1 DSA layer's adds its indexer's 160 key and head-weight rows to MLA's.
+K_ATTN, MLA_ROWS, DSA_ROWS, KDA_ROWS = 1536, 3648, 3808, 6288
 
 
 def _decoder(device, seed, *, layer_idx, prev_valid_blocks, write, rows):
@@ -409,28 +528,26 @@ def _close(actual, expected, rows, what, tol=0.02):
 
 
 # (prev_valid_blocks, writes a snapshot, input projection rows) per decoder layer:
-# the first writes block 0, the fourth block 1; KDA and MLA projections alternate.
+# the first writes block 0, the fourth block 1; KDA and MLA-family (MLA, then
+# DSA) projections alternate.
 DECODERS = (
     (0, True, KDA_ROWS),
     (1, False, MLA_ROWS),
     (1, False, KDA_ROWS),
-    (1, True, MLA_ROWS),
+    (1, True, DSA_ROWS),
     (2, False, KDA_ROWS),
 )
 NUM_BLOCKS = 2
 
 
 @pytest.fixture(scope="module")
-def layer_chain(chain):
-    """One decoder layer before each MoE layer (the first block-write, the rest
-    ring-fed), and the closing AttnRes."""
-    from tokenspeed_kernel.ops.moe._cute_dsl.k3_decode import KimiK3DecodeAttention
+def decoders():
+    """One decoder layer before each MoE layer, and the closing AttnRes weights.
 
-    weights, moe_layers, device, owner = chain
-    attention = KimiK3DecodeAttention(
-        group=dist.group.WORLD, batches=BATCHES, moe=owner
-    )
-    decoders = tuple(
+    The first decoder layer block-writes; the rest are ring-fed.
+    """
+    _, device = _setup()
+    layers = tuple(
         _decoder(
             device,
             21 + i,
@@ -441,17 +558,30 @@ def layer_chain(chain):
         )
         for i, (nb, write, rows) in enumerate(DECODERS)
     )
+    final = _decoder(device, 29, layer_idx=5, prev_valid_blocks=2, write=False, rows=8)
+    return layers, final
+
+
+def _layer_chain(moe_chain, decoders):
+    """Every decoder layer's chain over ``moe_chain`` and the closing AttnRes."""
+    from tokenspeed_kernel.ops.moe._cute_dsl.k3_decode import KimiK3DecodeAttention
+
+    weights, moe_layers, device, owner = moe_chain
+    decoders, final = decoders
+    attention = KimiK3DecodeAttention(
+        group=dist.group.WORLD, batches=BATCHES, moe=owner
+    )
     layers = [
         attention.layer(
             decoder,
             layer_idx=decoder.layer_idx,
-            mla=decoder.in_proj.shape[0] == MLA_ROWS,
+            mla=decoder.in_proj.shape[0] in (MLA_ROWS, DSA_ROWS),
             first=decoder.layer_idx == 0,
             projection_weight=decoder.in_proj,
+            moe=moe,
         )
-        for decoder in decoders
+        for decoder, moe in zip(decoders, moe_layers, strict=True)
     ]
-    final = _decoder(device, 29, layer_idx=5, prev_valid_blocks=2, write=False, rows=8)
     closing = attention.final(
         res_norm=final.self_attention_res_norm,
         res_proj=final.self_attention_res_proj,
@@ -459,6 +589,18 @@ def layer_chain(chain):
         num_blocks=NUM_BLOCKS,
     )
     return weights, moe_layers, device, decoders, layers, (final, closing)
+
+
+@pytest.fixture(scope="module")
+def layer_chain(chain, decoders):
+    return _layer_chain(chain, decoders)
+
+
+@pytest.fixture(scope="module")
+def reverted_layer_chain(reverted, reverted_chain, decoders):
+    with pytest.MonkeyPatch.context() as patch:
+        _revert(reverted, patch)
+        return _layer_chain(reverted_chain, decoders)
 
 
 def _layer_step(layer_chain, embedding, step):
@@ -550,6 +692,7 @@ def _layer_step(layer_chain, embedding, step):
         final.input_layernorm,
     )
     _close(out, expected[0], rows, "closing AttnRes")
+    moe_layers[0].owner.join()
     return out, projections
 
 
@@ -572,6 +715,7 @@ def _run(layer_chain, embedding, shards):
         projections.append(layer.project(h))
         moe.publish(layer.leave(shards[i], prefix, blocks, feed))
     out = closing.run_ring(prefix, blocks, torch.empty_like(embedding))
+    moe_layers[0].owner.join()
     return out, projections
 
 
@@ -591,16 +735,13 @@ for limit in (8, 32):
     assert any(a > limit >= b for a, b in pairs)
 
 
-def test_layer_chain_follows_changing_row_counts_in_cuda_graphs(layer_chain):
-    """The eager chain over a mixed row-count sequence, checked stage by stage;
-    then one graph per row count replayed in the same order with the same inputs
-    matches every eager step bit for bit."""
-    device = layer_chain[2]
-    eager = [
-        _layer_step(layer_chain, _inputs(batch, device, 4000 + step)[0], step)
-        for step, batch in enumerate(LAYER_SEQUENCE)
-    ]
-    graphs = {}
+def _captured_runs(layer_chain):
+    """One captured ``_run`` per row count: (graph, embedding, shards, outputs).
+
+    The outputs are (out, projections); each run is warmed up eagerly on a side
+    stream first.
+    """
+    device, graphs = layer_chain[2], {}
     for batch in BATCHES:
         embedding, shards = _inputs(batch, device, batch)[0], _shards(batch, device, 0)
         stream = torch.cuda.Stream()
@@ -613,14 +754,60 @@ def test_layer_chain_follows_changing_row_counts_in_cuda_graphs(layer_chain):
         with torch.cuda.graph(graph):
             outputs = _run(layer_chain, embedding, shards)
         graphs[batch] = graph, embedding, shards, outputs
+    return graphs
+
+
+def _replay(graphs, step, batch, device):
+    """Replay the graph of ``batch`` rows on step ``step``'s inputs."""
+    graph, embedding, shards, outputs = graphs[batch]
+    embedding.copy_(_inputs(batch, device, 4000 + step)[0])
+    for shard, fresh in zip(shards, _shards(batch, device, step)):
+        shard.copy_(fresh)
+    graph.replay()
+    return embedding, shards, outputs
+
+
+def _assert_same_run(actual, expected, what):
+    (out, projections), (expected_out, expected_projections) = actual, expected
+    assert torch.equal(out, expected_out), f"{what}: output"
+    for i, (p, q) in enumerate(zip(projections, expected_projections, strict=True)):
+        assert torch.equal(p, q), f"{what}: projection {i}"
+
+
+def test_layer_chain_follows_changing_row_counts_in_cuda_graphs(layer_chain):
+    """The eager chain over a mixed row-count sequence, checked stage by stage.
+
+    Then one graph per row count, replayed in the same order with the same
+    inputs, matches every eager step bit for bit.
+    """
+    device = layer_chain[2]
+    eager = [
+        _layer_step(layer_chain, _inputs(batch, device, 4000 + step)[0], step)
+        for step, batch in enumerate(LAYER_SEQUENCE)
+    ]
+    graphs = _captured_runs(layer_chain)
     for step, batch in enumerate(LAYER_SEQUENCE):
-        graph, embedding, shards, (out, projections) = graphs[batch]
-        embedding.copy_(_inputs(batch, device, 4000 + step)[0])
-        for shard, fresh in zip(shards, _shards(batch, device, step)):
-            shard.copy_(fresh)
-        graph.replay()
+        _, _, outputs = _replay(graphs, step, batch, device)
         torch.cuda.synchronize()
-        eager_out, eager_projections = eager[step]
-        assert torch.equal(out, eager_out), f"step {step} ({batch} rows): output"
-        for i, (p, q) in enumerate(zip(projections, eager_projections)):
-            assert torch.equal(p, q), f"step {step} ({batch} rows): projection {i}"
+        _assert_same_run(outputs, eager[step], f"step {step} ({batch} rows)")
+
+
+def test_reverted_scheduling_matches_bit_for_bit_in_the_layer_chain(
+    reverted, layer_chain, reverted_layer_chain
+):
+    """The layer chain's graphs equal the chain with a scheduling policy reverted.
+
+    The graphs replay the mixed row-count sequence; the reverted chain runs
+    eagerly on the same inputs.
+    """
+    if reverted == "no-prefetch":  # the attention's own prefetch points
+        owners = (layer_chain[1][0].owner, reverted_layer_chain[1][0].owner)
+        points = [{key[0] for key in owner.prefetch.launches} for owner in owners]
+        assert {"oproj_down", "attention_moe"} <= points[0] and not points[1]
+    device = layer_chain[2]
+    graphs = _captured_runs(layer_chain)
+    for step, batch in enumerate(LAYER_SEQUENCE):
+        embedding, shards, outputs = _replay(graphs, step, batch, device)
+        expected = _run(reverted_layer_chain, embedding, shards)
+        torch.cuda.synchronize()
+        _assert_same_run(outputs, expected, f"step {step} ({batch} rows)")

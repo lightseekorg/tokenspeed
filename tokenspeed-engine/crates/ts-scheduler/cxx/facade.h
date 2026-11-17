@@ -41,30 +41,52 @@ struct TransferBatchView;
 struct SchedulerAbortView;
 struct SchedulerSizes;
 struct AdmissionSnapshot;
+struct PrefillGateProbe;
+struct SharedPrefixPublication;
 struct CacheGroupPages;
 struct KvEventView;
 struct StorageTickView;
 struct StorageCancellationView;
 struct StorageDoneView;
 struct StorageStatsView;
+struct PrefixHitView;
 
 void submit_requests(tokenspeed::Scheduler& scheduler, rust::Slice<const RequestSpec> specs);
-std::unique_ptr<tokenspeed::ExecutionPlan> next_execution_plan(tokenspeed::Scheduler& scheduler);
+std::unique_ptr<tokenspeed::ExecutionPlan> next_execution_plan(tokenspeed::Scheduler& scheduler,
+                                                               bool allow_prefill, bool apply_prefill_watermark);
 void advance(tokenspeed::Scheduler& scheduler, rust::Slice<const ForwardEvent> events);
 void advance_head(tokenspeed::Scheduler& scheduler, rust::Slice<const StorageTickView> ticks,
                   rust::Slice<const StorageCancellationView> cancellations,
                   rust::Slice<const StorageDoneView> done, rust::Slice<const CacheEvent> cache_events);
 std::size_t demote_sessions(tokenspeed::Scheduler& scheduler, rust::Slice<const rust::String> ids, bool ended);
 std::size_t demote_session(tokenspeed::Scheduler& scheduler, rust::Str session_id, bool ended);
+std::size_t demote_cache_groups(tokenspeed::Scheduler& scheduler, rust::Slice<const rust::String> ids, bool ended);
 AdmissionSnapshot admission_snapshot(const tokenspeed::Scheduler& scheduler, std::int32_t token_step);
+bool shared_prefix_storage_enabled(const tokenspeed::Scheduler& scheduler);
+SharedPrefixPublication shared_prefix_publication(const tokenspeed::Scheduler& scheduler,
+                                                  rust::Slice<const std::int32_t> input_ids,
+                                                  std::int32_t max_prefix_tokens);
 SchedulerSizes sizes(const tokenspeed::Scheduler& scheduler);
 std::int32_t active_lcm_blocks(const tokenspeed::Scheduler& scheduler);
+PrefillGateProbe probe_prefill_gate(const tokenspeed::Scheduler& scheduler);
 CacheGroupPages cache_group_pages(const tokenspeed::Scheduler& scheduler, rust::Str group_id);
-rust::Vec<KvEventView> drain_kv_events(tokenspeed::Scheduler& scheduler);
+std::unique_ptr<tokenspeed::KvEventBatch> drain_kv_events(tokenspeed::Scheduler& scheduler);
+std::unique_ptr<tokenspeed::KvEventBatch> make_kv_event_batch(rust::Slice<const KvEventView> events);
+std::size_t kv_event_batch_size(const tokenspeed::KvEventBatch& batch);
+std::size_t kv_event_batch_bytes(const tokenspeed::KvEventBatch& batch);
+rust::Slice<const std::uint8_t> kv_event_stored(const tokenspeed::KvEventBatch& batch);
+rust::Slice<const std::uint8_t> kv_event_has_parent(const tokenspeed::KvEventBatch& batch);
+rust::Slice<const std::uint64_t> kv_event_parents(const tokenspeed::KvEventBatch& batch);
+rust::Slice<const std::int32_t> kv_event_block_sizes(const tokenspeed::KvEventBatch& batch);
+rust::Slice<const std::size_t> kv_event_hash_offsets(const tokenspeed::KvEventBatch& batch);
+rust::Slice<const std::size_t> kv_event_token_offsets(const tokenspeed::KvEventBatch& batch);
+rust::Slice<const std::uint64_t> kv_event_hashes(const tokenspeed::KvEventBatch& batch);
+rust::Slice<const std::int32_t> kv_event_tokens(const tokenspeed::KvEventBatch& batch);
 std::int32_t request_token_size(const tokenspeed::Scheduler& scheduler, rust::Str request_id);
 bool can_abort_before_admission(const tokenspeed::Scheduler& scheduler, rust::Str request_id);
 bool storage_pending(const tokenspeed::Scheduler& scheduler);
 StorageStatsView storage_stats(const tokenspeed::Scheduler& scheduler);
+PrefixHitView prefix_hit_stats(const tokenspeed::Scheduler& scheduler);
 bool clear_cache(tokenspeed::Scheduler& scheduler);
 bool clear_l1_cache(tokenspeed::Scheduler& scheduler);
 bool can_clear_cache(const tokenspeed::Scheduler& scheduler);
@@ -80,5 +102,7 @@ rust::Vec<TransferBatchView> plan_remote_prefill_transfer(const tokenspeed::Exec
 rust::Vec<SchedulerAbortView> plan_aborts(const tokenspeed::ExecutionPlan& plan);
 rust::Vec<CacheOpView> plan_cache_ops(const tokenspeed::ExecutionPlan& plan);
 rust::Vec<StorageOpView> plan_storage_ops(const tokenspeed::ExecutionPlan& plan);
+
+void set_profile_span_sink(bool installed);
 
 }  // namespace ts_scheduler

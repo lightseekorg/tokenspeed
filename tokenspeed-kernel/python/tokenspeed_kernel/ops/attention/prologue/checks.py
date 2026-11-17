@@ -23,17 +23,21 @@ kernel."""
 
 from __future__ import annotations
 
+import math
 from functools import lru_cache
 
 import torch
 from tokenspeed_kernel.ops.attention.prologue.types import (
     CUDA_ROPE_HEAD_DIMS,
+    ConvStream,
     HeadKVCache,
     HeadNorm,
     KVCacheFormat,
+    KVShortConv,
     LatentKVCache,
     MLAExpandedKV,
     MXFP8Scales,
+    RelativeHeadNorm,
     Rotary,
 )
 
@@ -131,14 +135,31 @@ def check_gqa_request(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    norm: HeadNorm | None,
+    norm: HeadNorm | RelativeHeadNorm | None,
     rotary: Rotary | None,
     cache: HeadKVCache,
 ) -> None:
     """Reject a GQA request any solution would misread; metadata only."""
-    norm_key = (
-        None if norm is None else (_layout(norm.q_weight), _layout(norm.k_weight))
-    )
+    if isinstance(norm, RelativeHeadNorm):
+        norm_key = (
+            "relative",
+            *(
+                None if x is None else _layout(x)
+                for x in (
+                    norm.relative,
+                    norm.projection,
+                    norm.q_scale,
+                    norm.k_scale,
+                    norm.rel_scale,
+                    norm.q_output_scale,
+                )
+            ),
+            _kv_conv_key(norm.kv_conv),
+        )
+    else:
+        norm_key = (
+            None if norm is None else (_layout(norm.q_weight), _layout(norm.k_weight))
+        )
     key = (
         "gqa",
         _layout(q),
@@ -149,6 +170,152 @@ def check_gqa_request(
         _cache_key(cache),
     )
     _once(key, _check_gqa_request, q, k, v, norm, rotary, cache)
+
+
+def _kv_conv_key(conv: KVShortConv | None) -> tuple | None:
+    if conv is None:
+        return None
+    batch = conv.batch
+    return (
+        *(
+            None if x is None else _layout(x)
+            for stream in (conv.k, conv.v)
+            for x in (
+                stream.weight,
+                stream.dynamic_weights,
+                stream.ring,
+                stream.checkpoint,
+            )
+        ),
+        *(
+            _layout(x)
+            for x in (
+                batch.cu_seqlens,
+                batch.seq_idx,
+                batch.cache_indices,
+                batch.has_initial_state,
+                batch.seq_lens,
+                batch.block_table,
+            )
+        ),
+        batch.num_extends > 0,
+        conv.output_scale,
+    )
+
+
+def _check_kv_conv(
+    conv: KVShortConv, num_tokens: int, channels: int, dtype: torch.dtype
+) -> None:
+    taps = conv.k.weight.shape[-1]
+
+    def bad_stream(stream: ConvStream) -> bool:
+        dynamic = stream.dynamic_weights
+        return (
+            stream.weight.shape != (channels, taps)
+            or stream.weight.dtype != dtype
+            or stream.ring.dim() != 3
+            or stream.ring.shape[2] != channels
+            or stream.ring.shape[1] < taps
+            or stream.ring.stride(-1) != 1
+            or stream.checkpoint.dim() != 3
+            or stream.checkpoint.shape[1:] != (taps - 1, channels)
+            or stream.checkpoint.stride(-1) != 1
+            or (
+                dynamic is not None
+                and (
+                    dynamic.dim() != 3
+                    or dynamic.shape[0] != num_tokens
+                    or dynamic.shape[2] != taps
+                    or channels % dynamic.shape[1]
+                    or not dynamic.is_floating_point()
+                )
+            )
+        )
+
+    if taps < 2 or any(bad_stream(s) for s in (conv.k, conv.v)):
+        raise ValueError(
+            "K/V convolution streams need [kv_channels, W >= 2] taps of the row "
+            "dtype, [slots, R >= W, kv_channels] rings, [pages, W - 1, "
+            "kv_channels] checkpoints, and [tokens, heads, W] coefficients"
+        )
+    k, v = conv.k, conv.v
+    if (
+        k.weight.stride() != v.weight.stride()
+        or k.ring.shape[:2] != v.ring.shape[:2]
+        or k.ring.stride() != v.ring.stride()
+        or k.checkpoint.stride() != v.checkpoint.stride()
+        or (k.dynamic_weights is None) != (v.dynamic_weights is None)
+        or (
+            k.dynamic_weights is not None
+            and (
+                k.dynamic_weights.shape != v.dynamic_weights.shape
+                or k.dynamic_weights.stride() != v.dynamic_weights.stride()
+            )
+        )
+    ):
+        raise ValueError("K and V convolution streams must share one layout")
+    batch = conv.batch
+    num_requests = batch.cache_indices.shape[0]
+    # Graph buckets may pass longer index buffers; the kernels read the first rows.
+    if (
+        batch.block_table.dim() != 2
+        or batch.block_table.shape[1] < 2
+        or batch.seq_idx.dim() != 1
+        or batch.seq_idx.shape[0] < num_tokens
+    ):
+        raise ValueError(
+            "the convolution batch needs a sequence index per token and an "
+            "input and a live block per request"
+        )
+    if (
+        batch.num_extends == 0
+        and num_tokens
+        and (
+            num_requests == 0
+            or num_tokens % num_requests
+            or num_tokens // num_requests > k.ring.shape[1] - (taps - 1)
+        )
+    ):
+        raise ValueError(
+            "a decode convolution needs uniform chunks of at most R - (W - 1) rows"
+        )
+    if not math.isfinite(conv.output_scale):
+        raise ValueError("the convolution needs a finite output scale")
+
+
+def _check_relative_norm(
+    norm: RelativeHeadNorm, num_tokens: int, num_q_heads: int, dtype: torch.dtype
+) -> None:
+    rel = norm.relative
+    if (
+        rel.dim() != 3
+        or rel.shape[:2] != (num_tokens, num_q_heads)
+        or rel.stride(2) != 1
+        or rel.stride(1) != rel.shape[2]
+        or rel.dtype != dtype
+    ):
+        raise ValueError(
+            f"relative heads {tuple(rel.shape)} are not [tokens, q_heads, rel_dim] "
+            "packed heads of the query dtype"
+        )
+    projection = norm.projection
+    if (
+        projection.dim() != 2
+        or projection.shape[0] != rel.shape[2]
+        or not projection.is_contiguous()
+        or projection.dtype != dtype
+    ):
+        raise ValueError(
+            "the relative projection must be a contiguous [rel_dim, extent] "
+            "weight of the query dtype"
+        )
+    scale = norm.q_output_scale
+    if scale is not None and (
+        scale.shape != (num_tokens,)
+        or scale.dtype != torch.float32
+        or not scale.is_contiguous()
+    ):
+        raise ValueError("the query output scale must be a dense fp32 [tokens] vector")
 
 
 def check_mla_request(
@@ -270,7 +437,7 @@ def _check_gqa_request(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    norm: HeadNorm | None,
+    norm: HeadNorm | RelativeHeadNorm | None,
     rotary: Rotary | None,
     cache: HeadKVCache,
 ) -> None:
@@ -282,16 +449,17 @@ def _check_gqa_request(
             f"q {tuple(q.shape)} is not [tokens, heads * head_dim] or [tokens, heads, head_dim]"
         )
     num_tokens = q.shape[0]
-    if cache.k_cache.dim() != 3:
+    if cache.k_cache.dim() not in (3, 4):
         raise ValueError(
-            f"key cache {tuple(cache.k_cache.shape)} is not [slots, heads, head_dim] rows"
+            f"key cache {tuple(cache.k_cache.shape)} is not [slots, heads, head_dim] "
+            "rows or [pages, rows, heads, head_dim] pages"
         )
-    num_kv_heads, head_dim = cache.k_cache.shape[1:]
+    num_kv_heads, head_dim = cache.k_cache.shape[-2:]
     if (
         cache.v_cache.shape != cache.k_cache.shape
         or cache.v_cache.dtype != cache.k_cache.dtype
         or any(
-            x.stride(-1) != 1 or (num_kv_heads > 1 and x.stride(1) != head_dim)
+            x.stride(-1) != 1 or (num_kv_heads > 1 and x.stride(-2) != head_dim)
             for x in (cache.k_cache, cache.v_cache)
         )
     ):
@@ -319,11 +487,15 @@ def _check_gqa_request(
         raise ValueError("q, k, v and the caches must not share addresses")
     if any(_misaligned(x) for x in (q, k, v, cache.k_cache, cache.v_cache)):
         raise ValueError("q, k, v and the caches must start rows on 16-byte boundaries")
-    if norm is not None and any(
+    if isinstance(norm, HeadNorm) and any(
         w.shape != (head_dim,) or w.stride(-1) != 1
         for w in (norm.q_weight, norm.k_weight)
     ):
         raise ValueError(f"norm weights are not dense [{head_dim}]")
+    if isinstance(norm, RelativeHeadNorm):
+        _check_relative_norm(norm, num_tokens, q.shape[1:].numel() // head_dim, q.dtype)
+        if norm.kv_conv is not None:
+            _check_kv_conv(norm.kv_conv, num_tokens, num_kv_heads * head_dim, q.dtype)
     if rotary is not None:
         _check_rotary(rotary, num_tokens)
         if rotary.rotary_dim > head_dim:

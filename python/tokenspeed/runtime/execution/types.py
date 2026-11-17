@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.execution._draft_overlap import RoundFence
     from tokenspeed.runtime.grammar.capturable_grammar import (
         GrammarStepCompletion,
     )
@@ -114,11 +115,13 @@ class NGramInputs:
 class RequestHistorySeeds:
     """Immutable committed prefixes that rebuild request-token history rows.
 
-    Row ``i`` restores the first ``prefix_lengths[i]`` tokens of request-pool
-    slot ``slots[i]`` from ``tokens[i]``: an extend that resumes a prefix it
-    did not compute on this slot (a prefix-cache hit, a later chunk, a PD
-    landing) must see that prefix before its own inputs are appended. No
-    request objects or device tensors cross this boundary.
+    Row ``i`` restores the committed prefix of request-pool slot ``slots[i]``,
+    ``prefix_lengths[i]`` tokens long, from ``tokens[i]``: an extend that
+    resumes a prefix it did not compute on this slot (a prefix-cache hit, a
+    later chunk, a PD landing) must see that prefix before its own inputs are
+    appended. For a model with a bounded history lookback ``tokens[i]`` is
+    only the prefix's tail, ending at ``prefix_lengths[i]``. No request
+    objects or device tensors cross this boundary.
     """
 
     slots: tuple[int, ...]
@@ -129,7 +132,7 @@ class RequestHistorySeeds:
         if not len(self.slots) == len(self.prefix_lengths) == len(self.tokens):
             raise ValueError("request history seed fields must have equal lengths")
         for prefix_length, tokens in zip(self.prefix_lengths, self.tokens):
-            if len(tokens) != prefix_length:
+            if len(tokens) > prefix_length:
                 raise ValueError(
                     f"request history seed has {len(tokens)} tokens for a "
                     f"{prefix_length}-token prefix"
@@ -230,6 +233,8 @@ class PlannedForward:
             no later scheduler activity can reach it.
         sampling_params_list: Per-slot sampling params, gathered by the loop.
             Read-only for the request's lifetime.
+        admission_ids: Immutable identities aligned with the forward's requests.
+            A new admission gets a new identity even when its rid is reused.
         dp_metadata: CPU-gathered DP metadata, None outside DP. A frozen
             dataclass of plain lists.
         grammar_inputs: Per-batch grammar state, None when no request in the
@@ -253,6 +258,7 @@ class PlannedForward:
     """
 
     forward_op: Any
+    admission_ids: tuple[int, ...]
     sampling_params_list: list
     dp_metadata: "DpForwardMetadata | None"
     grammar_inputs: Any
@@ -309,7 +315,11 @@ class ModelExecutionResult:
     """
     Result of model execution returned to scheduler.
 
-    This is the output from the Python executor back to the C++ scheduler.
+    The Rust host reads these tensors after their CPU copies have landed.
+    Producers emit fp32 logprob values and cumulative probabilities, and int64
+    top-k IDs, independently of the model's weight or activation dtype. The host
+    buffer reader also accepts fp64 values and int32 IDs; fp16/bfloat16 values
+    are not part of this result contract.
 
     Attributes:
         output_tokens: Sampled token IDs
@@ -317,14 +327,14 @@ class ModelExecutionResult:
     """
 
     output_tokens: torch.Tensor
-    copy_event: torch.cuda.Event | None = None
+    copy_event: torch.cuda.Event | RoundFence | None = None
     output_lengths: torch.Tensor | None = None
     grammar_completion: GrammarStepCompletion | None = None
-    # Per-position logprob of the sampled token, same layout as output_tokens.
+    # Per-position fp32 logprob of the sampled token, same layout as output_tokens.
     # Populated unconditionally by the sampling backend so it's always
     # available if any request asks for it.
     output_logprobs: torch.Tensor | None = None
-    # Probability mass preceding each sampled token in probability-descending,
+    # fp32 probability mass preceding each sampled token in probability-descending,
     # token-ID-ascending order; aligned with output_tokens and output_logprobs.
     output_token_cumulative_probs: torch.Tensor | None = None
     # P role, final chunk only: the sampled rows the commit path folds into
@@ -351,7 +361,7 @@ class ModelExecutionResult:
     _synced: bool = field(default=False, init=False, repr=False, compare=False)
 
     def sync(self) -> None:
-        """Block until this result's D2H copy has landed.
+        """Block until output copies and any retained draft tail have completed.
 
         Called exactly once, by the commit (``HostDataPlane.complete``) — the
         single gate between the forward thread and the control plane.

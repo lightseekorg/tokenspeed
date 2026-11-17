@@ -26,7 +26,8 @@ import functools
 
 import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
-from tokenspeed_kernel.platform import pdl_enabled
+from tokenspeed_kernel.ops._triton_l2 import prefetch_l2
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
 _RELU2_FP8_MAX = tl.constexpr(448.0)
 
@@ -35,6 +36,7 @@ __all__ = [
     "fused_gate_sigmoid_mul_add",
     "fused_swiglu_fp8_ue8m0",
     "fused_swiglu_fp8_ue8m0_masked_packed",
+    "moe_finalize_gate_add",
     "relu2",
     "sigmoid_mul",
     "silu_and_mul",
@@ -157,10 +159,145 @@ def fused_gate_sigmoid_mul_add(
 
 
 @triton.jit
+def _moe_finalize_gate_add_kernel(
+    gemm2_out,
+    permuted_idx,
+    expert_weights,
+    hidden_states_ptr,
+    gate_weight_ptr,
+    shared_output_ptr,
+    out_ptr,
+    hidden_dim: tl.constexpr,
+    gemm2_row_stride: tl.constexpr,
+    TOPK: tl.constexpr,
+    BLOCK: tl.constexpr,
+    CHUNK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    token_id = tl.program_id(0).to(tl.int64)
+    row_offset = token_id * hidden_dim
+    cols = tl.arange(0, BLOCK)
+    mask = cols < hidden_dim
+
+    if ENABLE_PDL:
+        # Wait for the predecessor's stores; release dependents immediately.
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
+    # Same code as _fused_gate_sigmoid_mul_add_kernel, so the same reduction
+    # and rounding. Every program of a token recomputes this 1-row dot.
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    h = tl.load(hidden_states_ptr + row_offset + cols, mask=mask, other=0.0)
+    w = tl.load(gate_weight_ptr + cols, mask=mask, other=0.0)
+    acc += h.to(tl.float32) * w.to(tl.float32)
+    gate_val = tl.sigmoid(tl.sum(acc, axis=0))
+
+    # The TRT-LLM finalize's arithmetic: fp32 sum over k in order, one bf16
+    # rounding; every gather of a CHUNK of columns is issued at once.
+    ccols = tl.program_id(1) * CHUNK + tl.arange(0, CHUNK)
+    cmask = ccols < hidden_dim
+    routed = tl.zeros([CHUNK], dtype=tl.float32)
+    for k in tl.static_range(TOPK):
+        row = tl.load(permuted_idx + token_id * TOPK + k).to(tl.int64)
+        scale = tl.load(expert_weights + token_id * TOPK + k).to(tl.float32)
+        valid = row >= 0
+        x = tl.load(
+            gemm2_out + tl.maximum(row, 0) * gemm2_row_stride + ccols,
+            mask=cmask & valid,
+            other=0.0,
+        ).to(tl.float32)
+        routed = tl.where(valid, routed + scale * x, routed)
+    routed = routed.to(tl.bfloat16)
+    s = tl.load(shared_output_ptr + row_offset + ccols, mask=cmask)
+    result = routed.to(tl.float32) + gate_val * s.to(tl.float32)
+    tl.store(out_ptr + row_offset + ccols, result.to(tl.bfloat16), mask=cmask)
+
+
+def moe_finalize_gate_add(
+    gemm2_out: torch.Tensor,
+    expanded_idx_to_permuted_idx: torch.Tensor,
+    expert_weights: torch.Tensor,
+    hidden_states: torch.Tensor,
+    gate_weight: torch.Tensor,
+    shared_output: torch.Tensor,
+) -> torch.Tensor:
+    """MoE finalize fused with ``fused_gate_sigmoid_mul_add``.
+
+    ``out[t] = bf16(bf16(sum_k w[t, k] * gemm2_out[perm[t, k]]) +
+    sigmoid(hidden_states[t] . gate_weight) * shared_output[t])``, bitwise equal
+    to the TRT-LLM finalize followed by ``fused_gate_sigmoid_mul_add``.
+
+    Args:
+        gemm2_out: ``[permuted_rows, hidden_padded]`` bf16 expert outputs from a
+            ``do_finalize=False`` MoE call.
+        expanded_idx_to_permuted_idx: ``[tokens * top_k]`` int32 row map (-1: not local).
+        expert_weights: ``[tokens, top_k]`` routing weights.
+        hidden_states: ``[tokens, hidden]`` MoE input (the gate's input).
+        gate_weight: ``[hidden]`` shared-expert gate weight.
+        shared_output: ``[tokens, hidden]`` shared-expert output.
+
+    Returns:
+        A new ``[tokens, hidden]`` bf16 tensor.
+    """
+    if hidden_states.ndim != 2 or not hidden_states.is_contiguous():
+        raise ValueError("hidden_states must be a contiguous 2D tensor")
+    num_tokens, hidden_dim = hidden_states.shape
+    if hidden_states.dtype != torch.bfloat16 or gemm2_out.dtype != torch.bfloat16:
+        raise ValueError("moe_finalize_gate_add expects bf16 activations")
+    if gate_weight.shape != (hidden_dim,) or not gate_weight.is_contiguous():
+        raise ValueError("gate_weight must be a contiguous [hidden] vector")
+    if shared_output.shape != (num_tokens, hidden_dim):
+        raise ValueError(
+            f"shared_output shape mismatch: expected {(num_tokens, hidden_dim)}, "
+            f"got {tuple(shared_output.shape)}"
+        )
+    if not shared_output.is_contiguous():
+        raise ValueError("shared_output must be contiguous")
+    if (
+        gemm2_out.ndim != 2
+        or gemm2_out.stride(1) != 1
+        or gemm2_out.shape[1] < hidden_dim
+    ):
+        raise ValueError("gemm2_out must be [rows, >= hidden] with unit column stride")
+    out = torch.empty_like(hidden_states)
+    if num_tokens == 0:
+        return out
+    top_k = expert_weights.shape[-1]
+    if expert_weights.ndim != 2 or expert_weights.shape[0] < num_tokens:
+        raise ValueError("expert_weights must be [tokens, top_k]")
+    if expanded_idx_to_permuted_idx.numel() < num_tokens * top_k:
+        raise ValueError("expanded_idx_to_permuted_idx must hold tokens * top_k rows")
+    # Only the first tokens' rows are read, densely in [token, k] order.
+    expert_weights = expert_weights[:num_tokens].contiguous()
+    expanded_idx_to_permuted_idx = expanded_idx_to_permuted_idx.reshape(-1).contiguous()
+    BLOCK = triton.next_power_of_2(hidden_dim)
+    num_warps = 4 if BLOCK <= 2048 else (8 if BLOCK <= 4096 else 16)
+    chunk = min(BLOCK, 1024)
+    enable_pdl = pdl_enabled()
+    _moe_finalize_gate_add_kernel[(num_tokens, triton.cdiv(hidden_dim, chunk))](
+        gemm2_out,
+        expanded_idx_to_permuted_idx,
+        expert_weights,
+        hidden_states,
+        gate_weight,
+        shared_output,
+        out,
+        hidden_dim=hidden_dim,
+        gemm2_row_stride=gemm2_out.stride(0),
+        TOPK=top_k,
+        BLOCK=BLOCK,
+        CHUNK=chunk,
+        ENABLE_PDL=enable_pdl,
+        num_warps=num_warps,
+        **({"launch_pdl": True} if enable_pdl else {}),
+    )
+    return out
+
+
+@triton.jit
 def _sigmoid_mul_kernel(
     x_ptr,
     gate_ptr,
-    n_elements,
     bias_ptr,
     hidden_dim: tl.constexpr,
     head_dim: tl.constexpr,
@@ -169,23 +306,22 @@ def _sigmoid_mul_kernel(
     BLOCK_SIZE: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
-    pid = tl.program_id(0).to(tl.int64)
-    block_start = pid * BLOCK_SIZE
-    offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
-
-    row = offsets // hidden_dim
-    col = offsets % hidden_dim
+    """One program per row and BLOCK_SIZE columns of it."""
+    row = tl.program_id(0).to(tl.int64)
+    col = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = col < hidden_dim
     head = col // head_dim
-    d = col % head_dim
-    gate_addrs = gate_ptr + row * gate_row_stride + head * gate_head_stride + d
+    gate_addrs = (
+        gate_ptr + row * gate_row_stride + head * gate_head_stride + col % head_dim
+    )
+    x_addrs = x_ptr + row * hidden_dim + col
 
     if ENABLE_PDL:
         # Wait for the predecessor's stores; release dependents immediately.
         tl.extra.cuda.gdc_wait()
         tl.extra.cuda.gdc_launch_dependents()
 
-    x = tl.load(x_ptr + offsets, mask=mask).to(tl.float32)
+    x = tl.load(x_addrs, mask=mask).to(tl.float32)
     g = tl.load(gate_addrs, mask=mask).to(tl.float32)
     if bias_ptr is not None:
         # The eager FP32 sigmoid: libdevice exp and an IEEE-rounded division.
@@ -193,7 +329,7 @@ def _sigmoid_mul_kernel(
         out = x * tl.div_rn(1.0, 1.0 + libdevice.exp(-z))
     else:
         out = x * tl.sigmoid(g)
-    tl.store(x_ptr + offsets, out, mask=mask)
+    tl.store(x_addrs, out, mask=mask)
 
 
 def sigmoid_mul(
@@ -275,18 +411,19 @@ def sigmoid_mul(
         else:
             head_dim = gate_head_stride = hidden_dim // bias_heads
 
-    n = x.numel()
-    if n == 0:
+    if x.numel() == 0:
         return x
 
-    BLOCK_SIZE = 1024
-    grid = ((n + BLOCK_SIZE - 1) // BLOCK_SIZE,)
+    # Row tiles avoid a 64-bit division per element; prefill sizes take wider tiles.
+    BLOCK_SIZE = min(
+        2048 if num_tokens >= 512 else 512, triton.next_power_of_2(hidden_dim)
+    )
+    grid = (num_tokens, triton.cdiv(hidden_dim, BLOCK_SIZE))
     enable_pdl = pdl_enabled()
     pdl_kwargs = {"launch_pdl": True} if enable_pdl else {}
     _sigmoid_mul_kernel[grid](
         x,
         gate,
-        n,
         head_bias,
         hidden_dim=hidden_dim,
         head_dim=head_dim,
@@ -1064,6 +1201,8 @@ def _rmsnorm_gated_kernel(
     gate_idx = token * gate_stride + offs_h[:, None] * head_dim + offs_d[None, :]
     g = tl.load(gate_ptr + gate_idx, mask=mask_h[:, None], other=0.0).to(tl.float32)
     if ENABLE_PDL:
+        # Release the next kernel at once; its own wait orders it after this one.
+        tl.extra.cuda.gdc_launch_dependents()
         # Gate and norm weight are independent of the KDA primary. Delay only
         # the attention-output read until every primary CTA has completed.
         tl.extra.cuda.gdc_wait()
@@ -1071,8 +1210,6 @@ def _rmsnorm_gated_kernel(
     var = tl.sum(x * x, axis=1) / head_dim
     rsig = tl.math.rsqrt(var + eps)
     y = x * rsig[:, None] * w[None, :] * tl.sigmoid(g)
-    if ENABLE_PDL:
-        tl.extra.cuda.gdc_launch_dependents()
     tl.store(out_ptr + idx, y.to(out_ptr.dtype.element_ty), mask=mask_h[:, None])
 
 
@@ -1094,8 +1231,9 @@ def rmsnorm_gated_sigmoid(
         weight: ``[head_dim]`` RMSNorm weight.
         eps: RMSNorm epsilon.
         num_heads / head_dim: per-head norm geometry.
-        enable_pdl: Whether to prefetch gate/weight before waiting for the
-            immediately preceding programmatic-launch primary.
+        enable_pdl: Whether to release the next kernel at entry and prefetch
+            gate/weight before waiting for the immediately preceding
+            programmatic-launch primary.
 
     Returns:
         ``[num_tokens, num_heads*head_dim]`` tensor of ``x``'s dtype.
@@ -1189,27 +1327,36 @@ def add3(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["n_tokens"])
 def _attnres_partial_kernel(
     blocks_ptr,  # [KB, T, H]
-    wp_ptr,  # [H] precomputed rms_w * res_w
-    m_ptr,  # [T]
-    s_ptr,  # [T]
-    acc_ptr,  # [T, H] fp32
+    wp_ptr,  # [Q, H] precomputed rms_w * res_w per query
+    m_ptr,  # [Q, T]
+    s_ptr,  # [Q, T]
+    acc_ptr,  # [Q, T, H] fp32
     n_blocks,
+    n_tokens,
     n_cols: tl.constexpr,
     stride_bk,
     stride_bt,
     eps,
+    NORMALIZE_VALUES: tl.constexpr,
     BLOCK: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
     """Online-softmax partial over the static block candidates (aux stream).
 
     Score weights and the running accumulator stay in registers; each block
-    row is read from global memory exactly once.
+    row is read from global memory exactly once. Program axis 1 selects the
+    query. ``NORMALIZE_VALUES`` accumulates the RMS-normalized blocks instead
+    of the raw ones.
     """
     t = tl.program_id(0)
+    q = tl.program_id(1)
+    wp_ptr += q * n_cols
+    m_ptr += q * n_tokens
+    s_ptr += q * n_tokens
+    acc_ptr += q.to(tl.int64) * n_tokens * n_cols
     offs = tl.arange(0, BLOCK)
     n_iters: tl.constexpr = (n_cols + BLOCK - 1) // BLOCK
     tl.static_assert(n_iters == 2)
@@ -1232,11 +1379,17 @@ def _attnres_partial_kernel(
     acc1 = tl.zeros([BLOCK], tl.float32)
     m_run = -float("inf")
     s_run = 0.0
+    # Load the next block row before reducing this one, so loads overlap reductions.
+    base = blocks_ptr + t * stride_bt
+    next0 = tl.load(base + col0, mask=mask0 & (n_blocks > 0), other=0.0)
+    next1 = tl.load(base + col1, mask=mask1 & (n_blocks > 0), other=0.0)
     b = 0
     while b < n_blocks:
-        base = blocks_ptr + b * stride_bk + t * stride_bt
-        v0 = tl.load(base + col0, mask=mask0, other=0.0).to(tl.float32)
-        v1 = tl.load(base + col1, mask=mask1, other=0.0).to(tl.float32)
+        v0 = next0.to(tl.float32)
+        v1 = next1.to(tl.float32)
+        base = blocks_ptr + (b + 1) * stride_bk + t * stride_bt
+        next0 = tl.load(base + col0, mask=mask0 & (b + 1 < n_blocks), other=0.0)
+        next1 = tl.load(base + col1, mask=mask1 & (b + 1 < n_blocks), other=0.0)
         sq = tl.sum(v0 * v0) + tl.sum(v1 * v1)
         dot = tl.sum(v0 * wp0) + tl.sum(v1 * wp1)
         rsig = tl.math.rsqrt(sq / n_cols + eps)
@@ -1244,6 +1397,9 @@ def _attnres_partial_kernel(
         m_new = tl.maximum(m_run, logit)
         corr = tl.exp(m_run - m_new)
         wgt = tl.exp(logit - m_new)
+        if NORMALIZE_VALUES:
+            v0 = v0 * rsig
+            v1 = v1 * rsig
         acc0 = acc0 * corr + wgt * v0
         acc1 = acc1 * corr + wgt * v1
         s_run = s_run * corr + wgt
@@ -1346,47 +1502,206 @@ def _attnres_partial_dual_kernel(
 
 
 @triton.jit
-def _attnres_combine_kernel(
-    prefix_ptr,  # [T, H]
+def _attnres_partial_pair_kernel(
+    blocks_ptr,  # [KB, T, H]
     wp_ptr,  # [H] precomputed rms_w * res_w
-    outw_ptr,  # out-norm weight or dummy
-    m_ptr,
-    s_ptr,
-    acc_ptr,
-    out_ptr,
+    m_ptr,  # [T]
+    s_ptr,  # [T]
+    acc_ptr,  # [T, H] fp32
+    n_blocks,
+    n_cols: tl.constexpr,
+    stride_bk,
+    stride_bt,
+    eps,
+    BLOCK: tl.constexpr,
+):
+    """``_attnres_partial_kernel`` with both column halves in one [2, BLOCK] tile.
+
+    Each half keeps its own 1-D summation tree, so results are bitwise equal on
+    64-lane waves, but a block pays one cross-wave reduction per quantity
+    instead of two.
+    """
+    t = tl.program_id(0)
+    n_iters: tl.constexpr = (n_cols + BLOCK - 1) // BLOCK
+    tl.static_assert(n_iters == 2)
+    cols = tl.arange(0, 2)[:, None] * BLOCK + tl.arange(0, BLOCK)[None, :]
+    mask = cols < n_cols
+    wp = tl.load(wp_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+
+    acc = tl.zeros([2, BLOCK], tl.float32)
+    m_run = -float("inf")
+    s_run = 0.0
+    b = 0
+    while b < n_blocks:
+        base = blocks_ptr + b * stride_bk + t * stride_bt
+        v = tl.load(base + cols, mask=mask, other=0.0).to(tl.float32)
+        sq = tl.sum(tl.sum(v * v, axis=1), axis=0)
+        dot = tl.sum(tl.sum(v * wp, axis=1), axis=0)
+        rsig = tl.math.rsqrt(sq / n_cols + eps)
+        logit = dot * rsig
+        m_new = tl.maximum(m_run, logit)
+        corr = tl.exp(m_run - m_new)
+        wgt = tl.exp(logit - m_new)
+        acc = acc * corr + wgt * v
+        s_run = s_run * corr + wgt
+        m_run = m_new
+        b += 1
+    tl.store(acc_ptr + t * n_cols + cols, acc, mask=mask)
+    tl.store(m_ptr + t, m_run)
+    tl.store(s_ptr + t, s_run)
+
+
+@triton.jit
+def _attnres_partial_dual_pair_kernel(
+    blocks_ptr,  # [KB, T, H]
+    wp_a_ptr,  # [H] precomputed side-A rms_w * res_w
+    wp_b_ptr,  # [H] side-B product
+    m_a_ptr,
+    s_a_ptr,
+    acc_a_ptr,
+    m_b_ptr,
+    s_b_ptr,
+    acc_b_ptr,
+    n_blocks,
+    n_cols: tl.constexpr,
+    stride_bk,
+    stride_bt,
+    eps,
+    BLOCK: tl.constexpr,
+):
+    """``_attnres_partial_dual_kernel`` with both column halves in one [2, BLOCK] tile.
+
+    Bitwise equal on 64-lane waves; see ``_attnres_partial_pair_kernel``.
+    """
+    t = tl.program_id(0)
+    n_iters: tl.constexpr = (n_cols + BLOCK - 1) // BLOCK
+    tl.static_assert(n_iters == 2)
+    cols = tl.arange(0, 2)[:, None] * BLOCK + tl.arange(0, BLOCK)[None, :]
+    mask = cols < n_cols
+    wa = tl.load(wp_a_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+    wb = tl.load(wp_b_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+
+    acc_a = tl.zeros([2, BLOCK], tl.float32)
+    acc_b = tl.zeros([2, BLOCK], tl.float32)
+    m_a = -float("inf")
+    s_a = 0.0
+    m_b = -float("inf")
+    s_b = 0.0
+    b = 0
+    while b < n_blocks:
+        base = blocks_ptr + b * stride_bk + t * stride_bt
+        v = tl.load(base + cols, mask=mask, other=0.0).to(tl.float32)
+        sq = tl.sum(tl.sum(v * v, axis=1), axis=0)
+        rsig = tl.math.rsqrt(sq / n_cols + eps)
+        dot_a = tl.sum(tl.sum(v * wa, axis=1), axis=0)
+        logit_a = dot_a * rsig
+        m_an = tl.maximum(m_a, logit_a)
+        corr_a = tl.exp(m_a - m_an)
+        wgt_a = tl.exp(logit_a - m_an)
+        acc_a = acc_a * corr_a + wgt_a * v
+        s_a = s_a * corr_a + wgt_a
+        m_a = m_an
+        dot_b = tl.sum(tl.sum(v * wb, axis=1), axis=0)
+        logit_b = dot_b * rsig
+        m_bn = tl.maximum(m_b, logit_b)
+        corr_b = tl.exp(m_b - m_bn)
+        wgt_b = tl.exp(logit_b - m_bn)
+        acc_b = acc_b * corr_b + wgt_b * v
+        s_b = s_b * corr_b + wgt_b
+        m_b = m_bn
+        b += 1
+    tl.store(acc_a_ptr + t * n_cols + cols, acc_a, mask=mask)
+    tl.store(m_a_ptr + t, m_a)
+    tl.store(s_a_ptr + t, s_a)
+    tl.store(acc_b_ptr + t * n_cols + cols, acc_b, mask=mask)
+    tl.store(m_b_ptr + t, m_b)
+    tl.store(s_b_ptr + t, s_b)
+
+
+@triton.jit(do_not_specialize=["n_tokens"])
+def _attnres_combine_kernel(
+    prefix_ptr,  # [T, H] first candidate term
+    term1_ptr,  # [T, H] second candidate term or dummy
+    term2_ptr,  # [T, H] third candidate term or dummy
+    cand_ptr,  # [T, H] rounded candidate destination or dummy
+    wp_ptr,  # [Q, H] precomputed rms_w * res_w per query
+    outw_ptr,  # [Q, H] out-norm weight or dummy
+    m_ptr,  # [Q, T]
+    s_ptr,  # [Q, T]
+    acc_ptr,  # [Q, T, H] fp32
+    out_ptr,  # [Q, T, H]; rows of one query are stride_o apart
+    n_tokens,
     n_cols: tl.constexpr,
     stride_p,
     stride_o,
     eps,
+    out_eps,
+    NUM_TERMS: tl.constexpr,
+    STORE_CANDIDATE: tl.constexpr,
+    NORMALIZE_VALUES: tl.constexpr,
+    ROUND_MIX: tl.constexpr,
     HAS_OUTNORM: tl.constexpr,
     BLOCK: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
+    TRIGGER_FIRST: tl.constexpr,
 ):
     """Fold the prefix candidate into the block partial; optional out-norm.
 
     All operands are read once and stay register-resident. Under PDL the
-    weights are prefetched before ``gdc_wait``; scratch and prefix are read
-    afterward. The caller must ensure the weights are already ready.
+    weights are prefetched before ``gdc_wait``; scratch and terms are read
+    afterward, their rows hinted into L2 first. The caller must ensure the
+    weights are already ready.
+
+    The candidate is the FP32 sum of ``NUM_TERMS`` rows. ``STORE_CANDIDATE``
+    sums from zero, rounds the sum once to ``cand_ptr``'s dtype, stores it
+    and mixes the rounded value. Program axis 1 selects the query.
+    ``ROUND_MIX`` rounds the mix to BF16 before the out-norm and store.
     """
     t = tl.program_id(0)
+    q = tl.program_id(1)
     offs = tl.arange(0, BLOCK)
     n_iters: tl.constexpr = (n_cols + BLOCK - 1) // BLOCK
     tl.static_assert(n_iters == 2)
+    tl.static_assert(NUM_TERMS >= 1 and NUM_TERMS <= 3)
 
     col0 = offs
     col1 = BLOCK + offs
     mask0 = col0 < n_cols
     mask1 = col1 < n_cols
+    wp_ptr += q * n_cols
+    m_ptr += q * n_tokens
+    s_ptr += q * n_tokens
+    acc_ptr += q.to(tl.int64) * n_tokens * n_cols
+    out_ptr += q.to(tl.int64) * n_tokens * stride_o
 
     wp0 = tl.load(wp_ptr + col0, mask=mask0, other=0.0).to(tl.float32)
     wp1 = tl.load(wp_ptr + col1, mask=mask1, other=0.0).to(tl.float32)
     if HAS_OUTNORM:
+        outw_ptr += q * n_cols
         ow0 = tl.load(outw_ptr + col0, mask=mask0, other=0.0).to(tl.float32)
         ow1 = tl.load(outw_ptr + col1, mask=mask1, other=0.0).to(tl.float32)
 
+    # The scratch row and the earlier terms are usually older than the chain
+    # and evicted from L2 by then: hint them (32 FP32 or 64 16-bit values per
+    # 128-byte line) so the loads after the wait find them there. A hint
+    # reads nothing into registers; one of a row the predecessor is still
+    # writing only warms L2.
+    line = tl.arange(0, triton.next_power_of_2(tl.cdiv(n_cols, 32)))
+    prefetch_l2(acc_ptr + t * n_cols + line * 32, line * 32 < n_cols)
+    row = tl.arange(0, triton.next_power_of_2(tl.cdiv(n_cols, 64))) * 64
+    prefetch_l2(prefix_ptr + t * stride_p + row, row < n_cols)
+    if NUM_TERMS >= 2:
+        prefetch_l2(term1_ptr + t * stride_p + row, row < n_cols)
+    if NUM_TERMS == 3:
+        prefetch_l2(term2_ptr + t * stride_p + row, row < n_cols)
     if ENABLE_PDL:
         # The predecessor may still be writing scratch and prefix.
+        if TRIGGER_FIRST:
+            # Only for successors that read nothing but constants before waiting.
+            tl.extra.cuda.gdc_launch_dependents()
         tl.extra.cuda.gdc_wait()
+        if not TRIGGER_FIRST:
+            tl.extra.cuda.gdc_launch_dependents()
 
     m_b = tl.load(m_ptr + t)
     s_b = tl.load(s_ptr + t)
@@ -1394,6 +1709,30 @@ def _attnres_combine_kernel(
     a1 = tl.load(acc_ptr + t * n_cols + col1, mask=mask1, other=0.0)
     v0 = tl.load(prefix_ptr + t * stride_p + col0, mask=mask0, other=0.0).to(tl.float32)
     v1 = tl.load(prefix_ptr + t * stride_p + col1, mask=mask1, other=0.0).to(tl.float32)
+    if STORE_CANDIDATE:
+        v0 = 0.0 + v0
+        v1 = 0.0 + v1
+    if NUM_TERMS >= 2:
+        v0 += tl.load(term1_ptr + t * stride_p + col0, mask=mask0, other=0.0).to(
+            tl.float32
+        )
+        v1 += tl.load(term1_ptr + t * stride_p + col1, mask=mask1, other=0.0).to(
+            tl.float32
+        )
+    if NUM_TERMS == 3:
+        v0 += tl.load(term2_ptr + t * stride_p + col0, mask=mask0, other=0.0).to(
+            tl.float32
+        )
+        v1 += tl.load(term2_ptr + t * stride_p + col1, mask=mask1, other=0.0).to(
+            tl.float32
+        )
+    if STORE_CANDIDATE:
+        c0 = v0.to(cand_ptr.dtype.element_ty)
+        c1 = v1.to(cand_ptr.dtype.element_ty)
+        tl.store(cand_ptr + t * stride_p + col0, c0, mask=mask0 & (q == 0))
+        tl.store(cand_ptr + t * stride_p + col1, c1, mask=mask1 & (q == 0))
+        v0 = c0.to(tl.float32)
+        v1 = c1.to(tl.float32)
     sq = tl.sum(v0 * v0) + tl.sum(v1 * v1)
     dot = tl.sum(v0 * wp0) + tl.sum(v1 * wp1)
     rsig = tl.math.rsqrt(sq / n_cols + eps)
@@ -1402,12 +1741,18 @@ def _attnres_combine_kernel(
     corr = tl.exp(m_b - m)
     w_p = tl.exp(logit_p - m)
     inv_s = 1.0 / (s_b * corr + w_p)
-    mix0 = ((a0 * corr + w_p * v0) * inv_s).to(tl.bfloat16).to(tl.float32)
-    mix1 = ((a1 * corr + w_p * v1) * inv_s).to(tl.bfloat16).to(tl.float32)
+    if NORMALIZE_VALUES:
+        v0 = v0 * rsig
+        v1 = v1 * rsig
+    mix0 = (a0 * corr + w_p * v0) * inv_s
+    mix1 = (a1 * corr + w_p * v1) * inv_s
+    if ROUND_MIX:
+        mix0 = mix0.to(tl.bfloat16).to(tl.float32)
+        mix1 = mix1.to(tl.bfloat16).to(tl.float32)
 
     if HAS_OUTNORM:
         mix_sq = tl.sum(mix0 * mix0) + tl.sum(mix1 * mix1)
-        rsig_mix = tl.math.rsqrt(mix_sq / n_cols + eps)
+        rsig_mix = tl.math.rsqrt(tl.div_rn(mix_sq, n_cols) + out_eps)
         tl.store(
             out_ptr + t * stride_o + col0,
             (mix0 * rsig_mix * ow0).to(out_ptr.dtype.element_ty),
@@ -1437,6 +1782,22 @@ def attnres_partial(blocks, wp, eps, scratch):
     """Blocks-side online-softmax partial. scratch = (m [T], s [T], acc [T,H] fp32)."""
     KB, T, H = blocks.shape
     m, s_, acc = scratch
+    if current_platform().is_amd:
+        _attnres_partial_pair_kernel[(T,)](
+            blocks,
+            wp,
+            m,
+            s_,
+            acc,
+            KB,
+            n_cols=H,
+            stride_bk=blocks.stride(0),
+            stride_bt=blocks.stride(1),
+            eps=eps,
+            BLOCK=4096,
+            num_warps=8,
+        )
+        return
     enable_pdl = pdl_enabled()
     pdl_kwargs = {"launch_pdl": True} if enable_pdl else {}
     _attnres_partial_kernel[(T,)](
@@ -1446,10 +1807,12 @@ def attnres_partial(blocks, wp, eps, scratch):
         s_,
         acc,
         KB,
+        T,
         n_cols=H,
         stride_bk=blocks.stride(0),
         stride_bt=blocks.stride(1),
         eps=eps,
+        NORMALIZE_VALUES=False,
         BLOCK=4096,
         ENABLE_PDL=enable_pdl,
         num_warps=8,
@@ -1469,6 +1832,26 @@ def attnres_partial_dual(blocks, wp_a, wp_b, eps, scratch_a, scratch_b):
     KB, T, H = blocks.shape
     m_a, s_a, acc_a = scratch_a
     m_b, s_b, acc_b = scratch_b
+    if current_platform().is_amd:
+        _attnres_partial_dual_pair_kernel[(T,)](
+            blocks,
+            wp_a,
+            wp_b,
+            m_a,
+            s_a,
+            acc_a,
+            m_b,
+            s_b,
+            acc_b,
+            KB,
+            n_cols=H,
+            stride_bk=blocks.stride(0),
+            stride_bt=blocks.stride(1),
+            eps=eps,
+            BLOCK=4096,
+            num_warps=8,
+        )
+        return
     enable_pdl = pdl_enabled()
     pdl_kwargs = {"launch_pdl": True} if enable_pdl else {}
     _attnres_partial_dual_kernel[(T,)](
@@ -1510,20 +1893,30 @@ def attnres_combine(prefix, wp, out_norm_w, eps, scratch, out):
     pdl_kwargs = {"launch_pdl": True} if enable_pdl else {}
     _attnres_combine_kernel[(T,)](
         prefix,
+        prefix,
+        prefix,
+        prefix,
         wp,
         out_norm_w if out_norm_w is not None else wp,
         m,
         s_,
         acc,
         out,
+        T,
         n_cols=H,
         stride_p=prefix.stride(0),
         stride_o=out.stride(0),
         eps=eps,
+        out_eps=eps,
+        NUM_TERMS=1,
+        STORE_CANDIDATE=False,
+        NORMALIZE_VALUES=False,
+        ROUND_MIX=True,
         HAS_OUTNORM=out_norm_w is not None,
         BLOCK=4096,
         num_warps=8,
         ENABLE_PDL=enable_pdl,
+        TRIGGER_FIRST=False,
         **pdl_kwargs,
     )
     return out
@@ -1603,10 +1996,11 @@ def relu2(
 # Launch options of the softcap pass: FP contraction off and libdevice's non-FTZ
 # path, as Torch's CUDA kernels compute (no fast math, denormals kept).
 _TANH_SOFTCAP_BLOCK = 2048
+_IS_HIP = tl.constexpr(torch.version.hip is not None)
 _TANH_SOFTCAP_LAUNCH_OPTIONS = dict(
     num_warps=4,
     enable_fp_fusion=False,
-    enable_reflect_ftz=False,
+    **({} if torch.version.hip else {"enable_reflect_ftz": False}),
 )
 
 
@@ -1614,6 +2008,9 @@ _TANH_SOFTCAP_LAUNCH_OPTIONS = dict(
 def _mul_rn_f32(left, right):
     """One correctly rounded FP32 multiply (``mul.rn.f32``, non-FTZ) that the
     compiler cannot fuse."""
+    if _IS_HIP:
+        # HIP launches disable FP contraction; use the portable FP32 multiply.
+        return left * right
     return tl.inline_asm_elementwise(
         "mul.rn.f32 $0, $1, $2;",
         constraints="=f,f,f",

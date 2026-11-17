@@ -152,6 +152,7 @@ def _prepare_records(x, t, *, raw_gate, original_qkv=None):
             recurrent_layout="v_major",
             store_states=False,
             replay_records=records,
+            output_norm=None,
             g_raw=raw_gate,
             **producers,
         )
@@ -978,6 +979,7 @@ def test_fused_verify_no_store_matches_store_and_leaves_tape_untouched():
         head_dim=V,
         draft_token_num=t,
         lower_bound=LOWER_BOUND,
+        output_norm=None,
     )
     torch.testing.assert_close(conv_tape, conv_before, atol=0.0, rtol=0.0)
     torch.testing.assert_close(state_tape, state_before, atol=0.0, rtol=0.0)
@@ -1028,6 +1030,7 @@ def test_fused_verify_no_store_matches_store_and_leaves_tape_untouched():
         head_dim=V,
         draft_token_num=t,
         lower_bound=LOWER_BOUND,
+        output_norm=None,
     )
     assert not torch.equal(wrong, no_store)
 
@@ -1057,6 +1060,7 @@ def test_split_verify_wrapper_matches_fused_wrapper(n):
         head_dim=V,
         draft_token_num=t,
         lower_bound=LOWER_BOUND,
+        output_norm=None,
     )
     args = (
         x["qkv_raw"],

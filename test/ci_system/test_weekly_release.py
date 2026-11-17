@@ -359,17 +359,18 @@ def test_weekly_schedule_and_failure_resume_contract():
         )
         assert set(pipeline.get("on") or pipeline.get(True)) == {"workflow_dispatch"}
         assert pipeline["concurrency"] == workflow["concurrency"]
-        for job, previous in (
-            ("version", ""),
-            ("publish", f"{component}-version"),
-            ("dependency", f"{component}-publish"),
-        ):
+        jobs = {"version": "", "publish": f"{component}-version"}
+        if component == "mla":
+            jobs["dependency"] = f"{component}-publish"
+        assert pipeline["jobs"].keys() == jobs.keys()
+        for job, previous in jobs.items():
             stage = pipeline["jobs"][job]
             assert stage["uses"] == "./.github/workflows/weekly-release-stage.yml"
             assert stage["with"]["stage"] == f"{component}-{job}"
             assert stage["with"]["previous"] == previous
         assert pipeline["jobs"]["publish"]["needs"] == "version"
-        assert pipeline["jobs"]["dependency"]["needs"] == "publish"
+        if component == "mla":
+            assert pipeline["jobs"]["dependency"]["needs"] == "publish"
 
 
 @pytest.fixture
@@ -1036,7 +1037,7 @@ def test_version_fast_forward_refuses_main_race(
     assert command("git", "ls-remote", "origin", "refs/heads/main").split()[0] == other
 
 
-@pytest.mark.parametrize("component", ["scheduler", "mla"])
+@pytest.mark.parametrize("component", ["mla"])
 def test_component_metadata_prs_replay_exact_diffs_without_downstream_version_bump(
     release_module, version_repository, tmp_path, monkeypatch, component
 ):
@@ -1125,8 +1126,8 @@ def test_component_failed_publication_blocks_dependency_and_resumes_same_run(
     controller.state["stages"][f"{component}-version"] = {"complete": True, "sha": sha}
     controller.save()
     files = {
-        f"scheduler-cp{python}-{arch}.whl": "a" * 64
-        for python in range(310, 314)
+        f"scheduler-{python_abi}-{arch}.whl": "a" * 64
+        for python_abi in ("cp311-cp311", "cp312-abi3")
         for arch in ("x86_64", "aarch64")
     }
     files["scheduler.tar.gz"] = "b" * 64
@@ -1229,9 +1230,10 @@ def test_component_failed_publication_blocks_dependency_and_resumes_same_run(
     with pytest.raises(RuntimeError, match="Child workflow failed"):
         controller.run("")
     assert not controller.phase.get("complete")
-    dependency = controller_type(controller.path, f"{component}-dependency")
-    with pytest.raises(RuntimeError, match=f"Previous {component} stage"):
-        dependency.run("")
+    if component == "mla":
+        dependency = controller_type(controller.path, f"{component}-dependency")
+        with pytest.raises(RuntimeError, match=f"Previous {component} stage"):
+            dependency.run("")
     run["conclusion"] = "success"
     resumed = controller_type(controller.path, f"{component}-publish")
     if component == "mla":
@@ -1250,27 +1252,28 @@ def test_component_failed_publication_blocks_dependency_and_resumes_same_run(
         assert dispatched[0]["inputs"] == {} and len(artifact_downloads) == 2
         resumed.run("")
         assert len(dispatched) == 1 and len(artifact_downloads) == 2
+    if component != "mla":
+        return
     bare = tmp_path / "origin.git"
     command("git", "clone", "--bare", str(version_repository), str(bare))
     command("git", "remote", "add", "origin", str(bare))
     dependency = controller_type(controller.path, f"{component}-dependency")
     dependency.gate()
-    if component == "mla":
-        publisher = yaml.safe_load(
-            (ROOT / ".github/workflows/release-tokenspeed-mla.yml").read_text()
-        )
-        source_gate = next(
-            step["run"]
-            for step in publisher["jobs"]["build"]["steps"]
-            if step.get("name") == "Require main or a pinned release"
-        )
-        gate_env = dict(release_module.os.environ, SOURCE_REF=f"refs/heads/{ref}")
-        assert (
-            release_module.subprocess.run(
-                ["bash", "-e", "-c", source_gate], env=gate_env, capture_output=True
-            ).returncode
-            == 0
-        )
+    publisher = yaml.safe_load(
+        (ROOT / ".github/workflows/release-tokenspeed-mla.yml").read_text()
+    )
+    source_gate = next(
+        step["run"]
+        for step in publisher["jobs"]["build"]["steps"]
+        if step.get("name") == "Require main or a pinned release"
+    )
+    gate_env = dict(release_module.os.environ, SOURCE_REF=f"refs/heads/{ref}")
+    assert (
+        release_module.subprocess.run(
+            ["bash", "-e", "-c", source_gate], env=gate_env, capture_output=True
+        ).returncode
+        == 0
+    )
     source_path = Path(release_module.PROJECTS[package])
     source_path.write_text(
         source_path.read_text() + "\n# unpublished component change\n"
@@ -1279,13 +1282,12 @@ def test_component_failed_publication_blocks_dependency_and_resumes_same_run(
     command("git", "commit", "-s", "-m", "component source update")
     with pytest.raises(RuntimeError, match="Unreleased changes"):
         dependency.gate()
-    if component == "mla":
-        assert (
-            release_module.subprocess.run(
-                ["bash", "-e", "-c", source_gate], env=gate_env, capture_output=True
-            ).returncode
-            != 0
-        )
+    assert (
+        release_module.subprocess.run(
+            ["bash", "-e", "-c", source_gate], env=gate_env, capture_output=True
+        ).returncode
+        != 0
+    )
 
 
 @pytest.mark.parametrize("component", ["scheduler", "mla"])

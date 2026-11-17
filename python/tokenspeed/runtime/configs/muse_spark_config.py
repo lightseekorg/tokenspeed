@@ -45,9 +45,14 @@ class MuseSparkConfig(PretrainedConfig):
         out_hidden_size: int,
         projector_hidden_size: int,
         projector_hidden_act: str,
+        decode_monokernel: bool = False,
         **kwargs,
     ) -> None:
         text = dict(text_config)
+        # Whether the model builds its decoder layers from the decode
+        # monokernel class. ModelConfig sets it from --decode-monokernel;
+        # checkpoints do not hold it.
+        self.decode_monokernel = bool(decode_monokernel)
         self.vision_config = dict(vision_config)
         self.audio_config = dict(audio_config)
         self.image_token_id = image_token_id

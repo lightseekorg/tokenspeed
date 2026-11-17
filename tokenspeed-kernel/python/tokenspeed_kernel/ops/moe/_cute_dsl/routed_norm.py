@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 import torch
 from tokenspeed_kernel.platform import (
@@ -34,6 +34,9 @@ from tokenspeed_kernel.platform import (
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
+
+if TYPE_CHECKING:
+    from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import AllReduceMailbox
 
 logger = logging.getLogger(__name__)
 
@@ -188,11 +191,31 @@ def _compiled_routed_sum(
     eps: float,
     weight_offset: float,
     enable_pdl: bool,
+    mailbox_sentinel: int | None,
+    mailbox_ranks: int,
 ) -> Callable[..., None]:
-    key = ("routed", device.index, width, topk, eps, weight_offset, enable_pdl)
+    key = (
+        "routed",
+        device.index,
+        width,
+        topk,
+        eps,
+        weight_offset,
+        enable_pdl,
+        mailbox_sentinel,
+        mailbox_ranks,
+    )
 
     def build() -> Callable[..., None]:
-        kernel = ClusterRoutedSumKernel(width, topk, eps, weight_offset, enable_pdl)
+        kernel = ClusterRoutedSumKernel(
+            width,
+            topk,
+            eps,
+            weight_offset,
+            enable_pdl,
+            mailbox_sentinel,
+            mailbox_ranks,
+        )
         # Separate symbols: only the padded width is promised divisible by eight.
         padded = cute.sym_int()
         routes = make_fake_tensor(
@@ -212,12 +235,34 @@ def _compiled_routed_sum(
             route_weights,
             norm_weight,
             output,
+            _fake(cutlass.BFloat16, (cute.sym_int(), width * mailbox_ranks)),
+            cutlass.Int64(0),
             1,
             1,
             _stream(device),
         )
 
     return _compile_once(key, device, build)
+
+
+def _check_all_reduce(mailbox: AllReduceMailbox, num_tokens: int, width: int) -> int:
+    """Reject a mailbox the kernel cannot reduce; return its partials per row."""
+    rows, destination = mailbox.rows, mailbox.destination
+    sentinel = mailbox.sentinel
+    if not 0 <= sentinel <= 0xFFFFFFFF or (sentinel & 0xFFFF) != (sentinel >> 16):
+        raise ValueError("the mailbox sentinel is one word whose halves agree")
+    if rows.dtype != torch.bfloat16 or rows.ndim != 2 or rows.shape[0] != num_tokens:
+        raise ValueError("the mailbox rows must be BF16 [tokens, width * ranks]")
+    ranks, remainder = divmod(rows.shape[1], width)
+    if remainder or ranks < 2:
+        raise ValueError("the mailbox must hold one partial per rank, two or more")
+    if not rows.is_contiguous() or rows.data_ptr() % _PTR_ALIGN:
+        raise ValueError("the mailbox rows must be contiguous and 16-byte aligned")
+    if destination.shape != (num_tokens, width):
+        raise ValueError("the destination must be this rank's [tokens, width] slot")
+    if destination.stride() != (width * ranks, 1) or destination.data_ptr() % 4:
+        raise ValueError("the destination rows must be mailbox rows apart")
+    return ranks
 
 
 @register_kernel(
@@ -241,6 +286,7 @@ def cute_dsl_routed_input_scale_rmsnorm_sum_gathered(
     weight_offset: float,
     enable_pdl: bool,
     output: torch.Tensor | None,
+    all_reduce: AllReduceMailbox | None,
 ) -> torch.Tensor:
     """The routed input-scale RMSNorm and top-k sum on one cluster per token.
 
@@ -254,6 +300,9 @@ def cute_dsl_routed_input_scale_rmsnorm_sum_gathered(
     if output is not None:
         raise ValueError("the cluster routed sum does not support caller-owned output")
     width = norm_weight.shape[0]
+    ranks = (
+        1 if all_reduce is None else _check_all_reduce(all_reduce, num_tokens, width)
+    )
     output = torch.empty(
         (num_tokens, width), dtype=torch.bfloat16, device=gemm2_out.device
     )
@@ -264,7 +313,11 @@ def cute_dsl_routed_input_scale_rmsnorm_sum_gathered(
         eps,
         weight_offset,
         enable_pdl,
+        None if all_reduce is None else all_reduce.sentinel,
+        ranks,
     )
+    # Without a mailbox the output stands in for it, never read.
+    mailbox = output if all_reduce is None else all_reduce.rows
     with torch.cuda.device(gemm2_out.device):
         compiled(
             to_cute(gemm2_out, _PTR_ALIGN),
@@ -272,6 +325,8 @@ def cute_dsl_routed_input_scale_rmsnorm_sum_gathered(
             to_cute(route_weights.view(-1), _PTR_ALIGN),
             to_cute(norm_weight, _PTR_ALIGN),
             to_cute(output, _PTR_ALIGN),
+            to_cute(mailbox, _PTR_ALIGN),
+            0 if all_reduce is None else all_reduce.destination.data_ptr(),
             num_tokens,
             gemm2_out.stride(0),
             _stream(gemm2_out.device),

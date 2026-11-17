@@ -65,6 +65,7 @@ class Qwen4ExpTextConfig(Qwen3_5TextConfig):
         layer_types: list[str] | None = None,
         rope_parameters: dict | None = None,
         num_experts: int | None = None,
+        decode_monokernel: bool = False,
         **kwargs,
     ) -> None:
         if hc_count <= 1:
@@ -82,8 +83,10 @@ class Qwen4ExpTextConfig(Qwen3_5TextConfig):
         self.ple_embed_dim = int(ple_embed_dim or self.hidden_size)
         self.ple_conv_kernel_size = int(ple_conv_kernel_size)
         # Storage dtype for the PLE n-gram embedding table. None keeps the
-        # model dtype; "float8_e4m3fn" stores the table in FP8 with online
-        # per-row quantization at load time (halves the table's memory).
+        # checkpoint's format: FP8 when its quantization config lists the
+        # table as FP8, the model dtype otherwise. "float8_e4m3fn" always
+        # stores FP8 (half the memory of BF16), quantizing a 16-bit table per
+        # row at load time.
         self.ple_embed_dtype = ple_embed_dtype
         # When enabled, keep the n-gram table in page-locked host memory and
         # let the gather kernel read it over PCIe/C2C. The table scales with
@@ -103,6 +106,10 @@ class Qwen4ExpTextConfig(Qwen3_5TextConfig):
         self._qwen4_exp_layer_types = (
             list(layer_types) if layer_types is not None else None
         )
+        # Whether the model builds its decoder layers from the decode
+        # monokernel classes. ModelConfig sets it from --decode-monokernel;
+        # checkpoints do not hold it.
+        self.decode_monokernel = bool(decode_monokernel)
 
     @property
     def layers_block_type(self) -> list[str]:

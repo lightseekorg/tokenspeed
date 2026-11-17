@@ -23,9 +23,9 @@
 Megatron's vocab-parallel cross-entropy computes, per row: the max over the
 local vocab shard and a MAX all-reduce; ``shard -= max``; the target logit
 gathered from the owning shard (zero elsewhere) and a SUM all-reduce; the
-denominator as ``sum(exp)`` over fixed 32768-wide vocab blocks whose partials
+denominator as ``sum(exp)`` over explicitly selected vocab blocks whose partials
 are folded in fp32 in block (rank) order; ``nll = log(sum_exp) - target``.
-``vocab_parallel_logprobs`` reproduces that order on the full vocabulary one
+``blockwise_logprobs`` reproduces that order on the full vocabulary one
 rank already holds, which is bit-identical to the collective form: the max
 is exact, adding the other shards' exact zeros cannot move the target, and
 the all-gathered block partials fold in the same order. The one solution-
@@ -43,10 +43,9 @@ The leaf contract (``register_kernel("sampling", "block_sumexp", ...)``):
   column ``j`` is ``sum(exp(shifted[:, j * block_size:(j + 1) *
   block_size]))`` reduced in the leaf's own fixed order;
 * the op folds the columns left to right in fp32 (``((p0 + p1) + p2) ...``),
-  Megatron's rank-ordered reduction of the per-shard partials: a shard
-  narrower than a block pairs back into the block's own tree at its top
-  level, so one full-vocabulary call and the trainer's sharded sum agree
-  bitwise whenever the leaf's in-block tree is pairwise over its tiles.
+  matching a rank-ordered reduction when the selected block width equals
+  the trainer's shard width. Pairing narrower shards before that fold is a
+  different FP32 tree and does not promise cross-topology agreement.
 
 The portable ``torch`` leaf registers at ``Priority.PORTABLE``; a vendor leaf
 with the trainer's in-block order (the fixed-order operator kit's
@@ -62,20 +61,21 @@ from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
-__all__ = ["vocab_parallel_logprobs"]
+__all__ = ["blockwise_logprobs"]
 
 _BATCH_INVARIANT = frozenset({"batch_invariant"})
 
 
-def vocab_parallel_logprobs(
+def blockwise_logprobs(
     logits: torch.Tensor,
     target_ids: torch.Tensor,
     *,
     vocab_block: int,
+    form: str,
     solution: str | None = None,
     override: str | None = None,
 ) -> torch.Tensor:
-    """Return each row's log-probability of ``target_ids`` in Megatron's order.
+    """Return selected-token logprobs with fixed-width blockwise reduction.
 
     Args:
         logits: ``[rows, vocab]`` logits of the whole vocabulary (any float
@@ -84,6 +84,8 @@ def vocab_parallel_logprobs(
         target_ids: ``[rows]`` integer token ids.
         vocab_block: Width of the fixed ``sum(exp)`` blocks (the trainer uses
             32768); the fold across blocks is a fp32 left fold in block order.
+        form: "negative-cross-entropy" for -(log(sum_exp) - target), or
+            "direct" for target - log(sum_exp); selects the zero sign.
         solution: Optional kernel solution for the block ``sum(exp)`` leaf;
             only leaves declaring the ``batch_invariant`` feature are eligible.
             None takes the highest-priority eligible leaf (a vendor leaf
@@ -91,10 +93,12 @@ def vocab_parallel_logprobs(
         override: Optional exact kernel-name or solution override.
 
     Returns:
-        ``[rows]`` fp32 log-probabilities, ``target - log(sum_exp)`` with
+        ``[rows]`` fp32 log-probabilities in the selected form, with
         ``target = logits[row, id] - max`` and ``sum_exp`` the fp32 left fold
         of the leaf's ``[rows, vocab // vocab_block]`` block partials.
     """
+    if form not in ("negative-cross-entropy", "direct"):
+        raise ValueError(f"Unknown blockwise logprob form: {form!r}")
     if logits.ndim != 2:
         raise ValueError(f"logits must be [rows, vocab], got {tuple(logits.shape)}")
     rows, vocab = logits.shape
@@ -136,6 +140,7 @@ def vocab_parallel_logprobs(
     sum_exp = partials[:, 0]
     for block in range(1, partials.shape[1]):
         sum_exp = sum_exp + partials[:, block]
-    # Preserve the trainer's positive zero when target and log(sum_exp) are
-    # both zero. Negating an NLL would instead produce a negative zero.
-    return target - torch.log(sum_exp)
+    normalizer = torch.log(sum_exp)
+    if form == "direct":
+        return target - normalizer
+    return -(normalizer - target)

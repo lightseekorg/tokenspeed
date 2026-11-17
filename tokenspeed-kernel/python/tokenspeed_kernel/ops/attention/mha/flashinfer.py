@@ -143,6 +143,31 @@ if platform.is_blackwell or platform.is_hopper:
 # ------------------------------------------------------------------------------
 
 _workspace_buffer: torch.Tensor | None = None
+# trtllm-gen's multi-CTA KV semaphores, one zeroed buffer per device. The
+# decode kernel resets them at the end of every launch, so every decode shares
+# it; FlashInfer would otherwise zero-fill a fresh buffer per call (one more
+# launch per attention layer).
+_kv_counter_buffers: dict[torch.device, torch.Tensor] = {}
+_KV_COUNTER_BYTES = 1 << 20
+
+
+def _kv_counter_buffer(
+    device: torch.device, batch_size: int, num_qo_heads: int
+) -> torch.Tensor | None:
+    """The device's shared counter buffer, or None (FlashInfer then zero-fills
+    its own) for a decode that needs more semaphores, or while a CUDA graph
+    captures before an eager decode allocated the buffer."""
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    required = get_trtllm_gen_multi_ctas_kv_counter_bytes(
+        batch_size, num_qo_heads, sm_count
+    )
+    if required > _KV_COUNTER_BYTES:
+        return None
+    counter = _kv_counter_buffers.get(device)
+    if counter is None and not torch.cuda.is_current_stream_capturing():
+        counter = torch.zeros(_KV_COUNTER_BYTES, dtype=torch.uint8, device=device)
+        _kv_counter_buffers[device] = counter
+    return counter
 
 
 if platform.is_nvidia and platform.is_hopper_plus:
@@ -260,6 +285,8 @@ if platform.is_nvidia and platform.is_hopper_plus:
             "return_lse": frozenset({False}),
             "sinks": frozenset({False, True}),
             "sliding_window": frozenset({False, True}),
+            # FA3/FA4/flashinfer take no token sink; the Triton leaf does.
+            "window_sink": frozenset({False}),
         },
     )
     def flashinfer_trtllm_mha_decode_with_kvcache(
@@ -314,6 +341,9 @@ if platform.is_nvidia and platform.is_hopper_plus:
             out_dtype=(torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype),
             q_len_per_req=max_seqlen_q,
             enable_pdl=_resolve_enable_pdl(enable_pdl),
+            multi_ctas_kv_counter_buffer=_kv_counter_buffer(
+                q.device, q.shape[0] // max_seqlen_q, q.shape[1]
+            ),
         )
 
 

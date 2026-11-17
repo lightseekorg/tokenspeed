@@ -26,6 +26,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import torch
@@ -83,6 +84,15 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
     # verify() here adds penalties and logit processors with no tree path yet.
     supports_tree_verify = False
 
+    def _init_vocab_shard_buffers(self, config: SamplingBackendConfig) -> None:
+        """No vocab-shard selection: sample() and verify() here apply penalties
+        and logit bias to whole rows, so the logits processor must gather them."""
+        self._vocab_shard_top_k = None
+        self._vocab_shard_staged = None
+        self._vocab_shard_landing = None
+        self._vocab_shard_ids = None
+        self._vocab_shard_values = None
+
     def __init__(self, config: SamplingBackendConfig) -> None:
         super().__init__(config)
         if config.max_req_pool_size <= 0 or config.vocab_size <= 0:
@@ -124,13 +134,13 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
 
     def prepare_step(
         self,
-        request_ids: list[str],
+        admission_ids: Sequence[int],
         request_pool_indices: list[int],
         sampling_params_list: list[SamplingParams],
         num_tokens_per_req: int = 1,
     ) -> None:
         super().prepare_step(
-            request_ids=request_ids,
+            admission_ids=admission_ids,
             request_pool_indices=request_pool_indices,
             sampling_params_list=sampling_params_list,
             num_tokens_per_req=num_tokens_per_req,

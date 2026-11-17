@@ -44,12 +44,12 @@ def _make_topk(correction_bias: torch.Tensor):
     )
 
 
-@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8])
-def test_generic_topk_uses_k3_decode_or_prefill_gluon_route(
+@pytest.mark.parametrize("num_tokens", [1, 2, 4, 8, 512])
+def test_generic_topk_uses_k3_decode_or_packed_route(
     num_tokens: int,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    """FP32 K3 routing uses decode for one row and prefill for multiple rows."""
+    """FP32 K3 routing uses decode for one row and packed for a verify window."""
     generator = torch.Generator(device="cuda").manual_seed(20260720 + num_tokens)
     hidden_states = torch.randn(
         (num_tokens, 7168),
@@ -83,9 +83,9 @@ def test_generic_topk_uses_k3_decode_or_prefill_gluon_route(
         patch_target = decode_topk_module
         patch_name = "decode_sigmoid_bias_topk"
     else:
-        original_route = routing_module.invoke_sigmoid_bias_topk_route_prefill_gluon
-        patch_target = routing_module
-        patch_name = "invoke_sigmoid_bias_topk_route_prefill_gluon"
+        original_route = decode_topk_module.kimi3_sigmoid_bias_topk
+        patch_target = decode_topk_module
+        patch_name = "kimi3_sigmoid_bias_topk"
 
     def spy_route(*args, **kwargs):
         nonlocal route_calls
@@ -149,10 +149,10 @@ def test_generic_topk_uses_prefill_gluon_route(
 ):
     generator = torch.Generator(device="cuda").manual_seed(20260725)
     hidden_states = torch.randn(
-        (9, 7168), device="cuda", dtype=torch.bfloat16, generator=generator
+        (513, 7168), device="cuda", dtype=torch.bfloat16, generator=generator
     )
     router_logits = torch.randn(
-        (9, 896), device="cuda", dtype=torch.float32, generator=generator
+        (513, 896), device="cuda", dtype=torch.float32, generator=generator
     )
     correction_bias = torch.randn(
         (896,), device="cuda", dtype=torch.float32, generator=generator

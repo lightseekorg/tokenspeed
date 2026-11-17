@@ -664,14 +664,13 @@ def _sandwich_fusion_applies(
     group: tuple[int, ...],
 ) -> bool:
     """Whether to try the fused launch: ``--enable-allreduce-fusion``, a
-    group of two or more ranks, ``1 <= T <= --comm-fusion-max-num-tokens``,
-    BF16 tensors and weights and one epsilon for both norms (the fused
-    kernel's contract)."""
+    group of two or more ranks, at least one token, BF16 tensors and weights
+    and one epsilon for both norms (the fused kernel's contract)."""
     return (
         global_server_args_dict.get("enable_allreduce_fusion", False)
         and len(group) > 1
         and post_norm.variance_epsilon == norm.variance_epsilon
-        and 1 <= x.shape[0] <= global_server_args_dict["comm_fusion_max_num_tokens"]
+        and x.shape[0] >= 1
         and all(
             t.dtype == torch.bfloat16
             for t in (x, residual, post_norm.weight, norm.weight)
@@ -695,9 +694,9 @@ def sandwich_rmsnorm_with_allreduce(
 
     The helper a model calls where a tensor-parallel sublayer output meets
     its own output norm, the residual add and the next pre-norm. Under
-    ``--enable-allreduce-fusion`` a call of at most
-    ``--comm-fusion-max-num-tokens`` rows runs as one MNNVL launch when the
-    group's workspace serves it (``allreduce_sandwich_rmsnorm``); every other
+    ``--enable-allreduce-fusion`` a call runs as one MNNVL launch per slice of
+    rows the group's workspace holds when that workspace serves it
+    (``allreduce_sandwich_rmsnorm``); every other
     call all-reduces ``x`` through the runtime backend and runs
     :func:`sandwich_rmsnorm`. The two paths perform the same operations with
     the same BF16 rounding points. The fused launch sums the partials as the

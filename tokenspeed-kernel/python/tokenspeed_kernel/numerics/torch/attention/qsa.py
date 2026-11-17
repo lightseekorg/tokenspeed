@@ -19,14 +19,91 @@
 # SOFTWARE.
 
 """PyTorch references for ``tokenspeed_kernel.ops.attention.qsa``: the block
-scorer and attention over the selected cache slots."""
+scorer, attention over the selected cache slots and the BF16 KV scratch."""
 
 from __future__ import annotations
 
 import torch
 from tokenspeed_kernel.numerics.torch.attention.mha import torch_dense_attention
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.signature import (
+    dense_tensor_format,
+    format_signature,
+    format_signatures,
+)
+
+
+@register_kernel(
+    "attention",
+    "qsa_bf16_kv_scratch",
+    name="torch_qsa_bf16_kv_scratch",
+    solution="torch",
+    signatures=frozenset(
+        {
+            format_signature(
+                k_cache=dense_tensor_format(torch.float8_e4m3fn),
+                k_scratch=dense_tensor_format(torch.bfloat16),
+            )
+        }
+    ),
+    priority=Priority.REFERENCE,
+)
+def torch_qsa_bf16_kv_scratch(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    selected_slots: torch.Tensor,
+    page_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    num_requests: int,
+    page_size: int,
+    scratch_pages: int,
+    k_scratch: torch.Tensor,
+    v_scratch: torch.Tensor,
+    page_map: torch.Tensor,
+    out_slots: torch.Tensor,
+    enable_pdl: bool,
+) -> torch.Tensor:
+    """Copy each request's pages to consecutive BF16 scratch pages, remap slots.
+
+    Request ``r``'s page-table columns ``[0, ceil(seq_lens[r] / page_size))``
+    follow the previous requests' pages from scratch page 1; pages from
+    ``scratch_pages`` on are not written. ``page_map[p]`` records the scratch
+    page of every copied cache page ``p``. A positive slot ``p * page_size +
+    o`` becomes ``page_map[p] * page_size + o``, or ``-1`` when that entry
+    names no page below ``scratch_pages``; padding is unchanged.
+
+    Returns:
+        ``out_slots``.
+    """
+    del enable_pdl
+    num_pool_pages = -(-k_cache.shape[0] // page_size)
+    first = 1
+    for request, length in enumerate(seq_lens[:num_requests].tolist()):
+        count = -(-max(int(length), 0) // page_size)
+        for column in range(count):
+            scratch_page = first + column
+            physical = int(page_table[request, column])
+            if scratch_page >= scratch_pages or not 0 <= physical < num_pool_pages:
+                continue
+            page_map[physical] = scratch_page
+            start = physical * page_size
+            rows = min(page_size, k_cache.shape[0] - start)
+            target = scratch_page * page_size
+            k_scratch[target : target + rows] = k_cache[start : start + rows].float()
+            v_scratch[target : target + rows] = v_cache[start : start + rows].float()
+        first += count
+    slots = selected_slots.long()
+    valid = slots > 0
+    pages = torch.where(valid, slots, 0) // page_size
+    in_pool = valid & (pages < num_pool_pages)
+    entries = torch.where(
+        in_pool, page_map.long()[pages.clamp(max=page_map.numel() - 1)], 0
+    )
+    mapped = in_pool & (entries > 0) & (entries < scratch_pages)
+    remapped = torch.where(mapped, entries * page_size + slots % page_size, -1)
+    out_slots.copy_(torch.where(valid, remapped, slots))
+    return out_slots
 
 
 @register_kernel(

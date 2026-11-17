@@ -80,6 +80,15 @@ public:
     // became dead meanwhile; one that waits for none settles here. nullopt
     // when nothing is copied.
     std::optional<WriteBackOperation> StartEvictionStores();
+    // A checkpoint demotion (CacheCoordinator::DemoteEntries) while an
+    // eviction write-back still carries some of `keys` to the Host: each such
+    // member's segment publishes it demoted, dated at the demoted epoch
+    // instead of its Device entry's. A Host entry the Host held already, which
+    // the segment holds to publish into and whose newer date its settlement
+    // would keep, is demoted now, unless something else holds it too. Returns
+    // the entries it demoted: the members that publish a new Host entry, and
+    // the Host entries.
+    std::int32_t DemoteInFlightEvictions(std::span<const CacheKey> keys);
     LoadBackOperation StartPrefixLoad(std::vector<BlockTransfer> block_transfers);
 
     // A retraction image and the two store ops that fill it. The L2 leg is a
@@ -112,9 +121,9 @@ public:
         std::vector<ImageSlot> slots;
         // The rows by boundary, one per content hash with every group's rows
         // at it, the shallowest first.
-        std::vector<CacheCoordinator::HostSegmentRows> boundaries;
+        std::vector<HostCache::HostSegmentRows> boundaries;
         // The Host takes the rows of the first num_host_boundaries
-        // (CacheCoordinator::NumHostBoundariesThatFit), the snapshot pool every
+        // (HostCache::NumHostBoundariesThatFit), the snapshot pool every
         // later one.
         std::size_t num_host_boundaries{0};
         // kSnapshotPool when the pool cannot hold the image even with every
@@ -149,9 +158,11 @@ public:
     // slot (shared) and the request-pool row the blob is imported into
     // (owned here until the ACK, then handed back by CompleteSnapshotRestore)
     // stay pinned until the ACK, so an abort while Restoring cannot re-grant a
-    // page, slot or row the copy is still writing. access_epoch is the
+    // page, slot or row the copy is still writing. A resumed decode's execution
+    // permit is also held here, even if the request is cancelled. access_epoch is the
     // request's, which the ACK's republication dates the L2 rows with.
     SnapshotRestoreOperation StartSnapshotRestore(const std::string& request_id, ReqPoolIndex request_pool_index,
+                                                  DecodeSlotIndex decode_slot,
                                                   std::shared_ptr<SnapshotSlotIndex> blob_slot,
                                                   std::vector<BlockTransfer> load_pairs,
                                                   std::vector<BlockTransfer> snapshot_pairs,
@@ -176,14 +187,18 @@ public:
     // scheduler can register the KV-event descriptors the republication
     // mutates and decide whether the request is still there to resume.
     std::optional<std::string> SnapshotRestoreRequest(std::uint32_t op_id) const;
-    // Drops the restore's pins and returns the request-pool row the op
-    // imported into (invalid for an unknown or duplicate op id): the caller
+    struct RestoredSlots {
+        ReqPoolIndex request_pool_index;
+        DecodeSlotIndex decode_slot;
+    };
+    // Drops the restore's pins and returns its row and any decode permit
+    // (invalid for an unknown or duplicate op id): the caller
     // installs it in the resumed state, or lets it drop when the request was
     // finished or aborted while restoring. With publish, the L2-tier
     // destinations are republished into the Device prefix index first; the
     // caller passes false for a dead request (its token descriptors are gone
     // with it, and the pages return to the pool with the pins).
-    ReqPoolIndex CompleteSnapshotRestore(std::uint32_t op_id, bool publish);
+    RestoredSlots CompleteSnapshotRestore(std::uint32_t op_id, bool publish);
 
     bool HasLoadBacksInFlight() const { return !load_backs_.empty(); }
     // Pinned stores hold Device capacity that returns by itself at the ACK;
@@ -265,7 +280,7 @@ private:
     // the ops carrying its members (its own drain's, and earlier ones it
     // borrowed a member from).
     struct InFlightSegment {
-        CacheCoordinator::EvictedSegment segment;
+        CacheEvictor::EvictedSegment segment;
         std::vector<StoreWait> stores;
     };
 
@@ -284,8 +299,11 @@ private:
         std::vector<BlockTransfer> transfers;
         std::shared_ptr<SnapshotSlotIndex> blob_slot;
         ReqPoolIndex request_pool_index;
+        DecodeSlotIndex decode_slot;
         std::uint64_t access_epoch{0};
     };
+    // Wraps by design: an id only tells in-flight ops apart, and none stays in
+    // flight across 2^32 later ops. The width is the wire format's.
     std::uint32_t nextOpId() { return next_op_id_++; }
     LoadBackOperation startLoadBack(std::vector<BlockTransfer> block_transfers);
     std::vector<CacheTransfer> resolveTransfers(std::span<const BlockTransfer> block_transfers) const;

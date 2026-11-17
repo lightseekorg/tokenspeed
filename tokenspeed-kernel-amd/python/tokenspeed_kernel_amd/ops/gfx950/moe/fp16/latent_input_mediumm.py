@@ -42,7 +42,7 @@ runs leftover K tiles inside the pipeline rather than after the drain. The
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel_amd._triton import gl, gluon, triton
+from tokenspeed_kernel_amd._triton import compile_ahead, gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (
     _mfma_lds_gload_layout_a,
     _mfma_lds_gload_layout_b,
@@ -111,7 +111,7 @@ def _next_k_tile(
     return gl.where(wrap, 0, k_tile), a_offsets, b_offsets
 
 
-@gluon.jit(launch_metadata=_mediumm_launch_metadata)
+@gluon.jit(launch_metadata=_mediumm_launch_metadata, do_not_specialize=("M",))
 def gluon_latent_input_mediumm_gfx950(
     a_ptr,
     b_ptr,
@@ -423,6 +423,7 @@ def launch_gluon_latent_input_mediumm_gfx950(
     *,
     beta: float,
     linear_beta: float | None,
+    warm_variants: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Project K3's packed weight and apply SiTU.
 
@@ -434,6 +435,8 @@ def launch_gluon_latent_input_mediumm_gfx950(
         packed_weight: View covering the three weight regions.
         beta: Positive gate clamp.
         linear_beta: Optional positive up clamp.
+        warm_variants: Also compile the row tile the other side of
+            ``_UPPER_M_THRESHOLD`` picks, for startup warmup.
 
     Returns:
         FP32 router logits, BF16 routed latent, and BF16 shared input.
@@ -453,8 +456,7 @@ def launch_gluon_latent_input_mediumm_gfx950(
     routed = torch.empty((m, _K3_ROUTED), dtype=torch.bfloat16, device=device)
     shared = torch.empty((m, _K3_SHARED), dtype=torch.bfloat16, device=device)
     block_m = _BLOCK_M if m <= _UPPER_M_THRESHOLD else _BLOCK_M_UPPER
-    warps_m, warps_n = _WARPS[block_m]
-    gluon_latent_input_mediumm_gfx950[(triton.cdiv(m, block_m), _K3_TOTAL // _BLOCK_N)](
+    args = (
         hidden_states,
         packed_weight,
         router,
@@ -472,21 +474,35 @@ def launch_gluon_latent_input_mediumm_gfx950(
         router.stride(0),
         routed.stride(0),
         shared.stride(0),
+    )
+    common = dict(
         K=_K3_HIDDEN,
         ROUTER_N=_K3_ROUTER,
         ROUTED_N=_K3_ROUTED,
         SHARED_N=_K3_SHARED,
         HAS_LINEAR_BETA=linear_beta is not None,
-        BLOCK_M=block_m,
         BLOCK_N=_BLOCK_N,
         BLOCK_K=_BLOCK_K,
-        WARPS_M=warps_m,
-        WARPS_N=warps_n,
         NUM_BUFFERS=_NUM_BUFFERS,
         NUM_XCDS=_NUM_XCDS,
-        XCD_SCHEDULE=_XCD_SCHEDULE[block_m],
-        num_warps=warps_m * warps_n,
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
+    )
+
+    def tile(rows: int) -> dict:
+        warps_m, warps_n = _WARPS[rows]
+        return common | dict(
+            BLOCK_M=rows,
+            WARPS_M=warps_m,
+            WARPS_N=warps_n,
+            XCD_SCHEDULE=_XCD_SCHEDULE[rows],
+            num_warps=warps_m * warps_n,
+        )
+
+    if warm_variants:
+        for rows in _WARPS:
+            compile_ahead(gluon_latent_input_mediumm_gfx950, *args, **tile(rows))
+    gluon_latent_input_mediumm_gfx950[(triton.cdiv(m, block_m), _K3_TOTAL // _BLOCK_N)](
+        *args, **tile(block_m)
     )
     return router, routed, shared
 

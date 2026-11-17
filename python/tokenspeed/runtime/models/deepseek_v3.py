@@ -43,7 +43,6 @@ from tokenspeed_kernel.ops.attention.prologue import MLAExpandedKV, MLAPrologueO
 from tokenspeed_kernel.ops.gemm import bmm, mm, plan_dense_gemm
 from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
 from tokenspeed_kernel.ops.gemm.trtllm import dsv3_fused_a_gemm
-from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 from transformers import PretrainedConfig
@@ -83,10 +82,6 @@ from tokenspeed.runtime.execution.context import (
     report_collective_sizing,
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.execution.forward_step import (
-    get_is_capture_mode,
-    get_is_cuda_graph_phase,
-)
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
 from tokenspeed.runtime.layers.linear import (
@@ -97,6 +92,7 @@ from tokenspeed.runtime.layers.linear import (
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
 from tokenspeed.runtime.layers.mlp import GatedMLP, GatedMLPFusion, gated_activation
+from tokenspeed.runtime.layers.moe.block import MoEBlock, MoEBlockFusion
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.topk import TopK
 from tokenspeed.runtime.layers.moe.utils import RoutingMethodType
@@ -116,7 +112,7 @@ from tokenspeed.runtime.layers.quantization.utils import (
     block_dequant,
     should_exclude_quant_module,
 )
-from tokenspeed.runtime.layers.rotary_embedding import get_rope
+from tokenspeed.runtime.layers.rotary_embedding import get_rope, yarn_get_mscale
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -126,7 +122,10 @@ from tokenspeed.runtime.model_loader.weight_utils import (
     default_weight_loader,
 )
 from tokenspeed.runtime.models.base import BaseCausalLM
-from tokenspeed.runtime.models.base.decoder_layer import capture_layer_input
+from tokenspeed.runtime.models.base.decoder_layer import (
+    BaseDecoderLayer,
+    capture_layer_input,
+)
 from tokenspeed.runtime.models.base.transformer_model import notify_target_capture
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.utils import (
@@ -134,7 +133,6 @@ from tokenspeed.runtime.utils import (
     add_prefix,
     get_colorful_logger,
 )
-from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import initialize_communication
 
@@ -154,11 +152,17 @@ def _prepare_mla_kv_b_proj_weights(
     When ``self_attn`` already holds a pair of the same geometry (a live
     weight update re-running ``post_load_weights``), the new values are
     copied into it so captured CUDA graphs keep valid addresses.
+
+    An attention with ``absorbed_weights_k_major`` set runs both absorbed
+    products as plain GEMMs and keeps their reduction dim contiguous
+    regardless of the fused value-projection kernel's preference.
     """
     w_kc, w_vc = w.unflatten(
         0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
     ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
-    if mla_project_value_prefers_contiguous_weight(
+    if not getattr(
+        self_attn, "absorbed_weights_k_major", False
+    ) and mla_project_value_prefers_contiguous_weight(
         dtype=w.dtype,
         heads=w_vc.shape[0],
         latent_dim=w_vc.shape[2],
@@ -297,7 +301,7 @@ class DeepseekV3MLP(GatedMLP):
         super().__init__(
             gate_up_proj,
             down_proj,
-            gated_activation(hidden_act),
+            gated_activation(hidden_act, swiglu_limit=None),
             fusions=(GatedMLPFusion.NVFP4_GEMM_SWIGLU_QUANT,),
         )
         self.mapping = mapping
@@ -354,7 +358,7 @@ class MoEGate(nn.Module):
         return logits
 
 
-class DeepseekV3MoE(nn.Module):
+class DeepseekV3MoE(MoEBlock):
     def __init__(
         self,
         config: PretrainedConfig,
@@ -364,38 +368,32 @@ class DeepseekV3MoE(nn.Module):
         prefix: str = "",
         alt_stream: torch.cuda.Stream | None = None,
     ):
-        super().__init__()
-        self.mapping = mapping
-        self.layer_index = layer_index
-        self.n_shared_experts = config.n_shared_experts
-        self.routed_scaling_factor = config.routed_scaling_factor
-        self.stream_fork = StreamFork(alt_stream)
-
-        if self.mapping.moe.ep_size > config.n_routed_experts:
+        if mapping.moe.ep_size > config.n_routed_experts:
             raise ValueError(
-                f"EP size {self.mapping.moe.ep_size} is greater than the number of experts {config.n_routed_experts}."
+                f"EP size {mapping.moe.ep_size} is greater than the number of experts {config.n_routed_experts}."
             )
         if config.hidden_act != "silu":
             raise ValueError(
                 f"Unsupported activation: {config.hidden_act}. Only silu is supported for now."
             )
 
-        self.gate = MoEGate(config=config, prefix=add_prefix("gate", prefix))
+        gate = MoEGate(config=config, prefix=add_prefix("gate", prefix))
 
+        shared_experts = None
         if config.n_shared_experts is not None:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
-            self.shared_experts = DeepseekV3MLP(
+            shared_experts = DeepseekV3MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=intermediate_size,
                 hidden_act=config.hidden_act,
-                mapping=self.mapping,
+                mapping=mapping,
                 quant_config=quant_config,
                 prefix=add_prefix("shared_experts", prefix),
                 is_shared_expert=True,
                 batch_invariant=False,
             )
 
-        self.experts = MoELayer(
+        experts = MoELayer(
             top_k=config.num_experts_per_tok,
             num_experts=config.n_routed_experts,
             hidden_size=config.hidden_size,
@@ -403,105 +401,42 @@ class DeepseekV3MoE(nn.Module):
             quant_config=quant_config,
             layer_index=layer_index,
             prefix=prefix,
-            tp_rank=self.mapping.moe.tp_rank,
-            tp_size=self.mapping.moe.tp_size,
-            ep_rank=self.mapping.moe.ep_rank,
-            ep_size=self.mapping.moe.ep_size,
+            tp_rank=mapping.moe.tp_rank,
+            tp_size=mapping.moe.tp_size,
+            ep_rank=mapping.moe.ep_rank,
+            ep_size=mapping.moe.ep_size,
             routing_mode=getattr(config, "moe_routing_mode", None),
             routing_config={
                 "n_group": getattr(config, "n_group", 0),
                 "topk_group": getattr(config, "topk_group", 0),
                 "routed_scaling_factor": getattr(config, "routed_scaling_factor", 1.0),
                 "normalize_topk_weights": config.norm_topk_prob,
-                "correction_bias": self.gate.e_score_correction_bias,
+                "correction_bias": gate.e_score_correction_bias,
                 "routing_method_type": RoutingMethodType.DeepSeekV3,
                 "precision_policy": getattr(config, "moe_precision_policy", "default"),
                 "output_scale": getattr(config, "moe_output_scale", 1.0),
             },
         )
 
-        self.topk = TopK(
+        topk = TopK(
             top_k=config.num_experts_per_tok,
             renormalize=config.norm_topk_prob,
             use_grouped_topk=True,
             num_expert_group=config.n_group,
             num_fused_shared_experts=0,
             topk_group=config.topk_group,
-            correction_bias=self.gate.e_score_correction_bias,
-            routed_scaling_factor=self.routed_scaling_factor,
-            output_format=self.experts.topk_output_format,
+            correction_bias=gate.e_score_correction_bias,
+            routed_scaling_factor=config.routed_scaling_factor,
+            output_format=experts.topk_output_format,
         )
-
-    def get_moe_routed_weights(self):
-        return [
-            x.data
-            for name, x in self.experts.named_parameters()
-            if name not in ["correction_bias"] and "shared_experts" not in name
-        ]
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        num_global_tokens: int,
-        max_num_tokens_per_gpu: int,
-    ) -> torch.Tensor:
-        num_tokens = hidden_states.size(0)
-
-        # Warm the shared-expert branch serially on its capture stream, then
-        # overlap it with routed experts during capture.
-        with self.stream_fork.scope(
-            enable=get_is_cuda_graph_phase(), overlap=get_is_capture_mode()
-        ) as fork:
-            # router_logits: (num_tokens, n_experts)
-            router_logits = self.gate(hidden_states)
-            if num_tokens > 0:
-                topk_output = self.topk(hidden_states, router_logits)
-            else:
-                topk_output = self.topk.empty_topk_output(
-                    hidden_states.device,
-                    hidden_states=hidden_states,
-                    router_logits=router_logits,
-                )
-
-            deferred_finalize = self.experts.supports_deferred_cuda_finalize
-            routed_expert_output = self.experts(
-                hidden_states=hidden_states,
-                topk_output=topk_output,
-                num_global_tokens=num_global_tokens,
-                max_num_tokens_per_gpu=max_num_tokens_per_gpu,
-                do_finalize=not deferred_finalize,
-            )
-
-            shared_output = None
-            with fork.branch():
-                if self.n_shared_experts is not None and num_tokens > 0:
-                    shared_output = self.shared_experts(hidden_states)
-
-        if deferred_finalize:
-            gemm2_out, expert_weights, expanded_idx = routed_expert_output
-            final_hidden_states = moe_finalize_fuse_shared(
-                gemm2_out,
-                expanded_idx,
-                expert_weights,
-                shared_output,
-                top_k=self.topk.topk_config.top_k,
-                hidden_dim=hidden_states.shape[-1],
-            )
-        else:
-            final_hidden_states = (
-                routed_expert_output + shared_output
-                if shared_output is not None
-                else routed_expert_output
-            )
-        return final_hidden_states
-
-
-def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
-    import math
-
-    if scale <= 1:
-        return 1.0
-    return 0.1 * mscale * math.log(scale) + 1.0
+        super().__init__(
+            gate,
+            topk,
+            experts,
+            shared_experts,
+            alt_stream,
+            fusions=(MoEBlockFusion.FINALIZE_ADD_SHARED,),
+        )
 
 
 class DeepseekV3FusedQkvAProjWithMqa(ReplicatedLinear):
@@ -1813,7 +1748,7 @@ class DeepseekV3DraftAttentionMLA(DeepseekV3AttentionMLA):
         return ctx.bs
 
 
-class DeepseekV3DecoderLayer(nn.Module):
+class DeepseekV3DecoderLayer(BaseDecoderLayer[PretrainedConfig]):
     @property
     def attention_cls(self) -> type[nn.Module]:
         return DeepseekV3AttentionMLA
@@ -1828,16 +1763,33 @@ class DeepseekV3DecoderLayer(nn.Module):
         prefix: str = "",
         alt_stream: torch.cuda.Stream | None = None,
     ) -> None:
-        super().__init__()
-        self.mapping = mapping
+        # Set before the base constructor, whose resolve_*() hooks read them.
+        self.is_nextn = is_nextn
+        self.alt_stream = alt_stream
+        super().__init__(config, layer_id, mapping, quant_config, prefix)
         self.hidden_size = config.hidden_size
-        rope_theta = get_rope_theta(config)
-        rope_scaling = getattr(config, "rope_scaling", None)
-        max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
 
-        self.self_attn = self.attention_cls(
+    @property
+    def is_moe_layer(self) -> bool:
+        return self._is_moe_layer(self.layer_id, self.is_nextn, self.config)
+
+    @property
+    def is_prev_moe_layer(self) -> bool:
+        return self._is_moe_layer(self.layer_id - 1, self.is_nextn, self.config)
+
+    @property
+    def dense_batch_invariant(self) -> bool:
+        return (
+            global_server_args_dict["tp_batch_invariant"] == "attn+dense"
+            and not self.is_moe_layer
+        )
+
+    def attention_kwargs(self, prefix: str) -> dict:
+        """Keyword arguments of ``attention_cls``."""
+        config = self.config
+        return dict(
             config=config,
-            hidden_size=self.hidden_size,
+            hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
             qk_nope_head_dim=config.qk_nope_head_dim,
             qk_rope_head_dim=config.qk_rope_head_dim,
@@ -1846,69 +1798,52 @@ class DeepseekV3DecoderLayer(nn.Module):
                 config.q_lora_rank if hasattr(config, "q_lora_rank") else None
             ),
             kv_lora_rank=config.kv_lora_rank,
-            rope_theta=rope_theta,
-            rope_scaling=rope_scaling,
-            max_position_embeddings=max_position_embeddings,
+            rope_theta=get_rope_theta(config),
+            rope_scaling=getattr(config, "rope_scaling", None),
+            max_position_embeddings=getattr(config, "max_position_embeddings", 8192),
             quant_config=(
                 None
                 if "self_attn" in getattr(config, "disable_quant_module", [])
-                else quant_config
+                else self.quant_config
             ),
-            layer_id=layer_id,
+            layer_id=self.layer_id,
             prefix=add_prefix("self_attn", prefix),
             reduce_attn_results=False,
-            alt_stream=alt_stream,
+            alt_stream=self.alt_stream,
             mapping=self.mapping,
         )
 
-        self.layer_id = layer_id
-        self.is_moe_layer = self._is_moe_layer(layer_id, is_nextn, config)
-        # --tp-batch-invariant attn+dense: the dense tail transposes rows
-        # instead of reduce-scattering head/channel partials.
-        dense_batch_invariant = (
-            global_server_args_dict["tp_batch_invariant"] == "attn+dense"
-        )
+    def resolve_attn(self, prefix: str) -> nn.Module:
+        return self.attention_cls(**self.attention_kwargs(prefix))
+
+    def resolve_mlp(self, prefix: str) -> nn.Module:
+        config = self.config
         if self.is_moe_layer:
-            self.mlp = DeepseekV3MoE(
+            return DeepseekV3MoE(
                 config=config,
                 mapping=self.mapping,
-                quant_config=quant_config,
-                layer_index=layer_id,
+                quant_config=self.quant_config,
+                layer_index=self.layer_id,
                 prefix=add_prefix("mlp", prefix),
-                alt_stream=alt_stream,
+                alt_stream=self.alt_stream,
             )
-        else:
-            self.mlp = DeepseekV3MLP(
-                hidden_size=config.hidden_size,
-                intermediate_size=(
-                    config.ffn_hidden_size
-                    if hasattr(config, "ffn_hidden_size")
-                    else config.intermediate_size
-                ),
-                hidden_act=config.hidden_act,
-                mapping=self.mapping,
-                quant_config=(
-                    None
-                    if "dense_mlp" in getattr(config, "disable_quant_module", [])
-                    else quant_config
-                ),
-                prefix=add_prefix("mlp", prefix),
-                is_shared_expert=False,
-                batch_invariant=dense_batch_invariant,
-            )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.comm_manager = CommManager(
+        return DeepseekV3MLP(
+            hidden_size=config.hidden_size,
+            intermediate_size=(
+                config.ffn_hidden_size
+                if hasattr(config, "ffn_hidden_size")
+                else config.intermediate_size
+            ),
+            hidden_act=config.hidden_act,
             mapping=self.mapping,
-            layer_id=self.layer_id,
-            is_moe=self.is_moe_layer,
-            prev_is_moe=self._is_moe_layer(layer_id - 1, is_nextn, config),
-            input_layernorm=self.input_layernorm,
-            post_attn_layernorm=self.post_attention_layernorm,
-            dense_batch_invariant=dense_batch_invariant and not self.is_moe_layer,
-            query_sharded=False,
+            quant_config=(
+                None
+                if "dense_mlp" in getattr(config, "disable_quant_module", [])
+                else self.quant_config
+            ),
+            prefix=add_prefix("mlp", prefix),
+            is_shared_expert=False,
+            batch_invariant=self.dense_batch_invariant,
         )
 
     @staticmethod
@@ -1923,45 +1858,19 @@ class DeepseekV3DecoderLayer(nn.Module):
             return True
         return False
 
-    def forward(
+    def forward_attn(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
         residual: torch.Tensor | None,
         aux_hidden_states: list[torch.Tensor] | None = None,
-    ) -> torch.Tensor:
-
-        num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
-            ctx
-        )
-
-        if ctx.forward_mode.is_idle():
-            # No rows of its own: the attention joins its group's collectives
-            # if the layout has any (the attention decides), then the MLP's.
-            self.self_attn(
-                positions=positions,
-                hidden_states=hidden_states,
-                ctx=ctx,
-                comm_manager=self.comm_manager,
-            )
-            # No rows, but the tap and its gather stay aligned across ranks.
-            capture_layer_input(
-                self.comm_manager, hidden_states, ctx, aux_hidden_states
-            )
-            hidden_states = self.forward_mlp(
-                hidden_states,
-                residual,
-                ctx,
-                num_global_tokens,
-                max_num_tokens_per_gpu,
-            )
-            return hidden_states, residual
-
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         hidden_states, residual = self.comm_manager.input_reduce_norm(
             hidden_states, residual
         )
         capture_layer_input(self.comm_manager, residual, ctx, aux_hidden_states)
+        # The attention runs its own communication.
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -1972,14 +1881,24 @@ class DeepseekV3DecoderLayer(nn.Module):
         hidden_states, residual = self.comm_manager.post_attn_reduce_norm(
             hidden_states, residual, ctx
         )
-        hidden_states = self.forward_mlp(
-            hidden_states,
-            residual,
-            ctx,
-            num_global_tokens,
-            max_num_tokens_per_gpu,
-        )
         return hidden_states, residual
+
+    def forward_idle_attn(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        ctx: ForwardContext,
+        aux_hidden_states: list[torch.Tensor] | None,
+    ) -> None:
+        # No rows of its own: the attention joins its group's collectives, if any.
+        self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            ctx=ctx,
+            comm_manager=self.comm_manager,
+        )
+        # No rows, but the tap and its gather stay aligned across ranks.
+        capture_layer_input(self.comm_manager, hidden_states, ctx, aux_hidden_states)
 
     def narrow_residual(
         self, residual: torch.Tensor, ctx: ForwardContext
@@ -1987,26 +1906,6 @@ class DeepseekV3DecoderLayer(nn.Module):
         """Align the residual with the attention output's rows; the draft
         layer narrows it to the live rows on a narrowing step."""
         return residual
-
-    def forward_mlp(
-        self,
-        hidden_states,
-        residual,
-        ctx: ForwardContext,
-        num_global_tokens,
-        max_num_tokens_per_gpu,
-    ):
-        hidden_states = self.comm_manager.pre_mlp_comm(hidden_states, ctx)
-        if self.is_moe_layer:
-            hidden_states = self.mlp(
-                hidden_states, num_global_tokens, max_num_tokens_per_gpu
-            )
-        else:
-            hidden_states = self.mlp(hidden_states)
-        hidden_states, residual = self.comm_manager.post_mlp_fused(
-            hidden_states, residual, ctx
-        )
-        return hidden_states
 
 
 class DeepseekV3Model(nn.Module):
@@ -2702,6 +2601,7 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
             tp_rank=self.mapping.lm_head.tp_rank,
             tp_size=self.mapping.lm_head.tp_size,
             tp_group=self.mapping.lm_head.tp_group,
+            attn_tp_size=self.mapping.attn.tp_size,
             dp_lm_head_tp=self.mapping.attn.has_dp and self.mapping.lm_head.has_tp,
         )
         self.capture_aux_hidden_states = True

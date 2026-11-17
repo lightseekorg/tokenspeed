@@ -82,6 +82,7 @@ def _run_scenario() -> None:
     )
     engine.record_scheduler_iteration(
         running=3,
+        inflight=5,
         waiting=2,
         num_active_pages=10,
         num_total_pages=40,
@@ -89,6 +90,7 @@ def _run_scenario() -> None:
     )
     engine.record_scheduler_iteration(
         running=1,
+        inflight=4,
         waiting=0,
         num_active_pages=4,
         num_total_pages=40,
@@ -110,6 +112,29 @@ def _run_scenario() -> None:
     engine.record_preemptions(2)
     engine.observe_request_queue_time(0.4)
     engine.observe_request_queue_time(9000.0)
+    engine.record_cache_occupancy(
+        used_pages=12, active_pages=8, total_pages=40, token_capacity=647
+    )
+    engine.record_prefill_queues(prealloc=1, inflight=2, retracted=0)
+    engine.record_decode_queues(prealloc=3, kv_wait=2, transfer=4, retracted=1)
+    engine.record_generation_tokens(25)
+    engine.record_request_tokens(prompt_tokens=100, cache_hit_tokens=40)
+    engine.observe_time_to_first_token(float("inf"))
+    engine.observe_time_to_first_token(0.25)
+    engine.observe_request_time(float("inf"))
+    engine.observe_request_time(1.5)
+    engine.observe_decode_time(float("inf"))
+    engine.observe_decode_time(1.2)
+    engine.observe_time_per_output_token(float("inf"))
+    engine.observe_time_per_output_token(0.02)
+    engine.record_completion_tokens(5)
+    engine.record_grammar_queue(2)
+    engine.record_prefix_hits(
+        prompt_tokens=100,
+        device_hit_tokens=40,
+        host_hit_tokens=30,
+        l3_hit_tokens=10,
+    )
 
     transfer = KVTransferMetrics(
         labels={"model_name": "m", "app_key": ""},
@@ -120,6 +145,7 @@ def _run_scenario() -> None:
     transfer.record_kv_transfer_timeout("bootstrapping")
     transfer.record_kv_transfer_timeout("waiting_for_input")
     transfer.record_kv_transfer_failure()
+    transfer.record_kv_transfer_size(4096)
 
 
 def build_fixtures() -> dict[str, str]:

@@ -92,7 +92,7 @@ def _prepare_coins(backend, kept_lengths):
         for row in range(LIVE_ROWS)
     ]
     backend.prepare_step(
-        [f"cumulative-chain-{row}" for row in range(LIVE_ROWS)],
+        [row + 1 for row in range(LIVE_ROWS)],
         list(range(1, LIVE_ROWS + 1)),
         params,
         num_tokens_per_req=WIDTH,
@@ -181,7 +181,7 @@ def _reference_target_mass(logits, tokens):
     [
         ("batch", "torch", "auto"),
         ("per-request", "torch", "auto"),
-        ("per-request", "megatron", "rl-bitwise"),
+        ("per-request", "blockwise", "rl-bitwise"),
     ],
 )
 @pytest.mark.parametrize("use_graph", [False, True], ids=["eager", "cuda_graph"])

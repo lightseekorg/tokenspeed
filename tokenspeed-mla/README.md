@@ -11,6 +11,7 @@ Speed-of-light TokenSpeed MLA kernels for `SM100/SM103/SM107` with:
   - Split-KV + workspace path with runtime auto-sizing and compile caching
 - `MLA K/V pack + FP8 quantize`:
   - Fused Triton kernel replacing `cat + cast + cast` in chunked prefill
+  - Groups adjacent token/head rows, preserving FP32 scaling and FP8 rounding
   - Supports strided views and optional pre-allocated output buffers
 
 This package includes performance-oriented optimizations for latency-sensitive
@@ -99,11 +100,49 @@ per-row causal positions and predicates partial output/LSE rows.
 For packed queries, auto split-KV uses `ceil(H * q_len / 128)` query tiles,
 and workspace needs `B * 128 * ceil(H * q_len / 128) * split_kv * 513 * 4`
 bytes for D512/FP32 partials, or zero when split-KV is one. Callers must
-provide sufficient workspace for the selected layout. Output shape, output dtype
+provide sufficient workspace for the selected layout. Device offsets multiply
+element counts by bytes per element; forming an intermediate bit count can
+overflow Int32 for partial-output buffers of 256 MiB or larger.
+Output shape, output dtype
 (BF16 for FP8; input dtype for FP16/BF16), and base-2 LSE semantics are unchanged.
 The FP16/BF16 implementation retains its existing split-KV heuristic, reducer
 capacity and PDL waits. The selected layout is part of the compile cache key.
 The wrapper keeps tiling, workspace sizing, and kernel selection consistent.
+
+A uniform split cuts every request of the batch into `split_kv` chunks, so in
+a batch of very different lengths the longest request sets the kernel time.
+FP8, BF16 and FP16 decode can instead take per-request split counts
+(`block_split_kvs`). `tokenspeed_mla_decode_split_kvs` takes the decode dtype
+and uses the uniform split's chunk budget, subject to rounding and caps, to
+give requests chunks of about the same length. One Triton launch reduces the
+lengths in int64 and writes counts, exclusive split offsets and a chunk map
+into the caller's buffers. Reserve map entries with
+`tokenspeed_mla_decode_task_capacity(B, H, q_len, min_split_kv, num_sms)` and
+pass that int64 buffer as the planner's fourth argument. Each entry packs the
+request index in the high 32 bits and the split index in the low 32 bits.
+Pass `block_split_kvs`, `block_split_offsets` and `block_split_tasks` to decode.
+`is_var_split_kv` selects the kernel mode: uniform splitting keeps its original
+workspace; per-request splitting uses the compact workspace and requires all
+three metadata buffers together. Each request can use up to
+`max(32, min_split_kv)` splits (`PER_REQUEST_SPLIT_KV_CAPACITY`), reduced to
+avoid empty partitions. The launch grid is `(cluster_m * query_tiles,
+chunk_capacity, 1)`: adjacent query tiles share a KV chunk, and each cluster
+looks up its request and split directly rather than searching offsets.
+The map capacity bounds the aggregate chunk budget plus rounding; padding
+clusters use empty splits through the existing pipeline lifecycle. Scheduler
+validity remains static, preserving warp-specialized code generation.
+The partial results share a compact split axis across requests. Reserve bytes with
+`tokenspeed_mla_decode_workspace_size`: total slots are bounded by the uniform
+chunk budget plus `B - 1` for rounding, rather than `B` times the grid width.
+The startup bound covers all batches up to the configured maximum. Counts and
+offsets and the chunk map are refreshed in place between CUDA graph replays,
+without recompilation. A sliced batch keeps the original plan's entire chunk
+map and slices only counts and offsets; the kernel rebases its request indices.
+Target verification, chain drafting, multi-depth MTP and block drafting
+refresh the same metadata when their cache lengths change. With compacted
+KVP/DCP pages, planning follows the local-length refresh and uses the gathered
+query-head count. Ranks choose their counts independently; the output/LSE
+merge is unchanged. Sliding-window and interleaved-CP calls keep uniform splits.
 
 Sliding-window and DCP masking remain supported; window boundaries use the
 packed row's original query-token position.
@@ -184,11 +223,14 @@ tile utilization as well as batch size and split-KV scheduling.
 Other optimizations include:
 
 - FP8 split-KV candidates are normalized to nonempty K partitions before
-  workspace allocation and kernel launch. The reducer uses a 32/64-split
-  capacity for the M128/M64 paths and selects 1/2/4 disjoint D512 output bands
-  when the real output rows do not fill the GPU. These changes adapt the
-  split-KV and reducer optimizations from FlashInfer PR #4178 to TokenSpeed's
-  folded-query layout; both reducer settings are included in the compile cache.
+  workspace allocation and kernel launch. The reducer's static capacity is
+  the power of two covering the split count, at least 8 splits. Splits past
+  the runtime count are masked, so the capacity does not change outputs, and
+  batch sizes with 2 to 8 splits share one binary. The reducer also selects
+  1/2/4 disjoint D512 output bands when the real output rows do not fill the
+  GPU. These changes adapt the split-KV and reducer optimizations from
+  FlashInfer PR #4178 to TokenSpeed's folded-query layout; both reducer
+  settings are included in the compile cache.
 - Use the 2CTA UTCMMA instruction to reduce shared memory usage.
 - Use as few mbarriers as possible.
 - Split the KV loading warp to get more latency-hiding ability. After loading K, V is already in the L2 cache. Loading K of the next tile does not have to wait for the completion of V loading.

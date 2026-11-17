@@ -105,7 +105,8 @@ private:
 struct ScheduleDecodeEvent : InvalidTransitionHandler<ScheduleDecodeEvent> {
     using InvalidTransitionHandler<ScheduleDecodeEvent>::operator();
 
-    explicit ScheduleDecodeEvent(std::int32_t decode_input_tokens) : decode_input_tokens_{decode_input_tokens} {}
+    ScheduleDecodeEvent(std::int32_t decode_input_tokens, DecodeSlotIndex decode_slot)
+        : decode_input_tokens_{decode_input_tokens}, decode_slot_{std::move(decode_slot)} {}
 
     Decoding operator()(PrefillDone&& state);
     Decoding operator()(PrefillAwaitingResult&& state);
@@ -116,6 +117,7 @@ private:
     Decoding decode(State&& state);
 
     std::int32_t decode_input_tokens_{};
+    DecodeSlotIndex decode_slot_;
 };
 
 // The request is done. A page-holding request parks in Finishing with its
@@ -154,6 +156,19 @@ struct ReleaseEvent : InvalidTransitionHandler<ReleaseEvent> {
 
 private:
     CacheCoordinator* coordinator_{};
+};
+
+// Cancellation cannot recycle a row or execution permit while a queued
+// forward can still write it. Finishing carries the resources until results
+// land, with publication disabled for the cancelled request.
+struct AbortInFlightEvent : InvalidTransitionHandler<AbortInFlightEvent> {
+    using InvalidTransitionHandler<AbortInFlightEvent>::operator();
+
+    template <typename State>
+        requires HoldsForwardResources<std::remove_cvref_t<State>>
+    Finishing operator()(State&& state) {
+        return Finishing{std::move(state.resources), /*publish_completed_pages=*/false};
+    }
 };
 
 struct AbortEvent : InvalidTransitionHandler<AbortEvent> {
@@ -204,12 +219,13 @@ struct SnapshotRetractEvent : InvalidTransitionHandler<SnapshotRetractEvent> {
     using InvalidTransitionHandler<SnapshotRetractEvent>::operator();
 
     SnapshotRetractEvent(CacheCoordinator* coordinator, std::int64_t epoch, bool resumes_generation,
-                         RetractionImage image, std::shared_ptr<SnapshotSlotIndex> blob_slot,
-                         std::vector<StoreWait> image_stores)
+                         RetractionImage image, std::vector<std::int32_t> kv_event_tails,
+                         std::shared_ptr<SnapshotSlotIndex> blob_slot, std::vector<StoreWait> image_stores)
         : coordinator_{coordinator},
           epoch_{epoch},
           resumes_generation_{resumes_generation},
           image_{std::move(image)},
+          kv_event_tails_{std::move(kv_event_tails)},
           blob_slot_{std::move(blob_slot)},
           image_stores_{std::move(image_stores)} {}
 
@@ -225,6 +241,7 @@ private:
     std::int64_t epoch_{0};
     bool resumes_generation_{false};
     RetractionImage image_;
+    std::vector<std::int32_t> kv_event_tails_;
     std::shared_ptr<SnapshotSlotIndex> blob_slot_;
     std::vector<StoreWait> image_stores_;
 };
@@ -265,12 +282,14 @@ private:
 struct RestoreDoneEvent : InvalidTransitionHandler<RestoreDoneEvent> {
     using InvalidTransitionHandler<RestoreDoneEvent>::operator();
 
-    explicit RestoreDoneEvent(ReqPoolIndex req_pool_index) : req_pool_index_{std::move(req_pool_index)} {}
+    RestoreDoneEvent(ReqPoolIndex req_pool_index, DecodeSlotIndex decode_slot)
+        : req_pool_index_{std::move(req_pool_index)}, decode_slot_{std::move(decode_slot)} {}
 
     std::variant<Prefilling, PrefillDone, Decoding> operator()(Restoring&& state);
 
 private:
     ReqPoolIndex req_pool_index_;
+    DecodeSlotIndex decode_slot_;
 };
 
 struct UpdateReserveNumTokensEvent : InvalidTransitionHandler<UpdateReserveNumTokensEvent> {
@@ -282,6 +301,7 @@ struct UpdateReserveNumTokensEvent : InvalidTransitionHandler<UpdateReserveNumTo
         state.SetReserveNumTokensInNextScheduleEvent(value_);
         return std::move(state);
     }
+    PdTransferring operator()(PdTransferring&& state) { return std::move(state); }
     Finished operator()(Finished&& state) { return std::move(state); }
 
 private:
@@ -327,6 +347,8 @@ struct ExtendResultEvent : InvalidTransitionHandler<ExtendResultEvent> {
         return std::move(state);
     }
     RemotePrefilling operator()(RemotePrefilling&& state) { return std::move(state); }
+    // A forward that was out when the request ended lands: nothing reads it.
+    PdTransferring operator()(PdTransferring&& state) { return std::move(state); }
 
     Finished operator()(Finished&& state) { return std::move(state); }
 

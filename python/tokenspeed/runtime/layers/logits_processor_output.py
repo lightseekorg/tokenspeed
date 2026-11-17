@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING
 import torch
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.layers.sampled_vocab_shard import SampledVocabShard
     from tokenspeed.runtime.sampling.logits_layout import LogitsLayoutPlan
 
 
@@ -35,13 +36,18 @@ if TYPE_CHECKING:
 class LogitsProcessorOutput:
     ## Part 1: This part will be assigned in python/tokenspeed/runtime/layers/logits_processor.py::LogitsProcessor
     # The logits of the next tokens.       shape: [#seq, vocab_size]
-    next_token_logits: torch.Tensor
+    # None when the processor left them as ``vocab_shard``.
+    next_token_logits: torch.Tensor | None
     # Used when ``do_argmax=True``.   shape: [#seq]
     next_token_ids: torch.Tensor | None = None
     # Used by speculative decoding.
     # The last hidden layers
     hidden_states: torch.Tensor | None = None
     logits_layout_plan: LogitsLayoutPlan | None = None
+    # The sampled rows' logits as this rank's vocabulary shard, for a sampler
+    # that selects from shards (``LogitsProcessor.keep_sampled_logits_vocab_sharded``);
+    # ``next_token_logits`` is then None.
+    vocab_shard: SampledVocabShard | None = None
 
     ## Part 2: Sampling output metadata.
     # Selected-token logprobs written by the active SamplingBackend. shape: [#seq]

@@ -126,14 +126,15 @@ void StorageLease::reset() noexcept {
     }
 }
 
-StorageLease StorageTransferManager::StartQuery(std::vector<CacheKey> keys) {
+StorageLease StorageTransferManager::StartQuery(std::vector<CacheKey> keys, std::vector<std::int32_t> key_tokens) {
     if (keys.empty() || !CanStart() || availableHostCredits() == 0 ||
         keys.size() > static_cast<std::size_t>(config_.max_keys_per_operation)) {
         return {};
     }
+    _assert(keys.size() == key_tokens.size(), "Each storage query key needs a token span");
     StorageQueryOperation op{nextId(), std::move(keys)};
     const auto id = op.op_id;
-    operations_.emplace(id, Ticket{decltype(op)::kKind, op.keys, {}, {}});
+    operations_.emplace(id, Ticket{decltype(op)::kKind, op.keys, std::move(key_tokens), {}, {}});
     commands_.push_back(std::move(op));
     return StorageLease{*this, id};
 }
@@ -148,19 +149,20 @@ bool StorageTransferManager::IsQuery(std::uint64_t id) const {
     return it != operations_.end() && it->second.kind == StorageKind::kQuery;
 }
 
-std::vector<CacheKey> StorageTransferManager::QueryHits(std::uint64_t id) const {
-    const Ticket& ticket = operations_.at(id);
+std::vector<CacheKey> StorageTransferManager::QueryHits(std::uint64_t id) {
+    Ticket& ticket = operations_.at(id);
     std::vector<CacheKey> keys;
     for (std::size_t i = 0; i < ticket.success.size(); ++i) {
-        if (ticket.success[i] && !IsNegative(ticket.keys[i])) keys.push_back(ticket.keys[i]);
+        if (!ticket.success[i] || IsNegative(ticket.keys[i])) continue;
+        keys.push_back(ticket.keys[i]);
+        query_hit_tokens_ += std::exchange(ticket.key_tokens[i], 0);
     }
     return keys;
 }
 
-StorageLease StorageTransferManager::StartRead(const CacheCoordinator::PromptPrefix& prompt,
-                                               std::span<const CacheKey> hits) {
+StorageLease StorageTransferManager::StartRead(const PromptPrefix& prompt, std::span<const CacheKey> hits) {
     if (!CanStart() || hits.empty()) return {};
-    auto reservation = coordinator_.ReserveStoragePrefix(prompt, hits, availableHostCredits());
+    auto reservation = coordinator_.Storage().ReserveStoragePrefix(prompt, hits, availableHostCredits());
     if (reservation.keys.empty()) return {};
     StorageGetOperation op{nextId(), reservation.keys, {}};
     for (std::size_t i = 0; i < reservation.blocks.size(); ++i) {
@@ -170,6 +172,7 @@ StorageLease StorageTransferManager::StartRead(const CacheCoordinator::PromptPre
     const auto id = op.op_id;
     operations_.emplace(id, Ticket{decltype(op)::kKind,
                                    op.keys,
+                                   {},
                                    std::move(reservation.blocks),
                                    {},
                                    std::move(reservation.tail_prior),
@@ -184,6 +187,15 @@ void StorageTransferManager::rememberNegative(const CacheKey& key) {
     while (negative_order_.size() > static_cast<std::size_t>(config_.metadata_entries)) {
         negative_.erase(negative_order_.front());
         negative_order_.pop_front();
+    }
+}
+
+void StorageTransferManager::rememberPublished(const CacheKey& key) {
+    if (!published_.insert(key).second) return;
+    published_order_.push_back(key);
+    while (published_order_.size() > static_cast<std::size_t>(config_.metadata_entries)) {
+        published_.erase(published_order_.front());
+        published_order_.pop_front();
     }
 }
 
@@ -208,16 +220,27 @@ void StorageTransferManager::Complete(const cache::StorageDone& event) {
         for (std::size_t i = 0; i < ticket.success.size(); ++i) {
             if (!ticket.detached && event.object_failures[i]) {
                 rememberNegative(ticket.keys[i]);
+                published_.erase(ticket.keys[i]);
+                std::erase(published_order_, ticket.keys[i]);
             }
             if (event.retired && !ticket.detached && ticket.success[i]) {
-                coordinator_.CacheHostBlock(ticket.blocks[i], ticket.keys[i], /*inherited_metadata=*/std::nullopt);
+                coordinator_.Host().CacheHostBlock(ticket.blocks[i], ticket.keys[i],
+                                                   /*inherited_metadata=*/std::nullopt);
+                // A successful accepted GET proves the immutable object also
+                // existed remotely. A later producer need not PUT it again.
+                rememberPublished(ticket.keys[i]);
             }
         }
         if (event.retired && !ticket.detached && ticket.tail) {
-            coordinator_.CacheHostTail(ticket.tail_prior, *ticket.tail);
+            coordinator_.Host().CacheHostTail(ticket.tail_prior, *ticket.tail);
         }
     }
     if (!event.retired) return;  // Quarantine is charged until a process/transport teardown proves safety.
+    if (kind == StorageKind::kPut) {
+        for (std::size_t i = 0; i < ticket.keys.size(); ++i) {
+            if (ticket.success[i]) rememberPublished(ticket.keys[i]);
+        }
+    }
     if (ticket.detached || kind == StorageKind::kPut) operations_.erase(it);
 }
 
@@ -292,7 +315,7 @@ void StorageTransferManager::StartBackups() {
         CacheKey key = std::move(backup_candidates_.front());
         backup_candidates_.pop_front();
         if (!pending.insert(key).second) continue;
-        CacheBlockRef ref = coordinator_.AcquireHostCachedBlock(key);
+        CacheBlockRef ref = coordinator_.Store().AcquireHostCachedBlock(key);
         if (!ref) {
             ++unavailable_dropped_backup_keys_;
             continue;
@@ -304,7 +327,7 @@ void StorageTransferManager::StartBackups() {
     }
     if (refs.empty()) return;
     op.op_id = nextId();
-    operations_.emplace(op.op_id, Ticket{decltype(op)::kKind, op.keys, std::move(refs), {}});
+    operations_.emplace(op.op_id, Ticket{decltype(op)::kKind, op.keys, {}, std::move(refs), {}});
     commands_.push_back(std::move(op));
 }
 
@@ -318,6 +341,9 @@ void StorageTransferManager::ClearMetadata() {
     DropBackups();
     negative_.clear();
     negative_order_.clear();
+    published_.clear();
+    published_order_.clear();
+    ++publication_epoch_;
 }
 
 std::vector<StorageOperation> StorageTransferManager::TakeCommands() {

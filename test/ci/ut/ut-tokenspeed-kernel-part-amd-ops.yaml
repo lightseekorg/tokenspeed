@@ -1,0 +1,26 @@
+api_version: ci.tokenspeed.io/v1
+name: ut-tokenspeed-kernel-part-amd-ops
+type: ut
+workflow_stage: unit-test
+# AMD splits the kernel suite across ut-tokenspeed-kernel,
+# ut-tokenspeed-kernel-part-amd-gfx950 and ut-tokenspeed-kernel-part-amd-ops.
+triggers:
+  - per-commit
+  - manual
+# Kernel tests never import the runtime (a pre-commit hook checks it).
+ignore_changes:
+  - python/tokenspeed
+  - test/runtime
+changed_paths: true
+runner:
+  labels:
+    - amd-mi355-1gpu
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps.sh
+ut:
+  commands:
+    - python3 -m pytest tokenspeed-kernel/test/ops/ -v
+report:
+  github_step_summary: true

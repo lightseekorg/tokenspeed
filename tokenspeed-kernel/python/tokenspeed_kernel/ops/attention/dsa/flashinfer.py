@@ -37,6 +37,7 @@ from functools import wraps
 from inspect import signature
 
 import torch
+from tokenspeed_kernel.ops.tuning import untuned
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -94,10 +95,27 @@ if platform.is_nvidia and platform.is_hopper_plus:
     )
 
 
-_dsa_sparse_workspace_buffers: dict[torch.device, torch.Tensor] = {}
+_dsa_sparse_workspace_buffers: dict[tuple[torch.device, bool], torch.Tensor] = {}
 _dsa_sparse_counter_buffers: dict[torch.device, torch.Tensor] = {}
 _retired_dsa_sparse_counter_buffers: list[torch.Tensor] = []
 _DSA_SPARSE_WORKSPACE_BYTES = 384 * 1024 * 1024
+# LSE stats cost 2 KiB per head and token: LSE calls chunk tokens in a larger workspace.
+_DSA_LSE_STATS_SLOT_BYTES = 256 * 8
+_DSA_LSE_WORKSPACE_BYTES = 1536 * 1024 * 1024
+_DSA_LSE_STATS_BYTES = 1024 * 1024 * 1024
+
+
+def trtllm_sparse_mla_query_heads(num_heads: int) -> int:
+    """The query head count the trtllm-gen sparse MLA core runs ``num_heads``
+    heads at: it has no 65..127-head variant, so those run as 128, the
+    padding heads zero. A caller that builds the padded query itself saves
+    this leaf a copy of every row."""
+    return 128 if 64 < num_heads < 128 else num_heads
+
+
+def _lse_chunk_tokens(kernel_heads: int) -> int:
+    """Query tokens per pass of an LSE call at ``kernel_heads`` core heads."""
+    return max(1, _DSA_LSE_STATS_BYTES // (kernel_heads * _DSA_LSE_STATS_SLOT_BYTES))
 
 
 def _register_flashinfer_trtllm_dsa(
@@ -108,6 +126,7 @@ def _register_flashinfer_trtllm_dsa(
     qk_nope_head_dim: frozenset[int],
     qk_rope_head_dim: frozenset[int],
     topk: frozenset[int],
+    return_lse: frozenset[bool] = frozenset({False}),
 ):
     return register_kernel(
         "attention",
@@ -132,22 +151,24 @@ def _register_flashinfer_trtllm_dsa(
             "has_kv_cache": frozenset({True}),
             "has_sparse_kv_cache": frozenset({False, True}),
             "logit_cap": frozenset({False}),
-            "return_lse": frozenset({False}),
+            "return_lse": return_lse,
             "topk_layout": frozenset({"global_slots"}),
         },
     )
 
 
-def _get_dsa_sparse_workspace(device: torch.device | str) -> torch.Tensor:
+def _get_dsa_sparse_workspace(
+    device: torch.device | str, lse: bool = False
+) -> torch.Tensor:
     device = torch.device(device)
-    workspace = _dsa_sparse_workspace_buffers.get(device)
+    workspace = _dsa_sparse_workspace_buffers.get((device, lse))
     if workspace is None:
         workspace = torch.zeros(
-            _DSA_SPARSE_WORKSPACE_BYTES,
+            _DSA_LSE_WORKSPACE_BYTES if lse else _DSA_SPARSE_WORKSPACE_BYTES,
             dtype=torch.uint8,
             device=device,
         )
-        _dsa_sparse_workspace_buffers[device] = workspace
+        _dsa_sparse_workspace_buffers[(device, lse)] = workspace
     return workspace
 
 
@@ -209,6 +230,37 @@ def _get_dsa_sparse_counter_buffer(
     return counter
 
 
+def reserve_flashinfer_trtllm_dsa_buffers(
+    device: torch.device | str, *, num_heads: int, return_lse: bool
+) -> None:
+    """Allocate the workspace a trtllm-gen sparse MLA call of ``num_heads``
+    query heads takes and, for an LSE call, its multi-CTA counter, before any
+    forward does.
+
+    Left to the first call, they are allocated mid-forward, where the caching
+    allocator may split them off a freed activation block; ``empty_cache``
+    then cannot return the rest of that block's segment while they live, and
+    the startup residue the CUDA-graph reserve charges grows by it. Allocated
+    on an emptied cache, each takes a segment of its own. An LSE call's
+    counter is sized by its chunk, fixed by the head count; a call without an
+    LSE sizes it by its token count, so that one still grows on first use.
+    """
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        # The forward keys these buffers by its tensors' indexed device.
+        device = torch.device("cuda", torch.cuda.current_device())
+    kernel_heads = trtllm_sparse_mla_query_heads(int(num_heads))
+    if (device, return_lse) not in _dsa_sparse_workspace_buffers or (
+        return_lse and device not in _dsa_sparse_counter_buffers
+    ):
+        torch.cuda.empty_cache()
+    _get_dsa_sparse_workspace(device, lse=return_lse)
+    if return_lse:
+        _get_dsa_sparse_counter_buffer(
+            device, _lse_chunk_tokens(kernel_heads), kernel_heads
+        )
+
+
 def _prepare_nope_sparse_slots(
     topk_slots: torch.Tensor,
     topk_lens: torch.Tensor | None,
@@ -242,12 +294,15 @@ def _flashinfer_trtllm_dsa_impl(
     return_lse: bool = False,
     out: torch.Tensor | None = None,
     enable_pdl: bool | None = None,
-) -> torch.Tensor:
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     del sparse_kv_cache, q_len_per_req
     if kv_cache is None:
         raise RuntimeError("FlashInfer/TRTLLM sparse MLA requires kv_cache")
-    if return_lse:
-        raise RuntimeError("FlashInfer/TRTLLM sparse MLA does not support return_lse")
+    if return_lse and qk_rope_head_dim == 0:
+        # The NoPE slots include a padding entry the LSE would have to exclude.
+        raise RuntimeError(
+            "FlashInfer/TRTLLM NoPE sparse MLA does not support return_lse"
+        )
     if logit_cap != 0.0:
         raise RuntimeError("FlashInfer/TRTLLM sparse MLA does not support logit_cap")
     if q.dim() == 3:
@@ -258,6 +313,14 @@ def _flashinfer_trtllm_dsa_impl(
         q_kernel = q.reshape(num_tokens, 1, q.shape[2], q.shape[3])
     else:
         raise ValueError(f"unsupported q shape {tuple(q.shape)}")
+    num_heads = q_kernel.shape[2]
+    kernel_heads = trtllm_sparse_mla_query_heads(num_heads)
+    if kernel_heads != num_heads:
+        # Independent heads make zero padding exact; scratch stays call-local.
+        padded_q = q_kernel.new_empty((num_tokens, 1, kernel_heads, q_kernel.shape[-1]))
+        padded_q[:, :, num_heads:].zero_()
+        padded_q[:, :, :num_heads].copy_(q_kernel)
+        q_kernel = padded_q
     if topk_slots.dim() != 2 or topk_slots.shape[0] != num_tokens:
         raise ValueError(
             "topk_slots must be [query_tokens, topk], got "
@@ -278,39 +341,91 @@ def _flashinfer_trtllm_dsa_impl(
 
     kv_dtype = q.dtype if q.dtype == torch.float8_e4m3fn else kv_cache.dtype
     kv = _flashinfer_trtllm_mla_kv_cache(kv_cache, page_size, kv_dtype)
-    output_shape = (num_tokens, 1, q_kernel.shape[2], int(kv_lora_rank))
+    output_shape = (num_tokens, 1, num_heads, int(kv_lora_rank))
     kernel_out = None
     if out is not None:
+        if out.dtype != torch.bfloat16 or out.device != q.device:
+            raise ValueError("out must have dtype bfloat16 on the query device")
         if out.numel() != math.prod(output_shape):
             raise ValueError(
                 f"out has {out.numel()} elements, expected {math.prod(output_shape)}"
             )
-        kernel_out = out.view(output_shape)
+        if num_heads == kernel_heads:
+            kernel_out = out.view(output_shape)
 
-    result = trtllm_batch_decode_with_kv_cache_mla(
-        query=q_kernel,
-        kv_cache=kv,
-        workspace_buffer=_get_dsa_sparse_workspace(q.device),
-        qk_nope_head_dim=int(qk_nope_head_dim),
-        kv_lora_rank=int(kv_lora_rank),
-        qk_rope_head_dim=int(qk_rope_head_dim),
-        block_tables=topk_slots.view(num_tokens, 1, -1),
-        seq_lens=seq_lens,
-        max_seq_len=int(max_seqlen_k),
-        sparse_mla_top_k=topk_slots.shape[-1],
-        out=kernel_out,
-        bmm1_scale=float(k_scale) * float(softmax_scale),
-        bmm2_scale=1.0,
-        backend="trtllm-gen",
-        multi_ctas_kv_counter_buffer=_get_dsa_sparse_counter_buffer(
-            q.device, num_tokens, q_kernel.shape[2]
-        ),
-        sparse_mla_top_k_lens=sparse_topk_lens,
-        enable_pdl=_resolve_enable_pdl(enable_pdl),
-    )
+    # Resolved once: an LSE call runs several chunks, each paying wrapper host time.
+    workspace = _get_dsa_sparse_workspace(q.device, lse=return_lse)
+    pdl = _resolve_enable_pdl(enable_pdl)
+
+    def run(start, stop, counter, kernel_out, lse_out):
+        return trtllm_batch_decode_with_kv_cache_mla(
+            query=q_kernel[start:stop],
+            kv_cache=kv,
+            workspace_buffer=workspace,
+            qk_nope_head_dim=int(qk_nope_head_dim),
+            kv_lora_rank=int(kv_lora_rank),
+            qk_rope_head_dim=int(qk_rope_head_dim),
+            block_tables=topk_slots[start:stop].view(stop - start, 1, -1),
+            seq_lens=seq_lens[start:stop],
+            max_seq_len=int(max_seqlen_k),
+            sparse_mla_top_k=topk_slots.shape[-1],
+            out=kernel_out,
+            bmm1_scale=float(k_scale) * float(softmax_scale),
+            bmm2_scale=1.0,
+            backend="trtllm-gen",
+            multi_ctas_kv_counter_buffer=counter,
+            sparse_mla_top_k_lens=(
+                None if sparse_topk_lens is None else sparse_topk_lens[start:stop]
+            ),
+            enable_pdl=pdl,
+            # The DCP combine merges natural-log LSEs; trtllm-gen defaults to base 2.
+            **(
+                {"lse": lse_out, "return_lse": True, "return_lse_base": "basee"}
+                if return_lse
+                else {}
+            ),
+        )
+
+    lse = None
+    if not return_lse:
+        counter = _get_dsa_sparse_counter_buffer(q.device, num_tokens, kernel_heads)
+        result = run(0, num_tokens, counter, kernel_out, None)
+    else:
+        chunk = _lse_chunk_tokens(kernel_heads)
+        counter = _get_dsa_sparse_counter_buffer(q.device, chunk, kernel_heads)
+        result = kernel_out
+        if result is None:
+            result = torch.empty(
+                (num_tokens, 1, kernel_heads, int(kv_lora_rank)),
+                dtype=torch.bfloat16,
+                device=q.device,
+            )
+        lse = torch.empty(
+            (num_tokens, kernel_heads), dtype=torch.float32, device=q.device
+        )
+        # Tuning profiles 8192 rows, past the LSE workspace: take the cached tactic.
+        with untuned("trtllm_batch_decode_mla"):
+            for start in range(0, num_tokens, chunk):
+                stop = min(start + chunk, num_tokens)
+                run(start, stop, counter, result[start:stop], lse[start:stop])
+    result = result.reshape(num_tokens, kernel_heads, int(kv_lora_rank))
+    if num_heads != kernel_heads:
+        result = result[:, :num_heads]
+    if lse is not None:
+        # Rows with no local slots get LSE -inf, so DCP combines ignore their output.
+        lse = (
+            lse.reshape(num_tokens, kernel_heads)[:, :num_heads]
+            .masked_fill((seq_lens == 0)[:, None], -float("inf"))
+            .contiguous()
+        )
     if out is not None:
-        return out
-    return result.reshape(num_tokens, q_kernel.shape[2], int(kv_lora_rank))
+        if num_heads != kernel_heads:
+            out.copy_(result.reshape_as(out))
+        result = out
+    elif lse is None:
+        result = result.contiguous()
+    # DCP combines read strided heads, so padded partials stay a view of padded rows.
+    return (result, lse) if lse is not None else result
 
 
 if platform.is_nvidia and platform.is_hopper_plus:
@@ -318,10 +433,11 @@ if platform.is_nvidia and platform.is_hopper_plus:
     @_register_flashinfer_trtllm_dsa(
         "dsa_decode",
         name="flashinfer_trtllm_dsa_decode",
-        q_len_per_req=frozenset({1, 2, 3, 4, 5, 6}),
+        q_len_per_req=frozenset({1, 2, 3, 4, 5, 6, 7, 8}),
         qk_nope_head_dim=frozenset({128, 192}),
         qk_rope_head_dim=frozenset({64}),
         topk=frozenset({512, 1024, 2048}),
+        return_lse=frozenset({False, True}),
     )
     def flashinfer_trtllm_dsa_decode(**kwargs) -> torch.Tensor:
         return _flashinfer_trtllm_dsa_impl(**kwargs)
@@ -344,6 +460,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
         qk_nope_head_dim=frozenset({128, 192}),
         qk_rope_head_dim=frozenset({64}),
         topk=frozenset({512, 1024, 2048}),
+        return_lse=frozenset({False, True}),
     )
     def flashinfer_trtllm_dsa_prefill(**kwargs) -> torch.Tensor:
         return _flashinfer_trtllm_dsa_impl(**kwargs)

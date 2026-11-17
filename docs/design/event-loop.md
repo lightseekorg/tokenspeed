@@ -22,13 +22,20 @@ Peripheral threads stay off the round: the wire's Tokio runtime
 transfer peer's workers (`ts-pd`), the grammar compilers, the KV event
 publisher, the expert-rebalance solver.
 
+Request traces use a bounded, lossy background queue. Plugins register a provider
+with `register_trace_provider`, selected explicitly by `--trace-provider NAME`.
+The provider maps a request ID to `(trace_id, optional_parent_span_id)` or `None`;
+ID policies belong to plugins. It runs only on the export thread and must be
+short and nonblocking, without I/O or GPU access. Missing or invalid context
+preserves native IDs; span lifecycle and RID sampling remain unchanged.
+
 With `--enable-async-logging`, the Rust tracing writer and Python root logger
 also run off the serving threads. Each has a bounded, lossy queue: a slow
 output stream must not introduce I/O backpressure into a round. The host
 owns Python log cleanup explicitly after serving returns, including errors
-and encode ranks, before notifying its launcher of a failure. Returning from
-Rust does not finalize Python, so an `atexit` hook alone cannot drain those
-records. Cleanup is bounded because an output stream can remain stalled.
+and encode ranks. Returning from Rust does not finalize Python, so an
+`atexit` hook alone cannot drain those records. Cleanup is bounded because
+an output stream can remain stalled.
 
 The ranks of a replica (an attention-TP group, across every pipeline stage)
 run the same scheduler. They talk over `ts-collective`'s TCP mesh, in fixed
@@ -52,6 +59,9 @@ handshake socket. An EPD encode node's ranks run the host's encode mode instead
 event loop. Their first rank dials the frontend the same way and takes
 encode requests.
 
+The launcher snapshots each rank's environment inside its start context so
+allocator preload hooks reach the child along with the native logging defaults.
+
 What an engine registers with tells its frontend what it serves: the
 request types it takes (an encode server takes encode requests only), the
 field order of the positional structs on its wire, its role and, for a
@@ -70,6 +80,48 @@ native frontend timestamps receipt and exposes a complete per-rank snapshot
 set to the gateway only while every report is less than three seconds old.
 The gateway converts these allocator counts to capacity ratios; it must not
 interpret an LCM block as a fixed-size token page.
+
+## Request identity and submission failures
+
+The wire identifies a request and its output stream by `rid` alone. A new
+request, including a retry after abort, should use a fresh id. Before ingress
+can publish a refusal or register data-plane state, the loop discards repeated
+ids in the same received round and ids still owned by the output processor.
+The original request keeps its state and stream; a warning records the
+duplicate. Sending a final error for that duplicate would end the original
+stream, since the wire cannot distinguish the two submissions.
+
+Output completion and scheduler retirement are separate fences. After the
+output processor forgets a request, the scheduler may still hold it while
+forward results drain or until the next plan removes its finished entry.
+An id in that interval receives a 409 refusal before data-plane admission.
+The check uses the scheduler's existing request lookup; it does not reclaim
+an id ahead of its in-flight work. Once both owners have released an id, this
+admission guard allows it again.
+
+Each accepted request gets a monotonically increasing admission identity
+before data-plane registration. The output processor allocates it once;
+the Python request record, planned forwards and snapshot/restore operations
+carry that same value. External `rid` remains the wire and scheduler lookup
+key. Reusing it after retirement creates a new admission, while chunks,
+decode steps and retraction keep the existing admission identity. Slot-state
+owners compare admissions so a recycled row cannot retain a previous
+request's stop criteria or sampling state. Identity allocation is independent
+of the sampling seed and does not retain a history of external request IDs.
+
+Cache-op adaptation resolves the admission while the host still holds the
+request record and stores it in the immutable operation. No asynchronous
+completion resolves a potentially recycled `rid` to infer slot ownership.
+The identity is local to the engine lifetime, like its slot-state images;
+it is not a cross-engine or persistent-cache key.
+
+The Rust/C++ submission bridge returns `Result`: native validation exceptions
+must never escape a `noexcept` bridge. The scheduler validates a complete
+submission batch before inserting requests. If it rejects the batch, the
+loop finishes and releases those unscheduled requests with a client error
+and continues serving; it starts PD transfers only after submission succeeds.
+Already running requests remain intact. Other requests in a rejected batch
+also receive its error and can be retried with fresh ids.
 
 ## Principle 1: the loop runs no GPU work, and cannot reach any
 
@@ -364,7 +416,11 @@ library compiles once per batch shape with no key to bucket -- FlashInfer's
 joint BF16 GEMM and the ll_bf16 router's dot-product kernel compile once per
 exact row count -- runs only before it:
 graph capture records it, and eager calls after it take a GEMM that never
-compiles instead of compiling on the forward thread.
+compiles instead of compiling on the forward thread. The pinned FlashInfer
+TGV tiles for BF16 decode GEMMs on small weights run only before it too,
+though they compile once per tile, not per shape: their route was measured
+only inside captured graphs, so eager calls after the mark keep cuBLASLt
+(`tokenspeed-kernel/python/tokenspeed_kernel/ops/gemm/README.md`).
 
 A full garbage collection is a stall of the same kind, for every Python
 thread of the process at once. Startup leaves millions of long-lived Python
@@ -395,6 +451,22 @@ device events within each rank and process rather than clip GPU time to host
 timestamps. Profile startup rejects unsupported capture capabilities instead
 of silently producing an incomplete trace.
 
+The torch profiler sees only torch ops and Python, so a torch profile also
+records the host's own spans (`ts_scheduler::profile`): the round's phases,
+the scheduler calls and their C++ phases (`csrc/core/profile_span.h`), the
+data-plane calls and their waits for the GIL on the control thread, and each
+operation on the forward thread. The profiler merges them into the trace it
+exports, on their threads' lanes, so a forward thread's operation encloses
+the Python it ran; the C++ scheduler's spans are under the `scheduler`
+category, the rest under `host`. The recording follows the torch profiler's window and
+costs one atomic load per span outside it; it keeps only the spans that began
+inside the window, so an operation open as a by-stage profile switches stages
+stays out of the next stage's trace. A trace the merge fails on is written
+without the host spans rather than failing the forward thread. A round that receives nothing,
+hands the data plane and the L3 executor nothing, and commits, acknowledges,
+or answers nothing leaves no spans: a loop waiting on a transfer spins through
+such rounds. A storage operation's outcome counts as an acknowledgment.
+
 ### The capture contract
 
 Information crosses to the data plane **only** as a queued operation's
@@ -403,7 +475,7 @@ Python object), from which the forward thread builds what a forward reads.
 What a launched forward reads freezes: no attribute rebinding, no in-place
 edit, no releasing a resource it holds while it may still run. Results cross
 back **only** as the launched forward's result, which the commit reads once
-its copy event landed, as plain lists built from the landed host copies.
+its copy event landed, as metadata lists and CPU logprob buffer views.
 
 The plan's cache ops follow the same capture rule: the data plane adapts
 them once into immutable Device and storage tuples, and
@@ -415,6 +487,13 @@ the executor's completion poll.
 `execution/device.py` states this in full, including the registered
 exceptions — grammar matchers, whose ownership splits by path and whose
 overlap the drain rules in Principle 4 break instead, and multimodal items.
+
+Completion queries export large logprob columns as CPU buffer views, after
+the result's copy event has landed. The host validates dtype, rank, shape
+and token-ID narrowing, then copies into Rust-owned vectors while Python
+buffer guards retain the storage. No borrowed array escapes the query or
+outlives the result's reuse lease. Buffer guards release on errors and
+unwinding too; no manual export/release pair belongs in the event loop.
 
 ## Principle 2: the event loop is a coordinator, nothing more
 
@@ -477,7 +556,13 @@ don't fit. It must not advance the scheduler itself.
 ## Principle 4: correctness never depends on the in-flight depth
 
 `in_flight_depth` parameterizes the loop: 0 (classic synchronous
-commit), 1 (the overlap schedule), or `pp_size` (the prefill chunk pipeline).
+commit), 1 (one forward ahead of its commit: the overlap schedule on a
+decoding role), or `pp_size` (the prefill chunk pipeline);
+`scheduler_utils.resolve_in_flight_depth` picks it. At PP=1 the prefill role
+runs at 1 too, the chunk pipeline's one-stage case: a round's planning,
+commit, and transfer polling overlap the chunk on the GPU. It still takes no
+overlap schedule, whose decode KV reservation (`overlap_schedule_depth`) it
+never needs. `--disable-overlap-schedule` sets the depth to 0 at PP=1.
 Dispatched forwards await commit in the `in_flight` queue. The round commits
 once the queue exceeds the effective depth (0 when the round dispatched no
 new work, so results never wait on future traffic).
@@ -521,9 +606,35 @@ order, as one batch. The batch is the round's net change: a block evicted and
 cached again within the round produces no event. Do not add per-mutation
 publish calls. They only fragment batches.
 
+The control thread drains an independent, contiguous event snapshot. The
+publisher takes ownership of that batch; its thread encodes MessagePack, frees
+the snapshot, and sends the payload. It cannot read the scheduler or retain cache
+blocks. Timestamps are taken when the control thread submits the batch, and
+sequence numbers and replay-buffer updates stay with the publisher in FIFO order.
+The Python event-list API and the published wire format remain compatible.
+
+The publisher keeps the existing bounded **batch-count** queue and blocking
+backpressure. A full queue delays its caller; accepted batches are never discarded
+to make room. Eliminating that wait would require an explicit loss/resynchronization
+protocol. A disconnected publisher logs the failed send. Its diagnostic progress
+handle counts outstanding snapshots (including a blocked producer and the active
+worker), their logical bytes and high-water marks, and enqueue-call time. These
+bytes stay charged until the send completes, even after encoding frees a snapshot.
+They exclude allocator slack and encoded replay buffers; process RSS measures
+those separately. The ownership guard releases counts on failed sends and dropped
+queued work as well as normal completion.
+
 The same reasoning fixes the metrics call: the loop records scheduler
 iteration metrics once per round, from the same pre-dispatch snapshot as the
 scheduler stats.
+
+Only ranks with an engine metrics exporter retain per-request timing samples.
+Decode request logs, exported latency metrics, and request traces use the
+arrival of the bootstrap token as the first-token timestamp. Metrics and
+tracing are independently enabled; tracing alone retains no metric samples.
+Decode throughput counts tokens appended to the request, including the stop
+token when present. A speculative suffix discarded at the stop boundary still
+advances the scheduler frontier but contributes no output tokens.
 
 Metric output plugins run in the node's metrics relay process
 (`metrics/relay.py`); the rank's `ts-metrics` hands them every update as an
@@ -545,18 +656,30 @@ retracted request re-enters the C++ waiting queue without passing the funnel
 again, so preemption yields no second observation. The stamp rides the
 request's state and dies with it; no cleanup pass exists.
 
+Generation throughput counts tokens committed by decode forwards; on a plain
+worker the first token normally comes from prefill. Completion counts are
+role-local: the bootstrap token appears in both P and D totals. Use decode
+completion totals for a disaggregated service's output-token count.
+L3 query hits count the token span of each successful storage key. Cache
+groups can cover the same prompt positions, so this measures storage hits
+per group rather than unique prompt tokens.
+
 Page gauges count LCM parents, excluding the reserved null parent. The
 per-round sampler reads `empty_lcm_blocks()` and `active_lcm_blocks()`.
 Cached-only parents are `num_usable_pages - empty - active`. Active and cached
 counts are disjoint, even when cache groups pack multiple blocks into a parent.
+The used and free token gauges prorate the recipe's effective token capacity
+by the resident and non-active parent counts, respectively. Round down after
+scaling so a fully free pool reports its full capacity, including packed or
+capacity-limited layouts.
 `available_lcm_blocks()` scans the pool and prefix indexes for reclaimability
 and belongs in diagnostics and leak checks, never in the per-round sampler.
-`active_lcm_blocks()` walks every live request's block tables, which at long
-contexts costs more than the rest of a round, so the loop takes it at most
-once per 100 ms and the frontend's load report, the metrics and the batch line
-share that value; a round with no request running takes it again (it then
-costs nothing), so an engine that goes idle reports none active at once, and
-does not keep it, so the first round with requests takes a fresh one. The
+`active_lcm_blocks()` is O(1): the block tables keep the count as they change
+(see cache-concepts.md). The loop takes it at most once per 100 ms and the
+frontend's load report, the metrics and the batch line share that value; a
+round with no request running takes it again, so an engine that goes idle
+reports none active at once, and does not keep it, so the first round with
+requests takes a fresh one. The
 scheduler's other counts (`sizes()`) are a pass over its requests per state:
 a round takes them for the load report, and as it planned only when the
 metrics or a batch line read them (they share that read); the idle check takes
@@ -566,8 +689,10 @@ them only when the loop holds no request, in-flight forward or open cache op.
 
 **Pause and memory release** (`control`). A pause in `abort` mode aborts what
 runs, `wait` lets it finish; both stop admissions and answer once the
-scheduler drained. `keep` freezes everything and answers at once: a frozen
-round commits what is dispatched and still joins the attention-DP agreement
+scheduler drained, including requests parked for PD retirement: both the
+transfer and local forwards must finish even if the output already ended.
+`keep` freezes everything and answers at once: a frozen round commits what is
+dispatched and still joins the attention-DP agreement
 (an idle forward when a peer runs one, but not while memory is released: the
 weights are unmapped; idle forwards count toward the expert rebalance like
 real ones, so the ranks' rebalances stay in step). It plans like any round,
@@ -587,16 +712,47 @@ for their images' embeddings, which end once their receives settle — the
 drain waits for those.
 A disaggregated engine refuses new requests while a release is draining or
 memory is released: their transfer registration would name memory the
-release unmaps. On release the prefill peer deregisters its cache regions and
-registers them again on resume under the same session; the decode peer
-starts a fresh transfer engine on resume, so its prefill peers see a new
-session and register it again. A release is refused while transfers are in
+release unmaps. On release the prefill peer deregisters its cache regions
+from both receiving and sending engines, and registers them again on resume.
+The decode peer starts a fresh transfer engine and assigns a new random cache
+identity on resume. Registrations carry this identity separately from the
+transport address: reusing an IP and port cannot identify the previous cache.
+A new registration retires old identities at the same control endpoint or
+transport address. Retirement waits for writes already in progress; queued
+writes recheck their identity, and late registrations cannot revive it. When
+a transport address is reused, the sender replaces its private transfer
+engine to discard cached remote memory keys, preserving the public engine
+address used by EPD. A release is refused while transfers are in
 flight, and refused for a paused PD engine with buffered requests, whose
 transfers cannot drain until those requests are admitted; their transfer
 registration is deferred until resume admits them, and aborted buffered
 requests never register one. An empty memory-resume request is a successful
 no-op while a drain is pending; it preserves that drain's admission hold
 until the owning pause or memory-release operation finishes.
+
+With attention DP, memory release waits for every rank to stop admissions
+and drain its requests, forwards, cancelled embedding receives, cache copies,
+transfers and queued weight operations. A locally drained rank keeps joining
+idle forwards while a peer drains. An idle but unpaused peer prevents release:
+it could admit a request in the next round. Release intent rides the head
+gate, so every rank joins the tail's readiness agreement when any release is
+pending, including ranks without a release of their own. Ordinary rounds add
+no collective. An NCCL release also requires a pending NCCL release on every
+rank: a previously completed KV release does not authorize that collective.
+Other memory regions retain their local release semantics. Readiness is
+MIN-reduced over the replica and then attention DP
+before any release runs on the forward thread.
+
+A resume containing NCCL uses the same-round operation gate: it waits until
+every attention-DP engine holds its resume before entering device collectives.
+Other regions still resume locally. A pending collective resume refuses a
+second memory resume until it finishes.
+
+The head gate also agrees whether any DP rank still has released regions.
+Until all regions are restored on every rank, it withholds forward permission
+through the scheduler's storage tick and suppresses idle forwards. This covers
+staggered and partial resumes without building a batch that cannot execute;
+control operations and cache acknowledgments continue to progress.
 
 **The same-round gate** (`EventLoop::gate`, every round on every rank).
 Weight-update `flush_cache` and a standalone flush first MAX-reduce
@@ -621,7 +777,11 @@ final result on all forward threads before replying. Under the discard
 policy, local loading success is pending: only the successful replica-wide
 commit marks parameters usable. A failed load invalidates every rank,
 including ranks that loaded locally; KV wake and forwarding remain blocked
-until deployment restart. The same gate carries the online expert
+until deployment restart. Discard requires both the model and its resolved
+quantization configuration to opt in; quantized post-load derivation must
+rebuild codes and scales in place from the complete new checkpoint, never
+reuse discarded values or mark remapped storage usable on its own.
+The same gate carries the online expert
 rebalance's *internal* steps (snapshot, commit, chunk apply) from a second
 queue with its own columns: frontend operations arrive on different DP
 engines in different rounds while the controller queues internal steps at
@@ -696,9 +856,130 @@ any other detaches from its storage work. Without L3 the round runs none of
 this. L3 requires PP=1; the D role receives its missing cache from its
 prefill peer.
 
-**PD** (`pd`, `ts-pd`). Requests register with the transfer peer at
-admission, and every round the replica agrees on which transfers changed
-state; their scheduler events join the round's tail feedback, and a failed
+**PD source retirement.** A terminal status alone does not release source
+pages. The prefill peer counts queued and executing transfer jobs. A failure
+agreed by the replica first stops new work on every rank and reports `Failed`,
+which parks the request without releasing its resources. Every rank must
+retire its jobs before `Stopped` reaches the scheduler. Queued
+jobs for failed rooms are dropped; executing jobs finish or return from the
+synchronous transport call before retiring. Client cancellation keeps the
+request's source ownership until that retirement event. The retirement agreement
+is needed only in rounds with a terminal status.
+
+**PD output completion.** A prefill's computed finish is not its client's
+final output: the output waits for the transfer's result. A transfer failure
+must publish an abort even after computation finished, unless the client
+already cancelled its stream or a final output was sent. A pause abort still
+notifies the client; repeated transfer events do not repeat the final output.
+This output fence does not retire source pages.
+
+**PD route refresh.** Before attaching a new room, the decode connection worker
+fetches the bootstrap route version. The version changes on bootstrap restart
+and source-rank registration, even when the address stays healthy. A changed
+version invalidates the cached route and target registrations for future rooms;
+existing rooms keep their targets and cancellation retirement fences. Bootstrap
+servers without a version are resolved afresh on each connection. This adds
+one bootstrap lookup per room, off the scheduler and forward threads. It does
+not transparently migrate an in-flight transfer to a replacement prefill peer.
+
+**PD cancellation.** Client aborts and `pause(abort)` cancel the tracked
+transfer as well as marking the request's output. A decode receiver sends a
+cancellation to every prefill target that could write its landing pages.
+Each target stops accepting work for the room and acknowledges only after
+its queued and executing writes retire. The receiver waits for every target,
+then agrees retirement across its replica before reporting `Stopped` to the
+scheduler; `Failed` may already have ended the client request. Failure
+notifications and receive timeouts use the same fence:
+neither proves that remote writes stopped. A receiver that never advertised
+landing pages can retire locally. Cancelled rooms reject delayed registration
+and manifests; repeated cancellation is safe.
+
+`Failed` precedes `Stopped`, but both may arrive in the same poll when the
+transfer has already retired. Consumers accept either one poll or separate
+polls and keep the pages until the retirement event and local forwards complete.
+
+The prefill control receiver handles cancellation even when no native request
+claimed the room or its scheduler is paused. Unclaimed rooms therefore need
+not wait for the bootstrap timeout after the decode request is cancelled.
+P and D must run versions supporting this cancellation protocol. If a target
+cannot acknowledge retirement, the receiver retains its pages and the drain
+remains pending; a transport failure alone cannot make those pages safe to
+reuse. Cancellation tombstones are retired with their destination cache
+identities. A prefill cancellation that never learns a destination identity
+must retain its room tombstone until that peer exits, since an arbitrarily
+late manifest must not revive the transfer.
+
+These records include every prefill failure and bootstrap timeout, not just
+explicit client cancellation. There is currently no count or age limit:
+unbound records last for the prefill peer's lifetime, and bound records can
+last just as long when a healthy decode cache is never superseded. Sustained
+timeouts therefore grow metadata with the number of failed rooms, even after
+all associated jobs and network workers retire. Request timeout bounds do not
+bound this memory. An age or size eviction would allow a delayed manifest to
+revive an ended room; the wire has no enforced message lifetime or retired
+attempt epoch to reject it. Bounded retention needs such a protocol guarantee
+(or a fail-closed admission policy), rather than assuming that a multiple of
+the bootstrap timeout rules out late messages.
+
+A native write error does not prove that its remote DMA stopped. The prefill
+peer marks that room uncertain and withholds cancellation acknowledgments even
+after its queued and executing calls return. Failure notices may still reach
+the receiver, but cannot release its pages. An uncertain room or an unreachable
+writer can therefore keep the receiver's drain pending indefinitely; stalled
+drains are logged periodically. A parked request also keeps operations that
+require a drained engine, such as cache flush, weight replacement and sleep
+with memory release, from completing. Recovery requires verified retirement
+of the writers or transport invalidation that makes further access to these
+registrations impossible; local forwards must also have completed before
+pages are released. A timeout can trigger diagnostics or recovery but cannot
+authorize page reuse; the current protocol provides no forced retirement
+for an uncertain room.
+
+**PD failure isolation.** Control messages use one bounded FIFO per destination
+endpoint. Connect and send each have a five-second deadline; a failed endpoint
+cannot hold another endpoint's registration, manifest or cancellation. An
+identical cancellation or status occupies at most one queued/in-flight entry.
+Queue refusal fails registration/manifest publication; partial publication
+still uses the cancellation fence. Cancellation polling retries refused or
+undelivered notifications. Network delivery itself remains best effort: a
+locally accepted message is not a remote acknowledgment. A connect or send
+failure discards that endpoint's queued backlog and retires its task; it does
+not spend another I/O timeout on every queued message. Requests still use
+their failure/timeout and cancellation paths. After 60 seconds with no queued
+or in-flight message, even a healthy endpoint retires its socket, task and
+registry entry. The next send recreates them. Idle retirement and enqueue
+share a lock so a new message cannot be stranded on a closing FIFO; an old
+task's teardown cannot erase its replacement. Socket retirement does not
+retire cache identities, room tombstones or possible remote writes.
+
+Decode bootstrap lookups are serialized per bootstrap address, with independent
+workers for other addresses. Polling (including idle polls) and registration
+release a lost address's sender once its route is gone and no live request is
+still looking it up. The worker finishes any bounded in-flight HTTP call,
+skips terminal queued requests and exits; a later request creates another
+worker. A first lookup with no route yet keeps its worker so concurrent
+requests for that address stay serialized. Heartbeat failure counters expire
+with the routes too. Cache registration on prefill fences only the
+cache identities being replaced. A replacement waits off the control receive
+path for those native writes, while unrelated registrations and cancellations
+continue. Manifests for the replacement wait until it is installed; queued
+old writes recheck their identity before reaching native I/O. Synchronous data
+writes still use the configured transfer worker pool, and heartbeat probes are
+still sequential; these bounds do not provide native write cancellation or
+writer incarnation discovery.
+
+Bootstrap timeout and other prefill failures retain the same terminal room
+record as explicit cancellation. A late manifest is rejected immediately,
+without another unclaimed timeout. Before manifest publication, decode bounds
+bootstrap and scheduler admission waiting by `waiting_timeout`. Publication
+starts a separate receive budget of the same duration. These phase budgets do
+not constitute an upstream end-to-end deadline. Before publication a failed
+receiver retires locally and notifies known targets; after publication it must
+obtain the normal retirement acknowledgments.
+
+**PD** (`pd`, `ts-pd`). Requests register with the transfer peer when submitted
+to the scheduler, before cache admission. Every round the replica agrees on
+which transfers changed state; their scheduler events join the round's tail feedback, and a failed
 transfer aborts its request on every rank together. A peer keeps state only
 for the rooms of requests the loop tracks (a sleep waits for those alone),
 with one exception on the prefill side: a room the decode node pre-allocated
@@ -707,6 +988,11 @@ EPD embedding timeout), waits unclaimed; one still unclaimed after the
 bootstrap timeout is dropped, and the decode ranks that pre-allocated for it
 are told it failed. A decode room whose KV lands without the request's first
 token fails: the first decode feeds on it.
+
+`pd::TransferStoppedEvent` retires the transfer of the parked request. Its
+resources still wait for any outstanding local forward results before release:
+a transport fence does not fence this engine's execution stream. A late success
+retires a parked transfer under the same local-forward condition.
 
 **EPD prefill** (`--disaggregation-mode prefill` with encode nodes). A
 request whose images an encode node embeds is staged at admission; each
@@ -724,6 +1010,37 @@ bitmasks through their handles, with one C++ fill (`grammar_host.Filler`)
 on both paths: the capturable path's host node runs it inside the forward
 and advances the matchers there; the eager path runs it before the forward
 and the commit advances them.
+
+## Request-token history seeds
+
+The control plane owns each request's committed token list. `HistoryRows`
+tracks slot ownership by admission, not by client request id, and seeds a
+new owner's prefix before its first forward. Consecutive chunks on the
+same owned row append their inputs without reseeding. Prefix-cache hits,
+PD landings, slot reuse and recovery into another slot use this same path.
+Only the most recently used slot can hold a request's current history. Moving
+to another slot invalidates the old ownership claim: a later restore into
+that old slot must seed again, even if no other request has used it.
+
+A model profile may declare `request_token_history_lookback`: the maximum
+number of committed tokens it reads behind its write frontier. Omission
+(`None`) preserves full-prefix seeds; zero permits an empty seed. The host
+uses the maximum bound across target and draft history readers, or full
+history if either reader declares no bound. A finite bound is a model
+correctness contract, not a serving knob: every history read must stay
+within it, including resumed and speculative forwards.
+
+For a prefix of length P and bound L, the seed carries tokens
+`[max(0, P-L), P)`, retaining P as `prefix_lengths`. The Python executor
+places them at their original absolute positions, never at position zero.
+The draft row keeps its existing one-token-left shift: source positions
+`[start+1, P)` populate draft positions `[start, P-1)`. The final draft position is not
+provided by the seed, just as with full-prefix seeding; the model/drafter
+must supply any boundary token it reads. Earlier row contents are
+unspecified and must not be read. This reduces copied and uploaded tokens,
+not the context-sized history allocation or KV-cache storage. Token history
+remains token-derived state, reconstructed rather than included in
+retraction snapshots.
 
 ## Anatomy of a round
 
@@ -779,20 +1096,28 @@ For orientation, one `EventLoop::round`:
    as another group's copy destination, which the arena writes only after
    every pair reading those byte ranges; a destination is never zeroed;
    no op id, no ACK), then
-   page zeroing (the new owner's sanitization), then the Device-bound copies
-   -- `LoadBackOp` and `RestoreOp`, ordered behind the zeroing: a load-back
-   lands on zeroed pages and the forward reads it layer by layer behind the
-   layerwise fences (a prefill graph replay waits for the whole load before
-   its first segment, which holds no fence), so the loads start first on the
-   load stream, and every plan, with cache ops or without, points the fences
-   at its own load or at none; a restore
+   page zeroing (the new owner's sanitization of the fresh pages nothing
+   fills whole: a copy destination and a block a remote landing fills are
+   left out), then the Device-bound copies
+   -- `LoadBackOp` and `RestoreOp`, ordered behind the zeroing and the
+   forwards in flight, which may still write a block an abort freed and this
+   plan granted (load-back destinations are never zeroed): the forward reads
+   a load-back layer by layer behind the
+   layerwise fences (a prefill graph replay waits on them before each
+   captured segment, which holds none, or, on a pool that does not declare
+   every access fenced, for the whole load instead), so the loads start first
+   on the load stream, and every plan, with cache ops or without, points
+   the fences at its own load or at none; a restore
    queues behind them, overwrites its destination blocks whole (the
    scheduler lists none of them for zeroing), reads both Host tiers under one
    event and arms no layerwise fence, its request being unschedulable until
    the ACK -- then the plan's remote streams to the transfer peer (a D-node
-   remote prefill waits on the zeroing fence inside its submission, which
-   the FIFO orders after the store fence), then the plan's batch to the
-   model. A store names the victim's request-pool slot, which the scheduler
+   remote prefill submits only its stream-ordered slot preparation here),
+   then the plan's batch to the model, then the D-node remote prefill's
+   pull, which waits on the zeroing fence before its CPU-issued RDMA
+   trigger. The zeroing orders behind the step in flight, so a pull queued
+   ahead of the batch would hold the batch's launch until that step ends. A
+   store names the victim's request-pool slot, which the scheduler
    freed in the same plan build: its next owner first writes it in a
    forward, and every forward is enqueued behind the store fence, so the
    slot-state export reads the victim's bytes; a restore names the resumed
@@ -821,6 +1146,47 @@ status. Failure, termination and constructor-error cleanup share one
 process-local shutdown latch: once cleanup starts, later rank notifications
 cannot interrupt it. Signal callbacks do not log or enumerate processes;
 cleanup runs outside the callback.
+
+While serving generation, a fatal control-loop or forward-thread error
+signals the owning launcher once from the thread that detects it. The
+signal requires no Python call and precedes the Rust error log and any wait
+for the forward thread or device cleanup. The launcher can begin stopping
+the local ranks even while the failing rank is still alive. An orderly stop
+still drains the forward thread and closes the data plane.
+
+Concurrent reporters wait only for the native signal attempt, never for
+another thread's log output. The data plane publishes its first failure
+and wakes waiters before logging either the rank failure or a failed signal.
+Later distinct failures and cleanup errors remain visible without replacing
+the original serving error.
+Failures outside generation serving use the same native notifier when
+they reach the host's final error handler; their cleanup timing is unchanged.
+
+### Startup requests
+
+Model warmup runs the model alone on a probe cache. It never reaches the
+request bookkeeping (input preparation, accepted-state commits), and the
+final cache can change kernel specializations it did prepare. With
+`--enable-startup-requests` the host closes both gaps before it registers:
+the loop starts with no frontend and `EventLoop::warm_up` serves requests of
+its own through the ordinary rounds (admission, planning, the data plane,
+commits), on every rank of the replica as a frontend's would be.
+
+`startup::Limits::phases` sizes them from the engine's limits alone: one
+one-token request, one each of a thirty-second of a prefill chunk, a
+sixteenth, one token more, and three sixteenths (the partial forwards that
+short prompts and a long prompt's last chunk run, aligned and not), one of a
+whole chunk, then `max_num_seqs` requests whose prompts cross one chunk
+boundary, each cut to what ingress
+admits and so the whole batch fits the cache. Each phase runs until every
+rank is idle, then its prefixes are flushed, so serving starts from an
+empty cache. Their outputs go nowhere and kernels prepare their compile
+variants as in model warmup. Only
+then does the host complete the frontend handshake and report ready: no
+client request waits behind them or is timed with them.
+
+A disaggregated node is refused (its requests need a peer), and so is an
+L3 store (the flush would delete its shared namespace).
 
 ## Checklist for extending the loop
 
@@ -859,3 +1225,15 @@ count. An unchanged idle load is sent at most once per second as a heartbeat,
 so the frontend can distinguish an idle engine from a stale connection. The
 active page count in it is reused for up to 100 ms (see the page gauges),
 far inside the three seconds the frontend considers a report fresh.
+
+## Independent execution with shared weights
+
+The device build exports `requires_forward_coordination` as an immutable
+capability derived from execution groups. The host hands the control plane a
+DP coordination group only when forwards span workers, or when a shared L3
+namespace needs agreed flushes. Without one, fully local workers omit the
+per-round DP metadata exchange, peer-induced idle forwards and the DP
+rendezvous for cache flushes while retaining their DP routing identities.
+Sharing immutable expert weights alone does not require forward coordination.
+Weight-copy streams and readiness/release events remain behind the model on
+the data plane; see [distributed immutable weights](distributed-weights.md).

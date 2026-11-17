@@ -94,6 +94,10 @@ wire_struct! {
         /// Selected tokens' cumulative probability mass, parallel to the
         /// logprob rows. Empty for the frame when diagnostics are disabled.
         pub output_token_cumulative_probs_val: Vec<Vec<f64>> = Vec::new(),
+        /// Reasoning tokens generated so far, excluding structural markers;
+        /// zero when no reasoning parser is configured. Cumulative, like
+        /// `completion_tokens`. Appended to preserve older columns' positions.
+        pub reasoning_tokens: Vec<i64> = Vec::new(),
     }
 }
 
@@ -129,6 +133,8 @@ pub struct RequestOutput<'a> {
     pub completion_tokens: i64,
     /// Prompt tokens served from the prefix cache.
     pub cached_tokens: i64,
+    /// Reasoning tokens generated so far, excluding structural markers.
+    pub reasoning_tokens: i64,
     /// Logprobs of this step's tokens; empty when not requested.
     pub output_token_logprobs: &'a [f64],
     /// Cumulative probability mass of this step's selected tokens; empty
@@ -205,6 +211,7 @@ impl BatchTokenIDOutSlim {
                 "output_token_cumulative_probs_val",
                 self.output_token_cumulative_probs_val.len(),
             ),
+            ("reasoning_tokens", self.reasoning_tokens.len()),
         ];
         if let Some((name, found)) = optional
             .iter()
@@ -242,6 +249,7 @@ impl BatchTokenIDOutSlim {
             prompt_tokens: self.prompt_tokens[i],
             completion_tokens: self.completion_tokens[i],
             cached_tokens: self.cached_tokens[i],
+            reasoning_tokens: self.reasoning_tokens.get(i).copied().unwrap_or(0),
             output_token_logprobs: &self.output_token_logprobs_val[i],
             output_token_cumulative_probs: self
                 .output_token_cumulative_probs_val

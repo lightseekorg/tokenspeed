@@ -11,6 +11,11 @@ performant kernels for multi-silicon AI inference. It features:
 TokenSpeed-kernel is pip-installable on its own. Others can use it
 directly.
 
+The vendored CUDA routing, sampling, and softmax kernels share reduction
+operators selected by the CCCL header version. CCCL releases before 2.8 use
+CUB operators; newer releases use CUDA operators. This supports building the
+same reductions with CUDA 12.8 without changing their algorithms.
+
 ## Public API
 
 ```python
@@ -165,6 +170,11 @@ TokenSpeed-kernel carefully curates external dependencies and actively
 re-evaluates their inclusion to maintain minimal dependencies and enable
 faster iteration.
 
+CUDA provider discovery tolerates missing optional native packages, including
+FlashMLA and DeepGEMM. Providers expose native implementations when their
+corresponding packages are available. Direct calls to unavailable native
+entry points raise an error.
+
 ### Numerics, benchmarking, profiling
 
 - `python -m tokenspeed_kernel.numerics` — dtype-aware tolerances, standard
@@ -273,6 +283,29 @@ site that keeps doing so. Calling a `@cute.jit` function directly, instead of
 the compiled function, traces it in Python on every call even when CuTe DSL
 has cached its binary, so the monitor reports such a call while serving.
 
+Across processes, `tokenspeed_kernel.cute_compile_cache` keeps `cute.compile`
+binaries in CuTe DSL's on-disk cache (`CUTE_DSL_CACHE_DIR`), which cutlass-dsl
+itself uses only for direct `@cute.jit` calls. It wraps
+`BaseDSL.compile_and_cache`, so tracing still runs and a hit skips lowering and
+ptxas (about half of the startup CuTe compile time). The key adds the source
+of the kernel's defining module, the cutlass-dsl version, the target and device
+architecture, the compile options and, with `--enable-tvm-ffi`, the TVM-FFI
+argument spec (attached after compiling, so an explicit stream and the
+environment stream need separate entries) to cutlass-dsl's own module hash, so
+an edit to a kernel file never loads a stale binary. The runtime installs it
+with the monitor; `CUTE_DSL_DISABLE_FILE_CACHING=1` turns it off. An unset
+`CUTE_DSL_CACHE_DIR` becomes `$XDG_CACHE_HOME/tokenspeed/cute-dsl` (beside the
+FlashInfer autotune cache), because cutlass-dsl's default under `$TMPDIR` starts
+empty in each new container; point it at persistent storage in deployments.
+Like Triton's cache it is never pruned, and each kernel-file edit adds entries
+for that file's kernels, so clear it from time to time while developing.
+cutlass-dsl's own helpers are not cached: their traces carry process
+addresses. The wrapped function is private to cutlass-dsl, so the cache
+installs only on the cutlass-dsl releases it was verified against, and only
+when the parameters it reads are still there; otherwise it stays off with one
+warning. Verify a new release with `test/nvidia/test_cute_compile_cache.py`
+before widening that range.
+
 A runtime argument still keys the cache: Triton specializes an integer on
 whether it is 1 or divisible by 16, and a pointer on 16-byte alignment.
 Startup warms only the classes graph capture happens to see. On the serving
@@ -327,3 +360,8 @@ This installs the Python registry and Ascend Triton provider and skips CUDA
 compilation. Install a compatible Torch/TorchNPU stack first. The
 `tokenspeed-kernel-npu` package and its native operator dependencies are separate
 installations.
+
+Shared modules may define GPU kernels during import. The Ascend Triton adapter
+accepts Gluon JIT and constexpr helper decorators without loading the GPU
+provider; calling these decorated functions still raises an explicit error.
+Capability selection must exclude them on Ascend.

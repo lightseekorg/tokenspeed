@@ -126,6 +126,7 @@ def test_dual_scheduler_snapshot_and_compile_deltas():
     )
     metrics.record_scheduler_iteration(
         running=3,
+        inflight=5,
         waiting=2,
         num_active_pages=2,
         num_total_pages=8,
@@ -137,6 +138,7 @@ def test_dual_scheduler_snapshot_and_compile_deltas():
     metrics.observe_request_queue_time(0.5)
     assert [(e.metric, e.operation, e.value) for e in sink.events] == [
         ("tokenspeed:num_requests_running", "set", 3),
+        ("tokenspeed:num_requests_inflight", "set", 5),
         ("tokenspeed:num_requests_waiting", "set", 2),
         ("tokenspeed:kv_cache_usage_perc", "set", 0.25),
         ("tokenspeed:iteration_tokens_total", "observe", 12),
@@ -147,6 +149,7 @@ def test_dual_scheduler_snapshot_and_compile_deltas():
         ("tokenspeed:request_queue_time_seconds", "observe", 0.5),
     ]
     assert registry.get_sample_value("tokenspeed:num_requests_running", LABELS) == 3
+    assert registry.get_sample_value("tokenspeed:num_requests_inflight", LABELS) == 5
     assert (
         registry.get_sample_value("tokenspeed:jit_serving_compiles_total", LABELS) == 5
     )
@@ -178,6 +181,7 @@ def test_idle_scheduler_gauges_emit_once_per_second(monkeypatch, reporters):
         clock.now = iteration / 4_000
         metrics.record_scheduler_iteration(
             running=0,
+            inflight=0,
             waiting=0,
             num_active_pages=0,
             num_total_pages=8,
@@ -185,11 +189,15 @@ def test_idle_scheduler_gauges_emit_once_per_second(monkeypatch, reporters):
         )
     assert [(e.metric, e.operation, e.value) for e in sink.events] == [
         ("tokenspeed:num_requests_running", "set", 0),
+        ("tokenspeed:num_requests_inflight", "set", 0),
         ("tokenspeed:num_requests_waiting", "set", 0),
         ("tokenspeed:kv_cache_usage_perc", "set", 0),
     ] * 10
     if "prometheus" in reporters:
         assert registry.get_sample_value("tokenspeed:num_requests_running", LABELS) == 0
+        assert (
+            registry.get_sample_value("tokenspeed:num_requests_inflight", LABELS) == 0
+        )
         assert registry.get_sample_value("tokenspeed:num_requests_waiting", LABELS) == 0
         assert registry.get_sample_value("tokenspeed:kv_cache_usage_perc", LABELS) == 0
 
@@ -368,3 +376,19 @@ def test_prometheus_only_ignores_optional_plugin_sink():
         registry.get_sample_value("tokenspeed:request_queue_time_seconds_count", LABELS)
         == 1
     )
+
+
+def test_memory_sampler_logs_unavailable_device(caplog):
+    from tokenspeed.runtime.engine.rust_host import MemoryMetricSampler, logger
+
+    sink = ListSink()
+    sampler = MemoryMetricSampler(
+        sink=sink, model_name="m", app_key="k", dp_rank=0, gpu_id=0, device="invalid"
+    )
+    logger.addHandler(caplog.handler)
+    try:
+        sampler.run()
+    finally:
+        logger.removeHandler(caplog.handler)
+    assert "Cannot initialize memory metrics for invalid" in caplog.text
+    assert not sink.events

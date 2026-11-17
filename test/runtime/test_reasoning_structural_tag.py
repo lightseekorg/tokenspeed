@@ -57,6 +57,15 @@ class _NoTokenizer:
         return None
 
 
+class _MarkerTokenizer:
+    def convert_tokens_to_ids(self, token):
+        return {"<think>": 1, "</think>": 2, "<｜DSML｜ calls>": 3}.get(token)
+
+    def convert_ids_to_tokens(self, ids):
+        tokens = {1: "<think>", 2: "</think>", 3: "<｜DSML｜ calls>"}
+        return [tokens.get(token_id) for token_id in ids]
+
+
 def _host_tag(grammar: ReasoningGrammar, prompt_ids: list[int]) -> str:
     """The tag the host admits a request with ``_SCHEMA`` under (the
     ingress's ``ReasoningGrammar::defer_schema``): the continuing one when
@@ -85,6 +94,14 @@ def test_deepseek_reasoning_parser_wraps_json_schema_after_thinking(parser):
     assert elements[0]["end"] == "</think>"
     assert elements[-1]["type"] == "json_schema"
     assert elements[-1]["json_schema"] == _SCHEMA
+
+
+def test_deepseek_v41_marks_the_tool_block_as_an_implicit_reasoning_closer():
+    grammar = reasoning_grammar("deepseek_v41", _MarkerTokenizer())
+
+    assert grammar.markers == (1, 2)
+    assert grammar.implicit_closer == 3
+    assert reasoning_grammar("deepseek_v31", _MarkerTokenizer()).implicit_closer is None
 
 
 def test_qwen3_reasoning_parser_uses_xgrammar_0_2_builtin_name():

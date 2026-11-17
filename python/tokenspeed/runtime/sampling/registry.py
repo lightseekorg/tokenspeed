@@ -31,6 +31,8 @@ from tokenspeed.runtime.sampling.backends.base import (
 )
 
 if TYPE_CHECKING:
+    from transformers import PretrainedConfig
+
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
@@ -77,6 +79,8 @@ def _is_sampling_backend_available(backend_name: str) -> bool:
         return True
     if backend_name == "triton_full":
         return True
+    if backend_name == "sonic":
+        return platform.is_nvidia
     if backend_name == "ascend_full":
         if not platform.is_npu:
             return False
@@ -108,6 +112,10 @@ def get_sampling_backend_class(server_args: ServerArgs) -> type[SamplingBackend]
     from tokenspeed.runtime.sampling.backends import triton as _t  # noqa: F401
     from tokenspeed.runtime.sampling.backends import triton_full as _tf  # noqa: F401
 
+    # sonic's kernels use NVIDIA's libdevice; other platforms never import them.
+    if current_platform().is_nvidia:
+        from tokenspeed.runtime.sampling.backends import sonic as _so  # noqa: F401
+
     name = _resolve_backend_name(server_args)
     if current_platform().is_npu and name == "ascend_full":
         from tokenspeed.runtime.sampling.backends import (  # noqa: F401
@@ -124,6 +132,7 @@ def get_sampling_backend_class(server_args: ServerArgs) -> type[SamplingBackend]
 def create_sampling_backend(
     server_args: ServerArgs,
     *,
+    hf_config: PretrainedConfig,
     max_bs: int,
     max_draft_tokens_per_req: int,
     device: str,
@@ -137,6 +146,7 @@ def create_sampling_backend(
     return cls(
         SamplingBackendConfig.from_server_args(
             server_args,
+            hf_config=hf_config,
             max_bs=max_bs,
             max_draft_tokens_per_req=max_draft_tokens_per_req,
             device=device,

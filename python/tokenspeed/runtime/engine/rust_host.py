@@ -34,8 +34,8 @@ interpreter runs, plus the launcher's side:
   forward thread runs each operation the control thread queued (a plan
   becomes the ``PlannedForward`` that ``DeviceHandle`` launches); its control
   thread runs the completion queries itself (a launched forward's landed
-  results as plain lists, the cache ops' acknowledgments). The L3 tier runs
-  in the host (``ts-l3``), from the ``L3Settings`` bootstrap resolves.
+  results as metadata and CPU logprob buffers, the cache ops' acknowledgments).
+  The L3 tier runs in the host (``ts-l3``), from the ``L3Settings`` bootstrap resolves.
 
 The host covers TP, attention-DP and pipeline ranks and both PD roles (its
 own Rust transfer peer, started from ``pd/host_peer.py``'s settings);
@@ -53,6 +53,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from multiprocessing import Pipe
@@ -61,11 +62,14 @@ from multiprocessing.connection import Connection
 import msgspec
 import torch
 import torch.distributed as dist
+from tokenspeed_engine.scheduler import Scheduler
 from tokenspeed_kernel.compile_monitor import compile_stats
-from tokenspeed_scheduler import Scheduler
+from tokenspeed_kernel.ops.tuning import kernel_warmup
 
 from tokenspeed.runtime.cache.l3.config import L3Settings
 from tokenspeed.runtime.cache.l3.factory import l3_settings
+from tokenspeed.runtime.configs.model_profile import resolve_history_seed_lookback
+from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.distributed.nccl_suspend import nccl_suspend_supported
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -87,11 +91,13 @@ from tokenspeed.runtime.engine.rank_setup import (
     request_length_limits,
     scheduler_config_from_args,
 )
+from tokenspeed.runtime.engine.result_buffers import completed_result
 from tokenspeed.runtime.engine.scheduler_utils import (
     cache_event_to_payload,
     cache_ops_from_plan,
     engram_context_len,
     resolve_dspark_prefix_replay_tokens,
+    resolve_in_flight_depth,
     should_use_overlap_schedule,
 )
 from tokenspeed.runtime.epd.encode_host import EncodeBootstrap
@@ -119,11 +125,14 @@ from tokenspeed.runtime.grammar.capturable_grammar import (
     resolve_grammar_completion,
 )
 from tokenspeed.runtime.grammar.host_grammar import HostGrammar, HostGrammarEntries
+from tokenspeed.runtime.grammar.inkling2_json import JsonFraming, inkling2_json_framing
 from tokenspeed.runtime.grammar.reasoning_structural_tag import (
     ReasoningGrammar,
     reasoning_grammar,
 )
-from tokenspeed.runtime.metrics.config import metrics_enabled
+from tokenspeed.runtime.metrics.config import metrics_enabled, raw_metrics_enabled
+from tokenspeed.runtime.metrics.events import MetricEvent, MetricEventSink
+from tokenspeed.runtime.metrics.service import metrics_service
 from tokenspeed.runtime.moe.expert_rebalance import ExpertRebalanceSpecs, SlotMoves
 from tokenspeed.runtime.multimodal.inputs import (
     MultimodalInputs,
@@ -132,16 +141,27 @@ from tokenspeed.runtime.multimodal.inputs import (
 from tokenspeed.runtime.multimodal.shm_transport import prepare_shm_features
 from tokenspeed.runtime.pd.host_peer import build_host_peer, kv_bootstrap_address
 from tokenspeed.runtime.pd.kv_events import KVEventsConfig, kv_events_enabled
+from tokenspeed.runtime.plugins.registry import (
+    TraceProvider,
+    get_trace_provider,
+)
 from tokenspeed.runtime.sampling.registry import get_sampling_backend_class
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
-from tokenspeed.runtime.utils import configure_logger, get_colorful_logger
+from tokenspeed.runtime.utils import (
+    configure_logger,
+    get_colorful_logger,
+)
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.hf_transformers_utils import get_tokenizer
 from tokenspeed.runtime.utils.jit_compile_check import (
     install_jit_compile_check,
     mark_jit_compile_serving,
 )
-from tokenspeed.runtime.utils.network import get_ip, join_host_port
+from tokenspeed.runtime.utils.network import (
+    get_ip,
+    join_host_port,
+    wildcard_host_for,
+)
 from tokenspeed.runtime.utils.process import set_parent_death_signal
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
 from tokenspeed.runtime.utils.startup_timing import startup_phase
@@ -280,6 +300,27 @@ def start_rust_host(
     if parent_death_signal:
         preexec_fn = functools.partial(set_parent_death_signal, os.getpid())
     with start_context:
+        # Capture launch-context environment changes (notably allocator LD_PRELOAD).
+        # Set each native writer's fallback before the host initializes logging.
+        level = server_args.log_level.lower()
+        host_env = os.environ.copy()
+        host_env.setdefault(
+            "TS_HOST_LOG",
+            {
+                "warning": "warn",
+                "critical": "error",
+                "fatal": "error",
+                "notset": "trace",
+            }.get(level, level),
+        )
+        host_env.setdefault(
+            "SPDLOG_LEVEL",
+            {
+                "warn": "warning",
+                "fatal": "critical",
+                "notset": "trace",
+            }.get(level, level),
+        )
         popen = subprocess.Popen(
             [
                 (
@@ -295,6 +336,7 @@ def start_rust_host(
                 str(server_args.enable_async_logging).lower(),
             ],
             executable=binary,
+            env=host_env,
             pass_fds=[child.fileno(), held_until_exit],
             preexec_fn=preexec_fn,
         )
@@ -323,6 +365,8 @@ class GrammarSettings:
         reasoning: How a JSON schema waits for the reasoning block of the
             ``--reasoning-parser``; None without one, or when xgrammar has
             no template for it.
+        json_framing: How the vocabulary frames a JSON answer in protocol
+            tokens for ``--reasoning-parser inkling2``; None for any other.
     """
 
     tokenizer_info: str
@@ -330,6 +374,7 @@ class GrammarSettings:
     compile_timeout_s: float
     max_retries: int
     reasoning: ReasoningGrammar | None
+    json_framing: JsonFraming | None
 
 
 def grammar_tokenizer_info(tokenizer, vocab_size: int, eos_token_ids) -> str:
@@ -372,6 +417,24 @@ class EplbSettings:
     ep_ranks: tuple[int, ...]
 
 
+def dp_coordination_ranks(
+    mapping: Mapping, *, requires_forward_coordination: bool, shared_l3: bool
+) -> tuple[int, ...] | None:
+    """The ranks the control plane keeps in step each round, or None.
+
+    Attention-DP workers whose forwards span workers gather per-round DP
+    metadata and run idle forwards for peers with work; workers that share a
+    Mooncake namespace agree their flushes. Workers that only share immutable
+    expert weights do neither: they keep their DP rank for routing and advance
+    independently.
+    """
+    if not mapping.has_attn_dp:
+        return None
+    if not (requires_forward_coordination or shared_l3):
+        return None
+    return tuple(mapping.world_group)
+
+
 @dataclass(frozen=True)
 class HostConfig:
     """What the host's control plane is configured from.
@@ -398,15 +461,27 @@ class HostConfig:
             model without Engram.
         request_token_history: The model reads each request's committed
             token history (``ModelConfig.requires_request_token_history``).
+        request_token_history_lookback: Committed tokens the model reads
+            behind the frontier, which bounds the history seeds; None seeds
+            the whole prefix.
         physical_context_len: Tokens a request's buffers hold.
         kv_total_pages: Usable cache pages, reported with the load.
+        startup_requests: ``--enable-startup-requests``: the engine serves
+            requests of its own before it registers, sized from
+            ``max_batch_size``, ``chunked_prefill_size``, the cache and the
+            context limits (``EventLoop::warm_up``).
+        max_batch_size: The most requests a forward runs.
+        chunked_prefill_size: The most prompt tokens a forward runs.
+        prefix_granularity: Tokens per cache page.
         rank: This rank.
         replica_ranks: The ranks that mirror this rank's scheduler: its
             attention-TP group, across every pipeline stage. The first owns
             the frontend.
         pp_ranks: With pipeline parallelism, this rank's pipeline, in stage
             order; the last stage samples. None without.
-        dp_ranks: With attention DP, every rank: their forwards run in step.
+        dp_ranks: The ranks whose rounds the control plane keeps in step:
+            with attention DP, every rank, when forwards span workers or a
+            shared L3 namespace needs agreed flushes (``dp_coordination_ranks``).
             None without.
         collective_bind_host: Where the rank listens for the other ranks'
             collective connections.
@@ -414,6 +489,7 @@ class HostConfig:
             multimodal inputs.
         memory_saver: ``--enable-memory-saver``: memory can be released.
         memory_regions: The regions this engine can release.
+        allow_reload_forward: ``--allow-reload-forward``: the reload_forward control call is served.
         metrics_prometheus_dir: ``PROMETHEUS_MULTIPROC_DIR``, where the host
             writes its Prometheus series, when the Prometheus reporter is
             on; else None.
@@ -435,6 +511,7 @@ class HostConfig:
         log_spec_accept_lengths: ``TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS``.
         finish_log: This rank logs each request's finish line: the
             attention-TP group's first rank.
+        ttft_trace_sampling_percentage: Percentage of PD rooms to log at bootstrap and first output.
         log_request_stats: ``--enable-log-request-stats``: the finish line is
             the request's timing summary.
         kv_events: The scheduler records KV cache events
@@ -442,6 +519,11 @@ class HostConfig:
         kv_events_publisher: Where this rank publishes them (the ZMQ
             publisher's fields), on the attention-TP group's first rank; else
             None.
+        otlp_traces_endpoint: ``--otlp-traces-endpoint``, the OTLP/HTTP
+            receiver finished requests trace to.
+        trace_provider: Optional registered provider of custom span context.
+        trace_sample_ratio: ``--trace-sample-ratio``, the share of requests
+            it keeps.
         l3: With the L3 storage tier, what the host starts its executor
             from; else None.
         l3_metrics: This rank reports the L3 tier's metrics: with the tier
@@ -452,10 +534,17 @@ class HostConfig:
         epd_receive_enabled: An EPD prefill node: requests whose images an encode
             node embeds wait for the embeddings before they are scheduled;
             its first stage receives them (``HostBootstrap.epd_receive``).
+        reasoning: The reasoning parser's structural tags and token markers;
+            used for grammar deferral and reasoning usage, also when grammar
+            constraints are off. None without a supported parser.
         grammar: Grammar-constrained decoding's settings; None with
             ``--grammar-backend none``.
         eager_grammar: The forward fills grammar bitmasks from the
             matchers' committed state (``DeviceSpecs.uses_eager_grammar``).
+        prefill_delay: The fused engine's prefill-delay gate,
+            (attempt, any) intervals in rounds and whether a window is one
+            prefill round; None plans prefill every round
+            (``ServerArgs.prefill_delay``).
     """
 
     handshake_address: str
@@ -473,8 +562,14 @@ class HostConfig:
     spec_num_tokens: int | None
     ngram_context_len: int
     request_token_history: bool
+    request_token_history_lookback: int | None
     physical_context_len: int
     kv_total_pages: int
+    kv_token_capacity: int
+    startup_requests: bool
+    max_batch_size: int
+    chunked_prefill_size: int
+    prefix_granularity: int
     rank: int
     replica_ranks: tuple[int, ...]
     pp_ranks: tuple[int, ...] | None
@@ -483,6 +578,7 @@ class HostConfig:
     multimodal: bool
     memory_saver: bool
     memory_regions: tuple[str, ...]
+    allow_reload_forward: bool
     metrics_prometheus_dir: str | None
     metrics_relay_endpoint: str | None
     engine_metrics: bool
@@ -497,16 +593,35 @@ class HostConfig:
     log_spec_accept_lengths: bool
     finish_log: bool
     log_request_stats: bool
+    ttft_trace_sampling_percentage: int
     kv_events: bool
     kv_events_publisher: KVEventsConfig | None
+    otlp_traces_endpoint: str | None
+    trace_sample_ratio: float
+    trace_provider: TraceProvider | None
     l3: L3Settings | None
     l3_metrics: bool
     attn_tp_rank: int
     engine_role: str
     eplb: EplbSettings | None
     epd_receive_enabled: bool
+    reasoning: ReasoningGrammar | None
     grammar: GrammarSettings | None
     eager_grammar: bool
+    # The fused engine's prefill-delay gate, (attempt, any) intervals in
+    # rounds and single_round; None plans prefill every round. See
+    # ``ServerArgs.prefill_delay``.
+    prefill_delay: tuple[int, int, bool] | None
+
+
+def host_in_flight_depth(server_args: ServerArgs) -> int:
+    """``HostConfig.in_flight_depth`` of a rank launched with
+    ``server_args`` (``resolve_in_flight_depth``)."""
+    return resolve_in_flight_depth(
+        disable_overlap_schedule=server_args.disable_overlap_schedule,
+        disaggregation_mode=server_args.disaggregation_mode,
+        pp_size=server_args.mapping.pp_size,
+    )
 
 
 _SAMPLING_PARAMS = msgspec.msgpack.Decoder(SamplingParams)
@@ -519,6 +634,7 @@ _L3_HOST_POOLS: list = []
 class _AdmittedRequest:
     """A request as the data plane holds it from admission to release."""
 
+    admission_id: int
     sampling_params: SamplingParams
     stop_criteria: StopCriteria
     # Read by ``multimodal_context_for_forward``; None for a text request.
@@ -533,30 +649,6 @@ class _Dispatched:
 
     results: ModelExecutionResult
     forward_mode: ForwardMode
-
-
-def _logprob_lists(results) -> tuple | None:
-    """A forward's prompt-row logprobs and top-k alternatives as lists, None
-    when it computed none."""
-
-    def top(values, ids):
-        return (values.tolist(), ids.tolist()) if values is not None else None
-
-    if (
-        results.input_token_logprobs is None
-        and results.input_top_logprobs_val is None
-        and results.output_top_logprobs_val is None
-    ):
-        return None
-    return (
-        (
-            results.input_token_logprobs.tolist()
-            if results.input_token_logprobs is not None
-            else None
-        ),
-        top(results.input_top_logprobs_val, results.input_top_logprobs_idx),
-        top(results.output_top_logprobs_val, results.output_top_logprobs_idx),
-    )
 
 
 class HostDataPlane:
@@ -580,8 +672,12 @@ class HostDataPlane:
         max_encoder_tokens: int | None,
         attn_tp_cpu_group,
         epd_publisher,
+        starting: bool,
     ) -> None:
         self._device = handle
+        # The engine serves its own startup requests (``HostConfig``'s
+        # ``startup_requests``) until ``finish_startup``.
+        self._starting = starting
         # The control plane exports the serving-time compilations.
         self._report_compiles = report_compiles
         self._profiler = profiler
@@ -617,23 +713,38 @@ class HostDataPlane:
         threading.current_thread().name = "tokenspeed::forward"
         self._device.bind_forward_thread()
 
+    def finish_startup(self) -> None:
+        """End the startup requests: the forwards from here on serve."""
+        self._starting = False
+
     def exit_forward_thread(self) -> None:
         """The forward thread's last call, once nothing more is queued:
-        finish a drafter's pending round before the caches close."""
-        self._device.settle()
+        finish a drafter's pending round, then release the expert weights
+        this rank shares with other ranks, before the caches close."""
+        try:
+            self._device.settle()
+        finally:
+            self._device.shutdown_model()
 
     def admit(
         self,
-        requests: list[tuple[str, bytes, list[int], int, list | None]],
+        requests: list[tuple[str, int, bytes, list[int], int, list | None]],
     ) -> None:
-        """Register requests: ``(rid, sampling params, stop token ids, token
+        """Register requests: ``(rid, admission id, sampling params, stop token ids, token
         limit, multimodal frames)`` each. The control plane already resolved
         the parameters (``is_normalized`` is set), so decoding them changes
         nothing. The multimodal frames are a generate request on the wire
         carrying only the request's multimodal inputs, whose features this
         side owns from here on."""
         carriers = []
-        for rid, encoded, stop_token_ids, token_limit, multimodal in requests:
+        for (
+            rid,
+            admission_id,
+            encoded,
+            stop_token_ids,
+            token_limit,
+            multimodal,
+        ) in requests:
             carrier = (
                 zmq_wire.decode_request_frames(multimodal)[0]
                 if multimodal is not None
@@ -642,6 +753,7 @@ class HostDataPlane:
             if carrier is not None:
                 carriers.append(carrier)
             self._requests[rid] = _AdmittedRequest(
+                admission_id=admission_id,
                 sampling_params=_SAMPLING_PARAMS.decode(encoded),
                 stop_criteria=StopCriteria(
                     stop_token_ids=tuple(stop_token_ids), token_limit=token_limit
@@ -654,6 +766,9 @@ class HostDataPlane:
             # Every attention-TP rank admits the same requests in the same
             # order, so the shared-memory reachability exchange pairs up.
             prepare_shm_features(carriers, self._attn_tp_cpu_group)
+
+    def _admission_id(self, rid: str) -> int:
+        return self._requests[rid].admission_id
 
     def execute(
         self,
@@ -707,6 +822,7 @@ class HostDataPlane:
             input_rows, sampled_top_k = logprobs
             planned = PlannedForward(
                 forward_op=forward_op,
+                admission_ids=tuple(request.admission_id for request in requests),
                 sampling_params_list=[request.sampling_params for request in requests],
                 dp_metadata=dp_metadata,
                 grammar_inputs=(
@@ -760,10 +876,13 @@ class HostDataPlane:
         # Each op once, validated before any owner runs one: the Host copies
         # go to the device; the host's L3 executor took the storage
         # operations.
-        cache_ops = cache_ops_from_plan(plan)
-        results = self._device.execute(plan, planned, cache_ops=cache_ops.device)
-        if idle_forward:
-            self._device.run_idle_forward(dp_metadata)
+        cache_ops = cache_ops_from_plan(plan, request_admission=self._admission_id)
+        # The engine's own startup requests let the kernels they reach
+        # prepare their compile variants, as model-only warmup does.
+        with kernel_warmup(enabled=self._starting):
+            results = self._device.execute(plan, planned, cache_ops=cache_ops.device)
+            if idle_forward:
+                self._device.run_idle_forward(dp_metadata)
         self._gc_hooks.note_round(forwarded=results is not None or idle_forward)
         if results is None:
             return None
@@ -774,17 +893,7 @@ class HostDataPlane:
             ),
         )
 
-    def complete(self, dispatched: _Dispatched) -> tuple[
-        list[int],
-        list[int],
-        list[float] | None,
-        list[int] | None,
-        list[list[int]] | None,
-        tuple[int, float] | None,
-        list[int] | None,
-        tuple | None,
-        list[float] | None,
-    ]:
+    def complete(self, dispatched: _Dispatched) -> tuple:
         """Wait for a forward's host copies to land (the control thread: the
         event wait releases the interpreter lock), and return its sampled
         tokens, kept lengths, logprobs, NaN flags and, on the P role, each
@@ -795,40 +904,19 @@ class HostDataPlane:
         grammar; and, when the forward computed any, its planned prompt
         rows' logprobs, their top-k alternatives and the prefill rows'
         sampled-token alternatives (values and ids each), None for those it
-        did not."""
+        did not. Numeric logprob buffers retain CPU storage while Rust copies
+        them into owned vectors; no per-element Python list is built."""
         results = dispatched.results
         results.sync()
         compiles = compile_stats() if self._report_compiles else None
-        return (
-            results.output_tokens.tolist(),
-            results.output_lengths.tolist(),
-            (
-                results.output_logprobs.tolist()
-                if results.output_logprobs is not None
-                else None
-            ),
-            (
-                results.output_nan_flags.tolist()
-                if results.output_nan_flags is not None
-                else None
-            ),
-            (
-                [list(row) for row in results.next_input_ids.tolist()]
-                if results.next_input_ids is not None
-                else None
-            ),
-            (
+        return completed_result(
+            results,
+            serving_compiles=(
                 (compiles.serving_compiles, compiles.serving_seconds)
                 if compiles is not None
                 else None
             ),
-            resolve_grammar_completion(results),
-            _logprob_lists(results),
-            (
-                results.output_token_cumulative_probs.tolist()
-                if results.output_token_cumulative_probs is not None
-                else None
-            ),
+            grammar_terminated_at=resolve_grammar_completion(results),
         )
 
     def note_committed(self, dispatched: _Dispatched) -> None:
@@ -929,6 +1017,13 @@ class HostDataPlane:
         output = self._profiler.profile(request)
         return bool(output.success), str(output.message)
 
+    def reload_forward(self, payload: bytes) -> tuple[bool, str]:
+        """Reload edited forward code and recapture the graphs (a msgpack ``ReloadForwardReqInput``); the engine drained and flushed."""
+        ok, message = self._device.reload_forward(
+            zmq_wire.decode_request_frames([zmq_wire.REQ_TYPE_CONTROL, payload])[0]
+        )
+        return bool(ok), str(message)
+
     def release_memory(self, tags: list[str]) -> None:
         """Free memory regions, in order; the scheduler has drained."""
         for tag in tags:
@@ -1007,6 +1102,81 @@ class HostDataPlane:
         )
 
 
+# Torch's allocator counters only exist in this rank's process; the Rust host
+# sees page counts, not bytes. Sample them here and report through the same
+# output plugin the engine's own metrics use.
+_MEMORY_METRIC_INTERVAL_SECONDS = 10.0
+
+
+class MemoryMetricSampler(threading.Thread):
+    """Emit allocator and driver memory gauges for one rank."""
+
+    def __init__(
+        self,
+        *,
+        sink: MetricEventSink,
+        model_name: str,
+        app_key: str,
+        dp_rank: int,
+        gpu_id: int,
+        device: str,
+    ) -> None:
+        super().__init__(name="ts-memory-metrics", daemon=True)
+        self._sink = sink
+        self._labels = {
+            "model_name": model_name,
+            "app_key": app_key,
+            "dp_rank": str(dp_rank),
+        }
+        self._gpu_id = gpu_id
+        self._device = device
+        self._stopping = threading.Event()
+
+    def stop(self) -> None:
+        self._stopping.set()
+        self.join(timeout=1.0)
+
+    def run(self) -> None:
+        try:
+            device_module = torch.get_device_module(torch.device(self._device).type)
+        except Exception as exc:
+            logger.warning(
+                f"Cannot initialize memory metrics for {self._device}: {exc}"
+            )
+            return
+        warned = False
+        while not self._stopping.wait(_MEMORY_METRIC_INTERVAL_SECONDS):
+            try:
+                free_bytes, total_bytes = device_module.mem_get_info(self._gpu_id)
+                allocated = device_module.memory_allocated(self._gpu_id)
+                reserved = device_module.memory_reserved(self._gpu_id)
+            except Exception as exc:
+                if not warned:
+                    logger.warning(
+                        f"Cannot sample memory on {self._device} GPU {self._gpu_id}: {exc}"
+                    )
+                    warned = True
+                continue
+            mib = 1024**2
+            used = total_bytes - free_bytes
+            values = {
+                "tokenspeed:mem_alloc_mb": allocated / mib,
+                "tokenspeed:mem_reserved_mb": reserved / mib,
+                "tokenspeed:mem_phys_used_mb": used / mib,
+                "tokenspeed:mem_non_torch_mb": max(0.0, used - reserved) / mib,
+            }
+            for metric, value in values.items():
+                self._sink.emit(
+                    MetricEvent(
+                        timestamp_ns=time.time_ns(),
+                        metric=metric,
+                        operation="set",
+                        value=float(value),
+                        labels=dict(self._labels),
+                    )
+                )
+
+
 class HostBootstrap:
     """One rank, built: the scheduler and config for the control thread, and
     the data plane the forward and control threads call."""
@@ -1021,12 +1191,16 @@ class HostBootstrap:
         port_args: PortArgs,
         connection: Connection,
         pd_outbox,
+        host_spans,
         metrics_relay_endpoint: str | None,
     ) -> None:
         self._server_args = server_args
         self._connection = connection
         mapping = server_args.mapping
-        gpu_id = mapping.rank % mapping.nprocs_per_node + server_args.base_gpu_id
+        gpu_id = mapping.gpu_id
+        self._gpu_id = gpu_id
+        self._port_args = port_args
+        self._memory_sampler: MemoryMetricSampler | None = None
         attn_tp_rank = mapping.attn.tp_rank
         dp_rank = mapping.attn.dp_rank
         global_rank = mapping.rank
@@ -1058,7 +1232,8 @@ class HostBootstrap:
             else:
                 draft_model_config = None
             ngram_context_len = engram_context_len(model_config.hf_text_config)
-            if ngram_context_len and mapping.has_pp:
+            in_flight_depth = host_in_flight_depth(server_args)
+            if ngram_context_len and in_flight_depth > 1:
                 raise NotImplementedError(
                     "Engram input history requires PP=1 and in-flight depth <= 1"
                 )
@@ -1091,6 +1266,9 @@ class HostBootstrap:
             )
             # The scheduler's request slots are per attention-DP rank.
             max_batch_size = server_args.max_num_seqs // max(mapping.attn.dp_size, 1)
+            max_resident_requests = (
+                max_batch_size + server_args.disaggregation_decode_extra_slots
+            )
             device = build_device_side(
                 server_args=server_args,
                 model_config=model_config,
@@ -1102,6 +1280,7 @@ class HostBootstrap:
                 overlap_schedule_depth=overlap_schedule_depth,
                 decode_input_tokens=decode_input_tokens,
                 max_batch_size=max_batch_size,
+                max_resident_requests=max_resident_requests,
                 kv_transfer_builder=functools.partial(
                     build_host_peer, outbox=pd_outbox
                 ),
@@ -1132,6 +1311,7 @@ class HostBootstrap:
                 storage_config=storage_config,
                 max_scheduled_tokens=server_args.chunked_prefill_size,
                 max_batch_size=max_batch_size,
+                max_resident_requests=max_resident_requests,
                 decode_input_tokens=decode_input_tokens,
                 overlap_schedule_depth=overlap_schedule_depth,
                 enable_kv_cache_events=kv_events,
@@ -1144,6 +1324,7 @@ class HostBootstrap:
                     draft_model_config=draft_model_config,
                 ),
             )
+
             #: Driven by the control thread only, once the host takes it.
             self.scheduler = Scheduler(scheduler_config)
             self._max_single_request_tokens = self.scheduler.max_single_request_tokens()
@@ -1217,14 +1398,16 @@ class HostBootstrap:
                 ),
                 pg_manager=pg_manager,
             )
+            reasoning = (
+                reasoning_grammar(server_args.reasoning_parser, tokenizer)
+                if server_args.reasoning_parser
+                else None
+            )
             self.config = HostConfig(
                 handshake_address=server_args.zmq_handshake_endpoint(),
                 engine_index=server_args.zmq_engine_index + dp_rank,
                 ready_response=zmq_wire.encode(ready_response),
-                # The chunk pipeline keeps one forward per stage in flight.
-                in_flight_depth=(
-                    mapping.pp_size if mapping.has_pp else overlap_schedule_depth
-                ),
+                in_flight_depth=in_flight_depth,
                 vocab_size=model_config.vocab_size,
                 eos_token_ids=tuple(sorted(eos_token_ids)),
                 top_k_exclusive_max=get_sampling_backend_class(
@@ -1244,10 +1427,25 @@ class HostBootstrap:
                 ),
                 ngram_context_len=ngram_context_len,
                 request_token_history=model_config.requires_request_token_history,
+                request_token_history_lookback=(
+                    resolve_history_seed_lookback(
+                        model_config.model_profile,
+                        (
+                            draft_model_config.model_profile
+                            if draft_model_config is not None
+                            else None
+                        ),
+                    )
+                ),
                 physical_context_len=(
                     model_config.context_len + server_args.spec_context_pad
                 ),
                 kv_total_pages=geometry.num_usable_pages,
+                kv_token_capacity=geometry.token_capacity,
+                startup_requests=server_args.enable_startup_requests,
+                max_batch_size=max_batch_size,
+                chunked_prefill_size=server_args.chunked_prefill_size,
+                prefix_granularity=geometry.prefix_granularity,
                 rank=global_rank,
                 # Every stage runs the same plan, so with a pipeline the replica
                 # is the world (ServerArgs refuses attention DP with one). Under
@@ -1264,12 +1462,20 @@ class HostBootstrap:
                     )
                 ),
                 pp_ranks=tuple(mapping.pp_group) if mapping.has_pp else None,
-                dp_ranks=tuple(mapping.world_group) if mapping.has_attn_dp else None,
-                # One node's ranks reach each other on loopback.
-                collective_bind_host="127.0.0.1" if mapping.nnodes == 1 else "0.0.0.0",
+                dp_ranks=dp_coordination_ranks(
+                    mapping,
+                    requires_forward_coordination=specs.requires_forward_coordination,
+                    shared_l3=l3 is not None,
+                ),
+                # One node's ranks reach each other on loopback; across nodes
+                # they dial get_ip(), so listen on its family's wildcard.
+                collective_bind_host=(
+                    "127.0.0.1" if mapping.nnodes == 1 else wildcard_host_for(get_ip())
+                ),
                 multimodal=model_config.is_multimodal_active,
                 memory_saver=server_args.enable_memory_saver,
                 memory_regions=tuple(regions),
+                allow_reload_forward=server_args.allow_reload_forward,
                 metrics_prometheus_dir=(
                     os.environ["PROMETHEUS_MULTIPROC_DIR"]
                     if metrics_enabled(server_args, "prometheus")
@@ -1289,12 +1495,20 @@ class HostBootstrap:
                 log_spec_accept_lengths=envs.TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS.get(),
                 finish_log=attn_tp_rank == 0,
                 log_request_stats=server_args.enable_log_request_stats,
+                ttft_trace_sampling_percentage=server_args.ttft_trace_sampling_percentage,
                 kv_events=kv_events,
                 kv_events_publisher=(
                     kv_events_config
                     if kv_events
                     and attn_tp_rank == 0
                     and kv_events_config.publisher in (None, "zmq")
+                    else None
+                ),
+                otlp_traces_endpoint=server_args.otlp_traces_endpoint,
+                trace_sample_ratio=server_args.trace_sample_ratio,
+                trace_provider=(
+                    get_trace_provider(server_args.trace_provider)
+                    if server_args.trace_provider is not None
                     else None
                 ),
                 epd_receive_enabled=(
@@ -1304,6 +1518,7 @@ class HostBootstrap:
                     )
                     and model_config.is_multimodal_active
                 ),
+                reasoning=reasoning,
                 grammar=(
                     GrammarSettings(
                         tokenizer_info=grammar_tokenizer_info(
@@ -1316,16 +1531,18 @@ class HostBootstrap:
                             server_args.grammar_compile_timeout_secs
                         ),
                         max_retries=int(server_args.grammar_compile_max_retries),
-                        reasoning=(
-                            reasoning_grammar(server_args.reasoning_parser, tokenizer)
-                            if server_args.reasoning_parser
-                            else None
+                        reasoning=reasoning,
+                        json_framing=inkling2_json_framing(
+                            server_args.reasoning_parser,
+                            tokenizer,
+                            model_config.vocab_size,
                         ),
                     )
                     if server_args.grammar_backend == "xgrammar"
                     else None
                 ),
                 eager_grammar=specs.uses_eager_grammar,
+                prefill_delay=server_args.prefill_delay,
                 eplb=(
                     EplbSettings(
                         specs=specs.expert_rebalance,
@@ -1370,6 +1587,7 @@ class HostBootstrap:
                             else mapping.attn.tp_group
                         ),
                     ),
+                    host_spans=host_spans,
                 ),
                 regions,
                 report_compiles=self.config.engine_metrics,
@@ -1384,6 +1602,7 @@ class HostBootstrap:
                 epd_publisher=(
                     epd_receive.publisher if epd_receive is not None else None
                 ),
+                starting=server_args.enable_startup_requests,
             )
             self._device = device.handle
 
@@ -1418,26 +1637,69 @@ class HostBootstrap:
             }
         )
 
+    def _start_memory_metrics(self) -> None:
+        """Sample this rank's accelerator memory, if an output plugin is on.
+
+        Only the rank that owns EngineMetrics reports, and only when a raw
+        reporter (not just Prometheus) selected this process's sink.
+        """
+        if self._memory_sampler is not None:
+            return
+        if not raw_metrics_enabled(self._server_args):
+            return
+        if self._server_args.mapping.attn.tp_rank != 0:
+            return
+        configs = self._port_args.metrics_producer_configs
+        if not configs:
+            return
+        try:
+            metrics_service.connect(configs)
+            sink = metrics_service.get_event_sink()
+        except Exception:
+            logger.warning("memory metrics are unavailable", exc_info=True)
+            return
+        if sink is None:
+            return
+        self._memory_sampler = MemoryMetricSampler(
+            sink=sink,
+            model_name=self._server_args.served_model_name or "",
+            app_key=self._server_args.app_key or "",
+            dp_rank=self._server_args.mapping.attn.dp_rank or 0,
+            gpu_id=self._gpu_id,
+            device=self._server_args.device,
+        )
+        self._memory_sampler.start()
+
     def enter_serving(self) -> None:
         """End startup: from here on a host synchronization or a kernel
         compilation on the data plane is a stall."""
+        self.data_plane.finish_startup()
         arm_data_plane_sync_debug(self._server_args.device)
         mark_jit_compile_serving()
         freeze_startup_heap()
+        self._start_memory_metrics()
 
     def close(self) -> None:
         """Release the device side's caches, once the forward thread and the
         L3 executor have stopped."""
+        if self._memory_sampler is not None:
+            self._memory_sampler.stop()
+            self._memory_sampler = None
         self._device.shutdown_cache()
 
 
 def bootstrap(
-    control_fd: int, pd_outbox, weight_update_commit_protocol: int = 0
+    control_fd: int,
+    pd_outbox,
+    weight_update_commit_protocol: int = 0,
+    host_spans=None,
 ) -> HostBootstrap | EncodeBootstrap:
     """Build this host's rank from the arguments the launcher sends on
     ``control_fd``; with PD, its transfer peer reaches the host through
     ``pd_outbox`` (see ``pd/host_peer.py``). An EPD encode rank runs the
-    host's encode mode instead (``epd/encode_host.py``)."""
+    host's encode mode instead (``epd/encode_host.py``). ``host_spans`` is
+    the host's span recording, which a profile merges into its trace
+    (``engine/profiler.py``); an older host binary passes none."""
     connection = Connection(control_fd)
     server_args, port_args, metrics_relay_endpoint = connection.recv()
     # Reject an older host binary before constructing a model or process
@@ -1453,7 +1715,12 @@ def bootstrap(
     if server_args.disaggregation_mode == "encode":
         return EncodeBootstrap(server_args, port_args, connection)
     return HostBootstrap(
-        server_args, port_args, connection, pd_outbox, metrics_relay_endpoint
+        server_args,
+        port_args,
+        connection,
+        pd_outbox,
+        host_spans,
+        metrics_relay_endpoint,
     )
 
 

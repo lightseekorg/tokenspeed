@@ -79,6 +79,7 @@ from tokenspeed.runtime.utils.network import (
     get_ip,
     get_local_ip_by_remote,
     join_host_port,
+    split_host_port,
 )
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
 
@@ -296,7 +297,7 @@ class EncodeDataPlane:
         # (the event after a batch's ring copies, its items' outcomes), in
         # batch order: appended by the forward thread, read by the control
         # thread.
-        self._copies: list[tuple[torch.cuda.Event | None, list[tuple]]] = []
+        self._copies: list[tuple[Any | None, list[tuple]]] = []
         self._lock = threading.Lock()
         self._gc_hooks = GcHooks(full_collection_interval=FULL_COLLECTION_INTERVAL)
 
@@ -304,8 +305,8 @@ class EncodeDataPlane:
         """Called once by the host's forward thread, before its first
         operation."""
         threading.current_thread().name = "tokenspeed::forward"
-        if self._device.type == "cuda":
-            torch.cuda.set_device(self._device)
+        if self._device.type in ("cuda", "npu"):
+            torch.get_device_module(self._device.type).set_device(self._device)
 
     def admit(self, requests: list[tuple[int, list[bytes]]]) -> list[bool]:
         """Take encode requests ``(admission, wire frames)``; say for each
@@ -409,8 +410,8 @@ class EncodeDataPlane:
                     nbytes += deep.numel() * deep.element_size()
                 self._cache.put(item.hash, (item.encoded, deep), nbytes)
         event = None
-        if self._device.type == "cuda":
-            event = torch.cuda.Event()
+        if self._device.type in ("cuda", "npu"):
+            event = torch.get_device_module(self._device.type).Event()
             event.record()
         with self._lock:
             self._copies.append((event, outcomes))
@@ -473,8 +474,8 @@ class EncodeBootstrap:
             )
         global_rank = mapping.rank
         attn_tp_rank = mapping.attn.tp_rank
-        gpu_id = mapping.rank % mapping.nprocs_per_node + server_args.base_gpu_id
-        device = f"cuda:{gpu_id}"
+        gpu_id = mapping.gpu_id
+        device = torch.device(server_args.device, gpu_id)
         faulthandler.enable()
         configure_logger(server_args, prefix=f" ATTN TP RANK {attn_tp_rank}")
         install_jit_compile_check()
@@ -540,7 +541,7 @@ class EncodeBootstrap:
         # Rank 0 hosts the node's bootstrap server; every rank registers with
         # it.
         bootstrap_host = (
-            server_args.dist_init_addr.split(":", 1)[0]
+            split_host_port(server_args.dist_init_addr)[0]
             if server_args.dist_init_addr
             else local_ip
         )

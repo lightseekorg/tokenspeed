@@ -114,7 +114,7 @@ def head_norm(head_dim: int, weight_offset: float, seed: int) -> HeadNorm:
         w = torch.rand(head_dim, device="cuda", generator=g) - 0.5
         return (w if weight_offset else w + 1.0).to(BF16)
 
-    return HeadNorm(weight(), weight(), weight_offset, 1e-6)
+    return HeadNorm(weight(), weight(), weight_offset, 1e-6, round_before_rope=False)
 
 
 def run_gqa(
@@ -149,6 +149,7 @@ def run_gqa(
         norm=norm,
         rotary=rotary,
         cache=HeadKVCache(k_cache=k_cache, v_cache=v_cache, scales=None, slots=slots),
+        query_dtype=q.dtype,
         return_kv=return_kv,
         solution=solution,
         override=None,

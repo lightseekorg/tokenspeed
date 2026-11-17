@@ -33,11 +33,11 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 from ci_system.ci_register import register_cuda_ci
 from tokenspeed_kernel.ops.sampling.cuda import fused_topk_topp_renorm
-from tokenspeed_kernel.ops.sampling.flashinfer import softmax
-from tokenspeed_kernel.thirdparty.cuda.eagle_harness import (
+from tokenspeed_kernel.ops.sampling.eagle_harness import (
     eagle_harness_residual_sample,
     eagle_harness_tree_reject_sample,
 )
+from tokenspeed_kernel.ops.sampling.flashinfer import softmax
 
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 from tokenspeed.runtime.sampling.backends.base import SamplingBackendConfig
@@ -179,7 +179,7 @@ def test_verify_tree_skips_greedy_and_uncut_rows_without_changing_decisions(
             sp.normalize(None)
             sampling_params.append(sp)
         backend.prepare_step(
-            request_ids=[f"skip_{seed}_{i}" for i in range(bs)],
+            admission_ids=[seed * bs + i + 1 for i in range(bs)],
             request_pool_indices=pool,
             sampling_params_list=sampling_params,
             num_tokens_per_req=n,

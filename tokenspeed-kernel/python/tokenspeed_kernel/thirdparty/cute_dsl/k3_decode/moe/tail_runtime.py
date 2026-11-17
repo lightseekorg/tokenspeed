@@ -37,7 +37,11 @@ CAP, POLL_CAP = 64, 8
 # B32 52.20/53.18, B64 79.27/81.50; TP16 B16 33.98/34.49, B32 42.19/42.52, B64
 # 65.05/60.51.
 TWOSHOT = {8: "", 16: "33-64:1"}
-# WaveMoeTail batches that release the next AttnRes at entry.
+# WaveMoeTail batches that release the next AttnRes at entry. The AttnRes then runs its
+# saved-block statistics and exchange beside the tail and only its Lamport poll waits
+# for the output rows. Not the TP8 B5-8 tails: they poll the shared rows of the urgent
+# side stream (``SharedFront.gated``), and the kernels their entry release lets in can
+# hold the SMs that side stream still needs (the TP8 chain test deadlocks).
 EARLY = {8: "9-64:1", 16: "9-64:1"}
 # WaveMoeTail batches whose up projection runs on tcgen05 (B9+; 1-GPU WaveMoeTail us
 # mma.sync vs tcgen05, B16/32/64: TP8 4.53/5.80/9.05 vs 4.45/5.26/7.80, TP16 two-shot

@@ -2353,11 +2353,285 @@ register_kernel(
 )(triton_qsa_sparse_attention)
 
 
+# ===-----------------------------------------------------------------------===#
+# BF16 KV scratch: copy one call's FP8 pages and remap its slots
+# ===-----------------------------------------------------------------------===#
+
+# A copy program moves _BF16_SCRATCH_CHUNK_SLOTS slots of one page, a tile of
+# at most _BF16_SCRATCH_TILE_ELEMS elements (16 per thread at 8 warps) at a time.
+_BF16_SCRATCH_CHUNK_SLOTS = 32
+_BF16_SCRATCH_TILE_ELEMS = 4096
+_BF16_SCRATCH_COPY_WARPS = 8
+_BF16_SCRATCH_REMAP_BLOCK = 1024
+_BF16_SCRATCH_REMAP_WARPS = 4
+
+
+@triton.jit(
+    do_not_specialize=[
+        "num_requests",
+        "num_slots",
+        "num_pool_pages",
+        "stride_table_row",
+    ]
+)
+def _qsa_bf16_kv_scratch_copy_kernel(
+    k_cache,
+    v_cache,
+    k_scratch,
+    v_scratch,
+    page_table,
+    seq_lens,
+    page_map,
+    num_requests,
+    num_slots,
+    num_pool_pages,
+    stride_cache_slot,
+    stride_table_row,
+    PAGE_SIZE: tl.constexpr,
+    SLOT_ELEMS: tl.constexpr,
+    SLOT_PAD: tl.constexpr,
+    CHUNK_SLOTS: tl.constexpr,
+    BLOCK_SLOTS: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    scratch_page = tl.program_id(0).to(tl.int64) + 1
+    chunk = tl.program_id(1)
+    # Requests own consecutive scratch pages from page 1, in row order. The
+    # scan is branch-free; a page past every request copies nothing.
+    request = tl.full((), -1, tl.int64)
+    column = tl.full((), 0, tl.int64)
+    first = tl.full((), 1, tl.int64)
+    for r in range(0, num_requests):
+        length = tl.load(seq_lens + r).to(tl.int64)
+        count = (tl.maximum(length, 0) + PAGE_SIZE - 1) // PAGE_SIZE
+        inside = (scratch_page >= first) & (scratch_page < first + count)
+        request = tl.where(inside, r, request)
+        column = tl.where(inside, scratch_page - first, column)
+        first += count
+    owned = request >= 0
+    physical = tl.load(
+        page_table + tl.maximum(request, 0) * stride_table_row + column,
+        mask=owned,
+        other=0,
+    ).to(tl.int64)
+    owned = owned & (physical >= 0) & (physical < num_pool_pages)
+    physical = tl.where(owned, physical, 0)
+    # Requests sharing a physical page write identical copies; either id is right.
+    tl.store(page_map + physical, scratch_page.to(tl.int32), mask=owned & (chunk == 0))
+
+    slot_offsets = tl.arange(0, BLOCK_SLOTS)
+    inner = tl.arange(0, SLOT_PAD)
+    inner_mask = inner < SLOT_ELEMS
+    chunk_first = chunk * CHUNK_SLOTS
+    for start in tl.static_range(0, CHUNK_SLOTS, BLOCK_SLOTS):
+        in_page = chunk_first + start + slot_offsets
+        source_slot = physical * PAGE_SIZE + in_page
+        target_slot = scratch_page * PAGE_SIZE + in_page
+        rows_ok = owned & (in_page < PAGE_SIZE) & (source_slot < num_slots)
+        mask = rows_ok[:, None] & inner_mask[None, :]
+        source = source_slot[:, None] * stride_cache_slot + inner[None, :]
+        target = target_slot[:, None] * SLOT_ELEMS + inner[None, :]
+        keys = tl.load(k_cache + source, mask=mask, other=0.0)
+        values = tl.load(v_cache + source, mask=mask, other=0.0)
+        # E4M3 -> FP32 -> BF16 is exact, as in the in-register FP8 conversion.
+        tl.store(k_scratch + target, keys.to(tl.float32).to(tl.bfloat16), mask=mask)
+        tl.store(v_scratch + target, values.to(tl.float32).to(tl.bfloat16), mask=mask)
+
+
+@triton.jit(
+    do_not_specialize=[
+        "num_pool_pages",
+        "scratch_pages",
+        "stride_in_row",
+        "stride_out_row",
+    ]
+)
+def _qsa_bf16_kv_scratch_remap_kernel(
+    selected_slots,
+    page_map,
+    out_slots,
+    num_pool_pages,
+    scratch_pages,
+    stride_in_row,
+    stride_out_row,
+    WIDTH: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    BLOCK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    row = tl.program_id(0).to(tl.int64)
+    columns = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = columns < WIDTH
+    slots = tl.load(
+        selected_slots + row * stride_in_row + columns, mask=mask, other=0
+    ).to(tl.int64)
+    valid = slots > 0
+    physical = tl.where(valid, slots, 0)
+    page = physical // PAGE_SIZE
+    scratch_page = tl.load(
+        page_map + page, mask=mask & valid & (page < num_pool_pages), other=0
+    ).to(tl.int64)
+    # Valid slots read only entries this call's copy wrote. A slot outside
+    # its request's pages (a caller error) reads a stale entry: it becomes
+    # padding or another page of this call, never an address past the copy.
+    mapped = (scratch_page > 0) & (scratch_page < scratch_pages)
+    remapped = tl.where(mapped, scratch_page * PAGE_SIZE + physical % PAGE_SIZE, -1)
+    # Padding keeps its value: kernels mask every non-positive slot.
+    tl.store(
+        out_slots + row * stride_out_row + columns,
+        tl.where(valid, remapped, slots).to(tl.int32),
+        mask=mask,
+    )
+
+
+def _bf16_scratch_copy_tiling(page_size: int, slot_elems: int) -> tuple[int, int, int]:
+    slot_pad = triton.next_power_of_2(slot_elems)
+    chunk_slots = min(_BF16_SCRATCH_CHUNK_SLOTS, triton.next_power_of_2(page_size))
+    block_slots = max(1, min(chunk_slots, _BF16_SCRATCH_TILE_ELEMS // slot_pad))
+    return slot_pad, chunk_slots, block_slots
+
+
+def triton_qsa_bf16_kv_scratch(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    selected_slots: torch.Tensor,
+    page_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    num_requests: int,
+    page_size: int,
+    scratch_pages: int,
+    k_scratch: torch.Tensor,
+    v_scratch: torch.Tensor,
+    page_map: torch.Tensor,
+    out_slots: torch.Tensor,
+    enable_pdl: bool,
+) -> torch.Tensor:
+    """Portable Triton copy and slot remap; see ``qsa_bf16_kv_scratch``."""
+    if k_cache.ndim != 3 or v_cache.shape != k_cache.shape:
+        raise ValueError("QSA BF16 scratch needs matching [slots, kv_heads, dim] K/V")
+    if k_cache.dtype is not torch.float8_e4m3fn or v_cache.dtype is not k_cache.dtype:
+        raise TypeError("QSA BF16 scratch reads an FP8 E4M3FN K/V cache")
+    slot_elems = k_cache.shape[1] * k_cache.shape[2]
+    for cache in (k_cache, v_cache):
+        if cache.stride(2) != 1 or cache.stride(1) != k_cache.shape[2]:
+            raise ValueError("QSA BF16 scratch needs contiguous heads within a slot")
+    if v_cache.stride(0) != k_cache.stride(0):
+        raise ValueError("QSA BF16 scratch needs one slot stride for K and V")
+    if (
+        k_scratch.dtype is not torch.bfloat16
+        or v_scratch.dtype is not torch.bfloat16
+        or k_scratch.shape[1:] != k_cache.shape[1:]
+        or v_scratch.shape != k_scratch.shape
+        or not k_scratch.is_contiguous()
+        or not v_scratch.is_contiguous()
+    ):
+        raise ValueError(
+            "QSA BF16 scratch must be contiguous BF16 [slots, kv_heads, dim]"
+        )
+    if page_size <= 0 or k_scratch.shape[0] % page_size:
+        raise ValueError("QSA BF16 scratch must hold whole pages")
+    if not 1 <= scratch_pages <= k_scratch.shape[0] // page_size:
+        raise ValueError(
+            f"QSA BF16 scratch holds {k_scratch.shape[0] // page_size} pages, "
+            f"call needs {scratch_pages}"
+        )
+    if selected_slots.ndim != 2 or selected_slots.dtype is not torch.int32:
+        raise ValueError("QSA selected slots must be int32 [rows, width]")
+    if out_slots.shape != selected_slots.shape or out_slots.dtype is not torch.int32:
+        raise ValueError("QSA remapped slots must match the selected slots")
+    if selected_slots.stride(1) != 1 or out_slots.stride(1) != 1:
+        raise ValueError("QSA slot rows must be contiguous")
+    if page_map.dtype is not torch.int32 or not page_map.is_contiguous():
+        raise ValueError("QSA scratch page map must be contiguous int32")
+    num_pool_pages = -(-k_cache.shape[0] // page_size)
+    if page_map.numel() < num_pool_pages:
+        raise ValueError("QSA scratch page map must cover every cache page")
+    if page_table.ndim != 2 or page_table.stride(1) != 1:
+        raise ValueError("QSA page table must have contiguous columns")
+    if page_table.shape[0] < num_requests or seq_lens.shape[0] < num_requests:
+        raise ValueError("QSA scratch metadata must cover every request")
+    pdl = bool(enable_pdl) and _is_nvidia
+    launch = {"launch_pdl": True} if pdl else {}
+    if scratch_pages > 1 and num_requests > 0:
+        slot_pad, chunk_slots, block_slots = _bf16_scratch_copy_tiling(
+            page_size, slot_elems
+        )
+        grid = (scratch_pages - 1, triton.cdiv(page_size, chunk_slots))
+        _qsa_bf16_kv_scratch_copy_kernel[grid](
+            k_cache,
+            v_cache,
+            k_scratch,
+            v_scratch,
+            page_table,
+            seq_lens,
+            page_map,
+            num_requests,
+            k_cache.shape[0],
+            num_pool_pages,
+            k_cache.stride(0),
+            page_table.stride(0),
+            PAGE_SIZE=page_size,
+            SLOT_ELEMS=slot_elems,
+            SLOT_PAD=slot_pad,
+            CHUNK_SLOTS=chunk_slots,
+            BLOCK_SLOTS=block_slots,
+            ENABLE_PDL=pdl,
+            num_warps=_BF16_SCRATCH_COPY_WARPS,
+            **launch,
+        )
+    rows, width = selected_slots.shape
+    if rows:
+        _qsa_bf16_kv_scratch_remap_kernel[
+            (rows, triton.cdiv(width, _BF16_SCRATCH_REMAP_BLOCK))
+        ](
+            selected_slots,
+            page_map,
+            out_slots,
+            num_pool_pages,
+            scratch_pages,
+            selected_slots.stride(0),
+            out_slots.stride(0),
+            WIDTH=width,
+            PAGE_SIZE=page_size,
+            BLOCK=_BF16_SCRATCH_REMAP_BLOCK,
+            ENABLE_PDL=pdl,
+            num_warps=_BF16_SCRATCH_REMAP_WARPS,
+            **launch,
+        )
+    return out_slots
+
+
+register_kernel(
+    "attention",
+    "qsa_bf16_kv_scratch",
+    name="triton_qsa_bf16_kv_scratch",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=frozenset(
+        {
+            format_signature(
+                k_cache=dense_tensor_format(torch.float8_e4m3fn),
+                k_scratch=dense_tensor_format(torch.bfloat16),
+            )
+        }
+    ),
+    priority=Priority.PORTABLE,
+)(triton_qsa_bf16_kv_scratch)
+
+
 __all__ = [
     "qwen4_exp_qsa_compress_and_store",
     "qwen4_exp_qsa_prepare_metadata",
     "qwen4_exp_qsa_recent_write",
     "qwen4_exp_qsa_selected_slots",
+    "triton_qsa_bf16_kv_scratch",
     "triton_qsa_block_scores",
     "triton_qsa_block_topk_select",
     "triton_qsa_block_topk_stream",

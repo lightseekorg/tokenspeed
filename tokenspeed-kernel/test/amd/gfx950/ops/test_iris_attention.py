@@ -43,25 +43,41 @@ def _require_iris():
 
 @pytest.mark.parametrize("rank", (0, 7))
 @pytest.mark.parametrize(
-    "operation,has_residual", (("reduce", False), ("reduce", True), ("gather", False))
+    "operation,has_residual,residual_is_sharded",
+    (
+        ("reduce", False, False),
+        ("reduce", True, False),
+        ("reduce", True, True),
+        ("published", False, False),
+        ("published", True, True),
+        ("gather", False, False),
+    ),
 )
-def test_attention_row_vector_codegen(rank, operation, has_residual, tmp_path):
+def test_attention_row_vector_codegen(
+    rank, operation, has_residual, residual_is_sharded, tmp_path
+):
     """Preserve vector payload traffic and completion signaling for runtime rows."""
     from tokenspeed_kernel._triton import gluon, triton
     from tokenspeed_kernel.ops.communication._iris.kimi_k3.allreduce_sharded import (
         iris_k3attn_pull_scatter,
+        iris_k3attn_pull_scatter_published,
         iris_k3attn_push_gather,
     )
 
-    fn = iris_k3attn_pull_scatter if operation == "reduce" else iris_k3attn_push_gather
+    fn = {
+        "reduce": iris_k3attn_pull_scatter,
+        "published": iris_k3attn_pull_scatter_published,
+        "gather": iris_k3attn_push_gather,
+    }[operation]
     constants = {
         "RANK": rank,
         "BLOCK_ELEMENTS": 2048,
         "NUM_PROGRAMS": 24 if operation == "reduce" else 32,
         "NUM_WARPS": 4,
     }
-    if operation == "reduce":
+    if operation != "gather":
         constants["HAS_RESIDUAL"] = has_residual
+        constants["RESIDUAL_IS_SHARDED"] = residual_is_sharded
     else:
         from tokenspeed_kernel.ops.communication._iris.all_reduce import (
             iris_arch_policy,
@@ -69,15 +85,17 @@ def test_attention_row_vector_codegen(rank, operation, has_residual, tmp_path):
         from tokenspeed_kernel.platform import ArchVersion
 
         constants["WAIT_STORES"] = iris_arch_policy(ArchVersion(9, 5)).wait_stores
+    if operation == "published":
+        constants["TILE_ROWS"] = 256
     signature = {}
     for name in fn.arg_names:
         if name in constants:
             continue
         if name.startswith("heap_base_"):
             signature[name] = "i64"
-        elif name in ("LOCAL_ROWS", "PARTITION_ELEMENTS"):
+        elif name in ("LOCAL_ROWS", "PARTITION_ELEMENTS") or name.startswith("TARGET"):
             signature[name] = "i32"
-        elif name == "ready_flags":
+        elif name in ("ready_flags", "counters"):
             signature[name] = "*i32"
         else:
             signature[name] = "*bf16"
@@ -98,10 +116,12 @@ def test_attention_row_vector_codegen(rank, operation, has_residual, tmp_path):
         options={"num_warps": 4},
     )
     assembly = kernel.asm["amdgcn"]
-    (tmp_path / f"attention-{operation}-rank{rank}.amdgcn").write_text(assembly)
+    (
+        tmp_path / f"attention-{operation}-{residual_is_sharded}-rank{rank}.amdgcn"
+    ).write_text(assembly)
     lines = assembly.splitlines()
-    loads = 8 + int(has_residual) if operation == "reduce" else 1
-    stores = 1 if operation == "reduce" else 8
+    loads = 1 if operation == "gather" else 8 + int(has_residual)
+    stores = 8 if operation == "gather" else 1
     assert sum("buffer_load_dwordx4" in line for line in lines) == loads
     assert sum("buffer_store_dwordx4" in line for line in lines) == stores
     if operation == "gather":
@@ -276,6 +296,9 @@ def _attention_worker(rank: int, port: int) -> None:
                         out_norm_weight=norm,
                         out_norm_eps=1e-6,
                         num_valid_blocks=valid_blocks,
+                        residual_is_sharded=False,
+                        published=None,
+                        defer_gather=False,
                     )
                 warmed_variants.add(variant)
                 assert mixed is not None
@@ -314,6 +337,9 @@ def _attention_worker(rank: int, port: int) -> None:
                             out_norm_weight=norm,
                             out_norm_eps=1e-6,
                             num_valid_blocks=valid_blocks,
+                            residual_is_sharded=False,
+                            published=None,
+                            defer_gather=False,
                         )
                     assert captured is not None
                     for sign in (-1, 1):
@@ -354,6 +380,9 @@ def _attention_worker(rank: int, port: int) -> None:
                         out_norm_weight=norm,
                         out_norm_eps=1e-6,
                         num_valid_blocks=valid_blocks,
+                        residual_is_sharded=False,
+                        published=None,
+                        defer_gather=False,
                     )
                     is None
                 )
@@ -396,6 +425,9 @@ def _attention_worker(rank: int, port: int) -> None:
                 out_norm_weight=norm,
                 out_norm_eps=1e-6,
                 num_valid_blocks=8,
+                residual_is_sharded=False,
+                published=None,
+                defer_gather=False,
             )
             is None
         )
@@ -416,6 +448,9 @@ def _attention_worker(rank: int, port: int) -> None:
             out_norm_weight=norm,
             out_norm_eps=1e-6,
             num_valid_blocks=0,
+            residual_is_sharded=False,
+            published=None,
+            defer_gather=False,
         )
         is None
     )
@@ -441,6 +476,9 @@ def _attention_worker(rank: int, port: int) -> None:
                 out_norm_weight=norm,
                 out_norm_eps=1e-6,
                 num_valid_blocks=8,
+                residual_is_sharded=False,
+                published=None,
+                defer_gather=False,
             )
             is None
         )
@@ -473,6 +511,9 @@ def _attention_worker(rank: int, port: int) -> None:
         out_norm_weight=norm,
         out_norm_eps=1e-6,
         num_valid_blocks=8,
+        residual_is_sharded=False,
+        published=None,
+        defer_gather=False,
     )
     assert alias_result is not None
     torch.testing.assert_close(
@@ -495,6 +536,7 @@ def _attention_worker(rank: int, port: int) -> None:
         prefix_is_sharded=False,
         norm_weight=None,
         eps=None,
+        shared_reduced=None,
     )
     assert expected_moe is not None
     expected_moe = expected_moe.clone()
@@ -514,6 +556,9 @@ def _attention_worker(rank: int, port: int) -> None:
             out_norm_weight=norm,
             out_norm_eps=1e-6,
             num_valid_blocks=8,
+            residual_is_sharded=False,
+            published=None,
+            defer_gather=False,
         )
         assert mixed is not None
         shard, activation = mixed
@@ -528,6 +573,7 @@ def _attention_worker(rank: int, port: int) -> None:
             prefix_is_sharded=True,
             norm_weight=None,
             eps=None,
+            shared_reduced=None,
         )
         assert moe is not None
         partial.copy_(source)
@@ -576,6 +622,7 @@ def _attention_worker(rank: int, port: int) -> None:
                 prefix_is_sharded=False,
                 norm_weight=None,
                 eps=None,
+                shared_reduced=None,
             )
             assert reference_moe is not None
             expected_moe = reference_moe.clone()

@@ -310,6 +310,7 @@ if is_decode_available():
             # Automatic selection must preserve the arena's null state. The
             # legacy BF16 implementation redirects negative indices to row 0.
             "state_dtype": frozenset({torch.float32}),
+            "padding_safe": frozenset({False}),
             "strided_qkv": frozenset({False}),
         },
     )
@@ -380,6 +381,9 @@ if is_decode_available():
         priority=Priority.SPECIALIZED,
         traits={
             "head_dim": frozenset({SUPPORTED_HEAD_DIM}),
+            "padding_safe": frozenset({False}),
+            "value_head_dim": frozenset({SUPPORTED_HEAD_DIM}),
+            "tree": frozenset({False}),
             "state_dtype": frozenset({torch.float32}),
             "separate_output_state": frozenset({False}),
             "strided_qkv": frozenset({False}),
@@ -433,31 +437,30 @@ if is_decode_available():
         exclusive with ``intermediate_states_buffer`` and requires
         ``disable_state_update=False``.
 
-        Dispatches to the bf16-state MTP kernel when ``initial_state`` is
-        bfloat16 with K == V == 128 (mirrors gdn_decode_step's own bf16/fp32
-        dispatch via gated_delta_rule_decode_pretranspose); otherwise uses the
-        float32-only standalone MTP entry point.
+        The registered geometry is K == V == 128 for both state dtypes.
+        BF16 state uses the BF16 MTP kernel; FP32 state uses the standalone
+        entry point. Direct BF16 calls outside this geometry are rejected.
 
         Returns the [B, T, HV, V] decode output (q.dtype).
         """
         if tree_ancestors is not None or replay_payload is not None:
             raise NotImplementedError(
-                "FlashInfer GDN MTP kernels follow a chain; draft trees run the Triton kernel"
+                "FlashInfer GDN MTP kernels do not support trees or replay payloads"
             )
         if output_state is not None:
             raise NotImplementedError(
                 "FlashInfer GDN MTP kernels write states into initial_state only"
             )
+        K_dim = q.shape[-1]
+        V_dim = v.shape[-1]
+        use_bf16_state = initial_state.dtype == torch.bfloat16
+        if use_bf16_state and (
+            K_dim != SUPPORTED_HEAD_DIM or V_dim != SUPPORTED_HEAD_DIM
+        ):
+            raise NotImplementedError("FlashInfer BF16 GDN MTP requires K=V=128")
         # Normalize decay inputs for FlashInfer's FP32 CuteDSL/DLPack boundary.
         A_log = A_log.detach().float()
         dt_bias = dt_bias.detach().float()
-        K_dim = q.shape[-1]
-        V_dim = v.shape[-1]
-        use_bf16_state = (
-            initial_state.dtype == torch.bfloat16
-            and K_dim == SUPPORTED_HEAD_DIM
-            and V_dim == SUPPORTED_HEAD_DIM
-        )
         if use_bf16_state:
             out = _gated_delta_rule_bf16_mtp(
                 enable_pdl=pdl_enabled(),

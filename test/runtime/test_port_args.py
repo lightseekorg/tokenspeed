@@ -1,3 +1,5 @@
+import pytest
+
 from tokenspeed.runtime.execution.distributed_initializer import DistributedConfig
 from tokenspeed.runtime.utils import server_args as server_args_module
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
@@ -40,3 +42,23 @@ def test_distributed_config_uses_resolved_dist_init_addr():
     )
 
     assert config.dist_init_addr == "127.0.0.1:8294"
+
+
+def test_ipv6_dist_init_addr_brackets_every_endpoint(monkeypatch):
+    args = ServerArgs(model="x", dist_init_addr="[fd00::2]:8284")
+    monkeypatch.setattr(server_args_module, "is_port_available", lambda port: True)
+
+    port_args = PortArgs.init_new(args)
+
+    assert port_args.dist_init_addr == "[fd00::2]:8284"
+    assert port_args.tokenizer_ipc_name == "tcp://[fd00::2]:8285"
+    assert port_args.rpc_ipc_name == "tcp://[fd00::2]:8287"
+    assert port_args.metrics_ipc_name == "tcp://[fd00::2]:8288"
+    assert port_args.scheduler_input_ipc_name == "tcp://[fd00::2]:8289"
+
+
+def test_malformed_dist_init_addr_is_rejected():
+    args = ServerArgs(model="x", dist_init_addr="fd00::2")
+
+    with pytest.raises(ValueError, match="host:port"):
+        PortArgs.init_new(args)

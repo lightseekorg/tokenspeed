@@ -39,6 +39,7 @@ from cutlass.cute.arch.nvvm_wrappers import FULL_MASK
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Float32, Int, Int32
 from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass.experimental import primitives as prims
 
 # ============================================================================
 # Torch to CuTE dtype mapping
@@ -124,6 +125,23 @@ def store_shared_remote(
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
     )
+
+
+@cute.jit
+def mbarrier_wait_acquire_cluster(mbar_ptr: cute.Pointer, phase: Int) -> None:
+    """Wait for a phase that peer CTAs complete with ``store_shared_remote``.
+
+    The peers' ``st.async`` complete-tx releases at cluster scope; the default
+    CTA-scope wait does not synchronize with it, so the reads of the delivered
+    slots would be unordered against the stores. A relaxed cluster-scope
+    try-wait followed by ``fence.acquire.sync_restrict::shared::cluster.cluster``
+    orders them, at no extra SASS cost.
+    """
+    while not prims.mbarrier_try_wait_parity(
+        mbar_ptr, phase, scope=prims.MBarrierScope.CLUSTER, order=prims.MemOrder.RELAXED
+    ):
+        pass
+    prims.fence_sync_restrict(prims.MemOrder.ACQUIRE)
 
 
 @cute.jit
@@ -620,7 +638,7 @@ class ArgmaxKernel(ReductionBase):
                     peer_cta_rank_in_cluster=lane_idx,
                 )
 
-            cute.arch.mbarrier_wait(mbar_ptr, phase=0)
+            mbarrier_wait_acquire_cluster(mbar_ptr, 0)
             block_reduce_val = -tXsX.element_type.inf
             block_reduce_argmax = Int32(0xFFFFFFFF)
             num_iter = cute.ceil_div(warps_per_row * cluster_n, cute.arch.WARP_SIZE)

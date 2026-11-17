@@ -22,12 +22,11 @@
 
 from __future__ import annotations
 
-import importlib.util
-
 import torch
 from tokenspeed_kernel.ops.attention.kpool._triton.expand import (
     expand_kpool_to_flat_kv,
 )
+from tokenspeed_kernel.ops.kvcache.index_k_scale import index_k_scale_dtype
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -53,17 +52,10 @@ def _kpool_cache_views(
         (page_stride, groups * 4, 1),
         cache.storage_offset() + page_size * head_dim,
     )
-    return values.view(torch.float8_e4m3fn), scales.view(torch.float32)
+    return values.view(torch.float8_e4m3fn), scales.view(index_k_scale_dtype())
 
 
-if (
-    current_platform().is_hopper_plus
-    and importlib.util.find_spec("deep_gemm") is not None
-    and importlib.util.find_spec("trtllm_kernel") is not None
-):
-    from tokenspeed_kernel.ops.attention.dsa.deep_gemm import (
-        deep_gemm_dsa_prefill_topk,
-    )
+if current_platform().is_hopper_plus:
 
     @register_kernel(
         "attention",
@@ -174,6 +166,11 @@ if (
                 out=out,
                 lens_out=lens_out,
             )
+
+        # The all-pools path above does not need the native scoring backend.
+        from tokenspeed_kernel.ops.attention.dsa.deep_gemm import (
+            deep_gemm_dsa_prefill_topk,
+        )
 
         values, scales = _kpool_cache_views(
             pooled_k_cache,

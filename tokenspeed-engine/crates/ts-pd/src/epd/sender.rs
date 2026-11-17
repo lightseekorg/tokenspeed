@@ -225,7 +225,7 @@ impl Shared {
     }
 
     fn push(&self, info: &TransferInfo, status: TransferPoll) {
-        self.transport.sockets.send(
+        let _ = self.transport.sockets.send_coalesced(
             &info.endpoint,
             info.port,
             status_frames(info.room, status, self.engine_rank),

@@ -127,7 +127,8 @@ def _assert_unfused(calls, inputs, *, reduced: bool, pair=(None, None), post_eps
     assert (n_kw["x_scale"], n_kw["residual_scale"]) == pair
 
 
-@pytest.mark.parametrize("tokens", [1, 64])  # 64: --comm-fusion-max-num-tokens
+# 65: above --comm-fusion-max-num-tokens, which the fused op serves in row slices.
+@pytest.mark.parametrize("tokens", [1, 64, 65])
 def test_a_served_call_is_one_fused_launch(calls, tokens):
     calls.fused_result = ("out", "residual_out")
     out, (x, residual, post, norm) = _run(
@@ -145,19 +146,20 @@ def test_a_served_call_is_one_fused_launch(calls, tokens):
 @pytest.mark.parametrize(
     "pair", [(0.5, None), (None, 0.5)], ids=["x-scale-only", "residual-scale-only"]
 )
-@pytest.mark.parametrize("tokens", [1, 65])  # 65: above --comm-fusion-max-num-tokens
-def test_a_one_sided_pair_reaches_either_path(calls, pair, tokens):
+@pytest.mark.parametrize("served", [True, False])
+def test_a_one_sided_pair_reaches_either_path(calls, pair, served):
     """One multiplier alone is a valid call on both paths (the missing one is
-    1.0 in the fused wrapper and in rmsnorm): at T = 1 it goes to the fused
-    launch, and above the fusion limit to the unfused chain, unchanged."""
-    calls.fused_result = ("out", "residual_out") if tokens == 1 else ("never",)
-    out, inputs = _run(tokens=tokens, x_scale=pair[0], residual_scale=pair[1])
-    if tokens == 1:
+    1.0 in the fused wrapper and in rmsnorm): to the fused launch where it
+    serves the call, and unchanged to the unfused chain where it declines."""
+    calls.fused_result = ("out", "residual_out") if served else None
+    out, inputs = _run(tokens=1, x_scale=pair[0], residual_scale=pair[1])
+    if served:
         assert out == ("out", "residual_out")
         ((kind, _, kwargs),) = calls.log
         assert kind == "fused"
         assert (kwargs["x_scale"], kwargs["residual_scale"]) == pair
     else:
+        assert calls.log[0][0] == "fused"
         _assert_unfused(calls, inputs, reduced=True, pair=pair)
 
 
@@ -174,10 +176,9 @@ def test_without_the_launch_option_nothing_is_fused(calls, monkeypatch):
     _assert_unfused(calls, inputs, reduced=True)
 
 
-@pytest.mark.parametrize("tokens", [0, 65])
-def test_token_counts_outside_the_fusion_range_run_unfused(calls, tokens):
+def test_an_empty_call_runs_unfused(calls):
     calls.fused_result = ("never",)
-    _, inputs = _run(tokens=tokens)
+    _, inputs = _run(tokens=0)
     _assert_unfused(calls, inputs, reduced=True)
 
 

@@ -15,10 +15,10 @@ vLLM as well).
 from __future__ import annotations
 
 import functools
-import importlib.util
 from collections.abc import Sequence
 
 import torch
+from tokenspeed_kernel._optional import has_optional_package
 from tokenspeed_kernel.ops.attention.msa._triton.indexer import (
     SPARSE_BLOCK_SIZE,
     minimax_indexer,
@@ -39,10 +39,7 @@ platform = current_platform()
 
 
 def _fmha_sm100_importable() -> bool:
-    return (
-        importlib.util.find_spec("cutlass") is not None
-        and importlib.util.find_spec("quack") is not None
-    )
+    return has_optional_package("cutlass", "quack")
 
 
 @functools.lru_cache(maxsize=1)

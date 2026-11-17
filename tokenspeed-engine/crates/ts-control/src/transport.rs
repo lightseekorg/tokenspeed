@@ -383,6 +383,7 @@ pub fn output_batch(
         prompt_tokens: Vec::with_capacity(n),
         completion_tokens: Vec::with_capacity(n),
         cached_tokens: Vec::with_capacity(n),
+        reasoning_tokens: Vec::with_capacity(n),
         output_token_logprobs_val: Vec::with_capacity(n),
         output_token_logprobs_idx: Vec::with_capacity(n),
         output_token_cumulative_probs_val: Vec::with_capacity(n),
@@ -417,6 +418,7 @@ pub fn output_batch(
         batch.prompt_tokens.push(output.prompt_tokens);
         batch.completion_tokens.push(output.completion_tokens);
         batch.cached_tokens.push(output.cached_tokens);
+        batch.reasoning_tokens.push(output.reasoning_tokens);
         batch.output_token_logprobs_val.push(output.output_logprobs);
         batch.output_token_logprobs_idx.push(logprob_ids);
         batch
@@ -500,6 +502,9 @@ impl Frontend for EngineTransport {
     fn reply(&mut self, mut output: ControlOutput) {
         if let ControlOutput::GetAdmission(snapshot) = &mut output {
             snapshot.dp_rank = i64::from(self.engine_index);
+        }
+        if let ControlOutput::GetSharedPrefixPublication(publication) = &mut output {
+            publication.dp_rank = i64::from(self.engine_index);
         }
         let asker = self
             .askers
@@ -805,6 +810,7 @@ mod tests {
             prompt_tokens: 4,
             completion_tokens: 2,
             cached_tokens: 0,
+            reasoning_tokens: 1,
             output_logprobs: Vec::new(),
             output_token_cumulative_probs: Vec::new(),
             finish_details: None,
@@ -824,6 +830,7 @@ mod tests {
             panic!("one output batch");
         };
         assert_eq!(*batch, output_batch(vec![output], 2, load));
+        assert_eq!(batch.reasoning_tokens, [1]);
         assert_eq!(
             (batch.engine_index, batch.num_waiting, batch.kv_used_pages),
             (2, 3, 9)

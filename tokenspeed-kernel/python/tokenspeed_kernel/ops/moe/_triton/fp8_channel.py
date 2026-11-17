@@ -158,7 +158,6 @@ def _fc1_kernel(
     EXPERTS: tl.constexpr,
     top_k: tl.constexpr,
     USE_TMA_GATHER: tl.constexpr,
-    MAX_IMPRECISE_ACC: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -204,10 +203,8 @@ def _fc1_kernel(
             up_w = w13_desc.load(
                 [expert_id, intermediate_size + n_offset, k_offset]
             ).reshape((BLOCK_N, BLOCK_K))
-            gate_acc = tl.dot(
-                x, gate_w.T, gate_acc, max_num_imprecise_acc=MAX_IMPRECISE_ACC
-            )
-            up_acc = tl.dot(x, up_w.T, up_acc, max_num_imprecise_acc=MAX_IMPRECISE_ACC)
+            gate_acc = tl.dot(x, gate_w.T, gate_acc)
+            up_acc = tl.dot(x, up_w.T, up_acc)
 
         offs_n = n_offset + tl.arange(0, BLOCK_N)
         x_scale = tl.load(x_scale_ptr + token_ids)
@@ -241,7 +238,6 @@ def _fc2_kernel(
     num_experts: tl.constexpr,
     EXPERTS: tl.constexpr,
     top_k: tl.constexpr,
-    MAX_IMPRECISE_ACC: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -280,7 +276,7 @@ def _fc2_kernel(
             weight = w2_desc.load([expert_id, n_offset, k_offset]).reshape(
                 (BLOCK_N, BLOCK_K)
             )
-            acc = tl.dot(act, weight.T, acc, max_num_imprecise_acc=MAX_IMPRECISE_ACC)
+            acc = tl.dot(act, weight.T, acc)
 
         offs_n = n_offset + tl.arange(0, BLOCK_N)
         act_scale = tl.load(act_scale_ptr + route_ids, mask=row_mask, other=0.0)
@@ -299,7 +295,7 @@ def _largest_block(size: int, candidates: tuple[int, ...]) -> int:
 
 
 def _launch_config(
-    num_tokens: int, hidden_size: int, intermediate_size: int
+    num_tokens: int, hidden_size: int, intermediate_size: int, *, sm90: bool
 ) -> dict[str, int]:
     """Tile sizes and launch options of the FC1 and FC2 kernels.
 
@@ -309,6 +305,10 @@ def _launch_config(
     these tiles but were not tuned.
     ``*_ctas_per_sm`` sizes each persistent grid in programs per SM (capped by
     the tile count), so co-resident programs hide each other's load latency.
+
+    ``sm90`` keeps every tile at 32 rows or fewer. A 64-row FP8 tile lowers to
+    wgmma on sm_90, whose accumulator is coarser than the scheme's FP32 even
+    when promoted every block; smaller tiles lower to mma.sync, which keeps it.
     """
     # A whole expert per rank (EP) has a long FC2 reduction: wider FC2 K tiles.
     wide = intermediate_size >= 2048
@@ -332,6 +332,9 @@ def _launch_config(
     elif num_tokens <= 512:
         fc1 = (16, n1, 128, 4, 4, 3)
         fc2 = (16, n2, k2, 4, 5, 3)
+    elif sm90:
+        fc1 = (32, n1_wide, 128, 4, 3, 3)
+        fc2 = (32, n2, k2_mid, 4, 4, 2)
     elif num_tokens <= 1024:
         fc1 = (64, n1, k1, 8, 4, 2)
         fc2 = (64, n2, k2_mid, 8, 5, 2) if wide else (64, n2, k2, 4, 5, 2)
@@ -376,9 +379,9 @@ def _triton_fp8_channel_moe_impl(
     device = torch.cuda.get_device_properties(x.device)
     if use_tma_gather is None:
         use_tma_gather = device.major == 10
-    # sm_90 FP8 wgmma accumulates imprecisely by default; promote every block.
-    promote_acc = device.major == 9
-    config = _launch_config(num_tokens, hidden_size, intermediate_size)
+    config = _launch_config(
+        num_tokens, hidden_size, intermediate_size, sm90=device.major == 9
+    )
     fc1_block_n, fc1_block_k = config["fc1_block_n"], config["fc1_block_k"]
     fc2_block_n, fc2_block_k = config["fc2_block_n"], config["fc2_block_k"]
     fc1_programs = min(
@@ -415,7 +418,6 @@ def _triton_fp8_channel_moe_impl(
         EXPERTS=triton.next_power_of_2(num_experts),
         top_k=top_k,
         USE_TMA_GATHER=use_tma_gather,
-        MAX_IMPRECISE_ACC=fc1_block_k if promote_acc else None,
         BLOCK_M=config["fc1_block_m"],
         BLOCK_N=fc1_block_n,
         BLOCK_K=fc1_block_k,
@@ -438,7 +440,6 @@ def _triton_fp8_channel_moe_impl(
         num_experts=num_experts,
         EXPERTS=triton.next_power_of_2(num_experts),
         top_k=top_k,
-        MAX_IMPRECISE_ACC=fc2_block_k if promote_acc else None,
         BLOCK_M=config["fc2_block_m"],
         BLOCK_N=fc2_block_n,
         BLOCK_K=fc2_block_k,

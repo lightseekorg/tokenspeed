@@ -47,10 +47,12 @@ register_cuda_ci(est_time=60, suite="runtime-1gpu")
 
 from test.l3_test_utils import storage_scheduler  # noqa: E402
 
-from tokenspeed_scheduler import (  # noqa: E402
+from tokenspeed_engine.scheduler import (  # noqa: E402
     AttnKind,
     Cache,
     CacheGroupConfig,
+    ExecutionEvent,
+    ForwardEvent,
     RequestSpec,
     Scheduler,
     SchedulerConfig,
@@ -59,12 +61,19 @@ from tokenspeed_scheduler import (  # noqa: E402
 from tokenspeed.runtime.engine.profiler import Profiler  # noqa: E402
 from tokenspeed.runtime.engine.rank_setup import request_length_limits  # noqa: E402
 from tokenspeed.runtime.engine.rust_host import (  # noqa: E402
+    HostBootstrap,
     HostDataPlane,
+    host_in_flight_depth,
     rust_host_refusals,
     start_rust_host,
 )
+from tokenspeed.runtime.engine.scheduler_utils import (  # noqa: E402
+    resolve_in_flight_depth,
+    should_use_overlap_schedule,
+)
 from tokenspeed.runtime.execution.device import DeviceHandle  # noqa: E402
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode  # noqa: E402
+from tokenspeed.runtime.execution.runtime_states import RuntimeStates  # noqa: E402
 from tokenspeed.runtime.execution.types import (  # noqa: E402
     InputLogprobPlan,
     ModelExecutionResult,
@@ -78,6 +87,30 @@ from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs  # noqa: E
 # ----------------------------------------------------------------------
 # The launcher's side
 # ----------------------------------------------------------------------
+
+
+def test_bootstrap_preserves_gpu_spacing(monkeypatch):
+    args = ServerArgs(
+        model="unavailable",
+        world_size=4,
+        nprocs_per_node=2,
+        nnodes=2,
+        attn_tp_size=4,
+        base_gpu_id=1,
+        gpu_id_step=2,
+    )
+    args.mapping.rank = 3
+
+    def unavailable_model(*args, **kwargs):
+        raise FileNotFoundError("model weights unavailable")
+
+    monkeypatch.setattr(
+        "tokenspeed.runtime.engine.rust_host.load_model_config", unavailable_model
+    )
+    host = HostBootstrap.__new__(HostBootstrap)
+    with pytest.raises(FileNotFoundError, match="model weights unavailable"):
+        host.__init__(args, None, None, None, None, None)
+    assert host._gpu_id == 3
 
 
 def test_the_default_engine_is_served():
@@ -195,6 +228,80 @@ def test_the_launcher_hands_a_host_its_rank_and_hears_it_ready(
     assert proc.exitcode == -signal.SIGTERM
 
 
+@pytest.mark.parametrize(
+    "level, override, expected",
+    [
+        ("DEBUG", {}, ("debug", "debug")),
+        ("WARNING", {}, ("warn", "warning")),
+        ("CRITICAL", {}, ("error", "critical")),
+        ("FATAL", {}, ("error", "critical")),
+        (
+            "error",
+            {"TS_HOST_LOG": "ts_pd=debug", "SPDLOG_LEVEL": "off"},
+            ("ts_pd=debug", "off"),
+        ),
+    ],
+)
+def test_spawned_host_inherits_engine_log_level(
+    tmp_path, monkeypatch, level, override, expected
+):
+    for key in ("TS_HOST_LOG", "SPDLOG_LEVEL"):
+        monkeypatch.delenv(key, raising=False)
+    for key, value in override.items():
+        monkeypatch.setenv(key, value)
+    binary = _fake_host(
+        tmp_path,
+        """
+        import os
+        connection.recv()
+        connection.send({"status": "ready", "levels": (os.environ["TS_HOST_LOG"], os.environ["SPDLOG_LEVEL"])})
+        time.sleep(600)
+    """,
+    )
+    args, ports = _rank_args(0)
+    args.log_level = level
+    proc, reader = start_rust_host(binary, args, ports, nullcontext(), None, False)
+    try:
+        (ready,) = receive_ready_messages([reader], [proc])
+        assert ready["levels"] == expected
+    finally:
+        proc.terminate()
+        proc.join(timeout=10)
+
+
+def test_spawned_host_inherits_start_context_environment(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+
+    key = "TS_TEST_LAUNCH_CONTEXT"
+    monkeypatch.delenv(key, raising=False)
+
+    @contextmanager
+    def configure_child():
+        with monkeypatch.context() as scoped:
+            scoped.setenv(key, "configured")
+            yield
+
+    binary = _fake_host(
+        tmp_path,
+        """
+        import os
+        connection.recv()
+        connection.send({"status": "ready", "context": os.environ.get("TS_TEST_LAUNCH_CONTEXT")})
+        time.sleep(600)
+        """,
+    )
+    proc, reader = start_rust_host(
+        binary, *_rank_args(0), configure_child(), None, False
+    )
+    try:
+        (ready,) = receive_ready_messages([reader], [proc])
+        assert ready["context"] == "configured"
+        assert key not in os.environ
+    finally:
+        proc.terminate()
+        proc.join(timeout=10)
+
+
 def test_a_host_that_dies_before_ready_fails_the_launch(tmp_path):
     binary = _fake_host(tmp_path, "connection.recv()\nsys.exit(3)\n")
     proc, reader = start_rust_host(binary, *_rank_args(0), nullcontext(), None, False)
@@ -250,6 +357,65 @@ def test_prefill_kv_capacity_must_exceed_the_unchanged_prompt_limit(
 
 
 # ----------------------------------------------------------------------
+# The rank's in-flight depth
+# ----------------------------------------------------------------------
+
+# (disaggregation_mode, pp_size, disable_overlap_schedule) -> in-flight depth.
+_IN_FLIGHT_DEPTHS = {
+    ("null", 1, False): 1,
+    ("null", 1, True): 0,
+    ("decode", 1, False): 1,
+    ("decode", 1, True): 0,
+    # The prefill role commits one chunk behind.
+    ("prefill", 1, False): 1,
+    ("prefill", 1, True): 0,
+    # An encode rank runs no LM loop.
+    ("encode", 1, False): 0,
+    ("encode", 1, True): 0,
+    # The chunk pipeline keeps one forward per stage in flight, overlap
+    # disabled or not.
+    ("prefill", 2, False): 2,
+    ("prefill", 2, True): 2,
+    ("prefill", 4, False): 4,
+    ("null", 2, False): 2,
+}
+
+
+@pytest.mark.parametrize("mode, pp_size, disabled", sorted(_IN_FLIGHT_DEPTHS))
+def test_the_in_flight_depth_per_role_pipeline_and_overlap_flag(
+    mode, pp_size, disabled
+):
+    depth = resolve_in_flight_depth(
+        disable_overlap_schedule=disabled,
+        disaggregation_mode=mode,
+        pp_size=pp_size,
+    )
+
+    assert depth == _IN_FLIGHT_DEPTHS[mode, pp_size, disabled]
+
+
+def test_a_prefill_rank_runs_one_chunk_ahead_without_the_overlap_schedule():
+    def prefill(**fields) -> ServerArgs:
+        return ServerArgs(
+            model="x",
+            disaggregation_mode="prefill",
+            disaggregation_transfer_backend="mooncake",
+            **fields,
+        )
+
+    server_args = prefill()
+    assert host_in_flight_depth(server_args) == 1
+    # It reserves no decode KV for the forward in flight: the role never
+    # decodes locally.
+    assert not should_use_overlap_schedule(
+        disable_overlap_schedule=server_args.disable_overlap_schedule,
+        disaggregation_mode=server_args.disaggregation_mode,
+    )
+    assert host_in_flight_depth(prefill(disable_overlap_schedule=True)) == 0
+    assert host_in_flight_depth(prefill(pipeline_parallel_size=2)) == 2
+
+
+# ----------------------------------------------------------------------
 # The data plane's side
 # ----------------------------------------------------------------------
 
@@ -274,6 +440,13 @@ class _CpuExecutor:
         self.output_token_cumulative_probs: torch.Tensor | None = (
             output_token_cumulative_probs
         )
+        self.runtime_states = RuntimeStates(
+            req_pool_size=4,
+            input_vocab_size=512,
+            vocab_size=512,
+            output_length=1,
+            device="cpu",
+        )
         self.forwards: list[tuple[list[str], list, tuple]] = []
         self.dp_metadata: list = []
         self.idle_forwards: list = []
@@ -282,6 +455,11 @@ class _CpuExecutor:
 
     def execute_forward_op(self, forward_op, sampling_params_list, **kwargs):
         rows = len(forward_op.request_ids)
+        self.runtime_states.bind_stop_criteria(
+            kwargs["admission_ids"],
+            forward_op.request_pool_indices,
+            kwargs["stop_criteria"],
+        )
         self.dp_metadata.append(kwargs["dp_metadata"])
         self.forwards.append(
             (
@@ -347,11 +525,12 @@ class _CpuExecutor:
         pass
 
 
-def _scheduler() -> Scheduler:
+def _scheduler(*, max_batch_size: int) -> Scheduler:
     config = SchedulerConfig()
     config.prefix_granularity = 16
     config.max_scheduled_tokens = 64
-    config.max_batch_size = 4
+    config.max_batch_size = max_batch_size
+    config.max_resident_requests = max_batch_size
     config.num_device_pages = 64
     config.num_snapshot_pages = 1
     config.cache_groups = [
@@ -385,12 +564,14 @@ def _data_plane(handle: DeviceHandle) -> HostDataPlane:
             attn_mapping=server_args.mapping.attn,
             sync_size=1,
             sync_group=None,
+            host_spans=None,
         ),
         {},
         report_compiles=False,
         max_encoder_tokens=None,
         attn_tp_cpu_group=None,
         epd_publisher=None,
+        starting=False,
     )
 
 
@@ -399,11 +580,16 @@ def executor():
     return _CpuExecutor(output_token_cumulative_probs=None)
 
 
-def test_the_data_plane_runs_a_plan_with_the_admitted_requests(executor):
+@pytest.mark.parametrize(
+    "history_prefix,history_tokens", [(2, [7, 8]), (9, [7, 8]), (9, [])]
+)
+def test_the_data_plane_runs_a_plan_with_the_admitted_requests(
+    executor, history_prefix, history_tokens
+):
     plane = _data_plane(DeviceHandle(executor))
     params = _resolved("r1", temperature=0.0, max_new_tokens=8, stop_token_ids={9})
-    plane.admit([("r1", msgspec.msgpack.encode(params), [2, 9], 11, None)])
-    scheduler = _scheduler()
+    plane.admit([("r1", 1, msgspec.msgpack.encode(params), [2, 9], 11, None)])
+    scheduler = _scheduler(max_batch_size=4)
     spec = RequestSpec()
     spec.request_id = "r1"
     spec.tokens = [1, 2, 3]
@@ -416,14 +602,15 @@ def test_the_data_plane_runs_a_plan_with_the_admitted_requests(executor):
         None,
         None,
         (None, 0),
-        ([1], [2], [[7, 8]]),
+        ([1], [history_prefix], [history_tokens]),
     )
 
     assert pending is not None
-    assert plane.complete(pending) == (
+    completed = plane.complete(pending)
+    assert completed[2].tolist() == [-0.5]
+    assert completed[:2] + completed[3:] == (
         [100],
         [1],
-        [-0.5],
         None,
         None,
         None,
@@ -436,7 +623,11 @@ def test_the_data_plane_runs_a_plan_with_the_admitted_requests(executor):
     assert sampling_params == [params]
     assert stop_criteria == (StopCriteria(stop_token_ids=(2, 9), token_limit=11),)
     assert executor.history_seeds == [
-        RequestHistorySeeds(slots=(1,), prefix_lengths=(2,), tokens=((7, 8),))
+        RequestHistorySeeds(
+            slots=(1,),
+            prefix_lengths=(history_prefix,),
+            tokens=(tuple(history_tokens),),
+        )
     ]
 
 
@@ -448,7 +639,7 @@ def test_the_data_plane_hands_the_logprob_plan_to_the_forward(cumulative_probs):
         )
     )
     plane = _data_plane(DeviceHandle(executor))
-    plane.admit([("r1", msgspec.msgpack.encode(_resolved("r1")), [], 11, None)])
+    plane.admit([("r1", 1, msgspec.msgpack.encode(_resolved("r1")), [], 11, None)])
 
     pending = plane.execute(
         _plan_with_one_request("r1"), None, None, None, (([0], [2], [0], 2), 1), None
@@ -458,20 +649,20 @@ def test_the_data_plane_hands_the_logprob_plan_to_the_forward(cumulative_probs):
     if cumulative_probs is None:
         assert returned_cumulative_probs is None
     else:
-        assert returned_cumulative_probs == pytest.approx(cumulative_probs)
+        assert returned_cumulative_probs.tolist() == pytest.approx(cumulative_probs)
     ((plan, sampled_top_k),) = executor.logprob_plans
     assert plan == InputLogprobPlan(
         row_starts=(0,), counts=(2,), position_starts=(0,), top_k=2
     )
     assert sampled_top_k == 1
     input_logprobs, input_top, output_top = logprobs
-    assert input_logprobs == pytest.approx([0.0, -0.1])
-    assert input_top[1] == [[0, 1], [1, 2]]
-    assert output_top == ([[-10.0]], [[100]])
+    assert input_logprobs.tolist() == pytest.approx([0.0, -0.1])
+    assert input_top[1].tolist() == [[0, 1], [1, 2]]
+    assert tuple(column.tolist() for column in output_top) == ([[-10.0]], [[100]])
 
 
 def _plan_with_one_request(rid: str):
-    scheduler = _scheduler()
+    scheduler = _scheduler(max_batch_size=4)
     spec = RequestSpec()
     spec.request_id = rid
     spec.tokens = [1, 2, 3]
@@ -482,7 +673,7 @@ def _plan_with_one_request(rid: str):
 
 def test_a_data_parallel_forward_carries_every_ranks_batch(executor):
     plane = _data_plane(DeviceHandle(executor))
-    plane.admit([("r1", msgspec.msgpack.encode(_resolved("r1")), [], 11, None)])
+    plane.admit([("r1", 1, msgspec.msgpack.encode(_resolved("r1")), [], 11, None)])
 
     pending = plane.execute(
         _plan_with_one_request("r1"),
@@ -506,7 +697,7 @@ def test_a_data_parallel_forward_carries_every_ranks_batch(executor):
 
 def test_an_idle_data_parallel_rank_runs_an_idle_forward(executor):
     plane = _data_plane(DeviceHandle(executor))
-    plane.admit([("r1", msgspec.msgpack.encode(_resolved("r1")), [], 11, None)])
+    plane.admit([("r1", 1, msgspec.msgpack.encode(_resolved("r1")), [], 11, None)])
 
     # This rank's plan has a batch, but the control plane decided it idles.
     assert (
@@ -531,7 +722,14 @@ def test_an_idle_data_parallel_rank_runs_an_idle_forward(executor):
 def test_a_plan_without_a_batch_runs_no_forward(executor):
     plane = _data_plane(DeviceHandle(executor))
     assert (
-        plane.execute(_scheduler().next_execution_plan(), None, None, None, None, None)
+        plane.execute(
+            _scheduler(max_batch_size=4).next_execution_plan(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
         is None
     )
     assert executor.forwards == []
@@ -577,7 +775,7 @@ def test_the_data_plane_leaves_a_plans_storage_operations_to_the_host(executor):
 def test_a_released_request_is_forgotten(executor):
     plane = _data_plane(DeviceHandle(executor))
     params = _resolved("r1")
-    plane.admit([("r1", msgspec.msgpack.encode(params), [], 10, None)])
+    plane.admit([("r1", 1, msgspec.msgpack.encode(params), [], 10, None)])
     plane.release(["r1"])
     with pytest.raises(KeyError):
         plane.release(["r1"])
@@ -587,7 +785,7 @@ def test_a_forward_lands_once_and_counts_toward_a_profile_at_its_note(executor):
     """The commit waits on the copy event exactly once; the profiler counts
     the forward only when the forward thread runs its committed note."""
     profiled = _data_plane(DeviceHandle(executor))
-    profiled.admit([("r1", msgspec.msgpack.encode(_resolved("r1")), [], 11, None)])
+    profiled.admit([("r1", 1, msgspec.msgpack.encode(_resolved("r1")), [], 11, None)])
     launched = profiled.execute(
         _plan_with_one_request("r1"), None, None, None, (None, 0), None
     )
@@ -619,3 +817,49 @@ def test_the_forward_thread_is_named_for_its_role(executor):
     thread.start()
     thread.join()
     assert names == ["tokenspeed::forward"]
+
+
+def test_reused_external_id_binds_the_new_admissions_stops(executor):
+    plane = _data_plane(DeviceHandle(executor))
+    scheduler = _scheduler(max_batch_size=1)
+    for admission_id, prompt_length, limit, stops in [
+        (41, 4, 6, [7]),
+        (42, 10, 30, []),
+    ]:
+        params = _resolved("reused", max_new_tokens=limit - prompt_length)
+        plane.admit(
+            [
+                (
+                    "reused",
+                    admission_id,
+                    msgspec.msgpack.encode(params),
+                    stops,
+                    limit,
+                    None,
+                )
+            ]
+        )
+        spec = RequestSpec()
+        spec.request_id = "reused"
+        spec.tokens = list(range(prompt_length))
+        spec.max_new_tokens = limit - prompt_length
+        scheduler.submit_requests([spec])
+        plan = scheduler.next_execution_plan()
+        assert list(plan.forward[0].request_pool_indices) == [1]
+        pending = plane.execute(plan, None, None, None, (None, 0), None)
+        assert pending is not None
+        plane.complete(pending)
+        assert int(executor.runtime_states.token_limits[1]) == limit
+        assert executor.runtime_states.stop_token_ids[1, :1].tolist() == (stops or [-1])
+        result = ForwardEvent.ExtendResult()
+        result.request_id = "reused"
+        result.tokens = [100]
+        finish = ForwardEvent.Finish()
+        finish.request_id = "reused"
+        events = ExecutionEvent()
+        events.add_event(result)
+        events.add_event(finish)
+        scheduler.advance(events)
+        scheduler.next_execution_plan()
+        assert scheduler.request_token_size("reused") == -1
+        plane.release(["reused"])

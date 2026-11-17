@@ -41,7 +41,17 @@ from tokenspeed.runtime.execution.drafter.dspark import DSpark  # noqa: E402
 from tokenspeed.runtime.execution.drafter.eagle import Eagle  # noqa: E402
 from tokenspeed.runtime.execution.drafter.mtp import Mtp  # noqa: E402
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode  # noqa: E402
+from tokenspeed.runtime.execution.model_executor import (  # noqa: E402
+    drafter_accept_lengths,
+)
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+from tokenspeed.runtime.models.kimi_k3 import (  # noqa: E402
+    KimiK3ForConditionalGeneration,
+)
+from tokenspeed.runtime.models.kimi_k25 import (  # noqa: E402
+    KimiK25ForConditionalGeneration,
+)
+from tokenspeed.runtime.models.registry import ModelRegistry  # noqa: E402
 from tokenspeed.runtime.models.target_capture import (  # noqa: E402
     TargetCaptureConfigurator,
 )
@@ -87,7 +97,7 @@ def _head_layout(**overrides) -> SimpleNamespace:
     """The LM-head layout the factory compares between a target and the draft
     sharing its head (``_check_shared_head_layout``): the logits processor's
     group, width and attention-DP flag. Default: one replicated head."""
-    layout = dict(tp_group=None, tp_size=1, dp_lm_head_tp=False)
+    layout = dict(tp_group=None, tp_size=1, attn_tp_size=1, dp_lm_head_tp=False)
     layout.update(overrides)
     return SimpleNamespace(**layout)
 
@@ -331,7 +341,7 @@ def test_wire_rejects_a_draft_head_in_another_layout():
         SimpleNamespace(
             get_embed_and_head=mock.Mock(side_effect=AssertionError("bound")),
             logits_processor=_head_layout(
-                tp_group=(0, 1), tp_size=2, dp_lm_head_tp=True
+                tp_group=(0, 1), tp_size=2, attn_tp_size=1, dp_lm_head_tp=True
             ),
         )
     )
@@ -540,7 +550,7 @@ def test_wire_eagle3_explicit_capture_ids_override_checkpoint():
 class _ContextDraft:
     """A draft implementing the DSparkContextModel protocol on one stage."""
 
-    hidden_size = 8
+    projection_width = 8
 
     def __init__(self, is_last_pp_rank: bool):
         self.mapping = SimpleNamespace(
@@ -802,8 +812,14 @@ def test_eagle_tree_drafting_ranks_full_vocab_logits():
 @pytest.mark.parametrize("drafter_class", [DFlash, DSpark])
 def test_block_drafter_wire_target_only_binds_resources(drafter_class):
     drafter = drafter_class.__new__(drafter_class)
-    drafter.model = SimpleNamespace()
-    embedding, head, processor = object(), object(), object()
+    # A one-rank layout: the draft's first layer reduces nothing, so the
+    # drafter's embedding lookup is left as bound.
+    drafter.model = SimpleNamespace(mapping=_mapping())
+    embedding, head = object(), object()
+    # wire_target asks the processor whether the target's head is vocab-sharded
+    # over attention-DP ranks (DFlash replicates it for drafting only then);
+    # _head_layout's default is the ordinary head, which is left alone.
+    processor = _head_layout()
     target = SimpleNamespace(
         get_input_embeddings=lambda: embedding,
         lm_head=head,
@@ -826,9 +842,11 @@ def test_block_drafter_wire_target_only_binds_resources(drafter_class):
 def test_block_drafter_binds_local_embedding_on_last_pipeline_stage():
     drafter = DSpark.__new__(DSpark)
     embedding = object()
-    drafter.model = SimpleNamespace(embed_tokens=embedding)
+    drafter.model = SimpleNamespace(embed_tokens=embedding, mapping=_mapping())
     target = SimpleNamespace(
-        get_input_embeddings=lambda: None, lm_head=object(), logits_processor=object()
+        get_input_embeddings=lambda: None,
+        lm_head=object(),
+        logits_processor=_head_layout(),
     )
     drafter.wire_target(target)
     assert drafter.embed_tokens is embedding
@@ -836,6 +854,7 @@ def test_block_drafter_binds_local_embedding_on_last_pipeline_stage():
 
 def test_deepseek_dspark_wire_target_only_binds_resources():
     drafter = DeepseekV41DSpark.__new__(DeepseekV41DSpark)
+    drafter.dp_local_graph = False
     draft_head = object()
     drafter.draft_model = SimpleNamespace(lm_head=draft_head)
     target = SimpleNamespace(
@@ -900,10 +919,25 @@ def test_device_weight_update_notifies_drafter_before_returning():
 # --------------------------------------------------------------------------
 
 
+def _draft_locations() -> SimpleNamespace:
+    """Return the draft router; the context KV lands in its own pages."""
+
+    def resolve(out, starts, width):
+        # Pages offset by 100: each slot names its position.
+        rows = 100 + starts[:, None] + torch.arange(width)
+        out[: rows.numel()] = rows.reshape(-1)
+        return out
+
+    return SimpleNamespace(
+        group_ids=("full_attention",), draft_write_locations_uniform=resolve
+    )
+
+
 def _target_ctx(num_extends: int, num_tokens: int) -> ForwardContext:
     return ForwardContext(
         attn_backend=SimpleNamespace(
-            decode_window_locations=lambda: torch.arange(100, 100 + 2 * num_tokens)
+            group_ids=("full_attention",),
+            decode_window_locations=lambda: torch.arange(100, 100 + 2 * num_tokens),
         ),
         token_to_kv_pool=None,
         bs=2,
@@ -914,16 +948,32 @@ def _target_ctx(num_extends: int, num_tokens: int) -> ForwardContext:
     )
 
 
-def _incremental_dflash(enabled: bool) -> DFlash:
-    """A DFlash with only the incremental-projection state set up."""
+class _TapTarget:
+    def __init__(self, stores_taps: bool):
+        self._stores_taps = stores_taps
+
+    def stores_capture_taps(self, ctx: ForwardContext) -> bool:
+        return self._stores_taps
+
+
+def _sink_dflash(
+    enabled: bool, hidden: int = 3, taps: int = 2, stores_taps: bool = False
+) -> DFlash:
+    """A DFlash with only the capture-sink state set up."""
     drafter = DFlash.__new__(DFlash)
-    drafter._incremental_proj_enabled = enabled
-    drafter._fused_kv_enabled = True
-    drafter._kv_aux_stream = object()
-    drafter._incremental_kv_write_done = True  # stale from a previous round
-    drafter._incr_num_tokens = 0
-    drafter._incr_acc_buf = torch.ones(16, 3)
+    drafter.target_model = _TapTarget(stores_taps)
+    drafter.hidden_size = hidden
+    drafter._tap_count = taps
+    drafter._tap_rows = (
+        torch.full((16, taps * hidden), 7.0, dtype=torch.bfloat16) if enabled else None
+    )
+    drafter._context_written = True  # stale from a previous round
+    drafter._sink_tokens = 0
     drafter.input_buffers = SimpleNamespace(positions_buf=torch.arange(16))
+    drafter.attn_backend = _draft_locations()
+    drafter.spec_num_tokens = 2
+    drafter.context_starts_buf = torch.zeros(2, dtype=torch.int64)
+    drafter.context_locs_buf = torch.zeros(4, dtype=torch.int32)
     return drafter
 
 
@@ -933,109 +983,140 @@ def test_base_prepare_target_forward_attaches_nothing():
     assert ctx.target_capture_sink is None
 
 
-def test_dflash_arms_the_incremental_projection_on_the_forward_context():
-    drafter = _incremental_dflash(enabled=True)
+def test_dflash_arms_the_capture_sink_on_the_forward_context():
+    drafter = _sink_dflash(enabled=True)
     ctx = _target_ctx(num_extends=0, num_tokens=4)
 
     drafter.prepare_target_forward(ctx)
 
     assert ctx.target_capture_sink is drafter
-    assert drafter._incremental_kv_write_done is False
-    assert drafter._incr_num_tokens == 4
-    assert torch.equal(drafter._incr_positions, torch.arange(4))
-    assert torch.equal(drafter._incr_cache_locs, torch.arange(100, 104))
-    # The accumulator rows of this forward are cleared, nothing else.
-    assert torch.equal(drafter._incr_acc_buf[:4], torch.zeros(4, 3))
-    assert torch.equal(drafter._incr_acc_buf[4:], torch.ones(12, 3))
+    assert drafter._context_written is False
+
+
+def test_dflash_leaves_the_taps_to_a_target_that_stores_them():
+    drafter = _sink_dflash(enabled=True, stores_taps=True)
+    ctx = _target_ctx(num_extends=0, num_tokens=4)
+
+    drafter.prepare_target_forward(ctx)
+
+    assert ctx.target_capture_sink is None
+    assert drafter._context_written is False
+
+
+def test_every_dflash_target_answers_whether_it_stores_the_taps():
+    # A block drafter asks each round, so a target it can attach to must answer.
+    missing = sorted(
+        name
+        for name, cls in ModelRegistry.models.items()
+        if hasattr(cls, "set_dflash_layers_to_capture")
+        and not hasattr(cls, "stores_capture_taps")
+    )
+    assert missing == []
 
 
 @pytest.mark.parametrize(
-    "enabled, num_extends, graph_warmup",
+    "wrapper", [KimiK3ForConditionalGeneration, KimiK25ForConditionalGeneration]
+)
+@pytest.mark.parametrize("stores_taps", [False, True])
+def test_a_multimodal_wrapper_answers_for_its_language_model(wrapper, stores_taps):
+    target = wrapper.__new__(wrapper)
+    torch.nn.Module.__init__(target)
+    target.language_model = _TapTarget(stores_taps)
+    drafter = _sink_dflash(enabled=True)
+    drafter.target_model = target
+    ctx = _target_ctx(num_extends=0, num_tokens=4)
+
+    drafter.prepare_target_forward(ctx)
+
+    assert target.stores_capture_taps(ctx) is stores_taps
+    assert (ctx.target_capture_sink is None) is stores_taps
+
+
+@pytest.mark.parametrize(
+    "wrapper", [KimiK3ForConditionalGeneration, KimiK25ForConditionalGeneration]
+)
+def test_an_encoder_only_wrapper_refuses_to_answer_for_taps(wrapper):
+    target = wrapper.__new__(wrapper)
+    torch.nn.Module.__init__(target)
+    target.language_model = None
+
+    with pytest.raises(AttributeError, match="encoder-only"):
+        target.stores_capture_taps(_target_ctx(num_extends=0, num_tokens=4))
+
+
+@pytest.mark.parametrize(
+    "enabled, num_extends, idle",
     [
-        (False, 0, False),  # projection disabled
+        (False, 0, False),  # the draft normalizes each tap itself (fc_norm)
         (True, 1, False),  # a mixed round: extend rows in the write vector
-        (True, 0, True),  # graph warmup runs auxiliary branches serially
+        (True, 0, True),  # an idle forward may skip the final-norm tap
     ],
 )
-def test_dflash_leaves_the_context_alone_when_it_will_not_overlap(
-    enabled, num_extends, graph_warmup
+def test_dflash_leaves_the_context_to_run_when_it_does_not_arm(
+    enabled, num_extends, idle
 ):
-    import tokenspeed.runtime.execution.drafter.dflash as dflash_module
+    drafter = _sink_dflash(enabled=enabled)
+    ctx = _target_ctx(num_extends=num_extends, num_tokens=0 if idle else 4)
+    if idle:
+        ctx.forward_mode = ForwardMode.IDLE
 
-    drafter = _incremental_dflash(enabled=enabled)
-    ctx = _target_ctx(num_extends=num_extends, num_tokens=4)
-
-    with mock.patch.object(
-        dflash_module, "get_is_cuda_graph_phase", return_value=graph_warmup
-    ):
-        drafter.prepare_target_forward(ctx)
+    drafter.prepare_target_forward(ctx)
 
     assert ctx.target_capture_sink is None
     # A stale "already written" from an earlier round never survives into
     # a round that did not arm.
-    assert drafter._incremental_kv_write_done is False
-    assert torch.equal(drafter._incr_acc_buf, torch.ones(16, 3))
+    assert drafter._context_written is False
 
 
 def test_dflash_rejects_a_capture_of_the_wrong_width():
-    drafter = _incremental_dflash(enabled=True)
+    drafter = _sink_dflash(enabled=True)
     drafter.prepare_target_forward(_target_ctx(num_extends=0, num_tokens=4))
     with pytest.raises(RuntimeError, match="armed for 4"):
         drafter.on_target_capture(0, torch.zeros(3, 3))
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="aux-stream projection")
-def test_dflash_sink_folds_the_taps_and_writes_the_kv_once():
-    """fc over the concatenated taps == the sum of per-tap GEMMs, accumulated
-    on the aux stream as each tap lands; the last tap writes the KV."""
-    torch.manual_seed(0)
-    device = torch.device("cuda")
-    num_tokens, hidden, n_taps = 4, 8, 2
-    drafter = _incremental_dflash(enabled=True)
-    drafter.input_buffers = SimpleNamespace(
-        positions_buf=torch.arange(16, device=device)
-    )
-    drafter._incr_acc_buf = torch.ones(16, hidden, device=device)
-    drafter._incr_slot_bufs = [
-        torch.empty(16, hidden, device=device) for _ in range(n_taps)
-    ]
-    drafter._incr_capture_events = [torch.cuda.Event() for _ in range(n_taps)]
-    drafter._incr_sub_weights_t = [
-        torch.randn(hidden, hidden, device=device) for _ in range(n_taps)
-    ]
-    drafter._incr_n_captures = n_taps
-    drafter._incr_hidden_norm = lambda acc: acc * 2
-    drafter._kv_aux_stream = torch.cuda.Stream()
-    drafter._kv_join_event = torch.cuda.Event()
+def test_dflash_sink_concatenates_the_taps_and_writes_the_context_once():
+    """Each tap lands, rounded, in its columns of the round's tap block; the
+    last tap hands the whole block to the one context write."""
+    num_tokens, hidden, taps = 4, 3, 2
+    drafter = _sink_dflash(enabled=True, hidden=hidden, taps=taps)
     writes = []
-    drafter._write_native_cache_fused = (
-        lambda ctx_hidden, positions, locs: writes.append(
-            (ctx_hidden.clone(), positions.clone(), locs.clone())
-        )
+    drafter._write_native_cache = lambda rows, positions, locs, decode_only: (
+        writes.append((rows.clone(), positions, locs, decode_only))
     )
     ctx = _target_ctx(num_extends=0, num_tokens=num_tokens)
-    ctx.attn_backend = SimpleNamespace(
-        decode_window_locations=lambda: torch.arange(100, 132, device=device)
-    )
-    taps = [torch.randn(num_tokens, hidden, device=device) for _ in range(n_taps)]
+    # Shared cache group: the taps are the target's rows, so the TARGET's
+    # router owns the window they are written through -- _target_ctx supplies
+    # that backend. FP32 rows a BF16 copy has to round.
+    tap_rows = [
+        torch.randn(num_tokens, hidden, dtype=torch.float32) for _ in range(taps)
+    ]
 
     drafter.prepare_target_forward(ctx)
-    assert ctx.target_capture_sink is drafter
-    ctx.target_capture_sink.on_target_capture(0, taps[0])
-    assert writes == []
-    ctx.target_capture_sink.on_target_capture(1, taps[1])
-    torch.cuda.synchronize()
+    drafter.on_target_capture(0, tap_rows[0])
+    assert writes == [] and drafter._context_written is False
+    drafter.on_target_capture(1, tap_rows[1])
 
-    expected = (
-        taps[0] @ drafter._incr_sub_weights_t[0]
-        + taps[1] @ drafter._incr_sub_weights_t[1]
+    assert drafter._context_written is True
+    ((rows, positions, locs, decode_only),) = writes
+    assert torch.equal(rows, torch.cat(tap_rows, dim=-1).to(torch.bfloat16))
+    assert torch.equal(positions, torch.arange(num_tokens))
+    assert torch.equal(locs, torch.arange(100, 100 + num_tokens))
+    assert decode_only is True
+    # Rows past this round's are untouched.
+    assert torch.equal(
+        drafter._tap_rows[num_tokens:],
+        torch.full((16 - num_tokens, taps * hidden), 7.0, dtype=torch.bfloat16),
     )
-    torch.testing.assert_close(drafter._incr_acc_buf[:num_tokens], expected)
-    assert drafter._incremental_kv_write_done is True
-    ((ctx_hidden, positions, locs),) = writes
-    torch.testing.assert_close(ctx_hidden, expected * 2)
-    assert torch.equal(positions, torch.arange(num_tokens, device=device))
-    assert torch.equal(locs, torch.arange(100, 100 + num_tokens, device=device))
+
+
+def test_dflash_run_refuses_a_round_whose_sink_never_completed():
+    drafter = _sink_dflash(enabled=True)
+    ctx = _target_ctx(num_extends=0, num_tokens=4)
+    drafter.prepare_target_forward(ctx)
+    drafter.on_target_capture(0, torch.zeros(4, 3))
+    with pytest.raises(RuntimeError, match="never handed over its last tap"):
+        drafter.run(ctx, None, None, None)
 
 
 @pytest.mark.parametrize("producer_owned", [False, True])
@@ -1057,21 +1138,26 @@ def test_context_cache_ownership_preserves_prefix_lengths(
     )
     drafter.runtime_states = SimpleNamespace(valid_cache_lengths=torch.tensor([10]))
     drafter.draft_seq_lens_buf = torch.zeros(1, dtype=torch.int32)
+    drafter.context_starts_buf = torch.zeros(1, dtype=torch.int64)
+    drafter.context_locs_buf = torch.zeros(4, dtype=torch.int32)
     drafter._write_native_cache = mock.Mock()
-    locations = torch.arange(4)
+    locations = torch.arange(4, dtype=torch.int32)
     backend = SimpleNamespace(
-        decode_window_locations=lambda: (
-            locations if not num_extends else torch.empty(0, dtype=torch.int64)
-        ),
+        draft_write_locations_uniform=lambda out, starts, width: out.copy_(locations),
         extend_span_locations=lambda: locations,
     )
+    # The write locations come from the DRAFT's own router: the pages belong
+    # to the draft's cache group, which is a group of its own when its
+    # attention family declares pages of another shape than the target's.
+    # Shared cache group: the taps are addressed by the TARGET's vector.
+    shared = SimpleNamespace(group_ids=("full_attention",), **vars(backend))
+    drafter.attn_backend = object() if producer_owned else shared
     ctx = SimpleNamespace(
         dspark_context_producer=object() if producer_owned else None,
         bs=1,
         num_extends=num_extends,
         input_num_tokens=4,
-        # A producer-owned update must not inspect write locations again.
-        attn_backend=object() if producer_owned else backend,
+        attn_backend=object() if producer_owned else shared,
     )
     hidden = torch.zeros(4, 8)
     logits = object() if producer_owned else SimpleNamespace(hidden_states=hidden)
@@ -1096,7 +1182,13 @@ def test_drafter_owned_context_requires_matching_target_hidden(hidden, error):
     drafter = DFlash.__new__(DFlash)
     drafter._update_draft_prefix_lengths = mock.Mock()
     drafter._write_native_cache = mock.Mock()
-    ctx = SimpleNamespace(dspark_context_producer=None, input_num_tokens=4)
+    # The width mismatch names the expected shape, which separates "taps
+    # collected but rows narrowed" from "no taps at all".
+    drafter.model = SimpleNamespace(num_context_features=4)
+    drafter.hidden_size = 8
+    ctx = SimpleNamespace(
+        dspark_context_producer=None, input_num_tokens=4, bs=1, num_extends=0
+    )
     with pytest.raises(RuntimeError, match=error):
         drafter._update_native_cache_from_target(
             ctx, SimpleNamespace(hidden_states=hidden), torch.tensor([1])
@@ -1114,15 +1206,16 @@ def test_k3_setup_capture_survives_resource_binding(monkeypatch, has_pp):
     draft.config = SimpleNamespace(aux_hidden_stream="attn_res")
     draft.target_capture_layer_ids = (2, 5)
     draft.hidden_size = 8
+    draft.projection_width = 8
     # Only a pipeline splits the taps across stages; off the pipeline the
     # drafter keeps projecting and writing the context itself.
-    draft.mapping = SimpleNamespace(has_pp=has_pp)
+    draft.mapping = _mapping(has_pp=has_pp)
     validation = mock.Mock()
     monkeypatch.setattr(kimi_k3_dspark, "validate_k3_dspark_config", validation)
     target = SimpleNamespace(
         get_input_embeddings=lambda: "embedding",
         lm_head="head",
-        logits_processor="processor",
+        logits_processor=_head_layout(),
         set_target_context_capture=mock.Mock(),
         set_dflash_layers_to_capture=mock.Mock(),
         set_dflash_aux_hidden_stream=mock.Mock(),
@@ -1174,6 +1267,11 @@ def test_ordinary_block_models_declare_capture_setup(family):
     draft = model_class.__new__(model_class)
     torch.nn.Module.__init__(draft)
     draft.config = SimpleNamespace(dflash_config={"target_layer_ids": [2, 7]})
+    # An unquantized draft without --decode-monokernel: DFlash2 also makes
+    # its FP8 head copy here when quantized, and packs its head monokernel
+    # under the switch, both from the target's real LM head.
+    draft.quant_config = None
+    draft.monokernel_state = None
     target = SimpleNamespace(set_dflash_layers_to_capture=mock.Mock())
     assert isinstance(draft, TargetCaptureConfigurator)
     draft.configure_target(target, None)
@@ -1334,6 +1432,17 @@ def test_unsupported_stream_fails_before_installing_capture(dflash_model):
     with pytest.raises(ValueError, match="only supply 'prefix'"):
         dflash_model.configure_target(target, None)
     setter.assert_not_called()
+
+
+def test_the_drafter_continues_each_decode_request_from_at_least_one_token():
+    """A stopped decode request (0 accepted) still hands the drafter its last
+    position; prefill rows and the reported lengths are left alone."""
+    accept_lengths = torch.tensor([0, 3, 0, 2], dtype=torch.int32)
+
+    lengths = drafter_accept_lengths(accept_lengths, slice(1, 4))
+
+    assert lengths.tolist() == [0, 3, 1, 2]
+    assert accept_lengths.tolist() == [0, 3, 0, 2]
 
 
 if __name__ == "__main__":

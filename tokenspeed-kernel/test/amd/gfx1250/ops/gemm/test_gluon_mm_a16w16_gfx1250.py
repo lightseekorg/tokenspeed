@@ -123,6 +123,26 @@ def test_dsv4_linear_fp32_dispatches_to_gfx1250_kernel(m: int) -> None:
     torch.testing.assert_close(dsv4_linear_fp32(a, b), actual, atol=0, rtol=0)
 
 
+def test_dsv4_linear_fp32_wide_n_matches_reference() -> None:
+    # DeepSeek V4.1 DSpark base logits: TP4 vocabulary shard, 5 rows per draft
+    # request at CUDA graph batch sizes 1 to 16.
+    n, k = 32320, 5120
+    b = _operands(1, n, k, seed=0)[1]
+    for m in (5, 10, 20, 40, 80):
+        a = _operands(m, n, k, seed=m)[0]
+        actual = dsv4_linear_fp32(a, b, override="gluon_dsv4_linear_fp32_gfx1250")
+        assert actual.dtype == torch.float32
+        torch.testing.assert_close(
+            actual.double(), _reference(a, b), atol=_ATOL, rtol=_RTOL
+        )
+    with assert_no_triton_compile(mm_mod._wmma_tdm_dense_kernel):
+        for m in (1, 17, 64, 128):
+            a = _operands(m, n, k, seed=m)[0]
+            torch.testing.assert_close(
+                _mm_fp32(a, b).double(), _reference(a, b), atol=_ATOL, rtol=_RTOL
+            )
+
+
 @pytest.mark.parametrize("m", [1, 6, 33, 96, 512, 2048, 4096])
 def test_mm_a16w16_bf16_matches_reference(m: int) -> None:
     a, b = _operands(m, 1024, 4096, seed=m + 1)
@@ -195,14 +215,47 @@ def test_grouped_bf16_projection_two_groups_match_reference(tokens: int) -> None
         _assert_bf16_close(actual[:, group], _reference(x[:, group], weight[group]))
 
 
+def _split_bf16_projection(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Return the BF16 grouped projection summed in the K split the quantizing
+    reduction uses, or the unquantized projection when it does not split."""
+    m, g, k = x.shape
+    n = weight.shape[1]
+    tiles = mm_mod._mm_a16w16_fp8_tiles(m, g * n, k)
+    unfused = grouped_bf16_projection(x, weight, None, None)
+    if tiles is None:
+        return unfused
+    block_m, block_n, block_k, num_buffers, warp_bases, split_k = tiles
+    projected = torch.empty((m, g, n), device=x.device, dtype=torch.bfloat16)
+    mm_mod._launch_wmma_tdm_dense_tiles(
+        x,
+        weight,
+        projected,
+        block_m=block_m,
+        block_n=block_n,
+        block_k=block_k,
+        num_buffers=num_buffers,
+        warp_bases=warp_bases,
+        split_k=split_k,
+    )
+    # Up to 32 rows the quantizing tiles split K where the unquantized ones
+    # do not. The FP32 sums then differ only in order, so each rounds to the
+    # same or an adjacent BF16 value (one ulp is at most 2**-7 relative).
+    torch.testing.assert_close(
+        projected.float(), unfused.float(), atol=_ATOL, rtol=2**-7
+    )
+    return projected
+
+
 @pytest.mark.parametrize("groups", [1, 2])
 @pytest.mark.parametrize("tokens", [1, 5, 40, 80, 300, 2048])
 def test_grouped_bf16_projection_fp8_matches_unfused(groups: int, tokens: int) -> None:
     x, weight = _two_group_operands(tokens, seed=tokens + 7)
     x, weight = x[:, :groups], weight[:groups]
     codes, scales = grouped_bf16_projection_quantize_fp8(x, weight)
+    # A different K split can move a BF16 sum by one ulp, which can cross an
+    # E4M3 rounding boundary, so compare against the same split's BF16 sum.
     expected_codes, expected_scales = quantize_fp8(
-        grouped_bf16_projection(x, weight, None, None).flatten(1),
+        _split_bf16_projection(x, weight).flatten(1),
         granularity="token_group",
         group_size=32,
         scale_encoding="ue8m0",

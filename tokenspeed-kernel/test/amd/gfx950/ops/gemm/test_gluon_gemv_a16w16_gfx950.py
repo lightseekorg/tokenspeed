@@ -31,13 +31,25 @@ if not is_cdna4():
         allow_module_level=True,
     )
 
-from tokenspeed_kernel.ops.gemm import _select_mv, mm  # noqa: E402
+from tokenspeed_kernel.ops.activation.triton import (  # noqa: E402
+    rmsnorm_gated_sigmoid,
+)
+from tokenspeed_kernel.ops.gemm import (  # noqa: E402
+    _select_mv,
+    mm,
+    mv_rmsnorm_gated_sigmoid,
+    mv_rmsnorm_gated_sigmoid_supported,
+)
 from tokenspeed_kernel.ops.gemm.gluon import (  # noqa: E402
     gluon_gemv_a16w16_gfx950 as registered_gemv,
 )
+from tokenspeed_kernel_amd._triton import triton  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (  # noqa: E402
+    _HALF_TILE_MAX_M,
     _PREFERRED_BUCKETS,
+    gluon_gated_norm_gemv_a16w16_gfx950,
     gluon_gemv_a16w16_gfx950,
+    launch_gluon_gated_norm_gemv_a16w16_gfx950,
     launch_gluon_gemv_a16w16_gfx950,
     prefers_gluon_gemv_a16w16_gfx950,
 )
@@ -142,6 +154,40 @@ def test_gemv_rejects_unsupported_shapes():
         launch_gluon_gemv_a16w16_gfx950(x, w[:, :64], x.new_empty(1, 64))
 
 
+@pytest.mark.parametrize("n,k", sorted(_HALF_TILE_MAX_M))
+@pytest.mark.parametrize("m", [2, 4, 8, 16])
+def test_half_tiles_match_one_program_per_cu_bitwise(m, n, k):
+    """16-row programs keep every column's MFMA chain, so the bits match."""
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    out = launch_gluon_gemv_a16w16_gfx950(x, w, x.new_empty(m, n))
+
+    cus = torch.cuda.get_device_properties(x.device).multi_processor_count
+    rows = triton.cdiv(n, cus)
+    one_per_cu = x.new_empty(m, n)
+    gluon_gemv_a16w16_gfx950[(triton.cdiv(n, rows),)](
+        x,
+        w,
+        one_per_cu,
+        m,
+        n,
+        rows,
+        x.stride(0),
+        one_per_cu.stride(0),
+        K=k,
+        BLOCK_M=16,
+        BLOCK_N=triton.next_power_of_2(rows),
+        BLOCK_K=128,
+        STAGES=0,
+        num_warps=4,
+    )
+
+    assert torch.equal(out, one_per_cu)
+    torch.testing.assert_close(
+        out, _reference(x, w), rtol=_RTOL[torch.bfloat16], atol=_ATOL
+    )
+
+
 def test_gemv_compiles_once_per_row_bucket():
     n, k = 2560, 3072
     w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
@@ -193,3 +239,71 @@ def test_mm_routes_a_measured_shape_through_the_gemv(m):
     expected = x.new_empty(m, n)
     launch_gluon_gemv_a16w16_gfx950(x, w, expected)
     assert torch.equal(mm(x, w), expected)
+
+
+@pytest.mark.parametrize("m", [2, 5, 8])
+def test_gated_norm_gemv_matches_the_gated_norm_then_mm(m):
+    """One launch reproduces ``rmsnorm_gated_sigmoid`` and ``mm`` bit for bit.
+
+    This is Kimi K3's TP8 KDA output projection at decode widths; the gate is
+    a strided view of the wider input projection, as the attention leaves it.
+    """
+    n, heads, head_dim = 7168, 12, 128
+    k = heads * head_dim
+    generator = torch.Generator(device="cuda").manual_seed(20261112 + m)
+    scale = torch.rand((m, heads, 1), device="cuda", generator=generator) * 4 + 0.05
+    x = torch.randn((m, heads, head_dim), device="cuda", generator=generator)
+    x = (x * scale).to(torch.bfloat16).reshape(m, k)
+    projected = torch.randn(
+        (m, 3 * k), dtype=torch.bfloat16, device="cuda", generator=generator
+    )
+    gate = projected[:, k : 2 * k]
+    norm_weight = torch.randn(head_dim, device="cuda", generator=generator) * 0.2 + 1
+    norm_weight = norm_weight.to(torch.bfloat16)
+    weight = (
+        torch.randn((n, k), dtype=torch.bfloat16, device="cuda", generator=generator)
+        / 32
+    )
+    assert mv_rmsnorm_gated_sigmoid_supported(gate, norm_weight, weight)
+    gated = rmsnorm_gated_sigmoid(
+        x, gate, norm_weight, 1e-5, heads, head_dim, enable_pdl=False
+    )
+    expected = mm(gated, weight)
+    actual = torch.full_like(expected, float("nan"))
+    mv_rmsnorm_gated_sigmoid(x, gate, norm_weight, weight, 1e-5, actual)
+    assert torch.equal(actual, expected)
+
+
+def test_gated_norm_gemv_compiles_once_per_norm_bucket():
+    n, heads, head_dim = 7168, 12, 128
+    k = heads * head_dim
+    weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    norm_weight = torch.ones(head_dim, device="cuda", dtype=torch.bfloat16)
+
+    def run(m):
+        x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+        gate = torch.randn(m, 3 * k, device="cuda", dtype=torch.bfloat16)[:, k : 2 * k]
+        launch_gluon_gated_norm_gemv_a16w16_gfx950(
+            x, gate, norm_weight, weight, x.new_empty(m, n), 1e-5
+        )
+
+    # Warm the 2..4 and 5..8 row buckets.
+    run(2)
+    run(5)
+    with assert_no_triton_compile(gluon_gated_norm_gemv_a16w16_gfx950):
+        for m in range(2, 9):
+            run(m)
+
+
+def test_gated_norm_gemv_leaves_other_rows_and_heads_to_two_launches():
+    n, k = 7168, 1536
+    weight = torch.empty((n, k), dtype=torch.bfloat16, device="cuda")
+    norm_weight = torch.empty(128, dtype=torch.bfloat16, device="cuda")
+    # One row takes the single-row GEMV, and past eight rows the norm would
+    # outlast the weight stream.
+    for m in (1, 12):
+        gate = torch.empty((m, k), dtype=torch.bfloat16, device="cuda")
+        assert not mv_rmsnorm_gated_sigmoid_supported(gate, norm_weight, weight)
+    # Heads narrower than the MFMA tile's K step are not ones it can serve.
+    gate = torch.empty((8, k), dtype=torch.bfloat16, device="cuda")
+    assert not mv_rmsnorm_gated_sigmoid_supported(gate, norm_weight[:64], weight)

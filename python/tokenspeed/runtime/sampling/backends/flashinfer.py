@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
+from tokenspeed_kernel.ops.sampling.block_verify import block_speculative_sampling
 from tokenspeed_kernel.ops.sampling.cuda import (
     chain_speculative_sampling_target_only,
 )
@@ -167,17 +168,50 @@ class FlashInferSamplingBackend(SamplingBackend):
 
     ``config.sampling_stream == "per-request"`` swaps the single-step kernel
     for the Gumbel-max pool route (``_sample_per_request``), including
-    verification at N == 1. Multi-token speculative verification retains
-    the chain kernels and its per-slot coin generators.
+    verification at N == 1. Sampled adaptive V4.1 DSpark uses position-keyed
+    CuTe probability sampling for every width. Other multi-token verification
+    retains the chain kernels and its per-slot coin generators.
     """
 
     _HAS_POOL_STATE = True
     supports_tree_verify = True
+    supports_packed_verify: bool = True
     _SUPPORTS_DP_VERIFY = True
     _SUPPORTS_OUTPUT_CUMULATIVE_PROBS = True
+    # Only over sampled drafts (speculative sampling); checked in __init__.
+    _SUPPORTS_SYNTHETIC_ACCEPTANCE = True
 
     def __init__(self, config: SamplingBackendConfig) -> None:
-
+        self._dspark_sampling = bool(
+            global_server_args_dict["enable_dsv41_adaptive_dspark"]
+            and config.enable_speculative_sampling
+        )
+        if self._dspark_sampling and (
+            config.sampling_stream != "per-request"
+            or global_server_args_dict["speculative_rejection_sample_method"]
+            != "standard"
+            or config.synthetic_acceptance_length is not None
+        ):
+            raise ValueError(
+                "sampled adaptive DSpark requires the per-request sampling stream, "
+                "standard rejection sampling, and no synthetic acceptance length"
+            )
+        # The rejection method is a server-wide choice read from the server
+        # args like ``numerics``; block verification only applies under
+        # speculative sampling.
+        self._block_verify = (
+            global_server_args_dict["speculative_rejection_sample_method"] == "block"
+            and config.enable_speculative_sampling
+        )
+        if (
+            config.synthetic_acceptance_length is not None
+            and not config.enable_speculative_sampling
+        ):
+            raise ValueError(
+                "synthetic acceptance on a flashinfer backend requires sampled "
+                "drafts (speculative sampling); otherwise use the greedy "
+                "sampling backend"
+            )
         super().__init__(config)
         self._init_dp_sampling(config)
         self._init_shared_buffers(config)
@@ -388,22 +422,21 @@ class FlashInferSamplingBackend(SamplingBackend):
         self._accept_index_local_buf: torch.Tensor | None = None
         self._accept_length_local_buf: torch.Tensor | None = None
 
-        # Draft-prob verify gathers each row's recorded distributions out of
-        # the pool-indexed RuntimeStates.draft_probs into this batch-ordered
-        # buffer (the chain kernel reads [bs, N, V] contiguous rows). Sized
-        # for the padded graph batch; the gather is captured with the graph.
+        # The native chain verifier reads batch-ordered [bs,N,V] rows. The
+        # CuTe verifier addresses the RuntimeStates proposal pool directly.
         self._draft_probs_gather_buf: torch.Tensor | None = None
         if config.enable_speculative_sampling:
             if config.vocab_size <= 0:
                 raise ValueError(
-                    "enable_speculative_sampling needs vocab_size > 0 to size the "
-                    f"draft-prob gather buffer, got {config.vocab_size}"
+                    "enable_speculative_sampling needs vocab_size > 0 for "
+                    f"proposal distributions, got {config.vocab_size}"
                 )
-            self._draft_probs_gather_buf = torch.empty(
-                (max_pad_bs, max_n, config.vocab_size),
-                dtype=torch.float32,
-                device=config.device,
-            )
+            if not self._dspark_sampling:
+                self._draft_probs_gather_buf = torch.empty(
+                    (max_pad_bs, max_n, config.vocab_size),
+                    dtype=torch.float32,
+                    device=config.device,
+                )
 
         # The per-request stream route (``_sample_per_request``) writes its
         # token ids into a caller-owned buffer.
@@ -527,7 +560,7 @@ class FlashInferSamplingBackend(SamplingBackend):
         request_pool_indices=None is the capture/warm-up path — uses
         _capture_gen for all rows. Otherwise reads per-slot generators
         populated via _reset_slot."""
-        if bs <= 0:
+        if bs <= 0 or self._dspark_sampling:
             return
         if self.config.sampling_stream == "per-request":
             if num_tokens_per_req == 1:
@@ -584,6 +617,33 @@ class FlashInferSamplingBackend(SamplingBackend):
     ) -> tuple[torch.Tensor, torch.Tensor]:
 
         logits = logits_output.next_token_logits
+
+        if self._dspark_sampling:
+            from tokenspeed_kernel.ops.sampling.packed_verify import (
+                RNG_TAG_BONUS,
+                sample_probs,
+            )
+
+            if sampling_info.vocab_mask is not None:
+                raise ValueError(
+                    "sampled adaptive DSpark does not support grammar masks"
+                )
+            slots = sampling_info.req_pool_indices
+            bs = logits.shape[0]
+            sampled = self._predict_buf[:bs]
+            sample_probs(
+                probs=self._dspark_probabilities(logits, slots),
+                seeds=self._seed_pool.index_select(0, slots),
+                positions=self._prepare_sampling_offsets(sampling_info).index_select(
+                    0, slots
+                ),
+                output=sampled,
+                rng_tag=RNG_TAG_BONUS,
+            )
+            lengths = self._accept_length_buf[:bs]
+            lengths.fill_(1)
+            self.maybe_broadcast(sampled)
+            return sampled, lengths
 
         # Grammar bitmask apply — captured inside the CUDA graph. Buffer is
         # pre-bound by bind_grammar_mask_buf; non-grammar rows stay all-ones.
@@ -654,7 +714,20 @@ class FlashInferSamplingBackend(SamplingBackend):
         candidates: torch.Tensor,
         *,
         tree: TreeVerifyBatch | None,
+        query_start_loc: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._dspark_sampling:
+            if tree is not None or sampling_info.vocab_mask is not None:
+                raise ValueError(
+                    "sampled adaptive DSpark requires plain chain verification"
+                )
+            return self._verify_dspark(
+                logits_output, sampling_info, candidates, query_start_loc
+            )
+        if query_start_loc is not None:
+            raise ValueError(
+                "packed flashinfer verification requires sampled adaptive DSpark"
+            )
         if tree is not None:
             return self._verify_tree(logits_output, sampling_info, candidates, tree)
 
@@ -824,21 +897,44 @@ class FlashInferSamplingBackend(SamplingBackend):
                 if use_draft_prob
                 else None
             )
-            chain_speculative_sampling_target_only(
-                predicts=predict,
-                accept_index=accept_index,
-                accept_token_num=accept_length,
-                candidates=candidates,
-                uniform_samples=coins[:bs, :n],
-                uniform_samples_for_final_sampling=final_coins[:bs],
-                target_probs=target_probs,
-                draft_probs=draft_probs,
-                threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
-                threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
-                deterministic=not dp_sampling,
-                use_draft_prob=use_draft_prob,
-                reject_draft_prob_threshold=self.config.spec_reject_draft_prob_threshold,
-            )
+            synthetic = self.config.synthetic_acceptance_length is not None
+            if (self._block_verify or synthetic) and draft_probs is None:
+                raise RuntimeError(
+                    "block verification and synthetic acceptance on this backend "
+                    "require recorded draft probabilities"
+                )
+            # Synthetic acceptance mirrors vLLM's rejection_sample_method
+            # "synthetic": the standard draft-probability chain rule below runs
+            # for its cost, then the forced lengths replace its outcome. The
+            # block verifier is a different rejection method and is not run.
+            if self._block_verify and not synthetic:
+                block_speculative_sampling(
+                    predicts=predict,
+                    accept_index=accept_index,
+                    accept_token_num=accept_length,
+                    candidates=candidates,
+                    uniform_samples=coins[:bs, :n],
+                    uniform_samples_for_final_sampling=final_coins[:bs],
+                    target_probs=target_probs,
+                    draft_probs=draft_probs,
+                    reject_draft_prob_threshold=self.config.spec_reject_draft_prob_threshold,
+                )
+            else:
+                chain_speculative_sampling_target_only(
+                    predicts=predict,
+                    accept_index=accept_index,
+                    accept_token_num=accept_length,
+                    candidates=candidates,
+                    uniform_samples=coins[:bs, :n],
+                    uniform_samples_for_final_sampling=final_coins[:bs],
+                    target_probs=target_probs,
+                    draft_probs=draft_probs,
+                    threshold_single=SPECULATIVE_ACCEPT_THRESHOLD_SINGLE,
+                    threshold_acc=SPECULATIVE_ACCEPT_THRESHOLD_ACC,
+                    deterministic=not dp_sampling,
+                    use_draft_prob=use_draft_prob,
+                    reject_draft_prob_threshold=self.config.spec_reject_draft_prob_threshold,
+                )
             if global_server_args_dict["numerics"] in BITWISE_ENVELOPES:
                 canonical_greedy_verify(
                     logits=logits,
@@ -848,11 +944,28 @@ class FlashInferSamplingBackend(SamplingBackend):
                     accept_index=accept_index,
                     accept_length=accept_length,
                 )
+            if synthetic:
+                lengths = self.synthetic_lengths(
+                    candidates, sampling_info.batch_row_offset
+                )
+                self.write_synthetic_outputs(
+                    candidates,
+                    self.sample_synthetic_targets(
+                        target_probs, lengths, final_coins[:bs]
+                    ),
+                    lengths,
+                    predict,
+                    accept_index,
+                    accept_length,
+                )
 
             accept_length += 1
             # This is the chain implementation's agreement requirement, not
             # a property of the request's random-stream policy. The fused
-            # renorm path skips TP sync only when PDL is disabled.
+            # renorm path skips TP sync only when PDL is disabled. The block
+            # verifier meets the same requirement: fixed grids, per-program
+            # reductions and no atomics, so equal inputs give equal outputs
+            # on every rank.
             needs_tp_sync = pdl_enabled() or not _FUSED_TOPK_TOPP_AVAILABLE
         logprobs_local = None
         if self.config.enable_output_logprobs and dp_sampling:
@@ -900,6 +1013,123 @@ class FlashInferSamplingBackend(SamplingBackend):
 
         return predict, accept_length
 
+    def _dspark_probabilities(self, logits, pool_indices):
+        """Normalize the target and proposal with the same request filters."""
+        temperatures, top_ks, top_ps, _, _, _ = gather_and_expand_scalars(
+            pool_indices,
+            temperature=self._temperature_pool,
+            top_k=self._top_k_pool,
+            top_p=self._top_p_pool,
+            n=1,
+        )
+        probabilities = softmax(logits, temperature=temperatures)
+        # Sub-tile vocabularies need the generic filter; the fused radix
+        # implementation can leave those probability rows empty.
+        if _FUSED_TOPK_TOPP_AVAILABLE and logits.shape[1] >= 1024:
+            return fused_topk_topp_renorm(
+                probabilities, top_ks, top_ps, in_place_skip=False
+            )
+        probabilities = top_p_renorm_prob(
+            top_k_renorm_prob(probabilities, top_ks), top_ps, is_deterministic=True
+        )
+        # Generic threshold filtering can retain tied maxima. A top-k=1
+        # request has the same canonical point mass as the fused filter.
+        greedy = top_ks == 1
+        maximum = sampling_argmax(logits).view(-1, 1)
+        values = probabilities.gather(1, maximum)
+        values = torch.where(greedy[:, None], 1.0, values)
+        probabilities.mul_((~greedy)[:, None])
+        probabilities.scatter_(1, maximum, values)
+        return probabilities
+
+    def sample_dspark_proposals(
+        self,
+        logits: torch.Tensor,
+        pool_indices: torch.Tensor,
+        positions: torch.Tensor,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Draw proposals into ``output`` and return their distributions.
+
+        Args:
+            logits: Proposal logits with shape ``[rows, vocab]``.
+            pool_indices: Request slot for each row, selecting its filters and seed.
+            positions: Per-row position keys for the proposal RNG.
+            output: Buffer overwritten with one sampled token per row.
+
+        Returns:
+            Normalized ``[rows, vocab]`` probability rows for the caller to record
+            and reuse during verification.
+        """
+        from tokenspeed_kernel.ops.sampling.packed_verify import (
+            RNG_TAG_DRAFT,
+            sample_probs,
+        )
+
+        if not self._dspark_sampling:
+            raise ValueError(
+                "DSpark proposal sampling requires sampled adaptive verification"
+            )
+        probabilities = self._dspark_probabilities(logits, pool_indices)
+        sample_probs(
+            probs=probabilities,
+            seeds=self._seed_pool.index_select(0, pool_indices),
+            positions=positions,
+            output=output,
+            rng_tag=RNG_TAG_DRAFT,
+        )
+        return probabilities
+
+    def _verify_dspark(self, logits_output, sampling_info, candidates, query_start_loc):
+        """Verify DSpark candidate chains against packed target-logit rows.
+
+        ``query_start_loc`` gives CSR row bounds per request; ``None`` uses the
+        uniform candidate width. Proposal-probability sentinels stop a chain
+        without locally recorded proposals. Writes ``_predict_buf``,
+        ``_accept_index_buf`` and ``_accept_length_buf`` in place, returning
+        prediction and acceptance-length views.
+        """
+        from tokenspeed_kernel.ops.sampling.packed_verify import verify_packed_chain
+
+        if logits_output.logits_layout_plan is not None:
+            raise ValueError("sampled adaptive DSpark does not support DP sampling")
+        if sampling_info.draft_probs is None:
+            raise ValueError(
+                "sampled adaptive DSpark requires recorded proposal distributions"
+            )
+        bs, width = candidates.shape
+        logits = logits_output.next_token_logits
+        slots = sampling_info.req_pool_indices
+        if query_start_loc is None:
+            query_start_loc = (
+                torch.arange(bs + 1, device=logits.device, dtype=torch.int64) * width
+            )
+        rows = torch.arange(logits.shape[0], device=logits.device, dtype=torch.int64)
+        requests = torch.searchsorted(query_start_loc[1:], rows, right=True).clamp_max(
+            bs - 1
+        )
+        row_slots = slots.index_select(0, requests)
+        predict = self._predict_buf[: bs * width]
+        indices = self._accept_index_buf[: bs * width].view(bs, width)
+        lengths = self._accept_length_buf[:bs]
+        verify_packed_chain(
+            predicts=predict,
+            accept_index=indices,
+            accept_length=lengths,
+            candidates=candidates.to(torch.int32),
+            target_probs=self._dspark_probabilities(logits, row_slots),
+            draft_probs=sampling_info.draft_probs,
+            draft_pool_indices=slots,
+            reject_draft_prob_threshold=self.config.spec_reject_draft_prob_threshold,
+            query_start_loc=query_start_loc,
+            seeds=self._seed_pool.index_select(0, slots),
+            positions=self._prepare_sampling_offsets(sampling_info).index_select(
+                0, slots
+            ),
+        )
+        self.broadcast_verify_outputs()
+        return predict, lengths
+
     def _verify_tree(
         self,
         logits_output: LogitsProcessorOutput,
@@ -936,35 +1166,6 @@ class FlashInferSamplingBackend(SamplingBackend):
                 path_logits, predict, logprob_order=self.config.logprob_order
             )
         return predict, accept_length
-
-    def get_packed_output_d2h(
-        self,
-        output_tokens: torch.Tensor,
-        output_lengths: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """One D2H of the packed predict+accept_length region.
-
-        Applies when both outputs alias into ``_output_pack_buf`` — both
-        ``verify()`` and ``sample()`` land their outputs there. Callers
-        holding outputs from another source fall back to two D2Hs.
-        """
-        if (
-            output_tokens.data_ptr() != self._output_pack_buf.data_ptr()
-            or output_lengths.data_ptr() != self._accept_length_buf.data_ptr()
-        ):
-            return None
-        n_t = output_tokens.numel()
-        n_l = output_lengths.numel()
-        # Copy the whole [0, predict_max + n_l). The gap [n_t, predict_max)
-        # is stale padding (max_bs * max_n  vs.  bs * n) — small enough that
-        # the saved launch beats the wasted bandwidth.
-        size = self._predict_max + n_l
-        cpu_pack = torch.empty(size, dtype=torch.int32, pin_memory=True)
-        cpu_pack.copy_(self._output_pack_buf[:size], non_blocking=True)
-        return (
-            cpu_pack[:n_t].view(output_tokens.shape),
-            cpu_pack[self._predict_max : self._predict_max + n_l],
-        )
 
 
 register_backend("flashinfer", FlashInferSamplingBackend)

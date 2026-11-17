@@ -68,8 +68,8 @@ fn run_scenario(directory: &Path) {
             dp_rank: 0,
         },
     );
-    engine.record_scheduler_iteration(3, 2, 10, 40, 17);
-    engine.record_scheduler_iteration(1, 0, 4, 40, 0);
+    engine.record_scheduler_iteration(3, 5, 2, 10, 40, 17);
+    engine.record_scheduler_iteration(1, 4, 0, 4, 40, 0);
     engine.record_spec_decode_step(4, 5, 3);
     engine.record_jit_compiles(2, 0.5);
     engine.record_nan_abort();
@@ -77,12 +77,25 @@ fn run_scenario(directory: &Path) {
     engine.record_preemptions(2);
     engine.observe_request_queue_time(0.4);
     engine.observe_request_queue_time(9000.0);
+    engine.record_cache_occupancy(12, 8, 40, 647);
+    engine.record_prefill_queues(1, 2, 0);
+    engine.record_decode_queues(3, 2, 4, 1);
+    engine.record_generation_tokens(25);
+    engine.record_request_tokens(100, 40);
+    engine.observe_time_to_first_token(0.25);
+    engine.observe_request_time(1.5);
+    engine.observe_decode_time(1.2);
+    engine.observe_time_per_output_token(0.02);
+    engine.record_completion_tokens(5);
+    engine.record_grammar_queue(2);
+    engine.record_prefix_hits(100, 40, 30, 10);
 
     let transfer = KvTransferMetrics::new(&exporter, "m", "");
     transfer.observe_latency(0.003);
     transfer.record_timeout("bootstrapping");
     transfer.record_timeout("waiting_for_input");
     transfer.record_failure();
+    transfer.record_size(4096);
 }
 
 #[test]
@@ -139,6 +152,121 @@ fn render(directory: &Path) -> Option<String> {
         panic!("rendering failed:\n{stderr}");
     }
     Some(String::from_utf8(rendered.stdout).unwrap())
+}
+
+#[test]
+fn decode_ready_wait_exports_duration_and_the_100ms_bucket() {
+    let directory = scratch_dir("decode-ready-wait");
+    let exporter = Exporter::new(&MetricsConfig {
+        prometheus_dir: Some(directory.clone()),
+        relay_endpoint: None,
+    })
+    .unwrap();
+    let engine = EngineMetrics::new(
+        &exporter,
+        &EngineLabels {
+            model_name: "m".to_owned(),
+            app_key: String::new(),
+            dp_rank: 0,
+        },
+    );
+    for seconds in [0.04, 0.1, 0.3] {
+        engine.observe_decode_ready_wait(seconds);
+    }
+    let Some(text) = render(&directory) else {
+        return;
+    };
+    let value = |name: &str, label: Option<&str>| -> f64 {
+        text.lines()
+            .find(|line| {
+                line.starts_with(&format!("{name}{{"))
+                    && label.is_none_or(|label| line.contains(label))
+            })
+            .unwrap_or_else(|| panic!("missing {name} in {text}"))
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    assert_eq!(
+        value("tokenspeed:decode_ready_wait_seconds_count", None),
+        3.0
+    );
+    assert!((value("tokenspeed:decode_ready_wait_seconds_sum", None) - 0.44).abs() < 1e-9);
+    assert_eq!(
+        value(
+            "tokenspeed:decode_ready_wait_seconds_bucket",
+            Some("le=\"0.1\"")
+        ),
+        2.0
+    );
+}
+
+#[test]
+fn decode_slot_gauges_report_occupancy_and_release_without_changing_load() {
+    let directory = scratch_dir("decode-slots");
+    let exporter = Exporter::new(&MetricsConfig {
+        prometheus_dir: Some(directory.clone()),
+        relay_endpoint: None,
+    })
+    .unwrap();
+    let engine = EngineMetrics::new(
+        &exporter,
+        &EngineLabels {
+            model_name: "m".to_owned(),
+            app_key: String::new(),
+            dp_rank: 3,
+        },
+    );
+    engine.record_scheduler_iteration(2, 5, 1, 4, 40, 0);
+    engine.record_decode_slot_usage(4, 2, 2);
+    let Some(first) = render(&directory) else {
+        return;
+    };
+    let value = |text: &str, name: &str| -> Option<f64> {
+        text.lines()
+            .find(|line| line.starts_with(&format!("{name}{{")) && line.contains("dp_rank=\"3\""))
+            .and_then(|line| line.split_whitespace().nth(1))
+            .map(|number| number.parse().unwrap())
+    };
+    assert_eq!(value(&first, "tokenspeed:num_requests_resident"), Some(4.0));
+    assert_eq!(
+        value(&first, "tokenspeed:num_active_decode_slots"),
+        Some(2.0)
+    );
+    assert_eq!(
+        value(&first, "tokenspeed:num_decode_ready_waiting_reqs"),
+        Some(2.0)
+    );
+
+    engine.record_decode_slot_usage(3, 1, 0);
+    let released = render(&directory).expect("the same Python can render the second snapshot");
+    assert_eq!(
+        value(&released, "tokenspeed:num_requests_resident"),
+        Some(3.0)
+    );
+    assert_eq!(
+        value(&released, "tokenspeed:num_active_decode_slots"),
+        Some(1.0)
+    );
+    assert_eq!(
+        value(&released, "tokenspeed:num_decode_ready_waiting_reqs"),
+        Some(0.0)
+    );
+    assert_eq!(
+        value(&released, "tokenspeed:num_requests_running"),
+        Some(2.0)
+    );
+    assert_eq!(
+        value(&released, "tokenspeed:num_requests_inflight"),
+        Some(5.0)
+    );
+    assert_eq!(
+        value(&released, "tokenspeed:num_requests_waiting"),
+        Some(1.0)
+    );
+    std::fs::remove_dir_all(&directory).unwrap();
 }
 
 #[test]

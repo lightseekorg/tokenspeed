@@ -30,16 +30,16 @@ from tokenspeed_kernel.ops.sampling.cuda import (
 from tokenspeed_kernel.ops.sampling.cuda import (
     fused_topk_topp_renorm,
 )
+from tokenspeed_kernel.ops.sampling.eagle_harness import (
+    eagle_harness_residual_sample,
+    eagle_harness_tree_reject_sample,
+)
 from tokenspeed_kernel.ops.sampling.flashinfer import (
     softmax,
     top_k_renorm_prob,
     top_p_renorm_prob,
 )
 from tokenspeed_kernel.ops.sampling.triton import gather_and_expand_scalars
-from tokenspeed_kernel.thirdparty.cuda.eagle_harness import (
-    eagle_harness_residual_sample,
-    eagle_harness_tree_reject_sample,
-)
 
 from tokenspeed.runtime.sampling.backends.base import SpeculativeSamplingPools
 from tokenspeed.runtime.sampling.tree_verify import DraftTreeQ, TreeVerifyBatch

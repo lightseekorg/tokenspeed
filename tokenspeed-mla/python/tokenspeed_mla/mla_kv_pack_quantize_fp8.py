@@ -37,7 +37,10 @@ import torch
 from tokenspeed_mla._triton import tl, triton
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["total_rows"],
+    do_not_specialize_on_alignment=["total_rows"],
+)
 def _mla_kv_pack_quantize_fp8_kernel(
     k_nope_ptr,
     k_pe_ptr,
@@ -46,7 +49,7 @@ def _mla_kv_pack_quantize_fp8_kernel(
     v_out_ptr,
     k_scale_inv,
     v_scale_inv,
-    s_total,
+    total_rows,
     k_nope_stride_t,
     k_nope_stride_h,
     k_pe_stride_t,
@@ -56,65 +59,57 @@ def _mla_kv_pack_quantize_fp8_kernel(
     k_out_stride_h,
     v_out_stride_t,
     v_out_stride_h,
+    HEADS: tl.constexpr,
     QK_NOPE: tl.constexpr,
     QK_ROPE: tl.constexpr,
     V_HEAD: tl.constexpr,
     FP8_DTYPE: tl.constexpr,
-    BLOCK_S: tl.constexpr,
+    BLOCK_NOPE: tl.constexpr,
+    BLOCK_ROPE: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+    ROWS: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
-    pid_s = tl.program_id(0)
-    pid_h = tl.program_id(1)
-
-    t_idx = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)  # [BLOCK_S]
-    # The row offset t_idx * stride_t passes 2**31 elements for prefill
-    # chunks a public caller can reach (e.g. 32k tokens at 128 heads).
-    t_idx = t_idx.to(tl.int64)
-    t_mask = t_idx < s_total
-
-    nope_idx = tl.arange(0, QK_NOPE)
-    rope_idx = tl.arange(0, QK_ROPE)
-    v_idx = tl.arange(0, V_HEAD)
+    # Flatten token/head rows; int64 addressing also covers page-strided views.
+    rows = tl.program_id(0).to(tl.int64) * ROWS + tl.arange(0, ROWS)
+    t_idx = (rows // HEADS)[:, None]
+    h_idx = (rows % HEADS)[:, None]
+    live = rows[:, None] < total_rows
+    nope_idx = tl.arange(0, BLOCK_NOPE)[None, :]
+    rope_idx = tl.arange(0, BLOCK_ROPE)[None, :]
+    v_idx = tl.arange(0, BLOCK_V)[None, :]
+    nope_mask = live & (nope_idx < QK_NOPE)
+    rope_mask = live & (rope_idx < QK_ROPE)
+    v_mask = live & (v_idx < V_HEAD)
 
     # PDL: wait for the kv_b_proj GEMM (and k_pe producer) to finish writing
     # before we read.
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
 
-    # k_nope: [BLOCK_S, QK_NOPE]
-    nope_off = (
-        t_idx[:, None] * k_nope_stride_t + pid_h * k_nope_stride_h + nope_idx[None, :]
-    )
-    k_nope = tl.load(k_nope_ptr + nope_off, mask=t_mask[:, None])
+    nope_off = t_idx * k_nope_stride_t + h_idx * k_nope_stride_h + nope_idx
+    k_nope = tl.load(k_nope_ptr + nope_off, mask=nope_mask, other=0)
 
-    # k_pe: [BLOCK_S, QK_ROPE] (shared across heads, but loaded per-CTA — L2 absorbs)
-    pe_off = t_idx[:, None] * k_pe_stride_t + rope_idx[None, :]
-    k_pe = tl.load(k_pe_ptr + pe_off, mask=t_mask[:, None])
+    pe_off = t_idx * k_pe_stride_t + rope_idx
+    k_pe = tl.load(k_pe_ptr + pe_off, mask=rope_mask, other=0)
 
-    # v: [BLOCK_S, V_HEAD]
-    v_off = t_idx[:, None] * v_stride_t + pid_h * v_stride_h + v_idx[None, :]
-    v = tl.load(v_ptr + v_off, mask=t_mask[:, None])
+    v_off = t_idx * v_stride_t + h_idx * v_stride_h + v_idx
+    v = tl.load(v_ptr + v_off, mask=v_mask, other=0)
 
     k_nope_fp8 = (k_nope.to(tl.float32) * k_scale_inv).to(FP8_DTYPE)
     k_pe_fp8 = (k_pe.to(tl.float32) * k_scale_inv).to(FP8_DTYPE)
     v_fp8 = (v.to(tl.float32) * v_scale_inv).to(FP8_DTYPE)
 
-    # k_out: [BLOCK_S, QK_NOPE + QK_ROPE]
-    k_out_base = t_idx[:, None] * k_out_stride_t + pid_h * k_out_stride_h
+    k_out_base = t_idx * k_out_stride_t + h_idx * k_out_stride_h
+    tl.store(k_out_ptr + k_out_base + nope_idx, k_nope_fp8, mask=nope_mask)
     tl.store(
-        k_out_ptr + k_out_base + nope_idx[None, :], k_nope_fp8, mask=t_mask[:, None]
-    )
-    tl.store(
-        k_out_ptr + k_out_base + QK_NOPE + rope_idx[None, :],
+        k_out_ptr + k_out_base + QK_NOPE + rope_idx,
         k_pe_fp8,
-        mask=t_mask[:, None],
+        mask=rope_mask,
     )
 
-    # v_out: [BLOCK_S, V_HEAD]
-    v_out_off = (
-        t_idx[:, None] * v_out_stride_t + pid_h * v_out_stride_h + v_idx[None, :]
-    )
-    tl.store(v_out_ptr + v_out_off, v_fp8, mask=t_mask[:, None])
+    v_out_off = t_idx * v_out_stride_t + h_idx * v_out_stride_h + v_idx
+    tl.store(v_out_ptr + v_out_off, v_fp8, mask=v_mask)
 
     # PDL: signal that dependent kernels (FMHA) can begin their preamble while
     # our writes finalize.
@@ -176,22 +171,12 @@ def mla_kv_pack_quantize_fp8(
     else:
         k_pe_2d = k_pe
 
+    if s == 0:
+        return k_out, v_out
+
     fp8_dtype_const = tl.float8e4nv if fp8_dtype is torch.float8_e4m3fn else tl.float8e5
 
-    # Heuristic config — manually tuned on B200 for K2.5 TP=4 shape. Picks
-    # BLOCK_S based on s so the grid stays well above SM count; small s favors
-    # tiny BLOCK_S to avoid wasting threads, large s favors larger BLOCK_S to
-    # amortize launch.
-    if s < 512:
-        block_s, num_warps, num_stages = 1, 1, 2
-    elif s < 2048:
-        block_s, num_warps, num_stages = 4, 2, 3
-    else:
-        block_s, num_warps, num_stages = 16, 4, 3
-
-    grid = (triton.cdiv(s, block_s), num_heads)
-
-    _mla_kv_pack_quantize_fp8_kernel[grid](
+    _mla_kv_pack_quantize_fp8_kernel[(triton.cdiv(s * num_heads, 8),)](
         k_nope,
         k_pe_2d,
         v,
@@ -199,7 +184,7 @@ def mla_kv_pack_quantize_fp8(
         v_out,
         k_scale_inv,
         v_scale_inv,
-        s,
+        s * num_heads,
         k_nope.stride(0),
         k_nope.stride(1),
         k_pe_2d.stride(0),
@@ -209,14 +194,18 @@ def mla_kv_pack_quantize_fp8(
         k_out.stride(1),
         v_out.stride(0),
         v_out.stride(1),
+        HEADS=num_heads,
         QK_NOPE=qk_nope,
         QK_ROPE=qk_rope,
         V_HEAD=v_head,
         FP8_DTYPE=fp8_dtype_const,
-        BLOCK_S=block_s,
+        BLOCK_NOPE=triton.next_power_of_2(qk_nope),
+        BLOCK_ROPE=triton.next_power_of_2(qk_rope),
+        BLOCK_V=triton.next_power_of_2(v_head),
+        ROWS=8,
         ENABLE_PDL=enable_pdl,
-        num_warps=num_warps,
-        num_stages=num_stages,
+        num_warps=4,
+        num_stages=3,
         launch_pdl=enable_pdl,
     )
     return k_out, v_out

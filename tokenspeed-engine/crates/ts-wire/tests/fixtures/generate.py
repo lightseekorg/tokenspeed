@@ -43,7 +43,10 @@ from tokenspeed.runtime.engine import zmq_wire
 from tokenspeed.runtime.engine.io_struct import (
     BatchTokenIDOutSlim,
     FlushCacheReqOutput,
+    GetAdmissionReqOutput,
     GetInternalStateReqOutput,
+    GetSharedPrefixPublicationReqInput,
+    GetSharedPrefixPublicationReqOutput,
     MsgpackEncoder,
     PauseSchedulerReqInput,
     ProfileReq,
@@ -51,6 +54,7 @@ from tokenspeed.runtime.engine.io_struct import (
     SessionParams,
     TokenizedGenerateReqInput,
     UpdateWeightsFromDistributedReqInput,
+    UpdateWeightsFromMooncakeReqInput,
 )
 from tokenspeed.runtime.epd.encode_worker import EncodeRequest
 from tokenspeed.runtime.multimodal.inputs import (
@@ -169,6 +173,8 @@ def _generate_text() -> list[bytes]:
             validation_error="rejected",
             data_parallel_rank=1,
             cache_session_id="cache-session",
+            cache_group_id="cache-group",
+            shared_prefix_tokens=[1, 3],
         )
     )
 
@@ -300,6 +306,72 @@ def _control_output_flush() -> list[bytes]:
     return [zmq_wire.encode_control(FlushCacheReqOutput(success=True))]
 
 
+def _control_update_mooncake() -> list[bytes]:
+    return _control(
+        UpdateWeightsFromMooncakeReqInput(
+            version=7,
+            flush_cache=True,
+            weight_version="7",
+            snapshot={
+                "format_version": 1,
+                "version": 7,
+                "publishers": [{"key": "weights/7"}],
+            },
+        )
+    )
+
+
+def _control_output_admission() -> list[bytes]:
+    return [
+        zmq_wire.encode_control(
+            GetAdmissionReqOutput(
+                success=True,
+                dp_rank=2,
+                contract_version=1,
+                free_slots=7,
+                total_slots=8,
+                available_blocks=29,
+                total_blocks=32,
+                host_free_blocks=40,
+                host_total_blocks=64,
+                retracted=3,
+                waiting=4,
+                max_tokens=8192,
+                capacity_token_step=1024,
+                capacity_blocks=[1, 2, 3, 4],
+                cache_group_contract=1,
+                shared_prefix_publication_contract=1,
+                shared_prefix_storage_enabled=True,
+            )
+        )
+    ]
+
+
+def _control_shared_prefix_publication() -> list[bytes]:
+    return _control(
+        GetSharedPrefixPublicationReqInput(
+            query_id="nonce-7", input_ids=[1, 2, 3], max_prefix_tokens=2
+        )
+    )
+
+
+def _control_output_shared_prefix_publication() -> list[bytes]:
+    return [
+        zmq_wire.encode_control(
+            GetSharedPrefixPublicationReqOutput(
+                success=True,
+                message="",
+                query_id="nonce-7",
+                dp_rank=2,
+                status="published",
+                confirmed_prefix_tokens=2,
+                storage_namespace="deployment-v1",
+                cache_epoch=7,
+            )
+        )
+    ]
+
+
 def _control_output_internal_state() -> list[bytes]:
     return [
         zmq_wire.encode_control(
@@ -360,6 +432,7 @@ def _output_slim_tail() -> list[bytes]:
         output_top_logprobs_val=[[[-0.25, -3.0]], []],
         output_top_logprobs_idx=[[[7, 1]], []],
         output_token_cumulative_probs_val=[[0.75], []],
+        reasoning_tokens=[1, 0],
     )
     return [bytes(f) for f in _ENCODER.encode(batch)]
 
@@ -463,7 +536,11 @@ FIXTURES = {
     "control_pause": _control_pause,
     "control_profile": _control_profile,
     "control_update_distributed": _control_update_distributed,
+    "control_update_mooncake": _control_update_mooncake,
     "control_output_flush": _control_output_flush,
+    "control_output_admission": _control_output_admission,
+    "control_shared_prefix_publication": _control_shared_prefix_publication,
+    "control_output_shared_prefix_publication": _control_output_shared_prefix_publication,
     "control_output_internal_state": _control_output_internal_state,
     "output_slim": _output_slim,
     "output_slim_tail": _output_slim_tail,

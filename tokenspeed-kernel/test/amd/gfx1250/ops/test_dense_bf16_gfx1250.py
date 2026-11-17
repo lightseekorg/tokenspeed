@@ -95,6 +95,19 @@ def test_dense_short_k_drains_tdm(k):
         torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.parametrize("n,k", [(32320, 5120), (38720, 4096)])
+def test_dense_vocab_shard_rows_match_and_reuse_compilation(n, k):
+    # DeepSeek V4.1 TP4 (one wave) and GLM-5.3-Flash TP4 LM-head shards.
+    torch.manual_seed(n)
+    a = torch.randn(16, k, device="cuda", dtype=torch.bfloat16) / k**0.5
+    b = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
+    gluon_wmma_tdm_dense_gfx1250(a[:2], b, split_k=None)
+    with assert_no_triton_compile(_wmma_tdm_dense_kernel):
+        for rows in (1, 5, 16):
+            actual = gluon_wmma_tdm_dense_gfx1250(a[:rows], b, split_k=None)
+            torch.testing.assert_close(actual, a[:rows] @ b.T, atol=1e-2, rtol=1e-2)
+
+
 @pytest.mark.parametrize("kda", [False, True])
 def test_dense_batch_sizes_reuse_compilation(kda):
     k, n = (7168, 6288) if kda else (1024, 128)

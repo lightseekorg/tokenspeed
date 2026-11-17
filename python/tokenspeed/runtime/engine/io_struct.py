@@ -145,6 +145,10 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     data_parallel_rank: int | None = None
     # Router-only cache retention identity; no prompt concatenation.
     cache_session_id: str | None = None
+    # Shared cache ownership across independent sessions; no prompt concatenation.
+    cache_group_id: str | None = None
+    # Bounded remote checkpoint hints; actual input tokens still determine keys.
+    shared_prefix_tokens: list[int] = []
     # array_like declaration order is the wire contract; append new fields here.
 
 
@@ -213,6 +217,61 @@ class BatchTokenIDOutSlim(BaseBatchReq, kw_only=True):
     # Appended diagnostic tail: per-token cumulative probability mass, parallel
     # to output_token_logprobs_val. Empty for frames without this diagnostic.
     output_token_cumulative_probs_val: list[list[float]] = []
+    # Cumulative reasoning tokens per request, excluding structural markers.
+    # Appended wire tail: older producers omit it and decode as [].
+    reasoning_tokens: list[int] = []
+
+
+class GetAdmissionReqInput(BaseReq, kw_only=True):
+    """Poll native allocator capacity and supported cache-group ownership."""
+
+
+class GetAdmissionReqOutput(BaseReq, kw_only=True):
+    success: bool
+    dp_rank: int
+    contract_version: int
+    free_slots: int
+    total_slots: int
+    available_blocks: int
+    total_blocks: int
+    host_free_blocks: int
+    host_total_blocks: int
+    retracted: int
+    waiting: int
+    max_tokens: int
+    capacity_token_step: int
+    capacity_blocks: list[int]
+    # Older native engines omit this append-only capability field.
+    cache_group_contract: int = 0
+    shared_prefix_publication_contract: int = 0
+    shared_prefix_storage_enabled: bool = False
+
+
+class GetSharedPrefixPublicationReqInput(BaseReq, kw_only=True):
+    query_id: str
+    input_ids: list[int]
+    max_prefix_tokens: int
+
+
+class GetSharedPrefixPublicationReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+    query_id: str
+    dp_rank: int
+    status: str
+    confirmed_prefix_tokens: int
+    storage_namespace: str
+    cache_epoch: int
+
+
+class DemoteCacheGroupsReqInput(BaseReq, kw_only=True):
+    cache_group_ids: list[str]
+    ended: bool
+
+
+class DemoteCacheGroupsReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
 
 
 class FlushCacheReqInput(BaseReq, kw_only=True):
@@ -352,6 +411,8 @@ class UpdateWeightsFromMooncakeReqInput(BaseReq, kw_only=True):
     # Required. The L3 namespace to publish after a successful load, or
     # ``None`` for the default ``mooncake_load_weight_version`` resolves.
     weight_version: str | None
+    # Optional publication directory for SDKs that use explicit snapshots.
+    snapshot: dict | None = None
 
 
 class UpdateWeightsFromMooncakeReqOutput(BaseReq, kw_only=True):
@@ -441,6 +502,22 @@ class ProfileReq(BaseReq, kw_only=True):
 
 
 class ProfileReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+
+
+class ReloadForwardReqInput(BaseReq, kw_only=True):
+    # How a drain treats running requests: "wait" lets them finish, "abort" ends them.
+    mode: str = "wait"
+    # Modules to re-execute; None reloads every module whose source changed.
+    modules: list[str] | None = None
+    # The caller's id, the same on every engine; the gate runs the reload once all hold it.
+    id: str | None = None
+    # Seconds to wait for the drain and every attention-DP engine; None waits until cancelled.
+    timeout_s: float | None = None
+
+
+class ReloadForwardReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
 

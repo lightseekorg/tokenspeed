@@ -99,20 +99,26 @@ class TreeSpec:
         # This round's drafted tree; the executor publishes it to RuntimeStates.future_parent_map.
         self.draft_parent_buf = self.chain_parent.repeat(max_bs, 1)
         # The chain the parents describe, so graph warmup's compact (no load_step) is a no-op.
-        self.depth_buf = torch.arange(n, dtype=torch.int32, device=device).repeat(
-            max_bs, 1
-        )
+        self.chain_depth = torch.arange(n, dtype=torch.int32, device=device)
+        self.depth_buf = self.chain_depth.repeat(max_bs, 1)
         chain_mask = [(1 << (i + 1)) - 1 for i in range(n)]
         chain_mask = [
             m - (1 << 64) if m >> 63 else m for m in chain_mask
         ]  # bit 63 is the sign
-        self.mask_buf = torch.tensor(
-            chain_mask, dtype=torch.int64, device=device
-        ).repeat(max_bs)
+        self.chain_mask = torch.tensor(chain_mask, dtype=torch.int64, device=device)
+        self.mask_buf = self.chain_mask.repeat(max_bs)
 
     @property
     def num_nodes(self) -> int:
         return self.config.num_nodes
+
+    def reset_to_chain(self) -> None:
+        """Rewrite every buffer to the chain in place, as constructed, so graph warmup's compact leaves positions alone again."""
+        rows = self.parent_buf.shape[0]
+        self.parent_buf.copy_(self.chain_parent.expand(rows, -1))
+        self.draft_parent_buf.copy_(self.chain_parent.expand(rows, -1))
+        self.depth_buf.copy_(self.chain_depth.expand(rows, -1))
+        self.mask_buf.view(rows, -1).copy_(self.chain_mask.expand(rows, -1))
 
     def load_step(
         self,

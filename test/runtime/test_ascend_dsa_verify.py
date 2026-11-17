@@ -875,8 +875,9 @@ class _CpuFusedDsaKernels:
     def merge_lse_direct(self, output, maximum, total, *, group, rank_size):
         rank = {"fused-dsa": 0}[group]
         # Resolve the communicator peers, then include the original producer.
-        peers = self.peer_outputs[:rank_size].expand(-1, 64, self.rows, 512).clone()
-        maxima = self.peer_maximum[:rank_size].expand(-1, self.rows, 64).clone()
+        heads = output.shape[0]
+        peers = self.peer_outputs[:rank_size].expand(-1, heads, self.rows, 512).clone()
+        maxima = self.peer_maximum[:rank_size].expand(-1, self.rows, heads).clone()
         sums = self.peer_sum[:rank_size].expand_as(maxima).clone()
         peers[rank].copy_(output)
         maxima[rank].copy_(maximum[0])
@@ -890,12 +891,18 @@ class _CpuFusedDsaKernels:
 
 
 def _fused_backend(
-    monkeypatch, rows, *, degree, rank=0, backend_class=ascend_dsa.AscendDSABackend
+    monkeypatch,
+    rows,
+    *,
+    degree,
+    heads,
+    rank=0,
+    backend_class=ascend_dsa.AscendDSABackend,
 ):
     def initialize_base(self, config, spec, *, kernel_page_size):
         self.is_draft = False
         self.spec_num_tokens = 8
-        self.num_local_heads = 64 // degree
+        self.num_local_heads = heads // degree
         self.step_counter = None
         self.kernel_page_size = kernel_page_size
 
@@ -913,7 +920,7 @@ def _fused_backend(
         is_dsa=True,
         index_k_format="bf16",
         attn_tp_size=degree,
-        num_attention_heads=64,
+        num_attention_heads=heads,
         index_head_dim=128,
         index_topk=2048,
         kv_cache_dim=576,
@@ -990,7 +997,9 @@ def _collective_dsa_worker(rank, rendezvous):
         with pytest.MonkeyPatch.context() as patch:
             patch.setattr(pg_module, "process_group_manager", manager)
             for rows in (1, 3, 16):
-                backend = _fused_backend(patch, rows, degree=degree, rank=rank)
+                backend = _fused_backend(
+                    patch, rows, degree=degree, heads=64, rank=rank
+                )
                 backend._indexer_kernels = _CpuCollectiveDsaKernels(rows, degree, rank)
                 # Small shapes must retain the general path even after the
                 # model has configured native buffers for larger shapes.
@@ -1089,7 +1098,7 @@ def test_single_rank_verify_preserves_each_candidates_causal_context(
             )
 
     rows = 2 * width
-    backend = _fused_backend(monkeypatch, rows, degree=1)
+    backend = _fused_backend(monkeypatch, rows, degree=1, heads=64)
     monkeypatch.setattr(backend, "_indexer_kernels", SingleRankKernels())
     monkeypatch.setattr(backend, "cache_placement", lambda layer: None)
     table = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int32)
@@ -1128,7 +1137,7 @@ def test_single_rank_verify_preserves_each_candidates_causal_context(
 def test_dsa_metadata_needs_no_collective_process_group(monkeypatch):
     # The global runtime may exist while this backend has no HCCL groups.
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
-    backend = _fused_backend(monkeypatch, 64, degree=8)
+    backend = _fused_backend(monkeypatch, 64, degree=8, heads=64)
     backend._dcp.refresh_metadata(
         page_table=torch.tensor([[1, 2]], dtype=torch.int32),
         seq_lens=torch.tensor([256], dtype=torch.int32),
@@ -1146,24 +1155,36 @@ def test_dsa_metadata_needs_no_collective_process_group(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "degree,rows", [(2, 64), (4, 64), (8, 64), (8, 128), (8, 256), (8, 512), (16, 64)]
+    "heads,degree,rows",
+    [
+        (64, 2, 64),
+        (64, 4, 64),
+        (64, 8, 64),
+        (64, 8, 128),
+        (64, 8, 256),
+        (64, 8, 512),
+        (64, 16, 64),
+        (32, 8, 1),
+        (32, 8, 32),
+        (32, 8, 512),
+    ],
 )
 @pytest.mark.parametrize("head_major", [False, True])
 def test_fused_dsa_uses_registered_outputs_and_merges_lse(
-    monkeypatch, degree, rows, head_major
+    monkeypatch, heads, degree, rows, head_major
 ):
-    backend = _fused_backend(monkeypatch, rows, degree=degree)
+    backend = _fused_backend(monkeypatch, rows, degree=degree, heads=heads)
     outputs = (
-        torch.empty(64, rows, 512),
-        torch.empty(1, rows, 64),
-        torch.empty(1, rows, 64),
+        torch.empty(heads, rows, 512),
+        torch.empty(1, rows, heads),
+        torch.empty(1, rows, heads),
     )
     backend.configure_fused_decode(
         group="fused-dsa",
         ranks=tuple(backend._dcp.ranks),
         attention_outputs={rows: outputs},
     )
-    local_heads = 64 // degree
+    local_heads = heads // degree
     packed_query = torch.zeros(degree, rows, local_heads, 576, dtype=torch.bfloat16)
     layer = SimpleNamespace(layer_id=0, scaling=1.0)
     index_cache = torch.zeros(2, 128, 1, 128, dtype=torch.bfloat16)
@@ -1189,7 +1210,7 @@ def test_fused_dsa_uses_registered_outputs_and_merges_lse(
             index_cache_written=True,
             packed_query=packed_query,
         ),
-        query_group_size=8,
+        query_group_size=min(8, rows),
         context_parallel=True,
         query_width=1,
         fused=True,
@@ -1214,7 +1235,7 @@ def test_fused_dsa_uses_registered_outputs_and_merges_lse(
 
 
 def test_dsa_rejects_resources_for_a_different_cp_group(monkeypatch):
-    backend = _fused_backend(monkeypatch, 64, degree=4)
+    backend = _fused_backend(monkeypatch, 64, degree=4, heads=64)
     outputs = (torch.empty(64, 64, 512), torch.empty(1, 64, 64), torch.empty(1, 64, 64))
     with pytest.raises(ValueError, match="cover the CP group"):
         backend.configure_fused_decode(
@@ -1226,7 +1247,7 @@ def test_dsa_rejects_resources_for_a_different_cp_group(monkeypatch):
 
 
 def test_dsa_missing_fused_resources_fail_before_native_launch(monkeypatch):
-    backend = _fused_backend(monkeypatch, 64, degree=8)
+    backend = _fused_backend(monkeypatch, 64, degree=8, heads=64)
     selection = ascend_dsa._AscendSparseSelection(
         torch.empty(8, 64, 8, 576),
         None,
@@ -1277,7 +1298,9 @@ def test_public_attention_provider_hook_selects_stage(monkeypatch, is_prefill):
         def attention_kernels(self, *, is_prefill):
             return StageKernels(2 if is_prefill else 3)
 
-    backend = _fused_backend(monkeypatch, 1, degree=1, backend_class=StageBackend)
+    backend = _fused_backend(
+        monkeypatch, 1, degree=1, heads=64, backend_class=StageBackend
+    )
     selection = ascend_dsa._AscendSparseSelection(
         torch.zeros(1, 8, 576), None, None, None, None, None, 3, False, False
     )
@@ -1694,7 +1717,7 @@ def test_collective_prefill_keeps_causal_rows_across_indexer_batch_limit(
 
 
 def test_fused_selection_rejects_missing_prolog_query(monkeypatch):
-    backend = _fused_backend(monkeypatch, 64, degree=8)
+    backend = _fused_backend(monkeypatch, 64, degree=8, heads=64)
     with pytest.raises(ValueError, match="requires the fused Prolog query"):
         backend._select_indexed(
             torch.empty(64, 8, 576),
@@ -1714,7 +1737,7 @@ def test_fused_selection_rejects_missing_prolog_query(monkeypatch):
 
 
 def test_ordinary_selection_rejects_fused_prolog_query(monkeypatch):
-    backend = _fused_backend(monkeypatch, 64, degree=8)
+    backend = _fused_backend(monkeypatch, 64, degree=8, heads=64)
     with pytest.raises(ValueError, match="does not accept a fused Prolog query"):
         backend._select_indexed(
             torch.empty(64, 8, 576),

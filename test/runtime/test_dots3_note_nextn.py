@@ -64,7 +64,9 @@ def test_draft_loader_preserves_own_embedding_and_shares_only_head(monkeypatch):
     assert torch.all(draft.model.decoder.input_layernorm.weight == 4)
     main_embedding = nn.Parameter(torch.ones(8, 4))
     main_head = nn.Parameter(torch.zeros(8, 4))
-    layout = SimpleNamespace(tp_group=None, tp_size=1, dp_lm_head_tp=False)
+    layout = SimpleNamespace(
+        tp_group=None, tp_size=1, attn_tp_size=1, dp_lm_head_tp=False
+    )
     draft.logits_processor = layout
     target = SimpleNamespace(
         logits_processor=layout,

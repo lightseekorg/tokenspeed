@@ -27,11 +27,13 @@ from collections.abc import Sequence
 from dataclasses import replace
 from fractions import Fraction
 from functools import cached_property
+from typing import TYPE_CHECKING
 
 import torch
 from typing_extensions import override
 
 from tokenspeed.runtime.distributed.pp_stage import pp_target_cache_windows
+from tokenspeed.runtime.layers.attention.configs.base import SoftmaxAttnConfig
 from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
     QWEN4_EXP_PLE_CACHE_GROUP,
     QWEN4_EXP_QSA_CACHE_GROUP,
@@ -61,6 +63,11 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupSpec,
     apply_pd_transfer_policies,
 )
+
+if TYPE_CHECKING:
+    from tokenspeed.runtime.layers.attention.qsa.bf16_scratch import (
+        QSABf16ScratchPlan,
+    )
 
 
 def _own_planes(
@@ -221,9 +228,61 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
             )
         return tuple(compressed_fields), tuple(recent_fields)
 
+    @cached_property
+    @override
+    def qsa_bf16_scratch_plan(self) -> QSABf16ScratchPlan | None:
+        """The QSA BF16 prefill scratch this engine reserves, or None.
+
+        ``--enable-qsa-prefill-bf16-scratch`` reserves it for the target's
+        QSA layers over an FP8 cache, sized by the prefill chunk. The decode
+        role, whose prompts arrive by transfer, runs no prefill and reserves
+        nothing.
+        """
+        server_args = self.server_args
+        if (
+            not server_args.enable_qsa_prefill_bf16_scratch
+            or server_args.disaggregation_mode == "decode"
+        ):
+            return None
+        # Imported here: the QSA package imports the attention backends.
+        from tokenspeed.runtime.layers.attention.qsa.bf16_scratch import (
+            MIN_ROWS,
+            plan_qsa_bf16_scratch,
+        )
+
+        config = self.attn_config
+        if not self._qsa_target_layers:
+            raise ValueError(
+                "--enable-qsa-prefill-bf16-scratch needs a model with QSA layers"
+            )
+        if config.kv_cache_dtype is not torch.float8_e4m3fn or config.kv_cache_mxfp8:
+            raise ValueError(
+                "--enable-qsa-prefill-bf16-scratch needs --kv-cache-dtype fp8_e4m3"
+            )
+        chunk = int(server_args.chunked_prefill_size)
+        if chunk <= 0:
+            # The scratch holds the rows of one prefill chunk.
+            raise ValueError(
+                "--enable-qsa-prefill-bf16-scratch needs chunked prefill: set "
+                f"--chunked-prefill-size to at least {MIN_ROWS}"
+            )
+        spec = config.component(SoftmaxAttnConfig)
+        return plan_qsa_bf16_scratch(
+            context_len=config.context_len,
+            max_rows=chunk,
+            # The full-attention group's block span, which its leaf runs at.
+            page_size=config.kernel_page_size or self.prefix_granularity,
+            kv_heads=max(spec.num_kv_heads // spec.attn_tp_size, 1),
+            head_dim=spec.head_dim,
+            q_heads=spec.num_attention_heads // spec.attn_tp_size,
+        )
+
     @override
     def workspace_bytes(self) -> int:
-        """GDN/PLE verify staging and commit rows, plus QSA verify staging."""
+        """GDN/PLE verify staging and commit rows, QSA verify staging, and the
+        QSA BF16 prefill scratch."""
+        scratch = self.qsa_bf16_scratch_plan
+        scratch_bytes = 0 if scratch is None else scratch.nbytes
         if (
             not self.num_draft_layers
             or self.attn_config.speculative_num_draft_tokens <= 1
@@ -232,13 +291,18 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
                 and self.server_args.disaggregation_mode == "prefill"
             )
         ):
-            return 0
+            return scratch_bytes
         num_ple_layers = sum(
             field.field_id.endswith(".conv") for field in self._ple_fields()
         )
         # Source and destination int64 row ids, shared by every batch size.
         ple_commit_bytes = 2 * self.attn_config.max_bs * num_ple_layers * 8
-        return super().workspace_bytes() + ple_commit_bytes + self._qsa_staging_bytes()
+        return (
+            super().workspace_bytes()
+            + ple_commit_bytes
+            + self._qsa_staging_bytes()
+            + scratch_bytes
+        )
 
     def _qsa_staging_bytes(self) -> int:
         """QSA target-verify staging, in closed form.

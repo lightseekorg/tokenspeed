@@ -301,6 +301,7 @@ def _worker_lm_head(rank: int, rendezvous: str) -> None:
             tp_rank=mapping.lm_head.tp_rank,
             tp_size=mapping.lm_head.tp_size,
             tp_group=mapping.lm_head.tp_group,
+            attn_tp_size=mapping.attn.tp_size,
             dp_lm_head_tp=True,
         )
         shard = padded_vocab // WORLD
@@ -361,6 +362,88 @@ def _worker_lm_head(rank: int, rendezvous: str) -> None:
 def test_lm_head_tp_under_dp_matches_replicated(tmp_path):
     mp.spawn(
         _worker_lm_head, args=((tmp_path / "rv").as_uri(),), nprocs=WORLD, join=True
+    )
+
+
+def _worker_replicated_attention_head(rank, rendezvous, world, head_tp):
+    from tokenspeed.runtime.layers.logits_processor import (
+        LogitsMetadata,
+        LogitsProcessor,
+    )
+
+    mapping = Mapping(
+        rank=rank,
+        world_size=world,
+        attn_tp_size=2,
+        attn_dp_size=world // 2,
+        lm_head_tp_size=head_tp,
+        nprocs_per_node=world,
+    )
+    init_gloo(rank, rendezvous, mapping)
+    try:
+        gen = torch.Generator().manual_seed(17)
+        vocab, padded_vocab = 61, 64
+        weight = torch.randn(padded_vocab, HIDDEN, generator=gen)
+        width = padded_vocab // head_tp
+        head = torch.nn.Linear(HIDDEN, width, bias=False).requires_grad_(False)
+        with torch.no_grad():
+            head.weight.copy_(
+                weight[
+                    mapping.lm_head.tp_rank
+                    * width : (mapping.lm_head.tp_rank + 1)
+                    * width
+                ]
+            )
+        processor = LogitsProcessor(
+            SimpleNamespace(model_type="test", vocab_size=vocab),
+            skip_all_gather=True,
+            tp_rank=mapping.lm_head.tp_rank,
+            tp_size=head_tp,
+            tp_group=mapping.lm_head.tp_group,
+            dp_lm_head_tp=True,
+            attn_tp_size=2,
+        )
+        # Uneven DP rows, idle peers, uniformly padded graph rows and all idle.
+        for dp_counts in (
+            [3, 0, 2, 1][: world // 2],
+            [2] * (world // 2),
+            [0] * (world // 2),
+        ):
+            counts = [n for n in dp_counts for _ in range(2)]
+            hidden = torch.randn(sum(dp_counts), HIDDEN, generator=gen)
+            dp_rank = rank // 2
+            start = sum(dp_counts[:dp_rank])
+            own = hidden[start : start + dp_counts[dp_rank]]
+            expected = (own @ weight.T)[:, :vocab]
+            decode = LogitsMetadata.from_forward_context(_ctx(None, rank, counts))
+            narrowed = replace(
+                decode,
+                global_num_tokens=[n + 1 for n in counts],
+                collective_global_num_tokens=counts,
+            )
+            mixed = replace(decode, all_decode_or_idle=False)
+            selected = replace(decode, logits_rows_selected=True)
+            for metadata in (decode, narrowed, mixed, selected):
+                logits = processor._get_logits(
+                    own, head, metadata, require_full_vocab=False
+                )
+                torch.testing.assert_close(logits, expected, atol=1e-5, rtol=1e-5)
+            # Exercise empty-rank participation through the real forward path.
+            output = processor(None, own, head, selected)
+            torch.testing.assert_close(
+                output.next_token_logits, expected, atol=1e-5, rtol=1e-5
+            )
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("world,head_tp", [(4, 2), (4, 4), (8, 8)])
+def test_lm_head_tp_with_replicated_attention_rows(tmp_path, world, head_tp):
+    mp.spawn(
+        _worker_replicated_attention_head,
+        args=((tmp_path / "rv").as_uri(), world, head_tp),
+        nprocs=world,
+        join=True,
     )
 
 
@@ -527,6 +610,7 @@ def _draft_layer(mapping: Mapping, attn):
     identity MLP and identity norms; dense TP 1 keeps the MLP comm a no-op so
     the layer's output is the attention's."""
     from torch import nn
+    from transformers import PretrainedConfig
 
     from tokenspeed.runtime.models.deepseek_nextn import DeepseekV3DraftDecoderLayer
 
@@ -536,7 +620,9 @@ def _draft_layer(mapping: Mapping, attn):
     layer.layer_id = 0
     layer.hidden_size = HIDDEN
     layer.self_attn = attn
-    layer.is_moe_layer = False
+    # A dense layer: the config routes no experts.
+    layer.config = PretrainedConfig(n_routed_experts=None)
+    layer.is_nextn = False
     layer.mlp = lambda hidden: hidden
     layer.input_layernorm = _norm_stub
     layer.post_attention_layernorm = _norm_stub

@@ -105,7 +105,7 @@ def _prepare(backend, *, step, with_bias):
         for seed in (73, 74)
     ]
     backend.prepare_step(
-        [f"shared-cumulative-a-{step}", f"shared-cumulative-b-{step}"],
+        [2 * step + 1, 2 * step + 2],
         [3, 1],
         params,
         num_tokens_per_req=1,
@@ -163,7 +163,7 @@ def _reference(logits, tokens):
     return left.gather(-1, rank[:, None]).squeeze(-1)
 
 
-@pytest.mark.parametrize("logprob_order", ["torch", "megatron"])
+@pytest.mark.parametrize("logprob_order", ["torch", "blockwise"])
 @pytest.mark.parametrize("decode", [False, True], ids=["sample", "verify_n1"])
 @pytest.mark.parametrize("use_graph", [False, True], ids=["eager", "cuda_graph"])
 def test_shared_metadata_preserves_tokens_and_logprobs(
@@ -174,7 +174,7 @@ def test_shared_metadata_preserves_tokens_and_logprobs(
 
     previous = global_server_args_dict.get("numerics")
     global_server_args_dict["numerics"] = (
-        "rl-bitwise" if logprob_order == "megatron" else "auto"
+        "rl-bitwise" if logprob_order == "blockwise" else "auto"
     )
     try:
         backend_name, create = backend_pair

@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import dataclasses
 import enum
-import importlib.util
 import inspect as _inspect
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -20,6 +19,7 @@ import cutlass.cute as cute
 from cutlass import Boolean, Float32, Int32, const_expr
 from cutlass._mlir.dialects import llvm, nvvm
 from cutlass.cutlass_dsl import T, dsl_user_op
+from tokenspeed_kernel._optional import has_optional_package
 
 for _compat_name in ("ThrMma", "ThrCopy"):
     if not hasattr(cute.core, _compat_name):
@@ -27,7 +27,7 @@ for _compat_name in ("ThrMma", "ThrCopy"):
 if not hasattr(cute, "make_fragment"):
     cute.make_fragment = cute.make_rmem_tensor
 
-if importlib.util.find_spec("flash_attn.cute") is None:
+if not has_optional_package("flash_attn", "flash_attn.cute"):
     raise ImportError("tokenspeed-fa4 is required for the rel_mha kernels")
 
 from flash_attn.cute import blackwell_helpers as sm100_utils

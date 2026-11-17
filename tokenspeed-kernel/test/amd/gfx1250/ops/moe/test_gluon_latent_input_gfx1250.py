@@ -31,6 +31,7 @@ pytest.importorskip(
 )
 
 from tokenspeed_kernel.ops.moe import latent_moe_input_projections  # noqa: E402
+from tokenspeed_kernel_amd._extern import extern_compile_options  # noqa: E402
 from tokenspeed_kernel_amd._triton import triton  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx1250.moe.fp16.latent_input_decode import (  # noqa: E402
     gluon_latent_input_decode_gfx1250,
@@ -126,9 +127,10 @@ def test_decode_replays_in_a_graph() -> None:
             torch.testing.assert_close(output, reference, atol=0.0, rtol=0.0)
 
 
-# 2000 is not a multiple of the 256-row tile, so it exercises the clamped
-# descriptor and the masked store that a whole number of tiles never reaches.
-@pytest.mark.parametrize("tokens", [1025, 2000, 8192])
+# 848 and 2000 leave a partial 128- and 256-row tile, so they exercise the
+# clamped load descriptor and the clipped store that whole tiles never reach;
+# 1280 and 1281 straddle the change from 128-row to 256-row tiles.
+@pytest.mark.parametrize("tokens", [848, 1280, 1281, 2000, 8192])
 def test_prefill_matches_reference(tokens: int) -> None:
     _packed, views = _weights()
     hidden = torch.randn(tokens, HIDDEN, dtype=torch.bfloat16, device="cuda")
@@ -143,7 +145,8 @@ def test_prefill_matches_reference(tokens: int) -> None:
     [
         (1, "gluon_latent_input_decode_gfx1250"),
         (64, "gluon_latent_input_decode_gfx1250"),
-        (1025, "gluon_latent_input_largem_gfx1250"),
+        (129, "gluon_latent_input_largem_gfx1250"),
+        (848, "gluon_latent_input_largem_gfx1250"),
         (8192, "gluon_latent_input_largem_gfx1250"),
     ],
 )
@@ -250,6 +253,7 @@ def test_decode_small_batch_pipeline(
         num_warps=1,
         num_stages=1,
         waves_per_eu=0,
+        **extern_compile_options(),
     )
 
     expected = _expected(

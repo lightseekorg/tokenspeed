@@ -36,7 +36,13 @@ below it need not be resident together, which would not fit in LDS.
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel_amd._triton import cdna4_async_copy, gl, gluon, triton
+from tokenspeed_kernel_amd._triton import (
+    cdna4_async_copy,
+    compile_ahead,
+    gl,
+    gluon,
+    triton,
+)
 
 # The MFMA instruction is 16 rows tall, so a decode tile any shorter pays for
 # rows it does not have. Past that the weight would be re-read once per token
@@ -66,7 +72,7 @@ def _split_k(tokens: int, total_n: int, hidden: int, block_m: int) -> int:
     return split
 
 
-@gluon.jit
+@gluon.jit(do_not_specialize=("tokens",))
 def gluon_latent_input_small_batch_gfx950(
     a_ptr,
     b_ptr,
@@ -81,6 +87,12 @@ def gluon_latent_input_small_batch_gfx950(
     SPLIT_K: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     WARPS_M: gl.constexpr,
+    REGION0_START: gl.constexpr = 0,
+    REGION0_TILES: gl.constexpr = -1,
+    REGION1_START: gl.constexpr = 0,
+    REGION1_TILES: gl.constexpr = 0,
+    REGION2_START: gl.constexpr = 0,
+    REGION2_TILES: gl.constexpr = 0,
 ):
     """Project one token tile against one column tile of the packed weight.
 
@@ -90,12 +102,31 @@ def gluon_latent_input_small_batch_gfx950(
     handful of compute units. Each split owns its own partial rather than
     accumulating in place, because every split of a tile targets the same
     columns and would otherwise serialize on those cache lines.
+
+    By default the tiles cover all TOTAL_N columns. Otherwise REGIONi_TILES
+    tiles start at column REGIONi_START of each of up to three regions; a
+    column's value does not depend on where its tile starts.
     """
     pid = gl.program_id(axis=0)
-    num_pid_n: gl.constexpr = TOTAL_N // BLOCK_N
+    ALL_TILES: gl.constexpr = REGION0_TILES < 0
+    num_pid_n: gl.constexpr = (
+        TOTAL_N // BLOCK_N
+        if ALL_TILES
+        else REGION0_TILES + REGION1_TILES + REGION2_TILES
+    )
     pid_n = pid % num_pid_n
     split_id = (pid // num_pid_n) % SPLIT_K
     pid_m = pid // (num_pid_n * SPLIT_K)
+    if ALL_TILES:
+        first_column = pid_n * BLOCK_N
+    else:
+        first_column = REGION0_START + pid_n * BLOCK_N
+        if pid_n >= REGION0_TILES:
+            first_column = REGION1_START + (pid_n - REGION0_TILES) * BLOCK_N
+        if pid_n >= REGION0_TILES + REGION1_TILES:
+            first_column = (
+                REGION2_START + (pid_n - REGION0_TILES - REGION1_TILES) * BLOCK_N
+            )
 
     mfma_layout: gl.constexpr = gl.amd.AMDMFMALayout(
         version=4,
@@ -138,7 +169,7 @@ def gluon_latent_input_small_batch_gfx950(
     bk_layout: gl.constexpr = gl.SliceLayout(1, gload_b)
     bn_layout: gl.constexpr = gl.SliceLayout(0, gload_b)
     offs_bk = gl.arange(0, BLOCK_K, layout=bk_layout)
-    offs_bn = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=bn_layout)
+    offs_bn = first_column + gl.arange(0, BLOCK_N, layout=bn_layout)
     b_offsets = (offs_bn[None, :] * HIDDEN + offs_bk[:, None]).to(gl.int32)
 
     k_start = split_id * (HIDDEN // SPLIT_K)
@@ -177,7 +208,7 @@ def gluon_latent_input_small_batch_gfx950(
     cm_layout: gl.constexpr = gl.SliceLayout(1, mfma_layout)
     cn_layout: gl.constexpr = gl.SliceLayout(0, mfma_layout)
     offs_cm = pid_m * BLOCK_M + gl.arange(0, BLOCK_M, layout=cm_layout)
-    offs_cn = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=cn_layout)
+    offs_cn = first_column + gl.arange(0, BLOCK_N, layout=cn_layout)
     offsets = (
         split_id * split_stride + offs_cm[:, None] * TOTAL_N + offs_cn[None, :]
     ).to(gl.int32)
@@ -275,6 +306,7 @@ def launch_gluon_latent_input_small_batch_gfx950(
     *,
     beta: float,
     linear_beta: float | None,
+    warm_max_tokens: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Project router, routed latent, and shared input from one weight pass.
 
@@ -287,6 +319,9 @@ def launch_gluon_latent_input_small_batch_gfx950(
             consecutive row views of.
         beta: Positive SiTU gate clipping scale.
         linear_beta: Optional positive SiTU linear-branch clipping scale.
+        warm_max_tokens: Also compile the row tile and K split of every
+            token count up to this, for startup warmup; 0 compiles only this
+            call's.
 
     Returns:
         FP32 router logits, the BF16 routed latent, and the BF16 activated
@@ -302,38 +337,22 @@ def launch_gluon_latent_input_small_batch_gfx950(
     device = hidden_states.device
     dtype = hidden_states.dtype
     total_n = router_n + latent_n + 2 * shared_n
-    block_m, warps_m = (_BLOCK_M, 1) if tokens <= _BLOCK_M else (_LARGE_BLOCK_M, 2)
-    split_k = _split_k(tokens, total_n, hidden, block_m)
+
+    def tiling(rows: int) -> tuple[int, int, int]:
+        block_m, warps_m = (_BLOCK_M, 1) if rows <= _BLOCK_M else (_LARGE_BLOCK_M, 2)
+        return block_m, warps_m, _split_k(rows, total_n, hidden, block_m)
+
+    block_m, warps_m, split_k = tiling(tokens)
     partials = torch.empty(
         (split_k, tokens, total_n), dtype=torch.float32, device=device
     )
     split_stride = tokens * total_n
-
-    grid = (triton.cdiv(tokens, block_m) * split_k * (total_n // _BLOCK_N),)
-    gluon_latent_input_small_batch_gfx950[grid](
-        hidden_states,
-        packed_weight,
-        partials,
-        tokens,
-        split_stride,
-        HIDDEN=hidden,
-        TOTAL_N=total_n,
-        BLOCK_M=block_m,
-        BLOCK_N=_BLOCK_N,
-        BLOCK_K=_BLOCK_K,
-        SPLIT_K=split_k,
-        NUM_WARPS=_NUM_WARPS,
-        WARPS_M=warps_m,
-        num_warps=_NUM_WARPS,
-    )
-
     router_out = torch.empty((tokens, router_n), dtype=torch.float32, device=device)
     routed_out = torch.empty((tokens, latent_n), dtype=dtype, device=device)
     shared_out = torch.empty((tokens, shared_n), dtype=dtype, device=device)
     emitted_n = router_n + latent_n + shared_n
-    gluon_latent_input_small_batch_epilogue_gfx950[
-        (tokens, triton.cdiv(emitted_n, _EPILOGUE_BLOCK_N))
-    ](
+    project_args = (hidden_states, packed_weight, partials, tokens, split_stride)
+    epilogue_args = (
         partials,
         router_out,
         routed_out,
@@ -341,15 +360,57 @@ def launch_gluon_latent_input_small_batch_gfx950(
         float(beta),
         1.0 if linear_beta is None else float(linear_beta),
         split_stride,
-        SPLIT_K=split_k,
-        TOTAL_N=total_n,
-        ROUTER_N=router_n,
-        LATENT_N=latent_n,
-        SHARED_N=shared_n,
-        HAS_LINEAR_BETA=linear_beta is not None,
-        BLOCK_N=_EPILOGUE_BLOCK_N,
-        num_warps=4,
     )
+
+    def project_kwargs(block_m: int, warps_m: int, split_k: int) -> dict:
+        return dict(
+            HIDDEN=hidden,
+            TOTAL_N=total_n,
+            BLOCK_M=block_m,
+            BLOCK_N=_BLOCK_N,
+            BLOCK_K=_BLOCK_K,
+            SPLIT_K=split_k,
+            NUM_WARPS=_NUM_WARPS,
+            WARPS_M=warps_m,
+            num_warps=_NUM_WARPS,
+        )
+
+    def epilogue_kwargs(split_k: int) -> dict:
+        return dict(
+            SPLIT_K=split_k,
+            TOTAL_N=total_n,
+            ROUTER_N=router_n,
+            LATENT_N=latent_n,
+            SHARED_N=shared_n,
+            HAS_LINEAR_BETA=linear_beta is not None,
+            BLOCK_N=_EPILOGUE_BLOCK_N,
+            num_warps=4,
+        )
+
+    for other in dict.fromkeys(tiling(rows) for rows in range(1, warm_max_tokens + 1)):
+        if other == (block_m, warps_m, split_k):
+            continue
+        for kernel, args, kwargs in (
+            (
+                gluon_latent_input_small_batch_gfx950,
+                project_args,
+                project_kwargs(*other),
+            ),
+            (
+                gluon_latent_input_small_batch_epilogue_gfx950,
+                epilogue_args,
+                epilogue_kwargs(other[2]),
+            ),
+        ):
+            compile_ahead(kernel, *args, **kwargs)
+
+    grid = (triton.cdiv(tokens, block_m) * split_k * (total_n // _BLOCK_N),)
+    gluon_latent_input_small_batch_gfx950[grid](
+        *project_args, **project_kwargs(block_m, warps_m, split_k)
+    )
+    gluon_latent_input_small_batch_epilogue_gfx950[
+        (tokens, triton.cdiv(emitted_n, _EPILOGUE_BLOCK_N))
+    ](*epilogue_args, **epilogue_kwargs(split_k))
     return router_out, routed_out, shared_out
 
 

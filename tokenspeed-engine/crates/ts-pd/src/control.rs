@@ -22,7 +22,52 @@
 //! loop sees them: requests register at admission, and every round the
 //! replica agrees on which transfers changed state.
 
+use std::time::{Duration, Instant};
+
 use ts_collective::{Group, Mesh};
+
+/// How long a failed or cancelled transfer may take to stop before its peer
+/// warns that the request's pages are still pinned.
+pub(crate) const DRAIN_STALL: Duration = Duration::from_secs(30);
+
+/// A failed or cancelled transfer whose readers or writers may still touch
+/// its request's pages ([`PdEvent::Stopped`] has not been reported).
+pub(crate) struct Draining {
+    pub(crate) rid: String,
+    pub(crate) room: u64,
+    pub(crate) since: Instant,
+}
+
+/// The transfers draining for [`DRAIN_STALL`] or longer, as log entries; at
+/// most once per [`DRAIN_STALL`] (`logged_at`). One that never stops (a
+/// write whose DMA may still land, a peer lost mid-drain) keeps its pages
+/// pinned and holds off a cache release.
+pub(crate) fn stalled_drains<'a>(
+    draining: impl IntoIterator<Item = &'a Draining>,
+    logged_at: &mut Option<Instant>,
+    now: Instant,
+) -> Vec<String> {
+    if logged_at.is_some_and(|at| now - at < DRAIN_STALL) {
+        return Vec::new();
+    }
+    let stalled: Vec<String> = draining
+        .into_iter()
+        .filter(|drain| now - drain.since >= DRAIN_STALL)
+        .take(8)
+        .map(|drain| {
+            format!(
+                "{}(room={}, age={:.0}s)",
+                drain.rid,
+                drain.room,
+                (now - drain.since).as_secs_f64()
+            )
+        })
+        .collect();
+    if !stalled.is_empty() {
+        *logged_at = Some(now);
+    }
+    stalled
+}
 
 /// Where a request's peer node reaches it: the prefill deployment's
 /// bootstrap server and the request's room.
@@ -59,8 +104,12 @@ pub struct RemotePrefill {
 pub enum PdEvent {
     /// The request's peers are connected.
     Bootstrapped(String),
-    /// The request's transfer failed.
+    /// The request's transfer failed. Its readers or writers may still be
+    /// stopping: [`PdEvent::Stopped`] follows.
     Failed(String),
+    /// A failed or cancelled transfer stopped on every member: no reader or
+    /// writer touches the request's pages any more.
+    Stopped(String),
     /// P role: the request's KV reached the decode node.
     Succeeded(String),
     /// D role: the request's KV landed.
@@ -92,7 +141,14 @@ pub trait TransferPeer {
     /// prompt tokens served from the cache and the first token's logprob.
     fn record_usage(&mut self, rid: &str, cached_tokens: i64, bootstrap_logprob: Option<f64>);
 
-    /// A transfer is still tracked: it may yet read or write the cache.
+    /// The scheduling loop ended `rid` while its transfer may still run:
+    /// stop it. Unless it succeeds first, [`PdEvent::Stopped`] reports it
+    /// once every reader and writer stopped. Every member calls this for the
+    /// same requests in the same rounds.
+    fn cancel(&mut self, rid: &str);
+
+    /// A transfer is still tracked or stopping: it may yet read or write
+    /// the cache.
     fn has_in_flight(&self) -> bool;
 
     /// EPD, P role: tell the decode node waiting on room `room` that the
@@ -211,4 +267,41 @@ pub trait EmbeddingSender {
     /// The begun rooms that concluded since the last call, sent or failed:
     /// their rows' slots take new rows.
     fn concluded(&mut self) -> Vec<u64>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn draining(rid: &str, age: Duration, now: Instant) -> Draining {
+        Draining {
+            rid: rid.to_owned(),
+            room: 7,
+            since: now - age,
+        }
+    }
+
+    #[test]
+    fn a_drain_past_the_stall_is_reported_once_per_interval() {
+        let now = Instant::now() + 2 * DRAIN_STALL;
+        let list = [
+            draining("young", DRAIN_STALL / 2, now),
+            draining("stuck", DRAIN_STALL, now),
+        ];
+        let mut logged_at = None;
+        let stalled = stalled_drains(&list, &mut logged_at, now);
+        assert_eq!(stalled.len(), 1);
+        assert!(stalled[0].starts_with("stuck(room=7, age="));
+        assert_eq!(logged_at, Some(now));
+        // Throttled until a whole interval passed since the report.
+        assert!(stalled_drains(&list, &mut logged_at, now + DRAIN_STALL / 2).is_empty());
+        assert_eq!(
+            stalled_drains(&list, &mut logged_at, now + DRAIN_STALL).len(),
+            2
+        );
+        // Nothing past the stall: nothing reported, the throttle untouched.
+        let mut fresh = None;
+        assert!(stalled_drains(&list[..1], &mut fresh, now).is_empty());
+        assert_eq!(fresh, None);
+    }
 }

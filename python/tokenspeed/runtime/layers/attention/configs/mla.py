@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import ClassVar
 
 import torch
 
@@ -28,6 +29,7 @@ from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.layers.attention.configs.base import (
     AttnConfig,
     SoftmaxAttnConfig,
+    block_draft_is_causal,
     is_block_drafter,
     model_wide_kwargs,
     resolve_cache_layer_types,
@@ -36,28 +38,10 @@ from tokenspeed.runtime.layers.attention.configs.base import (
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
-def resolve_mla_kv_cache_dtype(
-    server_args: ServerArgs, model_config: ModelConfig, is_draft: bool
-) -> torch.dtype:
-    """Resolve MLA cache precision without quantizing K3 DSpark context blindly.
-
-    The public K3 DSpark checkpoint has no FP8 KV scales and its reference vLLM
-    launch uses the default BF16 cache. TokenSpeed's K3 target currently requires
-    FP8 LCM storage, so the unified arena exposes a separate BF16 compute view
-    for the draft continuation fields. Other MLA drafts continue to honor the
-    global cache setting.
-    """
-    if (
-        is_draft
-        and server_args.speculative_algorithm == "DSPARK"
-        and getattr(model_config.hf_config, "model_type", None) == "k3_dspark"
-    ):
-        return torch.bfloat16
-    return resolve_dtype(server_args.kv_cache_dtype)
-
-
 @dataclass(kw_only=True)
 class MLAConfig(SoftmaxAttnConfig):
+    is_latent_kv: ClassVar[bool] = True
+
     kv_lora_rank: int
     qk_nope_head_dim: int
     qk_rope_head_dim: int
@@ -106,6 +90,9 @@ class MLAConfig(SoftmaxAttnConfig):
         draft_block_decode = is_block_drafter(
             server_args.speculative_algorithm, is_draft
         )
+        draft_block_causal = draft_block_decode and block_draft_is_causal(
+            model_config.hf_config
+        )
         spec = cls(**cls._spec_kwargs(server_args, model_config, is_draft))
         return AttnConfig(
             components=(spec,),
@@ -113,10 +100,14 @@ class MLAConfig(SoftmaxAttnConfig):
                 server_args,
                 model_config,
                 is_draft,
-                kv_cache_dtype=resolve_mla_kv_cache_dtype(
-                    server_args, model_config, is_draft
-                ),
+                kv_cache_dtype=resolve_dtype(server_args.kv_cache_dtype),
                 draft_block_decode=draft_block_decode,
+                draft_block_causal=draft_block_causal,
+                # An MTP depth plans the target's own DSA attention and
+                # computes the same query-context shard, sharing the target's
+                # history gather. Plain MLA cannot shard, and __post_init__
+                # refuses it as a target.
+                shards_query_context=spec.is_dsa,
             ),
         )
 

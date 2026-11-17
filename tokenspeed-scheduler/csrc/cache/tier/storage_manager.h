@@ -56,13 +56,20 @@ public:
     std::size_t NumNegativeKeys() const { return negative_.size(); }
     std::size_t NumBackupCandidates() const { return backup_candidates_.size(); }
     bool IsNegative(const CacheKey& key) const { return negative_.contains(key); }
-    // An empty lease when nothing was started.
-    StorageLease StartQuery(std::vector<CacheKey> keys);
+    // Historical successful, replica-agreed, retired PUT/accepted GET receipts. They
+    // do not pin Host memory or guarantee residence after external eviction.
+    bool WasPublished(const CacheKey& key) const { return published_.contains(key); }
+    std::size_t NumPublishedKeys() const { return published_.size(); }
+    std::uint64_t PublicationEpoch() const { return publication_epoch_; }
+    // Returns an empty lease when nothing was started.
+    StorageLease StartQuery(std::vector<CacheKey> keys, std::vector<std::int32_t> key_tokens);
     bool Completed(std::uint64_t id) const;
     bool IsQuery(std::uint64_t id) const;
-    std::vector<CacheKey> QueryHits(std::uint64_t id) const;
-    // An empty lease when nothing was started.
-    StorageLease StartRead(const CacheCoordinator::PromptPrefix& prompt, std::span<const CacheKey> hits);
+    // Successful query hits, and the cumulative tokens they cover. Each hit counts once per operation.
+    std::vector<CacheKey> QueryHits(std::uint64_t id);
+    std::uint64_t QueryHitTokens() const { return query_hit_tokens_; }
+    // Returns an empty lease when nothing was started.
+    StorageLease StartRead(const PromptPrefix& prompt, std::span<const CacheKey> hits);
     void Complete(const cache::StorageDone& event);
     void QueueBackups(std::span<const CacheKey> keys);
     void StartBackups();
@@ -76,6 +83,8 @@ private:
     struct Ticket {
         StorageKind kind;
         std::vector<CacheKey> keys;
+        // Query tickets: tokens each key covers, parallel to `keys`.
+        std::vector<std::int32_t> key_tokens;
         std::vector<CacheBlockRef> blocks;
         std::vector<std::uint8_t> success;
         ContentHash tail_prior;
@@ -88,6 +97,7 @@ private:
     // What dropping the operation's lease does.
     void detach(std::uint64_t id) noexcept;
     void rememberNegative(const CacheKey& key);
+    void rememberPublished(const CacheKey& key);
     std::size_t availableHostCredits() const;
     CacheCoordinator& coordinator_;
     StorageConfig config_;
@@ -95,6 +105,9 @@ private:
     std::deque<CacheKey> backup_candidates_;
     std::unordered_set<CacheKey, CacheKeyHash> negative_;
     std::deque<CacheKey> negative_order_;
+    std::unordered_set<CacheKey, CacheKeyHash> published_;
+    std::deque<CacheKey> published_order_;
+    std::uint64_t publication_epoch_{1};
     std::vector<StorageOperation> commands_;
     std::uint64_t next_id_{1};
     bool pressure_gate_closed_{false};
@@ -103,5 +116,7 @@ private:
     std::uint64_t unavailable_dropped_backup_keys_{0};
     std::uint64_t disabled_dropped_backup_keys_{0};
     std::uint64_t cleanup_dropped_backup_keys_{0};
+    // Cumulative tokens of keys storage queries found (L3 hits).
+    std::uint64_t query_hit_tokens_{0};
 };
 }  // namespace tokenspeed

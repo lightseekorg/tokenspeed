@@ -154,19 +154,24 @@ def test_hopper_refuses_experts_without_a_kernel(
         cls(tiny_config(), Mapping(rank=0, world_size=1), 1, PREFIX, quant_config)
 
 
-def test_hopper_fp8_checkpoint_keeps_expert_codes_and_scales(server, hopper_platform):
+@pytest.mark.parametrize("expert_width", [64, 128])
+def test_hopper_fp8_checkpoint_keeps_expert_codes_and_scales(
+    server, hopper_platform, expert_width
+):
     """The experts keep the checkpoint's FP8 codes and FP32 channel scales;
     the dense FP8 linears, with no SM90 FP8 GEMM, are dequantized after
     loading, so attention keeps no fused FP8 projection."""
     server("auto")
-    model = beam.BeamForCausalLM(tiny_config(), Mapping(rank=0, world_size=1), ct())
-    checkpoint, _ = fp8_checkpoint()
+    config = tiny_config()
+    config.moe_intermediate_size = expert_width
+    model = beam.BeamForCausalLM(config, Mapping(rank=0, world_size=1), ct())
+    checkpoint, _ = fp8_checkpoint(config)
     assert model.load_weights(checkpoint.items()) == checkpoint.keys()
     experts = model.model.layers[1].mlp.experts
     for expert in range(8):
         prefix = f"{PREFIX}.experts.{expert}"
         for half, projection in enumerate(("gate_proj", "up_proj")):
-            rows = slice(half * 64, (half + 1) * 64)
+            rows = slice(half * expert_width, (half + 1) * expert_width)
             assert torch.equal(
                 experts.w13_weight[expert, rows].view(torch.uint8),
                 checkpoint[f"{prefix}.{projection}.weight"].view(torch.uint8),

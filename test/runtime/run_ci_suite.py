@@ -17,6 +17,7 @@ import glob
 import os
 import sys
 from dataclasses import replace
+from pathlib import Path
 from typing import List, Optional
 
 # Add test directory to path for importing CI system helpers.
@@ -28,6 +29,7 @@ from ci_system.ci_register import (
     collect_tests,
 )
 from ci_system.ci_utils import run_unittest_files
+from ci_system.runtime_test_selection import CHANGED_PATHS_ENV, select_runtime_tests
 
 DEVICE_MAPPING = {
     "cuda": DeviceBackend.CUDA,
@@ -159,6 +161,27 @@ def run_a_suite(args):
     sanity_check = False
     all_tests = collect_tests(files, sanity_check=sanity_check)
     ci_tests, skipped_tests = filter_tests(all_tests, device, suite)
+
+    # On pull requests CI lists the changed paths; run only the files they reach.
+    changed_paths = [
+        line.strip()
+        for line in os.environ.get(CHANGED_PATHS_ENV, "").splitlines()
+        if line.strip()
+    ]
+    if changed_paths:
+        repo_root = os.path.dirname(os.path.dirname(base_dir))
+        selected = select_runtime_tests(
+            [os.path.relpath(test.filename, repo_root) for test in ci_tests],
+            changed_paths,
+            Path(repo_root),
+        )
+        if selected is not None:
+            ci_tests = [
+                test
+                for test in ci_tests
+                if os.path.relpath(test.filename, repo_root) in selected
+            ]
+            print(f"Changed paths select {len(ci_tests)} test files.", flush=True)
 
     if auto_partition_size:
         ci_tests = auto_partition(ci_tests, auto_partition_id, auto_partition_size)

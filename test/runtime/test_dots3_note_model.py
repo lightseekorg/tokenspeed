@@ -366,6 +366,7 @@ def test_dense_and_moe_decoder_construct(layer_id, monkeypatch):
     monkeypatch.setitem(global_server_args_dict, "numerics", "auto")
     config = Dots3NoteConfig(
         hidden_size=256,
+        num_hidden_layers=2,
         num_attention_heads=4,
         q_lora_rank=128,
         kv_lora_rank=128,

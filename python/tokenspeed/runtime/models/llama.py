@@ -27,9 +27,6 @@ variants have their own modules (``longcat_large.py``, ``llama_eagle3.py``).
 
 from __future__ import annotations
 
-from collections.abc import Iterable
-from typing import Any
-
 import torch
 from torch import nn
 from transformers import LlamaConfig
@@ -42,7 +39,6 @@ from tokenspeed.runtime.layers.mlp import GatedMLP, gated_activation
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
-from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.base import (
     BaseCausalLM,
     BaseDecoderLayer,
@@ -192,7 +188,7 @@ class LlamaDecoderLayer(BaseDecoderLayer):
         return GatedMLP.tensor_parallel(
             hidden_size=self.config.hidden_size,
             intermediate_size=self.config.intermediate_size,
-            activation=gated_activation(self.config.hidden_act),
+            activation=gated_activation(self.config.hidden_act, swiglu_limit=None),
             tp_rank=self.mapping.dense.tp_rank,
             tp_size=self.mapping.dense.tp_size,
             tp_group=self.mapping.dense.tp_group,
@@ -219,50 +215,6 @@ class LlamaForCausalLM(BaseCausalLM):
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
-
-    def load_weights(
-        self, weights: Iterable[tuple[str, torch.Tensor]], **kwargs: Any
-    ) -> None:
-        stacked_params_mapping = self.get_stacked_params_mapping()
-        params_dict = dict(self.named_parameters())
-        tie_word_embeddings = getattr(self.config, "tie_word_embeddings", False)
-
-        for name, loaded_weight in weights:
-            if "rotary_emb.inv_freq" in name:
-                continue
-            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
-                continue
-            # Llama-3.2-1B / 3B ship with tied input+output embeddings — some HF
-            # checkpoint variants still serialize lm_head.weight, skip it so we
-            # don't double-load into the shared embed_tokens parameter.
-            if tie_word_embeddings and "lm_head.weight" in name:
-                continue
-
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if name not in params_dict:
-                    continue
-                param = params_dict[name]
-                # Fused q/k/v and gate/up parameters are built by distributed
-                # linear layers that install ``weight_loader`` during init; the
-                # ``getattr`` fallback just guards against stray non-fused
-                # parameters that happened to match the pattern (e.g. a user
-                # fork that registers a plain ``qkv_proj`` buffer).
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                if name.endswith(".bias") and name not in params_dict:
-                    continue
-                if name not in params_dict:
-                    continue
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
 
 
 EntryClass = LlamaForCausalLM

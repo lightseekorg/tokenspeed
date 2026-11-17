@@ -433,3 +433,19 @@ def test_external_encoder_receive_budget(monkeypatch, mode, external, active, ex
     monkeypatch.setenv("TOKENSPEED_EPD_RECV_POOL_SLOTS", "2")
     monkeypatch.setenv("TOKENSPEED_EPD_RECV_POOL_SLOT_MB", "1")
     assert recv_pool.recv_pool_bytes(args, active) == expected
+
+
+def test_npu_receive_publishes_rows_before_releasing_slot():
+    pytest.importorskip("torch_npu")
+    if not torch.npu.is_available():
+        pytest.skip("needs an NPU")
+    device = torch.device("npu", torch.npu.current_device())
+    pools = ReceivePools(slots=1, slot_bytes=1 << 20, num_deepstack=0, device=device)
+    publisher = _publisher(pools, device=device)
+    item = _item(8)
+    rows, _ = _land(pools, 0, 8)
+    publisher.publish([([item], [(0, 0, 0, 8, 8, False)])])
+    torch.npu.synchronize()
+    assert publisher.released() == [0]
+    assert publisher.released() == []
+    assert torch.equal(item.encoded.cpu(), rows.cpu())

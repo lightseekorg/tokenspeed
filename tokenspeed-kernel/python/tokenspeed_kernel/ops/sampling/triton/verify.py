@@ -40,6 +40,7 @@ from tokenspeed_kernel.platform import pdl_enabled
         "candidates_row_stride",
         "candidates_col_stride",
         "target_sampled_stride",
+        "row_accept_stride",
     ],
 )
 def _verify_chain_target_sampled_kernel(
@@ -48,6 +49,7 @@ def _verify_chain_target_sampled_kernel(
     accept_token_num_ptr,
     candidates_ptr,
     target_sampled_ptr,
+    row_accept_ptr,
     predicts_stride,
     accept_index_row_stride,
     accept_index_col_stride,
@@ -55,8 +57,10 @@ def _verify_chain_target_sampled_kernel(
     candidates_row_stride,
     candidates_col_stride,
     target_sampled_stride,
+    row_accept_stride,
     NUM_DRAFT_TOKENS: tl.constexpr,
     WRITE_REJECTED_TARGETS: tl.constexpr,
+    FROM_ROW_DECISIONS: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
     if ENABLE_PDL:
@@ -77,7 +81,14 @@ def _verify_chain_target_sampled_kernel(
         draft_id = tl.load(
             candidates_ptr + row * candidates_row_stride + i * candidates_col_stride
         )
-        match = (active != 0) & (draft_id == target_id)
+        if FROM_ROW_DECISIONS:
+            # The row decided acceptance itself; an accepted row emits its
+            # draft, a rejected one the token it would stop on.
+            accepted = tl.load(row_accept_ptr + (base + i - 1) * row_accept_stride) != 0
+            match = (active != 0) & accepted
+            target_id = tl.where(accepted, draft_id, target_id)
+        else:
+            match = (active != 0) & (draft_id == target_id)
 
         if WRITE_REJECTED_TARGETS:
             tl.store(predicts_ptr + (base + i - 1) * predicts_stride, target_id)
@@ -118,36 +129,13 @@ def _verify_chain_target_sampled_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
 
-def verify_chain_target_sampled(
+def _check_chain_inputs(
     predicts: torch.Tensor,
     accept_index: torch.Tensor,
     accept_token_num: torch.Tensor,
     candidates: torch.Tensor,
     target_sampled: torch.Tensor,
-    *,
-    write_rejected_targets: bool,
-    enable_pdl: bool | None = None,
 ) -> None:
-    """Verify a chain against target token ids, with an explicit output policy.
-
-    Args:
-        predicts: Writable int32 [>= batch * width] target-token destination.
-        accept_index: Writable int32 [batch,width] flattened accepted row ids.
-        accept_token_num: Writable int32 [>= batch] accepted draft counts,
-            excluding the bonus token (callers add one).
-        candidates: Int32 [batch,width] draft chain; column zero is its anchor.
-        target_sampled: Int32/int64 target ids with at least batch * width entries.
-        write_rejected_targets: True writes every target id as int32, compares
-            after the same int32 conversion, and fills rejected indices with -1,
-            matching the Torch greedy reference. False preserves rejected token
-            and index tails, so accept_index must be -1-filled on entry.
-        enable_pdl: Override the platform PDL setting when supplied.
-
-    Returns:
-        None. Supplied outputs are updated in place; each chain emits its
-        longest matching draft prefix and the target's following bonus token.
-    """
-    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     if candidates.ndim != 2:
         raise ValueError(f"candidates must be 2D, got {candidates.ndim}D")
     if accept_index.shape != candidates.shape:
@@ -193,6 +181,42 @@ def verify_chain_target_sampled(
         for t in (predicts, accept_index, accept_token_num, target_sampled)
     ):
         raise ValueError("Verification inputs and outputs must share a device")
+
+
+def verify_chain_target_sampled(
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    candidates: torch.Tensor,
+    target_sampled: torch.Tensor,
+    *,
+    write_rejected_targets: bool,
+    enable_pdl: bool | None = None,
+) -> None:
+    """Verify a chain against target token ids, with an explicit output policy.
+
+    Args:
+        predicts: Writable int32 [>= batch * width] target-token destination.
+        accept_index: Writable int32 [batch,width] flattened accepted row ids.
+        accept_token_num: Writable int32 [>= batch] accepted draft counts,
+            excluding the bonus token (callers add one).
+        candidates: Int32 [batch,width] draft chain; column zero is its anchor.
+        target_sampled: Int32/int64 target ids with at least batch * width entries.
+        write_rejected_targets: True writes every target id as int32, compares
+            after the same int32 conversion, and fills rejected indices with -1,
+            matching the Torch greedy reference. False preserves rejected token
+            and index tails, so accept_index must be -1-filled on entry.
+        enable_pdl: Override the platform PDL setting when supplied.
+
+    Returns:
+        None. Supplied outputs are updated in place; each chain emits its
+        longest matching draft prefix and the target's following bonus token.
+    """
+    enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
+    _check_chain_inputs(
+        predicts, accept_index, accept_token_num, candidates, target_sampled
+    )
+    bs, num_draft_tokens = candidates.shape
     if bs == 0:
         return
 
@@ -204,13 +228,88 @@ def verify_chain_target_sampled(
         accept_token_num,
         candidates,
         target_sampled,
+        None,
         predicts.stride(0),
         *accept_index.stride(),
         accept_token_num.stride(0),
         *candidates.stride(),
         target_sampled.stride(0),
+        0,
         NUM_DRAFT_TOKENS=num_draft_tokens,
         WRITE_REJECTED_TARGETS=write_rejected_targets,
+        FROM_ROW_DECISIONS=False,
+        ENABLE_PDL=enable_pdl,
+        num_warps=1,
+        **extra_kwargs,
+    )
+
+
+def verify_chain_row_decisions(
+    *,
+    predicts: torch.Tensor,
+    accept_index: torch.Tensor,
+    accept_token_num: torch.Tensor,
+    candidates: torch.Tensor,
+    row_accept: torch.Tensor,
+    row_token: torch.Tensor,
+) -> None:
+    """Walk a chain whose rows already decided acceptance.
+
+    Row ``r`` of request ``b`` (flat row ``b * N + r``) accepted draft
+    ``candidates[b, r + 1]`` when ``row_accept`` is nonzero, and emits
+    ``row_token`` when the chain stops there. Outputs follow
+    ``verify_chain_target_sampled(write_rejected_targets=False)``: each chain
+    emits its accepted draft prefix, then the token of the first rejecting row
+    (or of the last row); rejected index and token tails are left as they
+    were, so ``accept_index`` must be -1-filled on entry.
+
+    Args:
+        predicts: Writable int32 ``[>= bs * N]`` emitted-token destination.
+        accept_index: Writable int32 ``[bs, N]`` flattened accepted row ids.
+        accept_token_num: Writable int32 ``[>= bs]`` accepted draft counts,
+            excluding the bonus token (callers add one).
+        candidates: Int32 ``[bs, N]`` draft chain; column zero is its anchor.
+        row_accept: Int32 ``[>= bs * N]`` per-row accept decisions.
+        row_token: Int32 ``[>= bs * N]`` per-row stop tokens.
+
+    Returns:
+        None. Supplied outputs are updated in place.
+    """
+    if row_accept.ndim != 1 or row_token.ndim != 1:
+        raise ValueError("row_accept and row_token must be one-dimensional")
+    if row_accept.dtype != torch.int32 or row_token.dtype != torch.int32:
+        raise ValueError(
+            f"row_accept and row_token must be int32, got {row_accept.dtype} and "
+            f"{row_token.dtype}"
+        )
+    total = candidates.numel()
+    if row_accept.shape[0] < total:
+        raise ValueError(f"row_accept is too small: {row_accept.shape[0]} < {total}")
+    if row_accept.device != candidates.device:
+        raise ValueError("Verification inputs and outputs must share a device")
+    _check_chain_inputs(predicts, accept_index, accept_token_num, candidates, row_token)
+    bs, num_draft_tokens = candidates.shape
+    if bs == 0:
+        return
+
+    enable_pdl = pdl_enabled()
+    extra_kwargs = {"launch_pdl": True} if enable_pdl else {}
+    _verify_chain_target_sampled_kernel[(bs,)](
+        predicts,
+        accept_index,
+        accept_token_num,
+        candidates,
+        row_token,
+        row_accept,
+        predicts.stride(0),
+        *accept_index.stride(),
+        accept_token_num.stride(0),
+        *candidates.stride(),
+        row_token.stride(0),
+        row_accept.stride(0),
+        NUM_DRAFT_TOKENS=num_draft_tokens,
+        WRITE_REJECTED_TARGETS=False,
+        FROM_ROW_DECISIONS=True,
         ENABLE_PDL=enable_pdl,
         num_warps=1,
         **extra_kwargs,

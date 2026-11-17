@@ -20,8 +20,7 @@
 
 """Base decoder layer classes.
 
-``BaseDecoderLayer`` uses CommManager for communication (the default path).
-``CompiledDecoderLayer`` uses the compiler-driven path.
+``BaseDecoderLayer`` uses CommManager for communication.
 """
 
 from __future__ import annotations
@@ -36,16 +35,7 @@ from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.layernorm import RMSNorm
-from tokenspeed.runtime.layers.moe.utils import get_all2all_backend
 from tokenspeed.runtime.layers.quantization import QuantizationConfig as Q
-from tokenspeed.runtime.models.base.execution import (
-    CompiledDecoderLayer as _CompiledRuntime,
-)
-from tokenspeed.runtime.models.base.execution import (
-    ExecutionNode,
-)
-from tokenspeed.runtime.models.base.module_spec import ModuleKind, ModuleSpec
-from tokenspeed.runtime.models.base.placement import ParallelGroup, Partial, Replicate
 
 
 def capture_layer_input(
@@ -71,21 +61,6 @@ def capture_layer_input(
     # aux consumers (e.g. the EAGLE3 drafter) expect full rows. Clone because
     # later norms update the residual in place.
     aux_hidden_states.append(comm_manager.gather_residual(residual, ctx).clone())
-
-
-def _default_compute_output_placement(
-    mapping: Mapping,
-    group: ParallelGroup,
-) -> Partial | None:
-    if group == ParallelGroup.ATTN_TP:
-        has_parallel = mapping.has_attn_tp
-    elif group == ParallelGroup.DENSE_TP:
-        has_parallel = mapping.dense.has_tp
-    elif group == ParallelGroup.MOE_TP_EP:
-        has_parallel = mapping.moe.has_tp_ep
-    else:
-        raise ValueError(f"Unknown group: {group}")
-    return Partial(group) if has_parallel else None
 
 
 _C = TypeVar("_C", bound=PretrainedConfig)
@@ -124,8 +99,8 @@ class BaseDecoderLayer(nn.Module, Generic[_C]):
             mapping=self.mapping,
             layer_id=layer_id,
             is_moe=self.is_moe_layer,
-            prev_is_moe=self.is_moe_layer,
-            dense_batch_invariant=False,
+            prev_is_moe=self.is_prev_moe_layer,
+            dense_batch_invariant=self.dense_batch_invariant,
             input_layernorm=self.input_layernorm,
             post_attn_layernorm=self.post_attention_layernorm,
             query_sharded=False,
@@ -133,6 +108,18 @@ class BaseDecoderLayer(nn.Module, Generic[_C]):
 
     @property
     def is_moe_layer(self) -> bool:
+
+        return False
+
+    @property
+    def is_prev_moe_layer(self) -> bool:
+
+        return self.is_moe_layer
+
+    @property
+    def dense_batch_invariant(self) -> bool:
+        """Whether the dense MLP tail transposes rows instead of
+        reduce-scattering head/channel partials (``--tp-batch-invariant``)."""
 
         return False
 
@@ -176,6 +163,19 @@ class BaseDecoderLayer(nn.Module, Generic[_C]):
         )
 
         return hidden_states, residual
+
+    def forward_idle_attn(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        ctx: ForwardContext,
+        aux_hidden_states: list | None,
+    ) -> None:
+        """Run the attention half of an idle forward, which has no rows.
+
+        Nothing by default; a layer whose attention joins collectives, or
+        whose tap must stay aligned across ranks, runs them here.
+        """
 
     def forward_mlp(
         self,
@@ -227,23 +227,17 @@ class BaseDecoderLayer(nn.Module, Generic[_C]):
                 aux_hidden_states,
             )
 
-            hidden_states = self.forward_mlp(
-                hidden_states,
-                residual,
-                ctx,
-                num_global_tokens,
-                max_num_tokens_per_gpu,
-            )
-
         else:
 
-            hidden_states = self.forward_mlp(
-                hidden_states,
-                residual,
-                ctx,
-                num_global_tokens,
-                max_num_tokens_per_gpu,
-            )
+            self.forward_idle_attn(positions, hidden_states, ctx, aux_hidden_states)
+
+        hidden_states = self.forward_mlp(
+            hidden_states,
+            residual,
+            ctx,
+            num_global_tokens,
+            max_num_tokens_per_gpu,
+        )
 
         return hidden_states, residual
 
@@ -253,147 +247,4 @@ class BaseMoEDecoderLayer(BaseDecoderLayer):
     @property
     def is_moe_layer(self) -> bool:
 
-        return True
-
-
-class CompiledDecoderLayer(nn.Module, Generic[_C]):
-    """Compiler-driven decoder layer (opt-in).
-
-    Instead of CommManager, the forward delegates to a
-    ``_CompiledRuntime`` produced by the layer compiler.
-    """
-
-    def __init__(
-        self,
-        config: _C,
-        layer_id: int,
-        mapping: Mapping,
-        quant_config: Q | None = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-
-        self.config = config
-        self.quant_config = quant_config
-        self.layer_id = layer_id
-        self.total_layers = config.num_hidden_layers
-        self.mapping = mapping
-        self.prefix = prefix
-
-        self._compiled: _CompiledRuntime | None = None
-        self._exec_plan = self.build_execution_plan(prefix)
-
-    @property
-    def is_moe_layer(self) -> bool:
-        return False
-
-    def resolve_norm(self) -> nn.Module:
-        return RMSNorm(self.config.hidden_size, eps=self.config.rms_norm_eps)
-
-    def build_execution_plan(self, prefix: str) -> list[ExecutionNode]:
-        self.input_layernorm = self.resolve_norm()
-        self.self_attn = self.resolve_attn(prefix)
-        self.post_attention_layernorm = self.resolve_norm()
-        self.mlp = self.resolve_mlp(prefix)
-
-        return [
-            ExecutionNode(
-                module=self.input_layernorm,
-                spec=self.norm_spec(captures_aux=True, skip_on_idle=True),
-                name="input_layernorm",
-            ),
-            ExecutionNode(
-                module=self.self_attn,
-                spec=self.attn_spec(),
-                name="self_attn",
-            ),
-            ExecutionNode(
-                module=self.post_attention_layernorm,
-                spec=self.norm_spec(),
-                name="post_attention_layernorm",
-            ),
-            ExecutionNode(
-                module=self.mlp,
-                spec=self.mlp_spec(),
-                name="mlp",
-            ),
-        ]
-
-    def norm_spec(
-        self,
-        *,
-        captures_aux: bool = False,
-        skip_on_idle: bool = False,
-    ) -> ModuleSpec:
-        return ModuleSpec.from_kind(
-            kind=ModuleKind.NORM,
-            supports_fused_reduce_norm=True,
-            captures_aux=captures_aux,
-            skip_on_idle=skip_on_idle,
-        )
-
-    def attn_spec(self) -> ModuleSpec:
-        input_placement = Replicate(ParallelGroup.ATTN_TP)
-        return ModuleSpec.from_kind(
-            input_placement=input_placement,
-            output_placement=_default_compute_output_placement(
-                self.mapping, ParallelGroup.ATTN_TP
-            ),
-            kind=ModuleKind.ATTENTION,
-            skip_on_idle=True,
-        )
-
-    def mlp_spec(self) -> ModuleSpec:
-        mlp_group = (
-            ParallelGroup.MOE_TP_EP if self.is_moe_layer else ParallelGroup.DENSE_TP
-        )
-        kind = ModuleKind.MOE if self.is_moe_layer else ModuleKind.DENSE_MLP
-        return ModuleSpec.from_kind(
-            input_placement=Replicate(mlp_group),
-            output_placement=_default_compute_output_placement(self.mapping, mlp_group),
-            kind=kind,
-        )
-
-    def resolve_attn(self, prefix: str) -> nn.Module:
-        raise NotImplementedError
-
-    def resolve_mlp(self, prefix: str) -> nn.Module:
-        raise NotImplementedError
-
-    def resolve_exec_plan(self) -> list[ExecutionNode]:
-        return self._exec_plan
-
-    def set_compiled(self, compiled: _CompiledRuntime) -> None:
-        self._compiled = compiled
-
-    def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        ctx: ForwardContext,
-        residual: torch.Tensor | None,
-        aux_hidden_states: list | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self._compiled.forward(
-            positions, hidden_states, ctx, residual, aux_hidden_states
-        )
-
-
-class CompiledMoEDecoderLayer(CompiledDecoderLayer):
-
-    def mlp_spec(self) -> ModuleSpec:
-        if get_all2all_backend().is_gluon_petit():
-            # MegaMoE consumes and returns the rank-local attention-DP token
-            # shard. Its fused kernel owns expert dispatch and combine, so the
-            # layer compiler must not wrap it in the all-gather/reduce-scatter
-            # pair used by local-expert MoE kernels.
-            return ModuleSpec.from_kind(
-                input_placement=Replicate(ParallelGroup.ATTN_TP),
-                output_placement=None,
-                kind=ModuleKind.MOE,
-            )
-        return super().mlp_spec()
-
-    @property
-    def is_moe_layer(self) -> bool:
         return True

@@ -72,6 +72,43 @@ def test_mm_reference_rejects_out_dtype_mismatch() -> None:
         kernel_mm(a, b, out=out, override="torch_mm")
 
 
+@pytest.mark.parametrize("device", ("cpu", "cuda"))
+@pytest.mark.parametrize("input_dtype", (torch.bfloat16, torch.float16))
+@pytest.mark.parametrize("use_out", (False, True))
+@pytest.mark.parametrize("use_epilogue", (False, True))
+def test_mm_fp32_output_preserves_accumulator(
+    device: str, input_dtype: torch.dtype, use_out: bool, use_epilogue: bool
+) -> None:
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("GPU required")
+    # Exact inputs whose sum needs FP32: a 16-bit store before widening loses it.
+    increment = 2.0**-12
+    a = torch.zeros((3, 64), device=device, dtype=input_dtype)
+    b = torch.zeros((17, 64), device=device, dtype=input_dtype)
+    a[:, :2] = 1.0
+    b[:, 0] = 1.0
+    b[:, 1] = increment
+    out = torch.empty((3, 19), device=device, dtype=torch.float32)[:, :17]
+    alpha = torch.tensor(2.0, device=device) if use_epilogue else None
+    bias = torch.full((17,), 0.25, device=device) if use_epilogue else None
+    result = kernel_mm(
+        a,
+        b,
+        out=out if use_out else None,
+        out_dtype=torch.float32,
+        alpha=alpha,
+        bias=bias,
+    )
+    expected = (1.0 + increment) * (2.0 if use_epilogue else 1.0)
+    expected += 0.25 if use_epilogue else 0.0
+    assert result.dtype == torch.float32
+    if use_out:
+        assert result is out
+    torch.testing.assert_close(
+        result, torch.full_like(result, expected), rtol=0, atol=0
+    )
+
+
 @pytest.mark.parametrize(
     ("n", "k"),
     (
@@ -392,7 +429,7 @@ def test_linear_attnres_partials_cpu_skips_device_kernel_selection(
     or "gfx950" not in getattr(torch.cuda.get_device_properties(0), "gcnArchName", ""),
     reason="gfx950 is required",
 )
-@pytest.mark.parametrize("tokens", [1, 2, 4])
+@pytest.mark.parametrize("tokens", [1, 2, 4, 8])
 @pytest.mark.parametrize("output_size", [3648, 6288])
 def test_linear_attnres_partials_gfx950_matches_composition(
     tokens: int, output_size: int
@@ -438,7 +475,11 @@ def test_linear_attnres_partials_gfx950_matches_composition(
         *scores,
         *scratch,
         eps=1e-6,
-        override="gluon_linear_attnres_partials_gfx950",
+        override=(
+            "gluon_linear_attnres_partials_gemv_gfx950"
+            if tokens > 4
+            else "gluon_linear_attnres_partials_gfx950"
+        ),
     )
 
     torch.testing.assert_close(
@@ -464,7 +505,10 @@ def test_linear_attnres_partials_gfx950_matches_composition(
             rtol=2e-4,
         )
 
-    with pytest.raises(ValueError, match="output size must be divisible by 16"):
+    with pytest.raises(
+        ValueError,
+        match="output size in" if tokens > 4 else "output size must be divisible by 16",
+    ):
         linear_attnres_partials(
             hidden,
             weight[:17],

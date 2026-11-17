@@ -67,6 +67,7 @@ from tokenspeed.runtime.layers.linear import (  # noqa: E402
 )
 from tokenspeed.runtime.layers.moe.expert import MoELayer  # noqa: E402
 from tokenspeed.runtime.model_loader import loader as loader_module  # noqa: E402
+from tokenspeed.runtime.models.deepseek_v41_moe import DeepseekV4MoE  # noqa: E402
 
 
 class _TinyModel(torch.nn.Module):
@@ -83,6 +84,10 @@ class _TinyModel(torch.nn.Module):
         for name, tensor in weights:
             self.seen.append(name)
             params[name].data.copy_(tensor)
+
+
+class _SelectedFileModel(_TinyModel):
+    checkpoint_weight_files = ("draft.safetensors",)
 
 
 def _write_checkpoint(directory: Path, scale: float) -> dict[str, torch.Tensor]:
@@ -104,8 +109,10 @@ def _runner(model: torch.nn.Module, booted_from: Path) -> ModelRunner:
     runner.gpu_id = 0
     runner.checkpoint_load_group = None
     runner._disk_reload_shapes = None
+    # Resident weights (no peer sharing), so disk reloads are allowed.
+    runner.mapping = Mapping(rank=0)
     runner.model_config = SimpleNamespace(
-        model_path=str(booted_from), mapping=Mapping(rank=0)
+        model_path=str(booted_from), mapping=runner.mapping
     )
     runner.server_args = SimpleNamespace(
         load_format="auto",
@@ -161,6 +168,24 @@ class TestRealCheckpoint:
         return runner.update_weights_from_disk(
             UpdateWeightFromDiskReqInput(model_path=str(path), **kwargs)
         )
+
+    def test_explicit_files_apply_to_reload_and_its_header_check(self):
+        original = _write_checkpoint(self.root / "step-0", scale=1.0)
+        updated = _write_checkpoint(self.root / "step-1", scale=7.0)
+        for step in ("step-0", "step-1"):
+            directory = self.root / step
+            (directory / "model.safetensors").rename(directory / "draft.safetensors")
+            (directory / "model.safetensors").write_bytes(b"not this model")
+            (directory / "model.safetensors.index.json").write_text(
+                json.dumps({"weight_map": {"target.weight": "model.safetensors"}})
+            )
+        model = _SelectedFileModel()
+        runner = _runner(model, self.root / "step-0")
+        for step, expected in (("step-1", updated), ("step-0", original)):
+            ok, message = self._load(runner, self.root / step)
+            assert ok, message
+            assert torch.equal(model.w, expected["w"])
+            assert torch.equal(model.b, expected["b"])
 
     def test_weights_arrive_from_the_named_checkpoint(self):
         original = _write_checkpoint(self.root / "step-0", scale=1.0)
@@ -287,8 +312,9 @@ class TestRealCheckpoint:
 def _bare(cls: type[torch.nn.Module]) -> torch.nn.Module:
     """An instance of ``cls`` built without its constructor.
 
-    The post-load check reads only a module's class, its ``quant_method`` and
-    an MoE layer's ``plan``, so no layer needs real weights or a mapping.
+    The post-load check reads only a module's class, its ``quant_method``, an
+    MoE layer's ``plan`` and whether a DeepSeek V4 MoE block fused its shared
+    expert, so no layer needs real weights or a mapping.
     """
     module = cls.__new__(cls)
     torch.nn.Module.__init__(module)
@@ -343,6 +369,16 @@ class TestPostLoadTransforms:
         # The unquantized gfx950 MoE kernels plan no weight preprocessor, so
         # their experts keep the checkpoint layout.
         assert (self._transformed(experts=_moe(None))) == ([])
+
+    def test_deepseek_v4_moe_is_a_transform_once_it_fuses_its_shared_expert(self):
+        # Its hook rewrites the shared expert in place only when MegaMoE takes
+        # it; the routed experts are judged by their own MoE layer.
+        unfused, fused = _bare(DeepseekV4MoE), _bare(DeepseekV4MoE)
+        unfused.shared_expert_fused = False
+        fused.shared_expert_fused = True
+        assert (self._transformed(unfused=unfused, fused=fused)) == (
+            ["fused (DeepseekV4MoE)"]
+        )
 
     def test_unknown_hook_is_a_transform(self):
         # A hook nobody has shown to be a no-op is treated as one that is not.

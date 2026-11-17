@@ -57,6 +57,7 @@ import ctypes
 import importlib
 import json
 import os
+import re
 import shlex
 import shutil
 import site
@@ -75,7 +76,7 @@ from setuptools.command.editable_wheel import editable_wheel
 ROOT = Path(__file__).resolve().parent
 REQUIREMENTS_DIR = ROOT / "requirements"
 THIRDPARTY_DIR = ROOT / "tokenspeed_kernel" / "thirdparty"
-BASE_VERSION = "0.1.4"
+BASE_VERSION = "0.1.5"
 BACKEND_ENV = "TOKENSPEED_KERNEL_BACKEND"
 VALID_BACKENDS = {"cuda", "rocm", "npu"}
 DEFAULT_CUDA_ARCHS = ("100a", "103a")
@@ -151,6 +152,28 @@ def _git_branch() -> str:
         return ""
 
 
+def _nightly_release_candidate() -> str:
+    """Return the release-candidate part of a manual nightly's version, or "".
+
+    TOKENSPEED_KERNEL_RELEASE_CANDIDATE=N (or rcN) adds rcN before the nightly's
+    date suffix. A release candidate sorts below every nightly with the same
+    base version, so it neither collides with the scheduled nightly of its date
+    nor shadows a nightly that satisfies the install.
+
+    Raises:
+        ValueError: If the value is set but is not a release-candidate number.
+    """
+    raw = os.environ.get("TOKENSPEED_KERNEL_RELEASE_CANDIDATE", "")
+    if not raw:
+        return ""
+    match = re.fullmatch(r"(?:rc)?([0-9]+)", raw.strip(), flags=re.IGNORECASE)
+    if match is None:
+        raise ValueError(
+            "Nightly release candidate must be a number such as 1 (or rc1)"
+        )
+    return f"rc{int(match.group(1))}"
+
+
 def _package_version() -> str:
     if os.environ.get("TOKENSPEED_KERNEL_NIGHTLY") == "true":
         version_date = _version_date()
@@ -161,8 +184,12 @@ def _package_version() -> str:
         ):
             raise ValueError("Nightly version date must be YYYYMMDD")
         datetime.strptime(version_date, "%Y%m%d")
-        return f"{BASE_VERSION}.post{version_date}"
+        return f"{BASE_VERSION}{_nightly_release_candidate()}.post{version_date}"
 
+    if os.environ.get("TOKENSPEED_KERNEL_RELEASE_CANDIDATE"):
+        raise ValueError(
+            "TOKENSPEED_KERNEL_RELEASE_CANDIDATE applies to nightly builds only"
+        )
     if _git_branch().startswith("release/"):
         return BASE_VERSION
 
@@ -555,6 +582,38 @@ KERNEL_GROUPS = [
             CUDA_CSRC_DIR / "attn_res_binding.cu",
         ],
         [],
+    ),
+    (
+        "dsv3_fused_a_gemm",
+        [
+            CUDA_CSRC_DIR / "dsv3_fused_a_gemm.cu",
+            CUDA_CSRC_DIR / "dsv3_fused_a_gemm_binding.cu",
+        ],
+        [],
+    ),
+    (
+        "indexer_topk",
+        [
+            CUDA_CSRC_DIR / "indexer_topk.cu",
+            CUDA_CSRC_DIR / "indexer_topk_binding.cu",
+        ],
+        [],
+    ),
+    (
+        "trtllm_fp8_quant",
+        [
+            CUDA_CSRC_DIR / "trtllm_fp8_quant.cu",
+            CUDA_CSRC_DIR / "trtllm_fp8_quant_binding.cu",
+        ],
+        [],
+    ),
+    (
+        "cublaslt_fp4_gemm",
+        [
+            CUDA_CSRC_DIR / "cublaslt_fp4_gemm.cu",
+            CUDA_CSRC_DIR / "cublaslt_fp4_gemm_binding.cu",
+        ],
+        ["-lcublas", "-lcublasLt"],
     ),
 ]
 
@@ -1096,18 +1155,30 @@ setup(
             "_cuda/*.cu",
             "_cuda/*.cuh",
         ],
+        # Committed TunableOp results (tuned BLAS solutions), one per GPU.
+        "tokenspeed_kernel.ops.gemm._hipblaslt": ["configs/*.csv"],
         "tokenspeed_kernel.thirdparty.cuda": [
             "objs/**/*.so",
             "csrc/kimi3_router.cu",
+            # Vendored FlashInfer/Cake Kimi-K3 front programs, JIT-built like the router.
+            "csrc/kimi3_latent_front/*.cu",
+            "csrc/kimi3_latent_front/*.h",
             # Vendored Lamport protocol and FFI headers for the optional JIT extension.
             "csrc/tvm_ffi_utils.h",
             "csrc/include/**/*.h",
             "csrc/include/**/*.cuh",
         ],
-        # Optional JIT adapter for fused AllGather quantization.
+        # Vendored sonic-sampler: its license and provenance.
+        "tokenspeed_kernel.thirdparty.sonic_sampler": [
+            "LICENSE",
+            "README.md",
+        ],
+        # Optional JIT adapters: fused AllGather quantization and the
+        # stand-alone block-scaled batched GEMM.
         "tokenspeed_kernel.thirdparty.flashinfer": [
             "allgather_quant.cu",
             "sm90_moe.patch",
+            "trtllm_block_scaled_bmm.cu",
         ],
         # Vendored MiniMax MSA CuTe sources: cute/ has no __init__.py (it is
         # loaded via the upstream sys.path bootstrap), so ship it as data.

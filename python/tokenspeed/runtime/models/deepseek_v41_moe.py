@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import functools
+import logging
 
 import torch
 from tokenspeed_kernel.ops.gemm import dsv4_linear_fp32
@@ -34,11 +35,7 @@ from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_step import get_is_capture_mode
-from tokenspeed.runtime.layers.activation import SiluAndMul
-from tokenspeed.runtime.layers.linear import (
-    MergedColumnParallelLinear,
-    RowParallelLinear,
-)
+from tokenspeed.runtime.layers.mlp import GatedMLP, gated_activation
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.topk import (
     StandardTopKOutput,
@@ -53,6 +50,8 @@ from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
 from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.nvtx import nvtx_range
+
+logger = logging.getLogger(__name__)
 
 
 def _deepseek_v4_mega_moe_max_num_tokens() -> int:
@@ -69,62 +68,6 @@ def _deepseek_v4_mega_moe_max_num_tokens() -> int:
         global_server_args_dict.get("max_num_seqs", 0),
     ]
     return max([int(value or 0) for value in candidates] + [1])
-
-
-class DeepseekV4MLP(nn.Module):
-    def __init__(
-        self,
-        hidden_size: int,
-        intermediate_size: int,
-        hidden_act: str,
-        mapping: Mapping,
-        quant_config: QuantizationConfig | None,
-        prefix: str,
-        swiglu_limit: float | None = None,
-        reduce_results: bool = False,
-        is_shared_expert: bool = False,
-    ) -> None:
-        super().__init__()
-        if hidden_act != "silu":
-            raise ValueError(f"Unsupported activation: {hidden_act}")
-        tp = mapping.moe if is_shared_expert else mapping.dense
-        tp_rank = tp.tp_ep_rank if is_shared_expert else tp.tp_rank
-        tp_size = tp.tp_ep_size if is_shared_expert else tp.tp_size
-        tp_group = tp.tp_ep_group if is_shared_expert else tp.tp_group
-        self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [intermediate_size] * 2,
-            bias=False,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
-            tp_group=tp_group,
-            quant_config=quant_config,
-            prefix=add_prefix("gate_up_proj", prefix),
-        )
-        self.down_proj = RowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            bias=False,
-            reduce_results=reduce_results,
-            tp_rank=tp_rank,
-            tp_size=tp_size,
-            tp_group=tp_group,
-            quant_config=quant_config,
-            prefix=add_prefix("down_proj", prefix),
-        )
-        self.swiglu_limit = swiglu_limit
-        self.act_fn = SiluAndMul(swiglu_limit)
-        self.reduce_results = reduce_results
-        self.tp_rank = tp_rank
-        self.tp_size = tp_size
-        self.tp_group = tp_group
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.shape[0] == 0:
-            return x.new_empty((0, self.down_proj.output_size))
-        gate_up, _ = self.gate_up_proj(x)
-        out, _ = self.down_proj.forward_with_activation(gate_up, self.act_fn)
-        return out
 
 
 def _random_expert_ids(
@@ -327,22 +270,34 @@ class DeepseekV4MoE(nn.Module):
         )
 
         if config.n_shared_experts is not None:
-            self.shared_experts = DeepseekV4MLP(
-                config.hidden_size,
-                config.moe_intermediate_size * config.n_shared_experts,
-                config.hidden_act,
-                mapping,
-                quant_config,
-                add_prefix("shared_experts", prefix),
-                swiglu_limit=getattr(config, "swiglu_limit", None),
+            # MegaMoE outputs are complete, so its shared expert stays dense and local.
+            if self.use_mega_moe or self.use_gluon_petit:
+                shared_tp_rank = mapping.dense.tp_rank
+                shared_tp_size = mapping.dense.tp_size
+                shared_tp_group = mapping.dense.tp_group
+            else:
+                shared_tp_rank = mapping.moe.tp_ep_rank
+                shared_tp_size = mapping.moe.tp_ep_size
+                shared_tp_group = mapping.moe.tp_ep_group
+            self.shared_experts = GatedMLP.tensor_parallel(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.moe_intermediate_size
+                * config.n_shared_experts,
+                activation=gated_activation(
+                    config.hidden_act, getattr(config, "swiglu_limit", None)
+                ),
+                tp_rank=shared_tp_rank,
+                tp_size=shared_tp_size,
+                tp_group=shared_tp_group,
                 reduce_results=False,
-                # Normal EP sums routed and shared partials over the same TPxEP
-                # group. Fused MegaMoE paths return complete routed outputs and
-                # therefore keep the shared expert dense and local.
-                is_shared_expert=not (self.use_mega_moe or self.use_gluon_petit),
+                fusions=(),
+                quant_config=quant_config,
+                prefix=add_prefix("shared_experts", prefix),
             )
         else:
             self.shared_experts = None
+        # Set once MegaMoE runs the shared expert inside its own launch.
+        self.shared_expert_fused = False
 
         if self.use_mega_moe and global_server_args_dict["moe_mxfp4_fp8_activation"]:
             raise ValueError(
@@ -385,6 +340,55 @@ class DeepseekV4MoE(nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
             hash_routing=self.gate.tid2eid is not None,
             weights_dtype=self.experts.topk_weights_dtype,
+        )
+
+    def process_weights_after_loading(self, module: nn.Module) -> None:
+        # Loaders call this once per module. The sharded-state loader calls it
+        # before copying a saved state in, which then holds the fused layout,
+        # as the routed experts' processing expects too.
+        self.fuse_shared_expert()
+
+    def fuse_shared_expert(self) -> None:
+        """Hand the shared expert to MegaMoE when its kernel can run it.
+
+        The shared expert's weights are then laid out in place for MegaMoE and
+        its own forward is no longer used.
+        """
+        shared = self.shared_experts
+        if not self.use_mega_moe or shared is None or self.shared_expert_fused:
+            return
+        gate_up, down = shared.gate_up_proj, shared.down_proj
+        if (
+            gate_up.weight.dtype != torch.float8_e4m3fn
+            or down.weight.dtype != torch.float8_e4m3fn
+        ):
+            reason = (
+                f"its weights are {gate_up.weight.dtype} and {down.weight.dtype}, "
+                "not torch.float8_e4m3fn"
+            )
+        # MegaMoE clamps every expert with the routed experts' limit.
+        elif shared.act_fn.swiglu_limit != self.experts.swiglu_arg.limit:
+            reason = (
+                f"its SwiGLU limit {shared.act_fn.swiglu_limit} differs from the "
+                f"routed experts' {self.experts.swiglu_arg.limit}"
+            )
+        else:
+            self.experts.process_weights_after_loading(self.experts)
+            self.shared_expert_fused = self.experts.fuse_shared_expert(
+                gate_up.weight.data,
+                gate_up.weight_scale_inv.data,
+                down.weight.data,
+                down.weight_scale_inv.data,
+            )
+            if self.shared_expert_fused:
+                return
+            reason = (
+                "the MegaMoE kernel does not take its weight shapes "
+                f"{tuple(gate_up.weight.shape)} and {tuple(down.weight.shape)}"
+            )
+        logger.info(
+            f"Layer {self.layer_index} runs its shared expert outside MegaMoE: "
+            f"{reason}"
         )
 
     def warmup(self) -> None:
@@ -482,6 +486,16 @@ class DeepseekV4MoE(nn.Module):
     ) -> torch.Tensor:
         with nvtx_range("moe_select_experts"):
             topk_output = self._compute_topk_output(hidden_states, input_ids)
+        if self.shared_expert_fused:
+            # The routed output already includes the shared expert.
+            with nvtx_range("moe_mega_experts"):
+                return self._forward_routed_experts(
+                    hidden_states,
+                    topk_output,
+                    num_global_tokens,
+                    max_num_tokens_per_gpu,
+                    do_finalize=True,
+                )
         shared = None
         with self.stream_fork.scope(enable=get_is_capture_mode()) as fork:
             with nvtx_range("moe_mega_experts"):

@@ -180,7 +180,7 @@ def test_mha_prefill_wide_transport_small(dtype, fused_tdm):
         waves_per_eu=1,
         llvm_fn_attrs="amdgpu-sched-strategy=coexec",
         enable_fp_fusion=True,
-        **prefill.sched_compile_options(),
+        **prefill.extern_compile_options(),
     )
     expected = _reference(q.double(), k.double(), v.double(), cu_cpu, 2, 1, 128)
     tolerance = 2e-2 if dtype == torch.bfloat16 else 3e-3
@@ -268,7 +268,7 @@ def test_mha_prefill_addresses_past_four_gib():
         num_warps=4,
         waves_per_eu=1,
         llvm_fn_attrs="",
-        **prefill.sched_compile_options(),
+        **prefill.extern_compile_options(),
     )
     torch.cuda.synchronize()
     assert torch.equal(storage[:head_dim], sentinel)
@@ -687,7 +687,7 @@ def _launch_tile(
         waves_per_eu=1,
         llvm_fn_attrs="amdgpu-sched-strategy=coexec",
         enable_fp_fusion=True,
-        **prefill.sched_compile_options(),
+        **prefill.extern_compile_options(),
     )
     return output
 

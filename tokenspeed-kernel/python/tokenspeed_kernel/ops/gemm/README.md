@@ -1,9 +1,7 @@
 # GEMM weight preparation
 
-The optional `trtllm_kernel` extension is required for TRT-LLM's fused-A
-projection and cuBLASLt NVFP4 GEMM provider. Without it, the NVFP4 leaf is not
-registered and a direct fused-A call reports the missing package; importing
-other GEMM providers does not require the extension.
+TRT-LLM's DeepSeek V3 fused-A projection and cuBLASLt NVFP4 GEMM provider are
+built into tokenspeed-kernel's CUDA extension, adapted from TensorRT-LLM.
 
 ## Blackwell block-FP8 automatic selection
 
@@ -60,6 +58,15 @@ scale view falls back to FlashInfer where its M range permits, or Triton.
 This scale check is conservative even when a layout copy would align the view.
 Online quantization supplies freshly allocated, aligned activations and scales.
 
+## Dense FP32 output
+
+For BF16 or FP16 inputs, `mm(..., out_dtype=torch.float32)` stores the FP32
+accumulator directly. It must not widen a result already rounded to the input
+dtype. Scaling and bias operate on that FP32 result, including when the caller
+supplies a strided output buffer. On gfx950, `gluon_mm_bf16_fp32_gfx950` serves
+measured BF16 projections; the AMD ops README records its shapes and reductions,
+which need not match a vendor GEMM bit for bit.
+
 ## Small dense projections
 
 `mv` selects the registered small-row projection implementation. Its dispatcher
@@ -72,15 +79,157 @@ On CDNA4, ordinary GEMM dispatch admits the measured single-row
 Callers that publish directly into a collective buffer pass that buffer as
 `out` to the same `mv` operation.
 
+`mv_fp8_weight` projects 16-bit rows through a weight-only FP8 weight: E4M3
+with one FP32 scale per output channel, as a 16-bit checkpoint quantizes at
+load. Activations stay 16-bit, so the only roundings past the weight's are
+the FP32 sums' and the output's. The `("gemm", "mv_fp8_weight")` operation
+takes up to `MV_FP8_WEIGHT_MAX_M` rows a launch, larger calls run in chunks of
+that many, and the Torch reference upcasts the weight a chunk at a time.
+
 `mv_weightless_rmsnorm_gated_sigmoid` normalizes, gates and projects one row
 through the `("gemm", "mv_weightless_rmsnorm_gated_sigmoid")` operation. A
 registered kernel serves it only where the separate gated norm and `mv` select
 the kernels it reproduces bit for bit; otherwise callers keep the two calls.
 
-On SM107, FlashInfer's TGV/CuTe DSL search supports BF16 output projections
-with weight shape `[2560, 6144]` and M <= 4. Startup tuning covers M=1/2/4.
-The kernels accumulate in FP32 and return BF16; reduction order can change
-rounding relative to the original GEMM.
+`mv_rmsnorm_gated_sigmoid` is its multi-row decode form, through the
+`("gemm", "mv_rmsnorm_gated_sigmoid")` operation: the GEMV's prologue runs the
+per-head `rmsnorm_gated_sigmoid` on 2 to 8 rows, each wave's K step one whole
+head. It stands in only where `mm` selects the GEMV it reproduces bit for bit
+on the normed rows; `mv_rmsnorm_gated_sigmoid_supported` tells callers when to
+keep the gated norm and `mm` as two calls.
+
+On SM107, BF16 projections run FlashInfer's CuTe DSL low-latency GEMM at
+M <= 32, as on SM100 and SM103, when `_sm107_cute_dsl_bf16_admits` admits the
+weight: K a multiple of 128, and either at most 8192 output columns or
+K >= 2048 and at most 96 MiB. CuTe DSL is pinned there as the measured winner;
+other weights, such as an LM head or a wide projection with a short K, keep
+cuBLASLt, which measured faster on them at 16 to 32 rows. Startup tuning
+covers M=1/2/4/8/16/32. The kernels accumulate in FP32 and return BF16;
+reduction order can change rounding relative to the original GEMM.
+
+## Decode GEMMs on small weights
+
+On SM100 and SM103, `mm` runs a BF16 GEMM on one pinned FlashInfer TGV tile
+instead of cuBLASLt when all of these hold:
+
+- No bias, BF16 output, and no plan, `solution`, override, scales, or `alpha`
+- `TGV_DECODE_MIN_M < M <= TGV_DECODE_MAX_M` (32 < M <= 512). Up to 32 rows
+  (`BF16_GEMM_MAX_M` on SM100 and SM103), `mm` takes FlashInfer's joint BF16
+  GEMM (`flashinfer_bf16_gemm`) instead, in which FlashInfer's tuner chooses
+  among its TGV and CuTe DSL tactics.
+- `TGV_DECODE_MIN_K <= K <= TGV_DECODE_MAX_K` (2048 <= K <= 3072; below)
+- This rank's weight takes at most `TGV_DECODE_MAX_WEIGHT_BYTES` (16 MiB).
+- One of the pinned tiles covers the GEMM in one wave (below).
+- PDL is enabled (`pdl_enabled()`, which the server's `--disable-pdl` turns
+  off).
+- The operands meet the joint BF16 contract (`flashinfer_joint_bf16_supported`):
+  contiguous, 32-byte aligned, K a multiple of 8.
+- Serving has not started (`is_serving()`).
+
+Under PDL, TGV loads weight tiles while the producer kernel still runs and
+waits only before loading activations; cuBLASLt starts loading after the
+producer finishes. FlashInfer's tactic profiling times each GEMM alone and
+cannot see that overlap, so `select_tgv_decode_tile` chooses the tile itself:
+of the 2-CTA tiles of 128 weight rows by 16, 32, or 64 activation rows, each
+with the most stages that fit in shared memory, the first whose grid has at
+most one CTA per SM. A GEMM for which none fits keeps cuBLASLt, and so does
+every GEMM without PDL, which has no overlap to gain. The choice depends only
+on M, N, K, the weight size, the SM count, and the PDL setting.
+
+The K window is measured, not derived: on GB300, in a captured PDL chain of an
+RMSNorm and this GEMM on a weight cold in L2, TGV beat cuBLASLt on most shapes
+with K in the window, by up to 1.30x. Outside it TGV lost on many shapes, down
+to 0.73x cuBLASLt's speed, mainly at K of 512 to 1024 and at K >= 4096 with
+few weight rows; at K = 1536 it also lost on some shapes (down to 0.92x).
+
+The weight limit and the K window are bounds on shape, not a list of layers.
+On a quantized checkpoint, the BF16 GEMMs that reach them are the small
+projections the checkpoint leaves unquantized; the route was measured end to
+end only in such a model's decode graphs. On a BF16 checkpoint they also admit
+dense projection shards under tensor parallelism, not measured in a model: at
+TP4, a model with hidden size 3072 and 8 KV heads of 128 has a 7.5 MiB fused
+QKV shard (K = 3072), routed up to M = 448 on 148 SMs, while its output
+projection shard (K = 768) keeps cuBLASLt.
+
+The serving gate has a different reason than the joint path's, which
+compiles once per row count. TGV compiles once per tile, but the route was
+measured only inside CUDA graphs. So graphs captured at startup, decode graphs
+and prefill graphs of 33 to 512 tokens alike, keep the TGV launches they
+recorded, and eager calls while serving keep cuBLASLt. The gate also keeps
+TGV compilation out of serving when startup compiled no tile, as under
+pipeline parallelism without CUDA graphs.
+
+A TGV tactic id is a position in FlashInfer's tactic table, so
+`resolve_tgv_tactics` finds the tiles by shape. If the installed FlashInfer
+lacks one of them or its TGV launcher, a warning is logged once and these
+GEMMs keep cuBLASLt. TGV compiles once per tile, PDL setting, and operand
+layout, never per shape. `kernel_warmup` compiles the three tiles at startup.
+Pipeline parallelism skips kernel warmup; there, the eager passes before each
+graph capture compile the tiles that graph uses. Either way, no tile compiles
+per row count, during capture, or while serving.
+
+Like the joint path, the route is a shortcut in `mm` ahead of registry
+selection, not a registered kernel: for the GEMMs it routes, it precedes every
+registered BF16 `gemm.mm` kernel, plugins included.
+
+TGV accumulates in FP32 and rounds once to BF16. Its reduction order differs
+from cuBLASLt's, so its results are not bitwise identical to cuBLASLt's: a
+decode batch replayed from a captured graph and an eager call of the same
+shape after serving starts can differ in the last bits. Repeated TGV calls on
+the same inputs, eager or replayed, agree bit for bit.
+
+## Offline-tuned BLAS solutions with TunableOp (ROCm)
+
+Dense BF16/FP16 projections that no registered kernel claims run `torch.mm`,
+which on ROCm takes hipBLASLt's heuristic solution. For skinny row counts, such
+as speculative-decoding verify steps, a measured solution can be much faster.
+TunableOp times both hipBLASLt and rocBLAS solutions, so a tuned file can list
+either kind (rocBLAS ones are named `Gemm_Rocblas_*`).
+
+`hipblaslt.py` is the runtime entry point; the loader, the stack check and the
+tuning tool are in `_hipblaslt/tuning.py`. Tuned files are committed in
+`_hipblaslt/configs/`, one per GPU, named like the Triton kernel configs after
+`torch.cuda.get_device_name()` with spaces replaced by underscores, such as
+`device_name=AMD_Instinct_MI355X.csv`. Serving loads the file of its GPU
+automatically, through `hipblaslt.py`, once per process and before graph
+capture, and replays it read-only through PyTorch TunableOp. GEMMs the file
+does not list keep the default solution. Serving never rewrites the file, and
+tunes only with the opt-in switch below. A GPU without a file keeps the
+defaults.
+
+A results file is valid only for the PyTorch, HIP, hipBLASLt and rocBLAS
+versions and the GPU architecture stamped in its `Validator` rows. On any
+mismatch the whole file is ignored with one warning and every GEMM keeps the
+default. Regenerate the file after changing the stack, on an idle GPU of the
+serving type, for each weight shape `N x K` and each row count to cover
+(captured verify or decode token counts):
+
+```bash
+python -m tokenspeed_kernel.ops.gemm._hipblaslt.tuning --dtype bfloat16 \
+    --shapes 14336x5120,5120x6144,16480x5120,34816x5120,5120x17408 \
+    --rows 64,128,192,256,384,512
+```
+
+Without `--out`, the tool writes this GPU's file in `_hipblaslt/configs/`. If
+the file exists with the running stack's stamp, its GEMMs are kept and only
+new ones are timed, so one file can cover several models; on another stack
+the tool stops, and the file must be deleted to re-tune. Tuning rotates
+weight copies through `--cold-bytes`, so each timing reads the weight from
+HBM as a serving step does. Another solution can sum K in another order, so
+results differ from the default within BF16 rounding.
+
+To cover GEMMs the file does not list without regenerating it, such as a new
+model or a new stack, set `TOKENSPEED_HIPBLASLT_AUTOTUNE=1` (off by default).
+During kernel warmup, before graph capture, serving then runs one eager
+decode step per captured batch size inside `hipblaslt_online_tuning()`:
+TunableOp times every solution of each GEMM it has no entry for, with the
+same rotating cold-weight buffer as the tool (512 MiB), and keeps the
+fastest. GEMMs the file lists are not re-timed, and a file from another stack
+is still ignored, so then every GEMM of those steps is tuned. Tuning stops
+before capture; the picks stay in the process and nothing is written, the
+committed file included. The cost is startup time on every start and every
+rank, and picks may differ between starts and ranks within BF16 rounding;
+commit the file with the tool above to fix them.
 
 ## Per-token/per-channel FP8
 
@@ -88,6 +237,7 @@ Per-channel FP8 projections use FP8 E4M3 weights with FP32 scales per output
 channel and dynamically quantize activations per token. This scale format is
 distinct from block scaling. Native FP8 matrix arithmetic uses FP32
 accumulators but need not match sequential FP32 arithmetic.
+The small-row Triton and PyTorch rowwise GEMMs support NVIDIA SM100 and newer.
 
 ## Startup tuning coverage
 
@@ -97,16 +247,67 @@ larger observed inputs and the enclosing native bucket. Native mappers,
 constraints, and caches are preserved. Explicit buckets and disabled profiling
 retain their semantics; small-M BF16 keeps its existing bound.
 
-## Hopper block-FP8 DeepGEMM
+## Decode-size BF16 projections
 
-`deepgemm_mm_fp8_blockscale` supports explicit `mm(..., override=...)` or
-`solution="deepgemm"` selection. Serving can opt in with
+`triton_skinny.skinny_mm` computes `x @ w.T` for up to 32 BF16 rows on NVIDIA,
+streaming the weight once. Its module docstring records the split-K fold, which
+keeps a row's result independent of the batch, and its PDL order.
+
+## Block-FP8 DeepGEMM
+
+`solution="deepgemm"` selects the appropriate block-FP8 kernel for the GPU.
+Explicit overrides are `deepgemm_mm_fp8_blockscale` on SM90 and
+`deepgemm_mm_fp8_blockscale_packed` on SM100/SM103. Serving can opt in with
 `--dense-gemm-backend deepgemm` for standard block-FP8 dense linears. The
 default `auto` route remains unchanged; routed experts use their own backend.
 
-This optional DeepGEMM integration requires Hopper, contiguous E4M3 operands
-A[M,K]/B[N,K], BF16 output, N divisible by 64, and K divisible by 128. It
-converts canonical FP32 1x128 activation and 128x128 weight scales to the
-required layout without UE8M0 rounding. Conversion is part of each call,
+This optional DeepGEMM integration supports SM90, SM100 and SM103, contiguous
+E4M3 operands A[M,K]/B[N,K], BF16 output, N divisible by 64, and K divisible
+by 128. On Hopper it converts canonical FP32 1x128 activation and 128x128
+weight scales to the required layout without UE8M0 rounding. Conversion is part of each call,
 including graph capture; no persistent weight cache is created. Unsupported
 forced calls fail explicitly. It does not claim batch-invariant numerics.
+
+On SM100/SM103, dense FP8 layers configured for DeepGEMM call
+`prepare_deepgemm_fp8_weight` after loading. It requantizes weights onto
+power-of-two scales and packs them once. The layer pins DeepGEMM for forward.
+Activations use the registered `packed_ue8m0` quantizer,
+which directly writes TMA-aligned int32 scales with initialized padding.
+GEMM consumes these packed scales without per-call copies or packing.
+The quantizer and DeepGEMM follow the global PDL setting and work in CUDA
+Graphs and on auxiliary streams. Default FP32-scale dispatch is unchanged.
+
+## Grouped FP8 projection
+
+`grouped_fp8_projection` computes `einsum('tgk,gnk->tgn')` from E4M3
+activations and weights that both carry one UE8M0 scale per 32 K channels
+(DeepSeek V4.1's grouped `wo_a`). `prepare_grouped_fp8_projection` re-lays the
+canonical `[groups * N, K / 32]` weight scales out once for the serving kernel
+and returns None where no kernel serves the weights, so callers keep their
+dequantized BF16 path. `has_grouped_fp8_projection` answers the same question
+from the device and shape alone, before any weight is loaded. The DeepGEMM
+kernel (SM100/SM103) takes activation scales packed four per int32, MN-major
+and TMA-aligned, which is what `dsv41.rope_quantize_fp8_grouped` writes.
+`grouped_fp8_projection_quantize_fp8` instead writes E4M3 codes of the
+BF16-rounded result with packed scales in that same layout, which
+`fp8_projection` (a dense E4M3 GEMM, `prepare_fp8_projection` for its weight
+scales) reads directly, so no quantization kernel runs between the two.
+
+DeepGEMM picks a tile configuration from the token count (one per 16 tokens)
+and JIT-compiles each on first use. `warmup_fp8_projections` launches every
+configuration up to a token bound at startup so serving never compiles.
+
+## Small-N BF16 Split-K policy
+
+`flashinfer_mm_bf16_small_n_splitk` uses FlashInfer's cached CuTe DSL Split-K
+launcher with tile `(64, 8)`, four K splits and six pipeline stages. Automatic
+SM107 dispatch admits the measured `(M,N,K) = (4,640,2560)` projection with
+PDL, contiguous BF16 operands/output and 32-byte pointer alignment. This is a
+measured performance policy, not the implementation's shape contract. Other
+shapes and unaligned views keep the existing GEMM selection; explicit overrides
+remain authoritative. FlashInfer validates the callable's wider tile support.
+
+The ordinary `mm` wrapper applies bias. The kernel preserves a supplied output
+and rejects unsupported scale arguments. Its cached callable uses runtime row
+counts, so changing M does not add specializations. The provider is optional;
+builds without this FlashInfer module retain the existing registered kernels.

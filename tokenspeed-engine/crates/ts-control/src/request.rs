@@ -28,6 +28,8 @@ use ts_wire::{
     value::Value,
 };
 
+use crate::grammar::ReasoningGrammar;
+
 /// Why an abort happened, as the frontend sees it (`ABORT_CODE`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AbortCode {
@@ -165,6 +167,57 @@ pub(crate) const MAX_CACHE_SESSION_ID_BYTES: usize = 4096;
 /// The device's per-request stop table width (`MAX_STOP_TOKEN_IDS`).
 pub const MAX_STOP_TOKEN_IDS: usize = 16;
 
+/// A request's cumulative reasoning-token usage, counted by token id before
+/// detokenization. Delimiters belong to neither the reasoning nor the answer.
+#[derive(Debug, Clone, Copy)]
+pub struct ReasoningTokens {
+    open_id: i32,
+    close_id: i32,
+    implicit_closer: i32,
+    in_reasoning: bool,
+    count: i64,
+}
+
+impl ReasoningTokens {
+    /// Start a counter from the request's rendered prompt.
+    pub fn new(grammar: &ReasoningGrammar, prompt_ids: &[i32]) -> Self {
+        let (open_id, close_id) = grammar.markers.unwrap_or((-1, -1));
+        let in_reasoning = open_id >= 0
+            && prompt_ids
+                .iter()
+                .rposition(|&id| id == open_id || id == close_id)
+                .is_some_and(|i| prompt_ids[i] == open_id);
+        // Templates without known single-token markers cannot account by
+        // token id; leave them at zero rather than counting the whole reply.
+        Self {
+            open_id,
+            close_id,
+            implicit_closer: grammar.implicit_closer.unwrap_or(-1),
+            in_reasoning,
+            count: 0,
+        }
+    }
+
+    /// Add committed output tokens. Retraction keeps these tokens and only
+    /// rebuilds their KV prefix, so each one is counted exactly once.
+    pub fn push(&mut self, token_ids: impl IntoIterator<Item = i32>) {
+        for id in token_ids {
+            if id == self.open_id {
+                self.in_reasoning = true;
+            } else if id == self.close_id || id == self.implicit_closer {
+                self.in_reasoning = false;
+            } else if self.in_reasoning {
+                self.count += 1;
+            }
+        }
+    }
+
+    /// Tokens inside the reasoning block so far.
+    pub fn count(&self) -> i64 {
+        self.count
+    }
+}
+
 /// One admitted request.
 #[derive(Debug, Clone)]
 pub struct RequestState {
@@ -195,6 +248,8 @@ pub struct RequestState {
     pub computed_length: i64,
     /// Generated tokens.
     pub output_ids: Vec<i32>,
+    /// Cumulative reasoning usage; `None` without a reasoning parser.
+    pub reasoning_tokens: Option<ReasoningTokens>,
     /// Their logprobs, when requested.
     pub output_logprobs: Vec<f64>,
     /// Selected tokens' cumulative probability mass, when diagnostics and
@@ -207,12 +262,15 @@ pub struct RequestState {
     pub input_logprob_rows: Option<Vec<Option<f64>>>,
     /// Their top-k alternatives, when requested.
     pub input_top_logprob_rows: Option<Vec<Option<Alternatives>>>,
-    /// The prompt logprobs once the prompt completed.
+    /// The completed prompt logprobs, until the first output takes them.
     pub input_logprobs: Option<InputLogprobs>,
     /// They were sent.
     pub input_logprobs_sent: bool,
     /// Prompt tokens served from the prefix cache.
     pub cached_tokens: i64,
+    /// The continual-prompting session the request belongs to, when it
+    /// names one; traces group a session's requests under it.
+    pub session_id: Option<String>,
     /// Speculative verify rounds this request took part in.
     pub spec_verify_ct: i64,
     /// The decode reservation last sent to the scheduler
@@ -235,11 +293,19 @@ pub struct RequestState {
     /// When it reached the scheduler's waiting queue, until its first
     /// forward observes the wait.
     pub submitted_at: Option<std::time::Instant>,
+    /// Decode KV landing, until its first decode dispatch observes the wait.
+    pub decode_ready_at: Option<std::time::Instant>,
     /// When the frontend received it (wall-clock seconds), 0 if it did not
     /// say.
     pub created_time: f64,
+    /// When its first output token existed (wall-clock seconds), 0 until
+    /// then. Unlike `timings`, this is collected whenever the rank reports
+    /// engine metrics.
+    pub first_token_time: f64,
     /// Its lifecycle timestamps, with `--enable-log-request-stats`.
     pub timings: Option<crate::request_stats::RequestTimings>,
+    /// Sampled PD timings, consumed at the first output or terminal release.
+    pub(crate) ttft: Option<Box<crate::request_stats::TtftTrace>>,
     /// The matcher of its grammar, once compiled.
     pub grammar: Option<RequestGrammar>,
 
@@ -296,6 +362,7 @@ impl RequestState {
             returns_input_logprobs: false,
             computed_length: 0,
             output_ids: Vec::new(),
+            reasoning_tokens: None,
             output_logprobs: Vec::new(),
             output_token_cumulative_probs: Vec::new(),
             output_top_logprobs: None,
@@ -304,6 +371,7 @@ impl RequestState {
             input_logprobs: None,
             input_logprobs_sent: false,
             cached_tokens: 0,
+            session_id: None,
             spec_verify_ct: 0,
             decode_reserve: None,
             accept_draft_tokens: None,
@@ -312,8 +380,11 @@ impl RequestState {
             to_abort: false,
             abort_notify_client: false,
             submitted_at: None,
+            decode_ready_at: None,
             created_time: 0.0,
+            first_token_time: 0.0,
             timings: None,
+            ttft: None,
             grammar: None,
             admission: 0,
             send_token_offset: 0,
@@ -335,7 +406,11 @@ impl RequestState {
         self.returns_input_logprobs = self.return_logprob && request.computes_prompt_logprobs;
         let scored = (last_position - self.logprob_start_len) as usize;
         if self.wants_input_logprobs() {
-            self.input_logprob_rows = Some(vec![None; scored]);
+            // Finalization prepends the unscored first position. Reserve its
+            // slot now so the completed output can reuse this allocation.
+            let mut rows = Vec::with_capacity(scored + 1);
+            rows.resize(scored, None);
+            self.input_logprob_rows = Some(rows);
             if self.top_logprobs_num > 0 {
                 self.input_top_logprob_rows = Some(vec![None; scored]);
             }
@@ -349,6 +424,12 @@ impl RequestState {
     /// default start, the last prompt position, needs none.
     pub fn wants_input_logprobs(&self) -> bool {
         self.returns_input_logprobs && self.logprob_start_len < self.prompt_len - 1
+    }
+
+    /// Finalization remains complete after the output takes ownership of
+    /// the buffers, including when a retraction replays the prompt.
+    pub fn input_logprobs_finalized(&self) -> bool {
+        self.input_logprobs.is_some() || self.input_logprobs_sent
     }
 
     /// Store one chunk's prompt logprobs for positions `[start, start + n)`
@@ -397,10 +478,10 @@ impl RequestState {
     /// Assemble the prompt logprobs once the prompt's final chunk
     /// committed; a second call keeps them.
     pub fn finalize_input_logprobs(&mut self) -> Result<(), String> {
-        if !self.returns_input_logprobs || self.input_logprobs.is_some() {
+        if !self.returns_input_logprobs || self.input_logprobs_finalized() {
             return Ok(());
         }
-        let rows = self.input_logprob_rows.take().unwrap_or_default();
+        let mut rows = self.input_logprob_rows.take().unwrap_or_default();
         let missing = rows.iter().filter(|row| row.is_none()).count();
         if missing > 0 {
             // Every scored position is recomputed by a chunk that commits
@@ -411,9 +492,8 @@ impl RequestState {
             ));
         }
         let start = self.logprob_start_len as usize;
-        let mut values = Vec::with_capacity(rows.len() + 1);
-        values.push(None);
-        values.extend(rows);
+        rows.insert(0, None);
+        let values = rows;
         let ids = self.prompt_ids[start..].to_vec();
         if values.len() != ids.len() {
             return Err(format!(
@@ -516,19 +596,20 @@ impl RequestState {
         if self.finished() {
             return !self.finished_output;
         }
-        let generated = self.output_ids.len() as i64;
         if self.stream {
-            // A zero interval would divide by zero; it means every token.
+            // An interval below one means every step.
             let interval = self
                 .stream_interval
                 .unwrap_or(default_stream_interval)
-                .max(1);
-            if interval > 1 {
-                generated % interval == 1
-            } else {
-                generated % interval == 0
-            }
+                .max(1) as usize;
+            // Send the first step's tokens at once, then whenever at least
+            // `interval` tokens are unsent. A speculative step appends several
+            // tokens, so the output length can step over any given value;
+            // counting unsent tokens doesn't depend on hitting an exact length.
+            let unsent = self.output_ids.len().saturating_sub(self.send_token_offset);
+            interval == 1 || (unsent > 0 && (self.send_token_offset == 0 || unsent >= interval))
         } else {
+            let generated = self.output_ids.len() as i64;
             generated == 1 || generated % FORCED_STREAM_INTERVAL == 0
         }
     }
@@ -547,6 +628,49 @@ mod tests {
             None,
             false,
         )
+    }
+
+    fn reasoning(markers: Option<(i32, i32)>, implicit_closer: Option<i32>) -> ReasoningGrammar {
+        ReasoningGrammar {
+            continues: String::new(),
+            may_open: String::new(),
+            schema_slot: String::new(),
+            markers,
+            implicit_closer,
+            boundary: None,
+        }
+    }
+
+    #[test]
+    fn reasoning_usage_excludes_structural_markers() {
+        let grammar = reasoning(Some((1, 2)), Some(3));
+        let mut tokens = ReasoningTokens::new(&grammar, &[9, 1]);
+        tokens.push([10, 11, 2, 12]);
+        assert_eq!(tokens.count(), 2);
+
+        // DeepSeek V4.1 may enter a tool block directly, without </think>.
+        tokens.push([1, 13, 3, 14]);
+        assert_eq!(tokens.count(), 3);
+    }
+
+    #[test]
+    fn reasoning_usage_starts_from_the_prompt_state() {
+        let grammar = reasoning(Some((1, 2)), None);
+        for (prompt, output, expected) in [
+            (vec![1, 2], vec![10, 1, 11, 2, 12], 1),
+            (vec![], vec![10, 1, 11], 1),
+            (vec![1], vec![10, 11], 2),
+        ] {
+            let mut tokens = ReasoningTokens::new(&grammar, &prompt);
+            tokens.push(output);
+            assert_eq!(tokens.count(), expected, "prompt: {prompt:?}");
+        }
+
+        // A template without known single-token markers cannot account by
+        // token id; it must not count the whole reply as reasoning.
+        let mut unmarked = ReasoningTokens::new(&reasoning(None, None), &[]);
+        unmarked.push([10, 11]);
+        assert_eq!(unmarked.count(), 0);
     }
 
     #[test]
@@ -581,27 +705,46 @@ mod tests {
         assert_eq!(request.finished_reason.unwrap().wire_type(), "abort");
     }
 
-    #[test]
-    fn stream_intervals_follow_the_python_schedule() {
-        let due = |stream: bool, interval: Option<i64>, generated: usize| {
-            let mut request = RequestState::new(
-                vec![1, 2, 3],
-                1000,
-                BTreeSet::new(),
-                stream,
-                interval,
-                false,
-            );
-            request.output_ids = vec![0; generated];
-            request.output_due(1)
-        };
-        assert!((1..5).all(|n| due(true, None, n)));
-        // An interval above one fires on its first token and every interval after.
-        assert_eq!(
-            (1..8).map(|n| due(true, Some(3), n)).collect::<Vec<_>>(),
-            [true, false, false, true, false, false, true]
+    /// Runs `steps` decode steps that each append `tokens_per_step` tokens and
+    /// returns the output lengths at which an output was sent. A send advances
+    /// `send_token_offset` as `OutputProcessor::stream_state` does.
+    fn sent_at(
+        stream: bool,
+        interval: Option<i64>,
+        tokens_per_step: usize,
+        steps: usize,
+    ) -> Vec<usize> {
+        let mut request = RequestState::new(
+            vec![1, 2, 3],
+            1000,
+            BTreeSet::new(),
+            stream,
+            interval,
+            false,
         );
+        let mut sent = Vec::new();
+        for _ in 0..steps {
+            request
+                .output_ids
+                .extend(std::iter::repeat_n(0, tokens_per_step));
+            if request.output_due(1) {
+                request.send_token_offset = request.output_ids.len();
+                sent.push(request.output_ids.len());
+            }
+        }
+        sent
+    }
+
+    #[test]
+    fn stream_intervals_send_once_enough_tokens_are_unsent() {
+        assert_eq!(sent_at(true, None, 1, 4), [1, 2, 3, 4]);
+        // An interval above one sends the first step's tokens, then every interval after.
+        assert_eq!(sent_at(true, Some(3), 1, 7), [1, 4, 7]);
+        // Speculative steps append several tokens, so the output length can
+        // step over any given value; an output still goes out once at least an
+        // interval's worth of tokens is unsent.
+        assert_eq!(sent_at(true, Some(40), 4, 30), [4, 44, 84]);
         // Non-streaming requests: the first token, then every 50.
-        assert!(due(false, None, 1) && !due(false, None, 2) && due(false, None, 50));
+        assert_eq!(sent_at(false, None, 1, 100), [1, 50, 100]);
     }
 }
