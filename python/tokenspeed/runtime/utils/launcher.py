@@ -234,17 +234,22 @@ def interface_for_host(host: str) -> str | None:
         address the kernel would use.
     """
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        family, _, _, _, target = socket.getaddrinfo(
+            host.strip("[]"), 9, socket.AF_UNSPEC, socket.SOCK_DGRAM
+        )[0]
+        with socket.socket(family, socket.SOCK_DGRAM) as sock:
             # No packet is sent; this only asks the kernel which source
             # address it would route from.
-            sock.connect((host, 9))
+            sock.connect(target)
             source = sock.getsockname()[0]
     except OSError:
         return None
 
     for name, addrs in psutil.net_if_addrs().items():
         for addr in addrs:
-            if addr.family == socket.AF_INET and addr.address == source:
+            # psutil gives an IPv6 address with its zone ID (fe80::1%eth0).
+            address = addr.address.split("%", 1)[0]
+            if addr.family == family and address == source.split("%", 1)[0]:
                 return name
     return None
 
