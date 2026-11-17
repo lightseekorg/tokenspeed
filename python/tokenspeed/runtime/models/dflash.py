@@ -21,12 +21,11 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.ops.embedding import apply_k_rope as _apply_k_rope
-from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
 from tokenspeed.runtime.configs.model_config import (
@@ -34,7 +33,11 @@ from tokenspeed.runtime.configs.model_config import (
     configure_mla_attention,
 )
 from tokenspeed.runtime.configs.model_profile import ModelProfile
-from tokenspeed.runtime.distributed.comm_ops import all_gather, all_reduce
+from tokenspeed.runtime.distributed.comm_backend.registry import get_global_backend
+from tokenspeed.runtime.distributed.comm_ops import (
+    all_gather,
+    prepare_all_reduce_fusion,
+)
 from tokenspeed.runtime.distributed.mapping import Mapping, MappingBase
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
@@ -61,7 +64,15 @@ from tokenspeed.runtime.utils.device_stream import is_current_stream_capturing
 from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.spec_block_geometry import read_checkpoint_block_size
 
-_is_amd = current_platform().is_amd
+if TYPE_CHECKING:
+    from tokenspeed_kernel.ops.communication._iris.residual_rmsnorm import (
+        LamportResidualRMSNorm,
+    )
+
+# Most rows one fused reduce + norm serves (16 requests of 8 block rows), the
+# most the row-owned kernel keeps resident; larger draft forwards keep the
+# unfused reduction.
+_FUSED_REDUCE_NORM_MAX_ROWS = 128
 
 
 class DFlashAttention(nn.Module):
@@ -202,29 +213,38 @@ def reduce_norm(
     residual: torch.Tensor,
     ctx: ForwardContext,
     group: MappingBase,
+    fused: LamportResidualRMSNorm | None,
+    allreduce_fusion: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Reduce a row-parallel partial over ``group``, then add-norm it.
 
-    On AMD the fused all-reduce + norm builds its own Iris state per shape on
-    first use, which a draft first reaches inside graph capture and at block
-    widths the target never runs; the reduce goes through the draft
-    all-reduce (the target's Lamport state when it covers the rows) and the
-    norm runs unfused.
+    Only fusions prepared before graph capture run: ``fused``, the draft's
+    reduce + norm, for the rows it holds, else the fused all-reduce + norm
+    up to ``comm_fusion_max_num_tokens`` rows when ``allreduce_fusion``
+    armed its workspace. Other forwards reduce through the draft all-reduce
+    (the target's Lamport state when it covers the rows) and norm unfused.
     """
-    if _is_amd or (
-        ctx.input_num_tokens > global_server_args_dict["comm_fusion_max_num_tokens"]
-    ):
-        if group.tp_size > 1:
-            hidden_states = (
-                draft_all_reduce(hidden_states, group.tp_group)
-                if _is_amd
-                else all_reduce(hidden_states, group.tp_group)
-            )
+    if group.tp_size <= 1:
         return norm(hidden_states, residual)
-    hidden_states, residual, *_ = norm.forward_with_allreduce_fusion(
-        group.tp_rank, group.tp_group, hidden_states, residual
-    )
-    return hidden_states, residual
+    rows = hidden_states.shape[0]
+    if fused is not None and 0 < rows <= fused.max_rows and norm.weight_offset == 0:
+        from tokenspeed_kernel.ops.communication.iris import (
+            iris_lamport_residual_rmsnorm,
+        )
+
+        return iris_lamport_residual_rmsnorm(
+            fused, hidden_states, residual, norm.weight, norm.variance_epsilon
+        )
+    if (
+        allreduce_fusion
+        and ctx.input_num_tokens
+        <= global_server_args_dict["comm_fusion_max_num_tokens"]
+    ):
+        hidden_states, residual, *_ = norm.forward_with_allreduce_fusion(
+            group.tp_rank, group.tp_group, hidden_states, residual
+        )
+        return hidden_states, residual
+    return norm(draft_all_reduce(hidden_states, group.tp_group), residual)
 
 
 class DFlashDecoderLayer(nn.Module):
@@ -251,6 +271,9 @@ class DFlashDecoderLayer(nn.Module):
         self.self_attn = self.resolve_attn(add_prefix("self_attn", prefix))
         self.post_attention_layernorm = self.resolve_norm()
         self.mlp = self.resolve_mlp(add_prefix("mlp", prefix))
+        # The draft's prepared fusions, bound by the draft model.
+        self.fused_reduce_norm: LamportResidualRMSNorm | None = None
+        self.allreduce_fusion = False
 
     def resolve_norm(self) -> nn.Module:
         eps = float(getattr(self.config, "rms_norm_eps", 1e-6))
@@ -298,7 +321,13 @@ class DFlashDecoderLayer(nn.Module):
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = reduce_norm(
-                self.input_layernorm, hidden_states, residual, ctx, self.mapping.dense
+                self.input_layernorm,
+                hidden_states,
+                residual,
+                ctx,
+                self.mapping.dense,
+                self.fused_reduce_norm,
+                self.allreduce_fusion,
             )
 
         hidden_states = self.self_attn(
@@ -313,6 +342,8 @@ class DFlashDecoderLayer(nn.Module):
             residual,
             ctx,
             self.mapping.attn,
+            self.fused_reduce_norm,
+            self.allreduce_fusion,
         )
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
@@ -459,6 +490,9 @@ class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
             ]
         )
         self.norm = RMSNorm(int(config.hidden_size), eps=eps)
+        # The draft's prepared fusions (prepare_communication_runtime).
+        self.fused_reduce_norm: LamportResidualRMSNorm | None = None
+        self.allreduce_fusion = False
         target_layer_ids = (getattr(config, "dflash_config", {}) or {}).get(
             "target_layer_ids"
         ) or (getattr(config, "target_layer_ids", None) or [])
@@ -639,9 +673,94 @@ class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
         if residual is None:
             return self.norm(hidden_states)
         hidden_states, _ = reduce_norm(
-            self.norm, hidden_states, residual, ctx, self.mapping.dense
+            self.norm,
+            hidden_states,
+            residual,
+            ctx,
+            self.mapping.dense,
+            self.fused_reduce_norm,
+            self.allreduce_fusion,
         )
         return hidden_states
+
+    def prepare_communication_runtime(self, max_num_tokens: int) -> bool:
+        """Prepare the fusions of the draft's layer boundaries, before cache
+        sizing and graph capture: the draft's own reduce + norm, then the
+        fused all-reduce + norm's workspace over the draft's groups.
+
+        Args:
+            max_num_tokens: Most rows a forward carries.
+
+        Returns:
+            Whether the draft prepared anything.
+        """
+        prepared = self._prepare_fused_reduce_norm(max_num_tokens)
+        cap = int(global_server_args_dict["comm_fusion_max_num_tokens"])
+        groups = dict.fromkeys(
+            (self.mapping.dense.tp_group, self.mapping.attn.tp_group)
+        )
+        # Collective: every rank arms the same groups in order, or declines alike.
+        self.allreduce_fusion = cap > 0 and all(
+            len(group) > 1
+            and prepare_all_reduce_fusion(group, int(self.config.hidden_size), cap)
+            for group in groups
+        )
+        for layer in self.layers:
+            layer.allreduce_fusion = self.allreduce_fusion
+        return prepared or self.allreduce_fusion
+
+    def _prepare_fused_reduce_norm(self, max_num_tokens: int) -> bool:
+        """Prepare the fused reduce + norm of the draft's layer boundaries.
+
+        Collective: every rank prepares or declines alike, before cache
+        sizing and graph capture. Taken on gfx950 at TP4/TP8 for a BF16 draft
+        when the attention and dense groups are one group whose performance
+        route is Iris and whose all-reduce is already prepared (the
+        target's): the mailboxes come out of the headroom of the heap that
+        preparation sized, and an allocation past
+        it raises on every rank alike.
+
+        Args:
+            max_num_tokens: Most rows a forward carries; unused, the fused
+                path serves at most ``_FUSED_REDUCE_NORM_MAX_ROWS``.
+
+        Returns:
+            Whether the draft prepared anything.
+        """
+        del max_num_tokens
+        if self.fused_reduce_norm is not None:
+            return True
+        from tokenspeed_kernel.ops.communication.iris import (
+            iris_lamport_residual_rmsnorm_supported,
+            prepare_iris_lamport_residual_rmsnorm,
+        )
+
+        from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
+
+        mapping = self.mapping
+        group = mapping.attn.tp_group
+        backend = get_global_backend()
+        hidden_size = int(self.config.hidden_size)
+        # The kernel's predicate decides the device, group size and width.
+        if (
+            not iris_lamport_residual_rmsnorm_supported(
+                mapping.attn.tp_size, hidden_size, torch.bfloat16
+            )
+            or mapping.dense.tp_group != group
+            or self.fc.weight.dtype != torch.bfloat16
+            or not isinstance(backend, AutoBackend)
+            or not backend.can_prepare_all_reduce_buffers(group, torch.bfloat16)
+        ):
+            return False
+        all_reduce_state = backend.iris.state(group, torch.bfloat16)
+        if all_reduce_state is None:
+            return False
+        self.fused_reduce_norm = prepare_iris_lamport_residual_rmsnorm(
+            all_reduce_state, _FUSED_REDUCE_NORM_MAX_ROWS, hidden_size
+        )
+        for layer in self.layers:
+            layer.fused_reduce_norm = self.fused_reduce_norm
+        return True
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
