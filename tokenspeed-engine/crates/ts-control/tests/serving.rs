@@ -580,9 +580,9 @@ impl TransferPeer for FakePeer {
     }
 }
 
-/// EPD: a `lost-*` request's receive fails at its second poll, a `slow-*`
-/// one's lands after a hundred; the others' land after three polls, one more
-/// on each later rank. Each landed item takes one slot of eight.
+/// EPD: a `lost-*` request's receive fails at its second poll. Other
+/// requests land after three polls, one more on each later rank. Each
+/// landed item takes one slot of eight.
 struct FakeReceiver {
     rank: usize,
     staged: Vec<(String, Vec<EmbeddingItem>, usize)>,
@@ -604,8 +604,6 @@ impl EmbeddingReceiver for FakeReceiver {
                 *polls += 1;
                 let landed_at = if rid.starts_with("lost") {
                     return i64::from(*polls < 2);
-                } else if rid.starts_with("slow") {
-                    100
                 } else {
                     3 + rank
                 };
@@ -5370,8 +5368,8 @@ async fn memory_release_waits_for_the_host_stores_in_flight() {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_drain_cancels_the_requests_still_receiving_their_embeddings() {
+#[test]
+fn a_drain_cancels_the_requests_still_receiving_their_embeddings() {
     let release = ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
         rid: None,
         http_worker_ipc: None,
@@ -5383,7 +5381,16 @@ async fn a_drain_cancels_the_requests_still_receiving_their_embeddings() {
         tags: None,
     });
     for (drain, undo) in [(pause("wait"), resume()), (release, wake)] {
-        let engine = start_ranks_with(
+        let tag = drain.reply_tag();
+        let undo_tag = undo.reply_tag();
+        let mut script = vec![Vec::new(); 16];
+        script[0].push(EngineRequest::Add(Box::new(epd_request("pending"))));
+        // The receive lands on the third poll. Drain on the second round
+        // while it is pending, then resume once the receive has settled.
+        script[1].push(EngineRequest::Control(Box::new(drain)));
+        script[3].push(EngineRequest::Control(Box::new(undo)));
+        script[4].push(EngineRequest::Add(Box::new(epd_request("img-1"))));
+        let ranks = run_scripted(
             Layout::Single,
             1,
             Tiers::DeviceOnly,
@@ -5391,34 +5398,36 @@ async fn a_drain_cancels_the_requests_still_receiving_their_embeddings() {
                 epd_receive_enabled: true,
                 ..Setup::default()
             },
-        )
-        .await;
-        // The drain arrives while the request waits for its image's
-        // embeddings: it is not in the scheduler, so the drain must end it
-        // rather than answer with it staged until the resume.
-        let stream = engine.client.generate(epd_request("slow-0")).await.unwrap();
-        let tag = drain.tag();
-        let drained = control(&engine, drain).await;
-        assert_eq!(drained.len(), 1);
-        assert!(drained[0].1, "{tag}");
-        let chunks = tokio::time::timeout(Duration::from_secs(1), collect(stream))
-            .await
-            .unwrap_or_else(|_| panic!("{tag} answered while the request still waits"));
-        let last = chunks.last().unwrap();
-        assert_eq!(last.finish_reason.as_deref(), Some("abort"), "{tag}");
-        let details = &last.finish_details.as_ref().unwrap().0;
+            vec![script],
+            no_reaction,
+        );
+        let rank = &ranks[0];
+        assert_eq!(rank.outcome, Ok(()), "{tag}");
+        assert_eq!(
+            outcome(rank.replies.clone()),
+            [(tag, true), (undo_tag, true)]
+        );
+        let aborted = rank
+            .outputs
+            .iter()
+            .find(|output| output.rid == "pending")
+            .unwrap();
+        assert_eq!(aborted.finish_reason, Some("abort"), "{tag}");
+        assert!(aborted.output_ids.is_empty(), "{tag}");
+        let details = &aborted.finish_details.as_ref().unwrap().0;
         assert!(
             details
                 .iter()
                 .any(|(k, v)| k == "message" && *v == Value::from("Aborted by pause")),
             "{tag}: {details:?}"
         );
-        assert!(control(&engine, undo).await[0].1);
-        // The engine serves on.
-        assert_eq!(
-            tokens(&run(&engine.client, epd_request("img-1")).await),
-            [1000, 1001, 1002]
-        );
+        let recovered: Vec<_> = rank
+            .outputs
+            .iter()
+            .filter(|output| output.rid == "img-1")
+            .flat_map(|output| output.output_ids.iter().copied())
+            .collect();
+        assert_eq!(recovered, [1000, 1001, 1002], "{tag}");
     }
 }
 
