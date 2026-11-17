@@ -47,11 +47,53 @@ from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
 from tokenspeed.runtime.layers.attention.kv_cache.mha import MHATokenToKVPool
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+    FLAT_KV_PLANE,
     CacheFieldSpec,
     pack,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroupSpec
 from tokenspeed.runtime.layers.paged_attention import PagedAttention
+
+
+def test_legacy_flatkv_plane_keeps_native_padded_pages():
+    group = CacheGroupSpec("history", "full_history", 4, 2, replayable=False)
+    layout = pack(
+        (
+            (
+                group,
+                (
+                    CacheFieldSpec(
+                        "layer.0.global_kv",
+                        "flatkv",
+                        (4, 8),
+                        "uint8",
+                        exact_page_stride=False,
+                    ),
+                    CacheFieldSpec(
+                        "layer.0.tail",
+                        "flatkv",
+                        (8,),
+                        "uint8",
+                        exact_page_stride=False,
+                    ),
+                ),
+            ),
+        ),
+        prefix_granularity=8,
+        cache_blocks_per_lcm_block={group.group_id: 1},
+        alignment=1,
+        max_padding_fraction=float("inf"),
+    )
+    arena = CacheArena(layout.bind(2), "cpu", cache_group_specs=(group,))
+    field = arena.plan.field("layer.0.global_kv")
+    assert field.page_stride_bytes == 40
+    arena.buffer.fill_(238)
+    expected = arena.buffer.clone()
+    block = arena.plan.group(group.group_id).page_count - 1
+    arena.field(field.field_id)[block, 2].fill_(37)
+    offset = arena.plan.field_page_byte_offset(field.field_id, block) + 2 * 8
+    expected[offset : offset + 8].fill_(37)
+    torch.testing.assert_close(arena.buffer, expected, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize(
@@ -70,7 +112,7 @@ def test_flat_kv_pool_validates_atom_capacity_without_allocating(
     fields = tuple(
         CacheFieldSpec(
             f"layer.0.{name}",
-            "flatkv",
+            FLAT_KV_PLANE,
             (256, 1, 64),
             "bfloat16",
             exact_page_stride=False,
@@ -85,7 +127,7 @@ def test_flat_kv_pool_validates_atom_capacity_without_allocating(
                 (
                     CacheFieldSpec(
                         "layer.1.ssm",
-                        "flatkv",
+                        FLAT_KV_PLANE,
                         (1 << 20,),
                         "uint8",
                         exact_page_stride=False,
@@ -196,7 +238,7 @@ def test_flat_kv_gpu_store_reaches_original_field(dtype, kernel_page_size, graph
     fields = tuple(
         CacheFieldSpec(
             f"layer.{layer}.{name}",
-            "flatkv",
+            FLAT_KV_PLANE,
             (grain, heads, dim),
             storage_dtype,
             exact_page_stride=False,
@@ -287,10 +329,10 @@ def test_flat_kv_rejects_each_misaligned_page_even_when_the_span_aligns():
     group = CacheGroupSpec("full_attention", "full_history", 4, 1, replayable=False)
     fields = (
         CacheFieldSpec(
-            "layer.0.k", "flatkv", (4, 1, 4), "bfloat16", exact_page_stride=False
+            "layer.0.k", FLAT_KV_PLANE, (4, 1, 4), "bfloat16", exact_page_stride=False
         ),
         CacheFieldSpec(
-            "layer.0.extra", "flatkv", (2,), "bfloat16", exact_page_stride=False
+            "layer.0.extra", FLAT_KV_PLANE, (2,), "bfloat16", exact_page_stride=False
         ),
     )
     layout = pack(
@@ -500,8 +542,8 @@ def test_flat_kv_groups_gdn_layers_on_one_plane(kv_dtype):
         QWEN4_EXP_QSA_CACHE_GROUP,
         QWEN4_EXP_QSA_RECENT_CACHE_GROUP,
     }
-    assert tuple(p.plane_id for p in arena.plan.planes) == ("flatkv",)
-    assert {f.plane_id for f in arena.plan.fields} == {"flatkv"}
+    assert tuple(p.plane_id for p in arena.plan.planes) == (FLAT_KV_PLANE,)
+    assert {f.plane_id for f in arena.plan.fields} == {FLAT_KV_PLANE}
     assert {f.field_id: f.group_id for f in arena.plan.fields} == {
         field.field_id: (
             "linear_attention_0"
@@ -552,14 +594,14 @@ def test_qwen4_exp_default_cache_layout_respects_cli(flags, flat):
     recipe.server_args = prepare_server_args(["--model", "x", *flags])
     plan = recipe.setup().spec.memory_plan
     if flat:
-        assert {plane.plane_id for plane in plan.planes} == {"flatkv"}
+        assert {plane.plane_id for plane in plan.planes} == {FLAT_KV_PLANE}
         assert {
             group.group_id
             for group in plan.groups
             if group.group_id.startswith("linear_attention_")
         } == {"linear_attention_0"}
     else:
-        assert "flatkv" not in {plane.plane_id for plane in plan.planes}
+        assert FLAT_KV_PLANE not in {plane.plane_id for plane in plan.planes}
         assert len(plan.planes) > 1
 
 

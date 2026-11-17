@@ -39,8 +39,8 @@ if TYPE_CHECKING:
 _MAX_LCM_BLOCK_BYTES = (1 << 63) - 1
 _MAX_KERNEL_PAGE_ID = (1 << 31) - 1
 
-# Full-history fields on this plane use contiguous atom views and translated IDs.
-FLAT_KV_PLANE = "flatkv"
+# Atom-addressed history uses a distinct plane id from native byte-page layouts.
+FLAT_KV_PLANE = "flatkv_atoms"
 
 # Byte width per cache dtype name. This module stays torch-free (pure integer
 # geometry, and the plan travels the PD wire as JSON), so dtypes are named by

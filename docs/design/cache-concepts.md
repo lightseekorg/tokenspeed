@@ -2014,7 +2014,7 @@ every plane its layers' fields touch, so a field on a plane that no other layer
 of its stage uses costs that stage the whole plane.
 
 By default, all Qwen4-Exp target and draft cache fields share one
-`flatkv` plane (PP=1, uniform per-view K/V heads, no MXFP8). All GDN layers
+`flatkv_atoms` plane (PP=1, uniform per-view K/V heads, no MXFP8). All GDN layers
 form one state group, with each layer's SSM and convolution fields together.
 Qwen3.8-Flash-Next has five groups: full attention, GDN state, PLE, compressed
 QSA and recent QSA. `--no-qwen4-exp-flat-kv` selects the ordinary layout,
@@ -2024,8 +2024,10 @@ packing full-attention K/V. Each other group packs as many pages as its
 payload and stride alignment permit. A parent still belongs to one group at
 a time; sharing the plane does not mix their allocation or prefix matching.
 
-The plane id explicitly selects contiguous atom views for full-history
-fields: both K/V and compressed QSA. State, PLE and recent QSA retain raw
+The `flatkv_atoms` plane id explicitly selects contiguous atom views for
+full-history fields: both K/V and compressed QSA. Native byte-page layouts
+such as DeepSeek V4.1 keep their `flatkv` plane and explicit page strides.
+State, PLE and recent QSA retain raw
 scheduler IDs and explicit page strides. Other padded K/V fields, including
 sink-enabled SWA, retain page-indexed views with ordinary kernel-subpage
 translation. Padding alone never selects FlatKV.

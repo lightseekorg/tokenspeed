@@ -32,7 +32,9 @@ never writes it; padded outputs are ignored.
 Decode and verify registrations for Triton, CuTe DSL, Gluon and FlashInfer
 accept `strided_state=True` within their existing execution contracts. The
 operator derives this trait from both state pools, and runtime capability
-queries include the bound input pool's layout. FlashInfer 0.7.4 uses native
+queries include the bound input pool's layout. Decode benchmark generators
+allocate contiguous state rows and select with `strided_state=False`, matching
+the operator's dispatch for those inputs. FlashInfer 0.7.4 uses native
 4D pool indexing for padded FP32 state, including final-state writeback and
 per-token scatter; its BF16 MTP path also preserves padded pool strides.
 The CuTe DSL WY leaf remains output-only, and FlashInfer MTP still writes

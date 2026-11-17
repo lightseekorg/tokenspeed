@@ -53,6 +53,27 @@ FULL = "full_attention"
 SWA = "sliding_attention"
 
 
+@pytest.mark.parametrize("width", [1, 16])
+def test_beam_mixed_fixture_uses_bound_pool_page_geometry(width):
+    from test.runtime.test_beam_triton_attention import (
+        _runtime_mixed_round,
+        _RuntimeMixedAttention,
+    )
+
+    harness = _RuntimeMixedAttention(width, device="cpu")
+    description = _runtime_mixed_round(
+        width, larger=False, all_fresh=False, first_prefix=0
+    )
+    harness.prepare(description, seed=23)
+    length = description[3][-1]
+    positions = torch.arange(length - width, length)
+    for gid in harness.groups:
+        raw_pages = harness.tables[gid][-1, positions // 16].to(torch.int64)
+        expected = raw_pages * 16 + positions % 16
+        actual = harness.router.decode_write_locations.by_group[gid][-width:]
+        torch.testing.assert_close(actual.to(torch.int64), expected, atol=0, rtol=0)
+
+
 class TestWriteLocationMathTest:
     """The slot rule over stacked tables, on CPU (the reference)."""
 

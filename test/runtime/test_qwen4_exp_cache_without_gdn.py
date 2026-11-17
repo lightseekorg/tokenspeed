@@ -57,7 +57,10 @@ from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
     qwen4_exp_ple_context_field,
     qwen4_exp_ple_conv_field,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import pack
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+    FLAT_KV_PLANE,
+    pack,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.qwen4_exp import (
     Qwen4ExpRecipe,
 )
@@ -436,7 +439,7 @@ def test_flat_kv_atom_pages_resolve_to_the_original_field_bytes(
     plan = arena.plan
     kv_ids = {f"layer.{layer}.{name}" for layer in range(2) for name in ("k", "v")}
     assert {field.plane_id for field in plan.fields if field.field_id in kv_ids} == {
-        "flatkv"
+        FLAT_KV_PLANE
     }
 
     granularity = plan.prefix_granularity
@@ -532,7 +535,7 @@ def test_flat_kv_rejects_pipeline_parallelism() -> None:
     with pytest.raises(NotImplementedError, match=r"PP=1.*--no-qwen4-exp-flat-kv"):
         recipe.setup()
     recipe.server_args.qwen4_exp_flat_kv = False
-    assert "flatkv" not in {
+    assert FLAT_KV_PLANE not in {
         plane.plane_id for plane in recipe.setup().spec.memory_plan.planes
     }
 
@@ -560,6 +563,6 @@ def test_flat_kv_rejects_mxfp8_draft_scale_addressing() -> None:
     ):
         recipe.setup()
     recipe.server_args.qwen4_exp_flat_kv = False
-    assert "flatkv" not in {
+    assert FLAT_KV_PLANE not in {
         plane.plane_id for plane in recipe.setup().spec.memory_plan.planes
     }

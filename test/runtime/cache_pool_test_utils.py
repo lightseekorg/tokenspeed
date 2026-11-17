@@ -153,7 +153,7 @@ def make_mha_pool_for_groups(
     """Build a small real MHA pool publishing the supplied group contracts.
 
     Each history group gets one layer's K/V fields; state groups get a state
-    field. Sixteen parents cover the page IDs used by metadata tests.
+    field. Thirty-two parents cover the page IDs used by metadata tests.
     """
     grain = math.lcm(
         *(
@@ -193,7 +193,7 @@ def make_mha_pool_for_groups(
         alignment=1,
         max_padding_fraction=float("inf"),
     )
-    arena = CacheArena(layout.bind(16), device, cache_group_specs=cache_group_specs)
+    arena = CacheArena(layout.bind(32), device, cache_group_specs=cache_group_specs)
     return MHATokenToKVPool(arena, torch.float16, 1, 1, len(cache_group_specs), 0)
 
 
