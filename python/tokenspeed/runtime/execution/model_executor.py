@@ -623,7 +623,7 @@ class ModelExecutor:
         self.device = config.device
         self.config = config
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=config.enable_memory_saver
+            enable=config.enable_memory_saver, device=config.device
         )
         self.model_runner = model_runner
         self.sampling_backend = sampling_backend
@@ -1124,6 +1124,16 @@ class ModelExecutor:
                     ),
                     observer=observer,
                 )
+
+        if self.device == "npu" and self.config.enable_memory_saver:
+            models = [("target", self.model_runner.model)]
+            if self._draft_model_runner is not None:
+                models.append(("draft", self._draft_model_runner.model))
+            self.model_runner.memory_saver_adapter.validate_startup(
+                models=models,
+                kv_regions=self.token_to_kv_pool.arena.regions,
+                graphs=self.forward_step.graphs.values(),
+            )
 
     @property
     def captures_drafter_prefill_graph(self) -> bool:

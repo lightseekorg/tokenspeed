@@ -24,6 +24,7 @@ from abc import ABC
 from collections.abc import Callable
 from contextlib import contextmanager
 from contextvars import ContextVar
+from typing import ClassVar
 
 import torch
 
@@ -34,17 +35,21 @@ _NAMED_REGION_POOLS = {
     "workspace": "persistent_buffers",
 }
 
-try:
-    import torch_memory_saver
+# PTA uses a CPU Torch build. Keep its allocator independent of CUDA libraries.
+if not (
+    hasattr(torch, "npu") and torch.version.cuda is None and torch.version.hip is None
+):
+    try:
+        import torch_memory_saver
 
-    _primary_memory_saver = torch_memory_saver.TorchMemorySaver()
-    # A separate CUDA MemPool prevents allocator block reuse from mixing
-    # discardable weights/KV with persistent runtime buffers that must survive sleep.
-    _buffer_memory_savers = {
-        "persistent_buffers": torch_memory_saver.TorchMemorySaver()
-    }
-except ImportError:
-    pass
+        _primary_memory_saver = torch_memory_saver.TorchMemorySaver()
+        # A separate CUDA MemPool prevents allocator block reuse from mixing
+        # discardable weights/KV with persistent runtime buffers that must survive sleep.
+        _buffer_memory_savers = {
+            "persistent_buffers": torch_memory_saver.TorchMemorySaver()
+        }
+    except ImportError:
+        pass
 
 
 _active_buffer_pool: ContextVar[object | None] = ContextVar(
@@ -70,12 +75,49 @@ def initialize_communication(operation: Callable[[], None]) -> None:
         pending.append(operation)
 
 
+@contextmanager
+def _defer_communication_initializers():
+    pending: list[Callable[[], None]] = []
+    token = _communication_initializers.set(pending)
+    try:
+        yield
+    finally:
+        _communication_initializers.reset(token)
+    # A failed load never initializes communication. Callbacks run only after
+    # the managed allocator scope has exited.
+    for operation in pending:
+        operation()
+
+
 class TorchMemorySaverAdapter(ABC):
+    # Startup reads the selected class without constructing an allocator.
+    supports_replica_memory_transitions: ClassVar[bool] = False
+
     @staticmethod
-    def create(enable: bool):
-        return (
-            _TorchMemorySaverAdapterReal() if enable else _TorchMemorySaverAdapterNoop()
-        )
+    def adapter_class(enable: bool, *, device: str) -> type["TorchMemorySaverAdapter"]:
+        """Select the backend class without allocating or initializing a device."""
+        if not enable:
+            return _TorchMemorySaverAdapterNoop
+        if device.split(":", 1)[0] == "npu":
+            from tokenspeed.runtime.utils.ascend_memory_saver_adapter import (
+                AscendMemorySaverAdapter,
+            )
+
+            return AscendMemorySaverAdapter
+        return _TorchMemorySaverAdapterReal
+
+    @staticmethod
+    def create(enable: bool, *, device: str) -> "TorchMemorySaverAdapter":
+        adapter = TorchMemorySaverAdapter.adapter_class(enable, device=device)
+        if (
+            adapter is _TorchMemorySaverAdapterReal
+            and torch.version.cuda is None
+            and torch.version.hip is None
+        ):
+            raise RuntimeError(
+                "CUDA memory saver requires a CUDA or ROCm PyTorch build"
+            )
+        return adapter()
 
     def configure_subprocess(self):
         raise NotImplementedError

@@ -40,7 +40,10 @@ use std::{
     time::Duration,
 };
 
-use pyo3::{prelude::*, types::PyBytes};
+use pyo3::{
+    prelude::*,
+    types::{PyBytes, PyDict},
+};
 use ts_collective::{Group, Listener, Mesh};
 use ts_control::{
     batch_log::BatchLogConfig,
@@ -77,6 +80,10 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 /// How long the host waits for the frontend's INIT and for the other ranks
 /// to connect.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(600);
+
+// Protocol 3 extends weight-load agreement with replica-wide memory transitions.
+const WEIGHT_UPDATE_PROTOCOL: u32 = 2;
+const WEIGHT_UPDATE_WITH_MEMORY_TRANSITIONS_PROTOCOL: u32 = 3;
 
 /// Collective group ids. Replicas are disjoint, and so are pipelines, so each
 /// kind shares one id.
@@ -438,6 +445,7 @@ impl HostConfig {
         config: &Bound<'_, PyAny>,
         requires_bootstrap: bool,
         role: Role,
+        replica_memory_transitions: bool,
     ) -> PyResult<Self> {
         let l3 = {
             let l3 = config.getattr("l3")?;
@@ -525,6 +533,7 @@ impl HostConfig {
             collective_bind_host: config.getattr("collective_bind_host")?.extract()?,
             controls: ControlConfig {
                 memory_saver: config.getattr("memory_saver")?.extract()?,
+                replica_memory_transitions,
                 memory_regions: config.getattr("memory_regions")?.extract()?,
                 // With L3, the namespace's weight version.
                 l3_weight_version: l3.as_ref().map(|l3| l3.weight_version.clone()),
@@ -645,22 +654,70 @@ fn watch_signals(stop: Arc<AtomicBool>) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Select the rank's memory protocol before Python initializes the device.
+fn bootstrap_worker<'py>(
+    runtime: &Bound<'py, pyo3::types::PyModule>,
+    control_fd: i32,
+    outbox: &Bound<'py, PyAny>,
+    host_spans: &Bound<'py, PyAny>,
+) -> PyResult<(Bound<'py, PyAny>, bool)> {
+    let py = runtime.py();
+    let prepare = match runtime.getattr("prepare_bootstrap") {
+        Ok(prepare) => prepare,
+        // Old Python still owns the launch pipe and understands weight protocol 2.
+        Err(error) if error.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) => {
+            let bootstrap = runtime.getattr("bootstrap")?;
+            // Check the signature before the call consumes the launch pipe.
+            let parameters = py
+                .import("inspect")?
+                .call_method1("signature", (&bootstrap,))?
+                .getattr("parameters")?;
+            let worker = if parameters.contains("host_spans")? {
+                bootstrap.call1((control_fd, outbox, WEIGHT_UPDATE_PROTOCOL, host_spans))?
+            } else {
+                bootstrap.call1((control_fd, outbox, WEIGHT_UPDATE_PROTOCOL))?
+            };
+            return Ok((worker, false));
+        }
+        Err(error) => return Err(error),
+    };
+    // This entry point requires checked startup. Do not retry a failed call:
+    // it may already have consumed the launch pipe.
+    let options = PyDict::new(py);
+    options.set_item("validate_memory_protocol", true)?;
+    let prepared = prepare.call((control_fd,), Some(&options))?;
+    let (replica_memory_transitions, start): (bool, Py<PyAny>) = prepared.extract()?;
+    let protocol = if replica_memory_transitions {
+        WEIGHT_UPDATE_WITH_MEMORY_TRANSITIONS_PROTOCOL
+    } else {
+        WEIGHT_UPDATE_PROTOCOL
+    };
+    let bootstrap = start.bind(py).call1((outbox, protocol, host_spans))?;
+    Ok((bootstrap, replica_memory_transitions))
+}
+
 fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
     let stop = Arc::new(AtomicBool::new(false));
     watch_signals(stop.clone())?;
 
-    let (bootstrap, outbox, mode) = Python::attach(|py| {
+    let (bootstrap, outbox, mode, replica_memory_transitions) = Python::attach(|py| {
         let built = (|| {
             let outbox = Bound::new(py, pd::Outbox::new())?;
             let host_spans = Bound::new(py, host_spans::HostSpans)?;
-            let bootstrap = py
-                .import("tokenspeed.runtime.engine.rust_host")?
-                .call_method1(
-                    "bootstrap",
-                    (args.control_fd, outbox.clone(), 2_u32, host_spans),
-                )?;
+            let runtime = py.import("tokenspeed.runtime.engine.rust_host")?;
+            let (bootstrap, replica_memory_transitions) = bootstrap_worker(
+                &runtime,
+                args.control_fd,
+                outbox.as_any(),
+                host_spans.as_any(),
+            )?;
             let mode: String = bootstrap.getattr("mode")?.extract()?;
-            Ok((bootstrap.unbind(), outbox.unbind(), mode))
+            Ok((
+                bootstrap.unbind(),
+                outbox.unbind(),
+                mode,
+                replica_memory_transitions,
+            ))
         })();
         built.map_err(|error| python_error(py, error))
     })?;
@@ -696,7 +753,12 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
                 transfer_metrics,
             )?;
             let role = peers.role;
-            let config = HostConfig::from_python(&python_config, peers.transfer.is_some(), role)?;
+            let config = HostConfig::from_python(
+                &python_config,
+                peers.transfer.is_some(),
+                role,
+                replica_memory_transitions,
+            )?;
             let data_plane = bootstrap.getattr("data_plane")?.unbind();
             Ok((
                 bootstrap.unbind(),
@@ -937,8 +999,13 @@ fn finish_serving(
 
 /// Run one rank on the calling (main) thread and exit without Python finalization.
 #[pyfunction]
-fn run_host(py: Python<'_>, control_fd: i32, enable_async_logging: bool) -> PyResult<()> {
-    py.detach(|| {
+fn run_host(
+    py: Python<'_>,
+    control_fd: i32,
+    enable_async_logging: bool,
+    restore_gil_for_exit: bool,
+) -> PyResult<()> {
+    let code = py.detach(|| {
         let args = Args {
             control_fd,
             enable_async_logging,
@@ -963,8 +1030,14 @@ fn run_host(py: Python<'_>, control_fd: i32, enable_async_logging: bool) -> PyRe
         // process::exit skips Rust drops and Python finalization. Drain native
         // logging explicitly; stuck Python threads must not keep a rank alive.
         drop(log_guard);
-        std::process::exit(code)
-    })
+        if !restore_gil_for_exit {
+            std::process::exit(code);
+        }
+        code
+    });
+    // Returning through detach restores the calling Python thread's saved
+    // state and GIL before native Ascend exit handlers can release objects.
+    std::process::exit(code)
 }
 
 /// The rank's native control loop and its single scheduler implementation.

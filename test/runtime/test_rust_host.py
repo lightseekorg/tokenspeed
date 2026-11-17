@@ -109,7 +109,9 @@ def test_bootstrap_preserves_gpu_spacing(monkeypatch):
     )
     host = HostBootstrap.__new__(HostBootstrap)
     with pytest.raises(FileNotFoundError, match="model weights unavailable"):
-        host.__init__(args, None, None, None, None, None)
+        host.__init__(
+            args, None, None, None, None, None, replica_memory_transitions=False
+        )
     assert host._gpu_id == 3
 
 
@@ -192,9 +194,10 @@ def _rank_args(rank: int) -> tuple[ServerArgs, PortArgs]:
     return server_args, PortArgs.init_new(server_args)
 
 
+@pytest.mark.parametrize("device", ["cuda", "npu"])
 @pytest.mark.parametrize("enable_async_logging", [False, True])
 def test_the_launcher_hands_a_host_its_rank_and_hears_it_ready(
-    tmp_path, enable_async_logging
+    tmp_path, enable_async_logging, device
 ):
     binary = _fake_host(
         tmp_path,
@@ -202,11 +205,20 @@ def test_the_launcher_hands_a_host_its_rank_and_hears_it_ready(
         server_args, port_args, relay = connection.recv()
         connection.send({"status": "ready", "rank": server_args.mapping.rank,
                          "python": python, "relay": relay,
-                         "async_logging": args["--enable-async-logging"]})
+                         "async_logging": args["--enable-async-logging"],
+                         "restore_gil": args.get("--restore-gil-for-exit")})
         time.sleep(600)
         """,
     )
-    server_args, port_args = _rank_args(3)
+    server_args = ServerArgs(
+        model="x",
+        device=device,
+        disable_prefill_graph=device == "npu",
+        disable_pdl=device == "npu",
+        enable_memory_saver=False,
+    )
+    server_args.mapping.rank = 3
+    port_args = PortArgs.init_new(server_args)
     server_args.enable_async_logging = enable_async_logging
     proc, reader = start_rust_host(
         binary, server_args, port_args, nullcontext(), "ipc:///tmp/relay", False
@@ -219,6 +231,7 @@ def test_the_launcher_hands_a_host_its_rank_and_hears_it_ready(
             "python": sys.executable,
             "relay": "ipc:///tmp/relay",
             "async_logging": str(enable_async_logging).lower(),
+            "restore_gil": "true" if device == "npu" else None,
         }
         assert proc.is_alive() and proc.exitcode is None
     finally:
@@ -571,6 +584,7 @@ def _data_plane(handle: DeviceHandle) -> HostDataPlane:
         max_encoder_tokens=None,
         attn_tp_cpu_group=None,
         epd_publisher=None,
+        replica_memory_transitions=False,
         starting=False,
     )
 

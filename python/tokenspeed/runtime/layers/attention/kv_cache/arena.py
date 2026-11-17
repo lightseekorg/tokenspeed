@@ -171,7 +171,7 @@ class CacheArena:
         # sleep and rebuilt after wake (paging overwrites; clear() zeros the
         # remapped pages).
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=enable_memory_saver
+            enable=enable_memory_saver, device=device
         )
         self.storage_plan = storage_plan or plan_cache_storage(
             plan,

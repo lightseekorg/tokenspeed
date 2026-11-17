@@ -730,6 +730,8 @@ requests never register one. An empty memory-resume request is a successful
 no-op while a drain is pending; it preserves that drain's admission hold
 until the owning pause or memory-release operation finishes.
 
+The following memory-release and NCCL coordination uses protocol 2.
+
 With attention DP, memory release waits for every rank to stop admissions
 and drain its requests, forwards, cancelled embedding receives, cache copies,
 transfers and queued weight operations. A locally drained rank keeps joining
@@ -753,6 +755,29 @@ Until all regions are restored on every rank, it withholds forward permission
 through the scheduler's storage tick and suppresses idle forwards. This covers
 staggered and partial resumes without building a batch that cannot execute;
 control operations and cache acknowledgments continue to progress.
+
+**Coordinated memory transitions (protocol 3)** extend the same control gate
+from 12 columns under protocol 2 to 15. The three added values coordinate
+call readiness, cancellation and timeout over the replica, or the existing
+attention-DP domain when present, including shared MoE TP/EP. All members
+must match direction, canonical tags and any transition ID before pause or
+allocator changes. Normal and idle forwards can progress while a call waits
+for missing participants. Cancellation and timeout refuse the whole observed
+batch at that gate; cancellation preserves the current device mappings.
+
+Release checks device prerequisites before its drain and again after the
+domain drains requests, forwards, cache work and PD transfers. Every stage
+must retire its KV transfers before source KV is released. Readiness is MIN-reduced directly
+over this domain. All members must report L1 clearability before any index
+is cleared; resume checks local prerequisites, including valid weights before
+KV wake. Successful tags and replies are published only after every member
+confirms device completion. A device-apply failure or L1-clear failure after
+readiness agreement is fatal to the entire domain through the host failure
+path, including otherwise healthy ranks; deployment supervision owns recovery.
+
+Protocol selection, startup compatibility, the timeout/retry contract and
+NCCL participation requirements are defined in the
+[memory-transition serving contract](../serving/ascend-memory-saver.md#memory-transition-protocol).
 
 **The same-round gate** (`EventLoop::gate`, every round on every rank).
 Weight-update `flush_cache` and a standalone flush first MAX-reduce

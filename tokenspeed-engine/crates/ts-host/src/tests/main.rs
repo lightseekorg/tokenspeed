@@ -454,3 +454,68 @@ trace_provider = resolve
         modules.del_item("ts_context_test").unwrap();
     });
 }
+
+#[test]
+fn bootstrap_selects_the_memory_protocol_for_the_rank() {
+    use pyo3::{
+        prelude::*,
+        types::{PyModule, PyString},
+    };
+
+    run_in_child(
+        "tests::bootstrap_selects_the_memory_protocol_for_the_rank",
+        || {
+            Python::initialize();
+            Python::attach(|py| {
+                let outbox = PyString::new(py, "outbox");
+                let spans = PyString::new(py, "host spans");
+                // Keep legacy three/four-argument entry points and prepared
+                // capability negotiation on the actual bootstrap_worker boundary.
+                let legacy = c"def bootstrap(fd, outbox, protocol): return (fd, outbox, protocol)";
+                let legacy_profiled = c"def bootstrap(fd, outbox, protocol, host_spans=None): return (fd, outbox, protocol, host_spans)";
+                let prepared = c"def prepare_bootstrap(fd, *, validate_memory_protocol):\n    return validate_memory_protocol and replica_memory_transitions, lambda outbox, protocol, host_spans: (fd, outbox, protocol, host_spans)";
+                for (source, capability, profiled) in [
+                    (legacy, false, false),
+                    (legacy_profiled, false, true),
+                    (prepared, false, true),
+                    (prepared, true, true),
+                ] {
+                    let module =
+                        PyModule::from_code(py, source, c"bootstrap_test.py", c"bootstrap_test")
+                            .unwrap();
+                    module
+                        .setattr("replica_memory_transitions", capability)
+                        .unwrap();
+                    let (worker, enabled) =
+                        super::bootstrap_worker(&module, 7, outbox.as_any(), spans.as_any())
+                            .unwrap();
+                    assert_eq!(enabled, capability);
+                    let protocol = if capability { 3 } else { 2 };
+                    if profiled {
+                        assert_eq!(
+                            worker.extract::<(i32, String, u32, String)>().unwrap(),
+                            (7, "outbox".to_owned(), protocol, "host spans".to_owned()),
+                        );
+                    } else {
+                        assert_eq!(
+                            worker.extract::<(i32, String, u32)>().unwrap(),
+                            (7, "outbox".to_owned(), protocol),
+                        );
+                    }
+                }
+                for source in [
+                    c"def prepare_bootstrap(fd, *, validate_memory_protocol):\n    raise TypeError('prepare consumed the pipe')\ndef bootstrap(*args):\n    raise AssertionError('must not retry the consumed pipe')",
+                    c"def prepare_bootstrap(fd):\n    raise AssertionError('unchecked entry must not run')\ndef bootstrap(*args):\n    raise AssertionError('must not downgrade an incompatible prepare')",
+                ] {
+                    let module = PyModule::from_code(
+                        py, source, c"broken_bootstrap.py", c"broken_bootstrap",
+                    ).unwrap();
+                    let error = super::bootstrap_worker(
+                        &module, 7, outbox.as_any(), spans.as_any(),
+                    ).unwrap_err();
+                    assert!(error.is_instance_of::<pyo3::exceptions::PyTypeError>(py));
+                }
+            });
+        },
+    );
+}

@@ -34,7 +34,7 @@ use std::{
         Arc, Mutex, Once, PoisonError,
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use pyo3::{prelude::*, types::PyDict};
@@ -58,7 +58,7 @@ use ts_control::{
 };
 use ts_l3::{
     monotonic_clock, Executor, ExecutorConfig, GroupLayout, HostBuffer, HostLayout, IoResult,
-    Namespace, Range, Store, StoreError,
+    MemoryStore, Namespace, Range, Store, StoreError,
 };
 use ts_pd::{
     BootstrapInfo, EmbeddingItem, EmbeddingReceiver, LandedItem, LandedRequest, PdError, PdEvent,
@@ -68,10 +68,11 @@ use ts_scheduler::{
     profile, CacheEvent, CacheEventKind, CacheOpKind, CacheOpView, ExecutionPlan, Scheduler,
 };
 use ts_wire::{
-    codec::Dict,
+    codec::{Dict, StrOrList},
     control::{
-        FlushCacheReqInput, IsSchedulerPausedReqInput, IsSleepingReqInput, PauseSchedulerReqInput,
-        ProfileReq, ReleaseMemoryOccupationReqInput, ReloadForwardReqInput,
+        FlushCacheReqInput, GetSharedPrefixPublicationReqInput,
+        GetSharedPrefixPublicationReqOutput, IsSchedulerPausedReqInput, IsSleepingReqInput,
+        PauseSchedulerReqInput, ProfileReq, ReleaseMemoryOccupationReqInput, ReloadForwardReqInput,
         ResumeMemoryOccupationReqInput, ResumeSchedulerReqInput, UpdateWeightFromDiskReqInput,
         PROFILE_START,
     },
@@ -297,6 +298,8 @@ struct FakeDevice {
     released: Arc<Mutex<Vec<(String, i32)>>>,
     /// Every plan run, in order.
     plans: Arc<Mutex<Vec<ExecutedPlan>>>,
+    /// Every prefill row's request ID and matching prefix length.
+    prefill_prefixes: Arc<Mutex<Vec<(String, i32)>>>,
     /// Cache ops run and not acknowledged yet, in the order they ran, each
     /// with the polls it still waits.
     unacknowledged: Vec<(usize, CacheOpView)>,
@@ -333,6 +336,12 @@ struct FakeDevice {
     /// The rank's load prerequisites refuse (weights released, KV still
     /// resident); a test clears it before retrying.
     weight_load_refused: Arc<AtomicBool>,
+    /// Model a discard-policy prerequisite on one rank.
+    discard_memory: bool,
+    /// Inject a device error after release was admitted.
+    fail_memory_release: bool,
+    /// Inject a device error after wake was admitted.
+    fail_memory_resume: bool,
     /// EPLB: this rank's EP rank, which skews the load it counts.
     ep_rank: usize,
     /// EPLB: the placement the experts sit in, as the routing tables say.
@@ -737,6 +746,12 @@ impl DataPlane for FakeDevice {
         let Some(batch) = forward else {
             return Ok(None);
         };
+        self.prefill_prefixes.lock().unwrap().extend(
+            batch.request_ids[..batch.num_extends]
+                .iter()
+                .cloned()
+                .zip(batch.extend_prefix_lens.iter().copied()),
+        );
         thread::sleep(FORWARD_TIME);
         let mut result = ForwardResult::default();
         for (i, rid) in batch.request_ids.iter().enumerate() {
@@ -863,12 +878,35 @@ impl DataPlane for FakeDevice {
         Ok((true, "Succeeded".to_owned()))
     }
 
+    fn check_memory_transition(
+        &mut self,
+        tags: &[String],
+        release: bool,
+    ) -> Result<(bool, String), DataPlaneError> {
+        if self.discard_memory {
+            if release && tags == ["weights"] {
+                return Ok((false, "release KV before discarding weights".to_owned()));
+            }
+            if !release
+                && tags.iter().any(|tag| tag == "kv_cache")
+                && self.weight_commits.lock().unwrap().last() != Some(&true)
+            {
+                return Ok((false, "weights have not been committed".to_owned()));
+            }
+        }
+        Ok((true, String::new()))
+    }
+
     fn release_memory(&mut self, tags: &[String]) -> Result<(), DataPlaneError> {
         self.device_ops
             .lock()
             .unwrap()
             .push(format!("release {}", tags.join(",")));
-        Ok(())
+        if self.fail_memory_release {
+            Err(DataPlaneError("injected memory release failure".to_owned()))
+        } else {
+            Ok(())
+        }
     }
 
     fn reload_forward(&mut self, op: &ControlRequest) -> Result<(bool, String), DataPlaneError> {
@@ -881,7 +919,11 @@ impl DataPlane for FakeDevice {
             .lock()
             .unwrap()
             .push(format!("resume {}", tags.join(",")));
-        Ok(())
+        if self.fail_memory_resume {
+            Err(DataPlaneError("injected memory resume failure".to_owned()))
+        } else {
+            Ok(())
+        }
     }
 
     fn attach_grammars(
@@ -999,6 +1041,8 @@ struct ScriptedStore {
     gate: Arc<Gate>,
     queries: Arc<Mutex<usize>>,
     gets: Arc<Mutex<usize>>,
+    /// Use the real in-memory store when a test needs publication and deletion.
+    memory: Option<Arc<MemoryStore>>,
 }
 
 impl Store for ScriptedStore {
@@ -1009,16 +1053,22 @@ impl Store for ScriptedStore {
     fn batch_exists(&self, keys: &[String]) -> Result<Vec<bool>, StoreError> {
         *self.queries.lock().unwrap() += 1;
         self.gate.pass();
+        if let Some(memory) = &self.memory {
+            return memory.batch_exists(keys);
+        }
         Ok(vec![true; keys.len()])
     }
 
     fn batch_get_into(
         &self,
         keys: &[String],
-        _: HostBuffer,
-        _: &[Range],
+        host: HostBuffer,
+        ranges: &[Range],
     ) -> Result<IoResult, StoreError> {
         *self.gets.lock().unwrap() += 1;
+        if let Some(memory) = &self.memory {
+            return memory.batch_get_into(keys, host, ranges);
+        }
         let landed = self.landed.unwrap_or(keys.len());
         Ok(IoResult {
             success: (0..keys.len()).map(|key| key < landed).collect(),
@@ -1030,9 +1080,12 @@ impl Store for ScriptedStore {
     fn batch_put_from(
         &self,
         keys: &[String],
-        _: HostBuffer,
-        _: &[Range],
+        host: HostBuffer,
+        ranges: &[Range],
     ) -> Result<IoResult, StoreError> {
+        if let Some(memory) = &self.memory {
+            return memory.batch_put_from(keys, host, ranges);
+        }
         Ok(IoResult {
             success: vec![true; keys.len()],
             retired: true,
@@ -1040,8 +1093,10 @@ impl Store for ScriptedStore {
         })
     }
 
-    fn remove_by_prefix(&self, _: &str) -> bool {
-        true
+    fn remove_by_prefix(&self, prefix: &str) -> bool {
+        self.memory
+            .as_ref()
+            .is_none_or(|memory| memory.remove_by_prefix(prefix))
     }
 
     fn close(&self) {}
@@ -1131,6 +1186,9 @@ enum Layout {
     TpKvp(usize, usize),
     /// This many attention-DP ranks, one scheduler and frontend each.
     Dp(usize),
+    /// One scheduler and frontend per attention-DP replica, with its plan
+    /// mirrored on each of the replica's attention-TP ranks.
+    TpDp { tp: usize, dp: usize },
     /// One scheduler mirrored on this many pipeline stages; the last samples.
     Pp(usize),
 }
@@ -1287,15 +1345,30 @@ struct Setup {
     l3_landed_keys: Option<fn(usize) -> usize>,
     /// L3: the stores' queries wait until the test opens their gates.
     l3_held_queries: bool,
+    /// Share a real store across the L3 executors instead of scripted hits.
+    l3_memory_store: Option<Arc<MemoryStore>>,
     /// The polls each rank's cache ops wait after the first before they are
     /// acknowledged; none when unset.
     cache_ack_polls: Option<fn(usize) -> usize>,
     /// The devices acknowledge no cache op until the test opens their gates.
     held_cache_acks: bool,
+    /// Give only this rank a write-through Host cache to exercise a
+    /// rank-local finish store with a real scheduler.
+    host_l2_rank: Option<usize>,
     /// A rank whose device refuses a weight load.
     weight_update_failure_rank: Option<usize>,
     /// The ranks whose load prerequisites refuse until the test clears them.
     weight_load_refused: Option<fn(usize) -> bool>,
+    /// A rank with discard-policy preflight requirements.
+    discard_memory_rank: Option<usize>,
+    /// Agree memory transitions across ranks that share device work.
+    replica_memory_transitions: bool,
+    /// Advertise the Ascend graph region beside the shared KV arena.
+    ascend_graph: bool,
+    /// A rank that fails after memory release begins.
+    memory_release_failure_rank: Option<usize>,
+    /// A rank that fails after memory resume begins.
+    memory_resume_failure_rank: Option<usize>,
     /// The requests each engine serves itself before its frontend attaches,
     /// [`STARTUP_OUTPUT_TOKENS`] each.
     startup: Vec<startup::Phase>,
@@ -1310,6 +1383,7 @@ impl Layout {
             Layout::Single => (1, 1, 1),
             Layout::Tp(size) | Layout::TpKvp(size, _) | Layout::Pp(size) => (size, size, 1),
             Layout::Dp(size) => (size, 1, size),
+            Layout::TpDp { tp, dp } => (tp * dp, tp, dp),
         }
     }
 }
@@ -1318,6 +1392,13 @@ impl Layout {
 fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopConfig {
     let pd = setup.pd.as_ref();
     let kv_total_pages = setup.device_pages.map_or(512, |pages| pages as i64 - 1);
+    let mut memory_regions = vec!["kv_cache".to_owned(), "weights".to_owned()];
+    if setup.nccl_suspendable {
+        memory_regions.push("nccl".to_owned());
+    }
+    if setup.ascend_graph {
+        memory_regions.push("acl_graph".to_owned());
+    }
     LoopConfig {
         in_flight_depth,
         limits: IngressLimits {
@@ -1348,15 +1429,8 @@ fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopCon
         request_token_history_lookback: setup.request_token_history_lookback,
         controls: ControlConfig {
             memory_saver: true,
-            memory_regions: if setup.nccl_suspendable {
-                vec![
-                    "kv_cache".to_owned(),
-                    "weights".to_owned(),
-                    "nccl".to_owned(),
-                ]
-            } else {
-                vec!["kv_cache".to_owned(), "weights".to_owned()]
-            },
+            replica_memory_transitions: setup.replica_memory_transitions,
+            memory_regions,
             l3_weight_version: None,
             allow_reload_forward: true,
         },
@@ -1405,7 +1479,7 @@ fn run_rank<F: Frontend>(
         rank,
         layout,
         tiers,
-        config,
+        mut config,
         setup,
         mesh_listener,
         addresses,
@@ -1426,6 +1500,9 @@ fn run_rank<F: Frontend>(
         ..
     } = setup;
     let role = pd.as_ref().map_or(Role::Plain, |pd| pd.role);
+    if store.is_some() {
+        config.controls.l3_weight_version = Some("v1".to_owned());
+    }
     let outputs = OutputProcessor::new(
         None,
         1,
@@ -1463,6 +1540,11 @@ fn run_rank<F: Frontend>(
     let kv_shard_count = match layout {
         Layout::TpKvp(_, shards) => shards,
         _ => 1,
+    };
+    let tiers = if setup.host_l2_rank == Some(rank) {
+        Tiers::HostL2
+    } else {
+        tiers
     };
     // Attached once the startup requests ran, as the host does.
     let mut event_loop = EventLoop::new(
@@ -1528,6 +1610,9 @@ fn fake_device(layout: Layout, rank: usize, setup: &Setup) -> FakeDevice {
                 .weight_load_refused
                 .is_some_and(|refused| refused(rank)),
         )),
+        discard_memory: setup.discard_memory_rank == Some(rank),
+        fail_memory_release: setup.memory_release_failure_rank == Some(rank),
+        fail_memory_resume: setup.memory_resume_failure_rank == Some(rank),
         // The trivial initial placement: slot p holds expert p % 4.
         placement: Arc::new(Mutex::new(vec![vec![0, 1, 2, 3, 0, 1]; 2])),
         ..Default::default()
@@ -1585,6 +1670,7 @@ async fn start_ranks_with(
                 gate: storage_gate.clone(),
                 queries: Arc::new(Mutex::new(0)),
                 gets: Arc::new(Mutex::new(0)),
+                memory: setup.l3_memory_store.clone(),
             });
             let handle = Rank {
                 thread: None,
@@ -1662,11 +1748,15 @@ async fn start_ranks_with(
 /// round.
 type Script = Vec<Vec<EngineRequest>>;
 
+type LiveInput = std::sync::mpsc::Receiver<(Vec<EngineRequest>, std::sync::mpsc::Sender<()>)>;
+
 /// One engine's frontend in a scripted run: each round it hands the engine
 /// the next batch of its script, after the messages `react` made of the
 /// previous round's outputs. Once its script ran out it is gone, so the
 /// engine stops.
 struct ScriptedFrontend {
+    /// Live ingress keeps the same rank harness open while a test drives it.
+    input: Option<LiveInput>,
     script: VecDeque<Vec<EngineRequest>>,
     react: fn(&[StreamedOutput]) -> Vec<EngineRequest>,
     reacted: Vec<EngineRequest>,
@@ -1677,14 +1767,23 @@ struct ScriptedFrontend {
 }
 
 impl Frontend for ScriptedFrontend {
-    fn receive(&mut self, _wait: Option<Duration>) -> Vec<EngineRequest> {
+    fn receive(&mut self, wait: Option<Duration>) -> Vec<EngineRequest> {
+        if let Some(input) = &self.input {
+            return match input.recv_timeout(wait.unwrap_or(Duration::ZERO)) {
+                Ok((messages, delivered)) => {
+                    delivered.send(()).unwrap();
+                    messages
+                }
+                Err(_) => Vec::new(),
+            };
+        }
         let mut messages = std::mem::take(&mut self.reacted);
         messages.extend(self.script.pop_front().unwrap_or_default());
         messages
     }
 
     fn closed(&self) -> bool {
-        self.script.is_empty() && self.reacted.is_empty()
+        self.input.is_none() && self.script.is_empty() && self.reacted.is_empty()
     }
 
     fn send(&mut self, outputs: Vec<StreamedOutput>, _load: Load) {
@@ -1714,6 +1813,7 @@ struct ScriptedRank {
     outputs: Vec<StreamedOutput>,
     released: Vec<(String, i32)>,
     cache_ops: Vec<CacheOpKind>,
+    prefill_prefixes: Vec<(String, i32)>,
     idle_forwards: usize,
     forwards: usize,
     /// The device operations the rank ran (weight updates, reloads, ...).
@@ -1731,10 +1831,54 @@ fn run_scripted(
     scripts: Vec<Script>,
     react: fn(&[StreamedOutput]) -> Vec<EngineRequest>,
 ) -> Vec<ScriptedRank> {
+    run_scripted_live(
+        layout,
+        in_flight_depth,
+        tiers,
+        setup,
+        scripts,
+        react,
+        LiveRun {
+            inputs: Vec::new(),
+            drive: |_: &[LiveObservation], _: &AtomicBool| {},
+        },
+    )
+}
+
+struct LiveObservation {
+    replies: Arc<Mutex<Vec<ControlOutput>>>,
+    outputs: Arc<Mutex<Vec<StreamedOutput>>>,
+    device_ops: Arc<Mutex<Vec<String>>>,
+}
+
+struct LiveRun<F> {
+    inputs: Vec<LiveInput>,
+    drive: F,
+}
+
+fn run_scripted_live(
+    layout: Layout,
+    in_flight_depth: usize,
+    tiers: Tiers,
+    setup: Setup,
+    scripts: Vec<Script>,
+    react: fn(&[StreamedOutput]) -> Vec<EngineRequest>,
+    live: LiveRun<impl FnOnce(&[LiveObservation], &AtomicBool)>,
+) -> Vec<ScriptedRank> {
+    let LiveRun { inputs, drive } = live;
+    struct StopOnDrop(Arc<AtomicBool>);
+    impl Drop for StopOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
     let (world, tp_size, num_engines) = layout.sizes();
     assert_eq!(scripts.len(), num_engines);
     let config = loop_config(in_flight_depth, matches!(layout, Layout::Pp(_)), &setup);
     let stop = Arc::new(AtomicBool::new(false));
+    let _stop_on_drop = StopOnDrop(stop.clone());
+    let mut inputs = inputs.into_iter();
+    let mut observed = Vec::new();
     let (mesh_listeners, addresses) = mesh_listeners(world);
     let mut scripts = scripts.into_iter();
     let (done, outcomes) = std::sync::mpsc::channel();
@@ -1744,12 +1888,19 @@ fn run_scripted(
         .map(|(rank, mesh_listener)| {
             let device = fake_device(layout, rank, &setup);
             let (plans, idle_forwards) = (device.plans.clone(), device.idle_forwards.clone());
+            let prefill_prefixes = device.prefill_prefixes.clone();
             let device_ops = device.device_ops.clone();
             let replies = Arc::new(Mutex::new(Vec::new()));
             let finished = Arc::new(Mutex::new(Vec::new()));
             let outputs = Arc::new(Mutex::new(Vec::new()));
             let released = device.released.clone();
+            observed.push(LiveObservation {
+                replies: replies.clone(),
+                outputs: outputs.clone(),
+                device_ops: device_ops.clone(),
+            });
             let frontend = (rank % tp_size == 0).then(|| ScriptedFrontend {
+                input: inputs.next(),
                 script: scripts.next().unwrap().into(),
                 react,
                 reacted: Vec::new(),
@@ -1780,11 +1931,13 @@ fn run_scripted(
                 outputs,
                 released,
                 plans,
+                prefill_prefixes,
                 idle_forwards,
                 device_ops,
             )
         })
         .collect();
+    drive(&observed, &stop);
     for _ in 0..world {
         if outcomes.recv_timeout(Duration::from_secs(60)).is_err() {
             stop.store(true, Ordering::Relaxed);
@@ -1794,7 +1947,17 @@ fn run_scripted(
     ranks
         .into_iter()
         .map(
-            |(thread, replies, finished, outputs, released, plans, idle_forwards, device_ops)| {
+            |(
+                thread,
+                replies,
+                finished,
+                outputs,
+                released,
+                plans,
+                prefill_prefixes,
+                idle_forwards,
+                device_ops,
+            )| {
                 let outcome = thread.join().unwrap();
                 let plans = plans.lock().unwrap();
                 ScriptedRank {
@@ -1807,6 +1970,7 @@ fn run_scripted(
                         .iter()
                         .flat_map(|(_, _, ops)| ops.iter().map(|op| op.kind))
                         .collect(),
+                    prefill_prefixes: prefill_prefixes.lock().unwrap().clone(),
                     idle_forwards: *idle_forwards.lock().unwrap(),
                     forwards: plans.iter().filter(|(_, rids, _)| !rids.is_empty()).count(),
                     device_ops: device_ops.lock().unwrap().clone(),
@@ -4626,21 +4790,10 @@ fn slow_schema() -> String {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_drain_cancels_the_requests_still_compiling_their_grammars() {
-    let release = ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
-        rid: None,
-        http_worker_ipc: None,
-        tags: None,
-    });
+    let release = memory_request(true, None, None);
     for (drain, undo) in [
         (pause("wait"), resume()),
-        (
-            release,
-            ControlRequest::ResumeMemoryOccupation(ResumeMemoryOccupationReqInput {
-                rid: None,
-                http_worker_ipc: None,
-                tags: None,
-            }),
-        ),
+        (release, memory_request(false, None, None)),
     ] {
         let engine = start_ranks_with(
             Layout::Single,
@@ -4972,11 +5125,7 @@ async fn a_failed_weight_load_is_committed_as_invalid_on_every_rank() {
 async fn a_released_pd_engine_refuses_requests_until_it_wakes() {
     let (prefill, decode, _wire) =
         start_pd_pair(1, Layout::Single, Tiers::DeviceOnly, Setup::default()).await;
-    let release = ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
-        rid: None,
-        http_worker_ipc: None,
-        tags: None,
-    });
+    let release = memory_request(true, None, None);
     assert_eq!(
         control(&decode, release).await,
         [("ReleaseMemoryOccupationReqOutput", true)]
@@ -4992,11 +5141,7 @@ async fn a_released_pd_engine_refuses_requests_until_it_wakes() {
          resume_memory_occupation"
             .into()
     );
-    let wake = ControlRequest::ResumeMemoryOccupation(ResumeMemoryOccupationReqInput {
-        rid: None,
-        http_worker_ipc: None,
-        tags: None,
-    });
+    let wake = memory_request(false, None, None);
     assert_eq!(
         control(&decode, wake).await,
         [("ResumeMemoryOccupationReqOutput", true)]
@@ -5016,11 +5161,7 @@ async fn a_released_pd_engine_refuses_requests_until_it_wakes() {
 #[tokio::test(flavor = "multi_thread")]
 async fn memory_is_released_after_the_drain_and_resumed_in_reverse_order() {
     let engine = start_engine(1).await;
-    let release = ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
-        rid: None,
-        http_worker_ipc: None,
-        tags: None,
-    });
+    let release = memory_request(true, None, None);
     let running = engine
         .client
         .generate(request("r1", 3, budget(20)))
@@ -5042,11 +5183,7 @@ async fn memory_is_released_after_the_drain_and_resumed_in_reverse_order() {
         control(&engine, resume()).await,
         [("ResumeSchedulerReqOutput", false)]
     );
-    let wake = ControlRequest::ResumeMemoryOccupation(ResumeMemoryOccupationReqInput {
-        rid: None,
-        http_worker_ipc: None,
-        tags: None,
-    });
+    let wake = memory_request(false, None, None);
     assert_eq!(
         control(&engine, wake).await,
         [("ResumeMemoryOccupationReqOutput", true)]
@@ -5080,13 +5217,34 @@ async fn memory_is_released_after_the_drain_and_resumed_in_reverse_order() {
     assert_eq!(tokens(&chunks), [1000, 1001]);
 }
 
+fn memory_request(release: bool, tags: Option<&[&str]>, id: Option<&str>) -> ControlRequest {
+    let tags = tags.map(|tags| tags.iter().map(|tag| (*tag).to_owned()).collect());
+    let rid = id.map(|id| StrOrList::One(id.to_owned()));
+    if release {
+        ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
+            rid,
+            http_worker_ipc: None,
+            tags,
+        })
+    } else {
+        ControlRequest::ResumeMemoryOccupation(ResumeMemoryOccupationReqInput {
+            rid,
+            http_worker_ipc: None,
+            tags,
+        })
+    }
+}
+
+fn memory_transition(release: bool, tags: Option<&[&str]>) -> EngineRequest {
+    EngineRequest::Control(Box::new(memory_request(release, tags, None)))
+}
+
+#[path = "serving/test_memory_saver.rs"]
+mod test_memory_saver;
+
 #[test]
 fn dp_memory_release_waits_for_every_rank_to_pause_and_drain() {
-    let release = ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
-        rid: None,
-        http_worker_ipc: None,
-        tags: None,
-    });
+    let release = memory_request(true, None, None);
     for peer_pause in [pause("wait"), release.clone()] {
         let peer_releases = matches!(&peer_pause, ControlRequest::ReleaseMemoryOccupation(_));
         let mut busy = vec![Vec::new(); 340];
@@ -5146,13 +5304,9 @@ fn dp_memory_release_waits_for_an_idle_peer_to_pause() {
         budget(20),
     ))));
     let mut releasing = vec![Vec::new(); 60];
-    releasing[2].push(EngineRequest::Control(Box::new(
-        ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
-            rid: None,
-            http_worker_ipc: None,
-            tags: None,
-        }),
-    )));
+    releasing[2].push(EngineRequest::Control(Box::new(memory_request(
+        true, None, None,
+    ))));
     let ranks = run_scripted(
         Layout::Dp(2),
         0,
@@ -5181,13 +5335,9 @@ fn dp_memory_resume_waits_for_every_rank_and_region_before_forwarding() {
     for wake_peer in [false, true] {
         let mut scripts = vec![vec![Vec::new(); 90]; 2];
         for (rank, script) in scripts.iter_mut().enumerate() {
-            script[0].push(EngineRequest::Control(Box::new(
-                ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
-                    rid: None,
-                    http_worker_ipc: None,
-                    tags: None,
-                }),
-            )));
+            script[0].push(EngineRequest::Control(Box::new(memory_request(
+                true, None, None,
+            ))));
             for (round, tag) in [(4 + rank * 16, "weights"), (8 + rank * 22, "kv_cache")] {
                 if rank == 1 && tag == "kv_cache" && !wake_peer {
                     continue;
@@ -5370,16 +5520,8 @@ async fn memory_release_waits_for_the_host_stores_in_flight() {
 
 #[test]
 fn a_drain_cancels_the_requests_still_receiving_their_embeddings() {
-    let release = ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
-        rid: None,
-        http_worker_ipc: None,
-        tags: None,
-    });
-    let wake = ControlRequest::ResumeMemoryOccupation(ResumeMemoryOccupationReqInput {
-        rid: None,
-        http_worker_ipc: None,
-        tags: None,
-    });
+    let release = memory_request(true, None, None);
+    let wake = memory_request(false, None, None);
     for (drain, undo) in [(pause("wait"), resume()), (release, wake)] {
         let tag = drain.reply_tag();
         let undo_tag = undo.reply_tag();
@@ -5565,6 +5707,7 @@ fn a_profile_keeps_the_spans_of_rounds_that_did_something() {
     script[0] = vec![EngineRequest::Add(Box::new(request("r", 16, budget(3))))];
     let finished = Arc::new(Mutex::new(Vec::new()));
     let frontend = ScriptedFrontend {
+        input: None,
         script: script.into(),
         react: no_reaction,
         reacted: Vec::new(),
@@ -5692,6 +5835,7 @@ fn a_profile_keeps_the_rounds_that_only_advance_storage() {
         gate: Gate::closed(),
         queries: Arc::new(Mutex::new(0)),
         gets: Arc::new(Mutex::new(0)),
+        memory: None,
     };
     let (queries, gets) = (store.queries.clone(), store.gets.clone());
     let notes = Arc::new(Mutex::new(RoundNotes::default()));
