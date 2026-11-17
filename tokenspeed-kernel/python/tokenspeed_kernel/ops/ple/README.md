@@ -11,12 +11,15 @@ use regular host gather. CUDA graph capture records regular host gather,
 and replay keeps that path. Per-row scales belong to the device-resident table
 path; hot cache requires offloading and supports scalar-scaled FP8 or BF16.
 
-Explicitly enabling hot cache without offloading is an error. Unsupported
-hardware, shapes or dtypes, invalid host table layouts or shard bounds, and a
-missing compiled CUDA gather library fail initialization instead of silently
-disabling the cache. `TOKENSPEED_PLE_HOST_CACHE_SLOTS` must be a power of two
-in [2, 4194304]; zero is invalid when hot cache is enabled. Successful
-initialization logs the supported lookup range and graph behavior.
+Explicitly enabling hot cache without offloading is an error. Initialization
+validates the NVIDIA architecture and storage/output dtypes. The caller supplies
+a contiguous pinned host table and its matching shard bounds. The CUDA library
+is loaded directly, with loader errors propagated.
+`TOKENSPEED_PLE_HOST_CACHE_SLOTS` must be a power of two greater than one;
+there is no 4M-slot cap. Successful
+initialization logs the supported lookup range and graph behavior. Head count
+and head dimension are checked by the CUDA launcher before launching the
+gather kernel, rather than by the Python constructor.
 
 The gather sorts and deduplicates fully owned 64-token tiles per head and
 writes BF16 values in input order. A tile containing out-of-shard IDs or an

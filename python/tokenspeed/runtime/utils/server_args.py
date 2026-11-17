@@ -3949,7 +3949,7 @@ class ServerArgs:
             "tables in GPU memory. Disabled by default. "
             "Requires PLE offloading and a supported table format and CUDA kernel. "
             "Small lookups and CUDA graphs use regular host gather. "
-            "TOKENSPEED_PLE_HOST_CACHE_SLOTS must be a power of two in [2, 4194304].",
+            "TOKENSPEED_PLE_HOST_CACHE_SLOTS must be a power of two greater than one.",
         )
         parser.add_argument(
             "--sampling-backend",

@@ -320,8 +320,12 @@ void ple_gather_staged(int64_t address, TensorView ids, TensorView tags, TensorV
                    tokens <= INT32_MAX / kHeads);
     TVM_FFI_ICHECK(vocab_start >= 0 && vocab_end > vocab_start &&
                    vocab_end - vocab_start <= INT32_MAX);
+    TVM_FFI_ICHECK(ids.ndim() == 2 && ids.size(1) == kHeads)
+        << "PLE hot cache requires IDs shaped [tokens, 16]";
+    TVM_FFI_ICHECK(out.ndim() == 2) << "PLE hot cache output must have shape [rows, head_dim]";
     int64_t dim = out.size(1);
-    TVM_FFI_ICHECK(dim == 160 || dim == 512);
+    TVM_FFI_ICHECK(dim == 160 || dim == 512)
+        << "PLE hot cache head_dim must be 160 or 512";
     int64_t row_bytes = dim * (is_fp8 ? 1 : sizeof(uint16_t));
     TVM_FFI_ICHECK(hot.size(1) == row_bytes && staged.size(1) == row_bytes);
     int capacity = tags.size(0);

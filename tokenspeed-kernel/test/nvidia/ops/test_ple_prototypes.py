@@ -430,9 +430,8 @@ def test_host_cache_keeps_aligned_and_tail_rows_until_invalidated(dim, dtype):
     assert not run(259).any()
 
 
-def test_host_cache_reports_initialization_failures(monkeypatch, tmp_path):
+def test_host_cache_reports_initialization_failures():
     from tokenspeed_kernel.ops.ple.host_cache import PLEHostCache
-    from tokenspeed_kernel.thirdparty.cuda import ple_host_gather as native
 
     table = torch.ones(32, 160, dtype=torch.bfloat16).pin_memory()
     args = dict(
@@ -447,24 +446,42 @@ def test_host_cache_reports_initialization_failures(monkeypatch, tmp_path):
     for override, message in (
         ({"slot_count": 0}, "must be a power of two"),
         ({"device": torch.device("cpu")}, "NVIDIA CUDA"),
-        ({"table": table.flatten()}, "shape"),
-        ({"table": torch.ones_like(table, pin_memory=False)}, "pinned CPU"),
-        ({"table": table[:, ::2]}, "contiguous"),
-        ({"vocab_end": 133}, "shard bounds"),
-        ({"ngram_heads": 8}, "supports 16 heads"),
-        ({"table": table[:, :128].contiguous().pin_memory()}, "head dimensions"),
         ({"table": table.float().pin_memory()}, "storage"),
         ({"output_dtype": torch.float16}, "BF16 output"),
     ):
         with pytest.raises((ValueError, RuntimeError), match=message):
             PLEHostCache(**(args | override))
-    native.ple_staged_gather.cache_clear()
-    monkeypatch.setattr(native, "_MODULE_PATH", tmp_path / "missing.so")
-    try:
-        with pytest.raises(RuntimeError, match="Reinstall tokenspeed-kernel"):
-            PLEHostCache(**args)
-    finally:
-        native.ple_staged_gather.cache_clear()
+    cache = PLEHostCache(**(args | {"slot_count": 1 << 23}))
+    ids = torch.zeros((256, 16), dtype=torch.int64, device="cuda")
+    assert cache.can_gather(ids)
+
+
+@pytest.mark.parametrize(
+    "heads, dim, message",
+    [
+        (8, 160, "IDs shaped"),
+        (32, 160, "IDs shaped"),
+        (16, 128, "head_dim must be"),
+    ],
+)
+def test_host_cache_launcher_rejects_unsupported_shapes(heads, dim, message):
+    from tokenspeed_kernel.ops.ple.host_cache import PLEHostCache
+
+    table = torch.ones(32, dim, dtype=torch.bfloat16).pin_memory()
+    cache = PLEHostCache(
+        slot_count=512,
+        table=table,
+        ngram_heads=heads,
+        output_dtype=torch.bfloat16,
+        vocab_start=0,
+        vocab_end=32,
+        device=torch.device("cuda", torch.cuda.current_device()),
+    )
+    ids = torch.zeros((256, heads), dtype=torch.int64, device="cuda")
+    out = torch.empty((ids.numel(), dim), dtype=torch.bfloat16, device="cuda")
+    assert cache.can_gather(ids)
+    with pytest.raises(RuntimeError, match=message):
+        cache.gather(ids, out, scale=None)
 
 
 def test_conv_state_large_request_offset(pdl):

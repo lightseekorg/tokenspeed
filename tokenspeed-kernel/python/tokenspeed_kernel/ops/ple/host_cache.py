@@ -43,7 +43,6 @@ class PLEHostCache:
     """
 
     HEADS = 16
-    HEAD_DIMS = (160, 512)
     TILE_TOKENS = 64
     MIN_TOKENS = 256
     MAX_TOKENS = ((1 << 31) - 1) // HEADS
@@ -63,7 +62,7 @@ class PLEHostCache:
         """Select a cache for a pinned FP8 or BF16 table shard.
 
         Args:
-            slot_count: Number of cache slots, a power of two in [2, 4194304].
+            slot_count: Number of cache slots, a power of two greater than one.
             table: Pinned host table of shape ``[local_vocab_rows, head_dim]``.
             ngram_heads: Number of row IDs per input token.
             output_dtype: Compute dtype of the gather output.
@@ -72,11 +71,11 @@ class PLEHostCache:
             device: GPU consuming the table and owning the cache.
 
         Raises:
-            ValueError: Invalid table layout, shard bounds, or unsupported shape/dtype.
-            RuntimeError: Unsupported GPU or missing compiled CUDA gather library.
+            ValueError: Invalid slot count or unsupported dtype.
+            RuntimeError: Unsupported GPU.
         """
-        if not 2 <= slot_count <= 1 << 22 or slot_count & (slot_count - 1):
-            raise ValueError("PLE cache slots must be a power of two in [2, 4194304]")
+        if slot_count < 2 or slot_count & (slot_count - 1):
+            raise ValueError("PLE cache slots must be a power of two greater than one")
         platform = current_platform()
         if not platform.is_nvidia or device.type != "cuda":
             raise RuntimeError("PLE hot cache requires an NVIDIA CUDA device")
@@ -84,27 +83,6 @@ class PLEHostCache:
         if capability[0] not in (9, 10):
             raise RuntimeError(
                 f"PLE hot cache requires Hopper or Blackwell, got SM{capability[0]}{capability[1]}"
-            )
-        if table.ndim != 2:
-            raise ValueError(
-                "PLE hot cache table must have shape [local_vocab_rows, head_dim]"
-            )
-        if (
-            table.device.type != "cpu"
-            or not table.is_pinned()
-            or not table.is_contiguous()
-        ):
-            raise ValueError("PLE hot cache requires a contiguous pinned CPU table")
-        if not 0 <= vocab_start < vocab_end <= (
-            1 << 63
-        ) - 1 or vocab_end - vocab_start > min(table.shape[0], (1 << 31) - 1):
-            raise ValueError(
-                "PLE hot cache shard bounds must fit the table and int32 local row indices"
-            )
-        if ngram_heads != self.HEADS or table.shape[1] not in self.HEAD_DIMS:
-            raise ValueError(
-                f"PLE hot cache supports {self.HEADS} heads and head dimensions {self.HEAD_DIMS}, "
-                f"got {ngram_heads} heads and dimension {table.shape[1]}"
             )
         if (
             table.dtype not in (torch.float8_e4m3fn, torch.bfloat16)

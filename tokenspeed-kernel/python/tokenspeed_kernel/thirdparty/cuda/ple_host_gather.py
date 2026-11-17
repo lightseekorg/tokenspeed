@@ -26,12 +26,6 @@ _MODULE_PATH = Path(__file__).parent / "objs" / "ple_host_gather" / "ple_host_ga
 
 @cache
 def ple_staged_gather():
-    if not _MODULE_PATH.is_file():
-        raise RuntimeError(
-            f"PLE hot cache CUDA library is missing: {_MODULE_PATH}. "
-            "Reinstall tokenspeed-kernel with the CUDA kernels built."
-        )
-
     import tvm_ffi
 
     return tvm_ffi.load_module(str(_MODULE_PATH)).ple_gather_staged
