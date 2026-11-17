@@ -49,9 +49,10 @@ Data under a flag: words that a flag publishes are stored write-through
 holds nothing dirty that a release would have to write back, and loaded past
 the caches (:meth:`Mailbox.load_words`). A plain store under a flag would
 need a real release (an L2 write-back), and a plain load could hit a stale L2
-line. Data that a later launch reads from another GPU (a draft's taps, for
-example) follows the same rule: write-through stores, loads past the
-caches.
+line. Data that a later launch reads on another XCD of the same GPU (a
+draft's taps: each rank's launch stores them and its draft reads them, from
+CTAs on any XCD) follows the same rule: write-through stores, loads past the
+caches, since an XCD's L2 does not see another XCD's stores.
 
 Fail-stop: a poll gives up after about a minute of waiting (the realtime
 clock, read every ``Plan.poll_check`` retries only) and executes
