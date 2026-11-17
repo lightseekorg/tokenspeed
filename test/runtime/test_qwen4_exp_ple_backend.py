@@ -338,6 +338,7 @@ def _expected_verify_window(scratch, row, width):
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="PLE batched copy requires CUDA"
 )
+@pytest.mark.parametrize("rebind", [False, True])
 @pytest.mark.parametrize("accepted_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize(
     "seq_lens, accepted_lengths, block_rows, copies",
@@ -350,9 +351,15 @@ def _expected_verify_window(scratch, row, width):
     ids=["first-verify", "acceptance-clamp", "in-place", "invalid-pages"],
 )
 def test_ple_commit_copies_only_accepted_checkpoints(
-    accepted_dtype, seq_lens, accepted_lengths, block_rows, copies
+    accepted_dtype, seq_lens, accepted_lengths, block_rows, copies, rebind
 ):
     backend = _make_backend(3, False, "cuda")
+    if rebind:
+        previous_scratch = backend._ple_verify_scratch
+        for scratch in previous_scratch.values():
+            scratch.fill_(-111)
+        backend.set_cache_pool(_make_backend(3, False, "cuda").cache_pool)
+        backend.preallocate_verify_workspace(4, 3)
     other_view = backend.cache_pool.arena.field(qwen4_exp_ple_conv_field(4))
     other_view.fill_(-77)
     for index, (field_id, scratch) in enumerate(backend._ple_verify_scratch.items()):

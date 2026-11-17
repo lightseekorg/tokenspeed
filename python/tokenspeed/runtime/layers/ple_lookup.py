@@ -204,13 +204,13 @@ class PLELookup(nn.Module):
             if offload
             else self.ngram_embedding.weight.device
         )
-        if offload and enable_hot_cache:
+        if enable_hot_cache:
             from tokenspeed_kernel.ops.ple.host_cache import PLEHostCache
 
             from tokenspeed.runtime.utils.env import envs
 
             shard = self.ngram_embedding.shard_indices
-            self._host_cache = PLEHostCache.create(
+            self._host_cache = PLEHostCache(
                 slot_count=envs.TOKENSPEED_PLE_HOST_CACHE_SLOTS.get(),
                 table=self.ngram_embedding.weight,
                 ngram_heads=ngram_heads,
@@ -302,7 +302,6 @@ class PLELookup(nn.Module):
             with torch.cuda.stream(stream):
                 if use_cache:
                     cache.gather(
-                        self.ngram_embedding.weight,
                         gathered_ids,
                         out.view(-1, self.head_dim),
                         scale=(

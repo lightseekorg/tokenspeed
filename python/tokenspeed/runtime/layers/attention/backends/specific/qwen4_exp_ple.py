@@ -403,6 +403,11 @@ class Qwen4ExpPLEBackend(AttentionBackend):
             "context_dst_stride": self._i64([row_stride_i32(context_field)], device),
             "context_row_bytes": context_field[0].numel()
             * context_field.element_size(),
+            "conv_compact": (
+                (conv_scratches[0], self.spec_num_tokens)
+                if context_field.is_cuda
+                else None
+            ),
             "conv_src": self._u64(
                 [scratch.data_ptr() for scratch in conv_scratches], device
             ),
@@ -475,10 +480,6 @@ class Qwen4ExpPLEBackend(AttentionBackend):
                 src_row_strides=tables["context_src_stride"],
                 dst_row_strides=tables["context_dst_stride"],
             )
-        if pages.is_cuda:
-            compact = (self._ple_verify_scratch[self._conv_field_ids[0]], width)
-        else:
-            compact = None
         copy_state_rows(
             tables["conv_src"],
             tables["conv_dst"],
@@ -487,6 +488,6 @@ class Qwen4ExpPLEBackend(AttentionBackend):
             row_bytes=tables["conv_row_bytes"],
             src_row_strides=tables["conv_src_stride"],
             dst_row_strides=tables["conv_dst_stride"],
-            compact=compact,
+            compact=tables["conv_compact"],
         )
         self._verify_commit_ctx = None

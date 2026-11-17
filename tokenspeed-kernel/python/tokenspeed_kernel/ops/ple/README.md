@@ -14,9 +14,9 @@ path; hot cache requires offloading and supports scalar-scaled FP8 or BF16.
 Explicitly enabling hot cache without offloading is an error. Unsupported
 hardware, shapes or dtypes, invalid host table layouts or shard bounds, and a
 missing compiled CUDA gather library fail initialization instead of silently
-disabling the cache. Setting `TOKENSPEED_PLE_HOST_CACHE_SLOTS=0` explicitly
-disables it and logs the reason; successful initialization logs the supported
-lookup range and graph behavior.
+disabling the cache. `TOKENSPEED_PLE_HOST_CACHE_SLOTS` must be a power of two
+in [2, 4194304]; zero is invalid when hot cache is enabled. Successful
+initialization logs the supported lookup range and graph behavior.
 
 The gather sorts and deduplicates fully owned 64-token tiles per head and
 writes BF16 values in input order. A tile containing out-of-shard IDs or an
@@ -25,7 +25,9 @@ On a cache miss it stages the raw bytes
 already read over UVA. A separate stream copies the last miss for each
 direct-mapped slot from staging to HBM. The next cached gather waits for the
 fill event before reading the tags. The model owner invalidates cached rows
-before changing the embedding weights. Callers select the cached path with
+before changing the embedding weights. The cache retains the table and its
+storage dtype from construction; each gather receives the current scale.
+Callers select the cached path with
 `can_gather` before invoking `gather`; the latter does not repeat size checks.
 
 ## Convolution and state
@@ -43,7 +45,9 @@ the tile. Tokens resolve their own request and position, so a tile can span a
 request boundary. Short batches and batches that write verify windows use one
 token per CTA.
 
-Verify metadata allocates only the strides used by its layout. CUDA compact
+Verify metadata binds the compact scratch and verify width when the workspace
+is built and allocates only the strides used by its layout. Rebinding the
+cache pool rebuilds those bindings. CUDA compact
 scratch needs no source stride table and uses destination strides in state
 elements. Full-window copies on non-CUDA devices keep source and destination
 strides in int32 units.

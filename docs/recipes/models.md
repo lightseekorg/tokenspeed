@@ -1253,14 +1253,14 @@ Pass `--enable-ple-hot-cache` to cache recently read PLE table rows in HBM.
 The cache defaults to off and applies only to offloaded BF16 or scalar-scaled
 FP8 tables with 16 n-gram heads and head dimension 160 or 512 on supported
 NVIDIA GPUs. `TOKENSPEED_PLE_HOST_CACHE_SLOTS` sets the capacity per shard
-when the flag is enabled (default 524288 slots, zero disables the cache).
+when the flag is enabled (default 524288 slots; must be a power of two in [2, 4194304]).
 At head dimension 160 the cache uses 84 MiB for FP8 or 164 MiB for BF16 per
 shard. At head dimension 512 it uses 260 MiB or 516 MiB, respectively. Miss
 staging is temporary and adds to those amounts.
 
 Enabling the flag with offloading disabled, an unsupported table format or GPU,
 or a missing CUDA gather library fails initialization with an explicit error.
-Zero slots disables the cache with a startup message. Small lookups (fewer than
+Zero slots is invalid when enabled. Small lookups (fewer than
 256 tokens) and CUDA graph capture/replay still use regular host gather.
 
 ## GPT-OSS 20B / 120B

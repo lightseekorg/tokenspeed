@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 class PLEHostCache:
     """Read a rank's FP8 or BF16 PLE table shard through its own HBM cache.
 
-    Use :meth:`create` to select the supported table layout and device. The
+    Construction validates the supported table layout and device. The
     table bytes must remain immutable between gathers, or the owner must call
     :meth:`invalidate` before updating the table.
     """
@@ -50,25 +50,7 @@ class PLEHostCache:
     _FILL_ROWS = 16
 
     def __init__(
-        self, slot_count: int, head_dim: int, vocab_start: int, vocab_end: int, launch
-    ):
-        self.slot_count = slot_count
-        self._slot_bits = slot_count.bit_length() - 1
-        self._head_dim = head_dim
-        self._block_dim = triton.next_power_of_2(head_dim)
-        self._vocab_start = vocab_start
-        self._vocab_end = vocab_end
-        self._launch = launch
-        self._tags: torch.Tensor | None = None
-        self._hot: torch.Tensor | None = None
-        self._winners: torch.Tensor | None = None
-        self._fill_stream: torch.cuda.Stream | None = None
-        self._fill_done: torch.cuda.Event | None = None
-        self._pending = False
-
-    @classmethod
-    def create(
-        cls,
+        self,
         *,
         slot_count: int,
         table: torch.Tensor,
@@ -77,11 +59,11 @@ class PLEHostCache:
         vocab_start: int,
         vocab_end: int,
         device: torch.device,
-    ) -> PLEHostCache | None:
+    ) -> None:
         """Select a cache for a pinned FP8 or BF16 table shard.
 
         Args:
-            slot_count: Number of power-of-two cache slots, or zero to disable.
+            slot_count: Number of cache slots, a power of two in [2, 4194304].
             table: Pinned host table of shape ``[local_vocab_rows, head_dim]``.
             ngram_heads: Number of row IDs per input token.
             output_dtype: Compute dtype of the gather output.
@@ -89,20 +71,12 @@ class PLEHostCache:
             vocab_end: Exclusive global ID of the last local row.
             device: GPU consuming the table and owning the cache.
 
-        Returns:
-            A cache with lazily allocated buffers, or ``None`` when slots are zero.
-
         Raises:
             ValueError: Invalid table layout, shard bounds, or unsupported shape/dtype.
             RuntimeError: Unsupported GPU or missing compiled CUDA gather library.
         """
-        if slot_count == 0:
-            logger.info("PLE hot cache disabled by TOKENSPEED_PLE_HOST_CACHE_SLOTS=0")
-            return None
         if not 2 <= slot_count <= 1 << 22 or slot_count & (slot_count - 1):
-            raise ValueError(
-                "PLE cache slots must be zero or a power of two in [2, 4194304]"
-            )
+            raise ValueError("PLE cache slots must be a power of two in [2, 4194304]")
         platform = current_platform()
         if not platform.is_nvidia or device.type != "cuda":
             raise RuntimeError("PLE hot cache requires an NVIDIA CUDA device")
@@ -127,9 +101,9 @@ class PLEHostCache:
             raise ValueError(
                 "PLE hot cache shard bounds must fit the table and int32 local row indices"
             )
-        if ngram_heads != cls.HEADS or table.shape[1] not in cls.HEAD_DIMS:
+        if ngram_heads != self.HEADS or table.shape[1] not in self.HEAD_DIMS:
             raise ValueError(
-                f"PLE hot cache supports {cls.HEADS} heads and head dimensions {cls.HEAD_DIMS}, "
+                f"PLE hot cache supports {self.HEADS} heads and head dimensions {self.HEAD_DIMS}, "
                 f"got {ngram_heads} heads and dimension {table.shape[1]}"
             )
         if (
@@ -144,10 +118,25 @@ class PLEHostCache:
         logger.info(
             f"PLE hot cache enabled: slots={slot_count}, storage={table.dtype}, "
             f"heads={ngram_heads}, head_dim={table.shape[1]}; "
-            f"eager lookups with {cls.MIN_TOKENS}..{cls.MAX_TOKENS} tokens use the cache; "
+            f"eager lookups with {self.MIN_TOKENS}..{self.MAX_TOKENS} tokens use the cache; "
             "other sizes and CUDA graph capture/replay use regular host gather"
         )
-        return cls(slot_count, table.shape[1], vocab_start, vocab_end, launch)
+        self.slot_count = slot_count
+        self._slot_bits = slot_count.bit_length() - 1
+        self._head_dim = table.shape[1]
+        self._block_dim = triton.next_power_of_2(self._head_dim)
+        self._vocab_start = vocab_start
+        self._vocab_end = vocab_end
+        self._table = table
+        self._storage_dtype = table.dtype
+        self._is_fp8 = table.dtype == torch.float8_e4m3fn
+        self._launch = launch
+        self._tags: torch.Tensor | None = None
+        self._hot: torch.Tensor | None = None
+        self._winners: torch.Tensor | None = None
+        self._fill_stream: torch.cuda.Stream | None = None
+        self._fill_done: torch.cuda.Event | None = None
+        self._pending = False
 
     def can_gather(self, ids: torch.Tensor) -> bool:
         """Select cache-safe sizes; flat winner indices must fit int32."""
@@ -165,7 +154,6 @@ class PLEHostCache:
 
     def gather(
         self,
-        table: torch.Tensor,
         ids: torch.Tensor,
         out: torch.Tensor,
         *,
@@ -174,7 +162,6 @@ class PLEHostCache:
         """Fill ``out`` with a BF16 lookup or a scalar-scaled FP8 lookup.
 
         Args:
-            table: The immutable pinned table selected by ``create``.
             ids: Contiguous CUDA int64 global IDs of shape ``[tokens, 16]``.
                 The caller must select this path with :meth:`can_gather`.
             out: Contiguous CUDA BF16 output of shape ``[tokens * 16, head_dim]``.
@@ -185,8 +172,7 @@ class PLEHostCache:
             the current stream. A side stream copies staged misses into the
             cache for the next cached lookup.
         """
-        is_fp8 = table.dtype == torch.float8_e4m3fn
-        if is_fp8 != (scale is not None):
+        if self._is_fp8 != (scale is not None):
             raise ValueError("PLE host cache requires a scale only for FP8")
         scale_value = scale if scale is not None else 1.0
         device = ids.device
@@ -201,7 +187,9 @@ class PLEHostCache:
                 (self.slot_count,), -1, dtype=torch.int32, device=device
             )
             self._hot = torch.empty(
-                (self.slot_count, self._head_dim), dtype=table.dtype, device=device
+                (self.slot_count, self._head_dim),
+                dtype=self._storage_dtype,
+                device=device,
             )
             self._winners = torch.empty_like(self._tags)
             for buf in (self._tags, self._hot, self._winners):
@@ -209,10 +197,10 @@ class PLEHostCache:
 
         query = ids.view(-1)
         rows = query.numel()
-        staged = torch.empty_like(out, dtype=table.dtype)
+        staged = torch.empty_like(out, dtype=self._storage_dtype)
         misses = torch.empty_like(query, dtype=torch.int32)
         self._winners.fill_(-1)
-        address = current_platform().device_visible_data_ptr(table)
+        address = current_platform().device_visible_data_ptr(self._table)
         aligned_tokens = ids.shape[0] // self.TILE_TOKENS * self.TILE_TOKENS
         self._launch(
             address,
@@ -222,7 +210,7 @@ class PLEHostCache:
             out,
             misses,
             scale_value,
-            is_fp8,
+            self._is_fp8,
             aligned_tokens,
             self._vocab_start,
             self._vocab_end,

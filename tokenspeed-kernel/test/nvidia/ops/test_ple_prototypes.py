@@ -392,7 +392,7 @@ def test_host_cache_keeps_aligned_and_tail_rows_until_invalidated(dim, dtype):
     table[1].fill_(2)
     table = table.to(dtype).pin_memory()
     scale = 0.125 if dtype == torch.float8_e4m3fn else None
-    cache = PLEHostCache.create(
+    cache = PLEHostCache(
         slot_count=512,
         table=table,
         ngram_heads=16,
@@ -401,15 +401,14 @@ def test_host_cache_keeps_aligned_and_tail_rows_until_invalidated(dim, dtype):
         vocab_end=vocab_start + len(table),
         device=device,
     )
-    assert cache is not None
 
-    def run(tokens):
+    def run(tokens, lookup_scale=scale):
         ids = torch.full((tokens, 16), vocab_start, device=device)
         ids[:, 1] += len(table)
         ids[-1, 0] += 1
         out = torch.empty((ids.numel(), dim), device=device, dtype=torch.bfloat16)
         assert cache.can_gather(ids)
-        return cache.gather(table, ids, out, scale=scale).cpu().view(tokens, 16, dim)
+        return cache.gather(ids, out, scale=lookup_scale).cpu().view(tokens, 16, dim)
 
     def expected(tokens):
         output = torch.full((tokens, 16, dim), scale or 1.0, dtype=torch.bfloat16)
@@ -419,6 +418,10 @@ def test_host_cache_keeps_aligned_and_tail_rows_until_invalidated(dim, dtype):
 
     torch.testing.assert_close(run(257), expected(257), rtol=0, atol=0)
     table.view(torch.uint8).zero_()
+    if scale is not None:
+        torch.testing.assert_close(
+            run(257, scale * 2), expected(257) * 2, rtol=0, atol=0
+        )
     with assert_no_triton_compile(
         _ple_gather_staged_tail_kernel, _ple_fill_staged_kernel
     ):
@@ -427,9 +430,7 @@ def test_host_cache_keeps_aligned_and_tail_rows_until_invalidated(dim, dtype):
     assert not run(259).any()
 
 
-def test_host_cache_reports_initialization_failures(monkeypatch, tmp_path, caplog):
-    import logging
-
+def test_host_cache_reports_initialization_failures(monkeypatch, tmp_path):
     from tokenspeed_kernel.ops.ple.host_cache import PLEHostCache
     from tokenspeed_kernel.thirdparty.cuda import ple_host_gather as native
 
@@ -443,10 +444,8 @@ def test_host_cache_reports_initialization_failures(monkeypatch, tmp_path, caplo
         vocab_end=132,
         device=torch.device("cuda", torch.cuda.current_device()),
     )
-    with caplog.at_level(logging.INFO):
-        assert PLEHostCache.create(**(args | {"slot_count": 0})) is None
-    assert "TOKENSPEED_PLE_HOST_CACHE_SLOTS=0" in caplog.text
     for override, message in (
+        ({"slot_count": 0}, "must be a power of two"),
         ({"device": torch.device("cpu")}, "NVIDIA CUDA"),
         ({"table": table.flatten()}, "shape"),
         ({"table": torch.ones_like(table, pin_memory=False)}, "pinned CPU"),
@@ -458,12 +457,12 @@ def test_host_cache_reports_initialization_failures(monkeypatch, tmp_path, caplo
         ({"output_dtype": torch.float16}, "BF16 output"),
     ):
         with pytest.raises((ValueError, RuntimeError), match=message):
-            PLEHostCache.create(**(args | override))
+            PLEHostCache(**(args | override))
     native.ple_staged_gather.cache_clear()
     monkeypatch.setattr(native, "_MODULE_PATH", tmp_path / "missing.so")
     try:
         with pytest.raises(RuntimeError, match="Reinstall tokenspeed-kernel"):
-            PLEHostCache.create(**args)
+            PLEHostCache(**args)
     finally:
         native.ple_staged_gather.cache_clear()
 
