@@ -25,7 +25,7 @@ from pathlib import Path
 from test.runtime.models.test_inkling2_config import _checkpoint
 
 import pytest
-from tokenspeed_scheduler import CapacityModel
+from tokenspeed_engine.scheduler import CapacityModel
 
 from tokenspeed.runtime.configs.inkling2 import Inkling2MMConfig, Inkling2MTPConfig
 from tokenspeed.runtime.configs.inkling_config import InklingMMConfig

@@ -28,9 +28,12 @@ def bootstrap(control_fd, outbox, protocol, host_spans=None):
     import tokenspeed_scheduler as ts
     import setproctitle
     import tokenspeed_engine
+    import tokenspeed_engine.scheduler
 
     scheduler = ts._ext
     assert scheduler is sys.modules["tokenspeed_engine._scheduler"]
+    # The engine's own scheduler API is the same linked module.
+    assert tokenspeed_engine.scheduler._ext is scheduler
     config = ts.SchedulerConfig()
     config.prefix_granularity = 16
     config.max_scheduled_tokens = 64

@@ -106,7 +106,6 @@ jobs:
       - name: Install CPU scheduler roundtrip dependencies
         run: |
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install -e 'tokenspeed-scheduler[test]'
 
       - name: Install the Rust toolchain
         run: |
@@ -154,19 +153,19 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-      # tokenspeed_engine.L3Executor without ts-host, which needs no C++
-      # scheduler build.
-      - name: Build the L3 executor's Python module
-        working-directory: tokenspeed-engine
+      # The scheduler the tests drive is the one tokenspeed-engine links.
+      - name: Install tokenspeed-engine
         run: |
-          PYO3_BUILD_EXTENSION_MODULE=1 cargo build --release --locked -p tokenspeed-py
-          cp target/release/lib_native.so \
-            "python/tokenspeed_engine/_native$(python -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')"
+          if ! sudo apt-get install -y --no-install-recommends libssl-dev; then
+            sudo apt-get update -o Acquire::Retries=5
+            sudo apt-get install -y --no-install-recommends -o Acquire::Retries=5 libssl-dev
+          fi
+          bash test/ci_system/install_tokenspeed_engine.sh
 
       - name: Run L3 unit tests and live master roundtrip
         env:
           MOONCAKE_REQUIRE_MASTER: "1"
-          PYTHONPATH: python:tokenspeed-engine/python
+          PYTHONPATH: python
         run: |
           python -m pytest \
             test/test_l3_kvstore.py \
@@ -187,20 +186,21 @@ jobs:
       - name: Install CPU protocol test dependencies
         run: |
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install psutil prometheus-client -e 'tokenspeed-scheduler[test]'
+          python -m pip install psutil prometheus-client 'pytest>=9'
 
       - name: Install the Rust toolchain
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
 
-      - name: Build the L3 executor's Python module
-        working-directory: tokenspeed-engine
+      # The scheduler the tests drive is the one tokenspeed-engine links.
+      - name: Install tokenspeed-engine
         run: |
-          PYO3_PYTHON=$(which python) PYO3_BUILD_EXTENSION_MODULE=1 \
-            cargo build --release --locked -p tokenspeed-py
-          cp target/release/lib_native.so \
-            "python/tokenspeed_engine/_native$(python -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')"
+          if ! sudo apt-get install -y --no-install-recommends libssl-dev; then
+            sudo apt-get update -o Acquire::Retries=5
+            sudo apt-get install -y --no-install-recommends -o Acquire::Retries=5 libssl-dev
+          fi
+          bash test/ci_system/install_tokenspeed_engine.sh
 
       # The release validation runner's own tests are CPU-only: real small
       # subprocesses and temporary files, no Mooncake master or GPU.
@@ -214,7 +214,7 @@ jobs:
       # Mooncake the native tail round trips skip.
       - name: Run asynchronous storage tests
         env:
-          PYTHONPATH: python:tokenspeed-engine/python
+          PYTHONPATH: python
         run: |
           python -m pytest -q \
             test/test_host_cache_storage.py \

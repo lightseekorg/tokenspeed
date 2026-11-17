@@ -34,7 +34,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
-from tokenspeed_scheduler import (
+from tokenspeed_engine.scheduler import (
     AttnKind,
     CacheGroupConfig,
     CacheTransferPolicy,

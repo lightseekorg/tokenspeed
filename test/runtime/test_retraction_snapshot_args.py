@@ -43,7 +43,7 @@ register_cuda_ci(
     disabled_on_runners_reason=None,
 )
 
-ts = pytest.importorskip("tokenspeed_scheduler")
+ts = pytest.importorskip("tokenspeed_engine.scheduler")
 
 from tokenspeed.runtime.cache.l2.sizing import (  # noqa: E402
     DEFAULT_DEVICE_RATIO,

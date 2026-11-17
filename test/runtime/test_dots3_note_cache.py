@@ -373,7 +373,7 @@ def test_router_rejects_a_global_page_override():
 
 
 def test_scheduler_reuses_both_history_groups():
-    import tokenspeed_scheduler as ts
+    import tokenspeed_engine.scheduler as ts
 
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge import (
         cache_group_config,

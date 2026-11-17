@@ -9,7 +9,7 @@ import pytest
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
-pytest.importorskip("tokenspeed_scheduler")
+pytest.importorskip("tokenspeed_engine.scheduler")
 
 from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
 from tokenspeed.runtime.engine.scheduler_utils import (

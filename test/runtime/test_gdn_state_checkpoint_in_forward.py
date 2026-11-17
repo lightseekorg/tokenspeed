@@ -152,7 +152,7 @@ class TestGdnStateCheckpointInForward:
                 make_extend_result_event,
             )
 
-            import tokenspeed_scheduler as ts
+            import tokenspeed_engine.scheduler as ts
             from tokenspeed_kernel.ops.attention.gdn import (
                 gdn_chunk_prefill_stores_state_checkpoints,
             )
@@ -163,7 +163,7 @@ class TestGdnStateCheckpointInForward:
                 GdnAttnBackend,
             )
         except (ImportError, ModuleNotFoundError) as exc:
-            pytest.skip(f"needs tokenspeed_scheduler + tokenspeed_kernel: {exc}")
+            pytest.skip(f"needs tokenspeed_engine.scheduler + tokenspeed_kernel: {exc}")
         if not gdn_chunk_prefill_stores_state_checkpoints(
             torch.bfloat16,
             head_dim=self.D,

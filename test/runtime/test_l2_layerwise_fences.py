@@ -66,7 +66,7 @@ def host_cache(request, io_backend):
     """
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
-    ts = pytest.importorskip("tokenspeed_scheduler")
+    ts = pytest.importorskip("tokenspeed_engine.scheduler")
     from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
     from tokenspeed.runtime.cache.l2.sizing import RetractionPoolRequest
     from tokenspeed.runtime.execution.device import DeviceHandle
