@@ -41,6 +41,7 @@
 #include "fsm/forward_events.h"
 #include "fsm/forward_states.h"
 #include "scheduler/capacity_model.h"
+#include "scheduler/operations/admission.h"
 #include "scheduler/operations/forward.h"
 #include "scheduler/operations/group_demands.h"
 #include "cache/prefix/prefix_hasher.h"
@@ -112,9 +113,8 @@ Scheduler::Scheduler(SchedulerConfig config)
     max_single_request_tokens_ = CapacityModel{config_}.MaxSingleRequestTokens(coordinator_.TotalLcmBlocks());
 
     if (config_.enable_kv_cache_events) {
-        coordinator_.SetCacheMutationSink([this](const CacheKey& key, CacheCoordinator::CacheMutation) {
-            markKvEventBoundaryForReconcile(eventKey(key));
-        });
+        coordinator_.SetCacheMutationSink(
+            [this](const CacheKey& key, CacheMutation) { markKvEventBoundaryForReconcile(eventKey(key)); });
     }
 
     // Validate requires in-forward checkpoints, and with them prefix caching,
@@ -140,18 +140,7 @@ Request* Scheduler::findRequest(const std::string& request_id) {
 }
 
 bool Scheduler::pdTransferInFlight(const Request& request) const {
-    switch (config_.role) {
-        case Role::kD:
-            return request.IsAnyOf<fsm::RemotePrefilling, fsm::PdTransferring>();
-        case Role::kP:
-            // Every page-holding state but Finishing, PdTransferring
-            // included: SucceededEvent moves a request to Finishing once the
-            // peer has read its pages.
-            return request.HoldsPages() && !request.Is<fsm::Finishing>();
-        case Role::kFused:
-            return false;
-    }
-    return false;
+    return PdTransferInFlight(config_.role, request);
 }
 
 bool Scheduler::PdTransferPinned(const std::string& request_id) const {
@@ -533,14 +522,14 @@ HostCacheStats Scheduler::GetHostCacheStats() const {
         .eviction_stores = tier_transfers_.WriteBackStatsFor(HostStoreCause::kEviction),
         .prefix_loads = tier_transfers_.PrefixLoadStats(),
         .restore_loads = tier_transfers_.RestoreLoadStats(),
-        .host_evictions = coordinator_.HostEvictions(),
-        .store_candidates_dropped_by_flush = coordinator_.StoreCandidatesDroppedByFlush(),
+        .host_evictions = coordinator_.Evictor().HostEvictions(),
+        .store_candidates_dropped_by_flush = coordinator_.Host().StoreCandidatesDroppedByFlush(),
         .dead_entries_not_written_back = coordinator_.DeadEntriesNotWrittenBack(),
         .demoted_entries_not_written_back = coordinator_.DemotedEntriesNotWrittenBack(),
         .device_evictions = coordinator_.DeviceEvictions(),
-        .lone_compactions = coordinator_.LoneCompactions(),
-        .lone_compaction_moves = coordinator_.LoneCompactionMoves(),
-        .checkpoint_resume_gaps = coordinator_.CheckpointResumeGaps(),
+        .lone_compactions = lone_requests_.Compactions(),
+        .lone_compaction_moves = lone_requests_.CompactionMoves(),
+        .checkpoint_resume_gaps = coordinator_.History().CheckpointResumeGaps(),
     };
 }
 
@@ -644,6 +633,7 @@ ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
         }
     }
     ++plan_calls_;
+    lone_requests_.StartPlan();
     const std::size_t num_live_requests = candidates.size();
     ExecutionPlan plan;
     for (const std::string& group_id : cache_group_ids_) {
@@ -724,8 +714,8 @@ ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
     // warning as before. The abort ends the streak, like any plan carrying
     // an abort: the next request stuck alone is judged on a streak of its
     // own.
-    if (config_.role == Role::kFused && stalled_rounds_ >= kNoProgressAbortPlans &&
-        last_lone_compaction_plan_ != plan_calls_ && built.blocked_alone != nullptr) {
+    if (config_.role == Role::kFused && stalled_rounds_ >= kNoProgressAbortPlans && !lone_requests_.ActedInPlan() &&
+        built.blocked_alone != nullptr) {
         Request& stuck = *built.blocked_alone;
         const bool restore = stuck.Is<fsm::Retracted>();
         const std::string detail = fmt::format(

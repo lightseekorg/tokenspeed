@@ -3976,8 +3976,7 @@ TEST(RetractionHeadroom, ReservesOnlyTheRemainingGenerationBudget) {
     std::vector<BlockTable> restored(coordinator.NumGroups());
     std::vector<GroupDemand> demands{GroupDemand{.table = &restored[0], .extent = DenseGrowth{0}, .reserve_tokens = 1}};
     ASSERT_TRUE(coordinator.Restore(request.GetIf<fsm::Retracted>()->image, demands,
-                                    /*copy_in_point=*/std::nullopt, /*request_access_epoch=*/1,
-                                    /*drop_claims_if_unfit=*/false));
+                                    /*copy_in_point=*/std::nullopt, /*request_access_epoch=*/1));
     request.Apply(
         fsm::ScheduleRestoreEvent{&coordinator, std::move(restored), /*copy_in_blocks=*/{}, /*restore_op=*/7});
     ASSERT_TRUE(request.Is<fsm::Restoring>());
@@ -4801,8 +4800,7 @@ TEST(CacheProgressTest, JunctionSurvivesPrefillRounds) {
     RequestSpec spec{.request_id = "r1", .tokens = MakeAlignedTokens(/*num_pages=*/6, /*granularity=*/2)};
     Request request{spec, /*prefix_granularity=*/2, Role::kFused};
     std::vector<BlockTable> tables(coordinator.NumGroups());
-    const std::optional<CacheCoordinator::AdmissionResult> admission =
-        AdmitForTest(coordinator, tables, /*num_tokens=*/4);
+    const std::optional<AdmissionResult> admission = AdmitForTest(coordinator, tables, /*num_tokens=*/4);
     ASSERT_TRUE(admission);
 
     request.Apply(fsm::SchedulePrefillFirstChunkEvent{/*tokens_this_round=*/4,
@@ -5019,7 +5017,7 @@ TEST_F(JunctionCutHostSuite, HostOnlyKvCutsTheFirstChunkAtTheJunction) {
     ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 7) << "six KV pages and state@12";
     ASSERT_TRUE(scheduler_->ClearL1Cache());
     // The clear evicts the six pages and state@12; Host holds all seven.
-    const CacheCoordinator::DeviceEvictionCounts flushed = scheduler_->GetHostCacheStats().device_evictions.flush;
+    const CacheEvictor::DeviceEvictionCounts flushed = scheduler_->GetHostCacheStats().device_evictions.flush;
     EXPECT_EQ(flushed.blocks, 7u);
     EXPECT_EQ(flushed.host_resident, 7u);
 
@@ -5095,7 +5093,7 @@ TEST(CacheProgressTest, RemotePrefillPreservesDecodeReserve) {
     Request request{spec, /*prefix_granularity=*/2, Role::kD};
     request.Apply(fsm::BootstrappedEvent{});
     std::vector<BlockTable> tables(coordinator.NumGroups());
-    const std::optional<CacheCoordinator::AdmissionResult> admission =
+    const std::optional<AdmissionResult> admission =
         AdmitForTest(coordinator, tables, GroupDemand{.extent = DenseGrowth{4}, .reserve_tokens = 3});
     ASSERT_TRUE(admission);
 
@@ -5169,8 +5167,7 @@ TEST(RetractionStateFsmTest, ADecodingVictimSuspendsAndResumesDecodingWithTheSam
     std::vector<BlockTable> restored(coordinator.NumGroups());
     std::vector<GroupDemand> demands{GroupDemand{.table = &restored[0], .extent = DenseGrowth{0}, .reserve_tokens = 1}};
     const auto restore =
-        coordinator.Restore(retracted->image, demands, /*copy_in_point=*/std::nullopt, admission->access_epoch,
-                            /*drop_claims_if_unfit=*/false);
+        coordinator.Restore(retracted->image, demands, /*copy_in_point=*/std::nullopt, admission->access_epoch);
     ASSERT_TRUE(restore);
     ASSERT_EQ(restore->snapshot_pairs.size(), 2u) << "the 4 computed prompt tokens; the decode input has no KV yet";
     request.Apply(
@@ -5217,8 +5214,7 @@ TEST(SnapshotRetractEvent, APrefillDoneVictimResumesAsPrefillDone) {
     RequestSpec spec{.request_id = "r1", .tokens = MakeAlignedTokens(/*num_pages=*/2, /*granularity=*/2)};
     Request request{spec, /*prefix_granularity=*/2, Role::kFused};
     std::vector<BlockTable> tables(coordinator.NumGroups());
-    const std::optional<CacheCoordinator::AdmissionResult> admission =
-        AdmitForTest(coordinator, tables, /*num_tokens=*/4);
+    const std::optional<AdmissionResult> admission = AdmitForTest(coordinator, tables, /*num_tokens=*/4);
     ASSERT_TRUE(admission);
 
     // Whole 4-token prompt in one chunk -> PrefillDone: holds pages, no decode yet.
@@ -5254,8 +5250,8 @@ TEST(SnapshotRetractEvent, APrefillDoneVictimResumesAsPrefillDone) {
         GroupDemand{.table = &restored[0], .extent = DenseGrowth{0}, .reserve_tokens = 1},
         GroupDemand{.table = &restored[1], .extent = DenseGrowth{0}, .reserve_tokens = 1},
     };
-    ASSERT_TRUE(coordinator.Restore(retracted->image, demands, /*copy_in_point=*/std::nullopt, admission->access_epoch,
-                                    /*drop_claims_if_unfit=*/false));
+    ASSERT_TRUE(
+        coordinator.Restore(retracted->image, demands, /*copy_in_point=*/std::nullopt, admission->access_epoch));
     request.Apply(
         fsm::ScheduleRestoreEvent{&coordinator, std::move(restored), /*copy_in_blocks=*/{}, /*restore_op=*/1});
     request.Apply(fsm::RestoreDoneEvent{req_pool.Allocate(), DecodeSlotIndex{}});
@@ -5663,7 +5659,7 @@ TEST_F(PrefixHitSuite, ClearL1CacheRemovesAnIdlePrefix) {
     EXPECT_NE(log.find("flush L1 cache completed"), std::string::npos);
     // r1 published 9 computed tokens: four pages and a one-token tail in each
     // of the two groups. No Host pool holds anything.
-    const CacheCoordinator::DeviceEvictionStats evictions = scheduler_->GetHostCacheStats().device_evictions;
+    const CacheEvictor::DeviceEvictionStats evictions = scheduler_->GetHostCacheStats().device_evictions;
     EXPECT_EQ(evictions.flush.blocks, 10u);
     EXPECT_EQ(evictions.flush.host_resident, 0u);
     EXPECT_EQ(evictions.admission.blocks + evictions.restore.blocks + evictions.tail_cap.blocks, 0u);
