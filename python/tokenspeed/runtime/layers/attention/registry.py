@@ -1290,7 +1290,7 @@ def _draft_only_group_ids(
 
 
 def _validate_hybrid_kvp_cache(
-    spec: CachePoolSpec, *, kvp_size: int, num_target_layers: int | None = None
+    spec: CachePoolSpec, *, kvp_size: int, num_target_layers: int
 ) -> None:
     """Validate declared storage, independent of recipe name or inheritance.
 
@@ -1300,11 +1300,7 @@ def _validate_hybrid_kvp_cache(
     groups = spec.cache_group_specs
     if not any(group.attn_kind == "full_history" for group in groups):
         raise ValueError("Hybrid MLA KVP requires a full-history cache group")
-    draft_groups = (
-        frozenset()
-        if num_target_layers is None
-        else _draft_only_group_ids(spec, num_target_layers=num_target_layers)
-    )
+    draft_groups = _draft_only_group_ids(spec, num_target_layers=num_target_layers)
     for group in groups:
         if group.attn_kind == "sliding_window" and group.group_id not in draft_groups:
             raise ValueError(
