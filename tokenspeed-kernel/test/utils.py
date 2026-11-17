@@ -27,6 +27,7 @@ from typing import Any
 from unittest.mock import patch
 
 import torch
+from tokenspeed_kernel.compile_monitor import serving_selection
 from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import (
     ArchVersion,
@@ -130,6 +131,42 @@ def assert_warmup_covers(
     with assert_no_triton_compile(*kernels):
         for value in sweep:
             run(value)
+
+
+def _launched_kernels(block: Callable[[], Any]) -> set[str]:
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA]
+    ) as profile:
+        block()
+        torch.cuda.synchronize()
+    return {
+        event.name
+        for event in profile.events()
+        if event.device_type == torch.autograd.DeviceType.CUDA
+    }
+
+
+def assert_warmup_launches_cover(
+    warm: Callable[[], Any], run: Callable[[Any], Any], sweep: Iterable[Any]
+) -> None:
+    """Fail if ``run`` launches, for a ``sweep`` value, a GPU kernel ``warm`` did not.
+
+    A library such as cuBLAS picks its kernel per shape and loads a kernel on
+    its first launch; a kernel ``warm`` launched once is loaded, so a later
+    launch of it loads nothing. ``run`` executes as serving selects kernels.
+    Build ``run``'s inputs beforehand: kernels that make them count as
+    launches too.
+    """
+    warmed = _launched_kernels(warm)
+    sweep = tuple(sweep)
+
+    def serve() -> None:
+        with serving_selection():
+            for value in sweep:
+                run(value)
+
+    missing = _launched_kernels(serve) - warmed
+    assert not missing, f"kernels launched after the warm-up only: {sorted(missing)}"
 
 
 @contextmanager

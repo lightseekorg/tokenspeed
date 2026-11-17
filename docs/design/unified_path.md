@@ -970,6 +970,12 @@ consumer rows carry no deferred post. Cache-only narrowing completes the incomin
 post before the global KV producer and skips new HC mixes; idle ranks still
 participate in expert-owned dispatch/combine, which never defers another reduction.
 
+The eager stages (the narrowing layer, the attention break inside each
+captured segment, and the logits tail) run at the live row count, not a
+bucket's. Library GEMMs there choose and load a kernel per row count, so
+DeepSeek V4.1 launches each one at every row count it can see before serving
+(`event-loop.md`).
+
 ### Drafter prefill graphs
 
 The drafter's work inside an extend forward replays from graphs too. The

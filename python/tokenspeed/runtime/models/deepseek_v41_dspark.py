@@ -31,6 +31,7 @@ CPU reference.
 
 from __future__ import annotations
 
+import functools
 import re
 from copy import copy
 from dataclasses import dataclass, replace
@@ -55,9 +56,15 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import (
 from tokenspeed.runtime.models.deepseek_v41 import (
     DeepseekV41ForCausalLM,
     DeepseekV41Model,
+    _forward_rows,
+    _launch_row_count_sites,
+    _max_decode_rows,
     _merged,
     _norm,
     _replicated,
+    _RowCountSite,
+    _unquantized_linear_sites,
+    _warmup_torch_row_counts,
     v41_hc_pre,
     v41_mxfp8_config,
     v41_quantize_fp8,
@@ -65,6 +72,7 @@ from tokenspeed.runtime.models.deepseek_v41 import (
 from tokenspeed.runtime.models.deepseek_v41_dspark_heads import DSparkVanillaMarkov
 from tokenspeed.runtime.models.target_capture import TargetCaptureConfigurator
 from tokenspeed.runtime.utils import add_prefix
+from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
 def _quantized_kv(x: torch.Tensor) -> torch.Tensor:
@@ -583,6 +591,62 @@ class DeepseekV41ForCausalLMDSpark(DeepseekV41ForCausalLM, TargetCaptureConfigur
     def set_embed_and_head(self, embed, head) -> None:
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
+
+    def post_quant_warmup(self) -> None:
+        super().post_quant_warmup()
+        if next(self.parameters()).is_cuda:
+            _launch_row_count_sites(self._draft_row_count_sites())
+
+    def _draft_row_count_sites(self) -> list[_RowCountSite]:
+        """The draft's own library GEMMs that run at the live row count.
+
+        Beyond the decoder layers and head that the inherited warm-up covers:
+        main_proj and context_wkv on the captured target rows, the FP32 base
+        logits on the shared head and, under adaptive DSpark, the FP32
+        confidence head on the drafted rows. Decode-only rounds replay these
+        inside the decode graphs; extend and mixed rounds, and batches above
+        the graph ladder, run them eagerly.
+        """
+        model = self.model
+        sites = _unquantized_linear_sites(
+            (model.main_proj, model.context_wkv), functools.partial(_forward_rows, 1)
+        )
+        head = self.lm_head.weight
+        base_logits = functools.partial(model.local_base_logits, head=head)
+        sites.append(
+            _RowCountSite(
+                ("dspark_base_logits", head.device, tuple(head.shape), head.dtype),
+                _max_decode_rows,
+                functools.partial(
+                    _warmup_torch_row_counts,
+                    base_logits,
+                    head.shape[1],
+                    head.dtype,
+                    head.device,
+                ),
+            )
+        )
+        if global_server_args_dict["enable_dsv41_adaptive_dspark"]:
+            weight = model.confidence_projection.weight
+            sites.append(
+                _RowCountSite(
+                    (
+                        "dspark_confidence",
+                        weight.device,
+                        tuple(weight.shape),
+                        weight.dtype,
+                    ),
+                    _max_decode_rows,
+                    functools.partial(
+                        _warmup_torch_row_counts,
+                        model.confidence_projection,
+                        weight.shape[1],
+                        weight.dtype,
+                        weight.device,
+                    ),
+                )
+            )
+        return sites
 
     def checkpoint_weight_name_filter(self, name: str) -> bool:
         return name.removeprefix("model.").startswith("mtp.")

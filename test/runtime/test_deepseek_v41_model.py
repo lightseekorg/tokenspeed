@@ -75,6 +75,7 @@ from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
     V41DecoderView,
     V41PrefillSpan,
 )
+from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.linear import LinearBase, ReplicatedLinear
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
 from tokenspeed.runtime.layers.mlp import GatedMLP, gated_activation
@@ -5069,3 +5070,175 @@ def test_mega_moe_takes_the_shared_expert_once(monkeypatch, caplog, case):
         shared.down_proj.weight_scale_inv,
     )
     assert all(t.data_ptr() == p.data_ptr() for t, p in zip(tensors, params))
+
+
+class _GatedDenseFFN(_DenseFFN):
+    """The dense test double with the MoE gate's FP32 projection weight."""
+
+    def __init__(self, config, mapping, quant_config, layer_index, prefix, aux_stream):
+        super().__init__(config, mapping, quant_config, layer_index, prefix, aux_stream)
+        self.gate.weight = nn.Parameter(
+            torch.empty(
+                config.n_routed_experts, config.hidden_size, dtype=torch.bfloat16
+            ),
+            requires_grad=False,
+        )
+
+
+class _TinyBf16LayerModel(BaseCausalLM):
+    """One BF16 V4.1 decoder layer behind the V4.1 warm-up hook."""
+
+    def __init__(self, config, mapping, layer_id):
+        super().__init__(config=SimpleNamespace(), mapping=mapping, encoder_only=True)
+        self.model = nn.Module()
+        self.model.layers = nn.ModuleList(
+            [
+                DeepseekV41DecoderLayer(
+                    config,
+                    mapping,
+                    layer_id,
+                    20,
+                    None,
+                    f"layers.{layer_id}",
+                    None,
+                    None,
+                    False,
+                    "gpu",
+                    None,
+                )
+            ]
+        )
+
+
+def _row_count_server_args(monkeypatch, chunk):
+    for key, value in {
+        "chunked_prefill_size": chunk,
+        "max_prefill_tokens": 64,
+        "max_model_len": 4096,
+        "max_num_seqs": 4,
+        "max_cudagraph_capture_size": 8,
+        "speculative_algorithm": None,
+        "input_logprob_chunk_tokens": 16,
+    }.items():
+        monkeypatch.setitem(global_server_args_dict, key, value)
+
+
+def _record_row_count_warmups(monkeypatch):
+    """Record the GPU-only warm-ups instead of launching them."""
+    calls = []
+    monkeypatch.setattr(
+        v41,
+        "warmup_dsv4_linear_fp32",
+        lambda weight, dtype, rows: calls.append(("fp32", weight.data_ptr(), rows)),
+    )
+    monkeypatch.setattr(
+        v41,
+        "warmup_grouped_bf16_projection",
+        lambda weight, stride, quantize, rows: calls.append(
+            ("grouped", stride, quantize, rows)
+        ),
+    )
+    monkeypatch.setattr(
+        UnquantizedLinearMethod,
+        "warmup_row_counts",
+        lambda self, layer, rows: calls.append(
+            ("linear", tuple(layer.weight.shape), rows)
+        ),
+    )
+    monkeypatch.setattr(v41, "_ROW_COUNTS_WARMED", {})
+    return calls
+
+
+@pytest.mark.parametrize("owns_ep", [False, True])
+def test_row_count_warmup_launches_each_eager_library_gemm(monkeypatch, owns_ep):
+    """Each library GEMM the attention break and the MoE run at the live row
+    count is launched up to the rows it sees: the MoE gate sees every attention
+    DP group's rows unless the experts own their communication. wo_a's and the
+    ratio-2 compressor's own linear GEMMs are not, since the forward hands
+    their weights to the grouped and FP32 projections."""
+    monkeypatch.setattr(v41, "DeepseekV41MoE", _GatedDenseFFN)
+    calls = _record_row_count_warmups(monkeypatch)
+    _row_count_server_args(monkeypatch, 64)
+    mapping = v41.Mapping(
+        rank=0,
+        world_size=2,
+        attn_tp_size=1,
+        dense_tp_size=1,
+        moe_tp_size=1,
+        moe_ep_size=2,
+    )
+    config = _config()
+    # 512-wide heads, which eager decode pads to the kernel's head count.
+    config.hidden_size = 256
+    config.num_attention_heads = config.o_groups = 2
+    config.head_dim, config.qk_rope_head_dim = 512, 64
+    config.q_lora_rank = config.o_lora_rank = 128
+    # Layer 2 owns a ratio-2 compressor and an indexer.
+    model = _TinyBf16LayerModel(config, mapping, 2)
+    layer = model.model.layers[0]
+    layer.ffn.owns_ep_communication = owns_ep
+    attn = layer.attn
+    (compressor,) = [
+        module
+        for module in attn.modules()
+        if isinstance(module, v41.DeepseekV41Compressor)
+    ]
+    assert compressor.ratio == 2 and attn.indexer is not None and not attn.wo_a_fp8
+
+    v41._launch_row_count_sites(v41._row_count_sites(model))
+
+    linears = {
+        tuple(module.weight.shape)
+        for module in attn.modules()
+        if isinstance(module, LinearBase)
+        and module is not attn.wo_a
+        and module is not compressor.wkv_wgate
+    }
+    assert {call[1] for call in calls if call[0] == "linear"} == linears
+    assert all(call[2] == 64 for call in calls if call[0] == "linear")
+    assert sorted(call[1:] for call in calls if call[0] == "fp32") == sorted(
+        [
+            (compressor.wkv_wgate.weight.data_ptr(), 64),
+            (layer.ffn.gate.weight.data_ptr(), 64 if owns_ep else 128),
+        ]
+    )
+    head_dim = attn.head_dim
+    assert sorted(call[1:] for call in calls if call[0] == "grouped") == [
+        (attn.n_local_heads * head_dim, False, 64),
+        (attn.n_kernel_heads * head_dim, False, 64),
+    ]
+
+
+def test_row_count_warmup_launches_nothing_already_warmed(monkeypatch):
+    """A second model of the same shapes, such as the DSpark draft, launches
+    nothing the first already launched to as many rows."""
+    monkeypatch.setattr(v41, "DeepseekV41MoE", _GatedDenseFFN)
+    calls = _record_row_count_warmups(monkeypatch)
+    _row_count_server_args(monkeypatch, 64)
+    model = _TinyBf16LayerModel(_config(), _mapping(0, 1, 1), 2)
+    v41._launch_row_count_sites(v41._row_count_sites(model))
+    assert calls
+    calls.clear()
+    model = _TinyBf16LayerModel(_config(), _mapping(0, 1, 1), 2)
+    v41._launch_row_count_sites(v41._row_count_sites(model))
+    assert not calls
+
+
+def test_row_count_warmup_warns_without_chunked_prefill(monkeypatch, caplog):
+    monkeypatch.setattr(v41, "DeepseekV41MoE", _GatedDenseFFN)
+    calls = _record_row_count_warmups(monkeypatch)
+    _row_count_server_args(monkeypatch, -1)
+    model = _TinyBf16LayerModel(_config(), _mapping(0, 1, 1), 2)
+    with caplog.at_level(logging.WARNING, logger=v41.logger.name):
+        v41._launch_row_count_sites(v41._row_count_sites(model))
+    assert not calls
+    (record,) = caplog.records
+    assert "--chunked-prefill-size" in record.getMessage()
+
+
+def test_row_count_warmup_reads_no_server_argument_without_sites(monkeypatch):
+    """A model with no eager library GEMM, such as one whose projections are
+    all FP8, warms nothing and reads no server argument."""
+    for key in ("chunked_prefill_size", "max_num_seqs", "input_logprob_chunk_tokens"):
+        monkeypatch.setitem(global_server_args_dict, key, None)
+    v41._launch_row_count_sites(v41._row_count_sites(_TinyFp8Model()))

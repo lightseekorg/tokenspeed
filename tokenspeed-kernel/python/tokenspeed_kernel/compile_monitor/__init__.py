@@ -56,7 +56,8 @@ import os
 import sys
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -78,6 +79,7 @@ __all__ = [
     "is_serving",
     "mark_serving",
     "reopen_startup",
+    "serving_selection",
     "uninstall_compile_monitor",
 ]
 
@@ -520,8 +522,28 @@ def reopen_startup(reloaded_modules: Iterable[str]) -> None:
 
 
 def is_serving() -> bool:
-    """Whether startup has ended, after which no kernel may compile per batch shape."""
+    """Whether the compile switch is closed (startup has ended, or a
+    :func:`serving_selection` block is open): no kernel may compile per batch shape."""
     return _serving
+
+
+@contextmanager
+def serving_selection() -> Iterator[None]:
+    """Close the compile switch for the block, so kernels are selected as serving selects them.
+
+    :func:`is_serving` reads true inside the block and its previous value is
+    restored on exit. The monitor's window is not touched: a compilation inside
+    the block is recorded as a startup compilation. For a startup pass that
+    launches serving's kernels ahead of serving; startup is single-threaded, so
+    the switch is not guarded against other threads.
+    """
+    global _serving
+    previous = _serving
+    _serving = True
+    try:
+        yield
+    finally:
+        _serving = previous
 
 
 def compile_stats() -> CompileStats | None:

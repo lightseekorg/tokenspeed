@@ -408,3 +408,33 @@ def test_reopening_startup_reopens_the_compile_switch():
     compile_monitor.mark_serving()
     compile_monitor.reopen_startup([])
     assert not compile_monitor.is_serving()
+
+
+def test_serving_selection_closes_the_switch_for_the_block_only(monkeypatch):
+    monkeypatch.setattr(compile_monitor, "_hooks", None)
+    with compile_monitor.serving_selection():
+        assert compile_monitor.is_serving()
+    assert not compile_monitor.is_serving()
+    with pytest.raises(RuntimeError, match="body"):
+        with compile_monitor.serving_selection():
+            raise RuntimeError("body")
+    assert not compile_monitor.is_serving()
+    compile_monitor.mark_serving()
+    with compile_monitor.serving_selection():
+        assert compile_monitor.is_serving()
+    assert compile_monitor.is_serving()
+
+
+def test_compilations_under_serving_selection_count_as_startup(device):
+    compile_monitor.install_compile_monitor("error")
+    try:
+        x = torch.empty(64, device=device)
+        scale = float(torch.randint(1, 1 << 20, ()).item())
+        with compile_monitor.serving_selection():
+            # Under "error", serving compilations of new N values would raise.
+            for count in range(3, 64, 2):
+                _fill_kernel[(1,)](x, 64, count, scale, 64)
+        stats = compile_monitor.compile_stats()
+        assert (stats.startup_compiles, stats.serving_compiles) == (31, 0)
+    finally:
+        compile_monitor.uninstall_compile_monitor()
