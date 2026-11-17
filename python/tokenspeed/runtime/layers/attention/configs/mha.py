@@ -105,9 +105,6 @@ class MHAConfig(SoftmaxAttnConfig):
         )
         return AttnConfig(
             components=(spec,),
-            draft_block_causal=(
-                draft_block_decode and block_draft_is_causal(hf_config)
-            ),
             **model_wide_kwargs(
                 server_args,
                 model_config,
@@ -115,6 +112,9 @@ class MHAConfig(SoftmaxAttnConfig):
                 kv_cache_dtype=resolve_dtype(kv_cache_dtype),
                 kv_cache_mxfp8=kv_cache_dtype == "mxfp8",
                 draft_block_decode=draft_block_decode,
+                draft_block_causal=(
+                    draft_block_decode and block_draft_is_causal(hf_config)
+                ),
             ),
         )
 
