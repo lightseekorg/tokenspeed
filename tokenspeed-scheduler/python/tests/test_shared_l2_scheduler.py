@@ -210,11 +210,8 @@ def publish(writer, runtime, rid, tokens):
 
 def settled(s, pool):
     """Nothing of the rank is left at the pool or in its proxy."""
-    stats = s.shared_l2_stats()
     return (
-        stats.tickets == 0
-        and stats.writes_in_flight == 0
-        and s.host_pool_cached_blocks() == 0
+        s.host_pool_cached_blocks() == 0
         and pool.stats()["pinned_blocks"] == 0
         and pool.stats()["reserved_blocks"] == 0
         and pool.stats()["lookups"] == 0
@@ -276,7 +273,7 @@ def test_a_waiting_prompt_is_admitted_only_after_its_lookup():
     # One lookup per prompt.
     for _ in range(3):
         reader_rt.plan(reader)
-    assert reader.shared_l2_stats().lookups == 1 and not reader_rt.lookups
+    assert not reader_rt.lookups
 
 
 def test_the_pool_pins_a_hit_until_its_load_completes():
@@ -549,7 +546,6 @@ def test_an_answer_outside_its_prompt_is_refused():
             [(lookup_id, 0, num_tokens, kv_tokens, tail, slots)]
         )
     # Nothing of either answer was taken, and no plan runs the prompt.
-    assert reader.shared_l2_stats().hits == 0
     assert reader.host_pool_cached_blocks() == 0
     reader_rt.plan(reader, lookup=False)
     assert "b" not in reader_rt.forwarded
@@ -562,7 +558,6 @@ def test_a_cold_pool_leaves_the_request_to_ordinary_admission():
     assert list(batch.extend_prefix_lens) == [0]
     assert not runtime.loads and not runtime.released
     assert pool.stats()["pinned_blocks"] == 0
-    assert s.shared_l2_stats().hits == 0
 
 
 def _with_l3(cfg):
@@ -689,7 +684,6 @@ def test_writes_left_open_pin_no_more_than_their_bound_and_admissions_go_on():
     # later prompts.
     assert len(rt.writes) == 2 and len(rt.open_writes) == 2
     assert all(len(op.keys) == 3 for op in rt.writes)
-    assert s.shared_l2_stats().writes_in_flight == 2
     # No request is left: the Device blocks out of reach are the six the two
     # writes read.
     assert s.active_lcm_blocks() == 0
@@ -731,7 +725,6 @@ def test_a_malformed_answer_is_refused(flaw):
             [(lookup_id, ticket, num_tokens, kv_tokens, tail, slots)]
         )
     # Nothing of the answer was taken.
-    assert reader.shared_l2_stats().hits == 0
     assert reader.host_pool_cached_blocks() == 0
 
 

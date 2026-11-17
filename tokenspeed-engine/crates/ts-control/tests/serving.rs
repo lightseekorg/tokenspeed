@@ -1538,7 +1538,6 @@ fn run_rank<F: Frontend>(
             l3_metrics: None,
             l3: store.map(|store| l3_executor(store, rank)),
             pool,
-            pool_metrics: None,
         },
     );
     if event_loop.warm_up(startup::requests(&startup, STARTUP_OUTPUT_TOKENS), stop)? {

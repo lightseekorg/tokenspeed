@@ -61,7 +61,6 @@ SharedL2Proxy::SharedL2Proxy(CacheCoordinator& coordinator) : coordinator_{coord
 SharedL2LookupHold SharedL2Proxy::StartLookup(const std::string& request_id) {
     const std::uint64_t lookup_id = ++next_lookup_id_;
     pending_.emplace(lookup_id, request_id);
-    ++num_lookups_;
     return SharedL2LookupHold{*this, lookup_id};
 }
 
@@ -104,7 +103,6 @@ std::vector<SharedL2ProxyPage> SharedL2Proxy::ApplyAnswer(const SharedL2LookupRe
     if (result.keys.empty()) {
         return created;
     }
-    ++num_hits_;
     // A key a proxy entry stands for already is pinned at the owner by the
     // ticket that entry was created under, which stays until the entry goes.
     std::vector<CacheBlockRef> shared;
@@ -124,7 +122,6 @@ std::vector<SharedL2ProxyPage> SharedL2Proxy::ApplyAnswer(const SharedL2LookupRe
     if (batch.stats.unallocated != 0) {
         // The proxy tier is sized past the pool, so only a mis-sized rank
         // gets here: the prompt computes its prefix instead.
-        ++num_proxy_overflows_;
         spdlog::warn("[SharedL2] lookup {}: the proxy Host tier has no room for {} of {} pool pages; taken as a miss",
                      result.lookup_id, batch.stats.unallocated, result.keys.size());
         commands_.push_back(SharedL2ReleaseOperation{result.ticket});
@@ -178,15 +175,6 @@ void SharedL2Proxy::ReleaseUnheld() {
         }
     }
     std::erase_if(tickets_, [](const TicketEntries& ticket) { return ticket.keys.empty(); });
-}
-
-SharedL2Stats SharedL2Proxy::Stats() const {
-    return SharedL2Stats{
-        .lookups = num_lookups_,
-        .hits = num_hits_,
-        .proxy_overflows = num_proxy_overflows_,
-        .tickets = tickets_.size(),
-    };
 }
 
 }  // namespace tokenspeed

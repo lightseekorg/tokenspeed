@@ -189,7 +189,8 @@ class _Rank(closed_loop._Loop):
             elif isinstance(op, ts.Cache.SharedL2WriteOp):
                 assert len(op.keys) <= self.shared.limits[1]
                 self.writes.append((self.round + self.io.randrange(4), op))
-        assert self.real.shared_l2_stats().writes_in_flight <= self.shared.limits[0]
+        # Every write not reported yet is one the scheduler has in flight.
+        assert len(self.writes) <= self.shared.limits[0]
         self.carry_out(everything=False)
 
     def carry_out(self, everything: bool) -> None:
@@ -301,8 +302,6 @@ def _run(seed: int, roles) -> dict:
     else:
         pytest.fail("the ranks did not drain")
     for rank in ranks:
-        stats = rank.real.shared_l2_stats()
-        assert (stats.tickets, stats.writes_in_flight) == (0, 0)
         assert rank.real.host_pool_cached_blocks() == 0, "a proxy entry is left"
         assert rank.real.waiting_size() == 0
         assert rank.real.can_clear_cache()
@@ -318,8 +317,8 @@ def _run(seed: int, roles) -> dict:
         "pool evictions": pool["evicted_blocks"],
         "pages written": shared.granted,
         "aborts": sum(rank.aborts for rank in ranks),
-        "junction or pool hits": sum(
-            rank.real.shared_l2_stats().hits for rank in ranks
+        "pool hits": sum(
+            bool(pinned) for rank in ranks for pinned in rank.pinned_for.values()
         ),
     }
 

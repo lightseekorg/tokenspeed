@@ -343,12 +343,6 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("max_writes", &tokenspeed::SharedL2Config::max_writes)
         .def_ro("max_write_keys", &tokenspeed::SharedL2Config::max_write_keys);
     scheduler_config.def_rw("shared_l2_config", &tokenspeed::SchedulerConfig::shared_l2_config);
-    nb::class_<tokenspeed::SharedL2Stats>(m, "SharedL2Stats")
-        .def_ro("lookups", &tokenspeed::SharedL2Stats::lookups)
-        .def_ro("hits", &tokenspeed::SharedL2Stats::hits)
-        .def_ro("proxy_overflows", &tokenspeed::SharedL2Stats::proxy_overflows)
-        .def_ro("tickets", &tokenspeed::SharedL2Stats::tickets)
-        .def_ro("writes_in_flight", &tokenspeed::SharedL2Stats::writes_in_flight);
     nb::enum_<tokenspeed::StorageKind>(m, "StorageKind")
         .value("Query", tokenspeed::StorageKind::kQuery)
         .value("Get", tokenspeed::StorageKind::kGet)
@@ -864,7 +858,6 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
             nb::arg("results"),
             "Apply the pool's answers in order and return the proxy blocks they created. An answer the scheduler "
             "cannot take raises: the runtime stops serving on it.")
-        .def("shared_l2_stats", &tokenspeed::Scheduler::GetSharedL2Stats)
         .def("drain_kv_events",
              [](tokenspeed::Scheduler& s) {
                  nb::list result;

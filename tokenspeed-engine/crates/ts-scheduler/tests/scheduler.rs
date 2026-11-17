@@ -1539,8 +1539,6 @@ fn a_pool_prompt_waits_for_its_lookup_and_resumes_behind_the_hit() {
             .collect::<Vec<_>>(),
         [(0, 0, 11), (0, 0, 12)]
     );
-    let stats = scheduler.shared_l2_stats();
-    assert_eq!((stats.lookups, stats.hits, stats.tickets), (1, 1, 1));
 
     // The prompt resumes behind the hit, which a load-back reads from the
     // proxy blocks.
@@ -1572,7 +1570,6 @@ fn a_pool_prompt_waits_for_its_lookup_and_resumes_behind_the_hit() {
         panic!("a release and a write, got {ops:?}");
     };
     assert_eq!((release.kind, release.id), (SharedL2OpKind::Release, 7));
-    assert_eq!(scheduler.shared_l2_stats().tickets, 0);
     // What the prompt computed goes to the pool: its third page and its
     // tail, not the two pages it loaded from there.
     assert_eq!(write.kind, SharedL2OpKind::Write);
@@ -1615,7 +1612,6 @@ fn a_pool_write_ends_with_its_completion() {
     assert_eq!(write.buckets, [0, 0, 0, 0]);
     assert_eq!(write.blocks.len(), 4);
     assert!(write.publications.is_empty(), "no State checkpoint");
-    assert_eq!(scheduler.shared_l2_stats().writes_in_flight, 1);
     assert!(!scheduler.can_clear_cache());
 
     // Its completion joins the head batch and lets its blocks go; a
@@ -1623,7 +1619,6 @@ fn a_pool_write_ends_with_its_completion() {
     scheduler
         .advance_head(&StorageRound::default(), &[], &[write.id])
         .unwrap();
-    assert_eq!(scheduler.shared_l2_stats().writes_in_flight, 0);
     let error = scheduler
         .advance_head(&StorageRound::default(), &[], &[write.id])
         .unwrap_err();
@@ -1666,10 +1661,10 @@ fn an_answer_the_scheduler_cannot_take_is_an_error() {
         error.what().contains("tail lies strictly inside"),
         "{error}"
     );
-    let stats = scheduler.shared_l2_stats();
-    assert_eq!((stats.hits, stats.tickets), (0, 0));
-    // No plan runs a prompt whose lookup has no answer.
-    assert!(!scheduler.next_execution_plan(true, false).needs_device());
+    // No plan runs a prompt whose lookup has no answer, and none has a
+    // ticket of a refused answer to release.
+    let plan = scheduler.next_execution_plan(true, false);
+    assert!(!plan.needs_device() && plan.shared_l2_ops().is_empty());
 
     // A miss and a hit settle their lookups; a second answer to a lookup
     // names none that waits.
@@ -1729,7 +1724,6 @@ fn without_a_pool_the_pool_calls_ask_nothing_and_fail_as_errors() {
         .submit_requests(&[spec("plain", (1..=40).collect())])
         .unwrap();
     assert!(scheduler.shared_l2_lookups().is_empty());
-    assert_eq!(scheduler.shared_l2_stats(), Default::default());
     let answer = SharedL2AnswerView {
         lookup_id: 1,
         ticket: 0,

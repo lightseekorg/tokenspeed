@@ -225,8 +225,6 @@ public:
         return !write_backs_.empty() || !load_backs_.empty() || !snapshot_stores_.empty() ||
                !snapshot_restores_.empty() || !pool_writes_.empty();
     }
-    // Shared L2 pool writes not completed yet.
-    std::size_t NumPoolWritesInFlight() const { return pool_writes_.size(); }
 
     // Cumulative Host L2 counters, never reset. Accounting only: no
     // scheduling decision reads them. What a drain takes lands in exactly one

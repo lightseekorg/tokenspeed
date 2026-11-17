@@ -55,7 +55,7 @@ use std::{
 };
 
 use ts_collective::{Group, Mesh, Reduce};
-use ts_metrics::{EngineMetrics, L3Metrics, SharedL2Metrics, SharedL2Stats};
+use ts_metrics::{EngineMetrics, L3Metrics};
 use ts_pd::{EmbeddingItem, EmbeddingReceiver, LandedRequest, PdError, PdEvent, TransferPeer};
 use ts_scheduler::{
     profile, CacheEvent, CacheOpKind, ExecutionPlan, ForwardBatchView, ForwardEvent,
@@ -547,8 +547,6 @@ pub struct Subsystems {
     /// With a shared L2 pool as the Host tier, this rank's client of the
     /// pool's owner. `None` without one.
     pub pool: Option<Box<dyn PoolClient + Send>>,
-    /// The pool's metrics, with a pool and `--enable-metrics`.
-    pub pool_metrics: Option<SharedL2Metrics>,
 }
 
 /// One rank's scheduling loop.
@@ -570,7 +568,6 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     l3_metrics: Option<L3Metrics>,
     /// The shared L2 pool: this rank's client and the writes in flight there.
     pool: Option<Pool>,
-    pool_metrics: Option<SharedL2Metrics>,
     /// Admissions waiting for their grammars to compile, in arrival order.
     grammar_queue: Vec<(Submission, GrammarKey, Instant)>,
     /// The last cumulative prefix-hit counters reported, for deltas.
@@ -647,7 +644,6 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             l3: subsystems.l3.map(Tier::new),
             l3_metrics: subsystems.l3_metrics,
             pool: subsystems.pool.map(Pool::new),
-            pool_metrics: subsystems.pool_metrics,
             scheduler,
             data_plane,
             frontend,
@@ -842,7 +838,6 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 .map_err(|error| LoopError::Scheduler(error.what().to_owned()))?;
         }
         self.record_storage_metrics()?;
-        self.record_pool_metrics()?;
 
         let mut events = Vec::new();
         if !forward_allowed {
@@ -1695,24 +1690,6 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             &snapshot,
             &crate::l3::scheduler_stats(self.scheduler.storage_stats()),
         );
-        Ok(())
-    }
-
-    /// Sample the shared L2 pool's metrics, at most once a second.
-    fn record_pool_metrics(&mut self) -> Result<(), LoopError> {
-        let (Some(pool), Some(metrics)) = (self.pool.as_mut(), self.pool_metrics.as_mut()) else {
-            return Ok(());
-        };
-        if pool.metrics_due() {
-            let stats = self.scheduler.shared_l2_stats();
-            metrics.record(&SharedL2Stats {
-                lookups: stats.lookups as f64,
-                hits: stats.hits as f64,
-                proxy_overflows: stats.proxy_overflows as f64,
-                tickets: stats.tickets as f64,
-                writes_in_flight: stats.writes_in_flight as f64,
-            });
-        }
         Ok(())
     }
 

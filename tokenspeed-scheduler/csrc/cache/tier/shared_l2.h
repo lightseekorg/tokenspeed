@@ -127,19 +127,6 @@ struct SharedL2TouchOperation {
 
 using SharedL2Operation = std::variant<SharedL2WriteOperation, SharedL2ReleaseOperation, SharedL2TouchOperation>;
 
-// Scheduler-owned observations of a shared L2 rank, cumulative unless noted.
-struct SharedL2Stats {
-    std::uint64_t lookups{0};
-    // Answers that pinned something at the owner, whether or not the prompt
-    // then loaded from it: the proxy overflows are among them.
-    std::uint64_t hits{0};
-    // Answers the proxy Host tier had no room to mirror, taken as misses.
-    std::uint64_t proxy_overflows{0};
-    // Now: owner tickets not released, writes not completed.
-    std::uint64_t tickets{0};
-    std::uint64_t writes_in_flight{0};
-};
-
 namespace cache {
 
 // The runtime committed a pool write: the write's Device blocks are

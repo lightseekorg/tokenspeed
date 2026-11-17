@@ -59,7 +59,6 @@ use ts_control::{
 };
 use ts_metrics::{
     EngineLabels, EngineMetrics, Exporter, KvTransferMetrics, L3Labels, L3Metrics, MetricsConfig,
-    SharedL2Metrics,
 };
 use ts_scheduler::Scheduler;
 use ts_wire::EngineCoreReadyResponse;
@@ -882,10 +881,6 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
             grammars,
             l3_metrics: config.metrics.l3_metrics(exporter.as_ref()),
             l3,
-            pool_metrics: exporter
-                .as_ref()
-                .filter(|_| config.metrics.engine && pool.is_some())
-                .map(|exporter| SharedL2Metrics::new(exporter, &config.metrics.labels)),
             pool: pool.map(|adapter| {
                 Box::new(PythonPoolClient::new(adapter)) as Box<dyn PoolClient + Send>
             }),

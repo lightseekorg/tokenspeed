@@ -33,8 +33,7 @@ use std::{
 
 use ts_metrics::{
     EngineLabels, EngineMetrics, Exporter, KvTransferMetrics, L3ExecutorSnapshot, L3Labels,
-    L3Metrics, L3OperationSnapshot, L3SchedulerStats, MetricEvent, MetricsConfig, SharedL2Metrics,
-    SharedL2Stats,
+    L3Metrics, L3OperationSnapshot, L3SchedulerStats, MetricEvent, MetricsConfig,
 };
 
 fn fixtures() -> PathBuf {
@@ -404,83 +403,6 @@ fn l3_snapshots_export_their_growth_once_and_keep_quarantine_visible() {
             "tokenspeed:l3_scheduler_resources",
             &[("resource", "pressure_gate_closed")],
             1.0,
-        ),
-    ] {
-        let mut labels: Vec<(&str, &str)> = rank.iter().chain(extra).copied().collect();
-        labels.sort_unstable();
-        let rendered_labels: Vec<String> = labels
-            .iter()
-            .map(|(name, value)| format!("{name}=\"{value}\""))
-            .collect();
-        let line = format!("{metric}{{{}}} {value:?}", rendered_labels.join(","));
-        assert!(rendered.contains(&line), "no {line} in:\n{rendered}");
-    }
-    std::fs::remove_dir_all(&directory).unwrap();
-}
-
-#[test]
-fn shared_l2_totals_export_their_growth_and_gauges_their_last_value() {
-    let directory = scratch_dir("shared-l2");
-    let exporter = Exporter::new(&MetricsConfig {
-        prometheus_dir: Some(directory.clone()),
-        relay_endpoint: None,
-    })
-    .unwrap();
-    let mut metrics = SharedL2Metrics::new(
-        &exporter,
-        &EngineLabels {
-            model_name: "m".to_owned(),
-            app_key: String::new(),
-            dp_rank: 2,
-        },
-    );
-    let first = SharedL2Stats {
-        lookups: 10.0,
-        hits: 4.0,
-        tickets: 2.0,
-        writes_in_flight: 1.0,
-        ..SharedL2Stats::default()
-    };
-    // Totals are cumulative: the same observation twice adds nothing.
-    metrics.record(&first);
-    metrics.record(&first);
-    metrics.record(&SharedL2Stats {
-        lookups: 12.0,
-        proxy_overflows: 1.0,
-        tickets: 0.0,
-        writes_in_flight: 0.0,
-        ..first
-    });
-    drop(metrics);
-    let Some(rendered) = render(&directory) else {
-        return;
-    };
-    let rank = [("app_key", ""), ("dp_rank", "2"), ("model_name", "m")];
-    for (metric, extra, value) in [
-        (
-            "tokenspeed:shared_l2_lookups_total",
-            &[("event", "sent")],
-            12.0,
-        ),
-        (
-            "tokenspeed:shared_l2_lookups_total",
-            &[("event", "hit")],
-            4.0,
-        ),
-        (
-            "tokenspeed:shared_l2_lookups_total",
-            &[("event", "proxy_overflow")],
-            1.0,
-        ),
-        (
-            "tokenspeed:shared_l2_resources",
-            &[("resource", "tickets")],
-            0.0,
-        ),
-        (
-            "tokenspeed:shared_l2_resources",
-            &[("resource", "writes_in_flight")],
-            0.0,
         ),
     ] {
         let mut labels: Vec<(&str, &str)> = rank.iter().chain(extra).copied().collect();

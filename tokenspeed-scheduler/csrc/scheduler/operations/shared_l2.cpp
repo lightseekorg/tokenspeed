@@ -26,12 +26,6 @@
 
 namespace tokenspeed {
 
-SharedL2Stats Scheduler::GetSharedL2Stats() const {
-    SharedL2Stats stats = shared_l2_ ? shared_l2_->Stats() : SharedL2Stats{};
-    stats.writes_in_flight = tier_transfers_.NumPoolWritesInFlight();
-    return stats;
-}
-
 void Scheduler::handleEvent(const cache::SharedL2WriteDone& event) {
     if (!shared_l2_) {
         throw std::invalid_argument("shared L2 completion without a configured pool");

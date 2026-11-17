@@ -175,7 +175,6 @@ TEST(SharedL2Proxy, AnAnswerBecomesProxyEntriesHeldUntilTheLookupsHoldGoes) {
     // Held: nothing is dropped, nothing released.
     rank.proxy.ReleaseUnheld();
     EXPECT_TRUE(rank.proxy.TakeCommands().empty());
-    EXPECT_EQ(rank.proxy.Stats().tickets, 1u);
     // The hold goes (an admission consumed the state): the entries leave at
     // the next pass, then the pool's ticket.
     hold.reset();
@@ -186,10 +185,9 @@ TEST(SharedL2Proxy, AnAnswerBecomesProxyEntriesHeldUntilTheLookupsHoldGoes) {
     ASSERT_EQ(commands.size(), 1u);
     EXPECT_EQ(CommandsOf<SharedL2ReleaseOperation>(commands).front().ticket, 7u);
     EXPECT_EQ(rank.cache.HostEvictions().released.blocks, 4u);
-    const SharedL2Stats stats = rank.proxy.Stats();
-    EXPECT_EQ(stats.lookups, 1u);
-    EXPECT_EQ(stats.hits, 1u);
-    EXPECT_EQ(stats.tickets, 0u);
+    // No ticket is left to release.
+    rank.proxy.ReleaseUnheld();
+    EXPECT_TRUE(rank.proxy.TakeCommands().empty());
 }
 
 TEST(SharedL2Proxy, ALookupIsPendingWhileItsHoldWaitsForTheAnswer) {
@@ -216,7 +214,6 @@ TEST(SharedL2Proxy, ALookupIsPendingWhileItsHoldWaitsForTheAnswer) {
         EXPECT_EQ(rank.proxy.PendingRequest(hold.LookupId()), nullptr);
     }
     EXPECT_TRUE(rank.proxy.TakeCommands().empty());
-    EXPECT_EQ(rank.proxy.Stats().lookups, 2u);
 }
 
 TEST(SharedL2Proxy, LookupsThatShareProxyEntriesKeepTheFirstTicket) {
@@ -244,7 +241,6 @@ TEST(SharedL2Proxy, LookupsThatShareProxyEntriesKeepTheFirstTicket) {
                   rank.cache.Allocator(static_cast<std::int32_t>(key.group_id)).ResolveCacheBlockId(*block));
         EXPECT_EQ(created[j].page, extended.pages[2 + j]);
     }
-    EXPECT_EQ(rank.proxy.Stats().tickets, 2u);
 
     // The first ticket stays while any lookup holds its entries.
     first.reset();
@@ -296,8 +292,10 @@ TEST(SharedL2Proxy, AnAnswerTheProxyTierCannotHoldIsAMiss) {
     EXPECT_TRUE(rank.proxy.ApplyAnswer(rank.Answer(hold, prompt, 5), rank.TailPrior(prompt), hold).empty());
     EXPECT_EQ(rank.cache.NumHostCachedBlocks(), 0);
     EXPECT_EQ(CommandsOf<SharedL2ReleaseOperation>(rank.proxy.TakeCommands()).front().ticket, 5u);
-    EXPECT_EQ(rank.proxy.Stats().proxy_overflows, 1u);
-    EXPECT_EQ(rank.proxy.Stats().tickets, 0u);
+    // The ticket went back with the answer: no later pass releases it again.
+    hold.reset();
+    rank.proxy.ReleaseUnheld();
+    EXPECT_TRUE(rank.proxy.TakeCommands().empty());
 }
 
 TEST(SharedL2Proxy, AMalformedAnswerIsRefusedBeforeAnythingOfItIsKept) {
@@ -327,7 +325,6 @@ TEST(SharedL2Proxy, AMalformedAnswerIsRefusedBeforeAnythingOfItIsKept) {
         EXPECT_THROW(rank.proxy.ApplyAnswer(misplaced_tail, rank.TailPrior(prompt), hold), std::invalid_argument);
     }
     EXPECT_NE(rank.proxy.PendingRequest(hold.LookupId()), nullptr);
-    EXPECT_EQ(rank.proxy.Stats().hits, 0u);
     EXPECT_TRUE(rank.proxy.TakeCommands().empty());
     EXPECT_EQ(rank.cache.NumHostCachedBlocks(), 0);
 }
@@ -410,7 +407,6 @@ TEST(SharedL2Proxy, PoolWritesAreBoundedAndOnlyThoseInFlightPinTheirSources) {
     EXPECT_NE(writes[0].write_id, writes[1].write_id);
     EXPECT_TRUE(rank.transfers.HasAnyInFlight());
     EXPECT_TRUE(rank.transfers.HasPinnedStoresInFlight());
-    EXPECT_EQ(rank.transfers.NumPoolWritesInFlight(), 2u);
 
     // Saturated: the rest stays queued and pins nothing, so the Device may
     // evict it -- all but the six blocks the two writes read.

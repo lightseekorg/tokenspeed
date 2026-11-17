@@ -553,22 +553,6 @@ mod ffi {
         publications: Vec<SharedL2PublicationView>,
     }
 
-    /// The scheduler's observations of its shared L2 pool (`SharedL2Stats`).
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-    struct SharedL2StatsView {
-        /// Lookups handed out, cumulative.
-        lookups: u64,
-        /// Answers that pinned something at the owner, cumulative; the
-        /// proxy overflows are among them.
-        hits: u64,
-        /// Hits the proxy Host tier had no room for, cumulative.
-        proxy_overflows: u64,
-        /// Owner tickets not released.
-        tickets: u64,
-        /// Writes not completed.
-        writes_in_flight: u64,
-    }
-
     unsafe extern "C++" {
         include!("ts-scheduler/cxx/facade.h");
 
@@ -642,7 +626,6 @@ mod ffi {
             scheduler: Pin<&mut Scheduler>,
             answer: &SharedL2AnswerView,
         ) -> Result<Vec<SharedL2PageView>>;
-        fn shared_l2_stats(scheduler: &Scheduler) -> SharedL2StatsView;
 
         fn plan_forward_batches(plan: &ExecutionPlan) -> Vec<ForwardBatchView>;
         fn plan_needs_device(plan: &ExecutionPlan) -> bool;
@@ -672,8 +655,8 @@ pub use ffi::{
     ForwardBatchView, ForwardEvent, ForwardEventKind, KvEventView, PrefillGateProbe, PrefixHitView,
     RequestSpec, SchedulerAbortView, SchedulerSizes, SharedL2AnswerView, SharedL2KeyView,
     SharedL2LookupView, SharedL2OpKind, SharedL2OpView, SharedL2PageView, SharedL2PublicationView,
-    SharedL2StatsView, StorageCancellationView, StorageDoneView, StorageKeyView, StorageOpKind,
-    StorageOpView, StorageStatsView, StorageTickView, TransferBatchView,
+    StorageCancellationView, StorageDoneView, StorageKeyView, StorageOpKind, StorageOpView,
+    StorageStatsView, StorageTickView, TransferBatchView,
 };
 
 /// What advances the scheduler at the head of a round: with L3, the agreed
@@ -863,11 +846,6 @@ impl Scheduler {
     ) -> Result<Vec<SharedL2PageView>, cxx::Exception> {
         let _span = profile::span("Scheduler::apply_shared_l2_lookup");
         ffi::apply_shared_l2_lookup(self.pinned(), answer)
-    }
-
-    /// The scheduler's observations of its shared L2 pool; zeros without one.
-    pub fn shared_l2_stats(&self) -> SharedL2StatsView {
-        ffi::shared_l2_stats(self.get())
     }
 
     /// Apply one batch with a single scan of each cache index.

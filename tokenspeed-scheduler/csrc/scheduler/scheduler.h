@@ -167,7 +167,6 @@ public:
     // -- throws std::invalid_argument, and the runtime stops serving: nothing
     // of that answer is kept, and the answers after it are not applied.
     std::vector<SharedL2ProxyPage> ApplySharedL2Lookups(const std::vector<SharedL2LookupResult>& results);
-    SharedL2Stats GetSharedL2Stats() const;
 
     void Advance(const ExecutionEvent& event);
     KvEventBatch DrainKvEventBatch();

@@ -38,10 +38,7 @@
 //! client answers one rank, so the pool needs a replica of one member
 //! (attention TP 1).
 
-use std::{
-    collections::VecDeque,
-    time::{Duration, Instant},
-};
+use std::collections::VecDeque;
 
 use ts_scheduler::{
     ExecutionPlan, SharedL2AnswerView, SharedL2LookupView, SharedL2OpKind, SharedL2OpView,
@@ -87,7 +84,6 @@ pub struct Pool {
     /// Writes not handed to the client yet, each batch with the forwards
     /// that must still be committed first, in plan order.
     held_writes: VecDeque<(usize, Vec<SharedL2OpView>)>,
-    metrics_sampled: Option<Instant>,
 }
 
 impl Pool {
@@ -97,7 +93,6 @@ impl Pool {
             client,
             writes: Vec::new(),
             held_writes: VecDeque::new(),
-            metrics_sampled: None,
         }
     }
 
@@ -204,17 +199,6 @@ impl Pool {
             self.client.submit(&writes)?;
         }
         Ok(())
-    }
-
-    /// Whether to sample the metrics now: at most once a second.
-    pub fn metrics_due(&mut self) -> bool {
-        let due = self
-            .metrics_sampled
-            .is_none_or(|at| at.elapsed() >= Duration::from_secs(1));
-        if due {
-            self.metrics_sampled = Some(Instant::now());
-        }
-        due
     }
 }
 

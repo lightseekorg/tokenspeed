@@ -459,17 +459,6 @@ rust::Vec<SharedL2PageView> apply_shared_l2_lookup(tokenspeed::Scheduler& schedu
     return out;
 }
 
-SharedL2StatsView shared_l2_stats(const tokenspeed::Scheduler& scheduler) {
-    const tokenspeed::SharedL2Stats stats = scheduler.GetSharedL2Stats();
-    return SharedL2StatsView{
-        .lookups = stats.lookups,
-        .hits = stats.hits,
-        .proxy_overflows = stats.proxy_overflows,
-        .tickets = stats.tickets,
-        .writes_in_flight = stats.writes_in_flight,
-    };
-}
-
 namespace {
 
 ForwardBatchView batch_view(const tokenspeed::ForwardBatch& batch) {

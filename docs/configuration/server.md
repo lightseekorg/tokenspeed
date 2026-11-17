@@ -1447,17 +1447,6 @@ carry the `model_name` and `app_key` labels:
 | `tokenspeed:kv_transfer_timeouts_total` | Counter | Transfers that timed out, with a bounded `stage` label: `bootstrapping` (prefill never received the cache manifest; `TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT`) or `waiting_for_input` (decode never received the transfer-done signal; `TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT`). |
 | `tokenspeed:kv_transfer_failures_total` | Counter | Transfers aborted on failure: send failures on the prefill node, and rooms failed on prefill-node loss (heartbeat) on the decode node. Timeouts are counted separately. |
 
-### Shared L2 pool metrics
-
-A rank whose Host tier is a shared L2 pool (`--shared-l2-config`) records the
-pool's metrics when metrics are enabled. All carry the `model_name`,
-`app_key` and `dp_rank` labels:
-
-| Metric | Type | Meaning |
-| --- | --- | --- |
-| `tokenspeed:shared_l2_lookups_total` | Counter | Pool lookups of waiting prompts, with a bounded `event` label. The events overlap; do not sum them. `sent`: every lookup sent to the pool's owner. `hit`: answers that pinned pool pages; among them `proxy_overflow` (the rank's proxy Host tier had no room for the hit), whose prompts were computed instead. |
-| `tokenspeed:shared_l2_resources` | Gauge | What the rank has open at the pool now, with a bounded `resource` label: `tickets` (hits not released yet), `writes_in_flight`. |
-
 ## TokenSpeed-specific runtime knobs
 
 These parameters are TokenSpeed-specific. They expose runtime

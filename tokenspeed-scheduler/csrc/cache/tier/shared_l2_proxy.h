@@ -61,10 +61,6 @@ public:
     void ReleaseUnheld();
     std::vector<SharedL2Operation> TakeCommands() { return std::exchange(commands_, {}); }
 
-    // Cumulative counts and the unreleased tickets; the caller fills in the
-    // writes.
-    SharedL2Stats Stats() const;
-
 private:
     friend class SharedL2LookupHold;
 
@@ -85,9 +81,6 @@ private:
     std::vector<TicketEntries> tickets_;
     std::vector<SharedL2Operation> commands_;
     std::uint64_t next_lookup_id_{0};
-    std::uint64_t num_lookups_{0};
-    std::uint64_t num_hits_{0};
-    std::uint64_t num_proxy_overflows_{0};
 };
 
 }  // namespace tokenspeed
