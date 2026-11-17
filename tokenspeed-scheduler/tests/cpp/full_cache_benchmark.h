@@ -231,22 +231,22 @@ public:
                 Measure([&] { hashes = ComputePrefixHashes(tokens.FullPrefixPages(config_.page_size, false), ""); });
             const auto candidates = std::span<const std::string>{hashes}.first(hashes.size() - 1);
             PreparedPrefixKeys keys;
-            sample.prepare_keys += Measure([&] { keys = Coordinator().PreparePrefixKeys(candidates); });
-            CacheCoordinator::PrefixProbe probe;
+            sample.prepare_keys += Measure([&] { keys = Coordinator().Prober().PreparePrefixKeys(candidates); });
+            PrefixProbe probe;
             sample.probe += Measure([&] {
-                probe = Coordinator().ProbePromptPrefix({.prefix_hashes = candidates,
-                                                         .tokens = requests_[i].tokens,
-                                                         .max_tokens = config_.request_tokens - 1,
-                                                         .prepared_keys = keys});
+                probe = Coordinator().Prober().ProbePromptPrefix({.prefix_hashes = candidates,
+                                                                  .tokens = requests_[i].tokens,
+                                                                  .max_tokens = config_.request_tokens - 1,
+                                                                  .prepared_keys = keys});
             });
             Require(probe.device.num_common_tokens == config_.HitTokens(), "unexpected prefix hit");
             const std::array demands{GroupDemand{.table = &tables[i],
                                                  .extent = DenseGrowth{config_.request_tokens - config_.HitTokens()},
                                                  .reserve_tokens = 1}};
-            std::optional<CacheCoordinator::AdmissionResult> result;
+            std::optional<AdmissionResult> result;
             sample.admit += Measure([&] {
                 result = Coordinator().Admit(std::move(probe), demands, RequestProgress{}, {}, std::nullopt,
-                                             std::nullopt, /*evict_blocks_past_segments=*/false, /*session_id=*/{},
+                                             std::nullopt, /*session_id=*/{},
                                              /*cache_group_id=*/{});
             });
             Require(result.has_value(), "cache admission failed");
@@ -364,7 +364,7 @@ private:
     }
 
     void RestoreHistory(const std::vector<std::string>& hashes) {
-        auto probe = Coordinator().ProbePrefix(hashes);
+        auto probe = Coordinator().Prober().ProbePrefix(hashes);
         const auto hit = probe.device.num_common_tokens;
         const auto total = static_cast<std::int32_t>(hashes.size()) * config_.page_size;
         Require(hit < total, "restoration must add missing pages");
@@ -373,7 +373,7 @@ private:
             GroupDemand{.table = &tables[0], .extent = DenseGrowth{total - hit}, .reserve_tokens = 0}};
         const auto result =
             Coordinator().Admit(std::move(probe), demands, RequestProgress{}, {}, std::nullopt, std::nullopt,
-                                /*evict_blocks_past_segments=*/false, /*session_id=*/{}, /*cache_group_id=*/{});
+                                /*session_id=*/{}, /*cache_group_id=*/{});
         Require(result.has_value(), "cache fill failed");
         if (enable_events_) {
             const auto history = static_cast<std::int32_t>(&hashes - histories_.data());

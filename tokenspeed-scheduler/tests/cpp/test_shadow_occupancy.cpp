@@ -775,7 +775,7 @@ TEST(BlockTableAccounting, SharedPrefixParentsCountOnceAcrossRequests) {
     CacheFullBlocksForTest(coordinator, a, ch);
     EXPECT_EQ(coordinator.NumActiveLcmBlocks(), 2);
 
-    CacheCoordinator::PrefixProbe prefix = coordinator.ProbePrefix(ch);
+    PrefixProbe prefix = coordinator.Prober().ProbePrefix(ch);
     ASSERT_EQ(prefix.device.num_common_tokens, 8);
     std::vector<BlockTable> b(1);
     ASSERT_TRUE(AdmitForTest(coordinator, b, std::move(prefix), GroupDemand{}));  // prefix hit, no new blocks
@@ -987,8 +987,7 @@ TEST(BlockTableAccounting, RestoreRebindsTheRebuiltTablesToTheActiveParentsGauge
     std::vector<BlockTable> restored(1);
     std::vector<GroupDemand> demands{{.table = &restored[0], .extent = DenseGrowth{0}, .reserve_tokens = 0}};
     const auto restore = coordinator.Restore(image->image, demands, /*copy_in_point=*/std::nullopt,
-                                             CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
-                                             /*drop_claims_if_unfit=*/false);
+                                             CacheCoordinatorTestAccess::NextAccessEpoch(coordinator));
     ASSERT_TRUE(restore);
     ASSERT_EQ(restored[0].NumBlocks(), 3);
 
