@@ -1082,10 +1082,13 @@ Its responsibilities:
   checkpoint may sit on the Device's last page); when the Device alone
   resumes furthest the Host tier mirrors its boundary and claims nothing.
   The probe records the longest usable KV boundary even when its State is
-  missing, since admission uses that reach for the junction cut; the reach
-  is at least the prefix-closed groups' coverage (on the Host, their run past
-  the Device's), even where a sliding window is missing, because the chunk
-  cut there writes and publishes its own window. Once it is
+  missing, since admission uses that reach for the junction cut; with a
+  State group the reach is at least the prefix-closed groups' coverage (on
+  the Host, their run past the Device's), rounded down to the checkpoint
+  grid, even where a sliding window is missing, because the chunk cut there
+  writes and publishes its own window. A sliding-only model and the D role's
+  probe (no State group in its order) keep the boundary every token-spanned
+  group accepts. Once it is
   known, shorter candidates missing a required State group are rejected
   before constructing their history hit arrays. This uses the same State
   predicate, including checkpoint granularity and mixed Device/Host hits;

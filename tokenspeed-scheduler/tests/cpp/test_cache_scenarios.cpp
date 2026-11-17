@@ -5113,6 +5113,229 @@ TEST_F(JunctionCutSlidingHostSuite, HostOnlyFullHistoryCutsTheFirstChunkWhenTheW
     ASSERT_EQ(batch->request_ids, std::vector<std::string>{"first"});
     EXPECT_EQ(batch->extend_prefix_lens, std::vector<std::int32_t>{0});
     EXPECT_EQ(batch->input_lengths, std::vector<std::int32_t>{6}) << "the chunk ends at the Host's full-history run";
+    SendForwardDone("first");
+    plan = PlanOnce();  // publishes state@6 and first's window behind it
+    AckWriteBacks(plan);
+    batch = FindForwardBatch(plan);
+    ASSERT_NE(batch, nullptr);
+    ASSERT_EQ(batch->request_ids, std::vector<std::string>{"first"});
+    EXPECT_EQ(batch->extend_prefix_lens.at(0), 6);
+    SendForwardDone("first", {7});
+
+    RequestSpec third = seed;
+    third.request_id = "third";
+    for (std::size_t i = 6; i < third.tokens.size(); ++i) {
+        third.tokens[i] += 3000;
+    }
+    Submit(third);
+    for (int round = 0; round < 4; ++round) {
+        plan = PlanOnce();
+        AckWriteBacks(plan);
+        batch = FindForwardBatch(plan);
+        ASSERT_NE(batch, nullptr);
+        const auto it = std::ranges::find(batch->request_ids, "third");
+        if (it == batch->request_ids.end()) {
+            continue;
+        }
+        const auto row = static_cast<std::size_t>(it - batch->request_ids.begin());
+        EXPECT_EQ(batch->extend_prefix_lens.at(row), 6) << "a later prompt resumes at the Host-reached junction";
+        return;
+    }
+    FAIL() << "third was never scheduled";
+}
+
+// Where the junction may reach past a missing window. A seed prompt is
+// prefilled in chunks of 8 (its windows are cached only where a chunk ends:
+// 8 and the prompt end), then `first` diverges from it at `diverge`, then
+// `third` diverges from the seed at the same token.
+class JunctionReachSuite : public SchedulerTestSuite {
+protected:
+    virtual bool WithState() const { return true; }
+    virtual std::int32_t Window() const { return 2; }
+    virtual std::int32_t Grain() const { return 1; }
+    virtual Role ServingRole() const { return Role::kFused; }
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg{};
+        cfg.role = ServingRole();
+        cfg.prefix_granularity = 2;
+        cfg.device_allocator.total_pages = 64;
+        cfg.host_allocator.total_pages = 64;
+        cfg.max_scheduled_tokens = 8;
+        cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
+        cfg.enable_l3_storage = false;
+        cfg.disable_l2_cache = true;
+        cfg.disable_prefix_cache = false;
+        cfg.cache_groups = {
+            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kFull),
+            MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kSlidingWindow,
+                      Window()),
+        };
+        if (WithState()) {
+            cfg.cache_groups.push_back(
+                MakeGroup("state", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kState));
+            if (Grain() > 1) {
+                cfg.cache_groups.back().checkpoint_granularity = Grain();
+                cfg.state_checkpoint_in_forward = true;
+            }
+        }
+        if (cfg.role != Role::kFused) {
+            for (CacheGroupConfig& group : cfg.cache_groups) {
+                group.transfer_policy = group.attn_kind == AttnKind::kState ? CacheTransferPolicy::LatestSnapshot
+                                                                            : CacheTransferPolicy::FullSuffix;
+            }
+        }
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+
+    static RequestSpec Diverging(const RequestSpec& seed, const std::string& id, std::size_t diverge,
+                                 std::int32_t offset) {
+        RequestSpec spec = seed;
+        spec.request_id = id;
+        for (std::size_t i = diverge; i < spec.tokens.size(); ++i) {
+            spec.tokens[i] += offset;
+        }
+        return spec;
+    }
+
+    // Prefills `id` to its prompt end, returning its chunks as {resumed, input} pairs.
+    std::vector<std::pair<std::int32_t, std::int32_t>> PrefillAll(const std::string& id) {
+        std::vector<std::pair<std::int32_t, std::int32_t>> chunks;
+        for (int round = 0; round < 8; ++round) {
+            const ExecutionPlan plan = PlanOnce();
+            const ForwardBatch* batch = FindForwardBatch(plan);
+            if (batch == nullptr || batch->NumExtends() == 0) {
+                continue;
+            }
+            chunks.emplace_back(batch->extend_prefix_lens.at(0), batch->input_lengths.at(0));
+            const bool left = batch->extend_prefix_lens[0] + batch->input_lengths[0] < batch->prefill_lengths[0];
+            SendForwardDone(id, left ? std::vector<std::int32_t>{} : std::vector<std::int32_t>{42});
+            if (!left) {
+                break;
+            }
+        }
+        return chunks;
+    }
+
+    // The seed, finished; then `first` prefilled; then the prefix `third` resumes at.
+    struct Outcome {
+        std::vector<std::pair<std::int32_t, std::int32_t>> first_chunks;
+        std::int32_t third_resumed{-1};
+        std::uint64_t unresumable_kv{0};
+    };
+    Outcome Run(std::int32_t seed_pages, std::size_t diverge) {
+        const RequestSpec seed = MakeRequestSpec("seed", seed_pages);
+        Submit(seed);
+        PrefillAll("seed");
+        PlanOnce();
+        SendForwardDone("seed", {43});
+        SendFinish("seed");
+        PlanOnce();
+        Outcome out;
+        Submit(Diverging(seed, "first", diverge, 1000));
+        out.first_chunks = PrefillAll("first");
+        Submit(Diverging(seed, "third", diverge, 3000));
+        for (int round = 0; round < 6 && out.third_resumed < 0; ++round) {
+            const ExecutionPlan plan = PlanOnce();
+            const ForwardBatch* batch = FindForwardBatch(plan);
+            if (batch == nullptr) {
+                continue;
+            }
+            const auto it = std::ranges::find(batch->request_ids, "third");
+            if (it != batch->request_ids.end() && batch->NumExtends() > 0) {
+                out.third_resumed =
+                    batch->extend_prefix_lens.at(static_cast<std::size_t>(it - batch->request_ids.begin()));
+            }
+        }
+        out.unresumable_kv = scheduler_->GetHostCacheStats().prefix_hits.unresumable_kv_tokens;
+        return out;
+    }
+    using Chunks = std::vector<std::pair<std::int32_t, std::int32_t>>;
+};
+
+// A sliding-only model has no State checkpoint for a junction to publish: the
+// reach stays the boundary every token-spanned group accepts, so nothing is
+// cut where the window is missing (first's first chunk runs whole to 8) and
+// no KV counts as unresumable.
+class JunctionReachSlidingOnlySuite : public JunctionReachSuite {
+protected:
+    bool WithState() const override { return false; }
+};
+
+TEST_F(JunctionReachSlidingOnlySuite, AMissingWindowCutsNothingWithoutAStateGroup) {
+    const Outcome out = Run(/*seed_pages=*/6, /*diverge=*/6);
+    EXPECT_EQ(out.first_chunks, (Chunks{{0, 8}, {8, 4}}));
+    EXPECT_EQ(out.third_resumed, 0);
+    EXPECT_EQ(out.unresumable_kv, 0u);
+}
+
+// A window wider than a page: first resumes at the seed's chunk end 8 and runs
+// to its prompt end in one chunk -- no extra round to cut at the coverage 10.
+class JunctionReachSlidingOnlyWideSuite : public JunctionReachSlidingOnlySuite {
+protected:
+    std::int32_t Window() const override { return 4; }
+};
+
+TEST_F(JunctionReachSlidingOnlyWideSuite, AWideWindowAddsNoPrefillRoundWithoutAStateGroup) {
+    const Outcome out = Run(/*seed_pages=*/8, /*diverge=*/10);
+    EXPECT_EQ(out.first_chunks, (Chunks{{8, 8}}));
+    EXPECT_EQ(out.third_resumed, 8);
+    EXPECT_EQ(out.unresumable_kv, 0u);
+}
+
+// A restricted State group (checkpoints on multiples of G = 4): the coverage
+// 10 is off the grid, where no checkpoint can ever be published or resumed
+// at, so the junction stays on the grid at 8 and third resumes there.
+class JunctionReachRestrictedSuite : public JunctionReachSuite {
+protected:
+    std::int32_t Grain() const override { return 4; }
+};
+
+TEST_F(JunctionReachRestrictedSuite, TheJunctionStaysOnTheCheckpointGrid) {
+    const Outcome out = Run(/*seed_pages=*/8, /*diverge=*/10);
+    EXPECT_EQ(out.first_chunks, (Chunks{{0, 8}, {8, 8}}));
+    EXPECT_EQ(out.third_resumed, 8);
+    EXPECT_EQ(out.unresumable_kv, 8u);
+}
+
+// The D role's probe leaves the State groups out (its prompt arrives by
+// transfer), so a missing window there makes no junction either: a prompt
+// diverging inside the seed counts no unresumable KV.
+class JunctionReachDecodeRoleSuite : public JunctionReachSuite {
+protected:
+    Role ServingRole() const override { return Role::kD; }
+    void SubmitBootstrapped(const RequestSpec& spec) {
+        Submit(spec);
+        ExecutionEvent event;
+        event.With(pd::BootstrappedEvent{spec.request_id});
+        scheduler_->Advance(std::move(event));
+    }
+    void Land(const std::string& id) {
+        ExecutionEvent event;
+        event.With(pd::RemotePrefillDoneEvent{id, 30000});
+        scheduler_->Advance(std::move(event));
+    }
+};
+
+TEST_F(JunctionReachDecodeRoleSuite, AMissingWindowMakesNoJunctionOnTheDecodeRole) {
+    const RequestSpec seed = MakeRequestSpec("seed", /*num_pages=*/6);
+    SubmitBootstrapped(seed);
+    ExecutionPlan plan = PlanOnce();
+    ASSERT_NE(FindRemoteAdmission(plan), nullptr);
+    Land("seed");
+    PlanOnce();
+    SendForwardDone("seed", {43});
+    SendFinish("seed");
+    PlanOnce();
+    ASSERT_EQ(scheduler_->DecodingSize(), 0u);
+
+    SubmitBootstrapped(Diverging(seed, "first", 6, 1000));
+    plan = PlanOnce();
+    const ForwardBatch* admission = FindRemoteAdmission(plan);
+    ASSERT_NE(admission, nullptr);
+    ASSERT_EQ(admission->request_ids, std::vector<std::string>{"first"});
+    EXPECT_EQ(scheduler_->GetHostCacheStats().prefix_hits.unresumable_kv_tokens, 0u);
 }
 
 class JunctionCutHostSuite : public JunctionCutSuite {

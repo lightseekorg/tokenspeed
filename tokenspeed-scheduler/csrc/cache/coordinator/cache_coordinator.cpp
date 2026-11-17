@@ -949,8 +949,13 @@ void CacheCoordinator::forEachCandidateBoundary(const PromptPrefix& prompt, std:
 // candidate by groupAcceptsBoundary. Without State groups the first candidate
 // the KV groups accept wins; with them the walk descends to the longest
 // published state checkpoint. kv_tokens records the KV reach for the junction
-// cut: the longest boundary every token-spanned group accepts, raised to the
-// closed groups' coverage, since the chunk cut there writes its own windows.
+// cut: the longest boundary every token-spanned group accepts, raised -- when
+// the probe has a State group -- to the closed groups' coverage on the
+// checkpoint grid, since the chunk cut there writes its own windows.
+bool CacheCoordinator::probesStateGroup(std::span<const std::size_t> match_order) const {
+    return std::ranges::any_of(match_order, [&](std::size_t i) { return GroupIsState(i); });
+}
+
 CacheCoordinator::PrefixProbe::Tier CacheCoordinator::probeTier(const PromptPrefix& prompt,
                                                                 std::span<const std::vector<CacheKey>> group_keys,
                                                                 std::span<const std::size_t> match_order,
@@ -1051,8 +1056,14 @@ CacheCoordinator::PrefixProbe::Tier CacheCoordinator::probeTier(const PromptPref
     forEachCandidateBoundary(prompt, /*floor_tokens=*/0, from_tokens, visit);
     // The junction reaches the closed groups' coverage even where a sliding
     // window is missing: the chunk cut there writes and publishes its own.
-    if (!closed_order.empty()) {
-        out.kv_tokens = std::max(out.kv_tokens, out.closed_kv_tokens);
+    // Only when the probe has a State group, since a junction is where a State
+    // checkpoint gets published: a model without one, and the D role's
+    // history probe (which leaves the State groups out), keep the reach every
+    // token-spanned group accepts. On the checkpoint grid, the only place a
+    // restricted State group publishes.
+    if (!closed_order.empty() && probesStateGroup(match_order)) {
+        out.kv_tokens =
+            std::max(out.kv_tokens, out.closed_kv_tokens / checkpoint_granularity_ * checkpoint_granularity_);
     }
     if (out.num_common_tokens == 0) {
         // No boundary matched: no group claims anything on the Device.
@@ -1243,10 +1254,12 @@ void CacheCoordinator::probeHostSuffix(const PromptPrefix& prompt, std::span<con
                              : static_cast<std::int32_t>(std::min<std::int64_t>(
                                    std::int64_t{host_kv_end_tokens} + prefix_granularity_ - 1, prompt.max_tokens));
     forEachCandidateBoundary(prompt, above_tokens, from_tokens, visit);
-    // As on the Device: the closed groups' Host run past the Device's
-    // coverage is KV reach, whether or not a window is cached at its end.
-    if (host_kv_end_tokens > device_kv_tokens) {
-        host.kv_tokens = std::max(host.kv_tokens, host_kv_end_tokens);
+    // As on the Device: with a State group in the probe, the closed groups'
+    // Host run past the Device's coverage is KV reach, on the checkpoint grid,
+    // whether or not a window is cached at its end.
+    const std::int32_t host_reach = host_kv_end_tokens / checkpoint_granularity_ * checkpoint_granularity_;
+    if (host_reach > device_kv_tokens && probesStateGroup(match_order)) {
+        host.kv_tokens = std::max(host.kv_tokens, host_reach);
     }
 }
 

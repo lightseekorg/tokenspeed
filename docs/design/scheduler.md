@@ -190,17 +190,33 @@ lies past the hit `T_s` (`AdmissionResult::junction_tokens`, kept in
 `CacheProgress::junction_tokens` until a chunk passes it), the first chunk
 after `T_s` ends exactly at `T`, so the natural checkpoint it leaves coincides
 with KV already cached and the next prompt sharing that prefix resumes at `T`
-in every group. The KV reach is at least the prefix-closed groups' coverage:
+in every group. With a State group, the KV reach is at least the
+prefix-closed groups' coverage, rounded down to the checkpoint grid (a
+restricted State group, `checkpoint_granularity` G > 1, publishes only on
+multiples of G, so a junction off that grid could never be resumed at):
 `T_s` falls short of it where a State checkpoint is missing, and also where a
 sliding window is -- a producer publishes its window only where its chunks
 end, so a prompt that diverges inside another prompt's chunk finds the full
-history cached but no window there. The chunk cut at `T` writes its own window
-and publishes it with the checkpoint, like any chunk end's completed pages. The next chunk's
-admission publishes that checkpoint (`PublicationPoint::kStateCheckpoint`):
-the state under the junction's key, but not the KV there, which is cached
-already, so the owner keeps writing its partial block and needs no copy-in
-(`cache-concepts.md`, copy-in). Every other chunk end publishes only its
-completed full pages.
+history cached but no window there. The chunk cut at `T` writes its own
+window and publishes it with the checkpoint, like any chunk end's completed
+pages. Without a State group (a sliding-only model) there is no checkpoint to
+publish, and the D role's probe leaves the State groups out (its prompt
+arrives by transfer): both keep the reach every token-spanned group accepts,
+as before. The next chunk's admission publishes that checkpoint
+(`PublicationPoint::kStateCheckpoint`): the state and the windows the chunk
+wrote under the junction's key, but not the full-history KV there, which is
+cached already, so the owner keeps writing its partial block and needs no
+copy-in (`cache-concepts.md`, copy-in). Every other chunk end publishes only
+its completed full pages.
+
+The trade-off: a junction publishes one checkpoint, and reaching past a
+missing window moves it from the producer's chunk end below the coverage
+(the last boundary with a window, where the cut used to land) up to the
+coverage itself. A later prompt diverging between the two finds neither and
+resumes at the next checkpoint below (e.g. a producer chunk end at 8, a
+coverage of 10: a prompt diverging at 9 resumed at 8 before and now at 0).
+The common case it serves is the opposite one: siblings that share the whole
+prefix up to the coverage, which now resume there instead of a chunk earlier.
 
 **Reserve.** What an admission holds beyond the chunk it computes is stated
 once per round (`PrefillReserve`: decode width, whether the round completes
@@ -395,8 +411,9 @@ admission states what the pair does through the group's `StateStep`
 stops writing it — a `PublicationPoint` other than an ordinary chunk end
 (§1): a fused prompt end (the first decode's admission publishes slot 1 under
 the prompt's key before rotating it into slot 0), a chunk end that falls on a
-junction (§1; the KV there is cached already, so only the state is
-published), and a finish or retraction on every role (`kFinal`: the P's
+junction (§1; the full-history KV there is cached already, so only the state
+and the sliding windows the chunk wrote are published), and a finish or
+retraction on every role (`kFinal`: the P's
 transferred prompt, the D's and the fused engine's last decoded state),
 except the dead prompt ends and finishes that the in-forward checkpoint
 skips (below). An ordinary chunk end or decode step publishes nothing for a State
@@ -594,8 +611,8 @@ the KV is the Device's prefix plus a Host suffix, and each State group's
 checkpoint comes from whichever tier holds it, the Device first -- so Device
 KV with a Host checkpoint resumes, loading the checkpoint alone. When the KV
 groups reach further than the state (`kv_tokens >
-num_common_tokens`, at least the prefix-closed groups' coverage), the
-difference is the junction: the first chunk ends there and publishes the
+num_common_tokens`; with a State group at least the prefix-closed groups'
+coverage on the checkpoint grid), the difference is the junction: the first chunk ends there and publishes the
 checkpoint and the sliding windows the cache lacked, so the next prompt that
 shares the prefix resumes at the KV boundary in every group. For unrestricted
 State groups no alignment is imposed on a chunk, and apart from the opt-in
