@@ -1198,6 +1198,20 @@ def _prepare_fixed_workspaces(
     if dsa_kvp_history_prefill(config):
         actual_bytes += backend.preallocate_history_gather_workspace(config.context_len)
         allocated = True
+    # V4.1 allocates its gathered projections and per-request packed history
+    # per forward; it has no DSA history gather workspace to reserve.
+    if config.qcp_size > 1 and config.component(DeepseekV41Config) is None:
+        actual_bytes += backend.preallocate_history_gather_workspace(config.context_len)
+        allocated = True
+        if draft_backend is not None:
+            workspace = backend.history_gather_workspace()
+            if workspace is None:
+                raise RuntimeError(
+                    "query context parallelism needs the target's history gather "
+                    "workspace for the draft to share"
+                )
+            draft_backend.adopt_history_gather_workspace(workspace)
+    # Account for history scratch before testing whether any verify budget remains.
     if isinstance(backend, Qwen4ExpBackend) or (
         uses_paged_state_verify and expected_bytes > actual_bytes
     ):
@@ -1213,19 +1227,6 @@ def _prepare_fixed_workspaces(
             qsa_bf16_scratch
         )
         allocated = True
-    # V4.1 allocates its gathered projections and per-request packed history
-    # per forward; it has no DSA history gather workspace to reserve.
-    if config.qcp_size > 1 and config.component(DeepseekV41Config) is None:
-        actual_bytes += backend.preallocate_history_gather_workspace(config.context_len)
-        allocated = True
-        if draft_backend is not None:
-            workspace = backend.history_gather_workspace()
-            if workspace is None:
-                raise RuntimeError(
-                    "query context parallelism needs the target's history gather "
-                    "workspace for the draft to share"
-                )
-            draft_backend.adopt_history_gather_workspace(workspace)
     if not allocated:
         return
     if actual_bytes != expected_bytes:

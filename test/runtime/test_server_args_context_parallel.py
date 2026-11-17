@@ -87,6 +87,7 @@ def test_off_by_default_everywhere():
         dict(kvp_size=1, dcp_size=1, qcp_size=4, disaggregation_mode="prefill"),
         dict(kvp_size=4, dcp_size=4, qcp_size=1, disaggregation_mode="decode"),
         dict(kvp_size=8, dcp_size=8, qcp_size=1, disaggregation_mode="null"),
+        dict(kvp_size=8, dcp_size=8, qcp_size=8, disaggregation_mode="null"),
     ],
 )
 def test_the_roles_that_take_the_flags(kwargs):
@@ -137,7 +138,7 @@ def test_the_roles_that_take_the_flags(kwargs):
         # The query shard is a prefill-role layout over sharded pages.
         (
             dict(kvp_size=2, dcp_size=1, qcp_size=2, disaggregation_mode="decode"),
-            "--query-context-parallel-size > 1 requires --disaggregation-mode prefill",
+            "--query-context-parallel-size > 1 requires --disaggregation-mode null or prefill",
         ),
         (
             dict(kvp_size=2, dcp_size=1, qcp_size=4, disaggregation_mode="prefill"),
@@ -200,6 +201,30 @@ def test_the_prefill_role_accepts_a_full_tp_query_shard():
     assert not args.disable_prefill_graph
 
 
+def test_aggregated_query_shard_retains_dcp_for_decode():
+    args = prepare_server_args(
+        BASE + ["--disaggregation-mode", "null", "--decode-context-parallel-size", "2"]
+    )
+    assert args.mapping.attn.qcp_size == args.mapping.attn.kvp_size == 2
+    assert args.decode_context_parallel_size == 2
+    assert not args.enable_mixed_batch
+
+
+def test_aggregated_query_shard_rejects_other_backends():
+    with pytest.raises(ValueError, match="aggregated QCP validation is limited to dsa"):
+        prepare_server_args(
+            BASE
+            + [
+                "--disaggregation-mode",
+                "null",
+                "--decode-context-parallel-size",
+                "2",
+                "--attention-backend",
+                "flashmla",
+            ]
+        )
+
+
 def test_the_prefill_role_shards_its_pages_without_a_query_shard():
     args = prepare_server_args(BASE[:6] + BASE[8:])
     assert args.mapping.attn.has_kvp and not args.mapping.attn.has_qcp
@@ -216,11 +241,11 @@ def test_the_prefill_role_shards_its_pages_without_a_query_shard():
         ),
         (
             ["--disaggregation-mode", "null"],
-            "--query-context-parallel-size > 1 requires --disaggregation-mode prefill",
+            "requires --decode-context-parallel-size 2",
         ),
         (
             ["--disaggregation-mode", "decode"],
-            "--query-context-parallel-size > 1 requires --disaggregation-mode prefill",
+            "--query-context-parallel-size > 1 requires --disaggregation-mode null or prefill",
         ),
         (["--enable-mixed-batch"], "--enable-mixed-batch"),
         (["--data-parallel-size", "2"], "attention DP 1"),
@@ -415,6 +440,20 @@ def test_the_attention_config_pins_query_sharding_to_a_bf16_native_cache():
     _dsa_attn_config(
         kv_cache_dtype=torch.float8_e4m3fn, qcp_size=1, qcp_rank=0, qcp_group=(0,)
     )
+
+
+def test_hybrid_dsa_query_shard_validates_the_resolved_leaf():
+    from dataclasses import replace
+
+    config = _dsa_attn_config()
+    component = config.components[0]
+    wrapped = replace(
+        config, components=(replace(component, backend_name="hybrid_linear_attn"),)
+    )
+    resolved = replace(wrapped, components=(replace(component, backend_name="dsa"),))
+    assert resolved.qcp_size == resolved.kvp_size == 2
+    with pytest.raises(ValueError, match="requires GPU DSA"):
+        replace(wrapped, components=(replace(component, backend_name="flashmla"),))
 
 
 @pytest.mark.parametrize("size", [2, 4, 8])

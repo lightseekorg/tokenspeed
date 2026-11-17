@@ -2774,10 +2774,10 @@ class ModelExecutor:
                         decode_width=self.config.output_length,
                     )
                 query_shard = None
-                if self.config.query_shard_size > 1:
-                    # The shard splits the packed extend span; host integers
-                    # from the same lengths gather_ids come from. The prefill
-                    # role never carries decode rows, so num_extends == bs.
+                if self.config.query_shard_size > 1 and num_extends > 0:
+                    # Shard pure Prefill spans. An aggregated engine retains
+                    # replicated query rows for Decode over the same KVP cache.
+                    # Mixed forwards still need a separate row-layout contract.
                     if num_extends != bs:
                         raise RuntimeError(
                             "query context parallelism shards pure extend "

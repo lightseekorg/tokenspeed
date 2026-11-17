@@ -291,7 +291,7 @@ def validate_context_parallel_roles(
     qcp_size: int,
     disaggregation_mode: str,
 ) -> None:
-    """Validate KVP/DCP roles and the PD-prefill-only QCP layout.
+    """Validate KVP/DCP roles and the Prefill query-sharding layout.
 
     Aggregated and PD decode engines require explicit DCP matching KVP.
     """
@@ -305,13 +305,11 @@ def validate_context_parallel_roles(
             f"or decode (got {disaggregation_mode!r})"
         )
     if qcp_size > 1:
-        if disaggregation_mode != "prefill":
+        if disaggregation_mode not in ("null", "prefill"):
             raise ValueError(
                 "--query-context-parallel-size > 1 requires --disaggregation-mode "
-                f"prefill (got {disaggregation_mode!r}): the query shard is a "
-                "prefill-role layout whose decode arm runs every row on every "
-                "rank (the drafter's steps only), which no engine serving "
-                "steady-state decode should pay"
+                f"null or prefill (got {disaggregation_mode!r}): queries are "
+                "sharded only on extend forwards; Decode keeps replicated rows"
             )
         if kvp_size not in (1, qcp_size):
             raise ValueError(
@@ -681,7 +679,7 @@ class ServerArgs:
     # path on the mapping's kvp_size, which the drafter's steps on a sharded
     # prefill engine take as well.
     decode_context_parallel_size: int = 1
-    # Query context parallelism on the PD prefill role: shard every extend
+    # Query context parallelism in aggregated and PD prefill engines: shard every extend
     # forward's rows over the attention TP group (1 = off; equals
     # kv_parallel_size when on).
     query_context_parallel_size: int = 1
@@ -1558,6 +1556,15 @@ class ServerArgs:
             qcp_size=self.mapping.attn.qcp_size,
             disaggregation_mode=self.disaggregation_mode,
         )
+        if (
+            self.mapping.attn.has_qcp
+            and self.disaggregation_mode == "null"
+            and self.attention_backend != "dsa"
+        ):
+            raise ValueError(
+                "Query-sharded execution requires --disaggregation-mode prefill "
+                "for this backend; aggregated QCP validation is limited to dsa"
+            )
         validate_qcp(
             qcp_size=self.mapping.attn.qcp_size,
             attn_tp_size=self.mapping.attn.tp_size,
@@ -4965,11 +4972,12 @@ class ServerArgs:
             "--query-context-parallel-size",
             type=int,
             default=ServerArgs.query_context_parallel_size,
-            help="Query context parallelism (QCP) on the PD prefill role: shard "
-            "every extend forward's query rows over the attention TP group, rank "
-            "r computing a contiguous slice of the chunk's rows against the "
+            help="Query context parallelism (QCP) for extend forwards: shard "
+            "query rows over the attention TP group, each rank computing its "
+            "assigned original query positions against the "
             "gathered KV history of its requests. Requires --disaggregation-mode "
-            "prefill, must equal --attn-tp-size and keeps the prefill eager. "
+            "null or prefill, must equal --attn-tp-size and keeps the prefill eager. "
+            "Aggregated engines need DCP matching KVP for subsequent Decode. "
             "--kv-parallel-size must be 1 or equal to it. GPU DSA attention "
             "needs it equal to --kv-parallel-size and a bf16 KV cache; its "
             "attention weights are head-replicated unless --attn-head-tp-size "
