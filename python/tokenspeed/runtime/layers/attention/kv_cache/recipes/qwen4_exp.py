@@ -52,6 +52,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.ownership import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     FLAT_KV_PLANE,
     CacheFieldSpec,
+    CacheLayout,
     cache_dtype_name,
     pack,
 )
@@ -204,6 +205,30 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
             )
             for gid, payload in payloads.items()
         }
+
+    @override
+    def parent_id_limit(self, layout: CacheLayout) -> int:
+        """Keep every target and draft atom write slot inside signed int32."""
+        limit = super().parent_id_limit(layout)
+        if not self._flat_kv:
+            return limit
+        specs = {spec.group_id: spec for spec in self._group_specs}
+        packing = dict(layout.group_packing)
+        for field in layout.fields:
+            spec = specs[field.group_id]
+            if spec.attn_kind != "full_history":
+                continue
+            # The last slot is block * stride / payload * block_tokens
+            # + block_tokens - 1, independent of the kernel page size.
+            # Include each view's payload and the final page's token span.
+            block_tokens = spec.block_granularity
+            limit = min(
+                limit,
+                ((1 << 31) - block_tokens)
+                * field.payload_bytes
+                // (packing[field.group_id] * field.page_stride_bytes * block_tokens),
+            )
+        return limit
 
     def _ple_fields(self) -> tuple[CacheFieldSpec, ...]:
         if not getattr(self._text_config, "ple_layer_ids", None):

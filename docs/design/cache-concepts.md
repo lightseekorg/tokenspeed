@@ -2051,6 +2051,12 @@ largest translated atom-page ID and its largest token write slot against
 signed int32. These bounds include the stride-derived multiplier, every
 kernel subpage, and the null page in the group's capacity; overflowing
 geometry fails at startup before any table value is narrowed.
+The recipe also caps the agreed parent capacity at the largest count all
+target and draft full-history fields can address. This keeps a larger GPU
+memory budget from producing an unbindable pool; a smaller draft payload
+can set the limit. The bound is independent of the kernel page size and
+includes the final page's token span. The bind-time check remains in place
+for explicitly constructed plans.
 
 L3 compatibility follows the cache layout signature, including field strides,
 payloads and group packing. The FlatKV flag is not a separate KV-producer

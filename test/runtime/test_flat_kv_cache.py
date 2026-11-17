@@ -485,6 +485,111 @@ def _qwen4_exp_recipe(*, flat, device, kv_dtype, state_layers, draft_num_kv_head
     return recipe
 
 
+@pytest.mark.parametrize("draft_index_dim", [64, 128])
+@pytest.mark.parametrize("kernel_page_size", [64, 256])
+def test_flat_kv_capacity_fits_every_target_and_draft_history_view(
+    draft_index_dim, kernel_page_size
+):
+    from dataclasses import replace
+    from test.runtime.test_cache_setup import _qwen4_exp_fp8_kv_recipe
+
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.layers.attention.configs.base import SoftmaxAttnConfig
+    from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
+    from tokenspeed.runtime.layers.attention.kv_cache.factory import create_cache_pool
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+        FULL_ATTENTION,
+        LINEAR_ATTENTION,
+    )
+
+    layer_types = (
+        LINEAR_ATTENTION,
+        LINEAR_ATTENTION,
+        LINEAR_ATTENTION,
+        FULL_ATTENTION,
+    ) * 12
+    recipe = _qwen4_exp_fp8_kv_recipe(
+        layer_types=layer_types,
+        ple_layer_ids=[2],
+        hidden_size=16,
+        linear=LinearAttnConfig(
+            num_k_heads=16,
+            num_v_heads=48,
+            head_k_dim=128,
+            head_v_dim=128,
+            conv_kernel_size=4,
+            layer_ids=tuple(
+                i for i, kind in enumerate(layer_types) if kind == LINEAR_ATTENTION
+            ),
+            tp_size=2,
+        ),
+        num_kv_heads=4,
+        head_dim=128,
+        mamba_ssm_dtype="float32",
+        qsa=True,
+        draft_num_kv_heads=4,
+        verify_width=4,
+        max_bs=2,
+        pp_size=1,
+        cache_budget_bytes=150 << 30,
+        device="meta",
+    )
+    recipe.server_args.qwen4_exp_flat_kv = True
+    recipe.server_args.mapping = Mapping(rank=0, world_size=2, attn_tp_size=2)
+    recipe.draft_model_config.hf_text_config.indexer_head_dim = draft_index_dim
+
+    def tp2_config(config):
+        softmax = config.component(SoftmaxAttnConfig)
+        return replace(
+            config,
+            kv_cache_dtype=torch.bfloat16,
+            components=tuple(
+                (
+                    replace(component, attn_tp_size=2)
+                    if component is softmax
+                    else component
+                )
+                for component in config.components
+            ),
+        )
+
+    recipe.attn_config = tp2_config(recipe.attn_config)
+    recipe.draft_attn_config = tp2_config(recipe.draft_attn_config)
+    setup = recipe.setup()
+    groups = recipe.groups()
+    layout = pack(
+        groups,
+        prefix_granularity=recipe.prefix_granularity,
+        cache_blocks_per_lcm_block=recipe.packing(groups),
+        alignment=recipe.alignment,
+        max_padding_fraction=recipe.max_padding_fraction,
+    )
+
+    def validate_views(plan):
+        arena = CacheArena(plan, "meta", cache_group_specs=setup.spec.cache_group_specs)
+        for offset, count, config in (
+            (0, setup.num_target_layers, recipe.attn_config),
+            (setup.num_target_layers, setup.num_draft_layers, recipe.draft_attn_config),
+        ):
+            pool = create_cache_pool(
+                setup.spec.layer_view(first_layer=offset, num_layers=count),
+                config,
+                arena,
+                num_layers=count,
+                rank=0,
+                field_layer_offset=offset,
+            )
+            for spec in setup.spec.cache_group_specs:
+                if spec.attn_kind == "full_history":
+                    pool.atom_pages_per_block(spec.group_id, kernel_page_size)
+
+    # The CI TP2 geometry exceeded int32 after sizing to free GPU memory.
+    # Meta views exercise every real pool's checks without allocating the arena.
+    validate_views(setup.spec.memory_plan)
+    with pytest.raises(ValueError, match="kernel write slot"):
+        validate_views(layout.bind(setup.spec.memory_plan.num_lcm_blocks + 1))
+
+
 def _qwen4_exp_pool(*, flat, device, kv_dtype, draft_num_kv_heads):
     from tokenspeed.runtime.layers.attention.kv_cache.factory import (
         create_cache_arena,
