@@ -22,6 +22,8 @@
 
 import json
 import os
+from contextlib import nullcontext
+from time import sleep
 
 import pytest
 import torch
@@ -193,6 +195,43 @@ def test_startup_graph_measurement_replays_and_restores():
     assert torch.equal(value, torch.zeros_like(value))
 
 
+def test_startup_measurement_includes_host_budget_time(monkeypatch):
+    # This host-only test substitutes the unavailable GPU clock and device.
+    # A fixed device duration must not hide the host budget delay.
+    class DeviceEvent:
+        def __init__(self, *, enable_timing):
+            pass
+
+        def record(self):
+            pass
+
+        def synchronize(self):
+            pass
+
+        def elapsed_time(self, end):
+            return 0.1
+
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
+    monkeypatch.setattr(torch.cuda, "Event", DeviceEvent)
+    value = torch.zeros(())
+
+    def replay():
+        sleep(0.01)
+        value.add_(1)
+
+    times = measure_startup_graph(
+        replay,
+        value.zero_,
+        device=torch.device("cuda"),
+        host_group=None,
+        warmup=1,
+        samples=2,
+    )
+    assert value.item() == 1
+    assert len(times) == 2 and all(t >= 10 for t in times)
+
+
 @pytest.mark.skipif(
     int(os.environ.get("WORLD_SIZE", "1")) < 2, reason="requires torchrun"
 )
@@ -287,6 +326,75 @@ def test_cache_roundtrip_and_configuration_change(tmp_path):
     assert not list(tmp_path.glob(".verify-*"))
 
 
+def test_cache_identity_values_are_private_and_order_independent(tmp_path):
+    sentinel = "synthetic-value-for-cache-privacy-test"
+    identity = {
+        "environment": {
+            "TOKENSPEED_TEST_SECRET": sentinel,
+            "CUDA_VISIBLE_DEVICES": "0",
+        },
+        "runtime": {"api_key": sentinel},
+    }
+    cache = VerifyCalibrationCache(tmp_path, identity=identity)
+    cache.save([profile()])
+    assert sentinel not in cache.path.read_text()
+    assert "TOKENSPEED_TEST_SECRET" not in cache.path.read_text()
+    assert cache.load() == (profile(),)
+    reordered = VerifyCalibrationCache(
+        tmp_path,
+        identity={
+            "runtime": {"api_key": sentinel},
+            "environment": {
+                "CUDA_VISIBLE_DEVICES": "0",
+                "TOKENSPEED_TEST_SECRET": sentinel,
+            },
+        },
+    )
+    assert reordered.load() == (profile(),)
+
+
+@pytest.mark.parametrize("change", ["name", "value", "add", "remove"])
+def test_cache_environment_changes_invalidate_identity(tmp_path, change):
+    environment = {"CUDA_A": "one", "NCCL_B": "two"}
+    cache = VerifyCalibrationCache(tmp_path, identity={"environment": environment})
+    cache.save([profile()])
+    environment = dict(environment)
+    if change == "name":
+        environment["CUDA_NEW"] = environment.pop("CUDA_A")
+    elif change == "value":
+        environment["CUDA_A"] = "different"
+    elif change == "add":
+        environment["TOKENSPEED_C"] = "three"
+    else:
+        del environment["NCCL_B"]
+    changed = VerifyCalibrationCache(tmp_path, identity={"environment": environment})
+    assert changed.load() is None
+    changed.path.write_bytes(cache.path.read_bytes())
+    assert changed.load() is None
+
+
+def test_cache_identity_encoding_preserves_environment_boundaries(tmp_path):
+    cache = VerifyCalibrationCache(
+        tmp_path, identity={"environment": {"CUDA_A": "x\nNCCL_B=y"}}
+    )
+    cache.save([profile()])
+    separated = VerifyCalibrationCache(
+        tmp_path, identity={"environment": {"CUDA_A": "x", "NCCL_B": "y"}}
+    )
+    assert separated.load() is None
+
+
+def test_legacy_raw_identity_cache_is_a_miss(tmp_path):
+    identity = {"environment": {"TOKENSPEED_TEST_SECRET": "synthetic-old-value"}}
+    cache = VerifyCalibrationCache(tmp_path, identity=identity)
+    cache.save([profile()])
+    payload = json.loads(cache.path.read_text())
+    legacy = {"version": 1, "identity": identity, "profiles": payload["profiles"]}
+    cache.path.write_text(json.dumps(legacy))
+    assert cache.load() is None
+    assert json.loads(cache.path.read_text()) == legacy
+
+
 @pytest.mark.parametrize("payload", ["{", "null", "[]", '{"version": 1}'])
 def test_corrupt_cache_is_a_miss(tmp_path, payload):
     cache = VerifyCalibrationCache(tmp_path, identity={"test": 1})
@@ -301,7 +409,9 @@ def test_invalid_cached_profile_and_version_are_misses(tmp_path):
     raw["profiles"][0]["native_step_ms"] = -1
     cache.path.write_text(json.dumps(raw))
     assert cache.load() is None
-    raw["version"] = 2
+    cache.save([profile()])
+    raw = json.loads(cache.path.read_text())
+    raw["version"] = cache.VERSION + 1
     cache.path.write_text(json.dumps(raw))
     assert cache.load() is None
 

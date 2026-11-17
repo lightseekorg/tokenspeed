@@ -141,3 +141,50 @@ def test_adaptive_dspark_cli_reaches_runtime_and_resets():
     finally:
         global_server_args_dict.clear()
         global_server_args_dict.update(original)
+
+
+def test_sampled_adaptive_dspark_requires_recorded_proposals():
+    argv = [
+        "--model",
+        "x",
+        "--speculative-algorithm",
+        "DSPARK",
+        "--sampling-backend",
+        "flashinfer",
+        "--grammar-backend",
+        "none",
+        "--disable-prefill-graph",
+        "--enable-dsv41-adaptive-dspark",
+    ]
+    with pytest.raises(ValueError, match="enable-speculative-sampling"):
+        prepare_server_args(argv)
+    with pytest.raises(ValueError, match="sampling-stream per-request"):
+        prepare_server_args(argv + ["--enable-speculative-sampling"])
+    args = prepare_server_args(
+        argv + ["--enable-speculative-sampling", "--sampling-stream", "per-request"]
+    )
+    assert args.enable_speculative_sampling
+    assert args.speculative_rejection_sample_method == "standard"
+
+
+def test_sampled_adaptive_dspark_rejects_attention_tp():
+    with pytest.raises(ValueError, match="attention TP1"):
+        prepare_server_args(
+            [
+                "--model",
+                "x",
+                "--speculative-algorithm",
+                "DSPARK",
+                "--sampling-backend",
+                "flashinfer",
+                "--grammar-backend",
+                "none",
+                "--disable-prefill-graph",
+                "--enable-dsv41-adaptive-dspark",
+                "--enable-speculative-sampling",
+                "--sampling-stream",
+                "per-request",
+                "--tensor-parallel-size",
+                "2",
+            ]
+        )

@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
     from tokenspeed.runtime.execution.memory_delta import MemoryDeltaObserver
+    from tokenspeed.runtime.execution.model_executor import ModelExecutor
     from tokenspeed.runtime.execution.query_shard import QueryShardPlan
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
     from tokenspeed.runtime.execution.tree_spec import TreeSpec
@@ -314,6 +315,17 @@ class BaseDrafter:
             ctx: The target forward's context.
         """
 
+    def prepare_request_state(
+        self,
+        admission_ids: Sequence[int],
+        request_pool_indices: Sequence[int],
+        num_extends: int,
+    ) -> None:
+        """Prepare slot-owned draft state for this round's request admissions."""
+
+    def profile_startup(self, executor: ModelExecutor) -> None:
+        """Calibrate final decode graphs before live requests are admitted."""
+
     def decode_graph_query_capacities(self, bs: int) -> tuple[int, ...]:
         """Physical target row capacities for one request-capacity bucket."""
         return (bs * self.spec_num_tokens,)
@@ -335,8 +347,21 @@ class BaseDrafter:
         """Select physical target extent for capture; None restores eager policy."""
 
     def target_forward_context(self, ctx: ForwardContext) -> AbstractContextManager:
-        """Lend temporary model inputs; restore them before sampling and commit."""
+        """Lend temporary input storage; restore it before sampling and commit.
+
+        Packed target output geometry remains on ``ctx`` for the sampler.
+        ``verify_candidates`` supplies the original fixed-width input window.
+        """
         return nullcontext()
+
+    def verify_candidates(self) -> torch.Tensor:
+        """Return the live ``[num_decodes, spec_num_tokens]`` packed-verify inputs.
+
+        A drafter that packs target queries must retain the original fixed-width
+        candidate window for sampling, independently of the target output rows.
+        The default drafter does not support packed verification.
+        """
+        raise ValueError(f"{type(self).__name__} does not support packed verification")
 
     def on_target_weights_updated(self) -> None:
         """Refresh draft-side state derived from shared target weights.

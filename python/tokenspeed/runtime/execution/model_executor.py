@@ -1683,8 +1683,10 @@ class ModelExecutor:
 
         Decode rows' input ids sit at the tail of ``input_ids_buf`` (prefill
         tokens first), N tokens per request: column 0 the last verified
-        token, columns 1.. the draft candidates. Non-speculative serving is
-        the N == 1 case — a one-column window with nothing to accept, which
+        token, columns 1.. the draft candidates. Packed target queries retain
+        that original window through the drafter's ``verify_candidates`` hook.
+        Non-speculative serving is the N == 1 case — a one-column window
+        with nothing to accept, which
         verify() resolves to exactly one sampled token (equivalence pinned
         by test_decode_verify_n1_equivalence.py). A persistent-buffer view,
         so the captured sampler reads live ids on every replay.
@@ -1693,12 +1695,8 @@ class ModelExecutor:
         if num_decodes == 0:
             return None
         if ctx.decode_query_indptr is not None:
-            from tokenspeed.runtime.execution.drafter.deepseek_v41_dspark import (
-                DeepseekV41DSpark,
-            )
-
-            if not isinstance(self.drafter, DeepseekV41DSpark):
-                raise ValueError("packed candidates require the V4.1 drafter")
+            if self.drafter is None:
+                raise ValueError("packed verification requires a drafter")
             return self.drafter.verify_candidates()
         n = self.config.output_length
         num_prefill_tokens = ctx.input_num_tokens - num_decodes * n
@@ -1795,14 +1793,8 @@ class ModelExecutor:
         if num_extends == 0:
             packed_kwargs = {}
             if ctx.decode_query_indptr is not None:
-                from tokenspeed.runtime.sampling.backends.greedy import (
-                    GreedySamplingBackend,
-                )
-
-                if not isinstance(self.sampling_backend, GreedySamplingBackend):
-                    raise ValueError(
-                        "packed decode requires the greedy sampling backend"
-                    )
+                if not self.sampling_backend.supports_packed_verify:
+                    raise ValueError("sampling backend does not support packed decode")
                 packed_kwargs["query_start_loc"] = ctx.decode_query_indptr
             output_tokens, accept_lengths = self.sampling_backend.verify(
                 logits_output,
@@ -2699,9 +2691,7 @@ class ModelExecutor:
 
             if request_history_seeds is not None:
                 self.runtime_states.seed_request_token_history(request_history_seeds)
-            if self.drafter is not None and hasattr(
-                self.drafter, "prepare_request_state"
-            ):
+            if self.drafter is not None:
                 self.drafter.prepare_request_state(
                     admission_ids,
                     forward_op.request_pool_indices,

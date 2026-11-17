@@ -949,9 +949,24 @@ class ServerArgs:
             raise ValueError("adaptive DSpark requires real acceptance")
         from tokenspeed.runtime.utils.env import envs
 
-        if self.speculative_algorithm != "DSPARK" or self.sampling_backend != "greedy":
+        if self.speculative_algorithm != "DSPARK" or self.sampling_backend not in (
+            "greedy",
+            "flashinfer",
+        ):
             raise ValueError(
-                "V4.1 adaptive verification requires DSPARK and greedy sampling"
+                "V4.1 adaptive verification requires DSPARK and greedy "
+                "or flashinfer sampling"
+            )
+        if self.sampling_backend == "flashinfer" and (
+            not self.enable_speculative_sampling
+            or self.sampling_stream != "per-request"
+            or self.mapping.attn.tp_size != 1
+            or self.speculative_rejection_sample_method != "standard"
+        ):
+            raise ValueError(
+                "sampled adaptive DSpark requires --enable-speculative-sampling, "
+                "--sampling-stream per-request, standard rejection sampling "
+                "and attention TP1"
             )
         if not self.disable_prefill_graph:
             raise ValueError(
@@ -978,13 +993,14 @@ class ServerArgs:
             self.grammar_backend != "none"
             or self.enable_output_logprobs
             or self.enable_output_cumulative_probs
-            or self.enable_speculative_sampling
+            or (self.enable_speculative_sampling and self.sampling_backend == "greedy")
             or self.speculative_draft_tree
             or envs.TOKENSPEED_SPEC_SIMULATED_ACCEPT_LEN.get()
             or self.disable_sampling_tp_sync
         ):
             raise ValueError(
-                "V4.1 adaptive verification requires plain greedy sampling, grammar none, and TP synchronization"
+                "V4.1 adaptive verification requires chain sampling, "
+                "grammar none, and TP synchronization"
             )
 
     def validate_output_cumulative_probs(self):
@@ -4338,16 +4354,16 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.enable_dsv41_adaptive_dspark,
             help="Adapt DeepSeek V4.1 DSpark verification capacity using confidence "
-            "and calibrated step costs. Requires greedy sampling and CUDA graphs.",
+            "and calibrated step costs. Requires CUDA graphs and greedy sampling "
+            "or flashinfer with --enable-speculative-sampling.",
         )
         parser.add_argument(
             "--dsv41-dspark-min-batch-size",
             type=int,
             default=ServerArgs.dsv41_dspark_min_batch_size,
-            help="Minimum actual decode batch size per attention rank for adaptive "
-            "DSpark, not global request concurrency. Smaller or padded batches "
-            "retain full verification; attention DP also requires equal local "
-            "decode batch sizes across ranks.",
+            help="Enable adaptive DSpark when the maximum actual local decode "
+            "batch size across attention ranks reaches this threshold. Uneven "
+            "or idle DP ranks share the selected physical query capacity.",
         )
         parser.add_argument(
             "--draft-model-path-use-base",

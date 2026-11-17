@@ -92,6 +92,8 @@ def test_compressor_tail_scatter_graph_strides_and_replay(device):
 def test_public_argument_defaults():
     for name in dsv41.__all__:
         fn = getattr(dsv41, name)
+        if not callable(fn):
+            continue
         assert fn.__doc__, name
         for parameter in inspect.signature(fn).parameters.values():
             if name == "index_topk" and parameter.name in ("index_metadata", "slots"):
