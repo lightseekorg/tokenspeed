@@ -26,6 +26,7 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.ops.embedding import apply_k_rope as _apply_k_rope
+from tokenspeed_kernel.platform import current_platform
 from torch import nn
 
 from tokenspeed.runtime.configs.model_config import (
@@ -34,7 +35,7 @@ from tokenspeed.runtime.configs.model_config import (
 )
 from tokenspeed.runtime.configs.model_profile import ModelProfile
 from tokenspeed.runtime.distributed.comm_ops import all_gather, all_reduce
-from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.distributed.mapping import Mapping, MappingBase
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.layernorm import RMSNorm
@@ -52,12 +53,15 @@ from tokenspeed.runtime.layers.paged_attention import (
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
+from tokenspeed.runtime.models.kimi_k3_comm import draft_all_reduce
 from tokenspeed.runtime.models.target_capture import TargetCaptureConfigurator
 from tokenspeed.runtime.models.utils import validate_attention_partition
 from tokenspeed.runtime.utils import add_prefix
 from tokenspeed.runtime.utils.device_stream import is_current_stream_capturing
 from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.spec_block_geometry import read_checkpoint_block_size
+
+_is_amd = current_platform().is_amd
 
 
 class DFlashAttention(nn.Module):
@@ -192,6 +196,37 @@ class DFlashAttention(nn.Module):
         )
 
 
+def reduce_norm(
+    norm: RMSNorm,
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    ctx: ForwardContext,
+    group: MappingBase,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reduce a row-parallel partial over ``group``, then add-norm it.
+
+    On AMD the fused all-reduce + norm builds its own Iris state per shape on
+    first use, which a draft first reaches inside graph capture and at block
+    widths the target never runs; the reduce goes through the draft
+    all-reduce (the target's Lamport state when it covers the rows) and the
+    norm runs unfused.
+    """
+    if _is_amd or (
+        ctx.input_num_tokens > global_server_args_dict["comm_fusion_max_num_tokens"]
+    ):
+        if group.tp_size > 1:
+            hidden_states = (
+                draft_all_reduce(hidden_states, group.tp_group)
+                if _is_amd
+                else all_reduce(hidden_states, group.tp_group)
+            )
+        return norm(hidden_states, residual)
+    hidden_states, residual, *_ = norm.forward_with_allreduce_fusion(
+        group.tp_rank, group.tp_group, hidden_states, residual
+    )
+    return hidden_states, residual
+
+
 class DFlashDecoderLayer(nn.Module):
     """A block-draft layer.
 
@@ -261,19 +296,9 @@ class DFlashDecoderLayer(nn.Module):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
-        elif (
-            ctx.input_num_tokens > global_server_args_dict["comm_fusion_max_num_tokens"]
-        ):
-            hidden_states = all_reduce(hidden_states, self.mapping.dense.tp_group)
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
         else:
-            hidden_states, residual, *_ = (
-                self.input_layernorm.forward_with_allreduce_fusion(
-                    self.mapping.dense.tp_rank,
-                    self.mapping.dense.tp_group,
-                    hidden_states,
-                    residual,
-                )
+            hidden_states, residual = reduce_norm(
+                self.input_layernorm, hidden_states, residual, ctx, self.mapping.dense
             )
 
         hidden_states = self.self_attn(
@@ -282,20 +307,13 @@ class DFlashDecoderLayer(nn.Module):
             ctx=ctx,
         )
 
-        if ctx.input_num_tokens > global_server_args_dict["comm_fusion_max_num_tokens"]:
-            hidden_states = all_reduce(hidden_states, self.mapping.attn.tp_group)
-            hidden_states, residual = self.post_attention_layernorm(
-                hidden_states, residual
-            )
-        else:
-            hidden_states, residual, *_ = (
-                self.post_attention_layernorm.forward_with_allreduce_fusion(
-                    self.mapping.attn.tp_rank,
-                    self.mapping.attn.tp_group,
-                    hidden_states,
-                    residual,
-                )
-            )
+        hidden_states, residual = reduce_norm(
+            self.post_attention_layernorm,
+            hidden_states,
+            residual,
+            ctx,
+            self.mapping.attn,
+        )
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
@@ -615,20 +633,15 @@ class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
 
         The layers build their MLP with ``reduce_results=False``; each layer's
         partial is reduced by the next layer's input norm, so the last one is
-        reduced here, fused with the norm as the layers' input norm is. Over a
-        dense group of one rank the reduce is a no-op.
+        reduced here the way the layers' input norm is. Over a dense group of
+        one rank the reduce is a no-op.
         """
         if residual is None:
             return self.norm(hidden_states)
-        if ctx.input_num_tokens > global_server_args_dict["comm_fusion_max_num_tokens"]:
-            hidden_states = all_reduce(hidden_states, self.mapping.dense.tp_group)
-            return self.norm(hidden_states, residual)[0]
-        return self.norm.forward_with_allreduce_fusion(
-            self.mapping.dense.tp_rank,
-            self.mapping.dense.tp_group,
-            hidden_states,
-            residual,
-        )[0]
+        hidden_states, _ = reduce_norm(
+            self.norm, hidden_states, residual, ctx, self.mapping.dense
+        )
+        return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
