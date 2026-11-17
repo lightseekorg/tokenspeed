@@ -131,6 +131,9 @@ Scheduler::Scheduler(SchedulerConfig config)
     // A peer's complete read demotes the holder's copy (PeerExports::Release)
     // through the same marks.
     coordinator_.SetCheckpointDemotion(checkpoint_lineage_.has_value() || peer_exports_ != nullptr);
+    if (config_.peer_config) {
+        next_peer_lease_ = config_.peer_config->incarnation << 32;
+    }
 
     if (const char* level = std::getenv("SPDLOG_LEVEL")) {
         spdlog::set_level(spdlog::level::from_str(level));

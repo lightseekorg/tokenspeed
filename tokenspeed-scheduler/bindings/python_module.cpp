@@ -284,10 +284,12 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("pressure_low", &tokenspeed::StorageConfig::pressure_low);
     scheduler_config.def_rw("storage_config", &tokenspeed::SchedulerConfig::storage_config);
     nb::class_<tokenspeed::PeerConfig>(m, "PeerConfig")
-        .def(nb::init<std::string, std::int32_t, std::int64_t, std::int64_t, std::int64_t, std::int32_t>(),
-             nb::arg("name"), nb::arg("max_leases"), nb::arg("soft_pin_us"), nb::arg("hard_pin_us"),
-             nb::arg("lookup_timeout_us"), nb::arg("min_fetch_tokens"))
+        .def(nb::init<std::string, std::uint64_t, std::int32_t, std::int64_t, std::int64_t, std::int64_t,
+                      std::int32_t>(),
+             nb::arg("name"), nb::arg("incarnation"), nb::arg("max_leases"), nb::arg("soft_pin_us"),
+             nb::arg("hard_pin_us"), nb::arg("lookup_timeout_us"), nb::arg("min_fetch_tokens"))
         .def_ro("name", &tokenspeed::PeerConfig::name)
+        .def_ro("incarnation", &tokenspeed::PeerConfig::incarnation)
         .def_ro("max_leases", &tokenspeed::PeerConfig::max_leases)
         .def_ro("soft_pin_us", &tokenspeed::PeerConfig::soft_pin_us)
         .def_ro("hard_pin_us", &tokenspeed::PeerConfig::hard_pin_us)

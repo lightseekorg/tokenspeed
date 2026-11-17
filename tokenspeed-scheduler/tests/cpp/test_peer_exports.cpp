@@ -42,6 +42,7 @@ constexpr std::uint32_t kState = 1;
 
 PeerConfig Config() {
     return PeerConfig{.name = "holder",
+                      .incarnation = 1,
                       .max_leases = 2,
                       .soft_pin_us = 100,
                       .hard_pin_us = 1000,

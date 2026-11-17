@@ -356,6 +356,8 @@ private:
         // so the peer omits the state transfer (PrefillOperation::state_prefix_cached).
         bool state_prefix_cached{false};
         std::optional<fsm::SchedulePrefillFirstChunkEvent> event;
+        // A peer landing's destinations: every block it fills whole.
+        std::vector<PeerPage> peer_destinations;
     };
     // `yield_tokens`: what a chunk that cannot finish gives up for whole
     // prompts behind it (YieldingChunkBudget). `must_complete`: admit only a
@@ -384,6 +386,8 @@ private:
     DecodeOperation applyEventAndBuildOperation(Request* request, fsm::ScheduleDecodeEvent event);
 
     AdmissionMatch matchPrefixAtAdmission(Request* request);
+    // The same probe, matching no further than max_probe_tokens.
+    AdmissionMatch matchPrefixAtAdmission(Request* request, std::int32_t max_probe_tokens);
     // Records an admission's fresh pages (to zero) and copies on the plan, a
     // copy from a block an earlier copy of the plan fills reading that copy's
     // source. Asserts that each copy destination is written once and never
@@ -498,6 +502,14 @@ private:
     // A waiting prompt with a peer hint asks its holder, once; one past its
     // wait gives the holder up.
     void preparePeer(Request& request);
+    // The blocks a landing of [hit_tokens, end_tokens) fills whole in the
+    // request's tables: a token-spanned group's from the block holding
+    // hit_tokens through the one holding the end, a State group's live slot.
+    std::vector<PeerPage> peerLandingDestinations(std::span<const BlockTable> tables, std::int32_t hit_tokens,
+                                                  std::int32_t end_tokens) const;
+    // Takes a landing's destinations out of the admission's pages to zero;
+    // none may be a copy or load destination.
+    void excludeLandedPages(AdmissionResult& admission, std::span<const PeerPage> destinations) const;
     void handleEvent(const cache::PeerTick& event);
     void handleEvent(const cache::PeerLookup& event);
     void handleEvent(const cache::PeerPin& event);

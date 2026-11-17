@@ -70,6 +70,7 @@ SchedulerConfig PeerConfigFor(const std::string& name, bool hybrid = false) {
         });
     }
     cfg.peer_config = PeerConfig{.name = name,
+                                 .incarnation = 7,
                                  .max_leases = 8,
                                  .soft_pin_us = 1000,
                                  .hard_pin_us = 1000,
@@ -200,6 +201,16 @@ TEST_P(PeerSchedulerTest, AReaderLandsTheHoldersPrefixAndComputesTheRest) {
         }));
     }
     EXPECT_EQ(reader_.GetPeerStats().landing_requests, 1u);
+    // The plan's device work leaves the destinations alone: the reads are not
+    // ordered with it.
+    const std::vector<std::string> group_ids{"full_attention", "sliding_attention", "linear_attention"};
+    for (const PeerPage& destination : fetch.destinations) {
+        const std::string& group = group_ids[destination.group_id];
+        EXPECT_EQ(std::ranges::count(landing_plan.pages_to_zero.at(group), destination.block_id), 0) << group;
+        for (const auto& [source, copied] : landing_plan.pages_to_copy.at(group)) {
+            EXPECT_NE(copied, destination.block_id) << group;
+        }
+    }
     EXPECT_TRUE(PrefillRows(Plan(reader_)).empty()) << "nothing reads a landing's pages";
 
     EXPECT_EQ(Fetch(fetch, /*read_succeeds=*/true), fetch.end_tokens);
@@ -236,6 +247,7 @@ TEST_P(PeerSchedulerTest, AMissOrAnUnansweredLookupIsAdmittedLocally) {
     Plan(reader_);
     const std::vector<PeerLookupRequest> lookups = reader_.TakePeerLookups();
     ASSERT_EQ(lookups.size(), 2u);
+    EXPECT_EQ(lookups[0].lease.id, (std::uint64_t{7} << 32) + 1) << "counted from the reader's incarnation";
     Send(reader_, cache::PeerLookupAnswered{.lease = lookups[0].lease, .num_tokens = 0});
     EXPECT_EQ(PrefillRows(Plan(reader_)), (std::vector<std::pair<std::string, std::int32_t>>{{"miss", 0}}));
 
@@ -288,6 +300,43 @@ TEST_P(PeerSchedulerTest, AHolderAnswersFromItsOwnCacheAndHoldsAPinUntilTheRelea
     ASSERT_EQ(answers.size(), 1u);
     EXPECT_EQ(answers.front().num_tokens, 0) << "a malformed lookup is a miss";
     EXPECT_EQ(holder_.GetPeerStats().leases, 0u);
+}
+
+// A local hit that ends inside a page (a tail) ends inside a block, which a
+// landing would fill as well as the hit's copy: the landing starts at the
+// page boundary below instead.
+TEST(PeerLandingAlignmentTest, ALocalTailHitLandsFromThePageBoundaryBelow) {
+    Scheduler holder{PeerConfigFor("holder")};
+    Scheduler reader{PeerConfigFor("reader")};
+    const std::vector<std::int32_t> tokens = MakeAlignedTokens(8, kP);
+    for (Scheduler* scheduler : {&holder, &reader}) {
+        // The holder computes the whole prompt, the reader a page and a tail.
+        const auto computed =
+            scheduler == &holder ? tokens : std::vector<std::int32_t>(tokens.begin(), tokens.begin() + kP + 1);
+        scheduler->SubmitRequests({RequestSpec{.request_id = "warm", .tokens = computed, .max_new_tokens = 1}});
+        ASSERT_EQ(PrefillRows(Plan(*scheduler)).size(), 1u);
+        Send(*scheduler, forward::ExtendResult{.request_id = "warm", .tokens = {7}});
+        Send(*scheduler, forward::Finish{.request_id = "warm"});
+        Plan(*scheduler);
+    }
+    reader.SubmitRequests({RequestSpec{.request_id = "r", .peer_holder = "holder", .tokens = tokens}});
+    Plan(reader);
+    for (const PeerLookupRequest& lookup : reader.TakePeerLookups()) {
+        Send(holder, cache::PeerLookup{.lease = lookup.lease,
+                                       .prefix_hashes = lookup.prefix_hashes,
+                                       .tokens = lookup.tokens,
+                                       .max_tokens = lookup.max_tokens});
+    }
+    for (const PeerAnswer& answer : holder.TakePeerAnswers()) {
+        ASSERT_GT(answer.num_tokens, 2 * kP);
+        Send(reader, cache::PeerLookupAnswered{.lease = answer.lease, .num_tokens = answer.num_tokens});
+    }
+    const ExecutionPlan plan = Plan(reader);
+    ASSERT_EQ(plan.peer_fetches.size(), 1u);
+    EXPECT_EQ(plan.peer_fetches.front().begin_tokens % kP, 0);
+    for (const auto& [group, copies] : plan.pages_to_copy) {
+        EXPECT_TRUE(copies.empty()) << group;
+    }
 }
 
 TEST(PeerSchedulerConfigTest, PeerSharingNeedsPrefixCachingOutsideTheDRoleAndNoReplayableGroup) {

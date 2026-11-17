@@ -41,6 +41,10 @@ struct PeerConfig {
     // The name other replicas address this one by, as the router's holder
     // hint carries it. A lease names its reader by it.
     std::string name;
+    // This process's incarnation, which a restart changes: a reader's lease
+    // ids count from it, so no lease of a restarted reader meets a holder's
+    // lease of the reader it replaced.
+    std::uint64_t incarnation;
     // Holder: leases held at once. A lookup past it is answered with a miss.
     std::int32_t max_leases;
     // Holder: how long a soft pin (a lookup's) and a hard pin last.

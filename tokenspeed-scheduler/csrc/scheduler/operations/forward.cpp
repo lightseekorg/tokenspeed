@@ -343,6 +343,10 @@ DecodeOperation applyDecodeEvent(Request& request, fsm::ScheduleDecodeEvent even
 }  // namespace
 
 Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
+    return matchPrefixAtAdmission(request, std::numeric_limits<std::int32_t>::max());
+}
+
+Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request, std::int32_t max_probe_tokens) {
     ProfileSpan profile_span{"Scheduler::matchPrefixAtAdmission"};
     // Only a first admission probes: a readmission copies the request's own
     // image back and matches nothing.
@@ -369,8 +373,8 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
     // the positions it needs logits for are recomputed rather than matched.
     // The bound is in tokens: a hit may end at it exactly.
     const std::int32_t replay_tokens = std::max(config_.prefix_replay_tokens, 1);
-    const std::int32_t max_cacheable_tokens =
-        std::max(std::min(request->PrefillSize() - replay_tokens, request->MaxCachedPrefixTokens()), 0);
+    const std::int32_t max_cacheable_tokens = std::max(
+        std::min({request->PrefillSize() - replay_tokens, request->MaxCachedPrefixTokens(), max_probe_tokens}), 0);
     // The last token is recomputed, so a page the prompt fills exactly can
     // never be hit -- except on the D role, whose prompt-end state check
     // needs the prompt's last page hashed when the prompt ends on it.
@@ -514,19 +518,30 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     if (req_pool_allocator_.AvailableSlots() == 0) {
         return FirstChunkOutcome{};
     }
-    AdmissionMatch match = matchPrefixAtAdmission(request);
-    if (match.waits_for_eviction_store) {
-        // The ACK makes the segment visible. Re-probe then, without taking
-        // pages or reporting a capacity failure while the copy is pending.
-        return FirstChunkOutcome{};
-    }
-
     // The D role's prompts are the peer's work, a peer landing's prefix the
     // holder's; every other first chunk is local.
     const fsm::PrefillSource source = config_.role == Role::kD  ? fsm::PrefillSource::kRemote
                                       : peer_landing_tokens > 0 ? fsm::PrefillSource::kPeer
                                                                 : fsm::PrefillSource::kLocal;
     const std::int32_t prefix_granularity = coordinator_.PrefixGranularity();
+    AdmissionMatch match = matchPrefixAtAdmission(request);
+    // A peer landing resumes its local hit only at a page boundary, a block
+    // boundary of every group: the block holding a tail hit's end would be
+    // filled by the admission's copy or load as well as by the landing, and
+    // the device's writes are not ordered with the reads'. A shorter probe
+    // cuts the hit to the page boundary below, or further.
+    if (source == fsm::PrefillSource::kPeer) {
+        for (std::int32_t hit = std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
+             hit % prefix_granularity != 0 && !match.waits_for_eviction_store;
+             hit = std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens)) {
+            match = matchPrefixAtAdmission(request, hit / prefix_granularity * prefix_granularity);
+        }
+    }
+    if (match.waits_for_eviction_store) {
+        // The ACK makes the segment visible. Re-probe then, without taking
+        // pages or reporting a capacity failure while the copy is pending.
+        return FirstChunkOutcome{};
+    }
 
     const std::int32_t hit_tokens = std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
     // Where a landing ends: the whole prompt from the PD peer, a prefix from
@@ -704,6 +719,13 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     _assert(std::max(admission->device_prefix_tokens, admission->host_prefix_tokens) == hit_tokens,
             "an admission claims exactly the prefix it probed");
     _assert(admission->junction_tokens == junction_tokens, "the junction changed between probe and admission");
+    // A landing fills its destinations whole, unordered with the plan's
+    // device work: none is zeroed, and none is a copy or load destination.
+    std::vector<PeerPage> peer_destinations;
+    if (source == fsm::PrefillSource::kPeer) {
+        peer_destinations = peerLandingDestinations(tables, hit_tokens, landing_end);
+        excludeLandedPages(*admission, peer_destinations);
+    }
     recordAdmittedPages(plan, *admission);
     // host_prefix_tokens is a boundary: the Host loads the KV that lies beyond
     // the Device's prefix (0 when only checkpoints come from Host), and
@@ -758,21 +780,23 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
             coordinator_.RetainInputCheckpoint(cache_progress.prefix_hashes, state_checkpoint);
     }
     return FirstChunkOutcome{.state_prefix_cached = admission->state_prefix_cached,
-                             .event = fsm::SchedulePrefillFirstChunkEvent{
-                                 tokens_this_round,
-                                 decode_reserve,
-                                 &req_pool_allocator_,
-                                 source,
-                                 &coordinator_,
-                                 std::move(tables),
-                                 hit_tokens,
-                                 std::move(cache_progress),
-                                 std::move(admission->copy_in_blocks),
-                                 std::move(admission->load_pairs),
-                                 // The P role holds a completed prompt until its result lands: the
-                                 // remote decode that hands it off carries the bootstrap token.
-                                 config_.role == Role::kP,
-                             }};
+                             .event =
+                                 fsm::SchedulePrefillFirstChunkEvent{
+                                     tokens_this_round,
+                                     decode_reserve,
+                                     &req_pool_allocator_,
+                                     source,
+                                     &coordinator_,
+                                     std::move(tables),
+                                     hit_tokens,
+                                     std::move(cache_progress),
+                                     std::move(admission->copy_in_blocks),
+                                     std::move(admission->load_pairs),
+                                     // The P role holds a completed prompt until its result lands: the
+                                     // remote decode that hands it off carries the bootstrap token.
+                                     config_.role == Role::kP,
+                                 },
+                             .peer_destinations = std::move(peer_destinations)};
 }
 
 std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(

@@ -127,6 +127,53 @@ void Scheduler::handleEvent(const cache::PeerFetchDone& event) {
     request->Apply(fsm::PeerLandingFailedEvent{&coordinator_});
 }
 
+std::vector<PeerPage> Scheduler::peerLandingDestinations(std::span<const BlockTable> tables, std::int32_t hit_tokens,
+                                                         std::int32_t end_tokens) const {
+    std::vector<PeerPage> destinations;
+    for (std::int32_t i = 0; i < coordinator_.NumGroups(); ++i) {
+        const BlockTable& table = tables[static_cast<std::size_t>(i)];
+        const std::span<const CacheBlockRef> blocks = table.Blocks();
+        const auto add = [&](std::int32_t slot) {
+            destinations.push_back(PeerPage{
+                .group_id = static_cast<std::uint32_t>(i),
+                .slot = slot,
+                .tier = CacheTier::kDevice,
+                .block_id = coordinator_.Allocator(i).ResolveCacheBlockId(*blocks[static_cast<std::size_t>(slot)]),
+            });
+        };
+        if (coordinator_.GroupIsState(static_cast<std::size_t>(i))) {
+            add(kPeerStateSlot);
+            continue;
+        }
+        const std::int32_t block_granularity = coordinator_.GroupBlockGranularity(i);
+        const std::int32_t past_end = std::min(CeilDiv(end_tokens, block_granularity), table.NumBlocks());
+        for (std::int32_t slot = hit_tokens / block_granularity; slot < past_end; ++slot) {
+            if (blocks[static_cast<std::size_t>(slot)]) {
+                add(slot);
+            }
+        }
+    }
+    return destinations;
+}
+
+void Scheduler::excludeLandedPages(AdmissionResult& admission, std::span<const PeerPage> destinations) const {
+    const auto landed = [&](std::size_t group, std::int32_t block_id) {
+        return std::ranges::any_of(
+            destinations, [&](const PeerPage& page) { return page.group_id == group && page.block_id == block_id; });
+    };
+    for (std::size_t i = 0; i < admission.new_page_ids.size(); ++i) {
+        std::erase_if(admission.new_page_ids[i], [&](std::int32_t block_id) { return landed(i, block_id); });
+        for (const auto& [source, destination] : admission.pages_to_copy[i]) {
+            _assert(!landed(i, destination), "a landing's destination is no copy destination");
+        }
+    }
+    for (const BlockTransfer& pair : admission.load_pairs) {
+        _assert(!landed(pair.group_id, coordinator_.Allocator(static_cast<std::int32_t>(pair.group_id))
+                                           .ResolveCacheBlockId(*pair.destination)),
+                "a landing's destination is no load destination");
+    }
+}
+
 void Scheduler::preparePeer(Request& request) {
     auto* submitted = request.GetIf<fsm::Submitted>();
     if (submitted == nullptr || submitted->admission.peer_prepared) {
@@ -142,10 +189,11 @@ void Scheduler::preparePeer(Request& request) {
     const std::int32_t max_tokens = cacheablePrefixTokens(request);
     const std::span<const std::string> hashes = request.PromptPrefixHashes(max_tokens / grain);
     const std::span<const std::int32_t> tokens = request.TokenSlice(0, max_tokens);
-    const PrefixProbe probe = coordinator_.Prober().ProbePromptPrefix({.prefix_hashes = hashes,
-                                                                       .tokens = tokens,
-                                                                       .max_tokens = max_tokens,
-                                                                       .shared_prefix_tokens = request.SharedPrefixTokens()});
+    const PrefixProbe probe =
+        coordinator_.Prober().ProbePromptPrefix({.prefix_hashes = hashes,
+                                                 .tokens = tokens,
+                                                 .max_tokens = max_tokens,
+                                                 .shared_prefix_tokens = request.SharedPrefixTokens()});
     const std::int32_t local = std::max(probe.device.num_common_tokens, probe.host.num_common_tokens);
     if (max_tokens - local < limits.min_fetch_tokens) {
         return;
@@ -209,33 +257,8 @@ void Scheduler::schedulePeerLandings(AdmissionFeedback& feedback, PlanBuild& bui
                                  .lease = hit.lease,
                                  .holder = request->PeerHolder(),
                                  .begin_tokens = landing.window.begin,
-                                 .end_tokens = landing.window.begin + landing.window.size};
-        // Every block the landing fills: a token-spanned group's from the
-        // block holding the hit's end through the one holding the landing's,
-        // a State group's live slot.
-        for (std::int32_t i = 0; i < coordinator_.NumGroups(); ++i) {
-            const BlockTable& table = landing.resources.block_tables[static_cast<std::size_t>(i)];
-            const std::span<const CacheBlockRef> blocks = table.Blocks();
-            const auto page = [&](std::int32_t slot) {
-                fetch.destinations.push_back(PeerPage{
-                    .group_id = static_cast<std::uint32_t>(i),
-                    .slot = slot,
-                    .tier = CacheTier::kDevice,
-                    .block_id = coordinator_.Allocator(i).ResolveCacheBlockId(*blocks[static_cast<std::size_t>(slot)]),
-                });
-            };
-            if (coordinator_.GroupIsState(static_cast<std::size_t>(i))) {
-                page(kPeerStateSlot);
-                continue;
-            }
-            const std::int32_t block_granularity = coordinator_.GroupBlockGranularity(i);
-            const std::int32_t past_end = std::min(CeilDiv(fetch.end_tokens, block_granularity), table.NumBlocks());
-            for (std::int32_t slot = fetch.begin_tokens / block_granularity; slot < past_end; ++slot) {
-                if (blocks[static_cast<std::size_t>(slot)]) {
-                    page(slot);
-                }
-            }
-        }
+                                 .end_tokens = landing.window.begin + landing.window.size,
+                                 .destinations = std::move(outcome.peer_destinations)};
         spdlog::debug("[Peer] rid={} lands [{}, {}) from {} ({} blocks)", request->Id(), fetch.begin_tokens,
                       fetch.end_tokens, fetch.holder, fetch.destinations.size());
         build.plan.peer_fetches.push_back(std::move(fetch));
