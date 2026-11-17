@@ -55,12 +55,12 @@ from enum import Enum
 from typing import NamedTuple
 
 import torch
+from tokenspeed_engine.scheduler import Cache
 from tokenspeed_kernel.ops.kvcache.host_transfer import (
     HostTransferWorkspace,
     transfer_cache_blocks,
     wait_layer_ready,
 )
-from tokenspeed_scheduler import Cache
 
 from tokenspeed.runtime.cache.host_storage import (
     HostCacheStorage,

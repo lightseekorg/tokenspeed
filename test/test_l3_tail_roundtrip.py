@@ -40,7 +40,7 @@ from test.l3_test_utils import (
 )
 
 import pytest
-import tokenspeed_scheduler as ts
+import tokenspeed_engine.scheduler as ts
 import torch
 
 # Every group's 8-byte blocks, one per LCM block: block ``b`` of any group is

@@ -28,7 +28,7 @@ from typing import Any, NamedTuple
 
 import numpy as np
 import torch
-from tokenspeed_scheduler import (
+from tokenspeed_engine.scheduler import (
     Cache,
     CacheGroupConfig,
     SchedulerConfig,

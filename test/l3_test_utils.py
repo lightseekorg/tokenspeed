@@ -38,7 +38,7 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class StorageOp:
     """A scheduler storage operation (``Cache.Storage*Op``) as a test writes
-    one: ``kind`` is a ``tokenspeed_scheduler.StorageKind`` and ``keys`` are
+    one: ``kind`` is a ``tokenspeed_engine.scheduler.StorageKind`` and ``keys`` are
     ``(group, content_hash, page_offset)``."""
 
     op_id: int
@@ -211,7 +211,7 @@ def mooncake_client(master: str, *, global_segment_size: int):
 
 def storage_ops(plan):
     """The Host-only commands in a scheduler's unified cache plan."""
-    from tokenspeed_scheduler import Cache
+    from tokenspeed_engine.scheduler import Cache
 
     types = (
         Cache.StorageQueryOp,
@@ -224,7 +224,7 @@ def storage_ops(plan):
 
 def storage_scheduler():
     """A small real scheduler with explicit Host-storage credits."""
-    import tokenspeed_scheduler as ts
+    import tokenspeed_engine.scheduler as ts
 
     cfg = ts.SchedulerConfig()
     cfg.role = ts.SchedulerConfig.Role.Fused

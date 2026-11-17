@@ -106,7 +106,7 @@ class TestGdnTokenLevelHitResumeTest:
                 make_extend_result_event,
             )
 
-            import tokenspeed_scheduler as ts
+            import tokenspeed_engine.scheduler as ts
             from tokenspeed_kernel.ops.attention.gdn.triton import (
                 triton_gdn_chunk_prefill,
             )
@@ -115,7 +115,7 @@ class TestGdnTokenLevelHitResumeTest:
             from tokenspeed.runtime.engine.scheduler_utils import make_config
             from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
         except (ImportError, ModuleNotFoundError) as exc:
-            pytest.skip(f"needs tokenspeed_scheduler + tokenspeed_kernel: {exc}")
+            pytest.skip(f"needs tokenspeed_engine.scheduler + tokenspeed_kernel: {exc}")
         self.ts = ts
         self.mamba = mamba
         self.ForwardMode = ForwardMode
