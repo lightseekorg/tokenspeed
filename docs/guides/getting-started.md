@@ -143,8 +143,7 @@ pip install -e tokenspeed-kernel/python/ --no-build-isolation
 ```
 
 Install the engine package, which builds the C++ scheduler in. It needs Rust,
-CMake and OpenSSL development headers (see
-[tokenspeed-engine](../../tokenspeed-engine/README.md)):
+CMake and OpenSSL development headers (see `tokenspeed-engine/README.md`):
 
 ```bash
 pip install -e tokenspeed-engine/
