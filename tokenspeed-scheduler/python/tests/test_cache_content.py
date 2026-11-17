@@ -253,7 +253,10 @@ def _config(rng, role, *, host_pages, policy, snapshot_pages, mixed, width):
     cfg.debug_force_retraction_interval = 3 if snapshot_pages > 1 else 0
     cfg.max_scheduled_tokens = 48
     cfg.max_batch_size = 6
-    cfg.max_resident_requests = cfg.max_batch_size
+    # Only the D role may hold extra residents, for in-flight remote admissions.
+    cfg.max_resident_requests = cfg.max_batch_size + (
+        4 if role == ts.SchedulerConfig.Role.D else 0
+    )
     cfg.enable_l3_storage = False
     cfg.disable_l2_cache = host_pages == 0
     cfg.host_write_policy = policy
@@ -858,7 +861,8 @@ def _scripted(role: str, groups, block_granularity: int) -> "ts.Scheduler":
     cfg.max_retracted_requests = 0
     cfg.max_scheduled_tokens = 48
     cfg.max_batch_size = 6
-    cfg.max_resident_requests = cfg.max_batch_size
+    # Only the D role may hold extra residents, for in-flight remote admissions.
+    cfg.max_resident_requests = cfg.max_batch_size + (4 if role == "D" else 0)
     cfg.enable_l3_storage = False
     cfg.disable_l2_cache = True
     cfg.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteThrough
