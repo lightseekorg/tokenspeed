@@ -98,13 +98,14 @@ head. It stands in only where `mm` selects the GEMV it reproduces bit for bit
 on the normed rows; `mv_rmsnorm_gated_sigmoid_supported` tells callers when to
 keep the gated norm and `mm` as two calls.
 
-On SM107, BF16 output projections whose weight shape is in the measured
-`_SM107_BF16_GEMM_SHAPES` set (the TP4 per-rank projections plus the TP1
-`[2560, 6144]` o_proj) run FlashInfer's CuTe DSL low-latency GEMM at M <= 4,
-pinned as the measured winner on every admitted shape; other shapes keep
-their existing path. Startup tuning covers M=1/2/4. The kernels accumulate
-in FP32 and return BF16; reduction order can change rounding relative to
-the original GEMM.
+On SM107, BF16 projections run FlashInfer's CuTe DSL low-latency GEMM at
+M <= 32, as on SM100 and SM103, when `_sm107_cute_dsl_bf16_admits` admits the
+weight: K a multiple of 128, and either at most 8192 output columns or
+K >= 2048 and at most 96 MiB. CuTe DSL is pinned there as the measured winner;
+other weights, such as an LM head or a wide projection with a short K, keep
+cuBLASLt, which measured faster on them at 16 to 32 rows. Startup tuning
+covers M=1/2/4/8/16/32. The kernels accumulate in FP32 and return BF16;
+reduction order can change rounding relative to the original GEMM.
 
 ## Decode GEMMs on small weights
 
