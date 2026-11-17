@@ -1466,7 +1466,12 @@ fn run_rank<F: Frontend>(
     };
     // Attached once the startup requests ran, as the host does.
     let mut event_loop = EventLoop::new(
-        new_scheduler(tiers, role, kv_shard_count, device_pages.unwrap_or(513)),
+        Arc::new(parking_lot::Mutex::new(new_scheduler(
+            tiers,
+            role,
+            kv_shard_count,
+            device_pages.unwrap_or(513),
+        ))),
         device,
         None,
         outputs,
@@ -1498,6 +1503,7 @@ fn run_rank<F: Frontend>(
             }),
             l3_metrics: None,
             l3: store.map(|store| l3_executor(store, rank)),
+            peer: None,
         },
     );
     if event_loop.warm_up(startup::requests(&startup, STARTUP_OUTPUT_TOKENS), stop)? {

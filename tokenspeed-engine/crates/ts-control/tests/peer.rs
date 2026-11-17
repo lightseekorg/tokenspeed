@@ -1,0 +1,335 @@
+// Copyright (c) 2026 LightSeek Foundation
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
+//! Two replicas sharing a prefix through their peer endpoints on this host:
+//! real schedulers, real sockets, and memory both replicas address through
+//! one arena (`docs/rfcs/0004-peer-prefix-sharing.md`).
+
+use std::{
+    ffi::CString,
+    sync::{Arc, Once},
+    time::{Duration, Instant},
+};
+
+use parking_lot::Mutex;
+use pyo3::{prelude::*, types::PyDict};
+use ts_control::peer::{
+    geometry::{DeviceField, RankGeometry},
+    landing::Timeouts,
+    read::Arena,
+    Peer, PeerSettings,
+};
+use ts_scheduler::{ForwardEvent, ForwardEventKind, PeerFetchView, RequestSpec, Scheduler};
+
+const PAGE: i32 = 16;
+const PAGE_BYTES: u64 = 64;
+const PAGES: u64 = 64;
+const HOLDER_BASE: u64 = 0;
+const READER_BASE: u64 = 100_000;
+
+fn interpreter() {
+    static START: Once = Once::new();
+    START.call_once(|| {
+        std::env::set_var("PYTHONHOME", env!("TS_CONTROL_TEST_PYTHONHOME"));
+        Python::initialize();
+        Python::attach(|py| {
+            let module = ts_scheduler::python_module(py).unwrap();
+            py.import("sys")
+                .unwrap()
+                .getattr("modules")
+                .unwrap()
+                .set_item("tokenspeed_scheduler.tokenspeed_scheduler_ext", module)
+                .unwrap();
+            let package = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../tokenspeed-scheduler/python");
+            py.import("sys")
+                .unwrap()
+                .getattr("path")
+                .unwrap()
+                .call_method1("insert", (0, package))
+                .unwrap();
+        });
+    });
+}
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+fn scheduler(name: &str, incarnation: u64) -> Scheduler {
+    interpreter();
+    Python::attach(|py| {
+        let code = format!(
+            r#"
+import tokenspeed_scheduler as ts
+cfg = ts.SchedulerConfig()
+cfg.role = ts.SchedulerConfig.Role.Fused
+cfg.prefix_granularity = {PAGE}
+cfg.max_scheduled_tokens = 512
+cfg.max_batch_size = 8
+cfg.max_resident_requests = 8
+cfg.num_device_pages = {PAGES}
+cfg.num_snapshot_pages = 1
+cfg.disable_l2_cache = True
+cfg.cache_groups = [ts.CacheGroupConfig(group_id="full_attention", block_granularity={PAGE},
+                                        total_pages={PAGES}, attn_kind=ts.AttnKind.Full)]
+cfg.peer_config = ts.PeerConfig(name="{name}", incarnation={incarnation}, max_leases=8,
+                                soft_pin_us=1_000_000, hard_pin_us=1_000_000,
+                                lookup_timeout_us=200_000, min_fetch_tokens={PAGE})
+result = ts.Scheduler(cfg)
+"#
+        );
+        let globals = PyDict::new(py);
+        py.run(&CString::new(code).unwrap(), Some(&globals), None)
+            .unwrap();
+        Scheduler::from_python(&globals.get_item("result").unwrap().unwrap()).unwrap()
+    })
+}
+
+fn geometry(base: u64) -> RankGeometry {
+    RankGeometry {
+        session: "local".into(),
+        device: vec![DeviceField {
+            group_id: 0,
+            field_id: "layer.0.kv".into(),
+            address: base,
+            page_stride: PAGE_BYTES,
+            bytes: PAGE_BYTES,
+        }],
+        host: None,
+    }
+}
+
+fn settings(name: &str, identity: &str) -> PeerSettings {
+    PeerSettings {
+        name: name.to_owned(),
+        bind_host: "127.0.0.1".into(),
+        incarnation: 1,
+        identity: identity.to_owned(),
+        timeouts: Timeouts {
+            answer_us: 1_000_000,
+            quarantine_us: 10_000,
+        },
+        record_lifetime: Duration::from_secs(5),
+    }
+}
+
+/// One single-member replica.
+struct Replica {
+    scheduler: Arc<Mutex<Scheduler>>,
+    peer: Peer,
+}
+
+impl Replica {
+    fn start(name: &str, identity: &str, base: u64, arena: &Arena) -> Self {
+        let scheduler = Arc::new(Mutex::new(scheduler(name, 1)));
+        let port = name.rsplit(':').next().unwrap().parse().unwrap();
+        let peer = Peer::start(
+            settings(name, identity),
+            0,
+            vec![geometry(base)],
+            port,
+            scheduler.clone(),
+            Arc::new(arena.clone()),
+        )
+        .unwrap();
+        Self { scheduler, peer }
+    }
+
+    /// One round as the control loop runs it: the agreement at the head,
+    /// then the plan, its landings and lookups dispatched, and its device
+    /// work reported done at once (its reads start with the next
+    /// agreement). Returns the plan's prefill rows, as (request, prefix
+    /// extended), and its landings.
+    fn round(&mut self) -> (Vec<(String, i32)>, Vec<PeerFetchView>) {
+        let report = self.peer.report();
+        let round = self.peer.agree(&[report]).unwrap();
+        let mut scheduler = self.scheduler.lock();
+        scheduler.advance_peer(round.now_us, &round.events).unwrap();
+        let plan = scheduler.next_execution_plan(true, false);
+        let fetches = plan.peer_fetches();
+        let lookups = scheduler.take_peer_lookups();
+        drop(scheduler);
+        self.peer.dispatch(fetches.clone(), lookups, round.now_us);
+        if !fetches.is_empty() {
+            self.peer.fence().ready();
+        }
+        let rows = plan
+            .forward_batches()
+            .into_iter()
+            .flat_map(|batch| {
+                let extends = batch.num_extends;
+                batch
+                    .request_ids
+                    .into_iter()
+                    .zip(batch.extend_prefix_lens)
+                    .take(extends)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        (rows, fetches)
+    }
+
+    fn advance(&self, events: &[ForwardEvent]) {
+        self.scheduler.lock().advance(events).unwrap();
+    }
+}
+
+fn event(kind: ForwardEventKind, request_id: &str, tokens: Vec<i32>) -> ForwardEvent {
+    ForwardEvent {
+        kind,
+        request_id: request_id.to_owned(),
+        tokens,
+        spec_candidate_ids: Vec::new(),
+        reserve_num_tokens: 0,
+        bootstrap_token: -1,
+    }
+}
+
+fn spec(request_id: &str, tokens: Vec<i32>, holder: &str) -> RequestSpec {
+    RequestSpec {
+        request_id: request_id.to_owned(),
+        session_id: String::new(),
+        cache_group_id: String::new(),
+        shared_prefix_tokens: Vec::new(),
+        peer_holder: holder.to_owned(),
+        tokens,
+        max_new_tokens: 4,
+        max_cached_prefix_tokens: i32::MAX,
+    }
+}
+
+/// The holder computes `tokens` and finishes, publishing them; each of its
+/// pages holds its block id as a byte pattern.
+fn holder_computes(holder: &mut Replica, tokens: &[i32], arena: &Arena) {
+    for block in 1..PAGES {
+        arena.write(HOLDER_BASE + block * PAGE_BYTES, &[block as u8; PAGE_BYTES as usize]);
+    }
+    holder
+        .scheduler
+        .lock()
+        .submit_requests(&[spec("h", tokens.to_vec(), "")])
+        .unwrap();
+    let (rows, _) = holder.round();
+    assert_eq!(rows, vec![("h".to_owned(), 0)]);
+    holder.advance(&[
+        event(ForwardEventKind::ExtendResult, "h", vec![7]),
+        event(ForwardEventKind::Finish, "h", Vec::new()),
+    ]);
+    holder.round();
+}
+
+/// Runs both replicas' rounds until the reader prefills `request`; returns
+/// the prefix it extends and the landings the reader's plans carried.
+fn rounds_until_prefill(reader: &mut Replica, holder: Option<&mut Replica>, request: &str) -> (i32, Vec<PeerFetchView>) {
+    let mut holder = holder;
+    let mut landings = Vec::new();
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(10) {
+        if let Some(holder) = holder.as_deref_mut() {
+            holder.round();
+        }
+        let (rows, fetches) = reader.round();
+        landings.extend(fetches);
+        if let Some((_, prefix)) = rows.into_iter().find(|(rid, _)| rid == request) {
+            return (prefix, landings);
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    panic!("the reader never prefilled {request}");
+}
+
+#[test]
+fn a_reader_lands_the_holders_prefix_byte_for_byte_and_computes_the_rest() {
+    let arena = Arena::new(200_000);
+    let holder_name = format!("127.0.0.1:{}", free_port());
+    let reader_name = format!("127.0.0.1:{}", free_port());
+    let mut holder = Replica::start(&holder_name, "ns", HOLDER_BASE, &arena);
+    let mut reader = Replica::start(&reader_name, "ns", READER_BASE, &arena);
+    let tokens: Vec<i32> = (1..=6 * PAGE).collect();
+    holder_computes(&mut holder, &tokens, &arena);
+
+    let mut longer = tokens.clone();
+    longer.extend(1000..1000 + PAGE);
+    reader
+        .scheduler
+        .lock()
+        .submit_requests(&[spec("r", longer, &holder_name)])
+        .unwrap();
+    let (prefix, landings) = rounds_until_prefill(&mut reader, Some(&mut holder), "r");
+
+    assert_eq!(landings.len(), 1, "one landing");
+    let landing = &landings[0];
+    assert_eq!(landing.begin_tokens, 0);
+    assert_eq!(prefix, landing.end_tokens, "it computes on from the landed boundary");
+    assert!(landing.end_tokens >= 5 * PAGE);
+    // Every destination holds one of the holder's pages, byte for byte.
+    for destination in &landing.destinations {
+        let page = arena.read_bytes(
+            READER_BASE + destination.block_id as u64 * PAGE_BYTES,
+            PAGE_BYTES as usize,
+        );
+        assert!(page[0] != 0 && page.iter().all(|&byte| byte == page[0]), "slot {}", destination.slot);
+    }
+    // The holder applied the release at its next head.
+    holder.round();
+    let stats = holder.scheduler.lock().peer_stats();
+    assert_eq!((stats.leases, stats.pinned_blocks), (0, 0));
+    assert_eq!(reader.scheduler.lock().peer_stats().landed_tokens, landing.end_tokens as u64);
+}
+
+#[test]
+fn a_holder_that_never_answers_leaves_the_reader_to_compute() {
+    let arena = Arena::new(200_000);
+    let silent = format!("127.0.0.1:{}", free_port());
+    let reader_name = format!("127.0.0.1:{}", free_port());
+    let mut reader = Replica::start(&reader_name, "ns", READER_BASE, &arena);
+    let tokens: Vec<i32> = (1..=4 * PAGE).collect();
+    reader
+        .scheduler
+        .lock()
+        .submit_requests(&[spec("r", tokens, &silent)])
+        .unwrap();
+    let (prefix, landings) = rounds_until_prefill(&mut reader, None, "r");
+    assert_eq!((prefix, landings.len()), (0, 0));
+}
+
+#[test]
+fn a_holder_of_another_namespace_is_never_read() {
+    let arena = Arena::new(200_000);
+    let holder_name = format!("127.0.0.1:{}", free_port());
+    let reader_name = format!("127.0.0.1:{}", free_port());
+    let mut holder = Replica::start(&holder_name, "other-weights", HOLDER_BASE, &arena);
+    let mut reader = Replica::start(&reader_name, "ns", READER_BASE, &arena);
+    let tokens: Vec<i32> = (1..=6 * PAGE).collect();
+    holder_computes(&mut holder, &tokens, &arena);
+    let mut longer = tokens.clone();
+    longer.extend(1000..1000 + PAGE);
+    reader
+        .scheduler
+        .lock()
+        .submit_requests(&[spec("r", longer, &holder_name)])
+        .unwrap();
+    let (prefix, landings) = rounds_until_prefill(&mut reader, Some(&mut holder), "r");
+    assert_eq!((prefix, landings.len()), (0, 0));
+}

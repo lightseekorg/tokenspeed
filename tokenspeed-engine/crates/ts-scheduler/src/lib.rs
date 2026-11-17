@@ -479,8 +479,11 @@ mod ffi {
     /// What a holder's answer answers.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum PeerAnswerKind {
+        /// A lookup's answer.
         Lookup,
+        /// A pin's answer.
         Pin,
+        /// A release's answer.
         Release,
     }
 
@@ -508,8 +511,9 @@ mod ffi {
         lease: PeerLeaseView,
         /// The holder's name.
         holder: String,
-        /// The tokens it lands: [begin_tokens, end_tokens).
+        /// Where the landed tokens begin: the local hit.
         begin_tokens: i32,
+        /// Where they end: the holder's boundary.
         end_tokens: i32,
         /// The blocks it fills.
         destinations: Vec<PeerPageView>,

@@ -847,7 +847,7 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
         .map(|publisher| KvEventPublisher::start(publisher, config.metrics.labels.dp_rank))
         .transpose()?;
     let mut event_loop = EventLoop::new(
-        scheduler,
+        std::sync::Arc::new(parking_lot::Mutex::new(scheduler)),
         data_plane,
         None::<EngineTransport>,
         outputs,
@@ -862,6 +862,7 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
             grammars,
             l3_metrics: config.metrics.l3_metrics(exporter.as_ref()),
             l3,
+            peer: None,
         },
     );
     // The engine registers only once its own requests ran: no client

@@ -38,6 +38,7 @@ pub mod ingress;
 pub mod json_framing;
 pub mod kv_events;
 pub mod l3;
+pub mod peer;
 pub mod output;
 pub mod relay;
 pub mod request;
