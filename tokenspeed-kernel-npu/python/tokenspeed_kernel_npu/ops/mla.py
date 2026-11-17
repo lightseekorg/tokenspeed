@@ -223,12 +223,14 @@ def mla_extend_with_kvcache(
             out=out,
         )
     k_nope, k_aux = kv_cache.split((kv_lora_rank, qk_rope_head_dim), dim=-1)
+    k_nope = k_nope.flatten(2).contiguous()
+    k_aux = k_aux.flatten(2).contiguous()
     output, lse = torch_npu.npu_fused_infer_attention_score(
         q_nope,
-        k_nope.flatten(2),
-        k_nope.flatten(2),
+        k_nope,
+        k_nope,
         query_rope=q_aux,
-        key_rope=k_aux.flatten(2),
+        key_rope=k_aux,
         atten_mask=_causal_mask(q.device) if is_causal else None,
         actual_seq_lengths=cu_seqlens_q[1:],
         actual_seq_lengths_kv=cache_seqlens,
