@@ -96,6 +96,26 @@ def test_strided_view_matches_contiguous_copy_bitwise():
     )
 
 
+def test_row_offsets_past_int32():
+    from tokenspeed.runtime.layers.attention.linear.gdn import fused_gdn_gating
+
+    # Rows 2**20 elements apart: the stride fits int32, the last row's offset
+    # (2**31) does not. Only the gated elements of the ~4 GiB buffer are
+    # written, so the test stays cheap.
+    heads, stride = 48, 2**20
+    rows = 2**31 // stride + 1
+    buffer = torch.empty(2**31 + heads, device="cuda", dtype=torch.bfloat16)
+    a = buffer.as_strided((rows, heads), (stride, 1))
+    A_log, values, dt_bias = _inputs(rows, heads, 13)
+    a.copy_(values)
+    torch.testing.assert_close(
+        fused_gdn_gating(A_log, a, dt_bias),
+        _reference(A_log, a, dt_bias),
+        rtol=5e-4,
+        atol=2e-6,
+    )
+
+
 def test_row_counts_compile_no_new_specialization():
     from tokenspeed.runtime.layers.attention.linear.gdn import (
         fused_gdn_gating,
