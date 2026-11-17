@@ -412,21 +412,19 @@ this platform cannot run, or whose traits exclude the request, raises.
 
 ## Ascend integration
 
-Numerical variants can retain the same storage and communication owners.
+Numerical variants can reuse Prefill storage and communication independently
+of the native numerical backend.
 `AscendDSAAttention._prepare_lora_scales` isolates native norm-weight folding
 from checkpoint projection preparation. A variant that scales after the BF16
 norm output overrides that step and supplies its own numerical forward.
-`AscendDSABackend._compute_prefill_attention` consumes the committed Prefill
-planes and returns head-major output; the enclosing forward still owns current
-row exchange, cache writes and the transport's completion. `AscendPrefillPlan`
-carries `key_row_count`, computed from host lengths for the active query shard,
+`AscendPrefill` owns history/current exchange and cache writes. Its
+`key_row_count` is computed from host lengths for the active query shard,
 so a TND consumer can size its views without reading device lengths back.
 Additional fixed scratch belongs to the backend, is shared across its layers,
 and must be reserved by the cache recipe before allocation.
-`AscendDSABackend._select_dsa_kernels` binds the numerical adapter and validates
-its communication requirements during construction. Prefill transport and
-Index-K scatter are data-only entry points; they do not load the native fused
-Indexer/SFA library when a variant selects different arithmetic.
+Prefill transport and Index-K scatter are data-only entry points; they do not
+load the native fused Indexer/SFA library when a variant selects different
+arithmetic.
 
 Shared Ascend DSA and MLA components own attention execution. Models supply
 configuration and checkpoint weights; kernel selection and weight preparation
