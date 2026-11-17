@@ -369,12 +369,23 @@ def test_conv_token_tiles_across_request_boundaries():
         torch.testing.assert_close(actual, torch.cat(expected), rtol=0, atol=0)
 
 
+@pytest.fixture
+def host_cache_device():
+    if not current_platform().is_nvidia or torch.cuda.get_device_capability()[
+        0
+    ] not in (9, 10):
+        pytest.skip("PLE host cache requires NVIDIA Hopper or Blackwell")
+    return torch.device("cuda", torch.cuda.current_device())
+
+
 @pytest.mark.parametrize(
     "dim, dtype",
     [(160, torch.float8_e4m3fn), (512, torch.bfloat16)],
     ids=["flash-fp8", "max-bf16"],
 )
-def test_host_cache_keeps_aligned_and_tail_rows_until_invalidated(dim, dtype):
+def test_host_cache_keeps_aligned_and_tail_rows_until_invalidated(
+    dim, dtype, host_cache_device
+):
     from tokenspeed_kernel.ops.ple._host_cache_triton import (
         _ple_fill_staged_kernel,
         _ple_gather_staged_tail_kernel,
@@ -382,11 +393,7 @@ def test_host_cache_keeps_aligned_and_tail_rows_until_invalidated(dim, dtype):
     from tokenspeed_kernel.ops.ple.host_cache import PLEHostCache
     from utils import assert_no_triton_compile
 
-    if not current_platform().is_nvidia or torch.cuda.get_device_capability()[
-        0
-    ] not in (9, 10):
-        pytest.skip("PLE host cache requires Hopper or Blackwell")
-    device = torch.device("cuda", torch.cuda.current_device())
+    device = host_cache_device
     vocab_start = 20_000_000
     table = torch.ones(32, dim)
     table[1].fill_(2)
@@ -430,7 +437,7 @@ def test_host_cache_keeps_aligned_and_tail_rows_until_invalidated(dim, dtype):
     assert not run(259).any()
 
 
-def test_host_cache_reports_initialization_failures():
+def test_host_cache_reports_initialization_failures(host_cache_device):
     from tokenspeed_kernel.ops.ple.host_cache import PLEHostCache
 
     table = torch.ones(32, 160, dtype=torch.bfloat16).pin_memory()
@@ -441,7 +448,7 @@ def test_host_cache_reports_initialization_failures():
         output_dtype=torch.bfloat16,
         vocab_start=100,
         vocab_end=132,
-        device=torch.device("cuda", torch.cuda.current_device()),
+        device=host_cache_device,
     )
     for override, message in (
         ({"slot_count": 0}, "must be a power of two"),
@@ -452,7 +459,7 @@ def test_host_cache_reports_initialization_failures():
         with pytest.raises((ValueError, RuntimeError), match=message):
             PLEHostCache(**(args | override))
     cache = PLEHostCache(**(args | {"slot_count": 1 << 23}))
-    ids = torch.zeros((256, 16), dtype=torch.int64, device="cuda")
+    ids = torch.zeros((256, 16), dtype=torch.int64, device=host_cache_device)
     assert cache.can_gather(ids)
 
 
@@ -464,7 +471,9 @@ def test_host_cache_reports_initialization_failures():
         (16, 128, "head_dim must be"),
     ],
 )
-def test_host_cache_launcher_rejects_unsupported_shapes(heads, dim, message):
+def test_host_cache_launcher_rejects_unsupported_shapes(
+    heads, dim, message, host_cache_device
+):
     from tokenspeed_kernel.ops.ple.host_cache import PLEHostCache
 
     table = torch.ones(32, dim, dtype=torch.bfloat16).pin_memory()
@@ -475,10 +484,12 @@ def test_host_cache_launcher_rejects_unsupported_shapes(heads, dim, message):
         output_dtype=torch.bfloat16,
         vocab_start=0,
         vocab_end=32,
-        device=torch.device("cuda", torch.cuda.current_device()),
+        device=host_cache_device,
     )
-    ids = torch.zeros((256, heads), dtype=torch.int64, device="cuda")
-    out = torch.empty((ids.numel(), dim), dtype=torch.bfloat16, device="cuda")
+    ids = torch.zeros((256, heads), dtype=torch.int64, device=host_cache_device)
+    out = torch.empty(
+        (ids.numel(), dim), dtype=torch.bfloat16, device=host_cache_device
+    )
     assert cache.can_gather(ids)
     with pytest.raises(RuntimeError, match=message):
         cache.gather(ids, out, scale=None)
