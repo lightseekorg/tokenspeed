@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import math
+import sys
 
 import pytest
 import tokenspeed_kernel.ops.gemm  # noqa: F401  (registration side effects)
@@ -113,6 +114,26 @@ def test_split_kernel_is_deterministic_and_replays_in_a_graph(m):
     assert torch.equal(out, eager)
 
 
+@pytest.mark.skipif(
+    not current_platform().is_blackwell,
+    reason="the warp-specialized loop is Blackwell's",
+)
+@pytest.mark.parametrize("m", [2048, 4099, 8192])
+@pytest.mark.parametrize("n,k", [(256, 5120), (1024, 2048), (768, 8192)])
+def test_warp_specialized_tiles_sum_like_the_drained_tiles(m, n, k):
+    """From 2048 rows on Blackwell, bit for bit the drained tiles output."""
+    x, w = _problem(m, n, k, seed=4)
+    pieces = mv_weight_split(w)
+    cfg = triton_bf16x3._bf16x3_config(m, n, k, warp_specialize=True)
+    assert cfg.warp_specialize
+    got, want = (torch.empty(m, n, device="cuda") for _ in range(2))
+    triton_bf16x3._bf16x3_launch(x, pieces, got, cfg)
+    triton_bf16x3._bf16x3_launch(
+        x, pieces, want, triton_bf16x3._bf16x3_config(m, n, k, False)
+    )
+    assert torch.equal(got, want)
+
+
 def test_non_finite_values_reach_the_output():
     m, n, k = 32, 256, 2048
     x, w = _problem(m, n, k, seed=2)
@@ -159,7 +180,11 @@ def test_row_counts_within_a_tile_bucket_do_not_recompile():
         assert _error_over_magnitude(y, x, w) <= 4
 
     def key(m):
-        return (triton_bf16x3._bf16x3_config(m, n, k), int_specialization_class(m))
+        blackwell = current_platform().is_blackwell
+        return (
+            triton_bf16x3._bf16x3_config(m, n, k, blackwell),
+            int_specialization_class(m),
+        )
 
     sweep = (18, 23, 27, 31)
     warm_specialization_classes(run, key, sweep, pool=(17, 32))
@@ -168,3 +193,7 @@ def test_row_counts_within_a_tile_bucket_do_not_recompile():
     ):
         for m in sweep:
             run(m)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))
