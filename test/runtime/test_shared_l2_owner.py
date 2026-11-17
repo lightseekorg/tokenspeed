@@ -20,7 +20,7 @@
 
 """The shared L2 pool's owner service over its real wire: a ZMQ ROUTER
 served from a thread, asked through ``OwnerConnection``. The pool behind it
-keeps the books of ``tokenspeed_scheduler.SharedL2Pool`` in Python."""
+keeps the books of the scheduler's ``SharedL2Pool`` in Python."""
 
 import copy
 import os
@@ -548,7 +548,7 @@ def test_the_owner_service_runs_from_the_command_line(block_size):
 
 
 def test_the_pool_is_built_over_the_groups_a_rank_reports():
-    pytest.importorskip("tokenspeed_scheduler")
+    pytest.importorskip("tokenspeed_engine.scheduler")
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge import (
         cache_group_config,
     )

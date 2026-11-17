@@ -54,7 +54,7 @@ from test.runtime.shared_l2_test_utils import (  # noqa: E402
     write_fields,
 )
 
-import tokenspeed_scheduler as ts  # noqa: E402
+import tokenspeed_engine.scheduler as ts  # noqa: E402
 
 from tokenspeed.runtime.cache.host_storage import (  # noqa: E402
     HostCacheStorage,
@@ -955,6 +955,7 @@ def test_a_pool_rank_runs_no_other_host_cache_op(ranks):
             num_device_pages=32,
             max_scheduled_tokens=64,
             max_batch_size=8,
+            max_resident_requests=8,
             prefix_granularity=2,
             num_host_pages=65,
             disable_l2_cache=False,

@@ -20,7 +20,7 @@
 
 """The pool's owner: one process serving the cache index to every client.
 
-It runs ``tokenspeed_scheduler.SharedL2Pool`` over every provider's memory and
+It runs the scheduler's ``SharedL2Pool`` over every provider's memory and
 holds no bytes. The pool is built when every expected provider has joined and
 the first client reports its cache geometry; later clients must match that
 geometry and the deployment the pool caches for. A provider joins with its
@@ -97,7 +97,7 @@ class SharedL2Owner:
             num_providers: Providers to wait for before the pool is built.
             client_timeout_s: Silence after which a client is dropped.
             make_pool: ``(geometry, num_lcm_blocks)`` to an object with
-                ``tokenspeed_scheduler.SharedL2Pool``'s methods; called once,
+                the scheduler's ``SharedL2Pool``'s methods; called once,
                 with the first client's geometry.
         """
         self._socket = zmq.Context.instance().socket(zmq.ROUTER)
@@ -330,7 +330,7 @@ def make_pool(
         checkpoint_retention_leaf_distance: The scheduler's setting of that
             name.
     """
-    import tokenspeed_scheduler as ts
+    import tokenspeed_engine.scheduler as ts
 
     groups = []
     for group in geometry["groups"]:

@@ -19,9 +19,9 @@
 # SOFTWARE.
 
 """A rank's control side of the shared L2 pool against a real owner service
-over real ZMQ. The pool behind the owner keeps the books of
-``tokenspeed_scheduler.SharedL2Pool`` in Python, and the transfer records the
-copies it is asked for instead of making them over RDMA."""
+over real ZMQ. The pool behind the owner keeps the books of the scheduler's
+``SharedL2Pool`` in Python, and the transfer records the copies it is asked
+for instead of making them over RDMA."""
 
 import copy
 import itertools

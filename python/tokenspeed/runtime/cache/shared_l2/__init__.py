@@ -20,7 +20,7 @@
 
 """Shared L2: one paged Host L2 pool that every prefill rank uses.
 
-``owner`` serves the pool's cache index (``tokenspeed_scheduler.SharedL2Pool``)
+``owner`` serves the pool's cache index (the scheduler's ``SharedL2Pool``)
 and holds no bytes; ``provider`` hosts one node's pool memory; ``client`` is a
 rank's control side, which carries the scheduler's lookups, writes and notices
 to the owner; ``wire`` is the request-reply wire between them.

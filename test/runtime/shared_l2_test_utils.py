@@ -19,9 +19,8 @@
 # SOFTWARE.
 
 """Shared pieces of the shared L2 service tests: a real owner served from a
-thread over real ZMQ, and a pool that keeps the books of
-``tokenspeed_scheduler.SharedL2Pool`` in Python, where every test can read
-them."""
+thread over real ZMQ, and a pool that keeps the books of the scheduler's
+``SharedL2Pool`` in Python, where every test can read them."""
 
 from __future__ import annotations
 
@@ -135,7 +134,7 @@ def wait_until(predicate, *, timeout_s: float = 5.0) -> None:
 
 
 class FakePool:
-    """``tokenspeed_scheduler.SharedL2Pool``'s interface over plain dicts.
+    """The scheduler's ``SharedL2Pool``'s interface over plain dicts.
 
     A committed publication is a checkpoint: a probe whose tokens start with
     its tokens hits it and pins the blocks its write asked for.

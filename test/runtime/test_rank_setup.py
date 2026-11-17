@@ -127,6 +127,7 @@ def test_a_shared_l2_pools_write_limits_reach_the_scheduler_config():
         storage_config=None,
         max_scheduled_tokens=args.chunked_prefill_size,
         max_batch_size=8,
+        max_resident_requests=8,
         decode_input_tokens=1,
         overlap_schedule_depth=0,
         enable_kv_cache_events=False,

@@ -244,8 +244,8 @@ def make_config(
             it elsewhere).
         shared_l2_config: With a shared L2 pool as the Host tier
             (``--shared-l2-config``), the scheduler's limits on its writes, a
-            ``tokenspeed_scheduler.SharedL2Config``: the Host pages are then
-            the pool's proxy and hold no bytes. None without a pool.
+            ``SharedL2Config``: the Host pages are then the pool's proxy and
+            hold no bytes. None without a pool.
     """
     if not 0 <= prefix_replay_tokens <= (1 << 31) - 1:
         raise ValueError(

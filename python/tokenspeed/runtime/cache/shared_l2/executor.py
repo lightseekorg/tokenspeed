@@ -46,7 +46,7 @@ from typing import Any
 
 import numpy as np
 import torch
-from tokenspeed_scheduler import Cache
+from tokenspeed_engine.scheduler import Cache
 
 from tokenspeed.runtime.cache.l2.layerwise_load import LayerwiseLoadTracker
 from tokenspeed.runtime.cache.shared_l2.client import SharedL2Client, SharedL2PoolView

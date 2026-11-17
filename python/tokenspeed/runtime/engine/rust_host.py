@@ -63,10 +63,9 @@ from multiprocessing.connection import Connection
 from typing import TYPE_CHECKING
 
 import msgspec
-import tokenspeed_scheduler
 import torch
 import torch.distributed as dist
-from tokenspeed_engine.scheduler import Scheduler
+from tokenspeed_engine.scheduler import Scheduler, SharedL2Config
 from tokenspeed_kernel.compile_monitor import compile_stats
 from tokenspeed_kernel.ops.tuning import kernel_warmup
 
@@ -1424,7 +1423,7 @@ class HostBootstrap:
                 specs,
                 storage_config=storage_config,
                 shared_l2_config=(
-                    tokenspeed_scheduler.SharedL2Config(
+                    SharedL2Config(
                         max_writes=pool_client.config.max_writes,
                         max_write_keys=pool_client.config.max_write_keys,
                     )
