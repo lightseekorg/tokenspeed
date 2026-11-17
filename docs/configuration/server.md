@@ -1890,6 +1890,7 @@ request computes the prefix itself.
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--peer-prefix-port` | off | The port this replica's endpoint binds; attention-DP rank `r` binds `PORT + r`. |
+| `--peer-prefix-host` | detected | The host others reach the endpoint at. The replica is named `host:PORT+r`, and a holder hint must name it exactly so. |
 | `--peer-prefix-answer-timeout-ms` | 50 | How long a request waits for each of the holder's answers (lookup, pin, release). |
 | `--peer-prefix-min-fetch-tokens` | 256 | The fewest tokens past the local prefix hit worth reading from a peer. |
 

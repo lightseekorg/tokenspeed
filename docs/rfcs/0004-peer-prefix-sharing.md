@@ -339,7 +339,10 @@ namespaces, and moving PD itself onto the new read entry point.
 ### Configuration
 
 `--peer-prefix-port` turns sharing on; attention-DP rank `r` binds
-`port + r`, and a replica's name is `local_ip:port`.
+`port + r`, and a replica's name is `host:port`, with the host from
+`--peer-prefix-host` (the address the worker advertises to the router) or
+else the detected local address. A holder hint must name the holder exactly
+so: a reader matches the holder's answers by that name.
 `--peer-prefix-answer-timeout-ms` bounds each wait for the holder (lookup,
 layout, pin, release) and `--peer-prefix-min-fetch-tokens` the smallest read
 worth a landing. Lease lifetimes, the lease limit and the read quarantine are

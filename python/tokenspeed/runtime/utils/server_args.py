@@ -626,6 +626,9 @@ class ServerArgs:
     # this replica's endpoint binds (attention-DP rank r binds port + r);
     # None turns it off.
     peer_prefix_port: int | None = None
+    # The host other replicas and the router reach this replica's endpoint at;
+    # its name is host:port. None takes this host's detected address.
+    peer_prefix_host: str | None = None
     peer_prefix_answer_timeout_ms: int = 50
     peer_prefix_min_fetch_tokens: int = 256
     # Retraction snapshot pool (pinned Host, per rank) and its slot-state
@@ -3598,6 +3601,14 @@ class ServerArgs:
             "the same model, cache layout, weights and parallel layout. RDMA "
             "devices come from --disaggregation-ib-device. See "
             "docs/rfcs/0004-peer-prefix-sharing.md.",
+        )
+        parser.add_argument(
+            "--peer-prefix-host",
+            type=str,
+            default=ServerArgs.peer_prefix_host,
+            help="The host other replicas and the router reach this replica's peer "
+            "endpoint at; the replica is named host:port, and a router's holder hint "
+            "must name it exactly so. Defaults to this host's detected address.",
         )
         parser.add_argument(
             "--peer-prefix-answer-timeout-ms",

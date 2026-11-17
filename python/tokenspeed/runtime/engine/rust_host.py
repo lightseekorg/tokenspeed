@@ -1226,8 +1226,10 @@ def _peer_sharing_settings(
     local_ip = get_local_ip_by_remote()
     enable_mooncake_ipv6_for_host(local_ip)
     port = server_args.peer_prefix_port + mapping.attn.dp_rank
+    # The name a router's hint carries: the advertised host when given.
+    host = server_args.peer_prefix_host or local_ip
     return PeerSharingSettings(
-        name=peer_endpoint_name(local_ip, port),
+        name=peer_endpoint_name(host, port),
         bind_host="::" if ":" in local_ip else "0.0.0.0",
         port=port,
         incarnation=incarnation[0],
