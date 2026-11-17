@@ -583,6 +583,38 @@ KERNEL_GROUPS = [
         ],
         [],
     ),
+    (
+        "dsv3_fused_a_gemm",
+        [
+            CUDA_CSRC_DIR / "dsv3_fused_a_gemm.cu",
+            CUDA_CSRC_DIR / "dsv3_fused_a_gemm_binding.cu",
+        ],
+        [],
+    ),
+    (
+        "indexer_topk",
+        [
+            CUDA_CSRC_DIR / "indexer_topk.cu",
+            CUDA_CSRC_DIR / "indexer_topk_binding.cu",
+        ],
+        [],
+    ),
+    (
+        "trtllm_fp8_quant",
+        [
+            CUDA_CSRC_DIR / "trtllm_fp8_quant.cu",
+            CUDA_CSRC_DIR / "trtllm_fp8_quant_binding.cu",
+        ],
+        [],
+    ),
+    (
+        "cublaslt_fp4_gemm",
+        [
+            CUDA_CSRC_DIR / "cublaslt_fp4_gemm.cu",
+            CUDA_CSRC_DIR / "cublaslt_fp4_gemm_binding.cu",
+        ],
+        ["-lcublas", "-lcublasLt"],
+    ),
 ]
 
 

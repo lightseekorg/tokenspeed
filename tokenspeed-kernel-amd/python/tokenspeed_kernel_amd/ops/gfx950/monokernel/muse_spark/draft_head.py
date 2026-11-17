@@ -171,6 +171,31 @@ class DraftHeadWeights:
     softcap: float
 
 
+# LM-head blocks the packer tiles a pass: the temporary bf16_tiles returns
+# (16 MiB at 64 blocks) stays in the caching allocator once freed, as startup
+# goes on to profile free memory for the KV-cache budget.
+_TILE_CHUNK_BLOCKS = 64
+
+
+def _padded_tiles(head: torch.Tensor) -> torch.Tensor:
+    """``bf16_tiles`` of the LM-head shard ``head`` zero-padded to ``BLOCKS``
+    16-row blocks, built a chunk of blocks at a time: a block's tiles fill
+    that block's rows of the output, so no full-size intermediate copy (the
+    padded shard) is allocated besides the tiles themselves."""
+    rows = int(BLOCKS) * 16
+    tiles = head.new_empty(rows, int(HIDDEN))
+    full = int(SHARD) // 16 * 16
+    chunk = _TILE_CHUNK_BLOCKS * 16  # rows a pass
+    for start in range(0, full, chunk):
+        end = min(start + chunk, full)
+        tiles[start:end] = bf16_tiles(head[start:end])
+    if full < rows:
+        tail = head.new_zeros(rows - full, int(HIDDEN))
+        tail[: int(SHARD) - full] = head[full:]
+        tiles[full:] = bf16_tiles(tail)
+    return tiles
+
+
 def pack_draft_head(
     tensors: dict[str, torch.Tensor], rank: int, scale: float, softcap: float
 ) -> DraftHeadWeights:
@@ -197,12 +222,9 @@ def pack_draft_head(
             raise ValueError(f"{name}: BF16 {shape}, got {t.dtype} {tuple(t.shape)}")
     if not softcap > 0:
         raise ValueError(f"softcap {softcap}: the head softcaps its scores")
-    head = tensors["lm_head"]
-    padded = head.new_zeros(int(BLOCKS) * 16, int(HIDDEN))
-    padded[: int(SHARD)] = head
     return DraftHeadWeights(
         rank=rank,
-        lm_head=bf16_tiles(padded),
+        lm_head=_padded_tiles(tensors["lm_head"]),
         hproj=bf16_tiles(tensors["hidden_proj"].contiguous()),
         pred=tensors["pred_codebook"].contiguous(),
         succ=tensors["succ_codebook"].contiguous(),

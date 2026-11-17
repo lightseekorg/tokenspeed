@@ -58,7 +58,6 @@ from tokenspeed.runtime.models.muse_spark_dflash2_monokernel import (  # noqa: E
     CONTEXT_OTHER,
     HEAD_NOT_SHARDED,
     HEAD_OTHER_SHAPES,
-    MAX_REQUESTS,
     MLA_DRAFT,
     NOT_BF16_KV,
     NOT_TP8,
@@ -85,20 +84,18 @@ def _ctx(mode: ForwardMode, bs: int, rows: int) -> ForwardContext:
     )
 
 
-def test_the_blocks_of_up_to_max_requests_take_the_kernels() -> None:
-    """A launch computes the blocks of 8 rows of up to MAX_REQUESTS requests;
-    more requests, other row counts and other modes keep the regular path.
-    The head and the context write serve the same requests: 7 draft steps
-    and 8 verify rows each."""
+def test_the_blocks_of_up_to_two_requests_take_the_kernels() -> None:
+    """A launch computes the blocks of 8 rows of one or two requests; more
+    requests, other row counts and other modes keep the regular path. The
+    head and the context write serve the same requests: 7 draft steps and 8
+    verify rows each."""
     assert takes_monokernels(BLOCK_ROWS, _ctx(ForwardMode.DECODE, 1, BLOCK_ROWS))
-    # Two requests' blocks only while MAX_REQUESTS allows them.
-    two = MAX_REQUESTS >= 2
-    assert takes_monokernels(2 * BLOCK_ROWS, _ctx(ForwardMode.DECODE, 2, 16)) == two
+    assert takes_monokernels(2 * BLOCK_ROWS, _ctx(ForwardMode.DECODE, 2, 16))
     assert not takes_monokernels(3 * BLOCK_ROWS, _ctx(ForwardMode.DECODE, 3, 24))
     assert not takes_monokernels(BLOCK_ROWS, _ctx(ForwardMode.DECODE, 2, 8))
     assert not takes_monokernels(BLOCK_ROWS, _ctx(ForwardMode.EXTEND, 1, 8))
     assert not takes_monokernels(BLOCK_ROWS, _ctx(ForwardMode.IDLE, 1, 8))
-    assert [takes_head(r) for r in (7, 14, 21, 8)] == [True, two, False, False]
+    assert [takes_head(r) for r in (7, 14, 21, 8)] == [True, True, False, False]
 
 
 def _config(**overrides) -> PretrainedConfig:
