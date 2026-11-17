@@ -1311,7 +1311,8 @@ bool CacheCoordinator::EvictionStoresExtendPrefix(const PromptPrefix& prompt, co
 std::vector<CacheCoordinator::PrefixBoundaryAvailability> CacheCoordinator::InspectPrefixAvailability(
     const PromptPrefix& prompt) const {
     _assert(groups_.size() <= 64, "prefix availability uses one bit per cache group");
-    const auto keys = buildGroupKeys(prompt.prefix_hashes);
+    const auto prepared_keys = resolvePreparedPrefixKeys(prompt);
+    const auto& keys = *prepared_keys;
     const auto contains = [&](std::size_t i, const CacheKey& key, std::size_t tier) {
         const PrefixCacheIndex& index = groups_[i].Index();
         const bool device = tier != 1 && index.Contains(pool_, key);
@@ -1325,9 +1326,11 @@ std::vector<CacheCoordinator::PrefixBoundaryAvailability> CacheCoordinator::Insp
         if (!groups_[i].Matcher().IsPrefixClosed()) {
             continue;
         }
+        const auto block_limit =
+            prompt.prefix_hashes.size() * static_cast<std::size_t>(BlocksPerBoundary(static_cast<std::int32_t>(i)));
         for (std::size_t tier = 0; tier < 3; ++tier) {
             std::int32_t block = 0;
-            while (static_cast<std::size_t>(block) < keys[i].size() &&
+            while (static_cast<std::size_t>(block) < block_limit &&
                    contains(i, keys[i][static_cast<std::size_t>(block)], tier)) {
                 ++block;
             }
