@@ -29,8 +29,6 @@
 
 """Blackwell QSA attention with grouped query and KV operand reuse."""
 
-from functools import lru_cache
-
 import cutlass
 import cutlass.cute as cute
 import torch
@@ -96,29 +94,11 @@ def _query_head_tile(heads_per_kv: int, head_tile: int, bf16_kv: bool) -> int:
     return _head_tile_for_geometry(heads_per_kv, bf16_kv, 1)
 
 
-@lru_cache(maxsize=None)
-def _is_sm107(device_index: int) -> bool:
-    return torch.cuda.get_device_capability(device_index) == (10, 7)
-
-
-def _select_head_tile(
-    heads_per_kv: int,
-    bf16_kv: bool,
-    query_group: int,
-    *,
-    rows: int,
-    kv_heads: int,
-    sm_count: int,
-    device: int,
-) -> int:
+def _select_head_tile(heads_per_kv: int, bf16_kv: bool, query_group: int) -> int:
     """Select the launch tile, keeping query packing independent of grid policy."""
-    if (
-        not bf16_kv
-        and heads_per_kv == 12
-        and (not _is_sm107(device) or rows * kv_heads >= sm_count)
-    ):
-        # Cover twelve heads with one gather/conversion stream. SM107 keeps
-        # tile8 until the unsplit grid has at least one tile per SM.
+    if not bf16_kv and heads_per_kv == 12:
+        # Cover twelve heads with one gather/conversion stream: the
+        # eight-column tile gathers and converts every FP8 K/V tile twice.
         return 16
     return _head_tile_for_geometry(heads_per_kv * query_group, bf16_kv, query_group)
 
@@ -128,15 +108,7 @@ def _configuration(rows, q_heads, kv_heads, max_seqlen_q, bf16_kv, sm_count, dev
     query_group = _query_group_size(
         rows, kv_heads, heads_per_kv, max_seqlen_q, bf16_kv, sm_count
     )
-    head_tile = _select_head_tile(
-        heads_per_kv,
-        bf16_kv,
-        query_group,
-        rows=rows,
-        kv_heads=kv_heads,
-        sm_count=sm_count,
-        device=device,
-    )
+    head_tile = _select_head_tile(heads_per_kv, bf16_kv, query_group)
     head_tiles_per_row = kv_heads * cute.ceil_div(heads_per_kv, head_tile)
     query_rows_per_cta, kv_splits, smem_slots, async_ready = _select_launch_config(
         rows,
@@ -148,19 +120,7 @@ def _configuration(rows, q_heads, kv_heads, max_seqlen_q, bf16_kv, sm_count, dev
             if rows * head_tiles_per_row <= _SMALL_MAX_CLUSTERS
             else 0
         ),
-        # The FP8 wave cost model was fitted on SM103; SM107 uses its own policy.
-        fp8_wave_sizing=not _is_sm107(device),
     )
-    if (
-        not bf16_kv
-        and heads_per_kv == 12
-        and kv_heads == 2
-        and rows * head_tiles_per_row >= 2 * sm_count
-        and _is_sm107(device)
-    ):
-        # Two independent output tiles per SM amortize a partial final wave.
-        # One split avoids repeated setup and partial-output reduction.
-        kv_splits = 1
     return (
         head_tile,
         query_group,

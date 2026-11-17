@@ -313,8 +313,8 @@ during prefill, decode, and CUDA graphs.
 ## FP8 decode head tile and grid
 
 The direct-slot CuTe path uses a 16-column tile for twelve query heads per KV
-head with FP8 caches: on SM100/SM103 for every grid, and on SM107 once
-`query_rows * kv_heads >= SM_count`. Each query retains its independent
+head with FP8 caches on SM100, SM103 and SM107, for every grid. Each query
+retains its independent
 selected-slot list. Covering all twelve heads in one tile avoids the second
 gather/conversion stream of the eight-column tactic. Both tactics compute
 sixteen padded head columns in total; useful QK/PV work is unchanged.
@@ -323,16 +323,18 @@ sixteen padded head columns in total; useful QK/PV work is unchanged.
 BF16 private-prefix fallback use a separate fixed-geometry helper, so launch
 policy cannot change their padding.
 
-On SM100/SM103, an FP8 grid of at least `3 * SM_count / 16` output tiles picks
-its query rows per CTA and KV splits from 1x1, 2x1, 1x2 and 1x4. With one
-resident CTA per SM, the choice minimizes the wave count times the per-CTA
-work: each of its query rows gathers the 2048-entry prefix slots within one KV
-split and adds a fixed per-row cost fitted on SM103. Smaller grids keep the
-split rule with one query per CTA. SM107 also keeps one query per CTA, but
-FP8 calls with 24 query heads and 2 KV heads use 1 KV split when the
-unsplit grid has at least 2 output tiles per SM, avoiding repeated setup
-and partial-output reduction. Smaller grids and other SM107 shapes retain
-their existing splits.
+An FP8 grid of at least `3 * SM_count / 16` output tiles picks its query rows
+per CTA and KV splits from 1x1, 2x1, 1x2 and 1x4. With one resident CTA per
+SM, the choice minimizes the wave count times the per-CTA work: each of its
+query rows gathers the 2048-entry prefix slots within one KV split and adds a
+fixed per-row cost fitted on SM103. Smaller grids keep the split rule with one
+query per CTA. SM107 shares both rules. Its earlier thresholds (16 columns only
+from one output tile per SM, four splits below two tiles per SM) cost a second
+CTA wave or a second gather stream at verify sizes. With the shared rules
+(24/2 heads, 2048 selected slots per row, CUDA-graph microbenchmark) 128 rows
+take 55.7 instead of 70.0 us, 64 rows 30.0 instead of 61.9 us and 32 rows 19.1
+instead of 31.5 us. At 8 rows the shared small-grid split (4) costs 11.7
+against 10.8 us for the earlier eight-column tactic.
 
 Within its KV split, each FP8 query row ends the prefix loop after the last
 128-entry tile holding a positive id, and runs at least one tile. The CTA
@@ -351,8 +353,8 @@ provider. Cache layout, writers, prefix/offload ownership and descales keep
 their contracts.
 Startup warmup enumerates every tile and launch configuration before graph
 capture, and rows remain dynamic within each configuration. Tests cover Hq/Hkv
-of 24/2 and 12/1, target and draft query widths, both sides of the SM107
-212-SM grid threshold, the SM100/SM103 wave-count choices, padding, prefixes
+of 24/2 and 12/1, target and draft query widths, the wave-count choices on
+152- and 212-SM grids, padding, prefixes
 ending inside or on the edge of a tile, refreshed cache values, PDL on/off,
 large KV offsets and execution without further compilation after warmup.
 

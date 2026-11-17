@@ -132,8 +132,13 @@ def test_large_fp8_grids_refresh_across_split_boundary(enable_pdl):
 
     torch.manual_seed(821)
     sm_count = torch.cuda.get_device_properties(0).multi_processor_count
-    # Each row contributes two output tiles for this head geometry.
-    boundary = sm_count
+
+    def kv_splits(rows):
+        return qsa_sparse._configuration(rows, 24, 2, 1, False, sm_count, 0)[2]
+
+    # Past 128 rows the wave model drops from two KV splits to one where a
+    # second split would add a CTA wave; replay graphs on both sides of it.
+    boundary = next(r for r in range(129, 16384) if kv_splits(r) != kv_splits(r - 1))
     query = torch.randn((16384, 24, 256), device="cuda", dtype=torch.bfloat16)
     keys = (torch.randn((4096, 2, 256), device="cuda") * 0.25).to(torch.float8_e4m3fn)
     values = (torch.randn((4096, 2, 256), device="cuda") * 0.25).to(torch.float8_e4m3fn)
