@@ -671,6 +671,7 @@ def test_fa4_mha_fp8_kvcache_matches_bf16_on_dequant_inputs(
         )
         run = mha_extend_with_kvcache
     else:
+        kwargs["block_draft"] = False
         run = mha_decode_with_kvcache
 
     out_fp8 = run(q=q8, k_cache=k8, v_cache=v8, **kwargs)
