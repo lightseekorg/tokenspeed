@@ -247,7 +247,7 @@ def test_config_tiles_the_problem_with_a_bounded_set_of_kernels(n, k, warp_speci
         split_rows = 64 if cfg.warp_specialize else row_tile
         ctas = (n // weight_tile) * -(-m // split_rows) * cfg.split
         assert ctas >= (120 if m <= 512 else 240) or cfg.split == blocks
-        assert cfg.split == _bf16x3_config(m, n, k).split
+        assert cfg.split == _bf16x3_config(m, n, k, False).split
         variants.add(
             (cfg.swap, cfg.block_a, cfg.block_b, cfg.split > 1, cfg.warp_specialize)
         )

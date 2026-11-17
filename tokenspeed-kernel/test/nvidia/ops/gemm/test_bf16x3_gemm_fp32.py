@@ -121,14 +121,16 @@ def test_split_kernel_is_deterministic_and_replays_in_a_graph(m):
 @pytest.mark.parametrize("m", [2048, 4099, 8192])
 @pytest.mark.parametrize("n,k", [(256, 5120), (1024, 2048), (768, 8192)])
 def test_warp_specialized_tiles_sum_like_the_drained_tiles(m, n, k):
-    """From 2048 rows on Blackwell, bit for bit the drained 64 x 128 tiles' output."""
+    """From 2048 rows on Blackwell, bit for bit the drained tiles output."""
     x, w = _problem(m, n, k, seed=4)
     pieces = mv_weight_split(w)
     cfg = triton_bf16x3._bf16x3_config(m, n, k, warp_specialize=True)
     assert cfg.warp_specialize
     got, want = (torch.empty(m, n, device="cuda") for _ in range(2))
     triton_bf16x3._bf16x3_launch(x, pieces, got, cfg)
-    triton_bf16x3._bf16x3_launch(x, pieces, want, triton_bf16x3._bf16x3_config(m, n, k))
+    triton_bf16x3._bf16x3_launch(
+        x, pieces, want, triton_bf16x3._bf16x3_config(m, n, k, False)
+    )
     assert torch.equal(got, want)
 
 
@@ -178,7 +180,11 @@ def test_row_counts_within_a_tile_bucket_do_not_recompile():
         assert _error_over_magnitude(y, x, w) <= 4
 
     def key(m):
-        return (triton_bf16x3._bf16x3_config(m, n, k), int_specialization_class(m))
+        blackwell = current_platform().is_blackwell
+        return (
+            triton_bf16x3._bf16x3_config(m, n, k, blackwell),
+            int_specialization_class(m),
+        )
 
     sweep = (18, 23, 27, 31)
     warm_specialization_classes(run, key, sweep, pool=(17, 32))

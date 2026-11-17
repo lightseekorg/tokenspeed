@@ -224,13 +224,11 @@ class _Bf16x3Config:
     block_b: int
     num_stages: int
     split: int
-    num_warps: int = 4
-    warp_specialize: bool = False
+    num_warps: int
+    warp_specialize: bool
 
 
-def _bf16x3_config(
-    m: int, n: int, k: int, warp_specialize: bool = False
-) -> _Bf16x3Config:
+def _bf16x3_config(m: int, n: int, k: int, warp_specialize: bool) -> _Bf16x3Config:
     """Tile and split-K choice, measured at 256 x K weights on GB200.
 
     Up to 64 rows the weight rows take the MMA's M side and the rows pad to a
@@ -268,7 +266,7 @@ def _bf16x3_config(
     )
     if warp_specialize and m >= 2048:
         return _Bf16x3Config(swap, 128, 128, 3, split, 8, True)
-    return _Bf16x3Config(swap, block_a, block_b, num_stages, split)
+    return _Bf16x3Config(swap, block_a, block_b, num_stages, split, 4, False)
 
 
 def triton_bf16x3_gemm_fp32(
@@ -320,7 +318,7 @@ def triton_bf16x3_gemm_fp32(
 def _bf16x3_launch(
     x: torch.Tensor, weight_split: torch.Tensor, out: torch.Tensor, cfg: _Bf16x3Config
 ) -> torch.Tensor:
-    """Run ``cfg`` for :func:`triton_bf16x3_gemm_fp32` on its checked operands."""
+    """Launch the kernels of ``cfg`` on checked operands."""
     m, k = x.shape
     n = weight_split.shape[1]
     x_rows, w_rows = (
