@@ -79,14 +79,15 @@ fn free_port() -> u16 {
         .port()
 }
 
-fn scheduler(name: &str, incarnation: u64) -> Scheduler {
+/// A replica's scheduler in `role` (`Fused` or `P`).
+fn scheduler(name: &str, incarnation: u64, role: &str) -> Scheduler {
     interpreter();
     Python::attach(|py| {
         let code = format!(
             r#"
 import tokenspeed_scheduler as ts
 cfg = ts.SchedulerConfig()
-cfg.role = ts.SchedulerConfig.Role.Fused
+cfg.role = ts.SchedulerConfig.Role.{role}
 cfg.prefix_granularity = {PAGE}
 cfg.max_scheduled_tokens = 512
 cfg.max_batch_size = 8
@@ -95,10 +96,11 @@ cfg.num_device_pages = {PAGES}
 cfg.num_snapshot_pages = 1
 cfg.disable_l2_cache = True
 cfg.cache_groups = [ts.CacheGroupConfig(group_id="full_attention", block_granularity={PAGE},
-                                        total_pages={PAGES}, attn_kind=ts.AttnKind.Full)]
+                                        total_pages={PAGES}, attn_kind=ts.AttnKind.Full,
+                                        transfer_policy=ts.CacheTransferPolicy.FullSuffix)]
 cfg.peer_config = ts.PeerConfig(name="{name}", incarnation={incarnation}, max_leases=8,
                                 soft_pin_us=1_000_000, hard_pin_us=1_000_000,
-                                lookup_timeout_us=200_000, min_fetch_tokens={PAGE})
+                                lookup_timeout_us=1_000_000, min_fetch_tokens={PAGE})
 result = ts.Scheduler(cfg)
 "#
         );
@@ -146,7 +148,11 @@ struct Replica {
 
 impl Replica {
     fn start(name: &str, weight_version: &str, base: u64, arena: &Arena) -> Self {
-        let scheduler = Arc::new(Mutex::new(scheduler(name, 1)));
+        Self::start_as(name, weight_version, base, arena, "Fused")
+    }
+
+    fn start_as(name: &str, weight_version: &str, base: u64, arena: &Arena, role: &str) -> Self {
+        let scheduler = Arc::new(Mutex::new(scheduler(name, 1, role)));
         let port = name.rsplit(':').next().unwrap().parse().unwrap();
         let peer = Peer::start(
             settings(name, weight_version),
@@ -166,6 +172,12 @@ impl Replica {
     /// agreement). Returns the plan's prefill rows, as (request, prefix
     /// extended), and its landings.
     fn round(&mut self) -> (Vec<(String, i32)>, Vec<PeerFetchView>) {
+        let (rows, fetches, _) = self.round_with_device();
+        (rows, fetches)
+    }
+
+    /// `round`, and whether its plan went to the data plane.
+    fn round_with_device(&mut self) -> (Vec<(String, i32)>, Vec<PeerFetchView>, bool) {
         let report = self.peer.report();
         let round = self.peer.agree(&[report]).unwrap();
         let mut scheduler = self.scheduler.lock();
@@ -175,7 +187,10 @@ impl Replica {
         let lookups = scheduler.take_peer_lookups();
         drop(scheduler);
         self.peer.dispatch(fetches.clone(), lookups, round.now_us);
-        if !fetches.is_empty() {
+        // The data plane reports the fence of every plan it runs, as the
+        // control loop hands it the plans that need the device.
+        let needs_device = plan.needs_device();
+        if needs_device && !fetches.is_empty() {
             self.peer.fence().ready();
         }
         let rows = plan
@@ -191,7 +206,7 @@ impl Replica {
                     .collect::<Vec<_>>()
             })
             .collect();
-        (rows, fetches)
+        (rows, fetches, needs_device)
     }
 
     fn advance(&self, events: &[ForwardEvent]) {
@@ -317,6 +332,53 @@ fn a_reader_lands_the_holders_prefix_byte_for_byte_and_computes_the_rest() {
         reader.scheduler.lock().peer_stats().landed_tokens,
         landing.end_tokens as u64
     );
+}
+
+/// A prefill replica reads a prefix too, and its landing's plan goes to the
+/// data plane although it prepays no decode room and so zeroes, copies and
+/// computes nothing else: the reads start from the fence the data plane
+/// reports for that plan.
+#[test]
+fn a_prefill_replica_lands_a_prefix_from_a_plan_with_no_other_device_work() {
+    let arena = Arena::new(200_000);
+    let holder_name = format!("127.0.0.1:{}", free_port());
+    let reader_name = format!("127.0.0.1:{}", free_port());
+    let mut holder = Replica::start(&holder_name, "v1", HOLDER_BASE, &arena);
+    let mut reader = Replica::start_as(&reader_name, "v1", READER_BASE, &arena, "P");
+    let tokens: Vec<i32> = (1..=6 * PAGE).collect();
+    holder_computes(&mut holder, &tokens, &arena);
+
+    let mut longer = tokens.clone();
+    longer.extend(1000..1000 + PAGE);
+    reader
+        .scheduler
+        .lock()
+        .submit_requests(&[spec("r", longer, &holder_name)])
+        .unwrap();
+    reader.advance(&[event(ForwardEventKind::PdBootstrapped, "r", Vec::new())]);
+    let start = Instant::now();
+    let mut landing_plans = Vec::new();
+    while start.elapsed() < Duration::from_secs(10) {
+        holder.round();
+        let (rows, fetches, needs_device) = reader.round_with_device();
+        if !fetches.is_empty() {
+            landing_plans.push(needs_device);
+        }
+        if let Some((_, prefix)) = rows.into_iter().find(|(rid, _)| rid == "r") {
+            assert_eq!(
+                landing_plans,
+                [true],
+                "one landing, from a plan the data plane runs"
+            );
+            assert!(
+                prefix >= 5 * PAGE,
+                "it computes on from the landed boundary"
+            );
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    panic!("the prefill replica never prefilled r; landing plans {landing_plans:?}");
 }
 
 #[test]

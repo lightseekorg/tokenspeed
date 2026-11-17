@@ -625,7 +625,10 @@ rust::Vec<ForwardBatchView> plan_forward_batches(const tokenspeed::ExecutionPlan
 }
 
 bool plan_needs_device(const tokenspeed::ExecutionPlan& plan) {
-    if (plan.remote_decode.has_value() || plan.remote_prefill.has_value()) {
+    // A peer landing's reads start from the fence the data plane reports for
+    // its plan, which may have no other device work: a prefill replica's
+    // landing prepays no decode room, so it zeroes nothing.
+    if (plan.remote_decode.has_value() || plan.remote_prefill.has_value() || !plan.peer_fetches.empty()) {
         return true;
     }
     for (const auto& [group_id, pages] : plan.pages_to_zero) {
