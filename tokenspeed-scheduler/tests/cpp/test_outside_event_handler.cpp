@@ -1660,7 +1660,6 @@ protected:
         SchedulerConfig cfg{};
         cfg.prefix_granularity = 2;
         cfg.role = Role::kP;
-        cfg.decode_allocation_policy = SchedulerConfig::DecodeAllocationPolicy::kEarly;
         cfg.max_scheduled_tokens = 16;
         cfg.max_batch_size = 4;
         cfg.max_resident_requests = cfg.max_batch_size;

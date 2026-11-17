@@ -752,7 +752,6 @@ protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = SchedulerKvCacheEventTestSuite::MakeConfig();
         cfg.role = Role::kP;
-        cfg.decode_allocation_policy = SchedulerConfig::DecodeAllocationPolicy::kEarly;
         cfg.max_scheduled_tokens = 9;
         cfg.device_allocator.total_pages = 8;
         cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
@@ -1092,7 +1091,6 @@ protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg{};
         cfg.role = Role::kP;
-        cfg.decode_allocation_policy = SchedulerConfig::DecodeAllocationPolicy::kEarly;
         cfg.prefix_granularity = kPage;
         cfg.device_allocator.total_pages = 257;
         cfg.disable_l2_cache = true;
@@ -2035,9 +2033,6 @@ TEST(SchedulerConstructionTest, RefusesAPrefillDecodeMinIntervalOutsideTheFusedR
     const auto config = [](Role role, std::int32_t interval) {
         SchedulerConfig cfg{};
         cfg.role = role;
-        if (role == Role::kP) {
-            cfg.decode_allocation_policy = SchedulerConfig::DecodeAllocationPolicy::kEarly;
-        }
         cfg.prefix_granularity = 2;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
@@ -2071,9 +2066,6 @@ TEST(SchedulerConstructionTest, RefusesAPrefillDecodeIntervalOutsideTheFusedRole
     const auto config = [](Role role, std::int32_t interval) {
         SchedulerConfig cfg{};
         cfg.role = role;
-        if (role == Role::kP) {
-            cfg.decode_allocation_policy = SchedulerConfig::DecodeAllocationPolicy::kEarly;
-        }
         cfg.prefix_granularity = 2;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
@@ -2176,9 +2168,6 @@ TEST(SchedulerConstructionTest, PrefillChunkYieldIsAPrefillRoleOptionOfAtMostHal
     const auto config = [](Role role, std::int32_t budget, std::int32_t yield) {
         SchedulerConfig cfg{};
         cfg.role = role;
-        if (role == Role::kP) {
-            cfg.decode_allocation_policy = SchedulerConfig::DecodeAllocationPolicy::kEarly;
-        }
         cfg.prefix_granularity = 2;
         cfg.device_allocator.total_pages = 32;
         cfg.disable_l2_cache = true;

@@ -126,7 +126,7 @@ def make_config(
     host_write_policy: str,
     prefill_decode_interval: int,
     prefill_decode_min_interval: int,
-    decode_allocation_policy: str | None,
+    decode_allocation_policy: str | None = None,
     debug_force_retraction_interval: int = 0,
     enable_kv_cache_events: bool = False,
     decode_input_tokens: int = 1,
@@ -191,11 +191,11 @@ def make_config(
             chunk, unless no decode can run, even while an overdue prompt
             suspends the interval; 0 is off. Fused role only.
         decode_allocation_policy:
-            ``--disaggregation-decode-allocation-policy``, required on the
-            prefill role and None on every other: ``"early"`` admits a prompt
-            once its Decode destination is allocated; ``"deferred"``
-            admits it without waiting for the destination and holds only its
-            KV transfer for it.
+            ``--disaggregation-decode-allocation-policy``, a prefill-role
+            setting and None on every other role: ``"early"``, which None is
+            on the prefill role, admits a prompt once its Decode destination
+            is allocated; ``"deferred"`` admits it without waiting for the
+            destination and holds only its KV transfer for it.
         debug_force_retraction_interval: ``--debug-force-retraction-interval``:
             0 is off; every ``|N|`` plans the scheduler retracts the oldest
             quiescent Decoding (``N > 0``) or Prefilling (``N < 0``) request

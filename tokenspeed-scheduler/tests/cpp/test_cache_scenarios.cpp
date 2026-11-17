@@ -4106,7 +4106,6 @@ protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = RetractSuite::MakeConfig();
         cfg.role = Role::kP;
-        cfg.decode_allocation_policy = SchedulerConfig::DecodeAllocationPolicy::kEarly;
         for (CacheGroupConfig& group : cfg.cache_groups) {
             group.transfer_policy = CacheTransferPolicy::FullSuffix;
         }
@@ -4234,7 +4233,6 @@ protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = RetractSuite::MakeConfig();
         cfg.role = Role::kP;
-        cfg.decode_allocation_policy = SchedulerConfig::DecodeAllocationPolicy::kEarly;
         cfg.device_allocator.total_pages = 33;
         cfg.max_scheduled_tokens = 8;
         cfg.prefill_chunk_yield_tokens = 4;
@@ -8166,7 +8164,6 @@ protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = BoundedReplaySuite::MakeConfig();
         cfg.role = RoleUnderTest();
-        if (cfg.role == Role::kP) cfg.decode_allocation_policy = SchedulerConfig::DecodeAllocationPolicy::kEarly;
         for (CacheGroupConfig& group : cfg.cache_groups) {
             group.transfer_policy = CacheTransferPolicy::FullSuffix;
         }

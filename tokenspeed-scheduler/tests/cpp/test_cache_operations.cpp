@@ -720,7 +720,6 @@ TEST(CacheOperationTest, PrefillAcceptsPromptThatFitsWithoutReservingDecodeToken
     config.max_batch_size = 2;
     config.max_resident_requests = config.max_batch_size;
     config.role = Role::kP;
-    config.decode_allocation_policy = SchedulerConfig::DecodeAllocationPolicy::kEarly;
     config.cache_groups.push_back(CacheGroupConfig{
         .group_id = "full",
         .block_granularity = 2,
