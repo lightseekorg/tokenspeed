@@ -230,6 +230,27 @@ def _capacity(compiled, kernel, device: torch.device, stream: CUstream):
     return _checked(cuda_driver.cuOccupancyMaxActiveClusters(function, config))
 
 
+# SM107 tiles for the 4 x 2560 / lowrank 320 dimensions by row count, each
+# replacing the generic tactic of its range: (first row, last row or None,
+# generic tactic, (split_k, M_proj, B_mma, stages)). Break points are where the
+# winner changes in a CUDA-graph microbenchmark (24 weight copies, cold L2):
+# - 65 to 192 rows: S8 with M64/N64 tiles, 9.9 to 10.0 us per call, against
+#   10.6 to 10.8 us for S4/N16 (65 to 96 rows) and 12.3 to 12.5 us for S4/N32
+#   (97 to 192 rows). It loses at 33 to 64 rows (8.7 to 8.9 against 8.3 to
+#   8.4 us) and past 192 rows (20.4 against 14.1 us).
+# - From 193 rows: S4 with M64/N64 tiles, 14.1 us against 17.4 us for the
+#   generic M128/N32 tactic and 14.1 to 16.1 us for the GEMM path. Larger
+#   exact-override batches keep these tiles and add scheduling rounds.
+# SM100/SM103 were not measured and keep the generic tactic. Up to 64 rows the
+# all-architecture S8/N32 rule in _model_tactic applies first, so the table
+# starts at 65 rows.
+_SM107_HC_ROW_TILES = (
+    (65, 96, (4, 64, 16, 1, 1, 5, 32), (8, 64, 64, 5)),
+    (97, 192, (4, 64, 32, 1, 1, 5, 32), (8, 64, 64, 5)),
+    (193, None, (4, 128, 32, 1, 1, 4, 32), (4, 64, 64, 5)),
+)
+
+
 def _tactic(rows: int, projection_rows: int):
     # S, M_proj, B_mma, L_proj, L_batch, stages, F_mma. The single
     # parameterized kernel also supports S=1 and cluster-local projection loops.
@@ -709,6 +730,17 @@ def _model_tactic(
     ):
         # S8/N32 keeps this model's token groups in one resident round.
         split_k, n = 8, 32
+    measured_dims = (hc_count, hidden_size, lowrank) == (4, 2560, 320)
+    if measured_dims and current_platform().arch_version == ArchVersion(10, 7):
+        # Only the generic tactic of a range is replaced, not a forced one.
+        for first, last, generic, tiles in _SM107_HC_ROW_TILES:
+            if (
+                first <= rows
+                and (last is None or rows <= last)
+                and (split_k, m, n, lp, lb, stages, f) == generic
+            ):
+                split_k, m, n, stages = tiles
+                break
     if projection_rows > 6 * m:
         # Four-CTA clusters expose more Up output work at the resident limit.
         # Keep enough independent projection tiles while buffering their K loop.

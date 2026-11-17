@@ -844,7 +844,8 @@ def test_dynamic_rows_reuse_round_bucket_and_workspace(dtype, enable_pdl, monkey
     with torch.cuda.stream(stream):
         mix(first, 0.25, True)
     stream.synchronize()
-    kernel = next(iter(cute_fused._PLANS.values()))[0]
+    # The last plan serves the call; the first is the single-worker capacity probe.
+    kernel = list(cute_fused._PLANS.values())[-1][0]
     span = kernel.n * kernel.workers
     values = [inputs(rows, dtype, True) for rows in (span + 1, span + 7, 2 * span - 1)]
     # A new scheduling-round bucket still needs warmup before capture.

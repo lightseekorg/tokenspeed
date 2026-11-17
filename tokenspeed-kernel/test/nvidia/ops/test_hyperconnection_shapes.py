@@ -32,7 +32,7 @@ from tokenspeed_kernel.ops.residual import (
     gated_residual_mix,
     pad_gated_residual_projection_weight,
 )
-from tokenspeed_kernel.platform import pdl_enabled
+from tokenspeed_kernel.platform import ArchVersion, current_platform, pdl_enabled
 
 
 @pytest.fixture(autouse=True)
@@ -122,6 +122,40 @@ def test_model_dimensions_and_changed_input_graph(
             graph.replay()
         torch.cuda.synchronize()
         _check(actual, values, g, h, r, inject)
+
+
+@pytest.mark.skipif(
+    current_platform().arch_version != ArchVersion(10, 7),
+    reason="SM107 tile choice",
+)
+@pytest.mark.parametrize(
+    "g,h,r,rows,tactic",
+    [
+        (4, 2560, 320, 64, (8, 64, 32, 5)),
+        (4, 2560, 320, 65, (8, 64, 64, 5)),
+        (4, 2560, 320, 96, (8, 64, 64, 5)),
+        (4, 2560, 320, 97, (8, 64, 64, 5)),
+        (4, 2560, 320, 192, (8, 64, 64, 5)),
+        (4, 2560, 320, 193, (4, 64, 64, 5)),
+        (4, 2560, 320, 256, (4, 64, 64, 5)),
+        (4, 2560, 320, 385, (4, 64, 64, 5)),
+        (4, 8192, 1024, 65, (None, 128, 96, None)),
+        (4, 8192, 1024, 128, (None, 64, 128, None)),
+        (4, 8192, 1024, 193, (None, 128, 256, None)),
+        (4, 8192, 1024, 256, (None, 128, 256, None)),
+    ],
+)
+def test_sm107_tiles_by_row_count(g, h, r, rows, tactic):
+    # The Qwen3.8 dimensions take M64/N64 tiles past 64 rows on SM107: split-K
+    # 8 up to 192 rows, 4 past it (385 rows: an exact override keeps them),
+    # where they measured faster than the generic tactics; 64 rows keep the
+    # generic S8/N32. The other dimensions keep their wide tactic. The batched
+    # FP64 tests cover these row counts.
+    split_k, m, n, _, _, stages, _ = cute_fused._model_tactic(rows, g, h, r, r + g)[:7]
+    expected_split_k, expected_m, expected_n, expected_stages = tactic
+    assert (m, n) == (expected_m, expected_n)
+    if expected_split_k is not None:
+        assert (split_k, stages) == (expected_split_k, expected_stages)
 
 
 @torch.inference_mode()
