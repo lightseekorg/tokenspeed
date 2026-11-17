@@ -73,6 +73,7 @@ def config(
     cfg.host_group_packing = [1, 1]
     cfg.max_scheduled_tokens = chunk
     cfg.max_batch_size = 8
+    cfg.max_resident_requests = cfg.max_batch_size
     cfg.cache_groups = groups(device_pages)
     cfg.shared_l2_config = ts.SharedL2Config(
         max_writes=max_writes, max_write_keys=max_write_keys

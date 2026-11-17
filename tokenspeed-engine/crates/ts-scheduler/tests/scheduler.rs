@@ -1475,6 +1475,7 @@ cfg.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteThrough
 cfg.num_snapshot_pages = 1
 cfg.max_scheduled_tokens = 16
 cfg.max_batch_size = 4
+cfg.max_resident_requests = 4
 cfg.disable_l2_cache = False
 cfg.shared_l2_config = ts.SharedL2Config(max_writes=2, max_write_keys=8)
 cfg.cache_groups = [ts.CacheGroupConfig("full", 2, 32, ts.AttnKind.Full)]
