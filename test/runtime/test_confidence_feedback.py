@@ -255,3 +255,15 @@ def test_history_is_reset_when_request_lifetime_changes(recompute):
     feedback.prepare([key], [1], ForwardOutputLayout(0, 0, 1, 4))
     assert feedback.select(1, [key]) == 4
     assert feedback.summary()["rejected_generations"] == 0
+
+
+def test_new_admission_in_the_same_slot_does_not_inherit_feedback():
+    states, feedback = _owners(3, budget_policy="confidence")
+    feedback.planner.set_baseline(1, 2, 1.4)
+    feedback.planner.set_baseline(1, 3, 1.8)
+    _round(states, feedback, 101, 1, [0.99, 0.99], prefill=True, accepted=0)
+    _round(states, feedback, 101, 1, [0.99, 0.99], prefill=False, accepted=1)
+    feedback.prepare([101], [1], ForwardOutputLayout(0, 0, 1, 3))
+    assert feedback.select(1, [101]) == 3
+    feedback.prepare([102], [1], ForwardOutputLayout(0, 0, 1, 3))
+    assert feedback.select(1, [102]) == 1

@@ -28,6 +28,7 @@ They are refreshed on the execution stream; no tensor value reaches Python.
 from __future__ import annotations
 
 import time
+from collections.abc import Hashable, Sequence
 from dataclasses import dataclass, field
 
 import torch
@@ -197,7 +198,7 @@ class _ConfidenceRequest:
 @dataclass(frozen=True)
 class _ConfidenceSample:
     # A tag names a request lifetime and this round's published generation.
-    tags: tuple[tuple[str, int, int] | None, ...]
+    tags: tuple[tuple[Hashable, int, int] | None, ...]
     values: torch.Tensor
     generations: torch.Tensor
     start: torch.cuda.Event | None
@@ -238,10 +239,10 @@ class ConfidenceFeedback:
             for _ in range(max_pending)
         ]
         self.pending: list[_ConfidenceSample] = []
-        self._requests: dict[str, _ConfidenceRequest] = {}
-        self._slot_owners: dict[int, str] = {}
+        self._requests: dict[Hashable, _ConfidenceRequest] = {}
+        self._slot_owners: dict[int, Hashable] = {}
         self._next_epoch = 0
-        self._round_tags: tuple[tuple[str, int, int] | None, ...] | None = None
+        self._round_tags: tuple[tuple[Hashable, int, int] | None, ...] | None = None
         self._successes = [1] * (width - 1)
         self._trials = [2] * (width - 1)
         self.selections = 0
@@ -266,7 +267,7 @@ class ConfidenceFeedback:
 
     def prepare(
         self,
-        request_ids: list[str],
+        request_ids: Sequence[Hashable],
         slots: list[int],
         output_layout: ForwardOutputLayout,
     ) -> None:
@@ -377,7 +378,7 @@ class ConfidenceFeedback:
                         self.confidence_observations += 1
             self._free_buffers.append((sample.values, sample.generations))
 
-    def select(self, batch: int, request_ids: list[str]) -> int:
+    def select(self, batch: int, request_ids: Sequence[Hashable]) -> int:
         started = time.perf_counter_ns()
         prior = [
             successes / trials

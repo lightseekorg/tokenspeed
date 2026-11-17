@@ -778,6 +778,7 @@ class ServerArgs:
     enable_prefix_caching: bool = True
     disable_kvstore: bool = False
     enforce_eager: bool = False
+    enable_dp_local_cuda_graph: bool = False
     disable_cuda_graph_padding: bool = False
     disable_autotune: bool = False
     enable_startup_requests: bool = False
@@ -933,8 +934,48 @@ class ServerArgs:
         self.resolve_numerics()
         self.resolve_disaggregation()
         self.validate_output_cumulative_probs()
+        self.validate_dp_local_cuda_graph()
         self.validate_dsv41_adaptive_dspark()
         self.validate()
+
+    def validate_dp_local_cuda_graph(self):
+        if not self.enable_dp_local_cuda_graph:
+            return
+        if self.disaggregation_mode in ("prefill", "encode"):
+            raise ValueError("DP-local CUDA graphs require a decode-capable worker")
+        if self.enforce_eager:
+            raise ValueError("DP-local CUDA graphs require CUDA graphs")
+        if self.speculative_algorithm != "DSPARK":
+            raise ValueError("DP-local CUDA graphs currently require DSPARK")
+        mega_moe_backends = ("mega_moe", "deep_gemm_mega_moe")
+        if (
+            self.moe_backend not in mega_moe_backends
+            or (self.draft_moe_backend or self.moe_backend) not in mega_moe_backends
+        ):
+            raise ValueError(
+                "DP-local CUDA graphs require MegaMoE for both target and draft"
+            )
+        if (
+            self.mapping.attn.tp_size != 1
+            or self.mapping.dense.tp_size != 1
+            or self.mapping.moe.tp_size != 1
+            or self.mapping.lm_head.tp_size != 1
+            or self.mapping.attn.has_head_tp
+            or self.pipeline_parallel_size != 1
+            or self.kv_parallel_size != 1
+            or self.decode_context_parallel_size != 1
+            or self.query_context_parallel_size != 1
+            or self.dp_sampling
+        ):
+            raise ValueError(
+                "DP-local CUDA graphs require attention/dense/MoE/LM-head TP1, "
+                "no head TP, PP1/KVP1/DCP1/QCP1 and no DP sampling"
+            )
+        if self.sampling_backend != "greedy" and not self.enable_dsv41_adaptive_dspark:
+            raise ValueError(
+                "DP-local CUDA graphs require greedy sampling "
+                "or adaptive DSpark sampling"
+            )
 
     def validate_dsv41_adaptive_dspark(self):
         if (
@@ -950,9 +991,24 @@ class ServerArgs:
             raise ValueError("adaptive DSpark requires real acceptance")
         from tokenspeed.runtime.utils.env import envs
 
-        if self.speculative_algorithm != "DSPARK" or self.sampling_backend != "greedy":
+        if self.speculative_algorithm != "DSPARK" or self.sampling_backend not in (
+            "greedy",
+            "flashinfer",
+        ):
             raise ValueError(
-                "V4.1 adaptive verification requires DSPARK and greedy sampling"
+                "V4.1 adaptive verification requires DSPARK and greedy "
+                "or flashinfer sampling"
+            )
+        if self.sampling_backend == "flashinfer" and (
+            not self.enable_speculative_sampling
+            or self.sampling_stream != "per-request"
+            or self.mapping.attn.tp_size != 1
+            or self.speculative_rejection_sample_method != "standard"
+        ):
+            raise ValueError(
+                "sampled adaptive DSpark requires --enable-speculative-sampling, "
+                "--sampling-stream per-request, standard rejection sampling "
+                "and attention TP1"
             )
         if not self.disable_prefill_graph:
             raise ValueError(
@@ -979,13 +1035,14 @@ class ServerArgs:
             self.grammar_backend != "none"
             or self.enable_output_logprobs
             or self.enable_output_cumulative_probs
-            or self.enable_speculative_sampling
+            or (self.enable_speculative_sampling and self.sampling_backend == "greedy")
             or self.speculative_draft_tree
             or envs.TOKENSPEED_SPEC_SIMULATED_ACCEPT_LEN.get()
             or self.disable_sampling_tp_sync
         ):
             raise ValueError(
-                "V4.1 adaptive verification requires plain greedy sampling, grammar none, and TP synchronization"
+                "V4.1 adaptive verification requires chain sampling, "
+                "grammar none, and TP synchronization"
             )
 
     def validate_output_cumulative_probs(self):
@@ -4356,20 +4413,29 @@ class ServerArgs:
 
         # Speculative decoding
         parser.add_argument(
+            "--enable-dp-local-cuda-graph",
+            action="store_true",
+            default=ServerArgs.enable_dp_local_cuda_graph,
+            help="Select decode CUDA graph capacities independently on attention-DP "
+            "ranks. Currently requires a supported DSPARK drafter, target and draft "
+            "MegaMoE, TP1 for attention/dense/MoE/LM head, and greedy or adaptive "
+            "DSpark sampling.",
+        )
+        parser.add_argument(
             "--enable-dsv41-adaptive-dspark",
             action="store_true",
             default=ServerArgs.enable_dsv41_adaptive_dspark,
             help="Adapt DeepSeek V4.1 DSpark verification capacity using confidence "
-            "and calibrated step costs. Requires greedy sampling and CUDA graphs.",
+            "and calibrated step costs. Requires CUDA graphs and greedy sampling "
+            "or flashinfer with --enable-speculative-sampling.",
         )
         parser.add_argument(
             "--dsv41-dspark-min-batch-size",
             type=int,
             default=ServerArgs.dsv41_dspark_min_batch_size,
-            help="Minimum actual decode batch size per attention rank for adaptive "
-            "DSpark, not global request concurrency. Smaller or padded batches "
-            "retain full verification; attention DP also requires equal local "
-            "decode batch sizes across ranks.",
+            help="Enable adaptive DSpark when the maximum actual local decode "
+            "batch size across attention ranks reaches this threshold. Uneven "
+            "or idle DP ranks share the selected physical query capacity.",
         )
         parser.add_argument(
             "--draft-model-path-use-base",

@@ -164,6 +164,7 @@ class TestPrefillCaptureArgsTest:
             query_shard_size=1,
             query_shard_rank=0,
             enable_memory_saver=False,
+            enable_dp_local_cuda_graph=False,
         )
         with pytest.raises((TypeError), match=("prefill_graph_capture_batch_sizes")):
             ModelExecutorConfig(**config_args)
@@ -1455,6 +1456,7 @@ class TestPrefillRoleGraphsTest:
             decode_only_attention=False,
             prefill_graph_capture_batch_sizes=None,
             enable_speculative_sampling=False,
+            enable_dp_local_cuda_graph=False,
             query_shard_size=1,
             query_shard_rank=0,
             enable_memory_saver=False,

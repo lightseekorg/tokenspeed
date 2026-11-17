@@ -45,6 +45,7 @@ from tokenspeed.runtime.multimodal.inputs import (
     MultimodalForwardContext,
     MultimodalInputs,
 )
+from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 
 def _lookup() -> nn.Embedding:
@@ -179,6 +180,7 @@ class _CPUInputGraph(PrefillGraph):
             max_cudagraph_capture_size=1,
             model_is_mrope=False,
             autotune_cache_key=None,
+            enable_dp_local_cuda_graph=False,
             prefill_only=False,
             decode_only_attention=False,
             prefill_graph_capture_batch_sizes=None,
@@ -198,6 +200,7 @@ class _CPUInputGraph(PrefillGraph):
             token_to_kv_pool=None,
             input_buffers=None,
             config=config,
+            memory_saver_adapter=TorchMemorySaverAdapter.create(enable=False),
             drafter=None,
             num_warmup=0,
             graph_supported=True,

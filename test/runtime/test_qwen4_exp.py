@@ -1210,6 +1210,7 @@ def test_qwen4_exp_draft_attention_preserves_rows_and_cache_context(
     layer = object.__new__(qwen4_exp_nextn.Qwen4ExpDraftAttentionDecoderLayer)
     torch.nn.Module.__init__(layer)
     layer.enable_fp8_attn_proj = False
+    layer.attn_tp_size = 1
     layer.qsa_fork = StreamFork(None)
     q = torch.arange(24, dtype=torch.float32).reshape(6, 4)
     k, v = q + 100, q + 200
@@ -1694,6 +1695,8 @@ def test_attention_dp_mtp_shares_vocab_sharded_head(
         target.lm_head.weight.copy_(full_weight[start : start + width])
     draft.set_embed_and_head_module(target.model.embed_tokens.weight, target.lm_head)
     assert draft.lm_head is target.lm_head
+    # This CPU transport has no symmetric-memory process group.
+    draft.logits_processor._all_gather_state = None
     rows = [1 + (r // attn_tp) % 3 for r in range(8)]
     hidden = [
         torch.arange(n * 4, dtype=torch.float32).reshape(n, 4) / 7 + r // attn_tp
@@ -2293,8 +2296,12 @@ def test_qwen4_exp_ple_in_forward_checkpoint_matches_a_forward_ending_there() ->
             state_checkpoints=checkpoints,
         )
         layer._metadata = lambda ctx: metadata
-        ctx = SimpleNamespace(
+        ctx = ForwardContext(
+            attn_backend=None,
             bs=1,
+            num_extends=1,
+            input_num_tokens=length,
+            output_layout=ForwardOutputLayout(1, 1, 0, 1),
             forward_mode=ForwardMode.EXTEND,
             token_to_kv_pool=pool,
             global_num_tokens=None,

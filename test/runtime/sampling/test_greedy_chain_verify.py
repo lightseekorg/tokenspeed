@@ -130,7 +130,9 @@ def test_compact_greedy_chain_replay_reads_only_selected_prefixes(
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         run()
-    with assert_no_triton_compile(_verify_chain_target_sampled_kernel):
+    with _kernel_test_utils().assert_no_triton_compile(
+        _verify_chain_target_sampled_kernel
+    ):
         for lengths in (
             [width, 1, 0, width],
             [0, width, 1, 0],

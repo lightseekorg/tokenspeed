@@ -269,6 +269,7 @@ class _Runner(ForwardStepRunner):
         self.capture_bs = [1, 2, 4]
         self.max_capture_bs = 4
         self.max_decode_bs = 8
+        self.dp_local_graph = False
         self.device = "cuda"
         self.vocab_size = 16
         self.drafter = executor.drafter

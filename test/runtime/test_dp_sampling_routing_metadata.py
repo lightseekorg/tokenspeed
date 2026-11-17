@@ -44,6 +44,7 @@ def _graph_route(
     wrapper.capture_bs = capture_bs
     wrapper.graphs = {(CUDA_GRAPH_VARIANT_DEFAULT, size) for size in capture_bs}
     wrapper.max_tokens_per_req = max_tokens_per_req
+    wrapper.dp_local_graph = False
     use_graph = wrapper.can_run(bs, ctx)
     return use_graph, wrapper.padded_bs(bs, ctx) if use_graph else bs
 
@@ -127,8 +128,9 @@ def test_forward_step_runner_uses_existing_route_for_padding():
     wrapper.disable_padding = False
     wrapper.max_capture_bs = 32
     wrapper.capture_bs = [24, 32]
-    wrapper.graphs = {24, 32}
+    wrapper.graphs = {("default", 24), ("default", 32)}
     wrapper.max_tokens_per_req = 1
+    wrapper.dp_local_graph = False
     ctx = ForwardContext(
         attn_backend=None,
         token_to_kv_pool=None,
@@ -145,6 +147,7 @@ def test_forward_step_runner_uses_existing_route_for_padding():
 
 def test_cuda_graph_req_pool_padding_uses_reserved_sink_row():
     wrapper = ForwardStepRunner.__new__(ForwardStepRunner)
+    wrapper.dp_local_graph = False
     wrapper.config = SimpleNamespace(max_req_pool_size=21, spec_algo="DFLASH")
     active_indices = torch.tensor([7, 8], dtype=torch.int64)
 
