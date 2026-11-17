@@ -23,6 +23,7 @@
 import pytest
 import torch
 
+from tokenspeed.runtime.grammar.base_grammar_backend import get_apply_vocab_mask_func
 from tokenspeed.runtime.sampling.backends.greedy import verify_packed_chain_greedy
 
 
@@ -56,14 +57,7 @@ def _apply_vocab_mask_torch(logits: torch.Tensor, vocab_mask: torch.Tensor) -> N
 
 
 def _vocab_mask_applier():
-    try:
-        from tokenspeed.runtime.grammar.base_grammar_backend import (
-            get_apply_vocab_mask_func,
-        )
-
-        return get_apply_vocab_mask_func("xgrammar")
-    except ImportError:
-        return _apply_vocab_mask_torch
+    return get_apply_vocab_mask_func("xgrammar")
 
 
 def _masked_reference(logits: torch.Tensor, vocab_mask: torch.Tensor) -> torch.Tensor:

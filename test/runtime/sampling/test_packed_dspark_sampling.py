@@ -43,6 +43,9 @@ from tokenspeed_kernel.ops.sampling.packed_verify import (  # noqa: E402
 )
 from tokenspeed_kernel.platform import current_platform  # noqa: E402
 
+from tokenspeed.runtime.grammar.base_grammar_backend import (  # noqa: E402
+    get_apply_vocab_mask_func,
+)
 from tokenspeed.runtime.layers.logits_processor import (  # noqa: E402
     LogitsProcessorOutput,
 )
@@ -133,14 +136,7 @@ def _apply_vocab_mask_torch(logits: torch.Tensor, vocab_mask: torch.Tensor) -> N
 
 
 def _vocab_mask_applier():
-    try:
-        from tokenspeed.runtime.grammar.base_grammar_backend import (
-            get_apply_vocab_mask_func,
-        )
-
-        return get_apply_vocab_mask_func("xgrammar")
-    except ImportError:
-        return _apply_vocab_mask_torch
+    return get_apply_vocab_mask_func("xgrammar")
 
 
 def _masked_reference(logits: torch.Tensor, vocab_mask: torch.Tensor) -> torch.Tensor:
@@ -157,6 +153,7 @@ def _assert_packed_logprobs(
     accept_index: torch.Tensor,
     query_start_loc: torch.Tensor,
 ) -> None:
+    """Independently map flat request/column indices through the packed CSR."""
     starts = query_start_loc.tolist()
     rows = []
     for request, indices in enumerate(accept_index.tolist()):
