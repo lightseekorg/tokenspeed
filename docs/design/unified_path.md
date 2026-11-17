@@ -2793,12 +2793,26 @@ After target forward, borrowed input storage and collective counts are restored.
 The context's input_num_tokens keeps the packed target extent until sampling and
 NaN checks consume the target outputs.
 
-Attention DP ranks agree on one physical capacity while actual request
+By default attention DP ranks agree on one physical capacity while actual request
 counts may differ or be zero. Padding retains one physical anchor, contributes
 no acceptance reward, writes to the dummy slot and discards outputs.
 The live-row mask must exclude padding from expert-load accounting.
 
-Serving and startup profiling use the same budget policy and agreement.
+`--enable-dp-local-cuda-graph` selects request buckets and target query
+capacities independently on each attention-DP replica. The runner still agrees
+the graph/eager phase from global decode-or-idle metadata and the capture
+ladder bound; an idle rank replays its smallest graph and participates in the
+same EP sequence. The drafter declares support and validates the loaded target
+and draft. V4.1 DSpark with MegaMoE and attention/dense/MoE/head TP1 is the
+initial supported combination. Its captured model contexts carry local row
+counts rather than fabricated peer extents; MegaMoE's fixed-capacity symmetric
+buffer supplies the common communication geometry. Scheduler write reservations
+are unchanged.
+
+Serving and startup profiling use the same budget policy. Local DP graphs
+select from local N-2 confidence and context feedback, including padded local
+request buckets; missing local feedback retains only that rank's full width.
+This serving decision has no cross-DP collective. Shared graphs retain agreement.
 DP budget metadata uses the global attention host group; TP-only metadata
 uses a TP-local host group. Startup's authoritative TP packet broadcast also
 uses a TP-local host group: different DP groups must not supply different roots
@@ -2814,8 +2828,9 @@ a context that synchronizes and restores capture metadata on exit.
 Packed prefixes do not have uniform rows per request, so they leave MegaMoE's
 request-ratio padding filter disabled; native fixed-width replays retain it.
 
-Serving selects a calibration interval by the global upper feedback-context
-bound, including the lookahead margin. A heterogeneous batch does not require
+Serving selects a calibration interval by the local upper feedback-context
+bound for local graphs, or the global upper bound for shared graphs, including
+the lookahead margin. A heterogeneous batch does not require
 all request lengths to fit that interval. The uniform endpoint supplies a
 representative cost estimate, not a latency bound for the mixed batch; missing
 coverage of the upper bound retains native verification. Periodic host decision

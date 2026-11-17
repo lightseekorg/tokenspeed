@@ -70,6 +70,7 @@ def _runner(
     events = []
     commits = {"recurrent": [], "ple": [], "qsa": []}
     wrapper = object.__new__(ForwardStepRunner)
+    wrapper.dp_local_graph = False
     wrapper.config = SimpleNamespace(
         spec_algo="MTP", max_req_pool_size=8, spec_draft_tree=False
     )
@@ -444,6 +445,7 @@ def test_runner_arms_mega_moe_counts_only_for_whole_batch_layouts(
         decode_only_attention=False,
         prefill_graph_capture_batch_sizes=None,
         enable_speculative_sampling=False,
+        enable_dp_local_cuda_graph=False,
         query_shard_size=1,
         query_shard_rank=0,
         enable_memory_saver=False,

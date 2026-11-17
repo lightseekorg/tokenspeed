@@ -114,6 +114,7 @@ class _PendingVerifyFeedback:
 class DeepseekV41DSpark(BaseDrafter):
     """V4.1 DSpark block drafter whose windows live in the SWA cache group."""
 
+    supports_dp_local_graph: bool = True
     shares_target_embed_head = True
     supports_speculative_sampling = True
 
@@ -233,6 +234,28 @@ class DeepseekV41DSpark(BaseDrafter):
     def slot_state_rows(self, slot: int) -> list[torch.Tensor]:
         return [] if self.confidence_scores is None else [self.confidence_scores[slot]]
 
+    def configure_decode_graph_scope(self, *, local: bool) -> None:
+        if local:
+            from tokenspeed.runtime.models.deepseek_v41 import DeepseekV41ForCausalLM
+
+            if self.target_model is None:
+                raise ValueError("local DP graphs require the wired target model")
+            if not isinstance(self.target_model, DeepseekV41ForCausalLM):
+                raise ValueError("local DP graphs require the native V4.1 target model")
+            for model in (self.target_model, self.draft_model):
+                mapping = model.mapping
+                if (
+                    mapping.attn.tp_size != 1
+                    or mapping.dense.tp_size != 1
+                    or mapping.moe.tp_size != 1
+                    or mapping.lm_head.tp_size != 1
+                    or not all(layer.ffn.use_mega_moe for layer in model.model.layers)
+                ):
+                    raise ValueError(
+                        "local DP graphs require target and draft MegaMoE with TP1"
+                    )
+        super().configure_decode_graph_scope(local=local)
+
     def bind_sampling_backend(self, sampling_backend) -> None:
         if self.runtime_states is None or self.runtime_states.draft_probs is None:
             return
@@ -335,6 +358,10 @@ class DeepseekV41DSpark(BaseDrafter):
         full = padded_bs * self.spec_num_tokens
         if self.verify_budget_policy is None:
             return full
+        if self.dp_local_graph:
+            return self._prepare_calibrated_budget(
+                actual_bs=actual_bs, padded_bs=padded_bs
+            )
         if self.draft_model.mapping.attn.dp_size > 1:
             # Admission must use global metadata before entering collectives.
             # Pure decode peers share physical capacity, not actual occupancy.
@@ -425,7 +452,11 @@ class DeepseekV41DSpark(BaseDrafter):
                     saved.index_select(0, self._verify_rows[:num_tokens])
                 )
             ctx.input_num_tokens = num_tokens
-            if original_global_num_tokens is not None:
+            if self.dp_local_graph:
+                # MegaMoE consumes local rows from a fixed-capacity symmetric
+                # buffer; peer physical extents are not captured host metadata.
+                ctx.global_num_tokens = None
+            elif original_global_num_tokens is not None:
                 ctx.global_num_tokens = [num_tokens] * len(original_global_num_tokens)
             backend = ctx.attn_backend
             tables = backend.query_metadata(ForwardMode.DECODE).block_tables
@@ -553,7 +584,7 @@ class DeepseekV41DSpark(BaseDrafter):
         context_bounds: tuple[int, int] | None,
     ) -> None:
         """Report host decisions without device reads or extra collectives."""
-        if self._verification_rank != 0:
+        if self._verification_rank != 0 and not self.dp_local_graph:
             return
         key = (batch_size, query_capacity, reason)
         counts = self._verify_budget_counts
@@ -659,15 +690,17 @@ class DeepseekV41DSpark(BaseDrafter):
 
     def _prepare_calibrated_budget(self, *, actual_bs: int, padded_bs: int) -> int:
         full = padded_bs * self.spec_num_tokens
-        if (
-            not self.verify_budget_policy.admits(
+        admitted = (
+            actual_bs >= self.adaptive_min_batch_size
+            if self.dp_local_graph
+            else self.verify_budget_policy.admits(
                 batch_size=actual_bs, graph_batch_size=padded_bs
             )
-            or actual_bs not in self._verify_budget_buffers
-        ):
+        )
+        if not admitted or padded_bs not in self._verify_budget_buffers:
             return full
         self._poll_verify_feedback()
-        buffers = self._verify_budget_buffers[actual_bs]
+        buffers = self._verify_budget_buffers[padded_bs]
         tp = int(self.draft_model.mapping.attn.tp_size)
         rank = int(self.draft_model.mapping.attn.tp_rank)
         selected = full
@@ -682,12 +715,12 @@ class DeepseekV41DSpark(BaseDrafter):
                 # Use the same upper-context bucket as attention DP.
                 for profile in self._verify_calibrations:
                     if profile.covers(
-                        batch_size=actual_bs,
+                        batch_size=padded_bs,
                         min_context=bounds[1],
                         max_context=bounds[1],
                     ):
-                        selected = self.verify_budget_policy.select(
-                            scores,
+                        selected = self.verify_budget_policy.select_distributed(
+                            (scores,),
                             graph_batch_size=padded_bs,
                             native_step_ms=profile.native_step_ms,
                             adaptive_step_ms=dict(profile.adaptive_step_ms),
@@ -699,8 +732,11 @@ class DeepseekV41DSpark(BaseDrafter):
         # All TP ranks participate even when their local async feedback is late.
         packet = torch.zeros(buffers.packet.shape, dtype=torch.float32, pin_memory=True)
         packet[0] = selected
+        packet[2] = actual_bs
         if rank == 0 and selected != full:
-            packet[3:].copy_(torch.tensor(scores, dtype=torch.float32).flatten())
+            packet[3 : 3 + actual_bs * self.block_size].copy_(
+                torch.tensor(scores, dtype=torch.float32).flatten()
+            )
         if tp > 1:
             torch.distributed.broadcast(
                 packet,
@@ -712,9 +748,9 @@ class DeepseekV41DSpark(BaseDrafter):
             selected = int(packet[0].item())
         if selected != full:
             buffers.packet.copy_(packet, non_blocking=True)
-            source = buffers.packet[3:].view(actual_bs, self.block_size)
+            source = buffers.packet[3:].view(padded_bs, self.block_size)
             self.prepare_verify_budget_layout(
-                source, batch_size=actual_bs, query_capacity=selected
+                source, batch_size=padded_bs, query_capacity=selected
             )
         self._record_verify_budget(
             batch_size=padded_bs,
@@ -782,17 +818,20 @@ class DeepseekV41DSpark(BaseDrafter):
                     valid_out=buffers.valid,
                     active_count=(
                         buffers.packet[2:3]
-                        if self.draft_model.mapping.attn.dp_size > 1
+                        if self.dp_local_graph
+                        or self.draft_model.mapping.attn.dp_size > 1
                         else None
                     ),
                     latest_scores=(
                         self.confidence_scores
-                        if self.draft_model.mapping.attn.dp_size > 1
+                        if self.dp_local_graph
+                        or self.draft_model.mapping.attn.dp_size > 1
                         else None
                     ),
                     request_slots=(
                         self.input_buffers.req_pool_indices_buf[:graph_bs]
-                        if self.draft_model.mapping.attn.dp_size > 1
+                        if self.dp_local_graph
+                        or self.draft_model.mapping.attn.dp_size > 1
                         else None
                     ),
                 )
@@ -1021,9 +1060,11 @@ class DeepseekV41DSpark(BaseDrafter):
             or graph_bs is None
             or graph_bs < ctx.bs
             or ctx.bs == 0
-            or max(ctx.global_bs or (ctx.bs,)) < self.adaptive_min_batch_size
+            or (ctx.bs if self.dp_local_graph else max(ctx.global_bs or (ctx.bs,)))
+            < self.adaptive_min_batch_size
             or (
                 self.draft_model.mapping.attn.dp_size == 1
+                and not self.dp_local_graph
                 and (graph_bs != ctx.bs or ctx.bs < self.adaptive_min_batch_size)
             )
         ):
@@ -1079,7 +1120,7 @@ class DeepseekV41DSpark(BaseDrafter):
             capture_hidden_mode=CaptureHiddenMode.NULL,
             global_num_tokens=(
                 [batch * self.block_size for batch in global_num_decodes]
-                if global_num_decodes is not None
+                if global_num_decodes is not None and not self.dp_local_graph
                 else None
             ),
             # global_bs keeps the round's total request counts, as in the idle

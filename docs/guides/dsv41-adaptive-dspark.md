@@ -12,10 +12,11 @@ Add these options to a supported DeepSeek V4.1 DSpark deployment:
 --enable-dsv41-adaptive-dspark --dsv41-dspark-min-batch-size 4
 ```
 
-The threshold is the largest actual local batch among attention ranks, not client
-concurrency. For balanced DP8, C32 gives local BS4. For TP8 with DP1, C32 gives
-local BS32. Reaching the threshold permits adaptation but does not guarantee
-that a shorter graph will be selected.
+With shared graph capacities, the threshold is the largest actual local batch
+among attention ranks, not client concurrency. With DP-local graphs, each rank
+uses its own actual batch size. For balanced DP8, C32 gives local BS4. For TP8
+with DP1, C32 gives local BS32. Reaching the threshold permits adaptation but
+does not guarantee that a shorter graph will be selected.
 
 ## Runtime requirements
 
@@ -66,15 +67,37 @@ verification. Mixed prefill/decode steps retain the existing full-width path. Th
 per-step timing calibration. Confidence feedback is updated asynchronously;
 weight reload invalidates the costs.
 
+## DP-local CUDA graph capacities
+
+`--enable-dp-local-cuda-graph` lets each attention-DP rank choose its decode
+graph capacity from its own request count. MegaMoE retains its expert
+communication across ranks, including ranks with no local requests. The
+default keeps the shared-capacity behavior described above.
+An idle rank uses the smallest configured capture bucket, including custom
+capture-size lists that omit batch size 1.
+
+The first supported drafter is DeepSeek V4.1 DSpark. Both target and draft
+must use `--moe-backend mega_moe` (the legacy `deep_gemm_mega_moe` name is also
+accepted); `--draft-moe-backend` inherits that selection when omitted.
+Attention, dense, MoE and LM-head TP must all be 1, without head TP, PP, KVP,
+DCP, QCP or DP sampling. CUDA graphs must be enabled. Use the flag on an
+aggregated or decode worker; prefill-only and encode workers reject it.
+
+Fixed-width greedy verification can use the flag without adaptive
+verification. Sampled adaptive verification uses the existing requirements
+above, including recorded proposals and the per-request sampling stream.
+The flag does not enable adaptive verification by itself. Validate correctness
+and performance on the intended workload and hardware.
+
 ## Startup costs and cache
 
 After graph capture, each eligible batch size is measured with synthetic
 contexts and disjoint cache blocks. No calibration dataset is required.
 Context endpoints are 8K, 32K, 128K, 512K and the configured limit, clipped and
-deduplicated. Serving selects the interval containing the largest feedback
-context bound across active attention ranks, including the existing lookahead
-margin. Mixed lengths within a rank or across ranks use that same endpoint's
-costs; they need not all lie in one interval. A missing interval or an upper
+deduplicated. Shared-capacity serving selects the interval containing the largest
+feedback context bound across active attention ranks, including the existing
+lookahead margin. DP-local graphs use each rank's own bound. Mixed lengths use
+the selected endpoint's costs; they need not all lie in one interval. A missing interval or an upper
 bound beyond the configured limit retains full verification. Uniform endpoint
 timings are a representative estimate for a mixed batch, not a bound on its
 latency or on the benefit of shortening.
@@ -83,7 +106,9 @@ Each graph gets two warmup replays and eight measured replays. Wall-clock
 timings run through GPU completion, use the slowest rank and include target
 verification, sampling and drafting. Shortened verification also uses the
 serving budget policy and DP/TP agreement, including host selection and layout
-submission. The native full-width tier omits budget selection. Metadata preparation,
+submission. DP-local serving omits cross-DP budget agreement, but still uses
+these synchronized, balanced startup measurements as a cost estimate. The native
+full-width tier omits budget selection. Metadata preparation,
 barriers, cache initialization and post-graph feedback collection/publication are
 excluded, including `finish_round`'s pinned D2H copies and events.
 At the position limit, profiling reserves space for the following draft block.
@@ -113,7 +138,8 @@ reason)`, with `packed`, `full`, `feedback_unavailable`, or `uncalibrated` as th
 reason. `context_bounds` spans the available feedback seen so far. Startup
 clears these counters before serving. Steps below admission thresholds are not
 counted, and the last log may omit up to 1023 trailing decisions. These host-only
-counters do not read GPU tensors or add collectives.
+counters do not read GPU tensors or add collectives. With DP-local graphs,
+each rank records its own decisions.
 
 ## Verification layout
 
@@ -124,8 +150,9 @@ historical scores when a current row is non-finite. A device-resident live
 request count excludes padding from draft allocation. Padding keeps one
 physical anchor for existing CSR and sampling conventions; its state writes
 use the runtime's dummy slot and its outputs are discarded. Budget rewards
-count real requests only, while costs use the common physical graph capacity.
-All ranks, including idle ranks, participate in the same host budget agreement.
+count real requests only, while costs use the selected physical graph capacity.
+Shared-capacity graphs require all ranks, including idle ranks, to participate
+in the same host budget agreement. DP-local graphs select independently.
 
 The kernel requires:
 

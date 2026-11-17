@@ -81,6 +81,7 @@ def make_drafter(device):
     # Model initialization requires weights and GPUs. Exercise the real
     # request-state and allocation methods with their existing tensor state.
     drafter = object.__new__(DeepseekV41DSpark)
+    drafter.dp_local_graph = False
     drafter.verify_feedback = None
     drafter.confidence_scores = torch.tensor(
         [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], dtype=torch.float32, device=device

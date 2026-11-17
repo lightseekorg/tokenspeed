@@ -777,6 +777,7 @@ class ServerArgs:
     enable_prefix_caching: bool = True
     disable_kvstore: bool = False
     enforce_eager: bool = False
+    enable_dp_local_cuda_graph: bool = False
     disable_cuda_graph_padding: bool = False
     disable_autotune: bool = False
     enable_startup_requests: bool = False
@@ -932,8 +933,48 @@ class ServerArgs:
         self.resolve_numerics()
         self.resolve_disaggregation()
         self.validate_output_cumulative_probs()
+        self.validate_dp_local_cuda_graph()
         self.validate_dsv41_adaptive_dspark()
         self.validate()
+
+    def validate_dp_local_cuda_graph(self):
+        if not self.enable_dp_local_cuda_graph:
+            return
+        if self.disaggregation_mode in ("prefill", "encode"):
+            raise ValueError("DP-local CUDA graphs require a decode-capable worker")
+        if self.enforce_eager:
+            raise ValueError("DP-local CUDA graphs require CUDA graphs")
+        if self.speculative_algorithm != "DSPARK":
+            raise ValueError("DP-local CUDA graphs currently require DSPARK")
+        mega_moe_backends = ("mega_moe", "deep_gemm_mega_moe")
+        if (
+            self.moe_backend not in mega_moe_backends
+            or (self.draft_moe_backend or self.moe_backend) not in mega_moe_backends
+        ):
+            raise ValueError(
+                "DP-local CUDA graphs require MegaMoE for both target and draft"
+            )
+        if (
+            self.mapping.attn.tp_size != 1
+            or self.mapping.dense.tp_size != 1
+            or self.mapping.moe.tp_size != 1
+            or self.mapping.lm_head.tp_size != 1
+            or self.mapping.attn.has_head_tp
+            or self.pipeline_parallel_size != 1
+            or self.kv_parallel_size != 1
+            or self.decode_context_parallel_size != 1
+            or self.query_context_parallel_size != 1
+            or self.dp_sampling
+        ):
+            raise ValueError(
+                "DP-local CUDA graphs require attention/dense/MoE/LM-head TP1, "
+                "no head TP, PP1/KVP1/DCP1/QCP1 and no DP sampling"
+            )
+        if self.sampling_backend != "greedy" and not self.enable_dsv41_adaptive_dspark:
+            raise ValueError(
+                "DP-local CUDA graphs require greedy sampling "
+                "or adaptive DSpark sampling"
+            )
 
     def validate_dsv41_adaptive_dspark(self):
         if (
@@ -4349,6 +4390,15 @@ class ServerArgs:
         )
 
         # Speculative decoding
+        parser.add_argument(
+            "--enable-dp-local-cuda-graph",
+            action="store_true",
+            default=ServerArgs.enable_dp_local_cuda_graph,
+            help="Select decode CUDA graph capacities independently on attention-DP "
+            "ranks. Currently requires a supported DSPARK drafter, target and draft "
+            "MegaMoE, TP1 for attention/dense/MoE/LM head, and greedy or adaptive "
+            "DSpark sampling.",
+        )
         parser.add_argument(
             "--enable-dsv41-adaptive-dspark",
             action="store_true",
