@@ -784,10 +784,8 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
                 .map_err(|error| python_error(py, error))
         })?;
     }
-    // With a pool the loop takes in requests while a forward's results are
-    // awaited, so the data plane watches the forwards land.
-    let data_plane = PythonDataPlane::start(data_plane, peers.streams, pool.is_some())
-        .map_err(HostError::DataPlane)?;
+    let data_plane =
+        PythonDataPlane::start(data_plane, peers.streams).map_err(HostError::DataPlane)?;
     let metrics = exporter
         .as_ref()
         .filter(|_| config.metrics.engine)

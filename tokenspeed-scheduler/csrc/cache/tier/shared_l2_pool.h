@@ -22,7 +22,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <map>
 #include <optional>
 #include <span>
@@ -43,16 +42,11 @@ struct SharedL2PoolTestAccess;
 // eviction) over pages it names but holds no bytes of. Ranks are its clients.
 // A client pins what a lookup hit until it releases the ticket, and reserves
 // the pages it writes until it commits them; both end with the client
-// (Disconnect). A client never retries a lookup or a write: it abandons the
-// one it gave up on, by the id it chose for it, and every call that ends
-// something (Release, AbandonLookup, AbandonWrite) can be repeated.
+// (Disconnect).
 class SharedL2Pool {
 public:
     using ClientId = std::uint64_t;
     using Ticket = std::uint64_t;
-    // The abandoned lookups, and writes, a client's entry remembers until the
-    // call they abandon arrives.
-    static constexpr std::size_t kMaxAbandoned = 4096;
 
     // A pool page: `page` is the block id in the pool's Host layout of the
     // key's group, `bucket` the shard it lies in (always 0 until the pool
@@ -74,9 +68,9 @@ public:
         std::vector<Slot> slots;
     };
     // A page, or why there is none. kHeld does not tell a key the pool holds
-    // from one another client is writing: if that write is abandoned the key
-    // is in neither state, and a client answered kHeld for it offers it again
-    // only when a request that published it finishes.
+    // from one another client is writing: if that client leaves before it
+    // commits, the key is in neither state, and a client answered kHeld for it
+    // offers it again only when a request that published it finishes.
     static constexpr std::int32_t kHeld = -1;    // the pool holds it or another client is writing it
     static constexpr std::int32_t kNoSlot = -2;  // every slot is pinned or reserved
     // Aligned with the requested keys: the page to write, or why there is
@@ -109,19 +103,14 @@ public:
     SharedL2Pool(const SharedL2Pool&) = delete;
     SharedL2Pool& operator=(const SharedL2Pool&) = delete;
 
-    // The prompt carries its tokens up to max_tokens. A lookup abandoned
-    // before it arrived hits nothing.
-    Hit Probe(ClientId client, std::uint64_t lookup_id, const CacheCoordinator::PromptPrefix& prompt);
+    // The prompt carries its tokens up to max_tokens.
+    Hit Probe(ClientId client, const CacheCoordinator::PromptPrefix& prompt);
     void Release(ClientId client, Ticket ticket);
-    // Releases what the lookup pinned; one not seen yet is remembered.
-    void AbandonLookup(ClientId client, std::uint64_t lookup_id);
     // A key the pool holds, one another write reserved or a repeated one gets
     // no page (kHeld). The keys the pool holds are refreshed, as a rank's
     // Device publication refreshes its own Host copies, before pages are
-    // taken for the others: the reservation does not evict them. A write
-    // abandoned before it arrived reserves nothing.
-    Reservation Reserve(ClientId client, std::uint64_t write_id, std::span<const CacheKey> keys,
-                        std::span<const std::int32_t> buckets);
+    // taken for the others: the reservation does not evict them.
+    Reservation Reserve(ClientId client, std::span<const CacheKey> keys, std::span<const std::int32_t> buckets);
     // Publishes a reservation's blocks, with the lineage of the checkpoints
     // whose State block is among them, in a Device publication's order: each
     // checkpoint's boundary is linked, the blocks are registered, then the
@@ -131,9 +120,6 @@ public:
     // ranking (CheckpointTree). False, with no change, for a ticket that
     // reserves nothing (any more).
     bool Commit(ClientId client, Ticket ticket, std::span<const CheckpointTree::Lineage> checkpoints);
-    // Frees an uncommitted write's pages and keys; one not seen yet is
-    // remembered.
-    void AbandonWrite(ClientId client, std::uint64_t write_id);
     void Touch(std::span<const CacheKey> keys);
     // Ends everything the client holds. The pool keeps no list of clients: a
     // call under this id afterwards starts it anew, so the service in front
@@ -154,8 +140,7 @@ private:
     // unless a commit registered them.
     class Write {
     public:
-        Write(std::unordered_set<CacheKey, CacheKeyHash>& writing, std::uint64_t write_id)
-            : writing_{&writing}, write_id_{write_id} {}
+        explicit Write(std::unordered_set<CacheKey, CacheKeyHash>& writing) : writing_{&writing} {}
         Write(const Write&) = delete;
         Write& operator=(const Write&) = delete;
         Write(Write&&) noexcept = default;
@@ -171,29 +156,20 @@ private:
             keys_.push_back(key);
             blocks_.push_back(std::move(block));
         }
-        std::uint64_t Id() const noexcept { return write_id_; }
         std::span<const CacheKey> Keys() const noexcept { return keys_; }
         std::span<CacheBlockRef> Blocks() noexcept { return blocks_; }
 
     private:
         std::unordered_set<CacheKey, CacheKeyHash>* writing_;
-        std::uint64_t write_id_;
         std::vector<CacheKey> keys_;
         std::vector<CacheBlockRef> blocks_;
     };
-    struct Lookup {
-        std::uint64_t lookup_id{0};
-        std::vector<CacheBlockRef> pins;
-    };
     struct Client {
-        std::map<Ticket, Lookup> lookups;
+        // The blocks each lookup pinned.
+        std::map<Ticket, std::vector<CacheBlockRef>> lookups;
         std::map<Ticket, Write> writes;
-        // Abandoned before the probe or the reservation arrived, oldest first.
-        std::deque<std::uint64_t> abandoned_lookups;
-        std::deque<std::uint64_t> abandoned_writes;
     };
 
-    static void rememberAbandoned(std::deque<std::uint64_t>& abandoned, std::uint64_t id);
     void validateKeys(std::span<const CacheKey> keys) const;
     void keepHeadroom();
 

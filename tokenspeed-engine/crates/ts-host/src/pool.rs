@@ -23,16 +23,16 @@
 //! pool's owner.
 //!
 //! The control thread makes every call, taking the GIL for the call. The
-//! adapter only hands work to the client's threads and reads what they
-//! finished; with `awaited` lookups its poll waits, without the GIL.
-
-use std::time::Duration;
+//! adapter's `lookup` sends one request to the owner and waits for the
+//! reply, without the GIL; its other calls hand work to the client's
+//! threads and read what they finished. A call that raises is the client's
+//! failure.
 
 use pyo3::{prelude::*, types::PyBytes};
-use ts_control::shared_l2::{ClientStats, Polled, PoolClient, PoolError};
+use ts_control::shared_l2::{PoolClient, PoolError};
 use ts_scheduler::{
     profile, SharedL2AnswerView, SharedL2KeyView, SharedL2LookupView, SharedL2OpKind,
-    SharedL2OpView, SharedL2PageView, SharedL2WriteDoneView,
+    SharedL2OpView, SharedL2PageView,
 };
 
 use crate::data_plane::describe;
@@ -84,8 +84,11 @@ impl PythonPoolClient {
 }
 
 impl PoolClient for PythonPoolClient {
-    fn submit_lookups(&mut self, lookups: &[SharedL2LookupView]) -> Result<(), PoolError> {
-        self.call(|adapter| {
+    fn lookup(
+        &mut self,
+        lookups: &[SharedL2LookupView],
+    ) -> Result<Vec<SharedL2AnswerView>, PoolError> {
+        let answers: Vec<PyAnswer> = self.call(|adapter| {
             let py = adapter.py();
             let lookups = lookups
                 .iter()
@@ -99,78 +102,57 @@ impl PoolClient for PythonPoolClient {
                     ))
                 })
                 .collect::<PyResult<Vec<_>>>()?;
-            adapter.call_method1("submit_lookups", (lookups,)).map(drop)
-        })
+            adapter.call_method1("lookup", (lookups,))?.extract()
+        })?;
+        Ok(answers
+            .into_iter()
+            .map(|(lookup_id, ticket, num_tokens, kv_tokens, tail, slots)| {
+                let (tail_tokens, tail_hash) = tail.unwrap_or_default();
+                SharedL2AnswerView {
+                    lookup_id,
+                    ticket,
+                    num_tokens,
+                    kv_tokens,
+                    tail_tokens,
+                    tail_hash,
+                    buckets: slots.iter().map(|(_, bucket, _)| *bucket).collect(),
+                    pages: slots.iter().map(|(_, _, page)| *page).collect(),
+                    keys: slots
+                        .into_iter()
+                        .map(
+                            |((namespace_id, group_id, content_hash, page_offset), _, _)| {
+                                SharedL2KeyView {
+                                    namespace_id,
+                                    group_id,
+                                    content_hash,
+                                    page_offset,
+                                }
+                            },
+                        )
+                        .collect(),
+                }
+            })
+            .collect())
     }
 
-    fn poll(
-        &mut self,
-        awaited: &[u64],
-        wait: Duration,
-        tickets: &[u64],
-    ) -> Result<Polled, PoolError> {
-        let (answers, writes, lease_lost): (Vec<PyAnswer>, Vec<(u64, bool)>, bool) =
-            self.call(|adapter| {
-                adapter
-                    .call_method1(
-                        "poll",
-                        (awaited.to_vec(), wait.as_secs_f64(), tickets.to_vec()),
-                    )?
-                    .extract()
-            })?;
-        Ok(Polled {
-            answers: answers
-                .into_iter()
-                .map(|(lookup_id, ticket, num_tokens, kv_tokens, tail, slots)| {
-                    let (tail_tokens, tail_hash) = tail.unwrap_or_default();
-                    SharedL2AnswerView {
-                        lookup_id,
-                        ticket,
-                        num_tokens,
-                        kv_tokens,
-                        tail_tokens,
-                        tail_hash,
-                        buckets: slots.iter().map(|(_, bucket, _)| *bucket).collect(),
-                        pages: slots.iter().map(|(_, _, page)| *page).collect(),
-                        keys: slots
-                            .into_iter()
-                            .map(
-                                |((namespace_id, group_id, content_hash, page_offset), _, _)| {
-                                    SharedL2KeyView {
-                                        namespace_id,
-                                        group_id,
-                                        content_hash,
-                                        page_offset,
-                                    }
-                                },
-                            )
-                            .collect(),
-                    }
-                })
-                .collect(),
-            writes: writes
-                .into_iter()
-                .map(|(write_id, success)| SharedL2WriteDoneView { write_id, success })
-                .collect(),
-            lease_lost,
-        })
+    fn poll(&mut self) -> Result<Vec<u64>, PoolError> {
+        self.call(|adapter| adapter.call_method0("poll")?.extract())
     }
 
-    fn map_pages(&mut self, ticket: u64, pages: &[SharedL2PageView]) -> Result<(), PoolError> {
+    fn map_pages(&mut self, pages: &[SharedL2PageView]) -> Result<(), PoolError> {
         self.call(|adapter| {
             let pages: Vec<_> = pages
                 .iter()
                 .map(|page| (page.group_id, page.block, page.bucket, page.page))
                 .collect();
-            adapter.call_method1("map_pages", (ticket, pages)).map(drop)
+            adapter.call_method1("map_pages", (pages,)).map(drop)
         })
     }
 
     fn submit(&mut self, commands: &[SharedL2OpView]) -> Result<(), PoolError> {
         self.call(|adapter| {
             let py = adapter.py();
-            let (mut writes, mut releases, mut touches, mut abandons) =
-                (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            let (mut writes, mut releases, mut touches) = (Vec::new(), Vec::new(), Vec::new());
             for command in commands {
                 let keys = || -> Vec<PyKey> {
                     command
@@ -212,7 +194,6 @@ impl PoolClient for PythonPoolClient {
                     }
                     SharedL2OpKind::Release => releases.push(command.id),
                     SharedL2OpKind::Touch => touches.push(keys()),
-                    SharedL2OpKind::Abandon => abandons.push(command.id),
                     kind => {
                         return Err(pyo3::exceptions::PyValueError::new_err(format!(
                             "no adapter call for the pool command {kind:?}"
@@ -221,18 +202,8 @@ impl PoolClient for PythonPoolClient {
                 }
             }
             adapter
-                .call_method1("submit", (writes, releases, touches, abandons))
+                .call_method1("submit", (writes, releases, touches))
                 .map(drop)
-        })
-    }
-
-    fn stats(&mut self) -> Result<ClientStats, PoolError> {
-        let (lookup_timeouts, dropped_write_blocks, no_pool) =
-            self.call(|adapter| adapter.call_method0("stats")?.extract())?;
-        Ok(ClientStats {
-            lookup_timeouts,
-            dropped_write_blocks,
-            no_pool,
         })
     }
 }

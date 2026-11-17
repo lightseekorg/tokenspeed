@@ -28,8 +28,8 @@ use pyo3::{prelude::*, types::PyDict};
 use ts_scheduler::{
     profile, BlockTableView, CacheEvent, CacheEventKind, CacheOpKind, ForwardEvent,
     ForwardEventKind, RequestSpec, Scheduler, SharedL2AnswerView, SharedL2KeyView,
-    SharedL2LookupView, SharedL2OpKind, SharedL2WriteDoneView, StorageCancellationView,
-    StorageDoneView, StorageOpKind, StorageRound, StorageTickView, TransferBatchView,
+    SharedL2LookupView, SharedL2OpKind, StorageCancellationView, StorageDoneView, StorageOpKind,
+    StorageRound, StorageTickView, TransferBatchView,
 };
 
 /// Start the interpreter once per test process, with the scheduler module
@@ -1540,15 +1540,7 @@ fn a_pool_prompt_waits_for_its_lookup_and_resumes_behind_the_hit() {
         [(0, 0, 11), (0, 0, 12)]
     );
     let stats = scheduler.shared_l2_stats();
-    assert_eq!(
-        (
-            stats.lookups,
-            stats.hits,
-            stats.pending_lookups,
-            stats.tickets
-        ),
-        (1, 1, 0, 1)
-    );
+    assert_eq!((stats.lookups, stats.hits, stats.tickets), (1, 1, 1));
 
     // The prompt resumes behind the hit, which a load-back reads from the
     // proxy blocks.
@@ -1626,106 +1618,76 @@ fn a_pool_write_ends_with_its_completion() {
     assert_eq!(scheduler.shared_l2_stats().writes_in_flight, 1);
     assert!(!scheduler.can_clear_cache());
 
-    // Its completion joins the head batch; one the scheduler does not know
-    // is ignored.
+    // Its completion joins the head batch and lets its blocks go; a
+    // completion of a write that is not in flight is an error.
     scheduler
-        .advance_head(
-            &StorageRound::default(),
-            &[],
-            &[
-                SharedL2WriteDoneView {
-                    write_id: write.id,
-                    success: false,
-                },
-                SharedL2WriteDoneView {
-                    write_id: write.id + 100,
-                    success: true,
-                },
-            ],
-        )
+        .advance_head(&StorageRound::default(), &[], &[write.id])
         .unwrap();
-    let stats = scheduler.shared_l2_stats();
-    assert_eq!(
-        (
-            stats.writes_in_flight,
-            stats.failed_writes,
-            stats.failed_write_blocks
-        ),
-        (0, 1, 4)
-    );
+    assert_eq!(scheduler.shared_l2_stats().writes_in_flight, 0);
+    let error = scheduler
+        .advance_head(&StorageRound::default(), &[], &[write.id])
+        .unwrap_err();
+    assert!(error.what().contains("unknown shared L2 write"), "{error}");
 }
 
 #[test]
-fn pool_lookups_and_hits_can_be_given_up() {
+fn an_answer_the_scheduler_cannot_take_is_an_error() {
     interpreter();
     let mut scheduler =
         Python::attach(|py| Scheduler::from_python(&run(py, POOL_SCHEDULER)).unwrap());
     scheduler
         .submit_requests(&[
-            spec("refused", (1..=7).collect()),
+            spec("missed", (1..=7).collect()),
             spec("hit", (11..=17).collect()),
-            spec("gone", (21..=27).collect()),
         ])
         .unwrap();
     let lookups = scheduler.shared_l2_lookups();
-    let [refused, hit, gone] = &lookups[..] else {
-        panic!("three lookups, got {lookups:?}");
+    let [missed, hit] = &lookups[..] else {
+        panic!("two lookups, got {lookups:?}");
     };
 
-    // An answer that does not fit its prompt is an error, not an abort, and
-    // leaves the lookup open; given up, it counts as a miss.
-    let mut misfit = pool_answer(refused, 3, 1);
+    // An answer that does not fit its prompt is an error, and so is one the
+    // proxy cannot mirror: nothing of either is kept.
+    let mut misfit = pool_answer(hit, 3, 1);
     misfit.num_tokens = 3;
     let error = scheduler.apply_shared_l2_lookup(&misfit).unwrap_err();
     assert!(error.what().contains("outside the prompt"), "{error}");
-    assert_eq!(scheduler.shared_l2_stats().pending_lookups, 3);
-    // So is one the proxy cannot mirror: nothing of it is kept either.
-    let mut unhashed = pool_answer(refused, 3, 1);
+    let mut unhashed = pool_answer(hit, 3, 1);
     unhashed.keys[0].content_hash.clear();
     let error = scheduler.apply_shared_l2_lookup(&unhashed).unwrap_err();
     assert!(error.what().contains("names keys"), "{error}");
-    let stats = scheduler.shared_l2_stats();
-    assert_eq!(
-        (stats.pending_lookups, stats.hits, stats.tickets),
-        (3, 0, 0)
+    // A tail is its tokens and its hash: a hash without tokens is refused.
+    let mut tokenless_tail = pool_answer(hit, 3, 1);
+    tokenless_tail.tail_hash = hit.prefix_hashes[0].clone();
+    let error = scheduler
+        .apply_shared_l2_lookup(&tokenless_tail)
+        .unwrap_err();
+    assert!(
+        error.what().contains("tail lies strictly inside"),
+        "{error}"
     );
-    scheduler
-        .abandon_shared_l2_lookups(&[refused.lookup_id])
-        .unwrap();
+    let stats = scheduler.shared_l2_stats();
+    assert_eq!((stats.hits, stats.tickets), (0, 0));
+    // No plan runs a prompt whose lookup has no answer.
+    assert!(!scheduler.next_execution_plan(true, false).needs_device());
 
-    // A hit no plan admitted yet is given up when the runtime may no longer
-    // load from the pool.
+    // A miss and a hit settle their lookups; a second answer to a lookup
+    // names none that waits.
+    assert!(scheduler
+        .apply_shared_l2_lookup(&pool_answer(missed, 0, 0))
+        .unwrap()
+        .is_empty());
     scheduler
         .apply_shared_l2_lookup(&pool_answer(hit, 5, 2))
         .unwrap();
-    scheduler.set_shared_l2_lease_lost(true).unwrap();
-    scheduler.set_shared_l2_lease_lost(true).unwrap();
-    assert_eq!(scheduler.shared_l2_stats().lease_expired_hits, 1);
-
-    // A request that leaves before its answer abandons its lookup itself.
-    scheduler
-        .advance(&[event(ForwardEventKind::Abort, "gone", vec![])])
-        .unwrap();
-
+    let error = scheduler
+        .apply_shared_l2_lookup(&pool_answer(hit, 6, 2))
+        .unwrap_err();
+    assert!(error.what().contains("no lookup that waits"), "{error}");
     let plan = scheduler.next_execution_plan(true, false);
     let batch = &plan.forward_batches()[0];
-    assert_eq!(batch.request_ids, ["refused", "hit"]);
-    assert_eq!(batch.extend_prefix_lens, [0, 0]);
-    assert!(plan.cache_ops().is_empty());
-    let mut told: Vec<_> = plan
-        .shared_l2_ops()
-        .iter()
-        .map(|op| (op.kind, op.id))
-        .collect();
-    told.sort_by_key(|(kind, id)| (kind.repr, *id));
-    assert_eq!(
-        told,
-        [
-            (SharedL2OpKind::Release, 5),
-            (SharedL2OpKind::Abandon, refused.lookup_id),
-            (SharedL2OpKind::Abandon, gone.lookup_id),
-        ]
-    );
+    assert_eq!(batch.request_ids, ["missed", "hit"]);
+    assert_eq!(batch.extend_prefix_lens, [0, 4]);
 }
 
 #[test]
@@ -1738,6 +1700,11 @@ fn a_plan_of_pool_commands_alone_needs_no_device() {
         .unwrap();
     let lookup = scheduler.shared_l2_lookups().remove(0);
     scheduler
+        .apply_shared_l2_lookup(&pool_answer(&lookup, 7, 2))
+        .unwrap();
+    // The request leaves before a plan admitted it: nothing holds the proxy
+    // blocks of its hit, and the next plan releases the ticket.
+    scheduler
         .advance(&[event(ForwardEventKind::Abort, "gone", vec![])])
         .unwrap();
     let plan = scheduler.next_execution_plan(true, false);
@@ -1746,7 +1713,7 @@ fn a_plan_of_pool_commands_alone_needs_no_device() {
             .iter()
             .map(|op| (op.kind, op.id))
             .collect::<Vec<_>>(),
-        [(SharedL2OpKind::Abandon, lookup.lookup_id)]
+        [(SharedL2OpKind::Release, 7)]
     );
     // The pool's client runs them: the data plane gets nothing.
     assert!(!plan.needs_device());
@@ -1774,16 +1741,11 @@ fn without_a_pool_the_pool_calls_ask_nothing_and_fail_as_errors() {
         buckets: Vec::new(),
         pages: Vec::new(),
     };
-    for error in [
-        scheduler.apply_shared_l2_lookup(&answer).unwrap_err(),
-        scheduler.abandon_shared_l2_lookups(&[1]).unwrap_err(),
-        scheduler.set_shared_l2_lease_lost(true).unwrap_err(),
-    ] {
-        assert!(
-            error.what().contains("without a configured pool"),
-            "{error}"
-        );
-    }
+    let error = scheduler.apply_shared_l2_lookup(&answer).unwrap_err();
+    assert!(
+        error.what().contains("without a configured pool"),
+        "{error}"
+    );
     let plan = scheduler.next_execution_plan(true, false);
     assert_eq!(plan.forward_batches()[0].request_ids, ["plain"]);
     assert!(plan.shared_l2_ops().is_empty());

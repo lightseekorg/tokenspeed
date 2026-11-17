@@ -54,7 +54,6 @@ struct SharedL2LookupView;
 struct SharedL2AnswerView;
 struct SharedL2PageView;
 struct SharedL2OpView;
-struct SharedL2WriteDoneView;
 struct SharedL2StatsView;
 
 void submit_requests(tokenspeed::Scheduler& scheduler, rust::Slice<const RequestSpec> specs);
@@ -64,7 +63,7 @@ void advance(tokenspeed::Scheduler& scheduler, rust::Slice<const ForwardEvent> e
 void advance_head(tokenspeed::Scheduler& scheduler, rust::Slice<const StorageTickView> ticks,
                   rust::Slice<const StorageCancellationView> cancellations,
                   rust::Slice<const StorageDoneView> done, rust::Slice<const CacheEvent> cache_events,
-                  rust::Slice<const SharedL2WriteDoneView> pool_writes);
+                  rust::Slice<const std::uint64_t> pool_writes);
 std::size_t demote_sessions(tokenspeed::Scheduler& scheduler, rust::Slice<const rust::String> ids, bool ended);
 std::size_t demote_session(tokenspeed::Scheduler& scheduler, rust::Str session_id, bool ended);
 std::size_t demote_cache_groups(tokenspeed::Scheduler& scheduler, rust::Slice<const rust::String> ids, bool ended);
@@ -100,8 +99,6 @@ bool can_clear_cache(const tokenspeed::Scheduler& scheduler);
 std::int32_t max_single_request_tokens(const tokenspeed::Scheduler& scheduler);
 rust::Vec<SharedL2LookupView> shared_l2_lookups(tokenspeed::Scheduler& scheduler);
 rust::Vec<SharedL2PageView> apply_shared_l2_lookup(tokenspeed::Scheduler& scheduler, const SharedL2AnswerView& answer);
-void abandon_shared_l2_lookups(tokenspeed::Scheduler& scheduler, rust::Slice<const std::uint64_t> lookup_ids);
-void set_shared_l2_lease_lost(tokenspeed::Scheduler& scheduler, bool lost);
 SharedL2StatsView shared_l2_stats(const tokenspeed::Scheduler& scheduler);
 
 rust::Vec<ForwardBatchView> plan_forward_batches(const tokenspeed::ExecutionPlan& plan);

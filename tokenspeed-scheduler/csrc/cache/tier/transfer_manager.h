@@ -79,8 +79,8 @@ public:
     // (CheckpointTree::LineageOf); the owner chooses the pool pages. Counted
     // as publication stores.
     std::vector<SharedL2WriteOperation> StartPoolWrites(const SharedL2Config& limits);
-    // The runtime committed the write, or gave it up: either way its Device
-    // sources are let go. An unknown or duplicate id is a no-op.
+    // The runtime committed the write: its Device sources are let go. Throws
+    // std::invalid_argument for a write that is not in flight.
     void CompletePoolWrite(const cache::SharedL2WriteDone& event);
     // Drains the segments this plan's admissions and restores recorded under
     // the write-back policy (CacheCoordinator::TakeEvictedSegments) into one
@@ -225,11 +225,8 @@ public:
         return !write_backs_.empty() || !load_backs_.empty() || !snapshot_stores_.empty() ||
                !snapshot_restores_.empty() || !pool_writes_.empty();
     }
-    // Shared L2 pool writes not completed yet; the failed ones so far, and
-    // the blocks they carried.
+    // Shared L2 pool writes not completed yet.
     std::size_t NumPoolWritesInFlight() const { return pool_writes_.size(); }
-    std::uint64_t NumFailedPoolWrites() const { return failed_pool_writes_; }
-    std::uint64_t NumFailedPoolWriteBlocks() const { return failed_pool_write_blocks_; }
 
     // Cumulative Host L2 counters, never reset. Accounting only: no
     // scheduling decision reads them. What a drain takes lands in exactly one
@@ -371,8 +368,6 @@ private:
     std::unordered_map<std::uint32_t, InFlightSnapshotRestore> snapshot_restores_;
     std::unordered_map<std::uint64_t, InFlightPoolWrite> pool_writes_;
     std::uint64_t next_pool_write_id_{0};
-    std::uint64_t failed_pool_writes_{0};
-    std::uint64_t failed_pool_write_blocks_{0};
     std::uint32_t next_op_id_{0};
     // Indexed by HostStoreCause; every per-group vector is sized at construction.
     std::array<WriteBackStats, 4> write_back_stats_;

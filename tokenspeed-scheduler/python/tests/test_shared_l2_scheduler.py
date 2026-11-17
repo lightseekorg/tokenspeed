@@ -20,8 +20,8 @@
 
 """Prefill schedulers sharing one L2 pool as their Host L2. The test plays
 the runtime: it answers each scheduler's lookups and commands from a real
-SharedL2Pool and completes load-backs from the proxy Host tier, when it
-chooses to. No bytes move."""
+SharedL2Pool and completes load-backs and writes, when it chooses to. No
+bytes move."""
 
 from __future__ import annotations
 
@@ -104,7 +104,7 @@ class Runtime:
         self.complete_loads = complete_loads
         self.complete_writes = complete_writes
         self.lookups, self.loads, self.writes, self.touched = [], [], [], []
-        self.released, self.abandoned = [], []
+        self.released = []
         self.forwarded = []
         # (group, proxy Host block) -> the pool page a load from it reads.
         self.pages = {}
@@ -115,7 +115,7 @@ class Runtime:
         lookup_id, _, hashes, tokens, max_tokens = lookup
         return (
             lookup_id,
-            *self.pool.probe(self.client, lookup_id, hashes, tokens, max_tokens),
+            *self.pool.probe(self.client, hashes, tokens, max_tokens),
         )
 
     def apply(self, s, answers):
@@ -128,7 +128,7 @@ class Runtime:
         self.apply(s, [self.answer(lookup) for lookup in lookups])
 
     def write(self, op):
-        ticket, pages = self.pool.reserve(self.client, op.write_id, op.keys, op.buckets)
+        ticket, pages = self.pool.reserve(self.client, op.keys, op.buckets)
         self.pool.commit(self.client, ticket, op.publications)
         return ticket, pages
 
@@ -159,15 +159,12 @@ class Runtime:
                 self.writes.append(op)
                 if self.complete_writes:
                     self.write(op)
-                    e.add_event(ts.Cache.SharedL2WriteDone(op.write_id, True))
+                    e.add_event(ts.Cache.SharedL2WriteDone(op.write_id))
                 else:
                     self.open_writes.append(op)
             elif isinstance(op, ts.Cache.SharedL2TouchOp):
                 self.touched.extend(op.keys)
                 self.pool.touch(op.keys)
-            elif isinstance(op, ts.Cache.SharedL2AbandonOp):
-                self.abandoned.append(op.lookup_id)
-                self.pool.abandon_lookup(self.client, op.lookup_id)
             else:
                 raise AssertionError(f"unexpected cache operation {op}")
         if self.complete_loads:
@@ -182,13 +179,12 @@ class Runtime:
         self.open_loads = []
         return event
 
-    def finish_writes(self, success=True):
-        """Carries out (or gives up) the writes left open and reports them."""
+    def finish_writes(self):
+        """Carries out the writes left open and reports them."""
         event = ts.ExecutionEvent()
         for op in self.open_writes:
-            if success:
-                self.write(op)
-            event.add_event(ts.Cache.SharedL2WriteDone(op.write_id, success))
+            self.write(op)
+            event.add_event(ts.Cache.SharedL2WriteDone(op.write_id))
         self.open_writes = []
         return event
 
@@ -216,8 +212,7 @@ def settled(s, pool):
     """Nothing of the rank is left at the pool or in its proxy."""
     stats = s.shared_l2_stats()
     return (
-        stats.pending_lookups == 0
-        and stats.tickets == 0
+        stats.tickets == 0
         and stats.writes_in_flight == 0
         and s.host_pool_cached_blocks() == 0
         and pool.stats()["pinned_blocks"] == 0
@@ -275,7 +270,6 @@ def test_a_waiting_prompt_is_admitted_only_after_its_lookup():
     for _ in range(3):
         reader_rt.plan(reader, lookup=False)
     assert "b" not in reader_rt.forwarded
-    assert reader.shared_l2_stats().pending_lookups == 1
     reader_rt.apply(reader, [reader_rt.answer(lookup)])
     [batch] = [b for b in reader_rt.plan(reader).forward if "b" in b.request_ids]
     assert list(batch.extend_prefix_lens) == [len(prompt)]
@@ -306,7 +300,7 @@ def test_the_pool_pins_a_hit_until_its_load_completes():
     assert settled(reader, pool)
 
 
-def test_a_request_gone_before_admission_gives_its_lookup_up():
+def test_a_request_gone_before_admission_lets_its_hit_go():
     pool = owner()
     writer, reader = scheduler(), scheduler()
     writer_rt, reader_rt = Runtime(pool, 1), Runtime(pool, 2)
@@ -325,26 +319,21 @@ def test_a_request_gone_before_admission_gives_its_lookup_up():
     abort("b")
     for _ in range(2):
         reader_rt.plan(reader)
-    assert len(reader_rt.released) == 1 and not reader_rt.abandoned
+    assert len(reader_rt.released) == 1
     assert settled(reader, pool)
 
-    # Not answered yet: the lookup is abandoned, and its late answer dropped.
+    # Gone between its lookup and the answer, which a runtime that answers a
+    # lookup in the call that sent it never sees: the answer names no lookup
+    # that waits, and is refused.
     reader.submit_requests([_spec("c", prompt + [60, 61])])
     [lookup] = reader.shared_l2_lookups()
     late = reader_rt.answer(lookup)
-    assert pool.stats()["pinned_blocks"] == 6
     abort("c")
     reader_rt.plan(reader)
-    assert reader_rt.abandoned == [lookup[0]]
-    assert pool.stats()["pinned_blocks"] == 0
-    assert reader.apply_shared_l2_lookups([late]) == []
-    reader_rt.plan(reader)
-    # Its ticket comes back too: the abandon may have overtaken the probe.
-    assert reader_rt.released[-1] == late[1]
+    with pytest.raises(ValueError, match="no lookup that waits"):
+        reader.apply_shared_l2_lookups([late])
     assert "b" not in reader_rt.forwarded and "c" not in reader_rt.forwarded
-    assert not reader_rt.loads
-    assert settled(reader, pool)
-    assert reader.shared_l2_stats().abandoned_lookups == 1
+    assert not reader_rt.loads and reader.host_pool_cached_blocks() == 0
 
 
 def test_prompts_sharing_a_pool_prefix_both_resume_from_it():
@@ -541,7 +530,7 @@ def test_kv_events_report_the_pages_a_rank_holds_on_its_device():
     assert stored_blocks(reader) == {(0, 1), (2, 3), (4, 5), (6, 7), (8, 50), (51,)}
 
 
-def test_an_answer_outside_its_prompt_is_refused_and_can_be_given_up():
+def test_an_answer_outside_its_prompt_is_refused():
     pool = owner()
     writer, reader = scheduler(), scheduler()
     writer_rt, reader_rt = Runtime(pool, 1), Runtime(pool, 2)
@@ -559,14 +548,11 @@ def test_an_answer_outside_its_prompt_is_refused_and_can_be_given_up():
         reader.apply_shared_l2_lookups(
             [(lookup_id, 0, num_tokens, kv_tokens, tail, slots)]
         )
-    # The lookup still waits; the runtime gives it up, and the owner frees
-    # what the probe pinned.
-    assert reader.shared_l2_stats().pending_lookups == 1
-    reader.abandon_shared_l2_lookups([lookup_id])
-    for _ in range(2):
-        reader_rt.plan(reader)
-    assert "b" in reader_rt.forwarded and reader_rt.abandoned == [lookup_id]
-    assert pool.stats()["pinned_blocks"] == 0
+    # Nothing of either answer was taken, and no plan runs the prompt.
+    assert reader.shared_l2_stats().hits == 0
+    assert reader.host_pool_cached_blocks() == 0
+    reader_rt.plan(reader, lookup=False)
+    assert "b" not in reader_rt.forwarded
 
 
 def test_a_cold_pool_leaves_the_request_to_ordinary_admission():
@@ -720,43 +706,8 @@ def test_writes_left_open_pin_no_more_than_their_bound_and_admissions_go_on():
     assert settled(s, pool)
 
 
-def test_a_lookup_the_runtime_gives_up_counts_as_a_miss():
-    pool = owner()
-    writer, reader = scheduler(), scheduler()
-    writer_rt, reader_rt = Runtime(pool, 1), Runtime(pool, 2)
-    prompt = list(range(9))
-    publish(writer, writer_rt, "a", prompt)
-
-    reader.submit_requests([_spec("b", prompt + [50, 51])])
-    [lookup] = reader.shared_l2_lookups()
-    reader_rt.plan(reader, lookup=False)
-    assert "b" not in reader_rt.forwarded
-    # The owner did not answer in time.
-    reader.abandon_shared_l2_lookups([lookup[0]])
-    reader.abandon_shared_l2_lookups([lookup[0]])
-    plan = reader_rt.plan(reader, lookup=False)
-    [batch] = [b for b in plan.forward if "b" in b.request_ids]
-    # The prompt computes from its start, and the owner is told to forget
-    # the lookup.
-    assert list(batch.extend_prefix_lens) == [0]
-    assert reader_rt.abandoned == [lookup[0]]
-    _advance(reader, "b", [1000])
-    # The answer arrives after all: nothing waits for it.
-    late = reader_rt.answer(lookup)
-    assert late[1] == 0, "the pool was told before the probe arrived"
-    assert reader.apply_shared_l2_lookups([late]) == []
-    for _ in range(3):
-        reader_rt.plan(reader)
-    assert not reader_rt.loads and not reader_rt.released
-    assert settled(reader, pool)
-    stats = reader.shared_l2_stats()
-    assert (stats.lookups, stats.hits, stats.abandoned_lookups) == (1, 0, 1)
-
-
 @pytest.mark.parametrize("flaw", ["key hash", "tail hash", "tail tokens"])
-def test_a_malformed_answer_is_refused_and_its_lookup_stays_pending(
-    flaw,
-):
+def test_a_malformed_answer_is_refused(flaw):
     pool = owner()
     writer, reader = scheduler(), scheduler()
     writer_rt, reader_rt = Runtime(pool, 1), Runtime(pool, 2)
@@ -779,204 +730,9 @@ def test_a_malformed_answer_is_refused_and_its_lookup_stays_pending(
         reader.apply_shared_l2_lookups(
             [(lookup_id, ticket, num_tokens, kv_tokens, tail, slots)]
         )
-    # Nothing of the answer was taken: the lookup is still open, so the
-    # runtime can give it up, and the prompt computes.
-    assert reader.shared_l2_stats().pending_lookups == 1
+    # Nothing of the answer was taken.
     assert reader.shared_l2_stats().hits == 0
     assert reader.host_pool_cached_blocks() == 0
-    reader.abandon_shared_l2_lookups([lookup_id])
-    [batch] = reader_rt.plan(reader, lookup=False).forward
-    assert list(batch.extend_prefix_lens) == [0]
-    assert reader_rt.abandoned == [lookup_id] and not reader_rt.loads
-    # The runtime releases the ticket of the answer it could not hand over.
-    pool.release(2, ticket)
-    assert settled(reader, pool)
-
-
-def test_a_miss_the_runtime_makes_up_admits_the_prompt_too():
-    pool = owner()
-    writer, reader = scheduler(), scheduler()
-    writer_rt, reader_rt = Runtime(pool, 1), Runtime(pool, 2)
-    prompt = list(range(9))
-    publish(writer, writer_rt, "a", prompt)
-
-    reader.submit_requests([_spec("b", prompt + [50, 51])])
-    [lookup] = reader.shared_l2_lookups()
-    # The runtime answers for the owner: a miss. Its client then abandons
-    # the lookup at the owner itself; the scheduler takes it as answered.
-    assert reader.apply_shared_l2_lookups([(lookup[0], 0, 0, 0, None, [])]) == []
-    [batch] = [b for b in reader_rt.plan(reader, lookup=False).forward]
-    assert list(batch.extend_prefix_lens) == [0] and not reader_rt.abandoned
-    _advance(reader, "b", [1000])
-    # The owner's answer comes after all, with pages pinned: the scheduler
-    # gives its ticket back.
-    late = reader_rt.answer(lookup)
-    assert late[1] != 0 and pool.stats()["pinned_blocks"] == 6
-    assert reader.apply_shared_l2_lookups([late]) == []
-    reader_rt.plan(reader)
-    assert reader_rt.released == [late[1]]
-    for _ in range(2):
-        reader_rt.plan(reader)
-    assert settled(reader, pool)
-
-
-def test_hits_the_runtime_gives_up_before_admission_are_computed_instead():
-    pool = owner()
-    writer, reader = scheduler(), scheduler()
-    writer_rt, reader_rt = Runtime(pool, 1), Runtime(pool, 2)
-    prompt = list(range(9))
-    publish(writer, writer_rt, "a", prompt)
-
-    reader.submit_requests(
-        [_spec("b", prompt + [50, 51]), _spec("c", [70, 71, 72, 73, 74])]
-    )
-    hit, miss, pending = (
-        _spec("d", prompt + [60]),
-        _spec("e", [80, 81, 82, 83]),
-        _spec("f", prompt + [61]),
-    )
-    reader_rt.lookup(reader)
-    reader.submit_requests([hit, miss])
-    reader_rt.lookup(reader)
-    reader.submit_requests([pending])
-    [open_lookup] = reader.shared_l2_lookups()
-    # Two hits wait for admission, on the same proxy entries; two prompts
-    # missed, and one lookup is not answered yet.
-    assert pool.stats()["pinned_blocks"] == 6
-    assert reader.host_pool_cached_blocks() == 6
-    # The rank's lease on the pins ran out before any plan admitted them.
-    reader.set_shared_l2_lease_lost(True)
-    assert reader.shared_l2_stats().lease_expired_hits == 2
-    assert reader.host_pool_cached_blocks() == 0
-    reader.set_shared_l2_lease_lost(True)
-    assert reader.shared_l2_stats().lease_expired_hits == 2
-    plan = reader_rt.plan(reader, lookup=False)
-    [batch] = plan.forward
-    # Every answered prompt computes from its start, in one chunk; the open
-    # lookup still gates its prompt.
-    assert sorted(batch.request_ids) == ["b", "c", "d", "e"]
-    assert list(batch.extend_prefix_lens) == [0] * 4
-    assert list(batch.input_lengths) == [11, 5, 10, 4]
-    assert not reader_rt.loads and len(reader_rt.released) == 2
-    assert pool.stats()["pinned_blocks"] == 0
-    reader_rt.apply(reader, [reader_rt.answer(open_lookup)])
-    for rid in batch.request_ids:
-        _advance(reader, rid, [1000])
-    # The lease stays lost until the runtime says otherwise: a hit applied
-    # meanwhile is not loaded either, and its entries go with its admission.
-    assert reader.host_pool_cached_blocks() == 6
-    plan = reader_rt.plan(reader, lookup=False)
-    [batch] = [b for b in plan.forward if "f" in b.request_ids]
-    assert batch.extend_prefix_lens[list(batch.request_ids).index("f")] == 0
-    assert not reader_rt.loads and len(reader_rt.released) == 3
-    assert reader.host_pool_cached_blocks() == 0
-    assert reader.shared_l2_stats().lease_expired_hits == 2
-    # A hit applied after the lease came back is used as before: the prompt
-    # resumes where the pool's checkpoint is and loads from the pool what the
-    # Device does not hold by now.
-    reader.set_shared_l2_lease_lost(False)
-    reader.submit_requests([_spec("g", prompt + [62])])
-    reader_rt.lookup(reader)
-    plan = reader_rt.plan(reader, lookup=False)
-    [batch] = [b for b in plan.forward if "g" in b.request_ids]
-    assert batch.extend_prefix_lens[list(batch.request_ids).index("g")] == len(prompt)
-    assert len(reader_rt.loads) == 1
-    assert reader.host_cache_stats().prefix_hits.host_hit_tokens > 0
-
-
-def test_a_lost_lease_starts_no_load_from_entries_a_load_in_flight_holds():
-    pool = owner()
-    writer, reader = scheduler(), scheduler()
-    writer_rt = Runtime(pool, 1)
-    reader_rt = Runtime(pool, 2, complete_loads=False)
-    prompt = list(range(9))
-    publish(writer, writer_rt, "a", prompt)
-
-    prefill(reader, reader_rt, "b", prompt + [50, 51])
-    reader.submit_requests([_spec("d", prompt + [60])])
-    reader_rt.lookup(reader)
-    # b's load-back is in flight, and d waits with a hit on the same proxy
-    # entries.
-    assert len(reader_rt.loads) == 1 and reader_rt.open_loads
-    assert reader.host_pool_cached_blocks() == 6
-    reader.set_shared_l2_lease_lost(True)
-    # The load in flight keeps its sources, so the entries stay; the next
-    # plan admits d and starts no load from them.
-    assert reader.host_pool_cached_blocks() == 6
-    assert reader.shared_l2_stats().lease_expired_hits == 1
-    plan = reader_rt.plan(reader, lookup=False)
-    [batch] = [b for b in plan.forward if "d" in b.request_ids]
-    assert batch.extend_prefix_lens[list(batch.request_ids).index("d")] == 0
-    assert len(reader_rt.loads) == 1
-    assert reader.host_cache_stats().prefix_hits.host_hit_tokens == len(prompt)
-    # Once the load lands its entries go, and the ticket with them.
-    reader.advance(reader_rt.finish_loads())
-    reader_rt.plan(reader, lookup=False)
-    assert len(reader_rt.released) == 2 and len(reader_rt.loads) == 1
-    assert settled(reader, pool)
-
-
-def test_a_lost_lease_drops_the_entries_of_a_load_that_landed_at_once():
-    pool = owner()
-    writer, reader = scheduler(), scheduler()
-    writer_rt = Runtime(pool, 1)
-    reader_rt = Runtime(pool, 2, complete_loads=False)
-    prompt = list(range(9))
-    publish(writer, writer_rt, "a", prompt)
-
-    prefill(reader, reader_rt, "b", prompt + [50, 51])
-    reader.advance(reader_rt.finish_loads())
-    # The load landed; no plan since has dropped its proxy entries.
-    assert reader.host_pool_cached_blocks() == 6
-    reader.submit_requests([_spec("d", prompt + [60])])
-    [lookup] = reader.shared_l2_lookups()
-    # The owner is gone: the runtime answers d's lookup as a miss and reports
-    # the lease lost. No prompt waits with a hit.
-    assert reader.apply_shared_l2_lookups([(lookup[0], 0, 0, 0, None, [])]) == []
-    reader.set_shared_l2_lease_lost(True)
-    assert reader.shared_l2_stats().lease_expired_hits == 0
-    assert reader.host_pool_cached_blocks() == 0
-    plan = reader_rt.plan(reader, lookup=False)
-    [batch] = [b for b in plan.forward if "d" in b.request_ids]
-    assert batch.extend_prefix_lens[list(batch.request_ids).index("d")] == 0
-    assert len(reader_rt.loads) == 1 and len(reader_rt.released) == 1
-    assert settled(reader, pool)
-
-
-def test_a_write_the_runtime_gives_up_releases_its_blocks():
-    pool = owner()
-    s, other = scheduler(), scheduler()
-    rt, other_rt = Runtime(pool, 1, complete_writes=False), Runtime(pool, 2)
-    prompt = list(range(9))
-    prefill(s, rt, "a", prompt)
-    _finish(s, "a")
-    rt.plan(s)
-    [op] = rt.open_writes
-    assert len(op.keys) == 6 and s.shared_l2_stats().writes_in_flight == 1
-    assert not s.can_clear_cache()
-    # The runtime reserved the pages, then lost the owner: it abandons the
-    # write there and reports it failed.
-    ticket, pages = pool.reserve(1, op.write_id, op.keys, op.buckets)
-    assert ticket and pool.stats()["reserved_blocks"] == 6
-    pool.abandon_write(1, op.write_id)
-    s.advance(rt.finish_writes(success=False))
-    assert pool.stats()["reserved_blocks"] == 0 and pool.stats()["cached_blocks"] == 0
-    stats = s.shared_l2_stats()
-    assert (stats.writes_in_flight, stats.failed_writes, stats.failed_write_blocks) == (
-        0,
-        1,
-        6,
-    )
-    # The blocks are not written again, and nothing is held: a flush is
-    # allowed, and another rank writes the same prefix.
-    for _ in range(3):
-        rt.plan(s)
-    assert len(rt.writes) == 1
-    assert settled(s, pool)
-    assert s.clear_cache()
-    publish(other, other_rt, "b", prompt)
-    assert pool.stats()["cached_blocks"] == 6
-    assert settled(other, pool)
 
 
 def test_a_finish_offers_its_entries_again_and_the_pool_takes_the_new_ones():
@@ -1005,9 +761,12 @@ def test_a_finish_offers_its_entries_again_and_the_pool_takes_the_new_ones():
     s.advance(_event_write_done(last.write_id))
     rt.plan(s)
     assert settled(s, pool)
+    # Only a write in flight has a completion.
+    with pytest.raises(ValueError, match="unknown shared L2 write"):
+        s.advance(_event_write_done(last.write_id))
 
 
 def _event_write_done(write_id):
     event = ts.ExecutionEvent()
-    event.add_event(ts.Cache.SharedL2WriteDone(write_id, True))
+    event.add_event(ts.Cache.SharedL2WriteDone(write_id))
     return event

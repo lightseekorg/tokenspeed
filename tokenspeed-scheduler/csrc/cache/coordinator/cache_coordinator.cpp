@@ -1270,7 +1270,7 @@ void CacheCoordinator::probeHostSuffix(const PromptPrefix& prompt, std::span<con
 
 CacheCoordinator::PrefixProbe CacheCoordinator::probePrefixWithOrder(const PromptPrefix& prompt,
                                                                      std::span<const std::size_t> match_order,
-                                                                     bool claim_partial, bool with_host) const {
+                                                                     bool claim_partial) const {
     _assert(prompt.prefix_hashes.size() <=
                 static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max() / prefix_granularity_),
             "prefix length exceeds int32 token range");
@@ -1287,10 +1287,7 @@ CacheCoordinator::PrefixProbe CacheCoordinator::probePrefixWithOrder(const Promp
     }
     const std::int32_t device_tokens = out.device.num_common_tokens;
     out.device_only_hit_tokens = device_tokens;
-    if (with_host) {
-        probeHostSuffix(prompt, *out.group_keys, match_order, device_tokens, /*extra_hits=*/nullptr, out.device,
-                        out.host);
-    }
+    probeHostSuffix(prompt, *out.group_keys, match_order, device_tokens, /*extra_hits=*/nullptr, out.device, out.host);
     if (out.host.num_common_tokens <= device_tokens) {
         // The Device alone resumes furthest. The Host tier keeps the Host's
         // KV reach: the junction still counts it, so a chunk cut there
@@ -1312,12 +1309,7 @@ PreparedPrefixKeys CacheCoordinator::PreparePrefixKeys(std::span<const std::stri
 
 CacheCoordinator::PrefixProbe CacheCoordinator::ProbePromptPrefix(const PromptPrefix& prompt) const {
     ProfileSpan profile_span{"CacheCoordinator::ProbePromptPrefix"};
-    return probePrefixWithOrder(prompt, match_order_, /*claim_partial=*/true, /*with_host=*/true);
-}
-
-CacheCoordinator::PrefixProbe CacheCoordinator::ProbeDevicePromptPrefix(const PromptPrefix& prompt) const {
-    ProfileSpan profile_span{"CacheCoordinator::ProbeDevicePromptPrefix"};
-    return probePrefixWithOrder(prompt, match_order_, /*claim_partial=*/true, /*with_host=*/false);
+    return probePrefixWithOrder(prompt, match_order_, /*claim_partial=*/true);
 }
 
 bool CacheCoordinator::EvictionStoresExtendPrefix(const PromptPrefix& prompt, const PrefixProbe& visible) const {

@@ -810,18 +810,18 @@ TEST_F(LoneRequestCompactionSuite, WaitsForTheQueuedPoolWritesOfThePagesItMoves)
     const BlockPool& pool = SchedulerTestAccess::Pool(*scheduler_);
     // The pool holds nothing: every lookup is a miss.
     const auto miss = [&] {
-        std::vector<std::uint64_t> lookups;
+        std::vector<SharedL2LookupResult> answers;
         for (const SharedL2Lookup& lookup : scheduler_->SharedL2Lookups()) {
-            lookups.push_back(lookup.lookup_id);
+            answers.push_back(SharedL2LookupResult{.lookup_id = lookup.lookup_id});
         }
-        scheduler_->AbandonSharedL2Lookups(lookups);
+        scheduler_->ApplySharedL2Lookups(answers);
     };
     // The runtime's round: the last plan's writes are done, then the plan.
     std::vector<std::uint64_t> writing;
     const auto next_plan = [&] {
         for (const std::uint64_t write_id : writing) {
             ExecutionEvent done;
-            done.With(cache::SharedL2WriteDone{.write_id = write_id, .success = true});
+            done.With(cache::SharedL2WriteDone{.write_id = write_id});
             scheduler_->Advance(std::move(done));
         }
         writing.clear();

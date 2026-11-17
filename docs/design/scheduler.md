@@ -115,39 +115,34 @@ every prefill rank shares: an owner process keeps the pool's index
 (`SharedL2Pool`, the Host L2 code over pages it holds no bytes of) and
 provider processes its bytes. `SharedL2Lookups()` hands the runtime each
 waiting prompt's lookup once, and none for a prompt whose Device prefix
-already covers what it may reuse. A `Submitted` prompt is absent from forward
-candidates until its lookup is settled: answered (`ApplySharedL2Lookups`), or
-given up by the runtime (`AbandonSharedL2Lookups`), which counts as a miss. No
-call waits for the owner. An answer becomes proxy Host entries, each standing
-for a pool page the owner pinned under the answer's ticket; from there
-admission, junction cuts and load-back are the Host L2 code, and the KV the
-answer reports past its checkpoint joins the Host tier's KV reach, so the
-first chunk is cut at that junction. The prompt's pre-admission state holds
-the lookup (`SharedL2LookupHold`): dropping it abandons a pending lookup at
-the owner and lets the proxy entries go, while a load-back the admission
-started holds its sources until its ACK. Each plan drops a ticket's proxy
-entries from its answer's last one back, up to the first one a waiting prompt
-or a load-back still holds, and releases the tickets left without an entry:
-an entry nothing holds stays while a later one of its ticket is held, and the
-owner keeps the ticket's pages pinned meanwhile. The scheduler mirrors the
-runtime's lease on the owner's pins (`SetSharedL2LeaseLost`), which the
-runtime reports whenever it has asked its client; the state stays until the
-next report. While the lease is lost no load may start from the pool, so a
-first admission probes the Device alone: it matches no proxy entry, including
-one a load-back in flight still holds.
-Each report of a lost lease also drops every hit a waiting prompt holds and,
-at once, every proxy entry nothing holds, whatever else its ticket still
-pins; those prompts compute their prefixes, and the entries a load-back holds
-go when it lands.
+already covers what it may reuse. Before a plan the runtime asks the owner
+about all of them in one request, waits for the reply and applies the answers
+(`ApplySharedL2Lookups`); a `Submitted` prompt is absent from forward
+candidates until its lookup is answered. An answer becomes proxy Host
+entries, each standing for a pool page the owner pinned under the answer's
+ticket; from there admission, junction cuts and load-back are the Host L2
+code, and the KV the answer reports past its checkpoint joins the Host tier's
+KV reach, so the first chunk is cut at that junction. A miss is an answer that
+names no page, and its prompt computes. An answer the scheduler cannot take
+(it names no lookup that waits, lies outside its prompt, or is malformed)
+throws, and the runtime stops serving. The prompt's pre-admission state holds
+the lookup (`SharedL2LookupHold`): dropping it lets the proxy entries go,
+while a load-back the admission started holds its sources until its ACK. Each
+plan drops a ticket's proxy entries from its answer's last one back, up to
+the first one a waiting prompt or a load-back still holds, and releases the
+tickets left without an entry: an entry nothing holds stays while a later one
+of its ticket is held, and the owner keeps the ticket's pages pinned
+meanwhile.
 Publications are written to the pool from the write-through store queue
 (`TierTransferManager::StartPoolWrites`): at most `max_writes` writes of
 `max_write_keys` blocks are in flight, and only those pin their Device
-sources, until the runtime reports each one done or failed; the rest wait as
-keys. A write carries the lineage of the State checkpoints among its blocks,
-which the owner's checkpoint retention ranks by. The runtime relays the
-plan's pool commands (write, release, touch, abandon) and none blocks it. The
-P and fused roles only, with replicated groups, no L3 and no snapshot pool: a
-shared L2 rank never retracts.
+sources, until the runtime reports each one done; the rest wait as keys. A
+write that fails stops the runtime. A write carries the lineage of the State
+checkpoints among its blocks, which the owner's checkpoint retention ranks
+by. The runtime relays the plan's pool commands (write, release, touch) to
+its pool client and none blocks it. The P and fused roles only, with
+replicated groups, no L3 and no snapshot pool: a shared L2 rank never
+retracts.
 
 A first admission with no free request-pool row skips prefix matching; with
 prefix caching, the prompt was hashed when it was submitted. This is a slot

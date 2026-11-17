@@ -351,12 +351,6 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
         if (config_.role == Role::kD) {
             return coordinator_.ProbeDecodeDevicePrefix(prompt, request->PrefillSize());
         }
-        // No load may start from a shared L2 pool while the lease on its pins
-        // is lost: a proxy entry still there (a load-back in flight holds it)
-        // is not matched.
-        if (shared_l2_ && shared_l2_->LeaseLost()) {
-            return coordinator_.ProbeDevicePromptPrefix(prompt);
-        }
         return coordinator_.ProbePromptPrefix(prompt);
     };
     AdmissionMatch match;

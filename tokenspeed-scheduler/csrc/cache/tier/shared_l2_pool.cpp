@@ -74,16 +74,11 @@ SharedL2Pool::SharedL2Pool(std::span<const CacheGroupSpec> specs, std::int32_t p
     }
 }
 
-SharedL2Pool::Hit SharedL2Pool::Probe(ClientId client, std::uint64_t lookup_id,
-                                      const CacheCoordinator::PromptPrefix& prompt) {
+SharedL2Pool::Hit SharedL2Pool::Probe(ClientId client, const CacheCoordinator::PromptPrefix& prompt) {
     if (prompt.max_tokens < 0 || prompt.tokens.size() < static_cast<std::size_t>(prompt.max_tokens)) {
         throw std::invalid_argument("a shared L2 lookup's tokens must reach its bound");
     }
     Hit hit;
-    const auto known = clients_.find(client);
-    if (known != clients_.end() && std::erase(known->second.abandoned_lookups, lookup_id) > 0) {
-        return hit;
-    }
     // The Device tier is empty, so the Host suffix of the probe starts at the
     // prompt's first token: the Host tier alone.
     CacheCoordinator::PrefixProbe probe = cache_.ProbePromptPrefix(prompt);
@@ -98,7 +93,7 @@ SharedL2Pool::Hit SharedL2Pool::Probe(ClientId client, std::uint64_t lookup_id,
     if (hit.num_tokens == 0) {
         return hit;
     }
-    Lookup lookup{.lookup_id = lookup_id};
+    std::vector<CacheBlockRef> pins;
     for (std::int32_t i = 0; i < cache_.NumGroups(); ++i) {
         const GroupAllocator& allocator = cache_.Allocator(i);
         for (CacheBlockRef& block : match.per_group[static_cast<std::size_t>(i)].blocks) {
@@ -110,37 +105,17 @@ SharedL2Pool::Hit SharedL2Pool::Probe(ClientId client, std::uint64_t lookup_id,
             hit.slots.push_back(Slot{.key = *key,
                                      .bucket = allocator.BucketOf(block->Location()),
                                      .page = allocator.ResolveCacheBlockId(*block)});
-            lookup.pins.push_back(std::move(block));
+            pins.push_back(std::move(block));
         }
     }
     hit.ticket = ++next_ticket_;
-    clients_[client].lookups.emplace(hit.ticket, std::move(lookup));
+    clients_[client].lookups.emplace(hit.ticket, std::move(pins));
     return hit;
 }
 
 void SharedL2Pool::Release(ClientId client, Ticket ticket) {
-    // A repeated release finds its ticket gone.
     if (const auto it = clients_.find(client); it != clients_.end()) {
         it->second.lookups.erase(ticket);
-    }
-}
-
-void SharedL2Pool::rememberAbandoned(std::deque<std::uint64_t>& abandoned, std::uint64_t id) {
-    if (std::ranges::find(abandoned, id) != abandoned.end()) {
-        return;
-    }
-    abandoned.push_back(id);
-    if (abandoned.size() > kMaxAbandoned) {
-        abandoned.pop_front();
-    }
-}
-
-void SharedL2Pool::AbandonLookup(ClientId client, std::uint64_t lookup_id) {
-    Client& state = clients_[client];
-    // The probe may still be on its way: its answer was given up on, so it
-    // must pin nothing when it arrives.
-    if (std::erase_if(state.lookups, [&](const auto& entry) { return entry.second.lookup_id == lookup_id; }) == 0) {
-        rememberAbandoned(state.abandoned_lookups, lookup_id);
     }
 }
 
@@ -153,7 +128,7 @@ void SharedL2Pool::validateKeys(std::span<const CacheKey> keys) const {
     }
 }
 
-SharedL2Pool::Reservation SharedL2Pool::Reserve(ClientId client, std::uint64_t write_id, std::span<const CacheKey> keys,
+SharedL2Pool::Reservation SharedL2Pool::Reserve(ClientId client, std::span<const CacheKey> keys,
                                                 std::span<const std::int32_t> buckets) {
     if (keys.size() != buckets.size()) {
         throw std::invalid_argument("a shared L2 reservation names one bucket per key");
@@ -167,10 +142,6 @@ SharedL2Pool::Reservation SharedL2Pool::Reserve(ClientId client, std::uint64_t w
     }
     Reservation result;
     result.pages.assign(keys.size(), kHeld);
-    Client& state = clients_[client];
-    if (std::erase(state.abandoned_writes, write_id) > 0) {
-        return result;
-    }
     // The rank published these keys on its Device. The ones the pool holds
     // are refreshed, as that publication refreshes a rank's own Host copies,
     // before pages are acquired for the others, which evicts the entries
@@ -193,7 +164,7 @@ SharedL2Pool::Reservation SharedL2Pool::Reserve(ClientId client, std::uint64_t w
         return result;
     }
     CacheCoordinator::HostAllocationBatch batch = cache_.AcquireHostBlocks(wanted_groups, wanted_buckets);
-    Write write{writing_, write_id};
+    Write write{writing_};
     for (std::size_t j = 0; j < wanted.size(); ++j) {
         CacheBlockRef& block = batch.blocks[j];
         if (!block) {
@@ -208,7 +179,7 @@ SharedL2Pool::Reservation SharedL2Pool::Reserve(ClientId client, std::uint64_t w
         return result;
     }
     result.ticket = ++next_ticket_;
-    state.writes.emplace(result.ticket, std::move(write));
+    clients_[client].writes.emplace(result.ticket, std::move(write));
     keepHeadroom();
     return result;
 }
@@ -288,15 +259,6 @@ bool SharedL2Pool::Commit(ClientId client, Ticket ticket, std::span<const Checkp
         }
     }
     return true;
-}
-
-void SharedL2Pool::AbandonWrite(ClientId client, std::uint64_t write_id) {
-    Client& state = clients_[client];
-    // A committed write is found neither here nor on its way: remembering its
-    // id costs one slot. The reservation may still be on its way.
-    if (std::erase_if(state.writes, [&](const auto& entry) { return entry.second.Id() == write_id; }) == 0) {
-        rememberAbandoned(state.abandoned_writes, write_id);
-    }
 }
 
 void SharedL2Pool::Touch(std::span<const CacheKey> keys) {

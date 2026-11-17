@@ -72,10 +72,7 @@ const std::string* SharedL2Proxy::PendingRequest(std::uint64_t lookup_id) const 
 
 void SharedL2Proxy::endLookup(std::uint64_t lookup_id) noexcept {
     // Answered lookups left pending_ when their answer was applied.
-    if (pending_.erase(lookup_id) != 0) {
-        ++num_abandoned_;
-        commands_.push_back(SharedL2AbandonOperation{lookup_id});
-    }
+    pending_.erase(lookup_id);
 }
 
 std::vector<SharedL2ProxyPage> SharedL2Proxy::ApplyAnswer(const SharedL2LookupResult& result,
@@ -162,12 +159,6 @@ std::vector<SharedL2ProxyPage> SharedL2Proxy::ApplyAnswer(const SharedL2LookupRe
     return created;
 }
 
-void SharedL2Proxy::DropAnswer(const SharedL2LookupResult& result) {
-    if (result.ticket != 0) {
-        commands_.push_back(SharedL2ReleaseOperation{result.ticket});
-    }
-}
-
 void SharedL2Proxy::Touch(std::vector<CacheKey> keys) {
     if (!keys.empty()) {
         commands_.push_back(SharedL2TouchOperation{std::move(keys)});
@@ -176,18 +167,11 @@ void SharedL2Proxy::Touch(std::vector<CacheKey> keys) {
 
 void SharedL2Proxy::ReleaseUnheld() {
     for (TicketEntries& ticket : tickets_) {
-        if (lease_lost_) {
-            // Nothing may load from an entry any more: each goes as soon as
-            // nothing holds it, whatever else its ticket still pins.
-            std::erase_if(ticket.keys, [this](const CacheKey& key) { return coordinator_.DropHostEntry(key); });
-        } else {
-            // From the answer's last entry back. One still held -- by a
-            // waiting prompt's lookup, or by the load-back reading it -- ends
-            // the pass for its ticket, so a ticket in use costs one check per
-            // plan.
-            while (!ticket.keys.empty() && coordinator_.DropHostEntry(ticket.keys.back())) {
-                ticket.keys.pop_back();
-            }
+        // From the answer's last entry back. One still held -- by a waiting
+        // prompt's lookup, or by the load-back reading it -- ends the pass
+        // for its ticket, so a ticket in use costs one check per plan.
+        while (!ticket.keys.empty() && coordinator_.DropHostEntry(ticket.keys.back())) {
+            ticket.keys.pop_back();
         }
         if (ticket.keys.empty()) {
             commands_.push_back(SharedL2ReleaseOperation{ticket.id});
@@ -200,9 +184,7 @@ SharedL2Stats SharedL2Proxy::Stats() const {
     return SharedL2Stats{
         .lookups = num_lookups_,
         .hits = num_hits_,
-        .abandoned_lookups = num_abandoned_,
         .proxy_overflows = num_proxy_overflows_,
-        .pending_lookups = pending_.size(),
         .tickets = tickets_.size(),
     };
 }

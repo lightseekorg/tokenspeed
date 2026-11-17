@@ -130,10 +130,10 @@ struct AdmissionResources {
     PreparedPrefixKeys prefix_keys;
     // With a shared L2 pool: the prompt's lookup, from the call that asks it
     // until admission consumes this state. The prompt is admitted only once
-    // the lookup is settled -- answered, given up by the runtime, or never
-    // needed -- so a prefix the pool holds is not recomputed. pool_kv_tokens
-    // is how far the answer said the pool's KV reaches: past the hit, a
-    // junction the first chunk is cut at.
+    // the lookup is settled -- answered, or never needed -- so a prefix the
+    // pool holds is not recomputed. pool_kv_tokens is how far the answer said
+    // the pool's KV reaches: past the hit, a junction the first chunk is cut
+    // at.
     SharedL2LookupHold pool_lookup;
     bool pool_settled{false};
     std::int32_t pool_kv_tokens{0};

@@ -361,11 +361,6 @@ public:
     // partial commit is not rolled back.
     PreparedPrefixKeys PreparePrefixKeys(std::span<const std::string> content_hashes) const;
     PrefixProbe ProbePromptPrefix(const PromptPrefix& prompt) const;
-    // The same probe with the Host tier left out, for a caller that may not
-    // load from the Host now (a shared L2 rank whose lease on the pool's pins
-    // is lost): the Device's own boundary, the Host tier mirroring it and
-    // claiming nothing, as when the Host holds nothing of the prompt.
-    PrefixProbe ProbeDevicePromptPrefix(const PromptPrefix& prompt) const;
     // Whether recorded or in-flight eviction stores would extend the visible
     // hit using ordinary matching rules. Never acquires unpublished blocks.
     bool EvictionStoresExtendPrefix(const PromptPrefix& prompt, const PrefixProbe& visible) const;
@@ -1323,9 +1318,8 @@ private:
     void forEachStorageDependency(const PrefixProbe::Tier& probe, std::span<const std::vector<CacheKey>> group_keys,
                                   std::int32_t floor_tokens, const Visit& visit) const;
     std::vector<CacheKey> tailKeysForGroup(std::size_t i, const ContentHash& hash, std::int32_t tail_tokens) const;
-    // with_host false leaves the Host suffix out (ProbeDevicePromptPrefix).
     PrefixProbe probePrefixWithOrder(const PromptPrefix& prompt, std::span<const std::size_t> match_order,
-                                     bool claim_partial, bool with_host) const;
+                                     bool claim_partial) const;
     template <CacheTier Tier>
     CoordinatorMatch acquireTierWithKeys(std::span<const std::vector<CacheKey>> group_keys, std::int32_t floor_tokens,
                                          PrefixProbe::Tier&& probe, std::uint64_t access_epoch);

@@ -150,41 +150,23 @@ public:
     static constexpr float kPrefillWatermark = 0.9F;
 
     // With a shared L2 pool (SchedulerConfig::shared_l2_config) a waiting
-    // prompt is admitted only once its lookup is settled. The runtime sends
-    // the lookups and answers them whenever the owner does; none blocks a
-    // plan.
+    // prompt is admitted only once its lookup is answered. Before a plan the
+    // runtime takes the lookups, asks the pool's owner about all of them in
+    // one request, waits for its reply and applies the answers.
     //
     // The waiting prompts' lookups not handed out yet, each once. A prompt
     // whose Device prefix already covers what it may reuse asks nothing.
     std::vector<SharedL2Lookup> SharedL2Lookups();
     // Mirrors the pool's answers into the proxy Host tier; returns the proxy
-    // blocks created, each with the pool page a load-back from it reads. An
-    // answer nothing waits for any more -- its request left, or the lookup
-    // was abandoned -- is dropped, and what it pinned released. A hit the
-    // proxy tier has no room for counts as a miss: what it pinned is released
-    // and its prompt computes its prefix. A malformed answer -- one that lies
+    // blocks created, each with the pool page a load-back from it reads. A
+    // hit the proxy tier has no room for counts as a miss: what it pinned is
+    // released and its prompt computes its prefix. An answer the scheduler
+    // cannot take -- one that names no lookup that waits for it, that lies
     // outside its prompt, or that does not name, under a ticket, a bucket and
     // a page for each key of the rank's cache groups and a tail inside a page
-    // -- throws std::invalid_argument: nothing of it is kept and its lookup
-    // stays pending, for the runtime to abandon. The answers before it in the
-    // call stay applied, but the proxy blocks they created are lost with the
-    // exception, and the answers after it are not applied: a caller that
-    // handles a refusal passes one answer per call.
+    // -- throws std::invalid_argument, and the runtime stops serving: nothing
+    // of that answer is kept, and the answers after it are not applied.
     std::vector<SharedL2ProxyPage> ApplySharedL2Lookups(const std::vector<SharedL2LookupResult>& results);
-    // The runtime gave these lookups up (the owner did not answer in time):
-    // each counts as a miss, and the next plan tells the owner to abandon it.
-    void AbandonSharedL2Lookups(const std::vector<std::uint64_t>& lookup_ids);
-    // The runtime's lease on what the lookups pinned at the owner, which it
-    // reports whenever it has asked its client, after applying the answers
-    // the client had: lost, the owner may have dropped the pins, and no load
-    // may start from the pool. The state stays until the next report. While
-    // the lease is lost a first admission probes the Device alone, so no plan
-    // starts a load-back from a proxy entry -- not from one a load-back in
-    // flight still holds either. Each report of a lost lease drops the hit of
-    // every waiting prompt (it computes its prefix) and, at once, every proxy
-    // entry nothing holds; the entries of a load-back in flight go when it
-    // lands.
-    void SetSharedL2LeaseLost(bool lost);
     SharedL2Stats GetSharedL2Stats() const;
 
     void Advance(const ExecutionEvent& event);
@@ -785,7 +767,6 @@ private:
     // The rank's proxy of its shared L2 pool; null without one. It outlives
     // the lookup holds of the requests below.
     std::unique_ptr<SharedL2Proxy> shared_l2_;
-    std::uint64_t shared_l2_lease_expired_hits_{0};
     std::int64_t storage_now_us_{0};
     std::uint64_t storage_wait_timeouts_{0};
     std::uint64_t storage_ready_expirations_{0};

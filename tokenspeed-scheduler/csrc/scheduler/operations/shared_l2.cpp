@@ -29,9 +29,6 @@ namespace tokenspeed {
 SharedL2Stats Scheduler::GetSharedL2Stats() const {
     SharedL2Stats stats = shared_l2_ ? shared_l2_->Stats() : SharedL2Stats{};
     stats.writes_in_flight = tier_transfers_.NumPoolWritesInFlight();
-    stats.failed_writes = tier_transfers_.NumFailedPoolWrites();
-    stats.failed_write_blocks = tier_transfers_.NumFailedPoolWriteBlocks();
-    stats.lease_expired_hits = shared_l2_lease_expired_hits_;
     return stats;
 }
 
@@ -83,8 +80,7 @@ std::vector<SharedL2ProxyPage> Scheduler::ApplySharedL2Lookups(const std::vector
     for (const SharedL2LookupResult& result : results) {
         const std::string* request_id = shared_l2_->PendingRequest(result.lookup_id);
         if (request_id == nullptr) {
-            shared_l2_->DropAnswer(result);
-            continue;
+            throw std::invalid_argument("a shared L2 answer names no lookup that waits for it");
         }
         // A pending lookup's hold lives in its request's pre-admission state.
         Request* request = findRequest(*request_id);
@@ -108,50 +104,6 @@ std::vector<SharedL2ProxyPage> Scheduler::ApplySharedL2Lookups(const std::vector
         pages.insert(pages.end(), created.begin(), created.end());
     }
     return pages;
-}
-
-void Scheduler::AbandonSharedL2Lookups(const std::vector<std::uint64_t>& lookup_ids) {
-    if (!shared_l2_) {
-        throw std::invalid_argument("shared L2 lookups abandoned without a configured pool");
-    }
-    for (const std::uint64_t lookup_id : lookup_ids) {
-        // One already answered, abandoned or whose request left needs nothing.
-        const std::string* request_id = shared_l2_->PendingRequest(lookup_id);
-        if (request_id == nullptr) {
-            continue;
-        }
-        Request* request = findRequest(*request_id);
-        auto* admission = request != nullptr ? request->AdmissionResourcesPtr() : nullptr;
-        FatalCheck(admission != nullptr && admission->pool_lookup.LookupId() == lookup_id,
-                   "a pending shared L2 lookup lost its waiting request");
-        // The prompt computes its prefix; dropping the hold abandons the
-        // lookup at the owner.
-        admission->pool_lookup.reset();
-        admission->pool_settled = true;
-    }
-}
-
-void Scheduler::SetSharedL2LeaseLost(bool lost) {
-    if (!shared_l2_) {
-        throw std::invalid_argument("shared L2 lease state without a configured pool");
-    }
-    shared_l2_->SetLeaseLost(lost);
-    if (!lost) {
-        return;
-    }
-    for (const auto& request : requests_) {
-        // A lookup still pending keeps waiting for its answer.
-        if (auto* admission = request->AdmissionResourcesPtr();
-            admission != nullptr && admission->pool_lookup.HoldsHit()) {
-            admission->pool_lookup.reset();
-            // Nothing of the answer is used: no junction is cut at its reach.
-            admission->pool_kv_tokens = 0;
-            ++shared_l2_lease_expired_hits_;
-        }
-    }
-    // At once rather than at the end of the next plan, whose commands then
-    // already release the tickets left without an entry.
-    shared_l2_->ReleaseUnheld();
 }
 
 }  // namespace tokenspeed

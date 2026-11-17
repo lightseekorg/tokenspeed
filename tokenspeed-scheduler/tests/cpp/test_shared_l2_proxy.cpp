@@ -190,39 +190,33 @@ TEST(SharedL2Proxy, AnAnswerBecomesProxyEntriesHeldUntilTheLookupsHoldGoes) {
     EXPECT_EQ(stats.lookups, 1u);
     EXPECT_EQ(stats.hits, 1u);
     EXPECT_EQ(stats.tickets, 0u);
-    EXPECT_EQ(stats.abandoned_lookups, 0u);
 }
 
-TEST(SharedL2Proxy, AHoldDroppedBeforeItsAnswerAbandonsTheLookup) {
+TEST(SharedL2Proxy, ALookupIsPendingWhileItsHoldWaitsForTheAnswer) {
     Rank rank(16, 16);
-    const Prompt prompt{Sequence(10)};
     std::uint64_t lookup_id = 0;
     {
         SharedL2LookupHold hold = rank.proxy.StartLookup("r");
         lookup_id = hold.LookupId();
-        // Moving the hold with its state abandons nothing.
+        // The lookup moves with its hold.
         SharedL2LookupHold moved = std::move(hold);
         EXPECT_FALSE(static_cast<bool>(hold));
-        EXPECT_TRUE(rank.proxy.TakeCommands().empty());
-        EXPECT_EQ(rank.proxy.Stats().pending_lookups, 1u);
+        ASSERT_NE(rank.proxy.PendingRequest(lookup_id), nullptr);
     }
-    const std::vector<SharedL2Operation> commands = rank.proxy.TakeCommands();
-    ASSERT_EQ(commands.size(), 1u);
-    EXPECT_EQ(CommandsOf<SharedL2AbandonOperation>(commands).front().lookup_id, lookup_id);
+    // The hold went before its answer (its request left): no answer is
+    // waited for, and the owner is told nothing.
     EXPECT_EQ(rank.proxy.PendingRequest(lookup_id), nullptr);
-    EXPECT_EQ(rank.proxy.Stats().abandoned_lookups, 1u);
+    EXPECT_TRUE(rank.proxy.TakeCommands().empty());
 
     // A miss settles its lookup: its hold then drops without a command.
     {
         SharedL2LookupHold hold = rank.proxy.StartLookup("s");
         EXPECT_TRUE(
             rank.proxy.ApplyAnswer(SharedL2LookupResult{.lookup_id = hold.LookupId()}, ContentHash{}, hold).empty());
+        EXPECT_EQ(rank.proxy.PendingRequest(hold.LookupId()), nullptr);
     }
     EXPECT_TRUE(rank.proxy.TakeCommands().empty());
-    // An answer nothing waits for gives its ticket back.
-    rank.proxy.DropAnswer(SharedL2LookupResult{.lookup_id = lookup_id, .ticket = 9});
-    rank.proxy.DropAnswer(SharedL2LookupResult{.lookup_id = lookup_id});
-    EXPECT_EQ(CommandsOf<SharedL2ReleaseOperation>(rank.proxy.TakeCommands()).size(), 1u);
+    EXPECT_EQ(rank.proxy.Stats().lookups, 2u);
 }
 
 TEST(SharedL2Proxy, LookupsThatShareProxyEntriesKeepTheFirstTicket) {
@@ -295,34 +289,6 @@ TEST(SharedL2Proxy, AnEntryALoadBackReadsStaysUntilTheLoadLands) {
     EXPECT_EQ(rank.cache.NumHostCachedBlocks(), 0);
 }
 
-TEST(SharedL2Proxy, ALostLeaseDropsEveryEntryNothingHoldsAtOnce) {
-    Rank rank(16, 16);
-    const Prompt prompt{Sequence(10)};
-    SharedL2LookupHold hold = rank.proxy.StartLookup("r");
-    rank.proxy.ApplyAnswer(rank.Answer(hold, prompt, 5), rank.TailPrior(prompt), hold);
-    // A load-back reads the second page alone; the answer's last entries, the
-    // tail and the checkpoint, are held by nothing once the lookup's hold went.
-    CacheBlockRef load = rank.cache.AcquireHostCachedBlock(prompt.Keys()[1]);
-    hold.reset();
-    rank.proxy.ReleaseUnheld();
-    // With the lease: from the last entry back, up to the one held.
-    EXPECT_EQ(rank.cache.NumHostCachedBlocks(), 2);
-    EXPECT_TRUE(rank.cache.ContainsHostCachedBlock(prompt.Keys()[0]));
-    rank.proxy.SetLeaseLost(true);
-    rank.proxy.ReleaseUnheld();
-    // Without it the entry before the held one goes too; the ticket stays
-    // for the load.
-    EXPECT_EQ(rank.cache.NumHostCachedBlocks(), 1);
-    EXPECT_TRUE(rank.cache.ContainsHostCachedBlock(prompt.Keys()[1]));
-    EXPECT_TRUE(rank.proxy.TakeCommands().empty());
-    EXPECT_EQ(rank.proxy.Stats().tickets, 1u);
-    load = {};
-    rank.proxy.SetLeaseLost(false);
-    rank.proxy.ReleaseUnheld();
-    EXPECT_EQ(CommandsOf<SharedL2ReleaseOperation>(rank.proxy.TakeCommands()).front().ticket, 5u);
-    EXPECT_EQ(rank.cache.NumHostCachedBlocks(), 0);
-}
-
 TEST(SharedL2Proxy, AnAnswerTheProxyTierCannotHoldIsAMiss) {
     Rank rank(16, /*host_blocks=*/3);
     const Prompt prompt{Sequence(10)};
@@ -334,7 +300,7 @@ TEST(SharedL2Proxy, AnAnswerTheProxyTierCannotHoldIsAMiss) {
     EXPECT_EQ(rank.proxy.Stats().tickets, 0u);
 }
 
-TEST(SharedL2Proxy, AMalformedAnswerIsRefusedAndItsLookupStaysPending) {
+TEST(SharedL2Proxy, AMalformedAnswerIsRefusedBeforeAnythingOfItIsKept) {
     Rank rank(16, 16);
     const Prompt prompt{Sequence(10)};
     SharedL2LookupHold hold = rank.proxy.StartLookup("r");
@@ -460,13 +426,13 @@ TEST(SharedL2Proxy, PoolWritesAreBoundedAndOnlyThoseInFlightPinTheirSources) {
     }
     EXPECT_FALSE(static_cast<bool>(rank.cache.AcquireDeviceCachedBlock(second.Keys()[3])));
 
-    // A failed write lets its sources go like a committed one.
-    rank.transfers.CompletePoolWrite(cache::SharedL2WriteDone{.write_id = writes[0].write_id, .success = false});
-    rank.transfers.CompletePoolWrite(cache::SharedL2WriteDone{.write_id = writes[0].write_id, .success = false});
-    rank.transfers.CompletePoolWrite(cache::SharedL2WriteDone{.write_id = writes[1].write_id, .success = true});
+    // A committed write lets its sources go; only a write in flight has a
+    // completion.
+    rank.transfers.CompletePoolWrite(cache::SharedL2WriteDone{.write_id = writes[0].write_id});
+    EXPECT_THROW(rank.transfers.CompletePoolWrite(cache::SharedL2WriteDone{.write_id = writes[0].write_id}),
+                 std::invalid_argument);
+    rank.transfers.CompletePoolWrite(cache::SharedL2WriteDone{.write_id = writes[1].write_id});
     EXPECT_FALSE(rank.transfers.HasAnyInFlight());
-    EXPECT_EQ(rank.transfers.NumFailedPoolWrites(), 1u);
-    EXPECT_EQ(rank.transfers.NumFailedPoolWriteBlocks(), 3u);
     // The queue drains: what the Device evicted meanwhile is counted, not written.
     const std::vector<SharedL2WriteOperation> late = rank.transfers.StartPoolWrites(limits);
     const TierTransferManager::WriteBackStats& stats = rank.transfers.WriteBackStatsFor(HostStoreCause::kPublication);
@@ -502,7 +468,7 @@ TEST(SharedL2Proxy, PoolWritesSkipWhatTheProxyHoldsAndWhatAWriteCarries) {
     EXPECT_TRUE(rank.transfers.StartPoolWrites(limits).empty());
     EXPECT_EQ(stats.in_flight, 1u);
     EXPECT_EQ(stats.host_cached, 2u);
-    rank.transfers.CompletePoolWrite(cache::SharedL2WriteDone{.write_id = writes[0].write_id, .success = true});
+    rank.transfers.CompletePoolWrite(cache::SharedL2WriteDone{.write_id = writes[0].write_id});
 }
 
 }  // namespace

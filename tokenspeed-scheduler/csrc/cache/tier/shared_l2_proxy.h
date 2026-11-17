@@ -43,8 +43,8 @@ public:
     // Starts the lookup of a waiting prompt; the runtime sends it and
     // answers it under the hold's id.
     SharedL2LookupHold StartLookup(const std::string& request_id);
-    // The request a lookup still waits for; null once it was answered,
-    // abandoned or its request left.
+    // The request a lookup still waits for; null once it was answered or its
+    // request left.
     const std::string* PendingRequest(std::uint64_t lookup_id) const;
     // Mirrors the pool's answer to hold's lookup into proxy Host entries,
     // which the hold pins; tail_prior precedes the hit's tail. Returns the
@@ -52,31 +52,23 @@ public:
     // shared, and stays under that lookup's ticket.
     std::vector<SharedL2ProxyPage> ApplyAnswer(const SharedL2LookupResult& result, const ContentHash& tail_prior,
                                                SharedL2LookupHold& hold);
-    // An answer no lookup waits for: what it pinned is released.
-    void DropAnswer(const SharedL2LookupResult& result);
     // The keys Device hits used since the last call go to the owner.
     void Touch(std::vector<CacheKey> keys);
-    // The runtime's lease on what the lookups pinned at the owner, as it last
-    // reported it. While it is lost the owner may have dropped the pins, so no
-    // load may start from a proxy entry: admission probes the Device alone
-    // (Scheduler::matchPrefixAtAdmission).
-    void SetLeaseLost(bool lost) { lease_lost_ = lost; }
-    bool LeaseLost() const { return lease_lost_; }
     // Drops proxy entries nothing holds any more -- no waiting prompt, no
     // load-back -- and releases each ticket left without one. A ticket's
     // entries go from the answer's last one back, up to the first one still
-    // held; while the lease is lost, every entry nothing holds goes.
+    // held.
     void ReleaseUnheld();
     std::vector<SharedL2Operation> TakeCommands() { return std::exchange(commands_, {}); }
 
-    // Cumulative counts and the pending lookups and unreleased tickets;
-    // the caller fills in the writes.
+    // Cumulative counts and the unreleased tickets; the caller fills in the
+    // writes.
     SharedL2Stats Stats() const;
 
 private:
     friend class SharedL2LookupHold;
 
-    // A hold ended: a lookup still pending is abandoned.
+    // A hold ended: a lookup still pending waits for no answer any more.
     void endLookup(std::uint64_t lookup_id) noexcept;
 
     // The proxy entries created under one owner ticket, in the answer's
@@ -92,11 +84,9 @@ private:
     std::unordered_map<std::uint64_t, std::string> pending_;
     std::vector<TicketEntries> tickets_;
     std::vector<SharedL2Operation> commands_;
-    bool lease_lost_{false};
     std::uint64_t next_lookup_id_{0};
     std::uint64_t num_lookups_{0};
     std::uint64_t num_hits_{0};
-    std::uint64_t num_abandoned_{0};
     std::uint64_t num_proxy_overflows_{0};
 };
 

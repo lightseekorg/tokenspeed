@@ -76,7 +76,7 @@ struct SharedL2Lookup {
 // The pool's answer: its longest reusable prefix of the prompt, pinned under
 // `ticket` (0 pins nothing), each key with its bucket and its pool page.
 // kv_tokens is how far the pool's KV reaches, past the checkpoint num_tokens
-// resumes from. A lookup the runtime gave up on is not answered but abandoned.
+// resumes from. A miss is an answer that names no key.
 struct SharedL2LookupResult {
     std::uint64_t lookup_id;
     std::uint64_t ticket;
@@ -125,48 +125,27 @@ struct SharedL2TouchOperation {
     bool operator==(const SharedL2TouchOperation&) const = default;
 };
 
-// A lookup nothing waits for any more -- its request left, or the runtime
-// gave it up: the owner releases whatever it pinned; no completion.
-struct SharedL2AbandonOperation {
-    std::uint64_t lookup_id;
-
-    bool operator==(const SharedL2AbandonOperation&) const = default;
-};
-
-using SharedL2Operation =
-    std::variant<SharedL2WriteOperation, SharedL2ReleaseOperation, SharedL2TouchOperation, SharedL2AbandonOperation>;
+using SharedL2Operation = std::variant<SharedL2WriteOperation, SharedL2ReleaseOperation, SharedL2TouchOperation>;
 
 // Scheduler-owned observations of a shared L2 rank, cumulative unless noted.
 struct SharedL2Stats {
     std::uint64_t lookups{0};
     // Answers that pinned something at the owner, whether or not the prompt
-    // then loaded from it: the proxy overflows and the hits given up for a
-    // lost lease are among them.
+    // then loaded from it: the proxy overflows are among them.
     std::uint64_t hits{0};
-    // Lookups that ended without an answer applied: the runtime gave them up
-    // (also after the scheduler refused their answer), or their request left.
-    std::uint64_t abandoned_lookups{0};
     // Answers the proxy Host tier had no room to mirror, taken as misses.
     std::uint64_t proxy_overflows{0};
-    // Hits waiting prompts gave up because the runtime's lease on the
-    // owner's pins was lost.
-    std::uint64_t lease_expired_hits{0};
-    // Now: lookups not answered, owner tickets not released, writes not completed.
-    std::uint64_t pending_lookups{0};
+    // Now: owner tickets not released, writes not completed.
     std::uint64_t tickets{0};
     std::uint64_t writes_in_flight{0};
-    // Writes the runtime reported failed, and the blocks they carried.
-    std::uint64_t failed_writes{0};
-    std::uint64_t failed_write_blocks{0};
 };
 
 namespace cache {
 
-// A pool write ended: the runtime committed it, or gave it up (success
-// false). Either way the write's Device blocks are released.
+// The runtime committed a pool write: the write's Device blocks are
+// released. A write that fails stops the runtime instead.
 struct SharedL2WriteDone {
     std::uint64_t write_id;
-    bool success;
 };
 
 }  // namespace cache

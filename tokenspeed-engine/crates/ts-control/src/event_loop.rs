@@ -55,7 +55,7 @@ use std::{
 };
 
 use ts_collective::{Group, Mesh, Reduce};
-use ts_metrics::{EngineMetrics, L3Metrics, SharedL2Metrics};
+use ts_metrics::{EngineMetrics, L3Metrics, SharedL2Metrics, SharedL2Stats};
 use ts_pd::{EmbeddingItem, EmbeddingReceiver, LandedRequest, PdError, PdEvent, TransferPeer};
 use ts_scheduler::{
     profile, CacheEvent, CacheOpKind, ExecutionPlan, ForwardBatchView, ForwardEvent,
@@ -82,7 +82,7 @@ use crate::{
     },
     relay::{self, RelayError},
     request::RequestGrammar,
-    shared_l2::{Polled, Pool, PoolClient, PoolError},
+    shared_l2::{Pool, PoolClient, PoolError},
 };
 
 /// Fold what an output-processor call produced into the round's results.
@@ -191,13 +191,6 @@ const RELOAD_GATE_CODE: i64 = 7;
 /// How long a frozen round sleeps, so a `keep` pause does not spin a core.
 const PAUSED_IDLE_SLEEP: Duration = Duration::from_millis(1);
 
-/// With a shared L2 pool, how long a wait for a forward's results goes on
-/// before the frontend is asked for requests again
-/// (`EventLoop::take_in_while_awaiting`). The forward's landing ends the wait
-/// at once; this only bounds how long an arriving request waits to be taken
-/// in.
-const FORWARD_INTAKE_POLL: Duration = Duration::from_micros(200);
-
 /// A failure of a data-plane operation; serving cannot continue.
 #[derive(Debug, thiserror::Error)]
 #[error("data plane: {0}")]
@@ -221,12 +214,6 @@ pub trait DataPlane {
 
     /// Wait for a forward's results.
     fn complete(&mut self, pending: Self::Pending) -> Result<ForwardResult, DataPlaneError>;
-
-    /// Whether a forward's results landed, after waiting up to `wait` for
-    /// them; [`DataPlane::complete`] then returns without waiting. The
-    /// landing ends the wait at once. Asked of the oldest forward not
-    /// completed yet: forwards land in dispatch order.
-    fn landed(&mut self, pending: &Self::Pending, wait: Duration) -> Result<bool, DataPlaneError>;
 
     /// The cache ops acknowledged since the last poll, in the order they
     /// landed; never waits on the device.
@@ -448,7 +435,7 @@ pub enum LoopError {
     /// The L3 executor refused what a plan or a control operation asked.
     #[error(transparent)]
     StorageExecutor(#[from] ts_l3::ExecutorError),
-    /// The shared L2 pool's client failed.
+    /// The shared L2 pool's client or its owner failed.
     #[error(transparent)]
     Pool(#[from] PoolError),
     /// The ranks disagree on a control operation.
@@ -581,12 +568,9 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     /// The L3 tier: this rank's executor and the replica's agreement.
     l3: Option<Tier>,
     l3_metrics: Option<L3Metrics>,
-    /// The shared L2 pool: this rank's client and the work in flight there.
+    /// The shared L2 pool: this rank's client and the writes in flight there.
     pool: Option<Pool>,
     pool_metrics: Option<SharedL2Metrics>,
-    /// With a pool: the messages a forward wait received from the first
-    /// control operation on, for the head of the next round.
-    held_back: Vec<EngineRequest>,
     /// Admissions waiting for their grammars to compile, in arrival order.
     grammar_queue: Vec<(Submission, GrammarKey, Instant)>,
     /// The last cumulative prefix-hit counters reported, for deltas.
@@ -664,7 +648,6 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             l3_metrics: subsystems.l3_metrics,
             pool: subsystems.pool.map(Pool::new),
             pool_metrics: subsystems.pool_metrics,
-            held_back: Vec::new(),
             scheduler,
             data_plane,
             frontend,
@@ -797,14 +780,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         let mut released: Vec<String> = Vec::new();
 
         let received = if self.owns_frontend() {
-            // The engine's own requests come first, then what a forward
-            // wait held back; neither waits for the frontend.
-            let wait =
-                (submitted.is_empty() && self.held_back.is_empty() && self.idle() && self.dp_idle)
-                    .then_some(IDLE_WAIT);
+            let wait = (submitted.is_empty() && self.idle() && self.dp_idle).then_some(IDLE_WAIT);
             let _span = profile::span("Frontend::receive");
             let mut received = submitted;
-            received.append(&mut self.held_back);
             received.extend(self.frontend.receive(wait));
             received
         } else {
@@ -847,12 +825,11 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         } else {
             Vec::new()
         };
-        // A round that did not ask the pool's client learns nothing of the
-        // lease either.
-        let polled = self.poll_pool()?;
-        let lease_lost = polled.as_ref().map(|polled| polled.lease_lost);
-        let polled = polled.unwrap_or_default();
-        if storage.tick.is_some() || !ready.is_empty() || !polled.writes.is_empty() {
+        let pool_writes = match self.pool.as_mut() {
+            Some(pool) => pool.finished_writes()?,
+            None => Vec::new(),
+        };
+        if storage.tick.is_some() || !ready.is_empty() || !pool_writes.is_empty() {
             if !ready.is_empty() {
                 tracing::debug!(
                     ?ready,
@@ -861,40 +838,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 );
             }
             self.scheduler
-                .advance_head(&storage, &ready, &polled.writes)
+                .advance_head(&storage, &ready, &pool_writes)
                 .map_err(|error| LoopError::Scheduler(error.what().to_owned()))?;
-        }
-        // The pool's answers are the head's other feedback: each settles its
-        // prompt's lookup ahead of the plan that may admit the prompt. An
-        // answer is no event of the batch above: the proxy blocks it creates
-        // go back to the pool's client, and one the scheduler refuses is
-        // given up alone, its ticket handed back to the client.
-        if let Some(pool) = self.pool.as_mut() {
-            for answer in &polled.answers {
-                match self.scheduler.apply_shared_l2_lookup(answer) {
-                    Ok(pages) => pool.applied(answer.ticket, &pages)?,
-                    Err(error) => {
-                        tracing::warn!(
-                            lookup = answer.lookup_id,
-                            error = error.what(),
-                            "shared L2 answer refused; its prompt computes"
-                        );
-                        self.scheduler
-                            .abandon_shared_l2_lookups(&[answer.lookup_id])
-                            .map_err(|error| LoopError::Scheduler(error.what().to_owned()))?;
-                        pool.refused(answer.ticket)?;
-                    }
-                }
-            }
-            if let Some(lost) = lease_lost {
-                // After the answers, whose tickets the client judged too.
-                // Lost, the owner may have dropped what the lookups pinned:
-                // the scheduler starts no load from the pool until a later
-                // poll says otherwise, and the waiting prompts compute.
-                self.scheduler
-                    .set_shared_l2_lease_lost(lost)
-                    .map_err(|error| LoopError::Scheduler(error.what().to_owned()))?;
-            }
         }
         self.record_storage_metrics()?;
         self.record_pool_metrics()?;
@@ -932,6 +877,26 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             self.note_forward(forwarded);
             std::thread::sleep(PAUSED_IDLE_SLEEP);
         } else {
+            // With a shared L2 pool, the waiting prompts not looked up yet
+            // ask the pool in one request, and the round waits for its
+            // answers: a prompt is in no plan before its answer, so that a
+            // prefix the pool holds is not recomputed. An answer is no event
+            // of the head's batch: the proxy blocks it creates go back to the
+            // pool's client.
+            if let Some(pool) = self.pool.as_mut() {
+                let lookups = self.scheduler.shared_l2_lookups();
+                if !lookups.is_empty() {
+                    let _span = profile::span("Pool::look_up");
+                    for answer in pool.look_up(&lookups)? {
+                        let pages = self
+                            .scheduler
+                            .apply_shared_l2_lookup(&answer)
+                            .map_err(|error| LoopError::Scheduler(error.what().to_owned()))?;
+                        pool.applied(&pages)?;
+                    }
+                    busy = true;
+                }
+            }
             let allow_prefill = self.prefill_delay_allows_prefill();
             busy |= self.plan_and_dispatch(
                 &mut stop,
@@ -966,11 +931,10 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             }
         }
         // A storage operation's outcome is an acknowledgment too, and so is
-        // what a shared L2 pool's client returned.
+        // a shared L2 pool's finished write.
         busy |= !ready.is_empty()
             || !storage.done.is_empty()
-            || !polled.answers.is_empty()
-            || !polled.writes.is_empty()
+            || !pool_writes.is_empty()
             || !events.is_empty()
             || !outputs.is_empty()
             || !released.is_empty();
@@ -1702,11 +1666,6 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             }
             return Ok(());
         }
-        if let Some(pool) = self.pool.as_mut() {
-            // A prompt is admitted only once the pool answered its lookup:
-            // the lookups leave now, and nothing waits for the owner.
-            pool.look_up(&self.scheduler.shared_l2_lookups())?;
-        }
         let now = std::time::Instant::now();
         for (rid, bootstrap) in requests {
             self.outputs.mark_submitted(&rid, now);
@@ -1739,75 +1698,20 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         Ok(())
     }
 
-    /// With a shared L2 pool, its client's answers and finished writes for
-    /// the head of the round; `None` when the client was not asked
-    /// ([`Pool::poll`]). The round waits for the answers of the lookups
-    /// sent since the last plan, up to [`crate::shared_l2::LOOKUP_WAIT`],
-    /// unless that would leave this rank's device idle with work to run:
-    /// it waits while the oldest dispatched forward still runs, and when
-    /// every request this rank holds waits for its lookup, so nothing else
-    /// could run. Otherwise it plans at once, and a prompt whose answer is
-    /// not there yet is admitted by a later round.
-    ///
-    /// A rank that attention DP keeps in step with others decides the same
-    /// way, from its own state. The wait lies between the round's two DP
-    /// collectives (the gate and the batch gather) and only delays this
-    /// rank's arrival at the second: its peers wait there at most the bound,
-    /// with a device that may be idle. Not waiting costs the prompt a round,
-    /// which in step is a forward of the slowest rank.
-    fn poll_pool(&mut self) -> Result<Option<Polled>, LoopError> {
-        let Some(pool) = self.pool.as_mut() else {
-            return Ok(None);
-        };
-        let wait = pool.has_fresh_lookups()
-            && match self.in_flight.front() {
-                Some((_, _, forward)) => !self.data_plane.landed(forward, Duration::ZERO)?,
-                None => {
-                    pool.waiting_requests()
-                        .filter(|rid| self.outputs.state(rid).is_some())
-                        .count()
-                        == self.outputs.num_running()
-                }
-            };
-        let _span = profile::span("Pool::poll");
-        Ok(pool.poll(wait)?)
-    }
-
     /// Sample the shared L2 pool's metrics, at most once a second.
     fn record_pool_metrics(&mut self) -> Result<(), LoopError> {
         let (Some(pool), Some(metrics)) = (self.pool.as_mut(), self.pool_metrics.as_mut()) else {
             return Ok(());
         };
         if pool.metrics_due() {
-            metrics.record(&pool.stats(self.scheduler.shared_l2_stats())?);
-        }
-        Ok(())
-    }
-
-    /// With a shared L2 pool: while a dispatched forward's results are
-    /// awaited, take in the requests that arrive, so that their lookups
-    /// travel during the forward instead of after it; the head of the next
-    /// round collects the answers. Requests and aborts only: a control
-    /// operation, and what arrives behind it, wait for that head, where
-    /// control operations act. Only on a replica of one member, whose
-    /// admissions need no relay.
-    fn take_in_while_awaiting(
-        &mut self,
-        forward: &D::Pending,
-        outputs: &mut Vec<StreamedOutput>,
-        released: &mut Vec<String>,
-    ) -> Result<(), LoopError> {
-        while self.held_back.is_empty() && !self.data_plane.landed(forward, FORWARD_INTAKE_POLL)? {
-            let mut received = self.frontend.receive(None);
-            if let Some(control) = received
-                .iter()
-                .position(|message| matches!(message, EngineRequest::Control(_)))
-            {
-                self.held_back = received.split_off(control);
-            }
-            if !received.is_empty() {
-                self.admit(received, outputs, released)?;
-            }
+            let stats = self.scheduler.shared_l2_stats();
+            metrics.record(&SharedL2Stats {
+                lookups: stats.lookups as f64,
+                hits: stats.hits as f64,
+                proxy_overflows: stats.proxy_overflows as f64,
+                tickets: stats.tickets as f64,
+                writes_in_flight: stats.writes_in_flight as f64,
+            });
         }
         Ok(())
     }
@@ -2822,9 +2726,6 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         while self.in_flight.len() > depth {
             let _span = profile::span("EventLoop::commit");
             let (batch, input_logprobs, pending) = self.in_flight.pop_front().expect("non-empty");
-            if self.pool.is_some() && self.ranks.replica.size() == 1 {
-                self.take_in_while_awaiting(&pending, outputs, released)?;
-            }
             let result = self.data_plane.complete(pending)?;
             if let Some(pool) = self.pool.as_mut() {
                 pool.forward_committed()?;

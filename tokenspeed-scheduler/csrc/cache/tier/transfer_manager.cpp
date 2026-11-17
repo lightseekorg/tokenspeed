@@ -201,16 +201,10 @@ std::vector<SharedL2WriteOperation> TierTransferManager::StartPoolWrites(const S
 }
 
 void TierTransferManager::CompletePoolWrite(const cache::SharedL2WriteDone& event) {
-    const auto it = pool_writes_.find(event.write_id);
-    if (it == pool_writes_.end()) {
-        return;
-    }
-    if (!event.success) {
-        ++failed_pool_writes_;
-        failed_pool_write_blocks_ += it->second.keys.size();
-    }
     // The record goes with its pins: the sources are evictable again.
-    pool_writes_.erase(it);
+    if (pool_writes_.erase(event.write_id) != 1) {
+        throw std::invalid_argument("completion of an unknown shared L2 write");
+    }
 }
 
 bool TierTransferManager::HasPinnedStoresInFlight() const {

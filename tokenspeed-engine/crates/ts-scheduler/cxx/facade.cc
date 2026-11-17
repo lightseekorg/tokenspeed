@@ -142,7 +142,7 @@ void advance(tokenspeed::Scheduler& scheduler, rust::Slice<const ForwardEvent> e
 void advance_head(tokenspeed::Scheduler& scheduler, rust::Slice<const StorageTickView> ticks,
                   rust::Slice<const StorageCancellationView> cancellations,
                   rust::Slice<const StorageDoneView> done, rust::Slice<const CacheEvent> cache_events,
-                  rust::Slice<const SharedL2WriteDoneView> pool_writes) {
+                  rust::Slice<const std::uint64_t> pool_writes) {
     // One batch, in the order the Python hooks built it: the storage clock,
     // the cancellations, the storage completions, then the Host copies' ACKs;
     // a shared L2 pool's finished writes come last.
@@ -195,9 +195,8 @@ void advance_head(tokenspeed::Scheduler& scheduler, rust::Slice<const StorageTic
                 throw std::invalid_argument("unknown cache event kind");
         }
     }
-    for (const SharedL2WriteDoneView& write : pool_writes) {
-        execution_event.With(
-            tokenspeed::cache::SharedL2WriteDone{.write_id = write.write_id, .success = write.success});
+    for (const std::uint64_t write_id : pool_writes) {
+        execution_event.With(tokenspeed::cache::SharedL2WriteDone{.write_id = write_id});
     }
     scheduler.Advance(execution_event);
 }
@@ -430,8 +429,10 @@ rust::Vec<SharedL2LookupView> shared_l2_lookups(tokenspeed::Scheduler& scheduler
 }
 
 rust::Vec<SharedL2PageView> apply_shared_l2_lookup(tokenspeed::Scheduler& scheduler, const SharedL2AnswerView& answer) {
+    // No tail is no tokens and no hash; one without the other is a tail the
+    // scheduler refuses.
     std::optional<tokenspeed::TailPublication> tail;
-    if (answer.tail_tokens != 0) {
+    if (answer.tail_tokens != 0 || !answer.tail_hash.empty()) {
         tail = tokenspeed::TailPublication{.tail_tokens = answer.tail_tokens, .hash = tokenspeed::ContentHash{std::string(answer.tail_hash)}};
     }
     std::vector<tokenspeed::CacheKey> keys;
@@ -458,25 +459,14 @@ rust::Vec<SharedL2PageView> apply_shared_l2_lookup(tokenspeed::Scheduler& schedu
     return out;
 }
 
-void abandon_shared_l2_lookups(tokenspeed::Scheduler& scheduler, rust::Slice<const std::uint64_t> lookup_ids) {
-    scheduler.AbandonSharedL2Lookups({lookup_ids.begin(), lookup_ids.end()});
-}
-
-void set_shared_l2_lease_lost(tokenspeed::Scheduler& scheduler, bool lost) { scheduler.SetSharedL2LeaseLost(lost); }
-
 SharedL2StatsView shared_l2_stats(const tokenspeed::Scheduler& scheduler) {
     const tokenspeed::SharedL2Stats stats = scheduler.GetSharedL2Stats();
     return SharedL2StatsView{
         .lookups = stats.lookups,
         .hits = stats.hits,
-        .abandoned_lookups = stats.abandoned_lookups,
         .proxy_overflows = stats.proxy_overflows,
-        .lease_expired_hits = stats.lease_expired_hits,
-        .pending_lookups = stats.pending_lookups,
         .tickets = stats.tickets,
         .writes_in_flight = stats.writes_in_flight,
-        .failed_writes = stats.failed_writes,
-        .failed_write_blocks = stats.failed_write_blocks,
     };
 }
 
@@ -751,14 +741,11 @@ rust::Vec<SharedL2OpView> plan_shared_l2_ops(const tokenspeed::ExecutionPlan& pl
                 } else if constexpr (std::is_same_v<Op, tokenspeed::SharedL2ReleaseOperation>) {
                     view.kind = SharedL2OpKind::Release;
                     view.id = op.ticket;
-                } else if constexpr (std::is_same_v<Op, tokenspeed::SharedL2TouchOperation>) {
+                } else {
+                    static_assert(std::is_same_v<Op, tokenspeed::SharedL2TouchOperation>,
+                                  "a new shared L2 pool command");
                     view.kind = SharedL2OpKind::Touch;
                     view.keys = to_rust(op.keys);
-                } else {
-                    static_assert(std::is_same_v<Op, tokenspeed::SharedL2AbandonOperation>,
-                                  "a new shared L2 pool command");
-                    view.kind = SharedL2OpKind::Abandon;
-                    view.id = op.lookup_id;
                 }
                 out.push_back(std::move(view));
             },

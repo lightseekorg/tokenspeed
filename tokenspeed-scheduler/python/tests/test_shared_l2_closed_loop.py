@@ -21,20 +21,18 @@
 """Randomized closed loops over several ranks sharing one tiny L2 pool.
 
 Each rank is the closed-loop driver of test_closed_loop_random with a shared
-L2 pool as its Host L2, and the test plays its runtime: lookups are answered
-zero to a few rounds late, some are given up and some of those answered
-after all; pool writes complete late, and some fail before or after their
-reservation; releases and abandons reach the owner late; load-backs are
-acknowledged late, out of order and now and then twice. The ranks draw their
-prompts from the same system prefixes and continue each other's finished
-sequences, so a prefix one rank published is resumed on another, on a pool
-small enough to evict all the time.
+L2 pool as its Host L2, and the test plays its runtime: every lookup is
+answered before the plan that follows it; pool writes complete late;
+releases reach the owner late; load-backs are acknowledged late, out of
+order and now and then twice. The ranks draw their prompts from the same
+system prefixes and continue each other's finished sequences, so a prefix
+one rank published is resumed on another, on a pool small enough to evict
+all the time.
 
-No scheduler may raise; no prompt is admitted before its lookup is settled,
-or computes what the pool's answer pinned for it; no pool page is granted to
-a write while a load-back still reads it; and once everything is
-acknowledged, no request is left waiting and neither the ranks nor the pool
-hold anything.
+No scheduler may raise; no prompt computes what the pool's answer pinned for
+it; no pool page is granted to a write while a load-back still reads it; and
+once everything is acknowledged, no request is left waiting and neither the
+ranks nor the pool hold anything.
 """
 
 from __future__ import annotations
@@ -137,82 +135,26 @@ class _Rank(closed_loop._Loop):
         self.scheduler = _Planned(self)
         # The pool client draws from its own stream.
         self.io = random.Random(seed + 3)
-        self.answers: list[tuple[int, tuple]] = []
-        self.give_ups: list[tuple[int, int]] = []
-        self.commands: list[tuple[int, object]] = []
+        self.commands: list[tuple[int, int]] = []
         self.writes: list[tuple[int, object]] = []
-        # The requests whose lookup is out, by lookup id, and for each one
-        # answered the tokens the pool pinned for it.
-        self.asked: dict[int, str] = {}
+        # For each prompt the pool answered, the tokens it pinned for it.
         self.pinned_for: dict[str, int] = {}
         self.started: set[str] = set()
         # (group, proxy Host block) -> pool page; load op -> the pages it reads.
         self.page_of: dict[tuple[int, int], int] = {}
         self.reads: dict[int, list[tuple[int, int]]] = {}
         self.pool_resumes = 0
-        self.failed_writes = 0
-        # The runtime's lease on the owner's pins, as it last reported it.
-        self.lease_lost = False
-        self.lease_losses = 0
 
     def before_plan(self) -> None:
+        # Every lookup is answered before the plan, as the event loop does.
         for lookup in self.real.shared_l2_lookups():
-            self.asked[lookup[0]] = lookup[1]
-            if self.io.random() < 0.15:
-                # The runtime will give this one up; its probe may still
-                # reach the owner, before or after.
-                self.give_ups.append((self.round + self.io.randrange(1, 3), lookup[0]))
-                if self.io.random() < 0.6:
-                    self.answers.append((self.round + self.io.randrange(5), lookup))
-            else:
-                self.answers.append((self.round + self.io.randrange(3), lookup))
-        self.settle(everything=False)
-        # The lease goes and comes back, with loads in flight or not; the
-        # runtime reports it after the round's answers, as the event loop
-        # does.
-        if self.io.random() < (0.3 if self.lease_lost else 0.04):
-            self.lease_lost = not self.lease_lost
-            self.lease_losses += self.lease_lost
-        self.real.set_shared_l2_lease_lost(self.lease_lost)
-        if self.lease_lost:
-            # The waiting prompts gave their hits up: they may compute.
-            self.pinned_for = {
-                request_id: pinned
-                for request_id, pinned in self.pinned_for.items()
-                if request_id in self.started
-            }
-
-    def settle(self, everything: bool) -> None:
-        """The give-ups and answers that are due."""
-        due = [i for when, i in self.give_ups if everything or when <= self.round]
-        self.give_ups = [
-            (when, i)
-            for when, i in self.give_ups
-            if not (everything or when <= self.round)
-        ]
-        self.real.abandon_shared_l2_lookups(due)
-        for lookup_id in due:
-            self.asked.pop(lookup_id, None)
-        answers = [
-            answer for when, answer in self.answers if everything or when <= self.round
-        ]
-        self.answers = [
-            (when, answer)
-            for when, answer in self.answers
-            if not (everything or when <= self.round)
-        ]
-        for lookup_id, request_id, hashes, tokens, max_tokens in answers:
-            result = self.pool.probe(self.client, lookup_id, hashes, tokens, max_tokens)
-            waited = self.real.shared_l2_stats().pending_lookups
-            created = self.real.apply_shared_l2_lookups([(lookup_id, *result)])
-            if self.real.shared_l2_stats().pending_lookups < waited:
-                # The scheduler was waiting for it: the prompt must resume
-                # at least where the pool pinned.
-                self.pinned_for[request_id] = result[1]
-                del self.asked[lookup_id]
-            else:
-                assert not created
-            for group, block, _, page in created:
+            lookup_id, request_id, hashes, tokens, max_tokens = lookup
+            result = self.pool.probe(self.client, hashes, tokens, max_tokens)
+            # The prompt must resume at least where the pool pinned.
+            self.pinned_for[request_id] = result[1]
+            for group, block, _, page in self.real.apply_shared_l2_lookups(
+                [(lookup_id, *result)]
+            ):
                 self.page_of[(group, block)] = page
 
     def after_plan(self, plan) -> None:
@@ -222,9 +164,6 @@ class _Rank(closed_loop._Loop):
                 if request_id in self.started:
                     continue
                 self.started.add(request_id)
-                assert (
-                    request_id not in self.asked.values()
-                ), f"{request_id} is admitted before its lookup is settled"
                 pinned = self.pinned_for.get(request_id, 0)
                 assert op.extend_prefix_lens[i] >= pinned, (
                     f"{request_id} computes from {op.extend_prefix_lens[i]}: "
@@ -232,9 +171,6 @@ class _Rank(closed_loop._Loop):
                 )
         for op in plan.cache:
             if isinstance(op, ts.Cache.LoadBackOp):
-                assert (
-                    not self.lease_lost
-                ), "a load starts from the pool without the lease"
                 for op_id, groups, sources in zip(
                     op.op_ids, op.group_ids, op.src_pages
                 ):
@@ -247,16 +183,7 @@ class _Rank(closed_loop._Loop):
                         self.shared.reading[page] = self.shared.reading.get(page, 0) + 1
                     self.pool_resumes += 1
             elif isinstance(op, ts.Cache.SharedL2ReleaseOp):
-                self.commands.append(
-                    (self.round + self.io.randrange(3), ("release", op.ticket))
-                )
-            elif isinstance(op, ts.Cache.SharedL2AbandonOp):
-                self.commands.append(
-                    (
-                        self.round + self.io.randrange(3),
-                        ("abandon_lookup", op.lookup_id),
-                    )
-                )
+                self.commands.append((self.round + self.io.randrange(3), op.ticket))
             elif isinstance(op, ts.Cache.SharedL2TouchOp):
                 self.pool.touch(op.keys)
             elif isinstance(op, ts.Cache.SharedL2WriteOp):
@@ -266,15 +193,15 @@ class _Rank(closed_loop._Loop):
         self.carry_out(everything=False)
 
     def carry_out(self, everything: bool) -> None:
-        """The owner calls and write completions that are due."""
-        due = [c for when, c in self.commands if everything or when <= self.round]
+        """The releases and write completions that are due."""
+        due = [t for when, t in self.commands if everything or when <= self.round]
         self.commands = [
-            (when, c)
-            for when, c in self.commands
+            (when, t)
+            for when, t in self.commands
             if not (everything or when <= self.round)
         ]
-        for name, argument in due:
-            getattr(self.pool, name)(self.client, argument)
+        for ticket in due:
+            self.pool.release(self.client, ticket)
         writes = [op for when, op in self.writes if everything or when <= self.round]
         self.writes = [
             (when, op)
@@ -283,42 +210,20 @@ class _Rank(closed_loop._Loop):
         ]
         events = ts.ExecutionEvent()
         for op in writes:
-            draw = self.io.random()
-            if draw < 0.08:
-                # Given up before the reservation arrived; it may arrive late.
-                self.pool.abandon_write(self.client, op.write_id)
-                if self.io.random() < 0.5:
+            ticket, pages = self.pool.reserve(self.client, op.keys, op.buckets)
+            for key, page in zip(op.keys, pages):
+                if page >= 1:
                     assert (
-                        self.pool.reserve(
-                            self.client, op.write_id, op.keys, op.buckets
-                        )[0]
-                        == 0
+                        key[1],
+                        page,
+                    ) not in self.shared.reading, (
+                        f"pool page {(key[1], page)} is rewritten under a load-back"
                     )
-            elif draw < 0.16:
-                # Given up after it, and its commit arrives late.
-                ticket, _ = self.pool.reserve(
-                    self.client, op.write_id, op.keys, op.buckets
-                )
-                self.pool.abandon_write(self.client, op.write_id)
-                assert not self.pool.commit(self.client, ticket, op.publications)
-            else:
-                ticket, pages = self.pool.reserve(
-                    self.client, op.write_id, op.keys, op.buckets
-                )
-                for key, page in zip(op.keys, pages):
-                    if page >= 1:
-                        assert (
-                            key[1],
-                            page,
-                        ) not in self.shared.reading, (
-                            f"pool page {(key[1], page)} is rewritten under a load-back"
-                        )
-                        self.shared.granted += 1
-                assert self.pool.commit(self.client, ticket, op.publications) == (
-                    ticket != 0
-                )
-            self.failed_writes += draw < 0.16
-            events.add_event(ts.Cache.SharedL2WriteDone(op.write_id, draw >= 0.16))
+                    self.shared.granted += 1
+            assert self.pool.commit(self.client, ticket, op.publications) == (
+                ticket != 0
+            )
+            events.add_event(ts.Cache.SharedL2WriteDone(op.write_id))
         if writes:
             self.real.advance(events)
 
@@ -358,9 +263,9 @@ def _run(seed: int, roles) -> dict:
         for rank in ranks:
             rank.round = round_
             rank.step(ROUNDS)
-    # No new prompt: every lookup is settled, every command carried out and
-    # every operation acknowledged, round after round, until every request
-    # has left its scheduler and a plan has nothing left to run.
+    # No new prompt: every command is carried out and every operation
+    # acknowledged, round after round, until every request has left its
+    # scheduler and a plan has nothing left to run.
     for round_ in range(ROUNDS, 10 * ROUNDS):
         idle = True
         for rank in ranks:
@@ -368,7 +273,6 @@ def _run(seed: int, roles) -> dict:
             while rank.pending:
                 rank.land(rank.pending.pop(0))
             rank.acknowledge(everything=True)
-            rank.settle(everything=True)
             if rank.prefill_only:
                 rank.peer(None)
             plan = rank.scheduler.next_execution_plan()
@@ -387,7 +291,6 @@ def _run(seed: int, roles) -> dict:
                 or plan.cache
                 or plan.remote_decode is not None
                 or rank.acks
-                or rank.answers
                 or rank.writes
                 or rank.commands
             ):
@@ -399,11 +302,7 @@ def _run(seed: int, roles) -> dict:
         pytest.fail("the ranks did not drain")
     for rank in ranks:
         stats = rank.real.shared_l2_stats()
-        assert (stats.pending_lookups, stats.tickets, stats.writes_in_flight) == (
-            0,
-            0,
-            0,
-        )
+        assert (stats.tickets, stats.writes_in_flight) == (0, 0)
         assert rank.real.host_pool_cached_blocks() == 0, "a proxy entry is left"
         assert rank.real.waiting_size() == 0
         assert rank.real.can_clear_cache()
@@ -418,19 +317,9 @@ def _run(seed: int, roles) -> dict:
         "pool resumes": sum(rank.pool_resumes for rank in ranks),
         "pool evictions": pool["evicted_blocks"],
         "pages written": shared.granted,
-        "abandoned lookups": sum(
-            rank.real.shared_l2_stats().abandoned_lookups for rank in ranks
-        ),
-        "failed writes": sum(
-            rank.real.shared_l2_stats().failed_writes for rank in ranks
-        ),
         "aborts": sum(rank.aborts for rank in ranks),
         "junction or pool hits": sum(
             rank.real.shared_l2_stats().hits for rank in ranks
-        ),
-        "lease losses": sum(rank.lease_losses for rank in ranks),
-        "hits given up for the lease": sum(
-            rank.real.shared_l2_stats().lease_expired_hits for rank in ranks
         ),
     }
 

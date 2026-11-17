@@ -534,8 +534,6 @@ mod ffi {
         Release,
         /// Refresh the pool's copies of keys (`SharedL2TouchOperation`).
         Touch,
-        /// Forget a lookup nothing waits for (`SharedL2AbandonOperation`).
-        Abandon,
     }
 
     /// A shared L2 pool command a plan carries, for the rank's pool client.
@@ -543,8 +541,7 @@ mod ffi {
     struct SharedL2OpView {
         /// What it does.
         kind: SharedL2OpKind,
-        /// A write's id, a release's ticket, an abandon's lookup id; unused
-        /// by a touch.
+        /// A write's id, a release's ticket; unused by a touch.
         id: u64,
         /// A write's or a touch's keys.
         keys: Vec<SharedL2KeyView>,
@@ -556,40 +553,20 @@ mod ffi {
         publications: Vec<SharedL2PublicationView>,
     }
 
-    /// A pool write that ended (`cache::SharedL2WriteDone`).
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    struct SharedL2WriteDoneView {
-        /// The write.
-        write_id: u64,
-        /// It was committed; else given up.
-        success: bool,
-    }
-
     /// The scheduler's observations of its shared L2 pool (`SharedL2Stats`).
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     struct SharedL2StatsView {
         /// Lookups handed out, cumulative.
         lookups: u64,
-        /// Answers that pinned something at the owner, cumulative; the two
-        /// kinds of hit below are among them.
+        /// Answers that pinned something at the owner, cumulative; the
+        /// proxy overflows are among them.
         hits: u64,
-        /// Lookups that ended without an answer applied, cumulative: given
-        /// up by the runtime, or left by their request.
-        abandoned_lookups: u64,
         /// Hits the proxy Host tier had no room for, cumulative.
         proxy_overflows: u64,
-        /// Hits waiting prompts gave up for a lost lease, cumulative.
-        lease_expired_hits: u64,
-        /// Lookups not answered.
-        pending_lookups: u64,
         /// Owner tickets not released.
         tickets: u64,
         /// Writes not completed.
         writes_in_flight: u64,
-        /// Writes reported failed, cumulative.
-        failed_writes: u64,
-        /// The blocks those writes carried, cumulative.
-        failed_write_blocks: u64,
     }
 
     unsafe extern "C++" {
@@ -613,7 +590,7 @@ mod ffi {
             cancellations: &[StorageCancellationView],
             done: &[StorageDoneView],
             cache_events: &[CacheEvent],
-            pool_writes: &[SharedL2WriteDoneView],
+            pool_writes: &[u64],
         ) -> Result<()>;
         fn demote_sessions(
             scheduler: Pin<&mut Scheduler>,
@@ -665,11 +642,6 @@ mod ffi {
             scheduler: Pin<&mut Scheduler>,
             answer: &SharedL2AnswerView,
         ) -> Result<Vec<SharedL2PageView>>;
-        fn abandon_shared_l2_lookups(
-            scheduler: Pin<&mut Scheduler>,
-            lookup_ids: &[u64],
-        ) -> Result<()>;
-        fn set_shared_l2_lease_lost(scheduler: Pin<&mut Scheduler>, lost: bool) -> Result<()>;
         fn shared_l2_stats(scheduler: &Scheduler) -> SharedL2StatsView;
 
         fn plan_forward_batches(plan: &ExecutionPlan) -> Vec<ForwardBatchView>;
@@ -700,9 +672,8 @@ pub use ffi::{
     ForwardBatchView, ForwardEvent, ForwardEventKind, KvEventView, PrefillGateProbe, PrefixHitView,
     RequestSpec, SchedulerAbortView, SchedulerSizes, SharedL2AnswerView, SharedL2KeyView,
     SharedL2LookupView, SharedL2OpKind, SharedL2OpView, SharedL2PageView, SharedL2PublicationView,
-    SharedL2StatsView, SharedL2WriteDoneView, StorageCancellationView, StorageDoneView,
-    StorageKeyView, StorageOpKind, StorageOpView, StorageStatsView, StorageTickView,
-    TransferBatchView,
+    SharedL2StatsView, StorageCancellationView, StorageDoneView, StorageKeyView, StorageOpKind,
+    StorageOpView, StorageStatsView, StorageTickView, TransferBatchView,
 };
 
 /// What advances the scheduler at the head of a round: with L3, the agreed
@@ -853,12 +824,13 @@ impl Scheduler {
     }
 
     /// Feed the round head's storage events, cache-op acknowledgments and,
-    /// with a shared L2 pool, its finished writes back, as one event batch.
+    /// with a shared L2 pool, the ids of its finished writes back, as one
+    /// event batch.
     pub fn advance_head(
         &mut self,
         storage: &StorageRound,
         cache_events: &[CacheEvent],
-        pool_writes: &[SharedL2WriteDoneView],
+        pool_writes: &[u64],
     ) -> Result<(), cxx::Exception> {
         let _span = profile::span("Scheduler::advance_head");
         let ticks: &[StorageTickView] = storage.tick.as_slice();
@@ -874,38 +846,23 @@ impl Scheduler {
 
     /// With a shared L2 pool: the lookups of the waiting prompts not handed
     /// out yet, each once. A prompt is admitted only once its lookup is
-    /// answered or abandoned; one whose Device prefix covers what it may
-    /// reuse asks nothing.
+    /// answered; one whose Device prefix covers what it may reuse asks
+    /// nothing.
     pub fn shared_l2_lookups(&mut self) -> Vec<SharedL2LookupView> {
         let _span = profile::span("Scheduler::shared_l2_lookups");
         ffi::shared_l2_lookups(self.pinned())
     }
 
     /// Settle a lookup with the pool's answer. Returns the proxy Host blocks
-    /// created, for the pool's loader; an answer nothing waits for any more
-    /// creates none, and a later plan releases its ticket. Fails, leaving the
-    /// lookup pending, on an answer that does not fit its prompt.
+    /// created, for the pool's loader. Fails on an answer the scheduler
+    /// cannot take: one no lookup waits for, or that does not fit its
+    /// prompt.
     pub fn apply_shared_l2_lookup(
         &mut self,
         answer: &SharedL2AnswerView,
     ) -> Result<Vec<SharedL2PageView>, cxx::Exception> {
         let _span = profile::span("Scheduler::apply_shared_l2_lookup");
         ffi::apply_shared_l2_lookup(self.pinned(), answer)
-    }
-
-    /// Give lookups up before their answers: each counts as a miss, and the
-    /// next plan tells the owner. Answered and unknown ids are ignored.
-    pub fn abandon_shared_l2_lookups(&mut self, lookup_ids: &[u64]) -> Result<(), cxx::Exception> {
-        ffi::abandon_shared_l2_lookups(self.pinned(), lookup_ids)
-    }
-
-    /// Report the lease on what the lookups pinned at the owner, after the
-    /// answers of the same poll were applied. The scheduler keeps the state
-    /// until the next report. While the lease is lost no plan starts a load
-    /// from the pool; each report of a lost lease gives up every hit a
-    /// waiting prompt holds, so the prompts compute their prefixes.
-    pub fn set_shared_l2_lease_lost(&mut self, lost: bool) -> Result<(), cxx::Exception> {
-        ffi::set_shared_l2_lease_lost(self.pinned(), lost)
     }
 
     /// The scheduler's observations of its shared L2 pool; zeros without one.

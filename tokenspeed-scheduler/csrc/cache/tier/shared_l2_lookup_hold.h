@@ -32,11 +32,11 @@ class SharedL2Proxy;
 // A waiting prompt's claim on its pool lookup, owned by its pre-admission
 // state: pending until the pool's answer is applied, then the proxy Host
 // entries the answer mirrored, pinned. Whatever ends the wait -- admission
-// consuming the state, an abort, the runtime giving the lookup up -- drops
-// it: a pending lookup is abandoned at the owner, and the proxy entries are
-// let go (the load-back an admission started holds its sources itself).
-// Move-only; an empty hold claims nothing. The proxy must outlive every hold
-// it issued.
+// consuming the state, an abort -- drops it, and the proxy entries are let
+// go (the load-back an admission started holds its sources itself). The
+// runtime answers a lookup in the call that sent it, so a hold is pending
+// only between SharedL2Lookups and ApplySharedL2Lookups. Move-only; an empty
+// hold claims nothing. The proxy must outlive every hold it issued.
 class SharedL2LookupHold {
 public:
     SharedL2LookupHold() noexcept = default;
@@ -49,8 +49,6 @@ public:
     explicit operator bool() const noexcept { return proxy_ != nullptr; }
     // The id the runtime answers the lookup under.
     std::uint64_t LookupId() const noexcept { return lookup_id_; }
-    // Whether the answer was a hit: proxy entries are pinned.
-    bool HoldsHit() const noexcept { return !blocks_.empty(); }
     // Ends the claim now and leaves the hold empty.
     void reset() noexcept;
 
