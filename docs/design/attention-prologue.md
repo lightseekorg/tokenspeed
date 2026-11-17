@@ -78,10 +78,11 @@ It joins the selection before core attention consumes either result, passing
 `k = v = None` to preserve the prepared-query contract. Output gating and
 projection use the same path as serial attention.
 
-The current latency policy covers a single target request with four verify
-rows. Prefill and mixed rounds, draft narrowing, layerwise load-backs, FP8
-attention projections and prefill graph breaks retain serial ordering. A layer
-without an auxiliary stream is serial too. Index geometry is derived from the
+The current latency policy covers up to 128 target requests on TP1 and one
+request on other TP sizes, with four verify rows per request. Prefill and mixed
+rounds, draft narrowing, layerwise load-backs, FP8 attention projections and
+prefill graph breaks retain serial ordering. A layer without an auxiliary
+stream is serial too. Index geometry is derived from the
 indexer, not a fixed model width or TP topology. Eager forwards record the
 cross-stream temporary lifetimes; graph capture records fork/join dependencies
 and keeps graph-pool storage. There is no new persistent request or cache state.

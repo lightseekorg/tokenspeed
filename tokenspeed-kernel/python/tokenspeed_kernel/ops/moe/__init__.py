@@ -43,6 +43,7 @@ from tokenspeed_kernel.signature import (
 )
 
 __all__ = [
+    "try_router_gemm_nvfp4",
     "bf16_moe_routes",
     "bf16_moe_routes_warmup",
     "gather_moe_routes",
@@ -81,6 +82,71 @@ __all__ = [
     "prepare_moe_sorted_down_weight",
     "warmup_moe_sorted_prefill",
 ]
+
+
+def try_router_gemm_nvfp4(
+    hidden_states: torch.Tensor,
+    router_weight: torch.Tensor,
+    quant_scale: torch.Tensor,
+    *,
+    override: str | None = None,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]] | None:
+    """Try a fused router projection and NVFP4 input producer.
+
+    Inputs are [tokens, hidden] activations, [experts, hidden] BF16 weights,
+    and a scalar FP32 *quantization-domain* global scale (as used by the MoE
+    consumer). Return BF16 logits and (packed E2M1 rows, linear E4M3 block
+    scales), or None when automatic selection has no matching implementation.
+    The caller retains routing and the unfused fallback. Explicit overrides
+    must execute or raise; they are never silently ignored.
+    """
+    if hidden_states.ndim != 2 or router_weight.ndim != 2:
+        raise ValueError("router projection requires 2D input and weights")
+    if router_weight.shape[1] != hidden_states.shape[1]:
+        raise ValueError("router weight width must match hidden states")
+    if quant_scale.numel() != 1 or quant_scale.dtype != torch.float32:
+        raise ValueError("router quantization scale must be a scalar FP32 tensor")
+    if any(t.device != hidden_states.device for t in (router_weight, quant_scale)):
+        raise ValueError("router inputs must be on the same device")
+    traits = {
+        "tokens": hidden_states.shape[0],
+        "hidden_size": hidden_states.shape[1],
+        "num_experts": router_weight.shape[0],
+        "inputs_contiguous": all(
+            t.is_contiguous() for t in (hidden_states, router_weight, quant_scale)
+        ),
+        "inputs_aligned_16": hidden_states.data_ptr() % 16
+        == router_weight.data_ptr() % 16
+        == 0,
+        "pdl_enabled": pdl_enabled(),
+    }
+    override = resolve_kernel_override("moe", "router_gemm_nvfp4", override)
+    try:
+        kernel = select_kernel(
+            "moe",
+            "router_gemm_nvfp4",
+            format_signature(
+                hidden_states=dense_tensor_format(hidden_states.dtype),
+                router_weight=dense_tensor_format(router_weight.dtype),
+            ),
+            traits=traits,
+            override=override,
+        )
+    except NoKernelFoundError:
+        if override is not None:
+            raise
+        return None
+    ShapeCapture.get().record(
+        "moe", "router_gemm_nvfp4", kernel.name, hidden_states.dtype, traits
+    )
+    with kernel_scope(
+        "moe",
+        "router_gemm_nvfp4",
+        hidden_states.dtype,
+        kernel_name=kernel.name,
+        **traits,
+    ):
+        return kernel(hidden_states, router_weight, quant_scale)
 
 
 def plan_softmax_bias_topk(
