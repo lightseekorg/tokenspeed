@@ -36,23 +36,19 @@ Requests (``wire``), by ``op``; every reply also carries ``ok``:
 * ``provider``: ``session`` (the provider's ``host:port``), ``base``,
   ``bytes``.
 * ``hello``: ``client``, ``geometry``, ``deployment_id`` -> ``ready``, and once
-  ready ``providers``, ``lcm_bytes``, ``client_timeout_s``.
+  ready ``providers``, ``lcm_bytes``.
 * ``ping``: ``client``.
-* ``probe_many``: ``client``, ``lookups`` ``[[lookup_id, prefix_hashes, tokens,
+* ``probe_many``: ``client``, ``lookups`` ``[[prefix_hashes, tokens,
   max_tokens]]`` -> ``hits`` ``[[ticket, num_tokens, kv_tokens, tail,
   [[key, bucket, page]]]]``, one per lookup. Each hit is pinned under its
   ticket; ticket 0 pins nothing.
-* ``abandon_lookup``: ``client``, ``lookup_ids``.
 * ``release``: ``client``, ``ticket``.
-* ``reserve``: ``client``, ``write_id``, ``keys``, ``buckets`` -> ``ticket``,
-  ``pages`` (one per key; negative: nothing to write).
+* ``reserve``: ``client``, ``keys``, ``buckets`` -> ``ticket``, ``pages`` (one
+  per key; negative: nothing to write).
 * ``commit``: ``client``, ``ticket``, ``publications`` ``[[tokens,
   prefix_hashes, tail, publisher]]`` -> ``committed``.
-* ``abandon_write``: ``client``, ``write_id``.
 * ``touch``: ``client``, ``keys``, ``buckets``.
 * ``clear`` -> ``cleared``; ``stats`` -> ``stats``, ``providers``, ``clients``.
-
-``release``, ``abandon_lookup`` and ``abandon_write`` may be repeated.
 
 A client's geometry is its scheduler's view of the cache: ``prefix_granularity``,
 ``lcm_bytes`` and, per cache group in the scheduler's order, ``group_id``,
@@ -187,25 +183,16 @@ class SharedL2Owner:
             return {"ok": True}
         if op == "probe_many":
             hits = [
-                pool.probe(
-                    client, int(lookup_id), prefix_hashes, tokens, int(max_tokens)
-                )
-                for lookup_id, prefix_hashes, tokens, max_tokens in request["lookups"]
+                pool.probe(client, prefix_hashes, tokens, int(max_tokens))
+                for prefix_hashes, tokens, max_tokens in request["lookups"]
             ]
             return {"ok": True, "hits": hits}
-        if op == "abandon_lookup":
-            for lookup_id in request["lookup_ids"]:
-                pool.abandon_lookup(client, int(lookup_id))
-            return {"ok": True}
         if op == "release":
             pool.release(client, int(request["ticket"]))
             return {"ok": True}
         if op == "reserve":
             ticket, pages = pool.reserve(
-                client,
-                int(request["write_id"]),
-                [tuple(key) for key in request["keys"]],
-                request["buckets"],
+                client, [tuple(key) for key in request["keys"]], request["buckets"]
             )
             return {"ok": True, "ticket": ticket, "pages": pages}
         if op == "commit":
@@ -220,9 +207,6 @@ class SharedL2Owner:
             ]
             committed = pool.commit(client, int(request["ticket"]), publications)
             return {"ok": True, "committed": committed}
-        if op == "abandon_write":
-            pool.abandon_write(client, int(request["write_id"]))
-            return {"ok": True}
         if op == "touch":
             # The pool's touch takes no bucket: it holds one per group so far.
             if any(request["buckets"]):
@@ -306,7 +290,6 @@ class SharedL2Owner:
             "ready": True,
             "providers": self._providers,
             "lcm_bytes": self._lcm_bytes,
-            "client_timeout_s": self._client_timeout_s,
         }
 
 

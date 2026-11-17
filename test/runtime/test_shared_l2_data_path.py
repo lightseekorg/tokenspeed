@@ -47,12 +47,7 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
-from test.runtime.shared_l2_test_utils import (  # noqa: E402
-    ServedOwner,
-    lookup_fields,
-    wait_until,
-    write_fields,
-)
+from test.runtime.shared_l2_test_utils import wait_until  # noqa: E402
 
 import tokenspeed_engine.scheduler as ts  # noqa: E402
 from tokenspeed_kernel.platform import current_platform  # noqa: E402
@@ -67,8 +62,6 @@ from tokenspeed.runtime.cache.l2.layerwise_load import (  # noqa: E402
 )
 from tokenspeed.runtime.cache.shared_l2 import executor as executor_module  # noqa: E402
 from tokenspeed.runtime.cache.shared_l2.client import (  # noqa: E402
-    SharedL2Client,
-    SharedL2ClientConfig,
     SharedL2PoolView,
     SharedL2Provider,
 )
@@ -84,7 +77,6 @@ from tokenspeed.runtime.cache.shared_l2.transfer import (  # noqa: E402
     RdmaEngine,
     SharedL2Transfer,
 )
-from tokenspeed.runtime.cache.shared_l2.wire import OwnerConnection  # noqa: E402
 from tokenspeed.runtime.cache.transfer.layout import (  # noqa: E402
     CacheField,
     CacheGroupLayout,
@@ -335,17 +327,12 @@ class Rank:
     """A rank's load path over a pool: its arena, its tracker and executor,
     and the proxy pages its scheduler would have mapped."""
 
-    def __init__(
-        self, pool, *, device="cpu", engine=None, words=PlainWords, load_pool=None
-    ):
+    def __init__(self, pool, *, device="cpu", engine=None, words=PlainWords):
         self.pool = pool
         self.arena = Arena(device)
         self.engine = engine if engine is not None else MemoryEngine()
         self.tracker = LayerwiseLoadTracker(len(CONSUMERS))
         self.proxy_pages = {}
-        # The tickets a load may still start from, unless a pool client's
-        # ``load_pool`` decides.
-        self.allowed_tickets = {1}
         # What the executor had stopped when it closed the pool client.
         self.closed_after = []
         self.executor = SharedL2LoadExecutor(
@@ -354,14 +341,8 @@ class Rank:
             signals=words,
             trackers=[(self.tracker, len(CONSUMERS))],
             proxy_page=lambda group, block: self.proxy_pages[group, block],
-            load_pool=load_pool
-            or (
-                lambda ticket: (
-                    self.pool.view if ticket in self.allowed_tickets else None
-                )
-            ),
+            pool=self.pool.view,
             load_workers=2,
-            num_lcm_blocks=self.pool.view.num_lcm_blocks,
             close=lambda: self.closed_after.append(
                 [thread.name for thread in threading.enumerate()]
             ),
@@ -370,13 +351,13 @@ class Rank:
         # The stream the forward's layer waits go to.
         self.forward = executor_module.device_module.current_stream()
 
-    def load(self, op_id, rows, *, ticket=1, stream=None):
+    def load(self, op_id, rows, *, stream=None):
         """Submit the load of ``(group, pool page, Device block)`` rows, each
         page behind a proxy Host block of its own."""
         proxied = []
         for group, page, block in rows:
             proxy = 100 + len(self.proxy_pages)
-            self.proxy_pages[group, proxy] = (ticket, 0, page)
+            self.proxy_pages[group, proxy] = (0, page)
             proxied.append((group, proxy, block))
         if stream is None:
             stream = self.forward
@@ -818,111 +799,6 @@ def test_a_plan_without_a_load_waits_for_none(pool, ranks):
     assert len(reader.words.waits) == waits
 
 
-def test_a_load_does_not_start_once_the_pins_may_be_gone(pool, ranks):
-    store(pool)
-    reader = ranks()
-    reader.allowed_tickets = {2}
-
-    reader.load(7, LOADED, ticket=1)
-    # The forward is let go, with nothing read into its blocks.
-    reader.run_forward()
-
-    assert reader.engine.copies == []
-    assert not reader.arena.kv.any() and not reader.arena.state.any()
-    with pytest.raises(RuntimeError, match="shared L2 load failed") as failure:
-        reader.executor.poll_results()
-    assert "lease on the pool pages ran out" in str(failure.value.__cause__)
-
-
-@pytest.mark.parametrize(
-    "case", ["silent owner", "restarted owner", "past the start bound"]
-)
-def test_a_planned_load_starts_until_its_start_bound_from_a_pool_the_rank_left(
-    pool, ranks, case
-):
-    """The pool's client decides: its lease on a hit, and the pool a load
-    planned from the hit reads, with the owner silent or restarted."""
-    owner = ServedOwner(num_providers=2, joined_providers=0, lcm_bytes=None)
-    for provider in pool.view.providers:
-        owner.admin.request(
-            "provider",
-            session=provider.session,
-            base=provider.base,
-            bytes=provider.lcm_blocks * pool.view.lcm_bytes,
-        )
-    late = case == "past the start bound"
-    config = SharedL2ClientConfig.from_json(
-        json.dumps(
-            {
-                "owner": owner.address,
-                "device_names": [""],
-                "request_timeout_ms": 100,
-                "connect_timeout_s": 5,
-                "lookup_deadline_ms": 3000,
-                # The rank leaves a silent pool long before the start bound of
-                # its tickets; or it stays and the start bound passes.
-                "no_pool_after_s": 30 if late else 1,
-                "lease_s": 0.2 if late else 30,
-                "load_start_margin_s": 0.2 if late else 5,
-                "load_workers": 1,
-                "write_workers": 1,
-                "scheduler": {"max_writes": 2, "max_write_keys": 64},
-            }
-        )
-    )
-    layout = Arena().layout
-    client = SharedL2Client(
-        config,
-        geometry=layout.geometry,
-        deployment_id="deployment",
-        transfer=SharedL2Transfer(layout, MemoryEngine()),
-        connection=OwnerConnection(owner.address, timeout_ms=100),
-    )
-    try:
-        # A hit of the pool, and the load of a plan made from it whose start
-        # word has not landed.
-        prompt = [1, 2, 3, 4, 5]
-        client.submit_write(1, *write_fields(prompt))
-        wait_until(lambda: client.poll_writes() == [(1, True)])
-        writer = store(pool)
-        client.submit_lookups([(10, "request", *lookup_fields(prompt))])
-        answered = []
-        wait_until(lambda: answered.extend(client.poll_lookups()) or answered)
-        ticket = answered[0][1]
-        assert ticket != 0
-        reader = ranks(load_pool=client.load_pool)
-        reader.words.hold_writes = True
-        reader.load(7, LOADED, ticket=ticket)
-
-        if case == "restarted owner":
-            # The new owner has no provider: the rank finds no pool to join.
-            owner.close()
-            owner = ServedOwner(address=owner.address, joined_providers=0)
-        else:
-            owner.stall()
-        if late:
-            wait_until(lambda: client.load_pool(ticket) is None)
-            assert not client.no_pool
-        else:
-            wait_until(lambda: client.no_pool)
-        reader.words.release_writes()
-        reader.run_forward()
-
-        if late:
-            with pytest.raises(RuntimeError, match="shared L2 load failed") as failure:
-                reader.executor.poll_results()
-            assert "lease on the pool pages ran out" in str(failure.value.__cause__)
-            assert reader.engine.copies == []
-        else:
-            assert_loaded(reader.arena, writer)
-            wait_until(
-                lambda: [event.op_id for event in reader.executor.poll_results()] == [7]
-            )
-    finally:
-        client.close()
-        owner.close()
-
-
 def test_a_failed_read_lets_the_forward_go_and_fails_the_next_poll(pool, ranks):
     store(pool)
     reader = ranks()
@@ -1035,9 +911,6 @@ def pool_config() -> str:
             "device_names": ["mlx5_0"],
             "request_timeout_ms": 1000,
             "connect_timeout_s": 60,
-            "lookup_deadline_ms": 5,
-            "no_pool_after_s": 10,
-            "lease_s": 20,
             "load_workers": 2,
             "write_workers": 2,
             "scheduler": {"max_writes": 4, "max_write_keys": 256},

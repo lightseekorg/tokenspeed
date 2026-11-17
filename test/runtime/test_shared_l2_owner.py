@@ -23,6 +23,7 @@ served from a thread, asked through ``OwnerConnection``. The pool behind it
 keeps the books of the scheduler's ``SharedL2Pool`` in Python."""
 
 import copy
+import functools
 import os
 import subprocess
 import sys
@@ -50,7 +51,10 @@ from test.runtime.shared_l2_test_utils import (  # noqa: E402
 )
 
 from tokenspeed.runtime.cache.shared_l2.layout import SharedL2Layout  # noqa: E402
-from tokenspeed.runtime.cache.shared_l2.owner import make_pool  # noqa: E402
+from tokenspeed.runtime.cache.shared_l2.owner import (  # noqa: E402
+    SharedL2Owner,
+    make_pool,
+)
 from tokenspeed.runtime.cache.shared_l2.provider import run_provider  # noqa: E402
 from tokenspeed.runtime.cache.shared_l2.wire import (  # noqa: E402
     OwnerConnection,
@@ -101,21 +105,21 @@ def connect():
         connection.close()
 
 
-def store(connection: OwnerConnection, client: int, write_id: int, prompt) -> list:
+def store(connection: OwnerConnection, client: int, prompt) -> list:
     """Reserve and commit ``prompt``'s blocks and checkpoint; its keys."""
     keys, buckets, _, publications = write_fields(prompt)
-    ticket = connection.request(
-        "reserve", client=client, write_id=write_id, keys=keys, buckets=buckets
-    )["ticket"]
+    ticket = connection.request("reserve", client=client, keys=keys, buckets=buckets)[
+        "ticket"
+    ]
     assert connection.request(
         "commit", client=client, ticket=ticket, publications=publications
     )["committed"]
     return keys
 
 
-def probe(connection: OwnerConnection, client: int, lookup_id: int, prompt) -> list:
+def probe(connection: OwnerConnection, client: int, prompt) -> list:
     (hit,) = connection.request(
-        "probe_many", client=client, lookups=[[lookup_id, *lookup_fields(prompt)]]
+        "probe_many", client=client, lookups=[lookup_fields(prompt)]
     )["hits"]
     return hit
 
@@ -135,7 +139,6 @@ def test_a_hello_is_not_ready_until_every_provider_joined(serve):
     owner.add_provider("node1", 4)
     reply = owner.admin.request("hello", client=1, **hello)
     assert reply["ready"] and reply["lcm_bytes"] == LCM_BYTES
-    assert reply["client_timeout_s"] == 60.0
     # A provider's LCM blocks follow those of the providers before it.
     assert reply["providers"] == [
         {"session": "node0", "base": 1 << 40, "lcm_blocks": 8, "start": 0},
@@ -267,15 +270,12 @@ def test_a_provider_smaller_than_a_block_stops_the_pool_from_being_built(serve):
 def test_probe_many_answers_every_lookup_in_order_and_pins_each_hit(serve, connect):
     owner = serve()
     writer, reader = connect(owner, 1), connect(owner, 2)
-    keys = store(writer, 1, 10, PROMPT)
+    keys = store(writer, 1, PROMPT)
 
     hits = reader.request(
         "probe_many",
         client=2,
-        lookups=[
-            [20, *lookup_fields(PROMPT + [6, 7])],
-            [21, *lookup_fields([9, 9, 9])],
-        ],
+        lookups=[lookup_fields(PROMPT + [6, 7]), lookup_fields([9, 9, 9])],
     )["hits"]
 
     ticket, num_tokens, kv_tokens, tail, slots = hits[0]
@@ -293,83 +293,65 @@ def test_probe_many_answers_every_lookup_in_order_and_pins_each_hit(serve, conne
     assert owner.pool.received["probe"] == (hashes, tokens, max_tokens)
 
 
-def test_a_write_is_reserved_then_committed_or_abandoned(serve, connect):
+def test_a_write_is_reserved_then_committed(serve, connect):
     owner = serve(provider_blocks=4)
     first, second = connect(owner, 1), connect(owner, 2)
     keys, buckets, _, publications = write_fields(PROMPT)
     reserve = dict(keys=keys, buckets=buckets)
 
-    reply = first.request("reserve", client=1, write_id=10, **reserve)
+    reply = first.request("reserve", client=1, **reserve)
     assert reply["ticket"] != 0 and all(page > 0 for page in reply["pages"])
     # The keys reached the pool as the tuples they were, each with its bucket.
     assert owner.pool.received["reserve"] == (keys, buckets)
     # Another client gets no page for a block that is being written.
-    assert second.request("reserve", client=2, write_id=20, **reserve) == {
+    assert second.request("reserve", client=2, **reserve) == {
         "ok": True,
         "ticket": 0,
         "pages": [-1] * len(keys),
     }
+    assert owner.stats()["reserved_blocks"] == len(keys)
 
-    # An abandoned write frees its pages, and may be abandoned again.
-    for _ in range(2):
-        assert first.request("abandon_write", client=1, write_id=10) == {"ok": True}
-    assert owner.stats()["reserved_blocks"] == 0
+    assert first.request(
+        "commit", client=1, ticket=reply["ticket"], publications=publications
+    )["committed"]
+    assert owner.pool.received["commit"] == publications
+    stats = owner.stats()
+    assert (stats["reserved_blocks"], stats["cached_blocks"]) == (0, len(keys))
+    # A ticket that reserves nothing commits nothing.
     assert not first.request(
         "commit", client=1, ticket=reply["ticket"], publications=publications
     )["committed"]
-    assert owner.stats()["cached_blocks"] == 0
-
-    ticket = second.request("reserve", client=2, write_id=21, **reserve)["ticket"]
-    assert second.request("commit", client=2, ticket=ticket, publications=publications)[
-        "committed"
-    ]
-    assert owner.pool.received["commit"] == publications
-    # Abandoning a committed write changes nothing.
-    second.request("abandon_write", client=2, write_id=21)
-    assert owner.stats()["cached_blocks"] == len(keys)
 
     # One free page is left of four: the second new block has no room.
     more = [(0, 0, "x", 0), (0, 0, "y", 0)]
     assert (
-        first.request("reserve", client=1, write_id=11, keys=more, buckets=[0, 0])[
-            "pages"
-        ][1]
-        == -2
+        first.request("reserve", client=1, keys=more, buckets=[0, 0])["pages"][1] == -2
     )
 
 
-def test_release_and_abandon_lookup_can_be_repeated(serve, connect):
+def test_a_release_unpins_what_its_clients_lookup_hit(serve, connect):
     owner = serve()
     writer, reader = connect(owner, 1), connect(owner, 2)
-    keys = store(writer, 1, 10, PROMPT)
+    keys = store(writer, 1, PROMPT)
 
-    released = probe(reader, 2, 20, PROMPT)[0]
-    abandoned = probe(reader, 2, 21, PROMPT)[0]
+    first = probe(reader, 2, PROMPT)[0]
+    second = probe(reader, 2, PROMPT)[0]
+    assert first != second
     assert owner.stats()["pinned_blocks"] == 2 * len(keys)
 
-    for _ in range(2):
-        assert reader.request("release", client=2, ticket=released) == {"ok": True}
+    assert reader.request("release", client=2, ticket=first) == {"ok": True}
     assert owner.stats()["pinned_blocks"] == len(keys)
-    for _ in range(2):
-        assert reader.request("abandon_lookup", client=2, lookup_ids=[21, 99]) == {
-            "ok": True
-        }
-    assert owner.stats()["pinned_blocks"] == 0
-    assert abandoned != released
     # A ticket is its client's: another client's release does not touch it.
-    kept = probe(reader, 2, 22, PROMPT)[0]
-    writer.request("release", client=1, ticket=kept)
+    writer.request("release", client=1, ticket=second)
     assert owner.stats()["pinned_blocks"] == len(keys)
 
 
 def test_a_silent_client_loses_what_it_held_and_is_told_so(serve, connect):
     owner = serve(client_timeout_s=0.5)
     silent, alive = connect(owner, 1), connect(owner, 2)
-    store(alive, 2, 10, PROMPT)
-    probe(silent, 1, 20, PROMPT)
-    silent.request(
-        "reserve", client=1, write_id=21, keys=[(0, 0, "new", 0)], buckets=[0]
-    )
+    store(alive, 2, PROMPT)
+    probe(silent, 1, PROMPT)
+    silent.request("reserve", client=1, keys=[(0, 0, "new", 0)], buckets=[0])
     assert owner.stats()["pinned_blocks"] > 0 and owner.stats()["reserved_blocks"] == 1
 
     deadline = time.monotonic() + 5
@@ -391,7 +373,7 @@ def test_a_silent_client_loses_what_it_held_and_is_told_so(serve, connect):
 def test_touch_clear_and_stats(serve, connect):
     owner = serve()
     client = connect(owner, 1)
-    keys = store(client, 1, 10, PROMPT)
+    keys = store(client, 1, PROMPT)
 
     client.request("touch", client=1, keys=keys[:2], buckets=[0, 0])
     assert owner.pool.touched == keys[:2]
@@ -399,7 +381,7 @@ def test_touch_clear_and_stats(serve, connect):
     with pytest.raises(OwnerError, match="bucket 0 only"):
         client.request("touch", client=1, keys=keys[:1], buckets=[1])
 
-    ticket = probe(client, 1, 20, PROMPT)[0]
+    ticket = probe(client, 1, PROMPT)[0]
     assert owner.admin.request("clear") == {"ok": True, "cleared": False}
     client.request("release", client=1, ticket=ticket)
     assert owner.admin.request("clear") == {"ok": True, "cleared": True}
@@ -419,20 +401,24 @@ def test_a_failed_request_gets_an_error_and_the_owner_keeps_serving(serve, conne
     # A pool error fails the request, not the owner.
     owner.pool.failing.add("reserve")
     with pytest.raises(OwnerError, match="reserve failed"):
-        client.request("reserve", client=1, write_id=1, keys=[], buckets=[])
+        client.request("reserve", client=1, keys=[], buckets=[])
     assert client.request("ping", client=1) == {"ok": True}
 
 
 def test_a_stalled_owner_times_a_request_out_and_answers_the_next(serve, connect):
     owner = serve()
-    client = connect(owner, 1)
-    owner.stall()
-    with pytest.raises(TimeoutError):
-        client.request("ping", client=1, timeout_ms=50)
-    owner.resume()
-    # The late answer to the first ping is not taken for this request's.
-    assert client.request("stats")["clients"] == 1
-    wait_until(lambda: client.request("ping", client=1) == {"ok": True})
+    connect(owner, 1)
+    client = OwnerConnection(owner.address, timeout_ms=200)
+    try:
+        owner.stall()
+        with pytest.raises(TimeoutError):
+            client.request("ping", client=1)
+        owner.resume()
+        # The late answer to the first ping is not taken for this request's.
+        assert client.request("stats")["clients"] == 1
+        wait_until(lambda: client.request("ping", client=1) == {"ok": True})
+    finally:
+        client.close()
 
 
 def test_a_provider_registers_its_memory_and_joins_the_pool(serve, monkeypatch):
@@ -547,7 +533,7 @@ def test_the_owner_service_runs_from_the_command_line(block_size):
         service.kill()
 
 
-def test_the_pool_is_built_over_the_groups_a_rank_reports():
+def test_the_owner_serves_the_schedulers_pool_over_the_groups_a_rank_reports():
     pytest.importorskip("tokenspeed_engine.scheduler")
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge import (
         cache_group_config,
@@ -593,27 +579,65 @@ def test_the_pool_is_built_over_the_groups_a_rank_reports():
         ],
         prefix_granularity=2,
     ).geometry
-    pool = make_pool(
-        geometry,
-        16,
-        headroom_lcm_blocks=0,
-        checkpoint_retention_requests=0,
-        checkpoint_retention_leaf_distance=0,
+    # The owner over the scheduler's pool, of 16 LCM blocks; its requests are
+    # handled here as its service hands them over.
+    owner = SharedL2Owner(
+        address=f"tcp://127.0.0.1:{get_free_port()}",
+        lcm_bytes=None,
+        num_providers=1,
+        client_timeout_s=60.0,
+        make_pool=functools.partial(
+            make_pool,
+            headroom_lcm_blocks=0,
+            checkpoint_retention_requests=0,
+            checkpoint_retention_leaf_distance=0,
+        ),
     )
+    try:
+        owner.handle(
+            {
+                "op": "provider",
+                "session": "node0",
+                "base": 0,
+                "bytes": 16 * geometry["lcm_bytes"],
+            }
+        )
+        for client in (1, 2):
+            assert owner.handle(
+                {
+                    "op": "hello",
+                    "client": client,
+                    "geometry": geometry,
+                    "deployment_id": deployment_id(),
+                }
+            )["ready"]
 
-    # Six pages of every history group and the checkpoint at their end.
-    prompt = list(range(1, 13))
-    hashes, _, keys = prompt_keys(prompt)
-    window = [(0, 2, page, 0) for page in hashes]
-    ticket, pages = pool.reserve(1, 1, keys + window, [0] * 13)
-    # An LCM block holds one KV page, three States or two window pages, as
-    # the rank's Host tier packs them; each group numbers its own pages.
-    assert pages == [1, 2, 3, 4, 5, 6, 19, 15, 16, 17, 18, 19, 20]
-    assert pool.commit(1, ticket, write_fields(prompt)[3])
+        # Six pages of every history group and the checkpoint at their end.
+        prompt = list(range(1, 13))
+        hashes, _, keys = prompt_keys(prompt)
+        window = [(0, 2, page, 0) for page in hashes]
+        reserved = owner.handle(
+            {"op": "reserve", "client": 1, "keys": keys + window, "buckets": [0] * 13}
+        )
+        # An LCM block holds one KV page, three States or two window pages, as
+        # the rank's Host tier packs them; each group numbers its own pages.
+        assert reserved["pages"] == [1, 2, 3, 4, 5, 6, 19, 15, 16, 17, 18, 19, 20]
+        assert owner.handle(
+            {
+                "op": "commit",
+                "client": 1,
+                "ticket": reserved["ticket"],
+                "publications": write_fields(prompt)[3],
+            }
+        )["committed"]
 
-    # The owner matches as the rank's scheduler does. Of the window group a
-    # hit needs, and pins, the sink's page and the last page.
-    _, num_tokens, _, _, slots = pool.probe(2, 1, *lookup_fields(prompt))
-    assert num_tokens == len(prompt)
-    assert [key for key, _, _ in slots] == keys + [window[0], window[-1]]
-    assert pool.stats()["pinned_blocks"] == len(keys) + 2
+        # The owner matches as the rank's scheduler does. Of the window group
+        # a hit needs, and pins, the sink's page and the last page.
+        ((_, num_tokens, _, _, slots),) = owner.handle(
+            {"op": "probe_many", "client": 2, "lookups": [lookup_fields(prompt)]}
+        )["hits"]
+        assert num_tokens == len(prompt)
+        assert [key for key, _, _ in slots] == keys + [window[0], window[-1]]
+        assert owner.handle({"op": "stats"})["stats"]["pinned_blocks"] == len(keys) + 2
+    finally:
+        owner.close()

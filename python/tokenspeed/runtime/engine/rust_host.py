@@ -933,16 +933,6 @@ class HostDataPlane:
             grammar_terminated_at=resolve_grammar_completion(results),
         )
 
-    def wait_landed(self, dispatched: _Dispatched) -> None:
-        """Wait for a forward's host copies to land, without committing it
-        (the host's landing watcher thread, with a shared L2 pool: the event
-        wait releases the interpreter lock). The control thread takes requests
-        in meanwhile; its ``complete`` then finds the copies landed."""
-        copy_event = dispatched.results.copy_event
-        if copy_event is None:
-            raise RuntimeError("copy_event is required before waiting for results.")
-        copy_event.synchronize()
-
     def note_committed(self, dispatched: _Dispatched) -> None:
         """A committed forward counts toward a profile's steps. The forward
         thread runs this, after the commit's ``complete``: the profiler
@@ -1135,68 +1125,53 @@ _MEMORY_METRIC_INTERVAL_SECONDS = 10.0
 class HostSharedL2:
     """A shared L2 pool's client as the host drives it.
 
-    The host's control thread makes every call, under its dispatch guard; none
-    waits for the pool's owner but ``poll``, for the lookups and as long as
-    the round says. The calls only hand work to the client's threads and read
-    what they finished: an owner that is slow, wrong or gone answers as a
-    miss or a failed write, never as an exception of these calls. (A load the
-    rank planned and could not start within its lease fails in the data
-    plane, which stops the engine.)
+    The host's control thread makes every call, under its dispatch guard.
+    ``lookup`` waits for the pool's owner, up to the client's request timeout,
+    with the interpreter lock released; the other calls hand work to the
+    client's threads or read what they finished. A pool operation that fails
+    raises: a lookup from ``lookup``, a write or a notice from the next
+    ``poll``. The loop then stops the engine.
     """
 
     def __init__(self, client: SharedL2Client) -> None:
         self._client = client
 
-    def submit_lookups(
+    def lookup(
         self, lookups: list[tuple[int, str, list[str], bytes, int]]
-    ) -> None:
-        """Send the scheduler's lookups, ``(lookup_id, request_id,
-        prefix_hashes, tokens, max_tokens)`` each, the tokens as int32
-        bytes."""
-        self._client.submit_lookups(lookups)
-
-    def poll(
-        self, awaited: list[int], wait_s: float, tickets: list[int]
-    ) -> tuple[list[tuple], list[tuple[int, bool]], bool]:
-        """What the client finished since the last poll.
-
-        Args:
-            awaited: Lookups whose answers the round waits for.
-            wait_s: For how long at most; the wait releases the interpreter
-                lock.
-            tickets: The tickets of the hits the scheduler still holds.
+    ) -> list[tuple]:
+        """Ask the pool, in one request, for its hit of each of the
+        scheduler's lookups, ``(lookup_id, request_id, prefix_hashes, tokens,
+        max_tokens)`` each, the tokens as int32 bytes.
 
         Returns:
-            The lookups' answers, as ``Scheduler.apply_shared_l2_lookups``
-            takes them (one past its deadline is a miss); the finished writes,
-            ``(write_id, success)`` each; and whether a load may no longer
-            be planned from one of ``tickets`` or of these answers' tickets:
-            the rank's lease on the owner's pins ran out.
+            One answer per lookup, in order, as
+            ``Scheduler.apply_shared_l2_lookups`` takes them: ``(lookup_id,
+            ticket, num_tokens, kv_tokens, tail, [(key, bucket, page)])``. A
+            miss has no pages.
         """
-        if awaited:
-            self._client.wait_lookups(awaited, wait_s)
-        answers = self._client.poll_lookups()
-        held = [*tickets, *(answer[1] for answer in answers if answer[1])]
-        lease_lost = not all(self._client.loads_allowed(ticket) for ticket in held)
-        return answers, self._client.poll_writes(), lease_lost
+        return self._client.lookup(lookups)
 
-    def map_pages(self, ticket: int, pages: list[tuple[int, int, int, int]]) -> None:
-        """The proxy Host blocks the answer with ``ticket`` created,
-        ``(group_id, proxy_block, bucket, page)`` each: a load-back from the
-        block reads the pool page. Before the plan that may carry that
-        load-back reaches the forward thread."""
-        self._client.map_proxy_pages(ticket, pages)
+    def poll(self) -> list[int]:
+        """The ids of the writes that finished since the last poll; does not
+        wait. Raises once a write or a notice has failed."""
+        return self._client.poll_writes()
+
+    def map_pages(self, pages: list[tuple[int, int, int, int]]) -> None:
+        """The proxy Host blocks an answer created, ``(group_id, proxy_block,
+        bucket, page)`` each: a load-back from the block reads the pool page.
+        Before the plan that may carry that load-back reaches the forward
+        thread."""
+        self._client.map_proxy_pages(pages)
 
     def submit(
         self,
         writes: list[tuple[int, list[tuple], list[int], list[int], list[tuple]]],
         releases: list[int],
         touches: list[list[tuple]],
-        abandons: list[int],
     ) -> None:
         """A plan's pool commands, each kind in plan order: the writes
         (``write_id, keys, buckets, Device blocks, publications``), the
-        tickets to release, the keys to touch, the lookups to abandon."""
+        tickets to release, the keys to touch."""
         for write in writes:
             self._client.submit_write(*write)
         for ticket in releases:
@@ -1204,18 +1179,6 @@ class HostSharedL2:
         for keys in touches:
             # The command carries no bucket: an unsharded group has one.
             self._client.touch(keys, [0] * len(keys))
-        for lookup_id in abandons:
-            self._client.abandon_lookup(lookup_id)
-
-    def stats(self) -> tuple[int, int, bool]:
-        """The client's counters: lookups answered as a miss at their
-        deadline, blocks of the writes it gave up, and whether the rank
-        serves without the pool."""
-        return (
-            self._client.lookup_timeouts,
-            self._client.dropped_write_blocks,
-            self._client.no_pool,
-        )
 
 
 class MemoryMetricSampler(threading.Thread):

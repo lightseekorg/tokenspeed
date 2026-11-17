@@ -215,10 +215,9 @@ class SharedL2LoadExecutor:
         *,
         signals: Callable[[int], Any],
         trackers: Sequence[tuple[LayerwiseLoadTracker, int]],
-        proxy_page: Callable[[int, int], tuple[int, int, int]],
-        load_pool: Callable[[int], SharedL2PoolView | None],
+        proxy_page: Callable[[int, int], tuple[int, int]],
+        pool: SharedL2PoolView,
         load_workers: int,
-        num_lcm_blocks: int,
         close: Callable[[], None],
     ):
         """
@@ -231,13 +230,10 @@ class SharedL2LoadExecutor:
             trackers: Each cache pool view's layer-wise load tracker,
                 registered with the view, and its layer count; their layers,
                 in order, are the flat layers of the layout's consumers.
-            proxy_page: ``(group, proxy Host block)`` to the ``(ticket, bucket,
-                page)`` it stands for (``SharedL2Client.proxy_page``).
-            load_pool: The pool a load planned from a ticket reads, or None
-                once the load may not start any more
-                (``SharedL2Client.load_pool``).
+            proxy_page: ``(group, proxy Host block)`` to the ``(bucket, page)``
+                it stands for (``SharedL2Client.proxy_page``).
+            pool: The pool the rank joined (``SharedL2Client.pool``).
             load_workers: Threads reading one load's providers in parallel.
-            num_lcm_blocks: LCM blocks of the pool the rank joined at start.
             close: Closes the rank's pool client, once the loads have
                 stopped: its writes share the engine with them
                 (``SharedL2Client.close``).
@@ -262,7 +258,7 @@ class SharedL2LoadExecutor:
         )
         self._num_layers = num_layers
         self._proxy_page = proxy_page
-        self._load_pool = load_pool
+        self._pool = pool
         self._close = close
         num_sets = len(self._trackers[0][0].event_sets)
         # Per tracker event set: a start word, then a ready word per layer.
@@ -287,7 +283,7 @@ class SharedL2LoadExecutor:
         # fragmentation.
         self.host_storage = None
         self.block_owners = None
-        self.num_host_pages = 2 * num_lcm_blocks + 1
+        self.num_host_pages = 2 * pool.num_lcm_blocks + 1
         self.host_group_packing = layout.host_packing
         self.num_snapshot_pages = 1
         self.max_retracted_requests = 0
@@ -313,7 +309,6 @@ class SharedL2LoadExecutor:
         """
         op_ids: list[int] = []
         rows: list[tuple[int, int, int, int]] = []
-        tickets: set[int] = set()
         for operation in cache_ops:
             if isinstance(operation, Cache.LoadBackOp):
                 for op_id, groups, sources, destinations in zip(
@@ -329,8 +324,7 @@ class SharedL2LoadExecutor:
                     ):
                         # Resolved now: the proxy block may stand for another
                         # page once its ticket is released.
-                        ticket, bucket, page = self._proxy_page(group, source)
-                        tickets.add(ticket)
+                        bucket, page = self._proxy_page(group, source)
                         rows.append((group, bucket, page, destination))
             elif not isinstance(operation, Cache.WriteBackOp):
                 raise TypeError(
@@ -371,17 +365,19 @@ class SharedL2LoadExecutor:
             word += count
             tracker.set_consumers(index)
         self._jobs[index] = self._loader.submit(
-            self._load, op_ids, rows, tickets, base, self._seq
+            self._load, op_ids, rows, base, self._seq
         )
 
     def _layer_reads(
-        self, pool: SharedL2PoolView, rows: Sequence[tuple[int, int, int, int]]
+        self, rows: Sequence[tuple[int, int, int, int]]
     ) -> list[dict[str, tuple[list, list, list]]]:
         """Per layer, per provider session: local and remote addresses and
         lengths of every field a load copies."""
         by_target: dict[tuple[int, str], tuple[list[int], list[int]]] = {}
         for group, bucket, page, block in rows:
-            session, address = self._layout.page_address(pool, group, bucket, page)
+            session, address = self._layout.page_address(
+                self._pool, group, bucket, page
+            )
             remotes, blocks = by_target.setdefault((group, session), ([], []))
             remotes.append(address)
             blocks.append(block)
@@ -405,7 +401,7 @@ class SharedL2LoadExecutor:
                 lengths.extend([size] * len(blocks))
         return layers
 
-    def _load(self, op_ids, rows, tickets, base: int, seq: int) -> None:
+    def _load(self, op_ids, rows, base: int, seq: int) -> None:
         words = self._signals.words
         try:
             # The start word lands once the plan's page zeroing is done.
@@ -413,17 +409,7 @@ class SharedL2LoadExecutor:
                 if self._closed:
                     raise RuntimeError("the executor shut down before the load")
                 time.sleep(_START_POLL_S)
-            # Past the lease's start bound the owner may have dropped the pins
-            # of a rank it has not heard: the pages could then hold another
-            # prompt's bytes. The tickets of one plan are of one pool.
-            pools = {self._load_pool(ticket) for ticket in tickets}
-            if None in pools or len(pools) > 1:
-                raise RuntimeError(
-                    "the rank's lease on the pool pages ran out before the load"
-                )
-            # A load without a row names no ticket and reads nothing.
-            pool = pools.pop() if pools else None
-            for layer, reads in enumerate(self._layer_reads(pool, rows)):
+            for layer, reads in enumerate(self._layer_reads(rows)):
                 pending = [
                     self._readers.submit(self._engine.read, session, *read)
                     for session, read in reads.items()
@@ -495,8 +481,7 @@ def build_shared_l2_load_executor(
         signals=functools.partial(HostSignals, gpu_id),
         trackers=trackers,
         proxy_page=client.proxy_page,
-        load_pool=client.load_pool,
+        pool=client.pool,
         load_workers=client.config.load_workers,
-        num_lcm_blocks=client.pool.num_lcm_blocks,
         close=client.close,
     )

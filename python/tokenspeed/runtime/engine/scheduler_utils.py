@@ -60,9 +60,7 @@ _CACHE_EVENT_TYPES = {
 }
 # A shared L2 pool's commands in a plan's cache ops, by class name: a
 # scheduler wheel released before the pool does not bind the classes.
-_POOL_OPS = frozenset(
-    {"SharedL2WriteOp", "SharedL2ReleaseOp", "SharedL2TouchOp", "SharedL2AbandonOp"}
-)
+_POOL_OPS = frozenset({"SharedL2WriteOp", "SharedL2ReleaseOp", "SharedL2TouchOp"})
 # make_config's host_write_policy names; ServerArgs validates the flag.
 _HOST_WRITE_POLICIES = {
     "write_through": SchedulerConfig.HostWritePolicy.WriteThrough,
@@ -630,8 +628,8 @@ def cache_ops_from_plan(
     L2 wire batches pass through; snapshot/restore batches become per-request
     operations. Host-only QUERY/GET/PUT/Cancel descriptors go to the storage
     tuple: the engine host's L3 executor runs them. A shared L2 pool's write,
-    release, touch and abandon commands are left out: the engine host's loop
-    reads them from the plan and hands them to the pool's client. Unknown
+    release and touch commands are left out: the engine host's loop reads
+    them from the plan and hands them to the pool's client. Unknown
     kinds fail the whole conversion without partial submission.
 
     ``request_admission`` resolves each snapshot/restore request while the

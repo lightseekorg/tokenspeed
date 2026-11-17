@@ -43,7 +43,7 @@ class OwnerError(RuntimeError):
 
 class UnknownClientError(OwnerError):
     """The owner holds nothing for this client: the client timed out there, or
-    the owner restarted. The client has to say hello again."""
+    the owner restarted."""
 
 
 class MalformedReplyError(OwnerError):
@@ -70,20 +70,16 @@ class OwnerConnection:
         self._sockets: list[zmq.Socket] = []
         self._lock = threading.Lock()
 
-    def request(
-        self, op: str, *, timeout_ms: int | None = None, **fields: Any
-    ) -> dict[str, Any]:
+    def request(self, op: str, **fields: Any) -> dict[str, Any]:
         """Send one request and return its reply.
 
         Args:
             op: The operation.
-            timeout_ms: How long to wait for the reply; None is the
-                connection's timeout.
             **fields: The operation's fields.
 
         Raises:
-            TimeoutError: No reply in time. The owner may still handle the
-                request.
+            TimeoutError: No reply within the connection's timeout. The owner
+                may still handle the request.
             UnknownClientError: The owner does not know the request's client.
             MalformedReplyError: The reply cannot be decoded or lacks a field
                 of the wire's reply.
@@ -93,6 +89,8 @@ class OwnerConnection:
         if socket is None:
             socket = self._context.socket(zmq.REQ)
             socket.setsockopt(zmq.LINGER, 0)
+            socket.setsockopt(zmq.SNDTIMEO, self._timeout_ms)
+            socket.setsockopt(zmq.RCVTIMEO, self._timeout_ms)
             # A timed-out request leaves the socket usable for the next one,
             # and its late reply is not taken for the next one's.
             socket.setsockopt(zmq.REQ_RELAXED, 1)
@@ -101,10 +99,6 @@ class OwnerConnection:
             self._local.socket = socket
             with self._lock:
                 self._sockets.append(socket)
-        if timeout_ms is None:
-            timeout_ms = self._timeout_ms
-        socket.setsockopt(zmq.SNDTIMEO, timeout_ms)
-        socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
         try:
             socket.send(msgspec.msgpack.encode({"op": op, **fields}))
             payload = socket.recv()

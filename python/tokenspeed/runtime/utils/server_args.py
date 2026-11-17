@@ -3530,10 +3530,8 @@ class ServerArgs:
             "instances of attention TP 1; not with L3 storage, KV offloading, "
             "retraction, --enable-memory-saver or --kvstore-write-policy "
             "write_back). Fields: owner, device_names, request_timeout_ms, "
-            "connect_timeout_s, lookup_deadline_ms, no_pool_after_s, lease_s, "
-            "load_workers, write_workers, scheduler {max_writes, max_write_keys} "
-            "and optionally load_start_margin_s; see "
-            "docs/configuration/server.md.",
+            "connect_timeout_s, load_workers, write_workers, scheduler "
+            "{max_writes, max_write_keys}; see docs/configuration/server.md.",
         )
         parser.add_argument(
             "--kvstore-storage-backend",

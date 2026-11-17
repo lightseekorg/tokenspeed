@@ -150,39 +150,23 @@ class FakePool:
         self.checkpoints = []
         # (client, ticket) -> slots.
         self.pins = {}
-        self._lookups = {}
         # (client, ticket) -> ({(key, bucket): page}, every (key, bucket)).
         self.reserved = {}
-        self._writes = {}
-        # Abandoned before their probe or reservation arrived.
-        self._abandoned = set()
         self._tickets = itertools.count(1)
-        # (method, client, id) of every call that names one, in order.
-        self.calls = []
         # The arguments of the last call of a method, as the owner passed them.
         self.received = {}
-        # What raises: a method, or (method, lookup or write id or ticket).
+        # The methods that raise.
         self.failing = set()
-        # Called with the method before each call; a test's place to be slow.
-        self.before = None
-        self.hits = 0
         self.touched = []
         self.disconnected = []
 
-    def _called(self, method, *ids, received=None):
-        if self.before is not None:
-            self.before(method)
-        self.calls.append((method, *ids))
+    def _called(self, method, received=None):
         self.received[method] = received
-        if method in self.failing or (method, ids[-1]) in self.failing:
+        if method in self.failing:
             raise RuntimeError(f"{method} failed")
 
-    def probe(self, client, lookup_id, prefix_hashes, tokens, max_tokens):
-        self._called(
-            "probe", client, lookup_id, received=(prefix_hashes, tokens, max_tokens)
-        )
-        if (client, "lookup", lookup_id) in self._abandoned:
-            return (0, 0, 0, None, [])
+    def probe(self, client, prefix_hashes, tokens, max_tokens):
+        self._called("probe", received=(prefix_hashes, tokens, max_tokens))
         hit = max(
             (found for found in self.checkpoints if tokens.startswith(found[0])),
             key=lambda found: len(found[0]),
@@ -194,25 +178,14 @@ class FakePool:
         ticket = next(self._tickets)
         slots = [(key, bucket, self.cached[key, bucket]) for key, bucket in blocks]
         self.pins[client, ticket] = slots
-        self._lookups[client, lookup_id] = ticket
-        self.hits += 1
         return (ticket, len(hit_tokens) // 4, len(hit_tokens) // 4, tail, slots)
 
     def release(self, client, ticket):
-        self._called("release", client, ticket)
+        self._called("release")
         self.pins.pop((client, ticket), None)
 
-    def abandon_lookup(self, client, lookup_id):
-        self._called("abandon_lookup", client, lookup_id)
-        ticket = self._lookups.pop((client, lookup_id), None)
-        if ticket is None:
-            self._abandoned.add((client, "lookup", lookup_id))
-        self.pins.pop((client, ticket), None)
-
-    def reserve(self, client, write_id, keys, buckets):
-        self._called("reserve", client, write_id, received=(keys, buckets))
-        if (client, "write", write_id) in self._abandoned:
-            return (0, [-1] * len(keys))
+    def reserve(self, client, keys, buckets):
+        self._called("reserve", received=(keys, buckets))
         writing = {block for placed, _ in self.reserved.values() for block in placed}
         placed, pages = {}, []
         for block in zip(keys, buckets, strict=True):
@@ -227,11 +200,10 @@ class FakePool:
             return (0, pages)
         ticket = next(self._tickets)
         self.reserved[client, ticket] = (placed, list(zip(keys, buckets)))
-        self._writes[client, write_id] = ticket
         return (ticket, pages)
 
     def commit(self, client, ticket, publications):
-        self._called("commit", client, ticket, received=publications)
+        self._called("commit", received=publications)
         placed, blocks = self.reserved.pop((client, ticket), (None, None))
         if placed is None:
             return False
@@ -239,14 +211,6 @@ class FakePool:
         for tokens, _, tail, _ in publications:
             self.checkpoints.append((tokens, tail, blocks))
         return True
-
-    def abandon_write(self, client, write_id):
-        self._called("abandon_write", client, write_id)
-        ticket = self._writes.pop((client, write_id), None)
-        if ticket is None:
-            self._abandoned.add((client, "write", write_id))
-        placed, _ = self.reserved.pop((client, ticket), ({}, None))
-        self._free.extend(placed.values())
 
     def touch(self, keys):
         self.touched.extend(keys)

@@ -63,7 +63,6 @@ from tokenspeed.runtime.engine.rank_setup import request_length_limits  # noqa: 
 from tokenspeed.runtime.engine.rust_host import (  # noqa: E402
     HostBootstrap,
     HostDataPlane,
-    HostSharedL2,
     host_in_flight_depth,
     rust_host_refusals,
     start_rust_host,
@@ -817,24 +816,6 @@ def test_a_result_without_a_copy_event_cannot_land():
         results.sync()
 
 
-def test_a_watched_forward_is_waited_for_without_being_committed(executor):
-    """The landing watcher waits on the copy event too; the commit's own wait
-    still happens, once."""
-    plane = _data_plane(DeviceHandle(executor))
-    plane.admit([("r1", 1, msgspec.msgpack.encode(_resolved("r1")), [], 11, None)])
-    launched = plane.execute(
-        _plan_with_one_request("r1"), None, None, None, (None, 0), None
-    )
-
-    plane.wait_landed(launched)
-    assert launched.results.copy_event.waits == 1
-    assert plane.complete(launched)[0] == [100]
-    assert launched.results.copy_event.waits == 2
-    launched.results.copy_event = None
-    with pytest.raises(RuntimeError, match="copy_event is required"):
-        plane.wait_landed(launched)
-
-
 def test_a_failed_pool_load_fails_the_commit_of_the_forward_it_let_go(executor):
     """With a shared L2 pool the commit polls the Host loads once the forward
     has landed: a failed load raises before any result is returned; the
@@ -873,110 +854,6 @@ def test_a_failed_pool_load_fails_the_commit_of_the_forward_it_let_go(executor):
         _plan_with_one_request("r3"), None, None, None, (None, 0), None
     )
     assert plain.complete(launched)[0] == [100]
-
-
-class _PoolClient:
-    """Stands in for a shared L2 pool's client, which needs the pool's owner
-    process and an RDMA transfer: it records its calls, returns what a test
-    queued, and refuses loads from the tickets a test names."""
-
-    def __init__(self) -> None:
-        self.calls: list[tuple] = []
-        self.answers: list[tuple] = []
-        self.writes: list[tuple[int, bool]] = []
-        self.refused: set[int] = set()
-        self.lookup_timeouts = 2
-        self.dropped_write_blocks = 5
-        self.no_pool = True
-
-    def submit_lookups(self, lookups) -> None:
-        self.calls.append(("submit_lookups", lookups))
-
-    def wait_lookups(self, lookup_ids, timeout_s) -> None:
-        self.calls.append(("wait_lookups", lookup_ids, timeout_s))
-
-    def poll_lookups(self) -> list[tuple]:
-        answers, self.answers = self.answers, []
-        return answers
-
-    def poll_writes(self) -> list[tuple[int, bool]]:
-        writes, self.writes = self.writes, []
-        return writes
-
-    def loads_allowed(self, ticket: int) -> bool:
-        self.calls.append(("loads_allowed", ticket))
-        return ticket not in self.refused
-
-    def map_proxy_pages(self, ticket, pages) -> None:
-        self.calls.append(("map_proxy_pages", ticket, pages))
-
-    def submit_write(self, write_id, keys, buckets, blocks, publications) -> None:
-        self.calls.append(("submit_write", write_id, keys, buckets, blocks))
-
-    def release(self, ticket) -> None:
-        self.calls.append(("release", ticket))
-
-    def touch(self, keys, buckets) -> None:
-        self.calls.append(("touch", keys, buckets))
-
-    def abandon_lookup(self, lookup_id) -> None:
-        self.calls.append(("abandon_lookup", lookup_id))
-
-
-def test_the_pool_adapter_waits_for_awaited_lookups_and_reports_a_lost_lease():
-    client = _PoolClient()
-    pool = HostSharedL2(client)
-    hit = (4, 9, 32, 32, None, [((0, 0, "h", 0), 0, 17)])
-    miss = (5, 0, 0, 0, None, [])
-
-    # Nothing awaited: no wait. The held ticket still allows loads.
-    client.writes = [(21, True)]
-    assert pool.poll([], 0.002, [3]) == ([], [(21, True)], False)
-    assert client.calls == [("loads_allowed", 3)]
-
-    # The round waits for lookup 4 first; a miss pins nothing to ask about.
-    client.calls.clear()
-    client.answers = [hit, miss]
-    assert pool.poll([4], 0.002, [3]) == ([hit, miss], [], False)
-    assert client.calls == [
-        ("wait_lookups", [4], 0.002),
-        ("loads_allowed", 3),
-        ("loads_allowed", 9),
-    ]
-
-    # A held ticket, or one a new answer brings, that refuses loads.
-    client.refused = {3}
-    assert pool.poll([], 0.0, [3, 8])[2] is True
-    client.refused = {9}
-    client.answers = [hit]
-    assert pool.poll([], 0.0, [3]) == ([hit], [], True)
-    assert pool.poll([], 0.0, []) == ([], [], False)
-
-
-def test_the_pool_adapter_hands_a_plans_commands_to_the_client():
-    client = _PoolClient()
-    pool = HostSharedL2(client)
-    key = (0, 0, "h", 0)
-    lookups = [(4, "r1", ["h"], b"\x07\x00\x00\x00", 1)]
-
-    pool.submit_lookups(lookups)
-    pool.map_pages(9, [(0, 5, 0, 17)])
-    pool.submit(
-        [(31, [key], [0], [12], [(b"\x07\x00\x00\x00", ["h"], None, 77)])],
-        [9],
-        [[key, key]],
-        [5],
-    )
-    assert client.calls == [
-        ("submit_lookups", lookups),
-        ("map_proxy_pages", 9, [(0, 5, 0, 17)]),
-        ("submit_write", 31, [key], [0], [12]),
-        ("release", 9),
-        # A touch names no bucket: every key is in bucket 0.
-        ("touch", [key, key], [0, 0]),
-        ("abandon_lookup", 5),
-    ]
-    assert pool.stats() == (2, 5, True)
 
 
 def test_the_forward_thread_is_named_for_its_role(executor):
