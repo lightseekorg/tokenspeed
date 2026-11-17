@@ -35,11 +35,14 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <span>
 #include <string>
 #include <utility>
 #include <variant>
 #include <vector>
 
+#include "cache/prefix/prefix_hasher.h"
+#include "cache_test_access.h"
 #include "integration_test_helper.h"
 
 namespace tokenspeed::test {
@@ -585,14 +588,14 @@ TEST_F(StateCheckpointSuite, TwoSlotsRotateThroughChunksTheFirstDecodeAndLaterDe
     SendForwardDone("r", {104});
 
     // Another prompt sharing the ten prompt tokens resumes at the published
-    // prompt-end state; one sharing only the first chunk finds no
-    // checkpoint at 8 and starts over (with the junction at 8).
+    // prompt-end state; one sharing only the first chunk resumes at 8, from
+    // the chunk-end checkpoint r published there.
     const Resume at_prompt_end = Probe("hit", {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 77, 78});
     EXPECT_EQ(at_prompt_end.prefix_tokens, 10);
     EXPECT_EQ(at_prompt_end.state_row.at(0), decode1[0]) << "resumes from the published checkpoint";
-    const Resume at_chunk_end = Probe("miss", {1, 2, 3, 4, 5, 6, 7, 8, 77, 78, 79, 80});
-    EXPECT_EQ(at_chunk_end.prefix_tokens, 0);
-    EXPECT_NE(at_chunk_end.state_row.at(0), decode1[0]) << "a fresh zero state, not a checkpoint";
+    const Resume at_chunk_end = Probe("fork", {1, 2, 3, 4, 5, 6, 7, 8, 77, 78, 79, 80});
+    EXPECT_EQ(at_chunk_end.prefix_tokens, 8);
+    EXPECT_EQ(at_chunk_end.state_row.at(0), chunk1[1]) << "the chunk-end checkpoint";
 
     // The two probes above each planned a decode of r; both land before the
     // finish, which publishes the frontier (15 computed tokens: the prompt
@@ -1338,10 +1341,11 @@ TEST_F(DropDeadCheckpointsSuite, NoTailOrStateIsCachedAtACoveredPromptEndOrAtThe
         // Six pages and, with the in-forward checkpoint, the checkpoint at 20
         // in each State group; without it the tail blocks at 22 and 25 and the
         // states published there.
-        EXPECT_EQ(empty - scheduler_->EmptyLcmBlocks(), in_forward ? 6 + 3 : 6 + 2 + 2 * 3);
+        // Plus the chunk-end checkpoints at 8 and 16 in each State group.
+        EXPECT_EQ(empty - scheduler_->EmptyLcmBlocks(), (in_forward ? 6 + 3 : 6 + 2 + 2 * 3) + 2 * 3);
 
         const Resume resent = Probe("resent", tokens);
-        EXPECT_EQ(resent.prefix_tokens, in_forward ? 20 : 0);
+        EXPECT_EQ(resent.prefix_tokens, in_forward ? 20 : 16) << "without it, the chunk-end checkpoint at 16";
         if (in_forward) {
             EXPECT_EQ(resent.state_row.at(0), checkpoint);
         }
@@ -1449,7 +1453,8 @@ TEST_F(DropDeadCheckpointsSuite, ReRenderedTurnsResumeAtTheCheckpointsWithNoTail
         std::vector<std::int32_t> prompt = MakeTokens(26);
         const std::vector<std::vector<std::int32_t>> next_tokens{{500, 501, 502, 503, 504}, {700, 701}};
         const std::vector<std::int32_t> resumes =
-            in_forward ? std::vector<std::int32_t>{0, 24, 28} : std::vector<std::int32_t>{0, 0, 24};
+            // Without the in-forward checkpoint the seed's chunk-end checkpoint at 24 serves turn 1.
+            in_forward ? std::vector<std::int32_t>{0, 24, 28} : std::vector<std::int32_t>{0, 24, 24};
         for (std::size_t turn = 0; turn < resumes.size(); ++turn) {
             SCOPED_TRACE(turn);
             const std::string id = "turn" + std::to_string(turn);
@@ -1552,8 +1557,9 @@ TEST_F(DropDeadCheckpointsSuite, AnEvictedCheckpointRevivesOnlyAPromptEndPublish
             ASSERT_EQ(chunks.size(), 12u);
             EXPECT_EQ(chunks[10].prefix_tokens, 20);
             EXPECT_EQ(chunks[10].state_rows[0].at(0), chunks[9].state_rows[0].at(1)) << "the live slot published at 20";
-            EXPECT_EQ(scheduler_->GetHostCacheStats().device_evictions.request_reclaim.blocks, smallest_pool ? 3u : 0u)
-                << "the checkpoint's block in each State group";
+            EXPECT_EQ(scheduler_->GetHostCacheStats().device_evictions.request_reclaim.blocks,
+                      smallest_pool ? 3u + 2u * 3u : 0u)
+                << "the checkpoint's block in each State group, and those of the chunk-end checkpoints";
 
             if (decodes) {
                 const ExecutionPlan first = Decode("seed", 1);
@@ -1574,6 +1580,7 @@ TEST_F(DropDeadCheckpointsSuite, AnEvictedCheckpointRevivesOnlyAPromptEndPublish
 // holds the six pages and the checkpoint, and a longer prompt resumes from it
 // at the checkpoint. Without the in-forward checkpoint Host holds the tails
 // at 22 and 25 and their states instead, and the longer prompt resumes at 22.
+// Either way Host also holds the chunk-end checkpoints at 8 and 16.
 TEST_F(DropDeadCheckpointsSuite, NeitherReachesHost) {
     for (const bool in_forward : {false, true}) {
         SCOPED_TRACE(in_forward);
@@ -1586,7 +1593,7 @@ TEST_F(DropDeadCheckpointsSuite, NeitherReachesHost) {
         AckWriteBacks(PlanOnce());
         ASSERT_TRUE(scheduler_->ClearL1Cache());
         EXPECT_EQ(scheduler_->TailEntries(), in_forward ? 0u : 2u);
-        EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), in_forward ? 6 + 3 : 6 + 2 + 2 * 3);
+        EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), (in_forward ? 6 + 3 : 6 + 2 + 2 * 3) + 2 * 3);
         const Resume longer = Probe("longer", Extended(tokens, {600, 601, 602, 603}));
         EXPECT_EQ(longer.prefix_tokens, in_forward ? 20 : 22);
         EXPECT_GT(longer.load_rows, 0) << "a Host hit";
@@ -1678,7 +1685,8 @@ TEST_F(DropDeadCheckpointsSlidingWindowSuite, EveryTurnResumesAtTheCheckpoint) {
         AckWriteBacks(PlanOnce());
         EXPECT_EQ(scheduler_->TailEntries(), in_forward ? 0u : 2u);
         EXPECT_EQ(scheduler_->AvailableLcmBlocks(), config_.device_allocator.NumUsableBlocks());
-        EXPECT_EQ(Probe("resent", tokens).prefix_tokens, in_forward ? 20 : 0);
+        // Without the in-forward checkpoint a resend resumes at the chunk-end checkpoint at 16.
+        EXPECT_EQ(Probe("resent", tokens).prefix_tokens, in_forward ? 20 : 16);
         EXPECT_EQ(Probe("longer", Extended(tokens, {600, 601, 602, 603})).prefix_tokens, in_forward ? 20 : 22);
         EXPECT_EQ(Probe("continued", Extended(tokens, {900, 901, 902, 77, 78})).prefix_tokens, in_forward ? 20 : 25);
     }
@@ -2353,8 +2361,8 @@ TEST_F(StateCheckpointInForwardMixedSuite, ChunksNearTheBoundaryEndOnAPageUnderA
 // A junction before the boundary fixes where a later chunk starts: the
 // 22-token prompt shares a cached 24-token prompt's first four pages but no
 // state checkpoint below them, so it resumes at 0 with the junction at 16.
-// [7, 14) keeps its budget rather than end on the page at 12, the junction
-// cuts [14, 16), and the chunk [16, 22) writes the checkpoint.
+// [7, 12) ends on the page at 12 for its chunk-end checkpoint, the junction
+// cuts [12, 16), and the chunk [16, 22) writes the checkpoint.
 TEST_F(StateCheckpointInForwardMixedSuite, AJunctionBeforeTheBoundaryLeavesTheChunksBeforeItWhole) {
     Reset(/*host_cache=*/false, /*decode_width=*/1);
     const std::vector<std::int32_t> cached = MakeTokens(24);
@@ -2362,6 +2370,24 @@ TEST_F(StateCheckpointInForwardMixedSuite, AJunctionBeforeTheBoundaryLeavesTheCh
     RunPrefill("cached", 24);
     SendFinish("cached");
     AckWriteBacks(PlanOnce());
+    // Evict the cached prompt's chunk-end checkpoints, as pressure may evict a State and leave its KV.
+    CacheCoordinator& coordinator = SchedulerTestAccess::Coordinator(*scheduler_);
+    ContentHash prior;
+    for (std::int32_t end = kP; end <= 16; end += kP) {
+        prior = HashPrefixPage(std::span{cached}.subspan(static_cast<std::size_t>(end - kP), kP), prior);
+        for (std::int32_t group = 0; group < coordinator.NumGroups(); ++group) {
+            if (!coordinator.GroupIsState(static_cast<std::size_t>(group))) {
+                continue;
+            }
+            const CacheKey key{.group_id = static_cast<std::uint32_t>(group), .content_hash = prior, .page_offset = 0};
+            if (const auto location =
+                    CacheCoordinatorTestAccess::DeviceLocationOf(coordinator, static_cast<std::size_t>(group), key)) {
+                ASSERT_TRUE(CacheCoordinatorTestAccess::EvictAloneInto(
+                    coordinator, static_cast<std::uint32_t>(group), *location,
+                    &CacheEvictor::DeviceEvictionStats::admission, /*segment=*/nullptr));
+            }
+        }
+    }
 
     StartDecoding();
     std::vector<std::int32_t> tokens(cached.begin(), cached.begin() + 16);
@@ -2371,7 +2397,7 @@ TEST_F(StateCheckpointInForwardMixedSuite, AJunctionBeforeTheBoundaryLeavesTheCh
     Submit(RequestWithTokens("seed", tokens));
     const MixedPrefill prefill = RunPrefillBesideTheDecode("seed", 22);
     EXPECT_EQ(prefill.chunks,
-              (std::vector<std::pair<std::int32_t, std::int32_t>>{{0, 7}, {7, 14}, {14, 16}, {16, 22}}));
+              (std::vector<std::pair<std::int32_t, std::int32_t>>{{0, 7}, {7, 12}, {12, 16}, {16, 22}}));
     EXPECT_EQ(prefill.checkpoint_len, 4);
 }
 
@@ -4086,14 +4112,15 @@ TEST_F(StateCheckpointFusedHostSuite, TheFusedRoleMarksTheInputAheadOfBothTailsO
                 ASSERT_NE(FindForwardBatch(plan), nullptr);
                 // Each tail leaves with its KV block and three checkpoints: the
                 // input as h's reclaim, s1's other tail as an admission victim.
+                // s1's older chunk-end checkpoints at 8 and 16 leave as admission victims too.
                 const HostCacheStats stats = scheduler_->GetHostCacheStats();
                 EXPECT_EQ(stats.device_evictions.request_reclaim.blocks, 4u);
-                EXPECT_EQ(stats.device_evictions.admission.blocks, 4u);
+                EXPECT_EQ(stats.device_evictions.admission.blocks, 4u + 2u * 3u);
                 std::uint64_t written_back = 0;
                 for (const std::uint64_t blocks : stats.eviction_stores.blocks) {
                     written_back += blocks;
                 }
-                EXPECT_EQ(written_back, policy == SchedulerConfig::HostWritePolicy::kWriteBack ? 4u : 0u);
+                EXPECT_EQ(written_back, policy == SchedulerConfig::HostWritePolicy::kWriteBack ? 4u + 2u * 3u : 0u);
                 AckWriteBacks(plan);
                 AbortAndRetire("f1");
                 AckWriteBacks(PlanOnce());
@@ -5281,6 +5308,7 @@ TEST_P(StateCheckpointPrefillHostShardSuite, WriteBackHoldsMoreSessionsThanEithe
 // one mixed batch, takes their room: the plan that evicts the tail copies it
 // to the Host, stream-ordered, and the ACK publishes its four blocks there. A
 // prompt that leaves s1 at 22 loads them back.
+// s1's chunk-end checkpoints at 8 and 16, its oldest entries, are written back first, one per admission.
 TEST_F(StateCheckpointFusedHostSuite, ThePromptEndTheFirstDecodePublishesLeavesWithItsWriteBack) {
     device_pages_ = 16;
     Reset(/*host_cache=*/true, /*decode_width=*/1);
@@ -5292,7 +5320,10 @@ TEST_F(StateCheckpointFusedHostSuite, ThePromptEndTheFirstDecodePublishesLeavesW
     const ExecutionPlan first_decode = PlanOnce();
     ASSERT_NE(FindForwardBatch(first_decode), nullptr);
     ASSERT_EQ(FindForwardBatch(first_decode)->request_ids, std::vector<std::string>{"s1"});
-    EXPECT_TRUE(ExtractCacheOpsOfKind<WriteBackBatch>(first_decode).empty()) << "nothing streams at publication";
+    const std::vector<CacheOperation> first_stores = ExtractCacheOpsOfKind<WriteBackBatch>(first_decode);
+    ASSERT_EQ(first_stores.size(), 1u) << "an eviction write-back, nothing streams at publication";
+    EXPECT_EQ(std::get<WriteBackBatch>(first_stores.front()).group_ids[0], (std::vector<std::uint32_t>{1, 2, 3}))
+        << "a chunk-end checkpoint's three State blocks";
     SendForwardDone("s1", {901});
 
     Submit(RequestWithTokens("f1", MakeTokens(4, 1000)));
@@ -5304,14 +5335,15 @@ TEST_F(StateCheckpointFusedHostSuite, ThePromptEndTheFirstDecodePublishesLeavesW
     const WriteBackBatch& store = std::get<WriteBackBatch>(stores.front());
     ASSERT_EQ(store.op_ids.size(), 1u);
     EXPECT_EQ(store.source_pinned, std::vector<bool>{false});
-    EXPECT_EQ(store.group_ids[0], (std::vector<std::uint32_t>{1, 0, 2, 3})) << "the tail block and its checkpoints";
+    EXPECT_EQ(store.group_ids[0], (std::vector<std::uint32_t>{1, 2, 3, 1, 0, 2, 3}))
+        << "the other chunk-end checkpoint, then the tail block and its checkpoints";
     const HostCacheStats stats = scheduler_->GetHostCacheStats();
     EXPECT_EQ(stats.publication_stores.ops + stats.finish_stores.ops, 0u);
-    EXPECT_EQ(stats.eviction_stores.ops, 1u);
-    EXPECT_EQ(stats.device_evictions.admission.blocks, 4u);
+    EXPECT_EQ(stats.eviction_stores.ops, 2u);
+    EXPECT_EQ(stats.device_evictions.admission.blocks, 3u + 7u);
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 0) << "published at the ACK, not before";
     AckWriteBacks(plan);
-    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 4);
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 7) << "the first decode's write-back is not acknowledged yet";
 
     SendForwardDone("s1", {902});
     SendForwardDone("f1", {903});
@@ -5419,7 +5451,8 @@ TEST_F(StateCheckpointFusedHostSuite, AClearWaitsForTheEvictionWriteBackInFlight
     EXPECT_FALSE(scheduler_->ClearL1Cache()) << "the eviction write-back is in flight";
     AckWriteBacks(eviction);
     AckWriteBacks(after_abort);
-    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 4) << "the tail block and three checkpoints";
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 4 + 2 * 3)
+        << "the tail block and three checkpoints, and s1's chunk-end checkpoints at 8 and 16";
     std::vector<std::int32_t> next = s1;
     next.push_back(900);
     next.push_back(77);
@@ -5428,7 +5461,7 @@ TEST_F(StateCheckpointFusedHostSuite, AClearWaitsForTheEvictionWriteBackInFlight
     EXPECT_EQ(before_clear.load_rows, 4);
 
     EXPECT_TRUE(scheduler_->ClearL1Cache());
-    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 4) << "a Device-only clear leaves the Host as it is";
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 4 + 2 * 3) << "a Device-only clear leaves the Host as it is";
     const Resume after_clear = Probe("s1-next-again", next);
     EXPECT_EQ(after_clear.prefix_tokens, 0);
     EXPECT_EQ(after_clear.load_rows, 0);

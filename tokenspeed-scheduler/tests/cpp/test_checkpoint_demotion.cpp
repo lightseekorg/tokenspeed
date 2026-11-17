@@ -27,6 +27,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <limits>
@@ -35,6 +36,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -1225,6 +1227,124 @@ TEST_F(CheckpointDemotionSuite, TheFlagRequiresInForwardCheckpointsAndActsOnlyWi
     Rebuild(/*demote=*/true, /*device_pages=*/257, /*host_pages=*/0);
     ThreeTurns();
     EXPECT_EQ(scheduler_->DemotedCheckpointEntries(), 0u);
+}
+
+// Fused role, P = 4, 8-token chunks, in-forward checkpoint on: a 30-token prompt has chunk-end checkpoints at 16, 24.
+class ChunkEndCheckpointSuite : public CheckpointDemotionSuite {
+protected:
+    void RebuildFused(std::int32_t device_pages = 257, std::int32_t host_pages = 0) {
+        role_ = Role::kFused;
+        Rebuild(/*demote=*/true, device_pages, host_pages);
+    }
+    // The State entry at `boundary` of the chain of `tokens`, if cached on the Device.
+    std::optional<PrefixCacheIndex::CachedBlockSnapshot> StateEntry(const std::vector<std::int32_t>& tokens,
+                                                                    std::int32_t boundary) {
+        ContentHash prior;
+        for (std::int32_t i = 0; i + kP <= boundary; i += kP) {
+            prior = HashPrefixPage(std::span{tokens}.subspan(static_cast<std::size_t>(i), kP), prior);
+        }
+        const CacheKey key{.group_id = 1, .content_hash = prior, .page_offset = 0};
+        return SchedulerTestAccess::Coordinator(*scheduler_)
+            .GroupPrefixIndex(1)
+            .Inspect(SchedulerTestAccess::Pool(*scheduler_), key);
+    }
+    static std::vector<std::int32_t> A() { return MakeTokens(30); }
+    // ProbeResume for the fused role, whose aborted probe's forward retires too, freeing its batch slot.
+    std::int32_t Probe(const std::string& id, std::vector<std::int32_t> tokens) {
+        Submit(RequestSpec{.request_id = id, .tokens = std::move(tokens), .max_new_tokens = 32});
+        const ExecutionPlan plan = PlanOnce();
+        AckLoads(plan);
+        AckWriteBacks(plan);
+        const ForwardBatch* batch = FindForwardBatch(plan);
+        const std::int32_t prefix =
+            batch == nullptr || batch->request_ids.empty() ? -1 : batch->extend_prefix_lens.at(0);
+        SendAbortEvent(id);
+        if (prefix >= 0) {
+            SendForwardDone(id);
+        }
+        AckWriteBacks(PlanOnce());
+        return prefix;
+    }
+};
+
+// Chunk-end checkpoints stay out of the in-forward lineage: forks resume at them, the next turn at the in-forward one.
+TEST_F(ChunkEndCheckpointSuite, ForksResumeAtChunkEndCheckpointsAndTheInForwardLineageStays) {
+    RebuildFused();
+    ASSERT_EQ(Turn("a", A()), 0);
+    EXPECT_EQ(scheduler_->ChunkEndCheckpointsPublished(), 2u);
+    EXPECT_EQ(Probe("fork18", Extend(First(A(), 18), 800, 6)), 16);
+    EXPECT_EQ(Probe("fork26", Extend(First(A(), 26), 810, 6)), 24);
+    EXPECT_EQ(Probe("next", Extend(First(A(), 29), 820, 6)), 28) << "the in-forward checkpoint";
+    ASSERT_EQ(Turn("a2", Extend(First(A(), 29), 830, 30)), 28);
+    EXPECT_EQ(scheduler_->ChunkEndCheckpointsPublished(), 2u) << "a2 resumed past one chunk";
+}
+
+// A chunk-end checkpoint is held only as the next chunk's State input; after that only the cache holds it.
+TEST_F(ChunkEndCheckpointSuite, AChunkEndCheckpointIsHeldOnlyAsTheNextChunksInput) {
+    RebuildFused();
+    ASSERT_EQ(Prefill("a", A()), 0);
+    ASSERT_TRUE(StateEntry(A(), 16).has_value());
+    ASSERT_TRUE(StateEntry(A(), 24).has_value());
+    EXPECT_FALSE(StateEntry(A(), 16)->pinned) << "only the cache holds it";
+    EXPECT_TRUE(StateEntry(A(), 24)->pinned) << "the last chunk's State input";
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(plan);
+    ASSERT_NE(batch, nullptr);
+    ASSERT_EQ(batch->request_ids, std::vector<std::string>{"a"}) << "the first decode";
+    EXPECT_FALSE(StateEntry(A(), 24)->pinned);
+}
+
+// Chunk-end checkpoints age under LRU like any entry, and a fork's hit dates one forward.
+TEST_F(ChunkEndCheckpointSuite, ChunkEndCheckpointsAgeLikeAnyEntry) {
+    RebuildFused();
+    const std::vector<std::int32_t> x = MakeTokens(30, 5000);
+    ASSERT_EQ(Turn("x", x), 0);
+    ASSERT_EQ(Turn("a", A()), 0);
+    EXPECT_EQ(scheduler_->ChunkEndCheckpointsPublished(), 4u);
+    std::vector<std::pair<CacheBlockLocation, std::string>> names;
+    for (const auto& [name, tokens, boundary] :
+         std::vector<std::tuple<std::string, std::vector<std::int32_t>, std::int32_t>>{
+             {"x16", x, 16}, {"x24", x, 24}, {"x28", x, 28}, {"a16", A(), 16}, {"a24", A(), 24}, {"a28", A(), 28}}) {
+        const auto entry = StateEntry(tokens, boundary);
+        ASSERT_TRUE(entry.has_value()) << name;
+        EXPECT_FALSE(entry->metadata.demoted) << name;
+        names.emplace_back(entry->location, name);
+    }
+    const auto position = [](const std::vector<std::string>& order, const char* name) {
+        return std::ranges::find(order, std::string{name}) - order.begin();
+    };
+    std::vector<std::string> order = EvictionOrder(SchedulerTestAccess::Coordinator(*scheduler_).GroupPrefixIndex(1),
+                                                   SchedulerTestAccess::Pool(*scheduler_), names);
+    ASSERT_EQ(order.size(), 6u);
+    for (const char* older : {"x16", "x24", "x28"}) {
+        for (const char* newer : {"a16", "a24", "a28"}) {
+            EXPECT_LT(position(order, older), position(order, newer)) << older << " before " << newer;
+        }
+    }
+    EXPECT_EQ(Probe("fork", Extend(First(A(), 18), 800, 6)), 16);
+    order = EvictionOrder(SchedulerTestAccess::Coordinator(*scheduler_).GroupPrefixIndex(1),
+                          SchedulerTestAccess::Pool(*scheduler_), names);
+    EXPECT_EQ(order.back(), "a16") << "the fork's hit dated it forward";
+}
+
+// A 62-token prompt (in-forward checkpoint at 60) publishes two, at the first chunk ends past 20 and 40.
+TEST_F(ChunkEndCheckpointSuite, APromptPublishesAtMostTwoSpreadBelowItsInForwardCheckpoint) {
+    RebuildFused();
+    const std::vector<std::int32_t> prompt = MakeTokens(62);
+    ASSERT_EQ(Turn("long", prompt), 0);
+    EXPECT_EQ(scheduler_->ChunkEndCheckpointsPublished(), 2u);
+    EXPECT_EQ(Probe("fork30", Extend(First(prompt, 30), 800, 6)), 24);
+    EXPECT_EQ(Probe("fork54", Extend(First(prompt, 54), 810, 6)), 40);
+}
+
+// Under write-through a fork resumes at a chunk-end checkpoint from the Host once the Device copy is gone.
+TEST_F(ChunkEndCheckpointSuite, AForkResumesAtAChunkEndCheckpointFromTheHost) {
+    write_policy_ = SchedulerConfig::HostWritePolicy::kWriteThrough;
+    RebuildFused(/*device_pages=*/257, /*host_pages=*/257);
+    ASSERT_EQ(Turn("a", A()), 0);
+    ASSERT_TRUE(scheduler_->ClearL1Cache());
+    EXPECT_FALSE(StateEntry(A(), 16).has_value()) << "gone from the Device";
+    EXPECT_EQ(Probe("fork18", Extend(First(A(), 18), 800, 6)), 16);
 }
 
 }  // namespace

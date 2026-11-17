@@ -260,8 +260,8 @@ class TestStateCheckpointInForward:
 
         scheduler.submit_requests([_spec("second", prompt[:6] + [99], MAX_NEW_TOKENS)])
         [batch] = _dispatched(scheduler.next_execution_plan())
-        # By default no state was published at 6 and the request starts over.
-        assert list(batch.extend_prefix_lens) == [6 if in_forward else 0]
+        # By default no state was published at 6; the chunk-end checkpoint at 4 serves.
+        assert list(batch.extend_prefix_lens) == [6 if in_forward else 4]
         if in_forward:
             second = _state_rows(batch, "second")
             assert {g: row[0] for g, row in second.items()} == {

@@ -183,9 +183,10 @@ arithmetic kept out of the planner: how a chunk is cut lives in
 entry both prefill paths call), what each group demands for it in
 `scheduler/operations/group_demands.h`.
 
-**Junction cut.** A chunk is never shortened to a page boundary: a prompt
-end publishes its partial page as a tail (§1.2), so a chunk ending mid-page
-costs nothing. The one cut is the *junction* of a hit: when the KV reach `T`
+**Junction cut.** A chunk is shortened to a page boundary only for a
+chunk-end State checkpoint (§1.2): a prompt end publishes its partial page as
+a tail (§1.2), so a chunk ending mid-page costs nothing otherwise. The other
+cut is the *junction* of a hit: when the KV reach `T`
 lies past the hit `T_s` (`AdmissionResult::junction_tokens`, kept in
 `CacheProgress::junction_tokens` until a chunk passes it), the first chunk
 after `T_s` ends exactly at `T`, so the natural checkpoint it leaves coincides
@@ -418,8 +419,9 @@ and the sliding windows the chunk wrote are published), and a finish or
 retraction on every role (`kFinal`: the P's
 transferred prompt, the D's and the fused engine's last decoded state),
 except the dead prompt ends and finishes that the in-forward checkpoint
-skips (below). An ordinary chunk end or decode step publishes nothing for a State
-group (`CompletedPages::publish_state` is false). The key is the key of the
+skips (below), and the chunk-end checkpoints of a prompt prefilled from
+(near) zero (below). Any other chunk end, and every decode step, publishes
+nothing for a State group (`CompletedPages::publish_state` is false). The key is the key of the
 exact token count `T`: the chain hash of the last page when `T` is a page
 multiple, otherwise the tail hash `hash@T` the KV groups use — so one key
 names a request's progress across every group kind (`cache-concepts.md`). A
@@ -498,6 +500,48 @@ then ownership is released. An admission that
 cannot fit drops its own optional hold before retrying, and retraction drops
 it before imaging the request. Neither an incomplete checkpoint nor a partial
 set of sliding-window dependencies is retained.
+
+**Chunk-end State checkpoints.** On the fused role, a prompt prefilled from
+(near) zero -- its prefix hit below one chunk budget -- publishes its State at up to
+`kChunkEndStateCheckpointsPerPrompt` (two) of its intermediate chunk ends.
+Such a chunk is cut down to a page boundary (fewer than one page is deferred
+to the next chunk, which then starts on a page), and the next chunk's
+admission publishes the live State there under the page hash
+(`PublicationPoint::kStateCheckpoint`), as at a junction. The n-th goes to the
+first page boundary a chunk end reaches at or past n/3 of the way to the
+in-forward checkpoint (the prompt end without one), so they are spread evenly
+below it; a chunk end at a junction or at the in-forward checkpoint already
+publishes a State and is not cut. The case served is a first fork inside a
+long prompt that was prefilled from scratch (a side call or a sibling
+subagent branching from a long context): without these it resumes at zero or
+at an old turn. A chunk-end checkpoint is not an in-forward checkpoint: it is
+not retained (`RetainInputCheckpoint`), not recorded in the checkpoint
+lineage, and never supersedes anything; it ages under LRU like any cache
+entry, and a fork that resumes there dates it forward like any hit. The P role
+publishes none for now: the extra entries would change which pages PD
+transfers pin and how write-back segments are laid out, which has not been
+measured; extending the rule to it is a follow-up with its own PD
+measurement. The D role never prefills a prompt from zero (its prompt arrives
+by transfer). An engine without prefix caching and restricted State groups
+(`checkpoint_granularity > 1`) publish none either.
+
+Why two: spread evenly below the in-forward checkpoint `C`, `K` checkpoints
+leave a fork at a uniformly random point of the prompt `C / (2 (K + 1))` tokens
+to recompute on average (`C/2`, `C/4`, `C/6` for none, one, two), while each
+costs one State block per State group of evictable cache and saves less than
+the one before (`C / (2 (K + 1) (K + 2))`). Two is not derived: it is what two
+full agentic A/B runs measured (fork first turns recompute 10-15% less, Device
+evictions unchanged within noise).
+
+They pin no extra blocks. The published block is the request's own live slot
+of the previous chunk: the next chunk holds it as its State input (slot 0),
+exactly as it would hold the unpublished block, and the admission after that
+rotates it out, after which only the cache holds it -- unpinned and evictable
+by any admission or restore, like any other entry. A request therefore holds
+the same blocks per State group with or without them (two, plus the
+in-forward checkpoint's while it is pending); what they add is up to two
+evictable entries per qualifying prompt, never an admission failure or a
+retraction. Accounting: `ChunkEndCheckpointsPublished`.
 
 **Dead checkpoints.** A next turn that re-renders the end of the previous
 prompt and its reply resumes at neither that prompt end nor its finish. That

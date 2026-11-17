@@ -5376,12 +5376,12 @@ TEST_F(JunctionCutHostSuite, HostOnlyKvCutsTheFirstChunkAtTheJunction) {
     SendForwardDone("seed", {42});
     SendFinish("seed");
     AckWriteBacks(PlanOnce());
-    ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 7) << "six KV pages and state@12";
+    ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 8) << "six KV pages, the chunk-end state@8 and state@12";
     ASSERT_TRUE(scheduler_->ClearL1Cache());
-    // The clear evicts the six pages and state@12; Host holds all seven.
+    // The clear evicts the six pages, state@8 and state@12; Host holds all eight.
     const CacheEvictor::DeviceEvictionCounts flushed = scheduler_->GetHostCacheStats().device_evictions.flush;
-    EXPECT_EQ(flushed.blocks, 7u);
-    EXPECT_EQ(flushed.host_resident, 7u);
+    EXPECT_EQ(flushed.blocks, 8u);
+    EXPECT_EQ(flushed.host_resident, 8u);
 
     RequestSpec first = seed;
     first.request_id = "first";

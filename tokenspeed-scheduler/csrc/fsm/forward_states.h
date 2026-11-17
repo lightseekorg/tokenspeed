@@ -98,6 +98,9 @@ struct CacheProgress {
     // block no forward wrote: a finish at the prompt end, whose first decode
     // ran as a padding row, publishes slot 0 (CompletedPages::state_slot).
     bool prompt_end_rotated{false};
+    // Chunk-end State checkpoints (scheduler.md §1.2): this chunk's cut boundary (0 for none) and the count published.
+    std::int32_t chunk_end_checkpoint_tokens{0};
+    std::int32_t chunk_end_checkpoints_published{0};
 };
 
 inline std::span<const std::int32_t> ComputeShiftedInputIds(const TokenContainer* token_container,

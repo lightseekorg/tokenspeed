@@ -438,7 +438,9 @@ below.
 
 A **natural checkpoint** is a state block that exists because a forward ended
 there -- the prompt end (the block rotated out of slot 1 as the first decode
-runs), the finish (slot 1 in place), the chunk the junction cut ended, or the
+runs), the finish (slot 1 in place), the chunk the junction cut ended, up to
+two chunk ends of a prompt prefilled from (near) zero ([Scheduler
+§1.2](scheduler.md#12-state-groups-two-slots-natural-checkpoints)), or the
 retraction image -- published under the hash of that token count, page
 boundary or not. The one interior checkpoint is opt-in
 (`--enable-state-checkpoint-in-forward`): the forward that spans a long

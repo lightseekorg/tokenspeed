@@ -161,6 +161,37 @@ std::int32_t chunkTowardInForwardCheckpoint(std::int32_t checkpoint, std::int32_
     return (checkpoint - first_pos) % prefix_granularity == 0 ? tokens : checkpoint - first_pos;
 }
 
+// Chunk-end State checkpoints per prompt; why two: docs/design/scheduler.md §1.2.
+constexpr std::int32_t kChunkEndStateCheckpointsPerPrompt = 2;
+
+// The page boundary a chunk-end State checkpoint cuts this chunk to, or 0 to leave it (scheduler.md §1.2).
+std::int32_t chunkEndCheckpointBoundary(const SchedulerConfig& config, const CacheCoordinator& coordinator,
+                                        std::int32_t prompt_tokens, std::int32_t resume_tokens, std::int32_t published,
+                                        std::int32_t first_pos, std::int32_t tokens, std::int32_t unscheduled,
+                                        std::int32_t junction, std::int32_t state_checkpoint) {
+    constexpr std::int32_t cap = kChunkEndStateCheckpointsPerPrompt;
+    if (published >= cap || config.disable_prefix_cache || config.role != Role::kFused || tokens >= unscheduled ||
+        resume_tokens >= config.max_scheduled_tokens || coordinator.CheckpointGranularity() > 1) {
+        return 0;
+    }
+    bool has_state_group = false;
+    for (std::int32_t i = 0; i < coordinator.NumGroups(); ++i) {
+        has_state_group = has_state_group || coordinator.GroupIsState(static_cast<std::size_t>(i));
+    }
+    const std::int32_t end = first_pos + tokens;
+    if (!has_state_group || end == junction || end == state_checkpoint) {
+        return 0;
+    }
+    const std::int32_t page = coordinator.PrefixGranularity();
+    const std::int32_t upper = state_checkpoint > 0 ? state_checkpoint : prompt_tokens;
+    const std::int64_t target = std::int64_t{upper} * (published + 1) / (cap + 1);
+    const std::int32_t boundary = end / page * page;
+    if (boundary <= first_pos || boundary < target || boundary >= upper) {
+        return 0;
+    }
+    return boundary;
+}
+
 // Adds the copy-in blocks an admission reserved (AdmissionResult::
 // copy_in_blocks: null for the slots it allocated no block for) to the ones
 // the request holds, slot by slot.
@@ -625,6 +656,14 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
                                               : 0;
     tokens_this_round = chunkTowardInForwardCheckpoint(state_checkpoint, hit_tokens, tokens_this_round, junction_tokens,
                                                        config_.max_scheduled_tokens, coordinator_.PrefixGranularity());
+    const std::int32_t chunk_end_checkpoint =
+        source == fsm::PrefillSource::kLocal
+            ? chunkEndCheckpointBoundary(config_, coordinator_, request->PrefillSize(), hit_tokens, /*published=*/0,
+                                         hit_tokens, tokens_this_round, unscheduled, junction_tokens, state_checkpoint)
+            : 0;
+    if (chunk_end_checkpoint > 0) {
+        tokens_this_round = chunk_end_checkpoint - hit_tokens;
+    }
     bool writes_checkpoint =
         writesInForwardCheckpoint(state_checkpoint, hit_tokens, tokens_this_round, coordinator_.PrefixGranularity());
     // A carried prompt runs whole or waits: one this budget or its shaping
@@ -725,6 +764,9 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
                                  ? std::optional<std::string>{admission->resumed_tail_hash->ToString()}
                                  : std::nullopt,
         .resume_tokens = hit_tokens,
+        .chunk_end_checkpoint_tokens =
+            chunk_end_checkpoint > 0 && hit_tokens + tokens_this_round == chunk_end_checkpoint ? chunk_end_checkpoint
+                                                                                               : 0,
     };
     // Checkpoint demotion counts the first admissions that resume at each
     // page boundary: one more than a conversation's own makes it shared
@@ -783,6 +825,16 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     prefill_tokens =
         chunkTowardInForwardCheckpoint(state_checkpoint, first_pos, prefill_tokens, cache_progress.junction_tokens,
                                        config_.max_scheduled_tokens, coordinator_.PrefixGranularity());
+    // The previous chunk's chunk-end checkpoint publishes at this admission, as a junction's does.
+    const bool ends_at_chunk_end_checkpoint =
+        cache_progress.chunk_end_checkpoint_tokens > 0 && first_pos == cache_progress.chunk_end_checkpoint_tokens;
+    const std::int32_t chunk_end_checkpoint = chunkEndCheckpointBoundary(
+        config_, coordinator_, request->PrefillSize(), cache_progress.resume_tokens,
+        cache_progress.chunk_end_checkpoints_published + (ends_at_chunk_end_checkpoint ? 1 : 0), first_pos,
+        prefill_tokens, unscheduled, cache_progress.junction_tokens, state_checkpoint);
+    if (chunk_end_checkpoint > 0) {
+        prefill_tokens = chunk_end_checkpoint - first_pos;
+    }
     bool writes_checkpoint =
         writesInForwardCheckpoint(state_checkpoint, first_pos, prefill_tokens, coordinator_.PrefixGranularity());
     // The chunk that ended at the junction publishes its natural checkpoint
@@ -799,12 +851,14 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     if (ends_at_state_checkpoint) {
         cache_progress.published_state_checkpoint_tokens = state_checkpoint;
     }
-    const RequestProgress progress = AdvanceRequestProgress(
-        *request, cache_progress, request->NumComputedTokens(), coordinator_.PrefixGranularity(),
-        config_.StreamsDeviceCacheToHost(),
-        ends_at_junction || ends_at_state_checkpoint ? PublicationPoint::kStateCheckpoint : PublicationPoint::kChunk,
-        /*allow_state_checkpoint=*/true, /*preserve_source_blocks=*/config_.role == Role::kP,
-        /*publish_to_cache=*/config_.PublishesCompletedPages());
+    const RequestProgress progress =
+        AdvanceRequestProgress(*request, cache_progress, request->NumComputedTokens(), coordinator_.PrefixGranularity(),
+                               config_.StreamsDeviceCacheToHost(),
+                               ends_at_junction || ends_at_state_checkpoint || ends_at_chunk_end_checkpoint
+                                   ? PublicationPoint::kStateCheckpoint
+                                   : PublicationPoint::kChunk,
+                               /*allow_state_checkpoint=*/true, /*preserve_source_blocks=*/config_.role == Role::kP,
+                               /*publish_to_cache=*/config_.PublishesCompletedPages());
 
     std::vector<BlockTable>& tables = request->BlockTablesRef();
     // A chunk reads the state its predecessor wrote (slot 1 -> slot 0) and
@@ -856,6 +910,13 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
         cache_progress.retained_input_checkpoint =
             coordinator_.RetainInputCheckpoint(cache_progress.prefix_hashes, state_checkpoint);
     }
+    // Unlike an in-forward checkpoint, a chunk-end checkpoint is neither retained nor in the lineage.
+    if (ends_at_chunk_end_checkpoint) {
+        ++cache_progress.chunk_end_checkpoints_published;
+        ++chunk_end_checkpoints_published_;
+    }
+    cache_progress.chunk_end_checkpoint_tokens =
+        chunk_end_checkpoint > 0 && first_pos + prefill_tokens == chunk_end_checkpoint ? chunk_end_checkpoint : 0;
     return fsm::SchedulePrefillEvent{prefill_tokens, decode_reserve, config_.role == Role::kP};
 }
 

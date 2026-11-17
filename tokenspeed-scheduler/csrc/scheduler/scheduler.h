@@ -254,6 +254,8 @@ public:
     // write-back's way to the Host; always 0 without
     // SchedulerConfig::demote_superseded_state_checkpoints. Accounting only.
     std::uint64_t DemotedCheckpointEntries() const { return demoted_checkpoint_entries_; }
+    // Chunk-end State checkpoints published since start (scheduler.md §1.2). Accounting only.
+    std::uint64_t ChunkEndCheckpointsPublished() const { return chunk_end_checkpoints_published_; }
     // Empty parents of the request-private snapshot pool: every block of it
     // belongs to some retracted request's image, so a request that finished
     // or aborted while retracted must have returned its share (leak check).
@@ -803,6 +805,8 @@ private:
     std::optional<CheckpointLineage> checkpoint_lineage_;
     // DemotedCheckpointEntries.
     std::uint64_t demoted_checkpoint_entries_{0};
+    // ChunkEndCheckpointsPublished.
+    std::uint64_t chunk_end_checkpoints_published_{0};
     // Decode steps admitted through the coordinator instead of consuming
     // their reserve in place (scheduleDecode). Read by tests only.
     std::uint64_t decode_admissions_{0};
