@@ -1431,7 +1431,7 @@ class DFlash(BaseDrafter):
         self._ensure_fused_workspace(total_ctx, ctx_hidden.dtype)
 
         proj_out_2d = self._fused_kv_proj_workspace[:total_ctx]
-        kernel_mm(ctx_hidden.contiguous(), self._fused_kv_flat_weight, out=proj_out_2d)
+        kernel_mm(ctx_hidden, self._fused_kv_flat_weight, out=proj_out_2d)
 
         proj_out = proj_out_2d.view(
             total_ctx, self._fused_kv_n_layers, self._fused_kv_layer_out_dim
