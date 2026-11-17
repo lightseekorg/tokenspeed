@@ -179,10 +179,10 @@ void Scheduler::prepareStorage(Request& request) {
             return;
         }
         CacheCoordinator::PromptPrefix prompt{.prefix_hashes = state->hashes,
-                                                    .tokens = request.TokenSlice(0, state->max_tokens),
-                                                    .max_tokens = state->max_tokens,
-                                                    .tail = state->tail,
-                                                    .shared_prefix_tokens = request.SharedPrefixTokens()};
+                                              .tokens = request.TokenSlice(0, state->max_tokens),
+                                              .max_tokens = state->max_tokens,
+                                              .tail = state->tail,
+                                              .shared_prefix_tokens = request.SharedPrefixTokens()};
         // Another request's D2H/GET may have fulfilled this dependency. This
         // bounded local check does not rehash the prompt while it waits.
         const auto probe = coordinator_.ProbePromptPrefix(prompt);

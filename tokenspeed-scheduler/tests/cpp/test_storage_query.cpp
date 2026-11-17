@@ -389,11 +389,11 @@ TEST(StorageQueryTest, PreparedReservationObservesCacheChanges) {
     QueryCache cache(4, FullAndStates(4, 4, 1), 64);
     QueryPrompt tokens(8, 4);
     auto prompt = tokens.Prefix(8, false);
-    const CacheKey first{.group_id = 0, .content_hash = tokens.hashes[0]};
+    const CacheKey first{.group_id = 0, .content_hash = ContentHash{tokens.hashes[0]}};
     const std::vector<CacheKey> remote{
         first,
-        {.group_id = 0, .content_hash = tokens.hashes[1]},
-        {.group_id = 1, .content_hash = tokens.hashes[1]},
+        {.group_id = 0, .content_hash = ContentHash{tokens.hashes[1]}},
+        {.group_id = 1, .content_hash = ContentHash{tokens.hashes[1]}},
     };
     cache.Warm(std::span{&first, 1});
     prompt.prepared_keys = cache.coordinator.ProbePromptPrefix(prompt).group_keys;
