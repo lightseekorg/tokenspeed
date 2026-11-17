@@ -33,8 +33,9 @@ placement can be derived (``--init-expert-location <records>``).
 
 The placement is process-global for the target model
 (``set_global_expert_location_metadata``); drafts route their own experts
-trivially. Models opt in explicitly (``BaseCausalLM.supports_expert_placement``)
-by building their MoE layers from the placement; the placement is refused for
+trivially. Models opt in explicitly (``BaseCausalLM.supports_expert_placement``,
+or the same class attribute on a model class outside ``BaseCausalLM``) by
+building their MoE layers from the placement; the placement is refused for
 any other model. Zero experts (LongCat) never enter these tables: the router
 keeps them as ``-1`` and maps only real expert ids.
 
@@ -777,7 +778,9 @@ def compute_logical_to_rank_dispatch_physical_map(
     if not 0 <= ep_rank < num_gpus:
         raise ValueError(f"ep_rank={ep_rank} is outside the {num_gpus} EP ranks")
     num_local = num_physical_experts // num_gpus
-    nodes = torch.tensor(list(ep_rank_nodes), dtype=torch.int64)
+    # Host-side table: explicit devices, since model construction may run under a
+    # CUDA default-device context.
+    nodes = torch.tensor(list(ep_rank_nodes), dtype=torch.int64, device="cpu")
     num_nodes = int(nodes.max().item()) + 1
 
     replicas = logical_to_all_physical_map.cpu().to(torch.int64)
@@ -792,7 +795,10 @@ def compute_logical_to_rank_dispatch_physical_map(
     # [layers, experts, gpus] instead of a loop over the gpus.
     def first_replica_on(owner: torch.Tensor, count: int) -> torch.Tensor:
         first = torch.full(
-            (num_layers, num_logical_experts, count), -1, dtype=torch.int64
+            (num_layers, num_logical_experts, count),
+            -1,
+            dtype=torch.int64,
+            device="cpu",
         )
         for column in reversed(range(max_replicas)):
             index = owner[..., column].clamp_min(0).unsqueeze(-1)
@@ -825,6 +831,7 @@ def compute_logical_to_rank_dispatch_physical_map(
         column[unassigned] = torch.tensor(
             _fair_choices(candidates, k=int(unassigned.sum().item()), r=r),
             dtype=torch.int64,
+            device="cpu",
         )
 
     return (
@@ -900,12 +907,18 @@ def build_expert_placement(
         return None
     # Deferred: the model base imports the MoE layers, whose router imports
     # this module for its placement view.
+    from tokenspeed.runtime.layers.moe.utils import MoeBackend
     from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
 
     model_class, architecture = get_model_architecture(model_config)
-    if not (
-        issubclass(model_class, BaseCausalLM) and model_class.supports_expert_placement
-    ):
+    # A model class outside BaseCausalLM (Kimi-K3's multimodal wrapper) opts
+    # in by declaring the flag on itself.
+    opted_in = (
+        model_class.supports_expert_placement
+        if issubclass(model_class, BaseCausalLM)
+        else vars(model_class).get("supports_expert_placement", False)
+    )
+    if opted_in is not True:
         raise ValueError(
             f"{architecture} does not route through an expert placement; "
             "--ep-num-redundant-experts, --init-expert-location, "
@@ -920,9 +933,11 @@ def build_expert_placement(
     placement = compute_initial_expert_location_metadata(server_args, model_config)
     if server_args.expert_distribution_recorder_mode is not None:
         placement.enable_load_recording(server_args.mapping)
-    if (
-        server_args.ep_dispatch_algorithm in STATIC_EP_DISPATCH_ALGORITHMS
-        and server_args.all2all_backend != "none"
+    if server_args.ep_dispatch_algorithm in STATIC_EP_DISPATCH_ALGORITHMS and (
+        server_args.all2all_backend != "none"
+        # MegaMoE fuses its own dispatch, so it runs all-to-all EP with no
+        # all-to-all backend (Kimi-K3).
+        or MoeBackend(server_args.moe_backend).is_mega_moe()
     ):
         # All-to-all EP slices this rank's static map while the model is
         # built, inside the weight region a memory-saver discard releases and

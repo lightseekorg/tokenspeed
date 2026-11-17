@@ -395,6 +395,7 @@ def test_build_expert_placement_refuses_models_that_do_not_opt_in():
         expert_distribution_recorder_mode="stat",
         ep_dispatch_algorithm="static",
         all2all_backend="none",
+        moe_backend="auto",
         enable_eplb=False,
         mapping=_mapping(),
     )
@@ -425,20 +426,22 @@ def test_build_expert_placement_refuses_models_that_do_not_opt_in():
 
 
 @pytest.mark.parametrize(
-    "algorithm,all2all_backend,built",
+    "algorithm,all2all_backend,moe_backend,built",
     [
-        ("static", "deepep", True),
-        ("static_with_zero_expert", "deepep", True),
-        ("static", "none", False),
-        ("dynamic", "deepep", False),
+        ("static", "deepep", "auto", True),
+        ("static_with_zero_expert", "deepep", "auto", True),
+        ("static", "none", "auto", False),
+        ("static", "none", "mega_moe", True),
+        ("dynamic", "deepep", "auto", False),
     ],
 )
 def test_build_expert_placement_owns_the_all_to_all_static_dispatch_map(
-    algorithm, all2all_backend, built
+    algorithm, all2all_backend, moe_backend, built
 ):
     # All-to-all EP slices this map while the model is built, inside the
     # weight region a memory-saver discard releases; the placement must hold
-    # it before then. Replicated-input EP still never builds it.
+    # it before then. MegaMoE fuses its dispatch, so it runs all-to-all EP
+    # with no all-to-all backend. Replicated-input EP still never builds it.
     from tokenspeed.runtime.layers.moe.topk import ExpertLocationDispatchInfo
     from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
 
@@ -457,6 +460,7 @@ def test_build_expert_placement_owns_the_all_to_all_static_dispatch_map(
         expert_distribution_recorder_mode=None,
         ep_dispatch_algorithm=algorithm,
         all2all_backend=all2all_backend,
+        moe_backend=moe_backend,
         enable_eplb=False,
         mapping=_mapping(),
     )

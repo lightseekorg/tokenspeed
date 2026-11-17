@@ -164,6 +164,75 @@ def test_placement_plan_for_896_slots_over_128_ranks_has_7_slots_per_rank():
     assert last[0].checkpoint_weight_name == "experts.121.gate_proj."
 
 
+def test_k3_900_slots_over_20_ranks_hold_every_expert_and_its_replicas():
+    # Kimi-K3: 896 routed experts do not divide over EP20; four redundant
+    # slots make 900 (45 per rank), the trivial placement wrapping slots
+    # 896..899 onto experts 0..3 on the last rank.
+    schema = ExpertCheckpointSchema(
+        gate_proj_name="w1", up_proj_name="w3", down_proj_name="w2"
+    )
+    physical_to_logical = (torch.arange(900) % 896).repeat(2, 1)
+    nodes = tuple(r // 4 for r in range(20))
+    with pytest.raises(ValueError, match="divide evenly"):
+        build_moe_checkpoint_loader(
+            params_dict={},
+            expert_schema=schema,
+            num_experts=896,
+            ep_rank=0,
+            ep_size=20,
+        )
+
+    slots_of_expert: dict[int, list[tuple[int, int]]] = {}
+    for ep_rank in range(20):
+        placement = ExpertLocationMetadata.from_physical_to_logical_map(
+            physical_to_logical, 896, ep_size=20, ep_rank=ep_rank, ep_rank_nodes=nodes
+        )
+        assert placement.num_local_physical_experts == 45
+        plan = _build_placed_expert_plan(
+            schema, expert_placement=placement, ep_rank=ep_rank
+        )
+        layer_plan = [entry for entry in plan if entry.layer_id == 1]
+        assert len(layer_plan) == 45 * 3
+        for entry in layer_plan[::3]:
+            expert = int(entry.checkpoint_weight_name.split(".")[1])
+            slots_of_expert.setdefault(expert, []).append(
+                (ep_rank, entry.local_expert_id)
+            )
+    assert sorted(slots_of_expert) == list(range(896))
+    for expert, slots in slots_of_expert.items():
+        if expert < 4:
+            assert slots == [(0, expert), (19, 41 + expert)]
+        else:
+            assert slots == [(expert // 45, expert % 45)]
+
+    # Rank 19 loads expert 2 into its replica slot and expert 860 into slot 5.
+    placement = ExpertLocationMetadata.from_physical_to_logical_map(
+        physical_to_logical, 896, ep_size=20, ep_rank=19, ep_rank_nodes=nodes
+    )
+    slots = _Slots(45)
+    loader = build_moe_checkpoint_loader(
+        params_dict={
+            f"model.layers.1.block_sparse_moe.experts.{name}": param
+            for name, param in slots.named_parameters()
+        },
+        expert_schema=schema,
+        num_experts=900,
+        ep_rank=19,
+        ep_size=20,
+        expert_placement=placement,
+    )
+    loader.load(
+        "model.layers.1.block_sparse_moe.experts.2.w2.weight", torch.full((4, 4), 2.0)
+    )
+    loader.load(
+        "model.layers.1.block_sparse_moe.experts.860.w2.weight",
+        torch.full((4, 4), 860.0),
+    )
+    assert slots.writes == [("w2", 43), ("w2", 5)]
+    assert slots.w2_weight[43, 0, 0] == 2.0 and slots.w2_weight[5, 0, 0] == 860.0
+    assert not loader.matches("model.layers.1.block_sparse_moe.experts.4.w1.weight")
+
+
 def test_loader_geometry_must_match_the_placement():
     placement = _placement([[0, 1, 2, 3, 0, 2]], 4, 2, ep_rank=0)
     with pytest.raises(ValueError, match="physical experts"):
