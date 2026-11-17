@@ -2125,7 +2125,12 @@ def test_draft_row_count_warmup_launches_its_own_library_gemms(monkeypatch, adap
     base_logits, width, dtype, rows = calls[0]
     head = model.lm_head.weight
     assert (width, dtype, rows) == (config.hidden_size, head.dtype, 48)
-    hidden = torch.randn(3, config.hidden_size, dtype=head.dtype)
+    # The head is allocated uninitialized; NaN bits in it would fail the exact
+    # comparison below (NaN != NaN) whatever the call.
+    generator = torch.Generator().manual_seed(0)
+    with torch.no_grad():
+        head.normal_(generator=generator)
+    hidden = torch.randn(3, config.hidden_size, dtype=head.dtype, generator=generator)
     torch.testing.assert_close(
         base_logits(hidden),
         draft.local_base_logits(hidden, head),
