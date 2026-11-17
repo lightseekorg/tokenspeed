@@ -25,6 +25,7 @@ and the route through ``mv``."""
 from __future__ import annotations
 
 import math
+import sys
 from dataclasses import replace
 from unittest.mock import Mock
 
@@ -39,7 +40,7 @@ from tokenspeed_kernel.ops.gemm._triton.bf16x3 import (
     split_fp32_weight_bf16x3,
     triton_bf16x3_gemm_fp32,
 )
-from tokenspeed_kernel.platform import ArchVersion
+from tokenspeed_kernel.platform import ArchVersion, current_platform
 from tokenspeed_kernel.registry import KernelRegistry, KernelSpec, Priority
 
 U = 2.0**-24  # FP32 unit roundoff
@@ -230,22 +231,29 @@ def test_kernel_model_keeps_non_finite_activations_non_finite():
     assert expected[0].isinf().all() and y[0].isnan().any()
 
 
+@pytest.mark.parametrize("warp_specialize", [False, True])
 @pytest.mark.parametrize("n,k", [(128, 2048), (256, 4096), (256, 7168), (1024, 3072)])
-def test_config_tiles_the_problem_with_a_bounded_set_of_kernels(n, k):
+def test_config_tiles_the_problem_with_a_bounded_set_of_kernels(n, k, warp_specialize):
     blocks = k // 64
     variants, splits = set(), set()
-    for m in [*range(BF16X3_MIN_M, 1100), 2048, 4095, 8192, 16384]:
-        cfg = _bf16x3_config(m, n, k)
+    for m in [*range(BF16X3_MIN_M, 1100), 2047, 2048, 4095, 8192, 16384]:
+        cfg = _bf16x3_config(m, n, k, warp_specialize)
+        assert cfg.warp_specialize == (warp_specialize and m >= 2048)
         weight_tile = cfg.block_a if cfg.swap else cfg.block_b
         row_tile = cfg.block_b if cfg.swap else cfg.block_a
         assert n % weight_tile == 0 and blocks % cfg.split == 0
         assert row_tile & (row_tile - 1) == 0 and (not cfg.swap or row_tile >= m)
-        ctas = (n // weight_tile) * -(-m // row_tile) * cfg.split
+        # Warp-specialized tiles keep the split of 64-row tiles, so the sums stay the same.
+        split_rows = 64 if cfg.warp_specialize else row_tile
+        ctas = (n // weight_tile) * -(-m // split_rows) * cfg.split
         assert ctas >= (120 if m <= 512 else 240) or cfg.split == blocks
-        variants.add((cfg.swap, cfg.block_a, cfg.block_b, cfg.split > 1))
+        assert cfg.split == _bf16x3_config(m, n, k, False).split
+        variants.add(
+            (cfg.swap, cfg.block_a, cfg.block_b, cfg.split > 1, cfg.warp_specialize)
+        )
         splits.add(cfg.split)
     # Each variant and split is one compile, whatever the row count.
-    assert len(variants) <= 5 and len(splits) <= 8
+    assert len(variants) <= 5 + warp_specialize and len(splits) <= 8
 
 
 class _Launches(list):
@@ -274,7 +282,7 @@ def test_kernel_is_launched_with_the_drain_and_without_fp_fusion(monkeypatch, m)
         triton_bf16x3, "_bf16x3_splitk_reduce_kernel", launches.kernel("reduce")
     )
     n, k = 256, 4096
-    cfg = _bf16x3_config(m, n, k)
+    cfg = _bf16x3_config(m, n, k, current_platform().is_blackwell)
     out = triton_bf16x3_gemm_fp32(
         torch.zeros(m, k, dtype=torch.bfloat16),
         torch.zeros(3, n, k, dtype=torch.bfloat16),
@@ -290,6 +298,8 @@ def test_kernel_is_launched_with_the_drain_and_without_fp_fusion(monkeypatch, m)
     assert kwargs["BK"] == kwargs["DRAIN"] == 64
     assert kwargs["enable_fp_fusion"] is False
     assert kwargs["SWAP"] == cfg.swap and kwargs["USE_WS"] == (cfg.split > 1)
+    assert kwargs["WARP_SPECIALIZE"] == cfg.warp_specialize
+    assert kwargs["num_warps"] == cfg.num_warps
     assert args[4:] == (m, k // cfg.split)
     if cfg.split == 1:
         assert len(launches) == 1 and args[2] is out
@@ -484,3 +494,7 @@ def test_decode_gemv_widens_bf16_rows_for_an_fp32_weight_on_torch():
     assert gemm_api.mv_weight_split(w) is None
     with pytest.raises(ValueError, match="out must match"):
         gemm_api.mv(x, w, out=torch.empty(20, 32, dtype=torch.bfloat16))
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

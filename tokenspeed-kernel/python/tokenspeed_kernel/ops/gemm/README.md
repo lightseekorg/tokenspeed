@@ -1,9 +1,7 @@
 # GEMM weight preparation
 
-The optional `trtllm_kernel` extension is required for TRT-LLM's fused-A
-projection and cuBLASLt NVFP4 GEMM provider. Without it, the NVFP4 leaf is not
-registered and a direct fused-A call reports the missing package; importing
-other GEMM providers does not require the extension.
+TRT-LLM's DeepSeek V3 fused-A projection and cuBLASLt NVFP4 GEMM provider are
+built into tokenspeed-kernel's CUDA extension, adapted from TensorRT-LLM.
 
 ## Blackwell block-FP8 automatic selection
 
@@ -100,13 +98,14 @@ head. It stands in only where `mm` selects the GEMV it reproduces bit for bit
 on the normed rows; `mv_rmsnorm_gated_sigmoid_supported` tells callers when to
 keep the gated norm and `mm` as two calls.
 
-On SM107, BF16 output projections whose weight shape is in the measured
-`_SM107_BF16_GEMM_SHAPES` set (the TP4 per-rank projections plus the TP1
-`[2560, 6144]` o_proj) run FlashInfer's CuTe DSL low-latency GEMM at M <= 4,
-pinned as the measured winner on every admitted shape; other shapes keep
-their existing path. Startup tuning covers M=1/2/4. The kernels accumulate
-in FP32 and return BF16; reduction order can change rounding relative to
-the original GEMM.
+On SM107, BF16 projections run FlashInfer's CuTe DSL low-latency GEMM at
+M <= 32, as on SM100 and SM103, when `_sm107_cute_dsl_bf16_admits` admits the
+weight: K a multiple of 128, and either at most 8192 output columns or
+K >= 2048 and at most 96 MiB. CuTe DSL is pinned there as the measured winner;
+other weights, such as an LM head or a wide projection with a short K, keep
+cuBLASLt, which measured faster on them at 16 to 32 rows. Startup tuning
+covers M=1/2/4/8/16/32. The kernels accumulate in FP32 and return BF16;
+reduction order can change rounding relative to the original GEMM.
 
 ## Decode GEMMs on small weights
 
@@ -179,6 +178,59 @@ decode batch replayed from a captured graph and an eager call of the same
 shape after serving starts can differ in the last bits. Repeated TGV calls on
 the same inputs, eager or replayed, agree bit for bit.
 
+## Offline-tuned BLAS solutions with TunableOp (ROCm)
+
+Dense BF16/FP16 projections that no registered kernel claims run `torch.mm`,
+which on ROCm takes hipBLASLt's heuristic solution. For skinny row counts, such
+as speculative-decoding verify steps, a measured solution can be much faster.
+TunableOp times both hipBLASLt and rocBLAS solutions, so a tuned file can list
+either kind (rocBLAS ones are named `Gemm_Rocblas_*`).
+
+`hipblaslt.py` is the runtime entry point; the loader, the stack check and the
+tuning tool are in `_hipblaslt/tuning.py`. Tuned files are committed in
+`_hipblaslt/configs/`, one per GPU, named like the Triton kernel configs after
+`torch.cuda.get_device_name()` with spaces replaced by underscores, such as
+`device_name=AMD_Instinct_MI355X.csv`. Serving loads the file of its GPU
+automatically, through `hipblaslt.py`, once per process and before graph
+capture, and replays it read-only through PyTorch TunableOp. GEMMs the file
+does not list keep the default solution. Serving never rewrites the file, and
+tunes only with the opt-in switch below. A GPU without a file keeps the
+defaults.
+
+A results file is valid only for the PyTorch, HIP, hipBLASLt and rocBLAS
+versions and the GPU architecture stamped in its `Validator` rows. On any
+mismatch the whole file is ignored with one warning and every GEMM keeps the
+default. Regenerate the file after changing the stack, on an idle GPU of the
+serving type, for each weight shape `N x K` and each row count to cover
+(captured verify or decode token counts):
+
+```bash
+python -m tokenspeed_kernel.ops.gemm._hipblaslt.tuning --dtype bfloat16 \
+    --shapes 14336x5120,5120x6144,16480x5120,34816x5120,5120x17408 \
+    --rows 64,128,192,256,384,512
+```
+
+Without `--out`, the tool writes this GPU's file in `_hipblaslt/configs/`. If
+the file exists with the running stack's stamp, its GEMMs are kept and only
+new ones are timed, so one file can cover several models; on another stack
+the tool stops, and the file must be deleted to re-tune. Tuning rotates
+weight copies through `--cold-bytes`, so each timing reads the weight from
+HBM as a serving step does. Another solution can sum K in another order, so
+results differ from the default within BF16 rounding.
+
+To cover GEMMs the file does not list without regenerating it, such as a new
+model or a new stack, set `TOKENSPEED_HIPBLASLT_AUTOTUNE=1` (off by default).
+During kernel warmup, before graph capture, serving then runs one eager
+decode step per captured batch size inside `hipblaslt_online_tuning()`:
+TunableOp times every solution of each GEMM it has no entry for, with the
+same rotating cold-weight buffer as the tool (512 MiB), and keeps the
+fastest. GEMMs the file lists are not re-timed, and a file from another stack
+is still ignored, so then every GEMM of those steps is tuned. Tuning stops
+before capture; the picks stay in the process and nothing is written, the
+committed file included. The cost is startup time on every start and every
+rank, and picks may differ between starts and ranks within BF16 rounding;
+commit the file with the tool above to fix them.
+
 ## Per-token/per-channel FP8
 
 Per-channel FP8 projections use FP8 E4M3 weights with FP32 scales per output
@@ -244,3 +296,18 @@ scales) reads directly, so no quantization kernel runs between the two.
 DeepGEMM picks a tile configuration from the token count (one per 16 tokens)
 and JIT-compiles each on first use. `warmup_fp8_projections` launches every
 configuration up to a token bound at startup so serving never compiles.
+
+## Small-N BF16 Split-K policy
+
+`flashinfer_mm_bf16_small_n_splitk` uses FlashInfer's cached CuTe DSL Split-K
+launcher with tile `(64, 8)`, four K splits and six pipeline stages. Automatic
+SM107 dispatch admits the measured `(M,N,K) = (4,640,2560)` projection with
+PDL, contiguous BF16 operands/output and 32-byte pointer alignment. This is a
+measured performance policy, not the implementation's shape contract. Other
+shapes and unaligned views keep the existing GEMM selection; explicit overrides
+remain authoritative. FlashInfer validates the callable's wider tile support.
+
+The ordinary `mm` wrapper applies bias. The kernel preserves a supplied output
+and rejects unsupported scale arguments. Its cached callable uses runtime row
+counts, so changing M does not add specializations. The provider is optional;
+builds without this FlashInfer module retain the existing registered kernels.

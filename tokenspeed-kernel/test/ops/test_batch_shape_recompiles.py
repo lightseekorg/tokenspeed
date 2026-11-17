@@ -921,6 +921,7 @@ def test_mha_decode_and_extend_table_width():
                 max_seqlen_q=1,
                 max_seqlen_k=256,
                 solution="triton",
+                block_draft=False,
             )
             for q in (q_grouped, q_per_head)
         ]

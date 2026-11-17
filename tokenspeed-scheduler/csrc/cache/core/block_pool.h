@@ -288,7 +288,7 @@ public:
 
     // One block at a given free child slot of a parent already bound to this
     // group. The one placement that names its slot: a lone request's
-    // compaction (CacheCoordinator::CompactLoneRequest) moves a block into a
+    // compaction (LoneRequestAdmission::Compact) moves a block into a
     // hole of one of the request's own denser parents, where the hole-first
     // order of nextLocation (most occupied parent first, then the FIFO) could
     // pick another parent or the block's own.
@@ -486,7 +486,7 @@ private:
         // Balanced allocation puts request load and bucket ID before that order.
         // Holes first, so a request's blocks can land one per parent beside
         // cached pages; what that leaves a request alone is undone by its
-        // compaction (CacheCoordinator::CompactLoneRequest), never here.
+        // compaction (LoneRequestAdmission::Compact), never here.
         using Priority = std::tuple<std::int64_t, std::size_t, std::int32_t, std::int32_t, std::int32_t>;
         std::optional<Priority> best;
         CacheBlockLocation location;

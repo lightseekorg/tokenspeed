@@ -393,6 +393,7 @@ def test_pd_derives_ordinary_transfer_metadata_from_physical_plan(
         kv_cache_dtype=torch.bfloat16,
         context_len=256,
         max_bs=4,
+        max_resident_requests=4,
         kv_cache_quant_method="none",
         pd_disaggregation_enabled=True,
         components=(spec,),

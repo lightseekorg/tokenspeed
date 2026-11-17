@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from abc import abstractmethod
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -43,11 +43,13 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbe
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.execution._draft_overlap import DecodeGraphOverlap
     from tokenspeed.runtime.execution.context import ForwardContext
     from tokenspeed.runtime.execution.cudagraph_memory import CapturedLadder
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
     from tokenspeed.runtime.execution.memory_delta import MemoryDeltaObserver
+    from tokenspeed.runtime.execution.model_executor import ModelExecutor
     from tokenspeed.runtime.execution.query_shard import QueryShardPlan
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
     from tokenspeed.runtime.execution.tree_spec import TreeSpec
@@ -119,6 +121,7 @@ class BaseDrafter:
     # samples its candidate walk (sparse q over the selector's candidates).
     # Other block drafters propose a whole block greedily and leave this False.
     supports_speculative_sampling = False
+    supports_dp_local_graph: bool = False
 
     # Whether every sampled proposal comes from ``sample_draft_step`` over the
     # draft model's own head, which can then hand it this rank's vocabulary
@@ -137,6 +140,7 @@ class BaseDrafter:
         vocab_size: int | None = None,
     ):
         self.spec_num_tokens = spec_num_tokens
+        self.dp_local_graph = False
         self.spec_num_steps = spec_num_steps
         self.draft_model_runner = draft_model_runner
         self.runtime_states = runtime_states
@@ -153,6 +157,7 @@ class BaseDrafter:
         # Bound by ``bind_sampling_backend`` under --enable-speculative-sampling;
         # None keeps the argmax proposal.
         self.draft_sampler: DraftProposalSampler | None = None
+        self.decode_overlap: DecodeGraphOverlap | None = None
 
     def set_cache_pool(self, token_to_kv_pool: CachePool | None) -> None:
         """Take a replacement pool; a drafter that caches views rebuilds them."""
@@ -314,6 +319,62 @@ class BaseDrafter:
             ctx: The target forward's context.
         """
 
+    def prepare_request_state(
+        self,
+        admission_ids: Sequence[int],
+        request_pool_indices: Sequence[int],
+        num_extends: int,
+    ) -> None:
+        """Prepare slot-owned draft state for this round's request admissions."""
+
+    def profile_startup(self, executor: ModelExecutor) -> None:
+        """Calibrate final decode graphs before live requests are admitted."""
+
+    def configure_decode_graph_scope(self, *, local: bool) -> None:
+        """Select local DP graph shapes only for a drafter declaring support."""
+        if local and not self.supports_dp_local_graph:
+            raise ValueError(
+                "this drafter does not support --enable-dp-local-cuda-graph"
+            )
+        self.dp_local_graph = local
+
+    def decode_graph_query_capacities(self, bs: int) -> tuple[int, ...]:
+        """Physical target row capacities for one request-capacity bucket."""
+        return (bs * self.spec_num_tokens,)
+
+    def prepare_decode_graph_token_layout(
+        self, ctx: ForwardContext, *, actual_bs: int, padded_bs: int
+    ) -> int:
+        """Retain the native fixed-width layout unless the drafter packs queries."""
+        return padded_bs * self.spec_num_tokens
+
+    def prepare_decode_graph_token_capture_layout(
+        self, *, bs: int, query_tokens: int
+    ) -> None:
+        """Validate the native target extent before graph warmup/capture."""
+        if query_tokens != bs * self.spec_num_tokens:
+            raise ValueError("native verification requires the full query capacity")
+
+    def set_decode_graph_query_extent(self, num_tokens: int | None) -> None:
+        """Select physical target extent for capture; None restores eager policy."""
+
+    def target_forward_context(self, ctx: ForwardContext) -> AbstractContextManager:
+        """Lend temporary input storage; restore it before sampling and commit.
+
+        Packed target output geometry remains on ``ctx`` for the sampler.
+        ``verify_candidates`` supplies the original fixed-width input window.
+        """
+        return nullcontext()
+
+    def verify_candidates(self) -> torch.Tensor:
+        """Return the live ``[num_decodes, spec_num_tokens]`` packed-verify inputs.
+
+        A drafter that packs target queries must retain the original fixed-width
+        candidate window for sampling, independently of the target output rows.
+        The default drafter does not support packed verification.
+        """
+        raise ValueError(f"{type(self).__name__} does not support packed verification")
+
     def on_target_weights_updated(self) -> None:
         """Refresh draft-side state derived from shared target weights.
 
@@ -471,14 +532,19 @@ class BaseDrafter:
         ``graph_bs``, the forward's stream ordered after it; a drafter may
         start its round behind it on another stream. Default: replays it on
         the current stream."""
-        del bs, graph_bs
-        graph.replay()
+        del graph_bs
+        if self.decode_overlap is None:
+            graph.replay()
+        else:
+            self.decode_overlap.replay(graph, live_rows=bs)
 
     def finish_round(self, ctx: ForwardContext, graph_bs: int | None) -> None:
         """Draft after the forward at its decode graph's padded batch (None: eager)."""
 
     def complete_round(self) -> None:
-        """Finish a round ``finish_round`` left pending (the next round's inputs)."""
+        """Finish a round left pending after replay or ``finish_round``."""
+        if self.decode_overlap is not None:
+            self.decode_overlap.settle()
 
     def capture_round_graphs(
         self, graph_bs: int, *, stream: torch.cuda.Stream, pool: tuple[int, int]

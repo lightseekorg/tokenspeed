@@ -344,9 +344,6 @@ def _bare(model_cls):
     lm = object.__new__(model_cls)
     nn.Module.__init__(lm)
     lm.model = nn.Module()
-    # Muse Spark's capture setters ask the backbone's config whether its
-    # decode monokernels reserve heap for the taps.
-    lm.model.config = SimpleNamespace(decode_monokernel=False)
     return lm
 
 

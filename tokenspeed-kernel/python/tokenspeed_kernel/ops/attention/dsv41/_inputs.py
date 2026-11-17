@@ -18,7 +18,11 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Projected index inputs whose preprocessing is fused into their consumer."""
+"""Index inputs and outputs that a kernel prepares or resolves in its launch.
+
+Projected index inputs have their preprocessing fused into their consumer;
+selection outputs are resolved by their producer in the same launch.
+"""
 
 from __future__ import annotations
 
@@ -64,3 +68,39 @@ class IndexKeyInput:
     norm_weight: torch.Tensor
     cos_sin_cache: torch.Tensor
     norm_eps: float
+
+
+@dataclass(frozen=True)
+class SelectionSlots:
+    """Caller-owned physical slots for index_topk's selected rows.
+
+    out is contiguous int32 [tokens, topk]. The other fields are exactly what
+    global_slots takes for the same rows: integer positions and requests
+    [tokens] (query causality and table row), the owner's integer
+    [requests, pages] LCM block table, raw tokens per global row (ratio) and
+    the field's page bound. out ends up equal to global_slots of the selected
+    row IDs. Slicing selects query rows. This record owns no cached state.
+    """
+
+    out: torch.Tensor
+    positions: torch.Tensor
+    requests: torch.Tensor
+    table: torch.Tensor
+    ratio: int
+    pages: int
+
+    def __getitem__(self, rows) -> SelectionSlots:
+        # A basic slice keeps out a view; advanced indexing would copy it and
+        # the selected slots would never reach the caller's tensor.
+        if not isinstance(rows, slice):
+            raise TypeError(
+                "SelectionSlots supports only slice indexing, so out stays a view"
+            )
+        return SelectionSlots(
+            self.out[rows],
+            self.positions[rows],
+            self.requests[rows],
+            self.table,
+            self.ratio,
+            self.pages,
+        )

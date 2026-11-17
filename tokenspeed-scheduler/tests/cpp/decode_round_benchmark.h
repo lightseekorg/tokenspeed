@@ -80,6 +80,7 @@ inline SchedulerConfig MakeDecodeSchedulerConfig(const DecodeRoundConfig& worklo
     config.max_retracted_requests = 0;
     config.max_scheduled_tokens = workload.num_requests * (workload.context_tokens + workload.page_size);
     config.max_batch_size = workload.num_requests;
+    config.max_resident_requests = config.max_batch_size;
     config.decode_input_tokens = workload.decode_tokens;
     config.overlap_schedule_depth = 0;
     config.disable_l2_cache = true;

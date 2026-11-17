@@ -48,6 +48,7 @@ def make_config(
     cfg.prefix_granularity = prefix_granularity
     cfg.max_scheduled_tokens = max_scheduled_tokens
     cfg.max_batch_size = max_batch_size
+    cfg.max_resident_requests = cfg.max_batch_size
     cfg.num_device_pages = num_device_pages
     cfg.num_snapshot_pages = 1  # never retracts
     cfg.cache_groups = [

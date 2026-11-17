@@ -32,6 +32,9 @@ identity never changes the request's seed.
 The host record fixes stop criteria for the lifetime of an admission, so
 stop binding uses that identity without a second key containing the criteria.
 A later request reusing the public RID still receives a new identity.
+Adaptive DSpark confidence and verification feedback use the same admission
+identity, so a reused public RID cannot retain the previous admission’s
+predictions. Retraction preserves confidence for the restored admission.
 
 A retraction keeps the admission identity. A sampler snapshot records whether
 that admission prepared the slot: an image taken before the first local
@@ -133,7 +136,39 @@ NPU graph task updates and replay run in inference mode because they write the
 output tensors allocated during capture. This applies to active and idle DP
 ranks; callers need not establish an inference context.
 
+### Whole-graph draft overlap
+
+`TOKENSPEED_DRAFT_GRAPH_OVERLAP=1` opts into an external event inside the
+complete decode graph. The graph stays intact on a round stream. After the
+first draft step has saved the accepted frontier and candidate write indices,
+the event releases the execution stream for the verified-state commit, output
+copies and the next target metadata refresh. The next draft metadata refresh
+and model forward still wait for the entire previous round.
+
+The result fence covers both the graph tail and output copies, retaining the
+graph and its events until result retirement. The control plane cannot reclaim
+request slots or pages on the prefix event. A batch membership/slot change,
+extend or history reset joins before modifying request state; other device
+tasks use the existing `DeviceHandle.settle` boundary. Graph release drains
+the round before dropping captured resources.
+
+The opt-in requires NVIDIA decode graphs, an MTP greedy chain with at least
+two draft steps, DP1/PP1, disjoint target/draft cache layers and separate metadata
+owners. The draft model must declare `supports_draft_overlap`: after step one,
+its tail cannot depend on buffers changed by verified-state commit or next-target
+preparation. Model implementations, including subclasses, own this contract.
+Grammar, draft token history, expert-load recording and MegaMoE's shared row
+mask are rejected at startup. Eager, extend and idle execution retain their
+normal stream ordering.
+
 ### Buffer sizing: the ladder is a performance subset, never a capacity limit
+
+Request slot capacity is independent of forward batch capacity. PD decode
+extra slots increase the real request range to 1..C, keep null row 0, and
+place padding at C+1. Persistent state indexed by request slot covers C+2
+rows. A batch of at most B requests can contain a slot index greater than B;
+batch-indexed inputs, metadata, graph buckets and scratch remain bounded by
+B. Passing a larger resident pool must not enlarge the execution ladder.
 
 `ForwardStepRunner` distinguishes `max_capture_bs` (top of the capture ladder,
 bounded by `max_cudagraph_capture_size`) from `max_decode_bs`
@@ -522,7 +557,7 @@ MegaMoE routes every row.
 
 ### Pointer-stable per-bs views from one builder
 
-Per-bs metadata objects (each leaf's `_decode_views_by_bs[bs]`, the router's
+Per-bs metadata objects (each leaf's `_decode_views_by_shape[(bs, num_tokens)]`, the router's
 `decode_write_locations` views) are views over the persistent buffers, built
 by a single per-bs builder shared by capture and refresh, cached per bs. A bs
 never captured (above-ladder decode, enforce-eager) builds its views lazily
@@ -1337,7 +1372,9 @@ its candidate index and a tree uses node depth. For example, a 2049-token prompt
 predicts position 2049 whether computed as `1024 + 1024 + 1`,
 `130 cached + 1024 + 895`, or 2048 cached tokens plus one decode input.
 Constructing the base position does not implement MTP acceptance/residual RNG
-or domain separation; multi-token FlashInfer still uses its existing coins.
+or domain separation; multi-token FlashInfer uses its existing coins except
+for sampled adaptive V4.1 DSpark, whose CuTe verifier keys each draw by request,
+position and draft/acceptance/rejection/bonus namespace.
 The Triton chain verify under `--enable-speculative-sampling` (DFLASH with a
 DFlash2 draft) keys its accept coins and draft noise by salted offsets
 disjoint from these positions. A row with a recorded draft q then emits an
@@ -1346,15 +1383,17 @@ rows and rows without a q keep the position-keyed token.
 
 With `sampling_stream=per-request`, FlashInfer and FlashInferFull route both
 `sample()` and `verify(N=1)` through the existing Gumbel pool kernel, keyed by
-request seed and this absolute position. Neither consumes the CPU coin generator.
+request seed and this absolute position. Sampled adaptive V4.1 DSpark uses the
+CuTe probability sampler for both. Neither consumes the CPU coin generator.
 Random-stream policy, verification geometry, and TP agreement are separate:
 
 * `per_request_stream` selects the position-keyed direct sampler for a window
   without draft candidates. `has_draft_candidates` describes the window, not a
   model family: wider windows still require acceptance and residual sampling.
 * `_prepare_step_hook` skips coin preparation only where no coins are consumed.
-  Wider per-request windows currently fall through to `_refill_legacy_coins`;
-  they do not yet have position-keyed accept/residual randomness. That refill
+  Wider per-request windows outside sampled adaptive V4.1 DSpark fall through
+  to `_refill_legacy_coins`; they do not yet have position-keyed accept/residual
+  randomness. That refill
   owns only generator advancement and buffer writes, not sampler selection.
 * Each selected sampling implementation declares `needs_tp_sync` locally.
   The common epilogue gathers DP-owned rows or broadcasts replicated TP outputs
@@ -2727,6 +2766,27 @@ partial-output reduction; SWA and compressor tails remain replicated. See
 [the V4.1 context-parallel contract](deepseek-v41-context-parallelism.md) for
 ownership, graph lifetime and supported configurations.
 
+### V4.1 context encoder/decoder with attention DP
+
+Ordinary EP supports attention, dense, and MoE TP1 with attention DP; other
+ordinary-EP attention-DP layouts are rejected during model construction. Its
+prefills require `--disable-prefill-graph`: CED narrowing changes each rank's
+decoder row count, which eager execution exchanges on a dedicated host
+process group before the CED source layer and again before the remaining
+decoder layers. Idle ranks enter the same exchanges and expert collectives
+with zero rows. The stage-local counts are restored after each stage; decode
+keeps the scheduler's graph-compatible counts. Fused EP retains its own
+dispatch and row-count exchange.
+
+For mixed text/image prefills, ordinary EP gathers the routing mask with
+the activations in eight additional aligned lanes. The mask therefore
+follows the same rank and row order as the gathered activations, including
+when a local CED tail is empty.
+
+The runtime's single-GPU CI task launches the two-process Gloo regression
+automatically. Its tensors stay on CPU; a visible accelerator is required
+to import the runtime's platform-dependent components.
+
 ### Distributed draft tuning
 
 The startup draft decode uses one request per attention TP rank so that
@@ -2745,3 +2805,68 @@ tuning, so startup tuning has no cross-rank collectives: the draft decode
 warmup uses `min(attn_tp_size, max_decode_bs)` requests, and an empty peer
 skips its GEMMs as it does when serving fewer requests than peers. Decode
 state stays sized by `--max-num-seqs`.
+
+
+### Adaptive DSpark query capacities
+
+Graph variants can include a query-capacity suffix (variant:queryN).
+Native full-width execution retains its original key. Buckets above the layout
+kernel's token bound retain only native full-width capture and replay.
+Packed verification refreshes decode_query_indptr and packed rows in persistent buffers before
+replay; V4.1 pointer-stable views are keyed by (bs, num_tokens).
+After target forward, borrowed input storage and collective counts are restored.
+The context's input_num_tokens keeps the packed target extent until sampling and
+NaN checks consume the target outputs.
+
+By default attention DP ranks agree on one physical capacity while actual request
+counts may differ or be zero. Padding retains one physical anchor, contributes
+no acceptance reward, writes to the dummy slot and discards outputs.
+The live-row mask must exclude padding from expert-load accounting.
+
+`--enable-dp-local-cuda-graph` selects request buckets and target query
+capacities independently on each attention-DP replica. The runner still agrees
+the graph/eager phase from global decode-or-idle metadata and the capture
+ladder bound; an idle rank replays its smallest graph and participates in the
+same EP sequence. The drafter declares support and validates the loaded target
+and draft. V4.1 DSpark with MegaMoE and attention/dense/MoE/head TP1 is the
+initial supported combination. Its captured model contexts carry local row
+counts rather than fabricated peer extents; MegaMoE's fixed-capacity symmetric
+buffer supplies the common communication geometry. Scheduler write reservations
+are unchanged.
+
+Serving and startup profiling use the same budget policy. Local DP graphs
+select from local N-2 confidence and context feedback, including padded local
+request buckets; missing local feedback retains only that rank's full width.
+This serving decision has no cross-DP collective. Shared graphs retain agreement.
+DP budget metadata uses the global attention host group; TP-only metadata
+uses a TP-local host group. Startup's authoritative TP packet broadcast also
+uses a TP-local host group: different DP groups must not supply different roots
+to the same global collective. Startup uses equal synthetic request counts on
+all ranks and measures host agreement through GPU completion with wall time.
+The native full-width measurement skips budget selection. Post-graph feedback
+collection, including pinned D2H copies/events and CPU publication, is outside
+all calibration intervals. Fresh pinned staging storage follows the overlap
+lifetime contract; reuse requires retiring both DMA and its CPU consumer.
+The drafter owns startup calibration orchestration. The runner supplies graph
+lookup by logical capacity and lends its normal metadata preparation through
+a context that synchronizes and restores capture metadata on exit.
+Packed prefixes do not have uniform rows per request, so they leave MegaMoE's
+request-ratio padding filter disabled; native fixed-width replays retain it.
+
+Serving selects a calibration interval by the local upper feedback-context
+bound for local graphs, or the global upper bound for shared graphs, including
+the lookahead margin. A heterogeneous batch does not require
+all request lengths to fit that interval. The uniform endpoint supplies a
+representative cost estimate, not a latency bound for the mixed batch; missing
+coverage of the upper bound retains native verification. Periodic host decision
+counts distinguish packed selection, full selection, missing feedback and
+missing calibration without adding device reads or collectives. Startup clears
+these counters before serving.
+
+Sampled V4.1 DSpark uses the same packed-query boundary for full-width and
+shortened verification. The sampler returns ordinary fixed-width outputs
+and an accepted length including the residual or bonus token, so runtime
+frontier and Engram commit remain shared. Proposal distributions belong to
+RuntimeStates, are invalidated at PD landing and slot reuse, and are exported
+with retraction state. Query capacity does not shorten the scheduler's
+reserved write extent. The sampled path currently requires attention TP1.

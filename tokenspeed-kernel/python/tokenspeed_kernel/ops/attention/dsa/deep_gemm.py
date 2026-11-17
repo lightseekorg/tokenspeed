@@ -5,7 +5,7 @@ import os
 from collections.abc import Callable
 
 import torch
-from tokenspeed_kernel._optional import has_optional_package, has_trtllm_kernel
+from tokenspeed_kernel._optional import has_optional_package
 
 # The package defines its feature names before importing its leaves, so the
 # partially initialized package already carries them here.
@@ -423,13 +423,8 @@ def _request_rows(rows: int, device: torch.device) -> torch.Tensor | None:
 
 if _HAS_DEEP_GEMM:
     prepare_cuda_toolkit_env()
-    if has_trtllm_kernel():
-        # DeepEP must initialize before TRT-LLM's static CUDA runtime.
-        import deep_ep  # noqa: F401
     import deep_gemm
-
-    if has_trtllm_kernel():
-        import trtllm_kernel  # noqa: F401
+    from tokenspeed_kernel.thirdparty.cuda.indexer_topk import indexer_topk_prefill
 
     def _deep_gemm_paged_mqa_plan(
         *,
@@ -839,7 +834,7 @@ if _HAS_DEEP_GEMM:
                     col_ids.view(1, -1) >= tile_lens.to(torch.int32).view(-1, 1),
                     float("-inf"),
                 )
-                torch.ops.trtllm.indexer_topk_prefill(
+                indexer_topk_prefill(
                     logits,
                     local_starts_i32[start:end],
                     tile_lens.to(torch.int32).contiguous(),

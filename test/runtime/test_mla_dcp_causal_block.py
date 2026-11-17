@@ -96,6 +96,7 @@ def _backend(degree, rank, kv_cache_dtype=torch.bfloat16):
         kv_cache_quant_method="none",
         context_len=CONTEXT,
         max_bs=len(BLOCKS),
+        max_resident_requests=len(BLOCKS),
         components=(spec,),
         is_draft=True,
         speculative_num_draft_tokens=BLOCK,

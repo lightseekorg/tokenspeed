@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from tokenspeed_scheduler import StorageConfig
+    from tokenspeed_engine.scheduler import StorageConfig
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,7 +53,7 @@ class StorageRuntimeConfig:
     def from_extra_config(
         cls, raw: str | None, *, host_blocks: int, prefix_granularity: int
     ) -> StorageRuntimeConfig:
-        from tokenspeed_scheduler import StorageConfig, StoragePressure
+        from tokenspeed_engine.scheduler import StorageConfig, StoragePressure
 
         knobs = parse_extra_config(raw).get("async", {})
         if not isinstance(knobs, dict):

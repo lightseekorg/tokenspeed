@@ -1221,6 +1221,40 @@ ts serve \
     --speculative-num-steps 3
 ```
 
+On SM107, also set `FLASHINFER_ROUTING_FORCE_BLOCK_PER_TOKEN=0` (FlashInfer
+0.7.4) in the server's environment. It changes which routing kernels FlashInfer
+runs for this model's routes (512 experts, top-10, softmax). By default, from
+32 to 256 tokens per MoE call, FlashInfer splits routing into a
+block-per-token top-k kernel and a permutation kernel; with the variable set,
+it runs one fused single-cluster kernel. With the variable set, from 257 to
+1024 tokens it uses the warp-per-token top-k kernel instead of the
+block-per-token one. Calls below 32
+or above 1024 tokens are unchanged, and the routed experts and weights are
+bit-identical either way. With MTP 3 steps, the target's MoE calls route 4
+tokens per request, so a batch of 8 requests makes 32-token calls.
+
+FlashInfer's default for this route comes from a routing-only sweep that
+covered SM100 and SM103 as well, and FlashInfer labels the variable a
+benchmarking override. The timings below were measured only on SM107, with the
+NVFP4 checkpoint at TP1 (BF16 router logits), so they are not a measurement of
+the FP8 command above; the token ranges, which depend only on the expert count,
+top-k and token count, are the same for it. FlashInfer reads the variable once
+per process for all of its custom (non-grouped) routing, whose default was
+tuned across expert counts and top-k, so set it only for this model.
+
+Routing per MoE layer below runs from the end of the hyper-connection mix to
+the start of FC1:
+
+| decode batch | routing per MoE layer | decode step |
+|---|---|---|
+| 1 | 4.4 -> 4.4 us | -0.6% (noise) |
+| 8 | 13.3 -> 9.2 us | -3.5% (median of 3 runs) |
+| 32 | 15.7 -> 12.0 us | -2.9% |
+| 64 | 18.3 -> 15.3 us | -1.3% |
+| 128 | 21.0 -> 20.7 us | -0.1% |
+
+A 16k-token prefill chunk is unchanged.
+
 ### AMD
 
 On AMD MI350X/MI355X (gfx950), serve the
