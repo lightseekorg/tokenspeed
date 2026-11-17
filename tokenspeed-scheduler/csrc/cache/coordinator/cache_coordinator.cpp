@@ -948,8 +948,9 @@ void CacheCoordinator::forEachCandidateBoundary(const PromptPrefix& prompt, std:
 // miss it behind the one below), so sliding and State groups are judged per
 // candidate by groupAcceptsBoundary. Without State groups the first candidate
 // the KV groups accept wins; with them the walk descends to the longest
-// published state checkpoint. kv_tokens records the KV groups' own boundary
-// for the junction cut.
+// published state checkpoint. kv_tokens records the KV reach for the junction
+// cut: the longest boundary every token-spanned group accepts, raised to the
+// closed groups' coverage, since the chunk cut there writes its own windows.
 CacheCoordinator::PrefixProbe::Tier CacheCoordinator::probeTier(const PromptPrefix& prompt,
                                                                 std::span<const std::vector<CacheKey>> group_keys,
                                                                 std::span<const std::size_t> match_order,
@@ -1048,6 +1049,11 @@ CacheCoordinator::PrefixProbe::Tier CacheCoordinator::probeTier(const PromptPref
             : static_cast<std::int32_t>(std::min<std::int64_t>(
                   std::int64_t{aligned.num_common_tokens} + prefix_granularity_ - 1, prompt.max_tokens));
     forEachCandidateBoundary(prompt, /*floor_tokens=*/0, from_tokens, visit);
+    // The junction reaches the closed groups' coverage even where a sliding
+    // window is missing: the chunk cut there writes and publishes its own.
+    if (!closed_order.empty()) {
+        out.kv_tokens = std::max(out.kv_tokens, out.closed_kv_tokens);
+    }
     if (out.num_common_tokens == 0) {
         // No boundary matched: no group claims anything on the Device.
         for (GroupPrefixProbe& hits : out.per_group) {
@@ -1237,6 +1243,11 @@ void CacheCoordinator::probeHostSuffix(const PromptPrefix& prompt, std::span<con
                              : static_cast<std::int32_t>(std::min<std::int64_t>(
                                    std::int64_t{host_kv_end_tokens} + prefix_granularity_ - 1, prompt.max_tokens));
     forEachCandidateBoundary(prompt, above_tokens, from_tokens, visit);
+    // As on the Device: the closed groups' Host run past the Device's
+    // coverage is KV reach, whether or not a window is cached at its end.
+    if (host_kv_end_tokens > device_kv_tokens) {
+        host.kv_tokens = std::max(host.kv_tokens, host_kv_end_tokens);
+    }
 }
 
 CacheCoordinator::PrefixProbe CacheCoordinator::probePrefixWithOrder(const PromptPrefix& prompt,

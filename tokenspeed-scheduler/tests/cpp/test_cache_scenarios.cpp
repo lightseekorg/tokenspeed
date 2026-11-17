@@ -4994,6 +4994,127 @@ TEST_F(JunctionCutSuite, CutsTheFirstChunkAtTheJunctionAndPublishesTheCheckpoint
     FAIL() << "third was never scheduled";
 }
 
+// The same hybrid model with a sliding-window group: the seed's window behind
+// token 6 slid out mid-chunk and was never cached, so only the full-history
+// coverage reaches 6. The junction still lies there: the chunk cut at it
+// writes its own window and publishes it with the checkpoint.
+class JunctionCutSlidingSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg{};
+        cfg.prefix_granularity = 2;
+        cfg.device_allocator.total_pages = 64;
+        cfg.host_allocator.total_pages = 64;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
+        cfg.max_scheduled_tokens = 8;
+        cfg.max_batch_size = 8;
+        cfg.max_resident_requests = cfg.max_batch_size;
+        cfg.enable_l3_storage = false;
+        cfg.disable_l2_cache = true;
+        cfg.disable_prefix_cache = false;
+        cfg.cache_groups = {
+            MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kFull),
+            MakeGroup("swa", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kSlidingWindow,
+                      /*sliding_window_tokens=*/2),
+            MakeGroup("state", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kState),
+        };
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+};
+
+TEST_F(JunctionCutSlidingSuite, CutsAtTheFullHistoryCoverageWhenTheWindowThereIsGone) {
+    RequestSpec seed = MakeRequestSpec("seed", /*num_pages=*/6);
+    Submit(seed);
+    PlanOnce();  // tokens 0..8: the window behind 6 slides out inside the chunk
+    SendForwardDone("seed");
+    PlanOnce();  // prompt end at token 12
+    SendForwardDone("seed", {42});
+    PlanOnce();  // first decode: the prompt-end checkpoint is published
+    SendForwardDone("seed", {43});
+    SendFinish("seed");
+    PlanOnce();
+    ASSERT_EQ(scheduler_->WaitingSize(), 0u);
+    ASSERT_EQ(scheduler_->DecodingSize(), 0u);
+
+    RequestSpec first = seed;
+    first.request_id = "first";
+    for (std::size_t i = 6; i < first.tokens.size(); ++i) {
+        first.tokens[i] += 1000;
+    }
+    Submit(first);
+    ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(plan);
+    ASSERT_NE(batch, nullptr);
+    ASSERT_EQ(batch->request_ids, std::vector<std::string>{"first"});
+    EXPECT_EQ(batch->extend_prefix_lens, std::vector<std::int32_t>{0});
+    EXPECT_EQ(batch->input_lengths, std::vector<std::int32_t>{6}) << "the chunk ends at the full-history coverage";
+    SendForwardDone("first");
+    plan = PlanOnce();  // publishes state@6 and first's window behind it
+    batch = FindForwardBatch(plan);
+    ASSERT_NE(batch, nullptr);
+    ASSERT_EQ(batch->request_ids, std::vector<std::string>{"first"});
+    EXPECT_EQ(batch->extend_prefix_lens.at(0), 6);
+    SendForwardDone("first", {7});
+
+    RequestSpec third = seed;
+    third.request_id = "third";
+    for (std::size_t i = 6; i < third.tokens.size(); ++i) {
+        third.tokens[i] += 3000;
+    }
+    Submit(third);
+    for (int round = 0; round < 4; ++round) {
+        plan = PlanOnce();
+        batch = FindForwardBatch(plan);
+        ASSERT_NE(batch, nullptr);
+        const auto it = std::ranges::find(batch->request_ids, "third");
+        if (it == batch->request_ids.end()) {
+            continue;
+        }
+        const auto row = static_cast<std::size_t>(it - batch->request_ids.begin());
+        EXPECT_EQ(batch->extend_prefix_lens.at(row), 6) << "the junction's checkpoint and window are a hit";
+        return;
+    }
+    FAIL() << "third was never scheduled";
+}
+
+class JunctionCutSlidingHostSuite : public JunctionCutSlidingSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = JunctionCutSlidingSuite::MakeConfig();
+        cfg.disable_l2_cache = false;
+        return cfg;
+    }
+};
+
+// The seed on Host alone: the Host's full-history run reaches 6 but holds no
+// window there, so `first` resumes at 0 and its first chunk is still cut at 6.
+TEST_F(JunctionCutSlidingHostSuite, HostOnlyFullHistoryCutsTheFirstChunkWhenTheWindowThereIsGone) {
+    RequestSpec seed = MakeRequestSpec("seed", /*num_pages=*/6);
+    Submit(seed);
+    AckWriteBacks(PlanOnce());  // tokens 0..8
+    SendForwardDone("seed");
+    AckWriteBacks(PlanOnce());  // prompt end at token 12
+    SendForwardDone("seed", {42});
+    SendFinish("seed");
+    AckWriteBacks(PlanOnce());
+    ASSERT_TRUE(scheduler_->ClearL1Cache());
+
+    RequestSpec first = seed;
+    first.request_id = "first";
+    for (std::size_t i = 6; i < first.tokens.size(); ++i) {
+        first.tokens[i] += 1000;
+    }
+    Submit(first);
+    ExecutionPlan plan = PlanOnce();
+    AckWriteBacks(plan);
+    const ForwardBatch* batch = FindForwardBatch(plan);
+    ASSERT_NE(batch, nullptr);
+    ASSERT_EQ(batch->request_ids, std::vector<std::string>{"first"});
+    EXPECT_EQ(batch->extend_prefix_lens, std::vector<std::int32_t>{0});
+    EXPECT_EQ(batch->input_lengths, std::vector<std::int32_t>{6}) << "the chunk ends at the Host's full-history run";
+}
+
 class JunctionCutHostSuite : public JunctionCutSuite {
 protected:
     SchedulerConfig MakeConfig() override {

@@ -247,11 +247,14 @@ public:
             std::int32_t num_common_tokens{0};
             // The full pages below it: num_common_tokens less the tail.
             std::int32_t full_page_tokens{0};
-            // The KV groups' own boundary before the State groups shortened
-            // it: the junction a chunk may be cut at so the next prompt
-            // resumes there. On the Host tier, the KV reach of the Device's
-            // prefix plus a Host suffix when the Host holds part of that KV,
-            // else 0; the junction takes the larger of the two tiers'.
+            // The KV reach before the State groups or a sliding window
+            // shortened the hit: the junction a chunk may be cut at so the
+            // next prompt resumes there. At least the prefix-closed groups'
+            // coverage: a sliding window missing there is written by the chunk
+            // cut at the junction, which publishes it with the checkpoint. On
+            // the Host tier, the KV reach of the Device's prefix plus a Host
+            // suffix when the Host holds part of that KV, else 0; the junction
+            // takes the larger of the two tiers'.
             std::int32_t kv_tokens{0};
             // Device prefix-closed coverage before windows or State shorten
             // the hit. Reused only within this probe and its storage queries.
