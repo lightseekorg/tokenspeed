@@ -452,10 +452,10 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         if not (
             self.experts.plan.get("weight_dtype") == "nvfp4"
             and self.experts.plan.get("solution") == "flashinfer_trtllm"
-            and self.experts.supports_prequantized_input
         ):
             return None
-        # This consumer's padded hidden rows require its own quantizer.
+        # TRT-LLM NVFP4 consumes x_quantized alongside BF16 routing input.
+        # Padded hidden rows still require its own quantizer.
         if self.experts.gemm2_weights_fp4_shuffled.shape[1] != hidden_states.shape[1]:
             return None
         return try_router_gemm_nvfp4(
