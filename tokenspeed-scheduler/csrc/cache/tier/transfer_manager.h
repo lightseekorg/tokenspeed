@@ -121,9 +121,9 @@ public:
         std::vector<ImageSlot> slots;
         // The rows by boundary, one per content hash with every group's rows
         // at it, the shallowest first.
-        std::vector<CacheCoordinator::HostSegmentRows> boundaries;
+        std::vector<HostCache::HostSegmentRows> boundaries;
         // The Host takes the rows of the first num_host_boundaries
-        // (CacheCoordinator::NumHostBoundariesThatFit), the snapshot pool every
+        // (HostCache::NumHostBoundariesThatFit), the snapshot pool every
         // later one.
         std::size_t num_host_boundaries{0};
         // kSnapshotPool when the pool cannot hold the image even with every
@@ -280,7 +280,7 @@ private:
     // the ops carrying its members (its own drain's, and earlier ones it
     // borrowed a member from).
     struct InFlightSegment {
-        CacheCoordinator::EvictedSegment segment;
+        CacheEvictor::EvictedSegment segment;
         std::vector<StoreWait> stores;
     };
 
