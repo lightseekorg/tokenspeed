@@ -273,6 +273,42 @@ TEST_P(PeerSchedulerTest, AReaderLandsTheHoldersPrefixAndComputesTheRest) {
     EXPECT_EQ(holder_.GetPeerStats().leases, 0u);
 }
 
+TEST_P(PeerSchedulerTest, ALandedPromptEndingInsideAPagePublishesItsEnd) {
+    // The prompt ends one token past the landed pages: its first decode
+    // publishes the prompt end and keeps writing past it, through the
+    // copy-in blocks the landing's admission reserved as a local prompt's
+    // would.
+    const std::vector<std::int32_t> tokens = MakeAlignedTokens(8, kP);
+    HolderComputes(tokens);
+    std::vector<std::int32_t> longer = tokens;
+    longer.push_back(901);
+    // Decode room makes the landing's admission prepay the rest of the
+    // prompt: the tail's block, and its copy-in slot, come with the landing.
+    reader_.SubmitRequests(
+        {RequestSpec{.request_id = "r", .peer_holder = "holder", .tokens = longer, .max_new_tokens = 4}});
+    Plan(reader_);
+    RelayLookups();
+    const ExecutionPlan landing_plan = Plan(reader_);
+    ASSERT_EQ(landing_plan.peer_fetches.size(), 1u);
+    const PeerFetchOperation fetch = landing_plan.peer_fetches.front();
+    EXPECT_EQ(Fetch(fetch, /*read_succeeds=*/true), fetch.end_tokens);
+    EXPECT_EQ(PrefillRows(Plan(reader_)), (std::vector<std::pair<std::string, std::int32_t>>{{"r", fetch.end_tokens}}));
+    Send(reader_, forward::ExtendResult{.request_id = "r", .tokens = {77}});
+    Plan(reader_);  // the first decode publishes the prompt end
+    Send(reader_, forward::ExtendResult{.request_id = "r", .tokens = {78}});
+    Plan(reader_);
+    Send(reader_, forward::Finish{.request_id = "r"});
+    Plan(reader_);
+
+    // The landed prompt, its end included, is the reader's own now.
+    std::vector<std::int32_t> again = longer;
+    again.insert(again.end(), {77, 600, 601, 602});
+    reader_.SubmitRequests({RequestSpec{.request_id = "again", .tokens = again}});
+    const auto rows = PrefillRows(Plan(reader_));
+    ASSERT_EQ(rows.size(), 1u);
+    EXPECT_GE(rows.front().second, static_cast<std::int32_t>(tokens.size()));
+}
+
 TEST_P(PeerSchedulerTest, AShortLandingIsAdmittedAgainFromTheLocalHit) {
     const std::vector<std::int32_t> tokens = MakeAlignedTokens(8, kP);
     HolderComputes(tokens);

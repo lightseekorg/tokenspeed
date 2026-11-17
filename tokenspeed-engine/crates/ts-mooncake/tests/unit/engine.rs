@@ -77,6 +77,32 @@ unsafe extern "C" fn write_pages(
     0
 }
 
+/// The last span READ: (target, sources, destinations, lengths), as the C
+/// entry point names them: `sources` on the peer, `destinations` local.
+type SpanRead = (String, Vec<u64>, Vec<u64>, Vec<u64>);
+static LAST_SPAN_READ: std::sync::Mutex<Option<SpanRead>> = std::sync::Mutex::new(None);
+
+unsafe extern "C" fn read(
+    _: *mut c_void,
+    target: *const c_char,
+    sources: *const u64,
+    destinations: *const u64,
+    lengths: *const u64,
+    count: usize,
+) -> c_int {
+    // SAFETY: Engine::read passes columns of `count` entries.
+    let read = unsafe {
+        (
+            CStr::from_ptr(target).to_str().unwrap().to_owned(),
+            std::slice::from_raw_parts(sources, count).to_vec(),
+            std::slice::from_raw_parts(destinations, count).to_vec(),
+            std::slice::from_raw_parts(lengths, count).to_vec(),
+        )
+    };
+    *LAST_SPAN_READ.lock().unwrap() = Some(read);
+    0
+}
+
 /// The last page READ: (target, source pages, destination pages, fields,
 /// batch size).
 type PageRead = (String, Vec<i64>, Vec<i64>, Vec<i64>, usize);
@@ -135,7 +161,7 @@ fn library_with_reads() -> Arc<Library> {
         unregister,
         write,
         write_pages,
-        read: Some(write),
+        read: Some(read),
         read_pages: Some(read_pages),
         _library: libloading::os::unix::Library::this().into(),
     })
@@ -154,6 +180,24 @@ fn a_library_without_reads_refuses_a_read_and_says_so() {
         engine.read("peer:1", &[], &[], &[]),
         Err(Error::NoReads(_))
     ));
+}
+
+#[test]
+fn a_span_read_takes_the_peers_addresses_as_its_sources() {
+    let engine = Engine::start(library_with_reads(), "127.0.0.1", "rdma", "").unwrap();
+    engine
+        .read("peer:1", &[0x1000, 0x2000], &[0x9000, 0xa000], &[64, 32])
+        .unwrap();
+    assert_eq!(
+        LAST_SPAN_READ.lock().unwrap().clone(),
+        Some((
+            "peer:1".to_owned(),
+            vec![0x1000, 0x2000],
+            vec![0x9000, 0xa000],
+            vec![64, 32]
+        )),
+        "the C entry point takes the peer's sources first and the local destinations second"
+    );
 }
 
 #[test]

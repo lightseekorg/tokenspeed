@@ -204,6 +204,19 @@ pub fn start(
         .map(|bytes| RankGeometry::decode(bytes))
         .collect::<Option<Vec<_>>>()
         .ok_or("a replica member's peer geometry does not decode")?;
+    tracing::debug!(
+        regions = ?settings
+            .regions
+            .iter()
+            .map(|(address, length)| format!("{address:#x}+{length:#x}"))
+            .collect::<Vec<_>>(),
+        fields = ?local
+            .device
+            .iter()
+            .map(|field| format!("{}@{:#x}/{:#x}", field.field_id, field.address, field.page_stride))
+            .collect::<Vec<_>>(),
+        "peer geometry"
+    );
     tracing::info!(
         name = settings.peer.name,
         session = engine.session_id(),

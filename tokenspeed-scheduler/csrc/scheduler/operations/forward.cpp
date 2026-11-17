@@ -672,11 +672,14 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     // chunk's admission publishes its live slot there, at the cost of a
     // round (a cache this full keeps no spare block). That optional block
     // never makes blocks leave one by one (docs/design/scheduler.md §1.4).
-    // A local prompt reserves the copy-in blocks of its prompt end with the
-    // blocks they serve, unless the prompt end is dead for a request resuming
-    // at the hit; a remote landing computes no prompt here.
+    // A prompt computed here reserves the copy-in blocks of its prompt end with
+    // the blocks they serve, unless the prompt end is dead for a request
+    // resuming at the hit. That includes a holder's landing: the rest of the
+    // prompt computes here and its first decode publishes the prompt end, and
+    // the landing's admission may prepay the tail's block. The PD peer's
+    // landing computes no prompt here.
     const std::optional<CopyInPoint> copy_in_point =
-        source == fsm::PrefillSource::kLocal ? promptEndCopyInPoint(*request, hit_tokens) : std::nullopt;
+        source != fsm::PrefillSource::kRemote ? promptEndCopyInPoint(*request, hit_tokens) : std::nullopt;
     // Read before the lone-request hand-over below may take the probe.
     const std::int32_t probed_device_full_page_tokens = match.probe.device.full_page_tokens;
     std::optional<AdmissionResult> admission;

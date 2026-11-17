@@ -734,14 +734,24 @@ protected:
         }
         const GroupDemand& demand = demands_[i];
         const auto* dense = std::get_if<DenseGrowth>(&demand.extent);
-        _assert(dense != nullptr, "the slots of a copy-in point grow densely");
+        const auto* sparse = std::get_if<SparseSuffix>(&demand.extent);
+        _assert(dense != nullptr || sparse != nullptr, "the slots of a copy-in point grow densely or land as a suffix");
         const BlockTable& table = *demand.table;
-        // The slots before the dense growth -- the rebuilt shape, the live
-        // table, or a first admission's prefix -- and the capacity the last
-        // of them leaves.
+        // The slots before the growth -- the rebuilt shape, the live table, or
+        // a first admission's prefix -- and the capacity the last of them
+        // leaves. A holder's landing lands a window as a sparse suffix, fresh
+        // blocks from its first block through its reserve, the prompt end's
+        // included: every copy-in slot lies in it.
         std::int32_t base = 0;
         std::int32_t available = 0;
-        if (!shapes_.empty()) {
+        std::int32_t growth_end = 0;
+        if (sparse != nullptr) {
+            _assert(shapes_.empty() && table.NumBlocks() == 0, "a landing's suffix is a first admission's");
+            base = sparse->first_block;
+            const std::int64_t extent = std::int64_t{sparse->extent_tokens} + demand.reserve_tokens;
+            growth_end = CheckedInt32((extent - 1) / geometry_[i].BlockGranularity() + 1);
+            _assert(slots.first >= base, "a landing's copy-in slots lie in its suffix");
+        } else if (!shapes_.empty()) {
             base = shapes_[i].num_blocks;
             available = shapes_[i].available_tokens;
         } else if (table.NumBlocks() > 0) {
@@ -754,8 +764,9 @@ protected:
             base = prefix.past_end;
             available = prefix.available_tokens;
         }
-        const std::int32_t growth_end =
-            base + geometry_[i].BlocksNeededBeyond(available, dense->num_tokens + demand.reserve_tokens);
+        if (dense != nullptr) {
+            growth_end = base + geometry_[i].BlocksNeededBeyond(available, dense->num_tokens + demand.reserve_tokens);
+        }
         const auto known_bucket = [](std::span<const CopyInReservation> known, std::int32_t slot) {
             const auto it = std::ranges::find(known, slot, &CopyInReservation::slot);
             _assert(it != known.end(), "a copy-in slot below the growth holds a block in a known bucket");

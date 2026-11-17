@@ -413,8 +413,8 @@ impl Engine {
             read(
                 self.raw.as_ptr(),
                 target_c.as_ptr(),
-                destinations.as_ptr(),
                 sources.as_ptr(),
+                destinations.as_ptr(),
                 lengths.as_ptr(),
                 sources.len(),
             )

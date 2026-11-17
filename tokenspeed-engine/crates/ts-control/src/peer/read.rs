@@ -80,7 +80,16 @@ impl Reads {
                         reader.read(&job.session, &job.spans)
                     };
                     if let Err(error) = &outcome {
-                        tracing::warn!(request = job.request_id, %error, "peer read failed");
+                        let spans = &job.spans;
+                        tracing::warn!(
+                            request = job.request_id,
+                            %error,
+                            spans = spans.lengths.len(),
+                            first_source = spans.sources.first().map(|a| format!("{a:#x}")),
+                            first_destination = spans.destinations.first().map(|a| format!("{a:#x}")),
+                            last_destination = spans.destinations.last().map(|a| format!("{a:#x}")),
+                            "peer read failed"
+                        );
                     }
                     if done.send((job.request_id, outcome.is_ok())).is_err() {
                         return;
