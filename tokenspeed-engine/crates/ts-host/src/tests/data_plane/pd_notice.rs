@@ -50,6 +50,7 @@ cfg.decode_allocation_policy = ts.SchedulerConfig.DecodeAllocationPolicy.Deferre
 cfg.prefix_granularity = 16
 cfg.max_scheduled_tokens = 64
 cfg.max_batch_size = 4
+cfg.max_resident_requests = 4
 cfg.num_device_pages = 64
 cfg.num_snapshot_pages = 1
 cfg.disable_l2_cache = True

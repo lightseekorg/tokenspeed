@@ -479,6 +479,7 @@ TEST_F(DeferredAllocationTest, DecodeAdmissionPressureDoesNotBlockPrefillComputa
     cfg.role = Role::kD;
     cfg.decode_allocation_policy.reset();
     cfg.max_batch_size = 1;
+    cfg.max_resident_requests = cfg.max_batch_size;
     SetTestSnapshotPool(cfg);
     Scheduler decode{WithHostPackingFromDevice(cfg)};
     const Scheduler::PlanOptions options{.allow_prefill = true, .apply_prefill_watermark = false};
@@ -577,6 +578,7 @@ protected:
             auto decode_config = config;
             decode_config.role = Role::kD;
             decode_config.max_batch_size = setup.decode_requests;
+            decode_config.max_resident_requests = decode_config.max_batch_size;
             decode_config.device_allocator.total_pages = pages;
             decode_config.cache_groups.front().total_pages = pages;
             SetTestSnapshotPool(decode_config);

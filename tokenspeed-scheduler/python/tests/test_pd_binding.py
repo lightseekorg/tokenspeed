@@ -191,6 +191,7 @@ def test_prefill_under_deferred_allocation_counts_prompts_waiting_for_their_dest
     cfg.prefix_granularity = 2
     cfg.max_scheduled_tokens = 8
     cfg.max_batch_size = 3
+    cfg.max_resident_requests = cfg.max_batch_size
     cfg.num_device_pages = 64
     cfg.num_snapshot_pages = 1
     cfg.disable_l2_cache = True
@@ -375,6 +376,7 @@ def test_prefill_under_deferred_allocation_holds_its_kv_until_the_destination_is
     cfg.prefix_granularity = 1
     cfg.max_scheduled_tokens = 8
     cfg.max_batch_size = 1
+    cfg.max_resident_requests = cfg.max_batch_size
     cfg.num_device_pages = 7
     cfg.num_snapshot_pages = 1  # the P role never retracts
     cfg.disable_l2_cache = True
