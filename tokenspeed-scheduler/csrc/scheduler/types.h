@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <optional>
 
+#include "cache/tier/shared_l2.h"
 #include "cache/tier/storage.h"
 #include <vector>
 
@@ -109,6 +110,11 @@ struct SchedulerConfig {
     bool disable_l2_cache{false};
     bool enable_l3_storage{false};
     std::optional<StorageConfig> storage_config;
+    // A shared L2 pool as the rank's Host L2: the Host allocator then sizes
+    // the proxy tier (no bytes; at least the pool's blocks), and published
+    // entries are written to the pool as a write-through Host store would be.
+    // P and fused roles, replicated groups, never with L3 or a snapshot pool.
+    std::optional<SharedL2Config> shared_l2_config;
     // Device residency events require at least one continuous Full/history group.
     bool enable_kv_cache_events{false};
     bool enable_mixed_prefill_decode{false};

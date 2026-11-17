@@ -29,6 +29,7 @@ mod encode;
 mod host_spans;
 mod logging;
 mod pd;
+mod pool;
 
 use std::{
     collections::HashSet,
@@ -52,6 +53,7 @@ use ts_control::{
     json_framing::{JsonFraming, MessageBoundary},
     kv_events::{KvEventPublisher, KvEventsConfig},
     output::{FinishLog, OutputProcessor, Role},
+    shared_l2::PoolClient,
     startup,
     transport::{EngineTransport, TransportError},
 };
@@ -61,7 +63,7 @@ use ts_metrics::{
 use ts_scheduler::Scheduler;
 use ts_wire::EngineCoreReadyResponse;
 
-use crate::data_plane::PythonDataPlane;
+use crate::{data_plane::PythonDataPlane, pool::PythonPoolClient};
 
 /// Rust's allocations go to mimalloc. The control thread allocates for every
 /// row of every round (scheduler events, outputs, the batches' columns); with
@@ -711,6 +713,23 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
         built.map_err(|error| python_error(py, error))
     })?;
 
+    // With a shared L2 pool as the Host tier, the pool client's adapter.
+    let pool = Python::attach(|py| {
+        bootstrap
+            .getattr(py, "shared_l2")
+            .map(|pool| (!pool.is_none(py)).then_some(pool))
+            .map_err(|error| python_error(py, error))
+    })?;
+    if pool.is_some() && config.replica_ranks.len() != 1 {
+        // The pool's client answers this rank alone: mirrored schedulers
+        // would not hold the same answers.
+        return Err(HostError::Interpreter(format!(
+            "a shared L2 pool needs a replica of one rank (attention TP 1, no pipeline); this \
+             one has {}",
+            config.replica_ranks.len()
+        )));
+    }
+
     // The ranks find each other through the data plane's rendezvous, then
     // connect: every rank is past startup once the mesh is up.
     let listener = Listener::bind(&config.collective_bind_host)?;
@@ -862,6 +881,9 @@ fn serve(args: &Args, launcher: &LauncherFailure) -> Result<(), HostError> {
             grammars,
             l3_metrics: config.metrics.l3_metrics(exporter.as_ref()),
             l3,
+            pool: pool.map(|adapter| {
+                Box::new(PythonPoolClient::new(adapter)) as Box<dyn PoolClient + Send>
+            }),
         },
     );
     // The engine registers only once its own requests ran: no client

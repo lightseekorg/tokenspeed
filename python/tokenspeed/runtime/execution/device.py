@@ -62,7 +62,11 @@ hold each piece:
   resolved past its gate because a text-only model has no vision tower.
 - ``host_cache`` — startup-only Host storage and immutable payload facts,
   consumed by Host-only storage construction outside the device builder.
-- ``DeviceHandle`` — the running handle, and the only piece the loop stores.
+- ``shared_l2`` — the rank's client of a shared L2 pool's owner, or None
+  without a pool. The handle's Host cache executor holds it, and so does
+  the adapter the host's control thread calls (``HostSharedL2``).
+- ``DeviceHandle`` — the running handle: with ``shared_l2``, what the loop
+  stores.
 
 Startup steps that need a real device object (the layerwise step counter,
 the peer's KV description) happen INSIDE the builder, so no such object ever
@@ -109,7 +113,7 @@ The two planes exchange information ONLY through the two channels below.
    shape rather than by anyone remembering them: what the loop cannot see,
    it cannot pass implicitly or mutate afterwards.
 
-5. Two registered exceptions — and new ones belong in this list, not in a
+5. Three registered exceptions — and new ones belong in this list, not in a
    comment at the call site:
 
    - Grammar matchers. ``GrammarStepInputs.grammars`` holds handles to the
@@ -130,6 +134,16 @@ The two planes exchange information ONLY through the two channels below.
      release of the shared SHM handles, behind any forward still reading
      them. What the shallow copy does freeze is the OUTER struct —
      ``mrope_positions`` and its siblings, which the next gather rebinds.
+
+   - Shared L2 proxy pages. With a shared L2 pool the control thread hands
+     the pool client the pool page behind each proxy Host block an answer
+     created (``HostSharedL2.map_pages``), and the forward thread reads
+     that map when it starts a plan's load-backs
+     (``SharedL2LoadExecutor.submit_load_backs``). The discipline is
+     ordering: the map is written at the head of the round, before the
+     plan that may load from those blocks is queued, and the scheduler
+     holds a proxy block a planned load reads until the load is
+     acknowledged, so no later answer remaps it first.
 """
 
 from __future__ import annotations
@@ -183,6 +197,7 @@ logger = get_colorful_logger(__name__)
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.cache.host_storage import HostCacheResources
+    from tokenspeed.runtime.cache.shared_l2.client import SharedL2Client
     from tokenspeed.runtime.configs.model_config import ModelConfig
     from tokenspeed.runtime.engine.scheduler_utils import SchedulerCacheGeometry
     from tokenspeed.runtime.execution.forward_reload import ForwardReloader
@@ -336,6 +351,9 @@ class DeviceBuild:
             register/abort, event polling — or None outside PD.
         host_cache: Startup-only Host resources and immutable payload facts,
             or None without an L2 Host allocation. Contains no Device buffers.
+        shared_l2: The rank's shared L2 pool client (lookups, writes and
+            notices; ``--shared-l2-config``), or None without a pool. The
+            pool's loads run behind ``handle`` like Host L2 loads.
         handle: The running handle; the loop's only reach into the device.
         encoder_model_facts: Zero-argument callable extracting the facts the
             EPD receive needs (``EncoderModelFacts``). A callable, not a
@@ -349,6 +367,7 @@ class DeviceBuild:
     transfer: Any
     handle: "DeviceHandle"
     host_cache: HostCacheResources | None
+    shared_l2: SharedL2Client | None
     encoder_model_facts: Any
 
 
@@ -700,8 +719,8 @@ class DeviceHandle:
         l2 = self._l2
         if l2 is None:
             raise RuntimeError(
-                "cache results polled without --enable-kvstore or a retraction "
-                "snapshot pool"
+                "cache results polled without --enable-kvstore, "
+                "--shared-l2-config or a retraction snapshot pool"
             )
         return l2.poll_results()
 
@@ -1795,11 +1814,53 @@ def build_device_side(
         decode_input_tokens=decode_input_tokens,
         overlap_schedule_depth=overlap_schedule_depth,
     )
-    if server_args.enable_kvstore or not snapshot_pool.disabled:
-        from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
+    shared_l2 = None
+    if (
+        server_args.shared_l2_config is not None
+        or server_args.enable_kvstore
+        or not snapshot_pool.disabled
+    ):
         from tokenspeed.runtime.distributed.process_group_manager import (
             process_group_manager as pg_manager,
         )
+
+        # What the Host cache executor's side and a shared L2 pool both
+        # read: the world's Gloo group, for their collectives, and the groups
+        # whose checkpoints are coarser than a page, part of the identity L3
+        # names its objects under and a pool admits its ranks by.
+        world_cpu_group = (
+            pg_manager.get_process_group("gloo", server_args.mapping.world_group)
+            if server_args.mapping.world_size > 1
+            else None
+        )
+        checkpoint_granularities = tuple(
+            (spec.group_id, spec.checkpoint_granularity)
+            for spec in views.token_to_kv_pool.arena.runtime_contract.group_specs
+            if spec.checkpoint_granularity is not None
+            and spec.checkpoint_granularity > 1
+        )
+    if server_args.shared_l2_config is not None:
+        from tokenspeed.runtime.cache.shared_l2.rank import join_shared_l2_pool
+
+        # The pool is this rank's Host L2: the scheduler's Host tier is its
+        # proxy and Host loads read it by RDMA, so its executor takes the
+        # Host cache executor's place (no local Host bytes, no snapshot pool).
+        shared_l2, host_cache_executor = join_shared_l2_pool(
+            server_args,
+            model_config,
+            draft_model_config,
+            device_pool=views.token_to_kv_pool,
+            draft_pool=views.draft_token_to_kv_pool,
+            cache_groups=views.cache_groups,
+            prefix_granularity=views.cache_geometry.prefix_granularity,
+            checkpoint_granularities=checkpoint_granularities,
+            attention_backend_name=attention.attention_backend_name,
+            draft_attention_backend_name=attention.draft_attention_backend_name,
+            world_cpu_group=world_cpu_group,
+            gpu_id=gpu_id,
+        )
+    elif server_args.enable_kvstore or not snapshot_pool.disabled:
+        from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
 
         host_cache_executor = HostCacheExecutor(
             views.token_to_kv_pool,
@@ -1813,11 +1874,7 @@ def build_device_side(
             attn_tp_rank=attn_tp_rank,
             kvp_rank=server_args.mapping.attn.kvp_rank,
             nprocs_per_node=server_args.mapping.nprocs_per_node,
-            world_cpu_group=(
-                pg_manager.get_process_group("gloo", server_args.mapping.world_group)
-                if server_args.mapping.world_size > 1
-                else None
-            ),
+            world_cpu_group=world_cpu_group,
         )
     elif attn_tp_rank == 0:
         # With an executor the line comes from its resolved sizing.
@@ -1852,12 +1909,7 @@ def build_device_side(
             memory_plan=views.token_to_kv_pool.arena.plan,
             attention_backend_name=attention.attention_backend_name,
             draft_attention_backend_name=attention.draft_attention_backend_name,
-            checkpoint_granularities=tuple(
-                (spec.group_id, spec.checkpoint_granularity)
-                for spec in views.token_to_kv_pool.arena.runtime_contract.group_specs
-                if spec.checkpoint_granularity is not None
-                and spec.checkpoint_granularity > 1
-            ),
+            checkpoint_granularities=checkpoint_granularities,
         )
 
     kv_transfer = kv_transfer_builder(
@@ -1942,6 +1994,7 @@ def build_device_side(
 
     return DeviceBuild(
         host_cache=host_cache,
+        shared_l2=shared_l2,
         specs=specs,
         transfer=kv_transfer,
         encoder_model_facts=encoder_model_facts,

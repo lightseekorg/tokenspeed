@@ -35,6 +35,7 @@
 #include "cache/coordinator/cache_coordinator.h"
 #include "cache/core/block_pool.h"
 #include "cache/tier/transfer_manager.h"
+#include "cache/tier/shared_l2_proxy.h"
 #include "cache/tier/storage_manager.h"
 #include "fsm/forward_events.h"
 #include "fsm/pd_events.h"
@@ -147,6 +148,25 @@ public:
     // Above this pressure hold new prompts back when delay is enabled.
     // Resident chunks must be able to consume their own reservations.
     static constexpr float kPrefillWatermark = 0.9F;
+
+    // With a shared L2 pool (SchedulerConfig::shared_l2_config) a waiting
+    // prompt is admitted only once its lookup is answered. Before a plan the
+    // runtime takes the lookups, asks the pool's owner about all of them in
+    // one request, waits for its reply and applies the answers.
+    //
+    // The waiting prompts' lookups not handed out yet, each once. A prompt
+    // whose Device prefix already covers what it may reuse asks nothing.
+    std::vector<SharedL2Lookup> SharedL2Lookups();
+    // Mirrors the pool's answers into the proxy Host tier; returns the proxy
+    // blocks created, each with the pool page a load-back from it reads. A
+    // hit the proxy tier has no room for counts as a miss: what it pinned is
+    // released and its prompt computes its prefix. An answer the scheduler
+    // cannot take -- one that names no lookup that waits for it, that lies
+    // outside its prompt, or that does not name, under a ticket, a bucket and
+    // a page for each key of the rank's cache groups and a tail inside a page
+    // -- throws std::invalid_argument, and the runtime stops serving: nothing
+    // of that answer is kept, and the answers after it are not applied.
+    std::vector<SharedL2ProxyPage> ApplySharedL2Lookups(const std::vector<SharedL2LookupResult>& results);
 
     void Advance(const ExecutionEvent& event);
     KvEventBatch DrainKvEventBatch();
@@ -480,6 +500,7 @@ private:
     void releaseStorage(Request& request);
     void expireStorage(Request& request);
     std::int32_t cacheablePrefixTokens(const Request& request) const;
+    void handleEvent(const cache::SharedL2WriteDone& event);
     void handleEvent(const cache::WriteBackDone& event);
     void handleEvent(const cache::LoadBackDone& event);
     void handleEvent(const cache::SnapshotDone& event);
@@ -742,6 +763,9 @@ private:
     CacheCoordinator coordinator_;
     TierTransferManager tier_transfers_;
     std::unique_ptr<StorageTransferManager> storage_transfers_;
+    // The rank's proxy of its shared L2 pool; null without one. It outlives
+    // the lookup holds of the requests below.
+    std::unique_ptr<SharedL2Proxy> shared_l2_;
     std::int64_t storage_now_us_{0};
     std::uint64_t storage_wait_timeouts_{0};
     std::uint64_t storage_ready_expirations_{0};

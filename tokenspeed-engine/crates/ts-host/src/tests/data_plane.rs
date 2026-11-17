@@ -764,3 +764,191 @@ fn assert_failure_is_published_before_logging(
         "{output}"
     );
 }
+
+/// A stand-in for the pool adapter (`HostSharedL2`): it records what each
+/// call was given and answers what a pool client would.
+const POOL_ADAPTER: &str = r#"
+import struct
+
+
+class Adapter:
+    def __init__(self):
+        self.calls = []
+
+    def lookup(self, lookups):
+        self.calls.append(("lookup", lookups))
+        hit = (4, 9, 32, 35, (3, "tail"), [((0, 1, "k1", 0), 0, 17), ((0, 2, "k2", 1), 0, 18)])
+        return [hit, (5, 0, 0, 0, None, [])]
+
+    def poll(self):
+        self.calls.append(("poll",))
+        return [21, 22]
+
+    def map_pages(self, pages):
+        self.calls.append(("map_pages", pages))
+
+    def submit(self, writes, releases, touches):
+        self.calls.append(("submit", writes, releases, touches))
+
+
+def int32(*tokens):
+    return struct.pack(f"={len(tokens)}i", *tokens)
+
+
+EXPECTED = [
+    ("lookup", [(4, "r1", ["h1", "h2"], int32(7, 8, 9), 3), (5, "r2", [], int32(), 0)]),
+    ("poll",),
+    ("map_pages", [(1, 5, 0, 17), (2, 6, 0, 18)]),
+    (
+        "submit",
+        [
+            (
+                31,
+                [(0, 1, "k1", 0), (0, 2, "k2", 1)],
+                [0, 0],
+                [12, 13],
+                [(int32(7, 8, 9), ["h1"], (1, "tail"), 77), (int32(7, 8), ["h1"], None, 78)],
+            )
+        ],
+        [9],
+        [[(0, 1, "k1", 0)]],
+    ),
+]
+result = Adapter()
+"#;
+
+#[test]
+fn the_pool_client_speaks_the_adapters_shapes() {
+    use ts_control::shared_l2::PoolClient;
+    use ts_scheduler::{
+        SharedL2KeyView, SharedL2LookupView, SharedL2OpKind, SharedL2OpView, SharedL2PageView,
+        SharedL2PublicationView,
+    };
+
+    interpreter();
+    let (adapter, globals) = Python::attach(|py| {
+        let globals = PyDict::new(py);
+        py.run(&CString::new(POOL_ADAPTER).unwrap(), Some(&globals), None)
+            .unwrap_or_else(|error| panic!("{}", describe(py, &error)));
+        let adapter = globals.get_item("result").unwrap().unwrap().unbind();
+        (adapter, globals.unbind())
+    });
+    let mut client = crate::pool::PythonPoolClient::new(Python::attach(|py| adapter.clone_ref(py)));
+    let key = |group_id: u32, hash: &str, page_offset: i32| SharedL2KeyView {
+        namespace_id: 0,
+        group_id,
+        content_hash: hash.to_owned(),
+        page_offset,
+    };
+
+    let answers = client
+        .lookup(&[
+            SharedL2LookupView {
+                lookup_id: 4,
+                request_id: "r1".to_owned(),
+                prefix_hashes: vec!["h1".to_owned(), "h2".to_owned()],
+                tokens: vec![7, 8, 9],
+                max_tokens: 3,
+            },
+            SharedL2LookupView {
+                lookup_id: 5,
+                request_id: "r2".to_owned(),
+                prefix_hashes: Vec::new(),
+                tokens: Vec::new(),
+                max_tokens: 0,
+            },
+        ])
+        .unwrap();
+    // A hit with a tail and a miss.
+    let [hit, miss] = &answers[..] else {
+        panic!("{answers:?}");
+    };
+    assert_eq!(
+        (hit.lookup_id, hit.ticket, hit.num_tokens, hit.kv_tokens),
+        (4, 9, 32, 35)
+    );
+    assert_eq!((hit.tail_tokens, hit.tail_hash.as_str()), (3, "tail"));
+    assert_eq!(hit.keys, [key(1, "k1", 0), key(2, "k2", 1)]);
+    assert_eq!((&hit.buckets, &hit.pages), (&vec![0, 0], &vec![17, 18]));
+    assert_eq!((miss.lookup_id, miss.ticket, miss.tail_tokens), (5, 0, 0));
+    assert!(miss.keys.is_empty() && miss.tail_hash.is_empty());
+    // The finished writes.
+    assert_eq!(client.poll().unwrap(), [21, 22]);
+
+    client
+        .map_pages(&[
+            SharedL2PageView {
+                group_id: 1,
+                block: 5,
+                bucket: 0,
+                page: 17,
+            },
+            SharedL2PageView {
+                group_id: 2,
+                block: 6,
+                bucket: 0,
+                page: 18,
+            },
+        ])
+        .unwrap();
+    let command = |kind, id| SharedL2OpView {
+        kind,
+        id,
+        keys: Vec::new(),
+        buckets: Vec::new(),
+        blocks: Vec::new(),
+        publications: Vec::new(),
+    };
+    let publication =
+        |tokens: &[i32], tail_tokens, tail_hash: &str, publisher| SharedL2PublicationView {
+            tokens: tokens.to_vec(),
+            prefix_hashes: vec!["h1".to_owned()],
+            tail_tokens,
+            tail_hash: tail_hash.to_owned(),
+            publisher,
+        };
+    client
+        .submit(&[
+            SharedL2OpView {
+                keys: vec![key(1, "k1", 0), key(2, "k2", 1)],
+                buckets: vec![0, 0],
+                blocks: vec![12, 13],
+                publications: vec![
+                    publication(&[7, 8, 9], 1, "tail", 77),
+                    publication(&[7, 8], 0, "", 78),
+                ],
+                ..command(SharedL2OpKind::Write, 31)
+            },
+            command(SharedL2OpKind::Release, 9),
+            SharedL2OpView {
+                keys: vec![key(1, "k1", 0)],
+                ..command(SharedL2OpKind::Touch, 0)
+            },
+        ])
+        .unwrap();
+
+    // What the adapter was given, as its Python client takes it.
+    Python::attach(|py| {
+        py.run(
+            c"assert result.calls == EXPECTED, f'{result.calls}\\n!=\\n{EXPECTED}'",
+            Some(globals.bind(py)),
+            None,
+        )
+        .unwrap_or_else(|error| panic!("{}", describe(py, &error)));
+    });
+
+    // A call that raises is the client's failure, with its traceback: the
+    // owner's error reply to a lookup, a write that failed.
+    Python::attach(|py| {
+        py.run(
+            c"def fail(*_):\n    raise RuntimeError('the owner refused')\nresult.lookup = result.poll = fail",
+            Some(globals.bind(py)),
+            None,
+        )
+        .unwrap();
+    });
+    let error = client.lookup(&[]).unwrap_err();
+    assert!(error.0.contains("the owner refused"), "{}", error.0);
+    let error = client.poll().unwrap_err();
+    assert!(error.0.contains("the owner refused"), "{}", error.0);
+}

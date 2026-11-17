@@ -50,6 +50,8 @@ from tokenspeed_scheduler.tokenspeed_scheduler_ext import (  # Core; Execution p
     Scheduler,
     SchedulerAbort,
     SchedulerConfig,
+    SharedL2Config,
+    SharedL2Pool,
 )
 
 StorageStats = _ext.StorageStats
@@ -86,6 +88,8 @@ __all__ = [
     # Core
     "Scheduler",
     "SchedulerConfig",
+    "SharedL2Config",
+    "SharedL2Pool",
     "StorageConfig",
     "StoragePressure",
     "StorageStats",

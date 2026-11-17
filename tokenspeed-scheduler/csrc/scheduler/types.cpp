@@ -136,6 +136,34 @@ void SchedulerConfig::Validate() const {
     if (HasHostCache() && host_write_policy == HostWritePolicy::kUnspecified) {
         throw std::invalid_argument("Scheduler: a Host L2 cache requires an explicit host_write_policy");
     }
+    if (shared_l2_config) {
+        shared_l2_config->Validate();
+        if (enable_l3_storage) {
+            throw std::invalid_argument("Scheduler: shared L2 and L3 storage are exclusive");
+        }
+        if (!HasHostCache()) {
+            throw std::invalid_argument("Scheduler: shared L2 needs its proxy Host tier");
+        }
+        if (role == Role::kD) {
+            throw std::invalid_argument("Scheduler: the decode role does not use shared L2");
+        }
+        // The pool is written from the publication store queue. An eviction
+        // write-back must precede the page's reuse in its own plan, which a
+        // remote write cannot.
+        if (host_write_policy != HostWritePolicy::kWriteThrough) {
+            throw std::invalid_argument("Scheduler: shared L2 requires host_write_policy WriteThrough");
+        }
+        // A retraction image's L2 leg would write into the proxy, which holds
+        // no bytes.
+        if (HasSnapshotPool()) {
+            throw std::invalid_argument("Scheduler: shared L2 ranks do not retract");
+        }
+        for (const CacheGroupConfig& group : cache_groups) {
+            if (group.shard_count != 1) {
+                throw std::invalid_argument("Scheduler: shared L2 needs replicated groups");
+            }
+        }
+    }
     // Write-back needs no KV-parallel check: each Host block takes its Device
     // block's bucket (docs/design/scheduler.md §5).
     //

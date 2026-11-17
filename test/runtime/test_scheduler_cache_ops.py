@@ -199,6 +199,42 @@ def test_plan_adapter_rejects_ragged_batches_and_unknown_kinds(wire):
         )
 
 
+def test_plan_adapter_leaves_a_shared_l2_pools_commands_to_the_host():
+    scheduler = ts.Scheduler(_pool_config())
+    spec = ts.RequestSpec()
+    spec.request_id = "r"
+    spec.tokens = list(range(1, 8))
+    scheduler.submit_requests([spec])
+    [lookup] = scheduler.shared_l2_lookups()
+    # The pool holds the prompt's first two pages.
+    slots = [
+        ((0, 0, page_hash, 0), 0, 11 + i) for i, page_hash in enumerate(lookup[2][:2])
+    ]
+    assert (
+        len(scheduler.apply_shared_l2_lookups([(lookup[0], 7, 4, 4, None, slots)])) == 2
+    )
+
+    # The load-back from the proxy blocks is the device's.
+    plan = scheduler.next_execution_plan()
+    ops = cache_ops_from_plan(plan, request_admission={}.__getitem__)
+    [load_back] = ops.device
+    assert type(load_back).__name__ == "LoadBackOp"
+    assert ops.storage == ()
+
+    # The release of the answer's ticket and the write of what the prompt
+    # computed are the pool client's: the adapter passes them to no one, and
+    # the host's loop reads them from the plan.
+    event = ts.ExecutionEvent()
+    event.add_event(ts.Cache.LoadBackDoneEvent(load_back.op_ids[0]))
+    scheduler.advance(event)
+    plan = scheduler.next_execution_plan()
+    assert [type(op).__name__ for op in plan.cache] == [
+        "SharedL2ReleaseOp",
+        "SharedL2WriteOp",
+    ]
+    assert cache_ops_from_plan(plan, request_admission={}.__getitem__) == ((), ())
+
+
 @pytest.mark.parametrize(
     "kind", ["WriteBackDoneEvent", "SnapshotDoneEvent", "RestoreDoneEvent"]
 )
@@ -235,6 +271,22 @@ def _config(**overrides):
     )
     fields.update(overrides)
     return make_config(**fields)
+
+
+def _pool_config():
+    return _config(
+        num_host_pages=65,
+        disable_l2_cache=False,
+        host_group_packing=(1,),
+        cache_groups=[ts.CacheGroupConfig("full", 2, 32, ts.AttnKind.Full)],
+        shared_l2_config=ts.SharedL2Config(max_writes=2, max_write_keys=8),
+    )
+
+
+def test_make_config_makes_the_host_tier_a_shared_l2_pools_proxy():
+    assert _config().shared_l2_config is None
+    limits = _pool_config().shared_l2_config
+    assert (limits.max_writes, limits.max_write_keys) == (2, 8)
 
 
 def test_make_config_states_the_snapshot_pool_on_every_role():

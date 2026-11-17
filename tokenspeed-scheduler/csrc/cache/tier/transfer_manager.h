@@ -28,6 +28,7 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -66,6 +67,21 @@ public:
     // queue -- StartRetractionStores builds it from the victim's tables.
     // `cause` (kPublication or kFinish) only picks the counters.
     std::optional<WriteBackOperation> StartPendingStores(StoreSourceGuard guard, HostStoreCause cause);
+    // The same drain on a rank whose Host tier is the proxy of a shared L2
+    // pool: the candidates go to the pool instead. At most limits.max_writes
+    // writes are in flight, each of up to limits.max_write_keys blocks, and
+    // only those pin their Device sources, until CompletePoolWrite; the other
+    // candidates stay queued, holding nothing (one evicted meanwhile counts as
+    // evicted_before_drain). The candidate checks are StartPendingStores': a
+    // key the proxy holds was loaded from the pool and is not written back,
+    // nor is one a write in flight carries. Each write names its blocks'
+    // buckets and carries the lineage of the State checkpoints among them
+    // (CheckpointTree::LineageOf); the owner chooses the pool pages. Counted
+    // as publication stores.
+    std::vector<SharedL2WriteOperation> StartPoolWrites(const SharedL2Config& limits);
+    // The runtime committed the write: its Device sources are let go. Throws
+    // std::invalid_argument for a write that is not in flight.
+    void CompletePoolWrite(const cache::SharedL2WriteDone& event);
     // Drains the segments this plan's admissions and restores recorded under
     // the write-back policy (CacheCoordinator::TakeEvictedSegments) into one
     // stream-ordered write-back op: their Device pages may be granted away
@@ -207,7 +223,7 @@ public:
     bool HasPinnedStoresInFlight() const;
     bool HasAnyInFlight() const {
         return !write_backs_.empty() || !load_backs_.empty() || !snapshot_stores_.empty() ||
-               !snapshot_restores_.empty();
+               !snapshot_restores_.empty() || !pool_writes_.empty();
     }
 
     // Cumulative Host L2 counters, never reset. Accounting only: no
@@ -302,6 +318,25 @@ private:
         DecodeSlotIndex decode_slot;
         std::uint64_t access_epoch{0};
     };
+    // A pool write pins its Device sources until the runtime completes it;
+    // its keys keep a later drain from writing them again meanwhile.
+    struct InFlightPoolWrite {
+        std::vector<CacheKey> keys;
+        std::vector<CacheBlockRef> device_block_refs;
+    };
+    // The Device sources of the oldest pending store candidates, up to
+    // max_sources of them, each with its bucket; the rest stay queued. A
+    // candidate the Host tier holds, one storing_keys names (which every
+    // source taken joins) or one that left the Device index is counted in
+    // `stats` and dropped.
+    struct StoreSources {
+        std::vector<CacheKey> keys;
+        std::vector<CacheBlockRef> device_block_refs;
+        std::vector<std::uint32_t> group_ids;
+        std::vector<std::int32_t> buckets;
+    };
+    StoreSources takeStoreSources(WriteBackStats& stats, std::unordered_set<CacheKey, CacheKeyHash>& storing_keys,
+                                  std::size_t max_sources);
     // Wraps by design: an id only tells in-flight ops apart, and none stays in
     // flight across 2^32 later ops. The width is the wire format's.
     std::uint32_t nextOpId() { return next_op_id_++; }
@@ -329,6 +364,8 @@ private:
     std::unordered_map<std::uint32_t, std::vector<BlockTransfer>> load_backs_;
     std::unordered_map<std::uint32_t, InFlightSnapshotStore> snapshot_stores_;
     std::unordered_map<std::uint32_t, InFlightSnapshotRestore> snapshot_restores_;
+    std::unordered_map<std::uint64_t, InFlightPoolWrite> pool_writes_;
+    std::uint64_t next_pool_write_id_{0};
     std::uint32_t next_op_id_{0};
     // Indexed by HostStoreCause; every per-group vector is sized at construction.
     std::array<WriteBackStats, 4> write_back_stats_;

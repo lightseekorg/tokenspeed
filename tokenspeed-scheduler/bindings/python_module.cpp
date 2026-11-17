@@ -30,9 +30,12 @@
 #include <nanobind/stl/vector.h>
 
 #include <cstdint>
+#include <cstring>
 #include <stdexcept>
 #include <vector>
 
+#include "cache/tier/shared_l2_pool.h"
+#include "scheduler/operations/cache.h"
 #include "scheduler/outside_events/inc.h"
 #include "scheduler/operations/inc.h"
 #include "scheduler/capacity_model.h"
@@ -83,6 +86,59 @@ void BindForwardCommonFields(Cls& cls) {
         .def_prop_ro(
             "input_lengths", [](const Op& op) -> const std::vector<std::int32_t>& { return op.input_lengths; },
             nb::rv_policy::reference_internal);
+}
+
+// Shared L2 values cross the binding as plain Python values, so the pool's
+// owner service relays them between its wire and the pool without parsing
+// them: a key is (namespace_id, group_id, content_hash, page_offset), a tail
+// (tail_tokens, hash), and a prompt's tokens are int32 bytes.
+using SharedL2KeyTuple = std::tuple<std::uint32_t, std::uint32_t, std::string, std::int32_t>;
+using SharedL2TailTuple = std::tuple<std::int32_t, std::string>;
+
+SharedL2KeyTuple SharedL2Key(const tokenspeed::CacheKey& key) {
+    return {key.namespace_id, key.group_id, key.content_hash.ToString(), key.page_offset};
+}
+
+std::vector<tokenspeed::CacheKey> SharedL2Keys(const std::vector<SharedL2KeyTuple>& keys) {
+    std::vector<tokenspeed::CacheKey> out;
+    out.reserve(keys.size());
+    for (const auto& [namespace_id, group_id, content_hash, page_offset] : keys) {
+        out.push_back(tokenspeed::CacheKey{.namespace_id = namespace_id,
+                                           .group_id = group_id,
+                                           .content_hash = tokenspeed::ContentHash{content_hash},
+                                           .page_offset = page_offset});
+    }
+    return out;
+}
+
+std::optional<SharedL2TailTuple> SharedL2Tail(const std::optional<tokenspeed::TailPublication>& tail) {
+    if (!tail) {
+        return std::nullopt;
+    }
+    return SharedL2TailTuple{tail->tail_tokens, tail->hash.ToString()};
+}
+
+std::optional<tokenspeed::TailPublication> SharedL2Tail(const std::optional<SharedL2TailTuple>& tail) {
+    if (!tail) {
+        return std::nullopt;
+    }
+    return tokenspeed::TailPublication{.tail_tokens = std::get<0>(*tail),
+                                       .hash = tokenspeed::ContentHash{std::get<1>(*tail)}};
+}
+
+nb::bytes SharedL2TokenBytes(const std::vector<std::int32_t>& tokens) {
+    return nb::bytes(reinterpret_cast<const char*>(tokens.data()), tokens.size() * sizeof(std::int32_t));
+}
+
+std::vector<std::int32_t> SharedL2Tokens(const nb::bytes& tokens) {
+    if (tokens.size() % sizeof(std::int32_t) != 0) {
+        throw std::invalid_argument("shared L2 tokens must be int32 bytes");
+    }
+    std::vector<std::int32_t> out(tokens.size() / sizeof(std::int32_t));
+    if (!out.empty()) {
+        std::memcpy(out.data(), tokens.c_str(), tokens.size());
+    }
+    return out;
 }
 
 }  // namespace
@@ -282,6 +338,11 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("pressure_high", &tokenspeed::StorageConfig::pressure_high)
         .def_ro("pressure_low", &tokenspeed::StorageConfig::pressure_low);
     scheduler_config.def_rw("storage_config", &tokenspeed::SchedulerConfig::storage_config);
+    nb::class_<tokenspeed::SharedL2Config>(m, "SharedL2Config")
+        .def(nb::init<std::int32_t, std::int32_t>(), nb::arg("max_writes"), nb::arg("max_write_keys"))
+        .def_ro("max_writes", &tokenspeed::SharedL2Config::max_writes)
+        .def_ro("max_write_keys", &tokenspeed::SharedL2Config::max_write_keys);
+    scheduler_config.def_rw("shared_l2_config", &tokenspeed::SchedulerConfig::shared_l2_config);
     nb::enum_<tokenspeed::StorageKind>(m, "StorageKind")
         .value("Query", tokenspeed::StorageKind::kQuery)
         .value("Get", tokenspeed::StorageKind::kGet)
@@ -317,7 +378,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("dead_entry", &tokenspeed::CacheCoordinator::HostEvictionStats::dead_entry)
         .def_ro("tail_cap", &tokenspeed::CacheCoordinator::HostEvictionStats::tail_cap)
         .def_ro("flush", &tokenspeed::CacheCoordinator::HostEvictionStats::flush)
-        .def_ro("duplicate_kv", &tokenspeed::CacheCoordinator::HostEvictionStats::duplicate_kv);
+        .def_ro("duplicate_kv", &tokenspeed::CacheCoordinator::HostEvictionStats::duplicate_kv)
+        .def_ro("released", &tokenspeed::CacheCoordinator::HostEvictionStats::released);
     nb::class_<tokenspeed::CacheCoordinator::DeviceEvictionCounts>(m, "DeviceEvictionCounts")
         .def_ro("blocks", &tokenspeed::CacheCoordinator::DeviceEvictionCounts::blocks)
         .def_ro("host_resident", &tokenspeed::CacheCoordinator::DeviceEvictionCounts::host_resident);
@@ -424,6 +486,43 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("success", &tokenspeed::cache::StorageDone::success)
         .def_ro("retired", &tokenspeed::cache::StorageDone::retired)
         .def_ro("object_failures", &tokenspeed::cache::StorageDone::object_failures);
+
+    // A shared L2 rank's commands to its pool, relayed by the runtime; keys,
+    // tails and tokens have the shapes SharedL2Pool takes.
+    const auto shared_l2_keys = [](const std::vector<tokenspeed::CacheKey>& keys) {
+        std::vector<SharedL2KeyTuple> out;
+        out.reserve(keys.size());
+        for (const tokenspeed::CacheKey& key : keys) out.push_back(SharedL2Key(key));
+        return out;
+    };
+    nb::class_<tokenspeed::SharedL2WriteOperation>(cache, "SharedL2WriteOp")
+        .def_ro("write_id", &tokenspeed::SharedL2WriteOperation::write_id)
+        .def_prop_ro("keys",
+                     [shared_l2_keys](const tokenspeed::SharedL2WriteOperation& op) { return shared_l2_keys(op.keys); })
+        .def_ro("buckets", &tokenspeed::SharedL2WriteOperation::buckets)
+        .def_ro("blocks", &tokenspeed::SharedL2WriteOperation::blocks)
+        // [(tokens, prefix_hashes, tail, publisher)], as SharedL2Pool.commit takes them.
+        .def_prop_ro("publications", [](const tokenspeed::SharedL2WriteOperation& op) {
+            nb::list publications;
+            for (const tokenspeed::SharedL2Publication& publication : op.publications) {
+                publications.append(nb::make_tuple(SharedL2TokenBytes(publication.tokens), publication.prefix_hashes,
+                                                   SharedL2Tail(publication.tail), publication.publisher));
+            }
+            return publications;
+        });
+    nb::class_<tokenspeed::SharedL2ReleaseOperation>(cache, "SharedL2ReleaseOp")
+        .def_ro("ticket", &tokenspeed::SharedL2ReleaseOperation::ticket);
+    nb::class_<tokenspeed::SharedL2TouchOperation>(cache, "SharedL2TouchOp")
+        .def_prop_ro(
+            "keys", [shared_l2_keys](const tokenspeed::SharedL2TouchOperation& op) { return shared_l2_keys(op.keys); });
+    nb::class_<tokenspeed::cache::SharedL2WriteDone>(cache, "SharedL2WriteDone")
+        .def(
+            "__init__",
+            [](tokenspeed::cache::SharedL2WriteDone* self, std::uint64_t write_id) {
+                new (self) tokenspeed::cache::SharedL2WriteDone{write_id};
+            },
+            nb::arg("write_id"))
+        .def_ro("write_id", &tokenspeed::cache::SharedL2WriteDone::write_id);
 
     nb::class_<tokenspeed::cache::WriteBackDone>(cache, "WriteBackDoneEvent")
         .def(nb::init<>())
@@ -713,6 +812,52 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
             },
             nb::call_guard<nb::gil_scoped_release>())
         .def("advance", &tokenspeed::Scheduler::Advance, nb::arg("event"))
+        .def("shared_l2_lookups",
+             // [(lookup_id, request_id, prefix_hashes, tokens, max_tokens)].
+             [](tokenspeed::Scheduler& s) {
+                 nb::list lookups;
+                 for (const tokenspeed::SharedL2Lookup& lookup : s.SharedL2Lookups()) {
+                     lookups.append(nb::make_tuple(lookup.lookup_id, lookup.request_id, lookup.prefix_hashes,
+                                                   SharedL2TokenBytes(lookup.tokens), lookup.max_tokens));
+                 }
+                 return lookups;
+             })
+        .def(
+            "apply_shared_l2_lookups",
+            // results: [(lookup_id, ticket, num_tokens, kv_tokens, tail, [(key, bucket, page)])], the
+            // tuple SharedL2Pool.probe returns behind its lookup id. Returns the proxy blocks created:
+            // [(group_id, block, bucket, page)].
+            [](tokenspeed::Scheduler& s,
+               const std::vector<std::tuple<
+                   std::uint64_t, std::uint64_t, std::int32_t, std::int32_t, std::optional<SharedL2TailTuple>,
+                   std::vector<std::tuple<SharedL2KeyTuple, std::int32_t, std::int32_t>>>>& results) {
+                std::vector<tokenspeed::SharedL2LookupResult> converted;
+                converted.reserve(results.size());
+                for (const auto& [lookup_id, ticket, num_tokens, kv_tokens, tail, slots] : results) {
+                    tokenspeed::SharedL2LookupResult& result =
+                        converted.emplace_back(tokenspeed::SharedL2LookupResult{.lookup_id = lookup_id,
+                                                                                .ticket = ticket,
+                                                                                .num_tokens = num_tokens,
+                                                                                .kv_tokens = kv_tokens,
+                                                                                .tail = SharedL2Tail(tail)});
+                    std::vector<SharedL2KeyTuple> keys;
+                    keys.reserve(slots.size());
+                    for (const auto& [key, bucket, page] : slots) {
+                        keys.push_back(key);
+                        result.buckets.push_back(bucket);
+                        result.pages.push_back(page);
+                    }
+                    result.keys = SharedL2Keys(keys);
+                }
+                std::vector<std::tuple<std::uint32_t, std::int32_t, std::int32_t, std::int32_t>> created;
+                for (const tokenspeed::SharedL2ProxyPage& page : s.ApplySharedL2Lookups(converted)) {
+                    created.emplace_back(page.group_id, page.block, page.bucket, page.page);
+                }
+                return created;
+            },
+            nb::arg("results"),
+            "Apply the pool's answers in order and return the proxy blocks they created. An answer the scheduler "
+            "cannot take raises: the runtime stops serving on it.")
         .def("drain_kv_events",
              [](tokenspeed::Scheduler& s) {
                  nb::list result;
@@ -794,4 +939,89 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
                 return std::tuple{std::move(group_ids), std::move(hashes), std::move(page_offsets)};
             },
             nb::arg("content_hashes"));
+
+    // The owner's side of a shared L2 pool. `config` gives the cache groups,
+    // the prefix granularity, the pool's page layout (host_group_packing) and
+    // the checkpoint retention settings; no scheduler is built from it.
+    using SharedL2Pool = tokenspeed::SharedL2Pool;
+    // (tokens, prefix_hashes, tail, publisher).
+    using SharedL2PublicationTuple =
+        std::tuple<nb::bytes, std::vector<std::string>, std::optional<SharedL2TailTuple>, std::uint64_t>;
+    nb::class_<SharedL2Pool>(m, "SharedL2Pool")
+        .def(
+            "__init__",
+            [](SharedL2Pool* self, const tokenspeed::SchedulerConfig& config, std::int32_t num_lcm_blocks,
+               std::int32_t headroom_lcm_blocks) {
+                // A rank's default window counts its own requests; the pool
+                // counts every rank's, so it takes no default.
+                if (!config.checkpoint_retention_requests) {
+                    throw std::invalid_argument(
+                        "SharedL2Pool: checkpoint_retention_requests must be set (0 ranks every entry by its own use)");
+                }
+                new (self)
+                    SharedL2Pool(tokenspeed::MakeSpecsFromConfig(config), config.prefix_granularity,
+                                 config.host_group_packing, num_lcm_blocks, headroom_lcm_blocks,
+                                 *config.checkpoint_retention_requests, config.checkpoint_retention_leaf_distance);
+            },
+            nb::arg("config"), nb::arg("num_lcm_blocks"), nb::arg("headroom_lcm_blocks"))
+        .def(
+            "probe",
+            // Returns (ticket, num_tokens, kv_tokens, tail, [(key, bucket, page)]).
+            [](SharedL2Pool& pool, std::uint64_t client, const std::vector<std::string>& prefix_hashes,
+               const nb::bytes& tokens, std::int32_t max_tokens) {
+                const std::vector<std::int32_t> prompt = SharedL2Tokens(tokens);
+                const SharedL2Pool::Hit hit =
+                    pool.Probe(client, {.prefix_hashes = prefix_hashes, .tokens = prompt, .max_tokens = max_tokens});
+                std::vector<std::tuple<SharedL2KeyTuple, std::int32_t, std::int32_t>> slots;
+                slots.reserve(hit.slots.size());
+                for (const SharedL2Pool::Slot& slot : hit.slots) {
+                    slots.emplace_back(SharedL2Key(slot.key), slot.bucket, slot.page);
+                }
+                return std::tuple{hit.ticket, hit.num_tokens, hit.kv_tokens, SharedL2Tail(hit.tail), std::move(slots)};
+            },
+            nb::arg("client"), nb::arg("prefix_hashes"), nb::arg("tokens"), nb::arg("max_tokens"))
+        .def("release", &SharedL2Pool::Release, nb::arg("client"), nb::arg("ticket"))
+        .def(
+            "reserve",
+            // Returns (ticket, pages aligned with keys).
+            [](SharedL2Pool& pool, std::uint64_t client, const std::vector<SharedL2KeyTuple>& keys,
+               const std::vector<std::int32_t>& buckets) {
+                SharedL2Pool::Reservation reservation = pool.Reserve(client, SharedL2Keys(keys), buckets);
+                return std::tuple{reservation.ticket, std::move(reservation.pages)};
+            },
+            nb::arg("client"), nb::arg("keys"), nb::arg("buckets"))
+        .def(
+            "commit",
+            [](SharedL2Pool& pool, std::uint64_t client, std::uint64_t ticket,
+               const std::vector<SharedL2PublicationTuple>& publications) {
+                std::vector<tokenspeed::CheckpointTree::Lineage> converted;
+                converted.reserve(publications.size());
+                for (const auto& [tokens, prefix_hashes, tail, publisher] : publications) {
+                    converted.push_back({.tokens = SharedL2Tokens(tokens),
+                                         .prefix_hashes = prefix_hashes,
+                                         .tail = SharedL2Tail(tail),
+                                         .access_epoch = publisher});
+                }
+                return pool.Commit(client, ticket, converted);
+            },
+            nb::arg("client"), nb::arg("ticket"), nb::arg("publications"))
+        .def(
+            "touch",
+            [](SharedL2Pool& pool, const std::vector<SharedL2KeyTuple>& keys) { pool.Touch(SharedL2Keys(keys)); },
+            nb::arg("keys"))
+        .def("disconnect", &SharedL2Pool::Disconnect, nb::arg("client"))
+        .def("clear", &SharedL2Pool::Clear)
+        .def("stats", [](const SharedL2Pool& pool) {
+            const SharedL2Pool::Stats stats = pool.GetStats();
+            return std::map<std::string, std::uint64_t>{
+                {"total_lcm_blocks", static_cast<std::uint64_t>(stats.total_lcm_blocks)},
+                {"free_lcm_blocks", static_cast<std::uint64_t>(stats.free_lcm_blocks)},
+                {"cached_blocks", static_cast<std::uint64_t>(stats.cached_blocks)},
+                {"pinned_blocks", static_cast<std::uint64_t>(stats.pinned_blocks)},
+                {"reserved_blocks", stats.reserved_blocks},
+                {"lookups", stats.lookups},
+                {"evicted_blocks", stats.evicted_blocks},
+                {"checkpoints", stats.checkpoints},
+            };
+        });
 }

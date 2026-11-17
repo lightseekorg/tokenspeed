@@ -58,6 +58,9 @@ _CACHE_EVENT_TYPES = {
     "SnapshotDoneEvent": Cache.SnapshotDoneEvent,
     "RestoreDoneEvent": Cache.RestoreDoneEvent,
 }
+# A shared L2 pool's commands in a plan's cache ops, by class name: a
+# scheduler wheel released before the pool does not bind the classes.
+_POOL_OPS = frozenset({"SharedL2WriteOp", "SharedL2ReleaseOp", "SharedL2TouchOp"})
 # make_config's host_write_policy names; ServerArgs validates the flag.
 _HOST_WRITE_POLICIES = {
     "write_through": SchedulerConfig.HostWritePolicy.WriteThrough,
@@ -136,6 +139,7 @@ def make_config(
     checkpoint_retention_requests: int | None = None,
     checkpoint_retention_leaf_distance: int | None = None,
     prefill_chunk_yield_tokens: int = 0,
+    shared_l2_config: Any = None,
 ) -> SchedulerConfig:
     """Build the C++ scheduler's configuration.
 
@@ -236,6 +240,10 @@ def make_config(
             same forward. 0 is off; the prefill role only, at most half of
             ``max_scheduled_tokens`` (``SchedulerConfig::Validate`` refuses
             it elsewhere).
+        shared_l2_config: With a shared L2 pool as the Host tier
+            (``--shared-l2-config``), the scheduler's limits on its writes, a
+            ``SharedL2Config``: the Host pages are then the pool's proxy and
+            hold no bytes. None without a pool.
     """
     if not 0 <= prefix_replay_tokens <= (1 << 31) - 1:
         raise ValueError(
@@ -304,6 +312,9 @@ def make_config(
     if prefill_chunk_yield_tokens:
         # Set only when on, for the same reason.
         cfg.prefill_chunk_yield_tokens = prefill_chunk_yield_tokens
+    if shared_l2_config is not None:
+        # Likewise set only with a pool.
+        cfg.shared_l2_config = shared_l2_config
     cfg.disable_l2_cache = disable_l2_cache
     cfg.host_write_policy = _HOST_WRITE_POLICIES[host_write_policy]
 
@@ -399,6 +410,7 @@ def resolve_dspark_prefix_replay_tokens(
     speculative_algorithm: str | None,
     enable_prefix_caching: bool,
     enable_kvstore: bool,
+    shared_l2_pool: bool,
     disaggregation_mode: str,
     draft_model_path_use_base: bool,
     draft_model_config: Any | None,
@@ -410,7 +422,9 @@ def resolve_dspark_prefix_replay_tokens(
     are cache resident. Same-checkpoint DSpark configurations without that
     capability remain fail-closed. External generic DSpark configurations
     keep their existing scheduler behavior until they advertise an
-    equivalent contract.
+    equivalent contract. The scheduler has a Host tier with the local Host L2
+    (``enable_kvstore``) or with a shared L2 pool in its place
+    (``shared_l2_pool``, ``--shared-l2-config``).
     """
 
     if speculative_algorithm != "DSPARK":
@@ -438,10 +452,10 @@ def resolve_dspark_prefix_replay_tokens(
         return 0
     # A drafter-private context cannot be restored from the host tier, with or
     # without prefix reuse.
-    if enable_kvstore:
+    if enable_kvstore or shared_l2_pool:
         raise ValueError(
-            "DSPARK captured-context replay does not support KVStore; "
-            "use --disable-kvstore."
+            "DSPARK captured-context replay does not support KVStore or a "
+            "shared L2 pool; use --disable-kvstore without --shared-l2-config."
         )
     if not enable_prefix_caching:
         return 0
@@ -613,8 +627,10 @@ def cache_ops_from_plan(
 
     L2 wire batches pass through; snapshot/restore batches become per-request
     operations. Host-only QUERY/GET/PUT/Cancel descriptors go to the storage
-    tuple: the engine host's L3 executor runs them. Unknown kinds fail the
-    whole conversion without partial submission.
+    tuple: the engine host's L3 executor runs them. A shared L2 pool's write,
+    release and touch commands are left out: the engine host's loop reads
+    them from the plan and hands them to the pool's client. Unknown
+    kinds fail the whole conversion without partial submission.
 
     ``request_admission`` resolves each snapshot/restore request while the
     plan is adapted. The resulting op holds the identity, never a late lookup
@@ -643,7 +659,8 @@ def cache_ops_from_plan(
             ),
         ):
             storage.append(op)
-        else:
+        elif type(op).__name__ not in _POOL_OPS:
+            # A pool's commands are skipped here; any other kind is unknown.
             raise TypeError(f"unsupported cache op kind: {type(op).__name__}")
     return CacheOperations(tuple(device), tuple(storage))
 

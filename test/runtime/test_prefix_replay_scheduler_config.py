@@ -63,6 +63,7 @@ def _resolve_replay(**overrides) -> int:
         "speculative_algorithm": "DSPARK",
         "enable_prefix_caching": True,
         "enable_kvstore": False,
+        "shared_l2_pool": False,
         "disaggregation_mode": "null",
         "draft_model_path_use_base": True,
         "draft_model_config": SimpleNamespace(dspark_prefix_replay_tokens=128),
@@ -101,11 +102,16 @@ def test_resolve_dspark_prefix_replay_rejects_invalid_capability(value: int) -> 
 
 @pytest.mark.parametrize(
     "overrides",
-    [{}, {"enable_kvstore": True}, {"disaggregation_mode": "prefill"}],
+    [
+        {},
+        {"enable_kvstore": True},
+        {"shared_l2_pool": True},
+        {"disaggregation_mode": "prefill"},
+    ],
 )
 def test_resolve_dspark_cache_resident_windows_need_no_replay(overrides) -> None:
     # A draft whose windows live in the KV cache (V4.1) advertises zero and is
-    # free to combine with KVStore and disaggregation.
+    # free to combine with KVStore, a shared L2 pool and disaggregation.
     assert (
         _resolve_replay(
             draft_model_config=SimpleNamespace(dspark_prefix_replay_tokens=0),
@@ -129,6 +135,8 @@ def test_resolve_dspark_prefix_replay_keeps_same_checkpoint_fail_closed() -> Non
     ("overrides", "message"),
     [
         ({"enable_kvstore": True}, "does not support KVStore"),
+        # The pool is the Host tier in the local Host L2's place.
+        ({"shared_l2_pool": True}, "does not support KVStore or a shared L2 pool"),
         ({"disaggregation_mode": "prefill"}, "disaggregated serving"),
         ({"disaggregation_mode": "decode"}, "disaggregated serving"),
     ],
