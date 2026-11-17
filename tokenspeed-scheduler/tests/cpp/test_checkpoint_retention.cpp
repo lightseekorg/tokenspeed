@@ -395,10 +395,10 @@ TEST(CheckpointRetention, HostPlacementRanksNonLeafCheckpoints) {
             for (const Checkpoint* point : {&other, &a, &b, &c}) {
                 Publish(cache, *point);
                 for (std::uint32_t group : {0u, 1u}) {
-                    CacheBlockRef block = cache.AcquireHostBlock(group, 0);
+                    CacheBlockRef block = cache.Host().AcquireHostBlock(group, 0);
                     ASSERT_TRUE(block);
-                    cache.CacheHostBlock(block, CacheKey{.group_id = group, .content_hash = point->Hash()},
-                                         std::nullopt);
+                    cache.Host().CacheHostBlock(block, CacheKey{.group_id = group, .content_hash = point->Hash()},
+                                                std::nullopt);
                 }
             }
             ASSERT_TRUE(cache.ClearDeviceCache());
@@ -406,10 +406,10 @@ TEST(CheckpointRetention, HostPlacementRanksNonLeafCheckpoints) {
             while (host.NumEmptyLcmBlocks() > 0) pins.push_back(host.AcquireBlock(0));
             const std::array<std::uint32_t, 1> groups{0};
             const std::array<std::int32_t, 1> buckets{0};
-            const std::array boundaries{CacheCoordinator::HostSegmentRows{.first_row = 0, .past_end_row = 1}};
-            const auto result = placement == 0   ? cache.AcquireHostBlocks(groups, buckets)
-                                : placement == 1 ? cache.AcquireHostBoundaries(groups, buckets, boundaries)
-                                                 : cache.AcquireHostSegments(groups, buckets, boundaries);
+            const std::array boundaries{HostCache::HostSegmentRows{.first_row = 0, .past_end_row = 1}};
+            const auto result = placement == 0   ? cache.Host().AcquireHostBlocks(groups, buckets)
+                                : placement == 1 ? cache.Host().AcquireHostBoundaries(groups, buckets, boundaries)
+                                                 : cache.Host().AcquireHostSegments(groups, buckets, boundaries);
             ASSERT_EQ(result.stats.allocated, 1u);
             const std::vector<bool> kept{Holds(cache, host, other), Holds(cache, host, a), Holds(cache, host, b),
                                          Holds(cache, host, c)};
@@ -435,9 +435,10 @@ TEST(CheckpointRetention, HostPlacementTakesTheOlderOfEqualDistances) {
         for (const Checkpoint* point : {&a, &a_next, &b, &b_next}) {
             Publish(cache, *point);
             for (std::uint32_t group : {0u, 1u}) {
-                CacheBlockRef block = cache.AcquireHostBlock(group, 0);
+                CacheBlockRef block = cache.Host().AcquireHostBlock(group, 0);
                 ASSERT_TRUE(block);
-                cache.CacheHostBlock(block, CacheKey{.group_id = group, .content_hash = point->Hash()}, std::nullopt);
+                cache.Host().CacheHostBlock(block, CacheKey{.group_id = group, .content_hash = point->Hash()},
+                                            std::nullopt);
             }
         }
         ASSERT_TRUE(cache.ClearDeviceCache());
@@ -445,10 +446,10 @@ TEST(CheckpointRetention, HostPlacementTakesTheOlderOfEqualDistances) {
         while (host.NumEmptyLcmBlocks() > 0) pins.push_back(host.AcquireBlock(0));
         const std::array<std::uint32_t, 1> groups{0};
         const std::array<std::int32_t, 1> buckets{0};
-        const std::array boundaries{CacheCoordinator::HostSegmentRows{.first_row = 0, .past_end_row = 1}};
-        const auto result = placement == 0   ? cache.AcquireHostBlocks(groups, buckets)
-                            : placement == 1 ? cache.AcquireHostBoundaries(groups, buckets, boundaries)
-                                             : cache.AcquireHostSegments(groups, buckets, boundaries);
+        const std::array boundaries{HostCache::HostSegmentRows{.first_row = 0, .past_end_row = 1}};
+        const auto result = placement == 0   ? cache.Host().AcquireHostBlocks(groups, buckets)
+                            : placement == 1 ? cache.Host().AcquireHostBoundaries(groups, buckets, boundaries)
+                                             : cache.Host().AcquireHostSegments(groups, buckets, boundaries);
         ASSERT_EQ(result.stats.allocated, 1u);
         EXPECT_FALSE(Holds(cache, host, a));
         EXPECT_TRUE(Holds(cache, host, b));
@@ -478,10 +479,10 @@ TEST(CheckpointRetention, LeafDistanceAppliesToEveryHostPlacement) {
             for (const Checkpoint* point : {&other, &a, &b}) {
                 Publish(cache, *point);
                 for (std::uint32_t group : {0u, 1u}) {
-                    CacheBlockRef block = cache.AcquireHostBlock(group, 0);
+                    CacheBlockRef block = cache.Host().AcquireHostBlock(group, 0);
                     ASSERT_TRUE(block);
-                    cache.CacheHostBlock(block, CacheKey{.group_id = group, .content_hash = point->Hash()},
-                                         std::nullopt);
+                    cache.Host().CacheHostBlock(block, CacheKey{.group_id = group, .content_hash = point->Hash()},
+                                                std::nullopt);
                 }
             }
             ASSERT_TRUE(cache.ClearDeviceCache());
@@ -489,10 +490,10 @@ TEST(CheckpointRetention, LeafDistanceAppliesToEveryHostPlacement) {
             while (host.NumEmptyLcmBlocks() > 0) pins.push_back(host.AcquireBlock(0));
             const std::array<std::uint32_t, 1> groups{0};
             const std::array<std::int32_t, 1> buckets{0};
-            const std::array boundaries{CacheCoordinator::HostSegmentRows{.first_row = 0, .past_end_row = 1}};
-            const auto result = placement == 0   ? cache.AcquireHostBlocks(groups, buckets)
-                                : placement == 1 ? cache.AcquireHostBoundaries(groups, buckets, boundaries)
-                                                 : cache.AcquireHostSegments(groups, buckets, boundaries);
+            const std::array boundaries{HostCache::HostSegmentRows{.first_row = 0, .past_end_row = 1}};
+            const auto result = placement == 0   ? cache.Host().AcquireHostBlocks(groups, buckets)
+                                : placement == 1 ? cache.Host().AcquireHostBoundaries(groups, buckets, boundaries)
+                                                 : cache.Host().AcquireHostSegments(groups, buckets, boundaries);
             ASSERT_EQ(result.stats.allocated, 1u);
             // A, at distance 1, is aged only with leaf distance 0.
             EXPECT_EQ(Holds(cache, host, other), leaf_distance == 0);
@@ -531,15 +532,15 @@ TEST(CheckpointRetention, ResumeGapCountsNewRequestsSinceTheCheckpointsLastUse) 
     std::vector<BlockTable> tables(2);
     auto admission = AdmitForTest(
         cache, tables,
-        cache.ProbePromptPrefix(CacheCoordinator::PromptPrefix{
+        cache.Prober().ProbePromptPrefix(PromptPrefix{
             .prefix_hashes = a.hashes, .tokens = a.tokens, .max_tokens = static_cast<std::int32_t>(a.tokens.size())}),
         GroupDemand{.extent = DenseGrowth{0}});
     ASSERT_TRUE(admission);
     EXPECT_EQ(admission->device_prefix_tokens, 4);
     // Three new requests came between: index 2 counts [2, 4).
-    std::vector<std::uint64_t> expected(cache.CheckpointResumeGaps().size(), 0);
+    std::vector<std::uint64_t> expected(cache.History().CheckpointResumeGaps().size(), 0);
     expected[2] = 1;
-    EXPECT_EQ(cache.CheckpointResumeGaps(), expected);
+    EXPECT_EQ(cache.History().CheckpointResumeGaps(), expected);
     cache.Free(tables);
 }
 

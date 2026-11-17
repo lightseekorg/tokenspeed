@@ -43,6 +43,7 @@
 #include "scheduler/execution_event.h"
 #include "scheduler/execution_plan.h"
 #include "scheduler/kv_cache_events.h"
+#include "scheduler/lone_request_recovery.h"
 #include "scheduler/operations/cache.h"
 #include "scheduler/request.h"
 #include "scheduler/types.h"
@@ -79,7 +80,7 @@ struct HostCacheStats {
     TierTransferManager::WriteBackStats eviction_stores;
     TierTransferManager::LoadBackStats prefix_loads;
     TierTransferManager::LoadBackStats restore_loads;
-    CacheCoordinator::HostEvictionStats host_evictions;
+    CacheEvictor::HostEvictionStats host_evictions;
     std::uint64_t store_candidates_dropped_by_flush{0};
     // What admissions and restores evicted under write-back and dropped at
     // once, no probe being able to resume from it on the Host (dead entries,
@@ -89,13 +90,13 @@ struct HostCacheStats {
     // (SchedulerConfig::demote_superseded_state_checkpoints), never written
     // back; counted under the eviction's cause.
     std::uint64_t demoted_entries_not_written_back{0};
-    CacheCoordinator::DeviceEvictionStats device_evictions;
-    // CacheCoordinator::LoneCompactions and LoneCompactionMoves: lone-request
+    CacheEvictor::DeviceEvictionStats device_evictions;
+    // LoneRequestAdmission::Compactions and CompactionMoves: lone-request
     // compactions (docs/design/scheduler.md §1.4) and the blocks they moved,
     // copied or re-placed.
     std::uint64_t lone_compactions{0};
     std::uint64_t lone_compaction_moves{0};
-    // CacheCoordinator::CheckpointResumeGaps, the gaps an admission resumed
+    // AdmissionHistory::CheckpointResumeGaps, the gaps an admission resumed
     // a State checkpoint after, on either tier.
     std::vector<std::uint64_t> checkpoint_resume_gaps;
 };
@@ -230,11 +231,11 @@ public:
 
     // Test/diagnostic view of pdTransferInFlight by request id.
     bool PdTransferPinned(const std::string& request_id) const;
-    std::int32_t HostPoolCachedBlocks() const { return coordinator_.NumHostCachedBlocks(); }
-    std::int32_t HostPoolFreeBlocks() const { return coordinator_.NumFreeHostLcmBlocks(); }
+    std::int32_t HostPoolCachedBlocks() const { return coordinator_.Host().NumHostCachedBlocks(); }
+    std::int32_t HostPoolFreeBlocks() const { return coordinator_.Host().NumFreeLcmBlocks(); }
     // Host pool parents, empty or not (0 without a Host pool).
     std::int32_t HostPoolTotalBlocks() const { return host_pool_.NumLcmBlocks(); }
-    std::int32_t HostPoolPinnedBlocks() const { return coordinator_.NumPinnedHostCachedBlocks(); }
+    std::int32_t HostPoolPinnedBlocks() const { return coordinator_.Host().NumPinnedHostCachedBlocks(); }
     HostCacheStats GetHostCacheStats() const;
     std::size_t DemoteSession(const std::string& id, bool ended) { return coordinator_.DemoteSession(id, ended); }
     std::size_t DemoteCacheGroups(const std::vector<std::string>& ids, bool ended) {
@@ -267,7 +268,7 @@ public:
     // storage operations, never a mutable shadow of remote existence.
     std::vector<std::string> PrefixHashesForTokens(const std::vector<std::int32_t>& tokens) const;
     std::vector<CacheKey> ExpandPrefixKeys(std::span<const std::string> content_hashes) const {
-        return coordinator_.ExpandPrefixKeys(content_hashes);
+        return coordinator_.Store().ExpandPrefixKeys(content_hashes);
     }
 
 private:
@@ -275,7 +276,7 @@ private:
     bool clearCache(bool include_host);
     bool cacheIsClearable(bool include_host) const;
     struct AdmissionMatch {
-        CacheCoordinator::PrefixProbe probe;
+        PrefixProbe probe;
         bool waits_for_eviction_store{false};
         std::string prefix_diagnostic;
         // Views of the request's immutable prompt hashes. Only an admitted
@@ -286,12 +287,13 @@ private:
     };
 
     // What the per-request admission layer reports back to the role
-    // grammars. Together with the output ExecutionPlan (where admit()
-    // records fresh pages to zero) this is ALL that layer sees of a
+    // grammars. Together with the output ExecutionPlan (where
+    // recordAdmittedPages records fresh pages to zero) this is ALL that layer sees of a
     // plan-building pass: batch composition lives in PlanBuild, which the
     // grammars alone hold, so nothing below them can bypass pushOperation.
     struct AdmissionFeedback {
-        // Set by admit() when the last admission failed for capacity (as
+        // Set by the admission paths (recordAdmission, admitStep, the first
+        // chunk's and a restore's) when the last admission failed for capacity (as
         // opposed to a chunk that aligned to zero tokens). The phases clear
         // it before each attempt.
         bool admission_failed{false};
@@ -365,26 +367,26 @@ private:
     // copy from a block an earlier copy of the plan fills reading that copy's
     // source. Asserts that each copy destination is written once and never
     // zeroed in the plan.
-    void recordAdmittedPages(ExecutionPlan& plan, const CacheCoordinator::AdmissionResult& result);
-    // copy_in_blocks and copy_in_point as for CacheCoordinator::Admit.
-    std::optional<CacheCoordinator::AdmissionResult> admit(ExecutionPlan& plan, AdmissionFeedback& feedback,
-                                                           CacheCoordinator::PrefixProbe&& prefix,
-                                                           std::span<const GroupDemand> demands,
-                                                           const RequestProgress& progress,
-                                                           std::span<std::vector<CacheBlockRef>> copy_in_blocks,
-                                                           std::optional<CacheCoordinator::CopyInPoint> copy_in_point,
-                                                           std::optional<std::uint64_t> request_access_epoch,
-                                                           bool evict_blocks_past_segments);
+    void recordAdmittedPages(ExecutionPlan& plan, const AdmissionResult& result);
+    // Records a coordinator admission's pages on the plan, or notes the
+    // failure in `feedback`; returns the admission.
+    std::optional<AdmissionResult> recordAdmission(ExecutionPlan& plan, AdmissionFeedback& feedback,
+                                                   std::optional<AdmissionResult> admission);
     // Admits a scheduled request's next step against its live cache progress,
-    // which the caller has advanced for the step (`staged`, committed by the
-    // caller on success, or by publishCompletedPagesFirst when a lone
-    // request's completed pages are published ahead of a step that still
-    // does not fit). The publication of a prompt end spends the copy-in
-    // blocks the request holds.
-    std::optional<CacheCoordinator::AdmissionResult> admitWithKvEventTracking(
-        ExecutionPlan& plan, AdmissionFeedback& feedback, Request& request, StagedCacheProgress& staged,
-        std::span<const GroupDemand> demands, const RequestProgress& progress,
-        std::optional<CacheCoordinator::CopyInPoint> copy_in_point, bool evict_blocks_past_segments);
+    // which the caller has advanced for the step (and commits on success).
+    // The publication of a prompt end spends the copy-in
+    // blocks the request holds. A retained input checkpoint is let go when
+    // the step does not fit with it. An attempt the step gives up for a
+    // smaller one calls this directly; the step's own admission is admitStep.
+    std::optional<AdmissionResult> admitWithKvEventTracking(ExecutionPlan& plan, AdmissionFeedback& feedback,
+                                                            Request& request, std::span<const GroupDemand> demands,
+                                                            const RequestProgress& progress,
+                                                            std::optional<CopyInPoint> copy_in_point);
+    // A later chunk's or a decode's admission: admitWithKvEventTracking, and
+    // when that fails, lone_requests_.AdmitStep.
+    std::optional<AdmissionResult> admitStep(ExecutionPlan& plan, AdmissionFeedback& feedback, Request& request,
+                                             StagedCacheProgress& staged, std::span<const GroupDemand> demands,
+                                             const RequestProgress& progress, std::optional<CopyInPoint> copy_in_point);
     // Registers the descriptors of full pages [first_page, past_end_page).
     void registerKvEventPrefixPages(Request& request, std::span<const std::string> prefix_hashes,
                                     std::int32_t first_page, std::int32_t past_end_page);
@@ -437,8 +439,7 @@ private:
     // admissions reserve copy-in blocks exactly for a prompt end the first
     // decode publishes.
     bool firstDecodePublishesPromptEnd(const Request& request, std::int32_t resume_tokens) const;
-    std::optional<CacheCoordinator::CopyInPoint> promptEndCopyInPoint(const Request& request,
-                                                                      std::int32_t resume_tokens) const;
+    std::optional<CopyInPoint> promptEndCopyInPoint(const Request& request, std::int32_t resume_tokens) const;
     // Superseded checkpoint demotion, at a finish that published an in-forward
     // State checkpoint C past the page boundary R it resumed from, before C
     // is recorded: when R is itself a recorded in-forward checkpoint, demotes
@@ -614,7 +615,7 @@ private:
     // (its operation the last pushed), each only if its first chunk completes
     // it on the budget left; stops at the first capacity failure, and admits
     // none once the plan is a lone-request compaction's (the holder's own;
-    // last_lone_compaction_plan_). Nothing it admits holds the head of line,
+    // LoneRequestRecovery::ActedInPlan). Nothing it admits holds the head of line,
     // and the holder's operation then moves behind theirs: the completing
     // prefills run first, the incomplete one last. candidates supplies the
     // round's FIFO order. With enable_short_prefill_first, a successful
@@ -663,21 +664,6 @@ private:
     // The first half of a retraction: publishes the pages the victim completed
     // since its last admission (see forward.cpp).
     void publishCompletedPrefix(Request& victim);
-    // Lone-request compaction for the admission `retry` repeats, which just
-    // failed in its last variant: gathers the request's blocks, records the
-    // moves on the plan, stamps the plan as the compaction's and retries
-    // once (see forward.cpp).
-    template <typename Retry>
-    std::optional<CacheCoordinator::AdmissionResult> compactLoneRequestAndRetry(
-        ExecutionPlan& plan, const Request& request, CacheCoordinator::PrefixProbe&& prefix,
-        std::span<const GroupDemand> demands, const RequestProgress& progress,
-        std::span<std::vector<CacheBlockRef>> copy_in_blocks,
-        std::optional<CacheCoordinator::CopyInPoint> copy_in_point, const Retry& retry);
-    // Publishes a lone request's completed pages ahead of a step that does
-    // not fit, so the next plan's compaction can move them, and commits
-    // `staged` (see forward.cpp).
-    void publishCompletedPagesFirst(ExecutionPlan& plan, Request& request, StagedCacheProgress& staged,
-                                    const RequestProgress& progress);
     // Why the host budgets cannot hold the request's image right now
     // (projected, nothing mutated), unset when they can (see forward.cpp).
     std::optional<ImageShortfall> imageShortfall(const Request& request) const;
@@ -753,11 +739,6 @@ private:
     std::int32_t max_single_request_tokens_{0};
     // Accounting only (schedulePrefillFirstChunk); no decision reads it.
     PrefixHitStats prefix_hit_stats_;
-    // The plan the last lone-request compaction ran in, or published a
-    // request's completed pages first for the next plan's: at most one per
-    // plan, whichever admission of the build asks (plan_calls_ stamps it),
-    // and never a plan the no-progress abort takes.
-    std::int64_t last_lone_compaction_plan_{-1};
 
     // Stamped onto each retraction; the readmission order lives on the
     // Retracted states themselves (rankedReadmissions).
@@ -785,6 +766,9 @@ private:
     // batches. The unique_ptr keeps each Request's address stable across
     // vector reshuffles, so the id index below never dangles.
     std::vector<std::unique_ptr<Request>> requests_;
+    // What a request no other one holds pages beside does when its admission
+    // or restore fails (docs/design/scheduler.md §1.4).
+    LoneRequestRecovery lone_requests_{coordinator_, tier_transfers_, requests_, config_, cache_group_ids_};
     std::unordered_map<std::string, Request*> requests_by_id_;
     // What the prefix index cannot tell us about a boundary: the token
     // descriptor the external event carries, and whether that event is

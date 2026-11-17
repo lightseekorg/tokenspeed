@@ -307,31 +307,31 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
 
     // Host L2 counters (Scheduler.host_cache_stats), read-only. Every by-group
     // list is indexed like SchedulerConfig.cache_groups.
-    nb::class_<tokenspeed::CacheCoordinator::HostEvictionCounts>(m, "HostEvictionCounts")
-        .def_ro("blocks", &tokenspeed::CacheCoordinator::HostEvictionCounts::blocks)
-        .def_ro("device_resident", &tokenspeed::CacheCoordinator::HostEvictionCounts::device_resident);
-    nb::class_<tokenspeed::CacheCoordinator::HostEvictionStats>(m, "HostEvictionStats")
-        .def_ro("lru", &tokenspeed::CacheCoordinator::HostEvictionStats::lru)
-        .def_ro("duplicate", &tokenspeed::CacheCoordinator::HostEvictionStats::duplicate)
-        .def_ro("superseded", &tokenspeed::CacheCoordinator::HostEvictionStats::superseded)
-        .def_ro("dead_entry", &tokenspeed::CacheCoordinator::HostEvictionStats::dead_entry)
-        .def_ro("tail_cap", &tokenspeed::CacheCoordinator::HostEvictionStats::tail_cap)
-        .def_ro("flush", &tokenspeed::CacheCoordinator::HostEvictionStats::flush)
-        .def_ro("duplicate_kv", &tokenspeed::CacheCoordinator::HostEvictionStats::duplicate_kv);
-    nb::class_<tokenspeed::CacheCoordinator::DeviceEvictionCounts>(m, "DeviceEvictionCounts")
-        .def_ro("blocks", &tokenspeed::CacheCoordinator::DeviceEvictionCounts::blocks)
-        .def_ro("host_resident", &tokenspeed::CacheCoordinator::DeviceEvictionCounts::host_resident);
-    nb::class_<tokenspeed::CacheCoordinator::DeviceEvictionStats>(m, "DeviceEvictionStats")
-        .def_ro("admission", &tokenspeed::CacheCoordinator::DeviceEvictionStats::admission)
-        .def_ro("request_reclaim", &tokenspeed::CacheCoordinator::DeviceEvictionStats::request_reclaim)
+    nb::class_<tokenspeed::CacheEvictor::HostEvictionCounts>(m, "HostEvictionCounts")
+        .def_ro("blocks", &tokenspeed::CacheEvictor::HostEvictionCounts::blocks)
+        .def_ro("device_resident", &tokenspeed::CacheEvictor::HostEvictionCounts::device_resident);
+    nb::class_<tokenspeed::CacheEvictor::HostEvictionStats>(m, "HostEvictionStats")
+        .def_ro("lru", &tokenspeed::CacheEvictor::HostEvictionStats::lru)
+        .def_ro("duplicate", &tokenspeed::CacheEvictor::HostEvictionStats::duplicate)
+        .def_ro("superseded", &tokenspeed::CacheEvictor::HostEvictionStats::superseded)
+        .def_ro("dead_entry", &tokenspeed::CacheEvictor::HostEvictionStats::dead_entry)
+        .def_ro("tail_cap", &tokenspeed::CacheEvictor::HostEvictionStats::tail_cap)
+        .def_ro("flush", &tokenspeed::CacheEvictor::HostEvictionStats::flush)
+        .def_ro("duplicate_kv", &tokenspeed::CacheEvictor::HostEvictionStats::duplicate_kv);
+    nb::class_<tokenspeed::CacheEvictor::DeviceEvictionCounts>(m, "DeviceEvictionCounts")
+        .def_ro("blocks", &tokenspeed::CacheEvictor::DeviceEvictionCounts::blocks)
+        .def_ro("host_resident", &tokenspeed::CacheEvictor::DeviceEvictionCounts::host_resident);
+    nb::class_<tokenspeed::CacheEvictor::DeviceEvictionStats>(m, "DeviceEvictionStats")
+        .def_ro("admission", &tokenspeed::CacheEvictor::DeviceEvictionStats::admission)
+        .def_ro("request_reclaim", &tokenspeed::CacheEvictor::DeviceEvictionStats::request_reclaim)
         .def_ro("request_reclaim_for_write_back",
-                &tokenspeed::CacheCoordinator::DeviceEvictionStats::request_reclaim_for_write_back)
-        .def_ro("stranded_suffix", &tokenspeed::CacheCoordinator::DeviceEvictionStats::stranded_suffix)
-        .def_ro("restore", &tokenspeed::CacheCoordinator::DeviceEvictionStats::restore)
-        .def_ro("flush", &tokenspeed::CacheCoordinator::DeviceEvictionStats::flush)
-        .def_ro("tail_cap", &tokenspeed::CacheCoordinator::DeviceEvictionStats::tail_cap)
-        .def_ro("dead_entry_collection", &tokenspeed::CacheCoordinator::DeviceEvictionStats::dead_entry_collection)
-        .def_ro("compaction", &tokenspeed::CacheCoordinator::DeviceEvictionStats::compaction);
+                &tokenspeed::CacheEvictor::DeviceEvictionStats::request_reclaim_for_write_back)
+        .def_ro("stranded_suffix", &tokenspeed::CacheEvictor::DeviceEvictionStats::stranded_suffix)
+        .def_ro("restore", &tokenspeed::CacheEvictor::DeviceEvictionStats::restore)
+        .def_ro("flush", &tokenspeed::CacheEvictor::DeviceEvictionStats::flush)
+        .def_ro("tail_cap", &tokenspeed::CacheEvictor::DeviceEvictionStats::tail_cap)
+        .def_ro("dead_entry_collection", &tokenspeed::CacheEvictor::DeviceEvictionStats::dead_entry_collection)
+        .def_ro("compaction", &tokenspeed::CacheEvictor::DeviceEvictionStats::compaction);
     nb::class_<tokenspeed::TierTransferManager::WriteBackStats>(m, "WriteBackStats")
         .def_ro("ops", &tokenspeed::TierTransferManager::WriteBackStats::ops)
         .def_ro("blocks", &tokenspeed::TierTransferManager::WriteBackStats::blocks)
