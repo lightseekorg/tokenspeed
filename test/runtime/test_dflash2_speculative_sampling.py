@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import os
 import sys
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -61,6 +62,9 @@ from tokenspeed.runtime.layers.logits_processor import LogitsProcessor  # noqa: 
 from tokenspeed.runtime.sampling.backends.base import (  # noqa: E402
     SamplingBackendConfig,
     SpeculativeSamplingPools,
+)
+from tokenspeed.runtime.sampling.backends.flashinfer import (  # noqa: E402
+    FlashInferSamplingBackend,
 )
 from tokenspeed.runtime.sampling.backends.triton import (  # noqa: E402
     TritonSamplingBackend,
@@ -251,9 +255,10 @@ def test_a_landed_or_readmitted_slot_takes_a_new_chain_after_the_reset():
     assert states.future_draft_q.pos[1].tolist() == [0, *lane[0].tolist()]
 
 
-def test_base_dflash_refuses_the_flag_at_bind():
-    # Base DFLASH (no candidate selector) proposes the argmax of every block
-    # row; only the loaded checkpoint tells it apart from DFlash2.
+def test_base_dflash_refuses_a_verifier_that_reads_no_dense_q():
+    # Base DFLASH (no candidate selector) records the dense q; the triton
+    # verifier reads only DFlash2's sparse q, so only the loaded checkpoint
+    # (hence the drafter) can tell this pairing is wrong.
     drafter = DFlash.__new__(DFlash)
     drafter.runtime_states = RuntimeStates(
         req_pool_size=POOL,
@@ -262,9 +267,27 @@ def test_base_dflash_refuses_the_flag_at_bind():
         output_length=N,
         device="cpu",
     )
-    with pytest.raises(ValueError, match="needs a DFlash2 draft"):
+    with pytest.raises(ValueError, match="records a dense draft q"):
         drafter.bind_sampling_backend(_triton_backend(enable_speculative_sampling=True))
+    # Off, nothing is checked.
     drafter.bind_sampling_backend(_triton_backend(enable_speculative_sampling=False))
+
+
+def test_dflash2_refuses_a_verifier_that_reads_no_sparse_q():
+    # FlashInfer reads the dense rows only; DFlash2 records the sparse q.
+    config = SamplingBackendConfig(
+        synthetic_acceptance_length=None,
+        enable_speculative_sampling=True,
+        sampling_stream="batch",
+        logprob_order="torch",
+        max_bs=MAX_BS,
+        max_draft_tokens_per_req=N,
+        max_req_pool_size=POOL,
+        vocab_size=VOCAB,
+        device="cpu",
+    )
+    with pytest.raises(ValueError, match="records a sparse draft q"):
+        _dflash2(_states()).bind_sampling_backend(FlashInferSamplingBackend(config))
 
 
 def _dflash2(states: RuntimeStates) -> DFlash2:
@@ -372,6 +395,8 @@ def test_dspark_keeps_the_dense_q_and_the_shared_sampler():
     executor = ModelExecutor.__new__(ModelExecutor)
     # No drafter keeps its draft head sharded, so q stays over whole rows.
     executor.drafter = None
+    # With no drafter to ask (a pipeline stage before the last), DFLASH keeps
+    # the old rule: it allocates no dense rows.
     for spec_algo, dense in (("DFLASH", False), ("DSPARK", True)):
         executor.runtime_states = RuntimeStates(
             req_pool_size=POOL,
@@ -383,6 +408,22 @@ def test_dspark_keeps_the_dense_q_and_the_shared_sampler():
         config = _executor_config(spec_algo)
         executor._init_draft_probs(config, N)
         assert (executor.runtime_states.draft_probs is not None) == dense
+
+    # With a drafter, the q it records decides: DFlash2 records the sparse q,
+    # base DFLASH the dense rows.
+    for drafter_cls, dense in ((DFlash2, False), (DFlash, True)):
+        executor.drafter = drafter_cls.__new__(drafter_cls)
+        executor.runtime_states = RuntimeStates(
+            req_pool_size=POOL,
+            input_vocab_size=VOCAB,
+            vocab_size=VOCAB,
+            output_length=N,
+            device="cpu",
+        )
+        executor._samples_from_vocab_shard = False
+        executor._init_draft_probs(_executor_config("DFLASH"), N)
+        assert (executor.runtime_states.draft_probs is not None) == dense
+    executor.drafter = None
 
     drafter = DSpark.__new__(DSpark)
     BaseDrafter.__init__(
@@ -409,6 +450,72 @@ def test_dspark_keeps_the_dense_q_and_the_shared_sampler():
     # record no q, so verify would reject every draft.
     assert isinstance(drafter.draft_sampler, DraftProposalSampler)
     assert not drafter.logits_processor.do_argmax
+
+
+class _RecordingSaver:
+    """A memory saver that records which named regions are open as tensors are
+    allocated; only the CPU-backed pool itself is stood in."""
+
+    def __init__(self):
+        self.open_regions: list[str] = []
+        self.seen: list[tuple[str, str]] = []
+
+    @contextmanager
+    def named_region(self, name):
+        self.open_regions.append(name)
+        try:
+            yield
+        finally:
+            self.open_regions.pop()
+
+    def note(self, what):
+        self.seen.append((what, self.open_regions[-1] if self.open_regions else ""))
+
+
+@pytest.mark.parametrize("drafter_cls", [DFlash, DFlash2])
+def test_sampled_drafting_allocates_and_binds_inside_the_runtime_states_region(
+    monkeypatch, drafter_cls
+):
+    # draft_probs (dense q) and the drafter's sampling scratch are read across
+    # rounds and by captured graphs, so they must join the CPU-backed region a
+    # weights release unmaps and a resume restores.
+    saver = _RecordingSaver()
+    executor = ModelExecutor.__new__(ModelExecutor)
+    executor.memory_saver_adapter = saver
+    executor.runtime_states = RuntimeStates(
+        req_pool_size=POOL,
+        input_vocab_size=VOCAB,
+        vocab_size=VOCAB,
+        output_length=N,
+        device="cpu",
+    )
+    executor._samples_from_vocab_shard = False
+    drafter = drafter_cls.__new__(drafter_cls)
+    bound = []
+    monkeypatch.setattr(
+        drafter_cls,
+        "bind_sampling_backend",
+        lambda self, backend: (saver.note("bind"), bound.append(backend)),
+    )
+    executor.drafter = drafter
+    executor.sampling_backend = object()
+    real_init = RuntimeStates.init_draft_probs
+
+    def init_draft_probs(self, **kwargs):
+        saver.note("draft_probs")
+        return real_init(self, **kwargs)
+
+    monkeypatch.setattr(RuntimeStates, "init_draft_probs", init_draft_probs)
+
+    executor._init_sampled_drafting(_executor_config("DFLASH"), N)
+
+    assert bound == [executor.sampling_backend]
+    # Base DFLASH records the dense rows; DFlash2 records a sparse q instead.
+    expected = [("bind", "runtime_states")]
+    if drafter_cls is DFlash:
+        expected.insert(0, ("draft_probs", "runtime_states"))
+    assert saver.seen == expected
+    assert saver.open_regions == []
 
 
 if __name__ == "__main__":
