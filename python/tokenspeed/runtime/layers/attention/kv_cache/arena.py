@@ -34,8 +34,8 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     CacheRuntimeContract,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
-    FLAT_KV_PLANE,
     CacheMemoryPlan,
+    is_flat_kv_plane,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupSpec,
@@ -332,7 +332,7 @@ class CacheArena:
         ):
             token_rows = spec.rows_per_page
         if (
-            field.plane_id == FLAT_KV_PLANE
+            is_flat_kv_plane(field.plane_id)
             and spec.attn_kind == "full_history"
             and field.shape[0] == spec.rows_per_page
         ):

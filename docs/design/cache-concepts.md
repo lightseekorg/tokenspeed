@@ -2137,19 +2137,29 @@ make one of the engine's pipeline stages hold more bytes: a stage allocates
 every plane its layers' fields touch, so a field on a plane that no other layer
 of its stage uses costs that stage the whole plane.
 
-By default, all Qwen4-Exp target and draft cache fields share one
-`flatkv_atoms` plane (PP=1, uniform per-view K/V heads, no MXFP8). All GDN layers
-form one state group, with each layer's SSM and convolution fields together.
+By default, Qwen4-Exp cache fields share one FlatKV plane per pipeline stage
+(uniform per-view K/V heads, no MXFP8). The complete cache plan gives each
+stage a plane containing only its fields, including independent draft fields
+on the last stage. All stages use the same group packing, block IDs and
+agreed parent count. The packer computes field offsets, page strides and
+plane size from the fields on each stage. Capacity uses the local plane size
+and the int32 address limits of all stages.
+All GDN layers form one state group, with each layer's SSM and convolution
+fields together.
 Qwen3.8-Flash-Next has five groups: full attention, GDN state, PLE, compressed
 QSA and recent QSA. `--no-qwen4-exp-flat-kv` selects the ordinary layout,
 which retains its plane-based GDN grouping.
-The recipe sizes the shared parent to fit the largest group while tightly
-packing full-attention K/V. Each other group packs as many pages as its
-payload and stride alignment permit. A parent still belongs to one group at
-a time; sharing the plane does not mix their allocation or prefix matching.
+The recipe derives packing from the fields on each plane. On each stage
+with K/V, the largest local block rounded to a whole aligned K/V block
+bounds the K/V count. These stages use the smallest of those counts.
+The packer sizes each plane for that count and a block of each other
+resident group. Each side group then packs as many blocks as fit on all
+of its owning stages at those plane sizes. A group confined to one stage,
+such as PLE in Qwen3.8-Flash-Next PP2, takes its count from that plane
+alone. A parent still belongs to one group at a time.
 
-The `flatkv_atoms` plane id explicitly selects contiguous atom views for
-full-history fields: both K/V and compressed QSA. Native byte-page layouts
+The `flatkv_atoms` plane ID (with a stage suffix under PP) selects
+contiguous atom views for K/V and compressed QSA. Native byte-page layouts
 such as DeepSeek V4.1 keep their `flatkv` plane and explicit page strides.
 State, PLE and recent QSA retain raw
 scheduler IDs and explicit page strides. Other padded K/V fields, including
