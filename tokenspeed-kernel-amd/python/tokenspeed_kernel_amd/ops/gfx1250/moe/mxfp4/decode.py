@@ -233,6 +233,7 @@ def _create_x_descriptor(
     stride_x_scale_k,
     GatherIndx,
     start_m,
+    x_rows,
 ):
     SCALE_BLOCK: gl.constexpr = cfg.SCALE_BLOCK
     if cfg.USE_GATHER:
@@ -245,7 +246,7 @@ def _create_x_descriptor(
         ).to(cfg.index_type)
         x_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
             base=x_ptr,
-            shape=(M, K // cfg.DIV_FACTOR_X),
+            shape=(x_rows, K // cfg.DIV_FACTOR_X),
             strides=(stride_xm, stride_xk),
             block_shape=(cfg.BLOCK_M, cfg.BLOCK_K // cfg.DIV_FACTOR_X),
             layout=cfg.shared_layout_x,
@@ -253,7 +254,7 @@ def _create_x_descriptor(
         if cfg.WITH_X_MX_SCALE:
             x_scale_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
                 base=x_scale_ptr,
-                shape=(M, K // SCALE_BLOCK),
+                shape=(x_rows, K // SCALE_BLOCK),
                 strides=(stride_x_scale_m, stride_x_scale_k),
                 block_shape=(cfg.BLOCK_M, cfg.BLOCK_K // SCALE_BLOCK),
                 layout=cfg.shared_layout_x_scale,
@@ -630,6 +631,7 @@ def _matmul_decode(
     stride_x_mx_m,
     stride_x_mx_k,
     M,
+    XSpareRow,
     XGlobalScale,
     WriteBackIndx,
     writeback_size,
@@ -857,7 +859,23 @@ def _matmul_decode(
         stride_x_mx_k,
         GatherIndx,
         start_m,
+        # The activation rows a gather may name: the routed rows, or past them
+        # the spare rows below.
+        gl.maximum(M, XSpareRow + BLOCK_M),
     )
+    if cfg.USE_GATHER:
+        # A block has BLOCK_M row slots and usually a row or two; the other
+        # slots would gather whatever rows the neighbouring routes use, which
+        # at a few requests is the same row many times over, and a gather that
+        # repeats a row is slow. With spare rows after the activations, each
+        # unused slot gathers its own.
+        SLOT_LAYOUT: gl.constexpr = _tdm_index_layout(BLOCK_M, cfg.NUM_WARPS)
+        slot = gl.arange(0, BLOCK_M, SLOT_LAYOUT)
+        gathered_m = gl.where(
+            (off_m + slot < eM) | (XSpareRow < 0),
+            gathered_m,
+            (XSpareRow + slot - 1).to(gathered_m.dtype),
+        )
     x_buffer, x_scale_buffer = _allocate_x_buffers(cfg, x_desc)
     for i in gl.static_range(NUM_BUFFERS - 1):
         if N_TILES > 1:

@@ -488,6 +488,35 @@ def test_kimi_k3_tp_situ_block_indexed_decode_matches_gfx1250(
     torch.testing.assert_close(by_block, by_expert, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("num_tokens", [1, 4, 64])
+def test_kimi_k3_tp_situ_spare_gather_rows_match_gfx1250(
+    monkeypatch: pytest.MonkeyPatch, num_tokens: int
+) -> None:
+    module, _, hidden_states, topk_weights, topk_ids, router_logits = _make_case(
+        num_tokens
+    )
+    plan = _make_plan()
+    kernel_moe_process_weights(plan, module)
+
+    def apply() -> torch.Tensor:
+        return kernel_moe_apply(
+            plan,
+            hidden_states,
+            module,
+            router_logits,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+        ).clone()
+
+    monkeypatch.setattr(fused, "_DECODE_GATHER_SPARE_ROWS", 0)
+    neighbour_rows = apply()
+    monkeypatch.setattr(fused, "_DECODE_GATHER_SPARE_ROWS", 32)
+    spare_rows = apply()
+    torch.cuda.synchronize()
+    assert torch.count_nonzero(neighbour_rows).item() > 0
+    torch.testing.assert_close(spare_rows, neighbour_rows, atol=0, rtol=0)
+
+
 def test_gfx1250_small_route_block_rows_follow_schedule() -> None:
     generator = torch.Generator(device="cuda").manual_seed(41)
     num_tokens, num_experts, top_k = 24, 64, 8

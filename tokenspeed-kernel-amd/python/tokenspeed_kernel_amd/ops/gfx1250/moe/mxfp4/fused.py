@@ -770,6 +770,7 @@ def _matmul(
     K,
     KW,
     GatherIndx,
+    XSpareRow,
     X,
     stride_x_z,
     stride_x_m,
@@ -1394,6 +1395,7 @@ def matmul(
     partial_tdm: bool,
     n_tiles: int = 1,
     block_indexed: bool = False,
+    x_spare_row: int = -1,
 ):
     """Run the gfx1250 Gluon MoE matmul kernel.
 
@@ -1643,6 +1645,7 @@ def matmul(
         B=bias,
         stride_b_e=bias_stride,
         M=M,
+        XSpareRow=x_spare_row,
         N=N,
         K=K,
         KW=K_W,
@@ -3211,6 +3214,12 @@ def _uses_quantizing_small_route(topk_ids: torch.Tensor, num_experts: int) -> bo
     )
 
 
+def _gather_spare_row(x: torch.Tensor, hidden_states: torch.Tensor) -> int:
+    """First spare row of a quantized MoE input, or -1 when it has none."""
+    tokens = int(hidden_states.shape[0])
+    return tokens if int(x.shape[0]) > tokens else -1
+
+
 def _uses_staged_route(topk_ids: torch.Tensor, num_experts: int) -> bool:
     return (
         topk_ids.shape[0] > 16
@@ -3226,6 +3235,7 @@ def _precomputed_topk_route_mxfp4(
     hidden_states: torch.Tensor,
     *,
     block_indexed: bool,
+    spare_rows: int,
 ):
     """Route and quantize the MoE input to MXFP4.
 
@@ -3250,10 +3260,15 @@ def _precomputed_topk_route_mxfp4(
         else:
             route_fn = None
         if route_fn is not None:
+            # ``spare_rows`` extra rows follow the quantized ones, unwritten.
             packed = torch.empty(
-                (tokens, k // 2), dtype=torch.uint8, device=hidden_states.device
+                (tokens + spare_rows, k // 2),
+                dtype=torch.uint8,
+                device=hidden_states.device,
             )
-            scale = empty_mxfp4_activation_scale(tokens, k, hidden_states.device)
+            scale = empty_mxfp4_activation_scale(
+                tokens + spare_rows, k, hidden_states.device
+            )
             route = route_fn(
                 topk_weights,
                 topk_ids,
@@ -3360,6 +3375,15 @@ _PREFILL_MXFP4_ACTIVATION_DOWN_TILES = {
 # way on Qwen3.8 Flash TP2, while resident launches of all four measured 1.2
 # to 1.8% slower with it. The down projection measured faster ungrouped.
 _DECODE_QUEUED_GATE_UP_GROUP_M = 8
+
+# Spare activation rows a decode gate/up launch gathers in the row slots its
+# blocks do not use, one fewer than the widest decode row tile needs. A gather
+# that repeats a row is slow, and unused slots otherwise name the rows of the
+# neighbouring routes: a single request names its one row in every slot. The
+# rows are never written and their products are never stored. Kimi K3 TP8
+# measured 15.8 -> 15.0 us at one request, 19.1 -> 17.9 us at four, 26.2 ->
+# 25.3 us at eight and 120.9 -> 119.2 us at 256.
+_DECODE_GATHER_SPARE_ROWS = 32
 
 # Gate/up programs per CU up to which a decode launch reads its row ranges by
 # block index. On Kimi K3 TP8 that measured 16.5 -> 16.2 us at two requests
@@ -3479,6 +3503,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
                 ).multi_processor_count
             )
 
+    spare_rows = _DECODE_GATHER_SPARE_ROWS if decode else 0
     if activation_dtype == "mxfp4":
         (
             ragged_metadata,
@@ -3493,6 +3518,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
             num_experts,
             hidden_states,
             block_indexed=block_indexed,
+            spare_rows=spare_rows,
         )
     else:
         x_fp8 = None
@@ -3507,7 +3533,11 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
             # The routing launch's spare programs cast the input as well. A
             # single token takes this route too: a separate cast is one more
             # launch (Kimi K3 TP8, one request: 16.6 -> 15.7 us).
-            x_fp8 = torch.empty_like(hidden_states, dtype=torch.float8_e4m3fn)
+            x_fp8 = torch.empty(
+                (tokens + spare_rows, int(hidden_states.shape[1])),
+                dtype=torch.float8_e4m3fn,
+                device=hidden_states.device,
+            )
             ragged_metadata, gather_indx, scatter_indx, _gate_scal = (
                 _precomputed_topk_route_small_m_gfx1250(
                     topk_weights,
@@ -3524,7 +3554,11 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         ):
             # Past the one-launch route the cast rides on the staged route's
             # last stage, as the MXFP4 quantization does.
-            x_fp8 = torch.empty_like(hidden_states, dtype=torch.float8_e4m3fn)
+            x_fp8 = torch.empty(
+                (tokens + spare_rows, int(hidden_states.shape[1])),
+                dtype=torch.float8_e4m3fn,
+                device=hidden_states.device,
+            )
             ragged_metadata, gather_indx, scatter_indx, _gate_scal = (
                 _precomputed_topk_route_large_m_gfx1250(
                     topk_weights,
@@ -3620,6 +3654,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
             fused_activation=fused_activation,
             scale_preshuffle=True,
             mxfp4_output=True,
+            x_spare_row=_gather_spare_row(x_mxfp4, hidden_states),
             **gate_up_tiles,
             **launch,
         )
@@ -3646,6 +3681,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
             out_dtype=torch.float8_e4m3fn,
             fused_activation=fused_activation,
             scale_preshuffle=True,
+            x_spare_row=_gather_spare_row(x_fp8, hidden_states),
             **gate_up_tiles,
             **launch,
         )
@@ -3725,6 +3761,7 @@ def gluon_mxfp_ragged_matmul(
         "partial_tdm",
         "n_tiles",
         "block_indexed",
+        "x_spare_row",
     }
     launch_kwargs = {k: extra_kwargs.pop(k) for k in list(extra_kwargs) if k in allowed}
     launch_kwargs.setdefault("partial_tdm", False)

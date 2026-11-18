@@ -1439,7 +1439,12 @@ def test_gfx1250_route_mxfp4_matches_route_then_quantize(num_tokens: int) -> Non
     topk_weights = topk_weights.contiguous()
 
     *route, packed, scale = gfx1250_fused._precomputed_topk_route_mxfp4(
-        topk_weights, topk_ids, num_experts, hidden_states, block_indexed=False
+        topk_weights,
+        topk_ids,
+        num_experts,
+        hidden_states,
+        block_indexed=False,
+        spare_rows=0,
     )
     expected_route = gfx1250_fused._precomputed_topk_route(
         topk_weights, topk_ids, num_experts, block_indexed=False
