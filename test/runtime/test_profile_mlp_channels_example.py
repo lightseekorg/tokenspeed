@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import subprocess
 import sys
 from argparse import Namespace
 from pathlib import Path
@@ -12,6 +14,62 @@ import pytest
 EXAMPLES = Path(__file__).resolve().parents[2] / "examples"
 sys.path.insert(0, str(EXAMPLES))
 import profile_mlp_channels as example  # noqa: E402
+
+
+def test_input_cases_and_hash_match_file_bytes(tmp_path) -> None:
+    path = tmp_path / "inputs.json"
+    contents = b'[{"id":"sample","token_ids":[1,2]}]\n'
+    path.write_bytes(contents)
+    cases, digest = example._read_inputs(path, max_tokens=2)
+    assert cases == (example.InputCase("sample", (1, 2)),)
+    assert digest == hashlib.sha256(contents).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        (str(EXAMPLES / "profile_mlp_channels.py"),),
+        ("-m", "examples.profile_mlp_channels"),
+    ],
+)
+def test_script_and_module_help(entry: tuple[str, ...]) -> None:
+    result = subprocess.run(
+        [sys.executable, *entry, "--help"],
+        cwd=EXAMPLES.parent,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "--mode {profile,watch}" in result.stdout
+
+
+@pytest.mark.parametrize(
+    (
+        "baseline",
+        "observed",
+        "top_k",
+        "finite",
+        "equal",
+        "max_difference",
+        "top_ids",
+    ),
+    [
+        ([1.0, 2.0], [1.0, 2.0], 1, True, True, 0.0, [1]),
+        ([1.0, 2.0], [2.0, 1.0], 10, True, False, 1.0, [0, 1]),
+        ([1.0, 2.0], [1.0, float("nan")], 1, False, False, None, []),
+    ],
+)
+def test_logit_comparison_preserves_finite_and_exact_equal_contract(
+    baseline, observed, top_k, finite, equal, max_difference, top_ids
+) -> None:
+    torch = pytest.importorskip("torch")
+    comparison = example._compare_logits(
+        torch.tensor(baseline), torch.tensor(observed), top_k=top_k
+    )
+    assert comparison["finite_logits"] is finite
+    assert comparison["watcher_on_off_exact_equal"] is equal
+    assert comparison["max_abs_logit_difference"] == max_difference
+    assert [row["token_id"] for row in comparison["next_token_top"]] == top_ids
 
 
 def test_explicit_ids_are_required_and_preserved() -> None:

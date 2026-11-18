@@ -163,19 +163,31 @@ def validate_watchlist_thresholds(
     )
 
 
-def _selected(channel: dict, thresholds: WatchlistThresholds) -> bool:
-    quiet = (
-        channel["active_fraction"] <= thresholds.max_active_fraction
-        and channel["mean_contribution"] <= thresholds.max_mean_contribution
-        and channel["max_contribution"] <= thresholds.max_observed_contribution
-    )
+def selection_reasons(
+    channel: dict,
+    *,
+    max_active_fraction: float,
+    max_mean_contribution: float,
+    max_observed_contribution: float,
+    min_down_norm_ratio: float,
+    max_outlier_active_fraction: float,
+) -> list[str]:
+    """Explain the same two eligibility gates used by the frozen watchlist."""
+    reasons = []
+    if (
+        channel["active_fraction"] <= max_active_fraction
+        and channel["mean_contribution"] <= max_mean_contribution
+        and channel["max_contribution"] <= max_observed_contribution
+    ):
+        reasons.append("quiet_activity")
     ratio = channel["down_norm_ratio_to_layer_median"]
-    norm_outlier = (
+    if (
         ratio is not None
-        and ratio >= thresholds.min_down_norm_ratio
-        and channel["active_fraction"] <= thresholds.max_outlier_active_fraction
-    )
-    return quiet or norm_outlier
+        and ratio >= min_down_norm_ratio
+        and channel["active_fraction"] <= max_outlier_active_fraction
+    ):
+        reasons.append("large_down_column_with_low_activity")
+    return reasons
 
 
 def select_watchlist(profile: dict, thresholds: WatchlistThresholds) -> dict:
@@ -187,7 +199,14 @@ def select_watchlist(profile: dict, thresholds: WatchlistThresholds) -> dict:
     entries = []
     for layer in profile["layers"]:
         for channel in layer["channels"]:
-            if not _selected(channel, thresholds):
+            if not selection_reasons(
+                channel,
+                max_active_fraction=thresholds.max_active_fraction,
+                max_mean_contribution=thresholds.max_mean_contribution,
+                max_observed_contribution=thresholds.max_observed_contribution,
+                min_down_norm_ratio=thresholds.min_down_norm_ratio,
+                max_outlier_active_fraction=thresholds.max_outlier_active_fraction,
+            ):
                 continue
             contribution_limit = max(
                 channel["max_contribution"] * thresholds.runtime_multiplier,

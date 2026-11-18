@@ -99,6 +99,10 @@ records contain exact token IDs; an optional rendered text field is checked
 against them without adding special tokens. It is a bounded integration
 example rather than a server integration or a tool policy.
 
+The example parses and hashes the same input bytes. It builds the ranking,
+watchlist, and preview from one exported profile, using the same channel
+selection rule for the watchlist and its displayed reasons.
+
 ```bash
 python examples/profile_mlp_channels.py \
   --mode profile --model /path/to/checkpoint --revision pinned-revision \
