@@ -48,8 +48,8 @@ garbage.
 
 from __future__ import annotations
 
+import dataclasses
 import random
-from dataclasses import dataclass, field
 
 import pytest
 
@@ -86,7 +86,7 @@ def _copied(group: str, value):
     return dict(value or {}) if group == HISTORY else value
 
 
-@dataclass
+@dataclasses.dataclass
 class _Request:
     prompt: list[int]
     # Every token it samples, drawn at submission.
@@ -105,11 +105,11 @@ class _Request:
         return (self.prompt + self.outputs)[:count]
 
 
-@dataclass
+@dataclasses.dataclass
 class _Transfer:
     """A PD transfer's pages, by group, and when it stops using them."""
 
-    pages: set[tuple[str, int]] = field(default_factory=set)
+    pages: set[tuple[str, int]] = dataclasses.field(default_factory=set)
     # The round after which its readers or writers stopped; None while the
     # transfer runs.
     stops_after: int | None = None
