@@ -4666,7 +4666,7 @@ class ServerArgs:
         parser.add_argument(
             "--enable-cudagraph-gc",
             action="store_true",
-            help="Enable garbage collection during CUDA graph capture. If disabled (default), GC is frozen during every CUDA graph capture (decode, prefill and drafter graphs) to speed up the process.",
+            help="Enable garbage collection during CUDA graph capture. If disabled (default), GC is frozen during capture to speed up the process.",
         )
         parser.add_argument(
             "--disable-nccl-nvls",

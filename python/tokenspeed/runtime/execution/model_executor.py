@@ -1101,8 +1101,11 @@ class ModelExecutor:
         captures every graph.
         """
         workspace_pool(self.device).freeze()
+        # Enforce-eager boots capture nothing and skip freeze_gc's collections.
+        if self.forward_step.disable and self.prefill_graph.disable:
+            return
 
-        # One frozen heap for every capture: each capture collects garbage first.
+        # Freeze once for all captures; prefill and drafter captures collect on entry.
         with freeze_gc(self.config.enable_cudagraph_gc):
             if not self.forward_step.disable:
                 self.forward_step.capture(entries=entries, observer=observer)

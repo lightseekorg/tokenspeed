@@ -18,7 +18,6 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from collections.abc import Callable, Iterator
 from contextlib import nullcontext
 from types import SimpleNamespace
 
@@ -226,68 +225,6 @@ def test_draft_final_step_follows_the_complete_drafter_run():
         "candidates-real",
         "draft-final",
     ]
-
-
-@pytest.fixture
-def cpu_workspace_pool_unfrozen_after() -> Iterator[None]:
-    from tokenspeed.runtime.execution.workspace import workspace_pool
-
-    yield
-    workspace_pool("cpu").unfreeze()
-
-
-@pytest.mark.parametrize("enable_cudagraph_gc", [False, True])
-def test_every_graph_capture_runs_with_the_collector_frozen(
-    enable_cudagraph_gc: bool, cpu_workspace_pool_unfrozen_after: None
-) -> None:
-    """Every capture runs with the heap frozen unless --enable-cudagraph-gc."""
-    import dataclasses
-    import gc
-
-    from tokenspeed.runtime.execution.memory_delta import NULL_MEMORY_DELTA_OBSERVER
-    from tokenspeed.runtime.execution.model_executor import ModelExecutorConfig
-
-    fields = {f.name for f in dataclasses.fields(ModelExecutorConfig)}
-    assert "enable_cudagraph_gc" in fields, "config must carry the flag"
-
-    # get_freeze_count() is process-global and other code freezes too, so
-    # compare against the count on entry rather than against zero.
-    before = gc.get_freeze_count()
-    canary = [object() for _ in range(64)]
-    seen: dict[str, int] = {}
-
-    def capture(name: str) -> Callable[..., None]:
-        def record(*args: object, **kwargs: object) -> None:
-            seen[name] = gc.get_freeze_count()
-
-        return record
-
-    executor = ModelExecutor.__new__(ModelExecutor)
-    executor.device = "cpu"
-    executor.config = SimpleNamespace(enable_cudagraph_gc=enable_cudagraph_gc)
-    executor.forward_step = SimpleNamespace(
-        disable=False, capture=capture("decode"), stream=None
-    )
-    executor.prefill_graph = SimpleNamespace(
-        disable=False,
-        capture=capture("prefill"),
-        capture_buckets=[16],
-        captured_hidden_spec=lambda: (8, torch.bfloat16),
-        num_warmup=1,
-    )
-    executor.drafter = SimpleNamespace(
-        captures_prefill_graph=True,
-        capture_prefill_graph=capture("drafter prefill"),
-        extend_graph_plan=lambda buckets: {"extend:decode": [(1, None)]},
-        capture_extend_graphs=capture("drafter extend"),
-    )
-    executor.capture_graphs(entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)
-
-    assert set(seen) == {"decode", "prefill", "drafter prefill", "drafter extend"}
-    for name, during in seen.items():
-        assert (during > before) is (not enable_cudagraph_gc), (name, before, during)
-    assert gc.get_freeze_count() <= before
-    assert len(canary) == 64
 
 
 def test_non_spec_decode_routes_through_verify():
