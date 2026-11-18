@@ -232,7 +232,7 @@ def test_the_drafter_proposes_the_same_block_either_way(rows) -> None:
     block = torch.randint(
         0, 2048, (rows, drafter.spec_num_tokens - 1), generator=gen, device="cuda"
     ).to(torch.int32)
-    block_logits = drafter._block_base_logits(hidden)
+    block_logits = drafter._block_base_logits(hidden, full_vocab=False)
     assert drafter._fused_walk_fits(block_logits)
 
     blocks = {}
