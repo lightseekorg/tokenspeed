@@ -95,9 +95,11 @@ def test_single_rank_verify_has_per_candidate_causal_metadata(batch, width):
     backend.spec_num_tokens = width
     backend.step_counter = None
     backend.kvp_group = (0,)
+    backend._kvp_degree = 1
     backend._ascend_placement = None
     backend._fused_decode = None
     backend._indexer_spec = SimpleNamespace(
+        attn_tp_size=1,
         index_head_dim=128,
         index_topk=2048,
         kv_cache_dim=576,
