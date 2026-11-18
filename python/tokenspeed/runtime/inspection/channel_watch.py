@@ -98,6 +98,137 @@ class ChannelWatchEvent:
     contribution_limit: float
 
 
+def _validate_execution_model(
+    model: Qwen3ForCausalLM,
+    *,
+    execution: Literal["eager"],
+    speculative: bool,
+    monokernel: bool,
+) -> None:
+    if execution != "eager" or speculative or monokernel:
+        raise ValueError(
+            "Channel observation requires eager, non-speculative, "
+            "non-monokernel execution"
+        )
+    if type(model) is not Qwen3ForCausalLM:
+        raise ValueError("Channel observation supports ordinary dense Qwen3 only")
+    if model.mapping.world_size != 1 or model.mapping.pp_size != 1:
+        raise ValueError("Channel observation requires TP=PP=DP=1")
+    if model.quant_config is not None or model._weight_update_active:
+        raise ValueError("Channel observation requires loaded, unquantized weights")
+    if model.training:
+        raise ValueError("Channel observation requires evaluation mode")
+
+
+def _watchlist_entries(
+    watchlist: Mapping[str, object], model_identity: str
+) -> list[object]:
+    if type(model_identity) is not str or not model_identity.strip():
+        raise ValueError("model_identity must be a nonempty caller-supplied string")
+    if not isinstance(watchlist, Mapping) or set(watchlist) != {
+        "schema",
+        "model_identity",
+        "entries",
+    }:
+        raise ValueError("Expected a channel-watchlist-v1 artifact")
+    if watchlist["schema"] != "channel-watchlist-v1":
+        raise ValueError("Unsupported channel watchlist schema")
+    if watchlist["model_identity"] != model_identity:
+        raise ValueError(
+            "Watchlist model identity does not match the loaded model identity"
+        )
+    entries = watchlist["entries"]
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("Watchlist must contain at least one channel entry")
+    return entries
+
+
+def _supported_layers_and_device(
+    model: Qwen3ForCausalLM,
+) -> tuple[Sequence[nn.Module], torch.device]:
+    layers = model.model.layers
+    if not layers or len(layers) != model.config.num_hidden_layers:
+        raise ValueError("Channel observation requires all local Qwen3 layers")
+    devices = {parameter.device for parameter in model.parameters()}
+    if len(devices) != 1:
+        raise ValueError("Channel observation requires all model weights on one device")
+    device = next(iter(devices))
+    for layer in layers:
+        mlp = layer.mlp
+        if type(mlp) is not GatedMLP:
+            raise ValueError("Channel observation requires ordinary GatedMLP layers")
+        if (
+            mlp.fusion is not GatedMLPFusion.NONE
+            or type(mlp.act_fn) is not SiluAndMul
+            or mlp.act_fn.swiglu_limit is not None
+            or type(mlp.gate_up_proj.quant_method) is not UnquantizedLinearMethod
+            or type(mlp.down_proj.quant_method) is not UnquantizedLinearMethod
+        ):
+            raise ValueError(
+                "Channel observation requires an unfused, unquantized SwiGLU MLP"
+            )
+        down = mlp.down_proj.weight
+        gate_up = mlp.gate_up_proj.weight
+        if (
+            down.dtype not in (torch.bfloat16, torch.float32)
+            or gate_up.dtype != down.dtype
+            or down.device != device
+            or gate_up.device != device
+        ):
+            raise ValueError(
+                "Channel observation requires unfused BF16/FP32 SwiGLU MLPs"
+            )
+        if (
+            down.ndim != 2
+            or gate_up.ndim != 2
+            or gate_up.shape[0] != 2 * down.shape[1]
+            or gate_up.shape[1] != down.shape[0]
+        ):
+            raise ValueError("Unsupported MLP projection shapes")
+    return layers, device
+
+
+def _group_watchlist_entries(
+    entries: Sequence[object], layers: Sequence[nn.Module]
+) -> dict[int, list[tuple[int, float]]]:
+    by_layer: dict[int, list[tuple[int, float]]] = {}
+    previous = (-1, -1)
+    for entry in entries:
+        if not isinstance(entry, Mapping) or set(entry) != {
+            "layer",
+            "channel",
+            "contribution_limit",
+        }:
+            raise ValueError("Malformed channel watchlist entry")
+        layer_id = entry["layer"]
+        channel = entry["channel"]
+        limit = entry["contribution_limit"]
+        if type(layer_id) is not int or not 0 <= layer_id < len(layers):
+            raise ValueError("Watchlist layer is outside the model")
+        width = layers[layer_id].mlp.down_proj.weight.shape[1]
+        if type(channel) is not int or not 0 <= channel < width:
+            raise ValueError("Watchlist channel is outside its MLP")
+        if isinstance(limit, bool) or not isinstance(limit, (float, int)):
+            raise ValueError("contribution_limit must be positive and finite")
+        try:
+            limit_value = float(limit)
+        except (OverflowError, ValueError) as exc:
+            raise ValueError("contribution_limit must be positive and finite") from exc
+        if (
+            not math.isfinite(limit_value)
+            or limit_value < math.ldexp(1.0, -149)
+            or limit_value > torch.finfo(torch.float32).max
+        ):
+            raise ValueError(
+                "contribution_limit must be positive and finite in float32"
+            )
+        if (layer_id, channel) <= previous:
+            raise ValueError("Watchlist entries must be unique and sorted")
+        previous = (layer_id, channel)
+        by_layer.setdefault(layer_id, []).append((channel, limit_value))
+    return by_layer
+
+
 class ChannelWatch:
     """Record watched channels in one eager Qwen3 forward at a time.
 
@@ -125,118 +256,15 @@ class ChannelWatch:
         speculative: bool,
         monokernel: bool,
     ) -> None:
-        if execution != "eager" or speculative or monokernel:
-            raise ValueError(
-                "Channel observation requires eager, non-speculative, "
-                "non-monokernel execution"
-            )
-        if type(model) is not Qwen3ForCausalLM:
-            raise ValueError("Channel observation supports ordinary dense Qwen3 only")
-        if model.mapping.world_size != 1 or model.mapping.pp_size != 1:
-            raise ValueError("Channel observation requires TP=PP=DP=1")
-        if model.quant_config is not None or model._weight_update_active:
-            raise ValueError("Channel observation requires loaded, unquantized weights")
-        if model.training:
-            raise ValueError("Channel observation requires evaluation mode")
-        if type(model_identity) is not str or not model_identity.strip():
-            raise ValueError("model_identity must be a nonempty caller-supplied string")
-        if not isinstance(watchlist, Mapping) or set(watchlist) != {
-            "schema",
-            "model_identity",
-            "entries",
-        }:
-            raise ValueError("Expected a channel-watchlist-v1 artifact")
-        if watchlist["schema"] != "channel-watchlist-v1":
-            raise ValueError("Unsupported channel watchlist schema")
-        if watchlist["model_identity"] != model_identity:
-            raise ValueError(
-                "Watchlist model identity does not match the loaded model identity"
-            )
-        entries = watchlist["entries"]
-        if not isinstance(entries, list) or not entries:
-            raise ValueError("Watchlist must contain at least one channel entry")
-
-        layers = model.model.layers
-        if not layers or len(layers) != model.config.num_hidden_layers:
-            raise ValueError("Channel observation requires all local Qwen3 layers")
-        devices = {parameter.device for parameter in model.parameters()}
-        if len(devices) != 1:
-            raise ValueError(
-                "Channel observation requires all model weights on one device"
-            )
-        self._device = next(iter(devices))
-        for layer in layers:
-            mlp = layer.mlp
-            if type(mlp) is not GatedMLP:
-                raise ValueError(
-                    "Channel observation requires ordinary GatedMLP layers"
-                )
-            if (
-                mlp.fusion is not GatedMLPFusion.NONE
-                or type(mlp.act_fn) is not SiluAndMul
-                or mlp.act_fn.swiglu_limit is not None
-                or type(mlp.gate_up_proj.quant_method) is not UnquantizedLinearMethod
-                or type(mlp.down_proj.quant_method) is not UnquantizedLinearMethod
-            ):
-                raise ValueError(
-                    "Channel observation requires an unfused, unquantized SwiGLU MLP"
-                )
-            down = mlp.down_proj.weight
-            gate_up = mlp.gate_up_proj.weight
-            if (
-                down.dtype not in (torch.bfloat16, torch.float32)
-                or gate_up.dtype != down.dtype
-                or down.device != self._device
-                or gate_up.device != self._device
-            ):
-                raise ValueError(
-                    "Channel observation requires unfused BF16/FP32 SwiGLU MLPs"
-                )
-            if (
-                down.ndim != 2
-                or gate_up.ndim != 2
-                or gate_up.shape[0] != 2 * down.shape[1]
-                or gate_up.shape[1] != down.shape[0]
-            ):
-                raise ValueError("Unsupported MLP projection shapes")
-
-        by_layer: dict[int, list[tuple[int, float]]] = {}
-        previous = (-1, -1)
-        for entry in entries:
-            if not isinstance(entry, Mapping) or set(entry) != {
-                "layer",
-                "channel",
-                "contribution_limit",
-            }:
-                raise ValueError("Malformed channel watchlist entry")
-            layer_id = entry["layer"]
-            channel = entry["channel"]
-            limit = entry["contribution_limit"]
-            if type(layer_id) is not int or not 0 <= layer_id < len(layers):
-                raise ValueError("Watchlist layer is outside the model")
-            width = layers[layer_id].mlp.down_proj.weight.shape[1]
-            if type(channel) is not int or not 0 <= channel < width:
-                raise ValueError("Watchlist channel is outside its MLP")
-            if isinstance(limit, bool) or not isinstance(limit, (float, int)):
-                raise ValueError("contribution_limit must be positive and finite")
-            try:
-                limit_value = float(limit)
-            except (OverflowError, ValueError) as exc:
-                raise ValueError(
-                    "contribution_limit must be positive and finite"
-                ) from exc
-            if (
-                not math.isfinite(limit_value)
-                or limit_value < math.ldexp(1.0, -149)
-                or limit_value > torch.finfo(torch.float32).max
-            ):
-                raise ValueError(
-                    "contribution_limit must be positive and finite in float32"
-                )
-            if (layer_id, channel) <= previous:
-                raise ValueError("Watchlist entries must be unique and sorted")
-            previous = (layer_id, channel)
-            by_layer.setdefault(layer_id, []).append((channel, limit_value))
+        _validate_execution_model(
+            model,
+            execution=execution,
+            speculative=speculative,
+            monokernel=monokernel,
+        )
+        entries = _watchlist_entries(watchlist, model_identity)
+        layers, self._device = _supported_layers_and_device(model)
+        by_layer = _group_watchlist_entries(entries, layers)
 
         self._model = model
         self._model_identity = model_identity
