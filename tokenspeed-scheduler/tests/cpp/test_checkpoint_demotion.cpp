@@ -84,16 +84,15 @@ TEST(CheckpointDemotionIndexTest, DemoteDatesBackNeverForwardSkipsHeldEntriesAnd
     }
     CacheBlockRef held = pool.AcquireBlock(0);
     index.Register(pool, held, Key("held"), 40, -1, CacheBoundaryKind::kEndpoint, nullptr, /*session=*/nullptr);
-    EXPECT_FALSE(index.Demote(pool, Key("held"), CacheCoordinator::kDemotedAccessEpoch, /*write_back_holds=*/0))
+    EXPECT_FALSE(index.Demote(pool, Key("held"), CacheStore::kDemotedAccessEpoch, /*write_back_holds=*/0))
         << "a request holds it";
 
-    EXPECT_TRUE(index.Demote(pool, Key("c"), CacheCoordinator::kDemotedAccessEpoch, /*write_back_holds=*/0));
-    EXPECT_FALSE(index.Demote(pool, Key("c"), CacheCoordinator::kDemotedAccessEpoch, /*write_back_holds=*/0))
+    EXPECT_TRUE(index.Demote(pool, Key("c"), CacheStore::kDemotedAccessEpoch, /*write_back_holds=*/0));
+    EXPECT_FALSE(index.Demote(pool, Key("c"), CacheStore::kDemotedAccessEpoch, /*write_back_holds=*/0))
         << "demoted already";
     EXPECT_FALSE(index.Demote(pool, Key("a"), 15, /*write_back_holds=*/0)) << "never dates forward";
-    EXPECT_FALSE(index.Demote(pool, Key("missing"), CacheCoordinator::kDemotedAccessEpoch, /*write_back_holds=*/0));
-    EXPECT_EQ(index.Inspect(pool, Key("c"))->metadata.eviction.last_access_epoch,
-              CacheCoordinator::kDemotedAccessEpoch);
+    EXPECT_FALSE(index.Demote(pool, Key("missing"), CacheStore::kDemotedAccessEpoch, /*write_back_holds=*/0));
+    EXPECT_EQ(index.Inspect(pool, Key("c"))->metadata.eviction.last_access_epoch, CacheStore::kDemotedAccessEpoch);
     EXPECT_TRUE(index.Inspect(pool, Key("c"))->metadata.demoted);
     EXPECT_FALSE(index.Inspect(pool, Key("a"))->metadata.demoted);
     EXPECT_EQ(index.Inspect(pool, Key("c"))->metadata.max_access_epoch, 30u) << "the newest touch stays";
@@ -126,22 +125,21 @@ TEST(CheckpointDemotionIndexTest, OnlyADemotionMarksAnEntryAndATouchEndsTheMark)
     const auto demoted = [&](const char* name) { return index.Inspect(pool, Key(name))->metadata.demoted; };
     session->demoted = true;
     ASSERT_EQ(index.DemoteSession(pool, session), 2u);
-    EXPECT_EQ(index.Inspect(pool, Key("a"))->metadata.eviction.last_access_epoch,
-              CacheCoordinator::kDemotedAccessEpoch);
+    EXPECT_EQ(index.Inspect(pool, Key("a"))->metadata.eviction.last_access_epoch, CacheStore::kDemotedAccessEpoch);
     EXPECT_FALSE(demoted("a"));
     EXPECT_FALSE(demoted("b"));
 
-    EXPECT_TRUE(index.Demote(pool, Key("a"), CacheCoordinator::kDemotedAccessEpoch, /*write_back_holds=*/0));
+    EXPECT_TRUE(index.Demote(pool, Key("a"), CacheStore::kDemotedAccessEpoch, /*write_back_holds=*/0));
     EXPECT_TRUE(demoted("a"));
     PrefixMatch hit =
         index.AcquireMatched(pool, std::vector<CacheKey>{Key("a")}, 0, GroupPrefixProbe{.hits = {1}}, 30, session);
     EXPECT_FALSE(demoted("a"));
-    EXPECT_EQ(index.Inspect(pool, Key("a"))->metadata.eviction.last_access_epoch, CacheCoordinator::kDemotedAccessEpoch)
+    EXPECT_EQ(index.Inspect(pool, Key("a"))->metadata.eviction.last_access_epoch, CacheStore::kDemotedAccessEpoch)
         << "the session is demoted still";
 
     CacheBlockRef held = index.Find(pool, Key("b"));
-    index.MarkDemoted(pool, Key("b"), CacheCoordinator::kDemotedAccessEpoch);
-    index.MarkDemoted(pool, Key("dated"), CacheCoordinator::kDemotedAccessEpoch);
+    index.MarkDemoted(pool, Key("b"), CacheStore::kDemotedAccessEpoch);
+    index.MarkDemoted(pool, Key("dated"), CacheStore::kDemotedAccessEpoch);
     EXPECT_TRUE(demoted("b"));
     EXPECT_FALSE(demoted("dated"));
     EXPECT_EQ(index.Inspect(pool, Key("dated"))->metadata.eviction.last_access_epoch, 20u);
@@ -155,13 +153,12 @@ TEST(CheckpointDemotionIndexTest, DemoteDiscountsOnlyTheWriteBackHolds) {
     CacheBlockRef write_back = pool.AcquireBlock(0);
     index.Register(pool, write_back, Key("h"), 10, -1, CacheBoundaryKind::kEndpoint, nullptr, /*session=*/nullptr);
     CacheBlockRef other = write_back;
-    EXPECT_FALSE(index.Demote(pool, Key("h"), CacheCoordinator::kDemotedAccessEpoch, /*write_back_holds=*/1))
+    EXPECT_FALSE(index.Demote(pool, Key("h"), CacheStore::kDemotedAccessEpoch, /*write_back_holds=*/1))
         << "another hold beside the write-back's";
     other.reset();
-    EXPECT_FALSE(index.Demote(pool, Key("h"), CacheCoordinator::kDemotedAccessEpoch, /*write_back_holds=*/0));
-    EXPECT_TRUE(index.Demote(pool, Key("h"), CacheCoordinator::kDemotedAccessEpoch, /*write_back_holds=*/1));
-    EXPECT_EQ(index.Inspect(pool, Key("h"))->metadata.eviction.last_access_epoch,
-              CacheCoordinator::kDemotedAccessEpoch);
+    EXPECT_FALSE(index.Demote(pool, Key("h"), CacheStore::kDemotedAccessEpoch, /*write_back_holds=*/0));
+    EXPECT_TRUE(index.Demote(pool, Key("h"), CacheStore::kDemotedAccessEpoch, /*write_back_holds=*/1));
+    EXPECT_EQ(index.Inspect(pool, Key("h"))->metadata.eviction.last_access_epoch, CacheStore::kDemotedAccessEpoch);
 }
 
 TEST(CheckpointLineageTest, RecordsPublicationsAndCountsResumesUpToTwo) {
@@ -234,11 +231,11 @@ TEST(CheckpointDemotionCoordinatorTest, ADemotedCheckpointIsNotQueuedForHost) {
     ASSERT_EQ(keys, std::vector<CacheKey>{Key("h0", 1)}) << "the State entry alone, never the KV page";
     EXPECT_EQ(coordinator.DemoteEntries(keys), 1);
     EXPECT_EQ(coordinator.DemoteEntries(keys), 0) << "dated back already";
-    coordinator.QueueCachedBlocksForStore(hashes);
-    EXPECT_EQ(coordinator.TakePendingStores().size(), 2u) << "demotion off: nothing is skipped";
+    coordinator.Host().QueueCachedBlocksForStore(hashes);
+    EXPECT_EQ(coordinator.Host().TakePendingStores().size(), 2u) << "demotion off: nothing is skipped";
     coordinator.SetCheckpointDemotion(true);
-    coordinator.QueueCachedBlocksForStore(hashes);
-    const std::vector<CacheCoordinator::StoreCandidate> pending = coordinator.TakePendingStores();
+    coordinator.Host().QueueCachedBlocksForStore(hashes);
+    const std::vector<HostCache::StoreCandidate> pending = coordinator.Host().TakePendingStores();
     ASSERT_EQ(pending.size(), 1u);
     EXPECT_EQ(pending[0].key, Key("h0", 0));
 }
@@ -307,10 +304,9 @@ protected:
             GroupDemand{.table = &tables[kState], .extent = StateStep{StateStep::Kind::kRotate}},
         };
         // Held until the publication: it registers the session.
-        const std::optional<CacheCoordinator::AdmissionResult> admitted =
-            coordinator_.Admit(coordinator_.ProbePrefix({}), demands, RequestProgress{}, /*copy_in_blocks=*/{},
-                               /*copy_in_point=*/std::nullopt, /*request_access_epoch=*/std::nullopt,
-                               /*evict_blocks_past_segments=*/false, session_id, /*cache_group_id=*/{});
+        const std::optional<AdmissionResult> admitted = coordinator_.Admit(
+            coordinator_.Prober().ProbePrefix({}), demands, RequestProgress{}, /*copy_in_blocks=*/{},
+            /*copy_in_point=*/std::nullopt, /*request_access_epoch=*/std::nullopt, session_id, /*cache_group_id=*/{});
         if (!admitted) {
             ADD_FAILURE() << "the admission failed";
             return {};
@@ -348,7 +344,7 @@ protected:
     void AdmitOneBlockOnAFullDevice() {
         HoldFreeCapacity(device_);
         std::vector<BlockTable> tables(2);
-        ASSERT_TRUE(AdmitForTest(coordinator_, tables, coordinator_.ProbePrefix({}),
+        ASSERT_TRUE(AdmitForTest(coordinator_, tables, coordinator_.Prober().ProbePrefix({}),
                                  GroupDemand{.extent = DenseGrowth{kP}}, RequestProgress{},
                                  StateStep{.kind = StateStep::Kind::kKeep}));
         coordinator_.Free(tables);
@@ -356,10 +352,10 @@ protected:
     }
 
     // The keys the plan's admissions recorded for their write-back drain.
-    static std::vector<CacheKey> RecordedKeys(const std::vector<CacheCoordinator::EvictedSegment>& segments) {
+    static std::vector<CacheKey> RecordedKeys(const std::vector<CacheEvictor::EvictedSegment>& segments) {
         std::vector<CacheKey> keys;
-        for (const CacheCoordinator::EvictedSegment& segment : segments) {
-            for (const CacheCoordinator::EvictedBlock& member : segment.members) {
+        for (const CacheEvictor::EvictedSegment& segment : segments) {
+            for (const CacheEvictor::EvictedBlock& member : segment.members) {
                 keys.push_back(member.key);
             }
         }
@@ -417,14 +413,14 @@ TEST_F(CheckpointDemotionWriteBackTest, ADemotedCheckpointIsDroppedNeverWrittenB
         const std::vector<std::string> shorter = Publish(MakeTokens(8));
         const std::vector<std::string> longer = Publish(MakeTokens(16));
         ASSERT_EQ(coordinator_.DemoteEntries(CheckpointKeys(shorter)), 1);
-        const CacheCoordinator::DeviceEvictionStats before = coordinator_.DeviceEvictions();
+        const CacheEvictor::DeviceEvictionStats before = coordinator_.DeviceEvictions();
         const std::uint64_t dropped_before = coordinator_.DemotedEntriesNotWrittenBack();
         AdmitOneBlockOnAFullDevice();
 
         EXPECT_FALSE(coordinator_.GroupPrefixIndex(kState).Contains(device_, Key(shorter[1], kState)));
         EXPECT_TRUE(coordinator_.GroupPrefixIndex(kState).Contains(device_, Key(longer[3], kState)));
         EXPECT_TRUE(RecordedKeys(coordinator_.TakeEvictedSegments()).empty()) << "nothing to write back";
-        const CacheCoordinator::DeviceEvictionStats& after = coordinator_.DeviceEvictions();
+        const CacheEvictor::DeviceEvictionStats& after = coordinator_.DeviceEvictions();
         EXPECT_EQ(after.admission.blocks - before.admission.blocks, demotion ? 1u : 0u);
         EXPECT_EQ(after.request_reclaim.blocks - before.request_reclaim.blocks, demotion ? 0u : 1u);
         EXPECT_EQ(coordinator_.DemotedEntriesNotWrittenBack() - dropped_before, demotion ? 1u : 0u);
@@ -442,20 +438,18 @@ TEST_F(CheckpointDemotionWriteBackTest, NoEvictionCauseWritesADemotedEntryBack) 
     const auto location_of = [&](const std::string& hash) {
         return *CacheCoordinatorTestAccess::DeviceLocationOf(coordinator_, kState, Key(hash, kState));
     };
-    CacheCoordinator::EvictedSegment segment;
-    ASSERT_TRUE(CacheCoordinatorTestAccess::EvictAloneInto(coordinator_, kState, location_of(shorter[1]),
-                                                           &CacheCoordinator::DeviceEvictionStats::stranded_suffix,
-                                                           &segment));
+    CacheEvictor::EvictedSegment segment;
+    ASSERT_TRUE(CacheCoordinatorTestAccess::EvictAloneInto(
+        coordinator_, kState, location_of(shorter[1]), &CacheEvictor::DeviceEvictionStats::stranded_suffix, &segment));
     EXPECT_TRUE(segment.members.empty());
     EXPECT_EQ(coordinator_.DemotedEntriesNotWrittenBack(), 1u);
     EXPECT_EQ(coordinator_.DeviceEvictions().stranded_suffix.blocks, 1u) << "counted under what evicted it";
-    ASSERT_TRUE(CacheCoordinatorTestAccess::EvictAloneInto(coordinator_, kState, location_of(longer[3]),
-                                                           &CacheCoordinator::DeviceEvictionStats::stranded_suffix,
-                                                           &segment));
+    ASSERT_TRUE(CacheCoordinatorTestAccess::EvictAloneInto(
+        coordinator_, kState, location_of(longer[3]), &CacheEvictor::DeviceEvictionStats::stranded_suffix, &segment));
     ASSERT_EQ(segment.members.size(), 1u) << "a dated checkpoint is written back";
     EXPECT_EQ(segment.members[0].key, Key(longer[3], kState));
     EXPECT_EQ(coordinator_.DemotedEntriesNotWrittenBack(), 1u);
-    coordinator_.SettleEvictedSegment(std::move(segment), /*placed_on_host=*/false);
+    coordinator_.Host().SettleEvictedSegment(std::move(segment), /*placed_on_host=*/false);
 }
 
 // The checkpoint at 8 is written back before it is demoted: its copy is
@@ -477,7 +471,7 @@ TEST_F(CheckpointDemotionWriteBackTest, ACheckpointDemotedWhileItsCopyIsOutLands
         transfers_.CompleteWriteBack(store->op_id);
         const std::optional<std::uint64_t> epoch = HostEpoch(Key(shorter[1], kState));
         ASSERT_TRUE(epoch.has_value());
-        EXPECT_EQ(*epoch == CacheCoordinator::kDemotedAccessEpoch, demoted_in_flight);
+        EXPECT_EQ(*epoch == CacheStore::kDemotedAccessEpoch, demoted_in_flight);
         EXPECT_EQ(HostEntryDemoted(Key(shorter[1], kState)), demoted_in_flight);
         ASSERT_TRUE(ClearRound());
     }
@@ -494,7 +488,7 @@ TEST_F(CheckpointDemotionWriteBackTest, AHostEntryTheCopyHoldsIsDemotedWithIt) {
         const std::vector<std::string> shorter = Publish(MakeTokens(8));
         const CacheKey checkpoint = Key(shorter[1], kState);
         CacheBlockRef block = host_.AcquireBlock(kState);
-        coordinator_.CacheHostBlock(block, checkpoint, std::nullopt);
+        coordinator_.Host().CacheHostBlock(block, checkpoint, std::nullopt);
         block.reset();
         const std::optional<std::uint64_t> dated = HostEpoch(checkpoint);
         AdmitOneBlockOnAFullDevice();
@@ -505,11 +499,10 @@ TEST_F(CheckpointDemotionWriteBackTest, AHostEntryTheCopyHoldsIsDemotedWithIt) {
             << "the Device entry is gone, the copy holds the Host entry";
         if (demoted_in_flight) {
             EXPECT_EQ(transfers_.DemoteInFlightEvictions(CheckpointKeys(shorter)), 1) << "the Host entry";
-            EXPECT_EQ(HostEpoch(checkpoint), CacheCoordinator::kDemotedAccessEpoch);
+            EXPECT_EQ(HostEpoch(checkpoint), CacheStore::kDemotedAccessEpoch);
         }
         transfers_.CompleteWriteBack(store->op_id);
-        EXPECT_EQ(HostEpoch(checkpoint),
-                  demoted_in_flight ? std::optional{CacheCoordinator::kDemotedAccessEpoch} : dated);
+        EXPECT_EQ(HostEpoch(checkpoint), demoted_in_flight ? std::optional{CacheStore::kDemotedAccessEpoch} : dated);
         EXPECT_EQ(HostEntryDemoted(checkpoint), demoted_in_flight) << "the settlement keeps the demotion";
         ASSERT_TRUE(ClearRound());
     }
@@ -530,10 +523,10 @@ TEST_F(CheckpointDemotionWriteBackTest, HostSegmentPlacementTakesADemotedCheckpo
             for (const std::vector<std::string>* pages : {&x, &d}) {
                 for (const std::string& page : *pages) {
                     CacheBlockRef block = host_.AcquireBlock(kFull);
-                    coordinator_.CacheHostBlock(block, Key(page, kFull), std::nullopt);
+                    coordinator_.Host().CacheHostBlock(block, Key(page, kFull), std::nullopt);
                 }
                 CacheBlockRef block = host_.AcquireBlock(kState);
-                coordinator_.CacheHostBlock(block, Key(pages->back(), kState), std::nullopt);
+                coordinator_.Host().CacheHostBlock(block, Key(pages->back(), kState), std::nullopt);
                 if (pages == &d && d_pages_on_device) {
                     // The checkpoint alone leaves the Device; D's pages stay.
                     ASSERT_TRUE(CacheCoordinatorTestAccess::EvictCachedBlock(
@@ -553,13 +546,13 @@ TEST_F(CheckpointDemotionWriteBackTest, HostSegmentPlacementTakesADemotedCheckpo
             HoldFreeCapacity(host_);
             const std::array<std::uint32_t, 1> groups{kState};
             const std::array<std::int32_t, 1> buckets{0};
-            const std::array<CacheCoordinator::HostSegmentRows, 1> segments{
-                CacheCoordinator::HostSegmentRows{.first_row = 0, .past_end_row = 1}};
-            CacheCoordinator::HostAllocationBatch batch = coordinator_.AcquireHostSegments(groups, buckets, segments);
+            const std::array<HostCache::HostSegmentRows, 1> segments{
+                HostCache::HostSegmentRows{.first_row = 0, .past_end_row = 1}};
+            HostCache::HostAllocationBatch batch = coordinator_.Host().AcquireHostSegments(groups, buckets, segments);
             ASSERT_TRUE(static_cast<bool>(batch.blocks[0]));
-            EXPECT_EQ(coordinator_.ContainsHostCachedBlock(Key(d.back(), kState)), !demote);
-            EXPECT_EQ(coordinator_.ContainsHostCachedBlock(Key(x.back(), kState)), demote || d_pages_on_device);
-            EXPECT_EQ(coordinator_.ContainsHostCachedBlock(Key(d.front(), kFull)), !demote && !d_pages_on_device)
+            EXPECT_EQ(coordinator_.Host().ContainsHostCachedBlock(Key(d.back(), kState)), !demote);
+            EXPECT_EQ(coordinator_.Host().ContainsHostCachedBlock(Key(x.back(), kState)), demote || d_pages_on_device);
+            EXPECT_EQ(coordinator_.Host().ContainsHostCachedBlock(Key(d.front(), kFull)), !demote && !d_pages_on_device)
                 << "D's pages leave with its demoted checkpoint, or as Device duplicates without demotion";
             batch.blocks.clear();
             held_.clear();
@@ -583,10 +576,10 @@ TEST_F(CheckpointDemotionWriteBackTest, HostSegmentPlacementTakesADemotedCheckpo
         for (const std::vector<std::string>* pages : {&x, &d}) {
             for (const std::string& page : *pages) {
                 CacheBlockRef block = host_.AcquireBlock(kFull);
-                coordinator_.CacheHostBlock(block, Key(page, kFull), std::nullopt);
+                coordinator_.Host().CacheHostBlock(block, Key(page, kFull), std::nullopt);
             }
             CacheBlockRef block = host_.AcquireBlock(kState);
-            coordinator_.CacheHostBlock(block, Key(pages->back(), kState), std::nullopt);
+            coordinator_.Host().CacheHostBlock(block, Key(pages->back(), kState), std::nullopt);
             // The checkpoint alone leaves the Device; the pages stay.
             ASSERT_TRUE(CacheCoordinatorTestAccess::EvictCachedBlock(
                 coordinator_, kState,
@@ -601,20 +594,20 @@ TEST_F(CheckpointDemotionWriteBackTest, HostSegmentPlacementTakesADemotedCheckpo
         HoldFreeCapacity(host_);
         const std::vector<std::uint32_t> groups(parents, kState);
         const std::vector<std::int32_t> buckets(parents, 0);
-        const std::array<CacheCoordinator::HostSegmentRows, 1> segments{
-            CacheCoordinator::HostSegmentRows{.first_row = 0, .past_end_row = parents}};
-        CacheCoordinator::HostAllocationBatch batch = coordinator_.AcquireHostSegments(groups, buckets, segments);
+        const std::array<HostCache::HostSegmentRows, 1> segments{
+            HostCache::HostSegmentRows{.first_row = 0, .past_end_row = parents}};
+        HostCache::HostAllocationBatch batch = coordinator_.Host().AcquireHostSegments(groups, buckets, segments);
         ASSERT_EQ(batch.stats.allocated, parents);
         for (const std::string& page : d) {
-            EXPECT_FALSE(coordinator_.ContainsHostCachedBlock(Key(page, kFull))) << "a held duplicate, first";
+            EXPECT_FALSE(coordinator_.Host().ContainsHostCachedBlock(Key(page, kFull))) << "a held duplicate, first";
         }
-        EXPECT_EQ(coordinator_.ContainsHostCachedBlock(Key(d.back(), kState)), parents < 2)
+        EXPECT_EQ(coordinator_.Host().ContainsHostCachedBlock(Key(d.back(), kState)), parents < 2)
             << "the demoted checkpoint, after the held duplicates";
         for (const std::string& page : x) {
-            EXPECT_EQ(coordinator_.ContainsHostCachedBlock(Key(page, kFull)), parents < 3)
+            EXPECT_EQ(coordinator_.Host().ContainsHostCachedBlock(Key(page, kFull)), parents < 3)
                 << "an unheld duplicate, after the demoted checkpoint";
         }
-        EXPECT_TRUE(coordinator_.ContainsHostCachedBlock(Key(x.back(), kState))) << "Host-only cache, last";
+        EXPECT_TRUE(coordinator_.Host().ContainsHostCachedBlock(Key(x.back(), kState))) << "Host-only cache, last";
         batch.blocks.clear();
         request.clear();
         held_.clear();
@@ -648,26 +641,26 @@ TEST_F(CheckpointDemotionWriteBackTest, ASessionsDemotedEntriesKeepTheirOwnRules
             ASSERT_EQ(coordinator_.GroupPrefixIndex(kState)
                           .Inspect(device_, shorter_checkpoint)
                           ->metadata.eviction.last_access_epoch,
-                      CacheCoordinator::kDemotedAccessEpoch);
-            coordinator_.QueueCachedBlocksForStore(shorter);
-            EXPECT_EQ(coordinator_.TakePendingStores().size(), 3u) << "the two pages and the checkpoint";
+                      CacheStore::kDemotedAccessEpoch);
+            coordinator_.Host().QueueCachedBlocksForStore(shorter);
+            EXPECT_EQ(coordinator_.Host().TakePendingStores().size(), 3u) << "the two pages and the checkpoint";
 
-            const CacheCoordinator::DeviceEvictionStats before = coordinator_.DeviceEvictions();
-            CacheCoordinator::EvictedSegment segment;
+            const CacheEvictor::DeviceEvictionStats before = coordinator_.DeviceEvictions();
+            CacheEvictor::EvictedSegment segment;
             ASSERT_TRUE(CacheCoordinatorTestAccess::EvictAloneInto(coordinator_, kState, location_of(longer_checkpoint),
-                                                                   &CacheCoordinator::DeviceEvictionStats::admission,
+                                                                   &CacheEvictor::DeviceEvictionStats::admission,
                                                                    &segment));
             EXPECT_TRUE(segment.members.empty());
-            const CacheCoordinator::DeviceEvictionStats& after = coordinator_.DeviceEvictions();
+            const CacheEvictor::DeviceEvictionStats& after = coordinator_.DeviceEvictions();
             EXPECT_EQ(after.request_reclaim.blocks - before.request_reclaim.blocks, 1u);
             EXPECT_EQ(after.admission.blocks, before.admission.blocks);
             ASSERT_TRUE(CacheCoordinatorTestAccess::EvictAloneInto(
                 coordinator_, kState, location_of(shorter_checkpoint),
-                &CacheCoordinator::DeviceEvictionStats::stranded_suffix, &segment));
+                &CacheEvictor::DeviceEvictionStats::stranded_suffix, &segment));
             ASSERT_EQ(segment.members.size(), 1u) << "the stranded suffix is written back";
             EXPECT_EQ(segment.members[0].key, shorter_checkpoint);
             EXPECT_EQ(coordinator_.DemotedEntriesNotWrittenBack(), 0u);
-            coordinator_.SettleEvictedSegment(std::move(segment), /*placed_on_host=*/false);
+            coordinator_.Host().SettleEvictedSegment(std::move(segment), /*placed_on_host=*/false);
             ASSERT_TRUE(ClearRound());
         }
     }
@@ -679,8 +672,8 @@ TEST_F(CheckpointDemotionWriteBackTest, ADemotionMarksAnEntryASessionsDemotionDa
     const std::vector<std::string> hashes = PublishInSession(MakeTokens(8), "s");
     ASSERT_EQ(coordinator_.DemoteSession("s", /*ended=*/false), 3u);
     EXPECT_EQ(coordinator_.DemoteEntries(CheckpointKeys(hashes)), 1);
-    coordinator_.QueueCachedBlocksForStore(hashes);
-    EXPECT_EQ(coordinator_.TakePendingStores().size(), 2u) << "the pages alone";
+    coordinator_.Host().QueueCachedBlocksForStore(hashes);
+    EXPECT_EQ(coordinator_.Host().TakePendingStores().size(), 2u) << "the pages alone";
 }
 
 // As in HostSegmentPlacementTakesADemotedCheckpointFirst, X older than D and
@@ -705,10 +698,11 @@ TEST_F(CheckpointDemotionWriteBackTest, HostSegmentPlacementRanksASessionsDemote
                 keys.push_back(Key(pages->back(), kState));
                 for (const CacheKey& key : keys) {
                     CacheBlockRef block = host_.AcquireBlock(key.group_id);
-                    coordinator_.CacheHostBlock(block, key,
-                                                coordinator_.GroupPrefixIndex(static_cast<std::int32_t>(key.group_id))
-                                                    .Inspect(device_, key)
-                                                    ->metadata);
+                    coordinator_.Host().CacheHostBlock(
+                        block, key,
+                        coordinator_.GroupPrefixIndex(static_cast<std::int32_t>(key.group_id))
+                            .Inspect(device_, key)
+                            ->metadata);
                 }
             }
             for (const std::string& page : x) {
@@ -727,13 +721,13 @@ TEST_F(CheckpointDemotionWriteBackTest, HostSegmentPlacementRanksASessionsDemote
             HoldFreeCapacity(host_);
             const std::array<std::uint32_t, 1> groups{kState};
             const std::array<std::int32_t, 1> buckets{0};
-            const std::array<CacheCoordinator::HostSegmentRows, 1> segments{
-                CacheCoordinator::HostSegmentRows{.first_row = 0, .past_end_row = 1}};
-            CacheCoordinator::HostAllocationBatch batch = coordinator_.AcquireHostSegments(groups, buckets, segments);
+            const std::array<HostCache::HostSegmentRows, 1> segments{
+                HostCache::HostSegmentRows{.first_row = 0, .past_end_row = 1}};
+            HostCache::HostAllocationBatch batch = coordinator_.Host().AcquireHostSegments(groups, buckets, segments);
             ASSERT_TRUE(static_cast<bool>(batch.blocks[0]));
-            EXPECT_TRUE(coordinator_.ContainsHostCachedBlock(Key(d.back(), kState)));
-            EXPECT_TRUE(coordinator_.ContainsHostCachedBlock(Key(x.back(), kState)));
-            EXPECT_FALSE(coordinator_.ContainsHostCachedBlock(Key(d.front(), kFull)));
+            EXPECT_TRUE(coordinator_.Host().ContainsHostCachedBlock(Key(d.back(), kState)));
+            EXPECT_TRUE(coordinator_.Host().ContainsHostCachedBlock(Key(x.back(), kState)));
+            EXPECT_FALSE(coordinator_.Host().ContainsHostCachedBlock(Key(d.front(), kFull)));
             batch.blocks.clear();
             held_.clear();
             ASSERT_TRUE(ClearRound());

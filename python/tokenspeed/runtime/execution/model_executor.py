@@ -29,6 +29,11 @@ from functools import partial
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import torch
+from tokenspeed_kernel.ops.gemm.hipblaslt import (
+    hipblaslt_autotune_enabled,
+    hipblaslt_online_tuning,
+    load_hipblaslt_tuned_solutions,
+)
 from tokenspeed_kernel.ops.metadata import advance_accepted_frontier
 from tokenspeed_kernel.ops.metadata.ngram import commit_ngram_inputs
 from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
@@ -1187,6 +1192,11 @@ class ModelExecutor:
         )
         if self.model_runner is None:
             return
+        # ROCm: replay this GPU's in-repo tuned BLAS solutions, if any. A
+        # process-wide BLAS setting rather than a kernel choice: GEMMs that
+        # dispatch to torch.mm replay the listed solutions from here on, in
+        # warmup and in graph capture alike. No-op elsewhere.
+        load_hipblaslt_tuned_solutions()
         ib = self.input_buffers
         # The one traversal that discovers each operator is shaped like the
         # forwards this engine runs: an extend over the prefill budget, or,
@@ -1318,6 +1328,16 @@ class ModelExecutor:
                                     self.forward_step.max_decode_bs,
                                 ),
                             ),
+                            graph_phase=False,
+                        )
+                if hipblaslt_autotune_enabled() and not self.config.prefill_only:
+                    # TOKENSPEED_HIPBLASLT_AUTOTUNE=1: one eager decode step per
+                    # captured batch size tunes the dense GEMMs the tuned file
+                    # does not list, so capture records the picks. Tuning ends
+                    # with the block, before any graph is captured.
+                    with hipblaslt_online_tuning():
+                        self.forward_step.warmup_decode_path(
+                            batch_sizes=tuple(self.forward_step.capture_bs),
                             graph_phase=False,
                         )
                 if self._samples_from_vocab_shard:
@@ -2040,6 +2060,11 @@ class ModelExecutor:
             self._compact_accepted_tree(ctx.bs, logits_output)
 
         if self.drafter is not None:
+            # Next-round preparation may refill the live row indices while the
+            # captured tail still publishes this round's candidates.
+            indices = self.input_buffers.state_write_req_pool_indices_buf[: ctx.bs]
+            if self.forward_step.draft_overlap is not None:
+                indices = self.forward_step.draft_overlap.snapshot(indices)
             draft_accept_lengths = accept_lengths
             if ctx.output_layout.num_decodes:
                 draft_accept_lengths = drafter_accept_lengths(
@@ -2054,7 +2079,6 @@ class ModelExecutor:
             # _update_runtime_state skips future_input_map when drafter is
             # active — drafter writes the next-round inputs directly, and the
             # row's candidate columns are real from here on.
-            indices = self.input_buffers.state_write_req_pool_indices_buf[: ctx.bs]
             for requests in (
                 ctx.output_layout.prefill_slice,
                 ctx.output_layout.decode_request_slice,
@@ -2580,6 +2604,17 @@ class ModelExecutor:
         stop_criteria: Sequence[StopCriteria],
         admission_ids: Sequence[int],
     ) -> ModelExecutionResult:
+        if self.forward_step.draft_overlap is not None:
+            self.forward_step.draft_overlap.prepare_batch(
+                tuple(zip(admission_ids, forward_op.request_pool_indices, strict=True)),
+                reset_state=(
+                    forward_op.num_extends() > 0
+                    or (
+                        request_history_seeds is not None
+                        and bool(request_history_seeds.slots)
+                    )
+                ),
+            )
         self._reset_valid_cache_length(forward_op)
         self.log_step += 1
         num_extends = forward_op.num_extends()
@@ -2988,6 +3023,8 @@ class ModelExecutor:
             # Enqueued behind the output copies; the next forward or task completes the rest.
             if self.drafter is not None and total_tokens > 0:
                 self.drafter.finish_round(ctx, self.forward_step.last_graph_bs)
+            if self.forward_step.draft_overlap is not None:
+                copy_event = self.forward_step.draft_overlap.fence_outputs(copy_event)
 
             if timing_enabled and (
                 num_extends > 0 or self.log_step < 64 or self.log_step % 100 == 0

@@ -32,7 +32,7 @@ pytestmark = pytest.mark.skipif(
 _EXPERTS = 896
 _TOPK = 16
 _BLOCK = 16
-_ROWS = (1, 32, 64, 128, 192, 256)
+_ROWS = (1, 8, 13, 32, 33, 64, 128, 192, 256)
 
 
 def _logits(kind: str, rows: int, seed: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -132,6 +132,21 @@ def _bits(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.view(torch.int32)
 
 
+def _assert_scratch_ready(scratch: torch.Tensor) -> None:
+    """The sorting programs' masks and counters are zeroed, and so are the
+    mask buffer and counter the next self-sorting launch takes."""
+    from tokenspeed_kernel.ops.moe._triton.kimi3_sigmoid_topk import (
+        _SORTED_ROW_WORDS,
+    )
+
+    words = _EXPERTS * _SORTED_ROW_WORDS + 16
+    assert not torch.any(scratch[:words])
+    buffers = scratch[words : words + 2 * _EXPERTS].view(2, _EXPERTS)
+    counters = scratch[words + 2 * _EXPERTS :]
+    parity = int(counters[2]) & 1
+    assert not torch.any(buffers[parity]) and int(counters[parity]) == 0
+
+
 def _route_blocks(sorted_ids, sorted_weights, sorted_expert_ids, total, rows):
     """Each route's sorted expert block and weight bits, indexed by route."""
     ids = sorted_ids[:total].long()
@@ -210,8 +225,7 @@ def test_sorted_routing_matches_topk_and_sort(rows, kind, deterministic_order):
         fused = _fused(logits, bias, scale, normalize, scratch)
         torch.cuda.synchronize()
         _check(fused, reference, rows, order_exact=deterministic_order)
-        # Each launch leaves the arrival masks and counter zeroed.
-        assert not torch.any(scratch)
+        _assert_scratch_ready(scratch)
 
 
 def test_sorted_routing_takes_only_its_layer_and_logits():
@@ -258,7 +272,7 @@ def test_sorted_routing_graph_replay_and_one_binary():
         stream.synchronize()
         for (logits, _), got, want in zip(layers, eager, references, strict=True):
             _check(got, want, logits.shape[0], order_exact=True)
-        assert not torch.any(scratch)
+        _assert_scratch_ready(scratch)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
             for layer in layers:
@@ -273,7 +287,7 @@ def test_sorted_routing_graph_replay_and_one_binary():
         torch.cuda.synchronize()
         for (logits, _), got, want in zip(layers, snapshots, references, strict=True):
             _check(got, want, logits.shape[0], order_exact=True)
-        assert not torch.any(scratch)
+        _assert_scratch_ready(scratch)
 
 
 @pytest.fixture(scope="module")
@@ -400,7 +414,7 @@ def test_sorted_routing_carries_shared_down(rows, out_kind):
     _check_shared_down(carried[6], hidden, weight)
     # A row-strided output keeps the columns past its width.
     assert torch.all(wide[:, _SHARED_N:] == -7.0)
-    assert not torch.any(scratch)
+    _assert_scratch_ready(scratch)
 
 
 def test_sorted_routing_shared_down_graph_replay():
@@ -442,7 +456,7 @@ def test_sorted_routing_shared_down_graph_replay():
             logits, _, hidden, weight, out = layer
             _check(got, want, logits.shape[0], order_exact=True)
             _check_shared_down(out, hidden, weight)
-        assert not torch.any(scratch)
+        _assert_scratch_ready(scratch)
 
 
 def test_sorted_routing_rejects_unsupported_shared_down():

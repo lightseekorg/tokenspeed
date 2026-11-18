@@ -712,7 +712,7 @@ public:
 
     // Marks key's entry demoted, as Demote does, when it carries `epoch`
     // already, whatever holds it: an eviction write-back publishes a copy a
-    // demotion reached on its way (CacheCoordinator::CacheHostBlock).
+    // demotion reached on its way (HostCache::CacheHostBlock).
     void MarkDemoted(const BlockPool& pool, const CacheKey& key, std::uint64_t epoch) {
         CacheEntries* cache_index = findCacheEntries(pool);
         if (cache_index == nullptr) {
@@ -812,7 +812,7 @@ public:
 
     // Moves the entry at `from` onto `to`, a block of the same tier the caller
     // acquired for a copy of the entry's block: a lone request's compaction
-    // (CacheCoordinator::CompactLoneRequest), which keeps the bucket. The
+    // (LoneRequestAdmission::Compact), which keeps the bucket. The
     // entry keeps its key, epochs, logical block index, boundary kind,
     // session, acquisition and demotion marks, pairing and its hold on the
     // boundary-tree node -- nothing a hash, KV event or checkpoint depends on

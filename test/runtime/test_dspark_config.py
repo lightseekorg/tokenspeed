@@ -37,6 +37,7 @@ from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.attention.backends.paged.mha import MHAAttnBackend
 from tokenspeed.runtime.layers.attention.configs.base import (
     SoftmaxAttnConfig,
+    block_draft_is_causal,
     resolve_speculative_num_tokens,
 )
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
@@ -47,7 +48,10 @@ from tokenspeed.runtime.models.base.transformer_model import (
     notify_target_capture,
 )
 from tokenspeed.runtime.models.dspark import _get_markov_params
-from tokenspeed.runtime.utils.hf_transformers_utils import get_config
+from tokenspeed.runtime.utils.hf_transformers_utils import (
+    _convert_speculators_dspark_config,
+    get_config,
+)
 from tokenspeed.runtime.utils.server_args import ServerArgs
 from tokenspeed.runtime.utils.spec_block_geometry import (
     BLOCK_SPEC_RULES,
@@ -518,6 +522,79 @@ def test_non_spec_archs_still_get_the_nextn_rewrite(tmp_path) -> None:
     path = _write_config(tmp_path, architectures=["Qwen3ForCausalLM"])
     config = get_config(path, trust_remote_code=False, is_draft_worker=True)
     assert config.architectures[0] == "Qwen3ForCausalLMNextN"
+
+
+# --------------------------------------------------------------------------
+# Speculators-format checkpoints
+# --------------------------------------------------------------------------
+
+
+def _speculators_config(**overrides) -> dict:
+    """A trimmed Inferact/Kimi-K3.1-Pro-DSpark config.json."""
+    config = {
+        "architectures": ["DSparkDraftModel"],
+        "speculators_model_type": "dspark",
+        "aux_hidden_state_layer_ids": [76, 80, 84, 88, 92],
+        "block_size": 7,
+        "mask_token_id": 163839,
+        "markov_rank": 512,
+        "markov_head_type": "vanilla",
+        "sample_from_anchor": True,
+        "sliding_window_non_causal": False,
+        "target_hidden_size": None,
+        "transformer_layer_config": {
+            "model_type": "qwen3",
+            "hidden_size": 7168,
+            "intermediate_size": 14336,
+            "num_hidden_layers": 5,
+            "num_attention_heads": 96,
+            "num_key_value_heads": 16,
+            "head_dim": 64,
+            "layer_types": ["sliding_attention"] * 5,
+            "sliding_window": 2048,
+            "use_sliding_window": True,
+            "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"},
+            "vocab_size": 163840,
+        },
+    }
+    config.update(overrides)
+    return config
+
+
+def test_speculators_dspark_config_maps_onto_dflash(tmp_path) -> None:
+    (tmp_path / "config.json").write_text(json.dumps(_speculators_config()))
+    config = get_config(str(tmp_path), trust_remote_code=False)
+    assert config.architectures == ["DSparkDraftModel"]
+    assert config.num_attention_heads == 96 and config.num_key_value_heads == 16
+    assert config.sliding_window == 2048
+    assert config.block_size == 7 and config.markov_rank == 512
+    # Hidden-states indices name the tapped layer plus one.
+    assert config.dflash_config == {
+        "mask_token_id": 163839,
+        "target_layer_ids": [75, 79, 83, 87, 91],
+        "causal": True,
+    }
+    assert block_draft_is_causal(config)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"sample_from_anchor": False},
+        {
+            "transformer_layer_config": {
+                **_speculators_config()["transformer_layer_config"],
+                "layer_types": ["sliding_attention", "full_attention"] * 2
+                + ["full_attention"],
+            }
+        },
+    ],
+)
+def test_speculators_dspark_config_rejects_what_the_drafter_cannot_serve(
+    overrides,
+) -> None:
+    with pytest.raises(ValueError):
+        _convert_speculators_dspark_config(_speculators_config(**overrides))
 
 
 # --------------------------------------------------------------------------

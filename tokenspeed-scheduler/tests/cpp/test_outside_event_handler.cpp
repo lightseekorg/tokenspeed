@@ -278,7 +278,7 @@ protected:
 TEST_F(LoadBackDoneTestSuite, LoadBackDonePrefixLenChangesInForward) {
     SetupHostCache();
     // The fills' admissions evicted r1's two pages after they reached Host.
-    const CacheCoordinator::DeviceEvictionCounts seeded = scheduler_->GetHostCacheStats().device_evictions.admission;
+    const CacheEvictor::DeviceEvictionCounts seeded = scheduler_->GetHostCacheStats().device_evictions.admission;
     EXPECT_EQ(seeded.blocks, 2u);
     EXPECT_EQ(seeded.host_resident, 2u);
 
@@ -1239,7 +1239,7 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, AClaimedPromptEndStateIsSupersededOnlyB
         ASSERT_NE(FindRemoteAdmission(PlanOnce()), nullptr);
         // Each state at 9 leaves with its tail's KV block: old's as an
         // admission victim, r0's, once r1 decoded, as r1's reclaim.
-        const CacheCoordinator::DeviceEvictionStats evictions = scheduler_->GetHostCacheStats().device_evictions;
+        const CacheEvictor::DeviceEvictionStats evictions = scheduler_->GetHostCacheStats().device_evictions;
         EXPECT_EQ(evictions.admission.blocks, 2u);
         EXPECT_EQ(evictions.request_reclaim.blocks, r1_decodes ? 2u : 0u);
         SendAbortEvent("big");

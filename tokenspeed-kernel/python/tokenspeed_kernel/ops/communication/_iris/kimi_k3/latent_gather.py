@@ -35,6 +35,11 @@ from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     _iris_sanitize_lamport_bf16,
     _iris_subgroup_any,
 )
+from tokenspeed_kernel.ops.communication._iris.kimi_k3.latent_route import (
+    _k3_route_row,
+    _k3_shared_down_tile,
+)
+from tokenspeed_kernel.ops.communication._iris.synchronization import wait_vmem
 
 K3_LATENT_GATHER_ROW_WORDS = gl.constexpr(512)
 
@@ -184,11 +189,18 @@ def _k3_latent_gather_row(
     MIN_AMAX: gl.constexpr,
     FP8_MAX: gl.constexpr,
     MAX_ROWS: gl.constexpr,
+    SKIP_ROUTER: gl.constexpr = False,
 ):
-    """Wait for, copy out and clear every rank's words of ``row``."""
+    """Wait for, copy out and clear every rank's words of ``row``.
+
+    With SKIP_ROUTER the router words stay unpublished and unpolled; the
+    latent words keep their places, so both of the row's tiles still carry a
+    word from every rank.
+    """
     WORDS: gl.constexpr = 16
     LANES: gl.constexpr = 64 * NUM_WARPS // WORLD_SIZE
     PUBLISHED: gl.constexpr = ROUTER_LOCAL + LATENT_LOCAL // 2
+    UNPOLLED: gl.constexpr = ROUTER_LOCAL if SKIP_ROUTER else 0
     gl.static_assert(LANES * WORDS >= PUBLISHED)
     gl.static_assert(ROUTER_LOCAL % WORDS == 0 and 256 % WORDS == 0)
     # Thread t polls WORDS words of slot t // LANES; a retry votes with one lane mask.
@@ -197,7 +209,9 @@ def _k3_latent_gather_row(
     lane_word = gl.arange(0, WORDS, layout=gl.SliceLayout(0, layout))
     slot = thread // LANES
     first = (thread % LANES) * WORDS
-    valid = (first < PUBLISHED)[:, None] & (lane_word >= 0)[None, :]
+    valid = ((first >= UNPOLLED) & (first < PUBLISHED))[:, None] & (lane_word >= 0)[
+        None, :
+    ]
     low_stage = gl.load(epochs + row * 2).to(gl.uint32) % 3
     high_stage = gl.load(epochs + row * 2 + 1).to(gl.uint32) % 3
     stage = gl.where(first < 256, low_stage, high_stage)
@@ -388,7 +402,10 @@ def _k3_latent_shared_input(
     SHARED_N: gl.constexpr,
     HAS_LINEAR_BETA: gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    down_sync=None,
+    ARRIVE: gl.constexpr = False,
 ):
+    """Write one SiTU tile; with ARRIVE, write through and count it at ``down_sync``."""
     BLOCK_N: gl.constexpr = 128
     # The shared SiTU input, as gluon_latent_input_small_batch_epilogue_gfx950.
     layout: gl.constexpr = gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
@@ -407,11 +424,23 @@ def _k3_latent_shared_input(
     gate *= 1.0 / (1.0 + gl.exp(-gate_raw))
     if HAS_LINEAR_BETA:
         up = linear_beta * gl.extra.libdevice.tanh(up / linear_beta)
-    gl.store(
-        shared_ptr + row * SHARED_N + column,
-        (gate * up).to(shared_ptr.dtype.element_ty),
-        mask=mask,
-    )
+    if ARRIVE:
+        gl.amd.cdna4.buffer_store(
+            (gate * up).to(shared_ptr.dtype.element_ty),
+            shared_ptr,
+            row * SHARED_N + column,
+            mask=mask,
+            cache=".wt",
+        )
+        wait_vmem()
+        gl.barrier()
+        gl.atomic_add(down_sync, 1, sem="relaxed", scope="gpu")
+    else:
+        gl.store(
+            shared_ptr + row * SHARED_N + column,
+            (gate * up).to(shared_ptr.dtype.element_ty),
+            mask=mask,
+        )
 
 
 @gluon.jit(do_not_specialize=("tokens", "split_stride"))
@@ -551,4 +580,182 @@ def iris_k3moe_latent_input_gather(
             SHARED_N,
             HAS_LINEAR_BETA,
             NUM_WARPS,
+        )
+
+
+@gluon.jit(do_not_specialize=("tokens", "split_stride", "down_out_stride"))
+def iris_k3moe_latent_input_gather_routed(
+    partial_ptr,
+    shared_ptr,
+    router_ptr,
+    routed_ptr,
+    fp8_ptr,
+    sync_ptr,
+    scale_ptr,
+    region,
+    epochs,
+    regions,
+    beta,
+    linear_beta,
+    tokens,
+    split_stride,
+    bias_ptr,
+    topk_ids,
+    topk_weights,
+    sorted_ids,
+    sorted_weights,
+    sorted_expert_ids,
+    num_valid_ids,
+    route_scratch,
+    down_weight_ptr,
+    down_out_ptr,
+    down_out_stride,
+    down_sync,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+    SPLIT_K: gl.constexpr,
+    TOTAL_N: gl.constexpr,
+    ROUTER_N: gl.constexpr,
+    LATENT_N: gl.constexpr,
+    SHARED_N: gl.constexpr,
+    HAS_LINEAR_BETA: gl.constexpr,
+    MAX_ELEMENTS: gl.constexpr,
+    PEER_SIGNAL_STORE_CACHE: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+    MAX_ROWS: gl.constexpr,
+    ROUTED_SCALING_FACTOR: gl.constexpr,
+    NORMALIZE_TOPK_WEIGHTS: gl.constexpr,
+    BLOCK_SHIFT: gl.constexpr,
+    DOWN_N: gl.constexpr,
+    DOWN_BLOCK_M: gl.constexpr,
+    QUANTIZE: gl.constexpr = False,
+    MIN_AMAX: gl.constexpr = 1.0e-12,
+    FP8_MAX: gl.constexpr = 448.0,
+):
+    """``iris_k3moe_latent_input_gather`` with routing and shared projection.
+
+    ``partial_ptr`` holds every router column's partials as well, so each
+    row's router program routes the row (``_k3_route_row``) instead of
+    publishing its logits, while the gathering programs wait for the latent
+    words; ``router_ptr`` still receives the full FP32 logits. Each SiTU
+    program counts its tile at ``down_sync[0]``, and DOWN_N / (16 *
+    NUM_WARPS) programs after the rows write ``shared_ptr @ down_weight.T``
+    (``[tokens, DOWN_N]`` BF16 at ``down_out_ptr``) once every tile is in.
+    Grid ``(tokens * (1 + L / 128 rounded up + SHARED_N / 128) + DOWN_N /
+    (16 * NUM_WARPS) + tokens,)`` with ``tokens <= DOWN_BLOCK_M <= 32``.
+    """
+    BLOCK_N: gl.constexpr = 128
+    ROUTER_LOCAL: gl.constexpr = ROUTER_N // WORLD_SIZE
+    LATENT_LOCAL: gl.constexpr = LATENT_N // WORLD_SIZE
+    LATENT_TILES: gl.constexpr = (LATENT_LOCAL + BLOCK_N - 1) // BLOCK_N
+    SHARED_TILES: gl.constexpr = SHARED_N // BLOCK_N
+    PER_ROW: gl.constexpr = 1 + LATENT_TILES + SHARED_TILES
+    DOWN_TILES: gl.constexpr = DOWN_N // (16 * NUM_WARPS)
+    gl.static_assert(WORLD_SIZE == 8 and ROUTER_LOCAL <= BLOCK_N)
+    gl.static_assert(ROUTER_N % WORLD_SIZE == 0 and LATENT_LOCAL % 32 == 0)
+    gl.static_assert(SHARED_N % BLOCK_N == 0 and DOWN_N % (16 * NUM_WARPS) == 0)
+    gl.static_assert(ROUTER_LOCAL + LATENT_LOCAL // 2 <= K3_LATENT_GATHER_ROW_WORDS)
+    gl.static_assert(DOWN_BLOCK_M <= 32)
+    pid = gl.program_id(0)
+    row = pid // PER_ROW
+    job = pid % PER_ROW
+    base = row * TOTAL_N
+    # Gathering programs come last so every publisher dispatches before they
+    # spin, and the down projection waits only on SiTU programs before it.
+    if pid >= tokens * PER_ROW + DOWN_TILES:
+        _k3_latent_gather_row(
+            region,
+            epochs,
+            router_ptr,
+            routed_ptr,
+            fp8_ptr,
+            sync_ptr,
+            scale_ptr,
+            pid - tokens * PER_ROW - DOWN_TILES,
+            tokens,
+            WORLD_SIZE,
+            ROUTER_LOCAL,
+            LATENT_LOCAL,
+            MAX_ELEMENTS,
+            NUM_WARPS,
+            QUANTIZE,
+            MIN_AMAX,
+            FP8_MAX,
+            MAX_ROWS,
+            True,
+        )
+    elif pid >= tokens * PER_ROW:
+        _k3_shared_down_tile(
+            shared_ptr,
+            down_weight_ptr,
+            down_out_ptr,
+            down_out_stride,
+            down_sync,
+            tokens,
+            pid - tokens * PER_ROW,
+            tokens * SHARED_TILES,
+            SHARED_N,
+            DOWN_TILES,
+            DOWN_BLOCK_M,
+            NUM_WARPS,
+        )
+    elif job == 0:
+        _k3_route_row(
+            partial_ptr,
+            router_ptr,
+            bias_ptr,
+            topk_ids,
+            topk_weights,
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            route_scratch,
+            row,
+            tokens,
+            base,
+            split_stride,
+            SPLIT_K,
+            ROUTED_SCALING_FACTOR,
+            NORMALIZE_TOPK_WEIGHTS,
+            BLOCK_SHIFT,
+            NUM_WARPS,
+        )
+    elif job <= LATENT_TILES:
+        _k3_latent_publish_latent(
+            partial_ptr,
+            epochs,
+            regions,
+            row,
+            base,
+            split_stride,
+            job - 1,
+            RANK,
+            WORLD_SIZE,
+            SPLIT_K,
+            ROUTER_N,
+            ROUTER_LOCAL,
+            LATENT_LOCAL,
+            MAX_ELEMENTS,
+            PEER_SIGNAL_STORE_CACHE,
+            NUM_WARPS,
+        )
+    else:
+        _k3_latent_shared_input(
+            partial_ptr,
+            shared_ptr,
+            beta,
+            linear_beta,
+            row,
+            base,
+            split_stride,
+            job - 1 - LATENT_TILES,
+            SPLIT_K,
+            ROUTER_N,
+            LATENT_N,
+            SHARED_N,
+            HAS_LINEAR_BETA,
+            NUM_WARPS,
+            down_sync,
+            True,
         )

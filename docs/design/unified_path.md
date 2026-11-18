@@ -136,6 +136,31 @@ NPU graph task updates and replay run in inference mode because they write the
 output tensors allocated during capture. This applies to active and idle DP
 ranks; callers need not establish an inference context.
 
+### Whole-graph draft overlap
+
+`TOKENSPEED_DRAFT_GRAPH_OVERLAP=1` opts into an external event inside the
+complete decode graph. The graph stays intact on a round stream. After the
+first draft step has saved the accepted frontier and candidate write indices,
+the event releases the execution stream for the verified-state commit, output
+copies and the next target metadata refresh. The next draft metadata refresh
+and model forward still wait for the entire previous round.
+
+The result fence covers both the graph tail and output copies, retaining the
+graph and its events until result retirement. The control plane cannot reclaim
+request slots or pages on the prefix event. A batch membership/slot change,
+extend or history reset joins before modifying request state; other device
+tasks use the existing `DeviceHandle.settle` boundary. Graph release drains
+the round before dropping captured resources.
+
+The opt-in requires NVIDIA decode graphs, an MTP greedy chain with at least
+two draft steps, DP1/PP1, disjoint target/draft cache layers and separate metadata
+owners. The draft model must declare `supports_draft_overlap`: after step one,
+its tail cannot depend on buffers changed by verified-state commit or next-target
+preparation. Model implementations, including subclasses, own this contract.
+Grammar, draft token history, expert-load recording and MegaMoE's shared row
+mask are rejected at startup. Eager, extend and idle execution retain their
+normal stream ordering.
+
 ### Buffer sizing: the ladder is a performance subset, never a capacity limit
 
 Request slot capacity is independent of forward batch capacity. PD decode

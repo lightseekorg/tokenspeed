@@ -45,10 +45,14 @@ def _require_iris():
     pytest.importorskip("tokenspeed_kernel.ops.communication._iris")
 
 
-@pytest.mark.parametrize("block_m", (1, 2, 4, None))
-def test_moe_gather_tail_codegen(block_m, tmp_path):
+@pytest.mark.parametrize(
+    ("block_m", "mix"),
+    ((1, False), (2, False), (4, False), (None, False), (None, True)),
+)
+def test_moe_gather_tail_codegen(block_m, mix, tmp_path):
     """Senders keep 16-byte vectors in registers; the reducer's retry rereads its
-    words and votes with one lane mask. ``None`` is the MFMA sender."""
+    words and votes with one lane mask. ``None`` is the MFMA sender, ``mix``
+    its row finishers."""
     from tokenspeed_kernel._triton import gluon, triton
     from tokenspeed_kernel.ops.communication._iris.all_reduce import (
         iris_arch_policy,
@@ -73,7 +77,7 @@ def test_moe_gather_tail_codegen(block_m, tmp_path):
     }
     if block_m is None:
         fn = iris_k3moe_mfma_lamport_gather
-        constants["CHUNK"] = 64
+        constants.update({"CHUNK": 64, "HAS_MIX": mix})
     else:
         fn = iris_k3moe_gemv_lamport_gather
         constants.update(
@@ -102,9 +106,11 @@ def test_moe_gather_tail_codegen(block_m, tmp_path):
             # Runtime scalars without divisibility annotations.
             signature[name] = "i32"
             continue
-        elif name == "eps":
+        elif name in ("eps", "mix_eps"):
             signature[name] = "fp32"
             continue
+        elif name in ("mix_m_ptr", "mix_s_ptr", "mix_acc_ptr"):
+            signature[name] = "*fp32"
         else:
             signature[name] = "*bf16"
         attrs[(index,)] = [["tt.divisibility", 16]]
@@ -117,7 +123,7 @@ def test_moe_gather_tail_codegen(block_m, tmp_path):
         options={"num_warps": 8},
     )
     assembly = kernel.asm["amdgcn"]
-    (tmp_path / f"moe-gather-tail-m{block_m}.amdgcn").write_text(assembly)
+    (tmp_path / f"moe-gather-tail-m{block_m}-mix{int(mix)}.amdgcn").write_text(assembly)
     assert not re.search(r"\bbuffer_(?:load_ushort|store_short)\b", assembly)
     assert re.search(r"\.vgpr_spill_count:\s+0\b", assembly)
     if block_m is None:
@@ -164,7 +170,9 @@ def _bf16_ulps(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 def _check_gather_tail(
     rank: int, device: torch.device, group: dist.ProcessGroup
 ) -> None:
+    from tokenspeed_kernel.ops.activation.triton import attnres_combine, attnres_partial
     from tokenspeed_kernel.ops.communication._iris.kimi_k3 import (
+        K3AttentionMix,
         prepare_k3_communication,
     )
     from tokenspeed_kernel.ops.communication._iris.kimi_k3.moetail_gather import (
@@ -219,10 +227,50 @@ def _check_gather_tail(
         normed = rmsnorm(routed, norm_weight, _EPS)
         return kimi3_latent_projection_add3(normed, weight, prefix, shared)
 
-    def gathered(routed, shared, prefix):
-        assert state.can_moe_gather_tail(routed, shared, prefix, weight, norm_weight)
+    def gathered(routed, shared, prefix, mix=None):
+        assert state.can_moe_gather_tail(
+            routed, shared, prefix, weight, norm_weight, mix
+        )
         return state.moe_gather_tail(
-            routed, shared, prefix, weight, norm_weight=norm_weight, eps=_EPS
+            routed,
+            shared,
+            prefix,
+            weight,
+            norm_weight=norm_weight,
+            eps=_EPS,
+            attention_mix=mix,
+        )
+
+    # The next layer's AttnRes attention mix: its weights and block partial.
+    mix_weight = (torch.randn((_HIDDEN,), generator=generator, device=device) / 20).to(
+        torch.bfloat16
+    )
+    mix_norm_weight = (
+        torch.rand((_HIDDEN,), generator=generator, device=device) + 0.5
+    ).to(torch.bfloat16)
+    blocks = torch.randn((3, 32, _HIDDEN), generator=generator, device=device).to(
+        torch.bfloat16
+    )
+    scratch = (
+        torch.empty((32,), dtype=torch.float32, device=device),
+        torch.empty((32,), dtype=torch.float32, device=device),
+        torch.empty((32, _HIDDEN), dtype=torch.float32, device=device),
+    )
+    attnres_partial(blocks, mix_weight, _EPS, scratch)
+
+    def attention_mix(rows):
+        m, s, acc = (t[:rows] for t in scratch)
+        return K3AttentionMix(mix_weight, mix_norm_weight, _EPS, m, s, acc)
+
+    def combined(rows, prefix):
+        mix = attention_mix(rows)
+        return attnres_combine(
+            prefix,
+            mix_weight,
+            mix_norm_weight,
+            _EPS,
+            (mix.scratch_m, mix.scratch_s, mix.scratch_acc),
+            torch.empty_like(prefix),
         )
 
     # Reductions and gathers share mailbox tile epochs: interleave them at varied rows.
@@ -263,6 +311,15 @@ def _check_gather_tail(
             gathered(routed[:narrow], shared[:narrow], prefix[:narrow]),
             result[:narrow],
         )
+        # Row finishers gather the same rows and mix them as attnres_combine does.
+        mixable = 4 < rows <= 32
+        assert mixable == state.can_moe_gather_tail(
+            routed, shared, prefix, weight, norm_weight, attention_mix(min(rows, 32))
+        )
+        if mixable:
+            out, mixed = gathered(routed, shared, prefix, attention_mix(rows))
+            assert torch.equal(out, result)
+            assert torch.equal(mixed, combined(rows, out))
 
     # Wider batches and misaligned rows take the ordinary tail.
     routed = torch.zeros((193, _LATENT), dtype=torch.bfloat16, device=device)
@@ -279,10 +336,15 @@ def _check_gather_tail(
     dist.barrier(group=group, device_ids=[rank])
 
     # Captured layers alternate reduce and gather, one rank late, without recompiling.
-    layer_rows = (4, 3, 8, 16, 32, 64, 192, 13, 128, 2)
-    for rows in layer_rows:
+    layer_rows = (4, 3, 8, 16, 32, 64, 192, 13, 128, 2, 8, 24)
+    # Layers that also mix the next attention input.
+    mixing = (False,) * 10 + (True, True)
+    layer_mixes = [
+        attention_mix(rows) if mix else None for rows, mix in zip(layer_rows, mixing)
+    ]
+    for rows, mix in zip(layer_rows, layer_mixes):
         routed, shared = reduce(rows, 200 + rows)
-        gathered(routed, shared, torch.zeros_like(shared))
+        gathered(routed, shared, torch.zeros_like(shared), mix)
     prefixes = [
         torch.randn((rows, _HIDDEN), generator=generator, device=device).to(
             torch.bfloat16
@@ -292,10 +354,15 @@ def _check_gather_tail(
     expected = []
     for layer, rows in enumerate(layer_rows):
         routed, shared = (t.clone() for t in reduce(rows, 300 + layer))
-        expected.append(gathered(routed, shared, prefixes[layer]).clone())
+        result = gathered(routed, shared, prefixes[layer], layer_mixes[layer])
+        expected.append(
+            tuple(t.clone() for t in result)
+            if isinstance(result, tuple)
+            else (result.clone(),)
+        )
     torch.cuda.synchronize()
     dist.barrier(group=group, device_ids=[rank])
-    snapshots = [torch.empty_like(t) for t in expected]
+    snapshots = [tuple(torch.empty_like(t) for t in oracle) for oracle in expected]
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream), assert_no_triton_compile(
         iris_k3moe_gemv_lamport_gather, iris_k3moe_mfma_lamport_gather
@@ -306,14 +373,21 @@ def _check_gather_tail(
                 if rank == (layer * 3 + 1) % 8:
                     torch.cuda._sleep(100_000)
                 routed, shared = reduce(rows, 300 + layer)
-                snapshots[layer].copy_(gathered(routed, shared, prefixes[layer]))
+                result = gathered(routed, shared, prefixes[layer], layer_mixes[layer])
+                for snapshot, value in zip(
+                    snapshots[layer],
+                    result if isinstance(result, tuple) else (result,),
+                    strict=True,
+                ):
+                    snapshot.copy_(value)
     torch.cuda.synchronize()
     dist.barrier(group=group, device_ids=[rank])
     for _ in range(3):
         graph.replay()
         torch.cuda.synchronize()
         for snapshot, oracle in zip(snapshots, expected, strict=True):
-            assert torch.equal(snapshot, oracle)
+            for value, reference in zip(snapshot, oracle, strict=True):
+                assert torch.equal(value, reference)
     dist.barrier(group=group, device_ids=[rank])
 
 

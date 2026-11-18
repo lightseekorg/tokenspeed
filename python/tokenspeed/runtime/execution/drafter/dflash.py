@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
+from tokenspeed_kernel.ops.gemm import mm as kernel_mm
 from tokenspeed_kernel.ops.kvcache.triton import (
     LatentPlanes,
     check_mla_latent_geometry,
@@ -227,6 +228,8 @@ class DFlash(BaseDrafter):
         # Legacy alias: callers that predate the verify/draft split.
         self.block_size = self.verify_width
         self.hidden_size = int(getattr(cfg, "hidden_size"))
+        # A draft-owned mask row replaces the target's; wire_target binds it.
+        self.mask_embedding_partial: torch.Tensor | None = None
         self._init_native_buffers()
         self._validate_draft_attention_window()
         self._validate_draft_window_sink()
@@ -426,6 +429,25 @@ class DFlash(BaseDrafter):
         if self.embed_tokens is None:
             self.embed_tokens = self.model.embed_tokens
         self._first_layer_input = self._first_layer_input_mode()
+        # Drafts without their own embedding table use the target's mask row.
+        own_mask_embedding = getattr(self.model, "own_mask_embedding", None)
+        own_row = own_mask_embedding() if own_mask_embedding is not None else None
+        self.mask_embedding_partial = None
+        if own_row is not None:
+            logger.info(
+                "Block draft uses its own embedding for mask token "
+                f"{self.mask_token_id}."
+            )
+            # The row joins the first layer's input as _first_layer_embeds
+            # hands it in: whole on every rank ("full"), else whole on the
+            # dense group's first rank and zeros on the others.
+            whole = (
+                self._first_layer_input == "full"
+                or self.model.mapping.dense.tp_rank == 0
+            )
+            self.mask_embedding_partial = (
+                own_row if whole else torch.zeros_like(own_row)
+            )
         self.lm_head = target_model.lm_head
         self.logits_processor = language_model.logits_processor
         self._replicate_head_over_attention_dp()
@@ -674,10 +696,14 @@ class DFlash(BaseDrafter):
             self.lm_head, "shard_indices"
         ):
             # Replicated draft rows: no query shard.
-            metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None)
-            logits = self.logits_processor._get_logits(
-                hidden_states, self.lm_head, metadata, require_full_vocab=False
-            )
+            if base_logits is None:
+                metadata = LogitsMetadata(
+                    forward_mode=ForwardMode.DECODE, query_shard=None
+                )
+                base_logits = self.logits_processor._get_logits(
+                    hidden_states, self.lm_head, metadata, require_full_vocab=False
+                )
+            logits = base_logits
             if bias_fn is not None:
                 logits = logits + bias_fn(0, int(logits.shape[-1])).to(logits.dtype)
             argmax = torch.argmax(logits, dim=-1)
@@ -987,6 +1013,24 @@ class DFlash(BaseDrafter):
         # Same order as __init__.
         self._init_context_taps()
 
+    def _draft_cache_page_sharded(self) -> bool:
+        """Whether any draft layer's cache group is page-sharded (KVP).
+
+        Asks the pool's plan, not the layers: this runs at construction,
+        before bind_cache_groups stamps the layers' groups.
+        """
+        if self.draft_model_runner.mapping.attn.kvp_size == 1:
+            return False
+        pool = self.token_to_kv_pool
+        shard_counts = {
+            str(spec.group_id): spec.shard_count
+            for spec in pool.arena.cache_group_specs
+        }
+        return any(
+            shard_counts[group_id] > 1
+            for group_id in pool.history_group_by_layer().values()
+        )
+
     def _init_fused_kv_helper(self) -> None:
         """Pre-stack KV weights, k_norm, eps, and cos_sin_cache for the bound pool."""
         self._fused_kv_enabled = False
@@ -995,12 +1039,12 @@ class DFlash(BaseDrafter):
         self._fused_kv_workspace_dtype = None
         self._fused_kv_proj_workspace = None
         self._fused_kv_latent_planes: LatentPlanes | None = None
-        # torch.mm(out=...) is always used; workspace pre-allocated at warmup.
+        # The projection writes into a workspace pre-allocated at warmup.
         self._fused_kv_k_buffers = []
         self._fused_kv_v_buffers = []
         if not self.uses_shared_context_projection:
             return
-        if self.draft_model_runner.mapping.attn.kvp_size > 1:
+        if self._draft_cache_page_sharded():
             # The fused scatter takes physical slots and has no ownership
             # mask; the per-layer writer translates through the placement.
             logger.info(
@@ -1069,8 +1113,7 @@ class DFlash(BaseDrafter):
                 k_norm_rows.append(attn.k_norm.weight)
                 eps_values.append(float(attn.k_norm.variance_epsilon))
 
-            flat_kv_weight = torch.cat(kv_weight_rows, dim=0)
-            self._fused_kv_flat_weight_t = flat_kv_weight.t().contiguous()
+            self._fused_kv_flat_weight = torch.cat(kv_weight_rows, dim=0).contiguous()
             self._fused_kv_k_norm_weight = torch.stack(k_norm_rows, dim=0).contiguous()
             self._fused_kv_eps = torch.tensor(
                 eps_values, dtype=torch.float32, device=self.device
@@ -1392,7 +1435,7 @@ class DFlash(BaseDrafter):
         self._ensure_fused_workspace(total_ctx, ctx_hidden.dtype)
 
         proj_out_2d = self._fused_kv_proj_workspace[:total_ctx]
-        torch.mm(ctx_hidden, self._fused_kv_flat_weight_t, out=proj_out_2d)
+        kernel_mm(ctx_hidden, self._fused_kv_flat_weight, out=proj_out_2d)
 
         proj_out = proj_out_2d.view(
             total_ctx, self._fused_kv_n_layers, self._fused_kv_layer_out_dim
@@ -1502,6 +1545,11 @@ class DFlash(BaseDrafter):
 
         flat_ids = block_ids.reshape(-1)
         input_embeds = self._first_layer_embeds(flat_ids)
+        if self.mask_embedding_partial is not None:
+            # Row 0 is the anchor; every later row is the mask token.
+            input_embeds.view(bs, self.draft_query_width, -1)[:, 1:].copy_(
+                self.mask_embedding_partial
+            )
 
         with torch.inference_mode():
             logits_output = self.draft_model_runner.forward(
