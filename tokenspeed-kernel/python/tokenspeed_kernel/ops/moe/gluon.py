@@ -1461,6 +1461,13 @@ _GFX1250_DECODE_MAX_AVERAGE_BPE = 16
 # The A8W4 SiTU GEMMs cross later: on Kimi K3 TP8 decode measured 195.9 vs
 # 208.2 us at 20.6 rows an expert, 209.2 vs 215.4 us at 22.9, and even at 25.
 _GFX1250_A8W4_SITU_DECODE_MAX_AVERAGE_BPE = 24
+# So do the MXFP4-activation GEMMs over a down weight stored in K planes,
+# where the decode down projection streams contiguous tiles. Decode against
+# prefill at 20 rows an expert: DSV4.1 Flash TP4 161.3 vs 169.2 us, Qwen3.8
+# Flash TP2 88.4 vs 97.1 us, Muse Spark TP8 93.2 vs 103.7 us. At 24 rows Muse
+# Spark measured 95.5 vs 102.8 us and DSV4.1 Flash 173.9 vs 172.4 us; at 32
+# rows DSV4.1 Flash measured 195.8 vs 186.0 us.
+_GFX1250_KPLANE_DECODE_MAX_AVERAGE_BPE = 24
 _warmed_a4w4_ep_families: set[tuple] = set()
 
 
@@ -2597,7 +2604,11 @@ if platform.is_amd:
         decode = _use_gfx1250_moe_decode(
             topk_ids.numel(),
             w.w13_weight_triton_tensor.shape[0],
-            _GFX1250_DECODE_MAX_AVERAGE_BPE,
+            (
+                _GFX1250_KPLANE_DECODE_MAX_AVERAGE_BPE
+                if getattr(w.w2_weight_triton_tensor, "kplane_rows", 0)
+                else _GFX1250_DECODE_MAX_AVERAGE_BPE
+            ),
         )
 
         return fused_mxfp_gfx1250.gluon_mxfp_precomputed_mxfp4_fused_moe(
