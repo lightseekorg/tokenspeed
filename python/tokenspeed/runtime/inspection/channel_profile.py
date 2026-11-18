@@ -27,8 +27,6 @@ that is quiet here is not necessarily quiet for other inputs or checkpoints.
 
 from __future__ import annotations
 
-import math
-import statistics
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -39,6 +37,15 @@ import torch
 from torch import nn
 from torch.utils.hooks import RemovableHandle
 
+from tokenspeed.runtime.inspection.channel_profile_report import (
+    LayerHostTotals,
+    build_layer_report,
+    nonnegative_finite,
+    rank_profile_candidates,
+    select_watchlist,
+    validate_candidate_limit,
+    validate_watchlist_thresholds,
+)
 from tokenspeed.runtime.layers.activation import SiluAndMul
 from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.mlp import GatedMLP, GatedMLPFusion
@@ -55,12 +62,6 @@ class _ChannelSums:
     sum_contribution: torch.Tensor
     max_contribution: torch.Tensor
     histogram: torch.Tensor
-
-
-def _nonnegative_finite(value: float, name: str) -> float:
-    if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
-        raise ValueError(f"{name} must be a finite nonnegative number")
-    return float(value)
 
 
 def _validate_profile_model(
@@ -87,11 +88,11 @@ def _validate_profile_model(
 def _normalize_profile_thresholds(
     activation_threshold: float, histogram_edges: Sequence[float]
 ) -> tuple[float, tuple[float, ...], torch.Tensor]:
-    activation_threshold = _nonnegative_finite(
+    activation_threshold = nonnegative_finite(
         activation_threshold, "activation_threshold"
     )
     edges = tuple(
-        _nonnegative_finite(value, "histogram edge") for value in histogram_edges
+        nonnegative_finite(value, "histogram edge") for value in histogram_edges
     )
     if (
         not edges
@@ -436,48 +437,20 @@ class ChannelActivityProfiler:
         self._require_unchanged_parameters()
         layers = []
         for layer_index, total in enumerate(self._totals):
-            rows = total.rows
             # Copy each aggregate once. Per-channel .item() would force one
             # device synchronization for every field of every channel.
-            sum_abs = total.sum_abs.cpu().tolist()
-            sum_square = total.sum_square.cpu().tolist()
-            max_abs = total.max_abs.cpu().tolist()
-            active_count = total.active_count.cpu().tolist()
-            sum_contribution = total.sum_contribution.cpu().tolist()
-            max_contribution = total.max_contribution.cpu().tolist()
-            histograms = total.histogram.cpu().tolist()
-            down_column_norms = self._down_norms[layer_index].cpu().tolist()
-            down_norm_median = statistics.median(down_column_norms)
-            channels = []
-            for channel in range(len(sum_abs)):
-                channels.append(
-                    {
-                        "layer": layer_index,
-                        "channel": channel,
-                        "sample_count": rows,
-                        "mean_abs": sum_abs[channel] / rows,
-                        "rms": math.sqrt(sum_square[channel] / rows),
-                        "max_abs": max_abs[channel],
-                        "active_count": active_count[channel],
-                        "active_fraction": active_count[channel] / rows,
-                        "down_column_norm": down_column_norms[channel],
-                        "down_norm_ratio_to_layer_median": (
-                            down_column_norms[channel] / down_norm_median
-                            if down_norm_median > 0
-                            else None
-                        ),
-                        "mean_contribution": sum_contribution[channel] / rows,
-                        "max_contribution": max_contribution[channel],
-                        "histogram_counts": histograms[channel],
-                    }
-                )
-            layers.append(
-                {
-                    "layer": layer_index,
-                    "down_norm_median": down_norm_median,
-                    "channels": channels,
-                }
+            host_totals = LayerHostTotals(
+                rows=total.rows,
+                sum_abs=total.sum_abs.cpu().tolist(),
+                sum_square=total.sum_square.cpu().tolist(),
+                max_abs=total.max_abs.cpu().tolist(),
+                active_count=total.active_count.cpu().tolist(),
+                sum_contribution=total.sum_contribution.cpu().tolist(),
+                max_contribution=total.max_contribution.cpu().tolist(),
+                histograms=total.histogram.cpu().tolist(),
+                down_column_norms=self._down_norms[layer_index].cpu().tolist(),
             )
+            layers.append(build_layer_report(layer_index, host_totals))
         return {
             "schema": "channel-activity-profile-v1",
             "model_identity": self._model_identity,
@@ -496,22 +469,8 @@ class ChannelActivityProfiler:
         does not classify any channel as inherently safe, unsafe or dormant.
         ``limit=None`` returns all channels. Ties use layer and channel index.
         """
-        if limit is not None and (type(limit) is not int or limit <= 0):
-            raise ValueError("limit must be a positive integer or None")
-        rows = [
-            channel
-            for layer in self.profile()["layers"]
-            for channel in layer["channels"]
-        ]
-        rows.sort(
-            key=lambda channel: (
-                channel["active_fraction"],
-                channel["mean_contribution"],
-                channel["layer"],
-                channel["channel"],
-            )
-        )
-        return rows if limit is None else rows[:limit]
+        limit = validate_candidate_limit(limit)
+        return rank_profile_candidates(self.profile(), limit=limit)
 
     def freeze_watchlist(
         self,
@@ -536,77 +495,14 @@ class ChannelActivityProfiler:
         change relative to these observations; it does not certify benign or
         malicious behavior.
         """
-        max_active_fraction = _nonnegative_finite(
-            max_active_fraction, "max_active_fraction"
+        thresholds = validate_watchlist_thresholds(
+            max_active_fraction=max_active_fraction,
+            max_mean_contribution=max_mean_contribution,
+            max_observed_contribution=max_observed_contribution,
+            min_down_norm_ratio=min_down_norm_ratio,
+            max_outlier_active_fraction=max_outlier_active_fraction,
+            min_observed_rows=min_observed_rows,
+            runtime_multiplier=runtime_multiplier,
+            contribution_floor=contribution_floor,
         )
-        max_mean_contribution = _nonnegative_finite(
-            max_mean_contribution, "max_mean_contribution"
-        )
-        max_observed_contribution = _nonnegative_finite(
-            max_observed_contribution, "max_observed_contribution"
-        )
-        min_down_norm_ratio = _nonnegative_finite(
-            min_down_norm_ratio, "min_down_norm_ratio"
-        )
-        max_outlier_active_fraction = _nonnegative_finite(
-            max_outlier_active_fraction, "max_outlier_active_fraction"
-        )
-        runtime_multiplier = _nonnegative_finite(
-            runtime_multiplier, "runtime_multiplier"
-        )
-        contribution_floor = _nonnegative_finite(
-            contribution_floor, "contribution_floor"
-        )
-        if (
-            max_active_fraction > 1
-            or min_down_norm_ratio <= 0
-            or max_outlier_active_fraction > 1
-            or runtime_multiplier < 1
-            or contribution_floor <= 0
-        ):
-            raise ValueError(
-                "Require fractions <= 1, norm ratio > 0, multiplier >= 1, "
-                "and floor > 0"
-            )
-        if type(min_observed_rows) is not int or min_observed_rows <= 0:
-            raise ValueError("min_observed_rows must be a positive integer")
-        profile = self.profile()
-        if any(
-            layer["channels"][0]["sample_count"] < min_observed_rows
-            for layer in profile["layers"]
-        ):
-            raise ValueError("Profile has fewer rows than min_observed_rows")
-        entries = []
-        for layer in profile["layers"]:
-            for channel in layer["channels"]:
-                quiet = (
-                    channel["active_fraction"] <= max_active_fraction
-                    and channel["mean_contribution"] <= max_mean_contribution
-                    and channel["max_contribution"] <= max_observed_contribution
-                )
-                ratio = channel["down_norm_ratio_to_layer_median"]
-                norm_outlier = (
-                    ratio is not None
-                    and ratio >= min_down_norm_ratio
-                    and channel["active_fraction"] <= max_outlier_active_fraction
-                )
-                if quiet or norm_outlier:
-                    contribution_limit = max(
-                        channel["max_contribution"] * runtime_multiplier,
-                        contribution_floor,
-                    )
-                    if not math.isfinite(contribution_limit):
-                        raise ValueError("Calculated contribution limit is nonfinite")
-                    entries.append(
-                        {
-                            "layer": channel["layer"],
-                            "channel": channel["channel"],
-                            "contribution_limit": contribution_limit,
-                        }
-                    )
-        entries.sort(key=lambda entry: (entry["layer"], entry["channel"]))
-        return {
-            "schema": "channel-watchlist-v1",
-            "model_identity": self._model_identity,
-            "entries": entries,
-        }
+        return select_watchlist(self.profile(), thresholds)
