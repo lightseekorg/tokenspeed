@@ -18,6 +18,15 @@ channel. It also records
 estimates the magnitude of the channel's contribution at the down projection.
 The final logits also depend on the residual stream and subsequent operations.
 
+This measurement applies to any dense MLP that projects an activation vector
+with a linear weight matrix. Channel `i` contributes its activation times
+column `i` of that matrix. For example, TokenSpeed's [dense Llama](../../python/tokenspeed/runtime/models/llama.py)
+and [dense Qwen3](../../python/tokenspeed/runtime/models/qwen3.py) use the same
+`GatedMLP` for this operation. The profiler and watcher currently accept only
+dense Qwen3. Enabling another model requires checking where its forward exposes
+the activation and verifying that observation preserves its full logits. A new
+checkpoint also needs its own calibration profile.
+
 The caller supplies the workload and a nonempty model identity. The watcher
 requires the same identity string as the profile. Keep the model fixed while
 recording and retain the checkpoint revision with the profile. Each statistic

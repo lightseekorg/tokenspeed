@@ -9,6 +9,14 @@ the original forward.
 
 ## Scope and ownership
 
+The replay method can be applied to other models by recording the inputs to
+their final down projection and executing their own residual addition, final
+normalization, output head, and logit-row selection. Dense Llama, for example,
+uses the same gated MLP and inherits the same final norm and logits path as
+dense Qwen3 in TokenSpeed. A model adapter must still reproduce the original
+logits and match a separate full-model intervention on that model. The current
+adapter implements this for dense Qwen3; checkpoint validation used Qwen3-0.6B.
+
 The initial adapter accepts the ordinary dense `Qwen3ForCausalLM`, unquantized
 BF16 or FP32 tensors, one device (TP=PP=DP=1), and eager execution. Fused
 GEMM/SwiGLU paths, quantization, speculative execution, monokernels, and graph
