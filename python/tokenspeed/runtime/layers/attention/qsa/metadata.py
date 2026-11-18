@@ -121,12 +121,13 @@ def qsa_forward_layout(
     if backend is None:
         raise RuntimeError("QSA requires an indexer backend")
     metadata = backend.metadata_for(ctx.forward_mode)
-    query_lengths = decode_query_lengths(
-        ctx,
-        total_tokens,
-        force_uniform=False,
+    verify = ctx.verify_queries
+    query_lengths = (
+        verify.query_lengths
+        if verify is not None
+        else decode_query_lengths(ctx, total_tokens, force_uniform=False)
     )
-    queries_per_request = query_lengths
+    queries_per_request = None if verify is not None else query_lengths
     if query_lengths is None:
         if metadata.extend_seq_lens is None:
             raise RuntimeError("QSA extend metadata requires query lengths")
@@ -138,6 +139,10 @@ def qsa_forward_layout(
     qsa_page_table = metadata.qsa_block_table
     recent_page_table = metadata.recent_block_table
     seq_lens = metadata.seq_lens[: ctx.bs]
+    if verify is not None:
+        # The scheduler still reserves a full verify window. Only its leading
+        # prefix is computed, so preserve the original window's start position.
+        seq_lens = seq_lens - verify.width + verify.query_lengths
     logical, requests, qsa_locs, recent_locs, complete_blocks = (
         qwen4_exp_qsa_prepare_metadata(
             seq_lens,
@@ -150,6 +155,7 @@ def qsa_forward_layout(
             compress_ratio,
             enable_pdl=pdl_enabled(),
             draft_logical_positions=reset_draft_tags,
+            query_start_loc=None if verify is None else verify.query_offsets,
         )
     )
     layout = QSALayout(

@@ -25,8 +25,62 @@ or distributed operations belong in this policy.
 """
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
+from itertools import accumulate
+from operator import mul
+
+
+def expected_prefix_tokens(rates: Sequence[Sequence[float]]) -> list[float]:
+    """Expected output for each additional query after the request anchors."""
+    gains = sorted((p for row in rates for p in accumulate(row, mul)), reverse=True)
+    return list(accumulate(gains, initial=float(len(rates))))
+
+
+class VerifyBudgetPlanner:
+    """Select Q from startup graph costs and expected accepted tokens."""
+
+    def __init__(self, width: int):
+        if width < 2:
+            raise ValueError("confidence requires a draft window")
+        self.width = width
+        self.baselines: dict[tuple[int, int], float] = {}
+
+    def set_baseline(self, batch: int, queries: int, milliseconds: float) -> None:
+        if (
+            batch < 1
+            or not batch <= queries <= batch * self.width
+            or not (math.isfinite(milliseconds) and milliseconds > 0)
+        ):
+            raise ValueError("invalid confidence timing sample")
+        self.baselines[batch, queries] = milliseconds
+
+    def select(
+        self,
+        batch: int,
+        rates: Sequence[Sequence[float]],
+        *,
+        capacities: Collection[int] | None = None,
+    ) -> int:
+        if batch < 1 or len(rates) > batch:
+            raise ValueError("invalid confidence batch")
+        if any(len(row) != self.width - 1 for row in rates):
+            raise ValueError("confidence width mismatch")
+        rewards = expected_prefix_tokens(
+            [
+                [min(1, max(0, p)) if math.isfinite(p) else 0 for p in row]
+                for row in rates
+            ]
+        )
+        # An unprofiled batch (e.g. above the capture ladder) keeps full width.
+        best_q, best_rate = batch * self.width, -1
+        for (b, q), cost in sorted(self.baselines.items()):
+            if b != batch or (capacities is not None and q not in capacities):
+                continue
+            rate = rewards[min(q - len(rates), len(rewards) - 1)] / cost
+            if rate > best_rate:
+                best_q, best_rate = q, rate
+        return best_q
 
 
 @dataclass(frozen=True)
@@ -141,19 +195,16 @@ class VerifyBudgetPolicy:
         # An idle rank contributes neither anchors nor draft gains.
         rewards = [float(sum(sizes))] * (full + 1)
         for scores in rank_scores:
-            gains = []
+            probabilities = []
             for row in scores:
-                survival = 1.0
+                converted = []
                 for score in row:
                     exp = math.exp(-abs(score))
-                    survival *= 1 / (1 + exp) if score >= 0 else exp / (1 + exp)
-                    gains.append(survival)
-            gains.sort(reverse=True)
-            prefix = [0.0]
-            for gain in gains:
-                prefix.append(prefix[-1] + gain)
+                    converted.append(1 / (1 + exp) if score >= 0 else exp / (1 + exp))
+                probabilities.append(converted)
+            prefix = expected_prefix_tokens(probabilities)
             for q in range(padded, full + 1):
-                rewards[q] += prefix[min(q - padded, len(gains))]
+                rewards[q] += prefix[min(q - padded, len(prefix) - 1)] - len(scores)
         native_rate = rewards[-1] / native_step_ms
         best_q = full
         best_rate = native_rate * (1 + self.min_gain)

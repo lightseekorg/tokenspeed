@@ -30,6 +30,7 @@ tvm-ffi's C ABI, without the GIL, as the engine host's do.
 
 from __future__ import annotations
 
+import inspect
 import threading
 from typing import Any
 
@@ -195,7 +196,7 @@ int32_t TraverseDraftTree(
     DLTensor masks = HostTensor(bitmask, mask_shape, 2, 32);
     TVMFFIAny rest[6] = {TensorArg(&next), TensorArg(&sibling), TensorArg(&drafts),
                          TensorArg(&masks), FloatArg(-1.0), NoneArg()};
-    return Call("traverse_draft_tree", handle, rest, 6) < 0 ? -1 : 0;
+    return Call("traverse_draft_tree", handle, rest, XGRAMMAR_TRAVERSE_ARGS) < 0 ? -1 : 0;
 }
 
 int32_t Retain(uint64_t handle) {
@@ -292,12 +293,26 @@ def _load() -> tuple[Any, HostGrammarEntries]:
             from tvm_ffi import libinfo
             from xgrammar.base import _core
 
+            # Match the installed matcher ABI: newer xgrammar adds an optional
+            # traversal argument. The test adapter supplies None when present.
+            traversal_args = (
+                len(
+                    inspect.signature(xgr.GrammarMatcher.traverse_draft_tree).parameters
+                )
+                - 1
+            )
+            if traversal_args not in (5, 6):
+                raise RuntimeError(
+                    f"Unsupported xgrammar traversal ABI: {traversal_args} arguments"
+                )
+
             # Link the libtvm_ffi xgrammar loaded: the error state is per library.
             tvm_ffi_dir = os.path.dirname(libinfo.find_libtvm_ffi())
             ext = load_inline(
                 name="tokenspeed_test_grammar_entries",
                 cpp_sources=[_CPP_SRC],
-                extra_cflags=["-O2"] + [f"-I{d}" for d in libinfo.include_paths()],
+                extra_cflags=["-O2", f"-DXGRAMMAR_TRAVERSE_ARGS={traversal_args}"]
+                + [f"-I{d}" for d in libinfo.include_paths()],
                 extra_ldflags=[
                     f"-L{tvm_ffi_dir}",
                     "-ltvm_ffi",

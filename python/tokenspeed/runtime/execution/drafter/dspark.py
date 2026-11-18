@@ -15,13 +15,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Static DSpark drafter.
-
-Static Markov head and fixed verify window (verify-all). Greedy by default;
---enable-speculative-sampling samples each Markov step through the shared
-sampler, on this rank's vocabulary shard when the sampled rows stay sharded.
-No confidence head / SPS-STS / ragged verify.
-"""
+"""DSpark block proposal with checkpoint-trained acceptance confidence."""
 
 from __future__ import annotations
 
@@ -65,6 +59,20 @@ class DSpark(DFlash):
     spec_algorithm = "DSPARK"
     supports_speculative_sampling = True
 
+    def decode_graph_query_capacities(self, bs: int) -> tuple[int, ...]:
+        if self.qwen4_adaptive_verify:
+            return tuple(range(bs, bs * self.spec_num_tokens + 1, bs))
+        return super().decode_graph_query_capacities(bs)
+
+    def prepare_target_forward(self, ctx) -> None:
+        if ctx.verify_queries is not None:
+            # Packed target rows need their original request layout. Project the
+            # request-shaped draft context after their compact taps return.
+            self._incremental_kv_write_done = False
+            ctx.target_capture_sink = None
+            return
+        super().prepare_target_forward(ctx)
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.markov_head = getattr(self.model, "markov_head", None)
@@ -73,6 +81,34 @@ class DSpark(DFlash):
                 "DSPARK requires the draft model to define a markov_head "
                 "(use a DSparkDraftModel checkpoint with markov_rank > 0)."
             )
+        self.confidence_head = self.model.confidence_head
+        self.qwen4_adaptive_verify = (
+            self.draft_model_runner.server_args.enable_qwen4_adaptive_dspark
+        )
+        if self.qwen4_adaptive_verify and (
+            self.confidence_head is None or not self.model.confidence_weights_loaded
+        ):
+            raise ValueError(
+                "confidence verification requires a loaded DSpark confidence head"
+            )
+        self.confidence_rates: torch.Tensor | None = None
+        self.confidence_group = None
+        if self.qwen4_adaptive_verify:
+            mapping = self.draft_model_runner.server_args.mapping
+            if mapping.world_size > 1:
+                from tokenspeed.runtime.distributed.process_group_manager import (
+                    process_group_manager,
+                )
+
+                self.confidence_group = process_group_manager.get_device_process_group(
+                    mapping.world_group
+                )
+            self.confidence_rates = torch.empty(
+                (self.input_buffers.max_bs, self.spec_num_tokens - 1),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            self.runtime_states.init_draft_confidence(self.spec_num_tokens - 1)
         self._walk_words: torch.Tensor | None = None
         self._walk_gathered: torch.Tensor | None = None
         # Resolved by the first greedy walk outside graph capture.
@@ -126,6 +162,35 @@ class DSpark(DFlash):
 
     @nvtx_range("dspark_sample_block", color="purple")
     def _sample_block(
+        self,
+        draft_hidden: torch.Tensor,
+        block_ids: torch.Tensor,
+        next_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Propose candidates and publish confidence for their actual predecessors."""
+        self._propose_block(draft_hidden, block_ids, next_tokens)
+        if self.confidence_rates is not None:
+            bs = next_tokens.shape[0]
+            for k in range(1, self.spec_num_tokens):
+                previous = next_tokens[:, k - 1].clamp(
+                    0, self.markov_head.vocab_size - 1
+                )
+                latent = (
+                    self.markov_head.get_prev_latent(previous)
+                    if self.confidence_head.with_markov
+                    else None
+                )
+                self.confidence_rates[:bs, k - 1].copy_(
+                    self.confidence_head(draft_hidden[:, k - 1], latent)
+                )
+            self.runtime_states.publish_draft_confidence(
+                self.input_buffers.state_write_req_pool_indices_buf[:bs],
+                self.confidence_rates[:bs],
+                group=self.confidence_group,
+            )
+        return next_tokens
+
+    def _propose_block(
         self,
         draft_hidden: torch.Tensor,
         block_ids: torch.Tensor,

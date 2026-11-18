@@ -11,6 +11,7 @@ from tokenspeed.runtime.execution.forward_step import ForwardStepRunner
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from tokenspeed.runtime.models.extensible import ExtensibleLM
+from tokenspeed.runtime.sampling.backends.base import CUDA_GRAPH_VARIANT_DEFAULT
 from tokenspeed.runtime.sampling.dp_sampling_config import (
     DpSamplingRuntimeConfig,
     DpSamplingRuntimeLimits,
@@ -40,7 +41,7 @@ def _graph_route(
     wrapper.disable_padding = disable_padding
     wrapper.max_capture_bs = max_bs
     wrapper.capture_bs = capture_bs
-    wrapper.graphs = {("default", bs) for bs in capture_bs}
+    wrapper.graphs = {(CUDA_GRAPH_VARIANT_DEFAULT, size) for size in capture_bs}
     wrapper.max_tokens_per_req = max_tokens_per_req
     wrapper.dp_local_graph = False
     use_graph = wrapper.can_run(bs, ctx)

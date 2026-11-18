@@ -1300,6 +1300,42 @@ after the Device cache evicts them, or drop the Host cache with
 compaction (`sysctl vm.compaction_proactiveness=0`) removes the background
 trigger.
 
+### Separate DSpark draft and confidence verification
+
+The [Qwen3.8-Flash-Next DSpark checkpoint](https://huggingface.co/shadowpa0327/Qwen3.8-Flash-Next-DSpark)
+uses five HC-mean target taps, a seven-token block and a trained confidence
+head. Download a pinned revision and supply its local directory as the draft
+path; its embedding and LM head are shared with the target.
+
+```bash
+ts serve nvidia/Qwen3.8-Flash-Next-NVFP4 \
+    --trust-remote-code \
+    --speculative-algorithm DSPARK \
+    --speculative-draft-model-path /path/to/pinned-dspark \
+    --speculative-num-steps 7 \
+    --speculative-num-draft-tokens 8 \
+    --enable-qwen4-adaptive-dspark \
+    --attention-backend trtllm \
+    --drafter-attention-backend trtllm \
+    --moe-backend flashinfer_trtllm
+```
+
+Omit `--enable-qwen4-adaptive-dspark` to use fixed-width verification on the
+same checkpoint. With the flag, completed scores and startup graph timings
+choose the query budget. The latest device scores assign request prefixes.
+
+Confidence verification keeps selected rows compact through the target body,
+including attention, GDN, PLE and MLP. The LM head and sampler use the
+full-width request layout. Cache reservations also retain the maximum window.
+Decode graphs use a request bucket and a query budget. A graph runs the
+target, verifier and draft, with accepted-state commit outside replay.
+Full-budget and adaptive output parity against fixed verification have not
+passed acceptance; distributed performance and multimodal validation remain
+outstanding. Attention DP and PP must equal one. PD, tree speculation and
+draft-prob rejection sampling are unsupported. QSA, `mha` and `trtllm` paged
+attention support compact verification;
+other paged leaves are rejected before capture.
+
 ### Optional `--hf-overrides`
 
 All keys are optional and can be combined in a single `--hf-overrides` JSON

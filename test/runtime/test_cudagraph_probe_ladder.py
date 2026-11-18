@@ -77,6 +77,7 @@ def _enter(observer, result):
 def _decode_runner(capture_bs, variants=None):
     """A ForwardStepRunner with only what ``capture`` reads."""
     runner = ForwardStepRunner.__new__(ForwardStepRunner)
+    runner.confidence_feedback = None
     runner.dp_local_graph = False
     runner.capture_bs = list(capture_bs)
     runner.global_rank = 1

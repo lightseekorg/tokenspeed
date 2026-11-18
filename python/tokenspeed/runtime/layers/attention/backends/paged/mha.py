@@ -140,6 +140,8 @@ class MHAAttnBackend(PagedAttentionBackend):
     # cannot serve one and says so before a layer declares a sink.
     supports_layer_window_sink: bool = False
 
+    supports_compact_verify = True
+
     def __init__(self, config: AttnConfig, spec: MHAConfig, *, kernel_page_size: int):
         super().__init__(config, spec, kernel_page_size=kernel_page_size)
         # Map the selected backend to the corresponding kernel solution string.
@@ -514,6 +516,11 @@ class MHAAttnBackend(PagedAttentionBackend):
             return self._tree_cascade(
                 q, layer, token_to_kv_pool, tree, sinks=kwargs.get("sinks")
             )
+        ctx = kwargs.get("ctx")
+        verify = None if ctx is None else ctx.verify_queries
+        page_table, seq_lens = metadata.page_table, metadata.seq_lens
+        if verify is not None:
+            page_table, seq_lens = verify.causal_metadata(seq_lens, page_table)
 
         scale_kwargs = {}
         if self.is_mxfp8:
@@ -526,13 +533,14 @@ class MHAAttnBackend(PagedAttentionBackend):
             scale_kwargs = _fp8_scale_kwargs(layer)
 
         k_cache, v_cache = self._get_kv_cache(layer, token_to_kv_pool)
+        max_seqlen_q = q.shape[0] // seq_lens.shape[0]
         sinks = kwargs.get("sinks")
         schedule = self._decode_schedule(
             layer,
             q,
             k_cache,
             v_cache,
-            metadata.seq_lens,
+            seq_lens,
             max_seqlen_q,
             sinks,
             scale_kwargs,
@@ -541,8 +549,8 @@ class MHAAttnBackend(PagedAttentionBackend):
             q=q,
             k_cache=k_cache,
             v_cache=v_cache,
-            page_table=metadata.page_table,
-            cache_seqlens=metadata.seq_lens,
+            page_table=page_table,
+            cache_seqlens=seq_lens,
             window_left=layer.sliding_window_size,
             window_sink=layer.sliding_window_sink,
             logit_cap=layer.logit_cap,

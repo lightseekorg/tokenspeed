@@ -42,6 +42,8 @@ def _drafter(spec_num_tokens: int = 8, vocab: int = VOCAB) -> DSpark:
     torch.manual_seed(0)
     head = VanillaMarkov(vocab_size=vocab, markov_rank=RANK)
     drafter.markov_head = head
+    drafter.confidence_head = None
+    drafter.confidence_rates = None
     return drafter
 
 
@@ -628,6 +630,63 @@ def test_the_fused_walk_proposes_what_the_unfused_walk_does(monkeypatch) -> None
     assert unfused[:, 0].tolist() == [5, 31, 0]
     assert ((unfused[:, 1:] >= 8) & (unfused[:, 1:] < 24)).all()
     assert torch.equal(fused, unfused)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@torch.inference_mode()
+def test_confidence_is_published_after_the_greedy_proposal(dtype) -> None:
+    from tokenspeed.runtime.configs.qwen3_config import Qwen3Config
+    from tokenspeed.runtime.execution.runtime_states import RuntimeStates
+    from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
+    from tokenspeed.runtime.models.dspark import AcceptRatePredictor
+
+    rows, spec = 2, 4
+    drafter = _drafter(spec_num_tokens=spec)
+    rank = 16
+    drafter.markov_head = VanillaMarkov(vocab_size=VOCAB, markov_rank=rank).to(
+        device="cuda", dtype=dtype
+    )
+    drafter.lm_head = VocabParallelEmbedding(VOCAB, HIDDEN, params_dtype=dtype).cuda()
+    drafter.lm_head.weight.normal_(std=0.1)
+    drafter.logits_processor = LogitsProcessor(
+        Qwen3Config(vocab_size=VOCAB), dp_lm_head_tp=False, attn_tp_size=1
+    )
+    drafter._dist_argmax_state = None
+    drafter._walk_words = None
+    drafter._walk_gathered = None
+    drafter.input_buffers = InputBuffers(rows, rows * spec, 6, device="cuda")
+    slots = torch.tensor([1, 3], device="cuda")
+    drafter.input_buffers.state_write_req_pool_indices_buf.copy_(slots)
+    drafter.runtime_states = RuntimeStates(5, VOCAB, VOCAB, spec, device="cuda")
+    drafter.runtime_states.init_draft_confidence(spec - 1)
+    drafter.confidence_head = AcceptRatePredictor(HIDDEN, rank, with_markov=True).to(
+        device="cuda", dtype=dtype
+    )
+    drafter.confidence_rates = torch.zeros((rows, spec - 1), device="cuda")
+    drafter.confidence_group = None
+    hidden = torch.randn(rows, spec - 1, HIDDEN, device="cuda", dtype=dtype)
+    block = torch.tensor([[3], [17]], dtype=torch.int32, device="cuda")
+    tokens = torch.empty(rows, spec, dtype=torch.int32, device="cuda")
+
+    for generation in (1, 2):
+        drafter._sample_block(hidden, block, tokens)
+        expected = torch.stack(
+            [
+                drafter.confidence_head(
+                    hidden[:, k], drafter.markov_head.get_prev_latent(tokens[:, k])
+                )
+                for k in range(spec - 1)
+            ],
+            dim=1,
+        )
+        torch.testing.assert_close(
+            drafter.runtime_states.draft_confidence[slots], expected
+        )
+        assert drafter.runtime_states.draft_confidence_generation[slots].tolist() == [
+            generation,
+            generation,
+        ]
 
 
 def _gate_drafter(markov_dtype, markov_vocab: int, state) -> DSpark:

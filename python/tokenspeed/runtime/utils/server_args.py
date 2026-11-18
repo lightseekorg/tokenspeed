@@ -743,6 +743,7 @@ class ServerArgs:
     speculative_num_steps: int = 3
     speculative_eagle_topk: int = 1
     speculative_num_draft_tokens: int | None = None
+    enable_qwen4_adaptive_dspark: bool = False
     enable_dsv41_adaptive_dspark: bool = False
     dsv41_dspark_min_batch_size: int = 32
     synthetic_acceptance_length: float | None = None
@@ -1915,6 +1916,19 @@ class ServerArgs:
         self.kv_offload_config = dict(options, layers=list(layers))
 
     def resolve_speculative_decoding(self):
+        if self.enable_qwen4_adaptive_dspark:
+            if self.speculative_algorithm != "DSPARK":
+                raise ValueError("confidence verification requires DSPARK")
+            if self.enable_speculative_sampling or self.speculative_eagle_topk != 1:
+                raise ValueError("confidence verification requires greedy chain drafts")
+            if self.mapping.attn.dp_size != 1 or self.pipeline_parallel_size != 1:
+                raise ValueError(
+                    "confidence verification currently requires attention DP=1 and PP=1"
+                )
+            if self.disaggregation_mode != "null":
+                raise ValueError("confidence verification does not support PD")
+            if self.device != "cuda":
+                raise ValueError("confidence verification requires NVIDIA CUDA")
         if self.speculative_algorithm == "DUMMY":
             if (
                 self.speculative_draft_model_path is not None
@@ -4498,6 +4512,13 @@ class ServerArgs:
             "ranks. Currently requires a supported DSPARK drafter, target and draft "
             "MegaMoE, TP1 for attention/dense/MoE/LM head, and greedy or adaptive "
             "DSpark sampling.",
+        )
+        parser.add_argument(
+            "--enable-qwen4-adaptive-dspark",
+            action="store_true",
+            default=ServerArgs.enable_qwen4_adaptive_dspark,
+            help="Adapt Qwen4 DSpark verification width using checkpoint confidence "
+            "and startup timings. Uses fixed-width verification when disabled.",
         )
         parser.add_argument(
             "--enable-dsv41-adaptive-dspark",

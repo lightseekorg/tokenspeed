@@ -25,7 +25,10 @@ import math
 
 import pytest
 
-from tokenspeed.runtime.execution.drafter.verify_budget import VerifyBudgetPolicy
+from tokenspeed.runtime.execution.drafter.verify_budget import (
+    VerifyBudgetPlanner,
+    VerifyBudgetPolicy,
+)
 
 
 def policy(*, enabled=True, min_bs=2, width=6):
@@ -200,3 +203,36 @@ def test_distributed_budget_matches_exhaustive_prefix_rewards(sizes):
         )
         == expected
     )
+
+
+def test_planner_accounts_for_full_round_cost_and_prefers_smaller_ties():
+    planner = VerifyBudgetPlanner(3)
+    planner.set_baseline(2, 2, 1.0)
+    planner.set_baseline(2, 4, 1.5)
+    planner.set_baseline(2, 6, 3.0)
+    assert planner.select(2, [[0.9, 0.9], [0.9, 0.9]]) == 4
+    assert planner.select(2, [[0.0, 0.0], [0.0, 0.0]]) == 2
+    with pytest.raises(ValueError):
+        planner.set_baseline(2, 4, float("nan"))
+    with pytest.raises(ValueError):
+        planner.select(2, [[1.0]])
+
+
+def test_planner_uses_captured_query_graphs_and_full_width_without_timings():
+    planner = VerifyBudgetPlanner(4)
+    rates = [[0.8] * 3 for _ in range(4)]
+    assert planner.select(4, rates) == 16
+    planner.set_baseline(4, 4, 1.0)
+    planner.set_baseline(4, 6, 1.05)
+    planner.set_baseline(4, 8, 2.0)
+    assert planner.select(4, rates) == 6
+
+
+def test_planner_uses_only_available_startup_buckets():
+    planner = VerifyBudgetPlanner(4)
+    rates = [[0.8] * 3 for _ in range(4)]
+    planner.set_baseline(4, 4, 1.0)
+    planner.set_baseline(4, 8, 3.0)
+    planner.set_baseline(4, 12, 0.1)
+    assert planner.select(4, rates, capacities={4, 8}) == 4
+    assert planner.select(4, rates, capacities={4, 8, 12}) == 12

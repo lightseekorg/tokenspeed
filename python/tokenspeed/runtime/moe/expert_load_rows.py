@@ -32,7 +32,9 @@ MoE input. The router counts routes per physical expert inside the forward
 ints that decided the padding. ``ExpertLoadRowMask`` carries that knowledge
 onto the device: one ``[max_rows]`` bool buffer, True for real rows, that the
 graph owners mark before a padded replay and clear right after it, on the
-same stream. Eager forwards are never padded and read the all-True mask;
+same stream. Compact verify forwards mark their selected device rows inside
+the model and clear the mask before returning; ordinary eager forwards read
+the all-True mask.
 ``record_expert_load`` counts a route iff its row is marked. The buffer is
 reserved once before the first forward, so captured graphs hold its address.
 """
@@ -45,6 +47,7 @@ import torch
 
 from tokenspeed.runtime.distributed.comm_manager import moe_input_row_segments
 from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.execution.query_shard import scatter_count
 
 __all__ = ["ExpertLoadRowMask", "LayerExpertLoad"]
 
@@ -133,6 +136,32 @@ class ExpertLoadRowMask:
         if self.mask is None:
             raise RuntimeError("the expert load row mask has not been reserved")
         self.mask.fill_(True)
+
+    def mark_selected(self, valid: torch.Tensor) -> None:
+        """Map a device query mask to the MoE input under replicated attention.
+
+        ``valid`` covers the compact model bucket. Attention DP must be one;
+        its TP ranks share this mask. Apply the same contiguous TP partition
+        and MoE group order as ``moe_input_row_segments``, without host lengths.
+        """
+        mapping = self._mapping
+        if mapping.attn.dp_size != 1 or valid.ndim != 1 or valid.dtype != torch.bool:
+            raise ValueError(
+                "selected expert rows require one replicated attention group"
+            )
+        moe_all_reduce = mapping.attn.tp_size == mapping.moe.tp_ep_size
+        if moe_all_reduce:
+            self.rows(valid.numel()).copy_(valid)
+            return
+        counts = scatter_count(valid.numel(), mapping.attn.tp_size)
+        ranks = mapping.moe.tp_ep_group if mapping.moe.has_tp_ep else [mapping.rank]
+        start = 0
+        for rank in ranks:
+            tp_rank = mapping.attn.scatter_index(rank) % mapping.attn.tp_size
+            offset = sum(counts[:tp_rank])
+            size = counts[tp_rank]
+            self.rows(start + size)[start:].copy_(valid[offset : offset + size])
+            start += size
 
 
 class LayerExpertLoad:

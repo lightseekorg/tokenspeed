@@ -8,6 +8,14 @@ heads, BF16/FP16/FP32 K-last initial states, and 1–16 tokens. Chains and trees
 share the same WY computation; the facade's existing tree workspace contract
 restricts its output-only trees to 8–16 nodes.
 
+Confidence verification uses the same WY computation with packed `[1,Q,...]`
+inputs and device prefix offsets. The request-width bound, rather than physical
+Q, selects the 4/8/16-token bucket. Each CTA reads only its request's prefix,
+skips empty requests before reading state, and writes output at the compact
+offset. Filler output is zeroed in the same launch. Optional raw replay rows
+retain the maximum request width so accepted-prefix commit uses its existing
+layout. No packing workspace or state write is introduced.
+
 The registration constrains platform, dtype, head dimensions, token count and
 output-only execution; its specialized priority wins over general recurrence
 on supported NVIDIA geometry, for both BF16 and FP32 state. Tree support is a
@@ -57,10 +65,10 @@ Warm each selected bucket/dtype/model geometry before CUDA Graph capture;
 replays consume updated inputs, parameters, state rows and ancestor masks.
 The kernel supports PDL and keeps PDL compilation variants separate.
 
-Aligned Q/K/V tiles load through TMA into raw shared-memory buffers before
+Aligned uniform Q/K/V tiles load through TMA into raw shared-memory buffers before
 FP32 normalization and value staging. This requires unit inner strides,
 16-byte-aligned base addresses and outer byte strides divisible by 16.
-Other layouts retain four-element vector reads when each physical row has
+Packed inputs and other layouts retain four-element vector reads when each row has
 unit inner stride and eight-byte alignment, with scalar reads otherwise.
 Normalization and raw payload stores reuse the loaded values. Four-token
 64-value tiles issue gate and parameter reads before Q/K normalization.
@@ -81,7 +89,8 @@ accumulator. A CTA barrier protects buffer reuse, and each transfer has its
 own completion phase. TMA row padding rereads eight keys in the first stage
 and zero-fills beyond the final stage; other tiers stage all 128 keys at once.
 
-Warmup compiles all four combinations of Q/K/V and checkpoint transport.
+Warmup compiles all four combinations of uniform Q/K/V and checkpoint transport;
+packed inputs prepare both checkpoint transports with direct Q/K/V reads.
 Graph capture can therefore refresh to a different supported alignment or
 stride without compiling inside capture. Descriptor extents and strides stay
 runtime values; the transport choices are bounded compilation variants.
