@@ -176,24 +176,14 @@ def test_k3_router_selects_physical_slot_ids(tokens: int, ep_rank: int):
     logits = torch.randn(tokens, _EXPERTS, device="cuda", generator=generator)
     hidden = torch.empty(tokens, 8, device="cuda")
 
-    def buffers():
-        # MegaMoE's workspace views: FP32 weights, INT32 ids.
-        return (
-            torch.empty(tokens, 16, dtype=torch.float32, device="cuda"),
-            torch.full((tokens, 16), -1, dtype=torch.int32, device="cuda"),
-        )
+    logical = topk(hidden, logits, expert_location_dispatch_info=None)
+    physical = topk(hidden, logits, expert_location_dispatch_info=info)
+    logical_ids = logical.topk_ids.long()
+    physical_ids = physical.topk_ids.long()
 
-    logical = buffers()
-    topk(hidden, logits, expert_location_dispatch_info=None, out=logical)
-    physical = buffers()
-    topk(hidden, logits, expert_location_dispatch_info=info, out=physical)
-
-    assert torch.equal(physical[0], logical[0])
+    assert torch.equal(physical.topk_weights, logical.topk_weights)
     # Every slot holds the expert the router chose.
-    assert torch.equal(
-        placement.physical_to_logical_map[3][physical[1].long()].to(torch.int32),
-        logical[1],
-    )
+    assert torch.equal(placement.physical_to_logical_map[3][physical_ids], logical_ids)
     # Rank 0 keeps its own slots 0..3; rank 19 its replicas 896..899.
-    replicas = physical[1][logical[1] < 4] - logical[1][logical[1] < 4]
+    replicas = physical_ids[logical_ids < 4] - logical_ids[logical_ids < 4]
     assert (replicas == (0 if ep_rank == 0 else _EXPERTS)).all()
