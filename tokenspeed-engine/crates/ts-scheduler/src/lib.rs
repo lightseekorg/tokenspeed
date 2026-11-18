@@ -54,6 +54,9 @@ mod ffi {
         cache_group_id: String,
         /// Candidate shared-store checkpoints within this prompt.
         shared_prefix_tokens: Vec<i32>,
+        /// The replica expected to hold this prompt's prefix, empty for
+        /// none (peer prefix sharing).
+        peer_holder: String,
         /// Prompt token ids.
         tokens: Vec<i32>,
         /// Generation limit the scheduler reserves for.
@@ -432,6 +435,147 @@ mod ffi {
         token_ids: Vec<i32>,
         /// Stored: tokens per block.
         block_size: i32,
+        /// The event concerns the Host cache; else the Device.
+        host: bool,
+    }
+
+    /// A peer lease's name: its reader and the reader's own counter
+    /// (`tokenspeed::PeerLeaseId`).
+    #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+    struct PeerLeaseView {
+        /// The reader replica's name.
+        reader: String,
+        /// The reader's counter.
+        id: u64,
+    }
+
+    /// One block of a peer prefix (`tokenspeed::PeerPage`): a holder's
+    /// cached block, or a reader's destination.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct PeerPageView {
+        /// The cache group.
+        group_id: u32,
+        /// The block's slot in the group's request table.
+        slot: i32,
+        /// Whether the block is in the Host pool rather than the Device's.
+        host: bool,
+        /// The scheduler block id on its tier.
+        block_id: i32,
+    }
+
+    /// A reader's lookup, to send to its holder (`tokenspeed::PeerLookupRequest`).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct PeerLookupView {
+        /// The lease the lookup opens.
+        lease: PeerLeaseView,
+        /// The holder's name.
+        holder: String,
+        /// The prompt's full-page chain hashes below `max_tokens`.
+        prefix_hashes: Vec<String>,
+        /// The prompt's tokens up to `max_tokens`.
+        tokens: Vec<i32>,
+        /// The bound on the prefix.
+        max_tokens: i32,
+    }
+
+    /// What a holder's answer answers.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum PeerAnswerKind {
+        /// A lookup's answer.
+        Lookup,
+        /// A pin's answer.
+        Pin,
+        /// A release's answer.
+        Release,
+    }
+
+    /// A holder's answer, to send to the lease's reader (`tokenspeed::PeerAnswer`).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct PeerAnswerView {
+        /// The lease.
+        lease: PeerLeaseView,
+        /// What it answers.
+        kind: PeerAnswerKind,
+        /// Lookup and pin: the boundary held, 0 for none.
+        num_tokens: i32,
+        /// Pin: the pinned blocks.
+        pages: Vec<PeerPageView>,
+        /// Release: whether the hard pin held for its whole life.
+        held: bool,
+    }
+
+    /// A reader's landing in a plan (`tokenspeed::PeerFetchOperation`).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct PeerFetchView {
+        /// The landing request.
+        request_id: String,
+        /// The lease it reads under.
+        lease: PeerLeaseView,
+        /// The holder's name.
+        holder: String,
+        /// Where the landed tokens begin: the local hit.
+        begin_tokens: i32,
+        /// Where they end: the holder's boundary.
+        end_tokens: i32,
+        /// The blocks it fills.
+        destinations: Vec<PeerPageView>,
+    }
+
+    /// The kind of a [`PeerEventView`].
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum PeerEventKind {
+        /// Holder: a reader's lookup (`cache::PeerLookup`).
+        Lookup,
+        /// Holder: a reader's pin (`cache::PeerPin`).
+        Pin,
+        /// Holder: a reader's release (`cache::PeerRelease`).
+        Release,
+        /// Reader: a holder's answer to a lookup (`cache::PeerLookupAnswered`).
+        LookupAnswered,
+        /// Reader: a landing's outcome (`cache::PeerFetchDone`).
+        FetchDone,
+    }
+
+    /// A peer event the replica agreed on. Fields other kinds do not use
+    /// are left empty.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct PeerEventView {
+        /// What happened.
+        kind: PeerEventKind,
+        /// The lease it concerns (all but FetchDone).
+        lease: PeerLeaseView,
+        /// Lookup: the prompt's full-page chain hashes.
+        prefix_hashes: Vec<String>,
+        /// Lookup: the prompt's tokens up to `max_tokens`.
+        tokens: Vec<i32>,
+        /// Lookup: the bound on the prefix.
+        max_tokens: i32,
+        /// Pin: the pages the holder's answer named.
+        pages: Vec<PeerPageView>,
+        /// Release: the reader has the whole prefix.
+        demote: bool,
+        /// Pin: the boundary the holder's answer named; LookupAnswered: the
+        /// holder's boundary; FetchDone: the boundary confirmed.
+        num_tokens: i32,
+        /// FetchDone: the landing request.
+        request_id: String,
+    }
+
+    /// The scheduler's peer sharing observations (`Scheduler::PeerStats`).
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    struct PeerStatsView {
+        /// Holder: leases held.
+        leases: usize,
+        /// Holder: blocks hard pins hold.
+        pinned_blocks: usize,
+        /// Reader: requests waiting for a lookup's answer.
+        looking_requests: usize,
+        /// Reader: requests landing.
+        landing_requests: usize,
+        /// Reader: tokens landed so far.
+        landed_tokens: u64,
+        /// Reader: landings given up so far.
+        failed_landings: u64,
     }
 
     /// One cache group's page counts.
@@ -465,6 +609,22 @@ mod ffi {
             done: &[StorageDoneView],
             cache_events: &[CacheEvent],
         ) -> Result<()>;
+        fn advance_peer(
+            scheduler: Pin<&mut Scheduler>,
+            now_us: i64,
+            events: &[PeerEventView],
+        ) -> Result<()>;
+        fn take_peer_lookups(scheduler: Pin<&mut Scheduler>) -> Vec<PeerLookupView>;
+        fn answer_peer_lookup(scheduler: &Scheduler, lookup: &PeerEventView) -> PeerAnswerView;
+        fn peer_pages_match(
+            scheduler: &Scheduler,
+            lookup: &PeerEventView,
+            num_tokens: i32,
+            pages: &[PeerPageView],
+        ) -> bool;
+        fn peer_lease_held(scheduler: &Scheduler, lease: &PeerLeaseView) -> bool;
+        fn plan_calls(scheduler: &Scheduler) -> i64;
+        fn peer_stats(scheduler: &Scheduler) -> PeerStatsView;
         fn demote_sessions(
             scheduler: Pin<&mut Scheduler>,
             session_ids: &[String],
@@ -501,6 +661,7 @@ mod ffi {
         fn kv_event_token_offsets(batch: &KvEventBatch) -> &[usize];
         fn kv_event_hashes(batch: &KvEventBatch) -> &[u64];
         fn kv_event_tokens(batch: &KvEventBatch) -> &[i32];
+        fn kv_event_media(batch: &KvEventBatch) -> &[u8];
         fn request_token_size(scheduler: &Scheduler, request_id: &str) -> i32;
         fn can_abort_before_admission(scheduler: &Scheduler, request_id: &str) -> bool;
         fn storage_pending(scheduler: &Scheduler) -> bool;
@@ -521,6 +682,7 @@ mod ffi {
         fn plan_aborts(plan: &ExecutionPlan) -> Vec<SchedulerAbortView>;
         fn plan_cache_ops(plan: &ExecutionPlan) -> Vec<CacheOpView>;
         fn plan_storage_ops(plan: &ExecutionPlan) -> Vec<StorageOpView>;
+        fn plan_peer_fetches(plan: &ExecutionPlan) -> Vec<PeerFetchView>;
 
         /// Install the scheduler's profile span sink, which forwards to
         /// [`record_scheduler_span`], or remove it.
@@ -535,10 +697,11 @@ mod ffi {
 
 pub use ffi::{
     BlockTableView, CacheEvent, CacheEventKind, CacheGroupPages, CacheOpKind, CacheOpView,
-    ForwardBatchView, ForwardEvent, ForwardEventKind, KvEventView, PrefillGateProbe, PrefixHitView,
-    RequestSpec, SchedulerAbortView, SchedulerSizes, StorageCancellationView, StorageDoneView,
-    StorageKeyView, StorageOpKind, StorageOpView, StorageStatsView, StorageTickView,
-    TransferBatchView,
+    ForwardBatchView, ForwardEvent, ForwardEventKind, KvEventView, PeerAnswerKind, PeerAnswerView,
+    PeerEventKind, PeerEventView, PeerFetchView, PeerLeaseView, PeerLookupView, PeerPageView,
+    PeerStatsView, PrefillGateProbe, PrefixHitView, RequestSpec, SchedulerAbortView,
+    SchedulerSizes, StorageCancellationView, StorageDoneView, StorageKeyView, StorageOpKind,
+    StorageOpView, StorageStatsView, StorageTickView, TransferBatchView,
 };
 
 /// What advances the scheduler at the head of a round: with L3, the agreed
@@ -706,6 +869,55 @@ impl Scheduler {
         )
     }
 
+    /// Feed the round head's peer events back: the agreed peer clock, then
+    /// the events in the order the replica agreed on (peer prefix sharing,
+    /// `docs/rfcs/0004-peer-prefix-sharing.md`).
+    pub fn advance_peer(
+        &mut self,
+        now_us: i64,
+        events: &[PeerEventView],
+    ) -> Result<(), cxx::Exception> {
+        let _span = profile::span("Scheduler::advance_peer");
+        ffi::advance_peer(self.pinned(), now_us, events)
+    }
+
+    /// A reader's lookups since the last take, to send to their holders.
+    pub fn take_peer_lookups(&mut self) -> Vec<PeerLookupView> {
+        ffi::take_peer_lookups(self.pinned())
+    }
+
+    /// A holder's answer to `lookup` (a [`PeerEventKind::Lookup`] event),
+    /// read from the cache as it stands; it changes nothing.
+    pub fn answer_peer_lookup(&self, lookup: &PeerEventView) -> PeerAnswerView {
+        ffi::answer_peer_lookup(self.get(), lookup)
+    }
+
+    /// Whether `lookup`'s prompt, up to `num_tokens`, still resolves to
+    /// exactly `pages`.
+    pub fn peer_pages_match(
+        &self,
+        lookup: &PeerEventView,
+        num_tokens: i32,
+        pages: &[PeerPageView],
+    ) -> bool {
+        ffi::peer_pages_match(self.get(), lookup, num_tokens, pages)
+    }
+
+    /// Whether `lease`'s pin holds its pages now.
+    pub fn peer_lease_held(&self, lease: &PeerLeaseView) -> bool {
+        ffi::peer_lease_held(self.get(), lease)
+    }
+
+    /// Plans built so far: no cache entry leaves between two plans.
+    pub fn plan_calls(&self) -> i64 {
+        ffi::plan_calls(self.get())
+    }
+
+    /// The scheduler's peer sharing observations.
+    pub fn peer_stats(&self) -> PeerStatsView {
+        ffi::peer_stats(self.get())
+    }
+
     /// Apply one batch with a single scan of each cache index.
     pub fn demote_sessions(&mut self, session_ids: &[String], ended: bool) -> usize {
         ffi::demote_sessions(self.pinned(), session_ids, ended)
@@ -853,6 +1065,17 @@ pub struct KvEvent<'a> {
     pub token_ids: &'a [i32],
     /// Tokens in a full block.
     pub block_size: i32,
+    /// The memory the event concerns.
+    pub medium: KvEventMedium,
+}
+
+/// The memory a KV event concerns (`tokenspeed::KvEventMedium`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KvEventMedium {
+    /// The GPU cache.
+    Device,
+    /// The pinned Host cache (Host L2).
+    Host,
 }
 impl KvEventBatch {
     /// Copy independent event rows into an owned batch, preserving wire fields.
@@ -897,6 +1120,7 @@ impl KvEventBatch {
         let token_offsets = columns.map_or(&[][..], ffi::kv_event_token_offsets);
         let hashes = columns.map_or(&[][..], ffi::kv_event_hashes);
         let tokens = columns.map_or(&[][..], ffi::kv_event_tokens);
+        let media = columns.map_or(&[][..], ffi::kv_event_media);
         (0..stored.len()).map(move |i| KvEvent {
             stored: stored[i] != 0,
             block_hashes: &hashes[hash_offsets[i]..hash_offsets[i + 1]],
@@ -904,6 +1128,11 @@ impl KvEventBatch {
             parent_block_hash: parents[i],
             token_ids: &tokens[token_offsets[i]..token_offsets[i + 1]],
             block_size: block_sizes[i],
+            medium: if media[i] == 0 {
+                KvEventMedium::Device
+            } else {
+                KvEventMedium::Host
+            },
         })
     }
 }
@@ -979,6 +1208,11 @@ impl ExecutionPlan {
     /// runs them on the cache owners' storage executors.
     pub fn storage_ops(&self) -> Vec<StorageOpView> {
         ffi::plan_storage_ops(&self.0)
+    }
+
+    /// The peer prefix landings the plan admitted, in plan order.
+    pub fn peer_fetches(&self) -> Vec<PeerFetchView> {
+        ffi::plan_peer_fetches(&self.0)
     }
 
     /// Hand the plan to Python as a `tokenspeed_scheduler.ExecutionPlan`.

@@ -37,7 +37,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use ts_scheduler::{profile, KvEventBatch};
+use ts_scheduler::{profile, KvEventBatch, KvEventMedium};
 use zeromq::{PubSocket, RouterSocket, Socket, SocketRecv, SocketSend, ZmqError, ZmqMessage};
 
 mod stats;
@@ -101,6 +101,9 @@ pub fn offset_endpoint_port(endpoint: &str, dp_rank: i64) -> Result<String, KvEv
     }
 }
 
+/// The medium of a Host event, as vLLM's events name the pinned Host cache.
+const MEDIUM_HOST: &str = "CPU_PINNED";
+
 /// One round's events as the publisher's payload (`KVEventBatch`): the
 /// time, the events and this rank's attention-DP rank.
 pub fn encode_batch(timestamp: f64, events: &KvEventBatch, dp_rank: i64) -> Vec<u8> {
@@ -109,8 +112,14 @@ pub fn encode_batch(timestamp: f64, events: &KvEventBatch, dp_rank: i64) -> Vec<
     encoder.float(timestamp);
     encoder.array_len(events.len());
     for event in events.iter() {
+        // vLLM's layout: a store's `lora_id` (always nil) and `medium`, a
+        // removal's `medium`; nil is the GPU cache.
+        let medium = |encoder: &mut ts_wire::msgpack::Encoder| match event.medium {
+            KvEventMedium::Device => encoder.nil(),
+            KvEventMedium::Host => encoder.str(MEDIUM_HOST),
+        };
         if event.stored {
-            encoder.array_len(5);
+            encoder.array_len(7);
             encoder.str("BlockStored");
             hashes(&mut encoder, event.block_hashes);
             if event.has_parent {
@@ -123,10 +132,13 @@ pub fn encode_batch(timestamp: f64, events: &KvEventBatch, dp_rank: i64) -> Vec<
                 encoder.int(i64::from(token));
             }
             encoder.int(i64::from(event.block_size));
+            encoder.nil();
+            medium(&mut encoder);
         } else {
-            encoder.array_len(2);
+            encoder.array_len(3);
             encoder.str("BlockRemoved");
             hashes(&mut encoder, event.block_hashes);
+            medium(&mut encoder);
         }
     }
     encoder.int(dp_rank);
@@ -385,6 +397,7 @@ mod tests {
                 parent_block_hash: 0,
                 token_ids: Vec::new(),
                 block_size: 0,
+                host: false,
             }])
         };
         let (queue, mut receiver) = tokio::sync::mpsc::channel(1);

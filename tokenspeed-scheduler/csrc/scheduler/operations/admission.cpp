@@ -32,6 +32,7 @@
 
 #include "fsm/forward_states.h"
 #include "fsm/pd_events.h"
+#include "fsm/peer_states.h"
 #include "utils.h"
 
 namespace tokenspeed {
@@ -95,6 +96,10 @@ bool OthersHoldPages(std::span<const std::unique_ptr<Request>> requests, const R
 }
 
 bool PdTransferInFlight(Role role, const Request& request) {
+    // A peer landing's reads write its pages on any role.
+    if (request.Is<fsm::PeerLanding>()) {
+        return true;
+    }
     switch (role) {
         case Role::kD:
             return request.IsAnyOf<fsm::RemotePrefilling, fsm::PdTransferring>();

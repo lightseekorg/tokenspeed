@@ -104,6 +104,9 @@ wire_struct! {
         pub cache_group_id: Option<String> = None,
         /// Candidate remote checkpoint boundaries, never proof of a cache hit.
         pub shared_prefix_tokens: Vec<i32> = Vec::new(),
+        /// The replica the router expects to hold this prompt's prefix (peer
+        /// prefix sharing); a hint the holder confirms.
+        pub peer_holder: Option<String> = None,
     }
 }
 
@@ -138,6 +141,7 @@ impl TokenizedGenerateReqInput {
             cache_session_id: None,
             cache_group_id: None,
             shared_prefix_tokens: Vec::new(),
+            peer_holder: None,
         }
     }
 }

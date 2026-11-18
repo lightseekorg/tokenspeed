@@ -265,6 +265,7 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
             max_batch_size=16,
             max_resident_requests=16,
             kv_transfer_builder=functools.partial(build_host_peer, outbox=None),
+            peer_outbox=None,
         )
     # Once, before tuning and capture, only where the checkpoint declares the contract.
     assert events.count(("plan-check",)) == int(declares_padded_replay)
@@ -329,6 +330,7 @@ def _plan(
     cache=(),
     remote_decode=None,
     remote_prefill=None,
+    has_peer_fetches=False,
 ):
     """A round's ExecutionPlan as ``execute`` reads it — every field the real
     plan exposes, so a fake cannot hide a renamed one. ``pages_to_zero`` is
@@ -345,6 +347,7 @@ def _plan(
         cache=list(cache),
         remote_decode=remote_decode,
         remote_prefill=remote_prefill,
+        has_peer_fetches=has_peer_fetches,
     )
 
 
@@ -691,6 +694,75 @@ def test_page_copies_follow_the_stores_and_precede_the_zeroing(wire_ops):
     trace.clear()
     _execute(handle, _plan(pages_to_zero=[2], pages_to_copy={"kv": []}), None)
     assert trace == [("zero", {"kv": (2,)}), ("load_backs", ())]
+
+
+class _PeerOutbox:
+    """The host's peer outbox: records when a plan's landings may be read."""
+
+    def __init__(self, trace: list) -> None:
+        self._trace = trace
+
+    def reads_ready(self) -> None:
+        self._trace.append("reads_ready")
+
+
+def _peer_handle(trace):
+    handle = _handle(trace, peer_outbox=_PeerOutbox(trace))
+    executor = handle._executor
+    executor.copy_cache_pages = lambda pairs: trace.append("copy")
+    executor.zero_cache_pages = lambda pages: trace.append("zero")
+
+    class _Event:
+        def record(self, stream) -> None:
+            trace.append(("record", stream))
+
+        def synchronize(self) -> None:
+            trace.append("wait_fence")
+
+    executor.device_module = SimpleNamespace(Event=_Event)
+    return handle
+
+
+@pytest.mark.parametrize("forwards", [True, False])
+def test_peer_reads_start_behind_the_plans_device_work(wire_ops, forwards):
+    """A landing's READs write the plan's blocks from outside the streams:
+    the fence they wait on is recorded on the default stream behind the
+    copies, the zeroing and the forwards in flight, and the host hears of it
+    only once it passed -- after the round's forward is launched, so the wait
+    never delays that launch."""
+    trace: list = []
+    handle = _peer_handle(trace)
+
+    _execute(
+        handle,
+        _plan(
+            pages_to_zero=[3],
+            pages_to_copy={"kv": [(3, 8)]},
+            has_peer_fetches=True,
+        ),
+        _planned(num_extends=1) if forwards else None,
+    )
+
+    assert trace == [
+        "copy",
+        "zero",
+        ("default waits", "execution-stream"),
+        ("record", handle._executor.default_stream),
+        *(["forward"] if forwards else []),
+        "wait_fence",
+        "reads_ready",
+    ]
+
+
+def test_a_plan_without_peer_landings_reports_none(wire_ops):
+    """Only a plan with landings has a fence: the host counts one report
+    per such plan, in order."""
+    trace: list = []
+    handle = _peer_handle(trace)
+
+    _execute(handle, _plan(pages_to_zero=[3]), _planned(num_extends=1))
+
+    assert trace == ["zero", "forward"]
 
 
 def test_a_failed_page_copy_fails_the_plan(wire_ops):

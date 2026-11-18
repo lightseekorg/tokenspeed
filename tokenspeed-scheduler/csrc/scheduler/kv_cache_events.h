@@ -20,6 +20,7 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <cstddef>
 #include <memory>
@@ -32,15 +33,22 @@
 
 namespace tokenspeed {
 
+// The memory an event concerns: the GPU cache, or the pinned Host cache (Host
+// L2). A consumer reading no medium takes the Device.
+enum class KvEventMedium : std::uint8_t { kDevice = 0, kHost = 1 };
+inline constexpr std::size_t kNumKvEventMedia = 2;
+
 struct KvBlockStoredEvent {
     std::vector<std::uint64_t> block_hashes;
     std::optional<std::uint64_t> parent_block_hash;
     std::vector<std::int32_t> token_ids;
     std::int32_t block_size;
+    KvEventMedium medium{KvEventMedium::kDevice};
 };
 
 struct KvBlockRemovedEvent {
     std::vector<std::uint64_t> block_hashes;
+    KvEventMedium medium{KvEventMedium::kDevice};
 };
 
 using KvCacheEvent = std::variant<KvBlockStoredEvent, KvBlockRemovedEvent>;
@@ -57,8 +65,11 @@ using KvEventDescriptorRef = std::shared_ptr<const KvEventDescriptor>;
 
 struct KvEventMutation {
     std::uint64_t block_hash;
-    // Null means that this boundary is no longer locally publishable.
+    // Null means that this boundary is no longer publishable on any medium.
     KvEventDescriptorRef stored;
+    // Where it is publishable: every routing history group caches it there.
+    // At least one is set exactly when `stored` is set.
+    std::array<bool, kNumKvEventMedia> resident{};
 };
 
 // An independent, owned snapshot. Offsets address contiguous columns, so moving
@@ -71,8 +82,8 @@ public:
     std::size_t ByteSize() const noexcept;
     void Reserve(std::size_t events, std::size_t hashes, std::size_t tokens);
     void Store(std::span<const std::uint64_t> hashes, std::optional<std::uint64_t> parent,
-               std::span<const std::int32_t> tokens, std::int32_t block_size);
-    void Remove(std::span<const std::uint64_t> hashes);
+               std::span<const std::int32_t> tokens, std::int32_t block_size, KvEventMedium medium);
+    void Remove(std::span<const std::uint64_t> hashes, KvEventMedium medium);
     // Compatibility at the Python/diagnostic boundary; the engine consumes
     // the columns directly. All event forms, including multi-hash events,
     // retain the existing wire representation.
@@ -87,11 +98,14 @@ public:
     std::span<const std::size_t> TokenOffsets() const noexcept { return token_offsets_; }
     std::span<const std::uint64_t> Hashes() const noexcept { return hashes_; }
     std::span<const std::int32_t> Tokens() const noexcept { return tokens_; }
+    // KvEventMedium values, one per event.
+    std::span<const std::uint8_t> Media() const noexcept { return media_; }
 
 private:
     void Append(bool stored, std::span<const std::uint64_t> hashes, std::optional<std::uint64_t> parent,
-                std::span<const std::int32_t> tokens, std::int32_t block_size);
+                std::span<const std::int32_t> tokens, std::int32_t block_size, KvEventMedium medium);
     std::vector<std::uint8_t> stored_;
+    std::vector<std::uint8_t> media_;
     std::vector<std::uint8_t> has_parent_;
     std::vector<std::uint64_t> parents_;
     std::vector<std::int32_t> block_sizes_;
@@ -101,8 +115,13 @@ private:
     std::vector<std::int32_t> tokens_;
 };
 
-// Projects per-boundary Device residency onto a prefix-closed routing view.
-// This owns only event metadata, never cache blocks or eviction decisions.
+// Projects per-boundary residency onto prefix-closed routing views, one per
+// medium. A Device boundary is out when its parent is out on the Device, as
+// before Host events existed. A Host boundary is out when its parent is out
+// on either medium: under write-back the two tiers hold complementary parts of
+// a prefix, and a router continues a match into the Host tier from wherever
+// the parent is. This owns only event metadata, never cache blocks or
+// eviction decisions.
 class KvEventPrefixView {
 public:
     // One ordering point: removals leaf-first, stores parent-first. Mutations
@@ -112,13 +131,15 @@ public:
 
 private:
     struct Node {
-        KvEventDescriptorRef resident;
+        // Set while the boundary is resident on any medium.
+        KvEventDescriptorRef descriptor;
+        std::array<bool, kNumKvEventMedia> resident{};
         std::optional<std::uint64_t> parent;
         std::unordered_set<std::uint64_t> children;
         std::int32_t depth{0};
         bool registered{false};
-        bool visible{false};
-        bool was_visible{false};
+        std::array<bool, kNumKvEventMedia> visible{};
+        std::array<bool, kNumKvEventMedia> was_visible{};
         std::uint64_t changed_round{0};
     };
     void Reconcile(std::uint64_t hash);

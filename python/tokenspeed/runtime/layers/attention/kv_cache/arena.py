@@ -33,7 +33,10 @@ from tokenspeed.runtime.layers.attention.kv_cache.offload import SparseKVOffload
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     CacheRuntimeContract,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import CacheMemoryPlan
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+    FLAT_KV_PLANE,
+    CacheMemoryPlan,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupSpec,
 )
@@ -329,6 +332,33 @@ class CacheArena:
         ):
             token_rows = spec.rows_per_page
         if (
+            field.plane_id == FLAT_KV_PLANE
+            and spec.attn_kind == "full_history"
+            and field.shape[0] == spec.rows_per_page
+        ):
+            # History readers use translated atom-page IDs. State and recent
+            # windows retain scheduler IDs and their explicit physical stride.
+            row_bytes = field.payload_bytes // field.shape[0]
+            if field.page_stride_bytes % row_bytes:
+                raise ValueError(
+                    f"cache field {field.field_id!r} stride does not cover "
+                    "a whole number of atom rows"
+                )
+            if field.page_stride_bytes % field.payload_bytes:
+                raise ValueError(
+                    f"cache field {field.field_id!r} stride does not cover "
+                    "a whole number of atom pages"
+                )
+            span_bytes = (
+                group.page_count - 1
+            ) * field.page_stride_bytes + field.payload_bytes
+            pages = pages.as_strided(
+                (span_bytes // field.payload_bytes, *field.shape),
+                (field.payload_bytes // field.element_size, *reversed(element_strides)),
+            )
+            if field.shape[0] != token_rows:
+                return pages
+        elif (
             spec.attn_kind == "state"
             or field.shape[0] != token_rows
             or field.page_stride_bytes != field.payload_bytes
@@ -341,8 +371,9 @@ class CacheArena:
 
         The view is shaped the way the field is addressed. A history field whose
         planned shape leads with the prefix grain stores an entry per token,
-        so its page axis is folded away when pages are contiguous. Padded pages
-        retain the page axis and consumers honor its explicit stride.
+        so its page axis is folded away when pages are contiguous. FlatKV
+        fields expose contiguous atom rows with translated page IDs; other
+        padded pages retain the page axis and its explicit stride.
         Offloaded fields use their group's physical row grain for this fold.
         Other fields (recurrent state, compressor state, block-scaled scale
         planes, V4's byte-shaped planes) retain page-indexed views.
