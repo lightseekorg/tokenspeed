@@ -65,8 +65,9 @@ public:
     StorageLease StartQuery(std::vector<CacheKey> keys, std::vector<std::int32_t> key_tokens);
     bool Completed(std::uint64_t id) const;
     bool IsQuery(std::uint64_t id) const;
-    // Successful query hits, and the cumulative tokens they cover. Each hit counts once per operation.
-    std::vector<CacheKey> QueryHits(std::uint64_t id);
+    // Return successful query hits and record their token counts. Repeated calls
+    // return the same surviving hits, counting each key at most once per operation.
+    std::vector<CacheKey> RecordQueryHits(std::uint64_t id);
     std::uint64_t QueryHitTokens() const { return query_hit_tokens_; }
     // Returns an empty lease when nothing was started.
     StorageLease StartRead(const PromptPrefix& prompt, std::span<const CacheKey> hits);
@@ -100,7 +101,7 @@ private:
     void rememberPublished(const CacheKey& key);
     std::size_t availableHostCredits() const;
     CacheCoordinator& coordinator_;
-    StorageConfig config_;
+    const StorageConfig config_;
     std::map<std::uint64_t, Ticket> operations_;
     std::deque<CacheKey> backup_candidates_;
     std::unordered_set<CacheKey, CacheKeyHash> negative_;

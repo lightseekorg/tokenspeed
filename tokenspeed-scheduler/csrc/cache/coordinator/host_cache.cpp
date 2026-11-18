@@ -32,8 +32,10 @@
 #include <utility>
 #include <vector>
 
+#include "cache/coordinator/eviction_candidates.h"
 #include "cache/coordinator/eviction_plan.h"
 #include "cache/coordinator/flat_hash_map.h"
+#include "cache/core/block_placement_demand.h"
 #include "utils.h"
 
 namespace tokenspeed {
@@ -56,23 +58,21 @@ public:
           groups_{groups},
           pool_{pool},
           plan_{pool, groups},
-          no_dense_need_(groups.size()),
-          no_pair_need_(groups.size()) {
-        plan_.StartCandidates(&taken_, nullptr, history.CheckpointAgingFor(CacheTier::kHost));
-    }
+          candidates_{groups, pool, history.CheckpointAgingFor(CacheTier::kHost)} {}
 
-    bool Fits(std::span<const std::vector<std::int64_t>> needed) const {
-        return plan_.Fits(needed, no_dense_need_, no_pair_need_);
-    }
+    bool Fits(std::span<const BlockPlacementDemand> block_demands) const { return plan_.Fits(block_demands); }
 
     void Seed(std::uint32_t group_id, CacheBlockLocation location) {
         taken_.insert(location);
         plan_.Remove(group_id, location);
     }
 
-    bool Fit(std::span<const std::vector<std::int64_t>> needed) {
-        return plan_.SelectUntilFits(needed, no_dense_need_, no_pair_need_, [&] {
-            while (const auto candidate = plan_.Next({})) {
+    bool Fit(std::span<const BlockPlacementDemand> block_demands) {
+        const CacheEvictionCandidates::LocationSet no_request_reclaims{&scratch_};
+        return plan_.SelectUntilFits(block_demands, [&] {
+            while (const auto candidate =
+                       candidates_.Next({}, taken_, no_request_reclaims,
+                                        [&](CacheBlockLocation location) { return taken_.contains(location); })) {
                 if (taken_.contains(candidate->location)) continue;
                 VictimSet set;
                 const auto take = [&](std::uint32_t group_id, CacheBlockLocation location) {
@@ -98,14 +98,14 @@ public:
         });
     }
 
-    void Minimize(std::span<const std::vector<std::int64_t>> needed) {
-        plan_.Minimize(victims_, needed, no_dense_need_, no_pair_need_);
+    void Minimize(std::span<const BlockPlacementDemand> block_demands) {
+        victims_ = plan_.Minimize(std::move(victims_), block_demands);
     }
     const std::vector<VictimSet>& Victims() const { return victims_; }
     std::vector<VictimSet> TakeVictims() { return std::move(victims_); }
     HostCache::HostAllocationStats Stats() const {
-        return {.group_scans = plan_.Candidates().GroupScans(),
-                .block_candidates = plan_.Candidates().ScannedCandidates(),
+        return {.group_scans = candidates_.GroupScans(),
+                .block_candidates = candidates_.ScannedCandidates(),
                 .parent_candidates = plan_.TouchedParents()};
     }
 
@@ -114,9 +114,7 @@ private:
     const std::vector<CacheGroup>& groups_;
     const BlockPool& pool_;
     CacheEvictionPlan plan_;
-    // Host rows land in their source's bucket: no dense blocks, no free-bucket pairs.
-    std::vector<std::int64_t> no_dense_need_;
-    std::vector<std::int64_t> no_pair_need_;
+    CacheEvictionCandidates candidates_;
     // Holds taken_'s slots until the planner dies, first in the planner's own
     // raw buffer (left uninitialized: only the arena writes it), so a small
     // placement calls no allocator for it.
@@ -189,18 +187,18 @@ HostCache::HostAllocationBatch HostCache::AcquireHostBlocks(std::span<const std:
         std::vector<std::size_t> accepted;
         {
             HostEvictionPlanner planner{store_, history_, store_.Groups(), *store_.HostPool()};
-            std::vector<std::vector<std::int64_t>> needed(store_.Groups().size());
+            std::vector<BlockPlacementDemand> block_demands(store_.Groups().size());
             for (std::size_t i = 0; i < store_.Groups().size(); ++i)
-                needed[i].resize(store_.Groups()[i].Allocator().ShardCount());
+                block_demands[i].blocks_by_bucket.resize(store_.Groups()[i].Allocator().ShardCount());
             for (const std::size_t row : unresolved) {
-                auto& need = needed[group_ids[row]][buckets[row]];
-                ++need;
-                if (planner.Fit(needed))
+                auto& bucket_blocks = block_demands[group_ids[row]].blocks_by_bucket[buckets[row]];
+                ++bucket_blocks;
+                if (planner.Fit(block_demands))
                     accepted.push_back(row);
                 else
-                    --need;
+                    --bucket_blocks;
             }
-            planner.Minimize(needed);
+            planner.Minimize(block_demands);
             victims = planner.TakeVictims();
             batch.stats = planner.Stats();
             batch.stats.requested = group_ids.size();
@@ -257,18 +255,18 @@ HostCache::HostPlacementPlan HostCache::planHostBoundaries(std::span<const std::
         next_row = boundary.past_end_row;
     }
     _assert(next_row == group_ids.size(), "Host boundaries cover every row");
-    std::vector<std::vector<std::int64_t>> needed(store_.Groups().size());
+    std::vector<BlockPlacementDemand> block_demands(store_.Groups().size());
     for (std::size_t i = 0; i < store_.Groups().size(); ++i)
-        needed[i].resize(store_.Groups()[i].Allocator().ShardCount());
+        block_demands[i].blocks_by_bucket.resize(store_.Groups()[i].Allocator().ShardCount());
     for (std::size_t row = 0; row < group_ids.size(); ++row) {
         _assert(group_ids[row] < store_.Groups().size(), "Host block group id out of range");
         _assert(buckets[row] >= 0 && buckets[row] < store_.Groups()[group_ids[row]].Allocator().ShardCount(),
                 "Host block bucket is outside the group's shard count");
-        ++needed[group_ids[row]][buckets[row]];
+        ++block_demands[group_ids[row]].blocks_by_bucket[buckets[row]];
     }
     HostEvictionPlanner planner{store_, history_, store_.Groups(), *store_.HostPool()};
     HostPlacementPlan plan;
-    if (planner.Fits(needed)) {
+    if (planner.Fits(block_demands)) {
         plan.num_placed = boundaries.size();
         return plan;
     }
@@ -276,22 +274,22 @@ HostCache::HostPlacementPlan HostCache::planHostBoundaries(std::span<const std::
         plan = planHostSegments(group_ids, buckets, boundaries);
         if (plan.num_placed == boundaries.size()) return plan;
     }
-    for (auto& group_need : needed) std::ranges::fill(group_need, 0);
+    for (BlockPlacementDemand& block_demand : block_demands) std::ranges::fill(block_demand.blocks_by_bucket, 0);
     const std::size_t segment_rows = plan.num_placed == 0 ? 0 : boundaries[plan.num_placed - 1].past_end_row;
-    for (std::size_t row = 0; row < segment_rows; ++row) ++needed[group_ids[row]][buckets[row]];
+    for (std::size_t row = 0; row < segment_rows; ++row) ++block_demands[group_ids[row]].blocks_by_bucket[buckets[row]];
     for (const auto& victim : plan.victims) planner.Seed(victim.group_id, victim.location);
 
     for (const HostSegmentRows& boundary : boundaries.subspan(plan.num_placed)) {
         for (std::size_t row = boundary.first_row; row < boundary.past_end_row; ++row)
-            ++needed[group_ids[row]][buckets[row]];
-        if (!planner.Fit(needed)) {
+            ++block_demands[group_ids[row]].blocks_by_bucket[buckets[row]];
+        if (!planner.Fit(block_demands)) {
             for (std::size_t row = boundary.first_row; row < boundary.past_end_row; ++row)
-                --needed[group_ids[row]][buckets[row]];
+                --block_demands[group_ids[row]].blocks_by_bucket[buckets[row]];
             break;
         }
         ++plan.num_placed;
     }
-    planner.Minimize(needed);
+    planner.Minimize(block_demands);
     for (const auto& set : planner.Victims()) {
         for (const auto& [group_id, location] : set.members) {
             plan.victims.push_back(

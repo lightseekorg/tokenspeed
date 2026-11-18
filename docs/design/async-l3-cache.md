@@ -414,6 +414,9 @@ while scheduler resource/deadline values are mirrored and must not be summed
 across TP owners. Successful adapter byte counters include idempotent PUT hits
 and detached GET results; they measure neither network traffic nor published
 cache hits. Metrics do not participate in scheduler decisions or agreement.
+`RecordQueryHits` explicitly records the tokens in successful query hits when
+the scheduler consumes them. Re-reading the surviving hits counts each key's
+tokens at most once per operation; completion alone does not consume them.
 The `backend_calls` event counts adapter invocations; a create-only PUT can
 finish after its existence check without calling the native PUT API.
 

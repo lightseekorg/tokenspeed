@@ -356,7 +356,8 @@ TEST(CacheOperationTest, StreamOrderedStorePinsNoDeviceSource) {
                                        /*session_id=*/{}, /*cache_group_id=*/{});
     ASSERT_TRUE(admission);
     const std::array<std::string, 1> hashes{"h0"};
-    coordinator.CacheFullBlocks(tables, hashes, admission->access_epoch, /*first_slot=*/0, CacheBoundaryKind::kChunk);
+    coordinator.CacheFullBlocks(tables, hashes, admission->access_epoch, /*first_prefix_page=*/0,
+                                CacheBoundaryKind::kChunk);
 
     coordinator.Host().QueueCachedBlocksForStore(hashes);
     auto write_back = transfers.StartPendingStores(StoreSourceGuard::kStreamOrdered, HostStoreCause::kPublication);
@@ -398,7 +399,8 @@ TEST(CacheOperationTest, PinnedStoreHoldsDeviceSourceUntilAck) {
                                        /*session_id=*/{}, /*cache_group_id=*/{});
     ASSERT_TRUE(admission);
     const std::array<std::string, 1> hashes{"h0"};
-    coordinator.CacheFullBlocks(tables, hashes, admission->access_epoch, /*first_slot=*/0, CacheBoundaryKind::kChunk);
+    coordinator.CacheFullBlocks(tables, hashes, admission->access_epoch, /*first_prefix_page=*/0,
+                                CacheBoundaryKind::kChunk);
 
     coordinator.Host().QueueCachedBlocksForStore(hashes);
     auto write_back = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kFinish);
@@ -507,7 +509,8 @@ TEST(CacheOperationTest, RetractionStoreSkipsWhenHostHasNoPlacement) {
                                        /*session_id=*/{}, /*cache_group_id=*/{});
     ASSERT_TRUE(admission);
     const std::array<std::string, 1> hashes{"h0"};
-    coordinator.CacheFullBlocks(tables, hashes, admission->access_epoch, /*first_slot=*/0, CacheBoundaryKind::kChunk);
+    coordinator.CacheFullBlocks(tables, hashes, admission->access_epoch, /*first_prefix_page=*/0,
+                                CacheBoundaryKind::kChunk);
 
     coordinator.Host().QueueCachedBlocksForStore(hashes);
     EXPECT_FALSE(transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kFinish));
@@ -669,7 +672,8 @@ TEST(CacheOperationTest, RetractionReleaseEstimateExcludesBlocksOwnedByAnotherRe
                                        /*session_id=*/{}, /*cache_group_id=*/{});
     ASSERT_TRUE(admission);
     const std::array<std::string, 2> hashes{"h0", "h1"};
-    coordinator.CacheFullBlocks(tables, hashes, admission->access_epoch, /*first_slot=*/0, CacheBoundaryKind::kChunk);
+    coordinator.CacheFullBlocks(tables, hashes, admission->access_epoch, /*first_prefix_page=*/0,
+                                CacheBoundaryKind::kChunk);
 
     CacheBlockRef other_request_ref = tables[0].Blocks()[1];
     EXPECT_EQ(coordinator.NumNewlyReleasableLcmBlocks(tables), 1);
@@ -1055,7 +1059,7 @@ TEST_F(AsyncStorageTailTest, QueryHitTokensCountEachGroupsActualTailSpan) {
     ASSERT_TRUE(query);
     storage.TakeCommands();
     storage.Complete(cache::StorageDone{query.OperationId(), {1, 1, 1, 1, 1}, true, {0, 0, 0, 0, 0}});
-    EXPECT_EQ(storage.QueryHits(query.OperationId()).size(), 5u);
+    EXPECT_EQ(storage.RecordQueryHits(query.OperationId()).size(), 5u);
     // Full history and SWA each cover 2 + 1 tokens; the state covers all three.
     EXPECT_EQ(storage.QueryHitTokens(), 9u);
 }
@@ -1697,9 +1701,9 @@ TEST_F(AsyncStorageTransactionTest, RejectedReadDoesNotPoisonObjectsAndCanRetry)
     ASSERT_TRUE(query);
     storage.TakeCommands();
     storage.Complete(cache::StorageDone{query.OperationId(), {1, 1, 1}, true, {0, 0, 0}});
-    const auto hits = storage.QueryHits(query.OperationId());
+    const auto hits = storage.RecordQueryHits(query.OperationId());
     EXPECT_EQ(storage.QueryHitTokens(), 6u);
-    EXPECT_EQ(storage.QueryHits(query.OperationId()), hits);
+    EXPECT_EQ(storage.RecordQueryHits(query.OperationId()), hits);
     EXPECT_EQ(storage.QueryHitTokens(), 6u);
     EXPECT_EQ(hits.size(), 3u);
     query.reset();

@@ -149,7 +149,7 @@ bool StorageTransferManager::IsQuery(std::uint64_t id) const {
     return it != operations_.end() && it->second.kind == StorageKind::kQuery;
 }
 
-std::vector<CacheKey> StorageTransferManager::QueryHits(std::uint64_t id) {
+std::vector<CacheKey> StorageTransferManager::RecordQueryHits(std::uint64_t id) {
     Ticket& ticket = operations_.at(id);
     std::vector<CacheKey> keys;
     for (std::size_t i = 0; i < ticket.success.size(); ++i) {
