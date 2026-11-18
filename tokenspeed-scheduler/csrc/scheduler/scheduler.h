@@ -186,6 +186,8 @@ public:
     // Retracted (waiting to be restored) and Restoring (their copy back is in
     // flight) -- which hold no schedulable work until they resume.
     std::size_t WaitingSize() const;
+    // Waiting prompts less their last observed cache hit, plus unscheduled local prefill tokens.
+    std::int64_t PendingPrefillTokens() const;
     std::size_t DecodingSize() const;
     std::size_t PrefillSize() const;
     // Requests in the running batch: local prefill forwards, prompts whose

@@ -1226,6 +1226,15 @@ so the frontend can distinguish an idle engine from a stale connection. The
 active page count in it is reused for up to 100 ms (see the page gauges),
 far inside the three seconds the frontend considers a report fresh.
 
+Token counts are independent of allocator occupancy. `num_resident_tokens`
+sums prompt plus committed output tokens over the output processor's live
+requests. `num_waiting_uncached_tokens` sums waiting prompts less the cache
+hit observed by their last admission probe, plus unscheduled local prefill
+tokens. Before the first probe a waiting prompt counts in full; reporting
+does not trigger a probe, and admission always rechecks cache residency.
+Both optional wire fields are declared in the handshake and retain `None`
+when decoding reports from older engines. New engines report zero when idle.
+
 ## Independent execution with shared weights
 
 The device build exports `requires_forward_coordination` as an immutable

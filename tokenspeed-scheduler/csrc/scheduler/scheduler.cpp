@@ -455,6 +455,18 @@ std::size_t Scheduler::RetractedSize() const {
     }));
 }
 
+std::int64_t Scheduler::PendingPrefillTokens() const {
+    std::int64_t tokens = 0;
+    for (const auto& request : requests_) {
+        if (const auto* admission = request->AdmissionResourcesPtr()) {
+            tokens += std::int64_t{request->PrefillSize()} - admission->cached_prefix_tokens;
+        } else if (request->Is<fsm::Prefilling>()) {
+            tokens += std::int64_t{request->PrefillSize()} - request->NumComputedTokens();
+        }
+    }
+    return tokens;
+}
+
 std::size_t Scheduler::DecodingSize() const {
     return static_cast<std::size_t>(std::ranges::count_if(
         requests_, [](const std::unique_ptr<Request>& request) { return request->Is<fsm::Decoding>(); }));

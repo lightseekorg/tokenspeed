@@ -122,6 +122,8 @@ struct StorageReadyHold {
 struct AdmissionResources {
     TokenContainer* token_container;
     std::int32_t prefix_granularity;
+    // Last admission probe's hit, for load reporting only; never reused by admission.
+    std::int32_t cached_prefix_tokens{0};
     bool storage_prepared{false};
     std::optional<StorageReadyHold> storage_hold;
     // Fixed prompt identities for admission retries, never residency. Leaving

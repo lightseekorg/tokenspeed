@@ -2241,6 +2241,8 @@ async fn idle_load_reports_preserve_resident_cache_capacity() {
     let load = snapshots[0].1;
     assert_eq!((load.num_running, load.num_waiting), (0, 0));
     assert_eq!(load.kv_active_pages, 0);
+    assert_eq!(load.num_resident_tokens, Some(0));
+    assert_eq!(load.num_waiting_uncached_tokens, Some(0));
     assert!(load.kv_used_pages > 0, "reclaimable prefixes stay resident");
     assert_eq!(load.kv_total_pages, 512);
 }
@@ -2381,12 +2383,12 @@ async fn dropping_a_stream_aborts_the_request() {
             );
             // Cancellation produces no final output for the dropped stream,
             // but the frontend must still learn that the engine is idle.
-            if engine
-                .client
-                .loads()
-                .iter()
-                .all(|load| load.num_running == 0 && load.num_waiting == 0)
-            {
+            if engine.client.loads().iter().all(|load| {
+                load.num_running == 0
+                    && load.num_waiting == 0
+                    && load.num_resident_tokens == Some(0)
+                    && load.num_waiting_uncached_tokens == Some(0)
+            }) {
                 return;
             }
         }
@@ -4725,6 +4727,9 @@ async fn an_abort_pause_aborts_what_runs_and_a_keep_pause_freezes_it() {
         before += 1;
     }
     assert!(before < 30, "the request kept running while frozen");
+    let load = engine.client.loads()[0];
+    assert_eq!(load.num_resident_tokens, Some(3 + before));
+    assert_eq!(load.num_waiting_uncached_tokens, Some(0));
     assert_eq!(
         control(&engine, resume()).await,
         [("ResumeSchedulerReqOutput", true)]
