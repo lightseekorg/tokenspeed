@@ -446,6 +446,32 @@ def prepare_shard_exchange(
     return backend.prepare_shard_exchange(group, channels, max_rows, dtype)
 
 
+def prepare_small_exchange(
+    group: Group,
+    cap_bytes: int,
+    timeout_ns: int,
+    backend: CommBackend | None = None,
+) -> bool:
+    """Prepare a one-hop exchange for small ``all_gather_single`` and even
+    ``all_to_all_single`` calls before graph capture.
+
+    Collective: every rank of ``group`` calls in the same order with the same
+    arguments. Larger or unaligned calls keep the generic collectives.
+
+    Args:
+        group: Global ranks of the exchange.
+        cap_bytes: Largest per-rank payload the exchange serves, a multiple of 16.
+        timeout_ns: Bound of every in-kernel wait for a peer.
+        backend: Backend to prepare, or ``None`` for the global backend.
+
+    Returns:
+        Whether the backend prepared a dedicated exchange.
+    """
+    if backend is None:
+        backend = get_global_backend()
+    return backend.prepare_small_exchange(group, cap_bytes, timeout_ns)
+
+
 def prepare_all_reduce_buffers(
     group: Group,
     *,

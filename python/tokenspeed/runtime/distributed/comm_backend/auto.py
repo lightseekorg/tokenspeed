@@ -128,6 +128,8 @@ class AutoBackend(CommBackend):
         # Lamport token/channel-shard exchanges prepared by layers at build
         # time (prepare_shard_exchange), keyed by (group, full channel width).
         self._shard_exchanges: dict[tuple[Group, int], object] = {}
+        # One-hop LL exchanges of small payloads (prepare_small_exchange).
+        self._small_exchanges: dict[Group, object] = {}
 
     @property
     def nccl(self) -> NcclBackend:
@@ -654,10 +656,38 @@ class AutoBackend(CommBackend):
                 return self._iris.all_gather(tensor, group, dim)
             # Small rows ride the all-reduce workspace's barrier-free exchange.
             gathered = self._trtllm_ar.lamport_all_gather(tensor, group)
+            if gathered is None:
+                gathered = self._small_all_gather(tensor, group, dim)
             if gathered is not None:
                 return gathered
             return self._rsag.all_gather(tensor, group, dim)
+        gathered = self._small_all_gather(tensor, group, dim)
+        if gathered is not None:
+            return gathered
         return self._nccl.all_gather(tensor, group, dim)
+
+    def _small_all_gather(
+        self, tensor: torch.Tensor, group: Group, dim: int
+    ) -> torch.Tensor | None:
+        """``all_gather`` through the group's prepared one-hop exchange, or
+        None where it does not serve ``tensor``."""
+        state = self._small_exchanges.get(group)
+        if (
+            state is None
+            or not state.serves(tensor.numel() * tensor.element_size())
+            or not tensor.is_contiguous()
+            or tensor.data_ptr() % 16
+        ):
+            return None
+        # NCCL's layout: rank blocks gathered along dim 0, then moved to ``dim``.
+        world = len(group)
+        gathered = tensor.new_empty((world * tensor.shape[0], *tensor.shape[1:]))
+        self.all_gather_single(gathered, tensor, group)
+        dim = dim + tensor.dim() if dim < 0 else dim
+        if dim == 0:
+            return gathered
+        blocks = gathered.reshape((world, *tensor.shape)).unbind(0)
+        return torch.cat(blocks, dim=dim)
 
     def acquire_exchange_input(
         self, nbytes: int, like: torch.Tensor, group: Group
@@ -687,6 +717,54 @@ class AutoBackend(CommBackend):
             )
         return None
 
+    def prepare_small_exchange(
+        self, group: Group, cap_bytes: int, timeout_ns: int
+    ) -> bool:
+        # Pure data movement over symmetric memory; the NCCL-only switch keeps NCCL.
+        if group in self._small_exchanges:
+            return self._small_exchanges[group].cap_bytes >= cap_bytes
+        if len(group) < 2 or not current_platform().is_nvidia:
+            return False
+        from tokenspeed_kernel.ops.communication.cute_dsl import (
+            create_ll_exchange_state,
+        )
+
+        state = create_ll_exchange_state(
+            pg_manager.get_process_group("gloo", group),
+            torch.device("cuda", torch.cuda.current_device()),
+            cap_bytes=cap_bytes,
+            timeout_ns=timeout_ns,
+            eligible=not self._force_deterministic_rsag(),
+        )
+        if state is None:
+            return False
+        self._small_exchanges[group] = state
+        return True
+
+    def _small_exchange(
+        self, output: torch.Tensor, input: torch.Tensor, group: Group, gather: bool
+    ):
+        """The group's prepared LL exchange when it serves this call, else None."""
+        state = self._small_exchanges.get(group)
+        if state is None:
+            return None
+        payload = input.numel() * input.element_size()
+        if not gather:
+            if payload % len(group):
+                return None
+            payload //= len(group)
+        # Only sizes and the group decide, which every rank of a call shares.
+        if (
+            not state.serves(payload)
+            or output.numel() * output.element_size() != payload * len(group)
+            or not input.is_contiguous()
+            or not output.is_contiguous()
+            or input.data_ptr() % 16
+            or output.data_ptr() % 16
+        ):
+            return None
+        return state
+
     def all_gather_single(
         self, output: torch.Tensor, input: torch.Tensor, group: Group
     ) -> None:
@@ -694,6 +772,14 @@ class AutoBackend(CommBackend):
         # pulled in place, every bit preserved.
         if self._iris_reaches(group):
             return self._iris.all_gather_single(output, input, group)
+        state = self._small_exchange(output, input, group, gather=True)
+        if state is not None:
+            from tokenspeed_kernel.ops.communication.cute_dsl import (
+                cute_dsl_ll_all_gather,
+            )
+
+            cute_dsl_ll_all_gather(state, input, output)
+            return None
         return self._nccl.all_gather_single(output, input, group)
 
     def all_gather_single_async(
@@ -780,6 +866,17 @@ class AutoBackend(CommBackend):
                 output_split_sizes=output_split_sizes,
                 input_split_sizes=input_split_sizes,
             )
+        even = output_split_sizes is None and input_split_sizes is None
+        state = (
+            self._small_exchange(output, input, group, gather=False) if even else None
+        )
+        if state is not None:
+            from tokenspeed_kernel.ops.communication.cute_dsl import (
+                cute_dsl_ll_all_to_all,
+            )
+
+            cute_dsl_ll_all_to_all(state, input, output)
+            return None
         return self._nccl.all_to_all_single(
             output,
             input,
