@@ -2648,6 +2648,83 @@ Channel-scaled FP8 expert weights can remain in their compact checkpoint
 format while projections use BF16 operands and FP32 accumulation. FP8 storage
 does not require native FP8 matrix arithmetic.
 
+### gfx950 Kimi-K3 MoE layer tail
+
+`gfx950/kimi_k3/moe_tail/` runs a Kimi-K3 (and K3.1) decoder layer's work
+after the attention core as one persistent launch per layer and rank: the
+attention output projection and its reduction across the eight TP ranks, the
+MLP attention-residual mix and post-attention norm, the router, the shared
+expert, the latent projections and norm around the MXFP4 routed experts,
+and the layer output. `tokenspeed_kernel/ops/model/kimi_k3/` registers it as
+the `kimi_k3` family's `moe_tail`, `moe_tail_prepare` and `moe_tail_pack`
+ops; its README describes the API.
+
+The tail is not a decode monokernel, and `docs/design/monokernel.md` does
+not apply to it: it covers only the part of a layer after the attention
+core, owns its buffers and step words, and needs no server flag. The
+Kimi-K3 model binds it wherever a registration serves its shapes. Unlike a
+monokernel, it does not keep the regular path's activation quantization
+(see the Algorithm).
+
+#### Contract
+
+Every registration of the `kimi_k3` MoE-tail API keeps this contract.
+
+- Scope: one Kimi-K3-family decoder layer's work after the attention core,
+  for the rows of one request's decode or speculative verify step, with one
+  tensor-parallel group for attention and MoE. A registration declares the
+  shapes (`KimiK3MoeTailShape`), expert weight formats and platforms it
+  serves as traits. For any other shape, `kimi_k3_moe_tail_expert_layout`
+  returns `None`, and the model keeps the regular path.
+- The layout query returns the routed-expert bank layout that the serving
+  registration reads. The MoE layers store their banks in that layout, and
+  `pack_kimi_k3_moe_tail_layer` refuses weights of any other dtype, shape or
+  layout.
+- A tail's row count (`shape.rows`) is fixed. A layer's launch options (its
+  index, whether it starts a step, its residual-block state, its norm
+  epsilons and whether it writes the next layer's input) are fixed when it
+  is packed.
+- Every rank of the group runs the same layers' tails in the same order.
+  `prepare_kimi_k3_moe_tail` is collective and returns this rank's buffers,
+  which every layer shares. A layer's first `kimi_k3_moe_tail` call is
+  collective too.
+- A registration may compute with numerics that differ from the regular
+  path's ops, for example in how it quantizes activations, and documents
+  them. The model binds a serving tail automatically, so a request's decode
+  numerics can depend on whether its step has the tail's row count.
+- With `next_mix`, the caller passes the next layer's FP32
+  attention-residual block partial, complete before the launch. The launch
+  writes that layer's normalized attention input with the separate
+  combine's reduction order and roundings.
+
+#### Algorithm
+
+This kernel serves Kimi-K3 and K3.1 at TP8 (hidden size 7168, latent size
+3584, 896 routed experts) at up to eight rows, on gfx950 with 256 to 1024
+compute units: all 256 workgroups are resident at once. Its routed experts
+read N16 banks and run A4W4: the normalized latent rows and the SiTU outputs
+are quantized to MXFP4, with one E8M0 scale per 32 values rounded up from
+amax / 6. The regular decode MoE quantizes its activations to FP8 (A8W4).
+Every wait has a time limit. A wait past its limit sets a stop flag on every
+rank and stops its launch with a store to the null page, so the process
+aborts with a GPU memory access fault; no host-readable record is kept, and
+a rank blocked outside the tail does not see the flag.
+
+Workgroups hand off through eight-byte tagged pairs, a payload and the
+step's tag read by one atomic load. Across ranks, the reductions use
+four-byte exchange words that each consumer re-arms after reading, and the
+router logits' partials and the quantized latent rows travel as tagged pairs
+in every rank's peer buffer. A reduction across ranks adds the eight ranks'
+words in rank order, so every rank computes the same sums. One group of
+workgroups projects the attention output while another reduces it slice by
+slice, mixes the residual blocks and normalizes. The router, latent and
+shared-expert projections then read the tagged rows. Every workgroup takes
+routed gate/up tasks over the sorted union of the rows' experts, then down
+tasks, and the shared-expert and latent up projections add into the
+exchanged layer output. Each task issues its weight loads before it waits
+on its inputs. The kernel is modified from sgl-amd-mono (Apache License
+2.0); see `THIRDPARTYNOTICES`.
+
 ## Residual
 
 ### gfx950 Kimi K3 AttnRes

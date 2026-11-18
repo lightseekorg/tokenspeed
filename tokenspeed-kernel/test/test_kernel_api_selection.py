@@ -85,6 +85,7 @@ import tokenspeed_kernel.ops.gemm.flashinfer as _gemm_flashinfer
 import tokenspeed_kernel.ops.gemm.gluon as _gemm_gluon
 import tokenspeed_kernel.ops.gemm.triton as _gemm_triton
 import tokenspeed_kernel.ops.gemm.trtllm as _gemm_trtllm
+import tokenspeed_kernel.ops.model.kimi_k3.gluon as _model_kimi_k3_gluon
 import tokenspeed_kernel.ops.moe as _moe_pkg
 import tokenspeed_kernel.ops.moe.cuda as _moe_cuda
 import tokenspeed_kernel.ops.moe.deep_ep as _moe_deep_ep
@@ -120,6 +121,10 @@ from tokenspeed_kernel.ops.attention.rmha import triton as _attention_triton_rel
 from tokenspeed_kernel.ops.gemm import bmm as kernel_bmm
 from tokenspeed_kernel.ops.gemm import dsv4_linear_fp32 as kernel_dsv4_linear_fp32
 from tokenspeed_kernel.ops.gemm import mm as kernel_mm
+from tokenspeed_kernel.ops.model.kimi_k3 import (
+    KimiK3MoeTailShape,
+    kimi_k3_moe_tail_expert_layout,
+)
 from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
 from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
 from tokenspeed_kernel.ops.moe import moe_process_weights as kernel_moe_process_weights
@@ -210,6 +215,7 @@ _RELOAD_MODULES = [
     _moe_deep_ep,
     _moe_flashinfer,
     _moe_gluon,
+    _model_kimi_k3_gluon,
     _moe_marlin,
     _moe_native,
     _moe_triton,
@@ -4435,6 +4441,62 @@ def test_kimi3_mxfp4_situ_n16_needs_a_kernel_that_reads_it(
     finally:
         Platform.override(real_platform)
         KernelRegistry.get().clear_cache()
+
+
+# Kimi-K3.1 at TP8, one request's 8-row speculative verify.
+_KIMI_K3_MOE_TAIL = KimiK3MoeTailShape(
+    rows=8,
+    hidden_size=7168,
+    tp_size=8,
+    num_heads=96,
+    head_dim=128,
+    num_experts=896,
+    top_k=16,
+    latent_size=3584,
+    intermediate_size=3072,
+    shared_intermediate_size=6144,
+    weight_dtype="mxfp4",
+    num_expert_groups=1,
+    topk_groups=1,
+    scoring_func="sigmoid",
+    routed_scaling_factor=1.0,
+    renormalize=True,
+    situ_beta=4.0,
+    situ_linear_beta=25.0,
+)
+
+
+@pytest.mark.parametrize(
+    "platform_fixture,change,layout",
+    [
+        ("mi350_platform", {}, "n16"),
+        ("mi350_platform", {"rows": 9}, None),
+        ("mi350_platform", {"tp_size": 4}, None),
+        ("mi350_platform", {"weight_dtype": "unquant"}, None),
+        ("h100_platform", {}, None),
+    ],
+)
+def test_kimi_k3_moe_tail_serves_only_its_sizes_on_gfx950(
+    platform_fixture: str,
+    change: dict,
+    layout: str | None,
+    request: pytest.FixtureRequest,
+) -> None:
+    registry = KernelRegistry.get()
+    if (
+        layout is not None
+        and registry.get_by_name("gluon_kimi_k3_moe_tail_gfx950") is None
+    ):
+        pytest.skip("the gfx950 MoE tail is unavailable")
+    real_platform = Platform.get()
+    try:
+        Platform.override(request.getfixturevalue(platform_fixture))
+        registry.clear_cache()
+        shape = replace(_KIMI_K3_MOE_TAIL, **change)
+        assert kimi_k3_moe_tail_expert_layout(shape) == layout
+    finally:
+        Platform.override(real_platform)
+        registry.clear_cache()
 
 
 @pytest.mark.parametrize(
