@@ -1409,17 +1409,16 @@ them into the request's own pages (SWA bounded replay,
 [`docs/design/scheduler.md` §1.3](../design/scheduler.md#13-bounded-replay)).
 The backend masks the global KV and index rows those replayed tokens
 recompute, so the shared rows stay exactly what the first computation
-produced. The CED decoder (layers 20–39) runs only on each prompt's
-last 128 positions (one row per chunk that does not complete its
-prompt), so the prefill row
-count changes at layer 20. The prefill CUDA graph therefore captures the
-model in two halves around that layer, which runs eager: encoder graphs per
-token bucket and decoder graphs per decoder-row bucket, the latter shared by
-every token bucket and capped at 128 rows per request
-(`--max-num-seqs` × 128, see
-[`docs/design/unified_path.md`](../design/unified_path.md#prefill-graphs-around-a-row-narrowing)).
-`--prefill-graph-capture-sizes` sets both ladders. `--disable-prefill-graph`
-turns both off. Decode CUDA graphs are unaffected.
+produced. The CED decoder (layers 20–39) keeps up to the last 128 positions
+of a completing prompt and at most one row from an unfinished chunk.
+The encoder and decoder use separate prefill graphs around the eager narrowing
+step. `--prefill-graph-capture-token-sizes` sets encoder buckets in input
+tokens. All encoder sizes share one set of decoder buckets. The default ladder
+doubles up to the 128-row window and then grows in steps of 128 or more. Its
+last bucket is the smaller of the encoder ceiling and the decoder's row capacity.
+Use `--prefill-graph-decoder-capture-token-sizes` to set exact retained-row
+capacities. `--disable-prefill-graph` disables both prefill graphs.
+See [prefill graphs around a row narrowing](../design/unified_path.md#prefill-graphs-around-a-row-narrowing).
 
 ```bash
 tokenspeed serve deepseek-ai/DeepSeek-V4.1-Flash \
