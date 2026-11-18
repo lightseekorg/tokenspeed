@@ -167,17 +167,17 @@ StorageQuery StorageQueries::MissingStorageKeys(const PromptPrefix& prompt, std:
             boundary.tail_tokens > 0
                 ? std::optional{TailPublication{.tail_tokens = boundary.tail_tokens, .hash = boundary.hash}}
                 : std::nullopt;
-        PrefixProbe::Tier device = local.device;
-        PrefixProbe::Tier probe;
-        prober_.ProbeHostSuffix(candidate, *local.group_keys, store_.MatchOrder(), local_tokens, &possible, device,
-                                probe);
+        const auto suffix = prober_.ProbeHostSuffix(candidate, *local.group_keys, store_.MatchOrder(), local_tokens,
+                                                    &possible, local.device);
+        const PrefixProbe::Tier& probe = suffix.host;
         _assert(probe.num_common_tokens == candidate.max_tokens, "an optimistic candidate must match completely");
         std::vector<CacheKey> additional;
         std::vector<std::int32_t> additional_tokens;
         std::unordered_set<CacheKey, CacheKeyHash> distinct;
         bool fits = true;
         forEachStorageDependency(
-            probe, *local.group_keys, device.full_page_tokens, [&](const CacheKey& key, std::int32_t logical_block) {
+            probe, *local.group_keys, suffix.device.full_page_tokens,
+            [&](const CacheKey& key, std::int32_t logical_block) {
                 if (!fits || host_.ContainsHostCachedBlock(key) || selected.contains(key) ||
                     !distinct.insert(key).second)
                     return;
@@ -225,10 +225,9 @@ StorageReservation StorageQueries::ReserveStoragePrefix(const PromptPrefix& prom
         result.blocks.clear();
         result.tail.reset();
         result.tail_prior = ContentHash{};
-        PrefixProbe::Tier device = device_only;
-        PrefixProbe::Tier probe;
-        prober_.ProbeHostSuffix(candidate, group_keys, store_.MatchOrder(), device_only.num_common_tokens, &remote,
-                                device, probe);
+        const auto suffix = prober_.ProbeHostSuffix(candidate, group_keys, store_.MatchOrder(),
+                                                    device_only.num_common_tokens, &remote, device_only);
+        const PrefixProbe::Tier& probe = suffix.host;
         if (probe.num_common_tokens <= device_only.num_common_tokens) return {};
         const auto pin = [&](const CacheKey& key, std::int32_t logical_block) {
             auto ref = store_.AcquireHostCachedBlock(key);
@@ -242,7 +241,7 @@ StorageReservation StorageQueries::ReserveStoragePrefix(const PromptPrefix& prom
         };
         // Protect warm dependencies only while allocating destinations. They
         // stay evictable during I/O; ordinary admission matches the cache again.
-        forEachStorageDependency(probe, group_keys, device.full_page_tokens, pin);
+        forEachStorageDependency(probe, group_keys, suffix.device.full_page_tokens, pin);
         if (probe.tail) {
             result.tail_prior =
                 probe.full_page_tokens == 0

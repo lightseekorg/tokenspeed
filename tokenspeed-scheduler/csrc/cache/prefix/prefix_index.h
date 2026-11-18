@@ -344,7 +344,7 @@ public:
             _assert(cache_index.boundary_tree == nullptr && cache_index.entries.empty(),
                     "an index tier binds its boundary tree once, before anything is registered");
             cache_index.boundary_tree = &tree;
-            cache_index.boundary_kind = BoundaryTree::EntryKind{.tier = tier, .state = state, .closed = closed};
+            cache_index.boundary_entry_kind = BoundaryTree::EntryKind{.tier = tier, .state = state, .closed = closed};
         };
         bind(device_pool, CacheTier::kDevice);
         if (host_pool != nullptr) {
@@ -399,7 +399,8 @@ public:
         if (cache_index.boundary_tree != nullptr) {
             // The tree keys its nodes by content hash alone.
             _assert(key.namespace_id == kDefaultCacheNamespaceId, "a tracked boundary lies in the default namespace");
-            entry_it->boundary = cache_index.boundary_tree->HoldEntry(key.content_hash, cache_index.boundary_kind);
+            entry_it->boundary =
+                cache_index.boundary_tree->HoldEntry(key.content_hash, cache_index.boundary_entry_kind);
         }
         linkCommonEntry(cache_index, entry_it);
         if (newly_cached != nullptr) {
@@ -869,9 +870,9 @@ public:
 
     // Pins the probed hits: marks them acquired at access_epoch and returns
     // owning references aligned with probe.hits.
-    PrefixMatch AcquireMatched(const BlockPool& pool, std::span<const CacheKey> keys, std::int32_t begin_blocks,
+    PrefixMatch AcquireMatched(const BlockPool& pool, std::span<const CacheKey> keys, std::int32_t begin_block,
                                const GroupPrefixProbe& probe, std::uint64_t access_epoch, SessionCacheOwner session) {
-        _assert(begin_blocks >= 0 && static_cast<std::size_t>(begin_blocks) + probe.hits.size() <= keys.size(),
+        _assert(begin_block >= 0 && static_cast<std::size_t>(begin_block) + probe.hits.size() <= keys.size(),
                 "matched block range is out of bounds");
         PrefixMatch match;
         match.blocks.resize(probe.hits.size());
@@ -882,7 +883,7 @@ public:
             }
             _assert(cache_index != nullptr, "cached pool disappeared between match probe and acquisition");
             CacheEntryIterator entry_it =
-                findMatchedEntry(*cache_index, pool, keys[static_cast<std::size_t>(begin_blocks) + i], probe, i);
+                findMatchedEntry(*cache_index, pool, keys[static_cast<std::size_t>(begin_block) + i], probe, i);
             _assert(entry_it != cache_index->entries.end(),
                     "cached block disappeared between match probe and acquisition");
             // The returned RAII owner pins the block. As for Find(), traversal
@@ -917,8 +918,8 @@ public:
     }
 
     std::vector<CacheBlockLocation> MatchedLocations(const BlockPool& pool, std::span<const CacheKey> keys,
-                                                     std::int32_t begin_blocks, const GroupPrefixProbe& probe) const {
-        _assert(begin_blocks >= 0 && static_cast<std::size_t>(begin_blocks) + probe.hits.size() <= keys.size(),
+                                                     std::int32_t begin_block, const GroupPrefixProbe& probe) const {
+        _assert(begin_block >= 0 && static_cast<std::size_t>(begin_block) + probe.hits.size() <= keys.size(),
                 "matched block range is out of bounds");
         std::vector<CacheBlockLocation> locations;
         locations.reserve(static_cast<std::size_t>(std::ranges::count(probe.hits, std::uint8_t{1})));
@@ -929,7 +930,7 @@ public:
             }
             _assert(cache_index != nullptr, "cached pool disappeared between match probes");
             const auto entry_it =
-                findMatchedEntry(*cache_index, pool, keys[static_cast<std::size_t>(begin_blocks) + i], probe, i);
+                findMatchedEntry(*cache_index, pool, keys[static_cast<std::size_t>(begin_block) + i], probe, i);
             _assert(entry_it != cache_index->entries.end(), "cached block disappeared between match probes");
             locations.push_back(entry_it->block_ref->Location());
         }
@@ -1004,7 +1005,7 @@ private:
         // TrackBoundaries: the tree each entry holds a node of, and what an
         // entry of this tier stands for there.
         BoundaryTree* boundary_tree{nullptr};
-        BoundaryTree::EntryKind boundary_kind{};
+        BoundaryTree::EntryKind boundary_entry_kind{};
         // Counts the entries that joined, left or moved, so an EvictableEntry
         // can tell that the entry it borrows may be gone or elsewhere.
         std::uint64_t membership{0};
