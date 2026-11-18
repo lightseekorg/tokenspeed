@@ -59,6 +59,7 @@ if _AVAILABLE:
             "tree": frozenset({False, True}),
             "separate_output_state": frozenset({False}),
             "strided_qkv": frozenset({False, True}),
+            "strided_state": frozenset({False, True}),
         },
     )
     def cute_dsl_gdn_decode_mtp(

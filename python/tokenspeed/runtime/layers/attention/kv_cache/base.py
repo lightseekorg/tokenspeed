@@ -29,6 +29,7 @@ from tokenspeed_kernel.ops.attention.prologue import HeadKVCache, LatentKVCache
 
 from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+    FLAT_KV_PLANE,
     cache_field_layer_id,
     cache_field_plane,
 )
@@ -262,6 +263,63 @@ class CachePool(ABC):
             first_layer=self._field_layer_offset,
             num_layers=self.layer_num,
         )
+
+    def atom_pages_per_block(self, group_id: str, kernel_page_size: int) -> int:
+        """Return atom pages per scheduler block for a kernel page table.
+
+        Full-history fields on the shared plane fold their physical stride
+        into atom IDs. State and sliding-window groups retain scheduler IDs.
+        """
+        specs = {spec.group_id: spec for spec in self.arena.cache_group_specs}
+        spec = specs[group_id]
+        granularity = spec.block_granularity
+        if kernel_page_size <= 0 or granularity % kernel_page_size:
+            raise ValueError(
+                f"cache group {group_id!r}: block_granularity {granularity} "
+                f"is not divisible by kernel page size {kernel_page_size}"
+            )
+        ratio = granularity // kernel_page_size
+        multipliers = set()
+        fields = self.arena.plan.fields if spec.attn_kind == "full_history" else ()
+        for field in fields:
+            if (
+                field.group_id != group_id
+                or _layer_plane(
+                    field.field_id, self._field_layer_offset, self.layer_num
+                )
+                is None
+            ):
+                continue
+            if field.plane_id != FLAT_KV_PLANE:
+                multipliers.add(ratio)
+                continue
+            if field.shape[0] != spec.rows_per_page or field.shape[0] % ratio:
+                raise ValueError(
+                    f"cache field {field.field_id!r} has incompatible atom rows"
+                )
+            atom_bytes = field.payload_bytes // ratio
+            if field.page_stride_bytes % atom_bytes:
+                raise ValueError(
+                    f"cache field {field.field_id!r}: page stride "
+                    f"{field.page_stride_bytes} is not divisible by atom-page "
+                    f"payload {atom_bytes}"
+                )
+            multipliers.add(field.page_stride_bytes // atom_bytes)
+        if not multipliers:
+            multipliers.add(ratio)
+        if len(multipliers) != 1:
+            raise ValueError(
+                f"cache group {group_id!r} needs one atom-page multiplier for "
+                f"every layer sharing its page table, got {sorted(multipliers)}"
+            )
+        multiplier = multipliers.pop()
+        self.arena.plan.validate_kernel_page_range(
+            group_id,
+            atom_pages_per_block=multiplier,
+            kernel_subpages=ratio,
+            kernel_page_size=kernel_page_size,
+        )
+        return multiplier
 
     def history_group_by_layer(self) -> dict[int, str]:
         """View-local layer id -> the history group its KV planes
