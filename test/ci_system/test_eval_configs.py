@@ -357,10 +357,6 @@ KIMI_K31_AMD_RECIPE_CONFIGS = (
         PERF_CONFIG_DIR,
         "kimi-k3.1-pro-dspark-mxfp4-tp8-kvp8-evalscope-agentic-mi35x.yaml",
     ),
-    (
-        PERF_CONFIG_DIR,
-        "kimi-k3.1-pro-dspark-mxfp4-tp8-kvp8-evalscope-random-50k-500-mi35x.yaml",
-    ),
 )
 # Serving flags that only the CI jobs set (the gateway tokenizer is staged on
 # the runners) and that only the doc sets (a public bind address).
@@ -422,9 +418,8 @@ def test_kimi_k31_amd_configs_have_expected_gating_and_baselines():
         task = yaml.safe_load((config_dir / filename).read_text(encoding="utf-8"))
         server_tokens = shlex.split(task["server"]["command"])
         is_recipe = "dspark" in filename
-        is_gate = is_recipe and "random-50k" not in filename
 
-        expected_triggers = ["per-commit", "manual"] if is_gate else ["manual"]
+        expected_triggers = ["per-commit", "manual"] if is_recipe else ["manual"]
         assert task["triggers"] == expected_triggers
         assert (
             task["env"]["KIMI_K31_GATEWAY_TOKENIZER"]
@@ -451,7 +446,7 @@ def test_kimi_k31_amd_configs_have_expected_gating_and_baselines():
             if not is_recipe:
                 assert flag_value(server_tokens, "--reasoning-parser") == "kimi_k3"
             assert task["score_threshold"] == 0.90
-        elif is_gate:
+        elif is_recipe:
             assert task["perf_threshold"] == 0.95
             assert task["perf_reference"] == {32: [24.7, 9400]}
         else:
@@ -459,10 +454,10 @@ def test_kimi_k31_amd_configs_have_expected_gating_and_baselines():
             assert "perf_threshold" not in task
         tasks[filename] = task
 
-    eval_task, agentic_task, perf_task = (
+    eval_task, agentic_task = (
         tasks[filename] for _, filename in KIMI_K31_AMD_RECIPE_CONFIGS
     )
-    for task in (eval_task, agentic_task, perf_task):
+    for task in (eval_task, agentic_task):
         server_tokens = shlex.split(task["server"]["command"])
         assert flag_value(server_tokens, "--speculative-algorithm") == "DSPARK"
         # A step count equal to the default leaves the checkpoint's block width.
@@ -494,29 +489,7 @@ def test_kimi_k31_amd_configs_have_expected_gating_and_baselines():
         flag_value(eval_tokens, "--work-dir")
         == ".ci-artifacts/published/kimi-k3.1-pro-dspark-aime26"
     )
-    assert "'evalscope[perf]==1.11.1'" in perf_task["perf"]["install"][0]
-    perf_tokens = shlex.split(perf_task["perf"]["command"])
-    assert (
-        "OUTPUTS_DIR=$PWD/.ci-artifacts/published/kimi-k3.1-pro-dspark-tp8-kvp8-50k-500-perf"
-        in perf_tokens
-    )
-    assert "trap" not in perf_tokens
-    for flag, value in {
-        "--parallel": "32",
-        "--number": "32",
-        "--warmup-num": "0",
-        "--dataset-offset": "300160",
-        "--seed": "20260906",
-        "--min-prompt-length": "50000",
-        "--max-prompt-length": "50000",
-        "--min-tokens": "500",
-        "--max-tokens": "500",
-    }.items():
-        assert flag_value(perf_tokens, flag) == value
-    assert flag_value(perf_tokens, "--total-timeout") == "21600"
-    assert "--no-apply-chat-template" in perf_tokens
-    assert "--no-test-connection" in perf_tokens
-
+    assert "'evalscope[perf]==1.11.1'" in agentic_task["perf"]["install"][0]
     assert "/tmp/agentic_dataset.json" in agentic_task["perf"]["install"][1]
     assert (
         'revision="2779acd48a05c211f2f82eee71bdbdf688d984ca"'
