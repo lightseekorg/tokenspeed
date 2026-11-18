@@ -978,6 +978,11 @@ if platform.is_nvidia and platform.arch_version == ArchVersion(10, 7):
         pass
 
 
+def prefer_bf16_small_n_splitk(m: int, n: int, k: int, *, enable_pdl: bool) -> bool:
+    """Give the available small-N policy precedence over startup GEMM shortcuts."""
+    return _bf16_splitk is not None and enable_pdl and _prefer_small_n_splitk(m, n, k)
+
+
 if _bf16_splitk is not None:
 
     @register_kernel(
