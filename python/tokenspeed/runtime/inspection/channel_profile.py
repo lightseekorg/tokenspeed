@@ -63,6 +63,104 @@ def _nonnegative_finite(value: float, name: str) -> float:
     return float(value)
 
 
+def _validate_profile_model(
+    model: Qwen3ForCausalLM,
+    *,
+    execution: Literal["eager"],
+    speculative: bool,
+    monokernel: bool,
+) -> None:
+    if execution != "eager" or speculative or monokernel:
+        raise ValueError(
+            "Profiling requires eager, non-speculative, non-monokernel execution"
+        )
+    if type(model) is not Qwen3ForCausalLM:
+        raise ValueError("Profiling supports the ordinary dense Qwen3 model only")
+    if model.mapping.world_size != 1 or model.mapping.pp_size != 1:
+        raise ValueError("Profiling requires one device (TP=PP=DP=1)")
+    if model.quant_config is not None or model._weight_update_active:
+        raise ValueError("Profiling requires unquantized, unchanged weights")
+    if model.training:
+        raise ValueError("Profiling requires evaluation mode")
+
+
+def _normalize_profile_thresholds(
+    activation_threshold: float, histogram_edges: Sequence[float]
+) -> tuple[float, tuple[float, ...], torch.Tensor]:
+    activation_threshold = _nonnegative_finite(
+        activation_threshold, "activation_threshold"
+    )
+    edges = tuple(
+        _nonnegative_finite(value, "histogram edge") for value in histogram_edges
+    )
+    if (
+        not edges
+        or edges[0] <= 0
+        or any(right <= left for left, right in zip(edges, edges[1:]))
+    ):
+        raise ValueError("histogram_edges must be positive and strictly ascending")
+    try:
+        edge_tensor = torch.tensor(edges, dtype=torch.float32)
+        threshold_tensor = torch.tensor(activation_threshold, dtype=torch.float32)
+    except (OverflowError, RuntimeError) as error:
+        raise ValueError("Profile thresholds must fit in float32") from error
+    if (
+        not bool(torch.isfinite(edge_tensor).all())
+        or edge_tensor[0] <= 0
+        or not bool((edge_tensor[1:] > edge_tensor[:-1]).all())
+    ):
+        raise ValueError(
+            "histogram_edges must stay finite, positive and distinct in float32"
+        )
+    if not bool(torch.isfinite(threshold_tensor)) or (
+        activation_threshold > 0 and threshold_tensor <= 0
+    ):
+        raise ValueError("activation_threshold cannot overflow or underflow float32")
+    return (
+        float(threshold_tensor.item()),
+        tuple(float(value) for value in edge_tensor.tolist()),
+        edge_tensor,
+    )
+
+
+def _validated_profile_mlps(
+    model: Qwen3ForCausalLM,
+) -> tuple[tuple[nn.Module, ...], tuple[GatedMLP, ...], nn.Parameter]:
+    layers = tuple(model.model.layers)
+    if not layers or len(layers) != model.config.num_hidden_layers:
+        raise ValueError("Profiling requires all local Qwen3 layers")
+    mlps = tuple(layer.mlp for layer in layers)
+    first_weight = mlps[0].down_proj.weight
+    if first_weight.dtype not in (torch.bfloat16, torch.float32):
+        raise ValueError("Profiling supports BF16 or FP32 tensors only")
+    for mlp in mlps:
+        if (
+            type(mlp) is not GatedMLP
+            or mlp.fusion is not GatedMLPFusion.NONE
+            or type(mlp.act_fn) is not SiluAndMul
+            or mlp.act_fn.swiglu_limit is not None
+            or type(mlp.gate_up_proj.quant_method) is not UnquantizedLinearMethod
+            or type(mlp.down_proj.quant_method) is not UnquantizedLinearMethod
+        ):
+            raise ValueError("Profiling requires unfused, unquantized SwiGLU MLPs")
+        down = mlp.down_proj.weight
+        gate_up = mlp.gate_up_proj.weight
+        if (
+            down.ndim != 2
+            or down.shape[1] <= 0
+            or gate_up.ndim != 2
+            or gate_up.shape[0] != 2 * down.shape[1]
+            or gate_up.shape[1] != down.shape[0]
+        ):
+            raise ValueError("Unsupported MLP projection shapes")
+        if any(
+            weight.device != first_weight.device or weight.dtype != first_weight.dtype
+            for weight in (down, gate_up)
+        ):
+            raise ValueError("MLP projections must share a dtype and device")
+    return layers, mlps, first_weight
+
+
 class ChannelActivityProfiler:
     """Collect every MLP channel's activity on explicitly recorded forwards.
 
@@ -100,93 +198,26 @@ class ChannelActivityProfiler:
         activation_threshold: float,
         histogram_edges: Sequence[float],
     ) -> None:
-        if execution != "eager" or speculative or monokernel:
-            raise ValueError(
-                "Profiling requires eager, non-speculative, non-monokernel execution"
-            )
-        if type(model) is not Qwen3ForCausalLM:
-            raise ValueError("Profiling supports the ordinary dense Qwen3 model only")
-        if model.mapping.world_size != 1 or model.mapping.pp_size != 1:
-            raise ValueError("Profiling requires one device (TP=PP=DP=1)")
-        if model.quant_config is not None or model._weight_update_active:
-            raise ValueError("Profiling requires unquantized, unchanged weights")
-        if model.training:
-            raise ValueError("Profiling requires evaluation mode")
+        _validate_profile_model(
+            model,
+            execution=execution,
+            speculative=speculative,
+            monokernel=monokernel,
+        )
         if type(model_identity) is not str or not model_identity.strip():
             raise ValueError("model_identity must be a nonempty string")
-        activation_threshold = _nonnegative_finite(
-            activation_threshold, "activation_threshold"
+        activation_threshold, edges, edge_tensor = _normalize_profile_thresholds(
+            activation_threshold, histogram_edges
         )
-        edges = tuple(
-            _nonnegative_finite(value, "histogram edge") for value in histogram_edges
-        )
-        if (
-            not edges
-            or edges[0] <= 0
-            or any(right <= left for left, right in zip(edges, edges[1:]))
-        ):
-            raise ValueError("histogram_edges must be positive and strictly ascending")
-        try:
-            edge_tensor = torch.tensor(edges, dtype=torch.float32)
-            threshold_tensor = torch.tensor(activation_threshold, dtype=torch.float32)
-        except (OverflowError, RuntimeError) as error:
-            raise ValueError("Profile thresholds must fit in float32") from error
-        if (
-            not bool(torch.isfinite(edge_tensor).all())
-            or edge_tensor[0] <= 0
-            or not bool((edge_tensor[1:] > edge_tensor[:-1]).all())
-        ):
-            raise ValueError(
-                "histogram_edges must stay finite, positive and distinct in float32"
-            )
-        if not bool(torch.isfinite(threshold_tensor)) or (
-            activation_threshold > 0 and threshold_tensor <= 0
-        ):
-            raise ValueError(
-                "activation_threshold cannot overflow or underflow float32"
-            )
-
-        layers = tuple(model.model.layers)
-        if not layers or len(layers) != model.config.num_hidden_layers:
-            raise ValueError("Profiling requires all local Qwen3 layers")
-        mlps = tuple(layer.mlp for layer in layers)
-        first_weight = mlps[0].down_proj.weight
-        if first_weight.dtype not in (torch.bfloat16, torch.float32):
-            raise ValueError("Profiling supports BF16 or FP32 tensors only")
-        for layer, mlp in zip(layers, mlps):
-            if (
-                type(mlp) is not GatedMLP
-                or mlp.fusion is not GatedMLPFusion.NONE
-                or type(mlp.act_fn) is not SiluAndMul
-                or mlp.act_fn.swiglu_limit is not None
-                or type(mlp.gate_up_proj.quant_method) is not UnquantizedLinearMethod
-                or type(mlp.down_proj.quant_method) is not UnquantizedLinearMethod
-            ):
-                raise ValueError("Profiling requires unfused, unquantized SwiGLU MLPs")
-            down = mlp.down_proj.weight
-            gate_up = mlp.gate_up_proj.weight
-            if (
-                down.ndim != 2
-                or down.shape[1] <= 0
-                or gate_up.ndim != 2
-                or gate_up.shape[0] != 2 * down.shape[1]
-                or gate_up.shape[1] != down.shape[0]
-            ):
-                raise ValueError("Unsupported MLP projection shapes")
-            if any(
-                weight.device != first_weight.device
-                or weight.dtype != first_weight.dtype
-                for weight in (down, gate_up)
-            ):
-                raise ValueError("MLP projections must share a dtype and device")
+        layers, mlps, first_weight = _validated_profile_mlps(model)
 
         self._model = model
         self._model_identity = model_identity
         self._layers = layers
         self._mlps = mlps
         self._device = first_weight.device
-        self._activation_threshold = float(threshold_tensor.item())
-        self._histogram_edges = tuple(float(value) for value in edge_tensor.tolist())
+        self._activation_threshold = activation_threshold
+        self._histogram_edges = edges
         self._edge_tensor = edge_tensor.to(self._device)
         self._down_norms = tuple(
             torch.linalg.vector_norm(mlp.down_proj.weight.detach().float(), dim=0)
