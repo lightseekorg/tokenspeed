@@ -451,6 +451,9 @@ def test_kimi_k31_amd_configs_have_expected_gating_and_baselines():
             if not is_recipe:
                 assert flag_value(server_tokens, "--reasoning-parser") == "kimi_k3"
             assert task["score_threshold"] == 0.90
+        elif is_gate:
+            assert task["perf_threshold"] == 0.95
+            assert task["perf_reference"] == {32: [24.7, 9400]}
         else:
             assert "perf_reference" not in task
             assert "perf_threshold" not in task
