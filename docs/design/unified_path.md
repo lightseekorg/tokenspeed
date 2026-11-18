@@ -538,10 +538,13 @@ every MegaMoE input staging reads, and writes (1, 1) back right after the
 replay, on the same stream, also when the replay raises. Staging gives each
 row at or past `num_tokens * live // padded` expert id -1 and weight 0, which
 MegaMoE skips in dispatch and combine; a filler row's MoE output is then
-zero, or the fused shared expert's alone. Eager forwards and prefill-graph
-buckets see (1, 1) and route every row.
+zero, or the fused shared expert's alone. Eager forwards and ordinary prefill
+buckets see (1, 1) and route every row. DP CED stage replays reuse this pair
+with (live rows, stage bucket): each physical row is one counted token.
+Only padded stages update the pair and restore (1, 1) in a `finally`
+before eager narrowing or the next forward. Exact fits use (1, 1) directly.
 
-The pair counts requests, not rows, so one pair serves the replay's forwards
+For full decode the pair counts requests, so one pair serves the replay's forwards
 of different rows per request, such as the DeepSeek V4.1 target's rows and
 its DSpark drafter's block rows, where a row mask would need one per row
 count. The share is right only when each rank's MegaMoE input is its
@@ -848,9 +851,9 @@ shared by ordinary forward and graph replay. At construction the graph owner
 resolves one embedding callable: this method, or a plain token lookup for models
 that do not require history. Argument preparation must preserve supplied
 `input_embeds` so the inner model skips embedding computation when they are present.
-The executor supplies its live `RequestTokenHistoryView`; the graph
-owner calls this method eagerly, before padding, and copies its result into
-the same static embedding buffer used by ordinary text and multimodal
+The executor supplies its live `RequestTokenHistoryView` in `model_kwargs`.
+The graph owner calls this method eagerly, before padding, and copies its
+result into the static embedding buffer used by ordinary text and multimodal
 prefills. The method must return all input rows, and every history-dependent
 operation must finish there. The captured inner stack consumes the supplied
 `input_embeds` without requiring or appending history, including during
@@ -916,12 +919,10 @@ static-buffer ownership, and zeroing of padded rows are unchanged.
 
 ### Prefill graphs around a row narrowing
 
-A prefill forward whose row count drops once, at a fixed layer, by an amount
-that is not a function of the token bucket cannot be one token-shaped
-breakable graph. DeepSeek-V4.1 is the case: its CED decoder (layer 20 on)
-runs on a per-request tail of the prefill rows (`decoder_view()` — a
-completing prompt's last window, no rows for an open chunk, every decode
-row), so the row count at layer 20 depends on which requests complete.
+DeepSeek-V4.1's CED decoder (layer 20 on) keeps every decode row and each
+completing prompt's last window. An open chunk keeps one row if another
+request in the local batch produces output, zero otherwise. The encoder's
+token count alone therefore cannot determine the decoder bucket.
 
 The model declares the split instead of opting out: it implements
 `PrefillGraph`'s `NarrowingPrefillModel` contract — `encoder_forward` (the
@@ -932,25 +933,38 @@ sampled-row gather, the DSpark row report); `forward` is their composition,
 so eager and graphed prefill are one path. `PrefillGraph` captures the
 encoder per token bucket and the decoder per decoder-row bucket, from a
 fixed-row static state the narrowing lands into (leading rows copied, tail
-zeroed). The decoder graphs depend only on their row count, so one ladder
-serves every token bucket; it is the token ladder clipped to
-`max_decoder_rows_per_request × max_num_seqs` (a request contributes at most
-its window). A replay is encoder graph → eager narrowing → decoder graph,
-all under the bucket-pinned ambient context. The narrowing and decoder
+zeroed). `--prefill-graph-decoder-capture-token-sizes` sets decoder buckets
+in retained rows. An explicit size may exceed the encoder ceiling if it fits
+both the forward token budget and `max_local_requests × min(window, context_len)`.
+
+Each stage replays the smallest captured bucket covering its rows, or runs
+eagerly if none fits. DP1 uses local input and retained row counts and runs
+an empty decoder eagerly. Both encoder paths read positions from `InputBuffers`,
+including M-RoPE positions prepared in place. The narrowing and decoder
 stages size their own collectives from their row counts
 (`report_collective_sizing`). The decoder graph replays with the narrowed
-row count as its valid rows, so its breaks scrub the static tail. A forward
-whose narrowed rows exceed the largest decoder bucket runs its decoder
-stage eager. Layers read their row plan from the live context, never from a
-loose argument a captured break would freeze. Capture runs the
-narrowing before every decoder run, as serving does: the decoder consumes
-per-forward backend state its predecessor produces (V4.1's reuse layers read
-the index source's selection, which later sources overwrite). Under
-attention DP the split graph stays off: the narrowed row count is rank-local
-(which prompts complete on this rank), so the decoder bucket and the
-collective shapes its graph bakes would differ across ranks, and the stages
-size their collectives from their own rows, which the DP metadata gather
-does not carry. Eager TP1 attention/dense with fused EP may narrow: the
+row count as its valid rows, so its breaks scrub the static tail. Layers
+read their row plan from the live context on every replay. Capture runs
+narrowing before each decoder run so V4.1's reuse layers read the current
+source's index selection before a later source overwrites it.
+
+Under attention DP, all ranks use the scheduler's maximum input count for the
+encoder. Before the target forward, one `MAX` on a dedicated Gloo group
+combines the actual decoder row counts and veto flags. All ranks use the
+largest count for the decoder, unless any rank vetoes replay and the whole
+round runs eagerly. In mixed rounds, decode-only peers participate and idle
+peers contribute zero rows. Idle replays use fresh empty attention metadata
+and route no rows to experts.
+
+This path requires DeepGEMM MegaMoE, TP1 for attention, head projections,
+dense and MoE layers, replicated KV and full-world expert-owned communication.
+Pure decode/idle rounds use the full decode path. Ordinary EP exchanges
+counts eagerly.
+
+Attention stays at eager breaks. The backend's `prefill_graph_scope` retains
+indexer scratch across encoder, narrowing and decoder, then releases it.
+
+Eager TP1 attention/dense with fused EP may narrow: the
 fused dispatch exchanges the actual local row counts, while the original
 DP counts remain capacity bounds. The CPU metadata gather also carries
 per-rank decode request counts. V4.1 DSpark sizes its one draft forward at
@@ -962,8 +976,9 @@ same uniform padded decode counts as their target batches.
 
 V4.1 completes deferred HC posts and reductions before stage handoffs or
 Engram updates. The fixed graph input state contains only completed residuals.
-Prefill warmup runs on the eventual capture stream because MegaMHC initializes
-per-stream barriers. Allocation observers wrap capture alone, leaving eager
+Eligible shifted MegaMHC joins run inside the prefill graph segments. Warmup
+on the capture stream initializes its split barriers, and DeepGEMM advances
+their epoch on every replay. Allocation observers wrap capture alone, leaving eager
 warmup allocations in utilization headroom. Fused HC all-reduce admission
 respects both deterministic and batch-invariant collective settings. Empty
 consumer rows carry no deferred post. Cache-only narrowing completes the incoming

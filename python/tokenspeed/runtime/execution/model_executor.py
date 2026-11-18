@@ -502,6 +502,7 @@ class ModelExecutorConfig:
     prefill_graph_max_tokens: int = 0
     # Explicit bucket list overriding the ladder (see get_prefill_token_buckets).
     prefill_graph_capture_sizes: list[int] | None = None
+    prefill_graph_decoder_capture_token_sizes: list[int] | None = None
     # The scheduler may give extend rows in-forward State checkpoints
     # (--enable-state-checkpoint-in-forward).
     state_checkpoint_in_forward: bool = False
@@ -541,6 +542,11 @@ class ModelExecutorConfig:
         # the backend classes (cuda_graph_support) and resolved in
         # ModelExecutor.__init__ once the backend instances exist.
         disable_prefill_graph = bool(server_args.disable_prefill_graph)
+        decoder_sizes = server_args.prefill_graph_decoder_capture_token_sizes
+        if decoder_sizes and narrowing_prefill_model(model) is None:
+            raise ValueError(
+                "--prefill-graph-decoder-capture-token-sizes requires a narrowing prefill model"
+            )
 
         return ModelExecutorConfig(
             max_req_pool_size=max_req_pool_size,
@@ -568,6 +574,7 @@ class ModelExecutorConfig:
             disable_prefill_graph=disable_prefill_graph,
             prefill_graph_max_tokens=_resolve_prefill_graph_max_tokens(server_args),
             prefill_graph_capture_sizes=server_args.prefill_graph_capture_sizes,
+            prefill_graph_decoder_capture_token_sizes=decoder_sizes,
             prefill_graph_capture_batch_sizes=server_args.prefill_graph_capture_batch_sizes,
             state_checkpoint_in_forward=server_args.writes_state_checkpoints_in_forward,
             model_is_mrope=model_is_mrope,
@@ -1591,11 +1598,10 @@ class ModelExecutor:
         # Prefill-graph replay when captured for this forward (the decode graph
         # replays one level up: it captures the whole _forward_step).
         mode = ctx.forward_mode
-        if (
-            mode is not None
-            and (mode.is_extend() or mode.is_mixed())
-            and self.prefill_graph.can_run(ctx, self._active_multimodal_context)
-        ):
+        buckets = self.prefill_graph.select_buckets(
+            ctx, self._active_multimodal_context
+        )
+        if buckets is not None:
             if ctx.query_shard is not None:
                 raise RuntimeError(
                     "a sharded extend cannot replay a prefill graph; query context "
@@ -1605,7 +1611,8 @@ class ModelExecutor:
                 ctx,
                 input_ids,
                 self._active_multimodal_context,
-                request_token_history=model_kwargs.get("request_token_history"),
+                buckets=buckets,
+                model_kwargs=model_kwargs,
             )
         if (
             mode is not None
@@ -2318,16 +2325,45 @@ class ModelExecutor:
                     )
                 return
 
-            # Run model forward with IDLE mode — skips attention but still
-            # participates in MLP NCCL collectives (dense all-gather, MoE).
             ctx.forward_mode = ForwardMode.IDLE
-            empty = torch.zeros(0, dtype=torch.int32, device=self.device)
-            self.model_runner.forward(
-                ctx,
-                input_ids=empty,
-                positions=empty,
-                **self._model_input_kwargs(0, 0, slice(0, 0)),
+            buckets = (
+                None
+                if ctx.all_decode_or_idle
+                else self.prefill_graph.select_buckets(ctx)
             )
+            empty = torch.empty(0, dtype=torch.int32, device=self.device)
+            kwargs = self._model_input_kwargs(0, 0, slice(0, 0))
+            if buckets is not None:
+                ib = self.input_buffers
+                # Use this round's empty view at attention breaks. Reusing the
+                # previous batch's metadata could read or overwrite its cache.
+                encoder, _ = buckets
+                ib.fill_dummy_decode_buffers(batch_size=0, total_tokens=encoder or 0)
+                self.attn_backend.refresh_decode_metadata(
+                    0,
+                    0,
+                    ib.req_pool_indices_buf[:0],
+                    ib.seq_lens_buf[:0],
+                    forward_mode=ForwardMode.IDLE,
+                    block_tables=self.forward_step.placeholder_block_tables(0),
+                    for_graph_replay=True,
+                )
+                # Eager breaks write the handoff tensors allocated at capture.
+                # Match the active target's inference mode on the idle entry.
+                with maybe_inference_mode():
+                    self.prefill_graph.replay(
+                        ctx,
+                        empty,
+                        buckets=buckets,
+                        model_kwargs=kwargs,
+                    )
+            else:
+                self.model_runner.forward(
+                    ctx,
+                    input_ids=empty,
+                    positions=empty,
+                    **kwargs,
+                )
 
             # If a drafter is active, its model also has MoE layers that issue
             # NCCL collectives. Idle ranks must match those collectives: the

@@ -44,6 +44,7 @@ holds (``V41Metadata.global_write_floor``).
 
 import logging
 from collections.abc import Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import NamedTuple
 
@@ -3134,6 +3135,15 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             )
             != "all"
         )
+
+    @contextmanager
+    def prefill_graph_scope(self):
+        """Use the eager forward's indexer scratch lifetime across graph stages."""
+        self.begin_indexer_forward()
+        try:
+            yield
+        finally:
+            self.end_indexer_forward()
 
     def begin_indexer_forward(self) -> None:
         """Start fresh geometry shared across this forward's stages.

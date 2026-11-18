@@ -851,6 +851,8 @@ class ServerArgs:
     prefill_graph_max_tokens: int | None = None
     # Explicit prefill bucket list; unset = the relative-stride ladder (see get_prefill_token_buckets).
     prefill_graph_capture_sizes: list[int] | None = None
+    # CED decoder token rows. An empty or omitted list uses window-based sizes.
+    prefill_graph_decoder_capture_token_sizes: list[int] | None = None
     # Request capacities for inline attention; unset keeps the minimum per bucket.
     prefill_graph_capture_batch_sizes: list[int] | None = None
     cudagraph_capture_sizes: list[int] | None = None
@@ -4829,7 +4831,7 @@ class ServerArgs:
             "--prefill-graph-max-tokens",
             type=int,
             default=ServerArgs.prefill_graph_max_tokens,
-            help="Largest token bucket captured by the breakable prefill CUDA "
+            help="Largest encoder or ordinary prefill token bucket captured by the CUDA "
             "graph. Default (unset) = min(8192, chunked-prefill size); "
             "0 disables.",
         )
@@ -4854,6 +4856,16 @@ class ServerArgs:
             nargs="+",
             help="Compatibility alias for --prefill-graph-capture-token-sizes. "
             "Specify only one spelling.",
+        )
+        parser.add_argument(
+            "--prefill-graph-decoder-capture-token-sizes",
+            metavar="ROWS",
+            type=int,
+            nargs="+",
+            help="CED decoder CUDA graph capacities in retained token rows. "
+            "Explicit sizes are independent of the encoder buckets. By default, "
+            "capture powers of two below the decoder window, then window-sized "
+            "steps with coarser spacing for larger batches.",
         )
         parser.add_argument(
             "--prefill-graph-capture-batch-sizes",
