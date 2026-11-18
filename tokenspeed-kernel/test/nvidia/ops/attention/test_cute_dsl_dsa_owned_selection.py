@@ -65,10 +65,12 @@ _PAGE, _BLOCK = 64, 128
 
 
 def _owned_candidates(degree: int, rows: int, q_len: int, topk: int, seed: int):
-    """A virtual index-page table and every rank's candidates, all on pages
-    the rank owns: positions ``[degree, rows, topk]`` (``-1`` invalid) and
-    their scores (``-inf`` invalid), with mandatory, signed-zero, NaN, short
-    and empty rows."""
+    """Build a virtual index-page table and every rank's owned candidates.
+
+    Returns positions ``[degree, rows, topk]`` (``-1`` invalid) on pages the
+    rank owns and their scores (``-inf`` invalid), with mandatory,
+    signed-zero, NaN, short and empty rows.
+    """
     generator = torch.Generator(device="cuda").manual_seed(seed)
     requests = rows // q_len
     blocks_per_request = 24 * degree
@@ -116,9 +118,12 @@ def _local_pages(table, virtual_blocks: int, degree: int, rank: int):
 
 
 def _merged_then_compacted(table, virtual_blocks, positions, scores, q_len, topk):
-    """Every rank's local slots through the full exchange: the merge's
-    selection (``cuda_dsa_merge_candidates``' threshold selection over an
-    exact top-k), its scheduler slots, then each rank's owned share."""
+    """Return every rank's local slots through the full exchange.
+
+    That is the merge's selection (``cuda_dsa_merge_candidates``' threshold
+    selection over an exact top-k), its scheduler slots, then each rank's
+    owned share.
+    """
     degree = positions.shape[0]
     records = torch.stack((positions, scores.view(torch.int32)), dim=-1)
     merged = rank_major_scores(records)
