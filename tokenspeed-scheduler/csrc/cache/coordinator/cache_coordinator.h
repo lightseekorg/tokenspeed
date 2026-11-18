@@ -174,6 +174,34 @@ public:
                                                      groupExpiredBlockEndAt(i, num_computed_tokens), count_uncached);
     }
 
+    // A prefix this replica holds, as a peer reads it
+    // (docs/rfcs/0004-peer-prefix-sharing.md): the probe's hit acquired on
+    // both tiers as an admission's first step acquires it, every hit dated
+    // with a new access epoch, each block at the slot a reader's table gives
+    // it (PeerPage::slot): the Device's hits from slot 0, the Host suffix's
+    // after them, a State group's checkpoint at the live slot. Dropping the
+    // blocks right away only refreshes the entries.
+    struct ExportedBlock {
+        CacheKey key;
+        std::int32_t slot{0};
+        CacheTier tier{CacheTier::kDevice};
+        CacheBlockRef block;
+    };
+    struct PrefixExport {
+        std::int32_t num_tokens{0};
+        std::vector<ExportedBlock> blocks;
+        // The access epoch the hits were dated with.
+        std::uint64_t access_epoch{0};
+    };
+    PrefixExport ExportPrefix(PrefixProbe&& probe);
+    // After a peer read in full the prefix an export dated `access_epoch`,
+    // whose entries are `keys`: demotes its leaf chain as DemoteEntries does.
+    // From the deepest boundary toward the root, a boundary joins the chain
+    // while it has no child off the chain and none of its entries was
+    // accessed since, so the chain leaves first and its leaving opens no gap
+    // under another branch. Returns the entries demoted.
+    std::int32_t DemoteExportedChain(std::span<const CacheKey> keys, std::uint64_t access_epoch);
+
     // Admit consumes the probe (PrefixProber) whether or not it admits; a
     // caller that retries after a failure keeps a copy. A missing epoch
     // starts a new request; a supplied epoch continues that request. Once
@@ -462,16 +490,20 @@ public:
     void CacheDeviceBlock(CacheBlockRef& block_ref, const CacheKey& key, std::int32_t logical_block_index,
                           CacheBoundaryKind boundary_kind, std::uint64_t access_epoch);
 
-    // Reports real device-cache entry insertions and removals. The scheduler
-    // folds the per-group mutations into one externally visible prefix event.
+    // Reports real Device cache entry insertions and removals, and changes of
+    // a boundary's Host entries (CacheMutation). The scheduler folds the
+    // per-group mutations into one externally visible prefix event per medium.
     void SetCacheMutationSink(CacheMutationSink sink) { store_.SetMutationSink(std::move(sink)); }
     struct BoundaryEventStatus {
-        bool publishable;
-        bool has_device_entries;
+        bool device_publishable;
+        bool host_publishable;
+        bool retains_descriptor;
     };
-    // Routing requires every continuous-history group on Device; auxiliary
-    // windows and State do not gate publication. Without continuous history,
-    // no boundary is publishable. Any Device entry retains the descriptor.
+    // Routing requires every continuous-history group on the medium (the
+    // Device, or the Host); auxiliary windows and State do not gate
+    // publication. Without continuous history, no boundary is publishable.
+    // Any Device entry, Host entry or pending Host store retains the
+    // descriptor: a write-back store follows the Device eviction.
     BoundaryEventStatus GetBoundaryEventStatus(const CacheKey& boundary, std::int32_t tail_tokens) const;
     // Whether every State group caches its checkpoint published under the
     // chain hash content_hash, on the Device or the Host, as the probe takes

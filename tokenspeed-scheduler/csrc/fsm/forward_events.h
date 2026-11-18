@@ -68,7 +68,8 @@ struct SchedulePrefillFirstChunkEvent : InvalidTransitionHandler<SchedulePrefill
           load_pairs_{std::move(load_pairs)},
           awaits_result_{awaits_result} {}
 
-    std::variant<PrefillDone, PrefillAwaitingResult, Prefilling, RemotePrefilling> operator()(Submitted&& state);
+    std::variant<PrefillDone, PrefillAwaitingResult, Prefilling, RemotePrefilling, PeerLanding> operator()(
+        Submitted&& state);
     std::vector<BlockTransfer> TakeLoadPairs() { return std::exchange(load_pairs_, {}); }
 
 private:
@@ -181,6 +182,8 @@ struct AbortEvent : InvalidTransitionHandler<AbortEvent> {
     Finished operator()(Bootstrapping&&);
     Finished operator()(Submitted&&);
     Finished operator()(Prefetching&&);
+    // A lookup's soft pin expires at the holder.
+    Finished operator()(PeerLooking&&) { return Finished{}; }
     // The op in flight keeps the Host blocks until its ACK; only the
     // request's own pins drop here.
     Finished operator()(Prefilling&& state);

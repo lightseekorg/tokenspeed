@@ -166,10 +166,14 @@ public:
     bool Acquire(BlockPool& pool, BlockTable& table, const AcquirePlan& plan, std::int32_t first_placed_slot,
                  std::vector<CacheBlockRef> placed) const {
         const std::int32_t old_num_blocks = table.NumBlocks();
-        _assert(placed.empty() || (plan.suffix_start < 0 && first_placed_slot >= old_num_blocks &&
-                                   first_placed_slot + static_cast<std::int64_t>(placed.size()) <=
-                                       static_cast<std::int64_t>(old_num_blocks) + plan.num_blocks),
-                "placed blocks fill slots of a dense append");
+        // A dense append's run starts at the table's end; a sparse suffix's
+        // after its head blocks, at the suffix's first slot.
+        const std::int32_t run_start = plan.suffix_start < 0 ? old_num_blocks : plan.suffix_start;
+        const std::int32_t run_offset = plan.suffix_start < 0 ? 0 : plan.head_blocks;
+        _assert(placed.empty() || (first_placed_slot >= run_start && first_placed_slot - run_start + run_offset +
+                                                                             static_cast<std::int64_t>(placed.size()) <=
+                                                                         plan.num_blocks),
+                "placed blocks fill slots of the appended run");
         const std::int32_t num_others = plan.num_blocks - static_cast<std::int32_t>(placed.size());
         std::vector<CacheBlockRef> block_refs;
         if (num_others > 0) {
@@ -187,7 +191,7 @@ public:
         }
         if (!placed.empty()) {
             // Slot order: the placed run sits among the other appended slots.
-            const auto before = static_cast<std::ptrdiff_t>(first_placed_slot - old_num_blocks);
+            const auto before = static_cast<std::ptrdiff_t>(first_placed_slot - run_start + run_offset);
             block_refs.insert(block_refs.begin() + before, std::make_move_iterator(placed.begin()),
                               std::make_move_iterator(placed.end()));
         }

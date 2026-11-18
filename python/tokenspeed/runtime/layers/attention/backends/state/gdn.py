@@ -130,10 +130,12 @@ class GdnAttnBackend(CapacityPrefillBackend):
         # with a copy of it. Where a decode or verify kernel takes strided
         # q/k/v (and a/b), it reads the projection views as handed over
         # instead of a packed copy.
-        ssm_dtype = self._state_components(self._state_layer_ids()[0])[1].dtype
+        ssm_state = self._state_components(self._state_layer_ids()[0])[1]
+        ssm_dtype = ssm_state.dtype
         decode_traits = {
             "head_dim": self._head_k_dim,
             "value_head_dim": self._head_v_dim,
+            "strided_state": not ssm_state.is_contiguous(),
         }
         verify_traits = {
             **decode_traits,

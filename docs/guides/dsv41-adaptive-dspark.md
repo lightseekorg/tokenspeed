@@ -34,7 +34,7 @@ the CuTe DSL probability sampler and DeepInfer-style chain rejection:
 ```bash
 --speculative-algorithm DSPARK --sampling-backend flashinfer \
 --enable-speculative-sampling --enable-dsv41-adaptive-dspark \
---sampling-stream per-request --disable-prefill-graph --grammar-backend none
+--sampling-stream per-request --disable-prefill-graph
 ```
 
 The sampled path requires NVIDIA SM90 or newer and attention TP1. Enable it
@@ -54,6 +54,14 @@ back to the lowest-index target argmax. Probability preparation uses the
 existing FlashInfer temperature and sequential top-k/top-p renormalization.
 The CuTe kernels consume packed probability rows without expanding them to
 the original fixed-width target tensor.
+
+Both greedy and sampled adaptive verification support
+`--grammar-backend xgrammar` and `--enable-output-logprobs`, including
+attention DP with DP-local CUDA graphs. The grammar mask is applied before
+target argmax or probability filtering; ordinary prefill sampling applies the
+same mask. Output logprobs are selected-token FP32 log-softmax values over
+those grammar-masked target logits. `--enable-output-cumulative-probs`
+remains unsupported and is rejected at startup.
 
 Random draws use request seeds, positions and separate Philox namespaces for
 draft, acceptance, rejection and bonus. They do not consume the legacy
@@ -151,6 +159,15 @@ request count excludes padding from draft allocation. Padding keeps one
 physical anchor for existing CSR and sampling conventions; its state writes
 use the runtime's dummy slot and its outputs are discarded. Budget rewards
 count real requests only, while costs use the selected physical graph capacity.
+
+The packed row indices also gather the request-major xgrammar bitmask into
+the target-logit order before sampling. Acceptance indices retain the normal
+flat `request * width + column` layout. To score an emitted token's output
+logprob, the sampler subtracts that request base and adds the request's CSR
+start; it never indexes the packed tensor with the flat acceptance index
+directly. An unused `-1` tail entry scores against the request's anchor and is
+excluded from the emitted output by its accepted length.
+
 Shared-capacity graphs require all ranks, including idle ranks, to participate
 in the same host budget agreement. DP-local graphs select independently.
 

@@ -29,11 +29,12 @@ from tokenspeed.runtime.layers.attention.backends.paged.group_tables import (
 )
 
 
-def make_stacks(device):
+def make_stacks(device, full_atom_pages):
     return GroupTableStacks(
         [
-            GroupTableSpec("full", 256, 64, 80),
-            GroupTableSpec("swa", 64, 64, 33),
+            GroupTableSpec("full", 256, 64, 80, full_atom_pages),
+            GroupTableSpec("swa", 64, 64, 33, 1),
+            GroupTableSpec("flat_single", 64, 64, 33, 3),
         ],
         max_bs=17,
         max_tokens_per_req=8,
@@ -63,10 +64,13 @@ def refresh_reference(stacks, bs, actual, raw, lengths, width, targets):
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 @pytest.mark.parametrize("width", [1, 4, 8])
 @pytest.mark.parametrize("actual", [0, 3, 17])
-def test_decode_refresh(device, width, actual):
+@pytest.mark.parametrize("full_atom_pages", [4, 8])
+def test_decode_refresh(device, width, actual, full_atom_pages):
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("requires CUDA")
-    fused, ref = make_stacks(device), make_stacks(device)
+    fused, ref = make_stacks(device, full_atom_pages), make_stacks(
+        device, full_atom_pages
+    )
     bs = 17
     # Strided and independent allocations, holes, and over-capacity lengths.
     raw = (

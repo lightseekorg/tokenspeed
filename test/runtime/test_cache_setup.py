@@ -627,6 +627,7 @@ def test_qwen4_exp_workspace_budget_includes_preallocated_ple_commit_rows(
         disaggregation_mode=role,
         mamba_ssm_dtype="float32",
         enable_qsa_prefill_bf16_scratch=False,
+        qwen4_exp_flat_kv=False,
     )
     setup = prepare_cache_setup(
         family="qwen4_exp",
@@ -760,6 +761,7 @@ def _qwen4_exp_fp8_kv_recipe(
             mamba_ssm_dtype=mamba_ssm_dtype,
             mapping=Mapping(rank=0, world_size=pp_size, pp_size=pp_size),
             enable_qsa_prefill_bf16_scratch=False,
+            qwen4_exp_flat_kv=False,
         ),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(text_config=text_config),
@@ -2034,6 +2036,7 @@ def test_every_boot_leaves_the_receive_pool_out_of_the_cache_budget(
             max_batch_size=8,
             max_resident_requests=8,
             kv_transfer_builder=functools.partial(build_host_peer, outbox=None),
+            peer_outbox=None,
         )
     budget, rows = sized.value.args
     assert (rows is not None) == probe

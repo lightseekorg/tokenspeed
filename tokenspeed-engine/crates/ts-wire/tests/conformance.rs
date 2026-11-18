@@ -198,6 +198,7 @@ fn generate_text() {
             cache_session_id: Some(s("cache-session")),
             cache_group_id: Some(s("cache-group")),
             shared_prefix_tokens: vec![1, 3],
+            peer_holder: Some(s("10.0.0.2:7100")),
         },
     );
 }
@@ -788,6 +789,8 @@ fn generate_from_an_older_client_preserves_session_and_tokens() {
     let Value::Array(mut fields) = decode_frames::<Value>(&frames[1..]).unwrap() else {
         panic!("generate messages must be arrays");
     };
+    assert_eq!(fields.pop(), Some(Value::from("10.0.0.2:7100")));
+    expected.peer_holder = None;
     assert_eq!(
         fields.pop(),
         Some(Value::Array(vec![Value::from(1), Value::from(3)]))

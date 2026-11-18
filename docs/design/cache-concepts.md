@@ -151,6 +151,23 @@ plans, so every plan starts with fresh tables and occupancy state. No array
 proportional to a sparse Host pool's theoretical slot count is initialized for
 planning.
 
+Emptying parents is where eviction gets expensive. A demand an uncached group
+(a replayable window) cannot place in its holes needs empty parents, and a
+parent of a cached group empties only once the walk reaches its newest entry:
+when placement has mixed access epochs inside parents, that is most of the
+cache, and `Minimize` hands nearly all of it back. In a model without State
+groups, each cached group's Device index therefore keeps, per LCM parent, its
+entry count and newest access epoch (`PrefixCacheIndex::ParentEntries`), and
+the planner first builds the walk's
+selection through the demand's first fit from those parents
+(`AdmissionPlanner::candidatesThroughParentFit`), leaving out the cached
+entries that only add holes no group still needs. This is not a second
+policy: it selects and keeps exactly what the walk would, in the same order,
+and it applies only where that holds by construction -- without segment
+eviction, without State groups, and when the holes the cached groups lack
+come from entries older than the fit. Anywhere else the walk runs.
+`test_parent_fit_eviction.cpp` holds the two to the same plans.
+
 Replicated groups have one ownership bucket: every Host hit needs a Device
 destination in that bucket, without looking up or temporarily owning the Host
 block to count it. Sharded groups count destinations by their Host sources'
@@ -1297,7 +1314,11 @@ Its responsibilities:
   Host-warm first-chunk extensions call `CacheFullBlocks` at admit (the
   layer-wise load makes the bytes available before any forward reads them);
   a load-back's `BlockTransfer.key` is therefore empty and `CompleteLoadBack`
-  only drops the op's pins. For L3, `StorageTransferManager::Complete`
+  only drops the op's pins. Peer PIN checks additionally exclude the Device
+  destinations still owned by an unacknowledged prefix load: remote reads do
+  not share the local layerwise fence. The replica-wide load ACK makes those
+  pages exportable without changing their local prefix visibility.
+  For L3, `StorageTransferManager::Complete`
   publishes successful rows through `CacheHostBlock` after all-owner native
   retirement, before admission can see them. There is no mixed Host/L3 hash
   to special-case.
@@ -1663,24 +1684,31 @@ Its responsibilities:
   (`AcquireHostSegments`, above) also considers checkpoint boundaries on both
   tiers: history needed by a Device checkpoint retains its ordinary eviction
   rank even when no Host checkpoint remains below it.
-* **Mutation reporting.** `SetCacheMutationSink` reports per-group cache
-  insertions/removals; the scheduler folds them into one externally visible
-  prefix event. Whether a scheduler-level boundary is fully, partially, or not
-  resident is the coordinator's answer (`DeviceBoundaryResidency`, read off
-  the group indexes), so the scheduler keeps no residency counters of its own
-  — only the token descriptor the event carries and whether that event is
-  currently out. A mutation only marks its boundary for reconcile;
-  `DrainKvEvents` publishes a boundary while all Full/history entries reside
-  on Device, using the existing closed-entry count; auxiliary State/SWA do not
-  gate local residency. `KvEventPrefixView` exposes only ancestor-complete
-  prefixes: it withdraws descendants when an ancestor leaves and republishes
+* **Mutation reporting.** `SetCacheMutationSink` (the sink `CacheStore`
+  holds) reports per-group Device insertions/removals, and the boundary tree
+  reports every change of a boundary's closed Host entries
+  (`CacheMutation::kHostResidency`); the scheduler folds them into one
+  externally visible prefix event per medium. Whether a scheduler-level
+  boundary is publishable on each medium is the coordinator's answer
+  (`GetBoundaryEventStatus`, read off the tree's per-tier closed-entry
+  counts), so the scheduler keeps no
+  residency counters of its own — only the token descriptor the event carries
+  and whether that event is currently out on each medium. A mutation only
+  marks its boundary for reconcile; `DrainKvEvents` publishes a boundary on a
+  medium while all Full/history entries reside there; auxiliary State/SWA do
+  not gate local residency. `KvEventPrefixView` exposes only ancestor-complete
+  prefixes: a Device boundary is out once its parent is out on the Device, a
+  Host boundary once its parent is out on either medium (write-back splits a
+  prefix across the tiers, and a router continues a Device match into the
+  Host). It withdraws descendants when an ancestor leaves and republishes
   resident descendants when it returns. This changes routing visibility, not
   physical eviction. Actual prefix admission still checks all required groups.
   KV events require a Full/history group: State-only, SWA-only and State + SWA
   layouts must disable events. No structural ancestors are synthesized.
-  Descriptors survive while any Device entry remains, including auxiliary
-  entries excluded from routing. Host eviction retains all-group residency
-  checks. Nothing is decided
+  Descriptors survive while any Device entry, Host entry or pending Host store
+  remains, including auxiliary entries excluded from routing; a Host block
+  for a boundary with no descriptor (an L3 read) publishes nothing. Host
+  eviction retains all-group residency checks. Nothing is decided
   mid-`Admit`, so one admission may evict a boundary's last cached copy and
   then store the request's own copy without any ordering hazard.
   The scheduler and routing view share immutable boundary descriptors. A drain
@@ -1985,9 +2013,14 @@ from layer counts.
 Cache construction resolves ownership into explicit field IDs once:
 `cache_fields_by_stage` describes residency, and `producer_fields_by_step`
 describes the local readiness barriers. These sets cover resident fields
-exactly once. PD never derives placement from target/draft identities,
-execution-layer counts or contiguous layer windows. Noncontiguous field sets
-are valid. The bootstrap wire carries `cache_fields_by_stage`; all prefill
+exactly once. A readiness barrier must follow the final write to every field
+it names. Hybrid backends propagate the producer counter to both attention
+children: state implementations may use it to publish staged prefill state
+before the wrapper records the step. Children dispatched through the wrapper's
+`forward` must not increment the same counter again, including decode dispatch
+with `record_kv_cache=True`. PD never derives placement from target/draft
+identities, execution-layer counts or contiguous layer windows. Noncontiguous
+field sets are valid. The bootstrap wire carries `cache_fields_by_stage`; all prefill
 ranks must register the same complete placement and logical field plan.
 Old bootstrap peers without explicit placement must be upgraded together.
 
@@ -2013,6 +2046,26 @@ whole). No family restates the order of the stages, and `_RECIPES`
 
 Automatic packing uses powers of two to avoid excessive LCM padding;
 exact page-stride constraints and explicit recipe packing take precedence.
+
+**Startup layout log.** After capacity agreement and PP narrowing, the runtime
+logs the bound `CacheRecipe` layout at INFO (probe builds use DEBUG). The ASCII
+matrix uses group names as columns and resident planes as rows. Column headers
+show physical blocks per parent (`packing`) and usable physical block counts;
+cells show field IDs, shapes, dtypes and byte ranges within one child stride.
+Packing repeats that stride within a plane. Plane rows also give bytes per
+parent and the plane's offset in the logical arena. Offloaded storage can map
+that arena onto both Device and Host regions; `layout_arena` is not a device
+allocation measurement.
+
+Padding includes alignment gaps between fields and trailing stride space,
+counted once per occupied plane. A hole is an entire plane unused by that
+group. Per-parent totals report payload, padding, holes, their sum (`unused`),
+and payload utilization. Each column describes a fully packed parent bound to
+that group, so columns must not be added together and unused bytes do not
+measure live allocator fragmentation. Arena bytes include the reserved null
+parent; usable parent and block counts exclude it. PP retains full shared
+planes, so space used only by a different stage appears as padding or holes
+in the local report.
 
 **Resident capacity before bind.** A PP owner projects the complete layout to
 the planes required by its fields. Whole retained planes, including padding
@@ -2077,6 +2130,76 @@ group wider than one K page also retains separate planes when sharing would
 make one of the engine's pipeline stages hold more bytes: a stage allocates
 every plane its layers' fields touch, so a field on a plane that no other layer
 of its stage uses costs that stage the whole plane.
+
+By default, all Qwen4-Exp target and draft cache fields share one
+`flatkv_atoms` plane (PP=1, uniform per-view K/V heads, no MXFP8). All GDN layers
+form one state group, with each layer's SSM and convolution fields together.
+Qwen3.8-Flash-Next has five groups: full attention, GDN state, PLE, compressed
+QSA and recent QSA. `--no-qwen4-exp-flat-kv` selects the ordinary layout,
+which retains its plane-based GDN grouping.
+The recipe sizes the shared parent to fit the largest group while tightly
+packing full-attention K/V. Each other group packs as many pages as its
+payload and stride alignment permit. A parent still belongs to one group at
+a time; sharing the plane does not mix their allocation or prefix matching.
+
+The `flatkv_atoms` plane id explicitly selects contiguous atom views for
+full-history fields: both K/V and compressed QSA. Native byte-page layouts
+such as DeepSeek V4.1 keep their `flatkv` plane and explicit page strides.
+State, PLE and recent QSA retain raw
+scheduler IDs and explicit page strides. Other padded K/V fields, including
+sink-enabled SWA, retain page-indexed views with ordinary kernel-subpage
+translation. Padding alone never selects FlatKV.
+
+For a full-history field page stride `S`, kernel page payload `B`, and
+scheduler block `b` containing kernel subpage `j`, the router emits atom page
+`b * (S / B) + j`, while each field's contiguous view starts at its block-0
+address. The address is therefore `base + b * S + j * B`, exactly the original
+strided address. `S` must be divisible by the native field-page payload;
+tightly packed fields reduce to the ordinary `b * r + j` mapping. Compressed
+QSA uses its native compressed rows when building its atom view, while its
+locations retain their raw-token units. The same atom tables drive reads
+and write locations. The fused decode refresh uses the physical multiplier
+for both outputs, separately from the logical subpage count. GDN kernels
+selected for padded state pages must declare
+`strided_state` support and address input and output pools with their own
+runtime page strides.
+
+Before building a group's kernel tables, the memory plan checks both its
+largest translated atom-page ID and its largest token write slot against
+signed int32. These bounds include the stride-derived multiplier, every
+kernel subpage, and the null page in the group's capacity; overflowing
+geometry fails at startup before any table value is narrowed.
+The recipe also caps the agreed parent capacity at the largest count all
+target and draft full-history fields can address. This keeps a larger GPU
+memory budget from producing an unbindable pool; a smaller draft payload
+can set the limit. The bound is independent of the kernel page size and
+includes the final page's token span. The bind-time check remains in place
+for explicitly constructed plans.
+
+L3 compatibility follows the cache layout signature, including field strides,
+payloads and group packing. The FlatKV flag is not a separate KV-producer
+option, so toggling it on a model whose layout is unchanged preserves its L3
+namespace.
+
+A single plane removes plane-specific holes when a parent belongs to a
+smaller group. It does not compress useful KV data: when the ordinary layout
+already fills a full-attention parent, its KV payload per token is unchanged.
+Parent rounding, the reserved null parent and the live mix of groups determine
+the resulting allocation and request capacity.
+
+For Qwen3.8-Flash-Next at TP1 with BF16 KV and FP32 GDN state, one complete
+36-layer GDN checkpoint has 110.109375 MiB of payload and occupies one
+110.5 MiB parent, with 0.3535% payload padding. The ordinary layout uses two
+78 MiB parents for that checkpoint. The larger FlatKV parent also increases
+the null-parent cost, the allocation unit for small groups, and the snapshot
+reservation for each request's group tails. In the recorded TP1 benchmark
+with 64 request slots, one GDN group reserved 37.08 GB for snapshots;
+experimental six- and eighteen-group layouts reserved 13.09 GB and 9.60 GB.
+Eighteen groups achieved about 3.6% higher output throughput, while one group
+had the highest hit rate and lower mean ITL and P90/P99 TTFT. The selected
+grouping trades snapshot capacity and throughput for tighter checkpoint
+packing and the measured tail-latency benefit; revisiting it must account for
+the snapshot budget and workload, as well as payload padding.
 
 Inkling's ShortConv checkpoints share the attention planes the same way: a
 kvconv group and one hiddenconv group per attention group put each layer's

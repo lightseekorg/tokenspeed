@@ -25,6 +25,10 @@ import json
 import logging
 import weakref
 from dataclasses import replace
+from test.runtime.cache_pool_test_utils import (
+    make_mha_pool_for_groups,
+    make_qsa_pool_for_layers,
+)
 from types import SimpleNamespace
 
 import pytest
@@ -59,9 +63,6 @@ from tokenspeed.runtime.layers.attention import registry as attention_registry
 from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
     HybridLinearAttnBackend,
 )
-from tokenspeed.runtime.layers.attention.backends.paged.cache_group_geometry import (
-    CacheGroupGeometry,
-)
 from tokenspeed.runtime.layers.attention.backends.paged.qsa import QSAAttnBackend
 from tokenspeed.runtime.layers.attention.backends.paged.router import CacheGroupRouter
 from tokenspeed.runtime.layers.attention.backends.specific.qsa_indexer import (
@@ -89,6 +90,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     FULL_ATTENTION,
     LINEAR_ATTENTION,
+    CacheGroupSpec,
 )
 from tokenspeed.runtime.layers.attention.qsa import (
     QWEN4_EXP_QSA_CACHE_GROUP,
@@ -504,7 +506,7 @@ def test_hyperconnection_fused_projection_matches_split_checkpoint_weights() -> 
 
 
 def test_qwen4_exp_qsa_rejects_invalid_kernel_page_size() -> None:
-    with pytest.raises(ValueError, match="positive multiple"):
+    with pytest.raises(ValueError, match="not divisible by kernel page size"):
         _qsa_router(kernel_page_size=96, max_bs=4, spec=1)
 
 
@@ -578,22 +580,11 @@ def _qsa_router(
     router = attention_registry.create_paged_router(
         config, AttentionArch.MHA, backend_name="qsa"
     )
-    router.bind(
-        CacheGroupGeometry(
-            granularities=dict(_QSA_GROUP_GRANULARITIES),
-            attn_kinds={gid: "full_history" for gid in _QSA_GROUP_GRANULARITIES},
-            full_history_group_id=FULL_ATTENTION,
-            row_geometry={
-                gid: (granularity, 1)
-                for gid, granularity in _QSA_GROUP_GRANULARITIES.items()
-            },
-            windows={gid: None for gid in _QSA_GROUP_GRANULARITIES},
-        ),
-        {
-            gid: router._leaf_factory(gid, granularity)
-            for gid, granularity in _QSA_GROUP_GRANULARITIES.items()
-            if gid == FULL_ATTENTION
-        },
+    router.set_cache_pool(
+        make_mha_pool_for_groups(
+            (CacheGroupSpec(FULL_ATTENTION, "full_history", 256, 1, replayable=False),),
+            device="cpu",
+        )
     )
     router.init_cuda_graph_state(max_bs)
     return router
@@ -607,43 +598,13 @@ def _qsa_root(
     router = attention_registry.create_paged_router(
         config, AttentionArch.MHA, backend_name="qsa"
     )
-    fields = {
-        qsa_raw_key_field(3): torch.zeros((8, 4, 1, 8), dtype=torch.bfloat16),
-        qsa_rope_position_field(3): torch.zeros((8, 3), dtype=torch.int64),
-        qsa_compressed_field(3): torch.zeros((8, 64, 1, 8), dtype=torch.bfloat16),
-    }
-    pool = SimpleNamespace(
-        field_layer_range=range(4),
-        _field_layer_id=lambda layer_id: layer_id,
-        paged_group_ids=tuple(_QSA_GROUP_GRANULARITIES),
-        arena=SimpleNamespace(
-            offload=None,
-            field=fields.__getitem__,
-            plan=SimpleNamespace(
-                fields=[
-                    SimpleNamespace(
-                        field_id=field_id,
-                        group_id=(
-                            QWEN4_EXP_QSA_CACHE_GROUP
-                            if field_id == qsa_compressed_field(3)
-                            else QWEN4_EXP_QSA_RECENT_CACHE_GROUP
-                        ),
-                    )
-                    for field_id in fields
-                ]
-            ),
-            cache_group_specs=tuple(
-                SimpleNamespace(
-                    group_id=gid,
-                    block_granularity=granularity,
-                    attn_kind="full_history",
-                    rows_per_page=granularity,
-                    entry_stride_tokens=1,
-                    sliding_window_tokens=None,
-                )
-                for gid, granularity in _QSA_GROUP_GRANULARITIES.items()
-            ),
-        ),
+    pool = make_qsa_pool_for_layers(
+        device="cpu",
+        layer_ids=(3,),
+        field_layer_offset=0,
+        num_layers=4,
+        num_lcm_blocks=7,
+        kv_head_dim=8,
     )
     backend = Qwen4ExpBackend(config, router, None, QSAIndexerBackend(config, router))
     backend.set_cache_pool(pool)
@@ -2357,6 +2318,7 @@ def test_qwen4_exp_cache_recipe_adds_ple_and_qsa_groups() -> None:
         kv_offload_config=None,
         mamba_ssm_dtype="float32",
         enable_qsa_prefill_bf16_scratch=False,
+        qwen4_exp_flat_kv=False,
     )
 
     setup = prepare_cache_setup(
@@ -2526,6 +2488,7 @@ def _fp8_kv_qwen4_exp_cache_setup(*, with_ple: bool):
         mamba_ssm_dtype="float32",
         mapping=Mapping(rank=0, world_size=1),
         enable_qsa_prefill_bf16_scratch=False,
+        qwen4_exp_flat_kv=False,
     )
     return prepare_cache_setup(
         family="qwen4_exp",
