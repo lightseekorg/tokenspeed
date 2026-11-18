@@ -980,6 +980,10 @@ def pt_weights_iterator(
         torch.cuda.empty_cache()
 
 
+def bind_checkpoint_dir(model: torch.nn.Module, checkpoint_dir: str) -> None:
+    model._checkpoint_dir = checkpoint_dir
+
+
 def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
     """Default weight loader."""
     if param.numel() == 1 and loaded_weight.numel() == 1:
