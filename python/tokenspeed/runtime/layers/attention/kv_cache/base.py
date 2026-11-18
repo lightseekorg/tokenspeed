@@ -25,6 +25,9 @@ from collections.abc import Iterable
 from typing import TYPE_CHECKING, ClassVar
 
 import torch
+from tokenspeed_kernel.ops.attention.ascend_prefill_workspace import (
+    AscendPrefillWorkspaceLayout,
+)
 from tokenspeed_kernel.ops.attention.prologue import HeadKVCache, LatentKVCache
 
 from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
@@ -233,8 +236,10 @@ class CachePool(ABC):
         rank: int,
         *,
         field_layer_offset: int = 0,
+        prefill_workspace_layout: AscendPrefillWorkspaceLayout | None = None,
     ):
         self.arena = arena
+        self.prefill_workspace_layout = prefill_workspace_layout
         self.dtype = dtype
         self.rank = rank
         self.layer_fields: dict[tuple[int, str], str] = {}

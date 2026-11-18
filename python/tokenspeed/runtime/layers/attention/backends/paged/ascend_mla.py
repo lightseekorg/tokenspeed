@@ -34,7 +34,6 @@ from tokenspeed_kernel.platform import current_platform
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.layers.attention.ascend_prefill import (
     AscendPrefill,
-    AscendPrefillCache,
 )
 from tokenspeed.runtime.layers.attention.backends.paged.mla import (
     MLAAttnBackend,
@@ -130,12 +129,12 @@ class AscendMLABackend(MLAAttnBackend):
         self._prefill: AscendPrefill | None = None
         self._prefill_spans: tuple[tuple[int, int, int], ...] = ()
         self._prefill_pages: torch.Tensor | None = None
-        self._prefill_options = None
+        self._prefill_layout = None
         self._prefill_cpu_table = None
 
     @property
     def prefill_enabled(self):
-        return self._prefill_options is not None
+        return self._prefill_layout is not None
 
     @property
     def prefill_needs_host_page_table(self):
@@ -149,11 +148,7 @@ class AscendMLABackend(MLAAttnBackend):
 
     def _publish_cache_pool(self, cache_pool):
         super()._publish_cache_pool(cache_pool)
-        self._prefill_options = (
-            cache_pool.prefill_options
-            if isinstance(cache_pool, AscendPrefillCache)
-            else None
-        )
+        self._prefill_layout = cache_pool.prefill_workspace_layout
         self._decode_metadata.clear_forward_metadata()
         self._current_active = None
         self._local_views.clear()
@@ -176,7 +171,7 @@ class AscendMLABackend(MLAAttnBackend):
 
     @property
     def prefill_kv_capacity(self) -> int:
-        return self._prefill_options.max_history_rows if self.prefill_enabled else 0
+        return self._prefill_layout.history_capacity if self.prefill_enabled else 0
 
     def preallocate_prefill_workspace(self) -> int:
         if not self.prefill_enabled:
@@ -191,12 +186,12 @@ class AscendMLABackend(MLAAttnBackend):
             kv,
             ranks=self._dcp.ranks,
             history_group=self._prefill_group,
-            max_current_rows=self._prefill_options.max_current_rows,
-            max_history_rows=self._prefill_options.max_history_rows,
-            history_null_rows=self._prefill_options.kv_page_size,
+            max_current_rows=self._prefill_layout.current_capacity,
+            max_history_rows=self._prefill_layout.history_capacity,
+            history_null_rows=self._prefill_layout.null_rows,
         )
         self._prefill = AscendPrefill(
-            options=self._prefill_options,
+            layout=self._prefill_layout,
             page_size=self.kernel_page_size,
             topk=1,
             runtime=runtime,

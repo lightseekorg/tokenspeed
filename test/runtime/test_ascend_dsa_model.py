@@ -42,7 +42,7 @@ def make_attention(
         mla_use_output_gate=False,
         mla_scale_q_lora=scale_q,
         cli_factor=1,
-        index_n_heads=2,
+        index_n_heads=16,
         index_head_dim=4,
         index_topk=4,
         index_init_tokens=0,
@@ -86,7 +86,9 @@ def test_failed_native_initialization_releases_its_window(monkeypatch):
     from tokenspeed.runtime.distributed.process_group_manager import (
         process_group_manager as pg,
     )
-    from tokenspeed.runtime.layers.attention.dsa import ascend_tp_kvp as ascend
+    from tokenspeed.runtime.layers.attention.backends.paged import (
+        ascend_dsa_tp_kvp_decode as ascend,
+    )
 
     # Substitute only communication and its native window. The real fused
     # constructor rejects this small model after the resource has been acquired.
@@ -130,7 +132,7 @@ def test_failed_native_initialization_releases_its_window(monkeypatch):
             [layer], Mapping(rank=0, world_size=8, attn_tp_size=8)
         )
     assert window.storage is None
-    assert layer._fused_decode_runtime is None
+    assert layer._fused_tp_kvp_decode_runtime is None
 
 
 @pytest.mark.parametrize("role", [None, "prefill", "decode"])
@@ -167,7 +169,6 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(
     """The prologue's KV write alone cannot release a DSA producer step."""
     from tokenspeed_kernel.ops.attention.prologue.types import (
         LatentKVCache,
-        MLAPrologueOutput,
     )
 
     from tokenspeed.runtime.layers.attention.backends.paged.ascend_dsa import (
@@ -179,7 +180,6 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(
     from tokenspeed.runtime.layers.attention.backends.paged.router import (
         CacheGroupRouter,
     )
-    from tokenspeed.runtime.layers.attention.dsa import ascend
     from tokenspeed.runtime.layers.dense import unquant
     from tokenspeed.runtime.layers.layernorm import RMSNorm
     from tokenspeed.runtime.pd.utils import StepCounter
@@ -200,7 +200,7 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(
         # The device SFA/index kernels are unavailable. This leaf writes a real
         # index-cache tensor and publishes when its device work would finish.
         def __init__(self):
-            self._prefill_options = None
+            self._prefill_layout = None
             self._prefill = QuerySpan()
             self.step_counter = None
             self.index_cache = torch.zeros(rows, 1, 4, dtype=torch.bfloat16)
@@ -239,16 +239,11 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(
         forward_mode: ForwardMode = ForwardMode.EXTEND
         bs: int = 1
 
-    def cpu_prologue(query, q_pe, latent, *, cache, **kwargs):
-        assert cache is None
-        return MLAPrologueOutput(query=query, key=None, value=None, latent=latent)
-
     def cpu_rmsnorm(x, weight, eps, **kwargs):
         return torch.nn.functional.rms_norm(
             x.float(), (x.shape[-1],), weight.float(), eps
         ).to(x.dtype)
 
-    monkeypatch.setattr(ascend, "mla_prologue", cpu_prologue)
     monkeypatch.setattr(
         unquant,
         "kernel_mm",
@@ -321,10 +316,10 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(
     )
     expected_index_q = torch.nn.functional.linear(
         latent, attention.indexer.wq_b.weight
-    ).view(rows, 2, 4)
+    ).view(rows, 16, 4)
     expected_weights = torch.nn.functional.linear(
         hidden.float(), attention.indexer.weights_proj.weight
-    ) * (4**-0.5 * 2**-0.5)
+    ) * (4**-0.5 * 16**-0.5)
     torch.testing.assert_close(leaf.query, expected_query, atol=0, rtol=0)
     torch.testing.assert_close(leaf.index_query, expected_index_q, atol=0, rtol=0)
     torch.testing.assert_close(leaf.index_weights, expected_weights, atol=0, rtol=0)
@@ -351,8 +346,8 @@ def test_model_router_leaves_cache_readiness_to_the_index_writer(
 def test_fused_support_uses_real_loaded_indexer_geometry(
     hidden, heads, query_rank, index_heads, supported
 ):
-    from tokenspeed.runtime.layers.attention.dsa.ascend_tp_kvp import (
-        supports_fused_dsa_decode,
+    from tokenspeed.runtime.layers.attention.backends.paged.ascend_dsa_tp_kvp_decode import (
+        supports_fused_dsa_tp_kvp_decode,
     )
 
     config = PretrainedConfig(
@@ -369,7 +364,7 @@ def test_fused_support_uses_real_loaded_indexer_geometry(
         index_use_rope=False,
     )
     rejection = (
-        pytest.raises(NotImplementedError, match="does not support Indexer64")
+        pytest.raises(NotImplementedError, match="supports only Indexer16/32")
         if index_heads == 64
         else nullcontext()
     )
@@ -391,9 +386,9 @@ def test_fused_support_uses_real_loaded_indexer_geometry(
         layer.indexer.weights_proj.float()
     if index_heads == 64:
         return
-    assert supports_fused_dsa_decode(layer) == supported
+    assert supports_fused_dsa_tp_kvp_decode(layer) == supported
     layer.indexer.weights_proj.bfloat16()
-    assert not supports_fused_dsa_decode(layer)
+    assert not supports_fused_dsa_tp_kvp_decode(layer)
 
 
 @pytest.mark.parametrize("index_heads", [16, 32])
@@ -408,7 +403,9 @@ def test_runtime_shares_projection_buffers_and_releases_bindings(
     from tokenspeed.runtime.distributed.process_group_manager import (
         process_group_manager as pg,
     )
-    from tokenspeed.runtime.layers.attention.dsa import ascend_tp_kvp as ascend
+    from tokenspeed.runtime.layers.attention.backends.paged import (
+        ascend_dsa_tp_kvp_decode as ascend,
+    )
 
     class Group:
         def _get_backend(self, device):
@@ -428,7 +425,7 @@ def test_runtime_shares_projection_buffers_and_releases_bindings(
             )
             self.runtime = None
 
-        def configure_fused_decode(self, runtime):
+        def configure_fused_tp_kvp_decode(self, runtime):
             self.runtime = runtime
 
     class CpuProjection:
@@ -499,9 +496,15 @@ def test_runtime_shares_projection_buffers_and_releases_bindings(
         def child_backends(self):
             return self.children
 
-    leaf = object.__new__(ascend.AscendDSABackend)
-    from tokenspeed.runtime.layers.attention.dsa import ascend_kvp_decode
-    from tokenspeed.runtime.layers.attention.dsa.ascend_kvp_decode import (
+    from tokenspeed.runtime.layers.attention.backends.paged.ascend_dsa import (
+        AscendDSABackend,
+    )
+
+    leaf = object.__new__(AscendDSABackend)
+    from tokenspeed.runtime.layers.attention.backends.paged import (
+        ascend_dsa_tp_kvp_decode as ascend_kvp_decode,
+    )
+    from tokenspeed.runtime.layers.attention.backends.paged.ascend_dsa_tp_kvp_decode import (
         AscendDSATPKVPDecode,
     )
 
@@ -528,3 +531,22 @@ def test_runtime_shares_projection_buffers_and_releases_bindings(
     assert leaf._decode._fused_decode is None
     assert borrowed.window is None
     assert not borrowed.outputs
+
+
+@pytest.mark.parametrize("index_heads", [0, 8, 48, 64])
+def test_indexer_head_count_is_rejected_at_initialization(index_heads):
+    config = PretrainedConfig(index_n_heads=index_heads)
+    with pytest.raises(NotImplementedError, match="supports only Indexer16/32"):
+        AscendDSAAttention(
+            config=config,
+            mapping=Mapping(rank=0),
+            hidden_size=8,
+            num_heads=2,
+            qk_nope_head_dim=4,
+            qk_rope_head_dim=4,
+            v_head_dim=4,
+            q_lora_rank=4,
+            kv_lora_rank=4,
+            lora_norm_eps=1e-6,
+            prefill_enabled=True,
+        )

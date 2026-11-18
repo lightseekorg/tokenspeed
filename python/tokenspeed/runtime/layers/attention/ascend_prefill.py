@@ -22,30 +22,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import torch
 
-
-@dataclass(frozen=True)
-class AscendPrefillOptions:
-    """Physical Prefill capacities; history also bounds summed scheduler KV rows."""
-
-    max_current_rows: int
-    kv_page_size: int
-    max_history_rows: int
-
-    def __post_init__(self):
-        if min(self.max_current_rows, self.kv_page_size, self.max_history_rows) < 1:
-            raise ValueError("Prefill needs positive token capacity and page geometry")
-
-
-class AscendPrefillCache:
-    """Carry the physical Prefill geometry supported by a model cache."""
-
-    def __init__(self, *, prefill_options: AscendPrefillOptions | None, **kwargs):
-        self.prefill_options = prefill_options
-        super().__init__(**kwargs)
+from tokenspeed.runtime.execution.query_shard import scatter_count
 
 
 def gather_prefill_pages(
@@ -58,13 +37,13 @@ def gather_prefill_pages(
     local_pages,
     degree,
     rank,
-    options,
+    layout,
     device,
     columns,
 ):
     if table_cpu is None or table_cpu.device.type != "cpu":
         raise ValueError("Prefill requires the scheduler's host page table")
-    if options.kv_page_size % page_size or len(extends) != table_cpu.shape[0]:
+    if layout.null_rows % page_size or len(extends) != table_cpu.shape[0]:
         raise ValueError("Prefill page and kernel table geometry disagree")
     per_block = 1 if placement is None else placement.block_granularity // page_size
     pages = table_cpu.tolist()
@@ -84,7 +63,7 @@ def gather_prefill_pages(
             if local >= local_pages:
                 raise ValueError("Prefill page lies outside its owner's cache")
             owners[owner].setdefault(page, local)
-    offsets, offset = [], options.kv_page_size // page_size
+    offsets, offset = [], layout.null_rows // page_size
     for owner in owners:
         offsets.append(offset)
         offset += len(owner)
@@ -114,8 +93,8 @@ def gather_prefill_pages(
 class AscendPrefill:
     """Prepare QCP/KVP metadata once per batch and reuse one transport workspace."""
 
-    def __init__(self, *, options, page_size, topk, runtime):
-        self.options = options
+    def __init__(self, *, layout, page_size, topk, runtime):
+        self.layout = layout
         self.page_size = page_size
         self.topk = topk
         self.runtime = runtime
@@ -127,7 +106,7 @@ class AscendPrefill:
         self.query_cu = self.key_cu = None
         self.query_seq = self.scan_count = None
         self.current_direct = self.patch_slots = None
-        self.cold = True
+        self.has_prefix_history = False
         self.key_row_count = 0
         self.history_slots = None
         self.history_counts = ()
@@ -136,7 +115,7 @@ class AscendPrefill:
     def prepare(self, metadata, placement, *, page_table_cpu, query_partition=None):
         """Resolve existing scheduler pages and each rank's causal query span."""
         degree, rank = self.degree, self.rank
-        options, page_size, topk = self.options, self.page_size, self.topk
+        layout, page_size, topk = self.layout, self.page_size, self.topk
         local_cache_pages = self.runtime.local_rows // page_size
         # Lengths already exist on the host. Bounded gathers also reuse the
         # scheduler's host page table; no device readback is needed.
@@ -151,7 +130,7 @@ class AscendPrefill:
         if placement is not None and placement.block_granularity % page_size:
             raise ValueError("Prefill ownership blocks must contain whole kernel pages")
         rows = sum(extends)
-        counts = [rows // degree + (r < rows % degree) for r in range(degree)]
+        counts = scatter_count(rows, degree)
         first, count = sum(counts[:rank]), counts[rank]
         if query_partition is not None:
             first, count = query_partition
@@ -182,15 +161,15 @@ class AscendPrefill:
             local_pages=local_cache_pages,
             degree=degree,
             rank=rank,
-            options=options,
+            layout=layout,
             device=table.device,
             columns=table.shape[1],
         )
-        if sum(history_counts) > options.max_history_rows:
+        if sum(history_counts) > layout.history_capacity:
             raise ValueError(
                 "Prefill batch KV pages exceed the reserved workspace capacity"
             )
-        history_pages = (options.kv_page_size + sum(history_counts)) // page_size
+        history_pages = (layout.null_rows + sum(history_counts)) // page_size
         patch_slots = torch.empty(rows, dtype=torch.int64, device=table.device)
         if table.device.type == "cpu":
             mapped = history_table.clone()
@@ -311,10 +290,10 @@ class AscendPrefill:
         self.query_cu, self.key_cu = qcu, kcu
         self.query_seq, self.scan_count = sequence, scan
         self.current_direct, self.patch_slots = direct, patch_slots
-        self.cold = not any(prefixes)
+        self.has_prefix_history = any(prefixes)
         self.key_row_count = key_rows
         self.history_slots, self.history_counts = history_slots, history_counts
-        self.history_rows = options.kv_page_size + sum(history_counts)
+        self.history_rows = layout.null_rows + sum(history_counts)
         self.send_rows = send_rows
 
     def gather_prefill_history(self, kv_cache, index_cache):
@@ -323,7 +302,7 @@ class AscendPrefill:
             kv_cache,
             index_cache,
             total_rows=sum(self.row_counts),
-            has_history=not self.cold,
+            has_history=self.has_prefix_history,
             history_slots=self.history_slots,
             history_counts=self.history_counts,
         )

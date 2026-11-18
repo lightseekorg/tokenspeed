@@ -23,8 +23,6 @@
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable
-from dataclasses import dataclass
 
 import torch
 from tokenspeed_kernel.ops.attention.dsa.ascend import (
@@ -36,65 +34,24 @@ from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.ascend_prefill import (
     AscendPrefill,
-    AscendPrefillCache,
+)
+from tokenspeed.runtime.layers.attention.backends.paged.ascend_dsa_local_decode import (
+    AscendDSALocalDecode,
+)
+from tokenspeed.runtime.layers.attention.backends.paged.ascend_dsa_tp_kvp_decode import (
+    AscendDSATPKVPDecode,
+    _AscendCachePlacement,
 )
 from tokenspeed.runtime.layers.attention.backends.paged.dsa import DSABackend
 from tokenspeed.runtime.layers.attention.backends.paged.mla import MLAAttnBackend
 from tokenspeed.runtime.layers.attention.dcp.placement import (
     CachePlacement,
 )
-from tokenspeed.runtime.layers.attention.dsa.ascend_kvp_decode import (
-    AscendDSATPKVPDecode,
-)
-from tokenspeed.runtime.layers.attention.dsa.ascend_local_decode import (
-    AscendDSALocalDecode,
-)
-from tokenspeed.runtime.layers.attention.dsa.ascend_prefill import run_prefill_attention
 from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 from tokenspeed.runtime.layers.attention.registry import register_backend
 
 # Fixed page geometry of Ascend SparseFlashAttentionDecode.
 ASCEND_SFAD_PAGE_SIZE = 128
-
-
-def ascend_dsa_prefill_backend(backend):
-    """Find the DSA leaf without adding model hooks to shared router nodes."""
-    if isinstance(backend, DSABackend):
-        return backend
-    leaves = []
-    pending = list(backend.child_backends())
-    while pending:
-        node = pending.pop()
-        if isinstance(node, DSABackend):
-            leaves.append(node)
-        else:
-            pending.extend(node.child_backends())
-    if len(leaves) != 1:
-        raise ValueError("DSA Prefill needs exactly one DSA cache leaf")
-    return leaves[0]
-
-
-@dataclass(frozen=True)
-class _AscendCachePlacement(CachePlacement):
-    # The placement owner prepares native DSA inputs before the first Prolog.
-    prepare_decode_metadata: Callable | None = None
-
-
-def prepare_ascend_dsa_cp_metadata(
-    locations, placement, *, initial_tokens, window_tokens
-):
-    """Prepare the leaf's CP metadata before Prolog through its placement owner."""
-    if (
-        not isinstance(placement, _AscendCachePlacement)
-        or placement.prepare_decode_metadata is None
-    ):
-        raise ValueError("Native DSA requires Ascend CP cache placement")
-    slots = placement.prepare_decode_metadata(
-        locations,
-        init_tokens=initial_tokens,
-        local_tokens=window_tokens,
-    )
-    return slots
 
 
 class AscendDSABackend(DSABackend):
@@ -164,11 +121,11 @@ class AscendDSABackend(DSABackend):
         self._indexer_kernels = ascend_dsa_kernels()
         self._prefill: AscendPrefill | None = None
         self._prefill_group = None
-        self._prefill_options = None
+        self._prefill_layout = None
 
     @property
     def prefill_enabled(self):
-        return self._prefill_options is not None
+        return self._prefill_layout is not None
 
     @property
     def prefill_needs_host_page_table(self):
@@ -178,11 +135,7 @@ class AscendDSABackend(DSABackend):
         self._prefill = None
         self._ascend_placement = None
         super()._publish_cache_pool(cache_pool)
-        self._prefill_options = (
-            cache_pool.prefill_options
-            if isinstance(cache_pool, AscendPrefillCache)
-            else None
-        )
+        self._prefill_layout = cache_pool.prefill_workspace_layout
         # Every world rank creates the cache-owner groups before any forward.
         if self.prefill_enabled and self._kvp_degree > 1:
             from tokenspeed.runtime.distributed.process_group_manager import (
@@ -197,7 +150,7 @@ class AscendDSABackend(DSABackend):
 
     @property
     def prefill_kv_capacity(self) -> int:
-        return self._prefill_options.max_history_rows if self.prefill_enabled else 0
+        return self._prefill_layout.history_capacity if self.prefill_enabled else 0
 
     def preallocate_prefill_workspace(self) -> int:
         if not self.prefill_enabled:
@@ -214,12 +167,12 @@ class AscendDSABackend(DSABackend):
             index,
             ranks=self._kvp_ranks,
             history_group=self._prefill_group,
-            max_current_rows=self._prefill_options.max_current_rows,
-            max_history_rows=self._prefill_options.max_history_rows,
-            history_null_rows=self._prefill_options.kv_page_size,
+            max_current_rows=self._prefill_layout.current_capacity,
+            max_history_rows=self._prefill_layout.history_capacity,
+            history_null_rows=self._prefill_layout.null_rows,
         )
         self._prefill = AscendPrefill(
-            options=self._prefill_options,
+            layout=self._prefill_layout,
             page_size=self.kernel_page_size,
             topk=self._indexer_spec.index_topk,
             runtime=runtime,
@@ -364,16 +317,33 @@ class AscendDSABackend(DSABackend):
         )
         if self.step_counter is not None:
             self.step_counter.record_cache()
-        output = run_prefill_attention(
-            q,
-            layer,
-            prefill,
-            prefill_kv,
-            prefill_index,
-            kernels=self._indexer_kernels,
-            spec=spec,
-            **kwargs,
-        )
+        if q.shape[0]:
+            index_pages = prefill_index.view(
+                -1, prefill.page_size, 1, spec.index_head_dim
+            )
+            indices = self._indexer_kernels.prefill_index(
+                kwargs["index_query"],
+                index_pages,
+                kwargs["index_weights"],
+                prefill.query_cu,
+                prefill.key_cu,
+                prefill.page_table,
+                spec.index_topk,
+                kwargs["index_init_tokens"],
+                kwargs["index_local_tokens"],
+            )
+            kv_pages = prefill_kv.view(-1, prefill.page_size, spec.kv_cache_dim)
+            output = self._indexer_kernels.prefill_attention(
+                q,
+                kv_pages,
+                indices,
+                prefill.scan_count,
+                prefill.page_table,
+                prefill.query_seq,
+                layer.scaling,
+            )
+        else:
+            output = q.new_empty((q.shape[1], 0, spec.kv_lora_rank))
         return (
             output
             if head_major_output

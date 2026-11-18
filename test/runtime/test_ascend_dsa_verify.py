@@ -25,6 +25,9 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.attention.ascend_prefill_workspace import (
+    AscendPrefillWorkspaceLayout,
+)
 from tokenspeed_kernel.ops.attention.dsa.paged import (
     PagedDSAAttentionKernels,
     PagedDSAIndexerKernels,
@@ -33,16 +36,20 @@ from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import KernelRegistry
 
 from tokenspeed.runtime.layers.attention import ascend_prefill, backends
-from tokenspeed.runtime.layers.attention.backends.paged import ascend_dsa
+from tokenspeed.runtime.layers.attention.backends.paged import (
+    ascend_dsa,
+)
+from tokenspeed.runtime.layers.attention.backends.paged import (
+    ascend_dsa_local_decode as ascend_local_decode,
+)
+from tokenspeed.runtime.layers.attention.backends.paged import (
+    ascend_dsa_tp_kvp_decode as ascend_kvp_decode,
+)
 from tokenspeed.runtime.layers.attention.backends.paged.dsa import DSABackend
 from tokenspeed.runtime.layers.attention.dcp import ascend as ascend_dcp
 from tokenspeed.runtime.layers.attention.dcp.placement import (
     CachePlacement,
     resolve_cache_slots,
-)
-from tokenspeed.runtime.layers.attention.dsa import (
-    ascend_kvp_decode,
-    ascend_local_decode,
 )
 from tokenspeed.runtime.layers.attention.registry import _BACKEND_REGISTRY
 
@@ -1247,9 +1254,15 @@ class _CpuPrefillTransport:
 def _prepare_cache_step_prefill(backend, pool, query, inputs):
     rows, degree = len(query), backend._kvp_degree
     backend.cache_pool = pool
-    backend._prefill_options = ascend_prefill.AscendPrefillOptions(rows, 128, 4096)
+    backend._prefill_layout = AscendPrefillWorkspaceLayout(
+        current_capacity=rows,
+        null_rows=128,
+        history_capacity=4096,
+        degree=degree,
+        has_index=True,
+    )
     prefill = ascend_prefill.AscendPrefill(
-        options=backend._prefill_options,
+        layout=backend._prefill_layout,
         page_size=128,
         topk=2,
         runtime=_CpuPrefillTransport(backend),

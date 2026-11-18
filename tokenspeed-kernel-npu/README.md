@@ -182,15 +182,6 @@ singleton-head shapes, partial pages and repeated layer reuse. CPU buffer tests
 use real Torch storage and substitute unavailable kernels and collectives; they do
 not establish hardware correctness or full-model serving capacity.
 
-`benchmarks/bench_dsa_prefill.py` measures transport, cache writes, indexer and
-sparse attention for one layer, excluding projections and metadata construction.
-Run it with `torchrun --standalone --nproc-per-node=8` and
-`--mode latency --histories 0 131072 524288 --layers 3 --repeat 5 --output PATH`.
-Use `--mode profile` for the timeline, or
-`--mode sweep --histories 524288 --sweep-step 8192 --layers 24 --output PATH`
-to check memory across growing histories and layer reuse. Fixed CPU inputs,
-input hashes and optional `--reference PATH` support full-output comparisons.
-
 Prepared fused Decode retains the current `npu_dcp_merge_topk` and
 `npu_dsa_merge_lse_direct` communication operators. Errors propagate without
 retrying through another implementation.

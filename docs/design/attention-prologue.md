@@ -519,15 +519,17 @@ their existing three-dimensional views.
 ### Ascend DSA execution ownership
 
 DSA Prefill prepares its batch metadata and reusable transport in
-`attention/ascend_prefill.py`. Numerical Prefill calls live in
-`attention/dsa/ascend_prefill.py`. Each layer gathers its history at the attention
-entry and commits current KV/Index-K before selection; there is no early-model
+`attention/ascend_prefill.py`. The DSA backend's `forward_extend` performs
+history/current KV preparation, Indexer selection and SFA in order. Each layer
+gathers its history at the attention entry and commits current KV/Index-K before
+selection; there is no early-model
 prefetch, active-layer deduplication, finish call or workspace close protocol.
 
-`attention/dsa/ascend_local_decode.py` owns TP1/KVP1 Decode, including single-token
-and multi-token causal metadata. It has no DCP metadata or communicator. The
-TP/KVP implementation is in `ascend_kvp_decode.py`; its fused projection and
-communication registration owner are in `ascend_tp_kvp.py`. Native resource
+`attention/backends/paged/ascend_dsa_local_decode.py` owns TP1/KVP1 Decode,
+including single-token and multi-token causal metadata. It has no DCP metadata
+or communicator. The
+TP/KVP attention, fused projections and communication registration live together
+in `attention/backends/paged/ascend_dsa_tp_kvp_decode.py`. Native resource
 release remains explicit after graph teardown; PyTorch buffers follow owner
 lifetime and are reused across layers.
 
@@ -535,3 +537,16 @@ Token-local Prefill loads complete projection weights directly. The existing
 host mapping still describes KV ownership and query groups. A Prefill replica
 using full projections must not execute head-sharded Decode; construct the
 separate TP/KVP Decode replica with Prefill disabled. Local Decode requires TP1.
+
+NoPE native DSA Decode writes the prepared latent directly with `latent_store`;
+its Q is already complete. Prefill defers the owner-local KV write to the shared
+transport after gathering current rows. Ranks with no query rows participate in
+that transport before skipping Indexer/SFA. The model derives the contiguous
+query span from the batch token count and KVP rank, using the same `scatter_count`
+as the backend; it does not search the backend tree during forward.
+
+The cache recipe reserves Prefill memory using `AscendPrefillWorkspaceLayout`,
+the same layout used for allocation. Its optional layout is passed through the
+existing cache pool binding; no marker mixin or second capacity object is needed.
+History capacity also limits scheduler KV admission, and the shared workspace
+is allocated once per backend rather than once per layer.

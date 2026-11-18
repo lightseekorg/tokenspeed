@@ -28,6 +28,9 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 import torch_npu  # noqa: F401
+from tokenspeed_kernel.ops.attention.ascend_prefill_workspace import (
+    AscendPrefillWorkspaceLayout,
+)
 from tokenspeed_kernel_npu.ops.prefill import AscendDSAPrefill
 
 from tokenspeed.runtime.execution.workspace import workspace_pool
@@ -69,7 +72,6 @@ class PrefillMetadata:
 def bounded_transport(rank, degree, scratch_pool, *, ranks, groups):
     """Uneven/empty owners, shared pages, both planes and mapped commits."""
     from tokenspeed.runtime.layers.attention.dcp.ascend import (
-        AscendPrefillOptions,
         AscendPrefillPlan,
     )
     from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
@@ -77,8 +79,12 @@ def bounded_transport(rank, degree, scratch_pool, *, ranks, groups):
     results = []
     runtimes = []
     for has_index in (False, True):
-        capacity = AscendPrefillOptions(
-            4096 if degree == 2 else 2048, kv_page_size=128, max_history_rows=8192
+        capacity = AscendPrefillWorkspaceLayout(
+            current_capacity=4096 if degree == 2 else 2048,
+            null_rows=128,
+            history_capacity=8192,
+            degree=1,
+            has_index=True,
         )
         local_rows = 4096 if degree == 2 else 2048
         cache = torch.empty((local_rows, 576), dtype=torch.bfloat16, device="npu")
@@ -92,9 +98,9 @@ def bounded_transport(rank, degree, scratch_pool, *, ranks, groups):
             index,
             ranks=ranks,
             history_group=groups[int(has_index)],
-            max_current_rows=capacity.max_current_rows,
-            max_history_rows=capacity.max_history_rows,
-            history_null_rows=capacity.kv_page_size,
+            max_current_rows=capacity.current_capacity,
+            max_history_rows=capacity.history_capacity,
+            history_null_rows=capacity.null_rows,
         )
         runtimes.append(runtime)
         assert runtime.workspace_bytes == runtime.layout.nbytes

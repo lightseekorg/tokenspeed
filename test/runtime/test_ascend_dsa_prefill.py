@@ -25,10 +25,12 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.attention.ascend_prefill_workspace import (
+    AscendPrefillWorkspaceLayout,
+)
 
 from tokenspeed.runtime.layers.attention.ascend_prefill import (
     AscendPrefill,
-    AscendPrefillOptions,
 )
 from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
 
@@ -47,7 +49,7 @@ def prepare_prefill(
     query_partition=None
 ):
     prefill = AscendPrefill(
-        options=options,
+        layout=options,
         page_size=page_size,
         topk=topk,
         runtime=SimpleNamespace(
@@ -123,12 +125,14 @@ def test_request_pages_and_query_causal_spans(degree, granularity, extends, pref
             page_size=page,
             topk=2048,
             local_cache_pages=local_capacity,
-            options=AscendPrefillOptions(
-                max(sum(extends), 1),
-                page,
-                max_history_rows=sum(
+            options=AscendPrefillWorkspaceLayout(
+                current_capacity=max(sum(extends), 1),
+                null_rows=page,
+                history_capacity=sum(
                     (length + page - 1) // page * page for length in lengths
                 ),
+                degree=1,
+                has_index=True,
             ),
         )
         for rank in range(degree)
@@ -235,5 +239,11 @@ def test_prefill_rejects_mismatched_request_lengths():
             page_size=128,
             topk=2048,
             local_cache_pages=8,
-            options=AscendPrefillOptions(5, 128, max_history_rows=8192),
+            options=AscendPrefillWorkspaceLayout(
+                current_capacity=5,
+                null_rows=128,
+                history_capacity=8192,
+                degree=1,
+                has_index=True,
+            ),
         )

@@ -25,10 +25,12 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.attention.ascend_prefill_workspace import (
+    AscendPrefillWorkspaceLayout,
+)
 
 from tokenspeed.runtime.layers.attention.ascend_prefill import (
     AscendPrefill,
-    AscendPrefillOptions,
 )
 from tokenspeed.runtime.layers.attention.backends.paged.ascend_mla import (
     AscendMLABackend,
@@ -52,7 +54,7 @@ def prepare_prefill(
     query_partition=None,
 ):
     prefill = AscendPrefill(
-        options=options,
+        layout=options,
         page_size=page_size,
         topk=topk,
         runtime=SimpleNamespace(
@@ -168,7 +170,13 @@ def test_head_shards_share_full_query_metadata_and_receive_page_addresses(
             topk=1,
             local_cache_pages=32,
             query_partition=(0, 146),
-            options=AscendPrefillOptions(146, 128, max_history_rows=8192),
+            options=AscendPrefillWorkspaceLayout(
+                current_capacity=146,
+                null_rows=128,
+                history_capacity=8192,
+                degree=1,
+                has_index=True,
+            ),
         )
         for rank in range(degree)
     ]
@@ -237,7 +245,6 @@ def test_prefill_commits_router_slots_across_request_and_page_boundaries(
     cache = torch.full((7 * page, 576), -1, dtype=torch.int32)
     backend = object.__new__(AscendMLABackend)
     backend.cache_pool = SimpleNamespace(get_key_buffer=lambda layer: cache)
-    from tokenspeed.runtime.layers.attention.ascend_prefill import AscendPrefillOptions
 
     backend._placement = CachePlacement(page, 7, (0,), 0)
     backend._prefill = prepare_prefill(
@@ -249,7 +256,13 @@ def test_prefill_commits_router_slots_across_request_and_page_boundaries(
         topk=1,
         local_cache_pages=7,
         query_partition=(0, total),
-        options=AscendPrefillOptions(total, 128, max_history_rows=8192),
+        options=AscendPrefillWorkspaceLayout(
+            current_capacity=total,
+            null_rows=128,
+            history_capacity=8192,
+            degree=1,
+            has_index=True,
+        ),
     )
     backend._prefill.runtime = CPUOwnerCommit(current, cache)
     backend.prepare_prefill_kv(7, current, slots[0])
@@ -512,7 +525,6 @@ def _prefill_cache_and_backend(monkeypatch, *, options):
     pytest.importorskip("torch_npu")
     if not torch.npu.is_available():
         pytest.skip("requires an NPU")
-    from tokenspeed.runtime.layers.attention.ascend_prefill import AscendPrefillCache
     from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
     from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
     from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
@@ -556,10 +568,10 @@ def _prefill_cache_and_backend(monkeypatch, *, options):
         pool = MLATokenToKVPool(**kwargs)
     else:
 
-        class NativePool(AscendPrefillCache, MLATokenToKVPool):
+        class NativePool(MLATokenToKVPool):
             pass
 
-        pool = NativePool(prefill_options=options, **kwargs)
+        pool = NativePool(prefill_workspace_layout=options, **kwargs)
     spec = MLAConfig(
         backend_name=None,
         num_attention_heads=2,
@@ -625,11 +637,17 @@ def test_unsupported_mla_cache_keeps_prefix_history_without_transport(
 
 
 def test_prefill_cache_binding_needs_no_transport_library_or_buffers(monkeypatch):
-    from tokenspeed.runtime.layers.attention.ascend_prefill import AscendPrefillOptions
 
     monkeypatch.delenv("TOKENSPEED_DSA_CP_LIBRARY", raising=False)
     pool, backend = _prefill_cache_and_backend(
-        monkeypatch, options=AscendPrefillOptions(129, 128, max_history_rows=8192)
+        monkeypatch,
+        options=AscendPrefillWorkspaceLayout(
+            current_capacity=129,
+            null_rows=128,
+            history_capacity=8192,
+            degree=1,
+            has_index=True,
+        ),
     )
     backend.set_cache_pool(pool)
     assert backend.prefill_enabled
@@ -641,9 +659,14 @@ def test_mla_backend_reuses_workspace_after_consumption(monkeypatch, tmp_path):
 
     import tokenspeed.runtime.distributed.process_group_manager as groups
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-    from tokenspeed.runtime.layers.attention.ascend_prefill import AscendPrefillOptions
 
-    options = AscendPrefillOptions(129, 128, max_history_rows=8192)
+    options = AscendPrefillWorkspaceLayout(
+        current_capacity=129,
+        null_rows=128,
+        history_capacity=8192,
+        degree=1,
+        has_index=True,
+    )
     pool, backend = _prefill_cache_and_backend(monkeypatch, options=options)
     manager = groups.ProcessGroupManager()
     monkeypatch.setattr(groups, "process_group_manager", manager)
@@ -677,13 +700,10 @@ def test_mla_backend_reuses_workspace_after_consumption(monkeypatch, tmp_path):
             query_shard=None,
         )
         assert backend._prefill is not None
-        from tokenspeed_kernel.ops.attention.ascend_prefill_workspace import (
-            AscendPrefillWorkspaceLayout,
-        )
 
         expected_bytes = AscendPrefillWorkspaceLayout(
-            history_capacity=options.max_history_rows,
-            current_capacity=options.max_current_rows,
+            history_capacity=options.history_capacity,
+            current_capacity=options.current_capacity,
             degree=1,
             null_rows=128,
             has_index=False,
@@ -722,7 +742,13 @@ def test_mla_backend_reuses_workspace_after_consumption(monkeypatch, tmp_path):
 @pytest.mark.parametrize("rows,page_size", [(0, 128), (1, 0), (-1, 128)])
 def test_prefill_requires_positive_physical_geometry(rows, page_size):
     with pytest.raises(ValueError, match="positive"):
-        AscendPrefillOptions(rows, page_size, max_history_rows=8192)
+        AscendPrefillWorkspaceLayout(
+            current_capacity=rows,
+            null_rows=page_size,
+            history_capacity=8192,
+            degree=1,
+            has_index=True,
+        )
 
 
 @pytest.mark.parametrize("degree", [1, 8])
@@ -730,12 +756,17 @@ def test_prefill_requires_positive_physical_geometry(rows, page_size):
 def test_bounded_prefill_counts_all_requests_and_compacts_owner_pages(
     degree, page_size
 ):
-    from tokenspeed.runtime.layers.attention.ascend_prefill import AscendPrefillOptions
 
     table = torch.tensor([[2, 3, 4, 5], [2, 3, 6, 7]], dtype=torch.int32)
     metadata = RequestMetadata(torch.tensor([3, 17]), torch.tensor([127, 63]), table)
     # Each request rounds to a 128-token scheduler page separately: 2 + 1.
-    options = AscendPrefillOptions(20, kv_page_size=128, max_history_rows=8192)
+    options = AscendPrefillWorkspaceLayout(
+        current_capacity=20,
+        null_rows=128,
+        history_capacity=8192,
+        degree=1,
+        has_index=True,
+    )
     placement = CachePlacement(128, 33, tuple(range(degree)), 0)
     plans = [
         prepare_prefill(

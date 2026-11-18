@@ -24,6 +24,9 @@ from typing import ClassVar
 
 import numpy as np
 import torch
+from tokenspeed_kernel.ops.attention.ascend_prefill_workspace import (
+    AscendPrefillWorkspaceLayout,
+)
 from tokenspeed_kernel.ops.attention.prologue import (
     LatentKVCache,
     PerTokenHeadPlanes,
@@ -61,12 +64,14 @@ class MLATokenToKVPool(CachePool):
         rank: int,
         *,
         field_layer_offset: int = 0,
+        prefill_workspace_layout: AscendPrefillWorkspaceLayout | None = None,
     ):
         super().__init__(
             arena,
             dtype,
             rank,
             field_layer_offset=field_layer_offset,
+            prefill_workspace_layout=prefill_workspace_layout,
         )
         self.model_dtype = model_dtype
         self.quant_method = quant_method

@@ -29,13 +29,13 @@ import torch
 from tokenspeed.runtime.layers.attention.backends.paged.ascend_dsa import (
     AscendDSABackend,
 )
+from tokenspeed.runtime.layers.attention.backends.paged.ascend_dsa_local_decode import (
+    AscendDSALocalDecode,
+)
 from tokenspeed.runtime.layers.attention.dcp.ascend import AscendDCPMetadata
 from tokenspeed.runtime.layers.attention.dcp.placement import (
     CachePlacement,
     resolve_cache_slots,
-)
-from tokenspeed.runtime.layers.attention.dsa.ascend_local_decode import (
-    AscendDSALocalDecode,
 )
 
 pytestmark = pytest.mark.skipif(

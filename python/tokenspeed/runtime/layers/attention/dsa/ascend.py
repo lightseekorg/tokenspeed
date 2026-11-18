@@ -25,16 +25,15 @@ from __future__ import annotations
 import math
 
 import torch
-from tokenspeed_kernel.ops.attention.prologue import mla_prologue
+from tokenspeed_kernel.ops.attention.prologue import latent_store
 from torch import nn
 from torch.nn import functional as F
 from transformers import PretrainedConfig
 
 from tokenspeed.runtime.distributed import Mapping
-from tokenspeed.runtime.layers.attention.backends.paged.ascend_dsa import (
-    ascend_dsa_prefill_backend,
+from tokenspeed.runtime.layers.attention.backends.paged.ascend_dsa_tp_kvp_decode import (
+    DSA_DECODE_ROWS,
 )
-from tokenspeed.runtime.layers.attention.dsa.ascend_tp_kvp import DSA_DECODE_ROWS
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import (
     ColumnParallelLinear,
@@ -126,10 +125,8 @@ class AscendDSAAttention(nn.Module):
         lora_norm_eps: float,
         prefill_enabled: bool,
     ) -> None:
-        if config.index_n_heads == 64:
-            raise NotImplementedError(
-                "Ascend DSA does not support Indexer64; supported models use Indexer16/32"
-            )
+        if config.index_n_heads not in (16, 32):
+            raise NotImplementedError("Ascend DSA supports only Indexer16/32")
         if not config.mla_use_nope or config.index_use_rope:
             raise ValueError(
                 "Ascend DSA requires both attention and Indexer RoPE disabled"
@@ -248,12 +245,12 @@ class AscendDSAAttention(nn.Module):
             prefix=add_prefix("indexer", prefix),
         )
         self._scales_prepared = False
-        self._fused_decode_runtime = None
+        self._fused_tp_kvp_decode_runtime = None
         self.prefill_enabled = prefill_enabled
 
-    def configure_fused_decode(self, runtime) -> None:
+    def configure_fused_tp_kvp_decode(self, runtime) -> None:
         """Attach prepared weights and communication state outside forward."""
-        self._fused_decode_runtime = runtime
+        self._fused_tp_kvp_decode_runtime = runtime
 
     def _prepare_lora_scales(self):
         """Fold native KV scaling; numerical variants may keep it in forward."""
@@ -282,30 +279,12 @@ class AscendDSAAttention(nn.Module):
                 "Token-local DSA Prefill requires complete TP1 projections"
             )
 
-    def _forward_fused_decode(self, positions, hidden_states, ctx, comm_manager):
-        if hidden_states.shape[0] == 0:
-            return hidden_states
-        if self._fused_decode_runtime is None:
-            raise RuntimeError("Initialize native DSA resources before forward/capture")
-        if (
-            hidden_states.ndim != 2
-            or hidden_states.shape[0] not in DSA_DECODE_ROWS
-            or hidden_states.shape[1] != self._fused_decode_runtime.hidden_size
-            or not ctx.forward_mode.is_decode()
-            or ctx.num_extends != 0
-            or not 1 <= ctx.bs <= 64
-            or ctx.output_layout.decode_width not in (1, 8)
-            or hidden_states.shape[0] != ctx.bs * ctx.output_layout.decode_width
-        ):
-            raise ValueError(
-                "Native DSA requires decode-only power-of-two rows1..512, "
-                "matching hidden width and query width1/8"
-            )
-        packed_query, index_query, index_weights = self._fused_decode_runtime.prolog(
-            hidden_states, positions, ctx
+    def _forward_fused_tp_kvp_decode(self, positions, hidden_states, ctx, comm_manager):
+        packed_query, index_query, index_weights = (
+            self._fused_tp_kvp_decode_runtime.prolog(hidden_states, positions, ctx)
         )
         out = ctx.attn_backend.forward(
-            packed_query[self._fused_decode_runtime.rank],
+            packed_query[self._fused_tp_kvp_decode_runtime.rank],
             None,
             None,
             self.attn_mqa,
@@ -324,17 +303,11 @@ class AscendDSAAttention(nn.Module):
             index_cache_written=True,
             packed_query=packed_query,
         )
-        return self._fused_decode_runtime.output_projection(out)
+        return self._fused_tp_kvp_decode_runtime.output_projection(out)
 
     def _forward_prefill(self, positions, hidden, ctx):
         if self.w_kc is None:
             raise RuntimeError("Prepare token-local DSA Prefill weights before forward")
-        backend = ascend_dsa_prefill_backend(ctx.attn_backend)
-        plan = backend._prefill
-        if plan is None or hidden.shape[0] != plan.row_end - plan.row_start:
-            raise ValueError(
-                "DSA Prefill hidden rows must follow the CP query partition"
-            )
         qb, kc, vc, wo = (
             self.q_b_proj.weight,
             self.w_kc,
@@ -345,10 +318,6 @@ class AscendDSAAttention(nn.Module):
         if hidden.shape[0]:
             q_lora = self.q_a_layernorm(self.q_a_proj(hidden)[0])
             iq, ik, weights = indexer(hidden, q_lora)
-        else:
-            iq = hidden.new_empty((0, indexer.index_n_heads, indexer.index_head_dim))
-            ik = hidden.new_empty((0, 1, indexer.index_head_dim))
-        if hidden.shape[0]:
             kv = self.kv_a_proj_with_mqa(hidden)[0]
             q = F.linear(q_lora, qb).view(
                 -1, kc.shape[0], self.qk_nope_head_dim + self.qk_rope_head_dim
@@ -366,20 +335,11 @@ class AscendDSAAttention(nn.Module):
                 dim=-1,
             )
             latent = torch.cat((latent, kv[:, self.kv_lora_rank :]), dim=-1)
-            prologue = mla_prologue(
-                query,
-                query[..., self.kv_lora_rank :],
-                latent,
-                expanded=None,
-                rotary=None,
-                cache=None,
-                solution=None,
-                override=None,
-            )
-            query, latent = prologue.query, prologue.latent
             if ctx.token_to_kv_pool.latent_write_sanitizes:
                 latent = torch.nan_to_num(latent)
         else:
+            iq = hidden.new_empty((0, indexer.index_n_heads, indexer.index_head_dim))
+            ik = hidden.new_empty((0, 1, indexer.index_head_dim))
             weights = torch.empty(
                 (0, indexer.index_n_heads), dtype=torch.float32, device=hidden.device
             )
@@ -425,20 +385,29 @@ class AscendDSAAttention(nn.Module):
             )
         if hidden_states.shape[0] == 0:
             return hidden_states
+        if self.head_tp_size == 1 and self.mapping.attn.kvp_size == 1:
+            return self._forward_decode(hidden_states, ctx)
+        return self._forward_tp_kvp_decode(positions, hidden_states, ctx, comm_manager)
+
+    def _forward_tp_kvp_decode(self, positions, hidden_states, ctx, comm_manager):
         if (
-            self._fused_decode_runtime is not None
+            self._fused_tp_kvp_decode_runtime is not None
             and hidden_states.ndim == 2
             and hidden_states.shape[0] in DSA_DECODE_ROWS
-            and hidden_states.shape[1] == self._fused_decode_runtime.hidden_size
+            and hidden_states.shape[1] == self._fused_tp_kvp_decode_runtime.hidden_size
             and ctx.forward_mode.is_decode()
             and ctx.num_extends == 0
             and 1 <= ctx.bs <= 64
             and ctx.output_layout.decode_width in (1, 8)
             and hidden_states.shape[0] == ctx.bs * ctx.output_layout.decode_width
         ):
-            return self._forward_fused_decode(
+            return self._forward_fused_tp_kvp_decode(
                 positions, hidden_states, ctx, comm_manager
             )
+        return self._forward_decode(hidden_states, ctx)
+
+    def _forward_decode(self, hidden_states, ctx):
+        """Ordinary projections and owner-local stores; the backend owns attention."""
         if self.w_kc is None:
             raise RuntimeError("Prepare DSA weights before forward/capture")
         # CommManager has already gathered this attention group's input rows.
@@ -463,16 +432,11 @@ class AscendDSAAttention(nn.Module):
         slots = ctx.attn_backend.padded_write_locations(
             self.attn_mqa, ctx.forward_mode, query.shape[0]
         )
-        query = self.attn_mqa.latent_prologue(
-            query,
-            query[..., self.kv_lora_rank :],
+        latent_store(
             latent_cache,
-            positions,
-            ctx,
-            slots=slots,
-            expanded=None,
-            key_rows=None,
-        ).query
+            kv_lora_rank=self.kv_lora_rank,
+            cache=self.attn_mqa._local_target(slots, ctx),
+        )
         index_query, index_key, index_weights = self.indexer(hidden_states, q_lora)
         output = ctx.attn_backend.forward(
             query,

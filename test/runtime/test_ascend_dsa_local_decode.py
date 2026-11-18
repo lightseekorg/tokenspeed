@@ -25,7 +25,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from tokenspeed.runtime.layers.attention.dsa import ascend_local_decode as module
+from tokenspeed.runtime.layers.attention.backends.paged import (
+    ascend_dsa_local_decode as module,
+)
 
 
 @pytest.fixture
