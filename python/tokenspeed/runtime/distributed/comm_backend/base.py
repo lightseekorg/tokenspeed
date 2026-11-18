@@ -92,9 +92,12 @@ class CommBackend(ABC):
     def prepare_small_exchange(
         self, group: Group, cap_bytes: int, timeout_ns: int
     ) -> bool:
-        """Collectively prepare a one-hop exchange for ``all_gather_single``
-        and even ``all_to_all_single`` calls of up to ``cap_bytes`` per rank;
-        False keeps the generic collectives."""
+        """Collectively prepare a one-hop exchange for small payloads.
+
+        It serves ``all_gather_single``, ``all_gather`` and equal-split
+        ``all_to_all_single`` calls of up to ``cap_bytes`` per rank; False
+        keeps the generic collectives.
+        """
         return False
 
     def try_shard_exchange(

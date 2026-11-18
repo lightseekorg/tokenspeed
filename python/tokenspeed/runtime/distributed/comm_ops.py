@@ -452,8 +452,10 @@ def prepare_small_exchange(
     timeout_ns: int,
     backend: CommBackend | None = None,
 ) -> bool:
-    """Prepare a one-hop exchange for small ``all_gather_single`` and even
-    ``all_to_all_single`` calls before graph capture.
+    """Prepare a one-hop exchange for small payloads before graph capture.
+
+    It serves ``all_gather_single``, ``all_gather`` and equal-split
+    ``all_to_all_single`` calls.
 
     Collective: every rank of ``group`` calls in the same order with the same
     arguments. Larger or unaligned calls keep the generic collectives.

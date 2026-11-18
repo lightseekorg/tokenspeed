@@ -18,10 +18,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""The one-hop LL all-gather and all-to-all against NCCL on node-local SM100 or
-SM103 GPUs: every byte value at sizes from one unit to the capacity, many
-calls through both parity slots, graph replays with fresh inputs, the refusal
-vote and argument errors."""
+"""Check the one-hop LL all-gather and all-to-all against NCCL.
+
+On node-local SM100 or SM103 GPUs: every byte value at sizes from one unit to
+the capacity, many calls through both parity slots, graph replays with fresh
+inputs, the refusal vote and argument errors.
+"""
 
 from datetime import timedelta
 

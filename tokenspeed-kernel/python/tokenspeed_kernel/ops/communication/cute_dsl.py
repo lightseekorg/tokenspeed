@@ -361,8 +361,10 @@ def create_ll_exchange_state(
     timeout_ns: int,
     eligible: bool,
 ) -> "LLExchangeState | None":
-    """Collectively build the one-hop LL all-gather and all-to-all of small
-    payloads, or agree that the group keeps its collectives.
+    """Collectively build the one-hop LL exchange for small payloads.
+
+    The state serves an all-gather and an all-to-all, or every rank agrees
+    that the group keeps its collectives.
 
     Every rank of the group calls this at the same program point, before graph
     capture and before the KV cache is sized. Every refusal is voted on before

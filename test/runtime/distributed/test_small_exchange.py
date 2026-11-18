@@ -20,10 +20,11 @@
 
 """Prepared one-hop exchanges of small payloads (``prepare_small_exchange``).
 
-``all_gather_single`` and even ``all_to_all_single`` calls that fit the
-prepared capacity run the backend's LL exchange; larger, unaligned and uneven
-calls keep NCCL. Both must move every bit unchanged, eager and under CUDA
-graph replay with new inputs; the NCCL-only switch keeps NCCL.
+``all_gather_single``, ``all_gather`` and equal-split ``all_to_all_single``
+calls that fit the prepared capacity run the backend's LL exchange; larger,
+unaligned and uneven calls keep NCCL. Both must move every bit unchanged,
+eager and under CUDA graph replay with new inputs; the NCCL-only switch keeps
+NCCL.
 """
 
 import gc

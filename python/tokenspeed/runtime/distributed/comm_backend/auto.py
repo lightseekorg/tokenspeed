@@ -669,8 +669,10 @@ class AutoBackend(CommBackend):
     def _small_all_gather(
         self, tensor: torch.Tensor, group: Group, dim: int
     ) -> torch.Tensor | None:
-        """``all_gather`` through the group's prepared one-hop exchange, or
-        None where it does not serve ``tensor``."""
+        """Run ``all_gather`` through the group's prepared one-hop exchange.
+
+        Returns None where the exchange does not serve ``tensor``.
+        """
         state = self._small_exchanges.get(group)
         if (
             state is None
