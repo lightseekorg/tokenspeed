@@ -25,6 +25,7 @@ import torch
 from tokenspeed_kernel.ops.gemm import _gemm_format_signature
 from tokenspeed_kernel.ops.gemm import flashinfer as flashinfer_ops
 from tokenspeed_kernel.ops.gemm import mm as kernel_mm
+from tokenspeed_kernel.profiling import ShapeCapture
 from tokenspeed_kernel.selection import select_kernel
 
 pytestmark = pytest.mark.skipif(
@@ -91,3 +92,61 @@ def test_padded_operand_rows_are_read_with_their_strides():
         a_wide[:, :512], b_wide[:, :512].t(), a_scale, b_scale, torch.bfloat16
     )
     assert ((result.float() - expected).norm() / expected.norm()).item() < 1e-2
+
+
+@pytest.mark.parametrize("m", [1, 7])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("offset", ["activation", "weight", "output", "all"])
+def test_offset_views_through_mm_and_cuda_graph(m, out_dtype, offset):
+    a, b, a_scale, b_scale, expected = _operands(m, 512, 384)
+
+    def offset_copy(tensor):
+        storage = torch.empty(
+            tensor.numel() + 1, dtype=tensor.dtype, device=tensor.device
+        )
+        return storage[1:].view(tensor.shape).copy_(tensor)
+
+    if offset in ("activation", "all"):
+        a = offset_copy(a)
+        assert a.is_contiguous() and a.data_ptr() % 16 != 0
+    if offset in ("weight", "all"):
+        b = offset_copy(b.t()).t()
+        assert b.t().is_contiguous() and b.data_ptr() % 16 != 0
+    storage = torch.full((m * 384 + 2,), 42, dtype=out_dtype, device=a.device)
+    out = (
+        storage[1:-1].view(m, 384)
+        if offset in ("output", "all")
+        else torch.empty((m, 384), dtype=out_dtype, device=a.device)
+    )
+
+    def run():
+        return kernel_mm(
+            a,
+            b,
+            A_scales=a_scale,
+            B_scales=b_scale,
+            out_dtype=out_dtype,
+            quant="fp8",
+            out=out,
+        )
+
+    capture = ShapeCapture.get()
+    capture.clear()
+    previous = capture.enabled
+    capture.enabled = True
+    try:
+        assert run() is out
+    finally:
+        capture.enabled = previous
+    assert capture._records[-1].kernel_name == "flashinfer_mm_fp8_tensor_scaled"
+    assert ((out.float() - expected).norm() / expected.norm()).item() < 1e-2
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    a.copy_((a.float() * 0.5).to(a.dtype))
+    expected = (a.float() * a_scale) @ (b.float() * b_scale)
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert ((out.float() - expected).norm() / expected.norm()).item() < 1e-2
+    assert storage[0] == 42 and storage[-1] == 42

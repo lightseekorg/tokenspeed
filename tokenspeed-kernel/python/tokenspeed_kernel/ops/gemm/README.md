@@ -231,6 +231,14 @@ committed file included. The cost is startup time on every start and every
 rank, and picks may differ between starts and ranks within BF16 rounding;
 commit the file with the tool above to fix them.
 
+## Per-tensor FP8
+
+The FlashInfer cuBLASLt path requires 16-byte-aligned, dense operands and
+output. Contiguous views can still start at an unaligned storage offset:
+the wrapper copies those operands into aligned storage and copies results
+back into strided or unaligned output views. Aligned dense tensors use their
+existing storage.
+
 ## Per-token/per-channel FP8
 
 Per-channel FP8 projections use FP8 E4M3 weights with FP32 scales per output

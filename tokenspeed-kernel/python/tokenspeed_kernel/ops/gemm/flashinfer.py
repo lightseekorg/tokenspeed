@@ -358,6 +358,18 @@ if mm_mxfp8 is not error_fn:
 
 
 _FP8_TENSOR_SCALE = ScaleFormat(storage_dtype=torch.float32, granularity="tensor")
+
+
+def _aligned_copy(tensor: torch.Tensor, alignment: int) -> torch.Tensor:
+    """``tensor`` itself, or a same-strided copy when its data is not ``alignment``-byte aligned."""
+    if tensor.data_ptr() % alignment == 0:
+        return tensor
+    copy = torch.empty_strided(
+        tensor.shape, tensor.stride(), dtype=tensor.dtype, device=tensor.device
+    )
+    return copy.copy_(tensor)
+
+
 cublas_fp8_gemm = error_fn
 
 if platform.is_nvidia and platform.is_blackwell:
@@ -417,9 +429,10 @@ if cublas_fp8_gemm is not error_fn:
                 f"per-tensor FP8 GEMM writes BF16 or FP16, not {out_dtype}"
             )
         # cuBLASLt reads dense operands: row-major A and column-major B.
-        A = A.contiguous()
-        B = B.t().contiguous().t()
-        direct = out is not None and out.is_contiguous()
+        # Contiguous offset views can retain unaligned pointers.
+        A = _aligned_copy(A.contiguous(), 16)
+        B = _aligned_copy(B.t().contiguous(), 16).t()
+        direct = out is not None and out.is_contiguous() and out.data_ptr() % 16 == 0
         result = (
             out
             if direct
@@ -434,7 +447,7 @@ if cublas_fp8_gemm is not error_fn:
         )
         if out is None or direct:
             return result
-        # cuBLASLt writes dense rows; a strided view gets a copy.
+        # Strided or unaligned destinations receive the aligned result.
         return out.copy_(result)
 
 
@@ -510,15 +523,6 @@ if mm_fp4 is not error_fn:
     from flashinfer.utils import get_device_sm_count
 
     _nvfp4_cute_dsl_runner = functools.cache(_cute_dsl_gemm_fp4_runner)
-
-    def _aligned_copy(tensor: torch.Tensor, alignment: int) -> torch.Tensor:
-        """``tensor`` itself, or a same-strided copy when its data is not ``alignment``-byte aligned."""
-        if tensor.data_ptr() % alignment == 0:
-            return tensor
-        copy = torch.empty_strided(
-            tensor.shape, tensor.stride(), dtype=tensor.dtype, device=tensor.device
-        )
-        return copy.copy_(tensor)
 
     @register_kernel(
         "gemm",
