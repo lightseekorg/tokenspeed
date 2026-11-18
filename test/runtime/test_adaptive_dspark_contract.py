@@ -207,19 +207,20 @@ def test_every_capture_forward_starts_at_the_native_query_extent():
     """The grammar fill slices verify candidates by ``ctx.input_num_tokens``.
 
     The warmups and the capture share one context, and a packed forward
-    leaves it narrowed, so each run has to restore the extent a serving
-    forward starts from; otherwise the captured copy reads an empty slice
-    and replays fill masks from stale draft tokens.
+    leaves it narrowed, so each capture forward has to restore the extent a
+    round starts from; otherwise the captured copy reads an empty slice and
+    replays fill masks from stale draft tokens.
     """
     bs, width, query_tokens = 2, 6, 8
     runner = ForwardStepRunner.__new__(ForwardStepRunner)
     runner.max_tokens_per_req = width
-    runner.drafter = _NarrowingDrafter(spec_num_tokens=width, query_tokens=query_tokens)
+    runner.capturable_grammar = None
+    drafter = _NarrowingDrafter(spec_num_tokens=width, query_tokens=query_tokens)
     extents = []
 
     def forward_func(*, bs, ctx, sampling_info):
         extents.append(ctx.input_num_tokens)
-        with runner.drafter.target_forward_context(ctx):
+        with drafter.target_forward_context(ctx):
             pass
 
     runner._forward_func = forward_func
@@ -232,14 +233,38 @@ def test_every_capture_forward_starts_at_the_native_query_extent():
         forward_mode=ForwardMode.DECODE,
         output_layout=ForwardOutputLayout(0, 0, bs, width),
     )
-    sampling_info = object()
 
-    def run_once():
-        ForwardStepRunner._reset_capture_query_extent(runner, ctx, bs)
-        return runner._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
-
-    for _ in range(4):
-        run_once()
-    run_once()
+    # The sequence a capture performs: four warmups, then the captured forward.
+    for _ in range(5):
+        runner._capture_forward(bs, ctx, sampling_info=None)
 
     assert extents == [bs * width] * 5
+
+
+def test_capture_forward_adds_one_grammar_batch_per_run():
+    """Each captured forward pops one grammar batch, so each adds exactly one."""
+    bs, width = 2, 6
+    runner = ForwardStepRunner.__new__(ForwardStepRunner)
+    runner.max_tokens_per_req = width
+    runner._forward_func = lambda **kwargs: None
+    added = []
+
+    class _Grammar:
+        def add_batch(self, *, grammars, bs, has_candidates, output_layout):
+            added.append((len(grammars), bs, has_candidates))
+
+    runner.capturable_grammar = _Grammar()
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=bs,
+        num_extends=0,
+        input_num_tokens=bs * width,
+        forward_mode=ForwardMode.DECODE,
+        output_layout=ForwardOutputLayout(0, 0, bs, width),
+    )
+
+    for _ in range(3):
+        runner._capture_forward(bs, ctx, sampling_info=None)
+
+    assert added == [(bs, bs, False)] * 3
