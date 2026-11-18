@@ -32,6 +32,9 @@ from datetime import timedelta
 import pytest
 import torch
 import torch.distributed as dist
+
+pytest.importorskip("cuda.bindings.driver")
+
 from tokenspeed_kernel.ops.communication.peer_weights import (
     ExpertPartition,
     ExpertWeightShard,

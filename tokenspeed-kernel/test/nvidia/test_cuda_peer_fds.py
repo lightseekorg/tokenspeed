@@ -32,6 +32,9 @@ from contextlib import closing
 
 import pytest
 import torch
+
+pytest.importorskip("cuda.bindings.driver")
+
 from tokenspeed_kernel.ops.communication.peer_weights import ExpertPartition
 from tokenspeed_kernel.thirdparty.cuda.dwdp import store
 from tokenspeed_kernel.thirdparty.cuda.dwdp.layout import WeightLayout
