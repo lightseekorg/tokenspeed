@@ -523,17 +523,16 @@ def test_kimi_k31_amd_configs_have_expected_gating_and_baselines():
         in agentic_task["perf"]["install"][1]
     )
     agentic_tokens = shlex.split(agentic_task["perf"]["command"])
-    # The warmup run precedes the measured one; flag_value needs one match.
-    measured = agentic_tokens[agentic_tokens.index("set") :]
+    assert agentic_tokens.count("/tmp/evalscope-perf/bin/evalscope") == 1
     for flag, value in {
         "--dataset": "swe_smith",
         "--max-tokens": "500",
         "--parallel": "32",
         "--number": "64",
     }.items():
-        assert flag_value(measured, flag) == value
-    assert "--multi-turn" in measured
-    assert "--dataset-offset" not in measured
+        assert flag_value(agentic_tokens, flag) == value
+    assert "--multi-turn" in agentic_tokens
+    assert "--dataset-offset" not in agentic_tokens
     # collect_outputs.py reads the GPU count from the attn_tp suffix.
     assert "$OUTPUTS_DIR/kimi-k3.1_attn_tp8;" in agentic_tokens
     assert (

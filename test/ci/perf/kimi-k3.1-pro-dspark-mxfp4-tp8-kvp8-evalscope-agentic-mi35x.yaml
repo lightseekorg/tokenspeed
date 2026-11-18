@@ -61,22 +61,8 @@ perf:
   command: >-
     REPO_ROOT=$PWD &&
     OUTPUTS_DIR="$PWD/.ci-artifacts/published/kimi-k3.1-pro-dspark-tp8-kvp8-agentic-perf" &&
-    WARMUP_DIR=/tmp/kimi-k3.1-agentic-warmup &&
-    rm -rf "$OUTPUTS_DIR" "$WARMUP_DIR" &&
+    rm -rf "$OUTPUTS_DIR" &&
     cd /tmp &&
-    /tmp/evalscope-perf/bin/evalscope perf
-    --model kimi-k3.1
-    --url http://127.0.0.1:21000/v1/chat/completions
-    --api openai
-    --dataset swe_smith
-    --dataset-path agentic_dataset.json
-    --max-tokens 500
-    --multi-turn
-    --number 2
-    --parallel 2
-    --dataset-offset 68
-    --outputs-dir "$WARMUP_DIR"
-    --extra-args '{"ignore_eos": true}' &&
     set +e &&
     /tmp/evalscope-perf/bin/evalscope perf
     --model kimi-k3.1
