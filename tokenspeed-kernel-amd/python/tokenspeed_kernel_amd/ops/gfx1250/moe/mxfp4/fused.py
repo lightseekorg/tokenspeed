@@ -2272,6 +2272,12 @@ _SMALL_ROUTE_MAX_GATES = 2048
 _QUANT_SMALL_ROUTE_MAX_TOKENS = 1024
 _QUANT_SMALL_ROUTE_MAX_GATES = 16384
 _QUANT_SMALL_ROUTE_STAGED_GATES = (8192, 12288)
+# Tokens up to which the FP8 cast rides on the staged route's last stage. It
+# saves the cast's own launch: Kimi K3 TP8 measured 161.2 -> 159.7 us at 640
+# requests, 190.0 -> 186.9 us at 1152 and 200.4 -> 197.4 us at 1280. From
+# 1536 requests it measured within 1.3 us either way, and at 2560, 4096 and
+# 8192 the standalone cast was 2.8 to 4.0 us faster.
+_STAGED_ROUTE_FP8_CAST_MAX_TOKENS = 1280
 _SMALL_ROUTE_NUM_WARPS = 4
 # Rows per placement program. Every program rebuilds the full histogram, while
 # the in-chunk rank costs CHUNK^2 compares; 64 rows measured fastest from 4 to
@@ -2679,32 +2685,54 @@ def _precomputed_topk_route_large_stage4_gfx1250_kernel(
     QUANT_K: gl.constexpr = 0,
     QUANT_BLOCK_M: gl.constexpr = 8,
     QUANT_BLOCK_K: gl.constexpr = 512,
+    QUANT_FP8: gl.constexpr = False,
+    fp8_scale_ptr=None,
 ):
     """Materialize schedules and scatter valid routes into compact slices.
 
     With ``x_ptr``, programs from ``ROUTE_PROGRAMS`` on quantize the MoE
-    input, ``G // TOPK`` rows of ``QUANT_K`` values, to MXFP4, one
+    input, ``G // TOPK`` rows of ``QUANT_K`` values, one
     ``QUANT_BLOCK_M x QUANT_BLOCK_K`` tile each, beside the latency-bound
-    routing programs.
+    routing programs: to MXFP4, or with ``QUANT_FP8`` to FP8 divided by the
+    scalar at ``fp8_scale_ptr``.
     """
     pid = gl.program_id(0)
     if x_ptr is not None:
         quant_tile = pid - ROUTE_PROGRAMS
         if quant_tile >= 0:
-            quantize_mxfp4_rows_tile_gfx1250(
-                x_ptr,
-                stride_x,
-                q_ptr,
-                stride_q,
-                q_scale_ptr,
-                stride_q_scale,
-                G // TOPK,
-                quant_tile,
-                QUANT_K,
-                QUANT_BLOCK_M,
-                QUANT_BLOCK_K,
-                NUM_WARPS,
-            )
+            if QUANT_FP8:
+                if fp8_scale_ptr is not None:
+                    inv_scale = 1.0 / gl.load(fp8_scale_ptr).to(gl.float32)
+                else:
+                    inv_scale = gl.to_tensor(1.0)
+                quantize_fp8_rows_tile_gfx1250(
+                    x_ptr,
+                    stride_x,
+                    q_ptr,
+                    stride_q,
+                    inv_scale,
+                    G // TOPK,
+                    quant_tile,
+                    QUANT_K,
+                    QUANT_BLOCK_M,
+                    QUANT_BLOCK_K,
+                    NUM_WARPS,
+                )
+            else:
+                quantize_mxfp4_rows_tile_gfx1250(
+                    x_ptr,
+                    stride_x,
+                    q_ptr,
+                    stride_q,
+                    q_scale_ptr,
+                    stride_q_scale,
+                    G // TOPK,
+                    quant_tile,
+                    QUANT_K,
+                    QUANT_BLOCK_M,
+                    QUANT_BLOCK_K,
+                    NUM_WARPS,
+                )
             return
     layout: gl.constexpr = gl.BlockedLayout([1], [32], [NUM_WARPS], [0])
     offset = gl.arange(0, ROUTE_BLOCK, layout=layout)
@@ -2787,6 +2815,9 @@ def _precomputed_topk_route_large_m_gfx1250(
     topk_ids: torch.Tensor,
     num_experts: int,
     quantize_into: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    quantize_fp8_into: (
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None
+    ) = None,
 ) -> tuple[
     RaggedTensorMetadata,
     torch.Tensor,
@@ -2904,6 +2935,24 @@ def _precomputed_topk_route_large_m_gfx1250(
             QUANT_K=quant_k,
             QUANT_BLOCK_M=_LARGE_ROUTE_QUANT_BLOCK_M,
             QUANT_BLOCK_K=_LARGE_ROUTE_QUANT_BLOCK_K,
+        )
+    elif quantize_fp8_into is not None:
+        x, out, act_scale = quantize_fp8_into
+        quant_k = int(x.shape[1])
+        quant_programs = triton.cdiv(tokens, _LARGE_ROUTE_QUANT_BLOCK_M) * triton.cdiv(
+            quant_k, _LARGE_ROUTE_QUANT_BLOCK_K
+        )
+        quant_args = dict(
+            ROUTE_PROGRAMS=route_programs,
+            x_ptr=x,
+            stride_x=x.stride(0),
+            q_ptr=out,
+            stride_q=out.stride(0),
+            QUANT_K=quant_k,
+            QUANT_BLOCK_M=_LARGE_ROUTE_QUANT_BLOCK_M,
+            QUANT_BLOCK_K=_LARGE_ROUTE_QUANT_BLOCK_K,
+            QUANT_FP8=True,
+            fp8_scale_ptr=act_scale,
         )
     _precomputed_topk_route_large_stage4_gfx1250_kernel[
         (route_programs + quant_programs,)
@@ -3449,12 +3498,12 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         x_fp8 = None
         tokens = int(hidden_states.shape[0])
         act_scale = getattr(w13_weight, "act_scale", None)
-        if (
+        castable = (
             hidden_states.dtype in (torch.bfloat16, torch.float16)
             and hidden_states.stride(1) == 1
             and (act_scale is None or isinstance(act_scale, torch.Tensor))
-            and _uses_quantizing_small_route(topk_ids, num_experts)
-        ):
+        )
+        if castable and _uses_quantizing_small_route(topk_ids, num_experts):
             # The routing launch's spare programs cast the input as well. A
             # single token takes this route too: a separate cast is one more
             # launch (Kimi K3 TP8, one request: 16.6 -> 15.7 us).
@@ -3466,6 +3515,22 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
                     num_experts,
                     quantize_fp8_into=(hidden_states, x_fp8, act_scale),
                     block_indexed=block_indexed,
+                )
+            )
+        elif (
+            castable
+            and tokens <= _STAGED_ROUTE_FP8_CAST_MAX_TOKENS
+            and _uses_staged_route(topk_ids, num_experts)
+        ):
+            # Past the one-launch route the cast rides on the staged route's
+            # last stage, as the MXFP4 quantization does.
+            x_fp8 = torch.empty_like(hidden_states, dtype=torch.float8_e4m3fn)
+            ragged_metadata, gather_indx, scatter_indx, _gate_scal = (
+                _precomputed_topk_route_large_m_gfx1250(
+                    topk_weights,
+                    topk_ids,
+                    num_experts,
+                    quantize_fp8_into=(hidden_states, x_fp8, act_scale),
                 )
             )
         else:

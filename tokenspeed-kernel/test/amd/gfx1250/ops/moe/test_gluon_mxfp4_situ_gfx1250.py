@@ -552,3 +552,31 @@ def test_gfx1250_small_route_fp8_quantize_matches_standalone(
     assert torch.equal(routed.view(torch.uint8), expected.view(torch.uint8))
     for actual, reference in zip(route[1:], plain[1:]):
         assert torch.equal(actual, reference)
+
+
+@pytest.mark.parametrize("scaled", [False, True], ids=["unscaled", "scaled"])
+def test_gfx1250_staged_route_fp8_quantize_matches_standalone(scaled: bool) -> None:
+    num_tokens = 640
+    generator = torch.Generator(device="cuda").manual_seed(11)
+    hidden_states = torch.randn(
+        num_tokens, 3584, dtype=torch.bfloat16, device="cuda", generator=generator
+    )
+    topk_weights, topk_ids = make_round_robin_topk(num_tokens, 896, 16)
+    scale = (
+        torch.full((1,), 0.37, dtype=torch.float32, device="cuda") if scaled else None
+    )
+    expected = fused._quantize_fp8_activation(hidden_states, scale)
+    routed = torch.empty_like(expected)
+    route = fused._precomputed_topk_route_large_m_gfx1250(
+        topk_weights.float().contiguous(),
+        topk_ids.to(torch.int32).contiguous(),
+        896,
+        quantize_fp8_into=(hidden_states, routed, scale),
+    )
+    plain = fused._precomputed_topk_route_large_m_gfx1250(
+        topk_weights.float().contiguous(), topk_ids.to(torch.int32).contiguous(), 896
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(routed.view(torch.uint8), expected.view(torch.uint8))
+    for actual, reference in zip(route[1:], plain[1:]):
+        assert torch.equal(actual, reference)
