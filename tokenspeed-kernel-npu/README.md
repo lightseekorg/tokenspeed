@@ -41,7 +41,8 @@ The runtime's unclamped `SiluAndMul` uses the fused NPU SwiGLU operator through
 the native FP32 calculation; FP8 output is unsupported on NPU.
 
 The Ascend plugin's explicit prefill composition can prepare a
-`W4A4GroupedPlan` from the existing fused W4A4 weight plan. It shares NZ
+`W4A4GroupedPlan` from the prepared W4A4 weights. The standalone INT4
+`moe/apply` chain is removed; complete Decode owns its fused execution. Prefill shares NZ
 weights, encodes official GMM scales once, and executes Cube FlatQuant before
 official InitRouting, GMM13, SwiGLU, Cube FlatQuant, GMM2, and FinalizeRouting.
 The caller supplies token-major expert IDs, route weights, and its local

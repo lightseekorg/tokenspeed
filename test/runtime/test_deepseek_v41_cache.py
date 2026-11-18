@@ -491,7 +491,9 @@ def test_packed_refresh_positions_padding_and_token_count(
     assert all(tensor.shape == (3 * verify_width,) for tensor in meta.compressor)
     pointers = [tensor.data_ptr() for tensor in tensors]
     runner = SimpleNamespace(
-        attn_backend=backend, draft_attn_backend=None, max_tokens_per_req=verify_width
+        attn_backend=backend,
+        draft_attn_backend=None,
+        max_tokens_per_req=verify_width,
     )
     for actual in (2, 1, 0, 2):
         ForwardStepRunner._prepare_decode_metadata(

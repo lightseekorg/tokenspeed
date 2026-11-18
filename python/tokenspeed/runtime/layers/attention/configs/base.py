@@ -35,7 +35,7 @@ their component explicitly: ``Backend(config, spec)``.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import ClassVar, TypeVar
+from typing import TYPE_CHECKING, ClassVar, TypeVar
 
 import torch
 
@@ -45,6 +45,9 @@ from tokenspeed.runtime.utils.server_args import ServerArgs
 from tokenspeed.runtime.utils.spec_block_geometry import resolve_draft_query_width
 
 ComponentT = TypeVar("ComponentT", bound="AttnComponentSpec")
+
+if TYPE_CHECKING:
+    from tokenspeed.runtime.layers.attention.backends.base import AttentionBackend
 
 
 def resolve_speculative_num_tokens(
@@ -349,6 +352,25 @@ class AttnConfig:
 
     def cache_cell_size(self) -> int:
         return self.component(SoftmaxAttnConfig).cache_cell_size(self)
+
+    def create_hybrid_backend(
+        self,
+        full_backend: AttentionBackend,
+        linear_backend: AttentionBackend | None,
+        full_attn_layers: list[int],
+    ) -> AttentionBackend:
+        """Compose the resolved leaves, including views with no linear layers.
+
+        A model-owned config may specialize the outer metadata entry without
+        changing leaf selection or the runner's capture/replay lifecycle.
+        """
+        from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
+            HybridLinearAttnBackend,
+        )
+
+        if linear_backend is None:
+            return full_backend
+        return HybridLinearAttnBackend(full_backend, linear_backend, full_attn_layers)
 
 
 def model_wide_kwargs(

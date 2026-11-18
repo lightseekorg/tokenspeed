@@ -26,12 +26,10 @@ import torch
 from tokenspeed_kernel_npu.ops.w4a4 import (
     FlatQuantStage,
     W4A4MoePlan,
-    ascend_int4_precomputed_moe_apply,
     pack_int4,
     prepare_flatquant_stage,
     prepare_w4a4_grouped_plan,
     prepare_w4a4_moe_weights,
-    require_fused_flatquant,
     unpack_int4,
 )
 
@@ -83,13 +81,12 @@ def test_prepare_preserves_layout_scales_and_matrix_orientation(
         w2 = pack_int4(logical2).transpose(1, 2).contiguous()
     left = torch.randn(8, 8).bfloat16()
     first = prepare_flatquant_stage(
-        left, torch.randn(8, 8).bfloat16(), torch.tensor([0.8]), width=h
+        left, torch.randn(8, 8).bfloat16(), torch.tensor([0.8])
     )
     second = prepare_flatquant_stage(
         torch.randn(8, 8).bfloat16(),
         torch.randn(8, 8).bfloat16(),
         torch.tensor([0.9]),
-        width=i,
     )
     calls = []
 
@@ -139,17 +136,6 @@ def test_prepare_preserves_layout_scales_and_matrix_orientation(
     assert torch.equal(plan.scale2, s2)
 
 
-@pytest.mark.parametrize("clip", (0.0, -1.0, 1.1, float("nan")))
-def test_flatquant_rejects_invalid_clip(clip):
-    with pytest.raises(ValueError, match="clip"):
-        prepare_flatquant_stage(
-            torch.eye(4).bfloat16(),
-            torch.eye(8).bfloat16(),
-            torch.tensor([clip]),
-            width=32,
-        )
-
-
 @pytest.mark.parametrize("transposed", (False, True))
 @pytest.mark.parametrize("h,i", ((128, 128), (512, 1024)))
 @pytest.mark.parametrize("activation_range", (1, 7))
@@ -175,7 +161,6 @@ def test_real_nz_weights_match_integer_gmm(transposed, h, i, activation_range):
             torch.eye(8, dtype=torch.bfloat16).npu(),
             torch.eye(width // 8, dtype=torch.bfloat16).npu(),
             torch.tensor([0.9]).npu(),
-            width=width,
         )
 
     plan = prepare_w4a4_moe_weights(
@@ -224,68 +209,3 @@ def test_real_nz_weights_match_integer_gmm(transposed, h, i, activation_range):
         if activation_range == 1:
             assert torch.equal(expected, accum.bfloat16())
         torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
-
-
-def test_old_smooth_only_abi_is_rejected():
-    old = torch._C.parse_schema(
-        "fused_mm13_mm2(Tensor x, int quant_bits=8, Tensor? smooth13=None) -> Tensor"
-    )
-    with pytest.raises(RuntimeError, match="split fallback is disabled"):
-        require_fused_flatquant(SimpleNamespace(_schema=old))
-    extended = torch._C.parse_schema(
-        "fused_mm13_mm2(Tensor x, str quant_mode, Tensor? flatquant13_left, "
-        "Tensor? flatquant13_right, Tensor? flatquant2_left, Tensor? flatquant2_right, "
-        "float clip13, float clip2, bool weight_transposed) -> Tensor"
-    )
-    require_fused_flatquant(SimpleNamespace(_schema=extended))
-
-
-@pytest.mark.parametrize("transposed", (False, True))
-def test_fused_invocation_preserves_flatquant_inputs(transposed):
-    first = prepare_flatquant_stage(
-        torch.eye(8).bfloat16(), torch.eye(8).bfloat16(), torch.tensor([0.75]), width=64
-    )
-    state = W4A4MoePlan(
-        torch.empty(2, 64, 16, dtype=torch.int32),
-        torch.empty(2, 64, 8, dtype=torch.int32),
-        torch.ones(2, 128),
-        torch.ones(2, 64),
-        first,
-        first,
-        transposed,
-    )
-    calls = []
-    output = torch.empty(3, 64, dtype=torch.bfloat16)
-
-    def fused(*args, **kwargs):
-        calls.append((args, kwargs))
-        return output
-
-    boundary = torch.zeros(25, dtype=torch.int32)
-    result = ascend_int4_precomputed_moe_apply(
-        plan=dict(
-            activation="swiglu",
-            expert_start=96,
-            routed_chain_op=fused,
-            routed_chain_boundary=boundary,
-        ),
-        x=torch.randn(3, 64).bfloat16(),
-        w=SimpleNamespace(_int4_plan=state),
-        router_logits=None,
-        topk_ids=torch.zeros(3, 2, dtype=torch.int32),
-        topk_weights=torch.ones(3, 2),
-        do_finalize=True,
-        enable_pdl=False,
-    )
-    assert result is output
-    assert len(calls) == 1
-    args, kwargs = calls[0]
-    assert args[2] is state.w13 and args[4] is state.w2
-    assert kwargs["expert_start"] == 96
-    assert kwargs["quant_mode"] == "flatquant" and kwargs["quant_bits"] == 4
-    assert kwargs["weight_transposed"] is transposed
-    assert kwargs["flatquant13_left"] is first.left
-    assert kwargs["flatquant13_right"] is first.right
-    assert kwargs["flatquant2_left"] is first.left
-    assert kwargs["flatquant2_right"] is first.right
-    assert kwargs["clip13"] == kwargs["clip2"] == 0.75

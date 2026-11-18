@@ -961,10 +961,6 @@ def _create_hybrid_linear_attn_backend(
     pool through the wrapper's ``set_cache_pool``. ``pool`` is inspected here
     only to select the consumers local to this model view.
     """
-    from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
-        HybridLinearAttnBackend,
-    )
-
     linear_factory = _LINEAR_ATTN_BACKENDS.get(linear_attention)
     if linear_factory is None:
         raise ValueError(
@@ -1013,17 +1009,17 @@ def _create_hybrid_linear_attn_backend(
             "layers, 0 linear "
             "attn layers in this cache view (skipping linear backend)",
         )
-        backend = full_attn_backend
+        linear_attn_backend = None
     else:
         linear_attn_backend = linear_factory(server_args, config)
-        backend = HybridLinearAttnBackend(
-            full_attn_backend, linear_attn_backend, full_attn_layers
-        )
         logger.info(
             f"Created hybrid_linear_attn backend: {len(full_attn_layers):d} full attn "
             f"layers, {len(linear_attn.layer_ids):d} linear attn layers, "
             f"{'LCM state fields'!s}",
         )
+    backend = config.create_hybrid_backend(
+        full_attn_backend, linear_attn_backend, full_attn_layers
+    )
     if is_qwen4_exp(hf_config):
         from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
             Qwen4ExpBackend,
