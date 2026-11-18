@@ -90,9 +90,12 @@ private:
         std::vector<std::uint8_t> success;
         ContentHash tail_prior;
         std::optional<TailPublication> tail;
-        bool completed{false};
         bool detached{false};
         bool quarantined{false};
+
+        // Every admitted L3 operation has keys. Even an all-failed completion
+        // supplies one result per key; no results means the operation is pending.
+        bool Completed() const { return !success.empty(); }
     };
     std::uint64_t nextId();
     // What dropping the operation's lease does.

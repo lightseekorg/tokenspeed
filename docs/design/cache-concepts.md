@@ -1789,6 +1789,8 @@ incomplete when any of its State entries on that tier is selected; the cursor
 derives that from the index and the predicate when it rechecks an aged rank.
 There is no separate checkpoint-removal counter to update or undo. The
 traversal retains its cursor positions, but no references to these inputs.
+Group-scan statistics count cursors that have loaded an epoch for selection;
+pre-scan snapshots alone do not increase that count.
 Device admission passes the same traversal through the feasibility pre-scan
 and victim selection so the retained epochs are reused. The cursor merges
 request releases with cache candidates and reads only the access epochs needed, with

@@ -131,9 +131,13 @@ TEST(CacheEvictionCandidates, PrescanReplaysPolicyOrderAcrossPinnedEpochsAndSnap
             }
             return result;
         };
+        EXPECT_EQ(direct.GroupScans(), 0u);
+        EXPECT_EQ(replay.GroupScans(), 0u) << "pre-scan snapshots do not start candidate selection";
         const auto expected = drain(direct);
         EXPECT_EQ(expected.size(), 10000u);
+        EXPECT_EQ(direct.GroupScans(), 2u);
         EXPECT_EQ(drain(replay), expected);
+        EXPECT_EQ(replay.GroupScans(), 2u);
         EXPECT_EQ(pool.NumEmptyLcmBlocks(), 0);
     }
 }
@@ -169,12 +173,14 @@ TEST(CacheEvictionCandidates, RequestReleasesMergeWithCacheCandidatesWithoutDupl
     ASSERT_TRUE(first);
     EXPECT_EQ(first->location, uncached->Location());
     EXPECT_EQ(candidates.ScannedCandidates(), 0u) << "a request-only release precedes every cached epoch";
+    EXPECT_EQ(candidates.GroupScans(), 0u);
     std::vector<CacheBlockLocation> selected;
     while (const auto candidate = candidates.Next(request_candidates, protected_locations, request_reclaim_locations,
                                                   [](CacheBlockLocation) { return false; })) {
         selected.push_back(candidate->location);
     }
     EXPECT_EQ(selected, (std::vector<CacheBlockLocation>{locations[0], locations[1], locations[3]}));
+    EXPECT_EQ(candidates.GroupScans(), 1u);
     EXPECT_EQ(pool.NumOccupiedSlots(), 5);
 }
 

@@ -156,7 +156,10 @@ public:
     }
 
     std::size_t ScannedCandidates() const { return scanned_candidates_; }
-    std::size_t GroupScans() const { return group_scans_; }
+    std::size_t GroupScans() const {
+        return static_cast<std::size_t>(
+            std::ranges::count_if(cursors_, [](const auto& group) { return group.started; }));
+    }
 
 private:
     // A request release can precede the cache; never inspect a newer epoch.
@@ -415,10 +418,7 @@ private:
 
     void loadEpoch(GroupCursor& group, std::uint64_t epoch, const LocationSet& protected_locations,
                    const LocationSet& request_reclaim_locations) {
-        if (!group.started) {
-            group.started = true;
-            ++group_scans_;
-        }
+        group.started = true;
         group.candidates.clear();
         group.next_candidate = 0;
         epoch_scratch_.clear();
@@ -493,7 +493,6 @@ private:
     // Aged candidates that became leaves within the plan, at their own epoch.
     std::vector<Candidate> requeued_;
     std::size_t scanned_candidates_{0};
-    std::size_t group_scans_{0};
 };
 
 }  // namespace tokenspeed

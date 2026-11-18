@@ -1688,6 +1688,27 @@ TEST_F(AsyncStorageTransactionTest, AnIndependentPutStillProtectsAWarmGetDepende
     EXPECT_EQ(coordinator.Prober().ProbePrefix(hashes).host.num_common_tokens, 0);
 }
 
+TEST_F(AsyncStorageTransactionTest, AllFailedQueryIsCompleteAndDuplicateResultsStayIgnored) {
+    auto query = storage.StartQuery({key("h0")}, {2});
+    ASSERT_TRUE(query);
+    const auto id = query.OperationId();
+    ASSERT_EQ(storage.TakeCommands().size(), 1u);
+    EXPECT_FALSE(storage.Completed(id));
+
+    EXPECT_THROW(storage.Complete(cache::StorageDone{id, {}, true, {}}), std::invalid_argument);
+    EXPECT_FALSE(storage.Completed(id));
+    storage.Complete(cache::StorageDone{id, {0}, true, {0}});
+    EXPECT_TRUE(storage.Completed(id));
+    EXPECT_TRUE(storage.RecordQueryHits(id).empty());
+
+    storage.Complete(cache::StorageDone{id, {1}, true, {0}});
+    EXPECT_TRUE(storage.Completed(id));
+    EXPECT_TRUE(storage.RecordQueryHits(id).empty());
+    EXPECT_EQ(storage.QueryHitTokens(), 0u);
+    query.reset();
+    EXPECT_EQ(storage.NumOperations(), 0u);
+}
+
 TEST_F(AsyncStorageTransactionTest, RejectedReadDoesNotPoisonObjectsAndCanRetry) {
     StorageLease read = storage.StartRead(StoragePrompt(hashes, 2), coordinator.Store().ExpandPrefixKeys(hashes));
     storage.TakeCommands();
