@@ -780,9 +780,12 @@ class AutoBackend(CommBackend):
         )
 
         exchange = cute_dsl_ll_all_gather if gather else cute_dsl_ll_all_to_all
-        target = _aligned(output)
+        # The call writes every output byte: a staged output needs no copy in.
+        target = output
+        if not output.is_contiguous() or output.data_ptr() % 16:
+            target = torch.empty(output.shape, dtype=output.dtype, device=output.device)
         exchange(state, _aligned(input), target)
-        if target.data_ptr() != output.data_ptr():
+        if target is not output:
             output.copy_(target)
 
     def all_gather_single(
