@@ -50,6 +50,7 @@ def _lookup(mapping):
         storage_dtype=None,
         output_dtype=torch.float32,
         offload=False,
+        host_table_backend="pinned",
         prefix="",
     )
 

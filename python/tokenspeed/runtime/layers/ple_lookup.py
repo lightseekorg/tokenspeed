@@ -28,6 +28,11 @@ from typing import TYPE_CHECKING
 import torch
 from torch import nn
 
+from tokenspeed.runtime.layers.shared_host_table import (
+    SharedHostTable,
+    ple_host_table_group,
+)
+
 if TYPE_CHECKING:
     from tokenspeed.runtime.distributed.mapping import Mapping
     from tokenspeed.runtime.layers.vocab_parallel_embedding import (
@@ -112,6 +117,8 @@ def host_gather_ngram_rows(
     scale: float | None,
     out: torch.Tensor,
     row_scale: torch.Tensor | None = None,
+    *,
+    mapped_table: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Fill ``out`` with the ``ids`` rows of a host-resident n-gram table.
 
@@ -125,7 +132,7 @@ def host_gather_ngram_rows(
     from tokenspeed_kernel.ops.ple import ple_host_gather
 
     return ple_host_gather(
-        embedding.weight,
+        embedding.weight if mapped_table is None else mapped_table,
         ids,
         out,
         embedding.shard_indices.org_vocab_start_index,
@@ -147,12 +154,19 @@ class PLELookup(nn.Module):
         output_dtype: torch.dtype,
         offload: bool,
         prefix: str,
+        host_table_backend: str,
+        shared_directory: str = "/dev/shm",
     ):
         super().__init__()
         from tokenspeed.runtime.layers.vocab_parallel_embedding import (
             VocabParallelEmbedding,
         )
 
+        if host_table_backend not in ("pinned", "auto", "shm", "cuda_vmm"):
+            raise ValueError("Unsupported PLE host table backend")
+        shared = host_table_backend != "pinned"
+        if shared and not offload and host_table_backend != "shm":
+            raise ValueError("CPU-only shared PLE requires backend='shm'")
         if min(vocab_size, ngram_heads, head_dim) <= 0:
             raise ValueError("PLE lookup dimensions must be positive")
         if storage_dtype not in (None, torch.float8_e4m3fn):
@@ -177,18 +191,43 @@ class PLELookup(nn.Module):
         self._checkpoint_weight_scale = 1.0
         self._gather_stream: torch.cuda.Stream | None = None
         self._pending: PendingLookup | None = None
-        with torch.device("meta") if offload else nullcontext():
+        self.host_table_backend = host_table_backend
+        self._requested_host_backend = host_table_backend
+        self.host_table_page_bytes = 0
+        self._shared_directory = shared_directory
+        self._shared_table: SharedHostTable | None = None
+        self._shared_scale: SharedHostTable | None = None
+        self._shared_ready = False
+        self._shared_loaded = False
+        self._online_quantized = False
+        with torch.device("meta") if offload or shared else nullcontext():
             self.ngram_embedding = VocabParallelEmbedding(
                 vocab_size,
                 head_dim,
                 org_num_embeddings=vocab_size,
                 params_dtype=storage_dtype or output_dtype,
                 prefix=prefix,
-                tp_rank=self.table_rank,
-                tp_size=len(self.table_group),
-                tp_group=self.table_group,
+                tp_rank=0 if shared else self.table_rank,
+                tp_size=1 if shared else len(self.table_group),
+                tp_group=(mapping.rank,) if shared else self.table_group,
             )
-        if offload:
+        if shared:
+            source = self.ngram_embedding.weight
+            self._shared_table = SharedHostTable.allocate(
+                tuple(source.shape),
+                source.dtype,
+                group=ple_host_table_group(mapping),
+                backend=host_table_backend,
+                directory=shared_directory,
+                register=offload,
+            )
+            weight = nn.Parameter(self._shared_table.host, requires_grad=False)
+            for name, value in vars(source).items():
+                setattr(weight, name, value)
+            self.ngram_embedding.weight = weight
+            self.host_table_backend = self._shared_table.backend
+            self.host_table_page_bytes = self._shared_table.huge_page_bytes
+        elif offload:
             materialize_ngram_table_on_host(self.ngram_embedding)
         self._compute_device = (
             torch.device("cuda", torch.cuda.current_device())
@@ -203,14 +242,14 @@ class PLELookup(nn.Module):
                     dtype=torch.float32,
                     device=self._compute_device,
                 )
-                if storage_dtype is not None and not offload
+                if storage_dtype is not None and not offload and not shared
                 else None
             ),
             persistent=False,
         )
 
     def make_layout(self, global_num_tokens, local_tokens: int) -> LookupTokenLayout:
-        if not self.has_dp:
+        if not self.has_dp or self._shared_table is not None:
             return LookupTokenLayout((local_tokens,))
         if global_num_tokens is None or len(global_num_tokens) <= max(self.dp_group):
             raise ValueError("Global PLE lookup requires global-rank token extents")
@@ -220,12 +259,13 @@ class PLELookup(nn.Module):
 
     def _gather_ids(self, ids, layout):
         sizes = layout.physical_extents
-        if len(sizes) != (len(self.dp_group) if self.has_dp else 1):
+        distributed = self.has_dp and self._shared_table is None
+        if len(sizes) != (len(self.dp_group) if distributed else 1):
             raise ValueError("PLE token layout does not match the DP group")
-        rank = self.dp_rank if self.has_dp else 0
+        rank = self.dp_rank if distributed else 0
         if ids.shape[0] > sizes[rank]:
             raise ValueError("PLE query rows exceed the DP token layout")
-        if not self.has_dp:
+        if not distributed:
             return ids, slice(0, ids.shape[0])
         start = sum(sizes[:rank])
         local_slice = slice(start, start + ids.shape[0])
@@ -247,6 +287,10 @@ class PLELookup(nn.Module):
         )
 
     def start(self, ids: torch.Tensor, layout: LookupTokenLayout) -> PendingLookup:
+        if self._shared_table is not None and not self._shared_ready:
+            raise RuntimeError(
+                "Shared PLE weights must be published by finish_loading before lookup"
+            )
         if self._pending is not None:
             raise RuntimeError("PLE lookup already has an in-flight request")
         if ids.ndim != 2 or ids.shape[1] != self.ngram_heads:
@@ -348,6 +392,9 @@ class PLELookup(nn.Module):
             scale,
             out.view(-1, self.head_dim),
             row_scale=row_scale,
+            mapped_table=(
+                self._shared_table.device if self._shared_table is not None else None
+            ),
         )
         return out
 
@@ -398,6 +445,18 @@ class PLELookup(nn.Module):
         return (raw.to(torch.float32) * scale.unsqueeze(-1)).to(self.embed_output_dtype)
 
     def load_shard(self, loaded_weight, shard_index: int, split_parts: int):
+        if self._shared_table is not None:
+            if self._shared_ready:
+                raise RuntimeError(
+                    "Reloading a published shared PLE table is not supported"
+                )
+            if (
+                self.embed_store_dtype is not None
+                and loaded_weight.dtype != torch.float8_e4m3fn
+            ):
+                self._online_quantized = True
+            if not self._shared_table.is_writer:
+                return
         embedding = self.ngram_embedding
         shard_size = (embedding.org_vocab_size + split_parts - 1) // split_parts
         row_start = shard_index * shard_size
@@ -407,6 +466,7 @@ class PLELookup(nn.Module):
         overlap_start = max(row_start, tp_start)
         overlap_end = min(row_end, tp_end)
         if overlap_start < overlap_end:
+            self._shared_loaded = True
             destination = overlap_start - tp_start
             source = overlap_start - row_start
             rows = overlap_end - overlap_start
@@ -420,7 +480,7 @@ class PLELookup(nn.Module):
             # _load_ple_weight_scale independently of checkpoint weight ordering.
             if target_is_fp8 and not source_is_fp8:
                 if scale_buffer is None:
-                    if not self.offload_embedding:
+                    if not self.offload_embedding and self._shared_table is None:
                         raise RuntimeError(
                             "FP8 PLE embedding is missing its scale buffer"
                         )
@@ -432,7 +492,11 @@ class PLELookup(nn.Module):
                     # gather reads scales from.
                     scale_buffer = torch.ones(
                         embedding.num_embeddings_per_partition,
-                        device=self._compute_device,
+                        device=(
+                            "cpu"
+                            if self._shared_table is not None
+                            else self._compute_device
+                        ),
                         dtype=torch.float32,
                     )
                     self.ngram_embedding_scale = scale_buffer
@@ -457,9 +521,17 @@ class PLELookup(nn.Module):
         scale = float(loaded_weight.to(torch.float32).item())
         if not math.isfinite(scale) or scale <= 0:
             raise ValueError(
-                f"Qwen4-Exp PLE weight scale must be finite and positive, got "
-                f"{scale}"
+                f"Qwen4-Exp PLE weight scale must be finite and positive, got {scale}"
             )
+
+        if self._shared_table is not None:
+            if self._shared_ready:
+                raise RuntimeError(
+                    "Reloading a published shared PLE table is not supported"
+                )
+            if not self._shared_table.is_writer:
+                self._checkpoint_weight_scale = scale
+                return
 
         scale_buffer = self.ngram_embedding_scale
         if scale_buffer is not None:
@@ -476,3 +548,57 @@ class PLELookup(nn.Module):
             # scale tensor. Future shard copies multiply by the new value.
             self.ngram_embedding.weight.data.mul_(scale / self._checkpoint_weight_scale)
         self._checkpoint_weight_scale = scale
+
+    def finish_loading(self) -> None:
+        """Publish shared weights and optional host scales once, before serving.
+
+        Every stage rank calls this after its checkpoint iterator completes.
+        Only node-local writers modify the table; readers wait here, never
+        inside lookup or CUDA graph capture. Legacy pinned shards are a no-op.
+        """
+        table = self._shared_table
+        if table is None or self._shared_ready:
+            return
+        states = table.group.exchange(
+            (
+                self._online_quantized,
+                self._checkpoint_weight_scale,
+                table.is_writer,
+                self._shared_loaded,
+            )
+        )
+        if any(state[:2] != states[0][:2] for state in states):
+            raise RuntimeError("PLE ranks disagree on checkpoint scale format")
+        if any(writer and not loaded for _, _, writer, loaded in states):
+            raise RuntimeError(
+                "Shared PLE tables require checkpoint loading on every node's writer"
+            )
+        if self._online_quantized:
+            scales = SharedHostTable.allocate(
+                (self.ngram_embedding.num_embeddings_per_partition,),
+                torch.float32,
+                group=table.group,
+                backend=(
+                    "shm" if table.backend == "shm" else self._requested_host_backend
+                ),
+                directory=self._shared_directory,
+                register=self.offload_embedding,
+            )
+            error = None
+            if table.is_writer:
+                try:
+                    scales.host.copy_(self.ngram_embedding_scale)
+                # Keep every peer in the publication error exchange.
+                except Exception as exc:  # noqa: BLE001
+                    error = f"{type(exc).__name__}: {exc}"
+            errors = table.group.errors(error)
+            if errors:
+                raise RuntimeError(
+                    f"Shared PLE scale publication failed: {'; '.join(errors)}"
+                )
+            self._shared_scale = scales
+            self.ngram_embedding_scale = (
+                scales.device if self.offload_embedding else scales.host
+            )
+        table.group.exchange(None)
+        self._shared_ready = True

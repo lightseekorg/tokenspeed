@@ -75,8 +75,9 @@ def ple_host_gather(
     """Gather global n-gram IDs from a sharded table in pinned host memory.
 
     Args:
-        table: Contiguous page-locked CPU table shaped ``[local_vocab, head_dim]``.
-            Its mapped address must be accessible to the GPU.
+        table: Contiguous mapped host table shaped ``[local_vocab, head_dim]``.
+            May be a page-locked CPU tensor or a zero-copy CUDA alias of shared
+            host storage. A CUDA alias does not imply that the bytes occupy HBM.
         ids: Device int64 global row IDs in any shape; flattened for lookup.
         out: Device output with ``ids.numel() * head_dim`` elements, reshapeable
             to ``[ids.numel(), head_dim]``. Rows outside this shard are zeroed.

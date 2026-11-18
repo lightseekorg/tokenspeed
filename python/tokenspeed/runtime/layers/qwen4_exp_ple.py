@@ -209,7 +209,8 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         divisible_by = int(config.make_ngram_vocab_size_divisible_by)
         padded_vocab = (total + divisible_by - 1) // divisible_by * divisible_by
         table_prefix = add_prefix("ngram_embedding", prefix)
-        offload_embedding = config.ple_offload_embedding
+        placement = config.ple_offload_embedding
+        offload_embedding = bool(placement)
         self.lookup = PLELookup(
             mapping,
             vocab_size=padded_vocab,
@@ -220,6 +221,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             ),
             output_dtype=torch.get_default_dtype(),
             offload=offload_embedding,
+            host_table_backend=placement if isinstance(placement, str) else "pinned",
             prefix=table_prefix,
         )
         if self.ple_layer_index == 0 and offload_embedding:
@@ -228,7 +230,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 "PLE offloading enabled: "
                 f"host_table={weight.device.type == 'cpu'}, "
                 f"pinned_memory={weight.is_pinned()}, "
-                f"storage_dtype={self.lookup.embed_store_dtype}"
+                f"storage_dtype={self.lookup.embed_store_dtype}, "
+                f"host_backend={self.lookup.host_table_backend}, "
+                f"gpu_page_bytes={self.lookup.host_table_page_bytes}"
             )
 
     @classmethod
