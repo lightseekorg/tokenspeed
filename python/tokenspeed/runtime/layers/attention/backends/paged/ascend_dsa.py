@@ -110,8 +110,6 @@ class AscendDSABackend(DSABackend):
         self._kvp_ranks = tuple(config.kvp_group)
         self._ascend_placement = None
         if self._kvp_degree == 1:
-            if spec.attn_tp_size != 1:
-                raise ValueError("Local DSA Decode requires TP1/KVP1")
             self._decode = AscendDSALocalDecode(
                 config, spec, page_size=kernel_page_size
             )
@@ -399,6 +397,8 @@ class AscendDSABackend(DSABackend):
         **kwargs,
     ) -> torch.Tensor:
         self._validate_logit_cap(layer.logit_cap)
+        if self._kvp_degree == 1 and self._indexer_spec.attn_tp_size != 1:
+            raise ValueError("Local DSA Decode requires TP1/KVP1")
         if bs <= 0 or q.shape[0] % bs:
             raise ValueError("Ascend DSA decode tokens must divide by requests")
         tokens_per_request = q.shape[0] // bs

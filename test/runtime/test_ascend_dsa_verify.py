@@ -294,7 +294,7 @@ def test_ascend_dsa_consumes_host_kvp_topology(monkeypatch, degree, rank, missin
         is_dsa=True,
         index_k_format="bf16",
         attn_tp_size=degree,
-        num_attention_heads=2 * degree,
+        num_attention_heads=32,
     )
     # Prefill construction must not validate unused fused Decode operators.
     ascend_dsa.AscendDSABackend(config, spec, kernel_page_size=128)
@@ -302,6 +302,20 @@ def test_ascend_dsa_consumes_host_kvp_topology(monkeypatch, degree, rank, missin
         spec.attn_tp_size = 1
         with pytest.raises(ValueError, match="KV sharding"):
             ascend_dsa.AscendDSABackend(config, spec, kernel_page_size=128)
+    else:
+        spec.attn_tp_size = 4
+        prefill = ascend_dsa.AscendDSABackend(config, spec, kernel_page_size=128)
+        with pytest.raises(ValueError, match="Local DSA Decode requires TP1/KVP1"):
+            prefill.forward_decode(
+                torch.empty(1, 32, 576),
+                None,
+                None,
+                SimpleNamespace(logit_cap=0),
+                None,
+                None,
+                1,
+                fused=False,
+            )
 
 
 def test_dsa_slots_share_the_metadata_refresh():
