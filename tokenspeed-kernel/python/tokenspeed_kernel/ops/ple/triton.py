@@ -346,6 +346,13 @@ def _ple_host_gather_kernel(
     BLOCK_D: tl.constexpr,
     BLOCK_R: tl.constexpr,
 ):
+    """Gather ``rows`` n-gram ids straight out of pinned host memory.
+
+    Each program gathers one ``BLOCK_R``-row tile into ``out_ptr`` through
+    :func:`_ple_host_gather_rows`, whose docstring covers the unified
+    addressing, shard masking and dequant contract.
+    """
+
     row = tl.program_id(0).to(tl.int64) * BLOCK_R + tl.arange(0, BLOCK_R)
     _ple_host_gather_rows(
         table_address,
@@ -386,6 +393,17 @@ def _ple_host_gather_persistent_kernel(
     BLOCK_D: tl.constexpr,
     BLOCK_R: tl.constexpr,
 ):
+    """Persistent variant for large gathers over a complete table.
+
+    The launcher sorts the ids first; programs walk the sorted ids in
+    grid-stride steps of ``grid * BLOCK_R`` rows and scatter each gathered
+    row to its original position through the ``destination_ptr``
+    indirection. Used instead of :func:`_ple_host_gather_kernel` when a
+    complete table serves at least 131,072 ids, where sorted host reads
+    stream better than direct gathers. The shared row helper's docstring
+    covers the unified addressing, shard masking and dequant contract.
+    """
+
     for base in tl.range(tl.program_id(0).to(tl.int64) * BLOCK_R, rows, grid * BLOCK_R):
         row = base + tl.arange(0, BLOCK_R)
         _ple_host_gather_rows(
@@ -618,6 +636,19 @@ def _ple_conv_token_tile(
     BLOCK_C: tl.constexpr,
     BLOCK_T: tl.constexpr,
 ):
+    """A ``BLOCK_T`` by ``BLOCK_C`` tile of the dilated depthwise conv + SiLU.
+
+    Mirrors :func:`_ple_dilated_conv_kernel` with the same virtual
+    per-request sequence ``[carried state (STATE cols) | tokens]`` and fused
+    epilogue addends, but covers ``BLOCK_T`` tokens per program so the
+    channel weights are fetched once per tile. Each token resolves its own
+    request and position, so a tile may cross a request boundary; tap ``k``
+    of output column ``c`` reads virtual position ``c + k*D`` from the
+    carried state or the flat token tensor. ``ADD_GATED`` / ``ADD_RESIDUAL``
+    fold the gated value stream and the incoming hidden states into the
+    epilogue with the same per-addend rounding as the per-token kernel.
+    """
+
     token = tl.program_id(0).to(tl.int64) * BLOCK_T + tl.arange(0, BLOCK_T)
     ch = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
     live = token < TOTAL

@@ -668,7 +668,8 @@ def test_qwen4_exp_workspace_budget_includes_preallocated_ple_commit_rows(
         )
         return
     # Eight verify rows: shared int64[2] context plus two bf16[4, 3]
-    # conv states; the commit holds two int64 ids per request per layer.
+    # conv states; the commit holds two int64 ids per request per layer, and
+    # each layer also keeps an int64 destination element stride.
     assert ple_bytes == (
         8 * (16 + 2 * 24) + 2 * 2 * 2 * 8 + 2 * 8 if ple_enabled else 0
     )
@@ -837,7 +838,8 @@ def test_qwen4_exp_ple_verify_workspace_accepts_uneven_page_strides() -> None:
     assert len(strides) > 1
     # Raised while the commit tables took every layer's stride from the first.
     # Eight verify rows of the int64[2] context and three 9 KiB PLE states,
-    # plus two int64 commit row ids per request and layer.
+    # plus two int64 commit row ids per request and layer; each layer also
+    # keeps an int64 destination element stride.
     assert backend.preallocate_verify_workspace(2, 3) == (
         8 * (16 + 3 * 9216) + 2 * 2 * 3 * 8 + 3 * 8
     )

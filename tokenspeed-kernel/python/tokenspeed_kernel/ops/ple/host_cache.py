@@ -18,6 +18,15 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+"""Opt-in HBM hot cache for offloaded PLE embedding table shards.
+
+Eligible eager lookups (offloaded BF16 or scalar-scaled FP8 tables on NVIDIA
+Hopper and Blackwell, at least 256 tokens) read recently gathered rows from
+GPU memory instead of the host; smaller lookups and CUDA graph capture and
+replay use the regular host gather. The staged gather and fill kernels live
+in :mod:`tokenspeed_kernel.ops.ple._host_cache_triton`.
+"""
+
 from __future__ import annotations
 
 import logging

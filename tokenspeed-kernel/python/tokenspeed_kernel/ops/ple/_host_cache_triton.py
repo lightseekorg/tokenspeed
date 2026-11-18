@@ -18,6 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+"""Staged hot-cache gather and fill Triton kernels used by host_cache.py."""
+
 from tokenspeed_kernel._triton import tl, triton
 
 
@@ -41,6 +43,23 @@ def _ple_gather_staged_tail_kernel(
     D: tl.constexpr,
     C: tl.constexpr,
 ):
+    """Gather the tail rows the CUDA tile gather leaves over.
+
+    The tile gather covers whole 64-token tiles; this launch takes the
+    remaining rows. A row whose id falls in this shard's ``vocab_start`` ..
+    ``vocab_end`` range probes its direct-mapped slot with a multiplicative
+    hash of the local id and reads the row from the hot cache on a tag hit
+    or straight from the pinned host table on a miss; ``out`` receives the
+    values either way, dequantized by ``scale`` for an FP8 table. Rows
+    outside the shard write zeros and take no part in the refill.
+
+    A miss also records its slot in ``miss_slot``, stages the raw
+    storage-dtype row in ``staged`` and bids for the slot in ``winners``
+    with an atomic max of ``row + row_offset`` -- ``row_offset`` shifts the
+    tail's row indices to be global across both gather kernels -- electing
+    one row per slot to refill the cache on the fill stream.
+    """
+
     row = tl.program_id(0) * R + tl.arange(0, R)
     gid = tl.load(ids + row, row < n, other=-1)
     owned = (row < n) & (gid >= vocab_start) & (gid < vocab_end)
@@ -87,6 +106,15 @@ def _ple_fill_staged_kernel(
     R: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
+    """Refill the hot cache from staged miss rows on the side fill stream.
+
+    A row copies its staged bytes into ``hot`` and publishes its local id in
+    ``tags`` only while ``winners`` still names it the slot's elected row,
+    so a superseded bid writes nothing. The moved rows are raw FP8 or BF16
+    storage bytes; any dequantization happens on the gather side. Each
+    program covers ``R`` rows of ``D`` elements in ``BLOCK``-wide accesses.
+    """
+
     row = tl.program_id(0) * R + tl.arange(0, R)
     slot = tl.load(miss_slot + row, row < rows, other=-1)
     win = (slot >= 0) & (tl.load(winners + slot, slot >= 0, other=-1) == row)
