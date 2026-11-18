@@ -1155,7 +1155,7 @@ setup(
             "_cuda/*.cu",
             "_cuda/*.cuh",
         ],
-        # Committed TunableOp results (tuned BLAS solutions), one per GPU.
+        # Committed TunableOp results (tuned BLAS solutions), one per GPU arch.
         "tokenspeed_kernel.ops.gemm._hipblaslt": ["configs/*.csv"],
         "tokenspeed_kernel.thirdparty.cuda": [
             "objs/**/*.so",

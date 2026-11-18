@@ -26,14 +26,17 @@ measured solution can be much faster. PyTorch's TunableOp times both
 hipBLASLt and rocBLAS solutions, and can replay the fastest one from a results
 file, so a tuned file can list solutions from either library.
 
-Tuned files live next to this module, one per GPU, named like the Triton
-kernel configs: ``configs/device_name=<torch.cuda.get_device_name()>.csv``
-with spaces replaced by underscores (``device_name=AMD_Instinct_MI355X.csv``).
-Serving loads the file of its GPU read-only:
+Tuned files live next to this module, one per GPU architecture:
+``configs/arch=<gfx arch>.csv`` (``arch=gfx950.csv``), the base of the GPU's
+``gcnArchName``. They are keyed on the architecture, which the file's
+``GCN_ARCH_NAME`` stamp also pins, and not on the marketing device name: that
+name comes from libdrm's ``amdgpu.ids`` table, which containers can lack, and
+then reads as a generic ``AMD Radeon Graphics``. Serving loads the file of its
+GPU read-only:
 
 * lookups only, so serving never tunes;
 * GEMM shapes the file does not list keep PyTorch's default solution;
-* no file for the GPU, or a file from a different PyTorch, HIP, hipBLASLt,
+* no file for the GPU architecture, or a file from a different PyTorch, HIP, hipBLASLt,
   rocBLAS or GPU architecture, is skipped as a whole (logged once), and every
   GEMM keeps the defaults.
 
@@ -72,21 +75,24 @@ logger = logging.getLogger(__name__)
 TUNED_CONFIG_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "configs")
 
 
-def hipblaslt_tuned_file(device_name: str | None = None) -> str:
-    """Path of the in-repo tuned file for a GPU.
+def _current_arch() -> str:
+    # 'gfx950:sramecc+:xnack-' -> 'gfx950'
+    return torch.cuda.get_device_properties().gcnArchName.split(":")[0]
+
+
+def hipblaslt_tuned_file(arch: str | None = None) -> str:
+    """Path of the in-repo tuned file for a GPU architecture.
 
     Args:
-        device_name: ``torch.cuda.get_device_name()`` of the GPU; the current
-            device when omitted.
+        arch: Base gfx architecture of the GPU, such as ``gfx950``; the
+            current device's when omitted.
 
     Returns:
-        ``<TUNED_CONFIG_DIR>/device_name=<name>.csv``, spaces in the name
-        replaced by underscores. The file may not exist.
+        ``<TUNED_CONFIG_DIR>/arch=<arch>.csv``. The file may not exist.
     """
-    if device_name is None:
-        device_name = torch.cuda.get_device_name()
-    name = device_name.replace(" ", "_")
-    return os.path.join(TUNED_CONFIG_DIR, f"device_name={name}.csv")
+    if arch is None:
+        arch = _current_arch()
+    return os.path.join(TUNED_CONFIG_DIR, f"arch={arch}.csv")
 
 
 def hipblaslt_file_validators(path: str) -> dict[str, str]:
@@ -145,7 +151,7 @@ def load_hipblaslt_tuned_solutions(path: str | None = None) -> bool:
         path = hipblaslt_tuned_file()
         if not os.path.exists(path):
             logger.info(
-                f"No tuned BLAS solutions for {torch.cuda.get_device_name()!r} "
+                f"No tuned BLAS solutions for {_current_arch()!r} "
                 f"({path}); using default solutions"
             )
             return False
@@ -329,7 +335,7 @@ def _main() -> None:
         "--out",
         default=None,
         help="output results CSV (default: this GPU's in-repo file, "
-        "configs/device_name=<GPU name>.csv)",
+        "configs/arch=<gfx arch>.csv)",
     )
     parser.add_argument(
         "--cold-bytes",

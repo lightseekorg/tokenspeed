@@ -168,8 +168,8 @@ def test_tuning_refuses_file_from_another_stack(tuned_file, tmp_path):
 
 
 def test_default_file_is_this_gpus():
-    name = torch.cuda.get_device_name().replace(" ", "_")
-    assert hipblaslt_tuned_file().endswith(f"/configs/device_name={name}.csv")
+    arch = torch.cuda.get_device_properties().gcnArchName.split(":")[0]
+    assert hipblaslt_tuned_file().endswith(f"/configs/arch={arch}.csv")
 
 
 def test_missing_file_keeps_tunableop_disabled(tmp_path):
