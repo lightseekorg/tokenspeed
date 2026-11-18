@@ -44,7 +44,9 @@ def _copy_score_logits(
 ) -> torch.Tensor:
     """Keep pre-penalty scores while samplers may change their input in place."""
     logits = logits_output.next_token_logits
-    if logits.ndim != 2 or logits.shape[0] != layout.num_output_tokens:
+    queries = logits_output.query_layout
+    score_rows = layout.num_output_tokens if queries is None else queries.query_capacity
+    if logits.ndim != 2 or logits.shape[0] != score_rows:
         raise ValueError("sampling score rows must match the forward output layout")
     if logits_output.logits_layout_plan is not None:
         raise ValueError("cumulative probabilities require full-vocabulary score rows")
@@ -78,6 +80,8 @@ def _copy_score_logits(
             )
         )
     packed_mask = parts[0] if len(parts) == 1 else torch.cat(parts)
+    if queries is not None:
+        packed_mask = queries.pack(packed_mask, token_dim=0)
     sampling_info.apply_vocab_mask(logits=scores, vocab_mask=packed_mask.contiguous())
     return scores
 
@@ -134,8 +138,17 @@ def sample_with_diagnostics(
         logprobs = logits_output.next_token_logprobs
         if logprobs is None or logprobs.shape != tokens.shape:
             raise ValueError("cumulative probabilities require aligned output logprobs")
-        logits_output.next_token_cumulative_probs = gather_token_cumulative_probs(
-            scores, tokens
+        queries = logits_output.query_layout
+        scored_tokens = tokens if queries is None else queries.pack(tokens, token_dim=0)
+        probabilities = gather_token_cumulative_probs(scores, scored_tokens)
+        logits_output.next_token_cumulative_probs = (
+            probabilities
+            if queries is None
+            else queries.expand(
+                probabilities,
+                token_dim=0,
+                request_count=layout.num_extends + layout.num_decodes,
+            )
         )
     return result
 

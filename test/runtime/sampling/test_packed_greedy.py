@@ -88,15 +88,16 @@ def test_packed_greedy_empty_requests_and_changed_graph_lengths(device):
         graph.reset()
 
 
-@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("layout_kind", ["uniform", "offsets", "confidence"])
 @pytest.mark.parametrize("through_executor", [False, True])
 def test_backend_verification_and_nan_guard_keep_request_ownership(
-    device, packed, through_executor
+    device, layout_kind, through_executor
 ):
     from tokenspeed.runtime.execution.context import ForwardContext
     from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
     from tokenspeed.runtime.execution.nan_guard import NanGuard
     from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+    from tokenspeed.runtime.execution.verify_layout import VerifyQueryLayout
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
     from tokenspeed.runtime.sampling.backends.base import SamplingBackendConfig
     from tokenspeed.runtime.sampling.backends.greedy import GreedySamplingBackend
@@ -124,12 +125,23 @@ def test_backend_verification_and_nan_guard_keep_request_ownership(
         [11, 12, 13, 14, 21, 99, 23, 24, 31, 32, 33, 34], device=device
     )
     selected = torch.tensor([0, 4, 5, 6, 8, 9, 10, 11], device=device)
+    packed = layout_kind != "uniform"
     if packed:
         targets = targets[selected]
     logits = torch.full((len(targets), 128), -1.0, device=device)
     logits.scatter_(1, targets[:, None], 1.0)
-    output = LogitsProcessorOutput(next_token_logits=logits)
-    starts = torch.tensor([0, 1, 4, 8], device=device) if packed else None
+    layout = None
+    if layout_kind == "confidence":
+        layout = VerifyQueryLayout(3, 8, 4, device)
+        layout.refresh(
+            torch.tensor([[0, 0, 0], [0.8, 0.8, 0.8], [1, 1, 1]], device=device),
+            torch.ones(3, dtype=torch.bool, device=device),
+            torch.ones(3, dtype=torch.bool, device=device),
+        )
+    output = LogitsProcessorOutput(next_token_logits=logits, query_layout=layout)
+    starts = (
+        torch.tensor([0, 1, 4, 8], device=device) if layout_kind == "offsets" else None
+    )
     ctx = ForwardContext(
         attn_backend=None,
         token_to_kv_pool=None,
@@ -139,6 +151,7 @@ def test_backend_verification_and_nan_guard_keep_request_ownership(
         forward_mode=ForwardMode.DECODE,
         output_layout=ForwardOutputLayout(0, 0, 3, 4),
         decode_query_indptr=starts,
+        verify_queries=layout,
     )
     guard = NanGuard.create(True, 3, device)
     guard.reset(3)

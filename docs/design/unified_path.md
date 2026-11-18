@@ -1675,8 +1675,10 @@ verify context or auxiliary-state hooks. GDN claims only the recurrent
 groups that back its own state fields.
 
 The runner calls `commit_state_after_acceptance` once on the target
-after decode/mixed execution or graph replay, with live acceptance and
-`num_extends`. KDA uses the same replay lifecycle for standard target decode:
+after decode/mixed execution, with acceptance and `num_extends`. Ordinary
+decode commits after graph replay; confidence includes this hook in its B
+graph, with zero acceptance and null destinations for padding. KDA uses the
+same replay lifecycle for standard target decode:
 its verify width and accepted count are one when there are no draft tokens.
 Its cache recipe reserves the record workspace for this case before sizing
 the arena. Replay capability determines this reservation even without a drafter;
@@ -2870,3 +2872,66 @@ frontier and Engram commit remain shared. Proposal distributions belong to
 RuntimeStates, are invalidated at PD landing and slot reuse, and are exported
 with retraction state. Query capacity does not shorten the scheduler's
 reserved write extent. The sampled path currently requires attention TP1.
+
+## DSpark confidence verification
+
+Qwen4-Exp targets can use a separate DSpark checkpoint. The draft configures
+its input taps through `TargetCaptureConfigurator`, before cache construction;
+the target materializes deferred residuals and captures the FP32 mean of its
+four HC branches. The confidence head consumes final-normalized draft hidden
+states and the previous-token Markov latent.
+
+`--speculative-verify-policy confidence` chooses Q from completed probabilities.
+`history` uses the same planner with a per-request EMA of prefix survival
+(weight 0.25). Rejection marks longer prefixes unsuccessful; full acceptance
+leaves the unseen tail unknown. Model confidence extrapolates that tail, so a
+short budget can grow when predicted output pays for the extra time.
+
+Both adaptive DSpark paths share the host feedback store and nonblocking event
+queue. Host feedback is expendable. It keys request lifetimes by scheduler admission
+ID and checks a device generation published with candidate scores. Generation
+N uses only completed N-2 feedback, without waiting for N-1. Acceptance in a
+packet describes its predecessor, so history can be older. Slot reuse and
+recompute invalidate feedback; restoration can rebase its generation. Both
+score generations and the device counter live in `RuntimeStates` and are
+imaged by `SlotStateExporter`. The latest GPU scores allocate this round's
+prefixes; missing host scores use observed conditional acceptance with a
+Beta(1, 1) cold prior.
+
+`VerifyBudgetPlanner` shares prefix rewards with the ordinary `VerifyBudgetPolicy`.
+It chooses expected committed tokens per time, preferring smaller Q on ties.
+Startup costs measure complete decode graphs. Completed whole-round timings
+correct those costs, including unvisited Q buckets. Rank zero chooses and
+agrees the budget over a separate host group.
+
+Qwen4 uses the existing decode graph variants with keys (B, Q), where B is
+the padded request bucket and Q is one to the maximum window width times B.
+One graph records target execution, verification, and drafting. The runner
+refreshes metadata before replay and commits accepted state afterwards.
+Explicit forward inputs that differ from the captured inputs use eager
+execution with the same compact layout and commit path.
+
+`VerifyQueryLayout` owns persistent lengths, offsets and row maps. Inactive
+requests have zero lengths. The fused prefix allocator shares sorting and
+CSR generation with V4.1, which reserves physical anchors for padded
+requests. Qwen4 passes live and candidate-ready masks and allocates from
+probabilities. CPU and batches beyond the fused allocator's capacity use
+the same layout via PyTorch. The target keeps Q rows through its body,
+LM head and argmax. The shared verifier emits maximum-width token buffers.
+Grammar, NaN attribution and expert-load accounting use the same row maps.
+Draft context writes, state replay and cache admission keep the maximum window.
+
+The prologue gathers selected write slots. QSA stages keys by original
+request/column; MHA and TRT-LLM use causal lengths per compact row. Unsupported
+leaves reject this layout before capture. GDN convolution and recurrence read
+device offsets; supported output-only 128-wide heads with windows up to sixteen
+use the same CuTe WY kernel as uniform verification. Replay payloads and state
+commit retain maximum width. PLE uses the same request/column map and ignores
+filler. Cache admission and rollback always reserve the maximum window.
+
+The adaptive scope remains NVIDIA Qwen4-Exp, a separate DSpark checkpoint with
+complete confidence weights, greedy chains and attention DP=1/PP=1. PD, trees
+and draft-probability rejection sampling are rejected. Mixed/prefill rounds
+retain full width. Full-checkpoint token/state equivalence and multimodal
+validation remain outstanding; automatic kernel selection does not establish
+batch-invariant target numerics.

@@ -20,9 +20,7 @@
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.attention import dsv41
 
-from tokenspeed.runtime.execution.drafter.deepseek_v41_dspark import DeepseekV41DSpark
 from tokenspeed.runtime.execution.drafter.verify_feedback import VerifyFeedback
 
 
@@ -52,7 +50,9 @@ def test_late_copy_cannot_cross_slot_reuse_or_extend_restart():
     old = history.snapshot()
     history.prepare(["b"], [1], num_extends=1)
     history.publish(old, [[9.0]])
-    assert history.slots[1].completed == {}
+    for _ in range(2):
+        history.prepare(["b"], [1], num_extends=0)
+    assert history.scores() is None
 
 
 def test_duplicate_nonfinite_and_invalidated_feedback():
@@ -77,7 +77,35 @@ def test_invalid_batch_does_not_change_state():
     assert history.snapshot() == ()
 
 
+def test_proposal_feedback_survives_slot_move_and_rows_without_proposals():
+    history = VerifyFeedback(draft_width=1)
+    first = history.prepare_proposals(["a"], [1], num_extends=1, produced=[True])
+    # A forward without proposals moves the request but does not advance its
+    # generation. A copy already in flight can still publish to that admission.
+    history.prepare_proposals(["a"], [2], num_extends=0, produced=[False])
+    history.publish(first, [[0.25]])
+    history.prepare_proposals(["a"], [2], num_extends=0, produced=[True])
+    assert history.scores() is None
+    history.prepare_proposals(["a"], [2], num_extends=0, produced=[True])
+    assert history.scores() == ((0.25,),)
+
+
+def test_v41_feedback_restarts_after_slot_move():
+    history = VerifyFeedback(draft_width=1)
+    history.prepare(["a"], [1], num_extends=0)
+    first = history.snapshot()
+    history.prepare(["a"], [2], num_extends=0)
+    history.publish(first, [[0.25]])
+    for _ in range(2):
+        history.prepare(["a"], [2], num_extends=0)
+    assert history.scores() is None
+
+
 def make_drafter(device):
+    from tokenspeed.runtime.execution.drafter.deepseek_v41_dspark import (
+        DeepseekV41DSpark,
+    )
+
     # Model initialization requires weights and GPUs. Exercise the real
     # request-state and allocation methods with their existing tensor state.
     drafter = object.__new__(DeepseekV41DSpark)
@@ -91,6 +119,8 @@ def make_drafter(device):
 
 
 def check_allocation(drafter, slots, history, expected):
+    from tokenspeed_kernel.ops.attention import dsv41
+
     device = drafter.confidence_scores.device
     history = torch.tensor(history, dtype=torch.float32, device=device)
     expected = torch.tensor(expected, dtype=torch.float32, device=device)
@@ -194,8 +224,9 @@ def test_idle_rejoin_and_slot_reuse_keep_feedback_request_local():
     # the previous occupant even if its asynchronous copy finishes late.
     history.prepare(["b", "c"], [2, 1], num_extends=0)
     history.publish(old, [[9.0, 9.0], [9.0, 9.0]], context_lengths=[900, 900])
-    assert history.slots[1].completed == {}
     history.prepare(["b", "c"], [2, 1], num_extends=0)
+    assert history.scores() is None
+    history.prepare(["c"], [1], num_extends=0)
     assert history.scores() is None
     history.prepare(["b"], [2], num_extends=0)
     assert history.scores() is None  # Old b feedback is now older than N-2.

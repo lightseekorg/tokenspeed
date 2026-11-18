@@ -380,6 +380,7 @@ if is_decode_available():
         ),
         priority=Priority.SPECIALIZED,
         traits={
+            "varlen": frozenset({False}),
             "head_dim": frozenset({SUPPORTED_HEAD_DIM}),
             "padding_safe": frozenset({False}),
             "value_head_dim": frozenset({SUPPORTED_HEAD_DIM}),

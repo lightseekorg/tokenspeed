@@ -566,6 +566,7 @@ def test_drafter_future_inputs_keep_original_request_rows():
     drafted: list[int] = []
     executor = SimpleNamespace(
         tree_spec=None,
+        forward_step=SimpleNamespace(draft_overlap=None),
         capturable_grammar=None,
         dspark_context_producer=None,
         attn_backend=SimpleNamespace(
@@ -603,6 +604,7 @@ def test_drafter_future_inputs_keep_original_request_rows():
         num_extends=2,
         output_layout=ForwardOutputLayout(2, 1, 2, 3),
         decode_query_indptr=None,
+        verify_queries=None,
     )
     forward(executor, 4, ctx, None)
     assert future_inputs.tolist() == [
@@ -818,6 +820,7 @@ def test_graph_padding_restores_live_output_layout(live_bs):
     # MegaMoE's (live, padded) request counts, (1, 1) outside a padded replay.
     live_requests = torch.ones(2, dtype=torch.int32)
     runner = SimpleNamespace(
+        confidence_feedback=None,
         _can_use_graph=lambda *args: True,
         _padded_bs=lambda *args: padded_bs,
         _pad_graph_req_pool_indices=lambda indices, bs: torch.nn.functional.pad(

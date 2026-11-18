@@ -147,6 +147,50 @@ def test_mask_rejects_a_forward_wider_than_the_reservation():
         ExpertLoadRowMask(Mapping(rank=0, world_size=1)).reserve(0, "cpu")
 
 
+@pytest.mark.parametrize("world,ep", [(1, 1), (2, 1), (2, 2), (4, 2), (4, 4)])
+def test_selected_mask_matches_the_communication_partition(world, ep):
+    for rank in range(world):
+        mapping = Mapping(
+            rank=rank,
+            world_size=world,
+            attn_tp_size=world,
+            moe_tp_size=1,
+            moe_ep_size=ep,
+        )
+        rows = ExpertLoadRowMask(mapping)
+        rows.reserve(28, "cpu")
+        rows.mark_padded(
+            padded_global_num_tokens=[7] * world, live_global_num_tokens=[5] * world
+        )
+        expected = rows.mask.clone()
+        rows.clear()
+        rows.mark_selected(torch.tensor([True] * 5 + [False] * 2))
+        torch.testing.assert_close(rows.mask, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_selected_mask_and_load_counters_refresh_inside_graph():
+    rows = ExpertLoadRowMask(Mapping(rank=0, world_size=1))
+    rows.reserve(8, "cuda")
+    valid = torch.tensor([True] * 5 + [False] * 3, device="cuda")
+    load = LayerExpertLoad(torch.zeros(1, dtype=torch.int64, device="cuda"), rows)
+    topk = torch.zeros(8, 1, dtype=torch.int32, device="cuda")
+    rows.mark_selected(valid)
+    load.record(topk)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        rows.mark_selected(valid)
+        load.record(topk)
+        rows.clear()
+    load.physical_load.zero_()
+    graph.replay()
+    assert load.physical_load.item() == 5
+    assert rows.mask.all()
+    valid[2:].fill_(False)
+    graph.replay()
+    assert load.physical_load.item() == 7
+
+
 # ----------------------------------------------------------------------
 # The graph owners bracket every padded replay: mark before, clear after.
 # ----------------------------------------------------------------------

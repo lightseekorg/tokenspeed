@@ -24,7 +24,7 @@ import bisect
 import dataclasses
 import gc
 import os
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Hashable, Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import TYPE_CHECKING
 
@@ -39,6 +39,8 @@ from tokenspeed.runtime.execution.cudagraph_memory import (
     CapturedLadder,
     probe_positions,
 )
+from tokenspeed.runtime.execution.drafter.verify_feedback import ConfidenceFeedback
+from tokenspeed.runtime.execution.drafter.verify_startup import measure_startup_graph
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
@@ -52,6 +54,7 @@ from tokenspeed.runtime.execution.memory_delta import (
     MemoryDeltaObserver,
 )
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+from tokenspeed.runtime.execution.verify_layout import VerifyQueryLayout
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     compute_max_logical_pages_for_capture,
 )
@@ -149,6 +152,7 @@ def get_batch_sizes_to_capture(config: ModelExecutorConfig | DecodeLadderArgs):
 
 
 global_graph_memory_pool = None
+DecodeGraphKey = tuple[str, int]
 
 
 def prepare_draft_extend_metadata(
@@ -321,6 +325,48 @@ def mega_moe_stages_whole_batches(
     return attention_tp_size in (1, moe_tp_ep_size)
 
 
+def same_confidence_sampling_inputs(
+    live: SamplingBatchInfo, captured: SamplingBatchInfo
+) -> bool:
+    # Explicit batch scalars are not persistent pool parameters. Respect
+    # them in the ordinary stage rather than replaying an omitted input.
+    if (
+        any(
+            value is not None
+            for value in (
+                live.temperatures,
+                live.top_ps,
+                live.top_ks,
+                live.min_ps,
+                live.extend_lengths,
+            )
+        )
+        or live.batch_row_offset
+    ):
+        return False
+    if live.vocab_size != captured.vocab_size or live.device != captured.device:
+        return False
+    for actual, expected, request_rows in (
+        (live.req_pool_indices, captured.req_pool_indices, True),
+        (live.valid_cache_lengths, captured.valid_cache_lengths, False),
+        (live.draft_probs, captured.draft_probs, False),
+        (live.vocab_mask, captured.vocab_mask, True),
+    ):
+        if actual is None or expected is None:
+            if actual is not expected:
+                return False
+        elif (
+            actual.data_ptr() != expected.data_ptr()
+            or actual.dtype != expected.dtype
+            or actual.device != expected.device
+            or actual.stride() != expected.stride()
+            or actual.shape[1:] != expected.shape[1:]
+            or (actual.shape != expected.shape and not request_rows)
+        ):
+            return False
+    return live.apply_vocab_mask is captured.apply_vocab_mask
+
+
 class ForwardStepRunner:
     """Owns one forward step end to end: metadata prep, then execution.
 
@@ -354,6 +400,8 @@ class ForwardStepRunner:
         sampling_backend: SamplingBackend | None = None,
         runtime_states: RuntimeStates | None = None,
         decode_graph_supported: bool = True,
+        *,
+        confidence_inputs_supported: Callable[[ForwardContext], bool] | None,
     ):
         self.config = config
         self.attn_backend = attn_backend
@@ -373,6 +421,8 @@ class ForwardStepRunner:
         self.capturable_grammar = capturable_grammar
         self.eager_grammar_buffers = eager_grammar_buffers
         self.runtime_states = runtime_states
+        self.confidence_inputs_supported = confidence_inputs_supported
+        self._confidence_sampling_info: dict[int, SamplingBatchInfo] = {}
         self.disable_padding = config.disable_cuda_graph_padding
         self.enable_cudagraph_gc = config.enable_cudagraph_gc
         self.device = config.device
@@ -406,6 +456,36 @@ class ForwardStepRunner:
         self.overlap_schedule_depth = config.overlap_schedule_depth
         self.dp_size = config.data_parallel_size
         self.world_size = config.world_size
+        self.confidence_feedback: ConfidenceFeedback | None = None
+        self.verify_query_layouts: dict[tuple[int, int], VerifyQueryLayout] = {}
+        self.confidence_request_ids: Sequence[Hashable] = []
+        self.confidence_queries: int | None = None
+        self.confidence_batch: int | None = None
+        self.confidence_round_prepared = False
+        self._confidence_host_group = None
+        if drafter is not None and drafter.verify_policy in ("confidence", "history"):
+            if confidence_inputs_supported is None:
+                raise ValueError("adaptive DSpark graphs require live input validation")
+            self.confidence_feedback = ConfidenceFeedback(
+                self.max_tokens_per_req,
+                max(2, config.overlap_schedule_depth + 2),
+                self.max_decode_bs,
+                budget_policy=drafter.verify_policy,
+            )
+            if self.world_size > 1:
+                from tokenspeed.runtime.distributed.process_group_manager import (
+                    process_group_manager,
+                )
+
+                group = tuple(config.world_group)
+                # Budget collectives run on the forward thread while the event
+                # loop can broadcast requests over the shared host group.
+                process_group_manager.init_process_group(
+                    group, backend="gloo", name="confidence_verify"
+                )
+                self._confidence_host_group = process_group_manager.get_process_group(
+                    "gloo", group, name="confidence_verify"
+                )
         # User intent (enforce_eager), a backend-declared restriction
         # (resolve_cuda_graph_support in ModelExecutor), or a role with no
         # decode step to capture: the prefill role of a disaggregated
@@ -468,8 +548,8 @@ class ForwardStepRunner:
             for spec in token_to_kv_pool.arena.cache_group_specs
         }
 
-        self.graphs: dict[tuple[str, int], object] = {}
-        self.output_buffers: dict[tuple[str, int], tuple] = {}
+        self.graphs: dict[DecodeGraphKey, object] = {}
+        self.output_buffers: dict[DecodeGraphKey, tuple] = {}
         # The padded batch the last call replayed a decode graph at (None: eager).
         self.last_graph_bs: int | None = None
         self._reported_query_graphs: set[tuple[str, int, int | None]] = set()
@@ -478,7 +558,7 @@ class ForwardStepRunner:
         # re-verified before every replay (graph_ptr_guard). Off by default —
         # replays then pay a single bool check.
         self._graph_debug = graph_debug_enabled()
-        self._metadata_snapshots: dict[tuple[str, int], dict[str, dict]] = {}
+        self._metadata_snapshots: dict[DecodeGraphKey, dict[str, dict]] = {}
 
         self._forward_func: Callable | None = forward_func
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
@@ -619,8 +699,9 @@ class ForwardStepRunner:
                 graph, output_buffers = self._capture_one(
                     bs, variant=variant, observer=observer.measure(f"decode:{variant}")
                 )
-                self.graphs[(variant, bs)] = graph
-                self.output_buffers[(variant, bs)] = output_buffers
+                key = self._capture_key(variant, bs)
+                self.graphs[key] = graph
+                self.output_buffers[key] = output_buffers
 
     @property
     def capture_plan(self) -> dict[str, list[int]]:
@@ -666,6 +747,8 @@ class ForwardStepRunner:
         if self.draft_overlap is not None:
             self.draft_overlap.release()
         self.graphs.clear()
+        if self.confidence_feedback is not None:
+            self._confidence_sampling_info.clear()
         self.output_buffers.clear()
         self._metadata_snapshots.clear()
         self._reported_query_graphs.clear()
@@ -717,12 +800,36 @@ class ForwardStepRunner:
             variant=self._split_query_variant(variant, bs)[0],
         )
 
+    def _capture_key(self, variant: str, bs: int) -> DecodeGraphKey:
+        return variant, bs
+
+    def query_layout(self, bs: int, queries: int) -> VerifyQueryLayout:
+        key = bs, queries
+        if key not in self.verify_query_layouts:
+            self.verify_query_layouts[key] = VerifyQueryLayout(
+                bs, queries, self.max_tokens_per_req, self.device
+            )
+        return self.verify_query_layouts[key]
+
+    def prepare_confidence_feedback(
+        self,
+        request_ids: Sequence[Hashable],
+        request_pool_indices: list[int],
+        output_layout: ForwardOutputLayout,
+    ) -> None:
+        self.confidence_request_ids = request_ids
+        if self.confidence_feedback is not None and self.global_rank == 0:
+            self.confidence_feedback.prepare(
+                request_ids, request_pool_indices, output_layout
+            )
+            self.confidence_round_prepared = True
+
     def _cuda_graph_replay_variant(self) -> str:
         if self.sampling_backend is None:
             return CUDA_GRAPH_VARIANT_DEFAULT
         return self.sampling_backend.cuda_graph_replay_variant(self.max_tokens_per_req)
 
-    def _cuda_graph_key(self, bs: int) -> tuple[str, int]:
+    def _cuda_graph_key(self, bs: int) -> DecodeGraphKey:
         variant = self._query_variant(
             self._cuda_graph_replay_variant(),
             self._decode_query_tokens or bs * self.max_tokens_per_req,
@@ -747,7 +854,7 @@ class ForwardStepRunner:
     def _has_cuda_graph_for_bs(self, bs: int) -> bool:
         return (CUDA_GRAPH_VARIANT_DEFAULT, bs) in self.graphs
 
-    def _verify_graph_metadata(self, graph_key: tuple[str, int]) -> None:
+    def _verify_graph_metadata(self, graph_key: DecodeGraphKey) -> None:
         """Assert the refresh rebound the tensors the captured graph reads."""
         snapshots = self._metadata_snapshots.get(graph_key)
         if snapshots is None:
@@ -779,6 +886,66 @@ class ForwardStepRunner:
             decode_width=self.max_tokens_per_req,
         )
 
+    def _queue_capture_grammar(self, ctx: ForwardContext) -> None:
+        if self.capturable_grammar is not None:
+            self.capturable_grammar.add_batch(
+                grammars=[None] * ctx.bs,
+                bs=ctx.bs,
+                has_candidates=False,
+                output_layout=ctx.output_layout,
+            )
+
+    def _capture_context(
+        self, bs: int, *, queries: VerifyQueryLayout | None
+    ) -> ForwardContext:
+        """One dummy decode layout for eager warmup and round graphs."""
+        ctx = ForwardContext(
+            attn_backend=self.attn_backend,
+            token_to_kv_pool=self.token_to_kv_pool,
+            bs=bs,
+            num_extends=0,
+            output_layout=ForwardOutputLayout(0, 0, bs, self.max_tokens_per_req),
+            input_num_tokens=bs * self.max_tokens_per_req,
+            forward_mode=ForwardMode.DECODE,
+            all_decode_or_idle=True,
+            capture_hidden_mode=(
+                CaptureHiddenMode.FULL
+                if self.drafter is not None
+                else CaptureHiddenMode.NULL
+            ),
+            verify_queries=queries,
+        )
+        if self.dp_size > 1 and not self.dp_local_graph:
+            # Match serving's collective geometry, including draft step zero.
+            ctx.global_num_tokens = [bs * self.max_tokens_per_req] * self.world_size
+            ctx.global_bs = [bs] * self.world_size
+            ctx.global_num_decodes = [bs] * self.world_size
+        return ctx
+
+    def _capture_sampling_info(self, bs: int) -> SamplingBatchInfo:
+        from tokenspeed.runtime.grammar.capturable_grammar import bind_grammar_mask_buf
+
+        states = self.runtime_states
+        info = SamplingBatchInfo(
+            req_pool_indices=self.input_buffers.req_pool_indices_buf[:bs],
+            valid_cache_lengths=(
+                states.valid_cache_lengths if states is not None else None
+            ),
+            draft_probs=states.draft_probs if states is not None else None,
+            draft_q=states.future_draft_q if states is not None else None,
+            vocab_size=self.vocab_size,
+            device=self.device,
+        )
+        bind_grammar_mask_buf(
+            info,
+            self.eager_grammar_buffers,
+            bs,
+            spec=self.drafter is not None,
+            capturable=self.capturable_grammar,
+            grammar_backend=self.grammar_backend,
+        )
+        return info
+
     def _capture_one(
         self,
         bs: int,
@@ -794,90 +961,23 @@ class ForwardStepRunner:
         graph = graph_cls()
         self._prepare_request_token_history_graph_inputs(active_bs=0, padded_bs=bs)
 
-        capture_forward_mode = ForwardMode.DECODE
-        ctx = ForwardContext(
-            attn_backend=self.attn_backend,
-            token_to_kv_pool=self.token_to_kv_pool,
-            bs=bs,
-            num_extends=0,
-            output_layout=ForwardOutputLayout(0, 0, bs, self.max_tokens_per_req),
-            input_num_tokens=bs * self.max_tokens_per_req,
-            forward_mode=capture_forward_mode,
-            # A decode graph is only ever replayed when every DP rank is
-            # decoding or idle (see _can_use_graph), so capture must record that
-            # same answer. Leaving the default False would let capture-time code
-            # take a different path than replay -- for DeepEP MoE that means
-            # recording the normal-mode legs, whose host-side receive counts
-            # cannot be captured at all.
-            all_decode_or_idle=True,
-            capture_hidden_mode=(
-                CaptureHiddenMode.FULL
-                if self.drafter is not None
-                else CaptureHiddenMode.NULL
-            ),
-        )
-
-        # For DP mode, global_num_tokens must be set so that the MoE
-        # all-gather comm layers know token counts for all DP ranks.
-        # During capture, use uniform dummy counts across ranks.
-        if self.dp_size > 1 and not self.dp_local_graph:
-            ctx.global_num_tokens = [bs * self.max_tokens_per_req] * self.world_size
-            # global_bs must ALSO be set at capture. The draft first step's
-            # collective sizing (reported via report_collective_sizing) reads
-            # global_bs; if left None at capture it records a single-rank
-            # layout (fallback branch in comm_manager), but at replay global_bs
-            # is the live per-rank batch list -> multi-rank layout. The mismatch
-            # makes the captured (frozen-offset) gather read uninitialized
-            # symm-mem -> NaN draft logits -> accept_rate 0. Set the matching
-            # uniform dummy.
-            ctx.global_bs = [bs] * self.world_size
-            ctx.global_num_decodes = [bs] * self.world_size
-
-        # The sampler has a single pool-indexed route: greedy requests are
-        # served by top_k=1 in the pool buffers, so capture and every replay
-        # record the same top_k_top_p sampling path.
-        ibd = self.input_buffers
-        sampling_info = SamplingBatchInfo(
-            req_pool_indices=ibd.req_pool_indices_buf[:bs],
-            valid_cache_lengths=(
-                self.runtime_states.valid_cache_lengths
-                if self.runtime_states is not None
-                else None
-            ),
-            draft_probs=(
-                self.runtime_states.draft_probs
-                if self.runtime_states is not None
-                else None
-            ),
-            draft_q=(
-                self.runtime_states.future_draft_q
-                if self.runtime_states is not None
-                else None
-            ),
-            vocab_size=self.vocab_size,
-            device=self.device,
-        )
-
-        from tokenspeed.runtime.grammar.capturable_grammar import (
-            bind_grammar_mask_buf,
-        )
-
-        # Bind whichever grammar buffer is active so the captured sampler
-        # records the apply_vocab_mask call. At replay, runtime fills the
-        # bound buffer in place (host node for capturable, sync H2D for
-        # eager) — the captured graph reads from the same memory.
-        bind_grammar_mask_buf(
-            sampling_info,
-            self.eager_grammar_buffers,
-            bs,
-            spec=self.drafter is not None,
-            capturable=self.capturable_grammar,
-            grammar_backend=self.grammar_backend,
-        )
-
         _, query_tokens = self._split_query_variant(variant, bs)
+        confidence = self.confidence_feedback
+        if confidence is not None:
+            self.input_buffers.fill_dummy_decode_buffers(
+                batch_size=bs, total_tokens=bs * self.max_tokens_per_req
+            )
+        ctx = self._capture_context(
+            bs,
+            queries=(
+                self.query_layout(bs, query_tokens) if confidence is not None else None
+            ),
+        )
+        sampling_info = self._capture_sampling_info(bs)
         adaptive_layout = (
-            self.drafter is not None and query_tokens < bs * self.max_tokens_per_req
+            confidence is None
+            and self.drafter is not None
+            and query_tokens < bs * self.max_tokens_per_req
         )
         if adaptive_layout:
             # Select the layout outside the graph. Runtime replay updates the
@@ -893,13 +993,7 @@ class ForwardStepRunner:
         def run_once():
             # Dummy add_batch keeps grammar batches 1:1 with replays: the
             # host node pops one batch per forward.
-            if self.capturable_grammar is not None:
-                self.capturable_grammar.add_batch(
-                    grammars=[None] * bs,
-                    bs=bs,
-                    has_candidates=False,
-                    output_layout=ctx.output_layout,
-                )
+            self._queue_capture_grammar(ctx)
             return self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
 
         global _is_cuda_graph_phase
@@ -994,10 +1088,25 @@ class ForwardStepRunner:
             snapshots = {"target": snapshot_graph_metadata(self.attn_backend)}
             if self.draft_attn_backend is not None:
                 snapshots["draft"] = snapshot_graph_metadata(self.draft_attn_backend)
-            self._metadata_snapshots[(variant, bs)] = snapshots
+            self._metadata_snapshots[self._capture_key(variant, bs)] = snapshots
 
         if self.drafter is not None:
             self.drafter.set_decode_graph_query_extent(None)
+        if confidence is not None:
+            self._confidence_sampling_info[bs] = sampling_info
+            with torch.cuda.stream(self.stream):
+                self.deepep_adapter.replay()
+                samples = measure_startup_graph(
+                    graph.replay,
+                    lambda: self._queue_capture_grammar(ctx),
+                    device=torch.device(self.device),
+                    host_group=self._confidence_host_group,
+                    warmup=0,
+                    samples=3,
+                )
+            confidence.planner.set_baseline(bs, query_tokens, sorted(samples)[1])
+            if self.capturable_grammar is not None:
+                self.capturable_grammar.reset_state()
         return graph, out
 
     def warmup_decode_path(
@@ -1018,65 +1127,15 @@ class ForwardStepRunner:
                 self._prepare_request_token_history_graph_inputs(
                     active_bs=0, padded_bs=bs
                 )
-                ctx = ForwardContext(
-                    attn_backend=self.attn_backend,
-                    token_to_kv_pool=self.token_to_kv_pool,
-                    bs=bs,
-                    num_extends=0,
-                    output_layout=ForwardOutputLayout(
-                        0, 0, bs, self.max_tokens_per_req
-                    ),
-                    input_num_tokens=bs * self.max_tokens_per_req,
-                    forward_mode=ForwardMode.DECODE,
-                    # Match _capture_one: the lazy state this warms up (DeepEP
-                    # buffers among it) must be the state capture will record.
-                    all_decode_or_idle=True,
-                    capture_hidden_mode=(
-                        CaptureHiddenMode.FULL
-                        if self.drafter is not None
-                        else CaptureHiddenMode.NULL
-                    ),
-                )
-                if self.dp_size > 1 and not self.dp_local_graph:
-                    ctx.global_num_tokens = [
-                        bs * self.max_tokens_per_req
-                    ] * self.world_size
-                    ctx.global_bs = [bs] * self.world_size
-                    ctx.global_num_decodes = [bs] * self.world_size
-
-                sampling_info = SamplingBatchInfo(
-                    req_pool_indices=self.input_buffers.req_pool_indices_buf[:bs],
-                    valid_cache_lengths=(
-                        self.runtime_states.valid_cache_lengths
-                        if self.runtime_states is not None
-                        else None
-                    ),
-                    draft_probs=(
-                        self.runtime_states.draft_probs
-                        if self.runtime_states is not None
-                        else None
-                    ),
-                    draft_q=(
-                        self.runtime_states.future_draft_q
-                        if self.runtime_states is not None
-                        else None
-                    ),
-                    vocab_size=self.vocab_size,
-                    device=self.device,
-                )
-
-                from tokenspeed.runtime.grammar.capturable_grammar import (
-                    bind_grammar_mask_buf,
-                )
-
-                bind_grammar_mask_buf(
-                    sampling_info,
-                    self.eager_grammar_buffers,
+                ctx = self._capture_context(
                     bs,
-                    spec=self.drafter is not None,
-                    capturable=self.capturable_grammar,
-                    grammar_backend=self.grammar_backend,
+                    queries=(
+                        self.query_layout(bs, bs * self.max_tokens_per_req)
+                        if self.confidence_feedback is not None
+                        else None
+                    ),
                 )
+                sampling_info = self._capture_sampling_info(bs)
 
                 self.device_module.synchronize()
                 dist.barrier()
@@ -1084,13 +1143,7 @@ class ForwardStepRunner:
                     bs=bs,
                     variant=CUDA_GRAPH_VARIANT_DEFAULT,
                 )
-                if self.capturable_grammar is not None:
-                    self.capturable_grammar.add_batch(
-                        grammars=[None] * bs,
-                        bs=bs,
-                        has_candidates=False,
-                        output_layout=ctx.output_layout,
-                    )
+                self._queue_capture_grammar(ctx)
                 self.input_buffers.seq_lens_buf[:bs].fill_(self.max_tokens_per_req)
                 self._init_capture_metadata(bs)
                 self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
@@ -1402,6 +1455,36 @@ class ForwardStepRunner:
         """
         use_graph = self._can_use_graph(bs, ctx)
         padded_bs = self._padded_bs(bs, ctx) if use_graph else bs
+        confidence_start = None
+        confidence_round = (
+            self.confidence_feedback is not None and ctx.forward_mode.is_decode()
+        )
+        if confidence_round:
+            self.confidence_batch = padded_bs
+            budget = [
+                (
+                    self.confidence_feedback.select(
+                        padded_bs,
+                        self.confidence_request_ids,
+                        capacities=(
+                            self.drafter.decode_graph_query_capacities(padded_bs)
+                            if use_graph
+                            else None
+                        ),
+                    )
+                    if self.global_rank == 0
+                    else None
+                )
+            ]
+            if self._confidence_host_group is not None:
+                dist.broadcast_object_list(
+                    budget, src=0, group=self._confidence_host_group
+                )
+            self.confidence_queries = budget[0]
+            ctx.verify_queries = self.query_layout(padded_bs, self.confidence_queries)
+            if self.global_rank == 0 and self.confidence_feedback.can_record():
+                confidence_start = self.device_module.Event(enable_timing=True)
+                confidence_start.record()
         active_req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
 
         live_output_layout = ctx.output_layout
@@ -1488,7 +1571,35 @@ class ForwardStepRunner:
             )
 
         self._decode_query_tokens = None
-        if use_graph and self.drafter is not None:
+        if use_graph and confidence_round:
+            captured = self._confidence_sampling_info[padded_bs]
+            if not self.confidence_inputs_supported(
+                ctx
+            ) or not same_confidence_sampling_inputs(sampling_info, captured):
+                # settle has bound the live sampling inputs. Reuse the regular
+                # metadata refresh at the unpadded extent for an eager forward.
+                use_graph = False
+                padded_bs = bs
+                ctx.bs = bs
+                ctx.output_layout = live_output_layout
+                queries = min(
+                    ctx.verify_queries.query_capacity, bs * self.max_tokens_per_req
+                )
+                ctx.verify_queries = self.query_layout(bs, queries)
+                self.confidence_batch, self.confidence_queries = bs, queries
+                self._prepare_decode_metadata(
+                    bs,
+                    bs,
+                    req_pool_indices[:bs],
+                    seq_lens[:bs],
+                    forward_mode=ctx.forward_mode,
+                    use_graph=False,
+                    settle=lambda: None,
+                    block_tables=block_tables,
+                )
+            else:
+                self._decode_query_tokens = ctx.verify_queries.query_capacity
+        elif use_graph and self.drafter is not None:
             self._decode_query_tokens = self.drafter.prepare_decode_graph_token_layout(
                 ctx, actual_bs=bs, padded_bs=padded_bs
             )
@@ -1537,7 +1648,9 @@ class ForwardStepRunner:
             query_tokens = (
                 self._decode_query_tokens or padded_bs * self.max_tokens_per_req
             )
-            packed = query_tokens != padded_bs * self.max_tokens_per_req
+            packed = (
+                confidence_round or query_tokens != padded_bs * self.max_tokens_per_req
+            )
             if self._expert_load_rows is not None:
                 if self.dp_local_graph:
                     # This graph's MoE input contains only its local rows.
@@ -1606,6 +1719,31 @@ class ForwardStepRunner:
                     else None
                 ),
             )
+
+        if self.confidence_feedback is not None and self.confidence_round_prepared:
+            slots = self.input_buffers.req_pool_indices_buf[:bs]
+            layout = ctx.verify_queries
+            query_lengths = (
+                layout.query_lengths[:bs]
+                if layout is not None
+                else torch.zeros_like(slots, dtype=torch.int32)
+            )
+            accept_lengths = (
+                layout.accept_lengths[:bs]
+                if layout is not None
+                else torch.zeros_like(slots, dtype=torch.int32)
+            )
+            self.confidence_feedback.record(
+                self.runtime_states.draft_confidence.index_select(0, slots),
+                self.runtime_states.draft_confidence_generation.index_select(0, slots),
+                self.runtime_states.previous_draft_confidence.index_select(0, slots),
+                query_lengths,
+                accept_lengths,
+                confidence_start,
+                self.confidence_batch if confidence_start is not None else None,
+                self.confidence_queries if confidence_start is not None else None,
+            )
+            self.confidence_round_prepared = False
 
         self.last_graph_bs = padded_bs if use_graph else None
         return result

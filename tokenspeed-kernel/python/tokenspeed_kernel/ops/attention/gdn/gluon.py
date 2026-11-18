@@ -107,6 +107,7 @@ if current_platform().is_amd:
         ),
         priority=Priority.SPECIALIZED,
         traits={
+            "varlen": frozenset({False}),
             "head_dim": frozenset({128}),
             "padding_safe": frozenset({False, True}),
             "tree": frozenset({False}),

@@ -24,6 +24,8 @@
 
 """The grammar interface the data plane drives, and the bitmask apply."""
 
+from functools import cache
+
 
 class BaseGrammarObject:
     """A request's grammar matcher as the data plane drives it: the bitmask
@@ -31,6 +33,7 @@ class BaseGrammarObject:
     (``HostGrammar``, over the matcher the Rust host owns)."""
 
 
+@cache
 def get_apply_vocab_mask_func(grammar_backend: str):
     """Return the backend-specific in-place vocab-mask-apply function.
 

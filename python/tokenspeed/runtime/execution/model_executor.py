@@ -747,6 +747,30 @@ class ModelExecutor:
                 vocab_size=config.vocab_size,
             )
             self.drafter.wire_target(self.model_runner.model)
+            if (
+                draft_model_runner is not None
+                and draft_model_runner.server_args.speculative_verify_policy
+                in ("confidence", "history")
+                and self.drafter.verify_policy
+                != draft_model_runner.server_args.speculative_verify_policy
+            ):
+                raise ValueError(
+                    "This DSpark drafter does not implement confidence verification"
+                )
+            if self.drafter.verify_policy in ("confidence", "history"):
+                from tokenspeed.runtime.models.qwen4_exp import (
+                    Qwen4ExpForCausalLM,
+                    Qwen4ExpForConditionalGeneration,
+                )
+
+                if not current_platform().is_nvidia or not isinstance(
+                    self.model_runner.model,
+                    (Qwen4ExpForCausalLM, Qwen4ExpForConditionalGeneration),
+                ):
+                    raise ValueError(
+                        "confidence verification currently supports NVIDIA Qwen4Exp DSpark"
+                    )
+                self.attn_backend.validate_compact_verify()
             MultimodalRuntime.wire_drafter(
                 self.input_buffers, self.model_runner.model_config
             )
@@ -1036,18 +1060,7 @@ class ModelExecutor:
         """
         self.forward_step = ForwardStepRunner(
             forward_func=self._forward_step,
-            attn_backend=self.attn_backend,
-            token_to_kv_pool=self.token_to_kv_pool,
-            input_buffers=self.input_buffers,
-            config=self.config,
-            drafter=self.drafter,
-            draft_attn_backend=self.draft_attn_backend,
-            draft_token_to_kv_pool=self.draft_token_to_kv_pool,
-            capturable_grammar=self.capturable_grammar,
-            eager_grammar_buffers=self.eager_grammar_buffers,
-            sampling_backend=self.sampling_backend,
-            runtime_states=self.runtime_states,
-            decode_graph_supported=self._graph_support.decode_graph,
+            confidence_inputs_supported=self._confidence_graph_inputs_supported,
         )
         # Eager warmup can be DP-asymmetric; prewarm RSAG under uniform dummy inputs.
         # The prefill role never decodes: a DECODE-shaped dummy would need the
@@ -1765,6 +1778,16 @@ class ModelExecutor:
                 )
             ),
         )
+        if ctx.verify_queries is not None:
+            accept_lengths.copy_(
+                torch.minimum(
+                    accept_lengths,
+                    ctx.verify_queries.query_lengths[: accept_lengths.shape[0]],
+                )
+            )
+            ctx.verify_queries.accept_lengths[: accept_lengths.shape[0]].copy_(
+                accept_lengths
+            )
         ib = self.input_buffers
         self.runtime_states.apply_stop_conditions(
             ib.state_write_req_pool_indices_buf[: ctx.bs],
@@ -1963,6 +1986,27 @@ class ModelExecutor:
             f"{dp_sampling!s} min_bs={runtime.min_bs:d}",
         )
 
+    def _confidence_graph_inputs_supported(self, ctx: ForwardContext) -> bool:
+        # These optional inputs can have new addresses or Python values on each
+        # forward. An ordinary stage must honor them instead of replaying the
+        # capture's inputs. Persistent input-buffer views remain graph inputs.
+        positions = self._active_positions_override
+        if positions is not None:
+            captured_positions = (
+                self.input_buffers.mrope_positions_buf
+                if self.config.model_is_mrope
+                else self.input_buffers.positions_buf
+            )
+            if (
+                positions.data_ptr() != captured_positions.data_ptr()
+                or positions.stride() != captured_positions.stride()
+                or positions.shape[:-1] != captured_positions.shape[:-1]
+                or positions.dtype != captured_positions.dtype
+                or positions.device != captured_positions.device
+            ):
+                return False
+        return self._active_multimodal_context is None and ctx.decode_input_ids is None
+
     @maybe_inference_mode()
     def _forward_step(
         self,
@@ -1994,6 +2038,25 @@ class ModelExecutor:
             stream=self.device_module.current_stream(),
         )
         ctx.dspark_context_producer = self.dspark_context_producer
+        ctx.logits_queries = None
+        if ctx.verify_queries is not None:
+            slots = self.input_buffers.state_write_req_pool_indices_buf[
+                : ctx.verify_queries.batch_size
+            ]
+            states = self.runtime_states
+            active = (slots > 0) & (slots < states.future_input_map.shape[0] - 1)
+            active &= ~states.stopped[slots]
+            ctx.verify_queries.refresh(
+                states.draft_confidence[slots],
+                states.spec_candidates_ready[slots],
+                active,
+            )
+            if (
+                self.sampling_backend.supports_packed_verify
+                and self.sampling_backend.config.synthetic_acceptance_length is None
+                and self._simulated_accept_length is None
+            ):
+                ctx.logits_queries = ctx.verify_queries
         if self.drafter is not None:
             self.drafter.prepare_target_forward(ctx)
 
@@ -2107,9 +2170,9 @@ class ModelExecutor:
     ):
         """Advance accepted inputs and cache lengths together on execution_stream.
 
-        Serving calls this after eager execution or graph replay. All writes
-        are tensor-only, including padding masks, so recording this update has
-        the same semantics. Callers must pass the state-write pool indices.
+        The runner completes this after drafting and accepted-state commit.
+        Captured completion uses the same tensor writes and padding masks.
+        Callers must pass the state-write pool indices.
         """
         if self.drafter is None:
             prefill = output_layout.prefill_slice
@@ -2879,6 +2942,11 @@ class ModelExecutor:
                     f"forward_step ext={num_extends} dec={bs - num_extends}",
                     color="blue",
                 ):
+                    self.forward_step.prepare_confidence_feedback(
+                        admission_ids,
+                        forward_op.request_pool_indices,
+                        ctx.output_layout,
+                    )
                     self._log_dp_sampling_route(bs, ctx)
                     forward_step_start = 0.0
                     if timing_enabled:

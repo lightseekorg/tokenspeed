@@ -147,6 +147,11 @@ class CachePoolBinding:
         """The nodes this one composes (graph support, pointer walk, binding); leaves: ()."""
         return ()
 
+    def validate_compact_verify(self) -> None:
+        """Validate every cache consumer before capturing packed verify rows."""
+        for backend in self.child_backends():
+            backend.validate_compact_verify()
+
     def fixed_workspace_bytes(self) -> int:
         """Return recipe-reserved workspace bytes, excluding the shared arena.
 

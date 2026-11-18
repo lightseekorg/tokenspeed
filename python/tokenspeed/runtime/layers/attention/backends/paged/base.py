@@ -109,6 +109,13 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
     supports_layer_window_sink: bool = False
     supports_mla_dcp: bool = False
     prefill_needs_host_page_table: bool = False
+    supports_compact_verify: bool = False
+
+    def validate_compact_verify(self) -> None:
+        if not self.supports_compact_verify:
+            raise ValueError(
+                f"{type(self).__name__} does not support compact verify queries"
+            )
 
     @classmethod
     def resolve_kernel_page_size(

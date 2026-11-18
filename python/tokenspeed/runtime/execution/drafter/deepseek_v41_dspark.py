@@ -61,7 +61,7 @@ from tokenspeed.runtime.execution.drafter.verify_calibration import (
     calibration_source_fingerprint,
 )
 from tokenspeed.runtime.execution.drafter.verify_feedback import (
-    FeedbackSnapshot,
+    FeedbackQueue,
     VerifyFeedback,
 )
 from tokenspeed.runtime.execution.forward_batch_info import (
@@ -101,14 +101,6 @@ class _VerifyBudgetBuffers:
     valid: torch.Tensor
     packet: torch.Tensor
     peers: torch.Tensor
-
-
-@dataclass
-class _PendingVerifyFeedback:
-    ready: torch.cuda.Event
-    scores: torch.Tensor
-    contexts: torch.Tensor
-    snapshot: tuple[FeedbackSnapshot, ...]
 
 
 class DeepseekV41DSpark(BaseDrafter):
@@ -190,7 +182,7 @@ class DeepseekV41DSpark(BaseDrafter):
         )
         self._verify_budget_buffers: dict[int, _VerifyBudgetBuffers] = {}
         self._verify_budget_graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
-        self._pending_verify_feedback: list[_PendingVerifyFeedback] = []
+        self._verify_feedback_queue = FeedbackQueue(max_pending=3)
         self._verify_cache_initialized = False
         self._verify_cache: VerifyCalibrationCache | None = None
         self._cached_verify_profiles: tuple[VerifyCalibration, ...] = ()
@@ -1040,15 +1032,12 @@ class DeepseekV41DSpark(BaseDrafter):
     def _poll_verify_feedback(self) -> None:
         if self.verify_feedback is None:
             return
-        while self._pending_verify_feedback:
-            pending = self._pending_verify_feedback[0]
-            if not pending.ready.query():
-                break
-            self._pending_verify_feedback.pop(0)
-            lengths = pending.contexts.tolist()
+        for pending in self._verify_feedback_queue.completed():
+            scores, contexts = pending.values
+            lengths = contexts.tolist()
             if lengths and all(length > 0 for length in lengths):
                 self.verify_feedback.publish(
-                    pending.snapshot, pending.scores.tolist(), context_lengths=lengths
+                    pending.snapshot, scores.tolist(), context_lengths=lengths
                 )
 
     def finish_round(self, ctx: ForwardContext, graph_bs: int | None) -> None:
@@ -1070,28 +1059,18 @@ class DeepseekV41DSpark(BaseDrafter):
         ):
             return
         self._poll_verify_feedback()
-        if len(self._pending_verify_feedback) >= 3:
+        if not self._verify_feedback_queue.can_record():
             return
         snapshot = self.verify_feedback.snapshot()
         if len(snapshot) != ctx.bs:
             raise RuntimeError("verification feedback does not match the active batch")
         slots = self.input_buffers.req_pool_indices_buf[: ctx.bs]
         scores = self.confidence_scores.index_select(0, slots)
-        host = torch.empty(
-            scores.shape, dtype=scores.dtype, device="cpu", pin_memory=True
-        )
-        host.copy_(scores, non_blocking=True)
-        contexts = torch.empty(
-            ctx.bs,
-            dtype=self.input_buffers.seq_lens_buf.dtype,
-            device="cpu",
-            pin_memory=True,
-        )
-        contexts.copy_(self.input_buffers.seq_lens_buf[: ctx.bs], non_blocking=True)
-        event = torch.cuda.Event()
-        event.record()
-        self._pending_verify_feedback.append(
-            _PendingVerifyFeedback(event, host, contexts, snapshot)
+        self._verify_feedback_queue.record(
+            snapshot,
+            (scores, self.input_buffers.seq_lens_buf[: ctx.bs]),
+            buffers=None,
+            timing=None,
         )
 
     def _draft_decode_rows(

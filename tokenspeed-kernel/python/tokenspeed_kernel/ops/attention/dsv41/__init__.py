@@ -57,11 +57,10 @@ from tokenspeed_kernel.ops.attention.dsv41._inputs import (
 )
 from tokenspeed_kernel.ops.attention.dsv41._metadata import index_logit_rows
 from tokenspeed_kernel.ops.attention.mla._triton.page_table import bounded_group_slots
+from tokenspeed_kernel.ops.metadata.query_rows import VERIFY_LAYOUT_MAX_TOKENS
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
-
-VERIFY_LAYOUT_MAX_TOKENS = 4096
 
 __all__ = [
     "VERIFY_LAYOUT_MAX_TOKENS",

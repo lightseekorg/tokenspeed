@@ -1300,6 +1300,47 @@ after the Device cache evicts them, or drop the Host cache with
 compaction (`sysctl vm.compaction_proactiveness=0`) removes the background
 trigger.
 
+### Separate DSpark draft and confidence verification
+
+The [Qwen3.8-Flash-Next DSpark checkpoint](https://huggingface.co/shadowpa0327/Qwen3.8-Flash-Next-DSpark)
+uses five HC-mean target taps, a seven-token block and a trained confidence
+head. Download a pinned revision and supply its local directory as the draft
+path; its embedding and LM head are shared with the target.
+
+```bash
+ts serve nvidia/Qwen3.8-Flash-Next-NVFP4 \
+    --trust-remote-code \
+    --speculative-algorithm DSPARK \
+    --speculative-draft-model-path /path/to/pinned-dspark \
+    --speculative-num-steps 7 \
+    --speculative-num-draft-tokens 8 \
+    --speculative-verify-policy confidence \
+    --attention-backend trtllm \
+    --drafter-attention-backend trtllm \
+    --moe-backend flashinfer_trtllm
+```
+
+Use `fixed` to compare full-width DSpark on the same checkpoint. Use
+`--speculative-verify-policy history` to estimate the total query budget from
+completed acceptance history and extrapolate unverified tails with checkpoint
+confidence. Both adaptive policies use the latest device confidence to assign
+request prefixes. History is asynchronous and may be older than generation
+N-2; its diagnostics report the observed lag. Neither policy guarantees a
+throughput improvement for every workload.
+
+Confidence verification keeps selected rows compact through attention, GDN,
+PLE, MLP and the greedy verifier. State rollback capacity and the external
+sampling layout retain the maximum window. Decode graphs use a request
+bucket and a query budget. A graph runs the target, verifier and draft,
+with metadata refresh and accepted-state commit outside replay.
+Single-GPU and TP2/EP2 smoke runs cover graph and eager execution.
+Full-budget and adaptive output parity against fixed verification have not
+passed acceptance; distributed performance and multimodal validation remain
+outstanding. Attention DP and PP must equal one. PD, tree speculation and
+draft-prob rejection sampling are unsupported. QSA, `mha` and `trtllm` paged
+attention support compact verification;
+other paged leaves are rejected before capture.
+
 ### Optional `--hf-overrides`
 
 All keys are optional and can be combined in a single `--hf-overrides` JSON
