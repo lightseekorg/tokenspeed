@@ -3169,7 +3169,7 @@ def test_ple_conv_epilogue_folds_full_width_adds(dtype) -> None:
 )
 @pytest.mark.parametrize("width,channels", [(4, 10240), (8, 32768)])
 def test_ple_conv_commits_compact_verify_scratch(width, channels) -> None:
-    from tokenspeed_kernel.ops.kvcache.triton import copy_state_rows
+    from tokenspeed_kernel.ops.kvcache.triton import copy_state_rows_compact
 
     batch, state = 8, 9
     stub, _, _ = _ple_stub(ngram_size=3, conv_kernel_size=4, channels=channels)
@@ -3207,15 +3207,15 @@ def test_ple_conv_commits_compact_verify_scratch(width, channels) -> None:
             windows_out=scratch,
             windows_block_rows=width + 1,
         )
-        copy_state_rows(
+        copy_state_rows_compact(
             src,
             dst,
             src_rows,
             requests,
             row_bytes=output.stride(0) * output.element_size(),
-            src_row_strides=None,
             dst_row_strides=strides,
-            compact=(scratch, width),
+            scratch=scratch,
+            verify_width=width,
         )
         return conv
 

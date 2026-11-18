@@ -56,6 +56,7 @@ __all__ = [
     "compact_window_rows",
     "copy_page_fields",
     "copy_state_rows",
+    "copy_state_rows_compact",
     "dequant_gather_kv_mxfp8",
     "fused_fp8_set_kv_buffer",
     "get_mla_kv_buffer_triton",
@@ -744,6 +745,31 @@ def _copy_state_rows_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
 
+def _state_row_copy_geometry(
+    src_addresses: torch.Tensor,
+    dst_addresses: torch.Tensor,
+    src_rows: torch.Tensor,
+    dst_rows: torch.Tensor,
+    dst_row_strides: torch.Tensor,
+) -> tuple[int, int]:
+    total = src_rows.numel()
+    num_layers = src_addresses.numel()
+    if total == 0:
+        return total, num_layers
+    if num_layers == 0 or total % num_layers:
+        raise ValueError("src_rows must hold rows_per_layer ids per layer")
+    if src_addresses.dtype != torch.uint64 or dst_addresses.dtype != torch.uint64:
+        raise ValueError("slab address tables must have dtype torch.uint64")
+    row_id_dtypes = (torch.int32, torch.int64)
+    if src_rows.dtype not in row_id_dtypes or dst_rows.dtype not in row_id_dtypes:
+        raise ValueError("row id tensors must have dtype torch.int32 or torch.int64")
+    if dst_row_strides.dtype != torch.int64 or dst_row_strides.numel() != num_layers:
+        raise ValueError("row stride tables must be int64 with one entry per layer")
+    if dst_rows.numel() != total or dst_addresses.numel() != num_layers:
+        raise ValueError("source/destination table sizes must match")
+    return total, num_layers
+
+
 def copy_state_rows(
     src_addresses: torch.Tensor,
     dst_addresses: torch.Tensor,
@@ -751,9 +777,8 @@ def copy_state_rows(
     dst_rows: torch.Tensor,
     *,
     row_bytes: int,
-    src_row_strides: torch.Tensor | None,
+    src_row_strides: torch.Tensor,
     dst_row_strides: torch.Tensor,
-    compact: tuple[torch.Tensor, int] | None = None,
 ) -> None:
     """Copy state rows between per-layer slabs with a bounded device grid.
 
@@ -774,64 +799,30 @@ def copy_state_rows(
             null cache page id can mask it instead of clamping it onto page 0.
         row_bytes: Byte width of a full state row. Divisible by 4 for full copies.
         src_row_strides: CUDA int64 ``[num_layers]`` row-to-row strides of the
-            source slabs in int32 units (``stride_bytes // 4``). Use None for
-            dense compact scratch.
+            source slabs in int32 units (``stride_bytes // 4``).
         dst_row_strides: CUDA int64 ``[num_layers]`` destination row strides in
-            int32 units for full copies or state elements for compact scratch.
-        compact: Optional CUDA ``(scratch, verify_width)``. The scratch tensor
-            provides the common ``[rows, channels, state]`` geometry and dtype.
-            Each request stores its carried window followed by one channel
-            vector per candidate. Source row ids encode
-            ``request * (verify_width + 1) + accepted_count``.
+            int32 units.
 
     Returns:
         None. Rows are copied in place. Ascend uses a conservative cap of
         65535 programs per launch; other devices use one launch.
     """
-    enable_pdl = pdl_enabled()
-    total = src_rows.numel()
+    total, num_layers = _state_row_copy_geometry(
+        src_addresses, dst_addresses, src_rows, dst_rows, dst_row_strides
+    )
     if total == 0:
         return
-    num_layers = src_addresses.numel()
-    if num_layers == 0 or total % num_layers:
-        raise ValueError("src_rows must hold rows_per_layer ids per layer")
-    if src_addresses.dtype != torch.uint64 or dst_addresses.dtype != torch.uint64:
-        raise ValueError("slab address tables must have dtype torch.uint64")
-    row_id_dtypes = (torch.int32, torch.int64)
-    if src_rows.dtype not in row_id_dtypes or dst_rows.dtype not in row_id_dtypes:
-        raise ValueError("row id tensors must have dtype torch.int32 or torch.int64")
-    if dst_row_strides.dtype != torch.int64 or dst_row_strides.numel() != num_layers:
+    if (
+        src_row_strides is None
+        or src_row_strides.dtype != torch.int64
+        or src_row_strides.numel() != num_layers
+    ):
         raise ValueError("row stride tables must be int64 with one entry per layer")
-    if dst_rows.numel() != total or dst_addresses.numel() != num_layers:
-        raise ValueError("source/destination table sizes must match")
-    if compact is None:
-        if (
-            src_row_strides is None
-            or src_row_strides.dtype != torch.int64
-            or src_row_strides.numel() != num_layers
-        ):
-            raise ValueError("row stride tables must be int64 with one entry per layer")
-        if row_bytes <= 0 or row_bytes % 4:
-            raise ValueError("row_bytes must be positive and divisible by 4")
-        scratch, verify_width, state = None, 0, 0
-        row_elements, block_elements = row_bytes // 4, 1024
-    else:
-        scratch, verify_width = compact
-        channels, state = scratch.shape[1:]
-        row_elements, block_elements = channels * state, 256
-        if not row_elements:
-            return
-        if (
-            not scratch.is_cuda
-            or not scratch.is_contiguous()
-            or src_row_strides is not None
-            or verify_width < 0
-            or row_bytes != row_elements * scratch.element_size()
-        ):
-            raise ValueError(
-                "compact copies require dense CUDA state scratch and matching row_bytes"
-            )
+    if row_bytes <= 0 or row_bytes % 4:
+        raise ValueError("row_bytes must be positive and divisible by 4")
 
+    enable_pdl = pdl_enabled()
+    row_elements, block_elements = row_bytes // 4, 1024
     chunks = triton.cdiv(row_elements, block_elements)
     # Ascend flattens the logical Triton grid into coreDim. Keep a conservative
     # 65535-program cap and split only grids that exceed it.
@@ -850,14 +841,84 @@ def copy_state_rows(
             dst_rows,
             total // num_layers,
             start,
-            scratch,
-            verify_width,
+            None,
+            0,
             ROW_ELEMENTS=row_elements,
             BLOCK_ELEMENTS=block_elements,
-            COMPACT_STATE=state,
+            COMPACT_STATE=0,
             ENABLE_PDL=enable_pdl,
             **({"launch_pdl": True} if enable_pdl else {}),
         )
+
+
+def copy_state_rows_compact(
+    src_addresses: torch.Tensor,
+    dst_addresses: torch.Tensor,
+    src_rows: torch.Tensor,
+    dst_rows: torch.Tensor,
+    *,
+    row_bytes: int,
+    dst_row_strides: torch.Tensor,
+    scratch: torch.Tensor,
+    verify_width: int,
+) -> None:
+    """Reconstruct accepted state windows from compact verify scratch.
+
+    Args:
+        src_addresses: CUDA uint64 base address of each layer's scratch slab.
+        dst_addresses: CUDA uint64 base address of each layer's state slab.
+        src_rows: Layer-major int32 or int64 row IDs encoded as
+            ``request * (verify_width + 1) + accepted_count``. Negative IDs
+            zero-fill the destination.
+        dst_rows: Layer-major int32 or int64 destination row IDs. Negative IDs
+            skip the write.
+        row_bytes: Byte width of one destination state window.
+        dst_row_strides: Int64 destination stride per layer in state elements.
+        scratch: A dense CUDA scratch slab defining the common
+            ``[rows, channels, state]`` geometry and dtype. Each request stores
+            its carried window followed by one channel vector per candidate.
+        verify_width: Number of candidates per request in the scratch layout.
+
+    Returns:
+        None. The reconstructed windows are written in place.
+    """
+    total, num_layers = _state_row_copy_geometry(
+        src_addresses, dst_addresses, src_rows, dst_rows, dst_row_strides
+    )
+    if total == 0:
+        return
+    channels, state = scratch.shape[1:]
+    row_elements = channels * state
+    if row_elements == 0:
+        return
+    if (
+        not scratch.is_cuda
+        or not scratch.is_contiguous()
+        or verify_width < 0
+        or row_bytes != row_elements * scratch.element_size()
+    ):
+        raise ValueError(
+            "compact copies require dense CUDA state scratch and matching row_bytes"
+        )
+    enable_pdl = pdl_enabled()
+    block_elements = 256
+    _copy_state_rows_kernel[(total, triton.cdiv(row_elements, block_elements))](
+        src_addresses,
+        dst_addresses,
+        None,
+        dst_row_strides,
+        src_rows,
+        dst_rows,
+        total // num_layers,
+        0,
+        scratch,
+        verify_width,
+        ROW_ELEMENTS=row_elements,
+        BLOCK_ELEMENTS=block_elements,
+        COMPACT_STATE=state,
+        ENABLE_PDL=enable_pdl,
+        **({"launch_pdl": True} if enable_pdl else {}),
+    )
 
 
 @triton.jit(

@@ -743,7 +743,7 @@ def test_delta_layer_verify_equals_decode_steps(requests, chain, with_ple):
                 assert torch.equal(context_windows[row], context[first + 1 + step])
 
     if with_ple:
-        from tokenspeed_kernel.ops.kvcache.triton import copy_state_rows
+        from tokenspeed_kernel.ops.kvcache.triton import copy_state_rows_compact
 
         restored = torch.empty(requests, WIDTH, 9, dtype=torch.bfloat16, device=dev)
         request_ids = torch.arange(requests, device=dev, dtype=torch.int64)
@@ -757,15 +757,15 @@ def test_delta_layer_verify_equals_decode_steps(requests, chain, with_ple):
         strides = torch.tensor([restored.stride(0)], device=dev, dtype=torch.int64)
         for accepted in range(chain + 1):
             accepted_counts = (request_ids + accepted) % (chain + 1)
-            copy_state_rows(
+            copy_state_rows_compact(
                 source_addresses,
                 destination_addresses,
                 source_base + accepted_counts,
                 request_ids,
                 row_bytes=restored[0].numel() * restored.element_size(),
-                src_row_strides=None,
                 dst_row_strides=strides,
-                compact=(ple_windows, chain),
+                scratch=ple_windows,
+                verify_width=chain,
             )
             assert torch.equal(restored, ple_state[base + accepted_counts])
 

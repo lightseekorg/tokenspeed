@@ -38,6 +38,23 @@ def ple_staged_gather():
 def validate_ple_hot_cache_geometry(
     heads: int, head_dim: int, vocab_start: int, vocab_end: int
 ) -> None:
+    """Validate the PLE hot cache geometry before the first gather.
+
+    Cache construction uses the same checks as the ``ple_gather_staged`` launcher.
+
+    Args:
+        heads: Number of n-gram heads. Must be 16.
+        head_dim: Number of elements per head. Must be 160 or 512.
+        vocab_start: Inclusive first ID of the local shard. Must be nonnegative.
+        vocab_end: Exclusive end of the local shard. The span must be positive
+            and fit in a signed int32.
+
+    Returns:
+        None if the geometry is supported.
+
+    Raises:
+        RuntimeError: If the geometry is unsupported.
+    """
     _load_module().ple_validate_hot_cache_geometry(
         heads, head_dim, vocab_start, vocab_end
     )

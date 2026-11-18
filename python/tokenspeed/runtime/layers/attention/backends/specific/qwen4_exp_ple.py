@@ -33,6 +33,7 @@ from tokenspeed_kernel.ops.attention.kda.triton import (
 )
 from tokenspeed_kernel.ops.kvcache.triton import (
     copy_state_rows,
+    copy_state_rows_compact,
     state_verify_commit_rows,
 )
 
@@ -480,14 +481,27 @@ class Qwen4ExpPLEBackend(AttentionBackend):
                 src_row_strides=tables["context_src_stride"],
                 dst_row_strides=tables["context_dst_stride"],
             )
-        copy_state_rows(
-            tables["conv_src"],
-            tables["conv_dst"],
-            src_rows,
-            dst_rows,
-            row_bytes=tables["conv_row_bytes"],
-            src_row_strides=tables["conv_src_stride"],
-            dst_row_strides=tables["conv_dst_stride"],
-            compact=tables["conv_compact"],
-        )
+        compact = tables["conv_compact"]
+        if compact is None:
+            copy_state_rows(
+                tables["conv_src"],
+                tables["conv_dst"],
+                src_rows,
+                dst_rows,
+                row_bytes=tables["conv_row_bytes"],
+                src_row_strides=tables["conv_src_stride"],
+                dst_row_strides=tables["conv_dst_stride"],
+            )
+        else:
+            scratch, verify_width = compact
+            copy_state_rows_compact(
+                tables["conv_src"],
+                tables["conv_dst"],
+                src_rows,
+                dst_rows,
+                row_bytes=tables["conv_row_bytes"],
+                dst_row_strides=tables["conv_dst_stride"],
+                scratch=scratch,
+                verify_width=verify_width,
+            )
         self._verify_commit_ctx = None
