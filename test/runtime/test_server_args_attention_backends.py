@@ -56,6 +56,20 @@ class TestAttentionBackendChoices:
                 return action
         raise AssertionError(f"no action with dest={dest!r}")
 
+    @pytest.mark.parametrize(
+        ("flags", "enabled"),
+        [
+            ([], True),
+            (["--qwen4-exp-flat-kv"], True),
+            (["--no-qwen4-exp-flat-kv"], False),
+            (["--qwen4-exp-flat-kv", "--no-qwen4-exp-flat-kv"], False),
+            (["--no-qwen4-exp-flat-kv", "--qwen4-exp-flat-kv"], True),
+        ],
+    )
+    def test_qwen4_exp_flat_kv_default_and_overrides(self, flags, enabled):
+        args = prepare_server_args(["--model", "x", *flags])
+        assert args.qwen4_exp_flat_kv is enabled
+
     def test_attention_backend_accepts_trtllm_mla(self):
         args = self._build_parser().parse_args(
             ["--model", "x", "--attention-backend", "trtllm_mla"]
