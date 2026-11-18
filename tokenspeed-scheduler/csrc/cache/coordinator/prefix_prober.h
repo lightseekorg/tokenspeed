@@ -100,9 +100,8 @@ public:
     // and `host` its Host part; otherwise `device` is left alone and
     // host.num_common_tokens is 0. Either way host.kv_tokens is the longest
     // boundary whose KV the two tiers hold together when the Host holds part of
-    // it -- the KV reach the Host adds past the Device's own; with a State group
-    // in match_order, at least the closed groups' Host run past the Device's
-    // coverage, rounded down to the checkpoint grid -- and 0 otherwise.
+    // it -- the KV reach the Host adds past the Device's own -- and 0
+    // otherwise.
     void ProbeHostSuffix(const PromptPrefix& prompt, std::span<const std::vector<CacheKey>> group_keys,
                          std::span<const std::size_t> match_order, std::int32_t above_tokens,
                          const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits, PrefixProbe::Tier& device,
@@ -120,8 +119,7 @@ public:
 
 private:
     std::vector<std::vector<CacheKey>> buildGroupKeys(std::span<const std::string> content_hashes) const;
-    // Whether match_order has a State group: only then does the junction reach
-    // the closed groups' coverage past a missing window (ProbeTier).
+    // Whether match_order has a State group, which a junction past a missing window needs.
     bool probesStateGroup(std::span<const std::size_t> match_order) const;
     // Aligned matching over token-spanned groups; no State checkpoint hits.
     // extra_hits counts additional assumed hits beside the tier's entries.

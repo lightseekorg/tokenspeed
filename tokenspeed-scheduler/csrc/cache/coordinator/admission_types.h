@@ -75,17 +75,12 @@ struct PrefixProbe {
         std::int32_t num_common_tokens{0};
         // The full pages below it: num_common_tokens less the tail.
         std::int32_t full_page_tokens{0};
-        // The KV reach before the State groups or a sliding window
-        // shortened the hit: the junction a chunk may be cut at so the
-        // next prompt resumes there. When the probe has a State group, at
-        // least the prefix-closed groups' coverage rounded down to the
-        // checkpoint grid: a sliding window missing there is written by
-        // the chunk cut at the junction, which publishes it with the
-        // checkpoint. Without one (a sliding-only model, the D role's
-        // history probe) the longest boundary every token-spanned group
-        // accepts. On the Host tier, the KV reach of the Device's prefix
-        // plus a Host suffix when the Host holds part of that KV, else 0;
-        // the junction takes the larger of the two tiers'.
+        // The KV groups' own boundary before the State groups shortened
+        // it: the junction a chunk may be cut at so the next prompt
+        // resumes there. On the Host tier, the KV reach of the Device's
+        // prefix plus a Host suffix when the Host holds part of that KV,
+        // else 0; the junction takes the larger of the two tiers'.
+        // With a State group in the probe, at least the closed groups' coverage on the checkpoint grid.
         std::int32_t kv_tokens{0};
         // Device prefix-closed coverage before windows or State shorten
         // the hit. Reused only within this probe and its storage queries.
@@ -130,10 +125,9 @@ struct CopyInPoint {
 struct AdmissionResult {
     std::int32_t device_prefix_tokens{0};
     std::int32_t host_prefix_tokens{0};
-    // The KV reach (PrefixProbe::Tier::kv_tokens) when it exceeds the
-    // admitted boundary (a State group had no checkpoint there, or a
-    // sliding window was missing): the junction a later chunk is cut at so
-    // its natural checkpoint lands where the KV is already cached.
+    // The KV groups' boundary when it exceeds the admitted one (a State
+    // group had no checkpoint there): the junction a later chunk is cut
+    // at so its natural checkpoint lands where the KV is already cached.
     std::int32_t junction_tokens{0};
     // The D role: every State group's prompt-end checkpoint was claimed,
     // so the peer omits the state transfer.

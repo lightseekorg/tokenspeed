@@ -4992,10 +4992,7 @@ TEST_F(JunctionCutSuite, CutsTheFirstChunkAtTheJunctionAndPublishesTheCheckpoint
     FAIL() << "third was never scheduled";
 }
 
-// The same hybrid model with a sliding-window group: the seed's window behind
-// token 6 slid out mid-chunk and was never cached, so only the full-history
-// coverage reaches 6. The junction still lies there: the chunk cut at it
-// writes its own window and publishes it with the checkpoint.
+// With a sliding-window group whose window at the junction was never cached, the cut there writes and publishes it.
 class JunctionCutSlidingSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
@@ -5085,8 +5082,7 @@ protected:
     }
 };
 
-// The seed on Host alone: the Host's full-history run reaches 6 but holds no
-// window there, so `first` resumes at 0 and its first chunk is still cut at 6.
+// The seed on the Host alone: its full-history run reaches 6 without a window, so `first` still cuts at 6.
 TEST_F(JunctionCutSlidingHostSuite, HostOnlyFullHistoryCutsTheFirstChunkWhenTheWindowThereIsGone) {
     RequestSpec seed = MakeRequestSpec("seed", /*num_pages=*/6);
     Submit(seed);
@@ -5142,18 +5138,14 @@ TEST_F(JunctionCutSlidingHostSuite, HostOnlyFullHistoryCutsTheFirstChunkWhenTheW
     FAIL() << "third was never scheduled";
 }
 
-// Where the junction may reach past a missing window. A seed prompt is
-// prefilled in chunks of 8 (its windows are cached only where a chunk ends:
-// 8 and the prompt end), then `first` diverges from it at `diverge`, then
-// `third` diverges from the seed at the same token.
+// A seed prefilled in chunks of 8 (windows cached only at 8 and its end), then `first` and `third` diverging from it.
 class JunctionReachSuite : public SchedulerTestSuite {
 protected:
     virtual bool WithState() const { return true; }
     virtual std::int32_t Window() const { return 2; }
     virtual std::int32_t Grain() const { return 1; }
     virtual Role ServingRole() const { return Role::kFused; }
-    // The seed on the Host alone: L2 on (write-through), and Run clears the
-    // Device cache once the seed finishes.
+    // The seed on the Host alone: L2 write-through on, and Run clears the Device cache after the seed.
     virtual bool HostOnlySeed() const { return false; }
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg{};
@@ -5261,10 +5253,7 @@ protected:
     using Chunks = std::vector<std::pair<std::int32_t, std::int32_t>>;
 };
 
-// A sliding-only model has no State checkpoint for a junction to publish: the
-// reach stays the boundary every token-spanned group accepts, so nothing is
-// cut where the window is missing (first's first chunk runs whole to 8) and
-// no KV counts as unresumable.
+// A sliding-only model has no checkpoint to publish, so no junction reaches past the missing window.
 class JunctionReachSlidingOnlySuite : public JunctionReachSuite {
 protected:
     bool WithState() const override { return false; }
@@ -5277,8 +5266,7 @@ TEST_F(JunctionReachSlidingOnlySuite, AMissingWindowCutsNothingWithoutAStateGrou
     EXPECT_EQ(out.unresumable_kv, 0u);
 }
 
-// A window wider than a page: first resumes at the seed's chunk end 8 and runs
-// to its prompt end in one chunk -- no extra round to cut at the coverage 10.
+// A window wider than a page: first resumes at the seed's chunk end 8 and needs no extra cut at 10.
 class JunctionReachSlidingOnlyWideSuite : public JunctionReachSlidingOnlySuite {
 protected:
     std::int32_t Window() const override { return 4; }
@@ -5291,9 +5279,7 @@ TEST_F(JunctionReachSlidingOnlyWideSuite, AWideWindowAddsNoPrefillRoundWithoutAS
     EXPECT_EQ(out.unresumable_kv, 0u);
 }
 
-// A restricted State group (checkpoints on multiples of G = 4): the coverage
-// 10 is off the grid, where no checkpoint can ever be published or resumed
-// at, so the junction stays on the grid at 8 and third resumes there.
+// A restricted State group (G = 4): the coverage 10 is off the grid, so the junction stays at 8.
 class JunctionReachRestrictedSuite : public JunctionReachSuite {
 protected:
     std::int32_t Grain() const override { return 4; }
@@ -5306,8 +5292,7 @@ TEST_F(JunctionReachRestrictedSuite, TheJunctionStaysOnTheCheckpointGrid) {
     EXPECT_EQ(out.unresumable_kv, 8u);
 }
 
-// The same on the Host: the seed on the Host alone, its full-history run
-// reaches 10, off the G = 4 grid, so the Host's reach stays at 8 too.
+// The same with the seed on the Host alone: the Host's reach stays on the grid at 8 too.
 class JunctionReachRestrictedHostSuite : public JunctionReachRestrictedSuite {
 protected:
     bool HostOnlySeed() const override { return true; }
@@ -5319,8 +5304,7 @@ TEST_F(JunctionReachRestrictedHostSuite, TheHostReachStaysOnTheCheckpointGrid) {
     EXPECT_EQ(out.unresumable_kv, 8u);
 }
 
-// A sliding-only model with the seed on the Host alone: the Host's
-// full-history run past a missing window makes no junction either.
+// A sliding-only model with the seed on the Host alone makes no junction past a missing window either.
 class JunctionReachSlidingOnlyHostSuite : public JunctionReachSlidingOnlySuite {
 protected:
     bool HostOnlySeed() const override { return true; }
@@ -5333,9 +5317,7 @@ TEST_F(JunctionReachSlidingOnlyHostSuite, AHostMissingWindowCutsNothingWithoutAS
     EXPECT_EQ(out.unresumable_kv, 0u);
 }
 
-// The D role's probe leaves the State groups out (its prompt arrives by
-// transfer), so a missing window there makes no junction either: a prompt
-// diverging inside the seed counts no unresumable KV.
+// The D role's probe leaves the State groups out, so a missing window makes no junction there either.
 class JunctionReachDecodeRoleSuite : public JunctionReachSuite {
 protected:
     Role ServingRole() const override { return Role::kD; }
