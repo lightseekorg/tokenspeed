@@ -73,6 +73,7 @@ def _specs(*, num_host_pages: int, num_snapshot_pages: int, max_retracted: int):
     return SimpleNamespace(
         cache_geometry=SimpleNamespace(num_device_pages=64, prefix_granularity=16),
         cache_groups=[],
+        cache_storage={},
         host_group_packing=(),
         num_host_pages=num_host_pages,
         num_snapshot_pages=num_snapshot_pages,
@@ -1181,3 +1182,16 @@ def test_server_args_refuse_a_draft_revision_nothing_uses(draft, error):
             speculative_draft_model_revision="v2",
             **draft,
         )
+
+
+@pytest.mark.parametrize(
+    "explicit,workspace,expected",
+    [(None, 512, 32), (1024, 512, 32), (256, 512, 16), (None, 0, 0)],
+)
+def test_prefill_page_budget_respects_reserved_workspace(explicit, workspace, expected):
+    args = ServerArgs(model="x", max_num_seqs=8, chunk_prefill_kv_size=explicit)
+    specs = _specs(num_host_pages=0, num_snapshot_pages=1, max_retracted=0)
+    specs.cache_storage["prefill_kv_capacity"] = workspace
+    cfg = _config(args, specs)
+    assert cfg.max_kv_page_num == expected
+    assert cfg.num_device_pages == specs.cache_geometry.num_device_pages

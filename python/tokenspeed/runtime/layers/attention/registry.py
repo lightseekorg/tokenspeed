@@ -209,6 +209,7 @@ def _cache_storage_report(
     configured_cache_bytes: int,
     pool,
     fixed_workspace_bytes: int = 0,
+    prefill_kv_capacity: int = 0,
 ) -> dict:
     """Describe cache storage from allocated tensors, not scheduler counts."""
     arena = pool.arena
@@ -243,6 +244,7 @@ def _cache_storage_report(
             f"{planned_peak_bytes} > {configured_cache_bytes}"
         )
     return {
+        "prefill_kv_capacity": prefill_kv_capacity,
         "configured_cache_bytes": int(configured_cache_bytes),
         "allocated_cache_bytes": allocated_cache_bytes,
         "planned_peak_cache_bytes": planned_peak_bytes,
@@ -1182,6 +1184,8 @@ def _prepare_fixed_workspaces(
     is_inkling: bool,
     qsa_bf16_scratch: QSABf16ScratchPlan | None,
     expected_bytes: int,
+    pool_options: object | None = None,
+    draft_pool_options: object | None = None,
 ) -> None:
     """Allocate the fixed workspaces the recipe reserved from the cache budget
     (``CacheRecipe.workspace_bytes``) and check the bytes agree.
@@ -1193,6 +1197,10 @@ def _prepare_fixed_workspaces(
     once and a query-context-parallel draft tree gathers into the same
     buffers (the draft's extend step follows the target's forward on the
     same stream), so the plan budgets one workspace.
+
+    Ascend prefill workspaces belong to each target/draft backend and are
+    reused by its layers. Their Torch-managed storage is included in this check
+    and in allocator statistics.
     """
     from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
         Qwen4ExpBackend,
@@ -1200,8 +1208,11 @@ def _prepare_fixed_workspaces(
     )
 
     width = int(server_args.speculative_num_draft_tokens or 1)
-    allocated = False
-    actual_bytes = 0
+    prefill_bytes = backend.preallocate_prefill_workspace(pool_options)
+    if draft_backend is not None:
+        prefill_bytes += draft_backend.preallocate_prefill_workspace(draft_pool_options)
+    allocated = bool(prefill_bytes)
+    actual_bytes = prefill_bytes
     if dsa_kvp_history_prefill(config):
         actual_bytes += backend.preallocate_history_gather_workspace(config.context_len)
         allocated = True
@@ -1669,12 +1680,17 @@ def create_attn_components(
             is_inkling=cache_family == "inkling",
             qsa_bf16_scratch=qsa_bf16_scratch,
             expected_bytes=fixed_workspace_bytes,
+            pool_options=target_spec.pool_options,
+            draft_pool_options=(
+                draft_view_spec.pool_options if draft_view_spec is not None else None
+            ),
         )
 
     cache_storage = _cache_storage_report(
         configured_cache_bytes=cache_budget_bytes,
         pool=pool,
         fixed_workspace_bytes=fixed_workspace_bytes,
+        prefill_kv_capacity=backend.prefill_kv_capacity,
     )
 
     return AttentionBuild(

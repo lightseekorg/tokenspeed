@@ -21,15 +21,48 @@
 """Prefill page staging preserves virtual-slot identity and causal endpoints."""
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.attention.ascend_qcp_prefill_workspace import (
+    AscendQCPPrefillWorkspaceLayout,
+)
 
-from tokenspeed.runtime.layers.attention.dcp.ascend import (
-    AscendPrefillOptions,
-    AscendPrefillPlan,
+from tokenspeed.runtime.layers.attention.ascend_qcp_prefill import (
+    AscendQCPPrefill,
 )
 from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
+
+
+def prepare_prefill(
+    metadata,
+    placement,
+    *,
+    degree,
+    rank,
+    page_size,
+    topk,
+    local_cache_pages,
+    options,
+    page_table_cpu=None,
+    query_partition=None
+):
+    prefill = AscendQCPPrefill(
+        layout=options,
+        page_size=page_size,
+        topk=topk,
+        runtime=SimpleNamespace(
+            degree=degree, rank=rank, local_rows=local_cache_pages * page_size
+        ),
+    )
+    prefill.prepare_batch_metadata(
+        metadata,
+        placement,
+        page_table_cpu=page_table_cpu,
+        query_partition=query_partition,
+    )
+    return prefill
 
 
 @dataclass
@@ -84,7 +117,7 @@ def test_request_pages_and_query_causal_spans(degree, granularity, extends, pref
     virtual_blocks = last_page // per_block + 1
     local_capacity = ((virtual_blocks - 2) // degree + 2) * per_block
     plans = [
-        AscendPrefillPlan.build(
+        prepare_prefill(
             metadata,
             CachePlacement(granularity, virtual_blocks, tuple(range(degree)), rank),
             degree=degree,
@@ -92,11 +125,21 @@ def test_request_pages_and_query_causal_spans(degree, granularity, extends, pref
             page_size=page,
             topk=2048,
             local_cache_pages=local_capacity,
-            options=AscendPrefillOptions(max(sum(extends), 1), page),
+            options=AscendQCPPrefillWorkspaceLayout(
+                current_capacity=max(sum(extends), 1),
+                null_rows=page,
+                history_capacity=sum(
+                    (length + page - 1) // page * page for length in lengths
+                ),
+                degree=1,
+                has_index=True,
+            ),
         )
         for rank in range(degree)
     ]
     global_pages = {0}
+    for plan in plans:
+        assert plan.key_row_count == int(plan.key_cu[-1])
     for request, length in enumerate(lengths):
         global_pages.update(table[request, : (length + page - 1) // page].tolist())
     caches = [{} for _ in range(degree)]
@@ -105,15 +148,15 @@ def test_request_pages_and_query_causal_spans(degree, granularity, extends, pref
         owner = (block - 1) % degree if block else 0
         physical = ((block - 1) // degree + 1) * per_block + subpage if block else 0
         caches[owner][physical] = torch.arange(page, dtype=torch.int64) + virtual * page
-    send_rows = -(-sum(extends) // (degree * page)) * page
-    gather_plan = plans[0].gather
-    history_rows = page + sum(gather_plan.row_counts)
+    current_rank_stride = -(-sum(extends) // (degree * page)) * page
+    history_rows = page + sum(plans[0].history_counts)
     gathered = torch.zeros(
-        (history_rows // page + degree * send_rows // page, page), dtype=torch.int64
+        (history_rows // page + degree * current_rank_stride // page, page),
+        dtype=torch.int64,
     )
     offset = page
     for rank, plan in enumerate(plans):
-        slots = plan.gather.send_slots.tolist()
+        slots = plan.history_slots.tolist()
         for local in slots:
             physical, lane = divmod(local, page)
             gathered.view(-1)[offset] = caches[rank][physical][lane]
@@ -128,7 +171,7 @@ def test_request_pages_and_query_causal_spans(degree, granularity, extends, pref
         )
     for owner, count in enumerate(plans[0].row_counts):
         start = sum(plans[0].row_counts[:owner])
-        target = history_rows + owner * send_rows
+        target = history_rows + owner * current_rank_stride
         gathered.view(-1)[target : target + count] = torch.tensor(
             current_values[start : start + count]
         )
@@ -176,7 +219,6 @@ def test_request_pages_and_query_causal_spans(degree, granularity, extends, pref
             and sum(extends[: request + 1]) > plan.row_start
             and count
         ]
-        assert plan.index_table.data_ptr() == plan.page_table.data_ptr()
         for request, qlen, klen in zip(active_requests, q_lens, k_lens):
             offset = sum(extends[:request])
             start = min(max(plan.row_start - offset, 0), extends[request])
@@ -190,7 +232,7 @@ def test_prefill_rejects_mismatched_request_lengths():
         torch.tensor([2, 3]), torch.tensor([0]), torch.ones(2, 1, dtype=torch.int32)
     )
     with pytest.raises(ValueError, match="request page-table"):
-        AscendPrefillPlan.build(
+        prepare_prefill(
             metadata,
             None,
             degree=1,
@@ -198,5 +240,11 @@ def test_prefill_rejects_mismatched_request_lengths():
             page_size=128,
             topk=2048,
             local_cache_pages=8,
-            options=AscendPrefillOptions(5, 128),
+            options=AscendQCPPrefillWorkspaceLayout(
+                current_capacity=5,
+                null_rows=128,
+                history_capacity=8192,
+                degree=1,
+                has_index=True,
+            ),
         )

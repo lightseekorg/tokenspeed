@@ -313,7 +313,13 @@ class AttnConfig:
                     raise ValueError(
                         "MLA DCP decode does not support non-causal block drafts"
                     )
-            elif softmax.is_dsa and softmax.backend_name in (None, "dsa"):
+            elif softmax.is_dsa and (
+                softmax.backend_name in (None, "dsa")
+                or torch.device(self.device).type == "npu"
+            ):
+                # Ascend plugins can select a numerical DSA backend over the
+                # same paged storage. The registry validates its capability
+                # after resolving the hybrid wrapper's concrete leaf.
                 device_type = torch.device(self.device).type
                 if device_type not in ("cuda", "npu"):
                     raise ValueError("DSA DCP decode requires CUDA or Ascend NPU")
