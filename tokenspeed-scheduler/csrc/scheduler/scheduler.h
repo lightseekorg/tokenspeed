@@ -35,9 +35,11 @@
 #include "cache/coordinator/cache_coordinator.h"
 #include "cache/core/block_pool.h"
 #include "cache/tier/transfer_manager.h"
+#include "cache/tier/peer_exports.h"
 #include "cache/tier/storage_manager.h"
 #include "fsm/forward_events.h"
 #include "fsm/pd_events.h"
+#include "fsm/peer_events.h"
 #include "resource/allocator/req_pool_allocator.h"
 #include "scheduler/checkpoint_lineage.h"
 #include "scheduler/execution_event.h"
@@ -178,6 +180,32 @@ public:
     };
     SharedPrefixPublication GetSharedPrefixPublication(std::span<const std::int32_t> tokens,
                                                        std::int32_t max_prefix_tokens) const;
+
+    // Peer prefix sharing (docs/rfcs/0004-peer-prefix-sharing.md).
+    //
+    // A reader's lookups since the last take; mirrored ranks produce the
+    // same, and the runtime sends one replica's.
+    std::vector<PeerLookupRequest> TakePeerLookups() { return std::exchange(peer_lookups_, {}); }
+    // A holder's answers: reads of the cache as it stands, which the runtime
+    // gives between rounds (PeerExports). What a message changes reaches
+    // every member as its event at the next round's head.
+    PeerAnswer AnswerPeerLookup(const cache::PeerLookup& lookup) const {
+        return PeerExports::AnswerLookup(coordinator_, lookup);
+    }
+    bool PeerPagesMatch(const cache::PeerLookup& lookup, std::int32_t num_tokens,
+                        std::span<const PeerPage> pages) const;
+    bool PeerLeaseHeld(const PeerLeaseId& lease) const { return peer_exports_ && peer_exports_->Held(lease); }
+    // Plans built so far: no cache entry leaves between two plans.
+    std::int64_t PlanCalls() const { return plan_calls_; }
+    struct PeerStats {
+        std::size_t leases{0};
+        std::size_t pinned_blocks{0};
+        std::size_t looking_requests{0};
+        std::size_t landing_requests{0};
+        std::uint64_t landed_tokens{0};
+        std::uint64_t failed_landings{0};
+    };
+    PeerStats GetPeerStats() const;
 
     // Lifecycle counters read the current FSM state; they do not schedule work.
     std::size_t BootstrappingSize() const;
@@ -339,6 +367,8 @@ private:
         // so the peer omits the state transfer (PrefillOperation::state_prefix_cached).
         bool state_prefix_cached{false};
         std::optional<fsm::SchedulePrefillFirstChunkEvent> event;
+        // A peer landing's destinations: every block it fills whole.
+        std::vector<PeerPage> peer_destinations;
     };
     // `yield_tokens`: what a chunk that cannot finish gives up for whole
     // prompts behind it (YieldingChunkBudget). `must_complete`: admit only a
@@ -346,10 +376,14 @@ private:
     // a chunk's forward; one that would not is skipped (no capacity failure),
     // and one whose in-forward checkpoint block does not fit fails for
     // capacity rather than ending at the checkpoint.
+    // peer_landing_tokens, when positive, is the end of a peer landing: the
+    // first chunk is [hit, end), filled from the holder instead of computed
+    // (fsm::PrefillSource::kPeer). Zero computes it, or on the D role lands
+    // the whole prompt from the PD peer.
     FirstChunkOutcome schedulePrefillFirstChunk(ExecutionPlan& plan, AdmissionFeedback& feedback, Request* request,
                                                 std::int32_t remaining, std::int32_t decode_input_tokens,
                                                 std::int64_t kv_token_limit, std::int32_t yield_tokens,
-                                                bool must_complete);
+                                                bool must_complete, std::int32_t peer_landing_tokens);
     std::optional<fsm::SchedulePrefillEvent> schedulePrefill(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                              Request* request, std::int32_t remaining,
                                                              std::int32_t reserve_num_tokens_in_next_schedule_event,
@@ -363,6 +397,8 @@ private:
     DecodeOperation applyEventAndBuildOperation(Request* request, fsm::ScheduleDecodeEvent event);
 
     AdmissionMatch matchPrefixAtAdmission(Request* request);
+    // The same probe, matching no further than max_probe_tokens.
+    AdmissionMatch matchPrefixAtAdmission(Request* request, std::int32_t max_probe_tokens);
     // Records an admission's fresh pages (to zero) and copies on the plan, a
     // copy from a block an earlier copy of the plan fills reading that copy's
     // source. Asserts that each copy destination is written once and never
@@ -474,6 +510,23 @@ private:
     // while a transfer may still touch its pages.
     void abortRequest(Request& request);
 
+    // A waiting prompt with a peer hint asks its holder, once; one past its
+    // wait gives the holder up.
+    void preparePeer(Request& request);
+    // The blocks a landing of [hit_tokens, end_tokens) fills whole in the
+    // request's tables: a token-spanned group's from the block holding
+    // hit_tokens through the one holding the end, a State group's live slot.
+    std::vector<PeerPage> peerLandingDestinations(std::span<const BlockTable> tables, std::int32_t hit_tokens,
+                                                  std::int32_t end_tokens) const;
+    // Takes a landing's destinations out of the admission's pages to zero;
+    // none may be a copy or load destination.
+    void excludeLandedPages(AdmissionResult& admission, std::span<const PeerPage> destinations) const;
+    void handleEvent(const cache::PeerTick& event);
+    void handleEvent(const cache::PeerLookup& event);
+    void handleEvent(const cache::PeerPin& event);
+    void handleEvent(const cache::PeerRelease& event);
+    void handleEvent(const cache::PeerLookupAnswered& event);
+    void handleEvent(const cache::PeerFetchDone& event);
     void handleEvent(const cache::StorageTick& event);
     void handleEvent(const cache::StorageDone& event);
     void handleEvent(const cache::StorageDetach& event);
@@ -709,6 +762,13 @@ private:
     bool prefillDeferralExhausted(std::span<Request* const> candidates) const;
     bool belowPrefillWatermark() const;
     bool prefillAllowed(const Request& request, const PlanBuild& build) const;
+    // Admits the waiting prompts whose holder answered with more than their
+    // local hit, each as a landing (fsm::PrefillSource::kPeer) that rides
+    // ExecutionPlan::peer_fetches beside the batch, taking no token budget
+    // and no batch row. One that did not fit keeps its hit, and no local
+    // admission takes it this round.
+    void schedulePeerLandings(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
+                              bool new_prompts_sealed);
     void scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                                   bool new_prompts_sealed, std::int32_t decode_reserve);
     void scheduleDecodeBatch(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates);
@@ -728,6 +788,14 @@ private:
     CacheCoordinator coordinator_;
     TierTransferManager tier_transfers_;
     std::unique_ptr<StorageTransferManager> storage_transfers_;
+    // Peer prefix sharing, when configured: the holder's leases, the peer
+    // clock, the reader's lease counter and what goes out to other replicas.
+    std::unique_ptr<PeerExports> peer_exports_;
+    std::int64_t peer_now_us_{0};
+    std::uint64_t next_peer_lease_{0};
+    std::vector<PeerLookupRequest> peer_lookups_;
+    std::uint64_t peer_landed_tokens_{0};
+    std::uint64_t peer_failed_landings_{0};
     std::int64_t storage_now_us_{0};
     std::uint64_t storage_wait_timeouts_{0};
     std::uint64_t storage_ready_expirations_{0};
@@ -775,18 +843,20 @@ private:
     // currently out (a BlockStored not yet followed by its BlockRemoved).
     // Residency itself is the coordinator's answer, never mirrored here.
     // Cache mutations and registrations only mark a boundary for reconcile;
-    // DrainKvEvents reconciles each marked boundary against its residency, so
-    // the order of evictions and publications inside one admission does not
-    // matter. After a drain, a descriptor exists exactly for the boundaries
-    // with any Device cached child, including State entries excluded from
-    // routing residency: their later mutations still need the descriptor.
+    // DrainKvEvents reconciles each marked boundary against its residency on
+    // the Device and on the Host, so the order of evictions and publications
+    // inside one admission does not matter. After a drain, a descriptor exists
+    // exactly for the boundaries with any Device cached child, including State
+    // entries excluded from routing residency, or any Host entry or pending
+    // Host store: their later mutations still need the descriptor.
     struct KvEventBoundary {
         KvEventDescriptorRef stored;
         // Position in the prefix chain (page index). Consumers resolve a
         // Stored event's parent_block_hash on receipt, so DrainKvEvents
         // orders each batch by depth rather than by mutation order.
         std::int32_t depth{0};
-        bool published{false};
+        // Out on each medium (KvEventMedium order).
+        std::array<bool, kNumKvEventMedia> published{};
         bool needs_reconcile{false};
     };
     std::unordered_map<CacheKey, KvEventBoundary, CacheKeyHash> kv_event_boundaries_;

@@ -67,7 +67,7 @@ pub use layout::{
     registration::{PrefillLayout, PrefillRoute},
     LayoutError,
 };
-pub use net::NetError;
+pub use net::{NetError, SendError, Sockets};
 pub use prefill::{Layerwise, PrefillConfig, PrefillOutbox, PrefillPeer};
 pub use status::TransferPoll;
 use ts_mooncake::{Engine, PageGrid};

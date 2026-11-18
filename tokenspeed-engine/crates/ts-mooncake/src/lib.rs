@@ -94,6 +94,9 @@ pub enum Error {
         /// The engine's status.
         status: c_int,
     },
+    /// The library lacks the one-sided READ entries.
+    #[error("{0} has no one-sided READ entry points")]
+    NoReads(PathBuf),
     /// A transfer failed or timed out.
     #[error("transfer to {target} failed ({status})")]
     Transfer {
@@ -137,6 +140,7 @@ type Write = unsafe extern "C" fn(
     *const u64,
     usize,
 ) -> c_int;
+type Read = Write;
 type WritePages = unsafe extern "C" fn(
     *mut c_void,
     *const c_char,
@@ -158,6 +162,10 @@ pub struct Library {
     unregister: Unregister,
     write: Write,
     write_pages: WritePages,
+    /// The one-sided READs, added after ABI version 1 without changing it:
+    /// absent from an older library.
+    read: Option<Read>,
+    read_pages: Option<WritePages>,
     /// Keeps the functions above mapped.
     _library: libloading::Library,
 }
@@ -196,6 +204,11 @@ impl Library {
                 write_pages: *library
                     .get(b"ts_mooncake_write_pages")
                     .map_err(load_error)?,
+                read: library.get::<Read>(b"ts_mooncake_read").ok().map(|f| *f),
+                read_pages: library
+                    .get::<WritePages>(b"ts_mooncake_read_pages")
+                    .ok()
+                    .map(|f| *f),
                 _library: library,
             }))
         }
@@ -204,6 +217,11 @@ impl Library {
     /// Where the library was loaded from.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Whether the library has the one-sided READ entries.
+    pub fn reads(&self) -> bool {
+        self.read.is_some() && self.read_pages.is_some()
     }
 }
 
@@ -350,6 +368,88 @@ impl Engine {
         // SAFETY: as in `write`; `fields` holds five values per field.
         let status = unsafe {
             (self.library.write_pages)(
+                self.raw.as_ptr(),
+                target_c.as_ptr(),
+                grid.src_pages.as_ptr(),
+                grid.dst_pages.as_ptr(),
+                grid.src_pages.len(),
+                fields.as_ptr(),
+                grid.fields.len(),
+                max_batch_size,
+            )
+        };
+        if status != 0 {
+            return Err(Error::Transfer {
+                target: target.to_owned(),
+                status,
+            });
+        }
+        Ok(())
+    }
+}
+
+impl Engine {
+    /// READ spans from the peer session `target` and wait: span i copies
+    /// `lengths[i]` bytes from the peer's `sources[i]` to local
+    /// `destinations[i]`.
+    pub fn read(
+        &self,
+        target: &str,
+        sources: &[u64],
+        destinations: &[u64],
+        lengths: &[u64],
+    ) -> Result<(), Error> {
+        let read = self
+            .library
+            .read
+            .ok_or_else(|| Error::NoReads(self.library.path.clone()))?;
+        if sources.len() != destinations.len() || sources.len() != lengths.len() {
+            return Err(Error::Shape("sources, destinations and lengths"));
+        }
+        let target_c = c_string(target, "target")?;
+        // SAFETY: the columns hold `sources.len()` entries each and outlive
+        // the call; the addresses are registered by the two engines.
+        let status = unsafe {
+            read(
+                self.raw.as_ptr(),
+                target_c.as_ptr(),
+                sources.as_ptr(),
+                destinations.as_ptr(),
+                lengths.as_ptr(),
+                sources.len(),
+            )
+        };
+        if status != 0 {
+            return Err(Error::Transfer {
+                target: target.to_owned(),
+                status,
+            });
+        }
+        Ok(())
+    }
+
+    /// READ a pages x fields grid from `target` and wait: span (f, i) copies
+    /// `fields[f][4]` bytes from the peer's `fields[f][0] + src_pages[i] *
+    /// fields[f][1]` to local `fields[f][2] + dst_pages[i] * fields[f][3]`
+    /// (see [`PageGrid`], whose source is the peer's here).
+    pub fn read_pages(
+        &self,
+        target: &str,
+        grid: &PageGrid,
+        max_batch_size: usize,
+    ) -> Result<(), Error> {
+        let read_pages = self
+            .library
+            .read_pages
+            .ok_or_else(|| Error::NoReads(self.library.path.clone()))?;
+        if grid.src_pages.len() != grid.dst_pages.len() {
+            return Err(Error::Shape("source and destination pages"));
+        }
+        let target_c = c_string(target, "target")?;
+        let fields: Vec<i64> = grid.fields.iter().flatten().copied().collect();
+        // SAFETY: as in `write_pages`; `fields` holds five values per field.
+        let status = unsafe {
+            read_pages(
                 self.raw.as_ptr(),
                 target_c.as_ptr(),
                 grid.src_pages.as_ptr(),

@@ -139,24 +139,8 @@ def _runtime_mixed_round(width, *, larger, all_fresh, first_prefix):
     return requests, queries, prefixes, lengths
 
 
-class _MixedCache:
-    """Storage only: routing and registered GPU attention stay real."""
-
-    def __init__(self, buffers):
-        self.buffers = buffers
-
-    def get_key_buffer(self, layer_id):
-        return self.buffers[layer_id][0]
-
-    def get_value_buffer(self, layer_id):
-        return self.buffers[layer_id][1]
-
-
 class _RuntimeMixedAttention:
     def __init__(self, width, *, device):
-        from tokenspeed.runtime.layers.attention.backends.paged.cache_group_geometry import (
-            CacheGroupGeometry,
-        )
         from tokenspeed.runtime.layers.attention.backends.paged.mha import (
             MHAAttnBackend,
         )
@@ -165,12 +149,57 @@ class _RuntimeMixedAttention:
         )
         from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
         from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
+        from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
+        from tokenspeed.runtime.layers.attention.kv_cache.mha import MHATokenToKVPool
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+            CacheFieldSpec,
+            pack,
+        )
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+            CacheGroupSpec,
+        )
         from tokenspeed.runtime.layers.paged_attention import PagedAttention
 
         self.width, self.device, self.bucket = width, device, 128
         self.groups = {"full": 16, "sliding": 8}
         self.leaves, self.layers, self.buffers = {}, {}, {}
         self.logical, self.tables = {}, {}
+        groups = tuple(
+            CacheGroupSpec(
+                gid,
+                "full_history" if gid == "full" else "sliding_window",
+                16,
+                1,
+                None if gid == "full" else 512,
+                replayable=False,
+            )
+            for gid in self.groups
+        )
+        layout = pack(
+            tuple(
+                (
+                    group,
+                    tuple(
+                        CacheFieldSpec(
+                            f"layer.{index}.{name}",
+                            f"layer.{index}.{name}",
+                            (16, KV_HEADS, HEAD_DIM),
+                            "bfloat16",
+                        )
+                        for name in ("k", "v")
+                    ),
+                )
+                for index, group in enumerate(groups)
+            ),
+            prefix_granularity=16,
+            cache_blocks_per_lcm_block={gid: 1 for gid in self.groups},
+            max_padding_fraction=float("inf"),
+        )
+        arena = CacheArena(layout.bind(192), device, cache_group_specs=groups)
+        arena.buffer.zero_()
+        self.cache = MHATokenToKVPool(
+            arena, torch.bfloat16, KV_HEADS, HEAD_DIM, len(groups), 0
+        )
         self.round = None
         self.q_cpu = None
         self.q = torch.empty(
@@ -210,32 +239,20 @@ class _RuntimeMixedAttention:
             )
             layer.bind_cache_group(gid)
             self.layers[gid] = layer
-            self.buffers[index] = tuple(
-                torch.zeros(
-                    193 * 16, KV_HEADS, HEAD_DIM, dtype=torch.bfloat16, device=device
-                )
-                for _ in range(2)
+            self.buffers[index] = (
+                self.cache.get_key_buffer(index),
+                self.cache.get_value_buffer(index),
             )
-        self.cache = _MixedCache(self.buffers)
         assert self.q.shape == (128, 12, 128)
         assert all(pair[0].shape[1:] == (2, 128) for pair in self.buffers.values())
         self.router = CacheGroupRouter(
-            None,
+            lambda gid, _grain: self.leaves[gid],
             is_draft=False,
             spec_num_tokens=width,
             device=device,
             consumed_group_ids=None,
         )
-        self.router.bind(
-            CacheGroupGeometry(
-                granularities={gid: 16 for gid in self.groups},
-                attn_kinds={"full": "full_history", "sliding": "sliding"},
-                full_history_group_id="full",
-                row_geometry={gid: (16, 1) for gid in self.groups},
-                windows={"full": None, "sliding": 512},
-            ),
-            self.leaves,
-        )
+        self.router.set_cache_pool(self.cache)
         self.router.init_cuda_graph_state(3, max_extend_tokens=self.bucket)
 
     def prepare(self, description, *, seed):

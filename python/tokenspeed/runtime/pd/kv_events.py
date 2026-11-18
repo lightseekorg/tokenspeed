@@ -57,15 +57,24 @@ class KVCacheEvent(
     """Base class for all KV cache-related events."""
 
 
+# ``medium`` is the memory an event concerns, as vLLM's events name it: None
+# for the GPU cache, ``"CPU_PINNED"`` for the pinned Host cache. ``lora_id``
+# keeps its place in the array before it and is always None.
+MEDIUM_HOST = "CPU_PINNED"
+
+
 class BlockStored(KVCacheEvent):
     block_hashes: list[int]
     parent_block_hash: int | None
     token_ids: list[int]
     block_size: int
+    lora_id: int | None = None
+    medium: str | None = None
 
 
 class BlockRemoved(KVCacheEvent):
     block_hashes: list[int]
+    medium: str | None = None
 
 
 class AllBlocksCleared(KVCacheEvent):
