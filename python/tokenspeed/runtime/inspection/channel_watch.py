@@ -98,6 +98,18 @@ class ChannelWatchEvent:
     contribution_limit: float
 
 
+@dataclass(frozen=True)
+class _LayerWatchState:
+    """Device-resident watch settings for one MLP layer."""
+
+    channels: tuple[int, ...]
+    width: int
+    dtype: torch.dtype
+    indices: torch.Tensor
+    limits: torch.Tensor
+    down_norms: torch.Tensor
+
+
 def _validate_execution_model(
     model: Qwen3ForCausalLM,
     *,
@@ -229,6 +241,66 @@ def _group_watchlist_entries(
     return by_layer
 
 
+def _build_layer_watch_state(
+    mlp: GatedMLP,
+    selected: Sequence[tuple[int, float]],
+    device: torch.device,
+) -> _LayerWatchState:
+    channels = tuple(channel for channel, _ in selected)
+    indices = torch.tensor(channels, dtype=torch.int64, device=device)
+    limits = torch.tensor(
+        [limit for _, limit in selected], dtype=torch.float32, device=device
+    )
+    down = mlp.down_proj.weight
+    with torch.no_grad():
+        down_norms = torch.linalg.vector_norm(
+            down.index_select(1, indices).float(), dim=0
+        )
+        if not bool(torch.isfinite(down_norms).all()):
+            raise ValueError("Watched down-projection norms must be finite")
+    return _LayerWatchState(
+        channels=channels,
+        width=down.shape[1],
+        dtype=down.dtype,
+        indices=indices,
+        limits=limits,
+        down_norms=down_norms,
+    )
+
+
+def _sample_layer_output(
+    output: torch.Tensor,
+    state: _LayerWatchState,
+    row_indices: torch.Tensor | None,
+    layer_id: int,
+) -> LayerChannelSample:
+    if row_indices is None:
+        activation = output.detach().index_select(1, state.indices)
+    else:
+        # Gather only watched rows and channels from the full MLP output.
+        activation = output.detach()[row_indices[:, None], state.indices[None, :]]
+    contribution = activation.float().abs() * state.down_norms
+    return LayerChannelSample(
+        layer=layer_id,
+        channels=state.channels,
+        activations=activation,
+        contribution_estimates=contribution,
+        contribution_limits=state.limits,
+        exceeds_limit=contribution > state.limits,
+    )
+
+
+def _copy_layer_sample(sample: LayerChannelSample) -> LayerChannelSample:
+    return LayerChannelSample(
+        layer=sample.layer,
+        channels=sample.channels,
+        activations=sample.activations.clone(),
+        contribution_estimates=sample.contribution_estimates.clone(),
+        contribution_limits=sample.contribution_limits.clone(),
+        exceeds_limit=sample.exceeds_limit.clone(),
+    )
+
+
 class ChannelWatch:
     """Record watched channels in one eager Qwen3 forward at a time.
 
@@ -269,36 +341,12 @@ class ChannelWatch:
         self._model = model
         self._model_identity = model_identity
         self._layer_ids = tuple(by_layer)
-        self._channels: dict[int, tuple[int, ...]] = {}
-        self._widths: dict[int, int] = {}
-        self._dtypes: dict[int, torch.dtype] = {}
-        self._indices: dict[int, torch.Tensor] = {}
-        self._limits: dict[int, torch.Tensor] = {}
-        self._down_norms: dict[int, torch.Tensor] = {}
+        self._layer_states: dict[int, _LayerWatchState] = {}
         for layer_id, selected in by_layer.items():
             mlp = layers[layer_id].mlp
-            indices = torch.tensor(
-                [channel for channel, _ in selected],
-                dtype=torch.int64,
-                device=self._device,
+            self._layer_states[layer_id] = _build_layer_watch_state(
+                mlp, selected, self._device
             )
-            down = mlp.down_proj.weight
-            self._channels[layer_id] = tuple(channel for channel, _ in selected)
-            self._widths[layer_id] = down.shape[1]
-            self._dtypes[layer_id] = down.dtype
-            self._indices[layer_id] = indices
-            self._limits[layer_id] = torch.tensor(
-                [limit for _, limit in selected],
-                dtype=torch.float32,
-                device=self._device,
-            )
-            with torch.no_grad():
-                down_norms = torch.linalg.vector_norm(
-                    down.index_select(1, indices).float(), dim=0
-                )
-                if not bool(torch.isfinite(down_norms).all()):
-                    raise ValueError("Watched down-projection norms must be finite")
-                self._down_norms[layer_id] = down_norms
 
         self._parameters = tuple(
             (name, parameter, parameter._version)
@@ -434,34 +482,20 @@ class ChannelWatch:
                 raise RuntimeError(
                     f"Expected one forward per record(), repeated layer {layer_id}"
                 )
+            state = self._layer_states[layer_id]
             if (
                 not isinstance(output, torch.Tensor)
                 or output.ndim != 2
                 or output.shape[0] != len(self._rows)
-                or output.shape[1] != self._widths[layer_id]
-                or output.dtype != self._dtypes[layer_id]
+                or output.shape[1] != state.width
+                or output.dtype != state.dtype
                 or output.device != self._device
             ):
                 raise ValueError(
                     "Watched MLP output does not match physical row mapping"
                 )
-            if self._row_indices is None:
-                activation = output.detach().index_select(1, self._indices[layer_id])
-            else:
-                # One sparse gather avoids a temporary copy of full hidden
-                # width for selected rows or all physical rows for channels.
-                activation = output.detach()[
-                    self._row_indices[:, None], self._indices[layer_id][None, :]
-                ]
-            contribution = activation.float().abs() * self._down_norms[layer_id]
-            exceeds = contribution > self._limits[layer_id]
-            self._samples[layer_id] = LayerChannelSample(
-                layer=layer_id,
-                channels=self._channels[layer_id],
-                activations=activation,
-                contribution_estimates=contribution,
-                contribution_limits=self._limits[layer_id],
-                exceeds_limit=exceeds,
+            self._samples[layer_id] = _sample_layer_output(
+                output, state, self._row_indices, layer_id
             )
 
         return hook
@@ -472,17 +506,7 @@ class ChannelWatch:
         if self._armed or not self._complete:
             raise RuntimeError("No completed channel record is available")
         samples = tuple(
-            LayerChannelSample(
-                layer=layer_id,
-                channels=self._samples[layer_id].channels,
-                activations=self._samples[layer_id].activations.clone(),
-                contribution_estimates=(
-                    self._samples[layer_id].contribution_estimates.clone()
-                ),
-                contribution_limits=self._samples[layer_id].contribution_limits.clone(),
-                exceeds_limit=self._samples[layer_id].exceeds_limit.clone(),
-            )
-            for layer_id in self._layer_ids
+            _copy_layer_sample(self._samples[layer_id]) for layer_id in self._layer_ids
         )
         return ChannelWatchSnapshot(
             model_identity=self._model_identity,
