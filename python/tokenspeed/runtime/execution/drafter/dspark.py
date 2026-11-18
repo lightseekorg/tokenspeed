@@ -41,6 +41,7 @@ from tokenspeed_kernel.ops.sampling.cute_dsl import (
 from tokenspeed_kernel.ops.sampling.triton import dspark_markov_shard_logits
 from typing_extensions import override
 
+from tokenspeed.runtime.distributed.comm_backend.registry import get_global_backend
 from tokenspeed.runtime.distributed.comm_ops import all_gather_single
 from tokenspeed.runtime.execution.drafter._dspark_walk import (
     dspark_walk_finish,
@@ -132,21 +133,17 @@ class DSpark(DFlash):
     ) -> torch.Tensor:
         """Semi-autoregressive proposal using the configured shared draft sampler."""
         next_tokens[:, 0] = block_ids[:, 0]
+        sampled = self.draft_sampler is not None
         # Only the bias follows the previous token; the projection does not.
-        block_logits = (
-            self._block_base_logits(draft_hidden)
-            if self.draft_sampler is None or self._samples_vocab_shard
-            else None
-        )
-        if self.draft_sampler is not None and block_logits is not None:
+        full_vocab = sampled and not self._samples_vocab_shard
+        block_logits = self._block_base_logits(draft_hidden, full_vocab=full_vocab)
+        if sampled and self._samples_vocab_shard:
             self._sampled_shard_walk(block_logits, next_tokens)
             return next_tokens
-        if block_logits is not None and self._fused_walk_fits(block_logits):
+        if not sampled and self._fused_walk_fits(block_logits):
             self._fused_greedy_walk(block_logits, next_tokens)
             return next_tokens
-        workspace = (
-            None if block_logits is None else self._resolve_markov_argmax(block_logits)
-        )
+        workspace = None if sampled else self._resolve_markov_argmax(block_logits)
         for k in range(1, self.spec_num_tokens):
             if workspace is not None:
                 # One launch: bias, add, and cross-rank argmax after token k - 1.
@@ -169,29 +166,10 @@ class DSpark(DFlash):
             # from a vocab-parallel argmax that can lose every shard. An
             # out-of-range id here indexes past the embedding table.
             bias_fn = self._make_step_bias_fn(next_tokens[:, k - 1])
-            if self.draft_sampler is not None:
-                # Full logits are necessary for the recorded proposal law.
-                # require_full_vocab gives this step private TP gather storage;
-                # successive Markov steps cannot alias a shared comm buffer.
-                metadata = LogitsMetadata(
-                    forward_mode=ForwardMode.DECODE, query_shard=None
-                )
-                logits = self.logits_processor._get_logits(
-                    draft_hidden[:, k - 1, :],
-                    self.lm_head,
-                    metadata,
-                    embedding_bias=None,
-                    plan=None,
-                    require_full_vocab=True,
-                )
+            if sampled:
+                logits = block_logits[k - 1]
                 logits = logits + bias_fn(0, logits.shape[-1]).to(logits.dtype)
                 next_tokens[:, k].copy_(self.draft_sampler.propose(logits, step=k - 1))
-            elif block_logits is None:
-                self._greedy_argmax_vocab_parallel(
-                    draft_hidden[:, k - 1, :],
-                    out=next_tokens[:, k],
-                    bias_fn=bias_fn,
-                )
             else:
                 self._greedy_argmax_vocab_parallel(
                     draft_hidden[:, k - 1, :],
@@ -241,6 +219,10 @@ class DSpark(DFlash):
         if torch.cuda.is_current_stream_capturing():
             return None  # allocation and compilation belong to warmup
         head = self.lm_head
+        if not hasattr(head, "shard_indices"):
+            # A replicated head has no distributed argmax to fuse into.
+            self._markov_argmax_resolved = True
+            return None
         state = self._ensure_dist_argmax_state(head.weight.dtype, head.weight.device)
         embedding = self.markov_head.markov_w1.weight
         projection = self.markov_head.markov_w2.weight
@@ -266,25 +248,37 @@ class DSpark(DFlash):
         self._markov_argmax_resolved = True
         return self._markov_argmax_workspace
 
-    def _block_base_logits(self, draft_hidden: torch.Tensor):
-        """Project every block position's hidden state in one GEMM.
+    def _block_base_logits(
+        self, draft_hidden: torch.Tensor, *, full_vocab: bool
+    ) -> torch.Tensor:
+        """Project the block once; each proposal step consumes its own slice.
 
-        Returns ``[positions, rows, org_vocab_shard]``, or None when the head
-        has no shard metadata and the caller must take its own path.
+        Args:
+            draft_hidden: ``[rows, positions, hidden]`` block hidden states.
+            full_vocab: Require gathered, scaled and softcapped logits for
+                sampling. Otherwise retain raw logits for a vocabulary shard;
+                replicated heads use their usual logits processing.
+
+        Returns:
+            ``[positions, rows, vocab]`` logits, with zero columns for an empty
+            local vocabulary shard. Projection errors propagate to the caller.
         """
         head = self.lm_head
-        if head is None:
-            return None
-        if not hasattr(head, "weight") or not hasattr(head, "shard_indices"):
-            return None
+        rows, positions, _ = draft_hidden.shape
+        flat = draft_hidden.reshape(rows * positions, -1)
+        if full_vocab or not hasattr(head, "shard_indices"):
+            # Full-vocabulary sampling keeps a private gather buffer across steps.
+            metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None)
+            logits = self.logits_processor._get_logits(
+                flat,
+                head,
+                metadata,
+                require_full_vocab=full_vocab,
+            )
+            return logits.view(rows, positions, logits.shape[-1]).transpose(0, 1)
         num_org = int(head.shard_indices.num_org_elements)
-        if num_org <= 0:
-            return None
-        positions = int(draft_hidden.shape[1])
-        rows = int(draft_hidden.shape[0])
         weight = head.weight
-        flat = draft_hidden.reshape(rows * positions, -1).to(weight.dtype)
-        logits = torch.matmul(flat, weight[:num_org].T)
+        logits = torch.matmul(flat.to(weight.dtype), weight[:num_org].T)
         # draft_hidden is [rows, positions, H]; the walk indexes by position.
         # The walk slices one position at a time; transpose alone would hand
         # each slice a positions-strided row layout, which the distributed
@@ -292,7 +286,7 @@ class DSpark(DFlash):
         return logits.view(rows, positions, num_org).transpose(0, 1).contiguous()
 
     def _fused_walk_fits(self, block_logits: torch.Tensor) -> bool:
-        """Whether the greedy walk can take one launch and one gather per round.
+        """Whether the greedy walk can take one launch and one exchange per round.
 
         Without a distributed argmax state the generic walk takes several
         launches and two all-gathers per round. A state, where the
@@ -303,6 +297,11 @@ class DSpark(DFlash):
         """
         markov = self.markov_head
         if not block_logits.is_cuda or not isinstance(markov, VanillaMarkov):
+            return False
+        # A replicated head (attention DP without LM-head TP) has no vocab
+        # shard to walk. Its layout is the same on every rank, so this test
+        # may precede the collective probe.
+        if not hasattr(self.lm_head, "shard_indices"):
             return False
         # The probe is collective, so no rank-local test may come before it.
         if (
@@ -362,7 +361,11 @@ class DSpark(DFlash):
         words, gathered = self._ensure_walk_buffers(block_logits.device)
         words = words[:, :rows]
         words.zero_()
+        group = self.logits_processor.tp_group
+        backend = get_global_backend()
         previous = None
+        # Words the next launch decodes: one per row once reduced with MAX.
+        previous_words = 1
         for k in range(1, rounds + 1):
             word = words[k - 1]
             dspark_walk_round(
@@ -374,14 +377,14 @@ class DSpark(DFlash):
                 previous,
                 column=k,
                 vocab_start=start,
-                tp=tp,
+                tp=previous_words,
             )
-            if tp == 1:
-                previous = word
+            if tp == 1 or backend.try_word_max(word, group):
+                previous, previous_words = word, 1
             else:
-                previous = gathered[k - 1, : tp * rows]
-                all_gather_single(previous, word, self.logits_processor.tp_group)
-        dspark_walk_finish(next_tokens, previous, column=rounds, tp=tp)
+                previous, previous_words = gathered[k - 1, : tp * rows], tp
+                all_gather_single(previous, word, group)
+        dspark_walk_finish(next_tokens, previous, column=rounds, tp=previous_words)
 
     def _make_step_bias_fn(self, prev_tokens: torch.Tensor):
         """Build the per-position additive-bias hook for the Markov head.
