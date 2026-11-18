@@ -141,6 +141,7 @@ def _make_moe(fork: _SpyFork, *, num_tokens: int) -> SimpleNamespace:
         # None keeps this on the separate per-module projections, which is the
         # composition whose fork structure these tests pin.
         _latent_input_projections=lambda hs, shared_out=None, **kwargs: None,
+        _routed_latent_inputs=lambda *args, **kwargs: None,
         packed_input_projection_weight=None,
         shared_experts=lambda hs, down_out=None: hs,
         routed_expert_down_proj=lambda hs: (hs, None),

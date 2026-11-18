@@ -159,9 +159,9 @@ AdmissionResult CacheCoordinator::commitAdmission(AdmissionPlan&& plan, std::spa
     SessionAccess session_access;
     if (!request_access_epoch) {
         if (!cache_group_id.empty()) {
-            session_access = SessionAccess{sessions_, access_epoch, sessions_.CacheGroupOwner(cache_group_id)};
+            session_access = SessionAccess{sessions_, access_epoch, sessions_.AcquireCacheGroupOwner(cache_group_id)};
         } else if (!session_id.empty()) {
-            session_access = SessionAccess{sessions_, access_epoch, sessions_.SessionOwner(session_id)};
+            session_access = SessionAccess{sessions_, access_epoch, sessions_.AcquireSessionOwner(session_id)};
         }
     }
     // The boundaries inside a block, per tier: the hitter's table ends in a
@@ -305,7 +305,7 @@ AdmissionResult CacheCoordinator::commitAdmission(AdmissionPlan&& plan, std::spa
         if (progress.num_computed_tokens) {
             store_.Groups()[i].Allocator().ReclaimExpired(
                 store_.DevicePool(), table,
-                store_.Geometry()[i].ExpiredBlocksAt(store_.Groups()[i].Spec(), *progress.num_computed_tokens));
+                store_.Geometry()[i].ExpiredBlockEndAt(store_.Groups()[i].Spec(), *progress.num_computed_tokens));
         }
     }
     if (progress.completed_pages) {
@@ -537,7 +537,7 @@ std::optional<AdmissionResult> CacheCoordinator::restore(const RetractionImage& 
     for (const bool claim : {true, false}) {
         claim_cached_slots = claim;
         std::vector<PlannedShape> shapes(store_.Groups().size());
-        std::vector<std::pair<std::uint32_t, CacheBlockLocation>> protected_locations;
+        std::vector<std::pair<std::uint32_t, CacheBlockLocation>> planned_claim_locations;
         for (std::size_t i = 0; i < store_.Groups().size(); ++i) {
             _assert(demands[i].table != nullptr && demands[i].table->NumBlocks() == 0,
                     "a restore rebuilds into an empty table");
@@ -553,7 +553,7 @@ std::optional<AdmissionResult> CacheCoordinator::restore(const RetractionImage& 
                                                     ? store_.Groups()[i].Index().Find(store_.DevicePool(), slot.key)
                                                     : CacheBlockRef{};
                 if (canonical) {
-                    protected_locations.emplace_back(store_.Groups()[i].Id(), canonical->Location());
+                    planned_claim_locations.emplace_back(store_.Groups()[i].Id(), canonical->Location());
                     continue;
                 }
                 ++shapes[i].blocks_by_bucket[static_cast<std::size_t>(allocator.BucketOf(slot.block->Location()))];
@@ -563,8 +563,8 @@ std::optional<AdmissionResult> CacheCoordinator::restore(const RetractionImage& 
             planAdmission(store_, history_.CheckpointAgingFor(CacheTier::kDevice), prober_.ProbePrefix({}), demands,
                           /*num_computed_tokens=*/std::nullopt,
                           copy_in_point ? std::optional<std::int32_t>{copy_in_point->tokens} : std::nullopt, shapes,
-                          protected_locations, write_back_evictions_);
-        if (candidate || protected_locations.empty() || !plan_without_claims_if_unfit) {
+                          planned_claim_locations, write_back_evictions_);
+        if (candidate || planned_claim_locations.empty() || !plan_without_claims_if_unfit) {
             break;
         }
     }
@@ -587,7 +587,7 @@ std::optional<AdmissionResult> CacheCoordinator::restore(const RetractionImage& 
             // The planner protected this entry; claim it like a prefix hit.
             const std::array<CacheKey, 1> keys{slot.key};
             PrefixMatch hit = store_.Groups()[i].Index().AcquireMatched(
-                store_.DevicePool(), keys, /*begin_blocks=*/0, GroupPrefixProbe{.hits = {1}}, request_access_epoch,
+                store_.DevicePool(), keys, /*begin_block=*/0, GroupPrefixProbe{.hits = {1}}, request_access_epoch,
                 SessionForAccess(request_access_epoch));
             claimed[i][j] = std::move(hit.blocks.front());
         }

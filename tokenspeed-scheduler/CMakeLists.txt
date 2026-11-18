@@ -182,6 +182,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_req_pool_allocator.cpp
         tests/cpp/test_capacity_model.cpp
         tests/cpp/test_shadow_occupancy.cpp
+        tests/cpp/test_cache_data_flow.cpp
         tests/cpp/test_flat_hash_map.cpp
         tests/cpp/test_closed_loop_random.cpp
         tests/cpp/test_lone_request_compaction.cpp

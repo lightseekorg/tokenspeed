@@ -93,7 +93,7 @@ private:
     const CacheStore& store_;
     const PrefixProber& prober_;
     HostCache& host_;
-    bool enabled_{false};
+    const bool enabled_;
 };
 
 }  // namespace tokenspeed

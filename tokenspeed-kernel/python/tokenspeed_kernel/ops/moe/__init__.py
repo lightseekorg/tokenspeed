@@ -2239,6 +2239,9 @@ def moe_plan(
     supports_prequantized_input = True in apply_spec.traits.get(
         "supports_prequantized_input", frozenset({False})
     )
+    supports_fp8_per_tensor_input = True in apply_spec.traits.get(
+        "supports_fp8_per_tensor_input", frozenset({False})
+    )
     sorted_route_rows = apply_spec.traits.get("sorted_route_rows", frozenset())
     sorted_route_block_sizes = apply_spec.traits.get(
         "sorted_route_block_size", frozenset()
@@ -2278,6 +2281,7 @@ def moe_plan(
         "supports_deferred_out": supports_deferred_out,
         "topk_weights_dtype": topk_weights_dtype,
         "supports_prequantized_input": supports_prequantized_input,
+        "supports_fp8_per_tensor_input": supports_fp8_per_tensor_input,
         "sorted_route_rows": sorted_route_rows,
         "sorted_route_block_size": next(iter(sorted_route_block_sizes), None),
         # All-to-all EP (DeepEP, Petit): each rank runs its own tokens'
