@@ -80,6 +80,7 @@ struct PrefixProbe {
         // resumes there. On the Host tier, the KV reach of the Device's
         // prefix plus a Host suffix when the Host holds part of that KV,
         // else 0; the junction takes the larger of the two tiers'.
+        // With a State group in the probe, at least the closed groups' coverage on the checkpoint grid.
         std::int32_t kv_tokens{0};
         // Device prefix-closed coverage before windows or State shorten
         // the hit. Reused only within this probe and its storage queries.
