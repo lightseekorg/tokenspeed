@@ -33,8 +33,6 @@ output order become deterministic).
 from __future__ import annotations
 
 import math
-from functools import wraps
-from inspect import signature
 
 import torch
 from tokenspeed_kernel.ops.tuning import untuned
@@ -42,7 +40,8 @@ from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
     current_platform,
-    pdl_enabled,
+    resolve_enable_pdl,
+    with_pdl_default,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
@@ -67,30 +66,8 @@ if platform.is_blackwell or platform.is_hopper:
     from flashinfer.utils import get_trtllm_gen_multi_ctas_kv_counter_bytes
 
 
-def _resolve_enable_pdl(enable_pdl: bool | None) -> bool:
-    return pdl_enabled() if enable_pdl is None else enable_pdl
-
-
-def _with_pdl_default(function):
-    enable_pdl_index = tuple(signature(function).parameters).index("enable_pdl")
-
-    @wraps(function)
-    def wrapper(*args, **kwargs):
-        if len(args) > enable_pdl_index:
-            args = (
-                *args[:enable_pdl_index],
-                _resolve_enable_pdl(args[enable_pdl_index]),
-                *args[enable_pdl_index + 1 :],
-            )
-        else:
-            kwargs["enable_pdl"] = _resolve_enable_pdl(kwargs.get("enable_pdl"))
-        return function(*args, **kwargs)
-
-    return wrapper
-
-
 if platform.is_nvidia and platform.is_hopper_plus:
-    trtllm_batch_decode_with_kv_cache_mla = _with_pdl_default(
+    trtllm_batch_decode_with_kv_cache_mla = with_pdl_default(
         _trtllm_batch_decode_with_kv_cache_mla
     )
 
@@ -355,7 +332,7 @@ def _flashinfer_trtllm_dsa_impl(
 
     # Resolved once: an LSE call runs several chunks, each paying wrapper host time.
     workspace = _get_dsa_sparse_workspace(q.device, lse=return_lse)
-    pdl = _resolve_enable_pdl(enable_pdl)
+    pdl = resolve_enable_pdl(enable_pdl)
 
     def run(start, stop, counter, kernel_out, lse_out):
         return trtllm_batch_decode_with_kv_cache_mla(

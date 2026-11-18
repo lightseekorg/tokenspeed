@@ -109,7 +109,7 @@ def test_bootstrap_preserves_gpu_spacing(monkeypatch):
     )
     host = HostBootstrap.__new__(HostBootstrap)
     with pytest.raises(FileNotFoundError, match="model weights unavailable"):
-        host.__init__(args, None, None, None, None, None)
+        host.__init__(args, None, None, None, None, None, peer_outbox=None)
     assert host._gpu_id == 3
 
 
