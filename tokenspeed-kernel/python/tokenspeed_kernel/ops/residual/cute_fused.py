@@ -230,25 +230,45 @@ def _capacity(compiled, kernel, device: torch.device, stream: CUstream):
     return _checked(cuda_driver.cuOccupancyMaxActiveClusters(function, config))
 
 
-# SM107 tiles for the 4 x 2560 / lowrank 320 dimensions by row count, each
-# replacing the generic tactic of its range: (first row, last row or None,
-# generic tactic, (split_k, M_proj, B_mma, stages)). Break points are where the
-# winner changes in a CUDA-graph microbenchmark (24 weight copies, cold L2):
-# - 65 to 192 rows: S8 with M64/N64 tiles, 9.9 to 10.0 us per call, against
-#   10.6 to 10.8 us for S4/N16 (65 to 96 rows) and 12.3 to 12.5 us for S4/N32
-#   (97 to 192 rows). It loses at 33 to 64 rows (8.7 to 8.9 against 8.3 to
-#   8.4 us) and past 192 rows (20.4 against 14.1 us).
-# - From 193 rows: S4 with M64/N64 tiles, 14.1 us against 17.4 us for the
-#   generic M128/N32 tactic and 14.1 to 16.1 us for the GEMM path. Larger
-#   exact-override batches keep these tiles and add scheduling rounds.
-# SM100/SM103 were not measured and keep the generic tactic. Up to 64 rows the
-# all-architecture S8/N32 rule in _model_tactic applies first, so the table
-# starts at 65 rows.
+# SM107 tiles for the 4 x 2560 / lowrank 320 dimensions past 64 rows (up to 64
+# the all-architecture S8/N32 rule in _model_tactic applies first). Each range
+# replaces its generic tactic: (first row, last row or None, generic tactic,
+# tiles when S8 does not fit one round, or None to keep the generic tactic).
+# CUDA-graph microbenchmark, 24 weight copies, cold L2, 212-SM part:
+# - S8 with M64/N64 tiles takes 9.9 to 10.3 us per call while all token tiles
+#   fit one resident round, against 12.2 to 12.5 us for the generic S4/N16 and
+#   S4/N32 tactics (65 to 192 rows) and 14.0 to 14.1 us for S4 M64/N64. A
+#   second round costs 20.4 us, so S8 is chosen only up to
+#   _one_round_rows: 192 rows with the 324 projection rows of a combining mixer
+#   (22 eight-CTA clusters over 6 projection clusters: 3 workers of 64 rows),
+#   256 rows with the 320 rows of the final mixer (4 workers). It loses at 33
+#   to 64 rows (8.7 to 8.9 against 8.3 to 8.4 us).
+# - Past that, from 193 rows: S4 with M64/N64 tiles, 14.0 to 14.1 us against
+#   17.4 to 17.5 us for the generic M128/N32 tactic and 14.1 to 16.1 us for the
+#   GEMM path. Larger exact-override batches keep these tiles and add
+#   scheduling rounds. Up to 192 rows the generic tactic stays (smaller
+#   contexts, such as green contexts, were not measured).
+# SM100/SM103 were not measured and keep the generic tactic.
 _SM107_HC_ROW_TILES = (
-    (65, 96, (4, 64, 16, 1, 1, 5, 32), (8, 64, 64, 5)),
-    (97, 192, (4, 64, 32, 1, 1, 5, 32), (8, 64, 64, 5)),
+    (65, 96, (4, 64, 16, 1, 1, 5, 32), None),
+    (97, 192, (4, 64, 32, 1, 1, 5, 32), None),
     (193, None, (4, 128, 32, 1, 1, 4, 32), (4, 64, 64, 5)),
 )
+# (split_k, M_proj, B_mma, stages) of the one-round SM107 tiles.
+_SM107_HC_ONE_ROUND_TILES = (8, 64, 64, 5)
+
+
+def _one_round_rows(projection_rows: int, split_k: int, m: int, n: int) -> int:
+    """Rows one resident round of a split_k x (m, n) plan covers on this stream.
+
+    A worker runs one split_k-CTA cluster per m-row projection tile and covers
+    n rows; the stream's cluster capacity (lower in a green context) bounds the
+    workers, as it does when the launch counts them.
+    """
+    index = torch.cuda.current_device()
+    stream = int(torch.cuda.current_stream(index).cuda_stream)
+    clusters = (projection_rows + m - 1) // m
+    return n * (_cluster_capacity_hint(index, stream, split_k) // clusters)
 
 
 def _tactic(rows: int, projection_rows: int):
@@ -733,13 +753,17 @@ def _model_tactic(
     measured_dims = (hc_count, hidden_size, lowrank) == (4, 2560, 320)
     if measured_dims and current_platform().arch_version == ArchVersion(10, 7):
         # Only the generic tactic of a range is replaced, not a forced one.
-        for first, last, generic, tiles in _SM107_HC_ROW_TILES:
+        for first, last, generic, otherwise in _SM107_HC_ROW_TILES:
             if (
                 first <= rows
                 and (last is None or rows <= last)
                 and (split_k, m, n, lp, lb, stages, f) == generic
             ):
-                split_k, m, n, stages = tiles
+                one_round = _SM107_HC_ONE_ROUND_TILES
+                if rows <= _one_round_rows(projection_rows, *one_round[:3]):
+                    split_k, m, n, stages = one_round
+                elif otherwise is not None:
+                    split_k, m, n, stages = otherwise
                 break
     if projection_rows > 6 * m:
         # Four-CTA clusters expose more Up output work at the resident limit.

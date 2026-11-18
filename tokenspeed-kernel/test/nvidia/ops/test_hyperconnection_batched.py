@@ -266,7 +266,8 @@ def test_up_activation_reuse_across_token_tiles(
 ):
     _reset_caches(monkeypatch)
     # Limit residency to one worker so its activation slot is overwritten for
-    # five token tiles, including a tail, within each launch.
+    # every token tile of the 129 rows, including the one-row tail, within each
+    # launch.
     monkeypatch.setattr(
         cute_fused,
         "_capacity",
@@ -882,7 +883,7 @@ def test_dynamic_rows_reuse_round_bucket_and_workspace(dtype, enable_pdl, monkey
     assert set(cute_fused._WORKSPACES) == workspace_keys
 
 
-@pytest.mark.parametrize("rows", [3, 17, 31, 33, 63, 193, 385, 513, 1023])
+@pytest.mark.parametrize("rows", [3, 17, 31, 33, 63, 65, 127, 193, 385, 513, 1023])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_dynamic_tail_preserves_output_guards(rows, dtype):
     values = inputs(rows, dtype, True)

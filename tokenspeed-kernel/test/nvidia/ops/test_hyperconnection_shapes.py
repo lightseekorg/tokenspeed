@@ -124,38 +124,84 @@ def test_model_dimensions_and_changed_input_graph(
         _check(actual, values, g, h, r, inject)
 
 
-@pytest.mark.skipif(
-    current_platform().arch_version != ArchVersion(10, 7),
-    reason="SM107 tile choice",
-)
+def _on_architecture(monkeypatch, version):
+    real = current_platform()
+
+    class _Platform:
+        # The real platform reporting another architecture.
+        arch_version = version
+
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+    monkeypatch.setattr(cute_fused, "current_platform", lambda: _Platform())
+
+
 @pytest.mark.parametrize(
-    "g,h,r,rows,tactic",
+    "projection_rows,capacity,rows,tactic",
     [
-        (4, 2560, 320, 64, (8, 64, 32, 5)),
-        (4, 2560, 320, 65, (8, 64, 64, 5)),
-        (4, 2560, 320, 96, (8, 64, 64, 5)),
-        (4, 2560, 320, 97, (8, 64, 64, 5)),
-        (4, 2560, 320, 192, (8, 64, 64, 5)),
-        (4, 2560, 320, 193, (4, 64, 64, 5)),
-        (4, 2560, 320, 256, (4, 64, 64, 5)),
-        (4, 2560, 320, 385, (4, 64, 64, 5)),
-        (4, 8192, 1024, 65, (None, 128, 96, None)),
-        (4, 8192, 1024, 128, (None, 64, 128, None)),
-        (4, 8192, 1024, 193, (None, 128, 256, None)),
-        (4, 8192, 1024, 256, (None, 128, 256, None)),
+        # 22 eight-CTA clusters: the 212-SM part.
+        (324, 22, 64, (8, 64, 32, 5)),
+        (324, 22, 65, (8, 64, 64, 5)),
+        (324, 22, 192, (8, 64, 64, 5)),
+        (324, 22, 193, (4, 64, 64, 5)),
+        (324, 22, 256, (4, 64, 64, 5)),
+        (324, 22, 385, (4, 64, 64, 5)),
+        (320, 22, 193, (8, 64, 64, 5)),
+        (320, 22, 256, (8, 64, 64, 5)),
+        (320, 22, 257, (4, 64, 64, 5)),
+        # 11 clusters, as in a smaller green context: one S8 round covers 64
+        # rows with 324 projection rows and 128 with 320; the generic tactic
+        # stays up to 192 rows.
+        (324, 11, 65, (4, 64, 16, 5)),
+        (324, 11, 97, (4, 64, 32, 5)),
+        (324, 11, 193, (4, 64, 64, 5)),
+        (320, 11, 128, (8, 64, 64, 5)),
+        (320, 11, 129, (4, 64, 32, 5)),
     ],
 )
-def test_sm107_tiles_by_row_count(g, h, r, rows, tactic):
-    # The Qwen3.8 dimensions take M64/N64 tiles past 64 rows on SM107: split-K
-    # 8 up to 192 rows, 4 past it (385 rows: an exact override keeps them),
-    # where they measured faster than the generic tactics; 64 rows keep the
-    # generic S8/N32. The other dimensions keep their wide tactic. The batched
-    # FP64 tests cover these row counts.
-    split_k, m, n, _, _, stages, _ = cute_fused._model_tactic(rows, g, h, r, r + g)[:7]
-    expected_split_k, expected_m, expected_n, expected_stages = tactic
-    assert (m, n) == (expected_m, expected_n)
-    if expected_split_k is not None:
-        assert (split_k, stages) == (expected_split_k, expected_stages)
+def test_sm107_qwen_tiles_follow_one_round_capacity(
+    monkeypatch, projection_rows, capacity, rows, tactic
+):
+    # S8 M64/N64 tiles while every token tile fits one resident round of the
+    # stream's eight-CTA clusters, S4 M64/N64 past 192 rows otherwise, where
+    # they measured faster than the generic tactics. The batched FP64 tests
+    # cover these row counts.
+    _on_architecture(monkeypatch, ArchVersion(10, 7))
+    monkeypatch.setattr(
+        cute_fused,
+        "_cluster_capacity_hint",
+        lambda index, stream, split_k: {8: capacity}[split_k],
+    )
+    split_k, m, n, _, _, stages, _ = cute_fused._model_tactic(
+        rows, 4, 2560, 320, projection_rows
+    )[:7]
+    assert (split_k, m, n, stages) == tactic
+
+
+@pytest.mark.parametrize(
+    "rows,m,n",
+    [(65, 128, 96), (128, 64, 128), (193, 128, 256), (256, 128, 256)],
+)
+def test_sm107_wide_dimensions_keep_their_tactic(monkeypatch, rows, m, n):
+    _on_architecture(monkeypatch, ArchVersion(10, 7))
+    tactic = cute_fused._model_tactic(rows, 4, 8192, 1024, 1028)
+    assert tactic[1:3] == (m, n)
+
+
+@pytest.mark.parametrize("version", [ArchVersion(10, 0), ArchVersion(10, 3)])
+def test_sm100_and_sm103_ignore_the_sm107_tiles(monkeypatch, version):
+    _on_architecture(monkeypatch, version)
+    cases = [(4, 2560, 320, 320), (4, 2560, 320, 324), (4, 8192, 1024, 1028)]
+    chosen = {
+        case: [cute_fused._model_tactic(rows, *case) for rows in range(1, 1025)]
+        for case in cases
+    }
+    monkeypatch.setattr(cute_fused, "_SM107_HC_ROW_TILES", ())
+    for case in cases:
+        assert chosen[case] == [
+            cute_fused._model_tactic(rows, *case) for rows in range(1, 1025)
+        ]
 
 
 @torch.inference_mode()
