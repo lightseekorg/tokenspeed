@@ -266,8 +266,7 @@ def test_up_activation_reuse_across_token_tiles(
 ):
     _reset_caches(monkeypatch)
     # Limit residency to one worker so its activation slot is overwritten for
-    # every token tile of the 129 rows, including the one-row tail, within each
-    # launch.
+    # five token tiles, including a tail, within each launch.
     monkeypatch.setattr(
         cute_fused,
         "_capacity",

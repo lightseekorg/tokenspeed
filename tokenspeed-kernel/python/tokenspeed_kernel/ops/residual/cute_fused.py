@@ -230,25 +230,7 @@ def _capacity(compiled, kernel, device: torch.device, stream: CUstream):
     return _checked(cuda_driver.cuOccupancyMaxActiveClusters(function, config))
 
 
-# SM107 tiles for the 4 x 2560 / lowrank 320 dimensions past 64 rows (up to 64
-# the all-architecture S8/N32 rule in _model_tactic applies first). Each range
-# replaces its generic tactic: (first row, last row or None, generic tactic,
-# tiles when S8 does not fit one round, or None to keep the generic tactic).
-# CUDA-graph microbenchmark, 24 weight copies, cold L2, 212-SM part:
-# - S8 with M64/N64 tiles takes 9.9 to 10.3 us per call while all token tiles
-#   fit one resident round, against 12.2 to 12.5 us for the generic S4/N16 and
-#   S4/N32 tactics (65 to 192 rows) and 14.0 to 14.1 us for S4 M64/N64. A
-#   second round costs 20.4 us, so S8 is chosen only up to
-#   _one_round_rows: 192 rows with the 324 projection rows of a combining mixer
-#   (22 eight-CTA clusters over 6 projection clusters: 3 workers of 64 rows),
-#   256 rows with the 320 rows of the final mixer (4 workers). It loses at 33
-#   to 64 rows (8.7 to 8.9 against 8.3 to 8.4 us).
-# - Past that, from 193 rows: S4 with M64/N64 tiles, 14.0 to 14.1 us against
-#   17.4 to 17.5 us for the generic M128/N32 tactic and 14.1 to 16.1 us for the
-#   GEMM path. Larger exact-override batches keep these tiles and add
-#   scheduling rounds. Up to 192 rows the generic tactic stays (smaller
-#   contexts, such as green contexts, were not measured).
-# SM100/SM103 were not measured and keep the generic tactic.
+# (first row, last row, generic tactic, tiles once S8 needs two rounds or None)
 _SM107_HC_ROW_TILES = (
     (65, 96, (4, 64, 16, 1, 1, 5, 32), None),
     (97, 192, (4, 64, 32, 1, 1, 5, 32), None),
@@ -259,12 +241,7 @@ _SM107_HC_ONE_ROUND_TILES = (8, 64, 64, 5)
 
 
 def _one_round_rows(projection_rows: int, split_k: int, m: int, n: int) -> int:
-    """Rows one resident round of a split_k x (m, n) plan covers on this stream.
-
-    A worker runs one split_k-CTA cluster per m-row projection tile and covers
-    n rows; the stream's cluster capacity (lower in a green context) bounds the
-    workers, as it does when the launch counts them.
-    """
+    """Rows one resident round of a split_k x (m, n) plan covers on this stream."""
     index = torch.cuda.current_device()
     stream = int(torch.cuda.current_stream(index).cuda_stream)
     clusters = (projection_rows + m - 1) // m

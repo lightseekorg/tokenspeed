@@ -124,14 +124,14 @@ def test_model_dimensions_and_changed_input_graph(
         _check(actual, values, g, h, r, inject)
 
 
-def _on_architecture(monkeypatch, version):
+def _on_architecture(monkeypatch: pytest.MonkeyPatch, version: ArchVersion) -> None:
     real = current_platform()
 
     class _Platform:
         # The real platform reporting another architecture.
         arch_version = version
 
-        def __getattr__(self, name):
+        def __getattr__(self, name: str) -> object:
             return getattr(real, name)
 
     monkeypatch.setattr(cute_fused, "current_platform", lambda: _Platform())
@@ -150,9 +150,7 @@ def _on_architecture(monkeypatch, version):
         (320, 22, 193, (8, 64, 64, 5)),
         (320, 22, 256, (8, 64, 64, 5)),
         (320, 22, 257, (4, 64, 64, 5)),
-        # 11 clusters, as in a smaller green context: one S8 round covers 64
-        # rows with 324 projection rows and 128 with 320; the generic tactic
-        # stays up to 192 rows.
+        # 11 clusters (a smaller context): S8 covers 64 rows at 324, 128 at 320.
         (324, 11, 65, (4, 64, 16, 5)),
         (324, 11, 97, (4, 64, 32, 5)),
         (324, 11, 193, (4, 64, 64, 5)),
@@ -163,10 +161,7 @@ def _on_architecture(monkeypatch, version):
 def test_sm107_qwen_tiles_follow_one_round_capacity(
     monkeypatch, projection_rows, capacity, rows, tactic
 ):
-    # S8 M64/N64 tiles while every token tile fits one resident round of the
-    # stream's eight-CTA clusters, S4 M64/N64 past 192 rows otherwise, where
-    # they measured faster than the generic tactics. The batched FP64 tests
-    # cover these row counts.
+    # The batched FP64 tests cover these row counts.
     _on_architecture(monkeypatch, ArchVersion(10, 7))
     monkeypatch.setattr(
         cute_fused,
