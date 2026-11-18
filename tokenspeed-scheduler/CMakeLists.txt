@@ -171,6 +171,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_token_position_bounds.cpp
         tests/cpp/test_forward_batch.cpp
         tests/cpp/test_full_cache_benchmark.cpp
+        tests/cpp/test_parent_fit_eviction.cpp
         tests/cpp/test_kv_cache_lifecycle.cpp
         tests/cpp/test_cache_scenarios.cpp
         tests/cpp/test_scheduler_plan.cpp
@@ -266,6 +267,16 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
     )
 
     target_link_libraries(tokenspeed_scheduler_full_cache_benchmark
+        PRIVATE
+            tokenspeed_scheduler_core
+            GTest::gtest
+    )
+
+    add_executable(tokenspeed_scheduler_aged_cache_benchmark EXCLUDE_FROM_ALL
+        tests/cpp/benchmark_aged_cache.cpp
+    )
+
+    target_link_libraries(tokenspeed_scheduler_aged_cache_benchmark
         PRIVATE
             tokenspeed_scheduler_core
             GTest::gtest
