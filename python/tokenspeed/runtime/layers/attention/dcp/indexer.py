@@ -25,6 +25,8 @@ from dataclasses import dataclass
 import torch
 from tokenspeed_kernel.ops.attention.dsa import (
     DSAIndexCandidatePages,
+    dsa_decode_index_candidates,
+    dsa_decode_index_candidates_supported,
     dsa_index_candidates,
     dsa_index_candidates_accepts_pages,
     dsa_merge_candidates,
@@ -615,6 +617,77 @@ def _score_rows(
     )
 
 
+def _score_owned_rows(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    index_k_cache: torch.Tensor,
+    metadata: DCPIndexMetadata,
+    *,
+    page_size: int,
+    topk: int,
+    softmax_scale: float,
+    initial_tokens: int,
+    local_tokens: int,
+    q_scales: torch.Tensor | None,
+    query_group_size: int,
+    scores_out: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Score the owned top-k's decode rows into their local candidates.
+
+    The KVP decode candidates op serves them where it can (BF16 queries, no
+    mandatory windows, planned pages), else :func:`_score_rows` in one tile.
+    Host values only, the same on every rank.
+    """
+    rows = q.shape[0]
+    pages = _tile_pages(q, weights, index_k_cache, metadata, 0, rows, page_size)
+    index_k_format = metadata.index_k_format or "fp8_scaled"
+    if (
+        pages is not None
+        and q_scales is None
+        and q.dtype == torch.bfloat16
+        and initial_tokens == 0
+        and local_tokens == 0
+        and dsa_decode_index_candidates_supported(
+            index_heads=q.shape[1],
+            head_dim=q.shape[2],
+            page_size=page_size,
+            topk=topk,
+            query_group_size=query_group_size,
+            index_k_format=index_k_format,
+            solution=None,
+        )
+    ):
+        return dsa_decode_index_candidates(
+            q,
+            weights,
+            index_k_cache,
+            pages,
+            query_group_size=query_group_size,
+            page_size=page_size,
+            topk=topk,
+            softmax_scale=softmax_scale,
+            index_k_format=index_k_format,
+            solution=None,
+            scores_out=scores_out,
+        )
+    return _score_rows(
+        q,
+        weights,
+        index_k_cache,
+        metadata,
+        0,
+        rows,
+        page_size=page_size,
+        topk=topk,
+        softmax_scale=softmax_scale,
+        initial_tokens=initial_tokens,
+        local_tokens=local_tokens,
+        q_scales=q_scales,
+        query_group_size=query_group_size,
+        scores_out=scores_out,
+    )
+
+
 def owned_dsa_topk_fits(
     rows: int,
     metadata: DCPIndexMetadata,
@@ -722,13 +795,11 @@ def select_owned_dsa_topk(
             send[score_bytes:].view(rows, -1).copy_(rider)
     else:
         local = torch.empty((rows, topk), device=q.device, dtype=torch.float32)
-    positions, _ = _score_rows(
+    positions, _ = _score_owned_rows(
         q,
         weights,
         index_k_cache,
         metadata,
-        0,
-        rows,
         page_size=page_size,
         topk=topk,
         softmax_scale=softmax_scale,

@@ -365,6 +365,40 @@ the query and weights are bit-identical to the two separate launches. Mixed
 rounds, prefill, and KV-parallel decode keep the separate write; decode rounds
 of the K3 decode chain run the fused decode front below instead.
 
+## KVP decode candidates (`cute_dsl_dsa_decode_index_candidates`)
+
+`dsa_decode_index_candidates` scores and selects a KVP decode's local index
+candidates: each row's exact local top-k over this rank's compact owned pages
+(`DSAIndexCandidatePages`), as logical positions and FP32 logits, `-1` and
+`-inf` for invalid candidates, the scores written straight into a send
+buffer's rows (`scores_out`). It serves decode rows without mandatory windows,
+each request's `query_group_size` rows consecutive;
+`dsa_decode_index_candidates_supported` decides from host sizes, and the owned
+decode top-k (`select_owned_dsa_topk`) falls back to `dsa_index_candidates`
+where it refuses.
+
+On SM100-SM103 the `cute_dsl` leaf runs the fused decode top-k's kernels in a
+KVP mode after the shared query quantization (`compile_candidates`):
+
+- The scorer scores every request, as a rank's share of the merged top-k is
+  unknown before the merge, over the request's compact pages: its last row's,
+  of which every earlier row sees a prefix. Each row stops at its own local
+  length, as rows of one verify window can end on different ranks' pages.
+  Logits are bit-identical to `deep_gemm_dsa_index_candidates`' (the same FP8
+  MMA and FP32 head sum).
+- The select keeps each row's exact top-k (ties at the threshold to the lowest
+  keys) and writes each key's logical position through the request's logical
+  page columns and its logit, recovered from its order key. A row of at most
+  `topk` keys takes all of them with their logits.
+- Rows, requests, columns and strides are runtime values: one compile per
+  `query_group_size`. At most 4096 requests per call; `topk` 1024-4096 in
+  steps of 1024.
+
+On GB300, a KVP8 rank's decode candidates of eight rows over 1.5K-token
+contexts take 8.2 us against 32.9 us for the DeepGEMM leaf (quantization,
+paged logits, scrub, selection and gather), 11.5 against 19.4 us for 128 rows
+over 16K tokens, and 27.8 against 31.8 us for 128 rows over 64K tokens.
+
 ## Fused decode front (`cute_dsl_dsa_decode_front`)
 
 On SM100-SM103 a Kimi-K3.1 TP8 decode round of the K3 decode chain runs, after
