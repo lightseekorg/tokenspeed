@@ -199,8 +199,9 @@ def mha_fp8_kvcache_query_dtype(
     logit_cap: float,
     sinks: bool | None,
     solution: str | None,
+    fp8_kv_scaled: bool,
 ) -> torch.dtype:
-    """The query dtype a paged read of a unit-scale FP8 KV cache takes.
+    """The query dtype a paged read of an FP8 KV cache takes.
 
     Queries are cast to the cache dtype when a kernel of ``mode`` reads FP8
     queries under these traits. Otherwise they stay in the activation dtype
@@ -219,6 +220,8 @@ def mha_fp8_kvcache_query_dtype(
         sinks: Whether attention sinks are used; ``None`` when the caller
             does not know yet (any kernel matches on this trait).
         solution: Optional kernel solution to restrict selection.
+        fp8_kv_scaled: Whether the cache is at per-tensor scales
+            (``fp8_kv_scales``), which selects among the kernels declaring it.
 
     Returns:
         ``kv_cache_dtype`` or ``activation_dtype``.
@@ -236,11 +239,14 @@ def mha_fp8_kvcache_query_dtype(
         traits["sinks"] = sinks
     if mode == "mha_extend_with_kvcache":
         traits["is_causal"] = True
+    cache_format = (
+        tensor_format("scaled-fp8", kv_cache_dtype, scale=FP8_ATTENTION_TENSOR_SCALE)
+        if fp8_kv_scaled
+        else dense_tensor_format(kv_cache_dtype)
+    )
     for q_dtype in (kv_cache_dtype, activation_dtype):
         signature = format_signature(
-            q=dense_tensor_format(q_dtype),
-            k_cache=dense_tensor_format(kv_cache_dtype),
-            v_cache=dense_tensor_format(kv_cache_dtype),
+            q=dense_tensor_format(q_dtype), k_cache=cache_format, v_cache=cache_format
         )
         candidates = KernelRegistry.get().get_for_operator(
             "attention",

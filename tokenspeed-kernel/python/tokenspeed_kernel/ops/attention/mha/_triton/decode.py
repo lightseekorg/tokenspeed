@@ -222,13 +222,15 @@ def _fwd_folded_kernel_stage2(
     stride_lse_h,
     stride_obs,
     stride_oh,
+    o_scale,
     BLOCK_DV: tl.constexpr,
     Lv: tl.constexpr,
     HAS_SINK: tl.constexpr,
     RETURN_LSE: tl.constexpr,
 ):
     """Merge the key-split partials of one (query row, head) by their base-2
-    log-sum-exp; a row with no key in reach gets a zero output and ``-inf``."""
+    log-sum-exp, times ``o_scale`` (a scaled FP8 cache's V scale); a row with
+    no key in reach gets a zero output and ``-inf``."""
     cur_q = tl.program_id(0).to(tl.int64)
     cur_head = tl.program_id(1)
     offs_d = tl.arange(0, BLOCK_DV)
@@ -270,7 +272,7 @@ def _fwd_folded_kernel_stage2(
     has_keys = e_sum > 0.0
     tl.store(
         O + cur_q * stride_obs + cur_head * stride_oh + offs_d,
-        tl.where(has_keys, acc / tl.where(has_keys, e_sum, 1.0), 0.0),
+        tl.where(has_keys, acc * o_scale / tl.where(has_keys, e_sum, 1.0), 0.0),
         mask=mask_d,
     )
     if RETURN_LSE:
@@ -338,6 +340,7 @@ def decode_attention_fwd_folded(
     logit_cap: float = 0.0,
     sinks: torch.Tensor | None = None,
     lse_out: torch.Tensor | None = None,
+    o_scale: float = 1.0,
 ) -> None:
     """Decode ``max_seqlen_q`` causal query rows per request with every row of
     a request and its KV group folded into one program per key split.
@@ -357,6 +360,8 @@ def decode_attention_fwd_folded(
         sinks: ``[num_q_heads]`` attention sink logits, or ``None``.
         lse_out: ``[bs * max_seqlen_q, num_q_heads]`` float32 natural-log
             log-sum-exp output, or ``None``.
+        o_scale: factor on the output (a scaled FP8 cache's V scale); the
+            log-sum-exp does not see it.
     """
     bs = cache_seqlens.shape[0]
     total_q, head_num, lk = q.shape
@@ -451,6 +456,7 @@ def decode_attention_fwd_folded(
             att_lse.stride(1),
             o.stride(0),
             o.stride(1),
+            o_scale,
             BLOCK_DV=block_dv,
             Lv=lv,
             HAS_SINK=sinks is not None,
@@ -476,10 +482,15 @@ def _triton_mha_decode_with_kvcache_impl(
     q_scale: torch.Tensor | None = None,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    fp8_kv_scales: tuple[float, float] | None = None,
     enable_pdl: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
+    # A scaled cache's rows are K / k and V / v: k joins the logit scale, v the
+    # output's.
+    k_descale, v_descale = (1.0, 1.0) if fp8_kv_scales is None else fp8_kv_scales
+    softmax_scale *= k_descale
     out = torch.empty_like(q)
     # Every decode folds a request's query rows (speculative verify: several;
     # plain decode: one) and its KV group into one program per KV head and
@@ -507,5 +518,6 @@ def _triton_mha_decode_with_kvcache_impl(
         logit_cap=logit_cap,
         sinks=sinks,
         lse_out=lse,
+        o_scale=v_descale,
     )
     return (out, lse) if return_lse else out

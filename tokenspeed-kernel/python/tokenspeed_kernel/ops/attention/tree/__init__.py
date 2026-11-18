@@ -25,13 +25,21 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel.profiling import kernel_scope
 from tokenspeed_kernel.selection import select_kernel
-from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from tokenspeed_kernel.signature import (
+    ScaleFormat,
+    dense_tensor_format,
+    format_signature,
+    tensor_format,
+)
 
 __all__ = ["tree_window_attention"]
 
 # Tree visibility is up to two 64-bit mask words per query row; verify rows fit one.
 MAX_TREE_ROWS = 64
 MAX_TREE_SLOTS = 128
+
+# One fp32 scale per K or V cache tensor (a per-tensor scaled FP8 cache).
+_FP8_TENSOR_SCALE = ScaleFormat(storage_dtype=torch.float32, granularity="tensor")
 
 
 def tree_window_attention(
@@ -49,6 +57,7 @@ def tree_window_attention(
     causal_prefix: bool,
     page_size: int,
     sm_scale: float,
+    fp8_kv_scales: tuple[float, float] | None = None,
 ) -> torch.Tensor:
     """Finish draft-tree attention from a causal prefix partial (cascade).
 
@@ -67,7 +76,7 @@ def tree_window_attention(
     Args:
         q: ``[bs * rows_per_req, num_q_heads, key_dim]`` queries.
         k_cache: ``[slots, num_kv_heads, key_dim]`` token rows of the cache, in
-            ``q.dtype`` or unscaled FP8 E4M3.
+            ``q.dtype`` or FP8 E4M3.
         v_cache: ``[slots, num_kv_heads, head_dim]`` value rows, in ``k_cache``'s
             dtype. ``head_dim`` equals ``key_dim`` (GQA), or is narrower (MLA:
             the value is the key row's leading latent and the remaining
@@ -78,13 +87,17 @@ def tree_window_attention(
             visibility, each query row's words contiguous.
         prefix_out: ``[bs * rows_per_req, num_q_heads, head_dim]`` causal prefix output.
         prefix_lse: ``[bs * rows_per_req, num_q_heads]`` float32 base-2
-            log-sum-exp of the prefix scores (scaled by ``sm_scale``).
+            log-sum-exp of the prefix scores (scaled by ``sm_scale`` and, for a
+            scaled cache, the K scale).
         rows_per_req: query rows per request, at most 64.
         window: tree window width in keys, at most 128.
         causal_prefix: Whether the partial is the causal ``rows_per_req``
             decode (else each row's covers its whole prefix).
         page_size: tokens per page.
         sm_scale: softmax scale applied to ``q . k``.
+        fp8_kv_scales: ``(k_scale, v_scale)`` of a per-tensor scaled FP8
+            cache, whose rows hold ``K / k_scale`` and ``V / v_scale``;
+            ``None`` for a unit-scale cache. ``prefix_out`` is in true V units.
 
     Returns:
         ``[bs * rows_per_req, num_q_heads, head_dim]`` attention output in ``q.dtype``.
@@ -94,10 +107,16 @@ def tree_window_attention(
             f"{rows_per_req} rows over a {window}-key window; at most "
             f"{MAX_TREE_ROWS} rows over {MAX_TREE_SLOTS} keys"
         )
+    if fp8_kv_scales is None:
+        k_format = dense_tensor_format(k_cache.dtype)
+        v_format = dense_tensor_format(v_cache.dtype)
+        scale_kwargs = {}
+    else:
+        k_format = tensor_format("scaled-fp8", k_cache.dtype, scale=_FP8_TENSOR_SCALE)
+        v_format = tensor_format("scaled-fp8", v_cache.dtype, scale=_FP8_TENSOR_SCALE)
+        scale_kwargs = {"fp8_kv_scales": fp8_kv_scales}
     signature = format_signature(
-        q=dense_tensor_format(q.dtype),
-        k_cache=dense_tensor_format(k_cache.dtype),
-        v_cache=dense_tensor_format(v_cache.dtype),
+        q=dense_tensor_format(q.dtype), k_cache=k_format, v_cache=v_format
     )
     kernel = select_kernel("attention", "tree_window", signature)
     with kernel_scope(
@@ -123,6 +142,7 @@ def tree_window_attention(
             causal_prefix=causal_prefix,
             page_size=page_size,
             sm_scale=sm_scale,
+            **scale_kwargs,
         )
 
 

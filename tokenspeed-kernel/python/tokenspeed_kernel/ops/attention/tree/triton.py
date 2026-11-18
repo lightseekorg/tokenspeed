@@ -43,12 +43,20 @@ from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import (
+    ScaleFormat,
     dense_tensor_format,
     format_signature,
     format_signatures,
+    tensor_format,
 )
 
 __all__ = ["triton_tree_window_attention"]
+
+_SCALED_FP8_CACHE = tensor_format(
+    "scaled-fp8",
+    torch.float8_e4m3fn,
+    scale=ScaleFormat(storage_dtype=torch.float32, granularity="tensor"),
+)
 
 
 @triton.jit
@@ -81,6 +89,7 @@ def _tree_window_merge_kernel(
     stride_oh,
     stride_od,
     sm_scale_log2,
+    v_scale,
     R: tl.constexpr,
     W: tl.constexpr,
     # Mask words per row: cdiv(W, 64).
@@ -209,7 +218,8 @@ def _tree_window_merge_kernel(
         alpha = tl.exp2(run_max - safe_max)
         probs = tl.exp2(scores - safe_max[:, None])
         run_sum = run_sum * alpha + tl.sum(probs, axis=1)
-        acc = acc * alpha[:, None] + tl.dot(probs.to(v.dtype), v)
+        # The partial is in true V units; a scaled cache's window rows are V / v_scale.
+        acc = acc * alpha[:, None] + tl.dot(probs.to(v.dtype), v) * v_scale
         run_max = new_max
 
     out = acc / tl.where(run_sum > 0.0, run_sum, 1.0)[:, None]
@@ -230,17 +240,23 @@ def _tree_window_merge_kernel(
     solution="triton",
     # Its prefix partial comes from trtllm-gen on NVIDIA and the Triton MHA decode on AMD.
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
-    # An FP8 KV cache is unscaled (every factor 1.0): its K/V widen to the query dtype.
+    # An FP8 KV cache's K/V widen to the query dtype; at per-tensor scales
+    # (``fp8_kv_scales``) the K scale joins the softmax scale and the V scale
+    # the window's P.V.
     signatures=format_signatures(
         ("q", "k_cache", "v_cache"), "dense", {torch.float16, torch.bfloat16}
     )
     | {
         format_signature(
             q=dense_tensor_format(dtype),
-            k_cache=dense_tensor_format(torch.float8_e4m3fn),
-            v_cache=dense_tensor_format(torch.float8_e4m3fn),
+            k_cache=cache_format,
+            v_cache=cache_format,
         )
         for dtype in (torch.float16, torch.bfloat16)
+        for cache_format in (
+            dense_tensor_format(torch.float8_e4m3fn),
+            _SCALED_FP8_CACHE,
+        )
     },
     priority=Priority.PORTABLE,
 )
@@ -259,7 +275,9 @@ def triton_tree_window_attention(
     causal_prefix: bool,
     page_size: int,
     sm_scale: float,
+    fp8_kv_scales: tuple[float, float] | None = None,
 ) -> torch.Tensor:
+    k_descale, v_descale = (1.0, 1.0) if fp8_kv_scales is None else fp8_kv_scales
     num_rows, num_q_heads, _ = q.shape
     num_kv_heads, head_dim = v_cache.shape[1:]
     group = num_q_heads // num_kv_heads
@@ -289,7 +307,8 @@ def triton_tree_window_attention(
         *prefix_out.stride(),
         *prefix_lse.stride(),
         *out.stride(),
-        sm_scale * 1.4426950408889634,
+        sm_scale * k_descale * 1.4426950408889634,
+        v_descale,
         R=rows_per_req,
         W=window,
         WORDS=triton.cdiv(window, 64),

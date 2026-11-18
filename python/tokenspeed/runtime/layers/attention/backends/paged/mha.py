@@ -189,10 +189,12 @@ class MHAAttnBackend(PagedAttentionBackend):
             self.draft_block_decode and not self.draft_block_causal
         )
 
-        # Query dtype of each unit-scale FP8 cache read, per (kernel mode,
-        # layer, sinks): FP8 when a kernel reads FP8 queries, else the
+        # Query dtype of each FP8 cache read, per (kernel mode, layer, sinks,
+        # per-tensor scaled): FP8 when a kernel reads FP8 queries, else the
         # activation dtype (see mha_fp8_kvcache_query_dtype).
-        self._fp8_query_dtypes: dict[tuple[str, int, bool | None], torch.dtype] = {}
+        self._fp8_query_dtypes: dict[
+            tuple[str, int, bool | None, bool], torch.dtype
+        ] = {}
 
         self.forward_decode_metadata: MHADecodeMetadata | None = None
         self.forward_extend_metadata: MHAExtendMetadata | None = None
@@ -272,7 +274,8 @@ class MHAAttnBackend(PagedAttentionBackend):
     def _fp8_query_dtype(
         self, mode: str, layer: PagedAttention, *, sinks: bool | None
     ) -> torch.dtype:
-        key = (mode, layer.layer_id, sinks)
+        scaled = layer.fp8_kv_scales is not None
+        key = (mode, layer.layer_id, sinks, scaled)
         dtype = self._fp8_query_dtypes.get(key)
         if dtype is None:
             dtype = mha_fp8_kvcache_query_dtype(
@@ -285,6 +288,7 @@ class MHAAttnBackend(PagedAttentionBackend):
                 logit_cap=layer.logit_cap,
                 sinks=sinks,
                 solution=self.kernel_solution,
+                fp8_kv_scaled=scaled,
             )
             self._fp8_query_dtypes[key] = dtype
         return dtype
@@ -624,7 +628,8 @@ class MHAAttnBackend(PagedAttentionBackend):
 
     def tree_support(self) -> TreeSupport:
         # The cascade's Triton prefix and window kernels read the model dtype or
-        # a unit-scale FP8 E4M3 cache (widened under the model-dtype query).
+        # an FP8 E4M3 cache (widened under the model-dtype query), unit-scale
+        # or at per-tensor scales.
         if self.kv_cache_dtype == self.qkv_dtype or (
             self.kv_cache_dtype == torch.float8_e4m3fn and not self.is_mxfp8
         ):
@@ -659,13 +664,12 @@ class MHAAttnBackend(PagedAttentionBackend):
         prefix's last key), so no prefix tail remains for the window kernel.
 
         ``q`` stays in the model dtype (query_dtype); with an FP8 cache both
-        kernels widen the K/V tiles under it.
+        kernels widen the K/V tiles under it. A cache at per-tensor scales
+        hands both the scales: the prefix decode returns its output and
+        log-sum-exp in true K/V units, which the window kernel continues.
         """
-        if layer.fp8_kv_scales is not None:
-            raise NotImplementedError(
-                "draft trees read a unit-scale FP8 cache only; per-tensor "
-                "scales have no tree path yet"
-            )
+        # tree_support admits no MXFP8 cache.
+        scale_kwargs = _fp8_scale_kwargs(layer) if self.is_fp8 else {}
         causal_prefix = layer.sliding_window_size < 0
         # Only lane rows (their own tables) decode a sliding window.
         if sinks is not None or (not causal_prefix and tree.row_page_table is None):
@@ -696,10 +700,11 @@ class MHAAttnBackend(PagedAttentionBackend):
                 softmax_scale=layer.scaling,
                 solution="triton",
                 block_draft=False,
+                **scale_kwargs,
             )
         else:
             prefix_out, prefix_lse = self._lane_prefix_decode(
-                q, layer, k_cache, v_cache, tree
+                q, layer, k_cache, v_cache, tree, scale_kwargs
             )
         dim = layer.qk_head_dim
         out = tree_window_attention(
@@ -717,6 +722,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             causal_prefix=causal_prefix,
             page_size=self.kernel_page_size,
             sm_scale=layer.scaling,
+            **scale_kwargs,
         )
         return out.view(-1, layer.tp_q_head_num * dim)
 
@@ -727,6 +733,7 @@ class MHAAttnBackend(PagedAttentionBackend):
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
         tree: TreeCascadeRows,
+        scale_kwargs: dict,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """The drafting lanes' sliding-window prefix partial. Every lane of a
         request queries the same keys (the window ending at the request's
@@ -754,6 +761,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             softmax_scale=layer.scaling,
             solution="triton",
             block_draft=False,
+            **scale_kwargs,
         )
         out = out.view(num_reqs, heads, rows, -1).transpose(1, 2)
         lse = lse.view(num_reqs, heads, rows).transpose(1, 2)

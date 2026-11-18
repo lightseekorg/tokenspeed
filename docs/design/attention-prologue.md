@@ -340,8 +340,9 @@ to e4m3's range: the layer passes `FP8TensorScales` as the write target's
 `scales` (format `fp8_per_tensor`, which the Triton solution writes). Every
 reader must apply them, so the layer refuses a backend whose
 `reads_fp8_kv_scales` is false. The MHA leaf reads through kernels that declare
-the `scaled-fp8` cache signature: trtllm-gen folds `k_scale` into the logit
-scale and `v_scale` into the output's. A cache of another dtype ignores the
+the `scaled-fp8` cache signature: trtllm-gen and the portable Triton decode
+and extend fold `k_scale` into the logit scale and `v_scale` into the
+output's. A cache of another dtype ignores the
 scales. MLA caches run at unit scale.
 
 An MLA layer reads its query in the activation dtype, except that an FP8

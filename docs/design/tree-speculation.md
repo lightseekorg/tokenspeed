@@ -83,13 +83,16 @@ same keys, so its prefix half folds the `K` lanes into the query heads (lane
 the same folded Triton decode with `q_len = 1`: the keys are read once per
 request instead of `K` times.
 
-An FP8 KV cache (E4M3, unscaled like every FP8 KV cache here) changes no
-structure: trtllm-gen takes the query cast to FP8 as it does for any decode,
-and `tree_window_attention` takes the unquantized query and widens the
-window's FP8 K/V to its dtype after loading them. The `mha` leaf's Triton
-prefix half does the same, so under a bound tree its decode query stays in
-the model dtype (`query_dtype`). A per-tensor scaled or MXFP8 cache has no tree
-path.
+An FP8 KV cache (E4M3) changes no structure: trtllm-gen takes the query cast
+to FP8 as it does for any decode, and `tree_window_attention` takes the
+unquantized query and widens the window's FP8 K/V to its dtype after loading
+them. The `mha` leaf's Triton prefix half does the same, so under a bound tree
+its decode query stays in the model dtype (`query_dtype`). In the `mha` leaf a
+layer at per-tensor KV scales (`fp8_kv_scales`) hands them to both halves:
+each folds `k_scale` into its softmax scale, the prefix decode returns its
+output times `v_scale` and its log-sum-exp in true logits, and the window
+kernel scales its own `P.V` by `v_scale` before merging. An MXFP8 cache has no
+tree path.
 
 MLA runs the same cascade over its latent cache. The prefix half is the leaf's
 own MLA decode with its base-2 log-sum-exp: trtllm-gen's MLA decode for
