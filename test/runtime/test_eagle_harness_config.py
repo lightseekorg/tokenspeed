@@ -40,6 +40,7 @@ from tokenspeed.runtime.execution.drafter.eagle_harness.config import (
     _routes_experts,
     chain_table_width,
     chain_width_table,
+    check_cost_tp_size,
     decode_graph_floors,
     first_rank_value,
 )
@@ -239,6 +240,21 @@ def test_every_rank_takes_the_first_ranks_read(tmp_path):
     torch.multiprocessing.spawn(
         _first_rank_worker, args=(str(tmp_path / "init"),), nprocs=2
     )
+
+
+def test_cost_data_tp_size(tmp_path):
+    """The server refuses cost data measure_run stamped with another TP size,
+    and serves unstamped (older) data."""
+    check_cost_tp_size(str(tmp_path), 2)  # no config at all
+    config = tmp_path / "config"
+    config.mkdir()
+    stamp = config / "measure_config.json"
+    stamp.write_text('{"batch_size": 32}')
+    check_cost_tp_size(str(tmp_path), 2)
+    stamp.write_text('{"batch_size": 32, "tp_size": 2}')
+    check_cost_tp_size(str(tmp_path), 2)
+    with pytest.raises(ValueError, match="measured at TP 2, but this server runs TP 1"):
+        check_cost_tp_size(str(tmp_path), 1)
 
 
 if __name__ == "__main__":
