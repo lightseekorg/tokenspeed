@@ -277,8 +277,6 @@ def scheduler_config_from_args(
         enable_kv_cache_events: Whether KV cache events are published.
         prefix_replay_tokens: DSpark prefix replay tokens, 0 without.
     """
-    geometry = specs.cache_geometry
-    has_l3 = server_args.kvstore_storage_backend is not None
     # Both explicit batching policy and allocated device workspace constrain the
     # same summed-page budget. Decode capacity remains the cache arena's limit.
     prefill_limits = [
@@ -290,6 +288,8 @@ def scheduler_config_from_args(
         if limit
     ]
     prefill_kv_rows = min(prefill_limits) if prefill_limits else 0
+    geometry = specs.cache_geometry
+    has_l3 = server_args.kvstore_storage_backend is not None
     return make_config(
         num_device_pages=geometry.num_device_pages,
         max_scheduled_tokens=max_scheduled_tokens,
