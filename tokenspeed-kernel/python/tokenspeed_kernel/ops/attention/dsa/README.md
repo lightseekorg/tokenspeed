@@ -76,9 +76,13 @@ and CUDA Graph replay.
 
 ## DCP local candidate selection
 
-`deep_gemm_dsa_index_candidates` scores compact owned Index-K pages. Its
-local top-k uses a length-aware selector with the original compact lengths,
-so selection excludes the unused logits tail. Empty shards keep length zero
+`deep_gemm_dsa_index_candidates` scores compact owned Index-K pages. It reads
+index queries with any row stride (a projection's column view) and declares
+`INDEX_CANDIDATE_SCORES_OUT_FEATURE`: its gather writes the scores straight
+into a caller's `scores_out` rows, -inf for invalid candidates, and the
+positions into their own contiguous matrix. Its local top-k uses a
+length-aware selector with the original compact lengths, so selection
+excludes the unused logits tail. Empty shards keep length zero
 for selection even though DeepGEMM's scoring scheduler needs a nonzero dummy
 length. Selectors are tried in this order:
 
