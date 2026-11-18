@@ -48,7 +48,8 @@ namespace {
 
 static_assert(
     std::is_same_v<decltype(std::declval<fsm::SchedulePrefillFirstChunkEvent&>()(std::declval<fsm::Submitted&&>())),
-                   std::variant<fsm::PrefillDone, fsm::PrefillAwaitingResult, fsm::Prefilling, fsm::RemotePrefilling>>);
+                   std::variant<fsm::PrefillDone, fsm::PrefillAwaitingResult, fsm::Prefilling, fsm::RemotePrefilling,
+                                fsm::PeerLanding>>);
 static_assert(std::is_same_v<decltype(std::declval<fsm::SchedulePrefillEvent&>()(std::declval<fsm::Prefilling&&>())),
                              std::variant<fsm::PrefillDone, fsm::PrefillAwaitingResult, fsm::Prefilling>>);
 
@@ -2017,6 +2018,7 @@ protected:
 
     // The boundaries the feed currently reports as stored, keyed by their
     // tokens; a drain's events are applied in order (removals first).
+    // The Device stream only: these scenarios follow the Device view.
     using Published = std::map<std::vector<std::int32_t>, std::uint64_t>;
     static void Apply(Published& published, const std::vector<KvCacheEvent>& events) {
         std::map<std::uint64_t, std::vector<std::int32_t>> by_hash;
@@ -2025,12 +2027,14 @@ protected:
         }
         for (const KvCacheEvent& event : events) {
             if (const auto* removed = std::get_if<KvBlockRemovedEvent>(&event)) {
+                if (removed->medium != KvEventMedium::kDevice) continue;
                 for (const std::uint64_t hash : removed->block_hashes) {
                     ASSERT_TRUE(by_hash.contains(hash)) << "a removal names a boundary never stored";
                     published.erase(by_hash.at(hash));
                 }
             } else {
                 const auto& stored = std::get<KvBlockStoredEvent>(event);
+                if (stored.medium != KvEventMedium::kDevice) continue;
                 ASSERT_EQ(stored.block_hashes.size(), 1u);
                 ASSERT_TRUE(published.emplace(stored.token_ids, stored.block_hashes.front()).second)
                     << "a boundary is stored once until it is removed";
@@ -2579,6 +2583,38 @@ TEST_F(L3LeaseLifetimeSuite, AnAbortReleasesTheReadyDataItHolds) {
     EXPECT_FALSE(scheduler_->StoragePending());
     EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0) << "the read's Host entries stay cached, unpinned";
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), static_cast<std::int32_t>(get.keys.size()));
+}
+
+// With KV events on, an L3 read registers Host entries for a prefix this
+// engine never published: the boundary tree reports their Host residency,
+// and the scheduler, holding no descriptor for them, publishes nothing until
+// a publication here describes them.
+class L3KvEventsSuite : public L3LeaseLifetimeSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = L3LeaseLifetimeSuite::MakeConfig();
+        cfg.enable_kv_cache_events = true;
+        return cfg;
+    }
+};
+
+TEST_F(L3KvEventsSuite, AnL3ReadOfAPrefixNeverPublishedHereIsNotAnEvent) {
+    Submit(MakeRequestSpec("r", /*num_pages=*/8));
+    Tick(1, /*allow_forward=*/true);
+    const auto query = std::get<StorageQueryOperation>(OnlyStorageOp(PlanOnce()));
+    Retire(query.op_id, query.keys.size());
+    const auto get = std::get<StorageGetOperation>(OnlyStorageOp(PlanOnce()));
+    Retire(get.op_id, get.keys.size());
+    ASSERT_GT(scheduler_->HostPoolCachedBlocks(), 0) << "the read landed Host entries";
+    for (const KvCacheEvent& event : scheduler_->DrainKvEvents()) {
+        const auto medium = std::visit([](const auto& e) { return e.medium; }, event);
+        EXPECT_NE(medium, KvEventMedium::kHost) << "no Host event without a descriptor";
+    }
+    // The request aborts: its read's Host entries stay cached, still
+    // undescribed, and nothing is reported.
+    SendAbortEvent("r");
+    PlanOnce();
+    EXPECT_TRUE(scheduler_->DrainKvEvents().empty());
 }
 
 // The session a request names is registered at its first admission for as

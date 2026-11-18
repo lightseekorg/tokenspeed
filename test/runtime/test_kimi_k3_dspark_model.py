@@ -547,18 +547,31 @@ class _LatentPool:
 def _chain_write(model, rows, positions, slots, planes, placement, sanitize):
     """The per-layer context write the fused one replaced.
 
-    It runs F.linear over the KV rows, kv_a_layernorm, RoPE, then the latent
-    store.
+    It projects the KV rows the way the fused write does (one GEMM over the
+    stacked rows, else F.linear per layer), then runs kv_a_layernorm, RoPE and
+    the latent store layer by layer.
     """
+    from tokenspeed_kernel.ops.gemm import mm as kernel_mm
     from tokenspeed_kernel.ops.kvcache.triton import set_mla_kv_buffer_triton
 
     from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
 
-    for layer, plane in zip(model.layers, planes, strict=True):
+    if model._kv_a_weight is not None:
+        projected = kernel_mm(rows, model._kv_a_weight)
+        projected = projected.view(rows.shape[0], len(model.layers), -1).unbind(1)
+    else:
+        projected = [
+            torch.nn.functional.linear(
+                rows,
+                layer.self_attn.fused_qkv_a_proj_with_mqa.weight[
+                    layer.self_attn.q_lora_rank :
+                ],
+            )
+            for layer in model.layers
+        ]
+    for layer, plane, latent in zip(model.layers, planes, projected, strict=True):
         attn = layer.self_attn
         rank = attn.kv_lora_rank
-        weight = attn.fused_qkv_a_proj_with_mqa.weight
-        latent = torch.nn.functional.linear(rows, weight[attn.q_lora_rank :])
         latent = torch.cat(
             (attn.kv_a_layernorm(latent[:, :rank].contiguous()), latent[:, rank:]),
             dim=-1,
@@ -579,13 +592,19 @@ def _chain_write(model, rows, positions, slots, planes, placement, sanitize):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("sanitize", [False, True])
 # Seed 61 reproduced the MI355 rounding difference across an FP8 boundary.
-@pytest.mark.parametrize(("rows", "seed"), [(1, 1), (8, 8), (40, 40), (40, 61)])
+# Weights that don't stack keep the per-layer projections.
+@pytest.mark.parametrize(
+    ("rows", "seed", "stacked"),
+    [(1, 1, True), (8, 8, True), (40, 40, True), (40, 61, True), (8, 8, False)],
+)
 def test_the_one_launch_context_write_stores_the_per_layer_chains_bytes(
-    dtype, sanitize, rows, seed
+    dtype, sanitize, rows, seed, stacked
 ):
     from tokenspeed.runtime.distributed.mapping import Mapping
 
     model = _tiny_draft(Mapping(rank=0, world_size=1))
+    if not stacked:
+        model._kv_a_weight = None
     generator = torch.Generator(device="cuda").manual_seed(seed)
     hidden = (torch.randn(rows, 256, device="cuda", generator=generator)).bfloat16()
     positions = torch.randint(4096, (rows,), device="cuda", generator=generator)
@@ -699,3 +718,30 @@ def test_context_kv_write_respects_dcp_ownership(seed):
         owned_rows += int(actual[0].abs().sum(dim=(1, 2)).gt(0).sum())
     # Rows 128..896 are owned by exactly one rank each; 0, 1024 and -1 by none.
     assert owned_rows == 6
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA kernels")
+def test_stacked_kv_rows_follow_each_weight_load():
+    """The context write's stacked KV rows are every layer's, refreshed in
+    place on reload so captured graphs read the new weights."""
+    from tokenspeed.runtime.distributed.mapping import Mapping
+
+    model = _tiny_draft(Mapping(rank=0, world_size=1))
+
+    def kv_rows():
+        return torch.cat(
+            [
+                layer.self_attn.fused_qkv_a_proj_with_mqa.weight[
+                    layer.self_attn.q_lora_rank :
+                ]
+                for layer in model.layers
+            ]
+        )
+
+    stacked = model._kv_a_weight
+    assert torch.equal(stacked, kv_rows())
+    for layer in model.layers:
+        layer.self_attn.fused_qkv_a_proj_with_mqa.weight.data.mul_(2.0)
+    model.post_load_weights()
+    assert model._kv_a_weight is stacked
+    assert torch.equal(stacked, kv_rows())

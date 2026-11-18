@@ -558,6 +558,7 @@ def test_single_pass_route_reduction_matches_two_pass(
     if use_map:
         permute_map = torch.randperm(rows, device=device).to(torch.int32)
         permute_map[torch.tensor([2, 9, 30], device=device)] = -1
+        permute_map[3 * topk : 4 * topk] = -1  # every route of token 3 is remote
     route_weights = torch.rand(tokens, topk, device=device, dtype=torch.float32)
     norm_weight = torch.randn(width, device=device, dtype=torch.bfloat16) * 0.1
     outputs = []

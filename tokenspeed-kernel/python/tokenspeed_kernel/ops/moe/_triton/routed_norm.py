@@ -242,6 +242,9 @@ ROUTED_SUM_SINGLE_PASS_MAX_BLOCK_CDNA4 = 8192
 # CDNA4, complete routes: one program per token wins from this many tokens.
 ROUTED_SUM_SINGLE_PASS_MIN_TOKENS_CDNA4 = 152
 
+# Blackwell, mapped routes: the widest block measured faster in one launch.
+ROUTED_SUM_SINGLE_PASS_MAX_BLOCK_BLACKWELL = 16384
+
 
 def _routed_sum_single_pass(num_tokens: int, block: int, has_map: bool) -> bool:
     """Whether one program per token reduces the routes instead of two launches.
@@ -257,7 +260,12 @@ def _routed_sum_single_pass(num_tokens: int, block: int, has_map: bool) -> bool:
         # each program reads all of its token's routes: one launch is slower
         # from 8 to 128 tokens, about even at 136-144 and faster from 152.
         return has_map or num_tokens >= ROUTED_SUM_SINGLE_PASS_MIN_TOKENS_CDNA4
-    return False
+    # GB200, top-8 with 1/2-1/8 of the routes on this rank: one launch wins at 65-2048 tokens, widths 4096-16384.
+    return (
+        has_map
+        and current_platform().is_blackwell_plus
+        and block <= ROUTED_SUM_SINGLE_PASS_MAX_BLOCK_BLACKWELL
+    )
 
 
 @register_kernel(
@@ -330,6 +338,30 @@ def triton_routed_input_scale_rmsnorm_sum(
 
 
 @triton.jit
+def _add_normalized_route(
+    acc,
+    routes_ptr,
+    row,
+    row_stride,
+    route_weights_ptr,
+    route,
+    dims,
+    dim_mask,
+    norm_weight,
+    width: tl.constexpr,
+    eps: tl.constexpr,
+):
+    values = tl.load(routes_ptr + row * row_stride + dims, mask=dim_mask, other=0.0).to(
+        tl.float32
+    )
+    product = values * norm_weight
+    variance = tl.sum(product * product, axis=0) / width
+    inv_rms = tl.rsqrt(variance + eps)
+    route_weight = tl.load(route_weights_ptr + route).to(tl.float32)
+    return acc + product * inv_rms * route_weight
+
+
+@triton.jit
 def _routed_input_scale_rmsnorm_sum_token_kernel(
     routes_ptr,
     map_ptr,
@@ -360,19 +392,35 @@ def _routed_input_scale_rmsnorm_sum_token_kernel(
         route = token * topk + slot
         if HAS_MAP:
             row = tl.load(map_ptr + route)
-            row_mask = dim_mask & (row >= 0)
-            row = tl.maximum(row, 0).to(tl.int64)
+            # A route another rank owns (-1) would add exact zeros; skip its reduction.
+            if row >= 0:
+                acc = _add_normalized_route(
+                    acc,
+                    routes_ptr,
+                    row.to(tl.int64),
+                    row_stride,
+                    route_weights_ptr,
+                    route,
+                    dims,
+                    dim_mask,
+                    norm_weight,
+                    width,
+                    eps,
+                )
         else:
-            row_mask = dim_mask
-            row = route.to(tl.int64)
-        values = tl.load(
-            routes_ptr + row * row_stride + dims, mask=row_mask, other=0.0
-        ).to(tl.float32)
-        product = values * norm_weight
-        variance = tl.sum(product * product, axis=0) / width
-        inv_rms = tl.rsqrt(variance + eps)
-        route_weight = tl.load(route_weights_ptr + route).to(tl.float32)
-        acc += product * inv_rms * route_weight
+            acc = _add_normalized_route(
+                acc,
+                routes_ptr,
+                route.to(tl.int64),
+                row_stride,
+                route_weights_ptr,
+                route,
+                dims,
+                dim_mask,
+                norm_weight,
+                width,
+                eps,
+            )
     tl.store(out_ptr + token * width + dims, acc, mask=dim_mask)
 
 
