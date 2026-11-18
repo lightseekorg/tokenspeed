@@ -148,6 +148,28 @@ def test_probe_holds_disjoint_parents_for_every_capture_group(family) -> None:
     assert built.spec.memory_plan.num_lcm_blocks >= parents
 
 
+def test_per_forward_workspace_counts_toward_peak_only(monkeypatch) -> None:
+    from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
+
+    recipe = _kimi_k3_recipe(max_bs=1)
+    recipe.probe_batch_rows = 1
+    temporary_bytes = 32768
+    monkeypatch.setattr(recipe, "temporary_workspace_bytes", lambda: temporary_bytes)
+    setup = recipe.setup()
+    arena = CacheArena(
+        setup.spec.memory_plan, "cpu", cache_group_specs=setup.spec.cache_group_specs
+    )
+    report = registry._cache_storage_report(
+        pool=SimpleNamespace(arena=arena),
+        configured_cache_bytes=setup.cache_budget_bytes,
+        fixed_workspace_bytes=setup.fixed_workspace_bytes,
+        temporary_workspace_bytes=setup.temporary_workspace_bytes,
+    )
+    assert setup.fixed_workspace_bytes == recipe.workspace_bytes()
+    assert report["allocated_cache_bytes"] + temporary_bytes == setup.cache_budget_bytes
+    assert report["planned_peak_cache_bytes"] == setup.cache_budget_bytes
+
+
 def test_the_probe_arena_does_not_grow_with_max_num_seqs() -> None:
     def arena_bytes(max_bs: int) -> int:
         recipe = _kimi_k3_recipe(max_bs=max_bs)

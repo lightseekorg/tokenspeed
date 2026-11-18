@@ -154,6 +154,7 @@ class CacheSetup:
     # The linear backend verifies from paged state and owns the planned
     # ``fixed_workspace_bytes`` of verify staging.
     uses_paged_state_verify: bool
+    temporary_workspace_bytes: int = 0
 
     @property
     def num_target_layers(self) -> int:
