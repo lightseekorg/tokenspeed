@@ -583,14 +583,14 @@ def make_kplane_w_descriptor(cfg: MoEConfig, w_tile_ptr, N, K):
     ``[W_KPLANE_ROWS, BLOCK_K // DIV_FACTOR_W]`` slab, so one weight tile is a
     single contiguous run instead of short pieces of every N row. ``N`` counts
     the rows left from this tile's start in the first plane; step ``k`` sits
-    ``k * W_KPLANE_ROWS`` rows further on.
+    ``k * W_KPLANE_ROWS`` rows further on. A K that is not a whole number of
+    steps has a last plane padded with zero weights.
     """
     gl.static_assert(cfg.W_TRANSPOSE, "K-plane weights are N-major")
-    gl.static_assert(cfg.EVEN_K, "K-plane weights need whole K steps")
     PLANE_BYTES: gl.constexpr = cfg.BLOCK_K // cfg.DIV_FACTOR_W
     return gl.amd.cdna5.tdm.make_tensor_descriptor(
         base=w_tile_ptr,
-        shape=((K // cfg.BLOCK_K - 1) * cfg.W_KPLANE_ROWS + N, PLANE_BYTES),
+        shape=((gl.cdiv(K, cfg.BLOCK_K) - 1) * cfg.W_KPLANE_ROWS + N, PLANE_BYTES),
         strides=(PLANE_BYTES, 1),
         block_shape=(cfg.BLOCK_N, PLANE_BYTES),
         layout=cfg.shared_layout_w,

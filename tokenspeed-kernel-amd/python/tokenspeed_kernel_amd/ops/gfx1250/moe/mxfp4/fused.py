@@ -1589,14 +1589,13 @@ def matmul(
         if (
             kplane_rows != N
             or plane_bytes != block_k // (2 if b_torch.dtype == torch.uint8 else 1)
-            or K % block_k
             or N % block_n
             or schedule != "baseline"
             or pingpong
         ):
             raise ValueError(
                 f"K-plane weights with {plane_bytes}-byte planes of {kplane_rows} "
-                f"rows need block_k covering one plane, whole K and N tiles and the "
+                f"rows need block_k covering one plane, whole N tiles and the "
                 f"baseline schedule; got N={N}, K={K}, block_n={block_n}, "
                 f"block_k={block_k}, schedule={schedule}, pingpong={pingpong}"
             )
@@ -3622,15 +3621,17 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         decode_block_m = (
             _resolve_block_m(True, rows, num_experts) if block_m is None else block_m
         )
+        w2_raw = w2_weight.storage.data if isinstance(w2_weight, Tensor) else w2_weight
         gate_up_tiles = decode_tile_config(gate_up_k, fp8_activation, decode_block_m)
-        down_tiles = decode_tile_config(down_k, fp8_activation, decode_block_m)
+        down_tiles = decode_tile_config(
+            down_k,
+            fp8_activation or bool(getattr(w2_raw, "kplane_bytes", 0)),
+            decode_block_m,
+        )
         gate_up_group_m = _DECODE_QUEUED_GATE_UP_GROUP_M
         if block_m is None and decode_block_m == 16:
             # Residency is measured with decode's 16-row tile; other row tiles
             # keep the tiles above.
-            w2_raw = (
-                w2_weight.storage.data if isinstance(w2_weight, Tensor) else w2_weight
-            )
             blocks = RaggedTensorMetadata.n_blocks(num_experts, rows, 16)
             cus = torch.cuda.get_device_properties(
                 hidden_states.device
@@ -3654,6 +3655,20 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         else:
             gate_up_tiles = _PREFILL_MXFP4_ACTIVATION_GATE_UP_TILES
             down_tiles = _PREFILL_MXFP4_ACTIVATION_DOWN_TILES
+            w2_raw = (
+                w2_weight.storage.data if isinstance(w2_weight, Tensor) else w2_weight
+            )
+            plane_bytes = int(getattr(w2_raw, "kplane_bytes", 0))
+            if plane_bytes:
+                # A down weight stored in K planes is read one plane a K step;
+                # the narrower steps take a third buffer (DSV4.1 Flash TP4
+                # 187.5 -> 185.8 us at 2048 requests, Qwen3.8 Flash TP2 114.2
+                # -> 113.0 us).
+                down_tiles = {
+                    **down_tiles,
+                    "block_k": 2 * plane_bytes,
+                    "num_buffers": 3,
+                }
     launch = dict(
         block_m=block_m,
         decode=decode,

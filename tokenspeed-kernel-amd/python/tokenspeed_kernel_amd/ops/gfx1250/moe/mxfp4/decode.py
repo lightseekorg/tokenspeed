@@ -45,7 +45,7 @@ from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.quantize import (
 _DECODE_LONG_K = 2048
 
 
-def decode_tile_config(k: int, fp8_activation: bool, block_m: int) -> dict[str, int]:
+def decode_tile_config(k: int, wide_short_k: bool, block_m: int) -> dict[str, int]:
     """Return the decode tile for a projection with reduction length ``k``.
 
     Decode streams each touched expert's weights once, so the tile is chosen
@@ -57,12 +57,14 @@ def decode_tile_config(k: int, fp8_activation: bool, block_m: int) -> dict[str, 
     three buffers leave two (1 to 2% faster from 512 to 1344 Kimi K3 requests
     and on DSV4.1 Flash and Qwen3.8 Flash at the same occupancy).
 
-    A short K spends most of each program in its fixed startup. With FP8
-    activations it takes 256-column tiles to halve the programs, and two
-    buffers of ``block_k=128`` so a program waits for one K step's tiles before
-    its first WMMA. With MXFP4 activations that tile measured up to 9% slower
-    than three buffers of 128 columns (DSV4.1 Flash TP4, 32 to 512 requests),
-    whose small LDS footprint keeps ten programs resident on a CU.
+    A short K spends most of each program in its fixed startup. With
+    ``wide_short_k`` (FP8 activations, or MXFP4 activations over a weight
+    stored in K planes) it takes 256-column tiles to halve the programs, and
+    two buffers of ``block_k=128`` so a program waits for one K step's tiles
+    before its first WMMA. Over a row-major weight with MXFP4 activations
+    that tile measured up to 9% slower than three buffers of 128 columns
+    (DSV4.1 Flash TP4, 32 to 512 requests), whose small LDS footprint keeps
+    ten programs resident on a CU.
     """
     if k >= _DECODE_LONG_K:
         return {
@@ -71,7 +73,7 @@ def decode_tile_config(k: int, fp8_activation: bool, block_m: int) -> dict[str, 
             "num_buffers": 3 if block_m == 16 else 2,
             "num_warps": 4,
         }
-    if fp8_activation:
+    if wide_short_k:
         return {"block_n": 256, "block_k": 128, "num_buffers": 2, "num_warps": 4}
     return {"block_n": 128, "block_k": 128, "num_buffers": 3, "num_warps": 4}
 

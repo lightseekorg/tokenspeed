@@ -1538,8 +1538,8 @@ if platform.is_amd:
     )
     from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4 import fused as fused_mxfp_gfx1250
     from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.weight_preprocess import (
-        preprocess_gluon_mxfp4_gfx1250_moe_weights,
         preprocess_gluon_mxfp4_gfx1250_situ_moe_weights,
+        preprocess_gluon_mxfp4_gfx1250_swiglu_moe_weights,
     )
 
     def gluon_mxfp4_gfx950_moe_weights(plan: dict, w: torch.nn.Module):
@@ -1559,7 +1559,7 @@ if platform.is_amd:
         preprocess_n16_mxfp4_weights(w)
 
     def gluon_mxfp4_gfx1250_moe_weights(plan: dict, w: torch.nn.Module):
-        return preprocess_gluon_mxfp4_gfx1250_moe_weights(plan, w)
+        return preprocess_gluon_mxfp4_gfx1250_swiglu_moe_weights(plan, w)
 
     def gluon_mxfp4_gfx1250_situ_moe_weights(plan: dict, w: torch.nn.Module):
         return preprocess_gluon_mxfp4_gfx1250_situ_moe_weights(plan, w)
@@ -2583,6 +2583,13 @@ if platform.is_amd:
         activation_dtype = (
             "fp8" if plan.get("internal_activation_dtype") == "fp8" else "mxfp4"
         )
+        if getattr(w, "_gluon_w2_is_kplane", False) and not getattr(
+            w.w2_weight_triton_tensor, "kplane_rows", 0
+        ):
+            raise ValueError(
+                "gfx1250 MXFP4 MoE down weight lost its K-plane layout "
+                "attributes after preprocessing"
+            )
 
         swiglu_alpha, swiglu_limit, swiglu_beta = _swiglu_args(w)
         w13_pc = w.w13_precision_config

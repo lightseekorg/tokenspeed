@@ -84,6 +84,7 @@ from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.quantize import (  # noqa: E402
 )
 from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.weight_preprocess import (  # noqa: E402
     preprocess_gluon_mxfp4_gfx1250_moe_weights,
+    preprocess_gluon_mxfp4_gfx1250_swiglu_moe_weights,
 )
 
 
@@ -1253,6 +1254,59 @@ def test_dynamic_mxfp4_activation_moe_gfx1250(decode: bool, num_tokens: int) -> 
     assert actual.shape == hidden_states.shape
     assert torch.count_nonzero(expected).item() > 0
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("decode", [True, False], ids=["decode", "prefill"])
+@pytest.mark.parametrize(
+    "intermediate_size", [256, 320], ids=["whole-planes", "partial-plane"]
+)
+def test_gfx1250_mxfp4_activation_kplane_down_weight_matches_row_major(
+    intermediate_size: int, decode: bool
+) -> None:
+    if not is_cdna5():
+        pytest.skip("gfx1250 is required for the CDNA5 MXFP4 MoE kernel")
+
+    generator = torch.Generator(device="cuda").manual_seed(20261118)
+    # Qwen3.8 Flash TP2's hidden size and, with 320, its down K.
+    hidden_size, num_experts, top_k = 2560, 8, 2
+    num_tokens = 8 if decode else 256
+    raw = make_mxfp4_moe_weights(num_experts, hidden_size, intermediate_size, generator)
+    hidden_states = torch.randn(
+        num_tokens,
+        hidden_size,
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    topk_weights, topk_ids = make_round_robin_topk(num_tokens, num_experts, top_k)
+
+    def apply(preprocess) -> tuple[torch.Tensor, torch.nn.Module]:
+        module = _make_mxfp4_moe_module(raw)
+        preprocess({}, module)
+        out = _gfx1250_static_moe(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            module.w13_weight_triton_tensor,
+            module.w2_weight_triton_tensor,
+            w13_mx_scale=module.w13_precision_config.b_mx_scale,
+            w2_mx_scale=module.w2_precision_config.b_mx_scale,
+            decode=decode,
+            activation_dtype="mxfp4",
+        )
+        return out.clone(), module
+
+    row_major, rows_module = apply(preprocess_gluon_mxfp4_gfx1250_moe_weights)
+    kplane, planes_module = apply(preprocess_gluon_mxfp4_gfx1250_swiglu_moe_weights)
+    torch.cuda.synchronize()
+    assert not getattr(rows_module.w2_weight_triton_tensor, "kplane_bytes", 0)
+    # 128-wide K steps: 64-byte planes of every N row, the last one zero-padded
+    # when K is not a whole number of steps.
+    planes = planes_module.w2_weight_triton_tensor
+    assert (planes.kplane_rows, planes.kplane_bytes) == (hidden_size, 64)
+    assert planes.stride(0) == hidden_size * 64 * -(-intermediate_size // 128)
+    assert torch.count_nonzero(row_major).item() > 0
+    torch.testing.assert_close(kplane, row_major, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize(
