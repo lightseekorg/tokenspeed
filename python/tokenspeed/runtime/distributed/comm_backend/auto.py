@@ -749,7 +749,7 @@ class AutoBackend(CommBackend):
 
     def _small_exchange(
         self, output: torch.Tensor, input: torch.Tensor, group: Group, gather: bool
-    ):
+    ) -> object | None:
         """The group's prepared LL exchange when it serves this call, else None.
 
         Only sizes and the group decide, which every rank of a call shares;

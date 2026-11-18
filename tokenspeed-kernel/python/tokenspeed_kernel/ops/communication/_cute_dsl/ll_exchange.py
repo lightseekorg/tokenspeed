@@ -118,6 +118,7 @@ def _poll_unit(slot, out, epoch, deadline, *, loc=None, ip=None):
 
 @dsl_user_op
 def _globaltimer(*, loc=None, ip=None):
+    """The ``%globaltimer`` nanosecond clock that bounds every wait."""
     value = llvm.inline_asm(
         T.i64(),
         [],
@@ -134,6 +135,7 @@ def _globaltimer(*, loc=None, ip=None):
 
 @dsl_user_op
 def _load_count(ctrl, *, loc=None, ip=None):
+    """The call count the last call's final CTA published at ``ctrl``."""
     value = llvm.inline_asm(
         T.i64(),
         [ctrl.ir_value(loc=loc, ip=ip)],
@@ -180,6 +182,7 @@ class LLExchange:
 
     @cute.kernel
     def kernel(self, src: Int64, out: Int64, peers: cute.Tensor, ctrl: Int64, units: Int32, cap: Int32, rank: Int32, grid: Int32, multicast: Int64, timeout: Int64):  # fmt: skip
+        """Push this rank's units for the call's parity, then poll every rank's."""
         tid, _, _ = cute.arch.thread_idx()
         block, _, _ = cute.arch.block_idx()
         deadline = _globaltimer() + timeout
@@ -239,6 +242,10 @@ class LLExchangeState:
         multicast: bool,
         timeout_ns: int,
     ) -> None:
+        """Allocate, rendezvous, and compile the group's exchange (collective).
+
+        Every rank calls this before graph capture; the workspace starts zeroed.
+        """
         self.ranks = group.size()
         self.rank = group.rank()
         self.device = device

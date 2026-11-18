@@ -333,7 +333,14 @@ def create_paged_row_all_gather_state(
     )
 
 
-def _check_ll_tensors(state, input: torch.Tensor, out: torch.Tensor, gather: bool):
+def _check_ll_tensors(
+    state, input: torch.Tensor, out: torch.Tensor, gather: bool
+) -> None:
+    """Raise ValueError unless this state's LL exchange serves the operands.
+
+    ``input`` and ``out`` must be contiguous, 16-byte aligned payloads of the
+    sizes it serves.
+    """
     payload = input.numel() * input.element_size()
     if not gather:
         payload //= state.ranks
