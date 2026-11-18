@@ -48,7 +48,7 @@ from tokenspeed.runtime.layers.mlp import GatedMLP, GatedMLPFusion
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
 )
-from tokenspeed.runtime.models.qwen3 import Qwen3ForCausalLM
+from tokenspeed.runtime.models.qwen3 import Qwen3DecoderLayer, Qwen3ForCausalLM
 
 
 @dataclass(frozen=True)
@@ -94,6 +94,86 @@ class FinalMLPReplay:
     intervened_mlp_output: torch.Tensor
 
 
+def _validate_observer_request(
+    model: Qwen3ForCausalLM,
+    num_rows: int,
+    num_logits_rows: int,
+    execution: str,
+    speculative: bool,
+    monokernel: bool,
+) -> None:
+    if execution != "eager" or speculative or monokernel:
+        raise ValueError(
+            "Observation requires eager, non-speculative, non-monokernel execution"
+        )
+    if type(model) is not Qwen3ForCausalLM:
+        raise ValueError(
+            "Observation supports the ordinary dense Qwen3ForCausalLM only"
+        )
+    if model.mapping.world_size != 1 or model.mapping.pp_size != 1:
+        raise ValueError("Observation requires one device (TP=PP=DP=1)")
+    if model.quant_config is not None or model._weight_update_active:
+        raise ValueError(
+            "Observation requires unquantized weights outside a weight update"
+        )
+    if (
+        type(num_rows) is not int
+        or type(num_logits_rows) is not int
+        or num_rows <= 0
+        or not 0 < num_logits_rows <= num_rows
+    ):
+        raise ValueError("Require 0 < num_logits_rows <= num_rows")
+
+
+def _validated_model_suffix(
+    model: Qwen3ForCausalLM,
+) -> tuple[Qwen3DecoderLayer, GatedMLP, str, torch.Tensor]:
+    layer = model.model.layers[-1]
+    mlp = layer.mlp
+    if (
+        type(mlp) is not GatedMLP
+        or mlp.fusion is not GatedMLPFusion.NONE
+        or type(mlp.act_fn) is not SiluAndMul
+        or mlp.act_fn.swiglu_limit is not None
+        or type(mlp.gate_up_proj.quant_method) is not UnquantizedLinearMethod
+        or type(mlp.down_proj.quant_method) is not UnquantizedLinearMethod
+    ):
+        raise ValueError("Observation requires an unfused, unquantized SwiGLU MLP")
+    if (
+        type(model.model.norm) is not RMSNorm
+        or type(layer.post_attention_layernorm) is not RMSNorm
+        or type(model.logits_processor) is not LogitsProcessor
+        or type(model.lm_head.quant_method)
+        not in (UnquantizedLinearMethod, UnquantizedEmbeddingMethod)
+    ):
+        raise ValueError(
+            "Observation requires the ordinary unquantized RMSNorm/head suffix"
+        )
+    processor = model.logits_processor
+    if (
+        processor.dp_sampling_enabled
+        or processor.do_argmax
+        or processor._sampled_shard_start is not None
+    ):
+        raise ValueError("Observation requires ordinary full-vocabulary logits")
+    mode = layer.comm_manager.layer_boundary_norm
+    if mode not in ("fused", "unfused"):
+        raise ValueError(f"Unsupported residual-add/norm mode: {mode}")
+    weight = mlp.down_proj.weight
+    if weight.dtype not in (torch.bfloat16, torch.float32):
+        raise ValueError("Observation supports BF16 or FP32 tensors only")
+    weights = (
+        mlp.gate_up_proj.weight,
+        weight,
+        layer.post_attention_layernorm.weight,
+        model.model.norm.weight,
+        model.lm_head.weight,
+    )
+    if any(w.device != weight.device or w.dtype != weight.dtype for w in weights):
+        raise ValueError("Observed projections and norms must share a dtype and device")
+    return layer, mlp, mode, weight
+
+
 class FinalMLPObserver:
     """Observe one eager Qwen3 forward at a time using private fixed buffers.
 
@@ -125,72 +205,10 @@ class FinalMLPObserver:
         speculative: bool,
         monokernel: bool,
     ) -> None:
-        if execution != "eager" or speculative or monokernel:
-            raise ValueError(
-                "Observation requires eager, non-speculative, non-monokernel execution"
-            )
-        if type(model) is not Qwen3ForCausalLM:
-            raise ValueError(
-                "Observation supports the ordinary dense Qwen3ForCausalLM only"
-            )
-        if model.mapping.world_size != 1 or model.mapping.pp_size != 1:
-            raise ValueError("Observation requires one device (TP=PP=DP=1)")
-        if model.quant_config is not None or model._weight_update_active:
-            raise ValueError(
-                "Observation requires unquantized weights outside a weight update"
-            )
-        if (
-            type(num_rows) is not int
-            or type(num_logits_rows) is not int
-            or num_rows <= 0
-            or not 0 < num_logits_rows <= num_rows
-        ):
-            raise ValueError("Require 0 < num_logits_rows <= num_rows")
-        layer = model.model.layers[-1]
-        mlp = layer.mlp
-        if (
-            type(mlp) is not GatedMLP
-            or mlp.fusion is not GatedMLPFusion.NONE
-            or type(mlp.act_fn) is not SiluAndMul
-            or mlp.act_fn.swiglu_limit is not None
-            or type(mlp.gate_up_proj.quant_method) is not UnquantizedLinearMethod
-            or type(mlp.down_proj.quant_method) is not UnquantizedLinearMethod
-        ):
-            raise ValueError("Observation requires an unfused, unquantized SwiGLU MLP")
-        if (
-            type(model.model.norm) is not RMSNorm
-            or type(layer.post_attention_layernorm) is not RMSNorm
-            or type(model.logits_processor) is not LogitsProcessor
-            or type(model.lm_head.quant_method)
-            not in (UnquantizedLinearMethod, UnquantizedEmbeddingMethod)
-        ):
-            raise ValueError(
-                "Observation requires the ordinary unquantized RMSNorm/head suffix"
-            )
-        processor = model.logits_processor
-        if (
-            processor.dp_sampling_enabled
-            or processor.do_argmax
-            or processor._sampled_shard_start is not None
-        ):
-            raise ValueError("Observation requires ordinary full-vocabulary logits")
-        mode = layer.comm_manager.layer_boundary_norm
-        if mode not in ("fused", "unfused"):
-            raise ValueError(f"Unsupported residual-add/norm mode: {mode}")
-        weight = mlp.down_proj.weight
-        if weight.dtype not in (torch.bfloat16, torch.float32):
-            raise ValueError("Observation supports BF16 or FP32 tensors only")
-        weights = (
-            mlp.gate_up_proj.weight,
-            weight,
-            layer.post_attention_layernorm.weight,
-            model.model.norm.weight,
-            model.lm_head.weight,
+        _validate_observer_request(
+            model, num_rows, num_logits_rows, execution, speculative, monokernel
         )
-        if any(w.device != weight.device or w.dtype != weight.dtype for w in weights):
-            raise ValueError(
-                "Observed projections and norms must share a dtype and device"
-            )
+        layer, mlp, mode, weight = _validated_model_suffix(model)
         self._model = model
         self._layer = layer
         self._mlp = mlp
