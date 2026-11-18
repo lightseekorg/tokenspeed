@@ -2532,6 +2532,84 @@ retains an independent scan over chunks, with partial expert groups masked.
 When the layer quantizes an MXFP4 input, the placement stage adds one program
 per 8 x 512 tile of it after its routing programs.
 
+### gfx1250 warp-pipelined FP8 x MXFP4 experts
+
+`gluon_mxfp_precomputed_mxfp4_warp_pipelined_moe` (`mxfp4/warp_pipelined.py`)
+runs the FP8-activation layer of the section above on the same preprocessed
+weights, routing and numerics: E4M3 activations scaled by the static
+per-tensor input scales, a gate/up epilogue that applies SwiGLU or SiTU and
+writes E4M3, and a down GEMM scattered to the route rows before the weighted
+top-k reduction. Three kernels replace the two expert GEMMs:
+
+- `gluon_moe_gate_up_warp_pipelined_gfx1250`: persistent prefill gate/up.
+- `gluon_moe_down_warp_pipelined_gfx1250`: prefill down, one tile per
+  program; `gluon_moe_down_warp_pipelined_persistent_gfx1250` keeps the ring
+  across tiles and stores from registers.
+- `gluon_moe_decode_warp_pipelined_gfx1250`: persistent 16-row decode tiles
+  for either GEMM.
+
+#### Contract
+
+- Prefill tiles are `block_m` routed rows by 512 columns with 256-wide K
+  tiles. The gate/up K must span at least three K tiles (K > 512); the down
+  K at least `num_buffers` of them, so a two-slot ring covers K of 384 or 512.
+  Decode tiles are 16 x 128 with `block_k` from 128 to 512.
+- M, N and K need not be tile multiples. Every K step moves its TDM
+  descriptors with `clamp_bounds`, so a partial last K tile reads zeros past
+  K; `add_offsets` alone moves the tile but keeps the descriptor's extent.
+- A cluster of `cta_m` workgroups owns `block_m * cta_m` rows of one expert
+  and shares each W tile by multicast; that product must be a routing block
+  size.
+- `resolve_partition_conflicts` splits X (by rows) and W over the two LDS
+  partitions, so the two warps that issue together read different
+  partitions. The gate/up GEMM gathers into, and stores its output from, the
+  row-partitioned X ring; that needs a Triton whose TDM gather and store
+  accept partitioned layouts. It measured no faster for gate/up, so only the
+  down GEMM enables it by default.
+- Per-batch counts and routing buffers are `do_not_specialize`, so token
+  counts never recompile a kernel.
+
+#### Algorithm
+
+Each program keeps a `num_buffers`-slot ring of X, W and W scales. Step t
+waits for K tile t, refills the slot step t - 1 consumed with K tile
+t + num_buffers - 1, and runs four warp-pipeline stages: load the low K half,
+its WMMAs, load the high half, its WMMAs. Warps 4-7 run one stage behind warps
+0-3, so one group reads LDS while the other issues WMMAs. Only warps 0-3
+produce TDM copies, because a TDM wait covers only the waiting warp's own
+copies and warps 4-7 reach theirs one stage late. Each K tile is one gather
+for X plus one fused copy of W and its scales (gate/up), or one fused copy of
+all three (down; two copies when the operands are partitioned).
+
+The persistent kernels issue the next tile's leading K tiles before the
+epilogue, so their latency hides under it. The gate/up epilogue stages its
+256-column E4M3 output in a ring slot and leaves the TDM store in flight; the
+next tile's first wait retires it, since TDM ops complete in order. The
+one-tile down kernel allocates its ring per tile, so the BF16 output tile is
+staged in the LDS the ring frees and scattered with one TDM op.
+
+The decode kernel keeps two 16-row programs per CU and streams each touched
+expert's W once with non-temporal loads. The down GEMM may stage its output
+and copy it with asynchronous LDS-to-global stores that drain under the next
+tile's K loop.
+
+`select_prefill_tiles` and `select_decode_tiles` hold the tiles measured on
+MI450 for GPT-OSS-120B, Kimi K3 (TP8 and EP8 shards), GLM-5.3-Flash and
+DeepSeek V4.1-Flash expert shapes. Against the A8W4 GEMMs of the section
+above, at 4096 to 8192 tokens the down GEMM runs 20% to 140% faster wherever
+its K spans three K tiles, and gate/up 30% to 50% faster except for Kimi K3
+(20% slower to 15% faster). A down K of 384 or 512 (two-slot ring) and Kimi K3
+TP8's 768-column gate/up stay slower than A8W4, as do prefill batches near
+1024 tokens. Decode GEMMs match or beat A8W4 except the down GEMM with K of
+384 or 512. With FP8 activations, `gluon_mxfp_precomputed_mxfp4_fused_moe`
+runs a projection on these kernels only for the shapes and token counts where
+`select_warp_pipelined_gemms` lists a measured gain above 10%, and on the A8W4
+kernels otherwise.
+
+The fused gate activations use approximate (2.5 ULP) reciprocals and an
+exponential form of `tanh`; libdevice `tanh` made the SiTU epilogue 15% to
+20% slower and, on newer Triton, spilled about 400 VGPRs.
+
 ### Causal MLA verification on gfx950
 
 `gluon_mla_decode_fp8_query_blocks_gfx950` decodes 2–16 causal queries per
