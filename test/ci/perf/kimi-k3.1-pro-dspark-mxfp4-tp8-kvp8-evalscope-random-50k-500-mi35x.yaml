@@ -1,10 +1,9 @@
 api_version: ci.tokenspeed.io/v1
-# Kimi-K3.1 Pro + Kimi-K3.1 DSpark long-context performance gate.
+# Kimi-K3.1 Pro + Kimi-K3.1 DSpark long-context burst (report-only).
 name: perf-kimi-k3.1-pro-dspark-mxfp4-tp8-kvp8-random-50k-500-mi35x
 type: perf
 workflow_stage: model-test
 triggers:
-  - per-commit
   - manual
 runner:
   labels:
@@ -24,7 +23,7 @@ server:
     --tokenizer ${KIMI_K31_GATEWAY_TOKENIZER:?K3.1_gateway_tokenizer_not_staged}
     --served-model-name kimi-k3.1
     --trust-remote-code
-    --max-model-len 65536
+    --max-model-len 131072
     --kv-cache-dtype fp8
     --dsa-index-k-format mxfp4
     --tensor-parallel-size 8

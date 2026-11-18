@@ -26,7 +26,7 @@ server:
     --tokenizer ${KIMI_K31_GATEWAY_TOKENIZER:?K3.1_gateway_tokenizer_not_staged}
     --served-model-name kimi-k3.1
     --trust-remote-code
-    --max-model-len 65536
+    --max-model-len 131072
     --kv-cache-dtype fp8
     --dsa-index-k-format mxfp4
     --tensor-parallel-size 8

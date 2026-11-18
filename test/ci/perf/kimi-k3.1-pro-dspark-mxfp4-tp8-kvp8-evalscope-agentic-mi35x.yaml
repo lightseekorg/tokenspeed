@@ -1,0 +1,105 @@
+api_version: ci.tokenspeed.io/v1
+# Kimi-K3.1 Pro + Kimi-K3.1 DSpark multi-turn agentic performance gate.
+name: perf-kimi-k3.1-pro-dspark-mxfp4-tp8-kvp8-agentic-mi35x
+type: perf
+workflow_stage: model-test
+triggers:
+  - per-commit
+  - manual
+runner:
+  labels:
+    - amd-mi350-8gpu-bench
+env:
+  CI: "true"
+  KIMI_K31_GATEWAY_TOKENIZER: /cache/huggingface/kimi-k3.1-gateway-tokenizer
+  GPU_MAX_HW_QUEUES: "2"
+install:
+  - bash test/ci_system/install_deps_rocm.sh
+# The server flags are the Kimi-K3.1 AMD recipe in docs/recipes/models.md plus
+# the CI-only flags listed in test_eval_configs.py; that test checks the match.
+server:
+  command: >-
+    ts serve
+    --model moonshotai/Kimi-K3.1-Pro
+    --tokenizer ${KIMI_K31_GATEWAY_TOKENIZER:?K3.1_gateway_tokenizer_not_staged}
+    --served-model-name kimi-k3.1
+    --trust-remote-code
+    --max-model-len 131072
+    --kv-cache-dtype fp8
+    --dsa-index-k-format mxfp4
+    --tensor-parallel-size 8
+    --mm-encoder-tp-mode data
+    --kv-parallel-size 8
+    --decode-context-parallel-size 8
+    --speculative-algorithm DSPARK
+    --speculative-draft-model-path Inferact/Kimi-K3.1-Pro-DSpark
+    --speculative-num-steps 5
+    --drafter-attention-backend mha
+    --prefill-graph-max-tokens 3072
+    --prefill-graph-capture-token-sizes 256 512 1024 1536 2048 3072
+    --disable-kvstore
+    --enable-startup-requests
+    --host 127.0.0.1
+    --port 21000
+    --policy round_robin
+    --engine-startup-timeout 3000
+    --gateway-startup-timeout 600
+  ready:
+    url: http://127.0.0.1:21000/readiness
+    timeout: 3600
+    interval: 10
+perf:
+  install:
+    - python3 -m uv venv --seed --clear /tmp/evalscope-perf && python3 -m uv pip install --python /tmp/evalscope-perf/bin/python 'evalscope[perf]==1.11.1'
+    - >-
+      /tmp/evalscope-perf/bin/python -c
+      'from huggingface_hub import hf_hub_download;
+      hf_hub_download(repo_id="lightseekorg/agentic-dataset",
+      filename="agentic_dataset.json", repo_type="dataset",
+      revision="2779acd48a05c211f2f82eee71bdbdf688d984ca", local_dir="/tmp")'
+      && test -s /tmp/agentic_dataset.json
+  command: >-
+    REPO_ROOT=$PWD &&
+    OUTPUTS_DIR="$PWD/.ci-artifacts/published/kimi-k3.1-pro-dspark-tp8-kvp8-agentic-perf" &&
+    WARMUP_DIR=/tmp/kimi-k3.1-agentic-warmup &&
+    rm -rf "$OUTPUTS_DIR" "$WARMUP_DIR" &&
+    cd /tmp &&
+    /tmp/evalscope-perf/bin/evalscope perf
+    --model kimi-k3.1
+    --url http://127.0.0.1:21000/v1/chat/completions
+    --api openai
+    --dataset swe_smith
+    --dataset-path agentic_dataset.json
+    --max-tokens 500
+    --multi-turn
+    --number 2
+    --parallel 2
+    --dataset-offset 68
+    --outputs-dir "$WARMUP_DIR"
+    --extra-args '{"ignore_eos": true}' &&
+    set +e &&
+    /tmp/evalscope-perf/bin/evalscope perf
+    --model kimi-k3.1
+    --url http://127.0.0.1:21000/v1/chat/completions
+    --api openai
+    --dataset swe_smith
+    --dataset-path agentic_dataset.json
+    --max-tokens 500
+    --multi-turn
+    --number 64
+    --parallel 32
+    --outputs-dir "$OUTPUTS_DIR"
+    --extra-args '{"ignore_eos": true}'
+    --no-timestamp;
+    PERF_STATUS=$?;
+    if [ -d "$OUTPUTS_DIR/kimi-k3.1" ]; then
+    mv "$OUTPUTS_DIR/kimi-k3.1" "$OUTPUTS_DIR/kimi-k3.1_attn_tp8";
+    fi;
+    python3 "$REPO_ROOT/test/agentic_benchmark/kimi_k3/tokenspeed/collect_outputs.py" "$OUTPUTS_DIR";
+    PARSE_STATUS=$?;
+    echo "=== DSpark speculative decoding metrics ===";
+    curl -s http://127.0.0.1:21000/metrics | grep -E 'spec_|accept|draft' || true;
+    if [ "$PERF_STATUS" -ne 0 ]; then exit "$PERF_STATUS"; fi;
+    exit "$PARSE_STATUS"
+report:
+  github_step_summary: true

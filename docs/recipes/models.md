@@ -799,7 +799,7 @@ if the two drift apart.
 GPU_MAX_HW_QUEUES=2 tokenspeed serve moonshotai/Kimi-K3.1-Pro \
   --served-model-name kimi-k3.1 \
   --trust-remote-code \
-  --max-model-len 65536 \
+  --max-model-len 131072 \
   --kv-cache-dtype fp8 \
   --dsa-index-k-format mxfp4 \
   --tensor-parallel-size 8 \
@@ -822,7 +822,7 @@ GPU_MAX_HW_QUEUES=2 tokenspeed serve moonshotai/Kimi-K3.1-Pro \
   MoE selection, the `dsa` attention backend, an 8192-token prefill budget,
   `--gpu-memory-utilization 0.95`, prefix caching, and CUDA graph capture sizes
   up to the speculative `--max-num-seqs` default.
-- `--max-model-len 65536` caps requests at 64K tokens. Raise it for longer
+- `--max-model-len 131072` caps requests at 128K tokens. Raise it for longer
   prompts; at the checkpoint's full 1M context the speculative verify padding
   runs past the RoPE tables, and the server warns at startup.
 - `--mm-encoder-tp-mode data`: the vision encoder's 12 heads don't split 8

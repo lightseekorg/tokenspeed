@@ -355,6 +355,10 @@ KIMI_K31_AMD_RECIPE_CONFIGS = (
     (EVAL_CONFIG_DIR, "kimi-k3.1-pro-dspark-mxfp4-tp8-kvp8-evalscope-aime26-amd.yaml"),
     (
         PERF_CONFIG_DIR,
+        "kimi-k3.1-pro-dspark-mxfp4-tp8-kvp8-evalscope-agentic-mi35x.yaml",
+    ),
+    (
+        PERF_CONFIG_DIR,
         "kimi-k3.1-pro-dspark-mxfp4-tp8-kvp8-evalscope-random-50k-500-mi35x.yaml",
     ),
 )
@@ -418,8 +422,9 @@ def test_kimi_k31_amd_configs_have_expected_gating_and_baselines():
         task = yaml.safe_load((config_dir / filename).read_text(encoding="utf-8"))
         server_tokens = shlex.split(task["server"]["command"])
         is_recipe = "dspark" in filename
+        is_gate = is_recipe and "random-50k" not in filename
 
-        expected_triggers = ["per-commit", "manual"] if is_recipe else ["manual"]
+        expected_triggers = ["per-commit", "manual"] if is_gate else ["manual"]
         assert task["triggers"] == expected_triggers
         assert (
             task["env"]["KIMI_K31_GATEWAY_TOKENIZER"]
@@ -451,10 +456,10 @@ def test_kimi_k31_amd_configs_have_expected_gating_and_baselines():
             assert "perf_threshold" not in task
         tasks[filename] = task
 
-    eval_task, perf_task = (
+    eval_task, agentic_task, perf_task = (
         tasks[filename] for _, filename in KIMI_K31_AMD_RECIPE_CONFIGS
     )
-    for task in (eval_task, perf_task):
+    for task in (eval_task, agentic_task, perf_task):
         server_tokens = shlex.split(task["server"]["command"])
         assert flag_value(server_tokens, "--speculative-algorithm") == "DSPARK"
         # A step count equal to the default leaves the checkpoint's block width.
@@ -508,6 +513,30 @@ def test_kimi_k31_amd_configs_have_expected_gating_and_baselines():
     assert flag_value(perf_tokens, "--total-timeout") == "21600"
     assert "--no-apply-chat-template" in perf_tokens
     assert "--no-test-connection" in perf_tokens
+
+    assert "/tmp/agentic_dataset.json" in agentic_task["perf"]["install"][1]
+    assert (
+        'revision="2779acd48a05c211f2f82eee71bdbdf688d984ca"'
+        in agentic_task["perf"]["install"][1]
+    )
+    agentic_tokens = shlex.split(agentic_task["perf"]["command"])
+    # The warmup run precedes the measured one; flag_value needs one match.
+    measured = agentic_tokens[agentic_tokens.index("set") :]
+    for flag, value in {
+        "--dataset": "swe_smith",
+        "--max-tokens": "500",
+        "--parallel": "32",
+        "--number": "64",
+    }.items():
+        assert flag_value(measured, flag) == value
+    assert "--multi-turn" in measured
+    assert "--dataset-offset" not in measured
+    # collect_outputs.py reads the GPU count from the attn_tp suffix.
+    assert "$OUTPUTS_DIR/kimi-k3.1_attn_tp8;" in agentic_tokens
+    assert (
+        "$REPO_ROOT/test/agentic_benchmark/kimi_k3/tokenspeed/collect_outputs.py"
+        in agentic_tokens
+    )
 
 
 @pytest.mark.parametrize(
