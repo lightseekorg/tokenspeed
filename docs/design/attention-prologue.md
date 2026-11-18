@@ -487,3 +487,15 @@ K and V fields share a plane. Prologue and context scatters resolve a token
 slot as ``page * page_stride + row * row_stride``; flattening these pages
 would discard the gap occupied by the other field. Dense row caches keep
 their existing three-dimensional views.
+
+### Ascend DSA weight reloads
+
+The startup preparation hook is idempotent. After a complete canonical
+checkpoint replaces the parameters, the loader calls
+`AscendDSAAttention.reload_weights_after_loading()`: it folds the KV-LoRA
+normalization scale exactly once into the newly loaded gamma and refreshes
+absorbed projections, prefill gathers and fused decode operands. Derived
+tensors retain their storage so existing graph captures read the new values.
+This entry requires a complete canonical reload; it is not a second startup
+hook and must not be called on already folded weights. Projection packing
+and forward arithmetic are unchanged.

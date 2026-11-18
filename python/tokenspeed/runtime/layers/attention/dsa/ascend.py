@@ -46,6 +46,7 @@ from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import ColumnParallelLinear, ReplicatedLinear
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
+from tokenspeed.runtime.model_loader.weight_utils import bind_or_copy
 from tokenspeed.runtime.models.deepseek_v3 import (
     DeepseekV3AttentionMLA,
     _prepare_mla_kv_b_proj_weights,
@@ -217,54 +218,19 @@ class FusedDSADecode:
         self.eps_q, self.eps_kv = eps_q, eps_kv
         self.eps_index = layer.indexer.k_norm.variance_epsilon
 
-        def gathered(value):
-            value = value.detach().contiguous()
-            outputs = [torch.empty_like(value) for _ in range(8)]
-            dist.all_gather(outputs, value, group=group)
-            return torch.cat(outputs, 0)
-
-        qb = (
-            gathered(layer.q_b_proj.weight)
-            .cpu()
-            .view(layer.num_heads, 192, layer.q_lora_rank)
-        )
+        self._weight_group = group
         self.query_scale = 1.0
-        if layer.scale_q_lora:
-            scale = math.sqrt(layer.hidden_size / layer.q_lora_rank)
-            if self.index_heads != 64:
-                self.query_scale = scale
-            else:
-                qb = qb * scale
-        iqb = (
-            layer.indexer.wq_b.weight.detach()
-            .cpu()
-            .view(self.index_heads, 128, layer.q_lora_rank)
-        )
-        self.qb = self.kernels.prepare_projection_weight(pack_dsa_qb(qb, iqb).npu())
-        down = torch.cat(
-            (
-                layer.q_a_proj.weight.detach(),
-                layer.kv_a_proj_with_mqa.weight.detach(),
-                layer.indexer.wk.weight.detach(),
-            ),
-            0,
-        )
-        self.down = self.kernels.prepare_projection_weight(
-            pack_down_qa_panels(down.detach().cpu()).npu()
-        )
-        self.uk = gathered(layer.w_kc)
-        self.gamma_q = layer.q_a_layernorm.weight.detach().contiguous()
-        self.gamma_kv = layer.kv_a_layernorm.weight.detach().contiguous()
-        self.gamma_index = layer.indexer.k_norm.weight.detach().contiguous()
-        self.score_scale = (
-            layer.indexer.weights_softmax_scale if self.index_heads == 16 else 1.0
-        )
-        score_weight = layer.indexer.weights_proj.weight.detach().float()
-        if self.index_heads != 16:
-            score_weight = score_weight * layer.indexer.weights_softmax_scale
-        self.score_weight = pack_score_fp32(score_weight.contiguous())
-        self.w_vc = layer.w_vc.detach().contiguous()
-        self.w_o = layer.o_proj.weight.detach().contiguous()
+        self.score_scale = 1.0
+        self.qb: torch.Tensor | None = None
+        self.down: torch.Tensor | None = None
+        self.uk: torch.Tensor | None = None
+        self.gamma_q: torch.Tensor | None = None
+        self.gamma_kv: torch.Tensor | None = None
+        self.gamma_index: torch.Tensor | None = None
+        self.score_weight: torch.Tensor | None = None
+        self.w_vc: torch.Tensor | None = None
+        self.w_o: torch.Tensor | None = None
+        self.refresh_weights(layer)
         self.rotary_mode = int(layer.rotary_emb is not None) | (
             int(layer.indexer.use_rotary) << 1
         )
@@ -297,6 +263,71 @@ class FusedDSADecode:
             )
             for rows in DSA_DECODE_ROWS
         }
+
+    def refresh_weights(self, layer) -> None:
+        """Refresh derived projections without replacing captured weight storage."""
+
+        def gathered(value):
+            value = value.detach().contiguous()
+            outputs = [torch.empty_like(value) for _ in range(8)]
+            dist.all_gather(outputs, value, group=self._weight_group)
+            return torch.cat(outputs, 0)
+
+        qb = (
+            gathered(layer.q_b_proj.weight)
+            .cpu()
+            .view(layer.num_heads, 192, layer.q_lora_rank)
+        )
+        self.query_scale = 1.0
+        if layer.scale_q_lora:
+            scale = math.sqrt(layer.hidden_size / layer.q_lora_rank)
+            if self.index_heads != 64:
+                self.query_scale = scale
+            else:
+                qb = qb * scale
+        iqb = (
+            layer.indexer.wq_b.weight.detach()
+            .cpu()
+            .view(self.index_heads, 128, layer.q_lora_rank)
+        )
+        self.qb = bind_or_copy(
+            self.qb, self.kernels.prepare_projection_weight(pack_dsa_qb(qb, iqb).npu())
+        )
+        down = torch.cat(
+            (
+                layer.q_a_proj.weight.detach(),
+                layer.kv_a_proj_with_mqa.weight.detach(),
+                layer.indexer.wk.weight.detach(),
+            ),
+            0,
+        )
+        self.down = bind_or_copy(
+            self.down,
+            self.kernels.prepare_projection_weight(
+                pack_down_qa_panels(down.detach().cpu()).npu()
+            ),
+        )
+        self.uk = bind_or_copy(self.uk, gathered(layer.w_kc))
+        self.gamma_q = bind_or_copy(
+            self.gamma_q, layer.q_a_layernorm.weight.detach().contiguous()
+        )
+        self.gamma_kv = bind_or_copy(
+            self.gamma_kv, layer.kv_a_layernorm.weight.detach().contiguous()
+        )
+        self.gamma_index = bind_or_copy(
+            self.gamma_index, layer.indexer.k_norm.weight.detach().contiguous()
+        )
+        self.score_scale = (
+            layer.indexer.weights_softmax_scale if self.index_heads == 16 else 1.0
+        )
+        score_weight = layer.indexer.weights_proj.weight.detach().float()
+        if self.index_heads != 16:
+            score_weight = score_weight * layer.indexer.weights_softmax_scale
+        self.score_weight = bind_or_copy(
+            self.score_weight, pack_score_fp32(score_weight.contiguous())
+        )
+        self.w_vc = bind_or_copy(self.w_vc, layer.w_vc.detach().contiguous())
+        self.w_o = bind_or_copy(self.w_o, layer.o_proj.weight.detach().contiguous())
 
     def prolog(self, hidden, positions, ctx):
         if self.window is None:
@@ -531,7 +562,15 @@ class AscendDSAAttention(DeepseekV3AttentionMLA):
         self._fused_decode_runtime = runtime
 
     def process_weights_after_loading(self, _module=None):
-        if not self._scales_prepared:
+        """Prepare startup weights; repeated startup hooks are idempotent."""
+        self._prepare_weights(complete_reload=False)
+
+    def reload_weights_after_loading(self) -> None:
+        """Prepare a complete canonical reload, including captured operands."""
+        self._prepare_weights(complete_reload=True)
+
+    def _prepare_weights(self, *, complete_reload: bool) -> None:
+        if not self._scales_prepared or complete_reload:
             # The indexer consumes the unscaled normalized Q latent. Apply
             # Q-LoRA scaling after the main projection, never to this shared norm.
             if self.scale_kv_lora:
@@ -543,7 +582,7 @@ class AscendDSAAttention(DeepseekV3AttentionMLA):
                 self.kv_b_proj.weight, self
             )
 
-        if self.prefill_enabled and self._prefill_weights is None:
+        if self.prefill_enabled and (self._prefill_weights is None or complete_reload):
             group = self.mapping.attn.head_tp_group
             pg = (
                 process_group_manager.get_device_process_group(group)
@@ -560,12 +599,20 @@ class AscendDSAAttention(DeepseekV3AttentionMLA):
 
             # Token-local Prefill computes all heads and the complete O row.
             # Decode continues to use the original sharded weights.
-            self._prefill_weights = (
+            weights = (
                 gather(self.q_b_proj.weight, 0),
                 gather(self.w_kc, 0),
                 gather(self.w_vc, 0),
                 gather(self.o_proj.weight, 1),
             )
+            if self._prefill_weights is None:
+                self._prefill_weights = weights
+            else:
+                for current, value in zip(self._prefill_weights, weights, strict=True):
+                    current.copy_(value)
+
+        if complete_reload and self._fused_decode_runtime is not None:
+            self._fused_decode_runtime.refresh_weights(self)
 
     def _forward_fused_decode(self, positions, hidden_states, ctx, comm_manager):
         if hidden_states.shape[0] == 0:
