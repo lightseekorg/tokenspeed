@@ -71,6 +71,7 @@ from tokenspeed.runtime.engine.scheduler_utils import cache_ops_from_plan
 from tokenspeed.runtime.execution.device import DeviceHandle, EncoderModelFacts
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.types import PlannedForward
+from tokenspeed.runtime.layers.attention.remote_cache import RemoteCacheAdmission
 from tokenspeed.runtime.multimodal.inputs import (
     Modality,
     MultimodalDataItem,
@@ -1014,7 +1015,7 @@ def _receiving_handle(trace, *, prepare=None):
     handle = _handle(trace, kv_transfer=_decode_peer(trace))
     executor = handle._executor
     executor.prepare_remote_cache_slots = prepare or (
-        lambda slots: trace.append(("prepare", slots))
+        lambda slots, *, admissions: trace.append(("prepare", slots, admissions))
     )
     executor.reset_remote_prefill_cache_lengths = lambda op: trace.append("reset")
     executor.zero_cache_pages = lambda pages: SimpleNamespace(
@@ -1024,7 +1025,14 @@ def _receiving_handle(trace, *, prepare=None):
 
 
 def _remote_prefill():
-    return SimpleNamespace(num_extends=lambda: 1, request_pool_indices=[3, 9])
+    return SimpleNamespace(
+        num_extends=lambda: 1,
+        request_pool_indices=[3, 9],
+        request_ids=["incoming", "inactive"],
+        input_lengths=[2],
+        prefill_lengths=[10],
+        block_tables_arrays=lambda: {"state": np.array([[0, 5], [7, -1]])},
+    )
 
 
 @pytest.mark.parametrize("forwards", [True, False])
@@ -1043,7 +1051,7 @@ def test_a_remote_prefill_pulls_behind_the_rounds_forward(forwards):
     )
 
     assert trace == [
-        ("prepare", [3]),
+        ("prepare", [3], {3: RemoteCacheAdmission("incoming", 10, {"state": (0, 5)})}),
         "reset",
         *(["forward"] if forwards else []),
         "wait_zeroing",
@@ -1056,7 +1064,7 @@ def test_a_failed_slot_preparation_never_triggers_the_pull():
     round itself, before the forward and the pull."""
     trace: list = []
 
-    def prepare(slots):
+    def prepare(slots, *, admissions):
         raise RuntimeError("slot preparation failed")
 
     handle = _receiving_handle(trace, prepare=prepare)
