@@ -820,8 +820,6 @@ def triton_eagle_harness_sample_children(
     tokens: torch.Tensor,
     scores: torch.Tensor,
     temperatures: torch.Tensor,
-    top_ks: torch.Tensor,
-    top_ps: torch.Tensor,
     q_store: torch.Tensor,
     qid_store: torch.Tensor,
     node_slot: torch.Tensor,
@@ -840,11 +838,11 @@ def triton_eagle_harness_sample_children(
     ``logits`` / ``candidates`` (``[requests, rows, NC]`` fp32 / int64) and
     ``tokens`` / ``scores`` (``[requests, rows, K]`` int64 / fp32) are views
     with unit last stride; request ``b`` expands its first ``width[0]`` rows
-    (int32 ``[1]``; None: all). Per request, ``temperatures`` (fp32),
-    ``top_ks`` (int32) and ``top_ps`` (fp32); a temperature <= 0 keeps the
-    row's children and marks them drawn without q. Row ``w``'s q (softmax of
-    ``logits / T`` over the candidates below ``vocab_limit``, cut to top-k /
-    top-p and renormalized) and candidate ids go to slot ``slot_base + w``
+    (int32 ``[1]``; None: all). Per request, ``temperatures`` (fp32); a
+    temperature <= 0 keeps the row's children and marks them drawn without
+    q. Row ``w``'s q (softmax of ``logits / T`` over the candidates below
+    ``vocab_limit``, not cut to the request's top-k / top-p) and candidate
+    ids go to slot ``slot_base + w``
     of ``q_store`` / ``qid_store`` (contiguous ``[requests, slots, NC]``
     fp32 / int32), its children's (slot, position) to nodes ``cumu_start[0]
     + w * K ..`` of ``node_slot`` / ``node_pos`` (int32 ``[requests,
@@ -899,7 +897,6 @@ def triton_eagle_harness_sample_children(
         raise ValueError("eagle_harness_sample_children: counter layout")
     if rows == 0:
         return
-    block_nc = triton.next_power_of_2(nc)
     _sampled._sample_children_kernel[(rows,)](
         logits,
         logits.stride(0),
@@ -914,8 +911,6 @@ def triton_eagle_harness_sample_children(
         scores.stride(0),
         scores.stride(1),
         temperatures,
-        top_ks,
-        top_ps,
         q_store,
         qid_store,
         node_slot,
@@ -934,8 +929,7 @@ def triton_eagle_harness_sample_children(
         K=k,
         K_PAD=triton.next_power_of_2(k),
         HAS_WIDTH=width is not None,
-        BLOCK_NC=block_nc,
-        CHUNK=max(1, min(block_nc, 4096 // block_nc)),
+        BLOCK_NC=triton.next_power_of_2(nc),
     )
 
 

@@ -21,8 +21,8 @@
 """Triton kernels of the EAGLE-Harness sampled trees.
 
 A sampled request draws each expanded row's ``K`` children from the draft
-distribution ``q`` over the row's ``NC`` candidate ids (Gumbel-top-K, after
-the request's top-k / top-p cut) and records ``q`` and the ids in a slot of
+distribution ``q`` over the row's ``NC`` candidate ids (Gumbel-top-K) and
+records ``q`` and the ids in a slot of
 its q store, each child's (slot, position) in the node tables. The verify
 accepts a node's children by recursive rejection against the target
 probabilities, rewriting a rejected node's row into its residual, and the
@@ -98,8 +98,6 @@ def _sample_children_kernel(
     scores_s0,
     scores_s1,
     temps_ptr,
-    top_ks_ptr,
-    top_ps_ptr,
     q_store_ptr,  # fp32 [req, num_slots, nc] contiguous
     qid_store_ptr,
     node_slot_ptr,  # int32 [req, max_nodes]
@@ -119,19 +117,17 @@ def _sample_children_kernel(
     K_PAD: tl.constexpr,
     HAS_WIDTH: tl.constexpr,
     BLOCK_NC: tl.constexpr,
-    CHUNK: tl.constexpr,
 ):
     """Draws the ``K`` children of request ``b``'s row ``w`` (one program
     each; rows at or past the request's width exit).
 
     A greedy request (temperature <= 0) only marks its children as drawn
     without q (node slot -1). Otherwise ``q = softmax(logits / T)`` over the
-    candidates below ``vocab_limit``, cut to the entries with fewer than
-    ``top_k`` candidates above them and less than ``top_p`` mass above them,
-    renormalized, is stored in slot ``slot_base + w`` with the candidate ids;
-    the children are the ``K`` best Gumbel keys ``log q + G`` (ties to the
-    lower position), ``G`` keyed by (round counter, launch, expanded row,
-    position). A child past the cut's support gets score 0.
+    candidates below ``vocab_limit`` is stored in slot ``slot_base + w`` with
+    the candidate ids; the children are the ``K`` best Gumbel keys ``log q +
+    G`` (ties to the lower position), ``G`` keyed by (round counter, launch,
+    expanded row, position). A child past q's support (fewer than ``K``
+    candidates with ``q > 0``) gets score 0.
     """
     pid = tl.program_id(0)
     b = pid // rows_per_req
@@ -169,25 +165,11 @@ def _sample_children_kernel(
             x_max = tl.max(x)
             e = tl.where(in_row & (x > -_FLT_MAX), tl.exp(x - x_max), 0.0)
             total = tl.sum(e)
-            top_k = tl.load(top_ks_ptr + b)
-            top_p = tl.load(top_ps_ptr + b)
             store_row = (b64 * num_slots + slot_base + w) * nc
-            if (top_k < nc) | (top_p < 1.0):
-                # Rank each entry against the whole row, CHUNK entries at a time read back from the store.
-                q = e / total
-                tl.store(q_store_ptr + store_row + j, q, mask=in_row)
-                tl.debug_barrier()
-                above = tl.zeros([BLOCK_NC], dtype=tl.int32)
-                mass = tl.zeros([BLOCK_NC], dtype=tl.float32)
-                for start in range(0, nc, CHUNK):
-                    i = start + tl.arange(0, CHUNK)
-                    q_i = tl.load(q_store_ptr + store_row + i, mask=i < nc, other=0.0)
-                    higher = q_i[None, :] > q[:, None]
-                    above += tl.sum(higher.to(tl.int32), axis=1)
-                    mass += tl.sum(tl.where(higher, q_i[None, :], 0.0), axis=1)
-                e = tl.where((above < top_k) & (mass < top_p), e, 0.0)
-                total = tl.sum(e)
-                tl.debug_barrier()
+            # Not cut to the request's top-k / top-p: the recursive rejection is
+            # exact for any q, and a cut q (often narrower than K at a low
+            # temperature) leaves children past its support that can never be
+            # accepted while the target keeps mass there.
             q = e / total
             tl.store(q_store_ptr + store_row + j, q, mask=in_row)
             tl.store(qid_store_ptr + store_row + j, cand.to(tl.int32), mask=in_row)

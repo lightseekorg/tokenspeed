@@ -812,7 +812,10 @@ run on the draft-tree path and share its requirements, with these limits:
   when measuring) and needs `--sampling-backend flashinfer` or `triton`,
   which accept them by tree rejection sampling (`triton` on its no-filter
   and top-k routes; its top-p-only and mixed routes keep the target-sampled
-  walk). Static `EAGLE4` drafts do not take it. The sampled-tree kernels
+  walk). A node's children are drawn without replacement from the draft's
+  `softmax(logits / T)` over its candidates; like the chains' `q`, it is not
+  cut to the request's top-k / top-p, which would leave children past the
+  cut that can never be accepted. Static `EAGLE4` drafts do not take it. The sampled-tree kernels
   have CUDA and Triton builds.
 
 ### Draft-prob rejection sampling

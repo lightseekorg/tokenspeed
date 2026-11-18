@@ -284,7 +284,6 @@ class EagleHarness(Eagle4):
             "round": torch.zeros((1,), dtype=torch.int64, device=device),
             "temperature": torch.zeros((max_bs,), dtype=torch.float32, device=device),
             "top_k": torch.ones((max_bs,), dtype=torch.int32, device=device),
-            "top_p": torch.ones((max_bs,), dtype=torch.float32, device=device),
         }
         self.runtime_states.init_draft_tree_q(num_nodes, num_slots, num_candidates)
 
@@ -350,8 +349,6 @@ class EagleHarness(Eagle4):
             tokens,
             scores,
             sampled["temperature"],
-            sampled["top_k"],
-            sampled["top_p"],
             self._sampled_q.q,
             self._sampled_q.q_ids,
             self._sampled_q.slot,
@@ -560,7 +557,6 @@ class EagleHarness(Eagle4):
         pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
         top_k = sampled["top_k"][:bs]
         torch.index_select(pools.top_k, 0, pool_indices, out=top_k)
-        torch.index_select(pools.top_p, 0, pool_indices, out=sampled["top_p"][:bs])
         temperature = sampled["temperature"][:bs]
         torch.index_select(pools.temperature, 0, pool_indices, out=temperature)
         temperature.masked_fill_(top_k == 1, 0.0)
