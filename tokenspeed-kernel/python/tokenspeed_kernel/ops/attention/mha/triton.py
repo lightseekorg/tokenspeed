@@ -32,26 +32,43 @@ from tokenspeed_kernel.ops.attention.mha._triton.qkv_rotary import *  # noqa: F4
 from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import (
+    ScaleFormat,
     dense_tensor_format,
     format_signature,
     format_signatures,
+    tensor_format,
 )
 
 _PORTABLE_CAPABILITY = CapabilityRequirement(vendors=frozenset({"nvidia", "amd"}))
 _PORTABLE_DTYPES = {torch.float16, torch.bfloat16}
 # Paged reads also take an fp8 e4m3 KV cache under a 16-bit query: the kernels
-# upcast each K/V tile to the query dtype in registers (unit scale), so q stays
-# in its activation dtype.
-_PORTABLE_KVCACHE_SIGNATURES = format_signatures(
-    ("q", "k_cache", "v_cache"), "dense", _PORTABLE_DTYPES
-) | {
-    format_signature(
-        q=dense_tensor_format(dtype),
-        k_cache=dense_tensor_format(torch.float8_e4m3fn),
-        v_cache=dense_tensor_format(torch.float8_e4m3fn),
-    )
-    for dtype in _PORTABLE_DTYPES
-}
+# upcast each K/V tile to the query dtype in registers, so q stays in its
+# activation dtype. A cache at per-tensor scales (``fp8_kv_scales``) folds the
+# K scale into the softmax scale and the V scale into the output.
+_SCALED_FP8_CACHE = tensor_format(
+    "scaled-fp8",
+    torch.float8_e4m3fn,
+    scale=ScaleFormat(storage_dtype=torch.float32, granularity="tensor"),
+)
+_PORTABLE_KVCACHE_SIGNATURES = (
+    format_signatures(("q", "k_cache", "v_cache"), "dense", _PORTABLE_DTYPES)
+    | {
+        format_signature(
+            q=dense_tensor_format(dtype),
+            k_cache=dense_tensor_format(torch.float8_e4m3fn),
+            v_cache=dense_tensor_format(torch.float8_e4m3fn),
+        )
+        for dtype in _PORTABLE_DTYPES
+    }
+    | {
+        format_signature(
+            q=dense_tensor_format(dtype),
+            k_cache=_SCALED_FP8_CACHE,
+            v_cache=_SCALED_FP8_CACHE,
+        )
+        for dtype in _PORTABLE_DTYPES
+    }
+)
 
 
 @register_kernel(
@@ -139,6 +156,7 @@ def triton_mha_extend_with_kvcache(
     q_scale: torch.Tensor | None = None,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    fp8_kv_scales: tuple[float, float] | None = None,
     enable_pdl: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     return _triton_mha_extend_with_kvcache_impl(
@@ -160,6 +178,7 @@ def triton_mha_extend_with_kvcache(
         q_scale=q_scale,
         k_scale=k_scale,
         v_scale=v_scale,
+        fp8_kv_scales=fp8_kv_scales,
         enable_pdl=enable_pdl,
     )
 
@@ -197,6 +216,7 @@ def triton_mha_decode_with_kvcache(
     q_scale: torch.Tensor | None = None,
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    fp8_kv_scales: tuple[float, float] | None = None,
     enable_pdl: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     return _triton_mha_decode_with_kvcache_impl(
@@ -216,6 +236,7 @@ def triton_mha_decode_with_kvcache(
         q_scale=q_scale,
         k_scale=k_scale,
         v_scale=v_scale,
+        fp8_kv_scales=fp8_kv_scales,
         enable_pdl=enable_pdl,
     )
 
