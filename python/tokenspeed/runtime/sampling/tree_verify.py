@@ -113,7 +113,7 @@ def accepted_path_rows(path: torch.Tensor) -> torch.Tensor:
 def packed_accepted_path_rows(
     accept_index: torch.Tensor, query_start_loc: torch.Tensor
 ) -> torch.Tensor:
-    """Map flat chain-verifier acceptance indices to packed target rows.
+    """Maps flat chain-verifier acceptance indices to packed target rows.
 
     ``accept_index[b, i]`` is ``b * width + column`` for an emitted token and
     ``-1`` past the accepted length. Unused predictions score against the

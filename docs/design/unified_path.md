@@ -2816,7 +2816,7 @@ Packed verification refreshes decode_query_indptr and packed rows in persistent 
 replay; V4.1 pointer-stable views are keyed by (bs, num_tokens).
 Grammar verify candidates are copied to pinned storage on the main stream before
 its fork event, so the side-stream host fill reads pre-packing tokens even when
-packed verification later rewrites input_ids_buf in place.
+packed verification later rewrites `input_ids_buf` in place.
 The same packed row indices gather request-major xgrammar bitmask rows into
 target-logit order. Greedy and sampled FlashInfer verification apply those
 masks and support selected-token output logprobs, as does sampled prefill;
