@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import sys
 import urllib.request
 from dataclasses import replace
@@ -63,6 +64,7 @@ from tokenspeed.runtime.pd.host_peer import (  # noqa: E402
     kv_bootstrap_address,
 )
 from tokenspeed.runtime.pd.topology import PDParallelTopology  # noqa: E402
+from tokenspeed.runtime.utils import network  # noqa: E402
 
 _SOURCE = 0x1000
 
@@ -149,9 +151,46 @@ def _server_args(bootstrap_port: int) -> SimpleNamespace:
     )
 
 
+@pytest.fixture(autouse=True)
+def _loopback_host_ip(monkeypatch):
+    # This host's IP, which a loopback rendezvous advertises: loopback keeps
+    # the tests' bootstrap traffic on this machine.
+    monkeypatch.setenv("TOKENSPEED_HOST_IP", "127.0.0.1")
+
+
 def test_the_kv_bootstrap_server_is_on_the_first_node():
     # Where the prefill ranks register, and where a frontend sends decode.
-    assert kv_bootstrap_address(_server_args(8998)) == ("127.0.0.1", 8998)
+    args = SimpleNamespace(
+        dist_init_addr="10.0.0.2:5000", disaggregation_bootstrap_port=8998
+    )
+    assert kv_bootstrap_address(args) == ("10.0.0.2", 8998)
+
+
+def test_a_loopback_rendezvous_advertises_the_host_ip(monkeypatch):
+    # A one-node prefill rendezvouses on loopback, which a decode on another
+    # host cannot dial.
+    monkeypatch.setenv("TOKENSPEED_HOST_IP", "fd00::7")
+    assert kv_bootstrap_address(_server_args(8998)) == ("fd00::7", 8998)
+
+
+@pytest.mark.parametrize("dist_init_addr", ["[fd00::2]:5000", "fd00::2:5000"])
+def test_the_kv_bootstrap_server_takes_an_ipv6_rendezvous(dist_init_addr):
+    args = SimpleNamespace(
+        dist_init_addr=dist_init_addr, disaggregation_bootstrap_port=8998
+    )
+    assert kv_bootstrap_address(args) == ("fd00::2", 8998)
+
+
+def test_the_kv_bootstrap_server_resolves_an_ipv6_only_head_name(monkeypatch):
+    def getaddrinfo(host, port, family, type):
+        assert host == "prefill-0.prefill"
+        return [(socket.AF_INET6, type, 6, "", ("fd00::2", 0, 0, 0))]
+
+    monkeypatch.setattr(network.socket, "getaddrinfo", getaddrinfo)
+    args = SimpleNamespace(
+        dist_init_addr="prefill-0.prefill:5000", disaggregation_bootstrap_port=8998
+    )
+    assert kv_bootstrap_address(args) == ("fd00::2", 8998)
 
 
 @pytest.mark.parametrize(

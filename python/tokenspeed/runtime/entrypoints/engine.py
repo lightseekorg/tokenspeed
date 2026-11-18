@@ -66,6 +66,7 @@ from tokenspeed.runtime.utils.launcher import (
     set_pinned_allocator_default,
     set_rocm_tool_registration_default,
 )
+from tokenspeed.runtime.utils.network import split_host_port
 from tokenspeed.runtime.utils.process import (
     kill_process_tree,
     receive_ready_messages,
@@ -87,7 +88,7 @@ def _set_socket_interface(server_args: ServerArgs):
     if server_args.mapping.nnodes <= 1 or not server_args.dist_init_addr:
         return
 
-    head = server_args.dist_init_addr.rsplit(":", 1)[0]
+    head = split_host_port(server_args.dist_init_addr)[0]
     interface = interface_for_host(head)
     if interface is None:
         logger.warning(

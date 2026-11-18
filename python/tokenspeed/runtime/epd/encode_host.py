@@ -79,6 +79,7 @@ from tokenspeed.runtime.utils.network import (
     get_ip,
     get_local_ip_by_remote,
     join_host_port,
+    split_host_port,
 )
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
 
@@ -540,7 +541,7 @@ class EncodeBootstrap:
         # Rank 0 hosts the node's bootstrap server; every rank registers with
         # it.
         bootstrap_host = (
-            server_args.dist_init_addr.split(":", 1)[0]
+            split_host_port(server_args.dist_init_addr)[0]
             if server_args.dist_init_addr
             else local_ip
         )

@@ -139,9 +139,10 @@ def _fp8_launch_config(
 
     An FP8 CTA gathers and converts 16 / splits ordered-prefix tiles of 128
     slots per query row, plus a fixed per-row prologue/epilogue worth about
-    six tiles (SM103 measurements with the staged-id gather ring); serial
-    query rows repeat both. One CTA is resident per SM, so a launch costs its
-    wave count times that per-CTA work. Ties keep the earlier candidate.
+    six tiles (SM103 measurements with the staged-id gather ring; SM107
+    timings fit about five and a half, with the same picks); serial query
+    rows repeat both. One CTA is resident per SM, so a launch costs its wave
+    count times that per-CTA work. Ties keep the earlier candidate.
     """
     best, best_cost = (1, 1), None
     for rows_per_cta, splits in ((1, 1), (2, 1), (1, 2), (1, 4)):
@@ -160,20 +161,16 @@ def _select_launch_config(
     bf16_kv: bool,
     sm_count: int,
     wide_cluster_capacity: int,
-    *,
-    fp8_wave_sizing: bool,
 ) -> tuple[int, int, int, bool]:
     """Return query rows/CTA, KV splits, BF16 slots and async publication.
 
     These thresholds come from joint tile/stage measurements. They are not
     occupancy guarantees: query the compiled launch's occupancy separately.
-    With fp8_wave_sizing, large FP8 grids pick rows/CTA and splits by wave
-    count; otherwise this helper uses the split rule below at every size.
-    The caller qsa_sparse._configuration overrides KV splits for large SM107
-    FP8 grids with 24 query heads and 2 KV heads.
+    Large FP8 grids pick rows/CTA and splits by wave count; smaller grids
+    use the split rule below.
     """
     output_tiles = num_rows * head_tiles_per_row
-    if not bf16_kv and fp8_wave_sizing and output_tiles * 16 >= sm_count * 3:
+    if not bf16_kv and output_tiles * 16 >= sm_count * 3:
         # FP8 keeps synchronous gather/conversion; size its grid by waves.
         query_rows_per_cta, splits = _fp8_launch_config(
             num_rows, head_tiles_per_row, sm_count

@@ -84,6 +84,7 @@ def _decode_runner(capture_bs, variants=None):
     runner.disable = False
     runner.max_tokens_per_req = 1
     runner.drafter = None
+    runner.draft_overlap = None
     runner._reported_query_graphs = set()
     runner.graphs = {}
     runner.output_buffers = {}

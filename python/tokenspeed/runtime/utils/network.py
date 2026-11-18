@@ -78,6 +78,48 @@ def join_host_port(host: str, port: int | str) -> str:
     return f"{host}:{port}"
 
 
+def split_host_port(address: str) -> tuple[str, int]:
+    """Split ``host:port`` into the host (brackets removed) and the port.
+
+    Accepts an IPv4 address, a hostname, a bracketed IPv6 literal
+    (``[2001:db8::1]:4000``) or a bare IPv6 literal, where the last colon
+    separates the port (``2001:db8::1:4000``).
+    """
+    address = address.strip()
+    if address.startswith("["):
+        host, sep, port = address[1:].partition("]:")
+        if not sep:
+            raise ValueError(f"{address!r}: expected [ipv6]:port")
+    else:
+        host, sep, port = address.rpartition(":")
+        if not sep or (":" in host and not is_valid_ipv6_address(host)):
+            raise ValueError(f"{address!r}: expected host:port")
+    if not host or not port.isdigit() or not 0 < int(port) < 65536:
+        raise ValueError(f"{address!r}: expected host:port")
+    return host, int(port)
+
+
+def wildcard_host_for(ip: str) -> str:
+    """The wildcard bind address of ``ip``'s family: ``"::"`` for an IPv6
+    address, else ``"0.0.0.0"``. A listener that peers dial at ``ip`` binds
+    this, as an IPv4 wildcard cannot accept on an IPv6-only host."""
+    return "::" if is_valid_ipv6_address(ip) else "0.0.0.0"
+
+
+def resolve_host(host: str) -> str:
+    """The numeric address of ``host`` (an IPv4/IPv6 literal, bracketed or
+    not, or a hostname), IPv4 or IPv6, in getaddrinfo's preference order;
+    unlike ``socket.gethostbyname`` this resolves IPv6-only names."""
+    host = host.strip("[]")
+    try:
+        ipaddress.ip_address(host.split("%", 1)[0])
+        return host
+    except ValueError:
+        pass
+    infos = socket.getaddrinfo(host, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+    return infos[0][4][0]
+
+
 def get_local_ip_by_remote() -> str | None:
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:

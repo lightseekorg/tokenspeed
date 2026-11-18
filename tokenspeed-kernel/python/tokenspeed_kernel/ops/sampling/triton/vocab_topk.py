@@ -33,6 +33,7 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.sampling import (
+    vocab_shard_topk_chunks,
     vocab_shard_topk_supports,
     vocab_topk_merge_supports,
 )
@@ -43,11 +44,6 @@ __all__ = [
     "triton_vocab_shard_topk",
     "triton_vocab_topk_merge",
 ]
-
-# Columns one program selects from. A whole vocab shard in one program leaves
-# most CUs idle at a few rows; chunks select in parallel, then one program per
-# row merges their candidates.
-_SHARD_CHUNK_COLUMNS = 2048
 
 
 @triton.jit
@@ -200,10 +196,8 @@ def triton_vocab_shard_topk(
     if rows == 0:
         return
     # The shard width is fixed per server, so the chunking compiles once.
-    chunks = triton.cdiv(n_cols, _SHARD_CHUNK_COLUMNS)
+    chunks = vocab_shard_topk_chunks(n_cols, k)
     chunk_cols = triton.cdiv(n_cols, chunks)
-    if chunk_cols < k or not vocab_topk_merge_supports(chunks, k):
-        chunks, chunk_cols = 1, n_cols
     # One chunk writes straight to out; more go through a pair block each.
     picks = out if chunks == 1 else out.new_empty((rows, chunks * 2 * k))
     _vocab_shard_topk_kernel[(rows, chunks)](
