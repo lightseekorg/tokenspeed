@@ -710,11 +710,11 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
         // already; publish them on the Device now (the layer-wise load makes
         // the bytes available before any forward reads them). A Host tail is
         // loaded into the hitter's private page and stays unpublished.
-        const std::int32_t first_extension_slot = probed_device_full_page_tokens / prefix_granularity;
+        const std::int32_t first_extension_prefix_page = probed_device_full_page_tokens / prefix_granularity;
         for (std::size_t i = 0; i < match.extension_hashes.size(); ++i) {
-            coordinator_.CacheFullBlocks(tables, std::span<const std::string>(match.extension_hashes).subspan(i, 1),
-                                         admission->access_epoch, first_extension_slot + static_cast<std::int32_t>(i),
-                                         CacheBoundaryKind::kChunk);
+            coordinator_.CacheFullBlocks(
+                tables, std::span<const std::string>(match.extension_hashes).subspan(i, 1), admission->access_epoch,
+                first_extension_prefix_page + static_cast<std::int32_t>(i), CacheBoundaryKind::kChunk);
         }
     }
     fsm::CacheProgress cache_progress{

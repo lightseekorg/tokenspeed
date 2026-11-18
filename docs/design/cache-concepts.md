@@ -40,7 +40,7 @@ the group's nature switches on this value and nothing else:
 * **`sliding_window`** (`kSlidingWindow`) — rows of token history of which
   the trailing `sliding_window_tokens` and optional leading `sink_tokens`
   stay resident; the middle slides out
-  (`ExpiredBlocksAt`). A trailing window of token rows (DeepSeek V4.1's SWA
+  (`ExpiredBlockEndAt`). A trailing window of token rows (DeepSeek V4.1's SWA
   kv and compressor tails) is this kind whatever a kernel calls its buffer.
 * **`state`** (`kState`) — recurrent/conv state whose block holds the state
   after some token count, whichever count a forward happened to end at. A
@@ -991,9 +991,11 @@ Perception rules per directory:
 `GroupAllocator` is **physical placement only**, and there is exactly one of
 it — no subclasses. It moves `CacheBlock`s between the `BlockPool` and
 `BlockTable`s (`Acquire`, `AppendHostExtension`, `Free`), resolves kernel
-page ids, and executes retention (`ReclaimExpired` punches the first *N*
-slots to null holes). It is deliberately token-free: every token quantity is
-converted to block counts before it reaches the manager.
+page ids, and executes retention (`ReclaimExpired` releases unkept slots below
+an exclusive expiration boundary). Its configuration is immutable; placement
+methods are `const` and modify only the pool and table supplied by the caller.
+It is deliberately token-free: every token quantity is converted to block
+counts or indices before it reaches the manager.
 
 Dense `Acquire` appends insert the new references as one range, letting the
 vector amortize host storage growth. Spare capacity does not add logical
@@ -1006,7 +1008,9 @@ The conversion is `GroupGeometry` in the coordinator layer:
   **`AcquirePlan`** (`cache/core/acquire_plan.h`) — block counts plus the
   bookkeeping values the manager stores verbatim; the manager executes the
   plan without deriving anything.
-* `ExpiredBlocksAt(spec, num_computed_tokens)` is the retention *policy*
+* `ExpiredBlockEndAt(spec, num_computed_tokens)` returns the exclusive expired
+  block boundary, including any kept sink positions; it is not the count of
+  blocks an admission can reclaim. It is the retention *policy*
   (full attention never expires; SWA slides whole pages out; a State group
   has no token span and never expires — its two slots turn over by
   `StateStep`); the manager only *executes* the resulting block count.
@@ -1068,6 +1072,15 @@ planner (`AdmissionPlanner`). The admission vocabulary (`PrefixProbe`,
 plans with its own planner through `CacheCoordinator::AdmitWith` and moves
 blocks through the store and the evictor, without reaching the
 coordinator's internals.
+
+`CacheStore` derives geometry, match order and checkpoint/replay limits as one
+value before binding the groups to live pools and indexes; those derived facts
+remain immutable. Its const views expose const pools. Prefix probes return
+their decisions and hit arrays together, including the Device/Host split of a
+Host suffix. Successive boundary probes consume and return their scratch arrays
+to reuse capacity without output parameters. Acquiring a session owner is an
+explicit command (`AcquireSessionOwner` / `AcquireCacheGroupOwner`): it may
+create or promote a tag, whereas owner lookup by access epoch is read-only.
 
 Its responsibilities:
 
@@ -1314,7 +1327,7 @@ Its responsibilities:
   tiers — never registered, never streamed to Host, never counted by
   `DeviceBoundaryResidency` — because their rows are approximations the
   model regenerates from re-fed tokens, not a function of the prefix alone.
-  Retention (`ExpiredBlocksAt`/`ReclaimExpired`) still slides their
+  Retention (`ExpiredBlockEndAt`/`ReclaimExpired`) still slides their
   request-private pages out.
 * **Checkpoint retention.** A request resumes from the newest checkpoint on
   its path, so a State checkpoint a later request's checkpoint extends
@@ -1696,7 +1709,15 @@ claim remote objects as resident data.
 The internal capacity planner behind `Admit`. It runs entirely on shadow
 occupancy — never mutating the real pool — and answers: *which cached blocks
 must be evicted for this admission to fit, while protecting the current
-prefix hits?* The algorithm: first check whether existing local holes plus
+prefix hits?* Its request inputs are immutable. Capacity calculation returns
+the block demands and copy-in reservations; candidate-constraint construction
+returns the protected locations and request releases. Checks and victim-set
+expansion receive these values explicitly. A local `AdmissionSelectionState`
+owns the mutable shadow, selected sets and traversal bookkeeping for one
+attempt. `Plan` returns its decisions, with no output references captured in
+the planner; the same request view can be planned again independently.
+
+The algorithm: first check whether existing local holes plus
 empty parents fit with zero eviction. Before selecting victims, a relaxed
 capacity bound may reject an impossible admission. It overestimates removable
 cache entries and credits this step's releasable State input and newly expired
@@ -1756,10 +1777,23 @@ its groups in tries victims the same way. Both Host plans fit on it over Host
 L2: the segment plan (`AcquireHostSegments`) and the boundary plan
 (`NumHostBoundariesThatFit`, `AcquireHostBoundaries`).
 
-`CacheEvictionPlan` (`eviction_plan.h`) shares candidate merging, shadow
-capacity, selection until demand fits, and reverse minimization between
-Device admission and both Host block-placement entry points. Its
-`CacheEvictionCandidates` cursor reads only the access epochs needed, with
+`CacheEvictionPlan` (`eviction_plan.h`) shares shadow capacity, selection until
+demand fits and reverse minimization between Device admission and both Host
+block-placement entry points. Its `Remove` and `Restore` operations change
+only capacity state; minimization consumes and returns the victim list.
+Callers construct and own the `CacheEvictionCandidates` traversal directly;
+the plan has no separate candidate-initialization phase. Each `Next` call
+receives the sorted request releases, protected and request-reclaim locations,
+and a predicate over the currently selected blocks. A checkpoint becomes
+incomplete when any of its State entries on that tier is selected; the cursor
+derives that from the index and the predicate when it rechecks an aged rank.
+There is no separate checkpoint-removal counter to update or undo. The
+traversal retains its cursor positions, but no references to these inputs.
+Group-scan statistics count cursors that have loaded an epoch for selection;
+pre-scan snapshots alone do not increase that count.
+Device admission passes the same traversal through the feasibility pre-scan
+and victim selection so the retained epochs are reused. The cursor merges
+request releases with cache candidates and reads only the access epochs needed, with
 the same boundary-tier/position ordering on both tiers; the aged
 checkpoints at the retention cutoff come from `CheckpointTree`, one distance
 at a time. The caller defines
@@ -2101,7 +2135,7 @@ The one relation between them is an inequality, not an equality: **a group
 must retain every token its layers can see.** `bind_cache_groups` enforces it —
 a full-visibility layer cannot ride a sliding group, and a sliding mask must
 fit inside the group's retention window (`window_left + 1 <=
-sliding_window_tokens`, matching `GroupGeometry::ExpiredBlocksAt`). Everything
+sliding_window_tokens`, matching `GroupGeometry::ExpiredBlockEndAt`). Everything
 off the diagonal is therefore legal by construction rather than by special
 case: a sliding-masked layer on a full-history group (a block drafter, DSA's
 sparse compute over a fully retained cache) retains more than it reads.
@@ -2498,7 +2532,14 @@ an opened parent gives every bucket `packing / shard_count` slots at once, so
 the parents needed are
 `max_b ceil((need_b - holes_b)+ / (packing / shard_count))`
 (`ParentsNeededForBuckets`, the formula the pool, the coordinator's image
-probe and the admission planner's shadow occupancy share). The planner counts
+probe and the admission planner's shadow occupancy share). A
+`BlockPlacementDemand` keeps each group's three placement counts together from
+the admission planner through the eviction plan, shadow occupancy and pool
+capacity check: `blocks_by_bucket` counts blocks in each specified bucket,
+`any_bucket_blocks` counts blocks that may each take any bucket, and
+`same_bucket_pairs` counts pairs whose two blocks must share a bucket
+chosen by the fit. The counts are disjoint: `TotalBlocks()` sums the bucket
+counts, the any-bucket count, and twice the pair count. The planner counts
 every block an admission places in a given bucket — a Host hit's destination,
 a tail copy, a copy-in block whose slot's block is known — as that bucket's
 demand, and only growth and a hole's fresh block as dense demand. A copy-in

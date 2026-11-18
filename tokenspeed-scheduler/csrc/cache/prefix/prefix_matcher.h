@@ -46,16 +46,17 @@ public:
     // True when every match is a hole-free run from the prefix start, so a
     // shorter boundary always remains valid.
     virtual bool IsPrefixClosed() const = 0;
-    // Cached pages a resumable boundary needs behind it, in group pages.
-    virtual std::int32_t BoundaryLookbackPages() const = 0;
-    // Probes keys[begin_blocks, begin_blocks + max_blocks) against the index.
-    // probe.hits[i] marks keys[begin_blocks + i]; holes are 0.
+    // Cached blocks a resumable boundary needs behind it, in group blocks.
+    virtual std::int32_t BoundaryLookbackBlocks() const = 0;
+    // Probes keys[begin_block, end_block) against the index, capped at keys.size().
+    // Both bounds are absolute block indices; end_block is exclusive.
+    // probe.hits[i] marks keys[begin_block + i]; holes are 0.
     // extra_hits is the L3 storage index (keys known to exist below Host).
     // Pass nullptr when L3 is unset; omitting it would silently skip L3 hits.
     // The page walk of the probe's aligned phase; a matcher the coordinator
     // judges per candidate boundary alone has no walk.
     virtual GroupPrefixProbe Probe(const PrefixCacheIndex& index, const BlockPool& pool, std::span<const CacheKey> keys,
-                                   std::int32_t begin_blocks, std::int32_t max_blocks,
+                                   std::int32_t begin_block, std::int32_t end_block,
                                    const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits) const = 0;
 };
 
@@ -64,16 +65,16 @@ public:
 class FullAttnMatcher : public PrefixMatcher {
 public:
     bool IsPrefixClosed() const override { return true; }
-    std::int32_t BoundaryLookbackPages() const override { return 0; }
+    std::int32_t BoundaryLookbackBlocks() const override { return 0; }
 
     GroupPrefixProbe Probe(const PrefixCacheIndex& index, const BlockPool& pool, std::span<const CacheKey> keys,
-                           std::int32_t begin_blocks, std::int32_t max_blocks,
+                           std::int32_t begin_block, std::int32_t end_block,
                            const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits) const override {
-        const std::int32_t end_blocks =
-            static_cast<std::int32_t>(std::min(keys.size(), static_cast<std::size_t>(std::max(max_blocks, 0))));
+        const std::int32_t bounded_end_block =
+            static_cast<std::int32_t>(std::min(keys.size(), static_cast<std::size_t>(std::max(end_block, 0))));
         GroupPrefixProbe probe;
         probe.location_pool = &pool;
-        for (std::int32_t j = begin_blocks; j < end_blocks; ++j) {
+        for (std::int32_t j = begin_block; j < bounded_end_block; ++j) {
             const CacheKey& key = keys[static_cast<std::size_t>(j)];
             const auto location = index.LocationOf(pool, key);
             if (!location && (extra_hits == nullptr || !extra_hits->contains(key))) {
@@ -93,11 +94,10 @@ public:
 class StateMatcher : public PrefixMatcher {
 public:
     bool IsPrefixClosed() const override { return false; }
-    std::int32_t BoundaryLookbackPages() const override { return 0; }
+    std::int32_t BoundaryLookbackBlocks() const override { return 0; }
 
     GroupPrefixProbe Probe(const PrefixCacheIndex& /*index*/, const BlockPool& /*pool*/,
-                           std::span<const CacheKey> /*keys*/, std::int32_t /*begin_blocks*/,
-                           std::int32_t /*max_blocks*/,
+                           std::span<const CacheKey> /*keys*/, std::int32_t /*begin_block*/, std::int32_t /*end_block*/,
                            const std::unordered_set<CacheKey, CacheKeyHash>* /*extra_hits*/) const override {
         FatalCheck(false, "a State group's boundaries are judged per candidate, never walked");
         return {};
@@ -117,82 +117,82 @@ public:
     }
 
     bool IsPrefixClosed() const override { return false; }
-    std::int32_t BoundaryLookbackPages() const override { return pagesNeededToResume(); }
+    std::int32_t BoundaryLookbackBlocks() const override { return blocksNeededToResume(); }
 
     // Right->left scan for a run backing a resumable boundary; slots left of it stay holes.
     GroupPrefixProbe Probe(const PrefixCacheIndex& index, const BlockPool& pool, std::span<const CacheKey> keys,
-                           std::int32_t begin_blocks, std::int32_t max_blocks,
+                           std::int32_t begin_block, std::int32_t end_block,
                            const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits) const override {
-        std::int32_t end_blocks =
-            static_cast<std::int32_t>(std::min(keys.size(), static_cast<std::size_t>(std::max(max_blocks, 0))));
+        std::int32_t bounded_end_block =
+            static_cast<std::int32_t>(std::min(keys.size(), static_cast<std::size_t>(std::max(end_block, 0))));
         GroupPrefixProbe probe;
-        if (begin_blocks >= end_blocks) {
+        if (begin_block >= bounded_end_block) {
             return probe;
         }
         // A missing head block rules out every boundary beyond that block.
-        // Slots below begin_blocks are supplied by the preceding tier.
-        for (std::int32_t i = begin_blocks; i < std::min(sink_blocks_, end_blocks); ++i) {
+        // Slots below begin_block are supplied by the preceding tier.
+        for (std::int32_t i = begin_block; i < std::min(sink_blocks_, bounded_end_block); ++i) {
             if (!PrefixKeyIsHit(index, pool, keys[static_cast<std::size_t>(i)], extra_hits)) {
-                end_blocks = i;
+                bounded_end_block = i;
                 break;
             }
         }
         const auto mark_sink = [&] {
-            const auto end = std::min(sink_blocks_, begin_blocks + static_cast<std::int32_t>(probe.hits.size()));
-            for (std::int32_t i = begin_blocks; i < end; ++i) {
-                probe.hits[static_cast<std::size_t>(i - begin_blocks)] = 1;
+            const auto end = std::min(sink_blocks_, begin_block + static_cast<std::int32_t>(probe.hits.size()));
+            for (std::int32_t i = begin_block; i < end; ++i) {
+                probe.hits[static_cast<std::size_t>(i - begin_block)] = 1;
             }
         };
-        // W == 1: no lookback, so every boundary is resumable with no cached page at all.
-        if (pagesNeededToResume() == 0) {
-            probe.hits.resize(static_cast<std::size_t>(end_blocks - begin_blocks));
+        // W == 1: no lookback, so every boundary is resumable with no cached block at all.
+        if (blocksNeededToResume() == 0) {
+            probe.hits.resize(static_cast<std::size_t>(bounded_end_block - begin_block));
             mark_sink();
             return probe;
         }
         const auto [boundary, hits_begin] = findResumableBoundary(
             [&](std::int32_t i) { return PrefixKeyIsHit(index, pool, keys[static_cast<std::size_t>(i)], extra_hits); },
-            begin_blocks, end_blocks);
-        if (boundary == begin_blocks) {
+            begin_block, bounded_end_block);
+        if (boundary == begin_block) {
             return probe;
         }
-        probe.hits.resize(static_cast<std::size_t>(boundary - begin_blocks));
+        probe.hits.resize(static_cast<std::size_t>(boundary - begin_block));
         for (std::int32_t i = hits_begin; i < boundary; ++i) {
-            probe.hits[static_cast<std::size_t>(i - begin_blocks)] = 1;
+            probe.hits[static_cast<std::size_t>(i - begin_block)] = 1;
         }
         mark_sink();
         return probe;
     }
 
 private:
-    // Cached pages a boundary needs behind it: they cover the window's last (window - 1) tokens.
-    std::int32_t pagesNeededToResume() const { return CeilDiv(sliding_window_ - 1, block_granularity_); }
+    // Cached blocks a boundary needs behind it: they cover the window's last (window - 1) tokens.
+    std::int32_t blocksNeededToResume() const { return CeilDiv(sliding_window_ - 1, block_granularity_); }
 
     struct ResumableBoundary {
-        std::int32_t boundary;    // == begin_blocks when no boundary qualifies
+        std::int32_t boundary;    // == begin_block when no boundary qualifies
         std::int32_t hits_begin;  // probe hits cover [hits_begin, boundary)
     };
 
     // Core scan shared by device and host lookup: the highest boundary backed by enough
-    // consecutive probe hits -- pagesNeededToResume(), or fewer bottoming out at begin_blocks.
+    // consecutive probe hits -- blocksNeededToResume(), or fewer bottoming out at begin_block.
     template <typename Probe>
-    ResumableBoundary findResumableBoundary(const Probe& probe, std::int32_t begin_blocks,
-                                            std::int32_t end_blocks) const {
-        const std::int32_t pages_needed = pagesNeededToResume();
-        for (std::int32_t boundary = end_blocks; boundary > begin_blocks;) {
+    ResumableBoundary findResumableBoundary(const Probe& probe, std::int32_t begin_block,
+                                            std::int32_t end_block) const {
+        const std::int32_t lookback_blocks = blocksNeededToResume();
+        for (std::int32_t boundary = end_block; boundary > begin_block;) {
             std::int32_t hits_begin = boundary;
-            while (hits_begin > begin_blocks && probe(hits_begin - 1)) {
+            while (hits_begin > begin_block && probe(hits_begin - 1)) {
                 --hits_begin;
-                if (boundary - hits_begin >= pages_needed) {
-                    return {boundary, hits_begin};  // enough pages behind the boundary
+                if (boundary - hits_begin >= lookback_blocks) {
+                    return {boundary, hits_begin};  // enough blocks behind the boundary
                 }
             }
-            if (hits_begin == begin_blocks && hits_begin < boundary) {
-                return {boundary, hits_begin};  // fewer, but nothing below begin_blocks is needed
+            if (hits_begin == begin_block && hits_begin < boundary) {
+                return {boundary, hits_begin};  // fewer, but nothing below begin_block is needed
             }
             // The miss at hits_begin-1 cuts every boundary in (hits_begin-1, boundary] short -- retry below it.
             boundary = hits_begin - 1;
         }
-        return {begin_blocks, begin_blocks};
+        return {begin_block, begin_block};
     }
 
     std::int32_t block_granularity_;

@@ -19,6 +19,7 @@
 // SOFTWARE.
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -41,14 +42,18 @@
 #include <spdlog/spdlog.h>
 
 #include "cache/cache_group.h"
+#include "cache/coordinator/admission_candidates.h"
+#include "cache/coordinator/admission_planner.h"
 #include "cache/coordinator/cache_coordinator.h"
 #include "cache/coordinator/eviction_candidates.h"
 #include "cache/coordinator/eviction_plan.h"
 #include "cache/coordinator/parent_occupancy.h"
 #include "cache/coordinator/shadow_occupancy.h"
 #include "cache/core/active_parents.h"
+#include "cache/core/block_placement_demand.h"
 #include "cache/core/cache_types.h"
 #include "cache/core/fixed_slot_resource.h"
+#include "cache/prefix/checkpoint_tree.h"
 #include "cache/prefix/prefix_hasher.h"
 #include "cache_test_access.h"
 
@@ -107,27 +112,176 @@ TEST(CacheEvictionCandidates, PrescanReplaysPolicyOrderAcrossPinnedEpochsAndSnap
                 if (i >= 16 && i < 32) pinned.push_back(block);
             }
         }
-        CacheEvictionCandidates replay{groups, pool, nullptr, nullptr, CheckpointAging{}, nullptr};
+        CacheEvictionCandidates replay{groups, pool, CheckpointAging{}};
         std::size_t seen = 0;
         const bool fits = replay.PreScanUntil([&](std::uint32_t, auto entries) {
             seen += entries.size();
             return seen >= threshold;
         });
         EXPECT_EQ(fits, threshold <= 10000);
-        CacheEvictionCandidates direct{groups, pool, nullptr, nullptr, CheckpointAging{}, nullptr};
+        CacheEvictionCandidates direct{groups, pool, CheckpointAging{}};
         using Key = std::tuple<std::uint32_t, std::int32_t, std::int32_t, std::uint64_t, std::int64_t>;
         const auto drain = [](CacheEvictionCandidates& candidates) {
+            const CacheEvictionCandidates::LocationSet no_exclusions{std::pmr::get_default_resource()};
             std::vector<Key> result;
-            while (const auto candidate = candidates.Next(std::numeric_limits<std::uint64_t>::max())) {
+            while (const auto candidate =
+                       candidates.Next({}, no_exclusions, no_exclusions, [](CacheBlockLocation) { return false; })) {
                 result.emplace_back(candidate->group_id, candidate->location.lcm_block_id,
                                     candidate->location.slot_index, candidate->rank_epoch, candidate->position_rank);
             }
             return result;
         };
+        EXPECT_EQ(direct.GroupScans(), 0u);
+        EXPECT_EQ(replay.GroupScans(), 0u) << "pre-scan snapshots do not start candidate selection";
         const auto expected = drain(direct);
         EXPECT_EQ(expected.size(), 10000u);
+        EXPECT_EQ(direct.GroupScans(), 2u);
         EXPECT_EQ(drain(replay), expected);
+        EXPECT_EQ(replay.GroupScans(), 2u);
         EXPECT_EQ(pool.NumEmptyLcmBlocks(), 0);
+    }
+}
+
+TEST(CacheEvictionCandidates, RequestReleasesMergeWithCacheCandidatesWithoutDuplicates) {
+    BlockPool pool{5, {1}};
+    const CacheGroupSpec spec{.cache_blocks_per_lcm_block = 1, .block_granularity = 4};
+    std::vector<CacheGroup> groups;
+    groups.emplace_back(spec, std::make_unique<GroupAllocator>(1, 0, 1, 0), MakePrefixMatcher(spec));
+    std::vector<CacheBlockLocation> locations;
+    for (int i = 1; i <= 4; ++i) {
+        auto block = pool.AcquireBlock(0);
+        locations.push_back(block->Location());
+        groups[0].Index().Register(pool, block, CacheKey{.group_id = 0, .content_hash = ContentHash{std::to_string(i)}},
+                                   i * 10, i, CacheBoundaryKind::kChunk, nullptr, nullptr);
+    }
+    const auto uncached = pool.AcquireBlock(0);
+    ASSERT_TRUE(uncached);
+    std::vector<CacheEvictionCandidates::Candidate> request_candidates{
+        CacheEvictionCandidates::MakeCandidate(groups[0], uncached->Location(), std::nullopt),
+        CacheEvictionCandidates::MakeCandidate(groups[0], locations[1],
+                                               groups[0].Index().MetadataFor(pool, locations[1]))};
+    CacheEvictionCandidates::Sort(request_candidates);
+    CacheEvictionCandidates::LocationSet protected_locations{std::pmr::get_default_resource()};
+    protected_locations.insert(locations[2]);
+    CacheEvictionCandidates::LocationSet request_reclaim_locations{std::pmr::get_default_resource()};
+    request_reclaim_locations.insert(locations[1]);
+
+    CacheEvictionCandidates candidates{groups, pool, CheckpointAging{}};
+    const CacheEvictionCandidates::LocationSet no_exclusions{std::pmr::get_default_resource()};
+    const auto first = candidates.Next(request_candidates, protected_locations, request_reclaim_locations,
+                                       [](CacheBlockLocation) { return false; });
+    ASSERT_TRUE(first);
+    EXPECT_EQ(first->location, uncached->Location());
+    EXPECT_EQ(candidates.ScannedCandidates(), 0u) << "a request-only release precedes every cached epoch";
+    EXPECT_EQ(candidates.GroupScans(), 0u);
+    std::vector<CacheBlockLocation> selected;
+    while (const auto candidate = candidates.Next(request_candidates, protected_locations, request_reclaim_locations,
+                                                  [](CacheBlockLocation) { return false; })) {
+        selected.push_back(candidate->location);
+    }
+    EXPECT_EQ(selected, (std::vector<CacheBlockLocation>{locations[0], locations[1], locations[3]}));
+    EXPECT_EQ(candidates.GroupScans(), 1u);
+    EXPECT_EQ(pool.NumOccupiedSlots(), 5);
+}
+
+TEST(CacheEvictionCandidates, ReplayedEpochsUseTheFiltersPassedToSelection) {
+    BlockPool pool{3, {1}};
+    const CacheGroupSpec spec{.cache_blocks_per_lcm_block = 1, .block_granularity = 4};
+    std::vector<CacheGroup> groups;
+    groups.emplace_back(spec, std::make_unique<GroupAllocator>(1, 0, 1, 0), MakePrefixMatcher(spec));
+    std::vector<CacheBlockLocation> locations;
+    for (int i = 1; i <= 3; ++i) {
+        auto block = pool.AcquireBlock(0);
+        locations.push_back(block->Location());
+        groups[0].Index().Register(pool, block, CacheKey{.group_id = 0, .content_hash = ContentHash{std::to_string(i)}},
+                                   i, i, CacheBoundaryKind::kChunk, nullptr, nullptr);
+    }
+    CacheEvictionCandidates candidates{groups, pool, CheckpointAging{}};
+    const CacheEvictionCandidates::LocationSet no_exclusions{std::pmr::get_default_resource()};
+    EXPECT_FALSE(candidates.PreScanUntil([](std::uint32_t, auto) { return false; }));
+    {
+        CacheEvictionCandidates::LocationSet protected_locations{std::pmr::get_default_resource()};
+        protected_locations.insert(locations[0]);
+        const auto candidate =
+            candidates.Next({}, protected_locations, no_exclusions, [](CacheBlockLocation) { return false; });
+        ASSERT_TRUE(candidate);
+        EXPECT_EQ(candidate->location, locations[1]);
+    }
+    CacheEvictionCandidates::LocationSet protected_locations{std::pmr::get_default_resource()};
+    protected_locations.insert(locations[2]);
+    EXPECT_FALSE(candidates.Next({}, protected_locations, no_exclusions, [](CacheBlockLocation) { return false; }));
+    EXPECT_EQ(pool.NumOccupiedSlots(), 3);
+}
+
+TEST(CacheEvictionCandidates, CheckpointRankingFollowsSelectedStateBlocksIncludingPartialRestores) {
+    for (const std::uint32_t state_groups : {1u, 2u}) {
+        BlockPool pool{static_cast<std::int32_t>(2 * state_groups + 1), std::vector<std::int32_t>(state_groups + 1, 1)};
+        const CacheGroupSpec state{
+            .attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0};
+        const CacheGroupSpec history{.cache_blocks_per_lcm_block = 1, .block_granularity = 4};
+        std::vector<CacheGroup> groups;
+        for (std::uint32_t group = 0; group < state_groups; ++group)
+            groups.emplace_back(state, std::make_unique<GroupAllocator>(1, group, 1, 0), MakePrefixMatcher(state));
+        groups.emplace_back(history, std::make_unique<GroupAllocator>(1, state_groups, 1, 0),
+                            MakePrefixMatcher(history));
+        const std::vector<std::int32_t> tokens{1, 2, 3, 4, 5, 6, 7, 8};
+        const std::vector<std::string> hashes = ContentHashesFor({{1, 2, 3, 4}, {5, 6, 7, 8}});
+        CheckpointTree tree{4, /*leaf_distance=*/0};
+        std::vector<CacheBlockLocation> parents;
+        std::vector<CacheBlockLocation> children;
+        for (std::size_t i = 0; i < hashes.size(); ++i) {
+            ASSERT_TRUE(tree.Observe(std::span(tokens).first((i + 1) * 4), std::span(hashes).first(i + 1), std::nullopt,
+                                     i + 1));
+            tree.Update(ContentHash{hashes[i]}, CheckpointTree::Residency{.complete = {true, false}, .held = true});
+            for (std::uint32_t group = 0; group < state_groups; ++group) {
+                auto block = pool.AcquireBlock(group);
+                (i == 0 ? parents : children).push_back(block->Location());
+                groups[group].Index().Register(pool, block,
+                                               CacheKey{.group_id = group, .content_hash = ContentHash{hashes[i]}},
+                                               30 + i * 10 + group, i, CacheBoundaryKind::kEndpoint, nullptr, nullptr);
+            }
+        }
+        CacheBlockLocation history_location;
+        {
+            auto block = pool.AcquireBlock(state_groups);
+            history_location = block->Location();
+            groups[state_groups].Index().Register(
+                pool, block, CacheKey{.group_id = state_groups, .content_hash = ContentHash{"history"}}, 20, 0,
+                CacheBoundaryKind::kChunk, nullptr, nullptr);
+        }
+        ASSERT_EQ(tree.AgedDistance(ContentHash{hashes[0]}, CacheTier::kDevice), 1);
+        const CheckpointAging aging{.tree = &tree, .tier = CacheTier::kDevice, .cutoff_epoch = 10};
+        CacheEvictionCandidates::LocationSet protected_locations{std::pmr::get_default_resource()};
+        for (const auto location : children) protected_locations.insert(location);
+        const CacheEvictionCandidates::LocationSet no_exclusions{std::pmr::get_default_resource()};
+        for (std::uint32_t removed = 0; removed <= state_groups; ++removed) {
+            for (const bool restore_first : {false, true}) {
+                CacheEvictionPlan plan{pool, groups};
+                CacheEvictionCandidates candidates{groups, pool, aging};
+                CacheEvictionCandidates::LocationSet selected{std::pmr::get_default_resource()};
+                for (std::uint32_t group = 0; group < removed; ++group) {
+                    plan.Remove(group, children[group]);
+                    selected.insert(children[group]);
+                }
+                if (restore_first && removed > 0) {
+                    plan.Restore(0, children[0]);
+                    selected.Erase(children[0]);
+                }
+                const auto is_selected = [&](CacheBlockLocation location) { return selected.contains(location); };
+                std::vector<CacheBlockLocation> order;
+                while (const auto candidate = candidates.Next({}, protected_locations, no_exclusions, is_selected))
+                    order.push_back(candidate->location);
+                // Any missing State group makes the child incomplete, so its
+                // parent returns to its own epoch, after the history at 20.
+                std::vector<CacheBlockLocation> expected = parents;
+                if (selected.empty())
+                    expected.push_back(history_location);
+                else
+                    expected.insert(expected.begin(), history_location);
+                EXPECT_EQ(order, expected);
+            }
+        }
+        EXPECT_EQ(pool.NumOccupiedSlots(), 2 * state_groups + 1);
     }
 }
 
@@ -206,12 +360,14 @@ TEST(CacheEvictionCandidates, EpochsLeaveInPolicyOrderOnAnyPhysicalLayout) {
 
     // Read from the index directly, and replayed from a pre-scan's snapshots.
     for (const bool prescan : {false, true}) {
-        CacheEvictionCandidates candidates{groups, pool, nullptr, nullptr, CheckpointAging{}, nullptr};
+        CacheEvictionCandidates candidates{groups, pool, CheckpointAging{}};
+        const CacheEvictionCandidates::LocationSet no_exclusions{std::pmr::get_default_resource()};
         if (prescan) {
             EXPECT_FALSE(candidates.PreScanUntil([](std::uint32_t, auto) { return false; }));
         }
         std::vector<std::int32_t> order;
-        while (const auto candidate = candidates.Next(std::numeric_limits<std::uint64_t>::max())) {
+        while (const auto candidate =
+                   candidates.Next({}, no_exclusions, no_exclusions, [](CacheBlockLocation) { return false; })) {
             order.push_back(candidate->location.lcm_block_id);
         }
         EXPECT_EQ(order, expected);
@@ -450,6 +606,101 @@ TEST(FixedSlotResource, FreeSlotsArePoisonedUntilHandedOut) {
 #endif
 }
 
+TEST(AdmissionCandidateConstraints, ReturnedReclaimsRespectClaimsWithoutChangingTables) {
+    BlockPool pool{8, {1}};
+    const std::vector specs{CacheGroupSpec{.attn_kind = AttnKind::kSlidingWindow,
+                                           .sliding_window = 4,
+                                           .cache_blocks_per_lcm_block = 1,
+                                           .block_granularity = 4}};
+    auto coordinator = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                       /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
+                                       /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
+    std::vector<BlockTable> tables(1);
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/20));
+    const PrefixProbe prefix = coordinator.Prober().ProbePrefix({});
+    const std::vector<GroupDemand> demands{{.table = &tables[0], .extent = DenseGrowth{0}}};
+    std::pmr::monotonic_buffer_resource resource;
+    const auto all = BuildAdmissionCandidateConstraints(coordinator.Store(), demands, 20, prefix, {}, &resource);
+    ASSERT_EQ(all.request_reclaim_candidates.size(), 4u);
+    const CacheBlockLocation first = tables[0].Blocks()[0]->Location();
+    const std::vector<std::pair<std::uint32_t, CacheBlockLocation>> claimed{{0, first}};
+    const auto protected_first =
+        BuildAdmissionCandidateConstraints(coordinator.Store(), demands, 20, prefix, claimed, &resource);
+    EXPECT_TRUE(protected_first.protected_locations.contains(first));
+    EXPECT_FALSE(protected_first.request_reclaim_locations.contains(first));
+    EXPECT_EQ(protected_first.request_reclaim_candidates.size(), 3u);
+    EXPECT_TRUE(all.request_reclaim_locations.contains(first));
+    EXPECT_EQ(all.request_reclaim_candidates.size(), 4u);
+    EXPECT_EQ(tables[0].NumBlocks(), 5);
+    EXPECT_EQ(pool.NumOccupiedSlots(), 5);
+    coordinator.Free(tables);
+}
+
+TEST(AdmissionPlanner, RepeatedPlansReturnIndependentDecisionsWithoutChangingThePool) {
+    BlockPool pool{2, {1}};
+    const std::vector specs{CacheGroupSpec{.cache_blocks_per_lcm_block = 1, .block_granularity = 4}};
+    auto coordinator = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                       /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
+                                       /*write_back_evictions=*/false, /*checkpoint_retention_requests=*/0);
+    std::vector<BlockTable> cached(1);
+    ASSERT_TRUE(AdmitForTest(coordinator, cached, /*num_tokens=*/8));
+    CacheFullBlocksForTest(coordinator, cached, ContentHashesFor({{1, 2, 3, 4}, {5, 6, 7, 8}}));
+    coordinator.Free(cached);
+    ASSERT_EQ(pool.NumEmptyLcmBlocks(), 0);
+    std::vector<BlockTable> request(1);
+    const PrefixProbe prefix = coordinator.Prober().ProbePrefix({});
+    const std::vector<GroupDemand> demands{{.table = &request[0], .extent = DenseGrowth{4}}};
+    const AdmissionPlanner planner{
+        coordinator.Store(),      CheckpointAging{}, demands, std::nullopt, std::nullopt, prefix, {}, {},
+        /*evicts_segments=*/false};
+    std::pmr::monotonic_buffer_resource first_resource;
+    std::pmr::monotonic_buffer_resource second_resource;
+    auto first = planner.Plan(&first_resource);
+    auto second = planner.Plan(&second_resource);
+    ASSERT_TRUE(first);
+    ASSERT_TRUE(second);
+    ASSERT_EQ(first->victims.size(), 1u);
+    ASSERT_EQ(second->victims.size(), 1u);
+    ASSERT_EQ(first->victims[0].members.size(), 1u);
+    ASSERT_EQ(second->victims[0].members.size(), 1u);
+    EXPECT_EQ(first->victims[0].members[0].location, second->victims[0].members[0].location);
+    first->victims.clear();
+    EXPECT_EQ(second->victims[0].members.size(), 1u);
+    EXPECT_EQ(request[0].NumBlocks(), 0);
+    EXPECT_EQ(pool.NumOccupiedSlots(), 2);
+}
+
+TEST(ShadowOccupancy, MixedPlacementDemandPreservesAllThreeConstraints) {
+    const CacheGroupSpec spec{.cache_blocks_per_lcm_block = 4, .block_granularity = 4};
+    std::vector<CacheGroup> groups;
+    groups.emplace_back(spec, std::make_unique<GroupAllocator>(4, 0, 2, 0), MakePrefixMatcher(spec));
+    BlockPool pool{2, {4}};
+    pool.RegisterGroup(0, 4, 2);
+    const auto held = pool.AcquireBlocksInBuckets(0, std::array<std::int32_t, 2>{0, 1});
+    ASSERT_EQ(held.size(), 2u);
+    ShadowOccupancy shadow{pool, groups};
+
+    // One hole in each bucket and one empty parent: six free slots in total.
+    std::vector<BlockPlacementDemand> block_demands{
+        {.blocks_by_bucket = {1, 1}, .any_bucket_blocks = 2, .same_bucket_pairs = 1}};
+    EXPECT_TRUE(shadow.Fits(block_demands));
+    ++block_demands[0].any_bucket_blocks;
+    EXPECT_FALSE(shadow.Fits(block_demands));
+
+    // Six blocks still fail when a fixed bucket needs four of its three slots.
+    block_demands[0] = {{4, 0}, 0, 1};
+    EXPECT_FALSE(shadow.Fits(block_demands));
+
+    // All six slots can hold individual blocks, but three pairs need an extra
+    // parent because each bucket has only three slots.
+    block_demands[0] = {{0, 0}, 6, 0};
+    EXPECT_TRUE(shadow.Fits(block_demands));
+    block_demands[0] = {{0, 0}, 0, 3};
+    EXPECT_FALSE(shadow.Fits(block_demands));
+    EXPECT_EQ(pool.NumOccupiedSlots(), 2);
+    EXPECT_EQ(pool.NumEmptyLcmBlocks(), 1);
+}
+
 TEST(ShadowOccupancy, ConcurrentPlansHaveIndependentCapacity) {
     const CacheGroupSpec history{.cache_blocks_per_lcm_block = 2, .block_granularity = 4};
     std::vector<CacheGroup> groups;
@@ -457,27 +708,26 @@ TEST(ShadowOccupancy, ConcurrentPlansHaveIndependentCapacity) {
     BlockPool pool{2, {2}};
     pool.RegisterGroup(0, 2, 1);
     const auto held = pool.AcquireBlocks(0, 4);
-    const std::vector<std::vector<std::int64_t>> needed{{2}};
-    const std::vector<std::int64_t> zero{0};
+    const std::vector<BlockPlacementDemand> block_demands{{.blocks_by_bucket = {2}}};
     for (int round = 0; round < 4; ++round) {
         ShadowOccupancy first{pool, groups};
         ShadowOccupancy second{pool, groups};
         ShadowOccupancy third{pool, groups};
-        EXPECT_FALSE(first.Fits(needed, zero, zero));
-        EXPECT_FALSE(second.Fits(needed, zero, zero));
-        EXPECT_FALSE(third.Fits(needed, zero, zero));
+        EXPECT_FALSE(first.Fits(block_demands));
+        EXPECT_FALSE(second.Fits(block_demands));
+        EXPECT_FALSE(third.Fits(block_demands));
         first.Remove(0, held[0]->Location());
         first.Remove(0, held[1]->Location());
-        EXPECT_TRUE(first.Fits(needed, zero, zero));
-        EXPECT_FALSE(second.Fits(needed, zero, zero));
+        EXPECT_TRUE(first.Fits(block_demands));
+        EXPECT_FALSE(second.Fits(block_demands));
         second.Remove(0, held[2]->Location());
-        EXPECT_FALSE(second.Fits(needed, zero, zero));
+        EXPECT_FALSE(second.Fits(block_demands));
         second.Remove(0, held[3]->Location());
-        EXPECT_TRUE(second.Fits(needed, zero, zero));
+        EXPECT_TRUE(second.Fits(block_demands));
         first.Restore(0, held[0]->Location());
-        EXPECT_FALSE(first.Fits(needed, zero, zero));
-        EXPECT_TRUE(second.Fits(needed, zero, zero));
-        EXPECT_FALSE(third.Fits(needed, zero, zero));
+        EXPECT_FALSE(first.Fits(block_demands));
+        EXPECT_TRUE(second.Fits(block_demands));
+        EXPECT_FALSE(third.Fits(block_demands));
         EXPECT_EQ(pool.NumOccupiedSlots(), 4);
     }
 }
@@ -501,20 +751,19 @@ TEST(ShadowOccupancy, ConcurrentPlansKeepSeparateCountsWhileTheyGrow) {
     }
     EXPECT_EQ(even.TouchedParents(), static_cast<std::size_t>(kParents / 2));
     EXPECT_EQ(odd.TouchedParents(), static_cast<std::size_t>(kParents / 2));
-    const std::vector<std::int64_t> zero{0};
-    const std::vector<std::vector<std::int64_t>> half{{kParents / 2}};
-    const std::vector<std::vector<std::int64_t>> more{{kParents / 2 + 1}};
+    const std::vector<BlockPlacementDemand> half{{.blocks_by_bucket = {kParents / 2}}};
+    const std::vector<BlockPlacementDemand> more{{.blocks_by_bucket = {kParents / 2 + 1}}};
     for (const ShadowOccupancy* shadow : {&even, &odd}) {
-        EXPECT_TRUE(shadow->Fits(half, zero, zero));
-        EXPECT_FALSE(shadow->Fits(more, zero, zero));
+        EXPECT_TRUE(shadow->Fits(half));
+        EXPECT_FALSE(shadow->Fits(more));
     }
     for (std::int32_t i = 0; i < kParents; i += 4) {
         even.Restore(0, held[i]->Location());
     }
-    EXPECT_FALSE(even.Fits(half, zero, zero));
-    EXPECT_TRUE(even.Fits(std::vector<std::vector<std::int64_t>>{{kParents / 4}}, zero, zero));
-    EXPECT_TRUE(odd.Fits(half, zero, zero));
-    EXPECT_FALSE(odd.Fits(more, zero, zero));
+    EXPECT_FALSE(even.Fits(half));
+    EXPECT_TRUE(even.Fits(std::vector<BlockPlacementDemand>{{.blocks_by_bucket = {kParents / 4}}}));
+    EXPECT_TRUE(odd.Fits(half));
+    EXPECT_FALSE(odd.Fits(more));
     EXPECT_EQ(pool.NumOccupiedSlots(), kParents);
 }
 
@@ -538,25 +787,18 @@ struct MixedPackingPool {
     std::vector<std::pair<std::uint32_t, CacheBlockRef>> held;
 };
 
-// Per group: blocks by bucket, dense blocks, pairs.
-struct MixedDemand {
-    std::vector<std::vector<std::int64_t>> need;
-    std::vector<std::int64_t> dense;
-    std::vector<std::int64_t> pairs;
-};
-
 // MixedDemands' entries whose fit is known without the formula.
 constexpr std::size_t kMoreThanThePool = 4;
 constexpr std::size_t kFitsAsThePoolIs = 5;
 
-std::vector<MixedDemand> MixedDemands() {
+std::vector<std::vector<BlockPlacementDemand>> MixedDemands() {
     return {
-        {{{3, 1}, {1}}, {14, 6}, {0, 0}},  // bucket and dense blocks
-        {{{0, 0}, {0}}, {20, 9}, {0, 0}},  // dense blocks only
-        {{{6, 2}, {0}}, {9, 0}, {3, 2}},   // pairs
-        {{{6, 6}, {3}}, {4, 5}, {1, 1}},   // all three
-        {{{0, 0}, {0}}, {60, 0}, {0, 0}},  // more than the whole pool
-        {{{1, 0}, {0}}, {0, 0}, {0, 0}},   // fits as the pool is
+        {{{3, 1}, 14, 0}, {{1}, 6, 0}},  // fixed buckets and any-bucket blocks
+        {{{0, 0}, 20, 0}, {{0}, 9, 0}},  // any-bucket blocks only
+        {{{6, 2}, 9, 3}, {{0}, 0, 2}},   // pairs
+        {{{6, 6}, 4, 1}, {{3}, 5, 1}},   // all three
+        {{{0, 0}, 60, 0}, {{0}, 0, 0}},  // more than the whole pool
+        {{{1, 0}, 0, 0}, {{0}, 0, 0}},   // fits as the pool is
     };
 }
 
@@ -565,9 +807,9 @@ std::vector<MixedDemand> MixedDemands() {
 TEST(ShadowOccupancy, ARemoveClosesAtMostOneParentOfTheShortfall) {
     MixedPackingPool setup;
     std::size_t removes_closing_one_parent = 0;
-    const std::vector<MixedDemand> demands = MixedDemands();
+    const std::vector<std::vector<BlockPlacementDemand>> demands = MixedDemands();
     for (std::size_t d = 0; d < demands.size(); ++d) {
-        const MixedDemand& demand = demands[d];
+        const std::vector<BlockPlacementDemand>& block_demands = demands[d];
         for (std::uint32_t seed = 0; seed < 4; ++seed) {
             SCOPED_TRACE(testing::Message() << "demand " << d << ", seed " << seed);
             std::vector<std::size_t> order(setup.held.size());
@@ -575,7 +817,7 @@ TEST(ShadowOccupancy, ARemoveClosesAtMostOneParentOfTheShortfall) {
             std::mt19937 random(seed);
             std::ranges::shuffle(order, random);
             ShadowOccupancy shadow{setup.pool, setup.groups};
-            const std::int64_t initial = shadow.ParentShortfall(demand.need, demand.dense, demand.pairs);
+            const std::int64_t initial = shadow.ParentShortfall(block_demands);
             if (d == kFitsAsThePoolIs) {
                 // An empty parent takes the one bucket-0 block.
                 EXPECT_EQ(initial, 0);
@@ -583,7 +825,7 @@ TEST(ShadowOccupancy, ARemoveClosesAtMostOneParentOfTheShortfall) {
             std::int64_t shortfall = initial;
             for (const std::size_t i : order) {
                 shadow.Remove(setup.held[i].first, setup.held[i].second->Location());
-                const std::int64_t next = shadow.ParentShortfall(demand.need, demand.dense, demand.pairs);
+                const std::int64_t next = shadow.ParentShortfall(block_demands);
                 ASSERT_GE(next, std::max<std::int64_t>(shortfall - 1, 0));
                 removes_closing_one_parent += next == shortfall - 1 ? 1 : 0;
                 shortfall = next;
@@ -595,7 +837,7 @@ TEST(ShadowOccupancy, ARemoveClosesAtMostOneParentOfTheShortfall) {
             std::ranges::shuffle(order, random);
             for (const std::size_t i : order) {
                 shadow.Restore(setup.held[i].first, setup.held[i].second->Location());
-                const std::int64_t next = shadow.ParentShortfall(demand.need, demand.dense, demand.pairs);
+                const std::int64_t next = shadow.ParentShortfall(block_demands);
                 ASSERT_GE(next, shortfall);
                 shortfall = next;
             }
@@ -624,14 +866,14 @@ TEST(CacheEvictionPlan, SelectionStopsAtTheFirstSelectionAfterWhichTheDemandFits
         if (permutation == 2) std::ranges::rotate(order, order.begin() + static_cast<std::ptrdiff_t>(order.size() / 2));
         if (permutation == 3) std::ranges::stable_partition(order, [](std::size_t i) { return i % 2 == 0; });
         for (const std::vector<std::size_t>& removed_per_selection : scripts) {
-            for (const MixedDemand& demand : MixedDemands()) {
+            for (const std::vector<BlockPlacementDemand>& block_demands : MixedDemands()) {
                 SCOPED_TRACE(permutation);
                 // Reference: ask the fit after every selection.
                 ShadowOccupancy reference{setup.pool, setup.groups};
                 std::optional<std::size_t> fits_after;
                 std::size_t next_block = 0;
                 for (std::size_t selection = 0;; ++selection) {
-                    if (reference.Fits(demand.need, demand.dense, demand.pairs)) {
+                    if (reference.Fits(block_demands)) {
                         fits_after = selection;
                         break;
                     }
@@ -645,7 +887,7 @@ TEST(CacheEvictionPlan, SelectionStopsAtTheFirstSelectionAfterWhichTheDemandFits
                 CacheEvictionPlan plan{setup.pool, setup.groups};
                 std::size_t selections = 0;
                 next_block = 0;
-                const bool fits = plan.SelectUntilFits(demand.need, demand.dense, demand.pairs, [&] {
+                const bool fits = plan.SelectUntilFits(block_demands, [&] {
                     if (selections == removed_per_selection.size()) return false;
                     for (std::size_t k = 0; k < removed_per_selection[selections]; ++k, ++next_block) {
                         const auto& [group_id, block] = setup.held[order[next_block]];
@@ -656,7 +898,7 @@ TEST(CacheEvictionPlan, SelectionStopsAtTheFirstSelectionAfterWhichTheDemandFits
                 });
                 EXPECT_EQ(fits, fits_after.has_value());
                 EXPECT_EQ(selections, fits_after.value_or(removed_per_selection.size()));
-                EXPECT_EQ(plan.Fits(demand.need, demand.dense, demand.pairs), fits);
+                EXPECT_EQ(plan.Fits(block_demands), fits);
             }
         }
     }
@@ -677,14 +919,12 @@ TEST(ShadowOccupancy, AReleasedHostParentCannotAlsoLeaveHistorySlotsBehind) {
     ShadowOccupancy shadow{host, groups};
     shadow.Remove(0, held->Location());
 
-    const std::vector<std::int64_t> dense{0, 0};
-    const std::vector<std::int64_t> pairs{0, 0};
-    const std::vector<std::vector<std::int64_t>> mixed{{2}, {1}};
-    const std::vector<std::vector<std::int64_t>> history_only{{8}, {0}};
-    const std::vector<std::vector<std::int64_t>> state_only{{0}, {1}};
-    EXPECT_FALSE(shadow.Fits(mixed, dense, pairs));
-    EXPECT_TRUE(shadow.Fits(history_only, dense, pairs));
-    EXPECT_TRUE(shadow.Fits(state_only, dense, pairs));
+    const std::vector<BlockPlacementDemand> mixed{{.blocks_by_bucket = {2}}, {.blocks_by_bucket = {1}}};
+    const std::vector<BlockPlacementDemand> history_only{{.blocks_by_bucket = {8}}, {.blocks_by_bucket = {0}}};
+    const std::vector<BlockPlacementDemand> state_only{{.blocks_by_bucket = {0}}, {.blocks_by_bucket = {1}}};
+    EXPECT_FALSE(shadow.Fits(mixed));
+    EXPECT_TRUE(shadow.Fits(history_only));
+    EXPECT_TRUE(shadow.Fits(state_only));
     EXPECT_EQ(host.NumEmptyLcmBlocks(), 0);  // The plan has not mutated storage.
 }
 
