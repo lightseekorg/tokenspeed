@@ -461,7 +461,7 @@ class ForwardStepRunner:
         self.confidence_request_ids: Sequence[Hashable] = []
         self.confidence_round_prepared = False
         self._confidence_host_group = None
-        if drafter is not None and drafter.verify_policy == "confidence":
+        if drafter is not None and drafter.qwen4_adaptive_verify:
             if confidence_inputs_supported is None:
                 raise ValueError("adaptive DSpark graphs require live input validation")
             self.confidence_feedback = ConfidenceFeedback(

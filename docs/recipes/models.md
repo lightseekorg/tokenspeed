@@ -1314,15 +1314,15 @@ ts serve nvidia/Qwen3.8-Flash-Next-NVFP4 \
     --speculative-draft-model-path /path/to/pinned-dspark \
     --speculative-num-steps 7 \
     --speculative-num-draft-tokens 8 \
-    --speculative-verify-policy confidence \
+    --enable-qwen4-adaptive-dspark \
     --attention-backend trtllm \
     --drafter-attention-backend trtllm \
     --moe-backend flashinfer_trtllm
 ```
 
-Use `fixed` to compare full-width DSpark on the same checkpoint.
-The `confidence` policy chooses a query budget using completed scores and
-startup graph timings. The latest device scores assign request prefixes.
+Omit `--enable-qwen4-adaptive-dspark` to use fixed-width verification on the
+same checkpoint. With the flag, completed scores and startup graph timings
+choose the query budget. The latest device scores assign request prefixes.
 
 Confidence verification keeps selected rows compact through the target body,
 including attention, GDN, PLE and MLP. The LM head and sampler use the

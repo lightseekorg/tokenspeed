@@ -2881,8 +2881,9 @@ the target materializes deferred residuals and captures the FP32 mean of its
 four HC branches. The confidence head consumes final-normalized draft hidden
 states and the previous-token Markov latent.
 
-`--speculative-verify-policy confidence` chooses Q from completed checkpoint
-probabilities and startup costs. `fixed` remains the default.
+`--enable-qwen4-adaptive-dspark` chooses Q from completed checkpoint
+probabilities and startup costs. Without the flag, DSpark verifies the full
+draft window.
 
 Both adaptive DSpark paths share the host feedback store and nonblocking
 event queue. Admission identity and device generation isolate request lifetimes.
