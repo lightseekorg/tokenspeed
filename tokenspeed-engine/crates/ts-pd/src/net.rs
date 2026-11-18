@@ -56,8 +56,10 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// associated request, or retry an idempotent notification on a later poll.
 #[derive(Debug, thiserror::Error)]
 pub enum SendError {
+    /// The destination's queue is full.
     #[error("the PD outgoing queue for {0} is full")]
     Full(String),
+    /// The destination's sending task stopped.
     #[error("the PD outgoing queue for {0} stopped")]
     Closed(String),
 }
@@ -199,11 +201,21 @@ impl Sockets {
     /// Bind the PULL socket on `host` at a port the OS picks; every message
     /// it receives goes to `incoming`, frames in order.
     pub fn start(host: &str, incoming: mpsc::Sender<Vec<Bytes>>) -> Result<Self, NetError> {
-        Self::with_timeouts(host, incoming, IO_TIMEOUT, IDLE_TIMEOUT)
+        Self::start_at(host, 0, incoming)
+    }
+
+    /// Bind the PULL socket on `host` at `port` (0: a port the OS picks).
+    pub fn start_at(
+        host: &str,
+        port: u16,
+        incoming: mpsc::Sender<Vec<Bytes>>,
+    ) -> Result<Self, NetError> {
+        Self::with_timeouts(host, port, incoming, IO_TIMEOUT, IDLE_TIMEOUT)
     }
 
     fn with_timeouts(
         host: &str,
+        port: u16,
         incoming: mpsc::Sender<Vec<Bytes>>,
         io_timeout: Duration,
         idle_timeout: Duration,
@@ -214,9 +226,9 @@ impl Sockets {
             .enable_all()
             .build()?;
         let address = if host.contains(':') {
-            format!("tcp://[{host}]:0")
+            format!("tcp://[{host}]:{port}")
         } else {
-            format!("tcp://{host}:0")
+            format!("tcp://{host}:{port}")
         };
         let (pull, port) = runtime.block_on(async {
             let mut pull = PullSocket::new();
@@ -490,6 +502,7 @@ mod tests {
         let (incoming, _) = mpsc::channel();
         let sender = Sockets::with_timeouts(
             "127.0.0.1",
+            0,
             incoming,
             IO_TIMEOUT,
             Duration::from_millis(100),
@@ -538,9 +551,14 @@ mod tests {
         let port = stalled.local_addr().unwrap().port();
         let address = format!("tcp://127.0.0.1:{port}");
         let (incoming, _) = mpsc::channel();
-        let sender =
-            Sockets::with_timeouts("127.0.0.1", incoming, Duration::from_secs(1), IDLE_TIMEOUT)
-                .unwrap();
+        let sender = Sockets::with_timeouts(
+            "127.0.0.1",
+            0,
+            incoming,
+            Duration::from_secs(1),
+            IDLE_TIMEOUT,
+        )
+        .unwrap();
         let (incoming, received) = mpsc::channel();
         let healthy = Sockets::start("127.0.0.1", incoming).unwrap();
         // Retry the same dead address after retirement, proving recreation too.
@@ -576,9 +594,14 @@ mod tests {
         let port = stalled.local_addr().unwrap().port();
         let address = format!("tcp://127.0.0.1:{port}");
         let (incoming, _) = mpsc::channel();
-        let sender =
-            Sockets::with_timeouts("127.0.0.1", incoming, Duration::from_secs(1), IDLE_TIMEOUT)
-                .unwrap();
+        let sender = Sockets::with_timeouts(
+            "127.0.0.1",
+            0,
+            incoming,
+            Duration::from_secs(1),
+            IDLE_TIMEOUT,
+        )
+        .unwrap();
         sender
             .send_coalesced("127.0.0.1", port, vec![ascii("old")])
             .unwrap();

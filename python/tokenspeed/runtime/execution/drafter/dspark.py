@@ -41,6 +41,7 @@ from tokenspeed_kernel.ops.sampling.cute_dsl import (
 from tokenspeed_kernel.ops.sampling.triton import dspark_markov_shard_logits
 from typing_extensions import override
 
+from tokenspeed.runtime.distributed.comm_backend.registry import get_global_backend
 from tokenspeed.runtime.distributed.comm_ops import all_gather_single
 from tokenspeed.runtime.execution.drafter._dspark_walk import (
     dspark_walk_finish,
@@ -285,7 +286,7 @@ class DSpark(DFlash):
         return logits.view(rows, positions, num_org).transpose(0, 1).contiguous()
 
     def _fused_walk_fits(self, block_logits: torch.Tensor) -> bool:
-        """Whether the greedy walk can take one launch and one gather per round.
+        """Whether the greedy walk can take one launch and one exchange per round.
 
         Without a distributed argmax state the generic walk takes several
         launches and two all-gathers per round. A state, where the
@@ -360,7 +361,11 @@ class DSpark(DFlash):
         words, gathered = self._ensure_walk_buffers(block_logits.device)
         words = words[:, :rows]
         words.zero_()
+        group = self.logits_processor.tp_group
+        backend = get_global_backend()
         previous = None
+        # Words the next launch decodes: one per row once reduced with MAX.
+        previous_words = 1
         for k in range(1, rounds + 1):
             word = words[k - 1]
             dspark_walk_round(
@@ -372,14 +377,14 @@ class DSpark(DFlash):
                 previous,
                 column=k,
                 vocab_start=start,
-                tp=tp,
+                tp=previous_words,
             )
-            if tp == 1:
-                previous = word
+            if tp == 1 or backend.try_word_max(word, group):
+                previous, previous_words = word, 1
             else:
-                previous = gathered[k - 1, : tp * rows]
-                all_gather_single(previous, word, self.logits_processor.tp_group)
-        dspark_walk_finish(next_tokens, previous, column=rounds, tp=tp)
+                previous, previous_words = gathered[k - 1, : tp * rows], tp
+                all_gather_single(previous, word, group)
+        dspark_walk_finish(next_tokens, previous, column=rounds, tp=previous_words)
 
     def _make_step_bias_fn(self, prev_tokens: torch.Tensor):
         """Build the per-position additive-bias hook for the Markov head.

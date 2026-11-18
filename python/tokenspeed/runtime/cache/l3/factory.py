@@ -122,65 +122,30 @@ def mooncake_store_library() -> str:
     return path
 
 
-def l3_settings(
+def cache_deployment_id(
     server_args: ServerArgs,
     model_config: ModelConfig,
     draft_model_config: ModelConfig | None,
     *,
-    host_cache: HostCacheResources | None,
+    host_cache: HostCacheResources,
     world_cpu_group: ProcessGroup | None,
-) -> L3Settings | None:
-    """The settings the engine host starts this rank's L3 executor from.
+) -> str:
+    """The cache namespace's deployment id: everything that shapes a cached
+    page's bytes (``storage_deployment_id``). Pages are shared only under one
+    id -- through the L3 tier, or between peer replicas
+    (``cache/peer.py``).
 
     Args:
         server_args: Resolved launch settings; numerical choices are snapshotted.
         model_config: Target checkpoint configuration, without model weights.
         draft_model_config: Draft checkpoint configuration, or None.
         host_cache: Shared Host resources and resolved CPU cache facts.
-            None when device construction produced no Host L2 allocation.
         world_cpu_group: The existing Gloo world group for checkpoint agreement;
-            None in a single-process deployment.
+            None in a single-process deployment. Every rank calls this.
 
     Returns:
-        The settings, with the Host pool by address: the caller keeps
-        ``host_cache.storage`` for the process. None without a storage
-        backend; then no collective runs.
+        The id; the weight version is not part of it.
     """
-    if server_args.kvstore_storage_backend is None:
-        return None
-    backend = server_args.kvstore_storage_backend.strip().lower()
-    if backend not in ("memory", "mooncake"):
-        raise ValueError(
-            "unsupported KVStore storage backend "
-            f"{server_args.kvstore_storage_backend!r}"
-        )
-    if host_cache is None:
-        raise ValueError("L3 construction requires a Host L2 allocation")
-    host_storage = host_cache.storage
-    ownership = host_cache.ownership
-    cache_fields = tuple(
-        tuple(field.field_id for field in group.fields) for group in host_cache.groups
-    )
-    from tokenspeed.runtime.layers.attention.kv_cache.recipes.transfer import (
-        build_cache_transfer_schema,
-    )
-
-    transfer_schema = build_cache_transfer_schema(
-        host_cache.memory_plan,
-        model_config=model_config,
-        draft_model_config=draft_model_config,
-    )
-    if len(cache_fields) != len(ownership.shard_counts):
-        raise ValueError("L3 field groups and Host ownership must agree")
-    for fields, shards in zip(cache_fields, ownership.shard_counts, strict=True):
-        if shards > 1:
-            for field_id in fields:
-                if transfer_schema.partition_for(field_id) is not None:
-                    raise ValueError(
-                        "L3 page sharding requires replicated field payloads; "
-                        f"{field_id} is head-partitioned"
-                    )
-
     from tokenspeed.runtime.utils.server_args import AUX_CAPTURE_SPEC_ALGORITHMS
 
     eagle3_layers_to_capture: tuple[int, ...] = ()
@@ -196,18 +161,12 @@ def l3_settings(
                 eagle3_layers_to_capture = tuple(int(layer) for layer in draft_layers)
     attention_backend_name = host_cache.attention_backend_name
     draft_attention_backend_name = host_cache.draft_attention_backend_name
-    from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
     from tokenspeed.runtime.cache.l3.identity import cache_layout_signature
 
     cache_signature = cache_layout_signature(
         host_cache,
         cache_dtype=f"{server_args.kv_cache_dtype}:{model_config.dtype}",
         checkpoint_granularities=host_cache.checkpoint_granularities,
-    )
-    config = StorageRuntimeConfig.from_extra_config(
-        server_args.kvstore_storage_backend_extra_config,
-        host_blocks=host_storage.num_host_lcm_blocks,
-        prefix_granularity=host_cache.memory_plan.prefix_granularity,
     )
     import torch.distributed as dist
 
@@ -274,14 +233,14 @@ def l3_settings(
         quantization_param_path=str(server_args.quantization_param_path or ""),
         draft_quantization=draft_quantization,
     )
-    deployment_id = storage_deployment_id(
+    return storage_deployment_id(
         str(server_args.model),
         revision=checkpoint_id,
         model_overrides=model_config.model_override_args,
         cache_signature=cache_signature,
         pipeline_rank=pipeline_rank,
         attn_tp_size=int(server_args.mapping.attn.tp_size),
-        group_shard_counts=ownership.shard_counts,
+        group_shard_counts=host_cache.ownership.shard_counts,
         draft_model=draft_model,
         draft_revision=draft_revision,
         cache_quantization=cache_quantization,
@@ -298,11 +257,87 @@ def l3_settings(
         ),
     )
 
+
+def l3_settings(
+    server_args: ServerArgs,
+    model_config: ModelConfig,
+    draft_model_config: ModelConfig | None,
+    *,
+    host_cache: HostCacheResources | None,
+    world_cpu_group: ProcessGroup | None,
+) -> L3Settings | None:
+    """The settings the engine host starts this rank's L3 executor from.
+
+    Args:
+        server_args: Resolved launch settings; numerical choices are snapshotted.
+        model_config: Target checkpoint configuration, without model weights.
+        draft_model_config: Draft checkpoint configuration, or None.
+        host_cache: Shared Host resources and resolved CPU cache facts.
+            None when device construction produced no Host L2 allocation.
+        world_cpu_group: The existing Gloo world group for checkpoint agreement;
+            None in a single-process deployment.
+
+    Returns:
+        The settings, with the Host pool by address: the caller keeps
+        ``host_cache.storage`` for the process. None without a storage
+        backend; then no collective runs.
+    """
+    if server_args.kvstore_storage_backend is None:
+        return None
+    backend = server_args.kvstore_storage_backend.strip().lower()
+    if backend not in ("memory", "mooncake"):
+        raise ValueError(
+            "unsupported KVStore storage backend "
+            f"{server_args.kvstore_storage_backend!r}"
+        )
+    if host_cache is None:
+        raise ValueError("L3 construction requires a Host L2 allocation")
+    host_storage = host_cache.storage
+    ownership = host_cache.ownership
+    cache_fields = tuple(
+        tuple(field.field_id for field in group.fields) for group in host_cache.groups
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.transfer import (
+        build_cache_transfer_schema,
+    )
+
+    transfer_schema = build_cache_transfer_schema(
+        host_cache.memory_plan,
+        model_config=model_config,
+        draft_model_config=draft_model_config,
+    )
+    if len(cache_fields) != len(ownership.shard_counts):
+        raise ValueError("L3 field groups and Host ownership must agree")
+    for fields, shards in zip(cache_fields, ownership.shard_counts, strict=True):
+        if shards > 1:
+            for field_id in fields:
+                if transfer_schema.partition_for(field_id) is not None:
+                    raise ValueError(
+                        "L3 page sharding requires replicated field payloads; "
+                        f"{field_id} is head-partitioned"
+                    )
+
+    from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
+
+    config = StorageRuntimeConfig.from_extra_config(
+        server_args.kvstore_storage_backend_extra_config,
+        host_blocks=host_storage.num_host_lcm_blocks,
+        prefix_granularity=host_cache.memory_plan.prefix_granularity,
+    )
+    deployment_id = cache_deployment_id(
+        server_args,
+        model_config,
+        draft_model_config,
+        host_cache=host_cache,
+        world_cpu_group=world_cpu_group,
+    )
+
     pp_size = server_args.mapping.pp_size if server_args.mapping.has_pp else 1
     return L3Settings(
         runtime=config,
         deployment_id=deployment_id,
-        has_draft=bool(draft_model),
+        has_draft=draft_model_config is not None
+        and bool(str(draft_model_config.model_path)),
         weight_version=str(server_args.weight_version),
         host_buffer=int(host_storage.host_buffer.data_ptr()),
         host_buffer_bytes=int(host_storage.host_buffer_bytes),

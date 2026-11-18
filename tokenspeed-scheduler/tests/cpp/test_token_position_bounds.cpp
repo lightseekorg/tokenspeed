@@ -135,7 +135,7 @@ TEST(TokenPositionBoundsTest, AnInt32MaxWindowsLookbackRoundsUpToWholeBlocks) {
         .cache_blocks_per_lcm_block = 1,
         .block_granularity = 1024,
     });
-    EXPECT_EQ(matcher->BoundaryLookbackPages(), 2097152);
+    EXPECT_EQ(matcher->BoundaryLookbackBlocks(), 2097152);
 }
 
 }  // namespace

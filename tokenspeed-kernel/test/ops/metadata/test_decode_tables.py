@@ -48,6 +48,7 @@ def test_dynamic_shapes_do_not_compile():
             actual_bs=bs,
             tokens_per_req=width,
             ratios=(4,),
+            atom_pages_per_block=(8,),
             pages=(80,),
             page_sizes=(64,),
             targets=(None,),
@@ -59,7 +60,7 @@ def test_dynamic_shapes_do_not_compile():
             refresh(*args)
     torch.testing.assert_close(
         locations[0, :3],
-        torch.tensor([1854, 1855, 1856], device="cuda", dtype=torch.int32),
+        torch.tensor([3646, 3647, 3648], device="cuda", dtype=torch.int32),
         atol=0,
         rtol=0,
     )
@@ -86,17 +87,18 @@ def test_source_offsets_beyond_int32():
         actual_bs=2,
         tokens_per_req=4,
         ratios=(4,),
+        atom_pages_per_block=(8,),
         pages=(16,),
         page_sizes=(64,),
         targets=(None,),
     )
     expected = torch.tensor(
-        [28, 29, 30, 31] * 4, dtype=torch.int32, device="cuda"
+        [56, 57, 58, 59] * 4, dtype=torch.int32, device="cuda"
     ).expand(2, -1)
     torch.testing.assert_close(tables[0], expected, atol=0, rtol=0)
     torch.testing.assert_close(
         locations[0],
-        torch.tensor([1853, 1854, 1855, 1856] * 2, dtype=torch.int32, device="cuda"),
+        torch.tensor([3645, 3646, 3647, 3648] * 2, dtype=torch.int32, device="cuda"),
         atol=0,
         rtol=0,
     )
@@ -104,7 +106,8 @@ def test_source_offsets_beyond_int32():
 
 @pytest.mark.parametrize("actual_bs", [0, 2, 3])
 @pytest.mark.parametrize("width", [1, 4])
-def test_cpu_decode_buffers(actual_bs, width):
+@pytest.mark.parametrize("atoms", [(2, 1, 4), (8, 3, 16)])
+def test_cpu_decode_buffers(actual_bs, width, atoms):
     ratios, pages, sizes = (2, 1, 4), (5, 7, 3), (4, 2, 2)
     raw = torch.tensor([[-1, 3, 0, 4], [5, 0, -1, 7], [2, 3, 4, 5]], dtype=torch.int32)
     source = raw.repeat_interleave(2, dim=1)[:, ::2]
@@ -131,7 +134,7 @@ def test_cpu_decode_buffers(actual_bs, width):
                 live = row < actual_bs and col < pages[g] and block < raw.shape[1]
                 value = int(raw[row, block]) if live else 0
                 expected_tables[g, row, col] = (
-                    value * ratios[g] + col % ratios[g] if value > 0 else 0
+                    value * atoms[g] + col % ratios[g] if value > 0 else 0
                 )
             for step in range(width):
                 pos = max(int(lengths[row]) - width + step, 0)
@@ -148,6 +151,7 @@ def test_cpu_decode_buffers(actual_bs, width):
         actual_bs=actual_bs,
         tokens_per_req=width,
         ratios=ratios,
+        atom_pages_per_block=atoms,
         pages=pages,
         page_sizes=sizes,
         targets=targets,

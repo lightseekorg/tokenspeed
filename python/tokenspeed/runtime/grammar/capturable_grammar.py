@@ -276,26 +276,23 @@ class CapturableGrammarExecutor:
     ) -> None:
         """Fork grammar work onto the side stream for this step.
 
-        Side stream: wait(fork_event) → D2H candidates (spec) →
-        host node → H2D bitmask → bitmask_event. Main rejoins
-        via wait_bitmask before apply_mask; forward on main overlaps
-        with the advance + fill on the side stream.
+        Main first copies verify candidates, then records fork_event. This
+        keeps the D2H ahead of any in-place input packing on main. Side
+        stream: wait(fork_event) → host node → H2D bitmask → bitmask_event.
+        Main rejoins via wait_bitmask before apply_mask; forward on main
+        overlaps with the advance + fill on the side stream.
         """
+        if input_ids_buf_slice is not None:
+            bs = input_ids_buf_slice.shape[0] // self.max_tokens_per_req
+            self.candidates[candidate_start : candidate_start + bs].copy_(
+                input_ids_buf_slice.view(bs, self.max_tokens_per_req),
+                non_blocking=True,
+            )
+
         self.fork_event.record()
 
         with torch.cuda.stream(self.stream):
-
             torch.cuda.current_stream().wait_event(self.fork_event)
-
-            if input_ids_buf_slice is not None:
-
-                bs = input_ids_buf_slice.shape[0] // self.max_tokens_per_req
-
-                self.candidates[candidate_start : candidate_start + bs].copy_(
-                    input_ids_buf_slice.view(bs, self.max_tokens_per_req),
-                    non_blocking=True,
-                )
-
             self.host.launch(torch.cuda.current_stream().cuda_stream)
 
             self.bitmask.copy_(self.host_bitmask, non_blocking=True)

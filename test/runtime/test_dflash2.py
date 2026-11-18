@@ -34,6 +34,8 @@ from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
+from test.runtime.cache_pool_test_utils import make_mha_pool_for_groups
+
 from tokenspeed.runtime.configs.model_config import _is_dflash2_mla
 from tokenspeed.runtime.execution.drafter import get_drafter_impl
 from tokenspeed.runtime.execution.drafter.dflash import DFlash
@@ -54,6 +56,7 @@ from tokenspeed.runtime.layers.attention.backends.paged.router import CacheGroup
 from tokenspeed.runtime.layers.attention.configs.base import (
     resolve_speculative_num_tokens,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroupSpec
 from tokenspeed.runtime.layers.attention.registry import _BACKEND_REGISTRY
 from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
@@ -862,6 +865,12 @@ def _dspark_context_drafter(
             windows={"full_attention": None},
         ),
         {"full_attention": _DraftLeaf(query_width)},
+    )
+    router.set_cache_pool(
+        make_mha_pool_for_groups(
+            (CacheGroupSpec("full_attention", "full_history", 4, 1, replayable=False),),
+            device="cpu",
+        )
     )
     router.init_cuda_graph_state(2)
 

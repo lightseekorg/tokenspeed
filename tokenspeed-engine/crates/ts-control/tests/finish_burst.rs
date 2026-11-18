@@ -135,6 +135,7 @@ fn requests(s: Shape, prompt: usize, steps: usize) -> Vec<RequestSpec> {
                 session_id: String::new(),
                 cache_group_id: String::new(),
                 shared_prefix_tokens: Vec::new(),
+                peer_holder: String::new(),
                 tokens,
                 max_new_tokens: steps as i32,
                 max_cached_prefix_tokens: i32::MAX,

@@ -78,7 +78,7 @@ from tokenspeed.runtime.models.deepseek_v41_dspark import (
 )
 from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.hf_transformers_utils import get_config
-from tokenspeed.runtime.utils.server_args import ServerArgs
+from tokenspeed.runtime.utils.server_args import ServerArgs, prepare_server_args
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
@@ -1691,6 +1691,22 @@ def _assert_adaptive_inputs_and_state(adapter):
     drafter.set_decode_graph_query_extent(None)
 
 
+def test_packed_grammar_mask_gather_uses_published_verify_rows():
+    drafter = object.__new__(DeepseekV41DSpark)
+    drafter.device = torch.device("cpu")
+    drafter.spec_num_tokens = 4
+    drafter._verify_rows = torch.empty(12, dtype=torch.int64)
+    drafter._verify_indptr = torch.empty(4, dtype=torch.int64)
+    drafter._verify_layout_counts = None
+    drafter.prepare_verify_layout((2, 4, 1), num_tokens=9)
+
+    vocab_mask = torch.arange(48, dtype=torch.int32).reshape(12, 4)
+    packed = drafter.pack_grammar_vocab_mask(vocab_mask, num_tokens=9)
+    expected_rows = torch.tensor([0, 1, 4, 5, 6, 7, 8, 0, 0])
+    torch.testing.assert_close(packed, vocab_mask.index_select(0, expected_rows))
+    assert drafter._verify_indptr.tolist() == [0, 2, 6, 7]
+
+
 @pytest.mark.parametrize(
     "field,value",
     [
@@ -1703,8 +1719,6 @@ def _assert_adaptive_inputs_and_state(adapter):
         ("query_context_parallel_size", 2),
         ("pipeline_parallel_size", 2),
         ("dp_sampling", True),
-        ("grammar_backend", "xgrammar"),
-        ("enable_output_logprobs", True),
         ("enable_output_cumulative_probs", True),
         ("enable_speculative_sampling", True),
         ("speculative_eagle_topk", 2),
@@ -1732,6 +1746,55 @@ def test_adaptive_v41_launch_contract(field, value):
     # With no opt-in, existing launch configurations incur no new restrictions.
     args.enable_dsv41_adaptive_dspark = False
     args.validate_dsv41_adaptive_dspark()
+
+
+def _adaptive_dp_local_cli(sampling_backend: str) -> list[str]:
+    argv = [
+        "--model",
+        "x",
+        "--speculative-algorithm",
+        "DSPARK",
+        "--sampling-backend",
+        sampling_backend,
+        "--moe-backend",
+        "mega_moe",
+        "--enable-dp-local-cuda-graph",
+        "--enable-dsv41-adaptive-dspark",
+        "--disable-prefill-graph",
+        "--grammar-backend",
+        "xgrammar",
+        "--enable-output-logprobs",
+    ]
+    if sampling_backend == "flashinfer":
+        argv += [
+            "--enable-speculative-sampling",
+            "--sampling-stream",
+            "per-request",
+            "--speculative-rejection-sample-method",
+            "standard",
+        ]
+    return argv
+
+
+@pytest.mark.parametrize("sampling_backend", ["greedy", "flashinfer"])
+def test_adaptive_dp_local_accepts_xgrammar_and_output_logprobs(sampling_backend):
+    args = prepare_server_args(
+        _adaptive_dp_local_cli(sampling_backend)
+        + ["--data-parallel-size", "2", "--enable-expert-parallel"]
+    )
+    assert args.mapping.attn.dp_size == 2
+    assert args.enable_dp_local_cuda_graph
+    assert args.grammar_backend == "xgrammar"
+    assert args.enable_output_logprobs
+
+
+@pytest.mark.parametrize("sampling_backend", ["greedy", "flashinfer"])
+def test_adaptive_dp_local_still_rejects_cumulative_probs(sampling_backend):
+    with pytest.raises(ValueError, match="adaptive verification does not support"):
+        prepare_server_args(
+            _adaptive_dp_local_cli(sampling_backend)
+            + ["--enable-output-cumulative-probs"]
+        )
 
 
 @pytest.mark.parametrize(

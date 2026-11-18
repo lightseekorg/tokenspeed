@@ -23,7 +23,7 @@
 use crate::*;
 use rustix::time::{clock_gettime, ClockId};
 use serde_json::{json, Value};
-use std::collections::VecDeque;
+use std::{collections::VecDeque, sync::Arc};
 use ts_control::kv_events::{KvEventProgress, KvEventPublisher, KvEventsConfig};
 
 struct BurstFrontend {
@@ -264,7 +264,7 @@ result=ts.Scheduler(cfg)
     config.in_flight_depth = depth;
     config.kv_events = enabled;
     let mut event_loop = EventLoop::new(
-        scheduler,
+        Arc::new(parking_lot::Mutex::new(scheduler)),
         InstantDevice {
             plans: plans.clone(),
             verify_width: 1,

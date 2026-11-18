@@ -172,12 +172,14 @@ def test_verify_has_no_elementwise_launches(
 
 
 @pytest.mark.parametrize("steps", [1, 3])
-def test_gdn_backend_reads_projection_views_like_dense_inputs(steps: int) -> None:
-    """Plain decode packs the model's row-strided projection views (here with a
-    misaligned ``a``) for FlashInfer's kernel, or hands them to kernels that
-    read by stride; chain verify's conv update writes dense q/k/v rows and the
-    verify reads the gates by stride. Outputs and states match dense inputs
-    bit for bit."""
+@pytest.mark.parametrize("strided_state", [False, True])
+def test_gdn_backend_reads_projection_views_like_dense_inputs(
+    steps: int, strided_state: bool
+) -> None:
+    """Plain decode and chain verify pack the model's row-strided projection
+    views (here with a misaligned ``a``) for FlashInfer's kernels, or hand them
+    to kernels that read by stride: outputs and states match dense inputs bit
+    for bit."""
     from tokenspeed.runtime.layers.attention.backends.state.gdn import GdnAttnBackend
 
     torch.manual_seed(5)
@@ -213,7 +215,13 @@ def test_gdn_backend_reads_projection_views_like_dense_inputs(steps: int) -> Non
     tables = torch.arange(1, pool_size, dtype=torch.int32, device="cuda").view(batch, 2)
     results = []
     for inputs in (views, {name: t.contiguous() for name, t in views.items()}):
-        conv, ssm = conv_init.clone(), ssm_init.clone()
+        conv = conv_init.clone()
+        if strided_state:
+            backing = torch.full((pool_size * 2, heads, dim, dim), 123.0, device="cuda")
+            ssm = backing[::2]
+            ssm.copy_(ssm_init)
+        else:
+            ssm = ssm_init.clone()
         pool = _ContractPool({0: ("linear_attention", conv, ssm)})
         backend = GdnAttnBackend(
             *_mamba_config_pair(
@@ -249,6 +257,8 @@ def test_gdn_backend_reads_projection_views_like_dense_inputs(steps: int) -> Non
             **inputs,
             **fixed,
         )
+        if strided_state:
+            assert torch.all(backing[1::2] == 123.0)
         results.append((out, conv, ssm))
     for strided, dense in zip(*results):
         assert torch.equal(strided, dense)

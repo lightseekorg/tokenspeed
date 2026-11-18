@@ -181,7 +181,8 @@ class VocabParallelArgmax:
     Each rank packs its shard's row maximum and global index into an int64
     key, and an all-reduce MAX over the group picks the same token the
     argmax of the gathered row would. It exchanges 8 bytes per row instead
-    of the logits shards.
+    of the logits shards, through the group's prepared word MAX where the
+    backend has one.
     """
 
     def __init__(self, tp_group: tuple[int, ...], vocab_offset: int):
@@ -191,7 +192,8 @@ class VocabParallelArgmax:
     def __call__(self, logits: torch.Tensor) -> torch.Tensor:
         keys = torch.empty(logits.shape[0], dtype=torch.int64, device=logits.device)
         vocab_parallel_argmax_keys(logits, vocab_offset=self.vocab_offset, out=keys)
-        keys = all_reduce(keys, self.tp_group, op=torch.distributed.ReduceOp.MAX)
+        if not get_global_backend().try_word_max(keys, self.tp_group):
+            keys = all_reduce(keys, self.tp_group, op=torch.distributed.ReduceOp.MAX)
         return argmax_key_index(keys, out=torch.empty_like(keys))
 
 

@@ -34,6 +34,7 @@
 #include <vector>
 
 #include "cache/coordinator/admission_planner.h"
+#include "cache/core/block_placement_demand.h"
 #include "core/profile_span.h"
 #include "utils.h"
 
@@ -46,7 +47,7 @@ namespace {
 // one does; a page leaves with the blocks of its boundary that can leave and
 // everything the Device holds under it, climbing nowhere, so the Device's
 // coverage stays closed. It also lends a compaction (LoneRequestAdmission::Compact) its
-// capacity and candidate views.
+// capacity checks and victim expansion.
 class LoneRequestPlanner final : public AdmissionPlanner {
 public:
     using AdmissionPlanner::AdmissionPlanner;
@@ -56,28 +57,26 @@ public:
     // over the blocks that keep their bucket (bucket_pinned, by bucket) plus
     // the bucket-exact demand, the blocks that may take any bucket
     // (free_movers, a request's unwritten reserve) plus the dense demand, and
-    // the demand's same-bucket pairs (reserveCopyIns). The gate of
+    // the demand's same-bucket pairs (copyInReservations). The gate of
     // LoneRequestAdmission::Compact, and what prepares the planner's
-    // capacity and candidate views for PlanBlockAlone.
+    // capacity bound used by the compaction.
     std::int64_t DenseLayoutParents(std::span<const std::vector<std::int64_t>> bucket_pinned,
-                                    std::span<const std::int64_t> free_movers) {
+                                    std::span<const std::int64_t> free_movers) const {
         _assert(bucket_pinned.size() == groups_.size() && free_movers.size() == groups_.size(),
                 "one bucket layout and one free-mover count per group");
-        if (!std::exchange(views_prepared_, true)) {
-            initializeCapacity();
-            collectCandidates();
-        }
+        const AdmissionCapacity capacity = buildCapacity();
         std::int64_t parents = 0;
         for (std::size_t i = 0; i < groups_.size(); ++i) {
-            _assert(bucket_pinned[i].size() == shape_need_[i].size(), "bucket layout must match the shard count");
-            std::vector<std::int64_t> need(shape_need_[i].size());
-            for (std::size_t b = 0; b < need.size(); ++b) {
-                need[b] = bucket_pinned[i][b] + shape_need_[i][b];
+            BlockPlacementDemand block_demand = capacity.block_demands[i];
+            _assert(bucket_pinned[i].size() == block_demand.blocks_by_bucket.size(),
+                    "bucket layout must match the shard count");
+            for (std::size_t b = 0; b < bucket_pinned[i].size(); ++b) {
+                block_demand.blocks_by_bucket[b] += bucket_pinned[i][b];
             }
-            const std::vector<std::int64_t> holes(need.size(), 0);
-            std::vector<std::int64_t> scratch(need.size(), 0);
-            parents += ParentsNeededForBucketsAndPairs(need, holes, free_movers[i] + blocks_needed_[i], pair_need_[i],
-                                                       pool_.Packing(groups_[i].Id()), scratch);
+            block_demand.any_bucket_blocks += free_movers[i];
+            const std::vector<std::int64_t> holes(bucket_pinned[i].size(), 0);
+            std::vector<std::int64_t> scratch(bucket_pinned[i].size(), 0);
+            parents += ParentsNeededForBucketsAndPairs(block_demand, holes, pool_.Packing(groups_[i].Id()), scratch);
         }
         return parents;
     }
@@ -90,17 +89,20 @@ public:
     // kept, or when the entry itself is one this admission keeps -- a page,
     // tail block or State checkpoint its probe hit, a restore's claim -- or
     // a slot the retry reclaims as the request's own: the candidate pass
-    // never offers those (StartCandidates), so a compaction never clears
+    // excludes those through AdmissionCandidateConstraints, so a compaction never clears
     // them either.
-    std::optional<VictimSet> PlanBlockAlone(std::uint32_t group_id, CacheBlockLocation location) {
-        _assert(views_prepared_, "DenseLayoutParents prepares the planner's views before a slot is planned alone");
-        if (!groups_[group_id].Index().UnpinnedKeyAt(pool_, location) || protected_locations_.contains(location) ||
-            request_reclaim_locations_.contains(location)) {
+    std::optional<VictimSet> PlanBlockAlone(std::uint32_t group_id, CacheBlockLocation location,
+                                            const AdmissionCandidateConstraints& constraints,
+                                            AdmissionSelectionState& selection) const {
+        if (!groups_[group_id].Index().UnpinnedKeyAt(pool_, location) ||
+            constraints.protected_locations.contains(location) ||
+            constraints.request_reclaim_locations.contains(location)) {
             return std::nullopt;
         }
-        std::optional<ExpandedVictimSet> expanded =
-            expandCandidatePastSegments(eviction_plan_.Candidates().MakeCandidate(
-                group_id, location, groups_[group_id].Index().MetadataFor(pool_, location)));
+        std::optional<ExpandedVictimSet> expanded = expandCandidatePastSegments(
+            CacheEvictionCandidates::MakeCandidate(groups_[group_id], location,
+                                                   groups_[group_id].Index().MetadataFor(pool_, location)),
+            constraints, selection);
         if (!expanded) {
             return std::nullopt;
         }
@@ -110,55 +112,36 @@ public:
         return std::move(expanded->set);
     }
 
-    // Whether `location` is one of the request's own slots the admission
-    // reclaims before it evicts (an expired window block, a released State
-    // input): the retry frees it, though PlanBlockAlone never takes it.
-    bool IsRequestReclaim(CacheBlockLocation location) const {
-        _assert(views_prepared_, "DenseLayoutParents prepares the planner's views before a slot is judged");
-        return request_reclaim_locations_.contains(location);
-    }
-
 protected:
-    std::optional<VictimCandidate> nextCandidatePastSegments() override {
-        if (next_passed_over_ == passed_over_.size()) {
+    std::optional<VictimCandidate> nextCandidatePastSegments(AdmissionSelectionState& selection) const override {
+        if (selection.next_passed_over == selection.passed_over.size()) {
             return std::nullopt;
         }
-        return passed_over_[next_passed_over_++];
+        return selection.passed_over[selection.next_passed_over++];
     }
 
-    std::optional<ExpandedVictimSet> expandCandidatePastSegments(const VictimCandidate& candidate) override {
-        if (set_member_by_location_.contains(candidate.location)) {
+    std::optional<ExpandedVictimSet> expandCandidatePastSegments(const VictimCandidate& candidate,
+                                                                 const AdmissionCandidateConstraints& constraints,
+                                                                 AdmissionSelectionState& selection) const override {
+        if (selection.set_member_by_location.contains(candidate.location)) {
             return std::nullopt;
         }
-        ExpandedVictimSet out{.set = VictimSet{member_resource_}};
         const BoundaryTree::Node* candidate_node = candidateNode(candidate);
-        if (expandAloneOrReclaim(candidate, candidate_node, out.set)) {
-            return out;
+        if (auto set = expandAloneOrReclaim(candidate, candidate_node, constraints, selection)) {
+            return ExpandedVictimSet{.set = std::move(*set)};
         }
         if (store_.GroupIsState(candidate.group_id)) {
-            if (!expandCheckpointsAlone(*candidate_node, out.set)) {
-                return std::nullopt;
-            }
-            return out;
+            auto set = expandCheckpointsAlone(*candidate_node, constraints, selection);
+            if (!set) return std::nullopt;
+            return ExpandedVictimSet{.set = std::move(*set)};
         }
         // A page leaving block by block may leave blocks in use at its
         // boundary, so its set starts no segment: no later walk takes it for
         // that node's subtree.
         const std::vector<NodeEntry> candidate_entries = store_.NodeEntries(pool_, *candidate_node);
-        if (!walkSubtree(*candidate_node, *candidate_node, candidate_entries, /*climbed=*/{},
-                         /*top_keeps_unavailable=*/true, out)) {
-            return std::nullopt;
-        }
-        return out;
+        return walkSubtree(*candidate_node, *candidate_node, candidate_entries, /*climbed=*/{},
+                           /*top_keeps_unavailable=*/true, constraints, selection);
     }
-
-private:
-    // The next of passed_over_ the block-by-block pass takes.
-    std::size_t next_passed_over_{0};
-    // Whether the capacity and candidate views Plan() collects before it
-    // selects are prepared for a compaction's calls: DenseLayoutParents
-    // prepares them once, PlanBlockAlone requires them.
-    bool views_prepared_{false};
 };
 
 }  // namespace
@@ -210,7 +193,7 @@ std::optional<AdmissionResult> LoneRequestAdmission::Compact(PrefixProbe&& prefi
         return planAdmissionWith<LoneRequestPlanner>(
                    store, coordinator_.History().CheckpointAgingFor(CacheTier::kDevice), PrefixProbe{prefix}, demands,
                    progress.num_computed_tokens, reserve_point, /*shapes=*/{},
-                   /*claimed=*/{}, write_back)
+                   /*planned_claim_locations=*/{}, write_back)
             .has_value();
     };
 
@@ -289,8 +272,8 @@ std::optional<AdmissionResult> LoneRequestAdmission::Compact(PrefixProbe&& prefi
         if (store.GroupIsState(i)) {
             first_slot = std::get<StateStep>(demands[i].extent).kind == StateStep::Kind::kKeep ? 0 : 1;
         } else if (progress.num_computed_tokens) {
-            first_slot = std::max(first_slot, store.Geometry()[i].ExpiredBlocksAt(store.Groups()[i].Spec(),
-                                                                                  *progress.num_computed_tokens));
+            first_slot = std::max(first_slot, store.Geometry()[i].ExpiredBlockEndAt(store.Groups()[i].Spec(),
+                                                                                    *progress.num_computed_tokens));
         }
         std::vector<bool> publishing(static_cast<std::size_t>(table.NumBlocks()), false);
         if (compacts && progress.completed_pages) {
@@ -343,11 +326,11 @@ std::optional<AdmissionResult> LoneRequestAdmission::Compact(PrefixProbe&& prefi
         // fresh block from where it was before this plan moved it
         // (RecordAdmittedPages).
         std::vector<CacheBlockLocation> probe_blocks = index.MatchedLocations(
-            store.DevicePool(), (*prefix.group_keys)[i], /*begin_blocks=*/0, prefix.device.per_group[i]);
-        const std::size_t num_pages = probe_blocks.size();
+            store.DevicePool(), (*prefix.group_keys)[i], /*begin_block=*/0, prefix.device.per_group[i]);
+        const std::size_t num_full_page_blocks = probe_blocks.size();
         if (const auto& tail = prefix.device.tail; tail && !tail->group_keys[i].empty()) {
             const std::vector<CacheBlockLocation> tail_blocks =
-                index.MatchedLocations(store.DevicePool(), tail->group_keys[i], /*begin_blocks=*/0, tail->per_group[i]);
+                index.MatchedLocations(store.DevicePool(), tail->group_keys[i], /*begin_block=*/0, tail->per_group[i]);
             probe_blocks.insert(probe_blocks.end(), tail_blocks.begin(), tail_blocks.end());
         }
         if (!compacts) {
@@ -356,7 +339,7 @@ std::optional<AdmissionResult> LoneRequestAdmission::Compact(PrefixProbe&& prefi
             // hits are held where they are.
             if (const auto& state = prefix.state_at_prompt_end; state && !state->group_keys[i].empty()) {
                 const std::vector<CacheBlockLocation> state_blocks = index.MatchedLocations(
-                    store.DevicePool(), state->group_keys[i], /*begin_blocks=*/0, state->per_group[i]);
+                    store.DevicePool(), state->group_keys[i], /*begin_block=*/0, state->per_group[i]);
                 probe_blocks.insert(probe_blocks.end(), state_blocks.begin(), state_blocks.end());
             }
             for (const CacheBlockLocation location : probe_blocks) {
@@ -372,7 +355,7 @@ std::optional<AdmissionResult> LoneRequestAdmission::Compact(PrefixProbe&& prefi
             if (!index.Inspect(store.DevicePool(), key)->pinned) {
                 hit = hit_pins.size();
                 hit_pins.push_back(index.Find(store.DevicePool(), key));
-                kind = b < num_pages ? Member::Kind::kHit : Member::Kind::kTail;
+                kind = b < num_full_page_blocks ? Member::Kind::kHit : Member::Kind::kTail;
             }
             ++bucket_pinned[i][static_cast<std::size_t>(allocator.BucketOf(location))];
             members[i].push_back(Member{.kind = kind, .in_bucket = true, .location = location, .slot = -1, .hit = hit});
@@ -380,15 +363,12 @@ std::optional<AdmissionResult> LoneRequestAdmission::Compact(PrefixProbe&& prefi
     }
 
     auto member_resource = std::make_unique<std::pmr::monotonic_buffer_resource>();
-    std::vector<VictimSet> victims;
-    std::vector<std::vector<CopyInReservation>> copy_ins;
-    LoneRequestPlanner planner{store,          coordinator_.History().CheckpointAgingFor(CacheTier::kDevice),
-                               demands,        progress.num_computed_tokens,
-                               reserve_point,  prefix,
-                               /*shapes=*/{},
-                               /*claimed=*/{}, write_back,
-                               victims,        member_resource.get(),
-                               copy_ins};
+    const CheckpointAging aging = coordinator_.History().CheckpointAgingFor(CacheTier::kDevice);
+    const LoneRequestPlanner planner{store,         aging,
+                                     demands,       progress.num_computed_tokens,
+                                     reserve_point, prefix,
+                                     /*shapes=*/{}, /*planned_claim_locations=*/{},
+                                     write_back};
     // Not fragmentation: the bound's own caveats, which compacting would
     // only churn at. The request waits as before. The count covers the
     // groups compaction gathers and the demand, not the parents the probe
@@ -399,6 +379,9 @@ std::optional<AdmissionResult> LoneRequestAdmission::Compact(PrefixProbe&& prefi
         return std::nullopt;
     }
 
+    AdmissionSelectionState selection{store, member_resource.get()};
+    const AdmissionCandidateConstraints constraints = BuildAdmissionCandidateConstraints(
+        store, demands, progress.num_computed_tokens, prefix, /*planned_claim_locations=*/{}, &selection.scratch);
     AdmissionResult result{
         .new_page_ids = std::vector<std::vector<std::int32_t>>(store.Groups().size()),
         .pages_to_copy = std::vector<std::vector<std::pair<std::int32_t, std::int32_t>>>(store.Groups().size()),
@@ -483,7 +466,8 @@ std::optional<AdmissionResult> LoneRequestAdmission::Compact(PrefixProbe&& prefi
                 vacatable = !store.DevicePool().IsOccupied(slot) ||
                             std::ranges::any_of(parents[p].members,
                                                 [&](std::size_t m) { return members[i][m].location == slot; }) ||
-                            planner.IsRequestReclaim(slot) || planner.PlanBlockAlone(group_id, slot).has_value();
+                            constraints.request_reclaim_locations.contains(slot) ||
+                            planner.PlanBlockAlone(group_id, slot, constraints, selection).has_value();
             }
             if (!vacatable) {
                 continue;
@@ -521,7 +505,8 @@ std::optional<AdmissionResult> LoneRequestAdmission::Compact(PrefixProbe&& prefi
                         if (!store.DevicePool().IsOccupied(candidate)) {
                             return Move{.destination = candidate};
                         }
-                        if (std::optional<VictimSet> clearing = planner.PlanBlockAlone(group_id, candidate)) {
+                        if (std::optional<VictimSet> clearing =
+                                planner.PlanBlockAlone(group_id, candidate, constraints, selection)) {
                             return Move{.destination = candidate, .clearing = std::move(clearing)};
                         }
                     }

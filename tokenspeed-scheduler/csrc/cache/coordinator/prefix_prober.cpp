@@ -34,6 +34,7 @@
 
 #include "cache/prefix/prefix_hasher.h"
 #include "cache/prefix/prefix_matcher.h"
+#include "cache/tier/peer.h"
 #include "core/profile_span.h"
 #include "utils.h"
 
@@ -90,10 +91,9 @@ bool PrefixProber::EvictionStoresExtendPrefix(const PromptPrefix& prompt, const 
     if (store_.HostPool() == nullptr || evictor_.PendingKeys().empty() || prompt.max_tokens <= hit) {
         return false;
     }
-    PrefixProbe::Tier device = visible.device;
-    PrefixProbe::Tier host;
-    ProbeHostSuffix(prompt, *visible.group_keys, store_.MatchOrder(), hit, &evictor_.PendingKeys(), device, host);
-    return host.num_common_tokens > hit;
+    const HostSuffixProbe suffix =
+        ProbeHostSuffix(prompt, *visible.group_keys, store_.MatchOrder(), hit, &evictor_.PendingKeys(), visible.device);
+    return suffix.host.num_common_tokens > hit;
 }
 
 std::vector<PrefixProber::PrefixBoundaryAvailability> PrefixProber::InspectPrefixAvailability(
@@ -254,8 +254,9 @@ PreparedPrefixKeys PrefixProber::ResolvePreparedPrefixKeys(const PromptPrefix& p
     const auto& keys = *prompt.prepared_keys;
     _assert(keys.size() == store_.Groups().size(), "prepared prefix keys must cover every cache group");
     for (const auto i : store_.MatchOrder()) {
-        const auto pages_per_hash = static_cast<std::size_t>(store_.BlocksPerBoundary(static_cast<std::int32_t>(i)));
-        _assert(keys[i].size() / pages_per_hash >= prompt.prefix_hashes.size(),
+        const auto blocks_per_boundary =
+            static_cast<std::size_t>(store_.BlocksPerBoundary(static_cast<std::int32_t>(i)));
+        _assert(keys[i].size() / blocks_per_boundary >= prompt.prefix_hashes.size(),
                 "prepared prefix keys do not cover the prompt hash chain");
     }
     return prompt.prepared_keys;
@@ -320,9 +321,9 @@ PrefixProbe::Tier PrefixProber::probeTierWithKeys(std::span<const std::vector<Ca
     // boundary. Only acquire the CacheBlocks covered by the shared boundary.
     for (const std::size_t i : spanned_order) {
         GroupPrefixProbe& probe = out.per_group[i];
-        const std::int32_t covered_pages = (common_tokens - floor_tokens) / store_.Geometry()[i].BlockGranularity();
-        if (static_cast<std::int32_t>(probe.hits.size()) > covered_pages) {
-            probe.hits.resize(static_cast<std::size_t>(covered_pages));
+        const std::int32_t covered_blocks = (common_tokens - floor_tokens) / store_.Geometry()[i].BlockGranularity();
+        if (static_cast<std::int32_t>(probe.hits.size()) > covered_blocks) {
+            probe.hits.resize(static_cast<std::size_t>(covered_blocks));
         }
     }
     out.num_common_tokens = common_tokens;
@@ -339,98 +340,101 @@ PrefixProbe::Tier PrefixProber::probeTierWithKeys(std::span<const std::vector<Ca
 // published at the boundary, its page hit counted from page 0 whatever the
 // floor (a Host checkpoint may sit on the Device's last full page).
 template <CacheTier Tier>
-bool PrefixProber::groupAcceptsBoundary(std::size_t i, std::span<const std::string> prefix_hashes,
-                                        std::int32_t floor_tokens, std::int32_t full_tokens, std::int32_t tail_tokens,
-                                        std::span<const CacheKey> tail_keys, GroupPrefixProbe& tail_hits,
-                                        GroupPrefixProbe* page_hits,
-                                        const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits) const {
-    const BlockPool& pool = store_.TierPool<Tier>();
-    const CacheGroup& group = store_.Groups()[i];
-    const PrefixCacheIndex& index = group.Index();
-    const auto contains = [&](const CacheKey& key) {
-        return index.Contains(pool, key) || (extra_hits != nullptr && extra_hits->contains(key));
-    };
-    tail_hits.hits.assign(tail_keys.size(), 0);
-    if (store_.GroupIsState(i)) {
-        if ((full_tokens + tail_tokens) % group.Spec().checkpoint_granularity != 0) {
-            return false;
-        }
-        if (tail_tokens > 0) {
-            _assert(tail_keys.size() == 1, "a State group has one key per boundary");
-            if (!contains(tail_keys[0])) {
+PrefixProber::GroupBoundaryProbe PrefixProber::probeGroupBoundary(
+    std::size_t i, std::span<const std::string> prefix_hashes, std::int32_t floor_tokens, std::int32_t full_tokens,
+    std::int32_t tail_tokens, std::span<const CacheKey> tail_keys, bool include_page_hits, GroupBoundaryHits hits,
+    const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits) const {
+    const bool accepts = [&] {
+        const BlockPool& pool = store_.TierPool<Tier>();
+        const CacheGroup& group = store_.Groups()[i];
+        const PrefixCacheIndex& index = group.Index();
+        const auto contains = [&](const CacheKey& key) {
+            return index.Contains(pool, key) || (extra_hits != nullptr && extra_hits->contains(key));
+        };
+        hits.tail.hits.assign(tail_keys.size(), 0);
+        if (store_.GroupIsState(i)) {
+            if ((full_tokens + tail_tokens) % group.Spec().checkpoint_granularity != 0) {
                 return false;
             }
-            tail_hits.hits[0] = 1;
+            if (tail_tokens > 0) {
+                _assert(tail_keys.size() == 1, "a State group has one key per boundary");
+                if (!contains(tail_keys[0])) {
+                    return false;
+                }
+                hits.tail.hits[0] = 1;
+                return true;
+            }
+            // An aligned boundary is keyed by the chain hash of its last page.
+            _assert(full_tokens > 0 && full_tokens % store_.PrefixGranularity() == 0, "a page boundary past page 0");
+            const auto page = static_cast<std::size_t>(full_tokens / store_.PrefixGranularity()) - 1;
+            const CacheKey key{
+                .group_id = group.Id(), .content_hash = ContentHash{prefix_hashes[page]}, .page_offset = 0};
+            if (!contains(key)) {
+                return false;
+            }
+            if (include_page_hits) {
+                hits.pages.hits.assign(page + 1, 0);
+                hits.pages.hits.back() = 1;
+            }
             return true;
         }
-        // An aligned boundary is keyed by the chain hash of its last page.
-        _assert(full_tokens > 0 && full_tokens % store_.PrefixGranularity() == 0, "a page boundary past page 0");
-        const auto page = static_cast<std::size_t>(full_tokens / store_.PrefixGranularity()) - 1;
-        const CacheKey key{.group_id = group.Id(), .content_hash = ContentHash{prefix_hashes[page]}, .page_offset = 0};
-        if (!contains(key)) {
-            return false;
-        }
-        if (page_hits != nullptr) {
-            page_hits->hits.assign(page + 1, 0);
-            page_hits->hits.back() = 1;
-        }
-        return true;
-    }
-    if (group.Matcher().IsPrefixClosed()) {
-        for (std::size_t j = 0; j < tail_keys.size(); ++j) {
-            if (!contains(tail_keys[j])) {
-                return false;
+        if (group.Matcher().IsPrefixClosed()) {
+            for (std::size_t j = 0; j < tail_keys.size(); ++j) {
+                if (!contains(tail_keys[j])) {
+                    return false;
+                }
+                hits.tail.hits[j] = 1;
             }
-            tail_hits.hits[j] = 1;
-        }
-        return true;
-    }
-    // A sliding window resumes at T when the blocks holding rows
-    // [T - W + 1, T) are cached, and with a sink the blocks holding it.
-    const std::int32_t block_granularity = store_.Geometry()[i].BlockGranularity();
-    const std::int32_t blocks_per_page = store_.PrefixGranularity() / block_granularity;
-    const std::int32_t floor_blocks = floor_tokens / block_granularity;
-    const std::int32_t full_blocks = full_tokens / block_granularity;
-    const CacheStore::BlockRange window =
-        store_.SlidingWindowBlocks(static_cast<std::int32_t>(i), full_tokens + tail_tokens);
-    _assert(window.past_end == full_blocks + static_cast<std::int32_t>(tail_keys.size()),
-            "the tail's keys end where the window does");
-    if (page_hits != nullptr) {
-        page_hits->hits.assign(static_cast<std::size_t>(std::max(full_blocks - floor_blocks, 0)), 0);
-    }
-    const auto holds = [&](std::int32_t block) {
-        if (block >= full_blocks) {
-            const auto j = static_cast<std::size_t>(block - full_blocks);
-            if (!contains(tail_keys[j])) {
-                return false;
-            }
-            tail_hits.hits[j] = 1;
             return true;
         }
-        if (block < floor_blocks) {
-            return true;
+        // A sliding window resumes at T when the blocks holding rows
+        // [T - W + 1, T) are cached, and with a sink the blocks holding it.
+        const std::int32_t block_granularity = store_.Geometry()[i].BlockGranularity();
+        const std::int32_t blocks_per_page = store_.PrefixGranularity() / block_granularity;
+        const std::int32_t floor_blocks = floor_tokens / block_granularity;
+        const std::int32_t full_blocks = full_tokens / block_granularity;
+        const CacheStore::BlockRange window =
+            store_.SlidingWindowBlocks(static_cast<std::int32_t>(i), full_tokens + tail_tokens);
+        _assert(window.past_end == full_blocks + static_cast<std::int32_t>(tail_keys.size()),
+                "the tail's keys end where the window does");
+        if (include_page_hits) {
+            hits.pages.hits.assign(static_cast<std::size_t>(std::max(full_blocks - floor_blocks, 0)), 0);
         }
-        const CacheKey page_key{
-            .group_id = group.Id(),
-            .content_hash = ContentHash{prefix_hashes[static_cast<std::size_t>(block / blocks_per_page)]},
-            .page_offset = block % blocks_per_page};
-        if (!contains(page_key)) {
-            return false;
-        }
-        if (page_hits != nullptr) {
-            page_hits->hits[static_cast<std::size_t>(block - floor_blocks)] = 1;
-        }
-        return true;
-    };
-    for (const CacheStore::BlockRange& needed :
-         {store_.SinkBlocksBelow(static_cast<std::int32_t>(i), window), window}) {
-        for (std::int32_t block = needed.first; block < needed.past_end; ++block) {
-            if (!holds(block)) {
+        const auto holds = [&](std::int32_t block) {
+            if (block >= full_blocks) {
+                const auto j = static_cast<std::size_t>(block - full_blocks);
+                if (!contains(tail_keys[j])) {
+                    return false;
+                }
+                hits.tail.hits[j] = 1;
+                return true;
+            }
+            if (block < floor_blocks) {
+                return true;
+            }
+            const CacheKey page_key{
+                .group_id = group.Id(),
+                .content_hash = ContentHash{prefix_hashes[static_cast<std::size_t>(block / blocks_per_page)]},
+                .page_offset = block % blocks_per_page};
+            if (!contains(page_key)) {
                 return false;
             }
+            if (include_page_hits) {
+                hits.pages.hits[static_cast<std::size_t>(block - floor_blocks)] = 1;
+            }
+            return true;
+        };
+        for (const CacheStore::BlockRange& needed :
+             {store_.SinkBlocksBelow(static_cast<std::int32_t>(i), window), window}) {
+            for (std::int32_t block = needed.first; block < needed.past_end; ++block) {
+                if (!holds(block)) {
+                    return false;
+                }
+            }
         }
-    }
-    return true;
+        return true;
+    }();
+    return GroupBoundaryProbe{.accepts = accepts, .hits = std::move(hits)};
 }
 
 bool PrefixProber::stateGroupsAcceptBoundary(std::span<const std::size_t> match_order,
@@ -438,7 +442,7 @@ bool PrefixProber::stateGroupsAcceptBoundary(std::span<const std::size_t> match_
                                              std::int32_t tail_tokens, const ContentHash& tail_hash, bool allow_host,
                                              const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits) const {
     CacheKey tail_key{.content_hash = tail_hash};
-    GroupPrefixProbe tail_hits;
+    GroupBoundaryHits hits;
     for (const std::size_t i : match_order) {
         if (!store_.GroupIsState(i)) {
             continue;
@@ -446,16 +450,16 @@ bool PrefixProber::stateGroupsAcceptBoundary(std::span<const std::size_t> match_
         tail_key.group_id = store_.Groups()[i].Id();
         const std::span<const CacheKey> keys =
             tail_tokens > 0 ? std::span<const CacheKey>{&tail_key, 1} : std::span<const CacheKey>{};
-        if (groupAcceptsBoundary<CacheTier::kDevice>(i, prefix_hashes, /*floor_tokens=*/0, full_tokens, tail_tokens,
-                                                     keys, tail_hits, /*page_hits=*/nullptr,
-                                                     /*extra_hits=*/nullptr)) {
-            continue;
-        }
-        if (!allow_host ||
-            !groupAcceptsBoundary<CacheTier::kHost>(i, prefix_hashes, /*floor_tokens=*/0, full_tokens, tail_tokens,
-                                                    keys, tail_hits, /*page_hits=*/nullptr, extra_hits)) {
-            return false;
-        }
+        auto probe = probeGroupBoundary<CacheTier::kDevice>(i, prefix_hashes, /*floor_tokens=*/0, full_tokens,
+                                                            tail_tokens, keys, /*include_page_hits=*/false,
+                                                            std::move(hits), /*extra_hits=*/nullptr);
+        hits = std::move(probe.hits);
+        if (probe.accepts) continue;
+        if (!allow_host) return false;
+        probe = probeGroupBoundary<CacheTier::kHost>(i, prefix_hashes, /*floor_tokens=*/0, full_tokens, tail_tokens,
+                                                     keys, /*include_page_hits=*/false, std::move(hits), extra_hits);
+        hits = std::move(probe.hits);
+        if (!probe.accepts) return false;
     }
     return true;
 }
@@ -467,7 +471,7 @@ bool PrefixProber::stateGroupsAcceptBoundary(std::span<const std::size_t> match_
 // group's acceptance is monotone in T, so its page walk bounds the candidates;
 // a sliding group's is not (it can hold the lookback behind one boundary and
 // miss it behind the one below), so sliding and State groups are judged per
-// candidate by groupAcceptsBoundary. Without State groups the first candidate
+// candidate by probeGroupBoundary. Without State groups the first candidate
 // the KV groups accept wins; with them the walk descends to the longest
 // published state checkpoint. kv_tokens records the KV groups' own boundary
 // for the junction cut.
@@ -514,9 +518,14 @@ PrefixProbe::Tier PrefixProber::ProbeTier(const PromptPrefix& prompt, std::span<
             if (tail_tokens > 0) {
                 tail.group_keys[i] = store_.TailKeysForGroup(i, published_hash, tail_tokens);
             }
-            const bool accepts = groupAcceptsBoundary<CacheTier::kDevice>(
+            auto probe = probeGroupBoundary<CacheTier::kDevice>(
                 i, prompt.prefix_hashes, /*floor_tokens=*/0, page_tokens, tail_tokens, tail.group_keys[i],
-                tail.per_group[i], &page_hits[i], /*extra_hits=*/nullptr);
+                /*include_page_hits=*/true,
+                GroupBoundaryHits{.tail = std::move(tail.per_group[i]), .pages = std::move(page_hits[i])},
+                /*extra_hits=*/nullptr);
+            const bool accepts = probe.accepts;
+            tail.per_group[i] = std::move(probe.hits.tail);
+            page_hits[i] = std::move(probe.hits.pages);
             // Once KV reach is known, a rejected boundary contributes nothing.
             if (!accepts && kv_settled) {
                 return true;
@@ -591,10 +600,11 @@ PrefixProbe::Tier PrefixProber::ProbeTier(const PromptPrefix& prompt, std::span<
 // plus one Host suffix. A Host-only probe from the Device's full pages is the
 // special case F = D.full_page_tokens <= L: every boundary it would accept is
 // accepted here.
-void PrefixProber::ProbeHostSuffix(const PromptPrefix& prompt, std::span<const std::vector<CacheKey>> group_keys,
-                                   std::span<const std::size_t> match_order, std::int32_t above_tokens,
-                                   const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits,
-                                   PrefixProbe::Tier& device, PrefixProbe::Tier& host) const {
+PrefixProber::HostSuffixProbe PrefixProber::ProbeHostSuffix(
+    const PromptPrefix& prompt, std::span<const std::vector<CacheKey>> group_keys,
+    std::span<const std::size_t> match_order, std::int32_t above_tokens,
+    const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits, PrefixProbe::Tier device) const {
+    PrefixProbe::Tier host;
     const std::int32_t num_prefix_pages = std::min(static_cast<std::int32_t>(prompt.prefix_hashes.size()),
                                                    prompt.max_tokens / store_.PrefixGranularity());
     std::vector<std::size_t> closed_order;
@@ -673,9 +683,12 @@ void PrefixProber::ProbeHostSuffix(const PromptPrefix& prompt, std::span<const s
                 continue;
             }
             device_tail.group_keys[i] = store_.TailKeysForGroup(i, published_hash, tail_tokens);
-            kv_tail_on_device = groupAcceptsBoundary<CacheTier::kDevice>(
+            auto probe = probeGroupBoundary<CacheTier::kDevice>(
                 i, prompt.prefix_hashes, split_tokens, page_tokens, tail_tokens, device_tail.group_keys[i],
-                device_tail.per_group[i], /*page_hits=*/nullptr, /*extra_hits=*/nullptr);
+                /*include_page_hits=*/false, GroupBoundaryHits{.tail = std::move(device_tail.per_group[i])},
+                /*extra_hits=*/nullptr);
+            kv_tail_on_device = probe.accepts;
+            device_tail.per_group[i] = std::move(probe.hits.tail);
         }
         bool kv_accepts = true;
         for (const std::size_t i : match_order) {
@@ -691,9 +704,14 @@ void PrefixProber::ProbeHostSuffix(const PromptPrefix& prompt, std::span<const s
             }
             // With the tail on the Device the split is the page: a sliding
             // group needs no Host block either.
-            if (!groupAcceptsBoundary<CacheTier::kHost>(i, prompt.prefix_hashes, split_tokens, page_tokens,
-                                                        kv_tail_on_device ? 0 : tail_tokens, host_tail.group_keys[i],
-                                                        host_tail.per_group[i], &host_hits[i], extra_hits)) {
+            auto probe = probeGroupBoundary<CacheTier::kHost>(
+                i, prompt.prefix_hashes, split_tokens, page_tokens, kv_tail_on_device ? 0 : tail_tokens,
+                host_tail.group_keys[i], /*include_page_hits=*/true,
+                GroupBoundaryHits{.tail = std::move(host_tail.per_group[i]), .pages = std::move(host_hits[i])},
+                extra_hits);
+            host_tail.per_group[i] = std::move(probe.hits.tail);
+            host_hits[i] = std::move(probe.hits.pages);
+            if (!probe.accepts) {
                 kv_accepts = false;
                 break;
             }
@@ -731,17 +749,24 @@ void PrefixProber::ProbeHostSuffix(const PromptPrefix& prompt, std::span<const s
             }
             const std::vector<CacheKey> keys =
                 tail_tokens > 0 ? store_.TailKeysForGroup(i, published_hash, tail_tokens) : std::vector<CacheKey>{};
-            if (groupAcceptsBoundary<CacheTier::kDevice>(i, prompt.prefix_hashes, split_tokens, page_tokens,
-                                                         tail_tokens, keys, device_tail.per_group[i], &device_hits[i],
-                                                         /*extra_hits=*/nullptr)) {
+            auto probe = probeGroupBoundary<CacheTier::kDevice>(
+                i, prompt.prefix_hashes, split_tokens, page_tokens, tail_tokens, keys, /*include_page_hits=*/true,
+                GroupBoundaryHits{.tail = std::move(device_tail.per_group[i]), .pages = std::move(device_hits[i])},
+                /*extra_hits=*/nullptr);
+            device_tail.per_group[i] = std::move(probe.hits.tail);
+            device_hits[i] = std::move(probe.hits.pages);
+            if (probe.accepts) {
                 device_tail.group_keys[i] = keys;
                 continue;
             }
             device_tail.per_group[i] = GroupPrefixProbe{};
-            if (!groupAcceptsBoundary<CacheTier::kHost>(i, prompt.prefix_hashes, split_tokens, page_tokens, tail_tokens,
-                                                        keys, host_tail.per_group[i], &host_hits[i], extra_hits)) {
-                return true;
-            }
+            probe = probeGroupBoundary<CacheTier::kHost>(
+                i, prompt.prefix_hashes, split_tokens, page_tokens, tail_tokens, keys, /*include_page_hits=*/true,
+                GroupBoundaryHits{.tail = std::move(host_tail.per_group[i]), .pages = std::move(host_hits[i])},
+                extra_hits);
+            host_tail.per_group[i] = std::move(probe.hits.tail);
+            host_hits[i] = std::move(probe.hits.pages);
+            if (!probe.accepts) return true;
             host_tail.group_keys[i] = keys;
         }
         const auto holds_tail = [](const PrefixProbe::TailHit& tail) {
@@ -763,6 +788,7 @@ void PrefixProber::ProbeHostSuffix(const PromptPrefix& prompt, std::span<const s
             : static_cast<std::int32_t>(std::min<std::int64_t>(
                   std::int64_t{host_kv_end_tokens} + store_.PrefixGranularity() - 1, prompt.max_tokens));
     ForEachCandidateBoundary(prompt, above_tokens, from_tokens, visit);
+    return HostSuffixProbe{.device = std::move(device), .host = std::move(host)};
 }
 
 PrefixProbe PrefixProber::probePrefixWithOrder(const PromptPrefix& prompt, std::span<const std::size_t> match_order,
@@ -783,7 +809,10 @@ PrefixProbe PrefixProber::probePrefixWithOrder(const PromptPrefix& prompt, std::
     }
     const std::int32_t device_tokens = out.device.num_common_tokens;
     out.device_only_hit_tokens = device_tokens;
-    ProbeHostSuffix(prompt, *out.group_keys, match_order, device_tokens, /*extra_hits=*/nullptr, out.device, out.host);
+    HostSuffixProbe suffix = ProbeHostSuffix(prompt, *out.group_keys, match_order, device_tokens,
+                                             /*extra_hits=*/nullptr, std::move(out.device));
+    out.device = std::move(suffix.device);
+    out.host = std::move(suffix.host);
     if (out.host.num_common_tokens <= device_tokens) {
         // The Device alone resumes furthest. The Host tier keeps the Host's
         // KV reach: the junction still counts it, so a chunk cut there
@@ -794,6 +823,73 @@ PrefixProbe PrefixProber::probePrefixWithOrder(const PromptPrefix& prompt, std::
         out.host.num_common_tokens = out.device.num_common_tokens;
         out.host.full_page_tokens = out.device.full_page_tokens;
         out.host.kv_tokens = host_kv_tokens;
+    }
+    return out;
+}
+
+PrefixProber::PrefixListing PrefixProber::ListPrefix(const PrefixProbe& probe) const {
+    PrefixListing out{.num_tokens = std::max(probe.device.num_common_tokens, probe.host.num_common_tokens)};
+    if (out.num_tokens == 0) {
+        return out;
+    }
+    // The same blocks at the same slots as CacheCoordinator::ExportPrefix:
+    // the Device's full pages then its tail, from slot 0, when it resumes at
+    // all; the Host suffix's full pages from its floor, then its tail, after
+    // them; a State group's one checkpoint, the Device's first.
+    const bool device_claims = probe.device.num_common_tokens > 0;
+    const bool host_claims = store_.HostPool() != nullptr && !probe.host.per_group.empty();
+    const std::span<const std::vector<CacheKey>> group_keys = *probe.group_keys;
+    for (std::size_t i = 0; i < store_.Groups().size(); ++i) {
+        if (store_.GroupIsReplayable(static_cast<std::int32_t>(i))) {
+            continue;
+        }
+        const PrefixCacheIndex& index = store_.Groups()[i].Index();
+        struct Run {
+            const BlockPool* pool;
+            CacheTier tier;
+            std::span<const CacheKey> keys;
+            std::int32_t begin_blocks;
+            const GroupPrefixProbe* hits;
+        };
+        std::vector<Run> runs;
+        const auto add_tier = [&](const PrefixProbe::Tier& tier, const BlockPool& pool, CacheTier which,
+                                  std::int32_t floor_tokens) {
+            const std::int32_t floor_pages =
+                store_.GroupIsState(i) ? 0 : floor_tokens / store_.Geometry()[i].BlockGranularity();
+            runs.push_back(Run{&pool, which, group_keys[i], floor_pages, &tier.per_group[i]});
+            if (tier.tail && !tier.tail->group_keys[i].empty()) {
+                runs.push_back(Run{&pool, which, tier.tail->group_keys[i], 0, &tier.tail->per_group[i]});
+            }
+        };
+        if (device_claims) {
+            add_tier(probe.device, store_.DevicePool(), CacheTier::kDevice, 0);
+        }
+        if (host_claims) {
+            add_tier(probe.host, *store_.HostPool(), CacheTier::kHost, probe.device.full_page_tokens);
+        }
+        std::int32_t slot = 0;
+        for (const Run& run : runs) {
+            const std::vector<CacheBlockLocation> locations =
+                index.MatchedLocations(*run.pool, run.keys, run.begin_blocks, *run.hits);
+            auto location = locations.begin();
+            for (std::size_t j = 0; j < run.hits->hits.size(); ++j, ++slot) {
+                if (run.hits->hits[j] == 0) {
+                    continue;
+                }
+                const CacheKey& key = run.keys[static_cast<std::size_t>(run.begin_blocks) + j];
+                const std::int32_t block_id = run.pool->ResolveCacheBlockId(store_.Groups()[i].Id(), *location++);
+                if (store_.GroupIsState(i)) {
+                    if (std::ranges::none_of(out.pages, [&](const ListedPage& page) {
+                            return page.key.group_id == store_.Groups()[i].Id();
+                        })) {
+                        out.pages.push_back(
+                            ListedPage{.key = key, .slot = kPeerStateSlot, .tier = run.tier, .block_id = block_id});
+                    }
+                    continue;
+                }
+                out.pages.push_back(ListedPage{.key = key, .slot = slot, .tier = run.tier, .block_id = block_id});
+            }
+        }
     }
     return out;
 }
