@@ -72,6 +72,8 @@ cdna4 = gl.amd.cdna4
 __all__ = [
     "NUM_WARPS",
     "gluon_gated_norm_gemv_a16w16_gfx950",
+    "gluon_gated_norm_gemv_a16w16_tiling_gfx950",
+    "gluon_gated_norm_gemv_tile_gfx950",
     "gluon_gemv_a16w16_gfx950",
     "gluon_gemv_a16w8_gfx950",
     "gluon_rmsnorm_gemv_a16w16_gfx950",
@@ -604,19 +606,18 @@ def _norm_rows_layout(block: int, num_warps: int):
     return gl.BlockedLayout([1, per_lane], [1, _WAVE], [1, num_warps], [1, 0])
 
 
-@gluon.jit(launch_metadata=_gemv_launch_metadata, do_not_specialize=("M",))
-def gluon_gated_norm_gemv_a16w16_gfx950(
+@gluon.jit
+def gluon_gated_norm_gemv_tile_gfx950(
     x_ptr,
     gate_ptr,
     norm_w_ptr,
     w_ptr,
-    y_ptr,
+    tile,
     M,
     N,
     rows,
     stride_xm,
     stride_gm,
-    stride_ym,
     eps,
     K: gl.constexpr,
     BLOCK_M: gl.constexpr,
@@ -624,16 +625,9 @@ def gluon_gated_norm_gemv_a16w16_gfx950(
     BLOCK_K: gl.constexpr,
     NORM_M: gl.constexpr,
 ):
-    """The MFMA tile of ``gluon_gemv_a16w16_gfx950`` on the gated norm of ``x``.
-
-    The activations are ``rmsnorm_gated_sigmoid(x, gate, norm_w)`` with
-    ``BLOCK_K``-wide heads: wave ``s`` of every K iteration owns one head and
-    normalizes and gates its first ``NORM_M`` rows as that Triton kernel
-    rounds them into LDS, while every weight iteration is already in flight.
-    LDS rows from ``NORM_M`` on stay unwritten; they only feed output rows
-    that are never stored.
-    """
-    tile = gl.program_id(0)
+    """FP32 output tile ``tile`` of :func:`gluon_gated_norm_gemv_a16w16_gfx950`:
+    ``[BLOCK_M, BLOCK_N]`` in ``SliceLayout(0, _mfma_layout(num_warps))``,
+    rows past ``M`` and columns past the tile's ``rows`` unused."""
     KS: gl.constexpr = gl.num_warps()
     KITER: gl.constexpr = KS * BLOCK_K
     ITERS: gl.constexpr = K // KITER
@@ -687,8 +681,58 @@ def gluon_gated_norm_gemv_a16w16_gfx950(
     for it in gl.static_range(ITERS):
         a = heads.index(it).load(a_l)
         acc = cdna4.mfma(a, gl.convert_layout(ws[it], b_l), acc)
-    out = gl.sum(acc, axis=0)
-    out_l: gl.constexpr = gl.SliceLayout(0, mfma)
+    return gl.sum(acc, axis=0)
+
+
+@gluon.jit(launch_metadata=_gemv_launch_metadata, do_not_specialize=("M",))
+def gluon_gated_norm_gemv_a16w16_gfx950(
+    x_ptr,
+    gate_ptr,
+    norm_w_ptr,
+    w_ptr,
+    y_ptr,
+    M,
+    N,
+    rows,
+    stride_xm,
+    stride_gm,
+    stride_ym,
+    eps,
+    K: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    NORM_M: gl.constexpr,
+):
+    """The MFMA tile of ``gluon_gemv_a16w16_gfx950`` on the gated norm of ``x``.
+
+    The activations are ``rmsnorm_gated_sigmoid(x, gate, norm_w)`` with
+    ``BLOCK_K``-wide heads: wave ``s`` of every K iteration owns one head and
+    normalizes and gates its first ``NORM_M`` rows as that Triton kernel
+    rounds them into LDS, while every weight iteration is already in flight.
+    LDS rows from ``NORM_M`` on stay unwritten; they only feed output rows
+    that are never stored.
+    """
+    tile = gl.program_id(0)
+    out = gluon_gated_norm_gemv_tile_gfx950(
+        x_ptr,
+        gate_ptr,
+        norm_w_ptr,
+        w_ptr,
+        tile,
+        M,
+        N,
+        rows,
+        stride_xm,
+        stride_gm,
+        eps,
+        K,
+        BLOCK_M,
+        BLOCK_N,
+        BLOCK_K,
+        NORM_M,
+    )
+    out_l: gl.constexpr = gl.SliceLayout(0, _mfma_layout(gl.num_warps()))
     o_m = gl.arange(0, BLOCK_M, gl.SliceLayout(1, out_l))
     o_n = gl.arange(0, BLOCK_N, gl.SliceLayout(0, out_l))
     col = tile * rows + o_n
@@ -1145,10 +1189,9 @@ def launch_gluon_gated_norm_gemv_a16w16_gfx950(
         raise ValueError(
             f"gated GEMV does not support M={m}, N={n}, K={k}, head_dim={head_dim}"
         )
-    cus = torch.cuda.get_device_properties(x.device).multi_processor_count
-    rows = triton.cdiv(n, cus)
-    block_n = max(triton.next_power_of_2(rows), _MFMA_MIN_BLOCK_N)
-    block_k, num_warps = _mfma_k_step(k)
+    rows, num_warps, tiling = gluon_gated_norm_gemv_a16w16_tiling_gfx950(
+        m, n, k, x.device
+    )
     gluon_gated_norm_gemv_a16w16_gfx950[(triton.cdiv(n, rows),)](
         x,
         gate,
@@ -1162,14 +1205,37 @@ def launch_gluon_gated_norm_gemv_a16w16_gfx950(
         gate.stride(0),
         out.stride(0),
         eps,
-        K=k,
-        BLOCK_M=_MFMA_BLOCK_M,
-        BLOCK_N=block_n,
-        BLOCK_K=block_k,
-        NORM_M=max(triton.next_power_of_2(m), 4),
+        **tiling,
         num_warps=num_warps,
     )
     return out
+
+
+def gluon_gated_norm_gemv_a16w16_tiling_gfx950(
+    m: int, n: int, k: int, device: torch.device
+) -> tuple[int, int, dict[str, int]]:
+    """The gated GEMV's tiling of ``m`` rows into ``n`` outputs over ``k``.
+
+    Returns:
+        ``(rows, num_warps, constexprs)``: each program's output columns (one
+        program a CU), its warps, and the ``K``, ``BLOCK_M``, ``BLOCK_N``,
+        ``BLOCK_K`` and ``NORM_M`` that :func:`gluon_gated_norm_gemv_tile_gfx950`
+        takes.
+    """
+    cus = torch.cuda.get_device_properties(device).multi_processor_count
+    rows = triton.cdiv(n, cus)
+    block_k, num_warps = _mfma_k_step(k)
+    return (
+        rows,
+        num_warps,
+        dict(
+            K=k,
+            BLOCK_M=_MFMA_BLOCK_M,
+            BLOCK_N=max(triton.next_power_of_2(rows), _MFMA_MIN_BLOCK_N),
+            BLOCK_K=block_k,
+            NORM_M=max(triton.next_power_of_2(m), 4),
+        ),
+    )
 
 
 def supports_gluon_rmsnorm_gemv_a16w16_gfx950(m: int, n: int, k: int) -> bool:
