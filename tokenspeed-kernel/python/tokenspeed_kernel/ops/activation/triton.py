@@ -27,6 +27,7 @@ import functools
 import torch
 from tokenspeed_kernel._triton import libdevice, tl, triton
 from tokenspeed_kernel.ops._triton_l2 import prefetch_l2
+from tokenspeed_kernel.ops._triton_ptx import mul_rn_f32
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 
 _RELU2_FP8_MAX = tl.constexpr(448.0)
@@ -2011,14 +2012,7 @@ def _mul_rn_f32(left, right):
     if _IS_HIP:
         # HIP launches disable FP contraction; use the portable FP32 multiply.
         return left * right
-    return tl.inline_asm_elementwise(
-        "mul.rn.f32 $0, $1, $2;",
-        constraints="=f,f,f",
-        args=[left, right],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
+    return mul_rn_f32(left, right)
 
 
 @triton.jit
