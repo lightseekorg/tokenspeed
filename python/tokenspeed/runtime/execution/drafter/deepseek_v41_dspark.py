@@ -312,6 +312,14 @@ class DeepseekV41DSpark(BaseDrafter):
             raise RuntimeError("packed verification has no original candidate window")
         return self._verify_candidates
 
+    def pack_grammar_vocab_mask(
+        self, vocab_mask: torch.Tensor, *, num_tokens: int
+    ) -> torch.Tensor:
+        """Gather request-major grammar rows into the packed target layout."""
+        if self._verify_rows is None:
+            raise RuntimeError("adaptive verification is disabled")
+        return vocab_mask.index_select(0, self._verify_rows[:num_tokens])
+
     def decode_graph_query_capacities(self, bs: int) -> tuple[int, ...]:
         if (
             bs < self.adaptive_min_batch_size

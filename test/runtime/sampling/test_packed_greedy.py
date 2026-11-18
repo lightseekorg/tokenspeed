@@ -23,6 +23,7 @@
 import pytest
 import torch
 
+from tokenspeed.runtime.grammar.base_grammar_backend import get_apply_vocab_mask_func
 from tokenspeed.runtime.sampling.backends.greedy import verify_packed_chain_greedy
 
 
@@ -31,6 +32,75 @@ def device(request):
     if request.param == "cuda" and not torch.cuda.is_available():
         pytest.skip("requires CUDA/ROCm")
     return request.param
+
+
+def _allow_tokens(allowed: torch.Tensor, vocab_size: int) -> torch.Tensor:
+    """Build an xgrammar bitmask with the given allowed IDs on each row."""
+    mask = torch.zeros(
+        (allowed.shape[0], (vocab_size + 31) // 32),
+        dtype=torch.int32,
+        device=allowed.device,
+    )
+    rows = torch.arange(allowed.shape[0], device=allowed.device)
+    for choice in range(allowed.shape[1]):
+        tokens = allowed[:, choice].long()
+        bits = (torch.ones_like(tokens) << (tokens % 32)).to(torch.int32)
+        mask[rows, tokens // 32] |= bits
+    return mask
+
+
+def _apply_vocab_mask_torch(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
+    bits = torch.arange(32, device=logits.device)
+    allowed = (vocab_mask.long().unsqueeze(-1) >> bits) & 1
+    allowed = allowed.flatten(1).bool()[:, : logits.shape[1]]
+    logits.masked_fill_(~allowed, float("-inf"))
+
+
+def _vocab_mask_applier():
+    return get_apply_vocab_mask_func("xgrammar")
+
+
+def _masked_reference(logits: torch.Tensor, vocab_mask: torch.Tensor) -> torch.Tensor:
+    reference = logits.clone()
+    _apply_vocab_mask_torch(reference, vocab_mask)
+    return reference
+
+
+def _assert_packed_logprobs(
+    actual: torch.Tensor,
+    logits: torch.Tensor,
+    vocab_mask: torch.Tensor,
+    predict: torch.Tensor,
+    accept_index: torch.Tensor,
+    query_start_loc: torch.Tensor,
+) -> None:
+    """Independently map flat request/column indices through the packed CSR."""
+    width = accept_index.shape[1]
+    starts = query_start_loc.tolist()
+    rows = []
+    for request, indices in enumerate(accept_index.tolist()):
+        for index in indices:
+            column = index - request * width if index >= 0 else 0
+            rows.append(starts[request] + column)
+    row_indices = torch.tensor(rows, dtype=torch.int64, device=logits.device)
+    reference = _masked_reference(logits, vocab_mask).index_select(0, row_indices)
+    expected = torch.log_softmax(reference, dim=-1, dtype=torch.float32).gather(
+        1, predict.long().unsqueeze(1)
+    )
+    torch.testing.assert_close(actual, expected.squeeze(1), atol=1e-6, rtol=1e-6)
+
+
+def test_packed_accepted_path_rows_subtracts_flat_request_base(device):
+    from tokenspeed.runtime.sampling.tree_verify import packed_accepted_path_rows
+
+    accept_index = torch.tensor(
+        [[0, 1, -1, -1], [4, -1, -1, -1], [8, 9, 10, -1]],
+        dtype=torch.int32,
+        device=device,
+    )
+    starts = torch.tensor([0, 2, 3, 6], dtype=torch.int64, device=device)
+    rows = packed_accepted_path_rows(accept_index, starts)
+    assert rows.tolist() == [0, 1, 0, 0, 2, 2, 2, 2, 3, 4, 5, 3]
 
 
 def test_packed_greedy_caps_matches_and_preserves_bonus(device):
@@ -167,6 +237,93 @@ def test_backend_verification_and_nan_guard_keep_request_ownership(
     guard.audit_logits(output, ctx)
     assert guard.flags.tolist() == [0, 0, 1]
     assert torch.isfinite(logits).all()
+
+
+def test_packed_greedy_logprobs_match_fullwidth_and_follow_grammar_csr(device):
+    from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
+    from tokenspeed.runtime.sampling.backends.base import SamplingBackendConfig
+    from tokenspeed.runtime.sampling.backends.greedy import GreedySamplingBackend
+    from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
+
+    vocab, width = 128, 4
+    backend = GreedySamplingBackend(
+        SamplingBackendConfig(
+            synthetic_acceptance_length=None,
+            enable_speculative_sampling=False,
+            sampling_stream="batch",
+            logprob_order="torch",
+            enable_output_logprobs=True,
+            max_bs=3,
+            max_draft_tokens_per_req=width,
+            max_req_pool_size=4,
+            vocab_size=vocab,
+            device=device,
+        )
+    )
+    targets = torch.tensor(
+        [11, 12, 13, 14, 21, 99, 23, 24, 31, 32, 33, 34], device=device
+    )
+    decoys = (targets + 17) % vocab
+    forbidden = (targets + 53) % vocab
+    rows = torch.arange(targets.numel(), device=device)
+    logits = torch.full((targets.numel(), vocab), -4.0, device=device)
+    logits[rows, forbidden] = 20.0
+    logits[rows, targets] = 2.0 + rows.float() / 8.0
+    logits[rows, decoys] = -1.0 + rows.float() / 16.0
+    assert not torch.equal(logits.argmax(dim=-1), targets)
+    vocab_mask = _allow_tokens(torch.stack((targets, decoys), dim=1), vocab)
+    candidates = torch.tensor(
+        [[10, 11, 12, 13], [20, 21, 22, 23], [30, 31, 32, 33]],
+        dtype=torch.int32,
+        device=device,
+    )
+
+    def run(selected=None, starts=None):
+        raw = logits if selected is None else logits.index_select(0, selected)
+        mask = vocab_mask if selected is None else vocab_mask.index_select(0, selected)
+        output = LogitsProcessorOutput(next_token_logits=raw.clone())
+        info = SamplingBatchInfo(
+            vocab_size=vocab,
+            vocab_mask=mask,
+            apply_vocab_mask=_vocab_mask_applier(),
+            device=device,
+        )
+        predict, lengths = backend.verify(
+            output, info, candidates, tree=None, query_start_loc=starts
+        )
+        indices = backend._accept_index_buf[: candidates.numel()].view_as(candidates)
+        return (
+            predict.clone(),
+            lengths.clone(),
+            indices.clone(),
+            output.next_token_logprobs.clone(),
+            raw,
+            mask,
+        )
+
+    fullwidth = run()
+    uniform_starts = torch.arange(4, dtype=torch.int64, device=device) * width
+    uniform_packed = run(starts=uniform_starts)
+    for got, reference in zip(uniform_packed[:3], fullwidth[:3], strict=True):
+        torch.testing.assert_close(got, reference, atol=0, rtol=0)
+    full_live = torch.arange(width, device=device)[None, :] < fullwidth[1][:, None]
+    torch.testing.assert_close(
+        uniform_packed[3].view(3, width)[full_live],
+        fullwidth[3].view(3, width)[full_live],
+        atol=0,
+        rtol=0,
+    )
+
+    selected = torch.tensor([0, 4, 5, 6, 8, 9, 10, 11], device=device)
+    short_starts = torch.tensor([0, 1, 4, 8], dtype=torch.int64, device=device)
+    shortened = run(selected, short_starts)
+    predict, lengths, indices, logprobs, raw, mask = shortened
+    assert lengths.tolist() == [1, 2, 4]
+    live = torch.arange(width, device=device)[None, :] < lengths[:, None]
+    assert predict.view(3, width)[live].tolist() == [11, 21, 99, 31, 32, 33, 34]
+    # Request 1 and request 2 have different flat candidate and packed-logit
+    # bases. Score every output slot, including the anchor-scored unused tail.
+    _assert_packed_logprobs(logprobs, raw, mask, predict, indices, short_starts)
 
 
 @pytest.mark.parametrize("length", [2.5, 4.0])

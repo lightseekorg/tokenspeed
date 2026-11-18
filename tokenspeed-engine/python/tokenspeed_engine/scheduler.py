@@ -60,6 +60,8 @@ StorageConfig = _ext.StorageConfig
 StoragePressure = _ext.StoragePressure
 StorageKind = _ext.StorageKind
 
+PeerConfig = _ext.PeerConfig
+
 PD = _ext.PD
 Cache = _ext.Cache
 Forward = _ext.Forward

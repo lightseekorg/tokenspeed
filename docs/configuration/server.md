@@ -1403,15 +1403,21 @@ Req: chatcmpl-019ef6b7 Finish! RequestStats(status='finished', reason='stop', pr
 
 ### KV cache events
 
-KV cache events publish reusable device prefix-cache mutations from the live
-C++ scheduler path. This initial stream does not publish Host/L2 loadback
-events. The scheduler caches block hash lineage on prefix-cache nodes, so
-publishing a stored block uses the parent node's cached hash instead of
-rebuilding the full ancestor prefix.
+KV cache events publish reusable prefix-cache mutations from the live C++
+scheduler path, on two media: the GPU cache (no medium) and, with Host L2
+(`--enable-kvstore`), the pinned Host cache (medium `CPU_PINNED`). The
+scheduler caches block hash lineage on prefix-cache nodes, so publishing a
+stored block uses the parent node's cached hash instead of rebuilding the full
+ancestor prefix.
 
-Host L2 entries publish no events. Under `--kvstore-write-policy write_back`,
-a block the GPU evicts is reported `BlockRemoved` even when it is written
-back to the Host.
+Each medium's stream is prefix-closed for a router that continues a GPU match
+into the Host tier: a GPU block is stored once its parent is stored on the
+GPU, and a Host block once its parent is stored on either medium. A block on
+both media is stored on each. Under `--kvstore-write-policy write_back`, a
+block the GPU evicts is reported `BlockRemoved` on the GPU and, once its copy
+lands, `BlockStored` on the Host. A Host block read from L3 for a prefix this
+engine never published carries no tokens to describe it and publishes
+nothing.
 
 Example:
 
@@ -1423,9 +1429,12 @@ The ZMQ publisher sends three frames: topic bytes, an 8-byte big-endian sequence
 number, and a msgpack payload. The payload is an array-like `KVEventBatch`:
 
 ```python
-[timestamp, [["BlockStored", [block_hash], parent_hash, token_ids, block_size]], attn_dp_rank]
-[timestamp, [["BlockRemoved", [block_hash]]], attn_dp_rank]
+[timestamp, [["BlockStored", [block_hash], parent_hash, token_ids, block_size, None, medium]], attn_dp_rank]
+[timestamp, [["BlockRemoved", [block_hash], medium]], attn_dp_rank]
 ```
+
+This is vLLM's layout: the `None` is `lora_id`, and `medium` is `None` for
+the GPU cache or `"CPU_PINNED"` for the Host cache.
 
 With attention data parallelism, each attention DP rank publishes on an offset
 port from the configured endpoint.
@@ -1866,6 +1875,35 @@ On a host whose address is IPv6, the PD transfer engine sets `MC_USE_IPV6=1`
 (unless it is already set) so Mooncake's handshake uses IPv6. The Mooncake L3
 store client reads `MC_USE_IPV6` on its own when the store starts, so export
 `MC_USE_IPV6=1` yourself when the L3 store runs on an IPv6 host.
+
+### Peer prefix sharing
+
+`--peer-prefix-port PORT` lets replicas reuse each other's cached prefixes
+(design: [RFC 0004](../rfcs/0004-peer-prefix-sharing.md)). A request the
+router sends with a holder (`peer_holder`, the holder's `host:port`) asks
+that replica how much of its prompt it caches, in its GPU or Host cache, and
+reads those pages over RDMA (Mooncake TransferEngine, one-sided READ) into
+its own GPU cache instead of computing them. Every replica serves its own
+cache the same way. If the holder does not answer, or a read fails, the
+request computes the prefix itself.
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--peer-prefix-port` | off | The port this replica's endpoint binds; attention-DP rank `r` binds `PORT + r`. |
+| `--peer-prefix-host` | detected | The host others reach the endpoint at. The replica is named `host:PORT+r`, and a holder hint must name it exactly so. |
+| `--peer-prefix-answer-timeout-ms` | 50 | How long a request waits for each of the holder's answers (lookup, pin, release). |
+| `--peer-prefix-min-fetch-tokens` | 256 | The fewest tokens past the local prefix hit worth reading from a peer. |
+
+Peer sharing needs the Host tier (`--enable-kvstore`) and prefix caching.
+It is refused with `--disaggregation-mode decode`,
+`--kvstore-storage-backend`, `--pipeline-parallel-size > 1` and
+`--query-context-parallel-size > 1`; the
+scheduler also refuses KV-page sharding (`--kv-parallel-size` with sharded
+groups). RDMA devices come from `--disaggregation-ib-device`. Replicas read
+each other only within one namespace: the same checkpoints, cache layout,
+numerics and parallel layout (the L3 deployment id), and the same
+`--weight-version`. A flushed weight update must name its `weight_version`,
+which moves the namespace, as it does for L3.
 
 ### Block verification (experimental)
 

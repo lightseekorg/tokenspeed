@@ -214,9 +214,9 @@ inline auto MatchPrefixForTest(CacheCoordinator& coordinator, std::span<const st
 }
 
 inline void CacheFullBlocksForTest(CacheCoordinator& coordinator, std::span<BlockTable> tables,
-                                   std::span<const std::string> content_hashes, std::int32_t first_slot = 0) {
+                                   std::span<const std::string> content_hashes, std::int32_t first_prefix_page = 0) {
     coordinator.CacheFullBlocks(tables, content_hashes, CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
-                                first_slot, CacheBoundaryKind::kChunk);
+                                first_prefix_page, CacheBoundaryKind::kChunk);
 }
 
 // Publishes the newly hashed pages [first_new_prefix_page, prefix_hashes.size())

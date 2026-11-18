@@ -83,6 +83,9 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     FULL_ATTENTION,
     STATE_LAYER_TYPES,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.visualization import (
+    format_cache_layout,
+)
 from tokenspeed.runtime.layers.attention.utils import (
     check_probe_cache_fits,
     profile_available_cache_memory_bytes,
@@ -1600,6 +1603,15 @@ def create_attn_components(
         f"fixed_workspace_bytes={fixed_workspace_bytes}, "
         f"budget_bytes={cache_budget_bytes}",
     )
+    layout_log_level = logging.DEBUG if probe_batch_rows is not None else logging.INFO
+    if logger.isEnabledFor(layout_log_level):
+        build = "probe" if probe_batch_rows is not None else "serving"
+        logger.log(
+            layout_log_level,
+            f"CacheRecipe {type(recipe).__name__} ({spec.family}): "
+            f"build={build}, pp_rank={server_args.mapping.pp_rank}\n"
+            f"{format_cache_layout(spec.memory_plan)}",
+        )
     arena = create_cache_arena(
         spec,
         device=config.device,

@@ -115,18 +115,18 @@ public:
         };
     }
 
-    // Pages [0, result), except retained sink blocks, have expired under the group's
+    // Blocks [0, result), except retained sink blocks, have expired under the group's
     // retention policy at this progress; kFull never expires and a State
     // group's slots are released by StateStep, not by token retention. This
-    // is where the sliding-window token policy meets page arithmetic, so it
+    // is where the sliding-window token policy meets block arithmetic, so it
     // lives here and not in the (token-free) allocator.
-    std::int32_t ExpiredBlocksAt(const CacheGroupSpec& spec, std::int32_t num_computed_tokens) const {
+    std::int32_t ExpiredBlockEndAt(const CacheGroupSpec& spec, std::int32_t num_computed_tokens) const {
         if (spec.attn_kind != AttnKind::kSlidingWindow) {
             return 0;
         }
         _assert(spec.sliding_window > 0, "retention window must be > 0");
         const std::int32_t skipped = num_computed_tokens - spec.sliding_window + 1;
-        // Only fully-slid-out pages expire.
+        // Only fully-slid-out blocks expire.
         return skipped <= 0 ? 0 : skipped / BlockGranularity();
     }
 
