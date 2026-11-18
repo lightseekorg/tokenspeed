@@ -35,6 +35,16 @@ tokenspeed serve nvidia/Kimi-K2.5-NVFP4 \
   --tool-call-parser kimik2
 ```
 
+## CUDA work queues
+
+Set `CUDA_DEVICE_MAX_CONNECTIONS` in the environment before starting the server
+to select the CUDA device work-queue limit. The launcher preserves explicit
+values and defaults to `4` only when the variable is unset. For example:
+
+```bash
+CUDA_DEVICE_MAX_CONNECTIONS=8 tokenspeed serve /path/to/model
+```
+
 ## Launch checklist
 
 - Put the model path directly after `tokenspeed serve`.
