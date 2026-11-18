@@ -705,8 +705,11 @@ def mm(
         # when this rank's actual GEMM retains the generic biased path.
         autotune_bf16_gemm(A, B)
         warm_tgv_decode_gemm(A, B)
+        # Let the registry check the small-N policy's layout/alignment traits.
+        small_n = prefer_bf16_small_n_splitk(M, N, K, enable_pdl=enable_pdl)
         if (
             bias is None
+            and not small_n
             and M <= BF16_GEMM_MAX_M
             and flashinfer_joint_bf16_supported(A, B, out)
             and not is_serving()
@@ -737,7 +740,7 @@ def mm(
         # BF16 gemm.mm kernel, plugins included.
         tgv_tactic = (
             flashinfer_tgv_decode_tactic(A, B, out)
-            if bias is None and not is_serving()
+            if bias is None and not small_n and not is_serving()
             else None
         )
         if tgv_tactic is not None:
@@ -754,7 +757,7 @@ def mm(
                 has_out=out is not None,
             ):
                 return flashinfer_tgv_decode_gemm(A, B, out, tgv_tactic)
-        if bias is None and _use_mv(A, B):
+        if bias is None and not small_n and _use_mv(A, B):
             return mv(A, B, out)
 
     block_scale_layout = (
@@ -4127,6 +4130,7 @@ from tokenspeed_kernel.ops.gemm.flashinfer import (  # noqa: E402
     gemm_fp8_nt_groupwise,
     has_flashinfer_cute_dsl_nvfp4_a16,
     has_flashinfer_mxfp8,
+    prefer_bf16_small_n_splitk,
     prepare_nvfp4_a16_weights,
     swizzle_mxfp8_scale,
     warm_tgv_decode_gemm,
