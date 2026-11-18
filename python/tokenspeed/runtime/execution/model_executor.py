@@ -1997,6 +1997,16 @@ class ModelExecutor:
                 input_ids_buf_slice=slice_, candidate_start=ctx.num_extends
             )
 
+        self.attn_backend.prepare_pending_recurrent_state(
+            self.input_buffers.req_pool_indices_buf[:bs],
+            self.runtime_states.valid_cache_lengths,
+            allow_defer=(
+                ctx.forward_mode.is_decode()
+                and ctx.num_extends == 0
+                and ctx.output_layout.decode_width == 4
+            ),
+        )
+
         # KV offloading uses scheduler request slots to bind hot partitions;
         # ordinary backends keep their existing path through a no-op hook.
         self.attn_backend.prepare_cache_batch(
@@ -3024,6 +3034,13 @@ class ModelExecutor:
                 else:
                     forward_logprobs = ForwardLogprobs()
 
+                recurrent_state_pending = self.attn_backend.recurrent_state_pending(
+                    self.input_buffers.req_pool_indices_buf[:bs]
+                )
+                if recurrent_state_pending is not None:
+                    recurrent_state_pending = recurrent_state_pending.to(
+                        dtype=torch.int32
+                    ).to("cpu", non_blocking=True)
                 output_nan_flags = self.nan_guard.flags_cpu
 
                 copy_event = self.device_module.Event()
@@ -3065,6 +3082,7 @@ class ModelExecutor:
             grammar_completion=grammar_completion,
             next_input_ids=next_input_ids,
             output_nan_flags=output_nan_flags,
+            recurrent_state_pending=recurrent_state_pending,
             spec_candidate_tokens=spec_candidate_tokens,
             input_token_logprobs=forward_logprobs.input_token_logprobs,
             # The plan rides along whether or not this rank scored the rows: a

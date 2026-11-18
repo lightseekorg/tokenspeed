@@ -1052,6 +1052,9 @@ DecodeOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::Sc
     // The event builds a fresh Decoding, so the restore marker is consumed here.
     DecodeOperation operation =
         applyDecodeEvent(*request, std::move(event), config_.decode_input_tokens, coordinator_, cache_group_ids_);
+    if (config_.defer_recurrent_state && config_.role != Role::kP) {
+        request->MarkRecurrentStatePending();
+    }
     if (needs_explicit_token) {
         operation.decode_input_id = explicit_token;
         operation.spec_candidate_ids = std::move(spec_candidate_ids);
@@ -1262,6 +1265,11 @@ std::optional<ImageShortfall> Scheduler::imageShortfall(const Request& request) 
 std::optional<ImageShortfall> Scheduler::retractVictim(Request& victim, PlanBuild& build,
                                                        std::vector<WriteBackOperation>& write_back_operations) {
     ProfileSpan profile_span{"Scheduler::retractVictim"};
+    if (victim.RecurrentStatePending()) {
+        materializeState(victim, fsm::MaterializationAction::kRetract);
+        build.scheduled.insert(&victim);
+        return std::nullopt;
+    }
     if (snapshot_slots_.AvailableSlots() == 0) {
         return ImageShortfall::kBlobSlot;
     }
@@ -1545,6 +1553,7 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
         if (shortfall) {
             onImageDoesNotFit(*victim, *shortfall, build);
         }
+        if (victim->Is<fsm::StateMaterializing>()) return;
 
         if (empty_round) {
             // The round's decodes, none of which got a page, take the freed
@@ -2319,6 +2328,13 @@ Scheduler::BuiltOperations Scheduler::buildForwardOperations(ExecutionPlan& plan
     // identical on every rank -- so within a phase, older requests win.
     AdmissionFeedback feedback;
     PlanBuild build{plan, options};
+    for (Request* request : candidates) {
+        if (!request->TakeMaterializedRetraction()) continue;
+        if (auto shortfall = retractVictim(*request, build, write_back_operations)) {
+            onImageDoesNotFit(*request, *shortfall, build);
+        }
+        build.scheduled.insert(request);
+    }
     build.token_budget = config_.max_scheduled_tokens;
     build.kv_page_budget = config_.max_kv_page_num;
     switch (config_.role) {

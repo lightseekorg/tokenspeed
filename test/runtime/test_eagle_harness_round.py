@@ -484,6 +484,7 @@ def _decode_batch(bs: int, width: int):
                     attn_kind=ts.AttnKind.Full,
                 )
             ],
+            defer_recurrent_state=False,
         )
     )
     for i in range(bs):

@@ -150,7 +150,10 @@ class Plane:
             raise RuntimeError("the completion failed")
         from array import array
         cumulative = None if self.cumulative_probs is None else array('d', self.cumulative_probs)
-        return ([launched], [1], None, None, None, None, None, None, cumulative)
+        result = ([launched], [1], None, None, None, None, None, None, cumulative)
+        if cumulative is None:
+            return result
+        return (*result, [1])
 
     def note_committed(self, launched):
         self.note("note_committed")
@@ -286,7 +289,7 @@ fn admission_identity_and_stop_criteria_reach_python_together() {
 }
 
 #[test]
-fn completion_keeps_the_selected_tokens_cumulative_probabilities() {
+fn completion_keeps_cumulative_probabilities_and_state_readiness() {
     let (plane, mut scheduler) = plane();
     Python::attach(|py| plane.setattr(py, "cumulative_probs", vec![0.875]).unwrap());
     let batch = batch();
@@ -302,6 +305,7 @@ fn completion_keeps_the_selected_tokens_cumulative_probabilities() {
     let result = data_plane.complete(forward).unwrap();
     assert_eq!(result.output_tokens, [100]);
     assert_eq!(result.output_token_cumulative_probs, Some(vec![0.875]));
+    assert_eq!(result.recurrent_state_pending, Some(vec![1]));
 }
 
 #[test]

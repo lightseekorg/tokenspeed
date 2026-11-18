@@ -116,6 +116,11 @@ def _select_registration(
             BenchmarkStatus.REGISTRATION_MISSING,
             f"Selected registration {selected.name!r} is not available",
         )
+    if spec.traits.get("pending_replay") == frozenset({True}):
+        raise BenchmarkCaseError(
+            BenchmarkStatus.NOT_APPLICABLE,
+            "Deferred replay requires the continuous GDN benchmark with owned payload banks",
+        )
     return spec
 
 
@@ -240,6 +245,7 @@ def prepare_gdn_decode_mtp(
         # Probe the general verify registration, not the serving-time chain candidate.
         "chunked_chain": False,
         "replay_payload": False,
+        "pending_replay": False,
     }
     if request.solution != "flashinfer" and per_token:
         # State-writing calls select by state dtype, as the facade does.
@@ -272,6 +278,7 @@ def prepare_gdn_decode_mtp(
             tree_ancestors=None,
             override=request.registration,
             solution=request.solution,
+            pending_replay=None,
         )
 
     return PreparedBenchmark(

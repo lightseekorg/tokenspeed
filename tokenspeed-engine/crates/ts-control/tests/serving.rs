@@ -794,6 +794,7 @@ impl DataPlane for FakeDevice {
                 CacheOpKind::LoadBack => CacheEventKind::LoadBackDone,
                 CacheOpKind::SnapshotStore => CacheEventKind::SnapshotDone,
                 CacheOpKind::SnapshotRestore => CacheEventKind::RestoreDone,
+                CacheOpKind::StateMaterialize => CacheEventKind::StateMaterialized,
                 kind => return Err(DataPlaneError(format!("no fake for {kind:?}"))),
             };
             self.acknowledged

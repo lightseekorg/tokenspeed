@@ -898,3 +898,33 @@ def _v41_confidence_drafter(monkeypatch):
 def test_v41_confidence_slot_state_is_complete(monkeypatch):
     drafter = _v41_confidence_drafter(monkeypatch)
     _assert_slot_state_complete(drafter, exporter=drafter, slot_domains={POOL_ROWS})
+
+
+def _gdn_pending():
+    from tokenspeed.runtime.layers.attention.backends.state.gdn_pending import (
+        GdnPendingState,
+    )
+
+    return GdnPendingState(
+        torch.empty(2, MAX_BS * 4, 128 + 2 * 128 + 4, dtype=torch.bfloat16),
+        torch.zeros(2, 2, 2),
+        slot_count=POOL_ROWS,
+        geometry=(1, 2, 128, 128),
+        state_addresses=torch.zeros(2, dtype=torch.uint64),
+        state_row_strides=torch.full((2,), 2 * 128 * 128, dtype=torch.int64),
+        rows_aligned=True,
+        group_indices=torch.zeros(2, dtype=torch.int64),
+    )
+
+
+def test_gdn_pending_metadata_is_complete_and_snapshots_require_materialization():
+    owner = _gdn_pending()
+    _assert_slot_state_complete(owner, exporter=owner, slot_domains={POOL_ROWS})
+    owner.records[3] = torch.tensor([7, -1, 100, -1])
+    image = torch.empty(owner.slot_state_bytes(), dtype=torch.uint8)
+    owner.export_slot_state(3, image, None, request_id="source")
+    owner.import_slot_state(6, image, None, request_id="restored")
+    assert torch.equal(owner.records[3], owner.records[6])
+    owner.records[3, 1] = 0
+    with pytest.raises(RuntimeError, match="must be materialized"):
+        owner.export_slot_state(3, image, None, request_id="pending")

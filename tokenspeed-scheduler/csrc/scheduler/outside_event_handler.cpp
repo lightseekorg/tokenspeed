@@ -81,7 +81,7 @@ void Scheduler::handleEvent(const pd::SucceededEvent& event) {
         handleEvent(pd::TransferStoppedEvent{event.request_id});
         return;
     }
-    if (!request->Is<fsm::PrefillDone>() && !request->Is<fsm::Decoding>()) {
+    if (!request->IsAnyOf<fsm::PrefillDone, fsm::Decoding, fsm::StateMaterializing>()) {
         throw std::logic_error("PD SucceededEvent received in state " + request->StateName());
     }
     // The transfer is done and the request leaves this engine: its computed
@@ -108,7 +108,7 @@ void Scheduler::handleEvent(const pd::RemotePrefillDoneEvent& event) {
         handleEvent(pd::TransferStoppedEvent{event.request_id});
         return;
     }
-    if (request->IsAnyOf<fsm::PrefillDone, fsm::Decoding, fsm::Finishing, fsm::Finished>()) {
+    if (request->IsAnyOf<fsm::PrefillDone, fsm::Decoding, fsm::Finishing, fsm::StateMaterializing, fsm::Finished>()) {
         return;
     }
     throw std::logic_error("PD RemotePrefillDoneEvent received before destination admission; state=" +
@@ -138,6 +138,13 @@ void Scheduler::settleFinishedRequests() {
         if (!request->Is<fsm::Finishing>() || request->ResultsInFlight() > 0) {
             continue;
         }
+        if (request->RecurrentStatePending()) {
+            const auto action = request->GetIf<fsm::Finishing>()->publish_completed_pages
+                                    ? fsm::MaterializationAction::kFinish
+                                    : fsm::MaterializationAction::kAbort;
+            materializeState(*request, action);
+            continue;
+        }
         if (request->GetIf<fsm::Finishing>()->publish_completed_pages) {
             if (auto store = publishCompletedPages(*request)) {
                 pending_write_back_operations_.push_back(std::move(*store));
@@ -148,6 +155,7 @@ void Scheduler::settleFinishedRequests() {
 }
 
 std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& request) {
+    _assert(!request.RecurrentStatePending(), "pending recurrent state cannot be published");
     ProfileSpan profile_span{"Scheduler::publishCompletedPages"};
     // Every forward has landed. Advance the finishing owner's progress in
     // place; its references and hash storage live through publication and
@@ -407,6 +415,14 @@ void Scheduler::handleEvent(const forward::ExtendResult& event) {
     }
 }
 
+void Scheduler::handleEvent(const forward::RecurrentStateReady& event) {
+    if (Request* request = findRequest(event.request_id)) {
+        // An older result cannot clear the conservative mark of a younger
+        // queued forward. Its own completion will provide the final fact.
+        if (request->HoldsPages() && request->ResultsInFlight() == 0) request->MarkRecurrentStateReady();
+    }
+}
+
 void Scheduler::handleEvent(const forward::Abort& event) {
     if (Request* request = findRequest(event.request_id)) {
         abortRequest(*request);
@@ -417,10 +433,26 @@ void Scheduler::abortRequest(Request& request) {
     if (pdTransferInFlight(request)) {
         // The transport stops the transfer; the pages wait for it.
         request.Apply(fsm::StopPdTransferEvent{});
-    } else if (request.ResultsInFlight() > 0) {
+    } else if (request.Is<fsm::StateMaterializing>()) {
+        request.Apply(fsm::AbortEvent{&coordinator_});
+    } else if (request.ResultsInFlight() > 0 || (request.HoldsPages() && request.RecurrentStatePending())) {
         request.Apply(fsm::AbortInFlightEvent{});
     } else {
         request.Apply(fsm::AbortEvent{&coordinator_});
+    }
+}
+
+void Scheduler::materializeState(Request& request, fsm::MaterializationAction action) {
+    const auto op_id = next_state_materialization_id_++;
+    _assert(op_id != 0, "state materialization operation id overflow");
+    const auto slot = request.RequestPoolIndex();
+    request.StartStateMaterialization(op_id, action);
+    pending_state_materializations_.push_back(StateMaterialization{op_id, {slot}});
+}
+
+void Scheduler::handleEvent(const cache::StateMaterialized& event) {
+    for (const auto& request : requests_) {
+        if (request->CompleteStateMaterialization(event.op_id)) return;
     }
 }
 

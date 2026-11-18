@@ -1237,3 +1237,12 @@ rendezvous for cache flushes while retaining their DP routing identities.
 Sharing immutable expert weights alone does not require forward coordination.
 Weight-copy streams and readiness/release events remain behind the model on
 the data plane; see [distributed immutable weights](distributed-weights.md).
+
+## Recurrent-state materialization feedback
+
+State materialization uses the existing execution-plan and cache-op feedback
+queues. `StateMaterializing` in the scheduler retains request resources; the
+loop holds only operation IDs and counts, never payloads, device masks or
+accepted lengths. The data plane polls a stream event and reports
+`StateMaterializedEvent`, which participates in the same replica agreement
+as cache-copy acknowledgments before the scheduler advances the request.

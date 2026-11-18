@@ -182,6 +182,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("max_batch_size", &tokenspeed::SchedulerConfig::max_batch_size)
         .def_rw("max_resident_requests", &tokenspeed::SchedulerConfig::max_resident_requests)
         .def_rw("decode_input_tokens", &tokenspeed::SchedulerConfig::decode_input_tokens)
+        .def_rw("defer_recurrent_state", &tokenspeed::SchedulerConfig::defer_recurrent_state)
         .def_rw("overlap_schedule_depth", &tokenspeed::SchedulerConfig::overlap_schedule_depth)
         .def_rw("role", &tokenspeed::SchedulerConfig::role)
         .def_prop_rw(
@@ -255,6 +256,10 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("request_id", &tokenspeed::forward::ExtendResult::request_id)
         .def_rw("tokens", &tokenspeed::forward::ExtendResult::tokens)
         .def_rw("spec_candidate_ids", &tokenspeed::forward::ExtendResult::spec_candidate_ids);
+
+    nb::class_<tokenspeed::forward::RecurrentStateReady>(forward_event, "RecurrentStateReady")
+        .def(nb::init<>())
+        .def_rw("request_id", &tokenspeed::forward::RecurrentStateReady::request_id);
 
     nb::class_<tokenspeed::forward::Finish>(forward_event, "Finish")
         .def(nb::init<>())
@@ -462,6 +467,9 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("op_id", &tokenspeed::cache::LoadBackDone::op_id);
 
     // The tail pages and slot-state blob of a retraction image landed.
+    nb::class_<tokenspeed::cache::StateMaterialized>(cache, "StateMaterializedEvent")
+        .def(nb::init<>())
+        .def_rw("op_id", &tokenspeed::cache::StateMaterialized::op_id);
     nb::class_<tokenspeed::cache::SnapshotDone>(cache, "SnapshotDoneEvent")
         .def(nb::init<>())
         .def_rw("op_id", &tokenspeed::cache::SnapshotDone::op_id);
@@ -663,11 +671,15 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("reason", &tokenspeed::SchedulerAbort::reason)
         .def_ro("detail", &tokenspeed::SchedulerAbort::detail);
 
+    nb::class_<tokenspeed::StateMaterialization>(m, "StateMaterialization")
+        .def_ro("op_id", &tokenspeed::StateMaterialization::op_id)
+        .def_ro("request_pool_indices", &tokenspeed::StateMaterialization::request_pool_indices);
     nb::class_<tokenspeed::ExecutionPlan>(m, "ExecutionPlan")
         .def(nb::init<>())
         .def_prop_ro("forward", collect_forward)
         .def_prop_ro("cache", collect_cache)
         .def_ro("aborts", &tokenspeed::ExecutionPlan::aborts)
+        .def_ro("state_materializations", &tokenspeed::ExecutionPlan::state_materializations)
         .def_prop_ro("remote_decode",
                      [](const tokenspeed::ExecutionPlan& plan) -> nb::object {
                          if (!plan.remote_decode) {

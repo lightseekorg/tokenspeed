@@ -200,7 +200,13 @@ def test_plan_adapter_rejects_ragged_batches_and_unknown_kinds(wire):
 
 
 @pytest.mark.parametrize(
-    "kind", ["WriteBackDoneEvent", "SnapshotDoneEvent", "RestoreDoneEvent"]
+    "kind",
+    [
+        "WriteBackDoneEvent",
+        "SnapshotDoneEvent",
+        "RestoreDoneEvent",
+        "StateMaterializedEvent",
+    ],
 )
 def test_cache_acks_become_the_payload_the_host_reads(kind):
     event = getattr(ts.Cache, kind)()
@@ -234,7 +240,10 @@ def _config(**overrides):
         storage_config=None,
     )
     fields.update(overrides)
-    return make_config(**fields)
+    return make_config(
+        **fields,
+        defer_recurrent_state=False,
+    )
 
 
 def test_make_config_states_the_snapshot_pool_on_every_role():
@@ -257,7 +266,17 @@ def test_make_config_states_the_snapshot_pool_on_every_role():
         _config(max_retracted_requests=4)
     with pytest.raises(TypeError):
         # The retraction fields are keyword-only and required.
-        make_config(32, 64, 8, 2, 0, True, False, "fused")
+        make_config(
+            32,
+            64,
+            8,
+            2,
+            0,
+            True,
+            False,
+            "fused",
+            defer_recurrent_state=False,
+        )
 
 
 def test_make_config_requires_storage_limits_exactly_with_l3():

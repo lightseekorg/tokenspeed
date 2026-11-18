@@ -900,7 +900,10 @@ def test_device_weight_update_notifies_drafter_before_returning():
         device="cpu",
         complete_pending_drafting=lambda: None,
     )
-    handle = DeviceHandle(executor)
+    handle = DeviceHandle(
+        executor,
+        recurrent_state_materialization=False,
+    )
     request = UpdateWeightsFromDistributedReqInput(
         names=[],
         dtype_names=[],

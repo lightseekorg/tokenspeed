@@ -59,6 +59,8 @@ pub struct ForwardResult {
     pub output_token_cumulative_probs: Option<Vec<f64>>,
     /// Per-row NaN-guard flags; `None` with the guard off.
     pub nan_flags: Option<Vec<i32>>,
+    /// Device pending snapshot after commit; None keeps conservative ownership.
+    pub recurrent_state_pending: Option<Vec<i32>>,
     /// P role: each row's sampled token and the drafter's candidates, the
     /// bootstrap payload a completed prompt's remote decode carries; `None`
     /// on the other roles.
@@ -129,6 +131,7 @@ impl ForwardResult {
         });
         out.option(self.grammar_terminated_at.as_deref(), Writer::i32s);
         out.option(self.input_token_logprobs.as_deref(), Writer::f64s);
+        out.option(self.recurrent_state_pending.as_deref(), Writer::i32s);
         out.finish()
     }
 
@@ -146,6 +149,7 @@ impl ForwardResult {
         })?;
         let grammar_terminated_at = reader.option(Reader::i32s)?;
         let input_token_logprobs = reader.option(Reader::f64s)?;
+        let recurrent_state_pending = reader.option(Reader::i32s)?;
         reader.finish(Self {
             output_tokens,
             output_lengths,
@@ -153,6 +157,7 @@ impl ForwardResult {
             // Not shared: the engine refuses the diagnostic under a pipeline.
             output_token_cumulative_probs: None,
             nan_flags,
+            recurrent_state_pending,
             next_input_ids,
             serving_compiles: None,
             grammar_terminated_at,
@@ -441,6 +446,18 @@ fn event(kind: ForwardEventKind, rid: &str, tokens: Vec<i32>, reserve: i32) -> F
 
 fn extend_result(rid: &str, tokens: Vec<i32>) -> ForwardEvent {
     event(ForwardEventKind::ExtendResult, rid, tokens, 0)
+}
+
+fn recurrent_state_readiness(
+    result: &ForwardResult,
+    row: usize,
+    rid: &str,
+) -> Option<ForwardEvent> {
+    result
+        .recurrent_state_pending
+        .as_ref()
+        .is_some_and(|flags| flags[row] == 0)
+        .then(|| event(ForwardEventKind::RecurrentStateReady, rid, Vec::new(), 0))
 }
 
 /// What the engine does in a disaggregated deployment, as its output
@@ -1308,6 +1325,9 @@ impl OutputProcessor {
             }
         };
         check("output_lengths", result.output_lengths.len())?;
+        if let Some(flags) = &result.recurrent_state_pending {
+            check("recurrent_state_pending", flags.len())?;
+        }
         if let Some(flags) = &result.nan_flags {
             check("nan_flags", flags.len())?;
         }
@@ -1399,6 +1419,9 @@ impl OutputProcessor {
                     rid,
                     if mid_chunk { Vec::new() } else { model_ids },
                 ));
+                committed
+                    .events
+                    .extend(recurrent_state_readiness(result, i, rid));
                 continue;
             };
             if i < batch.num_extends {
@@ -1426,6 +1449,9 @@ impl OutputProcessor {
                     state.numerical_error_detected = true;
                 }
                 committed.events.push(extend_result(rid, Vec::new()));
+                committed
+                    .events
+                    .extend(recurrent_state_readiness(result, i, rid));
                 continue;
             }
             if !state.prefill_finished() {
@@ -1617,6 +1643,9 @@ impl OutputProcessor {
             let mut extend = extend_result(rid, model_ids);
             extend.spec_candidate_ids = spec_candidate_ids;
             committed.events.push(extend);
+            committed
+                .events
+                .extend(recurrent_state_readiness(result, i, rid));
 
             if self.role == Role::Prefill {
                 // A numerically corrupted prompt's KV must never transfer:
@@ -1800,6 +1829,7 @@ mod tests {
             output_logprobs: None,
             output_token_cumulative_probs: None,
             nan_flags: None,
+            recurrent_state_pending: None,
             next_input_ids: None,
             serving_compiles: None,
             grammar_terminated_at: None,
@@ -2799,6 +2829,7 @@ mod tests {
             output_lengths: vec![2, 1],
             output_logprobs: Some(vec![-0.25, -1.5, f64::NEG_INFINITY]),
             nan_flags: Some(vec![0, 1]),
+            recurrent_state_pending: None,
             next_input_ids: Some(vec![vec![5, 6], vec![]]),
             serving_compiles: None,
             grammar_terminated_at: Some(vec![-1, 0]),
@@ -3068,6 +3099,52 @@ mod tests {
         );
         assert_eq!(c.released, ["r"]);
         assert_eq!(p.num_running(), 0);
+    }
+
+    #[test]
+    fn recurrent_readiness_follows_the_committed_device_snapshot() {
+        for pending in [0, 1] {
+            let mut p = processor(Some(4));
+            register(&mut p, "r", 4, 5, &[]);
+            p.commit(&batch(&[("r", 4, 0, 4)], 1), None, &result(&[7], &[1]))
+                .unwrap();
+            let mut finished = result(&[8, 9, 10, 11], &[4]);
+            finished.recurrent_state_pending = Some(vec![pending]);
+            let c = p
+                .commit(&batch(&[("r", 4, 0, 4)], 0), None, &finished)
+                .unwrap();
+            assert_eq!(
+                c.events
+                    .iter()
+                    .any(|event| event.kind == ForwardEventKind::RecurrentStateReady),
+                pending == 0
+            );
+            assert_eq!(c.events.last().unwrap().kind, ForwardEventKind::Finish);
+            assert_eq!(
+                ForwardResult::from_bytes(&finished.to_bytes())
+                    .unwrap()
+                    .recurrent_state_pending,
+                finished.recurrent_state_pending
+            );
+        }
+    }
+
+    #[test]
+    fn a_late_forward_still_reports_recurrent_readiness() {
+        let mut p = processor(Some(4));
+        register(&mut p, "r", 4, 1, &[]);
+        p.commit(&batch(&[("r", 4, 0, 4)], 1), None, &result(&[7], &[1]))
+            .unwrap();
+        let mut late = result(&[0, 0, 0, 0], &[0]);
+        late.recurrent_state_pending = Some(vec![0]);
+        let c = p.commit(&batch(&[("r", 4, 0, 4)], 0), None, &late).unwrap();
+        assert_eq!(
+            c.events.iter().map(|event| event.kind).collect::<Vec<_>>(),
+            [
+                ForwardEventKind::ExtendResult,
+                ForwardEventKind::RecurrentStateReady
+            ]
+        );
     }
 
     #[test]

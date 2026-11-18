@@ -139,6 +139,10 @@ struct FinishEvent : InvalidTransitionHandler<FinishEvent> {
     // The restore's copies are still filling the pages: nothing of the
     // frontier is on Device to publish, so the pages go straight back.
     Finished operator()(Restoring&& state);
+    StateMaterializing operator()(StateMaterializing&& state) {
+        if (state.action != MaterializationAction::kAbort) state.action = MaterializationAction::kFinish;
+        return std::move(state);
+    }
     Finishing operator()(Finishing&& state) { return std::move(state); }
     Finished operator()(Finished&& state) { return std::move(state); }
 
@@ -195,6 +199,10 @@ struct AbortEvent : InvalidTransitionHandler<AbortEvent> {
     Finished operator()(Restoring&& state);
     // Nothing of an aborted request is published, finished or not.
     Finished operator()(Finishing&& state);
+    StateMaterializing operator()(StateMaterializing&& state) {
+        state.action = MaterializationAction::kAbort;
+        return std::move(state);
+    }
     Finished operator()(Finished&& state) { return std::move(state); }
 
 private:

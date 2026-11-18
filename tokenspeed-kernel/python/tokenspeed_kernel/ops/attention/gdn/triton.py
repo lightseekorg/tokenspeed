@@ -1196,7 +1196,19 @@ def triton_gdn_chain_verify(
 # ===-----------------------------------------------------------------------===#
 
 
-@gluon.jit(do_not_specialize=["B", "T", "PAYLOAD_LAYER_STRIDE"])
+@triton.jit(do_not_specialize=["B"])
+def _gdn_selected_requests(mask, selected, B, BLOCK: tl.constexpr):
+    count = tl.full((), 0, tl.int32)
+    for first in range(tl.cdiv(B, BLOCK)):
+        row = first.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+        keep = tl.load(mask + row, row < B, False)
+        prefix = tl.cumsum(keep.to(tl.int32))
+        tl.store(selected + (count + prefix - 1).to(tl.int64), row.to(tl.int32), keep)
+        count += tl.sum(keep.to(tl.int32))
+    tl.store(selected + B, count)
+
+
+@gluon.jit(do_not_specialize=["B", "T", "PAYLOAD_LAYER_STRIDE", "L"])
 def _gdn_replay_commit_kernel(
     payload,
     parameters,
@@ -1205,9 +1217,11 @@ def _gdn_replay_commit_kernel(
     read_indices,
     write_indices,
     accepted_length,
+    selected_requests,
     B,
     T,
     PAYLOAD_LAYER_STRIDE,
+    L,
     H: gl.constexpr,
     HV: gl.constexpr,
     K: gl.constexpr,
@@ -1226,239 +1240,261 @@ def _gdn_replay_commit_kernel(
         tl.extra.cuda.gdc_wait()
         # Release successor setup; its wait still guards all dependent reads.
         tl.extra.cuda.gdc_launch_dependents()
-    # Keep batch out of grid division so serving batch changes remain runtime.
-    i_hv = (gl.program_id(0) // gl.cdiv(V, BV)) % HV
-    i_v = gl.program_id(0) % gl.cdiv(V, BV)
-    i_k = 0
-    i_n = gl.program_id(0) // (HV * gl.cdiv(V, BV))
-    i_l = gl.program_id(1)
-    i_h = i_hv // (HV // H)
-
-    # Adjacent CTAs cover contiguous V tiles; lanes own contiguous K.
-    # Warps own independent V columns.
-    layout: gl.constexpr = gl.BlockedLayout(
-        [SPT_K, 1], [WARP_SIZE // THREADS_V, THREADS_V], [1, gl.num_warps()], [0, 1]
-    )
-    o_k = i_k * BK + gl.arange(0, BK, layout=gl.SliceLayout(1, layout))
-    o_v = i_v * BV + gl.arange(0, BV, layout=gl.SliceLayout(0, layout))
-    mask_k = o_k < K
-    mask_v = o_v < V
-    mask_h = mask_k[:, None] & mask_v[None, :]
-
-    key_width: gl.constexpr = H * K
-    value_width: gl.constexpr = HV * V
-    payload_width: gl.constexpr = key_width + value_width + 2 * HV
-    layer_base = i_l.to(gl.int64) * PAYLOAD_LAYER_STRIDE
-    request_base = layer_base + i_n.to(gl.int64) * T * payload_width
-
-    layer_request = i_l * B + i_n
-    read_idx = gl.load(read_indices + layer_request).to(gl.int64)
-    steps = gl.load(accepted_length + i_n).to(gl.int32)
-    steps = gl.minimum(gl.maximum(steps, 0), T)
-    state_address = gl.load(state_addresses + i_l)
-    if STATE_DTYPE_CODE == 0:
-        state_pool = state_address.to(gl.pointer_type(gl.bfloat16))
-    elif STATE_DTYPE_CODE == 1:
-        state_pool = state_address.to(gl.pointer_type(gl.float16))
-    else:
-        state_pool = state_address.to(gl.pointer_type(gl.float32))
-    state_row_stride = gl.load(state_row_strides + i_l).to(gl.int64)
-    parameter_base = i_l * 2 * HV + i_hv
-    raw_A = gl.load(parameters + parameter_base).to(gl.float32)
-    b_dt_bias = gl.load(parameters + parameter_base + HV).to(gl.float32)
-    write_idx = gl.load(write_indices + layer_request).to(gl.int64)
-    # Pool row strides can break alignment; check each actual row address.
-    STATE_BITS: gl.constexpr = 32 if STATE_DTYPE_CODE == 2 else 16
-    PACK: gl.constexpr = 64 // STATE_BITS
-    PACK_WORDS: gl.constexpr = SPT_K // PACK
-    STATE_ALIGNMENT: gl.constexpr = 8 * PACK_WORDS
-    if STATE_DTYPE_CODE == 2 and K % PACK == 0:
-        # Each 64-bit word holds two FP32 elements.
-        packed_3d: gl.constexpr = gl.BlockedLayout(
-            [PACK_WORDS, PACK, 1],
-            [WARP_SIZE // THREADS_V, 1, THREADS_V],
-            [1, 1, gl.num_warps()],
-            [1, 0, 2],
+    units: gl.constexpr = HV * gl.cdiv(V, BV)
+    work_begin, work_end, work_stride = 0, 1, 1
+    if selected_requests is not None:
+        work_begin = gl.program_id(0).to(gl.int64)
+        work_end = gl.load(selected_requests + B).to(gl.int64) * L * units
+        work_stride = gl.num_programs(0)
+    for item in range(work_begin, work_end, work_stride):
+        work = gl.program_id(0)
+        if selected_requests is not None:
+            work = item
+        i_n = work // units
+        i_l = gl.program_id(1)
+        if selected_requests is not None:
+            i_l = i_n % L
+            i_n = gl.load(selected_requests + i_n // L).to(gl.int64)
+        i_hv = ((work // gl.cdiv(V, BV)) % HV).to(gl.int32)
+        i_v = (work % gl.cdiv(V, BV)).to(gl.int32)
+        i_k = 0
+        i_h = i_hv // (HV // H)
+        # Adjacent CTAs cover contiguous V tiles; lanes own contiguous K.
+        # Warps own independent V columns.
+        layout: gl.constexpr = gl.BlockedLayout(
+            [SPT_K, 1], [WARP_SIZE // THREADS_V, THREADS_V], [1, gl.num_warps()], [0, 1]
         )
-        packed_layout: gl.constexpr = gl.SliceLayout(1, packed_3d)
-        packed_k = i_k * (BK // PACK) + gl.arange(
-            0, BK // PACK, layout=gl.SliceLayout(1, packed_layout)
-        )
-        packed_v = i_v * BV + gl.arange(0, BV, layout=gl.SliceLayout(0, packed_layout))
-        pack_shift = (
-            gl.arange(0, PACK, layout=gl.SliceLayout(0, gl.SliceLayout(2, packed_3d)))
-            * STATE_BITS
-        )
-        packed_mask = (packed_k < K // PACK)[:, None] & (packed_v < V)[None, :]
-    b_h = gl.zeros([BK, BV], dtype=gl.float32, layout=layout)
-    if read_idx >= 0:
-        base = state_pool + read_idx * state_row_stride + i_hv * V * K
-        if K % PACK == 0:
-            if (base.to(gl.uint64) & (STATE_ALIGNMENT - 1)) == 0:
-                # Unsigned pointers isolate alignment hints from the fallback.
-                if STATE_DTYPE_CODE == 2:
-                    packed_ptr = base.to(gl.pointer_type(gl.uint64))
-                    packed_ptr = gl.multiple_of(packed_ptr, STATE_ALIGNMENT)
-                    raw = gl.load(
-                        packed_ptr
-                        + packed_v[None, :] * (K // PACK)
-                        + packed_k[:, None],
-                        mask=packed_mask,
-                        other=0,
-                    )
-                    bits = raw[:, None, :] >> pack_shift[None, :, None]
-                    values = bits.to(gl.uint32).to(gl.float32, bitcast=True)
-                    b_h = gl.convert_layout(gl.reshape(values, [BK, BV]), layout)
-                else:
-                    aligned_ptr = base.to(gl.pointer_type(gl.uint16))
-                    aligned_ptr = gl.multiple_of(aligned_ptr, STATE_ALIGNMENT)
-                    raw = gl.load(
-                        aligned_ptr + o_v[None, :] * K + o_k[:, None],
-                        mask=mask_h,
-                        other=0,
-                    )
-                    if STATE_DTYPE_CODE == 0:
-                        b_h = raw.to(gl.bfloat16, bitcast=True).to(gl.float32)
+        o_k = i_k * BK + gl.arange(0, BK, layout=gl.SliceLayout(1, layout))
+        o_v = i_v * BV + gl.arange(0, BV, layout=gl.SliceLayout(0, layout))
+        mask_k = o_k < K
+        mask_v = o_v < V
+        mask_h = mask_k[:, None] & mask_v[None, :]
+
+        key_width: gl.constexpr = H * K
+        value_width: gl.constexpr = HV * V
+        payload_width: gl.constexpr = key_width + value_width + 2 * HV
+        layer_base = i_l.to(gl.int64) * PAYLOAD_LAYER_STRIDE
+        request_base = layer_base + i_n.to(gl.int64) * T * payload_width
+
+        layer_request = i_l.to(gl.int64) * B + i_n
+        read_idx = gl.load(read_indices + layer_request).to(gl.int64)
+        steps = gl.load(accepted_length + i_n).to(gl.int32)
+        steps = gl.minimum(gl.maximum(steps, 0), T)
+        state_address = gl.load(state_addresses + i_l)
+        if STATE_DTYPE_CODE == 0:
+            state_pool = state_address.to(gl.pointer_type(gl.bfloat16))
+        elif STATE_DTYPE_CODE == 1:
+            state_pool = state_address.to(gl.pointer_type(gl.float16))
+        else:
+            state_pool = state_address.to(gl.pointer_type(gl.float32))
+        state_row_stride = gl.load(state_row_strides + i_l).to(gl.int64)
+        parameter_base = i_l * 2 * HV + i_hv
+        raw_A = gl.load(parameters + parameter_base).to(gl.float32)
+        b_dt_bias = gl.load(parameters + parameter_base + HV).to(gl.float32)
+        write_idx = gl.load(write_indices + layer_request).to(gl.int64)
+        # Pool row strides can break alignment; check each actual row address.
+        STATE_BITS: gl.constexpr = 32 if STATE_DTYPE_CODE == 2 else 16
+        PACK: gl.constexpr = 64 // STATE_BITS
+        PACK_WORDS: gl.constexpr = SPT_K // PACK
+        STATE_ALIGNMENT: gl.constexpr = 8 * PACK_WORDS
+        if STATE_DTYPE_CODE == 2 and K % PACK == 0:
+            # Each 64-bit word holds two FP32 elements.
+            packed_3d: gl.constexpr = gl.BlockedLayout(
+                [PACK_WORDS, PACK, 1],
+                [WARP_SIZE // THREADS_V, 1, THREADS_V],
+                [1, 1, gl.num_warps()],
+                [1, 0, 2],
+            )
+            packed_layout: gl.constexpr = gl.SliceLayout(1, packed_3d)
+            packed_k = i_k * (BK // PACK) + gl.arange(
+                0, BK // PACK, layout=gl.SliceLayout(1, packed_layout)
+            )
+            packed_v = i_v * BV + gl.arange(
+                0, BV, layout=gl.SliceLayout(0, packed_layout)
+            )
+            pack_shift = (
+                gl.arange(
+                    0, PACK, layout=gl.SliceLayout(0, gl.SliceLayout(2, packed_3d))
+                )
+                * STATE_BITS
+            )
+            packed_mask = (packed_k < K // PACK)[:, None] & (packed_v < V)[None, :]
+        b_h = gl.zeros([BK, BV], dtype=gl.float32, layout=layout)
+        if read_idx >= 0:
+            base = state_pool + read_idx * state_row_stride + i_hv * V * K
+            if K % PACK == 0:
+                if (base.to(gl.uint64) & (STATE_ALIGNMENT - 1)) == 0:
+                    # Unsigned pointers isolate alignment hints from the fallback.
+                    if STATE_DTYPE_CODE == 2:
+                        packed_ptr = base.to(gl.pointer_type(gl.uint64))
+                        packed_ptr = gl.multiple_of(packed_ptr, STATE_ALIGNMENT)
+                        raw = gl.load(
+                            packed_ptr
+                            + packed_v[None, :] * (K // PACK)
+                            + packed_k[:, None],
+                            mask=packed_mask,
+                            other=0,
+                        )
+                        bits = raw[:, None, :] >> pack_shift[None, :, None]
+                        values = bits.to(gl.uint32).to(gl.float32, bitcast=True)
+                        b_h = gl.convert_layout(gl.reshape(values, [BK, BV]), layout)
                     else:
-                        b_h = raw.to(gl.float16, bitcast=True).to(gl.float32)
+                        aligned_ptr = base.to(gl.pointer_type(gl.uint16))
+                        aligned_ptr = gl.multiple_of(aligned_ptr, STATE_ALIGNMENT)
+                        raw = gl.load(
+                            aligned_ptr + o_v[None, :] * K + o_k[:, None],
+                            mask=mask_h,
+                            other=0,
+                        )
+                        if STATE_DTYPE_CODE == 0:
+                            b_h = raw.to(gl.bfloat16, bitcast=True).to(gl.float32)
+                        else:
+                            b_h = raw.to(gl.float16, bitcast=True).to(gl.float32)
+                else:
+                    p_h0 = base + o_v[None, :] * K + o_k[:, None]
+                    b_h = gl.load(p_h0, mask=mask_h, other=0).to(gl.float32)
             else:
                 p_h0 = base + o_v[None, :] * K + o_k[:, None]
                 b_h = gl.load(p_h0, mask=mask_h, other=0).to(gl.float32)
-        else:
-            p_h0 = base + o_v[None, :] * K + o_k[:, None]
-            b_h = gl.load(p_h0, mask=mask_h, other=0).to(gl.float32)
 
-    b_A = -gl.exp(raw_A)
-    # Preserve normalization order while matching shared reads to state packing.
-    key_layout: gl.constexpr = gl.BlockedLayout(
-        [1, 2 if STATE_DTYPE_CODE == 2 else 4],
-        [THREADS_V, WARP_SIZE // THREADS_V],
-        [gl.num_warps(), 1],
-        [1, 0],
-    )
-    key_read_layout: gl.constexpr = gl.BlockedLayout(
-        [1, SPT_K], [THREADS_V, WARP_SIZE // THREADS_V], [gl.num_warps(), 1], [1, 0]
-    )
-    value_layout: gl.constexpr = gl.BlockedLayout(
-        [1, 2], [4, WARP_SIZE // 4], [1, gl.num_warps()], [1, 0]
-    )
-    shared_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
-    shared_k = gl.allocate_shared_memory(
-        gl.float32, [TOKENS_PER_CHUNK, BK], shared_layout
-    )
-    shared_v = gl.allocate_shared_memory(
-        gl.float32, [TOKENS_PER_CHUNK, BV], shared_layout
-    )
-    key_nodes = gl.arange(0, TOKENS_PER_CHUNK, layout=gl.SliceLayout(1, key_layout))
-    keys = gl.arange(0, BK, layout=gl.SliceLayout(0, key_layout))
-    value_nodes = gl.arange(0, TOKENS_PER_CHUNK, layout=gl.SliceLayout(1, value_layout))
-    values = i_v * BV + gl.arange(0, BV, layout=gl.SliceLayout(0, value_layout))
-    for start in range(0, steps, TOKENS_PER_CHUNK):
-        key_tokens = start + key_nodes
-        key_rows = payload + request_base + key_tokens.to(gl.int64) * payload_width
-        keys_raw = gl.load(
-            key_rows[:, None] + i_h * K + keys[None, :],
-            mask=(key_tokens < steps)[:, None] & (keys < K)[None, :],
-            other=0,
-        ).to(gl.float32)
-        keys_normalized = (
-            keys_raw / gl.sqrt(gl.sum(keys_raw * keys_raw, 1) + 1e-6)[:, None]
+        b_A = -gl.exp(raw_A)
+        # Preserve normalization order while matching shared reads to state packing.
+        key_layout: gl.constexpr = gl.BlockedLayout(
+            [1, 2 if STATE_DTYPE_CODE == 2 else 4],
+            [THREADS_V, WARP_SIZE // THREADS_V],
+            [gl.num_warps(), 1],
+            [1, 0],
         )
-        shared_k.store(keys_normalized)
-        value_tokens = start + value_nodes
-        value_rows = payload + request_base + value_tokens.to(gl.int64) * payload_width
-        values_raw = gl.load(
-            value_rows[:, None] + key_width + i_hv * V + values[None, :],
-            mask=(value_tokens < steps)[:, None] & (values < V)[None, :],
-            other=0,
-        ).to(gl.float32)
-        shared_v.store(values_raw)
-        raw_a = gl.load(
-            key_rows + key_width + value_width + i_hv, mask=key_tokens < steps, other=0
-        ).to(gl.float32)
-        raw_b = gl.load(
-            key_rows + key_width + value_width + HV + i_hv,
-            mask=key_tokens < steps,
-            other=0,
-        ).to(gl.float32)
-        x = raw_a + b_dt_bias
-        softplus = gl.where(x <= 20.0, gl.log(1.0 + gl.exp(x)), x)
-        decay = gl.exp(b_A * softplus)
-        beta = 1.0 / (1.0 + gl.exp(-raw_b))
-        gate_layout: gl.constexpr = gl.BlockedLayout(
-            [1], [WARP_SIZE], [gl.num_warps()], [0]
+        key_read_layout: gl.constexpr = gl.BlockedLayout(
+            [1, SPT_K], [THREADS_V, WARP_SIZE // THREADS_V], [gl.num_warps(), 1], [1, 0]
         )
-        decay = gl.convert_layout(decay, gate_layout)
-        beta = gl.convert_layout(beta, gate_layout)
-        gl.barrier()
-        for step in gl.static_range(0, TOKENS_PER_CHUNK):
-            if start + step < steps:
-                index = gl.full([1], step, gl.int32, layout=gate_layout)
-                b_decay = gl.sum(gl.gather(decay, index, 0), 0)
-                b_beta = gl.sum(gl.gather(beta, index, 0), 0)
-                b_k = gl.convert_layout(
-                    gl.reshape(shared_k.slice(step, 1).load(key_read_layout), [BK]),
-                    gl.SliceLayout(1, layout),
-                )
-                b_v = gl.convert_layout(
-                    gl.reshape(shared_v.slice(step, 1).load(layout), [BV]),
-                    gl.SliceLayout(0, layout),
-                )
-                next_h = b_h * b_decay
-                delta = b_v - gl.sum(next_h * b_k[:, None], 0)
-                next_h += b_k[:, None] * (delta * b_beta)[None, :]
-                b_h = next_h
-        # Finish every consumer before overwriting the next shared chunk.
-        gl.barrier()
+        value_layout: gl.constexpr = gl.BlockedLayout(
+            [1, 2], [4, WARP_SIZE // 4], [1, gl.num_warps()], [1, 0]
+        )
+        shared_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+        shared_k = gl.allocate_shared_memory(
+            gl.float32, [TOKENS_PER_CHUNK, BK], shared_layout
+        )
+        shared_v = gl.allocate_shared_memory(
+            gl.float32, [TOKENS_PER_CHUNK, BV], shared_layout
+        )
+        key_nodes = gl.arange(0, TOKENS_PER_CHUNK, layout=gl.SliceLayout(1, key_layout))
+        keys = gl.arange(0, BK, layout=gl.SliceLayout(0, key_layout))
+        value_nodes = gl.arange(
+            0, TOKENS_PER_CHUNK, layout=gl.SliceLayout(1, value_layout)
+        )
+        values = i_v * BV + gl.arange(0, BV, layout=gl.SliceLayout(0, value_layout))
+        for start in range(0, steps, TOKENS_PER_CHUNK):
+            key_tokens = start + key_nodes
+            key_rows = payload + request_base + key_tokens.to(gl.int64) * payload_width
+            keys_raw = gl.load(
+                key_rows[:, None] + i_h * K + keys[None, :],
+                mask=(key_tokens < steps)[:, None] & (keys < K)[None, :],
+                other=0,
+            ).to(gl.float32)
+            keys_normalized = (
+                keys_raw / gl.sqrt(gl.sum(keys_raw * keys_raw, 1) + 1e-6)[:, None]
+            )
+            shared_k.store(keys_normalized)
+            value_tokens = start + value_nodes
+            value_rows = (
+                payload + request_base + value_tokens.to(gl.int64) * payload_width
+            )
+            values_raw = gl.load(
+                value_rows[:, None] + key_width + i_hv * V + values[None, :],
+                mask=(value_tokens < steps)[:, None] & (values < V)[None, :],
+                other=0,
+            ).to(gl.float32)
+            shared_v.store(values_raw)
+            raw_a = gl.load(
+                key_rows + key_width + value_width + i_hv,
+                mask=key_tokens < steps,
+                other=0,
+            ).to(gl.float32)
+            raw_b = gl.load(
+                key_rows + key_width + value_width + HV + i_hv,
+                mask=key_tokens < steps,
+                other=0,
+            ).to(gl.float32)
+            x = raw_a + b_dt_bias
+            softplus = gl.where(x <= 20.0, gl.log(1.0 + gl.exp(x)), x)
+            decay = gl.exp(b_A * softplus)
+            beta = 1.0 / (1.0 + gl.exp(-raw_b))
+            gate_layout: gl.constexpr = gl.BlockedLayout(
+                [1], [WARP_SIZE], [gl.num_warps()], [0]
+            )
+            decay = gl.convert_layout(decay, gate_layout)
+            beta = gl.convert_layout(beta, gate_layout)
+            gl.barrier()
+            for step in gl.static_range(0, TOKENS_PER_CHUNK):
+                if start + step < steps:
+                    index = gl.full([1], step, gl.int32, layout=gate_layout)
+                    b_decay = gl.sum(gl.gather(decay, index, 0), 0)
+                    b_beta = gl.sum(gl.gather(beta, index, 0), 0)
+                    b_k = gl.convert_layout(
+                        gl.reshape(shared_k.slice(step, 1).load(key_read_layout), [BK]),
+                        gl.SliceLayout(1, layout),
+                    )
+                    b_v = gl.convert_layout(
+                        gl.reshape(shared_v.slice(step, 1).load(layout), [BV]),
+                        gl.SliceLayout(0, layout),
+                    )
+                    next_h = b_h * b_decay
+                    delta = b_v - gl.sum(next_h * b_k[:, None], 0)
+                    next_h += b_k[:, None] * (delta * b_beta)[None, :]
+                    b_h = next_h
+            # Finish every consumer before overwriting the next shared chunk.
+            gl.barrier()
 
-    if write_idx >= 0:
-        base = state_pool + write_idx * state_row_stride + i_hv * V * K
-        if K % PACK == 0:
-            if (base.to(gl.uint64) & (STATE_ALIGNMENT - 1)) == 0:
-                # Unsigned pointers isolate alignment hints from the fallback.
-                if STATE_DTYPE_CODE == 2:
-                    packed_ptr = base.to(gl.pointer_type(gl.uint64))
-                    packed_ptr = gl.multiple_of(packed_ptr, STATE_ALIGNMENT)
-                    packed_values = gl.convert_layout(
-                        gl.reshape(b_h, [BK // PACK, PACK, BV]), packed_3d
-                    )
-                    bits = packed_values.to(gl.uint32, bitcast=True).to(gl.uint64)
-                    raw = gl.sum(bits << pack_shift[None, :, None], 1)
-                    gl.store(
-                        packed_ptr
-                        + packed_v[None, :] * (K // PACK)
-                        + packed_k[:, None],
-                        raw,
-                        mask=packed_mask,
-                    )
-                else:
-                    aligned_ptr = base.to(gl.pointer_type(gl.uint16))
-                    if STATE_DTYPE_CODE == 0:
-                        bits = b_h.to(gl.bfloat16).to(gl.uint16, bitcast=True)
+        if write_idx >= 0:
+            base = state_pool + write_idx * state_row_stride + i_hv * V * K
+            if K % PACK == 0:
+                if (base.to(gl.uint64) & (STATE_ALIGNMENT - 1)) == 0:
+                    # Unsigned pointers isolate alignment hints from the fallback.
+                    if STATE_DTYPE_CODE == 2:
+                        packed_ptr = base.to(gl.pointer_type(gl.uint64))
+                        packed_ptr = gl.multiple_of(packed_ptr, STATE_ALIGNMENT)
+                        packed_values = gl.convert_layout(
+                            gl.reshape(b_h, [BK // PACK, PACK, BV]), packed_3d
+                        )
+                        bits = packed_values.to(gl.uint32, bitcast=True).to(gl.uint64)
+                        raw = gl.sum(bits << pack_shift[None, :, None], 1)
+                        gl.store(
+                            packed_ptr
+                            + packed_v[None, :] * (K // PACK)
+                            + packed_k[:, None],
+                            raw,
+                            mask=packed_mask,
+                        )
                     else:
-                        bits = b_h.to(gl.float16).to(gl.uint16, bitcast=True)
-                    aligned_ptr = gl.multiple_of(aligned_ptr, STATE_ALIGNMENT)
-                    gl.store(
-                        aligned_ptr + o_v[None, :] * K + o_k[:, None], bits, mask=mask_h
-                    )
+                        aligned_ptr = base.to(gl.pointer_type(gl.uint16))
+                        if STATE_DTYPE_CODE == 0:
+                            bits = b_h.to(gl.bfloat16).to(gl.uint16, bitcast=True)
+                        else:
+                            bits = b_h.to(gl.float16).to(gl.uint16, bitcast=True)
+                        aligned_ptr = gl.multiple_of(aligned_ptr, STATE_ALIGNMENT)
+                        gl.store(
+                            aligned_ptr + o_v[None, :] * K + o_k[:, None],
+                            bits,
+                            mask=mask_h,
+                        )
+                else:
+                    p_out = base + o_v[None, :] * K + o_k[:, None]
+                    gl.store(p_out, b_h.to(p_out.dtype.element_ty), mask=mask_h)
             else:
                 p_out = base + o_v[None, :] * K + o_k[:, None]
                 gl.store(p_out, b_h.to(p_out.dtype.element_ty), mask=mask_h)
-        else:
-            p_out = base + o_v[None, :] * K + o_k[:, None]
-            gl.store(p_out, b_h.to(p_out.dtype.element_ty), mask=mask_h)
 
-
-# Pipelined variant for BF16 states and payloads with 128-wide keys: one CTA per
-# (layer, request, key head) walks its value heads' V tiles through a two-stage
-# cp.async shared-memory ring, so the next tile's state streams in while the
-# current tile replays (the per-tile kernel above has nothing in flight while its
-# CTAs compute). The per-tile gate math, the chunk loop around the token steps and
-# all register layouts are the kernel above's, so results are bitwise equal:
-# the compiler pairs and contracts the fp32 step math per block, and moving the
-# step loop out of the chunk loop or normalizing keys from a vector shared-memory
-# load flips about 1e-7 of the outputs by one bf16 ulp. Needs 16-byte aligned
-# pool rows (checked by the caller from the host-side pool tables).
+    # Pipelined variant for BF16 states and payloads with 128-wide keys: one CTA per
+    # (layer, request, key head) walks its value heads' V tiles through a two-stage
+    # cp.async shared-memory ring, so the next tile's state streams in while the
+    # current tile replays (the per-tile kernel above has nothing in flight while its
+    # CTAs compute). The per-tile gate math, the chunk loop around the token steps and
+    # all register layouts are the kernel above's, so results are bitwise equal:
+    # the compiler pairs and contracts the fp32 step math per block, and moving the
+    # step loop out of the chunk loop or normalizing keys from a vector shared-memory
+    # load flips about 1e-7 of the outputs by one bf16 ulp. Needs 16-byte aligned
+    # pool rows (checked by the caller from the host-side pool tables).
 
 
 @gluon.constexpr_function
@@ -1467,7 +1503,7 @@ def _prefetch_l1_asm(outputs, inputs):
     return "\n".join(f"prefetch.global.L1 [{p}];" for p in ptrs)
 
 
-@gluon.jit(do_not_specialize=["B", "T", "PAYLOAD_LAYER_STRIDE"])
+@gluon.jit(do_not_specialize=["B", "T", "PAYLOAD_LAYER_STRIDE", "L"])
 def _gdn_replay_commit_ring_kernel(
     payload,
     parameters,
@@ -1476,9 +1512,11 @@ def _gdn_replay_commit_ring_kernel(
     read_indices,
     write_indices,
     accepted_length,
+    selected_requests,
     B,
     T,
     PAYLOAD_LAYER_STRIDE,
+    L,
     H: gl.constexpr,
     HV: gl.constexpr,
     K: gl.constexpr,
@@ -1499,203 +1537,224 @@ def _gdn_replay_commit_ring_kernel(
     GROUP: gl.constexpr = HV // H
     NV: gl.constexpr = V // BV
     TILES: gl.constexpr = GROUP * NV
-    i_n = gl.program_id(0) // H
-    i_h = gl.program_id(0) % H
-    i_l = gl.program_id(1)
-    first_hv = i_h * GROUP
-
-    # Register layout of the [BK, BV] state tile: the reference kernel's.
-    layout: gl.constexpr = gl.BlockedLayout(
-        [SPT_K, 1], [WARP_SIZE // THREADS_V, THREADS_V], [1, gl.num_warps()], [0, 1]
-    )
-    o_k = gl.arange(0, BK, layout=gl.SliceLayout(1, layout))
-    o_v = gl.arange(0, BV, layout=gl.SliceLayout(0, layout))
-    mask_h = (o_k < K)[:, None] & (o_v < BV)[None, :]
-
-    key_width: gl.constexpr = H * K
-    value_width: gl.constexpr = HV * V
-    payload_width: gl.constexpr = key_width + value_width + 2 * HV
-    request_base = (
-        i_l.to(gl.int64) * PAYLOAD_LAYER_STRIDE + i_n.to(gl.int64) * T * payload_width
-    )
-    layer_request = i_l * B + i_n
-    read_idx = gl.load(read_indices + layer_request).to(gl.int64)
-    write_idx = gl.load(write_indices + layer_request).to(gl.int64)
-    steps = gl.load(accepted_length + i_n).to(gl.int32)
-    steps = gl.minimum(gl.maximum(steps, 0), T)
-    state_pool = gl.load(state_addresses + i_l).to(gl.pointer_type(gl.bfloat16))
-    state_row_stride = gl.load(state_row_strides + i_l).to(gl.int64)
-    has_state = read_idx >= 0
-    read_base = gl.multiple_of(
-        state_pool + gl.maximum(read_idx, 0) * state_row_stride, 16
-    )
-
-    # cp.async: one 16-byte chunk (8 bf16 along K) per thread access.
-    copy_layout: gl.constexpr = gl.BlockedLayout(
-        [1, 8], [WARP_SIZE // (BK // 8), BK // 8], [gl.num_warps(), 1], [1, 0]
-    )
-    vcopy_layout: gl.constexpr = gl.BlockedLayout(
-        [1, 8], [WARP_SIZE // (BV // 8), BV // 8], [gl.num_warps(), 1], [1, 0]
-    )
-    plain: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
-    ring = gl.allocate_shared_memory(gl.bfloat16, [STAGES, BV, BK], plain)
-    values_smem = gl.allocate_shared_memory(
-        gl.bfloat16, [TILES_ALLOC, TOKENS_PER_CHUNK, BV], plain
-    )
-    c_v = gl.arange(0, BV, layout=gl.SliceLayout(1, copy_layout))
-    c_k = gl.arange(0, BK, layout=gl.SliceLayout(0, copy_layout))
-    # A missing committed state (read index < 0) zero-fills the tile.
-    state_mask = (c_v < BV)[:, None] & (c_k < BK)[None, :] & has_state
-    tile_offsets = c_v[:, None] * K + c_k[None, :]
-
-    # Value rows of every tile, joined to the first state stage's copy group.
-    p_rows = gl.multiple_of(payload + request_base, 16)
-    t_v = gl.arange(0, TOKENS_PER_CHUNK, layout=gl.SliceLayout(1, vcopy_layout))
-    c_vv = gl.arange(0, BV, layout=gl.SliceLayout(0, vcopy_layout))
-    for jt in gl.static_range(TILES):
-        src = (
-            p_rows
-            + t_v.to(gl.int64)[:, None] * payload_width
-            + key_width
-            + (first_hv + jt // NV) * V
-            + (jt % NV) * BV
-            + c_vv[None, :]
+    work_begin, work_end, work_stride = 0, 1, 1
+    if selected_requests is not None:
+        work_begin = gl.program_id(0).to(gl.int64)
+        work_end = gl.load(selected_requests + B).to(gl.int64) * L * H
+        work_stride = gl.num_programs(0)
+    for item in range(work_begin, work_end, work_stride):
+        work = gl.program_id(0)
+        if selected_requests is not None:
+            work = item
+        i_n = work // H
+        i_l = gl.program_id(1)
+        if selected_requests is not None:
+            i_l = i_n % L
+            i_n = gl.load(selected_requests + i_n // L).to(gl.int64)
+        i_h = (work % H).to(gl.int32)
+        first_hv = i_h * GROUP
+        # Register layout of the [BK, BV] state tile: the reference kernel's.
+        layout: gl.constexpr = gl.BlockedLayout(
+            [SPT_K, 1], [WARP_SIZE // THREADS_V, THREADS_V], [1, gl.num_warps()], [0, 1]
         )
-        gl.nvidia.ampere.async_copy.async_load(
-            values_smem.index(jt),
-            src,
-            mask=(t_v < steps)[:, None] & (c_vv < BV)[None, :],
+        o_k = gl.arange(0, BK, layout=gl.SliceLayout(1, layout))
+        o_v = gl.arange(0, BV, layout=gl.SliceLayout(0, layout))
+        mask_h = (o_k < K)[:, None] & (o_v < BV)[None, :]
+
+        key_width: gl.constexpr = H * K
+        value_width: gl.constexpr = HV * V
+        payload_width: gl.constexpr = key_width + value_width + 2 * HV
+        request_base = (
+            i_l.to(gl.int64) * PAYLOAD_LAYER_STRIDE
+            + i_n.to(gl.int64) * T * payload_width
         )
-    for s in gl.static_range(STAGES - 1):
-        if s < TILES:
-            gl.nvidia.ampere.async_copy.async_load(
-                ring.index(s),
-                read_base
-                + (first_hv + s // NV) * (V * K)
-                + (s % NV) * (BV * K)
-                + tile_offsets,
-                mask=state_mask,
+        layer_request = i_l.to(gl.int64) * B + i_n
+        read_idx = gl.load(read_indices + layer_request).to(gl.int64)
+        write_idx = gl.load(write_indices + layer_request).to(gl.int64)
+        steps = gl.load(accepted_length + i_n).to(gl.int32)
+        steps = gl.minimum(gl.maximum(steps, 0), T)
+        state_pool = gl.load(state_addresses + i_l).to(gl.pointer_type(gl.bfloat16))
+        state_row_stride = gl.load(state_row_strides + i_l).to(gl.int64)
+        has_state = read_idx >= 0
+        read_base = gl.multiple_of(
+            state_pool + gl.maximum(read_idx, 0) * state_row_stride, 16
+        )
+
+        # cp.async: one 16-byte chunk (8 bf16 along K) per thread access.
+        copy_layout: gl.constexpr = gl.BlockedLayout(
+            [1, 8], [WARP_SIZE // (BK // 8), BK // 8], [gl.num_warps(), 1], [1, 0]
+        )
+        vcopy_layout: gl.constexpr = gl.BlockedLayout(
+            [1, 8], [WARP_SIZE // (BV // 8), BV // 8], [gl.num_warps(), 1], [1, 0]
+        )
+        plain: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+        ring = gl.allocate_shared_memory(gl.bfloat16, [STAGES, BV, BK], plain)
+        values_smem = gl.allocate_shared_memory(
+            gl.bfloat16, [TILES_ALLOC, TOKENS_PER_CHUNK, BV], plain
+        )
+        c_v = gl.arange(0, BV, layout=gl.SliceLayout(1, copy_layout))
+        c_k = gl.arange(0, BK, layout=gl.SliceLayout(0, copy_layout))
+        # A missing committed state (read index < 0) zero-fills the tile.
+        state_mask = (c_v < BV)[:, None] & (c_k < BK)[None, :] & has_state
+        tile_offsets = c_v[:, None] * K + c_k[None, :]
+
+        # Value rows of every tile, joined to the first state stage's copy group.
+        p_rows = gl.multiple_of(payload + request_base, 16)
+        t_v = gl.arange(0, TOKENS_PER_CHUNK, layout=gl.SliceLayout(1, vcopy_layout))
+        c_vv = gl.arange(0, BV, layout=gl.SliceLayout(0, vcopy_layout))
+        for jt in gl.static_range(TILES):
+            src = (
+                p_rows
+                + t_v.to(gl.int64)[:, None] * payload_width
+                + key_width
+                + (first_hv + jt // NV) * V
+                + (jt % NV) * BV
+                + c_vv[None, :]
             )
-        gl.nvidia.ampere.async_copy.commit_group()
-
-    # Warm L1 with the gate rows the per-tile loads below read.
-    pf_layout: gl.constexpr = gl.BlockedLayout([1], [WARP_SIZE], [gl.num_warps()], [0])
-    lane = gl.arange(0, 64, layout=pf_layout)
-    tok = gl.minimum(lane // 16, T - 1)
-    li = lane % 16
-    line_off = gl.where(
-        li < 2,
-        i_h * K + li * 64,
-        gl.where(
-            li < 8,
-            key_width + first_hv * V + (li - 2) * 64,
-            gl.where(li < 11, key_width + value_width + (li - 8) * 64, 0),
-        ),
-    )
-    pf_ptrs = payload + request_base + tok.to(gl.int64) * payload_width + line_off
-    gl.inline_asm(_prefetch_l1_asm, ("l",), [pf_ptrs], (), is_pure=False)
-
-    # The key head, normalized once with the reference load and arithmetic.
-    key_layout: gl.constexpr = gl.BlockedLayout(
-        [1, 4], [THREADS_V, WARP_SIZE // THREADS_V], [gl.num_warps(), 1], [1, 0]
-    )
-    key_read_layout: gl.constexpr = gl.BlockedLayout(
-        [1, SPT_K], [THREADS_V, WARP_SIZE // THREADS_V], [gl.num_warps(), 1], [1, 0]
-    )
-    shared_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
-    shared_k = gl.allocate_shared_memory(
-        gl.float32, [TOKENS_PER_CHUNK, BK], shared_layout
-    )
-    key_nodes = gl.arange(0, TOKENS_PER_CHUNK, layout=gl.SliceLayout(1, key_layout))
-    keys = gl.arange(0, BK, layout=gl.SliceLayout(0, key_layout))
-    key_tokens = key_nodes
-    key_rows = payload + request_base + key_tokens.to(gl.int64) * payload_width
-    keys_raw = gl.load(
-        key_rows[:, None] + i_h * K + keys[None, :],
-        mask=(key_tokens < steps)[:, None] & (keys < K)[None, :],
-        other=0,
-    ).to(gl.float32)
-    keys_normalized = keys_raw / gl.sqrt(gl.sum(keys_raw * keys_raw, 1) + 1e-6)[:, None]
-    shared_k.store(keys_normalized)
-    token_valid = key_tokens < steps
-    gate_layout: gl.constexpr = gl.BlockedLayout(
-        [1], [WARP_SIZE], [gl.num_warps()], [0]
-    )
-    write_base = state_pool + write_idx * state_row_stride
-
-    for j in range(TILES):
-        gl.nvidia.ampere.async_copy.wait_group(STAGES - 2)
-        # Tile j (and, the first time, the value rows and normalized keys) are
-        # visible to every thread, and every thread finished reading the stage
-        # the next copy reuses.
-        gl.barrier()
-        jn = j + STAGES - 1
-        if jn < TILES:
             gl.nvidia.ampere.async_copy.async_load(
-                ring.index(jn % STAGES),
-                read_base
-                + (first_hv + jn // NV) * (V * K)
-                + (jn % NV) * (BV * K)
-                + tile_offsets,
-                mask=state_mask,
+                values_smem.index(jt),
+                src,
+                mask=(t_v < steps)[:, None] & (c_vv < BV)[None, :],
             )
-        gl.nvidia.ampere.async_copy.commit_group()
+        for s in gl.static_range(STAGES - 1):
+            if s < TILES:
+                gl.nvidia.ampere.async_copy.async_load(
+                    ring.index(s),
+                    read_base
+                    + (first_hv + s // NV) * (V * K)
+                    + (s % NV) * (BV * K)
+                    + tile_offsets,
+                    mask=state_mask,
+                )
+            gl.nvidia.ampere.async_copy.commit_group()
 
-        i_hv = first_hv + j // NV
-        i_v = j % NV
-        b_h = ring.index(j % STAGES).permute([1, 0]).load(layout).to(gl.float32)
-        parameter_base = i_l * 2 * HV + i_hv
-        raw_A = gl.load(parameters + parameter_base).to(gl.float32)
-        b_dt_bias = gl.load(parameters + parameter_base + HV).to(gl.float32)
-        b_A = -gl.exp(raw_A)
-        raw_a = gl.load(
-            key_rows + key_width + value_width + i_hv, mask=token_valid, other=0
+        # Warm L1 with the gate rows the per-tile loads below read.
+        pf_layout: gl.constexpr = gl.BlockedLayout(
+            [1], [WARP_SIZE], [gl.num_warps()], [0]
+        )
+        lane = gl.arange(0, 64, layout=pf_layout)
+        tok = gl.minimum(lane // 16, T - 1)
+        li = lane % 16
+        line_off = gl.where(
+            li < 2,
+            i_h * K + li * 64,
+            gl.where(
+                li < 8,
+                key_width + first_hv * V + (li - 2) * 64,
+                gl.where(li < 11, key_width + value_width + (li - 8) * 64, 0),
+            ),
+        )
+        pf_ptrs = payload + request_base + tok.to(gl.int64) * payload_width + line_off
+        gl.inline_asm(_prefetch_l1_asm, ("l",), [pf_ptrs], (), is_pure=False)
+
+        # The key head, normalized once with the reference load and arithmetic.
+        key_layout: gl.constexpr = gl.BlockedLayout(
+            [1, 4], [THREADS_V, WARP_SIZE // THREADS_V], [gl.num_warps(), 1], [1, 0]
+        )
+        key_read_layout: gl.constexpr = gl.BlockedLayout(
+            [1, SPT_K], [THREADS_V, WARP_SIZE // THREADS_V], [gl.num_warps(), 1], [1, 0]
+        )
+        shared_layout: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+        shared_k = gl.allocate_shared_memory(
+            gl.float32, [TOKENS_PER_CHUNK, BK], shared_layout
+        )
+        key_nodes = gl.arange(0, TOKENS_PER_CHUNK, layout=gl.SliceLayout(1, key_layout))
+        keys = gl.arange(0, BK, layout=gl.SliceLayout(0, key_layout))
+        key_tokens = key_nodes
+        key_rows = payload + request_base + key_tokens.to(gl.int64) * payload_width
+        keys_raw = gl.load(
+            key_rows[:, None] + i_h * K + keys[None, :],
+            mask=(key_tokens < steps)[:, None] & (keys < K)[None, :],
+            other=0,
         ).to(gl.float32)
-        raw_b = gl.load(
-            key_rows + key_width + value_width + HV + i_hv, mask=token_valid, other=0
-        ).to(gl.float32)
-        x = raw_a + b_dt_bias
-        softplus = gl.where(x <= 20.0, gl.log(1.0 + gl.exp(x)), x)
-        decay = gl.exp(b_A * softplus)
-        beta = 1.0 / (1.0 + gl.exp(-raw_b))
-        decay = gl.convert_layout(decay, gate_layout)
-        beta = gl.convert_layout(beta, gate_layout)
-        # The reference's chunk loop (one pass for T <= TOKENS_PER_CHUNK) is kept:
-        # without it the compiler contracts the step math differently.
-        for start in range(0, steps, TOKENS_PER_CHUNK):
-            for step in gl.static_range(0, TOKENS_PER_CHUNK):
-                if start + step < steps:
-                    index = gl.full([1], step, gl.int32, layout=gate_layout)
-                    b_decay = gl.sum(gl.gather(decay, index, 0), 0)
-                    b_beta = gl.sum(gl.gather(beta, index, 0), 0)
-                    b_k = gl.convert_layout(
-                        gl.reshape(shared_k.slice(step, 1).load(key_read_layout), [BK]),
-                        gl.SliceLayout(1, layout),
-                    )
-                    b_v = gl.convert_layout(
-                        gl.reshape(
-                            values_smem.index(j)
-                            .slice(step, 1)
-                            .load(layout)
-                            .to(gl.float32),
-                            [BV],
-                        ),
-                        gl.SliceLayout(0, layout),
-                    )
-                    next_h = b_h * b_decay
-                    delta = b_v - gl.sum(next_h * b_k[:, None], 0)
-                    next_h += b_k[:, None] * (delta * b_beta)[None, :]
-                    b_h = next_h
+        keys_normalized = (
+            keys_raw / gl.sqrt(gl.sum(keys_raw * keys_raw, 1) + 1e-6)[:, None]
+        )
+        shared_k.store(keys_normalized)
+        token_valid = key_tokens < steps
+        gate_layout: gl.constexpr = gl.BlockedLayout(
+            [1], [WARP_SIZE], [gl.num_warps()], [0]
+        )
+        write_base = state_pool + write_idx * state_row_stride
+
+        for j in range(TILES):
+            gl.nvidia.ampere.async_copy.wait_group(STAGES - 2)
+            # Tile j (and, the first time, the value rows and normalized keys) are
+            # visible to every thread, and every thread finished reading the stage
+            # the next copy reuses.
             gl.barrier()
+            jn = j + STAGES - 1
+            if jn < TILES:
+                gl.nvidia.ampere.async_copy.async_load(
+                    ring.index(jn % STAGES),
+                    read_base
+                    + (first_hv + jn // NV) * (V * K)
+                    + (jn % NV) * (BV * K)
+                    + tile_offsets,
+                    mask=state_mask,
+                )
+            gl.nvidia.ampere.async_copy.commit_group()
 
-        if write_idx >= 0:
-            out = gl.multiple_of(write_base + i_hv * (V * K) + i_v * (BV * K), 16)
-            gl.store(
-                out + o_v[None, :] * K + o_k[:, None],
-                b_h.to(gl.bfloat16),
-                mask=mask_h,
-            )
-    gl.nvidia.ampere.async_copy.wait_group(0)
+            i_hv = first_hv + j // NV
+            i_v = j % NV
+            b_h = ring.index(j % STAGES).permute([1, 0]).load(layout).to(gl.float32)
+            parameter_base = i_l * 2 * HV + i_hv
+            raw_A = gl.load(parameters + parameter_base).to(gl.float32)
+            b_dt_bias = gl.load(parameters + parameter_base + HV).to(gl.float32)
+            b_A = -gl.exp(raw_A)
+            raw_a = gl.load(
+                key_rows + key_width + value_width + i_hv, mask=token_valid, other=0
+            ).to(gl.float32)
+            raw_b = gl.load(
+                key_rows + key_width + value_width + HV + i_hv,
+                mask=token_valid,
+                other=0,
+            ).to(gl.float32)
+            x = raw_a + b_dt_bias
+            softplus = gl.where(x <= 20.0, gl.log(1.0 + gl.exp(x)), x)
+            decay = gl.exp(b_A * softplus)
+            beta = 1.0 / (1.0 + gl.exp(-raw_b))
+            decay = gl.convert_layout(decay, gate_layout)
+            beta = gl.convert_layout(beta, gate_layout)
+            # The reference's chunk loop (one pass for T <= TOKENS_PER_CHUNK) is kept:
+            # without it the compiler contracts the step math differently.
+            for start in range(0, steps, TOKENS_PER_CHUNK):
+                for step in gl.static_range(0, TOKENS_PER_CHUNK):
+                    if start + step < steps:
+                        index = gl.full([1], step, gl.int32, layout=gate_layout)
+                        b_decay = gl.sum(gl.gather(decay, index, 0), 0)
+                        b_beta = gl.sum(gl.gather(beta, index, 0), 0)
+                        b_k = gl.convert_layout(
+                            gl.reshape(
+                                shared_k.slice(step, 1).load(key_read_layout), [BK]
+                            ),
+                            gl.SliceLayout(1, layout),
+                        )
+                        b_v = gl.convert_layout(
+                            gl.reshape(
+                                values_smem.index(j)
+                                .slice(step, 1)
+                                .load(layout)
+                                .to(gl.float32),
+                                [BV],
+                            ),
+                            gl.SliceLayout(0, layout),
+                        )
+                        next_h = b_h * b_decay
+                        delta = b_v - gl.sum(next_h * b_k[:, None], 0)
+                        next_h += b_k[:, None] * (delta * b_beta)[None, :]
+                        b_h = next_h
+                gl.barrier()
+
+            if write_idx >= 0:
+                out = gl.multiple_of(write_base + i_hv * (V * K) + i_v * (BV * K), 16)
+                gl.store(
+                    out + o_v[None, :] * K + o_k[:, None],
+                    b_h.to(gl.bfloat16),
+                    mask=mask_h,
+                )
+        gl.nvidia.ampere.async_copy.wait_group(0)
+        gl.barrier()
 
 
 def _ring_replay_supported(
@@ -1747,6 +1806,8 @@ def triton_gdn_replay_commit(
     read_indices: torch.Tensor,
     write_indices: torch.Tensor,
     accepted_length: torch.Tensor,
+    request_mask: torch.Tensor | None,
+    request_workspace: torch.Tensor | None,
     draft_token_num: int,
     num_k_heads: int,
     num_v_heads: int,
@@ -1769,6 +1830,8 @@ def triton_gdn_replay_commit(
         write_indices: Accepted-state destination pages shaped ``[L, B]``.
         accepted_length: Number of verified tokens to replay per request,
             shaped ``[B]`` and bounded by ``T``.
+        request_mask: Device bool [B] selection, or None for every request.
+        request_workspace: Optional device int32 [B+1] compaction scratch.
         draft_token_num: Verify-window length ``T``.
         num_k_heads: Key-head count ``H``.
         num_v_heads: Value/state-head count ``HV``.
@@ -1782,9 +1845,23 @@ def triton_gdn_replay_commit(
 
     Returns:
         ``None``. Every layer's accepted state is written through its pool
-        address in one kernel launch.
+        address in one commit launch (plus mask compaction when selected).
     """
     enable_pdl = pdl_enabled()
+    selected_requests = None
+    if request_mask is not None:
+        selected_requests = request_workspace
+        if selected_requests is None:
+            selected_requests = torch.empty(
+                accepted_length.numel() + 1, device=payload.device, dtype=torch.int32
+            )
+        _gdn_selected_requests[(1,)](
+            request_mask,
+            selected_requests,
+            accepted_length.numel(),
+            BLOCK=128,
+            num_warps=4,
+        )
     if rows_aligned and _ring_replay_supported(
         payload,
         draft_token_num,
@@ -1796,7 +1873,16 @@ def triton_gdn_replay_commit(
     ):
         group_tiles = (num_v_heads // num_k_heads) * (head_v_dim // 64)
         _gdn_replay_commit_ring_kernel[
-            (accepted_length.numel() * num_k_heads, payload.shape[0])
+            (
+                (
+                    accepted_length.numel() * num_k_heads
+                    if selected_requests is None
+                    else min(
+                        1024, accepted_length.numel() * num_k_heads * payload.shape[0]
+                    )
+                ),
+                payload.shape[0] if request_mask is None else 1,
+            )
         ](
             payload,
             parameters,
@@ -1805,9 +1891,11 @@ def triton_gdn_replay_commit(
             read_indices,
             write_indices,
             accepted_length,
+            selected_requests,
             accepted_length.numel(),
             draft_token_num,
             payload.stride(0),
+            payload.shape[0],
             H=num_k_heads,
             HV=num_v_heads,
             K=head_k_dim,
@@ -1847,7 +1935,16 @@ def triton_gdn_replay_commit(
     NK, NV = triton.cdiv(head_k_dim, BK), triton.cdiv(head_v_dim, BV)
     if NK != 1:
         raise ValueError("GDN replay does not support head dimensions above one tile")
-    _gdn_replay_commit_kernel[(batch_size * num_v_heads * NV, num_layers)](
+    _gdn_replay_commit_kernel[
+        (
+            (
+                batch_size * num_v_heads * NV
+                if selected_requests is None
+                else min(1024, batch_size * num_v_heads * NV * num_layers)
+            ),
+            num_layers if selected_requests is None else 1,
+        )
+    ](
         payload=payload,
         parameters=parameters,
         state_addresses=state_addresses,
@@ -1855,9 +1952,11 @@ def triton_gdn_replay_commit(
         read_indices=read_indices,
         write_indices=write_indices,
         accepted_length=accepted_length,
+        selected_requests=selected_requests,
         B=batch_size,
         T=draft_token_num,
         PAYLOAD_LAYER_STRIDE=payload.stride(0),
+        L=num_layers,
         H=num_k_heads,
         HV=num_v_heads,
         K=head_k_dim,
@@ -1878,4 +1977,83 @@ def triton_gdn_replay_commit(
         ),
         **({"launch_pdl": True} if enable_pdl else {}),
         **({"maxnreg": 128, "sched4reg": True} if wide_state else {}),
+    )
+
+
+@register_kernel(
+    "attention",
+    "gdn_pending_metadata",
+    name="triton_gdn_pending_metadata",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=format_signatures(("q", "k", "v"), "dense", {torch.bfloat16}),
+    priority=Priority.PORTABLE,
+)
+def triton_gdn_pending_metadata(
+    *,
+    operation,
+    buffers,
+    input_slots,
+    input_frontier,
+    input_stopped,
+    input_accepted,
+    input_reads,
+    input_writes,
+    batch,
+    requested,
+):
+    """Refresh/complete GDN ownership using stable buffers; no state data is read."""
+    from tokenspeed_kernel.ops.attention.gdn._triton.pending import pending_metadata
+
+    capacity = buffers["slots"].numel()
+    layers = buffers["reads"].shape[0]
+    slot_count = buffers["records"].shape[0]
+    operations = {
+        "begin": 0,
+        "snapshot": 1,
+        "dropouts": 2,
+        "retire": 3,
+        "accept_facts": 4,
+        "accept": 5,
+        "materialize": 6,
+        "status": 7,
+    }
+    op = operations[operation]
+    size = slot_count if op == 0 else 2 * capacity if op in (2, 3, 6) else capacity
+    grid = (size if op in (1, 5) else triton.cdiv(size, 128),)
+    pending_metadata[grid](
+        buffers["records"],
+        buffers["row_slots"],
+        buffers["generations"],
+        buffers["steps"],
+        buffers["pages"],
+        buffers["valid"],
+        buffers["bank"],
+        buffers["rows"],
+        buffers["slots"],
+        buffers["reads"],
+        buffers["writes"],
+        buffers["immediate"],
+        buffers["current_steps"],
+        buffers["current_stopped"],
+        buffers["current_frontier"],
+        buffers["consumed"],
+        buffers["flush"],
+        buffers["group_indices"],
+        buffers["status"],
+        input_slots,
+        input_frontier,
+        input_stopped,
+        input_accepted,
+        input_reads,
+        input_writes,
+        capacity,
+        batch,
+        slot_count,
+        requested,
+        L=layers,
+        LB=triton.next_power_of_2(layers),
+        OP=op,
+        BLOCK=128,
+        num_warps=4,
     )

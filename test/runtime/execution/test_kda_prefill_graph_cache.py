@@ -1210,7 +1210,11 @@ def kimi_host_cache():
     model_executor._cache_runtime_contract = pool.arena.runtime_contract
     model_executor._cache_kvp_rank = 0
     model_executor.drafter = None
-    handle = DeviceHandle(model_executor, host_cache_executor=executor)
+    handle = DeviceHandle(
+        model_executor,
+        host_cache_executor=executor,
+        recurrent_state_materialization=False,
+    )
     handle.bind_forward_thread()
 
     leaf = object.__new__(Leaf)

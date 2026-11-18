@@ -279,3 +279,35 @@ request, and key head streams its value heads' state tiles through a
 two-stage cp.async shared-memory ring, loading the next tile while the
 current one replays. It keeps the per-tile arithmetic, so results match the
 per-tile kernel bitwise.
+
+## Deferred accepted-prefix replay
+
+On supported NVIDIA BF16 K128/V128 four-token chains, the next verify
+can replay the previous accepted prefix while it reads the recurrent
+state. The kernel writes the accepted state as BF16 and uses its FP32
+value for the current outputs. This can differ from rounding the state
+before a separate WY call.
+
+Pass `pending_replay` explicitly to `gdn_decode_mtp`. The descriptor
+references two batch payload banks, their accepted counts and page
+indices, and the previous row for each live request. Pass `None` to
+read committed state. The selected kernel must support the descriptor.
+For rows that leave the batch, pass the device request mask to
+`gdn_replay_commit`. Masked replay compacts selected rows before
+reading their state.
+
+The banked WY kernel uses V32 tiles and two state stages. It splits the
+value tiles across CTAs for small batches and streams the tiles within
+a CTA for larger batches. Both variants warm at startup. Batch sizes,
+page strides, accepted lengths and bank indices are runtime values.
+
+`benchmarks/nvidia/bench_gdn_deferred.py` measures a continuous sequence
+at the layer count and dimensions read from a checkpoint config. It
+includes pending metadata and conv commit. The serving benchmark
+`benchmarks/nvidia/bench_gdn_deferred_serving.py` measures native
+streaming requests after running requests, queued requests and active
+KV pages from warmup drain. Pass the engine's metrics endpoint through
+`--metrics-url` and use identical prefill capture settings for both runs.
+
+See the [runtime contract](../../../../../../docs/design/unified_path.md#deferred-gdn-accepted-state)
+for state ownership and the boundaries that require materialization.

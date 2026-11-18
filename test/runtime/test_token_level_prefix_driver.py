@@ -87,6 +87,7 @@ def _scheduler(*, with_state: bool = False) -> ts.Scheduler:
             prefill_decode_min_interval=0,
             storage_config=None,
             cache_groups=groups,
+            defer_recurrent_state=False,
         )
     )
 

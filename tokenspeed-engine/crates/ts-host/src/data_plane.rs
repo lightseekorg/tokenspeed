@@ -485,6 +485,7 @@ impl DataPlane for PythonDataPlane {
                     "LoadBackDoneEvent" => CacheEventKind::LoadBackDone,
                     "SnapshotDoneEvent" => CacheEventKind::SnapshotDone,
                     "RestoreDoneEvent" => CacheEventKind::RestoreDone,
+                    "StateMaterializedEvent" => CacheEventKind::StateMaterialized,
                     _ => return Err(self.fail(format!("unknown cache event {kind}"))),
                 };
                 Ok(CacheEvent { kind, op_id })
@@ -992,6 +993,14 @@ type Completed = (
 
 /// A launched forward's results, once they landed.
 fn complete(plane: &Bound<'_, PyAny>, launched: &Py<PyAny>) -> PyResult<ForwardResult> {
+    let result = plane.call_method1("complete", (launched,))?;
+    let row = result.cast::<PyTuple>()?;
+    // A state owner appends readiness to the usual result columns.
+    let (columns, recurrent_state_pending): (Completed, Option<Vec<i32>>) = if row.len() == 10 {
+        (row.get_slice(0, 9).extract()?, row.get_item(9)?.extract()?)
+    } else {
+        (row.extract()?, None)
+    };
     let (
         output_tokens,
         output_lengths,
@@ -1002,7 +1011,7 @@ fn complete(plane: &Bound<'_, PyAny>, launched: &Py<PyAny>) -> PyResult<ForwardR
         grammar_terminated_at,
         logprobs,
         output_token_cumulative_probs,
-    ): Completed = plane.call_method1("complete", (launched,))?.extract()?;
+    ) = columns;
     let (input_token_logprobs, input_top_logprobs, output_top_logprobs) =
         logprobs.unwrap_or_default();
     let py = plane.py();
@@ -1016,6 +1025,7 @@ fn complete(plane: &Bound<'_, PyAny>, launched: &Py<PyAny>) -> PyResult<ForwardR
         output_logprobs: output_logprobs.map(floats).transpose()?,
         output_token_cumulative_probs: output_token_cumulative_probs.map(floats).transpose()?,
         nan_flags,
+        recurrent_state_pending,
         next_input_ids,
         serving_compiles,
         grammar_terminated_at,

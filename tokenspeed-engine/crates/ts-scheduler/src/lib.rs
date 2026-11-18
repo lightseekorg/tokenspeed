@@ -91,6 +91,8 @@ mod ffi {
         /// PD: a failed or cancelled transfer stopped on every rank; the
         /// request's pages may return (`pd::TransferStoppedEvent`).
         PdTransferStopped,
+        /// Normal completion observed committed recurrent state.
+        RecurrentStateReady,
     }
 
     /// A forward event fed back to the scheduler. Fields other kinds do not
@@ -191,6 +193,8 @@ mod ffi {
         SnapshotStore,
         /// A retracted request's restore (`SnapshotRestoreBatch`).
         SnapshotRestore,
+        /// Accepted recurrent state must land before its pages are consumed.
+        StateMaterialize,
     }
 
     /// The kind of a plan's storage operation.
@@ -251,6 +255,8 @@ mod ffi {
         SnapshotDone,
         /// A restore finished (`cache::RestoreDone`).
         RestoreDone,
+        /// Deferred recurrent state is materialized.
+        StateMaterialized,
     }
 
     /// A cache op's acknowledgment, fed back to the scheduler.

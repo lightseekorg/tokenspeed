@@ -43,11 +43,16 @@ struct SnapshotDone {
 
 // A SnapshotRestoreOperation completed every H2D row and the slot-state
 // import: the restored request is schedulable again.
+struct StateMaterialized {
+    std::uint32_t op_id{};
+};
+
 struct RestoreDone {
     std::uint32_t op_id{};
 };
 
 };  // namespace cache
 
-using CacheEvent = std::variant<cache::WriteBackDone, cache::LoadBackDone, cache::SnapshotDone, cache::RestoreDone>;
+using CacheEvent = std::variant<cache::WriteBackDone, cache::LoadBackDone, cache::SnapshotDone, cache::RestoreDone,
+                                cache::StateMaterialized>;
 }  // namespace tokenspeed

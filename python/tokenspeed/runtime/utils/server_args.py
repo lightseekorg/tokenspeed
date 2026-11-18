@@ -766,6 +766,7 @@ class ServerArgs:
     # [SPEC_REJECT_DRAFT_PROB_THRESHOLD_MIN, SPEC_REJECT_DRAFT_PROB_THRESHOLD_MAX].
     spec_reject_draft_prob_threshold: float = 2.0
     enable_replay_ssm: bool = True
+    enable_deferred_gdn_state: bool = False
     eagle3_layers_to_capture: str | None = None
     # EAGLE-Harness dynamic draft trees for EAGLE4 (see the flags' help).
     speculative_exec_mode: int = -1
@@ -4664,6 +4665,12 @@ class ServerArgs:
             "above this value mark a request with no proposal yet (fresh "
             "admission, PD landing) and always reject. Must lie within "
             "[1.0, 2**20].",
+        )
+        parser.add_argument(
+            "--enable-deferred-gdn-state",
+            action="store_true",
+            default=ServerArgs.enable_deferred_gdn_state,
+            help="Defer accepted GDN recurrent replay to the next layer's WY (BF16 T4 chains).",
         )
         parser.add_argument(
             "--disable-replay-ssm",
