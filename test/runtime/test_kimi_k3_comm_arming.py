@@ -81,6 +81,11 @@ def _capture_iris_preparation(monkeypatch):
                 output=torch.empty((kwargs["sharded_max_rows"], 7168), device="meta")
             ),
             pull_exchange=None,
+            word_max=(
+                SimpleNamespace(max_rows=kwargs["word_max_rows"])
+                if kwargs["word_max_rows"]
+                else None
+            ),
         )
 
     prepare = Mock(side_effect=allocate)
@@ -176,12 +181,17 @@ def test_iris_preparation_caps_attnres_for_equal_tp8_groups(
         lambda: SimpleNamespace(is_cdna4=True),
     )
 
+    from tokenspeed_kernel.ops.communication.iris import (
+        iris_lamport_word_max_supported,
+    )
+
     assert kimi_k3.prepare_k3_all_reduce_buffers(
         mapping=mapping,
         hidden_size=7168,
         routed_hidden_size=3584,
         max_num_tokens=max_rows,
         states={},
+        word_max_rows=1024,
     )
     prepare.assert_called_once_with(
         group=group,
@@ -196,6 +206,7 @@ def test_iris_preparation_caps_attnres_for_equal_tp8_groups(
         device=torch.device("cuda:0"),
         rank_in_group=0,
         pull_exchange_max_bytes=0,
+        word_max_rows=1024 if iris_lamport_word_max_supported(8) else 0,
     )
 
 
@@ -238,6 +249,7 @@ def test_iris_preparation_handles_distinct_groups(monkeypatch):
             device=torch.device("cuda:0"),
             rank_in_group=0,
             pull_exchange_max_bytes=0,
+            word_max_rows=0,
         ),
         call(
             group=moe_group,
@@ -252,6 +264,7 @@ def test_iris_preparation_handles_distinct_groups(monkeypatch):
             device=torch.device("cuda:0"),
             rank_in_group=0,
             pull_exchange_max_bytes=0,
+            word_max_rows=0,
         ),
     ]
 
@@ -294,6 +307,7 @@ def test_iris_preparation_handles_moe_only_group(monkeypatch):
         device=torch.device("cuda:0"),
         rank_in_group=0,
         pull_exchange_max_bytes=0,
+        word_max_rows=0,
     )
 
 
@@ -334,6 +348,7 @@ def test_iris_preparation_keeps_baseline_window_for_equal_tp4(monkeypatch):
         device=torch.device("cuda:0"),
         rank_in_group=0,
         pull_exchange_max_bytes=0,
+        word_max_rows=0,
     )
 
 

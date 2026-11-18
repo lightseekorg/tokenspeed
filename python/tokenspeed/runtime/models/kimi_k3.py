@@ -2098,6 +2098,9 @@ def _attnres_scratch(
 _IRIS_MAX_TOKENS = 8192
 _IRIS_BASELINE_PRODUCER_DIRECT_MAX_TOKENS = 48
 _IRIS_MOE_ROW_SHARD_MIN_TOKENS = 40
+# Most rows the LM head group's greedy argmax and DSpark walk reduce through
+# its word MAX; more (a prefill's rows) keep the all-reduce.
+_IRIS_WORD_MAX_ROWS = 1024
 # Through this many rows a replicated residual takes the Lamport reduce and gather
 # tail; the Iris K3 fused decode row limit.
 _IRIS_MOE_GATHER_TAIL_MAX_TOKENS = 192
@@ -2113,11 +2116,13 @@ def prepare_k3_all_reduce_buffers(
     max_num_tokens: int,
     states: dict[tuple[int, ...], "K3IrisState"],
     pull_exchange_max_bytes: int = 0,
+    word_max_rows: int = 0,
 ) -> bool:
     """Prepare and retain each node-local group's Iris buffers before capture.
 
     ``pull_exchange_max_bytes`` sizes the attention group's pull exchange for
-    the KVP decode's gathers and records exchange (zero omits it)."""
+    the KVP decode's gathers and records exchange, and ``word_max_rows`` its
+    word MAX for the greedy argmax and DSpark walk (zero omits either)."""
     if not current_platform().is_cdna4:
         return False
 
@@ -2129,7 +2134,10 @@ def prepare_k3_all_reduce_buffers(
         allreduce_residual_attnres_max_tokens,
         prepare_k3_communication,
     )
-    from tokenspeed_kernel.ops.communication.iris import IRIS_ALL_REDUCE_MAX_BYTES
+    from tokenspeed_kernel.ops.communication.iris import (
+        IRIS_ALL_REDUCE_MAX_BYTES,
+        iris_lamport_word_max_supported,
+    )
 
     from tokenspeed.runtime.distributed.comm_backend import get_global_backend
     from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
@@ -2148,6 +2156,7 @@ def prepare_k3_all_reduce_buffers(
         enable_lamport,
         moe_tail_max_rows,
         pull_exchange_max_bytes=0,
+        word_max_rows=0,
     ):
         if not backend.can_prepare_all_reduce_buffers(group, torch.bfloat16):
             return False
@@ -2183,6 +2192,13 @@ def prepare_k3_all_reduce_buffers(
                         or state.sharded.output.shape[0] < moe_tail_max_rows
                     )
                 )
+                or (
+                    word_max_rows
+                    and (
+                        state.word_max is None
+                        or state.word_max.max_rows < word_max_rows
+                    )
+                )
             ):
                 raise RuntimeError("Cannot grow a prepared K3 Iris state")
             return True
@@ -2199,10 +2215,13 @@ def prepare_k3_all_reduce_buffers(
             device=torch.device(f"cuda:{torch.cuda.current_device()}"),
             all_reduce=backend.iris.state(group, torch.bfloat16),
             pull_exchange_max_bytes=pull_exchange_max_bytes,
+            word_max_rows=word_max_rows,
         )
         backend.iris.install(group, state.all_reduce)
         if state.pull_exchange is not None:
             backend.iris.install_pull_exchange(group, state.pull_exchange)
+        if state.word_max is not None:
+            backend.iris.install_word_max(group, state.word_max)
         states[group] = state
         return True
 
@@ -2255,6 +2274,11 @@ def prepare_k3_all_reduce_buffers(
             enable_lamport=enable_lamport,
             moe_tail_max_rows=moe_tail_max_rows,
             pull_exchange_max_bytes=pull_exchange_max_bytes,
+            word_max_rows=(
+                word_max_rows
+                if iris_lamport_word_max_supported(mapping.attn.tp_size)
+                else 0
+            ),
         )
     if mapping.moe.tp_ep_size > 1 and not groups_are_equal:
         prepared = (
@@ -5106,6 +5130,11 @@ class KimiLinearForCausalLM(BaseCausalLM):
             max_num_tokens=max_num_tokens,
             states=self.model.iris_states,
             pull_exchange_max_bytes=self._kvp_decode_exchange_bytes(),
+            word_max_rows=(
+                _IRIS_WORD_MAX_ROWS
+                if self.mapping.lm_head.tp_group == self.mapping.attn.tp_group
+                else 0
+            ),
         )
         attn_state = self.model.iris_states.get(self.mapping.attn.tp_group)
         moe_state = self.model.iris_states.get(self.mapping.moe.tp_ep_group)
