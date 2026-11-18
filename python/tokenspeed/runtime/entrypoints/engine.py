@@ -123,7 +123,8 @@ def _set_envs_and_config(server_args: ServerArgs):
         os.environ.setdefault("NCCL_CUMEM_ENABLE", "0")
     if server_args.disable_nccl_nvls:
         os.environ["NCCL_NVLS_ENABLE"] = "0"
-    os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "4"
+    # Preserve the caller's work-queue setting before launching CUDA workers.
+    os.environ.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "4")
     os.environ.setdefault("CUDA_MODULE_LOADING", "AUTO")
     if server_args._beam_checkpoint is None:
         # A hub id the local cache does not hold yet (a first launch): fetch

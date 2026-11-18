@@ -34,6 +34,14 @@ from tokenspeed_kernel.ops.communication._iris.all_reduce import (
 )
 from tokenspeed_kernel.platform import current_platform
 
+if current_platform().is_cdna4:
+    # The gated o-projection keeps the registered gated GEMV's tiles and bits.
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.gemv import (
+        gluon_gated_norm_gemv_a16w16_tiling_gfx950,
+        gluon_gated_norm_gemv_tile_gfx950,
+        supports_gluon_gated_norm_gemv_a16w16_gfx950,
+    )
+
 ATTNRES_WORLD_SIZE = 8
 ATTNRES_HIDDEN_SIZE = 7168
 ATTNRES_MAX_ROWS = 16
@@ -263,6 +271,142 @@ class IrisAttnResState:
             SUBGROUP_SIZE=64,
             PEER_SIGNAL_STORE_CACHE=self._arch.peer_signal_store,
             num_warps=_NUM_SUBGROUPS,
+        )
+        return hidden, residual_out
+
+    def gated_projection_supported(
+        self,
+        x: torch.Tensor,
+        gate: torch.Tensor,
+        norm_weight: torch.Tensor,
+        weight: torch.Tensor,
+        residual: torch.Tensor,
+        score_weight: torch.Tensor,
+        output_weight: torch.Tensor,
+        scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> bool:
+        """Whether ``gated_projection_lamport`` serves these rows."""
+        if not (
+            current_platform().is_cdna4
+            and x.ndim == 2
+            and weight.ndim == 2
+            and norm_weight.ndim == 1
+            and gate.shape == x.shape
+            and 0 < x.shape[0] <= self.lamport_max_rows
+        ):
+            return False
+        rows, k = x.shape
+        head_dim = norm_weight.numel()
+        if not (
+            weight.shape == (ATTNRES_HIDDEN_SIZE, k)
+            and x.dtype == gate.dtype == weight.dtype == torch.bfloat16
+            and x.is_contiguous()
+            and gate.stride(1) == 1
+            and weight.is_contiguous()
+            and norm_weight.is_contiguous()
+            and all(
+                tensor.device == self.device
+                for tensor in (x, gate, norm_weight, weight)
+            )
+            and head_dim > 0
+            and supports_gluon_gated_norm_gemv_a16w16_gfx950(
+                rows, ATTNRES_HIDDEN_SIZE, k, k // head_dim, head_dim
+            )
+        ):
+            return False
+        columns, num_warps, tiling = gluon_gated_norm_gemv_a16w16_tiling_gfx950(
+            rows, ATTNRES_HIDDEN_SIZE, k, self.device
+        )
+        lanes = 64 * num_warps
+        block = triton.next_power_of_2(ATTNRES_HIDDEN_SIZE)
+        block_columns = ATTNRES_HIDDEN_SIZE // self.world_size
+        # Each tile lies in one owner's block and holds one word a lane; the
+        # finisher holds one pack of its row a lane.
+        return (
+            block_columns % columns == 0
+            and columns % 2 == 0
+            and tiling["BLOCK_M"] * tiling["BLOCK_N"] == 2 * lanes
+            and block % lanes == 0
+            and block_columns % (block // lanes) == 0
+            and attnres_supported(
+                residual,
+                residual,
+                score_weight,
+                output_weight,
+                scratch,
+                world_size=self.world_size,
+                device=self.device,
+                max_rows=self.lamport_max_rows,
+            )
+        )
+
+    def gated_projection_lamport(
+        self,
+        x: torch.Tensor,
+        gate: torch.Tensor,
+        norm_weight: torch.Tensor,
+        weight: torch.Tensor,
+        norm_eps: float,
+        residual: torch.Tensor,
+        score_weight: torch.Tensor,
+        output_weight: torch.Tensor,
+        scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``lamport`` of ``launch_gluon_gated_norm_gemv_a16w16_gfx950``'s
+        partial, in one launch.
+
+        The residual matches bit for bit. The finishers run on the GEMV's four
+        warps rather than the two-shot's sixteen, which reorders the hidden
+        rows' sums; where that moves the mix across a BF16 rounding boundary,
+        a hidden element moves by about a BF16 step of the mix.
+        """
+        assert self.gated_projection_supported(
+            x, gate, norm_weight, weight, residual, score_weight, output_weight, scratch
+        )
+        assert eps > 0.0
+        rows, k = x.shape
+        columns, num_warps, tiling = gluon_gated_norm_gemv_a16w16_tiling_gfx950(
+            rows, ATTNRES_HIDDEN_SIZE, k, self.device
+        )
+        block = triton.next_power_of_2(ATTNRES_HIDDEN_SIZE)
+        tiles = ATTNRES_HIDDEN_SIZE // columns
+        m, s_, acc = scratch
+        hidden = torch.empty_like(residual)
+        residual_out = torch.empty_like(residual)
+        iris_k3attn_gated_projection_twoshot[(tiles + rows,)](
+            x,
+            gate,
+            norm_weight,
+            weight,
+            residual,
+            self.lamport_mailbox,
+            score_weight,
+            output_weight,
+            m,
+            s_,
+            acc,
+            hidden,
+            residual_out,
+            self.lamport_epochs,
+            *self.peer_lamport_mailboxes,
+            rows,
+            x.stride(0),
+            gate.stride(0),
+            norm_eps,
+            TILES=tiles,
+            COLUMNS=columns,
+            **tiling,
+            RANK=self.rank,
+            WORLD_SIZE=self.world_size,
+            HIDDEN=ATTNRES_HIDDEN_SIZE,
+            BLOCK=block,
+            MAX_SLOT_ELEMENTS=self.lamport_mailbox.shape[-1],
+            NUM_STAGES=_LAMPORT_STAGES,
+            EPS=eps,
+            ELEMENTS_PER_THREAD=block // (64 * num_warps),
+            PEER_SIGNAL_STORE_CACHE=self._arch.peer_signal_store,
+            num_warps=num_warps,
         )
         return hidden, residual_out
 
@@ -779,6 +923,275 @@ def _iris_attnres_twoshot_finish(
     # Every subgroup read this row's stage before any advances it.
     gl.barrier()
     gl.store(epochs + row, ((stage + 1) % NUM_STAGES).to(gl.int32))
+
+
+@gluon.jit(do_not_specialize=["M"])
+def iris_k3attn_gated_projection_twoshot(
+    x_ptr,
+    gate_ptr,
+    norm_weight_ptr,
+    weight_ptr,
+    residual_ptr,
+    region_sym_ptr,
+    score_weight_ptr,
+    output_weight_ptr,
+    scratch_m_ptr,
+    scratch_s_ptr,
+    scratch_acc_ptr,
+    hidden_ptr,
+    residual_out_ptr,
+    epochs,
+    region_0,
+    region_1,
+    region_2,
+    region_3,
+    region_4,
+    region_5,
+    region_6,
+    region_7,
+    M,
+    stride_xm,
+    stride_gm,
+    norm_eps,
+    TILES: gl.constexpr,
+    COLUMNS: gl.constexpr,
+    K: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    NORM_M: gl.constexpr,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+    HIDDEN: gl.constexpr,
+    BLOCK: gl.constexpr,
+    MAX_SLOT_ELEMENTS: gl.constexpr,
+    NUM_STAGES: gl.constexpr,
+    EPS: gl.constexpr,
+    ELEMENTS_PER_THREAD: gl.constexpr,
+    PEER_SIGNAL_STORE_CACHE: gl.constexpr,
+):
+    """``gluon_gated_norm_gemv_a16w16_gfx950`` into ``iris_k3attn_lamport_twoshot``.
+
+    Program t < TILES computes the gated GEMV's tile t, COLUMNS columns of
+    every row inside one rank's column block, and exchanges it in place of
+    the two-shot's exchangers: a tile of another rank's block goes straight
+    to that owner's reduce-scatter slots, and a tile of this rank's block
+    waits for the other ranks' copies, sums all eight in FP32 rank order with
+    one BF16 rounding, and publishes the sum to every all-gather slot.
+    Program TILES + r then finishes row r as the two-shot does, on this
+    launch's warps. A row's finisher advances its counter only after every
+    rank's sum of the row arrived, so every program that read the counter
+    has sent or published by then.
+    """
+    gl.static_assert(WORLD_SIZE == 8)
+    gl.static_assert(NUM_STAGES >= 3)
+    gl.static_assert(MAX_SLOT_ELEMENTS % 8 == 0)
+    gl.static_assert((HIDDEN // WORLD_SIZE) % COLUMNS == 0 and COLUMNS % 2 == 0)
+    program = gl.program_id(0)
+    regions = (
+        region_0,
+        region_1,
+        region_2,
+        region_3,
+        region_4,
+        region_5,
+        region_6,
+        region_7,
+    )
+    if program < TILES:
+        tile = gluon_gated_norm_gemv_tile_gfx950(
+            x_ptr,
+            gate_ptr,
+            norm_weight_ptr,
+            weight_ptr,
+            program,
+            M,
+            HIDDEN,
+            COLUMNS,
+            stride_xm,
+            stride_gm,
+            norm_eps,
+            K,
+            BLOCK_M,
+            BLOCK_N,
+            BLOCK_K,
+            NORM_M,
+        )
+        _iris_attnres_projection_exchange(
+            tile.to(gl.bfloat16),
+            program,
+            M,
+            region_sym_ptr,
+            epochs,
+            regions,
+            COLUMNS,
+            BLOCK_M,
+            BLOCK_N,
+            RANK,
+            WORLD_SIZE,
+            HIDDEN,
+            MAX_SLOT_ELEMENTS,
+            NUM_STAGES,
+            PEER_SIGNAL_STORE_CACHE,
+        )
+    else:
+        _iris_attnres_twoshot_finish(
+            residual_ptr,
+            region_sym_ptr,
+            score_weight_ptr,
+            output_weight_ptr,
+            scratch_m_ptr,
+            scratch_s_ptr,
+            scratch_acc_ptr,
+            hidden_ptr,
+            residual_out_ptr,
+            epochs,
+            program - TILES,
+            WORLD_SIZE,
+            HIDDEN,
+            BLOCK,
+            MAX_SLOT_ELEMENTS,
+            NUM_STAGES,
+            EPS,
+            ELEMENTS_PER_THREAD,
+            gl.num_warps(),
+            64,
+        )
+
+
+@gluon.jit
+def _iris_lamport_words(values):
+    """[packs, 2] BF16 as one 32-bit word a pack, its first element low."""
+    low, high = gl.split(values.to(gl.uint16, bitcast=True).to(gl.uint32))
+    return low | (high << 16)
+
+
+@gluon.jit
+def _iris_attnres_projection_exchange(
+    tile_values,
+    tile,
+    M,
+    region_sym_ptr,
+    epochs,
+    regions,
+    COLUMNS: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+    HIDDEN: gl.constexpr,
+    MAX_SLOT_ELEMENTS: gl.constexpr,
+    NUM_STAGES: gl.constexpr,
+    PEER_SIGNAL_STORE_CACHE: gl.constexpr,
+):
+    """Send or reduce GEMV tile ``tile``, BF16 ``[BLOCK_M, BLOCK_N]``.
+
+    Peers poll whole 32-bit words, so the tile moves as packs of two
+    columns of a row, one a lane, each pack in its row's stage.
+    """
+    NUM_WARPS: gl.constexpr = gl.num_warps()
+    BLOCK_COLUMNS: gl.constexpr = HIDDEN // WORLD_SIZE
+    PHASE: gl.constexpr = WORLD_SIZE * MAX_SLOT_ELEMENTS
+    PAIRS: gl.constexpr = BLOCK_N // 2
+    PACKS: gl.constexpr = BLOCK_M * PAIRS
+    pair_layout: gl.constexpr = gl.BlockedLayout(
+        [1, 2], [64 // PAIRS, PAIRS], [NUM_WARPS, 1], [1, 0]
+    )
+    packs: gl.constexpr = gl.BlockedLayout([1, 2], [64, 1], [NUM_WARPS, 1], [1, 0])
+    values = _iris_sanitize_lamport_bf16(
+        gl.convert_layout(
+            gl.reshape(gl.convert_layout(tile_values, pair_layout), [PACKS, 2]), packs
+        )
+    )
+    pack = gl.arange(0, PACKS, layout=gl.SliceLayout(1, packs))
+    element = gl.arange(0, 2, layout=gl.SliceLayout(0, packs))
+    row = pack // PAIRS
+    pair = pack % PAIRS
+    valid = (row < M) & (2 * pair < COLUMNS)
+    stage = gl.load(epochs + row, mask=row < M, other=0) % NUM_STAGES
+    owner = tile * COLUMNS // BLOCK_COLUMNS
+    # Each pack's element offset in a source's reduce-scatter slot.
+    slot = (
+        stage * (2 * PHASE)
+        + row * BLOCK_COLUMNS
+        + (tile * COLUMNS - owner * BLOCK_COLUMNS)
+        + 2 * pair
+    )
+    if owner != RANK:
+        words = _iris_lamport_words(values)
+        word_layout: gl.constexpr = words.type.layout
+        for peer in gl.static_range(WORLD_SIZE):
+            if peer != RANK:
+                if owner == peer:
+                    destination = gl.multiple_of(
+                        regions[peer].to(gl.pointer_type(gl.uint32)), 16
+                    )
+                    gl.amd.cdna4.buffer_store(
+                        words,
+                        destination,
+                        gl.convert_layout(
+                            (slot + RANK * MAX_SLOT_ELEMENTS) // 2, word_layout
+                        ),
+                        mask=gl.convert_layout(valid, word_layout),
+                        cache=PEER_SIGNAL_STORE_CACHE,
+                    )
+    else:
+        scattered = _iris_wait_lamport_slots(
+            region_sym_ptr,
+            slot[:, None] + element[None, :],
+            valid,
+            RANK,
+            WORLD_SIZE,
+            MAX_SLOT_ELEMENTS,
+            packs,
+        )
+        for source in gl.static_range(0, WORLD_SIZE):
+            if source == RANK:
+                term = values
+            else:
+                term = scattered[(source - RANK + WORLD_SIZE) % WORLD_SIZE - 1]
+            if source == 0:
+                accumulator = term.to(gl.float32)
+            else:
+                accumulator += term.to(gl.float32)
+        words = _iris_lamport_words(
+            _iris_sanitize_lamport_bf16(accumulator.to(gl.bfloat16))
+        )
+        word_layout: gl.constexpr = words.type.layout
+        word_valid = gl.convert_layout(valid, word_layout)
+        word_slot = gl.convert_layout(slot, word_layout) // 2
+        gathered = word_slot + (PHASE + RANK * MAX_SLOT_ELEMENTS) // 2
+        rotation = tile % (WORLD_SIZE - 1)
+        for first in gl.static_range(WORLD_SIZE - 1):
+            if rotation == first:
+                for step in gl.static_range(WORLD_SIZE - 1):
+                    destination = gl.multiple_of(
+                        regions[
+                            (RANK + 1 + (first + step) % (WORLD_SIZE - 1)) % WORLD_SIZE
+                        ].to(gl.pointer_type(gl.uint32)),
+                        16,
+                    )
+                    gl.amd.cdna4.buffer_store(
+                        words,
+                        destination,
+                        gathered,
+                        mask=word_valid,
+                        cache=PEER_SIGNAL_STORE_CACHE,
+                    )
+        local = gl.multiple_of(region_sym_ptr.to(gl.pointer_type(gl.uint32)), 16)
+        gl.amd.cdna4.buffer_store(words, local, gathered, mask=word_valid, cache=".wt")
+        empty = gl.full(words.shape, -2147483648, gl.int32, word_layout).to(
+            gl.uint32, bitcast=True
+        )
+        for delta in gl.static_range(1, WORLD_SIZE):
+            source = (RANK + delta) % WORLD_SIZE
+            gl.amd.cdna4.buffer_store(
+                empty,
+                local,
+                word_slot + source * MAX_SLOT_ELEMENTS // 2,
+                mask=word_valid,
+                cache=".wt",
+            )
 
 
 @gluon.jit
