@@ -152,6 +152,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # The replica the router expects to hold this prompt's prefix (peer prefix
     # sharing); a hint the holder confirms.
     peer_holder: str | None = None
+    peer_expected_tokens: int | None = None
     # array_like declaration order is the wire contract; append new fields here.
 
 
