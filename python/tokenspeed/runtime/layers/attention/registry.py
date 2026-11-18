@@ -209,6 +209,7 @@ def _cache_storage_report(
     configured_cache_bytes: int,
     pool,
     fixed_workspace_bytes: int = 0,
+    temporary_workspace_bytes: int = 0,
     prefill_kv_capacity: int = 0,
 ) -> dict:
     """Describe cache storage from allocated tensors, not scheduler counts."""
@@ -237,7 +238,11 @@ def _cache_storage_report(
     arena_bytes = _arena_allocated_bytes(arena)
     allocated_cache_bytes = arena_bytes + fixed_workspace_bytes
     storage = arena.storage_plan
-    planned_peak_bytes = allocated_cache_bytes + storage.temporary_workspace_bytes
+    planned_peak_bytes = (
+        allocated_cache_bytes
+        + temporary_workspace_bytes
+        + storage.temporary_workspace_bytes
+    )
     if planned_peak_bytes > configured_cache_bytes:
         raise RuntimeError(
             "planned cache storage exceeds its profiled budget: "
@@ -255,6 +260,7 @@ def _cache_storage_report(
             "arena_bytes": arena_bytes,
             "host_history_bytes": arena.allocated_host_bytes,
             "fixed_workspace_bytes": fixed_workspace_bytes,
+            "temporary_workspace_bytes": temporary_workspace_bytes,
             "offload_persistent_workspace_bytes": storage.persistent_workspace_bytes,
             "offload_temporary_workspace_bytes": storage.temporary_workspace_bytes,
         },
@@ -1686,6 +1692,7 @@ def create_attn_components(
         configured_cache_bytes=cache_budget_bytes,
         pool=pool,
         fixed_workspace_bytes=fixed_workspace_bytes,
+        temporary_workspace_bytes=cache_setup.temporary_workspace_bytes,
         prefill_kv_capacity=backend.prefill_kv_capacity,
     )
 
