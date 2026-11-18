@@ -4707,6 +4707,7 @@ class KimiLinearModel(nn.Module):
                 model_identity=f"{global_server_args_dict['model']}@{global_server_args_dict['revision']}",
                 pool_page_bytes=16 * 1024**2,
                 copy_implementation="simple",
+                handle_type="fabric",
                 solution="cuda",
             )
             self.peer_weights = MoEPeerWeights(partition=partition, store=store)

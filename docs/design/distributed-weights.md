@@ -14,11 +14,13 @@ use the compute specification.
 
 ## Loading and memory ownership
 
-The selected kernel preprocessor returns a `PreparedExpertWeights` manifest:
-a layout identity, processed expert-major tensors, and an explicit distinction
+The MoE kernel declares `supports_peer_weights` when its preprocessor returns
+a `PreparedExpertWeights` manifest: a layout identity, processed expert-major
+tensors, and an explicit distinction
 between streamed weights and small per-expert constants. Non-expert state stays
 on the layer. In particular, the loader must preserve the existing layer-wide
-input-scale maximum across all logical experts.
+input-scale maximum across all logical experts. The initial FlashInfer TRTLLM
+NVFP4 SiTU path supplies this manifest directly.
 
 A model-owned `MoEPeerWeights` publishes each processed layer immediately and
 rebinds its parameters to immutable owned storage. Old processed allocations do
@@ -33,6 +35,12 @@ source storage and remote regions to one of two reusable staging pools. Source
 pages that straddle expert boundaries receive their missing immutable edge bytes
 once at setup. All foreign allocations for one owner share a virtual-address
 arena, reducing fabric access-region use.
+
+The shareable-handle type is explicit. Fabric handles require an IMEX channel;
+POSIX file descriptors support owners in one Linux socket namespace, including
+SM90 systems without IMEX. Descriptor exchange is startup-only: owners send in
+rank order, and each receiver retains its descriptors until CUDA import finishes.
+Partial exchanges and failed imports close every descriptor they acquired.
 
 Physical source storage, both staging pools, full per-expert metadata, kernel
 workspace, and maximum-batch activations must be accounted for before sizing KV
@@ -58,6 +66,7 @@ other weight owners, over a dedicated named process group; ordinary prefetch,
 acquire and release do not.
 
 A prefetch submits one batch of copy-engine copies on the store's copy stream.
+The worker supports the CUDA 12.8 and CUDA 13 batch-copy API signatures.
 The batch splits each peer's bytes into chunks of 8 MB divided by the number
 of owners and takes one chunk from every peer per round, in a fixed per-rank
 random order. Submitting a layer's tens of thousands of copies blocks while
@@ -77,6 +86,15 @@ completion stays local. The initial DWDP configuration rejects shared L3 and
 online expert rebalancing; Host L2 remains supported. Paused workers use the
 same coordination group as normal rounds.
 
+Ordinary breakable prefill graphs keep MoE compute in captured segments over
+the full-expert views bound at finalization. First-layer prefetch, each acquire,
+and each release followed by the next prefetch are ordered eager breaks. They
+run during capture and on every replay, so staging state advances and reader
+release is recorded on the replay's compute stream. Warmups use the same eager
+operations; capture itself records compute without reading the weights. A
+plain CUDA graph capture is rejected because it cannot replay these host-side
+operations. Prefill-only instances never capture a decode graph.
+
 Weights are immutable while published. Live weight replacement is rejected.
 Teardown drains local reads/copies and establishes peer quiescence before
 unmapping source storage. A model exposing peer weights implements
@@ -85,10 +103,11 @@ unmapping source storage. A model exposing peer weights implements
 ## Initial supported configuration
 
 The initial integration supports K3 NVFP4 SiTU on a fabric-connected NVIDIA
-prefill instance with local execution groups and a fixed token budget. Model
-CUDA graphs are disabled; kernel tuning and graph consumers can use stable
-weight views with acquisition/release outside capture. Unsupported model,
-layout, transport and graph combinations fail explicitly.
+prefill instance with local execution groups, PP1, and a fixed token budget.
+Eager execution and ordinary breakable prefill graphs use the same weight
+ordering. Idle forwards skip weight reads. Kernel tuning and other graph
+consumers can use stable weight views with acquisition/release outside capture.
+Unsupported model, layout, transport and graph combinations fail explicitly.
 
 Validation includes cross-node reconstruction, page-boundary handling, complete
 expert metadata, idle owners, odd/even queued forwards, bounded staging,
