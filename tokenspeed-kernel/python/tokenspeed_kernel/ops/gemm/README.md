@@ -320,6 +320,9 @@ PDL, contiguous BF16 operands/output and 32-byte pointer alignment. This is a
 measured performance policy, not the implementation's shape contract. Other
 shapes and unaligned views keep the existing GEMM selection; explicit overrides
 remain authoritative. FlashInfer validates the callable's wider tile support.
+The small-N policy takes precedence over the startup BF16 shortcuts so CUDA
+graphs capture the registered projection. The registry still checks layout
+and alignment before selecting the kernel.
 
 The ordinary `mm` wrapper applies bias. The kernel preserves a supplied output
 and rejects unsupported scale arguments. Its cached callable uses runtime row

@@ -40,9 +40,11 @@ _SHARD = 25256
 _VOCAB_START = 3 * _SHARD
 
 
-def _logits(rows: int, seed: int, device: str, levels: int | None) -> torch.Tensor:
+def _logits(
+    rows: int, seed: int, device: str, levels: int | None, columns: int
+) -> torch.Tensor:
     gen = torch.Generator().manual_seed(seed)
-    logits = torch.randn(rows, _SHARD, generator=gen) * 4
+    logits = torch.randn(rows, columns, generator=gen) * 4
     if levels is not None:
         # Few distinct values: the k-th largest is tied across many columns.
         logits = torch.round(logits * levels / 4) / levels
@@ -58,7 +60,7 @@ def test_shard_topk_keeps_the_best_values_lowest_column_first(
     """The shard's chunks select in parallel and merge; ties straddling the
     k-th slot (few distinct values) keep the lowest columns."""
     rows = 14
-    logits = _logits(rows, 7, device, levels)
+    logits = _logits(rows, 7, device, levels, _SHARD)
     out = torch.full((rows, 2 * k), -1.0, device=device)
 
     vocab_shard_topk(logits, k, scale, _VOCAB_START, out, softcap=None, vocab_mask=None)
@@ -66,6 +68,26 @@ def test_shard_topk_keeps_the_best_values_lowest_column_first(
     expected = torch.empty_like(out)
     torch_vocab_shard_topk(
         logits, k, scale, _VOCAB_START, expected, softcap=None, vocab_mask=None
+    )
+    assert torch.equal(out, expected)
+
+
+@pytest.mark.parametrize("k", [128, 64])
+@pytest.mark.parametrize("levels", [None, 2])
+def test_shard_topk_splits_a_shard_wider_than_one_program(
+    levels, k, device: str
+) -> None:
+    """A TP4 shard of the same vocabulary has more columns than one program's
+    15-bit column key holds; its chunks key only their own columns."""
+    rows, columns = 5, 2 * _SHARD
+    logits = _logits(rows, 11, device, levels, columns)
+    out = torch.full((rows, 2 * k), -1.0, device=device)
+
+    vocab_shard_topk(logits, k, None, columns, out, softcap=None, vocab_mask=None)
+
+    expected = torch.empty_like(out)
+    torch_vocab_shard_topk(
+        logits, k, None, columns, expected, softcap=None, vocab_mask=None
     )
     assert torch.equal(out, expected)
 
@@ -114,7 +136,7 @@ def test_merge_sorts_every_rank_candidates_lowest_slot_first(
 
 def test_row_counts_and_shard_offsets_never_recompile(device: str) -> None:
     k = 16
-    logits = _logits(24, 1, device, None)
+    logits = _logits(24, 1, device, None, _SHARD)
     out = torch.empty(24, 2 * k, device=device)
     pairs = torch.randn(8, 24, 2 * k, device=device)
     ids_out = torch.empty(24, k, dtype=torch.int64, device=device)

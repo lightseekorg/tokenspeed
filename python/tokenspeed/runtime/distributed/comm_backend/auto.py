@@ -385,6 +385,9 @@ class AutoBackend(CommBackend):
             return False
         return self._iris.broadcast_from_first_rank(tensor, group)
 
+    def try_word_max(self, words: torch.Tensor, group: Group) -> bool:
+        return self._iris.try_word_max(words, group)
+
     def all_reduce(
         self,
         tensor: torch.Tensor | tuple[torch.Tensor, ...],

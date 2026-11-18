@@ -2297,3 +2297,43 @@ def test_lm_head_row_count_warmup_launches_every_serving_kernel():
                 processor._project_logits(inputs[rows], lm_head, None)
 
     assert not _launched_kernels(serve) - warmed
+
+
+@pytest.mark.parametrize("reduced", [True, False])
+def test_packed_key_argmax_reduces_through_a_prepared_word_max(monkeypatch, reduced):
+    """The packed keys take the group's word MAX where the backend prepared
+    one, and the all-reduce MAX otherwise."""
+    keys = torch.tensor([7, 3], dtype=torch.int64)
+
+    def fake_keys(logits, *, vocab_offset, out):
+        assert vocab_offset == 8
+        return out.copy_(keys)
+
+    def fake_word_max(words, group):
+        assert group == (0, 1)
+        if reduced:
+            words.add_(100)  # the group's maximum, as another rank sent it
+        return reduced
+
+    def fake_all_reduce(tensor, group, op):
+        assert not reduced, "a prepared word MAX replaces the all-reduce"
+        assert group == (0, 1) and op == torch.distributed.ReduceOp.MAX
+        return tensor + 200
+
+    monkeypatch.setattr(
+        logits_processor_module, "vocab_parallel_argmax_keys", fake_keys
+    )
+    monkeypatch.setattr(
+        logits_processor_module,
+        "argmax_key_index",
+        lambda keys, *, out: out.copy_(keys),
+    )
+    monkeypatch.setattr(
+        logits_processor_module,
+        "get_global_backend",
+        lambda: SimpleNamespace(try_word_max=fake_word_max),
+    )
+    monkeypatch.setattr(logits_processor_module, "all_reduce", fake_all_reduce)
+
+    ids = VocabParallelArgmax((0, 1), 8)(torch.zeros((2, 4)))
+    assert ids.tolist() == ([107, 103] if reduced else [207, 203])
