@@ -251,9 +251,10 @@ class TRTLLMMLABackend(PagedMLABackend):
         extend_seq_lens: torch.Tensor,
         extend_seq_lens_cpu: torch.Tensor,
         *,
+        extend_with_prefix: bool,
         page_table_cpu: torch.Tensor | None,
     ):
-        del page_table_cpu
+        del extend_with_prefix, page_table_cpu
         max_seq_len = self.max_context_len
         cum_seq_lens = torch.zeros(
             len(seq_lens) + 1, dtype=torch.int32, device=seq_lens.device
