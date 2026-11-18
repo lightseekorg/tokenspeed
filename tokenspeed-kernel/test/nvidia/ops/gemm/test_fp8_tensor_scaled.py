@@ -25,7 +25,6 @@ import torch
 from tokenspeed_kernel.ops.gemm import _gemm_format_signature
 from tokenspeed_kernel.ops.gemm import flashinfer as flashinfer_ops
 from tokenspeed_kernel.ops.gemm import mm as kernel_mm
-from tokenspeed_kernel.profiling import ShapeCapture
 from tokenspeed_kernel.selection import select_kernel
 
 pytestmark = pytest.mark.skipif(
@@ -97,7 +96,7 @@ def test_padded_operand_rows_are_read_with_their_strides():
 @pytest.mark.parametrize("m", [1, 7])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("offset", ["activation", "weight", "output", "all"])
-def test_offset_views_through_mm_and_cuda_graph(m, out_dtype, offset):
+def test_unaligned_views_are_rejected_through_mm(m, out_dtype, offset):
     a, b, a_scale, b_scale, expected = _operands(m, 512, 384)
 
     def offset_copy(tensor):
@@ -133,15 +132,41 @@ def test_offset_views_through_mm_and_cuda_graph(m, out_dtype, offset):
             out=out,
         )
 
-    capture = ShapeCapture.get()
-    capture.clear()
-    previous = capture.enabled
-    capture.enabled = True
-    try:
-        assert run() is out
-    finally:
-        capture.enabled = previous
-    assert capture._records[-1].kernel_name == "flashinfer_mm_fp8_tensor_scaled"
+    argument = {"activation": "A", "weight": "B", "output": "out", "all": "A"}[offset]
+    with pytest.raises(
+        ValueError,
+        match=rf"{argument} to be 16-byte aligned; got address % 16 = .*storage_offset = 1",
+    ):
+        run()
+    assert storage[0] == 42 and storage[-1] == 42
+
+
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float16])
+def test_aligned_offset_views_through_mm_and_cuda_graph(out_dtype):
+    a, b, a_scale, b_scale, expected = _operands(7, 512, 384)
+
+    def aligned_view(tensor):
+        storage = torch.empty(tensor.numel() + 16, dtype=tensor.dtype, device="cuda")
+        view = storage[16:].view(tensor.shape).copy_(tensor)
+        assert view.storage_offset() == 16 and view.data_ptr() % 16 == 0
+        return view
+
+    a = aligned_view(a)
+    b = aligned_view(b.t()).t()
+    out = aligned_view(torch.zeros(7, 384, dtype=out_dtype, device="cuda"))
+
+    def run():
+        return kernel_mm(
+            a,
+            b,
+            A_scales=a_scale,
+            B_scales=b_scale,
+            out_dtype=out_dtype,
+            quant="fp8",
+            out=out,
+        )
+
+    assert run() is out
     assert ((out.float() - expected).norm() / expected.norm()).item() < 1e-2
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -152,4 +177,3 @@ def test_offset_views_through_mm_and_cuda_graph(m, out_dtype, offset):
     graph.replay()
     torch.cuda.synchronize()
     assert ((out.float() - expected).norm() / expected.norm()).item() < 1e-2
-    assert storage[0] == 42 and storage[-1] == 42

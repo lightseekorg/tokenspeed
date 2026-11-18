@@ -131,8 +131,8 @@ def test_capture_before_warmup_runs_cublaslt_and_replays_after():
     torch.testing.assert_close(warm, changed, rtol=1e-2, atol=1e-2)
 
 
-@pytest.mark.parametrize("offset", ["activation", "weight", "both"])
-def test_offset_operands_through_mm_and_warmed_graph(offset):
+@pytest.mark.parametrize("offset", ["activation", "weight", "both", "output"])
+def test_alignment_contract_through_mm_and_warmed_graph(offset):
     a, b, a_scale, b_scale = _operands(1, 128, 2048)
 
     def offset_copy(tensor):
@@ -161,6 +161,16 @@ def test_offset_operands_through_mm_and_warmed_graph(offset):
             quant="fp8",
             out=out,
         )
+
+    if offset != "output":
+        argument = "B" if offset == "weight" else "A"
+        with pytest.raises(
+            ValueError,
+            match=rf"{argument} to be 16-byte aligned; got address % 16 = 1, storage_offset = 1",
+        ):
+            run()
+        assert torch.all(storage == 42)
+        return
 
     capture = ShapeCapture.get()
     capture.clear()

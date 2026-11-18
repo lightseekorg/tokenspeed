@@ -370,6 +370,15 @@ def _aligned_copy(tensor: torch.Tensor, alignment: int) -> torch.Tensor:
     return copy.copy_(tensor)
 
 
+def _assert_fp8_alignment(tensor: torch.Tensor, name: str) -> None:
+    remainder = tensor.data_ptr() % 16
+    if remainder:
+        raise ValueError(
+            f"per-tensor FP8 GEMM requires {name} to be 16-byte aligned; "
+            f"got address % 16 = {remainder}, storage_offset = {tensor.storage_offset()}"
+        )
+
+
 cublas_fp8_gemm = error_fn
 
 if platform.is_nvidia and platform.is_blackwell:
@@ -429,10 +438,14 @@ if cublas_fp8_gemm is not error_fn:
                 f"per-tensor FP8 GEMM writes BF16 or FP16, not {out_dtype}"
             )
         # cuBLASLt reads dense operands: row-major A and column-major B.
-        # Contiguous offset views can retain unaligned pointers.
-        A = _aligned_copy(A.contiguous(), 16)
-        B = _aligned_copy(B.t().contiguous(), 16).t()
-        direct = out is not None and out.is_contiguous() and out.data_ptr() % 16 == 0
+        # Validate the caller's buffers before layout normalization can hide offsets.
+        _assert_fp8_alignment(A, "A")
+        _assert_fp8_alignment(B, "B")
+        if out is not None:
+            _assert_fp8_alignment(out, "out")
+        A = A.contiguous()
+        B = B.t().contiguous().t()
+        direct = out is not None and out.is_contiguous()
         result = (
             out
             if direct
@@ -447,7 +460,7 @@ if cublas_fp8_gemm is not error_fn:
         )
         if out is None or direct:
             return result
-        # Strided or unaligned destinations receive the aligned result.
+        # Preserve the existing support for strided output rows.
         return out.copy_(result)
 
 

@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel.compile_monitor import is_serving
-from tokenspeed_kernel.ops.gemm.flashinfer import _aligned_copy, cublas_fp8_gemm
+from tokenspeed_kernel.ops.gemm.flashinfer import _assert_fp8_alignment, cublas_fp8_gemm
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, pdl_enabled
 from tokenspeed_kernel.registry import Priority, error_fn, register_kernel
 from tokenspeed_kernel.signature import (
@@ -106,6 +106,8 @@ if cublas_fp8_gemm is not error_fn:
         """
         if alpha is not None or block_size is not None:
             raise ValueError("per-tensor FP8 GEMM takes no alpha or block_size")
+        _assert_fp8_alignment(A, "A")
+        _assert_fp8_alignment(B, "B")
         n, k = B.shape[1], A.shape[1]
         key = (A.device.index or 0, n, k)
         capturing = torch.cuda.is_current_stream_capturing()
@@ -120,8 +122,8 @@ if cublas_fp8_gemm is not error_fn:
         direct = out is not None and out.is_contiguous()
         result = shape_dynamic_skinny_gemm(
             # The compiled vector loads require 16-byte-aligned operands.
-            _aligned_copy(A.contiguous(), 16),
-            _aligned_copy(B.t().contiguous(), 16),
+            A.contiguous(),
+            B.t().contiguous(),
             config,
             out=out if direct else None,
             scales=(A_scales.reshape(1), B_scales.reshape(1)),

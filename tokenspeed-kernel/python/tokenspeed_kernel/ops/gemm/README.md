@@ -233,13 +233,13 @@ commit the file with the tool above to fix them.
 
 ## Per-tensor FP8
 
-The FlashInfer cuBLASLt path requires 16-byte-aligned, dense operands and
-output. Contiguous views can still start at an unaligned storage offset:
-the wrapper copies those operands into aligned storage and copies results
-back into strided or unaligned output views. Aligned dense tensors use their
-existing storage. The single-row CuTe skinny GEMV also aligns its FP8
-operands before issuing vector loads; its scalar output stores accept offset
-output views directly.
+The FlashInfer cuBLASLt path requires 16-byte-aligned operands and output.
+The single-row CuTe skinny GEMV requires 16-byte-aligned operands; its scalar
+output stores accept offset output views. Both wrappers reject unaligned
+operands before layout normalization, and cuBLASLt also rejects unaligned
+output buffers. Errors identify the argument, address remainder and storage
+offset. Callers must supply aligned storage; wrappers do not copy to repair
+alignment. Existing normalization of padded rows remains supported.
 
 ## Per-token/per-channel FP8
 
