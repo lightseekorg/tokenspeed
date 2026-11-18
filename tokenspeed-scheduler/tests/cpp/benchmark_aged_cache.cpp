@@ -70,6 +70,9 @@ struct AgedCacheConfig {
             std::max({packing.swa, packing.global_r2, packing.global_r1, packing.compressor_tail});
         Require(static_cast<std::int64_t>(parents) * max_packing < std::numeric_limits<std::int32_t>::max(),
                 "every group's pages, with the null page, must fit int32");
+        // A sample hashes one page past the chunk.
+        Require(chunk_tokens <= std::numeric_limits<std::int32_t>::max() - prefix_granularity,
+                "the chunk and one more page must fit int32");
     }
 };
 
@@ -134,7 +137,7 @@ public:
     }
 
     std::int64_t CachedBlocks() {
-        return Coordinator().GroupPrefixIndex(kGlobalR1).NumEntries(Pool()) +
+        return std::int64_t{Coordinator().GroupPrefixIndex(kGlobalR1).NumEntries(Pool())} +
                Coordinator().GroupPrefixIndex(kGlobalR2).NumEntries(Pool());
     }
 
