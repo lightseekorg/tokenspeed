@@ -338,6 +338,30 @@ def triton_routed_input_scale_rmsnorm_sum(
 
 
 @triton.jit
+def _add_normalized_route(
+    acc,
+    routes_ptr,
+    row,
+    row_stride,
+    route_weights_ptr,
+    route,
+    dims,
+    dim_mask,
+    norm_weight,
+    width: tl.constexpr,
+    eps: tl.constexpr,
+):
+    values = tl.load(routes_ptr + row * row_stride + dims, mask=dim_mask, other=0.0).to(
+        tl.float32
+    )
+    product = values * norm_weight
+    variance = tl.sum(product * product, axis=0) / width
+    inv_rms = tl.rsqrt(variance + eps)
+    route_weight = tl.load(route_weights_ptr + route).to(tl.float32)
+    return acc + product * inv_rms * route_weight
+
+
+@triton.jit
 def _routed_input_scale_rmsnorm_sum_token_kernel(
     routes_ptr,
     map_ptr,
@@ -368,20 +392,35 @@ def _routed_input_scale_rmsnorm_sum_token_kernel(
         route = token * topk + slot
         if HAS_MAP:
             row = tl.load(map_ptr + route)
+            # A route another rank owns (-1) would add exact zeros; skip its reduction.
+            if row >= 0:
+                acc = _add_normalized_route(
+                    acc,
+                    routes_ptr,
+                    row.to(tl.int64),
+                    row_stride,
+                    route_weights_ptr,
+                    route,
+                    dims,
+                    dim_mask,
+                    norm_weight,
+                    width,
+                    eps,
+                )
         else:
-            row = route
-        # A route another rank owns (-1) would add exact zeros; skip its reduction.
-        if row >= 0:
-            values = tl.load(
-                routes_ptr + row.to(tl.int64) * row_stride + dims,
-                mask=dim_mask,
-                other=0.0,
-            ).to(tl.float32)
-            product = values * norm_weight
-            variance = tl.sum(product * product, axis=0) / width
-            inv_rms = tl.rsqrt(variance + eps)
-            route_weight = tl.load(route_weights_ptr + route).to(tl.float32)
-            acc += product * inv_rms * route_weight
+            acc = _add_normalized_route(
+                acc,
+                routes_ptr,
+                route.to(tl.int64),
+                row_stride,
+                route_weights_ptr,
+                route,
+                dims,
+                dim_mask,
+                norm_weight,
+                width,
+                eps,
+            )
     tl.store(out_ptr + token * width + dims, acc, mask=dim_mask)
 
 
