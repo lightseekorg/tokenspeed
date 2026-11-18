@@ -1,9 +1,11 @@
 # Final-MLP observation and replay
 
-`tokenspeed.runtime.inspection.final_mlp.FinalMLPObserver` is an opt-in developer
-tool for collecting actual inference intermediates and testing a local
-activation intervention. It does not classify neurons as malicious, authorize
-agent actions, or establish model integrity.
+`FinalMLPObserver` records the tensors between the final MLP and the selected
+logits during an eager TokenSpeed forward. When investigating a logit
+discrepancy, first replay the recorded MLP output through the final norm and
+head. Then recompute the down projection from the recorded activation and
+compare again. These two checks help locate where replay first diverges from
+the original forward.
 
 ## Scope and ownership
 
@@ -19,10 +21,8 @@ observer's owned buffers until the object is released.
 
 An observer owns fixed device buffers for one physical token-row count and one
 selected-logit-row count. It runs on the forward's thread and stream. Do not
-share it across concurrent forwards, move the model, reload weights, change
-kernel or numerics configuration, or update weights during its lifetime. This
-is a local analysis contract, not an integrity boundary against arbitrary
-memory writes.
+share it across concurrent forwards. Create a new observer after moving the
+model, reloading weights, or changing the kernel or numerics configuration.
 
 `record()` brackets exactly one forward. Every required hook must execute
 once; missing or repeated hooks fail the record, and exceptions invalidate it.
@@ -115,11 +115,11 @@ to subtracting `A[:, i] * D[:, i]` from the saved output. The API implements the
 former. It intervenes only on this forward's final MLP: it does not replay an
 altered prefix, earlier layers, future tokens, or a changed model's KV cache.
 
-Before interpreting channel effects, compare the complete original logits with
-both replay baselines. Exact equality is a validation result for the tested
-device, shape and configuration, not a guarantee across different kernels,
-row counts, dtypes or machines. Large activation or causal effect alone is not
-evidence of a backdoor.
+Before interpreting a channel's effect, compare the complete selected-logit
+arrays from both replay baselines with the recorded logits. Once both match,
+compare `intervened_logits` with `recomputed_logits` to measure the effect of
+zeroing the selected channels on this forward. Repeat the baseline checks when
+changing the kernel, physical row count, dtype, or device.
 
 ## Validation
 
@@ -173,5 +173,5 @@ graph replay, serving lifecycle, sampling and multi-device execution need
 their own integration coverage. Recording and host-export overhead are not
 measured here.
 
-See the [research results](../research/final-mlp-observation-results.md) for
-separate cached-decode checks, bounded timing measurements, and mitigation limits.
+The [validation results](../research/final-mlp-observation-results.md) include
+separate cached-decode checks and timing measurements for the tested shapes.

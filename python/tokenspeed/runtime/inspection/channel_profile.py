@@ -20,9 +20,8 @@
 
 """Opt-in, all-layer MLP activity profiling for an eager dense Qwen3 model.
 
-Each record covers one complete forward and counts its physical token rows.
-The resulting profile describes only the caller's sampled workload; a channel
-that is quiet here is not necessarily quiet for other inputs or checkpoints.
+Each record covers one complete forward. Channel statistics summarize the
+selected physical token rows for the supplied workload and checkpoint.
 """
 
 from __future__ import annotations
@@ -168,8 +167,8 @@ class ChannelActivityProfiler:
     Args:
         model: Unquantized dense Qwen3 on one device, held unchanged during
             profiling. It must be in evaluation mode.
-        model_identity: Nonempty checkpoint identifier supplied by the caller.
-            It is metadata, not a verified signature or safety assertion.
+        model_identity: Caller-supplied checkpoint label saved in the profile
+            and carried into its watchlist.
         execution: Only eager execution is supported; graph replay bypasses
             Python forward hooks.
         speculative: Must be False because draft/verify rows need separate
@@ -465,9 +464,9 @@ class ChannelActivityProfiler:
     def rank_candidates(self, *, limit: int | None) -> list[dict]:
         """Rank measured channels by active fraction, then mean contribution.
 
-        This ordering helps review a supplied workload's quiet channels; it
-        does not classify any channel as inherently safe, unsafe or dormant.
-        ``limit=None`` returns all channels. Ties use layer and channel index.
+        The least frequently active channels in this workload appear first.
+        Ties in both metrics use layer and channel index. ``limit=None``
+        returns the full ranking.
         """
         limit = validate_candidate_limit(limit)
         return rank_profile_candidates(self.profile(), limit=limit)
@@ -491,9 +490,9 @@ class ChannelActivityProfiler:
         Ratios are undefined when a layer's median norm is zero, and such
         layers cannot qualify through the norm-ratio gate. The runtime limit
         is the greater of the observed maximum contribution times
-        ``runtime_multiplier`` and ``contribution_floor``. It flags a later
-        change relative to these observations; it does not certify benign or
-        malicious behavior.
+        ``runtime_multiplier`` and ``contribution_floor``. A later forward
+        yields an event when the channel's estimated contribution exceeds
+        that limit.
         """
         thresholds = validate_watchlist_thresholds(
             max_active_fraction=max_active_fraction,

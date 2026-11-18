@@ -20,11 +20,10 @@
 
 """Opt-in, sparse channel observation during eager dense Qwen3 inference.
 
-The watchlist is produced by an offline workload profile. Its thresholds are
-heuristics, not a safety decision. This module neither changes inference nor
-authorizes tools. It observes the actual activation output of each selected
-MLP, without retaining whole MLP activation tensors. Exporting host events is
-an explicit step after the recorded forward has completed.
+A workload profile supplies the channels to sample and their contribution
+limits. Forward hooks gather those channels from the MLP activation output.
+After the forward, callers can export the rows and channels that exceeded a
+limit to locate differences from the profiling workload.
 """
 
 from __future__ import annotations
@@ -67,13 +66,13 @@ class LayerChannelSample:
 
 @dataclass(frozen=True)
 class ChannelWatchSnapshot:
-    """Independent sparse samples from one completed, triggering forward.
+    """Independent sparse samples from one completed forward.
 
     ``contribution_estimates`` are abs(activation) times the L2 norm of the
-    corresponding down-projection column. They are not logit effects or causal
-    replay. ``rows`` names all physical rows; ``selected_rows`` maps each
-    sample row back to its original physical row. Tensors remain on the model
-    device until the caller exports events.
+    corresponding down-projection column. This estimates the magnitude of a
+    channel's contribution at the MLP output. ``rows`` names all physical rows.
+    ``selected_rows`` maps each sample row back to its original physical row.
+    Tensors remain on the model device until the caller exports events.
     """
 
     model_identity: str
@@ -306,16 +305,15 @@ class ChannelWatch:
 
     Attach with a context manager, wrap each forward in ``record(rows)``, then
     call ``snapshot()``. Pass ``selected_rows`` to sample only specified
-    physical token rows; ``None`` samples them all. ``events(snapshot)``
-    transfers only the sparse samples to the host after the forward. The
-    caller supplies row identities; this class does not infer request, token,
-    or tool-action identity from internals. ``model_identity`` is caller
-    asserted metadata, not a checkpoint signature.
-    Use it on the model's forward thread and stream, with fixed loaded weights.
-    Ordinary Parameter replacements and in-place version changes are refused;
-    this is not a hash check and cannot detect raw storage writes via ``.data``.
-    Graph capture/replay, fused MLPs, quantization and parallel shards are not
-    supported. Graph replay that bypasses Python hooks fails the record check.
+    physical token rows. ``None`` samples them all. After the forward,
+    ``events(snapshot)`` exports over-limit samples with the request IDs and
+    token positions supplied in ``rows``. The caller's ``model_identity``
+    must match the label in the watchlist.
+
+    Use the model's forward thread and stream with fixed weights. The watcher
+    checks parameter identity and version. Raw storage writes via ``.data``
+    bypass those checks. Hooks require eager execution with unfused,
+    unquantized MLPs on one device.
     """
 
     def __init__(

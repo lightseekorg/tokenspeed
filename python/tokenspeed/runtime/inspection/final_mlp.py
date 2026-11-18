@@ -20,8 +20,8 @@
 
 """Eager, single-device Qwen3 final-MLP observation and local suffix replay.
 
-This is an opt-in evidence tool, not a detector or a serving callback API.
-Native hooks copy the actual intermediates; inference outputs are not replaced.
+Forward hooks copy intermediate tensors during inference. Replay uses those
+copies to compare the recorded logits with logits recomputed from the final MLP.
 """
 
 from __future__ import annotations

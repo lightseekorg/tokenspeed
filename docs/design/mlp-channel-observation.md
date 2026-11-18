@@ -1,28 +1,27 @@
 # MLP channel profiling and selective observation
 
-`ChannelActivityProfiler` and `ChannelWatch` provide an opt-in path from an
-offline workload sample to sparse activation records during eager inference.
-They do not decide whether a checkpoint or agent action is safe.
+`ChannelActivityProfiler` measures MLP activations over a calibration workload
+in eager TokenSpeed inference. Use `ChannelWatch` on a second workload to
+identify which token positions exceed a recorded channel limit. The watcher
+retains the activation, layer, channel, and physical row for each event.
 
 ## Measurement and ownership
 
 The profiler observes the actual output of each Qwen3 MLP's `SiluAndMul`: one
 activation per physical token row and intermediate channel. It collects all
-channels in all transformer blocks. A channel here is one coordinate of the
-MLP intermediate vector, not an attention head or a uniquely interpretable
-concept. The offline profile records the row count, mean absolute activation,
-RMS, observed maximum, fraction above a caller-set activation threshold, and
-an absolute-activation histogram for each channel. It also records
+channels in all transformer blocks. A channel is one coordinate of the MLP
+intermediate vector. The offline profile records the row count, mean absolute
+activation, RMS, observed maximum, fraction of rows whose absolute activation
+exceeds a caller-set threshold, and an absolute-activation histogram for each
+channel. It also records
 `abs(activation) * ||down_projection_column||_2` summaries. This last quantity
-estimates the size of the channel's direct MLP output contribution before
-later layers; it is neither a logit effect nor a causal effect.
+estimates the magnitude of the channel's contribution at the down projection.
+The final logits also depend on the residual stream and subsequent operations.
 
-The caller supplies the workload and a nonempty model identity. The identity
-binds the two artifacts by equality, but the caller must independently verify
-checkpoint provenance. The model must remain fixed while a profile or watcher
-is attached. A profile describes only the sampled input distribution. Rare
-activity on that sample does not establish that a channel was dormant during
-training, benign, or susceptible to a particular modification.
+The caller supplies the workload and a nonempty model identity. The watcher
+requires the same identity string as the profile. Keep the model fixed while
+recording and retain the checkpoint revision with the profile. Each statistic
+describes only the sampled inputs and selected rows.
 
 Profiling runs only inside an explicit `record()` around a complete model
 forward. The caller may select physical rows with `record(row_indices=...)`;
@@ -38,23 +37,21 @@ the device; `profile()` transfers aggregates for JSON export after recording.
 `freeze_watchlist()` selects channels by either of two explicit rules after a
 minimum row count. The quiet rule applies caller-set ceilings to observed
 active fraction, mean contribution estimate, and maximum contribution
-estimate. The weight-outlier rule requires a down-projection column norm above
-a caller-set multiple of its layer's median, plus a caller-set ceiling on
+estimate. The weight-outlier rule requires a down-projection column norm at
+least a caller-set multiple of its layer's median, plus a caller-set ceiling on
 active fraction. A layer with zero median cannot satisfy that rule. The
-profile exposes the norm, median, and ratio so the reason for a nomination can
-be inspected. Large output weight on a rarely active channel may be useful to
-review, but is not evidence of a malicious edit. The method emits a sorted
-list of `(layer, channel, contribution_limit)` entries under the same model
-identity. The runtime limit is `max(observed_max * multiplier, floor)`; both
-parameters are explicit. A frozen limit is a comparison with the calibration sample, not a
-confidence interval or a guarantee about future ordinary traffic.
+profile records the norm, median, and ratio used in the comparison.
+The resulting watchlist contains sorted `(layer, channel, contribution_limit)`
+entries. For each channel, the limit is `max(observed_max * multiplier, floor)`,
+where `observed_max` is its largest estimated contribution on the calibration
+rows. The caller supplies the multiplier and floor.
 
-Freeze thresholds and candidate selection before examining any held-out event
-that will be used to evaluate the watcher. Keep the calibration workload,
-thresholds, selected-channel count, held-out alarms, and misses with the
-result. A watchlist may be empty; in that case there is no runtime watcher to
-attach. Recalibrate after changing weights, model configuration, workload, or
-the meaning of physical rows.
+Freeze the watchlist before running the comparison workload so both the
+selection and the limits come from calibration alone. Record the workload,
+thresholds, selected-channel count, and number of sampled rows alongside the
+events. If calibration selects zero channels, skip attaching a watcher.
+Build a new reference profile when changing weights, model configuration, the
+calibration workload, or the rule for selecting rows.
 
 ## Sparse inference records
 
@@ -66,18 +63,17 @@ output, or synchronously export events. The caller wraps exactly one forward
 with `record(rows=...)`, supplying a `RowIdentity` for each physical row.
 The caller may also pass `selected_rows` to watch only designated physical
 rows; exported events retain their original physical-row index and supplied
-request/token identity. `snapshot()` owns copies of sparse device tensors.
+request/token identity. A snapshot owns device tensors covering every selected
+row and channel, including samples below the limit.
 `events(snapshot)` transfers only over-limit samples to the host after the
-forward; with no hits it transfers no activation values. The caller owns the
-event store, retention policy, request correlation, and later tool-action
-correlation; those are not inferred by the hook.
+forward. With no hits it transfers no activation values. The caller stores
+events and supplies the mapping from physical rows to requests and positions.
 
-An event means that a watched channel's direct contribution estimate exceeded
-its frozen threshold on one recorded row. It is a lead for inspection. It is
-not a model decision, an action authorization failure, or a proven backdoor.
-Some harmful behavior may involve channels absent from the watchlist, ordinary
-channels, attention, or many weak contributions. A large activation may also
-be legitimate. Tool permission checks belong at the action boundary.
+An event gives the contribution estimate and the limit it exceeded on one
+recorded row. Use the request and token position to locate that sample in
+the workload. For channels in the final MLP, a separate replay can measure
+how zeroing the channel changes the logits on the same input. See
+[final-MLP replay](final-mlp-observation.md).
 
 ## Supported execution
 
@@ -96,8 +92,7 @@ TokenSpeed cold eager forwards, writes a full profile, a ranked candidate
 preview, and a watchlist, then can apply the watchlist to separate inputs.
 `--rows all|last` makes the measured scope explicit in both phases. Input
 records contain exact token IDs; an optional rendered text field is checked
-against them without adding special tokens. It is a bounded integration
-example rather than a server integration or a tool policy.
+against them without adding special tokens.
 
 The example parses and hashes the same input bytes. It builds the ranking,
 watchlist, and preview from one exported profile, using the same channel
@@ -122,9 +117,8 @@ python examples/profile_mlp_channels.py \
   --rows last --watchlist profile-output/watchlist.json
 ```
 
-The numeric thresholds above illustrate the interface; derive them from a
-recorded calibration protocol and evaluate false alarms and misses on held-out
-traffic before using an event for any operational decision. The example
-compares complete model logits with and without watching on every input, and
-fails its report if they differ. It does not run an agent or enforce tool
-permissions.
+The numeric thresholds above illustrate the interface. Choose thresholds
+using a representative calibration workload, then inspect the event counts
+on held-out inputs. For each input the example compares the complete logits
+with and without the watcher and fails the report if they differ or contain
+nonfinite values.

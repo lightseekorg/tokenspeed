@@ -22,19 +22,17 @@
 
 The input is a JSON array of records with ``id`` and explicit ``token_ids``.
 An optional ``text`` must encode to exactly those IDs with no added special
-tokens. The IDs are the model input; this example never changes or truncates
-them. ``--rows all`` measures every input position; ``--rows last`` measures
-only each input's final, next-token decision position. It uses the same
-cold-prefill ModelRunner path as inspect_final_mlp.py.
+tokens. The runner takes those IDs as supplied. Use ``--rows all`` to measure
+every input position or ``--rows last`` to measure the final position that
+predicts the next token.
 
 Example input::
 
     [{"id": "request-1", "token_ids": [9707]}]
 
-This is a single-process analysis example, not a serving or tool policy. The
-caller-supplied model identity describes the loaded weights; it is not a
-verified signature. Profiling and watching support eager, unquantized,
-single-device Qwen3 only.
+Both modes use the cold-prefill ModelRunner path from inspect_final_mlp.py
+with an eager, unquantized Qwen3 on one device. Use the same checkpoint
+label when collecting a profile and comparing later inputs to its watchlist.
 """
 
 from __future__ import annotations
