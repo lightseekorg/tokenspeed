@@ -44,7 +44,7 @@ def _reference(out_a, lse_a, out_b, lse_b):
     return merged, mass
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("inplace", [False, True])
 @torch.inference_mode()
 def test_both_empty_partials_merge_to_zero(dtype, inplace):
@@ -66,7 +66,7 @@ def test_both_empty_partials_merge_to_zero(dtype, inplace):
     assert torch.isneginf(lse_a).all()
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("inplace", [False, True])
 @pytest.mark.parametrize("empty_side", ["a", "b"])
 @torch.inference_mode()
@@ -90,7 +90,7 @@ def test_one_empty_partial_returns_the_other(dtype, inplace, empty_side):
     torch.testing.assert_close(merged_lse, expected_lse, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("inplace", [False, True])
 @torch.inference_mode()
 def test_only_empty_rows_are_zeroed(dtype, inplace):
@@ -105,7 +105,7 @@ def test_only_empty_rows_are_zeroed(dtype, inplace):
 
     merged, merged_lse = attn_merge_state(out_a, lse_a, out_b, lse_b, math.log2(math.e))
 
-    tolerance = 2e-2 if dtype == torch.bfloat16 else 1e-5
+    tolerance = 1e-5 if dtype == torch.float32 else 2e-2
     torch.testing.assert_close(
         merged[:3].float(), expected[:3].float(), atol=tolerance, rtol=tolerance
     )
@@ -116,13 +116,14 @@ def test_only_empty_rows_are_zeroed(dtype, inplace):
     assert torch.isneginf(merged_lse[3]).all()
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @torch.inference_mode()
-def test_public_dispatcher_merges_empty_partials_to_zero():
+def test_public_dispatcher_merges_empty_partials_to_zero(dtype):
     torch.npu.set_device(0)
     torch.manual_seed(311)
     from tokenspeed_kernel.ops.attention import attn_merge_state as public_merge
 
-    out_a = torch.randn(3, 2, 16, dtype=torch.bfloat16, device="npu")
+    out_a = torch.randn(3, 2, 16, dtype=dtype, device="npu")
     out_b = torch.randn_like(out_a)
     lse = torch.full((3, 2), -torch.inf, dtype=torch.float32, device="npu")
 
@@ -132,11 +133,12 @@ def test_public_dispatcher_merges_empty_partials_to_zero():
     assert torch.isneginf(merged_lse).all()
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @torch.inference_mode()
-def test_empty_merge_survives_npugraph_replay():
+def test_empty_merge_survives_npugraph_replay(dtype):
     torch.npu.set_device(0)
     torch.manual_seed(313)
-    out_a = torch.randn(4, 2, 8, dtype=torch.bfloat16, device="npu")
+    out_a = torch.randn(4, 2, 8, dtype=dtype, device="npu")
     out_b = torch.randn_like(out_a)
     lse_a = torch.randn(4, 2, dtype=torch.float32, device="npu")
     lse_b = torch.randn_like(lse_a)
@@ -207,3 +209,22 @@ def test_empty_request_survives_prefill_and_split_merge():
         merged[2:].float(), expected.float(), atol=2e-2, rtol=2e-2
     )
     torch.testing.assert_close(merged_lse[2:], mass.float(), atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@torch.inference_mode()
+def test_public_dispatcher_merges_finite_partials(dtype):
+    torch.npu.set_device(0)
+    torch.manual_seed(319)
+    from tokenspeed_kernel.ops.attention import attn_merge_state as public_merge
+
+    out_a = torch.randn(4, 3, 8, dtype=dtype, device="npu")
+    out_b = torch.randn_like(out_a)
+    lse_a = torch.randn(4, 3, dtype=torch.float32, device="npu")
+    lse_b = torch.randn_like(lse_a)
+    expected, expected_lse = _reference(out_a, lse_a, out_b, lse_b)
+
+    merged, merged_lse = public_merge(out_a, lse_a, out_b, lse_b)
+
+    torch.testing.assert_close(merged.float(), expected.float(), atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(merged_lse, expected_lse.float(), atol=2e-2, rtol=2e-2)
