@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Static storage geometry for the Ascend prefill transport.
+"""Static storage geometry for Ascend QCP Prefill's KV transport.
 
 One allocation serves successive layers. History capacity is also the scheduler's
 batch KV bound, including page rounding and the current chunk's cache pages.
@@ -28,7 +28,7 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
-class AscendPrefillWorkspaceLayout:
+class AscendQCPPrefillWorkspaceLayout:
     history_capacity: int
     current_capacity: int
     degree: int
@@ -57,13 +57,16 @@ class AscendPrefillWorkspaceLayout:
         return (self.current_capacity + alignment - 1) // alignment * alignment
 
     @property
-    def plane_rows(self) -> int:
+    def attention_plane_rows(self) -> int:
+        # Final KV/Index-K inputs: null rows, compact history, padded current.
+        # The history all-gather receives directly into these planes.
         return self.null_rows + self.history_capacity + self.current_padded_rows
 
     @property
-    def send_rows(self) -> int:
+    def gather_send_rows(self) -> int:
         if self.degree == 1:
             return self.current_capacity
+        # History and current exchanges reuse one send buffer in sequence.
         # Page placement need not balance the owners in one prefill batch.
         return max(
             self.history_capacity,
@@ -71,10 +74,18 @@ class AscendPrefillWorkspaceLayout:
         )
 
     @property
-    def receive_rows(self) -> int:
-        # History collectives receive directly into their final planes.
+    def current_receive_rows(self) -> int:
+        # Packed current rows from all ranks; history receives in the planes.
         return self.current_capacity if self.degree > 1 else 0
 
     @property
     def nbytes(self) -> int:
-        return (self.plane_rows + self.send_rows + self.receive_rows) * self.width * 2
+        return (
+            (
+                self.attention_plane_rows
+                + self.gather_send_rows
+                + self.current_receive_rows
+            )
+            * self.width
+            * 2
+        )

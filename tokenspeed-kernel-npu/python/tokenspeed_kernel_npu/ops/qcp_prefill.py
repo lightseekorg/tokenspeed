@@ -18,22 +18,22 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Shared prefill history transport and owner-cache commit."""
+"""QCP Prefill KV transport shared by DSA and MLA, with KVP owner writes."""
 
 import torch
 import torch.distributed as dist
 import torch_npu
-from tokenspeed_kernel.ops.attention.ascend_prefill_workspace import (
-    AscendPrefillWorkspaceLayout,
+from tokenspeed_kernel.ops.attention.ascend_qcp_prefill_workspace import (
+    AscendQCPPrefillWorkspaceLayout,
 )
-from tokenspeed_kernel_npu.ops._prefill_transport import (
+from tokenspeed_kernel_npu.ops._qcp_prefill_transport import (
     gather_history,
     pack_current,
     store_current,
 )
 
 
-class AscendDSAPrefill:
+class AscendQCPPrefillTransport:
     """One bounded Torch workspace, reused by successive attention layers.
 
     History gather, current-row commit and attention run in order on the model
@@ -56,7 +56,7 @@ class AscendDSAPrefill:
         self.rank = ranks.index(dist.get_rank())
         self.device = kv_cache.device
         self.local_rows = kv_cache.numel() // 576
-        self.layout = AscendPrefillWorkspaceLayout(
+        self.layout = AscendQCPPrefillWorkspaceLayout(
             history_capacity=max_history_rows,
             current_capacity=max_current_rows,
             degree=self.degree,
@@ -89,24 +89,32 @@ class AscendDSAPrefill:
             offset += rows * width
             return result
 
-        self._kv = plane(self.layout.plane_rows, 576)
-        self._index = (
-            plane(self.layout.plane_rows, 128) if self.layout.has_index else None
+        # Final attention inputs also receive history directly. DSA uses both
+        # planes; MLA needs only latent KV.
+        self._attention_kv = plane(self.layout.attention_plane_rows, 576)
+        self._attention_index = (
+            plane(self.layout.attention_plane_rows, 128)
+            if self.layout.has_index
+            else None
         )
-        self._send = plane(self.layout.send_rows, self.layout.width)
-        self._receive = plane(self.layout.receive_rows, self.layout.width)
+        # History/current share send storage. Only current needs a separate
+        # receive packet before store_current unpacks into the attention planes.
+        self._gather_send = plane(self.layout.gather_send_rows, self.layout.width)
+        self._current_receive = plane(
+            self.layout.current_receive_rows, self.layout.width
+        )
         # History sends use separate contiguous planes so the collectives can
         # write directly to attention's planes. Current packets reuse this space.
-        send = self._send.view(-1)
-        split = self.layout.send_rows * 576
+        send = self._gather_send.view(-1)
+        split = self.layout.gather_send_rows * 576
         self._history_send_kv = send[:split].view(-1, 576)
         self._history_send_index = (
             send[split:].view(-1, 128) if self.layout.has_index else None
         )
         # No later operation writes the null page; initialize it once.
-        self._kv[:history_null_rows].zero_()
-        if self._index is not None:
-            self._index[:history_null_rows].zero_()
+        self._attention_kv[:history_null_rows].zero_()
+        if self._attention_index is not None:
+            self._attention_index[:history_null_rows].zero_()
         self.peak_buffer_bytes = 0
 
     @property
@@ -132,11 +140,15 @@ class AscendDSAPrefill:
             or not 0 <= total_rows <= self.layout.current_capacity
         ):
             raise ValueError("Prefill batch exceeds its planned workspace capacity")
-        send_rows = (total_rows + self.degree * 128 - 1) // (self.degree * 128) * 128
+        current_rank_stride = (
+            (total_rows + self.degree * 128 - 1) // (self.degree * 128) * 128
+        )
         history_rows = self.layout.null_rows + sum(history_counts)
-        rows = history_rows + self.degree * send_rows
-        kv = self._kv[:rows]
-        index = self._index[:rows] if self._index is not None else None
+        rows = history_rows + self.degree * current_rank_stride
+        kv = self._attention_kv[:rows]
+        index = (
+            self._attention_index[:rows] if self._attention_index is not None else None
+        )
         self.peak_buffer_bytes = max(
             self.peak_buffer_bytes,
             (rows + history_counts[self.rank]) * self.layout.width * 2,
@@ -181,12 +193,12 @@ class AscendDSAPrefill:
             self.peak_buffer_bytes,
             (total_rows + local_rows) * self.layout.width * 2,
         )
-        packet = self._send[:local_rows]
+        packet = self._gather_send[:local_rows]
         if local_rows:
             pack_current(kv, index, packet)
         if self.degree == 1:
             return packet
-        receive = self._receive[:total_rows]
+        receive = self._current_receive[:total_rows]
         if total_rows:
             torch_npu.distributed.all_gather_into_tensor_uneven(
                 output=receive,
@@ -208,7 +220,7 @@ class AscendDSAPrefill:
         *,
         mapped_slots,
         history_rows,
-        send_rows,
+        current_rank_stride,
         block_rows,
         virtual_blocks,
     ):
@@ -233,7 +245,7 @@ class AscendDSAPrefill:
             mapped_slots,
             direct,
             history_rows=history_rows,
-            send_rows=send_rows,
+            current_rank_stride=current_rank_stride,
             block_rows=block_rows,
             virtual_blocks=virtual_blocks,
             degree=self.degree,

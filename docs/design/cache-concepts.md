@@ -2582,17 +2582,15 @@ backend publishes it to scheduler startup, which applies the smaller of this
 capacity and an explicit admission bound. Decode remains limited by its cache
 arena. This option changes capacity, not the Prefill implementation.
 
-A model may submit history gathering at the first preceding KDA layer. The
-attention entry ensures the same batch/layer history exists before consumption.
-An active gather keeps layer references through its final queued read. The next
-layer reuses the storage on the executor stream; synchronous HCCL submissions
-join their internal stream onto it. `finish` clears references and retains
-storage. A single persistent Torch allocation avoids creating differently sized
-packets as history grows; PyTorch controls the allocation and its page policy.
-Actual teardown waits for consumers before releasing references to the allocator;
-no per-layer synchronization or permanent stream
-identity check is needed. The layout budgets the null page, current-row alignment
-and a send buffer large enough for unequal page ownership.
+`AscendQCPPrefill.prepare_batch_metadata` prepares page mappings and query bounds
+once per batch. Each attention layer calls `prepare_layer_kv` at its own entry
+with its cache tensors; history gather, current gather, owner writes and attention
+run in order on the model stream. The next layer reuses the workspace after those
+consumers. There is no earlier KDA-layer submission or per-layer finish/close
+protocol. A single persistent Torch allocation holds the attention planes, shared
+gather send buffer and current-only receive buffer. PyTorch controls its lifetime
+and page policy. The layout budgets the null page, current-row alignment and a
+send buffer large enough for unequal page ownership.
 A Qwen4 PD prefill role retains the target/draft cache layout for transfer,
 but reserves no speculative verify workspace: only the decode role verifies.
 

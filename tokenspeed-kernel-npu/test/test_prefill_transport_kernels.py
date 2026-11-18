@@ -48,7 +48,7 @@ def exact(actual, expected):
 @torch.inference_mode()
 def test_prefill_workspace_reuses_caching_allocator_storage(monkeypatch):
     import torch.distributed as dist
-    from tokenspeed_kernel_npu.ops.prefill import AscendDSAPrefill
+    from tokenspeed_kernel_npu.ops.qcp_prefill import AscendQCPPrefillTransport
 
     torch.npu.set_device(0)
     monkeypatch.setattr(dist, "get_rank", lambda: 0)
@@ -57,7 +57,7 @@ def test_prefill_workspace_reuses_caching_allocator_storage(monkeypatch):
     slots = torch.arange(128, 384, dtype=torch.int64, device="npu")
     torch.npu.synchronize()
     allocated = torch.npu.memory_allocated()
-    runtime = AscendDSAPrefill(
+    runtime = AscendQCPPrefillTransport(
         cache,
         None,
         ranks=(0,),
@@ -71,24 +71,20 @@ def test_prefill_workspace_reuses_caching_allocator_storage(monkeypatch):
     torch.npu.synchronize()
     workspace_allocated = torch.npu.memory_allocated()
     assert workspace_allocated - allocated >= size
-    for layer, history in enumerate((128, 256, 128)):
-        runtime.prefetch(
-            layer,
+    for history in (128, 256, 128):
+        kv, _ = runtime.gather_history(
             cache,
             None,
-            batch_key=object(),
             total_rows=128,
             has_history=True,
             history_slots=slots[:history],
             history_counts=(history,),
         )
-        exact(runtime.kv[128 : 128 + history], cache_host[128 : 128 + history])
-        runtime.finish(layer)
+        exact(kv[128 : 128 + history], cache_host[128 : 128 + history])
         torch.npu.synchronize()
         assert runtime._storage.data_ptr() == address
         assert torch.npu.memory_allocated() == workspace_allocated
-    runtime.close()
-    assert runtime.workspace_bytes == 0
+    del kv, runtime
     assert torch.npu.memory_allocated() == allocated
 
 
@@ -96,7 +92,7 @@ def test_prefill_workspace_reuses_caching_allocator_storage(monkeypatch):
 @pytest.mark.parametrize("rows", [1, 2, 17, 257, 1024])
 @torch.inference_mode()
 def test_history_and_current_copies_preserve_every_byte(has_index, rows):
-    from tokenspeed_kernel_npu.ops._prefill_transport import (
+    from tokenspeed_kernel_npu.ops._qcp_prefill_transport import (
         gather_history,
         pack_current,
         store_current,
@@ -106,8 +102,8 @@ def test_history_and_current_copies_preserve_every_byte(has_index, rows):
     degree, rank, page = 8, 0, 128
     width = 704 if has_index else 576
     history_rows = 128 + rows
-    send_rows = -(-rows // (degree * 128)) * 128
-    plane_rows = history_rows + degree * send_rows
+    current_rank_stride = -(-rows // (degree * 128)) * 128
+    attention_plane_rows = history_rows + degree * current_rank_stride
     cache_rows = 256 + -(-rows // (degree * page)) * page
     kv_host = payload(cache_rows, 576, 17)
     index_host = payload(cache_rows, 128, 19) if has_index else None
@@ -130,8 +126,8 @@ def test_history_and_current_copies_preserve_every_byte(has_index, rows):
     packet = torch.empty((rows, width), dtype=torch.bfloat16, device="npu")
     pack_current(current.npu(), current_index.npu() if has_index else None, packet)
     exact(packet, torch.cat((current_index, current), 1) if has_index else current)
-    expected_kv = payload(plane_rows, 576, 37)
-    expected_index = payload(plane_rows, 128, 41) if has_index else None
+    expected_kv = payload(attention_plane_rows, 576, 37)
+    expected_index = payload(attention_plane_rows, 128, 41) if has_index else None
     plane_kv = expected_kv.npu()
     plane_index = expected_index.npu() if has_index else None
     slots = torch.arange(rows, dtype=torch.int64) + page
@@ -149,7 +145,7 @@ def test_history_and_current_copies_preserve_every_byte(has_index, rows):
         mapped.npu(),
         direct.npu(),
         history_rows=history_rows,
-        send_rows=send_rows,
+        current_rank_stride=current_rank_stride,
         block_rows=page,
         virtual_blocks=virtual_blocks,
         degree=degree,
@@ -164,7 +160,7 @@ def test_history_and_current_copies_preserve_every_byte(has_index, rows):
         )
         position = (
             history_rows
-            + producer * send_rows
+            + producer * current_rank_stride
             + token
             - (producer * base + min(producer, extra))
         )
@@ -196,7 +192,7 @@ def test_history_and_current_copies_preserve_every_byte(has_index, rows):
 @pytest.mark.parametrize("layout", ["pages64", "pages128", "random", "broken_run"])
 @torch.inference_mode()
 def test_history_gather_preserves_arbitrary_slot_order(has_index, layout):
-    from tokenspeed_kernel_npu.ops._prefill_transport import gather_history
+    from tokenspeed_kernel_npu.ops._qcp_prefill_transport import gather_history
 
     torch.npu.set_device(0)
     cache_rows = 1024
@@ -236,7 +232,10 @@ def test_history_gather_preserves_arbitrary_slot_order(has_index, layout):
 @pytest.mark.parametrize("has_index", [False, True])
 @torch.inference_mode()
 def test_current_cache_tail_preserves_valid_rows(has_index):
-    from tokenspeed_kernel_npu.ops._prefill_transport import pack_current, store_current
+    from tokenspeed_kernel_npu.ops._qcp_prefill_transport import (
+        pack_current,
+        store_current,
+    )
 
     torch.npu.set_device(0)
     rows, page, cache_rows = 32, 128, 145
@@ -266,7 +265,7 @@ def test_current_cache_tail_preserves_valid_rows(has_index):
         torch.full((rows,), -1, dtype=torch.int64, device="npu"),
         torch.ones(rows, dtype=torch.uint8, device="npu"),
         history_rows=page,
-        send_rows=page,
+        current_rank_stride=page,
         block_rows=page,
         virtual_blocks=2,
         degree=1,
@@ -283,7 +282,7 @@ def test_current_cache_tail_preserves_valid_rows(has_index):
 
 @torch.inference_mode()
 def test_cache_addresses_beyond_int32_elements():
-    from tokenspeed_kernel_npu.ops._prefill_transport import (
+    from tokenspeed_kernel_npu.ops._qcp_prefill_transport import (
         gather_history,
         pack_current,
         store_current,
@@ -312,7 +311,7 @@ def test_cache_addresses_beyond_int32_elements():
         torch.tensor([-1], device="npu", dtype=torch.int64),
         torch.ones(1, device="npu", dtype=torch.bool),
         history_rows=128,
-        send_rows=128,
+        current_rank_stride=128,
         block_rows=page,
         virtual_blocks=first // page + 1,
         degree=1,
@@ -327,7 +326,7 @@ def test_batch_lengths_reuse_compiled_transport_kernels(has_index):
     import importlib.util
     from pathlib import Path
 
-    from tokenspeed_kernel_npu.ops._prefill_transport import (
+    from tokenspeed_kernel_npu.ops._qcp_prefill_transport import (
         _gather_history,
         _pack_current,
         _store_current,

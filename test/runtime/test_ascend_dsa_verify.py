@@ -25,8 +25,8 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.attention.ascend_prefill_workspace import (
-    AscendPrefillWorkspaceLayout,
+from tokenspeed_kernel.ops.attention.ascend_qcp_prefill_workspace import (
+    AscendQCPPrefillWorkspaceLayout,
 )
 from tokenspeed_kernel.ops.attention.dsa.paged import (
     PagedDSAAttentionKernels,
@@ -35,7 +35,7 @@ from tokenspeed_kernel.ops.attention.dsa.paged import (
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import KernelRegistry
 
-from tokenspeed.runtime.layers.attention import ascend_prefill, backends
+from tokenspeed.runtime.layers.attention import ascend_qcp_prefill, backends
 from tokenspeed.runtime.layers.attention.backends.paged import (
     ascend_dsa,
 )
@@ -1254,14 +1254,14 @@ class _CpuPrefillTransport:
 def _prepare_cache_step_prefill(backend, pool, query, inputs):
     rows, degree = len(query), backend._kvp_degree
     backend.cache_pool = pool
-    backend._prefill_layout = AscendPrefillWorkspaceLayout(
+    backend._prefill_layout = AscendQCPPrefillWorkspaceLayout(
         current_capacity=rows,
         null_rows=128,
         history_capacity=4096,
         degree=degree,
         has_index=True,
     )
-    prefill = ascend_prefill.AscendPrefill(
+    prefill = ascend_qcp_prefill.AscendQCPPrefill(
         layout=backend._prefill_layout,
         page_size=128,
         topk=2,
@@ -1279,7 +1279,7 @@ def _prepare_cache_step_prefill(backend, pool, query, inputs):
     prefill.history_slots = torch.empty(0, dtype=torch.int64)
     prefill.history_counts = (0,) * degree
     prefill.history_rows = 128
-    prefill.send_rows = ((rows + 127) // 128) * 128
+    prefill.current_rank_stride = ((rows + 127) // 128) * 128
     prefill.key_row_count = rows
     backend._prefill = prefill
     inputs["prefill_latent"] = torch.ones(rows, 3)

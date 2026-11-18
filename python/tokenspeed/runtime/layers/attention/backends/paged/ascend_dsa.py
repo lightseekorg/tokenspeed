@@ -25,6 +25,9 @@ from __future__ import annotations
 import dataclasses
 
 import torch
+from tokenspeed_kernel.ops.attention.ascend_qcp_prefill_workspace import (
+    AscendQCPPrefillWorkspaceLayout,
+)
 from tokenspeed_kernel.ops.attention.dsa.ascend import (
     ascend_dsa_kernels,
 )
@@ -32,8 +35,8 @@ from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.layers.attention.ascend_prefill import (
-    AscendPrefill,
+from tokenspeed.runtime.layers.attention.ascend_qcp_prefill import (
+    AscendQCPPrefill,
 )
 from tokenspeed.runtime.layers.attention.backends.paged.ascend_dsa_local_decode import (
     AscendDSALocalDecode,
@@ -119,7 +122,7 @@ class AscendDSABackend(DSABackend):
                 config, spec, page_size=kernel_page_size
             )
         self._indexer_kernels = ascend_dsa_kernels()
-        self._prefill: AscendPrefill | None = None
+        self._prefill: AscendQCPPrefill | None = None
         self._prefill_group = None
         self._prefill_layout = None
 
@@ -135,9 +138,25 @@ class AscendDSABackend(DSABackend):
         self._prefill = None
         self._ascend_placement = None
         super()._publish_cache_pool(cache_pool)
-        self._prefill_layout = cache_pool.prefill_workspace_layout
+        self._prefill_layout = None
+        self._prefill_group = None
+
+    @property
+    def prefill_kv_capacity(self) -> int:
+        return self._prefill_layout.history_capacity if self.prefill_enabled else 0
+
+    def preallocate_prefill_workspace(self, pool_options=None) -> int:
+        if self._prefill is not None:
+            return self._prefill.runtime.workspace_bytes
+        if pool_options is None:
+            return 0
+        if not isinstance(pool_options, AscendQCPPrefillWorkspaceLayout):
+            raise TypeError("Ascend Prefill requires a recipe workspace layout")
+        if self.cache_pool is None:
+            raise RuntimeError("Bind the DSA cache before preparing Prefill")
+        self._prefill_layout = pool_options
         # Every world rank creates the cache-owner groups before any forward.
-        if self.prefill_enabled and self._kvp_degree > 1:
+        if self._kvp_degree > 1:
             from tokenspeed.runtime.distributed.process_group_manager import (
                 process_group_manager,
             )
@@ -147,22 +166,10 @@ class AscendDSABackend(DSABackend):
             )
         else:
             self._prefill_group = None
-
-    @property
-    def prefill_kv_capacity(self) -> int:
-        return self._prefill_layout.history_capacity if self.prefill_enabled else 0
-
-    def preallocate_prefill_workspace(self) -> int:
-        if not self.prefill_enabled:
-            return 0
-        if self._prefill is not None:
-            return self._prefill.runtime.workspace_bytes
-        if self.cache_pool is None:
-            raise RuntimeError("Bind the DSA cache before preparing Prefill")
         layer_id = min(self.cache_pool.history_group_by_layer())
         kv = self.cache_pool.get_key_buffer(layer_id)
         index = self.cache_pool.get_component(layer_id, "dsa_index_k")
-        runtime = self._indexer_kernels.prepare_prefill(
+        runtime = self._indexer_kernels.prepare_qcp_prefill(
             kv,
             index,
             ranks=self._kvp_ranks,
@@ -171,7 +178,7 @@ class AscendDSABackend(DSABackend):
             max_history_rows=self._prefill_layout.history_capacity,
             history_null_rows=self._prefill_layout.null_rows,
         )
-        self._prefill = AscendPrefill(
+        self._prefill = AscendQCPPrefill(
             layout=self._prefill_layout,
             page_size=self.kernel_page_size,
             topk=self._indexer_spec.index_topk,
@@ -213,6 +220,9 @@ class AscendDSABackend(DSABackend):
         num_extends: int = 0,
         for_graph_replay: bool = False,
     ) -> None:
+        # MLA refreshes stable page-table/length buffers for eager and graph
+        # Decode. DSA then consumes page_table, seq_lens, num_extends and
+        # q_len_per_req to build its local or TP/KVP query metadata.
         self._dense_backend.refresh_decode_metadata(
             bs,
             actual_bs,
@@ -243,6 +253,9 @@ class AscendDSABackend(DSABackend):
                 "DSA decode metadata goes through refresh_decode_metadata; "
                 f"init_forward_metadata only serves extend/mixed ({forward_mode})"
             )
+        # QCP preparation consumes host extend/prefix lengths for partitioning
+        # and gather planning, plus device cum_extend_seq_lens, prefix lengths
+        # and page_table for attention addresses and causal query/KV boundaries.
         self._dense_backend.init_forward_metadata(
             bs,
             num_extends,
@@ -260,12 +273,14 @@ class AscendDSABackend(DSABackend):
         if num_extends > 0 and forward_mode.is_extend_or_mixed():
             cmeta = self._dense_backend.chunked_prefill_metadata
             if cmeta is not None:
+                # MLA may leave this unset when it expects dense gathered KV.
+                # DSA needs the original request pages to plan QCP workspace KV.
                 self._prefill_page_table = page_table[:num_extends]
                 cmeta.page_table = self._prefill_page_table
         if bs > num_extends:
             self._decode.refresh(self.forward_decode_metadata)
         if num_extends > 0 and self.prefill_enabled:
-            self._prefill.prepare(
+            self._prefill.prepare_batch_metadata(
                 self.forward_prefill_metadata,
                 self.cache_placement(None),
                 page_table_cpu=kwargs.get("page_table_cpu"),
@@ -308,7 +323,7 @@ class AscendDSABackend(DSABackend):
             raise ValueError(
                 "Prefill needs token-local queries with all attention heads"
             )
-        prefill_kv, prefill_index = prefill.prepare_layer(
+        prefill_kv, prefill_index = prefill.prepare_layer_kv(
             self.cache_pool.get_key_buffer(layer.layer_id),
             self.cache_pool.get_component(layer.layer_id, "dsa_index_k"),
             kwargs["prefill_latent"].contiguous(),

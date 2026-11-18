@@ -1181,6 +1181,8 @@ def _prepare_fixed_workspaces(
     is_inkling: bool,
     qsa_bf16_scratch: QSABf16ScratchPlan | None,
     expected_bytes: int,
+    pool_options: object | None = None,
+    draft_pool_options: object | None = None,
 ) -> None:
     """Allocate the fixed workspaces the recipe reserved from the cache budget
     (``CacheRecipe.workspace_bytes``) and check the bytes agree.
@@ -1203,9 +1205,9 @@ def _prepare_fixed_workspaces(
     )
 
     width = int(server_args.speculative_num_draft_tokens or 1)
-    prefill_bytes = backend.preallocate_prefill_workspace()
+    prefill_bytes = backend.preallocate_prefill_workspace(pool_options)
     if draft_backend is not None:
-        prefill_bytes += draft_backend.preallocate_prefill_workspace()
+        prefill_bytes += draft_backend.preallocate_prefill_workspace(draft_pool_options)
     allocated = bool(prefill_bytes)
     actual_bytes = prefill_bytes
     if dsa_kvp_history_prefill(config):
@@ -1666,6 +1668,10 @@ def create_attn_components(
             is_inkling=cache_family == "inkling",
             qsa_bf16_scratch=qsa_bf16_scratch,
             expected_bytes=fixed_workspace_bytes,
+            pool_options=target_spec.pool_options,
+            draft_pool_options=(
+                draft_view_spec.pool_options if draft_view_spec is not None else None
+            ),
         )
 
     cache_storage = _cache_storage_report(

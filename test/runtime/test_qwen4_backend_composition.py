@@ -181,7 +181,7 @@ def test_verify_workspace_counts_each_consumer_once_and_checks_zero_budget(
 
         return SimpleNamespace(
             preallocate_verify_workspace=preallocate,
-            preallocate_prefill_workspace=lambda: 0,
+            preallocate_prefill_workspace=lambda pool_options=None: 0,
         )
 
     config = _config(is_draft=is_draft, width=width)

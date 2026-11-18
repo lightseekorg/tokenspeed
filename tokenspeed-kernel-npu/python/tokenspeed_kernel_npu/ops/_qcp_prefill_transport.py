@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Bit-preserving prefill packing and owner-cache writes."""
+"""Bit-preserving QCP Prefill packing and KVP owner-cache writes."""
 
 import torch
 from tokenspeed_kernel_npu._triton import tl, triton
@@ -81,7 +81,7 @@ def _gather_history(KV, Index, Slots, SendKV, SendIndex, rows, HAS_INDEX: tl.con
     do_not_specialize=(
         "rows",
         "history_rows",
-        "send_rows",
+        "current_rank_stride",
         "local_rows",
         "virtual_blocks",
     )
@@ -97,7 +97,7 @@ def _store_current(
     Direct,
     rows,
     history_rows,
-    send_rows,
+    current_rank_stride,
     local_rows,
     virtual_blocks,
     DEGREE: tl.constexpr,
@@ -112,7 +112,7 @@ def _store_current(
     base, extra = rows // DEGREE, rows % DEGREE
     producer_rows = base + (producer < extra)
     packet_begin = producer * base + tl.minimum(producer, extra)
-    current_begin = history_rows + producer * send_rows
+    current_begin = history_rows + producer * current_rank_stride
     width: tl.constexpr = 704 if HAS_INDEX else 576
     kv_offset: tl.constexpr = 128 if HAS_INDEX else 0
     if first < producer_rows:
@@ -261,7 +261,7 @@ def store_current(
     direct,
     *,
     history_rows,
-    send_rows,
+    current_rank_stride,
     block_rows,
     virtual_blocks,
     degree,
@@ -284,7 +284,7 @@ def store_current(
             direct,
             rows,
             history_rows,
-            send_rows,
+            current_rank_stride,
             cache_kv.numel() // 576,
             virtual_blocks,
             DEGREE=degree,

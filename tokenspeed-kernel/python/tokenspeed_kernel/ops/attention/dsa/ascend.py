@@ -66,18 +66,18 @@ def ascend_dsa_kernels():
     return _kernels
 
 
-def ascend_prefill_cache_metadata(*args, **kwargs):
-    """Map owner pages and current receives without loading Indexer operators."""
+def ascend_qcp_prefill_cache_metadata(*args, **kwargs):
+    """Build QCP workspace addresses and query bounds for DSA/MLA readers."""
     from tokenspeed_kernel_npu.ops.dsa import AscendDSAKernels
 
-    return AscendDSAKernels.prefill_metadata(*args, **kwargs)
+    return AscendDSAKernels.qcp_prefill_metadata(*args, **kwargs)
 
 
-def ascend_prepare_dsa_prefill(*args, **kwargs):
-    """Create shared KV/Index-K transport without binding numerical operators."""
+def ascend_prepare_dsa_qcp_prefill(*args, **kwargs):
+    """Create QCP KV/Index-K transport without binding numerical operators."""
     from tokenspeed_kernel_npu.ops.dsa import AscendDSAKernels
 
-    return AscendDSAKernels.prepare_prefill(*args, **kwargs)
+    return AscendDSAKernels.prepare_qcp_prefill(*args, **kwargs)
 
 
 def ascend_prepare_dsa_resources(*, group, rank, heads):

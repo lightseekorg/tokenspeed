@@ -52,16 +52,18 @@ def transport_class(monkeypatch):
     device.is_available = lambda: False
     device.synchronize = lambda device: None
     monkeypatch.setattr(torch, "npu", device, raising=False)
-    kernels = ModuleType("tokenspeed_kernel_npu.ops._prefill_transport")
+    kernels = ModuleType("tokenspeed_kernel_npu.ops._qcp_prefill_transport")
     kernels.pack_current = pack_current
     kernels.gather_history = gather_history
     # Device store/owner mapping is exercised by test_mla_cp_transport on NPUs.
     kernels.store_current = lambda *args, **kwargs: None
     for module in (npu, kernels):
         monkeypatch.setitem(sys.modules, module.__name__, module)
-    monkeypatch.delitem(sys.modules, "tokenspeed_kernel_npu.ops.prefill", raising=False)
-    module = importlib.import_module("tokenspeed_kernel_npu.ops.prefill")
-    yield module.AscendDSAPrefill, npu.distributed
+    monkeypatch.delitem(
+        sys.modules, "tokenspeed_kernel_npu.ops.qcp_prefill", raising=False
+    )
+    module = importlib.import_module("tokenspeed_kernel_npu.ops.qcp_prefill")
+    yield module.AscendQCPPrefillTransport, npu.distributed
     monkeypatch.delitem(sys.modules, module.__name__, raising=False)
 
 
@@ -115,7 +117,7 @@ def test_growing_history_reuses_one_allocation_without_stale_bytes(
     )
     allocation = runtime._storage.data_ptr()
     allocated_bytes = runtime.workspace_bytes
-    for layer, history in enumerate((128, 256, 128)):
+    for history in (128, 256, 128):
         # Uneven pages: one owner can hold the entire batch's history.
         counts = tuple(history if owner == 0 else 0 for owner in range(degree))
         pieces = []
@@ -133,31 +135,27 @@ def test_growing_history_reuses_one_allocation_without_stale_bytes(
         monkeypatch.setattr(
             collectives, "all_gather_into_tensor_uneven", gather, raising=False
         )
-        key = object()
         options = dict(
-            batch_key=key,
             total_rows=129,
             has_history=True,
             history_slots=torch.arange(128, 128 + counts[rank]),
             history_counts=counts,
         )
-        runtime.prefetch(
-            layer, cache[rank], index[rank] if has_index else None, **options
+        kv, index_k = runtime.gather_history(
+            cache[rank], index[rank] if has_index else None, **options
         )
-        pointer = runtime.kv.data_ptr()
-        runtime.prefetch(
-            layer, cache[rank], index[rank] if has_index else None, **options
+        pointer = kv.data_ptr()
+        kv, index_k = runtime.gather_history(
+            cache[rank], index[rank] if has_index else None, **options
         )
-        assert runtime.kv.data_ptr() == pointer
-        exact(runtime.kv[128 : 128 + history], pieces[0][:, -576:])
+        assert kv.data_ptr() == pointer
+        exact(kv[128 : 128 + history], pieces[0][:, -576:])
         if has_index:
-            exact(runtime.index[128 : 128 + history], pieces[0][:, :128])
-        assert torch.count_nonzero(runtime.kv[:128]) == 0
-        runtime.finish(layer)
+            exact(index_k[128 : 128 + history], pieces[0][:, :128])
+            assert torch.count_nonzero(index_k[:128]) == 0
+        assert torch.count_nonzero(kv[:128]) == 0
         assert runtime.workspace_bytes == allocated_bytes
         assert runtime._storage.data_ptr() == allocation
-    runtime.close()
-    assert runtime.workspace_bytes == 0
 
 
 def test_prefill_refuses_batch_over_capacity_before_writing(
@@ -175,16 +173,15 @@ def test_prefill_refuses_batch_over_capacity_before_writing(
         max_history_rows=128,
         history_null_rows=128,
     )
+    runtime._storage.fill_(7)
+    before = runtime._storage.clone()
     with pytest.raises(ValueError, match="capacity"):
-        runtime.prefetch(
-            0,
+        runtime.gather_history(
             cache,
             None,
-            batch_key=object(),
             total_rows=1,
             has_history=True,
             history_slots=torch.arange(256),
             history_counts=(256,),
         )
-    assert runtime.layer_id is None
-    runtime.close()
+    exact(runtime._storage, before)

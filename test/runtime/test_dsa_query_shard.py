@@ -126,7 +126,7 @@ def _backend(
     backend._prefill_page_table = None
     backend._history_workspace = None
     backend._dense_backend = SimpleNamespace(
-        preallocate_prefill_workspace=lambda: 0,
+        preallocate_prefill_workspace=lambda pool_options=None: 0,
         init_forward_metadata=lambda *args, **kwargs: None,
         chunked_prefill_metadata=None,
         forward_decode_metadata=None,
@@ -1144,7 +1144,7 @@ def test_the_registry_allocates_the_history_workspace_for_the_target(monkeypatch
     target = _history_backend(0)
     staged = []
     linear = SimpleNamespace(
-        preallocate_prefill_workspace=lambda: 0,
+        preallocate_prefill_workspace=lambda pool_options=None: 0,
         preallocate_verify_workspace=lambda max_bs, width: staged.append(
             (max_bs, width)
         )

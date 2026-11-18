@@ -417,9 +417,8 @@ of the native numerical backend.
 `AscendDSAAttention._prepare_lora_scales` isolates native norm-weight folding
 from checkpoint projection preparation. A variant that scales after the BF16
 norm output overrides that step and supplies its own numerical forward.
-`AscendPrefill` owns history/current exchange and cache writes. Its
-`key_row_count` is computed from host lengths for the active query shard,
-so a TND consumer can size its views without reading device lengths back.
+`AscendQCPPrefill` prepares batch metadata once, then supplies each layer's
+cache to the shared history/current exchange and cache-write runtime.
 Additional fixed scratch belongs to the backend, is shared across its layers,
 and must be reserved by the cache recipe before allocation.
 Prefill transport and Index-K scatter are data-only entry points; they do not
@@ -519,7 +518,7 @@ their existing three-dimensional views.
 ### Ascend DSA execution ownership
 
 DSA Prefill prepares its batch metadata and reusable transport in
-`attention/ascend_prefill.py`. The DSA backend's `forward_extend` performs
+`attention/ascend_qcp_prefill.py`. The DSA backend's `forward_extend` performs
 history/current KV preparation, Indexer selection and SFA in order. Each layer
 gathers its history at the attention entry and commits current KV/Index-K before
 selection; there is no early-model
@@ -545,8 +544,24 @@ that transport before skipping Indexer/SFA. The model derives the contiguous
 query span from the batch token count and KVP rank, using the same `scatter_count`
 as the backend; it does not search the backend tree during forward.
 
-The cache recipe reserves Prefill memory using `AscendPrefillWorkspaceLayout`,
-the same layout used for allocation. Its optional layout is passed through the
-existing cache pool binding; no marker mixin or second capacity object is needed.
+The cache recipe reserves Prefill memory using `AscendQCPPrefillWorkspaceLayout`,
+the same layout used for allocation. The recipe's optional `pool_options` passes
+directly to the backend's Prefill preallocation hook. Cache pools expose cache
+planes without carrying platform-specific workspace configuration.
 History capacity also limits scheduler KV admission, and the shared workspace
 is allocated once per backend rather than once per layer.
+
+`AscendQCPPrefill.prepare_batch_metadata` partitions current queries, plans the
+history gather, and builds the attention page table, Q/K boundaries and per-query
+causal metadata. `prepare_qcp_prefill_gather_metadata` only prepares addresses
+and counts; it does not read KV or issue collectives. Native and bitwise NPU
+paths use the same device metadata builder; the CPU branch is its reference.
+`prepare_layer_kv` then supplies the current layer's KV/Index-K cache and
+projections to `AscendQCPPrefillTransport` in `tokenspeed_kernel_npu.ops.qcp_prefill`.
+
+The workspace has three storage groups: `_attention_kv`/`_attention_index`
+(`attention_plane_rows`) hold final attention inputs and receive history
+directly; `_gather_send` (`gather_send_rows`) is reused for history and current
+sends; `_current_receive` (`current_receive_rows`) holds gathered current rows
+before they are unpacked. `current_rank_stride` is the aligned distance between
+producers' current regions in the attention planes, distinct from send capacity.

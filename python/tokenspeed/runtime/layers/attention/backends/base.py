@@ -135,10 +135,11 @@ class SparseTopKShare:
 class CachePoolBinding:
     """A node's bound cache pool."""
 
-    def preallocate_prefill_workspace(self) -> int:
-        """Allocate cache-budgeted prefill storage once for each owning backend."""
+    def preallocate_prefill_workspace(self, pool_options: object | None = None) -> int:
+        """Allocate recipe-budgeted Prefill storage; options belong to its owner."""
         return sum(
-            child.preallocate_prefill_workspace() for child in self.child_backends()
+            child.preallocate_prefill_workspace(pool_options)
+            for child in self.child_backends()
         )
 
     @property
