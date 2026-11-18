@@ -2140,8 +2140,8 @@ of its stage uses costs that stage the whole plane.
 By default, Qwen4-Exp cache fields share one FlatKV plane per pipeline stage
 (uniform per-view K/V heads, no MXFP8). The complete cache plan gives each
 stage a plane containing only its fields, including independent draft fields
-on the last stage. All stages use the same group packing, block IDs and
-agreed parent count. The packer computes field offsets, page strides and
+on the last stage. All stages use the same group packing, block IDs, and
+agreed parent count. The packer computes field offsets, page strides, and
 plane size from the fields on each stage. Capacity uses the local plane size
 and the int32 address limits of all stages.
 All GDN layers form one state group, with each layer's SSM and convolution
