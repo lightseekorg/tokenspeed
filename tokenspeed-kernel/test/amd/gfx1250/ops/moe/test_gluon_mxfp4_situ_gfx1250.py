@@ -460,7 +460,7 @@ def test_gfx1250_decode_resident_tiles_keep_one_tile_with_mxfp4_activations() ->
 
 
 @pytest.mark.parametrize("scaled", [False, True], ids=["unscaled", "scaled"])
-@pytest.mark.parametrize("num_tokens", [4, 64])
+@pytest.mark.parametrize("num_tokens", [1, 4, 64])
 def test_gfx1250_small_route_fp8_quantize_matches_standalone(
     num_tokens: int, scaled: bool
 ) -> None:

@@ -3121,14 +3121,15 @@ def _precomputed_topk_route_mxfp4(
 
     Returns the ``_precomputed_topk_route`` tuple followed by the packed
     values and scales of ``launch_triton_quantize_mxfp4_activation_gfx1250``.
-    Multi-token routes quantize in extra programs of a routing launch: the
-    one-launch route up to its token limit, then stage 4 of the staged route.
-    Other batches launch the standalone quantizer.
+    Routes quantize in extra programs of a routing launch: the one-launch
+    route up to its token limit, then stage 4 of the staged route. That
+    includes a single token, where the standalone quantizer is one more launch
+    (Qwen3.8 Flash TP2, one request: 15.8 -> 14.4 us). Other batches launch the
+    standalone quantizer.
     """
     tokens, k = map(int, hidden_states.shape)
     if (
-        tokens > 1
-        and hidden_states.dtype in (torch.bfloat16, torch.float16)
+        hidden_states.dtype in (torch.bfloat16, torch.float16)
         and hidden_states.stride(1) == 1
         and k % MXFP4_BLOCK == 0
     ):
@@ -3346,13 +3347,14 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         tokens = int(hidden_states.shape[0])
         act_scale = getattr(w13_weight, "act_scale", None)
         if (
-            tokens > 1
-            and hidden_states.dtype in (torch.bfloat16, torch.float16)
+            hidden_states.dtype in (torch.bfloat16, torch.float16)
             and hidden_states.stride(1) == 1
             and (act_scale is None or isinstance(act_scale, torch.Tensor))
             and _uses_small_route(topk_ids, num_experts)
         ):
-            # The routing launch's spare programs cast the input as well.
+            # The routing launch's spare programs cast the input as well. A
+            # single token takes this route too: a separate cast is one more
+            # launch (Kimi K3 TP8, one request: 16.6 -> 15.7 us).
             x_fp8 = torch.empty_like(hidden_states, dtype=torch.float8_e4m3fn)
             ragged_metadata, gather_indx, scatter_indx, _gate_scal = (
                 _precomputed_topk_route_small_m_gfx1250(
