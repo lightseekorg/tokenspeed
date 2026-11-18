@@ -2013,9 +2013,14 @@ from layer counts.
 Cache construction resolves ownership into explicit field IDs once:
 `cache_fields_by_stage` describes residency, and `producer_fields_by_step`
 describes the local readiness barriers. These sets cover resident fields
-exactly once. PD never derives placement from target/draft identities,
-execution-layer counts or contiguous layer windows. Noncontiguous field sets
-are valid. The bootstrap wire carries `cache_fields_by_stage`; all prefill
+exactly once. A readiness barrier must follow the final write to every field
+it names. Hybrid backends propagate the producer counter to both attention
+children: state implementations may use it to publish staged prefill state
+before the wrapper records the step. Children dispatched through the wrapper's
+`forward` must not increment the same counter again, including decode dispatch
+with `record_kv_cache=True`. PD never derives placement from target/draft
+identities, execution-layer counts or contiguous layer windows. Noncontiguous
+field sets are valid. The bootstrap wire carries `cache_fields_by_stage`; all prefill
 ranks must register the same complete placement and logical field plan.
 Old bootstrap peers without explicit placement must be upgraded together.
 
