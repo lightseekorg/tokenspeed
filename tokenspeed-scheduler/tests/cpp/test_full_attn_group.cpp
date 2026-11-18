@@ -76,7 +76,7 @@ TEST(FullAttnManagerTest, ProbeAcceptsTypedCacheKeys) {
         CacheKey{.group_id = 0, .content_hash = ContentHash{"hash"}},
     };
 
-    const GroupPrefixProbe probe = mgr.Probe(pool, keys, /*begin_blocks=*/0, /*max_blocks=*/1);
+    const GroupPrefixProbe probe = mgr.Probe(pool, keys, /*begin_block=*/0, /*end_block=*/1);
     EXPECT_TRUE(probe.hits.empty());
 }
 

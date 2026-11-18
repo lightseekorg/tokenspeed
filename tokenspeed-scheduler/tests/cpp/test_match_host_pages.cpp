@@ -45,7 +45,7 @@ CacheKey Key(std::string content_hash) {
     return CacheKey{.content_hash = ContentHash{std::move(content_hash)}};
 }
 
-// The unified Match with a raised floor (begin_blocks > 0 over a non-device pool) is the
+// The unified Match with a raised floor (begin_block > 0 over a non-device pool) is the
 // host-tier lookup: slots below the floor are device-valid, holes come back as the queried
 // pool's null block.
 
@@ -70,7 +70,7 @@ TEST(HostTierMatchTest, FullWalksContiguousRunFromBegin) {
         put.push_back(Put(mgr, host_pool, keys[j]));
     }
     // Slots below begin=1 are device-valid; the run covers all extension slots, no holes.
-    PrefixMatch m = mgr.Match(host_pool, keys, /*begin_blocks=*/1, /*max_blocks=*/5);
+    PrefixMatch m = mgr.Match(host_pool, keys, /*begin_block=*/1, /*end_block=*/5);
     EXPECT_EQ(BlockIds(m.blocks), put);
     EXPECT_EQ(m.NumHitBlocks(), 4);
 }
@@ -142,7 +142,7 @@ TEST(HostTierMatchTest, SwaBeginAboveZeroInteriorBoundary) {
     (void)p3;  // hit at slot 3 sits below the winning run's window and stays a hole
     // Miss at 6 invalidates boundary 7; boundary 6 needs [4, 6), which hits -> vector
     // covers [3, 6): hole at slot 3, pages for 4 and 5.
-    PrefixMatch m = mgr.Match(host_pool, keys, /*begin_blocks=*/3, /*max_blocks=*/7);
+    PrefixMatch m = mgr.Match(host_pool, keys, /*begin_block=*/3, /*end_block=*/7);
     EXPECT_EQ(BlockIds(m.blocks), (std::vector<std::int32_t>{0, p4, p5}));
     EXPECT_EQ(m.NumHitBlocks(), 2);
 }

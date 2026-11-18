@@ -1232,7 +1232,7 @@ TEST(PrefixCacheIndexEvictionOrderTest, AcquiringAMatchMovesTheEntryToTheRequest
     const std::vector<CacheKey> keys{KeyOf("matched")};
     const GroupPrefixProbe probe{.hits = {1}};
     PrefixMatch match =
-        index.AcquireMatched(pool, keys, /*begin_blocks=*/0, probe, /*access_epoch=*/40, /*session=*/nullptr);
+        index.AcquireMatched(pool, keys, /*begin_block=*/0, probe, /*access_epoch=*/40, /*session=*/nullptr);
     ASSERT_EQ(match.blocks.size(), 1u);
     match.blocks.clear();
 
@@ -1253,7 +1253,7 @@ TEST(PrefixCacheIndexEvictionOrderTest, AppendsAtTheNewestEpochAndRemovesTheLast
         keys.push_back(KeyOf(std::to_string(i)));
     }
     for (int i = 0; i < 4; ++i) {
-        index.AcquireMatched(pool, std::vector<CacheKey>{keys[i]}, /*begin_blocks=*/0, GroupPrefixProbe{.hits = {1}},
+        index.AcquireMatched(pool, std::vector<CacheKey>{keys[i]}, /*begin_block=*/0, GroupPrefixProbe{.hits = {1}},
                              /*access_epoch=*/10 + i, /*session=*/nullptr);
     }
     EXPECT_EQ(DrainEvictionOrder(index, pool),
