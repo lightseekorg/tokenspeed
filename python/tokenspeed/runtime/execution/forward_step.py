@@ -779,6 +779,17 @@ class ForwardStepRunner:
             decode_width=self.max_tokens_per_req,
         )
 
+    def _reset_capture_query_extent(self, ctx: ForwardContext, bs: int) -> None:
+        """Restore the query extent a serving forward starts a round from.
+
+        Packed verification narrows ``ctx.input_num_tokens`` for the rest of
+        the forward that selected it, while the warmups and the capture share
+        one context. The grammar fill slices this round's verify candidates by
+        that extent, so a narrowed context would record an empty copy and
+        every replay would fill its masks from stale draft tokens.
+        """
+        ctx.input_num_tokens = bs * self.max_tokens_per_req
+
     def _capture_one(
         self,
         bs: int,
@@ -891,6 +902,7 @@ class ForwardStepRunner:
             self.drafter.set_decode_graph_query_extent(query_tokens)
 
         def run_once():
+            self._reset_capture_query_extent(ctx, bs)
             # Dummy add_batch keeps grammar batches 1:1 with replays: the
             # host node pops one batch per forward.
             if self.capturable_grammar is not None:

@@ -20,6 +20,8 @@
 
 """Packed candidate protocol and public adaptive DSpark opt-in contracts."""
 
+from contextlib import contextmanager
+
 import pytest
 import torch
 from torch import nn
@@ -30,6 +32,7 @@ from tokenspeed.runtime.execution.drafter.base import BaseDrafter
 from tokenspeed.runtime.execution.drafter.deepseek_v41_dspark import DeepseekV41DSpark
 from tokenspeed.runtime.execution.drafter.dspark import DSpark
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.forward_step import ForwardStepRunner
 from tokenspeed.runtime.execution.model_executor import ModelExecutor
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.utils.env import global_server_args_dict
@@ -180,3 +183,63 @@ def test_executor_without_decodes_has_no_candidates(packed_decode_context, packe
     ctx.output_layout = ForwardOutputLayout(2, 2, 0, 4)
     ctx.decode_query_indptr = torch.tensor([0], dtype=torch.int64) if packed else None
     assert executor._decode_candidates(ctx) is None
+
+
+class _NarrowingDrafter(BaseDrafter):
+    """A drafter whose target forward narrows the context, as packed verify does."""
+
+    def __init__(self, *, spec_num_tokens: int, query_tokens: int):
+        super().__init__(spec_num_tokens=spec_num_tokens)
+        self.query_tokens = query_tokens
+
+    def decode_graph_query_capacities(self, bs: int) -> tuple[int, ...]:
+        return (self.query_tokens, bs * self.spec_num_tokens)
+
+    @contextmanager
+    def target_forward_context(self, ctx: ForwardContext):
+        # Packed verification keeps the narrowed extent for the rest of its
+        # own forward: sampling and the NaN audit consume packed rows.
+        ctx.input_num_tokens = self.query_tokens
+        yield
+
+
+def test_every_capture_forward_starts_at_the_native_query_extent():
+    """The grammar fill slices verify candidates by ``ctx.input_num_tokens``.
+
+    The warmups and the capture share one context, and a packed forward
+    leaves it narrowed, so each run has to restore the extent a serving
+    forward starts from; otherwise the captured copy reads an empty slice
+    and replays fill masks from stale draft tokens.
+    """
+    bs, width, query_tokens = 2, 6, 8
+    runner = ForwardStepRunner.__new__(ForwardStepRunner)
+    runner.max_tokens_per_req = width
+    runner.drafter = _NarrowingDrafter(spec_num_tokens=width, query_tokens=query_tokens)
+    extents = []
+
+    def forward_func(*, bs, ctx, sampling_info):
+        extents.append(ctx.input_num_tokens)
+        with runner.drafter.target_forward_context(ctx):
+            pass
+
+    runner._forward_func = forward_func
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=bs,
+        num_extends=0,
+        input_num_tokens=bs * width,
+        forward_mode=ForwardMode.DECODE,
+        output_layout=ForwardOutputLayout(0, 0, bs, width),
+    )
+    sampling_info = object()
+
+    def run_once():
+        ForwardStepRunner._reset_capture_query_extent(runner, ctx, bs)
+        return runner._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
+
+    for _ in range(4):
+        run_once()
+    run_once()
+
+    assert extents == [bs * width] * 5
