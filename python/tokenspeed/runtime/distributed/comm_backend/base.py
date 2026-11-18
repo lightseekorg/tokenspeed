@@ -74,6 +74,13 @@ class CommBackend(ABC):
         """Broadcast in place when prepared; otherwise let the caller fall back."""
         return False
 
+    def try_word_max(self, words: torch.Tensor, group: Group) -> bool:
+        """Reduce 1-D int64 ``words`` with MAX over ``group`` in place when a
+        model prepared the group's word MAX; False lets the caller run
+        ``all_reduce`` MAX. Only group-wide facts decide, so every rank takes
+        the same path."""
+        return False
+
     def prepare_shard_exchange(
         self, group: Group, channels: int, max_rows: int, dtype: torch.dtype
     ) -> bool:
