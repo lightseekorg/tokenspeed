@@ -40,7 +40,9 @@ PAD_SLOT_ID = -1
 
 
 @triton.jit(
-    do_not_specialize=["seqlen"],
+    # num_cache_lines is the conv-state pool size, which the server sizes from free memory: as a
+    # constexpr (or a specialized int) every server start would compile a new variant.
+    do_not_specialize=["seqlen", "num_cache_lines"],
     do_not_specialize_on_alignment=["token_chunk_offset_ptr"],
 )
 def _causal_conv1d_fwd_kernel(  # continuous batching
@@ -58,7 +60,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     # Matrix dimensions
     dim: tl.constexpr,
     seqlen: tl.int32,  # cu_seqlen
-    num_cache_lines: tl.constexpr,
+    num_cache_lines,
     # Strides
     stride_x_seq: tl.constexpr,  # stride to get to next sequence,
     stride_x_dim: tl.constexpr,  # stride to get to next feature-value,
@@ -434,7 +436,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         tl.store(o_ptrs, acc, mask=mask_1d)
 
 
-@triton.jit(do_not_specialize=["batch"])
+@triton.jit(do_not_specialize=["batch", "num_cache_lines"])
 def _causal_conv1d_update_kernel(
     # Pointers to matrices
     x_ptr,  # (batch, dim, seqlen)
@@ -455,7 +457,7 @@ def _causal_conv1d_update_kernel(
     dim: tl.constexpr,
     seqlen: tl.constexpr,
     state_len: tl.constexpr,
-    num_cache_lines: tl.constexpr,
+    num_cache_lines,
     # Strides
     stride_x_seq: tl.constexpr,
     stride_x_dim: tl.constexpr,
