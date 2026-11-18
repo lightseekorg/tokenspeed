@@ -95,6 +95,15 @@ class DSpark(DFlash):
         workspace = (
             None if block_logits is None else self._resolve_markov_argmax(block_logits)
         )
+        # Sampled walk: the base logits of every position depend only on the draft
+        # hidden state, never on the previous proposal (only the Markov bias does),
+        # so project all positions through the shared head in one call instead of
+        # one full-vocabulary head pass (and TP gather) per Markov step.
+        sampled_base_logits = (
+            None
+            if self.draft_sampler is None
+            else self._sampled_block_base_logits(draft_hidden)
+        )
         for k in range(1, self.spec_num_tokens):
             if workspace is not None:
                 # One launch: bias, add, and cross-rank argmax after token k - 1.
@@ -118,20 +127,7 @@ class DSpark(DFlash):
             # out-of-range id here indexes past the embedding table.
             bias_fn = self._make_step_bias_fn(next_tokens[:, k - 1])
             if self.draft_sampler is not None:
-                # Full logits are necessary for the recorded proposal law.
-                # require_full_vocab gives this step private TP gather storage;
-                # successive Markov steps cannot alias a shared comm buffer.
-                metadata = LogitsMetadata(
-                    forward_mode=ForwardMode.DECODE, query_shard=None
-                )
-                logits = self.logits_processor._get_logits(
-                    draft_hidden[:, k - 1, :],
-                    self.lm_head,
-                    metadata,
-                    embedding_bias=None,
-                    plan=None,
-                    require_full_vocab=True,
-                )
+                logits = sampled_base_logits[:, k - 1, :]
                 logits = logits + bias_fn(0, logits.shape[-1]).to(logits.dtype)
                 next_tokens[:, k].copy_(self.draft_sampler.propose(logits, step=k - 1))
             elif block_logits is None:
@@ -189,6 +185,27 @@ class DSpark(DFlash):
             )
         self._markov_argmax_resolved = True
         return self._markov_argmax_workspace
+
+    def _sampled_block_base_logits(self, draft_hidden: torch.Tensor) -> torch.Tensor:
+        """Full-vocabulary base logits of every proposed position, in one head pass.
+
+        Returns ``[rows, spec_num_tokens - 1, vocab]``. Full logits are necessary
+        for the recorded proposal law; require_full_vocab gives the result private
+        TP gather storage, so the per-step slices cannot alias a shared comm
+        buffer that a later collective reuses.
+        """
+        rows = int(draft_hidden.shape[0])
+        steps = self.spec_num_tokens - 1
+        metadata = LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None)
+        logits = self.logits_processor._get_logits(
+            draft_hidden[:, :steps, :].reshape(rows * steps, -1),
+            self.lm_head,
+            metadata,
+            embedding_bias=None,
+            plan=None,
+            require_full_vocab=True,
+        )
+        return logits.view(rows, steps, -1)
 
     def _block_base_logits(self, draft_hidden: torch.Tensor):
         """Project every block position's hidden state in one GEMM.

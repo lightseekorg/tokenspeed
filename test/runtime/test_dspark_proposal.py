@@ -508,3 +508,97 @@ def test_the_fused_step_is_never_resolved_inside_a_capture(monkeypatch) -> None:
     drafter = _gate_drafter(torch.bfloat16, 32, object())
     assert drafter._resolve_markov_argmax(torch.zeros(3, 16)) is None
     assert not drafter._markov_argmax_resolved
+
+
+# --------------------------------------------------------------------------
+# The sampled walk (explicit draft-probability rejection)
+# --------------------------------------------------------------------------
+
+
+class _FullVocabProjection:
+    """Stand-in for the logits processor's full-vocabulary head pass.
+
+    The real one runs the TP gather on a GPU; on one rank it is the plain
+    projection of whatever rows it is handed.
+    """
+
+    def __init__(self, weight: torch.Tensor) -> None:
+        self.weight = weight
+
+    def _get_logits(
+        self, hidden, head, metadata, embedding_bias, plan, require_full_vocab
+    ):
+        assert require_full_vocab, "the proposal law needs full-vocab logits"
+        return hidden.float() @ self.weight.float().T
+
+
+class _RecordingSampler:
+    """Stand-in for the GPU draft sampler: records each step's logits and
+    proposes their argmax, so the walk is deterministic on the CPU."""
+
+    def __init__(self) -> None:
+        self.seen: list[tuple[int, torch.Tensor]] = []
+
+    def propose(self, logits: torch.Tensor, *, step: int) -> torch.Tensor:
+        self.seen.append((step, logits.clone()))
+        return torch.argmax(logits, dim=-1).to(torch.int32)
+
+
+def _sampled_drafter(spec_num_tokens: int, weight: torch.Tensor) -> DSpark:
+    drafter = _drafter(spec_num_tokens=spec_num_tokens)
+    # A strong, token-dependent bias so a wrong previous token is visible.
+    drafter.markov_head.markov_w1.weight.data.normal_(0.0, 3.0)
+    drafter.markov_head.markov_w2.weight.data.normal_(0.0, 3.0)
+    drafter.logits_processor = _FullVocabProjection(weight)
+    drafter.draft_sampler = _RecordingSampler()
+    return drafter
+
+
+def test_the_sampled_walk_hands_each_step_its_position_logits_plus_the_bias() -> None:
+    """The sampled walk projects every position once, up front; step k must
+    still sample from position k-1's base logits plus the Markov bias of the
+    token proposed at step k-1, row by row."""
+    torch.manual_seed(5)
+    spec = 6
+    weight = torch.randn(VOCAB, HIDDEN)
+    drafter = _sampled_drafter(spec, weight)
+    rows = 3
+    hidden = torch.randn(rows, spec - 1, HIDDEN)
+    block = torch.randint(0, VOCAB, (rows, spec - 1), dtype=torch.int32)
+    next_tokens = torch.zeros((rows, spec), dtype=torch.int32)
+
+    out = drafter._sample_block(hidden, block, next_tokens)
+
+    seen = drafter.draft_sampler.seen
+    assert [step for step, _ in seen] == list(range(spec - 1))
+    for step, logits in seen:
+        k = step + 1
+        bias = drafter._make_step_bias_fn(out[:, k - 1])(0, VOCAB).float()
+        want = hidden[:, k - 1, :].float() @ weight.float().T + bias
+        torch.testing.assert_close(logits, want)
+        assert out[:, k].tolist() == torch.argmax(want, dim=-1).tolist()
+
+
+def test_the_sampled_walk_keeps_each_row_its_own_chain() -> None:
+    """Projecting all rows and positions in one pass must not mix rows: a row
+    proposes the same block alone as inside a larger batch."""
+    torch.manual_seed(9)
+    spec = 5
+    weight = torch.randn(VOCAB, HIDDEN)
+    hidden = torch.randn(3, spec - 1, HIDDEN)
+    block = torch.randint(0, VOCAB, (3, spec - 1), dtype=torch.int32)
+
+    torch.manual_seed(2)
+    batched = _sampled_drafter(spec, weight)
+    together = batched._sample_block(
+        hidden, block, torch.zeros((3, spec), dtype=torch.int32)
+    ).clone()
+    for row in range(3):
+        torch.manual_seed(2)
+        single = _sampled_drafter(spec, weight)
+        alone = single._sample_block(
+            hidden[row : row + 1],
+            block[row : row + 1],
+            torch.zeros((1, spec), dtype=torch.int32),
+        )
+        assert alone[0].tolist() == together[row].tolist()
