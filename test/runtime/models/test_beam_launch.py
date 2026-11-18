@@ -482,6 +482,17 @@ def _setup(environ, caplog, path, caller, **overrides):
     return args, warnings
 
 
+@pytest.mark.parametrize("connections", [None, "1", "4", "8", "32"])
+def test_launcher_preserves_cuda_max_connections(
+    checkpoints, environ, caplog, connections
+):
+    key = "CUDA_DEVICE_MAX_CONNECTIONS"
+    environ.pop(key, None)
+    caller = {} if connections is None else {key: connections}
+    _setup(environ, caplog, checkpoints["other"], caller)
+    assert environ[key] == ("4" if connections is None else connections)
+
+
 @pytest.mark.parametrize(
     "caller",
     [{}, dict.fromkeys(TF32_KEYS, "1"), dict.fromkeys(TF32_KEYS, "0")],

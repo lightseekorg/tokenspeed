@@ -151,7 +151,7 @@ public:
     bool GroupHasReclaimableBlocksAt(std::int32_t i, const BlockTable& table, std::int32_t num_computed_tokens) const {
         const CacheGroup& group = store_.Groups()[static_cast<std::size_t>(i)];
         return !group.Allocator()
-                    .ReclaimableBlockLocationsAt(group.Index(), table, groupExpiredBlocksAt(i, num_computed_tokens))
+                    .ReclaimableBlockLocationsAt(group.Index(), table, groupExpiredBlockEndAt(i, num_computed_tokens))
                     .empty();
     }
     // Drops every State table's slot 0 (a decode step that writes slot 1 in
@@ -170,8 +170,8 @@ public:
     std::int32_t GroupBlocksReclaimableAt(std::int32_t i, const BlockTable& table, std::int32_t num_computed_tokens,
                                           bool count_uncached) const {
         const CacheGroup& group = store_.Groups()[static_cast<std::size_t>(i)];
-        return group.Allocator().BlocksReclaimableAt(group.Index(), table, groupExpiredBlocksAt(i, num_computed_tokens),
-                                                     count_uncached);
+        return group.Allocator().BlocksReclaimableAt(group.Index(), table,
+                                                     groupExpiredBlockEndAt(i, num_computed_tokens), count_uncached);
     }
 
     // A prefix this replica holds, as a peer reads it
@@ -290,8 +290,8 @@ public:
     // Slots covering [0, num_tokens) of a table and the capacity left inside
     // the last of them.
     struct DataSpan {
-        std::int32_t blocks{0};
-        std::int32_t tail_tokens{0};
+        std::int32_t num_blocks{0};
+        std::int32_t available_tokens{0};
     };
     // Rebuilds every group's table from its image -- identical block count,
     // null holes, tail capacity and reclaimed prefix, one fresh Device block
@@ -370,9 +370,10 @@ public:
     std::int32_t GroupAvailablePages(std::int32_t group_index) const;
 
     // Registers an exact range, used for transferred prefix blocks and tests.
+    // first_prefix_page is the logical prefix-page index of content_hashes[0].
     // Runtime publication during Admit follows each group's boundary contract.
     void CacheFullBlocks(std::span<BlockTable> tables, std::span<const std::string> content_hashes,
-                         std::uint64_t access_epoch, std::int32_t first_slot, CacheBoundaryKind boundary_kind);
+                         std::uint64_t access_epoch, std::int32_t first_prefix_page, CacheBoundaryKind boundary_kind);
     // Publication without admission, for finish, retraction and remote
     // completion. progress.completed_pages must be present.
     void CacheCompletedBlocks(std::span<BlockTable> tables, const RequestProgress& progress,
@@ -595,8 +596,8 @@ private:
     // its tail, none otherwise.
     void validateCopyInBlocks(const RequestProgress& progress,
                               std::span<const std::vector<CacheBlockRef>> copy_in_blocks) const;
-    std::int32_t groupExpiredBlocksAt(std::int32_t i, std::int32_t num_computed_tokens) const {
-        return store_.Geometry()[static_cast<std::size_t>(i)].ExpiredBlocksAt(
+    std::int32_t groupExpiredBlockEndAt(std::int32_t i, std::int32_t num_computed_tokens) const {
+        return store_.Geometry()[static_cast<std::size_t>(i)].ExpiredBlockEndAt(
             store_.Groups()[static_cast<std::size_t>(i)].Spec(), num_computed_tokens);
     }
     // The cache's groups, geometry, pools and boundary tree.

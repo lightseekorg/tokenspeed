@@ -1301,8 +1301,10 @@ struct Setup {
     startup: Vec<startup::Phase>,
     /// Receives the scheduler the loop runs over, as a peer servicer holds
     /// it.
-    scheduler: Option<Arc<Mutex<Option<Arc<parking_lot::Mutex<Scheduler>>>>>>,
+    scheduler: Option<Arc<Mutex<Option<SharedScheduler>>>>,
 }
+
+type SharedScheduler = Arc<parking_lot::Mutex<Scheduler>>;
 
 const STARTUP_OUTPUT_TOKENS: usize = 3;
 
@@ -3699,12 +3701,12 @@ async fn a_loop_waiting_on_a_transfer_hands_the_scheduler_to_a_waiting_servicer(
         .await
         .unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
-        while !wire
+        while wire
             .lock()
             .unwrap()
             .rooms
             .get(&70)
-            .is_some_and(|room| room.preallocated.is_some())
+            .is_none_or(|room| room.preallocated.is_none())
         {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }

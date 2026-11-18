@@ -559,6 +559,7 @@ def _check_final_norm(rank, world_size, port, fusion_max_tokens):
         input_num_tokens=ROWS,
         forward_mode=ForwardMode.DECODE,
     )
+    model.prepare_communication_runtime(ROWS)
     out = model.final_norm(partials[rank].clone(), residual.clone(), ctx)
     reference = model.norm(partials.sum(dim=0), residual.clone())[0]
     assert torch.equal(out, reference), (out - reference).abs().max()

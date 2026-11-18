@@ -932,10 +932,10 @@ TEST(SchedulerConfigValidateTest, AHostCacheRequiresAnExplicitWritePolicy) {
     }
 }
 
-// Write-back runs on every role but D (which parallel layouts run it is the
+// Write-back runs on every role (which parallel layouts run it is the
 // runtime's to decide): it needs a Host tier, takes a sharded group and the
 // fused role's snapshot pool, and supports cached and replayable windows.
-// It refuses the D role, L3 and more groups than the 64 bits that mark a
+// It refuses L3 and more groups than the 64 bits that mark a
 // hash's written-back groups.
 TEST(SchedulerConfigValidateTest, WriteBackOnEveryRole) {
     const auto prefill = [] {

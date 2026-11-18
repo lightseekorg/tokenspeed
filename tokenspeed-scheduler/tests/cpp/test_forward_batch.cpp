@@ -267,7 +267,7 @@ TEST(ForwardBatch, ReclaimedPrefixUsesCompactWindowAndRaggedRowsStayAligned) {
     GroupSource& full = sources.AddGroup("full");
     auto& reclaimed = full.AddRow({1, 2, 3, 4, 5, 6, 7, 8});
     const auto ids = PageIds(full, reclaimed);
-    full.allocator.ReclaimExpired(full.pool, reclaimed, /*num_expired_blocks=*/6);
+    full.allocator.ReclaimExpired(full.pool, reclaimed, /*expired_block_end=*/6);
 
     std::vector<ForwardOperation> ops;
     PrefillOperation with_prefix;
@@ -293,7 +293,7 @@ TEST(ForwardBatch, AllReclaimedRowsKeepLogicalZeroWidthWindow) {
     Sources sources;
     GroupSource& full = sources.AddGroup("full");
     auto& row = full.AddRow({1, 2, 3, 4});
-    full.allocator.ReclaimExpired(full.pool, row, /*num_expired_blocks=*/4);
+    full.allocator.ReclaimExpired(full.pool, row, /*expired_block_end=*/4);
     std::vector<ForwardOperation> ops;
     PrefillOperation prefill;
     prefill.request_id = "all-reclaimed";
@@ -395,7 +395,7 @@ TEST(ForwardBatch, AbsoluteRowsMaterializeOnceAcrossThreads) {
     Sources sources;
     GroupSource& full = sources.AddGroup("full");
     auto& row = full.AddRow({1, 2, 3, 4, 5});
-    full.allocator.ReclaimExpired(full.pool, row, /*num_expired_blocks=*/3);
+    full.allocator.ReclaimExpired(full.pool, row, /*expired_block_end=*/3);
     const auto expected = PageIds(full, row);
     std::vector<ForwardOperation> ops;
     PrefillOperation prefill;

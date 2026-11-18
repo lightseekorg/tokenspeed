@@ -109,8 +109,9 @@ def _check_residual_rmsnorm(rank, world_size, device):
         device=device,
     )
     torch.manual_seed(7)
-    for width in (2048, 16384):
-        # The narrowest and widest rows one launch layout covers.
+    for width in (2048, 7168, 16384):
+        # The narrowest and widest rows one launch layout covers, and a row
+        # the norm pads to a power of two (Kimi-K3's hidden size).
         state = prepare_iris_lamport_residual_rmsnorm(all_reduce, 16, width)
         negative_zero = torch.zeros(width, dtype=torch.bool, device=device)
         base = torch.randn(9, width, device=device)
@@ -124,6 +125,9 @@ def _check_residual_rmsnorm(rank, world_size, device):
         )
         assert torch.equal(residual_out, expected_residual), width
         assert _bf16_steps_apart(norm_out, expected_norm).max() <= 1, width
+        torch.cuda.synchronize()
+        for mailbox in (state.scatter, state.gather):
+            assert torch.all(mailbox.view(torch.int32) == -(1 << 31)), width
 
     width = 8192
     state = prepare_iris_lamport_residual_rmsnorm(all_reduce, MAX_ROWS, width)

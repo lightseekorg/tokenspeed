@@ -1293,6 +1293,57 @@ def test_the_fused_query_projection_matches_the_two_gemms(monkeypatch) -> None:
     assert bitwise.q_b_wq_b_weight is None
 
 
+@requires_gpu
+@pytest.mark.parametrize("rows", [2, 8, 12])
+def test_the_query_norm_and_projection_match_the_two_launches(
+    monkeypatch, rows
+) -> None:
+    """A decode round's q/KV latent norms and stacked [q_b; wq_b] projection
+    give ``fused_qk_layernorm`` then ``mm`` bit for bit, in one launch on
+    gfx950 up to eight rows. TP8 widths; the latents are views of the wider
+    a-projection."""
+    from tokenspeed_kernel.ops.gemm import mm
+
+    from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
+    from tokenspeed.runtime.models import kimi_k31
+
+    torch.manual_seed(rows)
+    norms = FusedRMSNorm(RMSNorm(1536), RMSNorm(512)).to("cuda", torch.bfloat16)
+    with torch.no_grad():
+        norms.weight_q_a.uniform_(0.5, 1.5)
+        norms.weight_kv_a.uniform_(0.5, 1.5)
+    layer = SimpleNamespace(
+        fused_qk_layernorm=norms,
+        q_b_wq_b_weight=torch.randn(6400, 1536, device="cuda", dtype=torch.bfloat16)
+        / 32,
+    )
+    projected = torch.randn(rows, 3648, device="cuda", dtype=torch.bfloat16) * 4
+    want_rows = projected.clone()
+    want_norm = want_rows.new_empty(rows, 1536)
+    norms(
+        input_q_a=want_rows[:, :1536],
+        input_kv_a=want_rows[:, 1536:2048],
+        output_q_a=want_norm,
+    )
+    want = mm(want_norm, layer.q_b_wq_b_weight)
+
+    launches = []
+    fused = kimi_k31.mv_rmsnorm
+    monkeypatch.setattr(
+        kimi_k31,
+        "mv_rmsnorm",
+        lambda *args: launches.append(args) or fused(*args),
+    )
+    q_norm = torch.empty_like(want_norm)
+    got = kimi_k31.KimiK31SparseMLAAttention._normalize_project_query(
+        layer, projected[:, :1536], projected[:, 1536:2048], q_norm
+    )
+    assert len(launches) == int(rows <= 8 and current_platform().is_cdna4)
+    assert torch.equal(got, want)
+    assert torch.equal(q_norm, want_norm)
+    assert torch.equal(projected, want_rows)
+
+
 def _separable_keys(num_tokens: int, bad: torch.Tensor, device):
     """Index rows whose top-k is unambiguous: every head's query is the same
     direction ``u``; good keys point along it (positive score), bad keys

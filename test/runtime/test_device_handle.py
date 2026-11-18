@@ -776,8 +776,9 @@ def test_peer_reads_start_behind_the_loads_of_the_local_hit(wire_ops):
         ("default waits", "execution-stream"),
         "load_backs",
         ("default waits", "execution-stream"),
-        ("default waits", "load-stream"),
         ("record", handle._executor.default_stream),
+        ("record", "load-stream"),
+        "wait_fence",
         "wait_fence",
         "reads_ready",
     ]
@@ -1133,13 +1134,144 @@ def test_a_remote_prefill_pulls_behind_the_loads_of_its_host_hit(wire_ops):
         ("default waits", "execution-stream"),
         "load_backs",
         ("default waits", "execution-stream"),
-        ("default waits", "load-stream"),
         ("record", handle._executor.default_stream),
+        ("record", "load-stream"),
         ("prepare", [3]),
         "reset",
         "wait_fence",
+        "wait_fence",
         ("pull", remote_prefill),
     ]
+
+
+class _PendingDeviceWork:
+    """GPU work with the dependencies captured when it was submitted."""
+
+    def __init__(self, dependencies, action):
+        self.dependencies = dependencies
+        self.action = action
+        self.completed = False
+
+    def complete(self):
+        if self.completed:
+            return
+        for dependency in self.dependencies:
+            dependency.complete()
+        if self.action is not None:
+            self.action()
+        self.completed = True
+
+
+class _OrderedDeviceStream:
+    def __init__(self):
+        self.work = None
+
+    def submit(self, action):
+        dependencies = () if self.work is None else (self.work,)
+        self.work = _PendingDeviceWork(dependencies, action)
+        return self.work
+
+    def wait_stream(self, stream):
+        dependencies = tuple(
+            work for work in (self.work, stream.work) if work is not None
+        )
+        self.work = _PendingDeviceWork(dependencies, None)
+
+
+class _RecordedDeviceEvent:
+    def __init__(self):
+        self.work = None
+
+    def record(self, stream):
+        self.work = stream.work
+
+    def synchronize(self):
+        if self.work is not None:
+            self.work.complete()
+
+
+class _LandingFenceDeviceModule:
+    Event = _RecordedDeviceEvent
+
+
+class _LandingFenceDevice:
+    """Substitute GPU queues and model work while driving the real handle.
+
+    Completing the forward follows its actual stream dependencies; a wait
+    on the entire load makes it observe the loaded bytes. The landing must
+    observe them regardless of whether a forward ran in the plan.
+    """
+
+    mode = "decode"
+
+    def __init__(self):
+        self.device = "cpu"
+        self.device_module = _LandingFenceDeviceModule()
+        self.default_stream = _OrderedDeviceStream()
+        self.execution_stream = _OrderedDeviceStream()
+        self.load_stream = _OrderedDeviceStream()
+        self.loaded = False
+        self.forward_saw_load = None
+        self.landing_saw_load = None
+
+    def complete_pending_drafting(self):
+        pass
+
+    def submit_write_backs(self, ops, *, prerequisite_stream, fence_stream):
+        pass
+
+    def submit_load_backs(self, ops, *, prerequisite_stream):
+        self.load_stream.wait_stream(prerequisite_stream)
+        self.load_stream.submit(self._load)
+
+    def _load(self):
+        self.loaded = True
+
+    def execute_forward_op(self, *args, **kwargs):
+        # ModelExecutor's forward prologue orders model work after this stream.
+        self.execution_stream.wait_stream(self.default_stream)
+        self.execution_stream.submit(self._forward).complete()
+
+    def _forward(self):
+        self.forward_saw_load = self.loaded
+
+    def prepare_remote_cache_slots(self, slots):
+        pass
+
+    def reset_remote_prefill_cache_lengths(self, op):
+        self.execution_stream.wait_stream(self.default_stream)
+
+    def execute(self, op):
+        self.landing_saw_load = self.loaded
+
+    def reads_ready(self):
+        self.landing_saw_load = self.loaded
+
+
+@pytest.mark.parametrize("landing", ["pd", "peer"])
+@pytest.mark.parametrize("forwards", [True, False])
+def test_landing_waits_for_host_load_without_delaying_current_forward(
+    wire_ops, landing, forwards
+):
+    device = _LandingFenceDevice()
+    handle = DeviceHandle(
+        device,
+        host_cache_executor=device,
+        kv_transfer=device if landing == "pd" else None,
+        peer_outbox=device if landing == "peer" else None,
+    )
+    _execute(
+        handle,
+        _plan(
+            cache=[_LoadBackOp("load")],
+            remote_prefill=_remote_prefill() if landing == "pd" else None,
+            has_peer_fetches=landing == "peer",
+        ),
+        _planned(num_extends=0) if forwards else None,
+    )
+
+    assert device.forward_saw_load is (False if forwards else None)
+    assert device.landing_saw_load is True
 
 
 def test_a_failed_slot_preparation_never_triggers_the_pull():

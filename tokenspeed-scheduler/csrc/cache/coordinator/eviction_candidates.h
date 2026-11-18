@@ -25,11 +25,11 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <numeric>
 #include <optional>
 #include <span>
 #include <tuple>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -45,9 +45,6 @@ namespace tokenspeed {
 class CacheEvictionCandidates {
 public:
     using LocationSet = FlatHashSet<CacheBlockLocation>;
-    // Per checkpoint, the State entries the plan has taken from this tier.
-    using RemovedCheckpoints = std::unordered_map<ContentHash, std::int32_t>;
-
     enum class BoundaryTier { kUncached, kProbationary, kEstablished, kClosedPrefix, kSink };
 
     struct Candidate {
@@ -61,15 +58,10 @@ public:
         std::int32_t aged_distance{0};
     };
 
-    CacheEvictionCandidates(const std::vector<CacheGroup>& groups, const BlockPool& pool,
-                            const LocationSet* protected_locations, const LocationSet* request_reclaim_locations,
-                            CheckpointAging aging, const RemovedCheckpoints* removed_checkpoints)
+    CacheEvictionCandidates(const std::vector<CacheGroup>& groups, const BlockPool& pool, CheckpointAging aging)
         : groups_{groups},
           pool_{pool},
-          protected_locations_{protected_locations},
-          request_reclaim_locations_{request_reclaim_locations},
           aging_{aging},
-          removed_checkpoints_{removed_checkpoints},
           aged_floor_{aging.tree != nullptr ? aging.tree->LeafDistance() : 0},
           next_aged_distance_{aging.tree != nullptr ? CheckpointTree::kMaxDistance : 0} {
         cursors_.reserve(groups.size());
@@ -78,9 +70,34 @@ public:
         }
     }
 
-    Candidate MakeCandidate(std::uint32_t group_id, CacheBlockLocation location,
-                            const std::optional<PrefixCacheIndex::CachedBlockMetadata>& metadata) const {
-        return makeCandidate(group_id, groupRanking(group_id), location, metadata ? &metadata->eviction : nullptr);
+    static Candidate MakeCandidate(const CacheGroup& group, CacheBlockLocation location,
+                                   const std::optional<PrefixCacheIndex::CachedBlockMetadata>& metadata) {
+        return makeCandidate(group.Id(), groupRanking(group), location, metadata ? &metadata->eviction : nullptr);
+    }
+    // An entry ranked as an epoch traversal of its group ranks it.
+    static Candidate MakeCandidate(const CacheGroup& group, const PrefixCacheIndex::EvictionCandidate& entry) {
+        return makeCandidate(group.Id(), groupRanking(group), entry.location, &entry.metadata);
+    }
+
+    // Merge the caller's sorted request releases with the cache traversal.
+    // Filters and selected-block membership are read for this call only.
+    template <typename IsSelected>
+    std::optional<Candidate> Next(std::span<const Candidate> request_reclaim_candidates,
+                                  const LocationSet& protected_locations, const LocationSet& request_reclaim_locations,
+                                  const IsSelected& is_selected) {
+        const Candidate* reclaim_candidate = next_request_reclaim_ < request_reclaim_candidates.size()
+                                                 ? &request_reclaim_candidates[next_request_reclaim_]
+                                                 : nullptr;
+        if (!next_cached_) {
+            next_cached_ = nextCached(
+                reclaim_candidate ? reclaim_candidate->rank_epoch : std::numeric_limits<std::uint64_t>::max(),
+                protected_locations, request_reclaim_locations, is_selected);
+        }
+        if (reclaim_candidate && (!next_cached_ || Before(*reclaim_candidate, *next_cached_))) {
+            ++next_request_reclaim_;
+            return *reclaim_candidate;
+        }
+        return std::exchange(next_cached_, std::nullopt);
     }
 
     static bool Before(const Candidate& lhs, const Candidate& rhs) { return evictionKey(lhs) < evictionKey(rhs); }
@@ -142,8 +159,17 @@ public:
         return false;
     }
 
+    std::size_t ScannedCandidates() const { return scanned_candidates_; }
+    std::size_t GroupScans() const {
+        return static_cast<std::size_t>(
+            std::ranges::count_if(cursors_, [](const auto& group) { return group.started; }));
+    }
+
+private:
     // A request release can precede the cache; never inspect a newer epoch.
-    std::optional<Candidate> Next(std::uint64_t max_rank_epoch) {
+    template <typename IsSelected>
+    std::optional<Candidate> nextCached(std::uint64_t max_rank_epoch, const LocationSet& protected_locations,
+                                        const LocationSet& request_reclaim_locations, const IsSelected& is_selected) {
         while (true) {
             const Candidate* best = nullptr;
             GroupCursor* best_group = nullptr;
@@ -178,7 +204,7 @@ public:
             }
             // Read complete equal epochs before applying policy tie-breaks.
             if (next_group != nullptr && (best == nullptr || *next_epoch <= best->rank_epoch)) {
-                loadEpoch(*next_group, *next_epoch);
+                loadEpoch(*next_group, *next_epoch, protected_locations, request_reclaim_locations);
                 continue;
             }
             // Each distance's aged checkpoints are read once those of every
@@ -186,7 +212,7 @@ public:
             if (next_aged_distance_ > aged_floor_ && aging_.cutoff_epoch <= max_rank_epoch &&
                 (best == nullptr || best->rank_epoch > aging_.cutoff_epoch ||
                  (best->rank_epoch == aging_.cutoff_epoch && best->aged_distance < next_aged_distance_))) {
-                loadAgedDistance();
+                loadAgedDistance(protected_locations, request_reclaim_locations);
                 continue;
             }
             if (best == nullptr) {
@@ -205,7 +231,7 @@ public:
                     const auto [candidate, hash] = aged_[next_aged_++];
                     // Descendants the plan took can bring this within the leaf distance.
                     if (aging_.tree->StaysAged(*hash, aging_.tier, [&](const ContentHash& descendant) {
-                            return removed_checkpoints_ != nullptr && removed_checkpoints_->contains(descendant);
+                            return checkpointRemoved(descendant, is_selected);
                         })) {
                         return candidate;
                     }
@@ -220,10 +246,20 @@ public:
         }
     }
 
-    std::size_t ScannedCandidates() const { return scanned_candidates_; }
-    std::size_t GroupScans() const { return group_scans_; }
+    // A checkpoint becomes incomplete when any State group's entry leaves.
+    // Query the selected blocks directly instead of mirroring them in a hash counter.
+    template <typename IsSelected>
+    bool checkpointRemoved(const ContentHash& hash, const IsSelected& is_selected) const {
+        CacheKey key{.content_hash = hash};
+        for (const CacheGroup& group : groups_) {
+            if (group.Spec().attn_kind != AttnKind::kState) continue;
+            key.group_id = group.Id();
+            const auto entry = group.Index().Inspect(pool_, key);
+            if (entry && is_selected(entry->location)) return true;
+        }
+        return false;
+    }
 
-private:
     // The evictionKey fields before (boundary_tier, position_rank): the
     // radix path of Sort requires every candidate to share them.
     static std::tuple<std::uint64_t, std::int32_t, std::uint64_t> rankPrefix(const Candidate& candidate) {
@@ -302,9 +338,9 @@ private:
         return true;
     }
 
-    bool excluded(CacheBlockLocation location) const {
-        return (protected_locations_ != nullptr && protected_locations_->contains(location)) ||
-               (request_reclaim_locations_ != nullptr && request_reclaim_locations_->contains(location));
+    static bool excluded(CacheBlockLocation location, const LocationSet& protected_locations,
+                         const LocationSet& request_reclaim_locations) {
+        return protected_locations.contains(location) || request_reclaim_locations.contains(location);
     }
 
     // The group facts a candidate's rank depends on, read once per epoch.
@@ -316,16 +352,15 @@ private:
         std::int32_t sink_blocks;
         bool has_sink;
     };
-    GroupRanking groupRanking(std::uint32_t group_id) const {
-        const CacheGroup& group = groups_[group_id];
+    static GroupRanking groupRanking(const CacheGroup& group) {
         return GroupRanking{.closed = group.Matcher().IsPrefixClosed(),
                             .sink_blocks = group.Allocator().KeptHeadBlocks(),
                             .has_sink = group.Spec().sink_tokens > 0};
     }
 
     // `metadata` is the entry's, null when no entry is at `location`.
-    Candidate makeCandidate(std::uint32_t group_id, const GroupRanking& ranking, CacheBlockLocation location,
-                            const PrefixCacheIndex::EvictionMetadata* metadata) const {
+    static Candidate makeCandidate(std::uint32_t group_id, const GroupRanking& ranking, CacheBlockLocation location,
+                                   const PrefixCacheIndex::EvictionMetadata* metadata) {
         Candidate candidate{.last_access_epoch = metadata ? metadata->last_access_epoch : 0,
                             .location = location,
                             .group_id = group_id};
@@ -385,11 +420,9 @@ private:
         return groups_[group.group_id].Index().PeekEvictionEpoch(pool_, group.index_cursor);
     }
 
-    void loadEpoch(GroupCursor& group, std::uint64_t epoch) {
-        if (!group.started) {
-            group.started = true;
-            ++group_scans_;
-        }
+    void loadEpoch(GroupCursor& group, std::uint64_t epoch, const LocationSet& protected_locations,
+                   const LocationSet& request_reclaim_locations) {
+        group.started = true;
         group.candidates.clear();
         group.next_candidate = 0;
         epoch_scratch_.clear();
@@ -406,9 +439,10 @@ private:
         }
         scanned_candidates_ += epoch_scratch_.size();
         group.candidates.reserve(epoch_scratch_.size());
-        const GroupRanking ranking = groupRanking(group.group_id);
+        const GroupRanking ranking = groupRanking(groups_[group.group_id]);
         for (const auto& entry : epoch_scratch_) {
-            if (excluded(entry.location) || aged(group.group_id, entry)) {
+            if (excluded(entry.location, protected_locations, request_reclaim_locations) ||
+                aged(group.group_id, entry)) {
                 continue;
             }
             group.candidates.push_back(makeCandidate(group.group_id, ranking, entry.location, &entry.metadata));
@@ -418,7 +452,7 @@ private:
 
     // The unpinned State entries of the next distance's aged checkpoints,
     // as loadEpoch skips them.
-    void loadAgedDistance() {
+    void loadAgedDistance(const LocationSet& protected_locations, const LocationSet& request_reclaim_locations) {
         const std::int32_t distance = next_aged_distance_--;
         aged_.clear();
         next_aged_ = 0;
@@ -429,12 +463,13 @@ private:
                 }
                 const auto entry = groups_[group_id].Index().Inspect(
                     pool_, CacheKey{.group_id = groups_[group_id].Id(), .content_hash = hash});
-                if (!entry || entry->pinned || excluded(entry->location) ||
+                if (!entry || entry->pinned ||
+                    excluded(entry->location, protected_locations, request_reclaim_locations) ||
                     entry->metadata.eviction.last_access_epoch < aging_.cutoff_epoch) {
                     continue;
                 }
-                Candidate candidate =
-                    makeCandidate(group_id, groupRanking(group_id), entry->location, &entry->metadata.eviction);
+                Candidate candidate = makeCandidate(group_id, groupRanking(groups_[group_id]), entry->location,
+                                                    &entry->metadata.eviction);
                 candidate.rank_epoch = aging_.cutoff_epoch;
                 candidate.aged_distance = distance;
                 aged_.emplace_back(candidate, &hash);
@@ -446,10 +481,9 @@ private:
 
     const std::vector<CacheGroup>& groups_;
     const BlockPool& pool_;
-    const LocationSet* protected_locations_;
-    const LocationSet* request_reclaim_locations_;
     CheckpointAging aging_;
-    const RemovedCheckpoints* removed_checkpoints_;
+    std::optional<Candidate> next_cached_;
+    std::size_t next_request_reclaim_{0};
     std::vector<GroupCursor> cursors_;
     std::vector<PrefixCacheIndex::EvictionCandidate> epoch_scratch_;
     // The other buffer of a loaded epoch's radix sort (Sort).
@@ -463,7 +497,6 @@ private:
     // Aged candidates that became leaves within the plan, at their own epoch.
     std::vector<Candidate> requeued_;
     std::size_t scanned_candidates_{0};
-    std::size_t group_scans_{0};
 };
 
 }  // namespace tokenspeed

@@ -141,8 +141,9 @@ The answers hold until then because nothing leaves a holder's cache outside
 a plan: eviction, dead-entry collection and compaction run only while one is
 built, and the next plan is built after the head that applies the pin. A
 member whose data plane still runs the plan dispatched before the answer
-touches no page the answer named: that plan's evictions were already in the
-scheduler state the answer read.
+touches no page an accepted pin named: that plan's evictions were already in
+the scheduler state the answer read, and the pin rejects Device pages whose
+H2D load has not been acknowledged by every replica member.
 
 **Lookup and soft pin.** The holder probes its own Device and Host prefix
 with the ordinary matchers, so a hybrid model's reply is already cut to a
@@ -162,11 +163,15 @@ destinations leave the plan's pages to zero, since the landing fills them
 whole.
 
 **Pin.** The servicer checks that the lookup's prompt, up to the answered
-boundary, still resolves to exactly the answered pages, answers, and queues
-the hard pin of exactly those pages; a pin that finds them changed at the
-head holds nothing. The hard pin takes block references (`CacheBlockRef`), so
-the pages can neither be evicted, relocated by compaction nor moved by
-write-back. It has its own deadline, after which the holder's scheduler
+boundary, still resolves to exactly the answered pages and that none of its
+Device pages is an unacknowledged prefix-load destination. Local forwards
+can use these indexed pages through their layerwise H2D fences; remote reads
+have no such ordering. A pin refused during a load falls back locally;
+unrelated Device pages and published Host pages remain available. An accepted
+answer queues the hard pin of exactly those pages; a pin that finds them
+changed at the head holds nothing. The hard pin takes block references
+(`CacheBlockRef`), so the pages can neither be evicted, relocated by
+compaction nor moved by write-back. It has its own deadline, after which the holder's scheduler
 releases it and leaves a tombstone.
 
 **Read.** Readers pull: one-sided reads from the holder's registered Device
@@ -178,7 +183,9 @@ local Host hit: a destination may be a block that plan freed, and the
 device's reads of it are not ordered with the network's writes; and the
 landing's end releases the request to a later plan's forward, which does not
 wait for this plan's loads. PD's decode role starts its receive from the same
-point.
+point. The landing waits on separate completion events for the default and
+load streams after the current forward is launched. The default stream does
+not wait for the entire load, so that forward keeps its layerwise load overlap.
 
 **Release.** The servicer answers whether the pages stayed untouched from the
 pin: either no plan ran on the holder since the pin's answer, or the hard pin
@@ -205,6 +212,10 @@ admitted boundary. No failure stops the engine.
 **A holder goes down** at any step: a lookup without an answer by its
 deadline admits locally; a pin, a read or a release without an answer by its
 deadline gives the landing up. Its leases go with it.
+Outstanding layout queries are coalesced only until their answer deadline;
+a send failure clears the query immediately. Later landings can ask again
+after a lost request or reply, and a weight update clears outstanding queries
+along with the cached layouts.
 
 **A reader goes down:** the holder's soft and hard pins expire by their
 deadlines; nothing leaks.
@@ -255,6 +266,11 @@ The transfer uses Mooncake Transfer Engine, not Mooncake Store. TokenSpeed's
 C entry points (`transfer_engine_tokenspeed.h`, loaded by `ts-mooncake`) gain a
 batched one-sided read beside the existing writes. Each engine registers its
 Device cache arena and its Host pool once at startup.
+Each reader rank runs at most four reads concurrently through the engine's
+thread-safe entry points. Workers share a queue and report each job only
+after its synchronous read returns; queued jobs retain their landing's pages
+too. Shutdown drains the queue and joins every worker before the transfer
+engine can unregister its memory.
 
 - Across nodes: RDMA, GPUDirect where the NIC and GPU allow it.
 - Within a node, between attention-DP replicas: NVLink (or the node's
@@ -382,13 +398,15 @@ leases held by tier, demoted and dropped blocks and their returns.
 ## Testing
 
 - Scheduler (C++): answers that change nothing, changes applied at the head,
-  a pin of changed pages, a release across a plan with and without the pin,
-  lease phases and expiry, fallback to a local admission at every step, an
-  abort while landing, a tail hit cut back to a page so no destination is a
+  a pin of changed or still-loading pages, a release across a plan with and
+  without the pin, lease phases and expiry, fallback to a local admission at
+  every step, an abort while landing, a tail hit cut back to a page so no destination is a
   copy or load destination, demotion of a leaf chain and its stop at a branch
   or an access, on full-history and hybrid (sliding window and State) group
   sets.
-- Engine host (Rust): control messages and deadlines over real sockets.
+- Engine host (Rust): control messages and deadlines over real sockets,
+  recovery after a lost layout query, bounded concurrent reads and draining
+  queued reads on shutdown.
 - GPU: reads from Device and from Host sources, on one node and across nodes;
   reader and holder killed mid-transfer; output identical to recomputation.
 - Router: scoring with each link model, hint round trip, stale directory.

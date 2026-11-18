@@ -112,19 +112,23 @@ public:
     // hits.
     PrefixProbe::Tier ProbeTier(const PromptPrefix& prompt, std::span<const std::vector<CacheKey>> group_keys,
                                 std::span<const std::size_t> match_order, bool claim_partial) const;
-    // The Host-suffix probe over boundaries above above_tokens: the Device's KV
+    struct HostSuffixProbe {
+        PrefixProbe::Tier device;
+        PrefixProbe::Tier host;
+    };
+    // The Host-suffix probe over boundaries beyond above_tokens: the Device's KV
     // prefix (device.kv_tokens, of the Device-only probe, bounds it), then a
     // Host suffix, the State checkpoints from either tier. extra_hits are
-    // assumed on the Host tier only. On a hit `device` becomes its Device part
-    // and `host` its Host part; otherwise `device` is left alone and
-    // host.num_common_tokens is 0. Either way host.kv_tokens is the longest
+    // assumed on the Host tier only. Returns both tiers together. On a hit the Device part
+    // is trimmed to its share; otherwise it keeps the supplied Device probe
+    // and host.num_common_tokens is 0. Either way host.kv_tokens is the longest
     // boundary whose KV the two tiers hold together when the Host holds part of
     // it -- the KV reach the Host adds past the Device's own -- and 0
     // otherwise.
-    void ProbeHostSuffix(const PromptPrefix& prompt, std::span<const std::vector<CacheKey>> group_keys,
-                         std::span<const std::size_t> match_order, std::int32_t above_tokens,
-                         const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits, PrefixProbe::Tier& device,
-                         PrefixProbe::Tier& host) const;
+    HostSuffixProbe ProbeHostSuffix(const PromptPrefix& prompt, std::span<const std::vector<CacheKey>> group_keys,
+                                    std::span<const std::size_t> match_order, std::int32_t above_tokens,
+                                    const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits,
+                                    PrefixProbe::Tier device) const;
     // The boundaries a tier may resume at, longest first: the tails published
     // inside each page under its prior that the prompt's own tokens reach and the
     // page boundaries themselves, from the page containing `from_tokens` down to
@@ -145,23 +149,30 @@ private:
                                         std::span<const std::size_t> match_order, std::int32_t num_prefix_pages,
                                         std::int32_t floor_tokens,
                                         const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits) const;
-    // Whether group i can resume at the boundary full_tokens + tail_tokens on
-    // this tier; on success fills tail_hits over tail_keys and, when asked,
-    // page_hits over the group's full-page keys above the floor (from page 0
-    // for a State group).
+    struct GroupBoundaryHits {
+        GroupPrefixProbe tail;
+        GroupPrefixProbe pages;
+    };
+    struct GroupBoundaryProbe {
+        bool accepts;
+        GroupBoundaryHits hits;
+    };
+    // Return the boundary decision and its hit arrays together. Consuming the
+    // previous arrays retains their capacity while successive boundaries are tried.
     template <CacheTier Tier>
-    bool groupAcceptsBoundary(std::size_t i, std::span<const std::string> prefix_hashes, std::int32_t floor_tokens,
-                              std::int32_t full_tokens, std::int32_t tail_tokens, std::span<const CacheKey> tail_keys,
-                              GroupPrefixProbe& tail_hits, GroupPrefixProbe* page_hits,
-                              const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits) const;
+    GroupBoundaryProbe probeGroupBoundary(std::size_t i, std::span<const std::string> prefix_hashes,
+                                          std::int32_t floor_tokens, std::int32_t full_tokens, std::int32_t tail_tokens,
+                                          std::span<const CacheKey> tail_keys, bool include_page_hits,
+                                          GroupBoundaryHits hits,
+                                          const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits) const;
     bool stateGroupsAcceptBoundary(std::span<const std::size_t> match_order, std::span<const std::string> prefix_hashes,
                                    std::int32_t full_tokens, std::int32_t tail_tokens, const ContentHash& tail_hash,
                                    bool allow_host, const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits) const;
     PrefixProbe probePrefixWithOrder(const PromptPrefix& prompt, std::span<const std::size_t> match_order,
                                      bool claim_partial) const;
-    // ProbeDecodePrefix's Host tier over its history groups.
-    void probeDecodeHostSuffix(const PromptPrefix& prompt, std::span<const std::size_t> history_match_order,
-                               PrefixProbe& probe) const;
+    // ProbeDecodePrefix's Device history and whole-page Host suffix.
+    PrefixProbe probeDecodeHistoryPrefix(const PromptPrefix& prompt,
+                                         std::span<const std::size_t> history_match_order) const;
 
     const CacheStore& store_;
     const CacheEvictor& evictor_;

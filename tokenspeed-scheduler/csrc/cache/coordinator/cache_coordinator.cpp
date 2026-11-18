@@ -239,7 +239,7 @@ template <CacheTier Tier>
 CoordinatorMatch CacheCoordinator::acquireTierWithKeys(std::span<const std::vector<CacheKey>> group_keys,
                                                        std::int32_t floor_tokens, PrefixProbe::Tier&& probe,
                                                        std::uint64_t access_epoch) {
-    BlockPool& pool = store_.TierPool<Tier>();
+    const BlockPool& pool = store_.TierPool<Tier>();
     CoordinatorMatch out;
     out.num_common_tokens = probe.num_common_tokens;
     out.per_group.resize(store_.Groups().size());
@@ -253,13 +253,13 @@ CoordinatorMatch CacheCoordinator::acquireTierWithKeys(std::span<const std::vect
             continue;
         }
         // A State group's hits count from page 0 (PrefixProbe::Tier).
-        const std::int32_t floor_pages = GroupIsState(i) ? 0 : floor_tokens / store_.Geometry()[i].BlockGranularity();
+        const std::int32_t begin_block = GroupIsState(i) ? 0 : floor_tokens / store_.Geometry()[i].BlockGranularity();
         out.per_group[i] = store_.Groups()[i].Index().AcquireMatched(
-            pool, group_keys[i], floor_pages, probe.per_group[i], access_epoch, SessionForAccess(access_epoch));
+            pool, group_keys[i], begin_block, probe.per_group[i], access_epoch, SessionForAccess(access_epoch));
         if constexpr (Tier == CacheTier::kDevice) {
             if (store_.HostPool() != nullptr) {
                 store_.Groups()[i].Index().TouchExisting(
-                    *store_.HostPool(), std::span{group_keys[i]}.subspan(floor_pages), out.per_group[i].blocks,
+                    *store_.HostPool(), std::span{group_keys[i]}.subspan(begin_block), out.per_group[i].blocks,
                     access_epoch, SessionForAccess(access_epoch));
             }
         }
@@ -267,7 +267,7 @@ CoordinatorMatch CacheCoordinator::acquireTierWithKeys(std::span<const std::vect
             // The tail's blocks follow the full pages in the same table.
             PrefixMatch tail_match = store_.Groups()[i].Index().AcquireMatched(
                 pool, probe.tail->group_keys[i],
-                /*begin_blocks=*/0, probe.tail->per_group[i], access_epoch, SessionForAccess(access_epoch));
+                /*begin_block=*/0, probe.tail->per_group[i], access_epoch, SessionForAccess(access_epoch));
             if constexpr (Tier == CacheTier::kDevice) {
                 if (store_.HostPool() != nullptr) {
                     store_.Groups()[i].Index().TouchExisting(*store_.HostPool(), probe.tail->group_keys[i],
@@ -332,7 +332,7 @@ CacheCoordinator::AcquiredPrefix CacheCoordinator::acquirePrefix(PrefixProbe&& p
             }
             PrefixMatch match =
                 store_.Groups()[i].Index().AcquireMatched(store_.DevicePool(), probe.state_at_prompt_end->group_keys[i],
-                                                          /*begin_blocks=*/0, probe.state_at_prompt_end->per_group[i],
+                                                          /*begin_block=*/0, probe.state_at_prompt_end->per_group[i],
                                                           access_epoch, SessionForAccess(access_epoch));
             if (store_.HostPool() != nullptr) {
                 store_.Groups()[i].Index().TouchExisting(*store_.HostPool(), probe.state_at_prompt_end->group_keys[i],
@@ -542,7 +542,7 @@ std::int32_t CacheCoordinator::NumNewlyReleasableLcmBlocks(std::span<const Block
 }
 
 void CacheCoordinator::CacheFullBlocks(std::span<BlockTable> tables, std::span<const std::string> content_hashes,
-                                       std::uint64_t access_epoch, std::int32_t first_slot,
+                                       std::uint64_t access_epoch, std::int32_t first_prefix_page,
                                        CacheBoundaryKind boundary_kind) {
     _assert(tables.size() == store_.Groups().size(), "tables/groups size mismatch");
     if (content_hashes.empty()) {
@@ -553,8 +553,8 @@ void CacheCoordinator::CacheFullBlocks(std::span<BlockTable> tables, std::span<c
             continue;  // a state checkpoint is published by its natural point, never by slot
         }
         std::vector<CacheKey> keys = store_.KeysForGroup(content_hashes, store_.Groups()[i].Id());
-        const std::int32_t pages_per_prefix_hash = store_.BlocksPerBoundary(static_cast<std::int32_t>(i));
-        cacheFullBlocksForGroup<CacheTier::kDevice>(i, tables[i], keys, first_slot * pages_per_prefix_hash,
+        const std::int32_t blocks_per_boundary = store_.BlocksPerBoundary(static_cast<std::int32_t>(i));
+        cacheFullBlocksForGroup<CacheTier::kDevice>(i, tables[i], keys, first_prefix_page * blocks_per_boundary,
                                                     access_epoch, boundary_kind, /*stream_completed_to_host=*/false);
     }
 }
@@ -1019,7 +1019,7 @@ void CacheCoordinator::ReclaimExpired(std::span<BlockTable> tables, std::int32_t
     _assert(tables.size() == store_.Groups().size(), "tables/groups size mismatch");
     for (std::size_t i = 0; i < store_.Groups().size(); ++i) {
         store_.Groups()[i].Allocator().ReclaimExpired(
-            store_.DevicePool(), tables[i], groupExpiredBlocksAt(static_cast<std::int32_t>(i), num_computed_tokens));
+            store_.DevicePool(), tables[i], groupExpiredBlockEndAt(static_cast<std::int32_t>(i), num_computed_tokens));
     }
 }
 
@@ -1129,15 +1129,15 @@ namespace {
 // two slots are both data.
 CacheCoordinator::DataSpan dataSpan(const BlockTable& table, const GroupGeometry& geometry, std::int32_t num_tokens) {
     if (!geometry.HasTokenSpan()) {
-        return CacheCoordinator::DataSpan{.blocks = table.NumBlocks(), .tail_tokens = 0};
+        return CacheCoordinator::DataSpan{.num_blocks = table.NumBlocks(), .available_tokens = 0};
     }
     const std::int32_t block_granularity = geometry.BlockGranularity();
     const std::int32_t covering = CeilDiv(num_tokens, block_granularity);
     _assert(covering <= table.NumBlocks(), "snapshot token count exceeds the table's logical fill");
     // Less than one block, though the covering blocks' capacity can pass INT32_MAX.
     return CacheCoordinator::DataSpan{
-        .blocks = covering,
-        .tail_tokens = static_cast<std::int32_t>(std::int64_t{covering} * block_granularity - num_tokens)};
+        .num_blocks = covering,
+        .available_tokens = static_cast<std::int32_t>(std::int64_t{covering} * block_granularity - num_tokens)};
 }
 
 }  // namespace
@@ -1150,7 +1150,7 @@ std::vector<std::vector<ImageSlot>> CacheCoordinator::PublishedDataSlots(std::sp
     for (std::size_t i = 0; i < store_.Groups().size(); ++i) {
         const DataSpan span = dataSpan(tables[i], store_.Geometry()[i], num_tokens);
         const std::span<const CacheBlockRef> blocks = tables[i].Blocks();
-        for (std::int32_t slot = 0; slot < span.blocks; ++slot) {
+        for (std::int32_t slot = 0; slot < span.num_blocks; ++slot) {
             const CacheBlockRef& block = blocks[static_cast<std::size_t>(slot)];
             if (std::optional<CacheKey> key = store_.Groups()[i].Index().KeyOf(store_.DevicePool(), block)) {
                 const std::optional<PrefixCacheIndex::CachedBlockMetadata> metadata =
@@ -1188,16 +1188,16 @@ std::optional<CacheCoordinator::SnapshotPoolPlan> CacheCoordinator::planSnapshot
     for (std::size_t i = 0; i < store_.Groups().size(); ++i) {
         const GroupAllocator& allocator = store_.Groups()[i].Allocator();
         plan.spans[i] = dataSpan(tables[i], store_.Geometry()[i], num_tokens);
-        std::vector<std::uint8_t> served(static_cast<std::size_t>(plan.spans[i].blocks), 0);
+        std::vector<std::uint8_t> served(static_cast<std::size_t>(plan.spans[i].num_blocks), 0);
         for (const ImageSlot& slot : host_served_slots[i]) {
             _assert(slot.InHostCache(), "a Host-served snapshot slot carries the key it is published under");
-            _assert(slot.slot_index >= 0 && slot.slot_index < plan.spans[i].blocks,
+            _assert(slot.slot_index >= 0 && slot.slot_index < plan.spans[i].num_blocks,
                     "a Host-served snapshot slot must be a data slot");
             served[static_cast<std::size_t>(slot.slot_index)] = 1;
         }
-        std::vector<std::int64_t> need(static_cast<std::size_t>(allocator.ShardCount()), 0);
+        std::vector<std::int64_t> blocks_by_bucket(static_cast<std::size_t>(allocator.ShardCount()), 0);
         const std::span<const CacheBlockRef> blocks = tables[i].Blocks();
-        for (std::int32_t slot = 0; slot < plan.spans[i].blocks; ++slot) {
+        for (std::int32_t slot = 0; slot < plan.spans[i].num_blocks; ++slot) {
             const CacheBlockRef& block = blocks[static_cast<std::size_t>(slot)];
             if (!block || served[static_cast<std::size_t>(slot)]) {
                 continue;
@@ -1205,11 +1205,11 @@ std::optional<CacheCoordinator::SnapshotPoolPlan> CacheCoordinator::planSnapshot
             const std::int32_t bucket = allocator.BucketOf(block->Location());
             plan.private_slots[i].push_back(slot);
             plan.private_buckets[i].push_back(bucket);
-            ++need[static_cast<std::size_t>(bucket)];
+            ++blocks_by_bucket[static_cast<std::size_t>(bucket)];
         }
         parents_needed +=
-            ParentsNeededForBuckets(need, store_.SnapshotPool()->FreeSlotsByBucket(store_.Groups()[i].Id()),
-                                    /*dense_need=*/0, store_.SnapshotPool()->Packing(store_.Groups()[i].Id()));
+            ParentsNeededForBuckets(blocks_by_bucket, store_.SnapshotPool()->FreeSlotsByBucket(store_.Groups()[i].Id()),
+                                    /*any_bucket_blocks=*/0, store_.SnapshotPool()->Packing(store_.Groups()[i].Id()));
     }
     if (parents_needed > store_.SnapshotPool()->NumEmptyLcmBlocks()) {
         return std::nullopt;
@@ -1245,7 +1245,7 @@ std::vector<std::vector<ImageSlot>> CacheCoordinator::PublishedDataSlotsAfter(st
                 // A slot beyond the data span, a null hole, or one already
                 // published is not added: the publication would register
                 // nothing new there.
-                if (slot >= span.blocks || !blocks[index] ||
+                if (slot >= span.num_blocks || !blocks[index] ||
                     std::ranges::any_of(slots, [slot](const ImageSlot& s) { return s.slot_index == slot; })) {
                     continue;
                 }
@@ -1282,9 +1282,9 @@ std::optional<CacheCoordinator::ImageTaken> CacheCoordinator::TakeImage(
     image.image.tables.reserve(store_.Groups().size());
     for (std::size_t i = 0; i < store_.Groups().size(); ++i) {
         ImageTable shape{
-            .num_blocks = plan->spans[i].blocks,
-            .reclaimed_prefix_blocks = std::min(tables[i].ReclaimedPrefixBlocks(), plan->spans[i].blocks),
-            .available_tokens = plan->spans[i].tail_tokens,
+            .num_blocks = plan->spans[i].num_blocks,
+            .reclaimed_prefix_blocks = std::min(tables[i].ReclaimedPrefixBlocks(), plan->spans[i].num_blocks),
+            .available_tokens = plan->spans[i].available_tokens,
             .slots = host_cached_slots[i],
         };
         std::vector<CacheBlockRef> snapshot_blocks =

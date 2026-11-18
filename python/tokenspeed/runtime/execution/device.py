@@ -605,13 +605,19 @@ class DeviceHandle:
         # below the landing: the request's first forward runs in a later plan,
         # whose layerwise load waits name only that plan's loads. The
         # landing's own blocks are never zeroed, copied or loaded into.
-        landing_fence = None
+        landing_fences = []
         if peer_fetches or remote_prefill is not None:
             executor.default_stream.wait_stream(executor.execution_stream)
+            fence_streams = [executor.default_stream]
             if l2 is not None and cache_ops:
-                executor.default_stream.wait_stream(l2.load_stream)
-            landing_fence = executor.device_module.Event()
-            landing_fence.record(executor.default_stream)
+                fence_streams.append(l2.load_stream)
+            # Keep the Host-load fence separate: putting its wait on the
+            # default stream would stall this plan's forward behind the
+            # entire load instead of its ordinary layerwise waits.
+            for stream in fence_streams:
+                fence = executor.device_module.Event()
+                fence.record(stream)
+                landing_fences.append(fence)
 
         # The transfer peer's streams: prefills or decodes the peer NODE runs,
         # handed over asynchronously exactly like the model's ForwardBatch,
@@ -644,13 +650,14 @@ class DeviceHandle:
             # landed, so masking continues from the right state.
             result = self._launch_forward(planned)
 
+        # Both transfer triggers are CPU-issued and write outside CUDA
+        # streams. Wait after launching this plan's forward, so that forward
+        # can overlap the loads while the landing waits for every prerequisite.
+        for fence in landing_fences:
+            fence.synchronize()
         if remote_prefill is not None:
-            self._pull_remote_prefill(remote_prefill, landing_fence)
+            peer.execute(remote_prefill)
         if peer_fetches:
-            # Behind the forward's launch, as the remote prefill's pull is:
-            # the wait holds the forward thread until the step in flight
-            # ends, and never delays this plan's launch.
-            landing_fence.synchronize()
             self._peer_outbox.reads_ready()
         return result
 
@@ -788,29 +795,6 @@ class DeviceHandle:
             list(remote_prefill.request_pool_indices[:num_extends])
         )
         executor.reset_remote_prefill_cache_lengths(remote_prefill)
-
-    def _pull_remote_prefill(self, remote_prefill, landing_fence) -> None:
-        """Pull a remote-prefill stream's rows' KV from the peer, behind the
-        round's forward.
-
-        The RDMA trigger is CPU-issued but writes the device pages the slot
-        preparation touched (Mooncake and GPUDirect writes are not ordered
-        with any stream), so it waits for the plan's landing fence: the
-        forwards in flight, the write-back stores reading pages this
-        admission was granted, the copies, the zeroing and the loads of the
-        admission's Host hit. The fence is ordered behind the step in flight,
-        so this wait holds the forward thread until that step ends; placed
-        after the round's forward is launched, it never delays that launch.
-        Completion arrives through the transfer events.
-
-        Args:
-            remote_prefill: The plan's remote-prefill stream; supplies the
-                admitted rows.
-            landing_fence: The event recorded behind everything the plan
-                does to the landing's blocks before the transfer.
-        """
-        landing_fence.synchronize()
-        self._kv_transfer.execute(remote_prefill)
 
     # ------------------------------------------------------------------
     # Memory-saver release/wake (see engine/memory_occupation.py)

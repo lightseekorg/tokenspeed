@@ -140,13 +140,16 @@ probes the Device alone. This RFC removes both rules.
   entries, now beside ordinary ones.
 - **Ordering.** A landing writes its blocks from outside the streams, and
   its end releases its request to a later plan's forward. So PD's decode
-  receive and RFC 0004's peer reads wait for one landing fence, recorded
-  behind:
+  receive and RFC 0004's peer reads wait for completion events covering:
   - the forwards in flight;
   - the write-back stores that read victims this plan regranted;
   - the copies and the zeroing;
   - this plan's loads of the request's Host hit, which the later forward's
     layerwise load waits do not cover.
+
+  The default and load streams have separate events. The landing waits for
+  both after launching the current forward, without making the default
+  stream wait for the whole load and delaying that forward's layerwise work.
 
   Today the receive waits for the plan's zeroing only, and a plan may zero
   nothing.

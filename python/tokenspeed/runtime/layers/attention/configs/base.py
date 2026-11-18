@@ -287,12 +287,12 @@ class AttnConfig:
         if self.kvp_size > 1:
             softmax = softmax_components[0]
             if self.is_draft and not softmax.is_latent_kv:
-                # A block drafter of its own attention family (DFlash: a GQA
-                # stack storing K/V head rows) shares the target's full-history
-                # group (check_block_drafter_storage), so page-sharding that
-                # group puts head-partitioned K/V inside a sharded group, which
-                # PD refuses to transfer (ts-pd layout/route.rs). Refused here,
-                # at startup, not per request once traffic arrives.
+                # A draft storing K/V head rows in the target's page-sharded
+                # full-history group puts head-partitioned K/V inside a sharded
+                # group, which PD refuses to transfer (ts-pd layout/route.rs).
+                # An MHA draft is configured without KVP instead
+                # (model_wide_kwargs). Refused here, at startup, not per
+                # request once traffic arrives.
                 raise ValueError(
                     "--kv-parallel-size > 1 page-shards the cache group a "
                     "block drafter shares with the target, but this draft "
@@ -362,6 +362,7 @@ def model_wide_kwargs(
     draft_block_causal: bool = False,
     speculative_num_draft_tokens: int | None = None,
     shards_query_context: bool = False,
+    shards_kv_history: bool = True,
 ) -> dict:
     """The AttnConfig fields shared by every family's generate().
 
@@ -372,6 +373,12 @@ def model_wide_kwargs(
     ``shards_query_context`` says whether this family can compute a query
     context parallel shard (GPU DSA through the MLA config, and V4.1). It only
     affects a draft config; ``__post_init__`` refuses a target that cannot shard.
+
+    ``shards_kv_history`` says whether this family's draft can live in a
+    page-sharded history group. One that stores K/V head rows cannot (PD
+    cannot transfer them out of one), so it is configured without KVP and its
+    recipe must give it an unsharded group; the registry refuses a plan that
+    page-shards it.
     """
     max_bs = server_args.max_num_seqs // (
         server_args.data_parallel_size or server_args.mapping.attn.dp_size
@@ -397,10 +404,11 @@ def model_wide_kwargs(
     # over them whole (the DFlash drafter builds its logits metadata with
     # ``query_shard=None``), so it is configured unsharded.
     draft_unsharded = is_draft and not shards_query_context
+    draft_history_unsharded = is_draft and not shards_kv_history
     kwargs.update(
-        kvp_size=attn_mapping.kvp_size,
-        kvp_rank=attn_mapping.kvp_rank,
-        kvp_group=attn_mapping.kvp_group,
+        kvp_size=1 if draft_history_unsharded else attn_mapping.kvp_size,
+        kvp_rank=0 if draft_history_unsharded else attn_mapping.kvp_rank,
+        kvp_group=(0,) if draft_history_unsharded else attn_mapping.kvp_group,
         qcp_size=1 if draft_unsharded else attn_mapping.qcp_size,
         qcp_rank=0 if draft_unsharded else attn_mapping.qcp_rank,
         qcp_group=(0,) if draft_unsharded else attn_mapping.qcp_group,

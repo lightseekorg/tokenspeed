@@ -281,10 +281,10 @@ TEST(FullAttnMatcherTest, ProbeRequiresExplicitL3HitSet) {
     std::unordered_set<CacheKey, CacheKeyHash> l3_hits{key};
 
     EXPECT_TRUE(FullAttnMatcher{}
-                    .Probe(index, pool, keys, /*begin_blocks=*/0, /*max_blocks=*/1, /*extra_hits=*/nullptr)
+                    .Probe(index, pool, keys, /*begin_block=*/0, /*end_block=*/1, /*extra_hits=*/nullptr)
                     .hits.empty());
     const GroupPrefixProbe probe =
-        FullAttnMatcher{}.Probe(index, pool, keys, /*begin_blocks=*/0, /*max_blocks=*/1, &l3_hits);
+        FullAttnMatcher{}.Probe(index, pool, keys, /*begin_block=*/0, /*end_block=*/1, &l3_hits);
     ASSERT_EQ(probe.hits.size(), 1u);
     EXPECT_EQ(probe.hits.front(), 1);
 }
@@ -988,7 +988,8 @@ TEST(CacheCoordinatorAdmissionTest, ProbeAndRejectedAdmissionDoNotAdvanceAccessE
 
     const std::optional<AdmissionResult> owner = AdmitForTest(coordinator, owner_tables, /*num_tokens=*/4);
     ASSERT_TRUE(owner);
-    coordinator.CacheFullBlocks(owner_tables, hashes, owner->access_epoch, /*first_slot=*/0, CacheBoundaryKind::kChunk);
+    coordinator.CacheFullBlocks(owner_tables, hashes, owner->access_epoch, /*first_prefix_page=*/0,
+                                CacheBoundaryKind::kChunk);
     const CacheBlockLocation location = owner_tables[0].Blocks().front()->Location();
 
     PrefixProbe probe = coordinator.Prober().ProbePrefix(hashes);
@@ -1036,14 +1037,14 @@ TEST(CacheCoordinatorAdmissionTest, FullEvictionPrefersOlderRequestBeforePositio
     std::vector<BlockTable> old_tables(coordinator.NumGroups());
     const std::optional<AdmissionResult> old_request = AdmitForTest(coordinator, old_tables, /*num_tokens=*/4);
     ASSERT_TRUE(old_request);
-    coordinator.CacheFullBlocks(old_tables, old_hashes, old_request->access_epoch, /*first_slot=*/0,
+    coordinator.CacheFullBlocks(old_tables, old_hashes, old_request->access_epoch, /*first_prefix_page=*/0,
                                 CacheBoundaryKind::kChunk);
     coordinator.Free(old_tables);
 
     std::vector<BlockTable> new_tables(coordinator.NumGroups());
     const std::optional<AdmissionResult> new_request = AdmitForTest(coordinator, new_tables, /*num_tokens=*/12);
     ASSERT_TRUE(new_request);
-    coordinator.CacheFullBlocks(new_tables, new_hashes, new_request->access_epoch, /*first_slot=*/0,
+    coordinator.CacheFullBlocks(new_tables, new_hashes, new_request->access_epoch, /*first_prefix_page=*/0,
                                 CacheBoundaryKind::kChunk);
     coordinator.Free(new_tables);
 
@@ -1069,7 +1070,7 @@ TEST(CacheCoordinatorAdmissionTest, FullEvictionIsSuffixFirstWithinOneAccessEpoc
     std::vector<BlockTable> cached_tables(coordinator.NumGroups());
     const std::optional<AdmissionResult> cached_request = AdmitForTest(coordinator, cached_tables, /*num_tokens=*/16);
     ASSERT_TRUE(cached_request);
-    coordinator.CacheFullBlocks(cached_tables, hashes, cached_request->access_epoch, /*first_slot=*/0,
+    coordinator.CacheFullBlocks(cached_tables, hashes, cached_request->access_epoch, /*first_prefix_page=*/0,
                                 CacheBoundaryKind::kChunk);
     coordinator.Free(cached_tables);
 
@@ -1448,7 +1449,7 @@ TEST(CacheCoordinatorAdmissionTest, FullEvictionUsesAccessEpochInsteadOfPermanen
     std::vector<BlockTable> first_tables(coordinator.NumGroups());
     const std::optional<AdmissionResult> first = AdmitForTest(coordinator, first_tables, /*num_tokens=*/4);
     ASSERT_TRUE(first);
-    coordinator.CacheFullBlocks(first_tables, std::span{hashes}.first(1), first->access_epoch, /*first_slot=*/0,
+    coordinator.CacheFullBlocks(first_tables, std::span{hashes}.first(1), first->access_epoch, /*first_prefix_page=*/0,
                                 CacheBoundaryKind::kChunk);
     coordinator.Free(first_tables);
 
@@ -1464,8 +1465,8 @@ TEST(CacheCoordinatorAdmissionTest, FullEvictionUsesAccessEpochInsteadOfPermanen
     std::vector<BlockTable> second_tables(coordinator.NumGroups());
     const std::optional<AdmissionResult> second = AdmitForTest(coordinator, second_tables, /*num_tokens=*/4);
     ASSERT_TRUE(second);
-    coordinator.CacheFullBlocks(second_tables, std::span{hashes}.subspan(1), second->access_epoch, /*first_slot=*/0,
-                                CacheBoundaryKind::kChunk);
+    coordinator.CacheFullBlocks(second_tables, std::span{hashes}.subspan(1), second->access_epoch,
+                                /*first_prefix_page=*/0, CacheBoundaryKind::kChunk);
     coordinator.Free(second_tables);
     ASSERT_EQ(pool.NumEmptyLcmBlocks(), 0);
 
@@ -2321,9 +2322,9 @@ TEST(CacheCoordinatorAdmissionTest, RejectsProspectiveVictimWithAnExtraOwner) {
     const std::array<CacheKey, 1> first_key{Key(hashes[0], /*group_id=*/0)};
     GroupAllocator& manager = coordinator.Allocator(0);
     PrefixMatch extra_owner = coordinator.GroupPrefixIndex(0).AcquireMatched(
-        pool, first_key, /*begin_blocks=*/0,
-        coordinator.GroupMatcher(0).Probe(coordinator.GroupPrefixIndex(0), pool, first_key, /*begin_blocks=*/0,
-                                          /*max_blocks=*/1, /*extra_hits=*/nullptr),
+        pool, first_key, /*begin_block=*/0,
+        coordinator.GroupMatcher(0).Probe(coordinator.GroupPrefixIndex(0), pool, first_key, /*begin_block=*/0,
+                                          /*end_block=*/1, /*extra_hits=*/nullptr),
         NextTestAccessEpoch(), /*session=*/nullptr);
     ASSERT_EQ(extra_owner.NumHitBlocks(), 1);
 
@@ -2570,7 +2571,7 @@ TEST(CoordinatorStepTest, CacheFullBlocksAtSlotOffsetExtendsPrefix) {
     std::vector<BlockTable> tables(2);
     ASSERT_TRUE(AdmitForTest(coord, tables, 24));                   // 6 pages each
     CacheFullBlocksForTest(coord, tables, std::span(ch).first(4));  // prefill path: slots 0..3
-    CacheFullBlocksForTest(coord, tables, std::span(ch).subspan(4), /*first_slot=*/4);
+    CacheFullBlocksForTest(coord, tables, std::span(ch).subspan(4), /*first_prefix_page=*/4);
 
     CoordinatorMatch m = MatchPrefixForTest(coord, ch).device;
     EXPECT_EQ(m.num_common_tokens, 24);
@@ -2606,7 +2607,7 @@ TEST(CoordinatorStepTest, CacheFullBlocksAtOffsetSkipsSwaHoles) {
     ASSERT_FALSE(tables[1].Blocks()[3]);
     ASSERT_TRUE(tables[1].Blocks()[4]);
 
-    CacheFullBlocksForTest(coord, tables, std::span(ch).subspan(2), /*first_slot=*/2);
+    CacheFullBlocksForTest(coord, tables, std::span(ch).subspan(2), /*first_prefix_page=*/2);
     for (std::size_t s = 2; s < 6; ++s) {
         EXPECT_TRUE(coord.GroupPrefixIndex(0).Contains(pool, Key(ch[s], 0))) << "full slot " << s;
     }
@@ -2631,8 +2632,8 @@ TEST(CoordinatorStepTest, CacheFullBlocksRejectsOutOfRangeFirstSlot) {
     std::vector<std::string> ch = ContentHashes({{7, 7, 7, 7}});
     std::vector<BlockTable> tables(2);
     ASSERT_TRUE(AdmitForTest(coord, tables, 8));  // 2 pages each
-    EXPECT_THROW(CacheFullBlocksForTest(coord, tables, ch, /*first_slot=*/2), std::runtime_error);
-    EXPECT_THROW(CacheFullBlocksForTest(coord, tables, ch, /*first_slot=*/-1), std::runtime_error);
+    EXPECT_THROW(CacheFullBlocksForTest(coord, tables, ch, /*first_prefix_page=*/2), std::runtime_error);
+    EXPECT_THROW(CacheFullBlocksForTest(coord, tables, ch, /*first_prefix_page=*/-1), std::runtime_error);
 }
 
 TEST(CoordinatorMatchTest, SwaRunCutByFullBoundDropsToNoValidMatch) {
@@ -3220,7 +3221,7 @@ TEST(CacheCoordinatorStoreCandidates, CollectsKeysWithoutPinningDeviceBlocks) {
     std::vector<std::string> hashes = ContentHashes({{1, 2}, {3, 4}});
     const std::int32_t free_before = pool.NumEmptyLcmBlocks();
 
-    CacheFullBlocksForTest(coordinator, tables, hashes, /*first_slot=*/0);
+    CacheFullBlocksForTest(coordinator, tables, hashes, /*first_prefix_page=*/0);
     std::vector<HostCache::StoreCandidate> pending = coordinator.Host().TakePendingStores();
 
     ASSERT_EQ(pending.size(), 2u);  // sliding-window group only; full-attention deferred
@@ -3389,9 +3390,9 @@ void HostHit(CacheCoordinator& coordinator, BlockPool& host_pool, const CacheKey
     const std::array keys{key};
     const GroupPrefixProbe probe =
         coordinator.GroupMatcher(group_index)
-            .Probe(index, host_pool, keys, /*begin_blocks=*/0, /*max_blocks=*/1, /*extra_hits=*/nullptr);
+            .Probe(index, host_pool, keys, /*begin_block=*/0, /*end_block=*/1, /*extra_hits=*/nullptr);
     PrefixMatch match =
-        index.AcquireMatched(host_pool, keys, /*begin_blocks=*/0, probe, access_epoch, /*session=*/nullptr);
+        index.AcquireMatched(host_pool, keys, /*begin_block=*/0, probe, access_epoch, /*session=*/nullptr);
     ASSERT_EQ(match.NumHitBlocks(), 1);
 }
 
@@ -9216,7 +9217,7 @@ TEST_F(BoundaryTreeCoordinatorTest, APublicationLinksTheNodeOfAPageItHolds) {
     ASSERT_TRUE(AdmitForTest(coordinator_, tables, 12));
     const std::uint64_t epoch = CacheCoordinatorTestAccess::NextAccessEpoch(coordinator_);
     for (std::int32_t page = 0; page < 2; ++page) {
-        coordinator_.CacheFullBlocks(tables, std::span{hashes}.subspan(page, 1), epoch, /*first_slot=*/page,
+        coordinator_.CacheFullBlocks(tables, std::span{hashes}.subspan(page, 1), epoch, /*first_prefix_page=*/page,
                                      CacheBoundaryKind::kChunk);
     }
     ASSERT_EQ(NodeOf(hashes[1]).parent, nullptr);

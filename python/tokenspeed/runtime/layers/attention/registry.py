@@ -71,6 +71,9 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.ownership import (
     cache_field_placement,
     pipeline_cache_ownership,
 )
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+    cache_field_layer_id,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
     CacheModelFamily,
     CachePoolSpec,
@@ -79,6 +82,9 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     FULL_ATTENTION,
     STATE_LAYER_TYPES,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.visualization import (
+    format_cache_layout,
 )
 from tokenspeed.runtime.layers.attention.utils import (
     check_probe_cache_fits,
@@ -161,9 +167,10 @@ def _resolve_heterogeneous_draft_family(
     if draft_family is None or draft_family == target_family:
         return None
     if target_family == "kimi_k3":
-        if draft_family != "mla":
+        if draft_family not in ("mla", "mha"):
             raise RuntimeError(
-                "Kimi-K3 unified cache currently requires an ordinary MLA draft view"
+                "Kimi-K3 unified cache hosts MLA or MHA draft views, got "
+                f"{draft_family!r}"
             )
         return draft_family
     if target_family == "inkling":
@@ -1270,22 +1277,69 @@ def _validate_mla_dcp_backend(name: str | None, arch: AttentionArch) -> None:
         )
 
 
-def _validate_hybrid_kvp_cache(spec: CachePoolSpec, *, kvp_size: int) -> None:
-    """Validate declared storage, independent of recipe name or inheritance."""
+def _draft_only_group_ids(
+    spec: CachePoolSpec, *, num_target_layers: int
+) -> frozenset[str]:
+    """Cache groups whose every field belongs to a draft layer."""
+    target, draft = set(), set()
+    for field in spec.memory_plan.fields:
+        owner = (
+            draft
+            if cache_field_layer_id(field.field_id) >= num_target_layers
+            else target
+        )
+        owner.add(field.group_id)
+    return frozenset(draft - target)
+
+
+def _validate_hybrid_kvp_cache(
+    spec: CachePoolSpec, *, kvp_size: int, num_target_layers: int
+) -> None:
+    """Validate declared storage, independent of recipe name or inheritance.
+
+    A sliding-window group is a draft's own window (``num_target_layers``
+    tells draft layers apart), which every rank keeps whole.
+    """
     groups = spec.cache_group_specs
     if not any(group.attn_kind == "full_history" for group in groups):
         raise ValueError("Hybrid MLA KVP requires a full-history cache group")
+    draft_groups = _draft_only_group_ids(spec, num_target_layers=num_target_layers)
     for group in groups:
-        if group.attn_kind == "sliding_window":
+        if group.attn_kind == "sliding_window" and group.group_id not in draft_groups:
             raise ValueError(
                 f"Hybrid MLA KVP cache group {group.group_id!r} "
                 "must be a full-history group"
             )
-        expected = kvp_size if group.attn_kind != "state" else 1
+        expected = kvp_size if group.attn_kind == "full_history" else 1
         if group.shard_count != expected:
             raise ValueError(
                 f"Hybrid MLA KVP cache group {group.group_id!r} ({group.attn_kind}) "
                 f"requires shard_count={expected}, got {group.shard_count}"
+            )
+
+
+def _validate_unsharded_draft_storage(
+    spec: CachePoolSpec, *, num_target_layers: int
+) -> None:
+    """A draft configured without KVP must not land in a page-sharded group.
+
+    Its K/V head rows cannot be transferred out of one by PD (ts-pd
+    layout/route.rs), and its attention reads every page as local.
+    """
+    shard_counts = {
+        group.group_id: group.shard_count for group in spec.cache_group_specs
+    }
+    for field in spec.memory_plan.fields:
+        if cache_field_layer_id(field.field_id) < num_target_layers:
+            continue
+        if shard_counts[field.group_id] > 1:
+            raise ValueError(
+                "--kv-parallel-size > 1 page-shards cache group "
+                f"{field.group_id!r}, which holds this draft's K/V head rows; "
+                "PD cannot transfer those from a page-sharded group. Launch "
+                "with --kv-parallel-size 1, or use a draft its recipe hosts "
+                "in an unsharded group (Kimi-K3: a GQA block draft whose every "
+                "layer slides)"
             )
 
 
@@ -1473,7 +1527,19 @@ def create_attn_components(
         check_probe_cache_fits(cache_setup.cache_budget_bytes, profiled_cache_bytes)
     spec = cache_setup.spec
     if config.kvp_size > 1 and target.is_hybrid_linear:
-        _validate_hybrid_kvp_cache(spec, kvp_size=config.kvp_size)
+        _validate_hybrid_kvp_cache(
+            spec,
+            kvp_size=config.kvp_size,
+            num_target_layers=num_target_cache_layers,
+        )
+    if (
+        config.kvp_size > 1
+        and draft_attn_config is not None
+        and draft_attn_config.kvp_size == 1
+    ):
+        _validate_unsharded_draft_storage(
+            spec, num_target_layers=num_target_cache_layers
+        )
     cache_fields_by_stage, stage_schedules = cache_field_placement(
         spec.memory_plan, owners
     )
@@ -1537,6 +1603,15 @@ def create_attn_components(
         f"fixed_workspace_bytes={fixed_workspace_bytes}, "
         f"budget_bytes={cache_budget_bytes}",
     )
+    layout_log_level = logging.DEBUG if probe_batch_rows is not None else logging.INFO
+    if logger.isEnabledFor(layout_log_level):
+        build = "probe" if probe_batch_rows is not None else "serving"
+        logger.log(
+            layout_log_level,
+            f"CacheRecipe {type(recipe).__name__} ({spec.family}): "
+            f"build={build}, pp_rank={server_args.mapping.pp_rank}\n"
+            f"{format_cache_layout(spec.memory_plan)}",
+        )
     arena = create_cache_arena(
         spec,
         device=config.device,
