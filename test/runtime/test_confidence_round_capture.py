@@ -183,7 +183,7 @@ class _Draft(BaseDrafter):
             attn_backend=backend,
             vocab_size=16,
         )
-        self.verify_policy = "confidence"
+        self.qwen4_adaptive_verify = True
         self.draft_query_width = 3
         self.draft_seq_lens_buf = torch.zeros(8, dtype=torch.int32, device="cuda")
         self.attention_kind = "qwen_mha"

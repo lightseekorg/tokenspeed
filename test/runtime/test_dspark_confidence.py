@@ -64,28 +64,19 @@ def _draft_model():
     return DSparkDraftModel(config, Mapping(rank=0, world_size=1))
 
 
-def test_confidence_is_opt_in_and_requires_dspark():
-    from tokenspeed.runtime.utils.server_args import ServerArgs
+def test_qwen4_adaptive_dspark_is_opt_in_and_requires_dspark():
+    from tokenspeed.runtime.utils.server_args import prepare_server_args
 
-    assert ServerArgs(model="x", device="cuda").speculative_verify_policy == "fixed"
-    assert (
-        ServerArgs(
-            model="x",
-            device="cuda",
-            speculative_algorithm="DSPARK",
-            speculative_verify_policy="confidence",
-        ).speculative_verify_policy
-        == "confidence"
-    )
+    base_args = ["--model", "x", "--device", "cuda"]
+    dspark_args = [*base_args, "--speculative-algorithm", "DSPARK"]
+    flag = "--enable-qwen4-adaptive-dspark"
+
+    assert not prepare_server_args(dspark_args).enable_qwen4_adaptive_dspark
+    assert prepare_server_args([*dspark_args, flag]).enable_qwen4_adaptive_dspark
     with pytest.raises(ValueError, match="requires DSPARK"):
-        ServerArgs(model="x", device="cuda", speculative_verify_policy="confidence")
-    with pytest.raises(ValueError, match="must be fixed or confidence"):
-        ServerArgs(
-            model="x",
-            device="cuda",
-            speculative_algorithm="DSPARK",
-            speculative_verify_policy="history",
-        )
+        prepare_server_args([*base_args, flag])
+    with pytest.raises(SystemExit):
+        prepare_server_args([*dspark_args, "--speculative-verify-policy", "fixed"])
 
 
 def test_confidence_checkpoint_loading_is_complete_and_numerical():

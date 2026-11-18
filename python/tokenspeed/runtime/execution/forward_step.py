@@ -477,7 +477,7 @@ class ForwardStepRunner:
         self.confidence_request_ids: Sequence[Hashable] = []
         self.confidence_round_prepared = False
         self._confidence_host_group = None
-        if drafter is not None and drafter.verify_policy == "confidence":
+        if drafter is not None and drafter.qwen4_adaptive_verify:
             self.confidence_feedback = ConfidenceFeedback(
                 self.max_tokens_per_req,
                 max(2, config.overlap_schedule_depth + 2),

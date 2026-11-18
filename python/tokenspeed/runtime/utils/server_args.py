@@ -728,13 +728,13 @@ class ServerArgs:
     draft_model_path_use_base: bool | None = False
     speculative_config: str | None = None
     speculative_algorithm: str | None = None
-    speculative_verify_policy: str | None = None
     speculative_draft_model_path: str | None = None
     speculative_draft_model_revision: str | None = None
     speculative_draft_model_quantization: str | None = "unquant"
     speculative_num_steps: int = 3
     speculative_eagle_topk: int = 1
     speculative_num_draft_tokens: int | None = None
+    enable_qwen4_adaptive_dspark: bool = False
     enable_dsv41_adaptive_dspark: bool = False
     dsv41_dspark_min_batch_size: int = 32
     synthetic_acceptance_length: float | None = None
@@ -1905,13 +1905,7 @@ class ServerArgs:
         self.kv_offload_config = dict(options, layers=list(layers))
 
     def resolve_speculative_decoding(self):
-        # Preserve old launch commands at the configuration boundary; runtime
-        # consumers always receive an explicit policy.
-        if self.speculative_verify_policy is None:
-            self.speculative_verify_policy = "fixed"
-        if self.speculative_verify_policy not in ("fixed", "confidence"):
-            raise ValueError("speculative verify policy must be fixed or confidence")
-        if self.speculative_verify_policy == "confidence":
+        if self.enable_qwen4_adaptive_dspark:
             if self.speculative_algorithm != "DSPARK":
                 raise ValueError("confidence verification requires DSPARK")
             if self.enable_speculative_sampling or self.speculative_eagle_topk != 1:
@@ -4425,6 +4419,13 @@ class ServerArgs:
             "DSpark sampling.",
         )
         parser.add_argument(
+            "--enable-qwen4-adaptive-dspark",
+            action="store_true",
+            default=ServerArgs.enable_qwen4_adaptive_dspark,
+            help="Adapt Qwen4 DSpark verification width using checkpoint confidence "
+            "and startup timings. Uses fixed-width verification when disabled.",
+        )
+        parser.add_argument(
             "--enable-dsv41-adaptive-dspark",
             action="store_true",
             default=ServerArgs.enable_dsv41_adaptive_dspark,
@@ -4478,12 +4479,6 @@ class ServerArgs:
             type=str,
             default=ServerArgs.speculative_draft_model_quantization,
             help="Quantization method for the draft model. Defaults to 'unquant'.",
-        )
-        parser.add_argument(
-            "--speculative-verify-policy",
-            choices=["fixed", "confidence"],
-            default=None,
-            help="DSpark verify budget: fixed width or checkpoint confidence. Defaults to fixed.",
         )
         parser.add_argument(
             "--speculative-num-steps",

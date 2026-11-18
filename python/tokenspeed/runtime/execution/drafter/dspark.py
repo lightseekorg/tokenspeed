@@ -77,10 +77,10 @@ class DSpark(DFlash):
                 "(use a DSparkDraftModel checkpoint with markov_rank > 0)."
             )
         self.confidence_head = self.model.confidence_head
-        self.verify_policy = (
-            self.draft_model_runner.server_args.speculative_verify_policy
+        self.qwen4_adaptive_verify = (
+            self.draft_model_runner.server_args.enable_qwen4_adaptive_dspark
         )
-        if self.verify_policy == "confidence" and (
+        if self.qwen4_adaptive_verify and (
             self.confidence_head is None or not self.model.confidence_weights_loaded
         ):
             raise ValueError(
@@ -88,7 +88,7 @@ class DSpark(DFlash):
             )
         self.confidence_rates: torch.Tensor | None = None
         self.confidence_group = None
-        if self.verify_policy == "confidence":
+        if self.qwen4_adaptive_verify:
             mapping = self.draft_model_runner.server_args.mapping
             if mapping.world_size > 1:
                 from tokenspeed.runtime.distributed.process_group_manager import (

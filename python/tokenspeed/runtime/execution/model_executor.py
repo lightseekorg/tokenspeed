@@ -750,15 +750,13 @@ class ModelExecutor:
             self.drafter.wire_target(self.model_runner.model)
             if (
                 draft_model_runner is not None
-                and draft_model_runner.server_args.speculative_verify_policy
-                == "confidence"
-                and self.drafter.verify_policy
-                != draft_model_runner.server_args.speculative_verify_policy
+                and draft_model_runner.server_args.enable_qwen4_adaptive_dspark
+                and not self.drafter.qwen4_adaptive_verify
             ):
                 raise ValueError(
                     "This DSpark drafter does not implement confidence verification"
                 )
-            if self.drafter.verify_policy == "confidence":
+            if self.drafter.qwen4_adaptive_verify:
                 from tokenspeed.runtime.models.qwen4_exp import (
                     Qwen4ExpForCausalLM,
                     Qwen4ExpForConditionalGeneration,
