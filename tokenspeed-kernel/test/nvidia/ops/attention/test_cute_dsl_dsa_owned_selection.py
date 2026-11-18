@@ -69,7 +69,7 @@ def _owned_candidates(degree: int, rows: int, q_len: int, topk: int, seed: int):
 
     Returns positions ``[degree, rows, topk]`` (``-1`` invalid) on pages the
     rank owns and their scores (``-inf`` invalid), with mandatory,
-    signed-zero, NaN, short and empty rows.
+    signed-zero, NaN, short, and empty rows.
     """
     generator = torch.Generator(device="cuda").manual_seed(seed)
     requests = rows // q_len
@@ -172,8 +172,8 @@ def test_owned_selection_is_each_ranks_share_of_the_merge(
         ).float()
         scores = torch.where(positions < 0, scores, ties)
     elif band == "narrow":
-        # Scores sharing their sign, exponent and leading mantissa bits,
-        # beside the mandatory, zero and NaN ones.
+        # Scores sharing their sign, exponent, and leading mantissa bits,
+        # beside the mandatory, zero, and NaN ones.
         scores = torch.where(
             scores.isfinite() & (scores > 0), 5 + scores * 1e-3, scores
         )

@@ -22,7 +22,7 @@
 
 The selection reads every rank's gathered candidate scores. Each CTA holds its row's ``ranks * topk`` scores as 32-bit order keys (NaN and
 -inf as 0, -0 as +0), finds the k-th largest live key for k = ``topk`` (the
-smallest one with fewer live) in three radix digits of 11, 11 and 10 bits, and
+smallest one with fewer live) in three radix digits of 11, 11, and 10 bits, and
 keeps this rank's candidates above it, then the ties at it through the ranks in
 order and within a rank in candidate order, ``topk`` in all: this rank's share
 of the merge's selection. Kept candidates map to local slots through the local
@@ -252,10 +252,10 @@ def _fake(dtype, shape, stride, align):
 
 @functools.cache
 def compile_owned_select(degree: int, width: int, page: int):
-    """Compile the owned selection for a rank count, width and page size.
+    """Compile the owned selection for a rank count, width, and page size.
 
     Selects among ``degree`` ranks' ``width`` candidates per row over
-    ``page``-token pages. Rows, the rank stride, the table and the rank are
+    ``page``-token pages. Rows, the rank stride, the table, and the rank are
     runtime values: one compile serves every batch.
     """
     sym = cute.sym_int

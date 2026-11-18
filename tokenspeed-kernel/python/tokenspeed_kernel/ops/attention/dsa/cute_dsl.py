@@ -879,7 +879,7 @@ if _fused_indexer is not None:
             for value in (positions, local_page_table, query_requests)
         ):
             raise TypeError(
-                "candidate positions, local pages and requests must be int32"
+                "candidate positions, local pages, and requests must be int32"
             )
         if positions.shape != (rows, width) or positions.stride(1) != 1:
             raise ValueError(

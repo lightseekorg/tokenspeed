@@ -475,7 +475,7 @@ def test_owned_decode_topk_is_each_ranks_share_of_the_merge(
         platform.is_nvidia
         and ArchVersion(10, 0) <= platform.arch_version <= ArchVersion(10, 3)
     ):
-        pytest.skip("the owned selection runs on CDNA4, SM100 and SM103")
+        pytest.skip("the owned selection runs on CDNA4, SM100, and SM103")
     mp.spawn(
         _worker,
         args=(degree, f"file://{tmp_path / 'rendezvous'}", pull_exchange),
