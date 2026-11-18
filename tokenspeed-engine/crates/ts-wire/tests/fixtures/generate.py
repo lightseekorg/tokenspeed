@@ -175,6 +175,7 @@ def _generate_text() -> list[bytes]:
             cache_session_id="cache-session",
             cache_group_id="cache-group",
             shared_prefix_tokens=[1, 3],
+            peer_holder="10.0.0.2:7100",
         )
     )
 

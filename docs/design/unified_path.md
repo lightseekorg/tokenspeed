@@ -2814,6 +2814,18 @@ Native full-width execution retains its original key. Buckets above the layout
 kernel's token bound retain only native full-width capture and replay.
 Packed verification refreshes decode_query_indptr and packed rows in persistent buffers before
 replay; V4.1 pointer-stable views are keyed by (bs, num_tokens).
+Grammar verify candidates are copied to pinned storage on the main stream before
+its fork event, so the side-stream host fill reads pre-packing tokens even when
+packed verification later rewrites `input_ids_buf` in place.
+The same packed row indices gather request-major xgrammar bitmask rows into
+target-logit order. Greedy and sampled FlashInfer verification apply those
+masks and support selected-token output logprobs, as does sampled prefill;
+cumulative output probabilities remain rejected at startup. Chain
+`accept_index` entries stay flat `request * width + column` values. Output
+logprob scoring subtracts the request base before adding the packed CSR start.
+A `-1` tail entry uses the request anchor and remains excluded by the accepted
+length. This mapping is required for requests after the first whenever the
+packed and fixed-width bases differ.
 After target forward, borrowed input storage and collective counts are restored.
 The context's input_num_tokens keeps the packed target extent until sampling and
 NaN checks consume the target outputs.

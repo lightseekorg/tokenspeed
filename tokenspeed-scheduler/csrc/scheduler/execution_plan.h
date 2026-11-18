@@ -27,6 +27,7 @@
 #include <utility>
 #include <vector>
 
+#include "cache/tier/peer.h"
 #include "scheduler/operations/inc.h"
 
 namespace tokenspeed {
@@ -110,6 +111,12 @@ public:
     // receive pulls their KV into the freshly admitted (and sanitized)
     // pages. The model sees the request only after RemotePrefillDone.
     std::optional<ForwardBatch> remote_prefill;
+    // Peer prefix landings admitted this round (fsm::PeerLanding): the
+    // runtime pins each prefix at its holder, reads it into the destination
+    // pages once this plan's page zeroing and copies have run, releases the
+    // pin and reports PeerFetchDone. Like the remote streams, they take no
+    // batch slot or token budget.
+    std::vector<PeerFetchOperation> peer_fetches;
 
     // Requests the scheduler aborted while building this plan (none on most
     // rounds): the last resort of a retraction whose victim could not be

@@ -67,7 +67,10 @@ from tokenspeed.runtime.sampling.dp_sampling_config import (
     slice_dp_vocab_mask,
 )
 from tokenspeed.runtime.sampling.registry import register_backend
-from tokenspeed.runtime.sampling.tree_verify import accepted_path_rows
+from tokenspeed.runtime.sampling.tree_verify import (
+    accepted_path_rows,
+    packed_accepted_path_rows,
+)
 from tokenspeed.runtime.sampling.utils import (
     coin_eps,
     gather_token_logprobs,
@@ -625,8 +628,8 @@ class FlashInferSamplingBackend(SamplingBackend):
             )
 
             if sampling_info.vocab_mask is not None:
-                raise ValueError(
-                    "sampled adaptive DSpark does not support grammar masks"
+                sampling_info.apply_vocab_mask(
+                    logits=logits, vocab_mask=sampling_info.vocab_mask
                 )
             slots = sampling_info.req_pool_indices
             bs = logits.shape[0]
@@ -643,6 +646,10 @@ class FlashInferSamplingBackend(SamplingBackend):
             lengths = self._accept_length_buf[:bs]
             lengths.fill_(1)
             self.maybe_broadcast(sampled)
+            if self.config.enable_output_logprobs:
+                logits_output.next_token_logprobs = gather_token_logprobs(
+                    logits, sampled, logprob_order=self.config.logprob_order
+                )
             return sampled, lengths
 
         # Grammar bitmask apply — captured inside the CUDA graph. Buffer is
@@ -717,7 +724,7 @@ class FlashInferSamplingBackend(SamplingBackend):
         query_start_loc: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self._dspark_sampling:
-            if tree is not None or sampling_info.vocab_mask is not None:
+            if tree is not None:
                 raise ValueError(
                     "sampled adaptive DSpark requires plain chain verification"
                 )
@@ -1099,6 +1106,10 @@ class FlashInferSamplingBackend(SamplingBackend):
             )
         bs, width = candidates.shape
         logits = logits_output.next_token_logits
+        if sampling_info.vocab_mask is not None:
+            sampling_info.apply_vocab_mask(
+                logits=logits, vocab_mask=sampling_info.vocab_mask
+            )
         slots = sampling_info.req_pool_indices
         if query_start_loc is None:
             query_start_loc = (
@@ -1128,6 +1139,13 @@ class FlashInferSamplingBackend(SamplingBackend):
             ),
         )
         self.broadcast_verify_outputs()
+        if self.config.enable_output_logprobs:
+            path_logits = logits.index_select(
+                0, packed_accepted_path_rows(indices, query_start_loc)
+            )
+            logits_output.next_token_logprobs = gather_token_logprobs(
+                path_logits, predict, logprob_order=self.config.logprob_order
+            )
         return predict, lengths
 
     def _verify_tree(

@@ -24,6 +24,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <list>
 #include <memory_resource>
 #include <optional>
@@ -227,6 +228,13 @@ public:
     // `checkpoints` (null: none) receives every change of a State
     // checkpoint's residency; it must outlive every hold.
     BoundaryTree(Config config, CheckpointTree* checkpoints) : config_{config}, checkpoints_{checkpoints} {}
+
+    // Called with a node's hash whenever its closed Host entries change, as
+    // a Host block of it is registered or leaves (the KV event stream
+    // reconciles that boundary's Host residency). It runs inside a hold's
+    // release, so it must not throw.
+    using HostEntriesObserver = std::function<void(const ContentHash&)>;
+    void SetHostEntriesObserver(HostEntriesObserver observer) { host_entries_observer_ = std::move(observer); }
     // Nodes and holds point at the tree, and nodes and the index at each
     // other's storage: a copy or a move would leave them pointing at the
     // original.
@@ -457,6 +465,9 @@ private:
                 node.state_entries_[hold.tier_] += hold.state_ ? delta : 0;
                 node.closed_entries_[hold.tier_] += hold.closed_ ? delta : 0;
                 node.closed_pairs_ += hold.paired_ ? delta : 0;
+                if (hold.tier_ == kHost && hold.closed_ && host_entries_observer_) {
+                    host_entries_observer_(node.hash);
+                }
                 break;
             case Hold::Kind::kPendingStore:
                 node.pending_stores_ += delta;
@@ -669,6 +680,7 @@ private:
 
     Config config_;
     CheckpointTree* checkpoints_;
+    HostEntriesObserver host_entries_observer_;
     // Node-based, so nodes, with the keys they own, keep their addresses
     // across rehashes.
     using NodeList = std::pmr::list<Node>;

@@ -252,6 +252,17 @@ public:
         EvictionMetadata metadata;
     };
 
+    // The entries of one LCM parent on a tier that tracks them
+    // (TrackParentEntries): how many there are, the newest
+    // last_access_epoch among them, and how many carry it. A parent whose
+    // every occupied child is an entry can be emptied by eviction alone, no
+    // earlier in the eviction order than its newest entry.
+    struct ParentEntries {
+        std::int32_t count{0};
+        std::int32_t count_at_newest{0};
+        std::uint64_t newest_access_epoch{0};
+    };
+
     // A read-only policy snapshot; inspecting it neither pins nor touches the
     // entry. Take a fresh snapshot after any ownership or index mutation.
     struct CachedBlockSnapshot {
@@ -352,6 +363,23 @@ public:
         }
     }
 
+    // Keeps ParentEntries for every LCM parent of `pool`'s tier from now on.
+    // The coordinator tracks the Device tier of each group it caches, before
+    // anything is registered there.
+    void TrackParentEntries(const BlockPool& pool) {
+        CacheEntries& cache_index = cacheEntries(pool);
+        _assert(cache_index.parent_entries.empty() && cache_index.entries.empty(),
+                "an index tier tracks its parents once, before anything is registered");
+        cache_index.parent_entries.resize(static_cast<std::size_t>(pool.NumLcmBlocks()) + 1);
+    }
+
+    // ParentEntries indexed by LCM block id; empty for a tier that does not
+    // track them.
+    std::span<const ParentEntries> EntriesByParent(const BlockPool& pool) const {
+        const CacheEntries* cache_index = findCacheEntries(pool);
+        return cache_index == nullptr ? std::span<const ParentEntries>{} : cache_index->parent_entries;
+    }
+
     // Registers block_ref under key. If key already has a canonical block,
     // block_ref is replaced with a reference to that block.
     void Register(const BlockPool& pool, CacheBlockRef& block_ref, const CacheKey& key, std::uint64_t access_epoch,
@@ -369,7 +397,7 @@ public:
                 existing_it->boundary_kind = boundary_kind;
             }
             mergeSession(*existing_it, session);
-            touchEntry(existing_it, access_epoch);
+            touchEntry(cache_index, existing_it, access_epoch);
             return;
         }
         // One key lookup finds the canonical entry or indexes a new one,
@@ -381,7 +409,7 @@ public:
                 entry_it->boundary_kind = boundary_kind;
             }
             mergeSession(*entry_it, session);
-            touchEntry(entry_it, access_epoch);
+            touchEntry(cache_index, entry_it, access_epoch);
             block_ref = entry_it->block_ref;
             return;
         }
@@ -395,6 +423,7 @@ public:
         entry.max_access_epoch = access_epoch;
         entry.session = std::move(session);
         cache_index.by_location.Set(entry_it->block_ref->Location(), entry_it);
+        countInParent(cache_index, entry_it->block_ref->Location(), entry.last_access_epoch);
         entry.available_order.Insert(cache_index.available_order, evictionOrder(entry), entry_it);
         if (cache_index.boundary_tree != nullptr) {
             // The tree keys its nodes by content hash alone.
@@ -683,7 +712,7 @@ public:
                 it->last_access_epoch == 0) {
                 continue;
             }
-            touchEntry(it, 0);
+            touchEntry(*cache_index, it, 0);
             ++changed;
         }
         return changed;
@@ -707,7 +736,7 @@ public:
             entry_it->block_ref.use_count() > 1 + write_back_holds) {
             return false;
         }
-        markDemoted(entry_it, epoch);
+        markDemoted(*cache_index, entry_it, epoch);
         return true;
     }
 
@@ -721,7 +750,7 @@ public:
         }
         const CacheEntryIterator entry_it = findEntry(*cache_index, key);
         if (entry_it != cache_index->entries.end() && entry_it->last_access_epoch == epoch) {
-            markDemoted(entry_it, epoch);
+            markDemoted(*cache_index, entry_it, epoch);
         }
     }
 
@@ -737,6 +766,20 @@ public:
             return std::nullopt;
         }
         return entry_it->key;
+    }
+
+    // The entry at `location` as an epoch traversal reports it
+    // (NextEvictionEpoch), when Evict would take it.
+    std::optional<EvictionCandidate> UnpinnedCandidateAt(const BlockPool& pool, CacheBlockLocation location) const {
+        const CacheEntries* cache_index = findCacheEntries(pool);
+        if (cache_index == nullptr) {
+            return std::nullopt;
+        }
+        const ConstCacheEntryIterator entry_it = findEntry(*cache_index, location);
+        if (entry_it == cache_index->entries.end() || !entry_it->block_ref.unique()) {
+            return std::nullopt;
+        }
+        return EvictionCandidate{.location = location, .metadata = evictionMetadataOf(*entry_it)};
     }
 
     std::optional<CacheKey> Evict(const BlockPool& pool, CacheBlockLocation location) {
@@ -839,6 +882,10 @@ public:
         cache_index->by_location.Erase(from);
         entry_it->block_ref = to;
         reorderEntry(entry_it);
+        if (to->Location().lcm_block_id != from.lcm_block_id) {
+            uncountInParent(*cache_index, from, entry_it->last_access_epoch);
+            countInParent(*cache_index, to->Location(), entry_it->last_access_epoch);
+        }
         if (entry_it->available_order.Suspended()) {
             entry_it->unique_observer.Observe(entry_it->block_ref, restoreAvailable, &*entry_it);
         }
@@ -891,7 +938,7 @@ public:
             match.blocks[i] = entry_it->block_ref;
             entry_it->was_acquired = true;
             mergeSession(*entry_it, session);
-            touchEntry(entry_it, access_epoch);
+            touchEntry(*cache_index, entry_it, access_epoch);
         }
         return match;
     }
@@ -912,7 +959,7 @@ public:
             auto entry = findEntry(*entries, keys[i]);
             if (entry != entries->entries.end()) {
                 mergeSession(*entry, session);
-                touchEntry(entry, std::max(entry->last_access_epoch, access_epoch));
+                touchEntry(*entries, entry, std::max(entry->last_access_epoch, access_epoch));
             }
         }
     }
@@ -975,7 +1022,8 @@ private:
     };
 
     struct CacheEntries {
-        CacheEntries(std::int32_t packing, std::int32_t parents) : by_location{packing, parents, entries.end()} {}
+        CacheEntries(std::int32_t packing, std::int32_t parents)
+            : packing{packing}, by_location{packing, parents, entries.end()} {}
         // The entry list allocates from entry_memory, the order indices and
         // lookup tables point into the list, and cursors and common peers
         // point at this object: it never copies or moves.
@@ -983,6 +1031,8 @@ private:
         CacheEntries& operator=(const CacheEntries&) = delete;
         CacheEntries(CacheEntries&&) = delete;
         CacheEntries& operator=(CacheEntries&&) = delete;
+        // The group's children per LCM parent on this tier.
+        const std::int32_t packing;
         // Owns each CacheEntry once. The maps are non-owning secondary indices
         // into stable list nodes. available_order keeps eviction candidates
         // sorted by age; common_order keeps shared keys in source age order.
@@ -1009,6 +1059,8 @@ private:
         // Counts the entries that joined, left or moved, so an EvictableEntry
         // can tell that the entry it borrows may be gone or elsewhere.
         std::uint64_t membership{0};
+        // TrackParentEntries: by LCM block id; empty when not tracked.
+        std::vector<ParentEntries> parent_entries;
     };
 
     void linkCommonEntry(CacheEntries& cache_index, CacheEntryIterator entry) {
@@ -1064,16 +1116,22 @@ private:
     // This preserves admission's ordered traversal and early exit. Continued requests can republish
     // under an older epoch, so moving entries to the back of an LRU list
     // would not preserve this order.
-    void touchEntry(CacheEntryIterator entry_it, std::uint64_t access_epoch) {
+    void touchEntry(CacheEntries& cache_index, CacheEntryIterator entry_it, std::uint64_t access_epoch) {
         entry_it->max_access_epoch = std::max(entry_it->max_access_epoch, access_epoch);
         // A touch ends a demotion; markDemoted marks the entry after its own.
         entry_it->demoted = false;
         if (entry_it->session && entry_it->session->demoted) access_epoch = 0;
-        if (entry_it->last_access_epoch == access_epoch) {
+        const std::uint64_t previous_epoch = entry_it->last_access_epoch;
+        if (previous_epoch == access_epoch) {
             return;
         }
         entry_it->last_access_epoch = access_epoch;
         reorderEntry(entry_it);
+        // Counted at the new epoch before leaving the old one, so a touch to
+        // a newer epoch never rescans the parent.
+        const CacheBlockLocation location = entry_it->block_ref->Location();
+        countInParent(cache_index, location, access_epoch);
+        uncountInParent(cache_index, location, previous_epoch);
     }
     // Re-keys the entry's order nodes to its current key: in available_order or, while pinned, in the
     // node kept aside, and in common_order when this tier keeps it.
@@ -1083,10 +1141,54 @@ private:
         if (entry_it->common_order.Registered()) entry_it->common_order.Rekey(key);
     }
     // Demote's and MarkDemoted's common step.
-    void markDemoted(CacheEntryIterator entry_it, std::uint64_t epoch) {
+    void markDemoted(CacheEntries& cache_index, CacheEntryIterator entry_it, std::uint64_t epoch) {
         entry_it->was_acquired = false;
-        touchEntry(entry_it, epoch);
+        touchEntry(cache_index, entry_it, epoch);
         entry_it->demoted = true;
+    }
+
+    // An entry joined `location`'s parent at `epoch` (ParentEntries).
+    static void countInParent(CacheEntries& cache_index, CacheBlockLocation location, std::uint64_t epoch) {
+        if (cache_index.parent_entries.empty()) {
+            return;
+        }
+        ParentEntries& parent = cache_index.parent_entries[static_cast<std::size_t>(location.lcm_block_id)];
+        if (parent.count++ == 0 || epoch > parent.newest_access_epoch) {
+            parent.newest_access_epoch = epoch;
+            parent.count_at_newest = 1;
+        } else if (epoch == parent.newest_access_epoch) {
+            ++parent.count_at_newest;
+        }
+    }
+    // An entry left `location`'s parent, or the epoch it was counted at; the
+    // location index no longer shows it there at that epoch. When the last
+    // entry at the newest epoch leaves, the parent's children are rescanned.
+    static void uncountInParent(CacheEntries& cache_index, CacheBlockLocation location, std::uint64_t epoch) {
+        if (cache_index.parent_entries.empty()) {
+            return;
+        }
+        ParentEntries& parent = cache_index.parent_entries[static_cast<std::size_t>(location.lcm_block_id)];
+        if (--parent.count == 0) {
+            parent = ParentEntries{};
+            return;
+        }
+        if (epoch != parent.newest_access_epoch || --parent.count_at_newest > 0) {
+            return;
+        }
+        parent.newest_access_epoch = 0;
+        for (std::int32_t slot = 0; slot < cache_index.packing; ++slot) {
+            const auto entry_it =
+                cache_index.by_location.Find({.lcm_block_id = location.lcm_block_id, .slot_index = slot});
+            if (entry_it == cache_index.entries.end()) {
+                continue;
+            }
+            if (parent.count_at_newest == 0 || entry_it->last_access_epoch > parent.newest_access_epoch) {
+                parent.newest_access_epoch = entry_it->last_access_epoch;
+                parent.count_at_newest = 1;
+            } else if (entry_it->last_access_epoch == parent.newest_access_epoch) {
+                ++parent.count_at_newest;
+            }
+        }
     }
 
     CacheEntries& cacheEntries(const BlockPool& pool) {
@@ -1148,7 +1250,9 @@ private:
         entry_it->unique_observer.Reset();
         FatalCheck(cache_index.by_key.ExtractObject(entry_it->key, *entry_it) == entry_it,
                    "an indexed cache entry keeps its key");
-        cache_index.by_location.Erase(entry_it->block_ref->Location());
+        const CacheBlockLocation location = entry_it->block_ref->Location();
+        cache_index.by_location.Erase(location);
+        uncountInParent(cache_index, location, entry_it->last_access_epoch);
         cache_index.entries.erase(entry_it);
         ++cache_index.membership;
     }
