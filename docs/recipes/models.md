@@ -1258,11 +1258,12 @@ At head dimension 160 the cache uses 84 MiB for FP8 or 164 MiB for BF16 per
 shard. At head dimension 512 it uses 260 MiB or 516 MiB, respectively. Miss
 staging is temporary and adds to those amounts.
 
-Enabling the flag with offloading disabled or an unsupported dtype or GPU
-fails initialization. CUDA library loading errors propagate directly.
-The CUDA launcher checks head count and head dimension before the first cached
-gather. Zero slots is invalid when enabled. Small lookups (fewer than
-256 tokens) and CUDA graph capture/replay still use regular host gather.
+Enabling the flag requires a Qwen4-Exp target with PLE layers and offloading.
+Unsupported model, cache geometry, dtype, or GPU configurations fail at startup.
+CUDA library loading errors propagate directly. Online-quantized FP8 tables
+with per-row scales log a warning at load time and use regular host gather.
+Small lookups (fewer than 256 tokens) and CUDA graph capture/replay also use
+regular host gather.
 
 ## GPT-OSS 20B / 120B
 

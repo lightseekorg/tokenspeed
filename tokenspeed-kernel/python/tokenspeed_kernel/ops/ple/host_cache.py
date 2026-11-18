@@ -38,7 +38,10 @@ from tokenspeed_kernel.ops.ple._host_cache_triton import (
     _ple_gather_staged_tail_kernel,
 )
 from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.thirdparty.cuda.ple_host_gather import ple_staged_gather
+from tokenspeed_kernel.thirdparty.cuda.ple_host_gather import (
+    ple_staged_gather,
+    validate_ple_hot_cache_geometry,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +104,8 @@ class PLEHostCache:
                 f"PLE hot cache requires FP8 E4M3FN or BF16 storage and BF16 output, "
                 f"got {table.dtype} storage and {output_dtype} output"
             )
+        head_dim = table.shape[1]
+        validate_ple_hot_cache_geometry(ngram_heads, head_dim, vocab_start, vocab_end)
         launch = ple_staged_gather()
         logger.info(
             f"PLE hot cache enabled: slots={slot_count}, storage={table.dtype}, "
@@ -110,7 +115,8 @@ class PLEHostCache:
         )
         self.slot_count = slot_count
         self._slot_bits = slot_count.bit_length() - 1
-        self._head_dim = table.shape[1]
+        self._device = device
+        self._head_dim = head_dim
         self._block_dim = triton.next_power_of_2(self._head_dim)
         self._vocab_start = vocab_start
         self._vocab_end = vocab_end
@@ -131,6 +137,20 @@ class PLEHostCache:
             self.MIN_TOKENS <= ids.shape[0] <= self.MAX_TOKENS
             and not torch.cuda.is_current_stream_capturing()
         )
+
+    def warmup(self, *, scale: float | None) -> None:
+        """Compile the tail gather and fill for this cache before serving."""
+        ids = torch.full(
+            (self.MIN_TOKENS + 1, self.HEADS),
+            self._vocab_start,
+            dtype=torch.int64,
+            device=self._device,
+        )
+        out = torch.empty(
+            (ids.numel(), self._head_dim), dtype=torch.bfloat16, device=self._device
+        )
+        self.gather(ids, out, scale=scale)
+        self.invalidate()
 
     def invalidate(self) -> None:
         """Finish the in-flight fill and invalidate the current table contents."""

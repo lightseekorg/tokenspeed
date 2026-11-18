@@ -3732,6 +3732,32 @@ def test_ple_hot_cache_cli_reaches_model_config(tmp_path, enabled):
 
     assert config.hf_text_config.enable_ple_hot_cache is enabled
     assert config.hf_text_config.ple_offload_embedding is True
+    if enabled:
+        draft_path = tmp_path / "draft"
+        _tiny_ple_config(
+            architectures=["Qwen4ExpForCausalLM"],
+            ple_layer_ids=[],
+        ).save_pretrained(draft_path)
+        draft_config = load_model_config(args, str(draft_path), draft_of=config)
+        assert draft_config.hf_text_config.enable_ple_hot_cache is False
+
+
+@pytest.mark.parametrize("qwen4_exp", [False, True], ids=["llama", "qwen4-without-ple"])
+def test_ple_hot_cache_cli_rejects_targets_without_ple(tmp_path, qwen4_exp):
+    from transformers import LlamaConfig
+
+    from tokenspeed.runtime.engine.rank_setup import load_model_config
+    from tokenspeed.runtime.utils.server_args import prepare_server_args
+
+    config = (
+        _tiny_ple_config(architectures=["Qwen4ExpForCausalLM"], ple_layer_ids=[])
+        if qwen4_exp
+        else LlamaConfig(architectures=["LlamaForCausalLM"])
+    )
+    config.save_pretrained(tmp_path)
+    args = prepare_server_args(["--model", str(tmp_path), "--enable-ple-hot-cache"])
+    with pytest.raises(ValueError, match="requires a Qwen4-Exp target model with PLE"):
+        load_model_config(args, args.model, draft_of=None)
 
 
 @pytest.mark.parametrize(

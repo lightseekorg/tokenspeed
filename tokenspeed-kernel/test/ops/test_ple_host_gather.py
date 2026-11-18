@@ -69,8 +69,14 @@ def test_ple_host_gather_empty_ids_skip_pointer_mapping(monkeypatch) -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
 @pytest.mark.parametrize(
     "head_dim, table_shards, scale_mode",
-    [(160, 4, "scalar"), (512, 4, "row"), (512, 4, "none"), (160, 1, "scalar")],
-    ids=["flash-tp4", "max-online-fp8", "max-bf16", "flash-tp1"],
+    [
+        (160, 4, "scalar"),
+        (512, 4, "row"),
+        (512, 4, "none"),
+        (160, 1, "scalar"),
+        (512, 1, "row"),
+    ],
+    ids=["flash-tp4", "max-online-fp8", "max-bf16", "flash-tp1", "max-tp1-online-fp8"],
 )
 def test_host_gather_decode_and_prefill(head_dim, table_shards, scale_mode):
     from tokenspeed_kernel.ops.ple.triton import (
@@ -79,7 +85,7 @@ def test_host_gather_decode_and_prefill(head_dim, table_shards, scale_mode):
     )
     from utils import assert_no_triton_compile
 
-    vocab_start = 20_000_000 if table_shards > 1 else 0
+    vocab_start = (1 << 33) + 113 if table_shards > 1 else 0
     dtype = torch.bfloat16 if scale_mode == "none" else torch.float8_e4m3fn
     table = torch.randn(128, head_dim).to(dtype).pin_memory()
     scalar = 0.00019931793212890625 if scale_mode == "scalar" else None
@@ -119,15 +125,27 @@ def test_host_gather_decode_and_prefill(head_dim, table_shards, scale_mode):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires GPU")
-def test_host_gather_large_table_offset():
+@pytest.mark.parametrize("table_shards, tokens", [(4, 4), (1, 8192)])
+def test_host_gather_large_table_offset(table_shards, tokens):
     dim = 160
     table_rows = 2**31 // dim + 2
     table = torch.empty((table_rows, dim), dtype=torch.float8_e4m3fn, pin_memory=True)
-    last = (torch.arange(dim).float() % 31 - 15).to(table.dtype)
-    table[-1].copy_(last)
-    ids = torch.full((4, 16), table_rows - 1, device="cuda", dtype=torch.int64)
+    last_rows = torch.arange(2 * dim).reshape(2, dim).float() % 31 - 15
+    table[-2:].copy_(last_rows.to(table.dtype))
+    ids = torch.tensor(
+        [table_rows - 1, -1, table_rows - 2, table_rows],
+        device="cuda",
+        dtype=torch.int64,
+    ).repeat(tokens, 4)
     out = torch.empty((ids.numel(), dim), device="cuda", dtype=torch.bfloat16)
     scale = 0.00019931793212890625
-    ple.ple_host_gather(table, ids, out, 0, table_rows, scale, None, table_shards=4)
-    expected = (last.float() * scale).bfloat16().expand_as(out)
+    ple.ple_host_gather(
+        table, ids, out, 0, table_rows, scale, None, table_shards=table_shards
+    )
+    zero = torch.zeros(dim)
+    expected = (
+        (torch.stack((last_rows[-1], zero, last_rows[0], zero)) * scale)
+        .bfloat16()
+        .repeat(tokens * 4, 1)
+    )
     torch.testing.assert_close(out.cpu(), expected, atol=0, rtol=0)

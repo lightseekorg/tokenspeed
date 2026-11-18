@@ -312,20 +312,27 @@ __global__ void gather_wide_cta(const uint8_t* __restrict__ host,
 
 }  // namespace
 
+void ple_validate_hot_cache_geometry(int64_t heads, int64_t head_dim,
+                                     int64_t vocab_start, int64_t vocab_end) {
+    TVM_FFI_ICHECK_EQ(heads, kHeads) << "PLE hot cache requires 16 n-gram heads";
+    TVM_FFI_ICHECK(head_dim == 160 || head_dim == 512)
+        << "PLE hot cache head_dim must be 160 or 512";
+    TVM_FFI_ICHECK(vocab_start >= 0 && vocab_end > vocab_start &&
+                   vocab_end - vocab_start <= INT32_MAX)
+        << "PLE hot cache requires a nonempty, nonnegative vocab span that fits int32";
+}
+
 void ple_gather_staged(int64_t address, TensorView ids, TensorView tags, TensorView hot,
                        TensorView out, TensorView misses, double scale, bool is_fp8, int64_t tokens,
                        int64_t vocab_start, int64_t vocab_end, TensorView staged,
                        TensorView winners) {
     TVM_FFI_ICHECK(tokens > 0 && tokens % kTokensPerTile == 0 &&
                    tokens <= INT32_MAX / kHeads);
-    TVM_FFI_ICHECK(vocab_start >= 0 && vocab_end > vocab_start &&
-                   vocab_end - vocab_start <= INT32_MAX);
-    TVM_FFI_ICHECK(ids.ndim() == 2 && ids.size(1) == kHeads)
+    TVM_FFI_ICHECK(ids.ndim() == 2)
         << "PLE hot cache requires IDs shaped [tokens, 16]";
     TVM_FFI_ICHECK(out.ndim() == 2) << "PLE hot cache output must have shape [rows, head_dim]";
     int64_t dim = out.size(1);
-    TVM_FFI_ICHECK(dim == 160 || dim == 512)
-        << "PLE hot cache head_dim must be 160 or 512";
+    ple_validate_hot_cache_geometry(ids.size(1), dim, vocab_start, vocab_end);
     int64_t row_bytes = dim * (is_fp8 ? 1 : sizeof(uint16_t));
     TVM_FFI_ICHECK(hot.size(1) == row_bytes && staged.size(1) == row_bytes);
     int capacity = tags.size(0);
@@ -361,3 +368,4 @@ void ple_gather_staged(int64_t address, TensorView ids, TensorView tags, TensorV
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(ple_gather_staged, ple_gather_staged);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(ple_validate_hot_cache_geometry, ple_validate_hot_cache_geometry);

@@ -55,7 +55,7 @@ from tokenspeed.runtime.layers.vocab_parallel_embedding import ParallelLMHead
 from tokenspeed.runtime.models.qwen4_exp import (
     Qwen4ExpAttentionDecoderLayer,
     Qwen4ExpModel,
-    _warmup_qwen4_moe,
+    _warmup_qwen4_kernels,
     load_qwen4_exp_weights,
 )
 from tokenspeed.runtime.models.qwen4_exp_monokernel import (
@@ -281,7 +281,7 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
         return None
 
     def post_quant_warmup(self) -> None:
-        _warmup_qwen4_moe(self.model)
+        _warmup_qwen4_kernels(self.model)
         # The draft layer is a monokernel layer unless the draft steps reuse
         # the first step's top-k (Qwen4ExpDraftModel._decode_monokernel).
         enable_decode_monokernels(self.model)

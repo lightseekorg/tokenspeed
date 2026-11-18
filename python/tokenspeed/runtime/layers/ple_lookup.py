@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -27,6 +28,8 @@ from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from tokenspeed_kernel.ops.ple.host_cache import PLEHostCache
@@ -292,7 +295,11 @@ class PLELookup(nn.Module):
         if self.offload_embedding:
             out = self.allocate_lookup_buffer(gathered_ids.shape[0], ids.device)
             cache = self._host_cache
-            use_cache = cache is not None and cache.can_gather(gathered_ids)
+            use_cache = (
+                cache is not None
+                and self.ngram_embedding_scale is None
+                and cache.can_gather(gathered_ids)
+            )
             if self._gather_stream is None:
                 self._gather_stream = torch.cuda.Stream(device=ids.device)
             stream = self._gather_stream
@@ -359,6 +366,17 @@ class PLELookup(nn.Module):
             dtype=self.embed_output_dtype,
             device=device,
         )
+
+    def warmup_host_cache(self) -> None:
+        cache = self._host_cache
+        if cache is not None and self.ngram_embedding_scale is None:
+            cache.warmup(
+                scale=(
+                    self._checkpoint_weight_scale
+                    if self.embed_store_dtype is not None
+                    else None
+                )
+            )
 
     def gather_host(self, ids: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
         """Read the ``ids`` rows from host memory into ``out``.
@@ -475,6 +493,11 @@ class PLELookup(nn.Module):
                         dtype=torch.float32,
                     )
                     self.ngram_embedding_scale = scale_buffer
+                    if self._host_cache is not None:
+                        logger.warning(
+                            "PLE hot cache uses regular host gather for online FP8 "
+                            "tables with per-row scales"
+                        )
                 # Quantize compute-dtype checkpoint rows for FP8 storage and retain
                 # their independently derived dequant scales.
                 source_rows, scale = quantize_ple_embedding_rows(source_rows)

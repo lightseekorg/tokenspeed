@@ -223,6 +223,39 @@ def test_sharded_host_cache_matches_unsharded_lookup(tmp_path, monkeypatch, tp_s
     )
 
 
+def test_online_fp8_host_lookup_uses_row_scales_with_hot_cache_enabled(monkeypatch):
+    from tokenspeed_kernel.platform import current_platform
+
+    if not torch.cuda.is_available() or not (
+        current_platform().is_hopper or current_platform().is_blackwell
+    ):
+        pytest.skip("requires a Hopper or Blackwell GPU")
+
+    monkeypatch.setenv("TOKENSPEED_PLE_HOST_CACHE_SLOTS", "512")
+    tokens, heads, dim, vocab = 257, 16, 160, 4
+    lookup = ple_lookup.PLELookup(
+        _mapping_class()(rank=0, world_size=1),
+        vocab_size=vocab,
+        ngram_heads=heads,
+        head_dim=dim,
+        storage_dtype=torch.float8_e4m3fn,
+        output_dtype=torch.bfloat16,
+        offload=True,
+        enable_hot_cache=True,
+        prefix="",
+    )
+    weights = torch.tensor([0.125, 1.0, -8.0, 32.0], dtype=torch.bfloat16)
+    table = weights[:, None].expand(vocab, dim).contiguous()
+    for index, shard in enumerate(table.chunk(2)):
+        lookup.load_shard(shard, index, 2)
+
+    ids = torch.arange(tokens * heads, device="cuda").reshape(tokens, heads) % vocab
+    layout = lookup.make_layout(None, tokens)
+    actual = lookup.finish(lookup.start(ids, layout))
+    expected = table[ids.cpu()].flatten(1)
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+
+
 def test_pure_tp_has_no_ids_collective(monkeypatch):
     mapping = _mapping_class()(rank=1, world_size=4)
     lookup = _lookup(mapping)

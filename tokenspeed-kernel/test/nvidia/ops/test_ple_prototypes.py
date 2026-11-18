@@ -394,7 +394,7 @@ def test_host_cache_keeps_aligned_and_tail_rows_until_invalidated(
     from utils import assert_no_triton_compile
 
     device = host_cache_device
-    vocab_start = 20_000_000
+    vocab_start = (1 << 33) + 113
     table = torch.ones(32, dim)
     table[1].fill_(2)
     table = table.to(dtype).pin_memory()
@@ -423,7 +423,12 @@ def test_host_cache_keeps_aligned_and_tail_rows_until_invalidated(
         output[-1, 0] *= 2
         return output
 
-    torch.testing.assert_close(run(257), expected(257), rtol=0, atol=0)
+    cache.warmup(scale=scale)
+    with assert_no_triton_compile(
+        _ple_gather_staged_tail_kernel, _ple_fill_staged_kernel
+    ):
+        for tokens in (256, 257):
+            torch.testing.assert_close(run(tokens), expected(tokens), rtol=0, atol=0)
     table.view(torch.uint8).zero_()
     if scale is not None:
         torch.testing.assert_close(
@@ -464,35 +469,30 @@ def test_host_cache_reports_initialization_failures(host_cache_device):
 
 
 @pytest.mark.parametrize(
-    "heads, dim, message",
+    "heads, dim, vocab_end, message",
     [
-        (8, 160, "IDs shaped"),
-        (32, 160, "IDs shaped"),
-        (16, 128, "head_dim must be"),
+        (8, 160, 32, "16 n-gram heads"),
+        (32, 160, 32, "16 n-gram heads"),
+        (16, 128, 32, "head_dim must be"),
+        (16, 160, 1 << 31, "vocab span that fits int32"),
     ],
 )
-def test_host_cache_launcher_rejects_unsupported_shapes(
-    heads, dim, message, host_cache_device
+def test_host_cache_rejects_unsupported_geometry_at_initialization(
+    heads, dim, vocab_end, message, host_cache_device
 ):
     from tokenspeed_kernel.ops.ple.host_cache import PLEHostCache
 
     table = torch.ones(32, dim, dtype=torch.bfloat16).pin_memory()
-    cache = PLEHostCache(
-        slot_count=512,
-        table=table,
-        ngram_heads=heads,
-        output_dtype=torch.bfloat16,
-        vocab_start=0,
-        vocab_end=32,
-        device=host_cache_device,
-    )
-    ids = torch.zeros((256, heads), dtype=torch.int64, device=host_cache_device)
-    out = torch.empty(
-        (ids.numel(), dim), dtype=torch.bfloat16, device=host_cache_device
-    )
-    assert cache.can_gather(ids)
     with pytest.raises(RuntimeError, match=message):
-        cache.gather(ids, out, scale=None)
+        PLEHostCache(
+            slot_count=512,
+            table=table,
+            ngram_heads=heads,
+            output_dtype=torch.bfloat16,
+            vocab_start=0,
+            vocab_end=vocab_end,
+            device=host_cache_device,
+        )
 
 
 def test_conv_state_large_request_offset(pdl):

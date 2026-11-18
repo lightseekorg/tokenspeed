@@ -25,7 +25,19 @@ _MODULE_PATH = Path(__file__).parent / "objs" / "ple_host_gather" / "ple_host_ga
 
 
 @cache
-def ple_staged_gather():
+def _load_module():
     import tvm_ffi
 
-    return tvm_ffi.load_module(str(_MODULE_PATH)).ple_gather_staged
+    return tvm_ffi.load_module(str(_MODULE_PATH))
+
+
+def ple_staged_gather():
+    return _load_module().ple_gather_staged
+
+
+def validate_ple_hot_cache_geometry(
+    heads: int, head_dim: int, vocab_start: int, vocab_end: int
+) -> None:
+    _load_module().ple_validate_hot_cache_geometry(
+        heads, head_dim, vocab_start, vocab_end
+    )

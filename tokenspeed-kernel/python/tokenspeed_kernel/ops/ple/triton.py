@@ -329,7 +329,7 @@ def _ple_host_gather_rows(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["rows"])
 def _ple_host_gather_kernel(
     table_address,
     ids_ptr,
