@@ -764,7 +764,25 @@ def _check_all_reduce_residual_attnres(
             torch.testing.assert_close(
                 actual_hidden, expected_hidden, atol=2e-2, rtol=2e-2
             )
-            # Lamport plus row epilogue must equal the fused push one-shot bit for bit.
+            # The Lamport all-reduce plus row epilogue, the fused Lamport
+            # two-shot, and the fused push one-shot agree bit for bit.
+            reduced = k3_state.reduce_attention(local)
+            if reduced is not None:
+                split_hidden, split_residual = k3_state.attnres.epilogue(
+                    reduced, residual, score_weight, output_weight, scratch, 1e-6
+                )
+                torch.testing.assert_close(
+                    split_hidden.view(torch.int16),
+                    actual_hidden.view(torch.int16),
+                    atol=0,
+                    rtol=0,
+                )
+                torch.testing.assert_close(
+                    split_residual.view(torch.int16),
+                    actual_residual.view(torch.int16),
+                    atol=0,
+                    rtol=0,
+                )
             if num_tokens > k3_state.attnres.max_rows:
                 continue
             fused_hidden, fused_residual = k3_state.attnres.run(
