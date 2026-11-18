@@ -55,7 +55,7 @@ import pytest
 
 ts = pytest.importorskip("tokenspeed_scheduler")
 
-P = 8
+PREFIX_GRANULARITY = 8
 HISTORY = "full_attention"
 STATES = ("linear_attention_0", "linear_attention_1")
 ROUNDS = 400
@@ -217,9 +217,9 @@ class _Device:
         return block
 
     def check_kv(self, request_id: str, table, position: int, want) -> int:
-        bg = self.history_block
-        block = int(table[position // bg])
-        got = self.device[HISTORY].get(block, {}).get(position % bg)
+        block_granularity = self.history_block
+        block = int(table[position // block_granularity])
+        got = self.device[HISTORY].get(block, {}).get(position % block_granularity)
         self.kv_reads += 1
         if got != want:
             raise ContentError(
@@ -243,9 +243,9 @@ def _describe(value) -> str:
 
 def _config(rng, role, *, host_pages, policy, snapshot_pages, mixed, width):
     pages = rng.choice([24, 40, 64])
-    history_block = rng.choice([P, P // 2])
+    history_block = rng.choice([PREFIX_GRANULARITY, PREFIX_GRANULARITY // 2])
     cfg = ts.SchedulerConfig()
-    cfg.prefix_granularity = P
+    cfg.prefix_granularity = PREFIX_GRANULARITY
     cfg.num_device_pages = pages
     cfg.num_host_pages = host_pages
     cfg.num_snapshot_pages = snapshot_pages
@@ -269,7 +269,7 @@ def _config(rng, role, *, host_pages, policy, snapshot_pages, mixed, width):
         ts.CacheGroupConfig(
             group_id=HISTORY,
             block_granularity=history_block,
-            total_pages=pages * (P // history_block),
+            total_pages=pages * (PREFIX_GRANULARITY // history_block),
             attn_kind=ts.AttnKind.Full,
             cache_blocks_per_lcm_block=1,
             transfer_policy=ts.CacheTransferPolicy.FullSuffix,
@@ -294,11 +294,29 @@ def _config(rng, role, *, host_pages, policy, snapshot_pages, mixed, width):
     return cfg, history_block
 
 
-def _event(kind: str, request_id: str, **fields):
-    event = getattr(ts.ForwardEvent, kind)()
+def _extend_result(request_id: str, tokens: list[int]):
+    event = ts.ForwardEvent.ExtendResult()
     event.request_id = request_id
-    for name, value in fields.items():
-        setattr(event, name, value)
+    event.tokens = tokens
+    return event
+
+
+def _reserve_num_tokens(request_id: str, count: int):
+    event = ts.ForwardEvent.UpdateReserveNumTokens()
+    event.request_id = request_id
+    event.reserve_num_tokens_in_next_schedule_event = count
+    return event
+
+
+def _abort(request_id: str):
+    event = ts.ForwardEvent.Abort()
+    event.request_id = request_id
+    return event
+
+
+def _finish(request_id: str):
+    event = ts.ForwardEvent.Finish()
+    event.request_id = request_id
     return event
 
 
@@ -385,7 +403,7 @@ class _Loop:
                 if self.rng.random() < 0.5:
                     tokens += user
             elif draw < 0.6 and self.short_turns:
-                tokens = user[: self.rng.randrange(1, P)]
+                tokens = user[: self.rng.randrange(1, PREFIX_GRANULARITY)]
             else:
                 tokens = self.rng.choice(self.systems) + user
             max_new = self.rng.randrange(1, 10)
@@ -423,7 +441,7 @@ class _Loop:
     def forward(self, batch, key) -> None:
         tables = batch.block_tables_arrays()
         num_extends = batch.num_extends()
-        bg = self.device.history_block
+        block_granularity = self.device.history_block
         state_writes: dict[tuple[str, int], str] = {}
         kv_writes: dict[tuple[int, int], str] = {}
         state_reads: list[tuple[str, int, str]] = []
@@ -473,9 +491,9 @@ class _Loop:
                 block = self.device.check_kv(
                     request_id, table, position, _kv_of(request.tokens(position + 1))
                 )
-                kv_reads.append((block, position % bg, request_id))
+                kv_reads.append((block, position % block_granularity, request_id))
             for position in range(before, before + window):
-                slot = position // bg
+                slot = position // block_granularity
                 block = int(table[slot]) if slot < table.shape[0] else 0
                 if block <= 0:
                     if position >= before + count:
@@ -484,11 +502,13 @@ class _Loop:
                         f"{request_id} writes the KV of position {position} to "
                         f"block {block}"
                     )
-                owner = kv_writes.setdefault((block, position % bg), request_id)
+                owner = kv_writes.setdefault(
+                    (block, position % block_granularity), request_id
+                )
                 if owner != request_id:
                     raise ContentError(
                         f"{owner} and {request_id} write block {block} row "
-                        f"{position % bg}"
+                        f"{position % block_granularity}"
                     )
                 value = (
                     _kv_of(request.tokens(position + 1))
@@ -496,7 +516,13 @@ class _Loop:
                     else ("rejected", (request_id, position))
                 )
                 pending_writes.append(
-                    ("kv", HISTORY, (block, position % bg), value, request_id)
+                    (
+                        "kv",
+                        HISTORY,
+                        (block, position % block_granularity),
+                        value,
+                        request_id,
+                    )
                 )
             if self.role == "P":
                 self.export_chunk(request_id, tables, i, before, count)
@@ -532,9 +558,11 @@ class _Loop:
         (layerwise), and the State at the prompt end.
         """
         transfer = self.device.transfers.setdefault(request_id, _Transfer())
-        bg = self.device.history_block
+        block_granularity = self.device.history_block
         table = tables[HISTORY][i]
-        for slot in range(before // bg, (before + count - 1) // bg + 1):
+        for slot in range(
+            before // block_granularity, (before + count - 1) // block_granularity + 1
+        ):
             transfer.pages.add((HISTORY, int(table[slot])))
         if before + count >= len(self.requests[request_id].prompt):
             for group in STATES:
@@ -548,15 +576,17 @@ class _Loop:
         """
         tables = batch.block_tables_arrays()
         cached = list(batch.state_prefix_cached) or [False] * len(batch.request_ids)
-        bg = self.device.history_block
+        block_granularity = self.device.history_block
         for i, request_id in enumerate(batch.request_ids):
             request = self.requests[request_id]
             hit = int(batch.extend_prefix_lens[i])
             table = tables[HISTORY][i]
             transfer = _Transfer()
             writes = []
-            for position in range((hit // bg) * bg, len(request.prompt)):
-                block = int(table[position // bg])
+            for position in range(
+                (hit // block_granularity) * block_granularity, len(request.prompt)
+            ):
+                block = int(table[position // block_granularity])
                 if block <= 0:
                     raise ContentError(
                         f"{request_id}'s landing has no block for the KV of position "
@@ -564,7 +594,12 @@ class _Loop:
                     )
                 transfer.pages.add((HISTORY, block))
                 writes.append(
-                    ("kv", block, position % bg, _kv_of(request.tokens(position + 1)))
+                    (
+                        "kv",
+                        block,
+                        position % block_granularity,
+                        _kv_of(request.tokens(position + 1)),
+                    )
                 )
             for group in STATES:
                 row = tables[group][i]
@@ -648,13 +683,13 @@ class _Loop:
                     batch.extend_prefix_lens[i] + batch.input_lengths[i]
                     < batch.prefill_lengths[i]
                 ):
-                    events.add_event(_event("ExtendResult", request_id, tokens=[]))
+                    events.add_event(_extend_result(request_id, []))
                     continue
                 if decode:
                     tokens = self.decided.pop((plan_id, index, i), [])
                 else:
                     tokens = [request.outputs[0]] if request.landed == 0 else []
-                events.add_event(_event("ExtendResult", request_id, tokens=tokens))
+                events.add_event(_extend_result(request_id, tokens))
                 request.landed += len(tokens)
                 if not tokens or request.finished or request_id not in self.live:
                     continue
@@ -664,17 +699,12 @@ class _Loop:
                     request.finished = True
                     finishes.append(request_id)
                 elif decode:
-                    events.add_event(
-                        _event(
-                            "UpdateReserveNumTokens",
-                            request_id,
-                            reserve_num_tokens_in_next_schedule_event=self.width,
-                        )
-                    )
+                    events.add_event(_reserve_num_tokens(request_id, self.width))
         for request_id in finishes:
-            events.add_event(
-                _event("Abort" if self.rng.random() < 0.1 else "Finish", request_id)
-            )
+            if self.rng.random() < 0.1:
+                events.add_event(_abort(request_id))
+            else:
+                events.add_event(_finish(request_id))
         self.scheduler.advance(events)
 
     def queue_acks(self, plan) -> None:
@@ -724,7 +754,7 @@ class _Loop:
             return
         request_id = self.abort_rng.choice(abortable)
         events = ts.ExecutionEvent()
-        events.add_event(_event("Abort", request_id))
+        events.add_event(_abort(request_id))
         self.scheduler.advance(events)
         self.end(request_id)
 
@@ -854,7 +884,7 @@ def test_prefill_role_transfers_keep_their_pages() -> None:
 
 def _scripted(role: str, groups, block_granularity: int) -> "ts.Scheduler":
     cfg = ts.SchedulerConfig()
-    cfg.prefix_granularity = P
+    cfg.prefix_granularity = PREFIX_GRANULARITY
     cfg.num_device_pages = 24
     cfg.num_host_pages = 0
     cfg.num_snapshot_pages = 1
@@ -875,7 +905,11 @@ def _scripted(role: str, groups, block_granularity: int) -> "ts.Scheduler":
         ts.CacheGroupConfig(
             group_id=group,
             block_granularity=block_granularity if group == HISTORY else 0,
-            total_pages=24 * (P // block_granularity) if group == HISTORY else 24,
+            total_pages=(
+                24 * (PREFIX_GRANULARITY // block_granularity)
+                if group == HISTORY
+                else 24
+            ),
             attn_kind=ts.AttnKind.Full if group == HISTORY else ts.AttnKind.State,
             transfer_policy=(
                 ts.CacheTransferPolicy.FullSuffix
@@ -905,7 +939,7 @@ def test_a_finish_behind_a_masked_first_decode_publishes_the_prompt_end_state() 
     hold the prompt-end state even after A's copy of it was evicted, as C
     resumes from it.
     """
-    scheduler = _scripted("Fused", [STATES[1], HISTORY, STATES[0]], P)
+    scheduler = _scripted("Fused", [STATES[1], HISTORY, STATES[0]], PREFIX_GRANULARITY)
     prompt = [8, 245, 288, 266, 420, 388, 449, 50, 287, 25, 80, 185]
     holds = {group: {} for group in STATES}
     stopped = set()
@@ -938,9 +972,9 @@ def test_a_finish_behind_a_masked_first_decode_publishes_the_prompt_end_state() 
     def land(*results, finish=None) -> None:
         events = ts.ExecutionEvent()
         for request_id, tokens in results:
-            events.add_event(_event("ExtendResult", request_id, tokens=tokens))
+            events.add_event(_extend_result(request_id, tokens))
         if finish is not None:
-            events.add_event(_event("Finish", finish))
+            events.add_event(_finish(finish))
         scheduler.advance(events)
 
     _submit(scheduler, "A", prompt, 7)
@@ -995,7 +1029,7 @@ def test_a_tail_hit_in_the_first_block_lands_in_a_real_block(
     events.add_event(ts.PD.RemotePrefillDoneEvent("A", 7))
     scheduler.advance(events)
     events = ts.ExecutionEvent()
-    events.add_event(_event("Finish", "A"))
+    events.add_event(_finish("A"))
     scheduler.advance(events)
     scheduler.next_execution_plan()
     remote = remote_admission("B", prompt + list(range(900, 900 + extra)), 4)
