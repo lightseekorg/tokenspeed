@@ -124,12 +124,17 @@ def test_pdl_and_cancellation(m):
 
 
 @pytest.mark.parametrize("m", [33, 48, 128, 192])
-def test_larger_rows_keep_original_gemm(m):
+def test_larger_rows_leave_the_joint_gemm(m):
     x, w = inputs(m, 99)
     out = torch.empty(m, N, dtype=x.dtype, device=x.device)
     with pytest.raises(ValueError, match="Unsupported input"):
         fi.flashinfer_bf16_gemm(x, w, out)
-    assert torch.equal(mm(x, w, out=out), x @ w.T)
+    # Rows the TGV policy admits under PDL take its tile.
+    tactic = fi.flashinfer_tgv_decode_tactic(x, w, out)
+    expected = (
+        x @ w.T if tactic is None else fi.flashinfer_tgv_decode_gemm(x, w, None, tactic)
+    )
+    assert torch.equal(mm(x, w, out=out), expected)
 
 
 def test_other_projections_and_invalid_layouts_keep_original_gemm():

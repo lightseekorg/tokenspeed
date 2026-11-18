@@ -726,7 +726,7 @@ def mm(
                 has_out=out is not None,
             ):
                 return flashinfer_bf16_gemm(A, B, out)
-        # Decode rows on small weights take one pinned TGV tile on SM100/103
+        # Decode rows on small weights take one pinned TGV tile on SM100/103/107
         # under PDL (README "Decode GEMMs on small weights"). Like the joint
         # path, only before serving: CUDA graphs captured at startup keep the
         # tile, and eager calls while serving keep cuBLASLt. Registering the
