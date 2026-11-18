@@ -45,6 +45,8 @@ _SF_VEC = 16
 _W13_ROW_GROUP = 64
 # One fixed tactic for both GEMMs (256-row routing tiles, 2-CTA clusters), so
 # each kernel compiles once, during the startup forward, for any row count.
+# It is in FlashInfer's Blackwell format, which builds the SM100 kernels; SM107
+# runs separate kernels that take Rubin-format tactics.
 _TACTIC = (256, ((256, 256), (2, 1), False), ((256, 256), (2, 1), False))
 
 _STREAMED = (
@@ -162,7 +164,7 @@ if platform.is_nvidia:
         capability=CapabilityRequirement(
             vendors=frozenset({"nvidia"}),
             min_arch_version=ArchVersion(10, 0),
-            max_arch_version=ArchVersion(10, 7),
+            max_arch_version=ArchVersion(10, 3),
         ),
         signatures=format_signatures("x", "dense", {torch.bfloat16, torch.uint8}),
         traits={
