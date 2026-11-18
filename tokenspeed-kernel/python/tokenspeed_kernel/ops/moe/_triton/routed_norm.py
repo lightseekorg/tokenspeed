@@ -242,6 +242,9 @@ ROUTED_SUM_SINGLE_PASS_MAX_BLOCK_CDNA4 = 8192
 # CDNA4, complete routes: one program per token wins from this many tokens.
 ROUTED_SUM_SINGLE_PASS_MIN_TOKENS_CDNA4 = 152
 
+# Blackwell, mapped routes: the widest block measured faster in one launch.
+ROUTED_SUM_SINGLE_PASS_MAX_BLOCK_BLACKWELL = 16384
+
 
 def _routed_sum_single_pass(num_tokens: int, block: int, has_map: bool) -> bool:
     """Whether one program per token reduces the routes instead of two launches.
@@ -258,7 +261,11 @@ def _routed_sum_single_pass(num_tokens: int, block: int, has_map: bool) -> bool:
         # from 8 to 128 tokens, about even at 136-144 and faster from 152.
         return has_map or num_tokens >= ROUTED_SUM_SINGLE_PASS_MIN_TOKENS_CDNA4
     # GB200, top-8 with 1/2-1/8 of the routes on this rank: one launch wins at 65-2048 tokens, widths 4096-16384.
-    return has_map and current_platform().is_nvidia
+    return (
+        has_map
+        and current_platform().is_blackwell_plus
+        and block <= ROUTED_SUM_SINGLE_PASS_MAX_BLOCK_BLACKWELL
+    )
 
 
 @register_kernel(
