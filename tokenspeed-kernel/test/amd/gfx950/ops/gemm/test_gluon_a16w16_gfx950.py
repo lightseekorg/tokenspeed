@@ -514,13 +514,18 @@ _K31_VERIFY_BUCKETS = [
     ((1536, 1536), (44, 100)),
 ]
 
-# The K3.1 DSpark drafter's TP8 buckets: its q_a with kv_a at draft-block rows,
-# the MLP down projection, the stacked context kv_a and the context projection.
+# The K3.1 DSpark drafters' TP8 buckets: the preview drafter's q_a with kv_a
+# at draft-block rows and its stacked context kv_a, and the released GQA
+# drafter's q|k|v, stacked context k|v and MLP gate/up; both share the MLP
+# down projection's and the context projection's rows.
 _K31_DSPARK_BUCKETS = [
     ((2112, 7168), (7, 14, 28)),
-    ((7168, 1792), (7, 16, 28)),
+    ((7168, 1792), (6, 7, 16, 28)),
     ((2880, 7168), (14, 32, 56)),
-    ((896, 35840), (7, 16)),
+    ((896, 35840), (6, 7, 16, 28)),
+    ((1024, 7168), (6, 16, 28, 48)),
+    ((1280, 7168), (6, 16, 28, 48)),
+    ((3584, 7168), (6, 8)),
 ]
 
 

@@ -387,7 +387,7 @@ def test_final_norm_reduces_the_last_row_parallel_mlp_output() -> None:
 
     with mock.patch.object(
         dspark_model_module,
-        "all_reduce",
+        "draft_all_reduce",
         side_effect=lambda hidden, group: hidden * 8,
     ) as reduce:
         out = model._finalize_hidden(local_hidden, residual)
