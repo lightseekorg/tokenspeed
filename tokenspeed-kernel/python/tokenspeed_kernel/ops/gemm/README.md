@@ -237,7 +237,9 @@ The FlashInfer cuBLASLt path requires 16-byte-aligned, dense operands and
 output. Contiguous views can still start at an unaligned storage offset:
 the wrapper copies those operands into aligned storage and copies results
 back into strided or unaligned output views. Aligned dense tensors use their
-existing storage.
+existing storage. The single-row CuTe skinny GEMV also aligns its FP8
+operands before issuing vector loads; its scalar output stores accept offset
+output views directly.
 
 ## Per-token/per-channel FP8
 

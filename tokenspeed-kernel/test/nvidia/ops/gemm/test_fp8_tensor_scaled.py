@@ -119,6 +119,9 @@ def test_offset_views_through_mm_and_cuda_graph(m, out_dtype, offset):
         else torch.empty((m, 384), dtype=out_dtype, device=a.device)
     )
 
+    if offset in ("output", "all"):
+        assert out.is_contiguous() and out.data_ptr() % 16 != 0
+
     def run():
         return kernel_mm(
             a,

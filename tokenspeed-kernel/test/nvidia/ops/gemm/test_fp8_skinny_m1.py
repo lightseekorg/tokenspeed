@@ -26,6 +26,7 @@ from tokenspeed_kernel.ops.gemm import _gemm_format_signature
 from tokenspeed_kernel.ops.gemm import cute_dsl as cute_dsl_ops
 from tokenspeed_kernel.ops.gemm import flashinfer as flashinfer_ops
 from tokenspeed_kernel.ops.gemm import mm as kernel_mm
+from tokenspeed_kernel.profiling import ShapeCapture
 from tokenspeed_kernel.selection import select_kernel
 
 pytestmark = pytest.mark.skipif(
@@ -128,3 +129,59 @@ def test_capture_before_warmup_runs_cublaslt_and_replays_after():
     assert not torch.equal(changed, expected)
     graph.replay()
     torch.testing.assert_close(warm, changed, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("offset", ["activation", "weight", "both"])
+def test_offset_operands_through_mm_and_warmed_graph(offset):
+    a, b, a_scale, b_scale = _operands(1, 128, 2048)
+
+    def offset_copy(tensor):
+        storage = torch.empty(
+            tensor.numel() + 1, dtype=tensor.dtype, device=tensor.device
+        )
+        return storage[1:].view(tensor.shape).copy_(tensor)
+
+    if offset in ("activation", "both"):
+        a = offset_copy(a)
+        assert a.is_contiguous() and a.data_ptr() % 16 != 0
+    if offset in ("weight", "both"):
+        b = offset_copy(b.t()).t()
+        assert b.t().is_contiguous() and b.data_ptr() % 16 != 0
+    storage = torch.full((130,), 42, dtype=torch.bfloat16, device=a.device)
+    out = storage[1:-1].view(1, 128)
+    assert out.is_contiguous() and out.data_ptr() % 16 != 0
+
+    def run():
+        return kernel_mm(
+            a,
+            b,
+            A_scales=a_scale,
+            B_scales=b_scale,
+            out_dtype=torch.bfloat16,
+            quant="fp8",
+            out=out,
+        )
+
+    capture = ShapeCapture.get()
+    capture.clear()
+    previous = capture.enabled
+    capture.enabled = True
+    try:
+        assert run() is out
+    finally:
+        capture.enabled = previous
+    assert capture._records[-1].kernel_name == "cute_dsl_mm_fp8_tensor_scaled_m1"
+    expected = (a.float() * a_scale) @ (b.float() * b_scale)
+    torch.testing.assert_close(out.float(), expected, rtol=1e-2, atol=3e-5)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    a.copy_((a.float() * 0.5).to(a.dtype))
+    b.t().copy_((b.t().float() * 0.5).to(b.dtype))
+    expected = (a.float() * a_scale) @ (b.float() * b_scale)
+    out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out.float(), expected, rtol=1e-2, atol=3e-5)
+    assert storage[0] == 42 and storage[-1] == 42
