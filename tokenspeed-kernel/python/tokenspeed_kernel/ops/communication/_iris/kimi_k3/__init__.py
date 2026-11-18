@@ -20,6 +20,7 @@
 
 """Kimi-K3's prepared Iris fusions, shared by sequential decoder layers."""
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -44,6 +45,8 @@ _K3_GATHER_NUM_WARPS = 8
 _K3_GATHER_WAVES_PER_OUTPUT = 2
 _K3_GATHER_BLOCK_K = 512
 _K3_GATHER_MFMA_CHUNK = 64
+# MFMA gathers that also mix the next attention input: the AttnRes fast path's rows.
+_K3_GATHER_MIX_MAX_ROWS = 32
 # The decode MoE input projection: [router; routed; shared gate; shared up].
 _K3_HIDDEN = 7168
 _K3_ROUTER = 896
@@ -95,6 +98,66 @@ def _k3_two_shot_heap_bytes(producer_direct_max_numel: int) -> int:
     return allocation_bytes((3, 2, 8, numel // 8), torch.bfloat16) if numel else 0
 
 
+def _k3_attnres_lamport_rows(world_size: int, enable_lamport: bool) -> int:
+    """Rows the fused AttnRes Lamport two-shot serves for this group."""
+    from tokenspeed_kernel.ops.communication._iris.kimi_k3.attnres import (
+        ATTNRES_LAMPORT_MAX_ROWS,
+        ATTNRES_WORLD_SIZE,
+    )
+
+    return (
+        ATTNRES_LAMPORT_MAX_ROWS
+        if enable_lamport and world_size == ATTNRES_WORLD_SIZE
+        else 0
+    )
+
+
+@dataclass(frozen=True)
+class K3AttentionMix:
+    """A layer's AttnRes attention-input mix as ``attnres_combine`` takes it.
+
+    ``weight`` holds the mix's per-column score weights, ``norm_weight`` the
+    following RMSNorm's, and ``scratch_*`` the ``(m, s, acc)`` block partial
+    by row.
+    """
+
+    weight: torch.Tensor
+    norm_weight: torch.Tensor
+    eps: float
+    scratch_m: torch.Tensor
+    scratch_s: torch.Tensor
+    scratch_acc: torch.Tensor
+
+    def supports(self, rows: int, width: int, device: torch.device) -> bool:
+        """Whether a fused mix reads these operands for ``rows`` rows of ``width``."""
+        return (
+            self.eps > 0.0
+            and all(
+                t.shape == (width,)
+                and t.dtype == torch.bfloat16
+                and t.is_contiguous()
+                and t.device == device
+                for t in (self.weight, self.norm_weight)
+            )
+            and all(
+                t.shape == shape
+                and t.dtype == torch.float32
+                and t.is_contiguous()
+                and t.device == device
+                for t, shape in (
+                    (self.scratch_m, (rows,)),
+                    (self.scratch_s, (rows,)),
+                    (self.scratch_acc, (rows, width)),
+                )
+            )
+        )
+
+    @classmethod
+    def unused(cls, like: torch.Tensor) -> "K3AttentionMix":
+        """Placeholder operands of a launch without a mix."""
+        return cls(like, like, 0.0, like, like, like)
+
+
 def allreduce_residual_attnres_max_tokens(world_size: int) -> int:
     """Return K3's measured fused AttnRes window for this group size."""
     return 16 if current_platform().is_cdna4 and world_size == 8 else 0
@@ -139,7 +202,13 @@ class K3IrisState:
         self.enable_lamport = enable_lamport
         self.attnres = (
             IrisAttnResState(
-                all_reduce.peers, attnres_max_numel, attnres_max_rows, all_reduce.dtype
+                all_reduce.peers,
+                attnres_max_numel,
+                attnres_max_rows,
+                all_reduce.dtype,
+                lamport_max_rows=_k3_attnres_lamport_rows(
+                    all_reduce.world_size, enable_lamport
+                ),
             )
             if attnres_max_numel
             else None
@@ -452,6 +521,7 @@ class K3IrisState:
         prefix: torch.Tensor,
         projection_weight: torch.Tensor,
         norm_weight: torch.Tensor | None,
+        attention_mix: K3AttentionMix | None = None,
     ) -> bool:
         """Whether ``moe_gather_tail`` serves these reduced decode rows."""
         from tokenspeed_kernel.ops.communication._iris.kimi_k3.moetail_gather import (
@@ -490,6 +560,14 @@ class K3IrisState:
                     and norm_weight.is_contiguous()
                 )
             )
+            and (
+                attention_mix is None
+                or (
+                    _K3_GATHER_GEMV_MAX_ROWS < rows <= _K3_GATHER_MIX_MAX_ROWS
+                    and rows * K3_GATHER_ROW_STRIDE <= self.lamport.max_numel
+                    and attention_mix.supports(rows, width, self.all_reduce.device)
+                )
+            )
         )
 
     def moe_gather_tail(
@@ -501,7 +579,8 @@ class K3IrisState:
         *,
         norm_weight: torch.Tensor | None,
         eps: float | None,
-    ) -> torch.Tensor:
+        attention_mix: K3AttentionMix | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Return ``prefix + norm(routed) @ projection_weight.T + shared`` for decode rows.
 
         ``routed`` and ``shared`` are the reduced latent and shared-expert rows,
@@ -510,6 +589,10 @@ class K3IrisState:
         mailbox, so the call is collective. Rows match RMSNorm followed by
         the fused MFMA add3 epilogue up to FP32 summation order (the norm's
         sum of squares and the projection).
+
+        With ``attention_mix``, also return the rows' mix into the next
+        layer's attention input, bit-identical to ``attnres_combine`` on the
+        returned rows with its operands.
         """
         from tokenspeed_kernel.ops.communication._iris.all_reduce import (
             iris_arch_policy,
@@ -521,7 +604,7 @@ class K3IrisState:
         )
 
         assert self.can_moe_gather_tail(
-            routed, shared, prefix, projection_weight, norm_weight
+            routed, shared, prefix, projection_weight, norm_weight, attention_mix
         )
         if norm_weight is not None and (eps is None or eps <= 0.0):
             raise ValueError("the fused RMSNorm needs a positive epsilon")
@@ -571,10 +654,31 @@ class K3IrisState:
                 **constants,
             )
         else:
-            # Per 16-row tile: a sender per 16 columns, a reducer per 1024 slot items.
+            # Per 16-row tile: a sender per 16 columns, a reducer per 1024 slot
+            # items; a mix finishes each row in one program instead.
+            row_tiles = -(-rows // 16)
+            mixed = None if attention_mix is None else torch.empty_like(out)
+            mix = K3AttentionMix.unused(out) if mixed is None else attention_mix
+            finishers = (
+                row_tiles * (16 * local_width // 1024) if mixed is None else rows
+            )
             iris_k3moe_mfma_lamport_gather[
-                (-(-rows // 16) * (local_width // 16 + 16 * local_width // 1024),)
-            ](*args, CHUNK=_K3_GATHER_MFMA_CHUNK, **constants)
+                (row_tiles * (local_width // 16) + finishers,)
+            ](
+                *args,
+                mix.weight,
+                mix.norm_weight,
+                mix.scratch_m,
+                mix.scratch_s,
+                mix.scratch_acc,
+                out if mixed is None else mixed,
+                mix.eps,
+                CHUNK=_K3_GATHER_MFMA_CHUNK,
+                HAS_MIX=mixed is not None,
+                **constants,
+            )
+            if mixed is not None:
+                return out, mixed
         return out
 
     def can_latent_input_gather(
@@ -927,6 +1031,7 @@ class K3IrisState:
         if self.attnres is None or partial.ndim != 2:
             return False
         rows = partial.shape[0]
+        lamported = rows <= self.attnres.lamport_max_rows
         # Rows past the push one-shot's inbox reduce through the two-shot.
         pushed = (
             partial.numel() <= self.attnres.max_numel and rows <= self.attnres.max_rows
@@ -937,7 +1042,7 @@ class K3IrisState:
             and partial.numel() <= self.two_shot_max_numel
             and partial.is_contiguous()
         )
-        return (pushed or reduced) and attnres_supported(
+        return (lamported or pushed or reduced) and attnres_supported(
             partial,
             residual,
             score_weight,
@@ -960,11 +1065,17 @@ class K3IrisState:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return normalized AttnRes output and the accumulated residual.
 
-        The partial reduces through the Lamport one-shot (below 8 rows) or
-        two-shot mailboxes, in the fused kernel's ascending rank order, and
-        a row epilogue finishes it; the fused push one-shot serves the rest.
+        Within the state's Lamport window one fused Lamport two-shot reduces
+        and finishes the partial. Otherwise it reduces through the Lamport
+        one-shot (below 8 rows) or two-shot mailboxes, in the fused kernel's
+        ascending rank order, and a row epilogue finishes it; the fused push
+        one-shot serves the rest.
         """
         assert self.attnres is not None
+        if partial.shape[0] <= self.attnres.lamport_max_rows:
+            return self.attnres.lamport(
+                partial, residual, score_weight, output_weight, scratch, eps
+            )
         reduced = (
             self._reduce_attention_lamport(partial) if partial.is_contiguous() else None
         )
@@ -1098,10 +1209,16 @@ def prepare_k3_communication(
         if all_reduce is None
         else 0
     )
+    attnres_lamport_rows = _k3_attnres_lamport_rows(world_size, enable_lamport)
+    attnres_lamport_bytes = 0
     if attnres_max_numel:
         total_bytes += IrisAttnResState.heap_bytes(
             attnres_max_numel, attnres_max_rows, world_size, dtype
         )
+        if attnres_lamport_rows:
+            attnres_lamport_bytes = IrisAttnResState.lamport_heap_bytes(
+                attnres_lamport_rows, world_size, dtype
+            )
     if enable_lamport and ProducerLamport.supported(world_size, dtype):
         lamport_numel = _k3_lamport_numel(producer_direct_max_numel)
         if lamport_numel:
@@ -1122,7 +1239,8 @@ def prepare_k3_communication(
     ctx = get_or_create_context(
         heap_size=max(MIN_HEAP_BYTES, total_bytes + HEAP_HEADROOM_BYTES)
         + sharded_bytes
-        + pull_exchange_bytes,
+        + pull_exchange_bytes
+        + attnres_lamport_bytes,
     )
     if all_reduce is None:
         all_reduce = IrisAllReduce(

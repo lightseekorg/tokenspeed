@@ -31,7 +31,6 @@ import torch.nn.functional as F
 from tokenspeed_kernel.ops.conv import dflash2_grouped_conv
 from torch import nn
 
-from tokenspeed.runtime.distributed.comm_backend.registry import get_global_backend
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping, MappingBase
@@ -66,11 +65,6 @@ if TYPE_CHECKING:
     from tokenspeed_kernel.ops.communication._iris.residual_rmsnorm import (
         LamportResidualRMSNorm,
     )
-
-# Most rows one fused reduce + norm serves (16 requests of 8 block rows), the
-# most the row-owned kernel keeps resident; larger draft forwards keep the
-# unfused reduction.
-_FUSED_REDUCE_NORM_MAX_ROWS = 128
 
 
 def _dflash2_config_value(config: Any, key: str, default: Any = None) -> Any:
@@ -339,8 +333,6 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
             prefix=prefix,
         )
         self.comm_manager = None
-        # The draft's prepared reduce + norm, bound by the draft model.
-        self.fused_reduce_norm: LamportResidualRMSNorm | None = None
         if self._uses_mla:
             self.comm_manager = CommManager(
                 mapping=mapping,
@@ -501,8 +493,6 @@ class DFlash2DraftModel(DFlashDraftModel):
         self.final_logit_softcapping = float(
             nested.get("final_logit_softcapping") or 0.0
         )
-        # The draft's prepared reduce + norm (prepare_communication_runtime).
-        self.fused_reduce_norm: LamportResidualRMSNorm | None = None
         self.candidate_selector = CandidateSelector(
             hidden_size=int(config.hidden_size),
             vocab_size=int(config.vocab_size),
@@ -618,59 +608,6 @@ class DFlash2DraftModel(DFlashDraftModel):
             process_group_manager.get_process_group("gloo", group),
             group.index(dist.get_rank()),
         )
-        return True
-
-    def _prepare_fused_reduce_norm(self, max_num_tokens: int) -> bool:
-        """Prepare the fused reduce + norm of the draft's layer boundaries.
-
-        Collective: every rank prepares or declines alike, before cache
-        sizing and graph capture. Taken on gfx950 at TP4/TP8 for a BF16 draft
-        when the attention and dense groups are one group whose performance
-        route is Iris and whose all-reduce is already prepared (the
-        target's): the mailboxes come out of the headroom of the heap that
-        preparation sized, and an allocation past
-        it raises on every rank alike.
-
-        Args:
-            max_num_tokens: Most rows a forward carries; unused, the fused
-                path serves at most ``_FUSED_REDUCE_NORM_MAX_ROWS``.
-
-        Returns:
-            Whether the draft prepared anything.
-        """
-        del max_num_tokens
-        if self.fused_reduce_norm is not None:
-            return True
-        from tokenspeed_kernel.ops.communication.iris import (
-            iris_lamport_residual_rmsnorm_supported,
-            prepare_iris_lamport_residual_rmsnorm,
-        )
-
-        from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
-
-        mapping = self.mapping
-        group = mapping.attn.tp_group
-        backend = get_global_backend()
-        hidden_size = int(self.config.hidden_size)
-        # The kernel's predicate decides the device, group size and width.
-        if (
-            not iris_lamport_residual_rmsnorm_supported(
-                mapping.attn.tp_size, hidden_size, torch.bfloat16
-            )
-            or mapping.dense.tp_group != group
-            or self.fc.weight.dtype != torch.bfloat16
-            or not isinstance(backend, AutoBackend)
-            or not backend.can_prepare_all_reduce_buffers(group, torch.bfloat16)
-        ):
-            return False
-        all_reduce_state = backend.iris.state(group, torch.bfloat16)
-        if all_reduce_state is None:
-            return False
-        self.fused_reduce_norm = prepare_iris_lamport_residual_rmsnorm(
-            all_reduce_state, _FUSED_REDUCE_NORM_MAX_ROWS, hidden_size
-        )
-        for layer in self.layers:
-            layer.fused_reduce_norm = self.fused_reduce_norm
         return True
 
     @property

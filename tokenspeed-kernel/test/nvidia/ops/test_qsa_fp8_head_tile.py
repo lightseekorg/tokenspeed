@@ -35,9 +35,11 @@ pytestmark = pytest.mark.skipif(
 @pytest.mark.parametrize(
     ("rows", "query_width", "large_offsets", "kv_heads"),
     [
-        (96, 1, False, 2),
-        (105, 1, False, 2),
-        (106, 1, False, 2),
+        # Below one output tile per SM: sixteen, four and two KV splits.
+        (4, 1, False, 2),
+        (8, 1, False, 2),
+        (32, 1, False, 2),
+        (32, 1, False, 1),
         (128, 4, False, 2),
         (384, 4, False, 2),
         (128, 4, True, 2),
@@ -121,6 +123,54 @@ def test_fp8_target_and_draft_graphs_refresh_without_compilation(
         pdl_enabled(previous)
 
 
+@pytest.mark.parametrize(
+    ("q_heads", "kv_heads", "rows"),
+    [(24, 2, 4), (24, 2, 8), (24, 2, 32), (12, 1, 8), (12, 1, 32)],
+)
+def test_small_fp8_grids_use_one_sixteen_column_tile_and_match_reference(
+    q_heads, kv_heads, rows
+):
+    """Grids of fewer output tiles than SMs cover twelve heads with one
+    sixteen-column tile, at every KV split the small-grid rule picks; full
+    random prefixes put data in every split."""
+    from tokenspeed_kernel.numerics.torch.attention.qsa import (
+        torch_qsa_selected_attention,
+    )
+    from tokenspeed_kernel.thirdparty.cute_dsl import qsa_sparse
+
+    sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+    assert rows * kv_heads < sm_count
+    head_tile = qsa_sparse._configuration(
+        rows, q_heads, kv_heads, 1, False, sm_count, 0
+    )[0]
+    assert head_tile == 16
+
+    torch.manual_seed(5 + rows)
+    keys = torch.randn((65536, kv_heads, 256), device="cuda").to(torch.float8_e4m3fn)
+    values = torch.randn((65536, kv_heads, 256), device="cuda").to(torch.float8_e4m3fn)
+    keys[0].fill_(float("nan"))
+    values[0].fill_(float("nan"))
+    query = torch.randn((rows, q_heads, 256), device="cuda", dtype=torch.bfloat16) * 2
+    selected = torch.randint(1, 65536, (rows, 2051), device="cuda", dtype=torch.int32)
+    selected[:, 13::19] = 0
+    selected[::3, 1500:2048] = -1
+    output = qsa_sparse.kernel(
+        query,
+        keys,
+        values,
+        selected,
+        scale=1 / 16,
+        max_seqlen_q=1,
+        k_scale=0.5,
+        v_scale=1.0,
+        enable_pdl=False,
+    )
+    expected = torch_qsa_selected_attention(
+        query, keys, values, selected, 1 / 16, 0.5, 1.0
+    )
+    torch.testing.assert_close(output, expected, atol=1e-3, rtol=1e-2)
+
+
 @pytest.mark.parametrize("enable_pdl", [False, True])
 def test_large_fp8_grids_refresh_across_split_boundary(enable_pdl):
     from tokenspeed_kernel.numerics.torch.attention.qsa import (
@@ -132,8 +182,13 @@ def test_large_fp8_grids_refresh_across_split_boundary(enable_pdl):
 
     torch.manual_seed(821)
     sm_count = torch.cuda.get_device_properties(0).multi_processor_count
-    # Each row contributes two output tiles for this head geometry.
-    boundary = sm_count
+
+    def kv_splits(rows):
+        return qsa_sparse._configuration(rows, 24, 2, 1, False, sm_count, 0)[2]
+
+    # Past 128 rows the wave model drops from two KV splits to one where a
+    # second split would add a CTA wave; replay graphs on both sides of it.
+    boundary = next(r for r in range(129, 16384) if kv_splits(r) != kv_splits(r - 1))
     query = torch.randn((16384, 24, 256), device="cuda", dtype=torch.bfloat16)
     keys = (torch.randn((4096, 2, 256), device="cuda") * 0.25).to(torch.float8_e4m3fn)
     values = (torch.randn((4096, 2, 256), device="cuda") * 0.25).to(torch.float8_e4m3fn)
