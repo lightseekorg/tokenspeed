@@ -768,20 +768,6 @@ public:
         return entry_it->key;
     }
 
-    // The entry at `location` as an epoch traversal reports it
-    // (NextEvictionEpoch), when Evict would take it.
-    std::optional<EvictionCandidate> UnpinnedCandidateAt(const BlockPool& pool, CacheBlockLocation location) const {
-        const CacheEntries* cache_index = findCacheEntries(pool);
-        if (cache_index == nullptr) {
-            return std::nullopt;
-        }
-        const ConstCacheEntryIterator entry_it = findEntry(*cache_index, location);
-        if (entry_it == cache_index->entries.end() || !entry_it->block_ref.unique()) {
-            return std::nullopt;
-        }
-        return EvictionCandidate{.location = location, .metadata = evictionMetadataOf(*entry_it)};
-    }
-
     std::optional<CacheKey> Evict(const BlockPool& pool, CacheBlockLocation location) {
         EvictableEntry evictable = FindEvictable(pool, location);
         if (!evictable) {
@@ -1022,8 +1008,7 @@ private:
     };
 
     struct CacheEntries {
-        CacheEntries(std::int32_t packing, std::int32_t parents)
-            : packing{packing}, by_location{packing, parents, entries.end()} {}
+        CacheEntries(std::int32_t packing, std::int32_t parents) : by_location{packing, parents, entries.end()} {}
         // The entry list allocates from entry_memory, the order indices and
         // lookup tables point into the list, and cursors and common peers
         // point at this object: it never copies or moves.
@@ -1031,8 +1016,6 @@ private:
         CacheEntries& operator=(const CacheEntries&) = delete;
         CacheEntries(CacheEntries&&) = delete;
         CacheEntries& operator=(CacheEntries&&) = delete;
-        // The group's children per LCM parent on this tier.
-        const std::int32_t packing;
         // Owns each CacheEntry once. The maps are non-owning secondary indices
         // into stable list nodes. available_order keeps eviction candidates
         // sorted by age; common_order keeps shared keys in source age order.
@@ -1176,7 +1159,7 @@ private:
             return;
         }
         parent.newest_access_epoch = 0;
-        for (std::int32_t slot = 0; slot < cache_index.packing; ++slot) {
+        for (std::int32_t slot = 0; slot < cache_index.by_location.Packing(); ++slot) {
             const auto entry_it =
                 cache_index.by_location.Find({.lcm_block_id = location.lcm_block_id, .slot_index = slot});
             if (entry_it == cache_index.entries.end()) {
