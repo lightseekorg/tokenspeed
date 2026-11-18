@@ -20,7 +20,6 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -38,10 +37,8 @@ from tokenspeed_kernel.ops.attention.mla.cuda import (
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.execution.query_shard import QueryShardPlan
-from tokenspeed.runtime.layers.attention.backends.base import reject_query_shard
 from tokenspeed.runtime.layers.attention.backends.paged.base import (
-    PagedAttentionBackend,
+    PagedMLABackend,
 )
 from tokenspeed.runtime.layers.attention.chunk import (
     build_chunked_prefill_metadata_arrays,
@@ -122,7 +119,7 @@ def _per_token_kv_indices(
 _global_workspace_buffer = None
 
 
-class FlashMLABackend(PagedAttentionBackend):
+class FlashMLABackend(PagedMLABackend):
     """FlashMLA leaf for TokenSpeed scheduling.
 
     Uses the FlashMLA kernel for decode (any q_len) and FlashInfer's MLA
@@ -228,6 +225,8 @@ class FlashMLABackend(PagedAttentionBackend):
         # graph recorded alive for the graph's lifetime.
         self._decode_tile_metadata: object | None = None
         self._decode_tile_metadata_keepalive: list[object] = []
+        # The current forward's extend_with_prefix, read by the prefill hook.
+        self._extend_with_prefix = False
 
     # ------------------------------------------------------------------
     # Metadata init
@@ -403,58 +402,11 @@ class FlashMLABackend(PagedAttentionBackend):
                 self.prefill_wrapper_ragged
             )
 
-    def init_forward_metadata(
-        self,
-        bs: int,
-        num_extends: int,
-        seq_lens: torch.Tensor,
-        page_table: torch.Tensor,
-        forward_mode: ForwardMode,
-        *,
-        extend_seq_lens: torch.Tensor,
-        extend_seq_lens_cpu: torch.Tensor,
-        extend_prefix_lens: torch.Tensor,
-        extend_prefix_lens_cpu: torch.Tensor,
-        extend_with_prefix: bool,
-        query_shard: QueryShardPlan | None,
-        page_table_cpu: torch.Tensor | None,
-        **kwargs,
-    ):
-        reject_query_shard(query_shard, "FlashMLABackend")
-        if not (forward_mode.is_extend_or_mixed() or forward_mode.is_idle()):
-            raise RuntimeError(
-                "FlashMLA decode metadata goes through refresh_decode_metadata; "
-                f"init_forward_metadata only serves extend/mixed ({forward_mode})"
-            )
-        if forward_mode.is_extend_or_mixed():
-            self._init_prefill_metadata(
-                seq_lens=seq_lens[:num_extends],
-                extend_with_prefix=extend_with_prefix,
-                extend_prefix_lens=extend_prefix_lens[:num_extends],
-                extend_prefix_lens_cpu=extend_prefix_lens_cpu[:num_extends],
-                extend_seq_lens=extend_seq_lens[:num_extends],
-                extend_seq_lens_cpu=extend_seq_lens_cpu[:num_extends],
-                page_table=page_table[:num_extends],
-                page_table_cpu=page_table_cpu,
-            )
-        # Target mixed/idle batches carry decode rows whose metadata this
-        # init must cover; the same in-place refresh serves them. A draft's
-        # decode metadata instead comes from the wrapper's refresh after this
-        # init (the unified draft contract).
-        if forward_mode.is_idle() or (forward_mode.is_mixed() and not self.is_draft):
-            self.refresh_decode_metadata(
-                bs, bs, seq_lens, page_table, num_extends=num_extends
-            )
-
-    @contextmanager
-    def override_num_extends(self, num_extends: int):
-        assert self.forward_decode_metadata is not None
-        prev = self.forward_decode_metadata.num_extends
-        self.forward_decode_metadata.num_extends = num_extends
-        try:
-            yield
-        finally:
-            self.forward_decode_metadata.num_extends = prev
+    def init_forward_metadata(self, *args, extend_with_prefix: bool, **kwargs) -> None:
+        self._extend_with_prefix = extend_with_prefix
+        super().init_forward_metadata(
+            *args, extend_with_prefix=extend_with_prefix, **kwargs
+        )
 
     def _renew_decode_tile_metadata(self, *, for_graph: bool) -> None:
         """Bind a fresh (uninitialized) FlashMLASchedMeta for the seq_lens just
@@ -485,7 +437,6 @@ class FlashMLABackend(PagedAttentionBackend):
     def _init_prefill_metadata(
         self,
         seq_lens: torch.Tensor,
-        extend_with_prefix: bool,
         extend_prefix_lens: torch.Tensor,
         extend_prefix_lens_cpu: torch.Tensor,
         extend_seq_lens: torch.Tensor,
@@ -495,7 +446,7 @@ class FlashMLABackend(PagedAttentionBackend):
         page_table_cpu: torch.Tensor | None,
     ):
         # EXTEND path — flashinfer ragged/paged prefill.
-        extend_no_prefix = not extend_with_prefix
+        extend_no_prefix = not self._extend_with_prefix
         if extend_no_prefix and bool(extend_prefix_lens_cpu.any()):
             # The ragged plan sizes its paged kv_indices by the prefix sum
             # (zero here), so a prefixed row would overrun it in-kernel.
