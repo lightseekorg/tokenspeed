@@ -69,7 +69,7 @@ def tuned(tmp_path_factory):
     with autotune(tune_mode=True, tuning_buckets=None, round_up=None):
         # Discovery on prefill must expose small decode profiles too.
         result = mm(x, w)
-        assert torch.equal(result, x @ w.T)
+        check_result(result, x, w)
     path = str(tmp_path_factory.mktemp("out-projection") / "tactics.json")
     assert save_autotune_cache(path, None, 0)
     tuner.clear_cache()
@@ -131,10 +131,21 @@ def test_larger_rows_leave_the_joint_gemm(m):
         fi.flashinfer_bf16_gemm(x, w, out)
     # Rows the TGV policy admits under PDL take its tile.
     tactic = fi.flashinfer_tgv_decode_tactic(x, w, out)
+    tile = fi.select_tgv_decode_tile(
+        m=m,
+        n=N,
+        k=K,
+        weight_bytes=w.numel() * w.element_size(),
+        arch=fi.platform.arch_version,
+        sm_count=fi.platform.sm_count,
+        pdl=pdl_enabled(),
+    )
+    assert (tactic is None) == (tile is None)
     expected = (
         x @ w.T if tactic is None else fi.flashinfer_tgv_decode_gemm(x, w, None, tactic)
     )
     assert torch.equal(mm(x, w, out=out), expected)
+    check_result(out, x, w)
 
 
 def test_other_projections_and_invalid_layouts_keep_original_gemm():

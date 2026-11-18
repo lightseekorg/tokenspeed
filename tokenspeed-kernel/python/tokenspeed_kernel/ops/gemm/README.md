@@ -116,11 +116,13 @@ tile instead of cuBLASLt when all of these hold:
 - `TGV_DECODE_MIN_M < M <= TGV_DECODE_MAX_M` (32 < M <= 512). Up to 32 rows
   (`BF16_GEMM_MAX_M`), `mm` takes FlashInfer's joint BF16
   GEMM (`flashinfer_bf16_gemm`) instead, in which FlashInfer's tuner chooses
-  among its TGV and CuTe DSL tactics.
+  among its TGV and CuTe DSL tactics (CuTe DSL only on SM107; above).
 - `TGV_DECODE_MIN_K <= K <=` the architecture's `max_k` in `TGV_DECODE_WINDOWS`
   (2048 <= K <= 3072 on SM100 and SM103, up to 6144 on SM107; below)
 - This rank's weight takes at most the window's `max_weight_bytes` (16 MiB on
   SM100 and SM103, 32 MiB on SM107).
+- On SM107, the weight has at least the window's `min_n` rows (512, the fewest
+  measured; below).
 - One of the pinned tiles covers the GEMM in one wave, or, on SM107, with at
   most half as many CTAs as SMs (below).
 - PDL is enabled (`pdl_enabled()`, which the server's `--disable-pdl` turns
@@ -149,14 +151,16 @@ with K in the window, by up to 1.30x. Outside it TGV lost on many shapes, down
 to 0.73x cuBLASLt's speed, mainly at K of 512 to 1024 and at K >= 4096 with
 few weight rows; at K = 1536 it also lost on some shapes (down to 0.92x).
 
-SM107's window comes from the same chain on a 212-SM VR200, over M = 48 to
-512, N = 512 to 8192 and K = 1536 to 8192. With the SM107 tiles and grids of at
-most half the SMs, TGV took 4.4% less time than cuBLASLt summed over the 96
-shapes, up to 1.7x faster (2560 x 6144 at 96 rows), and lost at most 8% (1280 x
-2560 at 192 rows). Grids of up to one wave instead lost up to 22% at many rows,
-and at K = 8192 with 512 weight rows TGV lost up to 28%. In the decode steps of
-a quantized model that keeps such projections in BF16, the routed GEMMs took
-3.7% of the step less time at 64 rows and 1.9% at 128 rows.
+SM107's window comes from the same chain on a 212-SM VR200, over M = 48 to 512,
+N = 512 to 8192 and K = 1536 to 8192. Below 512 weight rows TGV lost up to 26%
+at K = 5120 to 6144, so SM107 routes only measured row counts. With the SM107
+tiles and grids of at most half the SMs, TGV took 4.4% less time than cuBLASLt
+summed over the 96 shapes, up to 1.7x faster (2560 x 6144 at 96 rows), and lost
+at most 8% (1280 x 2560 at 192 rows). Grids of up to one wave instead lost up
+to 22% at many rows, and at K = 8192 with 512 weight rows TGV lost up to 28%.
+In the decode steps of a quantized model that keeps such projections in BF16,
+the routed GEMMs took 3.7% of the step less time at 64 rows and 1.9% at 128
+rows.
 
 The weight limit and the K window are bounds on shape, not a list of layers.
 On a quantized checkpoint, the BF16 GEMMs that reach them are the small

@@ -1064,7 +1064,8 @@ if _bf16_splitk is not None:
 # With PDL and before serving, mm() runs a bias-free BF16 GEMM with
 # TGV_DECODE_MIN_M < M <= TGV_DECODE_MAX_M rows and
 # TGV_DECODE_MIN_K <= K <= TGV_DECODE_MAX_K on a weight of at most
-# TGV_DECODE_MAX_WEIGHT_BYTES with one TGV tile instead of cuBLASLt. Under
+# TGV_DECODE_MAX_WEIGHT_BYTES (SM107: its TGV_DECODE_WINDOWS entry's bounds)
+# with one TGV tile instead of cuBLASLt. Under
 # PDL, TGV's weight-load warp fills its shared-memory stages while the
 # producer kernel still runs; only its activation-load warp waits for the
 # producer. cuBLASLt loads nothing before the producer finishes. FI's tactic
@@ -1073,7 +1074,7 @@ if _bf16_splitk is not None:
 # fits in one wave (half the SMs on SM107). Without PDL there is no overlap,
 # and cuBLASLt stays.
 #
-# FI's tuner keeps the 2-CTA TGV tactics 16 to 28, these tiles among them,
+# FI's tuner keeps the 2-CTA TGV tactics 16 to 28, SM100's tiles among them,
 # blocklisted (autotune() in ops/tuning.py) after replay failures of FI
 # 0.6.18's C++ TGV kernel. FI 0.7.2.post1 runs TGV as a CuTe DSL rewrite
 # (tgv_gemm_cute_ext), which these tiles call directly, outside the tuner.
@@ -1127,6 +1128,7 @@ class TgvDecodeWindow(NamedTuple):
     """One architecture's pinned TGV tiles and the GEMMs they take."""
 
     tiles: tuple[TgvTile, ...]  # in the order the policy tries them
+    min_n: int  # fewest weight rows the window was measured on
     max_k: int
     max_weight_bytes: int
     sms_per_cta: int  # a grid may hold at most sm_count // sms_per_cta CTAs
@@ -1134,6 +1136,7 @@ class TgvDecodeWindow(NamedTuple):
 
 _SM100_TGV_DECODE_WINDOW = TgvDecodeWindow(
     tiles=TGV_DECODE_TILES,
+    min_n=1,
     max_k=TGV_DECODE_MAX_K,
     max_weight_bytes=TGV_DECODE_MAX_WEIGHT_BYTES,
     sms_per_cta=1,
@@ -1144,6 +1147,7 @@ TGV_DECODE_WINDOWS = {
     ArchVersion(10, 3): _SM100_TGV_DECODE_WINDOW,
     ArchVersion(10, 7): TgvDecodeWindow(
         tiles=TGV_DECODE_SM107_TILES,
+        min_n=512,
         max_k=6144,
         max_weight_bytes=32 << 20,
         sms_per_cta=2,
@@ -1185,7 +1189,7 @@ def select_tgv_decode_tile(
 
     Returns:
         With PDL on an architecture of :data:`TGV_DECODE_WINDOWS`, for
-        ``TGV_DECODE_MIN_M < m <= TGV_DECODE_MAX_M``,
+        ``TGV_DECODE_MIN_M < m <= TGV_DECODE_MAX_M``, ``n >= window.min_n``,
         ``TGV_DECODE_MIN_K <= k <= window.max_k`` and
         ``weight_bytes <= window.max_weight_bytes``, the first of the
         window's tiles whose grid has at most
@@ -1198,6 +1202,7 @@ def select_tgv_decode_tile(
         not pdl
         or window is None
         or not TGV_DECODE_MIN_M < m <= TGV_DECODE_MAX_M
+        or n < window.min_n
         or not TGV_DECODE_MIN_K <= k <= window.max_k
         or weight_bytes > window.max_weight_bytes
     ):
@@ -1350,9 +1355,8 @@ def flashinfer_tgv_decode_gemm(
             :func:`flashinfer_joint_bf16_supported` or ``tactic`` is not a
             pinned tile of the installed FlashInfer.
     """
-    tgv = _flashinfer_tgv()
     if not flashinfer_joint_bf16_supported(x, weight, out) or (
-        tgv is None or tactic not in tgv.tactics.values()
+        (tgv := _flashinfer_tgv()) is None or tactic not in tgv.tactics.values()
     ):
         raise ValueError("Unsupported input to the pinned FlashInfer TGV GEMM")
     if out is None:

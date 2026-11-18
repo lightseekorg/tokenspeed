@@ -186,7 +186,15 @@ def test_mm_routes_decode_rows_by_the_tile_policy(m, n, k, routed):
 @pytest.mark.parametrize("pdl", [False, True])
 @pytest.mark.parametrize(
     "n,k",
-    [(512, 2560), (960, 2560), (2560, 2080), (2560, 160), (160, 2560), (1000, 2560)],
+    [
+        (512, 2560),
+        (960, 2560),
+        (2560, 2080),
+        (2560, 160),
+        (160, 2560),
+        (1000, 2560),
+        (2560, 6144),
+    ],
 )
 def test_pinned_tiles_match_fp64(pdl, n, k):
     """Every tile, with full and partial last activation, weight and K tiles:

@@ -180,6 +180,13 @@ def test_sm107_routes_k_from_2048_to_6144_and_weights_up_to_32_mib():
     assert select(33, 4096, 4096) is None
 
 
+def test_sm107_routes_only_weights_of_at_least_512_rows():
+    assert sm107(64, 511) is None
+    assert sm107(64, 512) == SM107_TILE16
+    assert sm107(64, 128, 6144) is None
+    assert select(48, 128) is not None
+
+
 @pytest.mark.parametrize(
     "m,n,expected",
     [
