@@ -106,9 +106,9 @@ def test_few_row_gemv_rows_match_the_single_row_gemv(n: int, k: int) -> None:
 
 
 # Qwen3.8-27B TP1 decode projections and its EAGLE-4 draft layer: gate-up,
-# down, GDN in/out, attention QKV/o_proj, draft fc and down. Each mixes the
-# single-row GEMV, the few-row GEMV and the multi-row GEMV across these row
-# counts.
+# down, GDN in/out, attention QKV/o_proj, draft QKV, o_proj, gate-up, fc and
+# down. Each mixes the single-row GEMV, the few-row GEMV, the multi-row GEMV
+# and hipBLASLt across these row counts.
 @pytest.mark.parametrize(
     ("n", "k"),
     [
@@ -118,6 +118,8 @@ def test_few_row_gemv_rows_match_the_single_row_gemv(n: int, k: int) -> None:
         (5120, 6144),
         (14336, 5120),
         (15360, 10240),
+        (32768, 5120),
+        (5120, 5120),
         (5120, 15360),
         (5120, 16384),
     ],
@@ -130,7 +132,7 @@ def test_qwen38_decode_projections_match_reference(n: int, k: int) -> None:
         / k**0.5
     )
     expected = x.float() @ weight.float().T
-    for m in (1, 2, 3, 4, 8, 16):
+    for m in (1, 2, 3, 4, 5, 8, 12, 16):
         torch.testing.assert_close(
             mm(x[:m], weight).float(), expected[:m], atol=2e-2, rtol=1e-2
         )

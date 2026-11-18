@@ -239,6 +239,13 @@ python -m tokenspeed_kernel.ops.gemm._hipblaslt.tuning --dtype bfloat16 \
     --rows 64,128,192,256,384,512
 ```
 
+The committed MI355X file also lists 32 rows for the shapes whose pick beat
+the default in cold-weight graph replay: Qwen3.8-27B's MLP gate-up and down,
+its attention o_proj and GDN out_proj (`5120x6144`), and the EAGLE-4 draft
+layer's QKV (`15360x10240`), gate-up (`32768x5120`) and down (`5120x16384`).
+The picks for the 32-row QKV, GDN in_proj and draft o_proj replayed no faster,
+so those keep the default.
+
 Without `--out`, the tool writes this GPU's file in `_hipblaslt/configs/`. If
 the file exists with the running stack's stamp, its GEMMs are kept and only
 new ones are timed, so one file can cover several models; on another stack
