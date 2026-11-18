@@ -305,7 +305,9 @@ def triton_fp32_router_gemv(
         # Where cuBLAS would round to TF32 anyway, the tensor-core split-K kernel rounds the same way.
         if rows <= ROUTER_DOT_MAX_ROWS and _cublas_rounds_to_tf32():
             return _tf32_router_dot(x, weight, multiplier, counters, use_pdl)
-        return torch.matmul(x, weight) * multiplier
+        # beta=0 never reads the empty out; cuBLAS scales in its epilogue, saving a multiply launch.
+        out = torch.empty((rows, columns), dtype=torch.float32, device=x.device)
+        return torch.addmm(out, x, weight, beta=0, alpha=multiplier, out=out)
     splits = triton.cdiv(hidden, ROUTER_GEMV_BLOCK_K)
     partial = torch.empty((splits, rows, columns), dtype=torch.float32, device=x.device)
     out = torch.empty((rows, columns), dtype=torch.float32, device=x.device)

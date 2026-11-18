@@ -179,6 +179,9 @@ def _model_dtype(dtype: torch.dtype):
 _NVIDIA_ONLY = pytest.mark.skipif(
     not current_platform().is_nvidia, reason="the latent down shard is NVIDIA-only"
 )
+_AMD_ONLY = pytest.mark.skipif(
+    not current_platform().is_amd, reason="the routed latent gather is AMD-only"
+)
 
 
 class TestKimiK3RegistrationTests:
@@ -328,15 +331,9 @@ class TestKimiK3RegistrationTests:
             "the packed weight must still be set, or the guard proves nothing"
         )
 
-    @pytest.mark.parametrize(
-        "apply_kernel, quantized",
-        (
-            ("gluon_mxfp4_a8w4_situ_precomputed_moe_apply", True),
-            ("triton_bf16_precomputed_moe_apply", False),
-        ),
-    )
-    def test_the_latent_gather_quantizes_only_for_the_a8w4_moe(
-        self, apply_kernel, quantized
+    @pytest.mark.parametrize("quantized", (True, False))
+    def test_the_latent_gather_quantizes_only_for_experts_that_read_fp8(
+        self, quantized
     ):
         """The gathered latent's FP8 copy reaches the experts that read it."""
         from tokenspeed.runtime.models import kimi_k3
@@ -355,7 +352,7 @@ class TestKimiK3RegistrationTests:
         moe = built.layer
         moe.packed_input_projection_weight = torch.zeros(1)
         moe.routed_expert_down_proj.narrowed = False
-        moe.experts.plan["apply_kernel_name"] = apply_kernel
+        moe.experts.plan["supports_fp8_per_tensor_input"] = quantized
         moe.experts._situ_input_fp8 = "stale"
         moe.shared_experts.act_fn = SimpleNamespace(beta=25.0, linear_beta=25.0)
         hidden = torch.zeros(4, 8)
@@ -384,6 +381,73 @@ class TestKimiK3RegistrationTests:
         moe.routed_expert_down_proj.narrowed = True
         assert moe._latent_input_projections(hidden, rows_replicated=True) is None
         assert moe.experts._situ_input_fp8 is None
+
+    @_AMD_ONLY
+    @pytest.mark.parametrize("quantized", (True, False))
+    def test_the_routed_latent_gather_hands_its_routes_to_the_experts(self, quantized):
+        """One launch's routes, expert sort and latent replace the routing launch."""
+        from tokenspeed.runtime.models import kimi_k3
+
+        built = self._build_moe_block(
+            kimi_k3.Kimi3MoEExecutionPlan(
+                use_mega_moe=False,
+                owns_ep_communication=False,
+                use_native=True,
+                use_trtllm=False,
+                overlap_shared_experts=False,
+                joint_moe_reduce=False,
+                decode_chain=False,
+            )
+        )
+        moe = built.layer
+        moe.packed_input_projection_weight = torch.zeros(1)
+        moe.routed_expert_down_proj.narrowed = False
+        moe.experts.plan["supports_fp8_per_tensor_input"] = quantized
+        moe.experts.sorted_route_rows = frozenset({4})
+        moe.experts.sorted_route_block_size = 16
+        moe.experts._situ_input_fp8 = "stale"
+        moe._fused_routing_scratch = torch.zeros(1, dtype=torch.int32)
+        moe.shared_experts.act_fn = SimpleNamespace(beta=25.0, linear_beta=25.0)
+        hidden = torch.zeros(4, 8)
+        shared_out = torch.zeros(4, 128)
+        logits, latent = torch.zeros(4, 8), torch.zeros(4, 64)
+        routes = tuple(torch.zeros(4, 2) for _ in range(6))
+        fp8 = (torch.zeros(4, 64, dtype=torch.float8_e4m3fn), torch.ones(1))
+        launched = []
+
+        def gather_routed(hidden_states, weight, *, routing, down_out, quantize, **kw):
+            launched.append((routing, quantize))
+            return logits, latent, routes, down_out, fp8 if quantize else None
+
+        serves = True
+        moe.iris_state = SimpleNamespace(
+            can_latent_input_gather_routed=lambda *args: serves,
+            latent_input_gather_routed=gather_routed,
+        )
+        routed_input, topk_output, shared_partial = moe._routed_latent_inputs(
+            hidden, shared_out, precompute_topk=True
+        )
+        ((routing, requested),) = launched
+        config = moe.topk.topk_config
+        assert requested == quantized
+        assert torch.equal(routing.correction_bias, config.correction_bias.float())
+        assert routing.routed_scaling_factor == float(config.routed_scaling_factor)
+        assert routing.normalize_topk_weights == config.renormalize
+        assert routing.block_size == 16
+        assert routing.scratch is moe._fused_routing_scratch
+        assert routed_input is latent and shared_partial is shared_out
+        assert topk_output.topk_weights is routes[0]
+        assert topk_output.topk_ids is routes[1]
+        assert topk_output.router_logits is logits
+        assert moe.experts._situ_sorted_routes == routes[2:]
+        assert moe.experts._situ_input_fp8 is (fp8 if quantized else None)
+
+        # Rows the launch does not serve fall back before launching anything.
+        assert moe._routed_latent_inputs(hidden, shared_out, False) is None
+        assert moe._routed_latent_inputs(torch.zeros(3, 8), None, True) is None
+        serves = False
+        assert moe._routed_latent_inputs(hidden, shared_out, True) is None
+        assert len(launched) == 1
 
     @_NVIDIA_ONLY
     def test_the_shard_is_wired_on_the_plan_that_absorbs_it(self):
