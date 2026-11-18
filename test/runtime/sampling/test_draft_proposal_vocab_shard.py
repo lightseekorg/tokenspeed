@@ -96,6 +96,7 @@ def _pools() -> SpeculativeSamplingPools:
         top_k=top_k,
         top_p=torch.ones(POOL + 1, device="cuda"),
         seed=torch.arange(POOL + 1, dtype=torch.int64, device="cuda") * 1009 + 7,
+        verify_reads_draft_q=torch.zeros(1, dtype=torch.int32, device="cuda"),
     )
 
 

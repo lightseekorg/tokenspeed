@@ -103,6 +103,16 @@ _SAMPLE_ROUTE_GUMBEL_NO_FILTER = 1
 _SAMPLE_ROUTE_GUMBEL_TOP_K = 2
 _SAMPLE_ROUTE_GUMBEL_TOP_K_TOP_P = 3
 _SAMPLE_ROUTE_GUMBEL_TOP_P = 4
+# Routes whose verify reads the recorded draft q (rejection sampling); the
+# others (top-p only, a batch mixing sampling parameters) verify by exact
+# match against the target's own draw.
+_DRAFT_Q_ROUTES = frozenset(
+    {
+        _SAMPLE_ROUTE_GUMBEL_NO_FILTER,
+        _SAMPLE_ROUTE_GUMBEL_TOP_K,
+        _SAMPLE_ROUTE_GUMBEL_TOP_K_TOP_P,
+    }
+)
 CUDA_GRAPH_VARIANT_TRITON_NO_FILTER = "triton_no_filter"
 CUDA_GRAPH_VARIANT_TRITON_TOP_K = "triton_top_k"
 CUDA_GRAPH_VARIANT_TRITON_TOP_K_TOP_P = "triton_top_k_top_p"
@@ -199,6 +209,12 @@ class TritonSamplingBackend(SamplingBackend):
         # membership moves; a steady decode batch pays nothing here.
         self._route_cache: tuple[int, int] | None = None
         self._route_cache_epoch: int | None = None
+        # Device copy of "this batch's verify reads the draft q", for the
+        # DFlash2 walk recorded in the decode graph; written only on change.
+        self._verify_reads_draft_q = torch.zeros(
+            (1,), dtype=torch.int32, device=config.device
+        )
+        self._verify_reads_draft_q_value = 0
 
     def _init_vocab_shard_buffers(self, config: SamplingBackendConfig) -> None:
         """Scratch of the top-k routes' selection from vocabulary shards.
@@ -623,6 +639,22 @@ class TritonSamplingBackend(SamplingBackend):
         # Restore from cache rather than skip: capture variants set the route
         # directly, and the next real step must win over what capture left.
         self._sample_route, self._top_k_top_p_pad = self._route_cache
+        self._publish_verify_reads_draft_q()
+
+    def _publish_verify_reads_draft_q(self) -> None:
+        """Tell the drafter whether this batch's verify reads its recorded q.
+
+        A DFlash2 walk samples its proposals only when the verify that follows
+        applies rejection sampling to them; otherwise it takes the best lane,
+        which an exact-match verify accepts more often than a draw.
+        """
+        value = int(
+            self.config.enable_speculative_sampling
+            and self._sample_route in _DRAFT_Q_ROUTES
+        )
+        if value != self._verify_reads_draft_q_value:
+            self._verify_reads_draft_q.fill_(value)
+            self._verify_reads_draft_q_value = value
 
     @staticmethod
     def _select_top_k_top_p_pad(sampling_params_list: list[SamplingParams]) -> int:
@@ -641,6 +673,7 @@ class TritonSamplingBackend(SamplingBackend):
             top_k=self._top_k_pool,
             top_p=self._top_p_pool,
             seed=self._seed_pool,
+            verify_reads_draft_q=self._verify_reads_draft_q,
         )
 
     def _use_qrita_verify_top_k_route(self, rows: int, vocab_size: int) -> bool:
@@ -1237,10 +1270,8 @@ class TritonSamplingBackend(SamplingBackend):
                 accept_length,
             )
             accept_length += 1
-        elif sampling_info.draft_q is not None and self._sample_route in (
-            _SAMPLE_ROUTE_GUMBEL_NO_FILTER,
-            _SAMPLE_ROUTE_GUMBEL_TOP_K,
-            _SAMPLE_ROUTE_GUMBEL_TOP_K_TOP_P,
+        elif (
+            sampling_info.draft_q is not None and self._sample_route in _DRAFT_Q_ROUTES
         ):
             row_accept, row_token = self._verify_rows_with_draft_q(
                 logits,

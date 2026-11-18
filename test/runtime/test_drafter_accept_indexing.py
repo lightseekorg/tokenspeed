@@ -770,6 +770,7 @@ def _draft_sampler(monkeypatch, *, top_k_rows, temperatures, vocab_map=None):
         top_k=torch.tensor(top_k_rows, dtype=torch.int32),
         top_p=torch.ones(POOL + 1),
         seed=torch.arange(POOL + 1, dtype=torch.int64) * 11,
+        verify_reads_draft_q=torch.zeros(1, dtype=torch.int32),
     )
     monkeypatch.setattr(
         spec,
@@ -1097,6 +1098,7 @@ def test_bind_refuses_block_drafters_and_arms_chain_drafters(monkeypatch):
         top_k=torch.ones(POOL + 1, dtype=torch.int32),
         top_p=torch.ones(POOL + 1),
         seed=torch.zeros(POOL + 1, dtype=torch.int64),
+        verify_reads_draft_q=torch.zeros(1, dtype=torch.int32),
     )
     backend = SimpleNamespace(
         config=SamplingBackendConfig(

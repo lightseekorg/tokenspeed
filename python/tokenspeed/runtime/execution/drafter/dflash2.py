@@ -88,6 +88,7 @@ class DFlash2(DFlash):
             top_k=torch.ones((1,), dtype=torch.int32, device=device),
             top_p=torch.ones((1,), dtype=torch.float32, device=device),
             seed=torch.zeros((1,), dtype=torch.int64, device=device),
+            verify_reads_draft_q=torch.zeros((1,), dtype=torch.int32, device=device),
         )
         # Where the walk records q for verify; None while drafting greedily.
         self._draft_q: DraftTreeQ | None = None
@@ -270,7 +271,9 @@ class DFlash2(DFlash):
         when sampling, record its q for the next round's verify.
 
         One kernel for every row: greedy rows (and every row while the flag
-        is off) take the best edge; sampling rows draw from q, with noise
+        is off, or while the batch's verify does not read the recorded q,
+        ``SpeculativeSamplingPools.verify_reads_draft_q``) take the best
+        edge; sampling rows draw from q, with noise
         keyed by the request's seed, this round's position and the drawn
         token id, so every TP rank draws the same token from the same
         replicated scores. With the flag on, the kernel writes each request's
@@ -315,4 +318,5 @@ class DFlash2(DFlash):
             tables.q_ids,
             tables.pos,
             tables.slot,
+            pools.verify_reads_draft_q,
         )

@@ -354,6 +354,10 @@ class FlashInferSamplingBackend(SamplingBackend):
             top_k=self._top_k_pool,
             top_p=self._top_p_pool,
             seed=self._seed_pool,
+            # This verifier reads the dense draft probs, never the sparse q.
+            verify_reads_draft_q=torch.zeros(
+                (1,), dtype=torch.int32, device=self._top_k_pool.device
+            ),
         )
 
     def _reset_slot(self, pool_idx: int, sp: SamplingParams) -> None:

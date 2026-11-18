@@ -154,6 +154,7 @@ def torch_dflash2_sample_path(
     top_k: torch.Tensor,
     top_p: torch.Tensor,
     gumbel: torch.Tensor,
+    verify_reads_draft_q: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Walk the lattice, sampling each step's lane or taking the best one.
 
@@ -172,6 +173,8 @@ def torch_dflash2_sample_path(
         top_k: ``[bs]`` top-k of each request (``1 << 30`` when disabled).
         top_p: ``[bs]`` top-p of each request.
         gumbel: ``[bs, L, K]`` fp32 Gumbel noise of each step's lanes.
+        verify_reads_draft_q: Whether the batch's verify reads the recorded
+            q; without it every request takes the best lane.
 
     Returns:
         ``(tokens [bs, L + 1] int32, q [bs, L, K] fp32, lanes [bs, L] int32,
@@ -194,6 +197,7 @@ def torch_dflash2_sample_path(
         sampled &= not (
             k == TOP_K_DISABLED and float(top_p[request]) < 1.0 - _TOP_P_ONE_EPS
         )
+        sampled &= verify_reads_draft_q
         proposal = sampled
         t = temperature[request].clamp_min(1.0e-20)
         previous = 0

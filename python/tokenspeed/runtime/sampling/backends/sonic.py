@@ -370,6 +370,10 @@ class SonicSamplingBackend(SamplingBackend):
             top_k=self.state.top_k,
             top_p=self._exact_state.top_p,
             seed=self.state.seeds,
+            # This verifier reads the dense draft probs, never the sparse q.
+            verify_reads_draft_q=torch.zeros(
+                (1,), dtype=torch.int32, device=self.state.top_k.device
+            ),
         )
 
     def _gather_pairs(
