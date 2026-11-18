@@ -138,6 +138,7 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
     current_forward_ctx,
     is_breakable_capture_active,
     slice_to_real_tokens,
+    weak_ref_tensor,
 )
 from tokenspeed.runtime.execution.context import (
     CapturedRows,
@@ -2476,6 +2477,20 @@ class V41RowState:
     def leading(self, rows: int) -> V41RowState:
         """The first ``rows`` rows of every tensor, as views."""
         return self._rebuilt([t if t is None else t[:rows] for t in self._tensors()])
+
+    def encoder_replay_view(self) -> V41RowState:
+        """Borrow the activations rewritten by this encoder graph on every replay.
+
+        Positions, masks and Engram hashes already refer to the runner's inputs.
+        Narrowing consumes the graph-pool tensors before another graph uses the
+        pool. A graph decoder first lands all retained rows in its own inputs.
+        """
+        return replace(
+            self,
+            hidden=weak_ref_tensor(self.hidden),
+            pre_mix=weak_ref_tensor(self.pre_mix),
+            captured=[weak_ref_tensor(tap) for tap in self.captured],
+        )
 
     def land_into(self, dst: V41RowState) -> None:
         """Copy this state into the leading rows of ``dst`` and zero its tail.
