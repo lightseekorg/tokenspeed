@@ -665,7 +665,9 @@ def test_gfx1250_small_m_route_matches_expert_grouping(
     ).to(torch.int32)
     weights = torch.rand(tokens, topk, generator=generator, device="cuda")
 
-    route = gfx1250_fused._precomputed_topk_route_small_m_gfx1250(weights, ids, experts)
+    route = gfx1250_fused._precomputed_topk_route_small_m_gfx1250(
+        weights, ids, experts, block_indexed=False
+    )
     torch.cuda.synchronize()
 
     _assert_gfx1250_large_route(ids, weights, experts, route)
@@ -697,6 +699,7 @@ def test_gfx1250_small_m_route_ignores_invalid_experts() -> None:
             weights,
             ids,
             experts,
+            block_indexed=False,
         )
     )
     torch.cuda.synchronize()
@@ -892,7 +895,9 @@ def test_gfx1250_large_m_route_handles_duplicates_invalid_ids_and_block64(
     ids[2::5, 5] = experts + 9
     weights = torch.randn(tokens, topk, device="cuda", dtype=torch.float32)
 
-    route = gfx1250_fused._precomputed_topk_route(weights, ids, experts)
+    route = gfx1250_fused._precomputed_topk_route(
+        weights, ids, experts, block_indexed=False
+    )
     torch.cuda.synchronize()
 
     _assert_gfx1250_large_route(ids, weights, experts, route)
@@ -1369,6 +1374,7 @@ def test_gfx1250_gate_up_mxfp4_output_matches_quantized_fp32(
             topk_weights.contiguous(),
             topk_ids.to(torch.int32).contiguous(),
             num_experts,
+            block_indexed=False,
         )
     )
     x, x_scale = launch_triton_quantize_mxfp4_activation_gfx1250(hidden_states)
@@ -1433,10 +1439,10 @@ def test_gfx1250_route_mxfp4_matches_route_then_quantize(num_tokens: int) -> Non
     topk_weights = topk_weights.contiguous()
 
     *route, packed, scale = gfx1250_fused._precomputed_topk_route_mxfp4(
-        topk_weights, topk_ids, num_experts, hidden_states
+        topk_weights, topk_ids, num_experts, hidden_states, block_indexed=False
     )
     expected_route = gfx1250_fused._precomputed_topk_route(
-        topk_weights, topk_ids, num_experts
+        topk_weights, topk_ids, num_experts, block_indexed=False
     )
     expected_packed, expected_scale = launch_triton_quantize_mxfp4_activation_gfx1250(
         hidden_states
@@ -1521,6 +1527,7 @@ def _gfx1250_first_expert_matmul(
             topk_weights.to(torch.float32).contiguous(),
             topk_ids.to(torch.int32).contiguous(),
             num_experts,
+            block_indexed=False,
         )
     )
     w13 = module.w13_weight_triton_tensor

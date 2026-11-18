@@ -1393,6 +1393,7 @@ def matmul(
     decode: bool = False,
     partial_tdm: bool,
     n_tiles: int = 1,
+    block_indexed: bool = False,
 ):
     """Run the gfx1250 Gluon MoE matmul kernel.
 
@@ -1679,6 +1680,18 @@ def matmul(
         grid_m=grid_m,
         grid_n=grid_n,
     )
+    block_indexed = (
+        block_indexed
+        and decode
+        and ragged_dimension == "M"
+        and opt_flags.block_m == 16
+        and a_ragged_metadata.block16_rows is not None
+    )
+    if block_indexed:
+        # The slice-offset slot carries the per-block row ranges: a program
+        # reads its expert's rows by its own block index, along with the
+        # schedule entry, instead of by the expert id that entry holds.
+        operands["XSliceOffs"] = a_ragged_metadata.block16_rows
     # Each kernel lists these operands in the order its programs first need them.
     leading = target_kernel.arg_names[: len(operands)]
     if set(leading) != set(operands):
@@ -1711,7 +1724,7 @@ def matmul(
         PINGPONG=pingpong,
         NUM_WARPS=num_warps,
         PARTIAL_TDM=partial_tdm,
-        **({"N_TILES": n_tiles} if decode else {}),
+        **({"N_TILES": n_tiles, "BLOCK_INDEXED": block_indexed} if decode else {}),
         W_KPLANE_ROWS=kplane_rows,
         num_warps=num_warps,
     )
@@ -1768,6 +1781,7 @@ def gluon_mxfp_combine(
     decode: bool = False,
     partial_tdm: bool,
     n_tiles: int = 1,
+    block_indexed: bool = False,
 ) -> torch.Tensor:
     """Combine GEMM using the gfx1250 Gluon MoE kernel."""
     del use_warp_pipeline, use_slice_mn, use_slice_n
@@ -1808,6 +1822,7 @@ def gluon_mxfp_combine(
         decode=decode,
         partial_tdm=partial_tdm,
         n_tiles=n_tiles,
+        block_indexed=block_indexed,
     )
     if n_expts_act is not None and int(n_expts_act) > 1:
         if n_tokens is None:
@@ -2059,6 +2074,7 @@ def _precomputed_topk_route_small_m_gfx1250_kernel(
     QUANT_BLOCK_K: gl.constexpr = 512,
     QUANT_FP8: gl.constexpr = False,
     fp8_scale_ptr=None,
+    block16_rows_ptr=None,
 ):
     """Stable counting sort of contiguous ``[M, TOPK]`` ids by expert.
 
@@ -2227,6 +2243,14 @@ def _precomputed_topk_route_small_m_gfx1250_kernel(
                 (expert_block << 16) | expert,
                 mask=expert_block < expert_blocks,
             )
+            if block16_rows_ptr is not None:
+                # The expert's row range again, at the block's own index, so a
+                # decode program reads it along with its schedule entry.
+                gl.store(
+                    block16_rows_ptr + block_exclusive + expert_block,
+                    (histogram << 16) | exclusive,
+                    mask=(expert_block < expert_blocks) & (block_size_index == 0),
+                )
 
 
 _SMALL_ROUTE_MAX_TOKENS = 512
@@ -2253,6 +2277,7 @@ def _precomputed_topk_route_small_m_gfx1250(
     quantize_fp8_into: (
         tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None
     ) = None,
+    block_indexed: bool = False,
 ) -> tuple[
     RaggedTensorMetadata,
     torch.Tensor,
@@ -2264,6 +2289,8 @@ def _precomputed_topk_route_small_m_gfx1250(
     ``quantize_into`` is ``(x, packed, scale)`` for MXFP4 activations and
     ``quantize_fp8_into`` is ``(x, out, act_scale)`` for FP8 activations
     divided by the scalar ``act_scale`` tensor (or not scaled when ``None``).
+    ``block_indexed`` also writes ``block16_rows`` of the metadata; the
+    single-token canonical route does not produce it.
     """
     if quantize_into is not None and quantize_fp8_into is not None:
         raise ValueError("choose one of quantize_into and quantize_fp8_into")
@@ -2308,6 +2335,7 @@ def _precomputed_topk_route_small_m_gfx1250(
     gather_indices = torch.empty(gates, dtype=torch.int32, device=device)
     scatter_indices = torch.empty(gates, dtype=torch.int32, device=device)
     gate_scale = torch.empty(gates, dtype=topk_weights.dtype, device=device)
+    block16_rows = None
     quant_args = {}
     quant_programs = 0
     if quantize_into is not None:
@@ -2379,6 +2407,9 @@ def _precomputed_topk_route_small_m_gfx1250(
     else:
         num_warps = _SMALL_ROUTE_NUM_WARPS
         lanes = 32 * num_warps
+        if block_indexed:
+            block16_rows = torch.empty(max_blocks, dtype=torch.int32, device=device)
+            quant_args = dict(quant_args, block16_rows_ptr=block16_rows)
         _precomputed_topk_route_small_m_gfx1250_kernel[
             (triton.cdiv(gates, _SMALL_ROUTE_CHUNK) + _ROUTE_NB + quant_programs,)
         ](
@@ -2413,6 +2444,7 @@ def _precomputed_topk_route_small_m_gfx1250(
         slice_offsets,
         block_offsets,
         block_schedule,
+        block16_rows=block16_rows,
     )
     return ragged_metadata, gather_indices, scatter_indices, gate_scale
 
@@ -3116,6 +3148,8 @@ def _precomputed_topk_route_mxfp4(
     topk_ids: torch.Tensor,
     num_experts: int,
     hidden_states: torch.Tensor,
+    *,
+    block_indexed: bool,
 ):
     """Route and quantize the MoE input to MXFP4.
 
@@ -3149,9 +3183,16 @@ def _precomputed_topk_route_mxfp4(
                 topk_ids,
                 num_experts,
                 quantize_into=(hidden_states, packed, scale),
+                **(
+                    {"block_indexed": block_indexed}
+                    if route_fn is _precomputed_topk_route_small_m_gfx1250
+                    else {}
+                ),
             )
             return (*route, packed, scale)
-    route = _precomputed_topk_route(topk_weights, topk_ids, num_experts)
+    route = _precomputed_topk_route(
+        topk_weights, topk_ids, num_experts, block_indexed=block_indexed
+    )
     return (*route, *launch_triton_quantize_mxfp4_activation_gfx1250(hidden_states))
 
 
@@ -3159,12 +3200,15 @@ def _precomputed_topk_route(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
     num_experts: int,
+    *,
+    block_indexed: bool,
 ):
     if _uses_small_route(topk_ids, num_experts):
         return _precomputed_topk_route_small_m_gfx1250(
             topk_weights,
             topk_ids,
             num_experts,
+            block_indexed=block_indexed,
         )
     if _uses_staged_route(topk_ids, num_experts):
         return _precomputed_topk_route_large_m_gfx1250(
@@ -3240,6 +3284,12 @@ _PREFILL_MXFP4_ACTIVATION_DOWN_TILES = {
 # way on Qwen3.8 Flash TP2, while resident launches of all four measured 1.2
 # to 1.8% slower with it. The down projection measured faster ungrouped.
 _DECODE_QUEUED_GATE_UP_GROUP_M = 8
+
+# Gate/up programs per CU up to which a decode launch reads its row ranges by
+# block index. On Kimi K3 TP8 that measured 16.5 -> 16.2 us at two requests
+# and 19.2 -> 18.9 us at four, nearly all of it in the down projection; with
+# four programs per CU allowed it cost 0.9 us at eight requests.
+_DECODE_BLOCK_INDEXED_PROGRAMS_PER_CU = 2
 
 # Row pitch in bytes of the scales the decode GEMM epilogue writes. Every
 # N tile stores a few bytes into each row; with packed 18-byte rows those
@@ -3331,6 +3381,28 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         device=hidden_states.device, dtype=torch.float32
     ).contiguous()
 
+    # A decode launch small enough that its programs rarely share a CU waits
+    # on each program's chain of metadata loads. The route then also writes
+    # every block's row range at the block's index, and both projections read
+    # it there along with the schedule entry.
+    block_indexed = False
+    if decode and block_m is None:
+        rows = int(topk_ids.numel())
+        if _resolve_block_m(True, rows, num_experts) == 16:
+            gate_up_n_tiles = triton.cdiv(
+                int(w13_raw.shape[-1]),
+                decode_tile_config(
+                    int(hidden_states.shape[-1]), activation_dtype == "fp8", 16
+                )["block_n"],
+            )
+            block_indexed = (
+                RaggedTensorMetadata.n_blocks(num_experts, rows, 16) * gate_up_n_tiles
+                <= _DECODE_BLOCK_INDEXED_PROGRAMS_PER_CU
+                * torch.cuda.get_device_properties(
+                    hidden_states.device
+                ).multi_processor_count
+            )
+
     if activation_dtype == "mxfp4":
         (
             ragged_metadata,
@@ -3340,7 +3412,11 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
             x_mxfp4,
             x_mx_scale,
         ) = _precomputed_topk_route_mxfp4(
-            topk_weights, topk_ids, num_experts, hidden_states
+            topk_weights,
+            topk_ids,
+            num_experts,
+            hidden_states,
+            block_indexed=block_indexed,
         )
     else:
         x_fp8 = None
@@ -3362,11 +3438,14 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
                     topk_ids,
                     num_experts,
                     quantize_fp8_into=(hidden_states, x_fp8, act_scale),
+                    block_indexed=block_indexed,
                 )
             )
         else:
             ragged_metadata, gather_indx, scatter_indx, _gate_scal = (
-                _precomputed_topk_route(topk_weights, topk_ids, num_experts)
+                _precomputed_topk_route(
+                    topk_weights, topk_ids, num_experts, block_indexed=block_indexed
+                )
             )
 
     if activation == "situ":
@@ -3430,7 +3509,12 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         else:
             gate_up_tiles = _PREFILL_MXFP4_ACTIVATION_GATE_UP_TILES
             down_tiles = _PREFILL_MXFP4_ACTIVATION_DOWN_TILES
-    launch = dict(block_m=block_m, decode=decode, partial_tdm=partial_tdm)
+    launch = dict(
+        block_m=block_m,
+        decode=decode,
+        partial_tdm=partial_tdm,
+        block_indexed=block_indexed,
+    )
     if activation_dtype == "mxfp4":
         intermediate, intermediate_mx_scale = gluon_mxfp_ragged_matmul(
             x_mxfp4,
@@ -3548,6 +3632,7 @@ def gluon_mxfp_ragged_matmul(
         "decode",
         "partial_tdm",
         "n_tiles",
+        "block_indexed",
     }
     launch_kwargs = {k: extra_kwargs.pop(k) for k in list(extra_kwargs) if k in allowed}
     launch_kwargs.setdefault("partial_tdm", False)
@@ -3565,6 +3650,7 @@ def gluon_mxfp_ragged_matmul(
             "decode",
             "partial_tdm",
             "n_tiles",
+            "block_indexed",
         }
     }
     unsupported = sorted(extra_kwargs)

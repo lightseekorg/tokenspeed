@@ -685,6 +685,7 @@ def _matmul_decode(
     NUM_WARPS: gl.constexpr = 4,
     PARTIAL_TDM: gl.constexpr = False,
     N_TILES: gl.constexpr = 1,
+    BLOCK_INDEXED: gl.constexpr = False,
     W_KPLANE_ROWS: gl.constexpr = 0,
 ):
     # Decode is a small-M, M-ragged MoE GEMM with a fixed baseline schedule.
@@ -757,6 +758,13 @@ def _matmul_decode(
         pid, grid_m, grid_n, grid_m * grid_n, XCD_SWIZZLE, GROUP_M, SPLIT_K
     )
     block_schedule = gl.load(XBlockSchedule + pid_m)
+    if BLOCK_INDEXED:
+        # XSliceOffs holds, per block, its expert's (rows << 16) | first row.
+        # A real entry is never negative, so the exit test below is unchanged;
+        # reading the entry's sign there makes the test need this load, which
+        # keeps it from being sunk behind the schedule wait.
+        block_rows = gl.load(XSliceOffs + pid_m)
+        block_schedule = block_schedule | (block_rows >> 31)
     if block_schedule == -1:
         return
     expt_id = block_schedule & 0x0000FFFF
@@ -814,8 +822,12 @@ def _matmul_decode(
         else:
             _issue_w_loads(cfg, w_desc, w_scale_desc, w_buffer, w_scale_buffer, i, 1)
 
-    start_m = gl.load(XSliceOffs + expt_id).to(address_index_type)
-    eM = gl.multiple_of(gl.load(XSliceSizes + expt_id), X_SLICE_SIZES_DIVISIBILITY)
+    if BLOCK_INDEXED:
+        start_m = (block_rows & 0xFFFF).to(address_index_type)
+        eM = gl.multiple_of(block_rows >> 16, X_SLICE_SIZES_DIVISIBILITY)
+    else:
+        start_m = gl.load(XSliceOffs + expt_id).to(address_index_type)
+        eM = gl.multiple_of(gl.load(XSliceSizes + expt_id), X_SLICE_SIZES_DIVISIBILITY)
 
     X_ptr = X
     if not cfg.USE_GATHER:

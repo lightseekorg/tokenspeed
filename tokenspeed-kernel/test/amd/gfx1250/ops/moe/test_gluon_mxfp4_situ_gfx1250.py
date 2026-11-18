@@ -459,6 +459,67 @@ def test_gfx1250_decode_resident_tiles_keep_one_tile_with_mxfp4_activations() ->
         assert decode.decode_resident_tile_config(384, 3584, blocks, cus, False) is None
 
 
+@pytest.mark.parametrize("num_tokens", [1, 2, 4])
+def test_kimi_k3_tp_situ_block_indexed_decode_matches_gfx1250(
+    monkeypatch: pytest.MonkeyPatch, num_tokens: int
+) -> None:
+    module, _, hidden_states, topk_weights, topk_ids, router_logits = _make_case(
+        num_tokens
+    )
+    plan = _make_plan()
+    kernel_moe_process_weights(plan, module)
+
+    def apply() -> torch.Tensor:
+        return kernel_moe_apply(
+            plan,
+            hidden_states,
+            module,
+            router_logits,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+        ).clone()
+
+    monkeypatch.setattr(fused, "_DECODE_BLOCK_INDEXED_PROGRAMS_PER_CU", 0)
+    by_expert = apply()
+    monkeypatch.setattr(fused, "_DECODE_BLOCK_INDEXED_PROGRAMS_PER_CU", 1 << 20)
+    by_block = apply()
+    torch.cuda.synchronize()
+    assert torch.count_nonzero(by_expert).item() > 0
+    torch.testing.assert_close(by_block, by_expert, atol=0, rtol=0)
+
+
+def test_gfx1250_small_route_block_rows_follow_schedule() -> None:
+    generator = torch.Generator(device="cuda").manual_seed(41)
+    num_tokens, num_experts, top_k = 24, 64, 8
+    topk_ids = torch.stack(
+        [
+            torch.randperm(num_experts, device="cuda", generator=generator)[:top_k]
+            for _ in range(num_tokens)
+        ]
+    ).to(torch.int32)
+    # A few experts with more than one 16-row block.
+    topk_ids[:, 0] = 3
+    topk_ids[:20, 1] = 7
+    topk_weights = torch.rand(
+        (num_tokens, top_k), dtype=torch.float32, device="cuda", generator=generator
+    )
+    metadata, *_ = fused._precomputed_topk_route_small_m_gfx1250(
+        topk_weights, topk_ids, num_experts, block_indexed=True
+    )
+    plain, *_ = fused._precomputed_topk_route_small_m_gfx1250(
+        topk_weights, topk_ids, num_experts, block_indexed=False
+    )
+    torch.cuda.synchronize()
+    assert plain.block16_rows is None
+    schedule = metadata.block_schedule(16)
+    blocks = schedule[schedule >= 0]
+    experts = (blocks & 0xFFFF).long()
+    assert int((metadata.slice_sizes > 16).sum()) >= 2
+    rows = metadata.block16_rows[: blocks.numel()]
+    assert torch.equal(rows & 0xFFFF, metadata.slice_offs[experts])
+    assert torch.equal(rows >> 16, metadata.slice_sizes[experts])
+
+
 @pytest.mark.parametrize("scaled", [False, True], ids=["unscaled", "scaled"])
 @pytest.mark.parametrize("num_tokens", [1, 4, 64])
 def test_gfx1250_small_route_fp8_quantize_matches_standalone(
@@ -479,9 +540,13 @@ def test_gfx1250_small_route_fp8_quantize_matches_standalone(
         topk_ids.to(torch.int32).contiguous(),
         896,
         quantize_fp8_into=(hidden_states, routed, scale),
+        block_indexed=False,
     )
     plain = fused._precomputed_topk_route_small_m_gfx1250(
-        topk_weights.float().contiguous(), topk_ids.to(torch.int32).contiguous(), 896
+        topk_weights.float().contiguous(),
+        topk_ids.to(torch.int32).contiguous(),
+        896,
+        block_indexed=False,
     )
     torch.cuda.synchronize()
     assert torch.equal(routed.view(torch.uint8), expected.view(torch.uint8))

@@ -329,6 +329,10 @@ class RaggedTensorMetadata:
     block_schedule_data: torch.Tensor
     # expected slice size (for heuristics)
     expected_slice_size: int | None = None
+    # Per 16-row block, in block-schedule order: its slice's row range packed
+    # as (rows << 16) | first row. Written by routes asked for block-indexed
+    # decode; None otherwise.
+    block16_rows: torch.Tensor | None = None
     # divisibility hint for values in `slice_sizes`
     slice_sizes_divisibility: int = None
 
