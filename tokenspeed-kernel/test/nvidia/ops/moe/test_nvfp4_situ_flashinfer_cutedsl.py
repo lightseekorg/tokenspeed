@@ -128,12 +128,9 @@ def _weights(generator: torch.Generator):
 
 
 def _routing(generator: torch.Generator, num_tokens: int):
-    ids = torch.stack(
-        [
-            torch.randperm(NUM_EXPERTS, generator=generator)[:TOP_K]
-            for _ in range(num_tokens)
-        ]
-    )
+    # TOP_K distinct experts per token.
+    ids = torch.rand(num_tokens, NUM_EXPERTS, generator=generator).argsort(dim=1)
+    ids = ids[:, :TOP_K]
     weights = torch.rand(num_tokens, TOP_K, generator=generator).softmax(dim=-1)
     return ids.to(torch.int32).cuda(), weights.cuda()
 
@@ -299,10 +296,10 @@ def test_routed_moe_compiles_once_for_any_row_count() -> None:
     cute = _Experts(_checkpoint(w13, w2, unit_scale=False)).cuda()
     flashinfer_cutedsl_nvfp4_situ_moe_weights({}, cute)
 
-    def run(num_tokens: int) -> None:
+    def run(num_tokens: int) -> torch.Tensor:
         hidden_states = torch.randn(num_tokens, HIDDEN, generator=generator)
         topk_ids, topk_weights = _routing(generator, num_tokens)
-        flashinfer_cutedsl_nvfp4_situ_routed_moe_apply(
+        return flashinfer_cutedsl_nvfp4_situ_routed_moe_apply(
             {},
             hidden_states.bfloat16().cuda(),
             cute,
@@ -315,6 +312,8 @@ def test_routed_moe_compiles_once_for_any_row_count() -> None:
     with assert_no_cute_compile():
         for num_tokens in (1, 37, 300):
             run(num_tokens)
+        # An idle attention-DP rank routes no tokens.
+        assert run(0).shape == (0, HIDDEN)
     torch.cuda.synchronize()
 
 

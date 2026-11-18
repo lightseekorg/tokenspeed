@@ -220,6 +220,10 @@ if platform.is_nvidia:
             raise ValueError("precomputed_topk plan requires topk_weights and topk_ids")
         if not do_finalize:
             raise ValueError("CuTe DSL NVFP4 SiTU MoE always finalizes")
+        # Idle attention-DP ranks route no tokens, which FlashInfer's routing rejects.
+        if topk_ids.shape[0] == 0:
+            hidden = w.cutedsl_w2_weight.shape[1]
+            return topk_weights.new_empty((0, hidden), dtype=torch.bfloat16)
         if isinstance(x, tuple):
             x_fp4, x_sf = x
         else:
@@ -228,6 +232,7 @@ if platform.is_nvidia:
                 w.w13_input_scale_quant,
                 sf_vec_size=_SF_VEC,
                 is_sf_swizzled_layout=False,
+                enable_pdl=enable_pdl,
             )
         experts, w13_rows, half_hidden = w.cutedsl_w1_weight.shape
         hidden = half_hidden * 2
