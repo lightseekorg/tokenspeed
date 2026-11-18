@@ -382,10 +382,8 @@ def test_sample_children_reads_strided_rows() -> None:
     cand = cand[:, :nc]
     tokens = torch.randint(0, vocab, (reqs * k, k), generator=gen).to(_DEVICE)
     scores = torch.rand((reqs * k, k), generator=gen).to(_DEVICE)
-    # A sampling request, a greedy one, and one cut to top-k / top-p.
+    # A sampling request, a greedy one, and one at a lower temperature.
     temps = torch.tensor([1.0, 0.0, 0.7], device=_DEVICE)
-    top_ks = torch.tensor([1 << 30, 1 << 30, 5], dtype=torch.int32, device=_DEVICE)
-    top_ps = torch.tensor([1.0, 1.0, 0.8], device=_DEVICE)
 
     def lanes(rows: torch.Tensor) -> torch.Tensor:
         return rows.view(reqs, k, -1)[:, :expanded]
@@ -398,7 +396,7 @@ def test_sample_children_reads_strided_rows() -> None:
             torch.zeros((reqs, 64), dtype=torch.int32, device=_DEVICE),
         ]
         eagle_harness_sample_children(
-            *rows, temps, top_ks, top_ps, *tables, width, 1, _count(5), vocab, 11,
+            *rows, temps, *tables, width, 1, _count(5), vocab, 11,
             torch.tensor([3], device=_DEVICE), 1,
         )  # fmt: skip
         return tables
@@ -466,8 +464,8 @@ def test_write_verify_tree(verify_num: int) -> None:
         assert parent_map[rows[b]].tolist() == want_parents
 
 
-def _sampled_round(target_rows, draft_logits, cand, topk, generator):
-    """One round per request at temperature 1: sample the root's K children
+def _sampled_round(target_rows, draft_logits, cand, topk, generator, *, temperature):
+    """One round per request at ``temperature``: sample the root's K children
     (and each child's K grandchildren) from the draft, accept by rejection,
     draw the bonus; returns each request's emitted tokens (-1 past them).
 
@@ -481,9 +479,7 @@ def _sampled_round(target_rows, draft_logits, cand, topk, generator):
     max_nodes, slots = 64, 1 + k
     nodes = 1 + k + k * k
     dev = "cuda"
-    temps = torch.ones(reqs, device=dev)
-    top_ks = _no_top_k(reqs)
-    top_ps = torch.ones(reqs, device=dev)
+    temps = torch.full((reqs,), temperature, device=dev)
     q_store = torch.zeros((reqs, slots, nc), device=dev)
     qid_store = torch.zeros((reqs, slots, nc), dtype=torch.int32, device=dev)
     node_slot = torch.full((reqs, max_nodes), -1, dtype=torch.int32, device=dev)
@@ -494,9 +490,8 @@ def _sampled_round(target_rows, draft_logits, cand, topk, generator):
     root_tokens = cand[0, :k].repeat(reqs, 1).contiguous()
     eagle_harness_sample_children(
         draft_logits[:1].repeat(reqs, 1)[:, None], cand[:1].repeat(reqs, 1)[:, None],
-        root_tokens[:, None], torch.zeros((reqs, 1, k), device=dev), temps, top_ks, top_ps,
-        q_store, qid_store, node_slot, node_pos, None, 0, _count(1), vocab, seed, counter,
-        0,
+        root_tokens[:, None], torch.zeros((reqs, 1, k), device=dev), temps, q_store,
+        qid_store, node_slot, node_pos, None, 0, _count(1), vocab, seed, counter, 0,
     )  # fmt: skip
     # A child's draft row is its own (indexed by the child's rank among the root's).
     child_logits = draft_logits[1:].repeat(reqs, 1).contiguous()
@@ -505,8 +500,8 @@ def _sampled_round(target_rows, draft_logits, cand, topk, generator):
     eagle_harness_sample_children(
         child_logits.view(reqs, k, -1), child_cand.view(reqs, k, -1),
         grand_tokens.view(reqs, k, k), torch.zeros((reqs, k, k), device=dev),
-        temps, top_ks, top_ps, q_store, qid_store, node_slot, node_pos,
-        None, 1, _count(1 + k), vocab, seed, counter, 1,
+        temps, q_store, qid_store, node_slot, node_pos, None, 1, _count(1 + k),
+        vocab, seed, counter, 1,
     )  # fmt: skip
     tokens = torch.cat(
         [torch.zeros((reqs, 1), dtype=torch.int64, device=dev), root_tokens,
@@ -568,7 +563,9 @@ def test_sampled_tree_emits_the_target_distribution(topk: int) -> None:
     accepted = 0
     trials = 240
     for _ in range(trials):
-        emitted, path = _sampled_round(target, draft_logits, cand, topk, generator)
+        emitted, path = _sampled_round(
+            target, draft_logits, cand, topk, generator, temperature=1.0
+        )
         first += torch.bincount(emitted[:, 0], minlength=vocab).float()
         # Rows whose first token is an accepted child (node path[1]) and that emitted a second.
         child = path[:, 1].long() - 1
@@ -662,9 +659,9 @@ def _verify_sampled(probas, tokens, parents, q_tables, coins, final_coins):
     return predicts, accept_length
 
 
-def _sample_root_children(logits, cand, tokens, *, top_k, top_p, vocab, seed):
+def _sample_root_children(logits, cand, tokens, *, temperature, vocab, seed):
     """Redraw each request's ``[bs, K]`` root children in place from its
-    ``[bs, NC]`` draft logits over ``cand`` at temperature 1; returns the q
+    ``[bs, NC]`` draft logits over ``cand`` at ``temperature``; returns the q
     tables (store, ids, node slots, node positions)."""
     bs, nc = logits.shape
     k = tokens.shape[1]
@@ -676,10 +673,9 @@ def _sample_root_children(logits, cand, tokens, *, top_k, top_p, vocab, seed):
     )
     eagle_harness_sample_children(
         logits[:, None], cand[:, None], tokens[:, None],
-        torch.zeros((bs, 1, k), device=_DEVICE), torch.ones(bs, device=_DEVICE),
-        torch.full((bs,), top_k, dtype=torch.int32, device=_DEVICE),
-        torch.full((bs,), top_p, device=_DEVICE), *tables, None, 0, _count(1), vocab,
-        seed, torch.zeros(1, dtype=torch.int64, device=_DEVICE), 0,
+        torch.zeros((bs, 1, k), device=_DEVICE),
+        torch.full((bs,), temperature, device=_DEVICE), *tables, None, 0, _count(1),
+        vocab, seed, torch.zeros(1, dtype=torch.int64, device=_DEVICE), 0,
     )  # fmt: skip
     return tables
 
@@ -694,7 +690,7 @@ def test_exhausted_residual_accepts_the_target_argmax() -> None:
     cand = torch.arange(nc, device=_DEVICE).repeat(bs, 1).contiguous()
     tokens = cand[:, :k].contiguous()
     q_store, qid_store, node_slot, node_pos = _sample_root_children(
-        logits, cand, tokens, top_k=1 << 30, top_p=1.0, vocab=vocab, seed=3
+        logits, cand, tokens, temperature=1.0, vocab=vocab, seed=3
     )
     assert (tokens[:, 0] == 5).all()
     tree = (
@@ -716,28 +712,68 @@ def test_exhausted_residual_accepts_the_target_argmax() -> None:
 
 
 @_sampled_trees
-@pytest.mark.parametrize("top_k,top_p", [(3, 1.0), (1 << 30, 0.5)])
-def test_sampled_children_respect_top_k_and_top_p(top_k: int, top_p: float) -> None:
-    """A request draws only from the draft's ``top_k`` best candidates and,
-    with top-p, from the smallest prefix (by q) holding that mass."""
-    bs, vocab, nc, k = 256, 300, 16, 2
+def test_sampled_children_follow_the_tempered_draft() -> None:
+    """The first child's law is softmax(logits / T) over the candidates in
+    the vocabulary, every candidate reachable: q is not cut to the request's
+    top-k / top-p (a cut q narrower than K leaves children that can never be
+    accepted while the target keeps mass at the candidates it drops)."""
+    # 1024 rows: the most one launch keys (MAX_KEYED); 16 seeds give 16384 draws.
+    bs, vocab, nc, k, temperature = 1024, 300, 16, 2, 0.6
     gen = torch.Generator().manual_seed(4)
-    logits = (
-        (torch.randn((1, nc), generator=gen) * 2).to(_DEVICE).repeat(bs, 1).contiguous()
+    logits = torch.randn((1, nc), generator=gen) * 0.8
+    cand = torch.randperm(vocab, generator=gen)[:nc]
+    cand[3] = vocab + 5  # past the vocabulary: never drawn
+    want = torch.zeros(vocab + 8)
+    keep = cand < vocab
+    want[cand[keep]] = torch.softmax(logits[0, keep] / temperature, -1)
+    first = torch.zeros(vocab + 8)
+    for seed in range(16):
+        tokens = cand[:k].to(_DEVICE).repeat(bs, 1).contiguous()
+        _sample_root_children(
+            logits.to(_DEVICE).repeat(bs, 1).contiguous(),
+            cand.to(_DEVICE).repeat(bs, 1).contiguous(),
+            tokens, temperature=temperature, vocab=vocab, seed=seed,
+        )  # fmt: skip
+        assert (tokens[:, 0] != tokens[:, 1]).all()
+        first += torch.bincount(tokens[:, 0].cpu(), minlength=vocab + 8).float()
+    torch.testing.assert_close(first / (16 * bs), want, rtol=0, atol=0.01)
+
+
+@_sampled_trees
+def test_sampled_tree_emits_a_cut_target_from_an_uncut_draft() -> None:
+    """A low-temperature draft against a target cut to a few tokens (a
+    request's top-k / top-p), one of them in the draft's tail: the tree still
+    emits exactly the target, and the root accepts a child more often than
+    the target mass inside the draft's own top-p (the bound a cut q had)."""
+    topk, vocab, nc, temperature = 3, 48, 32, 0.6
+    generator = torch.Generator().manual_seed(2)
+    cand = torch.stack(
+        [torch.randperm(vocab, generator=generator)[:nc] for _ in range(1 + topk)]
     )
-    cand = (
-        torch.randperm(vocab, generator=gen)[:nc].to(_DEVICE).repeat(bs, 1).contiguous()
+    draft_logits = torch.randn((1 + topk, nc), generator=generator) * 1.5
+    draft_logits[0, :3] = torch.tensor([6.0, 4.5, 3.0])
+    q = torch.softmax(draft_logits[0] / temperature, -1)
+    # The draft's top-p 0.95 keeps candidates 0 and 1 only; the target puts 0.3 on candidate 2.
+    assert q[0] + q[1] > 0.95 > q[0]
+    target = torch.softmax(
+        torch.randn((1 + topk + topk * topk, vocab), generator=generator) * 1.5, dim=-1
     )
-    probs = torch.softmax(logits[0], -1)
-    order = torch.argsort(probs, descending=True)
-    keep = min(top_k, int((torch.cumsum(probs[order], 0) < top_p).sum()) + 1)
-    allowed = set(cand[0, order[:keep]].tolist())
-    tokens = cand[:, :k].contiguous()
-    _sample_root_children(
-        logits, cand, tokens, top_k=top_k, top_p=top_p, vocab=vocab, seed=5
-    )
-    first = set(tokens[:, 0].tolist())
-    assert first <= allowed and len(first) > 1
+    target[0] = 0.0
+    target[0, cand[0, :3]] = torch.tensor([0.6, 0.1, 0.3])
+    first = torch.zeros(vocab)
+    accepted = 0
+    trials = 120
+    for _ in range(trials):
+        emitted, path = _sampled_round(
+            target.cuda(), draft_logits.cuda(), cand.cuda(), topk, generator,
+            temperature=temperature,
+        )  # fmt: skip
+        first += torch.bincount(emitted[:, 0], minlength=vocab).float()
+        accepted += int((path[:, 1] >= 0).sum())
+    total = trials * 256
+    torch.testing.assert_close(first / total, target[0], rtol=0, atol=0.01)
+    # A q cut to its top-p accepts at most 0.6 + 0.1; uncut, recursive rejection gives about 0.8.
+    assert accepted / total > 0.75
 
 
 @_sampled_trees
@@ -890,9 +926,8 @@ def _triton_sampled_round(bs: int, slot_base: int, launch: int, width: int) -> N
         torch.randint(0, vocab, (bs, 2, nc), device=_DEVICE),
         torch.zeros((bs, 2, k), dtype=torch.int64, device=_DEVICE),
         torch.zeros((bs, 2, k), device=_DEVICE),
-        torch.ones(bs, device=_DEVICE), int32(bs, fill=1 << 30),
-        torch.full((bs,), 0.9, device=_DEVICE), q_store, qid_store, node_slot,
-        node_pos, _count(width), slot_base, _count(1 + slot_base), vocab, 11,
+        torch.ones(bs, device=_DEVICE), q_store, qid_store, node_slot, node_pos,
+        _count(width), slot_base, _count(1 + slot_base), vocab, 11,
         torch.tensor([slot_base], dtype=torch.int64, device=_DEVICE), launch,
     )  # fmt: skip
     rows = torch.arange(bs, device=_DEVICE)

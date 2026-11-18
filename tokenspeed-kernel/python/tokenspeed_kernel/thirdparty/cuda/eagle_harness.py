@@ -219,8 +219,6 @@ def eagle_harness_sample_children(
     tokens: torch.Tensor,
     scores: torch.Tensor,
     temperatures: torch.Tensor,
-    top_ks: torch.Tensor,
-    top_ps: torch.Tensor,
     q_store: torch.Tensor,
     qid_store: torch.Tensor,
     node_slot: torch.Tensor,
@@ -240,9 +238,9 @@ def eagle_harness_sample_children(
     int32 ``[1]``; None: all ``R``). ``cumu_start`` is a device int32 ``[1]``. For rows of requests with ``temperatures > 0``,
     overwrite ``tokens`` (``[B, R, K]`` int64) with ``K`` candidates drawn
     without replacement from the softmax of ``logits / temperature`` over
-    the row's candidates (``[B, R, NC]`` fp32 logits, int64 ids), cut to the
-    request's top-k / top-p; ``scores`` (``[B, R, K]``, q's sorted top-K)
-    are kept, a child past the cut's support set to 0. Row ``r``'s q and ids
+    the row's candidates (``[B, R, NC]`` fp32 logits, int64 ids), not cut to
+    the request's top-k / top-p; ``scores`` (``[B, R, K]``, q's sorted
+    top-K) are kept, a child past q's support set to 0. Row ``r``'s q and ids
     go to slot ``slot_base + r`` of ``q_store`` / ``qid_store``
     (``[B, S, NC]``) and each child's slot and candidate position to
     ``node_slot`` / ``node_pos`` (``[B, nodes]`` int32) at pool nodes
@@ -257,8 +255,6 @@ def eagle_harness_sample_children(
         tokens,
         scores,
         temperatures,
-        top_ks,
-        top_ps,
         q_store,
         qid_store,
         node_slot,
