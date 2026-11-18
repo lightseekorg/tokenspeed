@@ -2088,6 +2088,9 @@ if platform.is_amd:
             "internal_activation_dtype": frozenset({"input"}),
             # Prefill rows may arrive as packed E2M1 data with CDNA4 scales.
             "supports_prequantized_input": frozenset({True}),
+            # Decode rows may arrive as an FP8 E4M3 copy with one per-tensor
+            # scale, as _dynamic_fp8_quantize returns them, in _situ_input_fp8.
+            "supports_fp8_per_tensor_input": frozenset({True}),
             # Decode rows that sort their routes take a sort made upstream
             # in gluon_moe_sorting's layout at this block size instead.
             "sorted_route_rows": frozenset(A8W4_SORTED_DECODE_ROWS),

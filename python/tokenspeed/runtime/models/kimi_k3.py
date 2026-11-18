@@ -2796,6 +2796,11 @@ class KimiLinearMoE(nn.Module):
             )
             offset += rows
 
+    def _apply_reads_gathered_fp8(self) -> bool:
+        """Whether the apply takes the FP8 latent the gather quantizes instead
+        of quantizing the BF16 latent itself."""
+        return self.experts.plan.get("supports_fp8_per_tensor_input", False)
+
     def _latent_input_projections(
         self,
         hidden_states: torch.Tensor,
@@ -2831,11 +2836,8 @@ class KimiLinearMoE(nn.Module):
                 hidden_states, self.packed_input_projection_weight
             )
         ):
-            # Project own columns and gather; A8W4 reuses the gathered FP8 latent.
-            quantize = (
-                self.experts.plan.get("apply_kernel_name")
-                == "gluon_mxfp4_a8w4_situ_precomputed_moe_apply"
-            )
+            # Project own columns and gather.
+            quantize = self._apply_reads_gathered_fp8()
             router_logits, routed_input, shared_input, *routed_fp8 = (
                 self.iris_state.latent_input_gather(
                     hidden_states,
@@ -2866,6 +2868,71 @@ class KimiLinearMoE(nn.Module):
             out=shared_out,
         )
         return router_logits, routed_input, shared_output
+
+    def _routed_latent_inputs(
+        self,
+        hidden_states: torch.Tensor,
+        shared_out: torch.Tensor | None,
+        precompute_topk: bool,
+    ) -> tuple[torch.Tensor, StandardTopKOutput, torch.Tensor] | None:
+        """Project, gather and route replicated rows and run the shared down
+        projection in the gather's launch.
+
+        The route ids and their expert sort match the separate sorted routing
+        launch bit for bit; the FP32 weights agree up to rounding. Returns
+        ``(routed_input, topk_output, shared_partial)``, or ``None`` before
+        launching anything when the Iris state's routed gather does not serve
+        these rows.
+        """
+        if (
+            self._fused_routing_scratch is None
+            or not precompute_topk
+            or self.topk.simulate_routing
+            or hidden_states.shape[0] not in self.experts.sorted_route_rows
+            or self.packed_input_projection_weight is None
+            or self.routed_expert_down_proj.narrowed
+        ):
+            return None
+        from tokenspeed_kernel.ops.communication._iris.kimi_k3 import K3MoeRouting
+
+        topk_config = self.topk.topk_config
+        routing = K3MoeRouting(
+            topk_config.correction_bias.float(),
+            float(topk_config.routed_scaling_factor),
+            topk_config.renormalize,
+            self.experts.sorted_route_block_size,
+            self._fused_routing_scratch,
+        )
+        down_weight = self.shared_experts.down_proj.weight
+        if not self.iris_state.can_latent_input_gather_routed(
+            hidden_states,
+            self.packed_input_projection_weight,
+            routing,
+            down_weight,
+            shared_out,
+        ):
+            return None
+        quantize = self._apply_reads_gathered_fp8()
+        router_logits, routed_input, routes, shared_partial, routed_fp8 = (
+            self.iris_state.latent_input_gather_routed(
+                hidden_states,
+                self.packed_input_projection_weight,
+                beta=self.shared_experts.act_fn.beta,
+                linear_beta=self.shared_experts.act_fn.linear_beta,
+                routing=routing,
+                down_weight=down_weight,
+                down_out=shared_out,
+                quantize=quantize,
+            )
+        )
+        topk_weights, topk_ids, *sorted_routes = routes
+        self.experts._situ_input_fp8 = routed_fp8
+        self.experts._situ_sorted_routes = tuple(sorted_routes)
+        return (
+            routed_input,
+            StandardTopKOutput(topk_weights, topk_ids, router_logits),
+            shared_partial,
+        )
 
     def process_weights_after_loading(self, module) -> None:
         """Configure the latent projection from the processed expert input scale."""
@@ -3255,17 +3322,33 @@ class KimiLinearMoE(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Project, route and run the experts on rows every rank holds whole."""
         precompute_topk = routing_output_format.is_standard()
+        rows_replicated = (
+            self.iris_state is not None
+            and self.mapping.pp_size == 1
+            and self.mapping.attn.tp_size == 8
+            and self.mapping.moe.tp_size == 8
+            and self.mapping.moe.ep_size == 1
+            and self.mapping.attn.tp_group == self.mapping.moe.tp_ep_group
+        )
+        routed_inputs = (
+            self._routed_latent_inputs(hidden_states, shared_out, precompute_topk)
+            if rows_replicated
+            else None
+        )
+        if routed_inputs is not None:
+            routed_in, topk_output, shared_partial = routed_inputs
+            routed = self._routed_experts(
+                routed_in,
+                topk_output,
+                num_global_tokens,
+                max_num_tokens_per_gpu,
+                do_finalize=True,
+            )
+            return routed, shared_partial
         fused_inputs = self._latent_input_projections(
             hidden_states,
             shared_out=shared_out,
-            rows_replicated=(
-                self.iris_state is not None
-                and self.mapping.pp_size == 1
-                and self.mapping.attn.tp_size == 8
-                and self.mapping.moe.tp_size == 8
-                and self.mapping.moe.ep_size == 1
-                and self.mapping.attn.tp_group == self.mapping.moe.tp_ep_group
-            ),
+            rows_replicated=rows_replicated,
             defer_shared_down=True,
         )
         shared_input = shared_partial = None
