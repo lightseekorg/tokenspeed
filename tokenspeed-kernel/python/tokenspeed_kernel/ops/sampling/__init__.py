@@ -35,6 +35,7 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
     "argmax",
+    "softmax",
     "eagle4_candidate_supports",
     "eagle4_candidate_tail",
     "eagle4_shard_topk",
@@ -141,6 +142,74 @@ def argmax(
         "sampling", "argmax", logits.dtype, kernel_name=kernel.name, **shape_params
     ):
         return kernel(logits, out=out)
+
+
+def _softmax_torch_fallback(
+    logits: _torch.Tensor, temperature: _torch.Tensor
+) -> _torch.Tensor:
+    return _torch.softmax(_torch.div(logits.float(), temperature.view(-1, 1)), dim=-1)
+
+
+def softmax(
+    logits: _torch.Tensor,
+    temperature: _torch.Tensor,
+    *,
+    solution: str | None = None,
+    override: str | None = None,
+) -> _torch.Tensor:
+    """Return ``softmax(logits / temperature)`` of each row in fp32.
+
+    Args:
+        logits: Input logits with shape ``(M, N)``.
+        temperature: ``(M,)`` fp32 temperature of each row.
+        solution: Optional kernel solution to force through normal selection.
+        override: Optional exact kernel-name or solution override.
+
+    Non-finite rows:
+        A row whose ``logits / temperature`` holds a NaN or ``+inf``, or no
+        value above ``-inf``, has no finite softmax and comes back NaN, as
+        from ``torch.softmax``. Inputs no kernel takes (empty, off the GPU,
+        another dtype, or a column stride other than 1) take
+        ``torch.softmax``.
+
+    Returns:
+        ``(M, N)`` contiguous fp32 probabilities.
+    """
+    if logits.dim() != 2:
+        raise ValueError(f"logits must be 2-D, got shape {tuple(logits.shape)}")
+    if temperature.shape != (logits.shape[0],) or temperature.dtype != _torch.float32:
+        raise ValueError(
+            f"temperature must be fp32 with shape {(logits.shape[0],)}, got "
+            f"{temperature.dtype} {tuple(temperature.shape)}"
+        )
+    if (
+        logits.numel() == 0
+        or not logits.is_cuda
+        or logits.dtype not in _SUPPORTED_DTYPES
+        or logits.stride(1) != 1
+    ):
+        return _softmax_torch_fallback(logits, temperature)
+
+    signature = format_signature(logits=dense_tensor_format(logits.dtype))
+    try:
+        kernel = select_kernel(
+            "sampling",
+            "softmax",
+            signature,
+            solution=solution,
+            override=override,
+        )
+    except NoKernelFoundError:
+        return _softmax_torch_fallback(logits, temperature)
+
+    shape_params = {"M": logits.shape[0], "N": logits.shape[1]}
+    ShapeCapture.get().record(
+        "sampling", "softmax", kernel.name, logits.dtype, shape_params
+    )
+    with kernel_scope(
+        "sampling", "softmax", logits.dtype, kernel_name=kernel.name, **shape_params
+    ):
+        return kernel(logits, temperature.contiguous())
 
 
 # The CUDA shard top-k's widest launch: 8-CTA clusters of 1024 threads x 32
@@ -504,7 +573,9 @@ def vocab_shard_draft_record(
 # Backend registration (side-effect imports).
 import tokenspeed_kernel.ops.sampling.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.cute_dsl  # noqa: E402,F401
+import tokenspeed_kernel.ops.sampling.flashinfer  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.torch  # noqa: E402,F401
+import tokenspeed_kernel.ops.sampling.triton.softmax  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.triton.vocab_shard_draft  # noqa: E402,F401
 import tokenspeed_kernel.ops.sampling.triton.vocab_topk  # noqa: E402,F401
