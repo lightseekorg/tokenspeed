@@ -472,20 +472,109 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> None:
-    args = parse_args()
-    prompts = json.loads(args.prompts.read_text(encoding="utf-8"))
+def parse_prompts(text: str) -> list[str]:
+    prompts = json.loads(text)
     if (
         not isinstance(prompts, list)
         or not prompts
         or any(not isinstance(p, str) for p in prompts)
     ):
         raise ValueError("--prompts must name a nonempty JSON array of strings")
-    channels = tuple(int(item) for item in args.channels.split(","))
+    return prompts
+
+
+def parse_channels(text: str) -> tuple[int, ...]:
+    channels = tuple(int(item) for item in text.split(","))
     if not channels or len(set(channels)) != len(channels) or min(channels) < 0:
         raise ValueError("--channels requires unique nonnegative integers")
-    if args.max_tokens < 1 or args.cache_mib < 1:
+    return channels
+
+
+def validate_limits(max_tokens: int, cache_mib: int) -> None:
+    if max_tokens < 1 or cache_mib < 1:
         raise ValueError("Token bound and cache budget must be positive")
+
+
+def collect_initial_report(args: argparse.Namespace, runtime: ColdPrefill) -> dict:
+    """Read source and device provenance before recording prompt results."""
+    properties = torch.cuda.get_device_properties(runtime.device)
+    source_root = Path(__file__).resolve().parents[1]
+    source_commit = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=source_root, text=True
+    ).strip()
+    return {
+        "model": args.model,
+        "revision": args.revision,
+        "source_commit": source_commit,
+        "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "observer_sha256": hashlib.sha256(
+            Path(inspect.getfile(FinalMLPObserver)).read_bytes()
+        ).hexdigest(),
+        "device": str(properties),
+        "torch": torch.__version__,
+        "hip": torch.version.hip,
+        "cuda": torch.version.cuda,
+        "dtype": "bfloat16",
+        "norm_mode": args.norm_mode,
+        "attention_backend": runtime.server.attention_backend,
+        "numerics": runtime.server.numerics,
+        "autotune": False,
+        "cache_prefix_tokens": 0,
+        "rms_norm_eps": runtime.model.config.rms_norm_eps,
+        "vocab_size": runtime.model.config.vocab_size,
+        "head_logit_scale": runtime.model.logits_processor.logit_scale,
+        "head_softcap": runtime.model.logits_processor.final_logit_softcapping,
+        "scope": "Full eager cold prefill; no sampling, generation, serving lifecycle, or graph validation",
+        "results": [],
+    }
+
+
+def unsupported_configuration_refusals(runtime: ColdPrefill) -> dict[str, str]:
+    refusals = {}
+    for label, options in (
+        (
+            "captured",
+            {"execution": "captured", "speculative": False, "monokernel": False},
+        ),
+        (
+            "speculative",
+            {"execution": "eager", "speculative": True, "monokernel": False},
+        ),
+        (
+            "monokernel",
+            {"execution": "eager", "speculative": False, "monokernel": True},
+        ),
+    ):
+        try:
+            FinalMLPObserver(runtime.model, num_rows=1, num_logits_rows=1, **options)
+        except ValueError as error:
+            refusals[label] = str(error)
+        else:
+            raise AssertionError(f"Unsupported {label} configuration was accepted")
+    return refusals
+
+
+def save_suffix_weights(runtime: ColdPrefill, output_dir: Path) -> None:
+    mlp = runtime.model.model.layers[-1].mlp
+    save_file(
+        {
+            name: value.detach().cpu().contiguous()
+            for name, value in {
+                "gate_up_weight": mlp.gate_up_proj.weight,
+                "down_weight": mlp.down_proj.weight,
+                "final_norm_weight": runtime.model.model.norm.weight,
+                "lm_head_weight": runtime.model.lm_head.weight,
+            }.items()
+        },
+        str(output_dir / "suffix-weights.safetensors"),
+    )
+
+
+def main() -> None:
+    args = parse_args()
+    prompts = parse_prompts(args.prompts.read_text(encoding="utf-8"))
+    channels = parse_channels(args.channels)
+    validate_limits(args.max_tokens, args.cache_mib)
     args.output_dir.mkdir(parents=True, exist_ok=False)
     try:
         runtime = ColdPrefill(args)
@@ -493,74 +582,12 @@ def main() -> None:
             raise ValueError(
                 "A requested channel exceeds this model's intermediate width"
             )
-        properties = torch.cuda.get_device_properties(runtime.device)
-        source_root = Path(__file__).resolve().parents[1]
-        source_commit = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=source_root, text=True
-        ).strip()
-        report = {
-            "model": args.model,
-            "revision": args.revision,
-            "source_commit": source_commit,
-            "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-            "observer_sha256": hashlib.sha256(
-                Path(inspect.getfile(FinalMLPObserver)).read_bytes()
-            ).hexdigest(),
-            "device": str(properties),
-            "torch": torch.__version__,
-            "hip": torch.version.hip,
-            "cuda": torch.version.cuda,
-            "dtype": "bfloat16",
-            "norm_mode": args.norm_mode,
-            "attention_backend": runtime.server.attention_backend,
-            "numerics": runtime.server.numerics,
-            "autotune": False,
-            "cache_prefix_tokens": 0,
-            "rms_norm_eps": runtime.model.config.rms_norm_eps,
-            "vocab_size": runtime.model.config.vocab_size,
-            "head_logit_scale": runtime.model.logits_processor.logit_scale,
-            "head_softcap": runtime.model.logits_processor.final_logit_softcapping,
-            "scope": "Full eager cold prefill; no sampling, generation, serving lifecycle, or graph validation",
-            "results": [],
-        }
-        refusals = {}
-        for label, options in (
-            (
-                "captured",
-                {"execution": "captured", "speculative": False, "monokernel": False},
-            ),
-            (
-                "speculative",
-                {"execution": "eager", "speculative": True, "monokernel": False},
-            ),
-            (
-                "monokernel",
-                {"execution": "eager", "speculative": False, "monokernel": True},
-            ),
-        ):
-            try:
-                FinalMLPObserver(
-                    runtime.model, num_rows=1, num_logits_rows=1, **options
-                )
-            except ValueError as error:
-                refusals[label] = str(error)
-            else:
-                raise AssertionError(f"Unsupported {label} configuration was accepted")
-        report["unsupported_configuration_refusals"] = refusals
+        report = collect_initial_report(args, runtime)
+        report["unsupported_configuration_refusals"] = (
+            unsupported_configuration_refusals(runtime)
+        )
         if args.export_suffix_weights:
-            mlp = runtime.model.model.layers[-1].mlp
-            save_file(
-                {
-                    name: value.detach().cpu().contiguous()
-                    for name, value in {
-                        "gate_up_weight": mlp.gate_up_proj.weight,
-                        "down_weight": mlp.down_proj.weight,
-                        "final_norm_weight": runtime.model.model.norm.weight,
-                        "lm_head_weight": runtime.model.lm_head.weight,
-                    }.items()
-                },
-                str(args.output_dir / "suffix-weights.safetensors"),
-            )
+            save_suffix_weights(runtime, args.output_dir)
         for index, prompt in enumerate(prompts):
             result = evaluate(
                 runtime,
