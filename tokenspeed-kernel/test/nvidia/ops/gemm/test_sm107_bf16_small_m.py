@@ -105,8 +105,14 @@ def test_admitted_projection_eager_and_graph(n, k, m):
     assert fi.flashinfer_joint_bf16_supported(x, w, out)
     assert mm(x, w, out=out) is out
     check_result(out, x, w)
-    # mm() took the CuTe DSL path, not cuBLASLt.
-    assert torch.equal(fi.flashinfer_bf16_gemm(x, w, None), out)
+    # The measured small-N projection uses the pinned CuTe DSL tile under PDL.
+    if fi.prefer_bf16_small_n_splitk(m, n, k, enable_pdl=pdl_enabled()):
+        expected = fi.flashinfer_mm_bf16_small_n_splitk(
+            x, w, None, None, x.dtype, enable_pdl=True
+        )
+    else:
+        expected = fi.flashinfer_bf16_gemm(x, w, None)
+    assert torch.equal(expected, out)
     # The graph replay contract needs a deterministic runner.
     assert torch.equal(mm(x, w), out)
     stream = torch.cuda.Stream()

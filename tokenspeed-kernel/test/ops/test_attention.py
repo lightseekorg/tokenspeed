@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import math
+import sys
 
 import pytest
 import torch
@@ -867,6 +868,43 @@ def test_triton_mha_decode_folds_query_rows(
         torch.testing.assert_close(lse, expected_lse, rtol=1e-4, atol=1e-4)
 
 
+@pytest.mark.parametrize(
+    "num_q_heads,num_kv_heads",
+    [
+        pytest.param(48, 2, id="gqa24"),
+        pytest.param(40, 2, id="gqa20"),
+        pytest.param(64, 2, id="gqa32"),
+        pytest.param(24, 4, id="gqa6"),
+    ],
+)
+def test_triton_mha_decode_grouped_heads_read_their_kv_head(
+    device: str, num_q_heads: int, num_kv_heads: int, require
+) -> None:
+    """Grouped one-token decode matches attention past a 16-head tile."""
+    require("attention", "mha_decode_with_kvcache", "triton", torch.bfloat16, "q")
+    seq_lens = [3, 64, 333, 2049]
+    q, k_cache, v_cache, page_table, cache_seqlens = _paged_decode_problem(
+        seq_lens, 1, num_q_heads, num_kv_heads, 128, 64, device
+    )
+    scale = 128**-0.5
+    expected, _ = _causal_decode_reference(
+        q, k_cache, v_cache, page_table, cache_seqlens, 1, -1, None, scale
+    )
+    out = mha_decode_with_kvcache(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        max_seqlen_k=max(seq_lens),
+        max_seqlen_q=1,
+        softmax_scale=scale,
+        solution="triton",
+        block_draft=False,
+    )
+    torch.testing.assert_close(out.float(), expected, rtol=2e-2, atol=2e-2)
+
+
 def test_triton_mha_decode_folded_no_recompile_across_batches(
     device: str, require
 ) -> None:
@@ -1011,3 +1049,7 @@ def test_triton_mha_decode_returns_lse_at_every_batch_size(
         check([777, 0, 64, 1500, 3])
         # Enough requests to fill the GPU without splitting.
         check([int(n) for n in torch.randint(1, 900, (512,))])
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))
