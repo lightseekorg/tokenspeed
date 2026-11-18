@@ -2486,14 +2486,13 @@ def _check_k3_expert_placement(
     config: KimiLinearConfig,
     mapping: Mapping,
     layer_index: int,
-    execution_plan: Kimi3MoEExecutionPlan,
     peer_weights: MoEPeerWeights | None,
 ) -> None:
     """Refuse a placement this K3 MoE layer cannot route through.
 
-    Only the attention-DP MegaMoE path consumes one: every rank routes its own
-    tokens, the router maps them to this rank's static replica choice, and
-    MegaMoE dispatches each route to the rank owning that physical slot.
+    Attention DP with EP-only MoE consumes one: each rank routes its own tokens
+    to this rank's static replica choice, and the dispatch delivers each route
+    to the rank owning that physical slot.
     """
     if placement.num_logical_experts != config.num_experts:
         raise ValueError(
@@ -2511,14 +2510,13 @@ def _check_k3_expert_placement(
             f"has ep_size={mapping.moe.ep_size}"
         )
     if not (
-        execution_plan.use_mega_moe
-        and mapping.attn.dp_size > 1
+        mapping.attn.dp_size > 1
         and mapping.moe.tp_size == 1
         and mapping.moe.ep_size > 1
     ):
         raise ValueError(
-            "Kimi-K3 expert placement requires attention DP with --moe-backend "
-            "mega_moe and MoE EP only (moe tp_size 1)"
+            "Kimi-K3 expert placement requires attention DP with MoE EP only "
+            "(moe tp_size 1)"
         )
     if peer_weights is not None:
         raise ValueError(
@@ -2536,8 +2534,8 @@ def _check_k3_expert_placement(
     if algorithm != "static":
         raise ValueError(
             "Kimi-K3 expert placement needs --ep-dispatch-algorithm static: the "
-            "router writes MegaMoE's id buffer through this rank's static "
-            f"replica map, not {algorithm}"
+            "router maps ids through this rank's static replica map, not "
+            f"{algorithm}"
         )
 
 
@@ -2623,7 +2621,6 @@ class KimiLinearMoE(nn.Module):
                 config,
                 mapping,
                 layer_index,
-                self.execution_plan,
                 peer_weights,
             )
         # Router (gate+topk) and shared experts run on this stream during
@@ -2632,6 +2629,12 @@ class KimiLinearMoE(nn.Module):
         # stream (aux-stream collectives can deadlock across ranks).
         self.stream_fork = StreamFork(alt_stream)
         self.num_experts = config.num_experts
+        # Routed-expert slots: the router emits slot ids when a placement is set.
+        self.num_physical_experts = (
+            self.num_experts
+            if self.expert_placement is None
+            else self.expert_placement.num_physical_experts
+        )
         self.top_k = config.num_experts_per_token
         self.routed_scaling_factor = config.routed_scaling_factor
         # Latent MoE: routed experts run at routed_expert_hidden_size.
@@ -2664,11 +2667,7 @@ class KimiLinearMoE(nn.Module):
         # TopK fallback (for example NVFP4, AMD-native, or Marlin SiTU).
         self.experts = MoELayer(
             top_k=self.top_k,
-            num_experts=(
-                self.num_experts
-                if self.expert_placement is None
-                else self.expert_placement.num_physical_experts
-            ),
+            num_experts=self.num_physical_experts,
             hidden_size=self.routed_hidden,
             intermediate_size=config.moe_intermediate_size,
             quant_config=quant_config,
@@ -2759,8 +2758,7 @@ class KimiLinearMoE(nn.Module):
                 layer_id=layer_index,
                 ep_dispatch_algorithm=global_server_args_dict["ep_dispatch_algorithm"],
                 expert_location_metadata=self.expert_placement,
-                # MegaMoE fuses its dispatch, so its plan names no all-to-all
-                # backend, yet each rank routes only its own tokens.
+                # Attention DP: each rank routes only its own tokens.
                 all_to_all_ep=True,
             )
 
@@ -2898,7 +2896,7 @@ class KimiLinearMoE(nn.Module):
                     ),
                     hidden_size=self.routed_hidden,
                     top_k=self.top_k,
-                    num_experts=self.num_experts,
+                    num_experts=self.num_physical_experts,
                     dtype=self.gate.weight.dtype,
                     weights_dtype=self.topk.topk_config.topk_weights_dtype,
                 )
@@ -4074,7 +4072,7 @@ def create_kimi_linear_moe(
         and implementation is not KimiLinearMoE
     ):
         raise ValueError(
-            "Kimi-K3 expert placement requires the attention-DP MegaMoE path, "
+            "Kimi-K3 expert placement requires the attention-DP MoE path, "
             "not --all2all-backend deepep"
         )
     peer_kwargs = {"peer_weights": peer_weights} if peer_weights is not None else {}
@@ -6445,9 +6443,8 @@ class KimiK3ForConditionalGeneration(nn.Module):
     a text ``language_model``. The text path is ``KimiLinearForCausalLM``.
     """
 
-    # The attention-DP MegaMoE layers size their slots from the expert
-    # placement and route through it; ``_check_k3_expert_placement`` refuses
-    # it on every other MoE path.
+    # The attention-DP MoE layers size their slots from the expert placement
+    # and route through it; ``_check_k3_expert_placement`` refuses it elsewhere.
     supports_expert_placement: ClassVar[bool] = True
 
     def __init__(

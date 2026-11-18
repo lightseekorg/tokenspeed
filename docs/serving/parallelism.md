@@ -273,6 +273,10 @@ Kimi-K3 requires
 `attention DP == MoE EP == world size`. By default, shared experts and attention
 projections are replicated. Only the routed experts require dispatch/combine
 communication.
+On this path (any transport but `deepep`, or MegaMoE), an EP size that does
+not divide the 896 routed experts takes redundant slots
+([static expert placement](#static-expert-placement-with-redundant-experts)),
+for example `--ep-num-redundant-experts 4 --ep-dispatch-algorithm static` at EP20.
 
 Select the transport with `--all2all-backend`:
 
@@ -293,9 +297,6 @@ Select the transport with `--all2all-backend`:
 For NVIDIA NVFP4 checkpoints, `--moe-backend mega_moe` replaces routed
 dispatch, SiTU expert computation, and combine with MegaMoE. It requires
 `--all2all-backend none`, keeps routing weights after FC2, and returns BF16 outputs.
-An EP size that does not divide the 896 routed experts takes redundant slots
-([static expert placement](#static-expert-placement-with-redundant-experts)),
-for example `--ep-num-redundant-experts 4 --ep-dispatch-algorithm static` at EP20.
 
 The AG/RS and FlashInfer transports quantize NVFP4 activations before dispatch and transfer their
 block scales alongside the routing IDs and weights. Combine outputs remain BF16.
@@ -494,9 +495,9 @@ rebalancing](#dynamic-expert-rebalancing) below). Models opt in explicitly
 (`supports_expert_placement` on the model class) by building their MoE layers
 from the placement and loading every placed slot — LongCat-Flash does, and
 Inkling2 does for static placements (it does not expose its expert weights to
-`--enable-eplb`), and so does Kimi-K3 on its attention-DP
-`--moe-backend mega_moe` path (static dispatch, no load recording or online
-rebalancing).
+`--enable-eplb`), and so does Kimi-K3 with attention DP and EP-only MoE
+(MegaMoE, or the all-to-all / all-gather dispatch to the local MoE; static
+dispatch, no load recording or online rebalancing).
 TokenSpeed refuses the placement flags for any other model, so it
 never installs a placement only to ignore it.
 `--ep-num-redundant-experts` also needs expert parallelism (`ep_size > 1`):

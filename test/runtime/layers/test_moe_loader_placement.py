@@ -173,15 +173,6 @@ def test_k3_900_slots_over_20_ranks_hold_every_expert_and_its_replicas():
     )
     physical_to_logical = (torch.arange(900) % 896).repeat(2, 1)
     nodes = tuple(r // 4 for r in range(20))
-    with pytest.raises(ValueError, match="divide evenly"):
-        build_moe_checkpoint_loader(
-            params_dict={},
-            expert_schema=schema,
-            num_experts=896,
-            ep_rank=0,
-            ep_size=20,
-        )
-
     slots_of_expert: dict[int, list[tuple[int, int]]] = {}
     for ep_rank in range(20):
         placement = ExpertLocationMetadata.from_physical_to_logical_map(

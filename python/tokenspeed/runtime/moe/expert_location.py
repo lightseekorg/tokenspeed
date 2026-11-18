@@ -907,7 +907,6 @@ def build_expert_placement(
         return None
     # Deferred: the model base imports the MoE layers, whose router imports
     # this module for its placement view.
-    from tokenspeed.runtime.layers.moe.utils import MoeBackend
     from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
 
     model_class, architecture = get_model_architecture(model_config)
@@ -935,9 +934,9 @@ def build_expert_placement(
         placement.enable_load_recording(server_args.mapping)
     if server_args.ep_dispatch_algorithm in STATIC_EP_DISPATCH_ALGORITHMS and (
         server_args.all2all_backend != "none"
-        # MegaMoE fuses its own dispatch, so it runs all-to-all EP with no
-        # all-to-all backend (Kimi-K3).
-        or MoeBackend(server_args.moe_backend).is_mega_moe()
+        # Attention-DP ranks route only their own tokens whatever carries the
+        # routes (Kimi-K3: MegaMoE, FlashInfer all-to-all or AG/RS).
+        or server_args.mapping.attn.dp_size > 1
     ):
         # All-to-all EP slices this rank's static map while the model is
         # built, inside the weight region a memory-saver discard releases and
