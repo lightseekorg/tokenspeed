@@ -811,17 +811,21 @@ def _causal_conv1d_tree_update_kernel(
     HAS_BIAS: tl.constexpr,
     KERNEL_WIDTH: tl.constexpr,
     SILU_ACTIVATION: tl.constexpr,
+    BLOCK_T: tl.constexpr,
     BLOCK_N: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
     PAD_SLOT: tl.constexpr,
 ):
-    """One (request x token, feature block) per program: a width-W causal conv
-    needs only the token's last W - 1 ancestors (or the initial window when
-    the path is shallower), so tree tokens run in parallel."""
-    idx_seq = tl.program_id(0) // seqlen
-    token = tl.program_id(0) % seqlen
+    """One (request, feature block) per program covers every tree token: a
+    width-W causal conv needs only each token's last W - 1 ancestors (or the
+    initial window when the path is shallower), so tokens run in parallel as
+    the rows of one [BLOCK_T, BLOCK_N] tile and the ancestor walk runs once
+    per request block instead of once per token."""
+    idx_seq = tl.program_id(0)
     feats = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
     mask = feats < dim
+    tokens = tl.arange(0, BLOCK_T)
+    token_mask = tokens < seqlen
 
     # Ahead of the PDL wait only weights and the step's parent and row tables, all written before the previous kernel.
     init_row = tl.load(conv_state_indices_ptr + idx_seq).to(tl.int64)
@@ -829,38 +833,36 @@ def _causal_conv1d_tree_update_kernel(
     parents = parent_indices_ptr + idx_seq * stride_parent_seq
 
     if HAS_BIAS:
-        acc = tl.load(bias_ptr + feats, mask=mask, other=0.0).to(tl.float32)
+        bias = tl.load(bias_ptr + feats, mask=mask, other=0.0).to(tl.float32)
     else:
-        acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
-    # Column c is the (W - 1 - c)-th ancestor, else the initial window's column.
+        bias = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_T, BLOCK_N), dtype=tl.float32) + bias[None, :]
     out_rows = output_state_indices_ptr + idx_seq * stride_out_rows_seq
-    out_row = tl.load(out_rows + token * stride_out_rows_step).to(tl.int64)
-    out_base = (
-        conv_state_ptr + out_row * stride_conv_state_seq + feats * stride_conv_state_dim
-    )
+    out_row = tl.load(
+        out_rows + tokens * stride_out_rows_step, mask=token_mask, other=-1
+    ).to(tl.int64)
+    # Column c is the (W - 1 - c)-th ancestor, else the initial window's column:
+    # walk all tokens' ancestor chains together, nearest column first.
     nodes, past_roots, weights = (), (), ()
+    node = tokens
+    past_root = tl.zeros((BLOCK_T,), dtype=tl.int32)
+    for d in tl.static_range(KERNEL_WIDTH):
+        if d > 0:
+            parent = tl.load(
+                parents + tl.maximum(node, 0) * stride_parent_step,
+                mask=token_mask & live,
+                other=-1,
+            )
+            past_root += (node < 0).to(tl.int32) + ((node >= 0) & (parent < 0)).to(
+                tl.int32
+            )
+            node = tl.where(node >= 0, parent, node)
+        nodes, past_roots = (node,) + nodes, (past_root,) + past_roots
     for c in tl.static_range(KERNEL_WIDTH):
-        # Ancestor distance for this column, and how far past the root it lands.
-        node = token
-        past_root = 0
-        for j in tl.static_range(KERNEL_WIDTH - 1):
-            if j + c < KERNEL_WIDTH - 1:
-                parent = tl.load(
-                    parents + tl.maximum(node, 0) * stride_parent_step,
-                    mask=live,
-                    other=-1,
-                )
-                past_root += (node < 0).to(tl.int32) + ((node >= 0) & (parent < 0)).to(
-                    tl.int32
-                )
-                node = tl.where(node >= 0, parent, node)
-        weight = tl.load(
-            w_ptr + feats * stride_w_dim + c * stride_w_width, mask=mask, other=0.0
-        )
-        nodes, past_roots, weights = (
-            nodes + (node,),
-            past_roots + (past_root,),
-            weights + (weight,),
+        weights = weights + (
+            tl.load(
+                w_ptr + feats * stride_w_dim + c * stride_w_width, mask=mask, other=0.0
+            ),
         )
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
@@ -875,35 +877,55 @@ def _causal_conv1d_tree_update_kernel(
         + feats * stride_conv_state_dim
     )
     x_row = x_ptr + idx_seq * stride_x_seq + feats * stride_x_dim
+    tile_mask = token_mask[:, None] & mask[None, :]
+    # The initial window once per feature block; tokens pick its columns below.
+    init_cols = ()
+    for j in tl.static_range(KERNEL_WIDTH - 1):
+        init_cols = init_cols + (
+            tl.load(init + j * stride_conv_state_tok, mask=mask, other=0.0),
+        )
     # Every load before any store, which the compiler cannot move loads past.
     values = ()
     for c in tl.static_range(KERNEL_WIDTH):
         node = nodes[c]
         from_x = tl.load(
-            x_row + tl.maximum(node, 0) * stride_x_token,
-            mask=mask & (node >= 0),
+            x_row[None, :] + tl.maximum(node, 0)[:, None] * stride_x_token,
+            mask=tile_mask & (node >= 0)[:, None],
             other=0.0,
         )
-        init_col = KERNEL_WIDTH - 1 - past_roots[c]
-        from_init = tl.load(
-            init + tl.maximum(init_col, 0) * stride_conv_state_tok,
-            mask=mask & (node < 0),
-            other=0.0,
-        )
-        values = values + (tl.where(node >= 0, from_x, from_init),)
-    for c in tl.static_range(KERNEL_WIDTH):
-        acc += values[c] * weights[c]
-        if c > 0:
-            if out_row >= 0:
-                tl.store(
-                    out_base + (c - 1) * stride_conv_state_tok, values[c], mask=mask
+        if c < KERNEL_WIDTH - 1:
+            # Only the newest W - 1 - c initial columns can reach column c.
+            init_col = KERNEL_WIDTH - 1 - past_roots[c]
+            for j in tl.static_range(c, KERNEL_WIDTH - 1):
+                from_x = tl.where(
+                    ((node < 0) & (init_col == j))[:, None],
+                    init_cols[j][None, :],
+                    from_x,
                 )
+        values = values + (from_x,)
+    out_base = (
+        conv_state_ptr
+        + out_row[:, None] * stride_conv_state_seq
+        + feats[None, :] * stride_conv_state_dim
+    )
+    out_mask = tile_mask & (out_row >= 0)[:, None]
+    for c in tl.static_range(KERNEL_WIDTH):
+        # The bf16 product, rounded once from its exact fp32 value.
+        product = values[c].to(tl.float32) * weights[c][None, :].to(tl.float32)
+        acc += product.to(values[c].dtype).to(tl.float32)
+        if c > 0:
+            tl.store(
+                out_base + (c - 1) * stride_conv_state_tok, values[c], mask=out_mask
+            )
     if SILU_ACTIVATION:
         acc = acc / (1 + tl.exp(-acc))
     tl.store(
-        o_ptr + idx_seq * stride_o_seq + token * stride_o_token + feats * stride_o_dim,
+        o_ptr
+        + idx_seq * stride_o_seq
+        + tokens[:, None] * stride_o_token
+        + feats[None, :] * stride_o_dim,
         acc,
-        mask=mask,
+        mask=tile_mask,
     )
 
 
@@ -922,8 +944,12 @@ def _causal_conv1d_tree_update(
     batch, dim, seqlen = x.shape
     width = weight.shape[1]
     out = torch.empty_like(x)
-    block_n = 256
-    _causal_conv1d_tree_update_kernel[(batch * seqlen, triton.cdiv(dim, block_n))](
+    # Every tree token of a request in one single-warp program with about 1K
+    # elements per tile (measured best on MI355X for 4-16 tokens); narrow the
+    # feature block for one or two requests so the grid still fills the GPU.
+    block_t = triton.next_power_of_2(seqlen)
+    block_n = min(64, max(16, 1024 // block_t)) if batch >= 4 else 16
+    _causal_conv1d_tree_update_kernel[(batch, triton.cdiv(dim, block_n))](
         x,
         weight,
         bias,
@@ -943,9 +969,11 @@ def _causal_conv1d_tree_update(
         HAS_BIAS=bias is not None,
         KERNEL_WIDTH=width,
         SILU_ACTIVATION=activation in ("silu", "swish"),
+        BLOCK_T=block_t,
         BLOCK_N=block_n,
         ENABLE_PDL=enable_pdl,
         PAD_SLOT=PAD_SLOT_ID,
+        num_warps=1,
         **({"launch_pdl": True} if enable_pdl else {}),
     )
     return out
