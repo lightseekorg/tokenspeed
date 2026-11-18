@@ -113,6 +113,11 @@ def _page_table(placed: list[list[int]]) -> torch.Tensor:
 
 def _plane(keys, virtual_blocks, placement, device):
     """This rank's FP8 index-K plane of every virtual slot's key."""
+    from tokenspeed_kernel.ops.kvcache.index_k_scale import (
+        encode_index_k_scale,
+        index_k_scale_ue8m0,
+        round_index_k_scale,
+    )
     from tokenspeed_kernel.ops.kvcache.triton import index_k_block_split_scatter
     from tokenspeed_kernel.ops.quantization import quantize_fp8
 
@@ -125,6 +130,12 @@ def _plane(keys, virtual_blocks, placement, device):
     values, scales = quantize_fp8(
         keys, granularity="token_group", group_size=128, scale_encoding="float32"
     )
+    if index_k_scale_ue8m0():
+        # A Blackwell plane's keys quantize with the power-of-two scale its
+        # UE8M0 word stores, as the index-K writes do.
+        scales = round_index_k_scale(scales)
+        values = (keys.float() / scales).clamp(-448, 448).to(values.dtype)
+        scales = encode_index_k_scale(scales)
     slots, owned = resolve_cache_slots(
         torch.arange(keys.shape[0], device=device), placement
     )
