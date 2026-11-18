@@ -626,6 +626,15 @@ class ServerArgs:
     # Optional L3 storage beneath the compact Host cache.
     kvstore_storage_backend: str | None = None
     kvstore_storage_backend_extra_config: str | None = None
+    # Peer prefix sharing (docs/rfcs/0004-peer-prefix-sharing.md): the port
+    # this replica's endpoint binds (attention-DP rank r binds port + r);
+    # None turns it off.
+    peer_prefix_port: int | None = None
+    # The host other replicas and the router reach this replica's endpoint at;
+    # its name is host:port. None takes this host's detected address.
+    peer_prefix_host: str | None = None
+    peer_prefix_answer_timeout_ms: int = 50
+    peer_prefix_min_fetch_tokens: int = 256
     # Retraction snapshot pool (pinned Host, per rank) and its slot-state
     # arena rows: a retracted request is suspended with its image and
     # resumed by restore; a victim whose image does not fit is aborted
@@ -2565,7 +2574,52 @@ class ServerArgs:
                 "--kvstore-storage-backend"
             )
 
+    def validate_peer_prefix_options(self):
+        """``--peer-prefix-port`` and its settings: what peer prefix sharing
+        runs with (``docs/rfcs/0004-peer-prefix-sharing.md``)."""
+        if self.peer_prefix_port is None:
+            return
+        unsupported = [
+            setting
+            for setting, refused in (
+                (
+                    "--disaggregation-mode decode",
+                    self.disaggregation_mode == "decode",
+                ),
+                ("--disable-kvstore (no Host L2)", not self.enable_kvstore),
+                ("--disable-prefix-caching", not self.enable_prefix_caching),
+                (
+                    "--kvstore-storage-backend",
+                    self.kvstore_storage_backend is not None,
+                ),
+                (
+                    "--pipeline-parallel-size > 1",
+                    self.pipeline_parallel_size > 1,
+                ),
+                (
+                    "--query-context-parallel-size > 1",
+                    self.query_context_parallel_size > 1,
+                ),
+            )
+            if refused
+        ]
+        if unsupported:
+            raise ValueError(
+                "--peer-prefix-port is not supported with " + ", ".join(unsupported)
+            )
+        last_port = self.peer_prefix_port + self.mapping.attn.dp_size - 1
+        if self.peer_prefix_port < 1 or last_port > 65535:
+            raise ValueError(
+                "--peer-prefix-port and one port per attention-DP rank after "
+                f"it must be valid ports; got {self.peer_prefix_port}"
+            )
+        if self.peer_prefix_answer_timeout_ms <= 0:
+            raise ValueError("--peer-prefix-answer-timeout-ms must be positive")
+        if self.peer_prefix_min_fetch_tokens <= 0:
+            raise ValueError("--peer-prefix-min-fetch-tokens must be positive")
+
     def validate_cache_options(self):
+        self.validate_peer_prefix_options()
         if self.kvstore_storage_backend is not None and self.pipeline_parallel_size > 1:
             raise ValueError(
                 "Asynchronous L3 currently requires --pipeline-parallel-size 1"
@@ -3536,6 +3590,45 @@ class ServerArgs:
             help="JSON object of extra L3 backend settings. For mooncake: "
             "master_server_address, local_hostname, metadata_server, "
             "global_segment_size, protocol, device_name, tenant_id.",
+        )
+        parser.add_argument(
+            "--peer-prefix-port",
+            type=int,
+            default=ServerArgs.peer_prefix_port,
+            help="Share prefix caches with other replicas: a request the router "
+            "sends with a peer holder reads the prefix that replica caches, in "
+            "its Device or Host cache, over RDMA, instead of computing it, and "
+            "this replica serves its own cache the same way. Its endpoint binds "
+            "this port (attention-DP rank r binds this port + r). Needs the Host "
+            "tier (--enable-kvstore) and prefix caching; refused with "
+            "--disaggregation-mode decode, --kvstore-storage-backend, "
+            "--pipeline-parallel-size > 1 and --query-context-parallel-size > 1. "
+            "Replicas share only with replicas of "
+            "the same model, cache layout, weights and parallel layout. RDMA "
+            "devices come from --disaggregation-ib-device. See "
+            "docs/rfcs/0004-peer-prefix-sharing.md.",
+        )
+        parser.add_argument(
+            "--peer-prefix-host",
+            type=str,
+            default=ServerArgs.peer_prefix_host,
+            help="The host other replicas and the router reach this replica's peer "
+            "endpoint at; the replica is named host:port, and a router's holder hint "
+            "must name it exactly so. Defaults to this host's detected address.",
+        )
+        parser.add_argument(
+            "--peer-prefix-answer-timeout-ms",
+            type=int,
+            default=ServerArgs.peer_prefix_answer_timeout_ms,
+            help="How long a request waits for the peer holder's answer to each "
+            "step (lookup, pin, release) before it computes the prefix itself.",
+        )
+        parser.add_argument(
+            "--peer-prefix-min-fetch-tokens",
+            type=int,
+            default=ServerArgs.peer_prefix_min_fetch_tokens,
+            help="The fewest tokens past the local prefix hit worth reading from "
+            "a peer holder; a shorter peer hit is computed instead.",
         )
         # Retraction snapshot pool
         parser.add_argument(

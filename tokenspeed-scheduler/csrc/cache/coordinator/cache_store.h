@@ -51,8 +51,11 @@
 namespace tokenspeed {
 
 // What a cache mutation reports to its observer (KV cache events): a key
-// stored in or removed from the Device index.
-enum class CacheMutation { kStored, kRemoved };
+// stored in or removed from the Device index (kStored, kRemoved), or a change
+// of a boundary's Host entries (kHostResidency, keyed by its content hash
+// alone). The boundary of a Host change may be one no Device publication ever
+// described: a Host block an L3 read brought in.
+enum class CacheMutation { kStored, kRemoved, kHostResidency };
 using CacheMutationSink = std::function<void(const CacheKey&, CacheMutation)>;
 
 // The first block (page offset) of a tail a group needs: 0 for a group that
@@ -264,9 +267,10 @@ public:
     // window; empty when the probe hit nothing or no group replays.
     std::vector<GroupDemand> ReplayedDemands(const PrefixProbe& prefix, std::span<const GroupDemand> demands) const;
 
-    // The observer of Device index stores and removals; empty for none.
+    // The observer of Device index stores and removals, and of the boundary
+    // tree's Host entry changes; empty for none.
     const CacheMutationSink& MutationSink() const { return mutation_sink_; }
-    void SetMutationSink(CacheMutationSink sink) { mutation_sink_ = std::move(sink); }
+    void SetMutationSink(CacheMutationSink sink);
 
     // Drops every group, and with them the index entries holding the trees'
     // nodes, while whoever their entries point at still exists.

@@ -97,6 +97,7 @@ def _config(args: ServerArgs, specs):
         overlap_schedule_depth=0,
         enable_kv_cache_events=False,
         prefix_replay_tokens=0,
+        peer_config=None,
     )
 
 

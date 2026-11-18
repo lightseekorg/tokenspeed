@@ -86,6 +86,23 @@ public:
     // prompt's last full page and prompt.tokens the whole prompt.
     PrefixProbe ProbeDecodeDevicePrefix(const PromptPrefix& prompt, std::int32_t prompt_end_tokens) const;
 
+    // The pages of a probe's hit, as CacheCoordinator::ExportPrefix would
+    // export them, without acquiring or refreshing anything: what a peer is
+    // told it may read (docs/rfcs/0004-peer-prefix-sharing.md).
+    struct ListedPage {
+        CacheKey key;
+        std::int32_t slot{0};
+        CacheTier tier{CacheTier::kDevice};
+        std::int32_t block_id{0};
+
+        bool operator==(const ListedPage&) const = default;
+    };
+    struct PrefixListing {
+        std::int32_t num_tokens{0};
+        std::vector<ListedPage> pages;
+    };
+    PrefixListing ListPrefix(const PrefixProbe& probe) const;
+
     // The probing steps the L3 storage queries build on (StorageQueries).
     PreparedPrefixKeys ResolvePreparedPrefixKeys(const PromptPrefix& prompt) const;
     // The Device's probe: the aligned phase, then the candidate phase.

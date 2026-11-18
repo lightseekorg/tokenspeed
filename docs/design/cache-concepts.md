@@ -1314,7 +1314,11 @@ Its responsibilities:
   Host-warm first-chunk extensions call `CacheFullBlocks` at admit (the
   layer-wise load makes the bytes available before any forward reads them);
   a load-back's `BlockTransfer.key` is therefore empty and `CompleteLoadBack`
-  only drops the op's pins. For L3, `StorageTransferManager::Complete`
+  only drops the op's pins. Peer PIN checks additionally exclude the Device
+  destinations still owned by an unacknowledged prefix load: remote reads do
+  not share the local layerwise fence. The replica-wide load ACK makes those
+  pages exportable without changing their local prefix visibility.
+  For L3, `StorageTransferManager::Complete`
   publishes successful rows through `CacheHostBlock` after all-owner native
   retirement, before admission can see them. There is no mixed Host/L3 hash
   to special-case.
@@ -1680,24 +1684,31 @@ Its responsibilities:
   (`AcquireHostSegments`, above) also considers checkpoint boundaries on both
   tiers: history needed by a Device checkpoint retains its ordinary eviction
   rank even when no Host checkpoint remains below it.
-* **Mutation reporting.** `SetCacheMutationSink` reports per-group cache
-  insertions/removals; the scheduler folds them into one externally visible
-  prefix event. Whether a scheduler-level boundary is fully, partially, or not
-  resident is the coordinator's answer (`DeviceBoundaryResidency`, read off
-  the group indexes), so the scheduler keeps no residency counters of its own
-  — only the token descriptor the event carries and whether that event is
-  currently out. A mutation only marks its boundary for reconcile;
-  `DrainKvEvents` publishes a boundary while all Full/history entries reside
-  on Device, using the existing closed-entry count; auxiliary State/SWA do not
-  gate local residency. `KvEventPrefixView` exposes only ancestor-complete
-  prefixes: it withdraws descendants when an ancestor leaves and republishes
+* **Mutation reporting.** `SetCacheMutationSink` (the sink `CacheStore`
+  holds) reports per-group Device insertions/removals, and the boundary tree
+  reports every change of a boundary's closed Host entries
+  (`CacheMutation::kHostResidency`); the scheduler folds them into one
+  externally visible prefix event per medium. Whether a scheduler-level
+  boundary is publishable on each medium is the coordinator's answer
+  (`GetBoundaryEventStatus`, read off the tree's per-tier closed-entry
+  counts), so the scheduler keeps no
+  residency counters of its own — only the token descriptor the event carries
+  and whether that event is currently out on each medium. A mutation only
+  marks its boundary for reconcile; `DrainKvEvents` publishes a boundary on a
+  medium while all Full/history entries reside there; auxiliary State/SWA do
+  not gate local residency. `KvEventPrefixView` exposes only ancestor-complete
+  prefixes: a Device boundary is out once its parent is out on the Device, a
+  Host boundary once its parent is out on either medium (write-back splits a
+  prefix across the tiers, and a router continues a Device match into the
+  Host). It withdraws descendants when an ancestor leaves and republishes
   resident descendants when it returns. This changes routing visibility, not
   physical eviction. Actual prefix admission still checks all required groups.
   KV events require a Full/history group: State-only, SWA-only and State + SWA
   layouts must disable events. No structural ancestors are synthesized.
-  Descriptors survive while any Device entry remains, including auxiliary
-  entries excluded from routing. Host eviction retains all-group residency
-  checks. Nothing is decided
+  Descriptors survive while any Device entry, Host entry or pending Host store
+  remains, including auxiliary entries excluded from routing; a Host block
+  for a boundary with no descriptor (an L3 read) publishes nothing. Host
+  eviction retains all-group residency checks. Nothing is decided
   mid-`Admit`, so one admission may evict a boundary's last cached copy and
   then store the request's own copy without any ordering hazard.
   The scheduler and routing view share immutable boundary descriptors. A drain
