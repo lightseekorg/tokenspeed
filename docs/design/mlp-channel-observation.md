@@ -1,9 +1,14 @@
-# MLP channel profiling and selective observation
+# MLP channel profiling and selective observation on dense Qwen3
 
 `ChannelActivityProfiler` measures MLP activations over a calibration workload
 in eager TokenSpeed inference. Use `ChannelWatch` on a second workload to
 identify which token positions exceed a recorded channel limit. The watcher
 retains the activation, layer, channel, and physical row for each event.
+
+```python
+from tokenspeed.runtime.inspection.qwen3_dense.channel_profile import ChannelActivityProfiler
+from tokenspeed.runtime.inspection.qwen3_dense.channel_watch import ChannelWatch, RowIdentity
+```
 
 ## Measurement and ownership
 
@@ -23,9 +28,7 @@ with a linear weight matrix. Channel `i` contributes its activation times
 column `i` of that matrix. For example, TokenSpeed's [dense Llama](../../python/tokenspeed/runtime/models/llama.py)
 and [dense Qwen3](../../python/tokenspeed/runtime/models/qwen3.py) use the same
 `GatedMLP` for this operation. The profiler and watcher currently accept only
-dense Qwen3. Enabling another model requires checking where its forward exposes
-the activation and verifying that observation preserves its full logits. A new
-checkpoint also needs its own calibration profile.
+dense Qwen3. Each checkpoint needs its own calibration profile.
 
 The caller supplies the workload and a nonempty model identity. The watcher
 requires the same identity string as the profile. Keep the model fixed while
@@ -131,3 +134,27 @@ using a representative calibration workload, then inspect the event counts
 on held-out inputs. For each input the example compares the complete logits
 with and without the watcher and fails the report if they differ or contain
 nonfinite values.
+
+## Adding a model family
+
+1. Add a sibling package under `tokenspeed.runtime.inspection` for the model
+   variant you have verified. For example, a future dense Llama profiler would
+   live in `inspection.llama_dense.channel_profile`. Tools import it explicitly.
+   The engine's model registry and forward path need no inspection imports.
+2. Identify the layer, activation consumed by its down projection, and mapping
+   from physical rows to request and token positions. The dense score above
+   uses one projection per layer. For a routed expert, identify the expert and
+   routed row, map it back to the source token, and account for the routing
+   weight when measuring its contribution to the combined MLP output.
+3. Verify the operation you expose. For profiling or watching, compare complete
+   logits from the same forward inputs with recording off and on, and check
+   recorded values and row identities against the native activations. For
+   final-MLP replay, reproduce the original logits first, then compare zeroing
+   a channel in replay with zeroing it in a separate full-model forward.
+   Document the operations, dtypes, and execution modes covered by those tests.
+
+`inspection.channel_profile_report` builds reports and selects watchlists from
+host-side aggregates using the Python standard library. Another adapter can
+reuse it when its channel identifiers and measurements have the same meaning.
+The earlier `inspection.channel_profile`, `inspection.channel_watch`, and
+`inspection.final_mlp` modules re-export the dense Qwen3 types for existing callers.

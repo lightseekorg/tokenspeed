@@ -36,7 +36,7 @@ from tokenspeed_kernel.numerics.torch.layernorm import torch_rmsnorm
 from tokenspeed.runtime.configs.qwen3_config import Qwen3Config
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.inspection.final_mlp import FinalMLPObserver
+from tokenspeed.runtime.inspection.qwen3_dense.final_mlp import FinalMLPObserver
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata
 from tokenspeed.runtime.layers.mlp import GatedMLPFusion
 from tokenspeed.runtime.models.qwen3 import Qwen3ForCausalLM

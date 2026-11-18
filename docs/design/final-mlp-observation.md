@@ -1,4 +1,4 @@
-# Final-MLP observation and replay
+# Final-MLP observation and replay on dense Qwen3
 
 `FinalMLPObserver` records the tensors between the final MLP and the selected
 logits during an eager TokenSpeed forward. When investigating a logit
@@ -13,9 +13,9 @@ The replay method can be applied to other models by recording the inputs to
 their final down projection and executing their own residual addition, final
 normalization, output head, and logit-row selection. Dense Llama, for example,
 uses the same gated MLP and inherits the same final norm and logits path as
-dense Qwen3 in TokenSpeed. A model adapter must still reproduce the original
-logits and match a separate full-model intervention on that model. The current
-adapter implements this for dense Qwen3; checkpoint validation used Qwen3-0.6B.
+dense Qwen3 in TokenSpeed. Checkpoint validation of this adapter used Qwen3-0.6B.
+See [Adding a model family](mlp-channel-observation.md#adding-a-model-family)
+for how to place another adapter and verify its replay against a full forward.
 
 The initial adapter accepts the ordinary dense `Qwen3ForCausalLM`, unquantized
 BF16 or FP32 tensors, one device (TP=PP=DP=1), and eager execution. Fused
@@ -72,7 +72,7 @@ forward context. The example wraps that existing forward; it does not build a
 second inference path.
 
 ```python
-from tokenspeed.runtime.inspection.final_mlp import FinalMLPObserver
+from tokenspeed.runtime.inspection.qwen3_dense.final_mlp import FinalMLPObserver
 
 with FinalMLPObserver(
     model,

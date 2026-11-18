@@ -248,11 +248,13 @@ def _run_profile(
 ) -> dict:
     import torch
 
-    from tokenspeed.runtime.inspection.channel_profile import ChannelActivityProfiler
     from tokenspeed.runtime.inspection.channel_profile_report import (
         rank_profile_candidates,
         select_watchlist,
         validate_watchlist_thresholds,
+    )
+    from tokenspeed.runtime.inspection.qwen3_dense.channel_profile import (
+        ChannelActivityProfiler,
     )
 
     with ChannelActivityProfiler(
@@ -387,7 +389,10 @@ def _run_watch(
     cases: Sequence[InputCase],
     common: dict,
 ) -> dict:
-    from tokenspeed.runtime.inspection.channel_watch import ChannelWatch, RowIdentity
+    from tokenspeed.runtime.inspection.qwen3_dense.channel_watch import (
+        ChannelWatch,
+        RowIdentity,
+    )
 
     watchlist_bytes = args.watchlist.read_bytes()
     watchlist = json.loads(watchlist_bytes)

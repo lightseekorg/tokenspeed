@@ -26,7 +26,10 @@ import torch.nn.functional as F
 
 from tokenspeed.runtime.configs.qwen3_config import Qwen3Config
 from tokenspeed.runtime.distributed.mapping import Mapping
-from tokenspeed.runtime.inspection.channel_watch import ChannelWatch, RowIdentity
+from tokenspeed.runtime.inspection.qwen3_dense.channel_watch import (
+    ChannelWatch,
+    RowIdentity,
+)
 from tokenspeed.runtime.models.qwen3 import Qwen3ForCausalLM
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
@@ -341,3 +344,23 @@ def test_row_shape_and_repeated_forward_are_rejected(monkeypatch):
             with watch.record([RowIdentity("one", 0)]):
                 layer.mlp(torch.ones(1, 64))
                 layer.mlp(torch.ones(1, 64))
+
+
+def test_existing_row_identity_keeps_request_attribution(monkeypatch):
+    from tokenspeed.runtime.inspection import channel_watch as legacy_watch
+
+    model = _model(monkeypatch)
+    row = legacy_watch.RowIdentity(request_id="request-a", token_position=17)
+    entry = {"layer": 1, "channel": 1, "contribution_limit": 1e-12}
+    with _watch(model, [entry]) as watch:
+        with watch.record([row]):
+            model.model.layers[1].mlp(torch.ones(1, 64))
+        snapshot = watch.snapshot()
+        (event,) = watch.events(snapshot)
+
+    assert isinstance(snapshot, legacy_watch.ChannelWatchSnapshot)
+    assert (event.request_id, event.token_position, event.physical_row) == (
+        "request-a",
+        17,
+        0,
+    )

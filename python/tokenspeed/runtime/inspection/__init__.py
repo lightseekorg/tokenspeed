@@ -18,4 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Opt-in developer tools for inspecting inference computations."""
+"""Opt-in inference inspection.
+
+Model-specific hooks live in the corresponding model package, such as
+``qwen3_dense``. Channel profile reporting operates on host data.
+"""

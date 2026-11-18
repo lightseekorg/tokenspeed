@@ -45,7 +45,7 @@ from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.model_runner import ModelRunner
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
-from tokenspeed.runtime.inspection.final_mlp import (
+from tokenspeed.runtime.inspection.qwen3_dense.final_mlp import (
     FinalMLPObservation,
     FinalMLPObserver,
     FinalMLPReplay,

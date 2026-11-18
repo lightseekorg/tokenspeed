@@ -31,7 +31,9 @@ import torch.nn.functional as F
 
 from tokenspeed.runtime.configs.qwen3_config import Qwen3Config
 from tokenspeed.runtime.distributed.mapping import Mapping
-from tokenspeed.runtime.inspection.channel_profile import ChannelActivityProfiler
+from tokenspeed.runtime.inspection.qwen3_dense.channel_profile import (
+    ChannelActivityProfiler,
+)
 from tokenspeed.runtime.layers.mlp import GatedMLPFusion
 from tokenspeed.runtime.models.qwen3 import Qwen3ForCausalLM
 from tokenspeed.runtime.utils.env import global_server_args_dict
