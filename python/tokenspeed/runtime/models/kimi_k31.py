@@ -819,11 +819,11 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
         A decode round of the decode chain (keys and head weights projected
         with the a-projection) qualifies where the front was selected, the
         layer computes its own top-k, the stacked [q_b; wq_b] weight exists,
-        the round's index-K write quantizes its query, its KV is not placed
-        across ranks, the front addresses the rows, there are at most
-        ``_DECODE_FRONT_MAX_ROWS`` of them, and no breakable capture records
-        the round (its eager break would replay the capture-time choice over
-        padded rows).
+        the round's index-K write quantizes its query, the front addresses
+        the rows, there are at most ``_DECODE_FRONT_MAX_ROWS`` of them, and no
+        breakable capture records the round (its eager break would replay the
+        capture-time choice over padded rows). A KVP placement's rows are
+        written by their owner (``_index_slot_owner``).
         """
         if (
             ctx.num_extends != 0
@@ -835,11 +835,6 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
             or index_key_weights is None
             or is_breakable_capture_active()
         ):
-            return False
-        backend = ctx.attn_backend
-        if isinstance(backend, HybridLinearAttnBackend):
-            backend = backend.full_attn_backend
-        if backend.cache_placement(self.attn_mqa) is not None:
             return False
         key, weights = index_key_weights.split(
             (self.indexer.index_head_dim, self.indexer.index_n_heads), dim=-1
@@ -892,6 +887,7 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
             key_norm_eps=indexer.k_norm.variance_epsilon,
             index_k_cache=pool.get_index_k_buffer(self.attn_mqa.layer_id),
             slots=ctx.attn_backend.write_locations(self.attn_mqa, ForwardMode.DECODE),
+            slot_owner=self._index_slot_owner(ctx),
             page_size=pool.index_k_page_size,
             softmax_scale=indexer.weights_softmax_scale,
         )
@@ -910,6 +906,24 @@ class KimiK31SparseMLAAttention(GlmDsaSparseAttentionMixin, KimiLinearMLAAttenti
         weights are not absorbed k-major.
         """
         return self.w_vc if self.absorbed_weights_k_major else None
+
+    def _index_slot_owner(
+        self, ctx: ForwardContext
+    ) -> tuple[int, int, int, int] | None:
+        """The front's ``slot_owner``: this rank's KVP placement of the
+        round's virtual slots, or None where the cache is not placed."""
+        backend = ctx.attn_backend
+        if isinstance(backend, HybridLinearAttnBackend):
+            backend = backend.full_attn_backend
+        placement = backend.cache_placement(self.attn_mqa)
+        if placement is None:
+            return None
+        return (
+            placement.block_granularity,
+            placement.virtual_block_count,
+            len(placement.group),
+            placement.rank,
+        )
 
     def project_latent_values(
         self,

@@ -638,6 +638,7 @@ if _decode_front is not None:
         key_norm_eps: float,
         index_k_cache: torch.Tensor,
         slots: torch.Tensor,
+        slot_owner: tuple[int, int, int, int] | None,
         page_size: int,
         softmax_scale: float,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -672,7 +673,11 @@ if _decode_front is not None:
             key_norm_eps: The index-key LayerNorm epsilon.
             index_k_cache: Contiguous packed uint8 ``fp8_scaled`` plane
                 ``[slots, 132]`` of whole pages, 16-byte aligned.
-            slots: Contiguous int64 or int32 ``[rows]`` non-negative plane slots.
+            slots: Contiguous int64 or int32 ``[rows]`` non-negative plane slots,
+                or virtual slots under ``slot_owner``.
+            slot_owner: None, or ``virtual_slots_to_local``'s ``(rows_per_page,
+                virtual_block_count, degree, rank)`` of a KVP placement: only
+                this rank's rows are written, at their local plane slots.
             page_size: Slots per plane page (64).
             softmax_scale: Score scale folded into the head weights.
 
@@ -748,6 +753,22 @@ if _decode_front is not None:
             or slots.stride(0) != 1
         ):
             raise ValueError(f"slots must be contiguous int64 or int32 [{rows}]")
+        # One owner writes every row at its slot.
+        rows_per_page, virtual_blocks, degree, rank = _FUSED_PAGE, 1, 1, 0
+        if slot_owner is not None:
+            rows_per_page, virtual_blocks, degree, rank = (int(v) for v in slot_owner)
+            if (
+                rows_per_page <= 0
+                or rows_per_page % _FUSED_PAGE
+                or virtual_blocks <= 0
+                or not 0 <= rank < degree
+                or rows_per_page * virtual_blocks >= 2**31
+            ):
+                raise ValueError(
+                    "slot_owner must be (rows_per_page, virtual_block_count, "
+                    f"degree, rank) of whole {_FUSED_PAGE}-slot pages, got "
+                    f"{slot_owner}"
+                )
         q_norm = torch.empty((rows, _FRONT_Q_LORA), dtype=torch.bfloat16, device=device)
         projected = torch.empty((rows, width), dtype=torch.bfloat16, device=device)
         q_fp8 = torch.empty(
@@ -784,6 +805,10 @@ if _decode_front is not None:
             _FRONT_FP8_MAX,
             _FRONT_AMAX_FLOOR,
             float(softmax_scale),
+            rows_per_page,
+            virtual_blocks,
+            degree,
+            rank,
         )
         return q_norm, projected, q_fp8, weights
 
