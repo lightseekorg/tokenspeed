@@ -511,6 +511,17 @@ class ModelExecutorConfig:
         """Drafts go through the draft-tree path: topk > 1, or EAGLE-Harness chains."""
         return self.spec_topk > 1 or self.eagle_harness is not None
 
+    @property
+    def input_token_capacity(self) -> int:
+        """Input rows for live forwards and the configured prefill graph padding."""
+        max_bs = self.max_num_seqs // max(self.data_parallel_size, 1)
+        graph_tokens = (
+            self.prefill_graph_max_tokens
+            if not self.disable_prefill_graph and not self.enforce_eager
+            else 0
+        )
+        return max(self.chunked_prefill_size, max_bs * self.output_length, graph_tokens)
+
     @staticmethod
     def from_server_args(
         server_args: ServerArgs,
@@ -662,9 +673,7 @@ class ModelExecutor:
         with self.memory_saver_adapter.named_region("executor_inputs"):
             self.input_buffers = InputBuffers(
                 max_bs=max_bs,
-                max_num_tokens=max(
-                    config.chunked_prefill_size, max_bs * config.output_length
-                ),
+                max_num_tokens=config.input_token_capacity,
                 state_write_padding_pool_index=config.max_req_pool_size,
                 device=self.device,
                 reads_state_checkpoints=config.state_checkpoint_in_forward,
@@ -1214,7 +1223,9 @@ class ModelExecutor:
             )
             if self.config.chunked_prefill_size > 0:
                 num_tokens = min(num_tokens, int(self.config.chunked_prefill_size))
-        set_autotune_max_num_tokens(num_tokens)
+        # Capture can pad above the scheduler's live prefill budget. Keep the
+        # tactic mapper wide enough for those rows even when discovery is smaller.
+        set_autotune_max_num_tokens(num_tokens if decode_only else ib.max_num_tokens)
         cpu_group = None
         if self.config.world_size > 1:
             cpu_group = pg_manager.get_process_group("gloo", self.config.world_group)

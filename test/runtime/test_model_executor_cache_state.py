@@ -346,11 +346,17 @@ def test_non_spec_decode_routes_through_verify():
 
 
 @pytest.mark.parametrize(
-    ("prefill_tokens", "dp_size", "width", "capacity"),
-    [(64, 1, 1, 160), (64, 1, 4, 640), (64, 4, 4, 160), (8192, 1, 4, 8192)],
+    ("prefill_tokens", "dp_size", "width", "graph_tokens", "capacity"),
+    [
+        (64, 1, 1, 0, 160),
+        (64, 1, 4, 0, 640),
+        (64, 4, 4, 0, 160),
+        (8192, 1, 4, 0, 8192),
+        (2048, 1, 4, 2080, 2080),
+    ],
 )
 def test_input_allocation_covers_decode(
-    monkeypatch, prefill_tokens, dp_size, width, capacity
+    monkeypatch, prefill_tokens, dp_size, width, graph_tokens, capacity
 ):
     import tokenspeed.runtime.execution.model_executor as module
 
@@ -374,10 +380,10 @@ def test_input_allocation_covers_decode(
     )
     # Check the real constructor's allocation arguments without model/GPU setup.
     monkeypatch.setattr(module, "InputBuffers", check_allocation)
-    config = SimpleNamespace(
+    config = module.ModelExecutorConfig(
         device="cpu",
         max_num_seqs=160,
-        enable_memory_saver=False,
+        enable_dp_local_cuda_graph=False,
         data_parallel_size=dp_size,
         chunked_prefill_size=prefill_tokens,
         output_length=width,
@@ -385,6 +391,29 @@ def test_input_allocation_covers_decode(
         spec_algo="EAGLE" if width > 1 else None,
         spec_num_tokens=width,
         state_checkpoint_in_forward=False,
+        enforce_eager=False,
+        prefix_granularity=128,
+        vocab_size=32,
+        input_vocab_size=32,
+        context_len=4096,
+        physical_context_len=4096,
+        gpu_id=0,
+        global_rank=0,
+        cudagraph_capture_sizes=[1, 8, 32, 128],
+        disable_cuda_graph_padding=False,
+        spec_topk=1,
+        max_cudagraph_capture_size=128,
+        model_is_mrope=False,
+        autotune_cache_key=None,
+        prefill_only=False,
+        decode_only_attention=False,
+        prefill_graph_capture_batch_sizes=None,
+        input_logprob_chunk_tokens=1024,
+        enable_speculative_sampling=False,
+        query_shard_size=1,
+        query_shard_rank=0,
+        enable_memory_saver=False,
+        prefill_graph_max_tokens=graph_tokens,
     )
     with pytest.raises(AllocationChecked):
         ModelExecutor(

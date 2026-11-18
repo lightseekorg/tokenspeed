@@ -4818,7 +4818,8 @@ class ServerArgs:
             default=ServerArgs.prefill_graph_max_tokens,
             help="Largest token bucket captured by the breakable prefill CUDA "
             "graph. Default (unset) = min(8192, chunked-prefill size); "
-            "0 disables.",
+            "0 disables. An explicit larger value reserves graph padding above "
+            "the scheduler's live-token budget, including dummy request slots.",
         )
         prefill_token_sizes = parser.add_mutually_exclusive_group()
         prefill_token_sizes.add_argument(

@@ -147,13 +147,11 @@ def get_prefill_token_buckets(config: ModelExecutorConfig) -> list[int]:
     Forwards above the largest bucket run eager.
 
     Returns an empty list (graph disabled) when ``disable_prefill_graph`` is set or
-    ``prefill_graph_max_tokens <= 0``. The largest bucket is clamped to the
-    chunked-prefill size: the scheduler's per-forward token budget
-    (``max_scheduled_tokens`` = chunked-prefill size) covers extends AND any fused
-    decode rows -- with mixed batching, decodes are scheduled first and each
-    decrements the budget, and the prefill chunk is sized to what remains
-    (scheduler ``newForwardOperation``/``push_op``) -- so no forward, mixed or
-    pure, ever exceeds the chunk. No headroom above it is needed.
+    ``prefill_graph_max_tokens <= 0``. The default ceiling is resolved against
+    the chunked-prefill size before this function is called. An explicit ceiling
+    may exceed that live-token budget to leave room for dummy native scan slots
+    when a full chunk rounds up to a captured request capacity. Input storage
+    covers the resolved ceiling while the scheduler counts only live tokens.
 
     The default ladder bounds RELATIVE padding waste: a forward pads its graphed
     compute to the next bucket, so what matters is the gap as a fraction of the
@@ -176,8 +174,7 @@ def get_prefill_token_buckets(config: ModelExecutorConfig) -> list[int]:
 
     Args:
         config: The model-executor config carrying ``disable_prefill_graph``,
-            ``prefill_graph_max_tokens``, ``prefill_graph_capture_sizes`` and
-            ``chunked_prefill_size``.
+            ``prefill_graph_max_tokens`` and ``prefill_graph_capture_sizes``.
 
     Returns:
         Sorted ascending list of token-bucket sizes (possibly empty).
@@ -185,9 +182,6 @@ def get_prefill_token_buckets(config: ModelExecutorConfig) -> list[int]:
     max_tokens = int(config.prefill_graph_max_tokens or 0)
     if config.disable_prefill_graph or max_tokens <= 0:
         return []
-    chunk = int(config.chunked_prefill_size or 0)
-    if chunk > 0:
-        max_tokens = min(max_tokens, chunk)
     explicit = config.prefill_graph_capture_sizes
     if explicit:
         buckets = {int(b) for b in explicit if 0 < int(b) <= max_tokens}
