@@ -767,8 +767,31 @@ class K3MoeTailComm:
         return all_reduce(shared_partial, self.mapping.moe.tp_ep_group)
 
 
+def draft_all_reduce(hidden_states: torch.Tensor, tp_group) -> torch.Tensor:
+    """Sum a draft layer's row-parallel ``[rows, hidden]`` output across
+    ``tp_group``.
+
+    Rows within the target's Lamport windows reduce through its prepared
+    Iris state, which target and draft share in stream order; other widths,
+    groups without a K3 target, and the deterministic-collective modes take
+    the ordinary all-reduce.
+    """
+    state = K3AttnComm.iris_states.get(tp_group)
+    if (
+        state is not None
+        and hidden_states.shape[0] > 0
+        and not global_server_args_dict.get("force_deterministic_rsag", False)
+        and not global_server_args_dict.get("batch_invariant_collectives", False)
+    ):
+        reduced = state.reduce_attention(hidden_states)
+        if reduced is not None:
+            return reduced
+    return all_reduce(hidden_states, tp_group)
+
+
 __all__ = [
     "K3_SHARED_RS_MAX_TOKENS",
     "K3AttnComm",
     "K3MoeTailComm",
+    "draft_all_reduce",
 ]

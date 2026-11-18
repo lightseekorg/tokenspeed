@@ -116,7 +116,7 @@ def _set_key_scale(cache: torch.Tensor, slot: int, value: float) -> None:
 
 
 @pytest.mark.parametrize("heads", [32, 64])
-@pytest.mark.parametrize("group", [1, 4])
+@pytest.mark.parametrize("group", [1, 4, 8])
 def test_gluon_owned_page_scorer_is_default_and_matches_reference(heads, group, device):
     table, requests, lens, q, q_scales, weights, cache, keys = _inputs(
         heads, group, device
@@ -340,7 +340,7 @@ def test_gluon_owned_page_scorer_compiles_once_across_batches(device):
             score(requests, 4, 4, 4100)
 
 
-@pytest.mark.parametrize("group", [4, 5])
+@pytest.mark.parametrize("group", [4, 5, 7])
 def test_gluon_owned_page_decode_runs_over_the_batch_score_alike(
     group, device, monkeypatch
 ):
