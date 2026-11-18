@@ -1099,16 +1099,9 @@ class ForwardStepRunner:
                     bs=bs,
                     variant=CUDA_GRAPH_VARIANT_DEFAULT,
                 )
-                if self.capturable_grammar is not None:
-                    self.capturable_grammar.add_batch(
-                        grammars=[None] * bs,
-                        bs=bs,
-                        has_candidates=False,
-                        output_layout=ctx.output_layout,
-                    )
                 self.input_buffers.seq_lens_buf[:bs].fill_(self.max_tokens_per_req)
                 self._init_capture_metadata(bs)
-                self._forward_func(bs=bs, ctx=ctx, sampling_info=sampling_info)
+                self._capture_forward(bs, ctx, sampling_info)
                 self.device_module.synchronize()
                 dist.barrier()
 

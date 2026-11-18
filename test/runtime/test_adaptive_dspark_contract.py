@@ -192,9 +192,6 @@ class _NarrowingDrafter(BaseDrafter):
         super().__init__(spec_num_tokens=spec_num_tokens)
         self.query_tokens = query_tokens
 
-    def decode_graph_query_capacities(self, bs: int) -> tuple[int, ...]:
-        return (self.query_tokens, bs * self.spec_num_tokens)
-
     @contextmanager
     def target_forward_context(self, ctx: ForwardContext):
         # Packed verification keeps the narrowed extent for the rest of its
