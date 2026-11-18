@@ -266,7 +266,7 @@ def test_up_activation_reuse_across_token_tiles(
 ):
     _reset_caches(monkeypatch)
     # Limit residency to one worker so its activation slot is overwritten for
-    # five token tiles, including a tail, within each launch.
+    # several token tiles, including a tail, within each launch.
     monkeypatch.setattr(
         cute_fused,
         "_capacity",
@@ -844,7 +844,8 @@ def test_dynamic_rows_reuse_round_bucket_and_workspace(dtype, enable_pdl, monkey
     with torch.cuda.stream(stream):
         mix(first, 0.25, True)
     stream.synchronize()
-    kernel = next(iter(cute_fused._PLANS.values()))[0]
+    # The last plan serves the call; the first is the single-worker capacity probe.
+    kernel = list(cute_fused._PLANS.values())[-1][0]
     span = kernel.n * kernel.workers
     values = [inputs(rows, dtype, True) for rows in (span + 1, span + 7, 2 * span - 1)]
     # A new scheduling-round bucket still needs warmup before capture.
@@ -881,7 +882,7 @@ def test_dynamic_rows_reuse_round_bucket_and_workspace(dtype, enable_pdl, monkey
     assert set(cute_fused._WORKSPACES) == workspace_keys
 
 
-@pytest.mark.parametrize("rows", [3, 17, 31, 33, 63, 193, 385, 513, 1023])
+@pytest.mark.parametrize("rows", [3, 17, 31, 33, 63, 65, 127, 193, 385, 513, 1023])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_dynamic_tail_preserves_output_guards(rows, dtype):
     values = inputs(rows, dtype, True)
