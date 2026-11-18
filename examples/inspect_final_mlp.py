@@ -48,6 +48,7 @@ from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.inspection.final_mlp import (
     FinalMLPObservation,
     FinalMLPObserver,
+    FinalMLPReplay,
 )
 from tokenspeed.runtime.layers.attention.backends.paged.router import CacheGroupRouter
 from tokenspeed.runtime.layers.attention.registry import create_attn_components
@@ -256,11 +257,23 @@ def trace_tensors(trace: FinalMLPObservation) -> dict[str, torch.Tensor]:
     }
 
 
+@dataclasses.dataclass(frozen=True)
+class ObservedRun:
+    """Captured forward, suffix replay, and snapshot-lifetime checks."""
+
+    baseline: torch.Tensor
+    observed: torch.Tensor
+    trace: FinalMLPObservation
+    replay: FinalMLPReplay
+    snapshot_unchanged: bool
+    second_record_changed: bool
+
+
 @torch.no_grad()
-def evaluate(
-    runtime: ColdPrefill, prompt: str, channels: tuple[int, ...], output: Path
-) -> dict:
-    ids = runtime.encode(prompt)
+def observe_and_replay(
+    runtime: ColdPrefill, ids: torch.Tensor, channels: tuple[int, ...]
+) -> ObservedRun:
+    """Measure the baseline and one observed forward at the same physical shape."""
     rows = ids.numel()
     for _ in range(2):
         runtime.forward(ids)
@@ -291,6 +304,21 @@ def evaluate(
             for name, value in trace_tensors(trace).items()
         )
         workspace_changed = not torch.equal(second.gate_up, trace.gate_up)
+    return ObservedRun(
+        baseline=baseline,
+        observed=observed,
+        trace=trace,
+        replay=replay,
+        snapshot_unchanged=independent,
+        second_record_changed=workspace_changed,
+    )
+
+
+@torch.no_grad()
+def full_model_intervention(
+    runtime: ColdPrefill, ids: torch.Tensor, channels: tuple[int, ...]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Check replay against an independent native hook, then remove that hook."""
 
     def ablate(module, inputs, activation):
         changed = activation.clone()
@@ -305,28 +333,43 @@ def evaluate(
     finally:
         handle.remove()
     restored = runtime.forward(ids)
-    checks = {
-        "observer_on_vs_off": compare(observed, baseline),
-        "recorded_logits_vs_off": compare(trace.selected_logits, baseline),
-        "saved_output_suffix_vs_off": compare(replay.suffix_logits, baseline),
+    return full_intervention, restored
+
+
+def comparison_checks(
+    run: ObservedRun, full_intervention: torch.Tensor, restored: torch.Tensor
+) -> dict:
+    return {
+        "observer_on_vs_off": compare(run.observed, run.baseline),
+        "recorded_logits_vs_off": compare(run.trace.selected_logits, run.baseline),
+        "saved_output_suffix_vs_off": compare(run.replay.suffix_logits, run.baseline),
         "recomputed_down_vs_recorded": compare(
-            replay.recomputed_mlp_output, trace.mlp_output
+            run.replay.recomputed_mlp_output, run.trace.mlp_output
         ),
-        "recomputed_suffix_vs_off": compare(replay.recomputed_logits, baseline),
+        "recomputed_suffix_vs_off": compare(run.replay.recomputed_logits, run.baseline),
         "suffix_vs_full_model_ablation": compare(
-            replay.intervened_logits, full_intervention
+            run.replay.intervened_logits, full_intervention
         ),
-        "restored_vs_off": compare(restored, baseline),
+        "restored_vs_off": compare(restored, run.baseline),
     }
+
+
+def save_evaluation_artifact(
+    output: Path,
+    ids: torch.Tensor,
+    run: ObservedRun,
+    full_intervention: torch.Tensor,
+    restored: torch.Tensor,
+) -> None:
     tensors = {
-        **trace_tensors(trace),
+        **trace_tensors(run.trace),
         "input_ids": ids,
-        "positions": torch.arange(rows, device=ids.device, dtype=torch.int64),
-        "baseline_logits": baseline,
-        "observed_logits": observed,
-        "saved_output_suffix_logits": replay.suffix_logits,
-        "recomputed_suffix_logits": replay.recomputed_logits,
-        "intervened_suffix_logits": replay.intervened_logits,
+        "positions": torch.arange(ids.numel(), device=ids.device, dtype=torch.int64),
+        "baseline_logits": run.baseline,
+        "observed_logits": run.observed,
+        "saved_output_suffix_logits": run.replay.suffix_logits,
+        "recomputed_suffix_logits": run.replay.recomputed_logits,
+        "intervened_suffix_logits": run.replay.intervened_logits,
         "full_model_intervened_logits": full_intervention,
         "restored_logits": restored,
     }
@@ -334,24 +377,49 @@ def evaluate(
         {name: value.detach().cpu().contiguous() for name, value in tensors.items()},
         str(output),
     )
+
+
+def evaluation_report(
+    prompt: str,
+    ids: torch.Tensor,
+    channels: tuple[int, ...],
+    output: Path,
+    run: ObservedRun,
+    full_intervention: torch.Tensor,
+    checks: dict,
+) -> dict:
     return {
         "prompt": prompt,
         "token_ids": ids.tolist(),
-        "physical_rows": rows,
-        "selected_rows": trace.logit_rows.tolist(),
-        "layer_id": trace.layer_id,
+        "physical_rows": ids.numel(),
+        "selected_rows": run.trace.logit_rows.tolist(),
+        "layer_id": run.trace.layer_id,
         "ablated_channels": list(channels),
         "checks": checks,
-        "snapshot_unchanged_after_reuse": independent,
-        "second_record_changed": workspace_changed,
-        "intervention_effect": compare(full_intervention, baseline),
-        "baseline_next_token": int(baseline.argmax(-1)[0]),
+        "snapshot_unchanged_after_reuse": run.snapshot_unchanged,
+        "second_record_changed": run.second_record_changed,
+        "intervention_effect": compare(full_intervention, run.baseline),
+        "baseline_next_token": int(run.baseline.argmax(-1)[0]),
         "intervened_next_token": int(full_intervention.argmax(-1)[0]),
         "artifact": output.name,
-        "passed": independent
-        and workspace_changed
+        "passed": run.snapshot_unchanged
+        and run.second_record_changed
         and all(item["exact_equal"] and item["finite"] for item in checks.values()),
     }
+
+
+@torch.no_grad()
+def evaluate(
+    runtime: ColdPrefill, prompt: str, channels: tuple[int, ...], output: Path
+) -> dict:
+    ids = runtime.encode(prompt)
+    run = observe_and_replay(runtime, ids, channels)
+    full_intervention, restored = full_model_intervention(runtime, ids, channels)
+    checks = comparison_checks(run, full_intervention, restored)
+    save_evaluation_artifact(output, ids, run, full_intervention, restored)
+    return evaluation_report(
+        prompt, ids, channels, output, run, full_intervention, checks
+    )
 
 
 def parse_args() -> argparse.Namespace:
