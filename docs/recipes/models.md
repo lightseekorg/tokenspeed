@@ -1328,11 +1328,15 @@ request prefixes. History is asynchronous and may be older than generation
 N-2; its diagnostics report the observed lag. Neither policy guarantees a
 throughput improvement for every workload.
 
-Confidence verification keeps selected rows compact through attention, GDN,
-PLE, MLP and the greedy verifier. State rollback capacity and the external
-sampling layout retain the maximum window. Decode graphs use a request
-bucket and a query budget. A graph runs the target, verifier and draft,
-with metadata refresh and accepted-state commit outside replay.
+Confidence verification is experimental and keeps selected rows compact
+through attention, GDN, PLE and MLP. State rollback capacity and the external
+sampling layout retain the maximum window. Confidence captures target execution,
+LM head, verification and stop processing by total query capacity; draft context
+writes, native drafting and state commit are captured separately by request
+capacity. With the greedy
+sampler the head and verifier consume compact query rows directly; other samplers
+retain maximum-window scores. Target graphs are shared across request counts.
+Metadata refresh and host scheduling remain outside the graphs.
 Single-GPU and TP2/EP2 smoke runs cover graph and eager execution.
 Full-budget and adaptive output parity against fixed verification have not
 passed acceptance; distributed performance and multimodal validation remain

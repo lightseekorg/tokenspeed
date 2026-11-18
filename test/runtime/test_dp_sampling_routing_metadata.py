@@ -36,6 +36,7 @@ def _graph_route(
     max_tokens_per_req: int = 1,
 ) -> tuple[bool, int]:
     wrapper = ForwardStepRunner.__new__(ForwardStepRunner)
+    wrapper.segmented_decode = None
     wrapper.disable = disable
     wrapper.dp_size = dp_size
     wrapper.disable_padding = disable_padding

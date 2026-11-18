@@ -43,7 +43,7 @@ def expected_prefix_tokens(rates: Sequence[Sequence[float]]) -> list[float]:
 class VerifyBudgetPlanner:
     """Query costs shared by confidence and acceptance-history policies.
 
-    Baselines measure complete decode graphs. Completed live rounds add a
+    Baselines combine the Q and B graph timings. Completed live rounds add a
     bounded correction to the whole curve, including unvisited query buckets.
     Keep nine samples per bucket; each Q with ten samples in the last 5,000
     rounds contributes its median to a nonnegative per-query correction.

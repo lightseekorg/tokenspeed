@@ -2900,26 +2900,38 @@ Beta(1, 1) cold prior.
 
 `VerifyBudgetPlanner` shares prefix rewards with the ordinary `VerifyBudgetPolicy`.
 It chooses expected committed tokens per time, preferring smaller Q on ties.
-Startup costs measure complete decode graphs. Completed whole-round timings
-correct those costs, including unvisited Q buckets. Rank zero chooses and
-agrees the budget over a separate host group.
+Startup costs compose target and draft timings; completed whole-round timings
+correct those costs, including unvisited Q buckets. Budget keys `(B,Q)` are
+cost keys, not graph keys. Rank zero chooses and agrees the budget over a
+separate host group; the event loop holds no confidence tensors.
 
-Qwen4 uses the existing decode graph variants with keys (B, Q), where B is
-the padded request bucket and Q is one to the maximum window width times B.
-One graph records target execution, verification, and drafting. The runner
-refreshes metadata before replay and commits accepted state afterwards.
-Explicit forward inputs that differ from the captured inputs use eager
-execution with the same compact layout and commit path.
+Target execution and verification are captured by Q, and draft execution plus
+accepted-state commit by B. Q is the union of capture batch sizes times 1..width;
+for `[1,2,4,8,16]` and width 8, that means 24 target and 5 draft graphs.
+Warmup, ordinary capture and stage capture share the runner's context, sampling
+and grammar setup. Eager forwards run the same executor stages.
 
-`VerifyQueryLayout` owns persistent lengths, offsets and row maps. Inactive
-requests have zero lengths. The fused prefix allocator shares sorting and
-CSR generation with V4.1, which reserves physical anchors for padded
-requests. Qwen4 passes live and candidate-ready masks and allocates from
-probabilities. CPU and batches beyond the fused allocator's capacity use
-the same layout via PyTorch. The target keeps Q rows through its body,
-LM head and argmax. The shared verifier emits maximum-width token buffers.
-Grammar, NaN attribution and expert-load accounting use the same row maps.
-Draft context writes, state replay and cache admission keep the maximum window.
+`VerifyQueryLayout` owns persistent lengths, offsets and row maps. Q determines
+the target request capacity, `min(max_capture_bs,Q)`; inactive requests have
+zero lengths. The fused prefix allocator shares sorting and CSR generation
+with V4.1, which reserves physical anchors for padded requests. Qwen4 passes
+live and candidate-ready masks and allocates from probabilities. CPU and
+batches beyond the fused allocator's capacity use the same layout via PyTorch.
+The target keeps Q rows through its body, LM head and argmax.
+The shared packed verifier reads prefix offsets and emits ordinary maximum-width
+token buffers. Grammar, NaN attribution and scalar diagnostics use the same maps.
+Only target taps, tokens and lengths cross the stage boundary; handoff buffers
+have no vocabulary dimension or request-slot ownership.
+
+The B graph reads those buffers at fixed addresses and performs context
+projection, KV writes, drafting, confidence publication, state commit and
+frontier advance. Commits run once, after drafting. GDN and PLE copy scheduler
+state tables into persistent buffers during refresh; `prepare_state_commit_capture`
+arms null destinations before capture. Target metadata is refreshed for Q and
+then B. Metadata delivery, input/output transfers, host budget selection and
+feedback remain outside both graphs. Explicit temporary inputs run the same
+stages eagerly. Filler rows have null destinations and zero acceptance and
+never contribute to expert-load accounting.
 
 The prologue gathers selected write slots. QSA stages keys by original
 request/column; MHA and TRT-LLM use causal lengths per compact row. Unsupported

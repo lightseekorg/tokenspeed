@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Replay whole-round dynamic verification with small model weights."""
+"""Replay the real executor stages with small replacement model weights."""
 
 import gc
 import os
@@ -37,9 +37,12 @@ from ci_system.ci_register import register_cuda_ci
 register_cuda_ci(est_time=45, suite="runtime-1gpu")
 
 from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.execution.confidence_graph import (
+    ConfidenceDecodeGraphs,
+    DecodeStages,
+)
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.drafter.base import BaseDrafter
-from tokenspeed.runtime.execution.drafter.dspark import DSpark
 from tokenspeed.runtime.execution.drafter.verify_feedback import ConfidenceFeedback
 from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
@@ -84,7 +87,6 @@ class _Config:
     max_req_pool_size: int = 9
     output_length: int = 4
     spec_num_tokens: int = 4
-    spec_algo: str = "DSPARK"
     spec_draft_tree: bool = False
     pp_size: int = 1
     pp_rank: int = 0
@@ -187,8 +189,6 @@ class _Draft(BaseDrafter):
             self.confidence.proj.weight.fill_(0.02)
             self.confidence.proj.bias.fill_(0.1)
 
-    decode_graph_query_capacities = DSpark.decode_graph_query_capacities
-
     def run(self, base_ctx, logits_output, output_tokens, accept_lengths):
         batch = base_ctx.bs
         slots = self.input_buffers.req_pool_indices_buf[:batch]
@@ -263,14 +263,13 @@ class _Executor(ModelExecutor):
 
 
 class _Runner(ForwardStepRunner):
-    def __init__(self, executor, *, grammar, budget_policy, graph=True):
+    def __init__(self, executor, *, grammar, budget_policy):
         self.config = executor.config
         self.max_tokens_per_req = 4
         self.capture_bs = [1, 2, 4]
         self.max_capture_bs = 4
         self.max_decode_bs = 8
-        self.disable = not graph
-        self.disable_padding = False
+        self.disable = False
         self.dp_size = self.world_size = 1
         self.dp_local_graph = False
         self.device = "cuda"
@@ -279,8 +278,7 @@ class _Runner(ForwardStepRunner):
         self.attn_backend = executor.attn_backend
         self.runtime_states = executor.runtime_states
         self.input_buffers = executor.input_buffers
-        self.token_to_kv_pool = _Pool()
-        self.draft_attn_backend = None
+        self.token_to_kv_pool = None
         self.capturable_grammar = None
         self.eager_grammar_buffers = (
             EagerGrammarBuffers(8, 16, 4, "cuda") if grammar else None
@@ -292,64 +290,19 @@ class _Runner(ForwardStepRunner):
         self.deepep_adapter = DeepEPCudaGraphRunnerAdapter()
         self._graph_debug = True
         self.enable_cudagraph_gc = False
-        self.global_rank = 0
-        self.gpu_id = torch.cuda.current_device()
-        self.device_module = torch.cuda
-        self.sampling_backend = executor.sampling_backend
-        self._forward_func = executor._forward_step
-        self._confidence_host_group = None
-        self._confidence_sampling_info = {}
-        self.confidence_round_prepared = False
-        self.confidence_request_ids = []
-        self.confidence_inputs_supported = executor._confidence_graph_inputs_supported
-        self._metadata_snapshots = {}
-        self._reported_query_graphs = set()
-        self._expert_load_rows = None
-        self._mega_moe_live_requests = None
         self.draft_overlap = None
-        self.graphs = {}
-        self.output_buffers = {}
-        self.executor = executor
         executor.forward_step = self
         self.confidence_feedback = ConfidenceFeedback(
             4, 2, 8, budget_policy=budget_policy
         )
-
-    def run_round(self, ctx, info, *, queries):
-        batch = ctx.bs
-        capture_batch = (
-            self.padded_bs(batch, ctx) if self.can_run(batch, ctx) else batch
+        self.update_runtime_state = executor._update_forward_runtime_state
+        self.decode_stages = DecodeStages(
+            executor._forward_target,
+            executor._forward_draft,
+            executor._forward_outputs,
+            executor._confidence_graph_inputs_supported,
         )
-        self.confidence_request_ids = list(range(batch))
-        planner = self.confidence_feedback.planner
-        # Select the tested budget, while exercising the real graph picker.
-        planner.baselines.clear()
-        planner.set_baseline(capture_batch, queries, 0.1)
-        empty = self.input_buffers.input_lengths_buf[:0]
-        result = self(
-            batch,
-            ctx,
-            info,
-            extend_with_prefix=False,
-            extend_prefix_lens=empty,
-            extend_prefix_lens_cpu=empty.cpu(),
-            extend_seq_lens=empty,
-            extend_seq_lens_cpu=empty.cpu(),
-            extend_replay_lens_cpu=empty.cpu(),
-            extend_prompt_lens_cpu=empty.cpu(),
-            block_tables={},
-            block_tables_cpu={},
-            settle=lambda: None,
-        )
-        self.executor._update_runtime_state(
-            self.input_buffers.state_write_req_pool_indices_buf[:batch],
-            result[0],
-            result[1],
-            self.input_buffers.input_lengths_buf[:batch],
-            0,
-            output_layout=ctx.output_layout,
-        )
-        return result
+        self.segmented_decode = ConfidenceDecodeGraphs(self, self.decode_stages)
 
     def placeholder_block_tables(self, bs):
         return {}
@@ -362,13 +315,9 @@ class _Runner(ForwardStepRunner):
             self.input_buffers.seq_lens_buf[:bs],
         )
 
-
-class _Pool:
-    @dataclass(frozen=True)
-    class Arena:
-        cache_group_specs: tuple = ()
-
-    arena = Arena()
+    def warmup_decode_path(self, batch_sizes, *, graph_phase):
+        # The stage owner does four ordinary warmups per captured bucket.
+        pass
 
 
 class _Observer:
@@ -389,10 +338,9 @@ def process_group(tmp_path_factory):
         dist.destroy_process_group()
 
 
-def _inputs(executor, runner, slots, *, step):
+def _inputs(executor, runner, slots, *, queries, step, graph):
     buffers = executor.input_buffers
     batch = len(slots)
-    buffers.fill_dummy_decode_buffers(8, 32)
     buffers.req_pool_indices_buf[:batch] = torch.tensor(slots, device="cuda")
     buffers.state_write_req_pool_indices_buf[:batch] = torch.tensor(
         slots, device="cuda"
@@ -416,6 +364,7 @@ def _inputs(executor, runner, slots, *, step):
     )
     buffers.input_lengths_buf[:batch].fill_(4)
     buffers.force_single_token_verify_buf.zero_()
+    capacity = min(4 if graph else 8, queries)
     ctx = ForwardContext(
         attn_backend=executor.attn_backend,
         token_to_kv_pool=None,
@@ -425,9 +374,13 @@ def _inputs(executor, runner, slots, *, step):
         forward_mode=ForwardMode.DECODE,
         output_layout=ForwardOutputLayout(0, 0, batch, 4),
         capture_hidden_mode=CaptureHiddenMode.FULL,
+        verify_queries=runner.query_layout(capacity, queries),
         all_decode_or_idle=True,
     )
     executor.nan_guard.reset(batch)
+    runner.segmented_decode.bind_round(
+        ctx, actual_bs=batch, block_tables={}, use_graph=graph
+    )
     info = runner._capture_sampling_info(batch)
     return ctx, info
 
@@ -435,15 +388,15 @@ def _inputs(executor, runner, slots, *, step):
 @pytest.mark.parametrize("graph", [False, True])
 def test_confidence_feedback_keeps_acceptance_before_token_limit(process_group, graph):
     executor = _Executor(logprobs=False, grammar=False)
-    runner = _Runner(executor, grammar=False, budget_policy="confidence", graph=graph)
+    runner = _Runner(executor, grammar=False, budget_policy="confidence")
     if graph:
         runner.capture(entries=None, observer=_Observer())
     states = executor.runtime_states
     states.spec_candidates_ready[1] = True
     # The uncached anchor already consumes one position of the token limit.
     states.token_limits[1] = states.valid_cache_lengths[1] + 2
-    ctx, info = _inputs(executor, runner, [1], step=0)
-    result = runner.run_round(ctx, info, queries=4)
+    ctx, info = _inputs(executor, runner, [1], queries=4, step=0, graph=graph)
+    result = runner.segmented_decode.run_round(ctx, info)
     assert result[1].tolist() == [1]
     assert ctx.verify_queries.accept_lengths[:1].tolist() == [4]
 
@@ -456,16 +409,16 @@ def test_captured_round_preserves_outputs_and_state_when_b_and_q_change(
     process_group, logprobs, grammar, budget_policy
 ):
     eager, captured = (_Executor(logprobs=logprobs, grammar=grammar) for _ in range(2))
-    reference = _Runner(
-        eager, grammar=grammar, budget_policy=budget_policy, graph=False
+    reference, runner = (
+        _Runner(executor, grammar=grammar, budget_policy=budget_policy)
+        for executor in (eager, captured)
     )
-    runner = _Runner(captured, grammar=grammar, budget_policy=budget_policy)
     runner.capture(entries=None, observer=_Observer())
     cases = [
         (8, [5, 2, 7, 1]),
-        (4, [2]),
+        (8, [2]),
         (4, [7, 5, 2]),
-        (8, [5, 1]),
+        (12, [5, 1]),
         (8, [7, 1, 5, 2]),
         (1, [1]),
     ]
@@ -476,8 +429,12 @@ def test_captured_round_preserves_outputs_and_state_when_b_and_q_change(
                 executor.runtime_states.token_limits[5] = (
                     executor.runtime_states.valid_cache_lengths[5] + 2
                 )
-        actual_ctx, actual_info = _inputs(captured, runner, slots, step=step)
-        expected_ctx, expected_info = _inputs(eager, reference, slots, step=step)
+        actual_ctx, actual_info = _inputs(
+            captured, runner, slots, queries=queries, step=step, graph=True
+        )
+        expected_ctx, expected_info = _inputs(
+            eager, reference, slots, queries=queries, step=step, graph=False
+        )
         if grammar:
             for owner in (runner, reference):
                 owner.eager_grammar_buffers.bitmask.fill_(-1)
@@ -493,12 +450,8 @@ def test_captured_round_preserves_outputs_and_state_when_b_and_q_change(
                 expected_info.vocab_mask = reference.eager_grammar_buffers.bitmask[::2][
                     : len(slots) * 4
                 ]
-        expected = reference.run_round(expected_ctx, expected_info, queries=queries)
-        actual = runner.run_round(actual_ctx, actual_info, queries=queries)
-        expected_bucket = runner.padded_bs(len(slots), actual_ctx)
-        assert runner.last_graph_bs == (
-            None if grammar and step == 3 else expected_bucket
-        )
+        expected = reference.segmented_decode.run_round(expected_ctx, expected_info)
+        actual = runner.segmented_decode.run_round(actual_ctx, actual_info)
         for got, want in zip(actual[:4], expected[:4]):
             if got is not None:
                 torch.testing.assert_close(got, want, atol=1e-6, rtol=1e-6)
@@ -543,17 +496,16 @@ def test_explicit_decode_override_and_above_ladder_keep_the_same_stage_behavior(
     executor = _Executor(logprobs=False, grammar=False)
     runner = _Runner(executor, grammar=False, budget_policy="confidence")
     runner.capture(entries=None, observer=_Observer())
-    queries = 8
-    ctx, info = _inputs(executor, runner, [1, 2], step=2)
+    ctx, info = _inputs(executor, runner, [1, 2], queries=8, step=2, graph=True)
     ctx.decode_input_ids = [3, 3]
     executor.input_buffers.force_single_token_verify_buf[:2].fill_(True)
     executor.runtime_states.spec_candidates_ready[1:3].fill_(True)
-    result = runner.run_round(ctx, info, queries=queries)
+    result = runner.segmented_decode.run_round(ctx, info)
     torch.testing.assert_close(
         result[1], torch.ones(2, dtype=torch.int32, device="cuda")
     )
     for persistent in (True, False):
-        ctx, info = _inputs(executor, runner, [1, 2], step=2)
+        ctx, info = _inputs(executor, runner, [1, 2], queries=8, step=2, graph=True)
         positions = executor.input_buffers.positions_buf[:8]
         executor._active_positions_override = (
             positions if persistent else positions.clone() + 200
@@ -566,8 +518,7 @@ def test_explicit_decode_override_and_above_ladder_keep_the_same_stage_behavior(
         expected = before + (
             hidden + executor._active_positions_override[:, None] / 100
         ).view(2, 4, 4).sum(1)
-        result = runner.run_round(ctx, info, queries=queries)
-        assert runner.last_graph_bs == (2 if persistent else None)
+        result = runner.segmented_decode.run_round(ctx, info)
         torch.testing.assert_close(
             result[1], torch.full((2,), 4, dtype=torch.int32, device="cuda")
         )
@@ -575,10 +526,11 @@ def test_explicit_decode_override_and_above_ladder_keep_the_same_stage_behavior(
             executor.attn_backend.committed[1:3], expected, atol=1e-5, rtol=1e-6
         )
     executor._active_positions_override = None
-    queries = 12
-    ctx, info = _inputs(executor, runner, [1, 2, 3, 4, 5, 6], step=2)
+    ctx, info = _inputs(
+        executor, runner, [1, 2, 3, 4, 5, 6], queries=12, step=2, graph=False
+    )
     before = executor.runtime_states.valid_cache_lengths.clone()
-    result = runner.run_round(ctx, info, queries=queries)
+    result = runner.segmented_decode.run_round(ctx, info)
     torch.testing.assert_close(
         executor.runtime_states.valid_cache_lengths[1:7] - before[1:7], result[1]
     )
@@ -604,14 +556,16 @@ def test_captured_grammar_host_node_uses_the_live_request_batch(process_group):
     runner.capture(entries=None, observer=_Observer())
     executor.runtime_states.spec_candidates_ready[1:9].fill_(True)
     for step, (queries, slots) in enumerate([(8, [1, 2]), (4, [2]), (8, [2, 1, 3])]):
-        ctx, info = _inputs(executor, runner, slots, step=step)
+        ctx, info = _inputs(
+            executor, runner, slots, queries=queries, step=step, graph=True
+        )
         completion = runtime.add_batch(
             grammars=[grammars[slot] for slot in slots],
             bs=len(slots),
             has_candidates=True,
             output_layout=ctx.output_layout,
         )
-        tokens, lengths, _, _, _ = runner.run_round(ctx, info, queries=queries)
+        tokens, lengths, _, _, _ = runner.segmented_decode.run_round(ctx, info)
         torch.cuda.synchronize()
         torch.testing.assert_close(
             lengths, torch.ones(len(slots), dtype=torch.int32, device="cuda")

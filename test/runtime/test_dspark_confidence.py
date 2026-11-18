@@ -222,16 +222,37 @@ def test_compact_gdn_prefixes_and_commits_survive_uniform_verify_tactics(
         forward(0)
         forward(1)
     graph = None
+    commit_graph = None
     if cuda_graph:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             actual = forward(1)
+        backend = backends[1]
+
+        def prepare_commit():
+            backend.init_forward_metadata_capture_cuda_graph(
+                batch,
+                torch.arange(batch, dtype=torch.int32, device="cuda"),
+                torch.full((batch,), 4 + width, dtype=torch.int32, device="cuda"),
+                ForwardMode.DECODE,
+            )
+            backend.prepare_state_commit_capture()
+
+        for _ in range(2):
+            prepare_commit()
+            backend.commit_verified_state(layouts[1].query_lengths, accepted_path=None)
+        prepare_commit()
+        commit_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(commit_graph):
+            backend.commit_verified_state(layouts[1].query_lengths, accepted_path=None)
     for step in range(2):
         actual_bs = 2 - step
         active.copy_(torch.arange(batch, device="cuda") < actual_bs)
         for layout in layouts:
             layout.refresh(rates.roll(step, 0), ready, active)
         for backend in backends:
+            # Fresh delivered storage on each round must not replace the
+            # table addresses recorded by the commit graph.
             backend.refresh_decode_metadata(
                 batch,
                 actual_bs,
@@ -259,10 +280,13 @@ def test_compact_gdn_prefixes_and_commits_survive_uniform_verify_tactics(
             atol=0,
             rtol=0,
         )
-        for backend in backends:
-            backend.commit_verified_state(
-                layouts[1].query_lengths[:actual_bs], accepted_path=None
+        backends[0].commit_verified_state(layouts[1].query_lengths, accepted_path=None)
+        if commit_graph is None:
+            backends[1].commit_verified_state(
+                layouts[1].query_lengths, accepted_path=None
             )
+        else:
+            commit_graph.replay()
         for component in ("conv_state", "recurrent_state"):
             torch.testing.assert_close(
                 pools[0].get_component(0, component),

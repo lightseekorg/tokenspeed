@@ -1799,6 +1799,7 @@ def test_fine_verify_graph_capture_plan_and_keys():
     drafter.confidence_scores = torch.empty(1)
     drafter.verify_graph_token_step = 8
     runner = object.__new__(ForwardStepRunner)
+    runner.segmented_decode = None
     runner.dp_local_graph = False
     runner.disable = False
     runner.capture_bs = [1, 8, 16, 32]
