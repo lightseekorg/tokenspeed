@@ -217,10 +217,14 @@ pub fn start(
             .collect::<Vec<_>>(),
         "peer geometry"
     );
+    // Replicas read only holders of the same namespace; a mismatch answers
+    // as a miss, so the namespace is worth seeing in the log.
     tracing::info!(
         name = settings.peer.name,
         session = engine.session_id(),
         incarnation = settings.peer.incarnation,
+        deployment_id = settings.peer.deployment_id,
+        weight_version = settings.peer.weight_version,
         "peer prefix sharing up"
     );
     let peer = Peer::start(

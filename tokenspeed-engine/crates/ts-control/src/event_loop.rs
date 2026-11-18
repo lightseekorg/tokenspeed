@@ -782,6 +782,14 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         stop_requested: bool,
         submitted: Vec<EngineRequest>,
     ) -> Result<bool, LoopError> {
+        // A peer servicer answers from the scheduler between rounds, and the
+        // loop releases it only while it waits on the device or on an idle
+        // frontend. A loop waiting on a transfer -- a prefill engine on its
+        // PD sends, a landing on its reads -- does neither and spins
+        // through empty rounds, so it hands the scheduler to a waiting
+        // servicer once per round; with none waiting this costs one atomic
+        // read.
+        ArcMutexGuard::bump(&mut self.scheduler);
         // A profile keeps the spans of a round that did something: a loop
         // waiting on a transfer spins through empty rounds.
         let held_spans = profile::hold();

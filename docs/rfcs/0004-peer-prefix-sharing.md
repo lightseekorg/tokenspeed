@@ -121,7 +121,10 @@ prefill chunk is hundreds of milliseconds; answering at the next round would
 make every lookup and pin wait that long. The scheduler is therefore shared
 with the servicer under a lock that the control thread holds through a
 round's scheduler work and releases while it waits on the device or on an
-idle frontend. The servicer answers with reads only (`AnswerPeerLookup`,
+idle frontend. A loop waiting on a transfer -- a prefill replica on its PD
+sends, a landing on its reads -- does neither and spins through
+empty rounds, so the control thread also hands the lock to a waiting servicer
+once per round. The servicer answers with reads only (`AnswerPeerLookup`,
 `PeerPagesMatch`, `PeerLeaseHeld`, `PlanCalls`): an answer costs a network
 round trip plus at most the rest of a round's scheduler work.
 

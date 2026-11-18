@@ -1299,6 +1299,9 @@ struct Setup {
     /// The requests each engine serves itself before its frontend attaches,
     /// [`STARTUP_OUTPUT_TOKENS`] each.
     startup: Vec<startup::Phase>,
+    /// Receives the scheduler the loop runs over, as a peer servicer holds
+    /// it.
+    scheduler: Option<Arc<Mutex<Option<Arc<parking_lot::Mutex<Scheduler>>>>>>,
 }
 
 const STARTUP_OUTPUT_TOKENS: usize = 3;
@@ -1423,6 +1426,7 @@ fn run_rank<F: Frontend>(
         grammar_timeouts,
         epd_receive_enabled,
         startup,
+        scheduler: scheduler_handle,
         ..
     } = setup;
     let role = pd.as_ref().map_or(Role::Plain, |pd| pd.role);
@@ -1465,13 +1469,17 @@ fn run_rank<F: Frontend>(
         _ => 1,
     };
     // Attached once the startup requests ran, as the host does.
+    let scheduler = Arc::new(parking_lot::Mutex::new(new_scheduler(
+        tiers,
+        role,
+        kv_shard_count,
+        device_pages.unwrap_or(513),
+    )));
+    if let Some(handle) = scheduler_handle {
+        *handle.lock().unwrap() = Some(scheduler.clone());
+    }
     let mut event_loop = EventLoop::new(
-        Arc::new(parking_lot::Mutex::new(new_scheduler(
-            tiers,
-            role,
-            kv_shard_count,
-            device_pages.unwrap_or(513),
-        ))),
+        scheduler,
         device,
         None,
         outputs,
@@ -3657,6 +3665,63 @@ fn a_pd_abort_in_the_submission_round_retires_the_transfer() {
             }
         }
     }
+}
+
+/// A peer servicer answers from the scheduler between rounds. A loop waiting
+/// on a transfer -- here a decode engine waiting for its prefill peer's KV --
+/// runs neither a forward nor an idle frontend wait, the two points that
+/// release the scheduler, so it hands the scheduler to a waiting servicer
+/// once per round instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_loop_waiting_on_a_transfer_hands_the_scheduler_to_a_waiting_servicer() {
+    let wire = Arc::new(Mutex::new(Wire {
+        prefill_ranks: 1,
+        ..Wire::default()
+    }));
+    let handle = Arc::new(Mutex::new(None));
+    let decode = start_ranks_with(
+        Layout::Single,
+        1,
+        Tiers::DeviceOnly,
+        Setup {
+            pd: Some(Pd {
+                role: Role::Decode,
+                wire: wire.clone(),
+            }),
+            scheduler: Some(handle.clone()),
+            ..Setup::default()
+        },
+    )
+    .await;
+    let _stream = decode
+        .client
+        .generate(disaggregated("waiting-kv", 70, 20, 4))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !wire
+            .lock()
+            .unwrap()
+            .rooms
+            .get(&70)
+            .is_some_and(|room| room.preallocated.is_some())
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("decode allocated its KV landing pages and waits for them");
+
+    let scheduler = handle.lock().unwrap().clone().unwrap();
+    let held = tokio::task::spawn_blocking(move || {
+        scheduler.try_lock_for(Duration::from_secs(5)).is_some()
+    })
+    .await
+    .unwrap();
+    assert!(
+        held,
+        "the servicer waited past five seconds of empty rounds"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
