@@ -22,14 +22,12 @@
 
 import logging
 import math
-import time
 from collections import deque
 from collections.abc import Collection, Hashable, Iterator, Sequence
 from dataclasses import dataclass, field
 
 import torch
 
-from tokenspeed.runtime.execution.confidence_history import AcceptanceHistory
 from tokenspeed.runtime.execution.drafter.verify_budget import VerifyBudgetPlanner
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 
@@ -44,7 +42,6 @@ class _RequestFeedback:
     completed: dict[int, tuple[float, ...]] = field(default_factory=dict)
     contexts: dict[int, int] = field(default_factory=dict)
     device_generation_offset: int | None = None
-    history: AcceptanceHistory | None = None
 
 
 @dataclass(frozen=True)
@@ -59,7 +56,6 @@ class PendingFeedback:
     snapshot: tuple[FeedbackSnapshot | None, ...]
     values: tuple[torch.Tensor, ...]
     ready: torch.cuda.Event
-    timing: tuple[torch.cuda.Event, int, int] | None
 
 
 class FeedbackQueue:
@@ -78,7 +74,6 @@ class FeedbackQueue:
         sources: tuple[torch.Tensor, ...],
         *,
         buffers: tuple[torch.Tensor, ...] | None,
-        timing: tuple[torch.cuda.Event, int, int] | None,
     ) -> None:
         if not self.can_record():
             raise RuntimeError("verification feedback queue is full")
@@ -89,9 +84,9 @@ class FeedbackQueue:
             )
         for source, host in zip(sources, buffers, strict=True):
             host[: len(snapshot)].copy_(source, non_blocking=True)
-        ready = torch.cuda.Event(enable_timing=timing is not None)
+        ready = torch.cuda.Event()
         ready.record()
-        self.pending.append(PendingFeedback(snapshot, buffers, ready, timing))
+        self.pending.append(PendingFeedback(snapshot, buffers, ready))
 
     def completed(self) -> Iterator[PendingFeedback]:
         while self.pending and self.pending[0].ready.query():
@@ -168,7 +163,7 @@ class VerifyFeedback:
             advances = not restart if produced is None else produced[row]
             if advances:
                 request.generation += 1
-            minimum = request.generation - (2 if produced is None else 3)
+            minimum = request.generation - 2
             request.completed = {
                 g: scores for g, scores in request.completed.items() if g >= minimum
             }
@@ -261,57 +256,31 @@ class VerifyFeedback:
 
 
 class ConfidenceFeedback:
-    """Asynchronous, generation-checked scores and live graph cost feedback.
+    """Read completed proposal probabilities without blocking decode.
 
-    A budget for draft generation N uses generation N-2. Missing feedback
-    uses observed conditional acceptance, with a Beta(1, 1) cold-start prior.
-    Request scores survive batches that do not schedule the request. Slot
-    reuse bounds this expendable host cache without changing device state.
+    The host budget uses generation N-2, with a 0.5 conditional prior for
+    requests missing that generation. The GPU uses current proposal scores.
     """
 
-    def __init__(
-        self, width: int, max_pending: int, max_batch_size: int, *, budget_policy: str
-    ):
-        if budget_policy not in ("confidence", "history"):
-            raise ValueError("confidence budget policy must be confidence or history")
+    def __init__(self, width: int, max_pending: int, max_batch_size: int):
         self.planner = VerifyBudgetPlanner(width)
-        self.budget_policy = budget_policy
-        self.width = width
         self.requests = VerifyFeedback(draft_width=width - 1)
         self.queue = FeedbackQueue(max_pending)
+        self._prior = (0.5,) * (width - 1)
         self._free_buffers = [
             (
                 torch.empty(
-                    (max_batch_size, 2 * width),
-                    dtype=torch.float32,
-                    pin_memory=True,
+                    (max_batch_size, width - 1), dtype=torch.float32, pin_memory=True
                 ),
                 torch.empty(max_batch_size, dtype=torch.int64, pin_memory=True),
             )
             for _ in range(max_pending)
         ]
         self._round_tags: tuple[FeedbackSnapshot | None, ...] | None = None
-        self._successes = [1] * (width - 1)
-        self._trials = [2] * (width - 1)
         self.selections = 0
         self.selected_requests = 0
         self.fallback_requests = 0
         self.rejected_generations = 0
-        self.completed_rounds = 0
-        self.allocated_queries = 0
-        self.effective_queries = 0
-        self.verified_requests = 0
-        self.calibration_requests = 0
-        self.predicted_tokens = 0.0
-        self.accepted_tokens = 0
-        self.confidence_error = 0.0
-        self.confidence_observations = 0
-        self.history_requests = 0
-        self.history_censored_requests = 0
-        self.history_generation_lag = 0
-        self.history_growth_rounds = 0
-        self.history_growth_queries = 0
-        self.decision_nanoseconds = 0
 
     def prepare(
         self,
@@ -336,69 +305,26 @@ class ConfidenceFeedback:
     def poll(self) -> None:
         for sample in self.queue.completed():
             host, device_generations = sample.values
-            values = host[: len(sample.snapshot)].tolist()
-            generations = device_generations[: len(sample.snapshot)].tolist()
-            if sample.timing is not None:
-                start, batch, queries = sample.timing
-                self.planner.observe(batch, queries, start.elapsed_time(sample.ready))
-                self.completed_rounds += 1
-                self.allocated_queries += queries
-                self.effective_queries += sum(int(row[-2]) for row in values)
-                self.verified_requests += sum(row[-2] > 0 for row in values)
-            for tag, row, generation in zip(
-                sample.snapshot, values, generations, strict=True
+            count = len(sample.snapshot)
+            for tag, rates, generation in zip(
+                sample.snapshot,
+                host[:count].tolist(),
+                device_generations[:count].tolist(),
+                strict=True,
             ):
-                if tag is None:
+                if tag is None or generation <= 0:
                     continue
-                expected = tag.generation
                 state = self.requests.resolve(tag)
-                if state is None:
-                    continue
-                if sample.timing is not None and row[-2] == 0:
-                    # A submitted lookahead can outlive the request. Its null
-                    # state destination intentionally publishes no generation.
+                if state is None or tag.generation < state.generation - 2:
                     continue
                 if state.device_generation_offset is None:
-                    # A restored slot may carry an absolute device counter
-                    # from before this host cache acquired the request.
-                    state.device_generation_offset = generation - expected
-                if generation != expected + state.device_generation_offset:
+                    # A restored slot can carry an absolute counter from
+                    # before the host bound this admission.
+                    state.device_generation_offset = generation - tag.generation
+                if generation != tag.generation + state.device_generation_offset:
                     self.rejected_generations += 1
                     continue
-                if expected >= state.generation - 3:
-                    state.completed[expected] = tuple(row[: self.width - 1])
-                queries, accepted = int(row[-2]), int(row[-1])
-                if queries <= 0 or expected < 2:
-                    continue
-                if self.budget_policy == "history":
-                    if state.history is None:
-                        state.history = AcceptanceHistory(
-                            self.width, observation_weight=0.25
-                        )
-                    # The newly published scores are generation `expected`;
-                    # acceptance describes its predecessor's candidates.
-                    state.history.observe(
-                        expected - 1, queries=queries, accepted=accepted
-                    )
-                # These scores accompanied the candidates just verified;
-                # newly published scores above are for a later budget.
-                rates = row[self.width - 1 : 2 * (self.width - 1)]
-                self.calibration_requests += 1
-                self.accepted_tokens += accepted
-                prefix = 1.0
-                self.predicted_tokens += 1.0
-                for position in range(queries - 1):
-                    probability = rates[position]
-                    prefix *= probability
-                    self.predicted_tokens += prefix
-                    # After the first mismatch, later positions are censored.
-                    # Acceptance is recorded before EOS/length truncation.
-                    if accepted >= position + 1:
-                        success = int(accepted > position + 1)
-                        self._successes[position] += success
-                        self._trials[position] += 1
-                        self.confidence_error += abs(probability - success)
-                        self.confidence_observations += 1
+                self.requests.publish((tag,), (rates,))
             self._free_buffers.append(sample.values)
 
     def select(
@@ -408,14 +334,7 @@ class ConfidenceFeedback:
         *,
         capacities: Collection[int] | None = None,
     ) -> int:
-        started = time.perf_counter_ns()
-        prior = [
-            successes / trials
-            for successes, trials in zip(self._successes, self._trials, strict=True)
-        ]
         rates = []
-        observed_rates = []
-        censored = False
         for key in request_ids:
             state = self.requests.request(key)
             scores = (
@@ -423,106 +342,28 @@ class ConfidenceFeedback:
             )
             if scores is None:
                 self.fallback_requests += 1
-                scores = prior
-            observed = scores
-            if (
-                self.budget_policy == "history"
-                and state is not None
-                and state.history is not None
-            ):
-                forecast = state.history.forecast(
-                    scores, maximum_generation=state.generation - 2
-                )
-                if forecast is not None:
-                    scores, observed = forecast.rates, forecast.observed_rates
-                    self.history_requests += 1
-                    self.history_generation_lag += (
-                        state.generation - forecast.generation
-                    )
-                    self.history_censored_requests += int(forecast.censored)
-                    censored |= forecast.censored
+                scores = self._prior
             rates.append(scores)
-            observed_rates.append(observed)
         self.selections += 1
         self.selected_requests += len(request_ids)
         queries = self.planner.select(batch, rates, capacities=capacities)
-        if censored:
-            observed_queries = self.planner.select(
-                batch, observed_rates, capacities=capacities
-            )
-            if queries > observed_queries:
-                self.history_growth_rounds += 1
-                self.history_growth_queries += queries - observed_queries
-        self.decision_nanoseconds += time.perf_counter_ns() - started
         if self.selections % 256 == 0:
             logger.info(f"Confidence verification: {self.summary()}")
         return queries
 
-    def summary(self) -> dict[str, float | int | str]:
-        """Return completed, same-round budget and confidence diagnostics."""
+    def summary(self) -> dict[str, float | int]:
         return {
-            "budget_policy": self.budget_policy,
-            "rounds": self.completed_rounds,
-            "mean_q": self.allocated_queries / max(1, self.completed_rounds),
-            "queries_per_request": self.effective_queries
-            / max(1, self.verified_requests),
-            "padding_fraction": 1
-            - self.effective_queries / max(1, self.allocated_queries),
-            "predicted_length": self.predicted_tokens
-            / max(1, self.calibration_requests),
-            "accepted_length": self.accepted_tokens / max(1, self.calibration_requests),
-            "confidence_mae": self.confidence_error
-            / max(1, self.confidence_observations),
             "fallback_fraction": self.fallback_requests
             / max(1, self.selected_requests),
             "rejected_generations": self.rejected_generations,
-            "history_fraction": self.history_requests / max(1, self.selected_requests),
-            "history_censored_fraction": self.history_censored_requests
-            / max(1, self.history_requests),
-            "history_generation_lag": self.history_generation_lag
-            / max(1, self.history_requests),
-            "history_growth_rounds": self.history_growth_rounds,
-            "history_growth_queries": self.history_growth_queries,
-            "decision_time_us": self.decision_nanoseconds
-            / max(1, self.selections)
-            / 1000,
         }
 
     def can_record(self) -> bool:
         return self.queue.can_record()
 
-    def record(
-        self,
-        current_rates: torch.Tensor,
-        current_generations: torch.Tensor,
-        older_rates: torch.Tensor,
-        query_lengths: torch.Tensor,
-        accept_lengths: torch.Tensor,
-        start: torch.cuda.Event | None,
-        batch: int | None,
-        queries: int | None,
-    ) -> None:
+    def record(self, rates: torch.Tensor, generations: torch.Tensor) -> None:
         tags = self._round_tags
         self._round_tags = None
         if tags is None or not self.can_record():
             return
-        timing = None
-        if start is not None:
-            if batch is None or queries is None:
-                raise ValueError("timed confidence feedback requires B and Q")
-            timing = (start, batch, queries)
-        values = torch.cat(
-            (
-                current_rates,
-                older_rates,
-                query_lengths[:, None].to(torch.float32),
-                accept_lengths[:, None].to(torch.float32),
-            ),
-            dim=-1,
-        )
-        self.queue.record(
-            tags,
-            (values, current_generations),
-            buffers=self._free_buffers.pop(),
-            timing=timing,
-        )
+        self.queue.record(tags, (rates, generations), buffers=self._free_buffers.pop())

@@ -459,18 +459,15 @@ class ForwardStepRunner:
         self.confidence_feedback: ConfidenceFeedback | None = None
         self.verify_query_layouts: dict[tuple[int, int], VerifyQueryLayout] = {}
         self.confidence_request_ids: Sequence[Hashable] = []
-        self.confidence_queries: int | None = None
-        self.confidence_batch: int | None = None
         self.confidence_round_prepared = False
         self._confidence_host_group = None
-        if drafter is not None and drafter.verify_policy in ("confidence", "history"):
+        if drafter is not None and drafter.verify_policy == "confidence":
             if confidence_inputs_supported is None:
                 raise ValueError("adaptive DSpark graphs require live input validation")
             self.confidence_feedback = ConfidenceFeedback(
                 self.max_tokens_per_req,
                 max(2, config.overlap_schedule_depth + 2),
                 self.max_decode_bs,
-                budget_policy=drafter.verify_policy,
             )
             if self.world_size > 1:
                 from tokenspeed.runtime.distributed.process_group_manager import (
@@ -1455,12 +1452,10 @@ class ForwardStepRunner:
         """
         use_graph = self._can_use_graph(bs, ctx)
         padded_bs = self._padded_bs(bs, ctx) if use_graph else bs
-        confidence_start = None
         confidence_round = (
             self.confidence_feedback is not None and ctx.forward_mode.is_decode()
         )
         if confidence_round:
-            self.confidence_batch = padded_bs
             budget = [
                 (
                     self.confidence_feedback.select(
@@ -1480,11 +1475,8 @@ class ForwardStepRunner:
                 dist.broadcast_object_list(
                     budget, src=0, group=self._confidence_host_group
                 )
-            self.confidence_queries = budget[0]
-            ctx.verify_queries = self.query_layout(padded_bs, self.confidence_queries)
-            if self.global_rank == 0 and self.confidence_feedback.can_record():
-                confidence_start = self.device_module.Event(enable_timing=True)
-                confidence_start.record()
+            queries = budget[0]
+            ctx.verify_queries = self.query_layout(padded_bs, queries)
         active_req_pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
 
         live_output_layout = ctx.output_layout
@@ -1586,7 +1578,6 @@ class ForwardStepRunner:
                     ctx.verify_queries.query_capacity, bs * self.max_tokens_per_req
                 )
                 ctx.verify_queries = self.query_layout(bs, queries)
-                self.confidence_batch, self.confidence_queries = bs, queries
                 self._prepare_decode_metadata(
                     bs,
                     bs,
@@ -1722,27 +1713,20 @@ class ForwardStepRunner:
 
         if self.confidence_feedback is not None and self.confidence_round_prepared:
             slots = self.input_buffers.req_pool_indices_buf[:bs]
-            layout = ctx.verify_queries
-            query_lengths = (
-                layout.query_lengths[:bs]
-                if layout is not None
-                else torch.zeros_like(slots, dtype=torch.int32)
-            )
-            accept_lengths = (
-                layout.accept_lengths[:bs]
-                if layout is not None
-                else torch.zeros_like(slots, dtype=torch.int32)
-            )
-            self.confidence_feedback.record(
-                self.runtime_states.draft_confidence.index_select(0, slots),
-                self.runtime_states.draft_confidence_generation.index_select(0, slots),
-                self.runtime_states.previous_draft_confidence.index_select(0, slots),
-                query_lengths,
-                accept_lengths,
-                confidence_start,
-                self.confidence_batch if confidence_start is not None else None,
-                self.confidence_queries if confidence_start is not None else None,
-            )
+            if self.confidence_feedback.can_record():
+                rates = self.runtime_states.draft_confidence.index_select(0, slots)
+                generations = (
+                    self.runtime_states.draft_confidence_generation.index_select(
+                        0, slots
+                    )
+                )
+                if ctx.verify_queries is not None:
+                    # Lookahead can include a stopped request whose draft
+                    # writes were redirected to the null slot.
+                    generations.masked_fill_(
+                        ctx.verify_queries.query_lengths[:bs] == 0, 0
+                    )
+                self.confidence_feedback.record(rates, generations)
             self.confidence_round_prepared = False
 
         self.last_graph_bs = padded_bs if use_graph else None

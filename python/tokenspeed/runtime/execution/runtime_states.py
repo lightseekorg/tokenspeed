@@ -123,7 +123,6 @@ class RuntimeStates:
         # (--enable-speculative-sampling), see init_draft_probs.
         self.draft_probs: torch.Tensor | None = None
         self.draft_confidence: torch.Tensor | None = None
-        self.previous_draft_confidence: torch.Tensor | None = None
         self.draft_confidence_generation: torch.Tensor | None = None
         self.draft_probs_sentinel: float = 0.0
         # Token id of draft_probs column 0: this rank's shard start when it holds its columns only.
@@ -163,7 +162,6 @@ class RuntimeStates:
         self.draft_confidence = torch.zeros(
             shape, dtype=torch.float32, device=self.device
         )
-        self.previous_draft_confidence = torch.zeros_like(self.draft_confidence)
         self.draft_confidence_generation = torch.zeros(
             shape[0], dtype=torch.int64, device=self.device
         )
@@ -181,11 +179,10 @@ class RuntimeStates:
         must not give them different prefix lengths or accepted frontiers.
         The device collective is capturable and stays on the candidate stream.
         """
-        if self.draft_confidence is None or self.previous_draft_confidence is None:
+        if self.draft_confidence is None:
             raise RuntimeError("confidence storage has not been initialized")
         if group is not None:
             dist.broadcast(rates, src=0, group=group)
-        self.previous_draft_confidence[slots] = self.draft_confidence[slots]
         self.draft_confidence[slots] = rates
         self.draft_confidence_generation[slots] += 1
 
@@ -462,7 +459,6 @@ class RuntimeStates:
             rows.extend(
                 (
                     self.draft_confidence[slot],
-                    self.previous_draft_confidence[slot],
                     self.draft_confidence_generation[slot],
                 )
             )
@@ -516,9 +512,6 @@ class RuntimeStates:
         self.reset_draft_probs(extend_request_pool_indices)
         if self.draft_confidence is not None:
             self.draft_confidence.index_fill_(0, extend_request_pool_indices, 0)
-            self.previous_draft_confidence.index_fill_(
-                0, extend_request_pool_indices, 0
-            )
             self.draft_confidence_generation.index_fill_(
                 0, extend_request_pool_indices, 0
             )

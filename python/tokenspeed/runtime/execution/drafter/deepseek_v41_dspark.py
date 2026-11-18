@@ -1070,7 +1070,6 @@ class DeepseekV41DSpark(BaseDrafter):
             snapshot,
             (scores, self.input_buffers.seq_lens_buf[: ctx.bs]),
             buffers=None,
-            timing=None,
         )
 
     def _draft_decode_rows(

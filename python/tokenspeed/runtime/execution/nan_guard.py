@@ -102,12 +102,7 @@ class NanGuard:
             return
         if logits_output.logits_layout_plan is None:
             rows = torch.isnan(logits.amax(dim=-1))
-            if logits_output.query_layout is not None:
-                rows = logits_output.query_layout.expand(
-                    rows, token_dim=0, request_count=ctx.bs
-                )
-                self._or_per_request(rows, ctx)
-            elif ctx.decode_query_indptr is None:
+            if ctx.decode_query_indptr is None:
                 self._or_per_request(rows, ctx)
             else:
                 if ctx.num_extends or ctx.bs == 0:

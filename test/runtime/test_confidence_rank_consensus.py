@@ -65,9 +65,6 @@ def _publish_worker(rank, store_path):
         local.copy_(next_source if rank == 0 else source)
         states.publish_draft_confidence(slots, local, group=dist.group.WORLD)
         torch.testing.assert_close(
-            states.previous_draft_confidence[slots], source, atol=0, rtol=0
-        )
-        torch.testing.assert_close(
             states.draft_confidence[slots], next_source, atol=0, rtol=0
         )
         layout.refresh(states.draft_confidence[slots], ready, ready)

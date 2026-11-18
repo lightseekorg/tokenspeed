@@ -670,7 +670,6 @@ def test_confidence_is_published_after_the_greedy_proposal(dtype) -> None:
     tokens = torch.empty(rows, spec, dtype=torch.int32, device="cuda")
 
     for generation in (1, 2):
-        previous = drafter.runtime_states.draft_confidence[slots].clone()
         drafter._sample_block(hidden, block, tokens)
         expected = torch.stack(
             [
@@ -683,9 +682,6 @@ def test_confidence_is_published_after_the_greedy_proposal(dtype) -> None:
         )
         torch.testing.assert_close(
             drafter.runtime_states.draft_confidence[slots], expected
-        )
-        torch.testing.assert_close(
-            drafter.runtime_states.previous_draft_confidence[slots], previous
         )
         assert drafter.runtime_states.draft_confidence_generation[slots].tolist() == [
             generation,

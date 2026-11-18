@@ -71,12 +71,19 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture(autouse=True)
-def _collect_graph_owners_after_test():
-    yield
-    # Runner callbacks form cycles. Free their graph pools before a later test
-    # starts another capture, where CUDA graph destruction is forbidden.
-    torch.cuda.synchronize()
-    gc.collect()
+def _graph_test_precision_and_cleanup():
+    # The shared Q graph and eager path can project different numbers of
+    # padded rows. Keep TF32 tactic changes out of the state/replay comparison.
+    precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    try:
+        yield
+    finally:
+        # Runner callbacks form cycles. Free their graph pools before another
+        # capture, where CUDA graph destruction is forbidden.
+        torch.cuda.synchronize()
+        gc.collect()
+        torch.set_float32_matmul_precision(precision)
 
 
 @dataclass(frozen=True)
@@ -263,7 +270,7 @@ class _Executor(ModelExecutor):
 
 
 class _Runner(ForwardStepRunner):
-    def __init__(self, executor, *, grammar, budget_policy, graph=True):
+    def __init__(self, executor, *, grammar, graph=True):
         self.config = executor.config
         self.max_tokens_per_req = 4
         self.capture_bs = [1, 2, 4]
@@ -311,9 +318,7 @@ class _Runner(ForwardStepRunner):
         self.output_buffers = {}
         self.executor = executor
         executor.forward_step = self
-        self.confidence_feedback = ConfidenceFeedback(
-            4, 2, 8, budget_policy=budget_policy
-        )
+        self.confidence_feedback = ConfidenceFeedback(4, 2, 8)
 
     def run_round(self, ctx, info, *, queries):
         batch = ctx.bs
@@ -433,33 +438,28 @@ def _inputs(executor, runner, slots, *, step):
 
 
 @pytest.mark.parametrize("graph", [False, True])
-def test_confidence_feedback_keeps_acceptance_before_token_limit(process_group, graph):
+def test_confidence_dense_verify_stops_at_the_query_budget(process_group, graph):
     executor = _Executor(logprobs=False, grammar=False)
-    runner = _Runner(executor, grammar=False, budget_policy="confidence", graph=graph)
+    runner = _Runner(executor, grammar=False, graph=graph)
     if graph:
         runner.capture(entries=None, observer=_Observer())
-    states = executor.runtime_states
-    states.spec_candidates_ready[1] = True
-    # The uncached anchor already consumes one position of the token limit.
-    states.token_limits[1] = states.valid_cache_lengths[1] + 2
+    executor.runtime_states.spec_candidates_ready[1] = True
     ctx, info = _inputs(executor, runner, [1], step=0)
-    result = runner.run_round(ctx, info, queries=4)
-    assert result[1].tolist() == [1]
-    assert ctx.verify_queries.accept_lengths[:1].tolist() == [4]
+    tokens, lengths, *_ = runner.run_round(ctx, info, queries=2)
+    # All candidates match. The final computed target prediction is the bonus.
+    assert lengths.tolist() == [2]
+    assert tokens[:2].tolist() == [3, 3]
 
 
 @pytest.mark.parametrize(
     "logprobs,grammar", [(False, False), (True, False), (True, True)]
 )
-@pytest.mark.parametrize("budget_policy", ["confidence", "history"])
 def test_captured_round_preserves_outputs_and_state_when_b_and_q_change(
-    process_group, logprobs, grammar, budget_policy
+    process_group, logprobs, grammar
 ):
     eager, captured = (_Executor(logprobs=logprobs, grammar=grammar) for _ in range(2))
-    reference = _Runner(
-        eager, grammar=grammar, budget_policy=budget_policy, graph=False
-    )
-    runner = _Runner(captured, grammar=grammar, budget_policy=budget_policy)
+    reference = _Runner(eager, grammar=grammar, graph=False)
+    runner = _Runner(captured, grammar=grammar)
     runner.capture(entries=None, observer=_Observer())
     cases = [
         (8, [5, 2, 7, 1]),
@@ -516,10 +516,6 @@ def test_captured_round_preserves_outputs_and_state_when_b_and_q_change(
                 eager.runtime_states.draft_confidence[1:9],
             ),
             (
-                captured.runtime_states.previous_draft_confidence[1:9],
-                eager.runtime_states.previous_draft_confidence[1:9],
-            ),
-            (
                 captured.runtime_states.draft_confidence_generation[1:9],
                 eager.runtime_states.draft_confidence_generation[1:9],
             ),
@@ -541,7 +537,7 @@ def test_explicit_decode_override_and_above_ladder_keep_the_same_stage_behavior(
     process_group,
 ):
     executor = _Executor(logprobs=False, grammar=False)
-    runner = _Runner(executor, grammar=False, budget_policy="confidence")
+    runner = _Runner(executor, grammar=False)
     runner.capture(entries=None, observer=_Observer())
     queries = 8
     ctx, info = _inputs(executor, runner, [1, 2], step=2)
@@ -596,7 +592,7 @@ def test_captured_grammar_host_node_uses_the_live_request_batch(process_group):
     ).compile_grammar('root ::= "b"{128}')
     grammars = {slot: host_grammar(compiled) for slot in (1, 2, 3)}
     executor = _Executor(logprobs=False, grammar=True)
-    runner = _Runner(executor, grammar=False, budget_policy="confidence")
+    runner = _Runner(executor, grammar=False)
     runtime = CapturableGrammarExecutor(8, 16, 4)
     executor.grammar_runtime = runtime
     runner.capturable_grammar = runtime

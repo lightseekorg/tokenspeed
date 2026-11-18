@@ -207,60 +207,32 @@ def test_distributed_budget_matches_exhaustive_prefix_rewards(sizes):
 
 def test_planner_accounts_for_full_round_cost_and_prefers_smaller_ties():
     planner = VerifyBudgetPlanner(3)
-    planner.observe(2, 2, 1.0)
-    planner.observe(2, 4, 1.5)
-    planner.observe(2, 6, 3.0)
+    planner.set_baseline(2, 2, 1.0)
+    planner.set_baseline(2, 4, 1.5)
+    planner.set_baseline(2, 6, 3.0)
     assert planner.select(2, [[0.9, 0.9], [0.9, 0.9]]) == 4
     assert planner.select(2, [[0.0, 0.0], [0.0, 0.0]]) == 2
     with pytest.raises(ValueError):
-        planner.observe(2, 4, float("nan"))
+        planner.set_baseline(2, 4, float("nan"))
     with pytest.raises(ValueError):
         planner.select(2, [[1.0]])
 
 
-def test_planner_uses_shared_query_graphs_and_anchor_only_without_timings():
+def test_planner_uses_captured_query_graphs_and_full_width_without_timings():
     planner = VerifyBudgetPlanner(4)
     rates = [[0.8] * 3 for _ in range(4)]
-    assert planner.select(4, rates) == 4
+    assert planner.select(4, rates) == 16
     planner.set_baseline(4, 4, 1.0)
     planner.set_baseline(4, 6, 1.05)
     planner.set_baseline(4, 8, 2.0)
     assert planner.select(4, rates) == 6
 
 
-def test_live_cost_corrects_unvisited_large_query_graphs():
+def test_planner_uses_only_available_startup_buckets():
     planner = VerifyBudgetPlanner(4)
-    for queries in (4, 6, 8, 12, 16):
-        planner.set_baseline(4, queries, 1.0)
-    rates = [[0.6] * 3 for _ in range(4)]
-    assert planner.select(4, rates) == 16
-    for _ in range(10):
-        planner.observe(4, 16, 9.0)
-    # Live attention costs 0.5 ms/query above startup. The unvisited graphs
-    # must inherit it instead of attracting the next round at 1 ms each.
-    assert planner.select(4, rates) == 4
-
-
-def test_graph_cost_correction_ignores_isolated_slow_samples():
-    planner = VerifyBudgetPlanner(4)
-    for queries in (4, 8, 12, 16):
-        planner.set_baseline(4, queries, 1.0)
-    rates = [[0.9] * 3 for _ in range(4)]
-    for _ in range(10):
-        planner.observe(4, 16, 1.0)
-    planner.observe(4, 4, 1000.0)
-    assert planner.select(4, rates) == 16
-
-
-def test_live_cost_correction_expires_after_the_feedback_window():
-    planner = VerifyBudgetPlanner(4)
-    for queries, cost in ((2, 0.5), (4, 0.8), (8, 1.0)):
-        planner.set_baseline(2, queries, cost)
-    rates = [[0.8] * 3 for _ in range(2)]
-    assert planner.select(2, rates) == 8
-    for _ in range(10):
-        planner.observe(2, 2, 1.5)
-    assert planner.select(2, rates) == 2
-    for _ in range(5000):
-        planner.observe(2, 4, 0.8)
-    assert planner.select(2, rates) == 8
+    rates = [[0.8] * 3 for _ in range(4)]
+    planner.set_baseline(4, 4, 1.0)
+    planner.set_baseline(4, 8, 3.0)
+    planner.set_baseline(4, 12, 0.1)
+    assert planner.select(4, rates, capacities={4, 8}) == 4
+    assert planner.select(4, rates, capacities={4, 8, 12}) == 12

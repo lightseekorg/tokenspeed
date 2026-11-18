@@ -64,6 +64,30 @@ def _draft_model():
     return DSparkDraftModel(config, Mapping(rank=0, world_size=1))
 
 
+def test_confidence_is_opt_in_and_requires_dspark():
+    from tokenspeed.runtime.utils.server_args import ServerArgs
+
+    assert ServerArgs(model="x", device="cuda").speculative_verify_policy == "fixed"
+    assert (
+        ServerArgs(
+            model="x",
+            device="cuda",
+            speculative_algorithm="DSPARK",
+            speculative_verify_policy="confidence",
+        ).speculative_verify_policy
+        == "confidence"
+    )
+    with pytest.raises(ValueError, match="requires DSPARK"):
+        ServerArgs(model="x", device="cuda", speculative_verify_policy="confidence")
+    with pytest.raises(ValueError, match="must be fixed or confidence"):
+        ServerArgs(
+            model="x",
+            device="cuda",
+            speculative_algorithm="DSPARK",
+            speculative_verify_policy="history",
+        )
+
+
 def test_confidence_checkpoint_loading_is_complete_and_numerical():
     model = _draft_model()
     weight = torch.arange(10, dtype=torch.float32).view(1, 10) / 10
@@ -339,18 +363,17 @@ def test_slot_confidence_generations_are_reset_and_restored():
     second = torch.tensor([[0.6, 0.5, 0.4]])
     states.publish_draft_confidence(slots, first, group=None)
     states.publish_draft_confidence(slots, second, group=None)
-    torch.testing.assert_close(states.previous_draft_confidence[slots], first)
+
     torch.testing.assert_close(states.draft_confidence[slots], second)
     assert states.draft_confidence_generation[1].item() == 2
     image = torch.empty(states.slot_state_bytes(), dtype=torch.uint8)
     states.export_slot_state(1, image, None, admission_id=1)
     states.import_slot_state(2, image, None, admission_id=1)
     torch.testing.assert_close(states.draft_confidence[2], second[0])
-    torch.testing.assert_close(states.previous_draft_confidence[2], first[0])
+
     assert states.draft_confidence_generation[2].item() == 2
     states.reset_states(torch.tensor([2]), torch.tensor([0], dtype=torch.int32))
     assert not states.draft_confidence[2].any()
-    assert not states.previous_draft_confidence[2].any()
     assert states.draft_confidence_generation[2].item() == 0
     torch.testing.assert_close(states.draft_confidence[1], second[0])
 

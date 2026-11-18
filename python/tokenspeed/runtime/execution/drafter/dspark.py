@@ -60,7 +60,7 @@ class DSpark(DFlash):
     supports_speculative_sampling = True
 
     def decode_graph_query_capacities(self, bs: int) -> tuple[int, ...]:
-        if self.verify_policy in ("confidence", "history"):
+        if self.verify_policy == "confidence":
             return tuple(range(bs, bs * self.spec_num_tokens + 1, bs))
         return super().decode_graph_query_capacities(bs)
 
@@ -85,7 +85,7 @@ class DSpark(DFlash):
         self.verify_policy = (
             self.draft_model_runner.server_args.speculative_verify_policy
         )
-        if self.verify_policy in ("confidence", "history") and (
+        if self.verify_policy == "confidence" and (
             self.confidence_head is None or not self.model.confidence_weights_loaded
         ):
             raise ValueError(
@@ -93,7 +93,7 @@ class DSpark(DFlash):
             )
         self.confidence_rates: torch.Tensor | None = None
         self.confidence_group = None
-        if self.verify_policy in ("confidence", "history"):
+        if self.verify_policy == "confidence":
             mapping = self.draft_model_runner.server_args.mapping
             if mapping.world_size > 1:
                 from tokenspeed.runtime.distributed.process_group_manager import (
