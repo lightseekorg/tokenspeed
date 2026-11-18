@@ -2014,6 +2014,26 @@ whole). No family restates the order of the stages, and `_RECIPES`
 Automatic packing uses powers of two to avoid excessive LCM padding;
 exact page-stride constraints and explicit recipe packing take precedence.
 
+**Startup layout log.** After capacity agreement and PP narrowing, the runtime
+logs the bound `CacheRecipe` layout at INFO (probe builds use DEBUG). The ASCII
+matrix uses group names as columns and resident planes as rows. Column headers
+show physical blocks per parent (`packing`) and usable physical block counts;
+cells show field IDs, shapes, dtypes and byte ranges within one child stride.
+Packing repeats that stride within a plane. Plane rows also give bytes per
+parent and the plane's offset in the logical arena. Offloaded storage can map
+that arena onto both Device and Host regions; `layout_arena` is not a device
+allocation measurement.
+
+Padding includes alignment gaps between fields and trailing stride space,
+counted once per occupied plane. A hole is an entire plane unused by that
+group. Per-parent totals report payload, padding, holes, their sum (`unused`),
+and payload utilization. Each column describes a fully packed parent bound to
+that group, so columns must not be added together and unused bytes do not
+measure live allocator fragmentation. Arena bytes include the reserved null
+parent; usable parent and block counts exclude it. PP retains full shared
+planes, so space used only by a different stage appears as padding or holes
+in the local report.
+
 **Resident capacity before bind.** A PP owner projects the complete layout to
 the planes required by its fields. Whole retained planes, including padding
 and shared fields, determine the local bytes per parent. The runtime subtracts
