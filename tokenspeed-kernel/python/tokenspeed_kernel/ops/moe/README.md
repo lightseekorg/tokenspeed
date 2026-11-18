@@ -352,6 +352,26 @@ independent winners.
 This is a temporary workaround for FlashInfer 0.7's MoE tactic selection.
 When upstream tuning handles the full decode graph, remove it.
 
+With TP1 (all 512 experts local), the policy covers the 64- to 512-token
+buckets instead (33 to 512 rows: 9 to 128 requests with four MTP rows each).
+FlashInfer tunes on balanced routes, about 2.5 to 10 tokens per expert there,
+and picks tiles of 8 or 16 tokens. Decode routes are skewed: on routes captured
+from a real-text prefill, a batch of 32 requests x 4 rows reaches only about
+161 of the 512 experts per layer, and a few experts take most of the rows. On
+SM107 with those routes (routing, FC1 and FC2 in a CUDA graph with PDL), the
+tuner's pick vs the tile-32 pick it makes under this policy, us per MoE call:
+
+| rows | tuner today | tile 32 |
+|---|---|---|
+| 64 | 44.96 | 43.07 |
+| 128 | 57.54 | 52.19 |
+| 256 | 65.83 | 62.78 |
+| 512 | 88.27 | 77.97 |
+
+At 8 to 32 rows the tuner's tile-8 and tile-16 picks are as fast or faster
+(tile 32: +4% at 8 rows), and at 1024 rows the tuner already picks tile 32, so
+other buckets keep the full tuner.
+
 The policy targets CUDA-graph latency across routing, shared experts, and MoE
 GEMMs. On the measured BS1 MTP3 graph, FlashInfer 0.7's isolated-kernel tuner
 selected tile 8, leaving an idle interval before routing. This policy keeps

@@ -21,7 +21,7 @@
 """Private FlashInfer TRT-LLM entrypoints with model-specific tactic policies.
 
 Keep the upstream routing, tuner and GEMM implementations. FlashInfer's routing
-producers initialize expert-tile padding. One Qwen3.8 decode shape and the
+producers initialize expert-tile padding. Two Qwen3.8 decode shapes and the
 Kimi-K3 TP8 decode shapes past 128 rows narrow the valid MoE tactics to tile 32.
 A cache-key hook applies that policy to the target profile for this private
 runner only. The installed package and upstream JIT artifacts remain untouched.
@@ -126,10 +126,13 @@ def _is_qwen38_decode_shape(
 ) -> bool:
     return (
         nvfp4
-        and 1 <= num_tokens <= 32
         and top_k == 10
         and num_experts == 512
-        and num_local_experts == 128
+        and (
+            (num_local_experts == 128 and 1 <= num_tokens <= 32)
+            # TP1 64- to 512-token buckets: skewed decode routes favour tile 32 (README).
+            or (num_local_experts == 512 and 64 <= num_tokens <= 512)
+        )
         and hidden_size == 2560
         and intermediate_size == 640
     )
