@@ -3208,13 +3208,27 @@ _PREFILL_DOWN_TILES = {
     "xcd_swizzle": 8,
 }
 
-# The tiles above were measured only with FP8 activations. MXFP4 activations
-# (A4W4) keep the original prefill tile until they are measured on that path.
-_PREFILL_MXFP4_ACTIVATION_TILES = {
+# MXFP4 activations (A4W4) take eight warps, a two-buffer ring and the XCD
+# swizzle for both projections, and 128-column gate/up tiles. Against the
+# four-warp, three-buffer 256-column tile both projections used before, each
+# step measured faster on its own and the four together took Qwen3.8 Flash TP2
+# from 153.2 to 122.2 us at 2048 requests and 226.9 to 176.9 us at 4096, and
+# DSV4.1 Flash TP4 from 251.9 to 208.4 us and 344.7 to 283.5 us. From there a
+# third buffer, four warps, 128-wide K steps, 32- or 128-row tiles, a narrower
+# swizzle and other down widths all measured slower or even.
+_PREFILL_MXFP4_ACTIVATION_GATE_UP_TILES = {
+    "block_n": 128,
+    "block_k": 256,
+    "num_warps": 8,
+    "num_buffers": 2,
+    "xcd_swizzle": 8,
+}
+_PREFILL_MXFP4_ACTIVATION_DOWN_TILES = {
     "block_n": 256,
     "block_k": 256,
-    "num_warps": 4,
-    "num_buffers": 3,
+    "num_warps": 8,
+    "num_buffers": 2,
+    "xcd_swizzle": 8,
 }
 
 # Row blocks a queued decode gate/up launch interleaves in program order. A
@@ -3412,7 +3426,8 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
             gate_up_tiles = _PREFILL_GATE_UP_TILES
             down_tiles = _PREFILL_DOWN_TILES
         else:
-            gate_up_tiles = down_tiles = _PREFILL_MXFP4_ACTIVATION_TILES
+            gate_up_tiles = _PREFILL_MXFP4_ACTIVATION_GATE_UP_TILES
+            down_tiles = _PREFILL_MXFP4_ACTIVATION_DOWN_TILES
     launch = dict(block_m=block_m, decode=decode, partial_tdm=partial_tdm)
     if activation_dtype == "mxfp4":
         intermediate, intermediate_mx_scale = gluon_mxfp_ragged_matmul(
