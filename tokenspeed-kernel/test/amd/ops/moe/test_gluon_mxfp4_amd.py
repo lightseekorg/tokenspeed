@@ -1536,7 +1536,7 @@ def _gfx1250_first_expert_matmul(
         )
     )
     w13 = module.w13_weight_triton_tensor
-    x_fp8 = gfx1250_fused._quantize_fp8_activation(hidden_states, w13.act_scale)
+    x_fp8 = gfx1250_fused._quantize_fp8_activation(hidden_states, w13.act_scale, 0)
     fused_activation = gfx1250_fused.FusedActivation(
         gfx1250_fused.FnSpecs("situ", None, ("beta", "linear_beta"), reduction_n=2),
         (4.0, 25.0),

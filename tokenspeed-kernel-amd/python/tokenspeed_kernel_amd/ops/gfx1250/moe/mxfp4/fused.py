@@ -999,6 +999,19 @@ def _matmul(
         GatherIndx,
         start_m,
     )
+    if cfg.USE_GATHER and RAGGED_DIMENSION == "M":
+        # Row slots past the expert's rows gather their own spare rows, not
+        # the rows of the neighbouring routes: a gather that repeats a row is
+        # slow (see _GATHER_SPARE_ROWS).
+        SLOT_LAYOUT: gl.constexpr = gl.SliceLayout(
+            0, get_tdm_gather_scatter_idx_layout(BLOCK_M, cfg.NUM_WARPS)
+        )
+        slot = gl.arange(0, BLOCK_M, SLOT_LAYOUT)
+        gathered_m = gl.where(
+            (off_m + slot < eM) | (XSpareRow < 0),
+            gathered_m,
+            (XSpareRow + slot - 1).to(gathered_m.dtype),
+        )
 
     Y_ptr = Y + start_z_out.to(address_index_type) * stride_y_z
 
@@ -1861,7 +1874,9 @@ def _fp8_quantize_kernel(
 def _quantize_fp8_activation(
     x: torch.Tensor,
     scale: torch.Tensor | None,
+    spare_rows: int,
 ) -> torch.Tensor:
+    """Cast ``x`` to FP8; ``spare_rows`` unwritten rows follow a cast result."""
     if x.dtype is torch.float8_e4m3fn:
         return x.contiguous()
     if x.dtype not in (torch.bfloat16, torch.float16):
@@ -1871,7 +1886,11 @@ def _quantize_fp8_activation(
         if scale.numel() != 1:
             raise ValueError("FP8 activation scale must be scalar")
         scale = scale.contiguous()
-    out = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    out = torch.empty(
+        (int(x.shape[0]) + spare_rows, int(x.shape[1])),
+        dtype=torch.float8_e4m3fn,
+        device=x.device,
+    )
     block_size = 4096
     _fp8_quantize_kernel[(triton.cdiv(x.numel(), block_size),)](
         x,
@@ -3376,14 +3395,14 @@ _PREFILL_MXFP4_ACTIVATION_DOWN_TILES = {
 # to 1.8% slower with it. The down projection measured faster ungrouped.
 _DECODE_QUEUED_GATE_UP_GROUP_M = 8
 
-# Spare activation rows a decode gate/up launch gathers in the row slots its
-# blocks do not use, one fewer than the widest decode row tile needs. A gather
-# that repeats a row is slow, and unused slots otherwise name the rows of the
-# neighbouring routes: a single request names its one row in every slot. The
-# rows are never written and their products are never stored. Kimi K3 TP8
-# measured 15.8 -> 15.0 us at one request, 19.1 -> 17.9 us at four, 26.2 ->
-# 25.3 us at eight and 120.9 -> 119.2 us at 256.
-_DECODE_GATHER_SPARE_ROWS = 32
+# Spare activation rows a gate/up launch gathers in the row slots its blocks
+# do not use, one fewer than the widest row tile needs. A gather that repeats
+# a row is slow, and unused slots otherwise name the rows of the neighbouring
+# routes: a single request names its one row in every slot. The rows are
+# never written and their products are never stored. Kimi K3 TP8 measured
+# 15.7 -> 15.0 us at one request, 19.1 -> 17.9 us at four, 121.0 -> 119.4 us at
+# 256 and 167.7 -> 165.0 us at 896.
+_GATHER_SPARE_ROWS = 64
 
 # Gate/up programs per CU up to which a decode launch reads its row ranges by
 # block index. On Kimi K3 TP8 that measured 16.5 -> 16.2 us at two requests
@@ -3503,7 +3522,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
                 ).multi_processor_count
             )
 
-    spare_rows = _DECODE_GATHER_SPARE_ROWS if decode else 0
+    spare_rows = _GATHER_SPARE_ROWS
     if activation_dtype == "mxfp4":
         (
             ragged_metadata,
@@ -3663,7 +3682,9 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         )
     else:
         if x_fp8 is None:
-            x_fp8 = _quantize_fp8_activation(hidden_states, w13_weight.act_scale)
+            x_fp8 = _quantize_fp8_activation(
+                hidden_states, w13_weight.act_scale, spare_rows
+            )
         # The second matmul wants its activation in FP8, so the first one
         # divides by that scale and casts in its epilogue. Quantizing
         # separately would re-read and rewrite the whole intermediate for no

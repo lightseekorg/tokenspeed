@@ -488,7 +488,7 @@ def test_kimi_k3_tp_situ_block_indexed_decode_matches_gfx1250(
     torch.testing.assert_close(by_block, by_expert, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 4, 64])
+@pytest.mark.parametrize("num_tokens", [1, 4, 64, 512])
 def test_kimi_k3_tp_situ_spare_gather_rows_match_gfx1250(
     monkeypatch: pytest.MonkeyPatch, num_tokens: int
 ) -> None:
@@ -508,9 +508,9 @@ def test_kimi_k3_tp_situ_spare_gather_rows_match_gfx1250(
             topk_ids=topk_ids,
         ).clone()
 
-    monkeypatch.setattr(fused, "_DECODE_GATHER_SPARE_ROWS", 0)
+    monkeypatch.setattr(fused, "_GATHER_SPARE_ROWS", 0)
     neighbour_rows = apply()
-    monkeypatch.setattr(fused, "_DECODE_GATHER_SPARE_ROWS", 32)
+    monkeypatch.setattr(fused, "_GATHER_SPARE_ROWS", 64)
     spare_rows = apply()
     torch.cuda.synchronize()
     assert torch.count_nonzero(neighbour_rows).item() > 0
@@ -562,7 +562,7 @@ def test_gfx1250_small_route_fp8_quantize_matches_standalone(
     scale = (
         torch.full((1,), 0.37, dtype=torch.float32, device="cuda") if scaled else None
     )
-    expected = fused._quantize_fp8_activation(hidden_states, scale)
+    expected = fused._quantize_fp8_activation(hidden_states, scale, 0)
     routed = torch.empty_like(expected)
     route = fused._precomputed_topk_route_small_m_gfx1250(
         topk_weights.float().contiguous(),
@@ -594,7 +594,7 @@ def test_gfx1250_staged_route_fp8_quantize_matches_standalone(scaled: bool) -> N
     scale = (
         torch.full((1,), 0.37, dtype=torch.float32, device="cuda") if scaled else None
     )
-    expected = fused._quantize_fp8_activation(hidden_states, scale)
+    expected = fused._quantize_fp8_activation(hidden_states, scale, 0)
     routed = torch.empty_like(expected)
     route = fused._precomputed_topk_route_large_m_gfx1250(
         topk_weights.float().contiguous(),
