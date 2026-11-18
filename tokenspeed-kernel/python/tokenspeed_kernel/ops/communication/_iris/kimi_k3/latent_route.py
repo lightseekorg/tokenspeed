@@ -125,8 +125,14 @@ def _k3_await_count(counter, target):
 
 @gluon.jit
 def _k3_ordered_key(value):
-    """Map FP32 ``value`` to a uint32 key in the same order (negative patterns
-    fully inverted, others sign-flipped) for ``_k3_top16``'s packed keys."""
+    """Map FP32 ``value`` to a uint32 key that compares as unsigned in the
+    same order as the floats, for ``_k3_top16``'s packed keys.
+
+    FP32 bits are sign and magnitude. Setting the sign bit of a non-negative
+    value puts it above every negative one, keeping magnitude order; inverting
+    every bit of a negative value clears its sign bit and reverses its
+    magnitude order, so a more negative value gets a smaller key.
+    """
     bits = value.to(gl.uint32, bitcast=True)
     sign = gl.full_like(bits, 0x80000000)
     return bits ^ gl.where((bits & sign) != 0, gl.full_like(bits, 0xFFFFFFFF), sign)
@@ -134,11 +140,20 @@ def _k3_ordered_key(value):
 
 @gluon.jit
 def _k3_popcount(words):
-    """Set bits in each 32-bit lane of the expert arrival ``words``, as int32."""
+    """Count the set bits in each 32-bit lane of the expert arrival ``words``.
+
+    The SWAR population count: each step adds neighboring fields of the
+    previous width in parallel, so every field holds the count of its bits.
+    The int32 result is each lane's count.
+    """
     bits = words.to(gl.uint32, bitcast=True)
+    # Each 2-bit field: its count of set bits (0..2), as pair - (pair >> 1).
     bits = bits - ((bits >> 1) & 0x55555555)
+    # Each 4-bit field: the sum of its two 2-bit counts (0..4).
     bits = (bits & 0x33333333) + ((bits >> 2) & 0x33333333)
+    # Each byte: the sum of its two 4-bit counts (0..8), which cannot carry.
     bits = (bits + (bits >> 4)) & 0x0F0F0F0F
+    # Multiplying by 0x01010101 sums the four byte counts into the top byte.
     return ((bits * 0x01010101) >> 24).to(gl.int32)
 
 

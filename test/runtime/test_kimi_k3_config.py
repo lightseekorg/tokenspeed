@@ -331,15 +331,9 @@ class TestKimiK3RegistrationTests:
             "the packed weight must still be set, or the guard proves nothing"
         )
 
-    @pytest.mark.parametrize(
-        "apply_kernel, quantized",
-        (
-            ("gluon_mxfp4_a8w4_situ_precomputed_moe_apply", True),
-            ("triton_bf16_precomputed_moe_apply", False),
-        ),
-    )
-    def test_the_latent_gather_quantizes_only_for_the_a8w4_moe(
-        self, apply_kernel, quantized
+    @pytest.mark.parametrize("quantized", (True, False))
+    def test_the_latent_gather_quantizes_only_for_experts_that_read_fp8(
+        self, quantized
     ):
         """The gathered latent's FP8 copy reaches the experts that read it."""
         from tokenspeed.runtime.models import kimi_k3
@@ -358,7 +352,7 @@ class TestKimiK3RegistrationTests:
         moe = built.layer
         moe.packed_input_projection_weight = torch.zeros(1)
         moe.routed_expert_down_proj.narrowed = False
-        moe.experts.plan["apply_kernel_name"] = apply_kernel
+        moe.experts.plan["supports_fp8_per_tensor_input"] = quantized
         moe.experts._situ_input_fp8 = "stale"
         moe.shared_experts.act_fn = SimpleNamespace(beta=25.0, linear_beta=25.0)
         hidden = torch.zeros(4, 8)
@@ -389,16 +383,8 @@ class TestKimiK3RegistrationTests:
         assert moe.experts._situ_input_fp8 is None
 
     @_AMD_ONLY
-    @pytest.mark.parametrize(
-        "apply_kernel, quantized",
-        (
-            ("gluon_mxfp4_a8w4_situ_precomputed_moe_apply", True),
-            ("triton_bf16_precomputed_moe_apply", False),
-        ),
-    )
-    def test_the_routed_latent_gather_hands_its_routes_to_the_experts(
-        self, apply_kernel, quantized
-    ):
+    @pytest.mark.parametrize("quantized", (True, False))
+    def test_the_routed_latent_gather_hands_its_routes_to_the_experts(self, quantized):
         """One launch's routes, expert sort and latent replace the routing launch."""
         from tokenspeed.runtime.models import kimi_k3
 
@@ -416,7 +402,7 @@ class TestKimiK3RegistrationTests:
         moe = built.layer
         moe.packed_input_projection_weight = torch.zeros(1)
         moe.routed_expert_down_proj.narrowed = False
-        moe.experts.plan["apply_kernel_name"] = apply_kernel
+        moe.experts.plan["supports_fp8_per_tensor_input"] = quantized
         moe.experts.sorted_route_rows = frozenset({4})
         moe.experts.sorted_route_block_size = 16
         moe.experts._situ_input_fp8 = "stale"
