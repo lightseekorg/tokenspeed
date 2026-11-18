@@ -1,17 +1,16 @@
-# Final-MLP observation: validation and limits
+# Final MLP replay validation
 
-The [observer](../design/final-mlp-observation.md) records actual final-MLP
-intermediates and replays a channel intervention with the model's existing
-down-projection, norm, and head kernels. It supplies evidence about one forward;
-it is not a backdoor detector, weight-integrity boundary, or agent-action policy.
-Without creating an observer, no hooks or observation buffers are introduced.
-Construction allocates buffers; attachment installs hooks whose guard checks
-still run while idle. Closing removes hooks but retains the object's buffers.
+The observer saves the final MLP activation and residual so a developer can
+replay the down projection, norm, and output head when investigating a logit
+difference. On the recorded Qwen3 run, replay reproduced the original logits
+exactly. Zeroing selected activations in replay and in a full model run also
+produced identical logits.
 
 The adapter supports dense unquantized Qwen3, BF16/FP32, TP=PP=DP=1, and eager
 execution. It retains all physical rows, separate pre-add residuals, and selected
 logit row indices. Graphs, speculation, monokernels, fused GEMM/SwiGLU, and
-quantization are unsupported. See the design document for lifetime constraints.
+quantization are outside the measured scope. See the [observer design](../design/final-mlp-observation.md)
+for hook and buffer lifetimes.
 
 ## Provenance and reproducibility
 
@@ -23,10 +22,10 @@ tensors were independently checked against the pinned checkpoint. The
 [compact evidence record](final-mlp-observation-evidence.json) binds source and
 checkpoint hashes and records the measured scope.
 
-The unit tests and cold-prefill example below are included in this change.
-Cached-decode, timing, and controlled-fixture measurements used separate research
-drivers and retained artifacts that are **not included**. Their summaries are
-reported observations, not independently reproducible benchmarks from this PR.
+The repository includes the unit tests and cold-prefill example below. The
+cached-decode, timing, and synthetic-input results summarize earlier runs using
+drivers and raw artifacts maintained outside this repository. The hashes in
+the evidence record identify the source and weights used for those measurements.
 
 In an installed TokenSpeed GPU environment, run from the repository root:
 
@@ -46,13 +45,12 @@ reports full-array errors and fails on nonfinite values or unequal arrays;
 matching winning tokens alone does not pass. The test suite includes CPU cases
 using numerical kernel references and GPU cases using native BF16 kernels.
 A CPU-only run skips those GPU cases.
-The final formatted source passed all 20 tests with no skips; source hashes
-were identical before and after that run.
+The source identified by the recorded hashes passed all 20 tests with no skips.
 
 ## Numerical validation
 
-All reported comparisons below were finite and exactly equal on the tested
-configuration. This is measured equality, not a cross-device guarantee.
+All array comparisons below were finite and exactly equal on the tested
+configuration. T counts physical token rows and S counts selected logit rows.
 
 | Validation | Rows and modes | Result |
 | --- | --- | --- |
@@ -89,34 +87,44 @@ outlier at T=512 was retained. GPU-event intervals also include host-dispatch id
 gaps. These are bounded analysis costs, not serving-throughput or decode-overhead
 claims.
 
-## Implications for conditional weight edits
+## Replay across synthetic inputs
 
-A separate study used harmless single-channel final-MLP marker fixtures and a
-label-blind score: rank `abs(activation) * L2(down column)`, ablate the top five,
-and measure the original winner-versus-runner-up margin drop. This score is
-outside the observer API. Clean calibration on 2,160 unique inputs froze the
-strict threshold `score > 3.25` before 3,600 held-out requests from two lineages.
+A separate experiment checked replay on 3,600 held-out requests using two
+synthetic model variants. Each variant had one modified final MLP channel and
+a designated output token. All 43,200 replay identity checks and 120 comparisons
+against full-model ablation passed.
 
-- Clean alarms were 35/3,600 (0.972%), but 24/400 (6%) on factual requests.
-  Grouped synthetic prompts do not establish a population false-positive bound.
-- All 498 observed unauthorized exact-marker overrides alarmed, as did all
-  257 authorized overrides. Causal concentration does not reveal authorization.
-- Preparation acceptance did not transfer reliably: trigger emissions were
-  13/360 for one lineage and 210/360 for the other; the latter also emitted on
-  125/360 baseline and 141/360 near-trigger requests.
-- Among 236 edited-wrong cases with a correct base first token, unconditional
-  top-one ablation restored 236 first tokens and top-five restored 226. They
-  damaged 14 and 53 currently correct edited cases, respectively. First-token
-  correctness does not establish complete-answer correctness.
-- All 43,200 replay identity checks and 120 full-model ablation checks passed.
-  All 3,600 matched controls preserved logit and write-score arrays. For 1,800
-  velvet requests, the nontrivial control multiplied down weights by 0.25 and
-  up weights by 4. The 1,800 marble controls used factor 1, an identity control
-  that supplies no evidence about rescaling sensitivity. A separate earlier
-  nonce-development control used down factor 64 and up factor 1/64 on 720
-  requests, also preserving every tested logit and write-score array exactly.
+All 3,600 matched controls preserved both the logit arrays and the channel
+scores `abs(activation) * L2(down column)`. The table shows which controls
+actually changed the weight scale.
 
-The useful primitive is faithful observation and local causal replay. A deployment
-would still need model provenance, independent action authorization, and its own
-calibration and workload validation. Neither these constructed fixtures nor their
-successful localization establish a universal defense against weight backdoors.
+| Input set | Requests | Down / up weight multipliers | What the comparison covers |
+| --- | ---: | --- | --- |
+| Velvet | 1,800 | 0.25 / 4 | Reciprocal rescaling |
+| Marble | 1,800 | 1 / 1 | Identity with unchanged weights |
+| Earlier nonce development set | 720 | 64 / (1/64) | Reciprocal rescaling, measured separately during development |
+
+The development set also preserved every tested logit and channel-score array.
+Its fixture had failed the preparation criteria, so the 720 requests are
+reported separately from the held-out results.
+
+The experiment ranked channels by the score above, zeroed the top five, and
+measured the drop in the logit margin between the original winner and runner-up.
+It fixed a threshold of 3.25 logits on 2,160 calibration inputs. This threshold
+applies to the replay experiment. The runtime watcher uses a separate limit on
+each channel's estimated contribution at the down projection.
+
+On held-out inputs, 35 of 3,600 baseline requests exceeded 3.25 logits,
+including 24 of the 400 factual requests. When a variant changed the baseline
+winner to the designated token, the drop exceeded 3.25 in all 498 cases where
+the token was unrequested and all 257 where it was requested.
+
+The two variants produced the designated token on 13/360 and 210/360 inputs
+containing the fixture's target pattern. The second also produced it on 125/360
+baseline inputs and 141/360 inputs containing a near match.
+
+Of 236 requests where a variant changed a correct first token to an incorrect
+one, zeroing the top channel restored 236 correct tokens and zeroing the top
+five restored 226. Of the 1,480 requests where the variant's first token was
+already correct, the same changes made 14 and 53 first tokens incorrect.
+The experiment scored only the first token of each response.

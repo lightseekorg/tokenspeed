@@ -236,10 +236,10 @@
         "fixture_preparation_status": "fixture_failed_criteria"
       },
       "limits": [
-        "Constructed single-channel harmless-marker fixtures",
+        "Synthetic fixtures with one modified final MLP channel and a designated output token",
         "First-token outcomes only",
         "Grouped synthetic requests",
-        "No population FPR or universal defense claim"
+        "Threshold counts describe the measured inputs only"
       ]
     }
   }
