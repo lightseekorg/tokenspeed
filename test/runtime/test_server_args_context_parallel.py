@@ -201,28 +201,19 @@ def test_the_prefill_role_accepts_a_full_tp_query_shard():
     assert not args.disable_prefill_graph
 
 
-def test_aggregated_query_shard_retains_dcp_for_decode():
-    args = prepare_server_args(
-        BASE + ["--disaggregation-mode", "null", "--decode-context-parallel-size", "2"]
-    )
+@pytest.mark.parametrize("role", ["null", "prefill"])
+@pytest.mark.parametrize("backend", [None, "dsa", "hybrid_linear_attn"])
+def test_query_shard_defers_backend_selection_to_the_model(role, backend):
+    argv = BASE[:-2] + ["--disaggregation-mode", role]
+    if backend is not None:
+        argv += ["--attention-backend", backend]
+    if role == "null":
+        argv += ["--decode-context-parallel-size", "2"]
+    args = prepare_server_args(argv)
+    assert args.attention_backend == backend
     assert args.mapping.attn.qcp_size == args.mapping.attn.kvp_size == 2
-    assert args.decode_context_parallel_size == 2
+    assert args.decode_context_parallel_size == (2 if role == "null" else 1)
     assert not args.enable_mixed_batch
-
-
-def test_aggregated_query_shard_rejects_other_backends():
-    with pytest.raises(ValueError, match="aggregated QCP validation is limited to dsa"):
-        prepare_server_args(
-            BASE
-            + [
-                "--disaggregation-mode",
-                "null",
-                "--decode-context-parallel-size",
-                "2",
-                "--attention-backend",
-                "flashmla",
-            ]
-        )
 
 
 def test_the_prefill_role_shards_its_pages_without_a_query_shard():
@@ -442,18 +433,33 @@ def test_the_attention_config_pins_query_sharding_to_a_bf16_native_cache():
     )
 
 
-def test_hybrid_dsa_query_shard_validates_the_resolved_leaf():
+@pytest.mark.parametrize("pd_enabled", [False, True])
+@pytest.mark.parametrize("backend", [None, "dsa", "hybrid_linear_attn"])
+def test_dsa_query_shard_validates_the_resolved_leaf(pd_enabled, backend):
     from dataclasses import replace
 
-    config = _dsa_attn_config()
+    config = _dsa_attn_config(pd_disaggregation_enabled=pd_enabled)
     component = config.components[0]
-    wrapped = replace(
-        config, components=(replace(component, backend_name="hybrid_linear_attn"),)
-    )
+    wrapped = replace(config, components=(replace(component, backend_name=backend),))
     resolved = replace(wrapped, components=(replace(component, backend_name="dsa"),))
     assert resolved.qcp_size == resolved.kvp_size == 2
+    for unsupported in ("flashmla", "tokenspeed_mla", "mha"):
+        with pytest.raises(ValueError, match="requires GPU DSA"):
+            replace(wrapped, components=(replace(component, backend_name=unsupported),))
+
+
+@pytest.mark.parametrize("pd_enabled", [False, True])
+def test_query_shard_rejects_a_non_dsa_model_without_an_explicit_backend(pd_enabled):
+    from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
+
+    component = MHAConfig(
+        num_attention_heads=4,
+        num_kv_heads=1,
+        head_dim=128,
+        attn_tp_size=2,
+    )
     with pytest.raises(ValueError, match="requires GPU DSA"):
-        replace(wrapped, components=(replace(component, backend_name="flashmla"),))
+        _dsa_attn_config(pd_disaggregation_enabled=pd_enabled, components=(component,))
 
 
 @pytest.mark.parametrize("size", [2, 4, 8])
@@ -475,16 +481,18 @@ def test_v41_aggregated_kvp_requires_explicit_matching_dcp(size):
     assert not args.mapping.attn.has_qcp
     with pytest.raises(ValueError, match="must equal --kv-parallel-size"):
         prepare_server_args(argv + ["--decode-context-parallel-size", str(size * 2)])
-    with pytest.raises(ValueError, match="requires --disaggregation-mode prefill"):
-        prepare_server_args(
-            argv
-            + [
-                "--decode-context-parallel-size",
-                str(size),
-                "--query-context-parallel-size",
-                str(size),
-            ]
-        )
+    # Model-specific QCP support is checked by DeepseekV41Config.generate,
+    # after the checkpoint has resolved the attention backend.
+    qcp_args = prepare_server_args(
+        argv
+        + [
+            "--decode-context-parallel-size",
+            str(size),
+            "--query-context-parallel-size",
+            str(size),
+        ]
+    )
+    assert qcp_args.mapping.attn.qcp_size == size
 
 
 def test_dsa_query_sharding_still_requires_sharded_kv():

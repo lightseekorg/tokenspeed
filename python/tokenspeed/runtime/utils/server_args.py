@@ -1556,15 +1556,8 @@ class ServerArgs:
             qcp_size=self.mapping.attn.qcp_size,
             disaggregation_mode=self.disaggregation_mode,
         )
-        if (
-            self.mapping.attn.has_qcp
-            and self.disaggregation_mode == "null"
-            and self.attention_backend != "dsa"
-        ):
-            raise ValueError(
-                "Query-sharded execution requires --disaggregation-mode prefill "
-                "for this backend; aggregated QCP validation is limited to dsa"
-            )
+        # Backend compatibility is checked when the model's attention config
+        # is built, including the resolved full-attention leaf of hybrid models.
         validate_qcp(
             qcp_size=self.mapping.attn.qcp_size,
             attn_tp_size=self.mapping.attn.tp_size,
@@ -1596,7 +1589,7 @@ class ServerArgs:
         The structural rules (head TP needs attention TP 1 or a full-TP query
         shard, is the query-shard group under QCP, tiles the stage world; LM
         head TP under DP needs attention TP 1) live in ``Mapping``; the
-        prefill role's rules in ``validate_qcp``. This checks what only the
+        Prefill layout rules in ``validate_qcp``. This checks what only the
         server knows: the engine role and the batch-invariance selection. The
         weights' quantization is checked once the checkpoint's is resolved
         (:meth:`validate_tp_batch_invariant_weights`).
@@ -1610,8 +1603,7 @@ class ServerArgs:
             # cached prefix, which the head-sharded kv_b_proj cannot produce.
             # Over the query shards (attn.has_qcp) the extend rows run the
             # absorbed sparse prefill through the exchange;
-            # validate_context_parallel_roles pinned the prefill role and the
-            # GPU DSA backend declares its prefill eager under a shard.
+            # the GPU DSA backend declares its prefill eager under a shard.
             if self.disaggregation_mode != "decode":
                 raise ValueError(
                     "--attn-head-tp-size > 1 serves decode rows only and "

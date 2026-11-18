@@ -784,9 +784,14 @@ without adding history gathers; latency still depends on query distribution
 and the selected kernels. A request whose history exceeds the workspace is
 rejected.
 
+Backend support is checked after the model's attention configuration resolves,
+including the full-attention leaf of a hybrid model. An explicit
+`--attention-backend dsa` is not required when the model selects DSA. Unsupported
+backends are rejected before cache allocation; V4.1 model QCP retains its
+prefill-role-only restriction.
+
 Requirements: `--disaggregation-mode prefill`, or `null` with
-`--attention-backend dsa` and `--decode-context-parallel-size N`, together with
-`--kv-parallel-size N`
+`--decode-context-parallel-size N`, together with `--kv-parallel-size N`
 (the query shard is a layout over the sharded pages; the engine keeps the
 Host KVStore, the retraction snapshot pool and L3 storage, as every
 KVP engine does, but not yet `--kvstore-write-policy write_back`),
@@ -797,9 +802,7 @@ each 1 or `N` (attention returns complete rows, so the drafter's replicated
 decode rows are never scattered and a narrower group would have nothing to
 gather). The prefill stays eager: the GPU DSA backend declares no prefill
 graph under a shard, so the launch need not say `--disable-prefill-graph`.
-Only pure extend forwards carry a query shard; mixed Prefill/Decode forwards
-are rejected. Decode retains replicated query rows and reads the same KVP
-pages through DCP. This also applies to a drafter's Decode steps.
+Only pure extend forwards carry a query shard; mixed forwards are rejected.
 
 **Head TP over the query shards.** Without `--attn-head-tp-size` the shard
 group's ranks hold different rows and every rank holds every head of

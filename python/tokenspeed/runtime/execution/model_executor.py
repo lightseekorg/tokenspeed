@@ -2775,8 +2775,7 @@ class ModelExecutor:
                     )
                 query_shard = None
                 if self.config.query_shard_size > 1 and num_extends > 0:
-                    # Shard pure Prefill spans. An aggregated engine retains
-                    # replicated query rows for Decode over the same KVP cache.
+                    # Query shards describe pure Prefill spans only.
                     # Mixed forwards still need a separate row-layout contract.
                     if num_extends != bs:
                         raise RuntimeError(
