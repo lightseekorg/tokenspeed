@@ -345,7 +345,7 @@ One workgroup computes a `256 x 256 x 128` tile with eight wave64s. Four
 `128 x 128` accumulator quadrants use native `32 x 32 x 64` E4M3 scaled MFMA.
 Two K tiles are software-pipelined at a time, and phase-shifted MFMA and memory
 stages implement the eight-wave warp-pipeline schedule. XCD-aware grouped tile
-ordering spreads adjacent output tiles across the eight XCDs.
+ordering spreads adjacent output tiles across the device's XCDs.
 
 E4M3 values use vectorized asynchronous global-to-LDS copies into separate,
 padded double buffers for A and B. Canonical row-major A scales use dword

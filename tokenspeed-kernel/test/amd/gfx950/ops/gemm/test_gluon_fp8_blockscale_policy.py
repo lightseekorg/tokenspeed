@@ -123,7 +123,7 @@ def test_public_fp32_requires_canonical_scales(missing_scale, block_size):
     ],
 )
 def test_fp32_shape_policy_boundaries(shape, expected, hint):
-    config = mm._fp32_launch_config(*shape)
+    config = mm._fp32_launch_config(*shape, torch.device("cuda"))
     assert tuple(config) == expected
     assert mm._fp32_pipeline_waves_per_eu(*shape, config) == hint
 
@@ -139,7 +139,7 @@ def test_fp32_shape_policy_boundaries(shape, expected, hint):
     ],
 )
 def test_fp32_ragged_partitions_have_work_and_legal_wave_tiles(m, n, k):
-    config = mm._fp32_launch_config(m, n, k)
+    config = mm._fp32_launch_config(m, n, k, torch.device("cuda"))
     assert ((k + 255) // 256) // config.splits >= 2
     assert config.waves in (4, 8)
 

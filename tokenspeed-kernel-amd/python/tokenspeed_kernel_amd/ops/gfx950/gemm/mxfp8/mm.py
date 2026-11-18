@@ -40,6 +40,7 @@ from __future__ import annotations
 from typing import Callable, NamedTuple
 
 import torch
+from tokenspeed_kernel_amd._device import num_cus, num_xcds
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.decode import (
     gluon_mm_mxfp8_decode_num_counters_gfx950,
@@ -58,7 +59,6 @@ MXFP8_NUM_WARPS = 8
 MXFP8_WAVES_PER_EU = 2
 MXFP8_WARPS_M = 2
 MXFP8_WARPS_N = 4
-MXFP8_NUM_XCDS = 8
 MXFP8_GROUP_SIZE_M = 4
 MXFP8_N_ALIGN = 16
 # Scale staging: direct register loads, dword async copies alongside the
@@ -67,7 +67,6 @@ MXFP8_SCALES_DIRECT = gl.constexpr(0)
 MXFP8_SCALES_ASYNC = gl.constexpr(1)
 MXFP8_SCALES_PRELOAD = gl.constexpr(2)
 MXFP8_PRELOAD_TILES = 8
-MXFP8_NUM_CUS = 256
 MXFP8_MIN_SPLIT_PAIRS = 2
 MXFP8_MAX_SPLITS = 8
 # Split-K cost model (microseconds), measured on MI355X: one 256x256x128 tile
@@ -2085,19 +2084,22 @@ def supports_mxfp8_gemm_shape(m: int, n: int, k: int) -> bool:
     )
 
 
-def _num_splits_for_tile(m: int, n: int, k: int, block_m: int, block_n: int) -> int:
+def _num_splits_for_tile(
+    m: int, n: int, k: int, block_m: int, block_n: int, device: torch.device
+) -> int:
     """Pick the split-K partition count for a shape.
 
     Splitting shortens each workgroup's K walk but adds an FP32 partial round
     trip through memory. The measured cost model below picks the cheapest
-    count that keeps every split within one wave of workgroups and at least
+    count that keeps every split within one wave of workgroups (one per CU of
+    ``device``) and at least
     MXFP8_MIN_SPLIT_PAIRS K-tile pairs long.
     """
     tiles = triton.cdiv(m, block_m) * triton.cdiv(n, block_n)
     pairs = triton.cdiv(k, MXFP8_K_UNROLL)
     best, best_us = 1, 2 * pairs * MXFP8_TILE_US
     for splits in range(2, MXFP8_MAX_SPLITS + 1):
-        if tiles * splits > MXFP8_NUM_CUS or pairs < splits * MXFP8_MIN_SPLIT_PAIRS:
+        if tiles * splits > num_cus(device) or pairs < splits * MXFP8_MIN_SPLIT_PAIRS:
             break
         estimate_us = (
             2 * triton.cdiv(pairs, splits) * MXFP8_TILE_US
@@ -2109,8 +2111,8 @@ def _num_splits_for_tile(m: int, n: int, k: int, block_m: int, block_n: int) -> 
     return best
 
 
-def _mxfp8_num_splits(m: int, n: int, k: int) -> int:
-    return _num_splits_for_tile(m, n, k, MXFP8_BLOCK_M, MXFP8_BLOCK_N)
+def _mxfp8_num_splits(m: int, n: int, k: int, device: torch.device) -> int:
+    return _num_splits_for_tile(m, n, k, MXFP8_BLOCK_M, MXFP8_BLOCK_N, device)
 
 
 def _validate_scale(name: str, scale: torch.Tensor, rows: int, k: int) -> None:
@@ -2183,7 +2185,9 @@ def _fp32_reducer_tile(m: int, n: int, k: int):
     )
 
 
-def _fp32_launch_config(m: int, n: int, k: int) -> _FP32LaunchConfig:
+def _fp32_launch_config(
+    m: int, n: int, k: int, device: torch.device
+) -> _FP32LaunchConfig:
     if m <= 256 or n <= 256:
         block_m = 16 if m <= 16 else 32
         if n > 256 and k > 512 and triton.cdiv(m, 64) * 64 == triton.cdiv(m, 32) * 32:
@@ -2213,7 +2217,9 @@ def _fp32_launch_config(m: int, n: int, k: int) -> _FP32LaunchConfig:
         )
         return _FP32LaunchConfig(128, 128, 8, splits)
     # Filled, aligned grids retain the large tile and its split cost model.
-    return _FP32LaunchConfig(256, 256, 8, _num_splits_for_tile(m, n, k, 256, 256))
+    return _FP32LaunchConfig(
+        256, 256, 8, _num_splits_for_tile(m, n, k, 256, 256, device)
+    )
 
 
 def launch_gluon_mm_mxfp8_gfx950(
@@ -2293,7 +2299,7 @@ def launch_gluon_mm_mxfp8_gfx950(
                 "unit inner stride"
             )
 
-    config = _fp32_launch_config(m, n, k) if fp32_scales else None
+    config = _fp32_launch_config(m, n, k, A.device) if fp32_scales else None
     block_m = config.block_m if fp32_scales else MXFP8_BLOCK_M
     block_n = config.block_n if fp32_scales else MXFP8_BLOCK_N
     grid_mn = triton.cdiv(m, block_m) * triton.cdiv(n, block_n)
@@ -2317,7 +2323,7 @@ def launch_gluon_mm_mxfp8_gfx950(
     splits = (
         config.splits
         if fp32_scales
-        else _num_splits_for_tile(m, n, k, block_m, block_n)
+        else _num_splits_for_tile(m, n, k, block_m, block_n, A.device)
     )
     if splits > 1:
         target = torch.empty((splits, m, n), device=A.device, dtype=torch.float32)
@@ -2421,7 +2427,7 @@ def _launch_pipeline_fp32_or_native(
         GRID_MN=grid_mn,
         SPLITS=splits,
         stride_cs=target.stride(0) if splits > 1 else 0,
-        NUM_XCDS=MXFP8_NUM_XCDS,
+        NUM_XCDS=num_xcds(A.device),
         GROUP_SIZE_M=MXFP8_GROUP_SIZE_M,
         SCALE_MODE=scale_mode,
         PRELOAD_TILES=MXFP8_PRELOAD_TILES,

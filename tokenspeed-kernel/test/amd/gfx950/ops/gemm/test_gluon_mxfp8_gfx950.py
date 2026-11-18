@@ -277,9 +277,10 @@ def test_mxfp8_shape_contract() -> None:
 
 
 def test_mxfp8_split_k_only_for_underfilled_long_k_launches() -> None:
-    assert _mxfp8_num_splits(641, 1152, 5120) > 1
-    assert _mxfp8_num_splits(8192, 1152, 5120) == 1
-    assert _mxfp8_num_splits(641, 8192, 1280) == 1
+    device = torch.device("cuda")
+    assert _mxfp8_num_splits(641, 1152, 5120, device) > 1
+    assert _mxfp8_num_splits(8192, 1152, 5120, device) == 1
+    assert _mxfp8_num_splits(641, 8192, 1280, device) == 1
 
 
 @pytest.mark.parametrize(
