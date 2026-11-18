@@ -2255,10 +2255,23 @@ def _precomputed_topk_route_small_m_gfx1250_kernel(
 
 _SMALL_ROUTE_MAX_TOKENS = 512
 _SMALL_ROUTE_MAX_GATES = 2048
-# A route that also quantizes the MoE input keeps the one-launch kernel up to
-# its token limit: from 342 to 512 DSV4.1 tokens it beat the staged route, with
-# the quantize on its stage 4, by 5-9 us per layer.
-_MXFP4_SMALL_ROUTE_MAX_GATES = 3072
+# A route that also quantizes the MoE input keeps the one-launch kernel much
+# further. Past it the apply launches the four stages of the staged route,
+# and with FP8 activations the cast as well; each launch costs about 1.1 us
+# before its programs do anything. One launch against those measured, per
+# apply: Kimi K3 TP8 112.9 vs 122.9 us at 144 requests, 121.1 vs 136.6 us at
+# 256, 138.7 vs 156.9 us at 512 and 168.1 vs 184.7 us at 1024; Qwen3.8 Flash
+# TP2 67.7 vs 78.2 us at 384 and 78.5 vs 89.9 us at 768; Muse Spark TP8 86.1
+# vs 96.6 us at 512; DSV4.1 Flash TP4 155.8 vs 168.0 us at 640.
+#
+# Every program of the one-launch route works over the routed rows rounded up
+# to a power of two, so just past 8192 rows it does twice the work for the
+# same rows: from there to 12288 rows it measured even on Kimi K3 and 4%
+# slower on Qwen3.8 Flash, and that stretch stays on the staged route. Past
+# 16384 rows it measured 11% slower than baseline on Kimi K3.
+_QUANT_SMALL_ROUTE_MAX_TOKENS = 1024
+_QUANT_SMALL_ROUTE_MAX_GATES = 16384
+_QUANT_SMALL_ROUTE_STAGED_GATES = (8192, 12288)
 _SMALL_ROUTE_NUM_WARPS = 4
 # Rows per placement program. Every program rebuilds the full histogram, while
 # the in-chunk rank costs CHUNK^2 compares; 64 rows measured fastest from 4 to
@@ -2304,12 +2317,14 @@ def _precomputed_topk_route_small_m_gfx1250(
         raise ValueError("unsupported gfx1250 small-M precomputed route")
     tokens, topk = map(int, topk_ids.shape)
     gates = tokens * topk
-    if not (1 <= tokens <= _SMALL_ROUTE_MAX_TOKENS and 0 < topk <= num_experts <= 1024):
+    if not (
+        1 <= tokens <= _QUANT_SMALL_ROUTE_MAX_TOKENS and 0 < topk <= num_experts <= 1024
+    ):
         raise ValueError("unsupported gfx1250 small-M route shape")
-    if gates > _MXFP4_SMALL_ROUTE_MAX_GATES:
+    if gates > _QUANT_SMALL_ROUTE_MAX_GATES:
         raise ValueError(
             "gfx1250 small-M route supports at most "
-            f"{_MXFP4_SMALL_ROUTE_MAX_GATES} rows"
+            f"{_QUANT_SMALL_ROUTE_MAX_GATES} rows"
         )
     if topk_ids.dtype != torch.int32:
         topk_ids = topk_ids.to(torch.int32)
@@ -3135,6 +3150,18 @@ def _uses_small_route(
     )
 
 
+def _uses_quantizing_small_route(topk_ids: torch.Tensor, num_experts: int) -> bool:
+    """Whether a route that also quantizes the MoE input takes one launch."""
+    gates = topk_ids.numel()
+    staged_from, staged_below = _QUANT_SMALL_ROUTE_STAGED_GATES
+    return (
+        0 < topk_ids.shape[0] <= _QUANT_SMALL_ROUTE_MAX_TOKENS
+        and gates <= _QUANT_SMALL_ROUTE_MAX_GATES
+        and not staged_from < gates < staged_below
+        and num_experts <= 1024
+    )
+
+
 def _uses_staged_route(topk_ids: torch.Tensor, num_experts: int) -> bool:
     return (
         topk_ids.shape[0] > 16
@@ -3167,7 +3194,7 @@ def _precomputed_topk_route_mxfp4(
         and hidden_states.stride(1) == 1
         and k % MXFP4_BLOCK == 0
     ):
-        if _uses_small_route(topk_ids, num_experts, _MXFP4_SMALL_ROUTE_MAX_GATES):
+        if _uses_quantizing_small_route(topk_ids, num_experts):
             route_fn = _precomputed_topk_route_small_m_gfx1250
         elif _uses_staged_route(topk_ids, num_experts):
             route_fn = _precomputed_topk_route_large_m_gfx1250
@@ -3426,7 +3453,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
             hidden_states.dtype in (torch.bfloat16, torch.float16)
             and hidden_states.stride(1) == 1
             and (act_scale is None or isinstance(act_scale, torch.Tensor))
-            and _uses_small_route(topk_ids, num_experts)
+            and _uses_quantizing_small_route(topk_ids, num_experts)
         ):
             # The routing launch's spare programs cast the input as well. A
             # single token takes this route too: a separate cast is one more
