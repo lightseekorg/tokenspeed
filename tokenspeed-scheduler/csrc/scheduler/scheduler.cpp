@@ -104,7 +104,8 @@ Scheduler::Scheduler(SchedulerConfig config)
       tier_transfers_{coordinator_},
       storage_transfers_{config_.enable_l3_storage
                              ? std::make_unique<StorageTransferManager>(coordinator_, *config_.storage_config)
-                             : nullptr} {
+                             : nullptr},
+      peer_exports_{config_.peer_config ? std::make_unique<PeerExports>(*config_.peer_config) : nullptr} {
     // config_.Validate() already ran; the body only derives state from it.
     cache_group_ids_.reserve(config_.cache_groups.size());
     for (const CacheGroupConfig& group : config_.cache_groups) {
@@ -113,8 +114,15 @@ Scheduler::Scheduler(SchedulerConfig config)
     max_single_request_tokens_ = CapacityModel{config_}.MaxSingleRequestTokens(coordinator_.TotalLcmBlocks());
 
     if (config_.enable_kv_cache_events) {
-        coordinator_.SetCacheMutationSink(
-            [this](const CacheKey& key, CacheMutation) { markKvEventBoundaryForReconcile(eventKey(key)); });
+        coordinator_.SetCacheMutationSink([this](const CacheKey& key, CacheMutation mutation) {
+            const CacheKey boundary = eventKey(key);
+            // A Host block can arrive for a boundary no publication here ever
+            // described (an L3 read): without its tokens there is no event.
+            if (mutation == CacheMutation::kHostResidency && !kv_event_boundaries_.contains(boundary)) {
+                return;
+            }
+            markKvEventBoundaryForReconcile(boundary);
+        });
     }
 
     // Validate requires in-forward checkpoints, and with them prefix caching,
@@ -127,7 +135,12 @@ Scheduler::Scheduler(SchedulerConfig config)
     if (config_.demote_superseded_state_checkpoints && config_.role != Role::kD && has_state_group) {
         checkpoint_lineage_.emplace();
     }
-    coordinator_.SetCheckpointDemotion(checkpoint_lineage_.has_value());
+    // A peer's complete read demotes the holder's copy (PeerExports::Release)
+    // through the same marks.
+    coordinator_.SetCheckpointDemotion(checkpoint_lineage_.has_value() || peer_exports_ != nullptr);
+    if (config_.peer_config) {
+        next_peer_lease_ = config_.peer_config->incarnation << 32;
+    }
 
     if (const char* level = std::getenv("SPDLOG_LEVEL")) {
         spdlog::set_level(spdlog::level::from_str(level));
@@ -176,12 +189,15 @@ KvEventBatch Scheduler::DrainKvEventBatch() {
                                      ? static_cast<std::int32_t>(descriptor_tokens)
                                      : 0;
         const auto status = coordinator_.GetBoundaryEventStatus(boundary, tail_tokens);
-        if (status.publishable != event_boundary.published) {
-            mutations.push_back({event_boundary.stored->block_hash,
-                                 status.publishable ? event_boundary.stored : KvEventDescriptorRef{}});
+        const std::array<bool, kNumKvEventMedia> publishable{status.device_publishable, status.host_publishable};
+        if (publishable != event_boundary.published) {
+            const bool anywhere = status.device_publishable || status.host_publishable;
+            mutations.push_back({.block_hash = event_boundary.stored->block_hash,
+                                 .stored = anywhere ? event_boundary.stored : KvEventDescriptorRef{},
+                                 .resident = publishable});
         }
-        event_boundary.published = status.publishable;
-        if (!status.has_device_entries) kv_event_boundaries_.erase(it);
+        event_boundary.published = publishable;
+        if (!status.retains_descriptor) kv_event_boundaries_.erase(it);
     }
     // Cache keys own no payload; retain the allocation for the next round.
     kv_event_boundaries_to_reconcile_.clear();
@@ -623,6 +639,10 @@ ExecutionPlan Scheduler::NextExecutionPlan(PlanOptions options) {
     if (storage_transfers_) {
         ProfileSpan profile_span{"Scheduler::prepareStorage"};
         for (const auto& request : requests_) prepareStorage(*request);
+    }
+    if (peer_exports_) {
+        ProfileSpan profile_span{"Scheduler::preparePeer"};
+        for (const auto& request : requests_) preparePeer(*request);
     }
     std::vector<Request*> candidates;
     candidates.reserve(requests_.size());
