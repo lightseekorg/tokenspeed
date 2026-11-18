@@ -446,17 +446,25 @@ def _worker(rank, degree, rendezvous, pull_exchange):
         dist.destroy_process_group()
 
 
-# NCCL and the pull exchange at two ranks; the pull exchange at K3.1's eight.
-@pytest.mark.parametrize("degree,pull_exchange", [(2, False), (2, True), (8, True)])
+# NCCL at two and four ranks, the pull exchange at two and at K3.1's eight.
+@pytest.mark.parametrize(
+    "degree,pull_exchange", [(2, False), (4, False), (2, True), (8, True)]
+)
 def test_owned_decode_topk_is_each_ranks_share_of_the_merge(
     tmp_path, degree, pull_exchange
 ):
-    from tokenspeed_kernel.platform import current_platform
+    from tokenspeed_kernel.platform import ArchVersion, current_platform
 
     if not torch.cuda.is_available() or torch.cuda.device_count() < degree:
         pytest.skip(f"requires {degree} GPUs")
-    if not current_platform().is_cdna4:
-        pytest.skip("the owned selection and Iris pull exchanges run on CDNA4")
+    platform = current_platform()
+    if pull_exchange and not platform.is_cdna4:
+        pytest.skip("Iris pull exchanges run on CDNA4")
+    if not platform.is_cdna4 and not (
+        platform.is_nvidia
+        and ArchVersion(10, 0) <= platform.arch_version <= ArchVersion(10, 3)
+    ):
+        pytest.skip("the owned selection runs on CDNA4, SM100 and SM103")
     mp.spawn(
         _worker,
         args=(degree, f"file://{tmp_path / 'rendezvous'}", pull_exchange),

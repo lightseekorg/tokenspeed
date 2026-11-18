@@ -55,6 +55,7 @@ from tokenspeed_kernel.platform import (
     pdl_enabled,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.selection import traits_problem_filter
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
@@ -783,3 +784,108 @@ if _decode_front is not None:
             float(softmax_scale),
         )
         return q_norm, projected, q_fp8, weights
+
+
+# Owned selection: a KVP rank's share of the merged top-k in one launch.
+
+if _fused_indexer is not None:
+    from tokenspeed_kernel.ops.attention.dsa._cute_dsl.owned_selection import (
+        cute_dsl_select_owned_from_gathered,
+        owned_selection_supported,
+    )
+
+    @register_kernel(
+        "attention",
+        "dsa_select_owned_candidates",
+        name="cute_dsl_dsa_select_owned_candidates",
+        solution="cute_dsl",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 3),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=frozenset(
+            {format_signature(scores=dense_tensor_format(torch.float32))}
+        ),
+        traits={
+            "topk": frozenset({512, 1024, 2048}),
+            "problem_filter": frozenset(
+                {
+                    traits_problem_filter(
+                        owned_selection_supported,
+                        "ranks",
+                        "rows",
+                        "topk",
+                        "rank_stride",
+                    )
+                }
+            ),
+        },
+        priority=Priority.SPECIALIZED,
+    )
+    def cute_dsl_dsa_select_owned_candidates(
+        scores: torch.Tensor,
+        positions: torch.Tensor,
+        local_page_table: torch.Tensor,
+        query_requests: torch.Tensor,
+        *,
+        rank: int,
+        topk: int,
+        page_size: int,
+        out: torch.Tensor | None = None,
+        lens_out: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run ``dsa_select_owned_candidates`` in one launch.
+
+        Serves the sizes ``dsa_select_owned_candidates_supported`` admits.
+        """
+        degree, rows, width = scores.shape
+        if (
+            width != topk
+            or scores.stride()[1:] != (width, 1)
+            or not owned_selection_supported(
+                ranks=degree, rows=rows, topk=topk, rank_stride=scores.stride(0)
+            )
+        ):
+            raise ValueError(
+                "owned selection needs FP32 [ranks, rows, topk] scores with "
+                "contiguous rows, power-of-two ranks and topk, and every rank's "
+                f"row in registers; got {tuple(scores.shape)} strided "
+                f"{scores.stride()} for top-{topk}"
+            )
+        if not 0 <= rank < degree:
+            raise ValueError(f"rank {rank} is outside {degree} ranks")
+        if any(
+            value.dtype != torch.int32
+            for value in (positions, local_page_table, query_requests)
+        ):
+            raise TypeError(
+                "candidate positions, local pages and requests must be int32"
+            )
+        if positions.shape != (rows, width) or positions.stride(1) != 1:
+            raise ValueError(
+                "this rank's candidate positions need contiguous [rows, topk] rows"
+            )
+        if local_page_table.stride(1) != 1:
+            raise ValueError("local pages need contiguous rows")
+        if query_requests.shape != (rows,) or not query_requests.is_contiguous():
+            raise ValueError("every row needs its request")
+        if out is None:
+            out = torch.empty((rows, topk), device=scores.device, dtype=torch.int32)
+        if lens_out is None:
+            lens_out = torch.empty((rows,), device=scores.device, dtype=torch.int32)
+        if out.shape != (rows, topk) or not out.is_contiguous():
+            raise ValueError("owned slots need a contiguous [rows, topk] output")
+        if lens_out.shape != (rows,) or not lens_out.is_contiguous():
+            raise ValueError("owned counts need a contiguous [rows] output")
+        return cute_dsl_select_owned_from_gathered(
+            scores,
+            positions,
+            local_page_table,
+            query_requests,
+            rank=rank,
+            topk=topk,
+            page_size=page_size,
+            out=out,
+            lens_out=lens_out,
+        )
