@@ -1450,7 +1450,17 @@ if platform.is_amd:
 
 
 _ROUTE_DIRECT_DECODE_MAX_TOKENS = 16
+# Average routed rows per expert up to which gfx1250 takes the decode GEMMs.
+# Decode streams an expert's weights once per 32-row block, so it stays ahead
+# of the prefill GEMMs until experts start needing a second block; where the
+# two cross depends on the model. With MXFP4 activations decode against
+# prefill measured 97.9 vs 103.3 us at 17.5 rows an expert and even at 20 on
+# Qwen3.8 Flash TP2, but 194.1 vs 184.3 us at 16 rows and even at 12 on
+# DSV4.1 Flash TP4.
 _GFX1250_DECODE_MAX_AVERAGE_BPE = 16
+# The A8W4 SiTU GEMMs cross later: on Kimi K3 TP8 decode measured 195.9 vs
+# 208.2 us at 20.6 rows an expert, 209.2 vs 215.4 us at 22.9, and even at 25.
+_GFX1250_A8W4_SITU_DECODE_MAX_AVERAGE_BPE = 24
 _warmed_a4w4_ep_families: set[tuple] = set()
 
 
@@ -1478,12 +1488,11 @@ def _select_gfx950_grouped_block_m(
     return 128
 
 
-def _use_gfx1250_moe_decode(num_routed_rows: int, num_experts: int) -> bool:
+def _use_gfx1250_moe_decode(
+    num_routed_rows: int, num_experts: int, max_average_bpe: int
+) -> bool:
     # Compare the average batch per expert without a division or device sync.
-    return (
-        0 < num_routed_rows
-        and num_routed_rows <= _GFX1250_DECODE_MAX_AVERAGE_BPE * num_experts
-    )
+    return 0 < num_routed_rows and num_routed_rows <= max_average_bpe * num_experts
 
 
 if platform.is_amd:
@@ -2487,7 +2496,9 @@ if platform.is_amd:
         w13_pc = w.w13_precision_config
         w2_pc = w.w2_precision_config
         decode = _use_gfx1250_moe_decode(
-            topk_ids.numel(), w.w13_weight_triton_tensor.shape[0]
+            topk_ids.numel(),
+            w.w13_weight_triton_tensor.shape[0],
+            _GFX1250_A8W4_SITU_DECODE_MAX_AVERAGE_BPE,
         )
 
         return fused_mxfp_gfx1250.gluon_mxfp_precomputed_mxfp4_fused_moe(
@@ -2514,6 +2525,9 @@ if platform.is_amd:
             situ_beta=situ_beta,
             situ_linear_beta=float(situ_linear_beta),
             decode=decode,
+            # Decode programs wait on their first tile loads, so each weight
+            # tile and its scales go out as one load.
+            partial_tdm=decode,
             out=getattr(w, "_situ_output_buffer", None),
         )
 
@@ -2574,7 +2588,9 @@ if platform.is_amd:
         w13_pc = w.w13_precision_config
         w2_pc = w.w2_precision_config
         decode = _use_gfx1250_moe_decode(
-            topk_ids.numel(), w.w13_weight_triton_tensor.shape[0]
+            topk_ids.numel(),
+            w.w13_weight_triton_tensor.shape[0],
+            _GFX1250_DECODE_MAX_AVERAGE_BPE,
         )
 
         return fused_mxfp_gfx1250.gluon_mxfp_precomputed_mxfp4_fused_moe(
@@ -2600,6 +2616,9 @@ if platform.is_amd:
             swiglu_limit=swiglu_limit,
             swiglu_beta=swiglu_beta,
             decode=decode,
+            # Decode programs wait on their first tile loads, so each weight
+            # tile and its scales go out as one load.
+            partial_tdm=decode,
             activation_dtype=activation_dtype,
         )
 

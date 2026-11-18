@@ -45,23 +45,94 @@ from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.quantize import (
 _DECODE_LONG_K = 2048
 
 
-def decode_tile_config(k: int) -> dict[str, int]:
+def decode_tile_config(k: int, fp8_activation: bool, block_m: int) -> dict[str, int]:
     """Return the decode tile for a projection with reduction length ``k``.
 
     Decode streams each touched expert's weights once, so the tile is chosen
-    for HBM streaming rather than reuse. 128-column tiles give a single-token
-    step enough programs to occupy the device. A long K reads 256-byte MXFP4
-    row segments (``block_k=512``), which keeps more bytes in flight per TDM
-    operation. A short K uses ``block_k=128`` so the three buffers hold the
-    whole reduction in a small LDS footprint, letting more programs stay
-    resident to hide each program's fixed latency.
+    for HBM streaming rather than reuse. A long K reads 256-byte MXFP4 row
+    segments (``block_k=512``), which keeps more bytes in flight per TDM
+    operation, in 128-column tiles so a single-token step has enough programs
+    to occupy the device. Its ring has three buffers with 16-row tiles; wider
+    row tiles take two, which keeps three programs resident on a CU where
+    three buffers leave two (1 to 2% faster from 512 to 1344 Kimi K3 requests
+    and on DSV4.1 Flash and Qwen3.8 Flash at the same occupancy).
+
+    A short K spends most of each program in its fixed startup. With FP8
+    activations it takes 256-column tiles to halve the programs, and two
+    buffers of ``block_k=128`` so a program waits for one K step's tiles before
+    its first WMMA. With MXFP4 activations that tile measured up to 9% slower
+    than three buffers of 128 columns (DSV4.1 Flash TP4, 32 to 512 requests),
+    whose small LDS footprint keeps ten programs resident on a CU.
     """
-    return {
-        "block_n": 128,
-        "block_k": 512 if k >= _DECODE_LONG_K else 128,
-        "num_buffers": 3,
-        "num_warps": 4,
-    }
+    if k >= _DECODE_LONG_K:
+        return {
+            "block_n": 128,
+            "block_k": 512,
+            "num_buffers": 3 if block_m == 16 else 2,
+            "num_warps": 4,
+        }
+    if fp8_activation:
+        return {"block_n": 256, "block_k": 128, "num_buffers": 2, "num_warps": 4}
+    return {"block_n": 128, "block_k": 128, "num_buffers": 3, "num_warps": 4}
+
+
+# Decode tiles in order of preference, each with the programs of it that one CU
+# holds at once. A launch larger than the device holds queues the rest, and a
+# queued program pays its whole startup after the CU's first programs have
+# drained: at 8 Kimi K3 requests the long-K launch took 24.7k shader clocks
+# with 512 of its 768 programs resident and 20.3k with all of them.
+#
+# A long-K program reserves its tile ring out of the CU's 320 KB of LDS; with
+# decode's 16-row tile a CU holds one program with block_k=1024, two with
+# three block_k=512 buffers and three with two, for FP8 and MXFP4 activations
+# alike. Deeper rings stream a lone program faster, so they come first; then
+# fewer programs, each covering two or three N tiles through one ring. With
+# FP8 activations a CU's wave slots hold seven short-K programs, and pairing
+# their N tiles pays up to twice that many single-tile programs.
+#
+# Programs that cover several N tiles are measured on FP8 activations only: a
+# gate/up launch with MXFP4 output cannot use them, and pairing the short-K
+# tiles measured slower with MXFP4 activations.
+_DECODE_LONG_K_RESIDENT_TILES = (
+    (1, {"block_k": 1024}),
+    (2, {}),
+    (3, {"num_buffers": 2}),
+    (2, {"n_tiles": 2}),
+    (3, {"num_buffers": 2, "n_tiles": 2}),
+    (3, {"num_buffers": 2, "n_tiles": 3}),
+)
+_DECODE_SHORT_K_RESIDENT_TILES = (
+    (7, {}),
+    (7, {"n_tiles": 2}),
+)
+
+
+def decode_resident_tile_config(
+    k: int, n: int, blocks: int, cus: int, fp8_activation: bool
+) -> dict[str, int] | None:
+    """Return the tile that keeps a launch of ``blocks`` row blocks resident.
+
+    The launch takes the first tile that keeps every program resident at once
+    on ``cus`` CUs. ``None`` means no tile does: the launch queues and is
+    HBM-bound, and takes the tile of :func:`decode_tile_config`. The residency
+    counts are those of decode's 16-row tile.
+    """
+    tiles = decode_tile_config(k, fp8_activation, 16)
+    if k >= _DECODE_LONG_K:
+        choices = _DECODE_LONG_K_RESIDENT_TILES
+    elif fp8_activation:
+        choices = _DECODE_SHORT_K_RESIDENT_TILES
+    else:
+        choices = ()
+    n_tiles = -(-n // tiles["block_n"])
+    for programs_per_cu, overrides in choices:
+        tiles_per_program = overrides.get("n_tiles", 1)
+        if tiles_per_program > 1 and not fp8_activation:
+            continue
+        programs = blocks * -(-n_tiles // tiles_per_program)
+        if programs <= programs_per_cu * cus:
+            return {**tiles, **overrides}
+    return None
 
 
 def _decode_launch_metadata(grid, kernel, args):
@@ -531,23 +602,13 @@ def _store_decode_tile(
 
 @gluon.jit(launch_metadata=_decode_launch_metadata)
 def _matmul_decode(
-    Y,
-    stride_y_k,
-    stride_y_z,
-    stride_y_m,
-    stride_y_n,
-    YGlobalScale,
-    YMxScale,
-    stride_y_mx_m,
-    XGlobalScale,
-    X,
-    stride_x_z,
-    stride_x_m,
-    stride_x_k,
-    XMxScale,
-    stride_x_mx_z,
-    stride_x_mx_m,
-    stride_x_mx_k,
+    # Operands are ordered by when a program first needs them: the block
+    # metadata and grid for its first load, then the weight operands, then the
+    # activation operands, then the output. Only the leading arguments arrive in
+    # the preloaded argument registers; the rest wait for a kernel-argument load.
+    XBlockSchedule,
+    grid_m,
+    grid_n,
     W,
     stride_w_e,
     stride_w_k,
@@ -557,32 +618,46 @@ def _matmul_decode(
     stride_w_mx_e,
     stride_w_mx_k,
     stride_w_mx_n,
-    B,
-    stride_b_e,  # Bias
-    M,
     N,
     K,
-    KW,  # shapes
+    XSliceOffs,
+    XSliceSizes,
     GatherIndx,
+    X,
+    stride_x_m,
+    stride_x_k,
+    XMxScale,
+    stride_x_mx_m,
+    stride_x_mx_k,
+    M,
+    XGlobalScale,
     WriteBackIndx,
     writeback_size,
-    RAGGED_DIMENSION: gl.constexpr,  #
-    XSliceSizes,
-    XSliceOffs,
+    Y,
+    stride_y_m,
+    stride_y_n,
+    YGlobalScale,
+    YMxScale,
+    stride_y_mx_m,
+    B,
+    stride_b_e,
+    RAGGED_DIMENSION: gl.constexpr,
+    X_SLICE_SIZES_DIVISIBILITY: gl.constexpr,
+    _W_SLICE_SIZES_DIVISIBILITY: gl.constexpr,
+    # The launcher shares one operand set with the prefill kernel; decode does not read these.
     XBlockOffs,
-    XBlockSchedule,
+    batch_size,
+    KW,
+    stride_x_z,
+    stride_x_mx_z,
+    stride_y_k,
+    stride_y_z,
     X_EXPECTED_SLICE_SIZE: gl.constexpr,
-    X_SLICE_SIZES_DIVISIBILITY: gl.constexpr,  #
     WSliceSizes,
     WSliceOffs,
     WBlockOffs,
     WBlockSchedule,
     W_EXPECTED_SLICE_SIZE: gl.constexpr,
-    _W_SLICE_SIZES_DIVISIBILITY: gl.constexpr,  #
-    # true grid size
-    batch_size,
-    grid_m,
-    grid_n,
     DO_SWIGLU: gl.constexpr,
     SWIGLU_ALPHA: gl.constexpr,
     SWIGLU_LIMIT: gl.constexpr,

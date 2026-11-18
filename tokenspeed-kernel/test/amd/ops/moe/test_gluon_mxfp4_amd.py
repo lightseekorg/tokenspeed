@@ -576,11 +576,13 @@ def test_static_fp8_activation_moe_gfx950_smoke() -> None:
         (64, 16),
         (128, 16),
         (256, 16),
-        (512, 16),
-        (1024, 16),
-        (2048, 32),
-        (4096, 64),
-        (16384, 128),
+        (448, 16),
+        # Eight rows an expert on average: some experts overflow a 16-row block.
+        (512, 32),
+        (1024, 32),
+        # A 64-row tile leaves one program resident on a CU, so decode stops at 32.
+        (4096, 32),
+        (16384, 32),
     ],
 )
 def test_gfx1250_resolve_block_m_tracks_decode_occupancy(
@@ -1389,7 +1391,7 @@ def test_gfx1250_gate_up_mxfp4_output_matches_quantized_fp32(
         decode=decode,
         partial_tdm=False,
         **(
-            decode_tile_config(hidden_size)
+            decode_tile_config(hidden_size, False, 16)
             if decode
             else gfx1250_fused._PREFILL_MXFP4_ACTIVATION_TILES
         ),
@@ -1615,11 +1617,23 @@ def test_gfx1250_epilogue_fp8_matches_fp32_result(
     torch.testing.assert_close(fused.float(), staged.float(), rtol=0.0, atol=0.0)
 
 
-def test_gfx1250_decode_tile_config_streams_long_k_in_wide_rows() -> None:
-    long_k = decode_tile_config(3584)
-    short_k = decode_tile_config(384)
+@pytest.mark.parametrize("fp8_activation", [True, False], ids=["fp8", "mxfp4"])
+def test_gfx1250_decode_tile_config_streams_long_k_in_wide_rows(
+    fp8_activation: bool,
+) -> None:
+    long_k = decode_tile_config(3584, fp8_activation, 16)
+    short_k = decode_tile_config(384, fp8_activation, 16)
     assert long_k["block_k"] == 512 and short_k["block_k"] == 128
-    assert long_k["block_n"] == short_k["block_n"] == 128
+    assert long_k["block_n"] == 128 and long_k["num_buffers"] == 3
+    if fp8_activation:
+        # Halves its programs and waits for one K step before its first WMMA.
+        assert short_k["block_n"] == 256 and short_k["num_buffers"] == 2
+    else:
+        assert short_k["block_n"] == 128 and short_k["num_buffers"] == 3
+    # A 32-row long-K tile takes two buffers so three programs stay on a CU;
+    # the short-K tile does not depend on the row tile.
+    assert decode_tile_config(3584, fp8_activation, 32) == {**long_k, "num_buffers": 2}
+    assert decode_tile_config(384, fp8_activation, 32) == short_k
 
 
 def _sparse_decode_moe_case(num_tokens: int):

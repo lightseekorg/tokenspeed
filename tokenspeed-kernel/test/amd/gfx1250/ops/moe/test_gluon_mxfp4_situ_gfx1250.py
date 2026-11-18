@@ -34,7 +34,7 @@ if not is_cdna5():
 from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
 from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
 from tokenspeed_kernel.ops.moe import moe_process_weights as kernel_moe_process_weights
-from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4 import fused  # noqa: E402
+from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4 import decode, fused  # noqa: E402
 
 # noqa: E402
 
@@ -369,8 +369,25 @@ def test_kimi_k3_tp_situ_stores_down_weight_in_k_planes_gfx1250() -> None:
         )
 
 
-def test_kimi_k3_tp_situ_paired_down_tiles_match_gfx1250(
-    monkeypatch: pytest.MonkeyPatch,
+_RESIDENT_TILE_CASES = [
+    (table, overrides)
+    for table in ("_DECODE_LONG_K_RESIDENT_TILES", "_DECODE_SHORT_K_RESIDENT_TILES")
+    for _, overrides in getattr(decode, table)
+    if overrides
+]
+
+
+@pytest.mark.parametrize(
+    ("table", "overrides"),
+    _RESIDENT_TILE_CASES,
+    ids=[
+        f"{'long_k' if 'LONG_K' in table else 'short_k'}-"
+        + "-".join(f"{key}{value}" for key, value in overrides.items())
+        for table, overrides in _RESIDENT_TILE_CASES
+    ],
+)
+def test_kimi_k3_tp_situ_resident_decode_tiles_match_gfx1250(
+    monkeypatch: pytest.MonkeyPatch, table: str, overrides: dict[str, int]
 ) -> None:
     num_tokens = 4
     module, _, hidden_states, topk_weights, topk_ids, router_logits = _make_case(
@@ -389,15 +406,57 @@ def test_kimi_k3_tp_situ_paired_down_tiles_match_gfx1250(
             topk_ids=topk_ids,
         ).clone()
 
-    single = apply()
-    monkeypatch.setattr(fused, "_DECODE_PAIR_N_TILES_PROGRAMS_PER_CU", 0)
-    assert (
-        fused._decode_down_n_tiles(num_tokens * 16, 16, 3584, 128, single.device) == 2
-    )
-    paired = apply()
+    monkeypatch.setattr(decode, "_DECODE_LONG_K_RESIDENT_TILES", ())
+    monkeypatch.setattr(decode, "_DECODE_SHORT_K_RESIDENT_TILES", ())
+    static = apply()
+    # Every launch size takes this tile.
+    monkeypatch.setattr(decode, table, ((1 << 30, overrides),))
+    resident = apply()
     torch.cuda.synchronize()
-    assert torch.count_nonzero(single).item() > 0
-    torch.testing.assert_close(paired, single, atol=0, rtol=0)
+    assert torch.count_nonzero(static).item() > 0
+    torch.testing.assert_close(resident, static, atol=0, rtol=0)
+
+
+def test_gfx1250_decode_resident_tiles_follow_launch_size() -> None:
+    cus = 256
+    long_k = decode.decode_tile_config(3584, True, 16)
+    short_k = decode.decode_tile_config(384, True, 16)
+
+    def long_k_tiles(blocks: int) -> dict[str, int]:
+        # Six 128-column N tiles a row block.
+        return decode.decode_resident_tile_config(3584, 768, blocks, cus, True)
+
+    def short_k_tiles(blocks: int) -> dict[str, int]:
+        # Fourteen 256-column N tiles a row block.
+        return decode.decode_resident_tile_config(384, 3584, blocks, cus, True)
+
+    assert long_k_tiles(42) == {**long_k, "block_k": 1024}
+    assert long_k_tiles(85) == long_k
+    assert long_k_tiles(128) == {**long_k, "num_buffers": 2}
+    assert long_k_tiles(170) == {**long_k, "n_tiles": 2}
+    assert long_k_tiles(256) == {**long_k, "num_buffers": 2, "n_tiles": 2}
+    assert long_k_tiles(384) == {**long_k, "num_buffers": 2, "n_tiles": 3}
+    # Past what any tile keeps resident the launch queues.
+    assert long_k_tiles(385) is None
+    assert short_k_tiles(128) == short_k
+    assert short_k_tiles(256) == {**short_k, "n_tiles": 2}
+    assert short_k_tiles(257) is None
+
+
+def test_gfx1250_decode_resident_tiles_keep_one_tile_with_mxfp4_activations() -> None:
+    cus = 256
+    long_k = decode.decode_tile_config(3584, False, 16)
+
+    def long_k_tiles(blocks: int) -> dict[str, int]:
+        return decode.decode_resident_tile_config(3584, 768, blocks, cus, False)
+
+    assert long_k_tiles(42) == {**long_k, "block_k": 1024}
+    assert long_k_tiles(85) == long_k
+    assert long_k_tiles(128) == {**long_k, "num_buffers": 2}
+    # No program covers several N tiles: the next launch size queues.
+    assert long_k_tiles(129) is None
+    for blocks in (1, 128, 256, 4096):
+        assert decode.decode_resident_tile_config(384, 3584, blocks, cus, False) is None
 
 
 @pytest.mark.parametrize("scaled", [False, True], ids=["unscaled", "scaled"])

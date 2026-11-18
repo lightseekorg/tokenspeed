@@ -62,6 +62,7 @@ from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4._common import (
 )
 from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.decode import (
     _matmul_decode,
+    decode_resident_tile_config,
     decode_tile_config,
 )
 from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.quantize import (
@@ -89,7 +90,9 @@ class _OptFlags:
     block_m: int
     block_n: int
     block_k: int
-    group_m: int = 8
+    # Programs walk one row block's N tiles in order: the program-id mapping is
+    # a single division, and consecutive programs read the same expert.
+    group_m: int = 1
     xcd_swizzle: int = 1
     split_k: int = 1
 
@@ -743,23 +746,17 @@ def _matmul_launch_metadata(grid, kernel, args):
 
 @gluon.jit(launch_metadata=_matmul_launch_metadata)
 def _matmul(
-    Y,
-    stride_y_k,
-    stride_y_z,
-    stride_y_m,
-    stride_y_n,
-    YGlobalScale,
-    YMxScale,
-    stride_y_mx_m,
-    XGlobalScale,
-    X,
-    stride_x_z,
-    stride_x_m,
-    stride_x_k,
-    XMxScale,
-    stride_x_mx_z,
-    stride_x_mx_m,
-    stride_x_mx_k,
+    # Operands are ordered by when a program first needs them: the block
+    # metadata and grid for its first load, then the weight operands, then the
+    # activation operands, then the output. Only the leading arguments arrive in
+    # the preloaded argument registers; the rest wait for a kernel-argument load.
+    XBlockOffs,
+    batch_size,
+    grid_m,
+    grid_n,
+    XBlockSchedule,
+    XSliceOffs,
+    XSliceSizes,
     W,
     stride_w_e,
     stride_w_k,
@@ -769,32 +766,41 @@ def _matmul(
     stride_w_mx_e,
     stride_w_mx_k,
     stride_w_mx_n,
-    B,
-    stride_b_e,  # Bias
-    M,
     N,
     K,
-    KW,  # shapes
+    KW,
     GatherIndx,
+    X,
+    stride_x_z,
+    stride_x_m,
+    stride_x_k,
+    XMxScale,
+    stride_x_mx_z,
+    stride_x_mx_m,
+    stride_x_mx_k,
+    M,
+    XGlobalScale,
+    Y,
+    stride_y_k,
+    stride_y_z,
+    stride_y_m,
+    stride_y_n,
+    YGlobalScale,
+    YMxScale,
+    stride_y_mx_m,
+    B,
+    stride_b_e,
     WriteBackIndx,
     writeback_size,
-    RAGGED_DIMENSION: gl.constexpr,  #
-    XSliceSizes,
-    XSliceOffs,
-    XBlockOffs,
-    XBlockSchedule,
+    RAGGED_DIMENSION: gl.constexpr,
     X_EXPECTED_SLICE_SIZE: gl.constexpr,
-    X_SLICE_SIZES_DIVISIBILITY: gl.constexpr,  #
+    X_SLICE_SIZES_DIVISIBILITY: gl.constexpr,
     WSliceSizes,
     WSliceOffs,
     WBlockOffs,
     WBlockSchedule,
     W_EXPECTED_SLICE_SIZE: gl.constexpr,
-    _W_SLICE_SIZES_DIVISIBILITY: gl.constexpr,  #
-    # true grid size
-    batch_size,
-    grid_m,
-    grid_n,
+    _W_SLICE_SIZES_DIVISIBILITY: gl.constexpr,
     DO_SWIGLU: gl.constexpr,
     SWIGLU_ALPHA: gl.constexpr,
     SWIGLU_LIMIT: gl.constexpr,
@@ -1285,6 +1291,22 @@ def _validate_schedule(
             raise ValueError("pingpong requires num_buffers=3")
 
 
+# Average rows per expert from which decode takes 32-row tiles. Every row
+# block of an expert streams the expert's weights again and decode is
+# HBM-bound, so an expert with 17 to 32 rows should be one 32-row program, not
+# two 16-row programs. Random routes start filling second 16-row blocks well
+# before the average reaches 16 rows; below about seven rows an expert the
+# wider tile only moves more activation bytes. 32-row against 16-row tiles at
+# eight rows an expert: DSV4.1 Flash TP4 157.4 vs 165.1 us, Qwen3.8 Flash TP2
+# (8.75 rows) 80.5 vs 84.1 us, Kimi K3 TP8 158.8 vs 157.3 us; at 16 rows
+# Kimi K3 181.7 vs 204.3 us.
+#
+# Decode stops at 32 rows: a 64-row tile's LDS footprint leaves one program
+# resident on a CU where the 32-row tile has two, and measured 10 to 30%
+# slower than the 32-row tile on Kimi K3 from 512 to 1792 requests.
+_DECODE_WIDE_BLOCK_M_ROWS_PER_EXPERT = 8
+
+
 def _resolve_block_m(
     decode: bool,
     m: int,
@@ -1293,8 +1315,9 @@ def _resolve_block_m(
     """Use stage defaults for prefill and expert occupancy for decode."""
     if not decode:
         return 64
-    rows_per_expert = max(1, m // num_experts)
-    return max(16, min(triton.next_power_of_2(rows_per_expert), 128))
+    if m >= _DECODE_WIDE_BLOCK_M_ROWS_PER_EXPERT * num_experts:
+        return 32
+    return 16
 
 
 # TDM zero-extends 16-bit indices when packing them (TDMUtility.cpp), so gl.int16
@@ -1360,7 +1383,7 @@ def matmul(
     block_m: int,
     block_n: int = 128,
     block_k: int = 256,
-    group_m: int = 8,
+    group_m: int = 1,
     xcd_swizzle: int = 1,
     w_transpose: bool = True,
     scale_preshuffle: bool | None = None,
@@ -1584,37 +1607,86 @@ def matmul(
     y_global_scale = _as_scalar_scale(y_global_scale, "y_global_scale", a.device)
 
     target_kernel = _matmul_decode if decode else _matmul
+    stride_y_k, stride_y_z, stride_y_m, stride_y_n = out_matmul.stride()
+    stride_x_z, stride_x_m, stride_x_k = a_strides
+    stride_x_mx_z, stride_x_mx_m, stride_x_mx_k = a_scale_strides
+    stride_w_e, stride_w_k, stride_w_n = b_storage.data.stride()
+    stride_w_mx_e, stride_w_mx_k, stride_w_mx_n = b_scale_strides
+    operands = dict(
+        Y=c_storage.data,
+        stride_y_k=stride_y_k,
+        stride_y_z=stride_y_z,
+        stride_y_m=stride_y_m,
+        stride_y_n=stride_y_n,
+        YGlobalScale=y_global_scale,
+        YMxScale=y_mx_scale,
+        stride_y_mx_m=None if y_mx_scale is None else y_mx_scale.stride(0),
+        XGlobalScale=x_global_scale,
+        X=a_storage.data,
+        stride_x_z=stride_x_z,
+        stride_x_m=stride_x_m,
+        stride_x_k=stride_x_k,
+        XMxScale=a_scale,
+        stride_x_mx_z=stride_x_mx_z,
+        stride_x_mx_m=stride_x_mx_m,
+        stride_x_mx_k=stride_x_mx_k,
+        W=b_storage.data,
+        stride_w_e=stride_w_e,
+        stride_w_k=stride_w_k,
+        stride_w_n=stride_w_n,
+        W_TRANSPOSE=w_transpose,
+        WMxScale=b_scale,
+        stride_w_mx_e=stride_w_mx_e,
+        stride_w_mx_k=stride_w_mx_k,
+        stride_w_mx_n=stride_w_mx_n,
+        B=bias,
+        stride_b_e=bias_stride,
+        M=M,
+        N=N,
+        K=K,
+        KW=K_W,
+        GatherIndx=gather_indx,
+        WriteBackIndx=scatter_indx,
+        writeback_size=None if scatter_indx is None else scatter_indx.shape[0],
+        RAGGED_DIMENSION=ragged_dimension,
+        **dict(
+            zip(
+                [
+                    "XSliceSizes",
+                    "XSliceOffs",
+                    "XBlockOffs",
+                    "XBlockSchedule",
+                    "X_EXPECTED_SLICE_SIZE",
+                    "X_SLICE_SIZES_DIVISIBILITY",
+                ],
+                expt_data_x,
+            )
+        ),
+        **dict(
+            zip(
+                [
+                    "WSliceSizes",
+                    "WSliceOffs",
+                    "WBlockOffs",
+                    "WBlockSchedule",
+                    "W_EXPECTED_SLICE_SIZE",
+                    "_W_SLICE_SIZES_DIVISIBILITY",
+                ],
+                expt_data_w,
+            )
+        ),
+        batch_size=batch_size,
+        grid_m=grid_m,
+        grid_n=grid_n,
+    )
+    # Each kernel lists these operands in the order its programs first need them.
+    leading = target_kernel.arg_names[: len(operands)]
+    if set(leading) != set(operands):
+        raise ValueError(
+            f"{target_kernel.__name__} does not lead with the shared GEMM operands"
+        )
     kernel = target_kernel[(grid,)](
-        c_storage.data,
-        *out_matmul.stride(),
-        y_global_scale,
-        y_mx_scale,
-        None if y_mx_scale is None else y_mx_scale.stride(0),
-        x_global_scale,
-        a_storage.data,
-        *a_strides,
-        a_scale,
-        *a_scale_strides,
-        b_storage.data,
-        *b_storage.data.stride(),
-        w_transpose,
-        b_scale,
-        *b_scale_strides,
-        bias,
-        bias_stride,
-        M,
-        N,
-        K,
-        K_W,
-        gather_indx,
-        scatter_indx,
-        None if scatter_indx is None else scatter_indx.shape[0],
-        ragged_dimension,
-        *expt_data_x,
-        *expt_data_w,
-        batch_size,
-        grid_m,
-        grid_n,
+        *(operands[name] for name in leading),
         do_swiglu,
         swiglu_alpha,
         swiglu_limit,
@@ -2087,10 +2159,10 @@ def _precomputed_topk_route_small_m_gfx1250_kernel(
     counts_smem.atomic_scatter_add(increment, key, axis=0)
     counts = counts_smem.load(expert_layout)
     histogram = counts & 0xFFFF
-    exclusive = gl.cumsum(histogram, 0) - histogram
     expert = gl.arange(0, EP, layout=expert_layout)
 
     if is_chunk:
+        exclusive = gl.cumsum(histogram, 0) - histogram
         row_key = gl.where((row_ids >= 0) & (row_ids < E), row_ids, E)
         # Every lane needs every key of the chunk; an LDS broadcast avoids a
         # uniform global load per column.
@@ -2112,17 +2184,24 @@ def _precomputed_topk_route_small_m_gfx1250_kernel(
         gl.store(gate_scale_ptr + position, weight.to(OUTPUT_DTYPE), mask=row_mask)
     else:
         block_size_index = pid - n_chunks
+        log2_block = 4 + block_size_index
+        expert_blocks = gl.where(
+            expert < E, (histogram + ((1 << log2_block) - 1)) >> log2_block, 0
+        )
+        # One prefix sum yields both offsets: rows in the low 16 bits, blocks
+        # in the high 16 (G < 2^15, and an expert has no more blocks than
+        # rows). A prefix sum is a chain of LDS round trips, and this program
+        # is the launch's longest.
+        packed = histogram + (expert_blocks << 16)
+        packed_exclusive = gl.cumsum(packed, 0) - packed
+        exclusive = packed_exclusive & 0xFFFF
+        block_exclusive = packed_exclusive >> 16
         if block_size_index == 0:
             gl.store(slice_sizes_ptr + expert, histogram, mask=expert < E)
             # Bin E is the invalid-id bin, so exclusive[E] is the valid total.
             # Storing it apart keeps the expert-range store vectorized.
             gl.store(slice_offsets_ptr + expert, exclusive, mask=expert < E)
             gl.store(slice_offsets_ptr + expert, exclusive, mask=expert == E)
-        log2_block = 4 + block_size_index
-        expert_blocks = gl.where(
-            expert < E, (histogram + ((1 << log2_block) - 1)) >> log2_block, 0
-        )
-        block_exclusive = gl.cumsum(expert_blocks, 0) - expert_blocks
         active_blocks, max_expert_blocks = gl.reduce(
             (expert_blocks, expert_blocks), 0, _sum_and_max
         )
@@ -2877,15 +2956,19 @@ def _weighted_topk_reduce_gfx1250_kernel(
             weights_ptr + pid_m.to(gl.int64) * stride_wm + slot * stride_wk
         ).to(gl.float32)
         weight = gl.where(route_valid, weight, 0.0)
+        # Every (token, slot) has a row in ``flat``, so the row loads go out
+        # without waiting for the scalar route metadata; an invalid route's
+        # row is dropped after it arrives.
         values = gl.amd.cdna5.buffer_load(
             flat_ptr,
             (
                 (pid_m.to(gl.int64) * TOPK + slot) * stride_fm
                 + offsets_n.to(gl.int64) * stride_fn
             ).to(gl.int32),
-            mask=mask & route_valid,
+            mask=mask,
             other=0.0,
         ).to(gl.float32)
+        values = gl.where(route_valid, values, 0.0)
         accumulator += values * weight
     gl.amd.cdna5.buffer_store(
         accumulator.to(output_ptr.dtype.element_ty),
@@ -3134,24 +3217,14 @@ _PREFILL_MXFP4_ACTIVATION_TILES = {
     "num_buffers": 3,
 }
 
-# Programs per CU from which a decode down projection pairs its N tiles. Many
-# experts with a row or two each launch tens of 26 KB programs per CU; one
-# program streaming two N tiles through one TDM ring measured 35.0 -> 31.8 us
-# at 16 Kimi K3 requests, while a single request has too few programs to pair.
-_DECODE_PAIR_N_TILES_PROGRAMS_PER_CU = 16
-
-
-def _decode_down_n_tiles(
-    rows: int, num_experts: int, n: int, block_n: int, device: torch.device
-) -> int:
-    block_m = _resolve_block_m(True, rows, num_experts)
-    n_tiles = triton.cdiv(n, block_n)
-    programs = RaggedTensorMetadata.n_blocks(num_experts, rows, block_m) * n_tiles
-    cus = torch.cuda.get_device_properties(device).multi_processor_count
-    if n_tiles % 2 == 0 and programs >= _DECODE_PAIR_N_TILES_PROGRAMS_PER_CU * cus:
-        return 2
-    return 1
-
+# Row blocks a queued decode gate/up launch interleaves in program order. A
+# launch that stays resident keeps an expert's N tiles in consecutive programs
+# (group_m=1); once programs queue, walking eight row blocks per N tile
+# measured 1 to 2% faster on DSV4.1 Flash TP4 and Muse Spark TP8 from 16
+# requests up, 0.6 to 1% faster on Kimi K3 TP8 from 256 and within 1% either
+# way on Qwen3.8 Flash TP2, while resident launches of all four measured 1.2
+# to 1.8% slower with it. The down projection measured faster ungrouped.
+_DECODE_QUEUED_GATE_UP_GROUP_M = 8
 
 # Row pitch in bytes of the scales the decode GEMM epilogue writes. Every
 # N tile stores a few bytes into each row; with packed 18-byte rows those
@@ -3301,21 +3374,39 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
             f"'swiglu', or 'situ', got {activation!r}"
         )
     if decode:
-        gate_up_tiles = decode_tile_config(int(hidden_states.shape[-1]))
+        fp8_activation = activation_dtype == "fp8"
+        gate_up_k = int(hidden_states.shape[-1])
         # The down projection reduces over the activation's half of W13's N.
-        down_tiles = decode_tile_config(int(w13_raw.shape[-1]) // 2)
-        if activation_dtype == "fp8":
-            # Pairing is tuned on FP8 activations; MXFP4 keeps one tile.
+        down_k = int(w13_raw.shape[-1]) // 2
+        rows = int(topk_ids.numel())
+        decode_block_m = (
+            _resolve_block_m(True, rows, num_experts) if block_m is None else block_m
+        )
+        gate_up_tiles = decode_tile_config(gate_up_k, fp8_activation, decode_block_m)
+        down_tiles = decode_tile_config(down_k, fp8_activation, decode_block_m)
+        gate_up_group_m = _DECODE_QUEUED_GATE_UP_GROUP_M
+        if block_m is None and decode_block_m == 16:
+            # Residency is measured with decode's 16-row tile; other row tiles
+            # keep the tiles above.
             w2_raw = (
                 w2_weight.storage.data if isinstance(w2_weight, Tensor) else w2_weight
             )
-            down_tiles["n_tiles"] = _decode_down_n_tiles(
-                int(topk_ids.numel()),
-                num_experts,
-                int(w2_raw.shape[-1]),
-                down_tiles["block_n"],
-                hidden_states.device,
+            blocks = RaggedTensorMetadata.n_blocks(num_experts, rows, 16)
+            cus = torch.cuda.get_device_properties(
+                hidden_states.device
+            ).multi_processor_count
+            resident = decode_resident_tile_config(
+                gate_up_k, int(w13_raw.shape[-1]), blocks, cus, fp8_activation
             )
+            if resident is not None:
+                gate_up_tiles = resident
+                gate_up_group_m = 1
+            resident = decode_resident_tile_config(
+                down_k, int(w2_raw.shape[-1]), blocks, cus, fp8_activation
+            )
+            if resident is not None:
+                down_tiles = resident
+        gate_up_tiles = {**gate_up_tiles, "group_m": gate_up_group_m}
     else:
         if activation_dtype == "fp8":
             gate_up_tiles = _PREFILL_GATE_UP_TILES
